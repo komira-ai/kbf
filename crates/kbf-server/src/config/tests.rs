@@ -228,6 +228,57 @@ fn a_segment_upload_cap_over_the_write_bound_is_refused() {
     assert!(message.contains("--write-bytes-in-flight"), "{message}");
 }
 
+/// Catches `--durable-wait` and `--ram-peer-grace` that do not reach the cache and the
+/// repair worker, defaults other than the design's (10 s and 5 s), a zero, and a wait that
+/// could outlast the chain's commit bound (mutants: the check removed; the bound compared
+/// without the half). A wait of 59 s starts; 60 s (half of the 120 s replica commit bound)
+/// is refused, naming the flag.
+#[test]
+fn the_durable_wait_and_the_peer_grace_are_flags_and_the_wait_is_bounded() {
+    let defaults = Args::parse_from(["kbf-server"]);
+    assert_eq!(defaults.durable_wait(), kbf_front::DEFAULT_DURABLE_WAIT);
+    assert_eq!(defaults.durable_wait(), Duration::from_secs(10));
+    assert_eq!(defaults.repair_config().peer_grace, Duration::from_secs(5));
+    assert_eq!(
+        defaults.repair_config().interval,
+        kbf_storage::repair::RepairConfig::default().interval
+    );
+    let set = Args::parse_from(["kbf-server", "--durable-wait=59", "--ram-peer-grace=3"]);
+    assert_eq!(set.durable_wait(), Duration::from_secs(59));
+    assert_eq!(set.repair_config().peer_grace, Duration::from_secs(3));
+    set.listeners().expect("59 s is under half of 120 s");
+    for flag in ["--durable-wait", "--ram-peer-grace"] {
+        assert!(
+            Args::try_parse_from(["kbf-server", &format!("{flag}=0")]).is_err(),
+            "{flag}=0 was accepted"
+        );
+    }
+    let refused = Args::parse_from(["kbf-server", "--durable-wait=60"])
+        .listeners()
+        .map(drop)
+        .expect_err("half the commit bound or more");
+    let message = refused.to_string();
+    assert!(message.contains("--durable-wait 60"), "{message}");
+}
+
+/// Catches `--ram-ack-bytes` and `--ram-drain-deadline` that do not reach the node: a
+/// default other than off and 30 s, a deadline of 0 (a stop that drains for no time would
+/// lose what it holds without trying), and a value that is read as another unit.
+#[test]
+fn the_ram_budget_and_its_stop_deadline_are_flags() {
+    let defaults = Args::parse_from(["kbf-server"]);
+    assert_eq!(defaults.ram_ack_bytes(), 0, "off until the producer ships");
+    assert_eq!(defaults.ram_drain_deadline(), Duration::from_secs(30));
+    let set = Args::parse_from([
+        "kbf-server",
+        "--ram-ack-bytes=1073741824",
+        "--ram-drain-deadline=7",
+    ]);
+    assert_eq!(set.ram_ack_bytes(), 1 << 30);
+    assert_eq!(set.ram_drain_deadline(), Duration::from_secs(7));
+    assert!(Args::try_parse_from(["kbf-server", "--ram-drain-deadline=0"]).is_err());
+}
+
 /// Catches a server that starts with a `--segment-upload-max-bytes` larger than one
 /// admission counts (mutant: the flag's upper limit removed). `Cache::admit` counts
 /// at most `kbf_front::MAX_ADMISSION_BYTES` (what its semaphore holds) for one call;
@@ -441,16 +492,7 @@ fn plain_text_off_loopback_checks_each_listener_through_loopback_only() {
 /// Mutant seen red: the open's error dropped (`.ok()`): the API starts store-less.
 #[test]
 fn a_releases_dir_that_cannot_be_made_stops_the_start_naming_it() {
-    // <target>/<profile>/deps/<test binary>: scratch beside it, in the target directory.
-    let exe = std::env::current_exe().expect("the test binary");
-    let target = exe
-        .ancestors()
-        .nth(3)
-        .expect("<target>/<profile>/deps/<binary>");
-    let base = target
-        .join("tmp")
-        .join(format!("config-releases-{}", std::process::id()));
-    std::fs::create_dir_all(&base).expect("dir");
+    let base = crate::test_dir::scratch_dir("config-releases");
     let file = base.join("a-file");
     std::fs::write(&file, b"x").expect("file");
     let under = file.join("store");

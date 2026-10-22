@@ -10,7 +10,10 @@ use kbf_server::update::{Alert, Generation, HoldReason, HostPhase, HostRecord, R
 use support::{GENERATION, NOW, ORDER, t};
 
 /// Catches: a hold that leaves the binary healthy, or the node already put back, paging a
-/// person as if data availability were at risk (or the other way round).
+/// person as if data availability were at risk (or the other way round). An activate order
+/// the helper refused flipped nothing, so it warns; a revert that could not run pages.
+///
+/// Mutants: `ActivateRefused` moved to the paging group; `RevertRefused` moved to warn.
 #[test]
 fn every_hold_reason_has_the_severity_its_cause_calls_for() {
     for reason in [
@@ -29,6 +32,7 @@ fn every_hold_reason_has_the_severity_its_cause_calls_for() {
         HoldReason::ConfirmStalled,
         HoldReason::Reverted,
         HoldReason::StillCordoned,
+        HoldReason::ActivateRefused,
     ] {
         assert_eq!(reason.severity(), Severity::Warn, "{reason:?}");
     }

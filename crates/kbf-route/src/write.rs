@@ -156,7 +156,11 @@ impl Router {
     ) -> Result<(), StorageError> {
         self.at_a_write_owner(&view, &action, |node| {
             let record = record.clone();
-            async move { self.commit_closed_at(&node, role, action, record).await }
+            let view = &view;
+            async move {
+                self.commit_closed_at(view, &node, role, action, record)
+                    .await
+            }
         })
         .await
     }
@@ -164,6 +168,7 @@ impl Router {
     /// [`Router::commit_with_closure`] at one owner, `node`.
     async fn commit_closed_at(
         &self,
+        view: &MapView,
         node: &Arc<dyn Storage>,
         role: Role,
         action: Digest,
@@ -194,9 +199,30 @@ impl Router {
             .buffer_unordered(COPIES_IN_FLIGHT)
             .try_collect::<()>()
             .await?;
+        // Rule 2, barrier (a): the entry is a durable pointer at every blob it names, so
+        // each is on the disk of an owner before it is written. After the copies, so a blob
+        // no owner holds ends the commit as it always did (the read of the copy fails), and
+        // the answer for a blob only the action's owner holds, as a copy, is a refusal: no
+        // reader asks that node for a blob it does not own. Not an owner's failure: the
+        // next owner of the action would ask the same owners the same.
+        self.require_durable(view, &needed)
+            .await
+            .map_err(Tried::Elsewhere)?;
         node.commit_action_record(role, action, record)
             .await
             .map_err(Tried::Node)
+    }
+
+    /// [`Router::copy_to`] for a caller outside a commit (read repair): the blob `digest`,
+    /// read from whichever owner has it and stored on `node`.
+    pub(crate) async fn copy_blob_to(
+        &self,
+        node: &Arc<dyn Storage>,
+        digest: Digest,
+    ) -> Result<(), StorageError> {
+        self.copy_to(node, digest)
+            .await
+            .map_err(|(Tried::Node(e) | Tried::Elsewhere(e))| e)
     }
 
     /// The blob `digest`, read from whichever owner has it and stored on `node`.
@@ -216,7 +242,10 @@ impl Router {
         let bytes = if digest.size_bytes == 0 {
             Bytes::new()
         } else {
-            self.read_blob(&digest).await.map_err(Tried::Elsewhere)?
+            // The commit's own hold waits for the blob's owners; a hold of the read's own
+            // would run a second bound inside the first, with the copy budget taken.
+            let plain = self.clone().unheld();
+            plain.read_blob(&digest).await.map_err(Tried::Elsewhere)?
         };
         // The action's owner is rarely the blob's: it holds the blob as one more copy.
         let stored = node.put_unowned(bytes).await.map_err(Tried::Node)?;

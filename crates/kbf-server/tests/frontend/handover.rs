@@ -16,23 +16,15 @@ use tonic::Code;
 
 use super::*;
 
-/// A directory of the test's own: the state file, the control socket.
-struct Dir(PathBuf);
+/// A directory of the test's own, removed when dropped: the state file, the control socket.
+struct Dir(kbf_testkit::dir::TestDir);
 
 impl Dir {
     fn new() -> Self {
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("kbf-frontend-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
-        Self(dir)
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        Self(kbf_testkit::dir::TestDir::under(
+            env!("CARGO_TARGET_TMPDIR"),
+            "kbf-frontend",
+        ))
     }
 }
 
@@ -452,6 +444,36 @@ async fn a_start_that_cannot_take_over_says_why_and_changes_nothing() {
         .err()
         .expect("no state store");
     assert!(error.to_string().contains("needs --state-store"), "{error}");
+}
+
+/// Catches: a handover over a Postgres state store, which cannot give up its writer role
+/// (`Store::demote` has no Postgres implementation until the takeover comes): the start
+/// is refused with its reason before the frontend serving is asked anything, whether or
+/// not one serves, and a frontend serving is untouched. Mutant: `state_uri` taking a
+/// Postgres store (the successor would knock, and the holder would fence itself and stop
+/// serving with nothing to hand to).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handover_over_a_postgres_store_is_refused_and_changes_nothing() {
+    let node = Node::start().await;
+    let dir = Dir::new();
+    let old = Proc::cold(&handover_flags(&node, &dir, "a", &[])).await;
+    let postgres = handover_flags(
+        &node,
+        &dir,
+        "b",
+        &["--state-store=postgres:///kbf?host=/run/postgresql"],
+    );
+    let (_stop, stopped) = oneshot::channel::<()>();
+    let error = taking_over(&postgres, stopped)
+        .await
+        .err()
+        .expect("refused");
+    assert!(
+        error.to_string().contains("cannot be handed over"),
+        "{error}"
+    );
+    meanwhile().await;
+    assert!(!old.drain.is_unready() && !old.drain.is_draining());
 }
 
 /// Catches (T-12): a successor that dies after the frontend serving has let go (the window

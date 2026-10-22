@@ -147,6 +147,30 @@ impl Storage for Called {
         })
     }
 
+    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        Box::pin(async move {
+            let service = self.judged().await?;
+            let catching_up = service.catching_up();
+            let missing = service.storage.find_durable(digests).await?;
+            match catch_up::missing_gap(catching_up, missing.len(), digests.len()) {
+                Some(status) => Err(lift(&status, None)),
+                None => Ok(missing),
+            }
+        })
+    }
+
+    fn find_durable_waiting<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        Box::pin(async move {
+            let service = self.judged().await?;
+            let catching_up = service.catching_up();
+            let missing = service.storage.find_durable_waiting(digests).await?;
+            match catch_up::missing_gap(catching_up, missing.len(), digests.len()) {
+                Some(status) => Err(lift(&status, None)),
+                None => Ok(missing),
+            }
+        })
+    }
+
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> Answer<'a, Bytes> {
         Box::pin(async move {
             let service = self.judged().await?;
@@ -231,6 +255,8 @@ impl Storage for Called {
         record: ActionRecord,
     ) -> Answer<'_, ()> {
         Box::pin(async move {
+            // Counted from the call, as the wire's is: a commit waiting for the map is open.
+            let _open = self.this.service.open_writes.begin();
             let service = self.judged().await?;
             let catching_up = service.catching_up();
             let committed = service
@@ -255,6 +281,7 @@ impl Segments for Judged {
         &self,
         request: Request<BeginRequest>,
     ) -> Result<Response<BeginResponse>, Status> {
+        let _open = self.this.service.open_writes.begin();
         self.this.service.check_map(self.generation).await?;
         self.this.service.segments.begin(request).await
     }

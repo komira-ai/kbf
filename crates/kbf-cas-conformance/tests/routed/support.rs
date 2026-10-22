@@ -148,6 +148,11 @@ impl Storage for Fake {
         })
     }
 
+    /// Holds nothing in RAM: durable is present.
+    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        self.find_missing(digests)
+    }
+
     fn read_blob<'a>(&'a self, _: &'a Digest) -> Answer<'a, Bytes> {
         Box::pin(async { Err(StorageError::Internal("the router reads ranges".to_owned())) })
     }
@@ -301,6 +306,7 @@ pub fn plane(fake: &Arc<Fake>, config: &TransferConfig) -> Arc<RoutedCas> {
     let view = MapView {
         map: Arc::new(map),
         previous: None,
+        earlier: Vec::new(),
     };
     let router = Router::new(Arc::new(Fixed(view)), Arc::new(Only(Arc::clone(fake))));
     Arc::new(RoutedCas::new(router, config))

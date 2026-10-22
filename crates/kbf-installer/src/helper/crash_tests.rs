@@ -5,7 +5,7 @@
 use std::cell::{Cell, RefCell};
 use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::activate;
@@ -17,10 +17,16 @@ use kbf_host::testkit::{ScratchHost, reply};
 use kbf_host::{Cmd, HostPath, Root, Step};
 
 use crate::helper::cycle::{Config, Helper};
+use crate::helper::fetcher::fake::FakeFetcher;
+use crate::helper::leases::fake::FakeLeases;
 use crate::helper::restart::Restart;
+use crate::helper::service::fake::ServiceRecorder;
+use kbf_update::{Facts, Locator, OrderRecord, Source, Verb};
 
 const UNIT: &str = "kbf.service";
 const T0: u64 = 1_800_000_000;
+const LOG: &str = "var/lib/kbf-meta";
+const OLD_LOG: &[u8] = b"machine version 4\n";
 
 struct Crashy {
     inner: Rc<RefCell<ScratchHost>>,
@@ -68,6 +74,7 @@ struct World {
     layout: Layout,
     counter: Rc<Cell<usize>>,
     crash_at: Rc<Cell<usize>>,
+    fetcher: FakeFetcher,
 }
 
 impl World {
@@ -76,14 +83,15 @@ impl World {
         let root = host.root.clone();
         for sub in [
             "run",
-            "var/lib/kbf-deploy",
-            "var/lib/kbf-updater/inbox/orders",
-            "usr/local/kbf/releases",
+            "var/lib/kbf-installer",
+            "var/lib/kbf-installer/orders",
+            "var/lib/kbf-installer/releases",
         ] {
             fs::create_dir_all(root.join(sub)).unwrap();
         }
+        // A is running; B is on the host already except where a scenario has it fetched.
         for r in [A, B] {
-            let d = root.join("usr/local/kbf/releases").join(r);
+            let d = root.join("var/lib/kbf-installer/releases").join(r);
             fs::create_dir_all(&d).unwrap();
             fs::write(d.join("kbf"), b"binary").unwrap();
         }
@@ -98,6 +106,7 @@ impl World {
             })
             .unwrap();
         World {
+            fetcher: FakeFetcher::new(&layout),
             host: Rc::new(RefCell::new(host)),
             root,
             layout,
@@ -107,10 +116,12 @@ impl World {
     }
     fn helper(&self) -> Helper<Crashy> {
         let cfg = Config {
-            update_dir: HostPath::new("/var/lib/kbf-updater").unwrap(),
+            update_dir: HostPath::new("/var/lib/kbf-installer").unwrap(),
+            orders_dir: HostPath::new("/var/lib/kbf-installer/orders").unwrap(),
             restart: Restart::Systemd(UNIT.to_owned()),
             window_secs: 600,
             starts: 3,
+            min_activation_interval_secs: 0,
         };
         Helper::new(
             self.layout.clone(),
@@ -120,14 +131,55 @@ impl World {
                 crash_at: self.crash_at.clone(),
             },
             cfg,
+            Box::new(self.fetcher.clone()),
+            Box::new(FakeLeases::default()),
+            Box::new(ServiceRecorder::default()),
         )
     }
     fn order(&self, id: u64, verb: &str, commit: &str) {
         self.order_in(id, 1, verb, commit);
     }
     fn order_in(&self, id: u64, epoch: u64, verb: &str, commit: &str) {
-        fs::write(self.root.join("var/lib/kbf-updater/inbox/orders").join(format!("{id:020}.json")),
-            format!("{{\"order_id\":{id},\"epoch\":{epoch},\"verb\":\"{verb}\",\"commit\":\"{commit}\",\"window_s\":600}}")).unwrap();
+        let verb = match verb {
+            "activate" => Verb::Activate,
+            "confirm" => Verb::Confirm,
+            "frontend_update" => Verb::FrontendUpdate,
+            _ => Verb::Revert,
+        };
+        let activate = verb == Verb::Activate;
+        let record = OrderRecord {
+            order_id: id,
+            epoch,
+            generation: 1,
+            verb,
+            commit: commit.to_owned(),
+            window_s: 600,
+            components: if activate {
+                vec![Locator {
+                    name: "kbf".to_owned(),
+                    sha256: "ab".repeat(32),
+                    size: 1000,
+                    attestation: "{}".to_owned(),
+                }]
+            } else {
+                Vec::new()
+            },
+            expected: activate.then(|| Facts {
+                platform: "linux-x86_64".to_owned(),
+                protocol: 7,
+                min_protocol: 6,
+                state_schema: 3,
+                profile: "release".to_owned(),
+            }),
+            source: Source::Fetch,
+        };
+        fs::write(
+            self.root
+                .join("var/lib/kbf-installer/orders")
+                .join(record.file_name()),
+            record.to_bytes().unwrap(),
+        )
+        .unwrap();
     }
     fn restarts(&self) -> usize {
         self.host
@@ -138,7 +190,7 @@ impl World {
             .count()
     }
     fn link(&self) -> String {
-        fs::read_link(self.root.join("usr/local/kbf/current"))
+        fs::read_link(self.root.join("var/lib/kbf-installer/releases/current"))
             .map(|p| p.display().to_string())
             .unwrap_or_default()
     }
@@ -146,7 +198,7 @@ impl World {
         crate::state::read_unlocked(&self.layout).unwrap().unwrap()
     }
     fn orders_left(&self) -> usize {
-        fs::read_dir(self.root.join("var/lib/kbf-updater/inbox/orders"))
+        fs::read_dir(self.root.join("var/lib/kbf-installer/orders"))
             .unwrap()
             .count()
     }
@@ -154,12 +206,8 @@ impl World {
 
 fn pass(w: &World, now: u64) {
     let mut h = w.helper();
-    let mut never =
-        |_: &mut Crashy, _: &Path| -> Result<crate::stage::Staged, crate::refusal::Refusal> {
-            panic!("no offer")
-        };
     h.recover().unwrap();
-    h.cycle(now, &mut never).unwrap();
+    h.cycle(now).unwrap();
 }
 
 fn crash_pass(w: &World, now: u64, at: usize) -> bool {
@@ -167,11 +215,7 @@ fn crash_pass(w: &World, now: u64, at: usize) -> bool {
     w.crash_at.set(at);
     let r = catch_unwind(AssertUnwindSafe(|| {
         let mut h = w.helper();
-        let mut never =
-            |_: &mut Crashy, _: &Path| -> Result<crate::stage::Staged, crate::refusal::Refusal> {
-                panic!("no offer")
-            };
-        h.cycle(now, &mut never).unwrap();
+        h.cycle(now).unwrap();
     }));
     w.crash_at.set(0);
     r.is_err()
@@ -186,9 +230,35 @@ fn steps_in_clean_pass(scn: &str) -> usize {
 
 fn prep(scn: &str, tag: &str) -> World {
     let w = World::new(&format!("{scn}-{tag}"));
+    if scn.starts_with("frontend") {
+        let dir = w.root.join("etc/kbf");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("kbf.toml"), "mode = \"frontend\"\n").unwrap();
+    }
     pass(&w, T0 - 100);
     match scn {
+        // The proxy's three orders; the host starts with B staged except for the update,
+        // which fetches it (B is not on the host then).
+        "frontend_update" => {
+            fs::remove_dir_all(w.root.join("var/lib/kbf-installer/releases").join(B)).unwrap();
+            Locked::acquire(&w.layout)
+                .unwrap()
+                .write(&State {
+                    current: Some(c(A)),
+                    ..State::default()
+                })
+                .unwrap();
+            w.order(5, "frontend_update", B);
+        }
+        "frontend_confirm" => w.order(5, "confirm", B),
+        "frontend_revert" => w.order(5, "revert", B),
         "activate" => {
+            w.order(5, "activate", B);
+        }
+        // B is not on the host: the fetcher installs it, and the pass can die on either
+        // side of that.
+        "activate_fetching" => {
+            fs::remove_dir_all(w.root.join("var/lib/kbf-installer/releases").join(B)).unwrap();
             w.order(5, "activate", B);
         }
         "revert" => {
@@ -207,7 +277,20 @@ fn prep(scn: &str, tag: &str) -> World {
             pass(&w, T0 + 3);
             w.order_in(1, 2, "revert", A);
         }
-        "expire" => {
+        "expire" | "expire_log" => {
+            if scn == "expire_log" {
+                // A storage node with a metadata log; B's first start saves it, then B
+                // raises it.
+                let kbf = w.root.join("etc/kbf");
+                fs::create_dir_all(&kbf).unwrap();
+                fs::write(
+                    kbf.join("kbf.toml"),
+                    "mode = \"storage\"\n[storage]\nmeta_dir = \"/var/lib/kbf-meta\"\n",
+                )
+                .unwrap();
+                fs::create_dir_all(w.root.join(LOG)).unwrap();
+                fs::write(w.root.join(LOG).join("RECORD"), OLD_LOG).unwrap();
+            }
             w.order(5, "activate", B);
             pass(&w, T0);
             let mut out = Vec::new();
@@ -217,6 +300,10 @@ fn prep(scn: &str, tag: &str) -> World {
                 crash_at: w.crash_at.clone(),
             };
             activate::boot_check(&mut ex, &w.layout, T0 + 10, 600, &mut out).unwrap();
+            if scn == "expire_log" {
+                fs::write(w.root.join(LOG).join("RECORD"), b"machine version 5\n").unwrap();
+                fs::write(w.root.join(LOG).join("segment-2"), b"new").unwrap();
+            }
         }
         _ => unreachable!(),
     }
@@ -245,10 +332,51 @@ fn kill_at_every_step_of(scn: &str) {
                 .unwrap_or_default();
             let restarts = w.restarts() - before;
             let mut why = Vec::new();
+            if scn == "expire_log" {
+                // The restart the helper owes runs the unit's start check first: the log is
+                // as the older release left it, whichever step the pass was killed at.
+                let mut ex = Crashy {
+                    inner: w.host.clone(),
+                    counter: w.counter.clone(),
+                    crash_at: w.crash_at.clone(),
+                };
+                activate::boot_check(&mut ex, &w.layout, T0 + 900, 600, &mut Vec::new()).unwrap();
+                let log = w.root.join(LOG);
+                if fs::read(log.join("RECORD")).unwrap() != OLD_LOG
+                    || log.join("segment-2").exists()
+                {
+                    why.push("the metadata log was not put back".to_owned());
+                }
+            }
             if !link.ends_with(&cur) {
                 why.push(format!("link {link} != state {cur}"));
             }
-            let moved = (scn == "activate" && cur == B) || (scn != "activate" && cur == A);
+            let activating = scn.starts_with("activate");
+            let frontend = scn.starts_with("frontend");
+            let moved = !frontend && ((activating && cur == B) || (!activating && cur == A));
+            if frontend {
+                // No unit is restarted for the proxy's orders; the state and the status end
+                // where the order puts them, and `current` is B only after a confirm.
+                let (want_cur, want_staged) = match scn {
+                    "frontend_update" => (A, Some(c(B))),
+                    "frontend_confirm" => (B, None),
+                    _ => (A, None),
+                };
+                if restarts != 0 {
+                    why.push(format!("{restarts} restarts"));
+                }
+                if cur != want_cur || st.staged != want_staged {
+                    why.push(format!("current {cur}, staged {:?}", st.staged));
+                }
+                let status = fs::read(w.root.join("var/lib/kbf-installer/status.json")).unwrap();
+                let status: serde_json::Value = serde_json::from_slice(&status).unwrap();
+                if status["installed_commit"] != cur.as_str() {
+                    why.push(format!(
+                        "status says installed {}",
+                        status["installed_commit"]
+                    ));
+                }
+            }
             if moved && restarts == 0 {
                 why.push("links moved, service never restarted".to_owned());
             }
@@ -257,6 +385,12 @@ fn kill_at_every_step_of(scn: &str) {
             }
             if w.orders_left() != 0 {
                 why.push("order file left".to_owned());
+            }
+            if scn == "activate_fetching"
+                && w.fetcher.count() != 1
+                && !(w.fetcher.count() == 2 && died)
+            {
+                why.push(format!("{} fetches", w.fetcher.count()));
             }
             if !why.is_empty() {
                 bad.push(format!("{scn} step {at} (died {died}): {}", why.join("; ")));
@@ -274,6 +408,20 @@ fn kill_at_every_step_of_an_activate() {
     kill_at_every_step_of("activate");
 }
 
+/// Catches a pass that dies around a fetch leaving the host wrong: a kill at every step of
+/// an activation of a release that is not on the host. The fetch is not a step (it writes the
+/// release directory), so the kills fall before it, between it and the swap, and after; in
+/// every case the links and the state agree after the next passes, the service was
+/// restarted if the links moved, and the release is fetched once, or twice only when the
+/// kill came before the fetch had finished.
+///
+/// Mutants planted: the restart owed before the fetch (a kill in between restarts the
+/// service with nothing swapped); the order file removed before the swap.
+#[test]
+fn kill_at_every_step_of_an_activate_that_fetches() {
+    kill_at_every_step_of("activate_fetching");
+}
+
 #[test]
 fn kill_at_every_step_of_a_revert() {
     kill_at_every_step_of("revert");
@@ -284,30 +432,68 @@ fn kill_at_every_step_of_a_revert_in_a_new_epoch() {
     kill_at_every_step_of("revert_in_a_new_epoch");
 }
 
+/// Catches a pass of a frontend host that dies around the proxy's orders leaving the host
+/// wrong: killed at every step of a `frontend_update` that fetches, a `confirm` that flips
+/// `previous` and `current`, and a `revert` that drops the staging, then started again (the
+/// start-up repair, then passes), the links agree with the state, the state is where the order
+/// puts it, `status.json` names the same installed release, no unit was restarted (not by the
+/// repair either), and the order file is gone.
+///
+/// Mutants planted: the repair owing a restart on a frontend host; the status not rewritten
+/// after a restart; the links moved before the state (the repair then restores the old ones).
+#[test]
+fn kill_at_every_step_of_a_frontend_update() {
+    kill_at_every_step_of("frontend_update");
+}
+
+#[test]
+fn kill_at_every_step_of_a_frontend_confirm() {
+    kill_at_every_step_of("frontend_confirm");
+}
+
+#[test]
+fn kill_at_every_step_of_a_frontend_revert() {
+    kill_at_every_step_of("frontend_revert");
+}
+
 #[test]
 fn kill_at_every_step_of_an_expiry() {
     kill_at_every_step_of("expire");
 }
 
-/// Catches orders read through a linked `inbox`: the service user owns that directory and
-/// could point it at one of its own anywhere. Mutant seen red: `orders` opened by its full
-/// path (the parent followed): the helper acted on the order and removed the file.
+/// Catches a metadata log left raised by a pass killed while it reverted the release that
+/// raised it: at every step of the pass the swap's window runs out in, then passes and the
+/// unit's start check, the links and the state agree and the log is as the older release left
+/// it, with the file the newer one added gone.
+///
+/// Mutant planted: the start check putting the log back only on the path that reverts itself
+/// (and not at a start after a revert some other pass made).
 #[test]
-fn inbox_replaced_by_a_link_is_not_followed_for_orders() {
-    let w = World::new("inboxlink");
+fn kill_at_every_step_of_an_expiry_that_raised_the_log() {
+    kill_at_every_step_of("expire_log");
+}
+
+/// Catches orders read through a linked spool: the service user owns that directory's
+/// parent chain below the root tree and could point `orders` at one of its own anywhere.
+/// Mutant seen red: `orders` opened by a path that follows the link: the helper acted on the
+/// order and removed the file.
+#[test]
+fn a_spool_replaced_by_a_link_is_not_followed_for_orders() {
+    let w = World::new("spoollink");
     pass(&w, T0 - 100);
-    let base = w.root.join("var/lib/kbf-updater");
+    let base = w.root.join("var/lib/kbf-installer");
     let elsewhere = w.root.join("var/lib/elsewhere");
-    fs::create_dir_all(elsewhere.join("orders")).unwrap();
-    fs::remove_dir_all(base.join("inbox")).unwrap();
-    std::os::unix::fs::symlink(&elsewhere, base.join("inbox")).unwrap();
-    let f = elsewhere.join("orders").join(format!("{:020}.json", 5));
-    fs::write(&f, format!("{{\"order_id\":5,\"epoch\":1,\"verb\":\"activate\",\"commit\":\"{B}\",\"window_s\":600}}")).unwrap();
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::remove_dir_all(base.join("orders")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, base.join("orders")).unwrap();
+    w.order_in(5, 1, "activate", B);
+    // `order_in` wrote through the link, into `elsewhere`.
+    let f = elsewhere.join(kbf_update::record::file_name(1, 5));
+    assert!(f.exists());
     pass(&w, T0);
-    eprintln!("current={} order file exists={}", w.link(), f.exists());
     assert!(
         w.link().ends_with(A),
-        "helper acted on an order through a linked inbox"
+        "helper acted on an order through a linked spool"
     );
-    assert!(f.exists(), "helper unlinked a file through a linked inbox");
+    assert!(f.exists(), "helper unlinked a file through a linked spool");
 }

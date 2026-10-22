@@ -16,7 +16,7 @@ use kbf_invocation::{
 };
 use kbf_objstore::MemoryStore;
 use kbf_sched::RequeueReason;
-use kbf_server::{Api, Listeners, StateStore, bind_server_with_state};
+use kbf_server::{Api, Listeners, StateStore, bind_server_with_ui};
 use kbf_types::{Digest, DigestFunction, LeaseId, OperationId, WorkerId};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -48,6 +48,25 @@ pub struct Answer {
     pub json: Value,
 }
 
+impl Answer {
+    /// The value of the one header `name` (any case), or `None`; a header sent twice fails
+    /// the test.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let mut found = self.head.lines().skip(1).filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then_some(value.trim())
+        });
+        let first = found.next();
+        assert!(found.next().is_none(), "{name} twice in {}", self.head);
+        first
+    }
+
+    /// The body as text.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
 fn loopback() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 0))
 }
@@ -61,6 +80,11 @@ impl Server {
     /// [`Server::start`], keeping the scheduler's state in `state` and writing the build
     /// history it names, if any.
     pub fn start_over(policy: Policy, memory: usize, state: Option<StateStore>) -> Self {
+        Self::start_ui(policy, memory, state, true)
+    }
+
+    /// [`Server::start_over`], with the web UI mounted or not (`--ui`).
+    pub fn start_ui(policy: Policy, memory: usize, state: Option<StateStore>, ui: bool) -> Self {
         let cache = Arc::new(Cache::memory());
         let listeners = Listeners {
             reapi: loopback(),
@@ -71,6 +95,7 @@ impl Server {
             hello_wait: Duration::from_secs(5),
             tick: Duration::from_millis(50),
             unservable_wait: kbf_sched::UNSERVABLE_WAIT,
+            default_platform: kbf_front::DefaultPlatform::NONE,
             memory_ladder: kbf_server::MemoryLadder::default(),
             finished_retention: kbf_sched::FINISHED_RETENTION,
             shutdown_timeout: Duration::from_secs(10),
@@ -89,13 +114,18 @@ impl Server {
             token: None,
             local_cache: None,
             releases: None,
+            poll: None,
         };
-        let bound = bind_server_with_state(
+        let bound = bind_server_with_ui(
             Arc::clone(&cache),
             listeners,
             Some(api),
             policy,
             state,
+            None,
+            None,
+            None,
+            ui,
             shutdown,
         )
         .expect("bind");
@@ -146,9 +176,21 @@ impl Server {
 
     /// [`Server::get`] with `headers` added to the request: lines ending in `\r\n`.
     pub async fn get_with(&self, path: &str, headers: &str) -> Answer {
+        self.request("GET", path, headers).await
+    }
+
+    /// One request of `method` and `path`, with `headers` added: lines ending in `\r\n`.
+    pub async fn request(&self, method: &str, path: &str, headers: &str) -> Answer {
         let mut stream = TcpStream::connect(self.api).await.expect("connect");
-        let request =
-            format!("GET {path} HTTP/1.1\r\nHost: kbf\r\n{headers}Connection: close\r\n\r\n");
+        // A request that is not a `GET` says it has no body.
+        let length = if method == "GET" {
+            ""
+        } else {
+            "Content-Length: 0\r\n"
+        };
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: kbf\r\n{headers}{length}Connection: close\r\n\r\n"
+        );
         stream.write_all(request.as_bytes()).await.expect("send");
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await.expect("read");

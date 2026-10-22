@@ -30,7 +30,6 @@ What a Linux daemon reports today:
 | `isa_level` (repeated) | **every** level the CPU reaches, lowest first | computed from the features |
 | `cpu.features` (repeated) | every CPU feature flag, in the kernel's names | `/proc/cpuinfo` |
 | `drivers` (repeated) | every execution driver this daemon runs, one per runtime: `container`, `native` or `fake` | `kbf-daemon --driver`, once per driver |
-| `label.<k>` | an operator's label, `--label k=v` | the daemon's flags |
 
 A daemon on an Apple silicon Mac asks `sysctl` instead: `hw.optional` (which `kbf-caps`
 parses into `cpu.features` and `isa_level`), `hw.ncpu` (`cpus`), `hw.memsize`
@@ -199,7 +198,7 @@ Each key has one typed comparison:
 | `isa_level` | at least, within the family: `x86-64-v3` is served by v3 and v4 |
 | `cpu.feature` (may repeat) | every requested feature is present |
 | `cpus`, `mem_gib`, `nvme_gib`, `gpu` | the node has at least this amount (`gpu` is also booked, below) |
-| `os`, `os_image`, `cpu.model`, `page_size`, `label.<k>` | exact |
+| `os`, `os_image`, `cpu.model`, `page_size` | exact |
 | `xcode` | membership: the node reports one `xcode` entry per ready Xcode build, and the request names one of them |
 | `os_build`, `os_version`, `kernel` | **planned**: exact, once they are report entries (see [The node status](#the-node-status)) |
 | `vm.image` | membership on the digest: the request names `<name>@sha256:<64 lowercase hex digits>` and matches a node that reports any name with that digest; a value without a digest is refused. No daemon reports `vm.image` yet, so a request for one matches no node (see [Planned VM entries](#planned-vm-entries)) |
@@ -273,8 +272,11 @@ property is not a capability and is left to whoever reads it (`kbf-lease`,
 Property names are read without regard to ASCII case (`kbf_caps::property_name`): the
 REAPI names above and every kbf key (`osfamily`, `OS`, `GPU`, `Kbf-Lease`), so a
 property meant for kbf is never dropped for its spelling and the action run anywhere.
-A label's own name keeps its case. `arch` spelled exactly so is kbf's key; any other
-spelling is REAPI's `Arch`. One name in two spellings is refused. The native driver
+`arch` spelled exactly so is kbf's key; any other
+spelling is REAPI's `Arch`. A `label.<k>` is no kbf key in any case: node labels were
+removed, so a request that names one is refused (`UnknownKey`), a platform property of
+that name is ignored like any name kbf does not read, and an entry of that name in a
+node report from an older daemon is skipped. One name in two spellings is refused. The native driver
 reads `xcode` in any case too.
 
 **`container-image` is the exception: it is matched exactly.** The front does not read

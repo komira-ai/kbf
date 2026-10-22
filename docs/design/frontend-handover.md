@@ -1,5 +1,13 @@
 # Updating the frontend without failing a build
 
+> **Retired.** The unit `kbf-frontend@.service` and the command `kbf frontend handover`
+> described below were removed by a maintainer decision: kbf-installer's proxy swaps frontend
+> children instead, and the state store is Postgres everywhere (a Postgres frontend refuses a
+> control socket, so the template could not start). The package ships `kbf-frontend.service`
+> (one process) and `kbf-proxy`. What stays of this page is the protocol in
+> `kbf_server::handover` (the test farm's frontend uses its control socket) and the history
+> below; nothing here is an instruction to enable the template.
+
 `kbf frontend handover` starts a new frontend beside the serving one, behind Envoy. The new
 one binds listeners of its own, takes the state store and the daemons over, and serves;
 Envoy sends new streams to it once it is ready; the old one goes not ready, forwards the
@@ -13,7 +21,7 @@ the command are here.
 Both instances run the same command line but for `--instance=a|b`. Instance a listens where
 `--listen`, `--worker-listen` and `--api-listen` say; instance b listens ten ports above each
 (port 0, which the system chooses, stays 0), so the two blocks are `base+0..2` and `base+10..12`,
-the ones Envoy's configuration (`kbf-deploy envoy render --topology box`) names. A handover
+the ones the installer's Envoy box render (`kbf-installer`, `envoy` module) names. A handover
 goes to the other instance. The two REAPI listeners must be on loopback, since the old one
 forwards the calls that still reach it to the new one. If the REAPI listener has a
 certificate, `--handover-peer-name` (the DNS name the other instance's certificate carries) and
@@ -28,10 +36,10 @@ the old one: `interval x threshold + timeout + interval`, four seconds by defaul
 ## The unit: `kbf-frontend@.service`
 
 One template, two instances, `kbf-frontend@a` and `kbf-frontend@b`, with the same command
-line. Only one serves at a time. `linux install-units --mode frontend` writes the template,
+line. Only one serves at a time. `kbf-installer` installs the template (`kbf-deploy linux install-units`, retired, did before),
 enables it (`DefaultInstance=a`: only `@a` starts at boot) and starts `@a` if neither
 instance is up. A serving instance is never restarted by an install: the plan says to run
-the handover instead. What the unit has, and why (check-units rule `handover`; rule `stop`
+the handover instead. What the unit has, and why (rule `handover` of the package test `package_units.rs`; rule `stop`
 still asks for `TimeoutStopSec=infinity` and `KillSignal=SIGTERM`):
 
 - `Type=notify`: kbf sends `READY=1` once it serves and its state store and map probes

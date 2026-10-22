@@ -18,7 +18,7 @@ After=network-online.target
 ConditionPathExists=/etc/kbf/kbf.toml
 
 # A failure that repeats quickly (the cold store or a disk not ready) must not use up
-# systemd's start limit of 5 starts in 10 s and leave the unit down (check-units rule
+# systemd's start limit of 5 starts in 10 s and leave the unit down (package-test rule
 # `restart`).
 StartLimitIntervalSec=0
 
@@ -32,7 +32,7 @@ StateDirectory=kbf
 StateDirectoryMode=0750
 # The daemon half manages its own cgroup: supervisor/ for itself, actions/ for builds.
 # Delegate=yes delegates cpuset with cpu, memory and pids: --lease-placement=numa-node
-# pins each lease to one NUMA node with it (check-units rule `delegate`).
+# pins each lease to one NUMA node with it (package-test rule `delegate`).
 Delegate=yes
 OOMScoreAdjust=-925
 # systemd starts a unit at a soft open-file limit of 1024; a build burst passes that (EMFILE).
@@ -40,7 +40,7 @@ LimitNOFILE=1048576
 CPUWeight=300
 # No MemorySwapMax=: leases may swap, and they live in this unit's cgroup.
 # One unit, one process, one user: the cold store's key is not read from an
-# EnvironmentFile= (check-units rule `credential`); kbf.toml names where kbf gets it. The
+# EnvironmentFile= (package-test rule `credential`); kbf.toml names where kbf gets it. The
 # user builds run as can read what this process reads, so this unit is for a trusted
 # network only, as all-in-one is, until a test proves an action cannot read the key
 # (design section 9).
@@ -49,11 +49,11 @@ ExecStartPre=+/usr/bin/kbf-installer boot-check
 # and exits 2 for those. Anything that can become ready later (a listen address, a peer,
 # a DNS name, a mount) is not refused here: it exits 75 (not ready, restarted), so a check
 # that runs before the bind retry never leaves the unit down for good (kbf#998, #1000).
-ExecStartPre=/var/lib/kbf-installer/current/kbf --mode=storage-and-daemon --check
-ExecStart=/var/lib/kbf-installer/current/kbf --mode=storage-and-daemon
+ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=storage-and-daemon --check
+ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=storage-and-daemon
 # The storage half drains on SIGTERM: a Write in flight is finished and acknowledged
 # before the process exits, and a large one takes longer than systemd's 90 s default stop
-# timeout, which would SIGKILL it and fail the upload (check-units rule `stop`).
+# timeout, which would SIGKILL it and fail the upload (package-test rule `stop`).
 KillSignal=SIGTERM
 TimeoutStopSec=infinity
 Restart=on-failure

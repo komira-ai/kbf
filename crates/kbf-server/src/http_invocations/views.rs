@@ -24,6 +24,9 @@ pub(crate) struct Draft {
     pub(crate) value: Value,
     /// Each blob's object, as a JSON pointer into `value`, and its digest.
     pub(crate) blobs: Vec<(String, Digest)>,
+    /// What `/failures` reads from the CAS for each failure it lists, in order; empty for
+    /// every other route.
+    pub(crate) reads: Vec<super::failures::Read>,
 }
 
 impl Draft {
@@ -68,12 +71,14 @@ pub(super) struct Builder {
     /// Whether the blob route answers: without it every `href` is `null`.
     pub(super) blobs_on: bool,
     pub(super) found: Vec<(String, Digest)>,
+    /// The CAS reads `/failures` asks for ([`Draft::reads`]).
+    pub(super) reads: Vec<super::failures::Read>,
 }
 
 impl Builder {
     /// A blob's object, `{"digest", "available", "href"}`, noted under the pointer
     /// `at`; `href` reads it on `instance`, named `name`, as text when `inline`.
-    fn blob(
+    pub(super) fn blob(
         &mut self,
         at: String,
         digest: Digest,
@@ -98,7 +103,13 @@ impl Builder {
     }
 
     /// A log's object, linked as text when it is small enough to be shown inline.
-    fn log(&mut self, at: String, digest: Option<Digest>, instance: &str, name: &str) -> Value {
+    pub(super) fn log(
+        &mut self,
+        at: String,
+        digest: Option<Digest>,
+        instance: &str,
+        name: &str,
+    ) -> Value {
         digest.map_or(Value::Null, |d| {
             let inline = d.size_bytes <= INLINE_MAX_BYTES;
             Value::Object(self.blob(at, d, instance, Some(name), inline))
@@ -131,6 +142,7 @@ pub(super) fn invocation(inv: &Invocation, base: &str, now: WallTime) -> Value {
         "counts": counts(inv.counts()),
         "collisions": collisions,
         "links": {
+            "failures": format!("{base}/failures"),
             "actions": format!("{base}/actions"),
             "artifacts": format!("{base}/artifacts"),
             "logs": format!("{base}/logs"),
@@ -311,20 +323,7 @@ pub(super) fn row(r: &ActionRow, base: &str) -> Map<String, Value> {
 pub(super) fn action(b: &mut Builder, r: &ActionRow, base: &str) -> Map<String, Value> {
     let mut map = row(r, base);
     let listing = r.listing.as_ref();
-    let outputs: Vec<Value> = listing
-        .map(|l| l.outputs.as_slice())
-        .unwrap_or_default()
-        .iter()
-        .enumerate()
-        .map(|(i, o)| {
-            let name = (!o.directory).then(|| file_name(&o.path));
-            let mut blob = b.blob(format!("/outputs/{i}"), o.digest, &r.instance, name, false);
-            blob.insert("path".to_owned(), o.path.clone().into());
-            blob.insert("executable".to_owned(), o.executable.into());
-            blob.insert("directory".to_owned(), o.directory.into());
-            Value::Object(blob)
-        })
-        .collect();
+    let outputs = outputs(b, r, "/outputs");
     let stdout = b.log(
         "/stdout".to_owned(),
         listing.and_then(|l| l.stdout),
@@ -352,6 +351,26 @@ pub(super) fn action(b: &mut Builder, r: &ActionRow, base: &str) -> Map<String, 
     });
     map.insert("blobs".to_owned(), blobs);
     map
+}
+
+/// Row `r`'s outputs as blob objects with their path and mode, each noted under
+/// `{at}/{i}`.
+pub(super) fn outputs(b: &mut Builder, r: &ActionRow, at: &str) -> Vec<Value> {
+    r.listing
+        .as_ref()
+        .map(|l| l.outputs.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(i, o)| {
+            let name = (!o.directory).then(|| file_name(&o.path));
+            let mut blob = b.blob(format!("{at}/{i}"), o.digest, &r.instance, name, false);
+            blob.insert("path".to_owned(), o.path.clone().into());
+            blob.insert("executable".to_owned(), o.executable.into());
+            blob.insert("directory".to_owned(), o.directory.into());
+            Value::Object(blob)
+        })
+        .collect()
 }
 
 /// One output of row `r` as `/artifacts` lists it.
@@ -525,7 +544,7 @@ fn run_usage(u: &RunUsage) -> Value {
     keys.into()
 }
 
-fn attempt(a: &Attempt) -> Value {
+pub(super) fn attempt(a: &Attempt) -> Value {
     let end = match &a.end {
         None => Value::Null,
         Some(AttemptEnd::Accepted) => json!({"result": "ok"}),
@@ -563,7 +582,7 @@ fn run_keys(a: &Attempt, keys: &mut Map<String, Value>) {
     }
 }
 
-fn outcome(o: Option<&Outcome>) -> Value {
+pub(super) fn outcome(o: Option<&Outcome>) -> Value {
     match o {
         None => Value::Null,
         Some(Outcome::Ok { exit_code }) => json!({"ok": {"exit_code": exit_code}}),
@@ -575,14 +594,14 @@ fn outcome(o: Option<&Outcome>) -> Value {
     }
 }
 
-fn text(t: Option<&Text>) -> Value {
+pub(super) fn text(t: Option<&Text>) -> Value {
     t.map_or(
         Value::Null,
         |t| json!({"value": t.value, "truncated": t.truncated}),
     )
 }
 
-fn usage(u: Option<Usage>) -> Value {
+pub(super) fn usage(u: Option<Usage>) -> Value {
     u.map_or(Value::Null, |u| {
         json!({
             "cpu_user_micros": u.cpu_user_micros,
@@ -594,7 +613,7 @@ fn usage(u: Option<Usage>) -> Value {
 }
 
 /// The last component of an output's path: the file name its link downloads as.
-fn file_name(path: &str) -> &str {
+pub(super) fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 

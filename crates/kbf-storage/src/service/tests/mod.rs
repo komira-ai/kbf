@@ -8,10 +8,13 @@
 
 mod catch_up;
 mod denied;
+mod durable;
 mod every_call;
 pub(crate) mod fake;
 mod generation;
+mod in_flight;
 mod in_process;
+mod open_writes;
 pub(crate) mod roles;
 mod stale_map;
 

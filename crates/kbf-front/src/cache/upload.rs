@@ -131,7 +131,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// # Errors
     /// [`CacheError::DigestMismatch`] for the first record that does not hash to its
     /// digest; [`CacheError::Internal`] if the hashing job failed.
-    async fn verify_built(&self, segment: BuiltSegment) -> Result<BuiltSegment, CacheError> {
+    pub(crate) async fn verify_built(
+        &self,
+        segment: BuiltSegment,
+    ) -> Result<BuiltSegment, CacheError> {
         let BuiltSegment { body, entries, .. } = segment;
         let records_len = Footer::parse(&body, body.len() as u64)?.records_len();
         let work = body.clone();
@@ -152,8 +155,13 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         // The same entry count as the declared footer, so the same length.
         let footer = encode_footer(records_len, &found.good);
         let records = &body[..usize::try_from(records_len).unwrap_or(body.len())];
+        // A fresh whole-segment copy (up to a segment's length), counted
+        // (`kbf_bytes_in_flight`) from its allocation until `store_segment` is done with
+        // it; the body it replaces is given back as this returns.
+        let copy = kbf_storage::in_flight::hold((records.len() + footer.len()) as u64);
+        let verified = [records, footer.as_slice()].concat();
         Ok(BuiltSegment {
-            body: Bytes::from([records, footer.as_slice()].concat()),
+            body: kbf_storage::in_flight::counted_with(verified, copy),
             entries: found.good,
             verified: true,
             staged: None,
@@ -162,8 +170,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
 
     /// Where each of `digests` is, in order: the object and offset of a blob present
     /// and reachable, `None` for any other (the empty blob included: it is in no
-    /// object). The present ones are touched before the answer, as a read is, so a
-    /// fill that reads them next finds them.
+    /// object; a blob held in RAM too). The present ones are touched before the answer, as
+    /// a read is, so a fill that reads them next finds them.
     ///
     /// # Errors
     /// The metadata log is unavailable or kept changing.
@@ -171,11 +179,18 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self,
         digests: &[Digest],
     ) -> Result<Vec<Option<Location>>, CacheError> {
+        // Held first, then the index (`held` module docs). A held blob has no object
+        // location to give, so it is `None` even if the index has it too (the drain's
+        // window), and the caller reads it whole.
+        let held = self.held.which(digests);
+        self.between_steps().await;
         let found = self
             .touched(|s| {
                 let found: Vec<Option<Location>> = digests
                     .iter()
-                    .map(|d| match s.blob(d) {
+                    .zip(&held)
+                    .map(|(d, held)| match s.blob(d) {
+                        _ if *held => None,
                         BlobAnswer::Present { location, .. } => Some(location),
                         BlobAnswer::Unavailable | BlobAnswer::Absent => None,
                     })

@@ -1,6 +1,7 @@
 //! `cargo xtask` run as CI runs it: the real binary, with `xtask-fake` as cargo and as
 //! the built kbf-server, and throwaway git repositories for `budget-diff`.
 
+use kbf_testkit::dir::TestDir;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -10,15 +11,8 @@ const HEAD: &str = "c0ffee0123456789c0ffee0123456789c0ffee01";
 const BUILD: &str = "build --locked -p kbf-server --bin kbf-server";
 
 /// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("xtask")
-        .join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clear scratch");
-    }
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask"), name)
 }
 
 fn xtask(root: &Path, args: &[&str]) -> Command {
@@ -41,7 +35,7 @@ fn stamps(
     name: &str,
     defect: Option<&str>,
     commit: &str,
-) -> (Option<i32>, String, String, PathBuf) {
+) -> (Option<i32>, String, String, TestDir) {
     let root = scratch(name);
     let mut cmd = xtask(&root, &["build-commit", "stamps", commit]);
     cmd.env("CARGO", FAKE).env("XTASK_FAKE_HEAD", &HEAD[..12]);
@@ -220,19 +214,19 @@ fn stamps_reports_a_cargo_that_does_not_start() {
 }
 
 /// A `kbf-server` (the fake, hard-linked) whose `--version` names `stamp`.
-fn server(name: &str, stamp: &str) -> PathBuf {
+fn server(name: &str, stamp: &str) -> (PathBuf, TestDir) {
     let dir = scratch(name);
     let bin = dir.join("kbf-server");
     std::fs::hard_link(FAKE, &bin).expect("link");
     std::fs::write(dir.join("kbf-server.stamp"), stamp).expect("stamp");
-    bin
+    (bin, dir)
 }
 
 #[test]
 fn check_passes_the_commit_the_binary_names_and_fails_another() {
     // Catches: a check that does not compare the stamp with the commit given (the
     // control inside the check catches one that accepts anything).
-    let bin = server("check", &HEAD[..12]);
+    let (bin, _own) = server("check", &HEAD[..12]);
     let run = |commit: &str| {
         let out = xtask(Path::new("."), &["build-commit", "check"])
             .arg(&bin)
@@ -263,19 +257,19 @@ fn check_passes_the_commit_the_binary_names_and_fails_another() {
 
 /// A `kbf` (the fake, hard-linked) whose `--version` names `stamp` and whose
 /// `--version --json` prints `json`.
-fn kbf(name: &str, stamp: &str, json: &str) -> PathBuf {
+fn kbf(name: &str, stamp: &str, json: &str) -> (PathBuf, TestDir) {
     let dir = scratch(name);
     let bin = dir.join("kbf");
     std::fs::hard_link(FAKE, &bin).expect("link");
     std::fs::write(dir.join("kbf.stamp"), stamp).expect("stamp");
     std::fs::write(dir.join("kbf.json"), json).expect("json");
-    bin
+    (bin, dir)
 }
 
 /// The identity `kbf --version --json` prints, as a release build of `commit` makes it.
 fn identity(commit: &str, profile: &str) -> String {
     format!(
-        "{{\"commit\":\"{commit}\",\"min_protocol\":1,\"profile\":\"{profile}\",\"protocol\":1,\"state_schema\":1,\"version\":\"0.1.0\"}}\n"
+        "{{\"admin_protocol\":1,\"commit\":\"{commit}\",\"meta_log\":4,\"min_protocol\":1,\"profile\":\"{profile}\",\"protocol\":1,\"seq\":812,\"state_schema\":1,\"version\":\"0.1.0\"}}\n"
     )
 }
 
@@ -286,7 +280,7 @@ fn check_json_passes_a_release_build_of_the_commit_and_names_what_is_wrong() {
     // prints no object, ships; and a `--json` that accepts the control commit.
     let stamp = &HEAD[..12];
     let run = |name: &str, json: &str| {
-        let bin = kbf(name, stamp, json);
+        let (bin, _own) = kbf(name, stamp, json);
         outcome(
             xtask(Path::new("."), &["build-commit", "check", "--json"])
                 .arg(&bin)
@@ -339,7 +333,7 @@ fn check_json_reports_a_json_form_that_fails_or_is_not_an_object() {
     // Catches: a `--version --json` that exits non-zero passed over, or reported as the
     // plain form failing (the message names the form that failed); and valid JSON that
     // is not an object (an array, a bare string) read as an object with no fields.
-    let bin = kbf("json-fails", &HEAD[..12], &identity(&HEAD[..12], "release"));
+    let (bin, _own) = kbf("json-fails", &HEAD[..12], &identity(&HEAD[..12], "release"));
     let out = xtask(Path::new("."), &["build-commit", "check", "--json"])
         .arg(&bin)
         .arg(HEAD)
@@ -358,7 +352,7 @@ fn check_json_reports_a_json_form_that_fails_or_is_not_an_object() {
         )
     );
     for json in ["[1]\n", "\"release\"\n"] {
-        let bin = kbf("json-array", &HEAD[..12], json);
+        let (bin, _own) = kbf("json-array", &HEAD[..12], json);
         let out = xtask(Path::new("."), &["build-commit", "check", "--json"])
             .arg(&bin)
             .arg(HEAD)
@@ -383,7 +377,7 @@ fn check_without_json_does_not_run_the_json_form() {
     // Catches: the identity check made implicit for every binary, so the kbf-server and
     // kbf-daemon checks (which print no JSON) would fail: here a `kbf` whose JSON is
     // wrong still passes a plain check.
-    let bin = kbf("json-not-asked", &HEAD[..12], "garbage");
+    let (bin, _own) = kbf("json-not-asked", &HEAD[..12], "garbage");
     let out = xtask(Path::new("."), &["build-commit", "check"])
         .arg(&bin)
         .arg(HEAD)
@@ -447,12 +441,12 @@ fn the_darwin_verbs_fail_off_macos() {
 }
 
 /// A git repository whose one commit holds `budget` as the budget file.
-fn repo(name: &str, budget: &str) -> PathBuf {
+fn repo(name: &str, budget: &str) -> TestDir {
     let root = scratch(name);
     let git = |args: &[&str]| {
         let out = Command::new("git")
             .arg("-C")
-            .arg(&root)
+            .arg(&*root)
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -515,6 +509,72 @@ fn budget_diff_refuses_a_new_row_and_passes_a_removal() {
     assert_eq!(budget_diff(&root, "HEAD").0, Some(0));
 }
 
+/// `git <args>` in `root`, with the identity the commits need.
+fn git(root: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .output()
+        .expect("git");
+    assert!(out.status.success(), "git {args:?}: {}", text(&out.stderr));
+}
+
+/// A repository whose base commit holds `a.sh` (listed in the budget) and `b.sh`, and
+/// whose next commit moves `a.sh` to `moved/a.sh` (the file's bytes unchanged) and
+/// writes `budget` as the budget file.
+fn repo_with_rename(name: &str, budget: &str) -> TestDir {
+    let root = repo(name, "[files]\na.sh\tto port\n[workflow]\n[src-sh-c]\n");
+    let body = "one\ntwo\nthree\nfour\nfive\n";
+    std::fs::write(root.join("a.sh"), body).expect("a.sh");
+    git(&root, &["add", "a.sh"]);
+    git(&root, &["commit", "-q", "-m", "add a.sh"]);
+    std::fs::create_dir_all(root.join("moved")).expect("moved");
+    git(&root, &["mv", "a.sh", "moved/a.sh"]);
+    std::fs::write(root.join("tools/interpreter_budget.tsv"), budget).expect("budget");
+    git(&root, &["add", "tools"]);
+    git(&root, &["commit", "-q", "-m", "move a.sh"]);
+    root
+}
+
+#[test]
+fn budget_diff_follows_a_git_rename_and_refuses_growth_with_it() {
+    // Catches (kbf#1401): a pure `git mv` of a listed file refused as a new row; a rename
+    // that excuses a second row added with it, or any new path.
+    let moved = "[files]\nmoved/a.sh\tto port\n[workflow]\n[src-sh-c]\n";
+    let root = repo_with_rename("budget-rename", moved);
+    let (code, out, err) = budget_diff(&root, "HEAD~1");
+    assert_eq!(
+        (code, err.as_str()),
+        (Some(0), ""),
+        "a pure rename adds no row"
+    );
+    assert_eq!(
+        out,
+        "ok: tools/interpreter_budget.tsv adds no row to HEAD~1's\n"
+    );
+    let grown = "[files]\nmoved/a.sh\tto port\nnew.sh\tnew\n[workflow]\n[src-sh-c]\n";
+    let root = repo_with_rename("budget-rename-grows", grown);
+    let (code, _, err) = budget_diff(&root, "HEAD~1");
+    assert_eq!(code, Some(1));
+    assert!(err.contains("a new [files] row for `new.sh`"), "{err}");
+    assert!(!err.contains("moved/a.sh"), "{err}");
+    let unrelated = "[files]\nother/z.sh\tx\n[workflow]\n[src-sh-c]\n";
+    let root = repo_with_rename("budget-rename-other", unrelated);
+    let (code, _, err) = budget_diff(&root, "HEAD~1");
+    assert_eq!(code, Some(1));
+    assert!(err.contains("a new [files] row for `other/z.sh`"), "{err}");
+    let gone = "[files]\n[workflow]\n[src-sh-c]\n";
+    let root = repo_with_rename("budget-rename-gone", gone);
+    assert_eq!(budget_diff(&root, "HEAD~1").0, Some(0));
+}
+
 #[test]
 fn budget_diff_refuses_what_it_cannot_compare() {
     // Catches: an unknown base, a missing budget file, a malformed one, or git not
@@ -564,4 +624,31 @@ fn budget_diff_defaults_to_this_repository() {
         out,
         "ok: tools/interpreter_budget.tsv adds no row to HEAD's\n"
     );
+}
+
+#[test]
+fn proxy_loom_passes_when_cargo_passes_and_fails_when_it_fails() {
+    let root = scratch("proxy-loom");
+    // The fake cargo prints cargo's result line for five models; `true` prints nothing, which
+    // is a gate that ran no model.
+    let mut passing = xtask(&root, &["proxy-loom"]);
+    passing.env("CARGO", FAKE);
+    let (code, out, err) = outcome(passing.output().expect("run xtask"));
+    assert_eq!(code, Some(0), "stderr:\n{err}");
+    assert!(
+        out.contains("the kbf-proxy loom models passed (5 ran)"),
+        "{out}"
+    );
+
+    let mut silent = xtask(&root, &["proxy-loom"]);
+    silent.env("CARGO", "true");
+    let (code, _, err) = outcome(silent.output().expect("run xtask"));
+    assert_eq!(code, Some(1));
+    assert!(err.contains("ran 0 tests"), "{err}");
+
+    let mut failing = xtask(&root, &["proxy-loom"]);
+    failing.env("CARGO", "false");
+    let (code, _, err) = outcome(failing.output().expect("run xtask"));
+    assert_eq!(code, Some(1));
+    assert!(err.contains("the kbf-proxy loom models failed"), "{err}");
 }

@@ -62,7 +62,7 @@ pub(super) fn expected(endpoint: Endpoint) -> &'static [&'static str] {
         }
         Endpoint::WriteLeg => &["storage"],
         Endpoint::ActionGet => &["frontend"],
-        Endpoint::ActionPrepare | Endpoint::ActionCommit => &["frontend", "daemon"],
+        Endpoint::ActionPrepare | Endpoint::ActionCommit => &["frontend"],
         Endpoint::Segments => &["daemon"],
     }
 }
@@ -542,4 +542,74 @@ async fn the_role_is_read_from_the_leaf_certificate_alone() {
     );
     let answer = call(Endpoint::Segments, &daemon_leaf).await;
     assert!(!refused(&answer), "daemon leaf on Segments: {answer:?}");
+}
+
+/// Catches `Daemon` among the roles of `ActionStore.Prepare` and `ActionStore.Commit`.
+/// `Writer` is a field of the request body, so the certificate's role is what decides who
+/// may write the action cache. Over real mutual TLS, a daemon's `Prepare` and a complete
+/// `Commit` are refused PERMISSION_DENIED and the store holds no entry afterwards; a
+/// frontend's `Prepare` and the same `Commit` are accepted and leave the entry; a daemon
+/// still reads blobs.
+///
+/// Mutant seen red: `Daemon` re-added to the roles of `ActionPrepare` and `ActionCommit`
+/// in `Endpoint::allowed`.
+#[tokio::test]
+async fn a_daemon_certificate_is_not_admitted_to_action_commit() {
+    use kbf_proto::storage::Record;
+
+    let pki = Pki::new();
+    let mem = Arc::new(Mem::default());
+    let storage: Arc<dyn Storage> = Arc::clone(&mem) as Arc<dyn Storage>;
+    let config = Config {
+        write_bytes_in_flight: 1 << 20,
+    };
+    let service = StorageService::new(storage, Admission::Certified, config);
+    let addr = serve_routes(service.routes(), Some(pki.server())).await;
+    let action = sha(b"an action");
+    let prepare = || PrepareRequest {
+        map_generation: 0,
+        result: Some(ActionResult::default()),
+    };
+    let commit = || CommitRequest {
+        map_generation: 0,
+        action: Some(super::wire::to_proto(&action)),
+        record: Some(Record {
+            result: Some(super::wire::to_proto(&sha(b"a result"))),
+            closure: vec![],
+        }),
+        writer: Writer::Daemon as i32,
+    };
+
+    let daemon = pki.client(addr, "daemon").await;
+    let mut as_daemon = ActionStoreClient::new(daemon.clone());
+    let answer = as_daemon.prepare(prepare()).await.map(drop);
+    assert!(
+        matches!(&answer, Err(s) if s.code() == Code::PermissionDenied),
+        "daemon Prepare: {answer:?}"
+    );
+    let answer = as_daemon.commit(commit()).await.map(drop);
+    assert!(
+        matches!(&answer, Err(s) if s.code() == Code::PermissionDenied),
+        "daemon Commit: {answer:?}"
+    );
+    assert!(
+        mem.actions.lock().expect("lock").is_empty(),
+        "a daemon wrote an action-cache entry"
+    );
+    call(Endpoint::Read, &daemon)
+        .await
+        .map(drop)
+        .unwrap_or_else(|status| assert_ne!(status.code(), Code::PermissionDenied));
+
+    let mut as_frontend = ActionStoreClient::new(pki.client(addr, "frontend").await);
+    as_frontend
+        .prepare(prepare())
+        .await
+        .expect("a frontend prepares");
+    let answer = as_frontend
+        .commit(commit())
+        .await
+        .expect("a frontend commits");
+    assert!(answer.into_inner().refused.is_none());
+    assert!(mem.actions.lock().expect("lock").contains_key(&action));
 }

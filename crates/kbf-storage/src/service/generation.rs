@@ -4,7 +4,7 @@
 use kbf_map::MemberId;
 use tonic::{Request, Status};
 
-use super::{MAP_GENERATION_HEADER, UNOWNED_HEADER};
+use super::{DURABLE_HEADER, DURABLE_ONLY, DURABLE_WAIT, MAP_GENERATION_HEADER, UNOWNED_HEADER};
 use crate::replicate::LEG_HEADER;
 
 /// The generation `request` was routed by: the decimal in its `kbf-map-generation`
@@ -55,4 +55,33 @@ pub(super) fn leg<T>(request: &Request<T>) -> Result<Option<MemberId>, Status> {
         .and_then(|text| text.parse().ok())
         .map(|id| Some(MemberId(id)))
         .ok_or_else(|| Status::invalid_argument(format!("{LEG_HEADER} is not a member id")))
+}
+
+/// Which answer a `FindMissingBlobs` asks for ([`DURABLE_HEADER`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Durability {
+    /// No entry: a held blob is present.
+    Servable,
+    /// `only`: the index alone.
+    Only,
+    /// `wait`: the index alone, after the held blobs have been given time to be written.
+    Wait,
+}
+
+/// The answer `request` asks for ([`DURABLE_HEADER`]).
+///
+/// # Errors
+/// INVALID_ARGUMENT if the entry has any value but `only` or `wait`: a caller that asked a
+/// question this node does not know is not answered the plain one.
+pub(super) fn durability<T>(request: &Request<T>) -> Result<Durability, Status> {
+    let Some(value) = request.metadata().get(DURABLE_HEADER) else {
+        return Ok(Durability::Servable);
+    };
+    match value.to_str() {
+        Ok(DURABLE_ONLY) => Ok(Durability::Only),
+        Ok(DURABLE_WAIT) => Ok(Durability::Wait),
+        _ => Err(Status::invalid_argument(format!(
+            "{DURABLE_HEADER} must be {DURABLE_ONLY} or {DURABLE_WAIT}"
+        ))),
+    }
 }

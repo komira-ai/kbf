@@ -13,7 +13,7 @@ use kbf_front::{Cache, CacheStorage, MemoryMetaLog, SegmentsConfig};
 use kbf_meta::ServerId;
 use kbf_objstore::MemoryStore;
 use kbf_segments::RecordHasher;
-use kbf_storage::{PutStream, Storage, StorageError};
+use kbf_storage::{CommitMode, PutStream, Storage, StorageError};
 use kbf_store::StdFs;
 use kbf_tier::TierOptions;
 use kbf_types::Digest;
@@ -117,7 +117,7 @@ async fn stream_as(
         .await
         .expect("finish");
     match finished {
-        Ok(streamed) => Ok(streamed.commit().await),
+        Ok(streamed) => Ok(streamed.commit(CommitMode::Durable).await),
         Err(e) => Err(e),
     }
 }

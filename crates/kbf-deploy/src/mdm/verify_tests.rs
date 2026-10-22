@@ -505,14 +505,12 @@ fn a_late_certificate_and_an_unreachable_proxy_fail() {
         failed(&exec, &server, late),
         ["the certificate is valid for 21 more days"]
     );
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let gone = TlsServer {
-        addr: closed.local_addr().expect("addr"),
+        addr: kbf_testkit::port::dead_addr(),
         ca: server.ca.clone(),
         paths: std::sync::Arc::default(),
         heads: std::sync::Arc::default(),
     };
-    drop(closed);
     let got = failed(&exec, &gone, december());
     assert_eq!(got.len(), 5, "{got:#?}");
     assert!(got.iter().all(|n| n.contains("https://")), "{got:#?}");

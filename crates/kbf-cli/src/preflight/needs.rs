@@ -1,26 +1,39 @@
 //! What each mode asks of its host, read from its parsed flags: which files it reads,
 //! which certificate is whose, which store needs which credential.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use kbf_server::Args;
+use kbf_server::proxy_auth::SECRET_BYTES;
 use kbf_server::stores::StoreUri;
 
-use super::{CertNeed, ContainerNeed, FileNeed, Needs, Row};
+use super::{CertNeed, ContainerNeed, FileNeed, KeyRule, Needs, Row, key_file};
 use crate::Invocation;
 
 /// The needs of `invocation`.
 #[must_use]
 pub fn needs(invocation: &Invocation) -> Needs {
+    needs_in(invocation, Path::new(crate::config::DEFAULT_PATH))
+}
+
+/// The needs of `invocation` started with the settings file `config`: the legacy key file
+/// is the `s3.env` in its directory.
+#[must_use]
+pub fn needs_in(invocation: &Invocation, config: &Path) -> Needs {
     match invocation {
+        // The flags of a start that enrolls are made after it has: the start checks them
+        // then (`node::run`).
+        Invocation::Registered(start) => Needs::new(start.mode.unwrap_or("kbf")),
         Invocation::Daemon(cli) => {
             let mut n = Needs::new("daemon");
             daemon(&mut n, cli);
+            n.key = KeyRule::Absent;
             n
         }
         Invocation::Storage(flags) => {
             let mut n = Needs::new("storage");
             storage(&mut n, flags);
+            n.key = KeyRule::Holder(key_file(config));
             n
         }
         Invocation::Frontend(flags) => {
@@ -43,13 +56,19 @@ pub fn needs(invocation: &Invocation) -> Needs {
             let mut n = Needs::new("storage-and-daemon");
             storage(&mut n, &flags.storage);
             daemon(&mut n, &flags.daemon);
+            n.key = KeyRule::RootAlone(key_file(config));
             n
         }
         Invocation::AllInOne(flags) => {
             let mut n = Needs::new("all-in-one");
             server_files(&mut n, &flags.server);
             n.s3 = s3(&flags.server);
+            n.hot_store = hot_dir(&flags.server);
             daemon(&mut n, &flags.daemon);
+            // An all-in-one with an S3 cold store holds the key on purpose.
+            if !n.s3 {
+                n.key = KeyRule::Absent;
+            }
             n
         }
     }
@@ -63,6 +82,9 @@ impl Needs {
             certs: Vec::new(),
             s3: false,
             container: None,
+            hot_store: None,
+            cpuset: false,
+            key: KeyRule::None,
         }
     }
 
@@ -71,6 +93,7 @@ impl Needs {
             flag,
             path: path.to_owned(),
             secret: false,
+            exact_len: None,
         });
     }
 
@@ -79,6 +102,17 @@ impl Needs {
             flag,
             path: path.to_owned(),
             secret: true,
+            exact_len: None,
+        });
+    }
+
+    /// A secret file that must hold exactly `len` bytes.
+    fn secret_of_len(&mut self, flag: &'static str, path: &Path, len: usize) {
+        self.files.push(FileNeed {
+            flag,
+            path: path.to_owned(),
+            secret: true,
+            exact_len: Some(len),
         });
     }
 
@@ -110,7 +144,7 @@ fn s3(args: &Args) -> bool {
 }
 
 /// The files the frontend half of `kbf-server` reads: the REAPI listener's pair, the auth
-/// policy, the operator API's token, the worker listener's certificate, key, client CA
+/// policy, the operator API's token, the proxy's secret, the worker listener's certificate, key, client CA
 /// and deny list.
 fn server_files(n: &mut Needs, a: &Args) {
     if let Some(cert) = &a.reapi_tls_cert {
@@ -125,6 +159,9 @@ fn server_files(n: &mut Needs, a: &Args) {
     }
     if let Some(token) = &a.api_token_file {
         n.secret("--api-token-file", token);
+    }
+    if let Some(secret) = &a.proxy_auth_file {
+        n.secret_of_len("--proxy-auth-file", secret, SECRET_BYTES);
     }
     if let Some(cert) = &a.worker_tls_cert {
         let ca = a.worker_client_ca.as_deref();
@@ -149,8 +186,21 @@ fn server_files(n: &mut Needs, a: &Args) {
     }
 }
 
+/// The directory of a `file://` hot store: the one directory whose ancestors the process
+/// must be able to enter.
+fn hot_dir(args: &Args) -> Option<PathBuf> {
+    match &args.hot_store {
+        Some(StoreUri::File(dir)) => Some(dir.clone()),
+        _ => None,
+    }
+}
+
 fn storage(n: &mut Needs, flags: &kbf_server::storage_node::StorageFlags) {
-    n.s3 = s3(&flags.server);
+    n.hot_store = hot_dir(&flags.server);
+    // A node that registers with a frontend may be given the key pair by it
+    // (`kbf_server::cold_apply`); the start says which variable is missing if the
+    // frontend has no store registered either.
+    n.s3 = s3(&flags.server) && flags.frontend.is_none();
     if let Some([cert, key, ca]) = &flags.tls {
         n.cert(
             ("--storage-tls-cert", cert),
@@ -178,4 +228,6 @@ fn daemon(n: &mut Needs, cli: &kbf_node::Cli) {
     n.container = d.container.map(|c| ContainerNeed {
         oci_runtime: c.oci_runtime,
     });
+    // Leases are placed on the node's CPUs and NUMA nodes by the container driver.
+    n.cpuset = n.container.is_some();
 }

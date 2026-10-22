@@ -27,7 +27,7 @@
 //!   `time_server`, `time_max_offset_ms` (Remote Login needs Full Disk Access; the clock
 //!   and the runner's own login are left alone).
 //!
-//! No kbf-daemon is built for these tests: they assert that the job is loaded, never
+//! No kbf is built for these tests: they assert that the job is loaded, never
 //! that the daemon runs. When nothing is installed at the daemon's path, a copy of
 //! `/usr/bin/true` stands there, so `launchctl bootstrap` has a program to start.
 //!
@@ -60,7 +60,7 @@ const SCRATCH: &str = "/private/tmp/kbf-mac-provision-as-root";
 const LABEL: &str = "org.example.kbf-daemon";
 const LOG_DIR: &str = "/Library/Logs/kbf";
 const ERR_LOG: &str = "/Library/Logs/kbf/kbf-daemon.err.log";
-const DAEMON_BIN: &str = "/usr/local/kbf/current/kbf";
+const DAEMON_BIN: &str = "/usr/local/kbf-installer/releases/current/kbf";
 const SOFTWARE_UPDATE: &str = "/Library/Preferences/com.apple.SoftwareUpdate";
 /// The items applied and asserted: none can break the job running the tests.
 const SAFE: &str = "hostname,role_user,updates_auto_download,updates_auto_install_macos,\
@@ -339,16 +339,19 @@ fn owner_mode_links(path: &str) -> (u32, u32, u32, u64) {
     (m.uid(), m.gid(), m.mode() & 0o7777, m.nlink())
 }
 
-/// Catches: `print` failing on a real profile, or a node label not made from the
-/// profile's name.
+/// Catches: `print` failing on a real profile, showing a node label (there is none), or
+/// not ending in the profile's SHA-256.
 #[test]
 #[ignore = "needs root: run by `cargo xtask sudo-test -p kbf-mac-provision --test as_root`"]
-fn print_names_the_node_label() {
+fn print_ends_in_the_profile_sha256_and_shows_no_node_label() {
     let (_serial, host) = host();
     let r = prov(&["print", "--profile", host.profile.as_str()]);
     assert_eq!(r.status, Some(0), "{}", r.stderr);
+    assert!(!r.stdout.contains("node_label"), "{}", r.stdout);
+    let last = r.stdout.lines().last().unwrap_or_default();
     assert!(
-        r.stdout.contains("node_label=profile=mac-arm64-pool@"),
+        last.strip_prefix("profile_sha256=")
+            .is_some_and(|sha| sha.len() == 64),
         "{}",
         r.stdout
     );

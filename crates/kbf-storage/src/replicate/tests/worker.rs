@@ -642,6 +642,11 @@ impl Storage for CommitsAfterTheRead {
         self.inner.find_missing(digests)
     }
 
+    /// Forwards: the inner storage decides what is durable.
+    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        self.inner.find_durable(digests)
+    }
+
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> Answer<'a, Bytes> {
         self.inner.read_blob(digest)
     }
@@ -845,7 +850,7 @@ async fn a_write_whose_commit_fails_leaves_no_debt() {
 }
 
 /// Catches a pass that waits for ever on an owner that is up and does not answer: the
-/// owner's `FindMissing` hangs, so the pass ends at the probe bound with the debt owed, and
+/// owner's durable `FindMissing` hangs, so the pass ends at the probe bound with the debt owed, and
 /// a pass over the owner answering again settles it. (A hang deadline, not a speed.)
 /// Mutant: the question asked without the bound.
 #[tokio::test]
@@ -875,7 +880,7 @@ async fn an_owner_that_does_not_answer_is_waited_for_not_hung_on() {
             waiting: 1
         }
     );
-    assert!(farm.nodes[1].mem.knobs.asked.load(Ordering::SeqCst) >= 1);
+    assert!(farm.nodes[1].mem.durable_asked.load(Ordering::SeqCst) >= 1);
     assert_eq!(owed_digests(&farm, 0), [digest]);
     farm.nodes[1]
         .mem
@@ -893,8 +898,8 @@ async fn an_owner_that_does_not_answer_is_waited_for_not_hung_on() {
     assert!(held(&farm, 1, &digest));
 }
 
-/// Catches a worker that cannot be stopped while a pass is stuck: the owner's `FindMissing`
-/// hangs and the probe bound is an hour, so only the stop can end `run`, and it does.
+/// Catches a worker that cannot be stopped while a pass is stuck: the owner's durable
+/// `FindMissing` hangs and the probe bound is an hour, so only the stop can end `run`, and it does.
 /// Mutant: `stop` polled only between passes.
 #[tokio::test]
 async fn run_stops_in_the_middle_of_a_stuck_pass() {
@@ -927,7 +932,7 @@ async fn run_stops_in_the_middle_of_a_stuck_pass() {
         }
     });
     within(async {
-        while farm.nodes[1].mem.knobs.asked.load(Ordering::SeqCst) == 0 {
+        while farm.nodes[1].mem.durable_asked.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -935,4 +940,95 @@ async fn run_stops_in_the_middle_of_a_stuck_pass() {
     let _ = stop.send(());
     within(running).await.expect("run returns");
     assert_eq!(owed_digests(&farm, 0), [digest]);
+}
+
+/// Puts `bytes` on node `node` of the farm in RAM only, as a blob acknowledged from RAM
+/// is until its write: present to `find_missing` and missing to `find_durable`.
+fn hold_in_ram(farm: &Farm, node: usize, digest: Digest, bytes: Vec<u8>) {
+    farm.nodes[node]
+        .mem
+        .blobs
+        .lock()
+        .expect("lock")
+        .insert(digest, Bytes::from(bytes));
+    farm.nodes[node]
+        .mem
+        .ram_only
+        .lock()
+        .expect("lock")
+        .insert(digest);
+}
+
+fn in_ram_only(farm: &Farm, node: usize, digest: &Digest) -> bool {
+    farm.nodes[node]
+        .mem
+        .ram_only
+        .lock()
+        .expect("lock")
+        .contains(digest)
+}
+
+/// Catches a debt settled against a peer that holds the blob only in RAM (T12): the peer
+/// has it in RAM and not on its disk, so the worker's probe (`kbf-durable: only`) says it
+/// is missing, the copy is sent, the peer (a copy asks for a durable one) writes it, and
+/// only then is the debt settled, the blob now on the peer's disk. Mutants: the worker's
+/// probe asks the plain question (no copy is sent, the debt is settled on a RAM copy and
+/// the blob is still RAM-only); the peer answers a copy of a blob it holds in RAM "already
+/// held" (the same).
+#[tokio::test]
+async fn a_peer_holding_the_blob_only_in_ram_is_given_the_copy_before_the_debt_is_settled() {
+    let farm = Farm::start(2, ChainConfig::default()).await;
+    let (bytes, digest) = owed_blob(&farm, 4096, 31).await;
+    farm.nodes[1].switch.restore();
+    hold_in_ram(&farm, 1, digest, bytes);
+
+    assert_eq!(
+        worker(&farm, 0).pass().await,
+        Pass {
+            settled: 1,
+            waiting: 0
+        }
+    );
+    assert!(owed_digests(&farm, 0).is_empty());
+    assert!(
+        !in_ram_only(&farm, 1, &digest),
+        "the peer wrote the blob to its disk before the debt was settled"
+    );
+    assert!(farm.nodes[1].mem.durable_asked.load(Ordering::SeqCst) >= 1);
+    assert_eq!(farm.nodes[1].mem.knobs.begun.load(Ordering::SeqCst), 1);
+}
+
+/// Catches a debt settled on the peer's RAM copy when the copy it was sent cannot be
+/// written: the peer holds the blob in RAM only and its disk refuses the write, so the
+/// pass leaves the debt owed (the peer is still not durable); with the disk back the next
+/// pass settles it and the blob is on the peer's disk. Mutant: the probe asks the plain
+/// question (the RAM copy counts: the debt is settled with nothing written).
+#[tokio::test]
+async fn a_debt_stays_while_the_peer_that_holds_the_blob_in_ram_cannot_write_it() {
+    let farm = Farm::start(2, ChainConfig::default()).await;
+    let (bytes, digest) = owed_blob(&farm, 4096, 32).await;
+    farm.nodes[1].switch.restore();
+    hold_in_ram(&farm, 1, digest, bytes);
+    *farm.nodes[1].mem.knobs.fault.lock().expect("lock") = StreamFault::CommitFails;
+    let repairs = worker(&farm, 0);
+
+    assert_eq!(
+        repairs.pass().await,
+        Pass {
+            settled: 0,
+            waiting: 1
+        }
+    );
+    assert_eq!(owed_digests(&farm, 0), [digest]);
+    assert!(in_ram_only(&farm, 1, &digest));
+
+    *farm.nodes[1].mem.knobs.fault.lock().expect("lock") = StreamFault::None;
+    assert_eq!(
+        repairs.pass().await,
+        Pass {
+            settled: 1,
+            waiting: 0
+        }
+    );
+    assert!(!in_ram_only(&farm, 1, &digest));
 }

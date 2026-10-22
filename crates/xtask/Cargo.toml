@@ -30,6 +30,16 @@ base64.workspace = true
 clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
+# The result document the Beta record in a release tag is, and the one definition of a set hash.
+kbf-gate.workspace = true
+# `release version-facts` runs `kbf --version --json` as the installer runs a staged binary
+# and reads what it prints with the installer's own parser: one definition of the fields,
+# the cap and the strictness (`binary::Version`), and of running a program with an empty
+# environment and a time limit (`run::SystemRunner`).
+kbf-installer.workspace = true
+# The platforms a release is built for and the tarballs a host of each needs
+# (`release stage-offer`): the one list the installer's bundle reader is checked against.
+kbf-types.workspace = true
 lzma-rs.workspace = true
 ruzstd.workspace = true
 # The runner user's uid and gid, and `uname -m`, for `crun-tests`.
@@ -45,7 +55,14 @@ ureq.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+# The Mac layout's paths, for `tests/pkg_macos.rs`: the gate is where `setup` writes
+# (`kbf_installer::layout`, a dependency above).
+kbf-host.workspace = true
+# A scratch directory a test owns and removes (the unit tests).
+kbf-testkit.workspace = true
 rcgen.workspace = true
+# The caller's umask, for the install.sh test.
+rustix = { workspace = true, features = ["fs", "process", "system"] }
 
 [lints]
 workspace = true

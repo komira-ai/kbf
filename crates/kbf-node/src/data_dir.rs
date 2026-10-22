@@ -36,8 +36,9 @@ const DATA_MODE: u32 = 0o755;
 /// The mode of `leases` and `cache`: the daemon's alone.
 const PRIVATE_MODE: u32 = 0o700;
 
-/// The mode of `leases` under the OCI backend: its container ids are "others" to the
-/// daemon and must search down to the lease directories.
+/// The mode of `leases` under the OCI backend and for a native pool
+/// (`kbf_driver_native::slots::LEASES_ROOT_MODE`): the container ids and the slot users
+/// are "others" to the daemon and must search down to the lease directories.
 const OPEN_MODE: u32 = 0o711;
 
 /// The cache's share of what [`Budgets`] sizes from, in percent; the trees' is a
@@ -68,7 +69,7 @@ pub(crate) struct DataArgs {
     #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..))]
     pub data_max_bytes: Option<u64>,
     /// The node's one cache, when the process runs local storage on the same disk
-    /// (`kbf-all-in-one`, [`crate::Cli::share_cache`]); no flag sets it.
+    /// (`kbf all-in-one`, [`crate::Cli::share_cache`]); no flag sets it.
     #[arg(skip)]
     pub local_cache: Option<std::sync::Arc<kbf_daemon::cache::LocalCache>>,
 }
@@ -76,7 +77,7 @@ pub(crate) struct DataArgs {
 impl crate::Cli {
     /// Makes the input cache the node's one cache with local storage, `local`: for a
     /// binary that runs local storage on the same disk in its own process
-    /// (`kbf-all-in-one`; see `kbf_storage::local_cache`).
+    /// (`kbf all-in-one`; see `kbf_storage::local_cache`).
     pub fn share_cache(&mut self, local: std::sync::Arc<kbf_daemon::cache::LocalCache>) {
         self.data.local_cache = Some(local);
     }
@@ -140,7 +141,8 @@ pub(crate) struct Plan {
     pub cached: bool,
     /// The budgets; `None` for a filesystem too small for a cache.
     pub budgets: Option<Budgets>,
-    /// Whether `leases` is searchable by others (the OCI backend).
+    /// Whether `leases` is searchable by others (the OCI backend, or a native pool's
+    /// slot users).
     pub open_leases: bool,
 }
 
@@ -194,7 +196,7 @@ impl Plan {
     }
 
     /// Whether `leases` must be searchable by others: the OCI backend's container ids
-    /// are not the daemon user's.
+    /// and a native pool's slot users are not the daemon user's.
     #[must_use]
     pub(crate) fn with_open_leases(mut self, open: bool) -> Self {
         self.open_leases = open;
@@ -216,10 +218,11 @@ impl Plan {
         self.dir.join("trees")
     }
 
-    /// Makes the data directory (0755) and `leases` (0700; 0711 with the OCI backend), and
+    /// Makes the data directory (0755) and `leases` (0700; 0711 with the OCI backend or a
+    /// native pool), and
     /// `cache` (0700) for a driver that uses it. `trees` is made by its store, with its
     /// own mode. A directory that exists keeps its mode, except that an existing `leases`
-    /// closed to others is opened (0711) under the OCI backend, logged once.
+    /// closed to others is opened (0711) under the OCI backend or a pool, logged once.
     ///
     /// # Errors
     /// A directory cannot be made.
@@ -291,7 +294,7 @@ fn open(dir: &Path) -> Result<(), DataDirError> {
         let now = std::fs::Permissions::from_mode(mode | 0o011);
         std::fs::set_permissions(dir, now).map_err(made(dir))?;
         let said = format!(
-            "data dir: {} was {mode:o}, now {:o}: the OCI backend's container ids must search it",
+            "data dir: {} was {mode:o}, now {:o}: the OCI backend's container ids or the pool's slot users must search it",
             dir.display(),
             mode | 0o011
         );

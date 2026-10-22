@@ -17,7 +17,7 @@ After=network-online.target
 ConditionPathExists=/etc/kbf/kbf.toml
 
 # A failure that repeats quickly (the cold store or a disk not ready) must not use up
-# systemd's start limit of 5 starts in 10 s and leave the unit down (check-units rule
+# systemd's start limit of 5 starts in 10 s and leave the unit down (package-test rule
 # `restart`).
 StartLimitIntervalSec=0
 
@@ -30,7 +30,7 @@ StateDirectory=kbf
 StateDirectoryMode=0750
 # The daemon manages its own cgroup: supervisor/ for itself, actions/ for builds.
 # Delegate=yes delegates cpuset with cpu, memory and pids: --lease-placement=numa-node
-# pins each lease to one NUMA node with it (check-units rule `delegate`).
+# pins each lease to one NUMA node with it (package-test rule `delegate`).
 Delegate=yes
 # Build containers get 0 back from the driver.
 OOMScoreAdjust=-900
@@ -44,11 +44,13 @@ ExecStartPre=+/usr/bin/kbf-installer boot-check
 # and exits 2 for those. Anything that can become ready later (a listen address, a peer,
 # a DNS name, a mount) is not refused here: it exits 75 (not ready, restarted), so a check
 # that runs before the bind retry never leaves the unit down for good (kbf#998, #1000).
-ExecStartPre=/var/lib/kbf-installer/current/kbf --mode=daemon --check
-ExecStart=/var/lib/kbf-installer/current/kbf --mode=daemon
-# A daemon does not drain on SIGTERM (its leases are abandoned; the operator API empties a
-# node before it is stopped), so it keeps systemd's stop timeout: an infinite one would
-# only hold a reboot on a daemon that hangs.
+ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=daemon --check
+ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=daemon
+# The daemon drains on SIGTERM for up to --drain-deadline-secs (600 by default), then
+# stops. The stop timeout is that plus 60 s, so systemd never SIGKILLs a drain; it stays
+# finite, so a hung daemon still lets a reboot through (package-test rule `stop`).
+TimeoutStopSec=660
+KillSignal=SIGTERM
 Restart=on-failure
 RestartSec=5
 # Exit 2 is a command line kbf refused (or a config or an image it cannot parse): a

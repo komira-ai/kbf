@@ -65,11 +65,11 @@ impl Rig {
             .is_some()
     }
 
-    /// FindMissing calls `member` has been sent, each as its number of digests.
+    /// Durable FindMissing calls `member` has been sent, each as its number of digests.
     fn finds(&self, member: u64) -> Vec<usize> {
         self.cluster
             .node(member)
-            .find_log()
+            .durable_log()
             .iter()
             .map(Vec::len)
             .collect()
@@ -180,7 +180,7 @@ async fn a_long_closure_is_asked_in_batches_the_node_takes() {
             .expect("an answer")
             .is_some()
     );
-    let sizes: Vec<usize> = cluster.node(1).find_log().iter().map(Vec::len).collect();
+    let sizes: Vec<usize> = cluster.node(1).durable_log().iter().map(Vec::len).collect();
     assert_eq!(sizes, [MAX_FIND_MISSING_DIGESTS, 1]);
 }
 
@@ -587,4 +587,49 @@ async fn a_lower_generation_with_a_higher_boot_neither_reads_nor_adds() {
         [2, 2, 2],
         "generation 2 boot 1 is still cached"
     );
+}
+
+/// Catches a closure check that asks the plain question (rule 2, T11): the entry names one
+/// blob held on disk by both owners and one that its primary holds only in RAM. The check
+/// is a miss (the action runs again; never a hit on a blob a restart loses), the check
+/// asked `find_durable` and never `find_missing`, and the RAM-only blob is not remembered:
+/// asked again, the primary is asked about it again, while the disk blob is cached. Once
+/// the blob is written the entry is a hit, and then the blob is remembered. Mutant:
+/// `closure_held` asks `find_missing` (the RAM-only blob counts, and the entry is a hit).
+#[tokio::test]
+async fn a_closure_blob_held_only_in_ram_is_a_miss_and_is_not_remembered() {
+    let rig = rig();
+    let blobs = rig.blobs(2);
+    let (disk, ram) = (blobs[0], blobs[1]);
+    for node in [1, 2] {
+        hold(&rig.cluster.node(node), &[disk]);
+    }
+    hold(&rig.cluster.node(1), &[ram]);
+    rig.cluster.node(1).make_ram_only(&ram);
+    let action = rig.action(0, &blobs);
+
+    assert!(
+        !rig.hit(&action).await,
+        "a blob held only in RAM is not there"
+    );
+    assert!(
+        rig.cluster.node(1).find_log().is_empty(),
+        "the plain question is never asked"
+    );
+    // The replica does not hold it either, so the check went down the owners: the primary
+    // asked about both blobs, the replica about the one the primary lacked.
+    assert_eq!(rig.finds(1), [2]);
+    assert_eq!(rig.finds(2), [1]);
+
+    assert!(!rig.hit(&action).await, "still a miss");
+    assert_eq!(
+        rig.finds(1),
+        [2, 1],
+        "the disk blob is cached; the RAM-only one is asked about again"
+    );
+
+    rig.cluster.node(1).make_durable(&ram);
+    assert!(rig.hit(&action).await, "written: a hit");
+    assert!(rig.hit(&action).await, "and now remembered");
+    assert_eq!(rig.finds(1), [2, 1, 1], "asked once more, then cached");
 }

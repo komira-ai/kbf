@@ -5,6 +5,8 @@
 mod common;
 #[path = "execution/platform.rs"]
 mod platform_tests;
+#[path = "execution/refuse_platform.rs"]
+mod refuse_platform_tests;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -409,7 +411,7 @@ async fn closing_ends_open_streams_unavailable() {
     assert_eq!(gone.code(), Code::Unavailable, "{gone:?}");
 }
 
-/// Catches (komira-build-farm#791): a drain that ends open streams (Buck2 does not
+/// Catches (kbf#791): a drain that ends open streams (Buck2 does not
 /// recover a broken Execute stream, so every action in flight would fail) instead of
 /// leaving them open until their action is done; a drain that lets a new Execute in;
 /// and a drain that refuses a WaitExecution on an operation still running. The
@@ -498,7 +500,7 @@ impl Dispatch for Gated {
 /// Catches an Execute that passed the drain check and is then refused, or ended, by a
 /// drain that began while its `submit` was running: the call was taken before the
 /// drain, so its stream is kept until its action is done, like every stream open at the
-/// drain (komira-build-farm#791: Buck2 does not recover a stream that breaks). The
+/// drain (kbf#791: Buck2 does not recover a stream that breaks). The
 /// drain begins, and the next Execute is refused, while the first is inside `submit`.
 /// Mutant: a second `closing.draining()` check after `submit` (returning UNAVAILABLE)
 /// fails the first `expect` below. `Dispatch::submit` is synchronous, so the test needs
@@ -731,6 +733,20 @@ async fn execute_is_measured_phase_by_phase() {
     }
 }
 
+/// Turns warn logging on for the process, discarding it: the refusal line of an Execute
+/// builds its arguments only when a subscriber wants it, and the coverage of this binary's
+/// copy of `submission` must run them.
+fn warnings_enabled() {
+    static ON: std::sync::Once = std::sync::Once::new();
+    ON.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(std::io::sink)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("the only subscriber");
+    });
+}
+
 /// Catches: an Execute that fails before the scheduler (an input missing, so
 /// FAILED_PRECONDITION; the scheduler refusing, so UNAVAILABLE) not counted as an error,
 /// one observed as reaching the scheduler when it did not, `in_flight` left raised by
@@ -738,6 +754,7 @@ async fn execute_is_measured_phase_by_phase() {
 /// error with its gauges lowered.
 #[tokio::test]
 async fn failed_and_abandoned_executes_count_as_errors() {
+    warnings_enabled();
     let script = Arc::new(Script::default());
     let farm = Farm::with_execution(Arc::clone(&script)).await;
     let metrics = &farm.cache.metrics().execute;

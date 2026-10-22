@@ -39,7 +39,8 @@
 //! controller ([`ControllerError::EpochBehind`]): see [`Controller::new`].
 //!
 //! **A run's commit stays with its hosts.** A host is stepped toward the commit of the run
-//! that started it ([`HostRow::commit`]). When a higher generation is offered (a rollback), a
+//! that started it ([`HostRow::commit`]), from the source that run named
+//! ([`HostRow::source`]). When a higher generation is offered (a rollback), a
 //! host that has done nothing irreversible (`Selected` to `Gated`) is given back, so the
 //! release being rolled back is not activated on it ([`super::GiveBack::Superseded`]); a host
 //! past the activate order finishes the step it began. The new generation is carried out by
@@ -194,6 +195,16 @@ impl Controller {
     /// [`ControllerError`]: a row or the farm could not be read, a row cannot be written, or
     /// the policy cannot be kept. Moves written before the error stand.
     pub fn tick(&mut self, now: FarmTime) -> Result<Tick, ControllerError> {
+        self.tick_gated(now, true)
+    }
+
+    /// [`Controller::tick`] that starts no host unless `may_start`: hosts already in a step
+    /// are moved as always. The caller's switch for a farm that does not roll by itself
+    /// (`update/policy.auto_nodes`, which the controller does not read).
+    ///
+    /// # Errors
+    /// As [`Controller::tick`].
+    pub fn tick_gated(&mut self, now: FarmTime, may_start: bool) -> Result<Tick, ControllerError> {
         let Some(mut pass) = self.read(now)? else {
             return Ok(Tick::default());
         };
@@ -225,7 +236,7 @@ impl Controller {
                 return Ok(pass.report);
             }
         }
-        if !pass.policy.paused && pass.report.missing.is_empty() {
+        if may_start && !pass.policy.paused && pass.report.missing.is_empty() {
             self.start(&mut pass)?;
         }
         Ok(pass.report)
@@ -275,6 +286,7 @@ impl Controller {
         }
         let facts = Facts {
             target: desired.commit.clone(),
+            source: desired.source,
             generation: desired.generation,
             // Drawn from the store when a move needs one ([`Controller::advance`]).
             next_order: OrderId::new(self.epoch, u64::MAX),
@@ -393,6 +405,7 @@ impl Controller {
         let stored = pass.rows[id].clone();
         let mut facts = pass.facts.clone();
         facts.target = stored.value.commit.clone();
+        facts.source = stored.value.source;
         let mut moved = decide(&facts, host, &pass.policy, pass.now);
         if moved.order.is_some() {
             // The step asked for an order id: draw one, and ask again with it. The step is
@@ -473,6 +486,10 @@ impl Controller {
         commands: &[Command],
         row: &HostRow,
     ) -> Result<bool, ControllerError> {
+        // The activate order says where the release comes from by the run that started the
+        // host, as the steps read it: not by `update/desired`, which a later offer may have
+        // changed under a host that is already in its step.
+        let source = row.source;
         for command in commands {
             let given = match command {
                 Command::CasSlot(SlotOp::Claim) => self.claim(pass, id).map(|()| Ok(()))?,
@@ -490,7 +507,9 @@ impl Controller {
                     Some(member) => self.transport.undown(id, member),
                     None => Err(no_member(id)),
                 },
-                Command::Activate { order } => self.transport.activate(id, *order, &row.commit),
+                Command::Activate { order } => {
+                    self.transport.activate(id, *order, &row.commit, source)
+                }
                 Command::Confirm { order } => self.transport.confirm(id, *order, &row.commit),
                 Command::Alert(alert) => self.tell(id, alert),
             };

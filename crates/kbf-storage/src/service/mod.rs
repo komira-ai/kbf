@@ -56,6 +56,7 @@ mod catch_up;
 mod client;
 mod generation;
 mod in_process;
+mod open_writes;
 mod segments;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -80,9 +81,26 @@ pub use catch_up::CatchUp;
 pub use client::RemoteStorage;
 pub(crate) use client::lift;
 pub use in_process::InProcess;
+pub use open_writes::{OpenWrite, OpenWrites};
 
 /// The metadata entry that carries the map generation on the standard calls.
 pub const MAP_GENERATION_HEADER: &str = "kbf-map-generation";
+
+/// The metadata entry on `FindMissingBlobs` that asks a durable question: `only` answers
+/// from the index alone, so a blob held in RAM and not yet written to disk is missing
+/// ([`crate::Storage::find_durable`]); `wait` first waits for the held ones to be written
+/// ([`crate::Storage::find_durable_waiting`]). Without it a held blob is present, as it can
+/// be served. Any other value is INVALID_ARGUMENT.
+pub const DURABLE_HEADER: &str = "kbf-durable";
+
+/// The value of [`DURABLE_HEADER`] that asks for the index alone.
+pub const DURABLE_ONLY: &str = "only";
+
+/// The value of [`DURABLE_HEADER`] that asks for the index alone after the node has waited,
+/// for at most its `--durable-wait`, for the held blobs among the digests to be written
+/// ([`crate::Storage::find_durable_waiting`]): the question a caller asks before it writes
+/// something durable that names a blob, and can wait for the write-behind to catch up.
+pub const DURABLE_WAIT: &str = "wait";
 
 /// The metadata entry that marks a `Write` as a copy the caller needs on this node
 /// although the map does not place the blob here ([`crate::Storage::put_unowned`]).
@@ -124,6 +142,7 @@ pub struct StorageService {
     chain: Option<Arc<Chain>>,
     map: Option<Arc<dyn MapSource>>,
     catch_up: Option<CatchUp>,
+    open_writes: OpenWrites,
     refetch_wait: Duration,
     write_room: Semaphore,
     write_room_bytes: u32,
@@ -140,6 +159,7 @@ impl StorageService {
             chain: None,
             map: None,
             catch_up: None,
+            open_writes: OpenWrites::new(),
             refetch_wait: replicate::REFETCH_WAIT,
             write_room: Semaphore::new(config.write_bytes_in_flight as usize),
             write_room_bytes: config.write_bytes_in_flight,
@@ -178,6 +198,16 @@ impl StorageService {
     #[must_use]
     pub fn with_catch_up(mut self, catch_up: CatchUp) -> Self {
         self.catch_up = Some(catch_up);
+        self
+    }
+
+    /// The service counting the writes it has open in `open_writes`, which the node's
+    /// registration reports ([`OpenWrites`]). A service given none counts into a handle
+    /// nobody reads.
+    #[must_use]
+    pub fn with_open_writes(mut self, open_writes: OpenWrites) -> Self {
+        self.segments = self.storage.segments_counted(&open_writes);
+        self.open_writes = open_writes;
         self
     }
 

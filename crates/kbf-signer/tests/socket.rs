@@ -26,10 +26,13 @@ fn mode(path: &Path) -> u32 {
 /// A connection that sends `request` raw and reads whatever comes back until it closes.
 fn raw(socket: &Path, request: &[u8]) -> Vec<u8> {
     let mut stream = UnixStream::connect(socket).expect("connect");
-    stream.write_all(request).expect("write");
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .expect("shutdown");
+    // A server that refuses the peer closes at once, so the write (or the shutdown after
+    // it) can fail with a broken pipe or a reset before anything is read: that is the
+    // same "no answer" as a close, for what these tests ask.
+    if stream.write_all(request).is_err() {
+        return Vec::new();
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Write);
     let mut answer = Vec::new();
     // A reset after the server closed is the same as a close for what these tests ask.
     let _ = stream.read_to_end(&mut answer);

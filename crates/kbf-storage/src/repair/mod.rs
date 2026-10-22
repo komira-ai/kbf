@@ -10,6 +10,7 @@
 //! the frontend ([`RepairLedger`]); [`RepairWorker`] makes the copies owed, to the owners
 //! the map names now, when they can take them, and only then settles the debt.
 
+mod confirm;
 mod journal;
 mod ledger;
 #[cfg(test)]
@@ -20,6 +21,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+pub use confirm::{Confirmed, PeerConfirmer, Tracked};
 pub use journal::{JOURNAL, JOURNAL_TMP, Journal, JournalError, Options};
 use kbf_map::MemberId;
 use kbf_store::Fs;

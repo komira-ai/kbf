@@ -104,5 +104,6 @@ pub use kbf::worker::v1 as worker;
 
 mod map;
 pub use map::MapDecodeError;
+mod store_config;
 mod usage;
 pub use usage::no_cgroup_fields;

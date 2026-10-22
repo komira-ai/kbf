@@ -5,12 +5,39 @@
 use std::cell::Cell;
 use std::fs;
 
-use super::harness::{NO_LEASES, order, rig_with_helper, status_json, why};
+use super::harness::{NO_LEASES, Rig, order, staged_order, status_json, why, with_key};
 use super::*;
 use crate::fixtures::commit;
 
-fn order_file(rig: &super::harness::Rig, id: u64) -> std::path::PathBuf {
-    rig.inbox().join("orders").join(format!("{id:020}.json"))
+/// The file of order `id` in epoch 7, the epoch the harness orders in.
+fn order_file(rig: &Rig, id: u64) -> std::path::PathBuf {
+    rig.spool().join(format!("{:020}-{id:020}.json", 7))
+}
+
+fn name_of(id: u64) -> String {
+    format!("{:020}-{id:020}.json", 7)
+}
+
+/// The `available` key of the installer's status, as it writes it.
+fn avail(hex: &str) -> String {
+    format!("\"available\":{{\"commit\":\"{hex}\",\"seq\":812}}")
+}
+
+/// Order `id` of `verb` for `commit` with `source` as given, which may be none.
+fn sourced(id: u64, verb: Verb, source: Option<Source>, commit: &str) -> Order {
+    Order {
+        source,
+        ..order(id, verb, commit)
+    }
+}
+
+/// A client whose installer says it holds `installed`, and which holds the offer for
+/// `commit(9)`, the commit these tests activate. (`_staged` keeps the old call shape.)
+fn rig_with_helper(name: &str, installed: &str, _staged: &str) -> Rig {
+    let rig = Rig::bare(name);
+    rig.write_status(&status_json("idle", installed, "", 0));
+    rig.offer(9);
+    rig
 }
 
 /// Catches an activation accepted while a lease is live (running, or finished with a
@@ -29,7 +56,8 @@ async fn an_activation_with_a_lease_live_is_refused() {
     assert_eq!(rig.orders(), Vec::<String>::new());
     assert_eq!(rig.handle.gate(), None);
     // Refused at the first look: the id was not recorded.
-    assert!(!rig.dir.join("client.json").exists());
+    let state = fs::read_to_string(rig.spool().join("client.json")).expect("state file");
+    assert!(state.contains("\"order_id\":0"), "{state}");
     assert_eq!(rig.rx.borrow().acked_order_id, 0);
     assert_eq!(rig.rx.borrow().state, State::Refused);
 
@@ -48,7 +76,7 @@ async fn an_activation_with_a_lease_live_is_refused() {
 
     // With none live it is accepted, and the gate closes.
     assert_eq!(rig.ask(3, Verb::Activate, &target), Decision::Accepted);
-    assert_eq!(rig.orders(), vec![format!("{:020}.json", 3)]);
+    assert_eq!(rig.orders(), vec![name_of(3)]);
     assert_eq!(
         rig.handle.gate(),
         Some(format!("update to {} ordered", &target[..12]))
@@ -59,7 +87,7 @@ async fn an_activation_with_a_lease_live_is_refused() {
     assert_eq!(status.refusal, "");
 }
 
-/// Catches the order file's content: fixed JSON, no path or command; and a confirmation
+/// Catches the record's content: fixed JSON, no path or command; and a confirmation
 /// that is held to the lease check or closes the gate.
 #[tokio::test]
 async fn the_order_file_is_the_frozen_json() {
@@ -76,7 +104,7 @@ async fn the_order_file_is_the_frozen_json() {
     );
     let text = fs::read_to_string(order_file(&rig, 12)).expect("order file");
     let expected = format!(
-        "{{\"order_id\":12,\"epoch\":7,\"verb\":\"confirm\",\"commit\":\"{target}\",\"window_s\":600}}"
+        "{{\"order_id\":12,\"epoch\":7,\"generation\":1,\"verb\":\"confirm\",\"commit\":\"{target}\",\"window_s\":600}}"
     );
     assert_eq!(text, expected);
     assert_eq!(rig.handle.gate(), None, "a confirmation opens no gate");
@@ -131,7 +159,7 @@ async fn the_gate_opens_when_the_helper_settles_the_order() {
 #[tokio::test]
 async fn an_order_is_deduplicated_and_ordered() {
     let target = commit(9);
-    let rig = rig_with_helper("floor", "", &target);
+    let rig = rig_with_helper("floor", &target, &target);
     let path = order_file(&rig, 5);
     assert_eq!(rig.ask(5, Verb::Activate, &target), Decision::Accepted);
     fs::write(&path, "marker").expect("mark");
@@ -190,18 +218,28 @@ async fn the_order_floor_survives_a_restart() {
     fs::remove_file(order_file(&rig, 7)).expect("remove");
     let rig = rig.restart();
     assert_eq!(rig.rx.borrow().acked_order_id, 0);
+    // The frontend offers again after the restart (the same generation): remembered, so
+    // the order can be written.
+    rig.offer(9);
     assert_eq!(rig.ask(7, Verb::Activate, &target), Decision::Accepted);
     assert_eq!(rig.orders().len(), 1);
 }
 
-/// Catches an order for a release this host has never held being written, an order
-/// without a verb, and one on a host with no helper (or one whose status cannot be read).
+/// Catches an activation written for a commit this node holds no offer for (the record
+/// would carry no locators), a confirm or revert for a release the installer does not hold,
+/// an order without a verb, and one on a host with no installer (or one whose status cannot
+/// be read).
 #[tokio::test]
-async fn an_order_needs_a_release_the_helper_holds() {
+async fn an_order_needs_an_offer_or_a_release_the_installer_holds() {
     let held = commit(9);
     let rig = rig_with_helper("holds", &commit(8), &held);
     for wanted in [commit(7), "9".repeat(12)] {
         let decision = rig.ask(1, Verb::Activate, &wanted);
+        assert_eq!(
+            why(&decision),
+            format!("no offer for commit {wanted} is held; not activating")
+        );
+        let decision = rig.ask(1, Verb::Confirm, &wanted);
         assert_eq!(
             why(&decision),
             format!("commit {wanted} is neither staged nor installed on this host")
@@ -225,9 +263,100 @@ async fn an_order_needs_a_release_the_helper_holds() {
     let decision = rig.ask(4, Verb::Confirm, &held);
     assert_eq!(
         why(&decision),
-        "no update helper reports on this host, so it cannot take an order"
+        "no update installer reports on this host, so it cannot take an order"
     );
     assert_eq!(rig.rx.borrow().state, State::Refused);
+}
+
+/// Catches an activation record that does not carry what the installer fetches by: the
+/// offer's locators and expected facts and the order's generation. An offer with no
+/// expected facts (a frontend that predates them) is refused here and writes nothing:
+/// fail closed.
+///
+/// Mutants planted: the facts copied as zeros; the generation taken from the offer.
+#[tokio::test]
+async fn an_activation_record_carries_the_locators_the_facts_and_the_orders_generation() {
+    let target = commit(9);
+    let rig = rig_with_helper("record", "", &target);
+    let mut o = order(1, Verb::Activate, &target);
+    o.generation = 42;
+    assert_eq!(rig.handle.order(&o, 7, NO_LEASES), Decision::Accepted);
+    let text = fs::read_to_string(order_file(&rig, 1)).expect("record");
+    let record = crate::OrderRecord::parse(text.as_bytes()).expect("parses");
+    assert_eq!(record.generation, 42, "the order's, not the offer's 9");
+    assert_eq!(record.components.len(), 1);
+    assert_eq!(record.components[0].sha256, "ab".repeat(32));
+    let facts = record.expected.expect("facts");
+    assert_eq!(
+        (
+            facts.platform.as_str(),
+            facts.protocol,
+            facts.min_protocol,
+            facts.state_schema
+        ),
+        (crate::fixtures::PLATFORM, 7, 6, 3)
+    );
+    assert_eq!(facts.profile, "release");
+
+    // An offer without facts: held (it is a good offer), but its activation is refused.
+    let mut bare = crate::fixtures::offer_of(10);
+    bare.expected = crate::types::Expected::default();
+    rig.handle.offer(bare.clone());
+    let decision = rig.ask(3, Verb::Activate, &bare.commit);
+    assert!(why(&decision).contains("expected facts"), "{decision:?}");
+    assert!(!order_file(&rig, 3).exists());
+}
+
+/// Catches the node taking an offer whose facts the frontend left out, or refusing one that
+/// is whole: an offer with every fact is activated and its record carries each fact, and
+/// an offer missing any one of `protocol`, `state_schema`, `profile` is held but its
+/// activation is refused naming the facts and writes no record (fail closed). A `min_protocol`
+/// of 0 is a real minimum (a build that speaks every version) and is accepted.
+///
+/// Mutant seen red: the refusal loosened (`protocol == 0 || state_schema == 0` made `&&`:
+/// a zero `state_schema` is accepted).
+#[tokio::test]
+async fn an_offer_with_every_fact_is_activated_and_one_missing_any_is_refused() {
+    let rig = rig_with_helper("facts-whole", "", &commit(9));
+    type Blank = fn(&mut crate::types::Expected);
+    let breaks: [(&str, Blank); 3] = [
+        ("protocol", |e| e.protocol = 0),
+        ("state_schema", |e| e.state_schema = 0),
+        ("profile", |e| e.profile.clear()),
+    ];
+    for (n, (fact, blank)) in breaks.into_iter().enumerate() {
+        let generation = 20 + n as u64;
+        let mut broken = crate::fixtures::offer_of(generation);
+        blank(&mut broken.expected);
+        rig.handle.offer(broken.clone());
+        let id = 10 + n as u64;
+        let decision = rig.ask(id, Verb::Activate, &broken.commit);
+        assert!(
+            why(&decision).contains("expected facts"),
+            "{fact}: {decision:?}"
+        );
+        assert!(!order_file(&rig, id).exists(), "{fact}: no record");
+    }
+
+    let mut open_minimum = crate::fixtures::offer_of(30);
+    open_minimum.expected.min_protocol = 0;
+    rig.handle.offer(open_minimum.clone());
+    assert_eq!(
+        rig.ask(40, Verb::Activate, &open_minimum.commit),
+        Decision::Accepted
+    );
+    let text = fs::read_to_string(order_file(&rig, 40)).expect("record");
+    let record = crate::OrderRecord::parse(text.as_bytes()).expect("parses");
+    let facts = record.expected.expect("facts");
+    assert_eq!(
+        (
+            facts.protocol,
+            facts.min_protocol,
+            facts.state_schema,
+            facts.profile.as_str()
+        ),
+        (7, 0, 3, "release")
+    );
 }
 
 /// Catches an order accepted when its id or file cannot be recorded: nothing the helper
@@ -236,16 +365,17 @@ async fn an_order_needs_a_release_the_helper_holds() {
 async fn an_order_that_cannot_be_recorded_is_refused() {
     let target = commit(9);
     let rig = rig_with_helper("unrecordable-order", "", &target);
-    fs::create_dir(rig.dir.join("client.json.tmp")).expect("block");
+    fs::create_dir(rig.spool().join("client.json.tmp")).expect("block");
     let decision = rig.ask(1, Verb::Activate, &target);
     assert!(
         why(&decision).starts_with("cannot record order 1: "),
         "{decision:?}"
     );
     assert_eq!(rig.orders(), Vec::<String>::new());
-    fs::remove_dir(rig.dir.join("client.json.tmp")).expect("unblock");
+    fs::remove_dir(rig.spool().join("client.json.tmp")).expect("unblock");
 
-    fs::remove_dir_all(rig.inbox().join("orders")).expect("remove");
+    // A directory where the record belongs: the rename over it fails.
+    fs::create_dir(order_file(&rig, 2)).expect("block the record");
     let decision = rig.ask(2, Verb::Activate, &target);
     assert!(
         why(&decision).starts_with("cannot write order 2: "),
@@ -262,7 +392,7 @@ async fn an_order_that_cannot_be_recorded_is_refused() {
 #[tokio::test]
 async fn a_new_epoch_with_a_lower_id_is_newer_and_an_old_epoch_is_not() {
     let target = commit(9);
-    let rig = rig_with_helper("epoch-floor", "", &target);
+    let rig = rig_with_helper("epoch-floor", &target, &target);
     let as_epoch = |rig: &super::harness::Rig, id: u64, epoch: u64, verb: Verb| {
         let mut o = order(id, verb, &target);
         o.epoch = epoch;
@@ -286,4 +416,156 @@ async fn a_new_epoch_with_a_lower_id_is_newer_and_an_old_epoch_is_not() {
         why(&as_epoch(&rig, 9, 7, Verb::Activate)),
         "order 9 is of epoch 7, older than the newest accepted, 9"
     );
+}
+
+/// Catches a node taking a frontend update from its session: the order is refused with its
+/// own reason (not the record's), nothing is written, no gate closes and the floor does not
+/// move, so the next real order is taken.
+///
+/// Mutant planted: the guard in `decide` removed (the record's own refusal gives another
+/// message, and the floor has moved).
+#[tokio::test]
+async fn a_frontend_update_order_is_refused_by_a_node_and_moves_nothing() {
+    let target = commit(9);
+    let rig = rig_with_helper("frontend-update", &target, &target);
+    let decision = rig.ask(1, Verb::FrontendUpdate, &target);
+    assert_eq!(
+        why(&decision),
+        "order 1 is a frontend update, which a node does not take from the session"
+    );
+    assert_eq!(rig.orders(), Vec::<String>::new());
+    assert_eq!(rig.handle.gate(), None);
+    assert_eq!(
+        rig.ask(1, Verb::Confirm, &target),
+        Decision::Accepted,
+        "id 1 is still free"
+    );
+}
+
+/// Catches a staged activation that needs an offer (it names the release the host's package
+/// carries, so none is held for it), one that consumes the offer the node happens to hold
+/// (the record would carry locators and facts, and the installer would fetch), one that
+/// is refused by the bundled check (a host that fetches nothing is the host a staged order is
+/// for), and one that is accepted only on a bundled host (a host that fetches from a URL and
+/// carries a package seed takes it too). The record is the frozen JSON with `source` last.
+///
+/// Mutants planted: an offer required for a staged order; the record writer consuming the held
+/// offer for a staged order (the held-offer half of the test sees components and facts in the
+/// file); the bundled check applied to a staged order; the staged accept requiring a bundled
+/// host.
+#[tokio::test]
+async fn a_staged_activation_needs_no_offer_and_is_a_locator_even_with_one_held() {
+    let target = commit(9);
+    let rig = Rig::bare("staged");
+    let plain = status_json("idle", "", "", 0);
+    let seeded = with_key(&plain, &avail(&target));
+    rig.write_status(&with_key(&seeded, "\"release_source\":\"bundled\""));
+
+    let decision = rig.handle.order(&staged_order(1, &target), 7, NO_LEASES);
+    assert_eq!(decision, Decision::Accepted);
+    assert_eq!(rig.orders(), vec![name_of(1)]);
+    let text = fs::read_to_string(order_file(&rig, 1)).expect("order file");
+    let expected = format!(
+        "{{\"order_id\":1,\"epoch\":7,\"generation\":1,\"verb\":\"activate\",\"commit\":\"{target}\",\"window_s\":600,\"source\":\"staged\"}}"
+    );
+    assert_eq!(text, expected);
+    assert_eq!(
+        rig.handle.gate(),
+        Some(format!("update to {} ordered", &target[..12]))
+    );
+    assert_eq!(rig.rx.borrow().acked_order_id, 1);
+
+    // The node holds the offer for the same commit now: a staged order still takes none.
+    rig.offer(9);
+    let decision = rig.handle.order(&staged_order(2, &target), 7, NO_LEASES);
+    assert_eq!(decision, Decision::Accepted);
+    let text = fs::read_to_string(order_file(&rig, 2)).expect("order file");
+    let record = crate::OrderRecord::parse(text.as_bytes()).expect("parses");
+    assert!(record.components.is_empty());
+    assert_eq!(record.expected, None);
+    assert_eq!(record.source, Source::Staged);
+
+    // A host that fetches from a URL and also carries a package seed takes a staged order too.
+    rig.write_status(&with_key(&seeded, "\"release_source\":\"url\""));
+    let decision = rig.handle.order(&staged_order(3, &target), 7, NO_LEASES);
+    assert_eq!(decision, Decision::Accepted);
+}
+
+/// Catches an order the installer cannot carry out being accepted, and a refusal that moves
+/// the order floor. Six orders, ids 9 down to 4, are each refused with their own reason (a
+/// source this build does not know; a source on a confirm; a source on a revert; a staged
+/// release when the installer reports no package; one when its package carries another
+/// commit, which differs from the ordered one in its last digit only; a fetch on a host that
+/// fetches nothing), and each leaves no file, no gate and the state refused. Order 1 is then
+/// accepted: had any refusal recorded its id, the later and lower ones would have read "not
+/// above the newest accepted", and 1 would be refused.
+///
+/// Mutants planted: each check moved after the floor is saved; an unknown source read as a
+/// fetch; a source allowed on a confirm; a staged order accepted on any `available`; a staged
+/// order accepted on a prefix of the commit.
+#[tokio::test]
+async fn an_order_the_installer_cannot_carry_out_is_refused_before_the_floor_moves() {
+    let target = commit(9);
+    let rig = rig_with_helper("source-refusals", "", &target);
+    let plain = status_json("idle", "", "", 0);
+    let refused = |status: &str, o: &Order| {
+        rig.write_status(status);
+        let decision = rig.handle.order(o, 7, NO_LEASES);
+        assert_eq!(rig.orders(), Vec::<String>::new());
+        assert_eq!(rig.handle.gate(), None);
+        assert_eq!(rig.rx.borrow().state, State::Refused);
+        why(&decision).to_owned()
+    };
+    assert_eq!(
+        refused(&plain, &sourced(9, Verb::Activate, None, &target)),
+        "order 9 names a source this node does not know"
+    );
+    let staged = Some(Source::Staged);
+    assert_eq!(
+        refused(&plain, &sourced(8, Verb::Confirm, staged, &target)),
+        "order 8: a confirm order takes no source"
+    );
+    assert_eq!(
+        refused(&plain, &sourced(7, Verb::Revert, staged, &target)),
+        "order 7: a revert order takes no source"
+    );
+    assert_eq!(
+        refused(&plain, &staged_order(6, &target)),
+        format!("commit {target} is not staged by this host's package: it reports none")
+    );
+    let other = commit(8);
+    let carrying = with_key(&plain, &avail(&other));
+    assert_eq!(
+        refused(&carrying, &staged_order(5, &target)),
+        format!("commit {target} is not staged by this host's package: it carries {other}")
+    );
+    let bundled = with_key(&plain, "\"release_source\":\"bundled\"");
+    assert_eq!(
+        refused(&bundled, &order(4, Verb::Activate, &target)),
+        format!(
+            "order names source fetch, but this host's installer fetches nothing (release_source bundled); use source=staged for {target}"
+        )
+    );
+
+    rig.write_status(&status_json("idle", &target, "", 0));
+    assert_eq!(rig.ask(1, Verb::Confirm, &target), Decision::Accepted);
+}
+
+/// Catches the offer requirement dropped for an activation that fetches because the installer
+/// reports a package: the seed excuses a staged order from an offer, and a fetching order for
+/// the seed's commit still has none held and is refused.
+///
+/// Mutant planted: the offer requirement dropped for every activation.
+#[tokio::test]
+async fn a_seed_does_not_excuse_a_fetch_from_its_offer() {
+    let target = commit(9);
+    let rig = Rig::bare("seed-fetch");
+    let plain = status_json("idle", "", "", 0);
+    rig.write_status(&with_key(&plain, &avail(&target)));
+    let decision = rig.ask(1, Verb::Activate, &target);
+    assert_eq!(
+        why(&decision),
+        format!("no offer for commit {target} is held; not activating")
+    );
+    assert_eq!(rig.orders(), Vec::<String>::new());
 }

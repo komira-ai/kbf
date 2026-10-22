@@ -7,11 +7,12 @@ use std::process::Command;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use kbf_testkit::dir::TestDir;
 use sha2::Digest;
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
-const REPO: &str = "komira-ai/komira-build-farm";
+const REPO: &str = "komira-ai/kbf";
 /// The kind of attestation of a bundle a host verifies a tarball with.
 const PROVENANCE: &str = "https://slsa.dev/provenance/v1";
 const COMMIT: &str = "c0ffee0123456789c0ffee0123456789c0ffee01";
@@ -29,13 +30,11 @@ const ARTIFACTS: [&str; 6] = [
 
 /// An empty directory of its own for one test, holding the fake as `gh/gh` and an
 /// empty `tmp/`.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("xtask-release")
-        .join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clear scratch");
-    }
+fn scratch(name: &str) -> TestDir {
+    let dir = TestDir::under(
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask-release"),
+        name,
+    );
     std::fs::create_dir_all(dir.join("gh")).expect("scratch");
     std::fs::create_dir_all(dir.join("tmp")).expect("tmp");
     std::fs::hard_link(FAKE, dir.join("gh/gh")).expect("link the fake as gh");
@@ -68,6 +67,17 @@ fn xtask(root: &Path, args: &[&str], defect: Option<&str>) -> (Option<i32>, Stri
 fn check(dir: &Path, commit: &str) -> (Option<i32>, String, String) {
     let out = Command::new(XTASK)
         .args(["release", "check", s(dir), "--commit", commit])
+        .output()
+        .expect("run xtask");
+    let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    (out.status.code(), text(&out.stdout), text(&out.stderr))
+}
+
+/// `cargo xtask release check --without-version-facts`, as the previous release is read.
+fn check_without_facts(dir: &Path, commit: &str) -> (Option<i32>, String, String) {
+    let out = Command::new(XTASK)
+        .args(["release", "check", s(dir), "--commit", commit])
+        .arg("--without-version-facts")
         .output()
         .expect("run xtask");
     let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
@@ -810,6 +820,113 @@ fn check_refuses_assets_of_another_commit_or_of_no_binary() {
     }
 }
 
+/// [`dist`] with one more listed file, `name`, holding `x`.
+fn dist_with(root: &Path, name: &str) -> PathBuf {
+    let d = dist(root, COMMIT);
+    let sums = std::fs::read_to_string(d.join("SHA256SUMS")).expect("sums");
+    std::fs::write(d.join(name), "x").expect("file");
+    let line = format!("{}  {name}\n", hex::encode(sha2::Sha256::digest(b"x")));
+    std::fs::write(d.join("SHA256SUMS"), format!("{sums}{line}")).expect("sums");
+    d
+}
+
+/// [`dist`] with the `kbf` tarball of `platform`, its bundle and, when `facts`, the
+/// version facts beside it.
+fn dist_with_kbf(root: &Path, platform: &str, facts: bool) -> PathBuf {
+    let d = dist(root, COMMIT);
+    let mut sums = std::fs::read_to_string(d.join("SHA256SUMS")).expect("sums");
+    let tarball = format!("kbf-{COMMIT}-{platform}.tar.gz");
+    let mut names = vec![tarball.clone()];
+    if facts {
+        names.push(format!("kbf-{COMMIT}-{platform}.version.json"));
+    }
+    for name in names {
+        let bytes = format!("{name} bytes");
+        std::fs::write(d.join(&name), &bytes).expect("file");
+        let sha = sha_of(&bytes);
+        sums.push_str(&format!("{sha}  {name}\n"));
+        if name == tarball {
+            let bundle = d.join(format!("{name}.sigstore.json"));
+            std::fs::write(bundle, bundle_text(&sha)).expect("bundle");
+        }
+    }
+    std::fs::write(d.join("SHA256SUMS"), sums).expect("sums");
+    d
+}
+
+#[test]
+fn check_takes_the_version_facts_of_kbf_for_the_commit() {
+    // Catches: the facts file the build jobs now list refused as no asset of the commit,
+    // which would stop every release. Control for the next tests: the name that passes is
+    // exactly `kbf-<commit>-<platform>.version.json`, beside its tarball.
+    let root = scratch("check-facts");
+    let d = dist_with_kbf(&root, "linux-arm64", true);
+    let (code, out, err) = check(&d, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("sums: 8 files match"), "{out}");
+    assert!(out.contains("is an asset of"), "{out}");
+    assert!(out.contains("each of the 4 tarballs"), "{out}");
+}
+
+#[test]
+fn check_waives_the_version_facts_of_a_release_made_before_them_and_only_that() {
+    // Catches: the first release after the facts were recorded failing at its check of the
+    // previous release (a `kbf` tarball and no facts: nothing is published), and a waiver
+    // that is a general pass: without the flag the same directory is refused, with it
+    // facts without their tarball are still refused, and so is a changed file. Mutants:
+    // the flag ignored; the flag skipping the whole pairing; the flag skipping the sums.
+    let root = scratch("check-waived");
+    let d = dist_with_kbf(&root, "linux-arm64", false);
+    let facts = format!("kbf-{COMMIT}-linux-arm64.version.json");
+    let tarball = format!("kbf-{COMMIT}-linux-arm64.tar.gz");
+    let (code, _, err) = check(&d, COMMIT);
+    assert_eq!(code, Some(1), "{err}");
+    let want =
+        format!("xtask: {tarball}: its version facts {facts} are not listed in SHA256SUMS\n");
+    assert_eq!(err, want);
+    let (code, out, err) = check_without_facts(&d, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("sums: 7 files match"), "{out}");
+    assert!(out.contains("each of the 4 tarballs"), "{out}");
+    // Facts with no tarball are refused whether or not the flag is given.
+    let orphan_root = scratch("check-orphan");
+    let orphan = dist_with(&orphan_root, &facts);
+    let want = format!(
+        "xtask: {facts}: the tarball it states the facts of, {tarball}, is not listed in \
+         SHA256SUMS\n"
+    );
+    for run in [check, check_without_facts] {
+        let (code, _, err) = run(&orphan, COMMIT);
+        assert_eq!(code, Some(1), "{err}");
+        assert_eq!(err, want);
+    }
+    // The sums are still read.
+    std::fs::write(d.join(&tarball), "other").expect("change");
+    let (code, _, err) = check_without_facts(&d, COMMIT);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("does not match its line"), "{err}");
+}
+
+#[test]
+fn check_refuses_version_facts_that_are_not_kbfs_for_the_commit() {
+    // Catches: any file ending `.version.json` taken as an asset (another binary's, an
+    // unknown platform's, a renamed copy), when the set holds one name per platform.
+    // Another commit's facts are refused earlier, by the sums (no tarball of it is listed);
+    // `is_facts_of` has a test of its own for that name. Mutant: the exact name replaced by
+    // the suffix.
+    for bad in [
+        format!("kbf-daemon-{COMMIT}-linux-arm64.version.json"),
+        format!("kbf-{COMMIT}-windows-x86_64.version.json"),
+        format!("kbf-{COMMIT}-linux-arm64.version.json.bak"),
+    ] {
+        let root = scratch("check-bad-facts");
+        let d = dist_with(&root, &bad);
+        let (code, _, err) = check(&d, COMMIT);
+        assert_eq!(code, Some(1), "{bad}");
+        assert_eq!(err, format!("xtask: {bad}: not an asset of {COMMIT}\n"));
+    }
+}
+
 #[test]
 fn check_refuses_a_changed_file() {
     // Catches: a check that reads names only (the `sha256sum --check` half dropped).
@@ -828,6 +945,80 @@ fn check_refuses_a_changed_file() {
 }
 
 fn publish(root: &Path, defect: Option<&str>) -> (Option<i32>, String, String) {
+    // The set hash `release verify` prints for the files in `dist`: sha256 of its SHA256SUMS.
+    let sums = std::fs::read_to_string(root.join("dist/SHA256SUMS")).unwrap_or_default();
+    publish_set(root, &sha_of(&sums), defect)
+}
+
+/// What `release notes` would have written, as the tests' notes file.
+const NOTES: &str = "# v0.1.0\n\n## Before you click\n\n### Not reversible\n\n- meta_log raised from 3 \
+                     (v0.0.9) to 4\n\n## Commits since v0.0.9\n\n- abc1234 a change\n";
+
+/// Writes [`NOTES`] to `<root>/notes.md` and returns the path.
+fn notes_file(root: &Path) -> PathBuf {
+    let path = root.join("notes.md");
+    std::fs::write(&path, NOTES).expect("notes");
+    path
+}
+
+/// Adds to the fake's API the release tags `tags` (one page) and the compare of the
+/// highest, `TAG`, with `commit`.
+fn tags_standing(root: &Path, tags: &[&str], top: &str, status: &str) {
+    let path = root.join("gh/gh-api.json");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| "{}".into());
+    let mut map: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&text).expect("gh-api.json");
+    let refs: Vec<serde_json::Value> = tags
+        .iter()
+        .map(|t| serde_json::json!({ "ref": format!("refs/tags/{t}") }))
+        .collect();
+    map.insert(
+        format!("repos/{REPO}/git/matching-refs/tags/v?per_page=100&page=1"),
+        serde_json::Value::Array(refs),
+    );
+    map.insert(
+        format!("repos/{REPO}/compare/{top}...{COMMIT}"),
+        serde_json::json!({ "status": status }),
+    );
+    std::fs::write(path, serde_json::Value::Object(map).to_string()).expect("gh-api.json");
+}
+
+fn publish_set(root: &Path, set_hash: &str, defect: Option<&str>) -> (Option<i32>, String, String) {
+    publish_tag(root, TAG, set_hash, defect)
+}
+
+fn publish_tag(
+    root: &Path,
+    tag: &str,
+    set_hash: &str,
+    defect: Option<&str>,
+) -> (Option<i32>, String, String) {
+    publish_with(root, tag, set_hash, &notes_file(root), defect)
+}
+
+fn publish_notes(
+    root: &Path,
+    set_hash: &str,
+    notes: &Path,
+    defect: Option<&str>,
+) -> (Option<i32>, String, String) {
+    publish_with(root, TAG, set_hash, notes, defect)
+}
+
+fn publish_with(
+    root: &Path,
+    tag: &str,
+    set_hash: &str,
+    notes: &Path,
+    defect: Option<&str>,
+) -> (Option<i32>, String, String) {
+    // Rule S reads the release tags: `TAG` is the highest and names `COMMIT`, unless the
+    // test has said otherwise.
+    if !std::fs::read_to_string(root.join("gh/gh-api.json"))
+        .is_ok_and(|t| t.contains("matching-refs"))
+    {
+        tags_standing(root, &[TAG], TAG, "identical");
+    }
     let dist = root.join("dist");
     let run = RUN.to_string();
     xtask(
@@ -839,11 +1030,15 @@ fn publish(root: &Path, defect: Option<&str>) -> (Option<i32>, String, String) {
             "--repo",
             REPO,
             "--tag",
-            TAG,
+            tag,
             "--commit",
             COMMIT,
             "--run-id",
             &run,
+            "--set-hash",
+            set_hash,
+            "--notes-file",
+            s(notes),
         ],
         defect,
     )
@@ -907,10 +1102,7 @@ fn publish_creates_the_release_with_every_verified_file() {
         )),
         "{create}"
     );
-    assert!(
-        create.contains(&format!("/actions/runs/{RUN})")),
-        "{create}"
-    );
+    assert!(args.contains(&format!("/actions/runs/{RUN})")), "{args}");
     // The notes span lines of the log; the verify command is one of them.
     assert!(
         args.contains(&format!(
@@ -931,6 +1123,98 @@ fn publish_creates_the_release_with_every_verified_file() {
         )),
         "{args}"
     );
+}
+
+#[test]
+fn publish_makes_the_notes_file_the_start_of_the_release_body() {
+    // Catches: a release whose body is not the generated notes (the reviewer approved
+    // notes that nobody published), or whose notes are cut, reflowed or followed by
+    // nothing: the body is the file verbatim, then how to verify the files.
+    let root = scratch("publish-body");
+    dist(&root, COMMIT);
+    let (code, _, err) = publish(&root, None);
+    assert_eq!(code, Some(0), "{err}");
+    let args = gh_args(&root);
+    let create = args.split("\nrelease create").last().expect("a create");
+    let body = create.split_once(" --notes ").expect("--notes").1;
+    assert!(
+        body.starts_with(&format!(
+            "{}\n## The files\n\nThe files run {RUN} of artifacts.yml built and attested",
+            NOTES.trim_end()
+        )),
+        "{body}"
+    );
+    assert!(
+        body.contains("Verify an asset before use"),
+        "the verification instructions are gone: {body}"
+    );
+}
+
+#[test]
+fn publish_requires_the_notes_file() {
+    // Catches: `--notes-file` made optional (a release with a fixed body again) and a
+    // missing, empty or unreadable file read as no notes. None may reach GitHub.
+    let root = scratch("publish-no-notes");
+    dist(&root, COMMIT);
+    let sums = std::fs::read_to_string(root.join("dist/SHA256SUMS")).unwrap();
+    let dist_dir = root.join("dist");
+    let run = RUN.to_string();
+    let (code, _, err) = xtask(
+        &root,
+        &[
+            "release",
+            "publish",
+            s(&dist_dir),
+            "--repo",
+            REPO,
+            "--tag",
+            TAG,
+            "--commit",
+            COMMIT,
+            "--run-id",
+            &run,
+            "--set-hash",
+            &sha_of(&sums),
+        ],
+        None,
+    );
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("--notes-file"), "{err}");
+    let gone = root.join("gone.md");
+    let (code, _, err) = publish_notes(&root, &sha_of(&sums), &gone, None);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("gone.md"), "{err}");
+    for blank in ["", " \n\n"] {
+        let empty = root.join("empty.md");
+        std::fs::write(&empty, blank).unwrap();
+        let (code, _, err) = publish_notes(&root, &sha_of(&sums), &empty, None);
+        assert_eq!(code, Some(1), "{err}");
+        assert!(err.contains("is empty"), "{err}");
+    }
+    assert_eq!(
+        gh_args(&root),
+        "",
+        "GitHub was asked about a release with no notes"
+    );
+    assert_eq!(released(&root), vec![], "a release was made");
+}
+
+#[test]
+fn publish_refuses_a_body_github_would_cut() {
+    // Catches: a body over GitHub's 125 000 characters, which `gh` would fail on after
+    // the checks, or which would be cut.
+    let root = scratch("publish-long-notes");
+    dist(&root, COMMIT);
+    let sums = std::fs::read_to_string(root.join("dist/SHA256SUMS")).unwrap();
+    let long = root.join("long.md");
+    std::fs::write(&long, "x".repeat(125_000)).unwrap();
+    let (code, _, err) = publish_notes(&root, &sha_of(&sums), &long, None);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("GitHub takes 125000"), "{err}");
+    assert_eq!(gh_args(&root), "", "GitHub was asked");
+    std::fs::write(&long, "x".repeat(100_000)).unwrap();
+    let (code, _, err) = publish_notes(&root, &sha_of(&sums), &long, None);
+    assert_eq!(code, Some(0), "{err}");
 }
 
 #[test]
@@ -1119,6 +1403,83 @@ fn publish_refuses_files_that_fail_the_check_before_asking_github() {
 }
 
 #[test]
+fn publish_refuses_a_commit_a_newer_release_supersedes_before_any_write() {
+    // Catches: Rule S missing from publish, or accepting `behind` (the commit is an
+    // ancestor of the highest tag: a re-run of an old run would publish over a newer
+    // release), `diverged`, or a compare GitHub cannot answer.
+    for status in ["behind", "diverged", "weird"] {
+        let root = scratch("publish-superseded");
+        dist(&root, COMMIT);
+        tags_standing(&root, &[TAG, "v0.2.0"], "v0.2.0", status);
+        let (code, out, err) = publish(&root, None);
+        assert_eq!(code, Some(1), "{status}: {out}");
+        assert!(
+            err.contains(&format!(
+                "superseded: the highest release tag is v0.2.0 and {COMMIT} is not at or \
+                 after it (compare says {status})"
+            )),
+            "{status}: {err}"
+        );
+        let args = gh_args(&root);
+        assert!(!args.contains("release create"), "{status}: {args}");
+        assert!(!args.contains("release upload"), "{status}: {args}");
+        assert!(!args.contains("releases/tags"), "{status}: {args}");
+        assert_eq!(released(&root), vec![], "{status}");
+    }
+}
+
+#[test]
+fn publish_goes_on_when_the_highest_tag_is_an_ancestor_of_the_commit() {
+    // Control for the test above: the highest tag is older than the commit (`ahead`),
+    // and a repository with no release tag at all is not superseded by one.
+    for (tags, top, status) in [
+        (vec!["v0.0.9"], "v0.0.9", "ahead"),
+        (vec![], TAG, "identical"),
+        (vec![TAG, "v0.1.0-rc1", "latest"], TAG, "identical"),
+    ] {
+        let root = scratch("publish-ahead");
+        dist(&root, COMMIT);
+        tags_standing(&root, &tags, top, status);
+        let (code, _, err) = publish(&root, None);
+        assert_eq!(code, Some(0), "{status}: {err}");
+        assert_eq!(released(&root), verified(&root));
+    }
+}
+
+#[test]
+fn publish_refuses_a_tag_that_is_not_above_the_highest_before_any_write() {
+    // Catches: Rule S comparing only the commit with the highest tag, so a caller could
+    // publish `--tag v0.0.1` for an ahead commit while v0.0.5 exists; a tag equal to the
+    // highest that does not name this commit; a lower tag when the highest names it; a
+    // tag that is no release tag. A re-run (the highest tag names this commit and is
+    // `--tag`) is the control, and it is in `a_rerun_changes_nothing`.
+    for (top, status, tag) in [
+        ("v0.0.5", "ahead", "v0.0.1"),
+        ("v0.0.5", "ahead", "v0.0.5"),
+        ("v0.0.5", "ahead", "latest"),
+        ("v0.0.5", "identical", "v0.0.1"),
+    ] {
+        let root = scratch("publish-low-tag");
+        let dist = dist(&root, COMMIT);
+        tags_standing(&root, &[top], top, status);
+        let sums = std::fs::read_to_string(dist.join("SHA256SUMS")).expect("sums");
+        let (code, out, err) = publish_tag(&root, tag, &sha_of(&sums), None);
+        assert_eq!(code, Some(1), "{tag} {status}: {out}");
+        assert!(
+            err.contains(&format!(
+                "--tag {tag} is no release above the highest release tag {top}"
+            )),
+            "{tag} {status}: {err}"
+        );
+        let args = gh_args(&root);
+        assert!(!args.contains("release create"), "{tag}: {args}");
+        assert!(!args.contains("release upload"), "{tag}: {args}");
+        assert!(!args.contains("releases/tags"), "{tag}: {args}");
+        assert_eq!(released(&root), vec![], "{tag}");
+    }
+}
+
+#[test]
 fn a_failed_gh_release_fails_the_run() {
     // Catches: a create or upload whose failure is not reported, so the workflow goes
     // green with no release.
@@ -1129,5 +1490,182 @@ fn a_failed_gh_release_fails_the_run() {
     assert_eq!(
         err,
         "xtask: gh release create: xtask-fake: release failed\n"
+    );
+}
+
+#[test]
+fn publish_refuses_files_whose_set_differs_from_the_verified_one_before_asking_github() {
+    // Catches: a publish that trusts the verified files without comparing their set to
+    // the one `release verify` printed (kbf-cicd.md 8.1: "if anything is rebuilt, verify fails"). The
+    // files pass `check` in every case, so only the set hash can refuse them.
+    let root = scratch("publish-other-set");
+    let dist = dist(&root, COMMIT);
+    // `release verify` printed another set than these files.
+    let other = sha_of("what verify printed");
+    let (code, _, err) = publish_set(&root, &other, None);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("other bytes than it verified"), "{err}");
+    assert!(err.contains(&other), "{err}");
+    assert!(released(&root).is_empty(), "nothing was released");
+    assert!(
+        !gh_args(&root).contains("release create"),
+        "GitHub was asked to create a release"
+    );
+    // The same files under their own set hash publish.
+    let sums = std::fs::read_to_string(dist.join("SHA256SUMS")).unwrap();
+    let (code, _, err) = publish_set(&root, &sha_of(&sums), None);
+    assert_eq!(code, Some(0), "{err}");
+}
+
+#[test]
+fn publish_refuses_a_set_hash_that_is_not_a_hash() {
+    let root = scratch("publish-bad-hash");
+    dist(&root, COMMIT);
+    let (code, _, err) = publish_set(&root, "abc", None);
+    assert_eq!(code, Some(2), "{err}");
+}
+
+/// The deb of `platform` named `name`, added to `dist` as `pkg-asset` and the attest job
+/// leave it: the file, its line in `SHA256SUMS`, and its bundle when `bundle`.
+fn add_deb(dist: &Path, name: &str, bundle: bool) {
+    let bytes = format!("{name} bytes");
+    std::fs::write(dist.join(name), &bytes).expect("deb");
+    let sha = sha_of(&bytes);
+    let mut sums = std::fs::read_to_string(dist.join("SHA256SUMS")).expect("sums");
+    sums.push_str(&format!("{sha}  {name}\n"));
+    std::fs::write(dist.join("SHA256SUMS"), sums).expect("sums");
+    if bundle {
+        std::fs::write(
+            dist.join(format!("{name}.sigstore.json")),
+            bundle_text(&sha),
+        )
+        .expect("bundle");
+    }
+}
+
+fn deb(commit: &str, platform: &str) -> String {
+    format!("kbf-installer-{commit}-{platform}.deb")
+}
+
+#[test]
+fn check_accepts_the_installer_package_of_the_commit_with_its_bundle() {
+    // Catches: a `.deb` in SHA256SUMS refused as "not an asset of <commit>" (the release
+    // of the first main push that lists one fails), or accepted with no bundle, and the
+    // bundles line not saying that a package was counted.
+    let root = scratch("check-deb");
+    let dist = dist(&root, COMMIT);
+    add_deb(&dist, &deb(COMMIT, "linux-x86_64"), true);
+    add_deb(&dist, &deb(COMMIT, "linux-arm64"), true);
+    let (code, out, err) = check(&dist, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(
+        out,
+        format!(
+            "sums: 8 files match; the flipped copy does not\n\
+             names: every listed file is an asset of {COMMIT}\n\
+             bundles: each of the 3 tarballs and 2 package(s) has one provenance bundle\n"
+        )
+    );
+}
+
+#[test]
+fn check_accepts_the_macos_installer_package_of_the_commit_and_refuses_the_uncommitted_name() {
+    // Catches: a `.pkg` in SHA256SUMS refused as "not an asset of <commit>" (the release of
+    // the first main push that lists the Mac package fails), the package counted with no
+    // bundle, and `pkg build`'s own name (`kbf-installer-<version>-macos-arm64.pkg`, which
+    // names no commit) accepted as an asset.
+    let root = scratch("check-pkg");
+    let accepted = dist(&root, COMMIT);
+    add_deb(
+        &accepted,
+        &format!("kbf-installer-{COMMIT}-darwin-arm64.pkg"),
+        true,
+    );
+    let (code, out, err) = check(&accepted, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(
+        out,
+        format!(
+            "sums: 7 files match; the flipped copy does not\n\
+             names: every listed file is an asset of {COMMIT}\n\
+             bundles: each of the 3 tarballs and 1 package(s) has one provenance bundle\n"
+        )
+    );
+    let root = scratch("check-pkg-foreign");
+    let foreign = dist(&root, COMMIT);
+    add_deb(&foreign, "kbf-installer-0.1.0-macos-arm64.pkg", true);
+    let (code, _, err) = check(&foreign, COMMIT);
+    assert_eq!(code, Some(1));
+    assert!(
+        err.contains("kbf-installer-0.1.0-macos-arm64.pkg: not an asset of"),
+        "{err}"
+    );
+}
+
+#[test]
+fn check_refuses_a_package_with_no_bundle_a_stray_package_bundle_and_a_foreign_package() {
+    // Catches: a package released with no bundle a host can verify it with; a bundle of
+    // a package that is not listed; and a `.deb` that is not an asset of this commit:
+    // another commit's, an unknown platform's, and nfpm's own name
+    // (`kbf-installer_<version>_<arch>.deb`), which names no commit.
+    let root = scratch("check-deb-refusals");
+    let held = dist(&root, COMMIT);
+    let name = deb(COMMIT, "linux-x86_64");
+    add_deb(&held, &name, false);
+    let (code, out, err) = check(&held, COMMIT);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!("xtask: {name}: no provenance bundle {name}.sigstore.json\n")
+    );
+    let stray = format!("{}.sigstore.json", deb(COMMIT, "linux-arm64"));
+    std::fs::write(
+        held.join(format!("{name}.sigstore.json")),
+        bundle_text(&sha_of(&format!("{name} bytes"))),
+    )
+    .expect("bundle");
+    std::fs::write(held.join(&stray), bundle_text(&sha_of("x"))).expect("stray");
+    let (code, out, err) = check(&held, COMMIT);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!("xtask: {stray}: not the bundle of a listed tarball\n")
+    );
+    for foreign in [
+        deb(OTHER, "linux-arm64"),
+        deb(COMMIT, "linux-riscv"),
+        "kbf-installer_0.1.0_amd64.deb".to_owned(),
+        format!("-{COMMIT}-linux-arm64.deb"),
+    ] {
+        let root = scratch("check-deb-foreign");
+        let dist = dist(&root, COMMIT);
+        add_deb(&dist, &foreign, true);
+        let (code, out, err) = check(&dist, COMMIT);
+        assert_eq!(code, Some(1), "{foreign}: {out}");
+        assert_eq!(
+            err,
+            format!("xtask: {foreign}: not an asset of {COMMIT}\n"),
+            "{foreign}"
+        );
+    }
+}
+
+#[test]
+fn publish_releases_the_package_and_its_bundle() {
+    // Catches: a release that lists the package in SHA256SUMS and uploads neither it
+    // nor its bundle (the names are the checked set plus the bundles of each file that
+    // has one), so the operator path (verify the deb offline, then dpkg -i) has nothing
+    // to start from.
+    let root = scratch("publish-deb");
+    let dist = dist(&root, COMMIT);
+    let name = deb(COMMIT, "linux-arm64");
+    add_deb(&dist, &name, true);
+    let (code, _, err) = publish(&root, None);
+    assert_eq!(code, Some(0), "{err}");
+    let names: Vec<String> = released(&root).into_iter().map(|(n, _)| n).collect();
+    assert!(names.contains(&name), "{names:?}");
+    assert!(
+        names.contains(&format!("{name}.sigstore.json")),
+        "{names:?}"
     );
 }

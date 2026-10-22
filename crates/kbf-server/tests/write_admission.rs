@@ -108,6 +108,7 @@ fn listeners() -> Listeners {
         hello_wait: Duration::from_secs(10),
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
+        default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -158,7 +159,7 @@ async fn concurrent_writes_stay_under_the_bytes_in_flight() {
         "{peak} bytes buffered over a {BOUND}-byte bound"
     );
     for d in &digests {
-        assert!(cache.is_durable(d).await.expect("durable"), "{d}");
+        assert!(cache.is_complete(d).await.expect("complete"), "{d}");
     }
 }
 

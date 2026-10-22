@@ -22,6 +22,12 @@
 //! - the cold store's S3 key pair is in the environment ([`env`]);
 //! - the container driver's `crun` ([`env`]);
 //! - the open-file limit in force is the floor the units set ([`env`], a warning).
+//! - the host rules `kbf-deploy linux check-units` had (re-homed here; the verb is retired): the directories above a `file://` `--hot-store`
+//!   can be entered by the user kbf runs as ([`traverse`]); the cgroup kbf runs in keeps
+//!   every CPU and NUMA node of the node, for a daemon on the container driver
+//!   ([`cpuset`]); a mode with no storage half has no AWS credential variable in its environment,
+//!   and the cold store's key file beside `kbf.toml`, if there is one, is owned and moded as
+//!   its mode needs ([`credential`]).
 //!
 //! What it does not repeat, because the mode already refuses it with its fix: subordinate
 //! ids and cgroup delegation (`kbf-driver-container`), image pins, the cold-store URI, the
@@ -34,19 +40,24 @@
 //! Both exit with every problem printed, not the first.
 
 mod certs;
+mod cpuset;
+mod credential;
 mod env;
 mod files;
 mod needs;
 #[cfg(test)]
+mod proxy_secret_tests;
+#[cfg(test)]
 mod tests;
+mod traverse;
 
 pub mod host;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 pub use host::{Host, System};
-pub use needs::needs;
+pub use needs::{needs, needs_in};
 
 use crate::Invocation;
 
@@ -145,9 +156,12 @@ pub struct FileNeed {
     /// Whether it holds a secret (a private key, a token): owned by the process's user and
     /// readable by no one else.
     pub secret: bool,
+    /// The exact size the file must have, in bytes, where the flag's value is a fixed-size
+    /// secret (the proxy's, 32 bytes); `None` for any size.
+    pub exact_len: Option<usize>,
 }
 
-/// A row of the farm's certificate table (docs/deploy/kbf-modes.md, "A node's
+/// A row of the farm's certificate table (docs/deploy/kbf-units.md, "A node's
 /// certificate").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Row {
@@ -198,6 +212,36 @@ pub struct Needs {
     pub s3: bool,
     /// The container driver runs.
     pub container: Option<ContainerNeed>,
+    /// The directory of a `file://` hot store: every directory above it that exists is
+    /// one the user kbf runs as can enter ([`traverse`]).
+    pub hot_store: Option<PathBuf>,
+    /// The container driver places leases on the node's CPUs and NUMA nodes: the cgroup
+    /// kbf runs in keeps all of them ([`cpuset`]).
+    pub cpuset: bool,
+    /// How the mode holds the cold store's key ([`credential`]).
+    pub key: KeyRule,
+}
+
+/// Where the legacy cold store key file is: `s3.env` beside the `kbf.toml` kbf loads.
+#[must_use]
+pub fn key_file(config: &Path) -> PathBuf {
+    config.with_file_name("s3.env")
+}
+
+/// What a mode's rule `credential` asks of the host ([`credential`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum KeyRule {
+    /// Nothing (the frontend).
+    #[default]
+    None,
+    /// A mode with no storage half: no AWS credential variable in the environment.
+    Absent,
+    /// The storage node, which holds the key as a user of its own: the key file, if
+    /// there is one, is root's or that user's and no one else can read it.
+    Holder(PathBuf),
+    /// The mode that holds the key beside its builds: the key file, if there is one, is
+    /// root's alone, mode 0600.
+    RootAlone(PathBuf),
 }
 
 /// Checks `needs` against `host`, everything, in a fixed order.
@@ -207,15 +251,36 @@ pub fn check(needs: &Needs, host: &dyn Host) -> Report {
     files::check(needs, host, &mut report);
     certs::check(needs, host, &mut report);
     env::check(needs, host, &mut report);
+    traverse::check(needs, host, &mut report);
+    cpuset::check(needs, host, &mut report);
+    credential::check(needs, host, &mut report);
     report
 }
 
 /// The refusal of `invocation`, printed to standard error, if its host does not meet
 /// what it needs; `None` to go on and start.
 #[must_use]
-pub fn refusal(invocation: &Invocation) -> Option<ExitCode> {
-    let needs = needs(invocation);
+pub fn refusal(invocation: &Invocation, config: &Path) -> Option<ExitCode> {
+    let needs = needs_in(invocation, config);
     let report = check(&needs, &System);
     eprint!("{}", report.render(needs.mode));
     report.exit_status().map(ExitCode::from)
+}
+
+/// `kbf <mode> --check`: the checks of a start, printed, and nothing started. Standard
+/// output says `ok` when nothing stops the start (warnings and problems go to standard
+/// error, as a start prints them); the exit status is the one a start would exit with:
+/// 0, [`REFUSED`] or [`NOT_READY`].
+#[must_use]
+pub fn check_only(invocation: &Invocation, config: &Path) -> ExitCode {
+    let needs = needs_in(invocation, config);
+    let report = check(&needs, &System);
+    eprint!("{}", report.render(needs.mode));
+    match report.exit_status() {
+        Some(code) => ExitCode::from(code),
+        None => {
+            println!("kbf {}: ok", needs.mode);
+            ExitCode::SUCCESS
+        }
+    }
 }

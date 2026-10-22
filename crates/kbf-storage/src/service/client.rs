@@ -29,8 +29,11 @@ use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tonic::{Code, Request, Response, Status};
 
-use super::{MAP_GENERATION_HEADER, MAX_MESSAGE_BYTES, UNOWNED_HEADER, wire};
-use crate::{ActionEntry, Answer, PutStream, ReadStream, Storage, StorageError};
+use super::{
+    DURABLE_HEADER, DURABLE_ONLY, DURABLE_WAIT, MAP_GENERATION_HEADER, MAX_MESSAGE_BYTES,
+    UNOWNED_HEADER, wire,
+};
+use crate::{ActionEntry, Answer, PutStream, ReadStream, Storage, StorageError, in_flight};
 
 /// The largest message of a `Write`'s data.
 const WRITE_CHUNK_BYTES: usize = 1 << 20;
@@ -229,46 +232,86 @@ fn record_to_proto(record: &ActionRecord) -> Record {
     }
 }
 
+/// The most [`RemoteStorage::read_blob`] allocates before the first byte arrives.
+const READ_BLOB_PREALLOCATE: u64 = 64 << 20;
+
+impl RemoteStorage {
+    /// `FindMissingBlobs` for `digests`, marked [`DURABLE_HEADER`] with `durable` when
+    /// there is one.
+    async fn ask_missing(
+        &self,
+        digests: &[Digest],
+        durable: Option<&'static str>,
+    ) -> Result<Vec<Digest>, StorageError> {
+        let request = FindMissingBlobsRequest {
+            instance_name: String::new(),
+            blob_digests: digests.iter().map(wire::to_proto).collect(),
+            digest_function: 0,
+        };
+        let mut request = self.tag(request);
+        if let Some(value) = durable {
+            request
+                .metadata_mut()
+                .insert(DURABLE_HEADER, MetadataValue::from_static(value));
+        }
+        let mut client = ContentAddressableStorageClient::new(self.channel.clone())
+            .max_decoding_message_size(MAX_MESSAGE_BYTES);
+        let response = client.find_missing_blobs(request).await.map_err(other)?;
+        response
+            .into_inner()
+            .missing_blob_digests
+            .iter()
+            .map(|d| wire::digest(Some(d)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(other)
+    }
+}
+
 impl Storage for RemoteStorage {
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
-        Box::pin(async move {
-            let request = FindMissingBlobsRequest {
-                instance_name: String::new(),
-                blob_digests: digests.iter().map(wire::to_proto).collect(),
-                digest_function: 0,
-            };
-            let mut client = ContentAddressableStorageClient::new(self.channel.clone())
-                .max_decoding_message_size(MAX_MESSAGE_BYTES);
-            let response = client
-                .find_missing_blobs(self.tag(request))
-                .await
-                .map_err(other)?;
-            response
-                .into_inner()
-                .missing_blob_digests
-                .iter()
-                .map(|d| wire::digest(Some(d)))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(other)
-        })
+        Box::pin(self.ask_missing(digests, None))
+    }
+
+    /// Asks with [`DURABLE_HEADER`]: the node answers from its index alone.
+    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        Box::pin(self.ask_missing(digests, Some(DURABLE_ONLY)))
+    }
+
+    /// Asks with [`DURABLE_HEADER`] `wait`: the node waits, for at most its own bound
+    /// (`--durable-wait`), for its held blobs among `digests` to be written, then answers
+    /// from its index alone.
+    fn find_durable_waiting<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        Box::pin(self.ask_missing(digests, Some(DURABLE_WAIT)))
     }
 
     /// The whole blob, collected from the stream of [`Storage::read_range`]; its length
     /// is checked against the digest's size.
+    ///
+    /// Each chunk is appended to one buffer as it arrives and dropped, so the blob is
+    /// held once and a chunk beside it, not twice. Counted (`kbf_bytes_in_flight`) at
+    /// the buffer's capacity as it grows, and until the last `Bytes` over it is dropped.
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> Answer<'a, Bytes> {
         Box::pin(async move {
-            let chunks: Vec<Bytes> = Storage::read_range(self, digest, 0, 0)
-                .await?
-                .try_collect()
-                .await?;
-            let blob = chunks.concat();
+            let mut chunks = Storage::read_range(self, digest, 0, 0).await?;
+            // The digest's size, up to a bound: the buffer is one allocation for any blob
+            // that fits it, and counted from here whether or not its pages are touched.
+            let room = usize::try_from(digest.size_bytes.min(READ_BLOB_PREALLOCATE)).unwrap_or(0);
+            let mut blob: Vec<u8> = Vec::with_capacity(room);
+            let mut held = in_flight::hold(blob.capacity() as u64);
+            while let Some(chunk) = chunks.try_next().await? {
+                let chunk = in_flight::counted(chunk);
+                blob.extend_from_slice(&chunk);
+                // The capacity only grows: what it grew by (nothing, for a blob up to the
+                // preallocation) is counted too.
+                held.add(blob.capacity() as u64 - held.bytes());
+            }
             if blob.len() as u64 != digest.size_bytes {
                 return Err(StorageError::Internal(format!(
                     "{digest} came back as {} bytes",
                     blob.len()
                 )));
             }
-            Ok(Bytes::from(blob))
+            Ok(in_flight::counted_with(blob, held))
         })
     }
 

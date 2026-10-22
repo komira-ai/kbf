@@ -6,7 +6,7 @@
 //! enrollment vocabulary (tokens, node ids, roles, the reasons a frontend refuses a node).
 //!
 //! This is a pure crate: no async runtime, network, clock, randomness or hashed
-//! collections. The layering test in `kbf-it` and the lists in `clippy.toml` enforce it.
+//! collections. The layering test in `kbf-integration-test` and the lists in `clippy.toml` enforce it.
 //! Every value here is plain data: two processes that build a value from the same
 //! inputs get equal values that order and format identically.
 
@@ -17,6 +17,8 @@ mod enroll;
 pub mod enroll_api;
 mod image;
 mod lease;
+pub mod object_store_api;
+pub mod operator_api;
 mod phase;
 mod platform;
 mod qos;
@@ -24,6 +26,7 @@ mod release;
 mod rollout;
 mod state;
 mod time;
+mod version;
 mod work;
 
 pub use digest::{Digest, DigestFunction, ParseDigestError};
@@ -43,6 +46,7 @@ pub use rollout::{
 };
 pub use state::{Effect, StateMachine};
 pub use time::FarmTime;
+pub use version::{VERSION_CAP, Version, VersionFault};
 pub use work::{
     ActionKey, Answer, ControlRecord, Failure, FarmFault, FarmRun, FencePolicy, LeaseGrant,
     LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Refusal, RefusalRecord, Resources,

@@ -5,10 +5,6 @@
 //!                          --mc PATH [--key-file PATH [--key-owner USER]] [--remove] [--apply]
 //! kbf-deploy minio nodeport --kubectl PATH --kubeconfig PATH [--context NAME]
 //!                           --namespace NS --service NAME --node-port N [--remove] [--apply]
-//! kbf-deploy linux render-units --config FILE --out DIR [--kbf-uid UID] [--mode MODE]
-//! kbf-deploy linux check-units --config FILE --dir DIR [--installable] [--mode MODE [--kbf-bin PATH]]
-//! kbf-deploy linux install-units --config FILE [--bin-dir DIR] [--restart-minio] [--apply]
-//! kbf-deploy linux install-units --config FILE --uninstall [--apply]
 //! kbf-deploy linux swap --config FILE [--kubelet-allows-swap] [--remove] [--apply]
 //! kbf-deploy linux meta-backup --meta-dir DIR [--hot-dir DIR] --out FILE [--metrics URL]
 //!                              [--unit NAME] [--ready-secs N] [--apply]
@@ -27,10 +23,6 @@
 //! kbf-deploy mdm verify --config FILE [--via ADDR:PORT]
 //! kbf-deploy mdm erase-request --serial SERIAL --reason TEXT [--lease ID] --key KEY
 //!                           --out FILE [--valid-for MINUTES] [--ssh-keygen PATH] [--apply]
-//! kbf-deploy envoy render --config FILE --out DIR
-//! kbf-deploy envoy check --config FILE [--dir DIR]
-//! kbf-deploy envoy apply --config FILE --kubectl PATH --kubeconfig PATH
-//!                        [--refuse-example FILE] [--apply]
 //! kbf-deploy pilot server-install --config FILE --bin FILE [--bind ADDR] [--pki DIR]
 //!                                 [--s3-env-file FILE] [--apply]
 //! kbf-deploy pilot server-install --config FILE --uninstall [--apply]
@@ -40,22 +32,12 @@
 //!
 //! Bad flags exit 2 for every subcommand. The `minio` subcommands change a host: without
 //! `--apply` they print their plan as `DRY-RUN:` lines and change nothing, and they exit
-//! 0 done (or nothing to do) or 1 refused or failed. `linux render-units` and
-//! `check-units` only write into or read the directory they are given, and exit 0 done,
-//! 1 a check found a broken rule, or 2 refused (a bad setting or file, printed as
-//! `REFUSED: ...` on stderr). `linux install-units` and `swap` change the
-//! host as root, plan by default as the `minio` subcommands do, and exit 0 done (or
+//! 0 done (or nothing to do) or 1 refused or failed. `linux swap` changes the
+//! host as root, plans by default as the `minio` subcommands do, and exits 0 done (or
 //! nothing to do), 1 a step or the check after an apply failed (`FAIL ...`), or 2
 //! refused (`REFUSED: ...` on stderr). `linux meta-backup` and `meta-verify` exit 0
 //! done, 1 a failure after the stop (the unit restarted) or an archive that does not
-//! verify (`FAIL ...` on stderr), or 2 refused ([`crate::linux::meta`]). `envoy render` only writes into the directory
-//! it is given, and exits 0 done or 2 refused (`REFUSED: ...` on stderr); `envoy check`
-//! only reads, and exits 0 every check passed, 1 a check failed (`FAIL <check>: ...` on
-//! stdout) or 2 refused. `envoy apply` reads the cluster and has it validate the render in
-//! a dry run as in an apply, changes it only with `--apply`, and exits 0 done (or
-//! planned), 1 a step or the check after an apply failed (`FAIL ...` on stderr), or 2
-//! refused before any step (`REFUSED: ...` on stderr; a render check's `FAIL` lines on
-//! stdout).
+//! verify (`FAIL ...` on stderr), or 2 refused ([`crate::linux::meta`]).
 //! The `mdm` verbs exit as the `linux` host verbs do; `mdm verify` exits 1 when a check
 //! fails, `mdm dep assign` when Apple did not assign every device, and `mdm tls
 //! --check-godaddy` when the account may not use the API ([`crate::mdm`]).
@@ -76,16 +58,15 @@ use std::fs::{self, DirBuilder};
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::os::unix::fs::DirBuilderExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::envoy;
 use crate::https::Client;
-use crate::linux::{self, HostError, LinuxConfig, install, install_mode, meta, swap};
+use crate::linux::{self, HostError, SwapConfig, meta, swap};
 use crate::log;
 use crate::mdm::dep::{Dep, Serial};
 use crate::mdm::erase::{self, EraseArgs, Made};
@@ -116,24 +97,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Kit {
-    /// The host side of a commit-confirm deploy: the releases under /usr/local/kbf and
-    /// the deploy state.
+    /// The host side of a commit-confirm deploy: the releases under the installer's tree
+    /// (/var/lib/kbf-installer on Linux) and the state.
     #[command(subcommand)]
     Host(crate::host::Host),
     /// A MinIO for kbf: its buckets and key, and a NodePort for its S3 port.
     #[command(subcommand)]
     Minio(Minio),
-    /// A converged Linux storage node: MinIO, kbf-server and kbf-daemon.
+    /// A Linux node: the build swapfile, the metadata backup and the certificate check.
     #[command(subcommand)]
     Linux(Linux),
     /// An Apple MDM on one Linux host: NanoHUB, the SCEP server, NanoDEP and an HTTPS
     /// proxy.
     #[command(subcommand)]
     Mdm(Mdm),
-    /// A client front: a Tailscale operator Ingress in front of Envoy, which routes
-    /// REAPI calls to the kbf-servers.
-    #[command(subcommand)]
-    Envoy(Envoy),
     /// A pilot kbf-server as a systemd user service, and the buck2 overlay that points
     /// one worktree at it.
     #[command(subcommand)]
@@ -143,129 +120,8 @@ enum Kit {
     Log(log::LogArgs),
 }
 
-/// What the envoy kit renders and checks.
-#[derive(Clone, Copy, clap::ValueEnum)]
-enum Topology {
-    Front,
-    Box,
-}
-
-#[derive(Subcommand)]
-enum Envoy {
-    /// Write manifests.json (the Kubernetes objects) and envoy.json (Envoy's config)
-    /// into a directory.
-    Render {
-        /// The kit's settings, KEY=VALUE lines.
-        #[arg(long)]
-        config: PathBuf,
-        /// Where to write the two files.
-        #[arg(long)]
-        out: PathBuf,
-        /// `front` (the default): the Kubernetes front. `box`: one host's Envoy in
-        /// front of two kbf instances; writes envoy.json and envoy.args, from the box
-        /// settings (templates/envoy/box.example).
-        #[arg(long, value_enum, default_value_t = Topology::Front)]
-        topology: Topology,
-    },
-    /// Check a render for what the REAPI path through the front depends on: every
-    /// client call routed with no bound on a stream's life, TLS to the CA naming
-    /// each server, health checks kbf-server answers, the Ingress and NetworkPolicy
-    /// reaching Envoy. One `FAIL <check>: <why>` line per failure.
-    Check {
-        /// The kit's settings, KEY=VALUE lines.
-        #[arg(long)]
-        config: PathBuf,
-        /// The directory render wrote; without it, the render of --config is checked.
-        #[arg(long)]
-        dir: Option<PathBuf>,
-        /// The topology --config and the render are of; see `render`. For `box`, the
-        /// rules are the long-stream, health, limit and hot-restart ones.
-        #[arg(long, value_enum, default_value_t = Topology::Front)]
-        topology: Topology,
-    },
-    /// Check the render and what the cluster must already hold, have the API server
-    /// validate the render, and with --apply apply it (server-side, field manager
-    /// kbf-front) and wait for Envoy and the Ingress's address.
-    Apply {
-        /// The kit's settings, KEY=VALUE lines.
-        #[arg(long)]
-        config: PathBuf,
-        /// kubectl, by absolute path.
-        #[arg(long, value_parser = HostPath::new)]
-        kubectl: HostPath,
-        /// A kubeconfig with the config's KBF_FRONT_KUBE_CONTEXT.
-        #[arg(long, value_parser = HostPath::new)]
-        kubeconfig: HostPath,
-        /// Settings whose context, tailnet and servers --config must not share (the
-        /// kit's own config.example); kbf's example when not given.
-        #[arg(long)]
-        refuse_example: Option<PathBuf>,
-        /// Apply for real.
-        #[arg(long)]
-        apply: bool,
-    },
-}
-
 #[derive(Subcommand)]
 enum Linux {
-    /// Render the node's four systemd files into a directory.
-    RenderUnits {
-        /// The kit's settings, KEY=VALUE lines.
-        #[arg(long)]
-        config: PathBuf,
-        /// Where to write the files, laid out as under /etc/systemd/system.
-        #[arg(long)]
-        out: PathBuf,
-        /// The kbf user's uid (the daemon's XDG_RUNTIME_DIR); without it the daemon's
-        /// unit keeps `<kbf uid>`, which `check-units --installable` refuses.
-        #[arg(long)]
-        kbf_uid: Option<u32>,
-        /// Render kbf.slice and the unit of this mode of the one kbf binary instead.
-        #[arg(long, value_enum)]
-        mode: Option<linux::Mode>,
-    },
-    /// Check rendered units against the host's priorities.
-    CheckUnits {
-        /// The settings the units were rendered with.
-        #[arg(long)]
-        config: PathBuf,
-        /// The directory render-units wrote.
-        #[arg(long)]
-        dir: PathBuf,
-        /// Also refuse a `<...>` placeholder.
-        #[arg(long)]
-        installable: bool,
-        /// Check the unit of this mode of the one kbf binary instead.
-        #[arg(long, value_enum)]
-        mode: Option<linux::Mode>,
-        /// The kbf that parses a built mode's flags (`kbf check-args`); without it the
-        /// unit's own ExecStart= binary, and the parse is skipped when that is not there.
-        #[arg(long, requires = "mode")]
-        kbf_bin: Option<PathBuf>,
-    },
-    /// Install the binaries and units, and start kbf-server and kbf-daemon (as root).
-    InstallUnits {
-        /// The kit's settings, KEY=VALUE lines.
-        #[arg(long)]
-        config: PathBuf,
-        /// Where new kbf-server and kbf-daemon binaries are; without it the installed
-        /// ones stay.
-        #[arg(long, value_parser = HostPath::new)]
-        bin_dir: Option<HostPath>,
-        /// Also restart MinIO, so its new priorities take effect now.
-        #[arg(long)]
-        restart_minio: bool,
-        /// Roll back: stop the services and move the four files aside.
-        #[arg(long, conflicts_with_all = ["bin_dir", "restart_minio"])]
-        uninstall: bool,
-        /// Install kbf.slice and the unit of this mode of the one kbf binary instead
-        /// (with --bin-dir, the new kbf too), and start it.
-        #[arg(long, value_enum, conflicts_with_all = ["restart_minio", "uninstall"])]
-        mode: Option<linux::Mode>,
-        /// Carry the plan out.
-        #[arg(long)]
-        apply: bool,
-    },
     /// Back up kbf-server's metadata log in a brief stop (as root): one tar file with
     /// a sha256 manifest; prints the downtime.
     MetaBackup(meta::cli::BackupArgs),
@@ -554,7 +410,6 @@ pub fn run<E: Exec>(
         Kit::Minio(Minio::Nodeport(a)) => minio_nodeport(a, exec, out),
         Kit::Linux(l) => return linux_kit(l, exec, out, err),
         Kit::Mdm(m) => return mdm_kit(m, exec, out, err),
-        Kit::Envoy(e) => return envoy_kit(e, exec, out, err),
         Kit::Log(a) => return log::run(&a, out, err),
         Kit::Pilot(p) => {
             return pilot::cli::run(p, exec, env, out, err, &pilot::cli::sleep_a_second);
@@ -569,88 +424,29 @@ pub fn run<E: Exec>(
     }
 }
 
-/// The `linux` kit: 0 done, 1 a check found a broken rule, 2 refused.
+/// The `linux` kit: 0 done, 1 a step failed, 2 refused.
 fn linux_kit<E: Exec>(
     l: Linux,
     exec: &mut E,
     mut out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let result = match l {
-        Linux::RenderUnits {
-            config,
-            out: dir,
-            kbf_uid,
-            mode,
-        } => match mode {
-            None => linux::render_units(&config, &dir, kbf_uid),
-            Some(mode) => linux::render_mode_unit(&config, &dir, kbf_uid, mode),
-        }
-        .map(|line| (vec![line], 0)),
-        Linux::CheckUnits {
-            config,
-            dir,
-            installable,
-            mode,
-            kbf_bin,
-        } => match mode {
-            None => linux::check_units(&config, &dir, installable),
-            Some(mode) => {
-                linux::check_mode_unit(exec, &config, &dir, mode, installable, kbf_bin.as_deref())
-            }
-        }
-        .map(|report| {
-            let code = u8::from(!report.failures.is_empty());
-            let mut lines: Vec<String> = report.failures.iter().map(ToString::to_string).collect();
-            lines.extend(report.notes);
-            lines.push(report.summary);
-            (lines, code)
-        }),
-        Linux::InstallUnits {
-            config,
-            bin_dir,
-            restart_minio,
-            uninstall,
-            mode: unit_mode,
-            apply,
-        } => {
-            let done = LinuxConfig::load(&config)
-                .map_err(HostError::from)
-                .and_then(|config| {
-                    if let Some(mode) = unit_mode {
-                        let a = install_mode::InstallMode {
-                            config,
-                            mode,
-                            bin_dir,
-                        };
-                        install_mode::run(exec, &a, self::mode(apply), &mut out)
-                    } else if uninstall {
-                        install::run_uninstall(exec, &config, &stamp(), mode(apply), &mut out)
-                    } else {
-                        let a = install::Install {
-                            config,
-                            bin_dir,
-                            restart_minio,
-                        };
-                        install::run(exec, &a, mode(apply), &mut out)
-                    }
-                });
-            return host_verb(done, err);
-        }
-        Linux::MetaBackup(a) => {
-            return meta::cli::backup(a, exec, &meta::metrics::http_get, out, err);
-        }
-        Linux::MetaVerify(a) => return meta::cli::verify(&a, out, err),
-        Linux::VerifyCert(a) => return linux::verify_cert::cli(&a, out, err),
+    match l {
+        Linux::MetaBackup(a) => meta::cli::backup(a, exec, &meta::metrics::http_get, out, err),
+        Linux::MetaVerify(a) => meta::cli::verify(&a, out, err),
+        Linux::VerifyCert(a) => linux::verify_cert::cli(&a, out, err),
         Linux::Swap {
             config,
             kubelet_allows_swap,
             remove,
             apply,
         } => {
-            let done = LinuxConfig::load(&config)
+            let done = SwapConfig::load(&config)
                 .map_err(HostError::from)
                 .and_then(|config| {
+                    if let Some(warning) = config.retired_warning() {
+                        let _ = writeln!(err, "{warning}");
+                    }
                     let a = swap::Swap {
                         config,
                         kubelet_allows_swap,
@@ -658,20 +454,7 @@ fn linux_kit<E: Exec>(
                     };
                     swap::run(exec, &a, mode(apply), &mut out)
                 });
-            return host_verb(done, err);
-        }
-    };
-    match result {
-        Ok((lines, code)) => {
-            for line in lines {
-                // A closed stdout (`| head`) is not worth a panic; the exit code still says it.
-                let _ = writeln!(out, "{line}");
-            }
-            ExitCode::from(code)
-        }
-        Err(e) => {
-            let _ = writeln!(err, "REFUSED: {e}");
-            ExitCode::from(2)
+            host_verb(done, err)
         }
     }
 }
@@ -809,120 +592,6 @@ fn mdm_kit<E: Exec>(m: Mdm, exec: &mut E, out: &mut dyn Write, err: &mut dyn Wri
     }
 }
 
-/// The `envoy` kit: 0 done (or every check passed), 1 a check (or an apply's step)
-/// failed, 2 refused.
-fn envoy_kit<E: Exec>(
-    e: Envoy,
-    exec: &mut E,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> ExitCode {
-    let done = match e {
-        Envoy::Apply {
-            config,
-            kubectl,
-            kubeconfig,
-            refuse_example,
-            apply,
-        } => {
-            let example = refuse_example.as_deref();
-            let done = envoy_apply(
-                &config,
-                kubectl,
-                kubeconfig,
-                example,
-                mode(apply),
-                exec,
-                out,
-            );
-            return match done {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) if e.exit_code() == 1 => {
-                    let _ = writeln!(err, "FAIL {e}");
-                    ExitCode::FAILURE
-                }
-                Err(e) => {
-                    let _ = writeln!(err, "REFUSED: {e}");
-                    ExitCode::from(2)
-                }
-            };
-        }
-        Envoy::Render {
-            config,
-            out: dir,
-            topology: Topology::Front,
-        } => envoy::render_files(&config, &dir),
-        Envoy::Render {
-            config,
-            out: dir,
-            topology: Topology::Box,
-        } => envoy::render_box_files(&config, &dir),
-        Envoy::Check {
-            config,
-            dir,
-            topology,
-        } => match envoy_check(topology, &config, dir.as_deref()) {
-            Ok(failures) if failures.is_empty() => Ok(match topology {
-                Topology::Front => envoy::check_passed(),
-                Topology::Box => envoy::check_box_passed(),
-            }),
-            Ok(failures) => {
-                for f in &failures {
-                    let _ = writeln!(out, "{}", f.line());
-                }
-                return ExitCode::FAILURE;
-            }
-            Err(e) => Err(e),
-        },
-    };
-    match done {
-        Ok(line) => {
-            let _ = writeln!(out, "{line}");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            let _ = writeln!(err, "REFUSED: {e}");
-            ExitCode::from(2)
-        }
-    }
-}
-
-/// `envoy check` of the topology's render.
-fn envoy_check(
-    topology: Topology,
-    config: &Path,
-    dir: Option<&Path>,
-) -> Result<Vec<envoy::check::CheckFailure>, envoy::Refusal> {
-    match topology {
-        Topology::Front => envoy::check_files(config, dir),
-        Topology::Box => envoy::check_box_files(config, dir),
-    }
-}
-
-/// `envoy apply`, with a private kubectl cache directory.
-fn envoy_apply<E: Exec>(
-    config: &Path,
-    kubectl: HostPath,
-    kubeconfig: HostPath,
-    example: Option<&Path>,
-    mode: Mode,
-    exec: &mut E,
-    mut out: &mut dyn Write,
-) -> Result<(), envoy::apply::ApplyError> {
-    let config = envoy::EnvoyConfig::load(config)?;
-    let example = envoy::apply::example(example)?;
-    let scratch = Scratch::new().map_err(envoy::apply::ApplyError::Scratch)?;
-    let args = envoy::apply::Apply {
-        config,
-        example,
-        kubectl,
-        kubeconfig,
-        cache_dir: scratch.path(),
-        wait: envoy::apply::Wait::DEFAULT,
-    };
-    envoy::apply::run(exec, &args, mode, &mut out)
-}
-
 /// A host-changing `linux` verb's exit: 0 done, 1 a step failed, 2 refused.
 fn host_verb(done: Result<(), HostError>, err: &mut dyn Write) -> ExitCode {
     match done {
@@ -938,8 +607,8 @@ fn host_verb(done: Result<(), HostError>, err: &mut dyn Write) -> ExitCode {
     }
 }
 
-/// The directory name `install-units --uninstall` moves the files into: seconds since
-/// the Unix epoch.
+/// The directory name `mdm install --uninstall` and `pilot server-install --uninstall`
+/// move the files into: seconds since the Unix epoch.
 pub(crate) fn stamp() -> String {
     stamp_secs().to_string()
 }

@@ -1,5 +1,5 @@
-//! The helper's word: `DIR/status.json`, which the root helper writes and the client
-//! reads. A missing file means there is no helper; a file the client cannot understand
+//! The installer's word: `DIR/status.json` (schema 2), which the root `kbf-installer`
+//! writes and the client reads. A missing file means there is no helper; a file the client cannot understand
 //! is a refusal with the reason, never a guess.
 
 use std::fs;
@@ -8,15 +8,16 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::types::{Staged, is_hex};
+use crate::types::{Available, ReleaseSource, Staged, is_hex};
 
 /// The schema this client reads.
-pub const SCHEMA: u64 = 1;
+pub const SCHEMA: u64 = 2;
 
 /// What the helper says it is doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HelperState {
     Idle,
+    Fetching,
     Staged,
     ActivatedUnconfirmed,
     Confirmed,
@@ -34,6 +35,11 @@ pub struct Report {
     pub refusal: String,
     pub acked_order_id: u64,
     pub staged_facts: Option<Staged>,
+    /// The seed the host's package carries, once the installer found it whole and above its
+    /// floor.
+    pub available: Option<Available>,
+    /// Where the installer fetches from, when it says.
+    pub release_source: ReleaseSource,
 }
 
 /// What reading the file found.
@@ -57,6 +63,17 @@ struct Raw {
     refusal: String,
     acked_order_id: u64,
     staged: Option<RawStaged>,
+    /// Written by an installer that carries a package with a seed; absent from the others.
+    #[serde(default)]
+    available: Option<RawAvailable>,
+    #[serde(default)]
+    release_source: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawAvailable {
+    commit: String,
+    seq: u64,
 }
 
 #[derive(Deserialize)]
@@ -86,6 +103,7 @@ fn parse(bytes: &[u8]) -> Result<Report, String> {
     }
     let state = match raw.state.as_str() {
         "idle" => HelperState::Idle,
+        "fetching" => HelperState::Fetching,
         "staged" => HelperState::Staged,
         "activated_unconfirmed" => HelperState::ActivatedUnconfirmed,
         "confirmed" => HelperState::Confirmed,
@@ -104,6 +122,11 @@ fn parse(bytes: &[u8]) -> Result<Report, String> {
             ));
         }
     }
+    if let Some(seed) = &raw.available
+        && !is_hex(&seed.commit, 40)
+    {
+        return Err("status.json: available.commit is not 40 lowercase hex digits".to_owned());
+    }
     Ok(Report {
         installed: raw.installed_commit,
         previous: raw.previous_commit,
@@ -116,6 +139,14 @@ fn parse(bytes: &[u8]) -> Result<Report, String> {
             min_protocol: s.min_protocol,
             state_schema: s.state_schema,
         }),
+        available: raw.available.map(|a| Available {
+            commit: a.commit,
+            seq: a.seq,
+        }),
+        release_source: raw
+            .release_source
+            .as_deref()
+            .map_or(ReleaseSource::Unreported, ReleaseSource::from_word),
     })
 }
 

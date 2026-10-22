@@ -15,6 +15,9 @@ pub const UNFLUSHED_BYTES: &str = "kbf_write_tier_unflushed_bytes";
 pub const UNFLUSHED_BLOCKS: &str = "kbf_write_tier_unflushed_blocks";
 /// Staged objects whose key in the store held another object.
 pub const FLUSH_CONFLICTS: &str = "kbf_write_tier_flush_conflicts_total";
+/// Bytes of blobs acknowledged from RAM and not yet in the index
+/// (`docs/design/storage-ram-ack.md`). A server older than the family does not print it.
+pub const RAM_UNWRITTEN_BYTES: &str = "kbf_storage_ram_unwritten_bytes";
 
 /// How long a `GET` of `/metrics` may take, connect and answer each.
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -27,11 +30,21 @@ pub struct Tier {
     pub conflicts: u64,
 }
 
-/// The write tier's readings at `url`, or `None` for a server with no write tier (none
-/// of the three families). Refuses an answer that is not a 200, a family given twice or
-/// with a value that is not a whole number, and a tier that reports some families but
-/// not all.
-pub fn read(get: Get<'_>, url: &HttpUrl) -> Result<Option<Tier>, MetaError> {
+/// What `meta-backup` reads from `/metrics`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Readings {
+    /// The write tier, or `None` for a server with no write tier.
+    pub tier: Option<Tier>,
+    /// Bytes acknowledged from RAM and not yet in the index; 0 when the server does not
+    /// print the family (it holds none).
+    pub ram_unwritten: u64,
+}
+
+/// The readings at `url`: the write tier's, or `None` for a server with no write tier
+/// (none of the three families), and the bytes held in RAM. Refuses an answer that is not
+/// a 200, a family given twice or with a value that is not a whole number, and a tier
+/// that reports some families but not all.
+pub fn read(get: Get<'_>, url: &HttpUrl) -> Result<Readings, MetaError> {
     let refuse = |why: String| MetaError::Metrics {
         url: url.to_string(),
         why,
@@ -42,7 +55,8 @@ pub fn read(get: Get<'_>, url: &HttpUrl) -> Result<Option<Tier>, MetaError> {
     }
     let text = String::from_utf8(body).map_err(|_| refuse("the body is not UTF-8".into()))?;
     let value = |name: &'static str| family(&text, name, url);
-    match (
+    let ram_unwritten = value(RAM_UNWRITTEN_BYTES)?.unwrap_or(0);
+    let tier = match (
         value(UNFLUSHED_BYTES)?,
         value(UNFLUSHED_BLOCKS)?,
         value(FLUSH_CONFLICTS)?,
@@ -65,7 +79,11 @@ pub fn read(get: Get<'_>, url: &HttpUrl) -> Result<Option<Tier>, MetaError> {
                 why: "is missing beside the write tier's other families",
             })
         }
-    }
+    }?;
+    Ok(Readings {
+        tier,
+        ram_unwritten,
+    })
 }
 
 /// The value of the sample `name` (a family without labels), if the text has one.

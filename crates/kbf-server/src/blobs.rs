@@ -42,13 +42,11 @@ use kbf_proto::worker::{
 };
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::identity::Peers;
+use crate::identity::{Peers, presented};
 
 /// Admits the call `request` is, as the module docs say, or says why not (and logs it).
 async fn admit<T>(peers: &Peers, request: &Request<T>, call: &'static str) -> Result<(), Status> {
-    let certs = kbf_tls::peer_certs(request);
-    let leaf = certs.as_deref().and_then(|chain| chain.first());
-    let admitted = peers.admit_call(leaf.map(AsRef::as_ref)).await;
+    let admitted = peers.admit_call(&presented(request.extensions())).await;
     admitted.map(drop).inspect_err(|refused| {
         let (code, reason) = (refused.code(), refused.message());
         tracing::warn!(call, ?code, reason, "blob call refused");

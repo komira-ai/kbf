@@ -13,12 +13,20 @@ pub const EXEC_ROOT: &str = "/kbf/root";
 /// `kbf-lease-<term>-<seq>`.
 pub(crate) const LEASE_PREFIX: &str = "kbf-lease-";
 
+/// The uid and gid an action runs as inside its container: a fixed unprivileged id, as an
+/// action runs on a worker that does not give it root. Rootless, the namespace maps
+/// container ids `0..65536` to the daemon user's subordinate range, so this id is
+/// subordinate id 1000 of that range, and permission checks are real: a mode-0 file is
+/// refused, a directory the action does not own cannot be written.
+pub(crate) const ACTION_ID: u32 = 1000;
+
 /// The owner, in the setup namespace (`oci::Mapping::Setup`), of a lease's overlay
-/// directories while its container may run: id 1, the first subordinate id, which the
-/// action's namespace maps the container's root to. The container cannot write under a
-/// directory whose owner it does not map, so without this the action could write nothing
-/// under the exec root (the overlay refuses with `EROFS`).
-pub(crate) const CONTAINER_OWNER: &str = "1:1";
+/// directories while its container may run: [`ACTION_ID`] there, which is
+/// `ACTION_ID + 1` (the setup namespace maps the daemon user to 0 and the range from 1).
+/// The container cannot write under a directory whose owner it does not map, or does not
+/// run as, so without this the action could write nothing under the exec root (the
+/// overlay refuses with `EACCES`).
+pub(crate) const CONTAINER_OWNER: &str = "1001:1001";
 
 /// The owner, in the same namespace, of the overlay directories once the container has
 /// stopped: id 0 there is the daemon's own user, so the driver reads every output (an
@@ -37,7 +45,7 @@ pub struct ContainerLimits {
     /// limit.
     pub nofile: u64,
     /// `RLIMIT_NPROC`, soft and hard. The kernel counts it per user, and every
-    /// container's root is the same subordinate id, so it bounds the processes of all the
+    /// container's action runs as the same subordinate id (uid 1000 of the range), so it bounds the processes of all the
     /// node's actions together, not one container's.
     pub nproc: u64,
 }
@@ -105,6 +113,14 @@ pub(crate) enum Ended {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Catches `CONTAINER_OWNER` drifting from the id the action runs as: a lease's
+    /// directories given to another id than the process's are unwritable to the action.
+    #[test]
+    fn the_container_owner_is_the_action_id_in_the_setup_namespace() {
+        let setup = ACTION_ID + 1;
+        assert_eq!(CONTAINER_OWNER, format!("{setup}:{setup}"));
+    }
 
     pub(crate) fn spec() -> ContainerSpec {
         ContainerSpec {

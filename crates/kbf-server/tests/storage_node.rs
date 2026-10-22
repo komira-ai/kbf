@@ -3,6 +3,7 @@
 //! (docs/design/architecture-v2.md, section 9).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use bytes::Bytes;
 use clap::CommandFactory as _;
@@ -17,12 +18,9 @@ use rcgen::{
 };
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 
-fn dir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("storage-node")
-        .join(name);
-    std::fs::create_dir_all(&dir).expect("directory");
-    dir
+/// A directory of its own, removed when it drops.
+fn dir(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("storage-node-{name}"))
 }
 
 /// The flags of `kbf storage` over new stores in `dir`, and these more.
@@ -39,6 +37,25 @@ fn flags(dir: &Path, more: &[String]) -> Result<StorageFlags, clap::Error> {
     parse(&command().try_get_matches_from(argv)?)
 }
 
+/// Whether any file under `dir` holds `needle`, as bytes anywhere in it.
+fn on_disk(dir: &Path, needle: &[u8]) -> bool {
+    std::fs::read_dir(dir).expect("dir").flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            return on_disk(&path, needle);
+        }
+        let body = std::fs::read(&path).unwrap_or_default();
+        body.windows(needle.len()).any(|w| w == needle)
+    })
+}
+
+/// A blob of a size and content nothing else in the directory has, and its bytes.
+fn marked(seed: u8) -> (kbf_front::VerifiedBlob, Bytes) {
+    let body: Vec<u8> = (0..4096_usize).map(|i| (i % 251) as u8 ^ seed).collect();
+    let bytes = Bytes::from(body);
+    (kbf_front::VerifiedBlob::hashed(bytes.clone()), bytes)
+}
+
 fn never() -> std::io::Result<std::future::Pending<()>> {
     Ok(std::future::pending())
 }
@@ -48,7 +65,8 @@ fn never() -> std::io::Result<std::future::Pending<()>> {
 /// is refused now, so no start line has one.
 #[tokio::test]
 async fn the_start_line_names_the_address_and_the_log() {
-    let local = flags(&dir("line-local"), &[]).expect("flags");
+    let dir = dir("line-local");
+    let local = flags(&dir, &[]).expect("flags");
     let node = start_storage(&local, never).await.expect("starts");
     let line = node.start_line().to_owned();
     let want = format!(
@@ -71,7 +89,7 @@ async fn the_start_line_names_the_address_and_the_log() {
 /// without them (IPv4, IPv6, and IPv4-mapped).
 #[tokio::test]
 async fn plain_text_is_for_loopback_only() {
-    let d = dir(&format!("plain-off-loopback-{}", std::process::id()));
+    let d = dir("plain-off-loopback");
     for addr in ["0.0.0.0:0", "[::]:0", "192.0.2.10:0", "[2001:db8::1]:0"] {
         let f = flags(&d, &[format!("--storage-listen={addr}")]).expect("parses");
         let refused = f.listener().expect_err(addr);
@@ -104,7 +122,8 @@ async fn plain_text_is_for_loopback_only() {
 /// Catches a node that serves past its shutdown future, or never starts serving.
 #[tokio::test]
 async fn it_serves_until_the_shutdown_future_completes() {
-    let f = flags(&dir("shutdown"), &[]).expect("flags");
+    let dir = dir("shutdown");
+    let f = flags(&dir, &[]).expect("flags");
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let node = start_storage(&f, || {
         Ok(async move {
@@ -116,6 +135,115 @@ async fn it_serves_until_the_shutdown_future_completes() {
     let serving = tokio::spawn(node.serve());
     stop.send(()).expect("stop");
     serving.await.expect("task").expect("serves to the end");
+}
+
+/// Catches a node with a RAM budget whose stop does not complete: with `--ram-ack-bytes`
+/// the node starts the drain task and drains once more when it stops; nothing is held, so
+/// the stop ends at once and serves to the end, as it does without the flag. The flags
+/// are accepted by `kbf storage` with their values.
+#[tokio::test]
+async fn a_node_with_a_ram_budget_starts_and_stops() {
+    let dir = dir("ram-budget");
+    let f = flags(
+        &dir,
+        &[
+            "--ram-ack-bytes=1048576".to_owned(),
+            "--ram-drain-deadline=2".to_owned(),
+        ],
+    )
+    .expect("flags");
+    assert_eq!(f.server.ram_ack_bytes(), 1 << 20);
+    assert_eq!(f.server.ram_drain_deadline(), Duration::from_secs(2));
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let node = start_storage(&f, || {
+        Ok(async move {
+            let _ = stopped.await;
+        })
+    })
+    .await
+    .expect("starts");
+    let serving = tokio::spawn(node.serve());
+    stop.send(()).expect("stop");
+    serving.await.expect("task").expect("serves to the end");
+}
+
+/// Catches `kbf storage` not wiring `--ram-ack-bytes` into its cache and not draining at
+/// its stop. A node started with a budget holds a blob (`Hold::Held`; with the budget
+/// not passed to the cache the answer is `Budget`), and when the node stops its cold
+/// store has the blob's bytes (with the drain not run after serving, or dropped, the
+/// bytes never reach the disk). The disk has none of them before the hold. Mutants: the
+/// assembly leaves out `with_ram_ack_bytes`; it leaves out `ram.after(node.serving)`.
+/// The stop's own drain is pinned apart from the background task by the unit test of
+/// `RamDrain::after` (`ram_drain/tests.rs`); this one pins the assembly.
+#[tokio::test]
+async fn a_node_with_a_ram_budget_writes_what_it_holds_when_it_stops() {
+    let dir = dir("ram-stop");
+    let f = flags(
+        &dir,
+        &[
+            "--ram-ack-bytes=1048576".to_owned(),
+            "--ram-drain-deadline=5".to_owned(),
+        ],
+    )
+    .expect("flags");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let node = start_storage(&f, || {
+        Ok(async move {
+            let _ = stopped.await;
+        })
+    })
+    .await
+    .expect("starts");
+    let (blob, bytes) = marked(7);
+    assert!(!on_disk(&dir, &bytes), "not on disk before the hold");
+    assert_eq!(node.hold(&blob), Some(kbf_front::Hold::Held));
+    let serving = tokio::spawn(node.serve());
+    stop.send(()).expect("stop");
+    serving.await.expect("task").expect("serves to the end");
+    assert!(on_disk(&dir, &bytes), "the stop wrote the held blob");
+}
+
+/// Catches `kbf storage` not flushing at its stop what its write tier has staged. With a
+/// hot store the node stages an acknowledged write in the open block of its tier, which
+/// the flusher seals only 30 s after it opened, so the cold store holds none of its bytes
+/// until the stop and holds them when `serve` returns, with no RAM budget set. Mutants:
+/// the assembly leaves out `ram.after(node.serving)`; the stop flushes only when
+/// `--ram-ack-bytes` is set. The flush itself, and that it begins only once the calls
+/// have ended, is pinned by `ram_drain/tests.rs` and kbf-front's `write_tier_stop.rs`;
+/// this one pins the assembly.
+#[tokio::test]
+async fn a_node_with_a_hot_store_flushes_what_it_staged_when_it_stops() {
+    let dir = dir("hot-stop");
+    let hot = format!("--hot-store=file://{}", dir.join("hot").display());
+    let f = flags(&dir, &[hot]).expect("flags");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let node = start_storage(&f, || {
+        Ok(async move {
+            let _ = stopped.await;
+        })
+    })
+    .await
+    .expect("starts");
+    let addr = node.addr;
+    let serving = tokio::spawn(node.serve());
+    let channel = Channel::from_shared(format!("http://{addr}"))
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    let (_, bytes) = marked(10);
+    RemoteStorage::new(channel, 0)
+        .put(bytes.clone())
+        .await
+        .expect("acknowledged");
+    let cold = dir.join("cold");
+    assert!(
+        !on_disk(&cold, &bytes),
+        "staged on the hot store, not flushed"
+    );
+    stop.send(()).expect("stop");
+    serving.await.expect("task").expect("serves to the end");
+    assert!(on_disk(&cold, &bytes), "the stop flushed the staged block");
 }
 
 /// Catches flags that do not make a node: the three certificate flags must come
@@ -144,6 +272,21 @@ async fn flags_that_do_not_make_a_node_are_refused() {
     )
     .expect("parses");
     assert!(over.listener().is_err());
+    let slow = flags(&d, &["--durable-wait=60".to_owned()]).expect("parses");
+    assert!(
+        slow.listener().is_err(),
+        "a wait of half the chain's commit bound"
+    );
+    let quick = flags(
+        &d,
+        &[
+            "--durable-wait=59".to_owned(),
+            "--ram-peer-grace=3".to_owned(),
+        ],
+    )
+    .expect("parses");
+    assert!(quick.listener().is_ok());
+    assert_eq!(quick.repair.peer_grace, Duration::from_secs(3));
     let missing: Vec<String> = ["tls-cert", "tls-key", "client-ca"]
         .iter()
         .map(|n| format!("--storage-{n}={}", d.join(format!("no-{n}.pem")).display()))

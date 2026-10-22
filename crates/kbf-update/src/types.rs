@@ -2,6 +2,8 @@
 //! node says back. These are plain values; the wire messages become them at the edge of
 //! the daemon (`kbf-daemon`'s `update_link`), so nothing here knows protobuf.
 
+use serde::{Deserialize, Serialize};
+
 /// The most bytes one component's tarball may be.
 pub const MAX_COMPONENT_BYTES: u64 = 512 << 20;
 
@@ -10,10 +12,6 @@ pub const MAX_ATTESTATION_BYTES: usize = 256 << 10;
 
 /// The components a node installs, by name. An offer naming another is refused.
 pub const COMPONENT_NAMES: [&str; 2] = ["kbf", "kbf-daemon"];
-
-/// How many times the size of an offer the disk must have free before the client starts
-/// fetching it: the tarballs land in the inbox and the helper unpacks them beside it.
-pub const FREE_DISK_FACTOR: u64 = 3;
 
 /// One file of a release, as the offer names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,17 +40,37 @@ pub struct Offer {
     pub platform: String,
     /// What to fetch.
     pub components: Vec<Component>,
+    /// What the frontend's version facts document states about the release (the offer's
+    /// `platform` is the platform of these facts). Claims: the installer checks the fetched binary's
+    /// own report against them. Zeros when the frontend predates the fields.
+    pub expected: Expected,
 }
 
-/// What an order asks the helper to do.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The facts a release's `kbf --version --json` is expected to declare.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Expected {
+    pub protocol: u32,
+    pub min_protocol: u32,
+    pub state_schema: u32,
+    /// The build profile, for example `release`.
+    pub profile: String,
+}
+
+/// What an order asks the installer to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Verb {
-    /// Switch to the staged release and restart.
+    /// Fetch the release if it is not installed, switch to it and restart.
     Activate,
     /// Keep the release that was switched to.
     Confirm,
     /// Go back to the previous release.
     Revert,
+    /// The frontend's own update, which the frontend writes into its own host's spool. It
+    /// is a word of the record format only: no wire message maps to it and this crate never
+    /// writes it (the installer on a node host would refuse it anyway).
+    #[serde(rename = "frontend_update")]
+    FrontendUpdate,
 }
 
 impl Verb {
@@ -63,6 +81,81 @@ impl Verb {
             Self::Activate => "activate",
             Self::Confirm => "confirm",
             Self::Revert => "revert",
+            Self::FrontendUpdate => "frontend_update",
+        }
+    }
+}
+
+/// Where the release an order names comes from: the installer's configured source, or the
+/// release its own package carries. It chooses between the two and never names a place: no
+/// path or URL travels in an order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    /// Pull it from the source `installer.toml` names, as every order has meant so far. This
+    /// is what an order that says nothing means, so a sender writes the word only for
+    /// [`Source::Staged`].
+    #[default]
+    Fetch,
+    /// Use the release the installer's package carries (its seed): nothing is pulled, and the
+    /// release goes through the same verification as a pulled one.
+    Staged,
+}
+
+impl Source {
+    /// The word the order file carries.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetch",
+            Self::Staged => "staged",
+        }
+    }
+
+    /// Whether this is the default, which a record leaves out.
+    #[must_use]
+    pub const fn is_fetch(&self) -> bool {
+        matches!(self, Self::Fetch)
+    }
+}
+
+/// The release the host's package carries, once its installer has found it whole (its digests
+/// and its build attestation) and newer than any release the host has confirmed: the release
+/// an operator can order by its commit with [`Source::Staged`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Available {
+    /// The commit: 40 lowercase hex digits.
+    pub commit: String,
+    /// The number of commits behind it, which puts two builds of one branch in order.
+    pub seq: u64,
+}
+
+/// Where the host's installer fetches the releases it is ordered to install from. An order that
+/// fetches cannot be carried out by a host that fetches nothing, so the frontend asks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReleaseSource {
+    /// The installer does not say: it predates the report, or could not read its settings.
+    #[default]
+    Unreported,
+    /// An https file server.
+    Url,
+    /// The frontend's release store.
+    Frontend,
+    /// Nothing: the release is the one the host's package carries.
+    Bundled,
+}
+
+impl ReleaseSource {
+    /// The source the word in `status.json` names. A word this build does not know is
+    /// [`ReleaseSource::Unreported`]: the installer is the gate on what it fetches, and this is
+    /// only what the frontend is told.
+    #[must_use]
+    pub fn from_word(word: &str) -> Self {
+        match word {
+            "url" => Self::Url,
+            "frontend" => Self::Frontend,
+            "bundled" => Self::Bundled,
+            _ => Self::Unreported,
         }
     }
 }
@@ -74,22 +167,29 @@ pub struct Order {
     pub order_id: u64,
     /// The epoch of the frontend that sent it; the node takes only its Welcome's.
     pub epoch: u64,
+    /// The generation of the desired release the order belongs to (0: the frontend sent
+    /// none). Carried to the installer, which holds the rule on it.
+    pub generation: u64,
     /// `None` when the message named no verb.
     pub verb: Option<Verb>,
     /// The release the order is about.
     pub commit: String,
     /// How long the helper waits for a confirmation before it reverts.
     pub window_s: u32,
+    /// Where the release comes from. `None` when the message named a number this build does
+    /// not know: the client refuses that order. (Unlike `verb`, an unset message is
+    /// `Some(Source::Fetch)`.)
+    pub source: Option<Source>,
 }
 
 /// Where the node stands, as the frontend is told.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
-    /// Nothing offered, or an offer not yet staged by the helper.
+    /// Nothing ordered.
     Idle,
-    /// The client is fetching an offer.
+    /// The installer is pulling the release of an order.
     Fetching,
-    /// The helper has the offered release staged.
+    /// The installer holds the offered release verified, not yet switched to.
     Staged,
     /// The helper switched to a release and awaits its confirmation.
     ActivatedUnconfirmed,
@@ -136,6 +236,11 @@ pub struct Status {
     pub helper_present: bool,
     /// The staged release's protocol facts, when the helper reported them.
     pub staged: Option<Staged>,
+    /// The release the host's package carries, when the helper says it is whole and newer than
+    /// what the host has confirmed.
+    pub available: Option<Available>,
+    /// Where the helper fetches releases from, when it says.
+    pub release_source: ReleaseSource,
     /// Whether the node is in the update gate: it takes no lease until the update
     /// settles. Not on the wire; it makes a change of gate wake the session.
     pub gated: bool,
@@ -155,6 +260,8 @@ impl Status {
             offered_generation: 0,
             helper_present: false,
             staged: None,
+            available: None,
+            release_source: ReleaseSource::Unreported,
             gated: false,
         }
     }

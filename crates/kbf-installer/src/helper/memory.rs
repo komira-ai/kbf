@@ -1,9 +1,11 @@
 //! What the helper remembers between cycles, in `helper.json` beside `state.json`
-//! (root-owned: the inbox is the service user's, so nothing the helper must trust is kept
-//! there).
+//! (root-owned: the order spool is the service user's, so nothing the helper must trust is
+//! kept there).
 
 use crate::CommitId;
+use crate::seed::Available;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// What the last thing the helper did came to, as `status.json` reports it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,7 +18,8 @@ pub enum Event {
     Refused,
 }
 
-/// What a staged release says about itself, for the frontend's ordering decision.
+/// What a fetched release says about itself, for the frontend's comparison with its
+/// preflight.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StagedFacts {
     pub commit: CommitId,
@@ -35,14 +38,49 @@ pub struct Memory {
     /// its id is higher; ids come from one counter in the store, not from this host, so
     /// no gap between them is a reason to refuse.
     pub acked_epoch: u64,
+    /// The same pair for `frontend_update` records. Each kind has its own floor: a frontend
+    /// order never advances or blocks the node's, and the reverse.
+    pub frontend_order_id: u64,
+    pub frontend_epoch: u64,
+    /// The id of the newest order acted on, of either kind: what `status.json` reports as
+    /// `acked_order_id` when it is above the node floor, so the proxy sees its own orders
+    /// (they ride the frontend floor) acknowledged.
+    pub last_acted_id: u64,
     pub event: Event,
-    /// Why the last offer or order was refused, or what was reverted.
+    /// Why the last order was refused, or what was reverted.
     pub refusal: String,
-    /// The newest inbox entry looked at, so a refused offer is not staged again every
-    /// cycle.
-    pub handled_entry: String,
+    /// The id of the proxy's order `refusal` answers, when it answers one: what lets the
+    /// frontend proxy tell its own order's refusal from another's. A node's order names none
+    /// (its ids are another counter's). Never stored: `helper.json` is read by builds that
+    /// refuse a key they do not know, so the helper keeps the id from one pass to the next
+    /// itself (`Notice`), and a restarted helper has none.
+    #[serde(skip)]
+    pub refused_order_id: Option<u64>,
+    /// When root first saw each record now in the spool, in seconds. A record expires by
+    /// this, never by the file's modification time, which its writer sets.
+    pub first_seen: BTreeMap<String, u64>,
     /// The unit must be restarted: the links moved and the restart is not done. Written
     /// before the restart, so a crash between the two restarts on the next cycle.
     pub restart_due: bool,
     pub staged: Option<StagedFacts>,
+    /// The profile that release declared (`--version --json`), shown beside its facts; a field
+    /// of its own rather than of [`StagedFacts`], which the proxy's tests build as a literal.
+    /// `None` in a `helper.json` written before the proxy read it.
+    pub staged_profile: Option<String>,
+    /// When the last swap was made, in seconds since the epoch; 0 when none was. Orders
+    /// closer to it than `min_activation_interval_s` are refused.
+    pub last_activation_at: u64,
+    /// A fetch is in progress (only while a pass runs; never stored, so a crash cannot
+    /// leave it set).
+    #[serde(skip)]
+    pub fetching: bool,
+    /// The seed the host's package carries, when the run loop has found it whole and above the
+    /// floor of `seq`: what `status.json` tells the frontend it can order. Re-derived every
+    /// pass and never stored, so a crash cannot leave one that is no longer true.
+    #[serde(skip)]
+    pub available: Option<Available>,
+    /// The word `installer.toml` holds for `release_source` (`url`, `frontend`, `bundled`),
+    /// when it could be read. Never stored, for the same reason.
+    #[serde(skip)]
+    pub release_source: Option<&'static str>,
 }

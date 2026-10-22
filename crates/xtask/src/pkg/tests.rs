@@ -4,23 +4,17 @@ use std::path::{Path, PathBuf};
 use super::sha1::{cksum, sha1_hex};
 use super::tree::Node;
 use super::*;
+use kbf_testkit::dir::TestDir;
 
 mod read;
 
 const BINARY_BYTES: &[u8] = b"kbf-installer's bytes";
 
-/// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::current_exe()
-        .expect("test binary")
-        .parent()
-        .expect("deps")
-        .join("xtask-pkg-unit")
-        .join(format!("{name}-{}", std::process::id()));
-    // Absent unless a run with this pid left it.
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// An empty directory of its own for one test, removed when it drops.
+fn scratch(name: &str) -> TestDir {
+    let beside = std::env::current_exe().expect("test binary");
+    let deps = beside.parent().expect("deps");
+    TestDir::under(deps.join("xtask-pkg-unit"), name)
 }
 
 /// The committed LaunchDaemon property list.
@@ -430,7 +424,16 @@ fn the_gate_refuses_a_job_that_starts_without_the_configuration() {
             "<string>/usr/local/kbf-installer/bin/kbf-installer</string>",
             "<string>/usr/local/bin/kbf-installer</string>",
         ),
-        ("<string>serve</string>", "<string>setup</string>"),
+        ("<string>run</string>", "<string>setup</string>"),
+        ("<string>run</string>", "<string>serve</string>"),
+        (
+            "<string>com.komira.kbf-daemon</string>",
+            "<string>com.komira.other</string>",
+        ),
+        (
+            "<string>--launchd-label</string>",
+            "<string>--unit</string>",
+        ),
     ] {
         let p = mutant(from, to);
         assert_eq!(p.len(), 1, "{to}: {p:?}");
@@ -721,7 +724,8 @@ fn sum() -> Sha256 {
     Sha256::of(b"the package")
 }
 
-const URL: &str = "https://github.com/komira-ai/komira-build-farm/releases/download/v1.2.3/kbf-installer-1.2.3-macos-arm64.pkg";
+const URL: &str =
+    "https://github.com/komira-ai/kbf/releases/download/v1.2.3/kbf-installer-1.2.3-macos-arm64.pkg";
 
 #[test]
 fn the_cask_installs_the_package_and_its_uninstall_unloads_the_job_and_forgets_the_files() {
@@ -828,5 +832,256 @@ fn package_info_counts_entries_and_rounds_kilobytes_up() {
         let want = format!("<payload numberOfFiles=\"3\" installKBytes=\"{kbytes}\"/>");
         let got = info(bytes);
         assert!(got.contains(&want), "{bytes} bytes: {got}");
+    }
+}
+
+#[test]
+fn trust_files_install_with_the_linux_packages_modes() {
+    // Catches: the pinned `gh` installed 0644 (not executable: `kbf-installer` could not
+    // run it and a Mac could not verify a release), and a data file installed
+    // executable. `gh` is 0755 and the other trust files, and any file the package is
+    // given, are 0644 (the same table as the deb: `pkg_linux::TRUST_FILES`).
+    let dir = scratch("trust-modes");
+    let mut f = files(&dir, BINARY_BYTES);
+    for name in ["gh", "installer.conf", "trusted_root.jsonl", "release.pub"] {
+        std::fs::write(dir.join(name), name.as_bytes()).unwrap();
+    }
+    f.trust = ["gh", "installer.conf", "trusted_root.jsonl", "release.pub"]
+        .iter()
+        .map(|n| dir.join(n))
+        .collect();
+    build_with(&f, "1.2.3", &dir.join("out")).expect("build");
+    let bytes = std::fs::read(dir.join("out").join(pkg_name("1.2.3"))).unwrap();
+    let installed = open::installed(&bytes).unwrap();
+    let mode = |name: &str| match &installed[&format!("{TRUST_DIR}/{name}")] {
+        open::Installed::File { mode, .. } => *mode,
+        other => panic!("{name}: {other:?}"),
+    };
+    assert_eq!(
+        [
+            mode("gh"),
+            mode("installer.conf"),
+            mode("trusted_root.jsonl"),
+            mode("release.pub")
+        ],
+        [0o755, 0o644, 0o644, 0o644]
+    );
+    assert_eq!(trust_mode("gh"), 0o755);
+    assert_eq!(trust_mode("anything-else"), 0o644);
+}
+
+#[test]
+fn the_reader_of_a_package_agrees_with_the_independent_one_and_refuses_damage() {
+    // Catches: `open` reading a package differently than the second implementation of
+    // the formats (`tests/read.rs`: it shares no code with the writers or with `open`):
+    // the same paths, modes and bytes; and a package read as fine after a byte of it,
+    // its payload's header or its trailer was damaged.
+    let pkg = built("open");
+    let got = open::installed(&pkg).unwrap();
+    let members = read::xar(&pkg).unwrap();
+    let theirs = read::cpio(&members["Payload"]).unwrap();
+    let want: Vec<(String, u32)> = theirs
+        .iter()
+        .filter(|m| m.name != ".")
+        .map(|m| (m.name.trim_start_matches("./").to_owned(), m.mode & 0o7777))
+        .collect();
+    let have: Vec<(String, u32)> = got
+        .iter()
+        .map(|(p, n)| match n {
+            open::Installed::Dir { mode } | open::Installed::File { mode, .. } => {
+                (p.clone(), *mode)
+            }
+        })
+        .collect();
+    assert_eq!(have, want);
+    for m in theirs.iter().filter(|m| m.mode & 0o170000 == 0o100000) {
+        let path = m.name.trim_start_matches("./");
+        assert!(
+            matches!(&got[path], open::Installed::File { bytes, .. } if *bytes == m.bytes),
+            "{path}"
+        );
+    }
+    // Damage: not a xar; the table's checksum; a member's bytes; a payload that is not
+    // gzip; an archive cut short, with a trailer and then more bytes, with a name that
+    // is not under ./, and with a block device.
+    assert!(open::members(b"PK").unwrap_err().contains("not a xar"));
+    let mut bad = pkg.clone();
+    bad[30] ^= 1;
+    assert!(open::members(&bad).unwrap_err().contains("checksum"));
+    let last = pkg.len() - 1;
+    bad = pkg.clone();
+    bad[last] ^= 1;
+    assert!(open::members(&bad).unwrap_err().contains("does not match"));
+    assert!(
+        open::installed(&xar::xar(&[("Bom", b"")]))
+            .unwrap_err()
+            .contains("no Payload")
+    );
+    assert!(open::payload(b"plain").unwrap_err().contains("not gzip"));
+    // A xar of a table of contents of our own, to reach what the writers never write.
+    let crafted = |toc: &str, heap: &[u8]| {
+        use std::io::Write as _;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        z.write_all(toc.as_bytes()).unwrap();
+        let z = z.finish().unwrap();
+        let mut out = b"xar!".to_vec();
+        out.extend(28u16.to_be_bytes());
+        out.extend(1u16.to_be_bytes());
+        out.extend((z.len() as u64).to_be_bytes());
+        out.extend((toc.len() as u64).to_be_bytes());
+        out.extend(1u32.to_be_bytes());
+        out.extend_from_slice(&z);
+        out.extend(sha1::sha1(&z));
+        out.extend_from_slice(heap);
+        out
+    };
+    let entry = |name: &str, offset: &str, sum: &str| {
+        format!(
+            "<file id=\"1\"><name>{name}</name><data><length>1</length><offset>{offset}</offset>\
+             <size>1</size><extracted-checksum style=\"sha1\">{sum}</extracted-checksum>\
+             <archived-checksum style=\"sha1\">{sum}</archived-checksum></data></file>"
+        )
+    };
+    let one = sha1::sha1_hex(b"x");
+    // The heap starts with the table's own 20-byte checksum, so a member is at offset 20.
+    let heap_x = b"x".to_vec();
+    let wrapped = |toc: &str| format!("<xar><toc>{toc}</toc></xar>");
+    for (what, bytes, why) in [
+        ("short", b"xar!".to_vec(), "no 2-byte number"),
+        (
+            "header",
+            {
+                let mut bad = pkg.clone();
+                bad[5] ^= 1;
+                bad
+            },
+            "xar header",
+        ),
+        (
+            "toc length",
+            {
+                let mut bad = pkg.clone();
+                bad[23] ^= 1;
+                bad
+            },
+            "the table of contents is",
+        ),
+        (
+            "toc not zlib",
+            {
+                let mut bad = crafted(&wrapped(""), &[]);
+                let n = u64::from_be_bytes(bad[8..16].try_into().unwrap()) as usize;
+                let z = vec![1u8; n];
+                bad[28..28 + n].copy_from_slice(&z);
+                let sum = sha1::sha1(&z);
+                bad[28 + n..28 + n + 20].copy_from_slice(&sum);
+                bad
+            },
+            "the table of contents: ",
+        ),
+        (
+            "no name end",
+            crafted(&wrapped("<file id=\"1\"><name>x"), &heap_x),
+            "no </name>",
+        ),
+        (
+            "offset",
+            crafted(&wrapped(&entry("x", "x", &one)), &heap_x),
+            "offset: ",
+        ),
+        (
+            "past",
+            crafted(&wrapped(&entry("x", "999", &one)), &heap_x),
+            "x runs past the end",
+        ),
+        (
+            "twice",
+            crafted(
+                &wrapped(&format!(
+                    "{}{}",
+                    entry("x", "20", &one),
+                    entry("x", "20", &one)
+                )),
+                &heap_x,
+            ),
+            "x is in the archive twice",
+        ),
+    ] {
+        let e = open::members(&bytes).expect_err(what);
+        assert!(e.contains(why), "{what}: {e}");
+    }
+    let t = {
+        let mut t = Tree::rooted();
+        t.file("a/b", 0o644, b"b".to_vec()).unwrap();
+        t
+    };
+    let raw = cpio::odc(&t);
+    for (what, bytes, why) in [
+        ("cut", raw[..raw.len() - 20].to_vec(), "runs past the end"),
+        (
+            "trailing",
+            [raw.clone(), b"x".to_vec()].concat(),
+            "after the cpio trailer",
+        ),
+        (
+            "magic",
+            raw.iter()
+                .enumerate()
+                .map(|(i, b)| if i == 0 { b'1' } else { *b })
+                .collect(),
+            "cpio magic",
+        ),
+        (
+            "outside",
+            String::from_utf8(raw.clone())
+                .unwrap()
+                .replace("./a/b", "x/a/b")
+                .into_bytes(),
+            "not under ./",
+        ),
+        (
+            "device",
+            String::from_utf8(raw.clone())
+                .unwrap()
+                .replacen("040755", "060755", 1)
+                .into_bytes(),
+            "neither a directory nor a regular file",
+        ),
+        (
+            "field",
+            String::from_utf8(raw.clone())
+                .unwrap()
+                .replacen("040755", "04zz55", 1)
+                .into_bytes(),
+            "a cpio header field",
+        ),
+        (
+            "size",
+            {
+                let mut bad = raw.clone();
+                // The size field of the first header.
+                bad[65..76].copy_from_slice(b"00000100000");
+                bad
+            },
+            "its bytes run past the end",
+        ),
+        (
+            "twice",
+            {
+                // The entry of `./a/b` twice.
+                let at: Vec<usize> = raw
+                    .windows(6)
+                    .enumerate()
+                    .filter(|(_, w)| *w == b"070707")
+                    .map(|(i, _)| i)
+                    .collect();
+                [&raw[..at[3]], &raw[at[2]..at[3]], &raw[at[3]..]].concat()
+            },
+            "is in the payload twice",
+        ),
+    ] {
+        let err = open::payload(&cpio::gzip(&bytes));
+        let e = err.expect_err(what);
+        assert!(e.contains(why), "{what}: {e}");
     }
 }

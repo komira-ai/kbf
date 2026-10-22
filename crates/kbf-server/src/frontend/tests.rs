@@ -211,8 +211,7 @@ async fn the_successor_is_dialled_over_tls_only_with_a_ca_and_a_name() {
     dial(addr).expect("a plain channel");
 
     // Storage over TLS does not make the REAPI listener's hop TLS: plain text still.
-    let dir = std::env::temp_dir().join(format!("kbf-dial-plain-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("directory");
+    let dir = crate::test_dir::scratch_dir("kbf-dial-plain");
     let file = |name: &str| {
         let path = dir.join(name);
         std::fs::write(&path, "pem").expect("write");
@@ -231,7 +230,6 @@ async fn the_successor_is_dialled_over_tls_only_with_a_ca_and_a_name() {
     let storage_tls = super::parse(&matches).expect("a frontend's flags");
     let dial = super::dial_of(&storage_tls).expect("a dialler");
     dial(addr).expect("a plain channel");
-    let _ = std::fs::remove_dir_all(&dir);
 
     let tls = parsed(&[
         socket,
@@ -295,8 +293,7 @@ async fn a_successor_over_tls_is_reached_only_under_the_name_its_certificate_has
     use tonic::transport::server::TcpIncoming;
     use tonic::transport::{Identity, Server, ServerTlsConfig};
 
-    let dir = std::env::temp_dir().join(format!("kbf-dial-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("directory");
+    let dir = crate::test_dir::scratch_dir("kbf-dial");
     let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca.key_usages = vec![
@@ -373,7 +370,6 @@ async fn a_successor_over_tls_is_reached_only_under_the_name_its_certificate_has
         .await
         .expect_err("another name is refused");
     assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Catches: a frontend that starts with a listener it could not bind, for the operator API
@@ -426,4 +422,87 @@ async fn a_frontend_binds_its_three_listeners_on_their_own_ports() {
         ports[0] != ports[1] && ports[1] != ports[2] && ports[0] != ports[2],
         "{ports:?}"
     );
+}
+
+/// Catches: `--auto-promote` on by default (a joiner would then be promoted without an
+/// operator on the first release, which the design says must behave as before), its
+/// companions turning it on or being refused without it (the config template writes them
+/// as live lines, so a refusal would break every frontend started from the template), the
+/// flag taken where no membership is kept (it needs the state store), and the values lost
+/// between the flags and the setting: the settle time in seconds and the degraded switch.
+#[test]
+fn auto_promote_is_off_by_default_and_its_companions_need_it() {
+    use crate::members::Handoff;
+    use std::time::Duration;
+
+    const STORE: &str = "--state-store=sqlite:///x.db";
+    assert_eq!(parsed(&[STORE]).expect("parses").handoff, None);
+    assert_eq!(parsed(&[]).expect("parses").handoff, None);
+    let on = parsed(&[STORE, "--auto-promote"]).expect("parses").handoff;
+    assert_eq!(on, Some(Handoff::default()));
+    let set = parsed(&[
+        STORE,
+        "--auto-promote",
+        "--handoff-settle-secs=5",
+        "--handoff-allow-degraded",
+    ])
+    .expect("parses")
+    .handoff;
+    assert_eq!(
+        set,
+        Some(Handoff {
+            settle: Duration::from_secs(5),
+            allow_degraded: true,
+        })
+    );
+    let zero = parsed(&[STORE, "--auto-promote", "--handoff-settle-secs=0"]).expect("parses");
+    assert_eq!(zero.handoff.map(|h| h.settle), Some(Duration::ZERO));
+    // The companions have a live line in the config template (with their defaults), so they
+    // must not need the switch: without it they change nothing.
+    for alone in [
+        vec![STORE, "--handoff-settle-secs=5"],
+        vec![STORE, "--handoff-allow-degraded"],
+        vec!["--handoff-settle-secs=30"],
+    ] {
+        assert_eq!(parsed(&alone).expect("parses").handoff, None, "{alone:?}");
+    }
+    let e = parsed(&["--auto-promote"]).expect_err("no state store");
+    assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    let help = super::command().render_long_help().to_string();
+    for flag in [
+        "--auto-promote",
+        "--handoff-settle-secs",
+        "--handoff-allow-degraded",
+    ] {
+        assert!(help.contains(flag), "{flag}");
+    }
+}
+
+/// Catches: the setting parsed and dropped before the members that use it (the frontend
+/// would take the flag and never promote), or given to members when none is asked for.
+#[test]
+fn the_members_of_a_frontend_carry_the_setting_it_was_given() {
+    use crate::members::Handoff;
+    use crate::serve::members_of;
+
+    let state = StateStore {
+        store: Arc::new(Fake::with_flaw(
+            Arc::new(ManualClock::default()),
+            Flaw::None,
+        )),
+        epoch: EpochPolicy::Keep,
+        members: crate::members::MembershipConfig::default(),
+        history: None,
+    };
+    let setting = Handoff {
+        settle: std::time::Duration::from_secs(9),
+        allow_degraded: true,
+    };
+    let given = members_of(Some(&state), Some(setting)).expect("members");
+    assert_eq!(given.handoff(), Some(setting));
+    assert_eq!(
+        members_of(Some(&state), None).expect("members").handoff(),
+        None
+    );
+    assert!(members_of(None, Some(setting)).is_none());
 }

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use kbf_server::update::{
     Command, Controller, FactsSource, FarmView, Generation, HostPhase, HostRecord, HostRow, Policy,
-    Release, Rows, SlotClass, SourceError, Stored,
+    Release, Rows, SlotClass, Source, SourceError, Stored,
 };
 use kbf_types::FarmTime;
 use support::harness::{Backing, Rig};
@@ -63,6 +63,7 @@ impl FactsSource for Intruder {
                     boot_before: None,
                 },
                 commit: Release::new(NEW),
+                source: Source::Fetch,
             };
             self.rows
                 .put_host(&id(self.host), &absent(), &row)
@@ -175,6 +176,7 @@ fn a_mark_or_unmark_for_a_member_the_farm_does_not_show_is_reported_not_given() 
             boot_before: Some(BOOT),
         },
         commit: Release::new(NEW),
+        source: Source::Fetch,
     };
     rig.rows.put_host(&id("s1"), &absent(), &row).unwrap();
     rig.rows

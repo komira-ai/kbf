@@ -519,3 +519,44 @@ async fn an_evicted_debt_whose_store_does_not_answer_stays_and_frees_the_gate() 
     );
     assert_eq!(repairs.open_records(), [record(1), record(2)]);
 }
+
+/// Catches a debt dropped for a blob this node still holds, in RAM only (T12): a blob a
+/// write acknowledged from RAM and the disk has not got yet is not evicted, and it is the
+/// only copy a peer's debt can be paid from. `settle_evicted` asks this node's store the
+/// plain question (held counts as present), so the debt stays; a blob the store holds
+/// nowhere is dropped, as before. Mutant: the probe asks `find_durable` (the RAM-held blob
+/// counts as missing and the debt is dropped).
+#[tokio::test]
+async fn an_evicted_debt_for_a_blob_held_only_in_ram_is_not_dropped() {
+    let repairs =
+        Repairs::open(FaultFs::new(), Options::default(), Arc::new(NoLedger)).expect("open");
+    drop(repairs.owe(record(1)).await.expect("owed"));
+    drop(repairs.owe(record(2)).await.expect("owed"));
+    let store = Mem::default();
+    store
+        .blobs
+        .lock()
+        .expect("lock")
+        .insert(digest(1), bytes::Bytes::from_static(b"in ram"));
+    store.ram_only.lock().expect("lock").insert(digest(1));
+
+    let begun = repairs.begun();
+    assert!(
+        !repairs
+            .settle_evicted(&digest(1), begun, &store, PROBE)
+            .await
+            .expect("answered"),
+        "the blob is held, in RAM: the debt stays"
+    );
+    assert_eq!(repairs.open_records(), [record(1), record(2)]);
+    assert!(
+        repairs
+            .settle_evicted(&digest(2), begun, &store, PROBE)
+            .await
+            .expect("answered"),
+        "a blob held nowhere is dropped"
+    );
+    assert_eq!(repairs.open_records(), [record(1)]);
+    assert_eq!(store.durable_asked.load(Ordering::SeqCst), 0);
+    assert_eq!(store.knobs.asked.load(Ordering::SeqCst), 2);
+}

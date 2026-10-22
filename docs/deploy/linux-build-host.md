@@ -34,8 +34,7 @@ chosen.
 
 The daemon checks the id range, the directories' search permission, `crun` and the two id
 tools at start and refuses to start naming the one that is wrong. Lingering and
-`XDG_RUNTIME_DIR` are not needed by `crun`; `kbf-deploy linux install-units` still checks
-that `kbf` lingers because its units still set `XDG_RUNTIME_DIR`, until they are changed.
+`XDG_RUNTIME_DIR` are not needed by `crun`.
 
 ## Memory on the host
 
@@ -95,8 +94,8 @@ sudo swapon /swapfile
 echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 ```
 
-On a converged storage node `kbf-deploy linux swap` makes these steps, each only if the host
-lacks it ([storage-node.md](storage-node.md#installing-on-the-host)).
+On a storage node `kbf-deploy linux swap` makes these steps, each only if the host
+lacks it ([storage-node.md](storage-node.md#the-build-swapfile)).
 
 ### Headroom: `--actions-memory-max-gib`
 

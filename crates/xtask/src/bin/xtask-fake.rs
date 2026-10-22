@@ -3,7 +3,8 @@
 //! without building the server, `verify-assets attestations` without GitHub, and
 //! `sudo-test` and `crun-tests` without root or systemd.
 //!
-//! - Run under any name but `kbf-server`, `gh` or `sudo`, it is cargo: it
+//! - Run under any name but `kbf-server`, `gh`, `sudo`, `uname`, `id`, `systemd-sysusers` or
+//!   `systemd-tmpfiles`, it is cargo: it
 //!   appends its arguments as one line to `target/debug/cargo-args` in its working
 //!   directory, "builds" by hard-linking itself to `target/debug/kbf-server`, and
 //!   writes the stamp that build embeds to `target/debug/kbf-server.stamp`:
@@ -11,6 +12,11 @@
 //!   not 12 lowercase hex digits fails the build with the build script's message. With
 //!   `--no-run` it builds nothing: it prints the file `cargo-messages` in its working
 //!   directory, the JSON messages a test wrote for it.
+//! - As cargo run as `cargo deny ...` (`advisories`), it prints the file `deny-stderr` in its
+//!   working directory on stderr, as `cargo deny --format json` does, and exits with the
+//!   number in `deny-exit` (default 0).
+//! - As cargo with a `loom_` filter among its arguments (`xtask proxy-loom`), it prints the
+//!   result line of five passing tests and builds nothing.
 //! - Run as `kbf-server`, it prints `kbf-server 0.1.0+<stamp>` from the stamp file next
 //!   to it.
 //! - Run as `kbf`, it prints `kbf 0.1.0+<stamp>` for `--version`, with the stamp from the
@@ -19,12 +25,27 @@
 //!   no `kbf.stamp` next to it, it reads both from a trailer on its own file (`kbf_says`
 //!   below), so a copy packaged into a tarball and extracted elsewhere says what the
 //!   tarball's bytes say. With `XTASK_FAKE_ANNOUNCE` set, it also prints the path it was
-//!   run as on stderr.
+//!   run as on stderr. When what the trailer says `--version --json` prints is exactly
+//!   `fail`, `hang` or `env` (a line end after it), it does that instead: exits 1, never
+//!   answers, or prints its working directory (`cwd=<path>`) and the environment it was
+//!   started with (`NAME=value` per line), so a test can see a binary run (and with what)
+//!   through the trailer alone, which an environment variable cannot do for a program
+//!   started with none. Two more: `orphan` (a line end after it) leaves a process holding
+//!   its output for a few seconds and exits 0; and `tamper <name>` (the line ends, and the
+//!   rest of the trailer is what it prints) first appends a byte to `../assets/<name>` and
+//!   rewrites that file's line in `../assets/SHA256SUMS`, as a binary run in the directory
+//!   `release stage-offer` runs it in could. What a test asks of it by an environment
+//!   variable, the empty environment of `release version-facts` does not carry, so two
+//!   more files beside it do: `kbf.env` (when it exists, the fake overwrites it with `ran` and one `NAME=value`
+//!   line per variable it was given) and `kbf.mode` (`fail`: print the answer, then exit 1;
+//!   `hang`: never answer, for two minutes).
 //! - Run as `kbf-installer`, it is the STUB of the real kbf-installer, which the package
 //!   build and its macOS install test ship until the real tool is built there (one path
 //!   change in `crates/xtask/tests/pkg_macos.rs`): it prints `kbf-installer-stub` and
 //!   its arguments on stdout and on stderr, and exits 0, so `--version` passes the
 //!   signing check and a job that runs it leaves its arguments in its log.
+//!   With `XTASK_FAKE_INSTALLER_VERSION=<stamp>` and the one argument `--version` it
+//!   prints `kbf-installer 0.1.0+<stamp>` instead.
 //! - Run as `gh attestation verify <file> <flags>`, it appends its arguments as one line
 //!   to `gh-args` next to it, and verifies the file when `attested` next to it holds
 //!   the line `<SHA-256 of the file> <flags>`: the store of attestations, each the file
@@ -34,9 +55,31 @@
 //!   `fakeAttestations`, the line `<SHA-256 of the file> <flags>` (the flags without the
 //!   two that name files). It appends one line to `gh-env` next to it: the proxy and
 //!   no-proxy variables it ran under (`NAME=value`, empty when unset).
+//! - Run as `gh attestation trusted-root`, it prints a line of JSON, as the trusted root
+//!   is one (it appends its arguments to `gh-args` like every `gh` call).
 //! - Run as `gh api <path>`, it prints the value under the key `<path>` of the JSON
 //!   object in `gh-api.json` next to it, or `gh: Not Found (HTTP 404)` on stderr and
 //!   exits 1 when there is none: the GitHub API, as a test wrote it.
+//!   An answer of the form `{"$sequence": [a, b, ...]}` is `a` on the first call of that
+//!   path, `b` on the next, and the last one from then on.
+//! - Run as `gh api <path> -X POST --input -`, it reads a JSON body on stdin. For
+//!   `repos/<repo>/git/tags` it stores a tag object under `repos/<repo>/git/tags/<id>` (its
+//!   tagger is `komira-release-bot[bot]`) and answers `{"sha": <id>}`. For
+//!   `repos/<repo>/git/refs` it stores the ref under `repos/<repo>/git/ref/tags/<name>`, or
+//!   fails with HTTP 422 `Reference already exists` when that key is there. No call updates
+//!   a ref. `gh-fault` next to it plants one fault: `fail-post:<code>[:<times>]` (the next
+//!   POSTs fail with HTTP `<code>`), `no-sha` (a tag object is answered with no id),
+//!   `garbage` (a reply that is not JSON), `refuse-ref` (a ref is refused with HTTP 422
+//!   `Validation Failed`), `race` (another run made the ref first, with another message),
+//!   `lose-ref-502` / `lose-ref-422` (the next ref is stored, and its reply is lost as that
+//!   HTTP status), or `fail-get:<code>` (every GET of a ref fails with that status).
+//! - Run as `gh api -X <METHOD> <path> [--input -]` (the method first: the issue calls of
+//!   `advisories`), it appends `{"args": [...], "body": <JSON or null>}` as one line to
+//!   `gh-calls` next to it, and answers `{"number": 42, "html_url": ...}`. It reads the
+//!   body from stdin only with `--input -` on its arguments, as `gh` does: a call without
+//!   one is sent with no body and refused with HTTP 422, as GitHub refuses an issue with
+//!   no title. With `gh-fault` next to it holding `empty-reply`, it answers a write with
+//!   nothing at all (an HTTP 204), and with `fail-write` it refuses a write with HTTP 404.
 //! - Run as `gh release create|upload <tag> <files> --repo <repo> ...`, it copies each
 //!   file into `releases/<tag>/` next to it (create makes that directory and fails if
 //!   it exists; a file already there fails the command, as GitHub refuses an asset
@@ -45,8 +88,26 @@
 //!   --dir <dir>` copies every file of `releases/<tag>/` into `<dir>`.
 //! - Run as `sudo`, it appends `<working directory>: <arguments>` as one line to
 //!   `sudo-args` next to it, and exits 0 (the tests it was asked to run passed).
+//! - Run as `tailscale` (`gamma deploy`'s `tailscale ssh <user>@<host> sudo ...`), it appends
+//!   its arguments as one line to `tailscale-args` next to it, writes its standard input to
+//!   `tailscale-stdin`, prints the file `tailscale-stdout` (when there is one: the
+//!   installer's summary, as a test wrote it), writes the file `tailscale-stderr` (when there
+//!   is one: what the remote side says, which a public log must not show) to its standard
+//!   error and exits with the number in `tailscale-exit` (0 when there is no such file).
+//! - Run as `buck2` (`gamma check-build` runs `<komira dir>/buck2 build ...`), it appends
+//!   `<working directory>: <arguments>` as one line to `buck2-args` next to it, prints the
+//!   file `buck2-stdout` (when there is one) to its standard output and the file
+//!   `buck2-output` (when there is one: the console, as a test recorded it) to its standard
+//!   error, and exits with the number in `buck2-exit` (0 when there is no such file).
+//! - Run as `uname` (by name, from PATH, or by path), it is a host that is no platform of
+//!   ours: `-s` prints `Linux` and `-m` prints `riscv64` (or `XTASK_FAKE_MACHINE` when set). Run as `id`, `-u` prints 1000
+//!   (a user that is not root).
+//! - Run as `systemd-sysusers` or `systemd-tmpfiles` (by name, from PATH, or by path), it
+//!   appends `<name> <arguments>` as one line to `systemd-args` next to the fake's own
+//!   file and exits 0: the host's systemd, as `packaging/install.sh` calls it.
 //!
-//! `XTASK_FAKE_DEFECT` plants one defect of the real build: `ignores-override` (the
+//! `XTASK_FAKE_DEFECT` plants one defect of the real build (`beta-bundle-any-commit`: the
+//! bundle check ignores the commit for the beta workflow's bundles only): `ignores-override` (the
 //! build embeds the head whatever the override), `accepts-bad` (a malformed override
 //! builds), `fails-other` (a malformed override fails, but not on the override),
 //! `build-fails` (every build fails), `json-fails` (`kbf --version --json` exits 1), `stamp-fails` (every build with an override
@@ -55,16 +116,20 @@
 //! attestation store: `accepts-all` (every file verifies, whatever the flags) or
 //! `ignores-bytes` (a file verifies when any attestation has its flags). Of a bundle:
 //! `bundle-any-file` (a bundle verifies any file whose flags it lists) or
-//! `bundle-any-commit` (`--source-digest` is not compared). Of the API:
-//! `api-fails` (every `gh api` exits 1 with an HTTP 502) or `api-garbage` (every `gh
+//! `bundle-any-commit` (`--source-digest` is not compared) or `bundle-deb-bundle-any` (a
+//! bundle named for a `.deb` verifies any file whose flags it lists). Of the API:
+//! `api-fails` (every `gh api` exits 1 with an HTTP 502), `api-jobs-fail` (the same for a
+//! path with `/jobs` in it, the list of a run's jobs, alone) or `api-garbage` (every `gh
 //! api` prints something that is not JSON). Of releases: `release-fails` (every `gh
-//! release` command exits 1). Of sudo:
+//! release` command exits 1). Of the trusted root: `trusted-root-fails` (`gh attestation
+//! trusted-root` exits 1). Of sudo:
 //! `tests-fail` (it exits 101, as a failed test binary does) or `fails:<a>,<b>,...`
 //! (it exits 101 when one of its arguments is one of `<a>`, `<b>`, ..., so some units
-//! of several fail).
+//! of several fail). Of systemd: `systemd-fails` (every systemd tool exits 1).
 use std::io::Write;
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
+use std::time::Duration;
 
 use sha2::Digest;
 
@@ -107,17 +172,106 @@ fn kbf_says(argv0: &str) -> (String, String) {
     (stamp.to_owned(), json.to_owned())
 }
 
+/// Appends a byte to the release file `../assets/<name>` and makes its line of
+/// `../assets/SHA256SUMS` say the new digest: the change a binary run in a sibling of
+/// `assets` can make to a release that was verified before it ran.
+fn tamper(name: &str) {
+    let assets = Path::new("../assets");
+    let file = assets.join(name);
+    let mut bytes = std::fs::read(&file).expect("the release file");
+    bytes.push(b'x');
+    std::fs::write(&file, &bytes).expect("write the release file");
+    let digest = hex::encode(sha2::Sha256::digest(&bytes));
+    let sums = assets.join("SHA256SUMS");
+    let text = std::fs::read_to_string(&sums).expect("SHA256SUMS");
+    let mut edited = String::new();
+    for line in text.lines() {
+        let listed = line.split_once("  ").map(|(_, n)| n);
+        let new = match listed {
+            Some(n) if n == name => format!("{digest}  {name}"),
+            _ => line.to_owned(),
+        };
+        edited.push_str(&new);
+        edited.push('\n');
+    }
+    std::fs::write(&sums, edited).expect("write SHA256SUMS");
+}
+
+/// What a test asked of `kbf` in the files beside it (see the top of this file): the
+/// environment it was given is written to `<argv0>.env`, if that file exists, and
+/// `<argv0>.mode` makes it fail or hang. The exit code to leave with, if it is not to answer.
+fn kbf_asked(argv0: &str) -> Option<ExitCode> {
+    let env_log = format!("{argv0}.env");
+    if Path::new(&env_log).exists() {
+        let mut seen = String::from("ran\n");
+        for (name, value) in std::env::vars() {
+            seen.push_str(&format!("{name}={value}\n"));
+        }
+        std::fs::write(&env_log, seen).expect("env log");
+    }
+    match std::fs::read_to_string(format!("{argv0}.mode")).as_deref() {
+        // It answers as it should and then fails: only its status can refuse it.
+        Ok("fail") => {
+            print!("{}", kbf_says(argv0).1);
+            Some(ExitCode::FAILURE)
+        }
+        // Long enough for any limit a test sets, short enough that a limit which is broken
+        // fails the test's own time assertion instead of hanging the suite.
+        Ok("hang") => {
+            std::thread::sleep(std::time::Duration::from_secs(120));
+            Some(ExitCode::FAILURE)
+        }
+        _ => None,
+    }
+}
+
 /// `kbf --version` and `kbf --version --json`, as [`kbf_says`] has them.
+#[allow(clippy::zombie_processes)] // `orphan` leaves its process behind on purpose
 fn kbf(argv0: &str, args: &[String]) -> ExitCode {
     // Where a test sees which file was run.
     if std::env::var_os("XTASK_FAKE_ANNOUNCE").is_some() {
         eprintln!("xtask-fake: kbf runs as {argv0}");
     }
+    if args == ["--hold"] {
+        // The process `orphan` leaves behind: it ends by itself.
+        std::thread::sleep(Duration::from_secs(3));
+        return ExitCode::SUCCESS;
+    }
+    if let Some(code) = kbf_asked(argv0) {
+        return code;
+    }
     if args == ["--version", "--json"] {
         if defect("json-fails") {
             return ExitCode::FAILURE;
         }
-        print!("{}", kbf_says(argv0).1);
+        let json = kbf_says(argv0).1;
+        let tampering = json.strip_prefix("tamper ");
+        if let Some((name, rest)) = tampering.and_then(|t| t.split_once('\n')) {
+            tamper(name);
+            print!("{rest}");
+            return ExitCode::SUCCESS;
+        }
+        match json.as_str() {
+            "orphan\n" => {
+                // It inherits the output, so the reader of it waits on it and not on us.
+                Command::new(argv0)
+                    .arg("--hold")
+                    .spawn()
+                    .expect("a process to leave behind");
+            }
+            "fail\n" => return ExitCode::FAILURE,
+            "hang\n" => loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            },
+            "env\n" => {
+                let cwd = std::env::current_dir().expect("a working directory");
+                println!("cwd={}", cwd.display());
+                for (name, value) in std::env::vars_os() {
+                    println!("{}={}", name.to_string_lossy(), value.to_string_lossy());
+                }
+            }
+            _ => print!("{json}"),
+        }
     } else {
         println!("kbf 0.1.0+{}", kbf_says(argv0).0);
     }
@@ -126,6 +280,15 @@ fn kbf(argv0: &str, args: &[String]) -> ExitCode {
 
 /// `kbf-installer`, the stand-in: its arguments, once on each output.
 fn installer_stub(args: &[String]) -> ExitCode {
+    // `XTASK_FAKE_INSTALLER_VERSION=<stamp>` makes `--version` answer as the real
+    // installer does, `kbf-installer 0.1.0+<stamp>`, for the tests of `pkg-config
+    // --version-of`.
+    if let (Ok(stamp), [flag]) = (std::env::var("XTASK_FAKE_INSTALLER_VERSION"), args)
+        && flag == "--version"
+    {
+        println!("kbf-installer 0.1.0+{stamp}");
+        return ExitCode::SUCCESS;
+    }
     let line = format!("kbf-installer-stub {}", args.join(" "));
     println!("{line}");
     eprintln!("{line}");
@@ -141,6 +304,26 @@ fn cargo(argv0: &str, args: &[String]) -> ExitCode {
         .open(dir.join("cargo-args"))
         .expect("cargo-args");
     writeln!(log, "{}", args.join(" ")).expect("cargo-args");
+    // `cargo deny ... check advisories --format json` (advisories): the file `deny-stderr`
+    // in the working directory is what cargo-deny printed (JSON lines, on stderr), and
+    // `deny-exit` (default 0) its exit status.
+    if args.first().is_some_and(|a| a == "deny") {
+        // The real cargo-deny takes `--format` and the other options before `check`;
+        // `check` takes only the names of the checks.
+        let after_check = args.iter().skip_while(|a| *a != "check").skip(1);
+        if let Some(flag) = after_check.clone().find(|a| a.starts_with('-')) {
+            eprintln!(
+                "error: unexpected argument '{flag}' found\n\nUsage: cargo-deny check <WHICH>..."
+            );
+            return ExitCode::from(2);
+        }
+        eprint!(
+            "{}",
+            std::fs::read_to_string("deny-stderr").expect("deny-stderr")
+        );
+        let code = std::fs::read_to_string("deny-exit").unwrap_or_default();
+        return ExitCode::from(code.trim().parse::<u8>().unwrap_or(0));
+    }
     if defect("build-fails") {
         eprintln!("xtask-fake: build failed");
         return ExitCode::from(101);
@@ -152,6 +335,12 @@ fn cargo(argv0: &str, args: &[String]) -> ExitCode {
             "{}",
             std::fs::read_to_string("cargo-messages").expect("cargo-messages")
         );
+        return ExitCode::SUCCESS;
+    }
+    // `cargo test -p kbf-proxy ... -- loom_` (proxy-loom): cargo's result line for the five
+    // models, as the real run prints it.
+    if args.iter().any(|a| a == "loom_") {
+        println!("test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out");
         return ExitCode::SUCCESS;
     }
     let head = std::env::var("XTASK_FAKE_HEAD").expect("XTASK_FAKE_HEAD");
@@ -196,8 +385,11 @@ fn gh(argv0: &str, args: &[String]) -> ExitCode {
         .expect("gh-args");
     writeln!(log, "{}", args.join(" ")).expect("gh-args");
     match args[0].as_str() {
+        "api" if args[1] == "-X" => return issues_write(dir, args),
+        "api" if args.iter().any(|a| a == "--input") => return api_write(dir, args),
         "api" => return api(dir, &args[1]),
         "release" => return release(dir, args),
+        "attestation" if args[1] == "trusted-root" => return trusted_root(),
         _ => {}
     }
     let file = args
@@ -220,6 +412,16 @@ fn gh(argv0: &str, args: &[String]) -> ExitCode {
     }
     eprintln!("xtask-fake: no attestation of {file} verifies with {flags}");
     ExitCode::FAILURE
+}
+
+/// `gh attestation trusted-root`: one line of JSON, or a failure.
+fn trusted_root() -> ExitCode {
+    if defect("trusted-root-fails") {
+        eprintln!("gh: the trusted root could not be fetched");
+        return ExitCode::FAILURE;
+    }
+    println!("{{\"fake\":\"trusted root\"}}");
+    ExitCode::SUCCESS
 }
 
 /// `flags` as one string, without the pair `--source-digest <commit>`.
@@ -287,8 +489,13 @@ fn verify_bundle(dir: &Path, sha256: &str, file: &str, bundle: &str, rest: &[Str
             })
         })
         .unwrap_or_default();
-    let by_commit = !defect("bundle-any-commit");
-    let by_bytes = !defect("bundle-any-file");
+    // `beta-bundle-any-commit` is `bundle-any-commit` for the beta workflow's bundles only,
+    // so the artifacts controls pass and the beta control is the one reached.
+    let beta = flags.iter().any(|f| f.ends_with("/beta.yml"));
+    let by_commit = !(defect("bundle-any-commit") || (beta && defect("beta-bundle-any-commit")));
+    let by_bytes = !(defect("bundle-any-file")
+        || (defect("bundle-deb-bundle-any")
+            && (bundle.ends_with(".deb.sigstore.json") || bundle.ends_with(".pkg.sigstore.json"))));
     let wanted = if by_commit {
         flags.join(" ")
     } else {
@@ -321,7 +528,7 @@ fn api_store(dir: &Path) -> serde_json::Map<String, serde_json::Value> {
 }
 
 fn api(dir: &Path, path: &str) -> ExitCode {
-    if defect("api-fails") {
+    if defect("api-fails") || (defect("api-jobs-fail") && path.contains("/jobs")) {
         eprintln!("gh: Server Error (HTTP 502)");
         return ExitCode::FAILURE;
     }
@@ -329,9 +536,18 @@ fn api(dir: &Path, path: &str) -> ExitCode {
         println!("<html>");
         return ExitCode::SUCCESS;
     }
-    match api_store(dir).get(path) {
+    let fault = std::fs::read_to_string(dir.join("gh-fault")).unwrap_or_default();
+    if let Some(code) = fault
+        .strip_prefix("fail-get:")
+        .filter(|_| path.contains("/git/ref/"))
+    {
+        eprintln!("gh: Error (HTTP {code})");
+        return ExitCode::FAILURE;
+    }
+    let mut store = api_store(dir);
+    match store.get(path).cloned() {
         Some(answer) => {
-            println!("{answer}");
+            println!("{}", next_answer(dir, &mut store, path, answer));
             ExitCode::SUCCESS
         }
         None => {
@@ -339,6 +555,178 @@ fn api(dir: &Path, path: &str) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The answer to give now: `answer` itself, or, when it is `{"$sequence": [a, b, ...]}`, `a`,
+/// which is dropped from the store for the next call unless it is the last (a state that
+/// changes between two looks: a run that is going, then done).
+fn next_answer(
+    dir: &Path,
+    store: &mut serde_json::Map<String, serde_json::Value>,
+    path: &str,
+    answer: serde_json::Value,
+) -> serde_json::Value {
+    let Some(steps) = answer.get("$sequence").and_then(|s| s.as_array()) else {
+        return answer;
+    };
+    let first = steps[0].clone();
+    if steps.len() > 1 {
+        store.insert(
+            path.to_owned(),
+            serde_json::json!({ "$sequence": steps[1..] }),
+        );
+        write_answers(dir, store.clone());
+    }
+    first
+}
+
+/// A tag object as the API stores it: the id is the hash of its parts.
+fn tag_object(
+    tag: &serde_json::Value,
+    message: &serde_json::Value,
+    object: &serde_json::Value,
+    kind: &serde_json::Value,
+) -> (String, serde_json::Value) {
+    let id = hex::encode(sha2::Sha256::digest(format!(
+        "{tag}{message}{object}{kind}"
+    )))[..40]
+        .to_owned();
+    let stored = serde_json::json!({
+        "tag": tag,
+        "sha": id,
+        "message": message,
+        "object": { "type": kind, "sha": object },
+        "tagger": { "name": "komira-release-bot[bot]" },
+    });
+    (id, stored)
+}
+
+/// A `gh api <path> -X POST --input -` call: the writes of the tag API, `git/tags` and
+/// `git/refs`. Nothing updates a ref: GitHub's rulesets would refuse it, and so does this.
+fn api_write(dir: &Path, args: &[String]) -> ExitCode {
+    let path = args[1].as_str();
+    let body: serde_json::Value = serde_json::from_reader(std::io::stdin()).expect("a JSON body");
+    let fault_file = dir.join("gh-fault");
+    let fault = std::fs::read_to_string(&fault_file).unwrap_or_default();
+    if let Some(spec) = fault.strip_prefix("fail-post:") {
+        let (code, times) = spec.split_once(':').unwrap_or((spec, "1"));
+        let left = times.parse::<u32>().expect("a count") - 1;
+        if left == 0 {
+            std::fs::remove_file(&fault_file).expect("gh-fault");
+        } else {
+            std::fs::write(&fault_file, format!("fail-post:{code}:{left}")).expect("gh-fault");
+        }
+        eprintln!("gh: Error (HTTP {code})");
+        return ExitCode::FAILURE;
+    }
+    if fault == "garbage" {
+        println!("<html>");
+        return ExitCode::SUCCESS;
+    }
+    let mut answers = api_store(dir);
+    let repo = path.split("/git/").next().expect("repos/<repo>");
+    let reply = if path.ends_with("/git/tags") && fault == "no-sha" {
+        serde_json::json!({})
+    } else if path.ends_with("/git/tags") {
+        let (id, stored) = tag_object(
+            &body["tag"],
+            &body["message"],
+            &body["object"],
+            &body["type"],
+        );
+        answers.insert(format!("{repo}/git/tags/{id}"), stored);
+        serde_json::json!({ "sha": id })
+    } else {
+        let name = body["ref"]
+            .as_str()
+            .and_then(|r| r.strip_prefix("refs/tags/"))
+            .expect("a tag ref");
+        let key = format!("{repo}/git/ref/tags/{name}");
+        if fault == "refuse-ref" {
+            eprintln!("gh: Validation Failed (HTTP 422)");
+            return ExitCode::FAILURE;
+        }
+        if fault == "race" {
+            // Another run made this tag first, with another message.
+            std::fs::remove_file(&fault_file).expect("gh-fault");
+            let (id, stored) = tag_object(
+                &body["ref"],
+                &serde_json::json!("other\n"),
+                &body["sha"],
+                &serde_json::json!("commit"),
+            );
+            answers.insert(format!("{repo}/git/tags/{id}"), stored);
+            answers.insert(
+                key.clone(),
+                serde_json::json!({ "object": { "type": "tag", "sha": id } }),
+            );
+        }
+        if answers.contains_key(&key) {
+            write_answers(dir, answers);
+            eprintln!("gh: Reference already exists (HTTP 422)");
+            return ExitCode::FAILURE;
+        }
+        answers.insert(
+            key,
+            serde_json::json!({ "object": { "type": "tag", "sha": body["sha"] } }),
+        );
+        if let Some(status) = fault.strip_prefix("lose-ref-") {
+            std::fs::remove_file(&fault_file).expect("gh-fault");
+            write_answers(dir, answers);
+            eprintln!("gh: Error (HTTP {status})");
+            if status == "422" {
+                eprintln!("Reference already exists");
+            }
+            return ExitCode::FAILURE;
+        }
+        serde_json::json!({})
+    };
+    write_answers(dir, answers);
+    println!("{reply}");
+    ExitCode::SUCCESS
+}
+
+/// A `gh api -X <METHOD> <path> [--input -]` call (the issue calls of `advisories`): the
+/// call, with the body `gh` would have sent, appended to `gh-calls`.
+fn issues_write(dir: &Path, args: &[String]) -> ExitCode {
+    let sends_stdin = args.windows(2).any(|w| w == ["--input", "-"]);
+    let body: serde_json::Value = if sends_stdin {
+        serde_json::from_reader(std::io::stdin()).expect("a JSON body")
+    } else {
+        serde_json::Value::Null
+    };
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("gh-calls"))
+        .expect("gh-calls");
+    writeln!(log, "{}", serde_json::json!({ "args": args, "body": body })).expect("gh-calls");
+    if body.is_null() {
+        eprintln!("gh: Validation Failed (HTTP 422)");
+        return ExitCode::FAILURE;
+    }
+    let fault = std::fs::read_to_string(dir.join("gh-fault")).unwrap_or_default();
+    if fault == "fail-write" {
+        eprintln!("gh: Not Found (HTTP 404)");
+        return ExitCode::FAILURE;
+    }
+    if fault == "empty-reply" {
+        return ExitCode::SUCCESS;
+    }
+    let path = &args[3];
+    println!(
+        "{}",
+        serde_json::json!({ "number": 42, "html_url": format!("https://github.com/{}/42", path.trim_start_matches("repos/")) })
+    );
+    ExitCode::SUCCESS
+}
+
+fn write_answers(dir: &Path, answers: serde_json::Map<String, serde_json::Value>) {
+    std::fs::write(
+        dir.join("gh-api.json"),
+        serde_json::Value::Object(answers).to_string(),
+    )
+    .expect("gh-api.json");
 }
 
 fn release(dir: &Path, args: &[String]) -> ExitCode {
@@ -430,10 +818,95 @@ fn sudo(argv0: &str, args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `tailscale ssh ...` for `gamma deploy`: what it was asked and given is left next to the
+/// fake, and the installer's answer is the file `tailscale-stdout` and the number in
+/// `tailscale-exit`.
+fn tailscale(argv0: &str, args: &[String]) -> ExitCode {
+    let dir = Path::new(argv0).parent().expect("the fake's directory");
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("tailscale-args"))
+        .expect("tailscale-args");
+    writeln!(log, "{}", args.join(" ")).expect("tailscale-args");
+    let mut input = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::stdin(), &mut input).expect("standard input");
+    std::fs::write(dir.join("tailscale-stdin"), input).expect("tailscale-stdin");
+    let answer = std::fs::read_to_string(dir.join("tailscale-stdout")).unwrap_or_default();
+    print!("{answer}");
+    let noise = std::fs::read_to_string(dir.join("tailscale-stderr")).unwrap_or_default();
+    eprint!("{noise}");
+    let code = std::fs::read_to_string(dir.join("tailscale-exit"))
+        .ok()
+        .and_then(|text| text.trim().parse::<u8>().ok());
+    ExitCode::from(code.unwrap_or(0))
+}
+
+/// `buck2 build ...` for `gamma check-build`: what it was asked and where is left next to the
+/// fake, and the console is the files `buck2-stdout` and `buck2-output`, as a test wrote them.
+fn buck2(argv0: &str, args: &[String]) -> ExitCode {
+    let dir = Path::new(argv0).parent().expect("the fake's directory");
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("buck2-args"))
+        .expect("buck2-args");
+    let cwd = std::env::current_dir().expect("working directory");
+    writeln!(log, "{}: {}", cwd.display(), args.join(" ")).expect("buck2-args");
+    let said = std::fs::read_to_string(dir.join("buck2-stdout")).unwrap_or_default();
+    print!("{said}");
+    let console = std::fs::read_to_string(dir.join("buck2-output")).unwrap_or_default();
+    eprint!("{console}");
+    let code = std::fs::read_to_string(dir.join("buck2-exit"))
+        .ok()
+        .and_then(|text| text.trim().parse::<u8>().ok());
+    ExitCode::from(code.unwrap_or(0))
+}
+
+fn systemd(name: &str, args: &[String]) -> ExitCode {
+    let exe = std::env::current_exe().expect("the fake's own path");
+    let dir = exe.parent().expect("the fake's directory");
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("systemd-args"))
+        .expect("systemd-args");
+    writeln!(log, "{name} {}", args.join(" ")).expect("systemd-args");
+    if defect("systemd-fails") {
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+/// `uname -s` and `uname -m` of a host with no platform of ours.
+fn uname(args: &[String]) -> ExitCode {
+    match args {
+        [a] if a == "-s" => println!("Linux"),
+        [a] if a == "-m" => {
+            println!(
+                "{}",
+                std::env::var("XTASK_FAKE_MACHINE").unwrap_or("riscv64".to_owned())
+            );
+        }
+        _ => return ExitCode::FAILURE,
+    }
+    ExitCode::SUCCESS
+}
+
+/// `id -u` of a user that is not root.
+fn id(args: &[String]) -> ExitCode {
+    match args {
+        [a] if a == "-u" => println!("1000"),
+        _ => return ExitCode::FAILURE,
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args();
     let argv0 = args.next().expect("argv0");
     let rest: Vec<String> = args.collect();
+    let base = argv0.rsplit('/').next().unwrap_or(&argv0);
     if argv0.ends_with("/kbf-server") {
         server(&argv0)
     } else if argv0.ends_with("/kbf") {
@@ -444,6 +917,16 @@ fn main() -> ExitCode {
         gh(&argv0, &rest)
     } else if argv0.ends_with("/sudo") {
         sudo(&argv0, &rest)
+    } else if argv0.ends_with("/tailscale") {
+        tailscale(&argv0, &rest)
+    } else if argv0.ends_with("/buck2") {
+        buck2(&argv0, &rest)
+    } else if matches!(base, "systemd-sysusers" | "systemd-tmpfiles") {
+        systemd(base, &rest)
+    } else if argv0 == "uname" || argv0.ends_with("/uname") {
+        uname(&rest)
+    } else if argv0 == "id" || argv0.ends_with("/id") {
+        id(&rest)
     } else {
         cargo(&argv0, &rest)
     }

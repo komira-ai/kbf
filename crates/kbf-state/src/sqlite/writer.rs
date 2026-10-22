@@ -22,6 +22,8 @@ pub(super) struct Reply {
     pub(super) commits: Vec<Result<Commit, Conflict>>,
     /// How many keys a reap request removed.
     pub(super) reaped: usize,
+    /// The failed precondition of a guarded reap, which then removed nothing.
+    pub(super) refused: Option<Conflict>,
 }
 
 /// One call on the store, waiting for its answer.
@@ -30,6 +32,8 @@ pub(super) struct Request {
     pub(super) txns: Vec<Txn>,
     /// Whether this is a reap request.
     pub(super) reap: bool,
+    /// For a reap request: the precondition that must hold when the keys are removed.
+    pub(super) guard: Option<(String, Cond)>,
     /// When the caller queued it: commit latency counts from here.
     pub(super) queued: Instant,
     /// Where the answer goes, once the group it is in is on disk.
@@ -162,6 +166,19 @@ impl Writer {
         let mut applier = Applier::new(&tx, self.head, now)?;
         let mut replies = Vec::with_capacity(group.len());
         for request in group {
+            if let Some((key, cond)) = &request.guard
+                && !applier.holds(key, *cond)?
+            {
+                replies.push(Reply {
+                    commits: Vec::new(),
+                    reaped: 0,
+                    refused: Some(Conflict {
+                        index: 0,
+                        key: key.clone(),
+                    }),
+                });
+                continue;
+            }
             let reaped = applier.reap()?;
             let mut commits = Vec::with_capacity(request.txns.len());
             for txn in &request.txns {
@@ -170,6 +187,7 @@ impl Writer {
             replies.push(Reply {
                 commits,
                 reaped: if request.reap { reaped } else { 0 },
+                refused: None,
             });
         }
         let head = applier.finish()?;

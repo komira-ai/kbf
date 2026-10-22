@@ -88,8 +88,8 @@ fn a_converged_mac_passes_every_item() {
 }
 
 /// Catches: a rendering defect in the job's property list: another `ProcessType` (the
-/// script's mutant "the job runs as a Standard process"), no `UserName` ("the job runs
-/// as root"), or no profile label ("the node label lacks the profile").
+/// script's mutant "the job runs as a Standard process"), or no `UserName` ("the job runs
+/// as root").
 #[test]
 fn the_job_renders_as_the_golden_property_list() {
     let mac = FakeMac::fresh("golden");
@@ -100,6 +100,50 @@ fn the_job_renders_as_the_golden_property_list() {
         support::golden_plist(p.short_sha())
     );
     assert_eq!(kbf_mac_provision::launchd::plist_path(&p), PLIST);
+}
+
+/// Catches: a rendering defect in the node's `kbf.toml`: a key in the wrong table, a
+/// missing `mode` or `driver`, a `label` key back, a value of another profile
+/// key. The golden is written by hand (`support/golden.rs`), not by the renderer.
+#[test]
+fn the_node_config_renders_as_the_golden_file() {
+    let mac = FakeMac::fresh("golden-config");
+    let text = mac.profile_text();
+    let p = kbf_mac_provision::profile::Profile::parse(text.as_bytes()).unwrap();
+    assert_eq!(
+        kbf_mac_provision::launchd::render_config(&p),
+        support::golden_config()
+    );
+    assert_eq!(kbf_mac_provision::launchd::NODE_CONFIG, support::CONFIG);
+}
+
+/// Catches: the node's `kbf.toml` carrying a node label again, from any profile: a
+/// `label` key in any table (the next daemon release removes the key, and one that refuses
+/// it would then fail to start), for the test profile, the example, a root daemon and a smaller pool.
+/// Read as lines, not as the golden, so a label put back with a golden updated to match
+/// still fails here.
+#[test]
+fn the_node_config_has_no_label_key_for_any_profile() {
+    let mac = FakeMac::fresh("no-label-key");
+    let base = mac.profile_text();
+    let texts = [
+        base.clone(),
+        format!("{base}daemon_user=root\n"),
+        format!("{base}pool_users=2\n"),
+        support::EXAMPLE.to_owned(),
+    ];
+    for text in texts {
+        let p = kbf_mac_provision::profile::Profile::parse(text.as_bytes()).unwrap();
+        let config = kbf_mac_provision::launchd::render_config(&p);
+        for line in config.lines() {
+            let key = line.split('=').next().unwrap().trim();
+            assert_ne!(key, "label", "a label key in\n{config}");
+        }
+        assert!(
+            !config.contains("profile=") && !config.contains("pool=mac"),
+            "{config}"
+        );
+    }
 }
 
 /// Catches: entries that are not drift reported as drift: an images list beside the

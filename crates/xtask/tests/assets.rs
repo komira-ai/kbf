@@ -7,13 +7,14 @@ use std::process::{Command, Output};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use kbf_testkit::dir::TestDir;
 use sha2::Digest;
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
 const COMMIT: &str = "c0ffee0123456789c0ffee0123456789c0ffee01";
-const REPO: &str = "komira-ai/komira-build-farm";
-const WORKFLOW: &str = "komira-ai/komira-build-farm/.github/workflows/artifacts.yml";
+const REPO: &str = "komira-ai/kbf";
+const WORKFLOW: &str = "komira-ai/kbf/.github/workflows/artifacts.yml";
 const SBOM_PREDICATE: &str = "--predicate-type https://cyclonedx.org/bom";
 const ISSUER: &str = "https://token.actions.githubusercontent.com";
 const PROVENANCE: &str = "https://slsa.dev/provenance/v1";
@@ -23,15 +24,11 @@ const DEAD_PROXY: &str = "http://127.0.0.1:9";
 const OTHER: &str = "badbad0123456789badbad0123456789badbad01";
 
 /// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("xtask-assets")
-        .join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clear scratch");
-    }
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask-assets"),
+        name,
+    )
 }
 
 /// The exit code, stdout and stderr of `cargo xtask <args>`.
@@ -105,7 +102,9 @@ fn bundle_json(sha: &str, flags: &str) -> String {
     format!("{bundle}\n")
 }
 
-/// The branch the development line is built and attested on (docs/artifacts.md).
+/// The branch the development line was built and attested on until main became the only
+/// integration branch (docs/artifacts.md). Kept: attestations it signed still exist and
+/// must verify as that branch's, never as main's.
 const DEV_REF: &str = "refs/heads/feature/arch-v2";
 
 /// What the release path leaves: `<root>/dist` packaged and summed as the workflow
@@ -114,6 +113,8 @@ struct Release {
     dist: PathBuf,
     gh: PathBuf,
     tmp: PathBuf,
+    /// The directory all of it is in; last, so it is removed after the rest.
+    _root: TestDir,
 }
 
 impl Release {
@@ -180,7 +181,12 @@ impl Release {
         let gh = root.join("gh").join("gh");
         std::fs::create_dir(root.join("gh")).expect("gh dir");
         std::fs::hard_link(FAKE, &gh).expect("link the fake as gh");
-        Release { dist, gh, tmp }
+        Release {
+            dist,
+            gh,
+            tmp,
+            _root: root,
+        }
     }
 
     /// The SHA256SUMS lines: (digest, name).
@@ -202,18 +208,62 @@ impl Release {
         self.attest_from(skip, "refs/heads/main");
     }
 
-    /// The tarballs of the release, by name.
-    fn tarballs(&self) -> Vec<(String, String)> {
+    /// The files with a bundle: the tarballs and the `.deb` packages.
+    fn bundled(&self) -> Vec<(String, String)> {
         self.sums()
             .into_iter()
-            .filter(|(_, name)| name.ends_with(".tar.gz"))
+            .filter(|(_, name)| {
+                name.ends_with(".tar.gz") || name.ends_with(".deb") || name.ends_with(".pkg")
+            })
             .collect()
     }
 
-    /// Writes next to each tarball the bundle the attest job leaves: one attestation of
-    /// that tarball, signed from `source_ref` for `commit`.
+    /// Adds the `kbf-installer` deb of `platform` as `pkg-asset` leaves it: the file in
+    /// `dist` (distinct bytes: an attestation covers a digest), listed in `SHA256SUMS`
+    /// (sorted by name, as `sums assemble` leaves it).
+    fn add_deb(&self, platform: &str) -> String {
+        self.add_package(platform, "deb")
+    }
+
+    /// Adds the `kbf-installer` package of `platform` with the extension `ext` (`deb`, or
+    /// `pkg` for the Mac's), as [`Release::add_deb`] does.
+    fn add_package(&self, platform: &str, ext: &str) -> String {
+        let name = format!("kbf-installer-{COMMIT}-{platform}.{ext}");
+        let bytes = format!("the kbf-installer package for {platform}");
+        self.add_listed(&name, &bytes);
+        name
+    }
+
+    /// Adds the version facts of `kbf` for `platform` as `release version-facts` leaves
+    /// them: a file in `dist` (distinct bytes), listed in `SHA256SUMS`.
+    fn add_facts(&self, platform: &str) -> String {
+        let name = format!("kbf-{COMMIT}-{platform}.version.json");
+        let bytes = format!("the version facts of kbf for {platform}\n");
+        self.add_listed(&name, &bytes);
+        name
+    }
+
+    /// Adds the file `name` holding `bytes` to `dist` and to `SHA256SUMS`, which stays
+    /// sorted by name as `sums assemble` leaves it.
+    fn add_listed(&self, name: &str, bytes: &str) {
+        std::fs::write(self.dist.join(name), bytes).expect("file");
+        let mut lines: Vec<String> = std::fs::read_to_string(self.dist.join("SHA256SUMS"))
+            .expect("SHA256SUMS")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.push(format!(
+            "{}  {name}",
+            hex::encode(sha2::Sha256::digest(bytes))
+        ));
+        lines.sort_by_key(|l| l.split_once("  ").map(|(_, n)| n.to_owned()));
+        std::fs::write(self.dist.join("SHA256SUMS"), lines.join("\n") + "\n").expect("sums");
+    }
+
+    /// Writes next to each tarball and package the bundle the attest job leaves: one
+    /// attestation of that file, signed from `source_ref` for `commit`.
     fn bundles(&self, source_ref: &str, commit: &str) {
-        for (sha, name) in self.tarballs() {
+        for (sha, name) in self.bundled() {
             std::fs::write(
                 self.dist.join(format!("{name}.sigstore.json")),
                 bundle_json(&sha, &bundle_flags(source_ref, commit)),
@@ -623,8 +673,85 @@ fn attestations_refuse_a_foreign_workflow_an_unknown_file_and_a_missing_gh() {
     assert_eq!(code, Some(1));
     assert_eq!(
         err,
-        "xtask: SHA256SUMS lists notes.txt, neither a tarball nor an SBOM\n"
+        "xtask: SHA256SUMS lists notes.txt, neither a tarball, a package, an SBOM \
+         nor version facts\n"
     );
+}
+
+#[test]
+fn a_kbf_tarball_without_its_version_facts_fails_the_sums_check() {
+    // Catches: a release set that does not need the facts of its `kbf` (a build job that
+    // lost the step would publish a platform with nothing for an offer to read), and the
+    // message not naming the tarball and the file missing. The second half is the control:
+    // with the facts listed and present the same set passes, so the refusal was for them
+    // and for nothing else, and `kbf-daemon`'s tarball (no facts) is not named. Mutant:
+    // the pairing taken out of `verify_sums`.
+    let names: &[&str] = &["kbf", "kbf-daemon"];
+    let r = Release::build_with("facts-missing", &[("linux-x86_64", names)]);
+    let tarball = format!("kbf-{COMMIT}-linux-x86_64.tar.gz");
+    let facts = format!("kbf-{COMMIT}-linux-x86_64.version.json");
+    let (code, out, err) = xtask(&["verify-assets", "sums", s(&r.dist)], &r.tmp, None);
+    assert_eq!(code, Some(1), "{out}");
+    let want = format!(
+        "xtask: {tarball}: its version facts {facts} are not listed in \
+         SHA256SUMS\n"
+    );
+    assert_eq!(err, want);
+    r.add_facts("linux-x86_64");
+    let (code, out, err) = xtask(&["verify-assets", "sums", s(&r.dist)], &r.tmp, None);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(out, "sums: 5 files match; the flipped copy does not\n");
+}
+
+#[test]
+fn version_facts_without_their_kbf_tarball_fail_the_sums_check() {
+    // Catches: facts in the release set of a platform that has no `kbf` there (a stray
+    // file, or another build's, would be attested and carried as if it stated something of
+    // a binary that ships), and a message that does not name both files. The control is
+    // the pairing of the test above, with the tarball listed. Mutant: the reverse pairing
+    // taken out of `verify_sums`.
+    let names: &[&str] = &["kbf-daemon"];
+    let r = Release::build_with("facts-orphan", &[("linux-x86_64", names)]);
+    let facts = r.add_facts("linux-x86_64");
+    let (code, out, err) = xtask(&["verify-assets", "sums", s(&r.dist)], &r.tmp, None);
+    assert_eq!(code, Some(1), "{out}");
+    let want = format!(
+        "xtask: {facts}: the tarball it states the facts of, \
+         kbf-{COMMIT}-linux-x86_64.tar.gz, is not listed in SHA256SUMS\n"
+    );
+    assert_eq!(err, want);
+}
+
+#[test]
+fn version_facts_are_verified_for_build_provenance_and_nothing_else() {
+    // Catches: facts the attest job signs that the verify job refuses as neither a tarball,
+    // a package nor an SBOM; facts held to what only a tarball has (an SBOM attestation, a
+    // bundle: neither exists, and the release check names a bundle of anything else); and
+    // facts whose provenance is not checked, or whose missing attestation is passed over.
+    let names: &[&str] = &["kbf", "kbf-daemon"];
+    let r = Release::build_with("facts-attested", &[("linux-x86_64", names)]);
+    let facts = r.add_facts("linux-x86_64");
+    r.attest(None);
+    let (code, out, err) = r.verify(&format!("{WORKFLOW}@refs/heads/main"), None);
+    assert_eq!(code, Some(0), "{err}");
+    let line = format!("verified: {facts} (provenance)\n");
+    assert!(out.contains(&line), "{out}");
+    let path = s(&r.dist.join(&facts)).to_owned();
+    let calls = r.gh_calls();
+    let mine: Vec<&String> = calls.iter().filter(|c| c.contains(&path)).collect();
+    assert_eq!(mine.len(), 1, "{mine:#?}");
+    assert_eq!(
+        *mine[0],
+        format!("attestation verify {path} {}", flags(WORKFLOW))
+    );
+    r.attest(Some((facts.as_str(), false)));
+    let (code, _, err) = r.verify(WORKFLOW, None);
+    assert_eq!(code, Some(1), "{err}");
+    let want = format!(
+        "xtask: {path}: no build provenance attestation signed by \
+         {WORKFLOW} verifies\n"
+    );
+    assert_eq!(err, want);
 }
 
 #[test]
@@ -934,5 +1061,206 @@ fn the_commit_a_bundle_is_checked_for_must_be_a_full_sha() {
         std::fs::read_to_string(r.gh.with_file_name("gh-args")).unwrap_or_default(),
         "",
         "gh was run for a refused commit"
+    );
+}
+
+/// A release of one tarball and the kbf-installer deb of the same platform, attested as
+/// the attest job leaves them: the deb has build provenance and a bundle, no SBOM.
+fn with_deb(name: &str) -> (Release, String) {
+    let one = [("linux-x86_64", &["kbf-installer"][..])];
+    let r = Release::build_with(name, &one);
+    let deb = r.add_deb("linux-x86_64");
+    r.attest(None);
+    (r, deb)
+}
+
+#[test]
+fn the_mac_package_is_verified_like_the_deb_for_provenance_and_its_own_bundle() {
+    // Catches: a `.pkg` in the macOS SHA256SUMS refused as "neither a tarball, a package
+    // nor an SBOM" (verify-darwin-arm64 failing on the first push that lists one), a `.pkg`
+    // verified without its bundle, asked for an SBOM attestation it does not have, and the
+    // package controls (its bundle verifying the tarball and the reverse) not run for it.
+    let one = [("darwin-arm64", &["kbf-installer"][..])];
+    let r = Release::build_with("pkg-good", &one);
+    let pkg = r.add_package("darwin-arm64", "pkg");
+    r.attest(None);
+    let (code, out, err) = r.verify(WORKFLOW, None);
+    assert_eq!(code, Some(0), "{err}: {out}");
+    assert!(
+        out.lines()
+            .any(|l| l == format!("verified: {pkg} (provenance, bundle)")),
+        "{out}"
+    );
+    let calls = r.gh_calls();
+    let path = r.dist.join(&pkg);
+    let on_pkg: Vec<&String> = calls
+        .iter()
+        .filter(|c| c.starts_with(&format!("attestation verify {} ", s(&path))))
+        .collect();
+    assert_eq!(on_pkg.len(), 4, "{on_pkg:#?}");
+    assert!(
+        on_pkg.iter().all(|c| !c.contains(SBOM_PREDICATE)),
+        "{on_pkg:#?}"
+    );
+    // Its bundle is required: removed, the listing is refused.
+    std::fs::remove_file(r.bundle_of(&pkg)).expect("remove");
+    let (code, _, err) = r.verify(WORKFLOW, None);
+    assert_eq!(code, Some(1));
+    assert!(
+        err.contains(&format!("{pkg}: no provenance bundle")),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_package_is_verified_for_provenance_and_its_own_bundle_and_for_no_sbom() {
+    // Catches: a deb in SHA256SUMS refused as "neither a tarball nor an SBOM" (the
+    // verifier and so the verify-linux job failing on the first push that lists one), a
+    // deb verified without its bundle (an unsigned bundle a host would rely on), one
+    // asked for an SBOM attestation it does not have, the bundle checked with other
+    // flags than the installer's, and the package controls not run (the deb's bundle
+    // verifying the tarball, the tarball verifying under the deb's bundle).
+    let (r, deb) = with_deb("deb-good");
+    let (code, out, err) = r.verify(WORKFLOW, None);
+    assert_eq!(code, Some(0), "{err}: {out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(
+        lines.contains(&format!("verified: {deb} (provenance, bundle)").as_str()),
+        "{out}"
+    );
+    let calls = r.gh_calls();
+    let deb_path = r.dist.join(&deb);
+    let file = s(&deb_path);
+    let verifying = format!("attestation verify {file} ");
+    let on_deb: Vec<&String> = calls.iter().filter(|c| c.starts_with(&verifying)).collect();
+    // Provenance, its bundle, and the controls: against the tarball's bundle, against
+    // its own for another commit. (The tarball against the deb's bundle has the tarball
+    // as its file.)
+    assert_eq!(on_deb.len(), 4, "{on_deb:#?}");
+    assert_eq!(
+        on_deb[0],
+        &format!("attestation verify {file} {}", flags(WORKFLOW))
+    );
+    let bundle = r.bundle_of(&deb);
+    assert_eq!(
+        on_deb[1],
+        &format!(
+            "attestation verify {file} --bundle {} {}",
+            s(&bundle),
+            bundle_flags("refs/heads/main", COMMIT)
+        )
+    );
+    assert!(
+        on_deb.iter().all(|c| !c.contains(SBOM_PREDICATE)),
+        "an SBOM attestation was asked of the deb: {on_deb:#?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.contains(&format!(".tar.gz --bundle {} ", s(&bundle)))),
+        "the tarball was not tried against the deb's bundle: {calls:#?}"
+    );
+}
+
+#[test]
+fn a_package_without_its_bundle_or_with_anothers_is_refused_before_gh_is_asked() {
+    // Catches: the pairing blind to a deb (a package released with no bundle a host can
+    // verify it with, a stray bundle of an unlisted deb, or the tarball's bundle copied
+    // under the deb's name, which only the subject comparison finds).
+    let (r, deb) = with_deb("deb-bundles");
+    std::fs::remove_file(r.bundle_of(&deb)).expect("remove");
+    let (code, out, err) = r.verify(WORKFLOW, None);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!("xtask: {deb}: no provenance bundle {deb}.sigstore.json\n")
+    );
+
+    let (r, deb) = with_deb("deb-swapped");
+    let tarball = format!("kbf-installer-{COMMIT}-linux-x86_64.tar.gz");
+    std::fs::copy(r.bundle_of(&tarball), r.bundle_of(&deb)).expect("swap");
+    let (code, out, err) = r.verify(WORKFLOW, None);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        err.starts_with(&format!(
+            "xtask: {deb}.sigstore.json: has the subject digest sha256:"
+        )),
+        "{err}"
+    );
+
+    let (r, _) = with_deb("deb-stray");
+    let stray = format!("kbf-installer-{COMMIT}-linux-arm64.deb.sigstore.json");
+    std::fs::copy(
+        r.bundle_of(&format!("kbf-installer-{COMMIT}-linux-x86_64.deb")),
+        r.dist.join(&stray),
+    )
+    .expect("stray");
+    let (code, out, err) = r.verify(WORKFLOW, None);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!("xtask: {stray}: not the bundle of a listed tarball\n")
+    );
+    assert_eq!(
+        std::fs::read_to_string(r.gh.with_file_name("gh-args")).unwrap_or_default(),
+        "",
+        "gh was run before the pairing was checked"
+    );
+}
+
+#[test]
+fn a_package_bundle_that_does_not_verify_fails_the_run_and_names_it() {
+    // Catches: the deb's own bundle never put to gh (only its provenance in GitHub's
+    // store), so a bundle signed for another commit, or by no one, would ship.
+    let (r, deb) = with_deb("deb-bad-bundle");
+    let sha = hex::encode(sha2::Sha256::digest(
+        "the kbf-installer package for linux-x86_64",
+    ));
+    std::fs::write(
+        r.bundle_of(&deb),
+        bundle_json(&sha, &bundle_flags("refs/heads/main", OTHER)),
+    )
+    .expect("bundle");
+    let (code, out, err) = r.verify(WORKFLOW, None);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        err.starts_with(&format!(
+            "xtask: {}: its bundle {deb}.sigstore.json does not verify: ",
+            s(&r.dist.join(&deb))
+        )),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_verifier_that_mixes_package_and_tarball_bundles_is_caught_by_the_package_controls() {
+    // Catches: each package control skipped. With a gh that verifies any file against a
+    // bundle, the deb passes the tarball's bundle; with one that takes any file under a
+    // deb's bundle, the tarball passes the deb's; with one that ignores the commit, the
+    // deb passes for another commit. Each message names the package.
+    let (r, deb) = with_deb("deb-controls-file");
+    let tarball = format!("kbf-installer-{COMMIT}-linux-x86_64.tar.gz");
+    let (code, out, err) = r.verify(WORKFLOW, Some("bundle-any-file"));
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!("xtask: control failed: the bundle of {tarball} verified the package {deb}\n")
+    );
+    let (r, deb) = with_deb("deb-controls-bundle");
+    let (code, out, err) = r.verify(WORKFLOW, Some("bundle-deb-bundle-any"));
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!("xtask: control failed: the bundle of the package {deb} verified {tarball}\n")
+    );
+    let (r, deb) = with_deb("deb-controls-commit");
+    let (code, out, err) = r.verify(WORKFLOW, Some("bundle-any-commit"));
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!(
+            "xtask: control failed: the bundle of {deb} verified for commit {}, not the commit it attests\n",
+            control_commit(COMMIT)
+        )
     );
 }

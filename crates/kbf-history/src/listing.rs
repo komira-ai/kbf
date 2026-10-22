@@ -242,11 +242,9 @@ impl<O> Reader<O> {
             let Some((_, listed, inv)) = root.parse_inv_list(&key) else {
                 return Ok(None);
             };
-            let row = root.invid(&inv);
-            let Some(stored) = self.index.get(row.clone()).await? else {
+            let Some(header) = self.stored_header(&inv).await? else {
                 return Ok(None);
             };
-            let header = decode_row::<InvocationHeader>(&row, &stored.value)?;
             let wanted = header.list_ms == listed
                 && !header.idless
                 && all_allow(&header, allow)

@@ -1,6 +1,9 @@
 //! The fake Mac's lease-user pool, its volume and a root daemon, as `apply` leaves them.
 
-use super::{ERR_LOG, FakeMac, HOMES, KEY, PLIST, SCRATCH, VOLUME, golden_plist_as, sha256_hex};
+use super::{
+    CONFIG, ERR_LOG, FakeMac, HOMES, KEY, ORDERS, PLIST, SCRATCH, VOLUME, golden_config,
+    golden_plist_as, sha256_hex,
+};
 
 impl FakeMac {
     /// A converged Mac whose profile adds `daemon_user=root`, with every item as
@@ -11,6 +14,7 @@ impl FakeMac {
         let text = format!("{}daemon_user=root\n", mac.profile);
         mac.set_profile(text);
         mac.own(ERR_LOG, 0, 0);
+        mac.own(ORDERS, 0, 0);
         mac.write(KEY, "key\n");
         mac.chmod(KEY, 0o600);
         mac.own(KEY, 0, 0);
@@ -61,13 +65,14 @@ impl FakeMac {
 
     /// Replaces the test profile of a converged Mac with `text`, and its property list
     /// with the golden one for `text` (without `UserName` when it sets
-    /// `daemon_user=root`).
+    /// `daemon_user=root`), and its `kbf.toml` with the golden one.
     pub fn set_profile(&mut self, text: String) {
         let user = (!text.contains("\ndaemon_user=root\n")).then_some("_kbf");
         self.write(
             PLIST,
             &golden_plist_as(&sha256_hex(text.as_bytes())[..12], user),
         );
+        self.write(CONFIG, &golden_config());
         self.profile = text;
     }
 }

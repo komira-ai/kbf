@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 use super::*;
 use kbf_host::testkit::{FakeExec, reply};
+use kbf_testkit::dir::TestDir;
 
 fn argv(args: &[&str]) -> Vec<OsString> {
     std::iter::once("kbf-deploy")
@@ -222,10 +223,7 @@ fn main_runs_on_the_host() {
     assert_eq!(main(argv(&args)), ExitCode::FAILURE);
 }
 
-const LINUX_CONFIG: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/templates/linux/config.example"
-);
+const LINUX_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/templates/linux/swap.example");
 
 fn no_env(_: &str) -> Option<OsString> {
     None
@@ -242,8 +240,6 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
     let refused = [
         // The fake's default answer, exit 0, is every kubelet active.
         (base("swap"), "kubelet.service is active"),
-        // ... and a cgroup.controllers that is not there.
-        (base("install-units"), "no cgroup v2 memory controller"),
         (
             vec!["linux", "swap", "--config", "/srv/none/config"],
             "/srv/none/config",
@@ -259,14 +255,7 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
         );
     }
 
-    let conflicts = [
-        [
-            base("install-units"),
-            vec!["--uninstall", "--restart-minio"],
-        ]
-        .concat(),
-        [base("swap"), vec!["--remove", "--kubelet-allows-swap"]].concat(),
-    ];
+    let conflicts = [[base("swap"), vec!["--remove", "--kubelet-allows-swap"]].concat()];
     for args in conflicts {
         let mut exec = FakeExec::new(0);
         let (code, _, _) = cli(&mut exec, &no_env, &args);
@@ -274,24 +263,6 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
         assert!(exec.queries.borrow().is_empty(), "{args:?} asked the host");
     }
 
-    // A mode's unit reaches its own install: on a host with no such user it asks for the
-    // user the frontend runs as and is refused before any step.
-    let mut exec = FakeExec::new(0);
-    let args = [base("install-units"), vec!["--mode", "frontend"]].concat();
-    let (code, _, err) = cli(&mut exec, &no_env, &args);
-    assert_eq!(code, ExitCode::from(2));
-    assert_eq!(
-        err,
-        "REFUSED: /usr/bin/getent passwd -- kbf-server printed \"\", which is not what this kit reads\n"
-    );
-    // The converged units' MinIO restart and rollback are not a mode's.
-    for flag in ["--restart-minio", "--uninstall"] {
-        let mut exec = FakeExec::new(0);
-        let args = [base("install-units"), vec!["--mode", "storage", flag]].concat();
-        let (code, _, _) = cli(&mut exec, &no_env, &args);
-        assert_eq!(code, ExitCode::from(2), "{args:?}");
-        assert!(exec.queries.borrow().is_empty(), "{args:?} asked the host");
-    }
     // verify-cert reaches its kit: a CA that is not there is refused; a daemon's row
     // needs its node id.
     let mut exec = FakeExec::new(0);
@@ -343,18 +314,20 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
     );
     assert!(!err.contains("REFUSED: cannot read"), "{err}");
 
-    // A rollback of a host whose services are on: a dry run plans, exits 0.
-    let mut exec = FakeExec::new(501);
-    let (code, out, _) = cli(
+    // A swapfile to remove, without --apply: a dry run plans, exits 0.
+    let mut exec = FakeExec::new(0);
+    exec.answer = Box::new(|_| Ok(reply(0, "", "")));
+    exec.entries.insert(
+        HostPath::new("/swapfile").expect("path"),
+        kbf_host::exec::Entry::Other,
+    );
+    let (code, out, err) = cli(
         &mut exec,
         &no_env,
-        &[base("install-units"), vec!["--uninstall"]].concat(),
+        &[base("swap"), vec!["--remove"]].concat(),
     );
-    assert_eq!(code, ExitCode::SUCCESS);
-    assert!(
-        out.contains("\nDRY-RUN: run /usr/bin/systemctl disable --now"),
-        "{out}"
-    );
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(out.contains("DRY-RUN: "), "{out}");
 
     // Removing a swapfile whose removal fails: exit 1.
     let mut exec = FakeExec::new(0);
@@ -385,183 +358,51 @@ fn the_rollback_stamp_is_unix_seconds() {
     assert!(stamp >= before && stamp <= before + 5, "{stamp}");
 }
 
-/// Catches the `linux` kit dropped from the merged command line (clap would exit 2 on
-/// an unknown subcommand, but on stderr with no `REFUSED:`), a linux refusal written to
-/// stdout or exiting 1 (1 means "the units are wrong"). (The binary's tests in
-/// `tests/linux_cli.rs` run the verbs end to end; this one also runs `run`'s linux arm in
-/// the lib tests' instantiation of `run`, the one the coverage ratchet counts.)
+/// Catches a retired units verb still taken by the command line (or answered by
+/// anything but clap's usage error, exit 2 with nothing asked of the host or written):
+/// an operator or script that still calls `render-units`, `check-units` or
+/// `install-units` must fail loudly, not find a verb that quietly does something else.
 #[test]
-fn a_linux_verb_runs_through_the_same_command_line() {
-    let mut exec = FakeExec::new(501);
-    let (code, out, err) = cli(
-        &mut exec,
-        &admin_env,
-        &[
-            "linux",
-            "render-units",
-            "--config",
-            "/nonexistent/kbf-deploy/config.local",
-            "--out",
-            "/nonexistent/kbf-deploy/units",
-        ],
-    );
-    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
-    assert!(
-        err.starts_with("REFUSED: cannot read /nonexistent/kbf-deploy/config.local"),
-        "{err}"
-    );
+fn the_retired_units_verbs_are_usage_errors() {
+    // Every argument the base's verb required, so that on the base each one parses.
+    let verbs: [(&str, &[&str]); 3] = [
+        ("render-units", &["--out", "/nonexistent/kbf-deploy/units"]),
+        ("check-units", &["--dir", "/nonexistent/kbf-deploy/units"]),
+        ("install-units", &["--apply"]),
+    ];
+    for (verb, rest) in verbs {
+        let mut exec = FakeExec::new(0);
+        let mut args = vec!["linux", verb, "--mode", "daemon", "--config", LINUX_CONFIG];
+        args.extend(rest);
+        let (code, out, err) = cli(&mut exec, &no_env, &args);
+        assert_eq!(
+            (code, out.as_str()),
+            (ExitCode::from(2), ""),
+            "{verb}: {err}"
+        );
+        assert!(err.contains(verb), "{verb}: {err}");
+        assert!(exec.queries.borrow().is_empty(), "{verb} asked the host");
+        assert!(exec.log.is_empty(), "{verb} changed the host");
+    }
 }
 
-/// Catches `render-units` or `check-units` output lost through the merged command line
-/// (a check's FAIL lines not printed, or a broken unit exiting 0). These run the lib
-/// tests' instantiation of the `linux` arm, the one the coverage ratchet counts.
+/// Catches `linux swap` refusing an existing node.conf, or taking it without a word:
+/// the retired keys are ignored with one warning on stderr naming them.
 #[test]
-fn render_units_then_check_units_exit_0_and_a_broken_unit_exits_1() {
-    let dir = kbf_host::testkit::scratch("cli-render");
-    let units = dir.join("units");
-    let units = units.to_str().expect("utf-8");
+fn swap_ignores_the_retired_keys_of_an_old_node_conf_and_says_so() {
+    let dir = kbf_host::testkit::scratch("cli-swap-old-conf");
+    let file = dir.join("node.conf");
+    std::fs::write(&file, include_str!("linux/testdata/node.conf")).expect("write");
     let mut exec = FakeExec::new(501);
-    let render = [
-        "linux",
-        "render-units",
-        "--config",
-        LINUX_CONFIG,
-        "--out",
-        units,
-        "--kbf-uid",
-        "1500",
-    ];
-    let (code, out, err) = cli(&mut exec, &no_env, &render);
-    assert_eq!(code, ExitCode::SUCCESS, "{err}");
-    assert!(out.starts_with("rendered kbf.slice "), "{out}");
-    let check = [
-        "linux",
-        "check-units",
-        "--config",
-        LINUX_CONFIG,
-        "--dir",
-        units,
-        "--installable",
-    ];
-    let (code, out, err) = cli(&mut exec, &no_env, &check);
-    assert_eq!(code, ExitCode::SUCCESS, "{out}{err}");
-    assert!(out.starts_with("UNITS OK"), "{out}");
-
-    let server = format!("{units}/kbf-server.service");
-    let text = std::fs::read_to_string(&server).expect("rendered");
-    std::fs::write(&server, text.replace("MemorySwapMax=0", "MemorySwapMax=1G")).expect("plant");
-    let (code, out, _) = cli(&mut exec, &no_env, &check);
-    assert_eq!(code, ExitCode::FAILURE, "{out}");
-    assert!(out.starts_with("FAIL "), "{out}");
-    assert!(out.contains("UNITS BROKEN"), "{out}");
-}
-
-/// Catches `--mode` not reaching the mode verbs through the merged command line (the
-/// converged units rendered or checked instead) and a broken mode unit exiting 0. Like
-/// the test above, these run the lib tests' instantiation of the `linux` arm.
-#[test]
-fn render_units_then_check_units_with_a_mode_exit_0_and_a_broken_unit_exits_1() {
-    let dir = kbf_host::testkit::scratch("cli-render-mode");
-    let units = dir.join("units");
-    let units = units.to_str().expect("utf-8");
-    let mut exec = FakeExec::new(501);
-    let render = [
-        "linux",
-        "render-units",
-        "--config",
-        LINUX_CONFIG,
-        "--out",
-        units,
-        "--kbf-uid",
-        "1500",
-        "--mode",
-        "daemon",
-    ];
-    let (code, out, err) = cli(&mut exec, &no_env, &render);
-    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    let args = ["linux", "swap", "--config", file.to_str().expect("utf-8")];
+    let (_, _, err) = cli(&mut exec, &no_env, &args);
+    assert!(!err.contains("unknown key"), "{err}");
+    assert_eq!(err.matches("no longer read").count(), 1, "{err}");
     assert!(
-        out.starts_with("rendered kbf.slice kbf-daemon.service into "),
-        "{out}"
-    );
-    let check = [
-        "linux",
-        "check-units",
-        "--config",
-        LINUX_CONFIG,
-        "--dir",
-        units,
-        "--installable",
-        "--mode",
-        "daemon",
-    ];
-    let (code, out, err) = cli(&mut exec, &no_env, &check);
-    assert_eq!(code, ExitCode::SUCCESS, "{out}{err}");
-    assert_eq!(
-        out,
-        "SKIP parse: no kbf binary at /usr/local/bin/kbf, so the flags of kbf daemon were \
-         not parsed; give --kbf-bin PATH to parse them with another\n\
-         UNIT OK: kbf-daemon.service runs kbf daemon\n"
-    );
-    // --kbf-bin reaches the parse rule, and needs --mode.
-    let check: Vec<&str> = check
-        .iter()
-        .copied()
-        .chain(["--kbf-bin", "/opt/kbf/kbf"])
-        .collect();
-    let (code, out, err) = cli(&mut exec, &no_env, &check);
-    assert_eq!(code, ExitCode::SUCCESS, "{out}{err}");
-    assert_eq!(out, "UNIT OK: kbf-daemon.service runs kbf daemon\n");
-    let asked = exec
-        .queries
-        .borrow()
-        .last()
-        .map(|c| (c.program.to_string(), c.args[..2].to_vec()));
-    assert_eq!(
-        asked,
-        Some((
-            "/opt/kbf/kbf".to_owned(),
-            vec!["check-args".to_owned(), "daemon".to_owned()]
-        ))
-    );
-    let converged = [
-        "linux",
-        "check-units",
-        "--config",
-        LINUX_CONFIG,
-        "--dir",
-        units,
-        "--kbf-bin",
-        "/opt/kbf/kbf",
-    ];
-    let (code, _, err) = cli(&mut exec, &no_env, &converged);
-    assert_eq!(code, ExitCode::from(2), "{err}");
-    assert!(err.contains("--mode"), "{err}");
-    // A --kbf-bin that is not absolute, or cannot be run, is refused: the flags went
-    // unparsed.
-    let relative: Vec<&str> = check[..check.len() - 1]
-        .iter()
-        .copied()
-        .chain(["kbf"])
-        .collect();
-    let (code, _, err) = cli(&mut exec, &no_env, &relative);
-    assert_eq!(code, ExitCode::from(2), "{err}");
-    assert!(err.contains("--kbf-bin: \"kbf\" is not absolute"), "{err}");
-    exec.answer = Box::new(|_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
-    let (code, out, err) = cli(&mut exec, &no_env, &check);
-    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
-    assert!(
-        err.contains("cannot run /opt/kbf/kbf check-args: permission denied"),
+        err.contains("KBF_HOST_NAME") && err.contains("docs/deploy/kbf-units.md"),
         "{err}"
     );
-    exec.answer = Box::new(|_| Ok(kbf_host::testkit::reply(0, "", "")));
-
-    let unit = format!("{units}/kbf-daemon.service");
-    let text = std::fs::read_to_string(&unit).expect("rendered");
-    std::fs::write(&unit, text.replace("Delegate=yes", "Delegate=no")).expect("plant");
-    let (code, out, _) = cli(&mut exec, &no_env, &check);
-    assert_eq!(code, ExitCode::FAILURE, "{out}");
-    assert!(out.starts_with("FAIL delegate: "), "{out}");
-    assert!(out.contains("UNIT BROKEN"), "{out}");
+    assert!(!err.contains("KBF_SWAP_FILE,"), "{err}");
 }
 
 /// The kit's settings in a file, with a LAN address filled in.
@@ -666,7 +507,8 @@ fn the_mdm_verbs_exit_0_done_1_failed_2_refused() {
     assert!(err.starts_with("kbf-deploy: step 0 ("), "{err}");
 
     // A dry run of a fetch into an empty directory: every pinned archive, exit 0.
-    let dir = std::env::temp_dir().join(format!("kbf-deploy-cli-fetch.{}", std::process::id()));
+    let own = TestDir::under(std::env::temp_dir(), "kbf-deploy-cli-fetch");
+    let dir = own.join("archives");
     let mut exec = FakeExec::new(501);
     let dir_arg = dir.to_string_lossy().into_owned();
     let (code, out, err) = cli(
@@ -693,9 +535,7 @@ fn the_mdm_verbs_exit_0_done_1_failed_2_refused() {
 #[test]
 fn mdm_verify_exits_1_when_a_check_fails() {
     let config = mdm_config("cli_mdm_verify");
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let via = closed.local_addr().expect("addr").to_string();
-    drop(closed);
+    let via = kbf_testkit::port::dead_addr().to_string();
     let mut exec = FakeExec::new(0);
     let (code, out, err) = cli(
         &mut exec,
@@ -705,199 +545,6 @@ fn mdm_verify_exits_1_when_a_check_fails() {
     assert_eq!(code, ExitCode::FAILURE, "{err}");
     assert!(out.contains("FAIL  https://mdm.example.com/version answers: https://mdm.example.com/version: Connection refused"), "{out}");
     assert!(out.ends_with(" check(s) failed\n"), "{out}");
-}
-
-/// Catches `envoy render` not wired to the kit, its line lost, or a refusal that
-/// exits other than 2 or prints elsewhere than stderr. In-process, so the lib tests'
-/// instantiation of `run` covers the `envoy` arm.
-#[test]
-fn envoy_render_exits_0_and_a_bad_setting_exits_2() {
-    let dir = kbf_host::testkit::scratch("cli-envoy");
-    let config = dir.join("config.local");
-    let example = include_str!("../templates/envoy/config.example");
-    std::fs::write(&config, example).expect("config");
-    let config = config.to_str().expect("utf-8").to_owned();
-    let rendered = dir.join("rendered");
-    let rendered = rendered.to_str().expect("utf-8").to_owned();
-    let mut exec = FakeExec::new(501);
-    let args = ["envoy", "render", "--config", &config, "--out", &rendered];
-    let (code, out, err) = cli(&mut exec, &no_env, &args);
-    assert_eq!((code, err.as_str()), (ExitCode::SUCCESS, ""), "{out}");
-    assert_eq!(
-        out,
-        format!("rendered manifests.json envoy.json into {rendered}\n")
-    );
-
-    std::fs::write(&config, example.replace("KBF_SERVERS=", "KBF_SERVER=")).expect("plant");
-    let (code, out, err) = cli(&mut exec, &no_env, &args);
-    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
-    assert!(
-        err.starts_with("REFUSED: line ") && err.ends_with(": unknown key KBF_SERVER\n"),
-        "{err}"
-    );
-}
-
-/// Catches `envoy check` not wired to the kit, a check that reads another file than
-/// `--dir`'s manifests.json (or no render without `--dir`), a failure printed
-/// elsewhere than stdout or with an exit other than 1, and an unreadable or non-JSON
-/// render or a bad setting exiting other than 2 with a `REFUSED:` line.
-#[test]
-fn envoy_check_exits_0_passed_1_failed_2_refused() {
-    let dir = kbf_host::testkit::scratch("cli-envoy-check");
-    let config = dir.join("config.local");
-    let example = include_str!("../templates/envoy/config.example");
-    std::fs::write(&config, example).expect("config");
-    let config = config.to_str().expect("utf-8").to_owned();
-    let rendered = dir.join("rendered");
-    let rendered = rendered.to_str().expect("utf-8").to_owned();
-    let mut exec = FakeExec::new(501);
-    let passed = "12 methods routed, every check passed\n";
-
-    let (code, out, err) = cli(&mut exec, &no_env, &["envoy", "check", "--config", &config]);
-    assert_eq!(
-        (code, out.as_str(), err.as_str()),
-        (ExitCode::SUCCESS, passed, "")
-    );
-
-    let check = ["envoy", "check", "--config", &config, "--dir", &rendered];
-    let (code, out, err) = cli(&mut exec, &no_env, &check);
-    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
-    assert!(
-        err.starts_with(&format!("REFUSED: cannot read {rendered}/manifests.json: ")),
-        "{err}"
-    );
-
-    let render = ["envoy", "render", "--config", &config, "--out", &rendered];
-    assert_eq!(cli(&mut exec, &no_env, &render).0, ExitCode::SUCCESS);
-    let (code, out, err) = cli(&mut exec, &no_env, &check);
-    assert_eq!(
-        (code, out.as_str(), err.as_str()),
-        (ExitCode::SUCCESS, passed, "")
-    );
-
-    let manifests = format!("{rendered}/manifests.json");
-    let text = std::fs::read_to_string(&manifests).expect("rendered");
-    let class = "\"ingressClassName\": \"tailscale\"";
-    assert_eq!(text.matches(class).count(), 1);
-    std::fs::write(
-        &manifests,
-        text.replace(class, "\"ingressClassName\": \"nginx\""),
-    )
-    .expect("plant");
-    let (code, out, err) = cli(&mut exec, &no_env, &check);
-    assert_eq!((code, err.as_str()), (ExitCode::FAILURE, ""), "{out}");
-    assert_eq!(
-        out,
-        "FAIL ingress-class: ingressClassName nginx is not the tailscale IngressClass\n"
-    );
-
-    std::fs::write(&manifests, "{").expect("plant");
-    let (code, out, err) = cli(&mut exec, &no_env, &check);
-    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
-    assert!(
-        err.starts_with(&format!("REFUSED: {manifests} is not JSON: ")),
-        "{err}"
-    );
-
-    std::fs::write(&config, example.replace("KBF_SERVERS=", "KBF_SERVER=")).expect("plant");
-    let (code, out, err) = cli(&mut exec, &no_env, &check);
-    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
-    assert!(err.ends_with(": unknown key KBF_SERVER\n"), "{err}");
-}
-
-/// Catches `--topology box` not wired to the box kit (the front's files written, or the
-/// front's check run on a box config), the box render and check not agreeing through
-/// the files, a failed box check exiting other than 1 with its line on stdout, an
-/// unreadable file or a bad setting exiting other than 2, and the default topology
-/// changing (the front's tests above run without the flag).
-#[test]
-fn envoy_box_topology_renders_checks_and_refuses() {
-    let dir = kbf_host::testkit::scratch("cli-envoy-box");
-    let config = dir.join("box.local");
-    let example = include_str!("../templates/envoy/box.example");
-    std::fs::write(&config, example).expect("config");
-    let config = config.to_str().expect("utf-8").to_owned();
-    let rendered = dir.join("rendered");
-    let rendered = rendered.to_str().expect("utf-8").to_owned();
-    let mut exec = FakeExec::new(501);
-    let passed = "12 methods routed, every box check passed\n";
-
-    let (code, out, err) = cli(
-        &mut exec,
-        &no_env,
-        &["envoy", "check", "--topology", "box", "--config", &config],
-    );
-    assert_eq!(
-        (code, out.as_str(), err.as_str()),
-        (ExitCode::SUCCESS, passed, "")
-    );
-    let check = [
-        "envoy",
-        "check",
-        "--topology",
-        "box",
-        "--config",
-        &config,
-        "--dir",
-        &rendered,
-    ];
-    let (code, out, err) = cli(&mut exec, &no_env, &check);
-    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
-    assert!(
-        err.starts_with(&format!("REFUSED: cannot read {rendered}/envoy.json: ")),
-        "{err}"
-    );
-
-    let render = [
-        "envoy",
-        "render",
-        "--topology",
-        "box",
-        "--config",
-        &config,
-        "--out",
-        &rendered,
-    ];
-    let (code, out, err) = cli(&mut exec, &no_env, &render);
-    assert_eq!((code, err.as_str()), (ExitCode::SUCCESS, ""), "{out}");
-    assert_eq!(
-        out,
-        format!("rendered envoy.json envoy.args into {rendered}\n")
-    );
-    assert!(
-        !std::path::Path::new(&rendered)
-            .join("manifests.json")
-            .exists()
-    );
-    let (code, out, err) = cli(&mut exec, &no_env, &check);
-    assert_eq!(
-        (code, out.as_str(), err.as_str()),
-        (ExitCode::SUCCESS, passed, "")
-    );
-
-    let args = format!("{rendered}/envoy.args");
-    let text = std::fs::read_to_string(&args).expect("rendered");
-    std::fs::write(&args, text.replace("22500", "900")).expect("plant");
-    let (code, out, err) = cli(&mut exec, &no_env, &check);
-    assert_eq!((code, err.as_str()), (ExitCode::FAILURE, ""), "{out}");
-    assert!(
-        out.starts_with("FAIL parent-shutdown: --parent-shutdown-time-s is 900, "),
-        "{out}"
-    );
-
-    let envoy = format!("{rendered}/envoy.json");
-    std::fs::write(&envoy, "{").expect("plant");
-    let (code, out, err) = cli(&mut exec, &no_env, &check);
-    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
-    assert!(
-        err.starts_with(&format!("REFUSED: {envoy} is not JSON: ")),
-        "{err}"
-    );
-
-    std::fs::write(&config, example.replace("KBF_BOX_HOST=", "KBF_BOX_HOSTS=")).expect("plant");
-    let (code, out, err) = cli(&mut exec, &no_env, &render);
-    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
-    assert!(err.ends_with(": unknown key KBF_BOX_HOSTS\n"), "{err}");
 }
 
 /// Catches the `pilot` kit dropped from the merged command line (clap would exit 2 on
@@ -1165,163 +812,26 @@ fn the_tls_push_cert_and_dep_verbs_reach_their_kit() {
     }
 }
 
-/// Catches `envoy apply` not wired to the kit or ignoring `--apply`, `--refuse-example`
-/// not read (kbf's example refused when it is not given), a failed address check not
-/// exiting 1 with a `FAIL` line, a refusal exiting other than 2, and kubectl's cache
-/// directory left behind. In-process, so the lib tests' instantiation of `run` covers
-/// the arm.
+/// Catches the retired `envoy` kit coming back or being accepted under another
+/// spelling: kbf fronts its frontend with kbf-proxy and runs no Envoy, so
+/// `kbf-deploy envoy render|check|apply` must be refused by the parser (exit 2, clap's
+/// "unrecognized subcommand" on stderr, nothing on stdout) and run nothing.
 #[test]
-fn envoy_apply_exits_0_done_1_failed_2_refused() {
-    let dir = kbf_host::testkit::scratch("cli-envoy-apply");
-    let example = include_str!("../templates/envoy/config.example");
-    let ours = example
-        .replace("=example-context", "=farm")
-        .replace("=tail0000.ts.net", "=tail1234.ts.net")
-        .replace("kbf-server-a.", "kbf-server-b.");
-    let (kbf_example, config) = (dir.join("kbf.example"), dir.join("config.local"));
-    std::fs::write(&kbf_example, example).expect("example");
-    std::fs::write(&config, &ours).expect("config");
-    let (kbf_example, config) = (
-        kbf_example.to_str().expect("utf-8").to_owned(),
-        config.to_str().expect("utf-8").to_owned(),
-    );
-    let cache_dirs = Rc::new(RefCell::new(Vec::new()));
-    let address = Rc::new(RefCell::new("kbf.tail1234.ts.net"));
-    let mut exec = FakeExec::new(501);
-    let (seen, at) = (Rc::clone(&cache_dirs), Rc::clone(&address));
-    exec.answer = Box::new(move |cmd| {
-        let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
-        seen.borrow_mut().push(args[3].to_owned());
-        Ok(match &args[6..] {
-            ["-n", _, "get", "secret", _, "-o", _] => reply(0, "yes", ""),
-            ["diff", ..] => reply(1, "+ a change\n", ""),
-            [.., "ingress", "kbf", "-o", _] => reply(0, *at.borrow(), ""),
-            _ => reply(0, "", ""),
-        })
-    });
-    let base = [
-        "envoy",
-        "apply",
-        "--kubectl",
-        "/usr/local/bin/kubectl",
-        "--kubeconfig",
-        "/srv/admin/kubeconfig",
-        "--config",
-    ];
-    let with = |more: &[&str]| -> Vec<String> {
-        base.iter().chain(more).map(|s| (*s).to_owned()).collect()
-    };
-    let go = |exec: &mut FakeExec, args: Vec<String>| {
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        cli(exec, &no_env, &args)
-    };
-
-    let (code, out, err) = go(&mut exec, with(&[&config]));
-    assert_eq!((code, err.as_str()), (ExitCode::SUCCESS, ""), "{out}");
-    assert!(
-        out.ends_with("dry run: nothing changed. Re-run with --apply.\n"),
-        "{out}"
-    );
-    assert!(exec.log.is_empty(), "{:?}", exec.log);
-    let dirs = cache_dirs.borrow().clone();
-    assert!(
-        !dirs.is_empty() && dirs.iter().all(|d| *d == dirs[0]),
-        "{dirs:?}"
-    );
-    assert!(!Path::new(&dirs[0]).exists(), "{} left behind", dirs[0]);
-
-    let (code, out, err) = go(&mut exec, with(&[&config, "--apply"]));
-    assert_eq!((code, err.as_str()), (ExitCode::SUCCESS, ""), "{out}");
-    assert!(
-        out.ends_with("clients dial grpcs://kbf.tail1234.ts.net:443\n"),
-        "{out}"
-    );
-    assert_eq!(exec.log.len(), 2, "{:?}", exec.log);
-
-    *address.borrow_mut() = "kbf-1.tail1234.ts.net";
-    let (code, _, err) = go(&mut exec, with(&[&config, "--apply"]));
-    assert_eq!(code, ExitCode::FAILURE, "{err}");
-    assert!(
-        err.starts_with("FAIL the Ingress's address is kbf-1.tail1234.ts.net, "),
-        "{err}"
-    );
-
-    let refused = [
-        (
-            with(&[&kbf_example]),
-            "REFUSED: KBF_FRONT_KUBE_CONTEXT is still the example config's value: fill it in\n"
-                .to_owned(),
-        ),
-        (
-            with(&[&config, "--refuse-example", &config]),
-            "REFUSED: KBF_FRONT_KUBE_CONTEXT is still the example config's value: fill it in\n"
-                .to_owned(),
-        ),
-        (
-            with(&[&config, "--refuse-example", "/srv/absent"]),
-            "REFUSED: cannot read /srv/absent: ".to_owned(),
-        ),
-        (
-            with(&["/srv/absent"]),
-            "REFUSED: cannot read /srv/absent: ".to_owned(),
-        ),
-    ];
-    let before = exec.log.len();
-    for (args, want) in refused {
-        let (code, out, err) = go(&mut exec, args.clone());
-        assert_eq!(
-            (code, out.as_str()),
-            (ExitCode::from(2), ""),
+fn the_retired_envoy_kit_is_an_unknown_subcommand() {
+    for args in [
+        &["envoy", "render", "--config", "/c", "--out", "/o"][..],
+        &["envoy", "check", "--config", "/c"][..],
+        &["envoy", "apply", "--config", "/c"][..],
+        &["envoy"][..],
+    ] {
+        let mut exec = FakeExec::new(0);
+        let (code, out, err) = cli(&mut exec, &no_env, args);
+        assert_eq!(code, ExitCode::from(2), "{args:?}: {err}");
+        assert_eq!(out, "", "{args:?}");
+        assert!(
+            err.starts_with("error: unrecognized subcommand 'envoy'"),
             "{args:?}: {err}"
         );
-        assert!(err.starts_with(&want), "{args:?}: {err}");
+        assert!(exec.queries.borrow().is_empty(), "{args:?}");
     }
-    assert_eq!(exec.log.len(), before, "a refusal applies nothing");
-}
-
-/// Catches `envoy check` checking the NetworkPolicy against a fixed operator
-/// namespace instead of the config's `KBF_TS_OPERATOR_NAMESPACE`: a config naming
-/// another namespace passes on its own render, and a render made for `tailscale`
-/// fails `netpol-from` under it, naming the config's namespace.
-#[test]
-fn envoy_check_takes_the_operator_namespace_from_the_config() {
-    let dir = kbf_host::testkit::scratch("cli-envoy-check-namespace");
-    let example = include_str!("../templates/envoy/config.example");
-    let line = "KBF_TS_OPERATOR_NAMESPACE=tailscale\n";
-    assert_eq!(example.matches(line).count(), 1);
-    let tailscale = dir.join("config.tailscale");
-    std::fs::write(&tailscale, example).expect("config");
-    let tailscale = tailscale.to_str().expect("utf-8").to_owned();
-    let other = dir.join("config.other");
-    std::fs::write(
-        &other,
-        example.replace(line, "KBF_TS_OPERATOR_NAMESPACE=ts-operator\n"),
-    )
-    .expect("config");
-    let other = other.to_str().expect("utf-8").to_owned();
-    let rendered = dir.join("rendered");
-    let rendered = rendered.to_str().expect("utf-8").to_owned();
-    let mut exec = FakeExec::new(501);
-
-    let (code, out, err) = cli(&mut exec, &no_env, &["envoy", "check", "--config", &other]);
-    assert_eq!(
-        (code, out.as_str(), err.as_str()),
-        (
-            ExitCode::SUCCESS,
-            "12 methods routed, every check passed\n",
-            ""
-        )
-    );
-
-    let render = [
-        "envoy", "render", "--config", &tailscale, "--out", &rendered,
-    ];
-    assert_eq!(cli(&mut exec, &no_env, &render).0, ExitCode::SUCCESS);
-    let check = ["envoy", "check", "--config", &other, "--dir", &rendered];
-    let (code, out, err) = cli(&mut exec, &no_env, &check);
-    assert_eq!((code, err.as_str()), (ExitCode::FAILURE, ""), "{out}");
-    assert_eq!(
-        out,
-        "FAIL netpol-from: the NetworkPolicy admits [{\"namespaceSelector\":{\"matchLabels\":{\"kubernetes.io/metadata.name\":\"tailscale\"}}}], not the operator's namespace ts-operator\n"
-    );
 }

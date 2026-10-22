@@ -15,7 +15,7 @@ use kbf_proto::kbf::map::v1 as pb;
 use kbf_server::members::{
     Members, MembershipConfig, MembershipError, PROTOCOL, Progress, Registrant, Registration,
 };
-use kbf_server::storage_health::Debts;
+use kbf_server::storage_health::Reported;
 use kbf_state::{Cond, Store, Txn};
 use kbf_types::{Digest, DigestFunction};
 use prost::Message as _;
@@ -131,7 +131,7 @@ fn a_member_goes_down_after_the_ttl_and_leaves_after_the_dwell() {
     let g = map.generation();
 
     s.clock.advance(20 * SECOND);
-    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
+    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
         .expect("a beats");
     s.clock.advance(9 * SECOND);
     let early = m.refresh().expect("refresh").expect("a map");
@@ -143,7 +143,7 @@ fn a_member_goes_down_after_the_ttl_and_leaves_after_the_dwell() {
     assert_eq!(early.generation(), g, "nothing changed, nothing bumped");
 
     s.clock.advance(3 * SECOND);
-    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
+    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
         .expect("a beats");
     let down = m.refresh().expect("refresh").expect("a map");
     assert_eq!(state(&down, b.id), Some(MemberState::Down));
@@ -152,7 +152,7 @@ fn a_member_goes_down_after_the_ttl_and_leaves_after_the_dwell() {
 
     for _ in 0..10 {
         s.clock.advance(10 * SECOND);
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
             .expect("a beats");
     }
     let within = m.refresh().expect("refresh").expect("a map");
@@ -165,7 +165,7 @@ fn a_member_goes_down_after_the_ttl_and_leaves_after_the_dwell() {
 
     for _ in 0..3 {
         s.clock.advance(10 * SECOND);
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
             .expect("a beats");
     }
     let gone = m.refresh().expect("refresh").expect("a map");
@@ -187,9 +187,9 @@ fn heartbeats_keep_a_member_alive_and_set_state_does_not() {
     let g = m.current_map().expect("read").expect("map").generation();
     for round in 1..=6 {
         s.clock.advance(20 * SECOND);
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
             .expect("a beats");
-        m.heartbeat(b.id, b.boot, Progress::CaughtUp, Debts::Unknown, None)
+        m.heartbeat(b.id, b.boot, Progress::CaughtUp, Reported::default(), None)
             .expect("b beats");
         let map = m.refresh().expect("refresh").expect("map");
         assert_eq!(
@@ -259,7 +259,7 @@ fn a_racing_refresh_gives_one_winner_and_one_retry() {
     m.set_state(a.id, MemberState::Active).expect("a");
     m.set_state(d.id, MemberState::Active).expect("d");
     s.clock.advance(40 * SECOND);
-    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
+    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
         .expect("a beats");
     s.clock.advance(25 * SECOND);
     let down = m.refresh().expect("refresh").expect("map");
@@ -278,7 +278,8 @@ fn a_racing_refresh_gives_one_winner_and_one_retry() {
 
     let map = m.current_map().expect("read").expect("map");
     assert_eq!(state(&map, d.id), None, "d left and stayed gone");
-    assert_eq!(state(&map, b.id), Some(MemberState::Active));
+    // The farm is over a minute old by now, and b is new to it: a joiner, not an Active member.
+    assert_eq!(state(&map, b.id), Some(MemberState::Joining));
     assert_eq!(map.generation(), down.generation() + 1);
     assert_eq!(b.map, map, "the loser answers with the winner's map");
     assert_eq!(
@@ -336,7 +337,7 @@ fn removing_a_member_remaps_only_its_blobs() {
         for _ in 0..secs / 10 {
             s.clock.advance(10 * SECOND);
             for r in survivors {
-                m.heartbeat(r.id, r.boot, Progress::CaughtUp, Debts::Unknown, None)
+                m.heartbeat(r.id, r.boot, Progress::CaughtUp, Reported::default(), None)
                     .expect("beat");
             }
         }
@@ -444,7 +445,7 @@ fn a_report_cannot_change_a_member_that_is_not_catching_up() {
         (&active, Progress::CatchingUp),
     ] {
         assert_eq!(
-            m.heartbeat(who.id, who.boot, progress, Debts::Unknown, None)
+            m.heartbeat(who.id, who.boot, progress, Reported::default(), None)
                 .expect("beat"),
             g
         );
@@ -456,14 +457,20 @@ fn a_report_cannot_change_a_member_that_is_not_catching_up() {
 
     s.clock.advance(20 * SECOND);
     for who in [&draining, &joining, &active] {
-        m.heartbeat(who.id, who.boot, Progress::CatchingUp, Debts::Unknown, None)
-            .expect("beat");
+        m.heartbeat(
+            who.id,
+            who.boot,
+            Progress::CatchingUp,
+            Reported::default(),
+            None,
+        )
+        .expect("beat");
     }
     s.clock.advance(11 * SECOND);
     let map = m.refresh().expect("refresh").expect("map");
     assert_eq!(state(&map, down.id), Some(MemberState::Down));
     assert!(matches!(
-        m.heartbeat(down.id, down.boot, Progress::CaughtUp, Debts::Unknown, None),
+        m.heartbeat(down.id, down.boot, Progress::CaughtUp, Reported::default(), None),
         Err(MembershipError::NotRegistered(id)) if id == down.id
     ));
     let after = m.current_map().expect("read").expect("map");
@@ -486,17 +493,23 @@ fn a_report_of_done_promotes_only_a_catching_up_member() {
     assert_eq!(state(&map, a.id), Some(MemberState::CatchingUp));
     let g = map.generation();
     assert_eq!(
-        m.heartbeat(a.id, a.boot, Progress::CatchingUp, Debts::Unknown, None)
-            .expect("beat"),
+        m.heartbeat(
+            a.id,
+            a.boot,
+            Progress::CatchingUp,
+            Reported::default(),
+            None
+        )
+        .expect("beat"),
         g
     );
     assert_eq!(
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
             .expect("beat"),
         g + 1
     );
     assert_eq!(
-        m.heartbeat(b.id, b.boot, Progress::CaughtUp, Debts::Unknown, None)
+        m.heartbeat(b.id, b.boot, Progress::CaughtUp, Reported::default(), None)
             .expect("beat"),
         g + 1
     );
@@ -504,7 +517,7 @@ fn a_report_of_done_promotes_only_a_catching_up_member() {
     assert_eq!(state(&map, a.id), Some(MemberState::Active));
     assert_eq!(state(&map, b.id), Some(MemberState::Draining));
     assert_eq!(
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
             .expect("beat"),
         g + 1,
         "a second report changes nothing"
@@ -540,7 +553,7 @@ fn bad_calls_are_refused_by_name() {
     let a = m.register(&node(1)).expect("a");
     let b = m.register(&node(1)).expect("a again");
     assert!(matches!(
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None),
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None),
         Err(MembershipError::Superseded {
             boot: 1,
             current: 2,
@@ -548,11 +561,17 @@ fn bad_calls_are_refused_by_name() {
         })
     ));
     assert!(
-        m.heartbeat(b.id, b.boot, Progress::CaughtUp, Debts::Unknown, None)
+        m.heartbeat(b.id, b.boot, Progress::CaughtUp, Reported::default(), None)
             .is_ok()
     );
     assert!(matches!(
-        m.heartbeat(MemberId(99), 1, Progress::CaughtUp, Debts::Unknown, None),
+        m.heartbeat(
+            MemberId(99),
+            1,
+            Progress::CaughtUp,
+            Reported::default(),
+            None
+        ),
         Err(MembershipError::NotRegistered(MemberId(99)))
     ));
     assert!(matches!(
@@ -596,7 +615,7 @@ fn the_map_clamps_replication_and_reports_its_generation() {
     let b = m.register(&node(2)).expect("b");
     assert_eq!(b.map.r(), 2);
     assert_eq!(
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
             .expect("beat"),
         b.map.generation()
     );
@@ -618,8 +637,8 @@ fn the_map_clamps_replication_and_reports_its_generation() {
 
 /// Catches: values in the store that the code cannot read being treated as empty or
 /// panicking: a member row that is not a message, a row without a member, a map that is
-/// not a message, a map the domain refuses, and an instance entry that is not an id. Each
-/// is an error that names it.
+/// not a message, a map the domain refuses (also for a registration, which reads the map
+/// for its floor), and an instance entry that is not an id. Each is an error that names it.
 #[test]
 fn unreadable_rows_are_errors_not_defaults() {
     let put = |s: &Arc<Hooked>, key: &str, value: Vec<u8>| {
@@ -647,6 +666,18 @@ fn unreadable_rows_are_errors_not_defaults() {
     put(&s, "map", pb::Map::default().encode_to_vec());
     assert!(corrupt(m.current_map().expect_err("generation 0")).starts_with("map"));
 
+    // A registration is judged by the map's floor, so a map that does not read refuses it
+    // (a floor is never guessed) before it is given an identity.
+    let e = m.register(&node(1)).expect_err("unreadable map");
+    assert!(corrupt(e).starts_with("map"));
+    assert_eq!(
+        s.fake.get("instance/node-1").expect("read"),
+        None,
+        "a registration refused for its map was given an identity"
+    );
+
+    let s = Hooked::new();
+    let m = members(&s, config(30, 120));
     put(&s, "instance/node-1", b"abc".to_vec());
     let e = m.register(&node(1)).expect_err("bad id");
     assert!(corrupt(e).contains("instance"));
@@ -679,7 +710,7 @@ fn writers_that_keep_losing_give_up_and_store_failures_surface() {
     }
     s.conflict_on(Some("member/"));
     assert!(matches!(
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None),
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None),
         Err(MembershipError::Contended)
     ));
     s.conflict_on(None);
@@ -724,41 +755,47 @@ fn the_map_source_follows_every_bump() {
     assert_eq!(*changes.borrow_and_update(), down.generation());
 }
 
-/// Catches a view that forgets the generation a bump replaced (a blob written before a
+/// Catches a view that forgets the generations a bump replaced (a blob written before a
 /// join would be looked for only where the new map puts it), one that keeps a map that is
-/// not older, and one that is a map the frontend has not seen: each bump moves the newest
-/// map to `previous`, a refresh that changes nothing moves nothing, and there is no view
-/// before the first member.
+/// not older, and one that is a map the frontend has not seen: each bump puts the newest
+/// map at the head of the history, a refresh that changes nothing moves nothing, and there
+/// is no view before the first member.
 #[test]
-fn the_view_keeps_the_generation_a_bump_replaced() {
+fn the_view_keeps_the_generations_a_bump_replaced() {
     let s = Hooked::new();
     let m = members(&s, config(30, 120));
     assert!(m.view().is_none(), "no member, no map");
     let a = m.register(&node(1)).expect("a");
-    let (latest, previous) = m.view().expect("a view");
+    let (latest, history) = m.view().expect("a view");
     assert_eq!(*latest, a.map);
-    assert!(previous.is_none());
+    assert!(history.is_empty());
 
     let b = m.register(&node(2)).expect("b");
-    let (latest, previous) = m.view().expect("a view");
+    let (latest, history) = m.view().expect("a view");
     assert_eq!(*latest, b.map);
-    assert_eq!(previous.as_deref(), Some(&a.map));
+    assert_eq!(generations(&history), [1]);
+    assert_eq!(*history[0], a.map);
 
-    // Nothing changed: the same two maps.
+    // Nothing changed: the same maps.
     m.refresh().expect("refresh");
     m.current_map().expect("read");
-    let (latest, previous) = m.view().expect("a view");
+    let (latest, history) = m.view().expect("a view");
     assert_eq!(*latest, b.map);
-    assert_eq!(previous.as_deref(), Some(&a.map));
+    assert_eq!(generations(&history), [1]);
 
     // A bump another frontend made is seen at a read, and replaces the newest.
     let c = other_frontend(&s, config(30, 120))
         .register(&node(3))
         .expect("c via another frontend");
     m.current_map().expect("read");
-    let (latest, previous) = m.view().expect("a view");
+    let (latest, history) = m.view().expect("a view");
     assert_eq!(*latest, c.map);
-    assert_eq!(previous.as_deref(), Some(&b.map));
+    assert_eq!(generations(&history), [2, 1]);
+    assert_eq!(*history[0], b.map);
+}
+
+fn generations(maps: &[Arc<Map>]) -> Vec<u64> {
+    maps.iter().map(|m| m.generation()).collect()
 }
 
 /// Catches a map source of a restarted frontend that starts with no map although its
@@ -831,7 +868,7 @@ fn a_restarted_active_member_is_active_again() {
     );
 
     s.clock.advance(20 * SECOND);
-    m.heartbeat(b.id, b.boot, Progress::CaughtUp, Debts::Unknown, None)
+    m.heartbeat(b.id, b.boot, Progress::CaughtUp, Reported::default(), None)
         .expect("b");
     s.clock.advance(11 * SECOND);
     let down = m.refresh().expect("refresh").expect("map");
@@ -912,7 +949,7 @@ fn heartbeats_of_the_same_boot_do_not_bump_the_generation() {
     for round in 0..10 {
         s.clock.advance(10 * SECOND);
         for r in [&restarted, &b] {
-            m.heartbeat(r.id, r.boot, Progress::CaughtUp, Debts::Unknown, None)
+            m.heartbeat(r.id, r.boot, Progress::CaughtUp, Reported::default(), None)
                 .expect("beat");
         }
         for frontend in [&m, &other] {
@@ -943,7 +980,7 @@ fn a_down_member_keeps_its_boot_and_a_return_publishes_the_next() {
     let a = m.register(&node(1)).expect("a");
     let b = m.register(&node(2)).expect("b");
     s.clock.advance(20 * SECOND);
-    m.heartbeat(b.id, b.boot, Progress::CaughtUp, Debts::Unknown, None)
+    m.heartbeat(b.id, b.boot, Progress::CaughtUp, Reported::default(), None)
         .expect("b");
     s.clock.advance(11 * SECOND);
     let down = m.refresh().expect("refresh").expect("map");
@@ -992,7 +1029,7 @@ fn a_catching_up_registration_becomes_active_on_its_caught_up_beat() {
     let a = m.register(&rebuilding).expect("a");
     assert_eq!(state(&a.map, a.id), Some(MemberState::CatchingUp));
     assert_eq!(s.fake.get("meta/members_formed").expect("read"), None);
-    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
+    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
         .expect("beat");
     let map = m.current_map().expect("read").expect("a map");
     assert_eq!(state(&map, a.id), Some(MemberState::Active));
@@ -1034,7 +1071,7 @@ fn a_heartbeat_is_asked_whether_the_caller_holds_the_address_before_the_boot_is_
                 a.id,
                 boot,
                 Progress::CaughtUp,
-                Debts::Unknown,
+                Reported::default(),
                 Some(&refuses),
             )
             .expect_err("the caller does not hold the address");
@@ -1055,7 +1092,7 @@ fn a_heartbeat_is_asked_whether_the_caller_holds_the_address_before_the_boot_is_
             MemberId(99),
             1,
             Progress::CaughtUp,
-            Debts::Unknown,
+            Reported::default(),
             Some(&refuses)
         ),
         Err(MembershipError::NotRegistered(MemberId(99)))
@@ -1066,7 +1103,7 @@ fn a_heartbeat_is_asked_whether_the_caller_holds_the_address_before_the_boot_is_
             a.id,
             a.boot + 5,
             Progress::CaughtUp,
-            Debts::Unknown,
+            Reported::default(),
             Some(&accepts)
         ),
         Err(MembershipError::Superseded { .. })
@@ -1075,7 +1112,7 @@ fn a_heartbeat_is_asked_whether_the_caller_holds_the_address_before_the_boot_is_
         a.id,
         a.boot,
         Progress::CaughtUp,
-        Debts::Unknown,
+        Reported::default(),
         Some(&accepts),
     )
     .expect("the holder beats");

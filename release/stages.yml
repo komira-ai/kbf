@@ -1,5 +1,5 @@
 # The release stages, and which workflow job belongs to which. The workflow lint
-# (crates/kbf-it/tests/workflows/stages.rs) reads this file and refuses:
+# (crates/kbf-integration-test/tests/workflows/stages.rs) reads this file and refuses:
 # - a job row that names a stage this file does not list, and an `after` that names a stage
 #   not listed before it;
 # - an `actions` stage with no job, and a stage marked `planned` that has one (delete
@@ -19,21 +19,31 @@ stages:
     after: []
     result: SHA256SUMS
     events: [pull_request, merge_group, push]
-  # The full end-to-end run against the built files. Planned: no job exists yet. The change
-  # that adds the beta job to artifacts.yml deletes the `planned` line below and lists the
-  # job (and the job that attests its result, as `signing: true`) under `jobs`.
+  # The full run, on a push: everything the pull-request gate (ci.yml) leaves out. The whole
+  # nextest run with its slow tests, the Arm run, the jobs that need a service, root, crun
+  # or a Mac, the Linux packages, and the end-to-end smoke of beta.yml (scenario B0, the farm
+  # under Buck2 load), which builds its own binaries, so its result says it is unattested.
+  # The full run on the attested bytes (a job of artifacts.yml, after `verify`), and the
+  # `signing: true` job that attests its result, are added to `jobs` by the changes that
+  # build them. beta.yml runs on a push only: no pull request and no merge queue entry.
   - name: beta
     runs: actions
-    planned: true
     after: [build]
     result: beta-result.json
-    events: [merge_group, push]
-  # The operator's own deployment follows the beta result; it is not an Actions job.
+    events: [push]
+  # gamma.yml follows a cut release (a completed run of release.yml on main) to the one gamma
+  # host, our own build farm's frontend: its `offer` job stages the offer, and its `deploy`
+  # job is skipped unless the repository variables are set, and otherwise runs
+  # `kbf-installer deploy` there. The 24 hour bake and its verdict run outside Actions.
   - name: gamma
-    runs: operator
-    after: [beta]
+    runs: actions
+    after: [build]
     result: gamma-verdict.json
-  # release.yml publishes a pushed v* tag, or dry-runs a commit by hand.
+    events: [workflow_run]
+  # release.yml gates, plans, verifies, tags with the release bot, publishes and bumps the
+  # internal repository, in one run. It is started by hand (a dry run through `verify`); the push
+  # event is allowed here for the change that adds `push: branches: [main]`, which the workflow
+  # lint (tests/release_workflow) pins until then.
   - name: prod
     runs: actions
     after: [gamma]
@@ -62,7 +72,51 @@ jobs:
     stage: build
   - job: artifacts.yml#verify-darwin-arm64
     stage: build
+  - job: beta.yml#smoke
+    stage: beta
+  - job: beta.yml#test-x86
+    stage: beta
+  - job: beta.yml#test-arm
+    stage: beta
+  - job: beta.yml#state-postgres
+    stage: beta
+  - job: beta.yml#objstore-s3
+    stage: beta
+  - job: beta.yml#crun-x86
+    stage: beta
+  - job: beta.yml#crun-arm
+    stage: beta
+  - job: beta.yml#m2-container
+    stage: beta
+  - job: beta.yml#native-macos
+    stage: beta
+  - job: beta.yml#pkg-macos
+    stage: beta
+  - job: beta.yml#packages
+    stage: beta
+  - job: beta.yml#m1-cell
+    stage: beta
+  - job: beta.yml#cross-version
+    stage: beta
+  - job: beta.yml#mixed-version
+    stage: beta
+  - job: gamma.yml#offer
+    stage: gamma
+  - job: gamma.yml#deploy
+    stage: gamma
+  - job: gamma.yml#check
+    stage: gamma
+  - job: release.yml#gates
+    stage: prod
+  - job: release.yml#plan
+    stage: prod
   - job: release.yml#verify
     stage: prod
+  - job: release.yml#tag
+    stage: prod
+  - job: release.yml#notes
+    stage: prod
   - job: release.yml#publish
+    stage: prod
+  - job: release.yml#bump
     stage: prod

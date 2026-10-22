@@ -21,7 +21,14 @@
 //! - **One read per blob** for callers that ask at the same time, whichever owner
 //!   answers ([`Router::read_blob`]).
 //! - **FindMissing** ([`Router::find_missing`]) asks each digest's primary only, one call
-//!   per primary, and puts the answers back in the order asked.
+//!   per primary, and puts the answers back in the order asked. It is the client's
+//!   question: a blob only a replica holds is reported missing, and the upload that
+//!   follows fills the primary.
+//! - **FindMissing for a caller that must not refuse what a read would find**
+//!   ([`Router::find_missing_anywhere`], the input check of an Execute): what the primary
+//!   lacks is asked of the blob's other owners and of the previous generation's, and
+//!   only a blob none of them holds is missing. A blob found off its primary is told to
+//!   read repair ([`Router::with_background_repair`] copies it, in the background).
 //! - **The closure check** (inside [`Router::action_result`]): the node that holds an
 //!   action-cache entry reports its closure with it. The entry is served only if every
 //!   blob of the closure is held by one of the blob's owners: each primary is asked in
@@ -47,6 +54,16 @@
 //! - **`STALE_MAP`**: a node that holds a newer map answers [`StorageError::StaleMap`].
 //!   The router fetches the newer map through the [`MapSource`] and runs the call again,
 //!   once; a second answer, or a fetch that brings no newer map, is `UNAVAILABLE`.
+//! - **The hold** ([`Router::with_hold`]): a storage node that restarts is away for a while,
+//!   so a call that no owner could answer (every owner `Down` in the map, or every attempt
+//!   `UNAVAILABLE`) is held and tried again, with growing pauses, against the map as it
+//!   is by then, until an owner answers or the bound has passed; then it is `UNAVAILABLE`
+//!   as it always was. It covers every call that takes a blob or an entry to its owners
+//!   and a read before its first byte. A read that fails after bytes have passed on is
+//!   resumed ([`MAX_RESUMES`]) without a hold. A router made by [`Router::new`] holds
+//!   nothing; the frontend and the daemon use [`DEFAULT_HOLD`]. A caller that talks to the
+//!   nodes itself from a [`Placement`] (the frontend's pass-through of a ByteStream) is not
+//!   held by this.
 //!
 //! # What it does not do
 //!
@@ -64,9 +81,12 @@
 //! [`Liveness`] it is given (ten seconds to dial, pings every ten seconds by default), so
 //! a read fails over to the next owner instead of waiting for the operating system.
 
+mod anywhere;
 mod closure;
+mod durable;
 mod find;
 mod flights;
+mod hold;
 mod nodes;
 mod read;
 mod repair;
@@ -77,8 +97,9 @@ mod source;
 mod write;
 
 pub use closure::{ClosureStats, DEFAULT_CLOSURE_ENTRIES, DEFAULT_CLOSURE_TTL};
+pub use hold::{DEFAULT_HOLD, HoldClock};
 pub use nodes::{Liveness, Nodes, TlsNodes};
-pub use repair::{ReadRepair, RepairLimit};
+pub use repair::{MAX_REPAIRS_IN_FLIGHT, ReadRepair, RepairLimit};
 pub use resume::MAX_RESUMES;
 pub use router::{DEFAULT_COPY_BYTES, MAX_MAP_REFETCHES, Placement, Router};
 pub use sink::{BlobSink, IntoError};

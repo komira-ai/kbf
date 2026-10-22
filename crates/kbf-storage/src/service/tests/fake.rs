@@ -2,7 +2,7 @@
 //! to stall and to count, the `Segments` it hands out, a loopback server, and a server
 //! that answers what a correct one never would.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -54,6 +54,17 @@ pub(crate) fn patterned(len: usize) -> Vec<u8> {
 #[derive(Default)]
 pub(crate) struct Mem {
     pub blobs: Arc<Mutex<BTreeMap<Digest, Bytes>>>,
+    /// Blobs of `blobs` held in RAM only: present to `find_missing`, missing to
+    /// `find_durable`, as a blob acknowledged from RAM is until it is on disk.
+    pub ram_only: Arc<Mutex<BTreeSet<Digest>>>,
+    /// Calls of `find_durable`.
+    pub durable_asked: AtomicUsize,
+    /// The digests a `find_missing`, `find_durable` or `find_durable_waiting` answered as
+    /// present, as the node's cache touches them to keep their retention (a question
+    /// whose positives are not touched here would let an entry's blobs expire).
+    pub touched: Mutex<Vec<Digest>>,
+    /// How many `find_durable_waiting` calls reached the store.
+    pub waited: AtomicUsize,
     pub actions: Mutex<BTreeMap<Digest, (Digest, ActionResult)>>,
     /// An entry is answered without its closure, as a node from before the field does.
     pub legacy_actions: AtomicBool,
@@ -81,6 +92,8 @@ pub(crate) struct Mem {
     active: AtomicUsize,
     pub most_active: AtomicUsize,
     pub segments: Arc<Seen>,
+    /// The handle the service asked for counted segment uploads with ([`Storage::segments_counted`]).
+    pub counted_with: Mutex<Option<crate::service::OpenWrites>>,
 }
 
 impl Mem {
@@ -101,9 +114,55 @@ impl Storage for Mem {
             }
             self.failing()?;
             let blobs = self.blobs.lock().expect("lock");
+            self.touched.lock().expect("lock").extend(
+                digests
+                    .iter()
+                    .filter(|d| d.size_bytes != 0 && blobs.contains_key(d)),
+            );
             Ok(digests
                 .iter()
                 .filter(|d| d.size_bytes != 0 && !blobs.contains_key(d))
+                .copied()
+                .collect())
+        })
+    }
+
+    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        Box::pin(async move {
+            self.durable_asked.fetch_add(1, Ordering::SeqCst);
+            if self.knobs.hang_find_missing.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            self.failing()?;
+            let blobs = self.blobs.lock().expect("lock");
+            let ram_only = self.ram_only.lock().expect("lock");
+            self.touched.lock().expect("lock").extend(
+                digests.iter().filter(|d| {
+                    d.size_bytes != 0 && blobs.contains_key(d) && !ram_only.contains(d)
+                }),
+            );
+            Ok(digests
+                .iter()
+                .filter(|d| d.size_bytes != 0 && (!blobs.contains_key(d) || ram_only.contains(d)))
+                .copied()
+                .collect())
+        })
+    }
+
+    fn find_durable_waiting<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        Box::pin(async move {
+            self.waited.fetch_add(1, Ordering::SeqCst);
+            self.failing()?;
+            let blobs = self.blobs.lock().expect("lock");
+            let ram_only = self.ram_only.lock().expect("lock");
+            self.touched.lock().expect("lock").extend(
+                digests.iter().filter(|d| {
+                    d.size_bytes != 0 && blobs.contains_key(d) && !ram_only.contains(d)
+                }),
+            );
+            Ok(digests
+                .iter()
+                .filter(|d| d.size_bytes != 0 && (!blobs.contains_key(d) || ram_only.contains(d)))
                 .copied()
                 .collect())
         })
@@ -170,6 +229,8 @@ impl Storage for Mem {
             self.active.fetch_sub(1, Ordering::SeqCst);
             let digest = sha(&bytes);
             self.blobs.lock().expect("lock").insert(digest, bytes);
+            // Written to the disk: durable from here.
+            self.ram_only.lock().expect("lock").remove(&digest);
             Ok(digest)
         })
     }
@@ -184,6 +245,7 @@ impl Storage for Mem {
             self.knobs.begun.fetch_add(1, Ordering::SeqCst);
             Box::new(MemPut {
                 blobs: Arc::clone(&self.blobs),
+                ram_only: Arc::clone(&self.ram_only),
                 puts: Arc::clone(&self.puts),
                 knobs: Arc::clone(&self.knobs),
                 size,
@@ -231,6 +293,11 @@ impl Storage for Mem {
 
     fn segments(&self) -> Arc<dyn Segments> {
         Arc::clone(&self.segments) as Arc<dyn Segments>
+    }
+
+    fn segments_counted(&self, open: &crate::service::OpenWrites) -> Arc<dyn Segments> {
+        *self.counted_with.lock().expect("lock") = Some(open.clone());
+        self.segments()
     }
 
     fn action_result<'a>(
@@ -291,6 +358,8 @@ impl Storage for Mem {
     ) -> Answer<'_, ()> {
         Box::pin(async move {
             self.failing()?;
+            // Open unless a test holds the commits (`Knobs::hold_commits`).
+            let _permit = self.knobs.commit_gate.acquire().await;
             if role != Role::Daemon {
                 return Err(ActionWriteError::NotDaemon.into());
             }
@@ -381,6 +450,7 @@ pub(crate) enum StreamFault {
 /// A blob being written to [`Mem`] as it arrives.
 struct MemPut {
     blobs: Arc<Mutex<BTreeMap<Digest, Bytes>>>,
+    ram_only: Arc<Mutex<BTreeSet<Digest>>>,
     puts: Arc<AtomicUsize>,
     knobs: Arc<Knobs>,
     size: u64,
@@ -433,6 +503,7 @@ impl PutStream for MemPut {
         );
         Ok(Box::new(MemStreamed {
             blobs: self.blobs,
+            ram_only: self.ram_only,
             puts: self.puts,
             knobs: self.knobs,
             digest,
@@ -443,6 +514,7 @@ impl PutStream for MemPut {
 
 struct MemStreamed {
     blobs: Arc<Mutex<BTreeMap<Digest, Bytes>>>,
+    ram_only: Arc<Mutex<BTreeSet<Digest>>>,
     puts: Arc<AtomicUsize>,
     knobs: Arc<Knobs>,
     digest: Digest,
@@ -450,7 +522,7 @@ struct MemStreamed {
 }
 
 impl crate::StreamedPut for MemStreamed {
-    fn commit(self: Box<Self>) -> Answer<'static, ()> {
+    fn commit(self: Box<Self>, _mode: crate::CommitMode) -> Answer<'static, ()> {
         Box::pin(async move {
             let _permit = self.knobs.commit_gate.acquire().await.expect("open");
             if *self.knobs.fault.lock().expect("lock") == StreamFault::CommitFails {
@@ -460,6 +532,8 @@ impl crate::StreamedPut for MemStreamed {
                 .lock()
                 .expect("lock")
                 .insert(self.digest, self.data);
+            // Written to the disk: durable from here.
+            self.ram_only.lock().expect("lock").remove(&self.digest);
             self.puts.fetch_add(1, Ordering::SeqCst);
             Ok(())
         })

@@ -169,6 +169,21 @@ pub fn shape_line(shape: &Shape) -> String {
     )
 }
 
+/// The exit code `result` reports: the action's, for a run the daemon says ended (an OK
+/// status with an `action_result`); `None` for one it reports failed or without a result.
+#[must_use]
+pub fn exit_code(result: &worker::Result) -> Option<i32> {
+    let ok = result
+        .status
+        .as_ref()
+        .is_none_or(|s| s.code == Code::Ok as i32);
+    result
+        .action_result
+        .as_ref()
+        .filter(|_| ok)
+        .map(|r| r.exit_code)
+}
+
 /// What a lease's report measured: its usage, and its exit code if it ended OK.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Measured {
@@ -185,13 +200,9 @@ impl Measured {
     pub fn of(result: &worker::Result) -> Option<Self> {
         let action_result = result.action_result.as_ref()?;
         let usage = ResourceUsage::in_result(action_result)?;
-        let ok = result
-            .status
-            .as_ref()
-            .is_none_or(|s| s.code == Code::Ok as i32);
         Some(Self {
             usage,
-            exit_code: ok.then_some(action_result.exit_code),
+            exit_code: exit_code(result),
         })
     }
 

@@ -14,9 +14,10 @@ use kbf_objstore::{ObjectStore, ObjectStoreError};
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::segments_server::Segments;
 use kbf_segments::RecordHasher;
+use kbf_storage::service::OpenWrites;
 use kbf_storage::{
-    ActionEntry, Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError,
-    StreamedPut,
+    ActionEntry, Answer, CommitMode, PutStream, READ_CHUNK_BYTES, ReadStream, Storage,
+    StorageError, StreamedPut,
 };
 use kbf_types::Digest;
 
@@ -43,6 +44,18 @@ impl<M, O> CacheStorage<M, O> {
 impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
         Box::pin(async move { Ok(self.cache.find_missing(digests).await?) })
+    }
+
+    /// The cache's durable answer ([`Cache::durable`]): the index alone, so a blob held in
+    /// RAM is missing.
+    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        Box::pin(async move { Ok(self.cache.durable(digests).await?) })
+    }
+
+    /// The cache's durable answer after it has waited for the held blobs among `digests`
+    /// ([`Cache::durable_waiting`]).
+    fn find_durable_waiting<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        Box::pin(async move { Ok(self.cache.durable_waiting(digests).await?) })
     }
 
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> Answer<'a, Bytes> {
@@ -138,6 +151,14 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
         ))
     }
 
+    /// As [`Storage::segments`], each upload counted in `open` while it is open.
+    fn segments_counted(&self, open: &OpenWrites) -> Arc<dyn Segments> {
+        Arc::new(
+            SegmentsService::new(Arc::clone(&self.cache), self.config, Connections::new())
+                .with_open_writes(open.clone()),
+        )
+    }
+
     fn action_result<'a>(
         &'a self,
         action: &'a Digest,
@@ -228,7 +249,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> PutStream for Writing<M, O> {
 struct Written<M, O>(StreamedRecord<M, O>);
 
 impl<M: MetaLog, O: ObjectStore + 'static> StreamedPut for Written<M, O> {
-    fn commit(self: Box<Self>) -> Answer<'static, ()> {
+    fn commit(self: Box<Self>, _mode: CommitMode) -> Answer<'static, ()> {
         Box::pin(async move { Ok(self.0.commit().await?) })
     }
 }

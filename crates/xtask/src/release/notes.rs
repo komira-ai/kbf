@@ -1,0 +1,307 @@
+//! `release notes`: the notes of a release, from the commits since the previous release
+//! and the Beta record the tag carries, shown as information
+//! (docs/design/kbf-cicd.md, section 8.1, item 3). A dry run shows them as an artifact of
+//! the verify job. What is not reversible comes from the two builds, never from the record.
+//! The record is audit only: a tag without one, or with one that failed, gets notes all the
+//! same, which say so.
+
+use std::path::Path;
+
+use kbf_gate::{ResultDoc, Verdict, reversible};
+use serde_json::Value;
+
+use super::git;
+use super::offer::{identity_of, whole_field};
+use super::verify::{Subject, verify};
+use crate::Error;
+
+/// Commits listed at most; the rest are counted.
+const MAX_COMMITS: usize = 200;
+
+/// The sentence a first release adds: no earlier build says which version fields hosts know.
+const FIRST_RELEASE_INSTALLER: &str = "Hosts running an untagged earlier build: upgrade \
+    kbf-installer before staging (older installers may refuse this build's version output).";
+
+/// The `kbf --version --json` of the release being made and of the one before it, which
+/// the caller ran from attested tarballs only.
+pub struct Identities<'a> {
+    /// This release's identity.
+    pub current: &'a Path,
+    /// The previous release's: required exactly when there is a previous release.
+    pub previous: Option<&'a Path>,
+}
+
+/// The release before `tag`: the nearest earlier `v*` tag (in version order) that is
+/// stable (no `-` suffix) and an ancestor of `commit`. A release candidate, a withdrawn
+/// side branch and a tag that sorts before by name only are not "the release before".
+pub fn previous_release(repo: &Path, tag: &str, commit: &str) -> Result<Option<String>, Error> {
+    let tags = git::release_tags(repo)?;
+    // A tag `v*` does not list has no place in the order: a first release.
+    let Some(at) = tags.iter().position(|t| t == tag) else {
+        return Ok(None);
+    };
+    let before = &tags[..at];
+    for t in before.iter().rev().filter(|t| !t.contains('-')) {
+        if git::is_ancestor(repo, &format!("refs/tags/{t}"), commit)? {
+            return Ok(Some(t.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// The notes of `s`: refused, like `release verify`, when the tag or the commit is not the
+/// release's, and when what is not reversible cannot be determined (fail closed). The tag's
+/// record is shown and never judged.
+pub fn notes(s: &Subject, ids: &Identities) -> Result<String, Error> {
+    let verified = verify(s)?;
+    let since = previous_release(s.repo_dir, s.tag, s.commit)?;
+    let current = identity_of(ids.current, s.commit, "--version-json").map_err(Error::Failed)?;
+    let previous = match (&since, ids.previous) {
+        (None, None) => None,
+        (None, Some(_)) => {
+            return Err(Error::Usage(
+                "--previous-version-json: there is no previous release".to_owned(),
+            ));
+        }
+        (Some(prev), None) => {
+            return Err(Error::Failed(format!(
+                "release {prev} precedes {}: --previous-version-json is required, since \
+                 what is not reversible cannot be determined without it",
+                s.tag
+            )));
+        }
+        (Some(prev), Some(path)) => {
+            let commit = git::commit_of(s.repo_dir, prev)?;
+            Some(identity_of(path, &commit, "--previous-version-json").map_err(Error::Failed)?)
+        }
+    };
+    let found = irreversible(since.as_deref(), &current, previous.as_ref())?;
+    let commits = git::commits(s.repo_dir, since.as_deref(), s.commit)?;
+    Ok(render(
+        verified.record.as_ref(),
+        s.tag,
+        since.as_deref(),
+        &commits,
+        &found,
+    ))
+}
+
+/// What the two builds' identities say makes going back to `since` not possible or not
+/// plain, one line each. Unknown counts as not reversible.
+fn irreversible(
+    since: Option<&str>,
+    current: &Value,
+    previous: Option<&Value>,
+) -> Result<Vec<String>, Error> {
+    let (Some(since), Some(previous)) = (since, previous) else {
+        return Ok(vec![format!(
+            "first release: there is no earlier release to go back to. {FIRST_RELEASE_INSTALLER}"
+        )]);
+    };
+    let field = |v: &Value, key: &str| whole_field(v, key).map_err(Error::Failed);
+    let mut found = Vec::new();
+    let (n, p) = (field(current, "meta_log")?, field(previous, "meta_log")?);
+    if !reversible(n, p) {
+        found.push(match (n, p) {
+            (Some(n), Some(p)) => format!(
+                "meta_log raised from {p} ({since}) to {n}: {since} cannot open the metadata log \
+                 this release writes, so there is no going back to it"
+            ),
+            _ => format!(
+                "meta_log is not stated by this release or by {since}: unknown counts as not \
+                 reversible"
+            ),
+        });
+    }
+    match (field(current, "protocol")?, field(previous, "protocol")?) {
+        (Some(n), Some(p)) if n == p => {}
+        (Some(n), Some(p)) => found.push(format!(
+            "wire protocol {p} ({since}) to {n}: nodes and proxies speak different protocols \
+             during a rollout or a rollback; follow the order of docs/design/kbf-cicd.md, \
+             section 8.3"
+        )),
+        _ => found.push(format!(
+            "wire protocol is not stated by this release or by {since}: unknown counts as \
+             changed (docs/design/kbf-cicd.md, section 8.3)"
+        )),
+    }
+    found.extend(installer_line(current, previous));
+    Ok(found)
+}
+
+/// The line telling operators to upgrade kbf-installer first: the current build's version
+/// output has top-level keys the previous build's lacks, which installers built before
+/// the current release may refuse. A previous output that is not an object has unknown
+/// keys: fail closed, the line is given. No line when the keys are a subset.
+fn installer_line(current: &Value, previous: &Value) -> Option<String> {
+    let short = current["commit"].as_str().unwrap_or_default();
+    let head = "Upgrade kbf-installer on every host before staging this release";
+    let tail = format!("which installers built before {short} may refuse");
+    let Some(current) = current.as_object() else {
+        return Some(format!(
+            "{head}: its version output is not an object, {tail}"
+        ));
+    };
+    let Some(previous) = previous.as_object() else {
+        return Some(format!(
+            "{head}: the previous release's version output keys are unknown, so the keys this \
+             release adds are unknown, {tail}"
+        ));
+    };
+    let mut added: Vec<&str> = current
+        .keys()
+        .filter(|k| !previous.contains_key(*k))
+        .map(String::as_str)
+        .collect();
+    added.sort_unstable();
+    if added.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{head}: its version output adds {}, {tail}",
+        added.join(", ")
+    ))
+}
+
+fn section(out: &mut String, heading: &str, items: &[String], none: &str) {
+    out.push_str(&format!("\n{heading}\n\n"));
+    if items.is_empty() {
+        out.push_str(&format!("{none}\n"));
+    }
+    for item in items {
+        out.push_str(&format!("- {item}\n"));
+    }
+}
+
+/// The record in one line, for the top of the notes. It says what the record states, not
+/// that the release is good: nothing gates on it.
+fn summary(doc: &ResultDoc) -> String {
+    let warned = doc
+        .gates
+        .iter()
+        .filter(|g| g.verdict == Verdict::Warn)
+        .count();
+    format!(
+        "status {:?}; {} gate(s), {warned} warning(s); detail under {:?} record (audit only, \
+         nothing gates on it)",
+        doc.status,
+        doc.gates.len(),
+        doc.stage
+    )
+}
+
+/// The notes for the release whose tag carries `record`, if any. What the approver must
+/// read before the click comes first.
+fn render(
+    record: Option<&ResultDoc>,
+    tag: &str,
+    since: Option<&str>,
+    commits: &[String],
+    found: &[String],
+) -> String {
+    let mut out = format!("# {tag}\n\n## Before you click\n");
+    // Only what verify computed from the two builds (`found`). The verdict's own
+    // `not_reversible` list is deliberately NOT read: a list typed into a tag is not a
+    // source (CEO ruling), so verify is the single source of this section.
+    section(
+        &mut out,
+        "### Not reversible",
+        found,
+        "Nothing in this release is flagged as not reversible: the metadata log and the wire \
+         protocol are the previous release's.",
+    );
+    let waivers: Vec<String> = record
+        .into_iter()
+        .flat_map(|doc| &doc.waivers)
+        .map(|w| format!("{} waived by {}: {}", w.what, w.by, w.reason))
+        .collect();
+    section(
+        &mut out,
+        "### Waivers",
+        &waivers,
+        "No gate or condition is waived.",
+    );
+    let line = record.map_or_else(
+        || "the tag carries no readable Beta record (nothing gates on it)".to_owned(),
+        summary,
+    );
+    section(&mut out, "### Record", &[line], "");
+    let shown: Vec<String> = commits.iter().take(MAX_COMMITS).cloned().collect();
+    let title = match since {
+        Some(prev) => format!("## Commits since {prev}"),
+        None => "## Commits (the first release)".to_owned(),
+    };
+    section(&mut out, &title, &shown, "None.");
+    if commits.len() > MAX_COMMITS {
+        out.push_str(&format!("- and {} more\n", commits.len() - MAX_COMMITS));
+    }
+
+    let Some(doc) = record else {
+        return out;
+    };
+    let mut detail = Vec::new();
+    for g in &doc.gates {
+        let measured = g.measured.map_or("absent".to_owned(), |m| m.to_string());
+        let mark = if g.verdict == Verdict::Warn {
+            " (warning)"
+        } else {
+            ""
+        };
+        detail.push(format!("gate {}: {measured}{mark}", g.name));
+    }
+    for w in &doc.waivers {
+        detail.push(format!("waived {} by {}: {}", w.what, w.by, w.reason));
+    }
+    let title = format!("## {:?} record", doc.stage);
+    section(&mut out, &title, &detail, "No detail recorded.");
+    out.push_str(&format!(
+        "\n## {:?} escapes\n\n{} scenario(s) only gamma found.\n",
+        doc.stage,
+        doc.escapes.len()
+    ));
+    for e in &doc.escapes {
+        out.push_str(&format!("- {e}\n"));
+    }
+    section(
+        &mut out,
+        "## Withdrawn",
+        &doc.withdrawn,
+        "No release is withdrawn.",
+    );
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::installer_line;
+
+    #[test]
+    fn an_unreadable_previous_output_gives_the_line_saying_its_keys_are_unknown() {
+        // Catches: fail-open, an unknown previous read as "nothing added".
+        let cur = json!({"commit": "abcdef012345", "seq": 1});
+        for prev in [json!(null), json!("text"), json!([1])] {
+            let line = installer_line(&cur, &prev).unwrap();
+            assert!(line.starts_with("Upgrade kbf-installer on every host before staging"));
+            assert!(line.contains("keys are unknown"), "{line}");
+            assert!(
+                line.contains("built before abcdef012345 may refuse"),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn added_keys_are_listed_sorted_and_a_subset_gives_no_line() {
+        let prev = json!({"commit": "x", "profile": "r", "gone": 1});
+        let cur = json!({"commit": "abcdef012345", "profile": "r", "zeta": 1, "seq": 2});
+        assert_eq!(
+            installer_line(&cur, &prev).unwrap(),
+            "Upgrade kbf-installer on every host before staging this release: its version \
+             output adds seq, zeta, which installers built before abcdef012345 may refuse"
+        );
+        assert_eq!(installer_line(&prev, &prev), None);
+        assert_eq!(installer_line(&json!({"commit": "x"}), &prev), None);
+    }
+}

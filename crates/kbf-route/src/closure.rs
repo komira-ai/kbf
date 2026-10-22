@@ -14,10 +14,11 @@
 //! What was verified is remembered per blob and owner ([`Verified`]), shared by every
 //! action: toolchain blobs repeat across actions, so most of a closure is usually cached.
 //! An entry is trusted only while the owner's map generation and published boot
-//! (`Member::boot`) are those it was verified under: a restarted owner may have lost
-//! blobs it held only in RAM, so a new boot drops its entries even when the generation did
-//! not move. An owner whose boot is 0 (unknown, a node from before the field) is never
-//! remembered: without a boot a restart cannot be told, so every check asks it.
+//! (`Member::boot`) are those it was verified under: a restarted owner is the one whose
+//! holdings are least certain (a disk replaced or wiped while it was down, say), so a new
+//! boot drops its entries even when the generation did not move. An owner whose boot is 0
+//! (unknown, a node from before the field) is never remembered: without a boot a restart
+//! cannot be told, so every check asks it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -350,7 +351,10 @@ impl Router {
                 // A node bounds the digests of one call, so a long list is several.
                 for chunk in asked.chunks(MAX_FIND_MISSING_DIGESTS) {
                     verified.counters.rpcs.fetch_add(1, Ordering::Relaxed);
-                    lacking.extend(node.find_missing(chunk).await?);
+                    // Durable only: a blob a node holds in RAM and has not written is not
+                    // one an entry may rest on, and a positive that is never remembered is
+                    // never wrong after the node restarts (rule 2, `kbf-durable: only`).
+                    lacking.extend(node.find_durable(chunk).await?);
                 }
                 Ok::<_, StorageError>(lacking)
             }))

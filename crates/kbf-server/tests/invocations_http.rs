@@ -23,11 +23,18 @@ use tonic::Status;
 /// Every route of invocation `id`.
 fn routes(id: &str, action: &str) -> Vec<String> {
     let base = format!("/v1/invocations/{id}");
-    ["", "/actions", "/artifacts", "/logs", "/metrics"]
-        .into_iter()
-        .map(|r| format!("{base}{r}"))
-        .chain([format!("{base}/actions/{action}")])
-        .collect()
+    [
+        "",
+        "/actions",
+        "/artifacts",
+        "/logs",
+        "/metrics",
+        "/failures",
+    ]
+    .into_iter()
+    .map(|r| format!("{base}{r}"))
+    .chain([format!("{base}/actions/{action}")])
+    .collect()
 }
 
 /// Catches (mutant "default allow": `InvocationReaders::from_policy` answering with an
@@ -276,6 +283,7 @@ async fn a_name_without_an_answer_is_refused_and_so_is_an_unknown_caller() {
         authorizers: Authorizers::allow_all(),
         invocations_get: Some(Arc::new(Mute)),
         blobs_get: Some(Arc::new(AllowAuthorizer)),
+        farm_get: None,
     };
     let server = Server::start(mute, kbf_front::DEFAULT_INVOCATION_MEMORY);
     server
@@ -405,7 +413,7 @@ async fn the_invocation_answers_its_header_counts_and_links() {
         (&counts["ac_hit"], &counts["ac_miss"]),
         (&json!(1), &json!(1))
     );
-    for link in ["actions", "artifacts", "logs", "metrics"] {
+    for link in ["failures", "actions", "artifacts", "logs", "metrics"] {
         let href = inv["links"][link].as_str().expect("a link");
         assert_eq!(href, format!("/v1/invocations/build/{link}"));
         server.ok(href).await;

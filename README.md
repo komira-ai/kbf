@@ -17,8 +17,9 @@ kbf is written in Rust. Its programs are named `kbf-*`:
   watched by the daemon.
 
 `kbf` is a new binary with the modes `frontend`, `storage`, `daemon`, `storage-and-daemon`
-and `all-in-one`; the programs above remain.
-Smoke test: `kbf all-in-one --help`
+and `all-in-one`, chosen with `kbf --mode=<mode>` (or `mode = "..."` in `/etc/kbf/kbf.toml`);
+the programs above remain.
+Smoke test: `kbf --mode=all-in-one --help`
 
 ## Status
 
@@ -40,6 +41,8 @@ build host: the daemon's systemd units, swap and memory headroom.
 [docs/deploy/storage-node.md](docs/deploy/storage-node.md) sets up a storage host,
 server-only or converged (server and builds on one host): the server's units, the
 priorities between MinIO, the server and builds, and the memory left to builds.
+[docs/deploy/kbf-ui.md](docs/deploy/kbf-ui.md) is the operator guide to the read-only,
+open web UI: how to reach it, how to turn it off, and what it exposes.
 
 ## Contributing
 

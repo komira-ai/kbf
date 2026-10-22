@@ -2,7 +2,8 @@
 //! daemon's actions run as throwaway pool users this file creates and deletes, through
 //! `launchctl asuser` and the `as-user` drop; every process of the slot's uid ends with
 //! the lease, and with the daemon's death through the keeper; two leases at once never
-//! share a user; and a root daemon without a pool runs nothing.
+//! share a user; a root daemon without a pool runs nothing; and a slot's lease directory is
+//! its user's alone, so another pool user cannot read, list or connect into it.
 //!
 //! Every test is `#[ignore]`: each needs root and real users. The macOS CI job runs them
 //! with `cargo xtask sudo-test -p kbf-driver-native --test slots`, which builds this
@@ -15,6 +16,7 @@
 
 mod support;
 
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -23,9 +25,9 @@ use std::time::{Duration, Instant};
 
 use kbf_daemon::Runtime as _;
 use kbf_daemon::uid;
-use kbf_driver_native::slots::{Pool, SlotUser};
+use kbf_driver_native::slots::{LEASE_DIR_MODE, LEASES_ROOT_MODE, Pool, SlotUser};
 use kbf_driver_native::{NativeConfig, NativeRuntime};
-use support::pool::{GID, Scratch, Users, config, ids_of, sleeper};
+use support::pool::{GID, Scratch, Users, config, ids_of, sleeper, slot_report};
 use support::{MemoryCas, PROMPT, Spec, stdout};
 
 /// The variable that turns [`keeper_daemon`] into the daemon [`the_keeper_ends_the_slot_when_the_daemon_dies`]
@@ -160,7 +162,13 @@ async fn an_action_ends_with_every_process_of_its_uid_and_nothing_else() {
         !setuid_lives,
         "the setuid sleep {setuid_pid} outlived its lease"
     );
-    assert_eq!(first.exit_code, 0, "{out}");
+    assert_eq!(
+        first.exit_code,
+        0,
+        "{out}{}\n{}",
+        support::stderr(&cas, &first),
+        slot_report(std::slice::from_ref(mine))
+    );
     let [sleeper, id, tmpdir, manager] = lines[..] else {
         panic!("the action printed {out:?}");
     };
@@ -226,7 +234,10 @@ fn the_keeper_ends_the_slot_when_the_daemon_dies() {
         }
         if Instant::now() > give_up || daemon.try_wait().expect("wait").is_some() {
             let _ = daemon.kill();
-            panic!("the daemon's lease never started its sleeper");
+            panic!(
+                "the daemon's lease never started its sleeper\n{}",
+                slot_report(std::slice::from_ref(user))
+            );
         }
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -343,7 +354,12 @@ echo "T=$(cat "${t}kbf-ci-same") H=$(cat "$h/kbf-ci-same") D=$(defaults read kbf
         let result = result.expect("ran");
         let out = stdout(&cas, &result);
         let err = support::stderr(&cas, &result);
-        assert_eq!(result.exit_code, 0, "lease {v}: {out}{err}");
+        assert_eq!(
+            result.exit_code,
+            0,
+            "lease {v}: {out}{err}\n{}",
+            slot_report(&users.0)
+        );
         assert_eq!(
             out,
             format!("T={v} H={v} D={v} K={v}\n"),
@@ -398,7 +414,8 @@ async fn with_every_slot_held_a_lease_waits_and_a_kill_ends_the_wait() {
         while !root(1).join("held").exists() {
             assert!(
                 Instant::now() < give_up,
-                "the first lease never held its slot"
+                "the first lease never held its slot\n{}",
+                slot_report(std::slice::from_ref(user))
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -428,7 +445,14 @@ async fn with_every_slot_held_a_lease_waits_and_a_kill_ends_the_wait() {
     let (first, (killed, took, waited, third)) =
         tokio::join!(support::run(&rt, &cas, 1, &hold), rest);
     let first = first.expect("the first lease ran");
-    assert_eq!(first.exit_code, 0, "{}", stdout(&cas, &first));
+    assert_eq!(
+        first.exit_code,
+        0,
+        "{}{}\n{}",
+        stdout(&cas, &first),
+        support::stderr(&cas, &first),
+        slot_report(std::slice::from_ref(user))
+    );
     assert!(
         matches!(killed, Err(kbf_daemon::RuntimeError::Killed)),
         "the lease killed while it waited for a slot ended {killed:?}"
@@ -525,4 +549,163 @@ async fn a_slot_users_denied_write_is_named_in_its_stderr() {
             )
         });
     assert!(line.contains("file-write-create"), "{line}");
+}
+
+/// A runtime whose pool is `user` alone, over the leases root `leases` made the way the
+/// daemon makes it for a pool (`kbf-node`'s `data_dir`): root's, [`LEASES_ROOT_MODE`].
+/// (`tests/support/pool.rs` makes the scratch folder 0755 and its `leases` by the
+/// runtime's default, which hid the 0700 root the daemon made: a pool user could not
+/// search it.)
+fn runtime_over(
+    scratch: &Scratch,
+    leases: &Path,
+    user: &SlotUser,
+    cas: &Arc<MemoryCas>,
+) -> NativeRuntime<MemoryCas> {
+    std::fs::create_dir_all(leases).expect("leases root");
+    std::fs::set_permissions(leases, std::fs::Permissions::from_mode(LEASES_ROOT_MODE))
+        .expect("chmod");
+    let mut config = config(scratch, Pool::new(vec![user.clone()]).expect("pool"));
+    config.scratch = leases.to_owned();
+    NativeRuntime::new(config, Arc::clone(cas)).expect("runtime")
+}
+
+/// What `probes` (act steps, each `PROBE <name> ok|errno=N`) come to, run as a lease of
+/// `rt` (a slot user's), one result per probe in order.
+async fn probe(
+    rt: &NativeRuntime<MemoryCas>,
+    cas: &MemoryCas,
+    seq: u64,
+    act: &str,
+    probes: &[[&str; 2]],
+) -> Vec<String> {
+    let mut argv = vec![act];
+    for (i, step) in probes.iter().enumerate() {
+        if i > 0 {
+            argv.push(";");
+        }
+        argv.extend(step);
+    }
+    let result = lease(rt, cas, seq, &Spec::argv(&argv)).await;
+    let (out, err) = (stdout(cas, &result), support::stderr(cas, &result));
+    assert_eq!(result.exit_code, 0, "{out}{err}");
+    let found: Vec<String> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("PROBE "))
+        .map(|l| l.split_once(' ').expect("PROBE name result").1.to_owned())
+        .collect();
+    assert_eq!(found.len(), probes.len(), "{out}{err}");
+    found
+}
+
+/// The lease directory of a slot. Catches (T026, measured on a Mac): a lease that cannot
+/// run as a pool user because the leases root is closed to it (here made as the daemon
+/// makes it, [`LEASES_ROOT_MODE`], and the lease runs and exits 0); and a slot's lease
+/// directory another pool user can read, list or connect into (it was 0755 and the pool
+/// users share a group): while lease A holds a file and a Unix socket in its directory,
+/// root-planted and A-bound, lease B (another slot user) finds the directory 0700 and
+/// A's, and B's read of the file, list of the directory and of the lease's root, and
+/// connect to the socket are each refused with EACCES (13). The same four probes then
+/// succeed with the directory opened to 0755 by root, so a refusal above is the mode and
+/// not a probe that cannot reach the target.
+///
+/// Runs only where `cargo xtask sudo-test` runs it (a Mac runner as root with real
+/// users: the beta workflow's macOS job and the slot spike workflow).
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slots"]
+#[tokio::test]
+async fn a_slots_lease_directory_is_closed_to_the_other_pool_users() {
+    const EACCES: &str = "errno=13";
+    assert_root();
+    let scratch = Scratch::new("modes");
+    let users = Users::new("modes", 2);
+    let (a, b) = (users.0[0].clone(), users.0[1].clone());
+    let cas = Arc::new(MemoryCas::default());
+    let (a_leases, b_leases) = (scratch.0.join("leases-a"), scratch.0.join("leases-b"));
+    let rt_a = runtime_over(&scratch, &a_leases, &a, &cas);
+    let rt_b = runtime_over(&scratch, &b_leases, &b, &cas);
+    let act = scratch.act();
+    let a_dir = a_leases.join("lease-1-1");
+    let a_root = a_dir.join("root");
+    let (socket, planted, ready, done) = (
+        a_root.join("a.sock"),
+        a_root.join("planted"),
+        a_root.join("ready"),
+        a_root.join("done"),
+    );
+    let path = |p: &Path| p.to_string_lossy().into_owned();
+    let (socket_s, ready_s, done_s) = (path(&socket), path(&ready), path(&done));
+    let hold = Spec::argv(&[
+        &act,
+        "spawn-child",
+        "unix-listen",
+        &socket_s,
+        "900",
+        ";",
+        "wait-for",
+        &socket_s,
+        "20",
+        ";",
+        "write-lines",
+        &ready_s,
+        ";",
+        "wait-for",
+        &done_s,
+        "900",
+    ]);
+    let run_a = async {
+        let work = support::work(1, hold.store(&cas), 0);
+        tokio::time::timeout(Duration::from_secs(900), rt_a.run(work))
+            .await
+            .expect("lease A ends")
+    };
+    let orchestrate = async {
+        let give_up = Instant::now() + PROMPT * 3;
+        while !ready.exists() {
+            assert!(
+                Instant::now() < give_up,
+                "lease A never held its socket\n{}",
+                slot_report(&users.0)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(std::fs::metadata(&ready).expect("ready").uid(), a.uid);
+        let dir = std::fs::metadata(&a_dir).expect("A's lease directory");
+        assert_eq!(dir.uid(), a.uid, "A's lease directory is not A's");
+        assert_eq!(
+            dir.permissions().mode() & 0o7777,
+            LEASE_DIR_MODE,
+            "A's lease directory is not closed to the other pool users"
+        );
+        std::fs::write(&planted, b"a's\n").expect("plant a file");
+        std::os::unix::fs::chown(&planted, Some(a.uid), Some(GID)).expect("chown");
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let (planted_s, dir_s, root_s) = (path(&planted), path(&a_dir), path(&a_root));
+        let probes = [
+            ["try-read", planted_s.as_str()],
+            ["try-list", dir_s.as_str()],
+            ["try-list", root_s.as_str()],
+            ["unix-connect", socket_s.as_str()],
+        ];
+        let closed = probe(&rt_b, &cas, 1, &act, &probes).await;
+        std::fs::set_permissions(&a_dir, std::fs::Permissions::from_mode(0o755)).expect("open");
+        let opened = probe(&rt_b, &cas, 2, &act, &probes).await;
+        std::fs::write(&done, b"").expect("release lease A");
+        (closed, opened)
+    };
+    let (a_result, (closed, opened)) = tokio::join!(run_a, orchestrate);
+    let a_result = a_result.expect("lease A ran");
+    assert_eq!(
+        a_result.exit_code,
+        0,
+        "{}",
+        support::stderr(&cas, &a_result)
+    );
+    assert_eq!(
+        closed, [EACCES; 4],
+        "B read, listed or connected into A's lease directory (read, list dir, list root, connect)"
+    );
+    assert_eq!(
+        opened, ["ok"; 4],
+        "the probes cannot reach A's files even with the directory opened: the refusals prove nothing"
+    );
 }

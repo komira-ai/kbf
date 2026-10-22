@@ -88,9 +88,14 @@ pub(crate) fn full_commit(flag: &str, commit: &str) -> Result<(), Error> {
     if commit.len() == 40 && is_commit(commit) {
         return Ok(());
     }
-    Err(Error::Usage(format!(
+    Err(not_full_commit(flag, commit))
+}
+
+/// The usage error for a `commit` that is not a full commit SHA.
+pub(crate) fn not_full_commit(flag: &str, commit: &str) -> Error {
+    Error::Usage(format!(
         "{flag} {commit:?} is not a full commit SHA (40 lowercase hex digits)"
-    )))
+    ))
 }
 
 /// `check` on a `--version` line, with the comparison `names` given (the real one is
@@ -243,7 +248,7 @@ impl Drop for Scratch {
 }
 
 /// Writes `bytes` to the new file `path`, mode 0755, and closes it, so it can be run.
-fn write_executable(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+pub(crate) fn write_executable(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .write(true)

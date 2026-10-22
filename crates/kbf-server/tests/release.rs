@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use axum::body::Bytes;
-use kbf_proto::update::FetchRequest;
 use kbf_proto::update::release_service_client::ReleaseServiceClient;
+use kbf_proto::update::{DescribeRequest, FetchRequest, ReleaseDescription};
 use kbf_server::release::{
     self, Commit, Component, Key, Limits, PutError, ReleaseStore, Sha256Hex,
 };
@@ -33,6 +33,24 @@ const SMALL: Limits = Limits {
     tarball: 1024,
     attestation: 64,
 };
+
+/// What `kbf --version --json` prints for a build of `commit`.
+fn facts_doc(commit: &str) -> Vec<u8> {
+    format!(
+        "{{\"commit\":\"{}\",\"min_protocol\":6,\"profile\":\"release\",\"protocol\":7,\
+         \"state_schema\":3,\"version\":\"0.1.0\"}}",
+        &commit[..12]
+    )
+    .into_bytes()
+}
+
+/// What a platform stored without its version facts is told.
+fn no_facts_note(platform: ReleasePlatform) -> String {
+    format!(
+        "no version facts (kbf-{COMMIT}-{platform}.version.json): nodes will not be offered \
+         this platform; rebuild the release to include it"
+    )
+}
 
 /// A directory unique to one test, removed when it is dropped.
 struct Dir(PathBuf);
@@ -124,6 +142,11 @@ async fn serve_with(limits: Limits, configured: bool, token: Option<ApiToken>) -
     let store = configured
         .then(|| Arc::new(ReleaseStore::open(&dir.store(), limits).expect("open the store")));
     let app = release::router(store.clone(), token);
+    // As `serve_api` does: the handlers read the gate's `Trust`.
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        None::<Arc<kbf_server::proxy_auth::ProxySecret>>,
+        kbf_server::proxy_auth::gate_requests,
+    ));
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
@@ -494,6 +517,7 @@ async fn unconfigured_answers_503_everywhere() {
 async fn a_put_needs_the_operator_token() {
     let served = serve().await;
     let path = path_of(COMMIT, "linux-x86_64", "kbf");
+    let facts = path_of(COMMIT, "linux-x86_64", "version.json");
     let wrong = vec![(
         "Authorization",
         "Bearer not-the-token-not-the-token-not-the-token".to_owned(),
@@ -503,16 +527,22 @@ async fn a_put_needs_the_operator_token() {
         ("Origin", "http://evil.example".to_owned()),
     ];
     for (headers, want) in [(Vec::new(), 401), (wrong, 401), (page, 403)] {
-        let reply = http(served.addr, "PUT", &path, &headers, b"payload").await;
-        assert_eq!(reply.status, want, "{}", reply.body);
+        for path in [&path, &facts] {
+            let reply = http(served.addr, "PUT", path, &headers, b"payload").await;
+            assert_eq!(reply.status, want, "{path}: {}", reply.body);
+        }
     }
     assert!(tree(&served.dir.store().join("files")).is_empty());
+    assert!(tree(&served.dir.store().join("index")).is_empty());
     assert_eq!(get_list(&served).await.status, 200);
 
     let off = serve_with(SMALL, true, None).await;
-    let reply = http(off.addr, "PUT", &path, &authorized(), b"payload").await;
-    assert_eq!(reply.status, 403, "{}", reply.body);
+    for path in [&path, &facts] {
+        let reply = http(off.addr, "PUT", path, &authorized(), b"payload").await;
+        assert_eq!(reply.status, 403, "{path}: {}", reply.body);
+    }
     assert!(tree(&off.dir.store().join("files")).is_empty());
+    assert!(tree(&off.dir.store().join("index")).is_empty());
 
     // The token lets the same request through.
     assert_eq!(put(&served, "kbf", b"payload").await.status, 201);
@@ -541,13 +571,21 @@ async fn the_list_names_what_is_stored_and_what_is_complete() {
         put_key(&k, component.as_str().as_bytes(), false).await;
         put_key(&k, b"bundle", true).await;
     }
+    // Only arm64 has its version facts.
+    let commit = Commit::parse(COMMIT).expect("a commit");
+    let doc = facts_doc(COMMIT);
+    store
+        .put_facts(&commit, arm, &mut body(&doc))
+        .await
+        .expect("facts");
     put_key(&key(COMMIT, x86, Component::KbfDaemon), b"d", false).await;
-    // darwin-arm64 holds both tarballs but only one attestation: not complete.
+    // darwin-arm64 holds both tarballs but attests only `kbf-daemon`, which no Mac needs: not
+    // complete, because the `kbf` its hosts run has no attestation.
     let darwin = ReleasePlatform::DarwinArm64;
     for component in Component::ALL {
         put_key(&key(COMMIT, darwin, component), b"t", false).await;
     }
-    put_key(&key(COMMIT, darwin, Component::Kbf), b"bundle", true).await;
+    put_key(&key(COMMIT, darwin, Component::KbfDaemon), b"bundle", true).await;
     // An attestation alone is not a component.
     put_key(&key(OTHER_COMMIT, x86, Component::Kbf), b"orphan", true).await;
     // Strangers.
@@ -562,14 +600,16 @@ async fn the_list_names_what_is_stored_and_what_is_complete() {
     let want = serde_json::json!({"releases": [{
     "commit": COMMIT,
     "platforms": [
-        {"platform": "linux-x86_64", "complete": false, "components": [
+        {"platform": "linux-x86_64", "complete": false, "version_facts": false,
+         "note": no_facts_note(ReleasePlatform::LinuxX86_64), "components": [
             {"name": "kbf-daemon", "sha256": sha(b"d"), "size": 1, "attested": false}]},
-        {"platform": "linux-arm64", "complete": true, "components": [
+        {"platform": "linux-arm64", "complete": true, "version_facts": true, "components": [
             {"name": "kbf", "sha256": sha(b"kbf"), "size": 3, "attested": true},
             {"name": "kbf-daemon", "sha256": sha(b"kbf-daemon"), "size": 10, "attested": true}]},
-            {"platform": "darwin-arm64", "complete": false, "components": [
-                {"name": "kbf", "sha256": sha(b"t"), "size": 1, "attested": true},
-                {"name": "kbf-daemon", "sha256": sha(b"t"), "size": 1, "attested": false}]},
+            {"platform": "darwin-arm64", "complete": false, "version_facts": false,
+             "note": no_facts_note(ReleasePlatform::DarwinArm64), "components": [
+                {"name": "kbf", "sha256": sha(b"t"), "size": 1, "attested": false},
+                {"name": "kbf-daemon", "sha256": sha(b"t"), "size": 1, "attested": true}]},
     ]}]});
     assert_eq!(listing.json(), want);
     let attestation = store
@@ -582,6 +622,53 @@ async fn the_list_names_what_is_stored_and_what_is_complete() {
         .await
         .expect("read");
     assert_eq!(none, None);
+}
+
+/// Catches a platform called complete (or incomplete) by a rule that is not the platform's:
+/// every host needs `kbf` (the tarball holds one binary, and a Mac runs `kbf --mode=daemon`
+/// like the rest), so a platform is complete with `kbf` attested and nothing else, and not
+/// with `kbf-daemon` alone, on Linux or on a Mac.
+///
+/// Mutant seen red: every platform wanting both components (a release is never complete).
+#[tokio::test]
+async fn a_platform_is_complete_with_the_tarball_its_hosts_need() {
+    let served = serve().await;
+    let store = served.store.as_ref().expect("store").clone();
+    let put_both = async |k: &Key| {
+        store.put_tarball(k, &mut body(b"t")).await.expect("put");
+        store
+            .put_attestation(k, &mut body(b"bundle"))
+            .await
+            .expect("put");
+    };
+    put_both(&key(COMMIT, ReleasePlatform::LinuxX86_64, Component::Kbf)).await;
+    put_both(&key(COMMIT, ReleasePlatform::DarwinArm64, Component::Kbf)).await;
+    put_both(&key(
+        COMMIT,
+        ReleasePlatform::LinuxArm64,
+        Component::KbfDaemon,
+    ))
+    .await;
+    let listing = get_list(&served).await.json();
+    let complete: Vec<(String, bool)> = listing["releases"][0]["platforms"]
+        .as_array()
+        .expect("platforms")
+        .iter()
+        .map(|p| {
+            (
+                p["platform"].as_str().expect("name").to_owned(),
+                p["complete"].as_bool().expect("flag"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        complete,
+        [
+            ("linux-x86_64".to_owned(), true),
+            ("linux-arm64".to_owned(), false),
+            ("darwin-arm64".to_owned(), true),
+        ]
+    );
 }
 
 /// Catches: a failing directory answered as success or as an empty list, and its path
@@ -622,6 +709,11 @@ async fn a_failing_directory_is_a_500_that_names_no_path() {
     let gone = serve().await;
     std::fs::remove_dir_all(gone.dir.store().join("files")).expect("remove");
     let reply = put(&gone, "kbf", b"x").await;
+    assert_eq!(reply.status, 500, "{}", reply.body);
+    assert!(!reply.body.contains("files"), "{}", reply.body);
+    // A bundle whose entry is stored but whose name by digest cannot be made is a failed
+    // put, not a bundle that `Describe` would name and `Fetch` could not serve.
+    let reply = put(&gone, "kbf.attestation", b"bundle").await;
     assert_eq!(reply.status, 500, "{}", reply.body);
     assert!(!reply.body.contains("files"), "{}", reply.body);
     std::fs::remove_dir_all(gone.dir.store().join("index")).expect("remove");
@@ -698,7 +790,7 @@ async fn fetch_streams_the_exact_bytes() {
         let k = key(
             &format!("{i:040x}"),
             ReleasePlatform::DarwinArm64,
-            Component::KbfDaemon,
+            Component::Kbf,
         );
         let digest = store
             .put_tarball(&k, &mut body(&bytes))
@@ -748,4 +840,605 @@ async fn fetch_streams_the_exact_bytes() {
             .expect_err("unopenable");
         assert_eq!(status.code(), Code::Internal);
     }
+}
+
+// ---- `ReleaseService.Describe`, `GET /v1/releases/{commit}` and bundles served by digest ----
+
+type Client = ReleaseServiceClient<tonic::transport::Channel>;
+
+async fn describe(
+    client: &mut Client,
+    commit: &str,
+    platform: &str,
+) -> Result<ReleaseDescription, tonic::Status> {
+    client
+        .describe(DescribeRequest {
+            commit: commit.to_owned(),
+            platform: platform.to_owned(),
+        })
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+/// The bytes of the tarball of `component` for `platform`, and of its bundle.
+fn tarball_of(platform: ReleasePlatform, component: Component) -> Vec<u8> {
+    format!("tarball {platform} {component}").into_bytes()
+}
+
+fn bundle_of(platform: ReleasePlatform, component: Component) -> Vec<u8> {
+    format!("bundle {platform} {component}").into_bytes()
+}
+
+/// Stores the tarball of `component` for `platform` of `commit` and, with `attested`, its
+/// bundle; both as `tarball_of` and `bundle_of` spell them.
+async fn store_component(
+    store: &ReleaseStore,
+    commit: &str,
+    platform: ReleasePlatform,
+    component: Component,
+    attested: bool,
+) {
+    let k = key(commit, platform, component);
+    store
+        .put_tarball(&k, &mut body(&tarball_of(platform, component)))
+        .await
+        .expect("tarball");
+    if attested {
+        store
+            .put_attestation(&k, &mut body(&bundle_of(platform, component)))
+            .await
+            .expect("bundle");
+    }
+}
+
+/// `COMMIT` complete for every platform (`kbf` for each), and a `kbf-daemon` of the first
+/// Linux platform that no host of it needs.
+async fn store_a_complete_release(store: &ReleaseStore) {
+    use ReleasePlatform::{DarwinArm64, LinuxArm64, LinuxX86_64};
+    for (platform, component) in [
+        (LinuxX86_64, Component::Kbf),
+        (LinuxX86_64, Component::KbfDaemon),
+        (LinuxArm64, Component::Kbf),
+        (DarwinArm64, Component::Kbf),
+    ] {
+        store_component(store, COMMIT, platform, component, true).await;
+    }
+}
+
+/// The `Component`s of a description as (platform, name).
+fn named(description: &ReleaseDescription) -> Vec<(&str, &str)> {
+    description
+        .components
+        .iter()
+        .map(|c| (c.platform.as_str(), c.name.as_str()))
+        .collect()
+}
+
+/// Catches an attestation bundle that the store keeps but does not serve: `Describe`
+/// names a bundle by its digest, the installer fetches it like a tarball, and a `url`
+/// mirror of `files/` must hold it. Putting the bundle makes it fetched back byte for byte
+/// under its digest, as the same file as the index's (one inode, two names); the same bytes
+/// again change nothing; other bytes (409) leave no file under their own digest; and a bundle
+/// whose name in `files/` is gone (as one stored before the link existed has none) gets it
+/// back from a repeat of the same put.
+///
+/// Mutants seen red: the link not made (the fetch is NOT_FOUND); the link made only for a
+/// new key (the repair at the end stays NOT_FOUND).
+#[tokio::test]
+async fn a_bundle_is_served_by_its_digest() {
+    use std::os::unix::fs::MetadataExt;
+    let served = serve().await;
+    let store = served.store.as_ref().expect("store").clone();
+    let mut client = grpc(release::service(Some(Arc::clone(&store)))).await;
+    let bundle = b"the bundle".to_vec();
+    let name = sha(&bundle);
+    let in_files = served.dir.store().join("files").join(&name);
+    let in_index = served
+        .dir
+        .store()
+        .join("index")
+        .join(COMMIT)
+        .join("linux-x86_64")
+        .join("kbf.attestation");
+
+    let first = put(&served, "kbf.attestation", &bundle).await;
+    assert_eq!(first.status, 201, "{}", first.body);
+    assert_eq!(first.json()["sha256"], name);
+    assert_eq!(
+        fetch_all(&mut client, &name).await.expect("fetch").concat(),
+        bundle
+    );
+    let (a, b) = (
+        std::fs::metadata(&in_files).expect("files"),
+        std::fs::metadata(&in_index).expect("index"),
+    );
+    assert_eq!((a.ino(), a.dev(), a.nlink()), (b.ino(), b.dev(), 2));
+
+    let before = tree(&served.dir.0);
+    assert_eq!(put(&served, "kbf.attestation", &bundle).await.status, 200);
+    assert_eq!(tree(&served.dir.0), before, "a repeat changes nothing");
+
+    let refused = put(&served, "kbf.attestation", b"other bytes").await;
+    assert_eq!(refused.status, 409, "{}", refused.body);
+    assert_eq!(tree(&served.dir.0), before, "refused bytes left no file");
+    assert_eq!(
+        fetch_all(&mut client, &sha(b"other bytes"))
+            .await
+            .expect_err("never stored")
+            .code(),
+        Code::NotFound
+    );
+
+    std::fs::remove_file(&in_files).expect("a bundle with no name in files");
+    assert_eq!(
+        fetch_all(&mut client, &name)
+            .await
+            .expect_err("gone")
+            .code(),
+        Code::NotFound
+    );
+    assert_eq!(put(&served, "kbf.attestation", &bundle).await.status, 200);
+    assert_eq!(
+        fetch_all(&mut client, &name)
+            .await
+            .expect("repaired")
+            .concat(),
+        bundle
+    );
+    // A bundle that is also a tarball's bytes is one file, not two.
+    let both = b"bytes that are a tarball and a bundle";
+    assert_eq!(put(&served, "kbf", both).await.status, 201);
+    let other = path_of(COMMIT, "linux-arm64", "kbf.attestation");
+    let reply = http(served.addr, "PUT", &other, &authorized(), both).await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    assert_eq!(
+        fetch_all(&mut client, &sha(both))
+            .await
+            .expect("one file")
+            .concat(),
+        both
+    );
+}
+
+/// Catches a `Describe` that leaves a file out, names a digest or size other than the
+/// stored file's, orders the components other than by platform and then component, offers
+/// a component a platform does not need, or names a file the service cannot serve. For a
+/// release complete for three platforms (and a stray `kbf-daemon` of the first, which no
+/// host of it needs) every component of the answer is checked against the file the service
+/// then serves under the digest it names: its bytes hash to the digest and are as long as
+/// the size, for the tarball and for the bundle.
+///
+/// Mutants seen red: the bundle omitted (empty `bundle_sha256`, size 0); the tarball's size
+/// off by one; the platforms in reverse order; the stray component included.
+#[tokio::test]
+async fn describe_names_every_file_of_a_complete_release_by_its_digest() {
+    let served = serve().await;
+    let store = served.store.as_ref().expect("store").clone();
+    store_a_complete_release(&store).await;
+    let mut client = grpc(release::service(Some(Arc::clone(&store)))).await;
+
+    let all = describe(&mut client, COMMIT, "").await.expect("described");
+    assert_eq!(all.commit, COMMIT);
+    assert_eq!(
+        named(&all),
+        [
+            ("linux-x86_64", "kbf"),
+            ("linux-arm64", "kbf"),
+            ("darwin-arm64", "kbf"),
+        ]
+    );
+    for c in &all.components {
+        let platform = ReleasePlatform::parse(&c.platform).expect("a platform");
+        let component = Component::parse(&c.name).expect("a component");
+        let (tarball, bundle) = (
+            tarball_of(platform, component),
+            bundle_of(platform, component),
+        );
+        assert_eq!(
+            c.tarball,
+            format!("{}-{COMMIT}-{}.tar.gz", c.name, c.platform)
+        );
+        assert_eq!(
+            (c.sha256.as_str(), c.size),
+            (sha(&tarball).as_str(), tarball.len() as u64)
+        );
+        assert_eq!(
+            (c.bundle_sha256.as_str(), c.bundle_size),
+            (sha(&bundle).as_str(), bundle.len() as u64)
+        );
+        // And what the service serves under those digests is those bytes.
+        let served_tarball = fetch_all(&mut client, &c.sha256).await.expect("tarball");
+        assert_eq!(served_tarball.concat(), tarball);
+        let served_bundle = fetch_all(&mut client, &c.bundle_sha256).await;
+        assert_eq!(served_bundle.expect("bundle").concat(), bundle);
+    }
+}
+
+/// Catches the platform filter ignored (every platform returned), applied as a prefix or
+/// without case or trimming, or an unlisted platform taken for "none": one platform asked
+/// gets its components alone; a platform the release is complete for but that was not
+/// asked is absent.
+///
+/// Mutant seen red: the filter dropped.
+#[tokio::test]
+async fn describe_can_be_asked_for_one_platform() {
+    let served = serve().await;
+    let store = served.store.as_ref().expect("store").clone();
+    store_a_complete_release(&store).await;
+    let mut client = grpc(release::service(Some(store))).await;
+    for (platform, want) in [
+        ("linux-x86_64", ("linux-x86_64", "kbf")),
+        ("linux-arm64", ("linux-arm64", "kbf")),
+        ("darwin-arm64", ("darwin-arm64", "kbf")),
+    ] {
+        let one = describe(&mut client, COMMIT, platform)
+            .await
+            .expect(platform);
+        assert_eq!(named(&one), [want], "{platform}");
+        assert_eq!(one.commit, COMMIT);
+    }
+}
+
+/// Catches a commit that is not held described (empty, or an error of another kind), and
+/// one that is held only by an attestation (no tarball) taken for a release.
+#[tokio::test]
+async fn describe_of_a_commit_the_store_does_not_hold_is_not_found() {
+    let served = serve().await;
+    let store = served.store.as_ref().expect("store").clone();
+    store_a_complete_release(&store).await;
+    // An attestation alone is not a release.
+    let orphan = key(OTHER_COMMIT, ReleasePlatform::LinuxX86_64, Component::Kbf);
+    store
+        .put_attestation(&orphan, &mut body(b"orphan"))
+        .await
+        .expect("bundle");
+    let mut client = grpc(release::service(Some(store))).await;
+    for (commit, platform) in [
+        (OTHER_COMMIT, ""),
+        (OTHER_COMMIT, "linux-x86_64"),
+        ("1111111111111111111111111111111111111111", ""),
+    ] {
+        let status = describe(&mut client, commit, platform)
+            .await
+            .expect_err(commit);
+        assert_eq!(status.code(), Code::NotFound, "{commit} {platform}");
+        assert!(status.message().contains(commit), "{}", status.message());
+    }
+}
+
+/// Catches a request that is not exactly what it says taken for one: a commit of 12 hex
+/// digits (the short form the binary reports), 39 or 41 digits, upper case, empty, padded or
+/// with a path in it; a platform that is not one of the three, in another case, padded or
+/// with a prefix. Each is INVALID_ARGUMENT, even when a stored release would match.
+///
+/// Mutant seen red: a commit of 12 hex digits accepted (it is NOT_FOUND, not
+/// INVALID_ARGUMENT).
+#[tokio::test]
+async fn describe_refuses_a_request_that_is_not_exactly_a_commit_and_a_platform() {
+    let served = serve().await;
+    let store = served.store.as_ref().expect("store").clone();
+    store_a_complete_release(&store).await;
+    let mut client = grpc(release::service(Some(store))).await;
+    let upper = COMMIT.to_uppercase();
+    let padded = format!(" {COMMIT}");
+    let path = format!("../{}", &COMMIT[..37]);
+    let bad_commits: [&str; 8] = [
+        "",
+        &COMMIT[..12],
+        &COMMIT[..39],
+        &format!("{COMMIT}0"),
+        &upper,
+        &padded,
+        &path,
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+    ];
+    for commit in bad_commits {
+        let status = describe(&mut client, commit, "").await.expect_err(commit);
+        assert_eq!(status.code(), Code::InvalidArgument, "{commit:?}");
+        assert!(status.message().contains("40 lowercase hex"), "{status:?}");
+    }
+    for platform in [
+        "plan9-mips",
+        "Linux-x86_64",
+        "linux-x86_64 ",
+        "linux",
+        "linux-x86_64/..",
+        "all",
+    ] {
+        let status = describe(&mut client, COMMIT, platform)
+            .await
+            .expect_err(platform);
+        assert_eq!(status.code(), Code::InvalidArgument, "{platform:?}");
+        assert!(status.message().contains("darwin-arm64"), "{status:?}");
+    }
+}
+
+/// `COMMIT` as an upload that stopped part way leaves it: Linux x86_64 has its tarball and
+/// no bundle; Linux arm64 has nothing; the Mac has `kbf-daemon`, which it does not need, and
+/// not `kbf`, which it does.
+async fn store_a_release_part_way(store: &ReleaseStore) {
+    store_component(
+        store,
+        COMMIT,
+        ReleasePlatform::LinuxX86_64,
+        Component::Kbf,
+        false,
+    )
+    .await;
+    store_component(
+        store,
+        COMMIT,
+        ReleasePlatform::DarwinArm64,
+        Component::KbfDaemon,
+        true,
+    )
+    .await;
+}
+
+/// Catches an incomplete platform described as if it were complete, or refused with a
+/// message that does not say what is missing. A platform asked fails FAILED_PRECONDITION
+/// naming what it lacks, for each of the ways to lack it: a tarball without its
+/// attestation, a platform with no tarball at all, and a platform that has one but not the
+/// one its hosts need.
+///
+/// Mutant seen red: the attestation check skipped (the unattested tarball goes on to the
+/// bundle read and the call is INTERNAL, not FAILED_PRECONDITION).
+#[tokio::test]
+async fn describe_of_a_platform_asked_for_says_what_it_lacks() {
+    let served = serve().await;
+    let store = served.store.as_ref().expect("store").clone();
+    let mut client = grpc(release::service(Some(Arc::clone(&store)))).await;
+    store_a_release_part_way(&store).await;
+    for (platform, lack) in [
+        ("linux-x86_64", "linux-x86_64 has no attestation of kbf"),
+        ("linux-arm64", "linux-arm64 has no tarball of kbf"),
+        ("darwin-arm64", "darwin-arm64 has no tarball of kbf"),
+    ] {
+        let status = describe(&mut client, COMMIT, platform)
+            .await
+            .expect_err(platform);
+        assert_eq!(status.code(), Code::FailedPrecondition, "{platform}");
+        assert!(status.message().contains(lack), "{}", status.message());
+        assert!(status.message().contains(COMMIT), "{}", status.message());
+    }
+}
+
+/// Catches a call that asks for no platform answered with nothing when no platform is
+/// complete (an empty description reads as a release with no files): it fails
+/// FAILED_PRECONDITION and names what every stored platform lacks.
+///
+/// Mutant seen red: a call with no complete platform answered with an empty description.
+#[tokio::test]
+async fn describe_with_no_complete_platform_names_what_each_lacks() {
+    let served = serve().await;
+    let store = served.store.as_ref().expect("store").clone();
+    let mut client = grpc(release::service(Some(Arc::clone(&store)))).await;
+    store_a_release_part_way(&store).await;
+    let status = describe(&mut client, COMMIT, "").await.expect_err("none");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    for lack in [
+        "linux-x86_64 has no attestation of kbf",
+        "darwin-arm64 has no tarball of kbf",
+    ] {
+        assert!(status.message().contains(lack), "{}", status.message());
+    }
+}
+
+/// Catches an incomplete platform failing a call that asked for none (one platform's
+/// missing bundle must not hide a release another platform's hosts can install), and one
+/// that is left out of an answer for a call that asked for it by name: with the bundle of
+/// Linux x86_64 stored, a call for no platform describes it alone, while the Mac and Linux
+/// arm64, still incomplete, fail a call that names them.
+///
+/// Mutant seen red: an incomplete platform failing a call that asked for none.
+#[tokio::test]
+async fn describe_leaves_an_incomplete_platform_out_of_a_call_that_asks_for_none() {
+    let served = serve().await;
+    let store = served.store.as_ref().expect("store").clone();
+    let mut client = grpc(release::service(Some(Arc::clone(&store)))).await;
+    store_a_release_part_way(&store).await;
+    let bundle = bundle_of(ReleasePlatform::LinuxX86_64, Component::Kbf);
+    let k = key(COMMIT, ReleasePlatform::LinuxX86_64, Component::Kbf);
+    store
+        .put_attestation(&k, &mut body(&bundle))
+        .await
+        .expect("bundle");
+    let all = describe(&mut client, COMMIT, "")
+        .await
+        .expect("one complete");
+    assert_eq!(named(&all), [("linux-x86_64", "kbf")]);
+    for platform in ["darwin-arm64", "linux-arm64"] {
+        let status = describe(&mut client, COMMIT, platform)
+            .await
+            .expect_err("still incomplete");
+        assert_eq!(status.code(), Code::FailedPrecondition, "{platform}");
+    }
+}
+
+/// Catches a bundle described that the service cannot serve: one stored before the store
+/// named bundles by digest has no name in `files/`, so `Fetch` would say NOT_FOUND mid-install.
+/// `Describe` says the bundle is not served by its digest, and a repeat of the put (the same
+/// bytes, `200`) repairs it.
+///
+/// Mutant seen red: the check left out (the bundle is described and is not fetchable).
+#[tokio::test]
+async fn describe_does_not_name_a_bundle_that_has_no_name_in_files() {
+    let served = serve().await;
+    let store = served.store.as_ref().expect("store").clone();
+    let mut client = grpc(release::service(Some(Arc::clone(&store)))).await;
+    store_component(
+        &store,
+        COMMIT,
+        ReleasePlatform::LinuxX86_64,
+        Component::Kbf,
+        true,
+    )
+    .await;
+    let k = key(COMMIT, ReleasePlatform::LinuxX86_64, Component::Kbf);
+    let bundle = bundle_of(ReleasePlatform::LinuxX86_64, Component::Kbf);
+    let in_files = served.dir.store().join("files").join(sha(&bundle));
+    std::fs::remove_file(&in_files).expect("remove");
+    let status = describe(&mut client, COMMIT, "linux-x86_64")
+        .await
+        .expect_err("not served");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert!(
+        status.message().contains("not served by its digest"),
+        "{}",
+        status.message()
+    );
+    store
+        .put_attestation(&k, &mut body(&bundle))
+        .await
+        .expect("a repeat repairs it");
+    describe(&mut client, COMMIT, "linux-x86_64")
+        .await
+        .expect("served again");
+}
+
+/// Catches a store that fails answered as a missing or a thin release, or with a path in the
+/// message: with an entry that is not one, and with a bundle that cannot be read, `Describe`
+/// is INTERNAL and `GET /v1/releases/{commit}` is 500, both saying only that the store failed.
+#[tokio::test]
+async fn describe_with_a_failing_directory_is_an_internal_error_that_names_no_path() {
+    let served = serve().await;
+    let store = served.store.as_ref().expect("store").clone();
+    let mut client = grpc(release::service(Some(Arc::clone(&store)))).await;
+    store_component(
+        &store,
+        COMMIT,
+        ReleasePlatform::LinuxX86_64,
+        Component::Kbf,
+        true,
+    )
+    .await;
+    let platform_dir = served
+        .dir
+        .store()
+        .join("index")
+        .join(COMMIT)
+        .join("linux-x86_64");
+    let check = async |client: &mut Client, what: &str| {
+        let status = describe(client, COMMIT, "").await.expect_err(what);
+        assert_eq!(status.code(), Code::Internal, "{what}");
+        assert_eq!(status.message(), "the release store failed", "{what}");
+        let reply = http(served.addr, "GET", &path_of_commit(COMMIT), &[], b"").await;
+        assert_eq!(reply.status, 500, "{what}: {}", reply.body);
+        assert!(!reply.body.contains("store/index"), "{}", reply.body);
+    };
+    // The bundle is a directory: it exists, and cannot be read.
+    let bundle = platform_dir.join("kbf.attestation");
+    let kept = std::fs::read(&bundle).expect("bundle");
+    std::fs::remove_file(&bundle).expect("remove");
+    std::fs::create_dir(&bundle).expect("dir");
+    check(&mut client, "an unreadable bundle").await;
+    std::fs::remove_dir(&bundle).expect("remove");
+    std::fs::write(&bundle, kept).expect("restore");
+    // The entry is not an entry.
+    std::fs::write(platform_dir.join("kbf"), "not an entry").expect("corrupt");
+    check(&mut client, "a corrupt entry").await;
+}
+
+fn path_of_commit(commit: &str) -> String {
+    format!("/v1/releases/{commit}")
+}
+
+/// Catches the `url` source's file, `releases/<commit>.json`, saying something else than
+/// `Describe`: for one release the HTTP body is read, and so is the gRPC answer, and the
+/// JSON must hold exactly the fields of the answer by their proto names (`schema` 1, the
+/// commit, each component's seven fields), the same values in the same order. The body is
+/// also pinned by hand for a small release, so the documented schema cannot drift with the
+/// code that renders it. It needs no credentials, like `GET /v1/releases`.
+///
+/// Mutants seen red: `schema` omitted from the JSON; the bundle omitted from the description
+/// (the hand-written first component differs); the platforms in reverse order.
+#[tokio::test]
+async fn the_url_source_json_is_what_describe_answers() {
+    let served = serve().await;
+    let store = served.store.as_ref().expect("store").clone();
+    store_a_complete_release(&store).await;
+    // And one platform of another commit that is not complete: not in the first's file.
+    store_component(
+        &store,
+        OTHER_COMMIT,
+        ReleasePlatform::LinuxArm64,
+        Component::Kbf,
+        false,
+    )
+    .await;
+    let mut client = grpc(release::service(Some(Arc::clone(&store)))).await;
+
+    let reply = http(served.addr, "GET", &path_of_commit(COMMIT), &[], b"").await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let all = describe(&mut client, COMMIT, "").await.expect("described");
+    let from_the_answer = serde_json::json!({
+        "schema": 1,
+        "commit": all.commit,
+        "components": all.components.iter().map(|c| serde_json::json!({
+            "name": c.name,
+            "platform": c.platform,
+            "tarball": c.tarball,
+            "sha256": c.sha256,
+            "size": c.size,
+            "bundle_sha256": c.bundle_sha256,
+            "bundle_size": c.bundle_size,
+        })).collect::<Vec<_>>(),
+    });
+    assert_eq!(reply.json(), from_the_answer);
+
+    // By hand, for the first platform: digests of the bytes `tarball_of` and `bundle_of` spell.
+    let body = reply.json();
+    assert_eq!(
+        &body["components"][0],
+        &serde_json::json!({
+            "name": "kbf",
+            "platform": "linux-x86_64",
+            "tarball": format!("kbf-{COMMIT}-linux-x86_64.tar.gz"),
+            "sha256": sha(b"tarball linux-x86_64 kbf"),
+            "size": 24,
+            "bundle_sha256": sha(b"bundle linux-x86_64 kbf"),
+            "bundle_size": 23,
+        })
+    );
+    assert_eq!(body["components"].as_array().expect("array").len(), 3);
+
+    // A commit with no complete platform has no file; a commit not held has none.
+    let reply = http(served.addr, "GET", &path_of_commit(OTHER_COMMIT), &[], b"").await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply.body.contains("linux-arm64 has no attestation of kbf"),
+        "{}",
+        reply.body
+    );
+    let unknown = path_of_commit("1111111111111111111111111111111111111111");
+    assert_eq!(
+        http(served.addr, "GET", &unknown, &[], b"").await.status,
+        404
+    );
+    for bad in [
+        path_of_commit(&COMMIT[..12]),
+        path_of_commit(&COMMIT.to_uppercase()),
+        path_of_commit(&format!("{COMMIT}0")),
+    ] {
+        let reply = http(served.addr, "GET", &bad, &[], b"").await;
+        assert_eq!(reply.status, 400, "{bad}: {}", reply.body);
+    }
+}
+
+/// Catches a server without a store answering the description with an empty or a missing
+/// release rather than saying the store is off, on the route and on the call.
+#[tokio::test]
+async fn describe_without_a_store_says_so() {
+    let served = serve_with(SMALL, false, Some(token())).await;
+    let reply = http(served.addr, "GET", &path_of_commit(COMMIT), &[], b"").await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert!(reply.body.contains("--releases-dir"), "{}", reply.body);
+    let mut client = grpc(release::service(None)).await;
+    let status = describe(&mut client, COMMIT, "").await.expect_err("off");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert!(
+        status.message().contains("--releases-dir"),
+        "{}",
+        status.message()
+    );
 }

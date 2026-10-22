@@ -9,7 +9,7 @@
 //!   group or other, the state directory 0700, and nothing `setup` makes (users,
 //!   releases, configuration). Then the gate: the LaunchDaemon is not loaded and no
 //!   process runs; loaded by hand it stays not running while
-//!   `/usr/local/etc/kbf/installer.toml` does not exist (the control that it is a real
+//!   the `installer.toml` of kbf-installer's layout (`/usr/local/etc/kbf`) does not exist (the control that it is a real
 //!   job: it runs once the file exists). Last, `check` refuses a user-owned prefix:
 //!   the prefix is handed to a user, `check` must refuse and name it, and given back
 //!   it must not. That step needs the real tool and is reported as skipped for the
@@ -34,9 +34,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
+use kbf_installer::layout::Platform;
 use xtask::pkg::sha1::cksum;
 
 mod support;
+use kbf_testkit::dir::TestDir;
 use support::{BUSY_WAIT, output_unbusy};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
@@ -46,8 +48,15 @@ const INSTALLER: &str = env!("CARGO_BIN_EXE_xtask-fake");
 const MINOS: &str = "14.0";
 const LABEL: &str = "com.komira.kbf-installer";
 const VERSION: &str = "0.1.0";
-const GATE_DIR: &str = "/usr/local/etc/kbf";
-const GATE: &str = "/usr/local/etc/kbf/installer.toml";
+/// The file the job's gate waits on, and its directory: where `kbf-installer setup` writes
+/// `installer.toml` on a Mac, by kbf-installer's own layout (never a path spelled here, which
+/// is how the gate and `setup` once disagreed unseen).
+fn gate() -> &'static str {
+    Platform::MacOs.installer_toml()
+}
+fn gate_dir() -> &'static str {
+    Platform::MacOs.config_dir()
+}
 const LOG_DIR: &str = "/Library/Logs/kbf-installer";
 const JOB_LOG: &str = "/Library/Logs/kbf-installer/kbf-installer.log";
 const PLIST: &str = "/Library/LaunchDaemons/com.komira.kbf-installer.plist";
@@ -108,11 +117,11 @@ fn s(p: &Path) -> &str {
 /// the target's tmp dir, not a shared parent: the `installer` test runs as root first
 /// (`cargo xtask sudo-test`) and a shared parent it created would be root's, so the
 /// `homebrew` test, run as the runner's user after it, could not create its own.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("xtask-pkg-macos-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("xtask-pkg-macos-{name}"),
+    )
 }
 
 /// The stub copied as `kbf-installer`, signed ad hoc as CI signs a release binary
@@ -180,7 +189,7 @@ impl Installed {
     fn clean() {
         let _ = run("launchctl", &["bootout", &format!("system/{LABEL}")]);
         let _ = run("pkgutil", &["--forget", LABEL]);
-        for path in INSTALLED.iter().chain(&[GATE, JOB_LOG]) {
+        for path in INSTALLED.iter().chain(&[gate(), JOB_LOG]) {
             let _ = std::fs::remove_file(path);
         }
         // Directories last, each only when empty: a test that left something in one
@@ -191,7 +200,7 @@ impl Installed {
             PREFIX,
             STATE,
             LOG_DIR,
-            GATE_DIR,
+            gate_dir(),
         ] {
             let _ = std::fs::remove_dir(dir);
         }
@@ -325,11 +334,11 @@ fn installer_places_files_and_loads_nothing() {
     );
     // What `setup` makes does not exist: no configuration, no release, no user, and
     // the job has not written.
-    assert!(!Path::new(GATE).exists());
+    assert!(!Path::new(gate()).exists());
     assert!(!Path::new(JOB_LOG).exists());
     assert!(!Path::new("/usr/local/kbf-installer/releases").exists());
     assert!(!Path::new("/usr/local/kbf-installer/current").exists());
-    for user in ["kbf", "_kbf-fetch", "kbf-verify"] {
+    for user in ["kbf", "_kbf-fetch"] {
         failure("id", &["-u", user]);
     }
 
@@ -344,17 +353,24 @@ fn installer_places_files_and_loads_nothing() {
     assert!(state.contains("state = not running"), "{state}");
     std::thread::sleep(Duration::from_secs(3));
     assert!(!is_running());
-    assert!(!Path::new(JOB_LOG).exists(), "the job ran without {GATE}");
-    // With it, it runs: the job's output is the stub's arguments.
-    std::fs::create_dir_all(GATE_DIR).unwrap();
-    std::fs::write(GATE, b"# configured\n").unwrap();
+    assert!(
+        !Path::new(JOB_LOG).exists(),
+        "the job ran without {}",
+        gate()
+    );
+    // With it, it runs: the job's output is the stub's arguments. The file is made by hand
+    // because the package holds the stub, which has no `setup`; its path is the one real
+    // `setup` writes (kbf-installer's `setup::tests` pins that the plist's gate is it).
+    std::fs::create_dir_all(gate_dir()).unwrap();
+    std::fs::write(gate(), b"# configured\n").unwrap();
     assert!(
         within(60, || std::fs::read_to_string(JOB_LOG)
-            .is_ok_and(|log| log.contains("kbf-installer-stub serve"))),
-        "the job did not run once {GATE} existed"
+            .is_ok_and(|log| log.contains("kbf-installer-stub run"))),
+        "the job did not run once {} existed",
+        gate()
     );
     success("launchctl", &["bootout", &format!("system/{LABEL}")]);
-    std::fs::remove_file(GATE).unwrap();
+    std::fs::remove_file(gate()).unwrap();
 
     check_refuses_a_user_owned_prefix();
 }

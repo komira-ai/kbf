@@ -38,30 +38,37 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_front::{CacheStorage, RebuildConfig, SegmentsConfig};
+use kbf_front::{CacheStorage, Hold, RebuildConfig, SegmentsConfig, VerifiedBlob};
 use kbf_mapsync::MapHolder;
 use kbf_meta::Retention;
-use kbf_objstore::{FsStore, ObjectStore};
+use kbf_objstore::FsStore;
 use kbf_storage::Storage;
 use kbf_storage::repair::Repairs;
 use kbf_storage::service::InProcess;
 use kbf_threads::disk::Statvfs;
 
+use crate::cold_apply::{ColdPick, Fixed, Registrable};
+use crate::listen::Binder;
+use crate::metrics::bind_node_sockets;
+use crate::ram_drain::RamDrain;
 use crate::rebuild::Background;
 use crate::replication::{REPAIR_DIR, bind_node};
-use crate::serve::{ServeError, StorageListener, bind_storage_socket};
+use crate::serve::{ServeError, StorageListener};
 use crate::start::{AbortOnDrop, open_cold_file, share_storage, tier_bytes};
 use crate::startup_pass::StartPass;
+use crate::storage_node::{Holder, holder_of};
 use crate::storage_node::{StorageFlags, open_cache};
 use crate::stores::{FILE_PREFIX_ROOT, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
-use crate::{RaftMetaLog, SERVER_VERSION, s3_store};
+use crate::{RaftMetaLog, SERVER_VERSION};
 
 /// A started storage half: bound, its write tier attached and its flusher (and any
 /// start-up pass) running, not yet serving.
 pub struct StorageHalf {
     /// Where the listener is.
     pub addr: SocketAddr,
+    /// Where it serves `/metrics`, when `--metrics-listen` is given.
+    pub metrics: Option<SocketAddr>,
     storage: Arc<dyn Storage>,
     in_process: InProcess,
     start_line: String,
@@ -72,9 +79,20 @@ pub struct StorageHalf {
     _background: Background,
     _joiner: Option<AbortOnDrop>,
     _repair: Option<AbortOnDrop>,
+    _metrics: Option<AbortOnDrop>,
+    /// Holds a blob in the one cache: [`StorageHalf::hold`].
+    holder: Holder,
 }
 
 impl StorageHalf {
+    /// Holds `blob` in this node's RAM as the acknowledgement point will (`Cache::hold`),
+    /// and says what became of it (`None`: the node's cache is gone). See
+    /// [`crate::storage_node::StorageHandle::hold`].
+    #[doc(hidden)]
+    pub fn hold(&self, blob: &VerifiedBlob) -> Option<Hold> {
+        (self.holder)(blob)
+    }
+
     /// The storage map the node holds ([`crate::storage_node::StorageHandle::maps`]).
     #[must_use]
     pub fn maps(&self) -> Arc<MapHolder> {
@@ -113,7 +131,10 @@ impl StorageHalf {
     }
 
     /// Serves until the shutdown future given to [`start`] completes and the calls in
-    /// flight end; the flusher and the pass stop then.
+    /// flight end; no new call is taken once it has completed. The blobs held in RAM are
+    /// then written to the disk and the blocks staged on the hot store flushed to the cold
+    /// store, within `--ram-drain-deadline` (`RamDrain::after`); the flusher and the
+    /// pass stop after that.
     ///
     /// # Errors
     /// The listener fails while serving.
@@ -124,6 +145,7 @@ impl StorageHalf {
             _background,
             _joiner,
             _repair,
+            _metrics,
             ..
         } = self;
         serving.await
@@ -151,16 +173,16 @@ where
         StoreUri::File(dir) => {
             let store = open_cold_file(&flags.server, dir)?;
             let files = Some(store.clone());
-            let opened = (store, files);
+            let opened = (Fixed(store), files);
             over(flags, listener, &stores, opened, FILE_PREFIX_ROOT, shutdown).await
         }
         StoreUri::S3(uri) => {
-            let store = s3_store(uri, |name| std::env::var(name).ok())?;
+            let cold = Registrable::new(uri, flags.env)?;
             over(
                 flags,
                 listener,
                 &stores,
-                (store, None),
+                (cold, None),
                 &uri.prefix,
                 shutdown,
             )
@@ -171,16 +193,16 @@ where
 
 /// [`start`] over the object store the cold store's URI named: the metadata log, the
 /// cache, its write tier, flusher and pass, and the listener over them.
-async fn over<O, S, F>(
+async fn over<C, S, F>(
     flags: &StorageFlags,
     listener: StorageListener,
     stores: &Stores,
-    (store, files): (O, Option<FsStore>),
+    (cold, files): (C, Option<FsStore>),
     prefix_root: &str,
     shutdown: S,
 ) -> Result<StorageHalf, Box<dyn Error>>
 where
-    O: ObjectStore + 'static,
+    C: ColdPick,
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
@@ -192,15 +214,29 @@ where
     // As `kbf storage` does ([`crate::storage_node::open_cache`]): bind, register with the
     // frontend if there is one, and only then open the cache, as the registration's member
     // and boot.
-    let socket = bind_storage_socket(listener.listen)?;
-    let (cache, registered) = open_cache(flags, socket, (meta, store, prefix, log)).await?;
+    // One start, one bind budget for both listeners, spent before the first await (a
+    // `Binder` is not `Send`).
+    let (socket, metrics) = bind_node_sockets(listener.listen, flags.metrics, &Binder::new())?;
+    let (cache, registered) = open_cache(flags, socket, (meta, cold, prefix, log)).await?;
     let cache = cache
         .with_writes(args.write_config())
-        .with_write_pool(args.write_pool_config());
+        .with_write_pool(args.write_pool_config())
+        .with_durable_wait(args.durable_wait())
+        .with_ram_ack_bytes(args.ram_ack_bytes());
     let local = args.local_cache.as_ref();
     let hot = stores.hot.as_ref();
     let (cache, tier) = crate::write_tier::attach_with(cache, hot, local.is_none()).await?;
     let cache = Arc::new(cache);
+    // With the one cache, its fill is on the scrape too.
+    let (metrics, _metrics) = metrics
+        .map(|m| {
+            m.serve(
+                Arc::clone(&cache),
+                args.local_cache.clone(),
+                listener.tls.clone(),
+            )
+        })
+        .unzip();
     share_storage(local, tier_bytes(Arc::downgrade(&cache)));
     let _flusher = tier.map(|_| {
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
@@ -212,6 +248,12 @@ where
         max_bytes: args.segment_upload_max_bytes,
         idle: Duration::from_secs(args.segment_upload_idle_secs),
     };
+    let ram = RamDrain::start(
+        Arc::clone(&cache),
+        args.ram_ack_bytes(),
+        args.ram_drain_deadline(),
+    );
+    let holder = holder_of(&cache);
     let storage: Arc<dyn Storage> = Arc::new(CacheStorage::new(cache, segments));
     // After the log is open: it refuses a directory that holds files it did not write.
     let repair_dir = stores.meta_dir.join(REPAIR_DIR);
@@ -221,15 +263,18 @@ where
     let addr = node.addr;
     Ok(StorageHalf {
         addr,
+        metrics,
         storage,
         in_process: node.in_process,
         start_line: format!("kbf-storage {SERVER_VERSION} storage={addr} log={log}"),
-        serving: node.serving,
+        serving: Box::pin(ram.after(node.serving)),
         maps: node.maps,
         repairs: node.repairs,
         _flusher,
         _background,
         _joiner: node.joiner,
         _repair: node.repair,
+        _metrics,
+        holder,
     })
 }

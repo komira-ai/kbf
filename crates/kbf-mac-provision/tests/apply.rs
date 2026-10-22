@@ -9,8 +9,8 @@ use std::fs;
 
 use kbf_mac_provision::cli::{self, Error};
 use support::{
-    DROPIN, ERR_LOG, FakeMac, INTENT, LOGINWINDOW, PLIST, XCODE, apply, apply_keys, calls, check,
-    check_keys, golden_plist, lines, ls, preference, sha256_hex,
+    CONFIG, DROPIN, ERR_LOG, FakeMac, INTENT, LOGINWINDOW, PLIST, XCODE, apply, apply_keys, calls,
+    check, check_keys, golden_config, golden_plist, lines, ls, preference, sha256_hex,
 };
 
 const RECORD: &str = "/var/db/kbf-mac-provision/settings.before";
@@ -62,6 +62,9 @@ fn one_apply_converges_a_fresh_mac() {
             "CHANGE xcode: installed Xcode 17A000 at /Applications/Xcode-26.6.app",
             "CHANGE xcode: installed Xcode 18A000 at /Applications/Xcode-27.0.app",
             "CHANGE default_developer_dir: xcode-select -s /Applications/Xcode-27.0.app/Contents/Developer",
+            "CHANGE launchd_label: wrote /usr/local/etc/kbf/kbf.toml, root's, mode 644",
+            "CHANGE launchd_label: /var/db/kbf-installer root's, mode 755",
+            "CHANGE launchd_label: /var/db/kbf-installer/orders _kbf's, mode 700",
             "CHANGE launchd_label: wrote /Library/LaunchDaemons/org.example.kbf-daemon.plist and restarted the job (error log truncated)",
         ]
     );
@@ -77,8 +80,16 @@ fn one_apply_converges_a_fresh_mac() {
         fs::read_to_string(mac.path(DROPIN)).unwrap(),
         "PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\n"
     );
+    assert_eq!(
+        fs::read_to_string(mac.path(CONFIG)).unwrap(),
+        golden_config()
+    );
     for (path, want) in [
         (PLIST, "-rw-r--r-- 0 0"),
+        (CONFIG, "-rw-r--r-- 0 0"),
+        ("/var/db/kbf-installer", "drwxr-xr-x 0 0"),
+        ("/var/db/kbf-installer/orders", "drwx------ 480 480"),
+        ("/usr/local/etc/kbf", "drwxr-xr-x 0 0"),
         (DROPIN, "-rw-r--r-- 0 0"),
         ("/Library/Logs/kbf", "drwxr-xr-x 0 0"),
         (ERR_LOG, "-rw-r--r-- 480 480"),

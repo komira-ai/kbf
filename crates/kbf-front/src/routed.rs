@@ -19,17 +19,28 @@
 //! whole is hashed against its digest at every owner; a read fails over to the next owner;
 //! a write goes to the first owner that is not down, and to the next if that one cannot be
 //! reached (dead before the map says so; the raw ByteStream upload does the same while none
-//! of its bytes past the request's first frames has been passed on).
+//! of its bytes past the request's first frames has been passed on). A call that no owner
+//! could answer is held and tried again for the bound [`Routed::with_hold`] sets before it
+//! is UNAVAILABLE; a `Routed` made without it holds nothing.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use kbf_map::Member;
-use kbf_route::{MapSource, Nodes, Placement, Router, TlsNodes};
+use kbf_route::{MapSource, Nodes, Placement, RepairLimit, Router, TlsNodes};
 use kbf_storage::StorageError;
 use kbf_storage::service::RemoteStorage;
 use kbf_types::Digest;
 use tonic::transport::Channel;
+
+/// How often read repair may be told of a blob found away from its owner: a burst of 256
+/// (a run's worth of inputs), then 64 a second.
+const REPAIR_LIMIT: RepairLimit = RepairLimit {
+    burst: NonZeroU32::new(256).expect("not zero"),
+    per_second: NonZeroU32::new(64).expect("not zero"),
+};
 
 /// The connection to a member, for a caller that speaks to a node without a
 /// [`kbf_storage::Storage`] (the proxy's raw pass-through of a ByteStream). A trait so a
@@ -77,12 +88,26 @@ impl Routed {
         channels: Arc<dyn Channels>,
     ) -> Self {
         Self {
-            router: Router::new(Arc::clone(&maps), nodes),
+            // A blob a read finds away from its owner is copied to that owner in the
+            // background (at most [`REPAIR_LIMIT`]): this frontend's certificate is what a
+            // node accepts an unowned copy from.
+            router: Router::new(Arc::clone(&maps), nodes).with_background_repair(REPAIR_LIMIT),
             maps,
             channels,
             settled: AtomicBool::new(false),
             bootstrap: Vec::new(),
         }
+    }
+
+    /// The same, holding a call that no storage owner could answer for up to `bound` before
+    /// it is UNAVAILABLE ([`Router::with_hold`]): a storage node that restarts is away for a
+    /// while. It covers what goes through the router; the raw ByteStream pass-through calls
+    /// the nodes itself and is not held yet: a ByteStream read or write whose owners are
+    /// all down still fails at once.
+    #[must_use]
+    pub fn with_hold(mut self, bound: Duration) -> Self {
+        self.router = self.router.with_hold(bound);
+        self
     }
 
     /// The same, also tagging the calls made through `storage`, the handle to the

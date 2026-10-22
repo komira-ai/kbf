@@ -139,6 +139,7 @@ async fn the_previous_generation_is_asked_after_this_ones() {
     cell.set(MapView {
         map: now.clone(),
         previous: Some(before.clone()),
+        earlier: Vec::new(),
     });
     // Owned by 1 and 4 now, and by 1 and 3 before: the old copy is at 3.
     let (blob, digest) = blob_where(|d| {
@@ -156,6 +157,37 @@ async fn the_previous_generation_is_asked_after_this_ones() {
         assert_eq!(cluster.node(id).read_count(), 1, "{id}");
     }
     assert_eq!(cluster.node(2).read_count(), 0);
+}
+
+/// Catches a router that looks back one generation only: a blob written two changes ago
+/// is held by a node that neither of the two newest maps names for it, and is found only
+/// if the view's `earlier` maps are asked too, after this generation's and the previous
+/// one's.
+#[tokio::test]
+async fn an_earlier_generation_is_asked_after_the_previous_one() {
+    let oldest = map(1, 2, active(&[1, 2, 3]));
+    let before = map(2, 2, active(&[1, 2, 4]));
+    let now = map(3, 2, active(&[1, 2, 5]));
+    let cluster = Cluster::of(5);
+    let (router, cell) = router(&now, &cluster);
+    cell.set(MapView {
+        map: now.clone(),
+        previous: Some(before.clone()),
+        earlier: vec![oldest.clone()],
+    });
+    let ids = |a: u64, b: u64| [kbf_map::MemberId(a), kbf_map::MemberId(b)];
+    let (blob, digest) = blob_where(|d| {
+        now.read_order(d) == ids(1, 5)
+            && before.read_order(d) == ids(1, 4)
+            && oldest.read_order(d) == ids(1, 3)
+    });
+    cluster.node(3).hold(&blob);
+
+    let (bytes, _) = collect(router.read_range(&digest, 0, 0).await.expect("a read"))
+        .await
+        .expect("bytes");
+    assert_eq!(bytes, blob);
+    assert_eq!(cluster.dialled(), [(1, 3), (5, 3), (4, 3), (3, 3)]);
 }
 
 /// Catches a farm whose owners are all down read as "absent" (the caller would upload the
@@ -242,6 +274,23 @@ async fn a_read_is_passed_on_chunk_by_chunk() {
     }
     let made = produced.load(Ordering::SeqCst);
     assert!(made <= 4, "{made} chunks produced for 3 taken");
+}
+
+/// Catches a read that mistakes a stream with no frame for a failed open (the router looks
+/// at a stream's first frame before it hands the stream over): an empty blob is an empty
+/// stream, and the caller gets no bytes and no error.
+#[tokio::test]
+async fn an_empty_blob_is_a_stream_of_no_chunks() {
+    let map = map(1, 1, active(&[1]));
+    let cluster = Cluster::of(1);
+    let (router, _) = router(&map, &cluster);
+    let digest = cluster.node(1).hold(b"");
+
+    let (bytes, chunks) = collect(router.read_range(&digest, 0, 0).await.expect("a read"))
+        .await
+        .expect("no bytes");
+    assert!(bytes.is_empty());
+    assert_eq!(chunks, 0);
 }
 
 /// Catches a read that cannot go on after its owner broke, or goes on from the wrong

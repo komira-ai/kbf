@@ -22,7 +22,8 @@ use kbf_meta::ServerId;
 use kbf_threads::disk::FreeSpace;
 
 use crate::identity::{DenyList, DenyListError};
-use crate::serve::{Api, Listeners, StreamTiming, WorkerTls};
+use crate::proxy_auth::{ProxySecret, ProxySecretError};
+use crate::serve::{Api, Behind, Listeners, StreamTiming, WorkerTls};
 use crate::stores::{S3Uri, StoreFlags, StoreUri, Stores, StoresError};
 use crate::token::{ApiToken, TokenFileError};
 
@@ -52,7 +53,7 @@ pub struct Args {
     #[arg(long, value_enum, default_value = "all")]
     pub role: Role,
     /// The node's one cache, when a daemon in this process shares the hot store's disk
-    /// (`kbf-all-in-one`, `kbf_storage::local_cache`). No flag sets it.
+    /// (`kbf all-in-one`, `kbf_storage::local_cache`). No flag sets it.
     #[arg(skip)]
     pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
     /// The durable object store, where every blob ends up: `file:///absolute/path` (a
@@ -244,9 +245,23 @@ pub struct Args {
     /// calls, a storage node's `Register` and `Heartbeat`), so an edit takes effect
     /// without a restart. A `node` entry also refuses a storage certificate with that DNS
     /// name. A list that cannot be read after start refuses all of those calls. Needs
-    /// mutual TLS.
-    #[arg(long, requires_all = ["worker_tls_cert", "worker_tls_key", "worker_client_ca"])]
+    /// mutual TLS, or `--proxy-auth-file` (then only `node` entries can name a caller: the
+    /// proxy forwards a node id, not a certificate, so a `serial` or `spki-sha256` entry
+    /// never matches).
+    #[arg(long)]
     pub worker_deny_list: Option<PathBuf>,
+    /// A file holding the per-boot secret of the TLS-terminating proxy in front of this
+    /// server (`docs/design/frontend-proxy.md`, section 3): exactly 32 bytes, owned by the
+    /// server's user with mode 0600 or 0400, read at start. The proxy presents them as 64
+    /// lower-case hex digits in `x-kbf-proxy-auth`. With it, the REAPI, worker and operator
+    /// listeners take calls from loopback only, and believe `x-kbf-node-id` and
+    /// `x-kbf-role` only from a call that presents the secret; every other `x-kbf-*` header is dropped. The worker listener then
+    /// takes the proxy's identity in place of a client certificate (it needs no TLS flags),
+    /// and the operator API's writes must come through the proxy as well as carry the token (a
+    /// local `curl` write is refused). The storage listener is not covered: it keeps its own
+    /// mutual TLS. Without it, behavior is as before.
+    #[arg(long, value_name = "PATH")]
+    pub proxy_auth_file: Option<PathBuf>,
     /// How often, in seconds, a TLS listener looks at its certificate, key and client CA
     /// files (the `--*-tls-cert`, `--*-tls-key` and `--*-client-ca` flags). A change is
     /// applied to the next TLS handshake, with no restart and without ending a connection
@@ -275,6 +290,14 @@ pub struct Args {
     /// refused FAILED_PRECONDITION. The wait restarts whenever one can.
     #[arg(long, default_value_t = kbf_sched::UNSERVABLE_WAIT.as_secs())]
     pub unservable_wait_secs: u64,
+    /// The OS and architecture, as `<os>/<arch>` (`linux` or `macos`; `x86_64` or
+    /// `arm64`), of an action whose platform names no OS, no architecture and no ISA
+    /// level, so that it is not given to whichever node sorts first, a Mac among them.
+    /// Not applied to an action that asks for `xcode` or an iOS device, which only a
+    /// Mac reports. `none` applies no default: such an action runs on any node that
+    /// fits. Placement only: the action's digest and cache key do not change.
+    #[arg(long, default_value_t = kbf_front::DefaultPlatform::LINUX_X86_64)]
+    pub default_platform: kbf_front::DefaultPlatform,
     /// The memory rungs of an action, in GiB, ascending and each at least 1. The first
     /// is what an action that names no size (`kbf-book-mem-gib`) books. An action that
     /// passes its own memory limit runs again on the next rung above what it booked,
@@ -427,6 +450,55 @@ pub struct Args {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub write_pool_stream_idle: u64,
+    /// How long, in seconds, a storage node waits for blobs it holds in RAM to be written
+    /// to its disk when a caller asks for a durable answer that waits (`kbf-durable:
+    /// wait`): an action-cache entry is committed only once every blob it names is on
+    /// an owner's disk, and the writer of the entry asks each owner with this wait; the
+    /// action's owner waits the same for its own copies. A blob still in RAM when it ends
+    /// is reported missing and the write fails UNAVAILABLE, for the caller to try again.
+    /// Nothing holds a blob in RAM yet, so no call waits. At least 1, and under half of
+    /// the 120 seconds a chain's replica may take to commit a blob
+    /// (`kbf_storage::replicate::ChainConfig`): a start with more is refused.
+    #[arg(
+        long,
+        default_value_t = kbf_front::DEFAULT_DURABLE_WAIT.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub durable_wait: u64,
+    /// How long, in seconds, after its own write of a blob it acknowledged from RAM a
+    /// storage node waits before it asks the blob's other owner whether the blob is on its
+    /// disk too, and journals a repair debt if it is not. Long enough that the usual answer
+    /// is yes and nothing is journalled. Nothing acknowledges from RAM yet, so no node
+    /// asks. At least 1.
+    #[arg(
+        long,
+        default_value_t = kbf_storage::repair::RepairConfig::default().peer_grace.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub ram_peer_grace: u64,
+    /// How many bytes of blobs a storage node may hold in RAM, acknowledged to the writer
+    /// and not yet written to its disk. 0, the default, is off: a write is acknowledged
+    /// from disk, as before. Nothing acknowledges from RAM yet, so with any value no blob
+    /// is held and the node behaves as with 0. A blob that finds the budget full is
+    /// written through to the disk before it is acknowledged, never waited for. A node
+    /// that does hold blobs counts them in `kbf_storage_ram_unwritten_bytes`, writes them
+    /// to its disk in the background and, when it stops, within `--ram-drain-deadline`. A
+    /// node can hold this many bytes beside the `--write-bytes-in-flight` it receives.
+    /// Storage nodes only: a server with no replica to hold a second copy holds nothing.
+    #[arg(long, default_value_t = 0)]
+    pub ram_ack_bytes: u64,
+    /// How long, in seconds, a storage node that is stopping waits, after its calls have
+    /// ended, for the blobs it holds in RAM to be written to its disk (`--ram-ack-bytes`)
+    /// and then for the blocks staged on its hot store to be flushed to the cold store: one
+    /// bound for both. The blobs left in RAM when it ends are lost to the stop; the blocks
+    /// left on the hot store are on its disk, flushed by the next start. Both are counted
+    /// in the log. At least 1.
+    #[arg(
+        long,
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub ram_drain_deadline: u64,
     /// How many times a segment PUT is tried. Only a PUT that did not complete
     /// (connect, reset, timeout) or that the store answered 5xx is tried again, after
     /// 100 ms and then four times longer each time, under a new object key; if every
@@ -450,12 +522,15 @@ pub struct Args {
     #[arg(long, default_value_t = kbf_front::InputTreeConfig::DEFAULT.reads_in_flight)]
     pub input_tree_reads_in_flight: NonZeroUsize,
     /// Where the scheduler keeps its state, written before each change is acknowledged and
-    /// replayed at start: `sqlite:///absolute/path`, a file on a local disk that this
-    /// process owns. Every start is a new epoch, so daemons kill the runs of the leases
-    /// they held before. The file is created, with its directory, if missing (0600, and
-    /// 0700 for a directory it makes) and held by one process: a second frontend on it
-    /// refuses to start. Any other value, `postgres://` included, is refused (Postgres is
-    /// not wired yet). Left out, the scheduler's state is in memory and a restart loses it
+    /// replayed at start: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a
+    /// local Unix socket, reached as this process's own user (peer authentication; a URL
+    /// with a password is refused, as the command line is world-readable). The server must
+    /// flush commits before it acknowledges them (`synchronous_commit` on) or the start is
+    /// refused; the tables are created if missing. Or `sqlite:///absolute/path`, a file on
+    /// a local disk that this process owns (created, with its directory, if missing: 0600,
+    /// and 0700 for a directory it makes; a second frontend on it refuses to start). Every
+    /// start is a new epoch, so daemons kill the runs of the leases they held before. Left
+    /// out, the scheduler's state is in memory and a restart loses it
     // Listed beside `--meta-dir`, whose place in the help it takes without moving the
     // flags declared after it.
     #[arg(
@@ -482,6 +557,28 @@ pub struct Args {
     /// Build history: `--history-objects` and `--history-index-root`.
     #[command(flatten)]
     pub history: crate::history::HistoryFlags,
+    /// The release poller: `--release-poll-every-secs`, `--release-poll-repo` and
+    /// `--release-poll-refs`.
+    #[command(flatten)]
+    pub release_poll: crate::release::poll::PollFlags,
+    /// Serves the web UI on the operator API (`--api-listen`): read-only pages under `/ui`
+    /// (`docs/design/kbf-ui-v1.md`). On by default; `--ui=false` turns it off, and `/ui` is
+    /// then a `404`. The UI is open: it asks for no login or certificate, and it shows
+    /// everything unredacted, the logs of builds and the arguments of failed commands, to
+    /// whoever reaches the operator API's port, whatever the REAPI policy says of
+    /// `--invocations-open`. Only `GET` and `HEAD` are served; the operator API's write
+    /// routes and their token are unchanged. Keep the operator API on loopback, or behind
+    /// the proxy and a network you trust
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        value_name = "BOOL"
+    )]
+    pub ui: bool,
 }
 
 /// This server in the tier registry. A farm runs one server today
@@ -516,6 +613,15 @@ pub enum ConfigError {
     /// The operator API token file is refused.
     #[error("--api-token-file: {0}")]
     ApiToken(#[from] TokenFileError),
+    /// The proxy's secret file is refused.
+    #[error("--proxy-auth-file: {0}")]
+    ProxyAuth(#[from] ProxySecretError),
+    /// `--worker-deny-list` with neither mutual TLS nor a proxy: nothing would read it.
+    #[error(
+        "--worker-deny-list needs mutual TLS (--worker-tls-cert, --worker-tls-key, \
+         --worker-client-ca) or --proxy-auth-file"
+    )]
+    DenyListWithoutIdentity,
     /// The release store's directory cannot be made.
     #[error("--releases-dir {dir}: {source}", dir = dir.display())]
     Releases {
@@ -543,6 +649,12 @@ pub enum ConfigError {
          a segment upload holds its ranges in memory under that bound"
     )]
     SegmentUploadOverWriteBound { cap: u64, bound: u64 },
+    /// A write that waits for blobs to be written could outlast the chain's commit bound.
+    #[error(
+        "--durable-wait {wait} is not under half of the {bound} seconds a chain's replica \
+         may take to commit a blob: a write that waited that long would be judged lost"
+    )]
+    DurableWaitOverCommitBound { wait: u64, bound: u64 },
     /// `kbf storage` would serve plain text off loopback, admitting every caller.
     #[error(
         "--storage-listen {addr} is not a loopback address and the node has no TLS, so it \
@@ -591,14 +703,56 @@ impl Args {
         .resolve(space)
     }
 
+    /// The proxy in front of every listener, if `--proxy-auth-file` names its secret
+    /// ([`Behind`]; `None`: the server is reached directly).
+    ///
+    /// # Errors
+    /// The secret file or the `--worker-deny-list` file cannot be read, or the secret is
+    /// not one the proxy can present ([`ProxySecret::from_file`]). A deny list that cannot be
+    /// read or parsed, at open or at the recount for the warning, stops the start (it is
+    /// never ignored); the error names the flag's path and line, never the secret.
+    pub fn proxy(&self) -> Result<Option<Behind>, ConfigError> {
+        let Some(path) = self.proxy_auth_file.as_deref() else {
+            return Ok(None);
+        };
+        let secret = ProxySecret::from_file(path)?;
+        let deny_list = self
+            .worker_deny_list
+            .as_deref()
+            .map(DenyList::open)
+            .transpose()?;
+        if let Some(list) = &deny_list {
+            let inert = list.certificate_entries()?;
+            if inert > 0 {
+                tracing::warn!(
+                    entries = inert,
+                    "--worker-deny-list has serial or spki-sha256 entries, which never match \
+                     a call behind --proxy-auth-file (the proxy forwards a node id, not a \
+                     certificate): only node entries take effect"
+                );
+            }
+        }
+        Ok(Some(Behind {
+            secret: Arc::new(secret),
+            deny_list,
+        }))
+    }
+
     /// The listeners these flags describe.
     ///
     /// # Errors
     /// A TLS file cannot be read; `--segment-upload-max-bytes` is over
-    /// `--write-bytes-in-flight`; `--memory-ladder-gib` is not a ladder.
+    /// `--write-bytes-in-flight`; `--durable-wait` is not under half the chain's commit
+    /// bound; `--memory-ladder-gib` is not a ladder.
     pub fn listeners(&self) -> Result<Listeners, ConfigError> {
         self.segment_upload_fits_write_bound()?;
+        self.durable_wait_fits_commit_bound()?;
         let reload = Duration::from_secs(self.tls_reload_interval_secs);
+        let deny_list = self
+            .worker_deny_list
+            .as_deref()
+            .map(DenyList::open)
+            .transpose()?;
         let worker_tls = match (
             &self.worker_tls_cert,
             &self.worker_tls_key,
@@ -614,14 +768,13 @@ impl Args {
                     },
                     reload,
                 )?,
-                deny_list: self
-                    .worker_deny_list
-                    .as_deref()
-                    .map(DenyList::open)
-                    .transpose()?,
+                deny_list: deny_list.clone(),
             }),
             _ => None,
         };
+        if deny_list.is_some() && worker_tls.is_none() && self.proxy_auth_file.is_none() {
+            return Err(ConfigError::DenyListWithoutIdentity);
+        }
         let reapi_tls = match (&self.reapi_tls_cert, &self.reapi_tls_key) {
             (Some(cert), Some(key)) => Some(TlsSource::files(
                 "reapi",
@@ -643,6 +796,7 @@ impl Args {
             hello_wait: Duration::from_secs(10),
             tick: Duration::from_secs(1),
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
+            default_platform: self.default_platform,
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: match self.shutdown_timeout_secs {
@@ -781,6 +935,7 @@ impl Args {
             token,
             local_cache,
             releases,
+            poll: self.release_poll.config(),
         }))
     }
 
@@ -822,6 +977,50 @@ impl Args {
         }
     }
 
+    /// How long a caller that needs held blobs written waits for them: `--durable-wait`.
+    #[must_use]
+    pub const fn durable_wait(&self) -> Duration {
+        Duration::from_secs(self.durable_wait)
+    }
+
+    /// How much a node may hold in RAM acknowledged and not yet on its disk:
+    /// `--ram-ack-bytes`.
+    #[must_use]
+    pub const fn ram_ack_bytes(&self) -> u64 {
+        self.ram_ack_bytes
+    }
+
+    /// How long a stopping node waits to write what it holds in RAM and to flush what is
+    /// staged on its hot store: `--ram-drain-deadline`.
+    #[must_use]
+    pub const fn ram_drain_deadline(&self) -> Duration {
+        Duration::from_secs(self.ram_drain_deadline)
+    }
+
+    /// How a node's repair worker and peer confirmer are paced: the defaults of
+    /// [`kbf_storage::repair::RepairConfig`] and `--ram-peer-grace`.
+    #[must_use]
+    pub fn repair_config(&self) -> kbf_storage::repair::RepairConfig {
+        kbf_storage::repair::RepairConfig {
+            peer_grace: Duration::from_secs(self.ram_peer_grace),
+            ..kbf_storage::repair::RepairConfig::default()
+        }
+    }
+
+    /// Refuses a `--durable-wait` of half the chain's commit bound or more: a replica
+    /// that waited that long for a blob to be written would be judged lost by its primary.
+    /// A function of its own, as [`Args::segment_upload_fits_write_bound`] is.
+    pub(crate) fn durable_wait_fits_commit_bound(&self) -> Result<(), ConfigError> {
+        let bound = kbf_storage::replicate::ChainConfig::default().commit;
+        if self.durable_wait() * 2 >= bound {
+            return Err(ConfigError::DurableWaitOverCommitBound {
+                wait: self.durable_wait,
+                bound: bound.as_secs(),
+            });
+        }
+        Ok(())
+    }
+
     /// The width of the CPU-bound pool on this machine: `--cpu-threads`, else one
     /// thread per CPU the process may use (`kbf_threads`).
     #[must_use]
@@ -844,6 +1043,18 @@ impl Args {
 pub fn s3_store(uri: &S3Uri, env: impl Fn(&str) -> Option<String>) -> Result<S3Store, ConfigError> {
     let need = |name: &'static str| env(name).ok_or(ConfigError::MissingEnv(name));
     let credentials = Credentials::new(need("AWS_ACCESS_KEY_ID")?, need("AWS_SECRET_ACCESS_KEY")?);
+    Ok(S3Store::new(s3_config(uri, credentials))?)
+}
+
+/// The store `uri` names, signed with `credentials` that did not come from the
+/// environment (the key pair a frontend registered).
+///
+/// # Errors
+/// The configuration is refused.
+pub(crate) fn s3_store_keyed(
+    uri: &S3Uri,
+    credentials: Credentials,
+) -> Result<S3Store, ConfigError> {
     Ok(S3Store::new(s3_config(uri, credentials))?)
 }
 

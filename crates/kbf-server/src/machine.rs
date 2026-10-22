@@ -29,6 +29,7 @@ use kbf_types::{ActionKey, Digest, LeaseId, LeaseKind, OperationId, WaiterId, Wo
 use crate::action_usage::Subject;
 use crate::fleet::SoftwareView;
 use crate::stamp::Stamp;
+use crate::update_status::UpdateReport;
 
 /// The REAPI name of the operation `waiter` waits on, in the process of `term`:
 /// `operations/{term}-{waiter}`.
@@ -72,6 +73,39 @@ pub struct Waiter {
     /// What the server's `action usage:` line says the action is; the first caller's
     /// names the operation.
     pub usage: Subject,
+    /// The OS family and ISA the action asked for, for the lease lines.
+    pub platform: Platform,
+}
+
+/// The operating system and architecture an action asked for, as kbf parsed them from
+/// its platform (`kbf_caps::Request::from_platform`), for the `lease granted` line. A
+/// part the action names none of is `-`. Only parsed values are kept, so a platform
+/// property's raw text never reaches the log.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Platform {
+    /// `linux` or `macos` (a daemon runs on no other); `-` for none, and for a value
+    /// that is neither.
+    pub os_family: &'static str,
+    /// The architecture's report name (`x86_64`, `arm64`); `-` for none.
+    pub isa: String,
+}
+
+impl Platform {
+    /// What `needs` asks for.
+    #[must_use]
+    pub fn of(needs: &kbf_caps::Request) -> Self {
+        let os_family = needs
+            .exact("os")
+            .and_then(|os| kbf_caps::DAEMON_OSES.iter().find(|known| **known == os))
+            .copied()
+            .unwrap_or("-");
+        let isa = needs
+            .properties()
+            .into_iter()
+            .find_map(|(key, value)| (key == "arch").then_some(value))
+            .unwrap_or_else(|| "-".to_owned());
+        Self { os_family, isa }
+    }
 }
 
 /// A lease whose `Start` was sent.
@@ -91,6 +125,11 @@ pub struct Node {
     pub connected: bool,
     /// The newest `NodeStatus` it sent, on any of its streams; `None` before the first.
     pub status: Option<SoftwareView>,
+    /// The newest `UpdateStatus` it sent, on any of its streams; `None` before the first.
+    pub update: Option<UpdateReport>,
+    /// Whether `update` came on the node's newest stream: a stream that registers
+    /// clears it until that stream sends its own.
+    pub update_live: bool,
 }
 
 /// The waiter records, the started table and the node registry of one farm (see the
@@ -182,8 +221,11 @@ impl FarmMachine {
         let node = self.nodes.entry(worker.clone()).or_insert(Node {
             connected: true,
             status: None,
+            update: None,
+            update_live: false,
         });
         node.connected = true;
+        node.update_live = false;
     }
 
     /// Records that the newest stream of `worker` has closed. The node stays listed.
@@ -197,6 +239,15 @@ impl FarmMachine {
     pub fn report_status(&mut self, worker: &WorkerId, status: SoftwareView) {
         if let Some(node) = self.nodes.get_mut(worker) {
             node.status = Some(status);
+        }
+    }
+
+    /// Keeps `report` as the newest update status of `worker`, from its newest stream, if
+    /// it has registered.
+    pub fn report_update(&mut self, worker: &WorkerId, report: UpdateReport) {
+        if let Some(node) = self.nodes.get_mut(worker) {
+            node.update = Some(report);
+            node.update_live = true;
         }
     }
 
@@ -263,6 +314,24 @@ mod tests {
         }
     }
 
+    /// Catches: a platform line that logs the request's raw text (an `os` that is not
+    /// one a daemon runs on is `-`), or a part the request does not name that is not `-`.
+    #[test]
+    fn a_platform_is_the_parsed_os_family_and_isa_or_dashes() {
+        let of = |properties: &[(&str, &str)]| {
+            let request = kbf_caps::Request::parse(properties.iter().copied()).expect("parses");
+            let platform = Platform::of(&request);
+            (platform.os_family, platform.isa)
+        };
+        assert_eq!(of(&[]), ("-", "-".to_owned()));
+        assert_eq!(
+            of(&[("os", "macos"), ("arch", "arm64")]),
+            ("macos", "arm64".to_owned())
+        );
+        assert_eq!(of(&[("os", "linux")]), ("linux", "-".to_owned()));
+        assert_eq!(of(&[("os", "x\nINFO forged")]), ("-", "-".to_owned()));
+    }
+
     fn waiter(n: u8) -> Waiter {
         Waiter {
             key: ActionKey {
@@ -277,6 +346,7 @@ mod tests {
             do_not_cache: n.is_multiple_of(5),
             queued: at(u64::from(n)),
             usage: Subject::of(kbf_front::Described::default()).0,
+            platform: Platform::of(&kbf_caps::Request::default()),
         }
     }
 
@@ -298,6 +368,23 @@ mod tests {
         }
     }
 
+    fn update(n: u8) -> UpdateReport {
+        UpdateReport {
+            state: "idle",
+            running_commit: format!("{n:012x}"),
+            installed_commit: String::new(),
+            staged_commit: String::new(),
+            refusal: String::new(),
+            offered_generation: u64::from(n),
+            helper_present: false,
+            acked_order_id: 0,
+            kind: kbf_proto::update::update_status::State::Idle,
+            available: None,
+            release_source: crate::update_status::ReleaseSource::Unreported,
+            received_at_unix_ms: u64::from(n),
+        }
+    }
+
     fn sent(operation: u64, n: u8) -> Sent {
         Sent {
             operation: OperationId(operation),
@@ -313,13 +400,14 @@ mod tests {
     /// is drawn from `rng` too, so a seed names exactly one call sequence.
     fn step(machine: &mut FarmMachine, rng: &mut SimRng) {
         let small = |rng: &mut SimRng| u8::try_from(rng.below(32)).unwrap_or_default();
-        match rng.below(8) {
+        match rng.below(9) {
             0 | 1 => {
                 machine.submit(waiter(small(rng)));
             }
             5 => machine.register(&node(rng.below(32))),
             6 => machine.disconnect(&node(rng.below(32))),
             7 => machine.report_status(&node(rng.below(32)), status(small(rng))),
+            8 => machine.report_update(&node(rng.below(32)), update(small(rng))),
             2 => {
                 let lease = LeaseId::new(rng.between(1, 3), rng.below(64));
                 machine.start(lease, sent(rng.below(8), small(rng)));
@@ -387,9 +475,10 @@ mod tests {
         base.start(LeaseId::new(1, 7), sent(4, 9));
         base.register(&node(1));
         base.report_status(&node(1), status(1));
+        base.report_update(&node(1), update(1));
         let lease = LeaseId::new(1, 7);
         type Change = fn(&mut FarmMachine);
-        let changes: [(&str, Change); 18] = [
+        let changes: [(&str, Change); 20] = [
             ("term", |m| m.term += 1),
             ("next_waiter", |m| m.next_waiter += 1),
             ("waiters: one more", |m| {
@@ -441,6 +530,8 @@ mod tests {
             ("nodes: one more", |m| m.register(&node(2))),
             ("node.connected", |m| m.disconnect(&node(1))),
             ("node.status", |m| m.report_status(&node(1), status(2))),
+            ("node.update", |m| m.report_update(&node(1), update(2))),
+            ("node.update_live", |m| m.register(&node(1))),
         ];
         for (field, change) in changes {
             let mut changed = base.clone();
@@ -451,8 +542,10 @@ mod tests {
     }
 
     /// Catches a registry that forgets a node whose stream closed (#235: it stays
-    /// listed, not connected), one that drops a node's status when it registers again
-    /// (the status is kept across streams), one whose registering again leaves it
+    /// listed, not connected), one that drops a node's status or update report when it
+    /// registers again (both are kept across streams), one that leaves the report live
+    /// for a stream that has sent none (a host that restarted onto another release
+    /// would be judged by its previous process), one whose registering again leaves it
     /// not connected, and one that lists a node that never registered because a
     /// status or a closed stream named it.
     #[test]
@@ -460,20 +553,27 @@ mod tests {
         let mut m = FarmMachine::new(TERM);
         m.disconnect(&node(1));
         m.report_status(&node(1), status(1));
+        m.report_update(&node(1), update(1));
         assert_eq!(m.node(&node(1)), None);
         assert_eq!(m.nodes().count(), 0);
         m.register(&node(1));
         m.report_status(&node(1), status(1));
+        m.report_update(&node(1), update(1));
         m.disconnect(&node(1));
         let left = Node {
             connected: false,
             status: Some(status(1)),
+            update: Some(update(1)),
+            update_live: true,
         };
         assert_eq!(m.node(&node(1)), Some(&left));
         m.register(&node(1));
+        // The report is kept, but no longer live: the new stream has not sent its own.
         let back = Node {
             connected: true,
             status: Some(status(1)),
+            update: Some(update(1)),
+            update_live: false,
         };
         assert_eq!(m.node(&node(1)), Some(&back));
         assert_eq!(m.nodes().collect::<Vec<_>>(), vec![&node(1)]);

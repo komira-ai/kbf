@@ -394,7 +394,7 @@ fn a_reported_failure_fails_the_operation() {
 /// Catches: placement that checks CPU but not memory (or the reverse), bookings that
 /// are not added up, and a worker silent for G still offered new work.
 #[test]
-fn first_fit_books_cpu_and_memory_on_live_workers() {
+fn placement_books_cpu_and_memory_on_live_workers() {
     let mut h = Harness::new();
     // `a` has CPU to spare but too little memory; `b` has both.
     h.worker("a", 16_000, GIB / 2);

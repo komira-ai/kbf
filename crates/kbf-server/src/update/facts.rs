@@ -19,12 +19,14 @@ use std::time::Duration;
 
 use kbf_map::{MemberId, MemberState};
 use kbf_types::{FarmTime, WorkerId};
+use serde::{Deserialize, Serialize};
 
 use super::command::Command;
 use super::gate::{GateFail, GateMode, storage_gate};
 use super::node_step::HostPhase;
 use super::policy::Policy;
 use super::slot::{Slot, SlotClass};
+use crate::update_status::ReleaseSource;
 
 /// A release, by whatever the controller compares: a commit or a software-set digest.
 /// Only equality is defined, so a rollback is another target and never "an older one".
@@ -43,6 +45,19 @@ impl Release {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Where the release of a run comes from. The same two words as `kbf_update::Source`, which
+/// this crate's library does not depend on. The default is [`Source::Fetch`], what every run
+/// has meant so far, so a row that names no source is a fetch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    /// The hosts pull the release from the source their installer is configured with.
+    #[default]
+    Fetch,
+    /// The hosts use the release their installer's package carries.
+    Staged,
 }
 
 /// The generation of a run (`update/desired`): it grows with every change of the desired
@@ -95,6 +110,12 @@ impl PlatformClass {
     #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
+    }
+
+    /// Its name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -156,7 +177,9 @@ pub enum HelperStatus {
     Confirmed,
     /// `REVERTED`: the helper put the previous release back (it did so itself).
     Reverted,
-    /// `REFUSED`: a revert that could not run, because the previous release is missing.
+    /// `REFUSED`: the helper refused the order. At step 6 that is the activate order itself,
+    /// before any flip. At steps 7 to 9 it is a revert that could not run, because the
+    /// previous release is missing.
     Refused,
 }
 
@@ -284,6 +307,16 @@ impl MemberFacts {
     }
 }
 
+/// A release the host's package carries, which its installer has found whole.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AvailableFact {
+    /// The release: a full commit (40 lowercase hex digits), so it compares equal to a target
+    /// that is a full commit.
+    pub commit: Release,
+    /// The number of commits behind it: puts two builds of one branch in order.
+    pub seq: u64,
+}
+
 /// One host as the controller sees it now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostFacts {
@@ -299,6 +332,14 @@ pub struct HostFacts {
     pub member: Option<MemberId>,
     /// The release it runs, as it reported it; `None` if it has not.
     pub release: Option<Release>,
+    /// The release its package carries, when its installer has found it whole; `None` if it
+    /// reports none, if its installer predates the field, or if it reports a commit that is
+    /// not 40 lowercase hex digits.
+    pub available: Option<AvailableFact>,
+    /// Where its installer fetches releases from; [`ReleaseSource::Unreported`] if it does not
+    /// say or sent a number this build does not know (an installer that predates the field, or
+    /// no report at all).
+    pub release_source: ReleaseSource,
     /// Whether its daemon stream is open.
     pub connected: bool,
     /// Whether placement has it cordoned; `None` if unknown.
@@ -350,6 +391,19 @@ impl HostFacts {
         self.connected && self.release.as_ref() == Some(target)
     }
 
+    /// The release its package carries, if it reports one ([`HostFacts::available`]).
+    #[must_use]
+    pub fn packaged(&self) -> Option<&Release> {
+        self.available.as_ref().map(|have| &have.commit)
+    }
+
+    /// Whether its package carries `target`: the whole name of one equals the whole name of
+    /// the other, so a prefix of the commit is not the release.
+    #[must_use]
+    pub fn carries(&self, target: &Release) -> bool {
+        self.packaged() == Some(target)
+    }
+
     /// Whether it can take work now, as the capacity floor counts it: connected, placement
     /// shows it uncordoned (unknown is not), and its record says it is not in a step. The
     /// record counts as well as placement because placement lags a cordon that was ordered.
@@ -375,6 +429,10 @@ pub struct Facts {
     /// The release the run drives every host to. A rollback is the same run with the old
     /// release here: hosts are compared with `==`, never ordered.
     pub target: Release,
+    /// Where `target` comes from. The picker reads the source of `update/desired`; the node
+    /// step reads the source of the run that started the host ([`super::HostRow::source`]),
+    /// as it reads that run's commit for `target`, so a host keeps its run's source.
+    pub source: Source,
     /// The generation of the run (`update/desired`).
     pub generation: Generation,
     /// The id the next order will carry: greater than every id issued so far. The
@@ -395,6 +453,24 @@ pub struct Facts {
 }
 
 impl Facts {
+    /// The facts of no run: only the storage `members`, with no host and the defaults for
+    /// the rest. It is what the storage gate is asked over when no run is under way (the
+    /// operator API's safe-to-stop query), so that the API names none of the fields.
+    #[must_use]
+    pub fn of_members(members: Vec<MemberFacts>) -> Self {
+        Self {
+            target: Release::new(""),
+            source: Source::default(),
+            generation: Generation(0),
+            next_order: OrderId::new(0, 0),
+            hosts: Vec::new(),
+            members,
+            slot: Slot::default(),
+            queued_classes: None,
+            wait_since: FarmTime::from_millis(0),
+        }
+    }
+
     /// The host `id`, if the run has it.
     #[must_use]
     pub fn host(&self, id: &WorkerId) -> Option<&HostFacts> {

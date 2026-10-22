@@ -193,10 +193,12 @@ fn rows_a_full_backlog_refuses_come_back_too() {
 }
 
 #[test]
-fn a_restart_keeps_one_list_entry_at_the_first_seen_time() {
-    // Catches: a second list entry for an invocation continued after a restart (keyed
-    // by the new life's first record), which lists the build twice, and an instance
-    // joining later getting an entry at another time.
+fn a_restart_lists_the_build_once_at_the_first_seen_time() {
+    // Catches: an invocation continued after a restart (a second writer, with a header
+    // row of its own) listed twice, once per writer's entry, and the merged header
+    // naming a time that no entry has. Each writer puts the entries of its own header,
+    // keyed by its first record; the reader's header is the earliest of them, so the
+    // entry at that time is shown and the other is stale.
     let mut life = Life::fresh(Limits::default());
     let inv = InvRef::named("b1");
     life.run(&inv, T + 5_000, "main", RunOutcome::Ok);
@@ -211,12 +213,24 @@ fn a_restart_keeps_one_list_entry_at_the_first_seen_time() {
     assert_eq!(
         rows,
         [
+            format!("ui/inv/main/{:012x}/{}", T + 4_000, inv.key),
             format!("ui/inv/main/{:012x}/{}", T + 5_000, inv.key),
-            format!("ui/inv/other/{:012x}/{}", T + 5_000, inv.key),
-        ]
+            format!("ui/inv/other/{:012x}/{}", T + 4_000, inv.key),
+        ],
+        "one entry per writer and instance"
     );
-    let listed = page(&again.reader(), &ListQuery::new("other", 5), &all).0;
-    assert_eq!(listed, [inv.key]);
+    for instance in ["main", "other"] {
+        let listed = page(&again.reader(), &ListQuery::new(instance, 5), &all).0;
+        assert_eq!(
+            listed,
+            std::slice::from_ref(&inv.key),
+            "{instance}: listed once"
+        );
+    }
+    let got = crate::support::whole(&again.reader(), &inv.key, &all)
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.header.list_ms, T + 4_000);
 }
 
 #[test]

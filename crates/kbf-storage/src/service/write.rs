@@ -13,8 +13,9 @@ use kbf_types::Digest;
 use tonic::Status;
 
 use super::{STREAM_FROM_BYTES, StorageService};
+use crate::in_flight;
 use crate::replicate::{Plan, ReplicaLeg, Staging, View};
-use crate::{PutStream, StorageError, StreamedPut};
+use crate::{CommitMode, PutStream, StorageError, StreamedPut};
 
 /// What a streamed write takes from [`super::Config::write_bytes_in_flight`]: room for the
 /// few chunks it holds (the writer's queue, the replica's, and the one in hand), not for
@@ -57,6 +58,7 @@ impl StorageService {
         unowned: bool,
         mut messages: Messages,
     ) -> Result<u64, Status> {
+        let _open = self.open_writes.begin();
         let view = self.view(requested).await?;
         let first = next_or(&mut messages, "write stream sent no message").await?;
         let digest = super::wire::write_resource(&first.resource_name)?;
@@ -67,7 +69,17 @@ impl StorageService {
             Err(StorageError::Invalid(_)) if unowned => (Plan::Local, None),
             planned => (planned?, view),
         };
-        if self.storage.find_missing(&[digest]).await?.is_empty() {
+        // A blob this node already holds is acknowledged at once. A copy a peer sends (a
+        // chain's leg, the repair worker's) is a request for a durable copy, so a blob held
+        // only in RAM does not answer it: it is written (rule 2,
+        // `docs/design/storage-ram-ack.md`). A client's write is answered by what can be
+        // served.
+        let held = if leg_from.is_some() {
+            self.storage.find_durable(&[digest]).await?
+        } else {
+            self.storage.find_missing(&[digest]).await?
+        };
+        if held.is_empty() {
             return Ok(size);
         }
         self.write_blob(digest, first, messages, view.as_ref(), leg_from, plan)
@@ -136,7 +148,7 @@ impl StorageService {
                 owing = Some(chain.degrade(view, replica, &digest, &why).await?);
             }
         }
-        let committed = staged.commit().await;
+        let committed = staged.commit(CommitMode::Durable).await;
         drop(owing);
         committed?;
         Ok(())
@@ -181,7 +193,9 @@ impl StorageService {
             stored?;
             return Ok(());
         }
-        let mut received = Vec::with_capacity(usize::try_from(size).unwrap_or_default());
+        let capacity = usize::try_from(size).unwrap_or_default();
+        let held = in_flight::hold(capacity as u64);
+        let mut received = Vec::with_capacity(capacity);
         let mut message = first;
         loop {
             if (received.len() + message.data.len()) as u64 > size {
@@ -193,7 +207,10 @@ impl StorageService {
             }
             message = next(&mut rest).await?;
         }
-        let stored = self.storage.put(received.into()).await?;
+        let stored = self
+            .storage
+            .put(in_flight::counted_with(received, held))
+            .await?;
         if stored != digest {
             return Err(StorageError::DigestMismatch {
                 claimed: digest,
@@ -247,9 +264,12 @@ async fn receive(
             return Err(more_than(&digest));
         }
         let finish = message.finish_write;
-        let data = Bytes::from(std::mem::take(&mut message.data));
+        // Counted (`kbf_bytes_in_flight`) until the staging and the replica are done with it.
+        let data = in_flight::counted(std::mem::take(&mut message.data));
         staging.push(data.clone()).await?;
         if let Some(leg) = &mut leg {
+            // The copy sent on is a buffer of its own.
+            let _copy = in_flight::hold(data.len() as u64);
             leg.send(WriteRequest {
                 data: data.to_vec(),
                 ..message
@@ -342,7 +362,7 @@ impl Incoming {
                 }
             }
             if !message.data.is_empty() {
-                return Some((Ok(Bytes::from(message.data)), self));
+                return Some((Ok(in_flight::counted(message.data)), self));
             }
         }
     }

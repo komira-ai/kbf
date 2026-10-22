@@ -47,14 +47,27 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self,
         digests: &[Digest],
     ) -> Result<BTreeMap<Digest, Result<Bytes, CacheError>>, CacheError> {
+        // Held first, then the index for the rest (`held` module docs). A held blob is
+        // read from RAM, whole and hashed as any read is.
+        // One look at the set gives both parts, so a blob the drain moves cannot fall
+        // between them.
+        let (held, unheld) = self.held.split(digests);
+        self.between_steps().await;
         let answers = self
             .touched(|s| {
                 let answers: BTreeMap<Digest, BlobAnswer> =
-                    digests.iter().map(|d| (*d, s.blob(d))).collect();
-                (answers, s.touch_for(digests))
+                    unheld.iter().map(|d| (*d, s.blob(d))).collect();
+                (answers, s.touch_for(&*unheld))
             })
             .await?;
         let mut out = BTreeMap::new();
+        for (digest, bytes) in held {
+            let read = self
+                .held_read(&digest, bytes, 0, digest.size_bytes)
+                .gather()
+                .await;
+            out.insert(digest, read);
+        }
         let mut held: BTreeMap<(StoreId, ObjectId), BTreeMap<u64, Digest>> = BTreeMap::new();
         let mut staged = Vec::new();
         for (digest, answer) in answers {
@@ -126,7 +139,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let key = self.object_key(run.object).ok()?;
         let range = ByteRange::new(run.start, run.end - run.start)?;
         match self.writer.get_range(&key, range).await {
-            Ok(bytes) => Some(bytes),
+            // Counted (`kbf_bytes_in_flight`) until the last blob sliced from it is
+            // dropped: the run (up to `MAX_BATCH_TOTAL_BYTES`) is alive as long as any
+            // slice is.
+            Ok(bytes) => Some(kbf_storage::in_flight::counted(bytes)),
             Err(error) => {
                 let blobs = run.blobs.len();
                 tracing::debug!(%key, %error, blobs, "joined read failed; reading each alone");

@@ -637,7 +637,9 @@ async fn a_commit_with_closure_follows_the_stale_map_rule() {
         .await
         .expect("committed after one refetch");
     assert_eq!(cell.fetched(), [2]);
-    assert_eq!(cluster.dialled(), [(1, 1), (1, 2)]);
+    // The stale call at generation 1, then at generation 2 the commit's own node and the
+    // owner the durable barrier asks about the entry's blobs.
+    assert_eq!(cluster.dialled(), [(1, 1), (1, 2), (1, 2)]);
 
     let three = map(3, 1, active(&[1]));
     cell.answer_fetch(Ok(view(&three)));

@@ -4,100 +4,9 @@
 //! `kbf-server`'s `tests/frontend_drain.rs`, which runs the client against the real
 //! operator API.
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener};
-use std::process::Command;
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+mod cluster_support;
 
-const BIN: &str = env!("CARGO_BIN_EXE_kbf");
-
-/// How long a test waits for the binary to call the server: a hang deadline.
-const HANG: Duration = Duration::from_secs(20);
-
-/// Answers one request with `status` and `body`; the thread returns the request as it
-/// was sent (head and body).
-fn serve_once(status: &'static str, body: &'static str) -> (SocketAddr, JoinHandle<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.set_nonblocking(true).expect("non-blocking");
-    let addr = listener.local_addr().expect("addr");
-    let thread = std::thread::spawn(move || {
-        let deadline = Instant::now() + HANG;
-        let mut stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(_) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(e) => panic!("kbf never called the server: {e}"),
-            }
-        };
-        stream.set_nonblocking(false).expect("blocking");
-        stream.set_read_timeout(Some(HANG)).expect("timeout");
-        let mut request = Vec::new();
-        let mut buf = [0u8; 4096];
-        let wanted = loop {
-            let n = stream.read(&mut buf).expect("read the request");
-            request.extend_from_slice(&buf[..n]);
-            let text = String::from_utf8_lossy(&request);
-            if let Some((head, rest)) = text.split_once("\r\n\r\n") {
-                let length = head
-                    .lines()
-                    .find_map(|l| {
-                        l.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .map(|v| v.trim().parse::<usize>().expect("a length"))
-                    })
-                    .unwrap_or(0);
-                if rest.len() >= length {
-                    break request.len();
-                }
-            }
-            assert!(n > 0, "the request ended early");
-        };
-        assert_eq!(wanted, request.len());
-        let reply = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(reply.as_bytes()).expect("reply");
-        String::from_utf8(request).expect("UTF-8")
-    });
-    (addr, thread)
-}
-
-fn kbf(args: &[&str]) -> (Option<i32>, String, String) {
-    let out = Command::new(BIN).args(args).output().expect("run kbf");
-    (
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
-}
-
-/// A token file holding `token` (the client does not check its mode).
-fn token_file(name: &str, token: &str) -> String {
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("kbf-cluster");
-    std::fs::create_dir_all(&dir).expect("a directory");
-    let path = dir.join(format!("{name}-{}", std::process::id()));
-    std::fs::write(&path, format!("{token}\n")).expect("write");
-    path.display().to_string()
-}
-
-/// Runs `kbf cluster --api <server> <args>` against a server answering `status` and
-/// `body`; the exit status, stdout, stderr and the request the server saw.
-fn cluster(
-    status: &'static str,
-    body: &'static str,
-    args: &[&str],
-) -> (Option<i32>, String, String, String) {
-    let (addr, request) = serve_once(status, body);
-    let api = addr.to_string();
-    let mut argv = vec!["cluster", "--api", &api];
-    argv.extend_from_slice(args);
-    let (code, out, err) = kbf(&argv);
-    (code, out, err, request.join().expect("the server thread"))
-}
+use cluster_support::{cluster, kbf, token_file};
 
 /// Catches each verb sending the wrong call: the method, the path (the node id
 /// percent-encoded as one segment), the `Authorization` header of the token file on a
@@ -107,7 +16,7 @@ fn cluster(
 fn each_verb_sends_its_call_and_prints_the_answer() {
     let token = token_file("each", "kbf-test-token-0123456789abcdef0123456789");
     let bearer = "authorization: bearer kbf-test-token-0123456789abcdef0123456789";
-    let cases: [(&[&str], &str, &str); 7] = [
+    let cases: [(&[&str], &str, &str); 9] = [
         (&["status"], "GET /v1/nodes HTTP/1.1", ""),
         (
             &["status", "--frontend"],
@@ -146,6 +55,32 @@ fn each_verb_sends_its_call_and_prints_the_answer() {
             "POST /v1/members/7 HTTP/1.1",
             r#"{"state":"draining"}"#,
         ),
+        (
+            &[
+                "member",
+                "7",
+                "--state",
+                "planned-down",
+                "--token-file",
+                &token,
+            ],
+            "POST /v1/members/7 HTTP/1.1",
+            r#"{"state":"planned_down"}"#,
+        ),
+        (
+            &[
+                "member",
+                "7",
+                "--state",
+                "planned-down",
+                "--for-secs",
+                "600",
+                "--token-file",
+                &token,
+            ],
+            "POST /v1/members/7 HTTP/1.1",
+            r#"{"for_secs":600,"state":"planned_down"}"#,
+        ),
     ];
     for (args, line, body) in cases {
         let (code, out, err, request) = cluster("200 OK", r#"{"answer":1}"#, args);
@@ -176,6 +111,60 @@ fn each_verb_sends_its_call_and_prints_the_answer() {
     }
 }
 
+/// Catches: `safe-to-stop` sending the wrong call (a `GET` of the member's path with the id
+/// percent-encoded as one segment, behind the token and the JSON content type), and an exit
+/// status that does not follow the verdict: 0 and "safe to stop" when it is safe, 3 and the
+/// reasons on stdout when it is not (never 0, which would stop the host; never 1, which a
+/// script reads as a failed call), nothing on stderr for either. Mutants it catches: the
+/// exit status inverted; the reasons not printed.
+#[test]
+fn safe_to_stop_exits_0_when_safe_and_3_when_not() {
+    let token = token_file("stop", "kbf-test-token-0123456789abcdef0123456789");
+    let args: &[&str] = &["safe-to-stop", "7", "--token-file", &token];
+    let safe = r#"{"safe":true,"reasons":[],"planned_down":false}"#;
+    let (code, out, err, request) = cluster("200 OK", safe, args);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(out, "safe to stop 7\n");
+    assert!(err.is_empty(), "{err}");
+    let head = "GET /v1/members/7/safe-to-stop HTTP/1.1\r\n";
+    assert!(request.starts_with(head), "{request}");
+    let lower = request.to_ascii_lowercase();
+    assert!(lower.contains("authorization: bearer kbf-test-token-"));
+    assert!(lower.contains("content-type: application/json"));
+
+    let owing = r#"{"safe":false,"reasons":["member m2 owes 5 blobs"],"planned_down":false}"#;
+    let (code, out, err, _) = cluster("200 OK", owing, args);
+    assert_eq!(code, Some(3), "{err}");
+    assert_eq!(out, "not safe to stop 7\n- member m2 owes 5 blobs\n");
+    assert!(err.is_empty(), "{err}");
+
+    let odd: &[&str] = &["safe-to-stop", "rack 1/a", "--token-file", &token];
+    let (_, _, _, request) = cluster("200 OK", safe, odd);
+    let head = "GET /v1/members/rack%201%2Fa/safe-to-stop HTTP/1.1\r\n";
+    assert!(request.starts_with(head), "{request}");
+}
+
+/// Catches: `safe-to-stop` reading anything but a verdict as an answer: an id the server
+/// does not know (404) and a 2xx body that is no verdict (a proxy's page) both exit 1 with
+/// nothing on stdout and the reason on stderr, so a script that stops hosts on exit 0 and
+/// waits on exit 3 never mistakes either for a yes or a "not yet".
+#[test]
+fn safe_to_stop_without_a_verdict_exits_1_and_says_why() {
+    let token = token_file("nosay", "kbf-test-token-0123456789abcdef0123456789");
+    let args: &[&str] = &["safe-to-stop", "9", "--token-file", &token];
+    let missing = r#"{"error":"no member or node"}"#;
+    let (code, out, err, _) = cluster("404 Not Found", missing, args);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("404"), "{err}");
+    assert!(err.contains("no member or node"), "{err}");
+
+    let (code, out, err, _) = cluster("200 OK", r#"{"answer":1}"#, args);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("not a safe-to-stop verdict"), "{err}");
+}
+
 /// Catches a refused or failed call that exits 0 (a rollout would go on), and one that
 /// hides why: a 401 from the API exits 1 naming the status and the API's reason, and an
 /// address nothing listens on exits 1 naming the address.
@@ -194,10 +183,7 @@ fn a_refusal_or_no_answer_exits_1_and_says_why() {
         "{err}"
     );
 
-    let gone = {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        listener.local_addr().expect("addr").to_string()
-    };
+    let gone = kbf_testkit::port::dead_addr().to_string();
     let (code, out, err) = kbf(&["cluster", "--api", &gone, "status"]);
     assert_eq!(code, Some(1), "{err}");
     assert!(out.is_empty(), "{out}");
@@ -216,11 +202,13 @@ fn a_refusal_or_no_answer_exits_1_and_says_why() {
 
 /// Catches a command line that is accepted and means something else: `drain` with no
 /// target or with both, a deadline for the frontend (it has none), `undrain --frontend`
-/// (a frontend drain is not undone), a write with no token file, and an unknown verb,
-/// all exit 2 with clap's message, and `check-args` does not take `cluster` as a mode.
+/// (a frontend drain is not undone), a write with no token file, `safe-to-stop` with no id
+/// or no token file, and an unknown verb, all exit 2 with clap's message.
 #[test]
 fn a_command_line_that_names_no_single_call_exits_2() {
-    let rows: [&[&str]; 7] = [
+    let rows: [&[&str]; 9] = [
+        &["cluster", "safe-to-stop", "--token-file", "t"],
+        &["cluster", "safe-to-stop", "7"],
         &["cluster", "drain", "--token-file", "t"],
         &["cluster", "drain", "n1", "--frontend", "--token-file", "t"],
         &[
@@ -242,8 +230,6 @@ fn a_command_line_that_names_no_single_call_exits_2() {
         assert_eq!(code, Some(2), "{argv:?}: {err}");
         assert!(out.is_empty(), "{argv:?}: {out}");
     }
-    let (code, _, err) = kbf(&["check-args", "cluster", "status"]);
-    assert_eq!(code, Some(2), "{err}");
 }
 
 /// Catches `cluster` missing from `kbf --help` (nothing else would tell an operator it
@@ -252,5 +238,25 @@ fn a_command_line_that_names_no_single_call_exits_2() {
 fn help_names_cluster_after_the_modes() {
     let (code, out, err) = kbf(&["--help"]);
     assert_eq!(code, Some(0), "{err}");
-    assert!(out.contains("kbf cluster status|drain|undrain"), "{out}");
+    let verbs = "kbf cluster status|drain|undrain|member|safe-to-stop|denied|object-store";
+    assert!(out.contains(verbs), "{out}");
+}
+
+/// Catches the `kbf cluster --help` about line and the "Not a mode" hint naming fewer
+/// verbs than the command has: each verb group must be named in both.
+#[test]
+fn the_cluster_help_and_the_hint_name_every_verb_group() {
+    let (code, out, err) = kbf(&["cluster", "--help"]);
+    assert_eq!(code, Some(0), "{err}");
+    let about = out.lines().next().unwrap_or_default();
+    for word in ["member", "be stopped", "denied", "object store"] {
+        assert!(
+            about.contains(word),
+            "{word} missing from the about line: {out}"
+        );
+    }
+    let (_, top, _) = kbf(&["--help"]);
+    for word in ["member", "safe-to-stop", "denied", "object-store"] {
+        assert!(top.contains(word), "{word} missing from the hint: {top}");
+    }
 }

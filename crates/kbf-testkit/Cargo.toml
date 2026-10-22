@@ -21,7 +21,12 @@ test = false
 # (mkfifo, and signal to ignore one). `kbf-m2-act` still links statically.
 [dependencies]
 libc.workspace = true
-rustix = { workspace = true, features = ["process"] }
+rustix = { workspace = true, features = ["process", "net"] }
+# `switch`: the forwarder tokio runs on the caller's runtime.
+tokio = { workspace = true, features = ["io-util", "net", "rt"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
 
 [lints]
 workspace = true

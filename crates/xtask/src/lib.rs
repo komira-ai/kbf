@@ -4,8 +4,13 @@
 //! - `build-commit check <binary> <commit>`, `build-commit check-asset <tarball>
 //!   <commit>` and `build-commit stamps <commit>` ([`build_commit`]): kbf-server names the
 //!   commit it was built from, and `kbf` does in the tarball that ships.
+//! - `advisories --repo <owner>/<repo> [--commit <sha>]` ([`advisories`]): `cargo deny check
+//!   advisories`, kept in one GitHub issue (opened, updated, or commented on and closed when
+//!   none remain) instead of failing a pull request. Exit 0 whatever it found; 1 when
+//!   cargo-deny or `gh` failed. `advisories.yml` runs it daily and on every push to `main`.
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
-//!   row the working tree's budget file has and `<rev>`'s does not is refused. CI runs
+//!   row the working tree's budget file has and `<rev>`'s does not is refused, unless
+//!   git sees the row's path renamed from a path `<rev>` has a row for. CI runs
 //!   it on pull requests, with the base branch as `<rev>`.
 //! - `sign-darwin <binary> --minos <version> [--summary <file>]` and `darwin-asset
 //!   <tarball> <name>` ([`darwin`]): the macOS binary signed ad hoc with the hardened
@@ -17,9 +22,28 @@
 //! - `package --binary <path> --sbom <path> --platform <platform> --commit <sha> --out
 //!   <dir>` ([`package`]): one binary as a release asset, a tarball that is the same
 //!   bytes on every runner, and its SBOM, with their lines in `SHA256SUMS.<platform>`.
+//! - `installer-tarball --binary <path> --platform <platform> --commit <sha> --units
+//!   <dir> --trust <dir> --sysusers <file> --tmpfiles <file> --out <dir>`
+//!   ([`installer_tarball`]): the files the Debian package ships, at the same paths and
+//!   modes (one list, [`pkg_linux::files`]), in a tarball that is the same bytes on every
+//!   runner, for `packaging/install.sh`.
 //! - `pkg-config`, `pkg-build`, `pkg-install-test` ([`pkg_linux`], [`pkg_install`]): the
 //!   `kbf-installer` deb and rpm: the nfpm configuration from the inputs, the packages
 //!   built twice to prove the bytes, and an install, remove and purge in a container.
+//! - `pkg-trust` and `pkg-asset` ([`pkg_trust`], [`pkg_asset`]): the trust directory of the
+//!   package from the pinned `gh`, `gh`'s trusted root and the branch the package is
+//!   attested on, and the built deb as the release asset
+//!   `kbf-installer-<commit>-<platform>.deb`, refused unless it holds the binary of the
+//!   attested tarball and trusts the branch it is attested for.
+//! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf-installer` package
+//!   carries, in the one form a deb and an rpm put in the same order, and the most a package
+//!   that carries a kbf release may weigh. `pkg-config` and `pkg-asset` take them up with
+//!   the release.
+//! - `pkg-macos-asset` and `pkg-macos-install-test` ([`pkg_macos_asset`],
+//!   [`pkg_macos_install`]): the Mac `.pkg` as the release asset
+//!   `kbf-installer-<commit>-darwin-arm64.pkg`, refused unless it holds the attested
+//!   binary, the pinned `gh`, a trusted root and trusts the branch it is attested for; and
+//!   its install as root on a Mac, every file checked and nothing started.
 //! - `pkg build --binary <path> --launchd-plist <path> [--trust <path>]... --version <v>
 //!   --out <dir>` and `pkg cask` ([`pkg`]): kbf-installer for a Mac, a `.pkg` that is
 //!   the same bytes on every host and installs a root-owned tree and a LaunchDaemon that
@@ -32,26 +56,42 @@
 //!   attestations` and `release check` hold a directory to one bundle per tarball,
 //!   each that tarball's (its one subject is the tarball's digest); `verify-assets
 //!   attestations` also has `gh` verify each tarball against its bundle.
-//! - `release {locate,main-control,check,publish}` ([`release`]): a GitHub release of
+//! - `release {locate,main-control,check,verify,offer,notes,plan,identity,previous,fetch-previous,stage-offer,publish,bump-internal}` ([`release`]): a GitHub release of
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
+//! - `gamma {evidence,deploy,check-build,summary,sudoers-line,held-steps}` ([`gamma`]): the
+//!   steps of `gamma.yml`, which follows a cut release to the one gamma host: whether the
+//!   release run published, the deploy through `tailscale ssh` and `sudo` (refused unless the
+//!   commit is the highest release), the build of komira's main against the updated farm (with
+//!   the farm's cache; it must run nothing locally), the summary with no node or host in it,
+//!   the sudoers line, and the settings a person makes once (printed, never applied).
+//! - `release version-facts --binary <kbf> --commit <sha> --platform <p> --out <dir>`
+//!   ([`version_facts`]): the `kbf` just built, run with `--version --json`, and what it
+//!   printed kept unchanged as the release asset `kbf-<commit>-<platform>.version.json`
+//!   with its line in `SHA256SUMS.<platform>`. The release set holds it for every `kbf`
+//!   tarball (`verify-assets sums`, `release check`), because only a runner of a platform
+//!   can run its binary.
 //! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
 //!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
 //!   unit.
 //! - `sudo-test -p <package> --test <name> [--sudo <path>] [-- <test args>]`
 //!   ([`sudo_test`]): one integration test target built as this user, then its
 //!   `#[ignore]` tests run as root through `sudo -n`.
+//! - `proxy-loom` ([`proxy_loom`]): the loom models of kbf-proxy's slot and gate, built under
+//!   `--cfg kbf_loom` in their own target directory.
 //!
 //! Exit status: 0 when the check passed, 1 when it failed (one reason per line on
 //! stderr), 2 on a usage error.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use clap::{Parser, Subcommand};
 
+pub mod advisories;
 pub mod budget;
 pub mod build_commit;
 pub mod bundles;
@@ -59,13 +99,24 @@ pub mod crun_tests;
 pub mod darwin;
 pub mod entitlements;
 pub mod fetch;
+pub mod gamma;
+pub mod installer_tarball;
 pub mod package;
 pub mod pkg;
+pub mod pkg_asset;
 pub mod pkg_install;
 pub mod pkg_linux;
+pub mod pkg_macos_asset;
+#[cfg(target_os = "macos")]
+pub mod pkg_macos_install;
+pub mod pkg_size;
+pub mod pkg_trust;
+pub mod pkg_version;
+pub mod proxy_loom;
 pub mod release;
 pub mod sudo_test;
 pub mod sums;
+pub mod version_facts;
 
 /// Why a verb failed.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -117,6 +168,8 @@ enum Verb {
     /// kbf-server's `--version` names the commit it was built from.
     #[command(subcommand)]
     BuildCommit(BuildCommit),
+    /// Keep the advisories `cargo deny` reports in one GitHub issue.
+    Advisories(advisories::Args),
     /// Refuse a row the budget file gains against `--base`.
     BudgetDiff {
         /// The revision to compare with (on a pull request, the base branch).
@@ -160,6 +213,34 @@ enum Verb {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Write the payload `packaging/install.sh` places (installer, unit files, trust
+    /// files) as a tarball in `--out`.
+    InstallerTarball {
+        /// The `kbf-installer` binary.
+        #[arg(long)]
+        binary: PathBuf,
+        /// The platform it was built for (Linux only).
+        #[arg(long, value_enum)]
+        platform: package::Platform,
+        /// The commit it was built from (on Actions, `GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// The directory of `kbf-*.service` files (and `kbf.slice`).
+        #[arg(long)]
+        units: PathBuf,
+        /// The directory of the three trust files.
+        #[arg(long)]
+        trust: PathBuf,
+        /// The sysusers.d file.
+        #[arg(long)]
+        sysusers: PathBuf,
+        /// The tmpfiles.d file.
+        #[arg(long)]
+        tmpfiles: PathBuf,
+        /// The directory the tarball goes in; created when missing.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Write the nfpm configuration and the file listing of the kbf-installer packages.
     PkgConfig {
         /// The kbf-installer binary.
@@ -181,8 +262,12 @@ enum Verb {
         #[arg(long, value_enum)]
         platform: package::Platform,
         /// The package version.
+        /// (One of the two is required; the verb says so, exit 2, as clap does for a bad flag.)
+        #[arg(long, conflicts_with = "version_of")]
+        version: Option<String>,
+        /// Take the version from this binary's `--version` (`<version>+<12 of the commit>`).
         #[arg(long)]
-        version: String,
+        version_of: Option<PathBuf>,
         /// The directory `nfpm.yaml` and `listing.txt` go in; created when missing.
         #[arg(long)]
         out: PathBuf,
@@ -202,9 +287,58 @@ enum Verb {
         #[arg(long, default_value_t = pkg_linux::SOURCE_DATE_EPOCH)]
         source_date_epoch: u64,
     },
+    /// Write the trust directory of the kbf-installer packages: the pinned `gh`, the
+    /// Sigstore trusted root, and an `installer.conf` trusting the branch given.
+    PkgTrust {
+        /// The pinned `gh` program (copied, mode 0755).
+        #[arg(long)]
+        gh: PathBuf,
+        /// The trusted root `gh attestation trusted-root` wrote (JSON lines).
+        #[arg(long)]
+        trusted_root: PathBuf,
+        /// The branch the package is attested on: `refs/heads/<branch>`.
+        #[arg(long)]
+        source_ref: String,
+        /// The directory the three files go in; created when missing.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// The kbf-installer deb as a release asset, refused unless it holds the attested
+    /// binary and trusts the branch it is attested for.
+    PkgAsset {
+        /// The deb nfpm built, or the directory holding the one (with `--verify-only`: the
+        /// asset itself).
+        #[arg(long)]
+        package: PathBuf,
+        /// The platform it was built for (`linux-x86_64`, `linux-arm64`).
+        #[arg(long, value_enum)]
+        platform: package::Platform,
+        /// The commit it was built from (`$GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// The `kbf-installer-<commit>-<platform>.tar.gz` whose binary the deb must hold.
+        #[arg(long)]
+        binary_tarball: PathBuf,
+        /// The branch the deb must trust, and is attested for (`$GITHUB_REF`).
+        #[arg(long)]
+        expect_ref: String,
+        /// The pinned `gh` the deb's must be byte for byte (optional with --verify-only).
+        #[arg(long)]
+        gh: Option<PathBuf>,
+        /// The directory the asset and its line of `SHA256SUMS.<platform>` go in.
+        #[arg(
+            long,
+            required_unless_present = "verify_only",
+            conflicts_with = "verify_only"
+        )]
+        out: Option<PathBuf>,
+        /// Only check `--package`, which must be named as the asset; write nothing.
+        #[arg(long)]
+        verify_only: bool,
+    },
     /// Install a package into a fresh container and check it never starts or enables.
     PkgInstallTest {
-        /// The package.
+        /// The package, or the directory holding the one package of its format.
         #[arg(long)]
         package: PathBuf,
         /// Its format.
@@ -219,9 +353,54 @@ enum Verb {
         /// A packaged unit and the file it needs to start: `<unit>=<file>`.
         #[arg(long)]
         gate: Vec<pkg_install::Gate>,
+        /// A command to run in the container after the install and what its output must
+        /// contain: `<program> <argument>..::<text>` (the command exits 0).
+        #[arg(long)]
+        probe: Vec<pkg_install::Probe>,
         /// The docker program.
         #[arg(long, default_value = "docker")]
         docker: PathBuf,
+    },
+    /// The kbf-installer `.pkg` as a release asset, refused unless it holds the attested
+    /// binary, the pinned gh, a trusted root and trusts the branch it is attested for.
+    PkgMacosAsset {
+        /// The `.pkg` `pkg build` wrote, or the directory holding the one (with
+        /// `--verify-only`: the asset itself).
+        #[arg(long)]
+        package: PathBuf,
+        /// The commit it was built from (`$GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// The `kbf-installer-<commit>-darwin-arm64.tar.gz` whose binary the package must hold.
+        #[arg(long)]
+        binary_tarball: PathBuf,
+        /// The branch the package must trust, and is attested for (`$GITHUB_REF`).
+        #[arg(long)]
+        expect_ref: String,
+        /// The pinned `gh` the package's must be byte for byte (optional with --verify-only).
+        #[arg(long)]
+        gh: Option<PathBuf>,
+        /// The directory the asset and its line of `SHA256SUMS.darwin-arm64` go in.
+        #[arg(
+            long,
+            required_unless_present = "verify_only",
+            conflicts_with = "verify_only"
+        )]
+        out: Option<PathBuf>,
+        /// Only check `--package`, which must be named as the asset; write nothing.
+        #[arg(long)]
+        verify_only: bool,
+    },
+    /// Install the `.pkg` on this Mac as root and check what it placed and that nothing
+    /// started (macOS only).
+    PkgMacosInstallTest {
+        /// The `.pkg`, or the directory holding the one.
+        #[arg(long)]
+        package: PathBuf,
+        /// A command to run after the install and what its output must contain:
+        /// `<program> <argument>..::<text>` (the command exits 0).
+        #[arg(long)]
+        probe: Vec<pkg_install::Probe>,
     },
     /// kbf-installer for a Mac: its `.pkg`, and the Homebrew cask.
     #[command(subcommand)]
@@ -249,6 +428,10 @@ enum Verb {
     /// A GitHub release of a `main` commit's attested assets, never rebuilt.
     #[command(subcommand)]
     Release(ReleaseVerb),
+    /// The steps of `gamma.yml`: the release run's evidence, the deploy on the gamma host,
+    /// its table, the sudoers line and the settings a person makes once.
+    #[command(subcommand)]
+    Gamma(GammaVerb),
     /// Run the container driver's real-crun tests on a hosted Linux runner, each
     /// test target in its own Delegate=yes system unit as this user.
     CrunTests {
@@ -256,6 +439,9 @@ enum Verb {
         #[arg(long, default_value = "sudo")]
         sudo: PathBuf,
     },
+    /// Run the loom models of kbf-proxy's slot and gate (`--cfg kbf_loom`, its own target
+    /// directory, release mode).
+    ProxyLoom,
     /// Build one integration test target, then run its ignored tests as root.
     SudoTest {
         /// The package the target is in.
@@ -288,8 +474,12 @@ enum PkgVerb {
         #[arg(long)]
         trust: Vec<PathBuf>,
         /// The release's version: letters, digits and `. _ + -`.
+        /// (One of the two is required; the verb says so, exit 2.)
+        #[arg(long, conflicts_with = "version_of")]
+        version: Option<String>,
+        /// Take the version from this binary's `--version` (`<version>+<12 of the commit>`).
         #[arg(long)]
-        version: String,
+        version_of: Option<PathBuf>,
         /// The directory the package goes in; created when missing.
         #[arg(long)]
         out: PathBuf,
@@ -398,6 +588,11 @@ enum ReleaseVerb {
         /// The commit the assets were built from, a full SHA.
         #[arg(long)]
         commit: String,
+        /// Do not require the version facts of each `kbf` tarball: for the release made
+        /// before the build jobs recorded them (the previous release, read by the first
+        /// release that has them). Facts without their tarball are still refused.
+        #[arg(long)]
+        without_version_facts: bool,
     },
     /// Create release `--tag` with every file of `<dir>`, or add the files it lacks;
     /// an asset it holds must be one of them, byte for byte.
@@ -415,9 +610,233 @@ enum ReleaseVerb {
         /// The artifacts workflow run that built and attested the files.
         #[arg(long)]
         run_id: u64,
+        /// The set hash of the verified files, as `release verify` printed it.
+        #[arg(long)]
+        set_hash: String,
+        /// The release's notes (`release notes --out`): the release body, followed by how
+        /// to verify the files. Required: no default body replaces it.
+        #[arg(long)]
+        notes_file: PathBuf,
         /// The `gh` program.
         #[arg(long, default_value = "gh")]
         gh: PathBuf,
+    },
+    /// The tag names this commit, which is on main. Reads no verdict: the tag's message is
+    /// an audit record nothing gates on. Prints `set-hash=<hex>` of the files.
+    Verify {
+        #[command(flatten)]
+        subject: SubjectArgs,
+        /// Append `set-hash=<hex>` to this file (on Actions, `GITHUB_OUTPUT`).
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// The checks that make a commit offerable to a farm; writes `offer.json`, sets
+    /// nothing on any farm.
+    Offer(release::offer::OfferArgs),
+    /// Wait for the push runs of ci, beta and artifacts for `--sha` on `--branch` and
+    /// require all three to succeed; print their run ids. Only reads.
+    Gates(release::gates::GatesArgs),
+    /// What a push would release: the next version, the push's class, and the freeze and
+    /// superseded refusals. Writes nothing but `--output`.
+    Plan(release::plan::PlanArgs),
+    /// The release before `--sha`: the highest release tag that names a strict ancestor of it,
+    /// downloaded, verified as `release offer` verifies one, and its named binaries taken
+    /// out into `--out`. With no such tag, prints `previous-source=none`.
+    FetchPrevious(release::fetch_previous::FetchPreviousArgs),
+    /// The offer for the release of `--sha`, for gamma only, and the bundle a gamma deploy is
+    /// handed: the release verified before any of it runs. A commit with no release is
+    /// `staged=false`, not an error.
+    StageOffer(release::stage_offer::StageOfferArgs),
+    /// Open the pull request in the internal repository that moves its submodule to the
+    /// released commit, with auto-merge on (the token is `GH_TOKEN`).
+    BumpInternal(release::bump::BumpArgs),
+    /// Create the annotated release tag at `--sha` through the GitHub API: create-only,
+    /// after the stale-run guards; a tag that exists is reused only when it is the same.
+    Tag(release::tag::TagArgs),
+    /// Write the Beta record a release tag carries as its message (audit only).
+    VerdictWrite(release::verdict_write::WriteArgs),
+    /// Run the `kbf` just built with `--version --json` and keep what it printed as the
+    /// release asset `kbf-<commit>-<platform>.version.json`, refused unless it is the
+    /// release build of `--commit`.
+    VersionFacts(version_facts::Args),
+    /// The same checks, then write the release's notes.
+    Notes {
+        #[command(flatten)]
+        subject: SubjectArgs,
+        /// `kbf --version --json` of this release's binary, run from an attested tarball.
+        #[arg(long)]
+        version_json: PathBuf,
+        /// The same for the previous release (`release previous` names it); required
+        /// exactly when there is one.
+        #[arg(long)]
+        previous_version_json: Option<String>,
+        /// Write the notes here.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Run `kbf --version --json` from the linux-x86_64 tarball of `--commit` in `<dir>` and
+    /// write what it prints. Runs a binary: only on files already checked and attested.
+    Identity {
+        dir: PathBuf,
+        /// The commit the tarball was built from, a full SHA.
+        #[arg(long)]
+        commit: String,
+        /// Write the identity here.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// The release before `--tag`, if any: prints `previous=<tag>` and
+    /// `previous-commit=<sha>` (both empty for a first release).
+    Previous {
+        /// A checkout that holds the tags and main's history.
+        #[arg(long, default_value = ".")]
+        repo_dir: PathBuf,
+        /// The release tag.
+        #[arg(long)]
+        tag: String,
+        /// The commit being released, a full SHA.
+        #[arg(long)]
+        commit: String,
+        /// Append the two lines to this file (on Actions, `GITHUB_OUTPUT`).
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+
+/// What `release verify` and `release notes` check a release against.
+#[derive(clap::Args)]
+struct SubjectArgs {
+    /// The verified release files (`SHA256SUMS` among them).
+    dir: PathBuf,
+    /// A checkout that holds the tag object and main's history.
+    #[arg(long, default_value = ".")]
+    repo_dir: PathBuf,
+    /// The release tag, annotated.
+    #[arg(long)]
+    tag: String,
+    /// The commit being released, a full SHA.
+    #[arg(long)]
+    commit: String,
+    /// The ref of main in `--repo-dir`.
+    #[arg(long, default_value = "origin/main")]
+    main_ref: String,
+}
+
+impl SubjectArgs {
+    fn subject(&self) -> release::verify::Subject<'_> {
+        release::verify::Subject {
+            repo_dir: &self.repo_dir,
+            tag: &self.tag,
+            commit: &self.commit,
+            dir: &self.dir,
+            main_ref: &self.main_ref,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum GammaVerb {
+    /// Whether run `--run-id` of the release workflow released `--sha`: a push to main that
+    /// succeeded, whose publish job succeeded. Prints `released=<true|false>`.
+    Evidence {
+        /// The repository, `<owner>/<repo>` (on Actions, `GITHUB_REPOSITORY`).
+        #[arg(long)]
+        repo: String,
+        /// The commit the run is for, a full SHA (the triggering run's `head_sha`).
+        #[arg(long)]
+        sha: String,
+        /// The release run (the triggering run's `id`).
+        #[arg(long)]
+        run_id: u64,
+        /// Append `released=<true|false>` to this file (on Actions, `GITHUB_OUTPUT`).
+        #[arg(long)]
+        output: PathBuf,
+        /// The `gh` program.
+        #[arg(long, default_value = "gh")]
+        gh: PathBuf,
+    },
+    /// Run `kbf-installer deploy` on the gamma host over Tailscale SSH, for the highest
+    /// release only, and write the summary without any node or host in it.
+    Deploy {
+        /// The repository, `<owner>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// The released commit, a full SHA.
+        #[arg(long)]
+        sha: String,
+        /// The gamma host's tailnet name: a short name, never an address. Masked in what
+        /// this prints, but a variable is shown by GitHub in the step's own header.
+        #[arg(long)]
+        host: String,
+        /// The deploy account on it (masked the same way).
+        #[arg(long)]
+        user: String,
+        /// The tar `release stage-offer` wrote, sent on standard input.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Where the installer's own summary goes; it names nodes and is never uploaded.
+        #[arg(long)]
+        raw: PathBuf,
+        /// Where the redacted summary goes.
+        #[arg(long)]
+        summary: PathBuf,
+        /// The `tailscale` program.
+        #[arg(long, default_value = "tailscale")]
+        tailscale: PathBuf,
+        /// The `gh` program.
+        #[arg(long, default_value = "gh")]
+        gh: PathBuf,
+    },
+    /// Build komira's main against the farm just updated, with its normal caching. Passes
+    /// only for `BUILD SUCCEEDED` and `local: 0`; the farm's buckconfig is the environment
+    /// variable `GAMMA_FARM_BUCKCONFIG`. Prints the `Commands:` line and the verdict, and
+    /// nothing buck2 wrote.
+    CheckBuild {
+        /// The checkout of komira's main (its `buck2` launcher is at the top).
+        #[arg(long)]
+        komira_dir: PathBuf,
+        /// The targets to build, separated by white space (the variable
+        /// `GAMMA_CHECK_TARGETS`). A flag, such as `--no-remote-cache`, is refused.
+        #[arg(long)]
+        targets: String,
+        /// Where the farm's buckconfig is written: an absolute path, given to buck2.
+        #[arg(long)]
+        buckconfig_file: PathBuf,
+        /// Where buck2's whole output goes. It is never printed.
+        #[arg(long)]
+        log: PathBuf,
+        /// Append the `Commands:` line and the verdict to this file (on Actions,
+        /// `GITHUB_STEP_SUMMARY`).
+        #[arg(long)]
+        summary: PathBuf,
+    },
+    /// Append a table of the redacted summary to a file (`GITHUB_STEP_SUMMARY`).
+    Summary {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// The sudoers line that lets the deploy account run the deploy command as root.
+    SudoersLine {
+        /// The deploy account on the gamma host.
+        #[arg(long)]
+        user: String,
+    },
+    /// Print the settings a person makes once. It changes nothing.
+    HeldSteps {
+        /// The repository, `<owner>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// The gamma host's tailnet name.
+        #[arg(long)]
+        host: String,
+        /// The deploy account on it.
+        #[arg(long)]
+        user: String,
+        /// The Tailscale tag the runner joins as (never the host's own tag).
+        #[arg(long, default_value = "tag:kbf-gamma-ci")]
+        tag: String,
     },
 }
 
@@ -445,30 +864,45 @@ fn default_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The budget file as `rev` holds it, read with `git show` in `root`.
-fn budget_at(root: &Path, rev: &str) -> Result<String, Error> {
-    let spec = format!("{rev}:{}", budget::BUDGET);
+/// What `git <args>` prints in `root`.
+fn git_stdout(root: &Path, args: &[&str]) -> Result<Vec<u8>, Error> {
     let out = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["show", &spec])
+        .args(args)
         .output()
         .map_err(Error::spawn("git".to_owned()))?;
     if !out.status.success() {
         return Err(Error::Failed(format!(
-            "git show {spec}: {}",
+            "git {}: {}",
+            args.join(" "),
             String::from_utf8_lossy(&out.stderr).trim_end()
         )));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(out.stdout)
 }
 
-/// `budget-diff --base <rev>`: the line it prints when nothing was added.
+/// The budget file as `rev` holds it, read with `git show` in `root`.
+fn budget_at(root: &Path, rev: &str) -> Result<String, Error> {
+    let spec = format!("{rev}:{}", budget::BUDGET);
+    let out = git_stdout(root, &["show", &spec])?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// The paths git sees renamed between `rev` and `HEAD` in `root`: new path to old.
+fn renames_since(root: &Path, rev: &str) -> Result<BTreeMap<String, String>, Error> {
+    let args = ["diff", "--find-renames", "--name-status", "-z", rev, "HEAD"];
+    Ok(budget::parse_renames(&git_stdout(root, &args)?))
+}
+
+/// `budget-diff --base <rev>`: the line it prints when nothing was added. A path git
+/// renamed since `rev` keeps its row.
 fn budget_diff(root: &Path, rev: &str) -> Result<String, Error> {
     let base = budget_at(root, rev)?;
+    let renames = renames_since(root, rev)?;
     let path = root.join(budget::BUDGET);
     let head = std::fs::read_to_string(&path).map_err(Error::spawn(path.display().to_string()))?;
-    let added = budget::new_rows(&base, &head).map_err(Error::Refused)?;
+    let added = budget::new_rows_renamed(&base, &head, &renames).map_err(Error::Refused)?;
     if added.is_empty() {
         return Ok(format!("ok: {} adds no row to {rev}'s", budget::BUDGET));
     }
@@ -528,11 +962,13 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             test: &test,
             args: &args,
         }),
+        Verb::ProxyLoom => proxy_loom::run(&cargo_program(), &root),
         Verb::CrunTests { sudo } => crun_tests::run(&crun_tests::CrunTests {
             cargo: &cargo_program(),
             sudo: &sudo,
             root: &root,
         }),
+        Verb::Advisories(args) => advisories::run(&args, &root, &cargo_program()),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
         Verb::Fetch {
             url,
@@ -552,6 +988,27 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             commit,
             out,
         } => package::package(&binary, &sbom, platform, &commit, &out),
+        Verb::InstallerTarball {
+            binary,
+            platform,
+            commit,
+            units,
+            trust,
+            sysusers,
+            tmpfiles,
+            out,
+        } => installer_tarball::installer_tarball(
+            platform,
+            &commit,
+            &pkg_linux::Sources {
+                binary: &binary,
+                units: &units,
+                trust: &trust,
+                sysusers: &sysusers,
+                tmpfiles: &tmpfiles,
+            },
+            &out,
+        ),
         Verb::PkgConfig {
             binary,
             units,
@@ -560,19 +1017,27 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             tmpfiles,
             platform,
             version,
+            version_of,
             out,
-        } => pkg_linux::write_config(
-            &pkg_linux::Inputs {
-                binary: &binary,
-                units: &units,
-                trust: &trust,
-                sysusers: &sysusers,
-                tmpfiles: &tmpfiles,
-                platform,
-                version: &version,
-            },
-            &out,
-        ),
+        } => {
+            let version = match (version, version_of) {
+                (Some(version), _) => version,
+                (None, Some(of)) => pkg_asset::binary_version(&of)?,
+                (None, None) => return Err(Error::Usage("--version or --version-of".to_owned())),
+            };
+            pkg_linux::write_config(
+                &pkg_linux::Inputs {
+                    binary: &binary,
+                    units: &units,
+                    trust: &trust,
+                    sysusers: &sysusers,
+                    tmpfiles: &tmpfiles,
+                    platform,
+                    version: &version,
+                },
+                &out,
+            )
+        }
         Verb::PkgBuild {
             nfpm,
             config,
@@ -586,21 +1051,85 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 epoch: source_date_epoch,
             },
         ),
+        Verb::PkgTrust {
+            gh,
+            trusted_root,
+            source_ref,
+            out,
+        } => pkg_trust::write(&gh, &trusted_root, &source_ref, &out),
+        Verb::PkgAsset {
+            package,
+            platform,
+            commit,
+            binary_tarball,
+            expect_ref,
+            gh,
+            out,
+            verify_only,
+        } => pkg_asset::asset(
+            &pkg_asset::sole(&package, "deb")?,
+            &commit,
+            &match (&out, verify_only) {
+                (Some(out), false) => pkg_asset::Mode::Add(out),
+                _ => pkg_asset::Mode::VerifyOnly,
+            },
+            &pkg_asset::Check {
+                platform,
+                binary_tarball: &binary_tarball,
+                expect_ref: &expect_ref,
+                gh: gh.as_deref(),
+            },
+        ),
+        Verb::PkgMacosAsset {
+            package,
+            commit,
+            binary_tarball,
+            expect_ref,
+            gh,
+            out,
+            verify_only,
+        } => pkg_macos_asset::asset(
+            &pkg_asset::sole(&package, "pkg")?,
+            &commit,
+            &match (&out, verify_only) {
+                (Some(out), false) => pkg_asset::Mode::Add(out),
+                _ => pkg_asset::Mode::VerifyOnly,
+            },
+            &pkg_macos_asset::Check {
+                binary_tarball: &binary_tarball,
+                expect_ref: &expect_ref,
+                gh: gh.as_deref(),
+            },
+        ),
+        #[cfg(target_os = "macos")]
+        Verb::PkgMacosInstallTest { package, probe } => {
+            pkg_macos_install::run_test(&pkg_asset::sole(&package, "pkg")?, &probe)
+        }
+        #[cfg(not(target_os = "macos"))]
+        Verb::PkgMacosInstallTest { .. } => Err(darwin::needs_macos("pkg-macos-install-test")),
         Verb::PkgInstallTest {
             package,
             format,
             listing,
             image_dir,
             gate,
+            probe,
             docker,
         } => pkg_install::run(
             &mut pkg_install::process(&docker),
             &pkg_install::InstallTest {
-                package: &package,
+                package: &pkg_asset::sole(
+                    &package,
+                    match format {
+                        pkg_install::Format::Deb => "deb",
+                        pkg_install::Format::Rpm => "rpm",
+                    },
+                )?,
                 format,
                 listing: &listing,
                 image_dir: &image_dir,
                 gates: &gate,
+                probes: &probe,
                 container: &format!("kbf-pkg-test-{}", std::process::id()),
             },
         ),
@@ -609,14 +1138,22 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             launchd_plist,
             trust,
             version,
+            version_of,
             out,
-        }) => pkg::build(&pkg::Build {
-            binary: &binary,
-            plist: &launchd_plist,
-            trust: &trust,
-            version: &version,
-            out: &out,
-        }),
+        }) => {
+            let version = match (version, version_of) {
+                (Some(version), _) => version,
+                (None, Some(of)) => pkg_asset::binary_version(&of)?,
+                (None, None) => return Err(Error::Usage("--version or --version-of".to_owned())),
+            };
+            pkg::build(&pkg::Build {
+                binary: &binary,
+                plist: &launchd_plist,
+                trust: &trust,
+                version: &version,
+                out: &out,
+            })
+        }
         Verb::Pkg(PkgVerb::Cask {
             pkg,
             version,
@@ -650,6 +1187,59 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::VerifyAssets(VerifyAssets::Sums { dir }) => {
             Ok(vec![sums::verify_sums(&dir, fetch::Sha256::of)?])
         }
+        Verb::Gamma(GammaVerb::Evidence {
+            repo,
+            sha,
+            run_id,
+            output,
+            gh,
+        }) => gamma::evidence(&gh, &repo, &sha, run_id, &output),
+        Verb::Gamma(GammaVerb::Deploy {
+            repo,
+            sha,
+            host,
+            user,
+            bundle,
+            raw,
+            summary,
+            tailscale,
+            gh,
+        }) => gamma::deploy(&gamma::Deploy {
+            gh: &gh,
+            tailscale: &tailscale,
+            repo: &repo,
+            sha: &sha,
+            host: &host,
+            user: &user,
+            bundle: &bundle,
+            raw: &raw,
+            summary: &summary,
+        }),
+        Verb::Gamma(GammaVerb::CheckBuild {
+            komira_dir,
+            targets,
+            buckconfig_file,
+            log,
+            summary,
+        }) => {
+            let config = std::env::var(gamma::BUCKCONFIG_ENV).unwrap_or_default();
+            gamma::check_build(&gamma::CheckBuild {
+                komira_dir: &komira_dir,
+                targets: &targets,
+                config: &config,
+                buckconfig_file: &buckconfig_file,
+                log: &log,
+                summary: &summary,
+            })
+        }
+        Verb::Gamma(GammaVerb::Summary { file, output }) => gamma::summary(&file, &output),
+        Verb::Gamma(GammaVerb::SudoersLine { user }) => Ok(vec![gamma::sudoers_line(&user)?]),
+        Verb::Gamma(GammaVerb::HeldSteps {
+            repo,
+            host,
+            user,
+            tag,
+        }) => gamma::held_steps(&repo, &host, &user, &tag),
         Verb::Release(ReleaseVerb::Locate {
             repo,
             commit,
@@ -664,15 +1254,134 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         }) => Ok(vec![release::main_control(
             &gh, &repo, &on_main, &off_main,
         )?]),
-        Verb::Release(ReleaseVerb::Check { dir, commit }) => release::check(&dir, &commit),
+        Verb::Release(ReleaseVerb::Check {
+            dir,
+            commit,
+            without_version_facts,
+        }) => {
+            let pairing = if without_version_facts {
+                version_facts::Pairing::Waived
+            } else {
+                version_facts::Pairing::Required
+            };
+            release::check(&dir, &commit, pairing)
+        }
+        Verb::Release(ReleaseVerb::Verify { subject, output }) => {
+            let verified = release::verify::verify(&subject.subject())?;
+            let line = format!("set-hash={}", verified.set_hash.as_str());
+            if let Some(output) = output {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&output)
+                    .and_then(|mut f| {
+                        std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes())
+                    })
+                    .map_err(Error::spawn(format!("append to {}", output.display())))?;
+            }
+            Ok(vec![
+                format!(
+                    "tag {} names {} on {}; the files are set {}",
+                    subject.tag,
+                    subject.commit,
+                    subject.main_ref,
+                    verified.set_hash.as_str()
+                ),
+                line,
+            ])
+        }
+        Verb::Release(ReleaseVerb::Offer(args)) => release::offer::run(&args),
+        Verb::Release(ReleaseVerb::Gates(args)) => release::gates::run(&args),
+        Verb::Release(ReleaseVerb::Plan(args)) => release::plan::run(&args),
+        Verb::Release(ReleaseVerb::FetchPrevious(args)) => release::fetch_previous::run(&args),
+        Verb::Release(ReleaseVerb::StageOffer(args)) => release::stage_offer::run(&args),
+        Verb::Release(ReleaseVerb::BumpInternal(args)) => release::bump::run(&args),
+        Verb::Release(ReleaseVerb::Tag(args)) => release::tag::run(&args),
+        Verb::Release(ReleaseVerb::VersionFacts(args)) => version_facts::run(&args),
+        Verb::Release(ReleaseVerb::VerdictWrite(args)) => release::verdict_write::run(&args),
+        Verb::Release(ReleaseVerb::Identity { dir, commit, out }) => {
+            // The binary's unpacking place, of this process alone.
+            let scratch =
+                std::env::temp_dir().join(format!("xtask-identity-{}", std::process::id()));
+            std::fs::create_dir_all(&scratch)
+                .map_err(Error::spawn(format!("create {}", scratch.display())))?;
+            let said = release::identity::identity(&dir, &commit, &scratch);
+            let _ = std::fs::remove_dir_all(&scratch);
+            let said = said?;
+            std::fs::write(&out, format!("{said}\n"))
+                .map_err(Error::spawn(format!("write {}", out.display())))?;
+            Ok(vec![format!(
+                "wrote the identity of {commit} to {}",
+                out.display()
+            )])
+        }
+        Verb::Release(ReleaseVerb::Previous {
+            repo_dir,
+            tag,
+            commit,
+            output,
+        }) => {
+            build_commit::full_commit("--commit", &commit)?;
+            let found = release::notes::previous_release(&repo_dir, &tag, &commit)?;
+            let at = match &found {
+                Some(prev) => release::commit_of(&repo_dir, prev)?,
+                None => String::new(),
+            };
+            let lines = vec![
+                format!("previous={}", found.unwrap_or_default()),
+                format!("previous-commit={at}"),
+            ];
+            if let Some(output) = output {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&output)
+                    .and_then(|mut f| {
+                        std::io::Write::write_all(
+                            &mut f,
+                            format!("{}\n", lines.join("\n")).as_bytes(),
+                        )
+                    })
+                    .map_err(Error::spawn(format!("append to {}", output.display())))?;
+            }
+            Ok(lines)
+        }
+        Verb::Release(ReleaseVerb::Notes {
+            subject,
+            version_json,
+            previous_version_json,
+            out,
+        }) => {
+            let previous = previous_version_json
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from);
+            let ids = release::notes::Identities {
+                current: &version_json,
+                // The workflow passes an empty path when there is no previous release.
+                previous: previous.as_deref(),
+            };
+            let text = release::notes::notes(&subject.subject(), &ids)?;
+            std::fs::write(&out, &text)
+                .map_err(Error::spawn(format!("write {}", out.display())))?;
+            Ok(vec![format!(
+                "wrote the notes of {} to {}",
+                subject.tag,
+                out.display()
+            )])
+        }
         Verb::Release(ReleaseVerb::Publish {
             dir,
             repo,
             tag,
             commit,
             run_id,
+            set_hash,
+            notes_file,
             gh,
         }) => {
+            let notes = release::read_notes(&notes_file)?;
+            let set_hash = kbf_gate::SetHash::parse(&set_hash)
+                .map_err(|e| Error::Usage(format!("--set-hash: {e}")))?;
             // The release's assets as it holds them, of this process alone.
             let scratch =
                 std::env::temp_dir().join(format!("xtask-release-{}", std::process::id()));
@@ -683,6 +1392,8 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 tag: &tag,
                 commit: &commit,
                 run_id,
+                set_hash: &set_hash,
+                notes: &notes,
                 gh: &gh,
                 scratch: &scratch,
             };
@@ -719,6 +1430,14 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             verified
         }
     }
+}
+
+/// Whether `args` (what follows `cargo xtask`) are a command line this program takes; the
+/// error is the parser's message. Nothing is run: a test of the lines a workflow runs uses it.
+pub fn check_args(args: &[&str]) -> Result<(), String> {
+    let argv = std::iter::once("xtask").chain(args.iter().copied());
+    let parsed = Cli::try_parse_from(argv);
+    parsed.map(drop).map_err(|e| e.to_string())
 }
 
 /// The program: parses the arguments, runs the verb and prints its result.

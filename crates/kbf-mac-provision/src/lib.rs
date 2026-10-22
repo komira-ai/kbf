@@ -6,7 +6,7 @@
 //! ```text
 //! kbf-mac-provision check   --profile FILE [--keys K,K] [--root DIR]  # one PASS/FAIL line per item
 //! kbf-mac-provision apply   --profile FILE [--keys K,K] [--root DIR]  # root: fix each FAIL, one CHANGE line per change
-//! kbf-mac-provision print   --profile FILE                            # the resolved profile, its SHA-256, the node label
+//! kbf-mac-provision print   --profile FILE                            # the resolved profile, and its SHA-256
 //! kbf-mac-provision restart --profile FILE [--root DIR]               # root: restart kbf-daemon, emptying its error log
 //! kbf-mac-provision revert  [--root DIR]                              # root: put back the recorded power and update settings
 //! ```

@@ -11,6 +11,42 @@ use kbf_types::Digest;
 use crate::router::{Router, unavailable, write_order};
 use crate::source::MapView;
 
+/// Which question a FindMissing round asks of a node.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ask {
+    /// Blobs it can serve, RAM-held ones included ([`kbf_storage::Storage::find_missing`]).
+    Servable,
+    /// Blobs on its disk only ([`kbf_storage::Storage::find_durable`]).
+    Durable,
+    /// Blobs on its disk only, after it has waited for its held ones to be written
+    /// ([`kbf_storage::Storage::find_durable_waiting`]).
+    DurableWaiting,
+}
+
+impl Ask {
+    /// The durable question, waiting for held blobs when `wait`.
+    pub(crate) const fn durable(wait: bool) -> Self {
+        if wait {
+            Self::DurableWaiting
+        } else {
+            Self::Durable
+        }
+    }
+
+    /// The question, asked of `node` about `digests`.
+    pub(crate) async fn of(
+        self,
+        node: &dyn kbf_storage::Storage,
+        digests: &[Digest],
+    ) -> Result<Vec<Digest>, StorageError> {
+        match self {
+            Self::Servable => node.find_missing(digests).await,
+            Self::Durable => node.find_durable(digests).await,
+            Self::DurableWaiting => node.find_durable_waiting(digests).await,
+        }
+    }
+}
+
 impl Router {
     /// The digests among `digests` the farm does not hold, in the order asked (a digest
     /// asked twice is answered twice): each digest is asked of its primary owner, one
@@ -22,29 +58,74 @@ impl Router {
     ///
     /// Only the primary is asked. A cold build asks mostly about blobs nobody holds, and
     /// a replica asked on every miss would double the calls for nothing: whatever the
-    /// primary has not got, a write sends again. When the primary cannot answer, its
+    /// primary has not got, a write sends again. This is the question a client's
+    /// FindMissing is: a blob only a replica holds is reported missing, the client
+    /// uploads it, and the upload fills the primary. A caller that must not refuse a
+    /// blob a read would find (the input check of an Execute) asks
+    /// [`Router::find_missing_anywhere`]. When the primary cannot answer, its
     /// digests go to the next owner that is not down, so a call that completes was
     /// answered for every digest, never for some.
     ///
     /// # Errors
     /// Some digest's every owner is down or could not answer.
     pub async fn find_missing(&self, digests: &[Digest]) -> Result<Vec<Digest>, StorageError> {
-        let missing = self.routed(|view| self.find_in(view, digests)).await?;
+        let missing = self
+            .routed(|view| async move { self.find_in(&view, digests).await })
+            .await?;
         Ok(digests
             .iter()
-            .filter(|d| missing.contains(d))
+            .filter(|d| missing.contains_key(d))
             .copied()
             .collect())
     }
 
-    /// The digests missing, as the map `view` places them.
-    async fn find_in(
+    /// [`Router::find_missing`] counting only blobs durable on the owner asked: one held
+    /// in RAM and not yet on its disk is missing (`kbf-durable: only`,
+    /// [`kbf_storage::Storage::find_durable`]). Asked of the same owners in the same order,
+    /// so a digest is answered by its primary, or by the next owner when the primary
+    /// cannot answer. The question rule 2 asks before a durable record names a blob.
+    ///
+    /// With `wait`, each node first waits, for at most its own `--durable-wait`, for its
+    /// held blobs among the digests to be written (`kbf-durable: wait`), so a blob that
+    /// is on its way to the disk is not reported missing.
+    ///
+    /// # Errors
+    /// As [`Router::find_missing`].
+    pub async fn find_durable(
         &self,
-        view: MapView,
         digests: &[Digest],
-    ) -> Result<BTreeSet<Digest>, StorageError> {
+        wait: bool,
+    ) -> Result<Vec<Digest>, StorageError> {
+        let ask = Ask::durable(wait);
+        let missing = self
+            .routed(|view| async move { self.find_in_as(&view, digests, ask).await })
+            .await?;
+        Ok(digests
+            .iter()
+            .filter(|d| missing.contains_key(d))
+            .copied()
+            .collect())
+    }
+
+    /// The digests missing, as the map `view` places them, each with the owner that said
+    /// it lacks it.
+    pub(crate) async fn find_in(
+        &self,
+        view: &MapView,
+        digests: &[Digest],
+    ) -> Result<BTreeMap<Digest, MemberId>, StorageError> {
+        self.find_in_as(view, digests, Ask::Servable).await
+    }
+
+    /// [`Router::find_in`], asking the question `ask` names.
+    async fn find_in_as(
+        &self,
+        view: &MapView,
+        digests: &[Digest],
+        ask: Ask,
+    ) -> Result<BTreeMap<Digest, MemberId>, StorageError> {
         let generation = view.map.generation();
-        let mut missing = BTreeSet::new();
+        let mut missing = BTreeMap::new();
         let mut pending: BTreeSet<Digest> = digests.iter().copied().collect();
         let mut failure = None;
         // Each round asks every pending digest of the owner at the next rank.
@@ -71,15 +152,15 @@ impl Router {
                 // A node bounds the digests of one call, so a long list is several.
                 let mut lacking = Vec::new();
                 for chunk in asked.chunks(MAX_FIND_MISSING_DIGESTS) {
-                    lacking.extend(node.find_missing(chunk).await?);
+                    lacking.extend(ask.of(node.as_ref(), chunk).await?);
                 }
                 Ok(lacking)
             }))
             .await;
-            for ((_, asked), answer) in by_owner.values().zip(answers) {
+            for ((owner, asked), answer) in by_owner.values().zip(answers) {
                 match answer {
                     Ok(lacking) => {
-                        missing.extend(lacking);
+                        missing.extend(lacking.into_iter().map(|d| (d, owner.id)));
                         for digest in asked {
                             pending.remove(digest);
                         }

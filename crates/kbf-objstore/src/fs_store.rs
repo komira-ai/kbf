@@ -76,6 +76,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 use crate::body::{self, BodyStream};
+use crate::released::{Gate, Released};
 use crate::types::Token;
 use crate::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectInfo, ObjectKey, ObjectStore,
@@ -209,11 +210,65 @@ struct Inner {
     window: usize,
     /// How many times a listing read every header: once per listing, not per page.
     walks: AtomicU64,
-    /// Held for the store's life: closing it releases the lock.
-    _lock: File,
+    /// Held for the store's life; released when the last handle is dropped
+    /// ([`Inner`]'s `Drop`).
+    lock: DirLock,
+    /// Opened when the lock is released ([`Released`]).
+    released: Arc<Gate>,
+    /// The store's directory, for [`Released`] to name.
+    dir: PathBuf,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // Unlock, then open the gate, so whoever waits finds the directory free. A lock
+        // that cannot be unlocked is released with the file at the end of this drop,
+        // just after the gate opens (an `unlock` on an open file does not fail).
+        self.released.release(|| {
+            self.lock.unlock();
+        });
+    }
+}
+
+/// The store directory's `LOCK` file with its `flock` held.
+///
+/// An `flock` belongs to the open file description, not to the descriptor, and a
+/// description lives until every copy of the descriptor is closed. A process forked
+/// while the store is open (any spawn of a child by another thread of this process)
+/// carries a copy until it execs, so closing the file would leave the directory locked
+/// for as long as that takes. Unlocking first, which no copy outlives, frees the
+/// directory as soon as the last handle's drop returns; dropping the lock does it too,
+/// for the ways out of `open` that never reach an [`Inner`].
+struct DirLock(File);
+
+impl DirLock {
+    fn unlock(&self) {
+        // An error leaves the close that follows to release the lock, as before.
+        let _ = self.0.unlock();
+    }
+}
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        self.unlock();
+    }
 }
 
 impl FsStore {
+    /// A watch for this store's close: [`Released::wait_within`] completes once every handle on
+    /// it, clones included, has been dropped and the directory is unlocked. It holds no
+    /// handle, so it does not keep the store open.
+    #[must_use]
+    pub fn released(&self) -> Released {
+        let weak: std::sync::Weak<Inner> = Arc::downgrade(&self.inner);
+        let holders: std::sync::Weak<dyn Send + Sync> = weak;
+        Released::new(
+            holders,
+            Arc::clone(&self.inner.released),
+            self.inner.dir.clone(),
+        )
+    }
+
     /// Opens the store in `dir`, creating the directory and its layout if missing,
     /// locking it, and removing every file left in `tmp/`. A write is refused while the
     /// file system would be left with less than `floor` free.
@@ -237,16 +292,18 @@ impl FsStore {
     ) -> Result<Self, FsStoreError> {
         fs::create_dir_all(dir).map_err(open_failed("create", dir))?;
         let lock_path = dir.join("LOCK");
-        let lock = File::options()
+        let file = File::options()
             .create(true)
             .truncate(false)
             .write(true)
             .open(&lock_path)
             .map_err(open_failed("open", &lock_path))?;
-        lock.try_lock().map_err(|source| FsStoreError::Locked {
+        file.try_lock().map_err(|source| FsStoreError::Locked {
             path: lock_path.clone(),
             source,
         })?;
+        // From here every way out of the open, an error included, unlocks.
+        let lock = DirLock(file);
         let objects = dir.join("objects");
         for shard in 0..=u8::MAX {
             let path = objects.join(format!("{shard:02x}"));
@@ -271,7 +328,9 @@ impl FsStore {
                 listing: Mutex::new(None),
                 window: LISTING_WINDOW,
                 walks: AtomicU64::new(0),
-                _lock: lock,
+                lock,
+                released: Arc::new(Gate::default()),
+                dir: dir.to_path_buf(),
             }),
         })
     }
@@ -828,6 +887,8 @@ impl ObjectStore for FsStore {
 
 #[cfg(test)]
 mod tests {
+    use kbf_testkit::dir::TestDir;
+
     use super::*;
 
     fn key(name: &str) -> ObjectKey {
@@ -858,8 +919,7 @@ mod tests {
     /// and a listing that ended keeps nothing for the next.
     #[tokio::test]
     async fn a_paged_listing_reads_the_headers_once() {
-        let dir = std::env::temp_dir().join(format!("kbf-objstore-walks.{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = TestDir::under(std::env::temp_dir(), "kbf-objstore-walks");
         let store = FsStore::open(&dir, Floor::Bytes(1)).expect("open");
         for i in 0..7 {
             for p in ["a", "b"] {
@@ -907,7 +967,6 @@ mod tests {
         assert_eq!(keys, ["b/0", "b/1"]);
         assert_eq!(walks(), 6);
         drop(store);
-        fs::remove_dir_all(&dir).expect("remove");
     }
 
     /// Catches a listing that keeps every key under its prefix (memory growing with the
@@ -918,8 +977,7 @@ mod tests {
     /// a shard directory that is not an object is skipped by every walk.
     #[tokio::test]
     async fn a_listing_longer_than_its_window_keeps_one_window_at_a_time() {
-        let dir = std::env::temp_dir().join(format!("kbf-objstore-window.{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = TestDir::under(std::env::temp_dir(), "kbf-objstore-window");
         let mut store = FsStore::open(&dir, Floor::Bytes(1)).expect("open");
         Arc::get_mut(&mut store.inner).expect("one handle").window = 3;
         for i in 0..7 {
@@ -954,7 +1012,6 @@ mod tests {
         assert_eq!(store.inner.walks.load(Ordering::Relaxed), 3);
         assert!(store.inner.listing.lock().expect("lock").is_none());
         drop(store);
-        fs::remove_dir_all(&dir).expect("remove");
     }
 
     /// Catches a fresh listing [`ListToken::after`] a key that walks from the start of
@@ -964,8 +1021,7 @@ mod tests {
     /// the listing is exactly the keys after it, in order.
     #[tokio::test]
     async fn a_file_store_listing_resumed_past_its_window_lists_only_the_rest() {
-        let dir = std::env::temp_dir().join(format!("kbf-objstore-resume.{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = TestDir::under(std::env::temp_dir(), "kbf-objstore-resume");
         let mut store = FsStore::open(&dir, Floor::Bytes(1)).expect("open");
         Arc::get_mut(&mut store.inner).expect("one handle").window = 3;
         for i in 0..9 {
@@ -995,6 +1051,5 @@ mod tests {
             }
         }
         drop(store);
-        fs::remove_dir_all(&dir).expect("remove");
     }
 }

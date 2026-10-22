@@ -11,8 +11,8 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use kbf_mac_provision::launchd::render_plist;
 use kbf_mac_provision::profile::Profile;
 use support::{
-    ERR_LOG, FakeMac, HOMES, KEY, PLIST, SCRATCH, apply, calls, check, golden_plist,
-    golden_plist_as, lines, ls, sha256_hex,
+    CONFIG, ERR_LOG, FakeMac, HOMES, KEY, ORDERS, PLIST, SCRATCH, apply, calls, check,
+    golden_config, golden_plist, golden_plist_as, lines, ls, sha256_hex,
 };
 
 /// The profile of `mac` with `extra` lines added (the property list follows it).
@@ -359,8 +359,16 @@ fn setting_daemon_user_root_on_a_role_mac_moves_the_daemon_to_root() {
         [
             "CHANGE daemon_user: /usr/local/kbf/etc/node.key root's, mode 600",
             "CHANGE daemon_user: /Volumes/kbf/data root's, mode 755",
+            "CHANGE launchd_label: /var/db/kbf-installer/orders root's, mode 700",
             "CHANGE launchd_label: wrote /Library/LaunchDaemons/org.example.kbf-daemon.plist and restarted the job (error log truncated)",
         ]
+    );
+    assert_eq!(ls(&mac, ORDERS), "drwx------ 0 0");
+    // The profile's bytes changed and `kbf.toml` did not: it holds no label made from the
+    // profile's SHA-256, so a profile edit alone leaves it as it was (no rewrite above).
+    assert_eq!(
+        fs::read_to_string(mac.path(CONFIG)).unwrap(),
+        golden_config()
     );
     let sha = sha256_hex(mac.profile_text().as_bytes());
     assert_eq!(

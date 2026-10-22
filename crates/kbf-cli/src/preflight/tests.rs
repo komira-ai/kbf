@@ -9,12 +9,13 @@ use std::time::SystemTime;
 
 use rcgen::{ExtendedKeyUsagePurpose as Eku, KeyUsagePurpose, SanType};
 
-use super::host::{Kind, Output, Stat};
+use super::host::{Kind, Lstat, Output, Stat};
 use super::{
-    CertNeed, Class, ContainerNeed, FileNeed, Host, NOT_READY, Needs, REFUSED, Report, Row, check,
+    CertNeed, Class, ContainerNeed, FileNeed, Host, KeyRule, NOT_READY, Needs, REFUSED, Report,
+    Row, check,
 };
 
-const ME: u32 = 1000;
+pub(super) const ME: u32 = 1000;
 const CA: &str = "/etc/kbf/ca.pem";
 const CERT: &str = "/etc/kbf/node.pem";
 const KEY: &str = "/etc/kbf/node.key";
@@ -23,30 +24,36 @@ const CRUN: &str = "/usr/bin/crun";
 // ---- a planted host -------------------------------------------------------------------
 
 #[derive(Clone)]
-struct Fake {
+pub(super) struct Fake {
     files: BTreeMap<PathBuf, (Stat, Vec<u8>)>,
     stat_errors: BTreeMap<PathBuf, io::ErrorKind>,
-    read_errors: BTreeMap<PathBuf, io::ErrorKind>,
+    pub(super) read_errors: BTreeMap<PathBuf, io::ErrorKind>,
+    gids: BTreeMap<PathBuf, u32>,
     vars: BTreeMap<String, String>,
     euid: u32,
+    egid: u32,
+    groups: Vec<u32>,
     nofile: u64,
     programs: BTreeMap<PathBuf, Result<(bool, String), io::ErrorKind>>,
 }
 
 impl Fake {
-    fn empty() -> Self {
+    pub(super) fn empty() -> Self {
         Self {
             files: BTreeMap::new(),
             stat_errors: BTreeMap::new(),
             read_errors: BTreeMap::new(),
+            gids: BTreeMap::new(),
             vars: BTreeMap::new(),
             euid: ME,
+            egid: ME,
+            groups: vec![ME],
             nofile: 1 << 20,
             programs: BTreeMap::new(),
         }
     }
 
-    fn put(mut self, path: &str, kind: Kind, uid: u32, mode: u32, bytes: &[u8]) -> Self {
+    pub(super) fn put(mut self, path: &str, kind: Kind, uid: u32, mode: u32, bytes: &[u8]) -> Self {
         self.files.insert(
             PathBuf::from(path),
             (Stat { kind, uid, mode }, bytes.to_vec()),
@@ -54,24 +61,42 @@ impl Fake {
         self
     }
 
-    fn file(self, path: &str, mode: u32, bytes: &[u8]) -> Self {
+    /// A directory, owned by `uid`:`gid`.
+    pub(super) fn dir(mut self, path: &str, uid: u32, gid: u32, mode: u32) -> Self {
+        self.gids.insert(PathBuf::from(path), gid);
+        self.put(path, Kind::Dir, uid, mode, b"")
+    }
+
+    /// A process run as `uid`:`gid` with the supplementary `groups`.
+    pub(super) fn running_as(mut self, uid: u32, gid: u32, groups: &[u32]) -> Self {
+        (self.euid, self.egid, self.groups) = (uid, gid, groups.to_vec());
+        self
+    }
+
+    /// A path whose `stat` fails with `kind`, and so does its `lstat`.
+    pub(super) fn unreadable(mut self, path: &str, kind: io::ErrorKind) -> Self {
+        self.stat_errors.insert(PathBuf::from(path), kind);
+        self
+    }
+
+    pub(super) fn file(self, path: &str, mode: u32, bytes: &[u8]) -> Self {
         self.put(path, Kind::File, ME, mode, bytes)
     }
 
-    fn var(mut self, name: &str, value: &str) -> Self {
+    pub(super) fn var(mut self, name: &str, value: &str) -> Self {
         self.vars.insert(name.to_owned(), value.to_owned());
         self
     }
 
     /// Changes the owner and mode of a file already there, keeping its bytes.
-    fn chmod(mut self, path: &str, uid: u32, mode: u32) -> Self {
+    pub(super) fn chmod(mut self, path: &str, uid: u32, mode: u32) -> Self {
         let (stat, _) = self.files.get_mut(Path::new(path)).expect("file there");
         stat.uid = uid;
         stat.mode = mode;
         self
     }
 
-    fn without(mut self, path: &str) -> Self {
+    pub(super) fn without(mut self, path: &str) -> Self {
         self.files.remove(Path::new(path));
         self
     }
@@ -104,6 +129,12 @@ impl Host for Fake {
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
     }
 
+    fn lstat(&self, path: &Path) -> io::Result<Lstat> {
+        let stat = self.stat(path)?;
+        let gid = self.gids.get(path).copied().unwrap_or(stat.uid);
+        Ok(Lstat { stat, gid })
+    }
+
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         if let Some(kind) = self.read_errors.get(path) {
             return Err(io::Error::from(*kind));
@@ -119,8 +150,20 @@ impl Host for Fake {
         self.vars.get(name).cloned()
     }
 
+    fn var_names(&self) -> Vec<String> {
+        self.vars.keys().cloned().collect()
+    }
+
     fn euid(&self) -> u32 {
         self.euid
+    }
+
+    fn egid(&self) -> u32 {
+        self.egid
+    }
+
+    fn groups(&self) -> Vec<u32> {
+        self.groups.clone()
     }
 
     fn nofile(&self) -> u64 {
@@ -205,6 +248,33 @@ impl Leaf {
     }
 }
 
+/// The flags of a daemon that runs containers, with every file it names.
+pub(super) const DAEMON: [&str; 8] = [
+    "--server=https://front:7070",
+    "--ca-cert=/c/ca.pem",
+    "--cert=/c/node.pem",
+    "--key=/c/node.key",
+    "--node-id=node-1",
+    "--driver=container",
+    "--oci-runtime=/opt/crun",
+    "--data-dir=/var/lib/kbf",
+];
+
+/// [`needs_from`] for a start that loads the settings file `config`.
+pub(super) fn needs_from_in(args: &[&str], config: &str) -> Needs {
+    let argv = std::iter::once("kbf").chain(args.iter().copied());
+    super::needs_in(
+        &crate::parse_from(argv).expect("flags parse"),
+        Path::new(config),
+    )
+}
+
+/// The needs of `kbf` run with `args`: from the flags to the checks, as a start goes.
+pub(super) fn needs_from(args: &[&str]) -> Needs {
+    let argv = std::iter::once("kbf").chain(args.iter().copied());
+    super::needs(&crate::parse_from(argv).expect("flags parse"))
+}
+
 // ---- the needs of a daemon ----------------------------------------------------------------
 
 fn file(flag: &'static str, path: &str, secret: bool) -> FileNeed {
@@ -212,6 +282,7 @@ fn file(flag: &'static str, path: &str, secret: bool) -> FileNeed {
         flag,
         path: PathBuf::from(path),
         secret,
+        exact_len: None,
     }
 }
 
@@ -235,6 +306,9 @@ fn daemon_needs() -> Needs {
         container: Some(ContainerNeed {
             oci_runtime: PathBuf::from(CRUN),
         }),
+        hot_store: None,
+        cpuset: false,
+        key: KeyRule::None,
     }
 }
 
@@ -716,6 +790,9 @@ fn s3_needs() -> Needs {
         certs: vec![],
         s3: true,
         container: None,
+        hot_store: None,
+        cpuset: false,
+        key: KeyRule::None,
     }
 }
 
@@ -966,6 +1043,7 @@ fn the_exit_statuses_are_the_ones_the_units_and_the_storage_classifier_use() {
 // ---- the flags of each mode reach the checks ----------------------------------------------
 
 mod system {
+    use std::os::unix::fs::MetadataExt as _;
     use std::path::Path;
 
     use super::super::Host as _;
@@ -992,6 +1070,40 @@ mod system {
         );
     }
 
+    /// Catches `lstat` following a link (a link is itself, [`Kind::Link`], where `stat`
+    /// reads its target), and the owner's group missing from what `stat` says.
+    #[test]
+    fn lstat_does_not_follow_a_link_and_stat_has_the_group() {
+        let exe = Path::new("/proc/self/exe");
+        assert_eq!(System.lstat(exe).expect("link").stat.kind, Kind::Link);
+        assert_eq!(System.stat(exe).expect("target").kind, Kind::File);
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let d = System.lstat(dir).expect("dir");
+        assert_eq!(d.stat.kind, Kind::Dir);
+        assert_eq!(d.gid, std::fs::metadata(dir).expect("meta").gid());
+        assert_eq!(
+            System
+                .lstat(&dir.join("no-such"))
+                .expect_err("absent")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    /// Catches the process's ids and environment names read from anywhere but the process.
+    #[test]
+    fn the_process_ids_and_environment_are_the_process_own() {
+        assert_eq!(System.euid(), rustix::process::geteuid().as_raw());
+        assert_eq!(System.egid(), rustix::process::getegid().as_raw());
+        let groups: Vec<u32> = rustix::process::getgroups()
+            .expect("groups")
+            .iter()
+            .map(|g| g.as_raw())
+            .collect();
+        assert_eq!(System.groups(), groups);
+        assert!(System.var_names().iter().any(|n| n == "PATH"));
+    }
+
     #[test]
     fn run_collects_stdout_and_the_exit_status() {
         let ok = System.run(Path::new("/bin/echo"), &["hi"]).expect("runs");
@@ -1013,6 +1125,7 @@ mod wiring {
 
     use super::super::{CertNeed, Needs};
     use super::super::{Row, needs};
+    use super::DAEMON;
 
     fn parse(args: &[&str]) -> Needs {
         let argv = std::iter::once("kbf").chain(args.iter().copied());
@@ -1029,17 +1142,6 @@ mod wiring {
             .find(|c| c.flag == flag)
             .unwrap_or_else(|| panic!("no certificate {flag} in {:?}", n.certs))
     }
-
-    const DAEMON: [&str; 8] = [
-        "--server=https://front:7070",
-        "--ca-cert=/c/ca.pem",
-        "--cert=/c/node.pem",
-        "--key=/c/node.key",
-        "--node-id=node-1",
-        "--driver=container",
-        "--oci-runtime=/opt/crun",
-        "--data-dir=/var/lib/kbf",
-    ];
 
     fn with(mode: &'static str, own: &[&'static str], rest: &[&'static str]) -> Needs {
         let all: Vec<&str> = std::iter::once(mode)
@@ -1067,6 +1169,58 @@ mod wiring {
             PathBuf::from("/opt/crun")
         );
         assert!(!n.s3);
+    }
+
+    /// Catches the host-reading rules of check-units not reaching the flags: the cpuset
+    /// of a daemon on the container driver (and only there), the `file://` hot store of
+    /// the modes that have one, and each mode's rule over the cold store's key.
+    #[test]
+    fn the_flags_of_each_mode_choose_its_host_rules() {
+        use super::super::{KeyRule, key_file};
+        let daemon = with("daemon", &DAEMON, &[]);
+        assert!(daemon.cpuset && daemon.hot_store.is_none());
+        assert_eq!(daemon.key, KeyRule::Absent);
+        let fake: Vec<&str> = DAEMON
+            .iter()
+            .map(|f| {
+                if *f == "--driver=container" {
+                    "--driver=fake"
+                } else {
+                    f
+                }
+            })
+            .collect();
+        assert!(!with("daemon", &fake, &[]).cpuset);
+        let hot = ["--hot-store=file:///srv/hot"];
+        let s3 = "--cold-store=s3://bucket/p?endpoint=http://127.0.0.1:9000";
+        let storage = with("storage", &[s3, "--meta-dir=/m"], &hot);
+        assert_eq!(storage.hot_store, Some(PathBuf::from("/srv/hot")));
+        assert_eq!(
+            storage.key,
+            KeyRule::Holder(key_file(std::path::Path::new("/etc/kbf/kbf.toml")))
+        );
+        assert!(!storage.cpuset);
+        let both = with("storage-and-daemon", &DAEMON, &[s3, "--meta-dir=/m"]);
+        assert_eq!(
+            both.key,
+            KeyRule::RootAlone(key_file(std::path::Path::new("/etc/kbf/kbf.toml")))
+        );
+        assert!(both.cpuset && both.hot_store.is_none());
+        let s3_hot = ["--hot-store=s3://bucket/p?endpoint=http://127.0.0.1:9000"];
+        assert_eq!(
+            with("storage", &[s3, "--meta-dir=/m"], &s3_hot).hot_store,
+            None
+        );
+        let aio =
+            |cold: &'static str| with("all-in-one", &DAEMON, &["--meta-dir=/m", cold, hot[0]]);
+        assert_eq!(aio(s3).key, KeyRule::None);
+        assert_eq!(aio("--cold-store=file:///c").key, KeyRule::Absent);
+        assert_eq!(aio(s3).hot_store, Some(PathBuf::from("/srv/hot")));
+        let frontend = parse(&["frontend", "--storage=http://127.0.0.1:8983"]);
+        assert_eq!(
+            (frontend.key, frontend.hot_store, frontend.cpuset),
+            (KeyRule::None, None, false)
+        );
     }
 
     #[test]
@@ -1113,6 +1267,19 @@ mod wiring {
         );
         assert!(n.s3);
         assert!(n.container.is_none());
+    }
+
+    /// Catches a preflight that refuses a node for want of `AWS_*` variables when the
+    /// frontend it registers with may give it the key pair (mutant: `s3` ignoring
+    /// `--frontend`): such a node needs none in its environment; the same node without a
+    /// frontend still does.
+    #[test]
+    fn a_node_that_registers_with_a_frontend_may_be_given_the_s3_pair() {
+        let mut registered = STORAGE.to_vec();
+        registered.push("--frontend=https://frontend.example:8981");
+        assert!(!with("storage", &registered, &[]).s3);
+        assert!(!with("storage-and-daemon", &registered, &DAEMON).s3);
+        assert!(with("storage", &STORAGE, &[]).s3);
     }
 
     #[test]
@@ -1173,6 +1340,7 @@ mod wiring {
             "--worker-deny-list=/c/deny",
             "--api-listen=127.0.0.1:8990",
             "--api-token-file=/c/token",
+            "--proxy-auth-file=/c/proxy-secret",
             "--storage-client-cert=/c/fe.pem",
             "--storage-client-key=/c/fe.key",
             "--storage-ca=/c/ca.pem",
@@ -1189,6 +1357,7 @@ mod wiring {
             [
                 "--reapi-tls-key",
                 "--api-token-file",
+                "--proxy-auth-file",
                 "--worker-tls-key",
                 "--storage-client-key"
             ]

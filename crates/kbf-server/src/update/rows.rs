@@ -3,10 +3,10 @@
 //!
 //! | key | value | written by |
 //! |---|---|---|
-//! | `update/desired` | `{generation, commit, set_at}` ([`Desired`]) | an offer |
+//! | `update/desired` | `{generation, commit, set_at}`, and the source when it is not a fetch ([`Desired`]) | an offer |
 //! | `update/policy` | the nine settings (the pause among them), and the node step's limits when they are not the default ([`Policy`]) | the operator, the pause button |
 //! | `update/slot` | the places in use, `{host, order_id, epoch}` each ([`Slot`]): one storage, up to `max_hosts_out` others | the controller |
-//! | `update/host/<id>` | `{phase, order_id, generation, since, boot_before}`, and the run's commit ([`HostRow`]) | the controller |
+//! | `update/host/<id>` | `{phase, order_id, generation, since, boot_before}`, and the run's commit and source ([`HostRow`]) | the controller |
 //!
 //! and two counters: `update/generation`, from which generations are drawn, and
 //! `update/order/<epoch>`, from which order ids are drawn. (The release rows belong to the
@@ -30,7 +30,7 @@ use super::codec::{
     Corrupt, Desired, HostRow, decode_desired, decode_host, decode_policy, decode_slot,
     encode_desired, encode_host, encode_policy, encode_slot,
 };
-use super::facts::{Generation, OrderId, Release};
+use super::facts::{Generation, OrderId, Release, Source};
 use super::policy::{Policy, PolicyError};
 use super::slot::{Holder, Slot, SlotClass};
 
@@ -78,6 +78,14 @@ pub enum RowError {
     /// The policy cannot be kept.
     #[error(transparent)]
     Policy(#[from] PolicyError),
+    /// An offer expected another generation than the one desired now.
+    #[error("the desired release is at generation {found}, not {expected}")]
+    Stale {
+        /// What the offer expected.
+        expected: u64,
+        /// What the row holds (0 before any offer).
+        found: u64,
+    },
     /// An offer names no release.
     #[error("an offer must name a release")]
     NoRelease,
@@ -131,6 +139,12 @@ impl Rows {
         Self { store }
     }
 
+    /// The state store the rows live in, for the other families the controller reads (the
+    /// enrollment registry that joins hosts to members).
+    pub(super) fn store(&self) -> &Arc<dyn Store> {
+        &self.store
+    }
+
     /// The run, if one was ever offered.
     ///
     /// # Errors
@@ -148,12 +162,14 @@ impl Rows {
         }
     }
 
-    /// Sets the desired release to `commit`, under a higher generation. A rollback is the
-    /// older commit offered the same way (section 2.11). Setting the commit that is already
-    /// desired changes nothing and keeps the generation (`pull-updates.md` section 5), so a
-    /// repeated click is not a new run. The generation is drawn from the counter
-    /// `update/generation`; it is never below the current run's plus one, whatever the
-    /// counter says. The pause is in `update/policy` and an offer does not touch it.
+    /// Sets the desired release to `commit`, to be fetched ([`Source::Fetch`]), under a higher
+    /// generation. A rollback is the older commit offered the same way (section 2.11).
+    /// Setting the commit that is already desired, from the same source, changes nothing and
+    /// keeps the generation (`pull-updates.md` section 5), so a repeated click is not a new
+    /// run; the same commit from another source is a new run. The generation is drawn from
+    /// the counter `update/generation`; it is never below the current run's plus one,
+    /// whatever the counter says. The pause is in `update/policy` and an offer does not touch
+    /// it.
     ///
     /// A host that has done nothing irreversible is given back when the generation moves
     /// (see [`super::Controller`]); a host past the activate order finishes its step.
@@ -161,12 +177,38 @@ impl Rows {
     /// # Errors
     /// [`RowError`]: the store failed, the row cannot be read, or `commit` is empty.
     pub fn offer(&self, commit: &Release, now: FarmTime) -> Result<Desired, RowError> {
+        self.offer_expecting(commit, Source::Fetch, now, None)
+    }
+
+    /// [`Rows::offer`] from `source`, that writes only if the desired release is at generation
+    /// `expected` (0 before any offer): a compare-and-set, so a click made on a stale page
+    /// does not replace what another operator has just set. The check and the write are one
+    /// conditional write of the row.
+    ///
+    /// # Errors
+    /// [`RowError::Stale`] when the generation is another; otherwise as [`Rows::offer`].
+    pub fn offer_expecting(
+        &self,
+        commit: &Release,
+        source: Source,
+        now: FarmTime,
+        expected: Option<u64>,
+    ) -> Result<Desired, RowError> {
         if commit.as_str().is_empty() {
             return Err(RowError::NoRelease);
         }
         for _ in 0..ATTEMPTS {
             let current = self.desired()?;
-            if let Some(same) = current.value.as_ref().filter(|d| d.commit == *commit) {
+            if let Some(expected) = expected {
+                let found = current.value.as_ref().map_or(0, |d| d.generation.0);
+                if found != expected {
+                    return Err(RowError::Stale { expected, found });
+                }
+            }
+            // The run is the pair: `Release` has equality only, so the pair is compared
+            // field by field and never ordered.
+            let is_this_run = |d: &&Desired| d.commit == *commit && d.source == source;
+            if let Some(same) = current.value.as_ref().filter(is_this_run) {
                 return Ok(same.clone());
             }
             let drawn = self.store.txn(Txn::new().next(GENERATION))??;
@@ -181,6 +223,7 @@ impl Rows {
                 generation: Generation(counter.max(above)),
                 commit: commit.clone(),
                 set_at: now,
+                source,
             };
             let txn = Txn::new().put(DESIRED, encode_desired(&next), current.cond());
             if self.store.txn(txn)?.is_ok() {
@@ -211,6 +254,17 @@ impl Rows {
             }
         }
         Err(RowError::Contended(POLICY))
+    }
+
+    /// The policy row, if the operator ever wrote one.
+    ///
+    /// # Errors
+    /// [`RowError`]: the store failed or the row cannot be read.
+    pub fn policy_if_set(&self) -> Result<Option<Policy>, RowError> {
+        self.store
+            .get(POLICY)?
+            .map(|row| read(POLICY, &row, decode_policy))
+            .transpose()
     }
 
     /// The policy: the row if there is one, else the design's defaults.

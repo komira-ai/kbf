@@ -4,7 +4,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::{FutureExt as _, StreamExt as _};
+use futures::{FutureExt as _, StreamExt as _, stream};
 use kbf_map::MemberId;
 use kbf_proto::reapi::ActionResult;
 use kbf_segments::RecordHasher;
@@ -119,18 +119,18 @@ impl Router {
         let filling = &filling;
         let walked = self
             .routed(|view| async move {
-                self.walk(&view, &digest, |node| async move {
-                    filling.lock().await.copy(node, digest).await
-                })
-                .await
+                let walked = self
+                    .walk(&view, &digest, |node| async move {
+                        filling.lock().await.copy(node, digest).await
+                    })
+                    .await?;
+                walked.found(digest)
             })
             .await;
         if let Some(failed) = filling.lock().await.failed.take() {
             return Err(IntoError::Sink(failed));
         }
-        walked
-            .and_then(|walked| walked.found(digest))
-            .map_err(IntoError::Storage)
+        walked.map_err(IntoError::Storage)
     }
 
     /// `GetActionResult`: the entry for `action`, and the digest of the blob it was read
@@ -146,61 +146,55 @@ impl Router {
         action: &Digest,
     ) -> Result<Option<(Digest, ActionResult)>, StorageError> {
         let action = *action;
-        let walked = self
-            .routed(|view| async move {
-                let walked = self
-                    .walk(&view, &action, move |node| async move {
-                        node.action_entry(&action).await
-                    })
-                    .await?;
-                let entry = match walked {
-                    Walked::Found(entry) => entry,
-                    Walked::Missed { absent, failure } => {
-                        return Ok(Walked::Missed { absent, failure });
-                    }
-                };
-                // The entry's owner checked its own copy of the closure; the blobs'
-                // owners are asked here, so an entry whose blob is gone from all of them
-                // is a miss (the action runs again).
-                if !self.closure_served(&view, entry.closure.as_deref()).await? {
-                    return Ok(Walked::Missed {
-                        absent: 1,
-                        failure: None,
-                    });
-                }
-                Ok(Walked::Found((entry.result_digest, entry.result)))
-            })
-            .await?;
-        match walked {
-            Walked::Found(entry) => Ok(Some(entry)),
-            Walked::Missed {
-                absent: 0,
-                failure: Some(failure),
-            } => Err(failure),
-            Walked::Missed { .. } => Ok(None),
-        }
+        self.routed(|view| async move {
+            let walked = self
+                .walk(&view, &action, move |node| async move {
+                    node.action_entry(&action).await
+                })
+                .await?;
+            let entry = match walked {
+                Walked::Found(entry) => entry,
+                Walked::Missed {
+                    absent: 0,
+                    failure: Some(failure),
+                } => return Err(failure),
+                Walked::Missed { .. } => return Ok(None),
+            };
+            // The entry's owner checked its own copy of the closure; the blobs'
+            // owners are asked here, so an entry whose blob is gone from all of them
+            // is a miss (the action runs again).
+            if !self.closure_served(&view, entry.closure.as_deref()).await? {
+                return Ok(None);
+            }
+            Ok(Some((entry.result_digest, entry.result)))
+        })
+        .await
     }
 
-    /// The first stretch of a read: the owner that holds the blob answers.
+    /// The first stretch of a read: the owner that holds the blob answers, with its first
+    /// frame (an owner that accepts the read and fails before any byte is one that failed
+    /// to open it). Held, when the router holds ([`Router::with_hold`]), while no owner
+    /// can be reached; a read that goes on after bytes have passed is opened through a
+    /// router that holds nothing (`crate::resume`).
     pub(crate) async fn open(
         &self,
         digest: Digest,
         offset: u64,
         limit: u64,
     ) -> Result<ReadStream, StorageError> {
-        let walked = self
-            .routed(|view| async move {
-                self.walk(&view, &digest, move |node| async move {
+        self.routed(|view| async move {
+            let walked = self
+                .walk(&view, &digest, move |node| async move {
                     match node.read_range(&digest, offset, limit).await {
-                        Ok(stream) => Ok(Some(stream)),
+                        Ok(stream) => first_frame(stream).await.map(Some),
                         Err(StorageError::NotFound(_)) => Ok(None),
                         Err(e) => Err(e),
                     }
                 })
-                .await
-            })
-            .await?;
-        walked.found(digest)
+                .await?;
+            walked.found(digest)
+        })
+        .await
     }
 
     /// The whole blob, in one piece, from the first owner that sends the bytes it names.
@@ -274,7 +268,7 @@ impl Router {
     /// answered after owners of this generation `absent` did not. An owner that failed
     /// without saying it lacked the blob is not in `absent`: it is down, and av2-11 repairs
     /// what it missed when it is back.
-    fn found_elsewhere(
+    pub(crate) fn found_elsewhere(
         &self,
         view: &MapView,
         digest: &Digest,
@@ -293,6 +287,19 @@ impl Router {
         if !missing.is_empty() && repair.limiter.allow() {
             repair.hook.found_elsewhere(digest, found_at, &missing);
         }
+    }
+}
+
+/// `stream` once its first item has arrived: the stream itself, with that item put back, or
+/// the failure that came in its place.
+async fn first_frame(mut stream: ReadStream) -> Result<ReadStream, StorageError> {
+    match stream.next().await {
+        Some(Err(e)) => Err(e),
+        Some(Ok(chunk)) => {
+            let first = stream::iter([Ok(chunk)]);
+            Ok(first.chain(stream).boxed())
+        }
+        None => Ok(stream::empty().boxed()),
     }
 }
 

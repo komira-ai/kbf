@@ -20,6 +20,7 @@
 use std::os::unix::fs::MetadataExt as _;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use kbf_map::Member;
 use kbf_mapsync::MapHolder;
@@ -149,7 +150,8 @@ pub struct FarmCas {
 
 impl FarmCas {
     /// A plane that goes through `server` until `maps` holds a map, and then to the
-    /// nodes `nodes` dials, within the limits `config` names.
+    /// nodes `nodes` dials, within the limits `config` names. A storage call that no
+    /// owner could answer fails at once ([`FarmCas::with_hold`] waits).
     #[must_use]
     pub fn new(
         server: Arc<Transfers>,
@@ -157,8 +159,22 @@ impl FarmCas {
         nodes: Arc<dyn Nodes>,
         config: &TransferConfig,
     ) -> Self {
+        Self::with_hold(server, maps, nodes, config, Duration::ZERO)
+    }
+
+    /// [`FarmCas::new`], holding a storage call that no owner could answer, and trying it
+    /// again, for up to `hold` before it fails ([`Router::with_hold`]): a storage node
+    /// that restarts is away for a while. The daemon process uses [`crate::DEFAULT_HOLD`].
+    #[must_use]
+    pub fn with_hold(
+        server: Arc<Transfers>,
+        maps: Arc<MapHolder>,
+        nodes: Arc<dyn Nodes>,
+        config: &TransferConfig,
+        hold: Duration,
+    ) -> Self {
         let held = Arc::new(HeldMaps::new(Arc::clone(&maps), REFETCH_WITHIN));
-        let routed = RoutedCas::new(Router::new(held, nodes), config);
+        let routed = RoutedCas::new(Router::new(held, nodes).with_hold(hold), config);
         Self {
             server,
             routed: Arc::new(routed),
@@ -360,7 +376,8 @@ impl Nodes for WithLocal {
 /// members that own it by the map `maps` holds (the one the daemon's frontend sends),
 /// the one that is `local` in-process and the others through `rest`. With no map held,
 /// every call fails UNAVAILABLE and nothing is written anywhere: there is no server leg
-/// to fall back on.
+/// to fall back on. A storage call that no owner could answer fails at once
+/// ([`member_cas_with_hold`] waits).
 #[must_use]
 pub fn member_cas(
     maps: Arc<MapHolder>,
@@ -368,7 +385,22 @@ pub fn member_cas(
     rest: Arc<dyn Nodes>,
     config: &TransferConfig,
 ) -> Arc<RoutedCas> {
+    member_cas_with_hold(maps, local, rest, config, Duration::ZERO)
+}
+
+/// [`member_cas`], holding a storage call that no owner could answer, and trying it again,
+/// for up to `hold` before it fails ([`Router::with_hold`]). The daemon process uses
+/// [`crate::DEFAULT_HOLD`].
+#[must_use]
+pub fn member_cas_with_hold(
+    maps: Arc<MapHolder>,
+    local: LocalMember,
+    rest: Arc<dyn Nodes>,
+    config: &TransferConfig,
+    hold: Duration,
+) -> Arc<RoutedCas> {
     let held = Arc::new(HeldMaps::new(maps, REFETCH_WITHIN));
     let nodes = Arc::new(WithLocal { local, rest });
-    Arc::new(RoutedCas::new(Router::new(held, nodes), config))
+    let router = Router::new(held, nodes).with_hold(hold);
+    Arc::new(RoutedCas::new(router, config))
 }

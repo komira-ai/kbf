@@ -18,13 +18,15 @@
 //! ```text
 //! kbf-daemon --driver native --server https://kbf-server:8981 --cas https://kbf-server:8981 \
 //!   --ca-cert ca.pem --cert node.pem --key node.key --node-id mac-studio-1 \
-//!   --data-dir /var/kbf --label pool=darwin-sized
+//!   --data-dir /var/kbf
 //! ```
 //!
 //! Exits non-zero when the node cannot be detected or the configuration cannot be
-//! loaded; otherwise runs until SIGTERM or SIGINT, then exits zero. Leases still
-//! running then are abandoned (their processes killed, their directories removed);
-//! the scheduler places them again.
+//! loaded; otherwise runs until SIGTERM or SIGINT, then drains: it takes no new lease,
+//! lets the running ones finish and report, waits for their acknowledgements and exits
+//! zero. A second signal, or `--drain-deadline-secs` after the first, stops it at once;
+//! leases still running then are abandoned (their processes killed, their directories
+//! removed) and the scheduler places them again.
 //!
 //! Everything the daemon keeps on disk is under one directory, `--data-dir` (default
 //! `/var/lib/kbf`; `data_dir`): `leases/`, and under the container driver and the
@@ -125,12 +127,17 @@ pub struct Cli {
     /// one connection, within the `--transfer-*` limits.
     #[arg(long)]
     cas: Option<String>,
-    /// The update directory: the daemon fetches the release the frontend offers into
-    /// its `inbox/`, over the connection `--cas` names, and reads the root helper's
-    /// `status.json` there. Left out, the node updates by hand: it says so and touches
-    /// no directory. Not taken by the all-in-one binary yet.
+    /// The root installer's directory: the daemon reads its `status.json` there. The
+    /// frontend's orders are written to `orders/` beneath it unless `--orders-dir` says
+    /// otherwise. Left out, the node updates by hand: it says so and touches no
+    /// directory. Not taken by the all-in-one binary yet.
     #[arg(long, value_name = "DIR")]
     update_dir: Option<PathBuf>,
+    /// The order spool (owned by the service user, mode 0700): where the daemon writes
+    /// the order records the root installer reads. With `--update-dir` only; default
+    /// `<update-dir>/orders`.
+    #[arg(long, value_name = "DIR", requires = "update_dir")]
+    orders_dir: Option<PathBuf>,
     #[command(flatten)]
     data: data_dir::DataArgs,
     #[command(flatten)]
@@ -215,6 +222,13 @@ pub struct Cli {
     /// pressure stall information (macOS, a kernel built without it).
     #[arg(long, default_value_t = 10.0, value_parser = percent)]
     memory_pressure_pause_percent: f64,
+    /// On the first SIGTERM or SIGINT the daemon drains: it takes no new lease, lets
+    /// the running ones finish and report, waits for their acknowledgements, then exits
+    /// 0. A second signal, or this many seconds after the first, stops it at once and
+    /// abandons the leases still running. Used by `kbf daemon` and `kbf
+    /// storage-and-daemon`; `kbf all-in-one` stops its daemon half with the server half.
+    #[arg(long, default_value_t = 600)]
+    drain_deadline_secs: u64,
     /// Where the kernel reports memory pressure stall information. For tests only.
     #[arg(long, hide = true, default_value = kbf_daemon::pressure::MEMORY_PSI)]
     psi_memory_file: PathBuf,
@@ -433,31 +447,131 @@ fn sizes_on(
 pub struct NodeHandle {
     tokio: tokio::runtime::Runtime,
     daemon: Daemon,
+    /// `--drain-deadline-secs`.
+    drain_deadline: Duration,
+    /// The storage network check of a daemon that keeps the frontend's map.
+    reach: Option<ReachCheck>,
+}
+
+/// What [`kbf_daemon::reach`] needs once the daemon serves: the map it keeps and the
+/// member that is this process, which is not dialled.
+struct ReachCheck {
+    maps: Arc<MapHolder>,
+    local: Option<String>,
+    plan: kbf_daemon::reach::Plan,
+}
+
+impl ReachCheck {
+    /// Completes with the error when no storage member answers the first map's probe;
+    /// never otherwise.
+    async fn refused(self) -> Error {
+        let checked =
+            kbf_daemon::reach::check_first_map(self.maps, self.local.as_deref(), self.plan).await;
+        match checked {
+            Err(error) => error.into(),
+            Ok(()) => std::future::pending().await,
+        }
+    }
+}
+
+/// `serving` until it ends, or until `reach` finds no storage member reachable: then the
+/// error, and the daemon is dropped (its leases abandoned, as at any stop).
+async fn serve_or_refuse(
+    serving: std::pin::Pin<Box<dyn Future<Output = ()> + '_>>,
+    reach: Option<ReachCheck>,
+) -> Result<(), Error> {
+    let refused = async {
+        match reach {
+            Some(reach) => reach.refused().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        () = serving => Ok(()),
+        error = refused => Err(error),
+    }
 }
 
 impl NodeHandle {
+    /// This node, ending with an error when the first storage map it holds names members
+    /// and none answers a connect (`local`, this process's own member, is not tried).
+    fn checking_reach(mut self, maps: Arc<MapHolder>, local: Option<String>) -> Self {
+        self.reach = Some(ReachCheck {
+            maps,
+            local,
+            plan: kbf_daemon::reach::Plan::DEFAULT,
+        });
+        self
+    }
+
     /// Serves until SIGTERM or SIGINT.
     ///
     /// # Errors
-    /// The signal handlers cannot be installed.
+    /// The signal handlers cannot be installed, or no storage member is reachable from
+    /// this host ([`kbf_daemon::reach`]).
     pub fn serve(self) -> Result<(), Error> {
-        // A signal handler is registered with the runtime's reactor, so the runtime's
-        // context is entered while it is made.
-        let (term, int) = {
+        let signals = {
             let _context = self.tokio.enter();
-            (
-                signal(SignalKind::terminate())?,
-                signal(SignalKind::interrupt())?,
-            )
+            Signals::install()?
         };
-        self.serve_until(shutdown(term, int));
-        Ok(())
+        self.serve_alongside(signals, std::future::pending())
+    }
+
+    /// [`Self::serve`] for a daemon beside another half in the same process, on `signals`
+    /// the caller installed earlier ([`Signals::install`]: one that arrived since then is
+    /// the first, so a stop during the other half's start is not lost). The first signal
+    /// drains as `serve` does (the half beside it is not told until the drain is over, so
+    /// a running lease still reaches its blobs through it), and `other` completing (that
+    /// half stopped on its own) stops the daemon at once, abandoning the leases still
+    /// running.
+    ///
+    /// # Errors
+    /// As [`Self::serve`], less the handlers.
+    pub fn serve_alongside(
+        self,
+        signals: Signals,
+        other: impl Future<Output = ()>,
+    ) -> Result<(), Error> {
+        let (sender, received) = tokio::sync::mpsc::unbounded_channel();
+        self.tokio.spawn(forward(signals, sender));
+        self.drain_on(received, other)
+    }
+
+    /// Drains on the first of `received` and ends at the second, at the drain deadline,
+    /// or when `other` completes, whichever is first ([`Daemon::run_draining`]).
+    fn drain_on(
+        self,
+        received: tokio::sync::mpsc::UnboundedReceiver<()>,
+        other: impl Future<Output = ()>,
+    ) -> Result<(), Error> {
+        let Self {
+            tokio,
+            daemon,
+            drain_deadline,
+            reach,
+        } = self;
+        let serving = Box::pin(async {
+            tokio::select! {
+                () = daemon.run_draining(received, drain_deadline) => {}
+                () = other => tracing::warn!("the half beside the daemon stopped: stopping"),
+            }
+        });
+        tokio.block_on(serve_or_refuse(serving, reach))
     }
 
     /// Serves until `shutdown` completes, then abandons the leases still running.
-    pub fn serve_until(self, shutdown: impl Future<Output = ()>) {
-        let Self { tokio, daemon } = self;
-        tokio.block_on(daemon.run(shutdown));
+    ///
+    /// # Errors
+    /// No storage member is reachable from this host ([`kbf_daemon::reach`]).
+    pub fn serve_until(self, shutdown: impl Future<Output = ()>) -> Result<(), Error> {
+        let Self {
+            tokio,
+            daemon,
+            reach,
+            ..
+        } = self;
+        let serving = Box::pin(daemon.run(shutdown));
+        tokio.block_on(serve_or_refuse(serving, reach))
     }
 }
 
@@ -473,9 +587,10 @@ pub fn start(cli: &Cli) -> Result<NodeHandle, Error> {
     // routes by it.
     let maps = Arc::new(MapHolder::new());
     let held = Arc::clone(&maps);
-    start_over(cli, Some(maps), move |cli, liveness| {
+    let node = start_over(cli, Some(Arc::clone(&maps)), move |cli, liveness| {
         farm(cli, &held, liveness).map(|(plane, _)| plane)
-    })
+    })?;
+    Ok(node.checking_reach(maps, None))
 }
 
 /// [`start`], for a daemon in the process of the storage node `local` (`kbf
@@ -489,9 +604,11 @@ pub fn start(cli: &Cli) -> Result<NodeHandle, Error> {
 pub fn start_member(cli: &Cli, local: LocalMember) -> Result<NodeHandle, Error> {
     let maps = Arc::new(MapHolder::new());
     let held = Arc::clone(&maps);
-    start_over(cli, Some(maps), move |cli, liveness| {
+    let own = local.addr().to_owned();
+    let node = start_over(cli, Some(Arc::clone(&maps)), move |cli, liveness| {
         member(cli, &held, &local, liveness)
-    })
+    })?;
+    Ok(node.checking_reach(maps, Some(own)))
 }
 
 /// [`start`], with every runtime reading and writing blobs through the data plane
@@ -546,7 +663,12 @@ fn start_over<C: Cas>(
         let daemon = update.into_iter().fold(daemon, Daemon::with_update);
         backstop(cli, daemon)
     };
-    Ok(NodeHandle { tokio, daemon })
+    Ok(NodeHandle {
+        tokio,
+        daemon,
+        drain_deadline: Duration::from_secs(cli.drain_deadline_secs),
+        reach: None,
+    })
 }
 
 /// The data plane of a daemon whose server is elsewhere: the process's transfer engine
@@ -572,7 +694,13 @@ fn farm(
          storage nodes it names"
     );
     let held = nodes.liveness();
-    let plane = FarmCas::new(server, Arc::clone(maps), nodes, &cli.transfer.config());
+    let plane = FarmCas::with_hold(
+        server,
+        Arc::clone(maps),
+        nodes,
+        &cli.transfer.config(),
+        kbf_daemon::DEFAULT_HOLD,
+    );
     Ok((Arc::new(plane), held))
 }
 
@@ -585,11 +713,12 @@ fn member(
     liveness: Liveness,
 ) -> Result<Arc<kbf_transfer::RoutedCas>, Error> {
     let nodes = kbf_daemon::storage_nodes(&DaemonConfig::from_args(&cli.daemon).tls, liveness)?;
-    Ok(kbf_daemon::member_cas(
+    Ok(kbf_daemon::member_cas_with_hold(
         Arc::clone(maps),
         local.clone(),
         nodes,
         &cli.transfer.config(),
+        kbf_daemon::DEFAULT_HOLD,
     ))
 }
 
@@ -721,7 +850,7 @@ impl<C: Cas> Node<C> {
 /// configuration `native` makes and the `xcrun` it surveys with and
 /// warms (a test names its own user folders and sandbox, and an `xcrun` of its own).
 /// Also returns what the native driver's Xcode watch sends the daemon, for a test to
-/// follow. Its node report is the detected entries, the labels and a `drivers` entry
+/// follow. Its node report is the detected entries and a `drivers` entry
 /// per runtime (which `Daemon::new` adds), its `cpus` and `mem_gib` no more than the
 /// container driver allows; the native driver adds its own with
 /// `Daemon::with_driver_report`. Its status lists every `--image`, which only the
@@ -777,10 +906,7 @@ fn node_over<C: Cas>(
     let leases = sizes(cli)?.lease_cpus() as u64;
     node.capacity.cpus = Some(node.capacity.cpus.map_or(leases, |cpus| cpus.min(leases)));
     // `Daemon::new` adds every runtime's driver.
-    let report = offered(
-        NodeReport::detect(&[])?.with_entries(cli.daemon.label_entries()),
-        node.capacity,
-    );
+    let report = offered(NodeReport::detect(&[])?, node.capacity);
     // A node without the whole-machine runtime is always serving: a phase that never
     // changes.
     let phase = node
@@ -878,13 +1004,44 @@ fn native_runtime<C: Cas>(
 /// What the native driver's surveys send the daemon, merged.
 type Reports = tokio::sync::watch::Receiver<kbf_daemon::DriverReport>;
 
-/// Completes on SIGTERM or SIGINT.
-async fn shutdown(mut term: Signal, mut int: Signal) {
-    let name = tokio::select! {
-        _ = term.recv() => "SIGTERM",
-        _ = int.recv() => "SIGINT",
-    };
-    tracing::info!("{name}: shutting down");
+/// The SIGTERM and SIGINT handlers of a process.
+pub struct Signals {
+    term: Signal,
+    int: Signal,
+}
+
+impl Signals {
+    /// Installs the handlers now, in the context of the tokio runtime that is entered:
+    /// from here on a signal is kept until [`Self::recv`] takes it, not given its default
+    /// action (which ends the process).
+    ///
+    /// # Errors
+    /// The handlers cannot be installed.
+    pub fn install() -> std::io::Result<Self> {
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    /// The next SIGTERM or SIGINT (two that arrived before it count as one), by name.
+    pub async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.term.recv() => "SIGTERM",
+            _ = self.int.recv() => "SIGINT",
+        }
+    }
+}
+
+/// Sends a `()` on `signals` for every SIGTERM or SIGINT, until the receiver is gone.
+async fn forward(mut signals: Signals, sender: tokio::sync::mpsc::UnboundedSender<()>) {
+    loop {
+        let name = signals.recv().await;
+        tracing::info!("{name}: shutting down");
+        if sender.send(()).is_err() {
+            return;
+        }
+    }
 }
 
 /// The data directory, resolved and made, for a daemon that runs a driver that keeps
@@ -899,14 +1056,21 @@ fn data_dir(cli: &Cli) -> Result<Option<data_dir::Plan>, Error> {
     // The drivers that link or clone leases' inputs from the cache.
     let cached = cli.drivers.contains(&Driver::Container)
         || (cfg!(target_os = "macos") && cli.drivers.contains(&Driver::Native));
-    // The container ids are not the daemon's: `leases` must be searchable.
-    let oci = cli.drivers.contains(&Driver::Container);
-    let plan = data_dir::Plan::new(&cli.data, cached, &Statvfs)?.with_open_leases(oci);
+    let plan = data_dir::Plan::new(&cli.data, cached, &Statvfs)?.with_open_leases(leases_open(cli));
     plan.create()?;
     for line in plan.describe() {
         tracing::info!("{line}");
     }
     Ok(Some(plan))
+}
+
+/// Whether `<--data-dir>/leases` must be searchable by others (0711, not the daemon's
+/// 0700): the container ids of the container driver are not the daemon's, and neither
+/// are the pool users of the native driver (`--pool-users`), each of which must reach
+/// its own lease directory through it. A native daemon run as its own user keeps 0700.
+fn leases_open(cli: &Cli) -> bool {
+    cli.drivers.contains(&Driver::Container)
+        || (cli.pool_users.is_some() && cli.drivers.contains(&Driver::Native))
 }
 
 /// The lease directory root, `<--data-dir>/leases`, which the real drivers require.
@@ -1117,7 +1281,9 @@ mod data_dir;
 mod instance;
 mod run;
 mod transfer;
-mod update;
+/// The node's update client, set up from `--update-dir` (public for the tests that read a
+/// host's `kbf.toml` into a node: kbf-cli's).
+pub mod update;
 mod whole_machine;
 
 #[cfg(test)]
@@ -1321,6 +1487,55 @@ mod tests {
         let root = pooled(&["--pool-users=1", "--pool-first-uid=0"]).expect("flags");
         let refused = native_config(&root).expect_err("a pool at uid 0");
         assert!(refused.to_string().contains("root"), "{refused}");
+    }
+
+    /// Catches a native daemon with a lease-user pool that makes `leases` 0700, which a
+    /// pool user cannot search: its first lease fails with "working directory:
+    /// Permission denied" (measured on a Mac with `--pool-users`). Starts the data
+    /// directory the way the daemon does: with a pool `leases` is
+    /// `kbf_driver_native::slots::LEASES_ROOT_MODE` (0711: searched, not listed, by the
+    /// slot users), and a leftover 0700 one from a start without the pool is opened;
+    /// without a pool the daemon's own user alone keeps it (0700); the container driver
+    /// keeps its 0711; the fake driver with a pool flag and no native driver does not
+    /// open it.
+    #[test]
+    fn leases_are_searchable_by_the_pool_users_of_a_native_daemon_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = tests::scratch("leases-pool-mode");
+        let mode = |dir: &Path| {
+            std::fs::metadata(dir.join("leases"))
+                .expect("leases")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let start = |name: &str, extra: &[&str]| {
+            let dir = base.join(name);
+            let data = format!("--data-dir={}", dir.display());
+            let flags = [&["--driver=native", data.as_str()][..], extra].concat();
+            let cli = parse(&flags).expect("flags");
+            data_dir(&cli).expect("started").expect("a data dir");
+            dir
+        };
+        let pool = ["--pool-users=2", "--pool-first-uid=700"];
+        let pooled = start("pooled", &pool);
+        assert_eq!(mode(&pooled), kbf_driver_native::slots::LEASES_ROOT_MODE);
+        assert_eq!(mode(&pooled), 0o711, "traverse, no list, no write");
+        let alone = start("alone", &[]);
+        assert_eq!(mode(&alone), 0o700, "a daemon without a pool");
+        // The same data directory started again, now with a pool.
+        let again = start("alone", &pool);
+        assert_eq!(again, alone);
+        assert_eq!(mode(&alone), 0o711, "an existing 0700 is opened for a pool");
+        let flags = [format!("--data-dir={}", base.join("oci").display())];
+        let oci = parse(&["--driver=container", flags[0].as_str()]).expect("flags");
+        assert!(leases_open(&oci), "the container driver");
+        let no_native =
+            parse(&["--driver=fake", flags[0].as_str(), pool[0], pool[1]]).expect("flags");
+        assert!(
+            !leases_open(&no_native),
+            "a pool flag without the native driver"
+        );
     }
 
     /// Catches an upload deadline that defaults to anything but
@@ -1913,6 +2128,145 @@ mod tests {
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
+    /// Catches a daemon that serves on with a storage map none of whose members it can
+    /// reach: `start` and `start_member` not arming the check on the map they keep (the
+    /// daemon would then run, take leases and fail every blob call), or the error not
+    /// reaching the caller of `serve_until`. A healthy start, whose member answers, is
+    /// not ended by it.
+    #[test]
+    fn serving_ends_with_an_error_when_no_storage_member_answers() {
+        use kbf_map::{Map, Member, MemberId, MemberState, Rule};
+
+        let dir = scratch("reach");
+        tls_files(&dir);
+        let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
+        let cli = Cli::try_parse_from([
+            "kbf-daemon".to_owned(),
+            "--server=https://127.0.0.1:1".to_owned(),
+            flag("ca-cert", &dir.join("ca.pem")),
+            flag("cert", &dir.join("node.pem")),
+            flag("key", &dir.join("node.key")),
+            "--node-id=mac-1".to_owned(),
+            "--driver=native".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
+            flag("data-dir", &dir),
+            flag("xcode-apps", &dir.join("Applications")),
+        ])
+        .expect("flags");
+        let map_at = |addr: String| {
+            let member = Member {
+                id: MemberId(1),
+                addr,
+                zone: String::new(),
+                weight: 1,
+                state: MemberState::Active,
+                boot: 1,
+            };
+            Map::new(1, vec![member], Rule::Rendezvous, 1, 0, Vec::new()).expect("a map")
+        };
+        // A low port nothing listens on: refused at once.
+        let dead = "127.0.0.1:1".to_owned();
+
+        // One round, so that the refusal is at once and not after the default window.
+        let once = kbf_daemon::reach::Plan {
+            attempts: 1,
+            ..kbf_daemon::reach::Plan::DEFAULT
+        };
+        let refused = |node: &mut NodeHandle| {
+            let reach = node.reach.as_mut().expect("armed");
+            reach.plan = once;
+            assert!(reach.maps.offer(map_at(dead.clone())));
+        };
+        // The shutdown is bounded: a check that is ignored fails this test in seconds
+        // (the daemon is told to stop and returns Ok) instead of hanging the run.
+        let mut node = start(&cli).expect("starts");
+        refused(&mut node);
+        let error = node
+            .serve_until(async { tokio::time::sleep(Duration::from_secs(5)).await })
+            .expect_err("no member answers");
+        assert!(error.to_string().contains(&dead), "{error}");
+
+        // `serve`, the entry the binary and the SIGTERM path use, ends the same way. It
+        // runs on a thread the test waits on for 5 s: a `serve` that ignores the check
+        // would wait for a signal for ever, and fails here instead of hanging the run.
+        let mut node = start(&cli).expect("starts");
+        refused(&mut node);
+        let (ended, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            ended.send(node.serve().map_err(|e| e.to_string())).ok();
+        });
+        let served = result.recv_timeout(Duration::from_secs(5));
+        assert!(served.is_ok(), "serve did not end: it ignores the check");
+        let error = served
+            .expect("ended")
+            .expect_err("serve ends with the refusal");
+        assert!(error.contains(&dead), "{error}");
+
+        // The same map with a member that answers: the daemon serves until told to stop.
+        let live = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let node = start(&cli).expect("starts");
+        let maps = Arc::clone(&node.reach.as_ref().expect("armed").maps);
+        assert!(maps.offer(map_at(live.local_addr().expect("addr").to_string())));
+        node.serve_until(async { tokio::time::sleep(Duration::from_millis(500)).await })
+            .expect("a reachable member does not end it");
+        drop(live);
+
+        // A daemon that keeps no map (the in-process one) has no check to end it.
+        start_with(&cli, remote)
+            .expect("starts")
+            .serve_until(async { tokio::time::sleep(Duration::from_millis(100)).await })
+            .expect("nothing to refuse");
+
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
+    /// Catches a daemon beside another half that does not drain on the first signal
+    /// (`drain_on` running the daemon with `run`, which ignores signals), and one that
+    /// keeps running when the half beside it has stopped. An idle node with a signal
+    /// waiting returns at once, and so does one whose other half has stopped, with no
+    /// signal; each runs on a thread the test waits on for 5 s, so a defect fails here
+    /// instead of hanging the run.
+    #[test]
+    fn a_daemon_beside_another_half_drains_on_a_signal_and_stops_when_the_other_does() {
+        let dir = scratch("drain-on");
+        tls_files(&dir);
+        let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
+        let cli = Cli::try_parse_from([
+            "kbf-daemon".to_owned(),
+            "--server=https://127.0.0.1:1".to_owned(),
+            flag("ca-cert", &dir.join("ca.pem")),
+            flag("cert", &dir.join("node.pem")),
+            flag("key", &dir.join("node.key")),
+            "--node-id=mac-1".to_owned(),
+            "--driver=native".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
+            flag("data-dir", &dir),
+            flag("xcode-apps", &dir.join("Applications")),
+        ])
+        .expect("flags");
+        let ends = |signalled: bool| {
+            let node = start_with(&cli, remote).expect("starts");
+            let (signals, received) = tokio::sync::mpsc::unbounded_channel();
+            if signalled {
+                signals.send(()).expect("sent");
+            }
+            let (ended, result) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let other = async move {
+                    if signalled {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                ended.send(node.drain_on(received, other).is_ok()).ok();
+                drop(signals);
+            });
+            result.recv_timeout(Duration::from_secs(5))
+        };
+        assert_eq!(ends(true), Ok(true), "no drain on the first signal");
+        assert_eq!(ends(false), Ok(true), "the other half's stop was ignored");
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
     /// Catches a daemon that starts with storage-liveness flags it cannot honour: a zero
     /// value, or a ping timeout past the interval, is refused by `start` (and by
     /// `start_with`, as the same check) before any driver is set up, naming the flag.
@@ -1954,5 +2308,61 @@ mod tests {
                 assert!(why.contains(said), "{flag}: {why}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use std::time::Duration;
+
+    use super::{Signals, forward};
+
+    fn raise(signal: libc::c_int) {
+        // SAFETY: raise(3) on this process, whose handler for `signal` the test installed.
+        assert_eq!(unsafe { libc::raise(signal) }, 0);
+    }
+
+    /// Catches handlers that do not keep a signal sent before they are read (the start of
+    /// the other half of `kbf storage-and-daemon` takes long, and a SIGTERM in it must
+    /// still be the first signal): one sent after `install` and before `recv` is
+    /// received, by its name, and is not the default action that ends this test.
+    #[tokio::test]
+    async fn a_signal_sent_before_it_is_read_is_kept() {
+        let mut signals = Signals::install().expect("handlers");
+        raise(libc::SIGTERM);
+        let within = Duration::from_secs(10);
+        let name = tokio::time::timeout(within, signals.recv()).await;
+        assert_eq!(name.expect("kept"), "SIGTERM");
+        raise(libc::SIGINT);
+        let name = tokio::time::timeout(within, signals.recv()).await;
+        assert_eq!(name.expect("kept"), "SIGINT");
+    }
+
+    /// Catches a forwarder that drops a signal (the daemon would never drain), one that
+    /// reads SIGINT differently from SIGTERM, and one that outlives its receiver (a task
+    /// per stopped daemon): each SIGTERM and SIGINT is one `()`, and the task ends once
+    /// nobody listens.
+    #[tokio::test]
+    async fn each_sigterm_and_sigint_is_one_signal_and_the_task_ends_with_its_receiver() {
+        let signals = Signals::install().expect("handlers");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(forward(signals, tx));
+        let within = Duration::from_secs(10);
+        raise(libc::SIGTERM);
+        tokio::time::timeout(within, rx.recv())
+            .await
+            .expect("SIGTERM forwarded")
+            .expect("open");
+        raise(libc::SIGINT);
+        tokio::time::timeout(within, rx.recv())
+            .await
+            .expect("SIGINT forwarded")
+            .expect("open");
+        drop(rx);
+        raise(libc::SIGTERM);
+        tokio::time::timeout(within, task)
+            .await
+            .expect("the forwarder ends")
+            .expect("no panic");
     }
 }

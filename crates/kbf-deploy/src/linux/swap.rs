@@ -24,7 +24,7 @@
 
 use std::io::Write;
 
-use super::config::LinuxConfig;
+use super::config::SwapConfig;
 use super::host::{
     self, CHMOD, DF, FALLOCATE, FINDMNT, HostError, MKSWAP, SWAPOFF, SWAPON, note, tool,
 };
@@ -49,7 +49,7 @@ const SPARE_GIB: u64 = 16;
 
 /// What `swap` was asked for.
 pub struct Swap {
-    pub config: LinuxConfig,
+    pub config: SwapConfig,
     pub kubelet_allows_swap: bool,
     pub remove: bool,
 }

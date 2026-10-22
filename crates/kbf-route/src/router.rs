@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use kbf_map::{Map, Member, MemberState};
 use kbf_storage::StorageError;
@@ -10,8 +11,9 @@ use tokio::sync::Semaphore;
 
 use crate::closure::{DEFAULT_CLOSURE_ENTRIES, DEFAULT_CLOSURE_TTL, Verified};
 use crate::flights::Flights;
+use crate::hold::{Hold, HoldClock};
 use crate::nodes::Nodes;
-use crate::repair::{Limiter, ReadRepair, RepairLimit};
+use crate::repair::{Background, Limiter, ReadRepair, RepairLimit};
 use crate::source::{MapSource, MapView};
 
 /// What [`Router::commit_with_closure`] holds in memory, across all its calls, unless
@@ -37,6 +39,8 @@ pub struct Router {
     pub(crate) copy_kib: u32,
     /// The blobs a closure check found held, shared by every clone.
     pub(crate) verified: Arc<Verified>,
+    /// How long a call that no owner could answer is held and tried again.
+    pub(crate) hold: Hold,
 }
 
 /// The read-repair hook and its limit.
@@ -77,7 +81,51 @@ impl Router {
             copying: Arc::new(Semaphore::new(DEFAULT_COPY_KIB as usize)),
             copy_kib: DEFAULT_COPY_KIB,
             verified: Arc::new(Verified::new(DEFAULT_CLOSURE_ENTRIES, DEFAULT_CLOSURE_TTL)),
+            hold: Hold::none(),
         }
+    }
+
+    /// The same router, holding a call that no owner of its blob could answer (every
+    /// owner `Down` in the map, or every attempt UNAVAILABLE) and trying it again, with
+    /// growing pauses, until an owner answers or `bound` has passed since the call began;
+    /// then the call is UNAVAILABLE, as it is without a hold. A router made by
+    /// [`Router::new`] holds nothing (a bound of zero). The frontend and the daemon use
+    /// [`crate::DEFAULT_HOLD`].
+    ///
+    /// The hold covers every call that takes a blob or an entry to its owners, and a read
+    /// before its first byte (an owner that accepts the read and fails as its first frame
+    /// is one that could not answer). A read that has passed bytes on and then fails goes
+    /// on ([`crate::MAX_RESUMES`]) as it always did, without a hold: the caller already
+    /// has part of the stream, and a bound that long is the caller's to wait out. A call
+    /// that fails for another reason (no map yet, a map that keeps moving) is not held.
+    /// Every try reads the map again, so an owner that is marked `Down` and then registers
+    /// again is found.
+    ///
+    /// A read of a blob that some owners could not answer and the others lack is held as
+    /// well: the blob may be on the owner that is away. A call that an owner answered, with
+    /// the blob or without the entry, is not.
+    ///
+    /// Callers of one blob share a read ([`Router::read_blob`]), which holds as the router
+    /// of the caller that started it does: a caller that joins a read begun through a
+    /// router that holds nothing (read repair) gets its answer at once.
+    #[must_use]
+    pub fn with_hold(mut self, bound: Duration) -> Self {
+        self.hold.bound = bound;
+        self
+    }
+
+    /// The same router, holding by `clock` (the time, and the sleeping between tries)
+    /// instead of Tokio's: for a test that runs a hold without real time.
+    #[must_use]
+    pub fn with_hold_clock(mut self, clock: Arc<dyn HoldClock>) -> Self {
+        self.hold.clock = clock;
+        self
+    }
+
+    /// The same router, holding nothing.
+    pub(crate) fn unheld(mut self) -> Self {
+        self.hold.bound = Duration::ZERO;
+        self
     }
 
     /// The same router, holding at most `bytes` of blobs in memory at once (counted in
@@ -103,6 +151,28 @@ impl Router {
         self
     }
 
+    /// The same router, copying a blob a read or [`Router::find_missing_anywhere`] found
+    /// away from the owner that should hold it to that owner, in the background, at most
+    /// as often as `limit` lets a find through ([`Router::with_read_repair`] with the
+    /// router's own hook).
+    ///
+    /// The copy never delays the call that found the blob: it runs in a task of its own
+    /// (so the call that finds a blob must run inside a Tokio runtime, or the find is
+    /// not repaired), at most [`crate::MAX_REPAIRS_IN_FLIGHT`] at a time, one per digest, and a
+    /// find that arrives while the copies are all busy is dropped: a later read finds the
+    /// blob away from its owner again and tells the hook again. A copy is read from
+    /// wherever the map has it, hashed against its digest, and written with
+    /// [`kbf_storage::Storage::put_unowned`]; the owner is asked first whether it still
+    /// lacks the blob.
+    #[must_use]
+    pub fn with_background_repair(self, limit: RepairLimit) -> Self {
+        // The task reads through a router without the hook, so a repair's own read is
+        // never reported as a find.
+        let mut plain = self.clone().unheld();
+        plain.repair = None;
+        self.with_read_repair(Arc::new(Background::new(plain)), limit)
+    }
+
     /// Who holds `digest` in the map as it is now.
     ///
     /// # Errors
@@ -121,6 +191,32 @@ impl Router {
         })
     }
 
+    /// A number that changes whenever what a "this blob is held" answer rests on may have
+    /// changed: the map's generation, and the id and boot of every member in it. A caller
+    /// that remembers an answer beside this number may trust it only while the number is
+    /// the same: a new generation moves blobs between owners, and a restarted owner (a
+    /// new boot) is the one whose holdings are least certain (a disk replaced or wiped
+    /// while it was down, say).
+    ///
+    /// `None` when no map has arrived, or when any member's boot is 0 (unknown: a restart
+    /// of that member could not be told), so that nothing is remembered.
+    #[must_use]
+    pub fn epoch(&self) -> Option<u64> {
+        use std::hash::{Hash as _, Hasher as _};
+        let view = self.view().ok()?;
+        let members = view.map.members();
+        if members.iter().any(|m| m.boot == 0) {
+            return None;
+        }
+        // The default hasher has fixed keys: equal inputs give equal numbers.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        view.map.generation().hash(&mut hasher);
+        for member in members {
+            (member.id, member.boot).hash(&mut hasher);
+        }
+        Some(hasher.finish())
+    }
+
     /// How many blobs are being read for waiting callers right now: for a gauge, and for
     /// tests.
     #[must_use]
@@ -135,16 +231,40 @@ impl Router {
             .ok_or_else(|| unavailable("no storage map has arrived yet".to_owned()))
     }
 
+    /// [`Router::attempt`], and while it answers UNAVAILABLE, again after a pause
+    /// ([`Router::with_hold`]) until it answers otherwise or the bound has passed, when the
+    /// last UNAVAILABLE is the answer. Each try is made against the map as it is then. The
+    /// UNAVAILABLE of the routing itself (no map yet, a map that keeps moving) is not held.
+    pub(crate) async fn routed<T, Fut>(
+        &self,
+        op: impl Fn(MapView) -> Fut,
+    ) -> Result<T, StorageError>
+    where
+        Fut: Future<Output = Result<T, StorageError>>,
+    {
+        let mut waiting = self.hold.begin();
+        loop {
+            let done = self.attempt(&op).await?;
+            if !matches!(done, Err(StorageError::Unavailable(_))) {
+                return done;
+            }
+            if !waiting.again().await {
+                return done;
+            }
+        }
+    }
+
     /// Runs `op` against the map as it is now. Each time a node answers `STALE_MAP`, fetches
     /// the newer map and runs it again against that: the map can move several times
     /// during one call (every member's promotion is a new generation). It stops, with
     /// UNAVAILABLE rather than a loop, when a fetch brings no map newer than the one just
     /// used (the generation has stopped moving where this process can see it), or after
-    /// [`MAX_MAP_REFETCHES`] fetches in one call.
-    pub(crate) async fn routed<T, Fut>(
+    /// [`MAX_MAP_REFETCHES`] fetches in one call. The outer error is that of the routing;
+    /// the inner is what `op` answered.
+    async fn attempt<T, Fut>(
         &self,
-        op: impl Fn(MapView) -> Fut,
-    ) -> Result<T, StorageError>
+        op: &impl Fn(MapView) -> Fut,
+    ) -> Result<Result<T, StorageError>, StorageError>
     where
         Fut: Future<Output = Result<T, StorageError>>,
     {
@@ -156,7 +276,7 @@ impl Router {
                 Err(StorageError::StaleMap { current }) => {
                     view = self.newer(used, current, &mut fetches).await?;
                 }
-                done => return done,
+                done => return Ok(done),
             }
         }
     }
@@ -195,10 +315,10 @@ impl Router {
 /// for a run of promotions during one call, and a bound on a map that never settles.
 pub const MAX_MAP_REFETCHES: usize = 8;
 
-/// This generation's read order of `digest`, then the previous generation's.
+/// This generation's read order of `digest`, then each retained earlier generation's, newest
+/// first.
 pub(crate) fn read_order<'a>(view: &'a MapView, digest: &Digest) -> Vec<&'a Member> {
-    view.map
-        .read_order_with_previous(view.previous.as_deref(), digest)
+    view.map.read_order_with_history(&view.history(), digest)
 }
 
 /// The owners a write of `digest` may go to: its write owners that are not down, primary

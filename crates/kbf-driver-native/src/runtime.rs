@@ -125,6 +125,23 @@ impl<C: Cas> NativeRuntime<C> {
         Self::with_remover(config, cas, &crate::mounts::remove_lease_dir)
     }
 
+    /// [`NativeRuntime::new`] with the clean of every pool slot made wrong on purpose
+    /// ([`clean::Mutant`](crate::slots::clean::Mutant): one step skipped, the check
+    /// honest or blind): for the mutant tests of `tests/slot_clean.rs` alone, which run
+    /// the freshness scenario over it and see the skipped step's residue.
+    ///
+    /// # Errors
+    /// As [`NativeRuntime::new`].
+    #[cfg(target_os = "macos")]
+    #[doc(hidden)]
+    pub fn with_clean_mutant(
+        config: NativeConfig,
+        cas: Arc<C>,
+        mutant: crate::slots::clean::Mutant,
+    ) -> std::io::Result<Self> {
+        Self::build(config, cas, &crate::mounts::remove_lease_dir, Some(mutant))
+    }
+
     /// [`NativeRuntime::new`], sweeping the scratch root with `remove`: a test hands
     /// it a remover that fails, as a directory an action locked would.
     fn with_remover(
@@ -132,14 +149,28 @@ impl<C: Cas> NativeRuntime<C> {
         cas: Arc<C>,
         remove: &dyn Fn(&Path) -> std::io::Result<()>,
     ) -> std::io::Result<Self> {
+        Self::build(config, cas, remove, None)
+    }
+
+    /// [`NativeRuntime::with_remover`], with the pool's clean mutated when `mutant` is
+    /// given.
+    fn build(
+        config: NativeConfig,
+        cas: Arc<C>,
+        remove: &dyn Fn(&Path) -> std::io::Result<()>,
+        mutant: Option<crate::slots::clean::Mutant>,
+    ) -> std::io::Result<Self> {
         let root = rustix::process::geteuid().is_root();
         crate::slots::check_daemon_user(root, config.pool.as_ref())
             .map_err(std::io::Error::other)?;
+        // Only a Mac has slots to clean.
+        #[cfg(not(target_os = "macos"))]
+        let _ = mutant;
         // Before the sweep: the keepers of a killed daemon's slots have ended them, and
         // this ends what is left, as every lease's end does.
         #[cfg(target_os = "macos")]
         let slots = (config.pool.as_ref())
-            .map(|pool| crate::slots::macos::Slots::start(pool, config.kill_wait))
+            .map(|pool| crate::slots::macos::Slots::start_mutated(pool, config.kill_wait, mutant))
             .transpose()?;
         std::fs::create_dir_all(&config.scratch)?;
         let rules = config
@@ -337,6 +368,7 @@ impl<C: Cas> NativeRuntime<C> {
         cas: &C::Lease,
         work: &Work,
         dir: &Path,
+        private: bool,
     ) -> Result<Prepared, RuntimeError> {
         let action: Action = fetch_message(cas, &work.action_digest)
             .await
@@ -364,7 +396,9 @@ impl<C: Cas> NativeRuntime<C> {
         let developer_dir = xcode::developer_dir(&self.xcodes(), &action, &command)?;
         let simulator = simulator::request_of(&action, &command)?;
 
-        tokio::fs::create_dir(dir).await.map_err(failed(dir))?;
+        crate::slots::make_lease_dir(dir, private)
+            .await
+            .map_err(failed(dir))?;
         let lease = tokio::fs::canonicalize(dir).await.map_err(failed(dir))?;
         let root = dir.join("root");
         tokio::fs::create_dir(&root).await.map_err(failed(&root))?;
@@ -671,8 +705,9 @@ impl<C: Cas> NativeRuntime<C> {
         }
         // A kill during prepare (a long input fetch) stops it at once; the clean
         // removes whatever was written.
+        let private = runner.private_lease();
         let mut prepared = tokio::select! {
-            prepared = self.prepare(&cas, work, dir) => prepared?,
+            prepared = self.prepare(&cas, work, dir, private) => prepared?,
             Ok(by) = &mut *stop => {
                 *killer = Some(by);
                 return Err(RuntimeError::Killed);
@@ -1120,15 +1155,7 @@ async fn spawn(
     keeper: KeeperFor,
 ) -> std::io::Result<Spawned> {
     let gate = crate::record::Gate::install(command, exec);
-    let give_up = Instant::now() + BUSY_WAIT;
-    loop {
-        match gate.spawn(command, record, keeper) {
-            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < give_up => {
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-            spawned => return spawned,
-        }
-    }
+    gate.spawn_unbusy(command, record, keeper, BUSY_WAIT).await
 }
 
 /// Answers `refused` as the action's result without running anything: empty stdout,
@@ -1445,13 +1472,9 @@ mod tests {
             !rustix::process::geteuid().is_root(),
             "run this test as a user"
         );
-        let scratch = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps")
-            .join("kbf-driver-native-unit")
-            .join(format!("pool-{}", std::process::id()));
-        let mut config = NativeConfig::new(scratch.clone());
+        let dir = crate::unit_dir("runtime-pool");
+        let scratch = dir.join("root");
+        let mut config = NativeConfig::new(scratch.to_path_buf());
         config.pool = crate::slots::Pool::provisioned(1, 700).ok();
         let refused = NativeRuntime::new(config, Arc::new(NoCas)).expect_err("started");
         #[cfg(target_os = "macos")]
@@ -1468,14 +1491,8 @@ mod tests {
     /// report, and an installed Xcode missing from the status.
     #[test]
     fn a_survey_changes_the_xcodes_actions_may_name() {
-        let scratch = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps")
-            .join("kbf-driver-native-unit")
-            .join(format!("apply-{}", std::process::id()));
-        let _ = kbf_outputs::remove_tree(&scratch);
-        let mut config = NativeConfig::new(scratch.clone());
+        let scratch = crate::unit_dir("runtime-apply");
+        let mut config = NativeConfig::new(scratch.to_path_buf());
         config.xcodes = BTreeMap::from([("1A".to_owned(), PathBuf::from("/A/Contents/Developer"))]);
         let runtime = NativeRuntime::new(config, Arc::new(NoCas)).expect("runtime");
         let network = (
@@ -1738,13 +1755,7 @@ mod tests {
     /// record once they have all ended.
     #[test]
     fn a_dropped_run_keeps_its_record_only_while_processes_survive() {
-        let dir = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps")
-            .join("kbf-driver-native-unit")
-            .join(format!("group-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = crate::unit_dir("runtime-group");
         let record = dir.join("lease-5-5");
         std::fs::write(&record, "x").expect("write");
         let me = i32::try_from(std::process::id()).expect("pid");
@@ -1797,14 +1808,8 @@ mod tests {
     async fn a_busy_program_is_retried() {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        let dir = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps")
-            .join("kbf-driver-native-unit");
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let program = dir.join(format!("busy-{}", std::process::id()));
-        let _ = std::fs::remove_file(&program);
+        let dir = crate::unit_dir("runtime-busy");
+        let program = dir.join("busy");
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)

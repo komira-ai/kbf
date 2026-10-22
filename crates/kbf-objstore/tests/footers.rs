@@ -5,20 +5,22 @@
 
 use std::collections::BTreeMap;
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures::TryStreamExt as _;
-use kbf_objstore::footers::{FooterRead, FooterReads, SkipReason, Totals, read_footers};
+use kbf_objstore::footers::{
+    FooterRead, FooterReads, SkipReason, Totals, read_footers, read_footers_unless,
+};
 use kbf_objstore::{
     ByteRange, Capabilities, Floor, FsStore, KeyPrefix, ListPage, ListToken, MemoryStore,
     ObjectInfo, ObjectKey, ObjectStore, ObjectStoreError, PageSize,
 };
 use kbf_segments::layout::{MAGIC, TRAILER_LEN, VERSION, footer_len};
 use kbf_segments::{MAX_SEGMENT_BYTES, SegmentError, SegmentWriter};
+use kbf_testkit::dir::TestDir;
 use kbf_types::Digest;
 
 /// Where each blob is, as the writer laid it out: object, offset.
@@ -134,13 +136,13 @@ async fn a_rebuild_recovers_exactly_the_written_index() {
     );
 }
 
-/// A fresh, absent directory for `name`, under the target directory.
-fn scratch(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-objstore-footers")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+/// A fresh, empty directory for `name`, under the target directory, removed when the
+/// returned value is dropped.
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-objstore-footers-{name}"),
+    )
 }
 
 /// Catches the same over a `file://` store, whose listing pages are cut from one walk
@@ -155,7 +157,6 @@ async fn a_rebuild_over_a_directory_recovers_the_written_index() {
     assert!(skipped.is_empty(), "{skipped:?}");
     assert_eq!(index, want);
     drop(store);
-    std::fs::remove_dir_all(&dir).expect("remove");
 }
 
 /// A trailer that passes every check of its own and claims `entries` records before
@@ -578,5 +579,49 @@ async fn footers_come_in_key_order_and_resume_after_a_key() {
     assert_eq!(
         resumed,
         keys[10..].iter().map(String::as_str).collect::<Vec<_>>()
+    );
+}
+
+/// Catches: `read_footers_unless` reading or yielding an object whose key the caller
+/// said it has handled (a standing pass would read every footer again at every pass),
+/// or dropping one that it did not name (an object that appears below keys already
+/// seen is new, and must come back). Five segments are written; the caller has handled
+/// the first, third and last; only the second and fourth come back, in key order, and
+/// the store returns the bytes of those two alone. Mutant seen red: `skip` ignored (all
+/// five come back and five objects are read).
+#[tokio::test]
+async fn footers_the_caller_has_handled_are_neither_read_nor_yielded() {
+    let store = Counting::new(Duration::ZERO);
+    let dir = prefix("tail/");
+    write_segments(&store, "tail/", 5, |_| 2, 40).await;
+    let handled: Vec<ObjectKey> = [0, 2, 4].map(|s| key(&format!("tail/{s:04}"))).to_vec();
+    let sizes: BTreeMap<String, u64> = store
+        .inner
+        .list(&dir, None, PageSize::MAX)
+        .await
+        .expect("list")
+        .objects
+        .into_iter()
+        .map(|o| (o.key.as_str().to_owned(), o.size))
+        .collect();
+    let read: Vec<FooterRead> =
+        read_footers_unless(&store, &dir, None, reads(2, 2, 1 << 16), |k| {
+            handled.contains(k)
+        })
+        .try_collect()
+        .await
+        .expect("listing");
+    let keys: Vec<String> = read
+        .iter()
+        .map(|r| match r {
+            FooterRead::Segment(s) => s.key.as_str().to_owned(),
+            FooterRead::Skipped(s) => panic!("{} skipped", s.key),
+        })
+        .collect();
+    assert_eq!(keys, ["tail/0001", "tail/0003"]);
+    assert_eq!(
+        store.bytes.load(Ordering::SeqCst),
+        sizes["tail/0001"] + sizes["tail/0003"],
+        "the tail of each unhandled segment, and no other"
     );
 }

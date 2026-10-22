@@ -1,24 +1,22 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::*;
+use kbf_testkit::dir::TestDir;
 
 const A: &str = "kbf-daemon-c0ffee012345-linux-x86_64.tar.gz";
 const A_SBOM: &str = "kbf-daemon-c0ffee012345-linux-x86_64.cdx.json";
 const B: &str = "kbf-daemon-c0ffee012345-darwin-arm64.tar.gz";
 
-/// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::current_exe()
-        .expect("test binary")
-        .parent()
-        .expect("deps")
-        .join("xtask-sums-unit")
-        .join(format!("{name}-{}", std::process::id()));
-    // Absent unless a run with this pid left it.
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// An empty directory of its own for one test, removed when it drops.
+fn scratch(name: &str) -> TestDir {
+    let beside = std::env::current_exe().expect("test binary");
+    let deps = beside.parent().expect("deps");
+    TestDir::under(deps.join("xtask-sums-unit"), name)
 }
+
+/// One row of the pairing test: what is listed, then the problem wanted when the pairing is
+/// required and when it is waived.
+type PairingRow<'a> = (&'a str, &'a [&'a str], Option<&'a str>, Option<&'a str>);
 
 fn line(name: &str, bytes: &[u8]) -> String {
     format!("{}  {name}\n", Sha256::of(bytes))
@@ -97,6 +95,39 @@ fn verify_sums_passes_when_listed_is_present_and_each_matches() {
         verify_sums(&dir, Sha256::of),
         Ok("sums: 2 files match; the flipped copy does not".to_owned())
     );
+}
+
+#[test]
+fn a_kbf_tarball_and_its_version_facts_are_listed_together() {
+    // Catches: the pairing in one direction only, the waiver skipping more than the facts
+    // of a tarball, and a waiver that is ignored. Rows: a `kbf` tarball without facts is
+    // refused, and passes when the pairing is waived; facts without their tarball are
+    // refused either way; both listed pass either way. Mutants: either `if` dropped.
+    let tarball = "kbf-c0ffee012345-linux-x86_64.tar.gz";
+    let facts = "kbf-c0ffee012345-linux-x86_64.version.json";
+    let no_facts = format!("{tarball}: its version facts {facts} are not listed in {SUMS}");
+    let no_tarball =
+        format!("{facts}: the tarball it states the facts of, {tarball}, is not listed in {SUMS}");
+    let (no_facts, no_tarball) = (no_facts.as_str(), no_tarball.as_str());
+    let rows: [PairingRow; 3] = [
+        ("tarball", &[tarball], Some(no_facts), None),
+        ("facts", &[facts], Some(no_tarball), Some(no_tarball)),
+        ("both", &[tarball, facts], None, None),
+    ];
+    let bytes: &[u8] = b"bytes";
+    for (what, listed, required, waived) in rows {
+        let dir = scratch(&format!("verify-pairing-{what}"));
+        let files: Vec<(&str, &[u8])> = listed.iter().map(|n| (*n, bytes)).collect();
+        let sums: String = listed.iter().map(|n| line(n, bytes)).collect();
+        assets(&dir, &files, &sums);
+        for (pairing, wanted) in [(Pairing::Required, required), (Pairing::Waived, waived)] {
+            let got = verify_sums_with(&dir, Sha256::of, pairing);
+            match wanted {
+                Some(problem) => assert_eq!(refused(got), [problem], "{what} {pairing:?}"),
+                None => assert!(got.is_ok(), "{what} {pairing:?}: {got:?}"),
+            }
+        }
+    }
 }
 
 #[test]
@@ -340,7 +371,8 @@ fn assemble_refuses_a_name_twice_an_unknown_platform_and_no_files() {
             .starts_with(&format!("append to {}: ", summary.display()))),
         "summary"
     );
-    let missing = scratch("assemble-missing").join("dist");
+    let _missing_own = scratch("assemble-missing");
+    let missing = _missing_own.join("dist");
     assert!(
         assemble(&missing, None, None).is_err_and(|e| e
             .to_string()

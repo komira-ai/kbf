@@ -101,6 +101,11 @@ impl Storage for Spy {
         self.inner.find_missing(digests)
     }
 
+    /// Forwards: the inner storage decides what is durable.
+    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        self.inner.find_durable(digests)
+    }
+
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> Answer<'a, Bytes> {
         match self.fault {
             Fault::Unreadable(d) if d == *digest => {
@@ -313,7 +318,9 @@ async fn both_kinds_answer_the_scheduler_calls_alike() {
         assert_eq!(hit, ActionResult::default());
 
         assert!(backend.leadership().is_none());
-        assert!(backend.render_metrics().contains("kbf_"), "{remote}");
+        let text = backend.render_metrics();
+        assert!(text.contains("kbf_"), "{remote}");
+        assert_in_flight_families(&text);
         assert_eq!(format!("{backend:?}"), "Backend(..)");
     }
 }
@@ -322,10 +329,17 @@ async fn both_kinds_answer_the_scheduler_calls_alike() {
 struct Trio {
     nodes: BTreeMap<MemberId, Arc<dyn Storage>>,
     map: Arc<Map>,
+    /// The generation before `map`, while a change settles.
+    previous: Option<Arc<Map>>,
 }
 
 impl Trio {
     fn new() -> Self {
+        Self::replicated(1)
+    }
+
+    /// The same, each blob written to `r` owners.
+    fn replicated(r: u8) -> Self {
         let nodes = (1..=3)
             .map(|id| {
                 let node: Arc<dyn Storage> = Arc::new(CacheStorage::new(
@@ -345,11 +359,54 @@ impl Trio {
                 boot: 0,
             })
             .collect();
-        let map = Map::new(1, members, Rule::Rendezvous, 1, 1, Vec::new()).expect("a map");
+        let map = Map::new(1, members, Rule::Rendezvous, r, 1, Vec::new()).expect("a map");
         Self {
             nodes,
             map: Arc::new(map),
+            previous: None,
         }
+    }
+
+    /// The same farm with every member's boot known (non-zero), so the router can say
+    /// what its "held" answers rest on ([`kbf_route::Router::epoch`]).
+    fn booted(mut self) -> Self {
+        let members = self
+            .map
+            .members()
+            .iter()
+            .cloned()
+            .map(|mut m| {
+                m.boot = 1;
+                m
+            })
+            .collect();
+        let map = Map::new(
+            self.map.generation(),
+            members,
+            Rule::Rendezvous,
+            self.map.r(),
+            1,
+            Vec::new(),
+        )
+        .expect("a map");
+        self.map = Arc::new(map);
+        self
+    }
+
+    /// The same farm after a change: `map` is generation 2 and the map it replaced is
+    /// the one this had.
+    fn changed(mut self, ids: &[u64]) -> Self {
+        let members = self
+            .map
+            .members()
+            .iter()
+            .filter(|m| ids.contains(&m.id.0))
+            .cloned()
+            .collect();
+        let r = self.map.r();
+        let next = Map::new(2, members, Rule::Rendezvous, r, 1, Vec::new()).expect("a map");
+        self.previous = Some(std::mem::replace(&mut self.map, Arc::new(next)));
+        self
     }
 
     /// A backend routed by the map, whose `--storage` node is member 1, and the same
@@ -389,7 +446,8 @@ impl MapSource for Trio {
     fn current(&self) -> Option<MapView> {
         Some(MapView {
             map: Arc::clone(&self.map),
-            previous: None,
+            previous: self.previous.clone(),
+            earlier: Vec::new(),
         })
     }
 
@@ -433,6 +491,86 @@ async fn the_routed_walk_finds_each_blob_at_its_owner() {
     assert_eq!(alone.absent, vec![root.0]);
 }
 
+/// A file in each of the three places the input check must look, and one nobody holds:
+/// at the second write owner only (the primary is a joined node that is still empty), at
+/// the previous generation's owner only, and nowhere; all under one directory.
+struct Spread {
+    root: (Digest, Bytes),
+    replica_only: (Digest, Bytes),
+    previous_only: (Digest, Bytes),
+    nowhere: (Digest, Bytes),
+}
+
+impl Spread {
+    /// Stores them on a farm of three that kept members `now` after a change from all three
+    /// (each blob written to two owners).
+    async fn store(now: &[u64]) -> (Arc<Trio>, Self) {
+        let before = Trio::replicated(2);
+        let old = Arc::clone(&before.map);
+        let trio = before.changed(now);
+        let new = Arc::clone(&trio.map);
+        let find = |tag: &str, want: &dyn Fn(&Digest) -> bool| {
+            (0..)
+                .map(|n| blob(&format!("{tag} {n}")))
+                .find(|b| want(&b.0))
+                .expect("a blob that fits")
+        };
+        let replica_only = find("replica", &|d| {
+            let owners = new.write_owners(d);
+            owners.len() == 2 && old.write_owners(d)[0] == owners[0]
+        });
+        let previous_only = find("previous", &|d| {
+            // The member that left is its old primary.
+            old.write_owners(d)[0] == MemberId(3)
+        });
+        let nowhere = blob("held by nobody");
+        let root = dir(&[replica_only.0, previous_only.0, nowhere.0], &[]);
+        let owners = new.write_owners(&replica_only.0);
+        trio.nodes[&owners[1]]
+            .put_unowned(replica_only.1.clone())
+            .await
+            .expect("stored");
+        let prior = old.write_owners(&previous_only.0)[0];
+        trio.nodes[&prior]
+            .put_unowned(previous_only.1.clone())
+            .await
+            .expect("stored");
+        for owner in new.write_owners(&root.0) {
+            trio.nodes[&owner]
+                .put_unowned(root.1.clone())
+                .await
+                .expect("stored");
+        }
+        (
+            Arc::new(trio),
+            Self {
+                root,
+                replica_only,
+                previous_only,
+                nowhere,
+            },
+        )
+    }
+}
+
+/// Catches the refusal that kept a farm from running its actions after a node joined: the
+/// input check asked only each file's primary, and a primary that had just joined held
+/// nothing, so files its replica (or the previous generation's owner) held were refused as
+/// "not in the CAS" on every run. The walk now reports only the file no owner of either
+/// generation holds.
+#[tokio::test]
+async fn the_routed_walk_finds_a_file_any_owner_holds() {
+    let (trio, spread) = Spread::store(&[1, 2]).await;
+    let (routed, _) = trio.backends();
+
+    let walked = routed.walk_inputs(spread.root.0).await.expect("walk");
+    assert_eq!(walked.absent, vec![spread.nowhere.0]);
+    assert!(
+        !walked.absent.contains(&spread.replica_only.0)
+            && !walked.absent.contains(&spread.previous_only.0)
+    );
+}
+
 /// Every call the scheduler side makes, in the order a run makes them, against `backend`
 /// over a farm that holds `held` and the directory `root`: the answers are the same whatever
 /// kind the backend is ([`both_kinds_answer_the_scheduler_calls_alike`]).
@@ -474,7 +612,9 @@ async fn scheduler_calls(backend: &Backend, held: (Digest, Bytes), root: (Digest
     assert_eq!(hit, ActionResult::default());
 
     assert!(backend.leadership().is_none());
-    assert!(backend.render_metrics().contains("kbf_"));
+    let text = backend.render_metrics();
+    assert!(text.contains("kbf_"));
+    assert_in_flight_families(&text);
     assert_eq!(format!("{backend:?}"), "Backend(..)");
 }
 
@@ -557,6 +697,7 @@ async fn the_routed_kind_uses_the_storage_node_until_the_map_has_two_members() {
             Some(MapView {
                 map: Arc::new(map),
                 previous: None,
+                earlier: Vec::new(),
             })
         }
         fn refetch(&self, at_least: u64) -> BoxFuture<'_, Result<MapView, RefetchError>> {
@@ -583,4 +724,110 @@ async fn the_routed_kind_uses_the_storage_node_until_the_map_has_two_members() {
         first.put(stored.1.clone()).await.expect("stored");
     }
     scheduler_calls(&backend, held, root).await;
+}
+
+/// Catches: a frontend backend whose `/metrics` text leaves out `kbf_bytes_in_flight` or
+/// `kbf_bytes_in_flight_peak` (the proxy kinds once rendered only their own counters).
+///
+/// Mutant: `Remote::render_metrics` returning `self.metrics.render()` alone.
+fn assert_in_flight_families(text: &str) {
+    for family in ["kbf_bytes_in_flight", "kbf_bytes_in_flight_peak"] {
+        assert!(
+            text.contains(&format!("# TYPE {family} gauge\n{family} ")),
+            "{family} missing from\n{text}"
+        );
+    }
+}
+
+/// A tree of a root over three directories of ten files each, every blob stored on the node
+/// the map writes it to; the walk of it reads four directories and asks about 30 files.
+async fn stored_tree(trio: &Trio) -> (Digest, usize) {
+    let files: Vec<_> = (0..30).map(|n| blob(&format!("file {n}"))).collect();
+    let subs: Vec<_> = files
+        .chunks(10)
+        .map(|chunk| dir(&chunk.iter().map(|f| f.0).collect::<Vec<_>>(), &[]))
+        .collect();
+    let root = dir(&[], &subs.iter().map(|d| d.0).collect::<Vec<_>>());
+    for held in files.iter().chain(&subs).chain([&root]) {
+        trio.store(held).await;
+    }
+    (root.0, 4)
+}
+
+/// Catches: the routed kind's walk forgetting nothing the router can vouch for, or never
+/// remembering: the second walk of a tree the farm held (a build's next Execute over the
+/// same toolchain) skips it, with no read and no FindMissing, because the router gave the
+/// map's epoch to the walk. Mutant: `Blobs::epoch` for the router returning `None` (the
+/// memory would never fire and every other test stays green): the second walk reads all
+/// four directories again. Under a map with a member of unknown boot there is no epoch
+/// and the second walk reads again.
+#[tokio::test]
+async fn the_routed_walk_skips_a_tree_it_found_held() {
+    let trio = Arc::new(Trio::new().booted());
+    let (root, dirs) = stored_tree(&trio).await;
+    let (routed, _) = trio.backends();
+
+    let first = routed.walk_inputs(root).await.expect("first walk");
+    assert!(first.absent.is_empty(), "{:?}", first.absent);
+    assert_eq!((first.dirs_read, first.dirs_skipped), (dirs as u64, 0));
+    assert_eq!((first.files_checked, first.file_asks), (30, 1));
+
+    let second = routed.walk_inputs(root).await.expect("second walk");
+    assert!(second.absent.is_empty());
+    assert_eq!(
+        (second.dirs_read, second.dirs_skipped),
+        (0, 1),
+        "the root was verified, so it alone is skipped"
+    );
+    assert_eq!((second.files_checked, second.file_asks), (0, 0));
+
+    // A member whose boot is unknown: the router cannot tell a restart, so nothing is kept.
+    let unknown = Arc::new(Trio::new());
+    let (root, dirs) = stored_tree(&unknown).await;
+    let (routed, _) = unknown.backends();
+    routed.walk_inputs(root).await.expect("first walk");
+    let again = routed.walk_inputs(root).await.expect("second walk");
+    // Nothing is believed verified: every Directory is taken again (from the content
+    // cache, so none is read, and each is asked about) and every file is asked about.
+    assert_eq!((again.dirs_skipped, again.files_checked), (0, 30));
+    assert_eq!(
+        (
+            again.dirs_read,
+            again.dir_cache_hits,
+            again.dirs_present_checked
+        ),
+        (0, dirs as u64, dirs as u64)
+    );
+}
+
+/// Catches: a single storage node's walk remembering what it found held. Nothing about
+/// one node says that a restart or a lost blob did not happen between two walks, so
+/// [`Backend::remote`] has no epoch and every walk reads the whole tree. Mutant: `Held`
+/// answering an epoch (`Some(1)`): the second walk skips the root.
+#[tokio::test]
+async fn a_walk_over_one_storage_node_never_skips() {
+    let cache = Arc::new(Cache::memory());
+    let held = blob("held");
+    let sub = dir(&[held.0], &[]);
+    let root = dir(&[], &[sub.0]);
+    put(&cache, &[&held, &sub, &root]).await;
+    let (_, remote) = both(&cache);
+
+    for round in 0..3 {
+        let walked = remote.walk_inputs(root.0).await.expect("walk");
+        assert!(walked.absent.is_empty(), "round {round}");
+        // The first walk reads both Directories; the later ones take them from the
+        // content cache and ask the node about them, but skip nothing as verified.
+        let (read, cached) = if round == 0 { (2, 0) } else { (0, 2) };
+        assert_eq!(
+            (walked.dirs_read, walked.dirs_skipped, walked.files_checked),
+            (read, 0, 1),
+            "round {round}"
+        );
+        assert_eq!(
+            (walked.dir_cache_hits, walked.dirs_present_checked),
+            (cached, cached),
+            "round {round}"
+        );
+    }
 }

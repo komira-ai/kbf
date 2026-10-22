@@ -1,6 +1,6 @@
 # Updating a split-mode farm without failing a build
 
-Status: design for the sequence. The pull updater it relies on is partly built: `kbf-installer` (merged), `kbf-update` (the node's client, #908) and
+Status: design for the sequence. (`kbf-deploy envoy render|check|apply`, named below, is retired: kbf runs no Envoy since the no-Envoy ruling, and the frontend is fronted by kbf-proxy.) The pull updater it relies on is partly built: `kbf-installer` (merged), `kbf-update` (the node's client, #908) and
 `kbf-installer run` (the root helper, #929) are built or in review; the controller, the node gates, the Envoy switch and the poller are not.
 Planned-down (#914) is built. It is read against `feature/arch-v2` and these pull requests, fetched
 when this was written: #857, #879 and #887 (the frontend handover, open, stacked), #803 (the rollout state machine, open), #886
@@ -355,9 +355,8 @@ control socket's `RuntimeDirectoryPreserve`.
 **Dropped:** `SCM_RIGHTS` and the `Sockets` of `handover/`; the successor's adoption of listeners and its `local_addr` check; the
 requirement that both instances have identical addresses (they now differ by port, and the holder's refusal of a different
 listen address is removed, while a different state path is still refused); the latches that close the old listeners at once;
-"connections that arrived in the gap wait in the backlog" (replaced by hold and retry). **Changed:** the check-units rule
-`handover` (instances differ in ports); the successor must serve health and *hold* calls before it holds the store (today it
-answers nothing before `ready`); `install-units` writes a flags file per instance.
+"connections that arrived in the gap wait in the backlog" (replaced by hold and retry). **Changed:** the `handover` rule (once check-units', now the package test's) (instances differ in ports); the successor must serve health and *hold* calls before it holds the store (today it
+answers nothing before `ready`); the installer writes a flags file per instance (`install-units` is retired).
 
 **Other conflicts and what they need:**
 
@@ -588,13 +587,14 @@ attempts; T1 measures it. An `Execute` queued because capacity is short keeps it
 | Node, step 3 leases do not end | uncordon at the limit, `Pending` | |
 | Step 4 or 5 gate fails | undo planned-down, uncordon, `Pending` or `Held` | |
 | Step 6 binary exits at once | boot counter reverts before the Nth start; `Held` | journal |
+| Step 6 the helper refuses the activate order | `Held` (`ActivateRefused`), node stays cordoned, warn-level alert; no restart was started | read the refusal in the helper's status |
 | Step 6/7 starts, never registers | window expires, helper reverts, `REVERTED`, `Held` | |
 | Step 7 stays `CatchingUp` | wait while rebuild progresses; a failed rebuild retries with back-off (**[F]** #860); past the rebuild limit `Held`, node stays cordoned, the other owner serves | decide |
 | Step 8 debt does not settle | `Held`, cordoned, no revert | look at the other owner |
 | A second member goes `Down` unplanned | the controller stops at once, restarts nothing; blobs owned by both are `UNAVAILABLE` until one returns | bring it back first |
 | Restart deadline passes | `Held`, alert; the dwell may start re-replication | |
 | Confirm lost | the timer fires; node returns to N; `Held` | |
-| Revert fails (previous missing) | node stays as is, cordoned, `REFUSED`, page-level alert | manual path |
+| Revert fails after the flip, steps 7 to 9 (previous missing) | node stays as is, cordoned, `REFUSED`, page-level alert | manual path |
 | Controller (frontend) dies mid-run | on start it reads `update/host/<id>` and resumes; the cordon row persists | |
 | Frontend host loses power | everything on it fails; cold start; running actions are re-sent after the epoch | accepted: one frontend is a scheduling single point of failure |
 
@@ -674,7 +674,7 @@ That document owns `update/release/<commit>/<platform>/<name>`, `update/desired 
 - `update/host/<id> {phase, order_id, generation, since, boot_before}`: what the controller resumes from; `boot_before` is the node's boot counter before the step, which the rejoin check compares with the registered one;
 - `update/policy {auto_nodes (bool), auto_frontend (bool), paused (bool), idle_wait, min_serving, max_hosts_out (default 1), new_work_only_to_updated, mac_force_after, accept_failing_builds}`
   (`pull-updates.md`'s `update/auto {enabled}` is `auto_nodes`);
-- `update/available/<commit>` from the poller: proposals and preflight results, metadata only.
+- `update/available/<commit>` from the poller: proposals and preflight results, metadata only. Not built: the release facts an offer carries are the release store's per-platform version facts document (`pull-updates.md` 6.2).
 
 The release store on disk is the source of truth for bytes; the `update/release/...` rows are metadata over it and are rebuilt
 from the disk index if lost (`pull-updates.md` 6.2).
@@ -703,7 +703,7 @@ monotonic id, and a host acts on each at most once. The node client refuses an a
 - it reads `kbf --version --json` from the binary (service user, empty environment, no network, a timeout) and rejects one whose commit differs from the run's;
 - it runs preflight against the live farm and stores the result, so the UI shows blockers without a click;
 - it stores `update/available/<commit>` (hashes, `meta`, attestation time, preflight result, the merge commit subject) and keeps the last few;
-- **it never applies.** `update/policy` decides. `auto_nodes` false (default) offers; true runs the whole sequence's node steps when preflight is
+- **it never applies.** `update/policy` decides. `auto_nodes` false (written by an operator; see Q7) offers; true runs the whole sequence's node steps when preflight is
   clean. `auto_frontend` is separate, defaults to false, and cannot be set to true unless `auto_nodes` is true and the last two runs finished
   without `Held`. A frontend handover is never started by a timer unless an authenticated operator wrote that row;
 - it never proposes a commit older than the running one by itself (an operator may set an older commit as a rollback, and the generation orders it), and it refuses a commit not on main and a run with a failed or missing attestation;
@@ -748,7 +748,7 @@ may not start the frontend phase or change policy.
 
 ## 7. Test plan
 
-End-to-end tests in `kbf-it` (a new cell, `kbf-cell upd`, beside `m1` and `m2`): real `kbf` processes, the pinned buck2,
+End-to-end tests in `kbf-integration-test` (a new cell, `kbf-cell upd`, beside `m1` and `m2`): real `kbf` processes, the pinned buck2,
 `//:pause`-style actions, a `file://` cold store, 3 storage-and-daemon nodes at R=2, one daemon-only process, the frontend as
 `@a`/`@b` processes with the control socket (the unit text is covered by the existing unit lints). A second cell runs the base
 binary and a test-only "N+1" built from the next commit for the mixed-version tests. Each test names the defect and the mutant to plant.
@@ -801,7 +801,7 @@ T5, T6 and E1 prove the model's one unproven step: if either cannot be made reli
 - **Q4** State-schema migration (3.4) is a `kbf-state` change of a few days and is on the critical path of the first release that changes a column. Until then the planner refuses such a release.
 - **Q5** Planned-down member state: **decided and built** (#914, `planned_down` with `for_secs`; 2.6 step 4); the router-failover alternative is not taken.
 - **Q6** Node graceful stop and a `Leave` call. **Lean yes.**
-- **Q7 [owner]** `auto_nodes` default false until two click-through runs are clean.
+- **Q7 [owner]** `auto_nodes` default false until two click-through runs are clean. **Changed (updfeed U1, CEO-visible):** a policy never written reads `auto_nodes` true. Only an operator's write of `update/desired` starts a run (the poller proposes and never writes it), so that write is the click; `pause` is the stop, and `auto_nodes` written false still stops it.
 - **Q8** One rollout record (K11). **Lean durable `update/*` rows.**
 - **Q9** A nightly mixed-version job against the release before the last tag (T10), a precondition for auto.
 - **Q10** The handover wire frozen at 1 (K12); say so in the doc that owns `handover.rs`.

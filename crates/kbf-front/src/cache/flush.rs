@@ -11,8 +11,19 @@
 //!   moved to another object.
 //! - **`AlreadyExists`** (a store with conditional writes, after an earlier attempt
 //!   whose answer was lost): the footer is read back; if it is ours the flush is done,
-//!   else `FlushConflict` commits, the object stays staged and is read locally, and the
-//!   flusher stops retrying it.
+//!   else the key is another object's (a frontend moved to a fresh state store hands out
+//!   a member and boot that an earlier store gave to another node, so the keys are
+//!   named again). The numbering moves past the range the other lifetime used
+//!   (`Writer::leave_numbering`), the object's records are copied into a block of their
+//!   own and synced (or, if the tier has no room, streamed to the store), and one
+//!   `ReseatStaged` moves the index entries, the flush order and the staged table entry
+//!   to the new object in a single commit: nothing is marked unreachable or counted as
+//!   lost, no blob is unavailable at any point, and a crash or failure before the commit
+//!   leaves the object and its block as they were. The old block is freed after the
+//!   commit; the other object is never touched. An object a build before this one left
+//!   in `Conflict` is taken the same way at the start of a round. The copy is not
+//!   hashed on the tier path, so a record the disk had damaged is found, as for any
+//!   staged object, by the new object's flush.
 //! - **Every record is hashed** as its pieces are read, on the cache's hashing pool
 //!   (off the runtime workers): the daemon's digests were trusted when the upload was
 //!   acknowledged, so this is where they are checked. The footer is written only once
@@ -30,6 +41,8 @@
 //!   [`FLUSH_BACKOFF_FIRST`] doubling to [`FLUSH_BACKOFF_MAX`].
 //! - **Eviction is on committed state:** the block becomes a flushed copy
 //!   ([`kbf_tier::WriteTier::flushed`]) only after `ObjectFlushed` applied.
+//! - **A stop flushes what is staged** ([`Cache::flush_for_shutdown`]), within a deadline;
+//!   what the deadline leaves is on the tier's disk and flushed by the next start.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -37,13 +50,16 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::StreamExt;
-use kbf_meta::{Applied, Command, ObjectId, StagedObject, StagedState, UnreachableReason};
+use kbf_meta::{
+    Applied, Command, ObjectId, StagedObject, StagedPut, StagedState, UnreachableReason,
+};
 use kbf_objstore::{BodyStream, ObjectStore, ObjectStoreError};
+use kbf_segments::Footer;
 use kbf_segments::layout::{encode_footer, footer_len};
-use kbf_segments::{Footer, IndexEntry};
-use kbf_tier::WriteTier;
+use kbf_tier::{TierOptions, WriteTier};
 use kbf_types::Digest;
 
+use super::ram::SHUTDOWN_RETRY;
 use super::read::READ_WINDOW_BYTES;
 use super::tier::{Staging, blocking};
 use super::verify::{RecordCheck, Verified};
@@ -175,6 +191,24 @@ pub(super) fn flush_backoff(failures: u32) -> Duration {
         .min(FLUSH_BACKOFF_MAX)
 }
 
+/// How far past now a final flush ([`Cache::flush_for_shutdown`]) reads the clock: past
+/// the seal delay of the open block and the longest wait a failed flush is given, so a
+/// round seals the open block and tries at once what the flusher was backing off from.
+/// The seal delay is [`TierOptions::SEAL_AFTER`], which the server never changes: a tier
+/// built with a longer one would not seal at a stop, and the final flush would end at its
+/// deadline with the open block still staged (on its disk, flushed by the next start).
+const SHUTDOWN_HORIZON: Duration = TierOptions::SEAL_AFTER.saturating_add(FLUSH_BACKOFF_MAX);
+
+/// How many times the commit that moves a staged object is tried before the move is
+/// given up for this round (the block is synced and held while it is tried).
+pub(super) const RESEAT_ATTEMPTS: u32 = 3;
+
+/// Whether `error` says the block file of a staged object is gone (the tier maps a
+/// missing file to [`kbf_tier::TierError::UnknownBlock`]).
+fn block_gone(error: &kbf_tier::TierError) -> bool {
+    matches!(error, kbf_tier::TierError::UnknownBlock(_))
+}
+
 /// What one [`Cache::flush_tier`] round did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FlushRound {
@@ -182,7 +216,9 @@ pub struct FlushRound {
     pub sealed: Vec<ObjectId>,
     /// Objects flushed: in the store, `ObjectFlushed` committed.
     pub flushed: Vec<ObjectId>,
-    /// Objects whose key holds another object: `FlushConflict` committed.
+    /// Objects whose key holds another object: their records were staged again under a
+    /// new key (an object an earlier build left in conflict counts when it is staged
+    /// again).
     pub conflicts: Vec<ObjectId>,
     /// Objects with a record that failed its digest: marked unreachable as corrupt, the
     /// records that were sound staged again as an object of their own.
@@ -191,6 +227,31 @@ pub struct FlushRound {
     pub dropped: Vec<Digest>,
     /// Objects whose flush failed this round, and how long until their next attempt.
     pub retrying: Vec<(ObjectId, Duration)>,
+}
+
+impl FlushRound {
+    /// How many objects the round took a step with: sealed, flushed, moved off a
+    /// conflicting key or found corrupt. 0 when nothing but failures happened.
+    fn moved(&self) -> usize {
+        self.sealed.len() + self.flushed.len() + self.conflicts.len() + self.corrupt.len()
+    }
+}
+
+/// How [`Cache::flush_for_shutdown`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownFlush {
+    /// No block holding acknowledged bytes is left on the write tier: every staged object
+    /// is in the store, or there was no tier.
+    Flushed,
+    /// The deadline ended with these blocks and committed bytes still on the tier. They
+    /// are durable on its disk (an acknowledgement follows `fdatasync` and the committed
+    /// log), and the next start recovers and flushes them.
+    TimedOut {
+        /// Blocks still on the tier.
+        blocks: u64,
+        /// Their committed bytes.
+        bytes: u64,
+    },
 }
 
 /// The most bytes of a block the flusher reads at once, and the pieces it hands to the
@@ -307,6 +368,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     ///    never guesses. It goes once the object is no longer staged on this tier (this
     ///    node became its flusher and flushed it, or it left staged state).
     ///
+    /// Rounds do not overlap: a call waits for the round in flight.
+    ///
     /// # Errors
     ///
     /// The metadata log could not answer a seal or the queue's query. A failed flush
@@ -315,6 +378,9 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let Some(staging) = self.writer.tier.get() else {
             return Ok(FlushRound::default());
         };
+        // One round at a time: the flusher's and a stop's final flush would else take the
+        // same sealed object, and the one that lost would find its block gone.
+        let _round = self.writer.rounds.lock().await;
         let mut round = FlushRound::default();
         for object in staging.tier.poll_seals(now) {
             self.commit_tier(Command::SealStaged { object }).await?;
@@ -323,10 +389,23 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             round.sealed.push(object);
         }
         let (tier, waiting, gate) = (staging.id, staging.waiting(now), self.gate.clone());
-        let due = self
+        let mark = self.writer.born.mark();
+        let (due, (backlog, backlog_bytes), mut staged) = self
             .writer
             .query(move |s| {
-                let ours = |o: &StagedObject| (o.tier(), o.state()) == (tier, StagedState::Sealed);
+                let mut staged = BTreeSet::new();
+                let backlog = s.staged_objects().filter(|(_, o)| o.tier() == tier).fold(
+                    (0u64, 0u64),
+                    |(n, b), (object, o)| {
+                        staged.insert(object);
+                        (n + 1, b + o.committed_len())
+                    },
+                );
+                // A conflict is taken too: a build before this one left them staged.
+                let ours = |o: &StagedObject| {
+                    o.tier() == tier
+                        && matches!(o.state(), StagedState::Sealed | StagedState::Conflict)
+                };
                 let sealed = s.staged_objects().filter(|(_, o)| ours(o));
                 let sealed = sealed.filter(|(object, _)| !waiting.contains(object));
                 // One flusher: an object none of whose digests this node flushes waits.
@@ -343,18 +422,27 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 let due = order.into_iter().filter_map(|(object, first)| {
                     let o = s.staged(object)?;
                     let blobs: Vec<(Digest, u64)> = o.blobs().map(|(d, at)| (*d, at)).collect();
-                    Some((object, o.committed_len(), blobs, first))
+                    Some((object, o.committed_len(), blobs, first, o.state()))
                 });
-                due.collect::<Vec<_>>()
+                (due.collect::<Vec<_>>(), backlog, staged)
             })
             .await?;
+        staging.counters.staged_objects.set(backlog);
+        staging.counters.staged_bytes.set(backlog_bytes);
         let mut done = BTreeSet::new();
-        for (object, len, blobs, first) in due {
+        for (object, len, blobs, first, state) in due {
             if !first.is_subset(&done) {
                 // An object it waits for failed this round: it waits for the next.
                 continue;
             }
-            match self.flush_one(staging, object, len, &blobs).await {
+            let flushed = if state == StagedState::Conflict {
+                self.reseat(staging, object, &blobs)
+                    .await
+                    .map(|()| Flushed::Conflict)
+            } else {
+                self.flush_one(staging, object, len, &blobs).await
+            };
+            match flushed {
                 Ok(Flushed::Done) => {
                     staging.done(object);
                     done.insert(object);
@@ -377,7 +465,60 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 }
             }
         }
+        // The staging dates of objects no longer staged here go with the round: nothing
+        // else need call `flush_report` for the dates not to pile up. A flushed object
+        // has left staged state; the others (open, sealed, conflicting) keep theirs.
+        for object in &done {
+            staged.remove(object);
+        }
+        self.writer.born.prune(mark, &staged);
         Ok(round)
+    }
+
+    /// The flush a graceful stop makes, after the node's calls have ended: rounds of
+    /// [`Cache::flush_tier`], run as if the seal delay had passed and the backoffs in place
+    /// when the stop began had ended, until no block holding acknowledged bytes is left on
+    /// the tier or `deadline` has passed. The open block is sealed and flushed too. A flush
+    /// that failed before the stop began is tried at once; one that fails during it is
+    /// logged where it fails (by [`Cache::flush_tier`]) and waits its backoff, 1 s doubling
+    /// to 60 s, within the deadline. A round that fails (the metadata log unavailable) is
+    /// logged and tried again after a pause, as is a round that moved nothing. Rounds do
+    /// not overlap those of the flusher: a round waits for one in flight. What the deadline
+    /// leaves is not lost: it is on the tier's disk, and the next start flushes it.
+    /// Without a tier, there is nothing to do.
+    pub async fn flush_for_shutdown(&self, deadline: Duration) -> ShutdownFlush {
+        let Some(staging) = self.writer.tier.get() else {
+            return ShutdownFlush::Flushed;
+        };
+        let unflushed = || staging.tier.unflushed(Instant::now());
+        let work = async {
+            while unflushed().blocks > 0 {
+                let at = Instant::now() + SHUTDOWN_HORIZON;
+                let moved = match self.flush_tier(at).await {
+                    Ok(round) => round.moved(),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "a round of the final flush of the write tier failed; trying again"
+                        );
+                        0
+                    }
+                };
+                if moved == 0 {
+                    tokio::time::sleep(SHUTDOWN_RETRY).await;
+                }
+            }
+        };
+        match tokio::time::timeout(deadline, work).await {
+            Ok(()) => ShutdownFlush::Flushed,
+            Err(_) => {
+                let left = unflushed();
+                ShutdownFlush::TimedOut {
+                    blocks: left.blocks,
+                    bytes: left.bytes,
+                }
+            }
+        }
     }
 
     /// Flushes `object`, staged with committed length `len` and `blobs` (sorted by
@@ -444,10 +585,65 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 "object {key} read back with another footer after its PUT"
             )));
         }
-        tracing::error!(%object, %key, "the store holds another object under a staged object's key; it stays staged, read locally, until an operator acts");
-        self.commit_tier(Command::FlushConflict { object }).await?;
+        tracing::warn!(%object, %key, "the store holds another object under a staged object's key; staging its records again under a new key");
+        self.reseat(staging, object, blobs).await?;
         staging.counters.conflicts.add(1);
         Ok(Flushed::Conflict)
+    }
+
+    /// Moves a staged `object` whose key is another object's (`blobs`, its records and
+    /// their offsets in its block) to an object of its own, in one commit.
+    ///
+    /// The numbering leaves the range that the other lifetime of this member and boot
+    /// used (`Writer::leave_numbering`); the records are
+    /// copied into a block of their own (or streamed to the store, if the tier has no
+    /// room) and made durable; and one `ReseatStaged` moves every index entry to the new
+    /// object, carries the flush order over to it and takes `object` out of the staged
+    /// table. Until that commit nothing about `object` has changed, so a failure or a
+    /// crash before it leaves the object and its block as they were, to be tried
+    /// again; after it, the old block is freed. No blob is unavailable at any point,
+    /// and none is counted as lost.
+    ///
+    /// The copy is not hashed on the tier path: a record the disk damaged is found by
+    /// the new object's flush, which hashes every record, as for any staged object.
+    ///
+    /// A block that is gone (the file is missing: nothing can produce the records) ends
+    /// the object instead of repeating every round: it is marked unreachable as missing,
+    /// which is a loss, and counted as one.
+    ///
+    /// # Errors
+    /// The copy, the store or the commit failed, after the commit was tried
+    /// [`RESEAT_ATTEMPTS`] times; nothing changed.
+    async fn reseat(
+        &self,
+        staging: &Staging,
+        object: ObjectId,
+        blobs: &[(Digest, u64)],
+    ) -> Result<(), CacheError> {
+        self.writer.leave_numbering();
+        let moved = if blobs.is_empty() {
+            // Nothing to copy: the object only leaves the table.
+            let empty = StagedPut {
+                object: self.writer.allocate(),
+                end: 0,
+                seal: true,
+                blobs: Vec::new(),
+            };
+            self.writer.reseat(staging.id, object, empty, true).await
+        } else {
+            self.restage(staging, object, blobs, Some(object)).await
+        };
+        match moved {
+            Ok(()) => {}
+            Err(CacheError::Tier(e)) if block_gone(&e) => {
+                tracing::error!(%object, error = %e, "the block of a staged object whose key holds another object is gone; its records are lost");
+                self.mark_unreachable(object, UnreachableReason::Missing)
+                    .await?;
+            }
+            Err(e) => return Err(e),
+        }
+        let _ = staging.tier.discard(object);
+        Ok(())
     }
 
     /// Handles a staged object with records that fail their digests: counts and logs
@@ -470,7 +666,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         staging.counters.corrupt.add(1);
         self.mark_unreachable(object, UnreachableReason::Corrupt)
             .await?;
-        if let Err(e) = self.restage(staging, object, &found.good).await {
+        let good: Vec<(Digest, u64)> = found.good.iter().map(|e| (e.digest, e.offset)).collect();
+        if let Err(e) = self.restage(staging, object, &good, None).await {
             tracing::error!(%object, error = %e, sound = found.good.len(), "the sound records of a corrupt staged object could not be stored again; they are unavailable until uploaded again");
         }
         let _ = staging.tier.discard(object);
@@ -480,14 +677,18 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
 
     /// Stores `good` (records of `object`'s block, each at its offset there) again as an
     /// object of their own, back to back, copied from the block a piece at a time: on
-    /// the write tier, a block of its own staged with one `PutStaged` (flushed, and so
-    /// hashed again, by a later round), when the tier has room; else in the store,
-    /// hashed again as the pieces go, and indexed with one `PutBlobs`.
+    /// the write tier, a block of its own, synced, when the tier has room; else in the
+    /// store, hashed again as the pieces go. Then one commit says where they are: with
+    /// `from` (an object whose key holds another object), a `ReseatStaged` that moves
+    /// the entries off `from`; without (a corrupt object, already marked unreachable),
+    /// a `PutStaged` or `PutBlobs` that heals them. A staged copy is flushed, and so
+    /// hashed again, by a later round.
     async fn restage(
         &self,
         staging: &Staging,
         object: ObjectId,
-        good: &[IndexEntry],
+        good: &[(Digest, u64)],
+        from: Option<ObjectId>,
     ) -> Result<(), CacheError> {
         if good.is_empty() {
             return Ok(());
@@ -495,10 +696,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let mut spans = Vec::with_capacity(good.len());
         let mut listed = Vec::with_capacity(good.len());
         let mut at = 0u64;
-        for entry in good {
-            let size = entry.digest.size_bytes;
-            spans.push((entry.offset, entry.offset + size));
-            listed.push((entry.digest, at));
+        for (digest, offset) in good {
+            let size = digest.size_bytes;
+            spans.push((*offset, offset + size));
+            listed.push((*digest, at));
             at += size;
         }
         if let Some(range) = self.reserve_range(at).await {
@@ -516,7 +717,17 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 Ok(range)
             };
             let range = blocking(&self.writer.metrics, Box::new(copy)).await?;
-            return self.stage_range(range, listed).await;
+            let (staging, synced) = self.sync_range(range).await?;
+            let at = synced.offset();
+            let blobs = listed.into_iter().map(|(d, o)| (d, at + o)).collect();
+            return match from {
+                Some(from) => {
+                    self.writer
+                        .reseat_staged(&staging, synced, blobs, from)
+                        .await
+                }
+                None => self.writer.put_staged(&staging, synced, blobs, true).await,
+            };
         }
         let total = at + footer_len(good.len() as u64);
         let found = Found::default();
@@ -530,8 +741,20 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             .read_footer(&key, total)
             .await
             .map_err(read_back)?;
-        let placed = placed(&footer, &key, sound, good.iter().map(|e| e.digest))?;
-        self.writer.commit_segment(placed).await
+        let placed = placed(&footer, &key, sound, good.iter().map(|(d, _)| *d))?;
+        let Some(from) = from else {
+            return self.writer.commit_segment(placed).await;
+        };
+        let put = StagedPut {
+            object: sound,
+            end: total,
+            seal: true,
+            blobs: placed
+                .into_iter()
+                .map(|(digest, location)| (digest, location.offset))
+                .collect(),
+        };
+        self.writer.reseat(staging.id, from, put, true).await
     }
 
     /// The body of an object read from `object`'s block: the bytes of `spans` (ranges

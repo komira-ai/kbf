@@ -1,11 +1,26 @@
-//! `PUT /v1/releases/{commit}/{platform}/{name}` and `GET /v1/releases`.
+//! `PUT /v1/releases/{commit}/{platform}/{name}`, `GET /v1/releases` and
+//! `GET /v1/releases/{commit}`.
 //!
+//! - `GET /v1/releases/{commit}` is what `ReleaseService.Describe` answers for every
+//!   complete platform, as JSON ([`super::describe::view`]): `200`, `400` for a commit that
+//!   is not 40 lowercase hex digits, `404` when no tarball of it is stored, `409` when no
+//!   platform is complete. It is open like `GET /v1/releases`; saved as
+//!   `releases/<commit>.json` beside the release's `files/`, it is the description a `url`
+//!   source gives.
 //! - The body of a `PUT` is the file: a tarball for `kbf` or `kbf-daemon`, a build
 //!   attestation bundle for the same with the suffix `.attestation`. It is written to the
 //!   store as it streams in ([`ReleaseStore`]), so the server holds a chunk of it, not the
 //!   file. `201` when the key is new, `200` when it already held exactly these bytes, `409`
 //!   for other bytes, `413` past the limit, `400` for a segment that is not what it must be,
 //!   an empty body or a body cut short.
+//! - **Version facts.** `PUT /v1/releases/{commit}/{platform}/version.json` takes the exact
+//!   bytes of that platform's `kbf --version --json` (the file `kbf-<commit>-<platform>.version.json`,
+//!   at most 4 KiB), the same answers as above, and `400` naming the file for a document that
+//!   does not parse, names another commit or platform, or states numbers a node refuses. A
+//!   platform stored without it is accepted as ever and never offered: the answer of a `PUT`
+//!   of its tarball or attestation carries a `note` that says so and names the file, and
+//!   `GET /v1/releases` lists the platform with `"version_facts": false` and the same
+//!   `note`.
 //! - A `PUT` needs what the other `/v1` writes need ([`crate::api::operator_gate`]): a
 //!   loopback peer, no `Origin`, the bearer token. Its body is not JSON, so the JSON
 //!   content type rule of the others does not apply. `GET` is open like `GET /v1/nodes`.
@@ -13,21 +28,22 @@
 //!   Serve the router with `into_make_service_with_connect_info`, as the API's.
 
 use std::io;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, put};
 use futures::StreamExt;
 use serde_json::json;
 
-use super::key::{Key, Part};
+use super::describe::{DescribeError, describe, view};
+use super::key::{Commit, FACTS_SEGMENT, Key, KeyError, Part, no_facts_note};
 use super::store::{CommitListing, PutError, ReleaseStore, Stored};
 use crate::api::{error, json, operator_gate};
+use crate::proxy_auth::Caller;
 use crate::token::ApiToken;
 
 /// The list route.
@@ -43,6 +59,7 @@ struct Releases {
 pub fn router(store: Option<Arc<ReleaseStore>>, token: Option<ApiToken>) -> Router {
     Router::new()
         .route(RELEASES, get(list))
+        .route("/v1/releases/{commit}", get(show))
         .route("/v1/releases/{commit}/{platform}/{name}", put(put_file))
         .with_state(Arc::new(Releases { store, token }))
 }
@@ -66,16 +83,19 @@ fn disk_failed(what: &str, e: &io::Error) -> Response {
 async fn put_file(
     State(releases): State<Arc<Releases>>,
     Path((commit, platform, name)): Path<(String, String, String)>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    if let Err((code, why)) = operator_gate(releases.token.as_ref(), peer, &headers) {
+    if let Err((code, why)) = operator_gate(releases.token.as_ref(), &peer, &headers) {
         return error(code, &why);
     }
     let Some(store) = releases.store.as_deref() else {
         return off();
     };
+    if name == FACTS_SEGMENT {
+        return put_facts(store, &commit, &platform, body).await;
+    }
     let (key, part) = match Key::parse(&commit, &platform, &name) {
         Ok(parsed) => parsed,
         Err(e) => return error(StatusCode::BAD_REQUEST, &e.to_string()),
@@ -85,19 +105,42 @@ async fn put_file(
         Part::Tarball => store.put_tarball(&key, &mut chunks).await,
         Part::Attestation => store.put_attestation(&key, &mut chunks).await,
     };
-    match put {
-        Ok(stored) => stored_answer(&stored),
+    let stored = match put {
+        Ok(stored) => stored,
+        Err(e) => return put_refused(&e),
+    };
+    // Said at every put of a component, so whoever uploads sees it whichever file is last.
+    let note = match store.facts(&key.commit, key.platform).await {
+        Ok(None) => Some(no_facts_note(&key.commit, key.platform)),
+        Ok(Some(_)) => None,
+        Err(e) => return disk_failed("facts", &e),
+    };
+    stored_answer(&stored, note)
+}
+
+/// The `PUT` of a platform's version facts.
+async fn put_facts(store: &ReleaseStore, commit: &str, platform: &str, body: Body) -> Response {
+    let (commit, platform) = match Key::parse_platform(commit, platform) {
+        Ok(parsed) => parsed,
+        Err(e) => return error(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let mut chunks = body.into_data_stream().map(|c| c.map_err(io::Error::other));
+    match store.put_facts(&commit, platform, &mut chunks).await {
+        Ok(stored) => stored_answer(&stored, None),
         Err(e) => put_refused(&e),
     }
 }
 
-fn stored_answer(stored: &Stored) -> Response {
+fn stored_answer(stored: &Stored, note: Option<String>) -> Response {
     let code = if stored.created {
         StatusCode::CREATED
     } else {
         StatusCode::OK
     };
-    let answer = json!({ "sha256": stored.sha256.as_str(), "size": stored.size });
+    let mut answer = json!({ "sha256": stored.sha256.as_str(), "size": stored.size });
+    if let Some(note) = note {
+        answer["note"] = note.into();
+    }
     json(code, &answer)
 }
 
@@ -105,7 +148,7 @@ fn put_refused(e: &PutError) -> Response {
     let code = match e {
         PutError::Conflict(_) => StatusCode::CONFLICT,
         PutError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
-        PutError::Empty | PutError::Body(_) => StatusCode::BAD_REQUEST,
+        PutError::Empty | PutError::Body(_) | PutError::Facts { .. } => StatusCode::BAD_REQUEST,
         PutError::Disk(e) => return disk_failed("put", e),
     };
     error(code, &e.to_string())
@@ -121,9 +164,27 @@ async fn list(State(releases): State<Arc<Releases>>) -> Response {
     }
 }
 
+/// `GET /v1/releases/{commit}`: [`describe`] of every complete platform, as the JSON of
+/// [`view`], which is also the file `releases/<commit>.json` of a `url` source.
+async fn show(State(releases): State<Arc<Releases>>, Path(commit): Path<String>) -> Response {
+    let Some(store) = releases.store.as_deref() else {
+        return off();
+    };
+    let Some(commit) = Commit::parse(&commit) else {
+        let why = KeyError::Commit(commit).to_string();
+        return error(StatusCode::BAD_REQUEST, &why);
+    };
+    match describe(store, &commit, None).await {
+        Ok(description) => json(StatusCode::OK, &view(&description)),
+        Err(e @ DescribeError::Unknown(_)) => error(StatusCode::NOT_FOUND, &e.to_string()),
+        Err(e @ DescribeError::Incomplete { .. }) => error(StatusCode::CONFLICT, &e.to_string()),
+        Err(DescribeError::Store(e)) => disk_failed("describe", &e),
+    }
+}
+
 /// The `GET /v1/releases` body: commits with, per platform, the components stored and
 /// whether the platform is complete.
-fn listing_view(listing: &[CommitListing]) -> serde_json::Value {
+pub(super) fn listing_view(listing: &[CommitListing]) -> serde_json::Value {
     let releases: Vec<_> = listing
         .iter()
         .map(|commit| {
@@ -143,11 +204,16 @@ fn listing_view(listing: &[CommitListing]) -> serde_json::Value {
                             })
                         })
                         .collect();
-                    json!({
+                    let mut platform = json!({
                         "platform": p.platform.as_str(),
                         "complete": p.complete,
+                        "version_facts": p.facts,
                         "components": components,
-                    })
+                    });
+                    if !p.facts {
+                        platform["note"] = no_facts_note(&commit.commit, p.platform).into();
+                    }
+                    platform
                 })
                 .collect();
             json!({ "commit": commit.commit.as_str(), "platforms": platforms })

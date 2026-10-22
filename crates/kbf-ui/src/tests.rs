@@ -10,7 +10,10 @@ use std::sync::Mutex;
 use futures::executor::block_on;
 use serde_json::{Value, json};
 
-use crate::pages::{ACTION, BUILD, BUILDS, PAGES};
+use crate::pages::{
+    ACTION, BUILD, BUILDS, LEASES, LOG, NODE, NODES, OVERVIEW, PAGES, QUEUE, STORAGE, TARGET,
+    TARGETS, UPDATES, sched_farm,
+};
 use crate::read::Page;
 use crate::{Answer, CONTENT_SECURITY_POLICY, Fetched, Source, SourceError, respond};
 
@@ -19,6 +22,10 @@ use crate::{Answer, CONTENT_SECURITY_POLICY, Fetched, Source, SourceError, respo
 pub(crate) struct Fake {
     answers: BTreeMap<String, Result<Fetched, String>>,
     seen: Mutex<Vec<String>>,
+    /// The ranges asked, as `(url, first, last)`.
+    ranges: Mutex<Vec<(String, u64, u64)>>,
+    /// The suffix ranges asked, as `(url, n)`.
+    suffixes: Mutex<Vec<(String, u64)>>,
 }
 
 impl Fake {
@@ -63,9 +70,53 @@ impl Fake {
     pub(crate) fn seen(&self) -> Vec<String> {
         self.seen.lock().expect("not poisoned").clone()
     }
+
+    /// Every range asked, `(url, first, last)`, in order.
+    pub(crate) fn ranges(&self) -> Vec<(String, u64, u64)> {
+        self.ranges.lock().expect("not poisoned").clone()
+    }
+
+    /// Every suffix range asked, `(url, n)`, in order.
+    pub(crate) fn suffixes(&self) -> Vec<(String, u64)> {
+        self.suffixes.lock().expect("not poisoned").clone()
+    }
+
+    /// Forgets the URLs asked so far.
+    pub(crate) fn forget_seen(&self) {
+        self.seen.lock().expect("not poisoned").clear();
+    }
 }
 
 impl Source for Fake {
+    /// Asked for a suffix: the table's answer is what a server sends for it, and the
+    /// suffix is remembered.
+    fn get_suffix(
+        &self,
+        url: &str,
+        n: u64,
+    ) -> impl Future<Output = Result<Fetched, SourceError>> + Send {
+        self.suffixes
+            .lock()
+            .expect("not poisoned")
+            .push((url.to_owned(), n));
+        self.get(url)
+    }
+
+    /// Asked with a range: the table's answer is what a server sends for that range
+    /// (a `206` with its `Content-Range`, or a `200`), and the range is remembered.
+    fn get_range(
+        &self,
+        url: &str,
+        first: u64,
+        last: u64,
+    ) -> impl Future<Output = Result<Fetched, SourceError>> + Send {
+        self.ranges
+            .lock()
+            .expect("not poisoned")
+            .push((url.to_owned(), first, last));
+        self.get(url)
+    }
+
     fn get(&self, url: &str) -> impl Future<Output = Result<Fetched, SourceError>> + Send {
         self.seen.lock().expect("not poisoned").push(url.to_owned());
         let answer = self.answers.get(url).cloned().unwrap_or_else(|| {
@@ -181,8 +232,53 @@ pub(crate) fn stderr_blob() -> Value {
         "href": format!("/v1/blobs/{d}?instance=main&name=stderr&inline=text")})
 }
 
-/// A read API holding build `ID` with one page of three rows and a second page, and its
-/// failed action with a stderr blob.
+/// A build as `GET /v1/invocations` lists it, with `failed` failed actions.
+pub(crate) fn listed(id: &str, state: &str, failed: u64) -> Value {
+    json!({
+        "id": id, "first_seen": "2026-10-11T09:00:00.000000Z",
+        "last_seen": "2026-10-11T09:01:00.000000Z", "state": state,
+        "complete": state == "closed", "instances": ["main", "edge"],
+        "counts": {"ran": 2, "hits": 5, "failed": failed},
+        "href": format!("/v1/invocations/{id}"),
+    })
+}
+
+/// The first line of a failure's command arguments: markup, as a hostile build would pass.
+pub(crate) const ARGUMENT: &str = "-DNAME=\"<script>alert(1)</script>\" & more";
+
+/// The stderr object of a failure, with its tail (`tail` null for none) of `STDERR`.
+pub(crate) fn stderr_tail(tail: &Value, truncated: bool) -> Value {
+    let d = digest('5', 4096);
+    json!({"digest": d, "available": true,
+        "href": format!("/v1/blobs/{d}?instance=main&name=stderr&inline=text"),
+        "bytes": 4096, "tail": tail, "tail_bytes": STDERR.len(), "truncated": truncated})
+}
+
+/// An entry of `/failures` for the action `digest`, whose target is `target`.
+pub(crate) fn failure(digest: &str, target: &str, stderr: &Value) -> Value {
+    let mut f = row(
+        digest,
+        target,
+        &json!({"failed": {"code": 2, "message": "<img src=x onerror=alert(1)>"}}),
+    );
+    let extra = json!({
+        "failure": {"class": "infra", "reason": "<b>worker lost</b>"},
+        "command": {"arguments": ["clang", ARGUMENT, "-o", "out/lib.o"],
+            "environment_names": ["PATH", "<ENV>"], "working_directory": "/work/<dir>",
+            "platform": {"OSFamily": "linux", "<k>": "v&"}, "timeout_micros": 90_000_000,
+            "output_paths": ["out/lib.o"], "truncated": false},
+        "command_available": true,
+        "stdout": null,
+        "stderr": stderr,
+    });
+    for (k, v) in extra.as_object().expect("an object") {
+        f[k] = v.clone();
+    }
+    f
+}
+
+/// A read API holding build `ID` with one page of three rows and a second page, its
+/// list of failed actions in two pages, and its failed action with a stderr blob.
 pub(crate) fn farm() -> Fake {
     let base = format!("/v1/invocations/{ID}");
     let ok = row(
@@ -190,6 +286,12 @@ pub(crate) fn farm() -> Fake {
         "//app:ok",
         &json!({"ok": {"exit_code": 0}}),
     );
+    let mut ok_action = action(&stderr_blob());
+    ok_action["outcome"] = json!({"ok": {"exit_code": 0}});
+    ok_action["action"] = json!(digest('b', 10));
+    let tail = stderr_tail(&json!(STDERR), true);
+    let first = failure(&action_digest(), "//app:<b>lib</b>", &tail);
+    let second = failure(&digest('7', 20), "//app:retried", &tail);
     let failed = row(
         &action_digest(),
         "//app:<b>lib</b>",
@@ -208,7 +310,279 @@ pub(crate) fn farm() -> Fake {
             &format!("{base}/actions/{}", action_digest()),
             &action(&stderr_blob()),
         )
+        .json(
+            &format!("{base}/actions/{}", digest('b', 10)),
+            &ok_action,
+        )
+        .json(
+            &format!("{base}/failures"),
+            &json!({"invocation": invocation(ID), "failures": [first],
+                "next_page": format!("{base}/failures?page_token=f%2B1"),
+                "next_page_token": "f+1"}),
+        )
+        .json(
+            &format!("{base}/failures?page_token=f%2B1"),
+            &json!({"invocation": invocation(ID), "failures": [second]}),
+        )
+        .json(
+            &format!("{base}/actions/{}", digest('7', 20)),
+            &retried_action(),
+        )
+        .json(
+            "/v1/invocations",
+            &json!({"invocations": [listed(ID, "closed", 1), listed("<i>b2</i>", "open", 0)],
+                "next_page": "/v1/invocations?page_size=20&page_token=l%2B1"}),
+        )
+        .json(
+            "/v1/invocations?page_token=l%2B1",
+            &json!({"invocations": [], "partial": true}),
+        )
         .with(&stderr_href, 200, STDERR)
+        .with_headers(
+            &format!("/v1/runs/{RUN_ID}/logs/stderr"),
+            206,
+            &[("Content-Range", &format!("bytes 0-{}/{}", STDERR.len() - 1, STDERR.len()))],
+            STDERR,
+        )
+}
+
+/// A run's id in history.
+pub(crate) const RUN_ID: &str = "0a0b0c0d0e0f0a0b0c0d0e0f";
+
+/// The answer of `/actions/{digest}` for `retried()`.
+fn retried_action() -> Value {
+    let mut a = retried();
+    let extra = json!({"outputs": [], "outputs_truncated": false, "stdout": null,
+        "stderr": null, "usage": null});
+    for (k, v) in extra.as_object().expect("an object") {
+        a[k] = v.clone();
+    }
+    a
+}
+
+pub(crate) const COMMIT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+pub(crate) const COMMIT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+/// `GET /v1/update`: desired `COMMIT_B` at generation 7 (not paused), no policy row,
+/// two releases: `COMMIT_A` with a complete linux platform and an incomplete darwin
+/// one, `COMMIT_B` complete on both.
+pub(crate) fn update_doc() -> Value {
+    json!({
+        "desired": {"generation": 7, "commit": COMMIT_B, "set_at_ms": 1_791_370_000_000_u64},
+        "paused": false,
+        "policy": null,
+        "releases": {"releases": [
+            {"commit": COMMIT_A, "platforms": [
+                {"platform": "linux-x86_64", "complete": true, "components": []},
+                {"platform": "darwin-arm64", "complete": false, "components": []}]},
+            {"commit": COMMIT_B, "platforms": [
+                {"platform": "linux-arm64", "complete": true, "components": []},
+                {"platform": "darwin-arm64", "complete": true, "components": []}]}]},
+    })
+}
+
+/// A node of `GET /v1/nodes`.
+pub(crate) fn node(id: &str, os: Option<&str>, update: &Value) -> Value {
+    json!({
+        "node_id": id, "connected": true,
+        "software": os.map(|os| json!({"os_name": os, "xcodes": []})),
+        "update": update, "needs_attention": [], "placement": {"state": "serving"},
+    })
+}
+
+/// `GET /v1/nodes`: the frontend's server at `COMMIT_B`, a current Linux host, a
+/// Mac that refused, and a host that never sent an `UpdateStatus`.
+pub(crate) fn nodes_doc() -> Value {
+    json!({"server": {"version": "0.1.0+bbbbbbbbbbbb", "commit": COMMIT_B}, "nodes": [
+        node("linux-1", Some("Linux"),
+            &json!({"state": "confirmed", "up_to_date": true, "availability": "ok"})),
+        node("mac-1", Some("macOS"),
+            &json!({"state": "refused", "up_to_date": false, "availability": "ok"})),
+        node("old-1", None,
+            &json!({"state": null, "up_to_date": null, "availability": "unsupported"}))]})
+}
+
+/// `GET /v1/update/hosts` for `nodes_doc`.
+pub(crate) fn hosts_doc() -> Value {
+    json!({"desired": null, "paused": false, "next_page_token": null, "hosts": [
+        {"node_id": "linux-1", "connected": true, "availability": "ok", "state": "confirmed",
+         "up_to_date": true, "desired_commit": COMMIT_B, "running_commit": "bbbbbbbbbbbb",
+         "installed_commit": COMMIT_B, "staged_commit": "", "refusal": "",
+         "offered_generation": 7, "helper_present": true, "reported_at_unix_ms": 1},
+        {"node_id": "mac-1", "connected": true, "availability": "ok", "state": "refused",
+         "up_to_date": false, "desired_commit": COMMIT_B, "running_commit": "aaaaaaaaaaaa",
+         "installed_commit": COMMIT_A, "staged_commit": "", "refusal": "no helper installed",
+         "offered_generation": 7, "helper_present": false, "reported_at_unix_ms": 2}]})
+}
+
+/// The URL of the per-host detail, as the page asks for it.
+pub(crate) const HOSTS_URL: &str = "/v1/update/hosts?page_size=1000";
+
+/// A read API that answers all three routes of the Updates page.
+pub(crate) fn updates_farm() -> Fake {
+    Fake::default()
+        .json("/v1/update", &update_doc())
+        .json("/v1/nodes", &nodes_doc())
+        .json(HOSTS_URL, &hosts_doc())
+}
+
+/// One storage member of `GET /v1/storage`, every report value known.
+pub(crate) fn storage_node(id: u64, state: &str) -> Value {
+    json!({
+        "id": id, "state": state, "planned_down": false, "repair_debts": 3,
+        "open_writes": 0, "generation": 12,
+        "unflushed_bytes": 1_048_576, "unflushed_blocks": 2, "oldest_unflushed_ms": 4200,
+        "budget_bytes": 107_374_182_400_u64, "used_bytes": 2_097_152,
+        "flush_failures": 0, "flush_conflicts": 5,
+    })
+}
+
+/// A member whose report says nothing: every value is `null`.
+pub(crate) fn storage_node_unknown(id: u64, state: &str) -> Value {
+    let mut node = storage_node(id, state);
+    for key in [
+        "repair_debts",
+        "open_writes",
+        "generation",
+        "unflushed_bytes",
+        "unflushed_blocks",
+        "oldest_unflushed_ms",
+        "budget_bytes",
+        "used_bytes",
+        "flush_failures",
+        "flush_conflicts",
+    ] {
+        node[key] = Value::Null;
+    }
+    node
+}
+
+/// `GET /v1/storage` with one known member and one that is silent.
+pub(crate) fn storage_doc() -> Value {
+    json!({
+        "members_total": 2, "members_active": 2, "not_active": [], "silent": [2],
+        "unreported": [], "debts_total": 3, "under_replicated_blobs": null,
+        "reasons": ["member 2 silent", "3 blobs owed"],
+        "nodes": [storage_node(1, "active"), storage_node_unknown(2, "active")],
+    })
+}
+
+/// A read API that answers the Storage page's route.
+pub(crate) fn storage_farm() -> Fake {
+    Fake::default().json("/v1/storage", &storage_doc())
+}
+
+/// The markup a hostile node or build would send in every string the pages show.
+pub(crate) const HOSTILE: &str = "<script>alert(1)</script>\"'&<img src=x onerror=alert(2)>";
+
+/// A node as `GET /v1/nodes` lists it, with `lease_count` and `booked`.
+pub(crate) fn fleet_node(id: &str, placement: &str, leases: u64, cpu: u64) -> Value {
+    json!({
+        "node_id": id, "connected": true, "protocol": 3,
+        "software": {"os_name": "macOS", "os_version": "15.1", "os_build": "24B83",
+            "kernel": "", "daemon_version": "0.1.0", "xcode_builds": [], "xcodes": []},
+        "needs_attention": [],
+        "placement": {"state": placement},
+        "phase": {"state": "serving"},
+        "update": {"state": "confirmed", "up_to_date": true, "availability": "ok"},
+        "lease_count": leases,
+        "booked": {"cpu_millis": cpu, "memory_bytes": 2_147_483_648_u64, "gpus": 1, "vms": 4},
+    })
+}
+
+/// A node whose every string is `HOSTILE`, quarantined and in need of attention.
+pub(crate) fn hostile_node() -> Value {
+    let mut n = fleet_node(HOSTILE, "serving", 1, 500);
+    n["connected"] = json!(false);
+    n["protocol"] = Value::Null;
+    n["software"] = json!({"os_name": HOSTILE, "os_version": HOSTILE, "daemon_version": HOSTILE});
+    n["needs_attention"] = json!([HOSTILE]);
+    n["placement"] = json!({"state": HOSTILE});
+    n["phase"] = json!({"state": "quarantined", "reason": HOSTILE});
+    n["update"] = json!({"state": HOSTILE, "up_to_date": null, "availability": HOSTILE});
+    n
+}
+
+/// `GET /v1/nodes` of the fleet fixtures: a Mac and a hostile node.
+pub(crate) fn fleet_nodes() -> Value {
+    json!({"server": {"version": "0.1.0+bbbbbbbbbbbb", "commit": COMMIT_B},
+        "nodes": [fleet_node("mac-1", "draining", 7, 3500), hostile_node()],
+        "oldest_protocol": 3, "protocol_unknown": 1})
+}
+
+/// `GET /v1/nodes/mac-1`: the list entry and its capacity, free and leases.
+pub(crate) fn fleet_node_detail() -> Value {
+    let mut n = fleet_node("mac-1", "draining", 2, 3500);
+    n["capacity"] =
+        json!({"cpu_millis": 8000, "memory_bytes": 17_179_869_184_u64, "gpus": 2, "vms": 6});
+    n["free"] =
+        json!({"cpu_millis": 4500, "memory_bytes": 15_032_385_536_u64, "gpus": 1, "vms": 2});
+    n["leases"] = json!(["117399224320012061.42", HOSTILE]);
+    n
+}
+
+/// `GET /v1/health` of the fleet fixtures: not ready, a failing check, every count its
+/// own value, storage with an unknown under-replicated count.
+pub(crate) fn health_doc() -> Value {
+    json!({"ready": false,
+        "failing": [{"check": "store", "reason": HOSTILE}],
+        "nodes": {"total": 21, "serving": 5, "cordoned": 3, "draining": 2, "drained": 4,
+            "quarantined": 1, "disconnected": 6},
+        "queue": {"depth": 9, "oldest_age_ms": null},
+        "leases": 13,
+        "storage": {"members_active": 2, "members_total": 3, "under_replicated_blobs": null},
+        "started_unix_ms": STARTED_MS, "uptime_ms": UPTIME_MS})
+}
+
+/// When the fixture server started, 2026-10-21T08:30:15Z.
+pub(crate) const STARTED_MS: u64 = 1_792_571_415_000;
+
+/// How long the fixture server had run: 2 h 5 min.
+pub(crate) const UPTIME_MS: u64 = 7_500_000;
+
+/// What the banner says of the fixture server's start.
+pub(crate) const STARTED_SAYS: &str =
+    "This server started at 2026-10-21T08:30:15Z, 2 h 5 min ago by its own clock.";
+
+/// A build of `GET /v1/invocations`.
+pub(crate) fn latest_build(id: &str) -> Value {
+    json!({"id": id, "first_seen": "2026-10-11T09:00:00.000000Z",
+        "last_seen": "2026-10-11T09:01:00.000000Z", "state": "closed", "complete": true,
+        "counts": {"ran": 11, "hits": 12, "failed": 13}, "instances": ["main", HOSTILE],
+        "href": format!("/v1/invocations/{id}")})
+}
+
+/// The Overview's build list URL.
+pub(crate) const LATEST_URL: &str = "/v1/invocations?page_size=10";
+
+/// A read API that answers the routes of the Overview, Nodes and Node pages.
+pub(crate) fn fleet_farm() -> Fake {
+    Fake::default()
+        .json("/v1/health", &health_doc())
+        .json("/v1/nodes", &fleet_nodes())
+        .json("/v1/nodes/mac-1", &fleet_node_detail())
+        .json(
+            LATEST_URL,
+            &json!({"invocations": [latest_build("build-1"), latest_build(HOSTILE)],
+                "next_page": "/v1/invocations?page_size=10&page_token=t"}),
+        )
+}
+
+/// The fake that makes `page` answer `200` on its contract paths.
+fn fake_for(page: &Page) -> Fake {
+    if page.name == UPDATES.name {
+        updates_farm()
+    } else if page.name == TARGETS.name || page.name == TARGET.name {
+        crate::pages::history_fixtures::farm()
+    } else if page.name == LEASES.name || page.name == QUEUE.name {
+        sched_farm()
+    } else if page.name == STORAGE.name {
+        storage_farm()
+    } else if [OVERVIEW.name, NODES.name, NODE.name].contains(&page.name) {
+        fleet_farm()
+    } else {
+        farm()
+    }
 }
 
 pub(crate) fn render(fake: &Fake, path_and_query: &str) -> Answer {
@@ -233,16 +607,16 @@ fn action_page() -> String {
 fn every_answer_carries_the_csp_and_nosniff() {
     assert_eq!(
         CONTENT_SECURITY_POLICY,
-        "default-src 'none'; style-src 'self'; img-src 'self'; script-src 'self'; \
-         frame-ancestors 'none'"
+        "default-src 'none'; style-src 'self'; img-src 'self'; frame-ancestors 'none'; \
+         base-uri 'none'; form-action 'self'"
     );
     let fake = farm().down("/v1/invocations/down");
     let paths = [
         "/ui".to_owned(),
         "/ui/".to_owned(),
-        format!("/ui?id={ID}"),
-        "/ui?id=missing".to_owned(),
-        "/ui?id=down".to_owned(),
+        format!("/ui/builds?id={ID}"),
+        "/ui/builds?id=missing".to_owned(),
+        "/ui/builds?id=down".to_owned(),
         format!("/ui/builds/{ID}"),
         "/ui/builds/missing".to_owned(),
         action_page(),
@@ -296,7 +670,7 @@ fn a_page_with_the_apis_status_passes_on_the_headers_it_needs() {
                 r#"{"error": "no"}"#,
             );
         for path in [
-            format!("/ui?id={ID}"),
+            format!("/ui/builds?id={ID}"),
             format!("/ui/builds/{ID}"),
             action_page(),
         ] {
@@ -354,15 +728,55 @@ fn a_stderr_of_script_renders_as_text() {
 /// every route it declares.
 fn contract_table() -> Vec<(&'static Page, Vec<String>)> {
     vec![
-        (&BUILDS, vec!["/ui".to_owned(), format!("/ui?id={ID}")]),
+        (&OVERVIEW, vec!["/ui".to_owned()]),
+        (
+            &BUILDS,
+            vec![
+                "/ui/builds".to_owned(),
+                "/ui/builds?page_token=l%2B1".to_owned(),
+                format!("/ui/builds?id={ID}"),
+            ],
+        ),
         (
             &BUILD,
             vec![
                 format!("/ui/builds/{ID}"),
                 format!("/ui/builds/{ID}?page_token=t%2B1"),
+                format!("/ui/builds/{ID}?failures_token=f%2B1"),
             ],
         ),
-        (&ACTION, vec![action_page()]),
+        (
+            &ACTION,
+            vec![
+                action_page(),
+                // A succeeded action: its log is read from the blob route.
+                format!("/ui/builds/{ID}/actions/{}", digest('b', 10)),
+            ],
+        ),
+        (
+            &LOG,
+            vec![
+                format!("/ui/runs/{RUN_ID}/logs/stderr"),
+                format!("/ui/runs/{RUN_ID}/logs/stderr?from=start"),
+            ],
+        ),
+        (&NODES, vec!["/ui/nodes".to_owned()]),
+        (&NODE, vec!["/ui/nodes/mac-1".to_owned()]),
+        (&UPDATES, vec!["/ui/updates".to_owned()]),
+        (
+            &LEASES,
+            vec!["/ui/leases".to_owned(), "/ui/leases?node=node-a".to_owned()],
+        ),
+        (&QUEUE, vec!["/ui/queue".to_owned()]),
+        (&TARGETS, vec!["/ui/targets".to_owned()]),
+        (
+            &TARGET,
+            vec![
+                "/ui/targets/1111111111111111?instance=main&cfg=cfgA".to_owned(),
+                "/ui/targets/1111111111111111".to_owned(),
+            ],
+        ),
+        (&STORAGE, vec!["/ui/storage".to_owned()]),
     ]
 }
 
@@ -386,7 +800,7 @@ fn every_page_reads_only_the_routes_it_declares() {
     for (page, paths) in &table {
         let mut used = vec![false; page.reads.len()];
         for path in paths {
-            let fake = farm();
+            let fake = fake_for(page);
             let answer = render(&fake, path);
             assert_eq!(answer.status(), 200, "{path}: {}", body(&answer));
             let seen = fake.seen();
@@ -469,7 +883,8 @@ fn a_log_href_outside_the_declared_routes_is_not_read() {
         let fake = Fake::default().json(&base, &action(&stderr));
         let answer = render(&fake, &action_page());
         assert_eq!(answer.status(), 200);
-        assert_eq!(fake.seen(), [base], "{href}");
+        let failures = format!("/v1/invocations/{ID}/failures");
+        assert_eq!(fake.seen(), [base, failures], "{href}");
         let page = body(&answer);
         assert!(page.contains("is not a route this page declares"), "{page}");
         assert!(page.contains("problem bug"), "{page}");
@@ -492,7 +907,6 @@ fn routing() {
     let fake = farm();
     for path in [
         "/uix",
-        "/ui/builds",
         "/ui/builds/",
         "/ui/builds//actions/x",
         "/ui/builds/x/actions/",
@@ -520,7 +934,7 @@ fn routing() {
     );
     assert!(body(&css).contains("prefers-color-scheme: dark"));
 
-    let slash = render(&fake, "/ui/");
+    let slash = render(&fleet_farm(), "/ui/");
     assert_eq!(slash.status(), 200);
     assert_eq!(
         slash.headers()[0],

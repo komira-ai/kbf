@@ -1,5 +1,5 @@
 //! The scheduler's queue and leases, and the time Execute spends before its first
-//! operation, on `/metrics` (issue komira-ai/komira-build-farm#666): a farm with
+//! operation, on `/metrics` (issue komira-ai/kbf#666): a farm with
 //! operations queued and slots idle must be readable from a scrape, not from a trace.
 
 mod support;

@@ -47,9 +47,6 @@ pub const REAPI_KEYS: [&str; 3] = ["OSFamily", "ISA", "Arch"];
 /// The property that is booked, not matched.
 const GPU_KEY: &str = "gpu";
 
-/// The prefix of a `label.<k>` key.
-const LABEL_PREFIX: &str = "label.";
-
 /// The name kbf reads platform property `name` by, or `None` for a property kbf does
 /// not read (`container-image`, `Pool`, ...).
 ///
@@ -59,9 +56,9 @@ const LABEL_PREFIX: &str = "label.";
 /// `ios.device.<attribute>`, the reserved keys, [`crate::RESERVED_KEYS`], and the keys
 /// it refuses, the report-only keys, [`crate::REPORT_ONLY_KEYS`]). A name
 /// kbf reads comes back in its canonical spelling: `osfamily` is `OSFamily`, `OS` is
-/// `os`, `GPU` is `gpu`, and `Label.Pool` is `label.Pool` (a label's own name keeps its
-/// case: labels are compared exactly). kbf's own spelling of one of its keys is that
-/// key, so `arch` is kbf's `arch`, and every other spelling of it is REAPI's `Arch`.
+/// `os` and `GPU` is `gpu`. kbf's own spelling of one of its keys is that key, so `arch`
+/// is kbf's `arch`, and every other spelling of it is REAPI's `Arch`. A `label.<k>` is not
+/// read, in any case: node labels are removed, so it names nothing a node reports.
 #[must_use]
 pub fn property_name(name: &str) -> Option<Cow<'_, str>> {
     if is_own_key(name) {
@@ -69,13 +66,6 @@ pub fn property_name(name: &str) -> Option<Cow<'_, str>> {
     }
     if let Some(reapi) = REAPI_KEYS.iter().find(|k| k.eq_ignore_ascii_case(name)) {
         return Some(Cow::Borrowed(reapi));
-    }
-    let label = name
-        .get(..LABEL_PREFIX.len())
-        .filter(|prefix| prefix.eq_ignore_ascii_case(LABEL_PREFIX))
-        .map(|_| &name[LABEL_PREFIX.len()..]);
-    if let Some(label) = label.filter(|label| !label.is_empty()) {
-        return Some(Cow::Owned(format!("{LABEL_PREFIX}{label}")));
     }
     let lower = name.to_ascii_lowercase();
     is_own_key(&lower).then_some(Cow::Owned(lower))

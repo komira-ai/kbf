@@ -14,16 +14,37 @@
 //!   spacing are CSS custom properties, light and dark by `prefers-color-scheme`, so a
 //!   new look is a new stylesheet.
 //!
-//! The pages, under [`PREFIX`]: `/ui` (Builds: look a build up by id; with `?id=`, its
-//! summary from `GET /v1/invocations/{id}`), `/ui/builds/{id}` (Build: the summary
-//! and a page of `GET /v1/invocations/{id}/actions`), and
+//! The pages, under [`PREFIX`]: `/ui` (Overview: readiness, nodes by state, queue, leases
+//! and storage from `GET /v1/health`, the latest builds from `GET /v1/invocations`),
+//! `/ui/nodes` (Nodes: `GET /v1/nodes`), `/ui/nodes/{id}` (Node: `GET /v1/nodes/{id}`;
+//! Overview, Nodes and Node reload themselves with `?refresh=N`), `/ui/builds` (Builds: the
+//! recent builds of `GET /v1/invocations`, filtered by state and instance; with `?id=`, one
+//! build's summary from `GET /v1/invocations/{id}`),
+//! `/ui/builds/{id}` (Build: the summary, a page of `GET /v1/invocations/{id}/failures`
+//! and a page of `.../actions`), and
+//! `/ui/runs/{run_id}/logs/{stream}` (Log: the first MiB of a run's `stdout`, `stderr` or
+//! `result` from `GET /v1/runs/{run_id}/logs/{stream}`, read with a `Range` header, as
+//! escaped text, with a link to the route that downloads all of it; linked from each
+//! attempt of the Action page that has a run id),
 //! `/ui/builds/{id}/actions/{digest}` (Action: `GET /v1/invocations/{id}/actions/
-//! {digest}`, with stdout and stderr shown as text when the blob route links them
-//! and they are small; a larger one is a link).
+//! {digest}`; for a failed action its failure class, command and log tails from
+//! `/failures`, each tail with a link that downloads the whole log; else stdout and stderr
+//! shown as text when the blob route links them and they are small; a larger one is a
+//! link), and `/ui/updates` (Updates: the
+//! desired release, the releases, and each host's update, from `GET /v1/update`,
+//! `GET /v1/nodes` and, where it answers, `GET /v1/update/hosts`; read-only, with the
+//! operator-API command to set the desired release shown as text), `/ui/leases` (Leases:
+//! `GET /v1/leases`, filtered by `?node=` and paged by the API's own links),
+//! `/ui/queue` (Queue: `GET /v1/queue`), `/ui/targets`
+//! (Targets: `GET /v1/tests` and, for the strips, `GET /v1/grid`),
+//! `/ui/targets/{key}?instance=&cfg=` (Target: `GET /v1/shapes/{key}` and a strip of the
+//! target's last builds, oldest left, from `GET /v1/grid`), and `/ui/storage`
+//! (Storage: the members, the under-replicated blobs and each member's write-tier
+//! health from `GET /v1/storage`; a value the API sends as `null` is "unknown").
 //!
-//! Not mounted on a server yet. A mount routes `GET` under [`PREFIX`] to [`respond`]
-//! and gives it a [`Source`] that asks the server's own routes with the caller's
-//! credentials, and sends every header of [`Answer::headers`].
+//! A mount routes `GET` under [`PREFIX`] to [`respond`], gives it a [`Source`] that asks
+//! the server's own read routes, and sends every header of [`Answer::headers`]
+//! (`kbf-server` mounts it, `ui_mount`).
 
 use std::future::Future;
 
@@ -37,10 +58,14 @@ mod read;
 pub const PREFIX: &str = "/ui";
 
 /// The `Content-Security-Policy` of every answer: nothing loads but this server's
-/// stylesheet (and, should one be added, images and one script from it); no inline
-/// script or style runs; no other site may frame a page.
+/// stylesheet (and, should one be added, its images); no script runs at all (`default-src`
+/// covers `script-src`); no inline style; no other site may frame a page; no `<base>`
+/// moves a link; a form may submit only to this server (the Builds lookup is a GET form).
 pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'self'; img-src 'self'; \
-     script-src 'self'; frame-ancestors 'none'";
+     frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+
+/// The `Referrer-Policy` a mount sends with every answer: ids and page tokens sit in URLs.
+pub const REFERRER_POLICY: &str = "no-referrer";
 
 /// The stylesheet's path.
 const STYLESHEET: &str = "/ui/static/kbf.css";
@@ -71,6 +96,78 @@ pub struct SourceError(pub String);
 pub trait Source {
     /// `GET url`, a root-relative path with its query.
     fn get(&self, url: &str) -> impl Future<Output = Result<Fetched, SourceError>> + Send;
+
+    /// `GET url` with `Range: bytes=-n`: the last `n` bytes, as the log and blob routes
+    /// read a suffix range: `206` with a `Content-Range` that names the whole, `416` for
+    /// an empty object (or an `n` of zero), or `200` with the whole body when the range is
+    /// ignored. The default reads the whole answer and cuts it as the server would, as
+    /// [`Source::get_range`]'s does.
+    fn get_suffix(
+        &self,
+        url: &str,
+        n: u64,
+    ) -> impl Future<Output = Result<Fetched, SourceError>> + Send {
+        let whole = self.get(url);
+        async move {
+            let mut fetched = whole.await?;
+            if fetched.status != 200 || fetched.body.is_empty() {
+                return Ok(fetched);
+            }
+            let total = fetched.body.len() as u64;
+            if n == 0 {
+                fetched.status = 416;
+                fetched.body = Vec::new();
+                fetched.headers = vec![("content-range".to_owned(), format!("bytes */{total}"))];
+                return Ok(fetched);
+            }
+            let first = total - n.min(total);
+            fetched.status = 206;
+            fetched.body = fetched.body[first as usize..].to_vec();
+            fetched.headers = vec![(
+                "content-range".to_owned(),
+                format!("bytes {first}-{}/{total}", total - 1),
+            )];
+            Ok(fetched)
+        }
+    }
+
+    /// `GET url` with `Range: bytes=first-last` (both inclusive), as the API's log and
+    /// blob routes read it: `206` with a `Content-Range`, `416` for a start past the
+    /// end, or `200` with the whole body when the range is ignored. A source that
+    /// cannot send a header keeps this default, which reads the whole answer and
+    /// answers a non-empty `200` as the server would have: the range as `206` with its
+    /// `Content-Range` (`416` for a start past the end), so the page never shows more
+    /// than it asked for; a source that can send the header should, so that a large
+    /// log is never read whole.
+    fn get_range(
+        &self,
+        url: &str,
+        first: u64,
+        last: u64,
+    ) -> impl Future<Output = Result<Fetched, SourceError>> + Send {
+        let whole = self.get(url);
+        async move {
+            let mut fetched = whole.await?;
+            if fetched.status != 200 || fetched.body.is_empty() {
+                return Ok(fetched);
+            }
+            let total = fetched.body.len() as u64;
+            if first >= total {
+                fetched.status = 416;
+                fetched.body = Vec::new();
+                fetched.headers = vec![("content-range".to_owned(), format!("bytes */{total}"))];
+                return Ok(fetched);
+            }
+            let end = last.min(total - 1);
+            fetched.status = 206;
+            fetched.body = fetched.body[first as usize..=end as usize].to_vec();
+            fetched.headers = vec![(
+                "content-range".to_owned(),
+                format!("bytes {first}-{end}/{total}"),
+            )];
+            Ok(fetched)
+        }
+    }
 }
 
 /// A page's answer: status, media type and body; [`Answer::headers`] adds the
@@ -161,11 +258,25 @@ pub async fn respond<S: Source + Sync>(source: &S, path: &str, query: &str) -> A
         return pages::not_found(path);
     };
     match segments.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        [] | [""] => pages::builds(source, query).await,
+        [] | [""] => pages::overview(source, query).await,
+        ["builds"] => pages::builds(source, query).await,
+        ["nodes"] => pages::nodes(source, query).await,
+        ["nodes", id] if !id.is_empty() => pages::node(source, id, query).await,
         ["builds", id] if !id.is_empty() => pages::build(source, id, query).await,
         ["builds", id, "actions", digest] if !id.is_empty() && !digest.is_empty() => {
-            pages::action(source, id, digest).await
+            pages::action(source, id, digest, query).await
         }
+        ["runs", run_id, "logs", stream]
+            if !run_id.is_empty() && pages::STREAMS.contains(&stream) =>
+        {
+            pages::run_log(source, run_id, stream, query).await
+        }
+        ["updates"] => pages::updates(source).await,
+        ["leases"] => pages::leases(source, query).await,
+        ["queue"] => pages::queue(source).await,
+        ["targets"] => pages::targets(source, query).await,
+        ["targets", key] if !key.is_empty() => pages::target(source, key, query).await,
+        ["storage"] => pages::storage(source).await,
         _ => pages::not_found(path),
     }
 }

@@ -1,11 +1,15 @@
 use std::fs;
+use std::io;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use super::*;
 use crate::fixtures::{Item, file, scratch_dir, tar_gz};
 
 const CAP: u64 = 1024;
+const WITHIN: Duration = Duration::from_secs(60);
 
 /// Unpack `tarball` (named `kbf`) into a fresh directory; the destination file and what
 /// the call said.
@@ -14,7 +18,7 @@ fn unpack(name: &str, tarball: &[u8], cap: u64) -> (PathBuf, Result<(), ArchiveF
     let source = dir.join("kbf.tar.gz");
     fs::write(&source, tarball).expect("seed");
     let dest = dir.join("kbf");
-    let result = unpack_one(&source, "kbf", &dest, cap);
+    let result = unpack_one(&source, "kbf", &dest, cap, WITHIN);
     (dest, result)
 }
 
@@ -133,7 +137,14 @@ fn the_cap_is_checked_before_a_byte_is_written() {
 #[test]
 fn a_missing_tarball_is_malformed() {
     let dir = scratch_dir("archive-missing");
-    let err = unpack_one(&dir.join("none.tar.gz"), "kbf", &dir.join("kbf"), CAP).expect_err("gone");
+    let err = unpack_one(
+        &dir.join("none.tar.gz"),
+        "kbf",
+        &dir.join("kbf"),
+        CAP,
+        WITHIN,
+    )
+    .expect_err("gone");
     assert_eq!(err.code(), "archive-malformed");
 }
 
@@ -146,7 +157,90 @@ fn an_existing_destination_is_never_replaced() {
     fs::write(&source, tar_gz(&[file("kbf", b"new")])).expect("seed");
     let dest = dir.join("kbf");
     fs::write(&dest, b"old").expect("seed");
-    let err = unpack_one(&source, "kbf", &dest, CAP).expect_err("exists");
+    let err = unpack_one(&source, "kbf", &dest, CAP, WITHIN).expect_err("exists");
     assert_eq!(err.code(), "archive-malformed");
     assert_eq!(fs::read(&dest).expect("there"), b"old");
+}
+
+/// Gzip of `bytes` as one member.
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(bytes).expect("gzip");
+    gz.finish().expect("gzip")
+}
+
+/// The tar a `tar_gz` of one file `kbf` holds, uncompressed.
+fn tar_of_one() -> Vec<u8> {
+    let packed = tar_gz(&[file("kbf", b"binary")]);
+    let mut gz = flate2::read::GzDecoder::new(packed.as_slice());
+    let mut tar = Vec::new();
+    io::Read::read_to_end(&mut gz, &mut tar).expect("tar");
+    tar
+}
+
+/// Catches data hidden where the tar reader stops looking: bytes after the gzip member, a
+/// second gzip member, a non-zero byte after the tar's end, and a damaged gzip trailer. A
+/// reader that stops at the tar's end accepts all four; each is refused, and a tar padded
+/// with zeros (as `tar` pads a record) is still fine.
+///
+/// Mutants seen red: the check of the bytes after the tar's end dropped (the non-zero
+/// tail passes); the check of the compressed stream's end dropped (the trailing bytes and
+/// the second member pass).
+#[test]
+fn nothing_follows_the_tar_or_the_gzip_member() {
+    let clean = tar_gz(&[file("kbf", b"binary")]);
+    let mut trailing = clean.clone();
+    trailing.extend_from_slice(b"\0\0\0\0");
+    let mut second = clean.clone();
+    second.extend_from_slice(&clean);
+    let mut tail = tar_of_one();
+    tail.extend_from_slice(b"hidden");
+    let mut damaged = clean.clone();
+    let end = damaged.len();
+    damaged[end - 8] ^= 0xff;
+    let mut padded = tar_of_one();
+    padded.resize(10240, 0);
+
+    let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+        ("trailing-bytes", trailing, "archive-trailing"),
+        ("second-member", second, "archive-trailing"),
+        ("data-after-tar", gzip(&tail), "archive-trailing"),
+        ("bad-crc", damaged, "archive-malformed"),
+    ];
+    for (name, bytes, want) in cases {
+        let (dest, result) = unpack(&format!("archive-{name}"), &bytes, CAP);
+        let err = result.expect_err(name);
+        assert_eq!(err.code(), want, "{name}: {err}");
+        let _ = fs::remove_file(dest);
+    }
+
+    let (dest, result) = unpack("archive-padded", &gzip(&padded), CAP);
+    result.expect("a zero-padded tar is fine");
+    fs::remove_file(dest).expect("remove");
+}
+
+/// Catches a gzip bomb: an archive whose second entry decompresses to far more than the
+/// cap (the first is small and right) is stopped at the cap plus framing, not read to its
+/// end; and an unpack that is out of time stops with its own code.
+///
+/// Mutants seen red: the decompressed bound dropped (the bomb is read in full); the
+/// deadline check dropped (the zero budget is ignored).
+#[test]
+fn the_decompressed_size_and_the_time_are_bounded() {
+    let bomb = tar_gz(&[file("kbf", b"x"), file("big", &vec![0u8; 8 << 20])]);
+    let (dest, result) = unpack("archive-bomb", &bomb, CAP);
+    assert_eq!(
+        result.expect_err("bomb").code(),
+        "archive-oversize",
+        "the second entry is the bomb"
+    );
+    let _ = fs::remove_file(dest);
+
+    let dir = scratch_dir("archive-slow");
+    let source = dir.join("kbf.tar.gz");
+    fs::write(&source, tar_gz(&[file("kbf", b"binary")])).expect("seed");
+    let err =
+        unpack_one(&source, "kbf", &dir.join("kbf"), CAP, Duration::ZERO).expect_err("no time");
+    assert_eq!(err.code(), "archive-timeout");
+    assert!(!dir.join("kbf").exists());
 }
