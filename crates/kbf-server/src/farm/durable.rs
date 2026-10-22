@@ -809,6 +809,19 @@ impl Durable {
         )
     }
 
+    /// Writes the key floor `floor` as it now stands, or deletes its row when it was
+    /// forgotten (an `ask` of 0): outside any requeue, after the estimator's decay lowered
+    /// it. Best effort for the caller; the row keeps its stamp.
+    pub(super) fn put_key_floor(&self, floor: &KeyFloor) -> Result<(), StateError> {
+        let row = floor::key_row(floor.key);
+        let txn = if floor.ask == 0 {
+            Txn::new().delete(row, Cond::Any)
+        } else {
+            Txn::new().put(row, floor::encode_key(floor), Cond::Any)
+        };
+        self.commit(txn)
+    }
+
     /// A lease given up: the operation holds nothing and is queued again. Repeatable:
     /// the farm writes a give-up the store refused again until the store takes it, so
     /// the lease row may be gone already, and the queue row may be there. An operation

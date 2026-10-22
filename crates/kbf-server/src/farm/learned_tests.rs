@@ -351,3 +351,115 @@ fn a_kill_through_the_farm_leaves_a_floor_the_next_start_books() {
     let off = farm_over(&store, LearnedSizes::Off);
     assert_eq!(off.lock().sched.key_floor(key), None);
 }
+
+/// The estimator's decay of a key floor reaches the scheduler and the store: after 256
+/// runs of the key and 7 days quiet the floor halves in the scheduler and its `keyfloor/`
+/// row, a restart books the lower floor, and a floor that falls to the first rung or below
+/// is forgotten (row deleted) so a new digest books the default.
+#[test]
+fn a_decayed_key_floor_is_lowered_in_the_scheduler_and_the_store() {
+    use crate::action_usage::Subject;
+    use crate::learned::{Attempt, key_of, kill_run, run_of};
+    use crate::machine::Platform;
+    use kbf_estimator::{Basis, GIB};
+    use kbf_front::Described;
+    use kbf_types::{FarmTime, LeaseId, Outcome};
+
+    let store = store();
+    let farm = farm_over(&store, LearnedSizes::On);
+    let node = register(&farm, "node-a");
+    Job::new(1).submit(&farm);
+    let size_key = keys(&store)[0].expect("keyed");
+    let (operation, lease) = {
+        let state = farm.lock();
+        let operation = state.sched.unfinished().next().expect("queued");
+        (operation, state.sched.leases_on(&node)[0])
+    };
+    let report = super::Report {
+        lease,
+        outcome: kbf_types::Outcome::Failed(kbf_types::Failure::OutOfMemory),
+        measured: None,
+        exit_code: None,
+        run: None,
+    };
+    let now = farm.now();
+    farm.lock().take_report(now, &node, operation, report);
+    assert_eq!(farm.lock().sched.key_floor(size_key), Some(16 * GIB));
+
+    // The same key, as the estimator knows it.
+    let (subject, _) = Subject::of(Described {
+        arguments: vec!["cc".to_owned()],
+        ..Described::default()
+    });
+    let platform = Platform {
+        os_family: "linux",
+        isa: "-".to_owned(),
+    };
+    let key = key_of("main", &platform, Basis::Cgroup, &subject).expect("a key");
+    let ok = Outcome::Completed {
+        action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+    };
+    let usage = kbf_invocation::RunUsage {
+        wall_micros: 2_000_000,
+        basis: kbf_invocation::UsageBasis::Cgroup,
+        memory_peak_bytes: Some(500 << 20),
+        cpu_usage_micros: Some(500),
+        ..Default::default()
+    };
+    let (_, run) = run_of(ok, Some(&usage), 16 * GIB).expect("a run");
+    let _ = kill_run;
+    let mut seq = 1_000;
+    let mut quiet = |farm: &Farm, days: u64| {
+        let mut state = farm.lock();
+        state
+            .learned
+            .clock(FarmTime::from_millis(days * 86_400_000));
+        for _ in 0..257 {
+            seq += 1;
+            let lease = LeaseId::new(9, seq);
+            state.learned.stage(
+                lease,
+                Some(Attempt {
+                    key: key.clone(),
+                    run,
+                }),
+            );
+            state.learned.name(lease, size_key);
+            state.finish_learning(lease, &node, true);
+        }
+    };
+    let row_ask = |store: &Arc<Fake>| {
+        let rows = store.scan_prefix("keyfloor/").expect("scan");
+        rows.first()
+            .map(|(_, row)| u64::from_be_bytes(row.value[9..17].try_into().expect("ask")))
+    };
+
+    quiet(&farm, 8);
+    assert_eq!(farm.lock().sched.key_floor(size_key), Some(8 * GIB));
+    assert_eq!(row_ask(&store), Some(8 * GIB), "the row is lowered too");
+    // The summaries are written behind; a restart takes up what was written.
+    farm.lock().flush_learned();
+    drop(farm);
+
+    let restarted = farm_over(&store, LearnedSizes::On);
+    assert_eq!(restarted.lock().sched.key_floor(size_key), Some(8 * GIB));
+    let other = register(&restarted, "node-b");
+    Job::new(2).submit(&restarted);
+    // The killed action's retry (queued in the store, at the rung it was raised to) and
+    // the new digest, at the lower floor.
+    assert_eq!(
+        restarted
+            .lock()
+            .sched
+            .booked(&other)
+            .map(|b| b.memory_bytes),
+        Some((16 + 8) << 30),
+    );
+    quiet(&restarted, 16);
+    assert_eq!(
+        restarted.lock().sched.key_floor(size_key),
+        None,
+        "a floor at the first rung is forgotten"
+    );
+    assert_eq!(row_ask(&store), None, "and its row is deleted");
+}

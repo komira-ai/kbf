@@ -93,6 +93,9 @@ impl State {
             Ok(key) => self.learned.stage(lease, Some(Attempt { key, run })),
             Err(why) => self.learned.skip(why),
         }
+        if let Some(size_key) = self.sched.size_key(operation) {
+            self.learned.name(lease, size_key);
+        }
     }
 
     /// The scheduler has answered the report of `lease`, run by `worker`; `taken`: it
@@ -104,6 +107,29 @@ impl State {
         let bounds = self.bounds_on(worker);
         let rows = self.learned.finish(lease, taken, &bounds);
         self.write_estimates(&rows);
+        self.lower_key_floors();
+    }
+
+    /// Takes the key floors the estimator's decay lowered to the scheduler, and writes them
+    /// down on a best-effort basis, as the size summaries are: a store that refuses the
+    /// row keeps the higher floor, which the next start books until a later decay writes
+    /// it again.
+    pub(super) fn lower_key_floors(&mut self) {
+        for (size_key, ask) in self.learned.take_lowered() {
+            let Some(row) = self.sched.lower_key_floor(size_key, ask) else {
+                continue;
+            };
+            let Some(durable) = self
+                .durable
+                .as_ref()
+                .filter(|d| !self.fenced && !d.fenced.load(Ordering::SeqCst))
+            else {
+                continue;
+            };
+            if let Err(error) = durable.put_key_floor(&row) {
+                tracing::warn!(%error, "a lowered key floor was not written");
+            }
+        }
     }
 
     /// The scheduler gave up `requeue`'s lease: the rows to write once the requeues are
@@ -114,7 +140,9 @@ impl State {
         }
         if let RequeueReason::OutOfMemory { raised, .. } = requeue.reason {
             let bounds = self.bounds_on(&requeue.worker);
-            return self.learned.requeued(requeue.lease, raised, &bounds);
+            let rows = self.learned.requeued(requeue.lease, raised, &bounds);
+            self.lower_key_floors();
+            return rows;
         }
         self.learned.forget(requeue.lease);
         Vec::new()
