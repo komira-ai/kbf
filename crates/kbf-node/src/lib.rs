@@ -250,9 +250,10 @@ pub struct Cli {
     /// when asked to end, such as Python's multiprocessing resource tracker with the
     /// shared memory it made, does so in this time; one that ignores SIGTERM is named in
     /// the lease's stderr. A slot's clean uses the same value (at most its own time
-    /// limit). More than 60000 is taken as 60000. The wait comes on top of the time
-    /// given to the kill that follows. A lease past its memory limit is killed at
-    /// once.
+    /// limit). More than 60000 is taken as 60000. The wait comes after the action's
+    /// timeout and its memory watch have ended it (neither runs during it), and on top
+    /// of the time given to the kill that follows. A lease past its memory limit is
+    /// killed at once. Applies on every platform.
     #[arg(long, default_value_t = 2000)]
     native_term_grace_ms: u64,
     /// The directory searched for `Xcode*.app` (native). Each Xcode whose own

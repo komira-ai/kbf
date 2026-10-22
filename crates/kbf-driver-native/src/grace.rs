@@ -24,7 +24,9 @@
 //! failed for it. SIGTERM is sent once, to the processes alive when the round starts.
 //!
 //! The grace is extra to the wait for SIGKILL to take effect (`kill_wait`), which is
-//! unchanged, and is at most [`MAX_GRACE`].
+//! unchanged, and is at most [`MAX_GRACE`]. It is outside the action's timeout and the
+//! memory watch: both have ended the action before it starts and neither runs during it,
+//! so the longest an ending takes is the grace (60 s at most) plus `kill_wait`.
 //!
 //! What this cannot see: shared memory made without a tracker (Python's
 //! `SharedMemory(track=False)`, or C code calling `shm_open` and exiting without
@@ -115,6 +117,32 @@ pub(crate) fn lenient(round: Result<Vec<Survivor>, String>, what: &str) -> Vec<S
         tracing::warn!("{what}: SIGTERM first did not complete ({why}); killing now");
         Vec::new()
     })
+}
+
+/// What `list` reads for the SIGTERM round, or `T::default()` without calling it when
+/// `grace` is zero: [`term_first`] looks at nothing then, so the read would be wasted.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn for_round<T: Default>(grace: Duration, list: impl FnOnce() -> T) -> T {
+    if grace.is_zero() {
+        T::default()
+    } else {
+        list()
+    }
+}
+
+/// The SIGTERM round `round` ([`lenient`]), then `kill` (given the survivors), which runs whatever the round
+/// gave. Returns the survivors with what `kill` returned.
+///
+/// # Errors
+/// `kill` failed.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn then_kill<K>(
+    round: Result<Vec<Survivor>, String>,
+    what: &str,
+    kill: impl FnOnce(&[Survivor]) -> Result<K, String>,
+) -> Result<(Vec<Survivor>, K), String> {
+    let survivors = lenient(round, what);
+    kill(&survivors).map(|killed| (survivors, killed))
 }
 
 /// `text` with control characters shown as escapes, so that an argument cannot add a

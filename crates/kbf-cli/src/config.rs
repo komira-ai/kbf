@@ -233,6 +233,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "drain-deadline-secs",
             "driver",
             "image",
+            "native-term-grace-ms",
             "orders-dir",
             "reconnect-max-ms",
             "reconnect-ms",
@@ -279,7 +280,6 @@ const GROUPS: &[(&str, &[&str])] = &[
         "macos",
         &[
             "mac-session-socket",
-            "native-term-grace-ms",
             "pool-first-uid",
             "pool-users",
             "require-metal-toolchain",

@@ -435,25 +435,24 @@ impl UidWatch {
             // launchd's own agents run as the uid whatever the lease did (a system
             // helper for the home's disk image, for one): they are not waited for or
             // named, as in the slot's clean. They are listed before the bootout empties
-            // the list.
-            let own = host::launchds_own(uid);
+            // the list, and not at all without a grace, which looks at no process.
+            let own = grace::for_round(grace, || host::launchds_own(uid));
             // The domain first, so that launchd starts none of its jobs again while the
             // processes are asked to end: those would be taken for ones that ignored it.
             uid::bootout(uid, wait.min(uid::BOOTOUT_WITHIN));
-            let survivors = grace::lenient(
-                term_uid(
-                    uid,
-                    grace,
-                    &mut || {
-                        let mut pids = uid::processes(uid).map_err(|e| e.to_string())?;
-                        pids.retain(|pid| !own.contains(pid));
-                        Ok(pids)
-                    },
-                    LEASE_LOOK,
-                ),
-                "the SIGTERM round",
+            let round = term_uid(
+                uid,
+                grace,
+                &mut || {
+                    let mut pids = uid::processes(uid).map_err(|e| e.to_string())?;
+                    pids.retain(|pid| !own.contains(pid));
+                    Ok(pids)
+                },
+                LEASE_LOOK,
             );
-            uid::kill_all(uid, wait).map_err(|e| e.to_string())?;
+            let (survivors, ()) = grace::then_kill(round, "the SIGTERM round", |_| {
+                uid::kill_all(uid, wait).map_err(|e| e.to_string())
+            })?;
             Ok::<_, String>(survivors)
         })
         .await;
@@ -731,6 +730,34 @@ mod tests {
             "the drop cleaned the slot"
         );
         slot.release().await;
+    }
+
+    /// Catches a lease end (`UidWatch::end`) and a slot clean (C3) that stop at a SIGTERM
+    /// round that failed (the uid's process table could not be read): both run their
+    /// kill through `grace::then_kill` after `term_uid`, whose `live` fails here at its
+    /// first look, so that no signal is sent. The kill must still run, once, with no
+    /// survivor named. (The callers' bodies need a real uid and `launchctl`, so they are
+    /// covered by the Mac job `slot-term`; this is their shared sequence.)
+    #[test]
+    fn the_kill_runs_when_the_term_round_of_a_lease_end_or_a_slot_clean_fails() {
+        for what in ["the SIGTERM round", "slot clean"] {
+            let kills = std::cell::Cell::new(0);
+            let round = term_uid(
+                u32::MAX,
+                Duration::from_secs(2),
+                &mut || Err("process table".to_owned()),
+                Duration::from_millis(1),
+            );
+            assert!(round.is_err());
+            let (survivors, ()) = grace::then_kill(round, what, |ignored| {
+                assert!(ignored.is_empty());
+                kills.set(kills.get() + 1);
+                Ok(())
+            })
+            .expect("the kill ran");
+            assert!(survivors.is_empty());
+            assert_eq!(kills.get(), 1, "{what}");
+        }
     }
 
     /// Catches a slot lease handed a simulator (it would be made in root's device set,

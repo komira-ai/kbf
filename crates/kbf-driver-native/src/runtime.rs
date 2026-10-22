@@ -2018,6 +2018,42 @@ mod tests {
         assert!(!record.exists(), "removed once nothing survives");
     }
 
+    /// Reads the process table, except that its first read fails: the SIGTERM round's.
+    fn table_fails_once() -> std::io::Result<Vec<Proc>> {
+        static READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            Err(std::io::Error::other("table"))
+        } else {
+            procs::snapshot()
+        }
+    }
+
+    /// Catches an action that outlives its lease because the SIGTERM round failed (the
+    /// process table could not be read): the end must still SIGKILL it, succeed, and
+    /// name no survivor. The leader is a real `sleep`, so only the kill ends it.
+    #[tokio::test]
+    async fn the_kill_runs_when_the_sigterm_round_fails() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let dir = crate::unit_dir("runtime-group-term-fails");
+        let record = dir.join("lease-6-6");
+        std::fs::write(&record, "x").expect("write");
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep");
+        let leader = i32::try_from(child.id().expect("pid")).expect("pid");
+        let me = i32::try_from(std::process::id()).expect("pid");
+        let mut group = Group::reading(Tracker::new(leader, me), record, table_fails_once);
+        let survivors = group
+            .end(&mut child, Duration::from_secs(10), Duration::from_secs(2))
+            .await
+            .expect("ended");
+        assert!(survivors.is_empty());
+        let status = child.try_wait().expect("wait").expect("reaped");
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+    }
+
     /// Catches a signal death reported as exit 0 or as the raw status.
     #[test]
     fn a_signal_is_128_plus_its_number() {

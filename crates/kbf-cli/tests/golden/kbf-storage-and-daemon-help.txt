@@ -229,7 +229,7 @@ Options:
           [default: 250]
 
       --native-term-grace-ms <NATIVE_TERM_GRACE_MS>
-          How long a lease's processes are given to end after SIGTERM before they are killed, in milliseconds; 0 kills them at once (native). A workload that cleans up when asked to end, such as Python's multiprocessing resource tracker with the shared memory it made, does so in this time; one that ignores SIGTERM is named in the lease's stderr. A slot's clean uses the same value (at most its own time limit). More than 60000 is taken as 60000. The wait comes on top of the time given to the kill that follows. A lease past its memory limit is killed at once
+          How long a lease's processes are given to end after SIGTERM before they are killed, in milliseconds; 0 kills them at once (native). A workload that cleans up when asked to end, such as Python's multiprocessing resource tracker with the shared memory it made, does so in this time; one that ignores SIGTERM is named in the lease's stderr. A slot's clean uses the same value (at most its own time limit). More than 60000 is taken as 60000. The wait comes after the action's timeout and its memory watch have ended it (neither runs during it), and on top of the time given to the kill that follows. A lease past its memory limit is killed at once. Applies on every platform
           
           [default: 2000]
 

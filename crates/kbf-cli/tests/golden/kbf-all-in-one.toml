@@ -62,6 +62,8 @@ drain-deadline-secs = 600
 # driver = []
 # A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon makes sure each is in the node's image store, as the prepare step of every lease does: it fetches the image from its registry by that digest, checks every byte against a digest, and unpacks it once. It exits with status 2 if one cannot be fetched, fails a check, or names an image index. The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
 # image = []
+# How long a lease's processes are given to end after SIGTERM before they are killed, in milliseconds; 0 kills them at once (native). A workload that cleans up when asked to end, such as Python's multiprocessing resource tracker with the shared memory it made, does so in this time; one that ignores SIGTERM is named in the lease's stderr. A slot's clean uses the same value (at most its own time limit). More than 60000 is taken as 60000. The wait comes after the action's timeout and its memory watch have ended it (neither runs during it), and on top of the time given to the kill that follows. A lease past its memory limit is killed at once. Applies on every platform
+native-term-grace-ms = 2000
 # The order spool (owned by the service user, mode 0700): where the daemon writes the order records the root installer reads. With `--update-dir` only; default `<update-dir>/orders`
 # orders-dir = "DIR"
 # The longest wait between rounds of connection attempts, in milliseconds. Each wait is jittered down by up to half
@@ -147,8 +149,6 @@ log-max-bytes = 67108864
 [macos]
 # The socket `kbf-mac-session` serves (native-whole-machine)
 mac-session-socket = "/var/run/kbf-mac-session/socket"
-# How long a lease's processes are given to end after SIGTERM before they are killed, in milliseconds; 0 kills them at once (native). A workload that cleans up when asked to end, such as Python's multiprocessing resource tracker with the shared memory it made, does so in this time; one that ignores SIGTERM is named in the lease's stderr. A slot's clean uses the same value (at most its own time limit). More than 60000 is taken as 60000. The wait comes on top of the time given to the kill that follows. A lease past its memory limit is killed at once
-native-term-grace-ms = 2000
 # The uid of `kbf-pool-0`, and the group id of all the pool users (`pool_first_uid` in kbf-mac-provision's profile); at least 600
 # pool-first-uid = "POOL_FIRST_UID"
 # How many lease users the pool has (native, macOS, a daemon run as root): every action runs as one of `kbf-pool-0` .. `kbf-pool-<N-1>`, one lease per user at a time, as kbf-mac-provision makes them (`pool_users`). Required of a root daemon, which runs no action as root; refused for any other

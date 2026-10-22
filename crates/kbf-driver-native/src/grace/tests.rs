@@ -245,3 +245,39 @@ fn control_characters_are_escaped_and_the_log_line_has_no_arguments() {
         "1 process(es) outlasted SIGTERM and were killed: pid 7 p"
     );
 }
+
+/// Catches a listing made for a round that looks at nothing: with a grace of zero (also
+/// a lease past its memory limit, which gets none) the list is not called, so a hung or
+/// slow listing cannot delay the kill; with a grace it is called once.
+#[test]
+fn nothing_is_listed_for_a_grace_of_zero() {
+    let calls = std::cell::Cell::new(0);
+    let list = || {
+        calls.set(calls.get() + 1);
+        vec![7]
+    };
+    assert_eq!(for_round(Duration::ZERO, list), Vec::<i32>::new());
+    assert_eq!(calls.get(), 0);
+    assert_eq!(for_round(Duration::from_millis(1), list), vec![7]);
+    assert_eq!(calls.get(), 1);
+}
+
+/// Catches a SIGTERM round that fails (the process table cannot be read) taking the
+/// SIGKILL with it: the kill runs once, is given no survivors, and its own failure is
+/// still the result.
+#[test]
+fn the_kill_runs_after_a_sigterm_round_that_failed() {
+    let kills = std::cell::Cell::new(0);
+    let kill = |survivors: &[Survivor]| {
+        kills.set(kills.get() + 1);
+        assert!(survivors.is_empty());
+        Ok(5)
+    };
+    let done = then_kill(Err("table".to_owned()), "test", kill);
+    assert_eq!(done, Ok((Vec::new(), 5)));
+    assert_eq!(kills.get(), 1);
+    let failed = then_kill(Err("table".to_owned()), "test", |_| {
+        Err::<(), _>("survived".to_owned())
+    });
+    assert_eq!(failed, Err("survived".to_owned()));
+}
