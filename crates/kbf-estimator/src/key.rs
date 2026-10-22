@@ -84,6 +84,11 @@ impl Key {
         }
     }
 
+    /// The instance the key belongs to.
+    pub fn instance(&self) -> &Instance {
+        &self.instance
+    }
+
     /// The instrument this key's samples come from.
     pub fn basis(&self) -> Basis {
         self.basis

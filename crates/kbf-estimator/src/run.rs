@@ -31,10 +31,13 @@ pub struct Run {
     pub peak_memory_bytes: Option<u64>,
     /// The memory it was booked at.
     pub booked_memory_bytes: u64,
-    /// The memory limit it ran under.
-    pub limit_bytes: u64,
     /// For an own-limit kill: the booking the caller's ladder retries with.
     pub raised_memory_bytes: Option<u64>,
+    /// How many times the run reached its memory limit (`memory.events` `max`); 0 when
+    /// none or not measured.
+    pub limit_hits: u64,
+    /// Swap the run peaked at, in bytes; 0 when none or not measured.
+    pub swap_peak_bytes: u64,
     /// CPU time used (user plus system) in microseconds.
     pub cpu_usage_us: u64,
     /// The node's CPU pressure (`avg10`, in tenths of a percent) when the run started,
@@ -42,13 +45,29 @@ pub struct Run {
     pub node_cpu_pressure_permille: Option<u16>,
 }
 
-/// What the caller can book at most and books by default.
+/// The hard memory limit (`memory.max`) of a lease that booked `booked` bytes: the
+/// booking plus half of it plus 512 MiB, as the container driver sets it. `None` when
+/// nothing was booked (no limit).
+pub fn memory_max(booked: u64) -> Option<u64> {
+    (booked > 0).then(|| {
+        booked
+            .saturating_add(booked / 2)
+            .saturating_add(512 * crate::MIB)
+    })
+}
+
+/// What the caller books by default and the bound it must stay under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bounds {
     /// What an action with no estimate books (today: 4 GiB).
     pub default_memory: u64,
-    /// The most memory any node offers; estimates and floors never exceed it.
-    pub memory_cap: u64,
+    /// The memory of the largest live node that matches the request. A booking at or
+    /// above it would own the whole host, so the crate's own sizes never reach it: key
+    /// floors stay strictly below it and an estimate that would reach it is
+    /// [`crate::Fallback::OverCap`]. A client hint is the client's statement: the crate
+    /// does not clamp it, and a hint at or above this bound makes the estimate
+    /// `OverCap` too, so the caller's existing over-capacity path decides.
+    pub host_memory: u64,
     /// The most CPU any node offers, in millicores.
     pub node_cpu_millis: u32,
 }
@@ -57,9 +76,17 @@ impl Default for Bounds {
     fn default() -> Self {
         Self {
             default_memory: 4 * GIB,
-            memory_cap: 32 * GIB,
+            host_memory: 64 * GIB,
             node_cpu_millis: 64_000,
         }
+    }
+}
+
+impl Bounds {
+    /// The largest key floor: the biggest 256 MiB step strictly below the host.
+    pub(crate) fn floor_ceiling(&self) -> u64 {
+        self.host_memory.saturating_sub(1) / crate::summary::MEMORY_STEP
+            * crate::summary::MEMORY_STEP
     }
 }
 
@@ -79,14 +106,14 @@ pub enum Discard {
     NotASample,
     /// No measurement, or a wall time under one second.
     Untrusted,
-    /// A success whose peak is above the node cap.
+    /// A success whose peak reaches the host's memory.
     OverCap,
 }
 
 /// What [`crate::Summaries::observe`] did with a run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Observed {
-    /// Whether the run entered the memory maxima.
+    /// Whether the run entered the memory samples.
     pub memory: Result<(), Discard>,
     /// Whether the run entered the CPU samples.
     pub cpu: bool,
