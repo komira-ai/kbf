@@ -325,14 +325,17 @@ impl MacSlot<'_> {
             }
             Ok(not_launchds_own(pids, &services_of(uid)))
         };
-        let ignored = super::term_uid(
-            uid,
-            self.grace.min(self.within),
-            &mut scan,
-            probe::SCAN_PAUSE,
-        )?;
-        if let Some(note) = crate::grace::note(&ignored) {
-            tracing::warn!(uid, "slot clean: {}", note.trim_end());
+        let ignored = crate::grace::lenient(
+            super::term_uid(
+                uid,
+                self.grace.min(self.within),
+                &mut scan,
+                probe::SCAN_PAUSE,
+            ),
+            "slot clean",
+        );
+        if let Some(brief) = crate::grace::brief(&ignored) {
+            tracing::warn!(uid, "slot clean: {brief}");
         }
         // The grace is extra to `within`, which bounds the kill alone.
         let give_up = Instant::now() + self.within;
@@ -647,6 +650,16 @@ fn make_home(home: &Path, uid: u32, gid: u32) -> io::Result<()> {
 pub fn leftover_processes(uid: u32) -> io::Result<Vec<i32>> {
     let pids = uid::processes(uid)?;
     Ok(not_launchds_own(pids, &services_of(uid)))
+}
+
+/// The processes `launchctl print user/<uid>` lists as running one of launchd's own
+/// agents ([`Service::own`]); read before a domain's bootout, which empties the list.
+pub(crate) fn launchds_own(uid: u32) -> Vec<i32> {
+    services_of(uid)
+        .into_iter()
+        .filter(|s| s.own)
+        .filter_map(|s| s.pid)
+        .collect()
 }
 
 /// `pids` without those `services` lists as running one of launchd's own agents.

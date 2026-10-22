@@ -3,9 +3,9 @@
 //! checks a test makes of the names they leave.
 //!
 //! - `shm-owner PREFIX COUNT [SECS]`: makes `COUNT` shared-memory names `/PREFIX-m<i>` and
-//!   `COUNT` semaphore names `/PREFIX-s<i>` (`i` from 0), starts a tracker child
-//!   (`shm-tracker`) that holds a pipe from this process, waits until the tracker is
-//!   ready, prints `shm-owner ready TRACKER`
+//!   `COUNT` semaphore names `/PREFIX-s<i>` (`i` from 0), after starting a tracker
+//!   child (`shm-tracker`) that holds a pipe from this process and waiting until it is
+//!   ready (so the names exist only once it handles SIGTERM), prints `shm-owner ready TRACKER`
 //!   (the tracker's process id), and blocks for `SECS` seconds (five
 //!   minutes without it) unless it is ended first, then exits 0. Nothing in this process removes a name.
 //! - `shm-tracker PREFIX COUNT`: the child `shm-owner` starts; not for a test to run. It
@@ -204,9 +204,10 @@ pub(crate) fn perform(step: &Shm<'_>) -> Result<(), Error> {
 }
 
 fn owner(prefix: &str, count: u32, hold: Duration) -> Result<(), Error> {
-    for (kind, name) in names(prefix, count) {
-        make(kind, &name).map_err(failed(format!("make {name:?}")))?;
-    }
+    // The tracker first, so that its SIGTERM handler is in place before any name
+    // exists: a test that ends this process once the names are there cannot reach a
+    // tracker that would die on the signal and unlink nothing. (Python's tracker is told
+    // of a name only once it runs, too.)
     let mut child = std::env::current_exe()
         .and_then(|exe| {
             Command::new(exe)
@@ -226,6 +227,9 @@ fn owner(prefix: &str, count: u32, hold: Duration) -> Result<(), Error> {
         .read_line(&mut said)
         .map_err(failed("read the tracker"))?;
     ready(&said)?;
+    for (kind, name) in names(prefix, count) {
+        make(kind, &name).map_err(failed(format!("make {name:?}")))?;
+    }
     write_line(
         std::io::stdout(),
         &format!("shm-owner ready {}", child.id()),

@@ -413,8 +413,8 @@ impl UidWatch {
     }
 
     /// Ends every process of the uid: [`uid::bootout`] of its domain, SIGTERM and up to
-    /// `grace` for them to end ([`term_uid`]), then [`uid::kill_all`] (`wait` at most),
-    /// then reaps the
+    /// `grace` for them to end ([`term_uid`]), then [`uid::kill_all`] (`wait` at most,
+    /// after the bootout and the grace, which come on top), then reaps the
     /// leader, `child`: once nothing of the uid is left the leader has exited too, or
     /// it is `launchctl`, which exits once its child has; one still there after `wait`
     /// is SIGKILLed by pid, safe because it is this process's unreaped child. Removes
@@ -432,15 +432,27 @@ impl UidWatch {
     ) -> Result<Vec<Survivor>, RuntimeError> {
         let uid = self.uid;
         let ended = tokio::task::spawn_blocking(move || {
+            // launchd's own agents run as the uid whatever the lease did (a system
+            // helper for the home's disk image, for one): they are not waited for or
+            // named, as in the slot's clean. They are listed before the bootout empties
+            // the list.
+            let own = host::launchds_own(uid);
             // The domain first, so that launchd starts none of its jobs again while the
             // processes are asked to end: those would be taken for ones that ignored it.
             uid::bootout(uid, wait.min(uid::BOOTOUT_WITHIN));
-            let survivors = term_uid(
-                uid,
-                grace,
-                &mut || uid::processes(uid).map_err(|e| e.to_string()),
-                LEASE_LOOK,
-            )?;
+            let survivors = grace::lenient(
+                term_uid(
+                    uid,
+                    grace,
+                    &mut || {
+                        let mut pids = uid::processes(uid).map_err(|e| e.to_string())?;
+                        pids.retain(|pid| !own.contains(pid));
+                        Ok(pids)
+                    },
+                    LEASE_LOOK,
+                ),
+                "the SIGTERM round",
+            );
             uid::kill_all(uid, wait).map_err(|e| e.to_string())?;
             Ok::<_, String>(survivors)
         })

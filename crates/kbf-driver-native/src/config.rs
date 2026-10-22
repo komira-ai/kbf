@@ -73,7 +73,9 @@ pub struct NativeConfig {
     pub kill_wait: Duration,
     /// How long the processes of an action, and of a slot being cleaned, are given to
     /// end after SIGTERM before they are killed; zero kills at once
-    /// ([`crate::grace`]). Extra to `kill_wait`, which bounds the kill that follows.
+    /// ([`crate::grace`]). Extra to `kill_wait`, which bounds the kill that follows; a lease
+    /// past its memory limit gets none. A slot's clean gives at most its
+    /// own time limit.
     pub term_grace: Duration,
     /// How long a lease's new simulator may take to be listed by Xcode, and how often
     /// the driver looks, before the action runs ([`crate::simulator`]).

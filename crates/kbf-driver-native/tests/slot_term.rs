@@ -39,6 +39,11 @@ use support::{MemoryCas, PROMPT, Spec};
 const COUNT: u32 = 3;
 const NAMES: usize = 2 * COUNT as usize;
 
+/// The grace of the test that has a workload ignore SIGTERM, and how long the action's
+/// own `sleep` runs: the lease cannot end sooner than both together.
+const GRACE: Duration = Duration::from_millis(600);
+const SLEEP_SECS: u64 = 1;
+
 fn assert_root() {
     support::pool::assert_root("slot_term");
 }
@@ -177,7 +182,7 @@ async fn a_workload_that_ignores_sigterm_is_named_in_the_result() {
     let scratch = Scratch::new("term-ignore");
     let users = Users::new("term-ignore", 1);
     let mut config = config(&scratch, users.pool());
-    config.term_grace = Duration::from_millis(600);
+    config.term_grace = GRACE;
     let cas = Arc::new(MemoryCas::default());
     let rt = NativeRuntime::new(config, Arc::clone(&cas)).expect("runtime");
     let act = scratch.act();
@@ -197,7 +202,7 @@ async fn a_workload_that_ignores_sigterm_is_named_in_the_result() {
         "300",
         ";",
         "sleep",
-        "1",
+        &SLEEP_SECS.to_string(),
         ";",
         "exit",
         "3",
@@ -214,7 +219,7 @@ async fn a_workload_that_ignores_sigterm_is_named_in_the_result() {
     assert_eq!(result.exit_code, 3, "{stderr}");
     assert!(
         stderr.contains(&format!(
-            "kbf: 1 process(es) ignored SIGTERM and were killed: pid {pid} "
+            "kbf: 1 process(es) outlasted SIGTERM and were killed: pid {pid} "
         )),
         "{stderr}"
     );
@@ -223,6 +228,7 @@ async fn a_workload_that_ignores_sigterm_is_named_in_the_result() {
         !support::alive(pid),
         "the survivor {pid} outlived the lease"
     );
-    assert!(took >= Duration::from_millis(1500), "no grace: {took:?}");
+    let floor = Duration::from_secs(SLEEP_SECS) + GRACE - Duration::from_millis(100);
+    assert!(took >= floor, "no grace: {took:?}");
     assert!(took < PROMPT * 2, "the grace was not bounded: {took:?}");
 }

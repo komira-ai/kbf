@@ -94,7 +94,7 @@ reconnect-ms = 1000
 [macos]
 # The socket `kbf-mac-session` serves (native-whole-machine)
 mac-session-socket = "/var/run/kbf-mac-session/socket"
-# How long a lease's processes are given to end after SIGTERM before they are killed, in milliseconds; 0 kills them at once (native). A workload that cleans up when asked to end, such as Python's multiprocessing resource tracker with the shared memory it made, does so in this time; one that ignores SIGTERM is named in the lease's stderr. A slot's clean uses the same value
+# How long a lease's processes are given to end after SIGTERM before they are killed, in milliseconds; 0 kills them at once (native). A workload that cleans up when asked to end, such as Python's multiprocessing resource tracker with the shared memory it made, does so in this time; one that ignores SIGTERM is named in the lease's stderr. A slot's clean uses the same value (at most its own time limit). More than 60000 is taken as 60000. The wait comes on top of the time given to the kill that follows. A lease past its memory limit is killed at once
 native-term-grace-ms = 2000
 # The uid of `kbf-pool-0`, and the group id of all the pool users (`pool_first_uid` in kbf-mac-provision's profile); at least 600
 # pool-first-uid = "POOL_FIRST_UID"

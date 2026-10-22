@@ -178,7 +178,7 @@ fn the_note_names_survivors_cut_and_capped() {
     let one = note(&[survivor(7, "sleep 100")]).expect("a note");
     assert_eq!(
         one,
-        "kbf: 1 process(es) ignored SIGTERM and were killed: pid 7 p [sleep 100]\n"
+        "kbf: 1 process(es) outlasted SIGTERM and were killed: pid 7 p [sleep 100]\n"
     );
     let long = "x".repeat(ARGS_SHOWN + 5);
     let cut = note(&[survivor(7, &long)]).expect("a note");
@@ -194,4 +194,54 @@ fn the_note_names_survivors_cut_and_capped() {
     assert!(capped.contains("pid 8 p"), "{capped}");
     assert!(!capped.contains("pid 9 p"), "{capped}");
     assert!(capped.trim_end().ends_with("; and 3 more"), "{capped}");
+}
+
+/// Catches: the arguments of thousands of survivors being read (each read is costly) when
+/// only eight are named, and a count that stops matching: every survivor is returned,
+/// only the first eight are described.
+#[test]
+fn only_the_survivors_that_are_named_are_described() {
+    let pids: Vec<i32> = (1..=12).collect();
+    let world = World::new(&pids, &pids);
+    let described = RefCell::new(Vec::new());
+    let survivors = term_first(
+        Duration::from_millis(20),
+        &mut || Ok(()),
+        &mut || Ok(world.alive.borrow().clone()),
+        &mut |pid| {
+            described.borrow_mut().push(pid);
+            Survivor::of(pid, Some(("p".to_owned(), String::new())))
+        },
+        &mut || *world.now.borrow(),
+        &mut || *world.now.borrow_mut() += Duration::from_millis(10),
+    )
+    .expect("ran");
+    assert_eq!(survivors.len(), 12);
+    assert_eq!(*described.borrow(), (1..=8).collect::<Vec<i32>>());
+}
+
+/// Catches: a failed SIGTERM round skipping the kill that follows (the caller kills
+/// whatever `lenient` hands back), and a survivor list invented from a failure.
+#[test]
+fn a_failed_round_names_nobody_and_lets_the_kill_run() {
+    assert_eq!(lenient(Err("fork".to_owned()), "test"), []);
+    assert_eq!(
+        lenient(Ok(vec![survivor(3, "")]), "test"),
+        [survivor(3, "")]
+    );
+}
+
+/// Catches: an argument with a line break forging a line in the lease's stderr or the
+/// log, and the log line carrying arguments (they can hold a secret).
+#[test]
+fn control_characters_are_escaped_and_the_log_line_has_no_arguments() {
+    let forged = note(&[survivor(7, "a\nkbf: forged\u{1b}[0m")]).expect("a note");
+    assert_eq!(forged.matches('\n').count(), 1, "{forged:?}");
+    assert!(forged.contains("a\\nkbf: forged\\u{1b}[0m"), "{forged}");
+    assert_eq!(brief(&[]), None);
+    let log = brief(&[survivor(7, "--token=abc")]).expect("a line");
+    assert_eq!(
+        log,
+        "1 process(es) outlasted SIGTERM and were killed: pid 7 p"
+    );
 }

@@ -636,7 +636,11 @@ impl<C: Cas> NativeRuntime<C> {
         // One more read before the processes are ended: what ran since the last poll.
         let _ = watch.measure().await;
         let ignored = watch
-            .end(&mut child, self.config.kill_wait, self.config.term_grace)
+            .end(
+                &mut child,
+                self.config.kill_wait,
+                grace_after(&ended, self.config.term_grace),
+            )
             .await?;
         self.report_ignored_sigterm(work.lease_id, dir, &ignored);
         *measured = watch.usage(started.elapsed());
@@ -714,15 +718,17 @@ impl<C: Cas> NativeRuntime<C> {
         self.add_to_stderr(lease, dir, &note, "the sandbox's denials");
     }
 
-    /// Names the processes that ignored SIGTERM ([`grace::note`]) in the node's log and
+    /// Names the processes that outlasted SIGTERM ([`grace::note`]) in the node's log and
     /// at the end of the action's stderr: its own hermeticity failure, which does not
     /// change its exit code.
     fn report_ignored_sigterm(&self, lease: LeaseId, dir: &Path, ignored: &[Survivor]) {
         let Some(note) = grace::note(ignored) else {
             return;
         };
-        tracing::warn!(%lease, "{}", note.trim_end());
-        self.add_to_stderr(lease, dir, &note, "the processes that ignored SIGTERM");
+        if let Some(brief) = grace::brief(ignored) {
+            tracing::warn!(%lease, "{brief}");
+        }
+        self.add_to_stderr(lease, dir, &note, "the processes that outlasted SIGTERM");
     }
 
     /// Appends `note` to the action's stderr in `dir`, unless that pushes it past the
@@ -1252,9 +1258,10 @@ impl Group {
             )
         })
         .await;
-        let survivors = (polite.map_err(std::io::Error::other))
-            .and_then(|round| round.map_err(std::io::Error::other))
-            .map_err(failed(Path::new("SIGTERM round")))?;
+        let survivors = grace::lenient(
+            polite.map_err(|e| e.to_string()).and_then(|round| round),
+            "the SIGTERM round",
+        );
         let give_up = Instant::now() + wait;
         loop {
             let members = self.members().await?;
@@ -1279,6 +1286,15 @@ impl Group {
             .await
             .map_err(failed(Path::new("reap the action")))?;
         Ok(survivors)
+    }
+}
+
+/// The grace an ending gets: `grace`, except none for a lease past its memory limit: its
+/// processes must not keep growing while they are asked to end.
+fn grace_after(ended: &Ended, grace: Duration) -> Duration {
+    match ended {
+        Ended::Exited(_) | Ended::TimedOut | Ended::Killed => grace,
+        Ended::OutOfMemory { .. } => Duration::ZERO,
     }
 }
 
@@ -1500,6 +1516,19 @@ pub(crate) fn failed(path: &Path) -> impl FnOnce(std::io::Error) -> RuntimeError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Catches: a lease past its memory limit getting a grace in which its runaway
+    /// processes go on growing, and an exit, a timeout or a cancel losing the grace.
+    #[test]
+    fn a_lease_past_its_memory_limit_gets_no_grace() {
+        let grace = Duration::from_secs(2);
+        let exited = Ended::Exited(Ok(ExitStatus::default()));
+        assert_eq!(grace_after(&exited, grace), grace);
+        assert_eq!(grace_after(&Ended::TimedOut, grace), grace);
+        assert_eq!(grace_after(&Ended::Killed, grace), grace);
+        let oom = Ended::OutOfMemory { used: 2, limit: 1 };
+        assert_eq!(grace_after(&oom, grace), Duration::ZERO);
+    }
 
     /// Catches spool files a killed daemon left filling the disk, and a start refused
     /// over an entry it cannot remove: a leftover file goes, a directory that is not a

@@ -390,7 +390,7 @@ async fn a_process_that_ignores_sigterm_is_named_in_the_result() {
     assert!(!alive(pid), "the process {pid} outlived the lease");
     assert!(
         stderr.contains(&format!(
-            "kbf: 1 process(es) ignored SIGTERM and were killed: pid {pid} "
+            "kbf: 1 process(es) outlasted SIGTERM and were killed: pid {pid} "
         )),
         "{stderr}"
     );

@@ -4,9 +4,11 @@
 //! matters for one kind of leftover: POSIX shared memory and semaphore names cannot be
 //! listed there, so nothing can remove the ones a killed workload made. Python's
 //! `multiprocessing` makes them through a resource tracker process, which unlinks every
-//! name it was told about when it is asked to end (SIGTERM) or when its parent goes
-//! away. Killed together with the workload, the tracker unlinks nothing and the names
-//! stay until the machine restarts.
+//! name it was told about once its workload has gone (the pipe from the workload
+//! closes). Killed together with the workload, the tracker unlinks nothing and the names
+//! stay until the machine restarts. With SIGTERM first, a workload that ends on it
+//! closes the pipe and the tracker has the grace to do its work; a workload that ignores
+//! SIGTERM keeps the pipe open, and both are killed when the grace ends.
 //!
 //! So both places that end a lease's processes, the end of the lease
 //! ([`crate::procs`]' process tree and the slot user's processes) and the slot's clean,
@@ -16,9 +18,13 @@
 //! first half, with the signals, the process table and the clock passed in, so that it
 //! runs under test on every platform.
 //!
-//! A process that is still alive when the grace ends ignored SIGTERM, and is named in
-//! the lease's stderr ([`note`]) as that action's own hermeticity failure: its pid,
-//! name and arguments. The action is not failed for it.
+//! A process that is still alive when the grace ends outlasted SIGTERM (it ignored it, or
+//! it was started after it was sent), and is named in the lease's stderr ([`note`]) as
+//! that action's own hermeticity failure: its pid, name and arguments. The action is not
+//! failed for it. SIGTERM is sent once, to the processes alive when the round starts.
+//!
+//! The grace is extra to the wait for SIGKILL to take effect (`kill_wait`), which is
+//! unchanged, and is at most [`MAX_GRACE`].
 //!
 //! What this cannot see: shared memory made without a tracker (Python's
 //! `SharedMemory(track=False)`, or C code calling `shm_open` and exiting without
@@ -26,6 +32,9 @@
 //! the system offers no way to list the names, so there is nothing to compare.
 
 use std::time::Duration;
+
+/// The longest grace there is: a larger `--native-term-grace-ms` is cut to this.
+pub const MAX_GRACE: Duration = Duration::from_secs(60);
 
 /// The most survivors [`note`] names; the rest are counted.
 pub(crate) const MAX_NAMED: usize = 8;
@@ -80,10 +89,38 @@ pub(crate) fn term_first(
             return Ok(Vec::new());
         }
         if elapsed() >= grace {
-            return Ok(left.into_iter().map(describe).collect());
+            // Only the ones [`note`] names are read: reading a process's arguments is
+            // costly, and there can be thousands.
+            return Ok(left
+                .into_iter()
+                .enumerate()
+                .map(|(i, pid)| {
+                    if i < MAX_NAMED {
+                        describe(pid)
+                    } else {
+                        Survivor::of(pid, None)
+                    }
+                })
+                .collect());
         }
         pause();
     }
+}
+
+/// What [`term_first`] gave, for a caller that kills next whatever happened: an error
+/// is logged at WARN as `what` failed and no survivor is named, so that the kill that
+/// follows still runs.
+pub(crate) fn lenient(round: Result<Vec<Survivor>, String>, what: &str) -> Vec<Survivor> {
+    round.unwrap_or_else(|why| {
+        tracing::warn!("{what}: SIGTERM first did not complete ({why}); killing now");
+        Vec::new()
+    })
+}
+
+/// `text` with control characters shown as escapes, so that an argument cannot add a
+/// line to a log.
+fn plain(text: &str) -> String {
+    text.chars().flat_map(char::escape_debug).collect()
 }
 
 /// The line that names `survivors` in the lease's stderr, or `None` for no survivor:
@@ -98,13 +135,13 @@ pub(crate) fn note(survivors: &[Survivor]) -> Option<String> {
         .iter()
         .take(MAX_NAMED)
         .map(|s| {
-            let args: String = s.args.chars().take(ARGS_SHOWN).collect();
+            let args: String = plain(&s.args.chars().take(ARGS_SHOWN).collect::<String>());
             let cut = if s.args.chars().count() > ARGS_SHOWN {
                 "..."
             } else {
                 ""
             };
-            format!("pid {} {} [{args}{cut}]", s.pid, s.name)
+            format!("pid {} {} [{args}{cut}]", s.pid, plain(&s.name))
         })
         .collect();
     let more = survivors.len().saturating_sub(MAX_NAMED);
@@ -114,7 +151,26 @@ pub(crate) fn note(survivors: &[Survivor]) -> Option<String> {
         String::new()
     };
     Some(format!(
-        "kbf: {} process(es) ignored SIGTERM and were killed: {}{more}\n",
+        "kbf: {} process(es) outlasted SIGTERM and were killed: {}{more}\n",
+        survivors.len(),
+        named.join("; ")
+    ))
+}
+
+/// Like [`note`] for the node's log: pids and names, no arguments (those can hold a
+/// secret), without the line end.
+#[must_use]
+pub(crate) fn brief(survivors: &[Survivor]) -> Option<String> {
+    if survivors.is_empty() {
+        return None;
+    }
+    let named: Vec<String> = survivors
+        .iter()
+        .take(MAX_NAMED)
+        .map(|s| format!("pid {} {}", s.pid, plain(&s.name)))
+        .collect();
+    Some(format!(
+        "{} process(es) outlasted SIGTERM and were killed: {}",
         survivors.len(),
         named.join("; ")
     ))

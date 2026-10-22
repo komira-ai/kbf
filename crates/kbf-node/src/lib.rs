@@ -249,7 +249,10 @@ pub struct Cli {
     /// killed, in milliseconds; 0 kills them at once (native). A workload that cleans up
     /// when asked to end, such as Python's multiprocessing resource tracker with the
     /// shared memory it made, does so in this time; one that ignores SIGTERM is named in
-    /// the lease's stderr. A slot's clean uses the same value.
+    /// the lease's stderr. A slot's clean uses the same value (at most its own time
+    /// limit). More than 60000 is taken as 60000. The wait comes on top of the time
+    /// given to the kill that follows. A lease past its memory limit is killed at
+    /// once.
     #[arg(long, default_value_t = 2000)]
     native_term_grace_ms: u64,
     /// The directory searched for `Xcode*.app` (native). Each Xcode whose own
@@ -1116,7 +1119,8 @@ fn native_config(cli: &Cli) -> Result<NativeConfig, Error> {
         headroom_bytes: cli.memory_headroom_mib.saturating_mul(1 << 20),
     };
     config.poll = Duration::from_millis(cli.memory_poll_ms.max(1));
-    config.term_grace = Duration::from_millis(cli.native_term_grace_ms);
+    config.term_grace =
+        Duration::from_millis(cli.native_term_grace_ms).min(kbf_driver_native::grace::MAX_GRACE);
     config.pool = (cli.pool_users.zip(cli.pool_first_uid))
         .map(|(count, first)| Pool::provisioned(count, first))
         .transpose()?;
@@ -1470,6 +1474,16 @@ mod tests {
         assert_eq!(
             native_config(&at_once).expect("config").term_grace,
             Duration::ZERO
+        );
+        let forever = parse(&[
+            "--driver=native",
+            "--data-dir=/s",
+            "--native-term-grace-ms=18446744073709551615",
+        ])
+        .expect("flags");
+        assert_eq!(
+            native_config(&forever).expect("config").term_grace,
+            kbf_driver_native::grace::MAX_GRACE
         );
         let relative = parse(&["--driver=native", "--data-dir=leases"]).expect("flags");
         assert!(native_config(&relative).is_err());
