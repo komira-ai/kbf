@@ -90,7 +90,7 @@ fn adapter(proxy: &FakeProxy, name: &str) -> FrontendHealth {
 fn serving(name: &str, body: String) -> (FakeProxy, FrontendHealth) {
     let proxy = fake_proxy(NAME, true, move |_, _| Some(http(200, &body)));
     let health = adapter(&proxy, name);
-    health.installing(&host());
+    health.installing(&host(), &target());
     (proxy, health)
 }
 
@@ -152,8 +152,40 @@ fn without_an_install_call_the_freshness_is_not_checked() {
     let proxy = fake_proxy(NAME, true, |_, _| Some(http(200, &done(BEFORE))));
     let health = adapter(&proxy, "fe-no-call");
     assert_eq!(check(&health), Ok(Health::Healthy));
-    health.installing(&host());
+    health.installing(&host(), &target());
     assert!(matches!(check(&health), Ok(Health::Waiting(_))));
+}
+
+/// Catches a retried install moving the freshness bar: the first call is at `INSTALL_MS`, the
+/// second five seconds later, and a swap begun between them (the first attempt landed late)
+/// is this roll's and is healthy; one begun before the first call still is not.
+#[test]
+fn a_retried_install_does_not_move_the_freshness_bar() {
+    let now = Arc::new(std::sync::Mutex::new(INSTALL_MS));
+    for (started, healthy) in [(AT_INSTALL, true), (BEFORE, false)] {
+        let proxy = fake_proxy(NAME, true, move |_, _| Some(http(200, &done(started))));
+        let dir = scratch("fe-retry");
+        let tls = ProxyTls {
+            addr: proxy.addr,
+            ca_file: file(&dir, "ca.pem", &proxy.ca, 0o644),
+            server_name: Some(NAME.to_owned()),
+        };
+        let token = file(&dir, "token", &format!("{TOKEN}\n"), 0o600);
+        let api = ProxyApi::new(&tls, token)
+            .expect("api")
+            .with_timeout(Duration::from_millis(500));
+        let clock = Arc::clone(&now);
+        let health = FrontendHealth::with_clock(api, Arc::new(move || *clock.lock().expect("l")));
+        *now.lock().expect("l") = INSTALL_MS;
+        health.installing(&host(), &target());
+        *now.lock().expect("l") = INSTALL_MS + 5_000;
+        health.installing(&host(), &target());
+        assert_eq!(
+            matches!(check(&health), Ok(Health::Healthy)),
+            healthy,
+            "{started}"
+        );
+    }
 }
 
 /// Catches a proxy restart being read as a reason to accept, or to refuse: between two reads
@@ -183,7 +215,7 @@ fn a_changed_proxy_boot_changes_nothing() {
         Some(http(200, &bodies[n.min(bodies.len() - 1)]))
     });
     let health = adapter(&proxy, "fe-boot");
-    health.installing(&host());
+    health.installing(&host(), &target());
     let first = check(&health).expect("first");
     assert!(waiting(&first).contains("running (baking)"), "{first:?}");
     assert_eq!(check(&health), Ok(Health::Healthy));
@@ -455,6 +487,10 @@ fn rfc3339_utc_is_read_to_the_second() {
         ("2026-01-31T12:00:00Z", 1_769_860_800),
         ("2026-10-22T08:41:16Z", 1_792_658_476),
         ("2026-12-31T23:59:59Z", 1_798_761_599),
+        ("2024-02-29T00:00:00Z", 1_709_164_800),
+        ("2000-02-29T00:00:00Z", 951_782_400),
+        ("2026-04-30T00:00:00Z", 1_777_507_200),
+        ("2026-02-28T00:00:00Z", 1_772_236_800),
     ] {
         assert_eq!(parse_utc(text), Some(secs), "{text}");
     }
@@ -471,6 +507,11 @@ fn rfc3339_utc_is_read_to_the_second() {
         "2026-13-01T00:00:00Z",
         "2026-00-01T00:00:00Z",
         "2026-10-32T00:00:00Z",
+        "2026-02-31T00:00:00Z",
+        "2026-02-29T00:00:00Z",
+        "2100-02-29T00:00:00Z",
+        "2026-04-31T00:00:00Z",
+        "2026-11-31T00:00:00Z",
         "2026-10-00T00:00:00Z",
         "2026-10-22T24:00:00Z",
         "2026-10-22T00:60:00Z",

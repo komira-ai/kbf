@@ -279,7 +279,7 @@ impl FakeHealth {
 }
 
 impl HealthCheck for FakeHealth {
-    fn installing(&self, host: &Host) {
+    fn installing(&self, host: &Host, _target: &Version) {
         lock(&self.installing).push(host.alias.clone());
     }
 

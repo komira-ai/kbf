@@ -90,8 +90,8 @@ impl FrontendHealth {
 }
 
 impl HealthCheck for FrontendHealth {
-    fn installing(&self, host: &Host) {
-        self.installs.note(&host.alias);
+    fn installing(&self, host: &Host, target: &Version) {
+        self.installs.note(&host.alias, target);
     }
 
     fn check(&self, host: &Host, target: &Version) -> Result<Health, PortError> {
@@ -115,7 +115,7 @@ impl HealthCheck for FrontendHealth {
         judge(
             &status,
             commit,
-            self.installs.at(&host.alias).map(|ms| ms / 1000),
+            self.installs.at(&host.alias, target).map(|ms| ms / 1000),
         )
     }
 }
@@ -138,8 +138,15 @@ pub(crate) fn parse_utc(text: &str) -> Option<u64> {
     let n = |from: usize, to: usize| text[from..to].parse::<i64>().unwrap_or_default();
     let (year, month, day) = (n(0, 4), n(5, 7), n(8, 10));
     let (hour, minute, second) = (n(11, 13), n(14, 16), n(17, 19));
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
     let valid = (1..=12).contains(&month)
-        && (1..=31).contains(&day)
+        && (1..=month_days).contains(&day)
         && hour < 24
         && minute < 60
         && second < 60;

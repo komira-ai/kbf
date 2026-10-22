@@ -21,7 +21,8 @@
 //!
 //! A frontend that already ran the target (an earlier roll) still shows that swap as `done`,
 //! and a daemon that has not restarted yet is still connected. So each adapter notes the time
-//! of the install call ([`InstallTimes`]) and accepts only what happened after it. After an
+//! of the first install call for the version ([`InstallTimes`]) and accepts only what
+//! happened after it. After an
 //! updater restart in the middle of a roll that time is unknown (it is not in `roll.json`),
 //! and the check is not made: the other conditions still hold.
 
@@ -49,10 +50,15 @@ pub fn system_wall_clock() -> WallClock {
     })
 }
 
-/// When the roll called the installer for each host, by alias; the last call of a host wins.
+/// When the roll first called the installer for each host and version; later attempts for the
+/// same pair do not move it.
+///
+/// The first call is the one that counts: an attempt that failed or was slow may still land
+/// later, and the swap it starts then began after the first call but before the last. Keyed
+/// by version too, so a roll to a newer version starts its own clock.
 pub struct InstallTimes {
     now: WallClock,
-    at: Mutex<BTreeMap<String, u64>>,
+    at: Mutex<BTreeMap<(String, String), u64>>,
 }
 
 impl InstallTimes {
@@ -63,21 +69,22 @@ impl InstallTimes {
         }
     }
 
-    /// The installer is about to be called for `alias`.
-    pub fn note(&self, alias: &str) {
+    /// The installer is about to be called for `alias`, to put `target` on it.
+    pub fn note(&self, alias: &str, target: &Version) {
         let now = (self.now)();
         self.at
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(alias.to_owned(), now);
+            .entry((alias.to_owned(), target.as_str().to_owned()))
+            .or_insert(now);
     }
 
-    /// When the installer was last called for `alias`, if this process did.
-    pub fn at(&self, alias: &str) -> Option<u64> {
+    /// When the installer was first called for `alias` and `target`, if this process did.
+    pub fn at(&self, alias: &str, target: &Version) -> Option<u64> {
         self.at
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(alias)
+            .get(&(alias.to_owned(), target.as_str().to_owned()))
             .copied()
     }
 }
@@ -121,8 +128,8 @@ impl HostHealth {
 }
 
 impl HealthCheck for HostHealth {
-    fn installing(&self, host: &Host) {
-        self.for_role(host.role).installing(host);
+    fn installing(&self, host: &Host, target: &Version) {
+        self.for_role(host.role).installing(host, target);
     }
 
     fn check(&self, host: &Host, target: &Version) -> Result<Health, PortError> {

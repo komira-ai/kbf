@@ -544,7 +544,7 @@ impl Updater {
     }
 
     fn install(&self, host: &Host, target: &Version) -> Result<(), InstallError> {
-        self.ports.health.installing(host);
+        self.ports.health.installing(host, target);
         match self.ports.installer.install(host, target) {
             Ok(()) => Ok(()),
             Err(e) if e.is_unreachable() => Err(InstallError::Unreachable),

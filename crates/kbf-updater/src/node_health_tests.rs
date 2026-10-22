@@ -99,6 +99,27 @@ fn waiting(health: &Result<Health, PortError>) -> String {
     }
 }
 
+/// Catches two members at one address being resolved by order: the first row is active and
+/// built from the target, the second is a stale duplicate (and the other way round); neither
+/// order may pass for healthy, and the wait says why. One member at the address, beside
+/// others at other addresses, is still healthy.
+#[test]
+fn two_members_at_the_nodes_address_wait_in_either_order() {
+    let good = member(ADDR, "active", Some(COMMIT));
+    let stale = member(&ADDR.to_ascii_uppercase(), "down", Some(OTHER));
+    for rows in [
+        vec![good.clone(), stale.clone()],
+        vec![stale.clone(), good.clone()],
+    ] {
+        let server = storage(rows);
+        let why = waiting(&storage_check(&server, "nh-dup"));
+        assert!(why.contains("more than one storage member"), "{why}");
+    }
+    let elsewhere = member("192.0.2.12:8982", "active", Some(OTHER));
+    let server = storage(vec![elsewhere, good]);
+    assert_eq!(storage_check(&server, "nh-one"), Ok(Health::Healthy));
+}
+
 /// Catches a storage node not found, or a wrong member taken: the node's advertised address
 /// (from the enrollment registry) picks the member (the first of two), the request is what the
 /// operator gates want (bearer, JSON content type), and a member that is active and built from
@@ -346,7 +367,7 @@ fn a_daemon_must_have_reported_since_the_install() {
     ] {
         let server = routes(vec![("/v1/nodes/dm", node(true, "serving", received))]);
         let health = adapter(&server, "nh-dm-fresh");
-        health.installing(&dm);
+        health.installing(&dm, &target());
         let got = daemon_check(&health);
         if healthy {
             assert_eq!(got, Ok(Health::Healthy), "{received:?}");
@@ -367,6 +388,28 @@ fn a_daemon_must_have_reported_since_the_install() {
             .expect_err("5xx")
             .is_unreachable()
     );
+}
+
+/// Catches a retried install moving the freshness bar: the daemon's newest status arrived
+/// between the first install call and the second (the first attempt landed late), and the
+/// roll's second call must not make that status look stale.
+#[test]
+fn a_retried_install_does_not_move_the_daemons_freshness_bar() {
+    let dm = host("dm", Role::Daemon);
+    let server = routes(vec![(
+        "/v1/nodes/dm",
+        node(true, "serving", Some(INSTALL_MS + 1_000)),
+    )]);
+    let now = Arc::new(Mutex::new(INSTALL_MS));
+    let clock = Arc::clone(&now);
+    let health = NodeHealth::with_api(
+        api(&server, "nh-dm-retry"),
+        Arc::new(move || *clock.lock().expect("lock")),
+    );
+    health.installing(&dm, &target());
+    *now.lock().expect("lock") = INSTALL_MS + 5_000;
+    health.installing(&dm, &target());
+    assert_eq!(daemon_check(&health), Ok(Health::Healthy));
 }
 
 /// Catches the node API's path built from anything but the alias, and the id being sent
@@ -424,21 +467,30 @@ fn a_version_names_its_commit_and_a_report_matches_by_prefix() {
     ));
 }
 
-/// Catches the install time being lost or crossed between hosts: the last call of a host wins,
-/// another host's is its own, and a host never announced has none.
+/// Catches the install time being lost or crossed between hosts, or moved by a retry: the
+/// first call of a host for a version wins (a first attempt that lands late would otherwise
+/// start its swap before the recorded time), another host's is its own, a newer version
+/// starts its own clock, and a host never announced has none.
 #[test]
-fn install_times_are_kept_per_host_and_the_last_call_wins() {
+fn install_times_are_kept_per_host_and_version_and_the_first_call_wins() {
     let now = Arc::new(Mutex::new(10u64));
     let clock = Arc::clone(&now);
     let times = InstallTimes::new(Arc::new(move || *clock.lock().expect("lock")));
-    assert_eq!(times.at("a"), None);
-    times.note("a");
+    let v = target();
+    let newer = Version::parse("0.1.8+g0123456789ab-4").expect("version");
+    assert_eq!(times.at("a", &v), None);
+    times.note("a", &v);
     *now.lock().expect("lock") = 20;
-    times.note("b");
-    assert_eq!((times.at("a"), times.at("b")), (Some(10), Some(20)));
+    times.note("b", &v);
+    assert_eq!((times.at("a", &v), times.at("b", &v)), (Some(10), Some(20)));
     *now.lock().expect("lock") = 30;
-    times.note("a");
-    assert_eq!((times.at("a"), times.at("b")), (Some(30), Some(20)));
+    times.note("a", &v);
+    assert_eq!((times.at("a", &v), times.at("b", &v)), (Some(10), Some(20)));
+    times.note("a", &newer);
+    assert_eq!(
+        (times.at("a", &v), times.at("a", &newer)),
+        (Some(10), Some(30))
+    );
     assert!(crate::health::system_wall_clock()() > 1_700_000_000_000);
 }
 
@@ -496,13 +548,13 @@ fn each_host_is_judged_by_the_adapter_of_its_role() {
         all.check(&host("dm", Role::Daemon), &v),
         Ok(Health::Healthy)
     );
-    all.installing(&host("dm", Role::Daemon));
+    all.installing(&host("dm", Role::Daemon), &target());
     assert!(matches!(
         all.check(&host("dm", Role::Daemon), &v),
         Ok(Health::Waiting(_))
     ));
     // The frontend's announcement goes to the frontend: the done swap began after INSTALL_MS.
-    all.installing(&host("fe", Role::Frontend));
+    all.installing(&host("fe", Role::Frontend), &target());
     assert_eq!(
         all.check(&host("fe", Role::Frontend), &v),
         Ok(Health::Healthy)

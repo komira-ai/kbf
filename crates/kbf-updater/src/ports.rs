@@ -132,9 +132,10 @@ pub enum Health {
 
 /// The health of a host, by its role (frontend or node).
 pub trait HealthCheck: Send + Sync {
-    /// The roll is about to call the installer for `host` (each attempt). An adapter that
-    /// must tell what happened after the install from what was there before notes the time.
-    fn installing(&self, host: &Host);
+    /// The roll is about to call the installer to put `target` on `host` (each attempt). An
+    /// adapter that must tell what happened after the install from what was there before
+    /// notes the time of the first attempt for the pair.
+    fn installing(&self, host: &Host, target: &Version);
 
     fn check(&self, host: &Host, target: &Version) -> Result<Health, PortError>;
 }
