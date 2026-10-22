@@ -230,9 +230,8 @@ fn a_segment_upload_cap_over_the_write_bound_is_refused() {
 
 /// Catches `--durable-wait` and `--ram-peer-grace` that do not reach the cache and the
 /// repair worker, defaults other than the design's (10 s and 5 s), a zero, and a wait that
-/// could outlast the chain's commit bound (mutants: the check removed; the bound compared
-/// without the half). A wait of 59 s starts; 60 s (half of the 120 s replica commit bound)
-/// is refused, naming the flag.
+/// could outlast the chain's commit bound. A wait of 59 s starts; 60 s (half of the 120 s
+/// replica commit bound) is refused, naming the flag.
 #[test]
 fn the_durable_wait_and_the_peer_grace_are_flags_and_the_wait_is_bounded() {
     let defaults = Args::parse_from(["kbf-server"]);

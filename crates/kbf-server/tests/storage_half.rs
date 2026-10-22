@@ -350,7 +350,6 @@ async fn a_stop_drains_a_write_in_flight() {
 
 /// The storage half's own assembly of `--ram-ack-bytes` (it is not `kbf storage`'s): the
 /// half holds a blob with the budget in its cache, and its stop writes it to the disk.
-/// Mutants: the half's assembly leaves out `with_ram_ack_bytes`, or `ram.after(..)`.
 #[tokio::test]
 async fn the_half_with_a_ram_budget_writes_what_it_holds_when_it_stops() {
     let dir = dir("ram-stop");
