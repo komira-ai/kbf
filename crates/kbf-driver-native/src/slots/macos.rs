@@ -50,7 +50,7 @@ pub struct Ready {
 
 /// The `/var/folders` entry of a slot as the system made it, found when the slot was
 /// resolved, before any lease: what the clean's last step gives its roots back. The
-/// install-time record the Mac pool plan has in mind replaces this later; until then a
+/// record made at install time should replace this; until then a
 /// daemon restarted after a lease tampered with the entry would record the tampering,
 /// minus a lock or `hidden`, which are never restored.
 #[derive(Clone, Debug, Default)]

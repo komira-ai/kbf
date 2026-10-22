@@ -11,7 +11,7 @@
 //! line sits in a block of lines that a process path containing a newline can forge, so
 //! the number in it names no one. How `ReportCrash` attributes a report to a user when
 //! the crashed process is not the console user's, and where it writes one on a Mac with
-//! no console user, is not measured (experiments X6 and G18 of the Mac pool plan): a
+//! no console user, is not yet known, and no other way a report can name a user is handled: a
 //! report this rule cannot attribute stays.
 //!
 //! **Where root walks.** The folders are other users' to write (the console user's own
@@ -165,10 +165,10 @@ pub(crate) fn found(dirs: &[PathBuf], scope: &Scope) -> Vec<String> {
 /// [`each`] with the whole [`READ_BUDGET`] over absolute `dirs`, from a descriptor on `/`.
 fn from_root(dirs: &[PathBuf], scope: &Scope, act: &mut dyn Act) -> Vec<String> {
     let root = rustix::fs::openat(CWD, "/", DIRECTORY, Mode::empty());
-    match root {
-        Ok(root) => each(&root, dirs, scope, READ_BUDGET, act),
-        Err(why) => vec![format!("/: {why}")],
-    }
+    root.map_or_else(
+        |why| vec![format!("/: {why}")],
+        |root| each(&root, dirs, scope, READ_BUDGET, act),
+    )
 }
 
 /// Calls `act` on each entry of `dirs` (paths from the folder `root` is a descriptor on,
@@ -232,16 +232,14 @@ fn walk(
         Ok(entries) => entries,
         Err(why) => return fail(format!("{}: {why}", path.display())),
     };
-    for entry in entries.filter_map(Result::ok) {
+    // Without `.` and `..`, and without what is gone since the listing.
+    let listed = entries.filter_map(Result::ok).filter_map(|entry| {
         let name = entry.file_name().to_owned();
-        if name.as_bytes() == b"." || name.as_bytes() == b".." {
-            continue;
-        }
-        // Gone since the listing: nothing to do.
-        let Ok(stat) = rustix::fs::statat(folder, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
-        else {
-            continue;
-        };
+        let dots = matches!(name.as_bytes(), b"." | b"..");
+        let stat = rustix::fs::statat(folder, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW);
+        stat.ok().filter(|_| !dots).map(|stat| (name, stat))
+    });
+    for (name, stat) in listed {
         if !hers(folder, &name, &stat, scope.uid, budget) {
             continue;
         }
@@ -291,18 +289,18 @@ fn hers(folder: &OwnedFd, name: &CString, stat: &Stat, uid: u32, budget: &mut Bu
 /// names `uid`: opened on the folder's descriptor without following a link or blocking,
 /// checked to be the file examined, and read within `budget`. False when it cannot be.
 fn names(folder: &OwnedFd, name: &CString, stat: &Stat, uid: u32, budget: &mut Budget) -> bool {
-    let Ok(file) = rustix::fs::openat(folder, name.as_c_str(), FILE, Mode::empty()) else {
+    // A file that cannot be opened (a link, say), or was swapped for something else since
+    // it was examined, is not read.
+    let same = |opened: &Stat| {
+        (opened.st_dev, opened.st_ino, kind(opened))
+            == (stat.st_dev, stat.st_ino, FileType::RegularFile)
+    };
+    let file = rustix::fs::openat(folder, name.as_c_str(), FILE, Mode::empty())
+        .ok()
+        .filter(|file| rustix::fs::fstat(file).is_ok_and(|opened| same(&opened)));
+    let Some(file) = file else {
         return false;
     };
-    let Ok(opened) = rustix::fs::fstat(&file) else {
-        return false;
-    };
-    // Swapped for something else since it was examined: not read.
-    if (opened.st_dev, opened.st_ino) != (stat.st_dev, stat.st_ino)
-        || kind(&opened) != FileType::RegularFile
-    {
-        return false;
-    }
     let allowed = budget.grant(HEAD);
     if allowed < HEAD {
         tracing::warn!("crash reports: the read budget is spent; a report is left unread");

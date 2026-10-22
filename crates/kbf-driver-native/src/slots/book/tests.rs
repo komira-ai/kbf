@@ -381,6 +381,8 @@ async fn a_slot_that_goes_dirty_at_run_time_is_recovered_promptly() {
     let (book, _) = book(1, vec![Outcome::Clean, dirty()], FAST);
     let reported = counts(&book);
     assert_eq!(reported.recv_timeout(LONG), Ok(1));
+    // Long enough for the recovery thread to be asleep with nothing dirty.
+    std::thread::sleep(Duration::from_millis(200));
     let (index, permit) = take(&book).await;
     book.held(index, permit).give();
     let seen = until(&reported, 1).expect("the slot never came back");

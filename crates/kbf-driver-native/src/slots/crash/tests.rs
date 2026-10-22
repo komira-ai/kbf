@@ -398,3 +398,23 @@ fn an_absolute_folder_that_is_not_there_holds_nothing() {
     assert_eq!(found(&dirs, &scope), Vec::<String>::new());
     assert!(open_folder(&root(Path::new("/")), Path::new("../x"), &scope).is_none());
 }
+
+/// Catches a folder that cannot be listed passing as clean: a descriptor that is not a
+/// directory (what a folder swapped for a file would give) is an error of the clean's own
+/// folder, and nothing of another's.
+#[test]
+fn a_folder_that_cannot_be_listed_is_an_error_of_the_cleans_own() {
+    let dir = tree("unlistable");
+    fs::write(dir.join("file"), "x").unwrap();
+    let file = rustix::fs::openat(CWD, dir.join("file"), FILE, Mode::empty()).unwrap();
+    let mut errors = Vec::new();
+    walk(
+        &file,
+        Path::new("file"),
+        &scope(me()),
+        (&mut Budget(READ_BUDGET), &mut Remove),
+        &mut errors,
+    );
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].starts_with("file: "), "{errors:?}");
+}

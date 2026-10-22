@@ -799,3 +799,68 @@ fn clear_flags_stops_at_its_depth_limit_without_an_error() {
     // Another owner's deep tree is nobody's to fail on: searched to the limit, no error.
     assert_eq!(clear_flags(&home, other()), Swept::default());
 }
+
+/// Catches a kept folder that another process swaps for a link between the examination and
+/// the open being followed, or passing as emptied: the open refuses the link (it is
+/// opened without following) and the entry is an error naming the folder, the link's
+/// target untouched.
+#[test]
+fn a_kept_folder_swapped_for_a_link_since_it_was_examined_is_an_error() {
+    let dir = scratch("kept-swap");
+    let entry = dir.join("entry");
+    fs::create_dir_all(entry.join("C")).unwrap();
+    let outside = dir.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("kept"), "x").unwrap();
+    let (c, target) = (entry.join("C"), outside.clone());
+    let done = std::cell::Cell::new(false);
+    let swept = vanishing(
+        move |point, _| {
+            if matches!(point, Point::Examined(n) if *n == "C") && !done.replace(true) {
+                remove(&c);
+                symlink(&target, &c).unwrap();
+            }
+        },
+        || empty_keeping(&entry, me(), &["C"]),
+    );
+    assert_eq!(swept.errors.len(), 1, "{swept:?}");
+    assert!(swept.errors[0].contains("entry/C:"), "{swept:?}");
+    assert!(outside.join("kept").exists(), "the link was followed");
+}
+
+/// Catches an entry of a kept folder that vanishes between the listing and its examination
+/// read as an error: it is removed already, and the folder is emptied without one.
+#[test]
+fn an_entry_of_a_kept_folder_gone_since_the_listing_is_no_error() {
+    let dir = scratch("kept-gone-entry");
+    let entry = dir.join("entry");
+    fs::create_dir_all(entry.join("C")).unwrap();
+    fs::write(entry.join("C/only"), "x").unwrap();
+    let only = entry.join("C/only");
+    let swept = vanishing(after_listing(2, move || remove(&only)), || {
+        empty_keeping(&entry, me(), &["C"])
+    });
+    assert_eq!(swept.errors, Vec::<String>::new(), "{swept:?}");
+}
+
+/// Catches a flag clear that errors on an entry gone since the listing, and one that enters
+/// another filesystem: the first is passed over, and with every entry reported on another
+/// device none is changed or entered.
+#[test]
+fn clear_flags_passes_over_a_vanished_entry_and_never_crosses_a_device() {
+    let dir = scratch("clear-edges");
+    let home = dir.join("home");
+    fs::create_dir_all(home.join("a")).unwrap();
+    fs::write(home.join("b"), "x").unwrap();
+    chmod(&home.join("b"), 0o400);
+    let gone = home.join("b");
+    let swept = vanishing(after_listing(1, move || remove(&gone)), || {
+        clear_flags(&home, me())
+    });
+    assert_eq!(swept.errors, Vec::<String>::new(), "{swept:?}");
+    let opened = open_base(&home).unwrap().unwrap();
+    let dev = rustix::fs::fstat(&opened).unwrap().st_dev;
+    let mut other_device = Swept::default();
+    clear_below(&opened, &home, me(), dev + 1, 0, &mut other_device).unwrap();
+    assert_eq!(other_device, Swept::default());
+}

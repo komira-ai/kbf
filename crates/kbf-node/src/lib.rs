@@ -1359,15 +1359,13 @@ mod tests {
     /// parts are taken by the wiring, the slots' first, so another taker finds neither.
     #[test]
     fn the_slots_part_and_the_xcodes_part_are_both_taken_by_the_wiring() {
-        let dir = std::env::temp_dir().join(format!("kbf-node-watch-parts-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let runtime =
-            NativeRuntime::new(NativeConfig::new(dir.clone()), Arc::new(NoCas)).expect("runtime");
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-node-watch-parts");
+        let runtime = NativeRuntime::new(NativeConfig::new(dir.to_path_buf()), Arc::new(NoCas))
+            .expect("runtime");
         let (driver, _reports, _xcodes) = watch_parts(&runtime).expect("the parts");
         assert!(driver.part(kbf_driver_native::slots::SOURCE).is_none());
         assert!(driver.part(xcode_watch::SOURCE).is_none());
         drop(runtime);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// With the host's memory above the actions cgroup's cap, the placer's whole-host

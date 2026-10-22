@@ -167,7 +167,8 @@ fn empty_base(path: &Path, uid: u32, keep: &[&str], swept: &mut Swept) -> io::Re
 /// Whether `name`, examined as `stat` in a directory on `dev`, is a directory
 /// [`empty_keeping`] keeps.
 fn is_kept(name: &OsStr, keep: &[&str], stat: &Stat, dev: StDev) -> bool {
-    is_dir(stat) && stat.st_dev == dev && keep.iter().any(|k| OsStr::new(k) == name)
+    // Without short-circuits: all three are read.
+    is_dir(stat) & (stat.st_dev == dev) & keep.iter().any(|k| OsStr::new(k) == name)
 }
 
 /// Empties the kept directory `name` of `dir`, examined as `stat`: each entry removed,
@@ -411,23 +412,17 @@ impl<'a> Park<'a> {
 
     /// Moves `name` of `from` up to a name of its own in the park.
     fn take(&self, from: &OwnedFd, name: &OsStr) -> io::Result<()> {
-        for _ in 0..64 {
-            let n = self.next.get();
-            self.next.set(n + 1);
-            let to = OsString::from(format!(".kbf-deep-{}-{n}", std::process::id()));
-            match rustix::fs::renameat(from, name, self.dir, to.as_os_str()) {
-                Ok(()) => {
-                    self.names.borrow_mut().push(to);
-                    return Ok(());
-                }
-                // A name taken: the next.
-                Err(Errno::EXIST | Errno::NOTEMPTY | Errno::NOTDIR | Errno::ISDIR) => {}
-                Err(why) => return Err(why.into()),
-            }
-        }
-        Err(io::Error::other(
-            "no free name to move a deep tree up under",
-        ))
+        // Named by the time as well as a count, so a name made ahead in the tree being
+        // emptied cannot be guessed to stop the move.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let n = self.next.get();
+        self.next.set(n + 1);
+        let to = OsString::from(format!(".kbf-deep-{}-{n}-{nanos}", std::process::id()));
+        rustix::fs::renameat(from, name, self.dir, to.as_os_str())
+            .map_err(io::Error::from)
+            .map(|()| self.names.borrow_mut().push(to))
     }
 
     /// Removes what was moved up, which may move more up, until nothing is left.
@@ -436,9 +431,9 @@ impl<'a> Park<'a> {
             let Some(name) = self.names.borrow_mut().pop() else {
                 return Ok(());
             };
-            if let Some(stat) = examine(self.dir, &name)? {
-                remove_entry(self.dir, &name, &stat, (uid, dev, 1), self)?;
-            }
+            examine(self.dir, &name)?.map_or(Ok(()), |stat| {
+                remove_entry(self.dir, &name, &stat, (uid, dev, 1), self)
+            })?;
         }
     }
 }

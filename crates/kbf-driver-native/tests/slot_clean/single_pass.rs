@@ -354,7 +354,7 @@ async fn without_the_crash_step_the_report_naming_the_uid_stays() {
 /// and a lease runs on it as that uid. Nothing on disk records the dirty state.
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
 #[tokio::test]
-async fn a_failed_clean_leaves_the_user_dirty_and_the_next_offer_cleans_it_again() {
+async fn a_failed_clean_leaves_the_user_dirty_and_the_recovery_cleans_it_again() {
     let rig = Rig::new("dirty", None);
     let home = home_of(&rig.user);
     let stuck = home.join("kbf-ci-stuck");
