@@ -1,4 +1,4 @@
-//! The swap's database migrator ([`super::migrator`]): its refusal words and its stored
+//! The swap's database migrator ([`crate::migrator`]): its refusal words and its stored
 //! facts without a server, and the swap's whole path over a real schema in `database`
 //! (`KBF_TEST_POSTGRES_URL`, tests `#[ignore]`d like the state crate's; the `state-postgres`
 //! job runs them, and its filter `database::` finds them by their module name).
@@ -12,12 +12,12 @@ use std::time::Duration;
 use kbf_state::postgres::schema::Outcome;
 
 use super::fakes::*;
-use super::migrator::{DbMigrator, Refusal, installed_schema};
 use super::model::{Mode, Phase, PortError, Step};
 use super::ports::{Migrator, Ports};
 use super::swap::Swap;
 use crate::database::Database;
 use crate::fixtures::{FakeRunner, ran, version_json};
+use crate::migrator::{DbMigrator, MigrateError, Refusal, installed_schema};
 use crate::testkit::{A, B, C, c};
 
 /// A password and names that must never come back in a message.
@@ -286,7 +286,7 @@ fn a_release_that_cannot_say_its_schema_is_refused_and_the_database_untouched() 
     let (w, _) = World::with_old();
     let applied = RefCell::new(0);
     let m = DbMigrator::new(unreachable_db(), &w)
-        .knowing_installed(|_| Err(PortError("schema_unknown: no".into())))
+        .knowing_installed(|_| Err(MigrateError("schema_unknown: no".into())))
         .with_apply(Box::new(|_, schema, _| {
             *applied.borrow_mut() += 1;
             outcome(schema)
@@ -300,7 +300,7 @@ fn a_release_that_cannot_say_its_schema_is_refused_and_the_database_untouched() 
 
 const PROGRAM: &str = "/var/lib/kbf-installer/releases/aaaa/kbf";
 
-fn probe(runner: &FakeRunner) -> Result<u32, PortError> {
+fn probe(runner: &FakeRunner) -> Result<u32, MigrateError> {
     installed_schema(runner, std::path::Path::new(PROGRAM), &c(A))
 }
 
@@ -426,7 +426,6 @@ mod database {
     use kbf_state::postgres::schema::{self, Migration};
     use kbf_state::{Cond, Store, Txn};
 
-    use super::super::migrator::DbMigrator;
     use super::super::model::{Mode, Phase, PortError, StagedFacts, Step};
     use super::super::ports::{Migrator, RootOrders};
     use super::super::swap::Swap;

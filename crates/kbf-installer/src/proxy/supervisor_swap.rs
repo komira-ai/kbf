@@ -12,7 +12,7 @@
 //! - `child`: [`super::child_real::ProcChild`];
 //! - `admin`: [`super::admin::Admin`] (`admin_protocol` 1, the proxy secret on every call);
 //! - `gate`: [`super::gate_real::ProxyGate`];
-//! - `migrator`: [`super::migrator::DbMigrator`] (the handover driver wraps it as
+//! - `migrator`: [`crate::migrator::DbMigrator`] (the handover driver wraps it as
 //!   `StateDbMigrator`); [`ExpandOnlyDefault`] is the one that migrates nothing, for a test;
 //! - `recorder`: [`super::record::FileRecorder`] over the proxy's state directory;
 //! - `orders`: [`super::root_orders::SpoolRootOrders`] over the order spool the API writes
