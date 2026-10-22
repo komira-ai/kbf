@@ -1,5 +1,5 @@
 //! `proxy --kbf-binary`: the proxy's own copies of `kbf` in the verb. The config and the start
-//! with the flag; the same without it is in `proxy_verb_tests`, whose helpers these share.
+//! with the flag; the same without it is in the verb's own tests, whose helpers these share.
 
 use std::fs;
 
