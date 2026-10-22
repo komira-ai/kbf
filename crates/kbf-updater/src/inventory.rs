@@ -208,7 +208,21 @@ fn valid_alias(s: &str) -> bool {
         && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 
-fn valid_address(s: &str) -> bool {
+/// Whether `s` is a pinned host key as the inventory reads one: a supported type, one space,
+/// base64. For a host not made by the parser (a line break in a key would be a second
+/// `known_hosts` line).
+pub(crate) fn valid_host_key(s: &str) -> bool {
+    let Some((key_type, key)) = s.split_once(' ') else {
+        return false;
+    };
+    KEY_TYPES.contains(&key_type)
+        && !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+}
+
+pub(crate) fn valid_address(s: &str) -> bool {
     let (host, port) = match s.rsplit_once(':') {
         Some((h, p)) => (h, Some(p)),
         None => (s, None),

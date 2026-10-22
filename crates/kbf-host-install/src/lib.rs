@@ -41,6 +41,34 @@ mod trust;
 
 use std::process::ExitCode;
 
+/// What a client of the forced command may rely on: the answers it prints and the requests
+/// it accepts. The client (`kbf-updater`) dev-depends on this to test its reading of the
+/// answers against the real types; nothing here is for production code.
+pub mod contract {
+    pub use crate::outcome::{Failure, FailureCode, Outcome, QueryReport, Refusal};
+
+    /// The version and the channel of `command`, when it is an `install` request this
+    /// program accepts; `None` for anything it would refuse and for `query`.
+    #[must_use]
+    pub fn install_request(command: &str) -> Option<(String, String)> {
+        match crate::request::Request::parse(command) {
+            Ok(crate::request::Request::Install { version, channel }) => {
+                Some((version.as_str().to_owned(), channel.as_str().to_owned()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `command` is the `query` request.
+    #[must_use]
+    pub fn is_query(command: &str) -> bool {
+        matches!(
+            crate::request::Request::parse(command),
+            Ok(crate::request::Request::Query)
+        )
+    }
+}
+
 /// The program: handle `SSH_ORIGINAL_COMMAND` against the production paths and exit with
 /// the status of the answer.
 #[must_use]

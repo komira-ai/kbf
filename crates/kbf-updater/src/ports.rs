@@ -12,11 +12,66 @@ use serde::{Deserialize, Serialize};
 use crate::inventory::Host;
 use crate::version::Version;
 
+/// What kind of failure a [`PortError`] reports. Only the one distinction the roll acts on:
+/// a host that could not be reached at all is not a host that failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortErrorKind {
+    /// The port answered, or failed in a way that says nothing about reachability.
+    Other,
+    /// The host could not be reached: ssh could not connect, authenticate or verify the host
+    /// key. The roll treats it like a query that timed out, not like a failed install.
+    Unreachable,
+}
+
 /// A port could not be asked or did not answer: a refused connection, a timeout, a 5xx. One
 /// line, never raw ssh or apt output.
+///
+/// Built with [`PortError::other`] or [`PortError::unreachable`]; the function
+/// [`PortError`] (`PortError("text".into())`) is [`PortError::other`] under the name the
+/// former tuple struct had, so callers written for it keep compiling.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{0}")]
-pub struct PortError(pub String);
+#[error("{text}")]
+pub struct PortError {
+    kind: PortErrorKind,
+    text: String,
+}
+
+impl PortError {
+    /// An error that says nothing about reachability.
+    pub fn other(text: impl Into<String>) -> PortError {
+        PortError {
+            kind: PortErrorKind::Other,
+            text: text.into(),
+        }
+    }
+
+    /// The host could not be reached.
+    pub fn unreachable(text: impl Into<String>) -> PortError {
+        PortError {
+            kind: PortErrorKind::Unreachable,
+            text: text.into(),
+        }
+    }
+
+    pub fn kind(&self) -> PortErrorKind {
+        self.kind
+    }
+
+    /// Whether the host could not be reached at all.
+    pub fn is_unreachable(&self) -> bool {
+        self.kind == PortErrorKind::Unreachable
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+/// [`PortError::other`], spelled as the tuple struct this type used to be.
+#[allow(non_snake_case)]
+pub fn PortError(text: String) -> PortError {
+    PortError::other(text)
+}
 
 /// The answer of `GET /v1/members/{id}/safe-to-stop`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,5 +197,24 @@ mod tests {
             }
         );
         assert_eq!(PortError("down".into()).to_string(), "down");
+    }
+
+    /// Catches an unreachable error that is not told apart from any other (the roll would
+    /// treat a dead host as a failed install), a constructor that sets the wrong kind, and a
+    /// kind that is lost on clone or ignored by equality.
+    #[test]
+    fn unreachable_is_a_kind_of_its_own() {
+        let down = PortError::unreachable("unreachable: connect");
+        assert!(down.is_unreachable());
+        assert_eq!(down.kind(), PortErrorKind::Unreachable);
+        assert_eq!(down.text(), "unreachable: connect");
+        assert_eq!(down.to_string(), "unreachable: connect");
+        assert!(down.clone().is_unreachable());
+        for other in [PortError::other("x"), PortError("x".into())] {
+            assert!(!other.is_unreachable());
+            assert_eq!(other.kind(), PortErrorKind::Other);
+        }
+        assert_eq!(PortError("x".into()), PortError::other("x"));
+        assert_ne!(PortError::unreachable("x"), PortError::other("x"));
     }
 }

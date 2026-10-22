@@ -18,5 +18,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# The contract test feeds the real answer types of the forced command to the ssh installer.
+kbf-host-install = { path = "../kbf-host-install" }
+kbf-testkit.workspace = true
+
 [lints]
 workspace = true
