@@ -500,6 +500,7 @@ async fn a_storage_node_registers_by_its_ip_through_the_proxy() {
         catching_up: false,
         last_member_id: 0,
         last_boot: 0,
+        ..pb::RegisterRequest::default()
     };
     let member = first
         .register(by_ip("192.0.2.1:8983"))

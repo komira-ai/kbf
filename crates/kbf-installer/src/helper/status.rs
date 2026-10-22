@@ -50,7 +50,7 @@ struct File<'a> {
     /// floor of `seq`; left out when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
     available: Option<&'a Available>,
-    /// Releases a link names that carry no `VERIFIED` marker (adopted by `migrate`); left out
+    /// Releases a link names that carry no `VERIFIED` marker (placed by hand, not by an install); left out
     /// when there are none, so a status of a host that has none reads as it always did.
     #[serde(skip_serializing_if = "<[CommitId]>::is_empty")]
     unverified: &'a [CommitId],

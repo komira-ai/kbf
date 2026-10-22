@@ -1,7 +1,7 @@
 //! Rule 2 of `docs/design/storage-ram-ack.md`, on real caches: a durable record that names
-//! a blob is written only once the blob is on a disk (the index) of an owner. Nothing puts
-//! a blob in the Held set in a running node yet; every test puts one there through
-//! `Cache::hold_for_test`, and waits for the barrier to park through
+//! a blob is written only once the blob is on a disk (the index) of an owner. Every test
+//! here puts a blob in the Held set through `Cache::hold_for_test` (`ram_ack_ac.rs` runs
+//! the same barrier over the producer), and waits for the barrier to park through
 //! `Cache::parked_for_test` (a positive event), never by sleeping or polling. The time the
 //! barrier waits is the paused clock's.
 //!
@@ -104,9 +104,7 @@ fn absent() -> Digest {
 /// Catches a durable answer that waits for nothing, one that waits when nothing is held,
 /// and one that answers before the blob is in the index: nothing held answers at once
 /// without parking; a held blob parks the wait, and when the drain has put it in the index
-/// and dropped it the answer is "durable". Mutants: `durable_waiting` is `durable` (the
-/// held blob is reported missing without parking); the wait returns before the index has
-/// the blob.
+/// and dropped it the answer is "durable".
 #[tokio::test]
 async fn a_wait_for_a_held_blob_ends_when_it_is_in_the_index() {
     let cache = cache();
@@ -128,11 +126,10 @@ async fn a_wait_for_a_held_blob_ends_when_it_is_in_the_index() {
     assert_eq!(waiting.await.expect("joined").expect("answer"), []);
 }
 
-/// Catches a wait that ends for the wrong blob, or never ends: two blobs are held; the wait
-/// is for the first; the second leaving does not end it (it parks again), the first does.
-/// Then the other way round, on the paused clock: a wait for the first ends when the first
-/// leaves though the second is still held (well inside the bound). Mutants: the wait ends
-/// when any entry leaves; the wait ends only when the whole set is empty.
+/// Catches a wait that ends for the wrong blob, or never ends: two blobs are held; the
+/// wait is for the first; the second leaving does not end it (it parks again), the first
+/// does. Then the other way round, on the paused clock: a wait for the first ends when the
+/// first leaves though the second is still held (well inside the bound).
 #[tokio::test(start_paused = true)]
 async fn a_wait_ends_only_when_its_own_blobs_have_left() {
     let cache = cache();
@@ -175,8 +172,6 @@ async fn a_wait_ends_only_when_its_own_blobs_have_left() {
 /// Catches a wait with no bound or the wrong one: a blob that never leaves is reported
 /// missing when `--durable-wait` (here 7 s, not the 10 s default) has passed on the paused
 /// clock, and not before; the answer then comes at once, without more time passing.
-/// Mutants: the bound ignored (the default is used: the wait is still parked at 7 s and
-/// the check below times out); no bound (it never ends).
 #[tokio::test(start_paused = true)]
 async fn a_blob_still_held_when_the_wait_ends_is_reported_missing() {
     let cache = cache();
@@ -219,8 +214,7 @@ fn result_of(blob: &Blob) -> ActionResult {
 /// Catches an action-cache write on the action's owner that does not wait for a blob the
 /// node holds only in RAM (barrier b: the log checks the index, so it would refuse a blob
 /// that is on its way): `prepare_action_result` parks until the drain, then returns a
-/// record naming the blob, and does not refuse. Mutant: `prepare_action_result` does not
-/// wait (it refuses `Absent` without parking).
+/// record naming the blob, and does not refuse.
 #[tokio::test]
 async fn preparing_an_entry_waits_for_a_closure_blob_held_in_ram() {
     let cache = cache();
@@ -241,11 +235,11 @@ async fn preparing_an_entry_waits_for_a_closure_blob_held_in_ram() {
     assert!(record.closure.iter().any(|d| *d == output.digest()));
 }
 
-/// Catches the commit of an entry on the action's owner not waiting, and a refusal that
-/// is not the node's own after the bound: the blob is held in RAM and in the index of
-/// another cache only; `commit_action_record` parks; when the drain has run the entry
-/// commits; where nothing drains, it is refused `Absent` when `--durable-wait` has passed
-/// (the unchanged check). Mutant: `commit_action_record` does not wait.
+/// Catches the commit of an entry on the action's owner not waiting, and a refusal that is
+/// not the node's own after the bound: the blob is held in RAM and in the index of another
+/// cache only; `commit_action_record` parks; when the drain has run the entry commits;
+/// where nothing drains, it is refused `Absent` when `--durable-wait` has passed (the
+/// unchanged check).
 #[tokio::test(start_paused = true)]
 async fn committing_an_entry_waits_for_its_blobs_to_be_written() {
     let cache = cache();
@@ -451,13 +445,11 @@ impl Farm {
 
 type CommitTask = tokio::task::JoinHandle<Result<(), StorageError>>;
 
-/// Catches barrier (a) missing, or not waiting (T3's positive twin): the output of an entry
-/// is held in RAM on its primary and nowhere else on a disk. The commit parks at the
+/// Catches barrier (a) missing, or not waiting (T3's positive twin): the output of an
+/// entry is held in RAM on its primary and nowhere else on a disk. The commit parks at the
 /// primary (the copy of the output to the action's owner went through: it is a durable
 /// non-owner copy, which is not enough), no entry exists while it is parked, and when the
-/// primary has written the blob the commit completes and the entry is found. Mutants:
-/// barrier (a) deleted (the commit finishes while the blob is only in RAM); the barrier
-/// asks without waiting (it is refused at once).
+/// primary has written the blob the commit completes and the entry is found.
 #[tokio::test]
 async fn an_entry_commits_only_after_its_blob_is_on_an_owners_disk() {
     let farm = farm();
@@ -498,8 +490,7 @@ async fn an_entry_commits_only_after_its_blob_is_on_an_owners_disk() {
 
 /// Catches an entry committed over a blob that never reaches a disk (T3: the owners lose
 /// their RAM): after the bound the commit is UNAVAILABLE (not `Ok`, not `Absent`: an owner
-/// holds the blob, and the caller can try again) and no entry exists. Mutant: the barrier
-/// deleted; the failure reported as `Absent`.
+/// holds the blob, and the caller can try again) and no entry exists.
 #[tokio::test(start_paused = true)]
 async fn an_entry_over_a_blob_that_stays_in_ram_is_refused_unavailable() {
     let farm = farm();
@@ -529,7 +520,7 @@ async fn an_entry_over_a_blob_that_stays_in_ram_is_refused_unavailable() {
 
 /// Catches a barrier that counts the action's owner's copy: the output is on the disk of
 /// member 3 only, which does not own it (a copy no reader asks for). The commit is refused
-/// `Absent` naming it, and no entry exists. Mutant: barrier (a) deleted.
+/// `Absent` naming it, and no entry exists.
 #[tokio::test]
 async fn a_copy_only_on_the_actions_owner_is_not_enough() {
     let farm = farm();
@@ -555,7 +546,7 @@ async fn a_copy_only_on_the_actions_owner_is_not_enough() {
 /// output is on the disk of the non-owner action node and held in RAM by its primary. The
 /// read is a miss, never a hit, and nothing about the held blob is remembered: once the
 /// primary has the blob in its index the same entry is a hit with no wait for a time to
-/// live. Mutant: the closure check asks `find_missing` (the first read is a hit).
+/// live.
 #[tokio::test]
 async fn a_closure_blob_held_in_ram_makes_the_entry_a_miss() {
     let farm = farm();
@@ -592,11 +583,10 @@ async fn a_closure_blob_held_in_ram_makes_the_entry_a_miss() {
     );
 }
 
-/// Catches a closure check that keeps nothing alive (mutant: the check does not touch what
-/// it finds durable, or does not ask): an entry's output is on its owner's disk, two days
-/// old, and a hit of the entry through the router asks that owner about it. The owner owes
-/// the blob a touch afterwards, so a hit of an entry nobody downloads from still refreshes
-/// its closure.
+/// Catches a closure check that keeps nothing alive: an entry's output is on its owner's
+/// disk, two days old, and a hit of the entry through the router asks that owner about it.
+/// The owner owes the blob a touch afterwards, so a hit of an entry nobody downloads from
+/// still refreshes its closure.
 #[tokio::test]
 async fn a_hit_touches_the_closure_blobs_on_their_owner() {
     let farm = touching_farm();
@@ -665,8 +655,7 @@ fn remote(cache: &Arc<MemCache>) -> RemoteStorage {
 
 /// Catches `kbf-durable: wait` not reaching the cache's wait: over the wire the node parks
 /// for a held blob and answers from the index once the drain has run; the `only` question
-/// asked beside it answers at once, naming the blob missing. Mutant: `CacheStorage` does not
-/// override `find_durable_waiting` (the default answers without waiting).
+/// asked beside it answers at once, naming the blob missing.
 #[tokio::test]
 async fn the_wait_header_makes_a_node_wait_for_its_held_blobs() {
     let cache = cache();

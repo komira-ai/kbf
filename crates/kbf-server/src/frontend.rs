@@ -93,7 +93,7 @@ use kbf_front::{
 };
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
 use kbf_proto::worker::worker_server::WorkerServer;
-use kbf_route::TlsNodes;
+use kbf_route::{DEFAULT_HOLD, Hold, TlsNodes};
 use kbf_storage::Storage;
 use kbf_storage::service::RemoteStorage;
 use kbf_threads::Topology;
@@ -155,6 +155,7 @@ pub const ALLOWED: &[&str] = &[
     "unservable_wait_secs",
     "default_platform",
     "memory_ladder_gib",
+    "learned_sizes",
     "finished_retention_secs",
     "shutdown_timeout_secs",
     "invocation_memory",
@@ -533,6 +534,13 @@ fn transport(url: &Endpoint, tls: bool) -> Result<(), String> {
 }
 
 impl FrontendFlags {
+    /// What a handover compares of the enroll flags ([`EnrollFlags::handover_key`]); `None`
+    /// without `--enroll-listen`.
+    fn enroll_key(&self) -> Option<String> {
+        let instance = self.handover.as_ref().and_then(|h| h.instance);
+        self.enroll.as_ref().map(|e| e.handover_key(instance))
+    }
+
     /// The CA and the client identity the TLS flags name, or `None` without them.
     ///
     /// # Errors
@@ -574,7 +582,9 @@ impl FrontendFlags {
 /// without the TLS flags, which every connection to a member needs: a member is dialled
 /// at `https://` and verified against its own address. With a state store but no TLS flags
 /// the start logs a warning that says so, since the farm may have members the daemons
-/// place blobs on that this frontend will not look at. Not generic, for the same reason
+/// place blobs on that this frontend will not look at. A call no member could answer is
+/// held for [`DEFAULT_HOLD`] before it fails (there is no flag for the bound yet; the raw
+/// ByteStream calls have the same bound, `proxy_owners`). Not generic, for the same reason
 /// as [`crate::serve::sweeping`].
 ///
 /// # Errors
@@ -597,8 +607,21 @@ fn routed_of(
     };
     let maps = Arc::new(FrontMaps::new(Arc::clone(members)));
     Ok(Some(Arc::new(
-        Routed::over_tls(maps, Arc::new(TlsNodes::new(ca, identity))).bootstrapped(storage.clone()),
+        Routed::over_tls(maps, Arc::new(TlsNodes::new(ca, identity)))
+            .with_hold(DEFAULT_HOLD)
+            .bootstrapped(storage.clone()),
     )))
+}
+
+/// The nodes the proxy calls: routed by the map when there is one, else the `--storage`
+/// node `bootstrap`. The raw ByteStream calls that no node of their blob can answer are held
+/// for [`DEFAULT_HOLD`], as `routed_of` holds the router's calls.
+fn proxy_owners(routed: Option<Arc<Routed>>, bootstrap: Owner) -> Owners {
+    let owners = match routed {
+        Some(routed) => Owners::routed(routed, bootstrap),
+        None => Owners::single(bootstrap),
+    };
+    owners.with_hold(Hold::new(DEFAULT_HOLD))
 }
 
 /// A started frontend: bound, not yet serving.
@@ -932,6 +955,7 @@ impl<'a> Prepared<'a> {
         ) -> Result<Bound, ServeError>,
     ) -> Result<Self, Box<dyn Error>> {
         let args = &flags.server;
+        args.release_poll.warn();
         let listeners = args.listeners()?;
         let proxy = args.proxy()?;
         let policy = args.reapi_auth_policy()?;
@@ -963,6 +987,7 @@ impl<'a> Prepared<'a> {
             instance: self.flags.handover.as_ref().and_then(|h| h.instance),
             reapi: self.sockets.reapi.local,
             state: state_uri(self.flags)?.identity(),
+            enroll: self.flags.enroll_key(),
         })
     }
 
@@ -1029,6 +1054,7 @@ impl<'a> Prepared<'a> {
             listeners.finished_retention,
         )
         .with_memory_ladder(listeners.memory_ladder.clone())
+        .with_learned_sizes(listeners.learned_sizes, listeners.memory_ladder.first())
         .recording(recorder.clone());
         let farm = Arc::new(farm.with_state(state)?);
         log_state(durable, farm.term(), farm.lease_epoch());
@@ -1065,10 +1091,7 @@ impl<'a> Prepared<'a> {
         let (worker_incoming, worker_latch) = worker.grpc(worker_tls)?;
         worker_stop.closes(worker_latch);
         let api_listener = api_socket.map(Socket::http).transpose()?;
-        let (token, releases, poll) = api.map_or((None, None, None), |api| {
-            (api.token, api.releases, api.poll)
-        });
-        let poll_stats = poll.as_ref().map(|_| Arc::default());
+        let (token, releases) = api.map_or((None, None), |api| (api.token, api.releases));
         // The enroll listener (which is closed the moment the drain begins, like the
         // others) and the operator API's enrollment routes, which need the CA's pin: both
         // are off without `--enroll-listen`, and the routes then answer 404.
@@ -1137,7 +1160,6 @@ impl<'a> Prepared<'a> {
         .merge(metrics_route(
             backend.clone(),
             history.as_ref().map(crate::history::History::stats),
-            poll_stats.clone(),
             members.clone(),
             tls_sources,
         ));
@@ -1172,11 +1194,7 @@ impl<'a> Prepared<'a> {
         let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
         let authorizers = Arc::new(policy.authorizers);
         let bootstrap = Owner::new(&flags.storage.uri().to_string(), channel);
-        let owners = match routed {
-            Some(routed) => Owners::routed(routed, bootstrap),
-            None => Owners::single(bootstrap),
-        };
-        let proxy = Proxy::new(owners, Arc::clone(&authorizers));
+        let proxy = Proxy::new(proxy_owners(routed, bootstrap), Arc::clone(&authorizers));
         let streams = kbf_front::OpenStreams { closing, progress };
         // With a handover configured, Execute and WaitExecution are forwarded to the
         // successor once this frontend has handed its roles over.
@@ -1250,6 +1268,7 @@ impl<'a> Prepared<'a> {
                         .state_store
                         .as_ref()
                         .map_or_else(PathBuf::new, crate::StateStoreUri::identity),
+                    enroll: flags.enroll_key(),
                 };
                 let peer = Peer {
                     successor,
@@ -1275,16 +1294,6 @@ impl<'a> Prepared<'a> {
             let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
             // The rolling-update controller; it starts hosts for the desired release unless the
             // operator wrote `auto_nodes` false or paused it.
-            let _poller = poll_stats
-                .and_then(|stats| {
-                    crate::release::poll::spawn(
-                        Arc::clone(&farm),
-                        update_store.clone(),
-                        poll,
-                        stats,
-                    )
-                })
-                .map(AbortOnDrop);
             let _updates = crate::update::spawn_controller(
                 Arc::clone(&farm),
                 update_store,
@@ -1469,21 +1478,17 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
 fn metrics_route(
     backend: Backend,
     history: Option<Arc<crate::history::Stats>>,
-    poll: Option<Arc<crate::release::poll::Stats>>,
     members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
 ) -> axum::Router {
     let tls = Arc::new(tls);
     let render = move || {
         let (backend, members, tls) = (backend.clone(), members.clone(), Arc::clone(&tls));
-        let (history, poll) = (history.clone(), poll.clone());
+        let history = history.clone();
         async move {
             let mut text = backend.render_metrics();
             if let Some(history) = history {
                 history.render(&mut text);
-            }
-            if let Some(poll) = poll {
-                poll.render(&mut text);
             }
             crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);

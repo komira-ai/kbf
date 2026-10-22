@@ -267,6 +267,7 @@ const GROUPS: &[(&str, &[&str])] = &[
     (
         "memory",
         &[
+            "learned-sizes",
             "memory-headroom-mib",
             "memory-ladder-gib",
             "memory-limit-percent",

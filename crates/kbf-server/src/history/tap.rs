@@ -9,12 +9,13 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use kbf_front::Tap;
 use kbf_history::records::{
-    Cgroup, HitHow, HitRecord, MemoryKill, Output, RunOutcome, RunRecord, Timestamps, WireDigest,
+    BookSource, Cgroup, Footprint, HitHow, HitRecord, MemoryKill, Output, RunOutcome, RunRecord,
+    Timestamps, UsageBasis, WireDigest,
 };
 use kbf_history::{Event, EventQueue, InvRef, Minter};
 use kbf_invocation::{
     ActionRow, Attempt, AttemptEnd, Ended, EndedKind, How, MemoryKillKind, NumaBytes, Outcome,
-    RecordKey, TargetKind, WallTime,
+    RecordKey, TargetKind, UsageBasis as InvBasis, WallTime,
 };
 use kbf_sched::RequeueReason;
 use kbf_types::{Digest, Failure};
@@ -270,6 +271,7 @@ fn hit_record(row: &ActionRow, at: WallTime) -> HitRecord {
 /// presubmit time.
 pub(crate) fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
     let run = attempt.run.as_deref();
+    let usage = run.and_then(|r| r.usage.as_ref());
     let (outcome, exit_code) = outcome_of(row, attempt);
     let kill = attempt.memory_kill().unwrap_or(MemoryKillKind::None);
     let memory_kill = match kill {
@@ -345,17 +347,47 @@ pub(crate) fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
             output_upload_completed_us: micros(times.output_upload_completed),
             worker_completed_us: micros(times.worker_completed),
         }),
-        cgroup: run.and_then(|r| r.usage.as_ref()).map(|u| Cgroup {
-            cpu_usage_us: u.cpu_usage_micros.unwrap_or(0),
-            cpu_user_us: u.cpu_user_micros.unwrap_or(0),
-            cpu_system_us: u.cpu_system_micros.unwrap_or(0),
-            periods: u.cpu_periods.unwrap_or(0),
-            throttled_periods: u.cpu_throttled_periods.unwrap_or(0),
-            throttled_us: u.cpu_throttled_micros.unwrap_or(0),
-            memory_peak_bytes: u.memory_peak_bytes.unwrap_or(0),
-            numa_bytes: numa(&u.numa),
-            wall_us: u.wall_micros,
-        }),
+        cgroup: usage
+            .filter(|u| u.basis != InvBasis::MacFootprint)
+            .map(|u| Cgroup {
+                cpu_usage_us: u.cpu_usage_micros.unwrap_or(0),
+                cpu_user_us: u.cpu_user_micros.unwrap_or(0),
+                cpu_system_us: u.cpu_system_micros.unwrap_or(0),
+                periods: u.cpu_periods.unwrap_or(0),
+                throttled_periods: u.cpu_throttled_periods.unwrap_or(0),
+                throttled_us: u.cpu_throttled_micros.unwrap_or(0),
+                // Absent stays absent: a kernel without `memory.peak` has no sample.
+                memory_peak_bytes: u.memory_peak_bytes,
+                numa_bytes: numa(&u.numa),
+                wall_us: (u.wall_micros > 0).then_some(u.wall_micros),
+                memory_events_max: u.memory_events_max,
+                memory_events_oom_kill: u.memory_events_oom_kill,
+                memory_swap_peak_bytes: u.memory_swap_peak_bytes,
+                memory_anon_swap_peak_bytes: u.memory_anon_swap_peak_bytes,
+                cpu_pressure_some_us: u.cpu_pressure_some_micros,
+                memory_pressure_some_us: u.memory_pressure_some_micros,
+                memory_pressure_full_us: u.memory_pressure_full_micros,
+                cpus_effective: u.cpus_effective,
+            }),
+        basis: usage
+            .map_or(UsageBasis::Unspecified, |u| match u.basis {
+                InvBasis::Unspecified => UsageBasis::Unspecified,
+                InvBasis::Cgroup => UsageBasis::Cgroup,
+                InvBasis::MacFootprint => UsageBasis::MacFootprint,
+            })
+            .into(),
+        footprint: usage
+            .filter(|u| u.basis == InvBasis::MacFootprint)
+            .and_then(|u| u.footprint.map(|f| (u.wall_micros, f)))
+            .map(|(wall, f)| Footprint {
+                peak_footprint_bytes: f.peak_footprint_bytes,
+                cpu_user_us: f.cpu_user_micros,
+                cpu_system_us: f.cpu_system_micros,
+                // The run's wall time stands in for one the block left out.
+                wall_us: f.wall_micros.or((wall > 0).then_some(wall)),
+            }),
+        node_cpu_pressure_centi: usage.and_then(|u| u.node_cpu_pressure_centi),
+        booked_millicpus: usage.and_then(|u| u.booked_millicpus),
         outputs: listing.map_or_else(Vec::new, |l| {
             l.outputs
                 .iter()
@@ -373,7 +405,22 @@ pub(crate) fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
         } else {
             0
         },
+        operation_id: row.operation_id.map(|o| o.0),
+        cpu_source: book_source(row.evidence.map(|e| e.cpu_source)).into(),
+        memory_source: book_source(row.evidence.map(|e| e.memory_source)).into(),
+        input_bytes: row.evidence.and_then(|e| e.input_bytes),
+        input_files: row.evidence.and_then(|e| e.input_files),
         ..RunRecord::default()
+    }
+}
+
+/// What a run record says of an axis' booking source: `Unspecified` when the row was
+/// never told (no evidence), so that a default is not claimed for a call nobody asked.
+fn book_source(source: Option<kbf_invocation::BookSource>) -> BookSource {
+    match source {
+        None => BookSource::Unspecified,
+        Some(kbf_invocation::BookSource::Default) => BookSource::Default,
+        Some(kbf_invocation::BookSource::Hint) => BookSource::Hint,
     }
 }
 

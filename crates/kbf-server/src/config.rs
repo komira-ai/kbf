@@ -89,7 +89,7 @@ pub struct Args {
     /// (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) is streamed to the cold store as it
     /// arrives (a ByteStream Write, or the in-process plane's own stream), never held
     /// whole and never refused for its size. The first start with a hot store raises
-    /// the metadata log to machine version 2, once; a binary that runs only version 1 no longer reads it.
+    /// the metadata log to machine version 5, once; a binary that runs only an earlier version no longer reads it.
     /// The metadata log lives in `<dir>/meta`, unless `--meta-dir` says otherwise.
     #[arg(long, value_name = "URI")]
     pub hot_store: Option<StoreUri>,
@@ -311,6 +311,14 @@ pub struct Args {
         default_values_t = kbf_sched::MemoryLadder::DEFAULT_GIB
     )]
     pub memory_ladder_gib: Vec<u64>,
+    /// What the farm does with `kbf-estimator`, which predicts an action's memory from
+    /// what its earlier runs used. `off` calls it never. `shadow` shows it every attempt
+    /// that finishes and logs, for every new operation, a `size estimate:` line with what
+    /// it would book, and counts how the attempts fall against its estimates
+    /// (`kbf_estimator_shadow_total`); it books exactly what `off` books. The size
+    /// summaries are kept in the state store; `off` neither reads nor deletes them.
+    #[arg(long, value_enum, default_value_t = crate::LearnedSizes::Off)]
+    pub learned_sizes: crate::LearnedSizes,
     /// How long, in seconds, a finished operation is kept after its callers are
     /// answered. Within it, WaitExecution on the operation's name streams its result
     /// (a client whose Execute stream broke gets a result the action cache does not
@@ -468,8 +476,8 @@ pub struct Args {
     /// How long, in seconds, after its own write of a blob it acknowledged from RAM a
     /// storage node waits before it asks the blob's other owner whether the blob is on its
     /// disk too, and journals a repair debt if it is not. Long enough that the usual answer
-    /// is yes and nothing is journalled. Nothing acknowledges from RAM yet, so no node
-    /// asks. At least 1.
+    /// is yes and nothing is journalled. Only a node that acknowledges from RAM
+    /// (`--ram-ack-bytes`) asks. At least 1.
     #[arg(
         long,
         default_value_t = kbf_storage::repair::RepairConfig::default().peer_grace.as_secs(),
@@ -478,19 +486,23 @@ pub struct Args {
     pub ram_peer_grace: u64,
     /// How many bytes of blobs a storage node may hold in RAM, acknowledged to the writer
     /// and not yet written to its disk. 0, the default, is off: a write is acknowledged
-    /// from disk, as before. Nothing acknowledges from RAM yet, so with any value no blob
-    /// is held and the node behaves as with 0. A blob that finds the budget full is
-    /// written through to the disk before it is acknowledged, never waited for. A node
-    /// that does hold blobs counts them in `kbf_storage_ram_unwritten_bytes`, writes them
+    /// from disk, as before. Over 0, a blob of at most 4 MiB written to two owners is
+    /// acknowledged once both hold it verified in RAM, and written to each disk
+    /// afterwards: losing both owners' RAM before then loses the blob. A blob that finds
+    /// the budget full is written through to the disk before it is acknowledged, never
+    /// waited for. Set it on every storage node or none. A node that does hold blobs
+    /// counts them in `kbf_storage_ram_unwritten_bytes`, writes them
     /// to its disk in the background and, when it stops, within `--ram-drain-deadline`. A
     /// node can hold this many bytes beside the `--write-bytes-in-flight` it receives.
     /// Storage nodes only: a server with no replica to hold a second copy holds nothing.
     #[arg(long, default_value_t = 0)]
     pub ram_ack_bytes: u64,
-    /// How long, in seconds, a storage node that is stopping waits for the blobs it holds
-    /// in RAM to be written to its disk (`--ram-ack-bytes`), after its calls have ended.
-    /// The blobs left when it ends are lost to the stop and are counted in the log. At
-    /// least 1.
+    /// How long, in seconds, a storage node that is stopping waits, after its calls have
+    /// ended, for the blobs it holds in RAM to be written to its disk (`--ram-ack-bytes`)
+    /// and then for the blocks staged on its hot store to be flushed to the cold store: one
+    /// bound for both. The blobs left in RAM when it ends are lost to the stop; the blocks
+    /// left on the hot store are on its disk, flushed by the next start. Both are counted
+    /// in the log. At least 1.
     #[arg(
         long,
         default_value_t = 30,
@@ -555,10 +567,9 @@ pub struct Args {
     /// Build history: `--history-objects` and `--history-index-root`.
     #[command(flatten)]
     pub history: crate::history::HistoryFlags,
-    /// The release poller: `--release-poll-every-secs`, `--release-poll-repo` and
-    /// `--release-poll-refs`.
+    /// The retired release poller's flags: accepted, hidden, ignored.
     #[command(flatten)]
-    pub release_poll: crate::release::poll::PollFlags,
+    pub release_poll: crate::retired::RetiredPollFlags,
     /// Serves the web UI on the operator API (`--api-listen`): read-only pages under `/ui`
     /// (`docs/design/kbf-ui-v1.md`). On by default; `--ui=false` turns it off, and `/ui` is
     /// then a `404`. The UI is open: it asks for no login or certificate, and it shows
@@ -796,6 +807,7 @@ impl Args {
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
             default_platform: self.default_platform,
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
+            learned_sizes: self.learned_sizes,
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: match self.shutdown_timeout_secs {
                 0 => Duration::MAX,
@@ -933,7 +945,6 @@ impl Args {
             token,
             local_cache,
             releases,
-            poll: self.release_poll.config(),
         }))
     }
 
@@ -988,8 +999,8 @@ impl Args {
         self.ram_ack_bytes
     }
 
-    /// How long a stopping node waits to write what it holds in RAM:
-    /// `--ram-drain-deadline`.
+    /// How long a stopping node waits to write what it holds in RAM and to flush what is
+    /// staged on its hot store: `--ram-drain-deadline`.
     #[must_use]
     pub const fn ram_drain_deadline(&self) -> Duration {
         Duration::from_secs(self.ram_drain_deadline)

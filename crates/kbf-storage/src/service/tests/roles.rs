@@ -550,9 +550,6 @@ async fn the_role_is_read_from_the_leaf_certificate_alone() {
 /// `Commit` are refused PERMISSION_DENIED and the store holds no entry afterwards; a
 /// frontend's `Prepare` and the same `Commit` are accepted and leave the entry; a daemon
 /// still reads blobs.
-///
-/// Mutant seen red: `Daemon` re-added to the roles of `ActionPrepare` and `ActionCommit`
-/// in `Endpoint::allowed`.
 #[tokio::test]
 async fn a_daemon_certificate_is_not_admitted_to_action_commit() {
     use kbf_proto::storage::Record;

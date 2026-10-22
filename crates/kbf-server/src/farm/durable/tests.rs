@@ -29,6 +29,17 @@ struct Flaky {
     /// Applied just before the next read of an `op/` row: a write landing between two
     /// reads of one look.
     before_op_read: std::sync::Mutex<Option<Txn>>,
+    /// Every transaction that writes an `est/` row is refused (not as an outage).
+    refuse_est: AtomicBool,
+    /// The next this many transactions that write an `est/` row are refused.
+    refuse_est_first: std::sync::atomic::AtomicU32,
+    /// Transactions that write an `est/` row are refused as the work of a superseded writer.
+    fence_est: AtomicBool,
+    /// Transactions that write an `est/` row, refused or not.
+    est_writes: std::sync::atomic::AtomicU32,
+    /// Scans of the `est/` prefix, and whether they fail.
+    est_scans: std::sync::atomic::AtomicU32,
+    fail_est_scan: AtomicBool,
 }
 
 impl Flaky {
@@ -39,6 +50,12 @@ impl Flaky {
             down: AtomicBool::new(false),
             touch_lease: AtomicBool::new(false),
             before_op_read: std::sync::Mutex::new(None),
+            refuse_est: AtomicBool::new(false),
+            refuse_est_first: std::sync::atomic::AtomicU32::new(0),
+            fence_est: AtomicBool::new(false),
+            est_writes: std::sync::atomic::AtomicU32::new(0),
+            est_scans: std::sync::atomic::AtomicU32::new(0),
+            fail_est_scan: AtomicBool::new(false),
         })
     }
 
@@ -51,6 +68,24 @@ impl Store for Flaky {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
         if self.down.load(Ordering::SeqCst) {
             return Err(StoreError::Failed("the store is down".to_owned()));
+        }
+        let writes_est = batch.iter().flat_map(Txn::ops).any(|op| {
+            op.key_cond()
+                .is_some_and(|(key, _)| key.starts_with("est/"))
+        });
+        if writes_est {
+            self.est_writes.fetch_add(1, Ordering::SeqCst);
+            if self.fence_est.load(Ordering::SeqCst) {
+                return Err(StoreError::Fenced);
+            }
+            let first = self.refuse_est_first.load(Ordering::SeqCst);
+            if first > 0 {
+                self.refuse_est_first.store(first - 1, Ordering::SeqCst);
+                return Err(StoreError::Failed("est rows refused".to_owned()));
+            }
+            if self.refuse_est.load(Ordering::SeqCst) {
+                return Err(StoreError::Failed("est rows refused".to_owned()));
+            }
         }
         self.inner.apply_batch(batch)
     }
@@ -74,6 +109,12 @@ impl Store for Flaky {
     }
 
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
+        if prefix == "est/" {
+            self.est_scans.fetch_add(1, Ordering::SeqCst);
+            if self.fail_est_scan.load(Ordering::SeqCst) {
+                return Err(StoreError::Failed("est scan refused".to_owned()));
+            }
+        }
         self.inner.scan_prefix(prefix)
     }
 
@@ -1573,4 +1614,611 @@ fn a_fate_that_cannot_be_written_or_read_is_refused() {
     put(&store, "fate/0000000000000004", vec![3]);
     let error = durable.load().expect_err("a fate of another version");
     assert!(error.to_string().contains("not a version 1 or 2 fate"));
+}
+
+fn size_key(instance: &str, cfg: Option<u64>) -> kbf_estimator::Key {
+    use kbf_estimator::{Basis, Cfg, Instance, Key, PlatformClass, Shape};
+    Key::new(
+        Instance::new(instance),
+        PlatformClass::new("linux/x86_64"),
+        Basis::Cgroup,
+        Shape(0x0123_4567_89ab_cdef),
+        cfg.map(Cfg),
+    )
+}
+
+/// A summary of `key` that has seen one quiet run on `day`, as the stored bytes.
+fn size_row(key: &kbf_estimator::Key, day: u32) -> Vec<u8> {
+    use kbf_estimator::{Bounds, Day, Outcome as RunOutcome, Run, Summaries};
+    let mut summaries = Summaries::default();
+    let run = Run {
+        outcome: RunOutcome::Success,
+        wall_us: 2_000_000,
+        peak_memory_bytes: Some(1 << 28),
+        booked_memory_bytes: 4 << 30,
+        raised_memory_bytes: None,
+        limit_hits: 0,
+        swap_peak_bytes: 0,
+        cpu_usage_us: 0,
+        node_cpu_pressure_permille: None,
+    };
+    summaries.observe(key, &run, Day(day), &Bounds::default());
+    summaries.get(key).expect("a summary").encode()
+}
+
+/// Catches: a row key that two keys share (one summary would overwrite another's), one
+/// that cannot be read back (an instance with a `/` or a space, a configuration or none, a
+/// Mac key), a key spelled another way (upper-case digits) read as if it were the first,
+/// a row of another version or with a part too many or too few guessed at, and a value
+/// that is not a row at all.
+#[test]
+fn a_size_row_names_its_key_and_nothing_else_reads_as_one() {
+    use kbf_estimator::{Basis, Instance, Key, PlatformClass, Shape};
+    let keys = [
+        size_key("main", None),
+        size_key("main", Some(0)),
+        size_key("a/b c", Some(u64::MAX)),
+        size_key("", None),
+        Key::new(
+            Instance::new("main"),
+            PlatformClass::new("macos"),
+            Basis::MacFootprint,
+            Shape(1),
+            None,
+        ),
+    ];
+    let names: std::collections::BTreeSet<String> = keys.iter().map(estimate::row_key).collect();
+    assert_eq!(names.len(), keys.len());
+    for key in &keys {
+        let name = estimate::row_key(key);
+        let value = estimate::encode(&[9, 8, 7]);
+        assert_eq!(
+            estimate::decode(&name, &value),
+            Some((key.clone(), vec![9, 8, 7]))
+        );
+    }
+    let name = estimate::row_key(&keys[0]);
+    let value = estimate::encode(&[1]);
+    let mut other_version = value.clone();
+    other_version[0] = 2;
+    assert_eq!(estimate::decode(&name, &other_version), None);
+    assert_eq!(estimate::decode(&name, &[]), None);
+    assert_eq!(estimate::decode(&format!("{name}/x"), &value), None);
+    assert_eq!(
+        estimate::decode(&name.replacen("/c/", "/z/", 1), &value),
+        None
+    );
+    // The same key spelled with an upper-case digit is not the key `row_key` writes.
+    assert_eq!(
+        estimate::decode("est/6D/6c/c/0000000000000001/-", &value),
+        None
+    );
+    assert_eq!(estimate::decode("floor/aa/bb/c/00/-", &value), None);
+    assert_eq!(
+        estimate::decode("est/zz/bb/c/0000000000000001/-", &value),
+        None
+    );
+    assert_eq!(
+        estimate::decode("est/6d/6c/c/0000000000000001/-", &value).map(|r| r.0.shape()),
+        Some(Shape(1))
+    );
+    assert_eq!(
+        estimate::decode("est/6/6c/c/0000000000000001/-", &value),
+        None
+    );
+    assert_eq!(
+        estimate::decode("est/ff/6c/c/0000000000000001/-", &value),
+        None
+    );
+    assert_eq!(estimate::decode("est/6d/6c/c/xyz/-", &value), None);
+    assert_eq!(
+        estimate::decode("est/6d/6c/c/0000000000000001/xyz", &value),
+        None
+    );
+}
+
+/// A shadow farm over `store` with a kill of operation 4 booked at 4 GiB staged, its rows
+/// and lease written, ready for `settle_requeues` of `killed(4, 0)`.
+fn farm_with_a_kill(store: &Arc<Flaky>) -> (Farm, kbf_estimator::Key) {
+    let farm = farm_over(store, crate::LearnedSizes::Shadow);
+    let key = size_key("main", None);
+    {
+        let state = farm.lock();
+        let durable = state.durable.as_ref().expect("a store");
+        durable
+            .submitted(OperationId(4), &request(1), &a_subject())
+            .expect("submit");
+        durable
+            .persist(&[Effect::Start(start(4, 0))], None)
+            .expect("grant");
+    }
+    let mut state = farm.lock();
+    state.learned.on_start(&start(4, 0));
+    let mut run = kbf_estimator::Run {
+        outcome: kbf_estimator::Outcome::OwnLimitKill,
+        wall_us: 0,
+        peak_memory_bytes: None,
+        booked_memory_bytes: 4 << 30,
+        raised_memory_bytes: None,
+        limit_hits: 0,
+        swap_peak_bytes: 0,
+        cpu_usage_us: 0,
+        node_cpu_pressure_permille: None,
+    };
+    run.peak_memory_bytes = Some(5 << 30);
+    state.learned.stage(
+        LeaseId::new(5, 0),
+        Some(crate::learned::Attempt {
+            key: key.clone(),
+            run,
+        }),
+    );
+    drop(state);
+    (farm, key)
+}
+
+/// Catches: a kill's summaries missing from the store once its requeue is settled, and
+/// a floor below the booking the retry runs at.
+#[test]
+fn a_kills_summary_is_written_right_after_its_requeue() {
+    let store = Flaky::new();
+    let (farm, key) = farm_with_a_kill(&store);
+    farm.lock().settle_requeues(&[killed(4, 0)]);
+    assert!(keys(&store).contains(&"queue/0000000000000004".to_owned()));
+    let held = open(&store).estimates().expect("read");
+    let (_, row) = held
+        .iter()
+        .find(|(k, _)| *k == key)
+        .expect("the kill's summary");
+    let mut summaries = kbf_estimator::Summaries::default();
+    summaries.insert_encoded(&key, row).expect("decodes");
+    let floor = summaries.key_floor(&key, &kbf_estimator::Bounds::default());
+    assert!(floor >= 16 << 30, "floor {floor}");
+}
+
+/// Catches: a store that refuses the size rows holding back the requeue (the queue row
+/// must land, and nothing is kept to retry), the refusal marking the whole store
+/// unreachable (a shadow write must not change what the farm does), and the refused
+/// summary lost instead of written again from the write-behind.
+#[test]
+fn a_store_that_refuses_the_size_rows_still_settles_the_requeue() {
+    let store = Flaky::new();
+    let (farm, key) = farm_with_a_kill(&store);
+    store.refuse_est.store(true, Ordering::SeqCst);
+    farm.lock().settle_requeues(&[killed(4, 0)]);
+    assert!(keys(&store).contains(&"queue/0000000000000004".to_owned()));
+    assert!(farm.lock().unsettled.is_empty());
+    assert!(
+        !farm
+            .lock()
+            .durable
+            .as_ref()
+            .expect("a store")
+            .unreachable
+            .load(Ordering::SeqCst)
+    );
+    assert!(store.scan_prefix("est/").expect("scan").is_empty());
+    // The key is dirty again: the write-behind writes its newest summary.
+    store.refuse_est.store(false, Ordering::SeqCst);
+    let mut state = farm.lock();
+    state
+        .learned
+        .clock(kbf_types::FarmTime::from_millis(10_000));
+    state.flush_learned();
+    drop(state);
+    let held = open(&store).estimates().expect("read");
+    assert!(held.iter().any(|(k, _)| *k == key));
+}
+
+/// Catches: a refused flush aborting the farm's tick path with an outage flag, and a
+/// fenced farm writing size rows at all.
+#[test]
+fn a_fenced_farm_writes_no_size_rows_and_a_refused_batch_is_kept_for_later() {
+    let store = Flaky::new();
+    let (farm, key) = farm_with_a_kill(&store);
+    let row = (key.clone(), size_row(&key, today()));
+    farm.lock().fenced = true;
+    farm.lock().write_estimates(std::slice::from_ref(&row));
+    farm.lock().flush_learned();
+    assert!(store.scan_prefix("est/").expect("scan").is_empty());
+    farm.lock().fenced = false;
+    farm.lock()
+        .durable
+        .as_ref()
+        .expect("a store")
+        .fenced
+        .store(true, Ordering::SeqCst);
+    farm.lock().write_estimates(std::slice::from_ref(&row));
+    assert!(store.scan_prefix("est/").expect("scan").is_empty());
+}
+
+/// Catches: a requeue that is not an own-limit kill (a lost run, a node-pressure kill)
+/// writing a summary or keeping the lease's booking.
+#[test]
+fn a_requeue_that_is_no_kill_writes_nothing_and_forgets_the_booking() {
+    let store = Flaky::new();
+    let (farm, _) = farm_with_a_kill(&store);
+    farm.lock().settle_requeues(&[requeue(4, 0)]);
+    assert!(store.scan_prefix("est/").expect("scan").is_empty());
+    assert_eq!(
+        farm.lock().learned.booking(LeaseId::new(5, 0)),
+        Err(crate::learned::Skip::NoBooking)
+    );
+}
+
+/// Catches: the write-behind batch not one transaction, a row a reader cannot read
+/// stopping the load of the rest (or being silently taken as a key), and rows of other
+/// prefixes read as summaries.
+#[test]
+fn size_rows_are_written_in_a_batch_and_unreadable_ones_are_skipped() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    let key = size_key("main", None);
+    durable
+        .put_estimates(&[(key.clone(), size_row(&key, 100))])
+        .expect("batch");
+    put(&store, "est/not-a-key", vec![1, 2]);
+    put(&store, "estimate/main", vec![1, 2]);
+    let held = durable.estimates().expect("read");
+    assert_eq!(held, [(key.clone(), size_row(&key, 100))]);
+    // Put again: replaced, not duplicated.
+    durable
+        .put_estimates(&[(key.clone(), size_row(&key, 101))])
+        .expect("batch");
+    assert_eq!(
+        durable.estimates().expect("read"),
+        [(key.clone(), size_row(&key, 101))]
+    );
+    store.set_down(true);
+    assert!(durable.put_estimates(&[(key, vec![])]).is_err());
+}
+
+/// Catches: a sweep that deletes a fresh row, keeps a stale one forever (the store would
+/// grow with every action ever run), drops a stale row that holds a floor (a floor does
+/// not expire by idleness) instead of stripping its samples, rewrites a row that is
+/// already as the estimator would keep it, or reads a row it cannot decode as stale.
+#[test]
+fn the_sweep_drops_what_is_stale_and_keeps_floors() {
+    use kbf_estimator::{Bounds, Day, Outcome as RunOutcome, Run, STALE_DAYS, Summaries};
+    let store = Flaky::new();
+    let durable = open(&store);
+    let (fresh, stale, floored) = (
+        size_key("fresh", None),
+        size_key("stale", None),
+        size_key("floored", None),
+    );
+    let kill = Run {
+        outcome: RunOutcome::OwnLimitKill,
+        wall_us: 2_000_000,
+        peak_memory_bytes: Some(5 << 30),
+        booked_memory_bytes: 4 << 30,
+        raised_memory_bytes: Some(16 << 30),
+        limit_hits: 0,
+        swap_peak_bytes: 0,
+        cpu_usage_us: 0,
+        node_cpu_pressure_permille: None,
+    };
+    let mut summaries = Summaries::default();
+    summaries.observe(&floored, &kill, Day(10), &Bounds::default());
+    let floored_row = summaries.get(&floored).expect("a summary").encode();
+    durable
+        .put_estimates(&[
+            (fresh.clone(), size_row(&fresh, 100)),
+            (stale.clone(), size_row(&stale, 100 - STALE_DAYS - 1)),
+            (floored.clone(), floored_row.clone()),
+        ])
+        .expect("batch");
+    put(&store, "est/not-a-key", vec![1, 2]);
+    let mut bad = estimate::encode(&[0, 0, 0]);
+    bad.push(1);
+    put(&store, &estimate::row_key(&size_key("bad", None)), bad);
+
+    assert_eq!(
+        durable.sweep_estimates(Day(100)).expect("sweep"),
+        (2, false)
+    );
+    let mut held: Vec<String> = durable
+        .estimates()
+        .expect("read")
+        .into_iter()
+        .map(|(k, _)| k.instance().as_str().to_owned())
+        .collect();
+    held.sort();
+    assert_eq!(held, ["bad", "floored", "fresh"]);
+    let floor = durable
+        .estimates()
+        .expect("read")
+        .into_iter()
+        .find(|(k, _)| *k == floored)
+        .expect("kept");
+    assert_ne!(floor.1, floored_row, "the samples are stripped");
+    let mut again = Summaries::default();
+    again.insert_encoded(&floored, &floor.1).expect("decodes");
+    assert!(again.key_floor(&floored, &Bounds::default()) > 0);
+    // Nothing left to change.
+    assert_eq!(
+        durable.sweep_estimates(Day(100)).expect("sweep"),
+        (0, false)
+    );
+}
+
+fn farm_over(store: &Arc<Flaky>, mode: crate::LearnedSizes) -> Farm {
+    let store: Arc<dyn Store> = store.clone();
+    Farm::new(
+        Arc::new(kbf_front::Cache::memory()),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    )
+    .with_learned_sizes(mode, 4 << 30)
+    .with_state(Some(crate::StateStore {
+        store,
+        epoch: EpochPolicy::Keep,
+        members: Default::default(),
+        history: None,
+    }))
+    .expect("a farm over the store")
+}
+
+fn today() -> u32 {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    u32::try_from(secs / 86_400).expect("a day")
+}
+
+/// Catches: `off` reading the size rows a `shadow` farm left (it must not even scan them: a
+/// store that fails the scan, or holds rows it cannot read, must not stop an off farm
+/// from starting), rewriting or deleting them (a flip back to `shadow` would start cold),
+/// writing behind, or sweeping when its ticks run however long it has run (the rows are
+/// a stale one, and a stale one that holds a floor, which a sweep would delete or strip);
+/// and `shadow` not taking them up at a start.
+#[tokio::test(start_paused = true)]
+async fn off_leaves_the_size_rows_alone_and_shadow_takes_them_up() {
+    use kbf_estimator::{Bounds, Day, Outcome as RunOutcome, Run, Summaries};
+    let store = Flaky::new();
+    let (fresh, stale, floored) = (
+        size_key("fresh", None),
+        size_key("stale", None),
+        size_key("floored", None),
+    );
+    let kill = Run {
+        outcome: RunOutcome::OwnLimitKill,
+        wall_us: 0,
+        peak_memory_bytes: Some(5 << 30),
+        booked_memory_bytes: 4 << 30,
+        raised_memory_bytes: Some(16 << 30),
+        limit_hits: 0,
+        swap_peak_bytes: 0,
+        cpu_usage_us: 0,
+        node_cpu_pressure_permille: None,
+    };
+    let mut summaries = Summaries::default();
+    summaries.observe(&floored, &kill, Day(10), &Bounds::default());
+    let floored_row = summaries.get(&floored).expect("a summary").encode();
+    open(&store)
+        .put_estimates(&[
+            (fresh.clone(), size_row(&fresh, today())),
+            (stale.clone(), size_row(&stale, 1)),
+            (floored.clone(), floored_row),
+        ])
+        .expect("rows");
+    let before = store.scan_prefix("est/").expect("scan");
+    assert_eq!(before.len(), 3);
+    store.est_scans.store(0, Ordering::SeqCst);
+    store.fail_est_scan.store(true, Ordering::SeqCst);
+
+    let off = farm_over(&store, crate::LearnedSizes::Off);
+    assert!(off.lock().learned.summaries().is_empty());
+    assert_eq!(off.lock().learned.calls(), 0);
+    // Hours of ticks, with something to write behind: no write-behind, no sweep.
+    off.lock().learned.observe(
+        &crate::learned::Attempt {
+            key: fresh.clone(),
+            run: kill,
+        },
+        &Bounds::default(),
+    );
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_secs(4_000)).await;
+        off.tick().await;
+    }
+    store.fail_est_scan.store(false, Ordering::SeqCst);
+    assert_eq!(
+        store.est_scans.load(Ordering::SeqCst),
+        0,
+        "off scanned the size rows"
+    );
+    assert_eq!(store.scan_prefix("est/").expect("scan"), before);
+    drop(off);
+
+    let shadow = farm_over(&store, crate::LearnedSizes::Shadow);
+    assert!(shadow.lock().learned.summaries().get(&fresh).is_some());
+    assert!(store.est_scans.load(Ordering::SeqCst) >= 1);
+}
+
+/// Catches: summaries a result changed never written (the shadow starts cold at every
+/// deploy), written at every result rather than behind, a refused write dropped rather
+/// than tried again at the next tick, and a sweep that never runs (the store would keep
+/// every action ever run).
+#[tokio::test(start_paused = true)]
+async fn shadow_writes_behind_and_sweeps_when_ticks_come() {
+    let store = Flaky::new();
+    let farm = farm_over(&store, crate::LearnedSizes::Shadow);
+    let key = size_key("main", None);
+    let stale = size_key("stale", None);
+    open(&store)
+        .put_estimates(&[(stale.clone(), size_row(&stale, 1))])
+        .expect("an old row");
+    let attempt = crate::learned::Attempt {
+        key: key.clone(),
+        run: kbf_estimator::Run {
+            outcome: kbf_estimator::Outcome::Success,
+            wall_us: 2_000_000,
+            peak_memory_bytes: Some(1 << 28),
+            booked_memory_bytes: 4 << 30,
+            raised_memory_bytes: None,
+            limit_hits: 0,
+            swap_peak_bytes: 0,
+            cpu_usage_us: 0,
+            node_cpu_pressure_permille: None,
+        },
+    };
+    let bounds = kbf_estimator::Bounds::default();
+    farm.lock().learned.observe(&attempt, &bounds);
+    farm.tick().await;
+    assert_eq!(
+        store.scan_prefix("est/").expect("scan").len(),
+        1,
+        "not yet due"
+    );
+
+    store.set_down(true);
+    tokio::time::advance(Duration::from_secs(6)).await;
+    farm.tick().await;
+    store.set_down(false);
+    assert_eq!(store.scan_prefix("est/").expect("scan").len(), 1, "refused");
+
+    tokio::time::advance(Duration::from_secs(6)).await;
+    farm.tick().await;
+    let held: Vec<_> = open(&store)
+        .estimates()
+        .expect("read")
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert!(held.contains(&key), "written on the next tick");
+
+    // An hour on, the sweep runs; the farm's day is today, and the old row is 60+ days old.
+    tokio::time::advance(Duration::from_secs(3_700)).await;
+    farm.tick().await;
+    tokio::time::advance(Duration::from_secs(3_700)).await;
+    farm.tick().await;
+    let held: Vec<_> = open(&store)
+        .estimates()
+        .expect("read")
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert!(!held.contains(&stale), "{held:?}");
+}
+
+/// Catches: a sweep that commits every stale row in one call (the farm lock is held for
+/// the lot), one that never finishes, and a transaction larger than its bound.
+#[test]
+fn the_sweep_commits_a_bounded_number_of_rows_a_call_and_resumes() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    let total = SWEEP_TXNS * SWEEP_ROWS + 76;
+    let rows: Vec<_> = (0..total)
+        .map(|i| {
+            let key = size_key(&format!("stale-{i:05}"), None);
+            let row = size_row(&key, 1);
+            (key, row)
+        })
+        .collect();
+    for chunk in rows.chunks(256) {
+        durable.put_estimates(chunk).expect("rows");
+    }
+    let swept = durable.sweep_estimates(Day(200)).expect("sweep");
+    assert_eq!(swept, (SWEEP_TXNS * SWEEP_ROWS, true));
+    assert_eq!(store.scan_prefix("est/").expect("scan").len(), 76);
+    assert_eq!(
+        durable.sweep_estimates(Day(200)).expect("sweep"),
+        (76, false)
+    );
+    assert!(store.scan_prefix("est/").expect("scan").is_empty());
+}
+
+/// Catches: one refused transaction of the sweep aborting the rest of it (the first batch
+/// is refused, the second must still be swept), the refused rows lost instead of left for
+/// the next sweep.
+#[test]
+fn a_refused_sweep_batch_does_not_stop_the_others() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    let rows: Vec<_> = (0..SWEEP_ROWS + 10)
+        .map(|i| {
+            let key = size_key(&format!("stale-{i:05}"), None);
+            let row = size_row(&key, 1);
+            (key, row)
+        })
+        .collect();
+    durable.put_estimates(&rows).expect("rows");
+    store.refuse_est_first.store(1, Ordering::SeqCst);
+    assert_eq!(
+        durable.sweep_estimates(Day(200)).expect("sweep"),
+        (10, false)
+    );
+    assert_eq!(store.scan_prefix("est/").expect("scan").len(), SWEEP_ROWS);
+    store.refuse_est.store(true, Ordering::SeqCst);
+    assert_eq!(
+        durable.sweep_estimates(Day(200)).expect("sweep"),
+        (0, false)
+    );
+    store.refuse_est.store(false, Ordering::SeqCst);
+    assert_eq!(
+        durable.sweep_estimates(Day(200)).expect("sweep"),
+        (SWEEP_ROWS, false)
+    );
+    assert!(store.scan_prefix("est/").expect("scan").is_empty());
+}
+
+/// Catches: an idle old writer that goes on trying to write size rows to a store a newer
+/// writer holds (every tick would send a refused transaction), and its refused rows kept
+/// for a retry that cannot succeed.
+#[test]
+fn a_fenced_refusal_of_size_rows_ends_the_writing() {
+    let store = Flaky::new();
+    let (farm, key) = farm_with_a_kill(&store);
+    let row = (key.clone(), size_row(&key, today()));
+    store.fence_est.store(true, Ordering::SeqCst);
+    farm.lock().write_estimates(std::slice::from_ref(&row));
+    assert_eq!(store.est_writes.load(Ordering::SeqCst), 1);
+    let fenced = farm
+        .lock()
+        .durable
+        .as_ref()
+        .expect("a store")
+        .fenced
+        .load(Ordering::SeqCst);
+    assert!(fenced, "the refusal is remembered");
+    // Later ticks send nothing, and nothing is waiting to be written.
+    let mut state = farm.lock();
+    state
+        .learned
+        .clock(kbf_types::FarmTime::from_millis(60_000));
+    state.flush_learned();
+    state.write_estimates(std::slice::from_ref(&row));
+    assert!(state.learned.due().is_empty());
+    drop(state);
+    assert_eq!(store.est_writes.load(Ordering::SeqCst), 1);
+}
+
+/// Catches: a sweep that commits nothing, because the store refuses every batch, asking to
+/// be called again at the next tick (it would scan every row every tick for an hour).
+#[test]
+fn a_sweep_that_commits_nothing_does_not_ask_for_another_call() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    let rows: Vec<_> = (0..SWEEP_TXNS * SWEEP_ROWS + 5)
+        .map(|i| {
+            let key = size_key(&format!("stale-{i:05}"), None);
+            let row = size_row(&key, 1);
+            (key, row)
+        })
+        .collect();
+    for chunk in rows.chunks(SWEEP_ROWS) {
+        durable.put_estimates(chunk).expect("rows");
+    }
+    store.refuse_est.store(true, Ordering::SeqCst);
+    assert_eq!(
+        durable.sweep_estimates(Day(200)).expect("sweep"),
+        (0, false)
+    );
+    store.refuse_est.store(false, Ordering::SeqCst);
+    assert_eq!(
+        durable.sweep_estimates(Day(200)).expect("sweep"),
+        (SWEEP_TXNS * SWEEP_ROWS, true)
+    );
 }

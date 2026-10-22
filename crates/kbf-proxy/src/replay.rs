@@ -137,9 +137,10 @@ pub enum Failure {
 /// Whether the proxy may dispatch the request again. The retry is a new bind, not a reuse:
 /// the caller drops the old permit (after resetting the old upstream stream), calls
 /// `ActiveSlot::bind` again with `attempts + 1`, and so lands in the hold queue if a hold is
-/// in force and in whichever slot is active. `attempts` counts dispatches so far. Never for
-/// ByteStream, never after an upstream response, never once the request outgrew the buffer or
-/// while the client's request is still open.
+/// in force and in whichever slot is active (a `WaitExecution` for the old child's operation
+/// lands in the old child's slot again while it lives). `attempts` counts dispatches so far.
+/// Never for ByteStream, never after an upstream response, never once the request outgrew the
+/// buffer or while the client's request is still open.
 #[must_use]
 pub fn may_retry(path: &str, failure: Failure, buffer: &ReplayBuffer, attempts: u8) -> bool {
     !is_bytestream(path)

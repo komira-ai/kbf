@@ -3,7 +3,9 @@
 //!
 //! - **Spawn** runs `releases/<commit>/kbf` (the file of that release, never `current`,
 //!   which moves at a confirm) in its own process group, with the activation variables
-//!   removed. The child outlives the proxy: nothing here kills on drop, and the unit keeps
+//!   removed. Under [`ProcChild::with_releases`] the releases are the proxy's own copies,
+//!   `<dir>/<commit>/kbf`, and the layout's are not looked at.
+//!   The child outlives the proxy: nothing here kills on drop, and the unit keeps
 //!   `KillMode=process` so a restart of the proxy leaves it running. The identity (pid,
 //!   start time, executable) is written to `<dir>/<slot>.json` before `spawn` returns, so a
 //!   candidate that was started and not yet recorded in `update.json` can still be found.
@@ -71,6 +73,8 @@ pub struct ProcChild {
     dir: PathBuf,
     argv: Argv,
     binary: &'static str,
+    /// Where the releases are when they are not under `layout` (the proxy's own copies).
+    releases: Option<PathBuf>,
     /// Names a process this port just started: a pidfd and the identity to record.
     identify: Identify,
     held: Mutex<BTreeMap<u32, Held>>,
@@ -149,9 +153,18 @@ impl ProcChild {
             dir,
             argv,
             binary: RELEASE_BINARY,
+            releases: None,
             identify: identify_started,
             held: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// The same, running the releases found in `dir` (`<dir>/<commit>/kbf`) in place of those
+    /// under the layout: the proxy's own copies of `kbf`.
+    #[must_use]
+    pub fn with_releases(mut self, dir: PathBuf) -> ProcChild {
+        self.releases = Some(dir);
+        self
     }
 
     /// The same, running another file of a release (tests run a stand-in program).
@@ -170,6 +183,9 @@ impl ProcChild {
 
     /// The program of `release`.
     pub(super) fn program(&self, release: &CommitId) -> PathBuf {
+        if let Some(dir) = &self.releases {
+            return dir.join(release.as_str()).join(self.binary);
+        }
         let dir = self.layout.release_dir(release);
         self.layout.join(&dir).join(self.binary)
     }

@@ -181,7 +181,7 @@ async fn a_write_stream_that_ends_early_is_invalid_and_stores_nothing() {
     for (what, requests, text) in cases {
         let stream = futures::stream::iter(requests.into_iter().map(Ok)).boxed();
         let status = service
-            .write_in(0, None, false, stream)
+            .write_in(0, (None, false), false, stream)
             .await
             .expect_err(what);
         assert_eq!(status.code(), Code::InvalidArgument, "{what}: {status}");
@@ -223,7 +223,7 @@ async fn a_write_stream_that_fails_answers_with_its_own_status() {
     for (what, items) in cases {
         let stream = futures::stream::iter(items).boxed();
         let status = service
-            .write_in(0, None, false, stream)
+            .write_in(0, (None, false), false, stream)
             .await
             .expect_err(what);
         assert_eq!(status.code(), Code::Aborted, "{what}: {status}");

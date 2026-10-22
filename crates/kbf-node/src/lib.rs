@@ -694,7 +694,13 @@ fn farm(
          storage nodes it names"
     );
     let held = nodes.liveness();
-    let plane = FarmCas::new(server, Arc::clone(maps), nodes, &cli.transfer.config());
+    let plane = FarmCas::with_hold(
+        server,
+        Arc::clone(maps),
+        nodes,
+        &cli.transfer.config(),
+        kbf_daemon::DEFAULT_HOLD,
+    );
     Ok((Arc::new(plane), held))
 }
 
@@ -707,11 +713,12 @@ fn member(
     liveness: Liveness,
 ) -> Result<Arc<kbf_transfer::RoutedCas>, Error> {
     let nodes = kbf_daemon::storage_nodes(&DaemonConfig::from_args(&cli.daemon).tls, liveness)?;
-    Ok(kbf_daemon::member_cas(
+    Ok(kbf_daemon::member_cas_with_hold(
         Arc::clone(maps),
         local.clone(),
         nodes,
         &cli.transfer.config(),
+        kbf_daemon::DEFAULT_HOLD,
     ))
 }
 

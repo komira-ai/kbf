@@ -1,8 +1,9 @@
 //! The drain of the held set (`docs/design/storage-ram-ack.md`, "Drain and shutdown"): a
 //! held blob is written to the hot disk through the write pool and leaves the set only once
 //! the index has it; a failed attempt keeps it and is tried again; a shutdown drain is
-//! bounded by its deadline. Nothing holds a blob in a running node yet, so the blobs here
-//! are put in through `Cache::hold` (the producer's entry) or `Cache::hold_for_test`.
+//! bounded by its deadline. The blobs here are put in through `Cache::hold` (the budgeted
+//! primitive under the producer) or `Cache::hold_for_test`; `ram_ack_chain.rs` drains blobs
+//! the write path held.
 //!
 //! Waits are events (the pool's drain hook, a parked store PUT, `durable_waiting`'s
 //! notification) or the paused clock; a test that needs the time to pass runs on a
@@ -99,9 +100,8 @@ fn indexed(rig: &Rig, blob: &TestBlob) -> bool {
 /// answers), the index has the blob, the entry is still held, its bytes still count in
 /// `unwritten_bytes` and its budget is still taken (a second blob of the same size is
 /// refused); released, the entry and its budget go. Catches an entry removed before the
-/// index has the blob (mutant: the pass removes the entry before it awaits the write: red
-/// at the first assertion in the hook), an entry that is never removed, and a budget that
-/// is returned early.
+/// index has the blob, an entry that is never removed, and a budget that is returned
+/// early.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_drain_writes_to_the_hot_disk_and_releases_after_the_index_has_it() {
     let rig = Rig::new();
@@ -162,14 +162,11 @@ async fn the_drain_writes_to_the_hot_disk_and_releases_after_the_index_has_it() 
 }
 
 /// A failed drain keeps the entry and tries again. The first `PutStaged` is refused: the
-/// pass reports one failure, the entry stays held as `Failing{n: 1}` (still readable, still
-/// counted as unwritten), `drain_failures_total` is 1; a pass before the backoff ends
-/// takes nothing; a pass at the time the first one said (`retry_at`) writes it, and the
-/// failure count stays 1. Catches a failure that drops the entry (mutant: the failed branch
-/// removes it: red at "stays held"), a retry that ignores the backoff (mutant: `claim`
-/// takes a failed blob at any time: red at the empty pass), a failed entry that is never
-/// taken again (mutant: `failed` leaves it `Writing`: red at the retry), and an
-/// uncounted failure.
+/// pass reports one failure, the entry stays held as `Failing{n: 1}` (still readable,
+/// still counted as unwritten), `drain_failures_total` is 1; a pass before the backoff
+/// ends takes nothing; a pass at the time the first one said (`retry_at`) writes it, and
+/// the failure count stays 1. Catches a failure that drops the entry, a retry that ignores
+/// the backoff, a failed entry that is never taken again, and an uncounted failure.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_drain_keeps_the_entry_and_retries_after_the_backoff() {
     let rig = Rig::new();
@@ -217,8 +214,8 @@ async fn a_failed_drain_keeps_the_entry_and_retries_after_the_backoff() {
 }
 
 /// Failures in a row lengthen the wait: the second failure of one blob is `Failing{n: 2}`
-/// and due later than the first one was. Catches a backoff that restarts at the first step
-/// (mutant: `failed` forgets the failures it had).
+/// and due later than the first one was. Catches a backoff that restarts at the first
+/// step.
 #[tokio::test(flavor = "multi_thread")]
 async fn failures_in_a_row_are_counted_and_the_wait_grows() {
     let rig = Rig::new();
@@ -310,9 +307,8 @@ async fn a_pass_takes_at_most_its_limit_and_the_next_takes_the_rest() {
 /// hold: `durable_waiting` returns (nothing missing) once the entry has left, which it
 /// reports by notification. Then a failed write is retried by the loop itself at the
 /// backoff (the paused clock moves to it when everything is idle): the PUT is refused
-/// once, and the blob is still written. Catches a loop that is never woken by a hold
-/// (mutant: `hold` does not ring the kick: the wait ends `Missing`) and one that does not
-/// retry (mutant: `run_drain` does not wait for the due time).
+/// once, and the blob is still written. Catches a loop that is never woken by a hold and
+/// one that does not retry.
 #[tokio::test(start_paused = true)]
 async fn the_background_drain_writes_what_is_held_and_retries_by_itself() {
     let rig = Rig::new();
@@ -371,11 +367,10 @@ async fn the_shutdown_drain_completes_within_its_deadline() {
 }
 
 /// A shutdown drain that cannot finish ends at its deadline and says what it left: the
-/// store refuses every PUT of one blob, the other is written, and the answer is
-/// `TimedOut` with the one blob and its bytes, still held and still counted. Catches a
-/// drain that ignores the deadline (the test would hang: the bound in `within` fails it),
-/// one that reports `Drained` regardless (mutant: the timeout arm answers `Drained`), and
-/// one that gives up the entries it could not write.
+/// store refuses every PUT of one blob, the other is written, and the answer is `TimedOut`
+/// with the one blob and its bytes, still held and still counted. Catches a drain that
+/// ignores the deadline (the test would hang: the bound in `within` fails it), one that
+/// reports `Drained` regardless, and one that gives up the entries it could not write.
 #[tokio::test(start_paused = true)]
 async fn the_shutdown_drain_stops_at_its_deadline_and_says_what_it_left() {
     let rig = Rig::new();
@@ -408,8 +403,7 @@ async fn the_shutdown_drain_stops_at_its_deadline_and_says_what_it_left() {
 
 /// A shutdown drain does not wait out a failed blob's backoff: a blob that failed a moment
 /// ago (so is due in a second) is written by a shutdown drain whose deadline is under that
-/// second. Catches a shutdown drain that takes only blobs that are due (mutant: `force`
-/// ignored: it times out).
+/// second. Catches a shutdown drain that takes only blobs that are due.
 #[tokio::test(start_paused = true)]
 async fn the_shutdown_drain_does_not_wait_for_a_backoff() {
     let rig = Rig::new();
@@ -427,8 +421,8 @@ async fn the_shutdown_drain_does_not_wait_for_a_backoff() {
 /// A drain that is cut off while a write is in flight gives the blob back: the PUT is
 /// parked, the shutdown deadline ends and drops the pass, and the entry is `Queued` again
 /// (or `Failing` with the failures it had), not stuck as being written, so the next pass
-/// takes it. Catches a pass that leaves its blobs claimed (mutant: no `Unclaim`), which
-/// would never be drained again.
+/// takes it. Catches a pass that leaves its blobs claimed, which would never be drained
+/// again.
 #[tokio::test(start_paused = true)]
 async fn a_drain_cut_off_gives_the_blob_back() {
     let rig = Rig::new();
@@ -467,9 +461,7 @@ async fn a_drain_cut_off_gives_the_blob_back() {
 /// The background drain goes on at once while a pass finds a full load: with two full
 /// passes and one blob held before the loop starts (the holds ring one wake-up between
 /// them), the loop takes the third pass without another hold, and `durable_waiting` for
-/// every blob returns. Catches a loop that sleeps after a full
-/// pass (mutant: the `continue` removed: the last blob waits for a wake-up that never
-/// comes, and the wait ends missing).
+/// every blob returns. Catches a loop that sleeps after a full pass.
 #[tokio::test(start_paused = true)]
 async fn the_background_drain_goes_on_after_a_full_pass() {
     let rig = Rig::new();

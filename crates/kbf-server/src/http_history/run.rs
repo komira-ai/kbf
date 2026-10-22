@@ -15,8 +15,8 @@ use kbf_auth::authorize;
 use kbf_front::Recorder;
 use kbf_history::RunId;
 use kbf_history::records::{
-    CommandRendering, FailedRun, FlogStream, RunOutcome, RunRecord, Tail, TailOmitted, Timestamps,
-    WireDigest,
+    BookSource, CommandRendering, FailedRun, FlogStream, RunOutcome, RunRecord, Tail, TailOmitted,
+    Timestamps, WireDigest,
 };
 use kbf_invocation::WallTime;
 use kbf_types::Digest;
@@ -372,6 +372,27 @@ pub(crate) fn render(r: &RunRecord) -> Value {
     if r.presubmit_us != 0 {
         put("presubmit_us", r.presubmit_us.into());
     }
+    if let Some(operation) = r.operation_id {
+        put("operation_id", operation.into());
+    }
+    for (key, source) in [
+        ("cpu_source", r.cpu_source()),
+        ("memory_source", r.memory_source()),
+    ] {
+        match source {
+            BookSource::Unspecified => {}
+            BookSource::Default => put(key, "default".into()),
+            BookSource::Hint => put(key, "hint".into()),
+        }
+    }
+    for (key, value) in [
+        ("input_bytes", r.input_bytes),
+        ("input_files", r.input_files),
+    ] {
+        if let Some(value) = value {
+            put(key, value.into());
+        }
+    }
     put("reapi_times", reapi_times(&t));
     if let Some(c) = &r.cgroup {
         put("usage", usage(c));
@@ -440,22 +461,25 @@ fn reapi_times(t: &Timestamps) -> Value {
 /// The cgroup block of a run, with the parallelism derived from it.
 fn usage(c: &kbf_history::records::Cgroup) -> Value {
     let mut keys = Map::new();
+    // The read API keeps writing a number for the two fields the record now holds as
+    // optional (a missing peak or wall reads 0 here, as before).
+    let (wall_us, memory_peak_bytes) = (c.wall_us.unwrap_or(0), c.memory_peak_bytes.unwrap_or(0));
     for (key, value) in [
-        ("wall_us", c.wall_us),
+        ("wall_us", wall_us),
         ("cpu_usage_us", c.cpu_usage_us),
         ("cpu_user_us", c.cpu_user_us),
         ("cpu_system_us", c.cpu_system_us),
         ("cpu_periods", c.periods),
         ("cpu_throttled", c.throttled_periods),
         ("throttled_us", c.throttled_us),
-        ("memory_peak_bytes", c.memory_peak_bytes),
+        ("memory_peak_bytes", memory_peak_bytes),
     ] {
         keys.insert(key.to_owned(), value.into());
     }
-    if c.wall_us > 0 {
+    if wall_us > 0 {
         keys.insert(
             "parallelism".to_owned(),
-            (c.cpu_usage_us as f64 / c.wall_us as f64).into(),
+            (c.cpu_usage_us as f64 / wall_us as f64).into(),
         );
     }
     let numa: Vec<Value> = c

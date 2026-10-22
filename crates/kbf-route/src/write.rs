@@ -242,7 +242,10 @@ impl Router {
         let bytes = if digest.size_bytes == 0 {
             Bytes::new()
         } else {
-            self.read_blob(&digest).await.map_err(Tried::Elsewhere)?
+            // The commit's own hold waits for the blob's owners; a hold of the read's own
+            // would run a second bound inside the first, with the copy budget taken.
+            let plain = self.clone().unheld();
+            plain.read_blob(&digest).await.map_err(Tried::Elsewhere)?
         };
         // The action's owner is rarely the blob's: it holds the blob as one more copy.
         let stored = node.put_unowned(bytes).await.map_err(Tried::Node)?;

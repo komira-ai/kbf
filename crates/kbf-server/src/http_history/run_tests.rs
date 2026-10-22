@@ -73,6 +73,11 @@ fn a_run_says_what_the_record_has_and_leaves_out_what_it_has_not() {
         "partition",
         "presubmit_us",
         "usage",
+        "operation_id",
+        "cpu_source",
+        "memory_source",
+        "input_bytes",
+        "input_files",
     ] {
         assert!(v.get(absent).is_none(), "{absent}: {v}");
     }
@@ -111,6 +116,11 @@ fn a_killed_run_says_how_and_a_shape_what_it_names() {
     r.wait_reason = "no node".to_owned();
     r.partition = "linux/large".to_owned();
     r.presubmit_us = 15;
+    r.operation_id = Some(0);
+    r.cpu_source = kbf_history::records::BookSource::Hint.into();
+    r.memory_source = kbf_history::records::BookSource::Default.into();
+    r.input_bytes = Some(0);
+    r.input_files = Some(16);
     r.reason = "killed".to_owned();
     r.action = Some(wire(1));
     r.command = Some(wire(2));
@@ -134,9 +144,14 @@ fn a_killed_run_says_how_and_a_shape_what_it_names() {
         ("farm_runs", 1),
         ("farm_budget", 2),
         ("presubmit_us", 15),
+        ("operation_id", 0),
+        ("input_bytes", 0),
+        ("input_files", 16),
     ] {
         assert_eq!(v[key], want, "{key}");
     }
+    assert_eq!(v["cpu_source"], "hint");
+    assert_eq!(v["memory_source"], "default");
     assert_eq!(v["wait_reason"], "no node");
     assert_eq!(v["partition"], "linux/large");
     assert_eq!(v["reason"], "killed");
@@ -193,9 +208,10 @@ fn the_times_and_the_cgroup_block_are_what_the_daemon_reported() {
         periods: 2,
         throttled_periods: 1,
         throttled_us: 9,
-        memory_peak_bytes: 77,
+        memory_peak_bytes: Some(77),
         numa_bytes: vec![10, 0, 20],
-        wall_us: 4,
+        wall_us: Some(4),
+        ..Cgroup::default()
     });
     let v = render(&r);
     assert_eq!(
@@ -220,6 +236,27 @@ fn the_times_and_the_cgroup_block_are_what_the_daemon_reported() {
     assert!(usage.get("numa_bytes").is_none());
     r.timestamps = None;
     assert_eq!(render(&r)["reapi_times"], json!({}));
+}
+
+/// Catches: the read API changing what it prints for a run whose record holds no peak or
+/// wall time (the record now keeps them as absent; the API still writes 0, as before): a
+/// different default, or the keys left out.
+#[test]
+fn an_absent_peak_and_wall_are_still_printed_as_zero() {
+    let mut r = base();
+    r.cgroup = Some(Cgroup {
+        cpu_usage_us: 8,
+        memory_peak_bytes: None,
+        wall_us: None,
+        ..Cgroup::default()
+    });
+    let usage = &render(&r)["usage"];
+    assert_eq!(usage["wall_us"], json!(0));
+    assert_eq!(usage["memory_peak_bytes"], json!(0));
+    assert!(
+        usage.get("parallelism").is_none(),
+        "no wall, no parallelism"
+    );
 }
 
 /// Catches: a shape wrongly made or not made when only one of the things that name it is

@@ -117,7 +117,7 @@ use tonic::{Code, Request as GrpcRequest, Response, Status};
 use tracing::Instrument as _;
 
 use kbf_auth::AuthenticationMetadata;
-use kbf_invocation::{CallKind, ExecuteAnswer};
+use kbf_invocation::{BookSource, CallKind, Evidence, ExecuteAnswer};
 
 use crate::backend::Backend;
 use crate::default_platform::{DefaultPlatform, Quiet};
@@ -171,6 +171,10 @@ pub struct Submission {
     /// The action's argv, output paths and client label, for the server's `action
     /// usage:` line only ([`Described`]).
     pub described: Described,
+    /// What the front knew at submit that the booking does not say: which axes the
+    /// client named, and the size of the input tree. For the run record only; it is
+    /// not part of the scheduler's [`Request`], which the log codec writes.
+    pub evidence: Evidence,
 }
 
 /// Where an operation is, as its callers see it.
@@ -717,6 +721,7 @@ impl<D> ExecutionService<D> {
             .execute_walk
             .observe_duration(window.walk);
         let walked = walked?;
+        let (input_bytes, input_files) = (walked.input_bytes, walked.input_files);
         window.dir_reads += walked.dirs_read;
         window.dirs_skipped += walked.dirs_skipped;
         window.dir_cache_hits += walked.dir_cache_hits;
@@ -745,6 +750,7 @@ impl<D> ExecutionService<D> {
         let Placed {
             kind,
             booked,
+            sources,
             needs,
             defaulted,
         } = placed;
@@ -764,6 +770,12 @@ impl<D> ExecutionService<D> {
             call: None,
             // The Command is here: an absent one returned MISSING above.
             described: command.map(Described::of).unwrap_or_default(),
+            evidence: Evidence {
+                cpu_source: sources.cpu,
+                memory_source: sources.memory,
+                input_bytes,
+                input_files,
+            },
         };
         Ok((submission, command_digest))
     }
@@ -775,7 +787,7 @@ impl<D> ExecutionService<D> {
     fn place(&self, action: &Action, command: Option<&Command>) -> Result<Placed, Status> {
         let platform = properties(platform(action, command))?;
         let kind = lease_kind(&platform)?;
-        let booked = booking(&platform, kind, self.default_memory)?;
+        let (booked, sources) = booking(&platform, kind, self.default_memory)?;
         let asked = needs(&platform)?;
         let (needs, defaulted) = match self.default_platform.apply(&asked) {
             Some(placed) => (placed, true),
@@ -786,6 +798,7 @@ impl<D> ExecutionService<D> {
         Ok(Placed {
             kind,
             booked: booked.with_gpus(gpus),
+            sources,
             needs,
             defaulted,
         })
@@ -874,11 +887,20 @@ impl<D> ExecutionService<D> {
     }
 }
 
+/// Where each axis of a booking came from: a size the platform named, or the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Sources {
+    cpu: BookSource,
+    memory: BookSource,
+}
+
 /// What an action's platform asks of the scheduler ([`ExecutionService::place`]).
 struct Placed {
     kind: LeaseKind,
     /// The resources to book, GPUs included.
     booked: Resources,
+    /// Which axes of `booked` the client named.
+    sources: Sources,
     needs: kbf_caps::Request,
     /// Whether the default platform completed `needs`.
     defaulted: bool,
@@ -963,16 +985,32 @@ fn mac_gpus(kind: LeaseKind, gpus: u64, needs: &kbf_caps::Request) -> Result<u64
 /// `kbf-book-mem-gib` GiB in place of the default where the platform names them, or
 /// INVALID_ARGUMENT for a value that is not a whole number of at least 1 in plain
 /// digits ([`starts_plain`]), one too large to book, or either key on a `whole_machine`
-/// lease.
-fn booking(platform: &Platform, kind: LeaseKind, default_memory: u64) -> Result<Resources, Status> {
+/// lease. The sources say which axes the platform named, so a named size equal to the
+/// default stays a hint.
+fn booking(
+    platform: &Platform,
+    kind: LeaseKind,
+    default_memory: u64,
+) -> Result<(Resources, Sources), Status> {
     let mut booked = if kind == LeaseKind::Action {
         Resources::new(DEFAULT_RESOURCES.cpu_millis, default_memory)
     } else {
         LEAST_WORKER
     };
-    for (key, unit, slot) in [
-        (BOOK_CPUS_KEY, 1_000, &mut booked.cpu_millis),
-        (BOOK_MEM_GIB_KEY, 1 << 30, &mut booked.memory_bytes),
+    let mut sources = Sources::default();
+    for (key, unit, slot, source) in [
+        (
+            BOOK_CPUS_KEY,
+            1_000,
+            &mut booked.cpu_millis,
+            &mut sources.cpu,
+        ),
+        (
+            BOOK_MEM_GIB_KEY,
+            1 << 30,
+            &mut booked.memory_bytes,
+            &mut sources.memory,
+        ),
     ] {
         let Some(value) = platform.get(key) else {
             continue;
@@ -995,8 +1033,9 @@ fn booking(platform: &Platform, kind: LeaseKind, default_memory: u64) -> Result<
                     u64::MAX / unit
                 ))
             })?;
+        *source = BookSource::Hint;
     }
-    Ok(booked)
+    Ok((booked, sources))
 }
 
 /// Whether `value` starts with a digit from 1 to 9. A size must also parse as a `u64`,

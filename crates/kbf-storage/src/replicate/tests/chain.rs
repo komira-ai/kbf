@@ -832,13 +832,12 @@ async fn a_store_whose_stream_call_fails_fails_the_write() {
     assert!(!held(&farm, 0, &digest) && !held(&farm, 1, &digest));
 }
 
-/// Catches a copy's dedup that keeps no blob alive : the replica already holds the
-/// blob on its disk, so the copy the primary sends is answered "held" at once (nothing is
+/// Catches a copy's dedup that keeps no blob alive : the replica already holds the blob on
+/// its disk, so the copy the primary sends is answered "held" at once (nothing is
 /// written), and the replica must have been asked the durable question about it, which is
 /// what refreshes the blob's retention there (the node's cache touches what it reports
 /// present). The primary's own client check is plain and runs on the primary, so a touch
-/// on the replica can only be the copy's. Mutants: the dedup asks nothing and writes always
-/// (the blob is written again and nothing is touched).
+/// on the replica can only be the copy's.
 #[tokio::test]
 async fn a_copy_of_a_blob_the_replica_holds_on_disk_touches_it() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -867,9 +866,8 @@ async fn a_copy_of_a_blob_the_replica_holds_on_disk_touches_it() {
 }
 
 /// The other side of the touch: the replica holds the blob in RAM only, so the copy's
-/// durable question reports it missing, nothing is touched on that answer, and the copy
-/// is written. Mutant: the dedup answers on RAM copies (nothing written, blob still
-/// RAM-only).
+/// durable question reports it missing, nothing is touched on that answer, and the copy is
+/// written.
 #[tokio::test]
 async fn a_copy_of_a_blob_the_replica_holds_in_ram_is_written_not_touched() {
     let farm = Farm::start(2, ChainConfig::default()).await;

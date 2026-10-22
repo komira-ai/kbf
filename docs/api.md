@@ -236,9 +236,12 @@ frontend, a daemon opens a worker stream.
 ```json
 { "generation": 7,
   "members": [
-    { "id": 1, "addr": "192.0.2.11:8982", "state": "active", "weight": 1, "protocol": 1 },
-    { "id": 2, "addr": "192.0.2.12:8982", "state": "draining", "weight": 1, "protocol": 2 },
-    { "id": 3, "addr": "192.0.2.13:8982", "state": "down", "weight": 2, "protocol": null }
+    { "id": 1, "addr": "192.0.2.11:8982", "state": "active", "weight": 1, "protocol": 1,
+      "runs_log": 5, "log_version": 4, "build_commit": "0123456789abcdef0123456789abcdef01234567" },
+    { "id": 2, "addr": "192.0.2.12:8982", "state": "draining", "weight": 1, "protocol": 2,
+      "runs_log": null, "log_version": null, "build_commit": null },
+    { "id": 3, "addr": "192.0.2.13:8982", "state": "down", "weight": 2, "protocol": null,
+      "runs_log": null, "log_version": null, "build_commit": null }
 ],
   "oldest_protocol": 1, "protocol_unknown": 1 }
 ```
@@ -251,12 +254,22 @@ frontend, a daemon opens a worker stream.
 | `state` | `joining` (registered, a write owner, read last), `catching_up`, `active` (a full owner), `draining` (takes no new writes) or `down` (its lease lapsed; kept in the map for the dwell, then it leaves the list) |
 | `weight` | its share of the digests relative to the others |
 | `protocol` | the protocol version in the `RegisterRequest` that wrote the member's row (a heartbeat and a state change keep it; a new registration of the member replaces it). `null` when the row names none, as a row written before this field existed, and for a `down` member: its row expires with its heartbeats, and the version went with it |
+| `runs_log` | the newest metadata-log machine version the node's build can raise its log to, as the `RegisterRequest` that wrote the row said (a heartbeat never replaces it; it fills it only when the row holds none) |
+| `log_version` | the machine version the node's metadata log was at in its newest heartbeat (a registration says it too); it rises when the log is raised |
+| `build_commit` | the commit the node's binary was built from, as its registration said (a heartbeat never replaces it; it fills it only when the row holds none): 40 hex digits, or the 12-digit commit when the build did not know the full one, or the text `unknown` when the build had no git checkout; at most 64 bytes are kept |
 | `oldest_protocol` | the least `protocol` among the members whose `protocol` is not `null`; `null` if none is |
 | `protocol_unknown` | how many members have a `null` `protocol`. Never counted in `oldest_protocol`: read the two together, as for [`GET /v1/nodes`](#get-v1nodes) |
 
 The registration is judged against the map's floor once, when it is made
 ([design/frontend-proxy.md](design/frontend-proxy.md) section 9); `protocol` is what it
 named, and nothing judges it again.
+
+`runs_log`, `log_version` and `build_commit` are information only: nothing in the frontend
+decides on them yet. Each is `null`, never `0` or `""`, when the node did not say it (a node
+of an older build sends none of them), and for a `down` member, whose row went with its
+heartbeats. A frontend built before these fields drops them when it rewrites a member's row;
+they read `null` until the node's next heartbeat to a frontend that knows them brings them back
+(while an older frontend still receives the node's heartbeats, they stay `null`).
 
 A node that registers for the first time in a farm formed more than a minute ago is
 `joining` until the operator promotes it with `POST /v1/members/{id}`; unless the frontend runs
@@ -382,6 +395,69 @@ So promote a joiner when its slice is expected to be empty or its blobs are chea
 rebuild (a new cluster, a cache), or have it hold the slice first; and promote one
 member at a time. `draining` is the reverse: the member takes no new writes, its
 successor takes its slot at once, and it is read first.
+
+## `GET /v1/members/{id}/safe-to-stop`
+
+Whether the host of a storage member may be stopped now without leaving a blob with one
+copy. The updater of a host asks it before it stops the host's process. It is a read that
+changes no member, row or placement, and it passes the same gates as the member write above
+([Who may write](#who-may-write): a loopback peer, no `Origin`, the token, a JSON content
+type), because its answer decides whether to stop a host. `kbf cluster safe-to-stop <id>
+--token-file F` calls it.
+
+```json
+{ "safe": false,
+  "reasons": ["member m2 owes 5 blobs"],
+  "planned_down": false }
+```
+
+| Field | Meaning |
+|---|---|
+| `safe` | `true` if the member can go out without a blob being left with one copy |
+| `reasons` | why `safe` is `false`: the worst thing found, one line. Empty when `safe` is `true` for a storage member; for a daemon, one line that says only the daemon was judged |
+| `planned_down` | whether the member is already planned down (`POST /v1/members/{id}` with `planned_down`). It does not make the stop unsafe: the member is already out of the write path |
+
+`{id}` is a storage member's number (`GET /v1/members` lists them; `2` for member `m2`)
+or the id of the node that runs it. The answer is the storage
+gate of the update controller, asked with this member out: every **other** member must be
+`active`, heard within the membership's time to live (15 s by default), not planned down,
+and report a repair debt that is zero (a debt that is not reported is not zero, and a
+report older than two heartbeat intervals is not a report); and at
+least one other member must exist to hold the second copy. The member's own state is not
+asked, so a member that is already planned down, or already down, is safe to stop; its own
+repair debt is. Each way the gate is shut is its own line in `reasons`:
+
+| `reasons` line | Meaning |
+|---|---|
+| `member mN is Down`, `is Draining` or `is Joining` | a second member is not `active` |
+| `member mN is catching up` | a second member is rebuilding its index |
+| `member mN is planned down` | a second member is already out for a planned restart |
+| `member mN was not heard within the time to live` | a second member counts as down |
+| `member mN does not report its repair debt` | its debt is unknown |
+| `member mN owes B blobs` | a member, the one asked about included, owes copies |
+| `no other member holds the second copy` | the member is the only one |
+
+`mN` is the member's id as the server writes it (`m2`). When several things are wrong, the
+line is the worst one: a second member down before a debt.
+
+A node id is judged by the storage member that is the node's storage half, joined as the
+update controller joins a host to its member: the address the node advertised when it
+enrolled (`GET /v1/enroll/nodes`) is the address one member registered. That member's
+answer is the node's, the same body as asking by the member's number. A node that has no
+storage half is a daemon, which drains in its own stop and needs no permit: a Mac, a Linux
+node enrolled with no storage address, and any node of a server without a state store
+(such a server keeps no storage members) answer `200` with `"safe": true` and a `reasons`
+line that says only the daemon was judged. A Linux node that cannot be told from one with a
+member answers `409` with `{"error": ...}` saying why, never safe: the enrollment registry
+does not know it or cannot be read, or its address is no member's or two members'. A
+number is a member's number first, then a node id. `404` with `{"error": ...}` for an
+`{id}` that is neither a member nor a node that has registered with this server
+(`GET /v1/nodes`). `503` when the state store cannot be read, `500` when a stored row does
+not decode; `401`, `403` or `415` from the gates.
+
+The answer is about the members as the server sees them now: a heartbeat is up to a time
+to live old, so the updater asks again just before it stops, and a `false` is retried
+rather than overridden.
 
 ## `GET /v1/denied`, `POST /v1/denied` and `DELETE /v1/denied`
 
@@ -1295,14 +1371,6 @@ could not keep. Without the flag these families are absent and nothing is record
 | `kbf_history_pending_rows` | gauge | index rows the writer has not applied yet |
 | `kbf_history_open_invocations` | gauge | invocations the writer holds state for |
 
-The release poller (`--release-poll-every-secs`, on the active frontend) adds these families
-while it runs; without it they are absent.
-
-| Family | Type | What it measures |
-|---|---|---|
-| `kbf_release_poll_polls_total`, `kbf_release_poll_not_modified_total`, `kbf_release_poll_proposals_total`, `kbf_release_poll_errors_total` | counter | the release poller's polls begun, polls answered "not modified", proposals written and polls that failed (the request, the feed or the update rows); present only when the poller runs |
-| `kbf_release_poll_ignored_total{reason}` | counter | feed entries that were not candidates, by the first reason met: `malformed`, `draft`, `prerelease`, `not_version_tag`, `no_commit`, `ref_not_allowed`, `no_checksums`, `unattested` |
-
 **Reading a stall with idle slots.** `kbf_sched_queued` high and `kbf_sched_leases` below the
 nodes' slots means work is waiting that placement cannot use (look at the node's booking and
 `GET /v1/nodes`). `kbf_sched_queued` low while buck2 has many Executes open means they have not
@@ -1992,7 +2060,8 @@ for the whole of its retries is `503` with `Retry-After: 1`: send it again.
 
 - `GET /v1/update` is open: `{"desired": null | {"generation", "commit", "set_at_ms"},
   "paused": bool, "policy": null | {...}, "proposals": [...], "releases": <the body of GET /v1/releases>}`.
-  `proposals` are the releases the release poller found (`--release-poll-every-secs`), oldest
+  `proposals` are the rows under `update/proposed/` (the release poller that wrote them was
+  removed; the list is empty on a new farm and keeps the rows an older one wrote), oldest
   first, each `{"commit", "tag", "published_at_secs", "proposed_at_ms"}`: the newest published
   GitHub release of a `v*` tag whose notes name an allowed ref and a commit and that lists
   `SHA256SUMS` and a provenance bundle for each tarball. Nothing is verified and nothing is

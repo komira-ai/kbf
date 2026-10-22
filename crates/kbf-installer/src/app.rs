@@ -17,21 +17,18 @@ use kbf_host::{HostExec, HostPath, Root};
 
 use crate::activate;
 use crate::boot_schema;
-use crate::cli::{
-    BootArgs, Cli, MigrateArgs, Mode, ReleaseSource, RunArgs, ServiceArgs, UninstallArgs, Verb,
-};
+use crate::cli::{BootArgs, Cli, Mode, RunArgs, ServiceArgs, Verb};
 use crate::database::Database;
 use crate::exit::Exit;
 use crate::helper::cycle::{Config, Helper, HelperError};
 use crate::helper::fetcher_host::HostFetcher;
-use crate::helper::host_mode;
 use crate::helper::leases;
 use crate::helper::operator::{self, Operator};
 use crate::helper::restart::Restart;
 use crate::helper::serve::{FileIdentity, Flow, PASS_INTERVAL, Serve};
 use crate::helper::service::HostProcs;
+use crate::host_mode;
 use crate::layout::{Layout, Platform};
-use crate::migrate;
 use crate::proxy_verb;
 use crate::release::ReleaseError;
 use crate::setup;
@@ -326,236 +323,6 @@ fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), Failure> {
     }
 }
 
-/// The user that must own every file the migration reads and writes. On a host every file
-/// belongs to root. Under `--root` (a rehearsal, a test) the tree is the caller's own, so the
-/// owner to expect is the caller: nobody gains anything by it, since root and a stranger
-/// alike only reach what they already could.
-pub(crate) fn owner_uid(rehearsal: bool, euid: u32) -> u32 {
-    if rehearsal { euid } else { 0 }
-}
-
-/// The user the version probe runs as: the failure when the host cannot say, has no such
-/// user, or the user is root (outside a rehearsal). (The generic part is one call; what it
-/// does with the answer is [`user_found`], so that there is one copy of it to run.)
-fn probe_user<E: kbf_host::Exec>(
-    exec: &E,
-    name: &str,
-    rehearsal: bool,
-    platform: Platform,
-) -> Result<kbf_host::RunUser, Failure> {
-    let user = user_found(
-        kbf_host::user::lookup_on(exec, name, platform.user_db()),
-        name,
-    )?;
-    // The probe runs a binary nobody has trusted yet, and who it runs as is the whole of what
-    // it is confined by (settings refuse root for the same reason). A rehearsal runs on the
-    // caller's own tree as the caller, whoever that is.
-    if !rehearsal && (user.uid == 0 || user.gid == 0) {
-        return Err(Failure {
-            exit: Exit::Usage,
-            why: format!(
-                "--fetch-user {name:?} is root (uid {}, gid {}): the version probe runs \
-                 binaries nobody has trusted yet and must not run as root",
-                user.uid, user.gid
-            ),
-        });
-    }
-    Ok(user)
-}
-
-fn user_found(
-    found: Result<Option<kbf_host::RunUser>, kbf_host::user::UserError>,
-    name: &str,
-) -> Result<kbf_host::RunUser, Failure> {
-    found
-        .map_err(|e| Failure::from(e.to_string()))?
-        .ok_or_else(|| Failure {
-            exit: Exit::Usage,
-            why: format!("no user {name:?} to run the version probe as"),
-        })
-}
-
-/// Where the replay floor of a host whose releases come from `source` is seeded from. Only a
-/// frontend can be asked for it; a `url` host and a `bundled` one have none to ask, so the floor
-/// is `--min-generation` or, said aloud, nothing.
-fn floor_source(source: ReleaseSource) -> migrate::Source {
-    match source {
-        ReleaseSource::Url | ReleaseSource::Bundled => migrate::Source::Url,
-        ReleaseSource::Frontend => migrate::Source::Frontend,
-    }
-}
-
-/// `migrate`: the report to print, or why it stopped.
-fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String, Failure> {
-    let rehearsal = root != Path::new("/");
-    let (layout, mut exec) = host(root)?;
-    let owner = owner_uid(rehearsal, rustix::process::geteuid().as_raw());
-    let (user, made) = probe_account(&mut exec, &layout, args, apply, rehearsal, owner)?;
-    // A node that is not on a host with the user simply has no owner for its spool: the
-    // migration says so and leaves the node's `kbf.toml` as it is.
-    let node_user = kbf_host::user::lookup_on(
-        &exec,
-        crate::setup::plan::service_user_name(crate::cli::Mode::Daemon),
-        layout.platform().user_db(),
-    )
-    .ok()
-    .flatten();
-    let m = migrate::Migration {
-        roots: migrate::Roots::new(layout.platform()),
-        layout,
-        run_as: crate::run::RunAs {
-            uid: user.uid,
-            gid: user.gid,
-        },
-        owner_uid: owner,
-        units: args.units.clone(),
-        helper_unit: args.helper_unit.clone(),
-        installer_unit: args.installer_unit.clone(),
-        seed: migrate::Seed {
-            source: floor_source(args.release_source),
-            min_generation: args.min_generation,
-        },
-        node_user,
-        lock_wait: operator::LOCK_WAIT,
-    };
-    let mode = if apply {
-        kbf_host::Mode::Apply
-    } else {
-        kbf_host::Mode::DryRun
-    };
-    let report = if args.rollback {
-        migrate::rollback(&m, &mut exec, mode)
-    } else {
-        // Nothing can fetch a release from its commit alone yet, and there is no frontend
-        // client: every release is adopted unverified, and the report says so.
-        let hooks = migrate::Hooks {
-            runner: &crate::run::SystemRunner,
-            verifier: &migrate::NotWired,
-            frontend: &migrate::NoFrontend,
-        };
-        migrate::migrate(&m, &mut exec, &hooks, mode)
-    }
-    .map_err(|e| Failure {
-        exit: e.exit(),
-        why: e.to_string(),
-    })?;
-    let mut shown = made;
-    shown.push(report.to_string().trim_end().to_owned());
-    Ok(shown.join("\n"))
-}
-
-/// `uninstall`: the report to print, or why it stopped. Nothing is looked up: the verb
-/// removes files and a job, and runs no program of the host's releases.
-fn uninstall_verb(root: PathBuf, apply: bool, args: &UninstallArgs) -> Result<String, Failure> {
-    let rehearsal = root != Path::new("/");
-    let (layout, mut exec) = host(root)?;
-    let u = migrate::Uninstall {
-        roots: migrate::Roots::new(layout.platform()),
-        layout,
-        owner_uid: owner_uid(rehearsal, rustix::process::geteuid().as_raw()),
-        installer_unit: args.installer_unit.clone(),
-        lock_wait: operator::LOCK_WAIT,
-    };
-    let mode = if apply {
-        kbf_host::Mode::Apply
-    } else {
-        kbf_host::Mode::DryRun
-    };
-    migrate::uninstall(&u, &mut exec, mode)
-        .map(|report| report.to_string().trim_end().to_owned())
-        .map_err(|e| Failure {
-            exit: e.exit(),
-            why: e.to_string(),
-        })
-}
-
-/// The account the version probe runs as, and the lines of the steps that made it. The first
-/// step of an applying migration (before the first look at the old layout runs a binary): on a
-/// Mac with the platform's own fetch account (no `--fetch-user`, or its name), that has an old
-/// layout to migrate, the account is made when it is not there ([`make_fetch_user`]). Not in a
-/// dry run (it changes nothing, so the account must exist already, and says how it comes to),
-/// not in a rollback, and not in a rehearsal under `--root` (the host's accounts are not the
-/// rehearsal's to change).
-fn probe_account<E: kbf_host::Exec>(
-    exec: &mut E,
-    layout: &Layout,
-    args: &MigrateArgs,
-    apply: bool,
-    rehearsal: bool,
-    owner: u32,
-) -> Result<(kbf_host::RunUser, Vec<String>), Failure> {
-    let platform = layout.platform();
-    let standard = setup::plan::fetch_user(platform);
-    let name = args.fetch_user.as_deref().unwrap_or(standard);
-    let mut made = Vec::new();
-    if apply
-        && !args.rollback
-        && !rehearsal
-        && name == standard
-        && matches!(
-            migrate::guard(layout, owner),
-            Err(migrate::MigrateError::Unmigrated(_))
-        )
-    {
-        made = make_fetch_user(exec, platform)?;
-    }
-    let user = probe_user(&*exec, name, rehearsal, platform).map_err(|f| {
-        if !apply && name == standard && platform == Platform::MacOs {
-            Failure {
-                why: format!(
-                    "{}; a dry run changes nothing and cannot make it: `migrate --apply` creates it, the way setup does",
-                    f.why
-                ),
-                ..f
-            }
-        } else {
-            f
-        }
-    })?;
-    Ok((user, made))
-}
-
-/// The fetch account on a Mac, made by the plan `setup` uses for it ([`setup::plan::fetch_user_plan`]:
-/// one definition of the account, so what `migrate` makes is what `setup` finds): the lines
-/// of the steps run, none when the account is there with the shape `setup` makes. An account
-/// of the wrong shape (uid, shell, home) is refused, not changed. On Linux the package's
-/// sysusers entry makes `kbf-fetch` when the package is installed, which `migrate` needs
-/// anyway, so there is nothing to make (and `setup` is not a prerequisite there either).
-fn make_fetch_user<E: kbf_host::Exec>(
-    exec: &mut E,
-    platform: Platform,
-) -> Result<Vec<String>, Failure> {
-    if platform != Platform::MacOs {
-        return Ok(Vec::new());
-    }
-    let plan = {
-        let os = setup::os::SystemOs::new(&*exec, platform);
-        setup::plan::fetch_user_plan(&os, &*exec)
-    }
-    .map_err(|e| Failure {
-        exit: e.exit(),
-        why: e.to_string(),
-    })?;
-    let mut lines = Vec::new();
-    for step in plan.steps() {
-        exec.apply(step)
-            .map_err(|e| Failure::from(format!("{step}: {e}")))?;
-        lines.push(format!("+ {step}"));
-    }
-    Ok(lines)
-}
-
-/// Refuses while the old layout's state is the host's and no migration finished.
-fn old_layout_guard(root: &Path) -> Result<(), Failure> {
-    let rehearsal = root != Path::new("/");
-    let (layout, _) = host(root.to_owned())?;
-    let owner = owner_uid(rehearsal, rustix::process::geteuid().as_raw());
-    migrate::guard(&layout, owner).map_err(|e| Failure {
-        exit: e.exit(),
-        why: e.to_string(),
-    })
-}
-
 /// A verb of the operator, run inline under the lock.
 fn operate(
     root: PathBuf,
@@ -692,27 +459,9 @@ fn update_verb(
     crate::deploy::update::run(args, out, err)
 }
 
-/// How a `migrate` that went through ends: its report on `out`, as text, or with `--json` as
-/// one object. (A failure is said like every other verb's, by `dispatch`.)
-fn finish_migrate(json: bool, apply: bool, report: &str, out: &mut dyn Write) -> Exit {
-    finish_report("migrate", json, apply, report, out)
-}
-
-/// [`finish_migrate`] for the verb `verb`, which reports the same way (`uninstall`).
-fn finish_report(verb: &str, json: bool, apply: bool, report: &str, out: &mut dyn Write) -> Exit {
-    // A closed pipe is the reader's business; the exit code still tells.
-    let _ = if json {
-        let object = serde_json::json!({"verb": verb, "apply": apply, "message": report});
-        writeln!(out, "{object}")
-    } else {
-        writeln!(out, "{report}")
-    };
-    Exit::Ok
-}
-
 /// Carry out `cli` as the user `euid`. A verb that fails or is not built says so: as text on
 /// `err`, or with `--json` as one object on `out`. A verb that succeeds prints nothing here,
-/// except `setup` (its steps) and `migrate` (its report).
+/// except `setup` (its steps).
 pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) -> Exit {
     // `update` prints its own summary line and needs no root: it is a client of the update API.
     if let Verb::Update(args) = &cli.verb {
@@ -738,19 +487,6 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
             serde_json::json!({"verb": name, "error": "needs_root", "euid": euid}),
         );
     }
-    // The old helper and the installer never both manage one host: while the old layout's
-    // state is the host's and no migration finished, the verbs that manage it wait.
-    // (A verb that is not built yet only says so; the PR that builds it calls this first.)
-    if cli.verb.built_by().is_none()
-        && cli.verb.manages_host()
-        && let Err(f) = old_layout_guard(&root_of(cli))
-    {
-        return say(
-            f.exit,
-            format!("kbf-installer: {name}: {}", f.why),
-            serde_json::json!({"verb": name, "error": "unmigrated", "message": f.why}),
-        );
-    }
     if let Verb::Proxy(args) = &cli.verb {
         return match proxy_verb::run(args, &root_of(cli)) {
             Ok(()) => Exit::Ok,
@@ -770,16 +506,6 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         }
         Verb::Run(args) => run(root_of(cli), args),
         Verb::BootCheck(args) => boot_check(root_of(cli), args),
-        // The report is the result of `migrate`: it is printed here, a failure goes on to
-        // be said like every other verb's.
-        Verb::Migrate(args) => match migrate_verb(root_of(cli), cli.apply, args) {
-            Ok(report) => return finish_migrate(cli.json, cli.apply, &report, out),
-            Err(failure) => Err(failure),
-        },
-        Verb::Uninstall(args) => match uninstall_verb(root_of(cli), cli.apply, args) {
-            Ok(report) => return finish_report(name, cli.json, cli.apply, &report, out),
-            Err(failure) => Err(failure),
-        },
         Verb::Confirm(n) => operate(root_of(cli), cli.apply, n.service.restart(), |o| {
             o.confirm(&n.id.to_string())
         }),
@@ -833,10 +559,6 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
 #[cfg(test)]
 #[path = "app_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "app_fetch_user_tests.rs"]
-mod fetch_user_tests;
 
 /// Start `me` in this process's place with this process's arguments; returns only the error
 /// of a start that failed. Not `Command::exec`: the standard library puts SIGPIPE back to its

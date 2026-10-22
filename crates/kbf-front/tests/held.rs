@@ -1,7 +1,6 @@
 //! The Held set (`docs/design/storage-ram-ack.md`): blobs a node holds in RAM and has
-//! acknowledged but not yet written to its disk. Nothing puts a blob there in a running
-//! node yet; these tests put blobs there through `Cache::hold_for_test` and check what
-//! each reader does: every one consults the set before the index (rule 1, never report
+//! acknowledged but not yet written to its disk. These tests put blobs there through
+//! `Cache::hold_for_test` and check what each reader does: every one consults the set before the index (rule 1, never report
 //! present what you cannot serve), and the durable question does not consult it.
 //!
 //! Each reader's test holds a blob that is **only** held (not in the index), so a reader
@@ -66,8 +65,7 @@ fn absent() -> Digest {
 
 /// Catches `find_missing` (rule 1, and the write dedup and `QueryWriteStatus` that read
 /// it) skipping the set: a blob that is only held is present, one that is indexed is
-/// present, and the absent one and the empty blob are as before. Mutant: `find_missing`
-/// asks the index for every digest.
+/// present, and the absent one and the empty blob are as before.
 #[tokio::test]
 async fn find_missing_counts_a_held_blob_present() {
     let (held, indexed) = (blob(1, 100), blob(2, 100));
@@ -82,7 +80,7 @@ async fn find_missing_counts_a_held_blob_present() {
     );
 }
 
-/// Catches `present` skipping the set. Mutant: `present` asks the index alone.
+/// Catches `present` skipping the set.
 #[tokio::test]
 async fn present_counts_a_held_blob_present() {
     let (held, indexed) = (blob(3, 100), blob(4, 100));
@@ -95,7 +93,6 @@ async fn present_counts_a_held_blob_present() {
 }
 
 /// Catches `is_complete` (the `QueryWriteStatus` answer of a cache) skipping the set.
-/// Mutant: `is_complete` asks the index alone.
 #[tokio::test]
 async fn a_held_blob_is_complete_for_a_write_status() {
     let held = blob(5, 100);
@@ -108,7 +105,7 @@ async fn a_held_blob_is_complete_for_a_write_status() {
 /// though the node can serve it), and a held read that serves wrong bytes: the whole blob,
 /// a range inside one window, and a range across the boundary of two windows of a blob of
 /// more than one all read back the held bytes, hashed as any read is; an absent blob is
-/// still NOT_FOUND. Mutant: `read_windows` asks the index alone.
+/// still NOT_FOUND.
 #[tokio::test]
 async fn a_held_blob_is_read_from_memory() {
     let small = blob(6, 1000);
@@ -143,9 +140,8 @@ async fn a_held_blob_is_read_from_memory() {
 }
 
 /// Catches the batch read skipping the set, and answering a held blob wrongly beside
-/// indexed and absent ones: one call over a held blob (asked twice), an indexed blob and an
-/// absent one answers each by its own rule. Mutant: `read_blobs` asks the index for every
-/// digest.
+/// indexed and absent ones: one call over a held blob (asked twice), an indexed blob and
+/// an absent one answers each by its own rule.
 #[tokio::test]
 async fn a_batch_read_serves_held_blobs_beside_indexed_and_absent_ones() {
     let (held, indexed) = (blob(8, 300), blob(9, 300));
@@ -167,8 +163,7 @@ async fn a_batch_read_serves_held_blobs_beside_indexed_and_absent_ones() {
 /// Catches the durable question consulting the set (a record that names a blob could then
 /// be written for one a restart loses), and one that counts nothing for the empty blob:
 /// `durable` names the held-only blob and the absent one missing, not the indexed one or
-/// the empty one. Mutant: `durable` skips the digests the set holds (the Held-consulting
-/// durable reader).
+/// the empty one.
 #[tokio::test]
 async fn the_durable_question_does_not_count_a_held_blob() {
     let (held, indexed) = (blob(10, 100), blob(11, 100));
@@ -183,10 +178,9 @@ async fn the_durable_question_does_not_count_a_held_blob() {
     assert_eq!(cache.find_missing(&asked).await.expect("found"), [absent()]);
 }
 
-/// Catches a store that trusts the set (a blob stored while only held would be answered
-/// as stored and never reach the index, so a caller that wrote something durable naming it
+/// Catches a store that trusts the set (a blob stored while only held would be answered as
+/// stored and never reach the index, so a caller that wrote something durable naming it
 /// would be wrong): `store_blobs` of a held blob writes it, and `durable` then counts it.
-/// Mutant: `held()`, the store's dedup, looks at the set.
 #[tokio::test]
 async fn storing_a_held_blob_writes_it() {
     let held = blob(12, 100);
@@ -205,9 +199,8 @@ async fn storing_a_held_blob_writes_it() {
 /// Catches an insert that overwrites (the second writer of a digest would take the first
 /// writer's entry, and the first's drain would remove an entry the second depends on), and
 /// a drop that reports a blob that was not held: the second `hold` of a digest reports it
-/// was held already, the first release removes it, the second finds nothing, and the
-/// blob is then absent to every reader. Mutant: `try_insert` always inserts and reports
-/// true.
+/// was held already, the first release removes it, the second finds nothing, and the blob
+/// is then absent to every reader.
 #[tokio::test]
 async fn a_digest_is_held_once_and_released_once() {
     let held = blob(13, 100);
@@ -300,8 +293,7 @@ fn draining_between_the_steps(blob: &Blob) -> Arc<MemCache> {
 /// blob that moves from one to the other between the two steps. Each reader is parked
 /// between its steps by the hook, which lets the index take the blob and the set drop it;
 /// every reader still finds the blob. Catches a reader that looks at the index before the
-/// set (it would see the blob in neither). Mutants: `find_missing` and `read_windows` with
-/// the steps swapped.
+/// set (it would see the blob in neither).
 #[tokio::test]
 async fn a_blob_moving_from_the_set_to_the_index_between_the_steps_is_never_missed() {
     for reader in Reader::ALL {
@@ -313,10 +305,9 @@ async fn a_blob_moving_from_the_set_to_the_index_between_the_steps_is_never_miss
 
 /// The drain race for a batch (T6, batch form): `read_blobs` over a held blob that moves
 /// to the index mid-read, an indexed blob, and an absent one answers every digest. The
-/// held bytes and the unheld list come from one look at the set, so a blob the drain
-/// moves between that look and the index query is in the set's part or the index's,
-/// never in neither. Mutant: `read_blobs` looks at the set twice (the unheld list, then
-/// the held bytes) with the drain between them: the moving blob is in no answer.
+/// held bytes and the unheld list come from one look at the set, so a blob the drain moves
+/// between that look and the index query is in the set's part or the index's, never in
+/// neither.
 #[tokio::test]
 async fn a_batch_read_never_loses_a_blob_the_drain_moves_mid_read() {
     let moving = blob(15, 300);
@@ -390,10 +381,9 @@ fn node(cache: &Arc<MemCache>) -> RemoteStorage {
     )
 }
 
-/// Catches the header not reaching the cache, and a plain FindMissing that does not
-/// count a held blob: over the wire, `FindMissingBlobs` counts the held blob present, and
-/// with `kbf-durable: only` names it missing, the indexed blob present in both. Mutant:
-/// `CacheStorage::find_durable` answers `find_missing`.
+/// Catches the header not reaching the cache, and a plain FindMissing that does not count
+/// a held blob: over the wire, `FindMissingBlobs` counts the held blob present, and with
+/// `kbf-durable: only` names it missing, the indexed blob present in both.
 #[tokio::test]
 async fn the_durable_header_ignores_the_set_over_the_wire() {
     let (held, indexed) = (blob(15, 100), blob(16, 100));
@@ -413,8 +403,7 @@ async fn the_durable_header_ignores_the_set_over_the_wire() {
 /// Catches a write's dedup (`write_in`, which asks the plain FindMissing before it opens a
 /// stream) writing a blob the node already holds in RAM: a `Write` of a held blob is
 /// acknowledged with its digest and stores nothing (the index still lacks it), as one of
-/// an indexed blob is; a `Write` of a blob not held is stored and durable. Mutant:
-/// `Cache::find_missing` skips the set (the write would store it).
+/// an indexed blob is; a `Write` of a blob not held is stored and durable.
 #[tokio::test]
 async fn a_write_of_a_held_blob_is_acknowledged_without_a_second_copy() {
     let (held, fresh) = (blob(17, 100), blob(18, 100));

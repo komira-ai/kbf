@@ -6,7 +6,7 @@ use kbf_sched::RequeueReason;
 use kbf_types::{Digest, Failure, LeaseId, OperationId, WorkerId};
 
 use crate::record::{Text, outcome_bytes, output_bytes, run_bytes, shape_bytes};
-use crate::run::{ActionShape, Run};
+use crate::run::{ActionShape, Evidence, Run};
 
 /// A wall-clock time, in microseconds since the Unix epoch, read by the caller.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -73,6 +73,8 @@ pub enum Event {
         command: Digest,
         /// The Command's shape, when the server read one.
         shape: Option<Box<ActionShape>>,
+        /// What the front knew of the call at submit, when it sent it.
+        evidence: Option<Evidence>,
     },
     /// A lease of `operation` was granted on `worker`.
     Granted {

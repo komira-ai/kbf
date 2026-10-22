@@ -452,3 +452,49 @@ fn the_fill_fingerprint_field_is_pinned() {
     let old = pb::HeartbeatRequest::decode(&[0x78, 5][..]).expect("decodes");
     assert_eq!((old.tail_epoch_done, old.fill_fp), (5, 0));
 }
+
+// Catches: the node facts (what a node runs and what its metadata log is at) moved to other
+// numbers or other wire types, which would make a node and a frontend of two builds read
+// different things from the same bytes; a fact of 0 read as absent, or an absent one as 0
+// (each field has presence, and a node of an older build sends none of them). The
+// registration carries them on fields 10 to 12 and the heartbeat on 24 to 26, whose tags
+// take two bytes (0xc0 0x01, 0xc8 0x01 and 0xd2 0x01); the two numbers are plain varints
+// and the commit is a string.
+#[test]
+fn the_node_facts_fields_are_pinned_and_have_presence() {
+    let register = pb::RegisterRequest {
+        runs_log: Some(5),
+        log_version: Some(0),
+        build_commit: Some("ab".to_owned()),
+        ..Default::default()
+    };
+    assert_eq!(
+        register.encode_to_vec(),
+        [0x50, 5, 0x58, 0, 0x62, 2, b'a', b'b'],
+        "fields 10 to 12"
+    );
+    let zero = pb::RegisterRequest::decode(&[0x58, 0][..]).expect("decodes");
+    assert_eq!(zero.log_version, Some(0), "zero is a version");
+    assert_eq!((zero.runs_log, zero.build_commit), (None, None));
+    let old = pb::RegisterRequest::decode(&[0x08, 1][..]).expect("decodes");
+    assert_eq!((old.runs_log, old.log_version), (None, None));
+    assert_eq!(old.build_commit, None);
+
+    let beat = pb::HeartbeatRequest {
+        runs_log: Some(5),
+        log_version: Some(0),
+        build_commit: Some("ab".to_owned()),
+        ..Default::default()
+    };
+    assert_eq!(
+        beat.encode_to_vec(),
+        [0xc0, 1, 5, 0xc8, 1, 0, 0xd2, 1, 2, b'a', b'b'],
+        "fields 24 to 26"
+    );
+    let zero = pb::HeartbeatRequest::decode(&[0xc8, 1, 0][..]).expect("decodes");
+    assert_eq!(zero.log_version, Some(0), "zero is a version");
+    assert_eq!((zero.runs_log, zero.build_commit), (None, None));
+    let old = pb::HeartbeatRequest::decode(&[0x08, 1, 0x10, 2][..]).expect("decodes");
+    assert_eq!((old.runs_log, old.log_version), (None, None));
+    assert_eq!(old.build_commit, None);
+}

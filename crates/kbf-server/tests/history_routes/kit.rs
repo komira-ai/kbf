@@ -36,6 +36,7 @@ pub fn run(id: &str, instance: &str, shape: ActionShape, n: u8, exit_code: i32) 
         action: digest(u64::from(n)),
         command: digest(99),
         shape: Some(Box::new(shape)),
+        evidence: None,
     };
     events.insert(1, command);
     events

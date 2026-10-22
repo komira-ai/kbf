@@ -14,7 +14,10 @@
 //!   slot A as a candidate, made to take the generation (a cold start with an epoch bump,
 //!   FP sections 6 and 8: [`super::cold`], the same steps as a restart in the middle of an
 //!   update) and routed to. If `status.json` names no release, or its binary is missing or
-//!   not executable, nothing is started: no other release is picked.
+//!   not executable, nothing is started: no other release is picked. The one exception is a
+//!   proxy that keeps its own copies of `kbf` (`--kbf-binary`, [`Adopt`]): its status file
+//!   is its own `releases.json`, and when that records no installed release the kbf the
+//!   package installed is copied and recorded as the installed one, and is what starts.
 //! - **Both slots have one**: left held; which one serves is the child's role to say.
 //!
 //! Anything else is left held: the proxy then answers `UNAVAILABLE` after the bound and
@@ -26,12 +29,14 @@
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::child_real::{Argv, ProcChild};
 use kbf_proxy::config::UpstreamTable;
 use kbf_proxy::route::Target;
 
 use super::admin::{Admin, Deadlines};
+use super::binary_watch::InUse;
 use super::boot::{Booted, ColdBoot, Reason, Report, Retry, Source};
 use super::child_http::Headers;
 use super::cold::{Cold, ReadyRule};
@@ -40,9 +45,11 @@ use super::migrator::{DbMigrator, installed_schema};
 use super::model::{PortError, ProcIdent, RoleState, Slot, Start, Timing};
 use super::ports::{Child as _, ChildAdmin, Clock, Migrator, StatusFacts};
 use super::record::FileRecorder;
+use super::releases::Local;
 use super::root_orders::installed_commit;
 use crate::CommitId;
 use crate::database::Database;
+use crate::layout::Layout;
 use crate::run::{Runner, SystemRunner};
 
 /// How the start ended.
@@ -59,13 +66,54 @@ pub fn children_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("children")
 }
 
+/// Where the releases are that the children run and the swap looks for: the proxy's own copies
+/// when it keeps them, else `releases/` of the host's layout.
+pub fn releases_of(local: Option<&Local>, layout: &Layout) -> PathBuf {
+    local.map_or_else(
+        || layout.join(&layout.releases()),
+        |local| local.copies.root().to_owned(),
+    )
+}
+
+/// `child`, running the proxy's own copies when it keeps them. Without, it is returned as it
+/// is: its releases are the layout's.
+pub fn run_from_copies(child: ProcChild, local: Option<&Local>) -> ProcChild {
+    match local {
+        Some(local) => child.with_releases(local.copies.root().to_owned()),
+        None => child,
+    }
+}
+
+/// The commits the records of the two slots name: what `child` started in a slot and no exit
+/// has cleared, so a process of that release may still run. Its copy is not to be removed.
+pub fn running_commits(child: &ProcChild) -> Vec<CommitId> {
+    [Slot::A, Slot::B]
+        .into_iter()
+        .filter_map(|slot| child.recorded(slot))
+        .map(|recorded| recorded.commit)
+        .collect()
+}
+
+/// What the binary watch asks for the commits a process may still run: [`running_commits`] of
+/// `child`, read at each prune.
+pub fn in_use(child: Arc<ProcChild>) -> InUse {
+    Box::new(move || running_commits(&child))
+}
+
 /// The command line of a frontend child after its program: its mode, the four loopback
 /// listeners at the slot's ports in `table` (`kbf-proxy`'s upstream table: REAPI, worker,
-/// operator and admin), the proxy's secret file, and `--await-takeover` for a candidate. The
-/// child's own configuration (stores, TLS) is its `kbf.toml`. Nothing here names an
-/// instance: `--instance` needs a handover socket, and the two slots do not hand over.
-pub fn frontend_argv(proxy_auth_file: &Path, table: UpstreamTable) -> Argv {
+/// operator and admin), the proxy's secret file, `--config=` when `installer.toml` names a
+/// file for the children (`frontend_config`) and `--await-takeover` for a candidate. The
+/// child's own configuration (stores, TLS) is that file, else the default `kbf.toml`. Nothing
+/// here names an instance: `--instance` needs a handover socket, and the two slots do not hand
+/// over.
+pub fn frontend_argv(
+    proxy_auth_file: &Path,
+    table: UpstreamTable,
+    config_file: Option<&Path>,
+) -> Argv {
     let secret = proxy_auth_file.to_owned();
+    let config = config_file.map(Path::to_owned);
     Box::new(move |slot, start| {
         let slot = gate_slot(slot);
         let mut proxy_auth = OsString::from("--proxy-auth-file=");
@@ -79,6 +127,11 @@ pub fn frontend_argv(proxy_auth_file: &Path, table: UpstreamTable) -> Argv {
             listen("admin-listen", table.admin_port(slot)),
             proxy_auth,
         ];
+        if let Some(file) = &config {
+            let mut flag = OsString::from("--config=");
+            flag.push(file);
+            argv.push(flag);
+        }
         if start == Start::Candidate {
             argv.push(OsString::from("--await-takeover"));
         }
@@ -136,9 +189,22 @@ pub struct Boot<'a> {
     /// [`host_migrator`]'s: the proxy does not start a release on a schema it cannot run on.
     pub migrator: &'a dyn Migrator,
     pub report: &'a dyn Report,
+    /// The status file the installed release is read from: the root half's `status.json`, or
+    /// the proxy's own `releases.json` (which has the same shape) with `adopt`.
     pub status: &'a Path,
     pub timing: Timing,
     pub retry: Retry,
+    /// What a cold start does when `status` records no installed release: with the proxy's
+    /// own copies (`--kbf-binary`), adopt the kbf the package installed. Without, nothing: the
+    /// root half is the one that installs, and a start without a record is held.
+    pub adopt: Option<Adopt<'a>>,
+}
+
+/// The kbf a cold start adopts as the installed release when none is recorded, and how it is
+/// run to be copied.
+pub struct Adopt<'a> {
+    pub local: &'a Local,
+    pub runner: &'a dyn Runner,
 }
 
 /// The migration hook of a proxy that starts on a database a test does not have: it migrates
@@ -154,9 +220,10 @@ impl Migrator for NoMigration {
 }
 
 /// The verb's migration hook: [`DbMigrator`] over the database `installer.toml` names, for
-/// the release a cold start is about to run. `facts` is the root half's `status.json`; the
-/// installed release's `state_schema` (which `status.json` does not keep across a restart of
-/// the root half) is asked of its own binary under `child`'s layout, run as the proxy's user.
+/// the release a cold start is about to run. `facts` is the root half's `status.json` (with
+/// `--kbf-binary`, the proxy's own `releases.json`); the installed release's `state_schema`
+/// (which `status.json` does not keep across a restart of the root half) is asked of its own
+/// binary under `child`'s layout, run as the proxy's user.
 /// A refusal carries a stable word ([`super::migrator::Refusal::word`]) and no part of the
 /// database URL.
 pub fn host_migrator<'a>(
@@ -258,6 +325,7 @@ fn start_installed(
     let source = HostSource {
         status: boot.status,
         child,
+        adopt: boot.adopt.as_ref(),
     };
     let keep = || gate.keep_startup_hold().is_ok();
     let run = ColdBoot {
@@ -282,11 +350,17 @@ fn start_installed(
 struct HostSource<'a> {
     status: &'a Path,
     child: &'a ProcChild,
+    adopt: Option<&'a Adopt<'a>>,
 }
 
 impl Source for HostSource<'_> {
+    /// The release `status` records. When it records none and the proxy keeps its own copies,
+    /// the kbf the package installed is copied and recorded, and is the installed release.
     fn installed(&self) -> Result<Option<CommitId>, PortError> {
-        installed_commit(self.status)
+        match (installed_commit(self.status)?, self.adopt) {
+            (None, Some(adopt)) => adopt.local.adopt(adopt.runner).map(Some),
+            (recorded, _) => Ok(recorded),
+        }
     }
 
     fn runnable(&self, release: &CommitId) -> Result<(), Reason> {
@@ -314,7 +388,7 @@ impl Source for HostSource<'_> {
         }
         let marker = program
             .parent()
-            .map(|dir| dir.join(crate::stage::VERIFIED))
+            .map(|dir| dir.join(crate::layout::VERIFIED))
             .and_then(|path| file(&path));
         marker.map(drop).ok_or(Reason::NotVerified)
     }
@@ -336,3 +410,7 @@ fn take_generation(cold: &Cold<'_>, slot: Slot, ident: &ProcIdent, what: &str) -
 #[cfg(test)]
 #[path = "supervisor_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "supervisor_copies_tests.rs"]
+mod copies_tests;

@@ -6,9 +6,11 @@
 
 use std::time::SystemTime;
 
-use kbf_invocation::{NumaBytes, ReapiTimes, Run, RunUsage, WallTime};
+use kbf_invocation::{
+    FootprintUsage, NumaBytes, ReapiTimes, Run, RunUsage, UsageBasis as RunBasis, WallTime,
+};
 use kbf_proto::reapi::ExecutedActionMetadata;
-use kbf_proto::worker::{self, ResourceUsage};
+use kbf_proto::worker::{self, ResourceUsage, UsageBasis};
 use kbf_types::{MemoryKill, MemoryRun};
 use prost_types::Timestamp;
 
@@ -64,11 +66,48 @@ pub(crate) fn killed(run: Run, killed: &MemoryRun) -> Run {
     }
 }
 
-fn run_usage(u: &ResourceUsage) -> RunUsage {
-    let none = worker::CgroupUsage::default();
-    let c = u.cgroup.as_ref().unwrap_or(&none);
+/// The run's usage, from the block its basis names and no other: a footprint basis
+/// reads the footprint block and leaves every cgroup field `None`; a cgroup basis, or
+/// none (a daemon that predates the field), reads the cgroup block when there is one,
+/// and the basis is never inferred from which block is there. A block that is absent
+/// stays absent; it is never filled from the other or made zero.
+pub(crate) fn run_usage(u: &ResourceUsage) -> RunUsage {
+    let carried = RunUsage {
+        node_cpu_pressure_centi: u.node_cpu_pressure_centi,
+        booked_millicpus: u.booked_millicpus,
+        ..RunUsage::default()
+    };
+    if u.basis() == UsageBasis::MacFootprint {
+        let f = u.footprint.unwrap_or_default();
+        return RunUsage {
+            wall_micros: f.wall_micros.unwrap_or(u.wall_micros),
+            basis: RunBasis::MacFootprint,
+            footprint: u.footprint.map(|f| FootprintUsage {
+                peak_footprint_bytes: f.peak_footprint_bytes,
+                cpu_user_micros: f.cpu_user_micros,
+                cpu_system_micros: f.cpu_system_micros,
+                wall_micros: f.wall_micros,
+            }),
+            ..carried
+        };
+    }
+    let basis = if u.basis() == UsageBasis::Cgroup {
+        RunBasis::Cgroup
+    } else {
+        RunBasis::Unspecified
+    };
+    // No block, no counters: nothing is made up for a runtime that has no cgroup (the
+    // daemon's own `wait4` figures), and the basis is whatever the runtime said.
+    let Some(c) = u.cgroup.as_ref() else {
+        return RunUsage {
+            wall_micros: u.wall_micros,
+            basis,
+            ..carried
+        };
+    };
     RunUsage {
         wall_micros: u.wall_micros,
+        basis,
         cpu_usage_micros: c.cpu_usage_micros,
         cpu_user_micros: c.cpu_user_micros,
         cpu_system_micros: c.cpu_system_micros,
@@ -76,6 +115,14 @@ fn run_usage(u: &ResourceUsage) -> RunUsage {
         cpu_throttled_periods: c.cpu_throttled_periods,
         cpu_throttled_micros: c.cpu_throttled_micros,
         memory_peak_bytes: c.memory_peak_bytes,
+        memory_events_max: c.memory_events_max,
+        memory_events_oom_kill: c.memory_events_oom_kill,
+        memory_swap_peak_bytes: c.memory_swap_peak_bytes,
+        memory_anon_swap_peak_bytes: c.memory_anon_swap_peak_bytes,
+        cpu_pressure_some_micros: c.cpu_pressure_some_micros,
+        memory_pressure_some_micros: c.memory_pressure_some_micros,
+        memory_pressure_full_micros: c.memory_pressure_full_micros,
+        cpus_effective: c.cpus_effective,
         numa: c
             .numa
             .iter()
@@ -84,6 +131,7 @@ fn run_usage(u: &ResourceUsage) -> RunUsage {
                 bytes: n.bytes,
             })
             .collect(),
+        ..carried
     }
 }
 
@@ -130,6 +178,7 @@ mod tests {
                 cpu_throttled_micros: Some(16),
                 memory_peak_bytes: Some(17),
                 numa: vec![NumaNodeBytes { node: 1, bytes: 18 }],
+                ..CgroupUsage::default()
             }),
             ..ResourceUsage::default()
         };
@@ -217,6 +266,192 @@ mod tests {
             }
         );
         assert_eq!(run.usage, None);
+    }
+
+    fn cgroup_block() -> CgroupUsage {
+        CgroupUsage {
+            cpu_usage_micros: Some(11),
+            cpu_user_micros: Some(12),
+            cpu_system_micros: Some(13),
+            memory_peak_bytes: Some(17),
+            ..CgroupUsage::default()
+        }
+    }
+
+    fn footprint_block() -> worker::FootprintUsage {
+        worker::FootprintUsage {
+            peak_footprint_bytes: Some(21),
+            cpu_user_micros: Some(22),
+            cpu_system_micros: Some(23),
+            wall_micros: Some(24),
+        }
+    }
+
+    /// Catches: a footprint run read from the cgroup block (the mutant that always
+    /// reads cgroup), the footprint peak filed as `memory_peak_bytes` (a footprint and a
+    /// cgroup peak pooled), and a cgroup block that rides beside a footprint basis
+    /// leaking its counters.
+    #[test]
+    fn a_footprint_basis_reads_the_footprint_block_and_never_the_cgroup_one() {
+        let usage = ResourceUsage {
+            wall_micros: 99,
+            basis: UsageBasis::MacFootprint.into(),
+            footprint: Some(footprint_block()),
+            cgroup: Some(cgroup_block()),
+            ..ResourceUsage::default()
+        };
+        let u = run_usage(&usage);
+        assert_eq!(u.basis, RunBasis::MacFootprint);
+        assert_eq!(
+            u.footprint,
+            Some(FootprintUsage {
+                peak_footprint_bytes: Some(21),
+                cpu_user_micros: Some(22),
+                cpu_system_micros: Some(23),
+                wall_micros: Some(24),
+            })
+        );
+        assert_eq!(u.wall_micros, 24, "the footprint block's own wall time");
+        assert_eq!(
+            [
+                u.cpu_usage_micros,
+                u.cpu_user_micros,
+                u.cpu_system_micros,
+                u.cpu_periods,
+                u.memory_peak_bytes
+            ],
+            [None; 5],
+            "no cgroup field under a footprint basis"
+        );
+    }
+
+    /// Catches: a cgroup run (or an older daemon's, with no basis) reading the
+    /// footprint block, which would file a footprint where a cgroup peak belongs; a
+    /// basis lost; and an absent footprint made into a zero or a block of zeros.
+    #[test]
+    fn a_cgroup_basis_or_none_reads_the_cgroup_block_and_an_absent_block_stays_absent() {
+        let mixed = |basis: UsageBasis| ResourceUsage {
+            basis: basis.into(),
+            footprint: Some(footprint_block()),
+            cgroup: Some(cgroup_block()),
+            wall_micros: 5,
+            ..ResourceUsage::default()
+        };
+        for (basis, want) in [
+            (UsageBasis::Cgroup, RunBasis::Cgroup),
+            (UsageBasis::Unspecified, RunBasis::Unspecified),
+        ] {
+            let u = run_usage(&mixed(basis));
+            assert_eq!(u.basis, want);
+            assert_eq!(u.footprint, None, "{basis:?}");
+            assert_eq!(u.memory_peak_bytes, Some(17), "{basis:?}");
+            assert_eq!(u.wall_micros, 5);
+        }
+        // A footprint basis with no footprint block: absent, not zero.
+        let none = run_usage(&ResourceUsage {
+            basis: UsageBasis::MacFootprint.into(),
+            wall_micros: 6,
+            ..ResourceUsage::default()
+        });
+        assert_eq!(none.basis, RunBasis::MacFootprint);
+        assert_eq!(none.footprint, None);
+        assert_eq!(none.wall_micros, 6, "the top-level wall time stands in");
+        assert_eq!(none.memory_peak_bytes, None);
+        // A footprint field the driver could not read stays `None`, beside one it did.
+        let part = run_usage(&ResourceUsage {
+            basis: UsageBasis::MacFootprint.into(),
+            footprint: Some(worker::FootprintUsage {
+                peak_footprint_bytes: Some(0),
+                ..worker::FootprintUsage::default()
+            }),
+            ..ResourceUsage::default()
+        });
+        let f = part.footprint.expect("block");
+        assert_eq!(
+            (
+                f.peak_footprint_bytes,
+                f.cpu_user_micros,
+                f.cpu_system_micros
+            ),
+            (Some(0), None, None)
+        );
+    }
+
+    /// Catches: the node's CPU pressure or the booked CPU dropped on the way to the
+    /// record, on either basis, or read as zero when the daemon did not report them.
+    #[test]
+    fn the_cpu_pressure_and_booking_ride_on_either_basis_and_stay_absent_when_unreported() {
+        for basis in [UsageBasis::Cgroup, UsageBasis::MacFootprint] {
+            let u = run_usage(&ResourceUsage {
+                basis: basis.into(),
+                node_cpu_pressure_centi: Some(1234),
+                booked_millicpus: Some(1500),
+                ..ResourceUsage::default()
+            });
+            assert_eq!(
+                (u.node_cpu_pressure_centi, u.booked_millicpus),
+                (Some(1234), Some(1500)),
+                "{basis:?}"
+            );
+        }
+        let u = run_usage(&ResourceUsage::default());
+        assert_eq!(
+            (u.node_cpu_pressure_centi, u.booked_millicpus),
+            (None, None)
+        );
+    }
+
+    /// Catches: the lease counters (events, swap peak, anon + swap peak, pressure
+    /// totals, CPUs) dropped on the way to the record, and a runtime with no cgroup
+    /// block (the daemon's own `wait4` figures) given a basis, a peak or counters it
+    /// did not measure: the basis is what the runtime said, never inferred.
+    #[test]
+    fn the_lease_counters_are_kept_and_no_block_means_no_sample_and_no_inferred_basis() {
+        let u = run_usage(&ResourceUsage {
+            basis: UsageBasis::Cgroup.into(),
+            cgroup: Some(CgroupUsage {
+                memory_events_max: Some(1),
+                memory_events_oom_kill: Some(2),
+                memory_swap_peak_bytes: Some(3),
+                memory_anon_swap_peak_bytes: Some(4),
+                cpu_pressure_some_micros: Some(5),
+                memory_pressure_some_micros: Some(6),
+                memory_pressure_full_micros: Some(7),
+                cpus_effective: Some(8),
+                ..CgroupUsage::default()
+            }),
+            ..ResourceUsage::default()
+        });
+        assert_eq!(
+            [
+                u.memory_events_max,
+                u.memory_events_oom_kill,
+                u.memory_swap_peak_bytes,
+                u.memory_anon_swap_peak_bytes,
+                u.cpu_pressure_some_micros,
+                u.memory_pressure_some_micros,
+                u.memory_pressure_full_micros,
+            ],
+            [1, 2, 3, 4, 5, 6, 7].map(Some)
+        );
+        assert_eq!(u.cpus_effective, Some(8));
+        // No block, an unspecified basis, and the figures `wait4` gave.
+        let wait4 = run_usage(&ResourceUsage {
+            cpu_user_micros: 1,
+            peak_memory_bytes: 99,
+            wall_micros: 5,
+            ..ResourceUsage::default()
+        });
+        assert_eq!(wait4.basis, RunBasis::Unspecified);
+        assert_eq!(wait4.memory_peak_bytes, None, "ru_maxrss is no cgroup peak");
+        assert_eq!(wait4.cpu_usage_micros, None);
+        assert_eq!(wait4.wall_micros, 5);
+        // A cgroup block does not make the basis cgroup.
+        let unsaid = run_usage(&ResourceUsage {
+            cgroup: Some(cgroup_block()),
+            ..ResourceUsage::default()
+        });
+        assert_eq!(unsaid.basis, RunBasis::Unspecified);
     }
 
     /// Catches: a cap set for a busy node's kill, or not set for an own-limit kill,

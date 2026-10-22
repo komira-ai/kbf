@@ -163,7 +163,7 @@ words, in either order): one JSON object on one line of stdout, exit 0, the fiel
 sorted by name.
 
 ```text
-{"admin_protocol":1,"commit":"0123456789ab","meta_log":4,"min_protocol":1,"profile":"release","protocol":1,"relay":1,"seq":812,"state_schema":1,"version":"0.1.0"}
+{"admin_protocol":1,"commit":"0123456789ab","commit_full":"0123456789abcdef0123456789abcdef01234567","meta_log":4,"min_protocol":1,"profile":"release","protocol":1,"relay":1,"seq":812,"state_schema":1,"version":"0.1.0"}
 ```
 
 - `admin_protocol`: the version of the admin calls of `kbf --mode frontend` (`GET role`,
@@ -172,6 +172,10 @@ sorted by name.
   changes meaning raises it.
 - `commit`: the first 12 hex digits of the commit built (`unknown` for a build with no
   git checkout); compare it with the first 12 of the commit in the asset's name.
+- `commit_full`: the 40 hex digits of the commit built (`kbf_server::BUILD_COMMIT_FULL`);
+  `commit` is its first 12. It is absent, not empty, from a build that did not know them (no
+  git checkout, or a `KBF_BUILD_COMMIT_OVERRIDE` stamp), and a build before this field prints
+  none. `kbf_types::Version` reads it as optional.
 - `meta_log`: the highest metadata-log machine version the binary runs
   (`kbf_server::raft_log::RUNS`). Going from release N to N-1 is reversible only if
   `meta_log(N) <= meta_log(N-1)`; a build that prints no `meta_log` is unknown, and
@@ -484,8 +488,8 @@ rebuilt. Its assets are every tarball and SBOM in the table above, for that comm
 it.
 
 One run of `release.yml` cuts a release; nobody tags. It is started by hand
-(`workflow_dispatch`, no inputs: it releases the commit it runs on) and, in a later change that
-adds `push: branches: [main]` and nothing else, by every push to `main`. A tag pushed by hand
+(`workflow_dispatch`, no inputs: it releases the commit it runs on, as a dry run) and by every
+push to `main` (`push: branches: [main]`). A tag pushed by hand
 starts nothing, and only the release bot (a GitHub App, the one bypass of the `v*` tag ruleset)
 can create one. The jobs, each with the least token it needs:
 
@@ -553,7 +557,7 @@ them.)
 (a dispatch only), the job graph and the scopes, `if:` and environment of each job, the halt on
 red, a checkout of the run's commit alone, the release bot's key read in `tag` and `bump` only,
 the data that flows from job to job, pinned actions and an empty top-level `permissions`. The
-workflow is named `release` and its job `publish`, because `gamma.yml` follows both. On every
+job list is pinned, `publish` among them (`gamma.yml`, which followed the workflow, is deleted). On every
 pull request into `main`, CI asks GitHub the same on-`main` question for the pull request's base
 commit (which must pass) and its merge commit (which must be refused), so a check that
 accepts every commit, or none, fails there (`cargo xtask release main-control`).

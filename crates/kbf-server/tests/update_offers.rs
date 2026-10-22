@@ -68,6 +68,7 @@ fn listeners() -> Listeners {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         streams: kbf_server::StreamTiming::default(),
@@ -119,7 +120,6 @@ fn start_with(releases: bool, state: bool) -> Frontend {
         token: Some(ApiToken::from_file(&path).expect("a usable token")),
         local_cache: None,
         releases,
-        poll: None,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     // Allows everything, and names `farm.getAuthorizer`, which turns `GET /v1/update/hosts` on.

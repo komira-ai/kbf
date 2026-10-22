@@ -21,6 +21,7 @@ fn submit_ticket(farm: &TestFarm, tag: u8) -> kbf_front::Ticket {
         request: request(tag),
         call: None,
         described: Described::default(),
+        evidence: Default::default(),
     })
     .expect("submitted")
 }

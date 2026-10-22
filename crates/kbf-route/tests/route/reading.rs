@@ -276,6 +276,23 @@ async fn a_read_is_passed_on_chunk_by_chunk() {
     assert!(made <= 4, "{made} chunks produced for 3 taken");
 }
 
+/// Catches a read that mistakes a stream with no frame for a failed open (the router looks
+/// at a stream's first frame before it hands the stream over): an empty blob is an empty
+/// stream, and the caller gets no bytes and no error.
+#[tokio::test]
+async fn an_empty_blob_is_a_stream_of_no_chunks() {
+    let map = map(1, 1, active(&[1]));
+    let cluster = Cluster::of(1);
+    let (router, _) = router(&map, &cluster);
+    let digest = cluster.node(1).hold(b"");
+
+    let (bytes, chunks) = collect(router.read_range(&digest, 0, 0).await.expect("a read"))
+        .await
+        .expect("no bytes");
+    assert!(bytes.is_empty());
+    assert_eq!(chunks, 0);
+}
+
 /// Catches a read that cannot go on after its owner broke, or goes on from the wrong
 /// place: the first owner passes two chunks and breaks, then answers nothing; the read
 /// goes on at the second owner from byte 8 (and with a limit, with the bytes still to
