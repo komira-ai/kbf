@@ -137,7 +137,7 @@
   <li><strong>Two clocks keep copies apart.</strong> The scheduler gives up every lease on a worker it has not heard from for 60 seconds; a worker stops self-fenced work 40 seconds after the newest heartbeat the scheduler acknowledged was sent. A margin covers a change of process, and the constants are checked at compile time so a change cannot break the order.</li>
   <li><strong>Present means durable.</strong> A blob is acknowledged and reported present only once its bytes are stored and its place is committed; every byte is checked against its digest on upload and on read; a hit never points at missing files.</li>
   <li><strong>Settings are flags or keys of one file.</strong> A secret is never a value: the key holds the path of a file. The object store's key pair is the one exception, taken from the standard <code>AWS_</code> variables.</li>
-  <li><strong>Nothing asserts a speed.</strong> Tests do not depend on timing, and every test has been seen failing on a planted defect.</li>
+  <li><strong>Nothing asserts a speed.</strong> Tests do not depend on timing; each one asserts the behaviour it is named for.</li>
 </ul>
 <p>Read <a href="story.html">the story</a> for how a farm of laptops became this one, or <a href="quickstart.html">start a farm</a>.</p>
 </main>
