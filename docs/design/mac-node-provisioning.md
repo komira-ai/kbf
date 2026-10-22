@@ -26,8 +26,8 @@ The rules this design keeps:
 
 - **One profile, applied by one program, checked by the same program.** A node is a
   pinned macOS build, plus a profile applied to a freshly erased Mac, plus the
-  `kbf-daemon` artifact the deployment installs. Nothing else is on it.
-- **No toolchains on a node unless actions need them.** `kbf-daemon` arrives as a
+  `kbf` release the deployment installs. Nothing else is on it.
+- **No toolchains on a node unless actions need them.** `kbf` arrives as a
   built, signed and attested `darwin-arm64` artifact from kbf's CI on `main`. It is never
   compiled on the node. The toolchains actions use (Xcode or the Command Line Tools,
   at pinned versions) belong to the node's *worker profile*, and nothing on the host
@@ -43,22 +43,25 @@ The rules this design keeps:
 |---|---|
 | Baseline | A pinned macOS version and build. A fresh state comes from *Erase All Content and Settings*, or from an Apple Configurator restore when the version must change or the Mac is new. There is no disk image for the host; VM golden images do live on Mac nodes (macOS VMs design). |
 | Provisioning layer | A plain, idempotent program (`kbf-mac-provision`, a Rust binary; first designed as a shell script) with `apply` and `check` modes, over a declarative key=value profile, that uses only programs macOS ships. Not nix-darwin, not Ansible ([comparison](#2-the-provisioning-layer)). |
-| `kbf-daemon` | Built and attested by CI on every commit to `main`, on a hosted macOS arm64 runner: signed (ad-hoc today; Developer ID if the project gets an Apple Developer account), with a SHA-256, an SBOM and build provenance. The operator's deployment job verifies the attestation and installs that per-commit tarball on each node. A release only tags digests that already ran; it never rebuilds. The profile holds host settings, not the daemon's version. |
+| `kbf` | Built and attested by CI on every commit to `main`, on a hosted macOS arm64 runner: signed (ad-hoc with the hardened runtime today; Developer ID if the project gets an Apple Developer account), with a SHA-256, an SBOM and build provenance. The operator's deployment job verifies the attestation and installs that per-commit tarball on each node, where the launchd job runs it in daemon mode (`kbf --mode=daemon`). A release only tags digests that already ran; it never rebuilds. The profile holds host settings, not the daemon's version. |
 | Toolchains | The pinned Xcodes (several per host, chosen per action with `DEVELOPER_DIR`, as the macOS VMs design proposes) are in the worker profile. Clients route on `xcode` and `os_build`. Client-defined probes (for example a host identity) run per Xcode and are reported, never matched; an Xcode whose probe value differs from the expected one leaves the report until it re-qualifies. Simulator runtimes live only in VM images. |
 | Power | `sleep 0`, `autorestart 1`. The daemon's fence clock stops during sleep or suspend on any OS; that is a code bug ([#78](https://github.com/komira-ai/kbf/issues/78)), not something a setting fixes ([section 5.1](#51-sleep)). |
 | Updates | Automatic download and install off, security responses included. Updates roll out canary-first as a new profile. MDM is decided: Apple Business Manager plus a self-hosted NanoHUB behind `kbf-mdm-gate` (fleet-updates design, section 7; [section 6](#6-updates-pinned-and-rolled-out)). |
 | FileVault | Off on rack nodes, so a Mac boots unattended after a power loss. Host auto-login is off at rest: GUI work runs in VM guests that log themselves in. The exceptions are bare-metal GPU tests: for one whole-machine lease, the root helper `kbf-mac-session` sets auto-login to that lease's throwaway user (non-admin unless the lease is privileged), and clears it afterwards ([fleet-updates design](fleet-updates.md)). If a VM cannot be started from a launch daemon (an open probe of the macOS VMs design), the fallback is an open decision ([section 5.4](#54-filevault-and-auto-login)). |
-| Admin | SSH only, key only, one admin account. `kbf-daemon` runs as a LaunchDaemon under a hidden role account. |
+| Admin | SSH only, key only, one admin account. `kbf --mode=daemon` runs as a LaunchDaemon under a hidden role account. |
 | Join and leave | The node's certificate names its node id ([#79](https://github.com/komira-ai/kbf/issues/79)). Drain is a protocol message. Short certificate lifetimes and a deny list close the revocation gap ([section 9](#9-joining-and-leaving-the-farm)). |
 
 ## What kbf has today
 
 This design builds on the code on `main`, read at the time of writing.
 
-- **The binary.** `kbf-daemon` lives in crate `kbf-node` and takes
+- **The binary.** The daemon's code lives in crate `kbf-node`. On a Mac it is the
+  `kbf` binary (crate `kbf-cli`) started as `kbf --mode=daemon --config <file>`; a
+  Linux release may also hold the separate `kbf-daemon` binary. It takes
   `--driver fake|container|native`. On a Mac it runs `--driver native` with `--server`,
-  `--cas`, `--ca-cert`, `--cert`, `--key`, `--node-id` and `--data-dir`. It is configured
-  by flags only. On
+  `--cas`, `--ca-cert`, `--cert`, `--key`, `--node-id` and `--data-dir`. The settings
+  are the flags' long names, as keys of the config file (`/usr/local/etc/kbf/kbf.toml`),
+  which `kbf-mac-provision` writes from the profile. On
   SIGTERM it drains (no new lease; running ones finish and report) and exits zero. A
   second signal, or `--drain-deadline-secs` after the first, abandons the leases still
   running (their processes are killed and their directories removed).
@@ -81,8 +84,9 @@ This design builds on the code on `main`, read at the time of writing.
   matches an action's `OSFamily`/`ISA`/`Arch` and kbf keys against node reports;
   properties that are not kbf keys are ignored (refusing them is planned).
 - **CI.** The `native-macos` job builds `kbf-daemon` on a hosted macOS runner and runs
-  the native driver's tests there. **No workflow publishes a binary for any platform,
-  and nothing signs one.**
+  the native driver's tests there, and the `kbf` binary's daemon mode with the words the
+  launchd job writes. The `artifacts.yml` workflow builds, signs and attests `kbf`,
+  `kbf-deploy` and `kbf-installer` for darwin-arm64; it builds no darwin `kbf-daemon`.
 - **The worker protocol** has no drain message (listed as planned in
   [worker-protocol.md](worker-protocol.md#planned)). Under mutual TLS the server
   checks that the client certificate's one DNS subjectAltName equals the `node_id` of
@@ -140,7 +144,7 @@ A node's baseline is three things, all of them named in the profile:
    or a Mac that will not boot. A Mac that was a workstation is always erased: a node
    is clean only if nothing was ever installed on it that the profile does not name.
 3. **The profile applied.** That includes the worker profile (section 3). Then the
-   deployment installs the `kbf-daemon` artifact (section 4).
+   deployment installs the `kbf` release (section 4).
 
 There is no image file to build, store or patch for the host. (VM golden images do
 live on Mac nodes; they are the macOS VMs design's, not part of the host baseline.)
@@ -186,8 +190,8 @@ It also sets the older `com.apple.commerce AutoUpdate` with `appstore_auto_updat
 before its first change to a power or software update setting it records all of them in
 `/var/db/kbf-mac-provision/settings.before`, which `revert` restores.
 
-`kbf-mac-provision` is one binary, to be shipped in the same tarball as `kbf-daemon`
-(section 4). Its three original verbs:
+`kbf-mac-provision` is one binary, to be shipped with the `kbf` release
+(section 4); CI builds and tests it but does not package it yet. Its three original verbs:
 
 ```text
 kbf-mac-provision check   --profile FILE   # read-only; one PASS/FAIL per key; exit 1 on any FAIL
@@ -206,7 +210,7 @@ kbf-mac-provision print   --profile FILE   # the profile as resolved, and its SH
 - The node does not report which profile it runs: node labels were removed, so the
   profile's hash no longer reaches the node's `kbf.toml` and `check` on the node is what
   sees a profile that differs.
-- **The profile holds host settings only.** The `kbf-daemon` commit and its SHA-256
+- **The profile holds host settings only.** The `kbf` commit and its SHA-256
   are not in it: they are the deployment job's input for each commit it rolls out
   (section 4.3). A daemon upgrade is then not a profile change, and every green
   commit on `main` can deploy without a reviewed edit to each node's profile.
@@ -252,9 +256,9 @@ The profile has two halves with different owners and different rates of change.
 
 **The host profile** holds what every Mac node has, whatever its actions need: power,
 updates, admin access, accounts, time, logs, the hostname, the scratch volume and the
-launchd job that runs `kbf-daemon` (the binary itself is the deployment's, section 4).
+launchd job that runs `kbf --mode=daemon` (the binary itself is the deployment's, section 4).
 It holds **no toolchain**: no Homebrew, no Rust, no Python, no
-package manager. `kbf-daemon` and `kbf-mac-provision` link only system libraries, and
+package manager. `kbf` and `kbf-mac-provision` link only system libraries, and
 `kbf-mac-provision` runs only programs macOS ships.
 
 **The worker profile** holds what actions run with:
@@ -361,42 +365,9 @@ compilers changed must not keep serving cache keys computed for the old ones.
 The second and later nodes with the same new value skip step 4: their value is already
 listed, and step 3 checks that they print it.
 
-## 4. Shipping `kbf-daemon`
+## 4. Shipping `kbf`
 
-### 4.1 Build and attest on `main` (planned)
-
-> **Built since this section was written:** the build and attestation workflow,
-> `.github/workflows/artifacts.yml`, described in [docs/artifacts.md](../artifacts.md),
-> which is the authority for what it does. Where it differs from this section and 4.2:
->
-> - **A separate `attest` job** holds `id-token: write` and `attestations: write`,
->   runs only on a push to `main`, and signs the files the build jobs made. The build
->   jobs hold `contents: read` only, so code a pull request changes never runs next to
->   a token that can sign.
-> - **The Linux binaries** (`kbf-daemon` and `kbf-server`, x86_64 and arm64) are built
->   by their own jobs, not by the macOS job.
-> - **The darwin release holds `kbf` (and the deploy tool and installer), not `kbf-daemon`:**
->   a Mac runs `kbf --mode=daemon` from `releases/current/kbf`, and no darwin `kbf-daemon` is
->   built (`ReleasePlatform::components` names `kbf` for every platform). The text of this
->   section that says `kbf-daemon-<commit>-darwin-arm64.tar.gz` is the design as first written.
->   `kbf-mac-provision` is built and tested in CI but not packaged yet; the fleet-updates
->   helpers do not exist yet.
-> - **The oldest macOS supported is 14.0** (`MACOSX_DEPLOYMENT_TARGET`), a choice of
->   that workflow; this design names none.
-> - **Signing is ad hoc with the hardened runtime** (`--options runtime`). CI checks
->   the flag, runs the signed binary, and verifies the signature again on the binary
->   taken out of its tarball. The hardened runtime's behaviour is checked only on a
->   runner with SIP enabled, and hosted runners do not enforce code signing on a
->   running process, so the kernel's page checks are not shown in CI.
-> - **Still planned:** the deployment job that verifies an asset before it reaches a
->   node, and the node's SHA-256 check in `apply`.
-> - **Built, unlike the model below:** the release workflow
->   (`.github/workflows/release.yml`, docs/artifacts.md). A person pushes a tag on a
->   commit of `main` (the soak is their judgment, not a check the workflow makes), and
->   the workflow attaches the files of that commit's `main` run of `artifacts.yml`,
->   checked against the attestations and never rebuilt. They come from that run's
->   workflow artifacts, not the deployment's copy, so a release is cut within the 90
->   days GitHub keeps them.
+### 4.1 Build and attest on `main`
 
 The model:
 
@@ -410,14 +381,18 @@ The model:
 The `main` build job:
 
 - **Runs on a hosted macOS arm64 runner** named by a literal label (the workflow lint
-  requires one). It gets `id-token: write` and `attestations: write` for the provenance
-  and `contents: read`, and nothing else.
-- **Builds** `cargo build --locked --release -p kbf-node --target aarch64-apple-darwin`
-  with `MACOSX_DEPLOYMENT_TARGET` set to the oldest macOS kbf supports. That is a
-  property of the build, not of the runner's OS.
+  requires one). It holds `contents: read` and nothing else, so code a pull request
+  changes never runs next to a token that can sign. A separate `attest` job, which runs
+  only on a push to `main`, holds `id-token: write` and `attestations: write` and signs
+  the files the build job made.
+- **Builds** `cargo build --locked --release --target aarch64-apple-darwin` of the
+  `kbf`, `kbf-deploy` and `kbf-installer` binaries, with `MACOSX_DEPLOYMENT_TARGET` set
+  to the oldest macOS kbf supports (14.0). That is a property of the build, not of the
+  runner's OS. No darwin `kbf-daemon` is built: the Mac daemon is `kbf --mode=daemon`.
 - **Signs** (section 4.2).
-- **Packages** one asset for nodes: `kbf-daemon-<commit>-darwin-arm64.tar.gz`, with the
-  binary and `kbf-mac-provision` and no configuration.
+- **Packages** one asset for nodes per binary: `kbf-<commit>-darwin-arm64.tar.gz` holds
+  `kbf`, and no configuration; the deploy tool and the installer have their own
+  tarballs. `kbf-mac-provision` is to ship with the `kbf` release.
   - A `.pkg` is built only if the project takes Developer ID: a signed installer
     package is what an MDM delivers.
   - It is not the node install path, because a pkg receipt keeps naming the installed
@@ -435,14 +410,15 @@ The `main` build job:
 - **Checks itself:** a last step downloads its own assets and verifies the sums and the
   attestations. A wrong sum fails the job.
 
-The same job builds the Linux binaries. Only binaries this job built are deployed or
-released. A build on a developer's machine never ships.
+The Linux binaries (`kbf`, `kbf-daemon`, `kbf-server`, `kbf-deploy` and
+`kbf-installer`, x86_64 and arm64) are built by their own jobs. Only binaries those
+jobs built are deployed or released. A build on a developer's machine never ships.
 
 ### 4.2 Signing and verification
 
-> **Built since this section was written:** ad-hoc signing with the hardened runtime
+> **Built:** ad-hoc signing with the hardened runtime
 > and the attestation checks, in `.github/workflows/artifacts.yml`; see
-> [docs/artifacts.md](../artifacts.md) and the deviations listed in section 4.1. The
+> [docs/artifacts.md](../artifacts.md). The
 > verification steps 1 and 2 below are still planned; the `verify` job runs step 1's
 > command on what the `attest` job signed.
 
@@ -472,7 +448,7 @@ elsewhere in either case:
    the runner type, not just the repository:
 
    ```text
-   gh attestation verify kbf-daemon-<commit>-darwin-arm64.tar.gz \
+   gh attestation verify kbf-<commit>-darwin-arm64.tar.gz \
      --repo <owner>/<repo> \
      --signer-workflow <owner>/<repo>/.github/workflows/<build workflow file> \
      --source-ref refs/heads/main \
@@ -495,9 +471,9 @@ job is written so that adding it is one step, which runs when the signing secret
 
 - The deployment job's input names a commit. The job verifies that commit's asset
   (4.2), then runs on each node, one at a time.
-- The binary is installed at `/usr/local/kbf-installer/releases/<commit>/kbf-daemon`.
+- The binary is installed at `/usr/local/kbf-installer/releases/<commit>/kbf`.
   `/usr/local/kbf-installer/releases/current` is a symlink to the one in use, and the launchd job runs
-  `current/kbf-daemon`. A small file, `/usr/local/kbf/deployed`, records the commit and
+  `current/kbf --mode=daemon`. A small file, `/usr/local/kbf/deployed`, records the commit and
   SHA-256 the job installed.
 - An upgrade:
   1. stages the new binary beside the old;
@@ -510,7 +486,7 @@ job is written so that adding it is one step, which runs when the signing secret
 - Rollback is the same job with an older commit as its input.
 - This is the path until `kbf-updater` ships on Macs (fleet-updates design, phase P1,
   once actions run as lease users). From then on, `kbf-updater` runs `apply` and
-  installs `kbf-daemon` from a signed set.
+  installs `kbf` from a signed set.
 - `check` compares the `current` target's SHA-256 with `/usr/local/kbf/deployed`, so a
   binary changed by hand shows as drift.
 
@@ -528,7 +504,7 @@ Every row is a profile key. `apply` sets it, and `check` reads it back.
 | App Store auto-update | off | `AutomaticallyInstallAppUpdates` = 0 (the older `com.apple.commerce AutoUpdate` is legacy; the Rust port sets it to 0 too) | Xcode never comes from the App Store |
 | Remote Login | on, key only | `systemsetup -setremotelogin on`, and `/etc/ssh/sshd_config.d/` with `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PermitRootLogin no` | the only admin path |
 | Screen Sharing, other remote-desktop servers | off, not installed | | SSH is the only way in |
-| Firewall | on | `socketfilterfw --setglobalstate on` | `kbf-daemon` never listens. The farm network is the real boundary |
+| Firewall | on | `socketfilterfw --setglobalstate on` | `kbf --mode=daemon` never listens. The farm network is the real boundary |
 | Network time | on, the farm's time server | `systemsetup -setusingnetworktime on`, `-setnetworktimeserver` | 5.5 |
 | Names | one scheme | `scutil --set` `HostName`, `LocalHostName`, `ComputerName` | 5.6 |
 | Scratch volume | its own APFS volume, with a quota and indexing off | `diskutil apfs addVolume … -quota`, `mdutil -i off` | a lease cannot fill the system's data volume, and Spotlight does not index lease directories |
@@ -598,14 +574,19 @@ proposed.
 
 ### 5.3 The launchd job
 
-`kbf-daemon` runs as a **LaunchDaemon** (`/Library/LaunchDaemons`), not a
+`kbf --mode=daemon` runs as a **LaunchDaemon** (`/Library/LaunchDaemons`), not a
 LaunchAgent. An agent runs only inside a user's login session and stops at logout. A
 daemon starts at boot with nobody logged in
 ([Creating launch daemons and agents](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)).
 
 ```xml
-<key>Label</key>             <string>org.example.kbf-daemon</string>
-<key>ProgramArguments</key>  <array><string>/usr/local/kbf-installer/releases/current/kbf-daemon</string> <!-- flags from the profile --></array>
+<key>Label</key>             <string>org.example.kbf</string> <!-- the profile's launchd_label -->
+<key>ProgramArguments</key>  <array>
+  <string>/usr/local/kbf-installer/releases/current/kbf</string>
+  <string>--mode=daemon</string>
+  <string>--config</string>
+  <string>/usr/local/etc/kbf/kbf.toml</string> <!-- every setting is a key of this file -->
+</array>
 <key>UserName</key>          <string>_kbf</string>
 <key>GroupName</key>         <string>_kbf</string>
 <key>RunAtLoad</key>         <true/>
@@ -661,7 +642,7 @@ the rack's physical security and short certificate lifetimes. A Mac on a desk, o
 a locked room, may keep FileVault on if the operator accepts that it waits for a person
 after every reboot.
 
-**Auto-login is off at rest.** `kbf-daemon` is a LaunchDaemon, and most GUI work runs
+**Auto-login is off at rest.** `kbf --mode=daemon` is a LaunchDaemon, and most GUI work runs
 in VM leases (`kbf-lease=vm`) whose guests log themselves in (macOS VMs design). The
 host needs auto-login in two cases, and in neither for the admin account:
 
@@ -725,7 +706,7 @@ server with `sntp` (read-only) and fails above an offset the profile names.
 
 ### 5.7 Logs (partly planned)
 
-Today `kbf-daemon` writes human-readable `tracing` lines to stderr (without terminal
+Today the daemon writes human-readable `tracing` lines to stderr (without terminal
 color codes unless stderr is a terminal), and launchd writes stderr to the file
 `StandardErrorPath` names. The daemon does not rotate that file: it grows by about
 0.6 KB per lease, and the deployment job empties it at each restart and upgrade (below).
@@ -740,7 +721,7 @@ On Linux under systemd, stderr goes to the journal, which rotates by its own lim
   while the job is stopped, at each restart and upgrade.
 - **Shipping:** one log shipper, chosen by the operator, tails `--log-dir` and forwards
   to the farm's log store. It is infrastructure, not a toolchain, and arrives the way
-  `kbf-daemon` does: a pinned artifact checked by SHA-256, as a LaunchDaemon under its
+  `kbf` does: a pinned artifact checked by SHA-256, as a LaunchDaemon under its
   own account.
 - Not in the daemon's log: actions' stdout and stderr, which go to the CAS with the
   result. Crash reports of the daemon are in `/Library/Logs/DiagnosticReports`. When a
@@ -859,7 +840,7 @@ The cutover of one Mac, using the first option:
    is the client's configuration that names the remote execution endpoint for its Mac
    platform.
 6. **Move the remaining Macs** one at a time, as in steps 2 and 3.
-7. **Rollback** at any step: stop `kbf-daemon` (`launchctl bootout`), reload the other
+7. **Rollback** at any step: stop the daemon (`launchctl bootout system/<label>`), reload the other
    farm's jobs from the kept files, and point the client's lane back. Until the Mac is
    erased, nothing is lost. After an erase, rollback means re-installing the other
    worker.
