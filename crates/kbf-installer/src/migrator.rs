@@ -1,4 +1,4 @@
-//! The real [`Migrator`]: brings the state database to the schema the staged release needs
+//! The database migrator: brings the state database to the schema the staged release needs
 //! before its candidate child starts (FP section 8).
 //!
 //! It adds nothing to the schema code. [`Database`] already owns the migrations (embedded
@@ -8,7 +8,7 @@
 //!
 //! - **Which schema.** The `state_schema` of the release asked for, and only when it is a
 //!   release whose facts are known. The staged release's are in `status.json`
-//!   ([`StatusFacts::staged`]); that is the swap's. The installed release (a cold start,
+//!   ([`Facts::staged_schema`]); that is the swap's. The installed release (a cold start,
 //!   after a reboot) has none there once the root half has restarted, so it is asked: its own
 //!   `--version --json` ([`installed_schema`]), as the unprivileged user the proxy runs as.
 //!   Any other commit is `not_staged`: a guess could migrate past what the release runs on.
@@ -16,7 +16,7 @@
 //!   all-in-one host, its streams held), so every lock wait ends after
 //!   [`DbMigrator::LOCK_WAIT`]: a second installer holding the schema lock, or a long read
 //!   on a table a migration alters, is `database_busy`, not a hang.
-//! - **A refusal word.** A refused migration is a [`PortError`] whose text is
+//! - **A refusal word.** A refused migration is a [`MigrateError`] whose text is
 //!   `<word>: <why>`; the swap records it as `failure.reason` of step `migrate`, so the
 //!   word is what an operator or a script matches. The words are [`Refusal::word`] and do
 //!   not change. The old child is never touched: a migration that fails rolled back its
@@ -40,8 +40,33 @@ use crate::binary::Version;
 use crate::database::Database;
 use crate::run::{Runner, Spawn};
 
-use super::model::PortError;
-use super::ports::{Migrator, StatusFacts};
+/// A migration or a probe that failed. For a refusal the text is `<word>: <why>` with a
+/// [`Refusal::word`]; a failure to read `status.json` carries the reader's own text.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct MigrateError(pub String);
+
+/// The staged release the root half's `status.json` names, and the `state_schema` it declares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedSchema {
+    pub commit: CommitId,
+    pub state_schema: u32,
+}
+
+/// The two facts of the root half's `status.json` that a migration reads.
+pub trait Facts {
+    /// The staged release and the schema it declares, if a release is staged.
+    ///
+    /// # Errors
+    /// `status.json` cannot be read.
+    fn staged_schema(&self) -> Result<Option<StagedSchema>, MigrateError>;
+
+    /// The commit `status.json` reports as installed, if it reports one.
+    ///
+    /// # Errors
+    /// `status.json` cannot be read.
+    fn installed_commit(&self) -> Result<Option<CommitId>, MigrateError>;
+}
 
 /// Why a migration was refused. Each has a stable [`word`](Refusal::word).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,22 +131,22 @@ impl Refusal {
         }
     }
 
-    fn because(self, why: impl std::fmt::Display) -> PortError {
-        PortError(format!("{}: {why}", self.word()))
+    fn because(self, why: impl std::fmt::Display) -> MigrateError {
+        MigrateError(format!("{}: {why}", self.word()))
     }
 }
 
-/// The swap's [`Migrator`] over the state database.
+/// The swap's migration over the state database.
 pub struct DbMigrator<'a> {
     db: Database,
-    facts: &'a dyn StatusFacts,
+    facts: Box<dyn Facts + 'a>,
     installed: Option<Asked<'a>>,
     lock_wait: Duration,
     apply: Apply<'a>,
 }
 
 /// How the `state_schema` of the installed release is learnt: from the release itself.
-type Asked<'a> = Box<dyn Fn(&CommitId) -> Result<u32, PortError> + 'a>;
+type Asked<'a> = Box<dyn Fn(&CommitId) -> Result<u32, MigrateError> + 'a>;
 
 /// What runs the migrations: the database, the schema wanted and the lock wait. A seam so
 /// that a test sees which bounds are handed over.
@@ -135,10 +160,10 @@ impl<'a> DbMigrator<'a> {
     /// Migrates `db`, learning the schema a staged release needs from `facts`. A release
     /// that is not the staged one is refused until [`knowing_installed`](Self::knowing_installed).
     #[must_use]
-    pub fn new(db: Database, facts: &'a dyn StatusFacts) -> DbMigrator<'a> {
+    pub fn new(db: Database, facts: impl Facts + 'a) -> DbMigrator<'a> {
         DbMigrator {
             db,
-            facts,
+            facts: Box::new(facts),
             installed: None,
             lock_wait: Self::LOCK_WAIT,
             apply: Box::new(Database::migrate_within),
@@ -150,14 +175,14 @@ impl<'a> DbMigrator<'a> {
     #[must_use]
     pub fn knowing_installed(
         mut self,
-        ask: impl Fn(&CommitId) -> Result<u32, PortError> + 'a,
+        ask: impl Fn(&CommitId) -> Result<u32, MigrateError> + 'a,
     ) -> DbMigrator<'a> {
         self.installed = Some(Box::new(ask));
         self
     }
 
     /// Runs `apply` instead of the database, to see what it is handed.
-    pub(super) fn with_apply(mut self, apply: Apply<'a>) -> DbMigrator<'a> {
+    pub(crate) fn with_apply(mut self, apply: Apply<'a>) -> DbMigrator<'a> {
         self.apply = apply;
         self
     }
@@ -171,17 +196,30 @@ impl<'a> DbMigrator<'a> {
 
     /// The `state_schema` of `release`: the staged one's from `status.json`, else the
     /// installed one's from itself.
-    fn needs(&self, release: &CommitId) -> Result<u32, PortError> {
-        match self.facts.staged() {
+    fn needs(&self, release: &CommitId) -> Result<u32, MigrateError> {
+        match self.facts.staged_schema() {
             Ok(Some(facts)) if facts.commit == *release => return Ok(facts.state_schema),
             Ok(_) => {}
             Err(e) => return Err(Refusal::NotStaged.because(format!("status.json: {e}"))),
         }
-        let installed = self.facts.installed().ok().flatten().as_ref() == Some(release);
+        let installed = self.facts.installed_commit().ok().flatten().as_ref() == Some(release);
         match (&self.installed, installed) {
             (Some(ask), true) => ask(release),
             _ => Err(Refusal::NotStaged.because("the staged release is not this update's")),
         }
+    }
+
+    /// Applies every forward migration `release` needs: idempotent, so running it again
+    /// after a crash changes nothing.
+    ///
+    /// # Errors
+    /// A [`MigrateError`] whose text starts with a [`Refusal::word`] and a colon; it never
+    /// carries the database URL.
+    pub fn migrate(&self, release: &CommitId) -> Result<(), MigrateError> {
+        let schema = self.needs(release)?;
+        (self.apply)(&self.db, schema, self.lock_wait)
+            .map(drop)
+            .map_err(|e| Refusal::of(&e).because(e))
     }
 }
 
@@ -196,7 +234,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// # Errors
 /// [`Refusal::SchemaUnknown`]: the program cannot run, runs past [`PROBE_TIMEOUT`], exits
 /// non-zero, or prints something else than a version object.
-pub fn probe_version(runner: &dyn Runner, program: &Path) -> Result<Version, PortError> {
+pub fn probe_version(runner: &dyn Runner, program: &Path) -> Result<Version, MigrateError> {
     let unknown = |why: String| Refusal::SchemaUnknown.because(why);
     let ran = runner
         .run(&Spawn {
@@ -221,7 +259,7 @@ pub fn probe_version(runner: &dyn Runner, program: &Path) -> Result<Version, Por
 ///
 /// # Errors
 /// [`Refusal::SchemaUnknown`]: it does not fit a `u32`.
-pub fn schema_of(version: &Version) -> Result<u32, PortError> {
+pub fn schema_of(version: &Version) -> Result<u32, MigrateError> {
     u32::try_from(version.state_schema)
         .map_err(|_| Refusal::SchemaUnknown.because("state_schema is too large"))
 }
@@ -236,19 +274,10 @@ pub fn installed_schema(
     runner: &dyn Runner,
     program: &Path,
     release: &CommitId,
-) -> Result<u32, PortError> {
+) -> Result<u32, MigrateError> {
     let version = probe_version(runner, program)?;
     version
         .check(release)
         .map_err(|fault| Refusal::SchemaUnknown.because(fault))?;
     schema_of(&version)
-}
-
-impl Migrator for DbMigrator<'_> {
-    fn migrate_forward(&self, release: &CommitId) -> Result<(), PortError> {
-        let schema = self.needs(release)?;
-        (self.apply)(&self.db, schema, self.lock_wait)
-            .map(drop)
-            .map_err(|e| Refusal::of(&e).because(e))
-    }
 }

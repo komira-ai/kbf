@@ -12,6 +12,7 @@ use std::time::Duration;
 use kbf_update::Source;
 
 use crate::CommitId;
+use crate::migrator::{DbMigrator, Facts, MigrateError, StagedSchema};
 
 use super::model::{
     AdoptError, CrashPoint, DesiredError, Halt, Intent, Locator, OpenCounts, PortError, ProcIdent,
@@ -117,13 +118,31 @@ pub trait Gate {
 
 /// Forward, backward-compatible Postgres migrations. The kbf child never alters tables
 /// (CEO 14:58Z), so this runs before the candidate starts. The real one is
-/// [`super::migrator::DbMigrator`].
+/// [`crate::migrator::DbMigrator`].
 pub trait Migrator {
     /// Apply every forward migration release `release` needs. Idempotent: running it
     /// again after a crash changes nothing. An `Err` text starts with a stable refusal
-    /// word and a colon ([`super::migrator::Refusal::word`]); it never carries the
+    /// word and a colon ([`crate::migrator::Refusal::word`]); it never carries the
     /// database URL.
     fn migrate_forward(&self, release: &CommitId) -> Result<(), PortError>;
+}
+
+impl Migrator for DbMigrator<'_> {
+    fn migrate_forward(&self, release: &CommitId) -> Result<(), PortError> {
+        self.migrate(release).map_err(PortError::from)
+    }
+}
+
+impl From<MigrateError> for PortError {
+    fn from(error: MigrateError) -> PortError {
+        PortError(error.0)
+    }
+}
+
+impl From<PortError> for MigrateError {
+    fn from(error: PortError) -> MigrateError {
+        MigrateError(error.0)
+    }
 }
 
 /// `update.json`: intent, written before each action (Q5).
@@ -177,6 +196,21 @@ impl<T: RootOrders> StatusFacts for T {
 
     fn installed(&self) -> Result<Option<CommitId>, PortError> {
         RootOrders::installed(self)
+    }
+}
+
+/// What the migration reads of `status.json`: the same two facts, as the migrator names them.
+impl<T: StatusFacts + ?Sized> Facts for &T {
+    fn staged_schema(&self) -> Result<Option<StagedSchema>, MigrateError> {
+        let staged = StatusFacts::staged(*self).map_err(MigrateError::from)?;
+        Ok(staged.map(|facts| StagedSchema {
+            commit: facts.commit,
+            state_schema: facts.state_schema,
+        }))
+    }
+
+    fn installed_commit(&self) -> Result<Option<CommitId>, MigrateError> {
+        StatusFacts::installed(*self).map_err(MigrateError::from)
     }
 }
 
