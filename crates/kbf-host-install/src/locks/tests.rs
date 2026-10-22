@@ -2,7 +2,7 @@ use std::fs;
 
 use kbf_testkit::dir::TestDir;
 
-use super::{flock_held, held, table_holds};
+use super::{flock_held, held, table_holds, wait_lockable};
 
 const TABLE: &str = "\
 1: POSIX  ADVISORY  WRITE 812 08:01:131075 0 EOF
@@ -83,6 +83,7 @@ fn an_flock_is_seen_and_the_probe_leaves_none() {
     assert!(flock_held(&path), "and still held after being asked");
     holder.unlock().unwrap();
     assert!(!flock_held(&path), "released");
+    wait_lockable(&path);
     let other = fs::File::open(&path).unwrap();
     other
         .try_lock()
@@ -118,4 +119,24 @@ fn an_unreadable_lock_is_held() {
         "a link is not followed, so not proved idle"
     );
     assert!(flock_held(&real.join("below")), "a path through a file");
+}
+
+/// The test helper waits for a holder to let go, and returns at once when there is none or
+/// no file.
+#[test]
+fn wait_lockable_waits_for_a_holder() {
+    let dir = TestDir::under(std::env::temp_dir(), "locks-wait");
+    let path = dir.join("install.lock");
+    wait_lockable(&path);
+    let holder = fs::File::create(&path).unwrap();
+    holder.lock().unwrap();
+    let started = std::time::Instant::now();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        holder.unlock().unwrap();
+    });
+    wait_lockable(&path);
+    assert!(started.elapsed() >= std::time::Duration::from_millis(70));
+    releaser.join().unwrap();
+    assert!(!flock_held(&path));
 }

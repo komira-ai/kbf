@@ -359,6 +359,7 @@ fn an_install_starts_one_unit() {
         fs::metadata(&fx.host.audit).unwrap().permissions().mode() & 0o777,
         0o600
     );
+    locks::wait_lockable(&fx.host.install_lock);
     assert!(!locks::flock_held(&fx.host.install_lock), "none left");
 }
 
@@ -494,6 +495,7 @@ fn an_overlapping_install_is_busy() {
     assert_eq!(fx.run(&runner, "query").code, 0);
 
     drop(holder);
+    locks::wait_lockable(&fx.host.install_lock);
     let runner = FakeRunner::new(vec![ok(&unit_says(&installed("1.2.3-1")))]);
     assert_eq!(fx.run(&runner, INSTALL).code, 0);
     assert_eq!(runner.calls().len(), 1);
@@ -716,6 +718,8 @@ fn a_query_leaves_no_lock() {
     write(&fx.host.install_lock, 0o600, "");
     let runner = FakeRunner::new(vec![ok("un  \n"), ok("")]);
     fx.run(&runner, "query");
+    // Taking it is the proof: a probe's shared lock left behind would refuse this.
+    locks::wait_lockable(&fx.host.install_lock);
     let file = fs::File::open(&fx.host.install_lock).unwrap();
     file.try_lock().expect("the query's probe was let go");
 }

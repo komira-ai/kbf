@@ -94,6 +94,7 @@ fn no_moment_of_the_install_reads_as_idle() {
     assert_eq!(asked.get(), 4);
 
     // And once it is over it is idle again.
+    locks::wait_lockable(&fx.host.install_lock);
     let probe = FakeRunner::new(vec![ok("ii  1.2.3-1\n"), exec(1, "", ""), ok("")]);
     let answer = fx.run(&probe, "query");
     assert_eq!(answer.json()["in_progress"], false);
@@ -186,6 +187,7 @@ fn a_failed_update_stops_the_install() {
         );
         assert!(!answer.err.contains('\x1b'));
         assert_eq!(runner.calls().len(), 2, "the install step did not run");
+        locks::wait_lockable(&fx.host.install_lock);
         assert!(!locks::flock_held(&fx.host.install_lock), "released");
     }
 }
@@ -251,6 +253,7 @@ fn unreadable_state_fails_the_install() {
             "{what}"
         );
         assert_eq!(runner.calls().len(), 1, "{what}: nothing else ran");
+        locks::wait_lockable(&fx.host.install_lock);
         assert!(!locks::flock_held(&fx.host.install_lock));
     }
 }
@@ -317,9 +320,11 @@ fn a_busy_lock_runs_nothing() {
         "still the holder's"
     );
     drop(holder);
+    locks::wait_lockable(&fx.host.install_lock);
     let runner = install_script("ii  1.0-1\n", "ii  1.2.3-1\n");
     assert_eq!(install(&fx, &runner).code, 0);
     // And the lock is released at the end of that install.
+    locks::wait_lockable(&fx.host.install_lock);
     let runner = FakeRunner::new(vec![ok("ii  1.2.3-1\n")]);
     assert_eq!(install(&fx, &runner).code, 0);
 }
@@ -370,6 +375,7 @@ fn the_unit_runs_only_an_install() {
         );
         assert!(runner.calls().is_empty(), "{request:?}");
     }
+    locks::wait_lockable(&fx.host.install_lock);
     assert!(!locks::flock_held(&fx.host.install_lock));
 }
 
