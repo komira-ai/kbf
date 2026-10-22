@@ -118,7 +118,7 @@ impl Router {
     /// instead of Tokio's: for a test that runs a hold without real time.
     #[must_use]
     pub fn with_hold_clock(mut self, clock: Arc<dyn HoldClock>) -> Self {
-        self.hold.clock = clock;
+        self.hold = self.hold.with_clock(clock);
         self
     }
 

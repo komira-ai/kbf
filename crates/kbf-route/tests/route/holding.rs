@@ -10,7 +10,7 @@ use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use kbf_map::{MemberId, MemberState};
 use kbf_meta::{ActionRecord, Role};
-use kbf_route::{HoldClock, Router};
+use kbf_route::{Hold, HoldClock, Router};
 use kbf_storage::StorageError;
 use kbf_types::Digest;
 
@@ -347,6 +347,29 @@ async fn a_commit_is_held_for_one_bound_not_one_per_blob_it_reads() {
     assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");
     assert_eq!(clock.elapsed(), BOUND);
     assert!(cluster.node(3).commits.lock().expect("lock").is_empty());
+}
+
+/// Catches a hold a caller outside the router cannot use as the router does (the frontend's
+/// pass-through of a ByteStream holds with one): it reports its bound, pauses as the router
+/// does (250 ms doubling) by the clock it is given, ends exactly at the bound, and a hold of
+/// nothing ends at once. Mutants: a bound not kept, the clock not used, a hold that ends
+/// early or late.
+#[tokio::test]
+async fn a_hold_of_its_own_pauses_and_ends_as_the_routers_does() {
+    let clock = FakeClock::new();
+    let hold = Hold::new(BOUND).with_clock(clock.clone());
+    assert_eq!(hold.bound(), BOUND);
+    assert_eq!(format!("{hold:?}"), "Hold { bound: 60s, .. }");
+
+    let mut waiting = hold.begin();
+    while waiting.again().await {}
+    assert_eq!(clock.elapsed(), BOUND);
+    assert_eq!(clock.pauses()[..3], [ms(250), ms(500), ms(1000)]);
+    assert!(!waiting.again().await, "a hold that has ended stays ended");
+
+    let none = Hold::none();
+    assert_eq!(none.bound(), Duration::ZERO);
+    assert!(!none.begin().again().await);
 }
 
 /// Catches a default clock that is not Tokio's: with no clock given, a router holds by

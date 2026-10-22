@@ -93,7 +93,7 @@ use kbf_front::{
 };
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
 use kbf_proto::worker::worker_server::WorkerServer;
-use kbf_route::{DEFAULT_HOLD, TlsNodes};
+use kbf_route::{DEFAULT_HOLD, Hold, TlsNodes};
 use kbf_storage::Storage;
 use kbf_storage::service::RemoteStorage;
 use kbf_threads::Topology;
@@ -582,8 +582,9 @@ impl FrontendFlags {
 /// at `https://` and verified against its own address. With a state store but no TLS flags
 /// the start logs a warning that says so, since the farm may have members the daemons
 /// place blobs on that this frontend will not look at. A call no member could answer is
-/// held for [`DEFAULT_HOLD`] before it fails (there is no flag for the bound yet). Not
-/// generic, for the same reason as [`crate::serve::sweeping`].
+/// held for [`DEFAULT_HOLD`] before it fails (there is no flag for the bound yet; the raw
+/// ByteStream calls have the same bound, `proxy_owners`). Not generic, for the same reason
+/// as [`crate::serve::sweeping`].
 ///
 /// # Errors
 /// A TLS file cannot be read.
@@ -609,6 +610,17 @@ fn routed_of(
             .with_hold(DEFAULT_HOLD)
             .bootstrapped(storage.clone()),
     )))
+}
+
+/// The nodes the proxy calls: routed by the map when there is one, else the `--storage`
+/// node `bootstrap`. The raw ByteStream calls that no node of their blob can answer are held
+/// for [`DEFAULT_HOLD`], as `routed_of` holds the router's calls.
+fn proxy_owners(routed: Option<Arc<Routed>>, bootstrap: Owner) -> Owners {
+    let owners = match routed {
+        Some(routed) => Owners::routed(routed, bootstrap),
+        None => Owners::single(bootstrap),
+    };
+    owners.with_hold(Hold::new(DEFAULT_HOLD))
 }
 
 /// A started frontend: bound, not yet serving.
@@ -1183,11 +1195,7 @@ impl<'a> Prepared<'a> {
         let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
         let authorizers = Arc::new(policy.authorizers);
         let bootstrap = Owner::new(&flags.storage.uri().to_string(), channel);
-        let owners = match routed {
-            Some(routed) => Owners::routed(routed, bootstrap),
-            None => Owners::single(bootstrap),
-        };
-        let proxy = Proxy::new(owners, Arc::clone(&authorizers));
+        let proxy = Proxy::new(proxy_owners(routed, bootstrap), Arc::clone(&authorizers));
         let streams = kbf_front::OpenStreams { closing, progress };
         // With a handover configured, Execute and WaitExecution are forwarded to the
         // successor once this frontend has handed its roles over.
