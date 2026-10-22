@@ -1074,7 +1074,6 @@ fn a_closed_output_stops_setup_at_each_database_line() {
         let backend = Backend {
             releases: &Unwired,
             schemas: &server,
-            migrations: &Standing::Fresh,
         };
         let result = run(
             &linux(),
