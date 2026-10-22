@@ -17,10 +17,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::{Phase, Roll, RollRequest, RollState};
+use crate::api::{Hosts, Phase, Roll, RollRequest, RollState};
 
 const NAME: &str = "roll.json";
 const TEMP: &str = ".roll.json.tmp";
+const LOCK: &str = "lock";
 
 /// The format written and the only one read.
 pub const FORMAT: u32 = 1;
@@ -46,10 +47,12 @@ pub struct Record {
 }
 
 impl Record {
-    /// The record contradicts itself: the roll's hosts are not the request's plan, a host is
-    /// in flight while an earlier one is not done, a later one has begun, or the state says
-    /// more than the hosts do. A hand-edited or half-merged file lands here and not in a
-    /// roll that touches the wrong host.
+    /// The record contradicts itself: for an explicit host list, the roll's hosts are not the
+    /// request's aliases (the same ones, in the same order, with at most one moved to the
+    /// front for the frontend; [`crate::Updater::open`] holds the exact plan to the inventory);
+    /// a host is in flight while an earlier one is not done, a later one has begun, or the
+    /// state says more than the hosts do. A hand-edited or half-merged file lands here and
+    /// not in a roll that touches the wrong host.
     pub fn check(&self) -> Result<(), String> {
         if self.format != FORMAT {
             return Err(format!("format {} is not {FORMAT}", self.format));
@@ -63,6 +66,14 @@ impl Record {
         let hosts = &self.roll.hosts;
         if hosts.is_empty() {
             return Err("the roll has no hosts".to_owned());
+        }
+        if let Hosts::Aliases(asked) = &self.request.hosts {
+            let have: Vec<&str> = hosts.iter().map(|h| h.alias.as_str()).collect();
+            if !is_plan_of(&have, asked) {
+                return Err(format!(
+                    "the roll's hosts {have:?} are not the request's {asked:?}"
+                ));
+            }
         }
         // Done*, then at most one host in flight (or failed), then Pending*.
         let mut open = false;
@@ -90,6 +101,21 @@ impl Record {
     }
 }
 
+/// `have` is `asked` as the plan makes it: the same aliases in the same order, except that
+/// one (the frontend) may have been moved to the front.
+fn is_plan_of(have: &[&str], asked: &[String]) -> bool {
+    if have.len() != asked.len() {
+        return false;
+    }
+    if have.iter().zip(asked).all(|(h, a)| h == a) {
+        return true;
+    }
+    (0..asked.len()).any(|i| {
+        let rest = asked[..i].iter().chain(&asked[i + 1..]);
+        have[0] == asked[i] && have[1..].iter().zip(rest).all(|(h, a)| h == a)
+    })
+}
+
 /// Why the record could not be used.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -99,19 +125,22 @@ pub enum StoreError {
     Corrupt(#[from] serde_json::Error),
     #[error("roll.json contradicts itself: {0}")]
     Inconsistent(String),
+    #[error("the state directory cannot be locked: another kbf-updater holds it")]
+    Busy,
 }
 
 /// The two syncs that make a record durable. A test passes one that looks at the directory
 /// when each is called, or fails after a count, so that dropping a sync, moving it before the
 /// rename or losing the process between two writes is visible (a crash cannot be staged in a
 /// test, a call order can).
-pub(crate) trait Durable: Send + Sync {
+pub(crate) trait Durable: Send + Sync + std::fmt::Debug {
     /// Flush the temp file's data, before the rename.
     fn file(&self, file: &File) -> std::io::Result<()>;
     /// Flush the directory entry, after the rename.
     fn dir(&self, dir: &Path) -> std::io::Result<()>;
 }
 
+#[derive(Debug)]
 pub(crate) struct Fsync;
 
 impl Durable for Fsync {
@@ -125,20 +154,42 @@ impl Durable for Fsync {
 }
 
 /// Reads and writes `roll.json` under a directory.
+///
+/// [`RollStore::open`] takes an exclusive `flock` on `lock` in the directory and holds it
+/// until the store is dropped, so a second updater process over the same directory is
+/// refused ([`StoreError::Busy`]) and not left to race the first on `roll.json`.
+#[derive(Debug)]
 pub struct RollStore {
     dir: PathBuf,
     sync: Box<dyn Durable>,
+    /// Held for its lock; never read.
+    _lock: Option<File>,
 }
 
 impl RollStore {
-    pub fn new(dir: &Path) -> RollStore {
-        RollStore::with_sync(dir, Box::new(Fsync))
+    /// The store in `dir` (which must exist), with the real fsyncs, and the directory locked.
+    pub fn open(dir: &Path) -> Result<RollStore, StoreError> {
+        let lock = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(dir.join(LOCK))?;
+        lock.try_lock().map_err(|_| StoreError::Busy)?;
+        Ok(RollStore {
+            dir: dir.to_owned(),
+            sync: Box::new(Fsync),
+            _lock: Some(lock),
+        })
     }
 
+    /// A store without the directory lock and with `sync` for its syncs: the test seam.
+    #[cfg(test)]
     pub(crate) fn with_sync(dir: &Path, sync: Box<dyn Durable>) -> RollStore {
         RollStore {
             dir: dir.to_owned(),
             sync,
+            _lock: None,
         }
     }
 

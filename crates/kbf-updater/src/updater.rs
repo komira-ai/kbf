@@ -14,11 +14,18 @@
 //! Memory never runs ahead of disk: a change is applied to a copy, written, and kept only if
 //! the write succeeded. A roll whose record cannot be written stops where it is
 //! (`state_lost`) rather than act on a phase it could not remember.
+//!
+//! Nor does memory fall behind it. A save that fails may still have renamed the new record
+//! into place (the directory fsync is after the rename), so after any save error the
+//! updater is poisoned: every operation answers `state_lost` until [`Updater::reload`] (or a
+//! new process) has read `roll.json` again and so knows what the disk says.
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use crate::api::{ApiError, ErrorCode, Failure, HostRoll, Phase, Roll, RollRequest, RollState};
+use crate::api::{
+    ApiError, ErrorCode, Failure, HostRoll, Hosts, Phase, Roll, RollRequest, RollState,
+};
 use crate::inventory::{Host, Inventory, Role};
 use crate::ports::{Clock, Health, HealthCheck, Installed, Installer, SafeToStop, Stop};
 use crate::record::{FORMAT, Record, RollStore, StoreError, roll_id};
@@ -95,12 +102,24 @@ pub struct Started {
     pub created: bool,
 }
 
-struct State {
-    rec: Option<Record>,
+pub(crate) struct State {
+    pub(crate) rec: Option<Record>,
     /// A thread is inside `drive`.
-    driving: bool,
+    pub(crate) driving: bool,
     /// The roll was found `running` at start-up and has not been resumed yet.
     recovering: bool,
+    /// A save failed, so the record on disk may be ahead of `rec`; see the module docs.
+    poisoned: bool,
+}
+
+/// Installs of one host per roll: the first, and the one rerun after a restart.
+const MAX_INSTALLS: u32 = 2;
+
+/// Why an install call did not succeed.
+enum InstallError {
+    /// No answer: whether it ran is unknown.
+    Unreachable,
+    Halt(Halt),
 }
 
 /// Why a host's turn ended early.
@@ -144,6 +163,22 @@ impl Updater {
         timing: Timing,
     ) -> Result<Updater, StoreError> {
         let rec = store.load()?;
+        if let Some(r) = &rec {
+            // An explicit list must be the plan the inventory makes of it, in its order (the
+            // record alone cannot tell which host is the frontend). A host that left the
+            // inventory is the roll's business at that host, not a corrupt file.
+            if let (Hosts::Aliases(_), Ok(plan)) =
+                (&r.request.hosts, inventory.plan(&r.request.hosts))
+            {
+                let want: Vec<&str> = plan.iter().map(|h| h.alias.as_str()).collect();
+                let have: Vec<&str> = r.roll.hosts.iter().map(|h| h.alias.as_str()).collect();
+                if want != have {
+                    return Err(StoreError::Inconsistent(format!(
+                        "the roll's hosts {have:?} are not the plan {want:?}"
+                    )));
+                }
+            }
+        }
         let recovering = rec
             .as_ref()
             .is_some_and(|r| r.roll.state == RollState::Running);
@@ -156,22 +191,37 @@ impl Updater {
                 rec,
                 driving: false,
                 recovering,
+                poisoned: false,
             }),
         })
     }
 
-    fn lock(&self) -> MutexGuard<'_, State> {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Write `next` and, only if that worked, keep it.
+    /// Refuse while the record in memory may be behind the disk.
+    fn check_live(st: &State) -> Result<(), ApiError> {
+        if st.poisoned {
+            return Err(ApiError::new(
+                ErrorCode::StateLost,
+                "a write of roll.json failed, so the updater no longer knows what it says; \
+                 reload it or restart the updater",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Write `next` and, only if that worked, keep it. A failed write poisons the updater.
     fn commit(&self, st: &mut State, next: Record) -> Result<Roll, ApiError> {
-        self.store.save(&next).map_err(|e| {
-            ApiError::new(
+        Updater::check_live(st)?;
+        if let Err(e) = self.store.save(&next) {
+            st.poisoned = true;
+            return Err(ApiError::new(
                 ErrorCode::StateLost,
                 format!("roll.json cannot be written: {e}"),
-            )
-        })?;
+            ));
+        }
         let roll = next.roll.clone();
         st.rec = Some(next);
         Ok(roll)
@@ -180,36 +230,73 @@ impl Updater {
     /// Change the current record by `f`, durably.
     fn update(&self, f: impl FnOnce(&mut Record)) -> Result<Roll, ApiError> {
         let mut st = self.lock();
-        let mut next = st
-            .rec
-            .clone()
-            .ok_or_else(|| ApiError::new(ErrorCode::UnknownRoll, "there is no roll"))?;
+        let mut next = Updater::live_record(&st)?;
         f(&mut next);
         self.commit(&mut st, next)
     }
 
-    fn snapshot(&self) -> Result<Record, ApiError> {
-        self.lock()
-            .rec
+    fn live_record(st: &State) -> Result<Record, ApiError> {
+        Updater::check_live(st)?;
+        st.rec
             .clone()
             .ok_or_else(|| ApiError::new(ErrorCode::UnknownRoll, "there is no roll"))
     }
 
-    /// The current (latest) roll, if any has run.
-    pub fn current(&self) -> Option<Roll> {
+    fn snapshot(&self) -> Result<Record, ApiError> {
+        Updater::live_record(&self.lock())
+    }
+
+    /// The roll in memory, whether or not the updater is poisoned (a test of "memory never
+    /// runs ahead of disk").
+    #[cfg(test)]
+    pub(crate) fn memory(&self) -> Option<Roll> {
         self.lock().rec.as_ref().map(|r| r.roll.clone())
     }
 
+    /// The current (latest) roll, if any has run.
+    pub fn current(&self) -> Result<Option<Roll>, ApiError> {
+        let st = self.lock();
+        Updater::check_live(&st)?;
+        Ok(st.rec.as_ref().map(|r| r.roll.clone()))
+    }
+
     pub fn get(&self, id: &str) -> Result<Roll, ApiError> {
-        self.current()
+        self.current()?
             .filter(|r| r.id == id)
             .ok_or_else(|| ApiError::new(ErrorCode::UnknownRoll, format!("no roll {id}")))
+    }
+
+    /// Read `roll.json` again and make it the updater's state, clearing a poison. A running
+    /// roll is then resumed by the next [`Updater::drive`] as after a restart. Refused (409)
+    /// while a thread drives, and `state_lost` if the file cannot be trusted (the updater
+    /// stays poisoned).
+    pub fn reload(&self) -> Result<Option<Roll>, ApiError> {
+        let mut st = self.lock();
+        if st.driving {
+            return Err(ApiError::new(
+                ErrorCode::RollActive,
+                "a roll is being driven; reload after it stops",
+            ));
+        }
+        let rec = self.store.load().map_err(|e| {
+            ApiError::new(
+                ErrorCode::StateLost,
+                format!("roll.json cannot be read: {e}"),
+            )
+        })?;
+        st.recovering = rec
+            .as_ref()
+            .is_some_and(|r| r.roll.state == RollState::Running);
+        st.rec = rec;
+        st.poisoned = false;
+        Ok(st.rec.as_ref().map(|r| r.roll.clone()))
     }
 
     /// Begin a roll: validate the aliases, apply the idempotency key and the one-roll rule,
     /// and write the record. Nothing runs until [`Updater::drive`].
     pub fn start(&self, req: &RollRequest) -> Result<Started, ApiError> {
         let mut st = self.lock();
+        Updater::check_live(&st)?;
         if let Some(rec) = &st.rec {
             if rec.request.idempotency_key == req.idempotency_key {
                 if rec.request == *req {
@@ -264,15 +351,20 @@ impl Updater {
     }
 
     /// Abort a roll. A running roll that a thread is driving stops after the host in hand
-    /// (between hosts); one nobody drives, and an interrupted one, is aborted at once. A
-    /// finished roll is a 409.
+    /// (between hosts) and ends `aborted`, also when that host was the last one (the abort
+    /// was asked for before the roll was over); the flag is consumed by that. If every host
+    /// is already done when the abort arrives, the reply says `done` and the roll ends
+    /// `done`. A roll nobody drives, and an interrupted one, is aborted at once. A finished
+    /// roll is a 409.
     pub fn abort(&self, id: &str) -> Result<Roll, ApiError> {
         let mut st = self.lock();
-        let mut next = st
-            .rec
-            .clone()
-            .filter(|r| r.roll.id == id)
-            .ok_or_else(|| ApiError::new(ErrorCode::UnknownRoll, format!("no roll {id}")))?;
+        let mut next = Updater::live_record(&st)?;
+        if next.roll.id != id {
+            return Err(ApiError::new(
+                ErrorCode::UnknownRoll,
+                format!("no roll {id}"),
+            ));
+        }
         if next.roll.state.is_terminal() {
             return Err(ApiError::new(
                 ErrorCode::RollTerminal,
@@ -280,6 +372,13 @@ impl Updater {
             ));
         }
         if st.driving {
+            if next.roll.hosts.iter().all(|h| h.phase == Phase::Done) {
+                // Every host is finished and the driver is about to say so: too late, and
+                // the reply says what the roll is.
+                let mut roll = next.roll;
+                roll.state = RollState::Done;
+                return Ok(roll);
+            }
             next.abort_requested = true;
         } else {
             next.roll.state = RollState::Aborted;
@@ -294,10 +393,13 @@ impl Updater {
     pub fn drive(&self, id: &str) -> Result<Roll, ApiError> {
         {
             let mut st = self.lock();
-            let rec =
-                st.rec.clone().filter(|r| r.roll.id == id).ok_or_else(|| {
-                    ApiError::new(ErrorCode::UnknownRoll, format!("no roll {id}"))
-                })?;
+            let rec = Updater::live_record(&st)?;
+            if rec.roll.id != id {
+                return Err(ApiError::new(
+                    ErrorCode::UnknownRoll,
+                    format!("no roll {id}"),
+                ));
+            }
             if rec.roll.state != RollState::Running {
                 return Ok(rec.roll);
             }
@@ -322,12 +424,17 @@ impl Updater {
         let _driving = Driving(self);
         loop {
             let rec = self.snapshot()?;
-            let Some(idx) = rec.roll.hosts.iter().position(|h| h.phase != Phase::Done) else {
+            let next = rec.roll.hosts.iter().position(|h| h.phase != Phase::Done);
+            // The abort flag is consumed here, after the last host as after any other.
+            if rec.abort_requested {
+                return self.update(|r| {
+                    r.abort_requested = false;
+                    r.roll.state = RollState::Aborted;
+                });
+            }
+            let Some(idx) = next else {
                 return self.update(|r| r.roll.state = RollState::Done);
             };
-            if rec.abort_requested {
-                return self.update(|r| r.roll.state = RollState::Aborted);
-            }
             match self.step(idx, &rec.request.version) {
                 Ok(()) => {}
                 Err(Halt::Fail(code, detail)) => {
@@ -392,8 +499,12 @@ impl Updater {
                     self.check_safe(host)?;
                 }
                 self.mark(idx, Phase::Installing, true)?;
-                self.install(host, target)?;
-                self.mark(idx, Phase::WaitingHealthy, false)?;
+                match self.install(host, target) {
+                    Ok(()) => self.mark(idx, Phase::WaitingHealthy, false)?,
+                    // No answer: the install may or may not have run. Ask, as after a restart.
+                    Err(InstallError::Unreachable) => self.recover_install(idx, host, target)?,
+                    Err(InstallError::Halt(h)) => return Err(h),
+                }
             }
             Phase::Installing => self.recover_install(idx, host, target)?,
             Phase::WaitingHealthy | Phase::Done => {}
@@ -432,11 +543,15 @@ impl Updater {
         }
     }
 
-    fn install(&self, host: &Host, target: &Version) -> Result<(), Halt> {
-        self.ports
-            .installer
-            .install(host, target)
-            .map_err(|e| Halt::Fail(ErrorCode::InstallFailed, e.to_string()))
+    fn install(&self, host: &Host, target: &Version) -> Result<(), InstallError> {
+        match self.ports.installer.install(host, target) {
+            Ok(()) => Ok(()),
+            Err(e) if e.is_unreachable() => Err(InstallError::Unreachable),
+            Err(e) => Err(InstallError::Halt(Halt::Fail(
+                ErrorCode::InstallFailed,
+                e.to_string(),
+            ))),
+        }
     }
 
     /// A host found `installing`: ask, do not install blindly. The target means the install
@@ -449,12 +564,30 @@ impl Updater {
         loop {
             match self.ports.installer.query(host) {
                 Ok(Installed::Version(v)) => {
-                    if v != target.as_str() {
-                        self.mark(idx, Phase::Installing, true)?;
-                        self.install(host, target)?;
+                    if v == target.as_str() {
+                        self.mark(idx, Phase::WaitingHealthy, false)?;
+                        return Ok(());
                     }
-                    self.mark(idx, Phase::WaitingHealthy, false)?;
-                    return Ok(());
+                    // Not the target: the install did not run or did not finish. One more
+                    // (section 13(e): rerun once); a host that is still not there after
+                    // that is for an operator.
+                    let attempts = self.snapshot()?.roll.hosts[idx].attempts;
+                    if attempts >= MAX_INSTALLS {
+                        return Err(Halt::Interrupt(format!(
+                            "{} runs {v} and not {} after {attempts} install attempts",
+                            host.alias,
+                            target.as_str()
+                        )));
+                    }
+                    self.mark(idx, Phase::Installing, true)?;
+                    match self.install(host, target) {
+                        Ok(()) => {
+                            self.mark(idx, Phase::WaitingHealthy, false)?;
+                            return Ok(());
+                        }
+                        Err(InstallError::Unreachable) => {}
+                        Err(InstallError::Halt(h)) => return Err(h),
+                    }
                 }
                 Ok(Installed::InProgress) => {
                     last_answer = self.now();

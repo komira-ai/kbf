@@ -12,11 +12,67 @@ use serde::{Deserialize, Serialize};
 use crate::inventory::Host;
 use crate::version::Version;
 
+/// Why a port call failed, in the one distinction the roll acts on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortErrorKind {
+    /// The host or service could not be reached or did not answer (a refused connection, a
+    /// timeout, a 5xx): no answer, as opposed to an answer that says no.
+    Unreachable,
+    /// Anything else: the far side answered and refused, or failed.
+    Other,
+}
+
 /// A port could not be asked or did not answer: a refused connection, a timeout, a 5xx. One
 /// line, never raw ssh or apt output.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{0}")]
-pub struct PortError(pub String);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortError {
+    kind: PortErrorKind,
+    text: String,
+}
+
+impl PortError {
+    /// No answer: the host could not be reached.
+    pub fn unreachable(text: impl Into<String>) -> PortError {
+        PortError {
+            kind: PortErrorKind::Unreachable,
+            text: text.into(),
+        }
+    }
+
+    /// An answer that is a refusal or a failure.
+    pub fn other(text: impl Into<String>) -> PortError {
+        PortError {
+            kind: PortErrorKind::Other,
+            text: text.into(),
+        }
+    }
+
+    pub fn kind(&self) -> PortErrorKind {
+        self.kind
+    }
+
+    pub fn is_unreachable(&self) -> bool {
+        self.kind == PortErrorKind::Unreachable
+    }
+}
+
+/// `PortError("..".into())` builds an [`PortErrorKind::Other`] error, as the tuple struct this
+/// type was did.
+#[allow(non_snake_case)]
+pub fn PortError(text: String) -> PortError {
+    PortError::other(text)
+}
+
+impl std::fmt::Display for PortError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            PortErrorKind::Unreachable => write!(f, "unreachable: {}", self.text),
+            PortErrorKind::Other => f.write_str(&self.text),
+        }
+    }
+}
+
+impl std::error::Error for PortError {}
 
 /// The answer of `GET /v1/members/{id}/safe-to-stop`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,5 +198,20 @@ mod tests {
             }
         );
         assert_eq!(PortError("down".into()).to_string(), "down");
+    }
+
+    /// Catches a kind that is lost or shown wrongly: the tuple-style call is `Other`, the
+    /// constructors set their kind, and only `Unreachable` is announced in the text.
+    #[test]
+    fn a_port_error_has_a_kind() {
+        let other = PortError("refused".into());
+        assert_eq!(other.kind(), PortErrorKind::Other);
+        assert!(!other.is_unreachable());
+        assert_eq!(other, PortError::other("refused"));
+        let gone = PortError::unreachable("ssh: timed out");
+        assert_eq!(gone.kind(), PortErrorKind::Unreachable);
+        assert!(gone.is_unreachable());
+        assert_eq!(gone.to_string(), "unreachable: ssh: timed out");
+        assert_ne!(gone, PortError::other("ssh: timed out"));
     }
 }

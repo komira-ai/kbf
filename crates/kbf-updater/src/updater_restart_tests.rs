@@ -14,11 +14,11 @@ use crate::ports::{Installed, PortError};
 use crate::record::{Durable, FORMAT, Record, RollStore, StoreError, roll_id};
 use crate::updater_tests::{ORDER, Rig, all};
 
-const OLD: &str = "1.0";
-const TARGET: &str = "2.0";
+pub(crate) const OLD: &str = "1.0";
+pub(crate) const TARGET: &str = "2.0";
 
 /// A record of `all("2.0", "run-1")` with the given phases (one per host, in plan order).
-fn record(phases: [(Phase, u32); 4], state: RollState) -> Record {
+pub(crate) fn record(phases: [(Phase, u32); 4], state: RollState) -> Record {
     let failed = phases.iter().position(|(p, _)| *p == Phase::Failed);
     Record {
         format: FORMAT,
@@ -52,7 +52,7 @@ use Phase::{Checking, Done, Failed, Installing, Pending, WaitingHealthy};
 
 /// Put `rec` on the rig's disk, as a process that stopped there would have left it, and open
 /// a new updater over it with the hosts as `installed` says.
-fn restart(rig: &Rig, rec: &Record) -> Updater {
+pub(crate) fn restart(rig: &Rig, rec: &Record) -> Updater {
     rig.store().save(rec).expect("save");
     rig.log.clear();
     rig.open()
@@ -230,7 +230,7 @@ fn an_install_in_progress_for_ever_interrupts_the_roll() {
 
 fn silent_for(rig: &Rig, errors: usize, then: Installed) {
     let mut answers: Vec<_> = (0..errors)
-        .map(|_| Err(PortError("ssh: timed out".into())))
+        .map(|_| Err(PortError::unreachable("ssh: timed out")))
         .collect();
     answers.push(Ok(then));
     rig.inst.script_query("st1", answers);
@@ -333,7 +333,10 @@ fn an_interrupted_roll_blocks_new_rolls_until_aborted() {
     assert_eq!(u.abort("roll-1").expect("abort").state, RollState::Aborted);
     // And it survives yet another restart as aborted, not running.
     let again = rig.open();
-    assert_eq!(again.current().expect("c").state, RollState::Aborted);
+    assert_eq!(
+        again.current().expect("live").expect("c").state,
+        RollState::Aborted
+    );
     assert!(again.start(&all(TARGET, "run-2")).is_ok());
 }
 
@@ -402,6 +405,7 @@ fn each_restart_is_counted() {
 
 /// Counts saves, and fails every one after the first `limit`: a crash between two writes of a
 /// roll, as far as the next process can tell (the temp file is left behind, as a kill would).
+#[derive(Debug)]
 struct Crash {
     saves: Arc<AtomicUsize>,
     limit: usize,
@@ -460,10 +464,10 @@ fn a_crash_at_every_write_of_a_roll_is_resumed_without_a_repeat_or_a_skip() {
         assert_eq!(err.code, ErrorCode::StateLost, "limit {limit}");
         // Memory never ran ahead of disk.
         let on_disk = rig.store().load().expect("load").map(|r| r.roll);
-        assert_eq!(u.current(), on_disk, "limit {limit}");
+        assert_eq!(u.memory(), on_disk, "limit {limit}");
 
         let u = rig.open();
-        let roll = match u.current() {
+        let roll = match u.current().expect("live") {
             Some(r) => u.drive(&r.id).expect("resume"),
             None => rig.roll(&u),
         };
@@ -481,6 +485,7 @@ fn a_crash_at_every_write_of_a_roll_is_resumed_without_a_repeat_or_a_skip() {
 }
 
 /// Records what is on disk each time a sync is called.
+#[derive(Debug)]
 struct Observe {
     dir: std::path::PathBuf,
     seen: Arc<std::sync::Mutex<Vec<String>>>,
@@ -731,7 +736,7 @@ fn a_leftover_temp_file_is_ignored_and_overwritten() {
     rig.store().save(&rec).expect("save");
     fs::write(rig.dir.join(".roll.json.tmp"), "{ half a rec").expect("tmp");
     let u = rig.open();
-    assert_eq!(u.current().expect("c").hosts[0].phase, Done);
+    assert_eq!(u.current().expect("live").expect("c").hosts[0].phase, Done);
     assert_eq!(u.drive("roll-1").expect("drive").state, RollState::Done);
     assert!(rig.store().load().expect("l").is_some());
 }
@@ -741,7 +746,7 @@ fn a_leftover_temp_file_is_ignored_and_overwritten() {
 fn no_roll_json_is_a_first_start() {
     let rig = Rig::new("first-start");
     let u = rig.open();
-    assert_eq!(u.current(), None);
+    assert_eq!(u.current().expect("live"), None);
     assert!(rig.store().load().expect("load").is_none());
 }
 
@@ -784,6 +789,8 @@ fn a_resume_that_cannot_record_itself_is_state_lost_and_leaves_the_roll_alone() 
             u.drive("roll-1").expect_err("lost").code,
             ErrorCode::StateLost
         );
+        // Not left believing a thread drives (a reload is refused while one does).
+        u.reload().expect("reload");
     }
     assert!(rig.log.events().is_empty());
     assert_eq!(rig.store().load().expect("l").expect("r"), rec);
