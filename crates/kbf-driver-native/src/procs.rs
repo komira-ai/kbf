@@ -327,10 +327,22 @@ mod platform {
     /// `numer / denom` nanoseconds. `(1, 1)` if the kernel refuses (it does not).
     #[must_use]
     pub fn timebase() -> (u32, u32) {
-        let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+        /// `struct mach_timebase_info` of <mach/mach_time.h>: two `uint32_t`. Declared
+        /// here because `libc` marks its copy deprecated.
+        #[repr(C)]
+        struct Timebase {
+            numer: u32,
+            denom: u32,
+        }
+        unsafe extern "C" {
+            // <mach/mach_time.h>: fills `info`, returns KERN_SUCCESS (0).
+            fn mach_timebase_info(info: *mut Timebase) -> libc::c_int;
+        }
+        let mut info = Timebase { numer: 0, denom: 0 };
         // FFI-BOUNDARY: `info` is this frame's; the call fills it and keeps no pointer.
-        // SAFETY: `info` is a writable mach_timebase_info.
-        let done = unsafe { libc::mach_timebase_info(&raw mut info) };
+        // SAFETY: `info` is a writable struct of the layout the declaration above gives
+        // (two u32, as in <mach/mach_time.h>).
+        let done = unsafe { mach_timebase_info(&raw mut info) };
         if done == 0 && info.denom != 0 {
             (info.numer, info.denom)
         } else {

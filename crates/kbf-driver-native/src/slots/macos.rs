@@ -765,6 +765,7 @@ mod tests {
     #[tokio::test]
     async fn the_watch_measures_the_uids_processes() {
         let watch = UidWatch {
+            meter: Arc::default(),
             uid: rustix::process::geteuid().as_raw(),
             record: PathBuf::from("/nonexistent"),
             seen: Arc::default(),
