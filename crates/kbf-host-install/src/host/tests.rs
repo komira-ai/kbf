@@ -560,6 +560,16 @@ fn a_failed_update_stops_the_install() {
     }
 }
 
+/// Some tools write their complaint to stdout: it is the detail when stderr is empty.
+#[test]
+fn the_detail_falls_back_to_stdout() {
+    let fx = Fx::new("host-detail");
+    let runner = FakeRunner::new(vec![ok("ii  1.0-1\n"), exec(100, "E: on stdout\n", "")]);
+    let answer = fx.run(&runner, INSTALL);
+    assert_eq!(answer.code, 3);
+    assert!(answer.err.contains("E: on stdout"), "{}", answer.err);
+}
+
 /// The install step failing is its own code.
 #[test]
 fn a_failed_install_step() {

@@ -144,6 +144,34 @@ fn a_source_without_signed_by_is_refused() {
     }
 }
 
+/// A continuation line belongs to the field above it, whatever the field is, and a line
+/// that is no field and no entry is ignored: neither can move a key into or out of the
+/// `Signed-By` field.
+#[test]
+fn continuation_and_stray_lines() {
+    let f = Fixture::new("config-continuation");
+    let key = f.key();
+    let text = format!(
+        "Types: deb\nURIs: https://a\nSuites: candidate\n stable\nstray words\nSigned-By: {}\nComponents: main\n extra\n",
+        key.display()
+    );
+    let source = f.write("c.sources", 0o644, &text);
+    assert!(
+        f.channel(&source).is_ok(),
+        "continuations of other fields are not keys"
+    );
+    let text = format!(
+        "Types: deb\nURIs: https://a\nSigned-By: {}\n /nonexistent/other.gpg\n",
+        key.display()
+    );
+    let source = f.write("d.sources", 0o644, &text);
+    assert_eq!(
+        f.channel(&source),
+        Err(Refusal::KeyUntrusted),
+        "a continuation of Signed-By is a key"
+    );
+}
+
 /// Catches a key that is accepted without being root's: a missing file, a file of another
 /// owner, a writable file, a key that is not a path (fingerprint, inline), and a list in
 /// which only the second key is bad.

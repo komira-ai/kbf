@@ -70,7 +70,9 @@ impl Audit {
             .mode(0o600)
             .open(path)?;
         let meta = file.metadata()?;
-        if !meta.is_file() || !trust.owns(&meta) || meta.mode() & 0o077 != 0 {
+        // Not `||`: each test is a condition of the log, none a branch of the code.
+        let usable = meta.is_file() & trust.owns(&meta) & (meta.mode() & 0o077 == 0);
+        if !usable {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "not a regular file of the trusted user that only it can access",
