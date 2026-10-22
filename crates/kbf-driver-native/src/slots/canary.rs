@@ -388,8 +388,8 @@ mod tests {
     /// overwrites would let a stale file hide an open door).
     #[test]
     fn the_real_calls_create_link_and_remove() {
-        let dir = std::env::temp_dir().join(format!("kbf-canary-unit-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
+        let scratch = crate::unit_dir("canary-real-calls");
+        let dir = scratch.path();
         let file = dir.join("f");
         RealFs.create(&file).expect("create");
         assert!(
@@ -402,7 +402,6 @@ mod tests {
         RealFs.remove(&file);
         RealFs.remove(&file);
         assert!(!linked.exists() && !file.exists());
-        let _ = std::fs::remove_dir(&dir);
     }
 
     /// Catches a probe mode that answers a process that did not ask for it, that runs a
