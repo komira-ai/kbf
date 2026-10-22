@@ -681,12 +681,12 @@ fn held_only(cache: &TestCache, text: &str) -> Digest {
     blob.digest()
 }
 
-/// Catches (mutant "the durable answer touches nothing": the closure check and the leg dedup
-/// ask it, so an entry hit every day would lose its blobs about 8 days after the last
-/// write): the durable question reports an indexed blob present and so owes it the touch
+/// Catches a durable answer that touches nothing (the closure check and the leg dedup ask
+/// it, so an entry hit every day would lose its blobs about 8 days after the last write):
+/// the durable question reports an indexed blob present and so owes it the touch
 /// `find_missing` records. Both blobs are two days old, so the touch is due; a blob held
-/// only in RAM is reported missing and is not touched, nor is one nobody has. The committed
-/// touch names the indexed blob alone.
+/// only in RAM is reported missing and is not touched, nor is one nobody has. The
+/// committed touch names the indexed blob alone.
 #[tokio::test]
 async fn durable_touches_what_it_reports_present_and_only_that() {
     let cache = cache().await;
@@ -705,9 +705,9 @@ async fn durable_touches_what_it_reports_present_and_only_that() {
     assert_eq!(log.touches(), [BTreeSet::from([present])]);
 }
 
-/// Catches (mutant "the waiting form does not touch"): `durable_waiting` for a blob that is
-/// held and leaves the set while it waits (the drain: the index takes it first) answers
-/// present and touches it, as `durable` does.
+/// Catches a waiting form that does not touch: `durable_waiting` for a blob that is held
+/// and leaves the set while it waits (the drain: the index takes it first) answers present
+/// and touches it, as `durable` does.
 #[tokio::test]
 async fn durable_waiting_touches_a_blob_once_it_is_present() {
     let cache = cache().await;
@@ -734,9 +734,9 @@ async fn durable_waiting_touches_a_blob_once_it_is_present() {
     assert_eq!(log.touches(), [BTreeSet::from([digest])]);
 }
 
-/// Catches (mutant "the waiting form touches what it waited for and did not get"): a blob
-/// still held when the wait ends is reported missing and is not touched; a digest nobody
-/// has is the same.
+/// Catches a waiting form that touches what it waited for and did not get: a blob still
+/// held when the wait ends is reported missing and is not touched; a digest nobody has is
+/// the same.
 #[tokio::test]
 async fn durable_waiting_does_not_touch_what_it_reports_missing() {
     let cache = cache().await.with_durable_wait(Duration::from_millis(1));

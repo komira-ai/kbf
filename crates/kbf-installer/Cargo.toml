@@ -19,8 +19,7 @@ publish.workspace = true
 # `boot-check`) are the root half of the pull-based updates: they read the order spool the
 # unprivileged `kbf` writes, stage and swap releases through this crate, restart the one
 # configured service and write the world-readable status.json the node reads. There is no
-# socket and no network, and a staged binary is never run as root. The `migrate` module (and
-# verb) adopts a host that runs the old layout into the installer's tree. The one exception is
+# socket and no network, and a staged binary is never run as root. The one exception is
 # the `proxy` verb (the `kbf-proxy` runtime: the frontend host's public port), which runs as the
 # unprivileged service user and shares nothing with the root half (tests/layering.rs in kbf-integration-test).
 # `deploy`'s CAS smoke is a small gRPC client of the local REAPI listener (kbf-proto, tonic, a

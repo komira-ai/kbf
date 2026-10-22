@@ -1,7 +1,7 @@
 # Updating an installed host
 
 This page is about a host that is already set up with [`kbf-installer setup`](kbf-installer-setup.md)
-or [`migrate`](kbf-installer-migrate.md). There are three ways to move it to a new release:
+(adoption of an older host is installing the kbf and kbf-proxy packages). There are three ways to move it to a new release:
 
 | way | state in this build |
 |---|---|
@@ -166,8 +166,7 @@ Planned: the frontend offers a release and each host pulls it. The design is
   `{"commit": "<40 hex>"}`, which needs a complete release in the store, and `GET /v1/update` shows
   it with its generation. `POST /v1/update/pause` and `/resume` hold and release the rollout.
 - A floor on each host. `installer.toml` carries `min_generation`, and a host refuses an order below
-  it. `setup --min-generation N` raises it (it never lowers it), and `migrate` prints the value to
-  use.
+  it. `setup --min-generation N` raises it (it never lowers it).
 
 Planned: a host pulling an update on its own. The host's release fetcher is wired into `run` (a
 fetch from the `url` source works, as under (b)), but nothing yet asks the frontend what the

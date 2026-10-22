@@ -524,8 +524,7 @@ async fn an_evicted_debt_whose_store_does_not_answer_stays_and_frees_the_gate() 
 /// write acknowledged from RAM and the disk has not got yet is not evicted, and it is the
 /// only copy a peer's debt can be paid from. `settle_evicted` asks this node's store the
 /// plain question (held counts as present), so the debt stays; a blob the store holds
-/// nowhere is dropped, as before. Mutant: the probe asks `find_durable` (the RAM-held blob
-/// counts as missing and the debt is dropped).
+/// nowhere is dropped, as before.
 #[tokio::test]
 async fn an_evicted_debt_for_a_blob_held_only_in_ram_is_not_dropped() {
     let repairs =

@@ -78,7 +78,6 @@ pub mod host_mode;
 pub mod installer_toml;
 pub mod layout;
 pub mod meta_log;
-pub mod migrate;
 pub mod observe;
 pub mod proxy;
 pub mod proxy_verb;
@@ -101,7 +100,6 @@ pub mod status_v2;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod trust;
-pub mod utc_stamp;
 pub mod version;
 
 use std::fmt;
