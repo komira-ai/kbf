@@ -798,10 +798,10 @@ const E: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 /// a commit are left, and nothing of the removal itself is left behind. A removed commit can be
 /// copied again, which a copy with some of its files gone could not.
 ///
-/// Mutants it catches: the keep list ignored; the keep test inverted; entries that are not
-/// commits removed too; a file named like a commit taken for a copy (its removal fails and ends
-/// the prune); the move to `.partial-gone-*` left without the removal (the entry stays in the
-/// listing).
+/// Asserts that the keep list is honoured, that entries that are not commits are not removed,
+/// that a file named like a commit is not taken for a copy (its removal would fail and end the
+/// prune), and that the move to `.partial-gone-*` is followed by the removal (the entry does
+/// not stay in the listing).
 #[test]
 fn a_prune_removes_the_copies_not_kept_and_nothing_that_is_not_a_copy() {
     let rig = rig("prune");
@@ -828,7 +828,7 @@ fn a_prune_removes_the_copies_not_kept_and_nothing_that_is_not_a_copy() {
 /// Catches a prune that cannot be told from one that worked: with nothing to keep every copy
 /// goes, and with the root gone the listing fails and says so.
 ///
-/// Mutants it catches: the listing's error dropped; a keep list that always holds something.
+/// Asserts that the listing's error is returned, and that an empty keep list keeps nothing.
 #[test]
 fn a_prune_keeps_nothing_when_told_nothing_and_fails_when_the_root_is_gone() {
     let rig = rig("prune-all");

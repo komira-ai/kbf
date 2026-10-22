@@ -341,8 +341,8 @@ fn with_copies_no_order_spool_is_opened_and_the_apis_writer_refuses_every_order(
 /// (the same binary, the same copies and the same orders, not new ones), and the seams are the
 /// same as `parts` builds.
 ///
-/// Mutants it catches: a wiring made whatever `local` says; the wiring over a `Local` opened
-/// again (its orders are not the config's); `parts_shared` leaving the seams unbuilt.
+/// Asserts that the wiring is made only when `local` is set, that it is over the config's own
+/// `Local` (its orders are the config's), and that `parts_shared` builds the seams.
 #[test]
 fn only_a_proxy_with_copies_gets_the_wiring_of_the_binary_watch() {
     let (seams, none) = parts_shared(&config("no-wiring")).expect("the seams");

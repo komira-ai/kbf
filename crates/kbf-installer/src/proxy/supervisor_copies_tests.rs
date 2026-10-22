@@ -201,8 +201,9 @@ fn the_installed_release_is_adopted_only_when_none_is_recorded() {
 /// none; the function the binary watch is given ([`in_use`]) answers the same, from the records
 /// as they are when it is called.
 ///
-/// Mutants it catches: one slot left out; the commit read from the wrong field; an unreadable
-/// record taken for a commit; the watch's function fixed to the records of its creation.
+/// Asserts that both slots are read, that the commit is read from the record's commit field,
+/// that an unreadable record is not a commit, and that the watch's function reads the records
+/// as they are when it is called.
 #[test]
 fn the_commits_a_child_may_still_run_are_those_of_the_slots_records() {
     let rig = rig("supervisor-running-commits");
