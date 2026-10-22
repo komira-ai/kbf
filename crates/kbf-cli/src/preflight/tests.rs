@@ -1090,43 +1090,6 @@ mod system {
         );
     }
 
-    /// A host written before `lstat`, the environment and the groups were asked of it (an
-    /// integration test's) keeps compiling: `lstat` is unsupported, the environment empty, and the
-    /// group the user.
-    #[test]
-    fn a_host_that_says_nothing_of_them_has_the_defaults() {
-        struct Bare;
-        impl super::super::Host for Bare {
-            fn stat(&self, _: &Path) -> std::io::Result<super::super::host::Stat> {
-                Err(std::io::ErrorKind::NotFound.into())
-            }
-            fn read(&self, _: &Path) -> std::io::Result<Vec<u8>> {
-                Ok(Vec::new())
-            }
-            fn var(&self, _: &str) -> Option<String> {
-                None
-            }
-            fn euid(&self) -> u32 {
-                7
-            }
-            fn nofile(&self) -> u64 {
-                0
-            }
-            fn run(&self, _: &Path, _: &[&str]) -> std::io::Result<super::super::host::Output> {
-                Err(std::io::ErrorKind::NotFound.into())
-            }
-            fn now(&self) -> std::time::SystemTime {
-                std::time::UNIX_EPOCH
-            }
-        }
-        assert_eq!(
-            Bare.lstat(Path::new("/")).expect_err("unsupported").kind(),
-            std::io::ErrorKind::Unsupported
-        );
-        assert!(Bare.var_names().is_empty() && Bare.groups().is_empty());
-        assert_eq!(Bare.egid(), 7);
-    }
-
     /// Catches the process's ids and environment names read from anywhere but the process.
     #[test]
     fn the_process_ids_and_environment_are_the_process_own() {

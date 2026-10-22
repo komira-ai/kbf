@@ -1,19 +1,18 @@
 //! The static unit files of the kbf-installer package (`packaging/linux/units/`) against
-//! the rules `kbf-deploy linux check-units` enforces on the units it renders, and against
+//! the rules `kbf-deploy linux check-units` (retired) enforced on the units it rendered, and against
 //! the kbf-installer contract (docs/design/kbf-installer.md, section 7).
 //!
 //! The package ships these files disabled, with no rendering: kbf-installer's own unit,
 //! each mode's unit, the frontend and Envoy templates, gated on `/etc/kbf/kbf.toml`
 //! (`ConditionPathExists=`), on `kbf-installer boot-check` and on `kbf <mode> --check`
 //! (both `ExecStartPre=`; `ExecCondition=` would skip a failed check silently).
-//! kbf-deploy's rule modules are private to it, so the rules are restated here over the
-//! same unit parser (`kbf_unitfile`), each with the defect it catches, and `MUTANTS`
+//! The rules are held here, over the unit parser (`kbf_unitfile`) the docs check uses, each with the defect it catches, and `MUTANTS`
 //! plants one defect per rule in a copy of the real file and requires that rule to name
 //! it. `every_rule_has_a_mutant` fails when a rule is added with no mutant, so no rule
 //! can be one that cannot fail.
 //!
 //! Catches:
-//! - a unit missing a rule of `check-units` that its mode needs (`restart`, `stop`,
+//! - a unit missing a rule that its mode needs (`restart`, `stop`,
 //!   `delegate`, `handover`, `credential`, `caps`, `swap`, `oom`, `cpuset`, user, slice,
 //!   `LimitNOFILE`), each named below;
 //! - a unit that runs a program outside the installer's tree (`/var/lib/kbf-installer/`),
@@ -154,7 +153,7 @@ fn all<'a>(unit: &'a UnitFile, section: &str, key: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// systemd's `Delegate=` as `config_parse_delegate` reads it (see check-units rule
+/// systemd's `Delegate=` as `config_parse_delegate` reads it (see package rule
 /// `delegate`): a boolean sets all or none, a list adds, an empty value starts over.
 fn delegated(unit: &UnitFile) -> Vec<String> {
     let mut set: Vec<String> = Vec::new();
@@ -238,7 +237,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
                 "kbf.slice sets MemoryMin=, a per-host value".into(),
             );
         }
-        // Catches a slice that disables a controller below it (check-units rule
+        // Catches a slice that disables a controller below it (package rule
         // `delegate`; a slice cannot delegate) or narrows the CPUs or NUMA nodes of
         // every unit in it (`cpuset`; the node's own set is a per-host drop-in, never
         // this static file).
@@ -377,7 +376,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     // Catches a server half run as the user builds run as: the frontend (the state store,
     // the operator token) and a storage node (the cold store's key) run as kbf-server, so an
     // action (run as kbf) cannot read what they hold; the modes that run builds run as kbf.
-    // As kbf-deploy's units do today.
+    // As the retired kbf-deploy units did.
     let want = if mode.is_some_and(|m| ["frontend", "storage"].contains(&m)) {
         "kbf-server"
     } else {
@@ -605,7 +604,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         }
     }
 
-    // Catches a limit on a build node's own unit (check-units rules `caps` and `swap`):
+    // Catches a limit on a build node's own unit (package rules `caps` and `swap`):
     // its leases live in the unit's cgroup, so the builds are capped by the daemon's
     // actions/memory.max alone and a limit here would cap the supervisor with them; and
     // a MemorySwapMax= would turn the daemon's swap watch into an OOM kill of the unit
@@ -623,7 +622,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
             v("swap", "a build node sets MemorySwapMax=".into());
         }
         // Catches a build node whose OOM score is not below 0, the build containers'
-        // score (check-units rule `oom`): a host-wide OOM kills the highest score
+        // score (package rule `oom`): a host-wide OOM kills the highest score
         // first, so a lease must die before the daemon that holds them.
         match unit
             .get("OOMScoreAdjust")

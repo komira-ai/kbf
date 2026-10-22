@@ -91,8 +91,8 @@ Each refuses while a commit-confirm deploy is pending in the state.
 
 **No verb restarts a service.** After `install --apply` or `rollback --apply`, restart
 the units that run `/var/lib/kbf-installer/releases/current/kbf` by hand (`sudo systemctl restart
-<unit>`), then check `kbf-deploy host status`. Installing the units and restarting them
-belongs to `kbf-deploy linux install-units`.
+<unit>`), then check `kbf-deploy host status`. The units are the packaged files
+(`kbf-installer`'s), and restarting them is the operator's.
 
 ## Staging a release that was verified offline
 
