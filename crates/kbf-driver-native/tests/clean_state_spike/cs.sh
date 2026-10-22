@@ -236,11 +236,11 @@ probe_CH02() { pr '[ -e "$H/f" ] || [ -L "$H/dangling" ] || [ -d "$H/Library" ]'
 
 do_CH03() { printf x >"${T}$M" && printf x >"${C}$M" && printf x >"${D}$M" && printf x >"${F}/$M"; }
 plant_CH03() { p CH03 do_CH03; }
-probe_CH03() { pr '[ -n "$(find -x "$F" -name "$M*" 2>/dev/null | head -1)" ]'; }
+probe_CH03() { echo "INFO CH03 found: $(find -x "$F" -name "$M*" 2>/dev/null | sed "s#^$F#F#" | tr '\n' ';')"; pr '[ -n "$(find -x "$F" -name "$M*" 2>/dev/null | head -1)" ]'; }
 
 put() { printf x >"$1/$M"; }
 plant_CH04() { for d in /private/tmp /private/var/tmp /Users/Shared /Library/Caches; do p "CH04$(echo "$d" | tr / _)" put "$d"; done; }
-probe_CH04() { pr 'find /private/tmp /private/var/tmp /Users/Shared /Library/Caches -maxdepth 1 -name "$M*" 2>/dev/null | grep -q .'; }
+probe_CH04() { echo "INFO CH04 found: $(find /private/tmp /private/var/tmp /Users/Shared /Library/Caches -maxdepth 1 -name "$M*" 2>/dev/null | tr '\n' ';')"; pr 'find /private/tmp /private/var/tmp /Users/Shared /Library/Caches -maxdepth 1 -name "$M*" 2>/dev/null | grep -q .'; }
 
 fixture_CH05() { printf orig >"/private/tmp/fx-$M"; chmod 666 "/private/tmp/fx-$M"; }
 do_CH05() { ln "/private/tmp/fx-$M" "$L/hl" && printf X >>"$L/hl"; }
@@ -500,6 +500,7 @@ fixture_W06b() { hdiutil create -quiet -size 4m -fs HFS+ -volname "$M" "$W/img-$
 do_W06b() {
   mkdir -p "$H/mnt" && hdiutil attach -quiet -mountpoint "$H/mnt" "$W/img-$M.dmg" || return 1
   printf sentinel >"$H/mnt/sentinel" || return 1
+  sync; sleep 1
   bg_ok hc "$K" hold-cwd "$H/mnt" && bg_ok hl "$K" hold-lock "$H/mnt/f"
 }
 plant_W06b() { p W06b do_W06b; }
