@@ -4,7 +4,7 @@
 
 use serde_json::{Value, json};
 
-use super::{Started, note};
+use super::{Started, note, rfc3339};
 use crate::html::Html;
 use crate::pages::sched_farm;
 use crate::tests::{Fake, HOSTILE, STARTED_MS, STARTED_SAYS, body, fleet_farm, health_doc, render};
@@ -225,4 +225,13 @@ fn the_note_is_one_sentence_each_way() {
         said(&Started::Unsaid("<b>why</b>".to_owned())),
         "<p class=\"hint\">When this server started is not known: &lt;b&gt;why&lt;/b&gt;.</p>"
     );
+}
+
+/// Catches: a time written wrongly: the epoch, a leap day, a time of day.
+#[test]
+fn a_time_is_written_as_rfc_3339() {
+    assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+    assert_eq!(rfc3339(951_782_400_000), "2000-02-29T00:00:00Z");
+    assert_eq!(rfc3339(1_709_210_096_999), "2024-02-29T12:34:56Z");
+    assert_eq!(rfc3339(1_791_370_000_000), "2026-10-07T10:46:40Z");
 }

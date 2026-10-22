@@ -1847,7 +1847,7 @@ there is nothing to mount it on.
   lists), `/ui/builds/{id}/actions/{digest}` (the action; for one that failed, its failure
   class, command arguments and environment names, exit code and the end of its stdout and
   stderr from `/failures`, each with a link that downloads the whole log, which the blob
-  route answers as an attachment), `/ui/updates`, `/ui/leases` (`GET /v1/leases`;
+  route answers as an attachment), `/ui/leases` (`GET /v1/leases`;
   `?node=`, `?page_size=` and `?page_token=` are handed to the route, and the next page is
   the route's own link on the page's path), `/ui/queue` (`GET /v1/queue`), and the
   stylesheet at `/ui/static/kbf.css`. Each page lists, at its foot, the `/v1` routes it read, each a link

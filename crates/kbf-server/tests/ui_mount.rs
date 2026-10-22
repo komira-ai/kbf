@@ -137,15 +137,6 @@ async fn the_ui_is_open_whatever_the_policy_says_of_the_network_routes() {
             action.text()
         );
         assert!(!action.text().contains("<script"), "{}", action.text());
-        // No state store here, so the update state is off: the page says so, from the
-        // route's own answer (a gate that refused it would say `401` or `404`).
-        let updates = server.get("/ui/updates").await;
-        assert_eq!(updates.code, 503, "{}", updates.text());
-        assert!(
-            updates.text().contains("update state is off"),
-            "{}",
-            updates.text()
-        );
         let css = server.get("/ui/static/kbf.css").await;
         assert_eq!(css.code, 200);
         assert_eq!(css.header("content-type"), Some("text/css; charset=utf-8"));
@@ -183,7 +174,6 @@ async fn the_ui_answers_get_and_head_only_and_every_answer_is_secured() {
         "/ui/builds?id=b1",
         "/ui/builds/b1",
         action_page.as_str(),
-        "/ui/updates",
         "/ui/static/kbf.css",
         "/ui/missing",
         "/ui/builds/none",
