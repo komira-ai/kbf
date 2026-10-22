@@ -114,6 +114,11 @@ fn e1_xl() {
     for row in ["XL_ka", "XL_sub", "XL_load", "XL_btm", "XL_resp"] {
         xl_row(&cs, row, row == "XL_ka" || row == "XL_resp");
     }
+    // Which rule of A closes launchd: A without its file-write deny.
+    for row in ["XL_ka", "XL_btm"] {
+        let x = run(&cs, row, Arm::ANoWrite, Clean::S, &[]);
+        say(format!("E1ROW {row} A-nowrite planted={} leased-probe={} clean={}", x.any_planted(), x.leased, x.word));
+    }
     xl_row(&cs, "W04x", true);
     xl_row(&cs, "W11x", false);
     // X8: BTM by plist file in ~/Library/LaunchAgents, no job.
@@ -291,16 +296,10 @@ fn e1_x6() {
 fn e1_x7() {
     let cs = Cs::new("e1_x7");
     cs.late.store(true, Ordering::SeqCst);
-    // Controls: root-planted late arrivals (+25 s, +70 s) the late looks must see; a surviving process the
-    // old-process list must name (P without the kill).
-    run(&cs, "LATEC", Arm::A, Clean::S, &[]);
-    run(&cs, "LATEK", Arm::A, Clean::P("P-nokill"), &[]);
-    run(&cs, "LATEK", Arm::A, Clean::S, &[]);
-    run(&cs, "LATEK", Arm::A, Clean::P("P"), &[]);
-    for (row, arm) in [("CH24", Arm::A), ("XL_ka", Arm::A), ("CH34", Arm::A)] {
-        run(&cs, row, arm, Clean::S, &[]);
-        run(&cs, row, arm, Clean::P("P"), &[]);
-    }
+    // Round 1 showed the controls and the quiet rows; this round: the simulator row with the late arrivals grouped,
+    // and the builds under the lease environment.
+    run(&cs, "CH34", Arm::A, Clean::S, &[]);
+    run(&cs, "CH34", Arm::A, Clean::P("P"), &[]);
     let o = base_env(&user_of(CELL_USER)).root("cs_prepare_rust", 120);
     say(format!("INFO prepare-rust {}", short(&o.text, 200)));
     for row in ["BR1", "BR2", "BR3", "BR4", "BR5"] {

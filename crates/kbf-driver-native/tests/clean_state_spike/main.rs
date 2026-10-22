@@ -87,6 +87,8 @@ enum Arm {
     B,
     C,
     R,
+    /// The shipped profile without its `(deny file-write*)` line (which of A's rules closes launchd).
+    ANoWrite,
     /// A plus all of `V2_RULES`.
     V2,
     /// A plus the one rule `V2_RULES[i]` (bisect: does this deny alone break the build).
@@ -102,6 +104,7 @@ impl Arm {
             Arm::B => "B",
             Arm::C => "C",
             Arm::R => "R",
+            Arm::ANoWrite => "A-nowrite",
             Arm::V2 => "V2",
             Arm::V2Only(i) => V2_ONLY[i],
             Arm::V2No(i) => V2_NO[i],
@@ -521,6 +524,12 @@ impl Cs {
                 let rules = if arm == Arm::B { &self.rules_b } else { &self.rules_c };
                 args[i + 1].push_str(rules);
             }
+            Arm::ANoWrite => {
+                let i = args.iter().position(|a| a == "-p").expect("-p in the launch");
+                let cut = args[i + 1].replace("(deny file-write*)", "");
+                assert_ne!(cut, args[i + 1], "no (deny file-write*) in the profile");
+                args[i + 1] = cut;
+            }
             Arm::V2 | Arm::V2Only(_) | Arm::V2No(_) => {
                 let i = args.iter().position(|a| a == "-p").expect("-p in the launch");
                 args[i + 1].push_str(&arm.v2_rules().expect("v2 rules"));
@@ -797,6 +806,15 @@ impl Cs {
             let snap = format!("{WORK}/snap.{}.late{t}", env.marker);
             env.root(&format!("snap > '{snap}' 2>&1"), 180);
             let n = self.diff(tag, &format!("late+{t}"), env, base, &snap);
+            if n > 0 {
+                let g = env.root(
+                    &format!("sdiff_ '{base}' '{snap}' | grep '^>' | sed -E 's#^> ([a-z-]+)\\|.* (/[^ ]*)$#\\1 \\2#' | cut -d/ -f1-9 | sort | uniq -c | sort -rn | head -10"),
+                    60,
+                );
+                for l in g.text.lines().filter(|l| !l.is_empty()) {
+                    say(format!("LATEGROUP {tag} +{t}s {}", short(l, 200)));
+                }
+            }
             let present = self.probe(tag, &format!("late+{t}"), env, v);
             say(format!(
                 "LATE {tag} +{t}s snapshot_diff_lines={n} probe={}",

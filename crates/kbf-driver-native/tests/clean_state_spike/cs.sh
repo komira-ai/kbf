@@ -601,6 +601,13 @@ cs_prepare_rust() {
   echo "rust-home=$RHOME toolchains=$(ls "$RHOME/.rustup/toolchains" 2>&1 | tr '\n' ' ')"
 }
 
+# the driver's lease environment (src/home.rs): HOME and CFFIXED_USER_HOME in the lease, TMPDIR, XDG_CACHE_HOME and the clang module cache beside it
+lease_env_run() {
+  mkdir -p "$L/home" "$L/tmp" "$L/cache/clang/ModuleCache"
+  _bp=$(build_path)
+  perl -e 'alarm shift; exec @ARGV' "${BT:-0}" env -i HOME="$L/home" CFFIXED_USER_HOME="$L/home" TMPDIR="$L/tmp" XDG_CACHE_HOME="$L/cache" CLANG_MODULE_CACHE_PATH="$L/cache/clang/ModuleCache" CARGO_HOME="$L/cargo" PATH="$_bp" "$@"
+}
+
 build_path() { echo "/usr/bin:/bin:/usr/sbin:/sbin:$(ls -d "$(cat "$W/rhome" 2>/dev/null)"/.rustup/toolchains/*/bin 2>/dev/null | head -1)"; }
 build_env() {
   _bp=$(build_path)
@@ -1047,7 +1054,7 @@ teardown_X5c() { for mp in $(mount | grep "c$M" | sed -E 's/^.* on (.*) \(.*$/\1
 do_X5d() { do_CH07a || return 1; sleep 1; }
 plant_X5d() { p X5d do_X5d; }
 midplant_X5d() { # SIGKILL what serves the image: processes whose command line names this lease
-  for _pid in $(ps -axo pid=,command= | grep -E "diskimages|hdiejectd|$M" | grep -v grep | awk '{print $1}'); do
+  for _pid in $(ps -axo pid=,ruid=,command= | awk -v id="$ID" '$2==id && /diskimages/ {print $1}'); do
     echo "kill -9 $_pid: $(ps -o ruid=,comm= -p "$_pid" | tr -s ' ' | head -1)"; kill -9 "$_pid" 2>/dev/null
   done
   sleep 2; echo "after-kill mounts: $(mount | grep -c "$H/mnt")"
@@ -1115,6 +1122,9 @@ cs_tcc_script() {
   _cn=$(stat -f %Su /dev/console); _ch=$(dscl . -read "/Users/$_cn" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
   { printf 'H=%q\nRH=%q\nERRF=%q\n' "$H" "${_ch:-/Users/runner}" "$W/tcc-rm.err"; cat <<'SH'
 echo "TCCCTX uid=$(id -u) console-home=$RH pool-home=$H"
+echo "TCCDB-sys: $(sqlite3 -readonly '/Library/Application Support/com.apple.TCC/TCC.db' "select service||':'||client||':'||auth_value from access where service in ('kTCCServiceSystemPolicyAllFiles','kTCCServiceSystemPolicyDesktopFolder','kTCCServiceSystemPolicyDocumentsFolder')" 2>&1 | head -12 | tr '\n' ' ')"
+echo "TCCDB-user: $(sqlite3 -readonly "$RH/Library/Application Support/com.apple.TCC/TCC.db" "select service||':'||client||':'||auth_value from access" 2>&1 | head -8 | tr '\n' ' ')"
+echo "TCCSIP: $(csrutil status 2>&1 | head -1)"
 while IFS= read -r d; do
   for pair in "ctl:$RH" "pool:$H"; do
     tag=${pair%%:*}; base=${pair#*:}
