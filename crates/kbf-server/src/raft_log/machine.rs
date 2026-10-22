@@ -17,11 +17,11 @@ pub struct NoSnapshots;
 /// format of the machine version committed before it, and applied in order. The first
 /// [`Bootstrap`] is kept and every later one is a no-op. A [`MachineVersion`] entry
 /// raises the version (a lower or equal one changes nothing), and with it the format
-/// of every later entry. An entry that does not decode, a version past the one this
-/// binary runs, or a control command (which this log does not apply), stops the
-/// machine: it applies nothing more, and the log refuses to open
-/// ([`MetaMachine::failed`] names the first such entry). Once open, the log applies
-/// only entries it encoded itself.
+/// of every later entry. An entry that does not decode, a command this binary does not
+/// know ([`LogCommand::Unknown`]), a version past the one this binary runs, or a control
+/// command (which this log does not apply), stops the machine: it applies nothing more,
+/// and the log refuses to open ([`MetaMachine::failed`] names the first such entry).
+/// Once open, the log applies only entries it encoded itself.
 ///
 /// The state sits behind its own lock ([`MetaMachine::state`]), so a query reads it
 /// without the host's lock, which a commit holds across its sync. The host applies an
@@ -80,7 +80,7 @@ impl MetaMachine {
     }
 
     /// The entry format of the committed machine version: what the next entry is
-    /// encoded and decoded under.
+    /// encoded under.
     pub const fn format(&self) -> Format {
         self.format
     }
@@ -165,9 +165,9 @@ impl Machine for MetaMachine {
                     self.failed = Some((entry.id.index, refused));
                 }
             },
-            // A control command: this log applies only metadata commands and its
-            // `Bootstrap`, so a later binary wrote it. Stop, as for an entry that does
-            // not decode.
+            // A control command, or a command this binary does not know: this log
+            // applies only metadata commands and its `Bootstrap`, so a later binary
+            // wrote it. Stop, as for an entry that does not decode.
             Ok(_) => {
                 self.failed = Some((entry.id.index, DecodeError::UnknownCommand("LogCommand")));
             }

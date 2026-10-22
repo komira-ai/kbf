@@ -7,7 +7,6 @@
 use std::path::{Path, PathBuf};
 
 use kbf_gate::{Beta, OfferDoc, SetHash, Target};
-use kbf_installer::deploy::offer::from_bundle;
 use serde_json::{Value, json};
 use xtask::package::tarball;
 use xtask::release::stage_offer::{BUNDLE_FILE, OFFER_FILE, WAIVER_OPERATOR, waiver_reason};
@@ -322,9 +321,8 @@ fn a_released_commit_is_staged_as_the_golden_has_it() {
     assert_eq!(doc.set_hash, SetHash::of_sums(&sums.bytes));
     let offer_bytes = std::fs::read(f.out().join(OFFER_FILE)).expect("offer.json");
     assert_eq!(entry(&entries, OFFER_FILE).bytes, offer_bytes);
-    // The offer as a deploy reads it from the bundle (`--offer -`).
-    let stored = entry(&entries, OFFER_FILE).bytes.as_slice();
-    let in_bundle = from_bundle(Some(stored)).expect("an offer the installer reads");
+    // The offer in the bundle is the offer on disk, as a document.
+    let in_bundle = OfferDoc::from_bytes(&offer_bytes).expect("the bundle's offer is an offer");
     assert_eq!(in_bundle, doc);
     for platform in ["linux-x86_64", "linux-arm64", "darwin-arm64"] {
         let facts = format!("kbf-{SHA}-{platform}.version.json");

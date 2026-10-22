@@ -60,12 +60,6 @@
 //!   the files the artifacts stage of a push run of the pipeline on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
-//! - `gamma {evidence,deploy,check-build,summary,sudoers-line,held-steps}` ([`gamma`]): the
-//!   steps of `gamma.yml`, which follows a cut release to the one gamma host: whether the
-//!   release run published, the deploy through `tailscale ssh` and `sudo` (refused unless the
-//!   commit is the highest release), the build of komira's main against the updated farm (with
-//!   the farm's cache; it must run nothing locally), the summary with no node or host in it,
-//!   the sudoers line, and the settings a person makes once (printed, never applied).
 //! - `release version-facts --binary <kbf> --commit <sha> --platform <p> --out <dir>`
 //!   ([`version_facts`]): the `kbf` just built, run with `--version --json`, and what it
 //!   printed kept unchanged as the release asset `kbf-<commit>-<platform>.version.json`
@@ -99,7 +93,6 @@ pub mod crun_tests;
 pub mod darwin;
 pub mod entitlements;
 pub mod fetch;
-pub mod gamma;
 pub mod installer_tarball;
 pub mod package;
 pub mod pkg;
@@ -428,10 +421,6 @@ enum Verb {
     /// A GitHub release of a `main` commit's attested assets, never rebuilt.
     #[command(subcommand)]
     Release(ReleaseVerb),
-    /// The steps of `gamma.yml`: the release run's evidence, the deploy on the gamma host,
-    /// its table, the sudoers line and the settings a person makes once.
-    #[command(subcommand)]
-    Gamma(GammaVerb),
     /// Run the container driver's real-crun tests on a hosted Linux runner, each
     /// test target in its own Delegate=yes system unit as this user.
     CrunTests {
@@ -733,112 +722,6 @@ impl SubjectArgs {
             main_ref: &self.main_ref,
         }
     }
-}
-
-#[derive(Subcommand)]
-enum GammaVerb {
-    /// Whether run `--run-id` of the release workflow released `--sha`: a push to main that
-    /// succeeded, whose publish job succeeded. Prints `released=<true|false>`.
-    Evidence {
-        /// The repository, `<owner>/<repo>` (on Actions, `GITHUB_REPOSITORY`).
-        #[arg(long)]
-        repo: String,
-        /// The commit the run is for, a full SHA (the triggering run's `head_sha`).
-        #[arg(long)]
-        sha: String,
-        /// The release run (the triggering run's `id`).
-        #[arg(long)]
-        run_id: u64,
-        /// Append `released=<true|false>` to this file (on Actions, `GITHUB_OUTPUT`).
-        #[arg(long)]
-        output: PathBuf,
-        /// The `gh` program.
-        #[arg(long, default_value = "gh")]
-        gh: PathBuf,
-    },
-    /// Run `kbf-installer deploy` on the gamma host over Tailscale SSH, for the highest
-    /// release only, and write the summary without any node or host in it.
-    Deploy {
-        /// The repository, `<owner>/<repo>`.
-        #[arg(long)]
-        repo: String,
-        /// The released commit, a full SHA.
-        #[arg(long)]
-        sha: String,
-        /// The gamma host's tailnet name: a short name, never an address. Masked in what
-        /// this prints, but a variable is shown by GitHub in the step's own header.
-        #[arg(long)]
-        host: String,
-        /// The deploy account on it (masked the same way).
-        #[arg(long)]
-        user: String,
-        /// The tar `release stage-offer` wrote, sent on standard input.
-        #[arg(long)]
-        bundle: PathBuf,
-        /// Where the installer's own summary goes; it names nodes and is never uploaded.
-        #[arg(long)]
-        raw: PathBuf,
-        /// Where the redacted summary goes.
-        #[arg(long)]
-        summary: PathBuf,
-        /// The `tailscale` program.
-        #[arg(long, default_value = "tailscale")]
-        tailscale: PathBuf,
-        /// The `gh` program.
-        #[arg(long, default_value = "gh")]
-        gh: PathBuf,
-    },
-    /// Build komira's main against the farm just updated, with its normal caching. Passes
-    /// only for `BUILD SUCCEEDED` and `local: 0`; the farm's buckconfig is the environment
-    /// variable `GAMMA_FARM_BUCKCONFIG`. Prints the `Commands:` line and the verdict, and
-    /// nothing buck2 wrote.
-    CheckBuild {
-        /// The checkout of komira's main (its `buck2` launcher is at the top).
-        #[arg(long)]
-        komira_dir: PathBuf,
-        /// The targets to build, separated by white space (the variable
-        /// `GAMMA_CHECK_TARGETS`). A flag, such as `--no-remote-cache`, is refused.
-        #[arg(long)]
-        targets: String,
-        /// Where the farm's buckconfig is written: an absolute path, given to buck2.
-        #[arg(long)]
-        buckconfig_file: PathBuf,
-        /// Where buck2's whole output goes. It is never printed.
-        #[arg(long)]
-        log: PathBuf,
-        /// Append the `Commands:` line and the verdict to this file (on Actions,
-        /// `GITHUB_STEP_SUMMARY`).
-        #[arg(long)]
-        summary: PathBuf,
-    },
-    /// Append a table of the redacted summary to a file (`GITHUB_STEP_SUMMARY`).
-    Summary {
-        #[arg(long)]
-        file: PathBuf,
-        #[arg(long)]
-        output: PathBuf,
-    },
-    /// The sudoers line that lets the deploy account run the deploy command as root.
-    SudoersLine {
-        /// The deploy account on the gamma host.
-        #[arg(long)]
-        user: String,
-    },
-    /// Print the settings a person makes once. It changes nothing.
-    HeldSteps {
-        /// The repository, `<owner>/<repo>`.
-        #[arg(long)]
-        repo: String,
-        /// The gamma host's tailnet name.
-        #[arg(long)]
-        host: String,
-        /// The deploy account on it.
-        #[arg(long)]
-        user: String,
-        /// The Tailscale tag the runner joins as (never the host's own tag).
-        #[arg(long, default_value = "tag:kbf-gamma-ci")]
-        tag: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -1188,59 +1071,6 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::VerifyAssets(VerifyAssets::Sums { dir }) => {
             Ok(vec![sums::verify_sums(&dir, fetch::Sha256::of)?])
         }
-        Verb::Gamma(GammaVerb::Evidence {
-            repo,
-            sha,
-            run_id,
-            output,
-            gh,
-        }) => gamma::evidence(&gh, &repo, &sha, run_id, &output),
-        Verb::Gamma(GammaVerb::Deploy {
-            repo,
-            sha,
-            host,
-            user,
-            bundle,
-            raw,
-            summary,
-            tailscale,
-            gh,
-        }) => gamma::deploy(&gamma::Deploy {
-            gh: &gh,
-            tailscale: &tailscale,
-            repo: &repo,
-            sha: &sha,
-            host: &host,
-            user: &user,
-            bundle: &bundle,
-            raw: &raw,
-            summary: &summary,
-        }),
-        Verb::Gamma(GammaVerb::CheckBuild {
-            komira_dir,
-            targets,
-            buckconfig_file,
-            log,
-            summary,
-        }) => {
-            let config = std::env::var(gamma::BUCKCONFIG_ENV).unwrap_or_default();
-            gamma::check_build(&gamma::CheckBuild {
-                komira_dir: &komira_dir,
-                targets: &targets,
-                config: &config,
-                buckconfig_file: &buckconfig_file,
-                log: &log,
-                summary: &summary,
-            })
-        }
-        Verb::Gamma(GammaVerb::Summary { file, output }) => gamma::summary(&file, &output),
-        Verb::Gamma(GammaVerb::SudoersLine { user }) => Ok(vec![gamma::sudoers_line(&user)?]),
-        Verb::Gamma(GammaVerb::HeldSteps {
-            repo,
-            host,
-            user,
-            tag,
-        }) => gamma::held_steps(&repo, &host, &user, &tag),
         Verb::Release(ReleaseVerb::Locate {
             repo,
             commit,

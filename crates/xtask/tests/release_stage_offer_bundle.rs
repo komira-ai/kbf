@@ -1,6 +1,5 @@
-//! The bundle `release stage-offer` hands a deploy ([`build_bundle`]), its caps and platform
-//! lists held to the installer's, and the run of `kbf --version --json` the verb makes
-//! ([`version_json`]). Both are called directly: a binary that never answers or floods its
+//! The bundle `release stage-offer` makes ([`build_bundle`]) and the run of
+//! `kbf --version --json` the verb makes ([`version_json`]). Both are called directly: a binary that never answers or floods its
 //! pipe needs a short wait, which the verb does not take as a flag.
 
 use std::io::Write;
@@ -9,8 +8,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use kbf_installer::deploy::bundle as installer;
-use kbf_installer::deploy::offer as installer_offer;
 use kbf_testkit::dir::TestDir;
 use kbf_types::ReleasePlatform;
 use xtask::Error;
@@ -66,34 +63,6 @@ fn expected_names() -> Vec<String> {
         }
     }
     names
-}
-
-#[test]
-fn the_caps_and_the_platform_and_component_lists_are_the_installers() {
-    // Catches: a cap that differs from the installer's reader (a bundle the reader refuses,
-    // found at a deploy), a platform the installer's store does not know, or a platform it
-    // knows that a release is never staged for, and a component it does not take.
-    // Mutant it catches: `MAX_FACTS` here set to a value other than the installer's.
-    assert_eq!(MAX_TARBALL, installer::MAX_TARBALL);
-    assert_eq!(MAX_ATTESTATION, installer::MAX_ATTESTATION);
-    assert_eq!(MAX_FACTS, installer::MAX_FACTS);
-    assert_eq!(MAX_SUMS, installer::MAX_SUMS);
-    assert_eq!(MAX_OFFER, installer_offer::MAX_OFFER);
-    let all = ReleasePlatform::ALL;
-    let mut platforms: Vec<&str> = all.map(ReleasePlatform::as_str).to_vec();
-    platforms.sort_unstable();
-    let mut known = installer::PLATFORMS.to_vec();
-    known.sort_unstable();
-    assert_eq!(platforms, known);
-    let mut components: Vec<&str> = Vec::new();
-    for platform in all {
-        components.extend(platform.components());
-    }
-    // Every component a release stages is one the installer takes. Not the reverse: the
-    // installer may take one (`kbf-daemon`) that no platform of the release stages yet.
-    for component in components {
-        assert!(installer::COMPONENTS.contains(&component), "{component}");
-    }
 }
 
 #[test]

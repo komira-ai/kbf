@@ -193,6 +193,31 @@ async fn every_failure_has_its_own_code() {
     assert_eq!(broken.code(), Code::Internal);
 }
 
+/// Asserts that a registration naming a role this build does not name is answered
+/// UNIMPLEMENTED, apart from one naming no role (INVALID_ARGUMENT), and that neither leaves
+/// a member, an instance or a boot behind: the map is still empty, and the next storage node
+/// is given member 1 at boot 1.
+#[tokio::test]
+async fn a_registration_naming_an_unknown_role_is_answered_apart_and_leaves_nothing() {
+    let store = Hooked::new();
+    let (members, mut client) = serve(&store).await;
+    let mut unknown = request(1);
+    unknown.role = 77;
+    let refused = client.register(unknown).await.expect_err("refused");
+    assert_eq!(refused.code(), Code::Unimplemented);
+    let mut unnamed = request(1);
+    unnamed.role = 0;
+    let refused = client.register(unnamed).await.expect_err("refused");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert_eq!(members.current_map().expect("read"), None);
+    let got = client
+        .register(request(1))
+        .await
+        .expect("registers")
+        .into_inner();
+    assert_eq!((got.member_id, got.boot), (1, 1));
+}
+
 /// Catches: a store call that blocks the runtime (it runs on a blocking thread), and a
 /// panic inside it taking the server down instead of failing the one call: the call
 /// answers INTERNAL and the next call works.

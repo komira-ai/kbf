@@ -54,20 +54,42 @@ pub(super) fn rules(text: &str) -> Vec<String> {
     }
 }
 
-/// The verbs of the retired gamma offer path: `gamma.yml` was their only caller, and they are
-/// deleted in the cleanup that follows. No workflow may run them again.
+/// The commands of the retired offer and gamma path: `gamma.yml` was their only caller. No
+/// workflow may run them again. They are matched on normalised text ([`normalised`]), so a
+/// command is found however its words are spaced, wrapped or separated by a lone `--`.
 #[cfg(test)]
-const RETIRED_VERBS: &[&str] = &["release stage-offer", "xtask gamma"];
+const RETIRED_VERBS: &[&str] = &["release stage-offer", "xtask gamma", "kbf-installer deploy"];
+
+/// Workflow files that stay deleted.
+#[cfg(test)]
+const RETIRED_FILES: &[&str] = &[
+    "gamma.yml",
+    "gamma.yaml",
+    "deploy-gamma.yml",
+    "deploy-gamma.yaml",
+];
+
+/// `text` with every run of white space (a line wrap, a `\` continuation, tabs) as one space
+/// and a lone `--` between words dropped, so `xtask -- gamma`, `xtask  gamma` and
+/// `cargo run -p xtask -- gamma` all read `xtask gamma`.
+#[cfg(test)]
+fn normalised(text: &str) -> String {
+    let words: Vec<&str> = text
+        .split_whitespace()
+        .filter(|w| *w != "\\" && *w != "--")
+        .collect();
+    words.join(" ")
+}
 
 /// Catches: a workflow (a re-added `gamma.yml`, or a job in another file) that runs the retired
-/// offer path, which a release now fires no part of. Mutant: a job running `cargo xtask release
-/// stage-offer` added to a workflow file.
+/// offer or gamma path, which a release now fires no part of.
 #[cfg(test)]
 fn retired_verbs_in(name: &str, text: &str) -> Vec<String> {
     let mut found = Vec::new();
-    if name == "gamma.yml" {
-        found.push("gamma.yml is deleted: gamma moves to kbf-updater".to_owned());
+    if RETIRED_FILES.contains(&name) {
+        found.push(format!("{name} is deleted: gamma moves to kbf-updater"));
     }
+    let text = normalised(text);
     for verb in RETIRED_VERBS.iter().filter(|v| text.contains(**v)) {
         found.push(format!("{name} runs `{verb}`, a retired verb"));
     }
@@ -161,5 +183,53 @@ mod tests {
         assert_eq!(retired_verbs_in("ci.yml", job).len(), 1);
         assert_eq!(retired_verbs_in("gamma.yml", "name: gamma\n").len(), 1);
         assert!(retired_verbs_in("ci.yml", "name: ci\n").is_empty());
+    }
+
+    #[test]
+    fn a_retired_command_is_found_however_it_is_spelled() {
+        for run in [
+            "cargo xtask gamma deploy",
+            "cargo xtask -- gamma deploy",
+            "cargo run -p xtask -- gamma evidence",
+            "cargo   run -p xtask --   gamma  held-steps",
+            "xtask\tgamma summary",
+            "cargo xtask \\\n    gamma deploy",
+            "cargo run -p xtask --\n  gamma deploy",
+            "kbf-installer deploy --commit abc",
+            "sudo kbf-installer   deploy",
+            "kbf-installer \\\n  deploy --commit abc",
+            "cargo xtask release   stage-offer",
+        ] {
+            let job = format!("    steps:\n      - run: {run}\n");
+            assert_eq!(retired_verbs_in("ci.yml", &job).len(), 1, "{run:?}");
+        }
+    }
+
+    #[test]
+    fn a_retired_workflow_file_is_refused_by_name() {
+        for name in [
+            "gamma.yml",
+            "gamma.yaml",
+            "deploy-gamma.yml",
+            "deploy-gamma.yaml",
+        ] {
+            assert_eq!(retired_verbs_in(name, "name: x\n").len(), 1, "{name}");
+        }
+        for name in ["ci.yml", "beta.yaml", "gamma-notes.yml"] {
+            assert!(retired_verbs_in(name, "name: x\n").is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn commands_that_only_look_like_the_retired_ones_are_not_refused() {
+        for run in [
+            "cargo xtask release plan",
+            "kbf-installer status",
+            "kbf-installer setup --mode=daemon",
+            "echo kbf-deploy host install",
+        ] {
+            let job = format!("      - run: {run}\n");
+            assert!(retired_verbs_in("ci.yml", &job).is_empty(), "{run:?}");
+        }
     }
 }

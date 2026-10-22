@@ -61,7 +61,7 @@
 //!   scheduler is checked against it, and operation names carry it.
 //!
 //! Values are the `kbf-log` encoding of the scheduler's own inputs (a `Submit`, the
-//! `Committed` lease, a `WorkerUp`), so the strict codec the replicated log already runs
+//! `Committed` lease, a `WorkerUp`), so the `kbf-log` codec the replicated log already runs
 //! decides what a row may hold.
 
 use std::collections::VecDeque;
@@ -395,6 +395,8 @@ fn decode(key: &str, bytes: &[u8]) -> Result<FarmInput, StateError> {
         Ok(LogCommand::Farm(FarmBatch { mut inputs, .. })) if inputs.len() == 1 => {
             Ok(inputs.remove(0))
         }
+        // A command this build does not know has no text of its own from the decoder.
+        Ok(LogCommand::Unknown) => Err(corrupt(key, "a command this binary does not know")),
         Ok(_) => Err(corrupt(key, "not a single scheduler input")),
         Err(e) => Err(corrupt(key, &e.to_string())),
     }

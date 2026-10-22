@@ -64,9 +64,10 @@ pub(crate) const fn since_v5(command: &Command) -> bool {
     matches!(command, Command::ReseatStaged { .. })
 }
 
-/// Whether `format` takes `command`: format 1 takes neither the format-2 nor the
-/// format-3 commands, format 2 takes no format-3 command, and no format before 4 takes
-/// a format-4 one (`SetWriter`, or a node writer's object in any command).
+/// Whether `format` takes `command` when it is encoded: format 1 takes neither the
+/// format-2 nor the format-3 commands, format 2 takes no format-3 command, and no format
+/// before 4 takes a format-4 one (`SetWriter`, or a node writer's object in any command).
+/// Decoding does not ask: it reads every command this binary knows under every format.
 pub(crate) fn takes(format: Format, command: &Command) -> bool {
     if since_v5(command) {
         format.get() >= Format::V5.get()
@@ -425,7 +426,7 @@ pub(crate) fn from_digest(d: proto::Digest, field: &'static str) -> Result<Diges
     Ok(Digest::new(function, hash, d.size_bytes))
 }
 
-/// A set of digests, refused unless strictly increasing: one set, one encoding.
+/// A set of digests, refused unless strictly increasing.
 fn set(digests: Vec<proto::Digest>, field: &'static str) -> Result<Vec<Digest>, DecodeError> {
     let out = digests
         .into_iter()
@@ -437,7 +438,7 @@ fn set(digests: Vec<proto::Digest>, field: &'static str) -> Result<Vec<Digest>, 
     Ok(out)
 }
 
-/// A set of object ids, refused unless strictly increasing: one set, one encoding.
+/// A set of object ids, refused unless strictly increasing.
 fn object_set(
     objects: Vec<proto::ObjectId>,
     field: &'static str,

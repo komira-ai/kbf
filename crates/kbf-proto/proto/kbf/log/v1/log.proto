@@ -1,39 +1,46 @@
 // kbf.log.v1: the payload of a command entry in the replicated log
 // (docs/design/ha.md, sections 4.1 and 4.6).
 //
-// Every replica decodes and applies the same bytes, so the encoding is strict:
-// - Enums are closed. Every enum's zero value is UNSPECIFIED and is refused, and so is
-//   any value this file does not name. A message whose `oneof` is unset (a command this
-//   file does not name) is refused. A refused entry is a decode error, which stops the
-//   replica; it is never read as a default.
-// - A message field the domain value requires is refused when absent.
-// - No `map` fields. A set is a repeated field in strictly increasing order; the decoder
-//   refuses a set out of order or with a repeat.
-// - One value has exactly one encoding: the one prost writes for it (fields in tag order,
-//   zero values left out, minimal varints). The decoder (kbf-log) refuses any other bytes
-//   that decode to a value, including bytes with a field this file does not name.
+// This file changes additively, and a reader skips what it does not know instead of
+// refusing it. Allowed: a new field (a reader that does not know it ignores it, so the
+// field must mean nothing at its zero value), a new command or other `oneof` arm, a new
+// message. Not allowed: renumbering a field, removing or reinterpreting one, a new value
+// in an enum a reader acts on (add a field instead), a required field. A new command
+// must be safe for an older reader to skip, and the change that adds it says what that
+// reader loses.
 //
-// Which encodings may appear in a log is the log's format version, committed in the log.
-// Format 1 is this file as it is now. Bootstrap and the control commands (`farm` to
-// `machine_version`) joined format 1 before any log was written (kbf-server's
-// the Raft metadata log is the first writer, and it writes only `meta` and `bootstrap`);
-// from now on, a field or command added here is a new format.
+// The decoder (kbf-log) therefore:
+// - ignores a field this file does not name, and decodes the rest of the message;
+// - reads a message whose `oneof` is unset (an arm this file does not name) as an unknown
+//   command, and so a command with an enum value this file does not name, or the
+//   UNSPECIFIED zero that every enum has: it is never read as a default;
+// - reads the bytes of a value however they are written (an explicit zero, a varint that
+//   is not minimal, a field repeated or out of order);
+// - decodes every command below under every format version.
+// It still refuses what no later version makes right: bytes that are not a well-formed
+// message, a message field the domain value requires when it is absent, a hash that is
+// not 32 bytes, and a set that is not in strictly increasing order (there are no `map`
+// fields; a set is a repeated field). A refused entry is a decode error, which stops the
+// replica.
+//
+// Which commands a writer may put in a log is the log's format version, committed in the
+// log; the encoder refuses a command under a format before the one it joined. Format 1
+// is this file as it first was. Bootstrap and the control commands (`farm` to
+// `machine_version`) joined format 1 before any log was written (the Raft metadata log of
+// kbf-server is the first writer, and it writes only `meta` and `bootstrap`).
 //
 // Format 2 is format 1 plus the write tier's metadata commands (MetaCommand fields 10
-// to 14, docs/design/write-path.md section 6.5). A format-1 reader refuses them: an
-// older binary sees an unset `oneof`, and this one refuses them under format 1.
+// to 14, docs/design/write-path.md section 6.5).
 //
 // Format 3 is format 2 plus `EvictObjects` (MetaCommand field 15), which forgets the
-// objects the store no longer holds. A format-1 or format-2 reader refuses it the same
-// way.
+// objects the store no longer holds.
 //
 // Format 4 is format 3 plus node writers (`SetWriter`, and an `ObjectId` naming a node or
 // another log's epoch) and the commands of a rebuild of the index from the store
-// (`AdoptSegment`, `RebuildProgress`, `RebuildDone`: MetaCommand fields 16 to 19). A reader of an earlier
-// format refuses them.
+// (`AdoptSegment`, `RebuildProgress`, `RebuildDone`: MetaCommand fields 16 to 19).
 //
 // Format 5 is format 4 plus `ReseatStaged` (MetaCommand field 20), which moves a staged
-// object's records to another object in one step. A reader of an earlier format refuses it.
+// object's records to another object in one step.
 syntax = "proto3";
 
 package kbf.log.v1;

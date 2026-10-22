@@ -10,7 +10,6 @@
 
 use std::path::PathBuf;
 
-use super::deploy_config::{DeployFlags, DeploySettings};
 use super::kbf_settings::{KbfFlags, Setting};
 use super::paths;
 use super::proxy::{ProxyFlags, ProxyPlan};
@@ -41,8 +40,6 @@ pub struct Raw {
     pub proxy: ProxyFlags,
     /// `--create-local-database`.
     pub create_local_database: bool,
-    /// The `--deploy-*` flags: the host's deploy config (frontend, all-in-one).
-    pub deploy: DeployFlags,
     /// `--installer-config`, as the host path it names; `None` is the platform's default.
     pub installer_config: Option<String>,
 }
@@ -73,8 +70,6 @@ pub struct Valid {
     pub proxy: Option<ProxyPlan>,
     /// With `--create-local-database`: what to create, from the URL.
     pub local_database: Option<LocalDatabase>,
-    /// What the `--deploy-*` flags ask of `deploy.json`; none when no flag was given.
-    pub deploy: Option<DeploySettings>,
 }
 
 impl Valid {
@@ -157,7 +152,6 @@ impl Raw {
         let proxy = self
             .proxy
             .validate(platform, self.mode, &self.kbf, &mut kbf, &mut problems);
-        let deploy = self.deploy.validate(self.mode, &mut problems);
         let installer_toml = paths::installer_toml(platform);
         if self
             .installer_config
@@ -200,7 +194,6 @@ impl Raw {
                 kbf,
                 proxy,
                 local_database,
-                deploy,
             }),
             _ => Err(problems),
         }

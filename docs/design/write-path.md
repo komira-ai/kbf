@@ -622,11 +622,12 @@ format 2** (`kbf_log::Format::V2`), as `log.proto` requires of any added command
 older binary already refuses them: an unset command decodes as
 `DecodeError::UnknownCommand` (`kbf-log/src/meta.rs`), the Raft machine stops on it
 (`kbf-server/src/raft_log/machine.rs`), and opening the log returns
-`RaftLogError::Decode` (`decoded`, `raft_log/mod.rs`). This binary refuses them under
-format 1 the same way, on encode and decode. A Raft log enters format 2 by one
+`RaftLogError::Decode` (`decoded`, `raft_log/mod.rs`). In this binary encode refuses
+them under format 1 and decode reads them under every format; a binary that runs only
+version 1 stops at the raise entry. A Raft log enters format 2 by one
 committed `MachineVersion` entry naming machine version 2 (`kbf_log::MachineVersion::V2`,
 whose format is `Format::V2`), which `RaftMetaLog::raise_machine_version` commits
-(rollout stage 5, section 6.8); every later entry is encoded and decoded as format 2,
+(rollout stage 5, section 6.8); every later entry is encoded as format 2,
 and a binary that runs only version 1 refuses the log at that entry. Tests in
 `kbf-log/tests/tier_codec.rs` and `kbf-server/tests/raft_log.rs` pin both. The snapshot
 encoding ([metadata-snapshots.md](metadata-snapshots.md)), not built yet, gains the
@@ -635,8 +636,8 @@ staged table, the tier registry and the record of objects that left.
 `ReseatStaged` (`MetaCommand` field 20) makes **log format 5** (`Format::V5`,
 `MachineVersion::V5`) the same way: a binary that runs only version 4 refuses a log
 raised to 5 at the raise (`kbf-server/tests/write_tier_raft.rs` opens one as version 4
-and gets `RaftLogError::Decode`), and a format-4 log refuses the command on encode and
-decode (`kbf-log/tests/reseat_codec.rs`). A server or storage node raises its log to
+and gets `RaftLogError::Decode`), and a format-4 log refuses the command on encode,
+while decode reads it under every format (`kbf-log/tests/reseat_codec.rs`). A server or storage node raises its log to
 version 5 when its write tier attaches, so after the first start of a build with this
 command that node's log cannot be opened by an older binary (a rollback of one node's
 binary needs its log restored; nodes' logs are separate, so nodes on either version run

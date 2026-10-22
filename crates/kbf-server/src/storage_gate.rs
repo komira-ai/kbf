@@ -94,7 +94,8 @@ pub enum GateFail {
         /// The member.
         member: MemberId,
     },
-    /// A member is in a state other than `Active` (`Down`, `Draining`, `Joining`).
+    /// A member is in a state other than `Active` (`Down`, `Draining`, `Joining`, or one this
+    /// build does not name).
     #[error("member {member} is {state:?}")]
     NotActive {
         /// The member.

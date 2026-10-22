@@ -6,6 +6,7 @@
 //! - [`version`]: the one rule for a version, shared with the host-side wrapper;
 //! - [`inventory`]: the root-owned host file, and the order a roll touches the hosts in;
 //! - [`ports`]: safe-to-stop, install and query, health, and the clock, as traits;
+//! - [`ssh_installer`]: the install port over ssh to the `kbf-host-install` forced command;
 //! - [`record`]: `roll.json`, the durable record;
 //! - [`Updater`]: the state machine over all of the above. One roll at a time, the frontend
 //!   first, the first failure stops it, a restart asks the host before it installs again;
@@ -20,7 +21,8 @@
 //!   refuse, so that a roll fails at its first step with no host touched;
 //! - [`daemon`]: the flags and the wiring of all of it.
 //!
-//! The ssh installer and the health check come in later changes.
+//! The health check comes in a later change. The daemon still wires `not_built` for the
+//! installer; switching it to `ssh_installer` is a later change.
 
 pub mod api;
 pub mod daemon;
@@ -33,6 +35,7 @@ pub mod ports;
 pub mod record;
 pub mod safe_http;
 pub mod server;
+pub mod ssh_installer;
 pub mod version;
 
 mod updater;
