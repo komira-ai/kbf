@@ -1,6 +1,6 @@
 //! The offer document: `offer.json`, what `cargo xtask release offer` writes once every
-//! check of an offer has passed (docs/design/kbf-cicd.md, section 5.1), and what a deploy
-//! reads (`kbf-installer deploy --offer offer.json`) before it moves a farm.
+//! check of an offer has passed (docs/design/kbf-cicd.md, section 5.1). The `kbf-installer deploy` verb that read it is
+//! deleted.
 //!
 //! The document is a record, not a command: it names the commit and set it is for, the
 //! beta evidence (an attested result, or a waiver written down), whether going back to the
