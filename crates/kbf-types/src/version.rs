@@ -330,6 +330,27 @@ mod tests {
         assert_eq!(err.code(), "version-unreadable");
     }
 
+    /// Catches the `commit_full` that `kbf --version --json` prints (the 40 hex digits of the
+    /// build's commit) not being read, a build that predates it or does not know its commit
+    /// refused instead of read as `None`, and a value that is not text accepted.
+    ///
+    /// Mutants to plant: `#[serde(skip)]` or a misspelled `#[serde(rename = "commit_ful")]` on
+    /// the field (the value is then lost: red on the `Some(COMMIT)` line); the field typed
+    /// `Option<serde_json::Value>` (the number is then accepted: red on the last assertion).
+    #[test]
+    fn the_version_object_may_carry_the_full_commit() {
+        let before = Version::parse(json(COMMIT, "release").as_bytes()).expect("pre-field");
+        assert_eq!(before.commit_full, None);
+        let extra = format!(",\"commit_full\":\"{COMMIT}\"}}");
+        let said = json(COMMIT, "release").replace('}', &extra);
+        let v = Version::parse(said.as_bytes()).expect("a build with the full commit parses");
+        assert_eq!(v.commit_full.as_deref(), Some(COMMIT));
+        assert_eq!(v.commit, COMMIT[..12], "the short commit is read as before");
+        let text = json(COMMIT, "release").replace('}', ",\"commit_full\":12}");
+        let err = Version::parse(text.as_bytes()).expect_err("a number");
+        assert_eq!(err.code(), "version-unreadable");
+    }
+
     /// Catches an unbounded read of what a not yet trusted binary prints: more than 4 KiB
     /// is refused whatever it holds, and exactly 4 KiB of valid JSON (padded with spaces)
     /// is read.

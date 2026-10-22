@@ -130,6 +130,51 @@ fn a_role_that_runs_cannot_be_restarted() {
 }
 
 #[test]
+fn a_restart_can_run_another_program_on_the_same_command_line() {
+    // Catches: a `restart_with` that starts the program the role had (a rolling update that
+    // never changes the build), one that changes the arguments with the program (another
+    // `kbf.toml`), and a program forgotten by the restart after it (the role is back on its
+    // first build). The first program, `sleep 300`, runs until it is ended; `true` ends at
+    // once with 0 whatever its arguments are.
+    // Mutants: `restart_with` stores the program after `restart`, or not at all.
+    let d = dir("restart-with");
+    let role = Role::Node(1);
+    let mut farm = Farm::supervise(&d, vec![sleeper(role, &d)]);
+    let argv = farm.spec(role).argv.clone();
+    farm.kill(role);
+    farm.restart_with(role, Path::new("true"));
+    assert_eq!(farm.spec(role).program, PathBuf::from("true"));
+    assert_eq!(farm.spec(role).argv, argv);
+    wait_all_ended_but(&mut farm, Role::Daemon(9));
+    let table = farm.process_table();
+    assert_eq!(table[1].ended.as_deref(), Some("exit 0"), "{table:?}");
+    farm.restart(role);
+    wait_all_ended_but(&mut farm, Role::Daemon(9));
+    let table = farm.process_table();
+    assert_eq!(table.len(), 3, "{table:?}");
+    assert_eq!(table[2].ended.as_deref(), Some("exit 0"), "{table:?}");
+}
+
+#[test]
+fn a_role_runs_the_kbf_the_topology_names_for_it_else_the_default() {
+    // Catches: a `kbf` named for one role run by another (node 2 and daemon 2 are different
+    // roles), the default lost for the roles with no entry, and the entry ignored.
+    // Mutant: `kbf_of` compares the roles' numbers only.
+    let topology = Topology {
+        binaries: vec![(Role::Node(2), PathBuf::from("/older/kbf"))],
+        ..Topology::rehearsal(2)
+    };
+    let default = Path::new("/tip/kbf");
+    assert_eq!(
+        topology.kbf_of(Role::Node(2), default),
+        Path::new("/older/kbf")
+    );
+    for role in [Role::Frontend, Role::Node(1), Role::Daemon(2)] {
+        assert_eq!(topology.kbf_of(role, default), default, "{role}");
+    }
+}
+
+#[test]
 fn a_kill_is_not_taken_for_a_crash() {
     // Catches: a killed role failing `wait` (the kill tests could never wait again), and
     // the other half: an exit nobody asked for being taken for a kill.

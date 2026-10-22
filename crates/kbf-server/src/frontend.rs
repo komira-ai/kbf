@@ -93,7 +93,7 @@ use kbf_front::{
 };
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
 use kbf_proto::worker::worker_server::WorkerServer;
-use kbf_route::TlsNodes;
+use kbf_route::{DEFAULT_HOLD, TlsNodes};
 use kbf_storage::Storage;
 use kbf_storage::service::RemoteStorage;
 use kbf_threads::Topology;
@@ -574,8 +574,9 @@ impl FrontendFlags {
 /// without the TLS flags, which every connection to a member needs: a member is dialled
 /// at `https://` and verified against its own address. With a state store but no TLS flags
 /// the start logs a warning that says so, since the farm may have members the daemons
-/// place blobs on that this frontend will not look at. Not generic, for the same reason
-/// as [`crate::serve::sweeping`].
+/// place blobs on that this frontend will not look at. A call no member could answer is
+/// held for [`DEFAULT_HOLD`] before it fails (there is no flag for the bound yet). Not
+/// generic, for the same reason as [`crate::serve::sweeping`].
 ///
 /// # Errors
 /// A TLS file cannot be read.
@@ -597,7 +598,9 @@ fn routed_of(
     };
     let maps = Arc::new(FrontMaps::new(Arc::clone(members)));
     Ok(Some(Arc::new(
-        Routed::over_tls(maps, Arc::new(TlsNodes::new(ca, identity))).bootstrapped(storage.clone()),
+        Routed::over_tls(maps, Arc::new(TlsNodes::new(ca, identity)))
+            .with_hold(DEFAULT_HOLD)
+            .bootstrapped(storage.clone()),
     )))
 }
 

@@ -35,6 +35,8 @@ fn the_installer_parses_what_kbf_prints() {
     assert_eq!(parsed.seq, Some(num("seq")));
     assert_eq!(parsed.state_schema, num("state_schema"));
     assert_eq!(parsed.commit, text("commit"));
+    // Absent from a build that does not know its full commit, and then `None`.
+    assert_eq!(parsed.commit_full.as_deref(), said["commit_full"].as_str());
     assert_eq!(parsed.profile, text("profile"));
     assert_eq!(parsed.version, text("version"));
     // Every key kbf emits is one `Version` holds (`Debug` names each field it has), so a

@@ -98,6 +98,8 @@ jobs:
     stage: beta
   - job: beta.yml#cross-version
     stage: beta
+  - job: beta.yml#mixed-version
+    stage: beta
   - job: gamma.yml#offer
     stage: gamma
   - job: gamma.yml#deploy

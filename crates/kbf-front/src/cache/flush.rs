@@ -41,6 +41,8 @@
 //!   [`FLUSH_BACKOFF_FIRST`] doubling to [`FLUSH_BACKOFF_MAX`].
 //! - **Eviction is on committed state:** the block becomes a flushed copy
 //!   ([`kbf_tier::WriteTier::flushed`]) only after `ObjectFlushed` applied.
+//! - **A stop flushes what is staged** ([`Cache::flush_for_shutdown`]), within a deadline;
+//!   what the deadline leaves is on the tier's disk and flushed by the next start.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -54,9 +56,10 @@ use kbf_meta::{
 use kbf_objstore::{BodyStream, ObjectStore, ObjectStoreError};
 use kbf_segments::Footer;
 use kbf_segments::layout::{encode_footer, footer_len};
-use kbf_tier::WriteTier;
+use kbf_tier::{TierOptions, WriteTier};
 use kbf_types::Digest;
 
+use super::ram::SHUTDOWN_RETRY;
 use super::read::READ_WINDOW_BYTES;
 use super::tier::{Staging, blocking};
 use super::verify::{RecordCheck, Verified};
@@ -188,6 +191,14 @@ pub(super) fn flush_backoff(failures: u32) -> Duration {
         .min(FLUSH_BACKOFF_MAX)
 }
 
+/// How far past now a final flush ([`Cache::flush_for_shutdown`]) reads the clock: past
+/// the seal delay of the open block and the longest wait a failed flush is given, so a
+/// round seals the open block and tries at once what the flusher was backing off from.
+/// The seal delay is [`TierOptions::SEAL_AFTER`], which the server never changes: a tier
+/// built with a longer one would not seal at a stop, and the final flush would end at its
+/// deadline with the open block still staged (on its disk, flushed by the next start).
+const SHUTDOWN_HORIZON: Duration = TierOptions::SEAL_AFTER.saturating_add(FLUSH_BACKOFF_MAX);
+
 /// How many times the commit that moves a staged object is tried before the move is
 /// given up for this round (the block is synced and held while it is tried).
 pub(super) const RESEAT_ATTEMPTS: u32 = 3;
@@ -216,6 +227,31 @@ pub struct FlushRound {
     pub dropped: Vec<Digest>,
     /// Objects whose flush failed this round, and how long until their next attempt.
     pub retrying: Vec<(ObjectId, Duration)>,
+}
+
+impl FlushRound {
+    /// How many objects the round took a step with: sealed, flushed, moved off a
+    /// conflicting key or found corrupt. 0 when nothing but failures happened.
+    fn moved(&self) -> usize {
+        self.sealed.len() + self.flushed.len() + self.conflicts.len() + self.corrupt.len()
+    }
+}
+
+/// How [`Cache::flush_for_shutdown`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownFlush {
+    /// No block holding acknowledged bytes is left on the write tier: every staged object
+    /// is in the store, or there was no tier.
+    Flushed,
+    /// The deadline ended with these blocks and committed bytes still on the tier. They
+    /// are durable on its disk (an acknowledgement follows `fdatasync` and the committed
+    /// log), and the next start recovers and flushes them.
+    TimedOut {
+        /// Blocks still on the tier.
+        blocks: u64,
+        /// Their committed bytes.
+        bytes: u64,
+    },
 }
 
 /// The most bytes of a block the flusher reads at once, and the pieces it hands to the
@@ -332,6 +368,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     ///    never guesses. It goes once the object is no longer staged on this tier (this
     ///    node became its flusher and flushed it, or it left staged state).
     ///
+    /// Rounds do not overlap: a call waits for the round in flight.
+    ///
     /// # Errors
     ///
     /// The metadata log could not answer a seal or the queue's query. A failed flush
@@ -340,6 +378,9 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let Some(staging) = self.writer.tier.get() else {
             return Ok(FlushRound::default());
         };
+        // One round at a time: the flusher's and a stop's final flush would else take the
+        // same sealed object, and the one that lost would find its block gone.
+        let _round = self.writer.rounds.lock().await;
         let mut round = FlushRound::default();
         for object in staging.tier.poll_seals(now) {
             self.commit_tier(Command::SealStaged { object }).await?;
@@ -432,6 +473,52 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         }
         self.writer.born.prune(mark, &staged);
         Ok(round)
+    }
+
+    /// The flush a graceful stop makes, after the node's calls have ended: rounds of
+    /// [`Cache::flush_tier`], run as if the seal delay had passed and the backoffs in place
+    /// when the stop began had ended, until no block holding acknowledged bytes is left on
+    /// the tier or `deadline` has passed. The open block is sealed and flushed too. A flush
+    /// that failed before the stop began is tried at once; one that fails during it is
+    /// logged where it fails (by [`Cache::flush_tier`]) and waits its backoff, 1 s doubling
+    /// to 60 s, within the deadline. A round that fails (the metadata log unavailable) is
+    /// logged and tried again after a pause, as is a round that moved nothing. Rounds do
+    /// not overlap those of the flusher: a round waits for one in flight. What the deadline
+    /// leaves is not lost: it is on the tier's disk, and the next start flushes it.
+    /// Without a tier, there is nothing to do.
+    pub async fn flush_for_shutdown(&self, deadline: Duration) -> ShutdownFlush {
+        let Some(staging) = self.writer.tier.get() else {
+            return ShutdownFlush::Flushed;
+        };
+        let unflushed = || staging.tier.unflushed(Instant::now());
+        let work = async {
+            while unflushed().blocks > 0 {
+                let at = Instant::now() + SHUTDOWN_HORIZON;
+                let moved = match self.flush_tier(at).await {
+                    Ok(round) => round.moved(),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "a round of the final flush of the write tier failed; trying again"
+                        );
+                        0
+                    }
+                };
+                if moved == 0 {
+                    tokio::time::sleep(SHUTDOWN_RETRY).await;
+                }
+            }
+        };
+        match tokio::time::timeout(deadline, work).await {
+            Ok(()) => ShutdownFlush::Flushed,
+            Err(_) => {
+                let left = unflushed();
+                ShutdownFlush::TimedOut {
+                    blocks: left.blocks,
+                    bytes: left.bytes,
+                }
+            }
+        }
     }
 
     /// Flushes `object`, staged with committed length `len` and `blobs` (sorted by
