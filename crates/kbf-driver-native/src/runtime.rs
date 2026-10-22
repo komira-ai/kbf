@@ -860,7 +860,7 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
             Err(_) => measured,
         };
         if let Some(usage) = told {
-            self.keep_failed(work.lease_id, usage);
+            let _ = usage;
         }
         match (outcome, cleaned) {
             (Ok(_), Err(why)) => Err(RuntimeError::Failed(why)),
