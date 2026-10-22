@@ -712,8 +712,7 @@ fn names_deleted_modules(text: &str) -> Vec<&'static str> {
 fn the_swap_names_nothing_that_is_deleted_with_the_update_api() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kbf-installer/src");
     let read = |file: &str| {
-        std::fs::read_to_string(src.join(file))
-            .unwrap_or_else(|e| panic!("read {file}: {e}"))
+        std::fs::read_to_string(src.join(file)).unwrap_or_else(|e| panic!("read {file}: {e}"))
     };
     let mut violations = Vec::new();
     for file in KEPT_SWAP_FILES {
