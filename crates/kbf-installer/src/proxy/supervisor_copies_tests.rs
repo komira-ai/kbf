@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use super::tests::{Env, gate, state_dir};
 use super::*;
 use crate::fixtures::{FakeRunner, ran, version_json_full};
+use crate::proxy::child_real::Recorded;
 use crate::proxy::child_rig::{Rig, rig};
 use crate::proxy::releases::Local;
 use crate::proxy::root_orders::StatusFile;
@@ -193,4 +194,40 @@ fn the_installed_release_is_adopted_only_when_none_is_recorded() {
         .installed()
         .expect_err("the kbf does not run");
     assert!(err.0.starts_with("cannot adopt "), "{}", err.0);
+}
+
+/// Catches a prune that is not told about a child still running: the commits are those of the
+/// two slots' records (slot A first), a slot with no record or a record that cannot be read adds
+/// none; the function the binary watch is given ([`in_use`]) answers the same, from the records
+/// as they are when it is called.
+///
+/// Mutants it catches: one slot left out; the commit read from the wrong field; an unreadable
+/// record taken for a commit; the watch's function fixed to the records of its creation.
+#[test]
+fn the_commits_a_child_may_still_run_are_those_of_the_slots_records() {
+    let rig = rig("supervisor-running-commits");
+    assert_eq!(running_commits(&rig.child), Vec::<CommitId>::new());
+    let kept = in_use(Arc::new(rig.restarted()));
+    std::fs::create_dir_all(&rig.dir).expect("children dir");
+    let record = |slot: &str, commit: &str| {
+        let ident = ProcIdent {
+            pid: 1,
+            start_time: 1,
+            exe: PathBuf::from("/kbf"),
+        };
+        let recorded = Recorded {
+            ident,
+            commit: c(commit),
+        };
+        let bytes = serde_json::to_vec(&recorded).expect("json");
+        std::fs::write(rig.dir.join(format!("{slot}.json")), bytes).expect("record");
+    };
+
+    record("b", B);
+    assert_eq!(running_commits(&rig.child), [c(B)]);
+    record("a", A);
+    assert_eq!(running_commits(&rig.child), [c(A), c(B)]);
+    assert_eq!(kept(), [c(A), c(B)]);
+    std::fs::write(rig.dir.join("a.json"), b"{").expect("torn record");
+    assert_eq!(running_commits(&rig.child), [c(B)]);
 }

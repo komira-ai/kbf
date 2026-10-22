@@ -36,7 +36,10 @@
 //! (`--orders-dir` and `--update-dir` are not looked at), the swap's confirm and revert touch
 //! no file of the root half, and the update API refuses to order a release. A start that
 //! finds no installed release recorded copies the kbf at `PATH` and records it as the
-//! installed one. Without the flag nothing of this exists and the proxy works as before.
+//! installed one. Once the swap's slot is filled the proxy also polls the file at `PATH` every
+//! 5 s ([`crate::proxy::binary_watch`]): a package that replaced it is copied, its facts are
+//! staged and the swap to it is started, as the update API would, with no request. Without the
+//! flag nothing of this exists and the proxy works as before.
 //!
 //! The start migrates before it runs anything: the installed release is brought to the
 //! `state_schema` it declares on the database `installer.toml` names (`database`, a URL
@@ -544,6 +547,7 @@ fn serve(
     listener: OwnedFd,
     root: &kbf_host::Root,
 ) -> Result<(), VerbError> {
+    let (parts, watch) = handover::parts_shared(handover)?;
     #[cfg(target_os = "linux")]
     let supervise_with = Supervise {
         database,
@@ -553,11 +557,12 @@ fn serve(
         operator_token_file: config.operator_token_file.clone(),
         status: handover.status_file.clone(),
         local: handover.local.clone(),
+        watch,
     };
-    // Off Linux nothing supervises the proxy, so neither the database nor the host root is used.
+    // Off Linux nothing supervises the proxy, so neither the database, the host root nor the
+    // binary watch is used.
     #[cfg(not(target_os = "linux"))]
-    let _ = (database, root);
-    let parts = handover::parts(handover)?;
+    let _ = (database, root, watch);
     unblock_stop_signals();
     let (handle, runner) = Proxy::bind(config, listener).map_err(VerbError::starting)?;
     let runtime = handle.runtime();
@@ -638,6 +643,10 @@ struct Supervise {
     /// The proxy's own copies of `kbf` (`--kbf-binary`): the children are run from them and a
     /// start with no installed release recorded adopts the package's kbf.
     local: Option<Local>,
+    /// The binary watch's seams (`--kbf-binary`, so set exactly when `local` is): the copies it
+    /// stages into and the swap it starts through, the one the update API holds. Started once
+    /// the swap's slot is filled ([`crate::proxy::binary_watch`]). `None` watches nothing.
+    watch: Option<crate::proxy::binary_watch::Wiring>,
 }
 
 /// The supervisor, on a thread of its own: starting a first child waits for it to be ready,
@@ -678,7 +687,7 @@ fn supervise(
     use crate::proxy::child_real::ProcChild;
     use crate::proxy::runtime::SystemClock;
     use crate::proxy::supervisor::{
-        Startup, children_dir, frontend_argv, releases_of, run_from_copies,
+        Startup, children_dir, frontend_argv, in_use, releases_of, run_from_copies,
     };
 
     let clock = Arc::new(SystemClock::new());
@@ -696,6 +705,7 @@ fn supervise(
                 frontend_argv(&with.proxy_auth_file, with.upstream),
             );
             let child = Arc::new(run_from_copies(child, with.local.as_ref()));
+            let watch = with.watch.clone();
             let started = start_with(&handle, &gate, &*wait, &child, with, Retry::boot());
             let (active, held) = match &started {
                 Ok(Startup::Adopted { active }) => (*active, None),
@@ -716,6 +726,10 @@ fn supervise(
                 secret: admin_secret(&handle.admin_headers()),
                 on_death,
             });
+            // The swap is startable now: the binary watch may ask for one. It ends with the
+            // clock, which `Supervised` stops.
+            let kept = in_use(recorder);
+            drop(crate::proxy::binary_watch::spawn(watch, wait, kept));
             gate
         })
         .ok();

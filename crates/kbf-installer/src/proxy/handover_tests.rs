@@ -335,3 +335,26 @@ fn with_copies_no_order_spool_is_opened_and_the_apis_writer_refuses_every_order(
         assert!(err.0.contains("there is no order spool"), "{}", err.0);
     }
 }
+
+/// Catches the binary watch being handed to a proxy that does not keep copies, or handed the
+/// wrong copies: `parts_shared` gives a wiring only with `local`, the wiring is that `local`
+/// (the same binary, the same copies and the same orders, not new ones), and the seams are the
+/// same as `parts` builds.
+///
+/// Mutants it catches: a wiring made whatever `local` says; the wiring over a `Local` opened
+/// again (its orders are not the config's); `parts_shared` leaving the seams unbuilt.
+#[test]
+fn only_a_proxy_with_copies_gets_the_wiring_of_the_binary_watch() {
+    let (seams, none) = parts_shared(&config("no-wiring")).expect("the seams");
+    assert!(none.is_none());
+    assert_eq!(seams.config.window_s, 900);
+
+    let cfg = config_local("wiring");
+    let own = cfg.local.clone().expect("copies");
+    let (seams, some) = parts_shared(&cfg).expect("the seams");
+    let wiring = some.expect("a proxy with copies is watched");
+    assert_eq!(seams.config.window_s, 900);
+    assert_eq!(wiring.local.binary, own.binary);
+    assert!(Arc::ptr_eq(&wiring.local.copies, &own.copies));
+    assert!(Arc::ptr_eq(&wiring.local.orders, &own.orders));
+}

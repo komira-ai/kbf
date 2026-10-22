@@ -85,6 +85,7 @@ fn the_start_with_copies_runs_the_copy_of_the_installed_release_and_migrates_it_
         operator_token_file: config.operator_token_file.clone(),
         status: state_dir.join(releases::STATUS),
         local: Some(local),
+        watch: None,
     };
     let retry = Retry {
         attempts: 1,

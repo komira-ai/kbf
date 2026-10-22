@@ -1055,6 +1055,7 @@ fn the_start_migrates_the_installed_release_before_it_runs_it() {
         operator_token_file: config.operator_token_file.clone(),
         status,
         local: None,
+        watch: None,
     };
     let retry = Retry {
         attempts: 1,
