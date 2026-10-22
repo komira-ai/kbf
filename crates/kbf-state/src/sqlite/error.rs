@@ -47,9 +47,8 @@ pub enum SqliteError {
         /// Its link count.
         links: u64,
     },
-    /// The file is not a state store this binary reads (an older schema, a file that lacks
-    /// a table or column this binary needs, or another application's database), or the
-    /// filesystem cannot keep it in WAL mode. A newer schema that only adds is read.
+    /// The file is not a state store this binary reads (another schema, or another
+    /// application's database), or the filesystem cannot keep it in WAL mode.
     #[error("{0}")]
     NotAStateStore(String),
     /// A filesystem call failed; the text names the path.

@@ -117,9 +117,9 @@ pub trait Store: Send + Sync {
     /// At most `limit` feed rows with a revision after `after`, in revision order, never
     /// past a revision that can still commit (C5).
     ///
-    /// A row of a kind this build does not know (a newer release wrote it) is logged and
-    /// left out of `rows`, though it counts toward `limit` and the cursor passes it: a
-    /// page can hold fewer rows than the limit, or none, and its cursor still moves on.
+    /// On Postgres, a row of a kind this build does not know (a newer release wrote it) is
+    /// logged and left out of `rows`, though it counts toward `limit` and the cursor passes
+    /// it: a page can hold fewer rows than the limit, or none, and its cursor still moves on.
     ///
     /// # Errors
     /// [`StoreError`] when the backend fails.

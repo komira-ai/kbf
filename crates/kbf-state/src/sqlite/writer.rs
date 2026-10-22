@@ -220,13 +220,12 @@ impl<'c> Applier<'c> {
         Ok(Applier {
             get: conn.prepare("SELECT version, expires_at FROM kv WHERE key = ?1")?,
             put: conn.prepare(
-                "INSERT INTO kv (key, value, version, expires_at) VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT (key) DO UPDATE SET value = excluded.value, \
-                 version = excluded.version, expires_at = excluded.expires_at",
+                "INSERT OR REPLACE INTO kv (key, value, version, expires_at) VALUES (?1, ?2, ?3, ?4)",
             )?,
             delete: conn.prepare("DELETE FROM kv WHERE key = ?1")?,
-            feed: conn
-                .prepare("INSERT INTO feed (revision, key, kind, value) VALUES (?1, ?2, ?3, ?4)")?,
+            feed: conn.prepare(
+                "INSERT INTO feed (revision, key, kind, value) VALUES (?1, ?2, ?3, ?4)",
+            )?,
             counter: conn.prepare(
                 "INSERT INTO counter (name, value) VALUES (?1, 1) \
                  ON CONFLICT (name) DO UPDATE SET value = value + 1 RETURNING value",

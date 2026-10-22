@@ -599,25 +599,20 @@ fn a_restore_refuses_another_applications_database() {
     refused_source("state-store-restore-foreign", &foreign, "schema version 0");
 }
 
-/// Asserts that a restore refuses a state store of a newer schema that lacks a table this
-/// binary needs, and names it. (A newer schema that only adds is taken, as the state
-/// store's own tests assert.)
+// Catches a restore that takes a state store of another schema version: it has the same
+// tables, so nothing but the version check stops its rows being read with the wrong
+// layout.
 #[test]
-fn a_restore_refuses_a_newer_state_store_that_lacks_a_needed_table() {
+fn a_restore_refuses_a_state_store_of_another_schema_version() {
     let newer = |good: &Path| {
         let newer = sibling(good, "newer.db");
         fs::copy(good, &newer).expect("copy");
         let conn = Connection::open(&newer).expect("open");
         conn.pragma_update(None, "user_version", 2)
             .expect("version");
-        conn.execute_batch("DROP TABLE counter").expect("drop");
         newer
     };
-    refused_source(
-        "state-store-restore-newer",
-        &newer,
-        "version 2 has no counter.name",
-    );
+    refused_source("state-store-restore-newer", &newer, "schema version 2");
 }
 
 // Catches a restore that takes a damaged backup, one whose damage only
