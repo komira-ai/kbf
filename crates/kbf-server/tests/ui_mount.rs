@@ -106,12 +106,6 @@ async fn the_ui_is_open_whatever_the_policy_says_of_the_network_routes() {
             network.code,
             network.head
         );
-        let hosts = server.get("/v1/update/hosts").await;
-        assert_eq!(
-            hosts.code, 404,
-            "the per-host detail stays off: {}",
-            hosts.head
-        );
 
         // The UI is not gated by it.
         let overview = server.get("/ui").await;

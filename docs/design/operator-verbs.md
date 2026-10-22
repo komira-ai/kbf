@@ -109,7 +109,6 @@ All answer 404 when the feature is off.
 | preview what a commit would change | `GET /v1/update/plan` | [V] #985 (design) | open |
 | pause updates | `POST /v1/update/pause` | [V] #976 | write |
 | resume updates | `POST /v1/update/resume` | [V] #976 | write |
-| per-host update state | `GET /v1/update/hosts` | [V] #1007 | policy (`farm.getAuthorizer`) |
 | the frontend's own update order, read | `GET /v1/update/frontend` | [V] #1062 | open |
 | the frontend's own update order, write | `POST /v1/update/frontend` | [V] #1062 | write |
 
