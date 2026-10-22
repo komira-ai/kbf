@@ -7,8 +7,10 @@
 //!
 //! A role starts only from that command line and file, and the [`Farm`] keeps the line, so
 //! [`Farm::restart`] runs the identical command and a test that changes the line
-//! (a rolling update) changes it in one place. The deviations from the packaged units'
-//! settings are listed in [`Farm::start`].
+//! (a rolling update) changes it in one place. The program is part of the line: each role
+//! runs the `kbf` the topology names for it ([`Topology::binaries`]), so a farm may hold two
+//! releases, and [`Farm::restart_with`] restarts a role under another. The deviations from
+//! the packaged units' settings are listed in [`Farm::start`].
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -147,6 +149,10 @@ impl Farm {
     ///
     /// Every other setting is the unit's.
     ///
+    /// Every role runs `bins.kbf`, except the roles [`Topology::binaries`] names a `kbf` for
+    /// (an older release's: the farm of two versions). The settings are the same for both: a
+    /// setting the older `kbf` does not know fails its start.
+    ///
     /// Call it from a thread that lives as long as the farm (the main thread, a test's own): the
     /// kernel kills a process when the thread that started it ends ([`crate::procs::Proc::start`]), so a
     /// farm started on a worker thread that returns is a farm of killed processes. The same
@@ -254,7 +260,13 @@ impl Farm {
         };
         let unit = units::frontend(&place, uid, &socket, topo);
         farm.socket = Some(socket);
-        farm.launch(&bins.kbf, Role::Frontend, &root, unit, None);
+        farm.launch(
+            topo.kbf_of(Role::Frontend, &bins.kbf),
+            Role::Frontend,
+            &root,
+            unit,
+            None,
+        );
         let line = farm.start_line(Role::Frontend, "kbf-frontend ")?;
         farm.reapi = field(&line, "reapi=").to_owned();
 
@@ -286,7 +298,7 @@ impl Farm {
             let container = (!native).then(|| Container::planted(&bin, &root));
             let unit = units::node((&place, uid), i + 1, metrics[i], topo, container.as_ref());
             farm.launch(
-                &bins.kbf,
+                topo.kbf_of(Role::Node(i + 1), &bins.kbf),
                 Role::Node(i + 1),
                 &root,
                 unit,
@@ -313,7 +325,7 @@ impl Farm {
             let container = (!native).then(|| Container::planted(&bin, &root));
             let unit = units::daemon((&place, uid), d, topo, container.as_ref());
             farm.launch(
-                &bins.kbf,
+                topo.kbf_of(Role::Daemon(d), &bins.kbf),
                 Role::Daemon(d),
                 &root,
                 unit,
@@ -604,6 +616,18 @@ impl Farm {
         m.proc = Proc::start(&m.spec, &logs, m.generation);
         m.started = unix_now();
         m.killed = false;
+    }
+
+    /// [`Farm::restart`] with `kbf` as the program in place of the one the role runs: the same
+    /// command line and `kbf.toml` under another build, as a rolling update restarts a host. A
+    /// later restart of the role runs `kbf` too.
+    ///
+    /// # Panics
+    /// When the role still runs, as [`Farm::restart`] (the role's program is then changed all
+    /// the same).
+    pub fn restart_with(&mut self, role: Role, kbf: &Path) {
+        self.member_mut(role).spec.program = kbf.to_owned();
+        self.restart(role);
     }
 
     /// Every start of every role, past ones first: role, pid, generation, start time and
