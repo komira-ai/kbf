@@ -223,6 +223,27 @@ fn the_times_and_the_cgroup_block_are_what_the_daemon_reported() {
     assert_eq!(render(&r)["reapi_times"], json!({}));
 }
 
+/// Catches: the read API changing what it prints for a run whose record holds no peak or
+/// wall time (the record now keeps them as absent; the API still writes 0, as before): a
+/// different default, or the keys left out.
+#[test]
+fn an_absent_peak_and_wall_are_still_printed_as_zero() {
+    let mut r = base();
+    r.cgroup = Some(Cgroup {
+        cpu_usage_us: 8,
+        memory_peak_bytes: None,
+        wall_us: None,
+        ..Cgroup::default()
+    });
+    let usage = &render(&r)["usage"];
+    assert_eq!(usage["wall_us"], json!(0));
+    assert_eq!(usage["memory_peak_bytes"], json!(0));
+    assert!(
+        usage.get("parallelism").is_none(),
+        "no wall, no parallelism"
+    );
+}
+
 /// Catches: a shape wrongly made or not made when only one of the things that name it is
 /// there: the key alone, a configuration other than `-` alone, a target alone, a test flag
 /// alone, each makes a shape, and a run with none of them has `null`.

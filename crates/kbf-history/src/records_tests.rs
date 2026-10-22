@@ -251,3 +251,30 @@ fn the_basis_footprint_pressure_and_booking_have_their_field_numbers() {
     assert_eq!(older.node_cpu_pressure_centi, None);
     assert_eq!(older.booked_millicpus, None);
 }
+
+#[test]
+fn the_peak_and_the_wall_are_optional_on_the_old_tags() {
+    // Catches: tag 7 or 9 renumbered, a measured zero dropped from the wire (a zero
+    // peak must stay distinct from none), an absent value written as 0, and a non-zero
+    // value encoded differently from the plain field older writers used (older readers
+    // and chunks must read it unchanged).
+    use prost::Message as _;
+    let block = |peak, wall| Cgroup {
+        memory_peak_bytes: peak,
+        wall_us: wall,
+        ..Cgroup::default()
+    };
+    // Tag 7 varint is key 0x38, tag 9 is key 0x48.
+    assert_eq!(block(Some(0), None).encode_to_vec(), [0x38, 0]);
+    assert_eq!(block(None, Some(0)).encode_to_vec(), [0x48, 0]);
+    assert!(block(None, None).encode_to_vec().is_empty());
+    assert_eq!(
+        block(Some(5), Some(300)).encode_to_vec(),
+        [0x38, 5, 0x48, 0xAC, 0x02]
+    );
+    // What an older writer wrote for a zero (field omitted) reads as none; non-zero reads.
+    let old = Cgroup::decode([0x38, 5, 0x48, 0xAC, 0x02].as_slice()).unwrap();
+    assert_eq!((old.memory_peak_bytes, old.wall_us), (Some(5), Some(300)));
+    let omitted = Cgroup::decode([].as_slice()).unwrap();
+    assert_eq!((omitted.memory_peak_bytes, omitted.wall_us), (None, None));
+}
