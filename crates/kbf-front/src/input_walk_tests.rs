@@ -453,6 +453,45 @@ async fn a_repeated_subtree_is_read_once() {
     assert!(store.reads.lock().unwrap().values().all(|n| *n == 1));
 }
 
+/// Catches: the totals summed per file entry instead of per distinct file (a file named
+/// in two Directories counted twice), a size taken from the wrong digest field, and the
+/// count and the bytes swapped. Files of 1, 22 and 333 bytes; the 22-byte one is in the
+/// root and in the subdirectory.
+#[tokio::test(start_paused = true)]
+async fn the_input_totals_count_each_distinct_file_once() {
+    let mut tree = Tree::default();
+    let (a, b, c) = (file("a"), file(&"b".repeat(22)), file(&"c".repeat(333)));
+    let sub = tree.add(dir(&[b, c], &[]));
+    let root = tree.add(dir(&[a, b], &[sub]));
+    tree.held.extend([a, b, c]);
+    let store = Store::fixed(tree, Duration::ZERO);
+    let walked = walk(&store, root, &Trees::default()).await.expect("walk");
+    assert!(walked.absent.is_empty());
+    assert_eq!(walked.input_files, Some(3));
+    assert_eq!(walked.input_bytes, Some(1 + 22 + 333));
+}
+
+/// Catches: a total reported for a tree with something absent (the files named below an
+/// absent Directory were never seen, so the figure would be a lower bound that reads as
+/// a size), and an empty tree reported as unknown instead of 0 files of 0 bytes.
+#[tokio::test(start_paused = true)]
+async fn the_input_totals_are_absent_when_the_tree_is_incomplete_and_zero_when_empty() {
+    let mut tree = Tree::default();
+    let (a, lost) = (file("a"), file("lost"));
+    let root = tree.add(dir(&[a, lost], &[]));
+    tree.held.insert(a);
+    let store = Store::fixed(tree, Duration::ZERO);
+    let walked = walk(&store, root, &Trees::default()).await.expect("walk");
+    assert_eq!(walked.absent, vec![lost]);
+    assert_eq!((walked.input_files, walked.input_bytes), (None, None));
+
+    let mut tree = Tree::default();
+    let root = tree.add(dir(&[], &[]));
+    let store = Store::fixed(tree, Duration::ZERO);
+    let walked = walk(&store, root, &Trees::default()).await.expect("walk");
+    assert_eq!((walked.input_files, walked.input_bytes), (Some(0), Some(0)));
+}
+
 /// A small generator, so a failing seed can be rerun.
 pub(super) struct Rng(u64);
 

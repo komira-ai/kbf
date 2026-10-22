@@ -9,6 +9,11 @@ impl Instance {
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
     }
+
+    /// The instance's name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// The OS and CPU class of the platform an action ran on (a test on arm64 and on x86_64
@@ -20,6 +25,11 @@ impl PlatformClass {
     /// A platform class named `name`.
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
+    }
+
+    /// The class's name.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -89,9 +99,24 @@ impl Key {
         &self.instance
     }
 
+    /// The platform class the key belongs to.
+    pub fn platform(&self) -> &PlatformClass {
+        &self.platform
+    }
+
     /// The instrument this key's samples come from.
     pub fn basis(&self) -> Basis {
         self.basis
+    }
+
+    /// The action shape.
+    pub fn shape(&self) -> Shape {
+        self.shape
+    }
+
+    /// The configuration, `None` for a key with only the L2 level.
+    pub fn cfg(&self) -> Option<Cfg> {
+        self.cfg
     }
 
     /// The same key with the configuration dropped (level L2).

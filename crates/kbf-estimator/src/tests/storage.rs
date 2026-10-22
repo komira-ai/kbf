@@ -391,3 +391,21 @@ fn a_full_table_refuses_another_instance() {
     assert_eq!((s.unpinned(), s.len()), (1, 9));
     assert_eq!(s.key_floor(&late, &b), 16 * GIB);
 }
+
+/// Catches: a key's parts unreadable or swapped (a caller that stores a summary under a
+/// name made of its key cannot rebuild the key on restart, or rebuilds another key).
+#[test]
+fn a_key_names_its_parts() {
+    let key = Key::new(
+        Instance::new("main"),
+        PlatformClass::new("linux/x86_64"),
+        Basis::MacFootprint,
+        Shape(7),
+        Some(Cfg(9)),
+    );
+    assert_eq!(key.instance().as_str(), "main");
+    assert_eq!(key.platform().as_str(), "linux/x86_64");
+    assert_eq!(key.basis(), Basis::MacFootprint);
+    assert_eq!((key.shape(), key.cfg()), (Shape(7), Some(Cfg(9))));
+    assert_eq!(key.l2().cfg(), None);
+}

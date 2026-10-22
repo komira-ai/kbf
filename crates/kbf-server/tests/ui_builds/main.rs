@@ -146,6 +146,7 @@ async fn a_failed_action_shows_its_command_and_tail_and_links_the_download() {
                 action,
                 command,
                 shape: None,
+                evidence: None,
             },
             granted(1, 1, "node-a", at(10)),
             started(1, 1, at(11)),
