@@ -1,0 +1,12 @@
+# Written by `kbf-installer setup`; run setup again to change these keys. Another setting
+# goes into the table it belongs to (add the key there, never a second table of the same name).
+mode = "frontend"
+
+[tls]
+api-token-file = "/etc/kbf/api-token"
+
+[storage-client]
+storage = "http://127.0.0.1:8990"
+
+[scheduler]
+state-store = "postgres:///kbf?host=/run/postgresql&user=kbf-server"

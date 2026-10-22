@@ -3,12 +3,16 @@
 //! A node mode (`storage`, `daemon`, `storage-and-daemon`) gets its listeners, certificates and
 //! storage URL from enrollment, so its file is complete with the mode, the frontend URL and
 //! the token path. A `frontend` host serves the public REAPI listener, the worker listener and
-//! the operator API and proxies blobs to a storage node; an `all-in-one` host serves the same
-//! listeners and runs the daemon half in its process, with a cold store of its own. Their
-//! certificates and paths are the operator's, and those are the flags here. A flag sets the
-//! `kbf` flag of its key's name (a few carry a longer name for the setup command line:
-//! `--storage-url` is `storage`, `--daemon-cert` is `cert`) and is written as that key in the
-//! table of its group (`crates/kbf-cli/src/config.rs`, `GROUPS`). A test checks every
+//! the operator API and proxies blobs to a storage node. An `all-in-one` host is always behind
+//! the proxy: its public listeners and certificates are the proxy's, its `kbf.toml` is the
+//! `storage-and-daemon` sibling's (the cold store, the metadata directory and the daemon
+//! half's identity, and a loopback listener `setup` adds from `--storage-port`), and the
+//! operator API, the state database and the sibling as storage node are the frontend child's
+//! `frontend.toml`, which `plan.rs` derives from `--database` and `--storage-port` and not from
+//! flags of this table. Their certificates and paths are the operator's, and those are the flags
+//! here. A flag sets the `kbf` flag of its key's name (a few carry a longer name for the setup
+//! command line: `--storage-url` is `storage`, `--daemon-cert` is `cert`) and is written as that
+//! key in the table of its group (`crates/kbf-cli/src/config.rs`, `GROUPS`). A test checks every
 //! `(table, key)` against `kbf`'s own per-mode goldens, so a renamed or moved flag fails there.
 //!
 //! The rules, all checked before the host is touched:
@@ -26,9 +30,9 @@
 //! - what the mode cannot start without is required: a frontend its storage URL, an
 //!   all-in-one host its cold store, metadata directory and the daemon half's identity.
 //!
-//! `setup` also writes what the mode needs and has one answer for: the operator API address
-//! (default `127.0.0.1:8982`, as `kbf` documents; the token file `setup` writes requires it)
-//! and, for `all-in-one`, `driver = "container"`, the only driver it accepts.
+//! `setup` also writes what the mode needs and has one answer for: on a frontend, the operator
+//! API address (default `127.0.0.1:8982`, as `kbf` documents; the token file `setup` writes
+//! requires it) and, for `all-in-one`, `driver = "container"`, the only driver it accepts.
 //!
 //! No message carries a value, only the flag and the rule: a path or a URL a person typed can
 //! hold a secret, and a log keeps what is printed.
@@ -72,7 +76,8 @@ enum Want {
 /// Which modes take a setting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Takes {
-    /// `frontend` and `all-in-one`.
+    /// `frontend` and `all-in-one`: the files the proxy reads (an all-in-one host is always
+    /// behind it, so on that host these move to `[proxy]` and are not written to its `kbf.toml`).
     Serving,
     /// `frontend` only.
     Frontend,
@@ -158,21 +163,21 @@ const SPECS: [Spec; 20] = [
         "listen",
         "listener",
         Want::Addr,
-        Takes::Serving,
+        Takes::Frontend,
         Need::Optional,
     ),
     same!(
         "worker-listen",
         "listener",
         Want::Addr,
-        Takes::Serving,
+        Takes::Frontend,
         Need::Optional,
     ),
     same!(
         "api-listen",
         "listener",
         Want::Addr,
-        Takes::Serving,
+        Takes::Frontend,
         Need::Default("127.0.0.1:8982"),
     ),
     same!(
@@ -193,14 +198,14 @@ const SPECS: [Spec; 20] = [
         "worker-tls-cert",
         "tls",
         Want::Cert,
-        Takes::Serving,
+        Takes::Frontend,
         Need::Optional,
     ),
     same!(
         "worker-tls-key",
         "tls",
         Want::Key,
-        Takes::Serving,
+        Takes::Frontend,
         Need::Optional,
     ),
     same!(
@@ -326,13 +331,13 @@ pub fn written(mode: Mode) -> Vec<(&'static str, &'static str)> {
 /// `kbf.toml` of a `frontend` or `all-in-one` host.
 #[derive(clap::Args, Clone, Debug, Default, PartialEq, Eq)]
 pub struct KbfFlags {
-    /// The public REAPI listener, as IP:PORT (kbf's --listen). frontend, all-in-one.
+    /// The public REAPI listener, as IP:PORT (kbf's --listen). frontend.
     #[arg(long)]
     pub listen: Option<String>,
-    /// The worker listener (daemons and storage nodes dial it), as IP:PORT. frontend, all-in-one.
+    /// The worker listener (daemons and storage nodes dial it), as IP:PORT. frontend.
     #[arg(long)]
     pub worker_listen: Option<String>,
-    /// The operator API listener, as IP:PORT; default 127.0.0.1:8982. frontend, all-in-one.
+    /// The operator API listener, as IP:PORT; default 127.0.0.1:8982. frontend.
     #[arg(long)]
     pub api_listen: Option<String>,
     /// The REAPI listener's certificate (PEM file, absolute path); needs --reapi-tls-key.

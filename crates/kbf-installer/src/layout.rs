@@ -93,6 +93,9 @@ pub const ORDERS: &str = "orders";
 /// The state file's name, and the copy of the last good one.
 pub const STATE_FILE: &str = "state.json";
 pub const STATE_BACKUP: &str = "state.json.bak";
+/// The frontend child's settings on an all-in-one host: a file beside `kbf.toml` in the
+/// configuration directory (there `kbf.toml` is the storage-and-daemon sibling's).
+pub const FRONTEND_CONFIG: &str = "frontend.toml";
 
 /// The names inside a release directory: its binaries, its systemd units and the
 /// manifest that lists them. Both platforms' releases hold `kbf`; it is the only binary

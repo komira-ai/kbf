@@ -77,6 +77,14 @@ pub struct Valid {
     pub deploy: Option<DeploySettings>,
 }
 
+impl Valid {
+    /// The loopback port of the `kbf-storage-and-daemon` sibling an all-in-one host runs; none
+    /// on every other host. Its presence is what makes a host the new all-in-one layout.
+    pub fn storage_port(&self) -> Option<u16> {
+        self.proxy.as_ref().and_then(|plan| plan.storage_port)
+    }
+}
+
 /// The role and database `--create-local-database` makes, and where the local server's socket
 /// is, all from the `--database` URL. The names are plain (letters, digits, `_`, `-`).
 #[derive(Clone, PartialEq, Eq)]

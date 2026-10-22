@@ -3,13 +3,20 @@
 //! and Refuse contract covers the new keys), a refusal for each invalid input, and the rule
 //! that no value of a flag appears in any message. The helpers are `tests.rs`'s. Each test says
 //! the defect it catches; the mutants planted to see them go red are in the pull request.
+//!
+//! An all-in-one host has two such files: the sibling's `kbf.toml` (`AIO_SIBLING_GOLDEN`, a
+//! `storage-and-daemon` node) and the frontend children's `frontend.toml`
+//! (`AIO_FRONTEND_GOLDEN`); its public listeners and certificates are the proxy's.
 
 use super::*;
 use crate::setup::kbf_settings::{self, KbfFlags};
 use kbf_host::testkit::ScratchHost;
 
 const FRONTEND_GOLDEN: &str = include_str!("../../tests/golden/kbf_toml/frontend.toml");
-const ALL_IN_ONE_GOLDEN: &str = include_str!("../../tests/golden/kbf_toml/all-in-one.toml");
+const AIO_SIBLING_GOLDEN: &str =
+    include_str!("../../tests/golden/kbf_toml/all-in-one-sibling.toml");
+const AIO_FRONTEND_GOLDEN: &str =
+    include_str!("../../tests/golden/kbf_toml/all-in-one-frontend.toml");
 const DAEMON_GOLDEN: &str = include_str!("../../tests/golden/kbf_toml/daemon.toml");
 const STORAGE_GOLDEN: &str = include_str!("../../tests/golden/kbf_toml/storage.toml");
 const STORAGE_AND_DAEMON_GOLDEN: &str =
@@ -17,7 +24,6 @@ const STORAGE_AND_DAEMON_GOLDEN: &str =
 
 /// The goldens of `kbf`'s own flags, one per mode: the file the settings must be valid in.
 const KBF_FRONTEND: &str = include_str!("../../../kbf-cli/tests/golden/kbf-frontend.toml");
-const KBF_ALL_IN_ONE: &str = include_str!("../../../kbf-cli/tests/golden/kbf-all-in-one.toml");
 const KBF_STORAGE: &str = include_str!("../../../kbf-cli/tests/golden/kbf-storage.toml");
 const KBF_DAEMON: &str = include_str!("../../../kbf-cli/tests/golden/kbf-daemon.toml");
 const KBF_STORAGE_AND_DAEMON: &str =
@@ -46,10 +52,16 @@ fn frontend_flags() -> KbfFlags {
     }
 }
 
-/// Every flag an all-in-one host takes: the listeners and certificates of a frontend, no
-/// storage client (its store is its own), and the cold store and the daemon half.
+/// Every flag an all-in-one host takes: the proxy's certificate pair and client CA (the host is
+/// always behind the proxy, which owns the listeners), no storage client (the sibling is its
+/// store, and the address is derived), and the cold store and the daemon half.
 fn all_in_one_flags() -> KbfFlags {
     KbfFlags {
+        listen: None,
+        worker_listen: None,
+        api_listen: None,
+        worker_tls_cert: None,
+        worker_tls_key: None,
         storage_url: None,
         storage_ca: None,
         storage_client_cert: None,
@@ -65,11 +77,15 @@ fn all_in_one_flags() -> KbfFlags {
     }
 }
 
-/// The files the flags name, for the user the mode's unit runs as: keys 0600, certificates
-/// 0644 (the daemon's pair is `tests.rs`'s `host()`).
-fn with_files(mut exec: FakeExec, service: Owner) -> FakeExec {
-    for key in ["reapi.key", "worker.key", "node.key"] {
-        put(&mut exec, &format!("/etc/kbf/{key}"), 0o600, service, "key");
+/// The files the flags name: keys 0600, certificates 0644. A frontend's keys and the proxy's are
+/// `kbf-server`'s; the daemon half's key, the sibling's, is `kbf`'s.
+fn with_files(mut exec: FakeExec) -> FakeExec {
+    for (key, owner) in [
+        ("reapi.key", KBF_SERVER),
+        ("worker.key", KBF_SERVER),
+        ("node.key", KBF),
+    ] {
+        put(&mut exec, &format!("/etc/kbf/{key}"), 0o600, owner, "key");
     }
     for cert in ["reapi.pem", "worker.pem", "ca.pem", "node.pem"] {
         put(&mut exec, &format!("/etc/kbf/{cert}"), 0o644, ROOT, "cert");
@@ -91,59 +107,59 @@ pub(super) fn all_in_one() -> Raw {
     }
 }
 
-fn service_of(mode: Mode) -> Owner {
-    if mode == Mode::Frontend {
-        KBF_SERVER
-    } else {
-        KBF
-    }
-}
-
-pub(super) fn host_for(raw: &Raw) -> FakeExec {
-    released(with_files(host(), service_of(raw.mode)), Platform::Linux)
+/// A host with a release and the files the flags of every mode name; each key belongs to the
+/// user that reads it, whatever the mode.
+pub(super) fn host_for(_: &Raw) -> FakeExec {
+    released(with_files(host()), Platform::Linux)
 }
 
 /// Catches a flag that is not written, written under the wrong key or table, or a mode that
 /// gets another mode's file: the whole `kbf.toml` of each of the five modes, byte for byte.
-/// The frontend and all-in-one files are complete (they start with these keys and the mode's
-/// own defaults), and the node modes' are complete without listeners or certificates, which
-/// enrollment supplies.
+/// The frontend file is complete (it starts with these keys and the mode's own defaults), the
+/// node modes' are complete without listeners or certificates, which enrollment supplies, and
+/// an all-in-one host's `kbf.toml` is the sibling's: a `storage-and-daemon` node on loopback.
+/// Each is root's, 0640, with the group of the user that reads it.
 #[test]
 fn each_mode_gets_its_complete_kbf_toml() {
     let cases = [
-        (frontend(), FRONTEND_GOLDEN),
-        (all_in_one(), ALL_IN_ONE_GOLDEN),
-        (raw(Mode::Daemon), DAEMON_GOLDEN),
-        (raw(Mode::Storage), STORAGE_GOLDEN),
-        (raw(Mode::StorageAndDaemon), STORAGE_AND_DAEMON_GOLDEN),
+        (frontend(), FRONTEND_GOLDEN, KBF_SERVER.gid),
+        (all_in_one(), AIO_SIBLING_GOLDEN, KBF.gid),
+        (raw(Mode::Daemon), DAEMON_GOLDEN, KBF.gid),
+        (raw(Mode::Storage), STORAGE_GOLDEN, KBF_SERVER.gid),
+        (
+            raw(Mode::StorageAndDaemon),
+            STORAGE_AND_DAEMON_GOLDEN,
+            KBF.gid,
+        ),
     ];
-    for (raw, golden) in cases {
+    for (raw, golden, group) in cases {
         let mut exec = host_for(&raw);
         go_ok(&FakeOs::linux(), &mut exec, &raw);
         assert_eq!(text(&exec, KBF_TOML), golden, "{:?}", raw.mode);
         let (mode, owner) = file_meta(&exec, KBF_TOML);
         assert_eq!(mode, 0o640, "{:?}", raw.mode);
-        assert_eq!(owner.uid, 0);
+        assert_eq!((owner.uid, owner.gid), (0, group), "{:?}", raw.mode);
     }
 }
 
-/// Catches the operator API address left out: with no `--api-listen` a serving host still
-/// gets `kbf`'s documented default, since the token file `setup` writes requires a listener.
+/// Catches the operator API address left out of a frontend: with no `--api-listen` it still gets
+/// `kbf`'s documented default, since the token file `setup` writes requires a listener. An
+/// all-in-one host has none in either of its files: the proxy gives its children the address on
+/// their command line, and the sibling has no operator API.
 #[test]
 fn the_api_listener_has_its_documented_default() {
-    for mode in [Mode::Frontend, Mode::AllInOne] {
-        let mut raw = if mode == Mode::Frontend {
-            frontend()
-        } else {
-            all_in_one()
-        };
-        raw.kbf.api_listen = None;
-        let mut exec = host_for(&raw);
-        go_ok(&FakeOs::linux(), &mut exec, &raw);
-        assert!(
-            text(&exec, KBF_TOML).contains("api-listen = \"127.0.0.1:8982\""),
-            "{mode:?}"
-        );
+    let mut raw = frontend();
+    raw.kbf.api_listen = None;
+    let mut exec = host_for(&raw);
+    go_ok(&FakeOs::linux(), &mut exec, &raw);
+    let file = text(&exec, KBF_TOML);
+    assert!(file.contains("api-listen = \"127.0.0.1:8982\""), "{file}");
+
+    let raw = all_in_one();
+    let mut exec = host_for(&raw);
+    go_ok(&FakeOs::linux(), &mut exec, &raw);
+    for file in [KBF_TOML, AIO_FRONTEND_TOML] {
+        assert!(!text(&exec, file).contains("api-listen"), "{file}");
     }
 }
 
@@ -197,7 +213,6 @@ fn strangers(ours: &str, kbf: &str) -> Vec<String> {
 fn the_keys_are_kbf_s_flags_in_kbf_s_tables_for_the_modes_that_write_them() {
     let modes = [
         (Mode::Frontend, KBF_FRONTEND, FRONTEND_GOLDEN),
-        (Mode::AllInOne, KBF_ALL_IN_ONE, ALL_IN_ONE_GOLDEN),
         (Mode::Storage, KBF_STORAGE, STORAGE_GOLDEN),
         (Mode::Daemon, KBF_DAEMON, DAEMON_GOLDEN),
         (
@@ -221,6 +236,26 @@ fn the_keys_are_kbf_s_flags_in_kbf_s_tables_for_the_modes_that_write_them() {
         Vec::<(&str, &str)>::new(),
         "a node's listeners and certificates come from enrollment"
     );
+
+    // An all-in-one host has two files: the sibling's is a `storage-and-daemon` node's and the
+    // children's a frontend's. The `[tls]` rows it takes are the proxy's, and `setup` moves them
+    // into `installer.toml`; every other row is the sibling's.
+    let sibling = keys_of(KBF_STORAGE_AND_DAEMON);
+    let rows = kbf_settings::written(Mode::AllInOne);
+    assert_eq!(rows.len(), 11, "{rows:?}");
+    for (table, key) in rows.into_iter().filter(|row| row.0 != "tls") {
+        assert!(
+            sibling.contains(&(table.to_owned(), key.to_owned())),
+            "the sibling's kbf has no [{table}] {key}"
+        );
+    }
+    let all_keys = [
+        (AIO_SIBLING_GOLDEN, KBF_STORAGE_AND_DAEMON),
+        (AIO_FRONTEND_GOLDEN, KBF_FRONTEND),
+    ];
+    for (ours, kbf) in all_keys {
+        assert_eq!(strangers(ours, kbf), Vec::<String>::new());
+    }
 }
 
 /// Catches the guard above passing for everything: a file with a renamed key, a key moved to
@@ -299,7 +334,7 @@ fn with_operator_key(golden: &str) -> String {
 fn a_file_with_the_operators_settings_is_kept_when_the_new_keys_match_and_refused_when_not() {
     let flags = [
         (frontend(), FRONTEND_GOLDEN),
-        (all_in_one(), ALL_IN_ONE_GOLDEN),
+        (all_in_one(), AIO_SIBLING_GOLDEN),
     ];
     for (raw, golden) in flags {
         let theirs = with_operator_key(golden);
@@ -344,16 +379,16 @@ fn a_file_with_the_operators_settings_is_kept_when_the_new_keys_match_and_refuse
         ),
         (
             Mode::AllInOne,
-            "api-listen = \"127.0.0.1:8982\"",
-            "api-listen = \"127.0.0.1:9\"",
-            "[listener] api-listen",
+            "storage-listen = \"127.0.0.1:8990\"",
+            "storage-listen = \"127.0.0.1:9\"",
+            "[listener] storage-listen",
         ),
     ];
     for (mode, from, to, key) in differing {
         let (raw, golden) = if mode == Mode::Frontend {
             (frontend(), FRONTEND_GOLDEN)
         } else {
-            (all_in_one(), ALL_IN_ONE_GOLDEN)
+            (all_in_one(), AIO_SIBLING_GOLDEN)
         };
         let theirs = with_operator_key(golden).replace(from, to);
         assert_ne!(
@@ -509,17 +544,22 @@ fn a_file_that_is_not_what_its_kind_needs_is_refused_before_anything_is_written(
     );
 }
 
-/// Catches a key readable by its service user's group or a key owned by the wrong user on an
-/// all-in-one host, which runs as `kbf`, not `kbf-server`: the owner a key needs is the
-/// mode's service user.
+/// Catches a key owned by the wrong user on an all-in-one host, which has two accounts: the
+/// proxy's key is read by `kbf-server` and the daemon half's by the sibling, which runs as `kbf`.
+/// With the two owners swapped both keys are refused, naming their flags; with the right ones the
+/// host is set up.
+///
+/// Mutants to plant: the proxy's files checked against the sibling's user (the service); the
+/// daemon half's against the proxy's.
 #[test]
-fn a_key_must_belong_to_the_user_the_modes_unit_runs_as() {
+fn a_key_must_belong_to_the_user_that_reads_it() {
     let raw = all_in_one();
-    let mut exec = released(with_files(host(), KBF_SERVER), Platform::Linux);
+    let mut exec = host_for(&raw);
+    put(&mut exec, "/etc/kbf/reapi.key", 0o600, KBF, "key");
     put(&mut exec, "/etc/kbf/node.key", 0o600, KBF_SERVER, "key");
     let err = go(&FakeOs::linux(), &mut exec, &raw, APPLY).expect_err("refused");
     let shown = err.to_string();
-    for flag in ["--reapi-tls-key", "--worker-tls-key", "--daemon-key"] {
+    for flag in ["--reapi-tls-key", "--daemon-key"] {
         assert!(shown.contains(flag), "{flag}: {shown}");
     }
     let mut exec = host_for(&raw);

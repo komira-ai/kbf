@@ -231,7 +231,8 @@ pub fn resolve(
     let (Some(api), Some(token_file)) = (api, token_file) else {
         return Err(SetupError::Invalid(problems));
     };
-    let service = ctx.service.as_ref().map(|u| u.uid);
+    // The operator token is the proxy's: on an all-in-one host its owner is not the sibling's.
+    let service = ctx.frontend_uid();
     let mut refused = Vec::new();
     refused.extend(check_file(
         exec,
