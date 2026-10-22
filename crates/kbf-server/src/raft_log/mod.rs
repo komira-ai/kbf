@@ -407,7 +407,7 @@ where
 
     /// Raises the log's machine version to `to` by committing a `MachineVersion`
     /// entry, unless the log is there already (a version is never lowered). Every
-    /// entry after it is encoded and decoded in `to`'s format: raising to
+    /// entry after it is encoded in `to`'s format: raising to
     /// [`MachineVersion::V2`] lets the write tier's commands commit
     /// (docs/design/metadata-snapshots.md, section 4). It is one-way: a binary that
     /// runs only an earlier version refuses the log from then on.
@@ -686,8 +686,8 @@ where
     ///
     /// The format is read under the host's lock, which a raise also commits under, so
     /// no raise falls between encoding a batch and committing it, and a batch holds no
-    /// `MachineVersion` entry: every entry in it is decoded in the format it was
-    /// encoded in.
+    /// `MachineVersion` entry: every entry in it is encoded in the format read
+    /// above.
     fn commit_batch(&self, commands: Vec<Command>) -> Vec<Answer> {
         let mut host = self.lock();
         let format = host.machine().format();
