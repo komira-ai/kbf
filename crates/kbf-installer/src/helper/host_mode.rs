@@ -46,26 +46,34 @@ fn first_unit(
 
 /// The top-level `mode` of the host's `kbf.toml`; why not when there is none.
 fn read_mode(layout: &Layout) -> Result<String, String> {
+    let table = read_table(layout)?.ok_or_else(|| format!("{} is not there", layout.kbf_toml()))?;
+    match table.get("mode").and_then(toml::Value::as_str) {
+        Some(mode) => Ok(mode.to_owned()),
+        None => Err(format!("{} has no mode", layout.kbf_toml())),
+    }
+}
+
+/// The host's `kbf.toml` as a table; `None` when the file is not there, why not when it
+/// cannot be read, is too big, or is not TOML.
+pub(crate) fn read_table(layout: &Layout) -> Result<Option<toml::Table>, String> {
     let path = layout.join(&layout.kbf_toml());
     let shown = layout.kbf_toml();
     let mut bytes = Vec::new();
-    std::fs::File::open(&path)
+    match std::fs::File::open(&path)
         .and_then(|file| file.take(MAX_BYTES + 1).read_to_end(&mut bytes))
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => format!("{shown} is not there"),
-            _ => format!("{shown} cannot be read: {e}"),
-        })?;
+    {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{shown} cannot be read: {e}")),
+    }
     if bytes.len() as u64 > MAX_BYTES {
         return Err(format!("{shown} is over {MAX_BYTES} bytes"));
     }
     let text = String::from_utf8(bytes).map_err(|_| format!("{shown} is not UTF-8 text"))?;
-    let table: toml::Table = text
+    let table = text
         .parse()
         .map_err(|e: toml::de::Error| format!("{shown} is not TOML: {}", e.message()))?;
-    match table.get("mode").and_then(toml::Value::as_str) {
-        Some(mode) => Ok(mode.to_owned()),
-        None => Err(format!("{shown} has no mode")),
-    }
+    Ok(Some(table))
 }
 
 #[cfg(test)]

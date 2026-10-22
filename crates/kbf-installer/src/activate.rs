@@ -28,6 +28,10 @@
 //!   wait hours between the two. With a start budget (Linux), a release that was
 //!   started that many times without a confirm is reverted before it starts again,
 //!   which catches a crash loop in seconds, with no timer.
+//!   Its first start is also where the metadata log is saved (see [`crate::meta_log`]): the
+//!   old process has stopped and the new one has not started. A log that cannot be saved
+//!   reverts the swap before the release starts. A start of a release whose swap was
+//!   reverted puts the log back first.
 //! - [`expire`]: with a deadline (the window has started), a swap not confirmed in time
 //!   is reverted. On macOS nothing runs before a start, so [`Arm::FromActivation`] starts
 //!   the window at the swap and this is the only trigger.
@@ -42,6 +46,7 @@ use kbf_host::plan::{Mode, Planner, RunAs, execute};
 
 use crate::CommitId;
 use crate::layout::{self, Layout};
+use crate::meta_log;
 use crate::release::{ReleaseError, has_binary};
 use crate::state::{Locked, PendingConfirm, State};
 
@@ -464,10 +469,31 @@ pub fn boot_check<E: Exec>(
     let window_secs = window(window_secs)?;
     let (lock, state) = open(host)?;
     let Some(p) = state.pending_confirm.clone() else {
+        restore_log(host, state.current.as_ref(), out)?;
         return Ok(Boot::Nothing);
     };
     if p.starts_left == Some(0) || p.deadline_wall.is_some_and(|d| now >= d) {
-        return Ok(Boot::Reverted(revert_in(exec, host, &lock, state, out)?));
+        let reverted = revert_in(exec, host, &lock, state, out)?;
+        restore_log(host, Some(&reverted.to), out)?;
+        return Ok(Boot::Reverted(reverted));
+    }
+    // The first start of the release on trial is where its older release's metadata log is
+    // saved: the old process is gone and the new one has not started, so nothing writes it. A
+    // log that cannot be saved is a release that does not start (nothing is lost yet).
+    if p.deadline_wall.is_none()
+        && let Err(why) = save_log(host, &p)
+    {
+        let _ = writeln!(out, "metadata log: {why}");
+        let _ = meta_log::note_refusal(
+            host,
+            &format!(
+                "activation of {} refused: its first start would need a copy of the metadata \
+                 log, and it cannot be made: {why}",
+                &p.commit.as_str()[..12]
+            ),
+        );
+        let reverted = revert_in(exec, host, &lock, state, out)?;
+        return Ok(Boot::Reverted(reverted));
     }
     let starts_left = p.starts_left.map(|n| n - 1);
     lock.write(&State {
@@ -479,6 +505,35 @@ pub fn boot_check<E: Exec>(
         ..state
     })?;
     Ok(Boot::Start { starts_left })
+}
+
+/// Save the metadata log of the release that ran before the one on trial. A swap with no
+/// release before it has nothing to go back to.
+fn save_log(host: &Layout, p: &PendingConfirm) -> Result<(), meta_log::MetaLogError> {
+    match &p.previous {
+        Some(older) => meta_log::save(host, older, &p.commit).map(|_| ()),
+        None => Ok(()),
+    }
+}
+
+/// Put the log back if `current` holds a copy of it, before `current` starts.
+fn restore_log(
+    host: &Layout,
+    current: Option<&CommitId>,
+    out: &mut dyn Write,
+) -> Result<(), ReleaseError> {
+    let Some(current) = current else {
+        return Ok(());
+    };
+    if let meta_log::Restored::Put { from } = meta_log::restore_owed(host, current)? {
+        let _ = writeln!(
+            out,
+            "metadata log: put back as {} left it ({} had started on it)",
+            &current.as_str()[..12],
+            &from.as_str()[..12],
+        );
+    }
+    Ok(())
 }
 
 /// Revert a swap whose window has run out without a confirm.
