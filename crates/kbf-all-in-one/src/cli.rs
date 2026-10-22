@@ -88,7 +88,10 @@ pub fn parse(matches: &ArgMatches) -> Result<Flags, clap::Error> {
 /// honoured here (the cache waits on it) and so is not.
 fn refuse_ram_ack(matches: &ArgMatches) -> Result<(), clap::Error> {
     let given = |id: &str| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine);
-    let flag = if matches.get_one::<u64>("ram_ack_bytes").is_some_and(|b| *b > 0) {
+    let flag = if matches
+        .get_one::<u64>("ram_ack_bytes")
+        .is_some_and(|b| *b > 0)
+    {
         "--ram-ack-bytes"
     } else if given("ram_drain_deadline") {
         "--ram-drain-deadline"
