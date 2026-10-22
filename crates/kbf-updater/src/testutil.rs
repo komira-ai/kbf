@@ -219,3 +219,94 @@ pub(crate) fn closed_port() -> SocketAddr {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
     l.local_addr().expect("addr")
 }
+
+/// A CA and a certificate and key for `name` signed by it, as PEM: `(ca, cert, key)`.
+pub(crate) fn pki(name: &str) -> (String, String, String) {
+    use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+    let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
+    let key = KeyPair::generate().expect("key");
+    let cert = CertificateParams::new(vec![name.to_owned()])
+        .expect("params")
+        .signed_by(&key, &ca)
+        .expect("sign");
+    (ca.pem(), cert.pem(), key.serialize_pem())
+}
+
+/// A fake kbf-proxy: HTTP/1.1 over TLS on loopback, under a certificate for `name` from a
+/// fresh CA. Each connection gets the answer `answer(n, head)` returns, having read its
+/// request head (`None`: never answer). The connection is then closed with the TLS goodbye if
+/// `graceful`, and without it if not.
+pub(crate) struct FakeProxy {
+    pub addr: SocketAddr,
+    /// The CA that vouches for the certificate, PEM.
+    pub ca: String,
+    pub seen: Arc<Mutex<Vec<String>>>,
+}
+
+pub(crate) fn fake_proxy(
+    name: &str,
+    graceful: bool,
+    answer: impl Fn(usize, &str) -> Option<Vec<u8>> + Send + 'static,
+) -> FakeProxy {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::{ServerConfig, ServerConnection, StreamOwned};
+
+    let (ca, cert, key) = pki(name);
+    let certs = CertificateDer::pem_slice_iter(cert.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("certificate");
+    let key = PrivateKeyDer::from_pem_slice(key.as_bytes()).expect("key");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = Arc::new(
+        ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("server certificate"),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for (n, tcp) in listener.incoming().flatten().enumerate() {
+            let conn = ServerConnection::new(Arc::clone(&config)).expect("connection");
+            let mut tls = StreamOwned::new(conn, tcp);
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            // A client that gives up in the handshake ends the read: nothing to answer.
+            while !head.ends_with(b"\r\n\r\n") && tls.read(&mut byte).is_ok_and(|got| got == 1) {
+                head.push(byte[0]);
+            }
+            if !head.ends_with(b"\r\n\r\n") {
+                continue;
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let reply = answer(n, &head);
+            locked(&log).push(head);
+            match reply {
+                Some(bytes) => {
+                    let _ = tls.write_all(&bytes);
+                    let _ = tls.flush();
+                    if graceful {
+                        tls.conn.send_close_notify();
+                        let _ = tls.flush();
+                    }
+                }
+                None => held.push(tls),
+            }
+        }
+    });
+    FakeProxy { addr, ca, seen }
+}
+
+impl FakeProxy {
+    pub fn requests(&self) -> Vec<String> {
+        locked(&self.seen).clone()
+    }
+}

@@ -15,6 +15,7 @@ use crate::daemon::{Config, Daemon, Stopper, start_with};
 use crate::fakes::{
     Event, FakeClock, FakeHealth, FakeInstaller, FakeSafeToStop, Log, unsafe_because,
 };
+use crate::https::ProxyTls;
 use crate::listener::{Listen, bind_socket};
 use crate::server::{Recent, Server, Settings, peer_allowed};
 use crate::testutil::{
@@ -40,6 +41,11 @@ fn prepare(name: &str, proxy_uid: u32) -> Config {
         operator_api: "127.0.0.1:1".parse().expect("addr"),
         token_file: dir.join("unused"),
         operator_proxy_auth_file: None,
+        proxy: ProxyTls {
+            addr: "127.0.0.1:1".parse().expect("addr"),
+            ca_file: dir.join("unused"),
+            server_name: None,
+        },
     }
 }
 

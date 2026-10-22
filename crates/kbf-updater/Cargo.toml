@@ -11,15 +11,21 @@ publish.workspace = true
 # time, behind kbf-proxy's local socket. This crate is the core: the API model, the host
 # inventory, the roll state machine over ports (safe-to-stop, install, health, clock) and
 # the durable roll record. On top of it: the API on a unix socket (`server`), the safe-to-stop
-# adapter (an HTTP client of the frontend's loopback operator API) and the binary's wiring
-# (`daemon`). Synchronous on purpose, threads and blocking sockets, no async runtime: HTTP is
-# read with httparse, which the workspace already uses for its loopback calls.
+# and health adapters (HTTP clients of the frontend's loopback operator API and, over rustls, of
+# kbf-proxy's public port) and the binary's wiring (`daemon`). Synchronous on purpose, threads
+# and blocking sockets, no async runtime: HTTP is read with httparse, which the workspace
+# already uses for its loopback calls, and TLS is rustls over a std socket (as kbf-installer's
+# deploy client).
 [dependencies]
 httparse.workspace = true
 libc.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
 
 [lints]
 workspace = true

@@ -33,11 +33,11 @@ fn version_goes_to_stdout_with_zero_and_usage_to_stderr_with_two() {
 
 /// Catches a binary that starts without a root-owned inventory it can read, or one that
 /// takes a non-loopback operator API: a missing inventory is exit 1 with the reason on
-/// stderr and nothing on stdout; a non-loopback API is a usage error before anything opens.
+/// stderr and nothing on stdout; a non-loopback operator API or proxy address is a usage error before anything opens.
 #[test]
 fn a_bad_start_exits_nonzero_with_the_reason_on_stderr() {
     let dir = std::env::temp_dir();
-    let flags = |api: &str| {
+    let flags_with = |api: &str, proxy: &str| {
         vec![
             "--state-dir".to_owned(),
             dir.display().to_string(),
@@ -51,11 +51,25 @@ fn a_bad_start_exits_nonzero_with_the_reason_on_stderr() {
             api.to_owned(),
             "--token-file".to_owned(),
             "/nonexistent/token".to_owned(),
+            "--proxy-api".to_owned(),
+            proxy.to_owned(),
+            "--proxy-ca-file".to_owned(),
+            "/nonexistent/ca.pem".to_owned(),
         ]
     };
+    let flags = |api: &str| flags_with(api, "https://127.0.0.1:8443");
     let (code, out, err) = run(&flags("http://192.0.2.7:8080"));
     assert_eq!((code, out.as_str()), (Some(2), ""));
     assert!(err.contains("loopback"), "{err}");
+    let (code, out, err) = run(&flags_with(
+        "http://127.0.0.1:8080",
+        "https://192.0.2.7:8443",
+    ));
+    assert_eq!((code, out.as_str()), (Some(2), ""));
+    assert!(
+        err.contains("--proxy-api must be a loopback address"),
+        "{err}"
+    );
     let (code, out, err) = run(&flags("http://127.0.0.1:8080"));
     assert_eq!((code, out.as_str()), (Some(1), ""));
     assert!(err.starts_with("kbf-updater: --token-file: "), "{err}");

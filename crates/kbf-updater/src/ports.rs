@@ -1,6 +1,6 @@
-//! The ports of the roll: everything the state machine asks of the outside world. A real
-//! adapter is a later change (an HTTP client for safe-to-stop and health, ssh for the
-//! installer); [`crate::fakes`] has one scripted fake per port.
+//! The ports of the roll: everything the state machine asks of the outside world. The real
+//! adapters are [`crate::safe_http`] (safe-to-stop) and [`crate::health`] (health); the ssh
+//! installer is a later change. [`crate::fakes`] has one scripted fake per port.
 //!
 //! The traits are synchronous: a roll is one host at a time and waits on each answer, so
 //! there is nothing to overlap, and a caller runs [`crate::Updater::drive`] on its own thread.
@@ -102,6 +102,10 @@ pub enum Installed {
     Version(String),
     /// An install is running now (the package lock is held).
     InProgress,
+    /// The package is not installed: the query's `installed_version` is `null`. A fresh host.
+    /// There is nothing to be older than, so the roll installs on it like on any other that
+    /// is not at the target.
+    NotInstalled,
 }
 
 /// The host-side install (the forced-command wrapper over ssh, later).
@@ -128,6 +132,10 @@ pub enum Health {
 
 /// The health of a host, by its role (frontend or node).
 pub trait HealthCheck: Send + Sync {
+    /// The roll is about to call the installer for `host` (each attempt). An adapter that
+    /// must tell what happened after the install from what was there before notes the time.
+    fn installing(&self, host: &Host);
+
     fn check(&self, host: &Host, target: &Version) -> Result<Health, PortError>;
 }
 

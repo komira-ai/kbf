@@ -2580,6 +2580,8 @@ version = "0.1.0"
 dependencies = [
  "httparse",
  "libc",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror",

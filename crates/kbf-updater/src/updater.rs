@@ -544,6 +544,7 @@ impl Updater {
     }
 
     fn install(&self, host: &Host, target: &Version) -> Result<(), InstallError> {
+        self.ports.health.installing(host);
         match self.ports.installer.install(host, target) {
             Ok(()) => Ok(()),
             Err(e) if e.is_unreachable() => Err(InstallError::Unreachable),
@@ -563,30 +564,22 @@ impl Updater {
         let mut last_answer = start;
         loop {
             match self.ports.installer.query(host) {
+                Ok(Installed::Version(v)) if v == target.as_str() => {
+                    self.mark(idx, Phase::WaitingHealthy, false)?;
+                    return Ok(());
+                }
+                // Not the target: the install did not run or did not finish. One more
+                // (section 13(e): rerun once); a host that is still not there after that is
+                // for an operator.
                 Ok(Installed::Version(v)) => {
-                    if v == target.as_str() {
-                        self.mark(idx, Phase::WaitingHealthy, false)?;
+                    if self.reinstall(idx, host, target, &format!("runs {v}"))? {
                         return Ok(());
                     }
-                    // Not the target: the install did not run or did not finish. One more
-                    // (section 13(e): rerun once); a host that is still not there after
-                    // that is for an operator.
-                    let attempts = self.snapshot()?.roll.hosts[idx].attempts;
-                    if attempts >= MAX_INSTALLS {
-                        return Err(Halt::Interrupt(format!(
-                            "{} runs {v} and not {} after {attempts} install attempts",
-                            host.alias,
-                            target.as_str()
-                        )));
-                    }
-                    self.mark(idx, Phase::Installing, true)?;
-                    match self.install(host, target) {
-                        Ok(()) => {
-                            self.mark(idx, Phase::WaitingHealthy, false)?;
-                            return Ok(());
-                        }
-                        Err(InstallError::Unreachable) => {}
-                        Err(InstallError::Halt(h)) => return Err(h),
+                }
+                // A fresh host: nothing is older than the target, so it is installed.
+                Ok(Installed::NotInstalled) => {
+                    if self.reinstall(idx, host, target, "has no kbf installed")? {
+                        return Ok(());
                     }
                 }
                 Ok(Installed::InProgress) => {
@@ -610,6 +603,35 @@ impl Updater {
                 }
             }
             self.ports.clock.sleep(self.timing.poll);
+        }
+    }
+
+    /// One more install of a host that is not at the target, if the cap allows. `Ok(true)`:
+    /// it ran and the host is `waiting_healthy`; `Ok(false)`: it got no answer, so the caller
+    /// asks again. `state` says what the host was found as, for the interrupt text.
+    fn reinstall(
+        &self,
+        idx: usize,
+        host: &Host,
+        target: &Version,
+        state: &str,
+    ) -> Result<bool, Halt> {
+        let attempts = self.snapshot()?.roll.hosts[idx].attempts;
+        if attempts >= MAX_INSTALLS {
+            return Err(Halt::Interrupt(format!(
+                "{} {state} and not {} after {attempts} install attempts",
+                host.alias,
+                target.as_str()
+            )));
+        }
+        self.mark(idx, Phase::Installing, true)?;
+        match self.install(host, target) {
+            Ok(()) => {
+                self.mark(idx, Phase::WaitingHealthy, false)?;
+                Ok(true)
+            }
+            Err(InstallError::Unreachable) => Ok(false),
+            Err(InstallError::Halt(h)) => Err(h),
         }
     }
 

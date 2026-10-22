@@ -6,12 +6,20 @@
 //! - `--inventory`: the root-owned host file;
 //! - `--proxy-uid`: the one uid whose connections are served;
 //! - `--operator-api`: `http://<loopback ip>:<port>`, the frontend's operator API, for
-//!   safe-to-stop; a host that is not a loopback address is refused;
-//! - `--token-file`: the file holding the operator bearer token.
+//!   safe-to-stop and the health of storage and daemon hosts; a host that is not a loopback
+//!   address is refused;
+//! - `--token-file`: the file holding the operator bearer token (the proxy takes the same
+//!   token on its swap status);
+//! - `--proxy-api`: `https://<loopback ip>:<port>`, kbf-proxy's public port on this host,
+//!   which serves `GET /v1/proxy/swap` for the health of the frontend; the swap status is
+//!   not on the operator API, because the proxy answers it itself;
+//! - `--proxy-ca-file`: the PEM file of the farm CA that vouches for the proxy's certificate.
 //!
 //! Optional: `--operator-proxy-auth-file`, the file holding the proxy's per-boot secret,
 //! for a frontend that runs behind kbf-proxy (`--proxy-auth-file` there): its operator API
-//! refuses a call without it. It is read on every call, like the token.
+//! refuses a call without it. It is read on every call, like the token. And
+//! `--proxy-server-name`, the DNS name the proxy's certificate carries (the IP of
+//! `--proxy-api` when absent).
 //!
 //! And the socket, one of two (never both):
 //!
@@ -21,8 +29,8 @@
 //! - **tests and development**: `--socket`, a path the updater binds itself, mode 0600, its
 //!   own user.
 //!
-//! This build has no host installer and no health check ([`crate::not_built`]): a roll is
-//! accepted and fails at the first install, with no host touched.
+//! This build has no host installer ([`crate::not_built`]): a roll is accepted and fails at
+//! the first install, with no host touched. The health checks are real ([`crate::health`]).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -36,9 +44,13 @@ use std::thread::JoinHandle;
 use serde_json::json;
 
 use crate::api::RollState;
+use crate::frontend_health::FrontendHealth;
+use crate::health::HostHealth;
+use crate::https::{ProxyApi, ProxyTls};
 use crate::inventory::Inventory;
 use crate::listener::{Activation, Listen, open};
-use crate::not_built::{NotBuiltHealth, NotBuiltInstaller};
+use crate::node_health::NodeHealth;
+use crate::not_built::NotBuiltInstaller;
 use crate::ports::SystemClock;
 use crate::record::RollStore;
 use crate::safe_http::HttpSafeToStop;
@@ -47,11 +59,12 @@ use crate::{Ports, Timing, Updater};
 
 pub const USAGE: &str = "usage: kbf-updater --version\n       kbf-updater --state-dir DIR \
 --inventory FILE --proxy-uid UID --operator-api http://IP:PORT --token-file FILE \
-[--operator-proxy-auth-file FILE] [--socket PATH]\n\
+--proxy-api https://IP:PORT --proxy-ca-file FILE [--operator-proxy-auth-file FILE] \
+[--proxy-server-name NAME] [--socket PATH]\n\
 the socket comes from systemd socket activation (LISTEN_PID, LISTEN_FDS=1) or from --socket, \
 which is for tests and development\n";
 
-const FLAGS: [&str; 7] = [
+const FLAGS: [&str; 10] = [
     "--state-dir",
     "--inventory",
     "--socket",
@@ -59,6 +72,9 @@ const FLAGS: [&str; 7] = [
     "--operator-api",
     "--token-file",
     "--operator-proxy-auth-file",
+    "--proxy-api",
+    "--proxy-ca-file",
+    "--proxy-server-name",
 ];
 
 /// The settings of a run.
@@ -74,11 +90,13 @@ pub struct Config {
     pub token_file: PathBuf,
     /// The proxy's per-boot secret, if the frontend is behind kbf-proxy.
     pub operator_proxy_auth_file: Option<PathBuf>,
+    /// Where kbf-proxy is and how to trust it, for the frontend's health.
+    pub proxy: ProxyTls,
 }
 
 /// The settings from the command line (without the program name) and from what the service
 /// manager passed. Each flag is given once, as `--flag value` or `--flag=value`; all but
-/// `--socket` and `--operator-proxy-auth-file` are required, and the socket is either
+/// `--socket`, `--operator-proxy-auth-file` and `--proxy-server-name` are required, and the socket is either
 /// `--socket` or the activated descriptor.
 pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, String> {
     let mut found: BTreeMap<&str, String> = BTreeMap::new();
@@ -114,6 +132,9 @@ pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, S
         .map_err(|_| "--proxy-uid must be a number".to_owned())?;
     let operator_api = parse_operator_url(&take("--operator-api")?)?;
     let token_file = PathBuf::from(take("--token-file")?);
+    let proxy_addr = parse_proxy_url(&take("--proxy-api")?)?;
+    let proxy_ca_file = PathBuf::from(take("--proxy-ca-file")?);
+    let proxy_server_name = found.remove("--proxy-server-name");
     let operator_proxy_auth_file = found
         .remove("--operator-proxy-auth-file")
         .map(PathBuf::from);
@@ -144,21 +165,41 @@ pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, S
         operator_api,
         token_file,
         operator_proxy_auth_file,
+        proxy: ProxyTls {
+            addr: proxy_addr,
+            ca_file: proxy_ca_file,
+            server_name: proxy_server_name,
+        },
     })
 }
 
 /// `http://<ip>:<port>` with a loopback ip. The operator token goes over this connection in
 /// clear, so any other host, a name, or `https` is refused.
 pub fn parse_operator_url(url: &str) -> Result<SocketAddr, String> {
-    let rest = url.strip_prefix("http://").ok_or(
-        "--operator-api must start with http:// (the token travels in clear, on loopback)",
-    )?;
+    loopback(
+        url,
+        "http://",
+        "--operator-api",
+        " (the token travels in clear, on loopback)",
+    )
+}
+
+/// `https://<ip>:<port>` with a loopback ip: kbf-proxy's public port on this host. The
+/// updater runs beside the proxy, and a config naming another host is a mistake to stop.
+pub fn parse_proxy_url(url: &str) -> Result<SocketAddr, String> {
+    loopback(url, "https://", "--proxy-api", "")
+}
+
+fn loopback(url: &str, scheme: &str, flag: &str, why: &str) -> Result<SocketAddr, String> {
+    let rest = url
+        .strip_prefix(scheme)
+        .ok_or_else(|| format!("{flag} must start with {scheme}{why}"))?;
     let addr: SocketAddr = rest
         .trim_end_matches('/')
         .parse()
-        .map_err(|_| "--operator-api must be http://<ip>:<port>, with an IP address".to_owned())?;
+        .map_err(|_| format!("{flag} must be {scheme}<ip>:<port>, with an IP address"))?;
     if !addr.ip().to_canonical().is_loopback() {
-        return Err("--operator-api must be a loopback address".to_owned());
+        return Err(format!("{flag} must be a loopback address"));
     }
     Ok(addr)
 }
@@ -210,9 +251,15 @@ pub fn stderr_sink() -> AuditSink {
     Arc::new(|line| eprintln!("{line}"))
 }
 
-/// The ports of this build: the real safe-to-stop and clock, and the refusing installer and
-/// health check.
+/// The ports of this build: the real safe-to-stop, health checks and clock, and the refusing
+/// installer.
 pub fn build_ports(cfg: &Config) -> Result<Ports, String> {
+    let proxy = ProxyApi::new(&cfg.proxy, cfg.token_file.clone()).map_err(|e| e.to_string())?;
+    let nodes = NodeHealth::new(
+        cfg.operator_api,
+        cfg.token_file.clone(),
+        cfg.operator_proxy_auth_file.clone(),
+    )?;
     Ok(Ports {
         safe: Box::new(HttpSafeToStop::new(
             cfg.operator_api,
@@ -220,7 +267,7 @@ pub fn build_ports(cfg: &Config) -> Result<Ports, String> {
             cfg.operator_proxy_auth_file.clone(),
         )?),
         installer: Box::new(NotBuiltInstaller),
-        health: Box::new(NotBuiltHealth),
+        health: Box::new(HostHealth::new(FrontendHealth::new(proxy), nodes)),
         clock: Box::new(SystemClock::new()),
     })
 }

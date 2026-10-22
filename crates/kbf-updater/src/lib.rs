@@ -15,23 +15,34 @@
 //!
 //! - [`server`] and [`http`]: the roll API on a unix socket behind kbf-proxy;
 //! - [`listener`]: where that socket comes from (systemd socket activation in production);
-//! - [`safe_http`]: the real safe-to-stop, a call to the frontend's loopback operator API;
-//! - [`not_built`]: the installer and health check this build does not have yet, which
-//!   refuse, so that a roll fails at its first step with no host touched;
+//! - [`operator`], [`https`], [`reply`] and [`secret`]: the clients of the frontend's
+//!   loopback operator API and of kbf-proxy's public port, and the token files they read;
+//! - [`safe_http`]: the real safe-to-stop, a call to the operator API;
+//! - [`health`]: the real health checks, [`frontend_health`] (kbf-proxy's swap status) and
+//!   [`node_health`] (the operator API's members and nodes);
+//! - [`not_built`]: the installer this build does not have yet, which refuses, so that a
+//!   roll fails at its first step with no host touched;
 //! - [`daemon`]: the flags and the wiring of all of it.
 //!
-//! The ssh installer and the health check come in later changes.
+//! The ssh installer comes in a later change.
 
 pub mod api;
 pub mod daemon;
 pub mod fakes;
+pub mod frontend_health;
+pub mod health;
 pub mod http;
+pub mod https;
 pub mod inventory;
 pub mod listener;
+pub mod node_health;
 pub mod not_built;
+pub mod operator;
 pub mod ports;
 pub mod record;
+pub mod reply;
 pub mod safe_http;
+pub mod secret;
 pub mod server;
 pub mod version;
 
@@ -42,7 +53,15 @@ pub use updater::{Ports, Started, Timing, Updater};
 #[cfg(test)]
 mod daemon_tests;
 #[cfg(test)]
+mod frontend_health_tests;
+#[cfg(test)]
+mod frontend_roll_tests;
+#[cfg(test)]
+mod https_tests;
+#[cfg(test)]
 mod listener_tests;
+#[cfg(test)]
+mod node_health_tests;
 #[cfg(test)]
 mod safe_http_tests;
 #[cfg(test)]
@@ -51,6 +70,8 @@ mod server_tests;
 mod testutil;
 #[cfg(test)]
 mod updater_followup_tests;
+#[cfg(test)]
+mod updater_fresh_host_tests;
 #[cfg(test)]
 mod updater_restart_tests;
 #[cfg(test)]

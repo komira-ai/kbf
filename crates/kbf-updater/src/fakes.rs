@@ -249,6 +249,9 @@ impl Installer for FakeInstaller {
 pub struct FakeHealth {
     log: Log,
     script: Arc<Script<Result<Health, PortError>>>,
+    /// The aliases the roll said it was about to install, in order (not in the [`Log`]: the
+    /// call sequences the roll tests pin do not change).
+    installing: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeHealth {
@@ -256,7 +259,13 @@ impl FakeHealth {
         FakeHealth {
             log: log.clone(),
             script: Arc::new(Script::new(Ok(Health::Healthy))),
+            installing: Arc::default(),
         }
+    }
+
+    /// The aliases the roll announced an install for, in order.
+    pub fn installing_calls(&self) -> Vec<String> {
+        lock(&self.installing).clone()
     }
 
     pub fn script(
@@ -270,6 +279,10 @@ impl FakeHealth {
 }
 
 impl HealthCheck for FakeHealth {
+    fn installing(&self, host: &Host) {
+        lock(&self.installing).push(host.alias.clone());
+    }
+
     fn check(&self, host: &Host, _target: &Version) -> Result<Health, PortError> {
         self.log.push(Event::Health(host.alias.clone()));
         self.script.next(&host.alias)

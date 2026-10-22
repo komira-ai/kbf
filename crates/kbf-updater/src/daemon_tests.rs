@@ -7,18 +7,20 @@ use serde_json::{Value, json};
 
 use crate::api::{ErrorCode, Roll, RollState};
 use crate::daemon::{
-    Config, build_ports, drive_loop, parse_flags, parse_operator_url, run_config, start,
-    stderr_sink,
+    Config, build_ports, drive_loop, parse_flags, parse_operator_url, parse_proxy_url, run_config,
+    start, stderr_sink,
 };
 use crate::fakes::{Event, FakeClock, FakeHealth, FakeInstaller, FakeSafeToStop, Log};
+use crate::https::ProxyTls;
 use crate::inventory::{Host, Role};
 use crate::listener::{Activation, Listen};
-use crate::not_built::{NOT_BUILT, NotBuiltHealth, NotBuiltInstaller};
-use crate::ports::{HealthCheck, Installer, PortErrorKind};
+use crate::not_built::{NOT_BUILT, NotBuiltInstaller};
+use crate::ports::{Installer, PortErrorKind};
 use crate::record::RollStore;
 use crate::server::Recent;
 use crate::testutil::{
-    FakeApi, KEY, Lines, TOKEN, call, eventually, fake_api, file, http, own_uid, scratch, sock,
+    FakeApi, KEY, Lines, TOKEN, call, closed_port, eventually, fake_api, file, http, own_uid, pki,
+    scratch, sock,
 };
 use crate::version::Version;
 use crate::{Ports, Timing, Updater, run_with};
@@ -27,7 +29,7 @@ fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| (*s).to_owned()).collect()
 }
 
-const FLAGS: [&str; 12] = [
+const FLAGS: [&str; 16] = [
     "--state-dir",
     "/s",
     "--inventory",
@@ -40,6 +42,10 @@ const FLAGS: [&str; 12] = [
     "http://127.0.0.1:8080",
     "--token-file",
     "/t",
+    "--proxy-api",
+    "https://127.0.0.1:8443",
+    "--proxy-ca-file",
+    "/ca.pem",
 ];
 
 fn parse(list: &[&str]) -> Result<Config, String> {
@@ -173,6 +179,68 @@ fn the_operator_proxy_auth_file_is_an_optional_flag() {
     );
 }
 
+/// Catches the proxy flags: the CA file is required; the server name is optional and read;
+/// and the proxy address must be `https://` and loopback (the token goes to it, and the
+/// updater runs beside it), both families and a mapped address taken, a name, `http`, no
+/// scheme, a missing port and a path refused.
+#[test]
+fn the_proxy_flags_are_read_and_the_address_must_be_loopback_https() {
+    let cfg = parse(&FLAGS).expect("flags");
+    assert_eq!(
+        (
+            cfg.proxy.addr.port(),
+            cfg.proxy.ca_file.to_str(),
+            cfg.proxy.server_name.as_deref()
+        ),
+        (8443, Some("/ca.pem"), None)
+    );
+    let named = [&FLAGS[..], &["--proxy-server-name", "proxy.farm.example"]].concat();
+    assert_eq!(
+        parse(&named).expect("named").proxy.server_name.as_deref(),
+        Some("proxy.farm.example")
+    );
+    for ok in [
+        "https://127.0.0.1:443",
+        "https://127.0.0.1:443/",
+        "https://[::1]:9",
+    ] {
+        assert!(parse_proxy_url(ok).is_ok(), "{ok}");
+    }
+    assert_eq!(
+        parse_proxy_url("https://[::ffff:127.0.0.1]:9").map(|a| a.port()),
+        Ok(9)
+    );
+    for (bad, why) in [
+        (
+            "https://192.0.2.5:443",
+            "--proxy-api must be a loopback address",
+        ),
+        ("https://localhost:443", "IP address"),
+        ("https://127.0.0.1", "IP address"),
+        ("https://127.0.0.1:443/v1", "IP address"),
+        (
+            "http://127.0.0.1:443",
+            "--proxy-api must start with https://",
+        ),
+        ("127.0.0.1:443", "--proxy-api must start with https://"),
+    ] {
+        let e = parse_proxy_url(bad).expect_err(bad);
+        assert!(e.contains(why), "{bad}: {e}");
+    }
+}
+
+/// Catches a start-up that goes on with a CA file that vouches for nothing: `build_ports`
+/// refuses it with the flag in the text.
+#[test]
+fn a_bad_proxy_ca_file_refuses_the_start() {
+    let api = fake_api(vec![Some(http(200, "{}"))]);
+    let mut cfg = config("bad-ca", "st1 st1.farm.example storage KEY\n", &api);
+    cfg.proxy.ca_file = file(&scratch("bad-ca2"), "ca.pem", "not a certificate\n", 0o644);
+    let e = build_ports(&cfg).err().expect("ca");
+    assert_eq!(e, "--proxy-ca-file: it holds no certificate");
+    assert!(start(&cfg).is_err());
+}
+
 /// Catches the operator token being sent anywhere but loopback in clear: a non-loopback IP, a
 /// name (no resolver is used), `https`, no scheme and a path or junk are refused; both
 /// loopback families are taken.
@@ -220,6 +288,11 @@ fn config(name: &str, inventory: &str, api: &FakeApi) -> Config {
         operator_api: api.addr,
         token_file: file(&dir, "token", TOKEN, 0o600),
         operator_proxy_auth_file: None,
+        proxy: ProxyTls {
+            addr: closed_port(),
+            ca_file: file(&dir, "ca.pem", &pki("proxy.example").0, 0o644),
+            server_name: Some("proxy.example".to_owned()),
+        },
     }
 }
 
@@ -320,9 +393,9 @@ fn a_node_is_checked_with_the_token_and_then_refused_by_the_installer() {
     daemon.wait();
 }
 
-/// Catches the refusing ports answering with anything but a refusal.
+/// Catches the refusing installer answering with anything but a refusal.
 #[test]
-fn the_not_built_ports_refuse_everything() {
+fn the_not_built_installer_refuses_everything() {
     let host = Host {
         alias: "st1".into(),
         address: "st1.farm.example".into(),
@@ -342,8 +415,6 @@ fn the_not_built_ports_refuse_everything() {
             .to_string(),
         NOT_BUILT
     );
-    let e = NotBuiltHealth.check(&host, &v).expect_err("health");
-    assert!(e.to_string().contains("no health check yet"));
 }
 
 /// Catches start-up that goes on over something wrong: an inventory that is not owned by the
@@ -481,6 +552,10 @@ fn the_process_entry_points() {
         "http://127.0.0.1:1",
         "--token-file",
         cfg.token_file.to_str().expect("utf8"),
+        "--proxy-api",
+        "https://127.0.0.1:1",
+        "--proxy-ca-file",
+        cfg.proxy.ca_file.to_str().expect("utf8"),
     ];
     let (code, out) = run_with(&args(&a), |_| panic!("not started"));
     assert_eq!(code, 1);
