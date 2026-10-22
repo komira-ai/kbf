@@ -592,7 +592,7 @@ async fn each_half_of_a_node_is_served_on_its_own_certificate() {
         ..pb::HeartbeatRequest::default()
     };
     membership
-        .heartbeat(beat)
+        .heartbeat(beat.clone())
         .await
         .expect("a storage certificate heartbeats");
 
@@ -982,7 +982,7 @@ async fn a_listed_storage_certificate_may_neither_register_nor_heartbeat() {
             boot: joined.boot,
             ..pb::HeartbeatRequest::default()
         };
-        client.heartbeat(beat).await.expect("beats");
+        client.heartbeat(beat.clone()).await.expect("beats");
         nodes.push((client, host, beat, cert.spki_sha256));
     }
 
@@ -1004,14 +1004,17 @@ async fn a_listed_storage_certificate_may_neither_register_nor_heartbeat() {
         assert_eq!(registered.code(), Code::PermissionDenied, "{host}");
         assert_eq!(registered.message(), matched);
         let beaten = client
-            .heartbeat(*beat)
+            .heartbeat(beat.clone())
             .await
             .expect_err("a listed certificate beats");
         assert_eq!(beaten.code(), Code::PermissionDenied, "{host}");
         assert_eq!(beaten.message(), matched);
     }
     let (client, host, beat, _) = &mut nodes[3];
-    client.heartbeat(*beat).await.expect("D is not listed");
+    client
+        .heartbeat(beat.clone())
+        .await
+        .expect("D is not listed");
     client
         .register(register_as(host.as_str(), host.as_str()))
         .await
@@ -1020,7 +1023,7 @@ async fn a_listed_storage_certificate_may_neither_register_nor_heartbeat() {
     write_list(&path, "");
     let (client, _, beat, _) = &mut nodes[0];
     client
-        .heartbeat(*beat)
+        .heartbeat(beat.clone())
         .await
         .expect("A is no longer listed");
 }
@@ -1051,7 +1054,7 @@ async fn an_unusable_deny_list_refuses_membership_calls_unavailable() {
 
     write_list(&path, "this is not an entry\n");
     let registered = node.register(registration()).await.expect_err("refused");
-    let beaten = node.heartbeat(beat).await.expect_err("refused");
+    let beaten = node.heartbeat(beat.clone()).await.expect_err("refused");
     for status in [registered, beaten] {
         assert_eq!(status.code(), Code::Unavailable);
         assert!(
