@@ -32,6 +32,7 @@ mod audit;
 mod config;
 mod debver;
 mod host;
+mod locks;
 mod outcome;
 mod plan;
 mod request;

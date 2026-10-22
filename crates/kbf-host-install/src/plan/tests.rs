@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use super::{
-    apt_install, apt_update, installed_version, running_build, unit_name, units_active, APT_GET,
-    DPKG_QUERY, KBF, SYSTEMCTL, SYSTEMD_RUN,
+    APT_GET, DPKG_QUERY, KBF, SYSTEMCTL, SYSTEMD_RUN, apt_install, apt_update, installed_version,
+    running_build, unit_name, units_active,
 };
 use crate::config::ChannelSource;
 use crate::request::Version;
@@ -111,10 +111,20 @@ fn the_query_commands() {
         installed_version(),
         Cmd {
             program: DPKG_QUERY.into(),
-            args: strings(&["--show", "--showformat=${db:Status-Abbrev} ${Version}\\n", "kbf"]),
+            args: strings(&[
+                "--show",
+                "--showformat=${db:Status-Abbrev} ${Version}\\n",
+                "kbf"
+            ]),
         }
     );
-    assert_eq!(running_build(), Cmd { program: KBF.into(), args: strings(&["--version", "--json"]) });
+    assert_eq!(
+        running_build(),
+        Cmd {
+            program: KBF.into(),
+            args: strings(&["--version", "--json"])
+        }
+    );
     assert_eq!(
         units_active(),
         Cmd {
@@ -129,12 +139,21 @@ fn the_query_commands() {
 #[test]
 fn unit_names_are_sanitized() {
     assert_eq!(unit_name(&version("1.2.3-1")), "kbf-host-install-1.2.3-1");
-    assert_eq!(unit_name(&version("1.0~rc1+b1")), "kbf-host-install-1.0_trc1_pb1");
+    assert_eq!(
+        unit_name(&version("1.0~rc1+b1")),
+        "kbf-host-install-1.0_trc1_pb1"
+    );
     assert_ne!(unit_name(&version("1.0~1")), unit_name(&version("1.0+1")));
-    for text in ["1.0~rc1+b1", "9", "1.2.3-1", &format!("1{}", "9".repeat(127))] {
+    for text in [
+        "1.0~rc1+b1",
+        "9",
+        "1.2.3-1",
+        &format!("1{}", "9".repeat(127)),
+    ] {
         let name = unit_name(&version(text));
         assert!(
-            name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b)),
+            name.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b)),
             "{name}"
         );
     }

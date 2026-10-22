@@ -38,8 +38,21 @@ impl Version {
     ///
     /// # Errors
     /// [`BadCommand`] when it is not in the grammar.
-    pub fn new(_text: &str) -> Result<Self, BadCommand> {
-        todo!()
+    pub fn new(text: &str) -> Result<Self, BadCommand> {
+        let (first, rest) = text.split_at_checked(1).ok_or(BadCommand)?;
+        let well_formed = text.len() <= MAX_VERSION_LEN
+            && first.starts_with(|c: char| c.is_ascii_digit())
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".+~-".contains(&b));
+        if !well_formed {
+            return Err(BadCommand);
+        }
+        let parsed = DebVersion::parse(text).map_err(|_| BadCommand)?;
+        Ok(Self {
+            text: text.to_owned(),
+            parsed,
+        })
     }
 
     /// The text, safe as an argument and as JSON.
@@ -62,8 +75,16 @@ impl Channel {
     ///
     /// # Errors
     /// [`BadCommand`] when it is not in the grammar.
-    pub fn new(_text: &str) -> Result<Self, BadCommand> {
-        todo!()
+    pub fn new(text: &str) -> Result<Self, BadCommand> {
+        let (first, rest) = text.split_at_checked(1).ok_or(BadCommand)?;
+        let lower_or_digit = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+        let well_formed = text.len() <= MAX_CHANNEL_LEN
+            && first.bytes().all(lower_or_digit)
+            && rest.bytes().all(|b| lower_or_digit(b) || b == b'-');
+        if !well_formed {
+            return Err(BadCommand);
+        }
+        Ok(Self(text.to_owned()))
     }
 
     /// The name.
@@ -86,8 +107,16 @@ impl Request {
     ///
     /// # Errors
     /// [`BadCommand`] for anything but the two forms.
-    pub fn parse(_text: &str) -> Result<Self, BadCommand> {
-        todo!()
+    pub fn parse(text: &str) -> Result<Self, BadCommand> {
+        if text == "query" {
+            return Ok(Self::Query);
+        }
+        let rest = text.strip_prefix("install kbf=").ok_or(BadCommand)?;
+        let (version, channel) = rest.split_once(" from ").ok_or(BadCommand)?;
+        Ok(Self::Install {
+            version: Version::new(version)?,
+            channel: Channel::new(channel)?,
+        })
     }
 
     /// The verb, for the audit line.

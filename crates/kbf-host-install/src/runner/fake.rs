@@ -16,7 +16,10 @@ pub struct FakeRunner {
 impl FakeRunner {
     /// A runner that will give `replies`, one per call.
     pub fn new(replies: Vec<io::Result<Exec>>) -> Self {
-        Self { replies: RefCell::new(replies.into()), calls: RefCell::default() }
+        Self {
+            replies: RefCell::new(replies.into()),
+            calls: RefCell::default(),
+        }
     }
 
     /// Every command run so far.
@@ -27,7 +30,11 @@ impl FakeRunner {
 
 /// An exit with `code` and these outputs.
 pub fn exec(code: i32, stdout: &str, stderr: &str) -> io::Result<Exec> {
-    Ok(Exec { code: Some(code), stdout: stdout.into(), stderr: stderr.into() })
+    Ok(Exec {
+        code: Some(code),
+        stdout: stdout.into(),
+        stderr: stderr.into(),
+    })
 }
 
 /// A successful exit with this stdout.

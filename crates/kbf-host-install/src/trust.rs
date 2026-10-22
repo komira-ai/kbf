@@ -4,12 +4,19 @@
 //! writable by its group or by others. Config and source files are opened with
 //! `O_NOFOLLOW` and checked on the open descriptor, so the file checked is the file read.
 
-use std::fs::Metadata;
-use std::io;
+use std::fs::{self, Metadata, OpenOptions};
+use std::io::{self, Read};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 /// The largest file read as config, in bytes.
 pub const MAX_FILE_LEN: u64 = 64 * 1024;
+
+/// The `open(2)` flag that refuses a final symbolic link, for `custom_flags`.
+pub fn nofollow() -> i32 {
+    // One bit of the flags word, far below the sign bit.
+    rustix::fs::OFlags::NOFOLLOW.bits() as i32
+}
 
 /// Why a file is not trusted.
 #[derive(Debug, thiserror::Error)]
@@ -46,8 +53,7 @@ impl Trust {
 
     /// Whether `meta` is owned by the trusted user.
     pub fn owns(&self, meta: &Metadata) -> bool {
-        let _ = meta;
-        todo!()
+        meta.uid() == self.uid
     }
 
     /// Check `meta` of a regular file: owner and mode.
@@ -55,8 +61,16 @@ impl Trust {
     /// # Errors
     /// [`TrustError`] for a file that is not trusted.
     pub fn check_meta(&self, meta: &Metadata) -> Result<(), TrustError> {
-        let _ = meta;
-        todo!()
+        if !meta.is_file() {
+            return Err(TrustError::NotRegular);
+        }
+        if !self.owns(meta) {
+            return Err(TrustError::NotOwned);
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(TrustError::Writable);
+        }
+        Ok(())
     }
 
     /// Check the file at `path`, following a symbolic link to its target.
@@ -64,8 +78,7 @@ impl Trust {
     /// # Errors
     /// [`TrustError`] for a file that is missing or not trusted.
     pub fn check_file(&self, path: &Path) -> Result<(), TrustError> {
-        let _ = path;
-        todo!()
+        self.check_meta(&fs::metadata(path)?)
     }
 
     /// Read the file at `path` as text: opened without following a symbolic link, checked
@@ -74,8 +87,17 @@ impl Trust {
     /// # Errors
     /// [`TrustError`] for a file that is missing, not trusted, too large or not UTF-8.
     pub fn read(&self, path: &Path) -> Result<String, TrustError> {
-        let _ = path;
-        todo!()
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(nofollow())
+            .open(path)?;
+        self.check_meta(&file.metadata()?)?;
+        let mut text = String::new();
+        file.take(MAX_FILE_LEN + 1).read_to_string(&mut text)?;
+        if text.len() as u64 > MAX_FILE_LEN {
+            return Err(TrustError::TooLarge);
+        }
+        Ok(text)
     }
 }
 

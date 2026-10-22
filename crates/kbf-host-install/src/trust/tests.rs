@@ -1,10 +1,10 @@
 use std::fs;
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use kbf_testkit::dir::TestDir;
 
-use super::{Trust, TrustError, MAX_FILE_LEN};
+use super::{MAX_FILE_LEN, Trust, TrustError};
 
 fn scratch(name: &str) -> TestDir {
     TestDir::under(std::env::temp_dir(), name)
@@ -41,7 +41,10 @@ fn another_owner_is_refused() {
     let path = file(&dir, "f", 0o644, "x");
     let stranger = Trust::owned_by(fs::metadata(&dir).unwrap().uid() + 1);
     assert!(matches!(stranger.read(&path), Err(TrustError::NotOwned)));
-    assert!(matches!(stranger.check_file(&path), Err(TrustError::NotOwned)));
+    assert!(matches!(
+        stranger.check_file(&path),
+        Err(TrustError::NotOwned)
+    ));
     assert!(!stranger.owns(&fs::metadata(&path).unwrap()));
     assert!(me(&dir).owns(&fs::metadata(&path).unwrap()));
 }
@@ -54,7 +57,10 @@ fn group_or_world_writable_is_refused() {
     let trust = me(&dir);
     for mode in [0o664, 0o646, 0o666, 0o620, 0o602, 0o777] {
         let path = file(&dir, "f", mode, "x");
-        assert!(matches!(trust.read(&path), Err(TrustError::Writable)), "mode {mode:o}");
+        assert!(
+            matches!(trust.read(&path), Err(TrustError::Writable)),
+            "mode {mode:o}"
+        );
         assert!(matches!(trust.check_file(&path), Err(TrustError::Writable)));
     }
 }
@@ -70,10 +76,22 @@ fn links_directories_and_missing_files() {
     symlink(&real, &link).unwrap();
     assert!(matches!(trust.read(&link), Err(TrustError::Io(_))));
     trust.check_file(&link).unwrap();
-    assert!(matches!(trust.read(&dir), Err(TrustError::NotRegular) | Err(TrustError::Io(_))));
-    assert!(matches!(trust.check_file(&dir), Err(TrustError::NotRegular)));
-    assert!(matches!(trust.read(&dir.join("missing")), Err(TrustError::Io(_))));
-    assert!(matches!(trust.check_file(&dir.join("missing")), Err(TrustError::Io(_))));
+    assert!(matches!(
+        trust.read(&dir),
+        Err(TrustError::NotRegular) | Err(TrustError::Io(_))
+    ));
+    assert!(matches!(
+        trust.check_file(&dir),
+        Err(TrustError::NotRegular)
+    ));
+    assert!(matches!(
+        trust.read(&dir.join("missing")),
+        Err(TrustError::Io(_))
+    ));
+    assert!(matches!(
+        trust.check_file(&dir.join("missing")),
+        Err(TrustError::Io(_))
+    ));
 }
 
 /// Catches an unbounded read: a file over the cap is refused, one at the cap is read; text

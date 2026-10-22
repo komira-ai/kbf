@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::{Failure, FailureCode, Outcome, QueryReport, Refusal};
 
@@ -19,7 +19,10 @@ const ALL_REFUSALS: [(Refusal, &str); 7] = [
 const ALL_FAILURES: [(FailureCode, &str); 7] = [
     (FailureCode::AuditUnavailable, "audit_unavailable"),
     (FailureCode::QueryFailed, "query_failed"),
-    (FailureCode::InstalledVersionInvalid, "installed_version_invalid"),
+    (
+        FailureCode::InstalledVersionInvalid,
+        "installed_version_invalid",
+    ),
     (FailureCode::PackageStateUnclean, "package_state_unclean"),
     (FailureCode::UpdateFailed, "update_failed"),
     (FailureCode::InstallFailed, "install_failed"),
@@ -40,19 +43,29 @@ fn the_codes_are_the_closed_set() {
 /// Catches an exit status that moved: 2 is "nothing ran", 3 is "something failed".
 #[test]
 fn exit_codes() {
-    let installed = Outcome::Installed { version: "1.0".into() };
-    let already = Outcome::AlreadyInstalled { version: "1.0".into() };
+    let installed = Outcome::Installed {
+        version: "1.0".into(),
+    };
+    let already = Outcome::AlreadyInstalled {
+        version: "1.0".into(),
+    };
     let query = Outcome::Queried(QueryReport {
         installed_version: None,
         running_commit: None,
         in_progress: false,
     });
-    assert_eq!([&installed, &already, &query].map(Outcome::exit_code), [0, 0, 0]);
+    assert_eq!(
+        [&installed, &already, &query].map(Outcome::exit_code),
+        [0, 0, 0]
+    );
     for (refusal, _) in ALL_REFUSALS {
         assert_eq!(Outcome::Refused(refusal).exit_code(), 2);
     }
     for (code, _) in ALL_FAILURES {
-        let failed = Outcome::Failed(Failure { code, detail: String::new() });
+        let failed = Outcome::Failed(Failure {
+            code,
+            detail: String::new(),
+        });
         assert_eq!(failed.exit_code(), 3);
     }
 }
@@ -61,18 +74,28 @@ fn exit_codes() {
 #[test]
 fn json_shapes() {
     assert_eq!(
-        json(&Outcome::Installed { version: "1.0-1".into() }),
+        json(&Outcome::Installed {
+            version: "1.0-1".into()
+        }),
         json!({"result": "installed", "installed_version": "1.0-1", "unit_state": "finished"})
     );
     assert_eq!(
-        json(&Outcome::AlreadyInstalled { version: "1.0-1".into() }),
+        json(&Outcome::AlreadyInstalled {
+            version: "1.0-1".into()
+        }),
         json!({"result": "already_installed", "installed_version": "1.0-1", "unit_state": "not_run"})
     );
     for (refusal, code) in ALL_REFUSALS {
-        assert_eq!(json(&Outcome::Refused(refusal)), json!({"result": "refused", "reason": code}));
+        assert_eq!(
+            json(&Outcome::Refused(refusal)),
+            json!({"result": "refused", "reason": code})
+        );
     }
     for (failure, code) in ALL_FAILURES {
-        let outcome = Outcome::Failed(Failure { code: failure, detail: "x".into() });
+        let outcome = Outcome::Failed(Failure {
+            code: failure,
+            detail: "x".into(),
+        });
         assert_eq!(json(&outcome), json!({"result": "failed", "reason": code}));
     }
 }
@@ -104,17 +127,34 @@ fn query_line_shape_and_order() {
 /// grammar, but dpkg's text is untrusted too) is escaped, never echoed raw.
 #[test]
 fn a_value_is_escaped_not_echoed() {
-    let line = Outcome::Installed { version: "1\"\n,\"result\":\"x".into() }.json_line();
+    let line = Outcome::Installed {
+        version: "1\"\n,\"result\":\"x".into(),
+    }
+    .json_line();
     assert!(!line.contains('\n'));
-    assert_eq!(json(&Outcome::Installed { version: "1\"\n,\"result\":\"x".into() })["result"], "installed");
+    assert_eq!(
+        json(&Outcome::Installed {
+            version: "1\"\n,\"result\":\"x".into()
+        })["result"],
+        "installed"
+    );
 }
 
 /// The audit fields: outcome and reason, one per case.
 #[test]
 fn audit_fields() {
-    assert_eq!(Outcome::Installed { version: "1".into() }.audit_fields(), ("installed", None));
     assert_eq!(
-        Outcome::AlreadyInstalled { version: "1".into() }.audit_fields(),
+        Outcome::Installed {
+            version: "1".into()
+        }
+        .audit_fields(),
+        ("installed", None)
+    );
+    assert_eq!(
+        Outcome::AlreadyInstalled {
+            version: "1".into()
+        }
+        .audit_fields(),
         ("already_installed", None)
     );
     let query = Outcome::Queried(QueryReport {
@@ -127,7 +167,10 @@ fn audit_fields() {
         Outcome::Refused(Refusal::KeyUntrusted).audit_fields(),
         ("refused", Some("key_untrusted"))
     );
-    let failed = Outcome::Failed(Failure { code: FailureCode::UpdateFailed, detail: String::new() });
+    let failed = Outcome::Failed(Failure {
+        code: FailureCode::UpdateFailed,
+        detail: String::new(),
+    });
     assert_eq!(failed.audit_fields(), ("failed", Some("update_failed")));
 }
 
@@ -136,11 +179,23 @@ fn audit_fields() {
 #[test]
 fn stderr_detail_is_cleaned_and_bounded() {
     assert_eq!(Outcome::Refused(Refusal::BadCommand).stderr_detail(), None);
-    assert_eq!(Outcome::Installed { version: "1".into() }.stderr_detail(), None);
+    assert_eq!(
+        Outcome::Installed {
+            version: "1".into()
+        }
+        .stderr_detail(),
+        None
+    );
     let failed = |detail: &str| {
-        Outcome::Failed(Failure { code: FailureCode::InstallFailed, detail: detail.into() })
+        Outcome::Failed(Failure {
+            code: FailureCode::InstallFailed,
+            detail: detail.into(),
+        })
     };
-    assert_eq!(failed("E: held\n").stderr_detail().as_deref(), Some("E: held\n"));
+    assert_eq!(
+        failed("E: held\n").stderr_detail().as_deref(),
+        Some("E: held\n")
+    );
     assert_eq!(
         failed("a\x1b[31mb\0c\r").stderr_detail().as_deref(),
         Some("a?[31mb?c?"),

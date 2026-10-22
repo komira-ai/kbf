@@ -5,13 +5,16 @@
 //! touch. A line is serialized, never formatted: a request that is not in the grammar is
 //! recorded as an escaped, truncated string, so it cannot forge a line.
 
-use std::fs::File;
-use std::io;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 use serde::Serialize;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
-use crate::trust::Trust;
+use crate::trust::{Trust, nofollow};
 
 /// The longest part of a refused command that is recorded, in characters.
 pub const MAX_RAW_CHARS: usize = 200;
@@ -36,13 +39,15 @@ pub struct Entry {
 
 /// The time now, RFC 3339 in UTC.
 pub fn now() -> String {
-    todo!()
+    // Formatting a date in this range does not fail.
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_default()
 }
 
 /// `text` cut to [`MAX_RAW_CHARS`] characters.
 pub fn truncate_raw(text: &str) -> String {
-    let _ = text;
-    todo!()
+    text.chars().take(MAX_RAW_CHARS).collect()
 }
 
 /// An open audit log.
@@ -58,8 +63,20 @@ impl Audit {
     /// The file cannot be opened, is a link, is not a regular file, is not the trusted
     /// user's, or is accessible to its group or to others.
     pub fn open(trust: &Trust, path: &Path) -> io::Result<Self> {
-        let _ = (trust, path);
-        todo!()
+        let file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .custom_flags(nofollow())
+            .mode(0o600)
+            .open(path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() || !trust.owns(&meta) || meta.mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "not a regular file of the trusted user that only it can access",
+            ));
+        }
+        Ok(Self { file })
     }
 
     /// Append `entry` as one line.
@@ -67,8 +84,10 @@ impl Audit {
     /// # Errors
     /// The write failed.
     pub fn append(&mut self, entry: &Entry) -> io::Result<()> {
-        let _ = (entry, &self.file);
-        todo!()
+        let mut line = serde_json::to_string(entry).map_err(io::Error::other)?;
+        line.push('\n');
+        // One `write` on an `O_APPEND` descriptor: the line lands whole.
+        self.file.write_all(line.as_bytes())
     }
 }
 

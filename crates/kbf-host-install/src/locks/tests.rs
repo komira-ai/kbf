@@ -15,16 +15,30 @@ const TABLE: &str = "\
 /// a waiter for a holder.
 #[test]
 fn the_table_is_read() {
-    assert!(table_holds(TABLE, 8, 1, 131_075), "a POSIX lock, device 08:01 in hex");
+    assert!(
+        table_holds(TABLE, 8, 1, 131_075),
+        "a POSIX lock, device 08:01 in hex"
+    );
     assert!(table_holds(TABLE, 0xfd, 0, 42), "a FLOCK lock");
-    assert!(table_holds(TABLE, 0xb3, 0x2a, 9), "an open-file-description lock");
+    assert!(
+        table_holds(TABLE, 0xb3, 0x2a, 9),
+        "an open-file-description lock"
+    );
     assert!(!table_holds(TABLE, 8, 1, 777), "a waiter holds nothing");
     assert!(!table_holds(TABLE, 8, 2, 131_075), "another device");
     assert!(!table_holds(TABLE, 9, 1, 131_075), "another major");
     assert!(!table_holds(TABLE, 8, 1, 131_076), "another inode");
-    assert!(!table_holds(TABLE, 8, 1, 0x20003), "the inode is decimal, not hex");
+    assert!(
+        !table_holds(TABLE, 8, 1, 0x131075),
+        "the inode is decimal, not hex"
+    );
     assert!(!table_holds("", 8, 1, 131_075));
-    assert!(!table_holds("garbage\n1: POSIX\n\n:::\nx: y z\n1: POSIX ADVISORY WRITE 1 a:b:c 0 0\n", 8, 1, 1));
+    assert!(!table_holds(
+        "garbage\n1: POSIX\n\n:::\nx: y z\n1: POSIX ADVISORY WRITE 1 a:b:c 0 0\n",
+        8,
+        1,
+        1
+    ));
     assert!(!table_holds("1: POSIX ADVISORY WRITE 1 1:2 0 0\n", 1, 2, 0));
 }
 

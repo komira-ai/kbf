@@ -64,14 +64,22 @@ fn equal_versions_compare_equal() {
         assert_eq!(v(a).cmp(&v(b)), Equal, "{a} = {b}");
         assert_eq!(v(a), v(b));
     }
-    assert_eq!(v("1.0").cmp(&v("1.0-0")), Equal, "an absent revision is revision 0");
+    assert_eq!(
+        v("1.0").cmp(&v("1.0-0")),
+        Equal,
+        "an absent revision is revision 0"
+    );
 }
 
 /// Catches a parser that takes the first hyphen, not the last, as the revision's start.
 #[test]
 fn the_revision_starts_at_the_last_hyphen() {
     assert_eq!(v("1.0-1-2").cmp(&v("1.0-1-02")), Equal);
-    assert_eq!(v("1.0-1-2").cmp(&v("1.0-2")), Greater, "upstream 1.0-1 is above 1.0");
+    assert_eq!(
+        v("1.0-1-2").cmp(&v("1.0-2")),
+        Greater,
+        "upstream 1.0-1 is above 1.0"
+    );
 }
 
 /// Catches a parser that accepts what dpkg refuses, or an error code that moved.
@@ -105,8 +113,16 @@ fn errors_read_aloud() {
     assert!(DebVersionError::BadChar.to_string().contains("alphabet"));
     assert!(DebVersionError::BadEpoch.to_string().contains("epoch"));
     assert!(DebVersionError::EmptyUpstream.to_string().contains("empty"));
-    assert!(DebVersionError::UpstreamNotDigit.to_string().contains("digit"));
-    assert!(DebVersionError::EmptyRevision.to_string().contains("revision"));
+    assert!(
+        DebVersionError::UpstreamNotDigit
+            .to_string()
+            .contains("digit")
+    );
+    assert!(
+        DebVersionError::EmptyRevision
+            .to_string()
+            .contains("revision")
+    );
 }
 
 /// `PartialOrd` agrees with `Ord`.

@@ -1,4 +1,4 @@
-use super::{BadCommand, Channel, Request, Version, MAX_CHANNEL_LEN, MAX_VERSION_LEN};
+use super::{BadCommand, Channel, MAX_CHANNEL_LEN, MAX_VERSION_LEN, Request, Version};
 
 fn parse(text: &str) -> Result<Request, BadCommand> {
     Request::parse(text)
@@ -59,7 +59,10 @@ fn refused_inputs() {
         ("query as a substring", "xquery".into()),
         ("query inside a sentence", "please query".into()),
         ("install as a prefix", "install kbf=1 from c; reboot".into()),
-        ("a second install", "install kbf=1 from c install kbf=2 from c".into()),
+        (
+            "a second install",
+            "install kbf=1 from c install kbf=2 from c".into(),
+        ),
         ("an install as a substring", "x install kbf=1 from c".into()),
         // An extra token after the channel, or a second argument.
         ("extra token", "install kbf=1 from c d".into()),
@@ -118,7 +121,10 @@ fn refused_inputs() {
         ("upper-case channel", "install kbf=1 from Candidate".into()),
         ("underscore channel", "install kbf=1 from a_b".into()),
         ("leading hyphen channel", "install kbf=1 from -x".into()),
-        ("over-long channel", format!("install kbf=1 from {long_channel}")),
+        (
+            "over-long channel",
+            format!("install kbf=1 from {long_channel}"),
+        ),
         // Line ends and NUL.
         ("trailing newline", "install kbf=1 from c\n".into()),
         ("trailing newline, query", "query\n".into()),
@@ -142,7 +148,10 @@ fn refused_inputs() {
         ("trailing colon", "install kbf=2.0: from c".into()),
         // The version itself.
         ("empty version", "install kbf= from c".into()),
-        ("over-long version", format!("install kbf={long_version} from c")),
+        (
+            "over-long version",
+            format!("install kbf={long_version} from c"),
+        ),
         ("letter first", "install kbf=a1 from c".into()),
         ("tilde first", "install kbf=~1 from c".into()),
         ("plus first", "install kbf=+1 from c".into()),

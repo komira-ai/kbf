@@ -32,17 +32,17 @@ pub struct Exec {
 impl Exec {
     /// Whether it exited with status 0.
     pub fn success(&self) -> bool {
-        todo!()
+        self.code == Some(0)
     }
 
     /// Stdout as text, invalid bytes replaced.
     pub fn stdout_text(&self) -> String {
-        todo!()
+        String::from_utf8_lossy(&self.stdout).into_owned()
     }
 
     /// Stderr as text, invalid bytes replaced.
     pub fn stderr_text(&self) -> String {
-        todo!()
+        String::from_utf8_lossy(&self.stderr).into_owned()
     }
 }
 
@@ -60,9 +60,19 @@ pub trait Runner {
 pub struct SystemRunner;
 
 impl Runner for SystemRunner {
-    fn run(&self, _cmd: &Cmd) -> io::Result<Exec> {
-        let _ = (Command::new("x"), Stdio::null());
-        todo!()
+    fn run(&self, cmd: &Cmd) -> io::Result<Exec> {
+        let output = Command::new(&cmd.program)
+            .args(&cmd.args)
+            .env_clear()
+            .env("PATH", PATH)
+            .env("LANG", LANG)
+            .stdin(Stdio::null())
+            .output()?;
+        Ok(Exec {
+            code: output.status.code(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
     }
 }
 

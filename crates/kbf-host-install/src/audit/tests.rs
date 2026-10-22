@@ -1,10 +1,10 @@
 use std::fs;
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
 use kbf_testkit::dir::TestDir;
 use serde_json::Value;
 
-use super::{now, truncate_raw, Audit, Entry, MAX_RAW_CHARS};
+use super::{Audit, Entry, MAX_RAW_CHARS, now, truncate_raw};
 use crate::trust::Trust;
 
 fn entry(outcome: &'static str) -> Entry {
@@ -32,7 +32,10 @@ fn lines_are_appended_to_a_private_file() {
     let (dir, trust) = setup("audit-append");
     let path = dir.join("log");
     let mut audit = Audit::open(&trust, &path).unwrap();
-    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     audit.append(&entry("installed")).unwrap();
     drop(audit);
     let mut again = Audit::open(&trust, &path).unwrap();
@@ -55,7 +58,10 @@ fn lines_are_appended_to_a_private_file() {
         })
     );
     let second: Value = serde_json::from_str(lines[1]).unwrap();
-    assert_eq!(second["command"], "rm -rf \"\n/\"", "escaped on the line, exact once parsed");
+    assert_eq!(
+        second["command"], "rm -rf \"\n/\"",
+        "escaped on the line, exact once parsed"
+    );
     assert_eq!(second["reason"], "bad_command");
     assert_eq!(second["verb"], Value::Null);
 }
@@ -70,7 +76,10 @@ fn an_unsafe_log_is_refused() {
     fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
     let link = dir.join("link");
     symlink(&real, &link).unwrap();
-    assert!(Audit::open(&trust, &link).is_err(), "a link is not followed");
+    assert!(
+        Audit::open(&trust, &link).is_err(),
+        "a link is not followed"
+    );
     for mode in [0o644, 0o660, 0o606, 0o640, 0o604, 0o666] {
         fs::set_permissions(&real, fs::Permissions::from_mode(mode)).unwrap();
         assert!(Audit::open(&trust, &real).is_err(), "mode {mode:o}");
@@ -78,8 +87,14 @@ fn an_unsafe_log_is_refused() {
     fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
     assert!(Audit::open(&trust, &real).is_ok());
     let stranger = Trust::owned_by(trust_uid(&dir) + 1);
-    assert!(Audit::open(&stranger, &real).is_err(), "not the trusted user's");
-    assert!(Audit::open(&trust, &dir).is_err(), "a directory is not a log");
+    assert!(
+        Audit::open(&stranger, &real).is_err(),
+        "not the trusted user's"
+    );
+    assert!(
+        Audit::open(&trust, &dir).is_err(),
+        "a directory is not a log"
+    );
     assert!(Audit::open(&trust, &dir.join("no-such-dir").join("log")).is_err());
 }
 
@@ -91,7 +106,10 @@ fn trust_uid(dir: &TestDir) -> u32 {
 #[test]
 fn time_and_truncation() {
     let t = now();
-    assert!(t.ends_with('Z') && t.len() >= 20 && t.as_bytes()[10] == b'T', "{t}");
+    assert!(
+        t.ends_with('Z') && t.len() >= 20 && t.as_bytes()[10] == b'T',
+        "{t}"
+    );
     assert!(t.starts_with("20"), "{t}");
     assert_eq!(truncate_raw("short"), "short");
     let long = "\u{e9}".repeat(MAX_RAW_CHARS + 50);

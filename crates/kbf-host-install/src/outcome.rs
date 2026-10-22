@@ -7,6 +7,9 @@
 
 use serde::Serialize;
 
+/// The most of a failure's detail that is written to stderr, in bytes.
+pub const MAX_DETAIL_LEN: usize = 2048;
+
 /// Why a request was refused. Nothing ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
@@ -29,7 +32,15 @@ pub enum Refusal {
 impl Refusal {
     /// The closed code.
     pub fn code(self) -> &'static str {
-        todo!()
+        match self {
+            Self::BadCommand => "bad_command",
+            Self::ChannelNotAllowed => "channel_not_allowed",
+            Self::ConfigInvalid => "config_invalid",
+            Self::ConfigUnsafe => "config_unsafe",
+            Self::ChannelUnsigned => "channel_unsigned",
+            Self::KeyUntrusted => "key_untrusted",
+            Self::OlderThanInstalled => "older_than_installed",
+        }
     }
 }
 
@@ -55,7 +66,15 @@ pub enum FailureCode {
 impl FailureCode {
     /// The closed code.
     pub fn code(self) -> &'static str {
-        todo!()
+        match self {
+            Self::AuditUnavailable => "audit_unavailable",
+            Self::QueryFailed => "query_failed",
+            Self::InstalledVersionInvalid => "installed_version_invalid",
+            Self::PackageStateUnclean => "package_state_unclean",
+            Self::UpdateFailed => "update_failed",
+            Self::InstallFailed => "install_failed",
+            Self::VerifyFailed => "verify_failed",
+        }
     }
 }
 
@@ -92,23 +111,86 @@ pub enum Outcome {
 impl Outcome {
     /// The exit status: 0, 2 or 3.
     pub fn exit_code(&self) -> u8 {
-        todo!()
+        match self {
+            Self::Installed { .. } | Self::AlreadyInstalled { .. } | Self::Queried(_) => 0,
+            Self::Refused(_) => 2,
+            Self::Failed(_) => 3,
+        }
     }
 
     /// The one JSON line for stdout, without its line end.
     pub fn json_line(&self) -> String {
-        todo!()
+        match self {
+            Self::Installed { version } => to_json(&Done {
+                result: "installed",
+                installed_version: version,
+                unit_state: "finished",
+            }),
+            Self::AlreadyInstalled { version } => to_json(&Done {
+                result: "already_installed",
+                installed_version: version,
+                unit_state: "not_run",
+            }),
+            Self::Queried(report) => to_json(report),
+            Self::Refused(refusal) => to_json(&Reason {
+                result: "refused",
+                reason: refusal.code(),
+            }),
+            Self::Failed(failure) => to_json(&Reason {
+                result: "failed",
+                reason: failure.code.code(),
+            }),
+        }
     }
 
     /// The outcome and reason of the audit line.
     pub fn audit_fields(&self) -> (&'static str, Option<&'static str>) {
-        todo!()
+        match self {
+            Self::Installed { .. } => ("installed", None),
+            Self::AlreadyInstalled { .. } => ("already_installed", None),
+            Self::Queried(_) => ("query", None),
+            Self::Refused(refusal) => ("refused", Some(refusal.code())),
+            Self::Failed(failure) => ("failed", Some(failure.code.code())),
+        }
     }
 
     /// The text for stderr: the detail of a failure, cleaned, else nothing.
     pub fn stderr_detail(&self) -> Option<String> {
-        todo!()
+        let Self::Failed(failure) = self else {
+            return None;
+        };
+        let mut text = String::new();
+        for c in failure.detail.chars() {
+            let c = if c.is_control() && c != '\n' && c != '\t' {
+                '?'
+            } else {
+                c
+            };
+            if text.len() + c.len_utf8() > MAX_DETAIL_LEN {
+                break;
+            }
+            text.push(c);
+        }
+        Some(text)
     }
+}
+
+#[derive(Serialize)]
+struct Done<'a> {
+    result: &'static str,
+    installed_version: &'a str,
+    unit_state: &'static str,
+}
+
+#[derive(Serialize)]
+struct Reason {
+    result: &'static str,
+    reason: &'static str,
+}
+
+/// The JSON text of `value`. Serializing strings and booleans does not fail.
+fn to_json<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_default()
 }
 
 #[cfg(test)]
