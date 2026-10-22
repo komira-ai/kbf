@@ -12,7 +12,6 @@ const NAV: &[(&str, &str)] = &[
     ("Builds", "/ui/builds"),
     ("Targets", "/ui/targets"),
     ("Nodes", "/ui/nodes"),
-    ("Updates", "/ui/updates"),
     ("Leases", "/ui/leases"),
     ("Queue", "/ui/queue"),
     ("Storage", "/ui/storage"),
