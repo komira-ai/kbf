@@ -43,6 +43,14 @@ fn rig(name: &str) -> Rig {
     }
 }
 
+/// The scratch directory goes with the test: a 0755 file named `kbf` left under the target
+/// directory is taken for the `kbf` binary by the coverage report, which then fails on it.
+impl Drop for Rig {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
 impl Rig {
     /// A source file of `bytes`, 0644: a copy must not take that mode over.
     fn source(&self, name: &str, bytes: &[u8]) -> PathBuf {
@@ -360,6 +368,7 @@ fn new_sweeps_what_a_killed_copy_left_and_nothing_else() {
 
     assert_eq!(names(&root), [A, "notes"]);
     assert_eq!(fs::read(copies.program(&c(A))).expect("kept"), b"kept");
+    fs::remove_dir_all(&dir).expect("the scratch directory goes");
 }
 
 /// Catches a root that is made with the wrong mode or not made at all (the proxy's state
