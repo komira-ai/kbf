@@ -349,3 +349,87 @@ pub fn member_facts(look: &MembersLook, now: FarmTime) -> Vec<MemberFacts> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn member(id: u64, addr: &str) -> MemberLook {
+        MemberLook {
+            id: MemberId(id),
+            addr: addr.to_owned(),
+            state: MemberState::Active,
+            boot: 1,
+            planned_down: false,
+            heard_ago: Some(Duration::from_secs(1)),
+            repair_debt: Some(0),
+            open_writes: Some(0),
+            reported_generation: Some(1),
+            marked_ago: None,
+        }
+    }
+
+    fn look(members: Vec<MemberLook>) -> MembersLook {
+        MembersLook {
+            generation: 1,
+            members,
+        }
+    }
+
+    fn adverts(addr: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([("host-1".to_owned(), addr.to_owned())])
+    }
+
+    fn host() -> WorkerId {
+        WorkerId::new("host-1")
+    }
+
+    /// A host is linked to the member whose address it advertised, and to no other.
+    /// Catches `link` comparing the wrong things or joining the first member regardless.
+    #[test]
+    fn link_joins_the_member_with_the_advertised_address_only() {
+        let members = look(vec![
+            member(1, "s1.example:7000"),
+            member(2, "s2.example:7000"),
+        ]);
+        match link(&host(), &adverts("s2.example:7000"), &members) {
+            Link::Member(m) => assert_eq!(m.id, MemberId(2)),
+            _ => panic!("expected the member at the advertised address"),
+        }
+        assert!(matches!(
+            link(&host(), &adverts("s3.example:7000"), &members),
+            Link::Unlinked(_)
+        ));
+    }
+
+    /// Both sides are read through `canonical_addr`, so case does not unlink a host.
+    #[test]
+    fn link_ignores_address_case_on_both_sides() {
+        let members = look(vec![member(1, "S1.Example:7000")]);
+        assert!(matches!(
+            link(&host(), &adverts("s1.EXAMPLE:7000"), &members),
+            Link::Member(_)
+        ));
+    }
+
+    /// An empty advertised address is a daemon-only host; an unknown host and an address
+    /// two members share are unlinked.
+    #[test]
+    fn link_tells_no_storage_from_unlinked() {
+        let members = look(vec![member(1, "s1:7000"), member(2, "s1:7000")]);
+        assert!(matches!(
+            link(&host(), &adverts(""), &members),
+            Link::NoStorage
+        ));
+        assert!(matches!(
+            link(&WorkerId::new("other"), &adverts("s1:7000"), &members),
+            Link::Unlinked(_)
+        ));
+        assert!(matches!(
+            link(&host(), &adverts("s1:7000"), &members),
+            Link::Unlinked(_)
+        ));
+    }
+}
