@@ -8,7 +8,10 @@ use tokio::time::Instant;
 use tonic::codegen::http::Uri;
 use tonic::transport::Endpoint;
 
-use super::{Identity, Joined, Joiner, RETRY_BASE, RETRY_MAX, backoff, jittered, unit_random};
+use super::{
+    Identity, Joined, Joiner, RETRY_BASE, RETRY_MAX, backoff, commit_of, jittered, reported_commit,
+    unit_random,
+};
 
 /// A number in `[0, 1)` from `seed`: splitmix64's output scaled by 2^-53, so a test has
 /// the spread of many nodes and knows every draw.
@@ -53,6 +56,23 @@ fn the_system_source_spreads_over_the_unit_interval() {
     let draws: Vec<f64> = (0..64).map(|_| unit_random()).collect();
     assert!(draws.iter().all(|u| (0.0..1.0).contains(u)), "{draws:?}");
     assert!(draws.iter().any(|u| *u != draws[0]), "{draws:?}");
+}
+
+/// Catches: a node that reports the 12-digit commit when its build knows the 40-digit one
+/// (a release is named by the full commit, and the short one is a prefix that two commits can
+/// share), or reports nothing when the build knows no full one (the empty text). The full
+/// commit wins when there is one, the short one is the fallback, and what the node reports is
+/// the pair this build embeds. Mutants: the arms swapped; the short commit always.
+#[test]
+fn the_reported_commit_is_the_full_one_or_the_short_one_when_the_build_knows_no_full_one() {
+    let full = "0123456789abcdef0123456789abcdef01234567";
+    assert_eq!(commit_of(full, "0123456789ab"), full);
+    assert_eq!(commit_of("", "0123456789ab"), "0123456789ab");
+    assert_eq!(commit_of("", "unknown"), "unknown");
+    assert_eq!(
+        reported_commit(),
+        commit_of(crate::BUILD_COMMIT_FULL, crate::BUILD_COMMIT)
+    );
 }
 
 /// A connector that fails every dial as a lookup that found nothing does, noting when.

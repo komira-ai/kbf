@@ -105,3 +105,40 @@ async fn a_state_store_without_tls_flags_warns_that_members_are_not_routed_to() 
         log.text()
     );
 }
+
+/// Catches: the retired `--release-poll-*` flags (a unit or `kbf.toml` written before the
+/// poller was removed carries them) being refused at start, or accepted without a word:
+/// a frontend given all three starts, logs one warning for each naming the flag, and with
+/// none of them logs none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_retired_release_poll_flags_start_and_warn_once_each() {
+    let log = Log::default();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let start = |f: &frontend::FrontendFlags| {
+        tracing::dispatcher::with_default(&dispatch, || {
+            start_frontend(f, || Ok(pending::<()>())).expect("starts")
+        })
+    };
+
+    let _plain = start(&flags(&[]));
+    assert!(!log.text().contains("no longer read"), "{}", log.text());
+    let _old = start(&flags(&[
+        "--release-poll-every-secs=300",
+        "--release-poll-repo=komira-ai/kbf",
+        "--release-poll-refs=main",
+    ]));
+    let text = log.text();
+    for flag in [
+        "--release-poll-every-secs",
+        "--release-poll-repo",
+        "--release-poll-refs",
+    ] {
+        let line = format!("{flag} is no longer read: the release poller was removed");
+        assert_eq!(text.matches(&line).count(), 1, "{text}");
+    }
+}

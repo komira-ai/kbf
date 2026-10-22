@@ -320,7 +320,9 @@ pub struct RunRecord {
     /// The memory the run used when it was killed, bytes.
     #[prost(uint64, tag = "31")]
     pub memory_used_bytes: u64,
-    /// The limit it was killed at, bytes.
+    /// The memory the run booked, bytes, when it was killed at its own limit (zero
+    /// otherwise). This is the booking, not the cgroup's `memory.max`, which is 1.5 times
+    /// the booking plus 512 MiB.
     #[prost(uint64, tag = "32")]
     pub memory_limit_bytes: u64,
     /// The action is a test run (its shape names a test execution root). Added after

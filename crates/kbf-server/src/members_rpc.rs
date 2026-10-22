@@ -47,7 +47,7 @@ use kbf_storage::service::{Admission, PeerNames, PeerRole, host_of, role_of};
 use tonic::{Request, Response, Status};
 
 use crate::identity::{DenyList, PeerCert, Presented, presented};
-use crate::members::{Fill, Members, MembershipError, Progress, Registrant};
+use crate::members::{Fill, Members, MembershipError, NodeFacts, Progress, Registrant};
 use crate::storage_health::{Debts, Reported, Writes};
 use crate::store_config::StoreConfigSource;
 use crate::store_config::acks::Acks;
@@ -274,6 +274,7 @@ impl Membership for MembershipService {
             covered(names, proxied, "instance_id", &req.instance_id)?;
             covered(names, proxied, "addr", &req.addr)?;
         }
+        let facts = NodeFacts::from_register(&req);
         let who = Registrant {
             instance_id: req.instance_id,
             addr: req.addr,
@@ -294,7 +295,7 @@ impl Membership for MembershipService {
             if let Some(peer) = &peer {
                 refuse_denied(peer, &members.denied()?)?;
             }
-            let joined = members.register_after(&who, last)?;
+            let joined = members.register_reporting(&who, last, &facts)?;
             Ok((joined, announced(source.as_ref())))
         })
         .await?;
@@ -338,6 +339,7 @@ impl Membership for MembershipService {
             req.tail_epoch_done,
             req.fill_fp,
         );
+        let facts = NodeFacts::from_beat(&req);
         let source = self
             .store_config
             .as_ref()
@@ -355,8 +357,14 @@ impl Membership for MembershipService {
                     peer.as_ref()
                         .is_none_or(|peer| peer.identity().names().covers(host_of(addr)))
                 };
-                let generation =
-                    members.heartbeat_with(id, req.boot, progress, said, fill, Some(&holds))?;
+                let generation = members.heartbeat_reporting(
+                    id,
+                    req.boot,
+                    progress,
+                    said,
+                    (fill, &facts),
+                    Some(&holds),
+                )?;
                 // Read only for a node that is behind: most beats carry no map.
                 let newer = if generation > have {
                     members.current_map()?.filter(|map| map.generation() > have)

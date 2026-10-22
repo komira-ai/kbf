@@ -1,7 +1,8 @@
 //! The two child slots, the active-slot handle and the per-stream permit.
 //!
-//! A stream binds to the slot that was active when its headers arrived, and holds a
-//! [`Permit`] on it until its upstream halves are finished (see [`Permit`]). The permit is
+//! A stream binds to the slot that was active when its headers arrived (a `WaitExecution`
+//! for the old child's operation, to that child's slot: [`ActiveSlot::bind_preferring`]), and
+//! holds a [`Permit`] on it until its upstream halves are finished (see [`Permit`]). The permit is
 //! taken on the slot's own state word, and a retired slot has its `CLOSED` bit set in that
 //! same word, so "take a permit" and "slot is not closed" cannot disagree. The retire is a
 //! compare-and-swap from "no permits, open" to "closed"; a bind that raced it either
@@ -479,10 +480,36 @@ impl ActiveSlot {
         self.bind_with(&mut || {})
     }
 
+    /// [`ActiveSlot::bind`] for a stream that belongs on `prefer`, the slot of the child that
+    /// holds what the stream asks for (a `WaitExecution` for an operation the old child
+    /// named): it binds there if that slot is open and is not the active one, and to the
+    /// active slot otherwise. The gate decides first, so a hold and an absent active slot
+    /// answer as they do for [`ActiveSlot::bind`], and a preferred slot that is retired
+    /// (closed) is not an error: the stream follows the active slot.
+    #[must_use]
+    pub fn bind_preferring(&self, prefer: Option<Slot>) -> Bind {
+        self.bind_preferring_with(prefer, &mut || {})
+    }
+
+    /// Whether `slot` is open: opened, and not retired since.
+    #[must_use]
+    pub fn is_open(&self, slot: Slot) -> bool {
+        self.inner.slots[slot.index()].load(Ordering::Acquire) & CLOSED == 0
+    }
+
     /// [`ActiveSlot::bind`], calling `after_failed_permit` between a permit that failed (the slot
     /// closed under the bind) and the reload of the gate: the one place a test can move the
     /// gate to stand for a supervisor that flipped meanwhile.
     fn bind_with(&self, after_failed_permit: &mut dyn FnMut()) -> Bind {
+        self.bind_preferring_with(None, after_failed_permit)
+    }
+
+    /// [`ActiveSlot::bind_preferring`] with the hook of [`ActiveSlot::bind_with`].
+    fn bind_preferring_with(
+        &self,
+        prefer: Option<Slot>,
+        after_failed_permit: &mut dyn FnMut(),
+    ) -> Bind {
         // Before the gate, so a release after the gate read moves the epoch past this one.
         let epoch = self.inner.epoch.load(Ordering::Acquire);
         let mut gate = self.inner.gate.load(Ordering::Acquire);
@@ -496,7 +523,12 @@ impl ActiveSlot {
             let Some(slot) = Self::decode(gate) else {
                 return Bind::NoActive;
             };
-            if let Some(permit) = self.permit(slot) {
+            // The preferred slot first, if it is another slot than the active one and still
+            // open; a closed one gives no permit and the stream goes to the active slot.
+            let preferred = prefer
+                .filter(|other| *other != slot)
+                .and_then(|other| self.permit(other));
+            if let Some(permit) = preferred.or_else(|| self.permit(slot)) {
                 return Bind::Bound(permit);
             }
             // The slot closed under us: the active slot has moved, or never will.

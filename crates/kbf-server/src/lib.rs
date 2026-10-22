@@ -121,6 +121,7 @@ pub mod read_limit;
 mod rebuild;
 pub mod release;
 pub mod replication;
+pub mod retired;
 pub mod rollout;
 mod run_record;
 pub mod serve;
