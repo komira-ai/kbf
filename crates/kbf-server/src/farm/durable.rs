@@ -737,11 +737,11 @@ impl Durable {
             worker: start.worker.clone(),
         };
         let value = encode(FarmInput::Committed(ControlRecord::Lease(grant)))?;
-        self.commit(
-            Txn::new()
-                .delete(queued, Cond::Version(row.version))
-                .put(lease_key(start.lease), value, Cond::Absent),
-        )
+        self.commit(Txn::new().delete(queued, Cond::Version(row.version)).put(
+            lease_key(start.lease),
+            value,
+            Cond::Absent,
+        ))
     }
 
     /// A lease given up: the operation holds nothing and is queued again. Repeatable:

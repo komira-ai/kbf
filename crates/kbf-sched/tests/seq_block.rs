@@ -4,8 +4,8 @@
 use kbf_caps::NodeCaps;
 use kbf_sched::{DaemonInstance, Event, Input, Request, Scheduler};
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, LeaseGrant, LeaseKind, Qos, Resources,
-    StateMachine, WaiterId, WorkerId,
+    ActionKey, ControlRecord, Digest, DigestFunction, Effect, LeaseGrant, LeaseKind, Qos,
+    Resources, StateMachine, WaiterId, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
