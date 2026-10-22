@@ -225,9 +225,8 @@ impl<'c> Applier<'c> {
                  version = excluded.version, expires_at = excluded.expires_at",
             )?,
             delete: conn.prepare("DELETE FROM kv WHERE key = ?1")?,
-            feed: conn.prepare(
-                "INSERT INTO feed (revision, key, kind, value) VALUES (?1, ?2, ?3, ?4)",
-            )?,
+            feed: conn
+                .prepare("INSERT INTO feed (revision, key, kind, value) VALUES (?1, ?2, ?3, ?4)")?,
             counter: conn.prepare(
                 "INSERT INTO counter (name, value) VALUES (?1, 1) \
                  ON CONFLICT (name) DO UPDATE SET value = value + 1 RETURNING value",

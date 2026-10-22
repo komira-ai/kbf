@@ -1205,7 +1205,7 @@ mod tests {
             event: Event::Put(b"w".to_vec()),
         };
         let page = store.changes(Revision(3), 10).expect("reads");
-        assert_eq!(page.rows, [after.clone()]);
+        assert_eq!(page.rows, std::slice::from_ref(&after));
         assert_eq!(page.cursor, Revision(7));
         let skipped = store.changes(Revision(3), 1).expect("reads");
         assert_eq!((skipped.rows.len(), skipped.cursor), (0, Revision(6)));
