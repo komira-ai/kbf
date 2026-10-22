@@ -102,8 +102,9 @@ impl Routed {
     /// The same, holding a call that no storage owner could answer for up to `bound` before
     /// it is UNAVAILABLE ([`Router::with_hold`]): a storage node that restarts is away for a
     /// while. It covers what goes through the router; the raw ByteStream pass-through calls
-    /// the nodes itself and is not held yet: a ByteStream read or write whose owners are
-    /// all down still fails at once.
+    /// the nodes itself and holds by the [`Hold`](kbf_route::Hold) its
+    /// [`Owners`](crate::Owners) are given ([`Owners::with_hold`](crate::Owners::with_hold)),
+    /// which the frontend sets to the same bound.
     #[must_use]
     pub fn with_hold(mut self, bound: Duration) -> Self {
         self.router = self.router.with_hold(bound);
