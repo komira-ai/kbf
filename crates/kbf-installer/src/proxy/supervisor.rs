@@ -314,7 +314,7 @@ impl Source for HostSource<'_> {
         }
         let marker = program
             .parent()
-            .map(|dir| dir.join(crate::stage::VERIFIED))
+            .map(|dir| dir.join(crate::layout::VERIFIED))
             .and_then(|path| file(&path));
         marker.map(drop).ok_or(Reason::NotVerified)
     }
