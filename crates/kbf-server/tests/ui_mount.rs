@@ -161,6 +161,33 @@ async fn ui_false_leaves_no_ui_and_every_other_route() {
     server.stop().await;
 }
 
+/// Catches: the removed Updates page still answering: `/ui/updates` and a path below it
+/// must answer exactly as a UI path that never existed, and the Overview must not link it.
+#[tokio::test]
+async fn the_updates_page_is_gone_and_answers_like_any_unknown_ui_path() {
+    let (server, _) = with_a_failed_build(pages::OPEN).await;
+    let unknown = server.get("/ui/never-a-page").await;
+    assert_eq!(unknown.code, 404, "{}", unknown.head);
+    for path in ["/ui/updates", "/ui/updates/plan"] {
+        let answer = server.get(path).await;
+        assert_eq!(answer.code, unknown.code, "{path}: {}", answer.head);
+        // The not-found page names the path it was asked for; the rest is the same.
+        assert_eq!(
+            answer.text().replace(path, "PATH"),
+            unknown.text().replace("/ui/never-a-page", "PATH"),
+            "{path}"
+        );
+    }
+    let overview = server.get("/ui").await;
+    assert_eq!(overview.code, 200);
+    assert!(
+        !overview.text().contains("/ui/updates"),
+        "{}",
+        overview.text()
+    );
+    server.stop().await;
+}
+
 /// Catches: a mount that serves a method other than `GET` and `HEAD` (mutant: `any`
 /// for `get`), `HEAD` with a body or refused, and any answer, a `405` or `404` included,
 /// without the headers (mutant: the `secure` layer removed).

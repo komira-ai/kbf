@@ -57,7 +57,6 @@ These amend the proposal. Where an older sentence below contradicts them, the ru
 ### 1.2 Beyond the assignment
 
 - **Overview** (in scope): the one-screen answer to "is the farm healthy". It adds no data of its own, it reads `/readyz`, `/v1/health` and the build list.
-- **Updates** (in scope, built): the page already exists in `kbf-ui` and reads built routes only. Unchanged by v1.
 - **Targets and Target pages** (kept, re-scoped by the CEO): a target's recent runs as a pass/fail strip, to spot flakiness fast (P8). The routes are built.
 - **`GET /v1/health`** (composed summary): without it the Overview would count nodes by state in the UI, which parity forbids.
 - Cut: the Grid page (TestGrid), the proxy-update row, `/llms.txt`.

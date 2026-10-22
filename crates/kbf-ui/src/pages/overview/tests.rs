@@ -72,6 +72,7 @@ fn the_overview_shows_health_counts_and_the_latest_builds() {
         html.contains("<a href=\"/ui/nodes\">All nodes</a>"),
         "{html}"
     );
+    assert!(!html.contains("/ui/updates"), "{html}");
     assert!(
         html.contains(
             "<th scope=\"row\"><a href=\"/ui/builds/build-1\">build-1</a></th>\
