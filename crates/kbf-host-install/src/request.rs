@@ -7,7 +7,8 @@
 //!
 //! - single spaces only, no leading or trailing space, no tab, newline, CR or NUL, no
 //!   extra token, lower-case verbs;
-//! - `version`: `[0-9][0-9A-Za-z.+~-]*`, at most 128 bytes, no epoch (no `:`), and a
+//! - `version`: `[0-9][0-9A-Za-z.+~-]*`, at most 128 bytes (and 230 once `+` and `~` count
+//!   twice, the room the unit name has), no epoch (no `:`), and a
 //!   version dpkg itself would parse (so `1.0-` is refused);
 //! - `channel`: `[a-z0-9][a-z0-9-]{0,31}`.
 //!
@@ -18,6 +19,11 @@ use crate::debver::DebVersion;
 
 /// The longest version, in bytes.
 pub const MAX_VERSION_LEN: usize = 128;
+
+/// The longest version, in bytes, once `+` and `~` are spelled as two bytes each in the
+/// unit name (see `plan::unit_name`): the unit name is the 17-byte prefix, this, and
+/// `.service`, so it stays within systemd's 255 bytes.
+pub const MAX_UNIT_VERSION_LEN: usize = 230;
 
 /// The longest channel name, in bytes.
 pub const MAX_CHANNEL_LEN: usize = 32;
@@ -40,7 +46,10 @@ impl Version {
     /// [`BadCommand`] when it is not in the grammar.
     pub fn new(text: &str) -> Result<Self, BadCommand> {
         let (first, rest) = text.split_at_checked(1).ok_or(BadCommand)?;
+        // `+` and `~` take two bytes in the unit name.
+        let unit_len = text.len() + text.bytes().filter(|b| b"+~".contains(b)).count();
         let well_formed = text.len() <= MAX_VERSION_LEN
+            && unit_len <= MAX_UNIT_VERSION_LEN
             && first.starts_with(|c: char| c.is_ascii_digit())
             && rest
                 .bytes()

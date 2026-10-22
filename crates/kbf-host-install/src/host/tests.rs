@@ -664,12 +664,71 @@ fn input_is_never_echoed() {
     assert!(!answer.out.contains("CANARY") && !answer.err.contains("CANARY"));
 }
 
+/// Two installs cannot overlap: while another invocation holds the install lock, an
+/// install is answered `busy` and runs nothing (so a second, older target cannot pass the
+/// not-older check against the same old version and then install over the first). Once
+/// the holder is gone the same install goes through.
+#[test]
+fn an_overlapping_install_is_busy() {
+    let fx = Fx::new("host-busy");
+    let holder = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&fx.host.install_lock)
+        .unwrap();
+    holder.lock().unwrap();
+    let runner = FakeRunner::new(vec![]);
+    let answer = fx.run(&runner, INSTALL);
+    assert_eq!(answer.code, 3);
+    assert_eq!(answer.json(), json!({"result": "failed", "reason": "busy"}));
+    assert!(runner.calls().is_empty(), "nothing ran");
+    assert_eq!(fx.audit_lines().len(), 1, "the attempt is audited");
+
+    // A query does not take the lock.
+    let runner = FakeRunner::new(vec![ok("un  \n"), exec(3, "", "")]);
+    assert_eq!(fx.run(&runner, "query").code, 0);
+
+    drop(holder);
+    let runner = install_script("ii  1.0-1\n", "ii  1.2.3-1\n");
+    assert_eq!(fx.run(&runner, INSTALL).code, 0);
+    // And the lock is released at the end of that install.
+    let runner = FakeRunner::new(vec![ok("ii  1.2.3-1\n")]);
+    assert_eq!(fx.run(&runner, INSTALL).code, 0);
+}
+
+/// A lock file that cannot be opened fails the install closed, before anything runs.
+#[test]
+fn an_unusable_lock_file_fails_closed() {
+    let mut fx = Fx::new("host-lock-missing");
+    fx.host.install_lock = fx.dir.join("no-such-dir").join("lock");
+    let runner = FakeRunner::new(vec![]);
+    let answer = fx.run(&runner, INSTALL);
+    assert_eq!(answer.code, 3);
+    assert_eq!(answer.json()["reason"], "lock_unavailable");
+    assert!(runner.calls().is_empty());
+
+    // A symbolic link in its place is not followed.
+    let target = fx.dir.join("elsewhere");
+    fs::write(&target, "").unwrap();
+    let link = fx.dir.join("lock-link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    fx.host.install_lock = link;
+    assert_eq!(
+        fx.run(&runner, INSTALL).json()["reason"],
+        "lock_unavailable"
+    );
+}
+
 /// The production paths are the ones the packaging installs.
 #[test]
 fn production_paths() {
     let host = Host::production();
     assert_eq!(host.config, PathBuf::from("/etc/kbf/host-install.toml"));
     assert_eq!(host.audit, PathBuf::from("/var/log/kbf-host-install.log"));
+    assert_eq!(
+        host.install_lock,
+        PathBuf::from("/run/kbf-host-install.lock")
+    );
     assert_eq!(host.proc_locks, PathBuf::from("/proc/locks"));
     assert_eq!(host.dpkg_lock, PathBuf::from("/var/lib/dpkg/lock-frontend"));
     assert_eq!(

@@ -60,6 +60,8 @@ changes it.
 
 ## What an install does
 
+0. Takes a non-blocking `flock` on `/run/kbf-host-install.lock` for the whole install; if
+   another install holds it, answers `failed` with reason `busy` and runs nothing.
 1. Reads the installed version with `dpkg-query`. A target older than the installed version
    is refused; the same version is a no-op that reports `already_installed`.
 2. Runs `apt-get update` restricted to the channel's source file
@@ -67,7 +69,7 @@ changes it.
    `apt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold
    -o DPkg::Lock::Timeout=300 -t <suite> kbf=<version>` with the same restriction. Each
    runs in a transient systemd unit (`systemd-run --wait --collect --pipe --quiet
-   --unit=kbf-host-install-<version>`), so a dropped ssh connection does not stop `dpkg`
+   --unit=kbf-host-install-<version>.service`), so a dropped ssh connection does not stop `dpkg`
    half way.
 3. Reads the installed version again and reports `installed` only if it is the target.
 
@@ -89,7 +91,7 @@ One JSON line on stdout.
 Refusal codes: `bad_command`, `channel_not_allowed`, `config_invalid`, `config_unsafe`,
 `channel_unsigned`, `key_untrusted`, `older_than_installed`. Failure codes:
 `audit_unavailable`, `query_failed`, `installed_version_invalid`, `package_state_unclean`,
-`update_failed`, `install_failed`, `verify_failed`.
+`update_failed`, `install_failed`, `verify_failed`, `busy`, `lock_unavailable`.
 
 `running_commit` is the commit `kbf --version --json` of the installed binary reports, or
 null. `in_progress` is true while a `kbf-host-install-*` unit is active or while some

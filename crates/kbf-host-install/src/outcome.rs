@@ -61,6 +61,10 @@ pub enum FailureCode {
     InstallFailed,
     /// The install ended well but the installed version is not the target.
     VerifyFailed,
+    /// Another install holds the install lock.
+    Busy,
+    /// The install lock file could not be opened.
+    LockUnavailable,
 }
 
 impl FailureCode {
@@ -74,6 +78,8 @@ impl FailureCode {
             Self::UpdateFailed => "update_failed",
             Self::InstallFailed => "install_failed",
             Self::VerifyFailed => "verify_failed",
+            Self::Busy => "busy",
+            Self::LockUnavailable => "lock_unavailable",
         }
     }
 }

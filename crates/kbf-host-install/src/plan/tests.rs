@@ -48,7 +48,7 @@ fn the_update_step_argv() {
             "--collect",
             "--pipe",
             "--quiet",
-            "--unit=kbf-host-install-1.2.3-1",
+            "--unit=kbf-host-install-1.2.3-1.service",
             "--property=RuntimeMaxSec=1800",
             &format!("--setenv=PATH={PATH}"),
             &format!("--setenv=LANG={LANG}"),
@@ -79,7 +79,7 @@ fn the_install_step_argv() {
             "--collect",
             "--pipe",
             "--quiet",
-            "--unit=kbf-host-install-1.2.3-1",
+            "--unit=kbf-host-install-1.2.3-1.service",
             "--property=RuntimeMaxSec=1800",
             &format!("--setenv=PATH={PATH}"),
             &format!("--setenv=LANG={LANG}"),
@@ -138,10 +138,13 @@ fn the_query_commands() {
 /// characters and are spelled out.
 #[test]
 fn unit_names_are_sanitized() {
-    assert_eq!(unit_name(&version("1.2.3-1")), "kbf-host-install-1.2.3-1");
+    assert_eq!(
+        unit_name(&version("1.2.3-1")),
+        "kbf-host-install-1.2.3-1.service"
+    );
     assert_eq!(
         unit_name(&version("1.0~rc1+b1")),
-        "kbf-host-install-1.0_trc1_pb1"
+        "kbf-host-install-1.0_trc1_pb1.service"
     );
     assert_ne!(unit_name(&version("1.0~1")), unit_name(&version("1.0+1")));
     for text in [
@@ -197,5 +200,18 @@ fn programs_are_absolute() {
 fn the_version_is_in_two_places() {
     let cmd = apt_install(&source(), &version("7.8.9"));
     let holders: Vec<&String> = cmd.args.iter().filter(|a| a.contains("7.8.9")).collect();
-    assert_eq!(holders, ["--unit=kbf-host-install-7.8.9", "kbf=7.8.9"]);
+    assert_eq!(
+        holders,
+        ["--unit=kbf-host-install-7.8.9.service", "kbf=7.8.9"]
+    );
+}
+
+/// A version ending in a unit type suffix (`.timer`, `.mount`) must not change the unit's
+/// type: the name always ends in `.service`.
+#[test]
+fn a_suffix_in_the_version_is_not_a_unit_type() {
+    for text in ["1.0.timer", "1.0.mount", "1.0.service", "1.0.slice"] {
+        let name = unit_name(&version(text));
+        assert_eq!(name, format!("kbf-host-install-{text}.service"));
+    }
 }

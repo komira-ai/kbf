@@ -42,7 +42,9 @@ pub const APT_GET: &str = "/usr/bin/apt-get";
 pub const KBF: &str = "/usr/bin/kbf";
 
 /// The unit name for installing `version`: the prefix and the version, with `+` as `_p`
-/// and `~` as `_t` (neither is allowed in a unit name; `_` cannot occur in a version).
+/// and `~` as `_t` (neither is allowed in a unit name; `_` cannot occur in a version),
+/// and always `.service`, so a version ending `.timer` or `.mount` is not a unit of that
+/// type. The request grammar bounds the length (`MAX_UNIT_VERSION_LEN`).
 pub fn unit_name(version: &Version) -> String {
     let mut name = String::from(UNIT_PREFIX);
     for c in version.as_str().chars() {
@@ -52,6 +54,7 @@ pub fn unit_name(version: &Version) -> String {
             c => name.push(c),
         }
     }
+    name.push_str(".service");
     name
 }
 

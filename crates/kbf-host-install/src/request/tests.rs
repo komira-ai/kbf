@@ -1,4 +1,6 @@
-use super::{BadCommand, Channel, MAX_CHANNEL_LEN, MAX_VERSION_LEN, Request, Version};
+use super::{
+    BadCommand, Channel, MAX_CHANNEL_LEN, MAX_UNIT_VERSION_LEN, MAX_VERSION_LEN, Request, Version,
+};
 
 fn parse(text: &str) -> Result<Request, BadCommand> {
     Request::parse(text)
@@ -192,4 +194,25 @@ fn version_and_channel_alone() {
     assert!(Channel::new("candidate").is_ok());
     assert!(Channel::new("").is_err());
     assert!(Channel::new("a b").is_err());
+}
+
+/// A version whose unit name would pass systemd's 255-byte limit is refused here, as a
+/// bad command, rather than failing later: `+` and `~` take two bytes in the name, so the
+/// limit is on the expanded length.
+#[test]
+fn a_version_too_long_for_a_unit_name_is_refused() {
+    let tildes = (MAX_UNIT_VERSION_LEN - 2) / 2;
+    let at_limit = format!("11{}", "~".repeat(tildes));
+    assert!(parse(&format!("install kbf={at_limit} from c")).is_ok());
+    for ch in ["~", "+"] {
+        let over = format!("11{}", ch.repeat(tildes + 1));
+        assert!(over.len() <= MAX_VERSION_LEN, "within the byte limit");
+        assert!(
+            parse(&format!("install kbf={over} from c")).is_err(),
+            "{ch}"
+        );
+    }
+    // Plain characters are one byte each: the full 128 is fine.
+    let plain = format!("1{}", "9".repeat(MAX_VERSION_LEN - 1));
+    assert!(parse(&format!("install kbf={plain} from c")).is_ok());
 }

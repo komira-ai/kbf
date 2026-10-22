@@ -16,7 +16,7 @@ const ALL_REFUSALS: [(Refusal, &str); 7] = [
     (Refusal::OlderThanInstalled, "older_than_installed"),
 ];
 
-const ALL_FAILURES: [(FailureCode, &str); 7] = [
+const ALL_FAILURES: [(FailureCode, &str); 9] = [
     (FailureCode::AuditUnavailable, "audit_unavailable"),
     (FailureCode::QueryFailed, "query_failed"),
     (
@@ -27,6 +27,8 @@ const ALL_FAILURES: [(FailureCode, &str); 7] = [
     (FailureCode::UpdateFailed, "update_failed"),
     (FailureCode::InstallFailed, "install_failed"),
     (FailureCode::VerifyFailed, "verify_failed"),
+    (FailureCode::Busy, "busy"),
+    (FailureCode::LockUnavailable, "lock_unavailable"),
 ];
 
 /// Catches a renamed code: the codes are the contract with the updater.

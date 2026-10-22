@@ -8,7 +8,9 @@
 //! warning goes to stderr), since neither changes the host.
 
 use std::ffi::OsStr;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use serde_json::Value;
@@ -21,13 +23,14 @@ use crate::outcome::{Failure, FailureCode, Outcome, QueryReport, Refusal};
 use crate::plan;
 use crate::request::{BadCommand, Channel, Request, Version};
 use crate::runner::{Cmd, Runner};
-use crate::trust::Trust;
+use crate::trust::{self, Trust};
 
 /// Where the files this program reads as root are, and who must own them.
 #[derive(Debug, Clone)]
 pub struct Host {
     pub(crate) config: PathBuf,
     pub(crate) audit: PathBuf,
+    pub(crate) install_lock: PathBuf,
     pub(crate) proc_locks: PathBuf,
     pub(crate) dpkg_lock: PathBuf,
     pub(crate) trust: Trust,
@@ -39,6 +42,7 @@ impl Host {
         Self {
             config: PathBuf::from("/etc/kbf/host-install.toml"),
             audit: PathBuf::from("/var/log/kbf-host-install.log"),
+            install_lock: PathBuf::from("/run/kbf-host-install.lock"),
             proc_locks: PathBuf::from("/proc/locks"),
             dpkg_lock: PathBuf::from("/var/lib/dpkg/lock-frontend"),
             trust: Trust::root(),
@@ -51,6 +55,7 @@ impl Host {
         Self {
             config: dir.join("host-install.toml"),
             audit: dir.join("audit.log"),
+            install_lock: dir.join("install.lock"),
             proc_locks: dir.join("proc-locks"),
             dpkg_lock: dir.join("lock-frontend"),
             trust,
@@ -229,6 +234,9 @@ fn install_checked(
             "the audit log cannot be opened; nothing was run",
         ));
     }
+    // One install at a time: the not-older check and the install are one critical
+    // section. The lock is dropped (and so released) when this function returns.
+    let _lock = take_install_lock(host)?;
     if let Some((text, installed)) = read_installed(runner)? {
         match version.parsed().cmp(&installed) {
             std::cmp::Ordering::Less => return Err(Outcome::Refused(Refusal::OlderThanInstalled)),
@@ -256,6 +264,28 @@ fn install_checked(
             "the installed version is not the one asked for",
         )),
     }
+}
+
+/// Take the install lock without waiting: an advisory `flock` on a root-owned file under
+/// `/run`, opened without following a symbolic link. Held by the returned file.
+fn take_install_lock(host: &Host) -> Result<File, Outcome> {
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(trust::nofollow())
+        .open(&host.install_lock)
+        .map_err(|e| {
+            fail(
+                FailureCode::LockUnavailable,
+                format!("{}: {e}", host.install_lock.display()),
+            )
+        })?;
+    // Anything but a lock taken means another install is running (or the lock cannot be
+    // held): either way nothing may start.
+    file.try_lock()
+        .map_err(|_| fail(FailureCode::Busy, "another install is running"))?;
+    Ok(file)
 }
 
 /// Run one step of the install; a failure to start it or a status but 0 is `code`.
