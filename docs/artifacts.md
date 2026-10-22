@@ -484,8 +484,8 @@ rebuilt. Its assets are every tarball and SBOM in the table above, for that comm
 it.
 
 One run of `release.yml` cuts a release; nobody tags. It is started by hand
-(`workflow_dispatch`, no inputs: it releases the commit it runs on) and, in a later change that
-adds `push: branches: [main]` and nothing else, by every push to `main`. A tag pushed by hand
+(`workflow_dispatch`, no inputs: it releases the commit it runs on, as a dry run) and by every
+push to `main` (`push: branches: [main]`). A tag pushed by hand
 starts nothing, and only the release bot (a GitHub App, the one bypass of the `v*` tag ruleset)
 can create one. The jobs, each with the least token it needs:
 
