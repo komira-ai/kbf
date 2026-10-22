@@ -1082,6 +1082,7 @@ fn the_start_migrates_the_installed_release_before_it_runs_it() {
         status,
         local: None,
         frontend_config: None,
+        watch: None,
     };
     let retry = Retry {
         attempts: 1,

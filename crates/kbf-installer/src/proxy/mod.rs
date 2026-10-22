@@ -19,7 +19,9 @@
 //! - [`migrator::DbMigrator`], the `Migrator` over the state database;
 //! - [`releases`], the proxy's own copies of the `kbf` it runs and the [`ports::RootOrders`] that
 //!   goes with them (a status file the proxy writes itself): what `kbf-installer proxy
-//!   --kbf-binary PATH` turns on (see [`handover`]); without the flag nothing uses it.
+//!   --kbf-binary PATH` turns on (see [`handover`]); without the flag nothing uses it;
+//! - [`binary_watch`], which polls the kbf at that path and starts the swap to a new one (the
+//!   trigger of a package upgrade, in place of the update API).
 //!
 //! Child control over HTTP: [`child_http`] is the blocking loopback client that the real
 //! child control and the fleet read call a child's ports with (U8b); [`admin`] is the
@@ -130,6 +132,7 @@
 pub mod admin;
 mod aio;
 pub mod api;
+pub mod binary_watch;
 #[cfg(target_os = "linux")]
 pub mod boot;
 pub mod child_http;
