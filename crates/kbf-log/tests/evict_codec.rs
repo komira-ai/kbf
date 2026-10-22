@@ -4,8 +4,6 @@
 //! - an encoding that changes under a committed log (golden bytes);
 //! - a conversion that loses, reorders or repeats an object (a round trip over
 //!   generated sets);
-//! - `EvictObjects` written into, or read from, a format-1 or format-2 log: a reader
-//!   without the command must refuse the entry, never skip it;
 //! - the command numbered onto a field a format-2 reader knows, which it would then
 //!   apply as another command;
 //! - a set accepted out of order or with a repeat, which would give one value two
@@ -119,12 +117,11 @@ fn generated_evict_objects_round_trip_and_reencode_to_the_same_bytes() {
     }
 }
 
-/// Catches: `EvictObjects` written into a format-1 or format-2 log, and a reader of
-/// either that skips it or reads it as something else, which would let a replica
-/// without the command keep entries the others dropped. Mutant: `since_v3` answering
-/// false (format 2 then takes the command).
+/// Asserts that `EvictObjects` is refused by the encoder under format 1 and format 2,
+/// and that its format-3 bytes decode to the same command under format 1 and format 2
+/// as under format 3, because decoding does not depend on the committed format.
 #[test]
-fn evict_refused_below_v3() {
+fn evict_is_written_from_v3_and_read_under_every_format() {
     for (name, command, hex) in golden() {
         let bytes = hex::decode(hex).expect("hex");
         for format in [Format::V1, Format::V2] {
@@ -134,8 +131,8 @@ fn evict_refused_below_v3() {
                 "{name} under {format:?}"
             );
             assert_eq!(
-                dec(format, &bytes),
-                Err(DecodeError::UnknownCommand("MetaCommand")),
+                dec(format, &bytes).as_ref(),
+                Ok(&command),
                 "{name} under {format:?}"
             );
         }
@@ -207,9 +204,9 @@ fn meta_bytes(command: &Command) -> Vec<u8> {
 
 /// What a format-2 binary sees in an `EvictObjects` entry: no command (the `oneof`
 /// unset). Catches the command numbered onto a field 1 to 14. The last format-2
-/// command still decodes under the old shape, so the check is not vacuous. That the
-/// decoder then refuses the entry is
-/// `an_unset_meta_command_is_refused_under_every_format`.
+/// command still decodes under the old shape, so the check is not vacuous. What the
+/// decoder then makes of the entry is
+/// `an_unset_meta_command_decodes_as_unknown_under_every_format`.
 #[test]
 fn a_format_2_binary_sees_no_command_in_an_evict_entry() {
     for (name, command, _) in golden() {
@@ -223,17 +220,13 @@ fn a_format_2_binary_sees_no_command_in_an_evict_entry() {
     assert!(matches!(old.command, Some(Format2Command::F14(_))));
 }
 
-/// What a format-2 binary decodes from an `EvictObjects` entry, `kbf_log::decode`
-/// refuses: the entry as that binary's prost leaves it (field 15 dropped, the
-/// `MetaCommand` empty) is refused with `UnknownCommand("MetaCommand")` under every
-/// format, by the unset-`oneof` check `meta::from_proto` has had since format 1. So a
-/// format-2 node stops at the entry instead of skipping it. Catches: an unset command
-/// decoded as a no-op (mutant: `from_proto` reads `None` as `Tick(0)`; the canonical
-/// re-encode check then refuses it as `NotCanonical`, a second barrier, so the
-/// assertion names the error). The raw entry under formats 1 and 2 is
-/// `evict_refused_below_v3`.
+/// Asserts that the entry as a format-2 binary's prost leaves it (field 15 dropped, the
+/// `MetaCommand` empty) decodes as an unknown command under every format, so a reader
+/// without `EvictObjects` skips the entry instead of refusing it or reading it as
+/// another command. The raw entry under formats 1 and 2 is
+/// `evict_is_written_from_v3_and_read_under_every_format`.
 #[test]
-fn an_unset_meta_command_is_refused_under_every_format() {
+fn an_unset_meta_command_decodes_as_unknown_under_every_format() {
     for (name, command, _) in golden() {
         let old = Format2MetaCommand::decode(meta_bytes(&command).as_slice()).expect("decode");
         let seen = proto::LogCommand {
@@ -246,7 +239,7 @@ fn an_unset_meta_command_is_refused_under_every_format() {
         for format in [Format::V1, Format::V2, Format::V3] {
             assert_eq!(
                 decode(format, &seen),
-                Err(DecodeError::UnknownCommand("MetaCommand")),
+                Ok(LogCommand::Unknown),
                 "{name} under {format:?}"
             );
         }

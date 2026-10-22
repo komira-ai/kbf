@@ -10,7 +10,7 @@ use super::*;
 use crate::golden::{
     INSTALLER_TOML_FRONTEND, INSTALLER_TOML_URL, installer_toml_frontend, installer_toml_url,
 };
-use crate::record::Sha256Hex;
+use crate::sha256_hex::Sha256Hex;
 
 /// A digest: 64 lowercase hex characters.
 const SHA: &str = "d2a84f4b8b650937ec8f73cd8be2c74add5a911ba64df27458ed8229da804a26";

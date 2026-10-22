@@ -19,8 +19,7 @@ use std::path::Path;
 
 use crate::cli::Mode;
 use crate::database::{Bounded, Database, DatabaseError, SchemaStep};
-use crate::proxy::migrator::{DbMigrator, probe_version, schema_of};
-use crate::proxy::model::PortError;
+use crate::migrator::{DbMigrator, MigrateError, probe_version, schema_of};
 use crate::run::Runner;
 
 /// The line of a check that did nothing because the mode keeps no state in the database.
@@ -63,7 +62,7 @@ pub fn migrate_before_start<S: SchemaStep>(
     let Some(mut step) = database()? else {
         return Ok(NO_DATABASE.to_owned());
     };
-    let unread = |e: PortError| format!("{} did not say its schema: {}", kbf.display(), e.0);
+    let unread = |e: MigrateError| format!("{} did not say its schema: {}", kbf.display(), e.0);
     let version = probe_version(runner, kbf).map_err(unread)?;
     let schema = schema_of(&version).map_err(unread)?;
     let said = step

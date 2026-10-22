@@ -29,11 +29,10 @@ futures.workspace = true
 kbf-unitfile.workspace = true
 kbf-daemon.workspace = true
 # `kbf-cell cross-version`'s check that the installer goes first is the installer's own
-# (`stage::understood`); the Envoy render the real-Envoy tests (tests/envoy_box,
-# tests/envoy_validate.rs) run, and the names tests/envoy_check.rs compares with the server's.
+# (`stage::understood`).
 kbf-installer.workspace = true
 kbf-objstore.workspace = true
-# The worker protocol's messages and client, for the same probe (and for tests/envoy_check.rs).
+# The worker protocol's messages and client, for the same probe.
 kbf-proto.workspace = true
 kbf-testkit.workspace = true
 kbf-transfer.workspace = true
@@ -93,8 +92,8 @@ rustls.workspace = true
 saphyr-parser.workspace = true
 sha2.workspace = true
 syn.workspace = true
-# The real-Envoy tests (tests/envoy_box): stub servers and Envoy as a child process.
-tokio = { workspace = true, features = ["io-util", "net", "process", "sync", "time"] }
+# The listeners, byte streams, channels and timers of the proxy, deploy and object-store tests.
+tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
 tokio-rustls.workspace = true
 tonic = { workspace = true, features = ["tls-ring"] }
 

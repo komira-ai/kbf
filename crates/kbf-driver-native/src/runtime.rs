@@ -90,6 +90,9 @@ pub struct NativeRuntime<C> {
     /// The slots of a root daemon's lease-user pool, one lease each.
     #[cfg(target_os = "macos")]
     slots: Option<crate::slots::macos::Slots>,
+    /// Whether the slot count reaches the daemon through a part of its own
+    /// ([`Self::report_slots_through`]) and so is left out of the Xcode survey's report.
+    slots_apart: std::sync::atomic::AtomicBool,
 }
 
 /// Everything `prepare` works out for `execute` and `finish`.
@@ -134,21 +137,21 @@ impl<C: Cas> NativeRuntime<C> {
         Self::with_remover(config, cas, &crate::mounts::remove_lease_dir)
     }
 
-    /// [`NativeRuntime::new`] with the clean of every pool slot made wrong on purpose
-    /// ([`clean::Mutant`](crate::slots::clean::Mutant): one step skipped, the check
-    /// honest or blind): for the mutant tests of `tests/slot_clean.rs` alone, which run
-    /// the freshness scenario over it and see the skipped step's residue.
+    /// [`NativeRuntime::new`] with one step left out of the clean of every pool slot
+    /// ([`clean::Skipped`](crate::slots::clean::Skipped): the step, and the check honest
+    /// or blind): for the tests of `tests/slot_clean.rs` alone, which run the freshness
+    /// scenario over it and see what the step is needed for.
     ///
     /// # Errors
     /// As [`NativeRuntime::new`].
     #[cfg(target_os = "macos")]
     #[doc(hidden)]
-    pub fn with_clean_mutant(
+    pub fn with_skipped_step(
         config: NativeConfig,
         cas: Arc<C>,
-        mutant: crate::slots::clean::Mutant,
+        skipped: crate::slots::clean::Skipped,
     ) -> std::io::Result<Self> {
-        Self::build(config, cas, &crate::mounts::remove_lease_dir, Some(mutant))
+        Self::build(config, cas, &crate::mounts::remove_lease_dir, Some(skipped))
     }
 
     /// [`NativeRuntime::new`], sweeping the scratch root with `remove`: a test hands
@@ -161,25 +164,27 @@ impl<C: Cas> NativeRuntime<C> {
         Self::build(config, cas, remove, None)
     }
 
-    /// [`NativeRuntime::with_remover`], with the pool's clean mutated when `mutant` is
-    /// given.
+    /// [`NativeRuntime::with_remover`], with a step left out of the pool's clean when
+    /// `skipped` is given.
     fn build(
         config: NativeConfig,
         cas: Arc<C>,
         remove: &dyn Fn(&Path) -> std::io::Result<()>,
-        mutant: Option<crate::slots::clean::Mutant>,
+        skipped: Option<crate::slots::clean::Skipped>,
     ) -> std::io::Result<Self> {
         let root = rustix::process::geteuid().is_root();
+        crate::slots::check_pool_isolation(config.pool.as_ref(), &config.isolation)
+            .map_err(std::io::Error::other)?;
         crate::slots::check_daemon_user(root, config.pool.as_ref())
             .map_err(std::io::Error::other)?;
         // Only a Mac has slots to clean.
         #[cfg(not(target_os = "macos"))]
-        let _ = mutant;
+        let _ = skipped;
         // Before the sweep: the keepers of a killed daemon's slots have ended them, and
         // this ends what is left, as every lease's end does.
         #[cfg(target_os = "macos")]
         let slots = (config.pool.as_ref())
-            .map(|pool| crate::slots::macos::Slots::start_mutated(pool, config.kill_wait, mutant))
+            .map(|pool| crate::slots::macos::Slots::start_skipping(pool, config.kill_wait, skipped))
             .transpose()?;
         std::fs::create_dir_all(&config.scratch)?;
         let rules = config
@@ -231,6 +236,7 @@ impl<C: Cas> NativeRuntime<C> {
             warm_up: Mutex::new(None),
             #[cfg(target_os = "macos")]
             slots,
+            slots_apart: std::sync::atomic::AtomicBool::new(false),
         };
         sweep_user_folders(&runtime.config);
         Ok(runtime)
@@ -304,6 +310,29 @@ impl<C: Cas> NativeRuntime<C> {
         entries
     }
 
+    /// Sends the daemon the number of free slots through `part` now and whenever it
+    /// changes (a slot went dirty, or was cleaned again), so the node reports its slots
+    /// without waiting for the Xcode survey to change. The survey's own report then
+    /// leaves the `action_slots` entry out: this part owns it. Without a pool, or off a
+    /// Mac, it sends nothing.
+    pub fn report_slots_through(&self, part: kbf_daemon::DriverPart) {
+        // Set whether or not there is a pool: with none, there is no entry to leave out.
+        self.slots_apart
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(target_os = "macos")]
+        if let Some(slots) = &self.slots {
+            let part = Arc::new(part);
+            slots.on_count(Arc::new(move |free| {
+                part.send(DriverReport {
+                    entries: vec![(crate::slots::CAPABILITY.to_owned(), free.to_string())],
+                    xcodes: Vec::new(),
+                });
+            }));
+        }
+        #[cfg(not(target_os = "macos"))]
+        drop(part);
+    }
+
     /// Makes the ready Xcodes of `installed` the ones actions may name, and returns
     /// what the daemon reports for them: [`Self::capabilities`] (one `xcode` entry per
     /// ready build), and every installed Xcode with its state for `NodeStatus`. Once
@@ -350,8 +379,12 @@ impl<C: Cas> NativeRuntime<C> {
             _ => None,
         };
         drop(warm_up);
+        let mut entries = self.capabilities();
+        if self.slots_apart.load(std::sync::atomic::Ordering::SeqCst) {
+            entries.retain(|(key, _)| key != crate::slots::CAPABILITY);
+        }
         let report = DriverReport {
-            entries: self.capabilities(),
+            entries,
             xcodes: installed.iter().map(xcode::Xcode::status).collect(),
         };
         (report, warming)
@@ -383,6 +416,69 @@ impl<C: Cas> NativeRuntime<C> {
     fn stops(&self) -> MutexGuard<'_, BTreeMap<LeaseId, oneshot::Sender<Stop>>> {
         // Each update is one map operation, so the map is consistent after a panic.
         self.stops.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Takes the lease's runner and prepares its directory: a root daemon's lease waits
+    /// for a free slot of the pool, killable, and a slot whose profile canaries are not
+    /// all refused is set aside and the next one taken (the action does not fail for it);
+    /// otherwise the daemon's own user runs it.
+    async fn start(
+        &self,
+        cas: &C::Lease,
+        work: &Work,
+        dir: &Path,
+        runner: &mut Runner,
+        stop: &mut oneshot::Receiver<Stop>,
+        killer: &mut Option<Stop>,
+    ) -> Result<Prepared, RuntimeError> {
+        #[cfg(target_os = "macos")]
+        if let Some(slots) = &self.slots {
+            return self
+                .slot_and_prepare(slots, (cas, work, dir), runner, (stop, killer))
+                .await;
+        }
+        // A kill during prepare (a long input fetch) stops it at once; the clean
+        // removes whatever was written.
+        let private = runner.private_lease();
+        let prepared = tokio::select! {
+            prepared = self.prepare(cas, work, dir, private) => prepared?,
+            Ok(by) = &mut *stop => {
+                *killer = Some(by);
+                return Err(RuntimeError::Killed);
+            }
+        };
+        runner.hand_over(dir, &Arc::default()).await?;
+        Ok(prepared)
+    }
+
+    /// [`Self::start`] for a pool: the first slot taken prepares the directory, each
+    /// slot taken is handed it and run through the profile canaries
+    /// ([`crate::slots::canary::first_passing`]); the one that passes is `runner`.
+    #[cfg(target_os = "macos")]
+    async fn slot_and_prepare(
+        &self,
+        slots: &crate::slots::macos::Slots,
+        (cas, work, dir): (&C::Lease, &Work, &Path),
+        runner: &mut Runner,
+        (stop, killer): (&mut oneshot::Receiver<Stop>, &mut Option<Stop>),
+    ) -> Result<Prepared, RuntimeError> {
+        // The offer borrows the runner, which the scope owns: the slot taken is in
+        // `runner` from the moment it is taken, whatever happens next.
+        let mut offer = SlotOffer {
+            runtime: self,
+            slots,
+            cas,
+            work,
+            dir,
+            stop,
+            killer,
+            prepared: std::sync::OnceLock::new(),
+            runner,
+        };
+        crate::slots::canary::first_passing(&mut offer).await?;
+        (offer.prepared)
+            .into_inner()
+            .ok_or_else(|| RuntimeError::Failed("no prepared lease".to_owned()))
     }
 
     /// Fetches and checks the action through the lease's `cas`, and writes its inputs
@@ -722,28 +818,7 @@ impl<C: Cas> NativeRuntime<C> {
         };
         // The lease's own view of the CAS, for its transfer counters.
         let cas = self.cas.lease(&work.lease_id);
-        // A lease of a root daemon waits for a free slot of the pool, killable.
-        #[cfg(target_os = "macos")]
-        if let Some(slots) = &self.slots {
-            *runner = tokio::select! {
-                slot = slots.take() => Runner::Slot(slot?),
-                Ok(by) = &mut *stop => {
-                    *killer = Some(by);
-                    return Err(RuntimeError::Killed);
-                }
-            };
-        }
-        // A kill during prepare (a long input fetch) stops it at once; the clean
-        // removes whatever was written.
-        let private = runner.private_lease();
-        let mut prepared = tokio::select! {
-            prepared = self.prepare(&cas, work, dir, private) => prepared?,
-            Ok(by) = &mut *stop => {
-                *killer = Some(by);
-                return Err(RuntimeError::Killed);
-            }
-        };
-        runner.hand_over(dir).await?;
+        let mut prepared = self.start(&cas, work, dir, runner, stop, killer).await?;
         runner.allows_simulator(prepared.simulator.is_some())?;
         // Not stopped by a kill: a `simctl create` cut short could still make its
         // device after the end looked for the lease's devices.
@@ -814,6 +889,97 @@ impl<C: Cas> NativeRuntime<C> {
     }
 }
 
+/// The slots of a pool offered to one lease ([`NativeRuntime::slot_and_prepare`]).
+#[cfg(target_os = "macos")]
+struct SlotOffer<'a, C: Cas> {
+    runtime: &'a NativeRuntime<C>,
+    slots: &'a crate::slots::macos::Slots,
+    cas: &'a C::Lease,
+    work: &'a Work,
+    dir: &'a Path,
+    stop: &'a mut oneshot::Receiver<Stop>,
+    killer: &'a mut Option<Stop>,
+    /// Made once, with the first slot taken.
+    prepared: std::sync::OnceLock<Prepared>,
+    /// The runner of the lease's scope: the slot taken last is put in it.
+    runner: &'a mut Runner,
+}
+
+#[cfg(target_os = "macos")]
+impl<C: Cas> crate::slots::canary::Offer for SlotOffer<'_, C> {
+    type Err = RuntimeError;
+
+    async fn next(&mut self) -> Result<(), RuntimeError> {
+        let taken = tokio::select! {
+            slot = self.slots.take() => Runner::Slot(slot?),
+            Ok(by) = &mut *self.stop => {
+                *self.killer = Some(by);
+                return Err(RuntimeError::Killed);
+            }
+        };
+        // Held from here on, in the scope's runner: every failure below leaves it there.
+        let private = taken.private_lease();
+        *self.runner = taken;
+        if self.prepared.get().is_none() {
+            let made = tokio::select! {
+                made = self.runtime.prepare(self.cas, self.work, self.dir, private) => made?,
+                Ok(by) = &mut *self.stop => {
+                    *self.killer = Some(by);
+                    return Err(RuntimeError::Killed);
+                }
+            };
+            let _ = self.prepared.set(made);
+        }
+        Ok(())
+    }
+
+    async fn probe(&mut self) -> Result<crate::slots::canary::Probe, RuntimeError> {
+        use crate::slots::canary::{Probe, Raced, until_killed};
+        let (slot, Some(made)) = (&*self.runner, self.prepared.get()) else {
+            return Err(RuntimeError::Failed("no lease to probe".to_owned()));
+        };
+        // The hand-over and the canaries are blocking work that cannot be dropped: on a
+        // kill they are told to stop and awaited, so that nothing of the slot runs after
+        // the lease is answered as killed (the directory is removed and the slot
+        // released next).
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let killed = async { (&mut *self.stop).await.ok() };
+        tokio::pin!(killed);
+        let handed = until_killed(slot.hand_over(self.dir, &cancel), &cancel, &mut killed).await;
+        match handed {
+            Raced::Done(done) => done?,
+            Raced::Killed(by) => {
+                *self.killer = Some(by);
+                return Err(RuntimeError::Killed);
+            }
+        }
+        let isolation = &self.runtime.config.isolation;
+        let ran = slot.canary(isolation, made.network, &made.lease, &cancel);
+        let report = match until_killed(ran, &cancel, &mut killed).await {
+            Raced::Done(done) => done?,
+            Raced::Killed(by) => {
+                *self.killer = Some(by);
+                return Err(RuntimeError::Killed);
+            }
+        };
+        Ok(if report.all_refused() {
+            Probe::Pass
+        } else {
+            Probe::Aside(report.failures())
+        })
+    }
+
+    async fn aside(&mut self, why: &str) -> Result<(), RuntimeError> {
+        // The slot's user owns the lease directory until it is taken back: a slot that
+        // is cleaned and offered again must not find it. If it cannot be taken back the
+        // slot stays held and the lease fails, so `run` removes the directory first.
+        self.runner.reclaim(self.dir).await?;
+        // The book logs it, in the shape of a failed clean.
+        std::mem::take(self.runner).set_aside(why);
+        Ok(())
+    }
+}
+
 impl<C: Cas> Runtime for NativeRuntime<C> {
     fn driver(&self) -> &'static str {
         DRIVER
@@ -826,27 +992,35 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
     async fn run(&self, work: Work) -> Result<ActionResult, RuntimeError> {
         let (stop_tx, mut stop) = oneshot::channel();
         let _registered = Registered::new(self, work.lease_id, stop_tx);
-        let dir = LeaseDir {
-            path: self.config.scratch.join(lease_name(work.lease_id)),
-            simctl: Arc::clone(&self.simctl),
-            simulator: Mutex::new(None),
-            armed: true,
+        // The lease directory and the runner (whose slot's user owns the directory) are
+        // one `Scope`, which drops the directory first and the slot after: a slot is
+        // cleaned and offered again as soon as it drops, and must not be while the
+        // directory still exists. That holds for a dropped run (the future cancelled) and
+        // for a panic too, because everything that holds the slot, the offer among it,
+        // borrows it from the scope and owns none.
+        let mut scope = crate::slots::Scope {
+            dir: LeaseDir {
+                path: self.config.scratch.join(lease_name(work.lease_id)),
+                simctl: Arc::clone(&self.simctl),
+                simulator: Mutex::new(None),
+                armed: true,
+            },
+            runner: Runner::Daemon,
         };
         let mut killer = None;
-        let mut runner = Runner::Daemon;
         let mut measured = None;
         let outcome = (self.attempt(
             &work,
-            &dir.path,
-            &dir.simulator,
-            &mut runner,
+            &scope.dir.path,
+            &scope.dir.simulator,
+            &mut scope.runner,
             &mut stop,
             &mut killer,
             &mut measured,
         ))
         .await;
-        let cleaned = dir.clean().await;
-        runner.release().await;
+        let cleaned = scope.dir.clean().await;
+        scope.runner.release().await;
         sweep_user_folders_after_lease(&self.config).await;
         // A kill that arrived after the work ended still waits for the clean.
         if let Some(by) = killer.or_else(|| stop.try_recv().ok()) {
@@ -1537,6 +1711,7 @@ mod tests {
         let scratch = dir.join("root");
         let mut config = NativeConfig::new(scratch.to_path_buf());
         config.pool = crate::slots::Pool::provisioned(1, 700).ok();
+        config.isolation = network::Isolation::Sandbox("/usr/bin/sandbox-exec".into());
         let refused = NativeRuntime::new(config, Arc::new(NoCas)).expect_err("started");
         #[cfg(target_os = "macos")]
         let want = "needs a daemon running as root";
@@ -1544,6 +1719,44 @@ mod tests {
         let want = "macOS only";
         assert!(refused.to_string().contains(want), "{refused}");
         assert!(!scratch.exists(), "a scratch root made before the refusal");
+    }
+
+    /// Catches a node with a pool and no `sandbox-exec` starting (the check exists but
+    /// `NativeRuntime::new` does not call it, or calls it after something is made): the
+    /// start is refused for that reason, before the scratch root is made. Seen red with
+    /// the call removed from `build`: the start succeeds on macOS and is refused for the
+    /// wrong reason elsewhere.
+    #[test]
+    fn a_pool_without_sandbox_exec_is_refused_by_the_runtime_before_it_makes_anything() {
+        let dir = crate::unit_dir("runtime-pool-no-sandbox");
+        let scratch = dir.join("root");
+        let mut config = NativeConfig::new(scratch.to_path_buf());
+        config.pool = crate::slots::Pool::provisioned(1, 700).ok();
+        config.isolation = network::Isolation::None;
+        let refused = NativeRuntime::new(config, Arc::new(NoCas)).expect_err("started");
+        assert!(
+            refused.to_string().contains("needs sandbox-exec"),
+            "{refused}"
+        );
+        assert!(!scratch.exists(), "a scratch root made before the refusal");
+    }
+
+    /// Catches a report-through that fails or sends something without a pool, and one that
+    /// changes the survey's other entries (the slot entry itself is left out of the survey
+    /// only on a Mac with a pool, which the runner tests): with the part taken, a node
+    /// with no pool sends the part nothing and the survey's report is the same.
+    #[test]
+    fn the_slots_part_owns_the_slot_entry_of_the_report() {
+        let scratch = crate::unit_dir("runtime-slots-part");
+        let runtime = NativeRuntime::new(NativeConfig::new(scratch.to_path_buf()), Arc::new(NoCas))
+            .expect("runtime");
+        let (driver, reports) = kbf_daemon::DriverWatch::new();
+        let part = driver.part(crate::slots::SOURCE).expect("the part");
+        let before = runtime.apply_xcodes(&[]).entries;
+        runtime.report_slots_through(part);
+        let after = runtime.apply_xcodes(&[]).entries;
+        assert_eq!(after, before, "no pool, no slot entry either way");
+        assert_eq!(*reports.borrow(), DriverReport::default());
     }
 
     /// Catches: a failed lease's usage lost (the daemon asks once, after `run` failed),

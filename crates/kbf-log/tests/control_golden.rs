@@ -360,6 +360,7 @@ fn the_golden_set_names_every_command_and_input() {
         let i = match &command {
             LogCommand::Meta(_) => unreachable!("metadata commands are meta_codec's"),
             LogCommand::Bootstrap(_) => unreachable!("Bootstrap is bootstrap_codec's"),
+            LogCommand::Unknown => unreachable!("an unknown command has no golden bytes"),
             LogCommand::Farm(b) => {
                 for input in &b.inputs {
                     let j = match input {

@@ -17,6 +17,9 @@
 //!   and the expiry, and the repair of the links after an interrupted verb.
 //! - [`meta_log`]: the node's metadata log, saved at a release's first start and put back when
 //!   the host goes back to the release that ran before (an older binary refuses a raised log).
+//! - [`migrator`]: brings the state database to the schema a release declares, and asks a
+//!   binary which schema that is (`--version --json`); the swap's migration and the schema
+//!   step of `boot-check` share it.
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
 //!
@@ -41,8 +44,6 @@
 //!   confirmed; the writer of the file [`seed`] reads.
 //! - [`archive`], [`binary`] and [`darwin`]: the tarball, the kind of executable and its
 //!   `--version --json`, and on macOS the quarantine attribute and the code signature.
-//! - [`envoy`]: the Envoy of a frontend host, rendered from settings and checked (a library
-//!   for the frontend-update path, with no command line).
 //! - [`proxy_verb`]: `kbf-installer proxy`, the host of the `kbf-proxy` runtime (the one
 //!   public port of a frontend host); it shares nothing with the root helper above.
 //! - [`proxy`]: the frontend proxy's update machinery, against traits (no socket, no child):
@@ -65,7 +66,6 @@ pub mod boot_schema;
 pub mod cli;
 pub mod darwin;
 pub mod database;
-pub mod envoy;
 pub mod exit;
 pub mod fetch;
 #[cfg(any(test, feature = "testkit"))]
@@ -77,6 +77,7 @@ pub mod host_mode;
 pub mod installer_toml;
 pub mod layout;
 pub mod meta_log;
+pub mod migrator;
 pub mod observe;
 pub mod proxy;
 pub mod proxy_verb;
@@ -91,6 +92,7 @@ mod seed_fixture;
 pub mod seq_floor;
 pub mod settings;
 pub mod setup;
+pub mod sha256_hex;
 pub mod spool;
 pub mod stage;
 pub mod state;

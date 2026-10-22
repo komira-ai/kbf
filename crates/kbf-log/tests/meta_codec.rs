@@ -7,12 +7,8 @@
 //!   must decode to the same command on a newer one;
 //! - a conversion that loses or mixes up a field (a round trip over generated values,
 //!   both `decode(encode(x)) == x` and `encode(decode(b)) == b`);
-//! - a decoder that reads an unknown or unspecified enum value as a default, or a
-//!   command it does not know as nothing at all, instead of refusing it;
 //! - a decoder that accepts an absent required field, a short hash, a store id past 16
-//!   bits, or a set out of order (which would give one value two encodings);
-//! - a decoder that accepts bytes `encode` would not write (an explicit zero, an
-//!   unknown field, a varint that is not minimal, a repeated or reordered field);
+//!   bits, or a set out of order;
 //! - a format other than 1 written or read.
 
 use kbf_log::{DecodeError, EncodeError, Format, LogCommand, decode, encode};
@@ -411,36 +407,19 @@ fn unreachable(reason: i32) -> proto::meta_command::Command {
     })
 }
 
-/// Catches: a decoder that reads an unspecified (zero) or unknown enum value as some
-/// default (an unknown reason as `Missing`, an unknown role as `Daemon`) instead of
-/// refusing the entry. Every enum field, at zero and at a value `log.proto` does not
-/// name; and the named values still decode, so the check is not vacuous.
+/// Asserts that an unspecified (zero) or unknown enum value decodes as an unknown
+/// command, not as some default (an unknown reason as `Missing`, an unknown role as
+/// `Daemon`) and not as an error. Every enum field, at zero and at a value `log.proto`
+/// does not name; and the named values still decode to their commands.
 #[test]
-fn an_unspecified_or_unknown_enum_value_is_refused() {
+fn an_unspecified_or_unknown_enum_value_decodes_as_unknown() {
+    let unknown = |meta| decode(Format::V1, &wrap(meta));
     for value in [0, 3, 99, -1] {
-        assert_eq!(
-            dec(&wrap(unreachable(value))),
-            Err(DecodeError::UnknownValue {
-                field: "ObjectUnreachable.reason",
-                value,
-            })
-        );
-        assert_eq!(
-            dec(&wrap(put_action(value, 1))),
-            Err(DecodeError::UnknownValue {
-                field: "PutAction.role",
-                value,
-            })
-        );
+        assert_eq!(unknown(unreachable(value)), Ok(LogCommand::Unknown));
+        assert_eq!(unknown(put_action(value, 1)), Ok(LogCommand::Unknown));
     }
     for value in [0, 2, 99, -1] {
-        assert_eq!(
-            dec(&wrap(put_action(1, value))),
-            Err(DecodeError::UnknownValue {
-                field: "PutAction.action",
-                value,
-            })
-        );
+        assert_eq!(unknown(put_action(1, value)), Ok(LogCommand::Unknown));
     }
     assert!(dec(&wrap(unreachable(1))).is_ok());
     assert!(dec(&wrap(unreachable(2))).is_ok());
@@ -448,22 +427,18 @@ fn an_unspecified_or_unknown_enum_value_is_refused() {
     assert!(dec(&wrap(put_action(2, 1))).is_ok());
 }
 
-/// Catches: a decoder that skips a command it does not know (an unset `oneof`, which is
-/// what prost leaves for a field number the file does not name) and applies nothing, or
-/// some default, in its place. A replica that skipped an entry the others applied would
-/// diverge silently.
+/// Asserts that a command this binary does not know (an unset `oneof`, which is what
+/// prost leaves for a field number the file does not name) decodes as an unknown
+/// command, at the top level and inside a metadata command, and that malformed bytes are
+/// still refused.
 #[test]
-fn a_command_this_binary_does_not_know_is_refused() {
-    // Field 15, length-delimited, empty: a command a later format might add.
-    let unknown = [0x7a, 0x00];
-    assert_eq!(
-        dec(&unknown),
-        Err(DecodeError::UnknownCommand("LogCommand"))
-    );
-    let mut meta = vec![0x0a, 0x02];
-    meta.extend(unknown);
-    assert_eq!(dec(&meta), Err(DecodeError::UnknownCommand("MetaCommand")));
-    assert_eq!(dec(&[]), Err(DecodeError::UnknownCommand("LogCommand")));
+fn a_command_this_binary_does_not_know_decodes_as_unknown() {
+    // `LogCommand` field 15, length-delimited, empty: a command a later format might add.
+    assert_eq!(decode(Format::V1, &[0x7a, 0x00]), Ok(LogCommand::Unknown));
+    // `MetaCommand` field 21 (`aa 01`), empty: the same, one level down.
+    let meta = [0x0a, 0x03, 0xaa, 0x01, 0x00];
+    assert_eq!(decode(Format::V1, &meta), Ok(LogCommand::Unknown));
+    assert_eq!(decode(Format::V1, &[]), Ok(LogCommand::Unknown));
     assert!(matches!(dec(&[0x0a, 0x05]), Err(DecodeError::Malformed(_))));
 }
 
@@ -631,8 +606,8 @@ fn malformed_values_are_refused() {
     }
 }
 
-/// Catches: an encoder or decoder that ignores the committed format, so a binary would
-/// write or read an encoding the log does not allow.
+/// Asserts that formats 0, 6 and `u32::MAX` are refused by both encode and decode, and
+/// that formats 1 to 5 decode the same bytes.
 #[test]
 fn only_formats_1_to_5_are_written_or_read() {
     let entry = LogCommand::Meta(Command::Collect);
@@ -656,12 +631,12 @@ fn only_formats_1_to_5_are_written_or_read() {
     }
 }
 
-/// Catches: a decoder that accepts bytes `encode` would not write, so one value would
-/// have two encodings and an entry would carry fields this binary ignores. prost on its
-/// own accepts every case below and drops the unknown fields; each decodes to a value
-/// whose canonical bytes are `canonical`, and each must be refused.
+/// Asserts that bytes `encode` would not write (an explicit zero, an unknown field, a
+/// varint that is not minimal, a repeated or reordered field) decode to the same value
+/// as the canonical bytes `encode` writes for it: prost accepts every case below and
+/// drops the unknown fields, and the decoder no longer compares with a re-encoding.
 #[test]
-fn bytes_encode_would_not_write_are_refused() {
+fn bytes_encode_would_not_write_decode_to_their_value() {
     let tick = Command::Tick(FarmTime::from_millis(1500));
     let reachable = Command::ObjectReachable {
         object: object(2, 9),
@@ -720,9 +695,8 @@ fn bytes_encode_would_not_write_are_refused() {
     ];
     for (name, hex, value, canonical) in cases {
         let bytes = hex::decode(hex).expect("hex");
-        assert_eq!(dec(&bytes), Err(DecodeError::NotCanonical), "{name}");
-        // The canonical bytes of the same value still decode: the refusal is the
-        // encoding's, not the value's.
+        assert_eq!(dec(&bytes).as_ref(), Ok(value), "{name}");
+        // The canonical bytes of the same value decode to it as well.
         assert_eq!(hex::encode(enc(value)), canonical, "{name}");
         assert_eq!(
             dec(&hex::decode(canonical).expect("hex")).as_ref(),

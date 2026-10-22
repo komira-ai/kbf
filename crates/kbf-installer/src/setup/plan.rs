@@ -9,6 +9,7 @@
 
 use kbf_host::{Cmd, Entry, Exec, HostPath, Owner, Perms, Plan, Planner, RunUser};
 
+use super::aio_migrate::Earlier;
 use super::kbf_settings::Setting;
 use super::kbf_toml::{self, Decision, Ours, UpdateDirs};
 use super::os::{DSCL, LAUNCHCTL, Os, SYSTEMCTL, View};
@@ -34,6 +35,9 @@ pub const MAC_DAEMON_LABEL: &str = "com.komira.kbf-daemon";
 pub const PROXY_UNITS: &[&str] = &["kbf-proxy.socket", "kbf-proxy.service"];
 /// The sibling of an all-in-one host's proxy: the storage and the daemon in one process.
 pub const STORAGE_AND_DAEMON_UNIT: &str = "kbf-storage-and-daemon.service";
+/// The unit of the earlier all-in-one layout, one process for everything; `setup` splits its
+/// `kbf.toml` and leaves the unit to the operator.
+pub const EARLIER_ALL_IN_ONE_UNIT: &str = "kbf-all-in-one.service";
 /// The units of an all-in-one host: the proxy's, then the sibling.
 const ALL_IN_ONE_UNITS: &[&str] = &[PROXY_UNITS[0], PROXY_UNITS[1], STORAGE_AND_DAEMON_UNIT];
 /// The account the proxy and its frontend children run as (`User=` of `kbf-proxy.service`).
@@ -50,7 +54,7 @@ const OLD_BACKUP_DROPIN: &str = "/etc/systemd/system/kbf-backup.service.d/10-ser
 const MAX_TOKEN_BYTES: u64 = 4096;
 
 /// The planner of this module: it reads the host through a [`View`].
-type Pl<'p, 'h> = Planner<'p, View<'h>>;
+pub(super) type Pl<'p, 'h> = Planner<'p, View<'h>>;
 
 fn hp(path: &str) -> Result<HostPath, SetupError> {
     Ok(HostPath::new(path)?)
@@ -58,13 +62,18 @@ fn hp(path: &str) -> Result<HostPath, SetupError> {
 
 /// A directory at `path`, `mode` and `owner`'s. (One line per call site, so that a failed
 /// step has a line of its own that a test runs.)
-fn dir(p: &mut Pl<'_, '_>, path: &str, mode: u32, owner: Owner) -> Result<(), SetupError> {
+pub(super) fn dir(
+    p: &mut Pl<'_, '_>,
+    path: &str,
+    mode: u32,
+    owner: Owner,
+) -> Result<(), SetupError> {
     p.dir(hp(path)?, Perms::new(mode), Some(owner))?;
     Ok(())
 }
 
 /// A file at `path` with these bytes, `mode` and `owner`'s; whether a step was planned.
-fn file(
+pub(super) fn file(
     p: &mut Pl<'_, '_>,
     path: &str,
     mode: u32,
@@ -91,7 +100,7 @@ pub fn mode_units(mode: Mode, proxy: bool) -> &'static [&'static str] {
         Mode::Daemon => &["kbf-daemon.service"],
         Mode::StorageAndDaemon => &[STORAGE_AND_DAEMON_UNIT],
         Mode::AllInOne if proxy => ALL_IN_ONE_UNITS,
-        Mode::AllInOne => &["kbf-all-in-one.service"],
+        Mode::AllInOne => &[EARLIER_ALL_IN_ONE_UNIT],
     }
 }
 
@@ -151,6 +160,9 @@ pub struct Ctx {
     /// The user of the proxy and its frontend children when the host also runs a sibling as
     /// `service` (all-in-one): `kbf-server`. None elsewhere, where `service` is that user.
     pub frontend: Option<RunUser>,
+    /// The `kbf.toml` of the earlier all-in-one layout, when the host has it: this run splits it
+    /// (`aio_migrate`) instead of deciding on it as on any file that is there.
+    pub earlier: Option<Earlier>,
 }
 
 /// The ids of `user` as the owner of a file.
@@ -213,6 +225,7 @@ pub fn context(os: &dyn Os, mode: Mode) -> Result<Ctx, SetupError> {
         root: os.root_owner(),
         service,
         frontend,
+        earlier: None,
     })
 }
 
@@ -446,7 +459,9 @@ pub fn before_release(
         .transpose()?;
     let settings = installer_settings(exec, v, platform)?;
     let listen = settings.proxy.as_ref().and_then(|p| p.listen);
+    // The earlier layout's file has these keys and is replaced by this run, so it is not refused.
     if v.proxy.is_some()
+        && ctx.earlier.is_none()
         && let Some(Entry::File { bytes, .. }) = exec.inspect(&hp(paths::kbf_toml(platform))?)?
     {
         let left = super::proxy::leftover_tls_keys(&String::from_utf8_lossy(&bytes));
@@ -494,7 +509,8 @@ pub fn before_release(
         file(&mut p, paths::enroll_token(platform), 0o600, service, token)?;
     }
     if serves_api(v.mode) {
-        operator_token(&mut p, os, exec, frontend, platform, &mut notes)?;
+        let earlier = ctx.earlier.as_ref();
+        operator_token(&mut p, os, exec, frontend, platform, earlier, &mut notes)?;
     }
 
     file(
@@ -511,24 +527,6 @@ pub fn before_release(
         plan: p.finish(),
         notes,
     })
-}
-
-/// Refuses an all-in-one host whose `kbf.toml` says `mode = "all-in-one"`: the layout of one
-/// process for everything, which `setup` does not rewrite into the proxy, the frontend child and
-/// the sibling (that move is not part of `setup` yet). Asked before the files the flags name are
-/// looked at, since on such a host they would be refused for what the earlier layout never had.
-/// Reads the host, changes nothing.
-pub fn refuse_earlier_all_in_one(exec: &dyn Exec, platform: Platform) -> Result<(), SetupError> {
-    let path = paths::kbf_toml(platform);
-    let Some(Entry::File { bytes, .. }) = exec.inspect(&hp(path)?)? else {
-        return Ok(());
-    };
-    if !kbf_toml::says_all_in_one(&String::from_utf8_lossy(&bytes)) {
-        return Ok(());
-    }
-    Err(SetupError::NeedsOperator(format!(
-        "{path} says mode = \"all-in-one\", the layout of one process for everything that an earlier release set up: setup writes the proxy layout (the proxy, a frontend child and the kbf-storage-and-daemon sibling) to a new host only and does not rewrite this file; leave this host on kbf-all-in-one.service, or set up another host"
-    )))
 }
 
 /// The text of the drop-in that moves `kbf-proxy.socket` to `addr`: the empty `ListenStream=`
@@ -570,15 +568,24 @@ fn proxy_listen(
 }
 
 /// The first operator token: made once, when the file is not there. It is never printed; the
-/// note names the file. Once a file is there, whatever it holds, setup makes no other.
+/// note names the file. Once a file is there, whatever it holds, setup makes no other. A host
+/// being moved from the earlier layout (`earlier`) keeps the token it has, as `owner`'s.
 fn operator_token(
     p: &mut Pl<'_, '_>,
     os: &dyn Os,
     exec: &dyn Exec,
     owner: Owner,
     platform: Platform,
+    earlier: Option<&Earlier>,
     notes: &mut Vec<String>,
 ) -> Result<(), SetupError> {
+    let kept = match earlier {
+        Some(earlier) => earlier.keep_token(p, exec, owner, platform, notes)?,
+        None => false,
+    };
+    if kept {
+        return Ok(());
+    }
     let token = paths::api_token(platform);
     if exec.stat(&hp(token)?)?.is_some() {
         return Ok(());
@@ -741,7 +748,15 @@ pub fn after_release(
                 .map_err(SetupError::NeedsOperator)?;
         }
     }
-    let decision = kbf_toml::decide(current.as_deref(), &ours, kbf_toml_path);
+    // The earlier layout's file is split, not decided on: its settings came in as flags, so
+    // `ours` has them, and the original is kept below before this file is replaced.
+    let decision = match &ctx.earlier {
+        Some(_) => Decision::Write(ours.render()),
+        None => kbf_toml::decide(current.as_deref(), &ours, kbf_toml_path),
+    };
+    if let Some(earlier) = &ctx.earlier {
+        earlier.plan(&mut p, ctx, &mut notes)?;
+    }
     // The children's file first: `kbf.toml` is the last file written, so that a stop part way
     // leaves no config that passes the sibling's unit condition.
     if let Some(port) = sibling {
@@ -752,11 +767,15 @@ pub fn after_release(
         uid: ctx.root.uid,
         gid: ctx.service_owner().gid,
     };
+    // The earlier layout's file is replaced while its unit may still run, and that unit must not
+    // be restarted onto it: the steps of the move say what to run, so the note that a running kbf
+    // keeps the old file (which reads as "restart it") is left out.
+    let existed = current.is_some() && ctx.earlier.is_none();
     config_file(
         &mut p,
         "kbf.toml",
         kbf_toml_path,
-        current.is_some(),
+        existed,
         decision,
         owner,
         &mut notes,

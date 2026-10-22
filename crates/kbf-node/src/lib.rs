@@ -127,17 +127,9 @@ pub struct Cli {
     /// one connection, within the `--transfer-*` limits.
     #[arg(long)]
     cas: Option<String>,
-    /// The root installer's directory: the daemon reads its `status.json` there. The
-    /// frontend's orders are written to `orders/` beneath it unless `--orders-dir` says
-    /// otherwise. Left out, the node updates by hand: it says so and touches no
-    /// directory. Not taken by the all-in-one binary yet.
-    #[arg(long, value_name = "DIR")]
-    update_dir: Option<PathBuf>,
-    /// The order spool (owned by the service user, mode 0700): where the daemon writes
-    /// the order records the root installer reads. With `--update-dir` only; default
-    /// `<update-dir>/orders`.
-    #[arg(long, value_name = "DIR", requires = "update_dir")]
-    orders_dir: Option<PathBuf>,
+    /// The retired `--update-dir` and `--orders-dir`: accepted, hidden, ignored.
+    #[command(flatten)]
+    retired_update: retired::RetiredUpdateFlags,
     #[command(flatten)]
     data: data_dir::DataArgs,
     #[command(flatten)]
@@ -635,6 +627,7 @@ fn start_over<C: Cas>(
 ) -> Result<NodeHandle, Error> {
     // Refused here, before any driver is set up, though only the plane over a storage
     // map reads the values; the plane gets the checked values, not the flags again.
+    cli.retired_update.warn();
     let liveness = cli.daemon.storage_liveness()?;
     let sizes = sizes(cli)?;
     sizes.log();
@@ -643,16 +636,6 @@ fn start_over<C: Cas>(
         // The CAS channel is made lazily, which needs the runtime's context.
         let _context = tokio.enter();
         let xcrun = Path::new(xcode::XCRUN);
-        // The update client is the frontend's daemon's alone: the in-process daemon of
-        // the all-in-one binary keeps none (its flags may not name one, so that none is
-        // silently ignored).
-        let update = match &maps {
-            Some(_) => Some(update::link(cli)?),
-            None if cli.update_dir.is_some() => {
-                return Err("--update-dir is not taken by the in-process daemon yet".into());
-            }
-            None => None,
-        };
         let (daemon, _) = node_over(
             cli,
             || native_config(cli),
@@ -660,7 +643,6 @@ fn start_over<C: Cas>(
             maps,
             Box::new(move |cli| plane(cli, liveness)),
         )?;
-        let daemon = update.into_iter().fold(daemon, Daemon::with_update);
         backstop(cli, daemon)
     };
     Ok(NodeHandle {
@@ -984,12 +966,7 @@ fn native_runtime<C: Cas>(
         }
         report
     };
-    // One part per survey, so none overwrites another's entries; the Xcodes' is the
-    // only one yet.
-    let (driver, reports) = DriverWatch::new();
-    let xcodes = driver
-        .part(xcode_watch::SOURCE)
-        .ok_or("the Xcode part of the driver watch is taken")?;
+    let (_driver, reports, xcodes) = watch_parts(&runtime)?;
     // Returns at once: the survey runs on the watch's thread.
     let _ = xcode_watch::watch(
         xcodes,
@@ -999,6 +976,24 @@ fn native_runtime<C: Cas>(
         Box::new(apply),
     );
     Ok((runtime, reports))
+}
+
+/// The native driver's driver watch, with a part per source so none overwrites another's
+/// entries: the slots' (the number of slots that can run a lease reaches the daemon
+/// whenever it changes, whether or not a survey does) wired to `runtime` before the
+/// Xcodes', whose part is returned for the survey.
+fn watch_parts<C: Cas>(
+    runtime: &NativeRuntime<C>,
+) -> Result<(DriverWatch, Reports, kbf_daemon::DriverPart), Error> {
+    let (driver, reports) = DriverWatch::new();
+    let slots = driver
+        .part(kbf_driver_native::slots::SOURCE)
+        .ok_or("the slots part of the driver watch is taken")?;
+    runtime.report_slots_through(slots);
+    let xcodes = driver
+        .part(xcode_watch::SOURCE)
+        .ok_or("the Xcode part of the driver watch is taken")?;
+    Ok((driver, reports, xcodes))
 }
 
 /// What the native driver's surveys send the daemon, merged.
@@ -1279,11 +1274,9 @@ mod container {
 
 mod data_dir;
 mod instance;
+mod retired;
 mod run;
 mod transfer;
-/// The node's update client, set up from `--update-dir` (public for the tests that read a
-/// host's `kbf.toml` into a node: kbf-cli's).
-pub mod update;
 mod whole_machine;
 
 #[cfg(test)]
@@ -1317,6 +1310,49 @@ mod tests {
             .expect("the first survey ends in time")
             .expect("the watch runs")
             .clone()
+    }
+
+    /// A CAS no test here reaches.
+    #[derive(Debug)]
+    struct NoCas;
+
+    impl Cas for NoCas {
+        type Lease = Arc<Self>;
+
+        fn lease(self: &Arc<Self>, _: &kbf_types::LeaseId) -> Arc<Self> {
+            Arc::clone(self)
+        }
+
+        async fn get(
+            &self,
+            digest: &kbf_proto::reapi::Digest,
+        ) -> Result<Vec<u8>, kbf_transfer::CasError> {
+            Err(kbf_transfer::CasError::Missing(digest.hash.clone()))
+        }
+
+        async fn put(
+            &self,
+            _: Vec<u8>,
+        ) -> Result<kbf_proto::reapi::Digest, kbf_transfer::CasError> {
+            Err(kbf_transfer::CasError::Unavailable(
+                "-".into(),
+                "no CAS".into(),
+            ))
+        }
+    }
+
+    /// Catches a driver watch whose slots' part is not wired to the runtime (the number of
+    /// slots that can run a lease would again wait for an Xcode survey to change): both
+    /// parts are taken by the wiring, the slots' first, so another taker finds neither.
+    #[test]
+    fn the_slots_part_and_the_xcodes_part_are_both_taken_by_the_wiring() {
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-node-watch-parts");
+        let runtime = NativeRuntime::new(NativeConfig::new(dir.to_path_buf()), Arc::new(NoCas))
+            .expect("runtime");
+        let (driver, _reports, _xcodes) = watch_parts(&runtime).expect("the parts");
+        assert!(driver.part(kbf_driver_native::slots::SOURCE).is_none());
+        assert!(driver.part(xcode_watch::SOURCE).is_none());
+        drop(runtime);
     }
 
     /// With the host's memory above the actions cgroup's cap, the placer's whole-host
@@ -2074,22 +2110,80 @@ mod tests {
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
-    /// The plane factory the update-dir test hands `start_over` three times: one function
-    /// item, so the three starts are one instantiation (the coverage ratchet counts the
-    /// best instantiation, which must run every arm of the match on the map and the flag).
+    /// The plane factory the retired-flags test hands `start_over` three times: one function
+    /// item, so the starts are one instantiation (the coverage ratchet counts the best
+    /// instantiation, which must run the map and no-map arms and the error return).
     fn plane(cli: &Cli, _: Liveness) -> Result<Arc<kbf_transfer::Transfers>, Error> {
         remote(cli)
     }
 
-    /// Catches a flag taken and ignored, and an update client left off: with a storage map
-    /// and `--update-dir` the daemon gets its update client; without a map (the in-process
-    /// daemon of the all-in-one binary) `--update-dir` is refused instead of silently doing
-    /// nothing; with neither, nothing is asked.
-    ///
-    /// Mutants seen red: the refusing arm dropped (the second start succeeds); the link
-    /// made whatever the flag says (the third start fails on the missing directory).
+    /// Starting with a retired flag logs the warning naming it, and starting without one logs
+    /// nothing of the kind: the call in `start_over` is what makes the flag's text reach a log.
     #[test]
-    fn the_update_dir_is_for_a_daemon_with_a_map_and_refused_without_one() {
+    fn start_over_logs_the_retired_flag_warning() {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("lock").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Sink {
+                self.clone()
+            }
+        }
+        let dir = scratch("retired-warn");
+        tls_files(&dir);
+        let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
+        let argv = |extra: Option<String>| {
+            let mut all = vec![
+                "kbf-daemon".to_owned(),
+                "--server=https://127.0.0.1:1".to_owned(),
+                flag("ca-cert", &dir.join("ca.pem")),
+                flag("cert", &dir.join("node.pem")),
+                flag("key", &dir.join("node.key")),
+                "--node-id=mac-1".to_owned(),
+                "--driver=native".to_owned(),
+                "--cas=https://127.0.0.1:1".to_owned(),
+                flag("data-dir", &dir),
+                flag("xcode-apps", &dir.join("Applications")),
+            ];
+            all.extend(extra);
+            Cli::try_parse_from(all).expect("flags")
+        };
+        let logged = |cli: &Cli| {
+            let sink = Sink::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(sink.clone())
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                drop(start_over(cli, None, plane).expect("start"));
+            });
+            let bytes = sink.0.lock().expect("lock").clone();
+            String::from_utf8(bytes).expect("utf8")
+        };
+        let with = logged(&argv(Some(flag("update-dir", &dir.join("update")))));
+        assert!(with.contains("--update-dir is no longer read"), "{with}");
+        let without = logged(&argv(None));
+        std::io::Write::flush(&mut Sink::default()).expect("the sink flushes");
+        assert!(!without.contains("no longer read"), "{without}");
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
+    /// The retired `--update-dir` and `--orders-dir` are still taken, with or without a
+    /// storage map and `--orders-dir` without `--update-dir`: a node whose `kbf.toml` or
+    /// plist still carries them starts, and nothing is refused in the all-in-one binary's
+    /// in-process daemon either. A start that fails inside `node_over` still returns its
+    /// error.
+    #[test]
+    fn the_retired_update_flags_are_accepted_with_or_without_a_map() {
         let dir = scratch("update-dir");
         tls_files(&dir);
         let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
@@ -2107,20 +2201,20 @@ mod tests {
         ];
         let mut asked = base.clone();
         asked.push(flag("update-dir", &dir.join("update")));
-        let with_dir = Cli::try_parse_from(asked).expect("flags");
-        let base_flags = base.clone();
-        let without = Cli::try_parse_from(base).expect("flags");
-        let started = start_over(&with_dir, Some(Arc::new(MapHolder::new())), plane);
-        drop(started.expect("a daemon with a map takes an update directory"));
-        let why = start_over(&with_dir, None, plane).err().expect("refused");
-        assert!(
-            why.to_string().contains("--update-dir is not taken"),
-            "{why}"
-        );
-        drop(start_over(&without, None, plane).expect("no flag, no client"));
-        // The fourth start fails inside `node_over`: this instantiation also takes the
+        asked.push(flag("orders-dir", &dir.join("orders")));
+        let with_dirs = Cli::try_parse_from(asked).expect("flags");
+        let mut orders_only = base.clone();
+        orders_only.push(flag("orders-dir", &dir.join("orders")));
+        let orders_only = Cli::try_parse_from(orders_only).expect("--orders-dir alone parses");
+        let started = start_over(&with_dirs, Some(Arc::new(MapHolder::new())), plane);
+        drop(started.expect("a daemon with a map takes the retired flags"));
+        drop(start_over(&with_dirs, None, plane).expect("so does the in-process daemon"));
+        drop(start_over(&orders_only, None, plane).expect("--orders-dir needs no --update-dir"));
+        assert!(!dir.join("update").exists(), "the flags create nothing");
+        assert!(!dir.join("orders").exists(), "the flags create nothing");
+        // The last start fails inside `node_over`: this instantiation also takes the
         // error return of that call, so it is the one the ratchet counts as fully run.
-        let mut broken = base_flags.clone();
+        let mut broken = base.clone();
         broken.push("--lease-placement=numa-node".to_owned());
         let broken = Cli::try_parse_from(broken).expect("flags");
         let why = start_over(&broken, None, plane).err().expect("refused");

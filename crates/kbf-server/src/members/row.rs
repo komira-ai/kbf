@@ -158,11 +158,20 @@ pub(super) struct Live {
     pub(super) version: Version,
 }
 
+/// The row a stored value holds. A state in it that this build does not name reads as
+/// [`kbf_map::MemberState::Unknown`] with the number it came with, so the row reads, the
+/// member is neither given work nor counted as active, and a row written back unchanged keeps
+/// the number.
+///
+/// # Errors
+/// [`MembershipError::Corrupt`] if the value is not a row message or holds no member.
 pub(super) fn decode_row(stored: &Versioned) -> Result<Live, MembershipError> {
     let row = Row::decode(stored.value.as_slice())
         .map_err(|e| MembershipError::Corrupt(format!("member row: {e}")))?;
-    let mut member = Member::try_from(row.member.unwrap_or_default())
-        .map_err(|e| MembershipError::Corrupt(format!("member row: {e}")))?;
+    let wire = row
+        .member
+        .ok_or_else(|| MembershipError::Corrupt("member row: no member".to_owned()))?;
+    let mut member = Member::from(wire);
     // The row's counter is the authority (a row written before the map named boots has
     // none inside the member).
     member.boot = row.boot;

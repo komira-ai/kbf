@@ -36,8 +36,7 @@ pub enum EvictReady {
     Ready,
     /// It does not, and the hook may not ready it: a cell of `voters` voters, whose
     /// machine version an operator raises once every replica runs one that takes the
-    /// command, or a single voter whose log the release's start ceiling holds below 3.
-    /// Nothing is forgotten until then.
+    /// command. Nothing is forgotten until then.
     NeedsV3 {
         /// The cell's voters.
         voters: usize,

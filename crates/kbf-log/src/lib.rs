@@ -5,28 +5,43 @@
 //! values they carry are in this crate ([`FarmBatch`], [`Report`], [`Takeover`],
 //! [`Checkpoint`], [`MachineVersion`]).
 //!
-//! [`encode`] and [`decode`] take the log's committed [`Format`]: [`Format::V1`];
-//! [`Format::V2`], which adds the write tier's metadata commands
-//! (docs/design/write-path.md, section 6.5); [`Format::V3`], which adds
-//! `EvictObjects`; or [`Format::V4`], which adds node writers (`SetWriter`, and object
-//! ids naming a storage node's member and boot) and the commands of a rebuild of the
-//! index; or [`Format::V5`], which adds `ReseatStaged`. Any other format is refused on both sides, and so is a command under a format
-//! before the one it joined, so a binary never writes or reads an encoding the log does
-//! not allow.
+//! [`encode`] takes the log's committed [`Format`]: [`Format::V1`]; [`Format::V2`],
+//! which adds the write tier's metadata commands (docs/design/write-path.md, section
+//! 6.5); [`Format::V3`], which adds `EvictObjects`; [`Format::V4`], which adds node
+//! writers (`SetWriter`, and object ids naming a storage node's member and boot) and the
+//! commands of a rebuild of the index; or [`Format::V5`], which adds `ReseatStaged`. Any
+//! other format is refused, and so is a command under a format before the one it joined,
+//! so a binary never writes an encoding the log does not allow. [`decode`] takes a
+//! format only to refuse a number this binary does not know: what it decodes never
+//! depends on it, so every command this binary knows decodes under every format.
 //!
-//! Decoding is strict, because every replica must apply the same value or none:
-//! - an enum value that is unspecified (zero) or unnamed is an error, never a default;
-//! - a `oneof` that is unset (a command or variant this binary does not know) is an
-//!   error;
-//! - a required message field that is absent is an error;
-//! - a set (a closure, a touch) must be in strictly increasing order;
-//! - a value its own type refuses (a custom QoS level, a capability request) is an
-//!   error, as the type's own constructor says;
-//! - the bytes must be the ones [`encode`] writes for the decoded value. prost on its own
-//!   accepts an explicit zero, a varint that is not minimal, a field repeated or out of
-//!   order, and drops a field it does not know; [`decode`] re-encodes the value and
-//!   refuses the entry unless the bytes match. So a value has exactly one encoding, and
-//!   `encode(decode(bytes)) == bytes` for every accepted entry.
+//! Every format changes additively, and a reader skips what it does not know instead of
+//! refusing it. A later binary may add a field to a message, a command to a `oneof`, or a
+//! new record kind; it may not renumber, remove or reinterpret anything, add a value to
+//! an enum a reader acts on (it adds a field instead), or make a field required. So
+//! [`decode`] skips:
+//! - a field no message of this binary names: prost drops it, and the part this binary
+//!   knows decodes as it would without the field;
+//! - a `oneof` that is unset, because its arm is one this binary does not name (a
+//!   command, a farm input, a record, an outcome, a QoS kind): the entry decodes as
+//!   [`LogCommand::Unknown`];
+//! - an enum value that is unspecified (zero) or unnamed, in a command this binary
+//!   knows: the entry decodes as [`LogCommand::Unknown`] as well;
+//! - the bytes [`encode`] would not have written (an explicit zero, a varint that is not
+//!   minimal, a field repeated or out of order): the value they stand for is decoded.
+//!
+//! What a host does with a [`LogCommand::Unknown`] entry is its own decision; this crate
+//! only reports it.
+//!
+//! [`decode`] still refuses an entry that is wrong in a way no later format makes right
+//! (a [`DecodeError`] other than `UnknownCommand` and `UnknownValue`):
+//! - bytes that are not a well-formed message;
+//! - a required message field that is absent, a log id, term or machine version that is
+//!   zero, or a hash that is not 32 bytes;
+//! - a set (a closure, a touch) that is not in strictly increasing order;
+//! - an object id that names no one writer, a store id or an urgency past 16 bits;
+//! - a value its own type refuses (a custom QoS level, a capability request), as the
+//!   type's own constructor says.
 //!
 //! An error is fail-stop for the replica that meets it.
 
@@ -45,7 +60,8 @@ use prost::Message;
 use proto::log_command::Command as P;
 
 /// Which entry encodings a log may hold. Committed in the log, raised only by a
-/// committed entry, so every replica decodes an entry under the same format.
+/// committed entry, so every replica encodes an entry under the same format. Decoding
+/// does not depend on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Format(u32);
 
@@ -148,6 +164,10 @@ pub enum LogCommand {
     Checkpoint(Checkpoint),
     /// Raises the machine version.
     MachineVersion(MachineVersion),
+    /// A command this binary does not know: a `oneof` arm that no message of this binary
+    /// names, or an enum value it does not know inside a command it does. The entry's
+    /// bytes are not kept, so it cannot be encoded.
+    Unknown,
 }
 
 /// Why an entry could not be encoded.
@@ -171,6 +191,9 @@ pub enum EncodeError {
     /// nanoseconds after it.
     #[error("a batch's wall-clock time is not a u64 count of nanoseconds since the Unix epoch")]
     WallTime,
+    /// A [`LogCommand::Unknown`] has no encoding.
+    #[error("a command this binary does not know has no encoding")]
+    Unknown,
 }
 
 /// Why an entry could not be decoded. Every case stops the replica.
@@ -182,10 +205,13 @@ pub enum DecodeError {
     /// The bytes are not a well-formed message.
     #[error("malformed entry: {0}")]
     Malformed(#[from] prost::DecodeError),
-    /// A `oneof` is unset: a command or variant this binary does not know.
+    /// A `oneof` is unset: a command or variant this binary does not know. [`decode`]
+    /// reads such an entry as [`LogCommand::Unknown`] and never returns this; a host
+    /// uses it to say why it stopped on an entry.
     #[error("{0} names no command or variant this binary knows")]
     UnknownCommand(&'static str),
-    /// An enum value that is unspecified or that this binary does not know.
+    /// An enum value that is unspecified or that this binary does not know. [`decode`]
+    /// reads such an entry as [`LogCommand::Unknown`] and never returns this.
     #[error("{field} has value {value}, which is unspecified or unknown")]
     UnknownValue {
         /// The field, as `Message.field`.
@@ -223,9 +249,6 @@ pub enum DecodeError {
     /// A set is out of order or repeats an element.
     #[error("{0} is not in strictly increasing order")]
     SetOrder(&'static str),
-    /// The bytes decode to a value, but are not the bytes [`encode`] writes for it.
-    #[error("entry is not the canonical encoding of its value")]
-    NotCanonical,
 }
 
 /// Encodes `command` under `format`.
@@ -249,6 +272,7 @@ pub fn encode(format: Format, command: &LogCommand) -> Result<Vec<u8>, EncodeErr
         LogCommand::MachineVersion(v) => {
             P::MachineVersion(proto::MachineVersion { version: v.get() })
         }
+        LogCommand::Unknown => return Err(EncodeError::Unknown),
     };
     let message = proto::LogCommand {
         command: Some(command),
@@ -256,12 +280,26 @@ pub fn encode(format: Format, command: &LogCommand) -> Result<Vec<u8>, EncodeErr
     Ok(message.encode_to_vec())
 }
 
-/// Decodes an entry's payload under `format`.
+/// Decodes an entry's payload. `format` must be one this binary knows, and nothing else
+/// depends on it: every command this binary knows decodes under every format. A command
+/// or value it does not know decodes as [`LogCommand::Unknown`], and a field it does not
+/// know is ignored; the crate documentation lists what is still refused.
 pub fn decode(format: Format, bytes: &[u8]) -> Result<LogCommand, DecodeError> {
     if !format.known() {
         return Err(DecodeError::Format(format));
     }
-    let command = match proto::LogCommand::decode(bytes)?.command {
+    match command(bytes) {
+        Err(DecodeError::UnknownCommand(_) | DecodeError::UnknownValue { .. }) => {
+            Ok(LogCommand::Unknown)
+        }
+        decoded => decoded,
+    }
+}
+
+/// The command in `bytes`; an unset `oneof` or an unknown enum value anywhere in it is
+/// the error [`decode`] reads as [`LogCommand::Unknown`].
+fn command(bytes: &[u8]) -> Result<LogCommand, DecodeError> {
+    Ok(match proto::LogCommand::decode(bytes)?.command {
         Some(P::Meta(c)) => LogCommand::Meta(meta::from_proto(c)?),
         Some(P::Bootstrap(b)) => LogCommand::Bootstrap(Bootstrap {
             log_id: NonZeroU64::new(b.log_id)
@@ -277,20 +315,5 @@ pub fn decode(format: Format, bytes: &[u8]) -> Result<LogCommand, DecodeError> {
             LogCommand::MachineVersion(control::machine_version_from_proto(v)?)
         }
         None => return Err(DecodeError::UnknownCommand("LogCommand")),
-    };
-    // A reader refuses a command its format does not take (a tier command under format
-    // 1, `EvictObjects` under format 1 or 2, a node writer before format 4) as an older
-    // binary does, which sees an unset `oneof` (or, for a node writer's object, fields
-    // it does not know, so bytes that are not canonical).
-    if let LogCommand::Meta(c) = &command
-        && !meta::takes(format, c)
-    {
-        return Err(DecodeError::UnknownCommand("MetaCommand"));
-    }
-    // One value, one encoding: refuse anything prost accepted that `encode` would not
-    // have written (an unknown field, a non-minimal varint, a reordered field).
-    if encode(format, &command).as_deref() != Ok(bytes) {
-        return Err(DecodeError::NotCanonical);
-    }
-    Ok(command)
+    })
 }

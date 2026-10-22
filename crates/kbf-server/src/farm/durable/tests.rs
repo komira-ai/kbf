@@ -719,8 +719,16 @@ fn an_unreadable_row_is_refused_naming_it() {
     });
     let pair = kbf_log::encode(Format::V1, &pair).expect("encode");
     let big = u64::MAX.to_be_bytes().to_vec();
-    let rows: [(&str, Vec<u8>, &str); 11] = [
+    // A metadata command whose `oneof` arm (field 21) no message of this build names:
+    // it decodes as an unknown command, which is refused by its own text.
+    let unknown = vec![0x0a, 0x03, 0xaa, 0x01, 0x00];
+    let rows: [(&str, Vec<u8>, &str); 12] = [
         ("op/0000000000000001", vec![0xff, 0xff, 0xff], "malformed"),
+        (
+            "op/0000000000000001",
+            unknown,
+            "a command this binary does not know",
+        ),
         ("op/0000000000000001", lease.clone(), "not a request"),
         ("op/0000000000000001", other, "not a single scheduler input"),
         ("op/0000000000000001", pair, "not a single scheduler input"),
@@ -1171,6 +1179,7 @@ fn raising(tag: u8, stamp: u64, evicted: &[u8]) -> FloorChange {
     FloorChange {
         raised: Some(a_floor(tag, stamp)),
         evicted: evicted.iter().map(|tag| key_of(*tag)).collect(),
+        ..FloorChange::default()
     }
 }
 
@@ -1278,6 +1287,7 @@ fn a_floor_is_written_though_its_operation_has_ended() {
     let evicted_only = FloorChange {
         raised: None,
         evicted: vec![key_of(2)],
+        ..FloorChange::default()
     };
     durable
         .requeued(&killed(7, 0), None, None, &evicted_only)
@@ -1342,6 +1352,7 @@ fn a_floor_row_that_is_not_one_is_refused() {
     let change = FloorChange {
         raised: Some(long),
         evicted: Vec::new(),
+        ..FloorChange::default()
     };
     let error = durable
         .requeued(&killed(1, 0), None, None, &change)
