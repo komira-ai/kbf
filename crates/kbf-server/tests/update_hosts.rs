@@ -124,7 +124,6 @@ fn start(policy: kbf_auth::Policy, state: Option<StateStore>) -> Running {
         token: None,
         local_cache: None,
         releases: None,
-        poll: None,
     };
     let bound = bind_server_with_state(
         Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory()),

@@ -1,9 +1,13 @@
 //! The RAM budget of the held set, its drain to the hot disk, the shutdown drain and the
 //! metrics (`docs/design/storage-ram-ack.md`, rule 3 and "Drain and shutdown").
 //!
-//! **Nothing puts a blob in the set in a running node yet** (the acknowledgement point is a
-//! later change): with `--ram-ack-bytes` at 0 every [`Cache::hold`] is refused, the set is
-//! empty, a drain pass finds nothing and the gauges read 0.
+//! **The producer** is the acknowledgement point: a streamed blob of at most
+//! [`crate::BUFFERED_BLOB_BYTES`] committed [`kbf_storage::CommitMode::Held`] on a node with
+//! `--ram-ack-bytes` over 0 is registered here by [`Cache::hold_write`] and the write is
+//! answered; the drain below writes it. Every other write is committed to disk first and
+//! counted in `writethrough{reason}`. With `--ram-ack-bytes` at 0 (the default) nothing
+//! calls [`Cache::hold_write`]: the set is empty, a drain pass finds nothing and the gauges
+//! read 0.
 //!
 //! **The budget** ([`RamBudget`]) is per node and never waited for. [`Cache::hold`] makes a
 //! non-blocking try-acquire of the blob's bytes; when the budget cannot give them the blob
@@ -133,7 +137,8 @@ pub enum Hold {
     /// The blob is held now, and its bytes are counted against the budget.
     Held,
     /// The blob needs no entry: it is held already (the first writer's entry stays and is
-    /// the only one drained), or it is the empty blob, which is always present.
+    /// the only one drained), it is the empty blob, which is always present, or (the
+    /// producer's look, [`Cache::hold_write`]) the index has it already.
     Duplicate,
     /// The budget has not the bytes: the blob is not held, and the caller writes it
     /// through to its disk.
@@ -146,6 +151,8 @@ pub(super) struct Ram {
     pub(super) budget: Arc<RamBudget>,
     drain_failures: Counter,
     writethrough: [Counter; WriteThrough::ALL.len()],
+    /// Blobs the node's peer confirmer keeps until the other owner has them on disk.
+    unconfirmed: AtomicU64,
     /// Rung when a blob is held: the background drain waits on it.
     kick: Notify,
 }
@@ -156,6 +163,7 @@ impl Default for Ram {
             budget: RamBudget::new(0),
             drain_failures: Counter::default(),
             writethrough: Default::default(),
+            unconfirmed: AtomicU64::new(0),
             kick: Notify::new(),
         }
     }
@@ -165,6 +173,20 @@ impl Ram {
     /// Counts a write that was committed to disk for `reason`.
     pub(super) fn through(&self, reason: WriteThrough) {
         self.writethrough[reason as usize].add(1);
+    }
+
+    /// Whether this node acknowledges a write from RAM at all (`--ram-ack-bytes` over 0).
+    pub(super) fn enabled(&self) -> bool {
+        self.budget.cap > 0
+    }
+
+    /// [`Ram::through`] for a write that went through the producer's decision: counted
+    /// only on a node that acknowledges from RAM, so a node that does not (the default)
+    /// reads 0 in every row.
+    pub(super) fn wrote_through(&self, reason: WriteThrough) {
+        if self.enabled() {
+            self.through(reason);
+        }
     }
 
     /// Appends the `kbf_storage_ram_*` families to `out`: the gauges as of `held`, the
@@ -192,6 +214,11 @@ impl Ram {
                 "kbf_storage_ram_unwritten_oldest_seconds {}\n",
                 held.oldest.as_secs_f64()
             ),
+        );
+        f.gauge(
+            "kbf_storage_ram_unconfirmed_blobs",
+            "Blobs acknowledged from RAM whose other owner is not yet known to have them on its disk",
+            self.unconfirmed.load(Ordering::Relaxed),
         );
         f.gauge(
             "kbf_storage_ram_budget_bytes",
@@ -281,7 +308,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// woken. See [`Hold`] for the answers. A refusal for the budget is counted as
     /// `writethrough{reason=budget}`.
     ///
-    /// Nothing in a running node calls this yet.
+    /// The primitive under [`Cache::hold_write`], which the write path calls: it does not
+    /// ask whether the index has the blob.
     pub fn hold(&self, blob: &VerifiedBlob) -> Hold {
         let digest = blob.digest();
         if is_empty_blob(&digest) || self.held.has(&digest) {
@@ -294,6 +322,44 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         self.insert_held(blob, Some(permit))
     }
 
+    /// The producer's entry (`StreamedPut::commit` with `Held`): [`Cache::hold`] for a blob
+    /// that is neither held nor already in the index. Looks at the set, then at the index,
+    /// in the readers' order: a blob a drain finished between the two is in the index, so a
+    /// late duplicate of a blob already on disk is a [`Hold::Duplicate`] and is not queued
+    /// to be written again. Two writers that both pass the look race on the insert, which
+    /// one wins.
+    ///
+    /// # Errors
+    /// The metadata log could not answer.
+    pub(crate) async fn hold_write(&self, blob: &VerifiedBlob) -> Result<Hold, super::CacheError> {
+        let digest = blob.digest();
+        if is_empty_blob(&digest) || self.held.has(&digest) {
+            return Ok(Hold::Duplicate);
+        }
+        if self.durable(&[digest]).await?.is_empty() {
+            return Ok(Hold::Duplicate);
+        }
+        Ok(self.hold(blob))
+    }
+
+    /// Whether this node acknowledges a write from RAM (`--ram-ack-bytes` over 0): the
+    /// answer to [`kbf_storage::Storage::ram_ack`].
+    #[must_use]
+    pub fn ram_ack_enabled(&self) -> bool {
+        self.ram.enabled()
+    }
+
+    /// Records how many digests the node's peer confirmer keeps
+    /// (`kbf_storage_ram_unconfirmed_blobs`).
+    pub fn set_unconfirmed(&self, blobs: usize) {
+        self.ram.unconfirmed.store(blobs as u64, Ordering::Relaxed);
+    }
+
+    /// Counts a write committed to disk for `reason`, on a node that acknowledges from RAM.
+    pub(super) fn wrote_through(&self, reason: WriteThrough) {
+        self.ram.wrote_through(reason);
+    }
+
     /// Holds `blob` with no budget, as a test that is not about the budget does; whether
     /// it did (`false`: the digest was held already). Only for tests.
     #[cfg(feature = "testkit")]
@@ -302,9 +368,14 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     }
 
     fn insert_held(&self, blob: &VerifiedBlob, permit: Option<Permit>) -> Hold {
-        let inserted =
-            self.held
-                .try_insert(blob.digest(), blob.bytes.clone(), permit, Instant::now());
+        let born = self.writer.born.generation();
+        let inserted = self.held.try_insert(
+            blob.digest(),
+            blob.bytes.clone(),
+            permit,
+            Instant::now(),
+            born,
+        );
         if !inserted {
             // The permit went with the refused entry.
             return Hold::Duplicate;
@@ -340,7 +411,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         };
         let outcomes =
             futures::future::join_all(claimed.into_iter().map(|(digest, bytes)| async move {
-                (digest, self.drain_one(digest, bytes).await)
+                let written = match self.drain_one(digest, bytes).await {
+                    Ok(()) => self.date_by_acknowledgement(&digest).await,
+                    Err(error) => Err(error),
+                };
+                (digest, written)
             }))
             .await;
         let mut report = DrainReport {
@@ -370,6 +445,27 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         drop(guard);
         report.retry_at = self.held.next_due();
         report
+    }
+
+    /// Dates the staged object that now holds `digest` by the map the blob was acknowledged
+    /// under, before the entry leaves the set (the flush report caps its clear generation by
+    /// the entry, then by the object, so the cap is never lost in between).
+    async fn date_by_acknowledgement(&self, digest: &Digest) -> Result<(), super::CacheError> {
+        let Some(born) = self.held.born_of(digest) else {
+            return Ok(());
+        };
+        let wanted = *digest;
+        let object = self
+            .writer
+            .query(move |s| match s.blob(&wanted) {
+                kbf_meta::BlobAnswer::Present { location, .. } => Some(location.object),
+                _ => None,
+            })
+            .await?;
+        if let Some(object) = object {
+            self.writer.born.lower(object, born);
+        }
+        Ok(())
     }
 
     /// Writes `bytes` as `digest` through the pool, or to the store if there is no pool.
@@ -442,5 +538,51 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     #[must_use]
     pub fn is_held_for_test(&self, digest: &Digest) -> bool {
         self.held.has(digest)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::*;
+
+    /// The empty blob is always present, so the producer holds nothing for it: with a budget
+    /// above 0 and a blob of no bytes, `hold_write` answers `Duplicate`, takes no budget and
+    /// leaves the set empty. (A stream of 0 bytes never reaches the producer, so this is
+    /// the arm's only caller.) Mutant: the arm removed (the empty blob is held, and its
+    /// zero bytes counted as a blob).
+    #[tokio::test]
+    async fn the_empty_blob_is_never_held() {
+        let cache = Cache::memory().with_ram_ack_bytes(1024);
+        let empty = VerifiedBlob::hashed(Bytes::new());
+        assert_eq!(
+            cache.hold_write(&empty).await.expect("asked"),
+            Hold::Duplicate
+        );
+        assert_eq!(cache.unwritten().blobs, 0);
+        let other = VerifiedBlob::hashed(Bytes::from_static(b"not empty"));
+        assert_eq!(cache.hold_write(&other).await.expect("asked"), Hold::Held);
+        assert_eq!(cache.unwritten().blobs, 1);
+    }
+
+    /// Dating a drained blob by its acknowledgement does nothing for a digest that is not
+    /// held (the entry left already), and for a held digest the index does not have (the
+    /// write did not stage it): both are `Ok`, and neither dates an object. Mutant: the
+    /// first arm answers an error.
+    #[tokio::test]
+    async fn dating_by_acknowledgement_needs_a_held_entry_and_a_staged_blob() {
+        let cache = Cache::memory().with_ram_ack_bytes(1024);
+        let blob = VerifiedBlob::hashed(Bytes::from_static(b"held, not written"));
+        cache
+            .date_by_acknowledgement(&blob.digest())
+            .await
+            .expect("not held");
+        assert_eq!(cache.hold(&blob), Hold::Held);
+        cache
+            .date_by_acknowledgement(&blob.digest())
+            .await
+            .expect("held, not in the index");
+        assert_eq!(cache.writer.born.dated(), 0);
     }
 }

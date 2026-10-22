@@ -235,6 +235,7 @@ impl Rig {
             facts: Facts {
                 instance: Some(Instance::A),
                 state: PathBuf::from("/var/lib/kbf/state.db"),
+                enroll: None,
             },
             successor: kbf_front::Successor::unknown(),
         }

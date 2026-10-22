@@ -78,7 +78,6 @@ fn start() -> Server {
         token: None,
         local_cache: None,
         releases: None,
-        poll: None,
     };
     let bound = bind_server_with_state(
         Arc::new(Cache::memory()),
@@ -386,7 +385,7 @@ async fn a_heartbeats_storage_health_reaches_the_api_and_null_is_unknown() {
         flush_conflicts: Some(u64::MAX),
         ..beat(&joined)
     };
-    client.heartbeat(said).await.expect("beats");
+    client.heartbeat(said.clone()).await.expect("beats");
     let shown = [11, 0, 33, 44, 55, 66].map(|v| json!(v));
     let mut want = shown.to_vec();
     want.push(Value::Null);

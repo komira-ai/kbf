@@ -3,13 +3,9 @@
 //! reports each way it differs; the real file must report none, and `tests` plants a defect for
 //! each rule on it.
 //!
-//! - **Events.** Exactly [`EVENTS`], and the dispatch takes no input. Today that is
-//!   `workflow_dispatch` alone. The change that makes a push to `main` cut a release adds
-//!   `push: branches: [main]` and `push` here, and nothing else (it lands last: every job and
-//!   rule below exists before the trigger does).
-//! - **Names gamma.yml depends on.** The workflow is named [`NAME`] (`gamma.yml` follows
-//!   `workflows: [release]`), and its job `publish` ([`PUBLISH`]) exists; `gamma evidence`
-//!   reads that job's conclusion. Renaming either stops every deploy to gamma silently.
+//! - **Events.** Exactly [`EVENTS`] (`push` filtered to `branches: [main]`, and
+//!   `workflow_dispatch`), and the dispatch takes no input. `push` is refused unless every job
+//!   of [`CHAIN`] is present: a push cuts a release only through the whole chain.
 //! - **The graph.** The jobs [`JOBS`], in that order, each with exactly the `needs`, token
 //!   scopes, `if:` and `environment` of [`RULES`]; the jobs that write need `gates`, `plan` and
 //!   `verify`, directly or through another. Only `publish` holds a write scope (`contents`),
@@ -36,17 +32,19 @@
 
 use super::workflows;
 
-/// The workflow's name: `gamma.yml` follows it (`workflows: [release]`).
-const NAME: &str = "release";
-/// The job whose conclusion `gamma evidence` reads. Keep it and give it no `name:`.
+/// The job that holds the write scope and creates the GitHub release.
 const PUBLISH: &str = "publish";
 
 /// The jobs, in file order.
 const JOBS: [&str; 7] = ["gates", "plan", "verify", "tag", "notes", PUBLISH, "bump"];
 
-/// The events that start the workflow. Add `push` here with the `push: branches: [main]` that
-/// starts it, in the change that does only that.
-const EVENTS: &[&str] = &["workflow_dispatch"];
+/// The events that start the workflow. `push` is allowed only with the filter
+/// `branches: [main]` and only while [`CHAIN`] is whole.
+const EVENTS: &[&str] = &["push", "workflow_dispatch"];
+
+/// The jobs a push to `main` must find in the workflow before it may start it: the gates, the
+/// plan, the checks, the tag, the publish and the bump. (No site job: none exists.)
+const CHAIN: &[&str] = &["gates", "plan", "verify", "tag", PUBLISH, "bump"];
 
 /// The environment of the jobs that hold the release bot's key or write.
 const ENVIRONMENT: &str = "release";
@@ -269,11 +267,6 @@ pub fn problems(release: &str) -> Result<Vec<String>, String> {
 }
 
 fn triggers(release: &str, out: &mut Vec<String>) -> Result<(), String> {
-    if workflows::workflow_name(release)?.as_deref() != Some(NAME) {
-        out.push(format!(
-            "the workflow is not named `{NAME}`: `gamma.yml` follows `workflows: [{NAME}]`, so no deploy to gamma would follow a release"
-        ));
-    }
     let events = workflows::events(release)?;
     for event in &events {
         if !EVENTS.contains(&event.as_str()) {
@@ -288,6 +281,14 @@ fn triggers(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         }
     }
     if events.iter().any(|e| e == "push") {
+        let jobs = workflows::job_names(release)?;
+        for job in CHAIN {
+            if !jobs.iter().any(|j| j == job) {
+                out.push(format!(
+                    "the workflow runs on `push` but has no job `{job}`: a push would cut a release without it"
+                ));
+            }
+        }
         let filters = workflows::push_filters(release).unwrap_or_default();
         if filters != [("branches".to_owned(), vec!["main".to_owned()])] {
             out.push(format!(
@@ -301,7 +302,7 @@ fn triggers(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     let names = workflows::job_names(release)?;
     if names != JOBS {
         out.push(format!(
-            "the jobs are {names:?}, not {JOBS:?} in that order (`{PUBLISH}` by that exact name: `gamma.yml` reads its conclusion)"
+            "the jobs are {names:?}, not {JOBS:?} in that order (`{PUBLISH}` by that exact name)"
         ));
     }
     let code = code(release);

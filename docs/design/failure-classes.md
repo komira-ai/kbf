@@ -541,7 +541,7 @@ floor** for the action's key, and later requests at that key book at least the f
   (a rebuild after a cache miss, a client retry), not yet the next commit's new digest;
   a key that survives a code change (O2 A or B) is a follow-up.
 - **Floors** (O3, still open) never fall and are not decayed; they live in the
-  scheduler's memory (a restart forgets them) and at most 65 536 are kept, the one
+  scheduler, written with the requeue and restored at start when a state store is configured (a restart without one forgets them); at most 65 536 are kept, the one
   raised longest ago forgotten first. There is no over-cap memo (O4): a repeat starts
   at its floor, the cap, and runs once (O4 C's behaviour).
 
@@ -605,7 +605,7 @@ the code shrinks again.
   through the server's API (planned). Pro: bounded waste, simple. Con: the numbers are
   guesses until pilot data sets them; decay needs each driver to report the action's
   whole-tree peak (the native watch measures it, the container driver can read the lease
-  cgroup's `memory.peak`; today's `ResourceUsage` holds one process's peak only).
+  cgroup's `memory.peak`; `ResourceUsage.peak_memory_bytes` is one process's peak from the local runtime and the cgroup's `memory.peak` from the container driver).
 - **B. No decay; operator clears only.** Pro: no peak reporting needed. Con: floors
   only grow, and capacity is lost silently.
 - **C. Track the measured peak** (the planned learned sizes) instead of a floor. Pro:

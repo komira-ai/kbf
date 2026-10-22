@@ -83,7 +83,7 @@ use crate::settings::Settings;
 use crate::state::Locked;
 
 /// The marker written into a release directory once every check has passed.
-pub const VERIFIED: &str = "VERIFIED";
+pub use crate::layout::VERIFIED;
 
 /// The most of an attestation bundle that is taken (the order record's own cap).
 pub const BUNDLE_CAP: u64 = 256 * 1024;

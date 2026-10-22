@@ -31,7 +31,7 @@
 //!
 //! This crate is a workspace member under the coverage gate (99% of lines and branches):
 //! the verbs are library functions over injected I/O, `main` is three lines, and every
-//! rule of the replay has a test and a planted mutant that turns it red.
+//! rule of the replay has a test that asserts it.
 
 #![forbid(unsafe_code)]
 

@@ -1,7 +1,6 @@
 //! The Held set (`docs/design/storage-ram-ack.md`): blobs a node holds in RAM and has
-//! acknowledged but not yet written to its disk. Nothing puts a blob there in a running
-//! node yet; these tests put blobs there through `Cache::hold_for_test` and check what
-//! each reader does: every one consults the set before the index (rule 1, never report
+//! acknowledged but not yet written to its disk. These tests put blobs there through
+//! `Cache::hold_for_test` and check what each reader does: every one consults the set before the index (rule 1, never report
 //! present what you cannot serve), and the durable question does not consult it.
 //!
 //! Each reader's test holds a blob that is **only** held (not in the index), so a reader

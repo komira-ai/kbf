@@ -15,12 +15,21 @@ use tonic::Status;
 use super::{STREAM_FROM_BYTES, StorageService};
 use crate::in_flight;
 use crate::replicate::{Plan, ReplicaLeg, Staging, View};
-use crate::{CommitMode, PutStream, StorageError, StreamedPut};
+use crate::{CommitMode, PutStream, StorageError, StreamedPut, Through};
 
 /// What a streamed write takes from [`super::Config::write_bytes_in_flight`]: room for the
 /// few chunks it holds (the writer's queue, the replica's, and the one in hand), not for
 /// the blob.
 const STREAM_WINDOW: u64 = 4 << 20;
+
+/// Who sent a write, beyond what the chain's plan says.
+#[derive(Clone, Copy)]
+pub(super) struct Origin {
+    /// The member that sent it as its replica's copy, if one did.
+    pub(super) from: Option<MemberId>,
+    /// That member asked for a held answer.
+    pub(super) asks_held: bool,
+}
 
 /// The messages of a `Write` after the first: a call's request stream, or the chunks of a
 /// blob an in-process caller holds ([`StorageService::in_process`]). One type for both so
@@ -49,15 +58,19 @@ impl StorageService {
     /// a chain). The answer is the blob's size. The one body of code a `Write` call and an
     /// in-process write ([`StorageService::in_process`]) both run.
     ///
+    /// `leg` says whether the write is a replica's copy and who sent it, and whether the
+    /// sender asked for a held answer ([`crate::replicate::LEG_HELD_HEADER`]).
+    ///
     /// # Errors
     /// What the checks and the store refuse, as the call's status.
     pub(super) async fn write_in(
         &self,
         requested: u64,
-        leg_from: Option<MemberId>,
+        leg: (Option<MemberId>, bool),
         unowned: bool,
         mut messages: Messages,
     ) -> Result<u64, Status> {
+        let (leg_from, asks_held) = leg;
         let _open = self.open_writes.begin();
         let view = self.view(requested).await?;
         let first = next_or(&mut messages, "write stream sent no message").await?;
@@ -69,12 +82,15 @@ impl StorageService {
             Err(StorageError::Invalid(_)) if unowned => (Plan::Local, None),
             planned => (planned?, view),
         };
-        // A blob this node already holds is acknowledged at once. A copy a peer sends (a
-        // chain's leg, the repair worker's) is a request for a durable copy, so a blob held
-        // only in RAM does not answer it: it is written (rule 2,
+        // A blob this node already holds is acknowledged at once. A copy a peer sends is a
+        // request for a durable copy unless the sender asked for a held answer (a chain's
+        // leg of a node that acknowledges from RAM): then a blob held in RAM answers it,
+        // as the sender itself acknowledges from RAM. Without that request (the repair
+        // worker's copy, a leg of a node that does not acknowledge from RAM) a blob held
+        // only in RAM does not answer: it is written (rule 2,
         // `docs/design/storage-ram-ack.md`). A client's write is answered by what can be
         // served.
-        let held = if leg_from.is_some() {
+        let held = if leg_from.is_some() && !asks_held {
             self.storage.find_durable(&[digest]).await?
         } else {
             self.storage.find_missing(&[digest]).await?
@@ -82,7 +98,11 @@ impl StorageService {
         if held.is_empty() {
             return Ok(size);
         }
-        self.write_blob(digest, first, messages, view.as_ref(), leg_from, plan)
+        let origin = Origin {
+            from: leg_from,
+            asks_held,
+        };
+        self.write_blob(digest, first, messages, view.as_ref(), origin, plan)
             .await?;
         Ok(size)
     }
@@ -105,20 +125,31 @@ impl StorageService {
 
     /// Stores the blob `digest`, of which `first` is the first message and `rest` the
     /// others, as `plan` says.
+    ///
+    /// **Where the write is acknowledged.** With `--ram-ack-bytes` (the storage says
+    /// [`crate::Storage::ram_ack`]) the primary of a chain asks its replica for a held
+    /// answer on the leg, and commits its own copy [`CommitMode::Held`] once the replica
+    /// has answered: the replica holds first, then the primary, then the client. A replica
+    /// that could not be reached is a write through with its debt journaled first
+    /// ([`Through::ReplicaLost`]), as is a blob with one owner ([`Through::SingleOwner`]).
+    /// The store decides the rest (a blob over the pool's buffered size, a full budget or
+    /// queue) and counts it. Each owner that may hold the blob in RAM registers its
+    /// digest with the peer confirmer until the other owner is known to have it on disk.
     pub(super) async fn write_blob(
         &self,
         digest: Digest,
         first: WriteRequest,
         rest: Messages,
         view: Option<&View>,
-        leg_from: Option<MemberId>,
+        origin: Origin,
         plan: Plan,
     ) -> Result<(), Status> {
         let size = digest.size_bytes;
+        let ram = self.storage.ram_ack();
         let put = self.open_stream(size).await?;
         let (put, leg) = match (&plan, put, &self.chain, view) {
             (Plan::Primary { replica }, Some(put), Some(chain), Some(view)) => {
-                (Some(put), Some(chain.open_leg(view, replica, size)?))
+                (Some(put), Some(chain.open_leg(view, replica, size, ram)?))
             }
             (Plan::Primary { .. }, None, _, _) => {
                 return Err(Status::failed_precondition(
@@ -138,8 +169,24 @@ impl StorageService {
         let _room = self.write_room.acquire_many(room).await.ok();
         let (staged, lost) = receive(digest, put, first, rest, leg).await?;
         let mut owing = None;
+        // How the blob is committed, and the owner that may hold it in RAM and so is to be
+        // confirmed on disk. A replica that was reached may hold it in RAM whether or not
+        // this node does.
+        let (mode, confirm) = match (&plan, origin.from) {
+            (Plan::Primary { .. }, _) if lost.is_some() => {
+                (CommitMode::Through(Through::ReplicaLost), None)
+            }
+            (Plan::Primary { replica }, _) if ram => (CommitMode::Held, Some(replica.id)),
+            (Plan::Primary { .. }, _) => (CommitMode::Durable, None),
+            // A copy from a primary that asked for a held answer; any other copy (the
+            // repair worker's) is for the disk.
+            (Plan::Local, Some(sender)) if origin.asks_held => (CommitMode::Held, Some(sender)),
+            (Plan::Local, Some(_)) => (CommitMode::Durable, None),
+            // One owner: R = 1, or a copy outside the chain.
+            (Plan::Local, None) => (CommitMode::Through(Through::SingleOwner), None),
+        };
         if let (Some(chain), Some(view)) = (&self.chain, view) {
-            chain.confirm(view, &digest, leg_from, &plan)?;
+            chain.confirm(view, &digest, origin.from, &plan)?;
             // The only way past a lost replica: the copy owed is on the disk before the
             // blob is present here, so a blob present here is replicated or owed. Until the
             // commit is over the debt is for a blob that may not be here yet, which the
@@ -148,9 +195,15 @@ impl StorageService {
                 owing = Some(chain.degrade(view, replica, &digest, &why).await?);
             }
         }
-        let committed = staged.commit(CommitMode::Durable).await;
+        let committed = staged.commit(mode).await;
         drop(owing);
         committed?;
+        if let (Some(peer), Some(confirmer), Some(view)) = (confirm, &self.confirmer, view) {
+            // After the blob is held here, before the client is answered: a full set
+            // journals its debt now.
+            confirmer.track(digest, peer, view.map.generation()).await?;
+            self.storage.unconfirmed(confirmer.len());
+        }
         Ok(())
     }
 

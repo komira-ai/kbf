@@ -73,6 +73,7 @@ use kbf_proto::worker::segments_server::{Segments, SegmentsServer};
 use tokio::sync::Semaphore;
 use tonic::service::Routes;
 
+use crate::repair::PeerConfirmer;
 use crate::replicate::{self, Chain, MapSource};
 use crate::{Storage, StorageError};
 
@@ -140,6 +141,7 @@ pub struct StorageService {
     segments: Arc<dyn Segments>,
     admission: Admission,
     chain: Option<Arc<Chain>>,
+    confirmer: Option<Arc<PeerConfirmer>>,
     map: Option<Arc<dyn MapSource>>,
     catch_up: Option<CatchUp>,
     open_writes: OpenWrites,
@@ -157,6 +159,7 @@ impl StorageService {
             storage,
             admission,
             chain: None,
+            confirmer: None,
             map: None,
             catch_up: None,
             open_writes: OpenWrites::new(),
@@ -191,6 +194,16 @@ impl StorageService {
         self.map = Some(chain.source());
         self.chain = Some(chain);
         Ok(self)
+    }
+
+    /// The service registering each blob it may hold in RAM with `confirmer`, which asks
+    /// the other owner whether it has the blob on disk once this node has written it
+    /// (`docs/design/storage-ram-ack.md`, "Peer confirmation and the repair debt"). A
+    /// service given none confirms nothing, as a node with no chain.
+    #[must_use]
+    pub fn with_confirmer(mut self, confirmer: Arc<PeerConfirmer>) -> Self {
+        self.confirmer = Some(confirmer);
+        self
     }
 
     /// The service of a node whose index may be being rebuilt: while `catch_up` says so,

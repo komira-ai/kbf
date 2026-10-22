@@ -20,8 +20,8 @@ const FIRST_PAUSE: Duration = Duration::from_millis(250);
 const MAX_PAUSE: Duration = Duration::from_secs(5);
 
 /// The time and the sleeping a hold uses, so that a test runs a hold without real time.
-/// [`Router::with_hold_clock`](crate::Router::with_hold_clock) sets it; the default is
-/// Tokio's clock, which a test can pause.
+/// [`Router::with_hold_clock`](crate::Router::with_hold_clock) and [`Hold::with_clock`] set
+/// it; the default is Tokio's clock, which a test can pause.
 pub trait HoldClock: Send + Sync {
     /// The time passed since some fixed moment of this clock's choosing. It never goes back.
     fn elapsed(&self) -> Duration;
@@ -53,25 +53,57 @@ impl HoldClock for TokioClock {
     }
 }
 
-/// How long a router holds a call that no owner could answer, and by which clock. A bound
-/// of zero holds nothing.
+/// How long a call that no owner could answer is held, and by which clock. A bound of zero
+/// holds nothing. A [`Router`](crate::Router) has one; a caller that talks to the nodes
+/// itself from a [`Placement`](crate::Placement) (the frontend's pass-through of a
+/// ByteStream) holds with its own, which pauses and ends as the router's does.
 #[derive(Clone)]
-pub(crate) struct Hold {
+pub struct Hold {
     pub(crate) bound: Duration,
     pub(crate) clock: Arc<dyn HoldClock>,
 }
 
+impl std::fmt::Debug for Hold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hold")
+            .field("bound", &self.bound)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Hold {
-    /// No hold: a call that no owner could answer is UNAVAILABLE at once.
-    pub(crate) fn none() -> Self {
+    /// A hold of `bound`, by Tokio's clock.
+    #[must_use]
+    pub fn new(bound: Duration) -> Self {
         Self {
-            bound: Duration::ZERO,
+            bound,
             clock: Arc::new(TokioClock::new()),
         }
     }
 
+    /// No hold: a call that no owner could answer is UNAVAILABLE at once.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::new(Duration::ZERO)
+    }
+
+    /// The same hold, by `clock` (the time, and the sleeping between tries) instead of
+    /// Tokio's: for a test that runs a hold without real time.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn HoldClock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// How long a call is held at most.
+    #[must_use]
+    pub fn bound(&self) -> Duration {
+        self.bound
+    }
+
     /// The start of one call's hold.
-    pub(crate) fn begin(&self) -> Waiting<'_> {
+    #[must_use]
+    pub fn begin(&self) -> Waiting<'_> {
         Waiting {
             hold: self,
             start: self.clock.elapsed(),
@@ -81,7 +113,7 @@ impl Hold {
 }
 
 /// One call's hold, from the first try.
-pub(crate) struct Waiting<'a> {
+pub struct Waiting<'a> {
     hold: &'a Hold,
     start: Duration,
     pause: Duration,
@@ -89,10 +121,10 @@ pub(crate) struct Waiting<'a> {
 
 impl Waiting<'_> {
     /// Pauses before the next try and answers true, unless the bound has passed since the
-    /// call began, which it answers at once with false. The pauses double up to
-    /// [`MAX_PAUSE`], and the last is cut short to end at the bound, so the call is tried
-    /// once more at the bound and never held past it.
-    pub(crate) async fn again(&mut self) -> bool {
+    /// call began, which it answers at once with false. The pauses double up to five
+    /// seconds, and the last is cut short to end at the bound, so the call is tried once
+    /// more at the bound and never held past it.
+    pub async fn again(&mut self) -> bool {
         let spent = self.hold.clock.elapsed().saturating_sub(self.start);
         if spent >= self.hold.bound {
             return false;

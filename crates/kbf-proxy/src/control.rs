@@ -1,10 +1,12 @@
 //! The seams U7 and U8 use: the update-API handler and the status the proxy reports.
 //!
 //! The admin calls on a child (`takeover`, `quiesce`, `stand_down`, `resume`, `role`) are not
-//! here. The proxy makes none of them: U7a's supervisor is their only caller, so the trait
-//! (`ChildControl`) lives in `kbf-installer` with the supervisor, and the proxy only supplies
-//! the child's admin port ([`crate::config::UpstreamTable::admin_port`]) and the headers that
-//! authenticate a call to it ([`crate::identity::admin_headers`]).
+//! here. The proxy makes none of them that change a child: U7a's supervisor is their only
+//! caller, so the trait (`ChildControl`) lives in `kbf-installer` with the supervisor, and the
+//! proxy only supplies the child's admin port ([`crate::config::UpstreamTable::admin_port`])
+//! and the headers that authenticate a call to it ([`crate::identity::admin_headers`]). The one
+//! call the proxy makes itself is the read-only `GET role`, once a second per open slot, for
+//! the term of the child's operation names (`crate::term`).
 
 use std::time::Duration;
 
