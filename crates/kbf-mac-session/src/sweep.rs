@@ -36,8 +36,8 @@ const DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC);
 
 /// How deeply nested a directory the walk searches for the uid's entries in another
-/// owner's directories, and how deep the flag clear looks. A tree of the departing uid is
-/// removed whatever its depth.
+/// owner's directories (the flag clear looks to [`PARK_DEPTH`], fewer descriptors). A tree
+/// of the departing uid is removed whatever its depth.
 pub const MAX_DEPTH: usize = 256;
 
 /// Where the sweep looks.
@@ -372,7 +372,7 @@ fn remove_present(
     if depth > PARK_DEPTH {
         // Too deep to go on holding a descriptor per level: moved up under the directory
         // being emptied, to be removed from there (see [`Park`]).
-        return park.take(dir, name);
+        return park.take(dir, name, stat);
     }
     let child = open_child(dir, name, stat)?;
     for entry in listed(&child)? {
@@ -388,6 +388,9 @@ fn remove_present(
 /// How deep the removal recurses before it moves what is below up to the top: it holds one
 /// descriptor per level (a Mac's default is 256 in all), so this stays well under that.
 const PARK_DEPTH: usize = 64;
+
+/// How many names [`Park::take`] tries before it gives up.
+const PARK_NAMES: usize = 4096;
 
 /// Where a removal puts a subtree that is deeper than [`PARK_DEPTH`]: `dir`, the directory
 /// being emptied (same filesystem, so a rename, and the subtree is only moved, never
@@ -410,19 +413,33 @@ impl<'a> Park<'a> {
         }
     }
 
-    /// Moves `name` of `from` up to a name of its own in the park.
-    fn take(&self, from: &OwnedFd, name: &OsStr) -> io::Result<()> {
-        // Named by the time as well as a count, so a name made ahead in the tree being
-        // emptied cannot be guessed to stop the move.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let n = self.next.get();
-        self.next.set(n + 1);
-        let to = OsString::from(format!(".kbf-deep-{}-{n}-{nanos}", std::process::id()));
-        rustix::fs::renameat(from, name, self.dir, to.as_os_str())
-            .map_err(io::Error::from)
-            .map(|()| self.names.borrow_mut().push(to))
+    /// Moves `name` of `from`, judged as `judged`, up to a name of its own in the park.
+    /// It is looked at again first: an entry replaced since it was judged is not moved
+    /// (an error), one gone is removed already. The move is exclusive, so a name made
+    /// ahead in the tree being emptied is never replaced, only skipped.
+    fn take(&self, from: &OwnedFd, name: &OsStr, judged: &Stat) -> io::Result<()> {
+        let same = examine(from, name)?
+            .is_some_and(|now| (now.st_dev, now.st_ino) == (judged.st_dev, judged.st_ino));
+        if !same {
+            return Err(io::Error::other("replaced while being examined"));
+        }
+        for _ in 0..PARK_NAMES {
+            let n = self.next.get();
+            self.next.set(n + 1);
+            let to = OsString::from(format!(".kbf-deep-{}-{n}", std::process::id()));
+            match rename_excl(from, name, self.dir, to.as_os_str()) {
+                Ok(()) => {
+                    self.names.borrow_mut().push(to);
+                    return Ok(());
+                }
+                // Taken: the next name.
+                Err(Errno::EXIST) => {}
+                Err(why) => return Err(why.into()),
+            }
+        }
+        Err(io::Error::other(
+            "no free name to move a deep tree up under",
+        ))
     }
 
     /// Removes what was moved up, which may move more up, until nothing is left.
@@ -436,6 +453,43 @@ impl<'a> Park<'a> {
             })?;
         }
     }
+}
+
+/// `renameat` that does not replace what is at the new name (`EEXIST` instead).
+#[cfg(target_os = "linux")]
+fn rename_excl(from: &OwnedFd, old: &OsStr, to: &OwnedFd, new: &OsStr) -> Result<(), Errno> {
+    rustix::fs::renameat_with(from, old, to, new, rustix::fs::RenameFlags::NOREPLACE)
+}
+
+/// `renameatx_np` with `RENAME_EXCL`: does not replace what is at the new name.
+#[cfg(target_os = "macos")]
+fn rename_excl(from: &OwnedFd, old: &OsStr, to: &OwnedFd, new: &OsStr) -> Result<(), Errno> {
+    use std::os::fd::AsRawFd as _;
+    let (Ok(old), Ok(new)) = (
+        std::ffi::CString::new(old.as_bytes()),
+        std::ffi::CString::new(new.as_bytes()),
+    ) else {
+        return Err(Errno::INVAL);
+    };
+    // SAFETY: both names are NUL-terminated and outlive the call, both descriptors are
+    // open directories borrowed for it.
+    let renamed = unsafe {
+        libc::renameatx_np(
+            from.as_raw_fd(),
+            old.as_ptr(),
+            to.as_raw_fd(),
+            new.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if renamed == 0 {
+        return Ok(());
+    }
+    Err(Errno::from_raw_os_error(
+        io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO),
+    ))
 }
 
 #[allow(clippy::unnecessary_cast)] // `st_mode` is u32 on Linux, u16 on macOS
@@ -569,31 +623,42 @@ fn clear_entry(
     if stat.st_uid == uid {
         clear_marked(dir, name, &stat)?;
         swept.removed += 1;
-        if !is_link(&stat) {
-            rustix::fs::chmodat(dir, name, owner_rwx(&stat), AtFlags::empty())?;
-        }
+        make_owner_rwx(dir, name, &stat)?;
     }
     if !is_dir(&stat) {
         return Ok(());
     }
-    if depth >= MAX_DEPTH {
-        // Not searched deeper: the removal that follows clears the locks of what the uid
-        // owns as it goes, and a root removal needs nothing else.
+    if depth >= PARK_DEPTH {
+        // Not searched deeper, so that no more than [`PARK_DEPTH`] descriptors are open
+        // (a Mac's soft limit can be 256 in all): the removal that follows clears the
+        // locks of what the uid owns as it goes, and a root removal needs nothing else.
         return Ok(());
     }
     let child = open_child(dir, name, &stat)?;
     clear_below(&child, here, uid, dev, depth + 1, swept)
 }
 
+/// Adds the owner's `rwx` to the entry `name` of `dir`, judged as `stat`, through a
+/// descriptor opened without following a link and checked to be the entry judged: a link
+/// swapped in since is never followed (`chmod` has no no-follow form on Linux), and one
+/// that cannot be opened (a link, a socket, a file root alone may read) is left as it is,
+/// which a removal by root does not need changed.
+fn make_owner_rwx(dir: &OwnedFd, name: &OsStr, stat: &Stat) -> io::Result<()> {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let Ok(file) = rustix::fs::openat(dir, name, flags, Mode::empty()) else {
+        return Ok(());
+    };
+    let opened = rustix::fs::fstat(&file)?;
+    if (opened.st_dev, opened.st_ino) != (stat.st_dev, stat.st_ino) {
+        return Ok(());
+    }
+    Ok(rustix::fs::fchmod(&file, owner_rwx(stat))?)
+}
+
 /// The permission bits of `stat` with the owner's `rwx` added.
 #[allow(clippy::unnecessary_cast)] // `st_mode` is u32 on Linux, u16 on macOS
 fn owner_rwx(stat: &Stat) -> Mode {
     Mode::from_raw_mode(((stat.st_mode as u32 & 0o7777) | 0o700) as _)
-}
-
-#[allow(clippy::unnecessary_cast)] // `st_mode` is u32 on Linux, u16 on macOS
-fn is_link(stat: &Stat) -> bool {
-    FileType::from_raw_mode(stat.st_mode as _) == FileType::Symlink
 }
 
 /// Clears [`CLEARED_FLAGS`] of the directory `dir` itself.

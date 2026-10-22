@@ -112,6 +112,17 @@ impl<R: Slotted + Send + Sync + 'static> Book<R> {
     /// The slots over `ready`, each cleaned by `cleaner` first (a slot whose clean leaves
     /// it dirty is not free), and the recovery thread started with `backoff`.
     pub(crate) fn start(ready: Vec<R>, cleaner: Cleaner<R>, backoff: Backoff) -> Arc<Self> {
+        Self::start_with(ready, cleaner, backoff, None)
+    }
+
+    /// [`Book::start`], the recovery thread given a stack of `stack` bytes if any (a test
+    /// asks for one that cannot be made).
+    fn start_with(
+        ready: Vec<R>,
+        cleaner: Cleaner<R>,
+        backoff: Backoff,
+        stack: Option<usize>,
+    ) -> Arc<Self> {
         let book = Arc::new(Self {
             permits: Arc::new(Semaphore::new(0)),
             free: Mutex::default(),
@@ -136,12 +147,14 @@ impl<R: Slotted + Send + Sync + 'static> Book<R> {
         let weak = Arc::downgrade(&book);
         let wake = Arc::clone(&book.wake);
         // A thread that cannot be made (out of memory) leaves dirty slots dirty, as the
-        // clean leaves them.
-        drop(
-            std::thread::Builder::new()
-                .name("kbf-slot-recovery".to_owned())
-                .spawn(move || recover(&weak, &wake, backoff)),
-        );
+        // clean leaves them, and is logged.
+        let mut thread = std::thread::Builder::new().name("kbf-slot-recovery".to_owned());
+        if let Some(bytes) = stack {
+            thread = thread.stack_size(bytes);
+        }
+        if let Err(why) = thread.spawn(move || recover(&weak, &wake, backoff)) {
+            tracing::error!(%why, "no thread to clean dirty slots again: they stay dirty");
+        }
         book.wake_up();
         book
     }
@@ -180,7 +193,12 @@ impl<R: Slotted + Send + Sync + 'static> Book<R> {
     /// overwrites a newer one at the receiver.
     fn changed(&self) {
         if let Some(hook) = lock(&self.hook).as_ref() {
-            hook(self.count());
+            // A hook that panics must not end the recovery thread, or the lease that
+            // called this: it is logged, and the next change calls it again.
+            let called = catch_unwind(AssertUnwindSafe(|| hook(self.count())));
+            if called.is_err() {
+                tracing::error!("the hook told of the slot count panicked");
+            }
         }
     }
 

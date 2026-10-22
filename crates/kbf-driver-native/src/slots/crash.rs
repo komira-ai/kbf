@@ -25,7 +25,7 @@
 //! folder another user owns) is logged and skipped, not a failure of this slot's clean.
 //! What is read of reports in all is capped ([`READ_BUDGET`]).
 
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::io::Read as _;
 use std::ops::RangeInclusive;
 use std::os::fd::OwnedFd;
@@ -181,11 +181,29 @@ fn each(
     reads: usize,
     act: &mut dyn Act,
 ) -> Vec<String> {
+    each_owned_by(root, dirs, scope, reads, act, &real_owner)
+}
+
+/// Who owns the directory `dir`, the component `name` of a path: its owner from `fstat`.
+fn real_owner(dir: &OwnedFd, _: &OsStr) -> Option<u32> {
+    rustix::fs::fstat(dir).ok().map(|stat| stat.st_uid)
+}
+
+/// [`each`], the owner of each directory on a path given by `owner` (a test gives each
+/// component a different one).
+fn each_owned_by(
+    root: &OwnedFd,
+    dirs: &[PathBuf],
+    scope: &Scope,
+    reads: usize,
+    act: &mut dyn Act,
+    owner: &dyn Fn(&OwnedFd, &OsStr) -> Option<u32>,
+) -> Vec<String> {
     let mut errors = Vec::new();
     let mut budget = Budget(reads);
     for dir in dirs {
         let relative = dir.strip_prefix("/").unwrap_or(dir);
-        let Some(folder) = open_folder(root, relative, scope) else {
+        let Some(folder) = open_folder(root, relative, scope, owner) else {
             continue;
         };
         walk(&folder, dir, scope, (&mut budget, act), &mut errors);
@@ -196,7 +214,12 @@ fn each(
 /// The folder `relative` below `root`, every component opened without following a link;
 /// `None` (and a debug line) when a component is not there, is a link or cannot be
 /// opened, or when a directory on the way is a pool user's.
-fn open_folder(root: &OwnedFd, relative: &Path, scope: &Scope) -> Option<OwnedFd> {
+fn open_folder(
+    root: &OwnedFd,
+    relative: &Path,
+    scope: &Scope,
+    owner: &dyn Fn(&OwnedFd, &OsStr) -> Option<u32>,
+) -> Option<OwnedFd> {
     let mut dir = rustix::fs::openat(root, ".", DIRECTORY, Mode::empty()).ok()?;
     for component in relative.components() {
         let Component::Normal(name) = component else {
@@ -207,7 +230,7 @@ fn open_folder(root: &OwnedFd, relative: &Path, scope: &Scope) -> Option<OwnedFd
             tracing::debug!(folder = %relative.display(), "crash folder not walked: not a directory here");
             return None;
         };
-        if scope.pool.contains(&rustix::fs::fstat(&next).ok()?.st_uid) {
+        if scope.pool.contains(&owner(&next, name)?) {
             tracing::debug!(folder = %relative.display(), "crash folder not walked: a pool user's directory is on its path");
             return None;
         }

@@ -758,7 +758,7 @@ fn clear_flags_makes_the_uids_entries_rwx_and_leaves_other_owners_alone() {
     fs::write(&outside, "x").unwrap();
     chmod(&outside, 0o600);
     symlink(&outside, home.join("link")).unwrap();
-    chmod(&home.join("a/b/f"), 0o000);
+    chmod(&home.join("a/b/f"), 0o400);
     chmod(&home.join("g"), 0o400);
     chmod(&home.join("a/b"), 0o500);
     chmod(&home, 0o500);
@@ -863,4 +863,184 @@ fn clear_flags_passes_over_a_vanished_entry_and_never_crosses_a_device() {
     let mut other_device = Swept::default();
     clear_below(&opened, &home, me(), dev + 1, 0, &mut other_device).unwrap();
     assert_eq!(other_device, Swept::default());
+}
+
+/// Runs `body` in a child of this test binary whose soft limit of open descriptors is 120
+/// (a Mac's default is 256, and the daemon's soft limit can stay there): the parent runs
+/// the test again as the child (`name` is the test's own name) and asserts it passed.
+/// A walk that holds a descriptor per level to 256 fails in the child with `EMFILE`.
+fn with_few_descriptors(name: &str, body: impl FnOnce()) {
+    if std::env::var_os("KBF_FEW_DESCRIPTORS").is_some() {
+        let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        let lowered = rustix::process::Rlimit {
+            current: Some(120),
+            maximum: limit.maximum,
+        };
+        rustix::process::setrlimit(rustix::process::Resource::Nofile, lowered).unwrap();
+        body();
+        return;
+    }
+    let path = module_path!().split_once("::").map_or("", |(_, rest)| rest);
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            &format!("{path}::{name}"),
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("KBF_FEW_DESCRIPTORS", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "with 120 descriptors: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+        "the child ran the test: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// Catches a walk that holds a descriptor per level to the full depth limit (a lease's
+/// deep tree would then fail the flag clear with `EMFILE` on a Mac whose soft limit is
+/// 256, on every re-clean): with only 120 descriptors, a tree 1000 deep is cleared of
+/// flags and removed, each with no error.
+#[test]
+fn a_tree_a_thousand_deep_needs_few_descriptors() {
+    with_few_descriptors("a_tree_a_thousand_deep_needs_few_descriptors", || {
+        let dir = scratch("few-descriptors");
+        let home = dir.join("home");
+        fs::create_dir(&home).unwrap();
+        build_deep(&home, 1000);
+        let cleared = clear_flags(&home, me());
+        assert_eq!(cleared.errors, Vec::<String>::new(), "{cleared:?}");
+        let emptied = empty(&home, me());
+        assert_eq!(emptied.errors, Vec::<String>::new(), "{emptied:?}");
+        assert_eq!(names(&home), Vec::<String>::new());
+    });
+}
+
+/// Catches a subtree moved up although it is not the entry that was judged (a directory
+/// swapped in at its name since the judgement would be moved, and removed, as if it were
+/// the uid's): the entry is looked at again before the move, and a different one is an
+/// error that leaves it where it is.
+#[test]
+fn a_deep_subtree_replaced_since_it_was_judged_is_not_moved() {
+    let dir = scratch("park-replaced");
+    let top = dir.join("top");
+    fs::create_dir(&top).unwrap();
+    // Levels named l0 to l69, one inside the next, built through descriptors.
+    let mut fd = rustix::fs::openat(rustix::fs::CWD, &top, DIRECTORY, Mode::empty()).unwrap();
+    for level in 0..70 {
+        let name = format!("l{level}");
+        rustix::fs::mkdirat(&fd, name.as_str(), Mode::from_raw_mode(0o700)).unwrap();
+        fd = rustix::fs::openat(&fd, name.as_str(), DIRECTORY, Mode::empty()).unwrap();
+    }
+    let mut parent = top.clone();
+    for level in 0..64 {
+        parent.push(format!("l{level}"));
+    }
+    let victim = parent.join("l64");
+    let done = std::cell::Cell::new(false);
+    let moved = parent.join("moved");
+    let swept = vanishing(
+        {
+            let victim = victim.clone();
+            move |point, _| {
+                if matches!(point, Point::Examined(n) if *n == "l64") && !done.replace(true) {
+                    fs::rename(&victim, &moved).unwrap();
+                    fs::create_dir(&victim).unwrap();
+                }
+            }
+        },
+        || empty(&top, me()),
+    );
+    assert_eq!(swept.errors.len(), 1, "{swept:?}");
+    assert!(swept.errors[0].contains("replaced"), "{swept:?}");
+    assert!(victim.is_dir(), "the replacement was moved or removed");
+    assert!(parent.join("moved").is_dir(), "what was judged was lost");
+}
+
+/// Catches a move that replaces an entry already at the park's name (a name made ahead in
+/// the tree being emptied would be lost or would stop the move): the name is taken, so
+/// the next is used, and the entry made ahead is still there.
+#[test]
+fn a_name_made_ahead_at_the_parks_is_skipped_not_replaced() {
+    let dir = scratch("park-name");
+    let top = dir.join("top");
+    fs::create_dir(&top).unwrap();
+    build_deep(&top, 100);
+    let planted = top.join(format!(".kbf-deep-{}-0", std::process::id()));
+    let done = std::cell::Cell::new(false);
+    let swept = vanishing(
+        {
+            let planted = planted.clone();
+            move |point, _| {
+                if matches!(point, Point::Examined(n) if *n == "d") && !done.replace(true) {
+                    fs::create_dir(&planted).unwrap();
+                    fs::write(planted.join("kept"), "x").unwrap();
+                }
+            }
+        },
+        || empty(&top, me()),
+    );
+    assert_eq!(swept.errors, Vec::<String>::new(), "{swept:?}");
+    assert_eq!(
+        names(&top),
+        [planted.file_name().unwrap().to_string_lossy().into_owned()]
+    );
+    assert!(
+        planted.join("kept").exists(),
+        "the entry made ahead was replaced"
+    );
+}
+
+/// Catches a mode change that follows a link swapped in at an entry's name after it was
+/// judged, or lands on another file swapped in (the target, which the uid does not own,
+/// would be made writable by the owner bit): in either case the target's mode is as it
+/// was.
+#[test]
+fn an_entry_swapped_in_after_the_judgement_does_not_change_its_targets_mode() {
+    for swap in ["link", "file"] {
+        let dir = scratch(&format!("chmod-{swap}"));
+        let home = dir.join("home");
+        fs::create_dir(&home).unwrap();
+        fs::write(home.join("b"), "x").unwrap();
+        chmod(&home.join("b"), 0o400);
+        let target = dir.join("target");
+        fs::write(&target, "x").unwrap();
+        chmod(&target, 0o400);
+        let done = std::cell::Cell::new(false);
+        let (b, other) = (home.join("b"), target.clone());
+        let swept = vanishing(
+            move |point, _| {
+                if matches!(point, Point::Examined(n) if *n == "b") && !done.replace(true) {
+                    fs::remove_file(&b).unwrap();
+                    if swap == "link" {
+                        symlink(&other, &b).unwrap();
+                    } else {
+                        fs::write(&b, "y").unwrap();
+                        chmod(&b, 0o400);
+                    }
+                }
+            },
+            || clear_flags(&home, me()),
+        );
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode(&target),
+            0o400,
+            "{swap}: the target was changed ({swept:?})"
+        );
+        if swap == "file" {
+            assert_eq!(
+                mode(&home.join("b")),
+                0o400,
+                "the file swapped in was changed"
+            );
+        }
+    }
 }

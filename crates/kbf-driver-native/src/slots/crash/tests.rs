@@ -396,7 +396,15 @@ fn an_absolute_folder_that_is_not_there_holds_nothing() {
     let dirs = [PathBuf::from("/nonexistent-kbf-crash/Library")];
     assert_eq!(sweep(&dirs, &scope), Vec::<String>::new());
     assert_eq!(found(&dirs, &scope), Vec::<String>::new());
-    assert!(open_folder(&root(Path::new("/")), Path::new("../x"), &scope).is_none());
+    assert!(
+        open_folder(
+            &root(Path::new("/")),
+            Path::new("../x"),
+            &scope,
+            &real_owner
+        )
+        .is_none()
+    );
 }
 
 /// Catches a folder that cannot be listed passing as clean: a descriptor that is not a
@@ -417,4 +425,38 @@ fn a_folder_that_cannot_be_listed_is_an_error_of_the_cleans_own() {
     );
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].starts_with("file: "), "{errors:?}");
+}
+
+/// Catches a pool-ownership check made on the last component of a path only (a pool
+/// user's directory higher up would then not stop the walk): a directory that is a pool
+/// user's anywhere on the way, the first component or a middle one, makes the folder
+/// skipped; with none, it is walked.
+#[test]
+fn a_pool_users_directory_on_any_component_of_the_path_skips_the_folder() {
+    let dir = tree("pool-any");
+    fs::create_dir_all(dir.join("first/middle/last")).unwrap();
+    fs::write(dir.join("first/middle/last/hers.ips"), IPS).unwrap();
+    let dirs = vec![PathBuf::from("first/middle/last")];
+    let pool_uid = 7_000_000_u32;
+    let scope = Scope {
+        uid: 771,
+        pool: pool_uid..=pool_uid + 1,
+    };
+    for pooled in ["first", "middle"] {
+        let owner =
+            move |_: &OwnedFd, name: &OsStr| Some(if name == pooled { pool_uid } else { me() });
+        let errors = each_owned_by(&root(&dir), &dirs, &scope, READ_BUDGET, &mut Remove, &owner);
+        assert_eq!(errors, Vec::<String>::new());
+        assert!(dir.join("first/middle/last/hers.ips").exists(), "{pooled}");
+    }
+    let nobody = |_: &OwnedFd, _: &OsStr| Some(me());
+    each_owned_by(
+        &root(&dir),
+        &dirs,
+        &scope,
+        READ_BUDGET,
+        &mut Remove,
+        &nobody,
+    );
+    assert!(!dir.join("first/middle/last/hers.ips").exists());
 }
