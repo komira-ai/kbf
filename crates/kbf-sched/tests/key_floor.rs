@@ -464,6 +464,8 @@ fn a_key_floor_never_books_a_smaller_worker_whole() {
     let mut f = Farm::new();
     f.node("a-small", 8, 32);
     f.node("b-big", 8, 64);
+    // A worker with no CPU never counts: it can take nothing.
+    f.node("c-tiny", 0, 8);
     f.submit_keyed(1, request(1, 4 * GIB), KEY);
     let first = only(f.tick());
     let second = f.killed(&first);
@@ -568,6 +570,11 @@ fn key_floors_are_in_the_memory_state_and_the_floor_change() {
     let mut f = farm_with_floor_16();
     let mut same = farm_with_floor_16();
     assert_eq!(f.s.memory_state(), same.s.memory_state());
+    assert_eq!(
+        f.s.take_floor_change(OperationId(99)),
+        kbf_sched::FloorChange::default(),
+        "an operation the scheduler does not hold"
+    );
     // A third scheduler with one more raise differs only by its key floor.
     same.submit_keyed(9, request(9, 4 * GIB), KEY + 1);
     let nine = only(same.tick());
@@ -652,4 +659,54 @@ fn an_operation_raised_beyond_the_remaining_nodes_is_lowered_not_refused() {
         assert!(size >= 4 * GIB, "{size}");
     }
     assert!(moved.iter().all(|s| s.worker == w("small")));
+}
+
+fn floor(ask_gib: u64, stamp: u64) -> KeyFloor {
+    KeyFloor {
+        key: KEY,
+        ask: ask_gib * GIB,
+        stamp,
+    }
+}
+
+/// With a floor held and no live worker that could run an operation, the operation keeps
+/// what it asked for; the first worker that can takes it at the floor, kept under that
+/// worker's memory.
+#[test]
+fn an_operation_waits_unraised_for_a_worker_and_is_raised_under_the_one_that_comes() {
+    let mut f = Farm::new();
+    f.s.restore_key_floors(vec![floor(32, 0)]);
+    f.submit_keyed(1, request(1, 4 * GIB), KEY);
+    assert!(f.tick().is_empty());
+    f.node("small", 8, 16);
+    let start = only(f.tick());
+    assert_eq!(start.resources.memory_bytes, 16 * GIB - 256 * MIB);
+}
+
+/// A floor above an operation's memory that the live workers cannot give leaves the
+/// operation as it is: it already asks for as much as they could give it.
+#[test]
+fn an_operation_that_already_asks_what_the_workers_can_give_is_left_alone() {
+    let mut f = Farm::new();
+    f.node("small", 8, 16);
+    f.s.restore_key_floors(vec![floor(32, 0)]);
+    f.submit_keyed(1, request(1, 16 * GIB - 256 * MIB), KEY);
+    let start = only(f.tick());
+    assert_eq!(start.resources.memory_bytes, 16 * GIB - 256 * MIB);
+}
+
+/// A floor raised again while an operation waits raises it again, from what it asked for
+/// first: the operation books the larger floor.
+#[test]
+fn a_floor_raised_again_while_an_operation_waits_raises_it_again() {
+    let mut f = Farm::new();
+    f.node("one-core", 1, 64);
+    f.submit(1, request(1, 4 * GIB));
+    let held = only(f.tick());
+    f.s.restore_key_floors(vec![floor(16, 0)]);
+    f.submit_keyed(2, request(2, 4 * GIB), KEY);
+    assert!(f.tick().is_empty());
+    f.s.restore_key_floors(vec![floor(32, 1)]);
+    let next = only(f.end(&held, ok()));
+    assert_eq!(next.resources.memory_bytes, 32 * GIB);
 }
