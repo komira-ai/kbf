@@ -173,16 +173,19 @@ deadline, the handover completes and the old frontend logs an ERROR naming the o
 it could not write; the new frontend then recovers each of them with the lease the store
 still holds, and the daemon's heartbeat or the lease grace settles it.
 
-Rows for the state that is in memory today and in the stack of changes #897, #911, #915 and
-#916 (`fate/` for the memory ladder and the fault budgets of an operation, `floor/` for the
-memory floors, `subject/` for the usage line of an operation) are carried only once those
-changes are merged; until then a successor starts those from nothing.
+Three more kinds of per-operation state that were in memory are also carried, as rows of the
+state store (#897, #911, #915 and #916): `fate/` for the memory ladder and the fault budgets
+of an operation, `floor/` for the memory floors, and `subject/` for the usage line of an
+operation. A successor books an operation that was killed for memory at the rung it was raised
+to, offers the floors to fresh submissions, and logs the usage line with the mnemonic and
+target the callers described.
 
 **Not carried.**
 
 - An invocation record is split between the two processes: an invocation in flight, or a
   recent one, looked up through `/v1` or the UI on the new frontend is not found. Build
-  results are not affected, because callers are answered from `done/`.
+  results are not affected, because callers are answered from `done/`. (The test
+  `a_successors_recorder_has_no_record_of_a_build_but_its_caller_is_answered` pins this.)
 - Counters restart at 0 in the new process (the `pressure` counter included), so a sum
   across processes scraped one by one sees a drop. Use `rate()` or `increase()`.
 - `action shape:` is logged again, once per key, by the new process.
