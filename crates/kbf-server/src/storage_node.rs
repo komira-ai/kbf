@@ -927,7 +927,7 @@ async fn open_among<O: ObjectStore>(
 }
 
 /// Refuses a log of more than one voter for a registered node: raising it to machine
-/// version 4 would make every replica that does not run it refuse the log.
+/// version 4 would leave every replica that does not run it skipping its commands.
 fn one_voter(voters: usize) -> Result<(), String> {
     if voters > 1 {
         return Err(format!(

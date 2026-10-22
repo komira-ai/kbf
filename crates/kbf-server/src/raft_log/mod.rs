@@ -45,14 +45,25 @@
 //!   [`MachineVersion::V3`] takes `EvictObjects` too, and one raised to
 //!   [`MachineVersion::V4`] node writers (`SetWriter`, and objects named by a storage
 //!   node's member and boot), and one raised to [`MachineVersion::V5`] `ReseatStaged`. A start replays the raise
-//!   with the log. A binary that does not run the version (any older one) refuses the
-//!   log at that entry. A raise commits alone, under the host's lock; a batch is
+//!   with the log. A binary that does not run the version (any older one) skips the raise
+//!   (see **Skipped entries**) and keeps the version and format the log had reached before
+//!   it; decoding does not depend on the format, so every command it knows still applies.
+//!   A raise commits alone, under the host's lock; a batch is
 //!   encoded under that lock too, in the format committed when it commits, so no
 //!   batch holds a `MachineVersion` entry and a command the format does not take is
 //!   refused alone while the rest of its batch commits. A start raises a log only up to
 //!   its start ceiling ([`START_CEILING`]; [`RaftMetaLog::raise_at_start`]), and each
 //!   feature that needs a version checks the log's [`RaftMetaLog::machine_version`] where
 //!   it uses it.
+//! - **Skipped entries.** Every format changes additively, and a binary skips what it does
+//!   not know instead of refusing it. An entry that holds a command this binary does not
+//!   know, a control command (which this log does not use), or a raise to a machine
+//!   version past what the binary runs is skipped: it applies nothing, it is counted
+//!   ([`RaftMetaLog::skipped_entries`]) and logged once per kind, and the entries after it
+//!   apply. An entry that does not decode still refuses the open ([`RaftLogError::Decode`]).
+//!   A skipped entry's effect is lost to this replica, so a log with more than one voter
+//!   needs every voter on releases that know the same commands (logs are single-voter
+//!   today).
 //! - **A storage error** stops the log for the life of the process: every later
 //!   commit is refused `Unavailable`.
 //! - **Dropping the log** stops its tick task, waits for a batch the committer is
@@ -232,6 +243,9 @@ struct Shared<F: Fs> {
     opened: Instant,
     /// The `Bootstrap` entries applied by the time the log opened.
     bootstraps: usize,
+    /// The entries the machine skipped at the open (the replay); the log applies only
+    /// entries it encoded itself after that.
+    skipped: u64,
     /// Set when the log is dropped: a batch that takes `host` after it is refused.
     closed: AtomicBool,
 }
@@ -325,9 +339,10 @@ where
     }
 
     /// [`RaftMetaLog::open`], for a binary that runs machine versions up to `runs`: a
-    /// log raised past it is refused at the raise (`RaftLogError::Decode`), as a
-    /// rollback to an older binary is. The server runs [`RUNS`]; a lower `runs` stands
-    /// for an older binary in tests of that rollback.
+    /// log raised past it opens, and the open skips the raise ([`RaftMetaLog::skipped_entries`])
+    /// and keeps the version the log had reached before it, as a rollback to an older
+    /// binary does. The server
+    /// runs [`RUNS`]; a lower `runs` stands for an older binary in tests of that rollback.
     ///
     /// # Errors
     /// As [`RaftMetaLog::open`], and [`RaftLogError::Runs`] for a version this binary
@@ -364,6 +379,7 @@ where
         while host.core().role() != Role::Leader {
             host.tick(0)?;
         }
+        // Only an entry that does not decode refuses the open; a skipped one does not.
         decoded(host.machine())?;
         let expected = Bootstrap {
             log_id,
@@ -386,6 +402,7 @@ where
         let shared = Arc::new(Shared {
             base,
             bootstraps: host.machine().bootstraps(),
+            skipped: host.machine().skipped(),
             term: host.core().hard_state().term.0,
             state: host.machine().state(),
             version: Arc::new(AtomicU32::new(host.machine().version().get())),
@@ -410,7 +427,8 @@ where
     /// entry after it is encoded in `to`'s format: raising to
     /// [`MachineVersion::V2`] lets the write tier's commands commit
     /// (docs/design/metadata-snapshots.md, section 4). It is one-way: a binary that
-    /// runs only an earlier version refuses the log from then on.
+    /// runs only an earlier version skips the raise and keeps the version the log had
+    /// reached before it.
     ///
     /// # Errors
     /// [`MetaLogError::Unavailable`] if `to` is past what this binary runs, or the
@@ -547,6 +565,14 @@ impl<F: Fs> RaftMetaLog<F> {
     #[must_use]
     pub fn bootstraps(&self) -> usize {
         self.shared.bootstraps
+    }
+
+    /// How many entries the log skipped at the open (the replay): commands this binary
+    /// does not know, control commands, and raises to a machine version past what it
+    /// runs. Zero for every log this version writes.
+    #[must_use]
+    pub fn skipped_entries(&self) -> u64 {
+        self.shared.skipped
     }
 }
 
