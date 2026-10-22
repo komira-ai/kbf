@@ -81,10 +81,11 @@ impl Migrator for Asked {
 /// it passes the check for a binary and a marker, and the migration is asked for it. The
 /// database refuses, so nothing is spawned.
 ///
-/// Mutants it catches: the adoption left out (the start is held as `no-installed-release`);
-/// the child control looking for the release under the layout (`binary-missing`); the
-/// adoption run at each attempt (the runner is called more than twice); the record not
-/// written (the next attempt adopts again).
+/// Asserts that the adoption runs (the start is not held as `no-installed-release`); that the
+/// child control looks for the release in the copies and not under the layout (not
+/// `binary-missing`); that the adoption runs once and not at each attempt (the runner is
+/// called no more than twice); and that the record is written (the next attempt does not
+/// adopt again).
 #[test]
 fn a_cold_start_with_no_record_adopts_the_package_kbf_and_goes_on_with_its_copy() {
     let rig = rig("supervisor-adopt-cold");
@@ -124,8 +125,8 @@ fn a_cold_start_with_no_record_adopts_the_package_kbf_and_goes_on_with_its_copy(
 /// copies the releases directory, and the program of a release, are theirs; without them they
 /// are the layout's, exactly as before.
 ///
-/// Mutants it catches: `releases_of` that always answers the layout's; `run_from_copies` that
-/// returns the child as it was, or that sets the directory without a copy.
+/// Asserts that `releases_of` answers the copies' directory when there are copies; and that
+/// `run_from_copies` changes the child, and sets the directory only with a copy.
 #[test]
 fn the_children_run_from_the_copies_when_the_proxy_keeps_them_and_from_the_layout_when_not() {
     let rig = rig("supervisor-copies-dirs");
@@ -150,9 +151,9 @@ fn the_children_run_from_the_copies_when_the_proxy_keeps_them_and_from_the_layou
 /// that says so. The adopted release passes the check for a binary and a marker, and is the
 /// copy.
 ///
-/// Mutants it catches: adoption without the match on `None` (a recorded release is replaced,
-/// or the runner is called each time); an unreadable file read as no record; the error of the
-/// adoption dropped.
+/// Asserts that adoption happens only on `None` (a recorded release is kept, and the runner
+/// is not called each time); that an unreadable file is an error and not an empty record; and
+/// that the error of the adoption is returned.
 #[test]
 fn the_installed_release_is_adopted_only_when_none_is_recorded() {
     let rig = rig("supervisor-adopt-source");
