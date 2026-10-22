@@ -16,8 +16,6 @@ Commands:
   record-release  Record a release placed on the host by hand as its first
   gc              Remove the releases nothing needs: current, previous, staged, the swap on trial and any a process executes from stay, and so do the newest `--keep` others
   boot-check      Run before each start of a release on trial; counts the start
-  migrate         Adopt the old layout (`/usr/local/kbf`, the deploy kit's state) into the installer's tree, or put it back with `--rollback`. A dry run without `--apply`
-  uninstall       Remove what the package left on a host that is rolled back or was never adopted: the LaunchDaemon plist, its receipt, disable override, logs and the files a rollback moved aside (a Mac). A dry run without `--apply`
   quiesce         For maintainer scripts: take the lock; exit 5 while a swap is pending
   check           Validate the installer's configuration, trust files and path chain
   proxy           Serve the frontend host's public port: route each stream to the active child frontend
@@ -290,21 +288,6 @@ Options:
       --kbf <KBF>                  The kbf this unit starts, on a bundled host (one with no releases and no state). It says the state schema it needs; the database is brought to it before the unit starts. Needs --mode
       --mode <MODE>                The mode of the unit that runs the check: only frontend and all-in-one keep state in the database. Needs --kbf [possible values: frontend, storage, daemon, storage-and-daemon, all-in-one]
   -h, --help                       Print help
-
-=== kbf-installer uninstall --help ===
-Remove what the package left on a host that is rolled back or was never adopted: the LaunchDaemon plist, its receipt, disable override, logs and the files a rollback moved aside (a Mac). A dry run without `--apply`
-
-Usage: kbf-installer uninstall [OPTIONS]
-
-Options:
-      --installer-unit <INSTALLER_UNIT>
-          The installer's own unit: stopped and, on Linux, disabled. A Mac without the flag acts on the package's job, `com.komira.kbf-installer.plist`; a Linux host without it leaves its unit to the package manager. The unit must be `.plist` on a Mac and `.service` on Linux (else exit 2). On a Mac a name other than the package's job replaces it as the job acted on: the package's own plist is then left in place, while the installer's tree, logs and receipt are removed
-      --json
-          Print the result as one JSON object on standard output
-      --apply
-          Do what the verb says. Without it a mutating verb is a dry run
-  -h, --help
-          Print help
 
 === kbf-installer quiesce --help ===
 For maintainer scripts: take the lock; exit 5 while a swap is pending

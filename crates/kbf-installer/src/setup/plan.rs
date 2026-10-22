@@ -125,9 +125,6 @@ pub struct Ctx {
     pub root: Owner,
     /// The user the mode's unit runs as (Linux); a Mac runs the daemon as root.
     pub service: Option<RunUser>,
-    /// The migration's journal says a Mac the kit installed was adopted (kit, phase done):
-    /// its `kbf.toml` is the kit's and `setup` only adds to it.
-    pub kit_adopted: bool,
 }
 
 impl Ctx {
@@ -160,7 +157,6 @@ pub fn context(os: &dyn Os, mode: Mode) -> Result<Ctx, SetupError> {
         layout: Layout::new(kbf_host::Root::new("/")?, platform),
         root: os.root_owner(),
         service,
-        kit_adopted: false,
     })
 }
 
@@ -323,8 +319,7 @@ fn check_fetch_shape(os: &dyn Os, user: &RunUser) -> Result<(), SetupError> {
 }
 
 /// The fetch account is there with the right shape, or its creation is a step of `p`. One
-/// function for `setup` and for `migrate` (which needs the account for the version probe
-/// before `setup` can have run), so there is one definition of the account.
+/// function, so there is one definition of the account.
 pub fn ensure_fetch_user(p: &mut Pl<'_, '_>, os: &dyn Os) -> Result<(), SetupError> {
     let name = fetch_user(os.platform());
     match os.user(name)? {
@@ -529,23 +524,6 @@ fn operator_token(
     Ok(())
 }
 
-/// Take the unit files `shadows` out of `/etc/systemd/system`, each after a copy of its
-/// bytes is in the migration's backup directory (root's 0700, where the originals of the
-/// migration are): a crash between the two leaves the file in place and the copy made, and a
-/// run again finishes. Nothing is deleted that was not first kept.
-pub fn retire(exec: &dyn Exec, ctx: &Ctx, shadows: &[super::Shadow]) -> Result<Plan, SetupError> {
-    let view = View(exec);
-    let mut p = Planner::new(&view);
-    let backup = format!("{}/migration-units", ctx.layout.state_dir());
-    dir(&mut p, &backup, 0o700, ctx.root)?;
-    for shadow in shadows {
-        let kept = format!("{backup}/{}", crate::migrate::retired_name(shadow.unit));
-        file(&mut p, &kept, 0o600, ctx.root, shadow.bytes.clone())?;
-        p.absent(hp(&shadow.path)?)?;
-    }
-    Ok(p.finish())
-}
-
 /// The part after the first release: `kbf.toml`, then the units. `released` says whether a
 /// release is installed (or, in a dry run, would be). Reads the host, changes nothing.
 pub fn after_release(
@@ -555,7 +533,6 @@ pub fn after_release(
     ctx: &Ctx,
     released: bool,
     no_start: bool,
-    retired: &[&str],
 ) -> Result<Outcome, SetupError> {
     let view = View(exec);
     let mut p = Planner::new(&view);
@@ -599,10 +576,7 @@ pub fn after_release(
                 .map_err(SetupError::NeedsOperator)?;
         }
     }
-    let decision = match (&current, ctx.kit_adopted) {
-        (Some(text), true) => kbf_toml::decide_adopted(text, &ours, kbf_toml_path),
-        _ => kbf_toml::decide(current.as_deref(), &ours, kbf_toml_path),
-    };
+    let decision = kbf_toml::decide(current.as_deref(), &ours, kbf_toml_path);
     match decision {
         Decision::Write(text) => {
             let existed = current.is_some();
@@ -626,7 +600,7 @@ pub fn after_release(
         Decision::Refuse(why) => return Err(SetupError::NeedsOperator(why)),
     }
 
-    notes.extend(units(&mut p, os, v, ctx, released, no_start, retired)?);
+    notes.extend(units(&mut p, os, v, ctx, released, no_start)?);
     Ok(Outcome {
         plan: p.finish(),
         notes,
@@ -670,7 +644,6 @@ fn units(
     ctx: &Ctx,
     released: bool,
     no_start: bool,
-    retired: &[&str],
 ) -> Result<Vec<String>, SetupError> {
     let mut notes = Vec::new();
     // The mode's units are started when the operator did not forbid it and a release is
@@ -744,14 +717,11 @@ fn units(
                 .iter()
                 .map(|u| (*u, start_mode))
                 .chain([(INSTALLER_UNIT, !no_start)]);
-            // A unit file was taken out of `/etc/systemd/system`: systemd reads the packaged
-            // unit of that name from the next reload, and it is enabled whatever was said of
-            // the old file (the enable symlink of the old file named the same unit).
-            if !retired.is_empty() || backup_gone {
+            if backup_gone {
                 p.run(Cmd::new(hp(SYSTEMCTL)?).arg("daemon-reload"));
             }
             for (unit, now) in wanted {
-                if retired.contains(&unit) || !os.unit_enabled(unit)? {
+                if !os.unit_enabled(unit)? {
                     let mut cmd = Cmd::new(hp(SYSTEMCTL)?).arg("enable");
                     if now {
                         cmd = cmd.arg("--now");

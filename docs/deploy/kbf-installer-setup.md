@@ -4,8 +4,8 @@
 directories kbf needs, writes `installer.toml` and `kbf.toml`, installs the first release when it
 is given one, and enables the units for the host's mode. The contract is
 [the installer design](../design/kbf-installer.md) (sections 2 and 3); this page is how the verb
-behaves in the code it describes. A host that has the old layout is moved first with
-[`kbf-installer migrate`](kbf-installer-migrate.md); a Mac has its own page,
+behaves in the code it describes. A host that has the old layout is not adopted by the installer: adoption = install the kbf and
+kbf-proxy packages (package-update design). A Mac has its own page,
 [installing on macOS](kbf-installer-macos.md).
 
 ```text
@@ -133,11 +133,6 @@ or be the installer's. A missing or different key, or no file, is refused with e
 key and saying that `kbf-mac-provision` renders it: run it again, then `setup`. The other keys
 `setup` owns follow the rule above.
 
-A Mac that `migrate` adopted from the Mac kit (the journal says `kit` and phase `done`) has the
-kit's `kbf.toml`. `setup` then keeps every key the kit wrote byte for byte and only adds the keys
-it needs that are missing; a key that is there with another value is refused (exit 5), naming the
-key. See [installing on macOS](kbf-installer-macos.md).
-
 ### The deploy config of a frontend and an all-in-one host
 
 `--deploy-stage gamma|prod` makes `setup` write `/etc/kbf-installer/deploy.json` (root's, mode
@@ -219,36 +214,10 @@ own atomically and never restart anything.
 
 ## The old layout, and a migrated host
 
-`setup` refuses to run while the old layout of the retired `kbf-helper` and `kbf-deploy host` is
-the host's: its state (`/var/lib/kbf-deploy`, on a Mac `/var/db/kbf-deploy`) is there and no
-migration finished. The two never both manage a host. It exits 5 with `unmigrated` and the
-message:
-
-```text
-the old layout's state is still the host's (<path>) and no migration finished: kbf-installer and the retired kbf-helper/kbf-deploy never both manage a host; run `kbf-installer migrate --apply --fetch-user kbf-fetch [--unit UNIT]` (without --apply it is a dry run), then run setup again
-```
-
-(`_kbf-fetch` on a Mac.) The test is the migration's journal, not the old paths. A host that
-`migrate` finished (journal phase `done`) passes, and it keeps `/usr/local/kbf` and
-`/var/lib/kbf-deploy` on purpose as its rollback path, so their presence alone does not stop
-`setup`. A migration that was rolled back is not finished. A journal that cannot be read stops
-`setup` with exit 1 (`migrate`); a Mac that was rolled back to the kit is refused with exit 5 until the
-package is installed again.
-
 On Linux a regular file at `/etc/systemd/system/<the mode's unit>` (for the proxy, also
 `kbf-proxy.socket` and `kbf-proxy.service`) shadows the packaged unit: systemd reads `/etc` before
-`/usr/lib`, so the host would keep the old flags. `setup` retires such a file only if
-`migrate --unit` journalled it by name. Then it:
-
-1. keeps the bytes in `migration-units/<unit>.retired` under the installer's state directory;
-2. removes the file;
-3. runs `systemctl daemon-reload`;
-4. enables the packaged unit, even if the old file's link made it look enabled.
-
-The dry run prints `DRY-RUN: retire <path> (shadows the packaged unit; original kept)`.
-`kbf-installer migrate --rollback` puts a retired file back. Any other file there is refused (exit
-5, `unit_shadow`) with this message, and `setup` never deletes a unit it did not see the migration
-take over:
+`/usr/lib`, so the host would keep the old flags. `setup` refuses it (exit 5, `unit_shadow`) before any
+step, with this message, and never deletes a unit it did not write:
 
 ```text
 <path> is a regular file and shadows the packaged unit <unit> (systemd reads /etc before /usr/lib, so enabling would keep its old flags): move it aside (mv <path> <path>.old; systemctl daemon-reload) and run setup again; setup never deletes a unit

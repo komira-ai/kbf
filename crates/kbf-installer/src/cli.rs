@@ -63,13 +63,6 @@ pub enum Verb {
     Gc(GcArgs),
     /// Run before each start of a release on trial; counts the start.
     BootCheck(BootArgs),
-    /// Adopt the old layout (`/usr/local/kbf`, the deploy kit's state) into the installer's
-    /// tree, or put it back with `--rollback`. A dry run without `--apply`.
-    Migrate(MigrateArgs),
-    /// Remove what the package left on a host that is rolled back or was never adopted: the
-    /// LaunchDaemon plist, its receipt, disable override, logs and the files a rollback moved
-    /// aside (a Mac). A dry run without `--apply`.
-    Uninstall(UninstallArgs),
     /// For maintainer scripts: take the lock; exit 5 while a swap is pending.
     Quiesce,
     /// Validate the installer's configuration, trust files and path chain.
@@ -353,50 +346,6 @@ impl RunArgs {
 }
 
 #[derive(Args)]
-pub struct MigrateArgs {
-    /// Put the old layout back instead (refused once the installer has moved the host on).
-    #[arg(long)]
-    pub rollback: bool,
-    /// A unit that runs kbf from `/usr/local/kbf/current`, to repoint at the installer's tree
-    /// (repeat for several; `.service`, or `.plist` for launchd).
-    #[arg(long = "unit", value_parser = crate::migrate::Unit::new)]
-    pub units: Vec<crate::migrate::Unit>,
-    /// The old helper's unit: stopped and disabled, so the installer is the only manager.
-    #[arg(long, value_parser = crate::migrate::Unit::new)]
-    pub helper_unit: Option<crate::migrate::Unit>,
-    /// The installer's own unit: enabled and started as the last step of a migration, stopped
-    /// and disabled first by a rollback.
-    #[arg(long, value_parser = crate::migrate::Unit::new)]
-    pub installer_unit: Option<crate::migrate::Unit>,
-    /// Where the host gets its releases: decides where the replay floor is seeded from. Only a
-    /// `frontend` host has a frontend to ask; a `url` or `bundled` one does not.
-    #[arg(long, value_enum, default_value = "url")]
-    pub release_source: ReleaseSource,
-    /// The lowest generation an order may carry: the floor when there is no frontend to ask.
-    /// Without it and without a frontend the host starts with no generation floor, and the
-    /// run says so.
-    #[arg(long)]
-    pub min_generation: Option<u64>,
-    /// The unprivileged user the old binaries' `--version --json` runs as. Without the flag it
-    /// is the fetch account of the platform (`kbf-fetch`; `_kbf-fetch` on a Mac), which on a
-    /// Mac an applying migration creates when it is not there (the way `setup` does).
-    #[arg(long)]
-    pub fetch_user: Option<String>,
-}
-
-#[derive(Args)]
-pub struct UninstallArgs {
-    /// The installer's own unit: stopped and, on Linux, disabled. A Mac without the flag acts
-    /// on the package's job, `com.komira.kbf-installer.plist`; a Linux host without it leaves
-    /// its unit to the package manager.
-    /// The unit must be `.plist` on a Mac and `.service` on Linux (else exit 2). On a Mac a
-    /// name other than the package's job replaces it as the job acted on: the package's own
-    /// plist is then left in place, while the installer's tree, logs and receipt are removed.
-    #[arg(long, value_parser = crate::migrate::Unit::new)]
-    pub installer_unit: Option<crate::migrate::Unit>,
-}
-
-#[derive(Args)]
 pub struct ProxyArgs {
     /// The installer.toml whose `[proxy]` table configures the proxy (default: the platform's,
     /// `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac).
@@ -470,8 +419,6 @@ impl Verb {
             Verb::RecordRelease(_) => "record-release",
             Verb::Gc(_) => "gc",
             Verb::BootCheck(_) => "boot-check",
-            Verb::Migrate(_) => "migrate",
-            Verb::Uninstall(_) => "uninstall",
             Verb::Quiesce => "quiesce",
             Verb::Check => "check",
             Verb::Proxy(_) => "proxy",
@@ -491,45 +438,9 @@ impl Verb {
         )
     }
 
-    /// Whether the verb changes what a host runs or how it is managed, so it must not run
-    /// while the old layout's state is the host's and unmigrated (the old helper and the
-    /// installer never both manage one host; `migrate` is how that ends). `status`, `check`,
-    /// `boot-check`, `quiesce` and `migrate` itself change no release; `fetch-child` is the
-    /// unprivileged process a verb that does manage the host starts, and manages nothing.
-    ///
-    /// Every verb is named (no `_`): a verb added later does not compile until it says
-    /// which it is.
-    pub fn manages_host(&self) -> bool {
-        match self {
-            Verb::Setup(_)
-            | Verb::Run(_)
-            | Verb::Confirm(_)
-            | Verb::Revert(_)
-            | Verb::Rollback(_)
-            | Verb::RecordRelease(_)
-            | Verb::Gc(_)
-            | Verb::Stage
-            | Verb::Activate => true,
-            Verb::Status
-            | Verb::Check
-            | Verb::BootCheck(_)
-            | Verb::Quiesce
-            | Verb::Migrate(_)
-            // `uninstall` is for a host the installer does not manage (rolled back, or never
-            // adopted), and an old-layout host that was never adopted is one.
-            | Verb::Uninstall(_)
-            | Verb::Proxy(_)
-            // `update` only POSTs to the proxy's API as an unprivileged client, and the proxy
-            // exists only on a new-layout host; the root half of an update (`run`) is guarded.
-            // `dispatch` returns for it before the old-layout guard, so the table says so.
-            | Verb::Update(_)
-            | Verb::FetchChild(_) => false,
-        }
-    }
-
     /// The pull request of the contract (section 9) that builds the verb, `None` for the
-    /// verbs that exist (`run`, `boot-check`, `proxy`, the operator's verbs, `setup` and
-    /// `migrate`).
+    /// verbs that exist (`run`, `boot-check`, `proxy`, the operator's verbs and
+    /// `setup`).
     pub fn built_by(&self) -> Option<&'static str> {
         match self {
             Verb::Run(_)
@@ -541,8 +452,6 @@ impl Verb {
             | Verb::Rollback(_)
             | Verb::RecordRelease(_)
             | Verb::Gc(_)
-            | Verb::Migrate(_)
-            | Verb::Uninstall(_)
             | Verb::Quiesce
             | Verb::Setup(_)
             | Verb::FetchChild(_) => None,

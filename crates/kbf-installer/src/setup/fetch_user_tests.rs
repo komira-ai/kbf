@@ -1,4 +1,4 @@
-//! The fetch account's one definition, shared by `setup` and `migrate`: its plan, its shape
+//! The fetch account's one definition, its plan, its shape
 //! check, and the production `Os` reading a login shell. Each test says the defect it catches.
 
 use kbf_host::testkit::{FakeExec, reply};

@@ -126,33 +126,9 @@ daemon job.
 ## A Mac the Mac kit installed
 
 The older Mac kit left `/usr/local/kbf` with `releases/`, the links `current` and `previous`, a
-settings file `etc/av2_mac.conf`, the LaunchDaemon `com.komira.kbf-daemon` (running
-`/usr/local/kbf/current/kbf`) and `/usr/local/etc/kbf/kbf.toml`. It keeps no `state.json` and no
-lock: the links are the truth. `kbf-installer migrate` adopts such a host.
-
-1. Install the package, so `/usr/local/kbf-installer/bin/kbf-installer` is there.
-2. Dry run: `sudo kbf-installer migrate --unit com.komira.kbf-daemon.plist`. Add `--fetch-user NAME`
-   only for a probe account other than `_kbf-fetch`.
-3. Apply it with `--apply`. A kit host is detected by the two markers (the settings file and a
-   plist that runs `current/`); the migration:
-   - names each release by running `releases/<commit>/kbf --version --json` as `_kbf-fetch`, which an
-     applying run makes if it is missing;
-   - copies `current` and `previous` into the installer's tree, unverified (see
-     [the migrate guide](kbf-installer-migrate.md)), and writes `state.json`, `helper.json`,
-     `status.json` and the links under `/var/db/kbf-installer` and `/usr/local/kbf-installer`;
-   - stops the daemon job, repoints the plist at `/usr/local/kbf-installer/releases/current`
-     (the original is kept in `migration-units/`), and starts it again;
-   - enables the package's `com.komira.kbf-installer` job last, even with no `--installer-unit`;
-   - checks `kbf.toml` instead of editing it: `update-dir` and `orders-dir` must be as above, or
-     the migration refuses before it stops anything (exit 5).
-4. Run `setup` with `--min-generation` as `migrate` printed. On an adopted host `setup` leaves every
-   key the kit wrote in `kbf.toml` byte for byte, adds only the keys it needs that are missing, and
-   refuses (exit 5) a key that is there with another value.
-
-`migrate --rollback` on such a host puts the kit's plist and job back, then boots out and disables
-`com.komira.kbf-installer`, and moves `installer.toml` and `/usr/local/kbf-installer` aside under
-`.rolled-back-<UTC time>`, because the kit refuses to manage a Mac while the installer's tree is
-there. Reinstalling the package hands the host back to the installer.
+settings file `etc/av2_mac.conf` and the LaunchDaemon `com.komira.kbf-daemon`. The installer does
+not adopt that layout: there is no `kbf-installer migrate` verb. Adoption = install the kbf and
+kbf-proxy packages (package-update design, `design.md` section 12), then run `setup`.
 
 ## What is still by hand
 
