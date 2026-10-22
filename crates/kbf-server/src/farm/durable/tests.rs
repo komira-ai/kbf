@@ -218,6 +218,7 @@ fn a_submitted_operation_is_loaded_queued() {
                 losses: 0,
                 fate: None,
                 subject: Some(a_subject()),
+                size_key: None,
             }],
             floors: Vec::new(),
             key_floors: Vec::new(),
@@ -1579,13 +1580,6 @@ fn a_fate_that_cannot_be_written_or_read_is_refused() {
     assert!(error.to_string().contains("not a version 1 or 2 fate"));
 }
 
-fn keyed(tag: u8, key: u64) -> Request {
-    Request {
-        size_key: Some(key),
-        ..request(tag)
-    }
-}
-
 fn a_key_floor(key: u64, stamp: u64) -> kbf_sched::KeyFloor {
     kbf_sched::KeyFloor {
         key,
@@ -1611,7 +1605,7 @@ fn a_key_floor_is_written_with_the_requeue_and_forgotten_with_its_eviction() {
     let store = Flaky::new();
     let durable = open(&store);
     durable
-        .submitted(OperationId(1), &keyed(1, 7), &a_subject())
+        .submitted_keyed(OperationId(1), &request(1), &a_subject(), Some(7))
         .expect("submit");
     durable
         .persist(&[Effect::Start(start(1, 10))], None)
@@ -1627,7 +1621,7 @@ fn a_key_floor_is_written_with_the_requeue_and_forgotten_with_its_eviction() {
     let stored = durable.load().expect("load");
     assert_eq!(stored.key_floors, vec![a_key_floor(7, 0)]);
     assert_eq!(stored.floors, vec![a_floor(1, 0)]);
-    assert_eq!(stored.operations[0].request.size_key, Some(7));
+    assert_eq!(stored.operations[0].size_key, Some(7));
     assert_eq!(floor_rows(&store), 1, "one digest floor row");
     assert_eq!(key_floor_rows(&store), 1);
 
@@ -1665,66 +1659,123 @@ fn a_key_floor_is_written_with_the_requeue_and_forgotten_with_its_eviction() {
     assert_eq!(key_floor_rows(&store), 1);
 }
 
-/// The rollback test: the binary before format 6 loads a store that holds queued
-/// requests and floors written without `--learned-sizes=on`, and it stops (a corrupt
-/// row, which a start refuses) on one written with it, which the machine version fence
-/// keeps from being written while such a binary can still run. Catches: a request with
-/// no size key written in format 6 (a rolled-back binary would fail on a store that
-/// never had the flag on), a keyed request written in format 1 (the key dropped, or the
-/// write refused), a reader that cannot read both, and key floors under the `floor/`
-/// prefix an older binary scans.
+/// The size key of an operation is a row of its own, written with the submission: it
+/// reads back with the operation, leaves the request row byte for byte what an unkeyed
+/// operation's is (an older reader sees the same request), and goes with the operation
+/// when it finishes, in the same transaction. An operation given no key has no row.
 #[test]
-fn only_a_keyed_row_is_beyond_the_binary_before_format_6() {
-    use kbf_log::{Format, LogCommand, decode};
+fn a_size_key_is_a_row_of_its_own_written_with_the_submission_and_gone_with_the_operation() {
     let store = Flaky::new();
     let durable = open(&store);
     durable
         .submitted(OperationId(1), &request(1), &a_subject())
         .expect("submit");
     durable
-        .submitted(OperationId(2), &keyed(2, 7), &a_subject())
+        .submitted_keyed(OperationId(2), &request(1), &a_subject(), Some(7))
+        .expect("submit");
+    let opkeys: Vec<String> = keys(&store)
+        .into_iter()
+        .filter(|k| k.starts_with("opkey/"))
+        .collect();
+    assert_eq!(opkeys, ["opkey/0000000000000002"]);
+    let rows = store.scan_prefix("op/").expect("scan");
+    assert_eq!(rows[0].1.value, rows[1].1.value, "the request is the same");
+    let stored = durable.load().expect("load");
+    let found: Vec<_> = stored.operations.iter().map(|o| o.size_key).collect();
+    assert_eq!(found, [None, Some(7)]);
+
+    durable
+        .persist(&[Effect::Start(start(2, 20))], None)
+        .expect("grant");
+    durable
+        .persist(&[Effect::Answer(answer(2, 20))], Some(&ended()))
+        .expect("finished");
+    assert!(!keys(&store).iter().any(|k| k.starts_with("opkey/")));
+}
+
+/// Catches a size key row read as anything but what was written: another version, a row
+/// cut short or with bytes after it, a name that is not an operation id.
+#[test]
+fn an_opkey_row_that_is_not_one_is_refused() {
+    let row = opkey::encode(0x0102_0304_0506_0708);
+    assert_eq!(opkey::decode(&row), Ok(0x0102_0304_0506_0708));
+    assert!(opkey::decode(&[2, 0, 0, 0, 0, 0, 0, 0, 1]).is_err());
+    for cut in 0..row.len() {
+        assert!(opkey::decode(&row[..cut]).is_err(), "{cut}");
+    }
+    let mut longer = row.clone();
+    longer.push(0);
+    assert!(opkey::decode(&longer).is_err());
+
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted(OperationId(1), &request(1), &a_subject())
+        .expect("submit");
+    store
+        .inner
+        .txn(Txn::new().put("opkey/not-an-id", row, Cond::Any))
+        .expect("write")
+        .expect("applied");
+    assert!(durable.load().is_err());
+}
+
+/// The release before this feature reads a store holding `opkey/` and `keyfloor/` rows and
+/// ignores them: the scheduler reads rows by prefix, and neither prefix is one of the
+/// others (nor begins with it), so every scan that release makes sees the store as it
+/// was, and everything else (an operation's request among them) is in the rows it always
+/// was in. The store here has an operation, a lease, a floor and both new kinds of row.
+#[test]
+fn a_store_with_size_key_rows_reads_as_it_did_without_them() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted_keyed(OperationId(1), &request(1), &a_subject(), Some(7))
         .expect("submit");
     durable
-        .requeued(
-            &killed(1, 0),
-            None,
-            None,
-            &FloorChange {
-                raised: Some(a_floor(1, 0)),
-                key_raised: Some(a_key_floor(7, 0)),
-                ..FloorChange::default()
-            },
-        )
+        .persist(&[Effect::Start(start(1, 10))], None)
+        .expect("grant");
+    let change = FloorChange {
+        raised: Some(a_floor(1, 0)),
+        key_raised: Some(a_key_floor(7, 0)),
+        ..FloorChange::default()
+    };
+    durable
+        .requeued(&killed(1, 10), None, None, &change)
         .expect("a kill");
-    let rows = store.scan_prefix("op/").expect("scan");
-    let read = |format, i: usize| decode(format, &rows[i].1.value);
-    // The unkeyed row: format 1 bytes, read by every format.
-    for format in [Format::V1, Format::V5, Format::V6] {
+    let all = keys(&store);
+    assert!(all.iter().any(|k| k.starts_with("opkey/")));
+    assert!(all.iter().any(|k| k.starts_with("keyfloor/")));
+
+    // The prefixes the release without the feature scans.
+    let known = [
+        "op/",
+        "queue/",
+        "lease/",
+        "session/",
+        "loss/",
+        "fate/",
+        "floor/",
+        "subject/",
+        "done/",
+        "cordon/",
+        "inflight/",
+    ];
+    let new = |k: &String| k.starts_with("opkey/") || k.starts_with("keyfloor/");
+    for prefix in known {
+        let scanned = store.scan_prefix(prefix).expect("scan");
         assert!(
-            matches!(read(format, 0), Ok(LogCommand::Farm(_))),
-            "{format:?}"
+            scanned.iter().all(|(k, _)| !new(k)),
+            "a scan of {prefix} meets a new row"
         );
     }
-    assert_eq!(
-        rows[0].1.value,
-        kbf_log::encode(
-            Format::V1,
-            &LogCommand::Farm(kbf_log::FarmBatch {
-                now: kbf_types::FarmTime::default(),
-                wall: std::time::UNIX_EPOCH,
-                inputs: vec![kbf_log::FarmInput::Submit(request(1))],
-            })
-        )
-        .expect("format 1")
-    );
-    // The keyed row: not a format-5 entry.
-    assert!(read(Format::V5, 1).is_err());
-    assert!(read(Format::V1, 1).is_err());
-    assert!(matches!(read(Format::V6, 1), Ok(LogCommand::Farm(_))));
-    // What the older binary scans for floors holds digest floors only.
-    let scanned = store.scan_prefix("floor/").expect("scan");
-    assert_eq!(scanned.len(), 1);
-    assert!(floor::decode(&scanned[0].1.value).is_ok());
+    // What those scans find is what a store without the feature holds: the request
+    // reads as a format-1 entry, the floor row as a digest floor.
+    let rows = store.scan_prefix("op/").expect("scan");
+    assert!(kbf_log::decode(kbf_log::Format::V1, &rows[0].1.value).is_ok());
+    let floors = store.scan_prefix("floor/").expect("scan");
+    assert_eq!(floors.len(), 1);
+    assert!(floor::decode(&floors[0].1.value).is_ok());
 }
 
 /// Catches a key floor row read as anything but what was written: another version, a

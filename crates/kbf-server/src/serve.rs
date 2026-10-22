@@ -746,10 +746,7 @@ where
         listeners.finished_retention,
     )
     .with_memory_ladder(listeners.memory_ladder.clone())
-    .with_learned_sizes(
-        listeners.learned_sizes,
-        crate::learned_sizes::admitted(listeners.learned_sizes, cache.meta()),
-    )
+    .with_learned_sizes(listeners.learned_sizes)
     .recording(recorder.clone());
     let durable = state.is_some();
     // Storage nodes register with a frontend that has a state store to keep them in.

@@ -108,13 +108,14 @@ impl Farm {
         assert!(self.feed(Event::Submit { waiter, request }).is_empty());
     }
 
-    /// [`Farm::submit`], then names `size_key` as the new operation's key, as the server
-    /// does once it has queued the operation.
+    /// [`Farm::submit`] of a request that starts a new operation, which is named `size_key`
+    /// before the submit is fed, as the server does: the first placement round sees it.
     fn submit_keyed(&mut self, waiter: u64, request: Request, size_key: u64) {
-        let before = self.s.next_operation();
+        assert!(self.s.twin(&request).is_none(), "joins a twin");
+        let next = self.s.next_operation();
+        self.s.set_size_key(next, size_key);
         self.submit(waiter, request);
-        assert_ne!(self.s.next_operation(), before, "joined a twin");
-        self.s.set_size_key(before, size_key);
+        assert_ne!(self.s.next_operation(), next);
     }
 
     /// A placement round: every `Start` it makes.

@@ -98,20 +98,6 @@ struct Operation {
     /// ([`Scheduler::reclamp_key_floor`] undoes the raise when no live worker is large
     /// enough for it).
     key_applied: Option<KeyApplied>,
-    /// The key its kill-driven memory floor is kept under, fed by the caller
-    /// ([`Scheduler::set_size_key`]); `None` for an operation that has none. Not part of
-    /// the request: it is in no log record or row the scheduler writes.
-    size_key: Option<u64>,
-}
-
-impl Operation {
-    /// The key of the floor this operation is subject to: its size key, for a plain
-    /// `action` without GPUs. Other kinds book a share of the worker or all of it, not
-    /// a size learned from earlier runs.
-    fn floor_key(&self) -> Option<u64> {
-        self.size_key
-            .filter(|_| self.request.kind == LeaseKind::Action && self.request.resources.gpus == 0)
-    }
 }
 
 /// A memory raise a key floor made to a queued operation.
@@ -308,6 +294,9 @@ pub struct Scheduler {
     /// kills ([`memory`]). Boxed: most schedulers hold none, and the scheduler is
     /// moved by value.
     memory: Box<MemoryState>,
+    /// The size key of each operation the caller named one for ([`Scheduler::set_size_key`]),
+    /// until the operation is retired. Not in the request, the log or the `Eq` memory state.
+    size_keys: BTreeMap<OperationId, u64>,
     /// The rungs of an action's memory booking ([`memory`]).
     ladder: MemoryLadder,
     /// Workers a recovered scheduler holds leases for that have not registered yet, and
@@ -344,6 +333,7 @@ impl Scheduler {
             requeues: None,
             reservations: BTreeMap::new(),
             memory: Box::default(),
+            size_keys: BTreeMap::new(),
             ladder: MemoryLadder::default(),
             awaited: BTreeMap::new(),
             store_down: false,
@@ -404,6 +394,7 @@ impl Scheduler {
             self.finished.pop_front();
             self.ops.remove(&id);
             self.memory.forget(id);
+            self.size_keys.remove(&id);
         }
     }
 
@@ -459,7 +450,6 @@ impl Scheduler {
                 avoid: BTreeSet::new(),
                 queued_at: self.now,
                 key_applied: None,
-                size_key: None,
             },
         );
         Vec::new()

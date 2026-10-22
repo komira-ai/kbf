@@ -53,46 +53,12 @@ impl fmt::Display for LearnedSizes {
     }
 }
 
-/// The machine version that admits `Request::size_key` (`kbf_log::MachineVersion::V6`).
-const SIZE_KEY_VERSION: u32 = 6;
-
-/// Whether requests may be keyed under `mode` over the metadata log `meta`: `on`, and the
-/// log is at machine version 6 (raised here when this process is its only voter). Says so
-/// at start when `on` cannot key.
-pub(crate) fn admitted<M: kbf_front::MetaLog>(mode: LearnedSizes, meta: &M) -> bool {
-    if mode != LearnedSizes::On {
-        return false;
-    }
-    let admitted = meta.admit_machine_version(SIZE_KEY_VERSION);
-    if admitted {
-        tracing::info!("learned sizes: on; requests of unnamed memory are keyed");
-    } else {
-        tracing::warn!(
-            "learned sizes: on, but the metadata log is below machine version 6 and this \
-             process may not raise it: no request is keyed (as off) until it is raised"
-        );
-    }
-    admitted
-}
-
-/// [`admitted`] for a frontend with no metadata log of its own (it reaches storage
-/// nodes): there is no group version to read, so `on` keys nothing there.
-pub(crate) fn admitted_without_log(mode: LearnedSizes) -> bool {
-    if mode == LearnedSizes::On {
-        tracing::warn!(
-            "learned sizes: on, but this frontend has no metadata log to read a machine \
-             version from: no request is keyed (as off)"
-        );
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Catches a spelling that does not round-trip, one accepted that should not be,
-    /// and a default other than `off`.
+    /// A spelling that does not round-trip, one accepted that should not be, and a
+    /// default other than `off`.
     #[test]
     fn the_modes_parse_print_and_default_to_off() {
         for mode in [LearnedSizes::Off, LearnedSizes::Shadow, LearnedSizes::On] {
@@ -101,17 +67,5 @@ mod tests {
         assert_eq!(LearnedSizes::default(), LearnedSizes::Off);
         let bad = "yes".parse::<LearnedSizes>().expect_err("not a mode");
         assert_eq!(bad.to_string(), "`yes` is not one of off, shadow, on");
-    }
-
-    /// Catches `on` keying over a log with no group version (a frontend, or an
-    /// in-process log): it must not, since no binary can be told to read the field.
-    /// And a mode other than `on` never raises anything.
-    #[test]
-    fn without_a_machine_version_nothing_is_admitted() {
-        let memory = kbf_front::MemoryMetaLog::new(Default::default());
-        for mode in [LearnedSizes::Off, LearnedSizes::Shadow, LearnedSizes::On] {
-            assert!(!admitted(mode, &memory), "{mode:?}");
-            assert!(!admitted_without_log(mode), "{mode:?}");
-        }
     }
 }

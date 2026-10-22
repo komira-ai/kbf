@@ -516,21 +516,6 @@ where
             term: self.shared.term,
         })
     }
-
-    fn machine_version(&self) -> Option<u32> {
-        Some(RaftMetaLog::machine_version(self).get())
-    }
-
-    fn admit_machine_version(&self, to: u32) -> bool {
-        let at = RaftMetaLog::machine_version(self).get();
-        if at >= to {
-            return true;
-        }
-        let Some(version) = std::num::NonZeroU32::new(to).map(MachineVersion::new) else {
-            return false;
-        };
-        self.voters() == 1 && self.raise_machine_version(version).is_ok()
-    }
 }
 
 /// Commands waiting to be committed, each with the caller to answer.

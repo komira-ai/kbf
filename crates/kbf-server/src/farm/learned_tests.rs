@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use kbf_front::{Described, Dispatch, Submission};
 use kbf_invocation::{BookSource, Evidence};
-use kbf_log::{FarmInput, Format, LogCommand};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
 use kbf_types::{ActionKey, Digest, DigestFunction, LeaseKind, Qos, Resources};
@@ -21,14 +20,14 @@ fn store() -> Arc<Fake> {
     ))
 }
 
-fn farm_over(store: &Arc<Fake>, mode: LearnedSizes, admitted: bool) -> Farm {
+fn farm_over(store: &Arc<Fake>, mode: LearnedSizes) -> Farm {
     let store: Arc<dyn Store> = store.clone();
     Farm::new(
         Arc::new(kbf_front::Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
     )
-    .with_learned_sizes(mode, admitted)
+    .with_learned_sizes(mode)
     .with_state(Some(StateStore {
         store,
         epoch: EpochPolicy::Keep,
@@ -75,7 +74,6 @@ impl Job {
             resources: Resources::new(1_000, 4 << 30).with_gpus(self.gpus),
             hermetic: true,
             do_not_cache: false,
-            size_key: None,
             needs: kbf_caps::Request::from_platform(self.platform.iter().copied()).unwrap(),
         };
         farm.submit(Submission {
@@ -94,27 +92,27 @@ impl Job {
     }
 }
 
-/// The size keys of the `op/` rows, in operation order; `None` for an unkeyed row. Each
-/// row is read as a format-6 reader reads it, and an unkeyed one must also read as a
-/// format-1 reader does.
+/// The size key of each operation of the store, in operation order: its `opkey/` row, or
+/// `None` for an operation with none. The request rows are format 1 whatever the key.
 fn keys(store: &Arc<Fake>) -> Vec<Option<u64>> {
+    let opkeys: std::collections::BTreeMap<String, Vec<u8>> = store
+        .scan_prefix("opkey/")
+        .expect("scan")
+        .into_iter()
+        .map(|(k, row)| (k["opkey/".len()..].to_owned(), row.value))
+        .collect();
     store
         .scan_prefix("op/")
         .expect("scan")
         .into_iter()
-        .map(|(_, row)| {
-            let Ok(LogCommand::Farm(batch)) = kbf_log::decode(Format::V6, &row.value) else {
-                panic!("an op row that does not read");
-            };
-            let [FarmInput::Submit(request)] = &batch.inputs[..] else {
-                panic!("not a submit");
-            };
-            assert_eq!(
-                kbf_log::decode(Format::V1, &row.value).is_ok(),
-                request.size_key.is_none(),
-                "an unkeyed row is format 1, a keyed one is not"
+        .map(|(k, row)| {
+            assert!(
+                kbf_log::decode(kbf_log::Format::V1, &row.value).is_ok(),
+                "a request row is format 1"
             );
-            request.size_key
+            opkeys
+                .get(&k["op/".len()..])
+                .map(|v| u64::from_be_bytes(v[1..9].try_into().expect("an opkey row")))
         })
         .collect()
 }
@@ -131,33 +129,35 @@ fn size_keys(farm: &Farm) -> Vec<Option<u64>> {
 
 fn keyed_with(jobs: &[Job]) -> Vec<Option<u64>> {
     let store = store();
-    let farm = farm_over(&store, LearnedSizes::On, true);
+    let farm = farm_over(&store, LearnedSizes::On);
     for job in jobs {
         job.submit(&farm);
     }
     keys(&store)
 }
 
-/// Catches: a keyed submission that is not keyed, the key written when the flag is off
-/// or shadow or the log does not admit the field (a binary before format 6 would stop on
-/// the row), and a row of an unkeyed submission written in a newer format than before.
-///
+/// Only `on` keys a submission: a plain action of unnamed memory is keyed with it, and
+/// with `off` or `shadow` no row is written and nothing is named.
 #[test]
-fn only_on_with_the_field_admitted_keys_a_submission() {
-    for (mode, admitted) in [
-        (LearnedSizes::Off, true),
-        (LearnedSizes::Shadow, true),
-        (LearnedSizes::On, false),
-        (LearnedSizes::Off, false),
-    ] {
+fn only_on_keys_a_submission() {
+    for mode in [LearnedSizes::Off, LearnedSizes::Shadow] {
         let store = store();
-        let farm = farm_over(&store, mode, admitted);
+        let farm = farm_over(&store, mode);
         Job::new(1).submit(&farm);
-        assert_eq!(keys(&store), vec![None], "{mode:?} {admitted}");
+        assert_eq!(keys(&store), vec![None], "{mode:?}");
+        assert_eq!(size_keys(&farm), vec![None], "{mode:?}");
     }
-    let [Some(_)] = keyed_with(&[Job::new(1)])[..] else {
-        panic!("on and admitted keys a plain action");
+    let store = store();
+    let farm = farm_over(&store, LearnedSizes::On);
+    Job::new(1).submit(&farm);
+    let [Some(key)] = keys(&store)[..] else {
+        panic!("on keys a plain action");
     };
+    assert_eq!(
+        size_keys(&farm),
+        vec![Some(key)],
+        "the scheduler holds it too"
+    );
 }
 
 /// Catches a key given to a submission the floor must not apply to: one whose memory the
@@ -228,15 +228,15 @@ fn the_key_names_the_instance_the_platform_and_the_shape() {
 #[test]
 fn a_restart_without_on_ignores_the_size_key_of_a_row() {
     let store = store();
-    let first = farm_over(&store, LearnedSizes::On, true);
+    let first = farm_over(&store, LearnedSizes::On);
     Job::new(1).submit(&first);
     assert!(keys(&store)[0].is_some());
     drop(first);
     for mode in [LearnedSizes::Off, LearnedSizes::Shadow] {
-        let farm = farm_over(&store, mode, true);
+        let farm = farm_over(&store, mode);
         let loaded = size_keys(&farm);
         assert_eq!(loaded, vec![None], "{mode:?}");
     }
-    let farm = farm_over(&store, LearnedSizes::On, true);
+    let farm = farm_over(&store, LearnedSizes::On);
     assert!(size_keys(&farm)[0].is_some());
 }

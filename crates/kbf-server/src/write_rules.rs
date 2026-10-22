@@ -118,6 +118,16 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
         ),
         fenced(Keys::Under("floor/"), "farm/durable", "floor/main/0000"),
         fenced(
+            Keys::Under("keyfloor/"),
+            "farm/durable",
+            "keyfloor/0000000000000001",
+        ),
+        fenced(
+            Keys::Under("opkey/"),
+            "farm/durable",
+            "opkey/0000000000000001",
+        ),
+        fenced(
             Keys::Under("subject/"),
             "farm/durable",
             "subject/0000000000000001",

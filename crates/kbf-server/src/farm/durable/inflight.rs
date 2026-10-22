@@ -52,14 +52,27 @@ impl Durable {
     /// # Errors
     /// The store cannot be read or written, or a row in the way does not go
     /// ([`StateError::Conflict`]).
+    #[cfg(test)]
     pub(super) fn submit(
+        &self,
+        id: OperationId,
+        request: &Request,
+        subject: &Subject,
+    ) -> Result<Submitted, StateError> {
+        self.submit_keyed(id, request, subject, None)
+    }
+
+    /// [`Durable::submit`], with the size key the operation is given, if any: written in
+    /// an `opkey/` row of the transaction that queues it.
+    pub(super) fn submit_keyed(
         &self,
         mut id: OperationId,
         request: &Request,
         subject: &Subject,
+        size_key: Option<u64>,
     ) -> Result<Submitted, StateError> {
         if !request.joinable() {
-            self.submitted(id, request, subject)?;
+            self.submitted_keyed(id, request, subject, size_key)?;
             return Ok(Submitted::Queued(id));
         }
         let pin = inflight_key(&request.key);
@@ -77,7 +90,7 @@ impl Durable {
                 // The operation it names is gone: the row is left over, and goes.
                 cond = Cond::Version(row.version);
             }
-            match self.submitted_pinned(id, request, subject, (&pin, cond)) {
+            match self.submitted_pinned(id, request, subject, size_key, (&pin, cond)) {
                 Ok(()) => return Ok(Submitted::Queued(id)),
                 // Another writer took the id, or queued this action since the look.
                 Err(StateError::Conflict(_)) if looks < LOOKS => {
@@ -121,6 +134,13 @@ impl Durable {
             Some(row) => Some(subject::decode(&row.value).map_err(|why| corrupt(&key, why))?),
             None => None,
         };
+        let size_key = match self.store.get(&opkey_key(operation))? {
+            Some(row) => {
+                let key = opkey_key(operation);
+                Some(opkey::decode(&row.value).map_err(|why| corrupt(&key, why))?)
+            }
+            None => None,
+        };
         Ok(Some(StoredOperation {
             operation,
             request,
@@ -128,6 +148,7 @@ impl Durable {
             losses,
             fate,
             subject,
+            size_key,
         }))
     }
 

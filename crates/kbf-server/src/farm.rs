@@ -137,20 +137,6 @@ pub struct Farm {
     state: Mutex<State>,
 }
 
-/// What `--learned-sizes` says and whether the log admits the field it writes.
-#[derive(Clone, Copy, Debug, Default)]
-struct Learned {
-    mode: LearnedSizes,
-    admitted: bool,
-}
-
-impl Learned {
-    /// Whether a request is keyed: `on`, with the field admitted.
-    fn keys(self) -> bool {
-        self.mode == LearnedSizes::On && self.admitted
-    }
-}
-
 /// An operator action named a node that never registered.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("no node {0} has registered")]
@@ -320,9 +306,8 @@ struct State {
     held_cap: usize,
     /// The scheduler was told the state store is unavailable ([`State::watch_store`]).
     store_down: bool,
-    /// What `--learned-sizes` says, and whether requests are keyed with it
-    /// ([`Farm::with_learned_sizes`]).
-    learned: Learned,
+    /// What `--learned-sizes` says ([`Farm::with_learned_sizes`]).
+    learned: LearnedSizes,
     /// When each node's session row in the state store was last written.
     renewed: BTreeMap<WorkerId, FarmTime>,
     /// A handover took the work from this farm ([`Farm::fence`]): it feeds the scheduler
@@ -431,7 +416,7 @@ impl Farm {
                 write_drops: 0,
                 held_cap: HELD_CAP,
                 store_down: false,
-                learned: Learned::default(),
+                learned: LearnedSizes::default(),
                 renewed: BTreeMap::new(),
                 fenced: false,
                 untraced_kept: BTreeMap::new(),
@@ -449,13 +434,15 @@ impl Farm {
         self
     }
 
-    /// This farm, learning sizes as `mode` says. `admitted` is whether the metadata log's
-    /// group admits the `size_key` field (machine version 6): only then does `on` key
-    /// requests, so no binary that cannot read the field meets it.
+    /// This farm, learning sizes as `mode` says: with `on`, a submission of an action
+    /// whose memory the client did not name, on a platform that pins the OS, is given a
+    /// size key ([`crate::size_key`]) that the scheduler's kill-driven memory floor is
+    /// kept under, and the state store holds beside the operation. Set before the farm
+    /// takes a state store over.
     #[must_use]
-    pub fn with_learned_sizes(mut self, mode: LearnedSizes, admitted: bool) -> Self {
+    pub fn with_learned_sizes(mut self, mode: LearnedSizes) -> Self {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-        state.learned = Learned { mode, admitted };
+        state.learned = mode;
         self
     }
 
@@ -1064,20 +1051,20 @@ impl Dispatch for Farm {
         let waiting = std::time::Instant::now();
         let mut state = self.lock();
         self.cache.metrics().sched_lock_wait.since(waiting);
-        if state.learned.keys() {
-            submission.request.size_key = Keyable {
-                instance: &submission.request.key.instance,
-                platform: &platform,
-                shape: usage.key,
-                kind: submission.request.kind,
-                gpus: submission.request.resources.gpus,
-                memory: submission.evidence.memory_source,
-            }
-            .key();
-        } else {
-            submission.request.size_key = None;
-        }
-        state.admit(&submission.request, &usage)?;
+        let size_key = (state.learned == LearnedSizes::On)
+            .then(|| {
+                Keyable {
+                    instance: &submission.request.key.instance,
+                    platform: &platform,
+                    shape: usage.key,
+                    kind: submission.request.kind,
+                    gpus: submission.request.resources.gpus,
+                    memory: submission.evidence.memory_source,
+                }
+                .key()
+            })
+            .flatten();
+        state.admit(&submission.request, &usage, size_key)?;
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
         let waiter = state.machine.submit(Waiter {
@@ -1095,6 +1082,12 @@ impl Dispatch for Farm {
         }
         let (stage, receiver) = watch::channel(Stage::Queued);
         state.stages.insert(waiter, stage);
+        // The operation this submit allocates (none if it joins a twin, which keeps its
+        // own key) is named before the submit is fed: its first placement round follows.
+        if let Some(key) = size_key.filter(|_| state.sched.twin(&submission.request).is_none()) {
+            let next = state.sched.next_operation();
+            state.sched.set_size_key(next, key);
+        }
         state.feed_quiet(
             now,
             Event::Submit {

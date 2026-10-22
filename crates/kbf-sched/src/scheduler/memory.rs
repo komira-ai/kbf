@@ -65,7 +65,8 @@
 use std::collections::BTreeMap;
 
 use kbf_types::{
-    ActionKey, Failure, FarmFault, MemoryKill, MemoryRun, OperationId, ResultRecord, WorkerId,
+    ActionKey, Failure, FarmFault, LeaseKind, MemoryKill, MemoryRun, OperationId, ResultRecord,
+    WorkerId,
 };
 
 use super::KeyApplied;
@@ -415,8 +416,7 @@ impl Scheduler {
     /// forgotten since the last call (the caller owns those now). Empty for an operation
     /// the scheduler no longer holds.
     pub fn take_floor_change(&mut self, operation: OperationId) -> FloorChange {
-        let held = self.ops.get(&operation);
-        let request = held.map(|op| &op.request);
+        let request = self.ops.get(&operation).map(|op| &op.request);
         let raised = request.and_then(|r| {
             let (ask, stamp) = self.memory.floors.stamped(&r.key)?;
             Some(Floor {
@@ -425,7 +425,7 @@ impl Scheduler {
                 stamp,
             })
         });
-        let key_raised = held.and_then(super::Operation::floor_key).and_then(|key| {
+        let key_raised = self.floor_key(operation).and_then(|key| {
             let (ask, stamp) = self.memory.key_floors.stamped(&key)?;
             Some(KeyFloor { key, ask, stamp })
         });
@@ -454,13 +454,24 @@ impl Scheduler {
     /// Names the key `operation`'s kill-driven memory floor is kept under, which the
     /// caller derives (from the instance, the platform class, the instrument and the
     /// action's shape) and keeps in its own rows: no scheduler input and no log record
-    /// carries it. A no-op for an operation the scheduler does not hold. Set it once the
-    /// operation is queued, and again for one taken up after a restart (before its worker
-    /// registers: a recovered lease is raised to its key's floor then).
+    /// carries it. Set it for an operation the scheduler is about to allocate (its
+    /// [`Scheduler::next_operation`], when the caller knows the submit will not join a
+    /// twin) before the submit is fed, so the first placement round sees it, and again for
+    /// one taken up after a restart (before its worker registers: a recovered lease is
+    /// raised to its key's floor then). Dropped with the operation.
     pub fn set_size_key(&mut self, operation: OperationId, size_key: u64) {
-        if let Some(op) = self.ops.get_mut(&operation) {
-            op.size_key = Some(size_key);
-        }
+        self.size_keys.insert(operation, size_key);
+    }
+
+    /// The key of the floor `operation` is subject to: its size key, for a plain `action`
+    /// without GPUs. Other kinds book a share of the worker or all of it, not a size
+    /// learned from earlier runs.
+    fn floor_key(&self, operation: OperationId) -> Option<u64> {
+        let request = &self.ops.get(&operation)?.request;
+        self.size_keys
+            .get(&operation)
+            .copied()
+            .filter(|_| request.kind == LeaseKind::Action && request.resources.gpus == 0)
     }
 
     /// The key floor of `size_key`, in bytes: the memory a queued operation with it
@@ -499,8 +510,8 @@ impl Scheduler {
     /// lease books it, and a successor recomputes the same booking.
     pub(super) fn raise_to_key_floor(&mut self, id: OperationId, bound: Option<u64>) {
         let op = &self.ops[&id];
-        let Some(ask) = op
-            .floor_key()
+        let Some(ask) = self
+            .floor_key(id)
             .and_then(|key| self.memory.key_floors.get(&key))
         else {
             return;
@@ -627,8 +638,8 @@ impl Scheduler {
             let Some(raised) = raised else {
                 return false;
             };
-            let key_bound = op
-                .floor_key()
+            let key_bound = self
+                .floor_key(id)
                 .map(|k| (k, self.key_floor_bound(&op.request)));
             let op = self.ops.get_mut(&id).expect("checked above");
             op.request.resources.memory_bytes = raised;

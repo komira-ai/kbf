@@ -317,10 +317,8 @@ pub struct Args {
     /// platform class, instrument and shape), which every later digest of the key, queued
     /// or new, books at least, strictly below the memory of the largest node that could
     /// run it. Only an action whose memory the client did not name, whose platform pins
-    /// the OS, is keyed. `on` writes a field older binaries do not read, so it keys
-    /// requests only while the metadata log is at machine version 6 (one raised to it
-    /// can no longer be read by an older binary); below that it behaves as `off` and
-    /// says so at start.
+    /// the OS, is keyed. The key is kept in the state store (rows of their own: a release
+    /// without this flag reads the store as it always did), so it survives a restart.
     #[arg(long, default_value_t = crate::LearnedSizes::Off)]
     pub learned_sizes: crate::LearnedSizes,
     /// How long, in seconds, a finished operation is kept after its callers are
