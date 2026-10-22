@@ -451,6 +451,17 @@ do_W03() { mkdir -p "$H/z/y" "$H/go/a/b" && touch "$H/z/y/f" "$H/go/a/b/f" && ch
 plant_W03() { p W03 do_W03; }
 probe_W03() { pr 'home_nonempty'; }
 
+install_job() { # <plist>: root puts a job in the uid's launchd on whichever way works; prints how
+  _pl=$1
+  _o1=$(launchctl bootstrap "user/$ID" "$_pl" 2>&1 | head -1)
+  if launchctl print "user/$ID" 2>/dev/null | grep -q "$M"; then echo "job installed via bootstrap user/"; return 0; fi
+  _o2=$(launchctl asuser "$ID" /bin/launchctl load -w "$_pl" 2>&1 | head -1); sleep 1
+  if launchctl asuser "$ID" /bin/launchctl list 2>/dev/null | grep -q "$M"; then echo "job installed via asuser launchctl load"; return 0; fi
+  _o3=$(launchctl asuser "$ID" /usr/bin/sudo -n -u "$U" /bin/launchctl load "$_pl" 2>&1 | head -1); sleep 1
+  if launchctl asuser "$ID" /usr/bin/sudo -n -u "$U" /bin/launchctl list 2>/dev/null | grep -q "$M"; then echo "job installed via asuser sudo launchctl load"; return 0; fi
+  echo "NO-JOB bootstrap: $_o1 | asuser load: $_o2 | asuser sudo load: $_o3"; return 1
+}
+
 # a respawning job in the user's launchd domain, put there by root (a pool user cannot bootstrap one itself on a
 # runner: see CH17), stands for any job launchd keeps alive for the uid
 fixture_W04() {
@@ -459,7 +470,7 @@ fixture_W04() {
 <plist version="1.0"><dict><key>Label</key><string>$M</string><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>1</integer><key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>echo x >>"$H/respawn-$M"; sleep 2</string></array></dict></plist>
 EOF
   chmod 644 "$W/$M.plist"
-  echo "W04 fixture bootstrap user/: $(launchctl bootstrap "user/$ID" "$W/$M.plist" 2>&1 | head -2 | tr '\n' ' ') plutil: $(plutil -lint "$W/$M.plist" 2>&1 | head -1) domain: $(launchctl print "user/$ID" 2>&1 | head -1)"
+  echo "W04 fixture: $(install_job "$W/$M.plist")"
   sleep 3
 }
 do_W04() { launchctl submit -l "kbf.w4.$M" -- /bin/sh -c "echo x >>$H/submit-$M; sleep 2"; echo "submit rc=$?"; sleep 2; }
@@ -470,6 +481,7 @@ probe_W04() {
     sleep "$_s"
     [ "$(wc -l <"$H/respawn-$M" 2>/dev/null | tr -d ' ')" -gt 1 ] 2>/dev/null && _any=1
     launchctl print "user/$ID" 2>/dev/null | grep -q "$M" && _any=1
+    launchctl asuser "$ID" /bin/launchctl list 2>/dev/null | grep -q "$M" && _any=1
   done
   echo "INFO W04 respawn-lines: $(wc -l <"$H/respawn-$M" 2>/dev/null | tr -d ' ') job-listed: $(launchctl print "user/$ID" 2>/dev/null | grep -c "$M")"
   [ "$_any" = 1 ] && echo "PROBE $ROW present" || echo "PROBE $ROW absent"
@@ -484,7 +496,7 @@ probe_W06a() { echo "INFO W06a lsof: $(lsof -a +L1 -u "$ID" 2>/dev/null | sed 1d
 plant_W06() { plant_W06a; }
 probe_W06() { probe_W06a; }
 
-fixture_W06b() { hdiutil create -quiet -size 4m -fs HFS+ -volname "$M" "$W/img-$M.dmg" && chmod 666 "$W/img-$M.dmg"; }
+fixture_W06b() { hdiutil create -quiet -size 4m -fs HFS+ -volname "$M" "$W/img-$M.dmg" && chown "$ID:$GID" "$W/img-$M.dmg" && chmod 600 "$W/img-$M.dmg"; ls -l "$W/img-$M.dmg"; }
 do_W06b() {
   mkdir -p "$H/mnt" && hdiutil attach -quiet -mountpoint "$H/mnt" "$W/img-$M.dmg" || return 1
   printf sentinel >"$H/mnt/sentinel" || return 1
@@ -560,7 +572,7 @@ fixture_W11() {
 <plist version="1.0"><dict><key>Label</key><string>$M</string><key>StartInterval</key><integer>5</integer><key>ProgramArguments</key><array><string>/usr/bin/touch</string><string>$H/si-$M</string></array></dict></plist>
 EOF
   chmod 644 "$W/$M.plist"
-  echo "W11 fixture bootstrap user/: $(launchctl bootstrap "user/$ID" "$W/$M.plist" 2>&1 | head -2 | tr '\n' ' ') plutil: $(plutil -lint "$W/$M.plist" 2>&1 | head -1)"
+  echo "W11 fixture: $(install_job "$W/$M.plist")"
 }
 do_W11a() { printf '* * * * * touch %s/cron-%s\n' "$H" "$M" >"$L/ct" && crontab "$L/ct"; }
 plant_W11() { p W11a do_W11a; }

@@ -582,7 +582,10 @@ impl Cs {
             let aside = env.root("ls -d \"$HOMES\"/.kbf-recreated-\"$U\"-* 2>/dev/null | wc -l | tr -d ' '", 30);
             let recreated = aside.text.trim() != "0";
             let after = format!("{WORK}/snap.{}.after", env.marker);
-            env.root(&format!("snap > '{after}' 2>&1"), 180);
+            env.root(
+                &format!("snap > '{after}' 2>&1; cp '{after}' '{WORK}/snap.last.after'"),
+                180,
+            );
             let present = self.probe(&tag, "clean", &env, verdict);
             let diffs = self.diff(&tag, "clean", &env, &base, &after);
             let word = if quarantined {
@@ -944,7 +947,7 @@ fn baseline_and_builds() {
     let m = cs.last_marker.lock().unwrap().clone();
     let o = env0.root(
         &format!(
-            "grep -v -e '^ds|' -e '^folders|' '{WORK}/snap.{m}.after' | sed -e 's#{HOMES}/kbf-cs-0#<H>#g' -e 's/kbf-cs-0/<U>/g' -e 's/61000/<ID>/g' > '{WORK}/b1.norm'; sdiff_ '{}' '{WORK}/b1.norm'",
+            "grep -v -e '^ds|' -e '^folders|' '{WORK}/snap.last.after' | sed -e 's#{HOMES}/kbf-cs-0#<H>#g' -e 's/kbf-cs-0/<U>/g' -e 's/61000/<ID>/g' > '{WORK}/b1.norm'; sdiff_ '{}' '{WORK}/b1.norm'",
             snaps[0]
         ),
         60,
@@ -967,6 +970,11 @@ fn baseline_and_builds() {
     for row in ["BR1", "BR2", "BR3", "BR4", "BR5"] {
         for benv in ["driver", "hostile"] {
             cs.cell(row, Arm::A, Clean::S, &[("BENV", benv)]);
+        }
+        // Does the tightened profile (B: no POSIX/SysV IPC, no mach-register; C: B plus the
+        // state-creating classes) still let the build run?
+        for arm in [Arm::B, Arm::C] {
+            cs.cell(row, arm, Clean::None, &[("BENV", "driver")]);
         }
     }
 
