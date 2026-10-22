@@ -1,5 +1,5 @@
 //! The roll API over a real unix socket in a scratch directory, with the fakes behind it.
-//! Each test says the defect it catches.
+//! Each test's doc comment says the behaviour it asserts.
 
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
