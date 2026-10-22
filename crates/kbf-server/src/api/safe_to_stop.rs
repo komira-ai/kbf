@@ -28,6 +28,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use kbf_map::MemberId;
+use kbf_state::Store;
 use kbf_types::{FarmTime, WorkerId};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinError;
@@ -36,7 +37,7 @@ use super::{ApiState, encode_segment, error, gate, json, member_failure};
 use crate::farm::Farm;
 use crate::members::{MemberLook, Members, MembersLook, MembershipError};
 use crate::proxy_auth::Caller;
-use crate::update::{Facts, GateMode, Policy, Rows, member_facts, storage_gate, storage_half};
+use crate::storage_gate::{GateMode, member_facts, storage_gate, storage_half};
 
 /// The instant a look is judged at. The gate reads only how long ago each member was heard,
 /// and a look carries those ages, so any instant later than the oldest age serves; this one
@@ -81,13 +82,9 @@ pub fn safe_to_stop_path(id: &str) -> String {
 /// The verdict for the storage member `own` of `look`, with `ttl` the time to live of the
 /// membership.
 fn verdict(look: &MembersLook, own: &MemberLook, ttl: Duration) -> Verdict {
-    let facts = Facts::of_members(member_facts(look, LOOK_AT));
-    let policy = Policy {
-        ttl,
-        ..Policy::default()
-    };
+    let members = member_facts(look, LOOK_AT);
     let mode = GateMode::Out { fresh_since: None };
-    let shut = storage_gate(&facts, own.id, mode, &policy, LOOK_AT).err();
+    let shut = storage_gate(&members, own.id, mode, ttl, LOOK_AT).err();
     Verdict {
         safe: shut.is_none(),
         reasons: shut.into_iter().map(|fail| fail.to_string()).collect(),
@@ -128,18 +125,18 @@ struct Seen {
 /// What the blocking read returned.
 type Looked = Result<Result<Seen, MembershipError>, JoinError>;
 
-/// The node `id` as the farm and the enrollment registry (`rows`, the state store's rows;
+/// The node `id` as the farm and the enrollment registry (in `store`, the state store;
 /// `None` on a server without one, which keeps no members) have it, given the members `look`.
-fn node_of(farm: &Farm, rows: Option<&Rows>, id: &str, look: &MembersLook) -> Node {
+fn node_of(farm: &Farm, store: Option<&dyn Store>, id: &str, look: &MembersLook) -> Node {
     let worker = WorkerId::new(id);
     let Some(seen) = farm.update_look().into_iter().find(|n| n.id == worker) else {
         return Node::Unknown;
     };
     // Only a Linux host has a storage half, as the update controller reads the farm.
-    let Some(rows) = rows.filter(|_| seen.os == "linux") else {
+    let Some(store) = store.filter(|_| seen.os == "linux") else {
         return Node::Daemon;
     };
-    match storage_half(rows, &worker, look) {
+    match storage_half(store, &worker, look) {
         Ok(None) => Node::Daemon,
         Ok(Some(member)) => Node::Member(member),
         Err(why) => Node::Unsure(why),
@@ -152,12 +149,12 @@ fn read(
     id: &str,
     farm: &Farm,
     members: Option<&Members>,
-    rows: Option<&Rows>,
+    store: Option<&dyn Store>,
 ) -> Result<Seen, MembershipError> {
     let ttl = members.map_or(Duration::ZERO, |m| m.config().ttl);
     let look = members.map_or_else(|| Ok(MembersLook::default()), Members::look)?;
     let node = if member_verdict(id, &look, ttl).is_none() {
-        node_of(farm, rows, id, &look)
+        node_of(farm, store, id, &look)
     } else {
         Node::Unknown
     };
@@ -205,8 +202,9 @@ pub(super) async fn check(
     }
     // A server without a state store keeps no members: every host it knows is a daemon.
     let members = api.members.clone();
-    let (farm, rows, name) = (Arc::clone(&api.farm), api.update.clone(), id.clone());
-    let job = move || read(&name, &farm, members.as_deref(), rows.as_ref());
+    let store = api.update.as_ref().map(|rows| Arc::clone(rows.store()));
+    let (farm, name) = (Arc::clone(&api.farm), id.clone());
+    let job = move || read(&name, &farm, members.as_deref(), store.as_deref());
     let looked = tokio::task::spawn_blocking(job).await;
     respond(&id, looked)
 }
