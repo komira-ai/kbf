@@ -48,7 +48,12 @@ kbf-objstore = { workspace = true, features = ["testkit"] }
 # The REAPI service definitions, read from kbf-proto's vendored files, so the
 # authorization test (tests/auth.rs) covers every method the routes serve.
 protox.workspace = true
+# The chain rig of the acknowledgement-point tests (`tests/support/chain.rs`): test
+# certificates, the switch that cuts a node off, and the TLS server the nodes serve with.
+kbf-testkit.workspace = true
+rcgen.workspace = true
 serde_json.workspace = true
+tonic = { workspace = true, features = ["tls-ring"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util", "time"] }
 tracing-subscriber.workspace = true
 

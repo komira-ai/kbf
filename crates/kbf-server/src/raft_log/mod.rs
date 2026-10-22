@@ -49,7 +49,10 @@
 //!   log at that entry. A raise commits alone, under the host's lock; a batch is
 //!   encoded under that lock too, in the format committed when it commits, so no
 //!   batch holds a `MachineVersion` entry and a command the format does not take is
-//!   refused alone while the rest of its batch commits.
+//!   refused alone while the rest of its batch commits. A start raises a log only up to
+//!   its start ceiling ([`START_CEILING`]; [`RaftMetaLog::raise_at_start`]), and each
+//!   feature that needs a version checks the log's [`RaftMetaLog::machine_version`] where
+//!   it uses it.
 //! - **A storage error** stops the log for the life of the process: every later
 //!   commit is refused `Unavailable`.
 //! - **Dropping the log** stops its tick task, waits for a batch the committer is
@@ -71,7 +74,7 @@ use std::io::{self, Read};
 use std::num::NonZeroU64;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
@@ -103,6 +106,15 @@ pub const LOCK: &str = "log.lock";
 /// tier's commands, `EvictObjects`, node writers (`SetWriter`) and `ReseatStaged`. A log
 /// stays at the version it was raised to; a new one starts at [`MachineVersion::V1`].
 pub const RUNS: MachineVersion = MachineVersion::V5;
+
+/// The highest machine version a start raises a log to: what the previous release runs.
+/// A release that adds a new machine version sets this one below [`RUNS`], so the raise
+/// waits for `kbf finalize`. It is [`RUNS`] today, so every start raises as it always has.
+pub const START_CEILING: MachineVersion = RUNS;
+
+// A ceiling past what the binary runs would have every start ask for a version the log
+// refuses ("past the one this binary runs").
+const _: () = assert!(START_CEILING.get() <= RUNS.get());
 
 /// How often the log commits farm time.
 pub const TICK: Duration = Duration::from_secs(1);
@@ -197,6 +209,9 @@ pub struct RaftMetaLog<F: Fs = StdFs> {
     /// [`RaftMetaLog::open_dir`]); released when the log is dropped, after its handle
     /// on the store (fields drop in order).
     lock: Option<DirLock>,
+    /// How far a start raises this log's machine version
+    /// ([`RaftMetaLog::raise_at_start`]); [`START_CEILING`] unless a test lowered it.
+    start_ceiling: MachineVersion,
 }
 
 struct Shared<F: Fs> {
@@ -205,6 +220,9 @@ struct Shared<F: Fs> {
     queue: Mutex<Queue>,
     /// The machine's applied state ([`MetaMachine::state`]), read without `host`.
     state: Arc<RwLock<MetaState>>,
+    /// The machine version committed, as [`RaftMetaLog::version_handle`] lends it: read
+    /// without `host`, which a commit holds across its sync.
+    version: Arc<AtomicU32>,
     log_id: FarmLogId,
     /// The term the open elected this server in.
     term: u64,
@@ -370,6 +388,7 @@ where
             bootstraps: host.machine().bootstraps(),
             term: host.core().hard_state().term.0,
             state: host.machine().state(),
+            version: Arc::new(AtomicU32::new(host.machine().version().get())),
             host: Mutex::new(host),
             queue: Mutex::default(),
             log_id,
@@ -382,6 +401,7 @@ where
             shared,
             ticker,
             lock: None,
+            start_ceiling: START_CEILING,
         })
     }
 
@@ -412,7 +432,38 @@ where
         let entry = kbf_log::encode(machine.format(), &LogCommand::MachineVersion(to))
             .map_err(unavailable)?;
         // A single voter applies its own proposal before `propose` returns.
-        host.propose(entry).map(|_| ()).map_err(unavailable)
+        host.propose(entry).map_err(unavailable)?;
+        self.shared
+            .version
+            .store(host.machine().version().get(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Raises the log's machine version to `target` or `ceiling`, whichever is lower, and
+    /// never above `ceiling`: [`RaftMetaLog::raise_machine_version`] to the lower of the
+    /// two, so a log already there (or past it, as a log finalized to a higher version
+    /// is) commits nothing and is never lowered. Every raise a start makes goes through
+    /// here, with the log's own ceiling ([`RaftMetaLog::raise_at_start`]).
+    ///
+    /// # Errors
+    /// As [`RaftMetaLog::raise_machine_version`].
+    pub fn raise_up_to(
+        &self,
+        target: MachineVersion,
+        ceiling: MachineVersion,
+    ) -> Result<(), MetaLogError> {
+        self.raise_machine_version(target.min(ceiling))
+    }
+
+    /// [`RaftMetaLog::raise_up_to`] `target`, up to the log's start ceiling
+    /// ([`START_CEILING`]). What the log's machine version is after it is the caller's to
+    /// check ([`RaftMetaLog::machine_version`]): a feature that needs more than the
+    /// ceiling lets is off, or takes its degraded path.
+    ///
+    /// # Errors
+    /// As [`RaftMetaLog::raise_machine_version`].
+    pub fn raise_at_start(&self, target: MachineVersion) -> Result<(), MetaLogError> {
+        self.raise_up_to(target, self.start_ceiling)
     }
 
     /// Commits `Tick(now)` and returns the committed farm time after it.
@@ -425,6 +476,21 @@ where
 }
 
 impl<F: Fs> RaftMetaLog<F> {
+    /// This log with `ceiling` as its start ceiling in place of [`START_CEILING`]: how a
+    /// test stands in for a release whose ceiling is below [`RUNS`]. It is not a flag; a
+    /// server always starts at [`START_CEILING`].
+    #[must_use]
+    pub fn with_start_ceiling(mut self, ceiling: MachineVersion) -> Self {
+        self.start_ceiling = ceiling;
+        self
+    }
+
+    /// The highest machine version a start raises this log to.
+    #[must_use]
+    pub fn start_ceiling(&self) -> MachineVersion {
+        self.start_ceiling
+    }
+
     /// The log's id, from its record.
     #[must_use]
     pub fn log_id(&self) -> FarmLogId {
@@ -456,6 +522,17 @@ impl<F: Fs> RaftMetaLog<F> {
     #[must_use]
     pub fn machine_version(&self) -> MachineVersion {
         self.shared.lock().machine().version()
+    }
+
+    /// A handle on the machine version the log has committed, as [`MachineVersion::get`]
+    /// numbers it: the number [`RaftMetaLog::machine_version`] answers, kept current by
+    /// every raise ([`RaftMetaLog::raise_machine_version`]) and read with no lock (that one
+    /// takes the host's, which a commit holds across its sync). It outlives the log and then
+    /// stays at the last version the log committed; a reader only reads it. A node reports
+    /// it to its frontend at every heartbeat ([`crate::join::Joiner::with_log`]).
+    #[must_use]
+    pub fn version_handle(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.shared.version)
     }
 
     /// How many servers vote in the log's cell: its Raft membership's voters. One

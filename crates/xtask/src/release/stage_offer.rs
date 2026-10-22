@@ -68,8 +68,10 @@ use std::time::{Duration, Instant};
 use kbf_gate::{Target, system_clock};
 use kbf_types::ReleasePlatform;
 
+use super::attest_gh::{Attester, Gh};
 use super::fetch_previous::{self, FetchPreviousArgs, tag_commit};
-use super::offer::{self, Attester, Evidence, Gh, IDENTITY_CAP, Request, incomplete, render};
+use super::identity_file::IDENTITY_CAP;
+use super::offer::{self, Evidence, Request, incomplete, render};
 use super::tags::{self, Standing};
 use crate::Error;
 use crate::build_commit::{full_commit, write_executable};

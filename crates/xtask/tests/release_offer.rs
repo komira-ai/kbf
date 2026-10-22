@@ -15,7 +15,8 @@ use kbf_testkit::dir::TestDir;
 use sha2::Digest;
 use xtask::Error;
 use xtask::package::Platform;
-use xtask::release::offer::{Attester, Evidence, Request, plan, summary, write};
+use xtask::release::attest_gh::Attester;
+use xtask::release::offer::{Evidence, Request, plan, summary, write};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");

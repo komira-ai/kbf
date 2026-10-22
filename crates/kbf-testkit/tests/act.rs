@@ -1048,3 +1048,15 @@ fn process_probes_see_a_process_of_the_same_user_and_not_a_missing_one() {
         errno("proc-sees", libc::ESRCH)
     );
 }
+
+/// Catches: `burn` returning at once (the leases' CPU-usage tests would measure nothing),
+/// running far past its time, or exiting non-zero.
+#[test]
+fn burn_runs_for_its_time_and_succeeds() {
+    let started = Instant::now();
+    let out = output(&["burn", "0.3"]);
+    let took = started.elapsed();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(took >= Duration::from_millis(300), "{took:?}");
+    assert!(took < Duration::from_secs(20), "{took:?}");
+}

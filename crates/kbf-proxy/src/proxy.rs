@@ -167,6 +167,7 @@ impl ProxyRunner {
             let abandon = Arc::clone(&core);
             tokio::spawn(async move { abandon.abandon_startup_after(hold_max).await });
             tokio::spawn(poll(Arc::clone(&core)));
+            tokio::spawn(crate::term::poll(Arc::clone(&core)));
             serve(core, updates, listener, Acceptor::Tls(tls), stopped).await;
         });
         Ok(())

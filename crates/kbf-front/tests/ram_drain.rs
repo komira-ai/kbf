@@ -1,8 +1,9 @@
 //! The drain of the held set (`docs/design/storage-ram-ack.md`, "Drain and shutdown"): a
 //! held blob is written to the hot disk through the write pool and leaves the set only once
 //! the index has it; a failed attempt keeps it and is tried again; a shutdown drain is
-//! bounded by its deadline. Nothing holds a blob in a running node yet, so the blobs here
-//! are put in through `Cache::hold` (the producer's entry) or `Cache::hold_for_test`.
+//! bounded by its deadline. The blobs here are put in through `Cache::hold` (the budgeted
+//! primitive under the producer) or `Cache::hold_for_test`; `ram_ack_chain.rs` drains blobs
+//! the write path held.
 //!
 //! Waits are events (the pool's drain hook, a parked store PUT, `durable_waiting`'s
 //! notification) or the paused clock; a test that needs the time to pass runs on a

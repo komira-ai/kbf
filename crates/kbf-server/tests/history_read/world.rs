@@ -310,6 +310,7 @@ pub fn measured(t: u64) -> Run {
                 NumaBytes { node: 0, bytes: 6 },
                 NumaBytes { node: 1, bytes: 4 },
             ],
+            ..RunUsage::default()
         }),
         booked_memory_bytes: None,
         cap_bytes: None,

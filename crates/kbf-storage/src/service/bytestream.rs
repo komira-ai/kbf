@@ -71,6 +71,7 @@ impl ByteStream for StorageService {
         request: Request<Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
         let leg_from = generation::leg(&request)?;
+        let asks_held = generation::asks_held(&request, leg_from)?;
         // Only the frontend's identity may ask for an unowned copy; any other caller that
         // sends the header gets the plain-write rule.
         let unowned = generation::takes_unowned(
@@ -87,7 +88,7 @@ impl ByteStream for StorageService {
         let requested = generation::requested(&request)?;
         let stream = request.into_inner();
         let size = self
-            .write_in(requested, leg_from, unowned, stream.boxed())
+            .write_in(requested, (leg_from, asks_held), unowned, stream.boxed())
             .await?;
         Ok(wire::committed(size))
     }
