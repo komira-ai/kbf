@@ -522,6 +522,7 @@ fn with_copies_the_verb_does_not_open_the_order_spool() {
         &handover,
         regular,
         &kbf_host::Root::host(),
+        None,
     ) {
         Err(VerbError::Failed(text)) => {
             assert!(text.starts_with("cannot start the proxy: "), "{text}");
