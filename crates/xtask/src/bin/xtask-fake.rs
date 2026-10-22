@@ -88,17 +88,6 @@
 //!   --dir <dir>` copies every file of `releases/<tag>/` into `<dir>`.
 //! - Run as `sudo`, it appends `<working directory>: <arguments>` as one line to
 //!   `sudo-args` next to it, and exits 0 (the tests it was asked to run passed).
-//! - Run as `tailscale` (`gamma deploy`'s `tailscale ssh <user>@<host> sudo ...`), it appends
-//!   its arguments as one line to `tailscale-args` next to it, writes its standard input to
-//!   `tailscale-stdin`, prints the file `tailscale-stdout` (when there is one: the
-//!   installer's summary, as a test wrote it), writes the file `tailscale-stderr` (when there
-//!   is one: what the remote side says, which a public log must not show) to its standard
-//!   error and exits with the number in `tailscale-exit` (0 when there is no such file).
-//! - Run as `buck2` (`gamma check-build` runs `<komira dir>/buck2 build ...`), it appends
-//!   `<working directory>: <arguments>` as one line to `buck2-args` next to it, prints the
-//!   file `buck2-stdout` (when there is one) to its standard output and the file
-//!   `buck2-output` (when there is one: the console, as a test recorded it) to its standard
-//!   error, and exits with the number in `buck2-exit` (0 when there is no such file).
 //! - Run as `uname` (by name, from PATH, or by path), it is a host that is no platform of
 //!   ours: `-s` prints `Linux` and `-m` prints `riscv64` (or `XTASK_FAKE_MACHINE` when set). Run as `id`, `-u` prints 1000
 //!   (a user that is not root).
@@ -818,51 +807,6 @@ fn sudo(argv0: &str, args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `tailscale ssh ...` for `gamma deploy`: what it was asked and given is left next to the
-/// fake, and the installer's answer is the file `tailscale-stdout` and the number in
-/// `tailscale-exit`.
-fn tailscale(argv0: &str, args: &[String]) -> ExitCode {
-    let dir = Path::new(argv0).parent().expect("the fake's directory");
-    let mut log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("tailscale-args"))
-        .expect("tailscale-args");
-    writeln!(log, "{}", args.join(" ")).expect("tailscale-args");
-    let mut input = Vec::new();
-    std::io::Read::read_to_end(&mut std::io::stdin(), &mut input).expect("standard input");
-    std::fs::write(dir.join("tailscale-stdin"), input).expect("tailscale-stdin");
-    let answer = std::fs::read_to_string(dir.join("tailscale-stdout")).unwrap_or_default();
-    print!("{answer}");
-    let noise = std::fs::read_to_string(dir.join("tailscale-stderr")).unwrap_or_default();
-    eprint!("{noise}");
-    let code = std::fs::read_to_string(dir.join("tailscale-exit"))
-        .ok()
-        .and_then(|text| text.trim().parse::<u8>().ok());
-    ExitCode::from(code.unwrap_or(0))
-}
-
-/// `buck2 build ...` for `gamma check-build`: what it was asked and where is left next to the
-/// fake, and the console is the files `buck2-stdout` and `buck2-output`, as a test wrote them.
-fn buck2(argv0: &str, args: &[String]) -> ExitCode {
-    let dir = Path::new(argv0).parent().expect("the fake's directory");
-    let mut log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("buck2-args"))
-        .expect("buck2-args");
-    let cwd = std::env::current_dir().expect("working directory");
-    writeln!(log, "{}: {}", cwd.display(), args.join(" ")).expect("buck2-args");
-    let said = std::fs::read_to_string(dir.join("buck2-stdout")).unwrap_or_default();
-    print!("{said}");
-    let console = std::fs::read_to_string(dir.join("buck2-output")).unwrap_or_default();
-    eprint!("{console}");
-    let code = std::fs::read_to_string(dir.join("buck2-exit"))
-        .ok()
-        .and_then(|text| text.trim().parse::<u8>().ok());
-    ExitCode::from(code.unwrap_or(0))
-}
-
 fn systemd(name: &str, args: &[String]) -> ExitCode {
     let exe = std::env::current_exe().expect("the fake's own path");
     let dir = exe.parent().expect("the fake's directory");
@@ -917,10 +861,6 @@ fn main() -> ExitCode {
         gh(&argv0, &rest)
     } else if argv0.ends_with("/sudo") {
         sudo(&argv0, &rest)
-    } else if argv0.ends_with("/tailscale") {
-        tailscale(&argv0, &rest)
-    } else if argv0.ends_with("/buck2") {
-        buck2(&argv0, &rest)
     } else if matches!(base, "systemd-sysusers" | "systemd-tmpfiles") {
         systemd(base, &rest)
     } else if argv0 == "uname" || argv0.ends_with("/uname") {

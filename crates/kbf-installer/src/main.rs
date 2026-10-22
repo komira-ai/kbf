@@ -25,19 +25,6 @@ fn main() -> ExitCode {
         print!("{}", version::line());
         return ExitCode::SUCCESS;
     }
-    if args.get(1).is_some_and(|a| a == "deploy") {
-        let rest: Vec<String> = args[2..]
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        let code = kbf_installer::deploy::cli::main(
-            &rest,
-            &mut std::io::stdin().lock(),
-            &mut std::io::stdout().lock(),
-            &mut std::io::stderr().lock(),
-        );
-        std::process::exit(code);
-    }
     let cli = Cli::parse();
     let euid = rustix::process::geteuid().as_raw();
     dispatch(&cli, euid, &mut std::io::stdout(), &mut std::io::stderr()).into()

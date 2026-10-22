@@ -44,7 +44,6 @@
 //! - `kbf.toml` is written after every file a unit needs, and the units after it.
 
 pub mod backend;
-pub mod deploy_config;
 pub mod kbf_settings;
 pub mod kbf_toml;
 pub mod os;
@@ -347,11 +346,6 @@ pub fn run(
     if !problems.is_empty() {
         return Err(SetupError::Invalid(problems));
     }
-    let proxy = match valid.deploy {
-        Some(_) => installer_settings(&*exec, &valid, ctx.platform)?.proxy,
-        None => None,
-    };
-    let deploy = deploy_config::resolve(&*exec, valid.deploy.as_ref(), proxy.as_ref(), &ctx)?;
     let mut notes = Vec::new();
 
     let before = plan::before_release(os, &*exec, &valid, &ctx)?;
@@ -420,13 +414,6 @@ pub fn run(
         (None, _) => {}
     }
 
-    // `deploy.json` is a file like `kbf.toml`: written before the units that need a host that has it.
-    if let Some(config) = &deploy {
-        let written = deploy_config::plan(&*exec, &ctx, config)?;
-        steps += emit(&written.plan, exec, options.apply, out)?;
-        notes.extend(written.notes);
-    }
-
     let after = plan::after_release(os, &*exec, &valid, &ctx, have_release, options.no_start)?;
     steps += emit(&after.plan, exec, options.apply, out)?;
     notes.extend(after.notes);
@@ -478,7 +465,6 @@ pub fn cli(
         kbf: args.kbf.clone(),
         proxy: args.proxy.clone(),
         create_local_database: args.create_local_database,
-        deploy: args.deploy.clone(),
         installer_config: args.installer_config.as_ref().map(ToString::to_string),
     };
     let options = Options {

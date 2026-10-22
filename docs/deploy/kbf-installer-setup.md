@@ -140,32 +140,6 @@ or be the installer's. A missing or different key, or no file, is refused with e
 key and saying that `kbf-mac-provision` renders it: run it again, then `setup`. The other keys
 `setup` owns follow the rule above.
 
-### The deploy config of a frontend and an all-in-one host
-
-`--deploy-stage gamma|prod` makes `setup` write `/etc/kbf-installer/deploy.json` (root's, mode
-0644, written atomically), so `kbf-installer deploy` needs no flag naming the API, the token or
-the stage. Without `--deploy-stage` nothing is written, and every other `--deploy-*` flag needs
-it; a node mode takes none of them.
-
-| flag | key | default |
-|---|---|---|
-| `--deploy-stage` | `stage` | required to write the file |
-| `--deploy-api` | `api` | the proxy's public port: `[proxy] listen` of `installer.toml` (an unspecified address read as loopback), else `127.0.0.1:8980` |
-| `--deploy-token-file` | `token_file` | `[proxy] operator_token_file` of `installer.toml` |
-| `--deploy-api-ca` | `api_ca` | none (the system's roots) |
-| `--deploy-server-name` | `api_server_name` | none (the API address's IP) |
-
-The token and the CA are referenced by path and are the operator's: `setup` never copies or
-reads them, and creates none but the first operator token (the default token, which a first
-run may therefore name before it exists). Before it touches the host it checks that each exists, is a regular file
-(a link is not followed), is owned by root or the service user, and that the token is mode 0600
-or 0400 and the CA is not writable by group or others; a failure is exit 5 naming the flag and
-the one command that fixes it. The five keys above are `setup`'s and are rewritten from the
-flags on every run (a run again with the same flags changes nothing); any other key in the file
-(`cas`, `cas_ca`, `cas_server_name`) is kept. A file that is not a JSON object is left alone and
-named. The sudoers rule that lets the deploy account run `deploy` is a held step, written out in
-`docs/design/gamma-deploy.md`, "The host's config: who writes it, and the sudoers rule".
-
 ## What it does, in this order
 
 1. Checks it is root and, to apply, that its own binary is root's alone. Checks the flags (every
@@ -201,9 +175,8 @@ named. The sudoers rule that lets the deploy account run `deploy` is a held step
    are `SOURCE_REFS` of `installer.conf` (default `refs/heads/main`); `source_refs` of
    `installer.toml` can only narrow that list, and a list with no ref in common refuses the fetch.
    When a release is installed already, `--commit` is not fetched and a note says so.
-9. `/etc/kbf-installer/deploy.json`, only when `--deploy-stage` is given (see "The deploy config of a frontend and an all-in-one host").
-10. `/etc/kbf/kbf.toml`, as above (on an all-in-one host `/etc/kbf/frontend.toml` first).
-11. The units, last. On Linux `systemctl enable`, with `--now` unless `--no-start`: the mode's unit
+9. `/etc/kbf/kbf.toml`, as above (on an all-in-one host `/etc/kbf/frontend.toml` first).
+10. The units, last. On Linux `systemctl enable`, with `--now` unless `--no-start`: the mode's unit
     (only when a release is installed), and `kbf-installer.service`. `kbf-frontend.service`,
     `kbf-all-in-one.service` (kept for a host of the earlier layout) and the proxy units, with
     `kbf-storage-and-daemon.service` beside them on an all-in-one host, are enabled and never started by `setup`: starting
