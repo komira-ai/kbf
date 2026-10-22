@@ -77,11 +77,46 @@ jobs:
       - run: rustup toolchain install
       - name: Descriptors of the child, in the run module
         run: cargo test -p kbf-installer --locked --lib -- run::tests --nocapture
-      - name: The fetch end-to-end test that saw a stray descriptor, 20 times
-        run: |
-          for i in $(seq 1 20); do
-            cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused || exit 1
-          done
+      - name: The fetch end-to-end test that saw a stray descriptor, round 1
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 2
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 3
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 4
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 5
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 6
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 7
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 8
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 9
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 10
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 11
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 12
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 13
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 14
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 15
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 16
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 17
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 18
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 19
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
+      - name: The fetch end-to-end test that saw a stray descriptor, round 20
+        run: cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused
 
   pool-spike:
     runs-on: macos-latest
