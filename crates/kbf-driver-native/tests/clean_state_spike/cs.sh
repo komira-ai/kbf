@@ -1226,7 +1226,7 @@ d_latwatch() {
 echo $$ >"$1"
 : >"$2"
 while :; do
-  out=$(log show --last 30s --info --debug --style ndjson --predicate 'eventMessage CONTAINS "e1dlat"' 2>/dev/null | grep -o 'e1dlat[0-9]*' | sort -u)
+  out=$(log show --last 30s --info --debug --style ndjson --predicate 'eventMessage CONTAINS "e1dlat"' 2>/dev/null | grep -o 'e1dlat[0-9a-z]*' | sort -u)
   t=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
   for n in $out; do grep -q "^/$n " "$2" || echo "/$n $t" >>"$2"; done
   sleep 0.2
@@ -1243,6 +1243,23 @@ d_query() {
   echo "QUERY rows=$(wc -l <"$E/$M.raw" | tr -d ' ') bytes=$(wc -c <"$E/$M.raw" | tr -d ' ') log_show_ms=$((_b-_a)) err=[$(head -c 140 "$E/$M.raw.err" | tr '\n' ' ')]"
   _a=$(now_ms); dpy parse "$E/$M.raw" "$E/$M.tsv" x; _b=$(now_ms); echo "QUERY parse_ms=$((_b-_a))"
   dpy parse "$E/$M.stream" "$E/$M.stream.tsv" stream | sed 's/^/STREAM /'
+}
+
+# in the lease: a marker name (named e1dlat... so the live watcher sees it) and its creation time
+d_mark() { # label
+  _mn="/e1dlat$1$(d_tag)"
+  "$IC" mk shm "$_mn" "$L/gt/marks" | sed -n 's/^MK shm \(\/[^ ]*\) .*t_ms=\(.*\)$/\1 \2/p' >>"$L/marks.times"
+}
+# root: where did the markers go: live watcher, stream, and the post-hoc query now and a minute later
+d_marks_report() {
+  dpy lat "$E/$M.stream.tsv" "$L/marks.times" "$E/$M.latseen" | sed 's/^/MARK /'
+  dpy cmp "$E/$M.tsv" "$E/$M.gt.marks" marks
+  sleep 60
+  log show --last 30m --info --debug --style ndjson --predicate "$D_PRED" >"$E/$M.raw2" 2>/dev/null
+  echo "MARK requery +60s (last30m): markers visible=$(dpy vis "$E/$M.raw2" e1dlat) of $(wc -l <"$L/marks.times" | tr -d ' ')"
+  log show --start "$(cat "$E/$M.t0")" --info --debug --style ndjson --predicate "$D_PRED" >"$E/$M.raw2" 2>/dev/null
+  echo "MARK requery +60s (start): markers visible=$(dpy vis "$E/$M.raw2" e1dlat) of $(wc -l <"$L/marks.times" | tr -d ' ')"
+  log show --start "$(cat "$E/$M.t0")" --info --debug --style ndjson --predicate 'eventMessage CONTAINS "e1dlat"' 2>/dev/null | grep -a -c 'e1dlat' | sed 's/^/MARK any-message-with-e1dlat (any process, any predicate): /'
 }
 
 # root, after the plant: the common report. Truth = the workload's own gt files + dtrace.
@@ -1392,6 +1409,10 @@ plant_DALL() {
 midplant_DALL() {
   sleep 12; d_stop
   d_report
+  _tg=$(d_tag)
+  for _tok in "$_tg-sp" "$_tg-tab" "$_tg-del" "$_tg-bad" "$_tg-lone" "$_tg-trail" "$_tg- lead" "$_tg-nl" "$_tg-ctl" "$_tg-esc"; do
+    grep -a -m2 -F -- "$_tok" "$E/$M.raw" | cut -c1-520 | sed "s/^/ODDRAW[$_tok] /"
+  done
   d_fullloop
 }
 probe_DALL() { echo "PROBE DALL none"; }
@@ -1447,7 +1468,7 @@ midplant_DF2() {
 probe_DF2() { echo "PROBE DF2 none"; }
 
 # ---------------------------------------------------------------- D5: hiding attempts
-fixture_D5() { d_fixture; }
+fixture_D5() { d_fixture; d_latwatch; }
 plant_D5() {
   IC="$W/ipcc"; TG=$(d_tag); mkdir -p "$L/gt"
   echo "INFO D5 h1 setuid-root copy: $("$W/ipcc_suid" mk shm "/$TG-h1" "$L/gt/h1" 2>&1 | head -c 200)"
@@ -1467,11 +1488,13 @@ plant_D5() {
   echo "$(BT=90 build_env /usr/bin/python3 -c "$_pyc" 2>&1 | tail -1) lease-env" >>"$L/pypids.txt"
   sed 's/^/INFO D5 pylock /' "$L/pypids.txt"
   # a kitchen sink of system tools: whatever the system creates for us is in the dtrace truth (every process of the uid)
+  : >"$L/marks.times"; _idx=0; d_mark k00
   for _c in "xcrun simctl list devices" "clang --version" "swift --version" "git --version" "sqlite3 :memory: 'select 1'" "curl -sI https://example.com" \
             "system_profiler SPHardwareDataType" "mdls /bin/ls" "mdfind -name zzzkbfe1d" "osascript -e 'return 1'" "plutil -p /System/Library/CoreServices/SystemVersion.plist" \
             "defaults write kbf.e1d k v" "notifyutil -p kbf.e1d" "hdiutil create -size 2m -fs HFS+ -volname kbfe1d $L/x.dmg" "diskutil list" \
             "xcodebuild -version" "ssh -V" "security find-identity" "codesign -dv /bin/ls" "spctl --status" "say -o $L/s.aiff hi" "sips --help"; do
     alarm_run 90 bash -c "$_c" >/dev/null 2>&1; echo "INFO D5 sink rc=$? $_c" | cut -c1-120
+    _idx=$((_idx+1)); d_mark "k$(printf %02d $_idx)"
   done
   echo "PLANTED D5"
 }
@@ -1492,6 +1515,7 @@ midplant_D5() {
   "$IC" rm shm "/$TG-h1c" >/dev/null 2>&1
   sleep 5; d_stop
   d_report
+  d_marks_report
   while read -r _pid _nm _how; do
     echo "PYLOCK $_how pid=$_pid name=$_nm: dtrace=[$(grep -a " $_pid " "$E/$M.dt" | grep -a '_open' | head -2 | tr '\n' ';' | cut -c1-120)] reports-by-pid=$(dpy grepmsg "$E/$M.raw" "($_pid)" 3 | wc -l | tr -d ' ') reports-by-name=$(dpy grepmsg "$E/$M.raw" "$_nm" 3 | wc -l | tr -d ' ')"
     dpy grepmsg "$E/$M.raw" "($_pid)" 2 | cut -c1-200
@@ -1514,18 +1538,27 @@ midplant_DX() {
 probe_DX() { echo "PROBE DX none"; }
 
 # ---------------------------------------------------------------- DS: a process spawned into the simulator by simctl spawn (runs outside the lease profile)
-fixture_DS() { d_fixture; }
+fixture_DS() { d_fixture; d_latwatch; }
 do_DS() {
-  IC="$W/ipcc"; TG=$(d_tag)
+  IC="$W/ipcc"; TG=$(d_tag); : >"$L/marks.times"
+  d_mark m0
   _rt=$(xcrun simctl list runtimes available 2>/dev/null | awk '/iOS/ {print $NF; exit}')
   _dt=$(xcrun simctl list devicetypes 2>/dev/null | awk '/iPhone/ {print $NF; exit}' | tr -d '()')
   [ -n "$_rt" ] && [ -n "$_dt" ] || { echo "no iOS runtime or device type"; return 77; }
+  d_mark m1
   _u=$(build_env xcrun simctl create "$M" "$_dt" "$_rt") || { echo "simctl create failed"; return 1; }
+  d_mark m2
   build_env xcrun simctl boot "$_u" 2>&1 | head -2
+  d_mark m3
   BT=240 build_env xcrun simctl bootstatus "$_u" 2>&1 | tail -2
+  d_mark m4
   echo "spawn shm: $(BT=60 build_env xcrun simctl spawn "$_u" "$W/ipcc_sim" mk shm "/$TG-ds1" "$L/gt/ds" 2>&1 | head -c 200)"
+  d_mark m5
   echo "spawn sem: $(BT=60 build_env xcrun simctl spawn "$_u" "$W/ipcc_sim" mk sem "/$TG-ds2" "$L/gt/ds" 2>&1 | head -c 200)"
+  d_mark m6
   echo "host control (inside the lease profile): $("$IC" mk shm "/$TG-dsctl" "$L/gt/dsctl" 2>&1 | head -c 200)"
+  sleep 30
+  d_mark m7
   return 0
 }
 plant_DS() { mkdir -p "$L/gt"; p DS do_DS; echo "PLANTED DS"; }
@@ -1533,43 +1566,50 @@ midplant_DS() {
   d_lsof
   sleep 12; d_stop
   d_report
+  d_marks_report
   d_fullloop
 }
 probe_DS() { echo "PROBE DS none"; }
-fixture_DS2() { d_fixture; }
+fixture_DS2() { d_fixture; d_latwatch; }
 plant_DS2() { mkdir -p "$L/gt"; p DS2 do_DS; echo "PLANTED DS2"; }
 midplant_DS2() { midplant_DS; }
 probe_DS2() { echo "PROBE DS2 none"; }
 
-# ---------------------------------------------------------------- DR: how long and under what log pressure does a report stay readable (root only, no lease)
-d_visible() { # name -> number of Sandbox.kext records that carry it
-  log show --last 30m --info --debug --style ndjson --predicate "eventMessage CONTAINS \"$1\"" 2>/dev/null | grep "$1" | grep -c 'Sandbox.kext'
+# ---------------------------------------------------------------- DR: when does a report become readable, in which `log show` form, and does log pressure change it (root only, no lease)
+d_vis() { # name form -> number of parsed ipc reports carrying the name
+  case "$2" in
+    last15) log show --last 15s --info --debug --style ndjson --predicate "$D_PRED" >"$E/vis.raw" 2>/dev/null;;
+    last30m) log show --last 30m --info --debug --style ndjson --predicate "$D_PRED" >"$E/vis.raw" 2>/dev/null;;
+    start) log show --start "$(cat "$E/$M.t0")" --info --debug --style ndjson --predicate "$D_PRED" >"$E/vis.raw" 2>/dev/null;;
+  esac
+  dpy vis "$E/vis.raw" "$1"
 }
-d_retention() { # mode label
+d_grid() { # label: create one name, then poll each log-show form until it is visible (45 rounds)
   IC="$W/ipcc"; _prof='(version 1)(allow default)(allow ipc-posix-shm* (with report))(allow ipc-posix-sem* (with report))'
-  _t=$(d_tag); _r="r$1$_t"
-  for _i in 1 2 3; do sandbox-exec -p "$_prof" "$IC" mk shm "/$_r-a$_i" >/dev/null; done
-  _t0=$(d_t)
-  echo "RET $1 age=0s visible=$(d_visible "$_r-a1")/1 status=[$(log config --status --subsystem com.apple.sandbox.reporting 2>&1 | head -c 120)]"
-  sleep 45; echo "RET $1 age=$(awk -v a="$(d_t)" -v b="$_t0" 'BEGIN{printf "%.0f", a-b}')s (idle) a1=$(d_visible "$_r-a1")"
-  sleep 60; echo "RET $1 age=$(awk -v a="$(d_t)" -v b="$_t0" 'BEGIN{printf "%.0f", a-b}')s (idle) a1=$(d_visible "$_r-a1")"
-  # pressure: info-level system log noise, then check the old names and a fresh one
-  seq 1 100000 | logger -p user.info -t kbfnoise
-  sandbox-exec -p "$_prof" "$IC" mk shm "/$_r-b1" >/dev/null
-  echo "RET $1 after 100k info-noise: age=$(awk -v a="$(d_t)" -v b="$_t0" 'BEGIN{printf "%.0f", a-b}')s a1=$(d_visible "$_r-a1") b1(fresh)=$(d_visible "$_r-b1")"
-  seq 1 400000 | logger -p user.info -t kbfnoise
-  echo "RET $1 after 500k info-noise: a1=$(d_visible "$_r-a1") b1=$(d_visible "$_r-b1") (b1 created before the 400k noise)"
-  sandbox-exec -p "$_prof" "$IC" mk shm "/$_r-c1" >/dev/null
-  echo "RET $1 fresh c1 after noise: $(d_visible "$_r-c1")"
-  for _i in 1 2 3; do "$IC" rm shm "/$_r-a$_i" >/dev/null 2>&1; done; "$IC" rm shm "/$_r-b1" >/dev/null 2>&1; "$IC" rm shm "/$_r-c1" >/dev/null 2>&1
+  _n="/g$(printf %s "$1" | tr -cd 'a-z0-9' | cut -c1-6)$(d_tag)"
+  _tc=$(sandbox-exec -p "$_prof" "$IC" lat "$_n" | sed -n 's/.*t_ms=\(.*\)$/\1/p')
+  _s1=""; _s2=""; _s3=""
+  for _r in $(seq 1 45); do
+    if [ -z "$_s1" ]; then _a=$(d_t); _c=$(d_vis "$_n" last15); _b=$(d_t); [ "${_c:-0}" -gt 0 ] && { _s1=1; echo "GRID $1 last15 visible: query $(awk -v a="$_a" -v b="$_b" -v c="$_tc" 'BEGIN{printf "%.1f..%.1f", a-c/1000, b-c/1000}')s after create"; }; fi
+    if [ -z "$_s2" ]; then _a=$(d_t); _c=$(d_vis "$_n" last30m); _b=$(d_t); [ "${_c:-0}" -gt 0 ] && { _s2=1; echo "GRID $1 last30m visible: query $(awk -v a="$_a" -v b="$_b" -v c="$_tc" 'BEGIN{printf "%.1f..%.1f", a-c/1000, b-c/1000}')s after create"; }; fi
+    if [ -z "$_s3" ]; then _a=$(d_t); _c=$(d_vis "$_n" start); _b=$(d_t); [ "${_c:-0}" -gt 0 ] && { _s3=1; echo "GRID $1 start visible: query $(awk -v a="$_a" -v b="$_b" -v c="$_tc" 'BEGIN{printf "%.1f..%.1f", a-c/1000, b-c/1000}')s after create"; }; fi
+    [ -n "$_s1" ] && [ -n "$_s2" ] && [ -n "$_s3" ] && break
+    sleep 1
+  done
+  echo "GRID $1 done: last15=${_s1:-NEVER} last30m=${_s2:-NEVER} start=${_s3:-NEVER} (after $_r rounds, $(awk -v a="$(d_t)" -v c="$_tc" 'BEGIN{printf "%.0f", a-c/1000}')s)"
+  "$IC" rm shm "$_n" >/dev/null 2>&1
 }
-fixture_DR() { :; }
+fixture_DR() { date '+%Y-%m-%d %H:%M:%S' >"$W/e1d/$M.t0" 2>/dev/null || { mkdir -p "$W/e1d"; date '+%Y-%m-%d %H:%M:%S' >"$W/e1d/$M.t0"; }; }
 plant_DR() { echo "PLANTED DR"; }
 midplant_DR() {
-  d_retention default-config
+  d_grid default-idle
+  seq 1 400000 | logger -p user.info -t kbfnoise; echo "RET 400k info-noise sent"
+  d_grid default-noise
   log config --mode 'level:info,persist:info' --subsystem com.apple.sandbox.reporting 2>&1 | head -2
   echo "RET config now: $(log config --status --subsystem com.apple.sandbox.reporting 2>&1 | head -c 160)"
-  d_retention persist-info
-  echo "RET plists: $(ls /Library/Preferences/Logging/Subsystems 2>&1 | tr '\n' ' ' | cut -c1-160)"
+  d_grid persist-idle
+  seq 1 400000 | logger -p user.info -t kbfnoise; echo "RET 400k info-noise sent"
+  d_grid persist-noise
+  log config --reset --subsystem com.apple.sandbox.reporting 2>&1 | head -2
 }
 probe_DR() { echo "PROBE DR none"; }

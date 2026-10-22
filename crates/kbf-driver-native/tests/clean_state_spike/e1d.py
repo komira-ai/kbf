@@ -367,6 +367,15 @@ def cmd_lsofgt(lsof, out):
     print('LSOFGT names=%d' % len(s))
 
 
+def cmd_vis(raw, name):
+    c = 0
+    for t, j in load_json(raw):
+        p = parse_msg(j)
+        if p and name in bytes.fromhex(p[3]).decode('utf-8', 'replace'):
+            c += 1
+    print(c)
+
+
 def cmd_tok(tsv, token):
     rows = load_tsv(tsv)
     tot = 0
