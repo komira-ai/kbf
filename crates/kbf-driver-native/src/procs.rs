@@ -12,7 +12,7 @@
 //!
 //! The pure part, [`Tracker`] and the text parsers, is tested on every platform. The
 //! process table and per-process memory come from `/proc` on Linux and from `libproc`
-//! on macOS ([`snapshot`], [`footprint`]).
+//! on macOS ([`snapshot`], [`rusage`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -172,11 +172,23 @@ pub fn parse_linux_status(text: &str) -> Option<u64> {
     Some(total * 1024)
 }
 
-pub use platform::{footprint, process, snapshot};
+/// What one read of a process gives: its footprint now, and, where the platform keeps
+/// them, the counters of its whole life ([`crate::usage`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rusage {
+    /// Physical footprint now, in bytes.
+    pub footprint: u64,
+    /// High-water mark and CPU time of the process so far: macOS only.
+    pub lifetime: Option<crate::usage::Lifetime>,
+}
+
+#[cfg(target_os = "macos")]
+pub use platform::timebase;
+pub use platform::{process, rusage, snapshot};
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{Proc, parse_linux_stat, parse_linux_status};
+    use super::{Proc, Rusage, parse_linux_stat, parse_linux_status};
 
     /// Every process in `/proc` that could be read. One that exits while the table
     /// is read is left out.
@@ -210,19 +222,25 @@ mod platform {
             .and_then(parse_linux_stat)
     }
 
-    /// What `pid` holds, in bytes; `None` once it is gone.
+    /// What `pid` holds, in bytes; `None` once it is gone. No lifetime counters: the
+    /// driver reports usage on macOS only.
     #[must_use]
-    pub fn footprint(pid: i32) -> Option<u64> {
+    pub fn rusage(pid: i32) -> Option<Rusage> {
         std::fs::read_to_string(format!("/proc/{pid}/status"))
             .ok()
             .as_deref()
             .and_then(parse_linux_status)
+            .map(|footprint| Rusage {
+                footprint,
+                lifetime: None,
+            })
     }
 }
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::Proc;
+    use super::{Proc, Rusage};
+    use crate::usage::Lifetime;
 
     /// `pbi_status` of a process that has exited and waits to be reaped.
     const SZOMB: u32 = 5;
@@ -279,19 +297,45 @@ mod platform {
     }
 
     /// The physical footprint of `pid` (what Activity Monitor calls its memory), in
-    /// bytes; `None` once it is gone.
+    /// bytes, with its lifetime high-water mark and CPU time; `None` once it is gone.
     #[must_use]
-    pub fn footprint(pid: i32) -> Option<u64> {
-        let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::zeroed();
-        // SAFETY: `info` is a writable rusage_info_v2, the struct RUSAGE_INFO_V2
-        // fills; the pointer outlives the call.
+    pub fn rusage(pid: i32) -> Option<Rusage> {
+        let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+        // FFI-BOUNDARY: `info` is this stack frame's; proc_pid_rusage writes the
+        // RUSAGE_INFO_V4 struct (<libproc.h>, <sys/resource.h>; `libc` declares the
+        // same layout as `rusage_info_v4`) into it and keeps no pointer past the call.
+        // SAFETY: `info` is a writable rusage_info_v4, the struct RUSAGE_INFO_V4 fills;
+        // the pointer outlives the call.
         let done =
-            unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V2, info.as_mut_ptr().cast()) };
+            unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, info.as_mut_ptr().cast()) };
         if done != 0 {
             return None;
         }
         // SAFETY: the call succeeded, so it filled the struct.
-        Some(unsafe { info.assume_init() }.ri_phys_footprint)
+        let info = unsafe { info.assume_init() };
+        Some(Rusage {
+            footprint: info.ri_phys_footprint,
+            lifetime: Some(Lifetime {
+                max_footprint: info.ri_lifetime_max_phys_footprint,
+                user_ticks: info.ri_user_time,
+                system_ticks: info.ri_system_time,
+            }),
+        })
+    }
+
+    /// The machine's mach timebase, `(numer, denom)`: a tick of mach absolute time is
+    /// `numer / denom` nanoseconds. `(1, 1)` if the kernel refuses (it does not).
+    #[must_use]
+    pub fn timebase() -> (u32, u32) {
+        let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+        // FFI-BOUNDARY: `info` is this frame's; the call fills it and keeps no pointer.
+        // SAFETY: `info` is a writable mach_timebase_info.
+        let done = unsafe { libc::mach_timebase_info(&raw mut info) };
+        if done == 0 && info.denom != 0 {
+            (info.numer, info.denom)
+        } else {
+            (1, 1)
+        }
     }
 }
 
@@ -559,7 +603,7 @@ mod tests {
         // SAFETY: getppid takes nothing and cannot fail.
         assert_eq!(mine.ppid, unsafe { libc::getppid() });
         assert!(!mine.zombie);
-        assert!(footprint(me).expect("footprint") > 0);
-        assert_eq!(footprint(-5), None);
+        assert!(rusage(me).expect("footprint").footprint > 0);
+        assert_eq!(rusage(-5), None);
     }
 }

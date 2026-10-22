@@ -355,6 +355,7 @@ impl Slot {
             uid: self.ready().user.uid,
             record,
             seen: Arc::default(),
+            meter: Arc::default(),
             armed: true,
         }
     }
@@ -407,10 +408,19 @@ pub struct UidWatch {
     record: PathBuf,
     /// Every pid of the uid any measurement saw: whose a sandbox denial is.
     seen: Arc<Mutex<BTreeSet<i32>>>,
+    /// What each measurement read of the uid's processes' lifetime counters
+    /// ([`crate::usage`]).
+    meter: Arc<Mutex<crate::usage::Meter>>,
     armed: bool,
 }
 
 impl UidWatch {
+    /// What the measurements so far read of the uid's processes, for the lease's usage.
+    #[must_use]
+    pub fn meter(&self) -> &Mutex<crate::usage::Meter> {
+        &self.meter
+    }
+
     /// Every pid of the uid seen so far.
     #[must_use]
     pub fn seen(&self) -> BTreeSet<i32> {
@@ -426,17 +436,14 @@ impl UidWatch {
     /// # Errors
     /// The process table could not be read.
     pub async fn measure(&self) -> Result<u64, RuntimeError> {
-        let (uid, seen) = (self.uid, Arc::clone(&self.seen));
+        let (uid, seen, meter) = (self.uid, Arc::clone(&self.seen), Arc::clone(&self.meter));
         let used = tokio::task::spawn_blocking(move || {
             let pids = uid::effective(uid)?;
             seen.lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .extend(pids.iter().copied());
-            Ok::<_, io::Error>(
-                pids.into_iter()
-                    .filter_map(procs::footprint)
-                    .fold(0_u64, u64::saturating_add),
-            )
+            let mut meter = meter.lock().unwrap_or_else(PoisonError::into_inner);
+            Ok::<_, io::Error>(meter.poll(pids, procs::rusage))
         })
         .await;
         used.map_err(io::Error::other)
