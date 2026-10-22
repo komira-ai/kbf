@@ -66,7 +66,6 @@ pub mod boot_schema;
 pub mod cli;
 pub mod darwin;
 pub mod database;
-pub mod deploy;
 pub mod envoy;
 pub mod exit;
 pub mod fetch;

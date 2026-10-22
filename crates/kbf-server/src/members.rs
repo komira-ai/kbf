@@ -311,7 +311,8 @@ pub enum MembershipError {
         current: u64,
     },
     /// Only `Joining`, `CatchingUp`, `Active` and `Draining` are set by hand; `Down` is
-    /// the store's verdict, or an operator's planned restart ([`Members::plan_down`]).
+    /// the store's verdict, or an operator's planned restart ([`Members::plan_down`]); a
+    /// state this build does not name is what a later build wrote, never set here.
     #[error("a member cannot be set {0:?}")]
     NotSettable(MemberState),
     /// Only an `Active` member can be planned down.
@@ -454,7 +455,7 @@ fn plan(
     let map = Map::new(
         current.map_or(1, |c| c.generation() + 1),
         members,
-        Rule::Rendezvous,
+        current.map_or(Rule::Rendezvous, Map::rule),
         r,
         floor,
         denied.to_vec(),
@@ -832,10 +833,11 @@ impl Members {
     /// `Draining`) and rebuilds the map. The row keeps the time to live it had.
     ///
     /// # Errors
-    /// [`MembershipError::NotSettable`] for `Down`; [`MembershipError::NotRegistered`] if
-    /// the member has no live row; the store failing.
+    /// [`MembershipError::NotSettable`] for `Down` and for a state this build does not name
+    /// ([`MemberState::Unknown`]); [`MembershipError::NotRegistered`] if the member has no
+    /// live row; the store failing.
     pub fn set_state(&self, id: MemberId, state: MemberState) -> Result<Map, MembershipError> {
-        if state == MemberState::Down {
+        if matches!(state, MemberState::Down | MemberState::Unknown(_)) {
             return Err(MembershipError::NotSettable(state));
         }
         if state == MemberState::Draining {

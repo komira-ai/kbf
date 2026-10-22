@@ -1,6 +1,6 @@
-//! `release stage-offer`: what the automatic gamma deploy is handed for one commit, made from
-//! the release of that commit and from nothing else (docs/design/gamma-deploy.md):
-//! `offer.json`, and `bundle.tar`, the tar `kbf-installer deploy --offer - --bundle -` reads.
+//! `release stage-offer`: the offer and bundle for one commit, made from the release of that
+//! commit and from nothing else: `offer.json`, and `bundle.tar`. Nothing reads them now that
+//! `kbf-installer deploy` is deleted.
 //!
 //! The offer is for gamma only. There is no `--target`, `--waive-beta` or `--operator`: beta
 //! is always waived, in the name [`WAIVER_OPERATOR`] and for the reason [`waiver_reason`]
@@ -43,8 +43,7 @@
 //! 10. `--output` gets the lines, last: if it cannot be written the run fails with `--out`
 //!     already made.
 //!
-//! `bundle.tar` is what the installer's bundle reader takes (`kbf-installer deploy --offer -
-//! --bundle -`, which reads the offer back from it): `SHA256SUMS` (the release's, byte for
+//! `bundle.tar` holds `SHA256SUMS` (the release's, byte for
 //! byte), `offer.json`, then for each complete platform, in [`ReleasePlatform::ALL`] order,
 //! its version facts `kbf-<sha>-<p>.version.json` (the release's, byte for byte, which the
 //! installer uploads to the release store and the store's offer to a node is made from), and

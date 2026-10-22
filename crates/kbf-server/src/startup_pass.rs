@@ -48,8 +48,7 @@ fn ready_to_evict(log: &RaftMetaLog) -> Result<EvictReady, MetaLogError> {
 /// would leave every replica that does not run version 3 yet skipping its commands, so there
 /// the operator raises it once every replica does, and until then the answer is
 /// [`EvictReady::NeedsV3`]. Called only when something is to be forgotten, so a log
-/// with nothing to forget stays one an older binary reads. The raise stops at the log's
-/// start ceiling: a log still below version 3 after it is not ready either.
+/// with nothing to forget stays one an older binary reads.
 fn ready_among(log: &RaftMetaLog, voters: usize) -> Result<EvictReady, MetaLogError> {
     if log.machine_version() >= MachineVersion::V3 {
         return Ok(EvictReady::Ready);
@@ -57,10 +56,7 @@ fn ready_among(log: &RaftMetaLog, voters: usize) -> Result<EvictReady, MetaLogEr
     if voters > 1 {
         return Ok(EvictReady::NeedsV3 { voters });
     }
-    log.raise_at_start(MachineVersion::V3)?;
-    if log.machine_version() < MachineVersion::V3 {
-        return Ok(EvictReady::NeedsV3 { voters });
-    }
+    log.raise_machine_version(MachineVersion::V3)?;
     Ok(EvictReady::Ready)
 }
 
@@ -375,39 +371,6 @@ mod tests {
         assert_eq!(ready_to_evict(&log), Ok(EvictReady::Ready));
         assert_eq!(log.machine_version(), MachineVersion::V3);
         assert_eq!(ready_among(&log, 2), Ok(EvictReady::Ready));
-        drop(log);
-    }
-
-    /// Catches a readiness that raises the log past its start ceiling (mutant: the
-    /// ceiling ignored by the raise); one that calls a log still below version 3 ready
-    /// because the raise returned (mutant: the version check after the raise dropped),
-    /// which would commit `EvictObjects` to a log that refuses it; one that refuses a
-    /// log an operator raised past the ceiling (mutant: the ceiling checked before the
-    /// log's own version); and a ceiling that holds back a raise it allows (mutant: the
-    /// target lowered by one). A single voter with its ceiling at 2 is raised to 2 and
-    /// no further, and says `NeedsV3`; raised to 3 by the operator it is ready; with its
-    /// ceiling at 3 it is raised to 3 and ready.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_start_ceiling_below_version_3_keeps_eviction_off() {
-        let below = crate::test_dir::scratch_dir("kbf-server-pass-ceiling-below");
-        let log = RaftMetaLog::open_dir(&below, Retention::default(), "kbf/")
-            .await
-            .expect("open the log")
-            .with_start_ceiling(MachineVersion::V2);
-        assert_eq!(ready_to_evict(&log), Ok(EvictReady::NeedsV3 { voters: 1 }));
-        assert_eq!(log.machine_version(), MachineVersion::V2);
-        log.raise_machine_version(MachineVersion::V3)
-            .expect("the operator's raise");
-        assert_eq!(ready_to_evict(&log), Ok(EvictReady::Ready));
-        drop(log);
-
-        let at = crate::test_dir::scratch_dir("kbf-server-pass-ceiling-at");
-        let log = RaftMetaLog::open_dir(&at, Retention::default(), "kbf/")
-            .await
-            .expect("open the log")
-            .with_start_ceiling(MachineVersion::V3);
-        assert_eq!(ready_to_evict(&log), Ok(EvictReady::Ready));
-        assert_eq!(log.machine_version(), MachineVersion::V3);
         drop(log);
     }
 

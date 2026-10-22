@@ -53,6 +53,38 @@ read the whole diff in one sitting. Split refactors from behavior changes, and
 land interfaces before the code that uses them. Keep source files under 1000
 lines.
 
+## Formats change additively
+
+Every format kbf writes and another kbf reads changes additively only: the
+metadata log, state-store rows, files a node keeps on disk, and the protobuf and
+JSON messages between processes. A farm runs two releases side by side during an
+update, and a node may go back to the release before; each release must start on
+data the other wrote.
+
+Allowed:
+
+- a new optional field, whose absence (or zero value) means what the code did
+  before the field existed;
+- a new record type, log command, oneof case or table;
+- a new column with a default.
+
+Not allowed:
+
+- renumbering, renaming on the wire, or removing a field, case or table that a
+  release has shipped;
+- giving an existing field or value a new meaning;
+- a required field, or a check that refuses data because it carries something
+  this release does not know;
+- a version or floor raise that an older release cannot open.
+
+A reader skips what it does not know: an unknown field is ignored, and an
+unknown record, command or enum value is passed over as a whole and counted.
+Data that cannot be parsed at all is still refused. When you add a record type,
+the pull request says what an older release loses by skipping it, and that loss
+must be safe. Every pull request that changes a format names the test that
+starts the previous release on data the new one wrote, and the new one on data
+the previous release wrote.
+
 ## Building and testing
 
 kbf is a Cargo workspace; the crates live under `crates/`. All builds and

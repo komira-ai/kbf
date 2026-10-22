@@ -71,6 +71,11 @@ one-member farm of itself.
 | `active` | yes | yes | in rank order |
 | `draining` | no; its successor takes its place at once (see the note below) | yes | in rank order, before its successor |
 | `down` | it keeps its place for the dwell; writers skip it and record a repair debt | yes | never listed |
+| `unknown` | no | not known | never listed |
+
+A state a later build wrote that this one does not name shows as `unknown`. The member
+stays in the map and is left out of placement. A heartbeat rewrites its row with the state
+it had; registering again, or setting a state by hand, replaces it.
 
 A joiner is first owner only when the farm has no settled member, as in a farm that is
 just forming, and then the best-scored joiner is the primary. With a replication factor of

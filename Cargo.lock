@@ -1905,7 +1905,6 @@ dependencies = [
  "httparse",
  "hyper",
  "kbf-cli",
- "kbf-gate",
  "kbf-host",
  "kbf-installer",
  "kbf-oidc",
@@ -1934,7 +1933,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
- "x509-parser",
 ]
 
 [[package]]
@@ -2609,6 +2607,8 @@ name = "kbf-updater"
 version = "0.1.0"
 dependencies = [
  "httparse",
+ "kbf-host-install",
+ "kbf-testkit",
  "libc",
  "serde",
  "serde_json",
