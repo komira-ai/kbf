@@ -86,6 +86,8 @@ pub struct Listeners {
     /// books, the others are what it climbs through when it passes its own memory
     /// limit, before a whole host (`--memory-ladder-gib`).
     pub memory_ladder: MemoryLadder,
+    /// Whether the farm shows `kbf-estimator` what finished (`--learned-sizes`).
+    pub learned_sizes: crate::LearnedSizes,
     /// How long a finished operation is kept after its callers are answered, in which
     /// WaitExecution on it still streams its result; then it is NOT_FOUND.
     pub finished_retention: Duration,
@@ -744,6 +746,7 @@ where
         listeners.finished_retention,
     )
     .with_memory_ladder(listeners.memory_ladder.clone())
+    .with_learned_sizes(listeners.learned_sizes, listeners.memory_ladder.first())
     .recording(recorder.clone());
     let durable = state.is_some();
     // Storage nodes register with a frontend that has a state store to keep them in.

@@ -518,7 +518,7 @@ fn a_joined_operation_keeps_its_losses_and_fate() {
         ..kbf_sched::Fate::default()
     };
     other
-        .requeued(&requeue, Some(3), Some(&fate), &FloorChange::default())
+        .requeued(&requeue, Some(3), Some(&fate), &FloorChange::default(), &[])
         .expect("requeue");
     store
         .txn(Txn::new().delete("subject/0000000000000000", Cond::Any))

@@ -50,6 +50,11 @@
 //! - `cordon/<worker>`: how an operator placed a node (cordoned, or draining until a
 //!   wall-clock deadline), kept until it is returned to placement, so a successor
 //!   process serves the node as the operator left it;
+//! - `est/<instance>/<platform>/<basis>/<shape>/<cfg>`: one size summary of the learned-sizes
+//!   shadow ([`crate::learned`]): a version byte and the estimator's own checksummed row.
+//!   A summary an own-limit kill changed is written in the transaction of the requeue the
+//!   kill causes, as a floor is; the rest is written behind, in batches, and a sweep deletes
+//!   the stale. Read only when the shadow is on;
 //! - `meta/epoch`, `meta/next_op`, `meta/next_seq`: the store incarnation and the first
 //!   operation id and lease sequence no earlier start used;
 //! - `meta/generation`: the writer generation ([`kbf_state::Fenced`]); every write of the
@@ -64,6 +69,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use kbf_estimator::{Day, Summaries};
 use kbf_front::{Described, Finished, Stage};
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
 use kbf_sched::fence::LEASE_GRACE;
@@ -85,6 +91,7 @@ use super::{
     refused_as,
 };
 use crate::action_usage::Subject;
+use crate::learned::Row;
 use crate::machine::Platform;
 use crate::state_store::StateStore;
 
@@ -102,6 +109,7 @@ const NEXT_SEQ: &str = "meta/next_seq";
 const CORDON: &str = "cordon/";
 const FATE: &str = "fate/";
 const FLOOR: &str = "floor/";
+const ESTIMATE: &str = "est/";
 const SUBJECT: &str = "subject/";
 
 /// The least time a `done/` row is kept, whatever the finished retention: a process that
@@ -258,6 +266,7 @@ impl StoredOperation {
     }
 }
 
+mod estimate;
 mod fate;
 mod floor;
 mod inflight;
@@ -518,6 +527,58 @@ impl Durable {
         })
     }
 
+    /// The size summaries the store holds. A row that cannot be read is skipped (and
+    /// counted in the log): its action starts cold.
+    pub(super) fn estimates(&self) -> Result<Vec<Row>, StateError> {
+        let mut rows = Vec::new();
+        for (key, row) in self.store.scan_prefix(ESTIMATE)? {
+            match estimate::decode(&key, &row.value) {
+                Some(row) => rows.push(row),
+                None => tracing::warn!(%key, "a size summary row cannot be read: skipped"),
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Writes `rows`, size summaries, in one transaction.
+    pub(super) fn put_estimates(&self, rows: &[Row]) -> Result<(), StateError> {
+        let mut txn = Txn::new();
+        for (key, summary) in rows {
+            txn = txn.put(estimate::row_key(key), estimate::encode(summary), Cond::Any);
+        }
+        self.commit(txn)
+    }
+
+    /// Deletes the size summaries idle past [`kbf_estimator::STALE_DAYS`] on `today`,
+    /// and strips the samples from those that hold a floor, as the estimator itself
+    /// does in memory. Returns how many rows it changed.
+    pub(super) fn sweep_estimates(&self, today: Day) -> Result<usize, StateError> {
+        let mut changed = 0;
+        for (name, row) in self.store.scan_prefix(ESTIMATE)? {
+            let Some((key, summary)) = estimate::decode(&name, &row.value) else {
+                continue;
+            };
+            let mut held = Summaries::default();
+            if held.insert_encoded(&key, &summary).is_err() {
+                continue;
+            }
+            held.expire(today);
+            let txn = Txn::new();
+            let txn = match held.get(&key) {
+                None => txn.delete(name, Cond::Version(row.version)),
+                Some(kept) if kept.encode() != summary => txn.put(
+                    name,
+                    estimate::encode(&kept.encode()),
+                    Cond::Version(row.version),
+                ),
+                Some(_) => continue,
+            };
+            self.commit(txn)?;
+            changed += 1;
+        }
+        Ok(changed)
+    }
+
     /// The nodes an operator placed.
     fn cordons(&self) -> Result<Vec<(WorkerId, StoredCordon)>, StateError> {
         let rows = self.store.scan_prefix(CORDON)?;
@@ -659,8 +720,13 @@ impl Durable {
         losses: Option<u32>,
         fate: Option<&Fate>,
         floors: &FloorChange,
+        estimates: &[Row],
     ) -> Result<(), StateError> {
         let mut txn = Txn::new();
+        // Like the floor, the summaries a kill changed outlive the operation.
+        for (key, summary) in estimates {
+            txn = txn.put(estimate::row_key(key), estimate::encode(summary), Cond::Any);
+        }
         // The floor outlives the operation: a kill raises it, and the operation may end
         // before the write is taken.
         let raised = floors.raised.as_ref();
@@ -679,7 +745,7 @@ impl Durable {
             txn = txn.delete(floor::row_key(key), Cond::Any);
         }
         if self.store.get(&op_key(requeue.operation))?.is_none() {
-            return if raised.is_some() || !floors.evicted.is_empty() {
+            return if raised.is_some() || !floors.evicted.is_empty() || !estimates.is_empty() {
                 self.commit(txn)
             } else {
                 Ok(())
@@ -1115,14 +1181,16 @@ impl State {
             } else {
                 FloorChange::default()
             };
-            self.unsettled.push((requeue.clone(), losses, fate, floors));
+            let estimates = self.learned_requeue(requeue);
+            self.unsettled
+                .push((requeue.clone(), losses, fate, floors, estimates));
         }
         let pending = std::mem::take(&mut self.unsettled);
         let refused: Vec<_> = pending
             .into_iter()
-            .filter(|(requeue, losses, fate, floors)| {
+            .filter(|(requeue, losses, fate, floors, estimates)| {
                 !self.durably("a requeue", |d| {
-                    d.requeued(requeue, *losses, fate.as_ref(), floors)
+                    d.requeued(requeue, *losses, fate.as_ref(), floors, estimates)
                 })
             })
             .collect();
@@ -1200,6 +1268,10 @@ impl State {
         }
         let next_operation = OperationId(stored.next_operation);
         self.sched.restore_floors(stored.floors);
+        // Off reads no size summaries and leaves them as they are.
+        if !self.learned.off() {
+            self.learned.restore(&durable.estimates()?);
+        }
         self.sched
             .recover(epoch, next_operation, stored.next_seq, recovered);
         self.restore_cordons(stored.cordons);

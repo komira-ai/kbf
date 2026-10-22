@@ -621,6 +621,8 @@ fn measured_row(usage: RunUsage) -> kbf_invocation::ActionRow {
         outputs_truncated: false,
         command: None,
         shape: None,
+        evidence: None,
+        operation_id: None,
     }
 }
 
