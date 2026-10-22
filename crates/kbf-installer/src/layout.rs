@@ -96,6 +96,12 @@ pub const STATE_BACKUP: &str = "state.json.bak";
 /// The frontend child's settings on an all-in-one host: a file beside `kbf.toml` in the
 /// configuration directory (there `kbf.toml` is the storage-and-daemon sibling's).
 pub const FRONTEND_CONFIG: &str = "frontend.toml";
+/// The directory in the state directory where the originals of what a migration replaces are
+/// kept (root's, 0700).
+pub const MIGRATION_UNITS: &str = "migration-units";
+/// The earlier all-in-one layout's `kbf.toml`, as `setup` keeps it in [`MIGRATION_UNITS`] when
+/// it splits it. (Not `kbf.toml`: that name is the one `migrate` keeps the daemon's file under.)
+pub const ALL_IN_ONE_KBF_TOML: &str = "kbf.toml.all-in-one";
 
 /// The names inside a release directory: its binaries, its systemd units and the
 /// manifest that lists them. Both platforms' releases hold `kbf`; it is the only binary
@@ -340,6 +346,16 @@ impl Layout {
     /// `[daemon] orders-dir`.
     pub fn orders_dir(&self) -> HostPath {
         path_in(self.platform.state_dir(), ORDERS)
+    }
+
+    /// `migration-units/` in the state directory: the originals a migration keeps.
+    pub fn migration_units(&self) -> HostPath {
+        path_in(self.platform.state_dir(), MIGRATION_UNITS)
+    }
+
+    /// Where `setup` keeps the `kbf.toml` of the earlier all-in-one layout when it splits it.
+    pub fn all_in_one_kbf_toml(&self) -> HostPath {
+        path_in(&self.migration_units().to_string(), ALL_IN_ONE_KBF_TOML)
     }
 
     /// The lock the state is read and written under.

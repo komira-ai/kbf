@@ -87,14 +87,13 @@ pub fn check_provisioned(table: &Table, update_dir: &str, orders_dir: &str) -> R
     Ok(())
 }
 
-/// Whether `text` is a `kbf.toml` whose top-level `mode` is `all-in-one`: the layout of one
-/// process for everything, which an all-in-one host no longer has. A text that is not TOML says
-/// no (`decide` names that fault).
-pub fn says_all_in_one(text: &str) -> bool {
-    let Ok(table) = text.parse::<Table>() else {
-        return false;
-    };
-    lookup(&table, "", "mode").and_then(Value::as_str) == Some("all-in-one")
+/// The table of `text` when it is a `kbf.toml` whose top-level `mode` is `all-in-one`: the layout
+/// of one process for everything, which an all-in-one host no longer has and `setup` splits
+/// ([`super::aio_migrate`]). A text that is not TOML is none (`decide` names that fault).
+pub fn all_in_one_table(text: &str) -> Option<Table> {
+    let table = text.parse::<Table>().ok()?;
+    let says = lookup(&table, "", "mode").and_then(Value::as_str) == Some("all-in-one");
+    says.then_some(table)
 }
 
 /// The tables of the file, in the order they are written: every table a setting can be in

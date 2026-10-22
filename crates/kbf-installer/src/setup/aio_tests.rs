@@ -1,8 +1,9 @@
 //! Tests of `setup --mode=all-in-one`, which is always behind the proxy: the files of the proxy,
 //! of its frontend children and of the `kbf-storage-and-daemon` sibling, the units, the one
-//! `installer.toml` key that points the children at their file, `--storage-port`, and the refusal
-//! of a host that has the earlier layout. The helpers are `tests.rs`'s. Each test says the defect
-//! it catches and names the mutants to plant to see it go red; none is claimed to have run.
+//! `installer.toml` key that points the children at their file, `--storage-port`, and what tells
+//! a host of the earlier layout (its move is `aio_migrate_tests.rs`'s). The helpers are
+//! `tests.rs`'s. Each test says the defect it catches and names the mutants to plant to see it go
+//! red; none is claimed to have run.
 
 use super::proxy_tests::{proxy_host, proxy_raw};
 use super::*;
@@ -170,57 +171,17 @@ fn a_dry_run_names_both_files_and_changes_nothing() {
     assert!(exec.log.is_empty(), "{:?}", exec.log);
 }
 
-/// Catches an existing `kbf.toml` of the earlier layout being rewritten into the new one without
-/// the move that goes with it (the old service stopped, its state looked after): setup refuses
-/// (exit 5) naming the file and the mode, plans nothing, and leaves the file and the children's
-/// file as they were, dry run or apply. The same file under another mode is not this refusal's.
-///
-/// Mutants to plant: the check dropped (red: the file is rewritten); the check made for every
-/// mode (red: the daemon run is refused); the check after the first plan is applied; the check
-/// after the flags are validated (red: the run without `--proxy` exits 2 for the flag).
-#[test]
-fn a_kbf_toml_of_the_earlier_layout_is_refused_and_nothing_is_touched() {
-    for options in [APPLY, DRY] {
-        let mut exec = aio_host();
-        put(&mut exec, KBF_TOML, 0o640, ROOT, EARLIER_KBF_TOML);
-        let r = raw(Mode::AllInOne);
-        let err = go(&FakeOs::linux(), &mut exec, &r, options).expect_err("refused");
-        assert_eq!(
-            (err.exit(), err.code()),
-            (Exit::NeedsOperator, "needs_operator")
-        );
-        let said = err.to_string();
-        assert!(said.contains(KBF_TOML), "{said}");
-        assert!(said.contains("mode = \"all-in-one\""), "{said}");
-        assert!(said.contains("kbf-all-in-one.service"), "{said}");
-        assert!(exec.log.is_empty(), "{:?}", exec.log);
-        assert_eq!(text(&exec, KBF_TOML), EARLIER_KBF_TOML);
-        assert!(!exec.entries.contains_key(&hp(AIO_FRONTEND_TOML)));
-
-        // The command line that set the earlier layout up has no `--proxy`: the host is named, not
-        // the missing flag.
-        let mut bare = raw(Mode::AllInOne);
-        bare.proxy.proxy = false;
-        let err = go(&FakeOs::linux(), &mut exec, &bare, options).expect_err("refused");
-        assert_eq!(err.exit(), Exit::NeedsOperator);
-        assert!(exec.log.is_empty(), "{:?}", exec.log);
-    }
-
-    let mut exec = aio_host();
-    put(&mut exec, KBF_TOML, 0o640, ROOT, "mode = \"all-in-one\"\n");
-    go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon));
-    assert_eq!(text(&exec, KBF_TOML), DAEMON_TOML);
-}
-
 /// Catches the test of the earlier layout taking more than it should, or less: only a TOML file
 /// whose top-level `mode` is `all-in-one` is it. Another mode, a mode that is not text, no mode,
-/// and a text that is not TOML are not.
+/// and a text that is not TOML are not. A run of another mode over such a file does not move it:
+/// the file is decided on as any other (here it holds the mode only, so the daemon's is written).
 ///
-/// Mutants to plant: the mode compared by prefix; a file that does not parse counted as it.
+/// Mutants to plant: the mode compared by prefix; a file that does not parse counted as it; the
+/// move made for every mode (red: no daemon file, and a copy appears).
 #[test]
 fn only_a_toml_file_with_the_mode_all_in_one_is_the_earlier_layout() {
-    assert!(kbf_toml::says_all_in_one("mode = \"all-in-one\"\n"));
-    assert!(kbf_toml::says_all_in_one(EARLIER_KBF_TOML));
+    assert!(kbf_toml::all_in_one_table("mode = \"all-in-one\"\n").is_some());
+    assert!(kbf_toml::all_in_one_table(EARLIER_KBF_TOML).is_some());
     for other in [
         "mode = \"storage-and-daemon\"\n",
         "mode = \"all-in-one-x\"\n",
@@ -229,8 +190,15 @@ fn only_a_toml_file_with_the_mode_all_in_one_is_the_earlier_layout() {
         "mode = [",
         "",
     ] {
-        assert!(!kbf_toml::says_all_in_one(other), "{other:?}");
+        assert!(kbf_toml::all_in_one_table(other).is_none(), "{other:?}");
     }
+
+    let mut exec = aio_host();
+    put(&mut exec, KBF_TOML, 0o640, ROOT, "mode = \"all-in-one\"\n");
+    go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon));
+    assert_eq!(text(&exec, KBF_TOML), DAEMON_TOML);
+    let copy = "/var/lib/kbf-installer/migration-units/kbf.toml.all-in-one";
+    assert!(!exec.entries.contains_key(&hp(copy)));
 }
 
 /// Catches the unit list of the proxy layout drifting from the proxy's: an all-in-one host behind
