@@ -1,7 +1,9 @@
 //! Profile canaries: before a lease is handed a pool user, the daemon runs each door the
 //! sandbox profile is meant to shut as that user, under the exact profile generated for
-//! the lease, and the door must be refused (`EPERM` or `EACCES`). No canary refused, no
-//! lease: the profile is asserted, not trusted
+//! the lease, and the door must be refused (`EPERM` or `EACCES`). A slot with a canary not
+//! refused is set aside, not offered and not counted among the node's action slots until
+//! its next offer ([`first_passing`]); the lease takes the next slot, or waits as when
+//! none is free. The profile is asserted, not trusted
 //! (`~/workplace/mac-pool-experiments-scratch/08_revised_design.md`, section 1.6).
 //!
 //! A canary is a row of [`CANARIES`]: its name, the profile rule it stands for
@@ -9,11 +11,12 @@
 //! ([`dispatch`]): it makes the syscall and prints one line, `canary <name> refused
 //! errno=<n>` or `canary <name> allowed`, exiting [`REFUSED`], [`ALLOWED`], [`FAILED`]
 //! (the call failed for another reason) or [`USAGE`]. [`judge`] reads that back and
-//! [`check`] runs the table, stopping at the first canary that is not refused. A new
+//! [`check`] runs the whole table and reports every canary that is not refused. A new
 //! deny gets its canary by adding a row and an [`Op`]; the macOS side
 //! ([`macos`](super::macos)) runs a probe as the slot's user under the lease's profile.
 
 use std::ffi::OsString;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -236,24 +239,40 @@ pub struct Failure {
     pub verdict: Verdict,
 }
 
+/// What [`check`] found: the canaries that were refused and the ones that were not.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Report {
+    pub passed: Vec<Passed>,
+    pub failed: Vec<Failure>,
+}
+
+impl Report {
+    /// Whether every canary was refused.
+    #[must_use]
+    pub fn all_refused(&self) -> bool {
+        self.failed.is_empty()
+    }
+
+    /// The failures, one line each, for a log: `name (deny): result; ...`.
+    #[must_use]
+    pub fn failures(&self) -> String {
+        let lines: Vec<String> = self.failed.iter().map(ToString::to_string).collect();
+        lines.join("; ")
+    }
+}
+
 /// Runs every canary of `canaries` with `run` (which starts the probe as the slot's user
-/// under the lease's profile) and returns what each showed, or the first one that was
-/// not refused. A canary that could not be started or timed out is a failure too. Every
+/// under the lease's profile), none skipped after a failure, so each can be seen red on
+/// its own. A canary that could not be started or timed out is a failure too. Every
 /// result is logged with the canary's name and how long it took.
-///
-/// # Errors
-/// The first canary that was allowed or could not run.
-pub fn check(
-    canaries: &[Canary],
-    run: &mut dyn FnMut(&Canary) -> io::Result<Ran>,
-) -> Result<Vec<Passed>, Failure> {
-    let mut passed = Vec::new();
+pub fn check(canaries: &[Canary], run: &mut dyn FnMut(&Canary) -> io::Result<Ran>) -> Report {
+    let mut report = Report::default();
     for canary in canaries {
         let verdict = match run(canary) {
             Ok(ran) => match judge(canary, &ran) {
                 Verdict::Refused(errno) => {
                     tracing::info!(canary = canary.name, errno, took = ?ran.took, "profile canary refused");
-                    passed.push(Passed {
+                    report.passed.push(Passed {
                         name: canary.name,
                         errno,
                         took: ran.took,
@@ -264,14 +283,58 @@ pub fn check(
             },
             Err(e) => Verdict::CannotRun(e.to_string()),
         };
-        tracing::error!(canary = canary.name, deny = canary.deny, %verdict, "profile canary failed: no lease for this user");
-        return Err(Failure {
+        tracing::error!(canary = canary.name, deny = canary.deny, %verdict, "profile canary failed: this slot is set aside");
+        report.failed.push(Failure {
             name: canary.name,
             deny: canary.deny,
             verdict,
         });
     }
-    Ok(passed)
+    report
+}
+
+/// What probing a slot decided.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Probe {
+    /// The slot may run the lease.
+    Pass,
+    /// The slot is not to run it; the text says which canaries failed.
+    Aside(String),
+}
+
+/// The slots a lease is offered, for [`first_passing`].
+pub trait Offer {
+    type Slot: Send;
+    type Err;
+
+    /// The next free slot (waiting when none is), or why the lease ends instead (a kill
+    /// while waiting).
+    fn next(&mut self) -> impl Future<Output = Result<Self::Slot, Self::Err>> + Send;
+
+    /// Hands the lease's directory to `slot` and runs its canaries.
+    fn probe(&mut self, slot: &Self::Slot)
+    -> impl Future<Output = Result<Probe, Self::Err>> + Send;
+
+    /// Sets `slot` aside; `why` says which canaries failed.
+    fn aside(&mut self, slot: Self::Slot, why: &str);
+}
+
+/// Takes slots until one passes its probe, setting each one that does not aside (it is
+/// not offered again until its next offer). A canary failure never fails the action: the
+/// next slot is taken, and with none free [`Offer::next`] waits, as it does when every
+/// slot is held.
+///
+/// # Errors
+/// What [`Offer::next`] or [`Offer::probe`] returns (a kill while waiting, a hand-over
+/// that failed).
+pub async fn first_passing<O: Offer + Send>(offer: &mut O) -> Result<O::Slot, O::Err> {
+    loop {
+        let slot = offer.next().await?;
+        match offer.probe(&slot).await? {
+            Probe::Pass => return Ok(slot),
+            Probe::Aside(why) => offer.aside(slot, &why),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -506,57 +569,139 @@ mod tests {
         ));
     }
 
-    /// Catches a check that gives a lease a user when one canary is allowed (the
-    /// "not offered" branch), when one cannot be started or times out (the "cannot
-    /// run" branch), or that skips the later canaries after a pass, and one that does
-    /// not name the canary, its deny and the result.
+    /// Catches a check that stops at the first failure (a second broken door is never
+    /// seen, so a mutant that breaks only the later canary cannot be shown red), that
+    /// passes when one canary is allowed (the "not offered" branch) or cannot run (the
+    /// "cannot run" branch), or that does not log the canary, its deny and the result.
     #[test]
-    fn check_passes_only_when_every_canary_is_refused() {
+    fn check_runs_every_canary_and_reports_every_failure() {
         let refused = |c: &Canary| Ok(ran(REFUSED, &format!("canary {} refused errno=1", c.name)));
-        let (passed, log) = Log::default().during(|| check(CANARIES, &mut |c| refused(c)));
-        let passed = passed.expect("all refused");
-        assert_eq!(passed.len(), CANARIES.len());
-        assert_eq!(passed[0].name, "write-outside");
-        assert_eq!(passed[0].took, Duration::from_millis(80));
+        let (report, log) = Log::default().during(|| check(CANARIES, &mut |c| refused(c)));
+        assert!(report.all_refused());
+        assert_eq!(report.passed.len(), CANARIES.len());
+        assert_eq!(report.passed[0].name, "write-outside");
+        assert_eq!(report.passed[0].took, Duration::from_millis(80));
         assert!(log.contains("profile canary refused"), "{log}");
         assert!(log.contains("link-outside"), "{log}");
 
-        let (open, log) = Log::default().during(|| {
-            check(CANARIES, &mut |c| {
-                if c.name == "link-outside" {
-                    Ok(ran(ALLOWED, "canary link-outside allowed"))
-                } else {
-                    refused(c)
-                }
-            })
-        });
-        let open = open.expect_err("a door is open");
-        assert_eq!(open.name, "link-outside");
-        assert_eq!(open.verdict, Verdict::Allowed);
-        assert_eq!(
-            open.to_string(),
-            "canary link-outside ((deny file-write*)): NOT refused: the call succeeded"
-        );
-        for want in [
-            "ERROR",
-            "profile canary failed",
-            "link-outside",
-            "NOT refused",
-        ] {
-            assert!(log.contains(want), "{want} not in {log}");
+        // Only one canary is broken, in turn: each is seen alone, the other refused.
+        for broken in CANARIES {
+            let (report, log) = Log::default().during(|| {
+                check(CANARIES, &mut |c| {
+                    if c.name == broken.name {
+                        Ok(ran(ALLOWED, &format!("canary {} allowed", c.name)))
+                    } else {
+                        refused(c)
+                    }
+                })
+            });
+            assert!(!report.all_refused());
+            assert_eq!(report.failed.len(), 1, "{}", report.failures());
+            assert_eq!(report.passed.len(), CANARIES.len() - 1);
+            let failed = &report.failed[0];
+            assert_eq!(
+                (failed.name, &failed.verdict),
+                (broken.name, &Verdict::Allowed)
+            );
+            assert_eq!(
+                report.failures(),
+                format!(
+                    "canary {} ({}): NOT refused: the call succeeded",
+                    broken.name, broken.deny
+                )
+            );
+            for want in ["ERROR", "profile canary failed", broken.name, "NOT refused"] {
+                assert!(log.contains(want), "{want} not in {log}");
+            }
         }
 
         let mut seen = 0;
-        let (cannot, log) = Log::default().during(|| {
+        let (report, log) = Log::default().during(|| {
             check(CANARIES, &mut |_| {
                 seen += 1;
                 Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"))
             })
         });
-        let cannot = cannot.expect_err("cannot run");
-        assert_eq!(seen, 1, "stops at the first failure");
-        assert_eq!(cannot.verdict, Verdict::CannotRun("timed out".to_owned()));
+        assert_eq!(seen, CANARIES.len(), "every canary runs");
+        assert_eq!(report.failed.len(), CANARIES.len());
+        assert_eq!(
+            report.failed[0].verdict,
+            Verdict::CannotRun("timed out".to_owned())
+        );
         assert!(log.contains("could not run: timed out"), "{log}");
-        assert_eq!(check(&[], &mut |_| unreachable!()), Ok(vec![]));
+        assert_eq!(check(&[], &mut |_| unreachable!()), Report::default());
+    }
+
+    /// Catches a lease that fails, or runs on a slot that failed its canaries, when a
+    /// later slot would pass: the bad slot must be set aside (not offered again, here
+    /// not handed out twice), the next one taken, and the probe's own error (a failed
+    /// hand-over) or the wait's (a kill) still fails the lease. With every slot bad the
+    /// wait does not end.
+    #[test]
+    fn a_failed_canary_sets_the_slot_aside_and_the_lease_takes_the_next() {
+        /// Slots from a queue; the probe passes the slots in `good`.
+        struct Fake {
+            queue: Vec<u32>,
+            good: Vec<u32>,
+            probe_error: bool,
+            probed: Vec<u32>,
+            aside: Vec<(u32, String)>,
+        }
+
+        impl Offer for Fake {
+            type Slot = u32;
+            type Err = String;
+
+            async fn next(&mut self) -> Result<u32, String> {
+                self.queue.pop().ok_or_else(|| "none free".to_owned())
+            }
+
+            async fn probe(&mut self, slot: &u32) -> Result<Probe, String> {
+                self.probed.push(*slot);
+                if self.probe_error {
+                    return Err("hand over failed".to_owned());
+                }
+                Ok(if self.good.contains(slot) {
+                    Probe::Pass
+                } else {
+                    Probe::Aside(format!("slot {slot} bad"))
+                })
+            }
+
+            fn aside(&mut self, slot: u32, why: &str) {
+                self.aside.push((slot, why.to_owned()));
+            }
+        }
+
+        let fake = |queue: Vec<u32>, good: Vec<u32>, probe_error| Fake {
+            queue,
+            good,
+            probe_error,
+            probed: Vec::new(),
+            aside: Vec::new(),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+
+        let mut offer = fake(vec![3, 2, 1], vec![3], false);
+        assert_eq!(rt.block_on(first_passing(&mut offer)), Ok(3));
+        assert_eq!(offer.probed, [1, 2, 3]);
+        assert_eq!(
+            offer.aside,
+            [(1, "slot 1 bad".to_owned()), (2, "slot 2 bad".to_owned())]
+        );
+
+        // A probe error is the lease's failure, and sets nothing aside.
+        let mut offer = fake(vec![1], vec![1], true);
+        let failed = rt.block_on(first_passing(&mut offer));
+        assert_eq!(failed, Err("hand over failed".to_owned()));
+        assert!(offer.aside.is_empty());
+
+        // Every slot bad: the wait for the next reports (here, ends) with all set aside.
+        let mut offer = fake(vec![1, 2], vec![], false);
+        let all_bad = rt.block_on(first_passing(&mut offer));
+        assert_eq!(offer.aside.len(), 2);
+        assert_eq!(all_bad, Err("none free".to_owned()));
     }
 }

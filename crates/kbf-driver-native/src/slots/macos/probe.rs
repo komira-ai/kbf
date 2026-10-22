@@ -1,9 +1,8 @@
 //! The profile canaries on a Mac ([`crate::slots::canary`] says what each is): each
 //! probe is started the way an action is ([`Slot::launch`]), as the slot's user under
 //! the profile generated for the lease, and its answer is judged by
-//! [`canary::check`]. A slot whose canaries are not all refused is not given to the
-//! lease; the slot itself is cleaned and offered again, and the canaries run again for
-//! its next lease.
+//! [`canary::check`]. A slot whose canaries are not all refused is set aside
+//! ([`Slot::set_aside`]) and the lease takes another.
 
 use std::io::{self, Read as _};
 use std::path::Path;
@@ -15,23 +14,24 @@ use kbf_daemon::uid;
 
 use super::Slot;
 use crate::network::{Isolation, Network};
-use crate::slots::canary::{self, CANARIES, Canary, Ran};
+use crate::slots::canary::{self, CANARIES, Canary, Ran, Report};
 
 /// How long the processes of a probe that timed out get to end.
 const END_WITHIN: Duration = Duration::from_secs(2);
 
 impl Slot {
     /// Runs every canary as the slot's user under the profile of a lease in `lease`
-    /// with `network`, and logs how long they took.
+    /// with `network`, and logs how long they took. Every canary runs; the report says
+    /// which were not refused (the slot is then to be set aside, [`Slot::set_aside`]).
     ///
     /// # Errors
-    /// A canary was not refused, or could not run: the lease must not get this user.
+    /// A canary command could not be built (the slot's uid is 0).
     pub async fn canary(
         &self,
         isolation: &Isolation,
         network: Network,
         lease: &Path,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<Report, RuntimeError> {
         let uid = self.ready().user.uid;
         let mut commands = Vec::new();
         for canary in CANARIES {
@@ -44,7 +44,7 @@ impl Slot {
             commands.push((canary.name, launch));
         }
         let started = Instant::now();
-        let checked = tokio::task::spawn_blocking(move || {
+        let report = tokio::task::spawn_blocking(move || {
             canary::check(CANARIES, &mut |c: &Canary| {
                 let (_, (program, args)) = commands
                     .iter()
@@ -55,20 +55,15 @@ impl Slot {
         })
         .await
         .map_err(|e| RuntimeError::Failed(format!("profile canaries did not finish: {e}")))?;
-        match checked {
-            Ok(passed) => {
-                tracing::info!(
-                    uid,
-                    total = ?started.elapsed(),
-                    canaries = ?passed.iter().map(|p| (p.name, p.took)).collect::<Vec<_>>(),
-                    "profile canaries passed"
-                );
-                Ok(())
-            }
-            Err(failure) => Err(RuntimeError::Failed(format!(
-                "profile canary failed for uid {uid}, so it gets no lease: {failure}"
-            ))),
+        if report.all_refused() {
+            tracing::info!(
+                uid,
+                total = ?started.elapsed(),
+                canaries = ?report.passed.iter().map(|p| (p.name, p.took)).collect::<Vec<_>>(),
+                "profile canaries passed"
+            );
         }
+        Ok(report)
     }
 }
 

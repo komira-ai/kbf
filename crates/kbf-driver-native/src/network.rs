@@ -190,20 +190,29 @@ fn quoted(path: &Path) -> std::io::Result<String> {
     Ok(format!("\"{text}\""))
 }
 
-/// A line dropped from the generated profile, to see a canary go red on a Mac: for the
+/// A change made to the generated profile, to see a canary go red on a Mac: for the
 /// tests of `tests/slot_canary.rs` alone, never set in production.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProfileMutant(pub &'static str);
+pub enum ProfileMutant {
+    /// Drops every copy of this line.
+    Drop(&'static str),
+    /// Adds this line at the end of the profile constant (before the device and home
+    /// rules).
+    Add(&'static str),
+}
 
 impl ProfileMutant {
-    /// `profile` without the line this mutant names (every copy of it).
+    /// `profile` with the change made.
     #[must_use]
     pub fn apply(self, profile: &str) -> String {
-        profile
-            .split_inclusive('\n')
-            .filter(|line| line.trim_end() != self.0)
-            .collect()
+        match self {
+            Self::Drop(line) => profile
+                .split_inclusive('\n')
+                .filter(|l| l.trim_end() != line)
+                .collect(),
+            Self::Add(line) => format!("{profile}{line}\n"),
+        }
     }
 }
 
@@ -726,13 +735,25 @@ mod tests {
             // appended after it.
             let own = |r: &&str| slot_profile(network).lines().any(|l| l == *r);
             for rule in wanted(network).filter(|r| *r != "(version 1)").filter(own) {
-                let mutated = generated(network, Some(ProfileMutant(rule)));
+                let mutated = generated(network, Some(ProfileMutant::Drop(rule)));
                 let lines: Vec<&str> = mutated.lines().collect();
                 assert!(!lines.contains(&rule), "{rule} is still there");
                 let before = whole.lines().filter(|l| *l == rule).count();
                 assert_eq!(whole.lines().count() - lines.len(), before, "{rule}");
             }
         }
+    }
+
+    /// Catches a mutant that does not change the profile as it says (an added rule that
+    /// is lost, or a drop that takes a neighbour).
+    #[test]
+    fn a_profile_mutant_adds_or_drops_exactly_its_line() {
+        let base = "(a)\n(b)\n(a)\n";
+        assert_eq!(ProfileMutant::Drop("(a)").apply(base), "(b)\n");
+        assert_eq!(
+            ProfileMutant::Add("(c)").apply(base),
+            "(a)\n(b)\n(a)\n(c)\n"
+        );
     }
 
     /// Catches a canary that names a deny the profile does not hold (so it would test a

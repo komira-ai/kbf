@@ -1,7 +1,8 @@
 //! The profile canaries for real (`~/workplace/mac-pool-experiments-scratch/08_revised_design.md`,
 //! section 1.6): a pool user, under the exact profile generated for a lease, is refused
 //! a write outside the four allowed paths and a hard link of a root-owned file into the
-//! lease directory, and a profile that lacks `(deny file-write*)` fails them.
+//! lease directory; a profile that lacks `(deny file-write*)` fails them, and one that
+//! only lets a link through fails the link canary alone; a slot that fails is set aside.
 //!
 //! The canary latency is printed as `CANARY-LATENCY` lines (the design measured 64 to 125
 //! ms for a run).
@@ -15,10 +16,11 @@
 mod support;
 
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use kbf_driver_native::network::{Isolation, Network, ProfileMutant};
+use kbf_driver_native::slots::canary::Report;
 use kbf_driver_native::slots::macos::{Slot, Slots};
 use kbf_driver_native::slots::{LEASES_ROOT_MODE, Pool};
 use support::pool::{Scratch, Users};
@@ -55,12 +57,27 @@ fn start(name: &str, mutant: Option<ProfileMutant>) -> (Users, Scratch, Slots) {
     (users, scratch, slots.expect("slots"))
 }
 
+/// The names of the canaries that were not refused.
+fn failed(report: &Report) -> Vec<&'static str> {
+    report.failed.iter().map(|f| f.name).collect()
+}
+
+/// Leftovers of an open door in /private/tmp.
+fn left_in_tmp() -> Vec<String> {
+    std::fs::read_dir("/private/tmp")
+        .expect("tmp")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".kbf-canary-"))
+        .collect()
+}
+
 /// Catches a generated profile that lets a pool user write outside the lease, `/dev`,
 /// its home and its `/var/folders` entry, or hard-link a root-owned file into the lease
 /// directory (both with and without the network), and a canary that cannot run on the
 /// Mac at all (a probe mode the binary does not answer, a launch that fails): every
-/// canary must be refused, and each run is timed. Mutant seen red on the runner:
-/// [`a_profile_without_its_write_deny_fails_the_canaries`].
+/// canary must be refused, and each run is timed. Mutants seen red on the runner: the
+/// other tests of this file.
 #[ignore = "needs root and real users: cargo xtask sudo-test"]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_canaries_are_refused_under_the_real_profile() {
@@ -71,17 +88,17 @@ async fn the_canaries_are_refused_under_the_real_profile() {
     for network in [Network::On, Network::Off] {
         for round in 0..3 {
             let started = Instant::now();
-            slot.canary(&isolation, network, &lease)
-                .await
-                .unwrap_or_else(|e| panic!("{network:?}: {e}"));
+            let report = slot.canary(&isolation, network, &lease).await.expect("ran");
             println!(
                 "CANARY-LATENCY network={network:?} round={round} both_canaries_ms={}",
                 started.elapsed().as_millis()
             );
+            assert!(report.all_refused(), "{network:?}: {}", report.failures());
+            assert_eq!(report.passed.len(), 2);
         }
     }
     assert!(
-        !Path::new(&lease).join(".kbf-canary-link").exists(),
+        !lease.join(".kbf-canary-link").exists(),
         "the link canary left its link"
     );
     slot.release().await;
@@ -89,33 +106,102 @@ async fn the_canaries_are_refused_under_the_real_profile() {
 
 /// Catches canaries that pass whatever the profile says (a probe that always exits 0, a
 /// judge that reads the exit code alone): the generated profile loses its
-/// `(deny file-write*)` line, so the user can write anywhere, and the first canary must
-/// report the write as not refused, naming the canary and the deny; with the network
-/// off too. The file the open door made is removed by the probe.
+/// `(deny file-write*)` line, so the user can write anywhere, and the write canary must
+/// be reported as not refused, naming the canary and the deny; with the network off
+/// too. The file the open door made is removed by the probe.
 #[ignore = "needs root and real users: cargo xtask sudo-test"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_profile_without_its_write_deny_fails_the_canaries() {
-    let mutant = ProfileMutant("(deny file-write*)");
+    let mutant = ProfileMutant::Drop("(deny file-write*)");
     let (_users, scratch, slots) = start("canary-mutant", Some(mutant));
     let (slot, lease) = leased(&slots, &scratch).await;
     let isolation = Isolation::detect();
     for network in [Network::On, Network::Off] {
-        let failed = slot
-            .canary(&isolation, network, &lease)
-            .await
-            .expect_err("the canaries must fail");
-        let text = failed.to_string();
-        println!("CANARY-MUTANT network={network:?}: {text}");
+        let report = slot.canary(&isolation, network, &lease).await.expect("ran");
+        println!(
+            "CANARY-MUTANT drop-file-write-deny network={network:?}: {}",
+            report.failures()
+        );
         assert!(
-            text.contains("canary write-outside ((deny file-write*)): NOT refused"),
-            "{text}"
+            failed(&report).contains(&"write-outside"),
+            "{}",
+            report.failures()
+        );
+        assert!(
+            report
+                .failures()
+                .contains("canary write-outside ((deny file-write*)): NOT refused"),
+            "{}",
+            report.failures()
         );
     }
-    let left: Vec<_> = std::fs::read_dir("/private/tmp")
-        .expect("tmp")
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with(".kbf-canary-"))
-        .collect();
-    assert!(left.is_empty(), "the open door's file stayed: {left:?}");
+    assert!(
+        left_in_tmp().is_empty(),
+        "the open door's file stayed: {:?}",
+        left_in_tmp()
+    );
     slot.release().await;
+}
+
+/// Catches a link canary that cannot fail on its own (it only follows the write canary's
+/// result, or the check stops at the first failure): the profile keeps
+/// `(deny file-write*)` but lets `file-link` through, so the write canary must still be
+/// refused and the link canary alone reported.
+#[ignore = "needs root and real users: cargo xtask sudo-test"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_profile_that_lets_a_link_through_fails_the_link_canary_alone() {
+    let mutant = ProfileMutant::Add("(allow file-link)");
+    let (_users, scratch, slots) = start("canary-link", Some(mutant));
+    let (slot, lease) = leased(&slots, &scratch).await;
+    let isolation = Isolation::detect();
+    for network in [Network::On, Network::Off] {
+        let report = slot.canary(&isolation, network, &lease).await.expect("ran");
+        println!(
+            "CANARY-MUTANT allow-file-link network={network:?}: {}",
+            report.failures()
+        );
+        assert_eq!(failed(&report), ["link-outside"], "{}", report.failures());
+        assert_eq!(report.passed.len(), 1);
+    }
+    assert!(
+        !lease.join(".kbf-canary-link").exists(),
+        "the open door's link stayed"
+    );
+    slot.release().await;
+}
+
+/// Catches a slot that fails its canaries and stays offered, stays counted, or is never
+/// canaried again: it is set aside (the count of slots drops to 0 and a lease waits, as
+/// when none is free), and offered again it is cleaned and canaried again, and set aside
+/// again by the same mutant.
+#[ignore = "needs root and real users: cargo xtask sudo-test"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slot_that_fails_its_canaries_is_set_aside_and_canaried_again_when_offered() {
+    let mutant = ProfileMutant::Drop("(deny file-write*)");
+    let (_users, scratch, slots) = start("canary-aside", Some(mutant));
+    let (slot, lease) = leased(&slots, &scratch).await;
+    let isolation = Isolation::detect();
+    assert_eq!(slots.count(), 1);
+    let report = slot
+        .canary(&isolation, Network::On, &lease)
+        .await
+        .expect("ran");
+    assert!(!report.all_refused());
+    slot.set_aside();
+    assert_eq!(slots.count(), 0, "a slot set aside is not counted");
+    let waited = tokio::time::timeout(Duration::from_secs(1), slots.take()).await;
+    assert!(waited.is_err(), "a slot set aside must not be offered");
+    slots.reoffer().await;
+    assert_eq!(slots.count(), 1, "cleaned and offered again");
+    let again = tokio::time::timeout(Duration::from_secs(5), slots.take()).await;
+    let again = again.expect("offered").expect("a slot");
+    again.hand_over(&lease).await.expect("hand over");
+    let report = again
+        .canary(&isolation, Network::On, &lease)
+        .await
+        .expect("ran");
+    assert!(!report.all_refused(), "canaried again, and failed again");
+    again.set_aside();
+    assert_eq!(slots.count(), 0);
+    assert!(left_in_tmp().is_empty(), "{:?}", left_in_tmp());
 }

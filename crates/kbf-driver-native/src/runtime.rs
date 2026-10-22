@@ -163,6 +163,8 @@ impl<C: Cas> NativeRuntime<C> {
         let root = rustix::process::geteuid().is_root();
         crate::slots::check_daemon_user(root, config.pool.as_ref())
             .map_err(std::io::Error::other)?;
+        crate::slots::check_pool_isolation(config.pool.as_ref(), &config.isolation)
+            .map_err(std::io::Error::other)?;
         // Only a Mac has slots to clean.
         #[cfg(not(target_os = "macos"))]
         let _ = mutant;
@@ -359,6 +361,67 @@ impl<C: Cas> NativeRuntime<C> {
     fn stops(&self) -> MutexGuard<'_, BTreeMap<LeaseId, oneshot::Sender<Stop>>> {
         // Each update is one map operation, so the map is consistent after a panic.
         self.stops.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Takes the lease's runner and prepares its directory: a root daemon's lease waits
+    /// for a free slot of the pool, killable, and a slot whose profile canaries are not
+    /// all refused is set aside and the next one taken (the action does not fail for it);
+    /// otherwise the daemon's own user runs it.
+    async fn start(
+        &self,
+        cas: &C::Lease,
+        work: &Work,
+        dir: &Path,
+        runner: &mut Runner,
+        stop: &mut oneshot::Receiver<Stop>,
+        killer: &mut Option<Stop>,
+    ) -> Result<Prepared, RuntimeError> {
+        #[cfg(target_os = "macos")]
+        if let Some(slots) = &self.slots {
+            return self
+                .slot_and_prepare(slots, (cas, work, dir), runner, (stop, killer))
+                .await;
+        }
+        // A kill during prepare (a long input fetch) stops it at once; the clean
+        // removes whatever was written.
+        let private = runner.private_lease();
+        let prepared = tokio::select! {
+            prepared = self.prepare(cas, work, dir, private) => prepared?,
+            Ok(by) = &mut *stop => {
+                *killer = Some(by);
+                return Err(RuntimeError::Killed);
+            }
+        };
+        runner.hand_over(dir).await?;
+        Ok(prepared)
+    }
+
+    /// [`Self::start`] for a pool: the first slot taken prepares the directory, each
+    /// slot taken is handed it and run through the profile canaries
+    /// ([`crate::slots::canary::first_passing`]); the one that passes is `runner`.
+    #[cfg(target_os = "macos")]
+    async fn slot_and_prepare(
+        &self,
+        slots: &crate::slots::macos::Slots,
+        (cas, work, dir): (&C::Lease, &Work, &Path),
+        runner: &mut Runner,
+        (stop, killer): (&mut oneshot::Receiver<Stop>, &mut Option<Stop>),
+    ) -> Result<Prepared, RuntimeError> {
+        let mut offer = SlotOffer {
+            runtime: self,
+            slots,
+            cas,
+            work,
+            dir,
+            stop,
+            killer,
+            prepared: std::sync::OnceLock::new(),
+        };
+        let slot = crate::slots::canary::first_passing(&mut offer).await?;
+        *runner = slot;
+        (offer.prepared)
+            .into_inner()
+            .ok_or_else(|| RuntimeError::Failed("no prepared lease".to_owned()))
     }
 
     /// Fetches and checks the action through the lease's `cas`, and writes its inputs
@@ -692,33 +755,7 @@ impl<C: Cas> NativeRuntime<C> {
         };
         // The lease's own view of the CAS, for its transfer counters.
         let cas = self.cas.lease(&work.lease_id);
-        // A lease of a root daemon waits for a free slot of the pool, killable.
-        #[cfg(target_os = "macos")]
-        if let Some(slots) = &self.slots {
-            *runner = tokio::select! {
-                slot = slots.take() => Runner::Slot(slot?),
-                Ok(by) = &mut *stop => {
-                    *killer = Some(by);
-                    return Err(RuntimeError::Killed);
-                }
-            };
-        }
-        // A kill during prepare (a long input fetch) stops it at once; the clean
-        // removes whatever was written.
-        let private = runner.private_lease();
-        let mut prepared = tokio::select! {
-            prepared = self.prepare(&cas, work, dir, private) => prepared?,
-            Ok(by) = &mut *stop => {
-                *killer = Some(by);
-                return Err(RuntimeError::Killed);
-            }
-        };
-        runner.hand_over(dir).await?;
-        // No canary refused, no lease: the slot's user is not given to this action, and
-        // the slot is cleaned and offered again (docs: slots/canary.rs).
-        runner
-            .canary(&self.config.isolation, prepared.network, &prepared.lease)
-            .await?;
+        let mut prepared = self.start(&cas, work, dir, runner, stop, killer).await?;
         runner.allows_simulator(prepared.simulator.is_some())?;
         // Not stopped by a kill: a `simctl create` cut short could still make its
         // device after the end looked for the lease's devices.
@@ -783,6 +820,68 @@ impl<C: Cas> NativeRuntime<C> {
         clock.worker_completed_timestamp = now();
         result.execution_metadata = Some(clock);
         Ok(result)
+    }
+}
+
+/// The slots of a pool offered to one lease ([`NativeRuntime::slot_and_prepare`]).
+#[cfg(target_os = "macos")]
+struct SlotOffer<'a, C: Cas> {
+    runtime: &'a NativeRuntime<C>,
+    slots: &'a crate::slots::macos::Slots,
+    cas: &'a C::Lease,
+    work: &'a Work,
+    dir: &'a Path,
+    stop: &'a mut oneshot::Receiver<Stop>,
+    killer: &'a mut Option<Stop>,
+    /// Made once, with the first slot taken.
+    prepared: std::sync::OnceLock<Prepared>,
+}
+
+#[cfg(target_os = "macos")]
+impl<C: Cas> crate::slots::canary::Offer for SlotOffer<'_, C> {
+    type Slot = Runner;
+    type Err = RuntimeError;
+
+    async fn next(&mut self) -> Result<Runner, RuntimeError> {
+        let slot = tokio::select! {
+            slot = self.slots.take() => Runner::Slot(slot?),
+            Ok(by) = &mut *self.stop => {
+                *self.killer = Some(by);
+                return Err(RuntimeError::Killed);
+            }
+        };
+        if self.prepared.get().is_none() {
+            let private = slot.private_lease();
+            let made = tokio::select! {
+                made = self.runtime.prepare(self.cas, self.work, self.dir, private) => made?,
+                Ok(by) = &mut *self.stop => {
+                    *self.killer = Some(by);
+                    return Err(RuntimeError::Killed);
+                }
+            };
+            let _ = self.prepared.set(made);
+        }
+        Ok(slot)
+    }
+
+    async fn probe(&mut self, slot: &Runner) -> Result<crate::slots::canary::Probe, RuntimeError> {
+        use crate::slots::canary::Probe;
+        slot.hand_over(self.dir).await?;
+        let Some(made) = self.prepared.get() else {
+            return Err(RuntimeError::Failed("no prepared lease".to_owned()));
+        };
+        let isolation = &self.runtime.config.isolation;
+        let report = slot.canary(isolation, made.network, &made.lease).await?;
+        Ok(if report.all_refused() {
+            Probe::Pass
+        } else {
+            Probe::Aside(report.failures())
+        })
+    }
+
+    fn aside(&mut self, slot: Runner, why: &str) {
+        tracing::error!(%why, "a slot failed its profile canaries; set aside, the lease takes another");
+        slot.set_aside();
     }
 }
 

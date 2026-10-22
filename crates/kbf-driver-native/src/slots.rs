@@ -204,6 +204,24 @@ pub fn check_daemon_user(root: bool, pool: Option<&Pool>) -> Result<(), String> 
     }
 }
 
+/// Whether a pool may run under `isolation`: a pool's slot profile is what keeps a lease
+/// from writing outside its own directories and its canaries ([`canary`]) run under it,
+/// so a node whose isolation is [`Isolation::None`] (no `sandbox-exec`) with a pool is
+/// refused at start, not at every lease.
+///
+/// # Errors
+/// What is refused, and why.
+pub fn check_pool_isolation(pool: Option<&Pool>, isolation: &Isolation) -> Result<(), String> {
+    match (pool, isolation) {
+        (Some(_), Isolation::None) => Err(
+            "a lease-user pool needs sandbox-exec, which this node lacks: the slot profile \
+             and its canaries cannot run"
+                .to_owned(),
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// Makes the lease directory `dir` ([`LEASE_DIR_MODE`] for a slot user's, otherwise the
 /// process's default for a directory) and nothing above it.
 ///
@@ -294,25 +312,31 @@ impl Runner {
     }
 
     /// Runs the profile canaries as the slot's user under the profile of the lease in
-    /// `lease` ([`macos::Slot::canary`]); nothing for the daemon's user, which has no
-    /// slot profile.
+    /// `lease` ([`macos::Slot::canary`]); none for the daemon's user, which has no slot
+    /// profile.
     ///
     /// # Errors
-    /// A canary was not refused or could not run: the lease must not run.
-    #[cfg_attr(
-        not(target_os = "macos"),
-        expect(unused_variables, reason = "no slots off macOS")
-    )]
+    /// A canary could not be started.
+    #[cfg(target_os = "macos")]
     pub async fn canary(
         &self,
         isolation: &Isolation,
         network: Network,
         lease: &Path,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<canary::Report, RuntimeError> {
         match self {
-            Self::Daemon => Ok(()),
-            #[cfg(target_os = "macos")]
+            Self::Daemon => Ok(canary::Report::default()),
             Self::Slot(slot) => slot.canary(isolation, network, lease).await,
+        }
+    }
+
+    /// Sets the slot aside after a failed canary ([`macos::Slot::set_aside`]): not
+    /// offered, not counted, cleaned and canaried again at its next offer.
+    #[cfg(target_os = "macos")]
+    pub fn set_aside(self) {
+        match self {
+            Self::Daemon => {}
+            Self::Slot(slot) => slot.set_aside(),
         }
     }
 
@@ -515,6 +539,20 @@ mod tests {
             assert!(as_user.contains("macOS only"), "{as_user}");
             assert!(as_root.expect_err("off macOS").contains("macOS only"));
         }
+    }
+
+    /// Catches a node with a pool and no `sandbox-exec` starting (every lease would then
+    /// fail its canaries, or worse run unsandboxed): refused once at start, with the
+    /// reason; a pool with a sandbox, and no pool with none, are fine.
+    #[test]
+    fn a_pool_without_sandbox_exec_is_refused_at_start() {
+        let pool = Pool::provisioned(1, 700).expect("pool");
+        let sandbox = Isolation::Sandbox(PathBuf::from("/usr/bin/sandbox-exec"));
+        let refused = check_pool_isolation(Some(&pool), &Isolation::None).expect_err("refused");
+        assert!(refused.contains("needs sandbox-exec"), "{refused}");
+        assert_eq!(check_pool_isolation(Some(&pool), &sandbox), Ok(()));
+        assert_eq!(check_pool_isolation(None, &Isolation::None), Ok(()));
+        assert_eq!(check_pool_isolation(None, &sandbox), Ok(()));
     }
 
     /// Catches the `as-user` mode taken for arguments that do not ask for it (the test

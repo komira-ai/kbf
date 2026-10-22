@@ -30,6 +30,9 @@ mod probe;
 /// The program that starts a process in a user's bootstrap namespace.
 pub const LAUNCHCTL: &str = kbf_mac_session::macos::gui::LAUNCHCTL;
 
+/// How long a lease waits for a free slot before the slots set aside are offered again.
+const REOFFER: Duration = Duration::from_secs(30);
+
 /// The program that names a user's `/var/folders` entry.
 const GETCONF: &str = "/usr/bin/getconf";
 
@@ -64,6 +67,9 @@ struct Shared {
     ready: Vec<Ready>,
     free: Mutex<BTreeSet<usize>>,
     quarantined: AtomicUsize,
+    /// Slots set aside after a failed canary ([`Slot::set_aside`]): counted in
+    /// `quarantined`, not free, until [`Slots::reoffer`].
+    aside: Mutex<BTreeSet<usize>>,
     cleaner: Cleaner,
     /// A line dropped from the profile every launch generates: a test's mutant only.
     profile_mutant: Option<ProfileMutant>,
@@ -160,6 +166,7 @@ impl Slots {
                 ready,
                 free: Mutex::new(free),
                 quarantined: AtomicUsize::new(quarantined),
+                aside: Mutex::default(),
                 cleaner,
                 profile_mutant: None,
             }),
@@ -180,7 +187,14 @@ impl Slots {
     /// None in practice: the semaphore is never closed, and a permit always finds a
     /// free slot.
     pub async fn take(&self) -> Result<Slot, RuntimeError> {
-        let permit = Arc::clone(&self.permits).acquire_owned().await;
+        // While every slot is held or set aside, the slots set aside are offered again
+        // from time to time ([`Slots::reoffer`]).
+        let permit = loop {
+            tokio::select! {
+                permit = Arc::clone(&self.permits).acquire_owned() => break permit,
+                () = tokio::time::sleep(REOFFER) => self.reoffer().await,
+            }
+        };
         let permit = permit.map_err(|e| RuntimeError::Failed(format!("slots: {e}")))?;
         let index = lock(&self.shared.free).pop_first();
         let index = index.ok_or_else(|| RuntimeError::Failed("slots: none free".to_owned()))?;
@@ -190,6 +204,28 @@ impl Slots {
             permit: Some(permit),
             program: self.program.clone(),
         })
+    }
+
+    /// Offers the slots set aside ([`Slot::set_aside`]) again: each is cleaned, and if the
+    /// clean passes it is free and counted again, its canaries run at the lease that takes
+    /// it. One whose clean fails stays out, as any quarantined slot.
+    #[doc(hidden)]
+    pub async fn reoffer(&self) {
+        let (shared, permits) = (Arc::clone(&self.shared), Arc::clone(&self.permits));
+        let done = tokio::task::spawn_blocking(move || {
+            let aside = std::mem::take(&mut *lock(&shared.aside));
+            for index in aside {
+                if settle(&shared.cleaner, &shared.ready[index], index) {
+                    lock(&shared.free).insert(index);
+                    shared.quarantined.fetch_sub(1, Ordering::SeqCst);
+                    permits.add_permits(1);
+                }
+            }
+        })
+        .await;
+        if let Err(why) = done {
+            tracing::error!(%why, "offering the slots set aside again did not finish");
+        }
     }
 }
 
@@ -310,6 +346,17 @@ impl Drop for Back {
 }
 
 impl Slot {
+    /// Sets the slot aside after a failed profile canary: not free, not counted among
+    /// the slots that can run a lease, and cleaned again ([`Slots::reoffer`]) before it
+    /// is next offered. Its canaries run again at the lease that takes it.
+    pub fn set_aside(mut self) {
+        if let Some(permit) = self.permit.take() {
+            self.shared.quarantined.fetch_add(1, Ordering::SeqCst);
+            lock(&self.shared.aside).insert(self.index);
+            permit.forget();
+        }
+    }
+
     /// The slot's user, home and folders.
     #[must_use]
     pub fn ready(&self) -> &Ready {
