@@ -159,6 +159,8 @@ xcode-apps = "/Applications"
 xcode-recheck-secs = 180
 
 [memory]
+# What the farm does with `kbf-estimator`, which predicts an action's memory from what its earlier runs used. `off` calls it never. `shadow` shows it every attempt that finishes and logs, for every new operation, a `size estimate:` line with what it would book, and counts how the attempts fall against its estimates (`kbf_estimator_shadow_total`); it books exactly what `off` books. The size summaries are kept in the state store; `off` neither reads nor deletes them
+learned-sizes = "off"
 # ...plus this many MiB (native). A lease that booked nothing has no limit
 memory-headroom-mib = 512
 # The memory rungs of an action, in GiB, ascending and each at least 1. The first is what an action that names no size (`kbf-book-mem-gib`) books. An action that passes its own memory limit runs again on the next rung above what it booked, and after the last on a whole host: the memory of the largest node that could run it, so that no other lease fits there. A rung not below that node's memory is skipped for the whole host. An action that does finish keeps its rung: later runs of it start there
@@ -203,8 +205,6 @@ input-tree-cache-bytes = 268435456
 input-tree-cache-entries = 1048576
 # The most Directory blobs the input check reads from the store at once, across all Executes
 input-tree-reads-in-flight = 64
-# Whether the farm learns action sizes from earlier runs: `off` (the default) books as it always did; `shadow` observes without booking differently; `on` lets a kill at an action's own memory limit leave a floor under the action's key (instance, platform class, instrument and shape), which every later digest of the key, queued or new, books at least, strictly below the memory of the largest node that could run it. Only an action whose memory the client did not name, whose platform pins the OS, is keyed. The key is kept in the state store (rows of their own: a release without this flag reads the store as it always did), so it survives a restart
-learned-sizes = "off"
 # How often, in seconds, every open Execute and WaitExecution stream is sent its operation again (same name, not done, current stage), so a load balancer's idle timeout never cuts a long action. 0 sends none
 progress-interval-secs = 30
 # How long, in milliseconds, `GET /readyz` on the operator API and the REAPI listener's `grpc.health.v1` service wait for the object store to answer their read-only probe before they answer not ready

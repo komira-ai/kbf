@@ -48,11 +48,11 @@ fn digest(blob: &VerifiedBlob) -> Digest {
     blob.digest()
 }
 
-/// Catches a budget that takes more than it has (mutant: `try_acquire` ignores the cap):
-/// with room for two blobs of 100 bytes the third is `Budget`, not held, not readable as
-/// present, counted as `writethrough{budget}` once, and the bytes held are exactly 200
-/// (invariant I4). The caller then writes the third through (`store_blobs`) and it is
-/// present and durable: a full budget pushes back, it does not lose the write.
+/// Catches a budget that takes more than it has: with room for two blobs of 100 bytes the
+/// third is `Budget`, not held, not readable as present, counted as `writethrough{budget}`
+/// once, and the bytes held are exactly 200 (invariant I4). The caller then writes the
+/// third through (`store_blobs`) and it is present and durable: a full budget pushes back,
+/// it does not lose the write.
 #[tokio::test]
 async fn a_full_budget_refuses_and_the_write_goes_through() {
     let cache = with_budget(200);
@@ -124,10 +124,10 @@ async fn the_bound_is_the_whole_budget_inclusive() {
     assert_eq!(cache.hold(&blob(3, 1)), Hold::Budget, "nothing is left");
 }
 
-/// Catches a permit that is not returned when the blob is drained (mutant: `Permit::drop`
-/// does nothing) and one that is returned twice or early: with room for one blob, a second
-/// writer of the same digest is a dedup answer and takes no second permit, the drain frees
-/// the one permit, and then a different blob fits.
+/// Catches a permit that is not returned when the blob is drained and one that is returned
+/// twice or early: with room for one blob, a second writer of the same digest is a dedup
+/// answer and takes no second permit, the drain frees the one permit, and then a different
+/// blob fits.
 #[tokio::test]
 async fn a_drain_returns_the_budget_once() {
     let cache = with_budget(100);
@@ -153,8 +153,7 @@ async fn a_drain_returns_the_budget_once() {
 
 /// With 16 writers racing for room for 5 blobs, exactly 5 are held, 11 are refused and
 /// counted, and the bytes held are exactly the budget whatever the interleaving (I4).
-/// Catches a check-then-add that two writers can both pass (mutant: the cap is not part
-/// of the atomic update).
+/// Catches a check-then-add that two writers can both pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn racing_writers_never_exceed_the_budget() {
     let cache = Arc::new(with_budget(500));
@@ -187,8 +186,8 @@ async fn racing_writers_never_exceed_the_budget() {
 /// times, the oldest's age, the oldest leaving, and the drain's end (`ram_drain.rs` reads
 /// the failure counter). Ages are read on the paused clock, so they are exact. Catches a
 /// gauge that is not updated when the set changes, an oldest age taken from the youngest
-/// blob (mutant: `min` for `max`), `writethrough` reasons that are not all printed, and a
-/// budget gauge that reads something else.
+/// blob, `writethrough` reasons that are not all printed, and a budget gauge that reads
+/// something else.
 #[tokio::test(start_paused = true)]
 async fn the_metrics_read_the_set_at_every_step() {
     let cache = with_budget(1000);

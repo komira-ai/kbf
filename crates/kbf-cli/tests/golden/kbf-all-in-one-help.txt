@@ -261,7 +261,11 @@ Options:
           [default: 8388608]
 
       --learned-sizes <LEARNED_SIZES>
-          Whether the farm learns action sizes from earlier runs: `off` (the default) books as it always did; `shadow` observes without booking differently; `on` lets a kill at an action's own memory limit leave a floor under the action's key (instance, platform class, instrument and shape), which every later digest of the key, queued or new, books at least, strictly below the memory of the largest node that could run it. Only an action whose memory the client did not name, whose platform pins the OS, is keyed. The key is kept in the state store (rows of their own: a release without this flag reads the store as it always did), so it survives a restart
+          What the farm does with `kbf-estimator`, which predicts an action's memory from what its earlier runs used. `off` calls it never. `shadow` shows it every attempt that finishes and logs, for every new operation, a `size estimate:` line with what it would book, and counts how the attempts fall against its estimates (`kbf_estimator_shadow_total`); it books exactly what `off` books. The size summaries are kept in the state store; `off` neither reads nor deletes them
+
+          Possible values:
+          - off:    The estimator is never called and nothing is read from or written to the store
+          - shadow: The estimator hears of every finished attempt and is asked for every new operation; the answers are logged and counted. Bookings are unchanged
           
           [default: off]
 

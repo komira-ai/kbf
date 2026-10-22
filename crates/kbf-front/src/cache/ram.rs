@@ -547,11 +547,10 @@ mod tests {
 
     use super::*;
 
-    /// The empty blob is always present, so the producer holds nothing for it: with a budget
-    /// above 0 and a blob of no bytes, `hold_write` answers `Duplicate`, takes no budget and
-    /// leaves the set empty. (A stream of 0 bytes never reaches the producer, so this is
-    /// the arm's only caller.) Mutant: the arm removed (the empty blob is held, and its
-    /// zero bytes counted as a blob).
+    /// The empty blob is always present, so the producer holds nothing for it: with a
+    /// budget above 0 and a blob of no bytes, `hold_write` answers `Duplicate`, takes no
+    /// budget and leaves the set empty. (A stream of 0 bytes never reaches the producer,
+    /// so this is the arm's only caller.)
     #[tokio::test]
     async fn the_empty_blob_is_never_held() {
         let cache = Cache::memory().with_ram_ack_bytes(1024);
@@ -568,8 +567,7 @@ mod tests {
 
     /// Dating a drained blob by its acknowledgement does nothing for a digest that is not
     /// held (the entry left already), and for a held digest the index does not have (the
-    /// write did not stage it): both are `Ok`, and neither dates an object. Mutant: the
-    /// first arm answers an error.
+    /// write did not stage it): both are `Ok`, and neither dates an object.
     #[tokio::test]
     async fn dating_by_acknowledgement_needs_a_held_entry_and_a_staged_blob() {
         let cache = Cache::memory().with_ram_ack_bytes(1024);

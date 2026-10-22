@@ -106,7 +106,6 @@ const GROUPS: &[(&str, &[&str])] = &[
             "input-tree-cache-bytes",
             "input-tree-cache-entries",
             "input-tree-reads-in-flight",
-            "learned-sizes",
             "progress-interval-secs",
             "readyz-store-timeout-ms",
             "state-store",
@@ -268,6 +267,7 @@ const GROUPS: &[(&str, &[&str])] = &[
     (
         "memory",
         &[
+            "learned-sizes",
             "memory-headroom-mib",
             "memory-ladder-gib",
             "memory-limit-percent",

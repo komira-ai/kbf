@@ -366,14 +366,12 @@ sync gates on both nodes, let the write return, then assert that writers are par
 - T1 kill the primary after the ack: restart over the surviving log; the primary says
   missing; a router read returns the bytes from the replica; after the replica's gate
   opens its index has the blob and `unwritten_bytes` is 0; an explicit confirmation step
-  finds the primary missing and journals exactly one debt. Mutant: ack before the replica
-  registers.
+  finds the primary missing and journals exactly one debt.
 - T2 kill the replica: the mirror.
 - T3 kill both: both missing, the read is `NOT_FOUND`. For an AC commit, run it with
   gates closed, wait until the barrier reports it is parked, crash both: `action_result`
   is a miss and no entry exists. Positive twin: open the gates, the commit completes,
-  crash both, the entry is present and the closure is on an owner. Mutants: delete
-  barrier (a), delete barrier (b).
+  crash both, the entry is present and the closure is on an owner.
 - T4 disk full: failing creates and failing store puts; the write is acknowledged and
   readable from Held; with a budget of one blob the next write completes only after the
   gate opens; `writethrough{budget}` is 1.
@@ -381,16 +379,14 @@ sync gates on both nodes, let the write return, then assert that writers are par
   the blob is absent on that node and intact on the peer.
 - T6 third node and the drain race: park the drain after the index apply and before the
   entry removal; router read and FindMissing at both points return the bytes, in both
-  lookup orders. Mutants: remove the entry before `put_staged` returns; look up the index
-  before Held.
+  lookup orders.
 - T7 replica lost: the write returns only after the gate opens; the debt is journaled
   before the commit.
 - T8 a blob over 4 MiB, and R=1, stay disk-acknowledged.
 - T9 the gauge returns to 0; the budget is never exceeded under N writers.
 - T10 duplicate in-flight writes of one digest: one permit, one removal, both
-  acknowledged. Mutant: overwrite on insert (permit leak).
-- T11 the closure check is durable-only: a RAM-only positive is not cached. Mutant: ask
-  plain.
+  acknowledged.
+- T11 the closure check is durable-only: a RAM-only positive is not cached.
 - T12 the repair worker copies in `Durable` mode and `settle_evicted` leaves a Held digest
   alone.
 

@@ -71,7 +71,7 @@ pub(crate) fn killed(run: Run, killed: &MemoryRun) -> Run {
 /// none (a daemon that predates the field), reads the cgroup block when there is one,
 /// and the basis is never inferred from which block is there. A block that is absent
 /// stays absent; it is never filled from the other or made zero.
-fn run_usage(u: &ResourceUsage) -> RunUsage {
+pub(crate) fn run_usage(u: &ResourceUsage) -> RunUsage {
     let carried = RunUsage {
         node_cpu_pressure_centi: u.node_cpu_pressure_centi,
         booked_millicpus: u.booked_millicpus,

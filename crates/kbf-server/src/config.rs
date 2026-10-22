@@ -311,15 +311,20 @@ pub struct Args {
         default_values_t = kbf_sched::MemoryLadder::DEFAULT_GIB
     )]
     pub memory_ladder_gib: Vec<u64>,
-    /// Whether the farm learns action sizes from earlier runs: `off` (the default) books
-    /// as it always did; `shadow` observes without booking differently; `on` lets a kill
-    /// at an action's own memory limit leave a floor under the action's key (instance,
-    /// platform class, instrument and shape), which every later digest of the key, queued
-    /// or new, books at least, strictly below the memory of the largest node that could
-    /// run it. Only an action whose memory the client did not name, whose platform pins
-    /// the OS, is keyed. The key is kept in the state store (rows of their own: a release
-    /// without this flag reads the store as it always did), so it survives a restart.
-    #[arg(long, default_value_t = crate::LearnedSizes::Off)]
+    /// What the farm does with `kbf-estimator`, which predicts an action's memory from
+    /// what its earlier runs used. `off` calls it never. `shadow` shows it every attempt
+    /// that finishes and logs, for every new operation, a `size estimate:` line with what
+    /// it would book, and counts how the attempts fall against its estimates
+    /// (`kbf_estimator_shadow_total`); it books exactly what `off` books. `on` is `shadow`
+    /// plus one change to a booking: a kill at an action's own memory limit leaves a floor
+    /// under the action's key (instance, platform class, instrument and shape), which every
+    /// later digest of the key, queued or new, books at least, strictly below the memory of
+    /// the largest node that could run it; the floor falls only after 256 runs of the key
+    /// and 7 days without a run near the heavy mode. Only an action whose memory the client
+    /// did not name, on a platform that pins the OS, is keyed. The size summaries and the
+    /// keys are kept in the state store, in rows of their own that a release without this
+    /// flag never reads; `off` neither reads nor deletes the summaries.
+    #[arg(long, value_enum, default_value_t = crate::LearnedSizes::Off)]
     pub learned_sizes: crate::LearnedSizes,
     /// How long, in seconds, a finished operation is kept after its callers are
     /// answered. Within it, WaitExecution on the operation's name streams its result

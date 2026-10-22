@@ -175,8 +175,7 @@ const DEADLINE: Duration = Duration::from_secs(5);
 
 /// The task started with a budget writes what is held, with no call from the test but the
 /// hold: `durable_waiting` returns with nothing missing, by notification, once the entry
-/// has left. Catches a task that is not started (mutant: `start` never spawns it: the wait
-/// ends missing after its bound) or one that is not woken by a hold.
+/// has left. Catches a task that is not started or one that is not woken by a hold.
 #[tokio::test(start_paused = true)]
 async fn the_task_writes_what_is_held_while_the_node_serves() {
     let (cache, _) = cache(1 << 20);
@@ -196,7 +195,7 @@ async fn the_task_writes_what_is_held_while_the_node_serves() {
 /// and ends without yielding, so the background task (which runs only when the test
 /// yields) has not run, and the blob is in the index when `after` returns only because the
 /// stop's drain wrote it. The output of `served` comes through. Catches a stop that does
-/// not drain (mutant: `after` returns `served`'s output at once: one blob is still held).
+/// not drain.
 #[tokio::test(start_paused = true)]
 async fn the_stop_drains_what_is_held_after_serving_ends() {
     let (cache, _) = cache(1 << 20);

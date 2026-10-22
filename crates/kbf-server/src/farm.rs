@@ -66,6 +66,7 @@ mod ack;
 mod beat;
 mod durable;
 mod handover;
+mod learning;
 mod nodes;
 mod phase;
 mod record;
@@ -77,10 +78,10 @@ pub use phase::Reported;
 
 use self::ack::{Verdict, refusal};
 use self::durable::Durable;
-use crate::LearnedSizes;
 use crate::action_usage::{self, Measured, Shapes};
 use crate::fault;
 use crate::fleet::{NodeView, SoftwareView, attention_changes};
+use crate::learned::{Learned, LearnedSizes};
 use crate::machine::{FarmMachine, Platform, Sent, Waiter};
 use crate::memory;
 use crate::missing;
@@ -306,8 +307,6 @@ struct State {
     held_cap: usize,
     /// The scheduler was told the state store is unavailable ([`State::watch_store`]).
     store_down: bool,
-    /// What `--learned-sizes` says ([`Farm::with_learned_sizes`]).
-    learned: LearnedSizes,
     /// When each node's session row in the state store was last written.
     renewed: BTreeMap<WorkerId, FarmTime>,
     /// A handover took the work from this farm ([`Farm::fence`]): it feeds the scheduler
@@ -320,6 +319,9 @@ struct State {
     /// The same for the operations relays follow ([`kbf_front::Handed::look`]), until
     /// the relay lets go of them.
     untraced_relayed: BTreeMap<OperationId, u32>,
+    /// The learned-sizes shadow ([`crate::learned`]); off unless `--learned-sizes`
+    /// says otherwise.
+    learned: Learned,
 }
 
 /// How many committed records the farm holds for a state store that refuses them.
@@ -416,13 +418,24 @@ impl Farm {
                 write_drops: 0,
                 held_cap: HELD_CAP,
                 store_down: false,
-                learned: LearnedSizes::default(),
                 renewed: BTreeMap::new(),
                 fenced: false,
                 untraced_kept: BTreeMap::new(),
                 untraced_relayed: BTreeMap::new(),
+                learned: Learned::new(LearnedSizes::Off, 0, 0),
             }),
         }
+    }
+
+    /// This farm, with learned sizes `mode` (`--learned-sizes`) over a first rung of
+    /// `default_memory` bytes. Set before the farm takes a state store over: `off` reads
+    /// none of the size summaries it holds.
+    #[must_use]
+    pub fn with_learned_sizes(mut self, mode: LearnedSizes, default_memory: u64) -> Self {
+        let epoch_unix_ms = self.epoch_unix_ms;
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        state.learned = Learned::new(mode, default_memory, epoch_unix_ms);
+        self
     }
 
     /// This farm, whose scheduler climbs `ladder` for an action that passes its memory limit
@@ -431,18 +444,6 @@ impl Farm {
     pub fn with_memory_ladder(mut self, ladder: MemoryLadder) -> Self {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         state.sched.set_memory_ladder(ladder);
-        self
-    }
-
-    /// This farm, learning sizes as `mode` says: with `on`, a submission of an action
-    /// whose memory the client did not name, on a platform that pins the OS, is given a
-    /// size key ([`crate::size_key`]) that the scheduler's kill-driven memory floor is
-    /// kept under, and the state store holds beside the operation. Set before the farm
-    /// takes a state store over.
-    #[must_use]
-    pub fn with_learned_sizes(mut self, mode: LearnedSizes) -> Self {
-        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-        state.learned = mode;
         self
     }
 
@@ -492,6 +493,7 @@ impl Farm {
         let metrics = self.cache.metrics();
         metrics.sched_queued.set(state.sched.queued_len() as u64);
         metrics.sched_leases.set(state.sched.leases_held() as u64);
+        state.learned.publish(&metrics.estimator_shadow);
     }
 
     /// Operations waiting in the scheduler's queue for a lease, now (read under the
@@ -817,6 +819,7 @@ impl Farm {
         let settled = {
             let mut state = self.lock();
             let answers = state.feed(now, Event::Tick);
+            state.flush_learned();
             self.publish(&state);
             let paused: BTreeSet<WorkerId> = state
                 .machine
@@ -1055,7 +1058,9 @@ impl Dispatch for Farm {
         let waiting = std::time::Instant::now();
         let mut state = self.lock();
         self.cache.metrics().sched_lock_wait.since(waiting);
-        let size_key = (state.learned == LearnedSizes::On)
+        let size_key = state
+            .learned
+            .keys()
             .then(|| {
                 Keyable {
                     instance: &submission.request.key.instance,
@@ -1070,6 +1075,7 @@ impl Dispatch for Farm {
             })
             .flatten();
         state.admit(&submission.request, &usage, size_key)?;
+        let joined = state.sched.twin(&submission.request).is_some();
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
         let waiter = state.machine.submit(Waiter {
@@ -1081,6 +1087,7 @@ impl Dispatch for Farm {
             platform,
         });
         let name = state.machine.name(waiter);
+        state.learn_submit(&name, &submission.request, &submission.evidence, joined);
         if let Some((call, shape)) = submission.call.take().zip(shape) {
             let call = call.with_shape(shape).with_evidence(submission.evidence);
             state.record_submit(call, &name, &submission.request);
@@ -1089,7 +1096,7 @@ impl Dispatch for Farm {
         state.stages.insert(waiter, stage);
         // The operation this submit allocates (none if it joins a twin, which keeps its
         // own key) is named before the submit is fed: its first placement round follows.
-        if let Some(key) = size_key.filter(|_| state.sched.twin(&submission.request).is_none()) {
+        if let Some(key) = size_key.filter(|_| !joined) {
             let next = state.sched.next_operation();
             state.sched.set_size_key(next, key);
         }
@@ -1172,6 +1179,9 @@ impl State {
             exit_code,
             run,
         } = report;
+        // Before the feed: an own-limit kill's requeue writes what it taught the
+        // estimator in its own transaction.
+        self.stage_learning(operation, lease, worker, outcome, measured.as_ref());
         // Taken first: a report that finishes the operation may drop its callers.
         let usage = measured.and_then(|measured| {
             let (_, waiter) = self.first_waiter(operation)?;
@@ -1205,6 +1215,7 @@ impl State {
                 }
             }
         };
+        self.finish_learning(lease, worker, accepted || taken == Taken::Held);
         if accepted && let Some((subject, measured)) = &usage {
             action_usage::log(operation, subject, measured, outcome, lease, worker);
         }
@@ -1273,6 +1284,7 @@ impl State {
     /// answers, for the caller to deliver once the lock is released.
     fn carry_out(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
         self.watch_store(now);
+        self.learned.clock(now);
         // Only the inputs whose callers deliver answers ([`State::feed_quiet`]) release
         // effects an earlier refusal held back: one of them may be an answer.
         let answering = matches!(
@@ -1505,6 +1517,7 @@ impl State {
             },
         };
         self.machine.start(start.lease, sent);
+        self.learned.on_start(&start);
         self.record_started(&start);
     }
 

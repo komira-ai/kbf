@@ -251,6 +251,7 @@ impl Cell {
             None,
             None,
             default_platform,
+            kbf_server::LearnedSizes::Off,
         )
         .await
     }
@@ -271,6 +272,33 @@ impl Cell {
             retention,
             ladder,
             StreamLimits::DEFAULT,
+        )
+        .await
+    }
+
+    /// A cell that books and climbs `ladder` with learned sizes `mode` (`--learned-sizes`),
+    /// keeping its scheduler's state in `state` if given.
+    pub async fn start_learned(
+        mode: kbf_server::LearnedSizes,
+        ladder: MemoryLadder,
+        state: Option<kbf_server::StateStore>,
+    ) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve_with_map(
+            cache,
+            store,
+            None,
+            None,
+            wait,
+            retention,
+            ladder,
+            StreamLimits::DEFAULT,
+            None,
+            state,
+            kbf_front::DefaultPlatform::NONE,
+            mode,
         )
         .await
     }
@@ -311,6 +339,7 @@ impl Cell {
             Some(map),
             None,
             kbf_front::DefaultPlatform::NONE,
+            kbf_server::LearnedSizes::Off,
         )
         .await
     }
@@ -340,6 +369,7 @@ impl Cell {
             None,
             Some(state),
             kbf_front::DefaultPlatform::NONE,
+            kbf_server::LearnedSizes::Off,
         )
         .await
     }
@@ -533,6 +563,7 @@ impl Cell {
             None,
             None,
             kbf_front::DefaultPlatform::NONE,
+            kbf_server::LearnedSizes::Off,
         )
         .await
     }
@@ -551,6 +582,7 @@ impl Cell {
         map: Option<Arc<dyn kbf_mapsync::MapSource>>,
         state: Option<kbf_server::StateStore>,
         default_platform: kbf_front::DefaultPlatform,
+        learned: kbf_server::LearnedSizes,
     ) -> Self {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -563,7 +595,7 @@ impl Cell {
             unservable_wait: wait,
             default_platform,
             memory_ladder: ladder,
-            learned_sizes: kbf_server::LearnedSizes::default(),
+            learned_sizes: learned,
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),
             streams: kbf_server::StreamTiming::default(),

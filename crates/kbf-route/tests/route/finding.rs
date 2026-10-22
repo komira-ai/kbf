@@ -218,7 +218,7 @@ async fn a_durable_question_fails_over_as_a_durable_question() {
 /// (`kbf-durable: wait`), or that carries it when `wait` is false: with `wait` the primary
 /// is asked `find_durable_waiting` (and the RAM-only blob is still reported missing, as
 /// the node's answer after its bound), without it `find_durable`; on a failover the
-/// replica is asked the same waiting question. Mutant: `Ask::durable` ignores `wait`.
+/// replica is asked the same waiting question.
 #[tokio::test]
 async fn a_durable_question_carries_the_wait_to_the_node_it_asks() {
     let map = map(1, 2, active(&[1, 2]));

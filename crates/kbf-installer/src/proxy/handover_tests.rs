@@ -15,6 +15,7 @@ use crate::proxy::handover_swap::NOT_BOUND;
 use crate::proxy::model::Verb;
 use crate::proxy::ports::RootOrders;
 use crate::proxy::record::Fsync;
+use crate::proxy::releases::{self, Local};
 use crate::proxy::root_orders::SpoolRootOrders;
 use crate::testkit::{A, B, c};
 
@@ -29,6 +30,7 @@ fn config(name: &str) -> HandoverConfig {
         state_dir,
         orders_dir: root.join("orders"),
         status_file: root.join("update").join("status.json"),
+        local: None,
         confirm_window_s: 900,
         fetch_timeout_s: 900,
         slots: SlotAddrs {
@@ -292,4 +294,67 @@ fn a_spool_that_cannot_be_opened_is_an_error_that_names_it() {
         }) => {}
         other => panic!("{other:?}"),
     }
+}
+
+/// A configuration for a proxy that keeps its own copies: the status file is its
+/// `releases.json`, in the state directory with the copies.
+fn config_local(name: &str) -> HandoverConfig {
+    let mut cfg = config(name);
+    let local = Local::open(PathBuf::from("/usr/bin/kbf"), &cfg.state_dir).expect("copies");
+    cfg.status_file = cfg.state_dir.join(releases::STATUS);
+    cfg.local = Some(local);
+    cfg
+}
+
+/// Catches seams that open root's order spool for a proxy that keeps its own copies (it owns
+/// no `orders/`, and failing fast on it would keep the proxy down), or an API writer that
+/// writes an order: with a file where `orders/` would be the seams are built, nothing is made
+/// there or in the state directory, the status is the proxy's `releases.json`, and both
+/// orders the API can write are refused with the reason.
+///
+/// Asserts that `parts` opens no spool when `local` is set; that the writer is not a spool;
+/// and that neither writer method answers `Ok`.
+#[test]
+fn with_copies_no_order_spool_is_opened_and_the_apis_writer_refuses_every_order() {
+    let cfg = config_local("copies-no-spool");
+    fs::write(&cfg.orders_dir, b"a file").expect("a file in the way");
+    let text = format!(r#"{{"installed_commit":"{A}"}}"#);
+    fs::write(&cfg.status_file, text).expect("releases.json");
+
+    let mut seams = parts(&cfg).expect("there is no spool to fail on");
+
+    assert_eq!(fs::read(&cfg.orders_dir).expect("untouched"), b"a file");
+    assert!(!cfg.state_dir.join("orders.json").exists(), "a counter");
+    let status = seams.status.read().expect("the proxy's own file");
+    assert_eq!(status.installed_commit, Some(c(A)));
+    let first = seams.orders.write(Verb::FrontendUpdate, &c(B), 900);
+    let source = kbf_update::Source::Fetch;
+    let second = seams.orders.write_update(&c(B), 900, source);
+    for refused in [first, second] {
+        let err = refused.expect_err("an order is refused");
+        assert!(err.0.contains("there is no order spool"), "{}", err.0);
+    }
+}
+
+/// Catches the binary watch being handed to a proxy that does not keep copies, or handed the
+/// wrong copies: `parts_shared` gives a wiring only with `local`, the wiring is that `local`
+/// (the same binary, the same copies and the same orders, not new ones), and the seams are the
+/// same as `parts` builds.
+///
+/// Asserts that the wiring is made only when `local` is set, that it is over the config's own
+/// `Local` (its orders are the config's), and that `parts_shared` builds the seams.
+#[test]
+fn only_a_proxy_with_copies_gets_the_wiring_of_the_binary_watch() {
+    let (seams, none) = parts_shared(&config("no-wiring")).expect("the seams");
+    assert!(none.is_none());
+    assert_eq!(seams.config.window_s, 900);
+
+    let cfg = config_local("wiring");
+    let own = cfg.local.clone().expect("copies");
+    let (seams, some) = parts_shared(&cfg).expect("the seams");
+    let wiring = some.expect("a proxy with copies is watched");
+    assert_eq!(seams.config.window_s, 900);
+    assert_eq!(wiring.local.binary, own.binary);
+    assert!(Arc::ptr_eq(&wiring.local.copies, &own.copies));
+    assert!(Arc::ptr_eq(&wiring.local.orders, &own.orders));
 }

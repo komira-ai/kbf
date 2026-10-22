@@ -128,6 +128,11 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
             "opkey/0000000000000001",
         ),
         fenced(
+            Keys::Under("est/"),
+            "farm/durable (size summaries, written best effort)",
+            "est/6d61696e/6c696e7578/c/0000000000000001/-",
+        ),
+        fenced(
             Keys::Under("subject/"),
             "farm/durable",
             "subject/0000000000000001",

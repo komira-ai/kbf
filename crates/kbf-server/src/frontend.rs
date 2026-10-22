@@ -1054,7 +1054,7 @@ impl<'a> Prepared<'a> {
             listeners.finished_retention,
         )
         .with_memory_ladder(listeners.memory_ladder.clone())
-        .with_learned_sizes(listeners.learned_sizes)
+        .with_learned_sizes(listeners.learned_sizes, listeners.memory_ladder.first())
         .recording(recorder.clone());
         let farm = Arc::new(farm.with_state(state)?);
         log_state(durable, farm.term(), farm.lease_epoch());

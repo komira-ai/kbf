@@ -123,7 +123,7 @@ impl Rig {
             unservable_wait: kbf_sched::UNSERVABLE_WAIT,
             default_platform: kbf_front::DefaultPlatform::NONE,
             memory_ladder: kbf_server::MemoryLadder::default(),
-            learned_sizes: kbf_server::LearnedSizes::default(),
+            learned_sizes: kbf_server::LearnedSizes::Off,
             finished_retention: kbf_sched::FINISHED_RETENTION,
             shutdown_timeout: Duration::from_secs(10),
             streams: kbf_server::StreamTiming::default(),

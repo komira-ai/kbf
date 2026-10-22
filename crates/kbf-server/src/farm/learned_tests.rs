@@ -27,7 +27,7 @@ fn farm_over(store: &Arc<Fake>, mode: LearnedSizes) -> Farm {
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
     )
-    .with_learned_sizes(mode)
+    .with_learned_sizes(mode, 4 << 30)
     .with_state(Some(StateStore {
         store,
         epoch: EpochPolicy::Keep,
@@ -269,7 +269,7 @@ fn a_bad_size_key_row_stops_a_start_only_when_on() {
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
     )
-    .with_learned_sizes(LearnedSizes::On);
+    .with_learned_sizes(LearnedSizes::On, 4 << 30);
     let store: Arc<dyn Store> = store;
     let refused = on.with_state(Some(StateStore {
         store,
