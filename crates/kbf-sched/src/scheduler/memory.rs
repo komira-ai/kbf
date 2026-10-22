@@ -326,6 +326,22 @@ impl<K: Clone + Ord> Floors<K> {
         self.evict();
     }
 
+    /// Lowers `key`'s floor to `ask` (0 forgets it), keeping its place in the order; never
+    /// raises. The stamp it keeps, if the floor changed.
+    fn lower(&mut self, key: &K, ask: u64) -> Option<u64> {
+        let &(before, stamp) = self.asks.get(key)?;
+        if ask >= before {
+            return None;
+        }
+        if ask == 0 {
+            self.asks.remove(key);
+            self.order.remove(&stamp);
+        } else {
+            self.asks.insert(key.clone(), (ask, stamp));
+        }
+        Some(stamp)
+    }
+
     /// Forgets the floors raised longest ago until no more than the bound remain.
     fn evict(&mut self) {
         while self.asks.len() > self.bound {
@@ -473,6 +489,20 @@ impl Scheduler {
             .get(&operation)
             .copied()
             .filter(|_| request.kind == LeaseKind::Action && request.resources.gpus == 0)
+    }
+
+    /// Lowers the key floor of `size_key` to `ask` bytes, or forgets it for 0, once the
+    /// caller has decided it is no longer needed (a floor never falls on its own). Never
+    /// raises. Operations already raised keep what they were given. Returns the floor as
+    /// it stands, for the caller to write down (an `ask` of 0: the row to delete), or
+    /// `None` if there was no floor above `ask`.
+    pub fn lower_key_floor(&mut self, size_key: u64, ask: u64) -> Option<KeyFloor> {
+        let stamp = self.memory.key_floors.lower(&size_key, ask)?;
+        Some(KeyFloor {
+            key: size_key,
+            ask,
+            stamp,
+        })
     }
 
     /// The key floor of `size_key`, in bytes: the memory a queued operation with it

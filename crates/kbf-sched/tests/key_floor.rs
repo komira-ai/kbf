@@ -710,3 +710,40 @@ fn a_floor_raised_again_while_an_operation_waits_raises_it_again() {
     let next = only(f.end(&held, ok()));
     assert_eq!(next.resources.memory_bytes, 32 * GIB);
 }
+
+/// The caller lowers a floor it has decided is no longer needed: a queued operation then
+/// books the lower floor, the lowered floor keeps its place in the order and is handed
+/// back to write down, and a floor is never raised this way or invented for an unknown
+/// key.
+#[test]
+fn a_lowered_key_floor_is_what_the_next_operation_books() {
+    let mut f = farm_with_floor_16();
+    assert_eq!(f.s.lower_key_floor(KEY + 1, 8 * GIB), None, "no such floor");
+    assert_eq!(f.s.lower_key_floor(KEY, 32 * GIB), None, "never raised");
+    assert_eq!(f.s.lower_key_floor(KEY, 16 * GIB), None, "no change");
+    let row = f.s.lower_key_floor(KEY, 8 * GIB).expect("lowered");
+    assert_eq!((row.key, row.ask), (KEY, 8 * GIB));
+    assert_eq!(f.s.key_floor(KEY), Some(8 * GIB));
+    f.submit_keyed(2, request(2, 4 * GIB), KEY);
+    assert_eq!(only(f.tick()).resources.memory_bytes, 8 * GIB);
+    // A floor lowered to nothing is forgotten and leaves the order.
+    let gone = f.s.lower_key_floor(KEY, 0).expect("forgotten");
+    assert_eq!(gone.ask, 0);
+    assert_eq!(f.s.key_floor(KEY), None);
+    f.submit_keyed(3, request(3, 4 * GIB), KEY);
+    assert_eq!(only(f.tick()).resources.memory_bytes, 4 * GIB);
+}
+
+/// A kill after a floor was lowered raises it again from where it stands: the ladder's
+/// rung above the booking that was killed.
+#[test]
+fn a_kill_after_a_lowered_floor_raises_it_again() {
+    let mut f = farm_with_floor_16();
+    f.s.lower_key_floor(KEY, 8 * GIB).expect("lowered");
+    f.submit_keyed(2, request(2, 4 * GIB), KEY);
+    let start = only(f.tick());
+    assert_eq!(start.resources.memory_bytes, 8 * GIB);
+    let rerun = f.killed(&start);
+    assert_eq!(rerun.resources.memory_bytes, 16 * GIB);
+    assert_eq!(f.s.key_floor(KEY), Some(16 * GIB));
+}
