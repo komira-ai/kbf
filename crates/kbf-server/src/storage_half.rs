@@ -38,7 +38,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_front::{CacheStorage, RebuildConfig, SegmentsConfig};
+use kbf_front::{CacheStorage, Hold, RebuildConfig, SegmentsConfig, VerifiedBlob};
 use kbf_mapsync::MapHolder;
 use kbf_meta::Retention;
 use kbf_objstore::FsStore;
@@ -56,6 +56,7 @@ use crate::replication::{REPAIR_DIR, bind_node};
 use crate::serve::{ServeError, StorageListener};
 use crate::start::{AbortOnDrop, open_cold_file, share_storage, tier_bytes};
 use crate::startup_pass::StartPass;
+use crate::storage_node::{Holder, holder_of};
 use crate::storage_node::{StorageFlags, open_cache};
 use crate::stores::{FILE_PREFIX_ROOT, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
@@ -79,9 +80,19 @@ pub struct StorageHalf {
     _joiner: Option<AbortOnDrop>,
     _repair: Option<AbortOnDrop>,
     _metrics: Option<AbortOnDrop>,
+    /// Holds a blob in the one cache: [`StorageHalf::hold`].
+    holder: Holder,
 }
 
 impl StorageHalf {
+    /// Holds `blob` in this node's RAM as the acknowledgement point will (`Cache::hold`),
+    /// and says what became of it (`None`: the node's cache is gone). See
+    /// [`crate::storage_node::StorageHandle::hold`].
+    #[doc(hidden)]
+    pub fn hold(&self, blob: &VerifiedBlob) -> Option<Hold> {
+        (self.holder)(blob)
+    }
+
     /// The storage map the node holds ([`crate::storage_node::StorageHandle::maps`]).
     #[must_use]
     pub fn maps(&self) -> Arc<MapHolder> {
@@ -239,6 +250,7 @@ where
         args.ram_ack_bytes(),
         args.ram_drain_deadline(),
     );
+    let holder = holder_of(&cache);
     let storage: Arc<dyn Storage> = Arc::new(CacheStorage::new(cache, segments));
     // After the log is open: it refuses a directory that holds files it did not write.
     let repair_dir = stores.meta_dir.join(REPAIR_DIR);
@@ -260,5 +272,6 @@ where
         _joiner: node.joiner,
         _repair: node.repair,
         _metrics,
+        holder,
     })
 }

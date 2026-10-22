@@ -41,6 +41,25 @@ fn file_stores(dir: &Path) -> Vec<String> {
     ]
 }
 
+/// Whether any file under `dir` holds `needle`, as bytes anywhere in it.
+fn on_disk(dir: &Path, needle: &[u8]) -> bool {
+    std::fs::read_dir(dir).expect("dir").flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            return on_disk(&path, needle);
+        }
+        let body = std::fs::read(&path).unwrap_or_default();
+        body.windows(needle.len()).any(|w| w == needle)
+    })
+}
+
+/// A blob of a size and content nothing else in the directory has, and its bytes.
+fn marked(seed: u8) -> (kbf_front::VerifiedBlob, Bytes) {
+    let body: Vec<u8> = (0..4096_usize).map(|i| (i % 251) as u8 ^ seed).collect();
+    let bytes = Bytes::from(body);
+    (kbf_front::VerifiedBlob::hashed(bytes.clone()), bytes)
+}
+
 fn never() -> std::io::Result<std::future::Pending<()>> {
     Ok(std::future::pending())
 }
@@ -293,4 +312,32 @@ async fn a_stop_drains_a_write_in_flight() {
         kbf_types::Digest::parse(kbf_types::DigestFunction::Sha256, &format!("{hash}/2048"))
             .expect("digest");
     assert_eq!(held.read_blob(&digest).await.expect("read"), blob);
+}
+
+/// The storage half's own assembly of `--ram-ack-bytes` (it is not `kbf storage`'s): the
+/// half holds a blob with the budget in its cache, and its stop writes it to the disk.
+/// Mutants: the half's assembly leaves out `with_ram_ack_bytes`, or `ram.after(..)`.
+#[tokio::test]
+async fn the_half_with_a_ram_budget_writes_what_it_holds_when_it_stops() {
+    let dir = dir("ram-stop");
+    let mut more = file_stores(&dir);
+    more.extend([
+        "--ram-ack-bytes=1048576".to_owned(),
+        "--ram-drain-deadline=5".to_owned(),
+    ]);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let half = start(&flags(&more), || {
+        Ok(async move {
+            let _ = stopped.await;
+        })
+    })
+    .await
+    .expect("starts");
+    let (blob, bytes) = marked(9);
+    assert!(!on_disk(&dir, &bytes), "not on disk before the hold");
+    assert_eq!(half.hold(&blob), Some(kbf_front::Hold::Held));
+    let serving = tokio::spawn(half.serve());
+    stop.send(()).expect("stop");
+    serving.await.expect("task").expect("serves to the end");
+    assert!(on_disk(&dir, &bytes), "the stop wrote the held blob");
 }
