@@ -119,6 +119,13 @@ fn a_push_trigger_needs_the_whole_chain_of_jobs() {
     // and bump renamed away in turn (each must name the missing job, as the push is present).
     // `triggers` is read alone: the later rules stop at a missing job with an error, and the
     // chain rule must stand on its own when they do not.
+    // The list itself is pinned here, not read back from `CHAIN`: shrinking `CHAIN` must not
+    // shrink this test with it.
+    assert_eq!(
+        CHAIN,
+        ["gates", "plan", "verify", "tag", "publish", "bump"],
+        "the jobs a push needs"
+    );
     let text = real();
     let mut control = Vec::new();
     triggers(&text, &mut control).expect("triggers read");
