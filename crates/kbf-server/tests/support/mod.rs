@@ -565,6 +565,7 @@ impl Cell {
             unservable_wait: wait,
             default_platform,
             memory_ladder: ladder,
+            learned_sizes: kbf_server::LearnedSizes::default(),
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),
             streams: kbf_server::StreamTiming::default(),

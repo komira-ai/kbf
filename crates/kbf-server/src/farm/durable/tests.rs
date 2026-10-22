@@ -221,6 +221,7 @@ fn a_submitted_operation_is_loaded_queued() {
                 subject: Some(a_subject()),
             }],
             floors: Vec::new(),
+            key_floors: Vec::new(),
             cordons: Vec::new(),
         }
     );
@@ -1577,4 +1578,194 @@ fn a_fate_that_cannot_be_written_or_read_is_refused() {
     put(&store, "fate/0000000000000004", vec![3]);
     let error = durable.load().expect_err("a fate of another version");
     assert!(error.to_string().contains("not a version 1 or 2 fate"));
+}
+
+fn keyed(tag: u8, key: u64) -> Request {
+    Request {
+        size_key: Some(key),
+        ..request(tag)
+    }
+}
+
+fn a_key_floor(key: u64, stamp: u64) -> kbf_sched::KeyFloor {
+    kbf_sched::KeyFloor {
+        key,
+        ask: 16 << 30,
+        stamp,
+    }
+}
+
+fn key_floor_rows(store: &Flaky) -> usize {
+    keys(store)
+        .iter()
+        .filter(|k| k.starts_with("keyfloor/"))
+        .count()
+}
+
+/// Catches: a key floor not written with the requeue that raises it (a successor would
+/// book the old size again), one lost because its operation ended first, a forgotten key
+/// not deleted (or deleted after being raised again), key floors read in another order
+/// than written, and a key floor row confused with a digest floor's (an older binary
+/// reads the `floor/` prefix and must never meet one).
+#[test]
+fn a_key_floor_is_written_with_the_requeue_and_forgotten_with_its_eviction() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted(OperationId(1), &keyed(1, 7), &a_subject())
+        .expect("submit");
+    durable
+        .persist(&[Effect::Start(start(1, 10))], None)
+        .expect("grant");
+    let change = FloorChange {
+        raised: Some(a_floor(1, 0)),
+        key_raised: Some(a_key_floor(7, 0)),
+        ..FloorChange::default()
+    };
+    durable
+        .requeued(&killed(1, 10), None, None, &change)
+        .expect("a kill");
+    let stored = durable.load().expect("load");
+    assert_eq!(stored.key_floors, vec![a_key_floor(7, 0)]);
+    assert_eq!(stored.floors, vec![a_floor(1, 0)]);
+    assert_eq!(stored.operations[0].request.size_key, Some(7));
+    assert_eq!(floor_rows(&store), 1, "one digest floor row");
+    assert_eq!(key_floor_rows(&store), 1);
+
+    // Raised again, with another key: two rows; the operation has ended by now.
+    let both = FloorChange {
+        key_raised: Some(a_key_floor(8, 1)),
+        ..FloorChange::default()
+    };
+    durable
+        .requeued(&killed(9, 90), None, None, &both)
+        .expect("an operation that is gone");
+    assert_eq!(
+        durable.load().expect("load").key_floors,
+        vec![a_key_floor(7, 0), a_key_floor(8, 1)]
+    );
+
+    // Key 9 forgets key 7; key 8 is forgotten and raised again in one change, and keeps
+    // its row.
+    let forgetting = FloorChange {
+        key_raised: Some(a_key_floor(8, 3)),
+        key_evicted: vec![7, 8],
+        ..FloorChange::default()
+    };
+    durable
+        .requeued(&killed(9, 90), None, None, &forgetting)
+        .expect("a forgotten key");
+    assert_eq!(
+        durable.load().expect("load").key_floors,
+        vec![a_key_floor(8, 3)]
+    );
+    // A change with nothing to write writes nothing.
+    durable
+        .requeued(&requeue(9, 0), None, None, &FloorChange::default())
+        .expect("nothing");
+    assert_eq!(key_floor_rows(&store), 1);
+}
+
+/// The rollback test: the binary before format 6 loads a store that holds queued
+/// requests and floors written without `--learned-sizes=on`, and it stops (a corrupt
+/// row, which a start refuses) on one written with it, which the machine version fence
+/// keeps from being written while such a binary can still run. Catches: a request with
+/// no size key written in format 6 (a rolled-back binary would fail on a store that
+/// never had the flag on), a keyed request written in format 1 (the key dropped, or the
+/// write refused), a reader that cannot read both, and key floors under the `floor/`
+/// prefix an older binary scans.
+#[test]
+fn only_a_keyed_row_is_beyond_the_binary_before_format_6() {
+    use kbf_log::{Format, LogCommand, decode};
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted(OperationId(1), &request(1), &a_subject())
+        .expect("submit");
+    durable
+        .submitted(OperationId(2), &keyed(2, 7), &a_subject())
+        .expect("submit");
+    durable
+        .requeued(
+            &killed(1, 0),
+            None,
+            None,
+            &FloorChange {
+                raised: Some(a_floor(1, 0)),
+                key_raised: Some(a_key_floor(7, 0)),
+                ..FloorChange::default()
+            },
+        )
+        .expect("a kill");
+    let rows = store.scan_prefix("op/").expect("scan");
+    let read = |format, i: usize| decode(format, &rows[i].1.value);
+    // The unkeyed row: format 1 bytes, read by every format.
+    for format in [Format::V1, Format::V5, Format::V6] {
+        assert!(
+            matches!(read(format, 0), Ok(LogCommand::Farm(_))),
+            "{format:?}"
+        );
+    }
+    assert_eq!(
+        rows[0].1.value,
+        kbf_log::encode(
+            Format::V1,
+            &LogCommand::Farm(kbf_log::FarmBatch {
+                now: kbf_types::FarmTime::default(),
+                wall: std::time::UNIX_EPOCH,
+                inputs: vec![kbf_log::FarmInput::Submit(request(1))],
+            })
+        )
+        .expect("format 1")
+    );
+    // The keyed row: not a format-5 entry.
+    assert!(read(Format::V5, 1).is_err());
+    assert!(read(Format::V1, 1).is_err());
+    assert!(matches!(read(Format::V6, 1), Ok(LogCommand::Farm(_))));
+    // What the older binary scans for floors holds digest floors only.
+    let scanned = store.scan_prefix("floor/").expect("scan");
+    assert_eq!(scanned.len(), 1);
+    assert!(floor::decode(&scanned[0].1.value).is_ok());
+}
+
+/// Catches a key floor row read as anything but what was written: another version, a
+/// row cut short or with bytes after it, a row under another key's name, and two rows
+/// with one stamp.
+#[test]
+fn a_key_floor_row_that_is_not_one_is_refused() {
+    let floor = a_key_floor(7, 5);
+    let row = floor::encode_key(&floor);
+    assert_eq!(floor::decode_key(&row), Ok(floor));
+    let mut other = row.clone();
+    other[0] = 2;
+    assert!(floor::decode_key(&other).is_err());
+    for cut in 0..row.len() {
+        assert!(floor::decode_key(&row[..cut]).is_err(), "{cut}");
+    }
+    let mut longer = row.clone();
+    longer.push(0);
+    assert!(floor::decode_key(&longer).is_err());
+
+    let store = Flaky::new();
+    let durable = open(&store);
+    store
+        .inner
+        .txn(Txn::new().put(floor::key_row(8), row.clone(), Cond::Any))
+        .expect("write")
+        .expect("applied");
+    let error = durable.load().expect_err("under another key's name");
+    assert!(error.to_string().contains("not the key"), "{error}");
+    let store = Flaky::new();
+    let durable = open(&store);
+    for key in [7, 8] {
+        let mut same = row.clone();
+        same[1..9].copy_from_slice(&u64::to_be_bytes(key));
+        store
+            .inner
+            .txn(Txn::new().put(floor::key_row(key), same, Cond::Any))
+            .expect("write")
+            .expect("applied");
+    }
+    let error = durable.load().expect_err("one stamp twice");
+    assert!(error.to_string().contains("stamp"), "{error}");
 }

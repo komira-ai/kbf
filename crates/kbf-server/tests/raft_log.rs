@@ -1046,3 +1046,26 @@ impl Fs for AppendAtListing {
         self.inner.sync_dir()
     }
 }
+
+/// Catches the gate for `Request::size_key` (machine version 6) admitting too much or too
+/// little: a log of one voter below 6 is raised to it and says yes, again says yes
+/// without committing a second raise, a version this binary does not run is refused,
+/// and the plain `MetaLog` default (a log of this process alone, with no group) says
+/// no.
+#[tokio::test]
+async fn a_single_voter_log_is_raised_to_admit_the_size_key() {
+    use kbf_front::MetaLog;
+    let fs = FaultFs::new();
+    let log = open(&fs, 6).await;
+    assert_eq!(MetaLog::machine_version(&log), Some(1));
+    assert!(MetaLog::admit_machine_version(&log, 6));
+    assert_eq!(log.machine_version(), MachineVersion::V6);
+    assert_eq!(MetaLog::machine_version(&log), Some(6));
+    let after = log.applied_index();
+    assert!(MetaLog::admit_machine_version(&log, 6));
+    assert_eq!(log.applied_index(), after, "a raise committed twice");
+    assert!(!MetaLog::admit_machine_version(&log, 7), "past what runs");
+    let memory = kbf_front::MemoryMetaLog::new(Retention::default());
+    assert_eq!(memory.machine_version(), None);
+    assert!(!memory.admit_machine_version(6));
+}

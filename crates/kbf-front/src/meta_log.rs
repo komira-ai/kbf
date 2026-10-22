@@ -45,6 +45,22 @@ pub trait MetaLog: Send + Sync + 'static {
     fn leadership(&self) -> Option<Leadership> {
         None
     }
+
+    /// The machine version the log's group has committed, for a log that outlives the
+    /// process and is shared by the replicas of a farm (`kbf-server`'s `RaftMetaLog`):
+    /// what a field only a newer binary reads may be written under. `None`, the
+    /// default, for a log of this process alone, which no other binary reads.
+    fn machine_version(&self) -> Option<u32> {
+        None
+    }
+
+    /// Whether the log is at machine version `to` or later, raising it first when this
+    /// process may (a log of one voter, where no replica is left to refuse it). `false`
+    /// for a log with no machine version, and for one of several voters below `to`: the
+    /// operator raises that once every replica runs a binary that reads it.
+    fn admit_machine_version(&self, _to: u32) -> bool {
+        false
+    }
 }
 
 /// What [`MetaLog::leadership`] names: a durable log's id, and the term of its

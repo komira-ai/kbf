@@ -117,6 +117,8 @@ default-platform = "linux/x86_64"
 finished-retention-secs = 60
 # The heartbeat interval daemons are asked for, in milliseconds, at most half the window in which a daemon may act on a `Start` (each `Start` names the newest heartbeat the server took, so a longer interval would leave it too little)
 heartbeat-interval-ms = 5000
+# Whether the farm learns action sizes from earlier runs: `off` (the default) books as it always did; `shadow` observes without booking differently; `on` lets a kill at an action's own memory limit leave a floor under the action's key (instance, platform class, instrument and shape), which every later digest of the key, queued or new, books at least, strictly below the memory of the largest node that could run it. Only an action whose memory the client did not name, whose platform pins the OS, is keyed. `on` writes a field older binaries do not read, so it keys requests only while the metadata log is at machine version 6 (one raised to it can no longer be read by an older binary); below that it behaves as `off` and says so at start
+learned-sizes = "off"
 # How often, in seconds, every open Execute and WaitExecution stream is sent its operation again (same name, not done, current stage), so a load balancer's idle timeout never cuts a long action. 0 sends none
 progress-interval-secs = 30
 # How long, in milliseconds, `GET /readyz` on the operator API and the REAPI listener's `grpc.health.v1` service wait for the object store to answer their read-only probe before they answer not ready

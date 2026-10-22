@@ -311,6 +311,18 @@ pub struct Args {
         default_values_t = kbf_sched::MemoryLadder::DEFAULT_GIB
     )]
     pub memory_ladder_gib: Vec<u64>,
+    /// Whether the farm learns action sizes from earlier runs: `off` (the default) books
+    /// as it always did; `shadow` observes without booking differently; `on` lets a kill
+    /// at an action's own memory limit leave a floor under the action's key (instance,
+    /// platform class, instrument and shape), which every later digest of the key, queued
+    /// or new, books at least, strictly below the memory of the largest node that could
+    /// run it. Only an action whose memory the client did not name, whose platform pins
+    /// the OS, is keyed. `on` writes a field older binaries do not read, so it keys
+    /// requests only while the metadata log is at machine version 6 (one raised to it
+    /// can no longer be read by an older binary); below that it behaves as `off` and
+    /// says so at start.
+    #[arg(long, default_value_t = crate::LearnedSizes::Off)]
+    pub learned_sizes: crate::LearnedSizes,
     /// How long, in seconds, a finished operation is kept after its callers are
     /// answered. Within it, WaitExecution on the operation's name streams its result
     /// (a client whose Execute stream broke gets a result the action cache does not
@@ -798,6 +810,7 @@ impl Args {
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
             default_platform: self.default_platform,
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
+            learned_sizes: self.learned_sizes,
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: match self.shutdown_timeout_secs {
                 0 => Duration::MAX,

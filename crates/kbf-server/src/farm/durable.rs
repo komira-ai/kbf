@@ -33,6 +33,11 @@
 //!   an operation. A successor loads them all, oldest stamp first, and raises past the
 //!   largest stamp, so the order of eviction survives a reload. They have no expiry;
 //!   in memory they have none either;
+//! - `keyfloor/<key>`: a key floor, the least memory a request carrying the size key
+//!   books at a placement round ([`kbf_sched::KeyFloor`]): the ask and a stamp, written
+//!   in the transaction of the requeue that raises it beside the `floor/` row, deleted
+//!   in the one that forgets it. A store that was never `--learned-sizes=on` has none,
+//!   and an older binary does not read the prefix;
 //! - `subject/<operation>`: what the operation's `action usage:` line says it is (the
 //!   shape key, configuration hash, target and the client's mnemonic and target hint,
 //!   [`crate::action_usage::Subject`]), written in the submission's transaction beside
@@ -68,8 +73,8 @@ use kbf_front::{Described, Finished, Stage};
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
 use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{
-    DaemonInstance, Fate, Floor, FloorChange, Recovered, RecoveredLease, Request, Requeue,
-    RequeueReason,
+    DaemonInstance, Fate, Floor, FloorChange, KeyFloor, Recovered, RecoveredLease, Request,
+    Requeue, RequeueReason,
 };
 use kbf_state::{Cond, Conflict, GENERATION, Store, StoreError, Txn, Versioned};
 use kbf_types::{
@@ -84,6 +89,7 @@ use super::{
     Detail, Farm, FarmMachine, Reported, Sent, Stamp, State, Waiter, finished_of, process_term,
     refused_as,
 };
+use crate::LearnedSizes;
 use crate::action_usage::Subject;
 use crate::machine::Platform;
 use crate::state_store::StateStore;
@@ -102,6 +108,7 @@ const NEXT_SEQ: &str = "meta/next_seq";
 const CORDON: &str = "cordon/";
 const FATE: &str = "fate/";
 const FLOOR: &str = "floor/";
+const KEY_FLOOR: &str = "keyfloor/";
 const SUBJECT: &str = "subject/";
 
 /// The least time a `done/` row is kept, whatever the finished retention: a process that
@@ -164,6 +171,8 @@ pub(super) struct Stored {
     pub operations: Vec<StoredOperation>,
     /// Every memory floor, in key order.
     pub floors: Vec<Floor>,
+    /// Every key floor, in key order.
+    pub key_floors: Vec<KeyFloor>,
     /// Every node an operator placed, in node-id order.
     pub cordons: Vec<(WorkerId, StoredCordon)>,
 }
@@ -375,11 +384,17 @@ fn encode(input: FarmInput) -> Result<Vec<u8>, StateError> {
         wall: UNIX_EPOCH,
         inputs: vec![input],
     };
-    Ok(kbf_log::encode(Format::V1, &LogCommand::Farm(batch))?)
+    // A row is written in the first format that holds it, so a store with no keyed
+    // request holds the bytes it always did and an older binary reads it. A request that
+    // carries a size key is format 6.
+    let keyed = matches!(&batch.inputs[..], [FarmInput::Submit(r)] if r.size_key.is_some());
+    let format = if keyed { Format::V6 } else { Format::V1 };
+    Ok(kbf_log::encode(format, &LogCommand::Farm(batch))?)
 }
 
 fn decode(key: &str, bytes: &[u8]) -> Result<FarmInput, StateError> {
-    match kbf_log::decode(Format::V1, bytes) {
+    // Format 6 reads every row a format-1 writer wrote, byte for byte.
+    match kbf_log::decode(Format::V6, bytes) {
         Ok(LogCommand::Farm(FarmBatch { mut inputs, .. })) if inputs.len() == 1 => {
             Ok(inputs.remove(0))
         }
@@ -495,6 +510,18 @@ impl Durable {
             }
             floors.push(floor);
         }
+        let mut key_floors = Vec::new();
+        let mut key_stamps = std::collections::BTreeSet::new();
+        for (key, row) in self.store.scan_prefix(KEY_FLOOR)? {
+            let floor = floor::decode_key(&row.value).map_err(|why| corrupt(&key, why))?;
+            if key != floor::key_row(floor.key) {
+                return Err(corrupt(&key, "not the key of the key floor it holds"));
+            }
+            if !key_stamps.insert(floor.stamp) {
+                return Err(corrupt(&key, "a stamp another key floor has"));
+            }
+            key_floors.push(floor);
+        }
         let mut operations = Vec::new();
         for (key, row) in self.store.scan_prefix("op/")? {
             let request = request_row(&key, &row)?;
@@ -514,6 +541,7 @@ impl Durable {
             next_seq: self.counter(NEXT_SEQ)?,
             operations,
             floors,
+            key_floors,
             cordons: self.cordons()?,
         })
     }
@@ -678,8 +706,28 @@ impl Durable {
         {
             txn = txn.delete(floor::row_key(key), Cond::Any);
         }
+        // The same for the key floor, in the same transaction.
+        let key_raised = floors.key_raised.as_ref();
+        if let Some(floor) = key_raised {
+            txn = txn.put(
+                floor::key_row(floor.key),
+                floor::encode_key(floor),
+                Cond::Any,
+            );
+        }
+        for key in floors
+            .key_evicted
+            .iter()
+            .filter(|k| key_raised.is_none_or(|f| f.key != **k))
+        {
+            txn = txn.delete(floor::key_row(*key), Cond::Any);
+        }
+        let floors_changed = raised.is_some()
+            || !floors.evicted.is_empty()
+            || key_raised.is_some()
+            || !floors.key_evicted.is_empty();
         if self.store.get(&op_key(requeue.operation))?.is_none() {
-            return if raised.is_some() || !floors.evicted.is_empty() {
+            return if floors_changed {
                 self.commit(txn)
             } else {
                 Ok(())
@@ -1149,6 +1197,11 @@ impl State {
     /// a caller of its own that no client waits on, which the next request for the
     /// action joins.
     fn take_stored(&mut self, mut op: StoredOperation, now: SystemTime) -> Recovered {
+        // Only `on` reads a size key: an operation queued while it was `on` keeps the
+        // memory its key floor raised it to, and is no longer a member of its key.
+        if self.learned.mode != LearnedSizes::On {
+            op.request.size_key = None;
+        }
         let key = op.request.key.clone();
         let waiter = self.machine.submit(Waiter {
             key: key.clone(),
@@ -1200,6 +1253,7 @@ impl State {
         }
         let next_operation = OperationId(stored.next_operation);
         self.sched.restore_floors(stored.floors);
+        self.sched.restore_key_floors(stored.key_floors);
         self.sched
             .recover(epoch, next_operation, stored.next_seq, recovered);
         self.restore_cordons(stored.cordons);

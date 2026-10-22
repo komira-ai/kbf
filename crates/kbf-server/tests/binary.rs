@@ -1240,6 +1240,33 @@ fn the_default_platform_comes_from_its_flag() {
     }
 }
 
+/// Catches: `--learned-sizes` not parsed into the listeners (a farm that ignores it never
+/// keys a request), a default other than `off` (the flag changes a booking only when an
+/// operator sets it), a value other than `off`, `shadow` and `on` accepted.
+#[test]
+fn learned_sizes_come_from_their_flag() {
+    use clap::Parser;
+    use kbf_server::LearnedSizes;
+    let parse = |args: &[&str]| {
+        kbf_server::Args::try_parse_from(std::iter::once("kbf-server").chain(args.iter().copied()))
+    };
+    let sizes = |args: &[&str]| {
+        parse(args)
+            .expect("flags parse")
+            .listeners()
+            .expect("listeners")
+            .learned_sizes
+    };
+    assert_eq!(sizes(&[]), LearnedSizes::Off);
+    assert_eq!(sizes(&["--learned-sizes", "off"]), LearnedSizes::Off);
+    assert_eq!(sizes(&["--learned-sizes=shadow"]), LearnedSizes::Shadow);
+    assert_eq!(sizes(&["--learned-sizes", "on"]), LearnedSizes::On);
+    for bad in ["", "ON", "true", "yes", "1"] {
+        let err = parse(&["--learned-sizes", bad]).expect_err(bad);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{bad}");
+    }
+}
+
 /// Catches: `--memory-ladder-gib` not parsed into the listeners' ladder (a farm that
 /// ignores it books 4 GiB whatever the operator set), a default other than 4, 16 and
 /// 32 GiB, a comma that does not separate rungs, and a ladder that is not ascending

@@ -77,6 +77,7 @@ pub use phase::Reported;
 
 use self::ack::{Verdict, refusal};
 use self::durable::Durable;
+use crate::LearnedSizes;
 use crate::action_usage::{self, Measured, Shapes};
 use crate::fault;
 use crate::fleet::{NodeView, SoftwareView, attention_changes};
@@ -84,6 +85,7 @@ use crate::machine::{FarmMachine, Platform, Sent, Waiter};
 use crate::memory;
 use crate::missing;
 use crate::run_record;
+use crate::size_key::Keyable;
 use crate::stamp::Stamp;
 use crate::update_status::{HostUpdate, UpdateReport};
 
@@ -133,6 +135,20 @@ pub struct Farm {
     /// `Result`s being taken now ([`Farm::report`]): a handover waits for none to be.
     reports: AtomicUsize,
     state: Mutex<State>,
+}
+
+/// What `--learned-sizes` says and whether the log admits the field it writes.
+#[derive(Clone, Copy, Debug, Default)]
+struct Learned {
+    mode: LearnedSizes,
+    admitted: bool,
+}
+
+impl Learned {
+    /// Whether a request is keyed: `on`, with the field admitted.
+    fn keys(self) -> bool {
+        self.mode == LearnedSizes::On && self.admitted
+    }
 }
 
 /// An operator action named a node that never registered.
@@ -304,6 +320,9 @@ struct State {
     held_cap: usize,
     /// The scheduler was told the state store is unavailable ([`State::watch_store`]).
     store_down: bool,
+    /// What `--learned-sizes` says, and whether requests are keyed with it
+    /// ([`Farm::with_learned_sizes`]).
+    learned: Learned,
     /// When each node's session row in the state store was last written.
     renewed: BTreeMap<WorkerId, FarmTime>,
     /// A handover took the work from this farm ([`Farm::fence`]): it feeds the scheduler
@@ -412,6 +431,7 @@ impl Farm {
                 write_drops: 0,
                 held_cap: HELD_CAP,
                 store_down: false,
+                learned: Learned::default(),
                 renewed: BTreeMap::new(),
                 fenced: false,
                 untraced_kept: BTreeMap::new(),
@@ -426,6 +446,16 @@ impl Farm {
     pub fn with_memory_ladder(mut self, ladder: MemoryLadder) -> Self {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         state.sched.set_memory_ladder(ladder);
+        self
+    }
+
+    /// This farm, learning sizes as `mode` says. `admitted` is whether the metadata log's
+    /// group admits the `size_key` field (machine version 6): only then does `on` key
+    /// requests, so no binary that cannot read the field meets it.
+    #[must_use]
+    pub fn with_learned_sizes(mut self, mode: LearnedSizes, admitted: bool) -> Self {
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        state.learned = Learned { mode, admitted };
         self
     }
 
@@ -1030,9 +1060,23 @@ impl Dispatch for Farm {
             .subject(std::mem::take(&mut submission.described));
         let shape = submission.call.as_ref().map(|_| usage.recorded());
         let now = self.now();
+        let platform = Platform::of(&submission.request.needs);
         let waiting = std::time::Instant::now();
         let mut state = self.lock();
         self.cache.metrics().sched_lock_wait.since(waiting);
+        if state.learned.keys() {
+            submission.request.size_key = Keyable {
+                instance: &submission.request.key.instance,
+                platform: &platform,
+                shape: usage.key,
+                kind: submission.request.kind,
+                gpus: submission.request.resources.gpus,
+                memory: submission.evidence.memory_source,
+            }
+            .key();
+        } else {
+            submission.request.size_key = None;
+        }
         state.admit(&submission.request, &usage)?;
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
@@ -1042,7 +1086,7 @@ impl Dispatch for Farm {
             do_not_cache: submission.request.do_not_cache,
             queued: SystemTime::now(),
             usage,
-            platform: Platform::of(&submission.request.needs),
+            platform,
         });
         let name = state.machine.name(waiter);
         if let Some((call, shape)) = submission.call.take().zip(shape) {
@@ -1650,5 +1694,7 @@ fn unrun(outcome: Outcome, farm_runs: &[FarmRun]) -> Finished {
     }
 }
 
+#[cfg(test)]
+mod learned_tests;
 #[cfg(test)]
 mod tests;
