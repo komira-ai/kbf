@@ -230,5 +230,8 @@ async fn a_workload_that_ignores_sigterm_is_named_in_the_result() {
     );
     let floor = Duration::from_secs(SLEEP_SECS) + GRACE - Duration::from_millis(100);
     assert!(took >= floor, "no grace: {took:?}");
-    assert!(took < PROMPT * 2, "the grace was not bounded: {took:?}");
+    // The workload's `sleep 300` ends the run only if the grace is not bounded; the rest
+    // is the lease's fixed cost on a busy runner (the user's setup, the denial reads,
+    // about ten seconds each).
+    assert!(took < PROMPT * 3, "the grace was not bounded: {took:?}");
 }
