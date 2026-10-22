@@ -256,7 +256,13 @@ fn the_cluster_help_and_the_hint_name_every_verb_group() {
         );
     }
     let (_, top, _) = kbf(&["--help"]);
-    for word in ["member", "safe-to-stop", "denied", "finalize", "object-store"] {
+    for word in [
+        "member",
+        "safe-to-stop",
+        "denied",
+        "finalize",
+        "object-store",
+    ] {
         assert!(top.contains(word), "{word} missing from the hint: {top}");
     }
 }
