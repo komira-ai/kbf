@@ -35,7 +35,7 @@ fn the_report_names_its_arms_its_funnel_and_its_limits() {
         "training window",
         "SCORED window",
         "own-limit kills per 1000 attempts: ",
-        "ladder climbs per 1000 operations: ",
+        "operations that climbed the ladder (killed at least once), per 1000: ",
         "queue wait p50 ",
         "backlog drain after each day: ",
         "resolved at L1 ",
@@ -86,7 +86,7 @@ fn only_the_days_after_training_are_scored() {
         "{null}"
     );
     assert!(
-        null.contains("ladder climbs per 1000 operations: 5/5 "),
+        null.contains("operations that climbed the ladder (killed at least once), per 1000: 5/5 "),
         "{null}"
     );
     let floor_at = text.find("arm: key floor").unwrap();

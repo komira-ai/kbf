@@ -49,8 +49,9 @@ fn write_section(out: &mut String, name: &str, s: &Section) {
     );
     let _ = writeln!(
         out,
-        "    ladder climbs per 1000 operations: {}",
-        rate(s.climbs)
+        "    operations that climbed the ladder (killed at least once), per 1000: {}; own-limit kills in all: {}",
+        rate(s.climbed),
+        s.kills.hits
     );
     match s.waits {
         Some(w) => {

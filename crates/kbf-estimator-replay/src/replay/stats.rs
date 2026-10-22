@@ -91,8 +91,8 @@ pub struct Section {
     pub refused: u64,
     /// Attempts, and how many were own-limit kills: per 1000 attempts.
     pub kills: Rate,
-    /// Kills out of operations: ladder climbs per 1000 operations.
-    pub climbs: Rate,
+    /// Operations that were killed at least once (climbed the ladder), out of operations.
+    pub climbed: Rate,
     /// Queue wait (queued to started) of every attempt; `None` for no attempts.
     pub waits: Option<Waits>,
     /// For each day of the window, the time after its end until every operation that had
@@ -135,16 +135,20 @@ pub fn section(run: &ArmRun, w: Window) -> Section {
         }
     }
     let mut waits = Vec::new();
+    let mut killed_ops = std::collections::BTreeSet::new();
     for a in &run.attempts {
         if in_window.binary_search(&a.op).is_err() {
             continue;
         }
         s.kills.of += 1;
         s.kills.hits += u64::from(a.killed);
+        if a.killed {
+            killed_ops.insert(a.op);
+        }
         waits.push(a.started_ms - a.queued_ms);
     }
-    s.climbs = Rate {
-        hits: s.kills.hits,
+    s.climbed = Rate {
+        hits: killed_ops.len() as u64,
         of: s.ops,
     };
     waits.sort_unstable();

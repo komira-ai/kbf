@@ -346,3 +346,17 @@ fn an_arrival_at_the_instant_an_attempt_ends_learns_it() {
         "one second before it ended"
     );
 }
+
+/// Catches an operation killed twice counted as two operations that climbed: kills are
+/// counted per attempt, climbing operations per operation (a proportion, so its interval
+/// is valid).
+#[test]
+fn an_operation_killed_twice_climbed_once() {
+    let r = run(
+        &trace(vec![op("main", 1, 0, 30 * GIB, 10, 10)], &big()),
+        Arm::Null,
+    );
+    let s = section(&r, Window { first: 1, last: 1 });
+    assert_eq!((s.kills.hits, s.kills.of), (2, 3));
+    assert_eq!((s.climbed.hits, s.climbed.of), (1, 1));
+}
