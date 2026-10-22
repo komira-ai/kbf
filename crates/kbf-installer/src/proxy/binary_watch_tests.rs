@@ -5,8 +5,7 @@
 //! the swap is a fake that records the start it is given, except in the last test, where it is
 //! the real [`Handover`] over the swap rig.
 //!
-//! Each "Mutants it catches" line names a change to the code that the test is written to turn
-//! red. They are the reason the test exists, not a record that anyone ran them.
+//! Each "Asserts" line says in plain words what the test checks about the behaviour.
 
 use std::fs::OpenOptions;
 use std::net::SocketAddr;
@@ -303,9 +302,10 @@ impl Bench {
 /// one swap, `A` to `B`, with `nodes` off, the source `staged` and the update id of the commit
 /// and the second; every later poll does nothing.
 ///
-/// Mutants it catches: acting on the first poll; never acting; the identity not consumed (a
-/// second start); the facts staged not those of the probe; `nodes` on; the source `fetch`; the
-/// update id made of the whole commit or without the time; the copy not made.
+/// Asserts that nothing happens on the first poll, that the action comes on the second, that
+/// the identity is consumed (no second start), that the facts staged are those of the probe,
+/// that `nodes` is off, that the source is not `fetch`, that the update id is made of the
+/// short commit and the time, and that the copy is made.
 #[test]
 fn a_new_binary_starts_exactly_one_swap_after_two_equal_polls() {
     let mut bench = Bench::new("start", Some(A), usize::MAX);
@@ -351,8 +351,8 @@ type Change = fn(&Bench);
 /// same file, whichever of its modification time (seconds, or only the fraction), its size or
 /// its inode is what changed, so the poll after the change waits and the one after that acts.
 ///
-/// Mutants it catches: an identity without the seconds, the nanoseconds, the size or the inode;
-/// the comparison against the first poll, not the last.
+/// Asserts that the identity holds the seconds, the nanoseconds, the size and the inode, and
+/// that each poll is compared with the last poll, not the first.
 #[test]
 fn a_change_of_any_part_of_the_identity_makes_the_next_poll_wait() {
     let changes: [(&str, Change); 4] = [
@@ -379,8 +379,8 @@ fn a_change_of_any_part_of_the_identity_makes_the_next_poll_wait() {
 /// and none acts; the fifth sees the fourth's file and acts. A file that is moved away and put
 /// back is new to the watch, though it is the very same file (the same inode and time).
 ///
-/// Mutants it catches: acting when the identity changed; a file that cannot be read keeping the
-/// last identity.
+/// Asserts that nothing is done while the identity changes, and that a file that cannot be
+/// read leaves no identity behind.
 #[test]
 fn a_file_still_being_written_or_gone_starts_the_two_polls_over() {
     let mut bench = Bench::new("half", Some(A), usize::MAX);
@@ -408,8 +408,8 @@ fn a_file_still_being_written_or_gone_starts_the_two_polls_over() {
 /// staged or started; when it is not busy any more the very next poll starts the swap, which
 /// it could not if the identity had been consumed meanwhile.
 ///
-/// Mutants it catches: the identity consumed while busy; the busy answer not asked; the kbf
-/// run or copied before it is asked.
+/// Asserts that the identity is kept while the swap is busy, that the busy answer is asked, and
+/// that the kbf is neither run nor copied before it is asked.
 #[test]
 fn a_swap_in_flight_leaves_the_change_pending_until_it_can_start() {
     let mut bench = Bench::new("busy", Some(A), usize::MAX);
@@ -438,8 +438,9 @@ fn a_swap_in_flight_leaves_the_change_pending_until_it_can_start() {
 /// staged, copied or started, and the later polls do not run it again. A new file that is
 /// still `A` is read once more.
 ///
-/// Mutants it catches: a swap started to the serving commit; the identity not consumed (the kbf
-/// is run at every poll); the same-commit answer made after the copy and the stage.
+/// Asserts that no swap is started to the serving commit, that the identity is consumed (the
+/// kbf is not run at every poll), and that the same-commit answer comes before the copy and
+/// the stage.
 #[test]
 fn the_release_that_serves_is_not_swapped_to() {
     let mut bench = Bench::new("same", Some(A), usize::MAX);
@@ -467,8 +468,8 @@ fn the_release_that_serves_is_not_swapped_to() {
 /// the kbf said, and a record that cannot be written are each a failed pass that says which,
 /// start no swap, stage nothing and leave no copy that is not whole.
 ///
-/// Mutants it catches: any of these taken for success; a failure that leaves a partial copy; the
-/// reason of a failure dropped.
+/// Asserts that each of these is a failure, that a failure leaves no partial copy, and that the
+/// reason of a failure is kept.
 #[test]
 fn a_kbf_that_cannot_be_used_is_a_failed_pass_that_says_why_and_changes_nothing() {
     let short = format!("short {B}");
@@ -531,8 +532,8 @@ fn a_kbf_that_cannot_be_used_is_a_failed_pass_that_says_why_and_changes_nothing(
 /// 300 s later, and every 300 s after that, and nothing is run in between; when it works again
 /// the very file that failed is acted on, with no change to it.
 ///
-/// Mutants it catches: no wait (the kbf is run at every poll); a wait that does not double or
-/// has no cap; a failure that consumes the identity (it is never tried again).
+/// Asserts that there is a wait (the kbf is not run at every poll), that the wait doubles and
+/// has a cap, and that a failure does not consume the identity (it is tried again).
 #[test]
 fn a_failed_identity_is_tried_again_after_a_doubling_wait_up_to_the_cap() {
     let broken = Arc::new(AtomicBool::new(false));
@@ -572,8 +573,8 @@ fn a_failed_identity_is_tried_again_after_a_doubling_wait_up_to_the_cap() {
 /// its own first failure waits the first wait again (10 s), not the second; a third file that
 /// works is started at its second poll.
 ///
-/// Mutants it catches: the wait not reset when the identity changes; only the time of the wait
-/// reset, with the count of failures kept (the second file would wait 20 s).
+/// Asserts that the wait is reset when the identity changes, both its time and the count of
+/// failures (the second file does not wait 20 s).
 #[test]
 fn a_different_file_is_tried_at_once_even_after_failures() {
     let mut bench = Bench::new("fresh", Some(A), usize::MAX);
@@ -603,7 +604,7 @@ fn a_different_file_is_tried_at_once_even_after_failures() {
 /// first poll after the step, 505 s, puts the end of the wait at the cap from then), not at
 /// 1010 s, which is 510 s after the step.
 ///
-/// Mutant it catches: the end of a wait kept as it was when the clock goes back.
+/// Asserts that the end of a wait is recomputed when the clock goes back.
 #[test]
 fn a_clock_set_back_does_not_stretch_a_wait_past_the_cap() {
     let mut bench = Bench::new("rewind", Some(A), usize::MAX);
@@ -622,7 +623,8 @@ fn a_clock_set_back_does_not_stretch_a_wait_past_the_cap() {
 /// `releases.json` (nothing is in flight to confirm or revert it), and the same file is
 /// tried again after the wait and starts the swap once it is accepted.
 ///
-/// Mutants it catches: the staged release kept after a refusal; the refusal taken for a start.
+/// Asserts that the staged release is cleared after a refusal, and that a refusal is not a
+/// start.
 #[test]
 fn a_swap_that_refuses_to_start_leaves_nothing_staged_and_is_tried_again() {
     let mut bench = Bench::new("refused", Some(A), usize::MAX);
@@ -647,8 +649,8 @@ fn a_swap_that_refuses_to_start_leaves_nothing_staged_and_is_tried_again() {
 /// of `A` (serving), `B` (the swap's) and `D` (a slot's), and `C` is gone. A poll that finds the
 /// serving release again prunes by the same rule, with nothing to go to.
 ///
-/// Mutants it catches: the serving copy removed; the swap's copy removed; the slots' ignored;
-/// nothing pruned.
+/// Asserts that the serving copy, the swap's copy and the slots' copies are kept, and that the
+/// others are pruned.
 #[test]
 fn the_copies_kept_are_the_serving_one_the_swaps_and_each_slots() {
     let mut bench = Bench::new("prune", Some(A), usize::MAX);
@@ -677,7 +679,7 @@ fn the_copies_kept_are_the_serving_one_the_swaps_and_each_slots() {
 /// and the pass still comes to what it found (the serving release), with the failure only
 /// logged.
 ///
-/// Mutant it catches: the prune's error returned as the pass's.
+/// Asserts that the prune's error is not the pass's result.
 #[test]
 fn a_prune_that_fails_does_not_fail_the_pass() {
     let mut bench = Bench::new("prune-fails", Some(A), usize::MAX);
@@ -693,8 +695,8 @@ fn a_prune_that_fails_does_not_fail_the_pass() {
 /// kbf that keeps waiting for a swap (the logging of that is once; what is seen here is that
 /// the loop goes on) starts nothing.
 ///
-/// Mutants it catches: a sleep of another length; no stop on `Interrupted`; the loop ending
-/// at the first pass that does something.
+/// Asserts that the sleep is five seconds, that the loop stops on `Interrupted`, and that the
+/// loop goes on after a pass that does something.
 #[test]
 fn run_polls_every_five_seconds_until_the_clock_stops() {
     let mut bench = Bench::new("run", Some(A), 4);
@@ -718,7 +720,7 @@ fn run_polls_every_five_seconds_until_the_clock_stops() {
 /// Catches words of the log that drifted from what they say, and a wait that overflows: each
 /// pass has its text, and a count of failures past what a shift can hold still waits the cap.
 ///
-/// Mutant it catches: the wait computed with a shift of the failure count unbounded.
+/// Asserts that the wait is computed with a bounded shift of the failure count.
 #[test]
 fn passes_have_their_words_and_a_wait_never_overflows() {
     assert_eq!(Pass::Quiet.to_string(), "nothing to do");
@@ -744,7 +746,7 @@ fn passes_have_their_words_and_a_wait_never_overflows() {
 /// largest one, which its checks refuse, not a small one that passes; the others and the
 /// profile are as printed.
 ///
-/// Mutant it catches: a cast that truncates.
+/// Asserts that a number too big is saturated, not truncated by a cast.
 #[test]
 fn a_number_too_big_for_the_facts_is_the_biggest_not_a_wrapped_one() {
     let json = version_json(B, "release");
@@ -937,8 +939,8 @@ fn the_wiring_assembled_from_a_config_waits_for_that_configs_gate() {
 /// no wiring spawns nothing, and a wiring spawns a thread that polls once, finds no file at the
 /// package's path, and returns because the clock it sleeps on is stopped.
 ///
-/// Mutants it catches: a thread spawned whatever the wiring; a loop that ignores the end of
-/// its clock (the join does not return).
+/// Asserts that a thread is spawned only with a wiring, and that the loop ends with its clock
+/// (the join returns).
 #[test]
 fn nothing_is_spawned_without_a_wiring_and_the_thread_ends_with_its_clock() {
     let none = spawn(None, Arc::new(SystemClock::new()), Box::new(Vec::new));

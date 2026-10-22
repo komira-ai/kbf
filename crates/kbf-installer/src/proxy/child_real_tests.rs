@@ -755,8 +755,9 @@ fn a_child_caught_while_exiting_is_identified_not_refused() {
 /// the program of a release is its file there, a release that only that directory has is
 /// started from it, and the layout's own is not looked at.
 ///
-/// Mutants it catches: `with_releases` that sets nothing; `program` that joins the layout's
-/// releases when a directory is set; `program` that leaves the commit's directory out.
+/// Asserts that `with_releases` sets the directory; that `program` joins that directory and
+/// not the layout's releases once it is set; and that `program` includes the commit's
+/// directory.
 #[test]
 fn with_releases_runs_the_programs_of_that_directory_and_not_the_layouts() {
     let rig = rig("child-real-releases");

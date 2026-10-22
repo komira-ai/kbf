@@ -453,8 +453,9 @@ fn route_reaches_neither_the_frontend_nor_the_daemon() {
 /// decodes a child's protocol (`kbf-proto`), runs none of the frontend, storage or node code
 /// (`kbf-server`, `kbf-front`, `kbf-storage`, `kbf-node`, `kbf-daemon`, the binaries
 /// `kbf-cli` and `kbf-all-in-one`), and does not know the installer, its host plan or its
-/// update types (`kbf-installer`, `kbf-host`, `kbf-update`, `kbf-deploy`): the calls to a
-/// child are the installer's, through a trait that lives there, and the installer depends on
+/// update types (`kbf-installer`, `kbf-host`, `kbf-update`, `kbf-deploy`): the admin calls to
+/// a child are the installer's, through a trait that lives there (the proxy's one is the
+/// read-only `GET role`, for the child's term, over plain HTTP), and the installer depends on
 /// the proxy, not the other way round.
 const PROXY_MUST_NOT_REACH: &[&str] = &[
     "kbf-installer",

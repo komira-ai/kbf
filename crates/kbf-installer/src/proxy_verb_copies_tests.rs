@@ -27,8 +27,8 @@ impl Drop for Gone {
 /// migrate: the attempt must fail as `migration-failed`, in the line the log gets and in
 /// `boot.json`, with nothing started.
 ///
-/// Mutants it catches: `run_from_copies` left out of the start (`binary-missing`); the status
-/// file taken from the root half (`no-installed-release`).
+/// Asserts that the start runs `run_from_copies` (it is not held as `binary-missing`); and
+/// that the status file is the proxy's own (not `no-installed-release`).
 #[cfg(target_os = "linux")]
 #[test]
 fn the_start_with_copies_runs_the_copy_of_the_installed_release_and_migrates_it_first() {
@@ -123,7 +123,8 @@ fn args_with(kbf_binary: Option<&str>) -> ProxyArgs {
 /// status file is `releases.json` in the proxy's state directory whatever `--update-dir`
 /// says; the copies are opened by the run, not by the config.
 ///
-/// Mutants it catches: the flag not looked at; the status file taken from `--update-dir`.
+/// Asserts that the flag is looked at; and that the status file is not taken from
+/// `--update-dir`.
 #[test]
 fn with_a_kbf_binary_the_status_file_is_the_proxys_own_releases_json() {
     let table = PROXY.replacen(
@@ -156,8 +157,8 @@ fn with_a_kbf_binary_the_status_file_is_the_proxys_own_releases_json() {
 /// (the proxy's user runs it) and a state directory that cannot be used are usage errors that
 /// name what is wrong.
 ///
-/// Mutants it catches: the copies opened whatever the flag says; the absolute path not
-/// required; the state directory's error read as success.
+/// Asserts that the copies are opened only when the flag is given; that an absolute path is
+/// required; and that the state directory's error is a failure.
 #[test]
 fn the_copies_are_opened_only_for_an_absolute_kbf_binary_in_a_usable_state_directory() {
     let state = kbf_host::testkit::scratch("proxy-verb-open-local");
@@ -187,8 +188,8 @@ fn the_copies_are_opened_only_for_an_absolute_kbf_binary_in_a_usable_state_direc
 /// Catches `--check` passing a configuration the run refuses: a `--kbf-binary` that is not an
 /// absolute path is a usage error with `--check` as without it, and an absolute one passes.
 ///
-/// Mutants it catches: the path rule left out of the `--check` branch; the rule applied
-/// whether or not the flag is given.
+/// Asserts that the path rule is applied in the `--check` branch; and that it is applied
+/// only when the flag is given.
 #[test]
 fn check_refuses_a_kbf_binary_that_is_not_an_absolute_path() {
     let path = file("check-kbf-binary", PROXY.as_bytes());
