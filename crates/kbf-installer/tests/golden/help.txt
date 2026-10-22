@@ -9,7 +9,6 @@ Commands:
   setup           First install: accounts, directories, installer.toml, the first release
   status          What is installed, staged and pending, and the last refusal
   run             Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap
-  update          Swap this host's frontend through the proxy's update API, and wait for it
   confirm         Keep the pending swap, naming its activation
   revert          Undo the pending swap, naming its activation
   rollback        Point `current` at `previous`, with no confirm window
@@ -120,16 +119,6 @@ Options:
           The Buck2 API key file, an absolute path, for --buck2-auth bearer
       --storage-port <STORAGE_PORT>
           The loopback port of the kbf-storage-and-daemon sibling an all-in-one host runs, which the frontend child dials in plain text (1024 to 65535, clear of the children's ports). Default 8990. Only for `--mode=all-in-one`, with --proxy
-      --deploy-stage <DEPLOY_STAGE>
-          The stage this host is, gamma or prod: setup writes /etc/kbf-installer/deploy.json so `kbf-installer deploy` binds an offer to it. frontend, all-in-one
-      --deploy-api <DEPLOY_API>
-          The operator API deploy calls, as a loopback IP:PORT. Default: the proxy's public port (installer.toml `[proxy] listen`, else 127.0.0.1:8980)
-      --deploy-api-ca <DEPLOY_API_CA>
-          A PEM file of the CA the API's certificate is verified against (absolute path; it must exist). Default: the system's roots only
-      --deploy-server-name <DEPLOY_SERVER_NAME>
-          The DNS name the API's certificate carries. Default: the API address's IP
-      --deploy-token-file <DEPLOY_TOKEN_FILE>
-          The operator token's file (absolute path, mode 0600 or 0400, owned by root; it must exist, except the token setup makes itself, /etc/kbf/api-token on Linux). Default: installer.toml `[proxy] operator_token_file`
       --installer-config <INSTALLER_CONFIG>
           The installer.toml `setup` writes (and reads, to keep what it does not set), under the host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which is the only value setup accepts. The same flag, with the same meaning, as on `run`
   -h, --help
@@ -173,39 +162,6 @@ Options:
           Stop after this many passes (a rehearsal or a test); without it, run until stopped
       --installer-config <INSTALLER_CONFIG>
           installer.toml, under the host root: its `database` key is the state database the installer migrates to what a release needs before that release is activated. Required when the unit restarted after a swap is a frontend's or the all-in-one's, unless the unit comes from kbf.toml's mode (no --unit): then the host's installer.toml (/etc/kbf, /usr/local/etc/kbf on a Mac) is the default
-  -h, --help
-          Print help
-
-=== kbf-installer update --help ===
-Swap this host's frontend through the proxy's update API, and wait for it
-
-Usage: kbf-installer update [OPTIONS] --commit <COMMIT> --frontend --api <API>
-
-Options:
-      --commit <COMMIT>
-          The release to update to (40 hex characters)
-      --json
-          Print the result as one JSON object on standard output
-      --apply
-          Do what the verb says. Without it a mutating verb is a dry run
-      --frontend
-          Update this host's frontend: ask the update API of the proxy to swap it, and wait
-      --api <API>
-          The proxy's public address, `127.0.0.1:port`: the update API is served there
-      --api-ca <API_CA>
-          CA certificates (PEM) the API's certificate is verified against, besides the system's
-      --api-server-name <API_SERVER_NAME>
-          The name the API's certificate carries (the address's own IP when none is given)
-      --token-file <TOKEN_FILE>
-          The operator token the API takes: a file of mode 0600 or 0400. `setup` writes it here [default: /etc/kbf/api-token]
-      --nodes
-          Have the new frontend update the nodes once it has baked. Without it only the frontend is swapped
-      --source <SOURCE>
-          Where the release comes from: `fetch` (from the source the installer is configured with, as every update has) or `staged` (the release this host's package carries). `staged` takes no `--nodes` yet [default: fetch]
-      --request-id <REQUEST_ID>
-          Names this update to the API, so a run repeated after a lost connection is the same update. Random when not given
-      --handover-timeout-s <HANDOVER_TIMEOUT_S>
-          How long to wait for the update to end, the new frontend's bake included [default: 3600]
   -h, --help
           Print help
 

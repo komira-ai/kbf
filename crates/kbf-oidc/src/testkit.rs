@@ -20,7 +20,7 @@ pub const NOW: u64 = 1_800_000_000;
 
 pub const AUDIENCE: &str = "kbf-gamma";
 pub const WORKFLOW: &str =
-    "komira-ai/komira-build-farm/.github/workflows/gamma.yml@refs/heads/main";
+    "komira-ai/komira-build-farm/.github/workflows/farm-check.yml@refs/heads/main";
 
 /// An RSA signing key and the JWK that publishes it.
 pub struct TestKey {

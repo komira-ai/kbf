@@ -17,7 +17,7 @@ kills a node while a build is running. The assertions are numbers, not logs: zer
 under-replicated blobs back to zero.
 
 A commit that passes beta may be offered to the operator's own farm: **gamma**. For our own build farm the trigger is
-automatic (RETIRED: `gamma.yml` is deleted, and gamma moves to kbf-updater, package-update design section 13; the text of this page about it is history): when a push to `main` has been cut into a release, `gamma.yml` verified the release, made the offer for gamma
+automatic (RETIRED: `gamma.yml` and the `kbf-installer deploy` verb are deleted, and hosts take releases from OS packages and kbf-updater; the text of this page about the deploy is history): when a push to `main` has been cut into a release, `gamma.yml` verified the release, made the offer for gamma
 and deployed the commit on the farm's frontend host over Tailscale SSH (section 5.4); the new frontend then offers it to
 the nodes, which pull it. The deploy is itself a test (no build failed because a connection was dropped). Planned: gamma's
 verdict (gamma verdict TBD, on a generic monitoring library) then comes from the operator's real usage over the metrics
@@ -123,8 +123,8 @@ result = "beta-result.json"
 
 [[stage]]
 name = "gamma"
-runs = "operator"         # gamma.yml is deleted (RETIRED); the deploy moves to kbf-updater; the bake and the verdict (Planned, section 7) run outside Actions
-after = ["beta"]          # the design; release/stages.yml has ["build"] until the beta result is attested
+runs = "operator"         # no workflow runs it: hosts take releases from OS packages and kbf-updater; the bake and the verdict (Planned, section 7) run outside Actions
+after = ["beta"]
 result = "gamma-verdict.json"
 
 [[stage]]
@@ -137,7 +137,7 @@ result = "release.json"
 
 The lint refuses a workflow job that names a stage not in the file, an `actions` stage with no job, a `pull_request` trigger
 on any of these workflows, an unpinned `uses:`, and `id-token: write` anywhere but `attest`. `runs = "operator"` stages have
-no job. The stage file as built is `release/stages.yml`, which lists no gamma stage: `gamma.yml` is deleted and gamma moves to kbf-updater (package-update design, section 13), so `prod` follows `beta`.
+no job. The stage file as built is `release/stages.yml`, which lists no gamma stage (no workflow runs gamma; hosts take releases from OS packages and kbf-updater), so `prod` follows `beta`.
 
 ## 3. The artifact every stage consumes
 
@@ -480,8 +480,8 @@ beta scenario in the same change that fixes it (section 11).
   when a newer one queues, so a workflow-level group would let a push that cut nothing cancel a pending release. A queued
   deploy for a commit that is no longer the highest release is refused before anything reaches the farm.
 - **Held, for the operator.** The environment and its policy, the variables and secrets, the Tailscale OAuth client and
-  policy, and the host's account, sudoers line and setup are settings, not code. `cargo xtask gamma held-steps` prints them
-  for the repository, host and account given, and applies nothing (`docs/deploy/gamma.md`).
+  policy, and the host's account, sudoers line and setup were settings, not code; `cargo xtask gamma held-steps` printed
+  them. It is deleted with the deploy (`docs/deploy/gamma.md`).
 
 ## 6. Promotion: the frontend's desired state
 

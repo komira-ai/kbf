@@ -117,9 +117,9 @@ async fn a_wrong_repository_is_refused() {
 async fn a_wrong_workflow_is_refused() {
     for other in [
         "komira-ai/komira-build-farm/.github/workflows/ci.yml@refs/heads/main",
-        "komira-ai/komira-build-farm/.github/workflows/gamma.yml@refs/heads/topic",
-        "komira-ai/komira-build-farm/.github/workflows/gamma.yml@refs/heads/main-evil",
-        "komira-ai/komira-build-farm/.github/workflows/gamma.yml",
+        "komira-ai/komira-build-farm/.github/workflows/farm-check.yml@refs/heads/topic",
+        "komira-ai/komira-build-farm/.github/workflows/farm-check.yml@refs/heads/main-evil",
+        "komira-ai/komira-build-farm/.github/workflows/farm-check.yml",
     ] {
         assert_eq!(
             refused_mutating(|c| c["job_workflow_ref"] = json!(other)).await,
