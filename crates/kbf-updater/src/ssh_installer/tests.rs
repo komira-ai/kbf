@@ -616,22 +616,58 @@ fn oversize_output_is_refused() {
     );
 }
 
-/// Catches a timeout that is reported as anything else, and a spawn failure that leaks its
-/// reason: the first is the word `timeout`, the second a fixed line.
+/// Catches a timeout that is reported as a failure of the call: the install keeps running in
+/// the host's unit, so the roll must re-query (the unreachable kind), never fail the roll. Also
+/// catches a spawn failure that leaks its reason: that one is a fixed line and not unreachable.
 #[test]
-fn a_timeout_and_a_missing_ssh_have_their_own_fixed_text() {
+fn a_timeout_is_unreachable_and_a_missing_ssh_is_not() {
     let r = rig();
     r.fake.says(Err(ExecError::Timeout));
     r.fake.says(Err(ExecError::Timeout));
     r.fake.says(Err(ExecError::Spawn));
-    assert_eq!(
-        r.ssh.install(&host(), &version("1")),
-        Err(PortError::other("timeout"))
-    );
-    assert_eq!(r.ssh.query(&host()), Err(PortError::other("timeout")));
+    let install = r.ssh.install(&host(), &version("1")).expect_err("timeout");
+    assert_eq!(install, PortError::unreachable("timeout"));
+    assert!(install.is_unreachable());
+    let query = r.ssh.query(&host()).expect_err("timeout");
+    assert_eq!(query, PortError::unreachable("timeout"));
+    assert!(query.is_unreachable());
     let spawn = r.ssh.query(&host()).expect_err("spawn");
     assert_eq!(spawn, PortError::other("cannot run ssh"));
     assert!(!spawn.is_unreachable());
+}
+
+/// Catches the inventory alias reaching ssh: it is a label from a file an operator edits, so a
+/// hostile one (spaces, an option, a newline, `;`) must appear nowhere in the argument vector
+/// or the known-hosts file. The address is the only name used.
+#[test]
+fn a_hostile_alias_never_reaches_ssh() {
+    let aliases = [
+        "a b",
+        "-oProxyCommand=touch /x",
+        "st1\nHost *",
+        "st1;reboot",
+        "$(id)",
+    ];
+    for alias in aliases {
+        let r = rig();
+        r.fake.says(exited(0, INSTALLED));
+        r.fake.says(exited(0, "{\"result\":\"query\",\"installed_version\":\"1\",\"running_commit\":null,\"in_progress\":false}\n"));
+        let mut h = host();
+        h.alias = alias.into();
+        let _ = r.ssh.install(&h, &version("1.2.3-1"));
+        let _ = r.ssh.query(&h);
+        let calls = r.fake.calls();
+        assert_eq!(calls.len(), 2, "{alias:?}");
+        for seen in calls {
+            for arg in &seen.spawn.args {
+                let arg = arg.to_str().expect("utf-8");
+                assert!(!arg.contains(alias), "{alias:?} in argv: {arg:?}");
+            }
+            assert!(strs(&seen.spawn.args).contains(&"kbf-update@203.0.113.7"));
+            let known = seen.known_hosts_text.expect("known hosts");
+            assert!(!known.contains(alias), "{alias:?} in known hosts");
+        }
+    }
 }
 
 /// Catches an ssh failure (exit 255) mapped as a failed install: it is the unreachable kind,

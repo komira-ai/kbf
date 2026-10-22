@@ -25,9 +25,12 @@
 //! never ssh's or apt's own words; stderr is only classified (exit 255, ssh's own failure,
 //! is the one kind the roll tells apart: [`PortError::is_unreachable`]) and then dropped.
 //!
-//! `command_timeout` bounds the whole call. On expiry ssh is killed and the call is
-//! `PortError("timeout")`. That does not stop an install: the wrapper runs it in a systemd
-//! unit, so a later `query` shows `InProgress`, which is what a restarted roll expects.
+//! `command_timeout` bounds the whole call. On expiry ssh is killed and the call is the
+//! unreachable kind, `PortError::unreachable("timeout")`, for install and query alike. A
+//! timeout does not stop an install: the wrapper runs it in a systemd unit, so a later `query`
+//! shows `InProgress`. The roll treats an unreachable install as "ask the host" (it re-queries
+//! through its recovery path); any other kind would fail the roll while the install is still
+//! going, so a timeout must never be reported as one.
 
 mod answer;
 mod exec;
@@ -247,7 +250,7 @@ impl SshInstaller {
             stdout_cap: answer::MAX_STDOUT,
         };
         let done = self.exec.run(&spawn).map_err(|e| match e {
-            ExecError::Timeout => PortError::other("timeout"),
+            ExecError::Timeout => PortError::unreachable("timeout"),
             ExecError::Spawn => PortError::other("cannot run ssh"),
         })?;
         drop(known);
