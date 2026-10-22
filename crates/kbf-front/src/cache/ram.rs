@@ -565,4 +565,24 @@ mod tests {
         assert_eq!(cache.hold_write(&other).await.expect("asked"), Hold::Held);
         assert_eq!(cache.unwritten().blobs, 1);
     }
+
+    /// Dating a drained blob by its acknowledgement does nothing for a digest that is not
+    /// held (the entry left already), and for a held digest the index does not have (the
+    /// write did not stage it): both are `Ok`, and neither dates an object. Mutant: the
+    /// first arm answers an error.
+    #[tokio::test]
+    async fn dating_by_acknowledgement_needs_a_held_entry_and_a_staged_blob() {
+        let cache = Cache::memory().with_ram_ack_bytes(1024);
+        let blob = VerifiedBlob::hashed(Bytes::from_static(b"held, not written"));
+        cache
+            .date_by_acknowledgement(&blob.digest())
+            .await
+            .expect("not held");
+        assert_eq!(cache.hold(&blob), Hold::Held);
+        cache
+            .date_by_acknowledgement(&blob.digest())
+            .await
+            .expect("held, not in the index");
+        assert_eq!(cache.writer.born.dated(), 0);
+    }
 }
