@@ -374,6 +374,17 @@ fn the_bound_is_the_largest_live_node_that_could_run_it() {
         capacity: Resources::new(8_000, 256 * GIB),
         caps: mac,
     });
+    // A live Linux worker of the right size that serves only whole-machine leases does not
+    // run an action: it is not counted.
+    f.feed(Event::WorkerUp {
+        worker: w("whole-only"),
+        instance: DaemonInstance::new("whole-only"),
+        predecessor_stopped: false,
+        capacity: Resources::new(8_000, 512 * GIB),
+        caps: NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
+            .unwrap()
+            .with_drivers(["native-whole-machine"]),
+    });
     let mut wants = request(1, 4 * GIB);
     wants.resources = Resources::new(2_000, 4 * GIB);
     assert_eq!(
