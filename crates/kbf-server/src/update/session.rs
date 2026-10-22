@@ -477,13 +477,7 @@ impl FarmFacts {
                 .map_or(OrderId::new(0, acked), |s| s.activation);
             Some(HelperReport { order, status })
         });
-        let work = if look.leases > 0 {
-            Work::Leased
-        } else if queue_empty {
-            Work::QueueEmpty
-        } else {
-            Work::Waiting
-        };
+        let work = work_of(look.leases, queue_empty);
         Some(HostFacts {
             id: look.id,
             kind,
@@ -583,6 +577,18 @@ impl FarmFacts {
             }
         }
         self.not_idle = now;
+    }
+}
+
+/// What a host's daemon has to do: leases it holds, else nothing queued anywhere, else queued
+/// work it may be given.
+const fn work_of(leases: u32, queue_empty: bool) -> Work {
+    if leases > 0 {
+        Work::Leased
+    } else if queue_empty {
+        Work::QueueEmpty
+    } else {
+        Work::Waiting
     }
 }
 
@@ -766,5 +772,15 @@ mod tests {
             order.seq + 1,
             "a handed-over farm drew an id"
         );
+    }
+
+    /// Catches: a host with leases read as idle, or an empty queue read as work waiting: the
+    /// leases decide first, then the queue.
+    #[test]
+    fn work_is_leased_before_it_is_queued() {
+        assert_eq!(work_of(2, true), Work::Leased);
+        assert_eq!(work_of(1, false), Work::Leased);
+        assert_eq!(work_of(0, true), Work::QueueEmpty);
+        assert_eq!(work_of(0, false), Work::Waiting);
     }
 }
