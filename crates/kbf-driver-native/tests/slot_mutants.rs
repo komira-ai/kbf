@@ -6,14 +6,13 @@
 //! [`Mutant`]/[`Mutated`] (`src/slots/clean.rs`): one step skipped, the check honest
 //! (design: mutant A) or blind (mutant B). Here the clean runs through it over a model
 //! Mac whose residue is the rows of [`support::slot_rows::COVERS`], each removed by its
-//! step, and the recreate moves the home and the `/var/folders` entry aside.
+//! step; there is no recreate and no retry, so a pass that leaves a row ends dirty.
 //!
 //! What this proves, and what it does not:
 //! - It proves the harness: the seam skips exactly the step it names; a blind check lets
 //!   the residue through as a clean (so it would reach lease B), exactly the rows of
 //!   that step; an honest check never reports a clean while a row is left (the slot is
-//!   quarantined, or recreated when the recreate removes the rows, and a survivor is
-//!   never recreated). It proves the table is whole: every row of the freshness test is
+//!   dirty, never clean). It proves the table is whole: every row of the freshness test is
 //!   under a step or listed as removed by none.
 //! - It does not prove the table. The model removes a row because the table says its
 //!   step does, so these tests cannot catch a table that is wrong about the real steps.
@@ -22,26 +21,23 @@
 
 mod support;
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 
 use kbf_driver_native::slots::clean::{
     self, Left, Mutant, Mutated, Os, Outcome, STEPS, Step, Verify,
 };
-use support::slot_rows::{COVERS, ROWS, UNCOVERED, covered_by};
+use support::slot_rows::{COVERS, ROWS, UNCOVERED, UNROWED, covered_by};
 
 /// A row left by the lease, and the step that removes it.
 type Residue = (&'static str, Step);
 
 /// A Mac with every row of [`COVERS`] planted. Each step removes the residue the table
 /// gives it; the look names what is left, under the step that should have removed it;
-/// the recreate moves the home and the `/var/folders` entry aside, so it removes what
-/// [`Step::Home`] and [`Step::Folders`] remove, and nothing else (a loaded job, a
-/// schedule, an image, an IPC object or a process of the uid survives a recreate).
+/// there is no recreate: a pass that leaves a row leaves the user dirty.
 struct Mac {
     residue: RefCell<BTreeSet<Residue>>,
     ran: RefCell<Vec<Step>>,
-    recreated: Cell<usize>,
 }
 
 impl Mac {
@@ -53,7 +49,6 @@ impl Mac {
         Self {
             residue: RefCell::new(residue),
             ran: RefCell::default(),
-            recreated: Cell::new(0),
         }
     }
 
@@ -86,12 +81,6 @@ impl Os for Mac {
     }
 
     fn pause(&self) {}
-
-    fn recreate(&self) -> Result<(), String> {
-        self.recreated.set(self.recreated.get() + 1);
-        self.removing(&[Step::Home, Step::Folders]);
-        Ok(())
-    }
 }
 
 fn set(rows: &[&'static str]) -> BTreeSet<&'static str> {
@@ -127,7 +116,11 @@ fn the_table_covers_every_row_of_the_freshness_test_and_every_step() {
         "the table's steps are not the clean's, in its order"
     );
     for (step, rows) in COVERS {
-        assert!(!rows.is_empty(), "{step} covers no row");
+        assert_eq!(
+            rows.is_empty(),
+            UNROWED.contains(&step),
+            "{step}: a step covers a row or is listed as unrowed, never both or neither"
+        );
         assert_eq!(rows.len(), set(rows).len(), "{step} names a row twice");
     }
 }
@@ -146,19 +139,15 @@ fn without_a_mutant_the_clean_leaves_no_row() {
     assert_eq!(clean::clean(&mac), Outcome::Clean);
     assert_eq!(mac.rows(), BTreeSet::new());
     assert_eq!(*mac.ran.borrow(), STEPS);
-    assert_eq!(mac.recreated.get(), 0);
 }
 
-/// What an honest check does with `step` skipped: the survivors' step is never
-/// recreated; the home and the `/var/folders` entry are removed by the recreate
-/// (the slot is back, recreated); everything else survives it, so the slot is
-/// quarantined.
+/// What an honest check does with `step` skipped: the slot is dirty when the step
+/// covers a row (what it left is found), and clean when it covers none.
 fn honest_outcome(step: Step) -> &'static str {
-    match step {
-        Step::Home | Step::Folders => "recreated",
-        Step::Bootout | Step::Schedules | Step::Kill | Step::Images | Step::Ipc | Step::Shared => {
-            "quarantined"
-        }
+    if covered_by(step).is_empty() {
+        "clean"
+    } else {
+        "dirty"
     }
 }
 
@@ -170,9 +159,8 @@ fn honest_outcome(step: Step) -> &'static str {
 ///   own: with the check blind the clean is `Clean` and exactly the rows the table gives
 ///   the step are left (lease B would find them, and nothing else);
 /// - an honest check that lets a skipped step pass: it never ends `Clean` with a row
-///   left, ends recreated only when the recreate removed every row, and a skipped
-///   [`Step::Kill`] is never recreated (the processes it leaves would run on as an
-///   orphan uid).
+///   left, and a skipped step is never retried or made good by a recreate: one pass,
+///   dirty.
 fn check_step(skip: Step) {
     let others: Vec<Step> = STEPS.iter().copied().filter(|s| *s != skip).collect();
 
@@ -192,7 +180,6 @@ fn check_step(skip: Step) {
         covered_by(skip).iter().copied().collect(),
         "rows left with {skip} skipped and the check blind"
     );
-    assert_eq!(blind.recreated.get(), 0);
 
     let honest = Mac::planted();
     let mutant = Mutant {
@@ -202,24 +189,22 @@ fn check_step(skip: Step) {
     let outcome = clean::clean(&Mutated::new(&honest, mutant));
     let kind = match &outcome {
         Outcome::Clean => "clean",
-        Outcome::Recreated { .. } => "recreated",
-        Outcome::Quarantined { .. } => "quarantined",
+        Outcome::Dirty { .. } => "dirty",
     };
     assert_eq!(
         kind,
         honest_outcome(skip),
         "honest, skipping {skip}: {outcome:?}"
     );
-    if kind == "recreated" {
-        assert_eq!(honest.rows(), BTreeSet::new(), "recreated with rows left");
-    } else {
-        assert!(!honest.rows().is_empty(), "quarantined with nothing left");
-    }
-    let recreates = usize::from(skip != Step::Kill);
     assert_eq!(
-        honest.recreated.get(),
-        recreates,
+        honest.rows().is_empty(),
+        kind == "clean",
         "honest, skipping {skip}: {outcome:?}"
+    );
+    assert_eq!(
+        honest.ran.borrow().len(),
+        others.len(),
+        "one pass, no retry, skipping {skip}"
     );
 }
 
@@ -243,9 +228,12 @@ step_tests! {
     skipping_the_kill_leaves_the_processes => Step::Kill,
     skipping_the_image_detach_leaves_the_image => Step::Images,
     skipping_the_ipc_removal_leaves_the_semaphore => Step::Ipc,
-    skipping_the_home_wipe_leaves_the_home_state => Step::Home,
-    skipping_the_folders_wipe_leaves_t_and_c => Step::Folders,
+    skipping_the_flags_leaves_no_row_but_a_locked_home => Step::Flags,
+    skipping_the_contents_removal_leaves_the_home_state_t_and_c => Step::Contents,
     skipping_the_shared_sweep_leaves_the_tmp_files => Step::Shared,
+    skipping_the_crash_sweep_leaves_no_row => Step::Crashes,
+    skipping_the_restore_leaves_no_row => Step::Restore,
+    skipping_the_second_look_leaves_no_row => Step::Look,
 }
 
 /// Catches a step added to the clean (or one test removed) without a mutant test: the

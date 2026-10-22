@@ -1,14 +1,16 @@
 //! The clean of a slot between two leases, for real (docs/design/macos-end-state.md,
-//! step 4): after every lease the daemon cleans its slot's user, checks the clean, makes
-//! the user again when the check fails, and quarantines the slot when that fails too.
+//! step 4): after every lease the daemon cleans its slot's user in one pass, checks the
+//! clean, and leaves the slot dirty (not offered, cleaned again before it is) when a step
+//! fails or the check finds something.
 //!
 //! The gate is [`a_lease_finds_nothing_the_lease_before_it_left_on_its_slot`]: with
 //! one slot, lease A leaves a marker in each place a lease can leave state, and lease B,
 //! on the same user, looks for each through the tool that would use it and finds none.
 //! The other tests: a process the uid cannot kill fails the clean within its deadline
-//! and quarantines the slot; a home the wipe cannot empty gets the user made again; a
-//! user that cannot be made again quarantines the slot; the start cleans what a
-//! killed daemon left; and a lease's job labelled like launchd's own is still counted.
+//! and leaves the slot dirty; the start cleans what a killed daemon left; a lease's job
+//! labelled like launchd's own is still counted; and the single-pass tests
+//! (`tests/slot_clean/single_pass.rs`: a home locked by its user, a file in the entry
+//! root, `/Library/Caches`, a crash report under another user's folder, a failed clean).
 //!
 //! The mutant tests (`tests/slot_clean/mutants.rs`) run the same scenario with one step
 //! of the clean skipped and the clean's own check blind, and see which rows turn red; the
@@ -24,7 +26,7 @@
 mod support;
 
 use std::collections::BTreeSet;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -36,16 +38,13 @@ use kbf_daemon::uid;
 use kbf_driver_native::NativeRuntime;
 use kbf_driver_native::slots::SlotUser;
 use kbf_driver_native::slots::clean::Mutant;
-use support::pool::{Scratch, Users, config, home_of, ids_of, name_of};
+use support::pool::{Scratch, Users, config, home_of, ids_of};
 use support::slot_rows::ROWS;
 use support::{MemoryCas, PROMPT, Spec, stdout};
 
 fn assert_root() {
     support::pool::assert_root("slot_clean");
 }
-
-/// Where a recreate moves a home it could not empty: `<homes>/<prefix><user>-...`.
-const ASIDE: &str = ".kbf-recreated-";
 
 /// Lease A's part inside the sandbox, as the slot user: `$1` the marker. Each place
 /// written prints `planted <row>`; then it waits for the test's `go`.
@@ -452,6 +451,8 @@ async fn a_lease_finds_nothing_the_lease_before_it_left_on_its_slot() {
 
 #[path = "slot_clean/mutants.rs"]
 mod mutants;
+#[path = "slot_clean/single_pass.rs"]
+mod single_pass;
 
 /// `go` in lease A's directory: it ends lease A's wait.
 fn scratch_go(a_root: &Path) -> PathBuf {
@@ -875,152 +876,6 @@ fn entries(dir: &Path) -> Vec<String> {
                 .collect()
         },
     )
-}
-
-/// The homes a recreate moved aside for `user`.
-fn moved_aside(user: &SlotUser) -> Vec<PathBuf> {
-    let prefix = format!("{ASIDE}{}-", user.name);
-    let homes = Path::new(support::pool::HOMES);
-    std::fs::read_dir(homes)
-        .expect("homes")
-        .filter_map(Result::ok)
-        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
-        .map(|e| e.path())
-        .collect()
-}
-
-/// Removes what [`moved_aside`] finds, its flags cleared first.
-fn remove_aside(user: &SlotUser) {
-    for dir in moved_aside(user) {
-        let _ = Command::new("/usr/bin/chflags")
-            .args(["-R", "nouchg"])
-            .arg(&dir)
-            .status();
-        let _ = kbf_outputs::remove_tree(&dir);
-    }
-}
-
-/// A root-owned file in `user`'s home, locked (`uchg`): the wipe clears flags only on
-/// the departing uid's own entries, so it cannot remove it.
-fn plant_stuck(user: &SlotUser) -> PathBuf {
-    let stuck = home_of(user).join("kbf-ci-stuck");
-    std::fs::write(&stuck, b"stuck").expect("stuck file");
-    support::pool::run("/usr/bin/chflags", &["uchg", &stuck.to_string_lossy()]);
-    stuck
-}
-
-/// A failed clean makes the user again. Catches a clean that ignores its check (the
-/// file it could not remove stays in the home for the next lease), and a slot
-/// quarantined although the user could be made again: with a root-owned locked file in
-/// the home, the lease's clean fails, the user is made again with the same name and uid
-/// and an empty home of its own (the old one moved aside, root's, mode 0700), and the
-/// next lease runs on the slot as that uid.
-#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
-#[tokio::test]
-async fn a_slot_whose_home_cannot_be_emptied_gets_its_user_made_again() {
-    assert_root();
-    let scratch = Scratch::new("recreate");
-    let users = Users::new("recreate", 1);
-    let user = users.0[0].clone();
-    remove_aside(&user);
-    let cas = Arc::new(MemoryCas::default());
-    let rt = NativeRuntime::new(config(&scratch, users.pool()), Arc::clone(&cas)).expect("runtime");
-    plant_stuck(&user);
-    let act = scratch.act();
-    let first = support::run(&rt, &cas, 1, &Spec::argv(&[&act, "id"])).await;
-    let home = home_of(&user);
-    let meta = std::fs::symlink_metadata(&home);
-    let in_home = entries(&home);
-    let aside = moved_aside(&user);
-    let aside_meta: Vec<(u32, u32, Vec<String>)> = aside
-        .iter()
-        .map(|dir| {
-            let m = std::fs::symlink_metadata(dir).expect("aside");
-            (m.uid(), m.mode() & 0o7777, entries(dir))
-        })
-        .collect();
-    let named = name_of(user.uid);
-    let reported = slots_reported(&rt);
-    let second = tokio::time::timeout(
-        PROMPT * 3,
-        support::run(&rt, &cas, 2, &Spec::argv(&[&act, "id"])),
-    )
-    .await;
-    remove_aside(&user);
-    let first = first.expect("the first lease ran");
-    assert_eq!(first.exit_code, 0, "{}", stdout(&cas, &first));
-    let meta = meta.expect("no home after the recreate");
-    assert!(meta.is_dir(), "the home is not a directory");
-    assert_eq!(
-        (meta.uid(), meta.gid(), meta.mode() & 0o7777),
-        (user.uid, user.gid, 0o700),
-        "the new home is not the user's, mode 0700"
-    );
-    assert!(
-        in_home.is_empty(),
-        "the home after the recreate holds {in_home:?}"
-    );
-    assert_eq!(
-        aside_meta,
-        vec![(0, 0o700, vec!["kbf-ci-stuck".to_owned()])],
-        "the old home was not moved aside, root's, mode 0700, with the stuck file: {aside:?}"
-    );
-    assert_eq!(
-        named.as_deref(),
-        Some(user.name.as_str()),
-        "uid {} lost its name",
-        user.uid
-    );
-    assert_eq!(reported.as_deref(), Some("1"), "the slot was quarantined");
-    let second = second
-        .expect("the next lease never got the slot")
-        .expect("the next lease ran");
-    assert_eq!(second.exit_code, 0, "{}", support::stderr(&cas, &second));
-    assert_eq!(stdout(&cas, &second), format!("{}\n", user.uid));
-}
-
-/// A failed recreate quarantines the slot. Catches a slot given back although its user
-/// could not be made again (the next lease would find what the clean could not
-/// remove): with the home itself root's and locked, so it can be neither emptied nor
-/// moved aside, the node reports no slot after the lease, and the next lease waits.
-#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
-#[tokio::test]
-async fn a_slot_whose_user_cannot_be_made_again_is_quarantined() {
-    assert_root();
-    let scratch = Scratch::new("quarantine");
-    let users = Users::new("quarantine", 1);
-    let user = users.0[0].clone();
-    remove_aside(&user);
-    let cas = Arc::new(MemoryCas::default());
-    let rt = NativeRuntime::new(config(&scratch, users.pool()), Arc::clone(&cas)).expect("runtime");
-    let home = home_of(&user);
-    plant_stuck(&user);
-    std::os::unix::fs::chown(&home, Some(0), Some(0)).expect("chown");
-    support::pool::run("/usr/bin/chflags", &["uchg", &home.to_string_lossy()]);
-    let act = scratch.act();
-    let first = support::run(&rt, &cas, 1, &Spec::argv(&[&act, "id"])).await;
-    let reported = slots_reported(&rt);
-    let second = tokio::time::timeout(
-        Duration::from_secs(3),
-        support::run(&rt, &cas, 2, &Spec::argv(&[&act, "id"])),
-    )
-    .await;
-    support::pool::run(
-        "/usr/bin/chflags",
-        &["-R", "nouchg", &home.to_string_lossy()],
-    );
-    remove_aside(&user);
-    let first = first.expect("the first lease ran");
-    assert_eq!(first.exit_code, 0, "{}", stdout(&cas, &first));
-    assert_eq!(
-        reported.as_deref(),
-        Some("0"),
-        "a slot whose user could not be made again is still reported"
-    );
-    assert!(
-        second.is_err(),
-        "a lease ran on the quarantined slot: {second:?}"
-    );
 }
 
 /// The start. Catches a start that ends a killed daemon's processes but leaves its

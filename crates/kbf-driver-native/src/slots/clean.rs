@@ -1,58 +1,117 @@
 //! The clean of a slot between two leases (docs/design/macos-end-state.md, step 4): the
-//! order of its steps, the check after them, the one retry, the recreate of the user,
-//! and the quarantine. What each step does to the Mac is an [`Os`]'s
-//! ([`super::macos`]); the rules here are the same on every platform, and tested on
-//! every one with a fake.
+//! order of its steps and the rule for a step that fails. What each step does to the Mac
+//! is an [`Os`]'s ([`super::macos`]); the rules here are the same on every platform, and
+//! tested on every one with a fake.
 //!
-//! [`clean`] runs every [`Step`] in [`STEPS`]' order, then looks for what is left
-//! ([`Os::left`]) twice, [`Os::pause`] apart, so a job that launchd or cron started
-//! again after the kill is seen. A clean that fails is run once more. One that fails
-//! again makes the user again ([`Os::recreate`]) and runs once more; if the recreate or
-//! that clean fails too, the slot is quarantined.
+//! [`clean`] runs every [`Step`] of [`STEPS`] once, in that order, then looks for what is
+//! left ([`Os::left`]) twice, [`Os::pause`] apart, so a job that launchd or cron started
+//! again after the kill is seen. There is **one pass**: no retry, no third attempt, no
+//! making the user again. A pass that fails leaves the user **dirty** ([`Outcome::Dirty`]):
+//! the slot is not offered to a lease, the node reports one slot fewer, nothing is
+//! written to disk about it, and it is cleaned again before it is offered
+//! ([`super::book`]). The old retry hid two failures that were order defects; the order
+//! below is their fix, and a failure that still happens is shown, not retried.
+//!
+//! The order, C1 to C11 ([`Step::code`]):
+//!
+//! 1. [`Step::Bootout`]: end the slot's launchd domains, whole, and wait until the domain
+//!    lists nothing of the lease's.
+//! 2. [`Step::Schedules`]: the uid's crontab and `at` jobs, before the kill: no job
+//!    starts after it.
+//! 3. [`Step::Kill`]: every process of the uid.
+//! 4. [`Step::Images`]: the disk images and volumes the uid mounted.
+//! 5. [`Step::Ipc`]: the System V IPC objects.
+//! 6. [`Step::Flags`]: the user flags, ACLs and modes that would stop the removal,
+//!    **roots first**: the home and the `/var/folders` entry themselves, then what is
+//!    below them.
+//! 7. [`Step::Contents`]: the home emptied; the entry's `0`, `C`, `T` and `X` emptied and
+//!    kept, anything else in the entry removed.
+//! 8. [`Step::Shared`]: the uid's files in the shared places.
+//! 9. [`Step::Crashes`]: the crash reports about the uid.
+//! 10. [`Step::Restore`]: the home and the entry's folders back to the owner, mode and
+//!     flags they are given.
+//! 11. [`Step::Look`]: a second look at the uid's processes, a pause after the first.
 //!
 //! Two rules keep the steps from racing the slot's processes. Nothing after
-//! [`Step::Kill`] runs while a process of the uid lives: a failed kill ends that
-//! attempt (the sweeps walk only what no process of the uid can change). And a slot
-//! whose processes survived is quarantined without a recreate: a user deleted under
-//! its own processes would leave them running as an orphan uid, and the next user of
-//! the uid would share them.
+//! [`Step::Kill`] runs while a process of the uid lives: a failed kill ends the pass (the
+//! sweeps walk only what no process of the uid can change). And a user is never deleted:
+//! a user deleted under its own processes would leave them running as an orphan uid, and
+//! the next user of the uid would share them.
 
 use std::fmt;
 
 /// One step of the clean, in the order [`clean`] runs them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Step {
-    /// `launchctl bootout user/<uid>`: launchd starts no `KeepAlive` or on-demand job
-    /// of the uid again.
+    /// C1. The slot's launchd domains `user/<uid>` and `gui/<uid>` booted out whole (no
+    /// job by its label), then waited for: launchd starts no `KeepAlive` or on-demand job
+    /// of the uid again, and the domain lists only launchd's own.
     Bootout,
-    /// The uid's crontab and `at` jobs, before the kill: no job starts after it.
+    /// C2. The uid's crontab and `at` jobs, before the kill: no job starts after it.
     Schedules,
-    /// Every process of the uid, by effective or real uid, within a deadline.
+    /// C3. Every process of the uid, by effective or real uid, until two scans 200 ms
+    /// apart find none (at most 100 scans, within a deadline).
     Kill,
-    /// The disk images the uid attached, detached.
+    /// C4. The disk images the uid attached, detached, and every mount under its folders,
+    /// unmounted.
     Images,
-    /// The System V IPC objects the uid owns or made, removed.
+    /// C5. The System V IPC objects the uid owns or made, removed.
     Ipc,
-    /// The home, back to an empty folder of the user's, mode 0700.
-    Home,
-    /// The uid's `/var/folders` entry: every folder in it (`0`, `C`, `T`) emptied.
-    Folders,
-    /// The uid's entries in the shared places (`/private/tmp`, `/private/var/tmp`,
-    /// the `Shared` folder under `/Users`) and launchd's per-uid files.
+    /// C6. The flags `uchg`, `uappnd`, `nodump`, `opaque` and `hidden` cleared, ACLs
+    /// removed and the owner's mode made `u+rwx`, on the roots first (the home and the
+    /// entry), then below them. A locked root stops the removal below it, so this is
+    /// before [`Step::Contents`].
+    Flags,
+    /// C7. The home emptied; the `/var/folders` entry's `0`, `C`, `T` and `X` emptied and
+    /// kept, and anything else in the entry removed whole.
+    Contents,
+    /// C8. The uid's files in the shared places (`/private/tmp`, `/private/var/tmp`, the
+    /// `Shared` folder under `/Users`, `/Library/Caches`) and launchd's per-uid files.
     Shared,
+    /// C9. The crash reports about the uid, in the crash folders and `/cores`.
+    Crashes,
+    /// C10. The home back to the uid:gid, mode 0700, no flags; the entry's roots to their
+    /// recorded owner and flags, with `hidden` cleared.
+    Restore,
+    /// C11. A second look at the uid's processes, 200 ms after the first: a respawn is
+    /// seen.
+    Look,
 }
 
 /// Every step, in the order [`clean`] runs them.
-pub const STEPS: [Step; 8] = [
+pub const STEPS: [Step; 11] = [
     Step::Bootout,
     Step::Schedules,
     Step::Kill,
     Step::Images,
     Step::Ipc,
-    Step::Home,
-    Step::Folders,
+    Step::Flags,
+    Step::Contents,
     Step::Shared,
+    Step::Crashes,
+    Step::Restore,
+    Step::Look,
 ];
+
+impl Step {
+    /// The step's number in the order: `C1` to `C11`.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Bootout => "C1",
+            Self::Schedules => "C2",
+            Self::Kill => "C3",
+            Self::Images => "C4",
+            Self::Ipc => "C5",
+            Self::Flags => "C6",
+            Self::Contents => "C7",
+            Self::Shared => "C8",
+            Self::Crashes => "C9",
+            Self::Restore => "C10",
+            Self::Look => "C11",
+        }
+    }
+}
 
 impl fmt::Display for Step {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -62,9 +121,12 @@ impl fmt::Display for Step {
             Self::Kill => "kill",
             Self::Images => "images",
             Self::Ipc => "ipc",
-            Self::Home => "home",
-            Self::Folders => "folders",
+            Self::Flags => "flags",
+            Self::Contents => "contents",
             Self::Shared => "shared",
+            Self::Crashes => "crashes",
+            Self::Restore => "restore",
+            Self::Look => "look",
         };
         f.write_str(name)
     }
@@ -90,21 +152,13 @@ pub trait Os {
 
     /// The wait between the check's two looks.
     fn pause(&self);
-
-    /// Deletes the slot's user and makes it again with the same name and uid, its home
-    /// and its `/var/folders` entry new (the old ones moved where the uid cannot reach
-    /// them). Never called while a process of the uid lives.
-    ///
-    /// # Errors
-    /// What could not be done; the slot is then quarantined.
-    fn recreate(&self) -> Result<(), String>;
 }
 
 /// How the check of a [`Mutant`] answers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verify {
     /// The inner [`Os::left`] answers: what the skipped step left is found, so the clean
-    /// fails, is retried and ends recreated or quarantined, never clean.
+    /// fails and the slot ends dirty, never clean.
     Honest,
     /// [`Os::left`] answers nothing is left, whatever the inner one finds (all of it,
     /// not only the skipped step's: a skipped step can leave work for another's look,
@@ -126,7 +180,7 @@ pub struct Mutant {
 
 /// An [`Os`] that is `inner` except as its [`Mutant`] says: [`Os::run`] of the skipped
 /// step does nothing and succeeds, [`Os::left`] is empty when the check is blind. The
-/// order, the pause and the recreate are `inner`'s.
+/// order and the pause are `inner`'s.
 pub struct Mutated<'a> {
     inner: &'a dyn Os,
     mutant: Mutant,
@@ -158,69 +212,28 @@ impl Os for Mutated<'_> {
     fn pause(&self) {
         self.inner.pause();
     }
-
-    fn recreate(&self) -> Result<(), String> {
-        self.inner.recreate()
-    }
 }
 
 /// How a clean ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// The slot is clean (perhaps at the second attempt).
+    /// The slot is clean.
     Clean,
-    /// The clean failed twice; the user was made again, and the clean after that
-    /// passed. `why` is the failure that led to it.
-    Recreated { why: String },
-    /// The slot cannot be used again until the node is looked at: `why` says what
-    /// failed last.
-    Quarantined { why: String },
+    /// A step failed or the check found something left: the user is dirty, and the slot
+    /// is not offered until a clean passes. `why` says what failed.
+    Dirty { why: String },
 }
 
-/// Why one attempt failed.
-struct Failed {
-    /// A process of the uid survived: no recreate.
-    processes: bool,
-    why: String,
-}
-
-/// Cleans one slot through `os`: see the module documentation for the rules.
+/// Cleans one slot through `os`, once: see the module documentation for the rules.
 pub fn clean(os: &dyn Os) -> Outcome {
-    let Err(first) = attempt(os) else {
-        return Outcome::Clean;
-    };
-    tracing::warn!(why = %first.why, "the clean of a slot failed; trying once more");
-    let Err(again) = attempt(os) else {
-        return Outcome::Clean;
-    };
-    if again.processes {
-        return Outcome::Quarantined { why: again.why };
-    }
-    tracing::warn!(why = %again.why, "the clean of a slot failed twice; making its user again");
-    if let Err(why) = os.recreate() {
-        return Outcome::Quarantined {
-            why: format!("{}; making the user again: {why}", again.why),
-        };
-    }
-    match attempt(os) {
-        Ok(()) => Outcome::Recreated { why: again.why },
-        Err(after) => Outcome::Quarantined {
-            why: format!("after the user was made again: {}", after.why),
-        },
-    }
-}
-
-/// Every step, then the check's two looks.
-fn attempt(os: &dyn Os) -> Result<(), Failed> {
     let mut failed = Vec::new();
     for step in STEPS {
         if let Err(why) = os.run(step) {
             failed.push(format!("{step}: {why}"));
             if step == Step::Kill {
-                return Err(Failed {
-                    processes: true,
+                return Outcome::Dirty {
                     why: failed.join("; "),
-                });
+                };
             }
         }
     }
@@ -230,22 +243,20 @@ fn attempt(os: &dyn Os) -> Result<(), Failed> {
         left = os.left();
     }
     if failed.is_empty() && left.is_empty() {
-        return Ok(());
+        return Outcome::Clean;
     }
-    let processes = left.iter().any(|l| l.step == Step::Kill);
     failed.extend(
         left.into_iter()
             .map(|l| format!("left ({}): {}", l.step, l.what)),
     );
-    Err(Failed {
-        processes,
+    Outcome::Dirty {
         why: failed.join("; "),
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, VecDeque};
 
     use super::*;
@@ -256,18 +267,15 @@ mod tests {
         Run(Step),
         Left,
         Pause,
-        Recreate,
     }
 
-    /// An [`Os`] that records its calls: each step fails as many times as `fails` says,
-    /// each look answers the next entry of `looks` (then nothing is left), and the
-    /// recreate fails when `recreate` says so.
+    /// An [`Os`] that records its calls: each step fails as many times as `fails` says
+    /// and each look answers the next entry of `looks` (then nothing is left).
     #[derive(Default)]
     struct Fake {
         calls: RefCell<Vec<Call>>,
         fails: RefCell<BTreeMap<Step, usize>>,
         looks: RefCell<VecDeque<Vec<Left>>>,
-        recreate: Option<String>,
     }
 
     impl Fake {
@@ -309,15 +317,10 @@ mod tests {
         fn pause(&self) {
             self.calls.borrow_mut().push(Call::Pause);
         }
-
-        fn recreate(&self) -> Result<(), String> {
-            self.calls.borrow_mut().push(Call::Recreate);
-            self.recreate.clone().map_or(Ok(()), Err)
-        }
     }
 
-    /// The calls of one attempt that runs every step and looks twice.
-    fn whole_attempt() -> Vec<Call> {
+    /// The calls of one pass that runs every step and looks twice.
+    fn whole_pass() -> Vec<Call> {
         let mut calls: Vec<Call> = STEPS.iter().copied().map(Call::Run).collect();
         calls.extend([Call::Left, Call::Pause, Call::Left]);
         calls
@@ -330,13 +333,22 @@ mod tests {
         }
     }
 
-    /// Catches a step skipped or run out of the design's order (a kill before the
-    /// bootout lets launchd start the uid's agents again; a wipe before the kill races
-    /// the uid's processes), a check that looks only once (a job started again after
-    /// the kill is missed), and a recreate on the normal path: a clean slot runs each
-    /// step once in order, looks twice a pause apart, and is clean.
+    fn dirty(why: &str) -> Outcome {
+        Outcome::Dirty {
+            why: why.to_owned(),
+        }
+    }
+
+    /// Catches a step skipped, added or run out of the design's order C1 to C11 (a
+    /// kill before the bootout lets launchd start the uid's agents again; a removal
+    /// before the kill races the uid's processes; a removal before the root flags is
+    /// the defect of a locked home), a check that looks only once (a job started again
+    /// after the kill is missed), a retry or a second pass on the normal path, and step
+    /// codes that are not the numbers the design gives: a clean slot runs each step
+    /// once in exactly this order, looks twice a pause apart, and is clean. The mutant
+    /// "sweep before root flags" (Contents ahead of Flags in [`STEPS`]) turns this red.
     #[test]
-    fn a_clean_slot_runs_every_step_in_order_and_looks_twice() {
+    fn a_clean_slot_runs_c1_to_c11_in_order_once_and_looks_twice() {
         assert_eq!(
             STEPS.map(|s| s.to_string()),
             [
@@ -345,154 +357,129 @@ mod tests {
                 "kill",
                 "images",
                 "ipc",
-                "home",
-                "folders",
-                "shared"
+                "flags",
+                "contents",
+                "shared",
+                "crashes",
+                "restore",
+                "look"
+            ]
+        );
+        assert_eq!(
+            STEPS.map(Step::code),
+            [
+                "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11"
             ]
         );
         let fake = Fake::default();
         assert_eq!(clean(&fake), Outcome::Clean);
-        assert_eq!(fake.calls(), whole_attempt());
+        assert_eq!(fake.calls(), whole_pass());
     }
 
-    /// Catches a clean whose check is ignored (what a step left would reach the next
-    /// lease), and a check's second look ignored (what came back after the pause):
-    /// a slot with something left at either look is cleaned again, and passes then
-    /// without a recreate.
+    /// A model of the home that was locked by its user: the root carries `uchg` until
+    /// [`Step::Flags`] clears it, and [`Step::Contents`] cannot remove an entry of a
+    /// locked root.
+    #[derive(Default)]
+    struct Locked {
+        locked: Cell<bool>,
+    }
+
+    impl Os for Locked {
+        fn run(&self, step: Step) -> Result<(), String> {
+            match step {
+                Step::Flags => self.locked.set(false),
+                Step::Contents if self.locked.get() => {
+                    return Err("home: Operation not permitted".to_owned());
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn left(&self) -> Vec<Left> {
+            Vec::new()
+        }
+
+        fn pause(&self) {}
+    }
+
+    /// Catches the defect of the home root with `chflags uchg` set by its user: the
+    /// removal that runs before the flags are cleared cannot empty a locked directory,
+    /// so the clean fails on its single pass. With the root flags first, the one pass
+    /// is clean. The mutant "sweep before root flags" (Contents ahead of Flags in
+    /// [`STEPS`]) fails here with `contents: home: Operation not permitted`.
     #[test]
-    fn what_either_look_finds_fails_the_attempt_and_the_retry_can_pass() {
-        let fake = Fake::looking(vec![vec![left(Step::Home, "a file")]]);
-        assert_eq!(clean(&fake), Outcome::Clean);
-        let mut want = STEPS.iter().copied().map(Call::Run).collect::<Vec<_>>();
+    fn a_home_locked_by_its_user_is_cleaned_on_the_single_pass() {
+        let os = Locked::default();
+        os.locked.set(true);
+        assert_eq!(clean(&os), Outcome::Clean);
+        assert!(
+            STEPS.iter().position(|s| *s == Step::Flags)
+                < STEPS.iter().position(|s| *s == Step::Contents)
+        );
+    }
+
+    /// Catches a check whose findings are ignored (what a step left would reach the next
+    /// lease), a second look ignored (what came back after the pause), and a retry after
+    /// either: a slot with something left at either look is dirty after one pass and
+    /// names what it found.
+    #[test]
+    fn what_either_look_finds_leaves_the_user_dirty_after_one_pass() {
+        let fake = Fake::looking(vec![vec![left(Step::Contents, "a file")]]);
+        assert_eq!(clean(&fake), dirty("left (contents): a file"));
+        let mut want: Vec<Call> = STEPS.iter().copied().map(Call::Run).collect();
         want.push(Call::Left);
-        want.extend(whole_attempt());
         assert_eq!(fake.calls(), want);
 
         let fake = Fake::looking(vec![vec![], vec![left(Step::Bootout, "an agent")]]);
-        assert_eq!(clean(&fake), Outcome::Clean);
-        let mut want = whole_attempt();
-        want.extend(whole_attempt());
-        assert_eq!(fake.calls(), want);
+        assert_eq!(clean(&fake), dirty("left (bootout): an agent"));
+        assert_eq!(fake.calls(), whole_pass());
     }
 
-    fn quarantined(why: &str) -> Outcome {
-        Outcome::Quarantined {
-            why: why.to_owned(),
-        }
-    }
-
-    /// Catches a failed step that does not fail the clean, a step failure that stops
-    /// the steps after it (one stuck image would leave the home unwiped), and a clean
-    /// that never makes the user again: a step that fails twice leads to one recreate,
-    /// and a clean after it that passes is a recreate, reported with why.
+    /// Catches a failed step that does not fail the clean (the mutant "a failed step
+    /// does not leave the user dirty": `clean` returning `Clean` for a failure turns
+    /// this red), a step failure that stops the steps after it (one stuck image would
+    /// leave the home unemptied), a retry of the pass, and a recreate of the user: a
+    /// step that fails leaves the user dirty with its reason, after one pass with every
+    /// step run, and the fake is never asked to try again.
     #[test]
-    fn a_step_that_fails_twice_makes_the_user_again() {
+    fn a_failed_step_leaves_the_user_dirty_after_one_pass() {
         let fake = Fake::failing(Step::Images, 2);
+        assert_eq!(clean(&fake), dirty("images: images failed"));
+        assert_eq!(fake.calls(), whole_pass());
+        let fake = Fake::failing(Step::Crashes, 1);
+        fake.fails.borrow_mut().insert(Step::Contents, 1);
         assert_eq!(
             clean(&fake),
-            Outcome::Recreated {
-                why: "images: images failed".to_owned()
-            }
+            dirty("contents: contents failed; crashes: crashes failed")
         );
-        let mut want = whole_attempt();
-        want.extend(whole_attempt());
-        want.push(Call::Recreate);
-        want.extend(whole_attempt());
-        assert_eq!(fake.calls(), want);
+        assert_eq!(fake.calls(), whole_pass());
     }
 
-    /// Catches a recreate of a user whose processes survived (they would run on as an
-    /// orphan uid beside the next lease), steps that run after a failed kill (sweeps
-    /// racing live processes), and a slot given back with survivors: a kill that fails
-    /// twice, or processes the check finds, quarantine the slot without a recreate.
+    /// Catches steps that run after a failed kill (sweeps racing live processes), and a
+    /// slot given back with survivors: a kill that fails ends the pass at once, the
+    /// slot is dirty, and no step after C3 ran. Survivors the check finds after a pass
+    /// are dirty too, and the pass is not repeated.
     #[test]
-    fn survivors_quarantine_the_slot_without_a_recreate() {
-        let fake = Fake::failing(Step::Kill, 2);
-        assert_eq!(clean(&fake), quarantined("kill: kill failed"));
-        let once = [Step::Bootout, Step::Schedules, Step::Kill].map(Call::Run);
-        assert_eq!(fake.calls(), [once.clone(), once].concat());
-
-        let survivor = || vec![left(Step::Kill, "pid 7"), left(Step::Home, "a file")];
-        let fake = Fake::looking(vec![survivor(), survivor()]);
-        assert_eq!(
-            clean(&fake),
-            quarantined("left (kill): pid 7; left (home): a file")
-        );
-        assert!(!fake.calls().contains(&Call::Recreate));
-    }
-
-    /// Catches a recreate decided by the first attempt's failure rather than the
-    /// second's: a first attempt that fails on the home, then a retry whose check finds
-    /// a live process of the uid, quarantines the slot without a recreate (the user
-    /// deleted under that process would leave it running as an orphan uid).
-    #[test]
-    fn survivors_at_the_retry_quarantine_the_slot_after_another_first_failure() {
-        let fake = Fake::failing(Step::Home, 1);
-        *fake.looks.borrow_mut() = vec![vec![], vec![], vec![left(Step::Kill, "pid 7")]].into();
-        assert_eq!(clean(&fake), quarantined("left (kill): pid 7"));
-        let mut want = whole_attempt();
-        want.extend(STEPS.iter().copied().map(Call::Run));
-        want.push(Call::Left);
-        assert_eq!(fake.calls(), want);
-        assert!(!fake.calls().contains(&Call::Recreate));
-    }
-
-    /// Catches a recreate decision that remembers the first attempt's failed kill
-    /// (`again.processes || first.processes`): a first attempt whose kill failed, then
-    /// a retry whose kill succeeded and found no survivor but failed on the home, makes
-    /// the user again, because no process of the uid lives at the second attempt.
-    #[test]
-    fn a_kill_that_failed_only_at_the_first_attempt_does_not_quarantine_the_slot() {
+    fn survivors_leave_the_user_dirty_and_a_failed_kill_ends_the_pass() {
         let fake = Fake::failing(Step::Kill, 1);
-        fake.fails.borrow_mut().insert(Step::Home, 1);
-        assert_eq!(
-            clean(&fake),
-            Outcome::Recreated {
-                why: "home: home failed".to_owned()
-            }
-        );
-        // The first attempt stops at the failed kill, the retry runs every step and
-        // looks twice, the recreate follows and the attempt after it is whole.
-        let mut want = [Step::Bootout, Step::Schedules, Step::Kill]
-            .map(Call::Run)
-            .to_vec();
-        want.extend(whole_attempt());
-        want.push(Call::Recreate);
-        want.extend(whole_attempt());
-        assert_eq!(fake.calls(), want);
-    }
+        assert_eq!(clean(&fake), dirty("kill: kill failed"));
+        let upto = [Step::Bootout, Step::Schedules, Step::Kill].map(Call::Run);
+        assert_eq!(fake.calls(), upto);
 
-    /// Catches a slot given back although its user could not be made again, or was
-    /// made again and still not clean: either quarantines it, saying why.
-    #[test]
-    fn a_failed_recreate_or_a_failed_clean_after_it_quarantines_the_slot() {
-        let mut fake = Fake::failing(Step::Home, 2);
-        fake.recreate = Some("rename: Operation not permitted".to_owned());
+        let survivor = || vec![left(Step::Kill, "pid 7"), left(Step::Contents, "a file")];
+        let fake = Fake::looking(vec![survivor()]);
         assert_eq!(
             clean(&fake),
-            quarantined(
-                "home: home failed; making the user again: rename: Operation not permitted"
-            )
+            dirty("left (kill): pid 7; left (contents): a file")
         );
-        assert_eq!(fake.calls().last(), Some(&Call::Recreate));
-
-        let fake = Fake::failing(Step::Shared, 3);
-        assert_eq!(
-            clean(&fake),
-            quarantined("after the user was made again: shared: shared failed")
-        );
-        let recreates = fake
-            .calls()
-            .iter()
-            .filter(|c| **c == Call::Recreate)
-            .count();
-        assert_eq!(recreates, 1);
+        assert_eq!(fake.calls().len(), STEPS.len() + 1);
     }
 
     /// Catches a mutant that skips more or less than the one step it names (the mutant
     /// tests would then blame the wrong step), or that reorders, drops or doubles the
-    /// rest: for every step, the inner [`Os`] is asked the other seven in [`STEPS`]'
-    /// order and never the skipped one, and the clean is whole.
+    /// rest: for every step, the inner [`Os`] is asked the other ten in [`STEPS`]' order
+    /// and never the skipped one, and the clean is whole.
     #[test]
     fn a_mutant_skips_exactly_its_step_and_nothing_else() {
         for skip in STEPS {
@@ -505,7 +492,7 @@ mod tests {
                 },
             );
             assert_eq!(clean(&mutated), Outcome::Clean, "skipping {skip}");
-            let mut want = whole_attempt();
+            let mut want = whole_pass();
             want.retain(|c| *c != Call::Run(skip));
             assert_eq!(fake.calls(), want, "skipping {skip}");
         }
@@ -514,18 +501,18 @@ mod tests {
     /// Catches a blind check that lets the inner look through, and an honest one that
     /// blinds: what the inner look finds is hidden from the clean when blind (clean
     /// although something is left, the mutant's whole point) and seen when honest (the
-    /// retry runs and the user is made again).
+    /// slot is dirty).
     #[test]
     fn a_blind_check_hides_what_the_inner_look_finds_and_an_honest_one_does_not() {
-        let looks = || vec![vec![left(Step::Home, "a file")]; 8];
+        let looks = || vec![vec![left(Step::Contents, "a file")]; 2];
         let blind = Fake::looking(looks());
         let mutant = Mutant {
-            skip: Step::Home,
+            skip: Step::Contents,
             verify: Verify::Blind,
         };
         assert_eq!(clean(&Mutated::new(&blind, mutant)), Outcome::Clean);
-        let mut want = whole_attempt();
-        want.retain(|c| *c != Call::Run(Step::Home));
+        let mut want = whole_pass();
+        want.retain(|c| *c != Call::Run(Step::Contents));
         assert_eq!(blind.calls(), want);
 
         let honest = Fake::looking(looks());
@@ -533,31 +520,9 @@ mod tests {
             verify: Verify::Honest,
             ..mutant
         };
-        let outcome = clean(&Mutated::new(&honest, mutant));
-        assert!(
-            matches!(outcome, Outcome::Quarantined { .. }),
-            "{outcome:?}"
-        );
-        assert!(honest.calls().contains(&Call::Recreate));
-    }
-
-    /// Catches a mutant that does not hand the recreate to the inner [`Os`] (the user
-    /// would not be made again, and the quarantine reason would be lost): the inner's
-    /// failure is the clean's.
-    #[test]
-    fn a_mutant_hands_the_recreate_to_the_inner_os() {
-        let mut fake = Fake::failing(Step::Home, 2);
-        fake.recreate = Some("rename: Operation not permitted".to_owned());
-        let mutant = Mutant {
-            skip: Step::Shared,
-            verify: Verify::Honest,
-        };
         assert_eq!(
-            clean(&Mutated::new(&fake, mutant)),
-            quarantined(
-                "home: home failed; making the user again: rename: Operation not permitted"
-            )
+            clean(&Mutated::new(&honest, mutant)),
+            dirty("left (contents): a file")
         );
-        assert_eq!(fake.calls().last(), Some(&Call::Recreate));
     }
 }

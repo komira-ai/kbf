@@ -135,21 +135,23 @@ async fn skipping_the_ipc_removal_turns_the_sem_row_red() {
     mutant_turns_red(Step::Ipc).await;
 }
 
-/// Mutant test: the home wipe skipped turns `home`, `defaults`, `keychain` and `agent`
-/// (the plist in the home) red. Catches a wipe that does nothing while the freshness
-/// test stays green.
+/// Mutant test: the flags step skipped turns no row red: no row of the freshness test
+/// locks anything, and the sweep clears the locks of what the uid owns itself. Pins that
+/// the freshness test is blind to this step; its test is the locked home
+/// (`single_pass.rs`, with its own mutant).
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
 #[tokio::test]
-async fn skipping_the_home_wipe_turns_the_home_rows_red() {
-    mutant_turns_red(Step::Home).await;
+async fn skipping_the_flags_step_turns_no_freshness_row_red() {
+    mutant_turns_red(Step::Flags).await;
 }
 
-/// Mutant test: the `/var/folders` wipe skipped turns `T` and `C` red. Catches a wipe
-/// that does nothing while the freshness test stays green.
+/// Mutant test: the contents removal skipped turns `home`, `defaults`, `keychain`,
+/// `agent` (the plist in the home), `T` and `C` red. Catches a removal that does nothing
+/// while the freshness test stays green.
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
 #[tokio::test]
-async fn skipping_the_folders_wipe_turns_the_t_and_c_rows_red() {
-    mutant_turns_red(Step::Folders).await;
+async fn skipping_the_contents_removal_turns_the_home_and_folder_rows_red() {
+    mutant_turns_red(Step::Contents).await;
 }
 
 /// Mutant test: the shared sweep skipped turns `tmp`, `var-tmp` and `shared` red.
@@ -159,4 +161,29 @@ async fn skipping_the_folders_wipe_turns_the_t_and_c_rows_red() {
 #[tokio::test]
 async fn skipping_the_shared_sweep_turns_the_tmp_rows_red() {
     mutant_turns_red(Step::Shared).await;
+}
+
+/// Mutant test: the crash sweep skipped turns no freshness row red (the scenario crashes
+/// nothing). Its test is the crash report under another user's folder (`single_pass.rs`,
+/// with its own mutant).
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
+#[tokio::test]
+async fn skipping_the_crash_sweep_turns_no_freshness_row_red() {
+    mutant_turns_red(Step::Crashes).await;
+}
+
+/// Mutant test: the restore skipped turns no row red: the contents removal leaves the
+/// home as it was, and nothing in the scenario changes its owner, mode or flags.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
+#[tokio::test]
+async fn skipping_the_restore_turns_no_freshness_row_red() {
+    mutant_turns_red(Step::Restore).await;
+}
+
+/// Mutant test: the second process look skipped turns no row red: the kill already left
+/// nothing, and the check's own looks are blind in these runs.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
+#[tokio::test]
+async fn skipping_the_second_look_turns_no_freshness_row_red() {
+    mutant_turns_red(Step::Look).await;
 }

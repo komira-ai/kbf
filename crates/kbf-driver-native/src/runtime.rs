@@ -281,6 +281,9 @@ impl<C: Cas> NativeRuntime<C> {
         )];
         #[cfg(target_os = "macos")]
         if let Some(slots) = &self.slots {
+            // A report is the one moment a node whose slots are all dirty hears of them:
+            // it takes no lease, so nothing else cleans them again.
+            slots.recheck();
             entries.push((
                 crate::slots::CAPABILITY.to_owned(),
                 slots.count().to_string(),

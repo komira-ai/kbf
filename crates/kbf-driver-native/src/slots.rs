@@ -11,9 +11,9 @@
 //!   once the lease has ended and the clean of its directory has run; the slot is
 //!   cleaned first ([`clean`]: its launchd domain, crontab, `at` jobs, processes, disk
 //!   images, System V IPC objects, home, `/var/folders` entry and files in the shared
-//!   temporary places), the clean is checked, the user is made again if the check
-//!   fails twice, and the slot is quarantined (the node reports one fewer) if that
-//!   fails too;
+//!   temporary places, crash reports), the clean is checked, and a clean that fails
+//!   leaves the slot dirty: not offered to a lease, the node reports one fewer, and it
+//!   is cleaned again before it is offered ([`book`]); the user is never made again;
 //! - its lease directory is the slot user's alone (mode 0700, from the moment it is made:
 //!   another pool user cannot read, list or connect into it, and the root of the leases is
 //!   searchable by others, `LEASES_ROOT_MODE`, so the slot user can reach it), and its
@@ -36,10 +36,10 @@
 //! ([`crate::procs`]); a pool there is refused.
 //!
 //! Not yet: the scheduler does not book slots (a lease past `N` waits here for a free
-//! one); a quarantined slot lowers the runtime's `action_slots` entry, which reaches
+//! one); a dirty slot lowers the runtime's `action_slots` entry, which reaches
 //! the server with the driver's next report (the next Xcode survey, every
 //! `--xcode-recheck-secs`), not at once; and nothing drains and reboots a node with a
-//! quarantined slot (section 1 of the design).
+//! dirty slot (section 1 of the design).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -49,9 +49,19 @@ use kbf_daemon::RuntimeError;
 use crate::network::{Isolation, Network};
 use crate::record::KeeperFor;
 
+// The bookkeeping and the clean's rules over text and a fake `launchctl` run on every
+// platform; only a Mac uses them outside tests.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod book;
 pub mod clean;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod crash;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod domain;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod probe;
 
 /// The lowest uid a pool user may have: every uid below it is root's, a system
 /// account's, or (from 501) one a Mac gives its first human users. The pool's uids

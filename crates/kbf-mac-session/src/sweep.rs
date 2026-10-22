@@ -123,27 +123,75 @@ pub fn sweep(plan: &SweepPlan, user: &str, uid: u32) -> Swept {
 /// stays, and a `dir` that does not exist holds nothing.
 #[must_use]
 pub fn empty(dir: &Path, uid: u32) -> Swept {
+    empty_keeping(dir, uid, &[])
+}
+
+/// [`empty`], but a directory of `dir` named in `keep` is emptied and kept, not removed
+/// (a `/var/folders` entry keeps its `0`, `C` and `T`; anything else in it, a file or a
+/// directory of another name, goes whole). A `keep` name that is not a directory of
+/// `dir`'s own filesystem (a file, a link, a mount point) is removed like any other
+/// entry.
+#[must_use]
+pub fn empty_keeping(dir: &Path, uid: u32, keep: &[&str]) -> Swept {
     let mut swept = Swept::default();
-    let result = empty_base(dir, uid, &mut swept);
+    let result = empty_base(dir, uid, keep, &mut swept);
     note(&mut swept, dir, result);
     swept
 }
 
-/// [`empty`]: every entry of `path` removed, each error recorded and the rest gone on
-/// with.
-fn empty_base(path: &Path, uid: u32, swept: &mut Swept) -> io::Result<()> {
+/// [`empty_keeping`]: every entry of `path` removed, each error recorded and the rest
+/// gone on with.
+fn empty_base(path: &Path, uid: u32, keep: &[&str], swept: &mut Swept) -> io::Result<()> {
     let Some(dir) = open_base(path)? else {
         return Ok(());
     };
     let dev = rustix::fs::fstat(&dir)?.st_dev;
     for name in listed(&dir)? {
+        let here = path.join(&name);
         // An entry gone since the listing is neither removed nor an error.
         let result = examine(&dir, &name).and_then(|stat| match stat {
+            Some(stat) if is_kept(&name, keep, &stat, dev) => {
+                empty_kept(&dir, &name, &here, &stat, uid, dev, swept).map(|()| 0)
+            }
             Some(stat) => remove_entry(&dir, &name, &stat, uid, dev, 1).map(|()| 1),
             None => Ok(0),
         });
         swept.removed += *result.as_ref().unwrap_or(&0);
-        note(swept, &path.join(&name), result.map(drop));
+        note(swept, &here, result.map(drop));
+    }
+    Ok(())
+}
+
+/// Whether `name`, examined as `stat` in a directory on `dev`, is a directory
+/// [`empty_keeping`] keeps.
+fn is_kept(name: &OsStr, keep: &[&str], stat: &Stat, dev: StDev) -> bool {
+    is_dir(stat) && stat.st_dev == dev && keep.iter().any(|k| OsStr::new(k) == name)
+}
+
+/// Empties the kept directory `name` of `dir`, examined as `stat`: each entry removed,
+/// each error recorded against its path.
+fn empty_kept(
+    dir: &OwnedFd,
+    name: &OsStr,
+    here: &Path,
+    stat: &Stat,
+    uid: u32,
+    dev: StDev,
+    swept: &mut Swept,
+) -> io::Result<()> {
+    let child = match open_child(dir, name, stat) {
+        Ok(child) => child,
+        // Gone since it was examined: it holds nothing.
+        Err(why) if why.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(why) => return Err(why),
+    };
+    for entry in listed(&child)? {
+        let result = examine(&child, &entry).and_then(|inner| match inner {
+            Some(inner) => remove_entry(&child, &entry, &inner, uid, dev, 2).map(|()| 1),
+            None => Ok(0),
+        });
+        swept.removed += *result.as_ref().unwrap_or(&0);
+        note(swept, &here.join(&entry), result.map(drop));
     }
     Ok(())
 }
@@ -384,6 +432,129 @@ fn unlock(dir: &OwnedFd, name: &OsStr, stat: &Stat) -> io::Result<()> {
 #[cfg(not(target_os = "macos"))]
 #[allow(clippy::unnecessary_wraps)] // the macOS variant can fail
 fn unlock(_dir: &OwnedFd, _name: &OsStr, _stat: &Stat) -> io::Result<()> {
+    Ok(())
+}
+
+/// The user flags [`clear_flags`] clears: `uchg`, `uappnd`, `nodump`, `opaque` and
+/// `hidden`, as the bits of `st_flags` (`UF_IMMUTABLE`, `UF_APPEND`, `UF_NODUMP`,
+/// `UF_OPAQUE`, `UF_HIDDEN`), never spelled as `chflags` words: `nodump` there is the flag
+/// itself, and its opposite is `dump`. The flags only root may change (`schg`,
+/// `restricted`) are not in it: they are not the pool user's to set.
+pub const CLEARED_FLAGS: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x8000;
+
+/// Clears [`CLEARED_FLAGS`] on the directory `dir` itself, whoever owns it (the caller
+/// names a home or a `/var/folders` entry, a place it knows), then, with the owner's
+/// mode made `u+rwx`, on every entry below it that `uid` owns, at any depth: never through
+/// a link, never past `dir`'s filesystem, and nothing of another owner's is changed (a
+/// hard link to a system file keeps the flags and mode of its inode). The root first, so
+/// a locked root does not stop the walk below it, and a clean's removal after this
+/// finds nothing locked. Each error is recorded against its path and the walk goes on.
+/// Flags are macOS's: elsewhere only the modes change.
+#[must_use]
+pub fn clear_flags(dir: &Path, uid: u32) -> Swept {
+    let mut swept = Swept::default();
+    let result = clear_base(dir, uid, &mut swept);
+    note(&mut swept, dir, result);
+    swept
+}
+
+/// [`clear_flags`] from the opened `path`.
+fn clear_base(path: &Path, uid: u32, swept: &mut Swept) -> io::Result<()> {
+    let Some(dir) = open_base(path)? else {
+        return Ok(());
+    };
+    clear_root(&dir)?;
+    let dev = rustix::fs::fstat(&dir)?.st_dev;
+    clear_below(&dir, path, uid, dev, 0, swept)
+}
+
+/// Every entry of `dir`, cleared; errors are recorded, not returned (a listing that
+/// fails is).
+fn clear_below(
+    dir: &OwnedFd,
+    path: &Path,
+    uid: u32,
+    dev: StDev,
+    depth: usize,
+    swept: &mut Swept,
+) -> io::Result<()> {
+    for name in listed(dir)? {
+        let here = path.join(&name);
+        let result = clear_entry(dir, &name, &here, (uid, dev, depth), swept);
+        note(swept, &here, vanished(result));
+    }
+    Ok(())
+}
+
+/// One entry of [`clear_below`]'s directory: its flags and mode if `uid` owns it, then
+/// what is below it if it is a directory on the same filesystem.
+fn clear_entry(
+    dir: &OwnedFd,
+    name: &OsStr,
+    here: &Path,
+    (uid, dev, depth): (u32, StDev, usize),
+    swept: &mut Swept,
+) -> io::Result<()> {
+    let Some(stat) = examine(dir, name)? else {
+        return Ok(());
+    };
+    if stat.st_dev != dev {
+        return Ok(());
+    }
+    if stat.st_uid == uid {
+        clear_marked(dir, name, &stat)?;
+        swept.removed += 1;
+        if !is_link(&stat) {
+            rustix::fs::chmodat(dir, name, owner_rwx(&stat), AtFlags::empty())?;
+        }
+    }
+    if !is_dir(&stat) {
+        return Ok(());
+    }
+    if depth >= MAX_DEPTH {
+        // The uid's own tree that deep fails closed; another owner's is not searched.
+        return if stat.st_uid == uid {
+            Err(too_deep())
+        } else {
+            Ok(())
+        };
+    }
+    let child = open_child(dir, name, &stat)?;
+    clear_below(&child, here, uid, dev, depth + 1, swept)
+}
+
+/// The permission bits of `stat` with the owner's `rwx` added.
+#[allow(clippy::unnecessary_cast)] // `st_mode` is u32 on Linux, u16 on macOS
+fn owner_rwx(stat: &Stat) -> Mode {
+    Mode::from_raw_mode(((stat.st_mode as u32 & 0o7777) | 0o700) as _)
+}
+
+#[allow(clippy::unnecessary_cast)] // `st_mode` is u32 on Linux, u16 on macOS
+fn is_link(stat: &Stat) -> bool {
+    FileType::from_raw_mode(stat.st_mode as _) == FileType::Symlink
+}
+
+/// Clears [`CLEARED_FLAGS`] of the directory `dir` itself.
+#[cfg(target_os = "macos")]
+fn clear_root(dir: &OwnedFd) -> io::Result<()> {
+    crate::macos::clear_dir_flags(dir, CLEARED_FLAGS)
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)] // the macOS variant can fail
+fn clear_root(_dir: &OwnedFd) -> io::Result<()> {
+    Ok(())
+}
+
+/// Clears [`CLEARED_FLAGS`] of `name` in `dir`, without following a link.
+#[cfg(target_os = "macos")]
+fn clear_marked(dir: &OwnedFd, name: &OsStr, stat: &Stat) -> io::Result<()> {
+    crate::macos::clear_flags_of(dir, name, stat.st_flags, CLEARED_FLAGS)
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)] // the macOS variant can fail
+fn clear_marked(_dir: &OwnedFd, _name: &OsStr, _stat: &Stat) -> io::Result<()> {
     Ok(())
 }
 
