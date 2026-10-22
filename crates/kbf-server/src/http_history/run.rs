@@ -15,8 +15,8 @@ use kbf_auth::authorize;
 use kbf_front::Recorder;
 use kbf_history::RunId;
 use kbf_history::records::{
-    CommandRendering, FailedRun, FlogStream, RunOutcome, RunRecord, Tail, TailOmitted, Timestamps,
-    WireDigest,
+    BookSource, CommandRendering, FailedRun, FlogStream, RunOutcome, RunRecord, Tail, TailOmitted,
+    Timestamps, WireDigest,
 };
 use kbf_invocation::WallTime;
 use kbf_types::Digest;
@@ -371,6 +371,27 @@ pub(crate) fn render(r: &RunRecord) -> Value {
     }
     if r.presubmit_us != 0 {
         put("presubmit_us", r.presubmit_us.into());
+    }
+    if let Some(operation) = r.operation_id {
+        put("operation_id", operation.into());
+    }
+    for (key, source) in [
+        ("cpu_source", r.cpu_source()),
+        ("memory_source", r.memory_source()),
+    ] {
+        match source {
+            BookSource::Unspecified => {}
+            BookSource::Default => put(key, "default".into()),
+            BookSource::Hint => put(key, "hint".into()),
+        }
+    }
+    for (key, value) in [
+        ("input_bytes", r.input_bytes),
+        ("input_files", r.input_files),
+    ] {
+        if let Some(value) = value {
+            put(key, value.into());
+        }
     }
     put("reapi_times", reapi_times(&t));
     if let Some(c) = &r.cgroup {

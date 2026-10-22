@@ -86,6 +86,12 @@ fn every_how_is_recorded() {
             Some(name("b", 4))
         ]
     );
+    let operations: Vec<_> = inv.rows().iter().map(|r| r.operation_id).collect();
+    assert_eq!(
+        operations,
+        [None, None, Some(OperationId(3)), Some(OperationId(4))],
+        "a cached answer waits on no operation"
+    );
     // A hit and a cached Execute are answered at once: OK, with the cached result.
     assert_eq!(inv.rows()[0].outcome, Some(Outcome::Ok { exit_code: 0 }));
     assert_eq!(inv.rows()[1].outcome, Some(Outcome::Ok { exit_code: 0 }));
@@ -618,6 +624,7 @@ fn the_command_digest_lands_on_its_row() {
         action: d(action),
         command: d(77),
         shape: None,
+        evidence: None,
     };
     let r = records([
         queued("b", t(0), 1, 1),
@@ -630,6 +637,59 @@ fn the_command_digest_lands_on_its_row() {
     let rows = r.get(&key("b")).expect("record b").rows();
     assert_eq!((rows[0].command, rows[1].command), (None, Some(d(77))));
     assert!(r.get(&key("nobody")).is_none());
+}
+
+/// Catches: the operation id not set on a queued row or on a joined one (the joiner's
+/// attempts could not be regrouped with its twin's), the id of another operation, one
+/// set on a cached answer, which waits on none, and the evidence of one caller landing on
+/// another's row. The two callers of operation 1 share its id and each keep their own
+/// evidence.
+#[test]
+fn a_row_keeps_its_operation_id_and_the_evidence_its_own_call_sent() {
+    use kbf_invocation::{BookSource, Evidence};
+    use kbf_types::OperationId;
+
+    let hinted = Evidence {
+        cpu_source: BookSource::Default,
+        memory_source: BookSource::Hint,
+        input_bytes: Some(10),
+        input_files: Some(2),
+    };
+    let sized = Evidence {
+        input_bytes: Some(99),
+        ..Evidence::default()
+    };
+    let command = |who: &str, action, evidence| Event::Command {
+        id: id(who),
+        owner: owner(""),
+        action: d(action),
+        command: d(77),
+        shape: None,
+        evidence,
+    };
+    let r = records([
+        queued("first", t(0), 1, 1),
+        command("first", 1, Some(hinted)),
+        joined("second", t(1), 1, 1),
+        command("second", 1, Some(Evidence::default())),
+        queued("third", t(2), 2, 2),
+        queued("third", t(2), 3, 3),
+        command("third", 3, Some(sized)),
+    ]);
+    let row = |k: &str| r.get(&key(k)).expect("record").rows()[0].clone();
+    assert_eq!(row("first").operation_id, Some(OperationId(1)));
+    assert_eq!(
+        row("second").operation_id,
+        Some(OperationId(1)),
+        "the twin's"
+    );
+    assert_eq!(row("third").operation_id, Some(OperationId(2)));
+    assert_eq!(row("first").evidence, Some(hinted));
+    assert_eq!(row("second").evidence, Some(Evidence::default()));
+    let third = r.get(&key("third")).expect("record").rows();
+    assert_eq!(third[0].evidence, None, "never told");
+    assert_eq!(third[1].evidence, Some(sized), "the row of its own action");
+    assert_eq!(third[1].operation_id, Some(OperationId(3)));
 }
 
 /// Catches lease events for an operation no record waits on, or for a lease the

@@ -426,6 +426,7 @@ fn submit(farm: &TestFarm, request: Request) -> Result<(), Status> {
         request,
         call: None,
         described: Described::default(),
+        evidence: Default::default(),
     })
     .map(drop)
 }
@@ -952,6 +953,7 @@ async fn the_third_lost_lease_answers_the_caller_with_the_reason() {
             request: request(1),
             call: None,
             described: Described::default(),
+            evidence: Default::default(),
         })
         .expect("submitted");
     assert_eq!(starts(&mut inbox).len(), 1);
@@ -1207,6 +1209,7 @@ async fn a_finished_operation_leaves_its_result_in_the_store() {
             request: request(1),
             call: None,
             described: Described::default(),
+            evidence: Default::default(),
         })
         .expect("submitted");
     let leases = starts(&mut inbox);
@@ -1239,6 +1242,7 @@ async fn a_refused_operation_leaves_its_refusal_in_the_store() {
             request: request(1),
             call: None,
             described: Described::default(),
+            evidence: Default::default(),
         })
         .expect("submitted");
     assert_eq!(starts(&mut inbox).len(), 1);
@@ -1265,6 +1269,7 @@ async fn running(disk: &Disk) -> (TestFarm, kbf_front::Ticket, LeaseId) {
             request: request(1),
             call: None,
             described: Described::default(),
+            evidence: Default::default(),
         })
         .expect("submitted");
     let leases = starts(&mut inbox);
@@ -1417,6 +1422,7 @@ async fn a_request_while_the_finish_is_held_does_not_retake_the_finished_operati
             request: request(1),
             call: None,
             described: Described::default(),
+            evidence: Default::default(),
         })
         .expect("submitted");
     let leases = starts(&mut inbox);
@@ -1470,6 +1476,7 @@ async fn a_request_after_the_retention_of_a_held_finish_does_not_retake_the_oper
             request: request(1),
             call: None,
             described: Described::default(),
+            evidence: Default::default(),
         })
         .expect("submitted");
     let leases = starts(&mut inbox);
@@ -1546,6 +1553,7 @@ async fn running_two(disk: &Disk) -> (TestFarm, [kbf_front::Ticket; 2], [LeaseId
             request: request(tag),
             call: None,
             described: Described::default(),
+            evidence: Default::default(),
         })
         .expect("submitted")
     });
@@ -1706,6 +1714,7 @@ async fn a_stale_record_in_the_feed_does_not_drop_a_written_answers_detail() {
                 request: request(tag),
                 call: None,
                 described: Described::default(),
+                evidence: Default::default(),
             })
             .expect("submitted")
         })
@@ -2014,6 +2023,7 @@ async fn a_kept_epoch_does_not_reuse_operation_names() {
             request: request(1),
             call: None,
             described: Described::default(),
+            evidence: Default::default(),
         })
         .expect("submitted")
         .name;
