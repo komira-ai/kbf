@@ -61,7 +61,7 @@ impl RamBudget {
     fn try_acquire(self: &Arc<Self>, bytes: u64) -> Option<Permit> {
         let taken = self
             .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|total| *total <= self.cap)
             });
         taken.ok().map(|_| Permit {

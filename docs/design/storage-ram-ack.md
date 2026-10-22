@@ -203,7 +203,10 @@ is 0, so with the flag at its default the set is empty and every number below re
 - `--ram-drain-deadline` (30 s, at least 1) bounds the drain a storage node makes when it
   stops: after its calls have ended (and so after the daemon's lease drain, which is what
   tells the storage half to stop), `drain_for_shutdown` takes every blob, not waiting
-  out a backoff, until none is held or the deadline ends; what it leaves is logged.
+  out a backoff, until none is held or the deadline ends; what it leaves is logged at
+  error level with the blob and byte counts. A stop that passes the deadline loses the
+  blobs that were acknowledged but are held only in RAM; the meta-backup refuses while any
+  are held.
   Only `kbf storage` and the storage half of `storage-and-daemon` run it; a server with
   no replica holds nothing. A Draining member is **not yet** kept from counting as filled
   while it holds entries: that belongs with the producer.

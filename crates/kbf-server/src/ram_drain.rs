@@ -58,7 +58,7 @@ impl<M: MetaLog + 'static, O: ObjectStore + 'static> RamDrain<M, O> {
                     tracing::info!("the blobs held in RAM are written to disk");
                 }
                 ShutdownDrain::TimedOut { blobs, bytes } => {
-                    tracing::warn!(
+                    tracing::error!(
                         blobs,
                         bytes,
                         ?deadline,

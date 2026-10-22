@@ -568,6 +568,9 @@ kbf-deploy linux meta-verify --archive FILE --into DIR
   `kbf_storage_ram_unwritten_bytes` (blobs acknowledged from RAM and not yet written to the
   disk; always 0 until a node acknowledges from RAM) is above 0; an answer it cannot read
   is a refusal. A server that does not print the RAM family holds none.
+  A stop that passes `--ram-drain-deadline` loses the blobs that were acknowledged but are
+  held only in RAM (the stop logs them at error level, with their count and bytes); that is
+  why `meta-backup` refuses while any are held.
   The write tier is not flushed at shutdown, so a block left on the hot store holds
   acknowledged bytes the object store does not have. A server with a write tier needs
   `--hot-dir` (its `--hot-store` directory); one without needs none.
