@@ -159,22 +159,23 @@ fn unit_names_are_sanitized() {
     }
 }
 
-/// Catches an interpolation into a shell: no command runs a shell, none passes a "run this
-/// string" flag, and no argument holds the version inside a longer shell-looking string.
-/// (The names are built at run time so this file is not itself a shell invocation.)
+/// Catches an interpolation into a shell: every program is one of the five this module
+/// names, the program a unit runs is `apt-get` and nothing else, no argument is the flag
+/// that makes a program run a string, and no argument holds a shell metacharacter. (The
+/// flag is built at run time, so this file does not itself name one.)
 #[test]
 fn no_shell_anywhere() {
-    let shells: Vec<String> = ["s", "bas", "das", "zs", "ks", "fis"]
-        .iter()
-        .flat_map(|s| [format!("/bin/{s}h"), format!("/usr/bin/{s}h")])
-        .collect();
+    let programs = [DPKG_QUERY, KBF, SYSTEMCTL, SYSTEMD_RUN];
     let run_string = format!("-{}", 'c');
     for cmd in every_command() {
-        assert!(!shells.contains(&cmd.program), "{cmd:?}");
-        assert!(!cmd.program.ends_with("sh"), "{cmd:?}");
+        assert!(programs.contains(&cmd.program.as_str()), "{cmd:?}");
+        if cmd.program == SYSTEMD_RUN {
+            let after: Vec<&String> = cmd.args.iter().skip_while(|a| *a != "--").collect();
+            assert_eq!(after[0], "--");
+            assert_eq!(after[1], APT_GET, "{cmd:?}");
+        }
         assert!(!cmd.args.contains(&run_string), "{cmd:?}");
         for arg in &cmd.args {
-            assert!(!shells.contains(arg), "{cmd:?}");
             for meta in [';', '|', '&', '`', '>', '<', '\n', '\''] {
                 assert!(!arg.contains(meta), "{arg:?} in {cmd:?}");
             }

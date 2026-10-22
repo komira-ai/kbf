@@ -174,7 +174,7 @@ fn refused_inputs() {
         ("capital KBF", "install KBF=1 from c".into()),
         // Other verbs.
         ("remove", "remove kbf".into()),
-        ("shell", "bash".into()),
+        ("a program name", "systemctl".into()),
         ("sftp", "internal-sftp".into()),
     ];
     for (what, text) in &cases {
