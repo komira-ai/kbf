@@ -225,18 +225,10 @@ impl Scheduler {
         if self.awaited.remove(id).is_none() {
             return;
         }
-        // A lease a key floor raised before the handover ran under that raise: the
-        // store holds the submitted request, so the raise is made again, under the node
-        // the lease runs on.
-        let leased: Vec<OperationId> = self
-            .held
-            .values()
-            .map(|held| held.operation)
-            .filter(|op| self.ops[op].state.holding().is_some_and(|(_, w)| w == id))
-            .collect();
-        for op in leased {
-            self.raise_to_key_floor(op, Some(worker.capacity.memory_bytes));
-        }
+        // A recovered lease books the request the store holds. A key floor is not raised
+        // onto it: the store does not say what the lease was granted at, and a floor set
+        // after the grant (by a sibling's kill) would book more than the lease runs under,
+        // so its own kill would step the ladder past a rung and count as a new event.
         for held in self.held.values_mut() {
             let op = &self.ops[&held.operation];
             if op.state.holding().is_none_or(|(_, holder)| holder != id) {

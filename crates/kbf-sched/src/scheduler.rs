@@ -107,6 +107,9 @@ struct KeyApplied {
     base: u64,
     /// The memory the raise gave it.
     applied: u64,
+    /// The raise was taken back because no worker could take it without owning the worker
+    /// whole: the operation books what it asked for, and the floor does not raise it again.
+    undone: bool,
 }
 
 /// A queued operation no live worker can run: since when, why, and whether the wait
@@ -541,14 +544,20 @@ impl Scheduler {
         let mut servable = Servable::new(&self.workers, &self.cordons, now);
         let mut placed = Vec::new();
         let mut verdicts = Vec::new();
+        let mut stuck = Vec::new();
         let mut reserved = BTreeSet::new();
         let mut reservations = BTreeMap::new();
         for &(_, id) in &self.queue {
             let op = &self.ops[&id];
             let request = &op.request;
+            // A memory a key floor gave it never owns a worker whole while another could
+            // take it.
+            let key_raised = op
+                .key_applied
+                .is_some_and(|a| !a.undone && a.applied == request.resources.memory_bytes);
             let fitted = placed.len() < PLACEMENT_ROUND
                 && servable
-                    .fit(&mut self.workers, request, &reserved, &op.avoid)
+                    .fit(&mut self.workers, request, &reserved, &op.avoid, key_raised)
                     .map(|(name, booked, device)| placed.push((id, name, booked, device)))
                     .is_some();
             let verdict = if fitted {
@@ -570,9 +579,21 @@ impl Scheduler {
                 reserved.insert(name.clone());
                 reservations.insert(id, name);
             }
+            if !fitted
+                && key_raised
+                && verdict == Verdict::Servable
+                && !servable.roomy(&self.workers, request)
+            {
+                // Only a worker the raise would own whole is left: it books what it
+                // asked for before the floor instead.
+                stuck.push(id);
+            }
             if op.unservable.is_some() || verdict != Verdict::Servable {
                 verdicts.push((id, verdict));
             }
+        }
+        for id in stuck {
+            self.undo_key_raise(id);
         }
         self.reservations = reservations;
         for (id, verdict) in verdicts {

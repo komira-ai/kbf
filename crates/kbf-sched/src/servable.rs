@@ -108,6 +108,10 @@ impl Servable {
     /// waits until some worker's free memory meets its request; nothing reserves a worker
     /// for it.
     ///
+    /// With `not_whole` (a request a key floor raised) a worker whose memory the request
+    /// equals is skipped: there it would own the host. [`Servable::roomy`] tells whether
+    /// any worker is left.
+    ///
     /// A worker in `avoid` (one the operation's earlier runs ended on as the farm's
     /// fault) is skipped while a worker placement may use outside it could run the
     /// request once its bookings end: the request waits for that one. Only when none
@@ -118,6 +122,7 @@ impl Servable {
         request: &Request,
         reserved: &BTreeSet<WorkerId>,
         avoid: &BTreeSet<WorkerId>,
+        not_whole: bool,
     ) -> Option<(WorkerId, Resources, Option<String>)> {
         let at = self.matching(workers, request);
         let skip = self.avoided(at, workers, request, avoid);
@@ -129,6 +134,7 @@ impl Servable {
                 !reserved.contains(*name)
                     && !skip.contains(*name)
                     && workers[*name].has_room(request)
+                    && (!not_whole || !workers[*name].exclusive(request))
             })
             // The first of the least loaded: `live` is in name order.
             .min_by_key(|name| workers[*name].load())?
@@ -149,6 +155,21 @@ impl Servable {
         let device = worker.free_device(&request.needs).map(str::to_owned);
         worker.devices.extend(device.clone());
         Some((name, booked, device))
+    }
+
+    /// Whether some live worker placement may use that serves `request` could take it
+    /// without being owned whole: one with more memory than the request asks for.
+    pub(crate) fn roomy(
+        &mut self,
+        workers: &BTreeMap<WorkerId, Worker>,
+        request: &Request,
+    ) -> bool {
+        let at = self.matching(workers, request);
+        self.memo[at].1.iter().any(|&i| {
+            let w = &workers[&self.live[i]];
+            w.capacity.fits(&request.resources)
+                && w.capacity.memory_bytes > request.resources.memory_bytes
+        })
     }
 
     /// The worker to hold for a whole-machine `request` that fits nowhere now: `kept`
