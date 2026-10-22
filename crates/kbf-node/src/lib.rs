@@ -2117,6 +2117,65 @@ mod tests {
         remote(cli)
     }
 
+    /// Starting with a retired flag logs the warning naming it, and starting without one logs
+    /// nothing of the kind: the call in `start_over` is what makes the flag's text reach a log.
+    #[test]
+    fn start_over_logs_the_retired_flag_warning() {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("lock").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Sink {
+                self.clone()
+            }
+        }
+        let dir = scratch("retired-warn");
+        tls_files(&dir);
+        let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
+        let argv = |extra: Option<String>| {
+            let mut all = vec![
+                "kbf-daemon".to_owned(),
+                "--server=https://127.0.0.1:1".to_owned(),
+                flag("ca-cert", &dir.join("ca.pem")),
+                flag("cert", &dir.join("node.pem")),
+                flag("key", &dir.join("node.key")),
+                "--node-id=mac-1".to_owned(),
+                "--driver=native".to_owned(),
+                "--cas=https://127.0.0.1:1".to_owned(),
+                flag("data-dir", &dir),
+                flag("xcode-apps", &dir.join("Applications")),
+            ];
+            all.extend(extra);
+            Cli::try_parse_from(all).expect("flags")
+        };
+        let logged = |cli: &Cli| {
+            let sink = Sink::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(sink.clone())
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                drop(start_over(cli, None, plane).expect("start"));
+            });
+            let bytes = sink.0.lock().expect("lock").clone();
+            String::from_utf8(bytes).expect("utf8")
+        };
+        let with = logged(&argv(Some(flag("update-dir", &dir.join("update")))));
+        assert!(with.contains("--update-dir is no longer read"), "{with}");
+        let without = logged(&argv(None));
+        assert!(!without.contains("no longer read"), "{without}");
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
     /// The retired `--update-dir` and `--orders-dir` are still taken, with or without a
     /// storage map and `--orders-dir` without `--update-dir`: a node whose `kbf.toml` or
     /// plist still carries them starts, and nothing is refused in the all-in-one binary's
