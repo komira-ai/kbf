@@ -1,8 +1,10 @@
 //! Who may have written a file this program reads as root.
 //!
 //! A file is trusted when it is a regular file owned by the trusted user (root) and not
-//! writable by its group or by others. Config and source files are opened with
-//! `O_NOFOLLOW` and checked on the open descriptor, so the file checked is the file read.
+//! writable by its group or by others, and so is every directory above it, all the way up to
+//! `/` (whoever can write a directory can replace what is in it). Config and source files are
+//! opened with `O_NOFOLLOW` and checked on the open descriptor, so the file checked is the
+//! file read.
 
 use std::fs::{self, Metadata, OpenOptions};
 use std::io::{self, Read};
@@ -86,11 +88,28 @@ impl Trust {
         Ok(())
     }
 
-    /// Check every directory above `path`, up to the anchor.
+    /// Check every directory above `path`, from the one that holds it up to the anchor
+    /// (`/` for root's): each must be owned by the trusted user and not writable by its group
+    /// or by others, or whoever can write it can replace the file whatever the file's own
+    /// mode is. The path is resolved first (`..` and links), so the directories checked are
+    /// the ones the file really lies under, a link's target's included.
     ///
     /// # Errors
-    /// [`TrustError`] for a directory that is not trusted.
-    fn check_parents(&self, _path: &Path) -> Result<(), TrustError> {
+    /// [`TrustError`] for a path that cannot be resolved or a directory that is not trusted.
+    fn check_parents(&self, path: &Path) -> Result<(), TrustError> {
+        let real = fs::canonicalize(path)?;
+        for dir in real.ancestors().skip(1) {
+            let meta = fs::metadata(dir)?;
+            if !self.owns(&meta) {
+                return Err(TrustError::ParentNotOwned);
+            }
+            if meta.mode() & 0o022 != 0 {
+                return Err(TrustError::ParentWritable);
+            }
+            if dir == self.anchor {
+                break;
+            }
+        }
         Ok(())
     }
 

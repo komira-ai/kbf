@@ -44,7 +44,7 @@ fn every_command() -> Vec<Cmd> {
         units_running(),
         apt_update(&source()),
         apt_install(&source(), &v),
-        unit(&v.as_str().to_owned()),
+        unit(v.as_str()),
     ]
 }
 

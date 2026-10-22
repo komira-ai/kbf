@@ -1,20 +1,34 @@
-//! Whether some process holds a lock on a file, from `/proc/locks`, without taking the
-//! lock and without waiting.
+//! Whether some process holds a lock on a file: the install lock by asking for it without
+//! waiting ([`flock_held`]), any lock from `/proc/locks` without taking one ([`held`]).
 //!
 //! Each line of `/proc/locks` is `<n>: <kind> <ADVISORY|MANDATORY> <READ|WRITE> <pid>
 //! <major>:<minor>:<inode> <start> <end>`; a process waiting for a lock has `->` after the
 //! number and does not hold it. `dpkg` and `apt` take `POSIX` locks, `flock(1)` takes
 //! `FLOCK` ones; either counts.
 
-use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::fs::{self, OpenOptions};
+use std::io::ErrorKind;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
+
+use crate::trust::nofollow;
 
 /// Whether some process holds the `flock` on `lock_file`, found by asking for it without
 /// waiting: a shared lock is taken and let go at once. A missing file is not held; a file
 /// that cannot be opened or asked is held, since idle is not proved.
-pub fn flock_held(_lock_file: &Path) -> bool {
-    false
+pub fn flock_held(lock_file: &Path) -> bool {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(nofollow())
+        .open(lock_file)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    // A shared request conflicts with the exclusive lock an install holds, and the lock it
+    // takes is let go with the file at the end of this function.
+    !matches!(file.try_lock_shared(), Ok(()))
 }
 
 /// Whether a lock is held on `lock_file`, reading the lock table at `proc_locks`. A

@@ -113,6 +113,9 @@ fn an_unreadable_lock_is_held() {
     fs::write(&real, "").unwrap();
     let link = dir.join("link");
     std::os::unix::fs::symlink(&real, &link).unwrap();
-    assert!(flock_held(&link), "a link is not followed, so not proved idle");
+    assert!(
+        flock_held(&link),
+        "a link is not followed, so not proved idle"
+    );
     assert!(flock_held(&real.join("below")), "a path through a file");
 }

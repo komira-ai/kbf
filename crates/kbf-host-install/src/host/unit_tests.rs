@@ -64,7 +64,10 @@ fn the_unit_runs_both_steps_under_the_lock() {
     );
     assert_eq!(seen.get(), 4, "the lock was looked at before every command");
     assert!(fx.audit_lines().is_empty(), "the unit does not audit");
-    assert!(!locks::flock_held(&fx.host.install_lock), "released at the end");
+    assert!(
+        !locks::flock_held(&fx.host.install_lock),
+        "released at the end"
+    );
 }
 
 /// Catches the gap: between `apt-get update` and `apt-get install` (and before and after
@@ -309,7 +312,10 @@ fn a_busy_lock_runs_nothing() {
     assert_eq!(answer.code, 3);
     assert_eq!(answer.json(), json!({"result": "failed", "reason": "busy"}));
     assert!(runner.calls().is_empty(), "nothing ran");
-    assert!(locks::flock_held(&fx.host.install_lock), "still the holder's");
+    assert!(
+        locks::flock_held(&fx.host.install_lock),
+        "still the holder's"
+    );
     drop(holder);
     let runner = install_script("ii  1.0-1\n", "ii  1.2.3-1\n");
     assert_eq!(install(&fx, &runner).code, 0);
@@ -335,10 +341,7 @@ fn an_unusable_lock_file_fails_closed() {
     let link = fx.dir.join("lock-link");
     std::os::unix::fs::symlink(&target, &link).unwrap();
     fx.host.install_lock = link;
-    assert_eq!(
-        install(&fx, &runner).json()["reason"],
-        "lock_unavailable"
-    );
+    assert_eq!(install(&fx, &runner).json()["reason"], "lock_unavailable");
     assert!(runner.calls().is_empty());
 }
 
@@ -406,7 +409,10 @@ fn the_unit_checks_the_allowlist_again() {
         ),
     );
     let answer = install(&fx, &runner);
-    assert_eq!((answer.code, answer.json()["reason"].as_str()), (2, Some("channel_insecure")));
+    assert_eq!(
+        (answer.code, answer.json()["reason"].as_str()),
+        (2, Some("channel_insecure"))
+    );
     assert!(runner.calls().is_empty(), "no refusal started a process");
     let _ = channel("candidate");
 }

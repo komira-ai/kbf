@@ -153,7 +153,11 @@ fn a_writable_directory_above_is_refused() {
     }
     assert_eq!(trust.read(&path).unwrap(), "x");
     trust.check_file(&path).unwrap();
-    for (which, d) in [("parent", &*deep), ("grandparent", &*middle), ("top", &*dir)] {
+    for (which, d) in [
+        ("parent", &*deep),
+        ("grandparent", &*middle),
+        ("top", &*dir),
+    ] {
         for mode in [0o775, 0o757, 0o770, 0o707, 0o777, 0o730, 0o703] {
             chmod(d, mode);
             assert!(

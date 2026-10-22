@@ -230,7 +230,14 @@ fn codes_round_trip() {
     for failure in FailureCode::ALL {
         assert_eq!(FailureCode::from_code(failure.code()), Some(failure));
     }
-    for text in ["", "nope", "Busy", "busy ", "bad_command\n", "install_failed"] {
+    for text in [
+        "",
+        "nope",
+        "Busy",
+        "busy ",
+        "bad_command\n",
+        "install_failed",
+    ] {
         assert_eq!(Refusal::from_code(text), None, "{text:?}");
     }
     for text in ["", "nope", "BUSY", " busy", "bad_command"] {
@@ -294,6 +301,12 @@ fn other_lines_are_not_a_units_answer() {
         r#"{"result":"installed","installed_version":1,"unit_state":"finished"}"#,
         r#"{"result":"installed","installed_version":"1","unit_state":"finished","x":1}"#,
         r#"{"result":"refused"}"#,
+        r#"{"result":"refused","reason":"bad_command","installed_version":"1"}"#,
+        r#"{"result":"failed","reason":"busy","installed_version":"1"}"#,
+        r#"{"result":"refused","reason":"bad_command","unit_state":"finished"}"#,
+        r#"{"result":"installed","unit_state":"finished"}"#,
+        r#"{"result":"already_installed","unit_state":"not_run"}"#,
+        r#"{"result":"installed","reason":"busy","installed_version":"1","unit_state":"finished"}"#,
         r#"{"result":"refused","reason":"nope"}"#,
         r#"{"result":"refused","reason":"busy"}"#,
         r#"{"result":"failed","reason":"bad_command"}"#,

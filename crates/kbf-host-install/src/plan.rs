@@ -1,23 +1,28 @@
 //! The commands, as argument vectors. Pure: nothing here runs anything.
 //!
-//! An install is two transient systemd units, one after the other, so an ssh drop that
-//! kills this process cannot kill `dpkg` half way:
+//! An install is ONE transient systemd unit, so an ssh drop that kills the process sshd
+//! started cannot kill `dpkg` half way, and the install lock has one holder for the whole
+//! install:
 //!
 //! ```text
-//! systemd-run --wait --collect --pipe --quiet --unit=kbf-host-install-<v> ... -- \
-//!     apt-get -o Dir::Etc::SourceList=<file> -o Dir::Etc::SourceParts=- update
-//! systemd-run ... -- apt-get install -y --no-install-recommends ... kbf=<version>
+//! systemd-run --wait --collect --pipe --quiet --unit=kbf-host-install-<v>.service \
+//!     --property=RuntimeMaxSec=1800 --setenv=KBF_HOST_INSTALL_UNIT=<request> -- \
+//!     /usr/libexec/kbf/kbf-host-install
 //! ```
 //!
-//! Both read the one source file of the channel and no other, and the unit gets the same
-//! fixed environment as every process here ([`crate::runner::PATH`], `LANG=C`) plus
-//! `DEBIAN_FRONTEND=noninteractive`.
+//! The unit runs this program again, with the request in the one variable only systemd-run
+//! sets ([`UNIT_ENV`]); that process takes the lock, then runs the two commands below,
+//! directly (`apt-get update`, then `apt-get install -y ... kbf=<version>`), and reads the
+//! package database before and after. Both apt commands read the one source file of the
+//! channel and no other, and run with the fixed environment of every process here
+//! ([`crate::runner::PATH`], `LANG=C`, `DEBIAN_FRONTEND=noninteractive`).
 
 use std::path::Path;
+use std::time::Duration;
 
 use crate::config::ChannelSource;
 use crate::request::{Channel, Version};
-use crate::runner::{Cmd, LANG, PATH};
+use crate::runner::Cmd;
 
 /// The prefix of every unit this program starts; `query` asks systemd about `<prefix>*`.
 pub const UNIT_PREFIX: &str = "kbf-host-install-";
@@ -68,22 +73,12 @@ fn cmd(program: &str, args: &[&str]) -> Cmd {
     }
 }
 
-/// The variable that makes the program run as the body of the install unit; only
-/// `systemd-run` sets it (see [`unit_install`]).
+/// The variable that makes the program run as the body of the install unit, holding the
+/// request. Only `systemd-run` sets it (see [`unit_install`]); an ssh session's is ignored.
 pub const UNIT_ENV: &str = "KBF_HOST_INSTALL_UNIT";
 
 /// Seconds `kbf --version --json` may run before `query` gives up on it.
 pub const RUNNING_BUILD_TIMEOUT_SECS: u64 = 10;
-
-/// The install unit: this program again, as the body of a transient unit.
-pub fn unit_install(_self_exe: &Path, _version: &Version, _channel: &Channel) -> Cmd {
-    cmd(SYSTEMD_RUN, &[])
-}
-
-/// Ask systemd whether any install unit exists in a state that is not over.
-pub fn units_running() -> Cmd {
-    units_active()
-}
 
 /// Read the installed version and package state of `kbf`: `<status> <version>`.
 pub fn installed_version() -> Cmd {
@@ -97,34 +92,51 @@ pub fn installed_version() -> Cmd {
     )
 }
 
-/// Ask the installed binary what build it is.
+/// Ask the installed binary what build it is. It runs as root and may hang: the runner
+/// kills it after [`RUNNING_BUILD_TIMEOUT_SECS`].
 pub fn running_build() -> Cmd {
-    cmd(KBF, &["--version", "--json"])
+    Cmd {
+        timeout: Some(Duration::from_secs(RUNNING_BUILD_TIMEOUT_SECS)),
+        ..cmd(KBF, &["--version", "--json"])
+    }
 }
 
-/// Ask systemd whether any install unit is active.
-pub fn units_active() -> Cmd {
+/// List the install units that are not over. `is-active` is true only for `active`, and a
+/// unit that is starting is `activating` (and one stopping is `deactivating`), so the
+/// states are named; the answer is the listing, and an empty one means none.
+pub fn units_running() -> Cmd {
     cmd(
         SYSTEMCTL,
-        &["is-active", "--quiet", "--", "kbf-host-install-*"],
+        &[
+            "list-units",
+            "--type=service",
+            "--state=active,activating,deactivating,reloading",
+            "--plain",
+            "--no-legend",
+            "--no-pager",
+            "--",
+            "kbf-host-install-*",
+        ],
     )
 }
 
-/// `systemd-run` around `inner`: waits for the unit, collects it, pipes its output, and
-/// gives it the fixed environment (the unit does not inherit this process's).
-fn in_unit(version: &Version, inner: Vec<String>) -> Cmd {
+/// The install unit: this program again (`self_exe`, an absolute path) as the body of a
+/// transient service that is waited for, collected and piped back, with the request in
+/// [`UNIT_ENV`]. Everything else the unit needs it sets for itself.
+pub fn unit_install(self_exe: &Path, version: &Version, channel: &Channel) -> Cmd {
     let mut args: Vec<String> = ["--wait", "--collect", "--pipe", "--quiet"]
         .iter()
         .map(|a| (*a).to_owned())
         .collect();
     args.push(format!("--unit={}", unit_name(version)));
     args.push(format!("--property=RuntimeMaxSec={RUNTIME_MAX_SECS}"));
-    args.push(format!("--setenv=PATH={PATH}"));
-    args.push(format!("--setenv=LANG={LANG}"));
-    args.push("--setenv=DEBIAN_FRONTEND=noninteractive".to_owned());
+    args.push(format!(
+        "--setenv={UNIT_ENV}=install kbf={} from {}",
+        version.as_str(),
+        channel.as_str()
+    ));
     args.push("--".to_owned());
-    args.push(APT_GET.to_owned());
-    args.extend(inner);
+    args.push(self_exe.display().to_string());
     Cmd {
         program: SYSTEMD_RUN.to_owned(),
         args,
@@ -142,22 +154,25 @@ fn only_source(source: &ChannelSource) -> [String; 4] {
     ]
 }
 
-/// `apt-get update` of the channel's source alone, in a unit. The other lists are kept:
+/// `apt-get update` of the channel's source alone. The other lists are kept:
 /// `List-Cleanup=0`, since a cleanup would delete every list this source does not name.
 pub fn apt_update(source: &ChannelSource) -> Cmd {
-    let version = &Version::new("0").unwrap();
-    let mut inner = only_source(source).to_vec();
-    inner.extend([
+    let mut args = only_source(source).to_vec();
+    args.extend([
         "-o".to_owned(),
         "APT::Get::List-Cleanup=0".to_owned(),
         "update".to_owned(),
     ]);
-    in_unit(version, inner)
+    Cmd {
+        program: APT_GET.to_owned(),
+        args,
+        timeout: None,
+    }
 }
 
-/// `apt-get install` of `kbf=<version>` from the channel's source alone, in a unit.
+/// `apt-get install` of `kbf=<version>` from the channel's source alone.
 pub fn apt_install(source: &ChannelSource, version: &Version) -> Cmd {
-    let mut inner: Vec<String> = [
+    let mut args: Vec<String> = [
         "install",
         "-y",
         "--no-install-recommends",
@@ -168,14 +183,18 @@ pub fn apt_install(source: &ChannelSource, version: &Version) -> Cmd {
     .iter()
     .map(|a| (*a).to_owned())
     .collect();
-    inner.push(format!("DPkg::Lock::Timeout={LOCK_TIMEOUT_SECS}"));
-    inner.extend(only_source(source));
-    inner.extend([
+    args.push(format!("DPkg::Lock::Timeout={LOCK_TIMEOUT_SECS}"));
+    args.extend(only_source(source));
+    args.extend([
         "-t".to_owned(),
         source.suite.clone(),
         format!("kbf={}", version.as_str()),
     ]);
-    in_unit(version, inner)
+    Cmd {
+        program: APT_GET.to_owned(),
+        args,
+        timeout: None,
+    }
 }
 
 #[cfg(test)]

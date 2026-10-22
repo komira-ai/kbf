@@ -235,7 +235,6 @@ fn config_problems_refuse() {
     assert!(runner.calls().is_empty(), "no refusal started a process");
 }
 
-
 /// No install goes unrecorded: when the log cannot be opened, an install is not started
 /// (exit 3, no process), while a query and a refusal are answered with a warning on stderr.
 #[test]
@@ -377,15 +376,18 @@ fn the_unit_answer_is_relayed() {
         },
     ];
     outcomes.extend(Refusal::ALL.map(Outcome::Refused));
-    outcomes.extend(FailureCode::ALL.map(|code| Outcome::Failed(crate::outcome::Failure {
-        code,
-        detail: String::new(),
-    })));
+    outcomes.extend(FailureCode::ALL.map(|code| {
+        Outcome::Failed(crate::outcome::Failure {
+            code,
+            detail: String::new(),
+        })
+    }));
     for outcome in outcomes {
         for noise in ["", "apt noise\n", "\n\n"] {
             let fx = Fx::new("host-relay");
             let stdout = format!("{noise}{}", unit_says(&outcome));
-            let runner = FakeRunner::new(vec![exec(outcome.exit_code().into(), &stdout, "E: why\n")]);
+            let runner =
+                FakeRunner::new(vec![exec(outcome.exit_code().into(), &stdout, "E: why\n")]);
             let answer = fx.run(&runner, INSTALL);
             assert_eq!(answer.code, outcome.exit_code(), "{outcome:?}");
             let want: Value = serde_json::from_str(&outcome.json_line()).unwrap();
@@ -395,7 +397,12 @@ fn the_unit_answer_is_relayed() {
             assert_eq!(audit[0]["outcome"], word);
             assert_eq!(audit[0]["reason"], json!(reason));
             let failed = matches!(outcome, Outcome::Failed(_));
-            assert_eq!(answer.err.contains("E: why"), failed, "{outcome:?}: {}", answer.err);
+            assert_eq!(
+                answer.err.contains("E: why"),
+                failed,
+                "{outcome:?}: {}",
+                answer.err
+            );
         }
     }
 }
@@ -419,14 +426,28 @@ fn an_unintelligible_unit_is_an_install_failure() {
         assert_eq!(answer.code, 3, "{outcome:?}");
         assert_eq!(answer.json()["reason"], "verify_failed", "{outcome:?}");
     }
-    let query = r#"{"result":"query","installed_version":null,"running_commit":null,"in_progress":false}"#;
+    let query =
+        r#"{"result":"query","installed_version":null,"running_commit":null,"in_progress":false}"#;
     let cases = [
         ("no output, exit 0", exec(0, "", "")),
-        ("no output, exit 1", exec(1, "", "Failed to start transient service unit")),
+        (
+            "no output, exit 1",
+            exec(1, "", "Failed to start transient service unit"),
+        ),
         ("not json", exec(0, "done\n", "")),
         ("a query line", exec(0, &format!("{query}\n"), "")),
-        ("killed by a signal", Ok(crate::runner::Exec { code: None, stdout: vec![], stderr: b"killed".to_vec() })),
-        ("cannot start", Err(std::io::Error::other("systemd-run: not found"))),
+        (
+            "killed by a signal",
+            Ok(crate::runner::Exec {
+                code: None,
+                stdout: vec![],
+                stderr: b"killed".to_vec(),
+            }),
+        ),
+        (
+            "cannot start",
+            Err(std::io::Error::other("systemd-run: not found")),
+        ),
         (
             "a line cut short",
             exec(0, "{\"result\":\"installed\",\"installed_ver", ""),
@@ -674,7 +695,10 @@ fn in_progress_is_any_of_three_signals() {
     );
 
     flock.lock().unwrap();
-    assert!(ask(""), "the held flock alone: the unit that holds it is not listed");
+    assert!(
+        ask(""),
+        "the held flock alone: the unit that holds it is not listed"
+    );
     assert!(ask(UNIT_LISTING), "flock and unit");
     flock.unlock().unwrap();
     assert!(!ask(""), "the flock released");
@@ -689,6 +713,7 @@ fn in_progress_is_any_of_three_signals() {
 #[test]
 fn a_query_leaves_no_lock() {
     let fx = Fx::new("host-query-lock");
+    write(&fx.host.install_lock, 0o600, "");
     let runner = FakeRunner::new(vec![ok("un  \n"), ok("")]);
     fx.run(&runner, "query");
     let file = fs::File::open(&fx.host.install_lock).unwrap();
@@ -718,9 +743,16 @@ fn query_does_not_report_a_package_in_error() {
     }
 }
 
+/// A read that cannot be trusted: what it is, dpkg's reply, and the code it is answered with.
+pub(super) type UnreadableCase = (
+    &'static str,
+    fn() -> std::io::Result<crate::runner::Exec>,
+    &'static str,
+);
+
 /// The reads that cannot be trusted, as `query` and as the install unit see them; the
 /// cases are shared by both.
-pub(super) fn unreadable_cases() -> Vec<(&'static str, fn() -> std::io::Result<crate::runner::Exec>, &'static str)> {
+pub(super) fn unreadable_cases() -> Vec<UnreadableCase> {
     vec![
         (
             "dpkg-query exit 2",
@@ -779,7 +811,14 @@ fn unreadable_state_fails_the_query() {
     for (what, reply) in [
         ("systemctl cannot start", Err(std::io::Error::other("gone"))),
         ("systemctl exits 1", exec(1, "", "Failed to connect to bus")),
-        ("systemctl is killed", Ok(crate::runner::Exec { code: None, stdout: vec![], stderr: vec![] })),
+        (
+            "systemctl is killed",
+            Ok(crate::runner::Exec {
+                code: None,
+                stdout: vec![],
+                stderr: vec![],
+            }),
+        ),
     ] {
         let fx = Fx::new("host-systemctl");
         let runner = FakeRunner::new(vec![ok("ii  1.0-1\n"), exec(1, "", ""), reply]);
@@ -815,7 +854,12 @@ fn the_environment_is_read_by_name() {
             ssh_session: true,
         }
     );
-    for name in ["SSH_ORIGINAL_COMMAND", "SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] {
+    for name in [
+        "SSH_ORIGINAL_COMMAND",
+        "SSH_CONNECTION",
+        "SSH_CLIENT",
+        "SSH_TTY",
+    ] {
         assert!(env(&[(name, "x")]).ssh_session, "{name}");
     }
     assert!(!env(&[("SSH_AUTH_SOCK", "x"), ("HOME", "/root")]).ssh_session);
@@ -847,7 +891,12 @@ fn the_unit_mode_is_not_reachable_over_ssh() {
     let request = "install kbf=1.2.3-1 from candidate";
     // Alone: the unit body runs (its first command is the package read under the lock).
     let fx = Fx::new("host-dispatch-unit");
-    let runner = FakeRunner::new(vec![exec(1, "", "no packages"), ok(""), ok(""), ok("ii  1.2.3-1\n")]);
+    let runner = FakeRunner::new(vec![
+        exec(1, "", "no packages"),
+        ok(""),
+        ok(""),
+        ok("ii  1.2.3-1\n"),
+    ]);
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = dispatch(
         &fx.host,
@@ -858,11 +907,19 @@ fn the_unit_mode_is_not_reachable_over_ssh() {
     );
     assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
     assert_eq!(runner.calls().len(), 4);
-    assert!(fx.audit_lines().is_empty(), "the unit does not audit; its starter did");
+    assert!(
+        fx.audit_lines().is_empty(),
+        "the unit does not audit; its starter did"
+    );
 
     // With any one ssh variable: the unit variable is ignored, the process is an ordinary
     // request handler, and the request (none, or not one) is refused and audited.
-    for name in ["SSH_ORIGINAL_COMMAND", "SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] {
+    for name in [
+        "SSH_ORIGINAL_COMMAND",
+        "SSH_CONNECTION",
+        "SSH_CLIENT",
+        "SSH_TTY",
+    ] {
         let fx = Fx::new("host-dispatch-ssh");
         let runner = FakeRunner::new(vec![]);
         let vars = [("KBF_HOST_INSTALL_UNIT", request), (name, "x")];
@@ -871,7 +928,10 @@ fn the_unit_mode_is_not_reachable_over_ssh() {
         let text = String::from_utf8(out).unwrap();
         assert_eq!(code, 2, "{name}: {text}");
         assert!(text.contains("bad_command"), "{name}: {text}");
-        assert!(runner.calls().is_empty(), "{name}: the install body did not run");
+        assert!(
+            runner.calls().is_empty(),
+            "{name}: the install body did not run"
+        );
         assert_eq!(fx.audit_lines().len(), 1, "{name}: audited as a request");
     }
 

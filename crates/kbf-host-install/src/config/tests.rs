@@ -134,6 +134,7 @@ fn a_source_without_signed_by_is_refused() {
             "field name in a comment",
             "Types: deb\nURIs: https://a\n# Signed-By: /x\n".to_owned(),
         ),
+        ("one-line, a bare word", "deb\n".to_owned()),
         (
             "trusted flag instead",
             "deb [trusted=yes] https://a candidate main\n".to_owned(),
@@ -271,7 +272,12 @@ fn a_writable_directory_makes_each_file_unsafe() {
     assert!(Allowlist::load(&f.trust, &config).is_ok());
 
     // The allowlist in an open directory.
-    let moved = f.write_in(&open, "host-install.toml", 0o644, &fs::read_to_string(&config).unwrap());
+    let moved = f.write_in(
+        &open,
+        "host-install.toml",
+        0o644,
+        &fs::read_to_string(&config).unwrap(),
+    );
     fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
     assert_eq!(
         Allowlist::load(&f.trust, &moved).unwrap_err(),
@@ -281,7 +287,12 @@ fn a_writable_directory_makes_each_file_unsafe() {
     assert!(Allowlist::load(&f.trust, &moved).is_ok());
 
     // The source in an open directory.
-    let moved_source = f.write_in(&open, "candidate.sources", 0o644, &fs::read_to_string(&source).unwrap());
+    let moved_source = f.write_in(
+        &open,
+        "candidate.sources",
+        0o644,
+        &fs::read_to_string(&source).unwrap(),
+    );
     let text = format!(
         "[channels.candidate]\nsuite = \"candidate\"\nsource_list = \"{}\"\n",
         moved_source.display()
@@ -304,6 +315,19 @@ fn a_writable_directory_makes_each_file_unsafe() {
     fs::set_permissions(&open, fs::Permissions::from_mode(0o775)).unwrap();
     assert_eq!(f.channel(&keyed), Err(Refusal::KeyUntrusted));
     fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A `signed-by` option with no value names no key: it is a key that is not a path.
+#[test]
+fn a_signed_by_option_with_no_value_is_no_key() {
+    let f = Fixture::new("config-bare-signed-by");
+    for text in [
+        "deb [signed-by] https://a candidate main\n",
+        "deb [signed-by=] https://a candidate main\n",
+    ] {
+        let source = f.write("s.list", 0o644, text);
+        assert_eq!(f.channel(&source), Err(Refusal::KeyUntrusted), "{text}");
+    }
 }
 
 /// A continuation line belongs to the field above it, whatever the field is, and a line

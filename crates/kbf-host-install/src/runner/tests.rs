@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use super::{Cmd, Exec, LANG, PATH, Runner, SystemRunner, fake};
+use super::{Cmd, DEBIAN_FRONTEND, Exec, LANG, PATH, Runner, SystemRunner, fake};
 
 fn cmd(program: &str, args: &[&str]) -> Cmd {
     Cmd {
@@ -30,7 +30,7 @@ fn the_child_environment_is_cleared() {
     let want: BTreeSet<String> = [
         format!("PATH={PATH}"),
         format!("LANG={LANG}"),
-        "DEBIAN_FRONTEND=noninteractive".to_owned(),
+        format!("DEBIAN_FRONTEND={DEBIAN_FRONTEND}"),
     ]
     .into_iter()
     .collect();
@@ -122,7 +122,11 @@ fn a_child_past_its_limit_is_killed() {
     let marker = "31.4159265";
     let started = Instant::now();
     let error = SystemRunner
-        .run(&within("/usr/bin/sleep", &[marker], Duration::from_millis(300)))
+        .run(&within(
+            "/usr/bin/sleep",
+            &[marker],
+            Duration::from_millis(300),
+        ))
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
     let took = started.elapsed();
@@ -146,7 +150,11 @@ fn a_child_within_its_limit_is_unaffected() {
         .unwrap();
     assert_eq!(failed.code, Some(1));
     let stderr = SystemRunner
-        .run(&within("/usr/bin/env", &["/nonexistent-kbf-program"], limit))
+        .run(&within(
+            "/usr/bin/env",
+            &["/nonexistent-kbf-program"],
+            limit,
+        ))
         .unwrap();
     assert_eq!(stderr.code, Some(127));
     assert!(!stderr.stderr_text().is_empty() && stderr.stdout.is_empty());
@@ -159,7 +167,9 @@ fn a_child_within_its_limit_is_unaffected() {
         .unwrap();
     assert!(big.success());
     assert_eq!(big.stdout.len(), 1_000_000);
-    let env = SystemRunner.run(&within("/usr/bin/env", &[], limit)).unwrap();
+    let env = SystemRunner
+        .run(&within("/usr/bin/env", &[], limit))
+        .unwrap();
     assert!(env.stdout_text().contains("LANG=C"));
 }
 

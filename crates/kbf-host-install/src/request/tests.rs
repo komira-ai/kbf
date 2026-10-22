@@ -225,8 +225,23 @@ fn a_version_too_long_for_a_unit_name_is_refused() {
 #[test]
 fn the_grammar_alone_refuses_an_option_and_a_non_digit() {
     for text in [
-        "-1.0", "--help", "-", "-1", "--version=1", "-o", "~1", "+1", ".1", "a1", "v1.0", "",
-        "1:2", "1 0", "1_0", "1/0", "1\u{e9}",
+        "-1.0",
+        "--help",
+        "-",
+        "-1",
+        "--version=1",
+        "-o",
+        "~1",
+        "+1",
+        ".1",
+        "a1",
+        "v1.0",
+        "",
+        "1:2",
+        "1 0",
+        "1_0",
+        "1/0",
+        "1\u{e9}",
     ] {
         assert!(!in_grammar(text), "{text:?}");
     }

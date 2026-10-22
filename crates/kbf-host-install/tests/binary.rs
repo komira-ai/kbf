@@ -84,6 +84,10 @@ fn the_unit_variable_selects_the_unit_body() {
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(2), "{request:?}");
-        assert_eq!(String::from_utf8(out.stdout).unwrap(), REFUSED, "{request:?}");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            REFUSED,
+            "{request:?}"
+        );
     }
 }

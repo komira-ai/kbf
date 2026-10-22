@@ -6,12 +6,15 @@ use std::io;
 
 use super::{Cmd, Exec, Runner};
 
+/// A look at the host as a command is about to run.
+type Hook = Box<dyn Fn(&Cmd)>;
+
 /// Replies in order, one per call; a call past the script is an error the test shows.
 #[derive(Default)]
 pub struct FakeRunner {
     replies: RefCell<VecDeque<io::Result<Exec>>>,
     calls: RefCell<Vec<Cmd>>,
-    before: Option<Box<dyn Fn(&Cmd)>>,
+    before: Option<Hook>,
 }
 
 impl FakeRunner {

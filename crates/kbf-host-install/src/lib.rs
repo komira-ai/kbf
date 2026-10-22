@@ -14,17 +14,23 @@
 //! - `install kbf=<version> from <channel>`: install that version of the `kbf` package
 //!   from a channel the root-owned allowlist names ([`config`]), never an older version
 //!   than the installed one ([`debver`]), through `apt-get` restricted to the channel's one
-//!   signed source, in a transient systemd unit an ssh drop cannot kill ([`plan`]);
-//! - `query`: print what is installed, what runs and whether an install is in progress.
+//!   signed source. The process sshd starts checks the request and starts ONE transient
+//!   systemd unit an ssh drop cannot kill; the unit runs this program again, takes the install
+//!   lock and holds it for both apt steps ([`plan`], [`host`]);
+//! - `query`: print what is installed, what runs and whether an install is in progress (the
+//!   install lock held, an install unit not over, or the dpkg lock held).
 //!
 //! Nothing runs through a shell: every process is an `execve` with an explicit argument
 //! vector and a cleared environment ([`runner`]). The answer is one JSON line on stdout
-//! ([`outcome`]); the exit status is 0 (done), 2 (refused: nothing ran) or 3 (failed). Every
-//! invocation appends one line to the audit log ([`audit`]).
+//! ([`outcome`], every line with a `result`); the exit status is 0 (done), 2 (refused:
+//! nothing ran) or 3 (failed). Every invocation appends one line to the audit log
+//! ([`audit`]).
 //!
 //! The paths this program reads as root are constants of [`host::Host::production`]. The
 //! only way to point them elsewhere is a `cfg(test)` constructor: no environment variable
-//! and no argument does it.
+//! and no argument does it. (One variable does exist, `KBF_HOST_INSTALL_UNIT`: it makes the
+//! program the body of the install unit, and counts only when sshd set none of its own
+//! variables; see [`host::dispatch`].)
 
 #![forbid(unsafe_code)]
 
