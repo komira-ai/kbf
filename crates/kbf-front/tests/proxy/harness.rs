@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -114,6 +114,11 @@ pub struct Fake {
     pub refuse_writes: Option<tonic::Code>,
     /// Answers a Write UNAVAILABLE after reading this many of its messages.
     pub fail_writes_after: Option<usize>,
+    /// The next this many Reads and Writes are answered UNAVAILABLE before a byte is read
+    /// or sent, as a node that is restarting does; after them the node serves.
+    pub away: AtomicUsize,
+    /// The status that ends a blob of kind `2` after its two chunks (DATA_LOSS if none).
+    pub break_with: Option<tonic::Code>,
 }
 
 struct DropFlag(Arc<AtomicBool>);
@@ -162,6 +167,31 @@ impl Fake {
         })
     }
 
+    /// A node that answers its first `calls` Reads and Writes UNAVAILABLE, as one that is
+    /// restarting does, and serves after them.
+    pub fn away_for(calls: usize) -> Arc<Self> {
+        Arc::new(Self {
+            away: AtomicUsize::new(calls),
+            ..Self::default()
+        })
+    }
+
+    /// A node whose Reads send two chunks and then end with `code`.
+    pub fn breaking_reads(code: tonic::Code) -> Arc<Self> {
+        Arc::new(Self {
+            force: Some('2'),
+            break_with: Some(code),
+            ..Self::default()
+        })
+    }
+
+    /// Takes one of the calls the node is away for, if any is left.
+    fn take_away(&self) -> bool {
+        self.away
+            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    }
+
     fn note(&self, method: &'static str, name: &str, metadata: &MetadataMap) {
         self.calls.fetch_add(1, SeqCst);
         self.seen.lock().unwrap().push(Seen {
@@ -189,6 +219,9 @@ impl ByteStream for Fake {
         let metadata = r.metadata().clone();
         let name = r.into_inner().resource_name;
         self.note("Read", &name, &metadata);
+        if self.take_away() {
+            return Err(Status::unavailable("restarting"));
+        }
         let (hash, size) = tail(&name);
         let kind = self.force.or_else(|| hash.chars().next()).unwrap_or('0');
         match kind {
@@ -202,13 +235,14 @@ impl ByteStream for Fake {
         }
         let size = if kind == '5' { 0 } else { size };
         let lead = Arc::clone(&self.lead);
+        let lost = self.break_with.unwrap_or(tonic::Code::DataLoss);
         let guard = DropFlag(Arc::clone(&self.dropped));
         let chunks = size.div_ceil(CHUNK as u64) as usize;
         let s = stream::unfold((0usize, guard), move |(i, g)| {
             let lead = Arc::clone(&lead);
             async move {
                 if kind == '2' && i == 2 {
-                    return Some((Err(Status::data_loss("lost")), (usize::MAX, g)));
+                    return Some((Err(Status::new(lost, "lost")), (usize::MAX, g)));
                 }
                 if i >= chunks {
                     return None;
@@ -235,6 +269,10 @@ impl ByteStream for Fake {
         if let Some(code) = self.refuse_writes {
             self.note("Write", "", &metadata);
             return Err(Status::new(code, "refused"));
+        }
+        if self.take_away() {
+            self.note("Write", "", &metadata);
+            return Err(Status::unavailable("restarting"));
         }
         let mut s = r.into_inner();
         let (mut i, mut total) = (0usize, 0i64);
@@ -516,6 +554,35 @@ pub fn routed_owners_over(maps: Arc<dyn MapSource>, addrs: &[SocketAddr]) -> Own
             .collect(),
     ));
     Owners::routed(Arc::new(Routed::new(maps, wires.clone(), wires)), down())
+}
+
+/// A map the test moves, and never has anything newer to fetch.
+pub struct Switch(pub Mutex<Arc<Map>>);
+
+impl Switch {
+    /// From now on the map is `map`.
+    pub fn set(&self, map: Arc<Map>) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = map;
+    }
+}
+
+impl MapSource for Switch {
+    fn current(&self) -> Option<MapView> {
+        Some(MapView {
+            map: Arc::clone(&self.0.lock().unwrap_or_else(PoisonError::into_inner)),
+            previous: None,
+            earlier: Vec::new(),
+        })
+    }
+
+    fn refetch(&self, at_least: u64) -> BoxFuture<'_, Result<MapView, RefetchError>> {
+        Box::pin(async move {
+            Err(RefetchError {
+                at_least,
+                reason: "nothing newer".to_owned(),
+            })
+        })
+    }
 }
 
 /// A map that is there for one look and gone for the next, and so on: a frontend whose

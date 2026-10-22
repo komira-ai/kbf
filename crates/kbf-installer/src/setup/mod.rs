@@ -24,6 +24,12 @@
 //!   `kbf.toml` with its reason). On a frontend or all-in-one host the
 //!   state database's schema is created or brought forward ([`Schemas`]) once `installer.toml`
 //!   is written, and a unit that makes a frontend is enabled and never started.
+//! - `--mode=all-in-one` is always behind the proxy (`--proxy`): the host runs the proxy, its
+//!   frontend children and `kbf-storage-and-daemon.service` beside them. `kbf.toml` is the
+//!   sibling's (`mode = "storage-and-daemon"` on the loopback `--storage-port`) and
+//!   `frontend.toml`, which `installer.toml` names as `frontend_config`, the children's; the
+//!   second is written first. Only a fresh host: a `kbf.toml` that says `mode = "all-in-one"`
+//!   is refused (exit 5) and left as it is.
 //! - `[proxy] listen` of `installer.toml` (the operator's key) becomes the drop-in
 //!   `kbf-proxy.socket.d/listen.conf` on Linux, and no key removes the drop-in. Setup never
 //!   reloads systemd or restarts the socket: it says that is needed.
@@ -221,6 +227,11 @@ pub fn installer_settings(
     if let Some(plan) = &v.proxy {
         settings.proxy = Some(plan.merge(settings.proxy.take())?);
     }
+    // The flags decide this key as they decide the rest: the proxy's children read their own
+    // file only where a sibling holds `kbf.toml`.
+    settings.frontend_config = v
+        .storage_port()
+        .map(|_| PathBuf::from(paths::frontend_toml(platform)));
     Ok(settings)
 }
 
@@ -304,6 +315,11 @@ pub fn run(
     if options.apply {
         os.trusted_binary()?;
     }
+    // Before the flags are checked: a host of the earlier layout re-run with the command line
+    // that set it up (no `--proxy`) is told it is that host, not that `--proxy` is required.
+    if raw.mode == Mode::AllInOne {
+        plan::refuse_earlier_all_in_one(&*exec, os.platform())?;
+    }
     let valid = raw.validate(os.platform()).map_err(SetupError::Invalid)?;
     let ctx = plan::context(os, valid.mode)?;
     // A host that fetches nothing is told so to the frontend by the `kbf` that runs on it, or the
@@ -320,9 +336,16 @@ pub fn run(
         find_shadows(&*exec, valid.mode, valid.proxy.is_some())?;
     }
     let service_uid = ctx.service.as_ref().map(|u| u.uid);
-    kbf_settings::check_files(&*exec, &valid.kbf, service_uid)?;
+    let mut problems = Vec::new();
+    kbf_settings::push_problems(&*exec, &valid.kbf, service_uid, &mut problems);
+    // The proxy's files belong to the proxy's user, which on an all-in-one host is not the
+    // sibling's `service`. Both are checked before either is reported.
     if let Some(proxy) = &valid.proxy {
-        kbf_settings::check_files(&*exec, &proxy.files(), service_uid)?;
+        let frontend = ctx.frontend_uid();
+        kbf_settings::push_problems(&*exec, &proxy.files(), frontend, &mut problems);
+    }
+    if !problems.is_empty() {
+        return Err(SetupError::Invalid(problems));
     }
     let proxy = match valid.deploy {
         Some(_) => installer_settings(&*exec, &valid, ctx.platform)?.proxy,

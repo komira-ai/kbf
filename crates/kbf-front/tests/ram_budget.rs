@@ -1,6 +1,6 @@
 //! The RAM budget of the held set and its metrics (`docs/design/storage-ram-ack.md`, rule
-//! 3). Nothing holds a blob in a running node yet; these tests call `Cache::hold`, the
-//! producer's entry, over a cache with no tier (a drain pass then writes to the store).
+//! 3). These tests call `Cache::hold`, the budgeted primitive under the producer
+//! (`ram_ack_cache.rs` and `ram_ack_chain.rs` run the producer), over a cache with no tier (a drain pass then writes to the store).
 //!
 //! The budget is a non-blocking try-acquire: a blob it cannot take is not held, the caller
 //! writes it through, and `writethrough{reason=budget}` counts it. No test waits on a

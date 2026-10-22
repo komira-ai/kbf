@@ -16,7 +16,9 @@
 //! - [`runtime::SystemClock`] and [`runtime::RequestQueue`], the `Clock` and the `Requests`;
 //! - [`supervisor`] (Linux), the proxy's start: adopt the children a previous proxy left;
 //! - [`supervisor_swap`], the update API's `Supervisor`: the swap on its own thread;
-//! - [`migrator::DbMigrator`], the `Migrator` over the state database.
+//! - [`migrator::DbMigrator`], the `Migrator` over the state database;
+//! - [`releases`], the proxy's own copies of the `kbf` it runs and the [`ports::RootOrders`] that
+//!   goes with them (a status file the proxy writes itself); nothing calls it yet.
 //!
 //! Child control over HTTP: [`child_http`] is the blocking loopback client that the real
 //! child control and the fleet read call a child's ports with (U8b); [`admin`] is the
@@ -141,6 +143,7 @@ pub mod orders;
 pub mod ports;
 pub mod record;
 mod recover;
+pub mod releases;
 mod retire;
 pub mod root_orders;
 pub mod running_binary;
@@ -180,6 +183,8 @@ mod reconcile_tests;
 mod record_tests;
 #[cfg(test)]
 mod recover_tests;
+#[cfg(test)]
+mod releases_tests;
 #[cfg(test)]
 mod root_orders_tests;
 #[cfg(test)]

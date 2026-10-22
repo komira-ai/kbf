@@ -74,9 +74,11 @@ pub mod fixtures;
 #[cfg(any(test, feature = "testkit"))]
 pub mod golden;
 pub mod helper;
+pub mod host_mode;
 pub mod installer_toml;
 pub mod layout;
 pub mod meta_log;
+pub mod observe;
 pub mod proxy;
 pub mod proxy_verb;
 pub mod record;

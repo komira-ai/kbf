@@ -57,7 +57,8 @@ accepts only `--mode=daemon`.
 | `--database`, `--create-local-database` | the state database, see below |
 | `--no-start` | enable units without starting them |
 | `--installer-config` | accepts only the platform's own `installer.toml` path; it is a flag of `run` |
-| `--proxy`, `--proxy-base-port`, `--buck2-auth`, `--buck2-token-file` | a frontend behind the bundled proxy, see below |
+| `--proxy`, `--proxy-base-port`, `--buck2-auth`, `--buck2-token-file` | a frontend behind the bundled proxy, see below; `--proxy` is required by `--mode=all-in-one` |
+| `--storage-port` | `--mode=all-in-one` only: the loopback port of its sibling, default 8990, see "An all-in-one host" |
 
 `--database` is `postgres:///NAME?host=SOCKET_DIR&user=ROLE`. The role is required, because
 `setup` runs as root and the service as its own account. A URL with a password is refused (the
@@ -71,15 +72,18 @@ rule in "The `kbf.toml` file".
 A node's listeners, certificates and storage URL come from enrollment. A `frontend` or
 `all-in-one` host does not enroll, so its addresses, certificates and stores are the operator's.
 `setup` takes them as flags and writes each as the key of the `kbf` flag it sets, in the table of
-that flag's group.
+that flag's group. An all-in-one host is always behind the proxy, so its public listeners and
+certificates are the proxy's: the three files go to the `[proxy]` table and the listener flags are
+refused, as for a frontend behind the proxy.
 
 | flag | `[table] key` | frontend | all-in-one |
 |---|---|---|---|
-| `--listen`, `--worker-listen` | `[listener]` | optional | optional |
-| `--api-listen` | `[listener] api-listen` | default `127.0.0.1:8982` | default `127.0.0.1:8982` |
-| `--reapi-tls-cert`, `--reapi-tls-key` | `[tls]` | both or none | both or none |
-| `--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca` | `[tls]` | all three or none | all three or none |
-| `--storage-url` (key `storage`) | `[storage-client] storage` | required | refused |
+| `--listen`, `--worker-listen` | `[listener]` | optional | refused (the proxy's) |
+| `--api-listen` | `[listener] api-listen` | default `127.0.0.1:8982` | refused (the proxy's) |
+| `--reapi-tls-cert`, `--reapi-tls-key` | `[tls]` | both or none | both, in `[proxy]` |
+| `--worker-tls-cert`, `--worker-tls-key` | `[tls]` | both with `--worker-client-ca`, or none | refused |
+| `--worker-client-ca` | `[tls]` | with the worker pair, or none | required, in `[proxy]` |
+| `--storage-url` (key `storage`) | `[storage-client] storage` | required | refused (derived from `--storage-port`) |
 | `--storage-ca`, `--storage-client-cert`, `--storage-client-key` | `[storage-client]` | all three with `https`, none with `http` | refused |
 | `--cold-store` | `[stores] cold-store` | refused | required, `file:///absolute/path` |
 | `--meta-dir` | `[stores] meta-dir` | refused | required, absolute path |
@@ -90,7 +94,8 @@ A node mode refuses all of them. Every rule is checked before anything is writte
 flag and the rule named, a value never quoted). An address is `IP:PORT`. A file flag is an
 absolute path of plain characters. A URL has no user name, password, path or query, and `http://`
 storage is for a loopback host only. The files named must exist as regular files (a link is not
-followed). A key must be owned by the user the mode's unit runs as, with no group or other
+followed). A key must be owned by the user that reads it (the mode's unit; on an all-in-one host
+the proxy's files are `kbf-server`'s and the daemon half's key is `kbf`'s), with no group or other
 permission bit; a certificate or CA is owned by root or that user and not writable by group or
 others. An `s3://` cold store is refused, because its credentials are in the environment, which
 `setup` does not manage. `--node-id` is a DNS label. The directory that holds a key or a
@@ -111,7 +116,9 @@ key and checks them instead, see "The Mac path".
 `setup` writes `/etc/kbf/kbf.toml` (root, group of the service user, mode 0640) with the keys in
 this order: `mode`, `[frontend] url`, `[enroll] token_file`, `[listener]`, `[tls]` (including
 `api-token-file` on a frontend or all-in-one host), `[storage-client]`, `[stores]`, `[identity]`,
-`[daemon]`, `[scheduler] state-store` (the database URL). The rule for a file that is there:
+`[daemon]`, `[scheduler] state-store` (the database URL). On an all-in-one host this is the
+sibling's file and `setup` writes a second one, `frontend.toml`, see "An all-in-one host" below.
+The rule for a file that is there, either of the two:
 
 - A file that holds only keys this run writes is rewritten to the flags.
 - A file that also holds other settings is kept when the keys this run writes match, and refused
@@ -169,12 +176,13 @@ named. The sudoers rule that lets the deploy account run `deploy` is a held step
    subgid ranges and enables lingering. The `kbf` and `kbf-server` users come from the package's
    sysusers files: a host without them is refused (exit 2), naming the user.
 3. `/etc/kbf`, the installer tree `/var/lib/kbf-installer` (root, 0755) and its `orders/`
-   (0700, owned by the user the mode's unit runs as).
+   (0700, owned by the user the mode's unit runs as; on an all-in-one host `kbf-server`, the
+   proxy's).
 4. Node modes: the enrollment token from `--token-file` to `/etc/kbf/enroll.token`, mode 0600,
    owned by the service user.
 5. Frontend and all-in-one: the first operator token (32 random bytes as hex) in
-   `/etc/kbf/api-token`, 0600, owned by the service user, only when that file is not there. The
-   output names the file and never the secret.
+   `/etc/kbf/api-token`, 0600, owned by the service user (on an all-in-one host `kbf-server`),
+   only when that file is not there. The output names the file and never the secret.
 6. `/etc/kbf/installer.toml` (root, 0644): the release source, the floor, for the `frontend` source
    the node certificate and key paths that enrollment writes (`pki/daemon.*` for `daemon` and
    `storage-and-daemon`, `pki/storage.*` for `storage`), and for the Postgres modes `database`.
@@ -194,10 +202,11 @@ named. The sudoers rule that lets the deploy account run `deploy` is a held step
    `installer.toml` can only narrow that list, and a list with no ref in common refuses the fetch.
    When a release is installed already, `--commit` is not fetched and a note says so.
 9. `/etc/kbf-installer/deploy.json`, only when `--deploy-stage` is given (see "The deploy config of a frontend and an all-in-one host").
-10. `/etc/kbf/kbf.toml`, as above.
+10. `/etc/kbf/kbf.toml`, as above (on an all-in-one host `/etc/kbf/frontend.toml` first).
 11. The units, last. On Linux `systemctl enable`, with `--now` unless `--no-start`: the mode's unit
     (only when a release is installed), and `kbf-installer.service`. `kbf-frontend.service`,
-    `kbf-all-in-one.service` and the proxy units are enabled and never started by `setup`: starting
+    `kbf-all-in-one.service` (kept for a host of the earlier layout) and the proxy units, with
+    `kbf-storage-and-daemon.service` beside them on an all-in-one host, are enabled and never started by `setup`: starting
     one takes the database, the TLS files and the port. A unit that is enabled already is left
     alone, and nothing is restarted. On a host that an earlier build set up with
     `kbf-backup.timer`, `setup` also disables the timer if it is enabled, removes the drop-in an
@@ -257,6 +266,58 @@ packaged port) and `ListenStream=<address>`. With no `listen` it removes the dro
 restarts the socket: it says to run `systemctl daemon-reload` and `systemctl restart
 kbf-proxy.socket`.
 
+## An all-in-one host: `--mode=all-in-one --proxy`
+
+An all-in-one host is the proxy, its frontend children and, beside them, a sibling process that
+holds the storage and the daemon: `kbf-storage-and-daemon.service`. It needs `--proxy` (without it
+`setup` refuses, exit 2) and takes the proxy's flags and `--database` as a frontend does; its own
+flags are the cold store, the metadata directory and the daemon half's identity. Linux only.
+`--storage-port` (default 8990, 1024 to 65535, clear of the children's ports) is the loopback
+port the sibling listens on and the children dial in plain text.
+
+| file | owner, mode | holds |
+|---|---|---|
+| `/etc/kbf/kbf.toml` | root:`kbf`, 0640 | the sibling's: `mode = "storage-and-daemon"`, `[listener] storage-listen = "127.0.0.1:<port>"`, `[stores]`, `[identity]`, `[daemon] driver`. No `[frontend]` or `[enroll]` table: `kbf` reads it as plain flags, and the sibling is a farm of one that is not registered with any frontend |
+| `/etc/kbf/frontend.toml` | root:`kbf-server`, 0640 | the children's: `mode = "frontend"`, `[scheduler] state-store`, `[tls] api-token-file`, `[storage-client] storage = "http://127.0.0.1:<port>"` |
+| `/etc/kbf/installer.toml` | root:root, 0644 | the `[proxy]` table, and the top-level key `frontend_config = "/etc/kbf/frontend.toml"`, which makes the proxy start its children with `--config=` that file. `setup` writes the key on an all-in-one host only, and removes it from any other |
+| `/etc/kbf/api-token` | `kbf-server`, 0600 | the first operator token, as for a frontend |
+
+The units are `kbf-proxy.socket`, `kbf-proxy.service` and `kbf-storage-and-daemon.service`, in
+that order. They are enabled and never started by `setup` (starting one takes the database, the
+TLS files and the ports): start the sibling first, since the children dial it, then the proxy. The
+proxy's files (the certificate pair and the client CA) and the operator token belong to
+`kbf-server`; the daemon half's identity (`--daemon-server`, `--daemon-ca-cert`, `--daemon-cert`,
+`--daemon-key`, `--node-id`) is the operator's, as before, and belongs to `kbf`. `--daemon-server`
+now dials the proxy, so its host must be a name on the proxy's certificate. The `orders/`
+directory of the installer's tree is `kbf-server`'s here, and the `kbf` account gets the subid
+ranges and lingering that run the sibling's containers.
+
+`frontend.toml` is written before `kbf.toml`, which is the file the sibling's unit waits for, and
+both follow the rule for a file that is there ("The `kbf.toml` file").
+
+**A restart of the sibling is felt by clients.** The sibling is no longer swapped by the proxy,
+and a farm of one has no map for the proxy to hold requests against: while
+`kbf-storage-and-daemon.service` is restarted, requests through the proxy that need the storage
+answer `UNAVAILABLE`, and the daemon half drains first (`drain-deadline-secs`, 600 by default).
+A frontend swap does not have this cost: only the children are swapped.
+
+**The sibling's listener is plain text and has no authentication.** It serves h2c on loopback, so
+any process on the host can reach `127.0.0.1:<port>`. The old all-in-one had no such socket.
+Whether an action running in a container can reach the host's loopback depends on the container
+driver's network; `setup` does not check it, so treat the port as open to every local user and to
+what the host's actions can reach.
+
+**The update path does not know this layout yet.** The installer's root half decides what a host
+runs from the `mode` of its `kbf.toml`, which on this host is `storage-and-daemon`. It therefore
+refuses `frontend_update` orders here (the host "runs no frontend"), and the unit it restarts is
+the sibling's. Until it reads the children's file from `installer.toml`, the children of an
+all-in-one host are not swapped through the update API.
+
+**Only a fresh host.** A `kbf.toml` that says `mode = "all-in-one"` is the earlier layout, one
+process for everything. `setup` does not rewrite it into this one: it refuses (exit 5,
+`needs_operator`), naming the file, and changes nothing. Keep such a host on
+`kbf-all-in-one.service`; moving it is a separate step that `setup` does not take.
+
 ## The state database
 
 `frontend` and `all-in-one` keep their state in one Postgres database on the host. The package only
@@ -274,7 +335,8 @@ at the URL's socket.
   with the URL's role, and as the service account when it exists) and, when the server refuses,
   prints the rules to add: above the first `local` line of `pg_hba.conf`
   `local <database> <role> peer map=kbf`, and in `pg_ident.conf` the lines `kbf root <role>` and
-  `kbf <service> <role>` (`<service>` is `kbf-server` for `frontend`, `kbf` for `all-in-one`).
+  `kbf <service> <role>` (`<service>` is `kbf-server`: on an all-in-one host it is the proxy's
+  child that holds the connection, not the sibling that runs as `kbf`).
   Reload the server and run `setup` again. The map name is any name used on both sides.
 - **A remote or managed server.** `setup` holds no password and does not reach a remote
   superuser. Create the role and database, make the server admit the logins, and run `setup`

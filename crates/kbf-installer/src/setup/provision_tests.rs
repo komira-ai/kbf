@@ -738,11 +738,12 @@ fn each_refused_login_has_its_recipe_and_names_nothing() {
     );
     assert!(text.contains("above the first `local` line"), "{text}");
     assert!(text.contains("reload the server (not restart)"), "{text}");
-    // All-in-one runs as `kbf`, and the recipe maps that account.
+    // On an all-in-one host the database is the proxy's child's, which runs as `kbf-server`
+    // and not as the sibling's `kbf`: the recipe maps that account.
     let mut aio = raw(Mode::AllInOne);
     aio.database = Some(URL.to_owned());
     let (_, out) = setup_on(&Shared::default(), &server, &aio, APPLY);
-    assert!(refusal(out).contains("`kbf  kbf  <role>`"));
+    assert!(refusal(out).contains("`kbf  kbf-server  <role>`"));
 }
 
 /// Catches an ident map that admits root and not the service: setup's own login works and the

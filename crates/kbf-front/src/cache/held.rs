@@ -1,10 +1,11 @@
 //! The blobs a node holds in RAM and has acknowledged but not yet written to its disk
 //! (`docs/design/storage-ram-ack.md`), and the order every reader consults them in.
 //!
-//! **Nothing puts a blob here yet.** A later change registers a blob when a write is
-//! acknowledged from RAM and removes it once the blob is in the index; until then the set
-//! is empty and every reader answers from the index alone, as before. A test puts blobs in
-//! through [`Cache::hold_for_test`] (the `testkit` feature).
+//! **The producer** registers a blob when a write is acknowledged from RAM
+//! ([`Cache::hold_write`], from `StreamedPut::commit` with `Held`, on a node with
+//! `--ram-ack-bytes` over 0) and the drain removes it once the blob is in the index. With
+//! the flag at 0 the set is empty and every reader answers from the index alone, as before.
+//! A test can also put blobs in through [`Cache::hold_for_test`] (the `testkit` feature).
 //!
 //! **Held first, then the index.** A reader looks at this set, then at the index, as two
 //! steps in that order (the index is queried inside one `MetaState` closure, so they cannot
@@ -84,6 +85,9 @@ pub(super) struct Entry {
     _permit: Option<Permit>,
     state: DrainState,
     since: Instant,
+    /// The map generation the node held when the blob was acknowledged (0: not known), by
+    /// which the flush report dates it as it dates a staged object.
+    born: u64,
 }
 
 /// What the set holds in all: the bytes and blobs not yet in the index, and the age of
@@ -121,6 +125,7 @@ impl Held {
         bytes: Bytes,
         permit: Option<Permit>,
         now: Instant,
+        born: u64,
     ) -> bool {
         match self.blobs().entry(digest) {
             std::collections::btree_map::Entry::Occupied(_) => false,
@@ -130,6 +135,7 @@ impl Held {
                     _permit: permit,
                     state: DrainState::Queued,
                     since: now,
+                    born,
                 });
                 true
             }
@@ -144,6 +150,16 @@ impl Held {
             self.left.notify_waiters();
         }
         removed
+    }
+
+    /// The oldest generation a held blob was acknowledged under, if any is held.
+    pub(super) fn oldest_born(&self) -> Option<u64> {
+        self.blobs().values().map(|e| e.born).min()
+    }
+
+    /// The generation `digest` was acknowledged under, if it is held.
+    pub(super) fn born_of(&self, digest: &Digest) -> Option<u64> {
+        self.blobs().get(digest).map(|e| e.born)
     }
 
     /// Whether nothing is held.
@@ -371,8 +387,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     }
 
     /// Returns when none of `digests` is held, or [`Cache::with_durable_wait`] after it
-    /// was called, whichever comes first; at once when none is held (always, while
-    /// nothing puts a blob in the set). A blob leaves the set only after the index has
+    /// was called, whichever comes first; at once when none is held (always, on a node
+    /// that does not acknowledge from RAM). A blob leaves the set only after the index has
     /// it, so a caller that asks the index afterwards finds what has left.
     pub(super) async fn wait_drained(&self, digests: &[Digest]) {
         if !self.held.any(digests) {

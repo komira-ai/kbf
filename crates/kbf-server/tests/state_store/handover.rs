@@ -474,3 +474,97 @@ async fn a_cordon_survives_a_restart_over_the_fake() {
 async fn a_cordon_survives_a_restart_over_sqlite() {
     a_cordon_survives_a_restart(Backing::Sqlite).await;
 }
+
+/// A farm over `disk` that tells `recorder` what happens to its operations.
+fn recorded_farm(disk: &Disk, recorder: &kbf_front::Recorder) -> TestFarm {
+    let store: Arc<dyn Store> = disk.store.clone();
+    Farm::new(
+        Arc::new(Cache::memory()),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    )
+    .recording(recorder.clone())
+    .with_state(Some(StateStore {
+        store,
+        epoch: EpochPolicy::Keep,
+        members: Default::default(),
+        history: None,
+    }))
+    .expect("a farm over the store")
+}
+
+/// Pins the documented loss in `docs/design/frontend-handover.md` ("Not carried": an
+/// invocation record is split between the two processes). The invocation record is
+/// built by a process's own recorder from the events its own farm sent, and no row of
+/// the state store carries it. So after a handover the successor's recorder has no
+/// record of the build whose call the predecessor recorded, while the caller the
+/// predecessor kept is still answered, from the `done/` row the successor wrote.
+/// Catches: a build result that depended on the recorder (the caller left waiting for
+/// a record that is not there), and a change that starts carrying the record (this test
+/// then goes red, and the doc line must change with it). Mutant: the successor given the
+/// predecessor's recorder instead of a fresh one finds the record. No change to the farm
+/// makes the successor find it, since nothing writes it to the store: this test pins the
+/// documented loss; it cannot catch a regression that has no code to regress.
+#[tokio::test(start_paused = true)]
+async fn a_successors_recorder_has_no_record_of_a_build_but_its_caller_is_answered() {
+    let disk = Disk::new();
+    let (before, recording) = kbf_front::Recorder::new(1 << 20, 64);
+    tokio::spawn(recording.run());
+    let metadata = kbf_front::CallMetadata {
+        invocation_id: kbf_front::InvocationId::parse("build-1"),
+        ..Default::default()
+    };
+    let key = kbf_invocation::RecordKey::owner(kbf_invocation::InvocationId::new("build-1"));
+    let asked = request(1);
+    let call = kbf_front::ExecuteCall::new(
+        &before,
+        &metadata,
+        &Default::default(),
+        "main",
+        asked.key.action,
+        asked.key.action,
+    )
+    .expect("a recorded call");
+
+    let old = recorded_farm(&disk, &before);
+    let (_, mut inbox) = register(&old);
+    let ticket = old
+        .submit(Submission {
+            request: asked,
+            call: Some(call),
+            described: Described::default(),
+        })
+        .expect("queued");
+    let [lease] = starts(&mut inbox)[..] else {
+        panic!("one lease expected");
+    };
+    before.caught_up().await;
+    assert!(before.get(&key).is_some(), "the predecessor recorded it");
+
+    old.fence();
+    assert_eq!(old.follow().expect("follow"), 1);
+
+    // The successor has a recorder of its own, as a new process does.
+    let (after, recording) = kbf_front::Recorder::new(1 << 20, 64);
+    tokio::spawn(recording.run());
+    let new = recorded_farm(&disk, &after);
+    let (stream, _inbox) = register(&new);
+    assert!(new.heartbeat(&node(), stream, 1, vec![lease]).await);
+    assert!(
+        accepted(&new, lease).await,
+        "the successor takes the result"
+    );
+    after.caught_up().await;
+    assert!(
+        after.get(&key).is_none(),
+        "the successor has no record of the build"
+    );
+
+    // The caller the predecessor kept is answered from the row, whatever the recorder says.
+    assert_eq!(old.follow().expect("follow"), 0);
+    let finished = done(&ticket).expect("answered from the done row");
+    assert_eq!(
+        status(&finished),
+        (Code::InvalidArgument as i32, "test".to_owned())
+    );
+}

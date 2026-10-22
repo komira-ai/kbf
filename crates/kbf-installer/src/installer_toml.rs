@@ -15,6 +15,10 @@
 //! source takes the keys of its own and refuses the others'. Parsing checks the shape of every
 //! value and reads no file: the CA files are looked at when they are used.
 //!
+//! `frontend_config` is the one key of the proxy's children: an absolute path, the file they
+//! read (`--config=`) instead of the default `kbf.toml`. `setup` writes it on an all-in-one
+//! host only, where `kbf.toml` is the storage-and-daemon sibling's; the tolerant reader takes it.
+//!
 //! [`InstallerToml::parse`] is the closed reader, for whoever decides where a release comes
 //! from (the fetcher) or rewrites the file (`setup`): it must understand all of it. A reader
 //! that takes only some of the keys (the proxy verb) reads it with
@@ -67,14 +71,16 @@ struct Raw {
     /// keys are closed the same way.
     proxy: Option<toml::Value>,
     database: Option<String>,
+    frontend_config: Option<String>,
 }
 
 /// The keys [`InstallerToml::parse_tolerant`] reads; it drops every other before it looks.
-const TOLERANT_KEYS: [&str; 4] = [
+const TOLERANT_KEYS: [&str; 5] = [
     "confirm_window_s",
     "confirm_window_max_s",
     "fetch_timeout_s",
     "proxy",
+    "frontend_config",
 ];
 
 /// The keys of the frontend snapshot, in the order `render` writes them.
@@ -176,6 +182,10 @@ pub struct InstallerToml {
     /// leniently (only this key, and it refuses a password); this field exists so that the
     /// closed reader here does not reject the key, and it has no other consumer.
     pub database: Option<String>,
+    /// The `kbf.toml`-shaped file the proxy's frontend children read (`--config=`) instead of
+    /// the default `kbf.toml`: an absolute path. Written by `setup` on an all-in-one host only,
+    /// where `kbf.toml` is the sibling's; every other host leaves the children the default.
+    pub frontend_config: Option<PathBuf>,
 }
 
 impl Default for InstallerToml {
@@ -196,6 +206,7 @@ impl Default for InstallerToml {
             frontend: None,
             proxy: None,
             database: None,
+            frontend_config: None,
         }
     }
 }
@@ -209,6 +220,8 @@ pub struct Tolerant {
     pub fetch_timeout_s: u32,
     /// The `[proxy]` table, which is closed whoever reads it.
     pub proxy: Option<ProxyConfig>,
+    /// `frontend_config`, checked as the closed reader checks it.
+    pub frontend_config: Option<PathBuf>,
 }
 
 /// Why a file is not an `installer.toml`.
@@ -457,8 +470,8 @@ impl InstallerToml {
     }
 
     /// The tolerant reader, for a reader that fetches nothing and so needs only the confirm
-    /// window, the fetch timeout and the `[proxy]` table (`database` it reads on its own,
-    /// leniently, as the proxy verb does): every other key is dropped before the
+    /// window, the fetch timeout, the `[proxy]` table and `frontend_config` (`database` it
+    /// reads on its own, leniently, as the proxy verb does): every other key is dropped before the
     /// file is looked at, so a key or a value this build has never heard of (a source a later
     /// build wrote) cannot stop it. What it does read is checked as [`InstallerToml::parse`]
     /// checks it, the `[proxy]` table stays closed, and a message repeats no text of the file.
@@ -484,6 +497,7 @@ impl InstallerToml {
             confirm_window_s: file.confirm_window_s,
             fetch_timeout_s: file.fetch_timeout_s,
             proxy: file.proxy,
+            frontend_config: file.frontend_config,
         })
     }
 
@@ -579,6 +593,7 @@ impl InstallerToml {
             &mut problems,
         );
         let release_ca = absolute("release_ca", &raw.release_ca, &mut problems);
+        let frontend_config = absolute("frontend_config", &raw.frontend_config, &mut problems);
         let identity_given = raw.node_cert.is_some() || raw.node_key.is_some();
         let snapshot_given = raw.frontend_url.is_some()
             || raw.frontend_ca.is_some()
@@ -617,6 +632,7 @@ impl InstallerToml {
                 frontend,
                 proxy,
                 database: raw.database,
+                frontend_config,
             }),
             _ => Err(ConfigError::Invalid(problems)),
         }
@@ -675,6 +691,9 @@ impl InstallerToml {
         }
         if let Some(url) = &self.database {
             out.push_str(&format!("database = {}\n", toml_string(url)));
+        }
+        if let Some(p) = &self.frontend_config {
+            out.push_str(&format!("frontend_config = \"{}\"\n", p.display()));
         }
         if let Some(proxy) = &self.proxy {
             render_proxy(proxy, &mut out);

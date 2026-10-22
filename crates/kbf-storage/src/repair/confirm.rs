@@ -14,8 +14,11 @@
 //! restarted peer (which answers missing) is paid a debt.
 //!
 //! The set is capped ([`RepairConfig::unconfirmed_cap`]): a digest that arrives when it is
-//! full journals its debt at once. **Nothing puts a digest here yet**: the acknowledgement
-//! point that does is a later change, so the set is empty and a pass asks nobody.
+//! full journals its debt at once. The storage service puts a digest here when a write it
+//! acknowledged may be held in RAM on either owner (`--ram-ack-bytes`); with the flag at 0
+//! nothing does, the set is empty and a pass asks nobody. [`RepairWorker::confirm_pass`]
+//! says which digests this node has written (an own durable question) before it asks the
+//! peer.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -155,6 +158,18 @@ impl PeerConfirmer {
                 .await?,
         );
         Ok(Tracked::Owed)
+    }
+
+    /// The digests kept whose own copy is not yet known to be on this node's disk
+    /// ([`PeerConfirmer::drained`]), at most `limit` of them.
+    #[must_use]
+    pub fn undrained(&self, limit: usize) -> Vec<Digest> {
+        self.set()
+            .iter()
+            .filter(|(_, entry)| entry.due.is_none())
+            .map(|(digest, _)| *digest)
+            .take(limit)
+            .collect()
     }
 
     /// Says this node has written `digest` to its own disk at `now`: the peer is asked

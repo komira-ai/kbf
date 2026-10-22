@@ -266,7 +266,8 @@ fn a_regular_file_shadowing_the_packaged_unit_stops_setup_before_any_step() {
         (Mode::StorageAndDaemon, "kbf-storage-and-daemon.service"),
         (Mode::Daemon, "kbf-daemon.service"),
         (Mode::Storage, "kbf-storage.service"),
-        (Mode::AllInOne, "kbf-all-in-one.service"),
+        (Mode::AllInOne, "kbf-storage-and-daemon.service"),
+        (Mode::AllInOne, "kbf-proxy.service"),
         (Mode::Frontend, "kbf-frontend.service"),
     ];
     for (mode, file) in cases {

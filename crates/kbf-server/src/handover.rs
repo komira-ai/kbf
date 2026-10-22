@@ -9,8 +9,12 @@
 //!
 //! 1. The successor binds its listeners and connects to the control socket, saying what
 //!    it is started with (`hello`: protocol, instance, where its REAPI listener is, state
-//!    file). A holder refuses the same instance, another state file or protocol, a REAPI
-//!    address that is not loopback, a peer that is another user's ([`outgoing`]).
+//!    file, and, with `--enroll-listen`, the enroll flags that decide the CA and the
+//!    address). A holder refuses the same instance, another state file or protocol, another
+//!    enroll listener or CA (or one where the holder has none), a REAPI address that is not
+//!    loopback, a peer that is another user's ([`outgoing`]). The enroll listener is not
+//!    passed on: like the others, each instance binds its own, ten ports apart, over the
+//!    one CA directory.
 //!    Nothing is connected, or the connection is refused: the successor is the only
 //!    frontend and starts as any start does.
 //! 2. The holder answers `offer` with the state store's generation, and goes on serving.
@@ -98,6 +102,18 @@ impl Instance {
             Self::A => Some(port),
             Self::B if port == 0 => Some(0),
             Self::B => port.checked_add(Self::SECOND_OFFSET),
+        }
+    }
+}
+
+impl Instance {
+    /// The port the flags say, where this instance listens on `port`: the inverse of
+    /// [`Instance::port`]. Port 0 stays 0.
+    #[must_use]
+    pub fn base_port(self, port: u16) -> u16 {
+        match self {
+            Self::A => port,
+            Self::B => port.saturating_sub(Self::SECOND_OFFSET),
         }
     }
 }

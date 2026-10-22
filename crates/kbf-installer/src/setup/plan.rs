@@ -9,6 +9,7 @@
 
 use kbf_host::{Cmd, Entry, Exec, HostPath, Owner, Perms, Plan, Planner, RunUser};
 
+use super::kbf_settings::Setting;
 use super::kbf_toml::{self, Decision, Ours, UpdateDirs};
 use super::os::{DSCL, LAUNCHCTL, Os, SYSTEMCTL, View};
 use super::paths;
@@ -31,6 +32,12 @@ pub const MAC_INSTALLER_LABEL: &str = "com.komira.kbf-installer";
 pub const MAC_DAEMON_LABEL: &str = "com.komira.kbf-daemon";
 /// The units of a frontend host behind the proxy.
 pub const PROXY_UNITS: &[&str] = &["kbf-proxy.socket", "kbf-proxy.service"];
+/// The sibling of an all-in-one host's proxy: the storage and the daemon in one process.
+pub const STORAGE_AND_DAEMON_UNIT: &str = "kbf-storage-and-daemon.service";
+/// The units of an all-in-one host: the proxy's, then the sibling.
+const ALL_IN_ONE_UNITS: &[&str] = &[PROXY_UNITS[0], PROXY_UNITS[1], STORAGE_AND_DAEMON_UNIT];
+/// The account the proxy and its frontend children run as (`User=` of `kbf-proxy.service`).
+const FRONTEND_USER: &str = "kbf-server";
 /// The frontend instance a host without the proxy runs.
 const FRONTEND_UNIT: &str = "kbf-frontend.service";
 pub const INSTALLER_UNIT: &str = "kbf-installer.service";
@@ -73,23 +80,37 @@ fn file(
 ///
 /// A frontend behind the proxy (`proxy`) is run by the proxy's units, which start the frontend
 /// children themselves: `kbf-frontend.service` is never enabled beside them. The socket is
-/// first, so it holds the public port before the service takes it.
+/// first, so it holds the public port before the service takes it. An all-in-one host behind
+/// the proxy has the sibling after them (`kbf-all-in-one.service` is the earlier layout's, one
+/// process for everything, and is no longer enabled by `setup`).
 pub fn mode_units(mode: Mode, proxy: bool) -> &'static [&'static str] {
     match mode {
         Mode::Frontend if proxy => PROXY_UNITS,
         Mode::Frontend => &[FRONTEND_UNIT],
         Mode::Storage => &["kbf-storage.service"],
         Mode::Daemon => &["kbf-daemon.service"],
-        Mode::StorageAndDaemon => &["kbf-storage-and-daemon.service"],
+        Mode::StorageAndDaemon => &[STORAGE_AND_DAEMON_UNIT],
+        Mode::AllInOne if proxy => ALL_IN_ONE_UNITS,
         Mode::AllInOne => &["kbf-all-in-one.service"],
     }
 }
 
-/// The user a mode's unit runs as on Linux (`User=` of the package's units).
+/// The user a mode's unit runs as on Linux (`User=` of the package's units). On an all-in-one
+/// host this is the sibling's; the proxy's is [`FRONTEND_USER`].
 pub(crate) fn service_user_name(mode: Mode) -> &'static str {
     match mode {
-        Mode::Frontend | Mode::Storage => "kbf-server",
+        Mode::Frontend | Mode::Storage => FRONTEND_USER,
         Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne => "kbf",
+    }
+}
+
+/// The user that holds the connection to the state database: the frontend's, which on an
+/// all-in-one host is the proxy's child (`kbf-server`) and not the sibling `service_user_name`
+/// names.
+pub(crate) fn database_user_name(mode: Mode) -> &'static str {
+    match mode {
+        Mode::AllInOne => FRONTEND_USER,
+        other => service_user_name(other),
     }
 }
 
@@ -99,8 +120,10 @@ fn runs_actions(mode: Mode) -> bool {
 }
 
 /// Whether the mode's daemon takes update orders: the one `kbf` starts with a storage map. The
-/// in-process daemon of `all-in-one` refuses `--update-dir` (`kbf-node`'s `start_over`), so it
-/// is not written there.
+/// in-process daemon of the earlier `all-in-one` layout refuses `--update-dir` (`kbf-node`'s
+/// `start_over`), and the sibling of the proxy layout takes no orders either, so neither key is
+/// written for an all-in-one host: this looks at the host's mode, not at the node mode that
+/// host's `kbf.toml` names.
 pub fn takes_orders(mode: Mode) -> bool {
     matches!(mode, Mode::Daemon | Mode::StorageAndDaemon)
 }
@@ -125,16 +148,46 @@ pub struct Ctx {
     pub root: Owner,
     /// The user the mode's unit runs as (Linux); a Mac runs the daemon as root.
     pub service: Option<RunUser>,
+    /// The user of the proxy and its frontend children when the host also runs a sibling as
+    /// `service` (all-in-one): `kbf-server`. None elsewhere, where `service` is that user.
+    pub frontend: Option<RunUser>,
+}
+
+/// The ids of `user` as the owner of a file.
+fn owner_of(user: &RunUser) -> Owner {
+    Owner {
+        uid: user.uid,
+        gid: user.gid,
+    }
 }
 
 impl Ctx {
     /// The owner of what the service user reads or writes; root when there is none.
     fn service_owner(&self) -> Owner {
-        self.service.as_ref().map_or(self.root, |u| Owner {
-            uid: u.uid,
-            gid: u.gid,
-        })
+        self.service.as_ref().map_or(self.root, owner_of)
     }
+
+    /// The user the proxy and its frontend children run as: the sibling's host has one of its
+    /// own, a frontend host's service user is it.
+    fn frontend_user(&self) -> Option<&RunUser> {
+        self.frontend.as_ref().or(self.service.as_ref())
+    }
+
+    /// The owner of what the proxy and the frontend children read or write; root when there is
+    /// none.
+    fn frontend_owner(&self) -> Owner {
+        self.frontend_user().map_or(self.root, owner_of)
+    }
+
+    /// The uid keys and certificates of the proxy and the children must belong to.
+    pub fn frontend_uid(&self) -> Option<u32> {
+        self.frontend_user().map(|user| user.uid)
+    }
+}
+
+/// The account `name`, or why the host cannot be set up: the package makes it.
+fn account(os: &dyn Os, name: &'static str) -> Result<RunUser, SetupError> {
+    os.user(name)?.ok_or(SetupError::NoUser { name })
 }
 
 pub fn context(os: &dyn Os, mode: Mode) -> Result<Ctx, SetupError> {
@@ -146,17 +199,20 @@ pub fn context(os: &dyn Os, mode: Mode) -> Result<Ctx, SetupError> {
         )));
     }
     let service = match platform {
-        Platform::Linux => {
-            let name = service_user_name(mode);
-            Some(os.user(name)?.ok_or(SetupError::NoUser { name })?)
-        }
+        Platform::Linux => Some(account(os, service_user_name(mode))?),
         Platform::MacOs => None,
+    };
+    // The proxy runs as the frontend's user, the sibling as the service user: two accounts.
+    let frontend = match (platform, mode) {
+        (Platform::Linux, Mode::AllInOne) => Some(account(os, FRONTEND_USER)?),
+        _ => None,
     };
     Ok(Ctx {
         platform,
         layout: Layout::new(kbf_host::Root::new("/")?, platform),
         root: os.root_owner(),
         service,
+        frontend,
     })
 }
 
@@ -422,21 +478,23 @@ pub fn before_release(
         }
     }
 
-    // The installer's tree is root's; `orders/` inside it is the service user's (on a Mac the
-    // daemon is root, so it is root's).
+    // The installer's tree is root's; `orders/` inside it is the frontend's (on an all-in-one
+    // host the proxy's, not the sibling's; on a Mac the daemon is root, so it is root's).
     let (root, service) = (ctx.root, ctx.service_owner());
+    let frontend = ctx.frontend_owner();
     dir(&mut p, paths::etc_dir(platform), 0o755, root)?;
     let state_dir = ctx.layout.state_dir().to_string();
     dir(&mut p, &state_dir, 0o755, root)?;
-    dir(&mut p, ctx.layout.orders_dir().as_str(), 0o700, service)?;
+    dir(&mut p, ctx.layout.orders_dir().as_str(), 0o700, frontend)?;
 
     // The tokens belong to the user whose process reads them: both loaders refuse a token
-    // file another user owns, or one with a mode other than 0600 or 0400.
+    // file another user owns, or one with a mode other than 0600 or 0400. The operator API is
+    // the frontend's, whatever user the rest of the host runs as.
     if let Some(token) = enroll_token {
         file(&mut p, paths::enroll_token(platform), 0o600, service, token)?;
     }
     if serves_api(v.mode) {
-        operator_token(&mut p, os, exec, service, platform, &mut notes)?;
+        operator_token(&mut p, os, exec, frontend, platform, &mut notes)?;
     }
 
     file(
@@ -453,6 +511,24 @@ pub fn before_release(
         plan: p.finish(),
         notes,
     })
+}
+
+/// Refuses an all-in-one host whose `kbf.toml` says `mode = "all-in-one"`: the layout of one
+/// process for everything, which `setup` does not rewrite into the proxy, the frontend child and
+/// the sibling (that move is not part of `setup` yet). Asked before the files the flags name are
+/// looked at, since on such a host they would be refused for what the earlier layout never had.
+/// Reads the host, changes nothing.
+pub fn refuse_earlier_all_in_one(exec: &dyn Exec, platform: Platform) -> Result<(), SetupError> {
+    let path = paths::kbf_toml(platform);
+    let Some(Entry::File { bytes, .. }) = exec.inspect(&hp(path)?)? else {
+        return Ok(());
+    };
+    if !kbf_toml::says_all_in_one(&String::from_utf8_lossy(&bytes)) {
+        return Ok(());
+    }
+    Err(SetupError::NeedsOperator(format!(
+        "{path} says mode = \"all-in-one\", the layout of one process for everything that an earlier release set up: setup writes the proxy layout (the proxy, a frontend child and the kbf-storage-and-daemon sibling) to a new host only and does not rewrite this file; leave this host on kbf-all-in-one.service, or set up another host"
+    )))
 }
 
 /// The text of the drop-in that moves `kbf-proxy.socket` to `addr`: the empty `ListenStream=`
@@ -515,6 +591,106 @@ fn operator_token(
     Ok(())
 }
 
+/// A setting `setup` writes without a flag of its own: `[table] key = "value"`.
+fn setting(table: &'static str, key: &'static str, value: String) -> Setting {
+    Setting { table, key, value }
+}
+
+/// The loopback address the sibling of an all-in-one host listens on.
+fn loopback(port: u16) -> String {
+    format!("127.0.0.1:{port}")
+}
+
+/// The settings of `kbf.toml`: the flags' and, on an all-in-one host, where the sibling listens.
+fn node_settings(v: &Valid) -> Vec<Setting> {
+    let mut all = Vec::new();
+    if let Some(port) = v.storage_port() {
+        all.push(setting("listener", "storage-listen", loopback(port)));
+    }
+    all.extend(v.kbf.iter().cloned());
+    all
+}
+
+/// The text of the file at `path`; none when it is not there. A file that is not a regular
+/// file is the operator's to deal with.
+fn read_current(exec: &dyn Exec, path: &str) -> Result<Option<String>, SetupError> {
+    let current = match exec.inspect(&hp(path)?)? {
+        Some(Entry::File { bytes, .. }) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        Some(_) => {
+            return Err(SetupError::NeedsOperator(format!(
+                "{path} is not a regular file"
+            )));
+        }
+        None => None,
+    };
+    Ok(current)
+}
+
+/// Plans the file at `path` as `decision` says, mode 0640 and `owner`'s; `label` is its name in
+/// the notes and `existed` whether it is there already.
+fn config_file(
+    p: &mut Pl<'_, '_>,
+    label: &str,
+    path: &str,
+    existed: bool,
+    decision: Decision,
+    owner: Owner,
+    notes: &mut Vec<String>,
+) -> Result<(), SetupError> {
+    match decision {
+        Decision::Write(text) => {
+            let changed = file(p, path, 0o640, owner, text.into_bytes())?;
+            if changed && existed {
+                notes.push(format!(
+                    "{label} changed: a running kbf keeps the old one until it is restarted; setup does not restart it"
+                ));
+            }
+        }
+        Decision::Keep => notes.push(format!(
+            "{label} holds other settings and the keys setup writes already match: left as it is"
+        )),
+        Decision::Refuse(why) => return Err(SetupError::NeedsOperator(why)),
+    }
+    Ok(())
+}
+
+/// Plans `frontend.toml`, the file the proxy's children read on an all-in-one host: `mode =
+/// "frontend"`, the operator token, the state database, and the sibling as their storage node
+/// (plain text, on loopback). Decided as `kbf.toml` is. root:<the proxy's group> 0640.
+fn frontend_file(
+    p: &mut Pl<'_, '_>,
+    exec: &dyn Exec,
+    v: &Valid,
+    ctx: &Ctx,
+    port: u16,
+    notes: &mut Vec<String>,
+) -> Result<(), SetupError> {
+    let path = paths::frontend_toml(ctx.platform);
+    let storage = format!("http://{}", loopback(port));
+    let extra = [setting("storage-client", "storage", storage)];
+    let ours = Ours {
+        mode: mode_name(Mode::Frontend),
+        frontend_url: None,
+        token_file: None,
+        api_token_file: Some(paths::api_token(ctx.platform)),
+        state_store: v.database.as_deref(),
+        update: None,
+        extra: &extra,
+    };
+    let current = read_current(exec, &path)?;
+    let decision = kbf_toml::decide(current.as_deref(), &ours, &path);
+    let owner = Owner {
+        uid: ctx.root.uid,
+        gid: ctx.frontend_owner().gid,
+    };
+    let existed = current.is_some();
+    let label = "frontend.toml";
+    config_file(p, label, &path, existed, decision, owner, notes)
+}
+
+/// The part after the first release: `kbf.toml` (on an all-in-one host `frontend.toml` before
+/// it), then the units. `released` says whether a release is installed (or, in a dry run, would
+/// be). Reads the host, changes nothing.
 /// The part after the first release: `kbf.toml`, then the units. `released` says whether a
 /// release is installed (or, in a dry run, would be). Reads the host, changes nothing.
 pub fn after_release(
@@ -535,28 +711,26 @@ pub fn after_release(
         ctx.layout.update_dir().to_string(),
         ctx.layout.orders_dir().to_string(),
     );
+    // An all-in-one host's `kbf.toml` is the sibling's, a `storage-and-daemon` node that
+    // listens on the loopback port and has no enrollment: the operator API and the state
+    // database are the frontend children's, in `frontend.toml`.
+    let sibling = v.storage_port();
+    let node_mode = sibling.map_or(v.mode, |_| Mode::StorageAndDaemon);
+    let node_extra = node_settings(v);
     let ours = Ours {
-        mode: mode_name(v.mode),
+        mode: mode_name(node_mode),
         frontend_url: v.frontend_url.as_deref(),
         token_file: v.token_file.as_ref().map(|_| paths::enroll_token(platform)),
-        api_token_file: serves_api(v.mode).then_some(paths::api_token(platform)),
-        state_store: v.database.as_deref(),
+        api_token_file: serves_api(node_mode).then_some(paths::api_token(platform)),
+        state_store: v.database.as_deref().filter(|_| sibling.is_none()),
         // A Mac's keys are kbf-mac-provision's: checked below, never written.
         update: (takes_orders(v.mode) && platform != Platform::MacOs).then_some(UpdateDirs {
             update_dir: &update_dir,
             orders_dir: &orders_dir,
         }),
-        extra: &v.kbf,
+        extra: &node_extra,
     };
-    let current = match exec.inspect(&hp(kbf_toml_path)?)? {
-        Some(Entry::File { bytes, .. }) => Some(String::from_utf8_lossy(&bytes).into_owned()),
-        Some(_) => {
-            return Err(SetupError::NeedsOperator(format!(
-                "{kbf_toml_path} is not a regular file"
-            )));
-        }
-        None => None,
-    };
+    let current = read_current(exec, kbf_toml_path)?;
     if platform == Platform::MacOs && takes_orders(v.mode) {
         // No file: provision has not run. A file that is not TOML is `decide`'s to name.
         let table = current
@@ -568,28 +742,25 @@ pub fn after_release(
         }
     }
     let decision = kbf_toml::decide(current.as_deref(), &ours, kbf_toml_path);
-    match decision {
-        Decision::Write(text) => {
-            let existed = current.is_some();
-            // root:<service group> 0640: the service reads it, nobody else; only root writes.
-            let owner = Owner {
-                uid: ctx.root.uid,
-                gid: ctx.service_owner().gid,
-            };
-            let changed = file(&mut p, kbf_toml_path, 0o640, owner, text.into_bytes())?;
-            if changed && existed {
-                notes.push(
-                    "kbf.toml changed: a running kbf keeps the old one until it is restarted; setup does not restart it"
-                        .to_owned(),
-                );
-            }
-        }
-        Decision::Keep => notes.push(
-            "kbf.toml holds other settings and the keys setup writes already match: left as it is"
-                .to_owned(),
-        ),
-        Decision::Refuse(why) => return Err(SetupError::NeedsOperator(why)),
+    // The children's file first: `kbf.toml` is the last file written, so that a stop part way
+    // leaves no config that passes the sibling's unit condition.
+    if let Some(port) = sibling {
+        frontend_file(&mut p, exec, v, ctx, port, &mut notes)?;
     }
+    // root:<service group> 0640: the service reads it, nobody else; only root writes.
+    let owner = Owner {
+        uid: ctx.root.uid,
+        gid: ctx.service_owner().gid,
+    };
+    config_file(
+        &mut p,
+        "kbf.toml",
+        kbf_toml_path,
+        current.is_some(),
+        decision,
+        owner,
+        &mut notes,
+    )?;
 
     notes.extend(units(&mut p, os, v, ctx, released, no_start)?);
     Ok(Outcome {
@@ -628,6 +799,24 @@ fn remove_old_backup_timer(
     Ok(dropin || dir)
 }
 
+/// What `setup` tells of the units it enables and leaves stopped on a host that keeps its state
+/// in Postgres: starting one takes the database, the TLS files and the ports, which only the
+/// operator decides. On an all-in-one host the sibling goes first, since the frontend child
+/// dials it, and a restart of it later is felt by the clients: the proxy holds nothing for it.
+fn not_started_note(v: &Valid) -> &'static str {
+    match (v.mode, v.proxy.is_some()) {
+        (Mode::AllInOne, _) => {
+            "the proxy units and kbf-storage-and-daemon.service are enabled, not started: start kbf-storage-and-daemon.service first (the frontend child dials it), then kbf-proxy.socket and kbf-proxy.service, when the database, the TLS files and the ports are ready; a later restart of kbf-storage-and-daemon.service leaves clients with UNAVAILABLE until it is back, because the proxy holds no request for it"
+        }
+        (_, true) => {
+            "the proxy units are enabled, not started: start kbf-proxy.socket and kbf-proxy.service when the database, the TLS files and the port are ready"
+        }
+        (_, false) => {
+            "the frontend unit is enabled, not started: start it when the database, the TLS files and the port are ready"
+        }
+    }
+}
+
 fn units(
     p: &mut Pl<'_, '_>,
     os: &dyn Os,
@@ -642,12 +831,7 @@ fn units(
     // frontend is never started here: starting one takes the state database and the public
     // port, which only the operator decides.
     let start_mode = if v.mode.keeps_state_in_database() {
-        notes.push(if v.proxy.is_some() {
-            "the proxy units are enabled, not started: start kbf-proxy.socket and kbf-proxy.service when the database, the TLS files and the port are ready"
-        } else {
-            "the frontend unit is enabled, not started: start it when the database, the TLS files and the port are ready"
-        }
-        .to_owned());
+        notes.push(not_started_note(v).to_owned());
         false
     } else if no_start {
         notes.push("--no-start: units are enabled, not started".to_owned());

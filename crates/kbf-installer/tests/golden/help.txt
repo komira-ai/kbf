@@ -73,11 +73,11 @@ Options:
       --no-start
           Enable the units without starting them
       --listen <LISTEN>
-          The public REAPI listener, as IP:PORT (kbf's --listen). frontend, all-in-one
+          The public REAPI listener, as IP:PORT (kbf's --listen). frontend
       --worker-listen <WORKER_LISTEN>
-          The worker listener (daemons and storage nodes dial it), as IP:PORT. frontend, all-in-one
+          The worker listener (daemons and storage nodes dial it), as IP:PORT. frontend
       --api-listen <API_LISTEN>
-          The operator API listener, as IP:PORT; default 127.0.0.1:8982. frontend, all-in-one
+          The operator API listener, as IP:PORT; default 127.0.0.1:8982. frontend
       --reapi-tls-cert <REAPI_TLS_CERT>
           The REAPI listener's certificate (PEM file, absolute path); needs --reapi-tls-key
       --reapi-tls-key <REAPI_TLS_KEY>
@@ -111,13 +111,15 @@ Options:
       --node-id <NODE_ID>
           The daemon half's node name, a DNS label unique in the cell. Required for all-in-one
       --proxy
-          Set this frontend host up behind `kbf-installer proxy`: write the `[proxy]` table of installer.toml and enable kbf-proxy.socket and kbf-proxy.service instead of kbf-frontend.service. Only for `--mode=frontend`. The proxy takes --reapi-tls-cert, --reapi-tls-key and --worker-client-ca; the listener flags are not taken
+          Set this host up behind `kbf-installer proxy`: write the `[proxy]` table of installer.toml and enable kbf-proxy.socket and kbf-proxy.service instead of kbf-frontend.service (an all-in-one host also gets kbf-storage-and-daemon.service, and cannot be set up without --proxy). Only for `--mode=frontend` and `--mode=all-in-one`. The proxy takes --reapi-tls-cert, --reapi-tls-key and --worker-client-ca; the listener flags are not taken
       --proxy-base-port <PROXY_BASE_PORT>
           The first loopback port of the frontend children the proxy starts (1024 to 65521); slot A uses it and the four after, slot B ten above. Default 18000. With --proxy
       --buck2-auth <BUCK2_AUTH>
           How REAPI and Buck2 callers authenticate to the proxy; default none. With --proxy [possible values: none, bearer, mtls]
       --buck2-token-file <BUCK2_TOKEN_FILE>
           The Buck2 API key file, an absolute path, for --buck2-auth bearer
+      --storage-port <STORAGE_PORT>
+          The loopback port of the kbf-storage-and-daemon sibling an all-in-one host runs, which the frontend child dials in plain text (1024 to 65535, clear of the children's ports). Default 8990. Only for `--mode=all-in-one`, with --proxy
       --deploy-stage <DEPLOY_STAGE>
           The stage this host is, gamma or prod: setup writes /etc/kbf-installer/deploy.json so `kbf-installer deploy` binds an offer to it. frontend, all-in-one
       --deploy-api <DEPLOY_API>
