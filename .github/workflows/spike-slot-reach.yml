@@ -1,9 +1,7 @@
-# Clean-state spike (branch spike/mac-pool-clean-state only; this file is not for main).
-# What a pool user can leave behind, what the clean removes, what proves it gone: the
-# plants and probes of crates/kbf-driver-native/tests/clean_state_spike, one job per slice
-# of the rows so the slices run on separate hosted Macs. It prints CELL / ASSERT / CLEAN /
-# WIPE / SNAPDIFF / BUILD* lines and asserts only that the harness ran and left no user
-# behind. By hand only (workflow_dispatch); dispatch once per push, because
+# Experiment round E1 of the Mac pool plan (branch spike/mac-pool-e1 only; this file is not for main).
+# One job per slice, so the slices run on separate hosted Macs. They print the harness's lines
+# (CELL / CLEAN / E1ROW / E1DOOR / E1BUILD / ...) and assert only that the harness ran and left no
+# user behind. By hand only (workflow_dispatch); dispatch once per push, because
 # `cancel-in-progress` ends a run when a second one starts on the branch.
 name: spike-slot-reach
 
@@ -17,9 +15,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  cs-channels-1:
+  e1-xl:
     runs-on: macos-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     permissions:
       contents: read
     steps:
@@ -29,12 +27,12 @@ jobs:
       - run: sw_vers
       - run: uname -m
       - run: rustup toolchain install
-      - name: channels_1 (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture channels_1
+      - name: X-L, X8 (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1_xl
 
-  cs-channels-2:
+  e1-canaries:
     runs-on: macos-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     permissions:
       contents: read
     steps:
@@ -44,12 +42,12 @@ jobs:
       - run: sw_vers
       - run: uname -m
       - run: rustup toolchain install
-      - name: channels_2 (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture channels_2
+      - name: v2 canaries, X1 (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1_canaries
 
-  cs-channels-3:
+  e1-builds:
     runs-on: macos-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     permissions:
       contents: read
     steps:
@@ -59,18 +57,12 @@ jobs:
       - run: sw_vers
       - run: uname -m
       - run: rustup toolchain install
-      - name: Remote Login for the sshd row (printed; the row says what happened)
-        run: |
-          sudo systemsetup -getremotelogin || true
-          sudo systemsetup -setremotelogin on || true
-          sudo launchctl enable system/com.openssh.sshd || true
-          sudo systemsetup -getremotelogin || true
-      - name: channels_3 (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture channels_3
+      - name: X-Bprime builds (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1_builds
 
-  cs-channels-4:
+  e1-xcode:
     runs-on: macos-latest
-    timeout-minutes: 120
+    timeout-minutes: 170
     permissions:
       contents: read
     steps:
@@ -80,12 +72,12 @@ jobs:
       - run: sw_vers
       - run: uname -m
       - run: rustup toolchain install
-      - name: channels_4 (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture channels_4
+      - name: X-Bprime xcodebuild (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1_xcode
 
-  cs-wipe-1:
+  e1-x5:
     runs-on: macos-latest
-    timeout-minutes: 120
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
@@ -95,12 +87,12 @@ jobs:
       - run: sw_vers
       - run: uname -m
       - run: rustup toolchain install
-      - name: wipe_1 (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture wipe_1
+      - name: X5 mounts (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1_x5
 
-  cs-wipe-2:
+  e1-tcc:
     runs-on: macos-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     permissions:
       contents: read
     steps:
@@ -110,12 +102,18 @@ jobs:
       - run: sw_vers
       - run: uname -m
       - run: rustup toolchain install
-      - name: wipe_2 (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture wipe_2
+      - name: TCC on an image volume
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1_tcc_vol
+      - name: TCC in /Users
+        if: always()
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1_tcc_users
+      - name: TCC in the spike homes
+        if: always()
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1_tcc_var
 
-  cs-wipe-3:
+  e1-x6:
     runs-on: macos-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     permissions:
       contents: read
     steps:
@@ -125,12 +123,12 @@ jobs:
       - run: sw_vers
       - run: uname -m
       - run: rustup toolchain install
-      - name: wipe_3 (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture wipe_3
+      - name: X6 cores and reports
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1_x6
 
-  cs-baseline:
+  e1-x7:
     runs-on: macos-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     permissions:
       contents: read
     steps:
@@ -140,5 +138,20 @@ jobs:
       - run: sw_vers
       - run: uname -m
       - run: rustup toolchain install
-      - name: baseline_and_builds (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture baseline_and_builds
+      - name: X7, X9 late arrivals
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1_x7
+
+  e1-base:
+    runs-on: macos-latest
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: X-base
+        run: cargo xtask sudo-test -p kbf-driver-native --test clean_state_spike -- --test-threads=1 --nocapture e1_base

@@ -37,6 +37,12 @@ const WORK: &str = "/private/var/kbf-cs-work";
 const LEASES: &str = "/private/var/kbf-cs-leases.noindex";
 const HOMES: &str = "/private/var/kbf-cs-homes.noindex";
 const UID0: u32 = 61000;
+static HOMES_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The directory of the pool homes: `HOMES` unless a job set another before `Cs::new_with`.
+fn homes() -> &'static str {
+    HOMES_DIR.get().map_or(HOMES, String::as_str)
+}
 const NUSERS: u32 = 8;
 /// The user the cells run as; users 6 and 7 are the "other" uid of the cross-uid probes.
 const CELL_USER: u32 = 0;
@@ -63,12 +69,30 @@ const C_RULES: &[&str] = &[
     "(deny mach-lookup (global-name \"com.apple.coreservices.launchservicesd\") (global-name \"com.apple.backgroundtaskmanagementd\") (global-name \"com.apple.tccd\") (global-name \"com.apple.pasteboard.1\") (global-name-prefix \"com.apple.CoreSimulator.\") (global-name-prefix \"com.apple.coreservices.appleevents\"))",
 ];
 
+/// Profile v2 of `08_revised_design.md` 1.3: the shipped slot profile (A) plus these denies.
+const V2_RULES: [&str; 5] = [
+    "(deny ipc-posix*)",
+    "(deny mach-register)",
+    "(deny job-creation)",
+    "(deny lsopen)",
+    "(deny file-mount)",
+];
+const V2_NAMES: [&str; 5] = ["ipc", "mach", "job", "lsopen", "mount"];
+const V2_ONLY: [&str; 5] = ["A+ipc", "A+mach", "A+job", "A+lsopen", "A+mount"];
+const V2_NO: [&str; 5] = ["V2-ipc", "V2-mach", "V2-job", "V2-lsopen", "V2-mount"];
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Arm {
     A,
     B,
     C,
     R,
+    /// A plus all of `V2_RULES`.
+    V2,
+    /// A plus the one rule `V2_RULES[i]` (bisect: does this deny alone break the build).
+    V2Only(usize),
+    /// V2 without `V2_RULES[i]` (the profile mutant: that canary must open).
+    V2No(usize),
 }
 
 impl Arm {
@@ -78,7 +102,21 @@ impl Arm {
             Arm::B => "B",
             Arm::C => "C",
             Arm::R => "R",
+            Arm::V2 => "V2",
+            Arm::V2Only(i) => V2_ONLY[i],
+            Arm::V2No(i) => V2_NO[i],
         }
+    }
+
+    /// The rules appended to the shipped profile for this arm.
+    fn v2_rules(self) -> Option<String> {
+        let idx: Vec<usize> = match self {
+            Arm::V2 => (0..V2_RULES.len()).collect(),
+            Arm::V2Only(i) => vec![i],
+            Arm::V2No(i) => (0..V2_RULES.len()).filter(|j| *j != i).collect(),
+            _ => return None,
+        };
+        Some(idx.iter().map(|i| format!("\n{}", V2_RULES[*i])).collect())
     }
 }
 
@@ -157,7 +195,13 @@ fn run_timeout(mut cmd: Command, secs: u64) -> Out {
                 if started.elapsed() > Duration::from_secs(secs) {
                     timed_out = true;
                     let _ = child.kill();
-                    let _ = child.wait();
+                    // A process stuck in the kernel (a stalled mount) may not die: wait a little, then leave it.
+                    for _ in 0..100 {
+                        if matches!(child.try_wait(), Ok(Some(_))) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                     break None;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -199,7 +243,7 @@ struct Env {
 impl Env {
     fn exports(&self) -> String {
         let mut s = format!(
-            "export W='{WORK}' K='{WORK}/canary' ID='{}' GID='{}' U='{}' H='{}' F='{}' L='{}' M='{}' ROW='{}' MK='{}' LEASES='{LEASES}' HOMES='{HOMES}' OU='{}' OID='{}' STAGE='{}' MODE='{}' SNAPX='{}'; ",
+            "export W='{WORK}' K='{WORK}/canary' ID='{}' GID='{}' U='{}' H='{}' F='{}' L='{}' M='{}' ROW='{}' MK='{}' LEASES='{LEASES}' HOMES='{}' OU='{}' OID='{}' STAGE='{}' MODE='{}' SNAPX='{}'; ",
             self.id,
             self.gid,
             self.name,
@@ -209,6 +253,7 @@ impl Env {
             self.marker,
             self.row,
             self.mk,
+            homes(),
             self.other,
             self.other_id,
             self.stage,
@@ -251,6 +296,18 @@ struct Cs {
     stats: Mutex<Stats>,
     job: String,
     last_marker: Mutex<String>,
+    /// The user the next cells run as (an index into the pool users).
+    cu: AtomicU32,
+    /// Late-arrival and old-process looks after each clean (X7, X9).
+    late: std::sync::atomic::AtomicBool,
+    /// What the last cell's plant printed: the subrows planted, the subrows denied.
+    last_planted: Mutex<Vec<String>>,
+    last_denied: Mutex<Vec<String>>,
+    /// Whether the leased probe of the last cell read present.
+    last_leased: Mutex<bool>,
+    last_word: Mutex<String>,
+    /// Run the plants as the console user (uid 501, which has real launchd domains) instead of the pool user (X1).
+    runner: std::sync::atomic::AtomicBool,
 }
 
 fn say(line: impl AsRef<str>) {
@@ -276,7 +333,7 @@ fn base_env(user: &SlotUser) -> Env {
         id: user.uid,
         gid: user.gid,
         name: user.name.clone(),
-        home: format!("{HOMES}/{}", user.name),
+        home: format!("{}/{}", homes(), user.name),
         folders: "/nonexistent-folders".into(),
         lease: format!("{LEASES}/none"),
         marker: "kbf00000000".into(),
@@ -293,7 +350,15 @@ fn base_env(user: &SlotUser) -> Env {
 
 impl Cs {
     fn new(job: &str) -> Cs {
+        Self::new_with(job, None, None)
+    }
+
+    /// `homes_dir`: where the pool homes go; `pre`: a shell function of `cs.sh` run as root before the users are made.
+    fn new_with(job: &str, homes_dir: Option<&str>, pre: Option<&str>) -> Cs {
         support::pool::assert_root("clean_state_spike");
+        if let Some(h) = homes_dir {
+            let _ = HOMES_DIR.set(h.to_owned());
+        }
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::WARN)
             .try_init();
@@ -323,12 +388,18 @@ impl Cs {
         // What an earlier run left, then the users.
         let sweep = env.root("cs_sweep", 600);
         say(format!("INFO sweep-start {}", short(&sweep.text, 200)));
+        if let Some(pre) = pre {
+            let o = env.root(pre, 600);
+            for l in o.text.lines().filter(|l| !l.is_empty()) {
+                say(format!("PRE {}", short(l, 230)));
+            }
+        }
         for i in 0..NUSERS {
             let u = user_of(i);
             let made = env.root(
                 &format!(
-                    "cs_mkuser '{}' {} {} '{HOMES}/{}'",
-                    u.name, u.uid, u.gid, u.name
+                    "cs_mkuser '{}' {} {} '{}/{}'",
+                    u.name, u.uid, u.gid, homes(), u.name
                 ),
                 120,
             );
@@ -358,6 +429,13 @@ impl Cs {
             }),
             job: job.to_owned(),
             last_marker: Mutex::new(String::new()),
+            cu: AtomicU32::new(CELL_USER),
+            late: std::sync::atomic::AtomicBool::new(false),
+            last_planted: Mutex::new(Vec::new()),
+            last_denied: Mutex::new(Vec::new()),
+            last_leased: Mutex::new(false),
+            last_word: Mutex::new(String::new()),
+            runner: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -418,6 +496,10 @@ impl Cs {
         match row {
             "W09" => 900,
             "CH19" | "CH20" | "CH23" | "CH30" | "CH33" | "CH34" | "BR1" | "BR3" | "BR5" => 240,
+            "BR8" | "BR8i" => 1700,
+            "X6" => 700,
+            "X5a" | "X5b" | "X5c" | "X5d" => 240,
+            "BR6" | "BR7" | "XCAN" => 300,
             _ => 120,
         }
     }
@@ -439,11 +521,21 @@ impl Cs {
                 let rules = if arm == Arm::B { &self.rules_b } else { &self.rules_c };
                 args[i + 1].push_str(rules);
             }
+            Arm::V2 | Arm::V2Only(_) | Arm::V2No(_) => {
+                let i = args.iter().position(|a| a == "-p").expect("-p in the launch");
+                args[i + 1].push_str(&arm.v2_rules().expect("v2 rules"));
+            }
             Arm::R => {
                 let i = args.iter().position(|a| a == "--").expect("-- in the launch");
                 args.truncate(i + 1);
                 args.extend(["/bin/bash".to_owned(), "-c".to_owned(), script.to_owned()]);
             }
+        }
+        if self.runner.load(Ordering::SeqCst) {
+            // launchctl asuser <uid> <program> __as-user <uid> <gid> -- ...
+            args[1] = "501".to_owned();
+            args[4] = "501".to_owned();
+            args[5] = "20".to_owned();
         }
         let mut cmd = Command::new(program);
         cmd.args(args);
@@ -455,7 +547,7 @@ impl Cs {
     fn cell(&self, row: &str, arm: Arm, clean: Clean, extra: &[(&str, &str)]) -> Verdict {
         let n = self.counter.fetch_add(1, Ordering::SeqCst);
         let tag = format!("{row} {} {}", arm.name(), clean.name());
-        let user = user_of(CELL_USER);
+        let user = user_of(self.cu.load(Ordering::SeqCst));
         let mut env = base_env(&user);
         env.row = row.to_owned();
         env.marker = format!("kbf{n:08x}");
@@ -470,7 +562,7 @@ impl Cs {
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
         env.snapx = match row {
-            "CH17" | "CH21" | "W04" => "btm".to_owned(),
+            "CH17" | "CH21" | "W04" | "XL_btm" | "XL_ka" | "W04x" => "btm".to_owned(),
             "CH14" | "CH15" | "W05" | "W06a" | "W06c" => "lsof".to_owned(),
             _ => String::new(),
         };
@@ -500,6 +592,13 @@ impl Cs {
         fs::create_dir_all(&lease).expect("lease dir");
         env.lease = lease.to_string_lossy().into_owned();
         self.rt.block_on(slot.hand_over(&lease)).expect("hand over");
+        if self.runner.load(Ordering::SeqCst) {
+            env.id = 501;
+            env.gid = 20;
+            env.name = "runner".into();
+            env.home = format!("{}/home", env.lease);
+            env.root("mkdir -p \"$H\" && chown -R 501:20 \"$L\" && chmod 700 \"$L\"", 30);
+        }
 
         let fixture = env.root(
             "cs_skel; hasfn fixture_$ROW && fixture_$ROW; touch \"$MK\"; echo fixture-done",
@@ -529,11 +628,19 @@ impl Cs {
         );
         let verdict = self.report_plant(&tag, &out, started.elapsed());
 
+        let mid = env.root(
+            "if hasfn midplant_$ROW; then midplant_$ROW; fi",
+            Self::plant_secs(row),
+        );
+        for line in mid.text.lines().filter(|l| !l.is_empty()) {
+            say(format!("MID {tag} {}", short(line, 220)));
+        }
         std::thread::sleep(Duration::from_millis(800));
         // Probes while the lease is live.
         env.stage = "leased".into();
         let leased = self.probe(&tag, "leased", &env, verdict);
         let leased_present = leased;
+        *self.last_leased.lock().unwrap() = leased;
         if verdict == Verdict::Planted && !leased_present && !matches!(row, "CH35" | "CH37") {
             self.stats.lock().unwrap().blind += 1;
             say(format!("PROBE-BLIND {tag} plant succeeded but the probe reads absent while leased"));
@@ -544,6 +651,25 @@ impl Cs {
             self.diff(&tag, "leased", &env, &base, &leased_snap);
         }
         // The driver's end of a lease: the lease directory goes (no mount crossed) before the slot is cleaned.
+        if row.starts_with("X5") {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let l = lease.clone();
+            let started = Instant::now();
+            std::thread::spawn(move || {
+                let _ = tx.send(kbf_driver_native::mounts::remove_lease_dir(&l));
+            });
+            match rx.recv_timeout(Duration::from_secs(150)) {
+                Ok(r) => say(format!(
+                    "LEASE-END-REAL {tag} took_ms={} result={}",
+                    started.elapsed().as_millis(),
+                    match r {
+                        Ok(()) => "ok".to_owned(),
+                        Err(e) => format!("err {e}"),
+                    }
+                )),
+                Err(_) => say(format!("LEASE-END-REAL {tag} HUNG after 150 s")),
+            }
+        }
         let le = env.root("cs_lease_end", 120);
         if le.text.contains("LEASE-DIR-LEFT") {
             say(format!("INFO {tag} {}", short(&le.text, 160)));
@@ -557,7 +683,12 @@ impl Cs {
         let mut pinfo = String::new();
         match clean {
             Clean::S => {
-                self.rt.block_on(slot.release());
+                let timed = self.rt.block_on(async {
+                    tokio::time::timeout(Duration::from_secs(240), slot.release()).await
+                });
+                if timed.is_err() {
+                    say(format!("CLEAN-TIMEOUT {tag} the shipped clean did not return in 240 s"));
+                }
                 quarantined = slots.count() == 0;
                 cleaned = true;
             }
@@ -578,6 +709,9 @@ impl Cs {
             }
         }
         let took = t.elapsed();
+        let clean_end = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
         if cleaned {
             let aside = env.root("ls -d \"$HOMES\"/.kbf-recreated-\"$U\"-* 2>/dev/null | wc -l | tr -d ' '", 30);
             let recreated = aside.text.trim() != "0";
@@ -604,6 +738,10 @@ impl Cs {
                 if quarantined { "y" } else { "n" },
                 if recreated { "y" } else { "n" },
             ));
+            *self.last_word.lock().unwrap() = word.to_owned();
+            if self.late.load(Ordering::SeqCst) {
+                self.late_looks(&tag, &mut env, &base, clean_end, verdict);
+            }
             if row.starts_with('W') {
                 say(format!(
                     "WIPE {row} {} {} took_ms={} quarantined={} recreated={}",
@@ -644,12 +782,42 @@ impl Cs {
         verdict
     }
 
+    /// X7 and X9: what arrives after the clean's own look (+5, +30, +120 s), and which
+    /// processes of the uid are older than the clean's end.
+    fn late_looks(&self, tag: &str, env: &mut Env, base: &str, clean_end: u64, v: Verdict) {
+        let o = env.root(&format!("cs_oldprocs {clean_end}"), 30);
+        for l in o.text.lines().filter(|l| !l.is_empty()) {
+            say(format!("OLDPROC {tag} {}", short(l, 200)));
+        }
+        let mut waited = 0u64;
+        for t in [5u64, 30, 120] {
+            std::thread::sleep(Duration::from_secs(t - waited));
+            waited = t;
+            env.stage = format!("late+{t}");
+            let snap = format!("{WORK}/snap.{}.late{t}", env.marker);
+            env.root(&format!("snap > '{snap}' 2>&1"), 180);
+            let n = self.diff(tag, &format!("late+{t}"), env, base, &snap);
+            let present = self.probe(tag, &format!("late+{t}"), env, v);
+            say(format!(
+                "LATE {tag} +{t}s snapshot_diff_lines={n} probe={}",
+                if present { "present" } else { "absent" }
+            ));
+            if t == 120 {
+                let o = env.root(&format!("cs_oldprocs {clean_end}"), 30);
+                for l in o.text.lines().filter(|l| !l.is_empty()) {
+                    say(format!("OLDPROC {tag} +120s {}", short(l, 200)));
+                }
+            }
+        }
+        env.stage = "clean".into();
+    }
+
     fn reset_user(&self, env: &Env) {
-        let u = user_of(CELL_USER);
+        let u = user_of(self.cu.load(Ordering::SeqCst));
         let o = env.root(
             &format!(
-                "cs_rmuser '{}' {} '{HOMES}/{}'; cs_mkuser '{}' {} {} '{HOMES}/{}'",
-                u.name, u.uid, u.name, u.name, u.uid, u.gid, u.name
+                "cs_rmuser '{}' {} '{}/{}'; cs_mkuser '{}' {} {} '{}/{}'",
+                u.name, u.uid, homes(), u.name, u.name, u.uid, u.gid, homes(), u.name
             ),
             300,
         );
@@ -662,12 +830,16 @@ impl Cs {
         let mut verdict = Verdict::Denied;
         let mut any = false;
         let mut skipped = false;
+        let mut planted_names = Vec::new();
+        let mut denied_names = Vec::new();
         for line in out.text.lines() {
             if let Some(rest) = line.strip_prefix("PLANTED ") {
+                planted_names.push(rest.split_whitespace().next().unwrap_or("").to_owned());
                 say(format!("CELL {tag} planted {rest}"));
                 verdict = Verdict::Planted;
                 any = true;
             } else if let Some(rest) = line.strip_prefix("DENIED ") {
+                denied_names.push(rest.split_whitespace().next().unwrap_or("").to_owned());
                 say(format!("CELL {tag} denied {}", short(rest, 220)));
                 any = true;
             } else if let Some(rest) = line.strip_prefix("SKIPPED ") {
@@ -681,6 +853,8 @@ impl Cs {
         if out.timed_out {
             say(format!("CELL {tag} timeout after {:?}", took));
         }
+        *self.last_planted.lock().unwrap() = planted_names;
+        *self.last_denied.lock().unwrap() = denied_names;
         if !any {
             say(format!(
                 "CELL {tag} no-plant-output code={:?} out={}",
@@ -995,3 +1169,5 @@ fn baseline_and_builds() {
     }
     cs.finish();
 }
+
+mod e1;

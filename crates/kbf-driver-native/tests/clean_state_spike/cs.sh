@@ -188,9 +188,9 @@ p_crash() { find $(crash_dirs) -newer "$MK" -type f -name 'canary*' -delete 2>/d
 cs_clean_p() { # MODE: P | P-kill-first | P-rm-first | P-noflags | P-nounmount
   _t0=$(now_ms)
   if [ "$MODE" = P-rm-first ]; then p_flags; p_delete; fi
-  if [ "$MODE" = P-kill-first ]; then p_kill; p_bootout; else p_bootout; fi
+  if [ "$MODE" = P-kill-first ]; then p_kill; p_bootout; elif [ "$MODE" != P-nokill ]; then p_bootout; fi
   p_cron
-  [ "$MODE" = P-kill-first ] || p_kill
+  [ "$MODE" = P-kill-first ] || [ "$MODE" = P-nokill ] || p_kill
   [ "$MODE" = P-nounmount ] || p_unmount
   p_ipc
   if [ "$MODE" != P-rm-first ]; then p_flags; p_delete; fi
@@ -605,6 +605,7 @@ build_path() { echo "/usr/bin:/bin:/usr/sbin:/sbin:$(ls -d "$(cat "$W/rhome" 2>/
 build_env() {
   _bp=$(build_path)
   if [ "$BENV" = hostile ]; then env -i PATH="$_bp" "$@"
+  elif [ "$BENV" = lease ]; then lease_env_run "$@"
   else env -i HOME="$H" TMPDIR="$L/tmp" CARGO_HOME="$L/cargo" PATH="$_bp" "$@"; fi
 }
 
@@ -630,6 +631,7 @@ plant_BR4() { p BR4 do_BR4; }
 plant_BR5() { p BR5 do_BR5; }
 
 probe_BR() {
+  case "$STAGE" in late*) echo "PROBE $ROW none"; return;; esac
   _start=$(date -r "$(stat -f %m "$MK")" '+%Y-%m-%d %H:%M:%S')
   log show --start "$_start" --style compact --predicate 'sender == "Sandbox" OR subsystem == "com.apple.sandbox.reporting" OR eventMessage BEGINSWITH "Sandbox: " OR eventMessage CONTAINS "deny("' 2>/dev/null |
     grep 'deny(' | sed -E 's/^.*Sandbox: //' | sed -E "s#$H#<H>#g;s#$F#<F>#g;s#$L#<L>#g;s/\\([0-9]+\\)//" | sort | uniq -c | sort -rn | head -30 | sed "s/^/BUILDDENY $ROW $BENV /"
@@ -680,3 +682,485 @@ cs_inventory() {
   echo "count=$(printf '%s\n' "$_l" | grep -c .) sha=$(printf '%s\n' "$_l" | shasum | cut -c1-16) os=$(sw_vers -productVersion)"
   printf '%s\n' "$_l" | head -40
 }
+
+# ================================================================ E1 (experiment round E1; spike only)
+
+# the uid's processes older than the clean's end (X9): OLD = started before the clean ended
+cs_oldprocs() { # clean end, epoch seconds
+  _e=$1
+  ps -axo pid=,lstart=,ruid=,uid=,svuid=,comm= | while read -r _pid _dw _mo _dy _tm _yr _ru _u _sv _cm; do
+    [ "$_ru" = "$ID" ] || [ "$_u" = "$ID" ] || [ "$_sv" = "$ID" ] || continue
+    _st=$(date -j -f '%a %b %d %T %Y' "$_dw $_mo $_dy $_tm $_yr" +%s 2>/dev/null)
+    if [ -n "$_st" ] && [ "$_st" -lt "$_e" ]; then echo "OLD pid=$_pid comm=$_cm start=$_st clean_end=$_e before_end_s=$((_e-_st))"
+    else echo "new pid=$_pid comm=$_cm start=${_st:-?} clean_end=$_e"; fi
+  done
+}
+
+# ---------------------------------------------------------------- X-L: launchd, with LimitLoadToSessionType = Background
+
+agent_plist() { # path label command extra-keys   (SESS: session type, default Background)
+  cat >"$1" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>Label</key><string>$2</string><key>LimitLoadToSessionType</key><string>${SESS:-Background}</string>$4<key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>$3</string></array></dict></plist>
+EOF
+}
+xl_boot() { # label plist: bootstrap into user/$ID as the pool user (what tests/slot_clean.rs does as the user), print what launchctl said
+  _o=$(launchctl bootstrap "user/$ID" "$2" 2>&1); _rc=$?
+  echo "bootstrap user/$ID rc=$_rc: $_o"
+  if [ "$_rc" != 0 ]; then
+    _o2=$(launchctl bootstrap "gui/$ID" "$2" 2>&1); _rc2=$?
+    echo "bootstrap gui/$ID rc=$_rc2: $_o2"
+    [ "$_rc2" = 0 ] && return 0
+    return 1
+  fi
+  if launchctl print "user/$ID/$1" >/dev/null 2>&1; then echo "print-as-user: listed"; else echo "print-as-user: not-listed"; fi
+  return 0
+}
+xl_listed() { launchctl print "user/$ID/$M" >/dev/null 2>&1; }
+xl_pid() { launchctl print "user/$ID/$M" 2>/dev/null | grep -E '^[[:space:]]+pid = ' | head -1 | awk '{print $3}'; }
+
+do_XL_ka() {
+  mkdir -p "$H/Library/LaunchAgents"
+  agent_plist "$H/Library/LaunchAgents/$M.plist" "$M" "touch /private/tmp/ka-$M; sleep 1000" '<key>KeepAlive</key><true/><key>RunAtLoad</key><true/><key>ThrottleInterval</key><integer>1</integer>'
+  xl_boot "$M" "$H/Library/LaunchAgents/$M.plist" || return 1
+  sleep 3
+}
+plant_XL_ka() { p XL_ka do_XL_ka; }
+probe_XL_ka() {
+  echo "INFO XL_ka listed=$(xl_listed && echo y || echo n) pid=$(xl_pid) escape-marker=$([ -e "/private/tmp/ka-$M" ] && echo "y owner=$(stat -f %Su "/private/tmp/ka-$M")" || echo n) sleepers=$(procs_of | grep -c sleep)"
+  pr 'xl_listed || [ -e "/private/tmp/ka-$M" ] || procs_of | grep -q sleep'
+}
+teardown_XL_ka() { launchctl bootout "user/$ID/$M" >/dev/null 2>&1; rm -f "/private/tmp/ka-$M"; }
+
+do_XL_sub() { launchctl submit -l "kbf.$M" -- /bin/sh -c "touch /private/tmp/esc-$M; sleep 3600" && sleep 2; }
+plant_XL_sub() { p XL_sub do_XL_sub; }
+probe_XL_sub() {
+  echo "INFO XL_sub listed=$(launchctl print "user/$ID/kbf.$M" >/dev/null 2>&1 && echo y || echo n) escape-marker=$([ -e "/private/tmp/esc-$M" ] && echo "y owner=$(stat -f %Su "/private/tmp/esc-$M")" || echo n)"
+  pr '[ -e "/private/tmp/esc-$M" ] || launchctl print "user/$ID/kbf.$M" >/dev/null 2>&1'
+}
+teardown_XL_sub() { launchctl bootout "user/$ID/kbf.$M" >/dev/null 2>&1; rm -f "/private/tmp/esc-$M"; }
+
+do_XL_load() {
+  mkdir -p "$H/Library/LaunchAgents"
+  agent_plist "$H/Library/LaunchAgents/$M.plist" "$M" "touch /private/tmp/ld-$M; sleep 1000" '<key>RunAtLoad</key><true/>'
+  launchctl load -w "$H/Library/LaunchAgents/$M.plist"; _rc=$?
+  echo "launchctl load -w rc=$_rc"; sleep 3; return $_rc
+}
+plant_XL_load() { p XL_load do_XL_load; }
+probe_XL_load() {
+  echo "INFO XL_load listed=$(xl_listed && echo y || echo n) escape-marker=$([ -e "/private/tmp/ld-$M" ] && echo y || echo n)"
+  pr 'xl_listed || [ -e "/private/tmp/ld-$M" ]'
+}
+teardown_XL_load() { launchctl bootout "user/$ID/$M" >/dev/null 2>&1; rm -f "/private/tmp/ld-$M"; }
+
+do_XL_btm() {
+  mkdir -p "$H/Library/LaunchAgents"
+  agent_plist "$H/Library/LaunchAgents/$M.plist" "$M" /usr/bin/true '<key>RunAtLoad</key><false/>'
+  xl_boot "$M" "$H/Library/LaunchAgents/$M.plist" || return 1
+  sleep 3
+}
+plant_XL_btm() { p XL_btm do_XL_btm; }
+probe_XL_btm() {
+  _b=$(sfltool dumpbtm 2>&1)
+  echo "INFO XL_btm dumpbtm-bytes=$(printf %s "$_b" | wc -c | tr -d ' ') mentions-label=$(printf %s "$_b" | grep -c "$M") listed=$(xl_listed && echo y || echo n)"
+  pr 'printf %s "$_b" | grep -q "$M" || xl_listed'
+}
+teardown_XL_btm() { launchctl bootout "user/$ID/$M" >/dev/null 2>&1; }
+
+# W04 again: a respawning job and a submitted one, writing in the home
+do_W04x() {
+  mkdir -p "$H/Library/LaunchAgents"
+  agent_plist "$H/Library/LaunchAgents/$M.plist" "$M" "echo x | /usr/bin/tee -a $H/respawn-$M; sleep 2" '<key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>1</integer>'
+  xl_boot "$M" "$H/Library/LaunchAgents/$M.plist" || return 1
+  launchctl submit -l "kbf.w4.$M" -- /bin/sh -c "echo x | /usr/bin/tee -a $H/submit-$M >/dev/null; sleep 2"
+  sleep 4
+}
+plant_W04x() { p W04x do_W04x; }
+probe_W04x() {
+  _any=0
+  for _s in 0 2 3; do
+    sleep "$_s"
+    [ "$(wc -l <"$H/respawn-$M" 2>/dev/null | tr -d ' ')" -gt 1 ] 2>/dev/null && _any=1
+    xl_listed && _any=1
+  done
+  echo "INFO W04x respawn-lines=$(wc -l <"$H/respawn-$M" 2>/dev/null | tr -d ' ') job-listed=$(xl_listed && echo y || echo n) submit-listed=$(launchctl print "user/$ID/kbf.w4.$M" >/dev/null 2>&1 && echo y || echo n)"
+  [ "$_any" = 1 ] && echo "PROBE $ROW present" || echo "PROBE $ROW absent"
+}
+teardown_W04x() { launchctl bootout "user/$ID/$M" >/dev/null 2>&1; launchctl bootout "user/$ID/kbf.w4.$M" >/dev/null 2>&1; }
+
+# W11 launchd half: a StartInterval job writing in the home
+do_W11x() {
+  mkdir -p "$H/Library/LaunchAgents"
+  agent_plist "$H/Library/LaunchAgents/$M.plist" "$M" "/usr/bin/touch $H/si-$M" '<key>StartInterval</key><integer>5</integer>'
+  xl_boot "$M" "$H/Library/LaunchAgents/$M.plist" || return 1
+}
+plant_W11x() { p W11x do_W11x; }
+probe_W11x() {
+  sleep 12
+  echo "INFO W11x home: $(ls "$H" 2>/dev/null | tr '\n' ' ') listed=$(xl_listed && echo y || echo n)"
+  pr 'ls "$H" 2>/dev/null | grep -q "si-" || xl_listed'
+}
+teardown_W11x() { launchctl bootout "user/$ID/$M" >/dev/null 2>&1; }
+
+# respawn after kill: root kills the job's process while leased; the job must come back
+do_XL_resp() { do_XL_ka; }
+plant_XL_resp() { p XL_resp do_XL_resp; }
+midplant_XL_resp() {
+  _p1=$(xl_pid); echo "pid-before=${_p1:-none}"
+  [ -n "$_p1" ] && kill -9 "$_p1"
+  sleep 4
+  _p2=$(xl_pid); echo "pid-after=${_p2:-none} respawned=$([ -n "$_p2" ] && [ "$_p2" != "$_p1" ] && echo y || echo n)"
+}
+probe_XL_resp() { probe_XL_ka; }
+teardown_XL_resp() { teardown_XL_ka; }
+
+# X8: Background Task Management by FILE, no job
+do_X8() {
+  mkdir -p "$H/Library/LaunchAgents" "$H/Library/LaunchDaemons" "$L/la"
+  agent_plist "$H/Library/LaunchAgents/$M.agent.plist" "$M.agent" /usr/bin/true '<key>RunAtLoad</key><false/>'
+  agent_plist "$H/Library/LaunchDaemons/$M.daemon.plist" "$M.daemon" /usr/bin/true ''
+  agent_plist "$L/la/$M.lease.plist" "$M.lease" /usr/bin/true ''
+  sleep 12
+}
+plant_X8() { p X8 do_X8; }
+probe_X8() {
+  _b=$(sfltool dumpbtm 2>&1)
+  echo "INFO X8 dumpbtm-bytes=$(printf %s "$_b" | wc -c | tr -d ' ') mentions-marker=$(printf %s "$_b" | grep -c "$M") mentions-uid-home=$(printf %s "$_b" | grep -c "$H")"
+  pr 'printf %s "$_b" | grep -q "$M"'
+}
+
+# positive controls for the BTM probe: (a) a job the console user's gui domain loads (the spike's B3), (b) a plist FILE only, in the console
+# user's LaunchAgents and in /Library/LaunchAgents (what X8 plants in a pool home)
+cs_btmctl() {
+  _cu=$(stat -f %u /dev/console); _cn=$(stat -f %Su /dev/console); _ch=$(dscl . -read "/Users/$_cn" NFSHomeDirectory | awk '{print $2}')
+  echo "btmctl console=$_cn uid=$_cu home=$_ch"
+  _pl=/Library/LaunchAgents/kbf.cs.btm.plist
+  SESS=Aqua agent_plist "$_pl" kbf.cs.btm /usr/bin/true '<key>RunAtLoad</key><false/>'
+  chown 0:0 "$_pl"; chmod 644 "$_pl"
+  echo "btm-job bootstrap gui/$_cu: $(launchctl bootstrap "gui/$_cu" "$_pl" 2>&1 | head -2 | tr '\n' ' ')"
+  sleep 4; _b=$(sfltool dumpbtm 2>&1); _m=$(printf %s "$_b" | grep -c kbf.cs.btm)
+  echo "BTMCTL job-in-gui-domain: mentions=$_m -> $([ "$_m" -gt 0 ] && echo POSITIVE || echo BLIND)"
+  launchctl bootout "gui/$_cu/kbf.cs.btm" >/dev/null 2>&1; rm -f "$_pl"
+  _pf="$_ch/Library/LaunchAgents/kbf.cs.btmfile.plist"
+  mkdir -p "$_ch/Library/LaunchAgents"
+  SESS=Aqua agent_plist "$_pf" kbf.cs.btmfile /usr/bin/true '<key>RunAtLoad</key><false/>'
+  chown "$_cu" "$_pf" 2>/dev/null
+  _pg=/Library/LaunchAgents/kbf.cs.btmfile2.plist
+  SESS=Aqua agent_plist "$_pg" kbf.cs.btmfile2 /usr/bin/true '<key>RunAtLoad</key><false/>'
+  chown 0:0 "$_pg"; chmod 644 "$_pg"
+  sleep 15; _b=$(sfltool dumpbtm 2>&1)
+  _m1=$(printf %s "$_b" | grep -c kbf.cs.btmfile.plist); _m2=$(printf %s "$_b" | grep -c kbf.cs.btmfile2)
+  echo "BTMCTL file-in-console-user-LaunchAgents: mentions=$_m1 -> $([ "$_m1" -gt 0 ] && echo POSITIVE || echo BLIND)"
+  echo "BTMCTL file-in-/Library/LaunchAgents: mentions=$_m2 -> $([ "$_m2" -gt 0 ] && echo POSITIVE || echo BLIND)"
+  rm -f "$_pf" "$_pg"
+}
+
+# X1: the same doors as the console user (uid 501 has real domains and a GUI session), where open/lsopen can be seen working
+plant_X1() {
+  export SESS=Aqua
+  p x1_open do_CH19
+  p x1_submit launchctl submit -l "kbf.x1.$M" -- /bin/sh -c "touch /private/tmp/x1s-$M; sleep 30"
+  p x1_gui do_x1_gui
+  p x1_osa do_CH20
+  SESS=Background p x1_user do_x1_user
+}
+do_x1_gui() {
+  agent_plist "$L/g.plist" "kbf.xg.$M" "touch /private/tmp/xg-$M; sleep 30" '<key>RunAtLoad</key><true/>'
+  launchctl bootstrap "gui/$ID" "$L/g.plist"
+}
+do_x1_user() {
+  agent_plist "$L/u.plist" "kbf.xu.$M" "touch /private/tmp/xu-$M; sleep 30" '<key>RunAtLoad</key><true/>'
+  launchctl bootstrap "user/$ID" "$L/u.plist"
+}
+probe_X1() {
+  echo "INFO X1 markers: $(ls /private/tmp 2>/dev/null | grep -E "^(open|ae|x1s|xg|xu)-$M" | tr '\n' ' ')"
+  pr 'ls /private/tmp 2>/dev/null | grep -q -E "^(open|ae|x1s|xg|xu)-$M"'
+}
+teardown_X1() {
+  launchctl bootout "gui/$ID/kbf.xg.$M" >/dev/null 2>&1; launchctl bootout "user/$ID/kbf.xu.$M" >/dev/null 2>&1
+  launchctl asuser "$ID" /bin/launchctl remove "kbf.x1.$M" >/dev/null 2>&1
+  rm -f "/private/tmp/open-$M" "/private/tmp/ae-$M" "/private/tmp/x1s-$M" "/private/tmp/xg-$M" "/private/tmp/xu-$M"
+}
+
+# ---------------------------------------------------------------- X-B': the v2 denies, one canary each
+
+fixture_XCAN() { printf orig >"/private/tmp/fx-$M"; chmod 666 "/private/tmp/fx-$M"; }
+do_canary_boot() {
+  mkdir -p "$L/la"
+  agent_plist "$L/la/$M.plist" "kbf.cb.$M" /usr/bin/true '<key>RunAtLoad</key><false/>'
+  launchctl bootstrap "user/$ID" "$L/la/$M.plist"
+}
+plant_XCAN() {
+  p c_write put /private/tmp
+  p c_hlink ln "/private/tmp/fx-$M" "$L/hl"
+  p c_shm "$K" shm-create "/c$M"
+  p c_sem "$K" sem-create "/c$M"
+  p c_mach bg_ok cm "$K" mach-register "kbf.c$M" 20
+  p c_job_submit launchctl submit -l "kbf.c.$M" -- /bin/sleep 20
+  p c_job_boot do_canary_boot
+  p c_lsopen do_CH19
+  p c_mount_img do_CH07a
+  p c_mount_dev do_CH07b
+  p c_userpref defaults write "kbf.c.$M" k v
+}
+probe_XCAN() {
+  echo "INFO XCAN shm-open-by-root: $("$K" shm-open "/c$M" 2>&1 | head -1) sem-open-by-root: $("$K" sem-open "/c$M" 2>&1 | head -1)"
+  pr '"$K" shm-open "/c$M" 2>&1 | grep -q ok || "$K" sem-open "/c$M" 2>&1 | grep -q ok'
+}
+teardown_XCAN() {
+  "$K" shm-unlink "/c$M" >/dev/null 2>&1; "$K" sem-unlink "/c$M" >/dev/null 2>&1
+  rm -f "/private/tmp/fx-$M" "/private/tmp/$M"
+  launchctl bootout "user/$ID/kbf.cb.$M" >/dev/null 2>&1; launchctl remove "kbf.c.$M" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------- X-B': more builds, with the lease environment
+
+do_BR6() {
+  mkdir -p "$L/pk6" && cd "$L/pk6" && build_env swift package init --type executable --name pk6 >/dev/null 2>&1 || { echo "swift package init failed"; return 1; }
+  BT=600 build_env swift build --disable-sandbox >"$L/sb6.log" 2>&1; _rc=$?
+  echo "swift build --disable-sandbox rc=$_rc $(tail -c 300 "$L/sb6.log" | tr '\n' ' ')"
+  [ "$_rc" = 0 ]
+}
+plant_BR6() { p BR6 do_BR6; }
+probe_BR6() { probe_BR; }
+
+write_mp() {
+  cat >"$L/mp.py" <<'PY'
+import sys, multiprocessing as mp
+def work(q): q.put("child-ok")
+def sq(x): return x * x
+def main(which):
+    ctx = mp.get_context("spawn")
+    if which == "lock":
+        l = ctx.Lock(); l.acquire(); l.release(); print("lock-ok")
+    elif which == "queue":
+        q = ctx.Queue(); p = ctx.Process(target=work, args=(q,)); p.start(); print(q.get(timeout=30)); p.join()
+    elif which == "pool":
+        with ctx.Pool(2) as pl: print(pl.map(sq, [1, 2, 3]))
+    elif which == "shm":
+        from multiprocessing import shared_memory
+        s = shared_memory.SharedMemory(create=True, size=64); s.close(); s.unlink(); print("shm-ok")
+    elif which == "executor":
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(2, mp_context=ctx) as ex: print(list(ex.map(sq, [1, 2, 3])))
+if __name__ == "__main__": main(sys.argv[1])
+PY
+}
+do_mp() { # which, interpreter
+  BT=90 build_env "$2" "$L/mp.py" "$1" 2>&1
+}
+plant_BR7() {
+  mkdir -p "$L/tmp"
+  write_mp
+  for _w in lock queue pool shm executor; do p "BR7_sys_$_w" do_mp "$_w" /usr/bin/python3; done
+  if [ -x /opt/homebrew/bin/python3 ]; then for _w in lock queue pool shm executor; do p "BR7_brew_$_w" do_mp "$_w" /opt/homebrew/bin/python3; done; fi
+}
+probe_BR7() { probe_BR; }
+
+mkpk8() {
+  mkdir -p "$L/pk8" && cd "$L/pk8" && build_env swift package init --type library --name Pk8 >/dev/null 2>&1 || { echo "swift package init failed"; return 1; }
+}
+do_BR8() {
+  mkpk8 || return 1
+  BT=900 build_env xcodebuild -scheme Pk8 -destination 'platform=macOS' -derivedDataPath "$L/dd8" -skipPackagePluginValidation build >"$L/xb.log" 2>&1; _b=$?
+  echo "xcodebuild build rc=$_b $(grep -E 'BUILD (SUCCEEDED|FAILED)|error:' "$L/xb.log" | tail -n 3 | tr '\n' ' ')"
+  [ "$_b" = 0 ] || return 1
+  BT=900 build_env xcodebuild -scheme Pk8 -destination 'platform=macOS' -derivedDataPath "$L/dd8" -skipPackagePluginValidation test >"$L/xt.log" 2>&1; _t=$?
+  echo "xcodebuild test rc=$_t $(grep -E 'Executed|Test run with|TEST (SUCCEEDED|FAILED)|error:' "$L/xt.log" | tail -n 4 | tr '\n' ' ')"
+  [ "$_t" = 0 ]
+}
+plant_BR8() { p BR8 do_BR8; }
+probe_BR8() { probe_BR; }
+do_BR8i() {
+  mkpk8 || return 1
+  _rt=$(xcrun simctl list runtimes available 2>/dev/null | awk '/iOS/ {print $NF; exit}')
+  _dt=$(xcrun simctl list devicetypes 2>/dev/null | awk '/iPhone/ {print $NF; exit}' | tr -d '()')
+  [ -n "$_rt" ] && [ -n "$_dt" ] || { echo "no iOS runtime or device type"; return 77; }
+  _u=$(build_env xcrun simctl create "$M" "$_dt" "$_rt") || { echo "simctl create failed"; return 1; }
+  build_env xcrun simctl boot "$_u" 2>&1 | head -2
+  BT=1200 build_env xcodebuild -scheme Pk8 -destination "platform=iOS Simulator,id=$_u" -derivedDataPath "$L/ddi" -skipPackagePluginValidation test >"$L/xi.log" 2>&1; _t=$?
+  echo "xcodebuild test (iOS simulator) rc=$_t $(grep -E 'Executed|Test run with|TEST (SUCCEEDED|FAILED)|error:' "$L/xi.log" | tail -n 4 | tr '\n' ' ')"
+  [ "$_t" = 0 ]
+}
+plant_BR8i() { p BR8i do_BR8i; }
+probe_BR8i() { probe_BR; }
+
+# ---------------------------------------------------------------- X5: mounts the clean might not get past
+
+X5_PORT=18081
+write_dav() {
+  cat >"$W/dav.py" <<'PY'
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+BODY = ('<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:"><D:response><D:href>/</D:href><D:propstat><D:prop>'
+        '<D:resourcetype><D:collection/></D:resourcetype><D:getlastmodified>Mon, 01 Jan 2029 00:00:00 GMT</D:getlastmodified>'
+        '<D:creationdate>2029-01-01T00:00:00Z</D:creationdate></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>').encode()
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, *a): pass
+    def do_OPTIONS(self):
+        self.send_response(200); self.send_header("DAV", "1,2"); self.send_header("Allow", "OPTIONS,PROPFIND,GET,HEAD"); self.send_header("Content-Length", "0"); self.end_headers()
+    def do_PROPFIND(self):
+        self.send_response(207); self.send_header("Content-Type", "application/xml; charset=utf-8"); self.send_header("Content-Length", str(len(BODY))); self.end_headers(); self.wfile.write(BODY)
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
+    do_HEAD = do_GET
+HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+  chmod 644 "$W/dav.py"
+}
+fixture_X5a() { write_dav; echo "dav server script written"; }
+do_X5a() {
+  mkdir -p "$L/m" || return 1
+  ( /usr/bin/python3 "$W/dav.py" "$X5_PORT" >"$L/dav.log" 2>&1 & echo $! >"$L/dav.pid" )
+  sleep 2
+  _o=$(alarm_run 40 mount_webdav -S "http://127.0.0.1:$X5_PORT/" "$L/m" 2>&1); _rc=$?
+  echo "mount_webdav rc=$_rc: $_o"
+  mount | grep -q "$L/m" || { echo "no webdav mount listed: server-log: $(head -c 200 "$L/dav.log")"; return 1; }
+  echo "mounted: $(mount | grep "$L/m" | cut -c1-140)"
+  kill -STOP "$(cat "$L/dav.pid")"
+  ( ls "$L/m" >/dev/null 2>&1 & )
+  echo "server stopped; a reader holds the mount"
+  return 0
+}
+plant_X5a() { p X5a do_X5a; }
+probe_X5a() {
+  echo "INFO X5a mounts: $(mount | grep -c "$L/m") ls-5s: $(alarm_run 5 /bin/ls "$L/m" 2>&1 | head -c 80)"
+  pr 'mount | grep -q "$L/m"'
+}
+plant_X5b() { echo "SKIPPED X5b reason=no-smb-server-on-the-runner(mount_smbfs-not-measured)"; }
+probe_X5b() { echo "PROBE X5b none"; }
+do_X5c() {
+  hdiutil create -quiet -size 2m -fs HFS+ -volname "c$M" "$L/c.dmg" || return 1
+  _o=$(hdiutil attach "$L/c.dmg" 2>&1); _rc=$?
+  echo "attach (no -mountpoint) rc=$_rc: $(printf %s "$_o" | tr '\n' ' ' | cut -c1-200)"
+  mount | grep "c$M" | cut -c1-140
+  [ "$_rc" = 0 ] && mount | grep -q "c$M"
+}
+plant_X5c() { p X5c do_X5c; }
+probe_X5c() {
+  echo "INFO X5c mounts: $(mount | grep "c$M" | sed -E 's/\(.*//' | tr '\n' ';') /Volumes: $(ls /Volumes | tr '\n' ' ')"
+  pr 'mount | grep -q "c$M"'
+}
+teardown_X5c() { for mp in $(mount | grep "c$M" | sed -E 's/^.* on (.*) \(.*$/\1/'); do hdiutil detach -force "$mp" >/dev/null 2>&1; done; }
+do_X5d() { do_CH07a || return 1; sleep 1; }
+plant_X5d() { p X5d do_X5d; }
+midplant_X5d() { # SIGKILL what serves the image: processes whose command line names this lease
+  for _pid in $(ps -axo pid=,command= | grep -E "diskimages|hdiejectd|$M" | grep -v grep | awk '{print $1}'); do
+    echo "kill -9 $_pid: $(ps -o ruid=,comm= -p "$_pid" | tr -s ' ' | head -1)"; kill -9 "$_pid" 2>/dev/null
+  done
+  sleep 2; echo "after-kill mounts: $(mount | grep -c "$H/mnt")"
+}
+probe_X5d() { echo "INFO X5d mounts: $(mount | grep "$H/mnt" | sed -E 's/\(.*//' | tr '\n' ';')"; pr 'mount | grep -q "$H/mnt"'; }
+
+# ---------------------------------------------------------------- X6: cores, resource reports, crash attribution
+
+fixture_X6() { # root-run crash, the positive control for the report probe
+  sh -c 'echo "ROOT-CRASH-PID $$"; exec "$K" crash-segv' 2>&1 | head -2
+  printf x >"/cores/core.ctl-$M" 2>/dev/null && chown "$ID" "/cores/core.ctl-$M" && echo "core-control planted in /cores owned by the uid"
+  echo "coredump=$(sysctl -n kern.coredump 2>&1) corefile=$(sysctl -n kern.corefile 2>&1) cores-dir=$(ls -ld /cores 2>&1)"
+}
+do_X6() {
+  ulimit -c unlimited 2>&1; echo "ulimit-c=$(ulimit -c)"
+  sh -c 'echo "USER-CRASH-PID $$"; exec "$K" crash-segv' 2>&1 | head -2
+  sh -c 'echo "USER-ABORT-PID $$"; exec "$K" crash-abort' 2>&1 | head -2
+  ( /usr/bin/perl -e '$e=time+215; while(time<$e){ $x++ }' >/dev/null 2>&1 & )
+  dd if=/dev/zero of="$L/big" bs=1m count=3072 2>&1 | tail -1
+  sleep 225
+  return 0
+}
+plant_X6() { p X6 do_X6; }
+x6_reports() {
+  for f in $(find /Library/Logs/DiagnosticReports /cores /private/var/root/Library/Logs/DiagnosticReports /Users/*/Library/Logs/DiagnosticReports "$H/Library/Logs/DiagnosticReports" -newer "$MK" -type f 2>/dev/null | head -30); do
+    echo "INFO X6 REPORT $f owner=$(stat -f %Su:%Sg "$f") mode=$(stat -f %Lp "$f") $(head -c 6000 "$f" 2>/dev/null | grep -o -E '"(userID|uid|procName|pid|name|app_name)" *: *("[^"]*"|[0-9]+)' | head -6 | tr '\n' ' ')"
+  done
+}
+probe_X6() {
+  x6_reports
+  echo "INFO X6 cores-owned-by-uid: $(find /cores -user "$ID" 2>/dev/null | head -3 | tr '\n' ' ')"
+  pr 'find /cores /Library/Logs/DiagnosticReports -newer "$MK" -type f \( -user "$ID" -o -name "canary*" -o -name "*.diag" \) 2>/dev/null | grep -q .'
+}
+
+# ---------------------------------------------------------------- X-TCC
+
+cs_tcc_vol() { # an APFS volume in an image at /Volumes/kbfpool, ownership honoured: the farm's home is on /Volumes/<volume>/home
+  rm -f "$W/pool.dmg"
+  hdiutil create -quiet -size 600m -fs APFS -volname kbfpool "$W/pool.dmg" 2>&1 | head -2
+  hdiutil attach -quiet -owners on -mountpoint /Volumes/kbfpool "$W/pool.dmg" 2>&1 | head -2
+  echo "TCCVOL mount: $(mount | grep kbfpool | cut -c1-160)"
+  echo "TCCVOL ls: $(ls -ld /Volumes/kbfpool 2>&1)"
+  mkdir -p /Volumes/kbfpool/home && chown 0:0 /Volumes/kbfpool/home && chmod 755 /Volumes/kbfpool/home
+  echo "TCCVOL fs: $(diskutil info /Volumes/kbfpool 2>&1 | grep -E 'File System|Ownership|Owners' | tr -s ' ' | tr '\n' ';')"
+}
+cs_tcc_vol_end() { hdiutil detach -force /Volumes/kbfpool 2>&1 | head -1; rm -f "$W/pool.dmg"; }
+
+cs_daemon_sh() { # script file: run it in a system LaunchDaemon (no grants of the runner step); output in $W/dsh.out
+  _pl=/Library/LaunchDaemons/kbf.cs.dsh.plist
+  rm -f "$W/dsh.done" "$W/dsh.out"
+  cat >"$_pl" <<PL
+<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>Label</key><string>kbf.cs.dsh</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>-c</string><string>/bin/bash $1; touch $W/dsh.done</string></array>
+<key>StandardOutPath</key><string>$W/dsh.out</string><key>StandardErrorPath</key><string>$W/dsh.out</string>
+<key>RunAtLoad</key><true/></dict></plist>
+PL
+  chown 0:0 "$_pl"; chmod 644 "$_pl"
+  launchctl bootstrap system "$_pl" 2>&1 | head -2
+  for _i in $(seq 1 120); do [ -e "$W/dsh.done" ] && break; sleep 1; done
+  cat "$W/dsh.out" 2>/dev/null
+  [ -e "$W/dsh.done" ] || echo "TCCDAEMON timeout"
+  launchctl bootout system/kbf.cs.dsh >/dev/null 2>&1; rm -f "$_pl"
+}
+cs_tcc_script() {
+  _cn=$(stat -f %Su /dev/console); _ch=$(dscl . -read "/Users/$_cn" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+  { printf 'H=%q\nRH=%q\nERRF=%q\n' "$H" "${_ch:-/Users/runner}" "$W/tcc-rm.err"; cat <<'SH'
+echo "TCCCTX uid=$(id -u) console-home=$RH pool-home=$H"
+while IFS= read -r d; do
+  for pair in "ctl:$RH" "pool:$H"; do
+    tag=${pair%%:*}; base=${pair#*:}
+    if [ ! -e "$base/$d" ]; then echo "TCCPROBE $tag $d absent"; continue; fi
+    o=$(ls -A "$base/$d" 2>&1 >/dev/null | head -c 70)
+    r=""
+    if [ "$tag" = pool ]; then rm -f "${base:?}/${d:?}/f" 2>"$ERRF"; r=" rm-rc=$? $(head -c 70 "$ERRF" 2>/dev/null)"; fi
+    echo "TCCPROBE $tag $d ls-err=[$o]$r"
+  done
+done <<'EOF'
+Desktop
+Documents
+Downloads
+Library/Safari
+Library/Mail
+Library/Messages
+Library/Calendars
+Library/Cookies
+Library/Application Support/AddressBook
+Library/Group Containers/group.com.apple.notes
+Library/Containers/com.apple.Safari/Data
+EOF
+SH
+  } >"$W/tcc.sh"
+  chmod 644 "$W/tcc.sh"
+}
+midplant_TCC() {
+  cs_tcc_script
+  echo "TCC step-context:"; bash "$W/tcc.sh" 2>&1 | head -40
+  echo "TCC daemon-context:"; cs_daemon_sh "$W/tcc.sh" | head -40
+}
+plant_TCC() { p TCC do_W07; }
+probe_TCC() { probe_W07; }
+
+# ---------------------------------------------------------------- X7, X9 controls and X-base
+
+fixture_LATEC() { # root-planted late arrivals, at +25 s and +70 s from now: the late looks must see them
+  ( sleep 25; printf x >"$H/late25-$M"; chown "$ID:$GID" "$H/late25-$M" ) >/dev/null 2>&1 &
+  ( sleep 70; printf x >"$H/late70-$M"; chown "$ID:$GID" "$H/late70-$M" ) >/dev/null 2>&1 &
+}
+plant_LATEC() { p LATEC true; }
+probe_LATEC() { pr 'ls "$H" 2>/dev/null | grep -q late'; }
+do_LATEK() { nohup sleep 3600 >/dev/null 2>&1 & sleep 1; }
+plant_LATEK() { p LATEK do_LATEK; }
+probe_LATEK() { pr 'procs_of | grep -q sleep'; }
+do_B1k() { nohup sleep 3600 >/dev/null 2>&1 & sleep 1; }
+plant_B1k() { p B1k do_B1k; }
+probe_B1k() { echo "PROBE B1k none"; }
+teardown_X6() { rm -f "/cores/core.ctl-$M"; find /cores -user "$ID" -delete 2>/dev/null; }
