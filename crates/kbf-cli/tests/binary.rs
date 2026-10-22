@@ -132,24 +132,30 @@ fn version_json_reports_the_build_identity() {
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(
-            fields,
-            [
-                "admin_protocol",
-                "commit",
-                "meta_log",
-                "min_protocol",
-                "profile",
-                "protocol",
-                "relay",
-                "seq",
-                "state_schema",
-                "version"
-            ],
-            "{out}"
-        );
+        // `commit_full` is printed by a build that knows its full commit, and by no other.
+        let known = !kbf_server::BUILD_COMMIT_FULL.is_empty();
+        let full = known.then_some("commit_full");
+        let mut want = vec![
+            "admin_protocol",
+            "commit",
+            "meta_log",
+            "min_protocol",
+            "profile",
+            "protocol",
+            "relay",
+            "seq",
+            "state_schema",
+            "version",
+        ];
+        want.extend(full);
+        want.sort_unstable();
+        assert_eq!(fields, want, "{out}");
         assert_eq!(v["relay"], kbf_cli::version::RELAY);
         assert_eq!(v["commit"], kbf_server::BUILD_COMMIT);
+        assert_eq!(
+            v["commit_full"].as_str().unwrap_or_default(),
+            kbf_server::BUILD_COMMIT_FULL
+        );
         assert_eq!(v["admin_protocol"], kbf_server::managed::ADMIN_PROTOCOL);
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         let profile = if cfg!(debug_assertions) {
