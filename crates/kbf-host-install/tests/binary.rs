@@ -18,6 +18,10 @@ fn run(request: Option<&OsStr>, args: &[&str]) -> Output {
     command
         .args(args)
         .env_remove("SSH_ORIGINAL_COMMAND")
+        .env_remove("SSH_CONNECTION")
+        .env_remove("SSH_CLIENT")
+        .env_remove("SSH_TTY")
+        .env_remove("KBF_HOST_INSTALL_UNIT")
         .stdin(Stdio::null());
     if let Some(request) = request {
         command.env("SSH_ORIGINAL_COMMAND", request);
@@ -62,4 +66,24 @@ fn only_the_environment_is_a_request() {
     let out = run(None, &["query"]);
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(String::from_utf8(out.stdout).unwrap(), REFUSED);
+}
+
+/// The body of the install unit is chosen by the one variable alone, with no ssh variable
+/// around: a request that is not an install is refused there, which a query would not be.
+/// (It runs nothing and writes no audit line, so it is safe to drive on any machine.)
+#[test]
+fn the_unit_variable_selects_the_unit_body() {
+    for request in ["query", "install kbf=1;id from candidate", ""] {
+        let out = Command::new(env!("CARGO_BIN_EXE_kbf-host-install"))
+            .env_remove("SSH_ORIGINAL_COMMAND")
+            .env_remove("SSH_CONNECTION")
+            .env_remove("SSH_CLIENT")
+            .env_remove("SSH_TTY")
+            .env("KBF_HOST_INSTALL_UNIT", request)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{request:?}");
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), REFUSED, "{request:?}");
+    }
 }

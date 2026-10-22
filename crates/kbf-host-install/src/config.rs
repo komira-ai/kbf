@@ -101,7 +101,10 @@ impl Allowlist {
 /// written it, invalid when it could not be read.
 fn refusal(error: TrustError) -> Refusal {
     match error {
-        TrustError::NotOwned | TrustError::Writable => Refusal::ConfigUnsafe,
+        TrustError::NotOwned
+        | TrustError::Writable
+        | TrustError::ParentNotOwned
+        | TrustError::ParentWritable => Refusal::ConfigUnsafe,
         TrustError::Io(_) | TrustError::NotRegular | TrustError::TooLarge => Refusal::ConfigInvalid,
     }
 }

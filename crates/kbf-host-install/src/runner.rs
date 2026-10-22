@@ -5,6 +5,7 @@
 //! only environment a child sees is [`PATH`] and [`LANG`].
 
 use std::io;
+use std::time::Duration;
 use std::process::{Command, Stdio};
 
 /// The only `PATH` a child sees.
@@ -18,6 +19,8 @@ pub const LANG: &str = "C";
 pub struct Cmd {
     pub program: String,
     pub args: Vec<String>,
+    /// How long it may run before it is killed; none to wait for it however long it takes.
+    pub timeout: Option<Duration>,
 }
 
 /// How a child ended and what it wrote.

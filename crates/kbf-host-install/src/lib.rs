@@ -45,11 +45,10 @@ use std::process::ExitCode;
 /// the status of the answer.
 #[must_use]
 pub fn main() -> ExitCode {
-    let command = std::env::var_os("SSH_ORIGINAL_COMMAND");
-    let code = host::handle(
+    let code = host::dispatch(
         &host::Host::production(),
         &runner::SystemRunner,
-        command.as_deref(),
+        &host::Environment::from_process(),
         &mut std::io::stdout(),
         &mut std::io::stderr(),
     );

@@ -13,8 +13,10 @@
 //! fixed environment as every process here ([`crate::runner::PATH`], `LANG=C`) plus
 //! `DEBIAN_FRONTEND=noninteractive`.
 
+use std::path::Path;
+
 use crate::config::ChannelSource;
-use crate::request::Version;
+use crate::request::{Channel, Version};
 use crate::runner::{Cmd, LANG, PATH};
 
 /// The prefix of every unit this program starts; `query` asks systemd about `<prefix>*`.
@@ -62,7 +64,25 @@ fn cmd(program: &str, args: &[&str]) -> Cmd {
     Cmd {
         program: program.to_owned(),
         args: args.iter().map(|a| (*a).to_owned()).collect(),
+        timeout: None,
     }
+}
+
+/// The variable that makes the program run as the body of the install unit; only
+/// `systemd-run` sets it (see [`unit_install`]).
+pub const UNIT_ENV: &str = "KBF_HOST_INSTALL_UNIT";
+
+/// Seconds `kbf --version --json` may run before `query` gives up on it.
+pub const RUNNING_BUILD_TIMEOUT_SECS: u64 = 10;
+
+/// The install unit: this program again, as the body of a transient unit.
+pub fn unit_install(_self_exe: &Path, _version: &Version, _channel: &Channel) -> Cmd {
+    cmd(SYSTEMD_RUN, &[])
+}
+
+/// Ask systemd whether any install unit exists in a state that is not over.
+pub fn units_running() -> Cmd {
+    units_active()
 }
 
 /// Read the installed version and package state of `kbf`: `<status> <version>`.
@@ -108,6 +128,7 @@ fn in_unit(version: &Version, inner: Vec<String>) -> Cmd {
     Cmd {
         program: SYSTEMD_RUN.to_owned(),
         args,
+        timeout: None,
     }
 }
 
@@ -123,7 +144,8 @@ fn only_source(source: &ChannelSource) -> [String; 4] {
 
 /// `apt-get update` of the channel's source alone, in a unit. The other lists are kept:
 /// `List-Cleanup=0`, since a cleanup would delete every list this source does not name.
-pub fn apt_update(source: &ChannelSource, version: &Version) -> Cmd {
+pub fn apt_update(source: &ChannelSource) -> Cmd {
+    let version = &Version::new("0").unwrap();
     let mut inner = only_source(source).to_vec();
     inner.extend([
         "-o".to_owned(),

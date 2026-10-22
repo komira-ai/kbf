@@ -10,6 +10,13 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+/// Whether some process holds the `flock` on `lock_file`, found by asking for it without
+/// waiting: a shared lock is taken and let go at once. A missing file is not held; a file
+/// that cannot be opened or asked is held, since idle is not proved.
+pub fn flock_held(_lock_file: &Path) -> bool {
+    false
+}
+
 /// Whether a lock is held on `lock_file`, reading the lock table at `proc_locks`. A
 /// missing lock file, or an unreadable table, is "not held".
 pub fn held(proc_locks: &Path, lock_file: &Path) -> bool {

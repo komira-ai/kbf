@@ -21,7 +21,7 @@ fn entry(outcome: &'static str) -> Entry {
 
 fn setup(name: &str) -> (TestDir, Trust) {
     let dir = TestDir::under(std::env::temp_dir(), name);
-    let trust = Trust::owned_by(fs::metadata(&*dir).unwrap().uid());
+    let trust = Trust::owned_by(fs::metadata(&*dir).unwrap().uid(), &dir);
     (dir, trust)
 }
 
@@ -86,7 +86,7 @@ fn an_unsafe_log_is_refused() {
     }
     fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
     assert!(Audit::open(&trust, &real).is_ok());
-    let stranger = Trust::owned_by(trust_uid(&dir) + 1);
+    let stranger = Trust::owned_by(trust_uid(&dir) + 1, &dir);
     assert!(
         Audit::open(&stranger, &real).is_err(),
         "not the trusted user's"

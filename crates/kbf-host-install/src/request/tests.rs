@@ -1,5 +1,6 @@
 use super::{
     BadCommand, Channel, MAX_CHANNEL_LEN, MAX_UNIT_VERSION_LEN, MAX_VERSION_LEN, Request, Version,
+    in_grammar,
 };
 
 fn parse(text: &str) -> Result<Request, BadCommand> {
@@ -215,4 +216,45 @@ fn a_version_too_long_for_a_unit_name_is_refused() {
     // Plain characters are one byte each: the full 128 is fine.
     let plain = format!("1{}", "9".repeat(MAX_VERSION_LEN - 1));
     assert!(parse(&format!("install kbf={plain} from c")).is_ok());
+}
+
+/// The version grammar alone, without dpkg's parse behind it: `Version::new` also asks
+/// `DebVersion::parse`, which refuses most of these too, so a defect in the grammar's own
+/// first-character rule (the one that keeps `-` from becoming an option to `apt-get`) is
+/// seen only here. The first group is outside the grammar, the second inside it.
+#[test]
+fn the_grammar_alone_refuses_an_option_and_a_non_digit() {
+    for text in [
+        "-1.0", "--help", "-", "-1", "--version=1", "-o", "~1", "+1", ".1", "a1", "v1.0", "",
+        "1:2", "1 0", "1_0", "1/0", "1\u{e9}",
+    ] {
+        assert!(!in_grammar(text), "{text:?}");
+    }
+    for text in ["0", "1", "1.0", "1.0-1", "0.1.0~rc1+git-1", "9a"] {
+        assert!(in_grammar(text), "{text:?}");
+    }
+    // A first character that is a digit but not an ASCII one is not a digit.
+    assert!(!in_grammar("\u{661}.0"));
+}
+
+/// The limits of the grammar alone: the byte limit and the unit-name limit, each inclusive.
+#[test]
+fn the_grammar_alone_has_inclusive_limits() {
+    assert!(in_grammar(&format!("1{}", "0".repeat(MAX_VERSION_LEN - 1))));
+    assert!(!in_grammar(&format!("1{}", "0".repeat(MAX_VERSION_LEN))));
+    let tildes = (MAX_UNIT_VERSION_LEN - 2) / 2;
+    assert!(in_grammar(&format!("11{}", "~".repeat(tildes))));
+    assert!(!in_grammar(&format!("11{}", "~".repeat(tildes + 1))));
+}
+
+/// The request parser alone: a version with a leading hyphen is not a request, whichever
+/// layer refuses it. (`parse` goes through the grammar first; this pins the result.)
+#[test]
+fn a_leading_hyphen_is_no_request() {
+    for version in ["-1.0", "--help", "-", "-1"] {
+        assert!(
+            Request::parse(&format!("install kbf={version} from candidate")).is_err(),
+            "{version}"
+        );
+    }
 }

@@ -1,12 +1,16 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use super::{
-    APT_GET, DPKG_QUERY, KBF, SYSTEMCTL, SYSTEMD_RUN, apt_install, apt_update, installed_version,
-    running_build, unit_name, units_active,
+    APT_GET, DPKG_QUERY, KBF, RUNNING_BUILD_TIMEOUT_SECS, SYSTEMCTL, SYSTEMD_RUN, UNIT_ENV,
+    apt_install, apt_update, installed_version, running_build, unit_install, unit_name,
+    units_running,
 };
 use crate::config::ChannelSource;
-use crate::request::Version;
-use crate::runner::{Cmd, LANG, PATH};
+use crate::request::{Channel, Version};
+use crate::runner::Cmd;
+
+const SELF_EXE: &str = "/usr/libexec/kbf/kbf-host-install";
 
 fn source() -> ChannelSource {
     ChannelSource {
@@ -19,6 +23,14 @@ fn version(text: &str) -> Version {
     Version::new(text).unwrap()
 }
 
+fn channel() -> Channel {
+    Channel::new("candidate").unwrap()
+}
+
+fn unit(text: &str) -> Cmd {
+    unit_install(Path::new(SELF_EXE), &version(text), &channel())
+}
+
 fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|a| (*a).to_owned()).collect()
 }
@@ -29,32 +41,23 @@ fn every_command() -> Vec<Cmd> {
     vec![
         installed_version(),
         running_build(),
-        units_active(),
-        apt_update(&source(), &v),
+        units_running(),
+        apt_update(&source()),
         apt_install(&source(), &v),
+        unit(&v.as_str().to_owned()),
     ]
 }
 
-/// The exact vector of the update step: a unit around `apt-get update` that reads the one
-/// source, with the other lists left alone.
+/// The exact vector of the update step: `apt-get update` of the one source, with the other
+/// lists left alone. It runs inside the install unit, so it is not wrapped in one.
 #[test]
 fn the_update_step_argv() {
-    let cmd = apt_update(&source(), &version("1.2.3-1"));
-    assert_eq!(cmd.program, SYSTEMD_RUN);
+    let cmd = apt_update(&source());
+    assert_eq!(cmd.program, APT_GET);
+    assert_eq!(cmd.timeout, None);
     assert_eq!(
         cmd.args,
         strings(&[
-            "--wait",
-            "--collect",
-            "--pipe",
-            "--quiet",
-            "--unit=kbf-host-install-1.2.3-1.service",
-            "--property=RuntimeMaxSec=1800",
-            &format!("--setenv=PATH={PATH}"),
-            &format!("--setenv=LANG={LANG}"),
-            "--setenv=DEBIAN_FRONTEND=noninteractive",
-            "--",
-            APT_GET,
             "-o",
             "Dir::Etc::SourceList=/etc/kbf/host-install/candidate.sources",
             "-o",
@@ -71,21 +74,11 @@ fn the_update_step_argv() {
 #[test]
 fn the_install_step_argv() {
     let cmd = apt_install(&source(), &version("1.2.3-1"));
-    assert_eq!(cmd.program, SYSTEMD_RUN);
+    assert_eq!(cmd.program, APT_GET);
+    assert_eq!(cmd.timeout, None);
     assert_eq!(
         cmd.args,
         strings(&[
-            "--wait",
-            "--collect",
-            "--pipe",
-            "--quiet",
-            "--unit=kbf-host-install-1.2.3-1.service",
-            "--property=RuntimeMaxSec=1800",
-            &format!("--setenv=PATH={PATH}"),
-            &format!("--setenv=LANG={LANG}"),
-            "--setenv=DEBIAN_FRONTEND=noninteractive",
-            "--",
-            APT_GET,
             "install",
             "-y",
             "--no-install-recommends",
@@ -104,6 +97,31 @@ fn the_install_step_argv() {
     );
 }
 
+/// The one unit of an install: this program again, with the request in the one variable
+/// only the unit has, in a unit that is waited for, collected and piped back. Both apt
+/// steps run inside it, so what holds the install lock is what runs them.
+#[test]
+fn the_install_unit_argv() {
+    let cmd = unit("1.2.3-1");
+    assert_eq!(cmd.program, SYSTEMD_RUN);
+    assert_eq!(cmd.timeout, None);
+    assert_eq!(
+        cmd.args,
+        strings(&[
+            "--wait",
+            "--collect",
+            "--pipe",
+            "--quiet",
+            "--unit=kbf-host-install-1.2.3-1.service",
+            "--property=RuntimeMaxSec=1800",
+            "--setenv=KBF_HOST_INSTALL_UNIT=install kbf=1.2.3-1 from candidate",
+            "--",
+            SELF_EXE,
+        ])
+    );
+    assert_eq!(UNIT_ENV, "KBF_HOST_INSTALL_UNIT");
+}
+
 /// The read-only commands.
 #[test]
 fn the_query_commands() {
@@ -116,20 +134,36 @@ fn the_query_commands() {
                 "--showformat=${db:Status-Abbrev} ${Version}\\n",
                 "kbf"
             ]),
+            timeout: None,
         }
     );
+    // The binary runs as root and may hang: it gets a limit; nothing else here does.
     assert_eq!(
         running_build(),
         Cmd {
             program: KBF.into(),
-            args: strings(&["--version", "--json"])
+            args: strings(&["--version", "--json"]),
+            timeout: Some(Duration::from_secs(10)),
         }
     );
+    assert_eq!(RUNNING_BUILD_TIMEOUT_SECS, 10);
+    // `is-active` is true only for `active`: a unit that is starting is `activating`, so the
+    // listing names every state that is not over.
     assert_eq!(
-        units_active(),
+        units_running(),
         Cmd {
             program: SYSTEMCTL.into(),
-            args: strings(&["is-active", "--quiet", "--", "kbf-host-install-*"]),
+            args: strings(&[
+                "list-units",
+                "--type=service",
+                "--state=active,activating,deactivating,reloading",
+                "--plain",
+                "--no-legend",
+                "--no-pager",
+                "--",
+                "kbf-host-install-*"
+            ]),
+            timeout: None,
         }
     );
 }
@@ -163,19 +197,18 @@ fn unit_names_are_sanitized() {
 }
 
 /// Catches an interpolation into a shell: every program is one of the five this module
-/// names, the program a unit runs is `apt-get` and nothing else, no argument is the flag
+/// names, the program a unit runs is this program and nothing else, no argument is the flag
 /// that makes a program run a string, and no argument holds a shell metacharacter. (The
 /// flag is built at run time, so this file does not itself name one.)
 #[test]
 fn no_shell_anywhere() {
-    let programs = [DPKG_QUERY, KBF, SYSTEMCTL, SYSTEMD_RUN];
+    let programs = [DPKG_QUERY, KBF, SYSTEMCTL, SYSTEMD_RUN, APT_GET];
     let run_string = format!("-{}", 'c');
     for cmd in every_command() {
         assert!(programs.contains(&cmd.program.as_str()), "{cmd:?}");
         if cmd.program == SYSTEMD_RUN {
             let after: Vec<&String> = cmd.args.iter().skip_while(|a| *a != "--").collect();
-            assert_eq!(after[0], "--");
-            assert_eq!(after[1], APT_GET, "{cmd:?}");
+            assert_eq!(after, ["--", SELF_EXE], "{cmd:?}");
         }
         assert!(!cmd.args.contains(&run_string), "{cmd:?}");
         for arg in &cmd.args {
@@ -194,15 +227,28 @@ fn programs_are_absolute() {
     }
 }
 
-/// Catches a version that reaches an argument other than its own: it is in the unit name
-/// and in `kbf=<version>` and nowhere else.
+/// Catches a version that reaches an argument other than its own: in the install step it
+/// is `kbf=<version>` and nowhere else; in the unit it is the unit name and the request.
 #[test]
-fn the_version_is_in_two_places() {
+fn the_version_is_only_where_it_belongs() {
     let cmd = apt_install(&source(), &version("7.8.9"));
+    let holders: Vec<&String> = cmd.args.iter().filter(|a| a.contains("7.8.9")).collect();
+    assert_eq!(holders, ["kbf=7.8.9"]);
+    assert!(
+        !apt_update(&source())
+            .args
+            .iter()
+            .any(|a| a.contains("7.8.9")),
+        "the update names no version"
+    );
+    let cmd = unit("7.8.9");
     let holders: Vec<&String> = cmd.args.iter().filter(|a| a.contains("7.8.9")).collect();
     assert_eq!(
         holders,
-        ["--unit=kbf-host-install-7.8.9.service", "kbf=7.8.9"]
+        [
+            "--unit=kbf-host-install-7.8.9.service",
+            "--setenv=KBF_HOST_INSTALL_UNIT=install kbf=7.8.9 from candidate"
+        ]
     );
 }
 

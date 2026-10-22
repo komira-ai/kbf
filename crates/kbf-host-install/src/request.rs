@@ -45,16 +45,7 @@ impl Version {
     /// # Errors
     /// [`BadCommand`] when it is not in the grammar.
     pub fn new(text: &str) -> Result<Self, BadCommand> {
-        let (first, rest) = text.split_at_checked(1).ok_or(BadCommand)?;
-        // `+` and `~` take two bytes in the unit name.
-        let unit_len = text.len() + text.bytes().filter(|b| b"+~".contains(b)).count();
-        let well_formed = text.len() <= MAX_VERSION_LEN
-            && unit_len <= MAX_UNIT_VERSION_LEN
-            && first.starts_with(|c: char| c.is_ascii_digit())
-            && rest
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b".+~-".contains(&b));
-        if !well_formed {
+        if !in_grammar(text) {
             return Err(BadCommand);
         }
         let parsed = DebVersion::parse(text).map_err(|_| BadCommand)?;
@@ -73,6 +64,23 @@ impl Version {
     pub fn parsed(&self) -> &DebVersion {
         &self.parsed
     }
+}
+
+/// Whether `text` is within the version grammar, before dpkg's own parse is asked: a digit
+/// first (so never a hyphen, which `apt-get` would take for an option), then letters,
+/// digits and `.+~-`, within both length limits.
+fn in_grammar(text: &str) -> bool {
+    let Some((first, rest)) = text.split_at_checked(1) else {
+        return false;
+    };
+    // `+` and `~` take two bytes in the unit name.
+    let unit_len = text.len() + text.bytes().filter(|b| b"+~".contains(b)).count();
+    text.len() <= MAX_VERSION_LEN
+        && unit_len <= MAX_UNIT_VERSION_LEN
+        && first.starts_with(|c: char| c.is_ascii_digit())
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".+~-".contains(&b))
 }
 
 /// A channel name: a key of the allowlist, never a path.

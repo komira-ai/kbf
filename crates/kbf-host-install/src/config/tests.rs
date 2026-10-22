@@ -17,7 +17,8 @@ struct Fixture {
 impl Fixture {
     fn new(name: &str) -> Self {
         let dir = TestDir::under(std::env::temp_dir(), name);
-        let trust = Trust::owned_by(fs::metadata(&*dir).unwrap().uid());
+        fs::set_permissions(&*dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let trust = Trust::owned_by(fs::metadata(&*dir).unwrap().uid(), &dir);
         Self { dir, trust }
     }
 
@@ -142,6 +143,167 @@ fn a_source_without_signed_by_is_refused() {
         let source = f.write("s.sources", 0o644, &text);
         assert_eq!(f.channel(&source), Err(Refusal::ChannelUnsigned), "{what}");
     }
+}
+
+/// Catches a source that names a key and then switches the check off: `trusted=yes`,
+/// `allow-insecure=yes`, `allow-weak=yes` and `allow-downgrade-to-insecure=yes` each make apt
+/// accept what the key did not sign, in the one-line form and in deb822, in either case and
+/// with any value but a plain no; and it is the second entry that does it as well as the first.
+#[test]
+fn a_signed_source_that_weakens_the_check_is_refused() {
+    let f = Fixture::new("config-insecure");
+    let key = f.key();
+    let k = key.display();
+    let mut cases: Vec<(String, String)> = Vec::new();
+    for option in [
+        "trusted=yes",
+        "allow-insecure=yes",
+        "allow-weak=yes",
+        "allow-downgrade-to-insecure=yes",
+        "Trusted=YES",
+        "ALLOW-INSECURE=Yes",
+        "trusted=true",
+        "trusted=1",
+        "trusted=on",
+        "trusted=maybe",
+        "trusted=",
+        "trusted+=yes",
+    ] {
+        cases.push((
+            format!("one-line, {option} after the key"),
+            format!("deb [signed-by={k} {option}] https://a candidate main\n"),
+        ));
+        cases.push((
+            format!("one-line, {option} before the key"),
+            format!("deb [{option} signed-by={k}] https://a candidate main\n"),
+        ));
+    }
+    for (field, value) in [
+        ("Trusted", "yes"),
+        ("Allow-Insecure", "yes"),
+        ("Allow-Weak", "yes"),
+        ("Allow-Downgrade-To-Insecure", "yes"),
+        ("trusted", "Yes"),
+        ("ALLOW-INSECURE", "true"),
+        ("Trusted", ""),
+        ("Trusted", "anything"),
+    ] {
+        cases.push((
+            format!("deb822, {field}: {value}"),
+            format!("Types: deb\nURIs: https://a\nSigned-By: {k}\n{field}: {value}\n"),
+        ));
+        cases.push((
+            format!("deb822, {field}: {value} before the key"),
+            format!("Types: deb\n{field}: {value}\nURIs: https://a\nSigned-By: {k}\n"),
+        ));
+    }
+    cases.push((
+        "second one-line entry".into(),
+        format!(
+            "deb [signed-by={k}] https://a candidate main\ndeb [signed-by={k} trusted=yes] https://b candidate main\n"
+        ),
+    ));
+    cases.push((
+        "second stanza".into(),
+        format!(
+            "Types: deb\nURIs: https://a\nSigned-By: {k}\n\nTypes: deb\nURIs: https://b\nSigned-By: {k}\nTrusted: yes\n"
+        ),
+    ));
+    for (what, text) in cases {
+        let source = f.write("s.sources", 0o644, &text);
+        assert_eq!(f.channel(&source), Err(Refusal::ChannelInsecure), "{what}");
+    }
+}
+
+/// Catches a refusal that is too wide: the same options switched off, or no mention at
+/// all, leave a signed source usable.
+#[test]
+fn an_explicit_no_is_not_insecure() {
+    let f = Fixture::new("config-secure");
+    let key = f.key();
+    let k = key.display();
+    for text in [
+        format!("deb [signed-by={k} trusted=no] https://a candidate main\n"),
+        format!("deb [signed-by={k} allow-insecure=false allow-weak=No] https://a c main\n"),
+        format!("deb [signed-by={k} trusted=0] https://a candidate main\n"),
+        format!("deb [signed-by={k} trusted=off] https://a candidate main\n"),
+        format!("Types: deb\nURIs: https://a\nSigned-By: {k}\nTrusted: no\n"),
+        format!("Types: deb\nURIs: https://a\nSigned-By: {k}\nAllow-Insecure: false\n"),
+        format!("Types: deb\nURIs: https://a\nSigned-By: {k}\nComponents: trusted=yes\n"),
+        format!("deb [signed-by={k} arch=amd64] https://a/trusted=yes candidate main\n"),
+    ] {
+        let source = f.write("s.sources", 0o644, &text);
+        assert!(f.channel(&source).is_ok(), "{text}");
+    }
+}
+
+/// A source with no key and a weakening option is still unsigned (the first fault found);
+/// one with a weakening option is refused as insecure before its keys are looked at.
+#[test]
+fn the_order_of_the_signing_refusals() {
+    let f = Fixture::new("config-insecure-order");
+    let source = f.write(
+        "s.sources",
+        0o644,
+        "deb [trusted=yes] https://a candidate main\n",
+    );
+    assert_eq!(f.channel(&source), Err(Refusal::ChannelUnsigned));
+    let source = f.write(
+        "t.sources",
+        0o644,
+        "deb [signed-by=/nonexistent/k.gpg trusted=yes] https://a candidate main\n",
+    );
+    assert_eq!(f.channel(&source), Err(Refusal::ChannelInsecure));
+}
+
+/// Catches a path that is not walked: the allowlist, a source and a key each sit in a
+/// directory that others can write, and each is refused as unsafe (the allowlist and the
+/// source) or untrusted (the key) with the file itself in good order.
+#[test]
+fn a_writable_directory_makes_each_file_unsafe() {
+    let f = Fixture::new("config-parents");
+    let open = f.dir.join("open");
+    fs::create_dir(&open).unwrap();
+    let key = f.key();
+    let source = f.deb822(&key.display().to_string());
+    f.allowlist(&source);
+    let config = f.dir.join("host-install.toml");
+    assert!(Allowlist::load(&f.trust, &config).is_ok());
+
+    // The allowlist in an open directory.
+    let moved = f.write_in(&open, "host-install.toml", 0o644, &fs::read_to_string(&config).unwrap());
+    fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
+    assert_eq!(
+        Allowlist::load(&f.trust, &moved).unwrap_err(),
+        Refusal::ConfigUnsafe
+    );
+    fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(Allowlist::load(&f.trust, &moved).is_ok());
+
+    // The source in an open directory.
+    let moved_source = f.write_in(&open, "candidate.sources", 0o644, &fs::read_to_string(&source).unwrap());
+    let text = format!(
+        "[channels.candidate]\nsuite = \"candidate\"\nsource_list = \"{}\"\n",
+        moved_source.display()
+    );
+    let path = f.write("moved.toml", 0o644, &text);
+    let list_moved = Allowlist::load(&f.trust, &path).unwrap();
+    let candidate = Channel::new("candidate").unwrap();
+    assert!(list_moved.channel(&f.trust, &candidate).is_ok());
+    fs::set_permissions(&open, fs::Permissions::from_mode(0o757)).unwrap();
+    assert_eq!(
+        list_moved.channel(&f.trust, &candidate),
+        Err(Refusal::ConfigUnsafe)
+    );
+    fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The key in an open directory.
+    let moved_key = f.write_in(&open, "key.gpg", 0o644, "key");
+    let keyed = f.deb822(&moved_key.display().to_string());
+    assert!(f.channel(&keyed).is_ok());
+    fs::set_permissions(&open, fs::Permissions::from_mode(0o775)).unwrap();
+    assert_eq!(f.channel(&keyed), Err(Refusal::KeyUntrusted));
+    fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// A continuation line belongs to the field above it, whatever the field is, and a line
@@ -272,7 +434,7 @@ fn an_untrusted_allowlist_is_refused() {
     let text = "[channels.candidate]\nsuite = \"candidate\"\nsource_list = \"/x.sources\"\n";
     let path = f.write("a.toml", 0o644, text);
     assert!(Allowlist::load(&f.trust, &path).is_ok());
-    let stranger = Trust::owned_by(f.trust_uid() + 1);
+    let stranger = Trust::owned_by(f.trust_uid() + 1, &f.dir);
     assert_eq!(
         Allowlist::load(&stranger, &path).unwrap_err(),
         Refusal::ConfigUnsafe
@@ -372,6 +534,13 @@ fn only_a_named_channel_is_allowed() {
 }
 
 impl Fixture {
+    fn write_in(&self, dir: &Path, name: &str, mode: u32, text: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, text).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
     fn trust_uid(&self) -> u32 {
         fs::metadata(&*self.dir).unwrap().uid()
     }

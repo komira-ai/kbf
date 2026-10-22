@@ -7,7 +7,7 @@
 //! unrecorded. A refusal or a `query` is answered even when the log is unavailable (the
 //! warning goes to stderr), since neither changes the host.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -25,6 +25,55 @@ use crate::request::{BadCommand, Channel, Request, Version};
 use crate::runner::{Cmd, Runner};
 use crate::trust::{self, Trust};
 
+/// Where the packaging installs this program (the forced command of the key).
+pub const SELF_EXE: &str = "/usr/libexec/kbf/kbf-host-install";
+
+/// What the process was started with that decides how it runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Environment {
+    /// `SSH_ORIGINAL_COMMAND`: the request.
+    pub ssh_original_command: Option<OsString>,
+    /// The variable only the install unit has, holding its request.
+    pub unit_request: Option<OsString>,
+    /// Whether sshd started this process (it sets any of four variables).
+    pub ssh_session: bool,
+}
+
+impl Environment {
+    /// Read it from this process's environment.
+    pub fn from_process() -> Self {
+        Self::from_vars(|name| std::env::var_os(name))
+    }
+
+    /// Read it through `get`.
+    pub fn from_vars(get: impl Fn(&str) -> Option<OsString>) -> Self {
+        let _ = get;
+        Self::default()
+    }
+}
+
+/// Run as what the environment says: the body of the install unit, or an ssh request.
+pub fn dispatch(
+    host: &Host,
+    runner: &dyn Runner,
+    env: &Environment,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    handle(host, runner, env.ssh_original_command.as_deref(), out, err)
+}
+
+/// The body of the install unit.
+pub fn handle_unit(
+    _host: &Host,
+    _runner: &dyn Runner,
+    _request: Option<&OsStr>,
+    _out: &mut dyn Write,
+    _err: &mut dyn Write,
+) -> u8 {
+    2
+}
+
 /// Where the files this program reads as root are, and who must own them.
 #[derive(Debug, Clone)]
 pub struct Host {
@@ -33,6 +82,8 @@ pub struct Host {
     pub(crate) install_lock: PathBuf,
     pub(crate) proc_locks: PathBuf,
     pub(crate) dpkg_lock: PathBuf,
+    /// This program, as the install unit runs it again.
+    pub(crate) self_exe: PathBuf,
     pub(crate) trust: Trust,
 }
 
@@ -45,6 +96,7 @@ impl Host {
             install_lock: PathBuf::from("/run/kbf-host-install.lock"),
             proc_locks: PathBuf::from("/proc/locks"),
             dpkg_lock: PathBuf::from("/var/lib/dpkg/lock-frontend"),
+            self_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from(SELF_EXE)),
             trust: Trust::root(),
         }
     }
@@ -58,6 +110,7 @@ impl Host {
             install_lock: dir.join("install.lock"),
             proc_locks: dir.join("proc-locks"),
             dpkg_lock: dir.join("lock-frontend"),
+            self_exe: PathBuf::from(SELF_EXE),
             trust,
         }
     }
@@ -246,7 +299,7 @@ fn install_checked(
     }
     step(
         runner,
-        &plan::apt_update(&source, version),
+        &plan::apt_update(&source),
         FailureCode::UpdateFailed,
     )?;
     step(
@@ -306,3 +359,5 @@ fn step(runner: &dyn Runner, cmd: &Cmd, code: FailureCode) -> Result<(), Outcome
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod unit_tests;

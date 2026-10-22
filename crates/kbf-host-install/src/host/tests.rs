@@ -1,36 +1,39 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use kbf_testkit::dir::TestDir;
 use serde_json::{Value, json};
 
-use super::{Host, handle};
+use super::{Environment, Host, SELF_EXE, dispatch, handle};
 use crate::config::ChannelSource;
+use crate::locks;
+use crate::outcome::{FailureCode, Outcome, Refusal};
 use crate::plan;
-use crate::request::Version;
+use crate::request::{Channel, Version};
 use crate::runner::Runner;
 use crate::runner::fake::{FakeRunner, exec, ok};
 use crate::trust::Trust;
 
-const INSTALL: &str = "install kbf=1.2.3-1 from candidate";
+pub(super) const INSTALL: &str = "install kbf=1.2.3-1 from candidate";
 
-struct Fx {
-    dir: TestDir,
-    host: Host,
-    source: PathBuf,
+pub(super) struct Fx {
+    pub(super) dir: TestDir,
+    pub(super) host: Host,
+    pub(super) source: PathBuf,
 }
 
-struct Answer {
-    code: u8,
-    out: String,
-    err: String,
+pub(super) struct Answer {
+    pub(super) code: u8,
+    pub(super) out: String,
+    pub(super) err: String,
 }
 
 impl Answer {
-    fn json(&self) -> Value {
+    pub(super) fn json(&self) -> Value {
         assert!(
             self.out.ends_with('\n') && self.out.matches('\n').count() == 1,
             "{:?}",
@@ -42,9 +45,10 @@ impl Answer {
 
 impl Fx {
     /// A host whose allowlist names `candidate`, signed by a key of the trusted user.
-    fn new(name: &str) -> Self {
+    pub(super) fn new(name: &str) -> Self {
         let dir = TestDir::under(std::env::temp_dir(), name);
-        let trust = Trust::owned_by(fs::metadata(&*dir).unwrap().uid());
+        fs::set_permissions(&*dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let trust = Trust::owned_by(fs::metadata(&*dir).unwrap().uid(), &dir);
         let host = Host::for_test(&dir, trust);
         let key = dir.join("key.gpg");
         write(&key, 0o644, "key");
@@ -68,11 +72,11 @@ impl Fx {
         Self { dir, host, source }
     }
 
-    fn run(&self, runner: &dyn Runner, command: &str) -> Answer {
+    pub(super) fn run(&self, runner: &dyn Runner, command: &str) -> Answer {
         self.run_os(runner, Some(OsStr::new(command)))
     }
 
-    fn run_os(&self, runner: &dyn Runner, command: Option<&OsStr>) -> Answer {
+    pub(super) fn run_os(&self, runner: &dyn Runner, command: Option<&OsStr>) -> Answer {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = handle(&self.host, runner, command, &mut out, &mut err);
         Answer {
@@ -82,7 +86,7 @@ impl Fx {
         }
     }
 
-    fn audit_lines(&self) -> Vec<Value> {
+    pub(super) fn audit_lines(&self) -> Vec<Value> {
         fs::read_to_string(&self.host.audit)
             .unwrap_or_default()
             .lines()
@@ -90,7 +94,7 @@ impl Fx {
             .collect()
     }
 
-    fn channel_source(&self) -> ChannelSource {
+    pub(super) fn channel_source(&self) -> ChannelSource {
         ChannelSource {
             suite: "candidate".into(),
             source_list: self.source.clone(),
@@ -98,119 +102,18 @@ impl Fx {
     }
 }
 
-fn write(path: &std::path::Path, mode: u32, text: &str) {
+pub(super) fn write(path: &std::path::Path, mode: u32, text: &str) {
     fs::write(path, text).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
-fn version(text: &str) -> Version {
+pub(super) fn version(text: &str) -> Version {
     Version::new(text).unwrap()
 }
 
 /// The script of an install over an older package: read, update, install, read again.
-fn install_script(before: &str, after: &str) -> FakeRunner {
+pub(super) fn install_script(before: &str, after: &str) -> FakeRunner {
     FakeRunner::new(vec![ok(before), ok("updated"), ok("installed"), ok(after)])
-}
-
-/// A normal install: the four commands, in order, are the plan's; the line says installed;
-/// the audit line says who, what and the outcome.
-#[test]
-fn an_install_runs_the_plan() {
-    let fx = Fx::new("host-install");
-    let runner = install_script("ii  1.0-1\n", "ii  1.2.3-1\n");
-    let answer = fx.run(&runner, INSTALL);
-    assert_eq!(answer.code, 0, "{}", answer.err);
-    assert_eq!(
-        answer.json(),
-        json!({"result": "installed", "installed_version": "1.2.3-1", "unit_state": "finished"})
-    );
-    let v = version("1.2.3-1");
-    assert_eq!(
-        runner.calls(),
-        vec![
-            plan::installed_version(),
-            plan::apt_update(&fx.channel_source(), &v),
-            plan::apt_install(&fx.channel_source(), &v),
-            plan::installed_version(),
-        ]
-    );
-    let audit = fx.audit_lines();
-    assert_eq!(audit.len(), 1);
-    assert_eq!(audit[0]["verb"], "install");
-    assert_eq!(audit[0]["version"], "1.2.3-1");
-    assert_eq!(audit[0]["channel"], "candidate");
-    assert_eq!(audit[0]["outcome"], "installed");
-    assert_eq!(audit[0]["reason"], Value::Null);
-    assert!(audit[0]["time"].as_str().unwrap().ends_with('Z'));
-    assert_eq!(
-        fs::metadata(&fx.host.audit).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-}
-
-/// A host with no `kbf` yet installs: `dpkg-query` exits 1 with nothing for an unknown
-/// package, and a package that was removed but not purged (`rc`) is the same.
-#[test]
-fn installing_over_nothing() {
-    for before in [
-        exec(1, "", "dpkg-query: no packages found matching kbf"),
-        ok("rc  1.0-1\n"),
-        ok("un  \n"),
-    ] {
-        let fx = Fx::new("host-fresh");
-        let runner = FakeRunner::new(vec![before, ok(""), ok(""), ok("ii  1.2.3-1\n")]);
-        let answer = fx.run(&runner, INSTALL);
-        assert_eq!(answer.code, 0, "{}", answer.err);
-        assert_eq!(answer.json()["result"], "installed");
-        assert_eq!(runner.calls().len(), 4);
-    }
-}
-
-/// Equal is a no-op that reports installed: exit 0, only the read ran. Equal means equal
-/// under dpkg's ordering, so `1.2.3-01` is the version `1.2.3-1` is.
-#[test]
-fn the_same_version_is_a_no_op() {
-    for installed in ["1.2.3-1", "1.2.3-01", "0:1.2.3-1"] {
-        let fx = Fx::new("host-equal");
-        let runner = FakeRunner::new(vec![ok(&format!("ii  {installed}\n"))]);
-        let answer = fx.run(&runner, INSTALL);
-        assert_eq!(answer.code, 0, "{installed}: {}", answer.err);
-        assert_eq!(
-            answer.json(),
-            json!({"result": "already_installed", "installed_version": installed, "unit_state": "not_run"})
-        );
-        assert_eq!(
-            runner.calls(),
-            vec![plan::installed_version()],
-            "nothing else ran"
-        );
-        assert_eq!(fx.audit_lines()[0]["outcome"], "already_installed");
-    }
-}
-
-/// A downgrade is refused with exit 2 and nothing but the read runs: an older upstream, an
-/// older revision, a higher epoch installed, and a release candidate of the same version.
-#[test]
-fn a_downgrade_is_refused() {
-    for installed in ["1.2.4-1", "1.2.3-2", "1:0.1-1", "2.0", "1.2.3-1+b1"] {
-        let fx = Fx::new("host-downgrade");
-        let runner = FakeRunner::new(vec![ok(&format!("ii  {installed}\n"))]);
-        let answer = fx.run(&runner, INSTALL);
-        assert_eq!(answer.code, 2, "{installed}");
-        assert_eq!(
-            answer.json(),
-            json!({"result": "refused", "reason": "older_than_installed"})
-        );
-        assert_eq!(runner.calls().len(), 1, "{installed}: nothing installed");
-        assert_eq!(fx.audit_lines()[0]["reason"], "older_than_installed");
-    }
-    let fx = Fx::new("host-rc");
-    let runner = FakeRunner::new(vec![ok("ii  1.2.3-1\n")]);
-    assert_eq!(
-        fx.run(&runner, "install kbf=1.2.3~rc1 from candidate").code,
-        2,
-        "an rc is older"
-    );
 }
 
 /// A request outside the grammar, a channel the allowlist does not name, or no request at
@@ -299,7 +202,7 @@ fn config_problems_refuse() {
 
     let fx = Fx::new("host-cfg-owner");
     let stranger = Host {
-        trust: Trust::owned_by(fs::metadata(&*fx.dir).unwrap().uid() + 1),
+        trust: Trust::owned_by(fs::metadata(&*fx.dir).unwrap().uid() + 1, &fx.dir),
         ..fx.host.clone()
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -332,21 +235,292 @@ fn config_problems_refuse() {
     assert!(runner.calls().is_empty(), "no refusal started a process");
 }
 
-/// `query` does not need the allowlist: it answers on a host with none.
+
+/// No install goes unrecorded: when the log cannot be opened, an install is not started
+/// (exit 3, no process), while a query and a refusal are answered with a warning on stderr.
+#[test]
+fn no_install_without_an_audit_log() {
+    let fx = Fx::new("host-no-audit");
+    write(&fx.host.audit, 0o644, "");
+    let runner = FakeRunner::new(vec![]);
+    let answer = fx.run(&runner, INSTALL);
+    assert_eq!(answer.code, 3);
+    assert_eq!(
+        answer.json(),
+        json!({"result": "failed", "reason": "audit_unavailable"})
+    );
+    assert!(answer.err.contains("audit"), "{}", answer.err);
+    assert!(runner.calls().is_empty(), "nothing ran");
+
+    let runner = FakeRunner::new(vec![ok("un  \n"), ok("")]);
+    let answer = fx.run(&runner, "query");
+    assert_eq!(answer.code, 0);
+    assert!(answer.err.contains("audit"));
+    let runner = FakeRunner::new(vec![]);
+    let answer = fx.run(&runner, "query x");
+    assert_eq!(answer.code, 2);
+    assert!(answer.err.contains("audit"));
+    assert_eq!(
+        fs::read_to_string(&fx.host.audit).unwrap(),
+        "",
+        "the unsafe log was left alone"
+    );
+}
+
+/// Nothing a request holds is echoed: stdout is the closed line, whatever came in.
+#[test]
+fn input_is_never_echoed() {
+    let fx = Fx::new("host-echo");
+    let runner = FakeRunner::new(vec![]);
+    let canary = "CANARY-1;\"\\";
+    let answer = fx.run(&runner, &format!("install kbf={canary} from candidate"));
+    assert!(!answer.out.contains("CANARY") && !answer.err.contains("CANARY"));
+}
+
+/// The production paths are the ones the packaging installs.
+#[test]
+fn production_paths() {
+    let host = Host::production();
+    assert_eq!(host.config, PathBuf::from("/etc/kbf/host-install.toml"));
+    assert_eq!(host.audit, PathBuf::from("/var/log/kbf-host-install.log"));
+    assert_eq!(
+        host.install_lock,
+        PathBuf::from("/run/kbf-host-install.lock")
+    );
+    assert_eq!(host.proc_locks, PathBuf::from("/proc/locks"));
+    assert_eq!(host.dpkg_lock, PathBuf::from("/var/lib/dpkg/lock-frontend"));
+    // The unit runs this very binary again, by the path it was started from.
+    assert!(host.self_exe.is_absolute(), "{:?}", host.self_exe);
+    assert_eq!(
+        host.self_exe,
+        std::env::current_exe().unwrap(),
+        "the test binary stands for the program here"
+    );
+    assert_eq!(SELF_EXE, "/usr/libexec/kbf/kbf-host-install");
+    assert_eq!(
+        Host::for_test(Path::new("/x"), Trust::root()).self_exe,
+        PathBuf::from(SELF_EXE)
+    );
+    assert_eq!(
+        host.trust.owns(&fs::metadata("/").unwrap()),
+        fs::metadata("/").unwrap().uid() == 0
+    );
+}
+
+// ---- the install, as the process sshd starts sees it: one unit, its answer relayed ----
+
+pub(super) fn channel(text: &str) -> Channel {
+    Channel::new(text).unwrap()
+}
+
+/// What the unit prints for `outcome`: its line and a newline.
+fn unit_says(outcome: &Outcome) -> String {
+    format!("{}\n", outcome.json_line())
+}
+
+fn installed(text: &str) -> Outcome {
+    Outcome::Installed {
+        version: text.into(),
+    }
+}
+
+/// A normal install, as the process sshd starts sees it: exactly one command runs, the
+/// install unit, and it is the plan's; its answer is the answer; the audit line says who,
+/// what and the outcome. This process does not hold the install lock while it waits (the unit
+/// does): a hold here would end with the ssh connection, with `dpkg` still running.
+#[test]
+fn an_install_starts_one_unit() {
+    let fx = Fx::new("host-install");
+    let lock = fx.host.install_lock.clone();
+    let runner = FakeRunner::new(vec![ok(&unit_says(&installed("1.2.3-1")))])
+        .before_each(move |_| assert!(!locks::flock_held(&lock), "the caller holds the lock"));
+    let answer = fx.run(&runner, INSTALL);
+    assert_eq!(answer.code, 0, "{}", answer.err);
+    assert_eq!(
+        answer.json(),
+        json!({"result": "installed", "installed_version": "1.2.3-1", "unit_state": "finished"})
+    );
+    assert_eq!(
+        runner.calls(),
+        vec![plan::unit_install(
+            &fx.host.self_exe,
+            &version("1.2.3-1"),
+            &channel("candidate")
+        )]
+    );
+    let audit = fx.audit_lines();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0]["verb"], "install");
+    assert_eq!(audit[0]["version"], "1.2.3-1");
+    assert_eq!(audit[0]["channel"], "candidate");
+    assert_eq!(audit[0]["outcome"], "installed");
+    assert_eq!(audit[0]["reason"], Value::Null);
+    assert!(audit[0]["time"].as_str().unwrap().ends_with('Z'));
+    assert_eq!(
+        fs::metadata(&fx.host.audit).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!locks::flock_held(&fx.host.install_lock), "none left");
+}
+
+/// Every answer the unit can give is the answer, with its exit status and its audit line:
+/// done, already done, each refusal (exit 2) and each failure (exit 3), with the failure's
+/// detail, from the unit's stderr, on stderr. Noise before the line (a unit may write
+/// anything) is not the answer; the last line is.
+#[test]
+fn the_unit_answer_is_relayed() {
+    let mut outcomes = vec![
+        installed("1.2.3-1"),
+        installed("1.2.3-01"),
+        Outcome::AlreadyInstalled {
+            version: "1.2.3-1".into(),
+        },
+    ];
+    outcomes.extend(Refusal::ALL.map(Outcome::Refused));
+    outcomes.extend(FailureCode::ALL.map(|code| Outcome::Failed(crate::outcome::Failure {
+        code,
+        detail: String::new(),
+    })));
+    for outcome in outcomes {
+        for noise in ["", "apt noise\n", "\n\n"] {
+            let fx = Fx::new("host-relay");
+            let stdout = format!("{noise}{}", unit_says(&outcome));
+            let runner = FakeRunner::new(vec![exec(outcome.exit_code().into(), &stdout, "E: why\n")]);
+            let answer = fx.run(&runner, INSTALL);
+            assert_eq!(answer.code, outcome.exit_code(), "{outcome:?}");
+            let want: Value = serde_json::from_str(&outcome.json_line()).unwrap();
+            assert_eq!(answer.json(), want, "{outcome:?}");
+            let audit = fx.audit_lines();
+            let (word, reason) = outcome.audit_fields();
+            assert_eq!(audit[0]["outcome"], word);
+            assert_eq!(audit[0]["reason"], json!(reason));
+            let failed = matches!(outcome, Outcome::Failed(_));
+            assert_eq!(answer.err.contains("E: why"), failed, "{outcome:?}: {}", answer.err);
+        }
+    }
+}
+
+/// The unit's answer is not believed past what was asked: a version other than the target
+/// (under dpkg's ordering) is a failed verification, and a unit that did not answer, or
+/// answered with something else, is an install failure, whatever its exit status.
+#[test]
+fn an_unintelligible_unit_is_an_install_failure() {
+    let wrong_version = [
+        installed("1.2.4-1"),
+        Outcome::AlreadyInstalled {
+            version: "1.2.2-1".into(),
+        },
+        installed("1.2.3-1+b1"),
+    ];
+    for outcome in wrong_version {
+        let fx = Fx::new("host-relay-wrong");
+        let runner = FakeRunner::new(vec![ok(&unit_says(&outcome))]);
+        let answer = fx.run(&runner, INSTALL);
+        assert_eq!(answer.code, 3, "{outcome:?}");
+        assert_eq!(answer.json()["reason"], "verify_failed", "{outcome:?}");
+    }
+    let query = r#"{"result":"query","installed_version":null,"running_commit":null,"in_progress":false}"#;
+    let cases = [
+        ("no output, exit 0", exec(0, "", "")),
+        ("no output, exit 1", exec(1, "", "Failed to start transient service unit")),
+        ("not json", exec(0, "done\n", "")),
+        ("a query line", exec(0, &format!("{query}\n"), "")),
+        ("killed by a signal", Ok(crate::runner::Exec { code: None, stdout: vec![], stderr: b"killed".to_vec() })),
+        ("cannot start", Err(std::io::Error::other("systemd-run: not found"))),
+        (
+            "a line cut short",
+            exec(0, "{\"result\":\"installed\",\"installed_ver", ""),
+        ),
+    ];
+    for (what, reply) in cases {
+        let fx = Fx::new("host-relay-lost");
+        let runner = FakeRunner::new(vec![reply]);
+        let answer = fx.run(&runner, INSTALL);
+        assert_eq!(answer.code, 3, "{what}");
+        assert_eq!(
+            answer.json(),
+            json!({"result": "failed", "reason": "install_failed"}),
+            "{what}"
+        );
+        assert!(!answer.err.is_empty(), "{what}: the cause is on stderr");
+        assert_eq!(fx.audit_lines()[0]["reason"], "install_failed");
+    }
+}
+
+/// Two installs cannot overlap: while the install lock is held (by the unit of another
+/// install) a second request is answered `busy` and starts nothing, so a second, older
+/// target cannot pass the not-older check against the same old version and then install over
+/// the first; and a repeat of the running install is `busy` and not a unit that systemd
+/// refuses by name. A lock file that cannot be asked about is busy too (idle is not
+/// proved). Once the holder is gone the same install goes through. A query takes no lock.
+#[test]
+fn an_overlapping_install_is_busy() {
+    let fx = Fx::new("host-busy");
+    let holder = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&fx.host.install_lock)
+        .unwrap();
+    holder.lock().unwrap();
+    let runner = FakeRunner::new(vec![]);
+    let answer = fx.run(&runner, INSTALL);
+    assert_eq!(answer.code, 3);
+    assert_eq!(answer.json(), json!({"result": "failed", "reason": "busy"}));
+    assert!(runner.calls().is_empty(), "nothing ran");
+    assert_eq!(fx.audit_lines().len(), 1, "the attempt is audited");
+
+    let runner = FakeRunner::new(vec![ok("un  \n"), ok("")]);
+    assert_eq!(fx.run(&runner, "query").code, 0);
+
+    drop(holder);
+    let runner = FakeRunner::new(vec![ok(&unit_says(&installed("1.2.3-1")))]);
+    assert_eq!(fx.run(&runner, INSTALL).code, 0);
+    assert_eq!(runner.calls().len(), 1);
+
+    let mut fx = Fx::new("host-busy-link");
+    let target = fx.dir.join("elsewhere");
+    fs::write(&target, "").unwrap();
+    let link = fx.dir.join("lock-link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    fx.host.install_lock = link;
+    let runner = FakeRunner::new(vec![]);
+    assert_eq!(fx.run(&runner, INSTALL).json()["reason"], "busy");
+    assert!(runner.calls().is_empty());
+}
+
+/// Every invocation adds exactly one audit line: a query, an install, a refusal.
+#[test]
+fn every_invocation_adds_exactly_one_line() {
+    let fx = Fx::new("host-lines");
+    let runner = FakeRunner::new(vec![
+        ok("un  \n"),
+        ok(""),
+        ok(&unit_says(&installed("1.2.3-1"))),
+    ]);
+    fx.run(&runner, "query");
+    fx.run(&runner, INSTALL);
+    fx.run(&runner, "query x");
+    assert_eq!(fx.audit_lines().len(), 3);
+}
+
+// ---- query ----
+
+/// `query` does not need the allowlist: it answers on a host with none, and says what it is
+/// (`result`: `query`) like every other answer.
 #[test]
 fn query_does_not_read_the_allowlist() {
     let fx = Fx::new("host-query-nocfg");
     fs::remove_file(&fx.host.config).unwrap();
-    let runner = FakeRunner::new(vec![ok("un  \n"), exec(3, "inactive\n", "")]);
+    let runner = FakeRunner::new(vec![ok("un  \n"), ok("")]);
     let answer = fx.run(&runner, "query");
     assert_eq!(answer.code, 0);
     assert_eq!(
         answer.json(),
-        json!({"installed_version": null, "running_commit": null, "in_progress": false})
+        json!({"result": "query", "installed_version": null, "running_commit": null, "in_progress": false})
     );
     assert_eq!(
         runner.calls(),
-        vec![plan::installed_version(), plan::units_active()]
+        vec![plan::installed_version(), plan::units_running()]
     );
     assert_eq!(fx.audit_lines()[0]["verb"], "query");
     assert_eq!(fx.audit_lines()[0]["outcome"], "query");
@@ -356,8 +530,11 @@ fn kbf_json(extra: &str) -> String {
     format!("{{\"profile\":\"release\",\"version\":\"0.1.0\"{extra}}}\n")
 }
 
+const UNIT_LISTING: &str =
+    "kbf-host-install-1.2.3-1.service loaded activating start start kbf-host-install\n";
+
 /// `query` on an installed host: the version, the commit the binary reports, and whether
-/// an install unit is active.
+/// an install is in progress.
 #[test]
 fn query_reports_version_commit_and_progress() {
     let fx = Fx::new("host-query");
@@ -367,25 +544,26 @@ fn query_reports_version_commit_and_progress() {
         ok(&kbf_json(&format!(
             ",\"commit\":\"0123456789ab\",\"commit_full\":\"{full}\""
         ))),
-        exec(0, "", ""),
+        ok(UNIT_LISTING),
     ]);
     let answer = fx.run(&runner, "query");
     assert_eq!(
         answer.json(),
-        json!({"installed_version": "1.2.3-1", "running_commit": full, "in_progress": true})
+        json!({"result": "query", "installed_version": "1.2.3-1", "running_commit": full, "in_progress": true})
     );
     assert_eq!(
         runner.calls(),
         vec![
             plan::installed_version(),
             plan::running_build(),
-            plan::units_active()
+            plan::units_running()
         ]
     );
 }
 
 /// The running commit falls back to the short commit, and is null when the build did not
-/// know it, when the binary fails or prints something else, or when it is not text.
+/// know it, when the binary fails, hangs (the runner kills it at its limit) or prints
+/// something else, or when it is not text.
 #[test]
 fn the_running_commit_is_best_effort() {
     for (what, reply, want) in [
@@ -422,19 +600,44 @@ fn the_running_commit_is_best_effort() {
             Err(std::io::Error::other("no such file")),
             Value::Null,
         ),
+        (
+            "hung and killed at the limit",
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "ran past its limit",
+            )),
+            Value::Null,
+        ),
     ] {
         let fx = Fx::new("host-commit");
-        let runner = FakeRunner::new(vec![ok("ii  1.2.3-1\n"), reply, exec(3, "", "")]);
+        let runner = FakeRunner::new(vec![ok("ii  1.2.3-1\n"), reply, ok("")]);
         let answer = fx.run(&runner, "query");
         assert_eq!(answer.code, 0, "{what}");
         assert_eq!(answer.json()["running_commit"], want, "{what}");
+        assert_eq!(answer.json()["installed_version"], "1.2.3-1", "{what}");
+        assert_eq!(runner.calls().len(), 3, "{what}: the rest was still asked");
     }
 }
 
-/// In progress is true when the unit is active, or when the dpkg lock is held, and false
-/// when neither; the lock is read from the lock table, so no lock is taken.
+/// The running build is asked under a limit: the command the query runs is the plan's, whose
+/// limit the runner keeps (a binary that hangs as root must not hang the query).
 #[test]
-fn in_progress_is_the_unit_or_the_lock() {
+fn the_running_build_has_a_limit() {
+    let fx = Fx::new("host-commit-limit");
+    let runner = FakeRunner::new(vec![ok("ii  1.2.3-1\n"), ok("{}"), ok("")]);
+    fx.run(&runner, "query");
+    let asked = runner.calls()[1].clone();
+    assert_eq!(asked.program, "/usr/bin/kbf");
+    assert_eq!(asked.timeout, Some(Duration::from_secs(10)));
+}
+
+/// An install is in progress when ANY of three things holds, and each alone is enough:
+/// the install flock is held (by the unit, the process doing the work), a `kbf-host-install-*`
+/// unit exists that is not over (the listing is not empty: `activating` and `deactivating` are
+/// in it, not only `active`), or some process holds the dpkg frontend lock (read from the lock
+/// table, so no lock is taken). With none of them it is false.
+#[test]
+fn in_progress_is_any_of_three_signals() {
     let fx = Fx::new("host-progress");
     write(&fx.host.dpkg_lock, 0o644, "");
     let meta = fs::metadata(&fx.host.dpkg_lock).unwrap();
@@ -445,31 +648,80 @@ fn in_progress_is_the_unit_or_the_lock() {
         rustix::fs::minor(dev),
         meta.ino()
     );
-    let ask = |unit: i32| {
-        let runner = FakeRunner::new(vec![
-            ok("ii  1.2.3-1\n"),
-            exec(1, "", ""),
-            exec(unit, "", ""),
-        ]);
+    let ask = |units: &str| {
+        let runner = FakeRunner::new(vec![ok("ii  1.2.3-1\n"), exec(1, "", ""), ok(units)]);
         fx.run(&runner, "query").json()["in_progress"]
             .as_bool()
             .unwrap()
     };
+    let flock = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&fx.host.install_lock)
+        .unwrap();
     write(&fx.host.proc_locks, 0o644, "");
-    assert!(!ask(3), "neither");
-    assert!(ask(0), "the unit alone");
+
+    assert!(!ask(""), "none of the three");
+    assert!(!ask("\n  \n"), "a listing of blanks is empty");
+    assert!(ask(UNIT_LISTING), "an activating unit alone");
+    assert!(
+        ask("kbf-host-install-1.2.3-1.service loaded active running x\n"),
+        "an active unit alone"
+    );
+    assert!(
+        ask("kbf-host-install-1.2.3-1.service loaded deactivating stop-sigterm x\n"),
+        "a deactivating unit alone"
+    );
+
+    flock.lock().unwrap();
+    assert!(ask(""), "the held flock alone: the unit that holds it is not listed");
+    assert!(ask(UNIT_LISTING), "flock and unit");
+    flock.unlock().unwrap();
+    assert!(!ask(""), "the flock released");
+
     write(&fx.host.proc_locks, 0o644, &line);
-    assert!(ask(3), "the lock alone");
-    assert!(ask(0), "both");
+    assert!(ask(""), "the dpkg lock alone");
+    write(&fx.host.proc_locks, 0o644, "");
+    assert!(!ask(""), "and gone");
 }
 
-/// A read that cannot be trusted is a failure with exit 3, not a guess: `dpkg-query` failing
-/// or printing nonsense, a package state that is neither installed nor absent, a version
-/// dpkg would not accept, and `systemctl` that cannot start.
+/// A query does not take the install lock for good: after it, an install can.
 #[test]
-fn unreadable_state_fails() {
-    type Reply = fn() -> std::io::Result<crate::runner::Exec>;
-    let cases: Vec<(&str, Reply, &str)> = vec![
+fn a_query_leaves_no_lock() {
+    let fx = Fx::new("host-query-lock");
+    let runner = FakeRunner::new(vec![ok("un  \n"), ok("")]);
+    fx.run(&runner, "query");
+    let file = fs::File::open(&fx.host.install_lock).unwrap();
+    file.try_lock().expect("the query's probe was let go");
+}
+
+/// A package that dpkg flags as needing a reinstall (`iiR`) is not cleanly installed: `query`
+/// reports no installed version for it (the updater then installs, and apt repairs it) and
+/// still answers, with exit 0.
+#[test]
+fn query_does_not_report_a_package_in_error() {
+    for status in ["iiR", "iiH", "iiX", "iiZ"] {
+        let fx = Fx::new("host-query-flag");
+        let runner = FakeRunner::new(vec![ok(&format!("{status} 1.2.3-1\n")), ok("")]);
+        let answer = fx.run(&runner, "query");
+        assert_eq!(answer.code, 0, "{status}");
+        assert_eq!(
+            answer.json(),
+            json!({"result": "query", "installed_version": null, "running_commit": null, "in_progress": false}),
+            "{status}"
+        );
+        assert_eq!(
+            runner.calls(),
+            vec![plan::installed_version(), plan::units_running()],
+            "{status}: no build is asked of a package that is not installed"
+        );
+    }
+}
+
+/// The reads that cannot be trusted, as `query` and as the install unit see them; the
+/// cases are shared by both.
+pub(super) fn unreadable_cases() -> Vec<(&'static str, fn() -> std::io::Result<crate::runner::Exec>, &'static str)> {
+    vec![
         (
             "dpkg-query exit 2",
             || exec(2, "", "dpkg-query: error"),
@@ -503,236 +755,136 @@ fn unreadable_state_fails() {
             || ok("ii  1.0\"1\n"),
             "installed_version_invalid",
         ),
-    ];
-    for (what, reply, reason) in cases {
-        for command in ["query", INSTALL] {
-            let fx = Fx::new("host-unreadable");
-            let runner = FakeRunner::new(vec![reply()]);
-            let answer = fx.run(&runner, command);
-            assert_eq!(answer.code, 3, "{what} / {command}");
-            assert_eq!(
-                answer.json(),
-                json!({"result": "failed", "reason": reason}),
-                "{what}"
-            );
-            assert_eq!(runner.calls().len(), 1, "{what}: nothing else ran");
-            assert_eq!(fx.audit_lines()[0]["reason"], reason);
-        }
-    }
-    let fx = Fx::new("host-systemctl");
-    let runner = FakeRunner::new(vec![
-        ok("ii  1.0-1\n"),
-        exec(1, "", ""),
-        Err(std::io::Error::other("gone")),
-    ]);
-    let answer = fx.run(&runner, "query");
-    assert_eq!(
-        (answer.code, answer.json()["reason"].as_str()),
-        (3, Some("query_failed"))
-    );
+    ]
 }
 
-/// A failing step stops the install: the update failing means no install ran, and the
-/// detail (cleaned) is on stderr, not stdout.
+/// A read that cannot be trusted is a failure with exit 3, not a guess: `dpkg-query` failing
+/// or printing nonsense, a package state that is neither installed nor absent, a version
+/// dpkg would not accept; and the systemd listing failing, or exiting non-zero.
 #[test]
-fn a_failed_update_stops_the_install() {
-    for reply in [
-        exec(100, "", "E: Failed to fetch\x1b[0m\n"),
-        Err(std::io::Error::other("systemd-run: not found")),
-    ] {
-        let fx = Fx::new("host-update-fails");
-        let runner = FakeRunner::new(vec![ok("ii  1.0-1\n"), reply]);
-        let answer = fx.run(&runner, INSTALL);
-        assert_eq!(answer.code, 3);
+fn unreadable_state_fails_the_query() {
+    for (what, reply, reason) in unreadable_cases() {
+        let fx = Fx::new("host-unreadable");
+        let runner = FakeRunner::new(vec![reply()]);
+        let answer = fx.run(&runner, "query");
+        assert_eq!(answer.code, 3, "{what}");
         assert_eq!(
             answer.json(),
-            json!({"result": "failed", "reason": "update_failed"})
+            json!({"result": "failed", "reason": reason}),
+            "{what}"
         );
-        assert!(
-            answer.err.contains("Failed to fetch") || answer.err.contains("not found"),
-            "{}",
-            answer.err
+        assert_eq!(runner.calls().len(), 1, "{what}: nothing else ran");
+        assert_eq!(fx.audit_lines()[0]["reason"], reason);
+    }
+    for (what, reply) in [
+        ("systemctl cannot start", Err(std::io::Error::other("gone"))),
+        ("systemctl exits 1", exec(1, "", "Failed to connect to bus")),
+        ("systemctl is killed", Ok(crate::runner::Exec { code: None, stdout: vec![], stderr: vec![] })),
+    ] {
+        let fx = Fx::new("host-systemctl");
+        let runner = FakeRunner::new(vec![ok("ii  1.0-1\n"), exec(1, "", ""), reply]);
+        let answer = fx.run(&runner, "query");
+        assert_eq!(
+            (answer.code, answer.json()["reason"].as_str()),
+            (3, Some("query_failed")),
+            "{what}"
         );
-        assert!(!answer.err.contains('\x1b'));
-        assert_eq!(runner.calls().len(), 2, "the install step did not run");
-        assert_eq!(fx.audit_lines()[0]["outcome"], "failed");
-        assert_eq!(fx.audit_lines()[0]["reason"], "update_failed");
     }
 }
 
-/// Some tools write their complaint to stdout: it is the detail when stderr is empty.
-#[test]
-fn the_detail_falls_back_to_stdout() {
-    let fx = Fx::new("host-detail");
-    let runner = FakeRunner::new(vec![ok("ii  1.0-1\n"), exec(100, "E: on stdout\n", "")]);
-    let answer = fx.run(&runner, INSTALL);
-    assert_eq!(answer.code, 3);
-    assert!(answer.err.contains("E: on stdout"), "{}", answer.err);
+// ---- which mode the process is in ----
+
+fn env(vars: &[(&str, &str)]) -> Environment {
+    Environment::from_vars(|name| {
+        vars.iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| OsString::from(value))
+    })
 }
 
-/// The install step failing is its own code.
+/// The environment is read from four sshd variables and the one unit variable, by name.
 #[test]
-fn a_failed_install_step() {
-    for reply in [
-        exec(100, "", "E: Unable to locate package kbf\n"),
-        Err(std::io::Error::other("gone")),
-    ] {
-        let fx = Fx::new("host-install-fails");
-        let runner = FakeRunner::new(vec![ok("ii  1.0-1\n"), ok(""), reply]);
-        let answer = fx.run(&runner, INSTALL);
-        assert_eq!(answer.code, 3);
-        assert_eq!(answer.json()["reason"], "install_failed");
-        assert_eq!(runner.calls().len(), 3);
-        assert!(!answer.err.is_empty());
+fn the_environment_is_read_by_name() {
+    assert_eq!(env(&[]), Environment::default());
+    assert!(!env(&[]).ssh_session);
+    assert_eq!(
+        env(&[("SSH_ORIGINAL_COMMAND", "query")]),
+        Environment {
+            ssh_original_command: Some("query".into()),
+            unit_request: None,
+            ssh_session: true,
+        }
+    );
+    for name in ["SSH_ORIGINAL_COMMAND", "SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] {
+        assert!(env(&[(name, "x")]).ssh_session, "{name}");
     }
+    assert!(!env(&[("SSH_AUTH_SOCK", "x"), ("HOME", "/root")]).ssh_session);
+    assert_eq!(
+        env(&[("KBF_HOST_INSTALL_UNIT", "install kbf=1 from c")]),
+        Environment {
+            ssh_original_command: None,
+            unit_request: Some("install kbf=1 from c".into()),
+            ssh_session: false,
+        }
+    );
+    assert_eq!(plan::UNIT_ENV, "KBF_HOST_INSTALL_UNIT");
+    // The real environment of this process is the same reading (cargo's variables are
+    // neither).
+    let process = Environment::from_process();
+    assert_eq!(
+        process.unit_request.is_some(),
+        std::env::var_os("KBF_HOST_INSTALL_UNIT").is_some()
+    );
 }
 
-/// An install that ends well but leaves another version (or cannot be read back) is not
-/// reported installed.
+/// The unit mode is reachable only from systemd: the variable alone starts it, and any sign
+/// of an ssh session (the request, the connection, the client, a terminal) makes the
+/// variable count for nothing and the process an ordinary request handler. Catches an
+/// ssh client that sets the variable (sshd passes variables the host's `AcceptEnv` names)
+/// and reaches the install body without the audit line and the checks of the front.
 #[test]
-fn an_install_is_verified() {
-    for after in [
-        ok("ii  1.0-1\n"),
-        ok("un  \n"),
-        exec(2, "", "boom"),
-        ok("ii  1.2.3-1+b1\n"),
-    ] {
-        let fx = Fx::new("host-verify");
-        let runner = FakeRunner::new(vec![ok("ii  1.0-1\n"), ok(""), ok(""), after]);
-        let answer = fx.run(&runner, INSTALL);
-        assert_eq!(answer.code, 3);
-        assert_eq!(answer.json()["reason"], "verify_failed");
+fn the_unit_mode_is_not_reachable_over_ssh() {
+    let request = "install kbf=1.2.3-1 from candidate";
+    // Alone: the unit body runs (its first command is the package read under the lock).
+    let fx = Fx::new("host-dispatch-unit");
+    let runner = FakeRunner::new(vec![exec(1, "", "no packages"), ok(""), ok(""), ok("ii  1.2.3-1\n")]);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = dispatch(
+        &fx.host,
+        &runner,
+        &env(&[("KBF_HOST_INSTALL_UNIT", request)]),
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    assert_eq!(runner.calls().len(), 4);
+    assert!(fx.audit_lines().is_empty(), "the unit does not audit; its starter did");
+
+    // With any one ssh variable: the unit variable is ignored, the process is an ordinary
+    // request handler, and the request (none, or not one) is refused and audited.
+    for name in ["SSH_ORIGINAL_COMMAND", "SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] {
+        let fx = Fx::new("host-dispatch-ssh");
+        let runner = FakeRunner::new(vec![]);
+        let vars = [("KBF_HOST_INSTALL_UNIT", request), (name, "x")];
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = dispatch(&fx.host, &runner, &env(&vars), &mut out, &mut err);
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(code, 2, "{name}: {text}");
+        assert!(text.contains("bad_command"), "{name}: {text}");
+        assert!(runner.calls().is_empty(), "{name}: the install body did not run");
+        assert_eq!(fx.audit_lines().len(), 1, "{name}: audited as a request");
     }
-}
 
-/// No install goes unrecorded: when the log cannot be opened, an install is not started
-/// (exit 3, no process), while a query and a refusal are answered with a warning on stderr.
-#[test]
-fn no_install_without_an_audit_log() {
-    let fx = Fx::new("host-no-audit");
-    write(&fx.host.audit, 0o644, "");
-    let runner = FakeRunner::new(vec![]);
-    let answer = fx.run(&runner, INSTALL);
-    assert_eq!(answer.code, 3);
-    assert_eq!(
-        answer.json(),
-        json!({"result": "failed", "reason": "audit_unavailable"})
+    // No variable: the ordinary handler, whatever the session.
+    let fx = Fx::new("host-dispatch-plain");
+    let runner = FakeRunner::new(vec![ok("un  \n"), ok("")]);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = dispatch(
+        &fx.host,
+        &runner,
+        &env(&[("SSH_ORIGINAL_COMMAND", "query")]),
+        &mut out,
+        &mut err,
     );
-    assert!(answer.err.contains("audit"), "{}", answer.err);
-    assert!(runner.calls().is_empty(), "nothing ran");
-
-    let runner = FakeRunner::new(vec![ok("un  \n"), exec(3, "", "")]);
-    let answer = fx.run(&runner, "query");
-    assert_eq!(answer.code, 0);
-    assert!(answer.err.contains("audit"));
-    let runner = FakeRunner::new(vec![]);
-    let answer = fx.run(&runner, "query x");
-    assert_eq!(answer.code, 2);
-    assert!(answer.err.contains("audit"));
-    assert_eq!(
-        fs::read_to_string(&fx.host.audit).unwrap(),
-        "",
-        "the unsafe log was left alone"
-    );
-}
-
-/// The audit line is the last thing written: when it cannot be written after a run the
-/// outcome stands. (A log that is full cannot be made in a test; a log removed between the
-/// open and the write still accepts the write, so this checks the line exists once.)
-#[test]
-fn every_invocation_adds_exactly_one_line() {
-    let fx = Fx::new("host-lines");
-    let runner = FakeRunner::new(vec![
-        ok("un  \n"),
-        exec(3, "", ""),
-        ok("ii  1.2.3-1\n"),
-        ok("un  \n"),
-    ]);
-    fx.run(&runner, "query");
-    fx.run(&runner, INSTALL);
-    fx.run(&runner, "query x");
-    assert_eq!(fx.audit_lines().len(), 3);
-}
-
-/// Nothing a request holds is echoed: stdout is the closed line, whatever came in.
-#[test]
-fn input_is_never_echoed() {
-    let fx = Fx::new("host-echo");
-    let runner = FakeRunner::new(vec![]);
-    let canary = "CANARY-1;\"\\";
-    let answer = fx.run(&runner, &format!("install kbf={canary} from candidate"));
-    assert!(!answer.out.contains("CANARY") && !answer.err.contains("CANARY"));
-}
-
-/// Two installs cannot overlap: while another invocation holds the install lock, an
-/// install is answered `busy` and runs nothing (so a second, older target cannot pass the
-/// not-older check against the same old version and then install over the first). Once
-/// the holder is gone the same install goes through.
-#[test]
-fn an_overlapping_install_is_busy() {
-    let fx = Fx::new("host-busy");
-    let holder = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&fx.host.install_lock)
-        .unwrap();
-    holder.lock().unwrap();
-    let runner = FakeRunner::new(vec![]);
-    let answer = fx.run(&runner, INSTALL);
-    assert_eq!(answer.code, 3);
-    assert_eq!(answer.json(), json!({"result": "failed", "reason": "busy"}));
-    assert!(runner.calls().is_empty(), "nothing ran");
-    assert_eq!(fx.audit_lines().len(), 1, "the attempt is audited");
-
-    // A query does not take the lock.
-    let runner = FakeRunner::new(vec![ok("un  \n"), exec(3, "", "")]);
-    assert_eq!(fx.run(&runner, "query").code, 0);
-
-    drop(holder);
-    let runner = install_script("ii  1.0-1\n", "ii  1.2.3-1\n");
-    assert_eq!(fx.run(&runner, INSTALL).code, 0);
-    // And the lock is released at the end of that install.
-    let runner = FakeRunner::new(vec![ok("ii  1.2.3-1\n")]);
-    assert_eq!(fx.run(&runner, INSTALL).code, 0);
-}
-
-/// A lock file that cannot be opened fails the install closed, before anything runs.
-#[test]
-fn an_unusable_lock_file_fails_closed() {
-    let mut fx = Fx::new("host-lock-missing");
-    fx.host.install_lock = fx.dir.join("no-such-dir").join("lock");
-    let runner = FakeRunner::new(vec![]);
-    let answer = fx.run(&runner, INSTALL);
-    assert_eq!(answer.code, 3);
-    assert_eq!(answer.json()["reason"], "lock_unavailable");
-    assert!(runner.calls().is_empty());
-
-    // A symbolic link in its place is not followed.
-    let target = fx.dir.join("elsewhere");
-    fs::write(&target, "").unwrap();
-    let link = fx.dir.join("lock-link");
-    std::os::unix::fs::symlink(&target, &link).unwrap();
-    fx.host.install_lock = link;
-    assert_eq!(
-        fx.run(&runner, INSTALL).json()["reason"],
-        "lock_unavailable"
-    );
-}
-
-/// The production paths are the ones the packaging installs.
-#[test]
-fn production_paths() {
-    let host = Host::production();
-    assert_eq!(host.config, PathBuf::from("/etc/kbf/host-install.toml"));
-    assert_eq!(host.audit, PathBuf::from("/var/log/kbf-host-install.log"));
-    assert_eq!(
-        host.install_lock,
-        PathBuf::from("/run/kbf-host-install.lock")
-    );
-    assert_eq!(host.proc_locks, PathBuf::from("/proc/locks"));
-    assert_eq!(host.dpkg_lock, PathBuf::from("/var/lib/dpkg/lock-frontend"));
-    assert_eq!(
-        host.trust.owns(&fs::metadata("/").unwrap()),
-        fs::metadata("/").unwrap().uid() == 0
-    );
+    assert_eq!(code, 0);
 }

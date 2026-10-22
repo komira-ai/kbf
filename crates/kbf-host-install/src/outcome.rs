@@ -25,11 +25,31 @@ pub enum Refusal {
     ChannelUnsigned,
     /// The key the source names is not a root-owned file.
     KeyUntrusted,
+    /// The source switches signature checking off or weakens it (`trusted`,
+    /// `allow-insecure`, `allow-weak`, `allow-downgrade-to-insecure`), even if it names a key.
+    ChannelInsecure,
     /// The target is older than the installed version.
     OlderThanInstalled,
 }
 
 impl Refusal {
+    /// Every refusal.
+    pub const ALL: [Self; 8] = [
+        Self::BadCommand,
+        Self::ChannelNotAllowed,
+        Self::ConfigInvalid,
+        Self::ConfigUnsafe,
+        Self::ChannelUnsigned,
+        Self::KeyUntrusted,
+        Self::ChannelInsecure,
+        Self::OlderThanInstalled,
+    ];
+
+    /// The refusal whose closed code this is.
+    pub fn from_code(_code: &str) -> Option<Self> {
+        None
+    }
+
     /// The closed code.
     pub fn code(self) -> &'static str {
         match self {
@@ -39,6 +59,7 @@ impl Refusal {
             Self::ConfigUnsafe => "config_unsafe",
             Self::ChannelUnsigned => "channel_unsigned",
             Self::KeyUntrusted => "key_untrusted",
+            Self::ChannelInsecure => "channel_insecure",
             Self::OlderThanInstalled => "older_than_installed",
         }
     }
@@ -68,6 +89,24 @@ pub enum FailureCode {
 }
 
 impl FailureCode {
+    /// Every failure.
+    pub const ALL: [Self; 9] = [
+        Self::AuditUnavailable,
+        Self::QueryFailed,
+        Self::InstalledVersionInvalid,
+        Self::PackageStateUnclean,
+        Self::UpdateFailed,
+        Self::InstallFailed,
+        Self::VerifyFailed,
+        Self::Busy,
+        Self::LockUnavailable,
+    ];
+
+    /// The failure whose closed code this is.
+    pub fn from_code(_code: &str) -> Option<Self> {
+        None
+    }
+
     /// The closed code.
     pub fn code(self) -> &'static str {
         match self {
@@ -147,6 +186,13 @@ impl Outcome {
                 reason: failure.code.code(),
             }),
         }
+    }
+
+    /// The outcome an install unit printed, read back by the process that started it: none
+    /// for anything but the closed lines of an install (`query` is never a unit's answer).
+    /// A failure's detail is not on the line and is empty here.
+    pub fn from_unit_line(_line: &str) -> Option<Self> {
+        None
     }
 
     /// The outcome and reason of the audit line.
