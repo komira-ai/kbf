@@ -970,10 +970,10 @@ mkpk8() {
 }
 do_BR8() {
   mkpk8 || return 1
-  BT=900 build_env xcodebuild -scheme Pk8 -destination 'platform=macOS' -derivedDataPath "$L/dd8" -skipPackagePluginValidation build >"$L/xb.log" 2>&1; _b=$?
+  BT=900 build_env xcodebuild -scheme Pk8 -destination 'platform=macOS' -derivedDataPath "$L/dd8" -skipPackagePluginValidation -IDEPackageSupportDisableManifestSandbox YES -IDEPackageSupportDisablePluginExecutionSandbox YES build >"$L/xb.log" 2>&1; _b=$?
   echo "xcodebuild build rc=$_b $(grep -E 'BUILD (SUCCEEDED|FAILED)|error:|Could not|fatal|denied|not permitted|failed' "$L/xb.log" | head -n 8 | cut -c1-260 | tr '\n' '|')"
   [ "$_b" = 0 ] || return 1
-  BT=900 build_env xcodebuild -scheme Pk8 -destination 'platform=macOS' -derivedDataPath "$L/dd8" -skipPackagePluginValidation test >"$L/xt.log" 2>&1; _t=$?
+  BT=900 build_env xcodebuild -scheme Pk8 -destination 'platform=macOS' -derivedDataPath "$L/dd8" -skipPackagePluginValidation -IDEPackageSupportDisableManifestSandbox YES -IDEPackageSupportDisablePluginExecutionSandbox YES test >"$L/xt.log" 2>&1; _t=$?
   echo "xcodebuild test rc=$_t $(grep -E 'Executed|Test run with|TEST (SUCCEEDED|FAILED)|error:|Could not|fatal|denied|not permitted|failed' "$L/xt.log" | head -n 8 | cut -c1-260 | tr '\n' '|')"
   [ "$_t" = 0 ]
 }
@@ -986,7 +986,7 @@ do_BR8i() {
   [ -n "$_rt" ] && [ -n "$_dt" ] || { echo "no iOS runtime or device type"; return 77; }
   _u=$(build_env xcrun simctl create "$M" "$_dt" "$_rt") || { echo "simctl create failed"; return 1; }
   build_env xcrun simctl boot "$_u" 2>&1 | head -2
-  BT=1200 build_env xcodebuild -scheme Pk8 -destination "platform=iOS Simulator,id=$_u" -derivedDataPath "$L/ddi" -skipPackagePluginValidation test >"$L/xi.log" 2>&1; _t=$?
+  BT=1200 build_env xcodebuild -scheme Pk8 -destination "platform=iOS Simulator,id=$_u" -derivedDataPath "$L/ddi" -skipPackagePluginValidation -IDEPackageSupportDisableManifestSandbox YES -IDEPackageSupportDisablePluginExecutionSandbox YES test >"$L/xi.log" 2>&1; _t=$?
   echo "xcodebuild test (iOS simulator) rc=$_t $(grep -E 'Executed|Test run with|TEST (SUCCEEDED|FAILED)|error:|Could not|fatal|denied|not permitted|failed' "$L/xi.log" | head -n 8 | cut -c1-260 | tr '\n' '|')"
   [ "$_t" = 0 ]
 }
