@@ -15,8 +15,8 @@ use kbf_storage::StorageError;
 use kbf_types::Digest;
 
 use super::support::{
-    Cluster, Node, active, blob_read_from, blob_where, blob_written_to, blobs_with_primary, collect,
-    map, member, router, sha, unavailable, view,
+    Cluster, Node, active, blob_read_from, blob_where, blob_written_to, blobs_with_primary,
+    collect, map, member, router, sha, unavailable, view,
 };
 
 /// How long the routers of these tests hold a call.

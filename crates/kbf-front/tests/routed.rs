@@ -1001,8 +1001,8 @@ async fn a_call_no_owner_answers_is_held_for_the_bound() {
     farm.set(1, &[MemberState::Active], 1);
     farm.plain.take_down(1);
     let bound = Duration::from_millis(300);
-    let routed = Routed::new(farm.cell.clone(), farm.plain.clone(), farm.plain.clone())
-        .with_hold(bound);
+    let routed =
+        Routed::new(farm.cell.clone(), farm.plain.clone(), farm.plain.clone()).with_hold(bound);
     let started = Instant::now();
 
     let error = routed
