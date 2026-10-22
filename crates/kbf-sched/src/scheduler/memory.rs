@@ -512,6 +512,18 @@ impl Scheduler {
         self.memory.key_floors.get(&size_key)
     }
 
+    /// The key floor of `size_key` as the state store keeps it (with its stamp), if the
+    /// scheduler holds one.
+    #[must_use]
+    pub fn key_floor_row(&self, size_key: u64) -> Option<KeyFloor> {
+        let (ask, stamp) = self.memory.key_floors.stamped(&size_key)?;
+        Some(KeyFloor {
+            key: size_key,
+            ask,
+            stamp,
+        })
+    }
+
     /// The bound a key floor of `request` stays strictly below, in bytes: the memory of
     /// the largest live node (cordoned or not) that serves its lease kind, satisfies its
     /// platform and holds its CPU and GPU request. A booking at or above a node's memory

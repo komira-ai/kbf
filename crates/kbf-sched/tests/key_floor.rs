@@ -727,6 +727,8 @@ fn a_lowered_key_floor_is_what_the_next_operation_books() {
     assert_eq!(f.s.lower_key_floor(KEY, 16 * GIB), None, "no change");
     let row = f.s.lower_key_floor(KEY, 8 * GIB).expect("lowered");
     assert_eq!((row.key, row.ask), (KEY, 8 * GIB));
+    assert_eq!(f.s.key_floor_row(KEY), Some(row), "as the store keeps it");
+    assert_eq!(f.s.key_floor_row(KEY + 1), None);
     assert_eq!(f.s.key_floor(KEY), Some(8 * GIB));
     f.submit_keyed(2, request(2, 4 * GIB), KEY);
     assert_eq!(only(f.tick()).resources.memory_bytes, 8 * GIB);
