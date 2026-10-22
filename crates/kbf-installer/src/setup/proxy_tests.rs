@@ -497,15 +497,10 @@ fn flags_the_proxy_makes_pointless_are_refused() {
 }
 
 /// Catches `--proxy` accepted where the proxy cannot serve (it starts `kbf --mode=frontend`
-/// children), and its helper flags accepted without it.
+/// children, and beside an all-in-one host's sibling), and its helper flags accepted without it.
 #[test]
 fn the_proxy_flags_belong_to_a_frontend_and_to_each_other() {
-    for mode in [
-        Mode::AllInOne,
-        Mode::Daemon,
-        Mode::Storage,
-        Mode::StorageAndDaemon,
-    ] {
+    for mode in [Mode::Daemon, Mode::Storage, Mode::StorageAndDaemon] {
         let raw = Raw {
             proxy: proxy_raw().proxy,
             ..raw(mode)
@@ -518,12 +513,13 @@ fn the_proxy_flags_belong_to_a_frontend_and_to_each_other() {
         );
         assert!(exec.log.is_empty(), "{mode:?}");
     }
-    let without: [(&str, ProxyEdit); 3] = [
+    let without: [(&str, ProxyEdit); 4] = [
         ("--proxy-base-port", |p| p.proxy_base_port = Some(18_000)),
         ("--buck2-auth", |p| p.buck2_auth = Some(AuthFlag::None)),
         ("--buck2-token-file", |p| {
             p.buck2_token_file = some("/etc/kbf/bearer")
         }),
+        ("--storage-port", |p| p.storage_port = Some(8990)),
     ];
     for (flag, edit) in without {
         let mut raw = Raw {
