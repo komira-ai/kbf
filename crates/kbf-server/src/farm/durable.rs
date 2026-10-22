@@ -55,8 +55,17 @@
 //!   Never in the transaction of a requeue or a finish: a summary an own-limit kill changed
 //!   is written right after it, best effort, and the rest is written behind, in batches;
 //!   a sweep deletes the stale. Read only when the shadow is on;
-//! - `meta/epoch`, `meta/next_op`, `meta/next_seq`: the store incarnation and the first
-//!   operation id and lease sequence no earlier start used;
+//! - `meta/epoch`, `meta/next_op`, `meta/next_seq`: the store incarnation, and the first
+//!   operation id and lease sequence no frontend has reserved. A frontend reserves a block
+//!   of [`ID_BLOCK`] ids of either with one compare-and-set write of `max(stored, its own
+//!   next) + ID_BLOCK` (read again and tried again when another frontend wrote first) and
+//!   numbers inside the block, so the stored value never goes back and no two frontends,
+//!   and no restarted one, take an id twice. The `op/` and `lease/` rows of a finished
+//!   operation are deleted, so their absence guards no id. The value is eight bytes,
+//!   big-endian, as it was when each id was written as it was taken, so no new row or
+//!   format is needed: a store from that time reads as one whose blocks are spent. The
+//!   epoch row is created with an absent-only write, and a frontend that loses that race
+//!   reads the other's;
 //! - `meta/generation`: the writer generation ([`kbf_state::Fenced`]); every write of the
 //!   scheduler is checked against it, and operation names carry it.
 //!
@@ -65,8 +74,9 @@
 //! decides what a row may hold.
 
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_estimator::{Day, Summaries};
@@ -96,6 +106,8 @@ use crate::machine::Platform;
 use crate::state_store::StateStore;
 
 use self::inflight::Submitted;
+
+pub use self::blocks::ID_BLOCK;
 
 /// How often a daemon session's row in the store is renewed while the daemon heartbeats:
 /// a third of the lease grace, so the row outlives two missed renewals. One write per
@@ -129,6 +141,15 @@ pub enum EpochPolicy {
     /// Take the next one: the start is a new incarnation, and a daemon that sees it
     /// kills the runs of the leases it held before.
     Bump,
+}
+
+/// An operator's raise of the stored epoch ([`Farm::bump_epoch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpochBump {
+    /// The epoch the store held before.
+    pub previous: u64,
+    /// The epoch it holds now.
+    pub epoch: u64,
 }
 
 /// Why the state store could not be read or written.
@@ -167,9 +188,9 @@ pub enum StateError {
 /// What a store holds of the scheduler, as a start reads it.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Stored {
-    /// The first operation id no earlier start used.
+    /// The first operation id no frontend has reserved.
     pub next_operation: u64,
-    /// The first lease sequence no earlier start used.
+    /// The first lease sequence no frontend has reserved.
     pub next_seq: u64,
     /// Every unfinished operation, in id order.
     pub operations: Vec<StoredOperation>,
@@ -269,6 +290,7 @@ impl StoredOperation {
     }
 }
 
+mod blocks;
 mod estimate;
 mod fate;
 mod floor;
@@ -334,6 +356,9 @@ pub(super) struct Durable {
     /// scheduler was superseded and takes no more work. Never cleared; unlike an outage,
     /// the store coming back does not end it.
     pub(super) fenced: AtomicBool,
+    /// The operation ids this handle reserved last ([`Durable::reserve_operation`]):
+    /// numbered inside it, and no other frontend takes one of them.
+    ops: Mutex<Range<u64>>,
 }
 
 impl std::fmt::Debug for Durable {
@@ -440,22 +465,13 @@ impl Durable {
         policy: EpochPolicy,
         first: u64,
     ) -> Result<(Self, u64), StateError> {
-        let row = store.get(EPOCH)?;
-        let (epoch, write) = match (&row, policy) {
-            (None, _) => (first, Some(Cond::Absent)),
-            (Some(row), EpochPolicy::Keep) => (number(EPOCH, row)?, None),
-            (Some(row), EpochPolicy::Bump) => {
-                (number(EPOCH, row)? + 1, Some(Cond::Version(row.version)))
-            }
-        };
         let durable = Self {
             store,
             unreachable: AtomicBool::new(false),
             fenced: AtomicBool::new(false),
+            ops: Mutex::new(0..0),
         };
-        if let Some(cond) = write {
-            durable.commit(Txn::new().put(EPOCH, epoch.to_be_bytes(), cond))?;
-        }
+        let epoch = durable.settle_epoch(policy, first)?;
         Ok((durable, epoch))
     }
 
@@ -707,8 +723,7 @@ impl Durable {
                 subject::encode(subject),
                 Cond::Absent,
             )
-            .put(queue_key(operation), Vec::new(), Cond::Absent)
-            .put(NEXT_OP, (operation.0 + 1).to_be_bytes(), Cond::Any))
+            .put(queue_key(operation), Vec::new(), Cond::Absent))
     }
 
     /// A grant committed: the operation leaves the queue and holds `grant`'s lease. The
@@ -725,8 +740,7 @@ impl Durable {
         self.commit(
             Txn::new()
                 .delete(queued, Cond::Version(row.version))
-                .put(lease_key(start.lease), value, Cond::Absent)
-                .put(NEXT_SEQ, (start.lease.seq + 1).to_be_bytes(), Cond::Any),
+                .put(lease_key(start.lease), value, Cond::Absent),
         )
     }
 
@@ -955,8 +969,13 @@ impl Farm {
     /// [`StateStore::epoch`] decides: kept, a daemon that reconnects keeps the runs of
     /// its leases; bumped, it kills them. Call it before the farm serves anything.
     ///
+    /// The farm numbers its operations and leases in blocks it reserves in the store
+    /// ([`ID_BLOCK`] ids at a time); the first blocks are reserved here, past every id any
+    /// frontend of the store reserved before.
+    ///
     /// # Errors
-    /// The store cannot be read, or holds a row that is not one the scheduler wrote.
+    /// The store cannot be read or written, or holds a row that is not one the scheduler
+    /// wrote.
     pub fn with_state(mut self, state: Option<StateStore>) -> Result<Self, StateError> {
         let state_of_farm = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         let epoch = state_of_farm.keep_in(state)?;
@@ -980,6 +999,19 @@ impl Farm {
             .durable
             .as_ref()
             .map_or(Ok(None), |d| d.ended(operation))
+    }
+
+    /// Raises the epoch the state store holds by one, and returns the epoch before and the
+    /// one stored now; `None` if the farm has no state store. This farm keeps the epoch it
+    /// started under (its leases and its `Welcome` name it): the stored one is read by a
+    /// frontend when it starts, so the daemons drop the leases of the older epoch when
+    /// they reach a frontend started after the bump.
+    ///
+    /// # Errors
+    /// The store cannot be read or written, or holds no epoch.
+    pub fn bump_epoch(&self) -> Result<Option<EpochBump>, StateError> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.durable.as_ref().map(Durable::bump_epoch).transpose()
     }
 }
 
@@ -1298,14 +1330,20 @@ impl State {
         for op in stored.operations {
             recovered.push(self.take_stored(op, now));
         }
-        let next_operation = OperationId(stored.next_operation);
+        // The first blocks of ids are reserved here, past everything any frontend of the
+        // store reserved, and the scheduler numbers inside them from now on. Every start
+        // reserves, so a start never takes an id an earlier one took, whether or not the
+        // rows of the operations that used them are still there.
+        let first_operation = durable.reserve_operation(OperationId(stored.next_operation))?;
+        let seqs = durable.reserve_seqs(stored.next_seq)?;
         self.sched.restore_floors(stored.floors);
         // Off reads no size summaries and leaves them as they are.
         if !self.learned.off() {
             self.learned.restore(&durable.estimates()?);
         }
         self.sched
-            .recover(epoch, next_operation, stored.next_seq, recovered);
+            .recover(epoch, first_operation, seqs.start, recovered);
+        self.sched.use_seq_block(seqs);
         self.restore_cordons(stored.cordons);
         self.durable = Some(durable);
         Ok(Some(epoch))
@@ -1322,9 +1360,12 @@ impl State {
         if self.sched.twin(request).is_some() {
             return Ok(());
         }
-        let id = self.sched.next_operation();
+        let wanted = self.sched.next_operation();
         let mut submitted = None;
         let taken = self.durably("a submission", |d| {
+            // The id comes from the block this frontend reserved: the operation's row
+            // is put under an id no other frontend takes.
+            let id = d.reserve_operation(wanted)?;
             submitted = Some(d.submit(id, request, subject)?);
             Ok(())
         });
@@ -1388,6 +1429,8 @@ impl State {
     }
 }
 
+#[cfg(test)]
+mod blocks_tests;
 #[cfg(test)]
 mod submit_tests;
 #[cfg(test)]

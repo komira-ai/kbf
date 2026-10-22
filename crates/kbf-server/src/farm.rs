@@ -72,7 +72,7 @@ mod phase;
 mod record;
 pub mod sched_view;
 
-pub use durable::{DONE_FLOOR, EpochPolicy, SESSION_RENEWAL, StateError};
+pub use durable::{DONE_FLOOR, EpochBump, EpochPolicy, ID_BLOCK, SESSION_RENEWAL, StateError};
 pub use handover::UNTRACED_LOOKS;
 pub use phase::Reported;
 
@@ -1256,6 +1256,7 @@ impl State {
     /// answers, for the caller to deliver once the lock is released.
     fn carry_out(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
         self.watch_store(now);
+        self.reserve_seqs();
         self.learned.clock(now);
         // Only the inputs whose callers deliver answers ([`State::feed_quiet`]) release
         // effects an earlier refusal held back: one of them may be an answer.

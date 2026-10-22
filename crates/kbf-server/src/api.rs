@@ -41,6 +41,12 @@
 //!   sent GOAWAY, open streams run until their action is done, and the server exits
 //!   when they have. It is not undone: a drained frontend is restarted.
 //!
+//! - `POST /v1/epoch/bump`: raises the epoch the state store holds by one ([`Farm::bump_epoch`])
+//!   and answers `{"previous", "epoch", "serving"}`. A frontend reads the stored epoch when
+//!   it starts and keeps it, so daemons drop the leases of the older epoch when they reach a
+//!   frontend started after the bump; the one that answers goes on serving the epoch it
+//!   started under (`serving`). The operator's step after a restore from a backup.
+//!
 //! - `/v1/enroll/...`: the enrollment tokens and the node registry ([`crate::enroll::api`]).
 //!   Every one of these routes, a GET included, passes the gates below.
 //!
@@ -71,12 +77,13 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use kbf_map::{DenyEntry, Map, MemberId, MemberState};
+use kbf_state::StoreError;
 use kbf_types::WorkerId;
 use serde::{Deserialize, Serialize};
 
 use crate::drain::{Drain, DrainStatus};
 use crate::enroll::api::EnrollApi;
-use crate::farm::{Farm, NodeAction};
+use crate::farm::{EpochBump, Farm, NodeAction, StateError};
 use crate::fleet::ProtocolSummary;
 use crate::members::{Members, MembershipError};
 use crate::proxy_auth::{Caller, Trust};
@@ -98,6 +105,9 @@ pub const DRAIN_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 /// The path of the frontend's drain: `GET` reads it, `POST` begins it.
 pub const FRONTEND_DRAIN: &str = "/v1/frontend/drain";
+
+/// The path of `POST /v1/epoch/bump`.
+pub const EPOCH_BUMP: &str = "/v1/epoch/bump";
 
 /// The path of `GET /v1/nodes`.
 pub const NODES: &str = "/v1/nodes";
@@ -170,6 +180,7 @@ pub fn router(
         .route("/v1/members/{id}/safe-to-stop", get(safe_to_stop::check))
         .route(DENIED, post(deny_entry).delete(allow_entry))
         .route(FRONTEND_DRAIN, get(drain_status).post(begin_drain))
+        .route(EPOCH_BUMP, post(bump_epoch))
         .with_state(Arc::new(ApiState {
             farm,
             token,
@@ -218,6 +229,65 @@ async fn begin_drain(
         tracing::info!("frontend drain begun by the operator API");
     }
     json(StatusCode::OK, &status(&api))
+}
+
+async fn bump_epoch(
+    State(api): State<Arc<ApiState>>,
+    peer: Caller,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err((code, why)) = gate(api.token.as_ref(), &peer, &headers) {
+        return error(code, &why);
+    }
+    if !body.is_empty()
+        && let Err(e) = serde_json::from_slice::<NoBody>(&body)
+    {
+        let why = format!("an epoch bump takes no body, or {{}}: {e}");
+        return error(StatusCode::BAD_REQUEST, &why);
+    }
+    // The store's calls block (its trait says so).
+    let farm = Arc::clone(&api.farm);
+    let bumped = tokio::task::spawn_blocking(move || farm.bump_epoch()).await;
+    epoch_answer(api.farm.lease_epoch(), bumped)
+}
+
+/// The answer to an epoch bump, from what the blocking call returned: the epoch before it
+/// and the epoch stored now, and `serving`, the epoch this frontend started under and goes
+/// on serving. A server with no state store has no epoch to raise (404).
+fn epoch_answer(
+    serving: u64,
+    bumped: Result<Result<Option<EpochBump>, StateError>, tokio::task::JoinError>,
+) -> Response {
+    match bumped {
+        Ok(Ok(Some(EpochBump { previous, epoch }))) => {
+            tracing::info!(previous, epoch, "the stored epoch was raised");
+            json(
+                StatusCode::OK,
+                &serde_json::json!({ "previous": previous, "epoch": epoch, "serving": serving }),
+            )
+        }
+        Ok(Ok(None)) => error(
+            StatusCode::NOT_FOUND,
+            "this server keeps no state store: it has no epoch to raise",
+        ),
+        Ok(Err(e)) => error(epoch_failure(&e), &e.to_string()),
+        Err(e) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("epoch task: {e}"),
+        ),
+    }
+}
+
+/// The status a failed epoch bump answers with: a store that is down, or that other
+/// writers kept changing the epoch of, is to be tried again; a frontend that a newer writer
+/// superseded (409) or a row that cannot be read is not.
+const fn epoch_failure(e: &StateError) -> StatusCode {
+    match e {
+        StateError::Store(StoreError::Fenced) => StatusCode::CONFLICT,
+        StateError::Store(_) | StateError::Conflict(_) => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 /// The commit the farm wants, for judging each node's `update.up_to_date`; `None` when
@@ -839,7 +909,7 @@ pub(crate) fn error_coded(status: StatusCode, why: &str, code: &str) -> Response
 #[cfg(test)]
 mod tests {
     use kbf_map::{Member, Rule};
-    use kbf_state::StoreError;
+    use kbf_state::{Conflict, StoreError};
 
     use super::*;
 
@@ -1010,6 +1080,55 @@ mod tests {
             .await;
         let (code, _) = body(allowed_answer(&entry, Err(panicked.expect_err("a panic")))).await;
         assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// Asserts that an epoch bump answers the epochs before and after it and the epoch
+    /// this frontend serves, that a server with no state store says so (404), and that a
+    /// store that is down or kept changing under the bump is to be tried again (503),
+    /// that a frontend a newer writer superseded is refused (409), and that a row that
+    /// cannot be read and a panicked task are ours (500).
+    #[tokio::test]
+    async fn an_epoch_bump_answers_each_outcome_with_its_status() {
+        let bumped = EpochBump {
+            previous: 4,
+            epoch: 5,
+        };
+        let (code, ok) = body(epoch_answer(4, Ok(Ok(Some(bumped))))).await;
+        assert_eq!(code, StatusCode::OK);
+        let expected = serde_json::json!({"previous": 4, "epoch": 5, "serving": 4});
+        assert_eq!(ok, expected);
+        let (code, none) = body(epoch_answer(4, Ok(Ok(None)))).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        let said = none["error"].as_str().unwrap_or_default();
+        assert!(said.contains("no state store"), "{said}");
+        let lost = Conflict {
+            index: 0,
+            key: "meta/epoch".to_owned(),
+        };
+        let down = StoreError::Failed("down".to_owned());
+        let failures = [
+            (StateError::Store(down), StatusCode::SERVICE_UNAVAILABLE),
+            (StateError::Conflict(lost), StatusCode::SERVICE_UNAVAILABLE),
+            (StateError::Store(StoreError::Fenced), StatusCode::CONFLICT),
+            (
+                StateError::Missing("meta/epoch".to_owned()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+        for (failure, want) in failures {
+            let text = failure.to_string();
+            let (code, answer) = body(epoch_answer(4, Ok(Err(failure)))).await;
+            assert_eq!(code, want, "{text}");
+            assert_eq!(answer["error"], text);
+        }
+        let panicked = tokio::task::spawn_blocking(|| -> Result<Option<EpochBump>, StateError> {
+            panic!("the epoch call panicked")
+        })
+        .await;
+        let (code, answer) = body(epoch_answer(4, Err(panicked.expect_err("a panic")))).await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        let said = answer["error"].as_str().unwrap_or_default();
+        assert!(said.contains("epoch task"), "{said}");
     }
 }
 

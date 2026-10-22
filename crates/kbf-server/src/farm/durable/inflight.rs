@@ -46,8 +46,9 @@ impl Durable {
     /// outcome the caller never learned has put the row, and the repeat finds the
     /// operation it wrote.
     ///
-    /// If the store's counter is ahead of `id` (another writer took the id), the next
-    /// free one is used; [`Submitted::Queued`] says which.
+    /// `id` comes from the block this handle reserved ([`Durable::reserve_operation`]),
+    /// where no other frontend numbers. If a row of an earlier writer is in the way of it,
+    /// the next id of the block is used; [`Submitted::Queued`] says which.
     ///
     /// # Errors
     /// The store cannot be read or written, or a row in the way does not go
@@ -79,10 +80,12 @@ impl Durable {
             }
             match self.submitted_pinned(id, request, subject, (&pin, cond)) {
                 Ok(()) => return Ok(Submitted::Queued(id)),
-                // Another writer took the id, or queued this action since the look.
+                // Another writer queued this action since the look, or a row of an earlier
+                // writer is in the way of the id: look again, and try the next id of the
+                // block.
                 Err(StateError::Conflict(_)) if looks < LOOKS => {
                     looks += 1;
-                    id = OperationId(self.counter(NEXT_OP)?.max(id.0));
+                    id = self.reserve_operation(OperationId(id.0 + 1))?;
                 }
                 Err(error) => return Err(error),
             }

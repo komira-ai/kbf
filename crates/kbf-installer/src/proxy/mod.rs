@@ -53,8 +53,8 @@
 //!   [`ports::ChildAdmin::resume`].
 //! - **Cold start** ([`boot`]). With no live child the proxy starts `installed_commit` of
 //!   `status.json`, running `releases/<sha>/kbf` (never `releases/current`) in slot A as a
-//!   candidate, and makes it take the generation: no live holder, so the child bumps the epoch
-//!   (FP section 8). It starts nothing unless the binary is executable and the release has
+//!   candidate, and makes it take the generation: no live holder, and the child keeps the
+//!   epoch. It starts nothing unless the binary is executable and the release has
 //!   its `VERIFIED` marker. A failed attempt is stopped (SIGKILL only if the process never
 //!   answered ready, SIGTERM otherwise) and tried again after 2, 4, ... 30 s, ten attempts in
 //!   all; then the streams stay held until the proxy restarts. "Ready" for this boot is the
@@ -126,7 +126,7 @@
 //!   the other one (a dead child needs no signal; a live one gets SIGTERM once idle,
 //!   never SIGKILL). The update ends `failed` at `switch`, not `rolled_back`, which is the
 //!   operator's answer. If both children are dead the recorded-active release is spawned
-//!   again, takes the generation (no live holder, so the child bumps the epoch) and is
+//!   again, takes the generation (no live holder, and the child keeps the epoch) and is
 //!   recorded. A live child that does not answer `role` is not reconciled.
 
 pub mod admin;

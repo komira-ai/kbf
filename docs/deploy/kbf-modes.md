@@ -290,8 +290,9 @@ half gains `--frontend`, `--advertise-addr`, `--storage-zone` and `--storage-wei
 
 **Planned:** a conversion of the blobs, the action cache and the queue of an `all-in-one`
 host into a farm. Today the farm starts with an empty cache and its own scheduler state;
-in-flight work does not move, and every start of a frontend is a new epoch in which the
-daemons kill the runs of the leases they held before. Copying a joining member's slice to it
+in-flight work does not move, and the farm's new state store is given an epoch of its own,
+so the daemons that reconnect see an epoch they did not know and kill the runs of the
+leases they held before. Copying a joining member's slice to it
 (the join handoff, architecture-v2.md section 8.4) is not built either.
 
 ## Stopping and draining
