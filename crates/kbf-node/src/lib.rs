@@ -977,9 +977,14 @@ fn native_runtime<C: Cas>(
         }
         report
     };
-    // One part per survey, so none overwrites another's entries; the Xcodes' is the
-    // only one yet.
+    // One part per source, so none overwrites another's entries.
     let (driver, reports) = DriverWatch::new();
+    // The slots' part, before the survey's: the number of free slots reaches the daemon
+    // whenever it changes, whether or not a survey does.
+    let slots = driver
+        .part(kbf_driver_native::slots::SOURCE)
+        .ok_or("the slots part of the driver watch is taken")?;
+    runtime.report_slots_through(slots);
     let xcodes = driver
         .part(xcode_watch::SOURCE)
         .ok_or("the Xcode part of the driver watch is taken")?;

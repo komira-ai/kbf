@@ -29,6 +29,25 @@ pub(crate) const MAX_SCANS: usize = 100;
 /// second process look.
 pub(crate) const SCAN_PAUSE: Duration = Duration::from_millis(200);
 
+/// The user flags the clean never gives back to an entry root or folder, as bits of
+/// `st_flags`: `uchg` and `uappnd` (a lock would stop the next removal) and `hidden`
+/// (the system sets it and it hides the entry from the listing the check reads).
+/// `nodump` and `opaque` are kept when the system had them.
+pub(crate) const NOT_RESTORED: u32 = 0x2 | 0x4 | 0x8000;
+
+/// The flags an entry root or folder is given back, from the `recorded` ones found when
+/// the slot was resolved: those without [`NOT_RESTORED`].
+pub(crate) fn kept_flags(recorded: u32) -> u32 {
+    recorded & !NOT_RESTORED
+}
+
+/// Whether the `flags` of a restored entry root hold one the restore never leaves
+/// ([`NOT_RESTORED`]). The same set [`kept_flags`] removes, so a root the system gave
+/// `nodump` or `opaque` is not found wrong after every clean.
+pub(crate) fn unrestored(flags: u32) -> bool {
+    flags & NOT_RESTORED != 0
+}
+
 /// The places the shared sweep covers: launchd's per-uid files, and every entry the uid
 /// owns in the `Shared` folder under `/Users`, `/private/tmp`, `/private/var/tmp` and
 /// `/Library/Caches`. Not all of `/private/var/folders`: the uid can write only its own

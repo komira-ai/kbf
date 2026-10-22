@@ -410,3 +410,76 @@ async fn a_failed_clean_leaves_the_user_dirty_and_the_next_offer_cleans_it_again
         rig.user.uid
     );
 }
+
+/// The `action_slots` value of the newest report of the watch.
+fn reported_slots(
+    reports: &tokio::sync::watch::Receiver<kbf_daemon::DriverReport>,
+) -> Option<String> {
+    let report = reports.borrow();
+    (report.entries.iter())
+        .find(|(key, _)| key == kbf_driver_native::slots::CAPABILITY)
+        .map(|(_, value)| value.clone())
+}
+
+/// Waits until the newest report says `want` slots; the values it said on the way.
+async fn report_says(
+    reports: &mut tokio::sync::watch::Receiver<kbf_daemon::DriverReport>,
+    want: &str,
+    within: Duration,
+) -> Result<Vec<String>, Vec<String>> {
+    let mut seen: Vec<String> = reported_slots(reports).into_iter().collect();
+    let give_up = tokio::time::Instant::now() + within;
+    while seen.last().map(String::as_str) != Some(want) {
+        if tokio::time::timeout_at(give_up, reports.changed())
+            .await
+            .is_err()
+        {
+            return Err(seen);
+        }
+        seen.extend(reported_slots(reports));
+    }
+    Ok(seen)
+}
+
+/// Recovery with no lease. Catches a node whose every slot is dirty that never comes back
+/// (it takes no lease, so no lease cleans it, and no Xcode survey changes to carry a new
+/// report): the slot is dirty after a lease, the report pushed through the slots' part
+/// of the driver watch says 0, and once the file that stopped the clean can go, the
+/// recovery thread cleans the slot again with no lease waiting and the report says 1.
+/// No lease runs on the slot in between: the home is empty because the recovery
+/// emptied it.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
+#[tokio::test]
+async fn a_node_whose_every_slot_is_dirty_recovers_by_itself_and_reports_it() {
+    let rig = Rig::new("recover", None);
+    let (driver, mut reports) = kbf_daemon::DriverWatch::new();
+    rig.rt.report_slots_through(
+        driver
+            .part(kbf_driver_native::slots::SOURCE)
+            .expect("the part"),
+    );
+    assert_eq!(reported_slots(&reports).as_deref(), Some("1"));
+    let home = home_of(&rig.user);
+    let stuck = home.join("kbf-ci-stuck");
+    std::fs::write(&stuck, b"stuck").expect("stuck file");
+    crate::support::pool::run("/usr/bin/chflags", &["uchg", &stuck.to_string_lossy()]);
+    let first = rig.lease(1).await;
+    assert_eq!(first.exit_code, 0);
+    let down = report_says(&mut reports, "0", PROMPT).await;
+    assert!(
+        down.is_ok(),
+        "the report never said the slot was dirty: {down:?}"
+    );
+    assert_eq!(entries(&home), ["kbf-ci-stuck"]);
+    crate::support::pool::run("/usr/bin/chflags", &["nouchg", &stuck.to_string_lossy()]);
+    let up = report_says(&mut reports, "1", PROMPT * 3).await;
+    assert!(
+        up.is_ok(),
+        "the report never said the slot was back: {up:?}"
+    );
+    assert_eq!(entries(&home), Vec::<String>::new());
+    assert_eq!(rig.reported().as_deref(), Some("1"));
+    let again = rig.lease(2).await;
+    assert_eq!(stdout(&rig.cas, &again), format!("{}\n", rig.user.uid));
+    drop(driver);
+}

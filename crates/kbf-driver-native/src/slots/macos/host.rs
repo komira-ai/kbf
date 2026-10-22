@@ -39,7 +39,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use kbf_daemon::uid;
-use kbf_mac_session::sweep::{self, CLEARED_FLAGS, SweepPlan, Swept};
+use kbf_mac_session::sweep::{self, SweepPlan, Swept};
 use rustix::fs::{CWD, Mode, OFlags};
 
 use super::Ready;
@@ -120,6 +120,11 @@ impl Launchd for Launchctl {
 
     fn pause(&self, time: Duration) {
         std::thread::sleep(time);
+    }
+
+    fn now(&self) -> Duration {
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        START.get_or_init(Instant::now).elapsed()
     }
 }
 
@@ -325,7 +330,7 @@ fn restore(ready: &Ready) -> Result<(), String> {
     }
     match open_dir(&ready.folders) {
         Ok(root) => {
-            if let Err(why) = set_flags(&root, kept_flags(ready.entry.flags)) {
+            if let Err(why) = set_flags(&root, probe::kept_flags(ready.entry.flags)) {
                 failed.push(format!("{}: {why}", ready.folders.display()));
             }
         }
@@ -334,7 +339,7 @@ fn restore(ready: &Ready) -> Result<(), String> {
     for (name, folder_gid, flags) in &ready.entry.folders {
         let path = ready.folders.join(name);
         let result = match open_dir(&path) {
-            Ok(dir) => own(&dir, (uid, *folder_gid, 0o700), kept_flags(*flags)),
+            Ok(dir) => own(&dir, (uid, *folder_gid, 0o700), probe::kept_flags(*flags)),
             // The system makes it again, as the user, when it is next asked for.
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
@@ -346,17 +351,11 @@ fn restore(ready: &Ready) -> Result<(), String> {
     joined(failed)
 }
 
-/// The flags a restored entry root or folder gets from the `recorded` ones: never a lock
-/// (`uchg`, `uappnd`: they would stop the next removal) or `hidden`.
-fn kept_flags(recorded: u32) -> u32 {
-    recorded & !(libc::UF_HIDDEN | libc::UF_IMMUTABLE | libc::UF_APPEND)
-}
-
 /// Whether the entry's root and folders are as C10 leaves them.
 fn entry_is_restored(ready: &Ready) -> Result<(), String> {
     let root = rustix::fs::lstat(&ready.folders)
         .map_err(|e| format!("{}: {e}", ready.folders.display()))?;
-    if root.st_flags & CLEARED_FLAGS != 0 {
+    if probe::unrestored(root.st_flags) {
         return Err(format!(
             "{}: flags {:#x}",
             ready.folders.display(),

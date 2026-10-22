@@ -36,10 +36,10 @@
 //! ([`crate::procs`]); a pool there is refused.
 //!
 //! Not yet: the scheduler does not book slots (a lease past `N` waits here for a free
-//! one); a dirty slot lowers the runtime's `action_slots` entry, which reaches
-//! the server with the driver's next report (the next Xcode survey, every
-//! `--xcode-recheck-secs`), not at once; and nothing drains and reboots a node with a
-//! dirty slot (section 1 of the design).
+//! one); and nothing drains and reboots a node with a dirty slot (section 1 of the
+//! design). A dirty slot lowers the runtime's `action_slots` entry at once, through its
+//! own part of the driver watch ([`SOURCE`]), and a recovery thread cleans it again
+//! ([`book`]) with no Xcode survey and no lease needed.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -82,6 +82,10 @@ pub const LEASES_ROOT_MODE: u32 = 0o711;
 /// primary group and a Mac's default is 0755, so any other mode lets another slot read
 /// the lease's files, list them and connect to a socket in them.
 pub const LEASE_DIR_MODE: u32 = 0o700;
+
+/// The name of the slots' part of the daemon's driver watch: the `action_slots` entry,
+/// pushed whenever the number of free slots changes.
+pub const SOURCE: &str = "slots";
 
 /// The node report entry that says how many actions run at once.
 pub const CAPABILITY: &str = "action_slots";

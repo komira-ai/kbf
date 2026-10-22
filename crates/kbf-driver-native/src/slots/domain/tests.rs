@@ -13,6 +13,9 @@ struct Fake {
     looks: RefCell<VecDeque<Said>>,
     jobs: Vec<(&'static str, Said)>,
     bootout: Said,
+    /// Every call hangs until its alarm.
+    hang: bool,
+    clock: RefCell<Duration>,
 }
 
 impl Fake {
@@ -23,6 +26,8 @@ impl Fake {
             looks: RefCell::new(looks.into()),
             jobs: Vec::new(),
             bootout: exited(0, ""),
+            hang: false,
+            clock: RefCell::new(Duration::ZERO),
         }
     }
 
@@ -32,8 +37,12 @@ impl Fake {
 }
 
 impl Launchd for Fake {
-    fn run(&self, args: &[&str], _: Duration) -> Said {
+    fn run(&self, args: &[&str], alarm: Duration) -> Said {
         self.asked.borrow_mut().push(args.join(" "));
+        if self.hang {
+            *self.clock.borrow_mut() += alarm;
+            return Said::TimedOut;
+        }
         match args {
             ["bootout", _] => self.bootout.clone(),
             ["print", target] if target.matches('/').count() == 1 => {
@@ -51,8 +60,13 @@ impl Launchd for Fake {
         }
     }
 
-    fn pause(&self, _: Duration) {
+    fn pause(&self, time: Duration) {
         *self.pauses.borrow_mut() += 1;
+        *self.clock.borrow_mut() += time;
+    }
+
+    fn now(&self) -> Duration {
+        *self.clock.borrow()
     }
 }
 
@@ -181,4 +195,56 @@ fn a_launchctl_that_cannot_run_fails_the_step() {
     let fake = Fake::new(vec![Said::Missing("denied".to_owned())]);
     let why = end(&fake, 700).expect_err("print");
     assert!(why.starts_with("launchctl print user/700: denied"), "{why}");
+}
+
+/// Catches a step bounded in looks and not in time (150 prints of a launchd that hangs
+/// for its whole 20 s alarm would hold the daemon's start for fifty minutes): with every
+/// call hanging until its alarm, the step fails at the 60 s total, after three calls
+/// (two bootouts and one print), the last cut to what was left.
+#[test]
+fn a_launchctl_that_hangs_fails_the_step_at_the_total_deadline() {
+    let mut fake = Fake::new(vec![listing(&[])]);
+    fake.hang = true;
+    let why = end(&fake, 700).expect_err("a hung launchctl passed");
+    assert!(why.contains("did not settle within 60s"), "{why}");
+    assert_eq!(
+        fake.asked(),
+        ["bootout user/700", "bootout gui/700", "print user/700"]
+    );
+    assert!(fake.now() >= WITHIN);
+}
+
+/// Catches a bootout that eats the whole budget unseen: a bootout that hangs leaves the
+/// poll only what is left, never a fresh 20 s.
+#[test]
+fn a_call_is_cut_to_what_is_left_of_the_total() {
+    struct Slow(Fake, u64);
+    impl Launchd for Slow {
+        fn run(&self, args: &[&str], alarm: Duration) -> Said {
+            if args == ["bootout", "user/700"] {
+                // Takes `self.1` s of the minute, whatever its alarm.
+                *self.0.clock.borrow_mut() += Duration::from_secs(self.1);
+                return Said::TimedOut;
+            }
+            assert!(
+                alarm <= Duration::from_secs(10),
+                "{alarm:?} of the 10 s left"
+            );
+            self.0.run(args, alarm)
+        }
+        fn pause(&self, time: Duration) {
+            self.0.pause(time);
+        }
+        fn now(&self) -> Duration {
+            self.0.now()
+        }
+    }
+    let slow = Slow(Fake::new(vec![listing(&[])]), 50);
+    assert_eq!(end(&slow, 700), Ok(()));
+    // A first bootout that takes the whole minute leaves the second no time: the step
+    // fails there, before it runs another call.
+    let spent = Slow(Fake::new(vec![listing(&[])]), 60);
+    let why = end(&spent, 700).expect_err("no time left");
+    assert!(why.contains("gui/700 did not settle"), "{why}");
+    assert_eq!(spent.0.asked(), Vec::<String>::new());
 }

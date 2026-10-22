@@ -4,14 +4,15 @@
 //! report names the crashed program's arguments and paths.
 //!
 //! A report is the uid's when the file is **owned by the uid**, or when its **header names
-//! the uid** ([`names_uid`]): the `userID` of an `.ips` report, or the `User ID:` line of
-//! a text one, in the first [`HEAD`] bytes. That is the whole attribution rule. How
+//! the uid** ([`names_uid`]): the `userID` key of an `.ips` report's header or body
+//! object, or the `User ID:` line of a text report's header, never a number quoted in the
+//! body. That is the whole attribution rule. How
 //! `ReportCrash` attributes a report to a user when the crashed process is not the
 //! console user's, and where it writes one on a Mac with no console user, is not
 //! measured (experiments X6 and G18 of the Mac pool plan): a report this rule cannot
 //! attribute stays, and a test that plants a different shape does not exist yet.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::Read as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
@@ -39,24 +40,51 @@ pub(crate) fn crash_dirs(users: &[String]) -> Vec<PathBuf> {
     dirs
 }
 
-/// How much of a report [`names_uid`] reads: the header and the first lines of the body.
+/// How much of a text report [`names_uid`] reads: its header is in the first lines.
 pub(crate) const HEAD: usize = 16 * 1024;
 
-/// Whether the text `head` of a crash report names `uid` as the user of the crashed
-/// process: a JSON `"userID": <uid>` (an `.ips` report) or a line `User ID: <uid>` (a
-/// text report), the whole number, not a prefix of a longer one.
-pub(crate) fn names_uid(head: &[u8], uid: u32) -> bool {
+/// How much of an `.ips` report is read: both of its JSON values must be whole to be
+/// parsed, and a report larger than this names no one.
+pub(crate) const WHOLE: usize = 4 * 1024 * 1024;
+
+/// The sections of a text report that end its header: a line that starts one.
+const BODY: [&str; 5] = [
+    "Thread ",
+    "Backtrace",
+    "Last Exception Backtrace",
+    "Application Specific Information:",
+    "Binary Images:",
+];
+
+/// Whether the crash report `text` names `uid` as the user of the crashed process, in its
+/// **header** and nowhere else (a report owned by another user can quote any number in
+/// its body, and the clean removes what this finds as root):
+///
+/// - an `.ips` report (it starts with `{`) is two JSON values, a header line and a body;
+///   `userID` must be a key of one of those two objects, not of anything nested in them;
+/// - a text report names it in a line that starts with `User ID:`, before the first
+///   section of the body ([`BODY`]).
+///
+/// The whole number must equal the uid.
+pub(crate) fn names_uid(text: &[u8], uid: u32) -> bool {
+    if text.first() == Some(&b'{') {
+        let values = serde_json::Deserializer::from_slice(text).into_iter::<serde_json::Value>();
+        // A body cut off at the end of what was read is an error after the header.
+        return values.map_while(Result::ok).take(2).any(|value| {
+            value.get("userID").and_then(serde_json::Value::as_u64) == Some(u64::from(uid))
+        });
+    }
+    let head = &text[..text.len().min(HEAD)];
     let text = String::from_utf8_lossy(head);
-    let json = text.match_indices("\"userID\"").any(|(at, key)| {
-        let rest = text[at + key.len()..].trim_start();
-        rest.strip_prefix(':')
-            .is_some_and(|value| starts_with_number(value.trim_start(), uid))
-    });
-    json || text.lines().any(|line| {
-        line.trim_start()
-            .strip_prefix("User ID:")
-            .is_some_and(|value| starts_with_number(value.trim_start(), uid))
-    })
+    for line in text.lines() {
+        if BODY.iter().any(|section| line.starts_with(section)) {
+            return false;
+        }
+        if let Some(value) = line.strip_prefix("User ID:") {
+            return starts_with_number(value.trim_start(), uid);
+        }
+    }
+    false
 }
 
 /// Whether `text` begins with exactly the decimal number `uid`: the digits end at a
@@ -133,7 +161,8 @@ pub(crate) fn found(dirs: &[PathBuf], uid: u32) -> Vec<String> {
     found
 }
 
-/// Whether the head of the regular file `path` names `uid`; false when it cannot be read.
+/// Whether the regular file `path` is a report that names `uid` ([`names_uid`]); false
+/// when it cannot be read.
 fn names(path: &Path, uid: u32) -> bool {
     // Not following a link, not blocking: an entry swapped for a FIFO or a link since
     // the listing is read as nothing.
@@ -144,10 +173,18 @@ fn names(path: &Path, uid: u32) -> bool {
     let Ok(file) = file else {
         return false;
     };
-    let mut head = Vec::new();
-    // A read that fails part way leaves the head read so far.
-    let _ = File::take(file, HEAD as u64).read_to_end(&mut head);
-    names_uid(&head, uid)
+    let mut text = Vec::new();
+    // A read that fails part way leaves what was read so far.
+    let mut head = file.take(HEAD as u64);
+    let _ = head.read_to_end(&mut text);
+    // Only a JSON report is read whole: a core file or a text report is judged by its head.
+    if text.first() == Some(&b'{') {
+        let _ = head
+            .into_inner()
+            .take((WHOLE - HEAD) as u64)
+            .read_to_end(&mut text);
+    }
+    names_uid(&text, uid)
 }
 
 #[cfg(test)]

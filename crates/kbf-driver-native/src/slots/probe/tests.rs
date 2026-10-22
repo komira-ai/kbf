@@ -103,6 +103,29 @@ garbage line
     assert_eq!(mounts_under("", &[home]), Vec::<PathBuf>::new());
 }
 
+/// Catches a check stricter than the restore (a root the system gave `nodump` or `opaque`
+/// restored with them and then found wrong, so every clean of that slot failed), a
+/// restore that gives back a lock or `hidden`, and one that drops the other flags: the
+/// restore and the check agree on the same three bits.
+#[test]
+fn the_restore_and_its_check_agree_on_the_flags_they_never_leave() {
+    const NODUMP: u32 = 0x1;
+    const UCHG: u32 = 0x2;
+    const UAPPND: u32 = 0x4;
+    const OPAQUE: u32 = 0x8;
+    const HIDDEN: u32 = 0x8000;
+    const ARCHIVED: u32 = 0x10000;
+    let recorded = NODUMP | UCHG | UAPPND | OPAQUE | HIDDEN | ARCHIVED;
+    assert_eq!(kept_flags(recorded), NODUMP | OPAQUE | ARCHIVED);
+    for flags in [NODUMP, OPAQUE, ARCHIVED, 0, kept_flags(recorded)] {
+        assert!(!unrestored(flags), "{flags:#x}");
+    }
+    for flags in [UCHG, UAPPND, HIDDEN, recorded] {
+        assert!(unrestored(flags), "{flags:#x}");
+        assert!(!unrestored(kept_flags(flags)), "{flags:#x}");
+    }
+}
+
 /// A scripted uid: `scans` are what the successive scans find (then nothing).
 fn run_loop(
     scans: &[&[i32]],

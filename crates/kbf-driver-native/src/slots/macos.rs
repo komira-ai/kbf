@@ -19,7 +19,7 @@ use kbf_daemon::uid;
 use tokio::process::Child;
 use tokio::sync::OwnedSemaphorePermit;
 
-use super::book::{Book, Cleaner, Held, Slotted};
+use super::book::{Backoff, Book, Cleaner, CountHook, Held, Slotted};
 use super::clean::{self, Mutant, Mutated};
 use super::{AS_USER_ARG, Pool, SlotUser, probe};
 use crate::network::{Isolation, Network};
@@ -136,7 +136,7 @@ impl Slots {
     /// it dirty is not free.
     fn with(ready: Vec<Ready>, cleaner: Cleaner<Ready>, program: PathBuf) -> Self {
         Self {
-            book: Arc::new(Book::new(ready, cleaner)),
+            book: Book::start(ready, cleaner, Backoff::DAEMON),
             program,
         }
     }
@@ -147,11 +147,12 @@ impl Slots {
         self.book.count()
     }
 
-    /// Cleans the dirty slots again in the background, if there are any: called when
-    /// the node reports its slots, so a node whose every slot is dirty, which takes no
-    /// lease, recovers.
-    pub fn recheck(&self) {
-        self.book.recheck();
+    /// Calls `hook` with the number of free slots now and whenever it changes: a slot
+    /// went dirty, or the recovery thread ([`crate::slots::book`]) cleaned one again.
+    /// That is how the node's report follows the slots without waiting for the Xcode
+    /// survey to change.
+    pub fn on_count(&self, hook: CountHook) {
+        self.book.on_count(hook);
     }
 
     /// A free slot, waiting for one while every slot is held.

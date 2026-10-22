@@ -31,6 +31,8 @@ fn a_header_names_the_uid_by_its_user_id_value() {
     assert!(names_uid(TEXT.as_bytes(), 771));
     assert!(names_uid(b"{\"userID\" : 771}", 771));
     assert!(names_uid(b"{\"userID\":771,\"x\":1}", 771));
+    // In the header line of an `.ips` report, with a body that is not valid.
+    assert!(names_uid(b"{\"userID\":771}\n{\"pid\":", 771));
     for other in [77, 7710, 1771, 0] {
         assert!(!names_uid(IPS.as_bytes(), other), "{other}");
         assert!(!names_uid(TEXT.as_bytes(), other), "{other}");
@@ -41,6 +43,36 @@ fn a_header_names_the_uid_by_its_user_id_value() {
     assert!(!names_uid(b"Parent User ID: 771", 771));
     assert!(!names_uid(b"\xff\xfe", 771));
     assert!(!names_uid(b"", 771));
+}
+
+/// Catches a report owned by someone else that merely quotes the uid being removed as
+/// root: a number in the body is not the crashed process's user. The uid in a nested
+/// object or array of an `.ips` body, in a string, in a third JSON value, after the first
+/// section of a text report, or on an indented line is not named; the header's is.
+#[test]
+fn a_uid_quoted_in_the_body_names_nobody() {
+    let body = |inner: &str| format!("{{\"app_name\":\"x\"}}\n{{\"pid\":1,{inner}}}\n");
+    assert!(!names_uid(
+        body("\"threads\":[{\"userID\":771}]").as_bytes(),
+        771
+    ));
+    assert!(!names_uid(
+        body("\"note\":\"\\\"userID\\\":771\"").as_bytes(),
+        771
+    ));
+    assert!(!names_uid(body("\"a\":{\"userID\":771}").as_bytes(), 771));
+    assert!(names_uid(body("\"userID\":771").as_bytes(), 771));
+    let third = "{}\n{}\n{\"userID\":771}\n";
+    assert!(!names_uid(third.as_bytes(), 771));
+    for section in ["Thread 0 Crashed:", "Backtrace", "Binary Images:"] {
+        let text = format!("Process: x [1]\nUser ID: 12\n\n{section}\nUser ID: 771\n");
+        assert!(!names_uid(text.as_bytes(), 771), "{section}");
+        assert!(names_uid(text.as_bytes(), 12), "{section}");
+    }
+    assert!(!names_uid(b"Process: x [1]\n  User ID: 771\n", 771));
+    // No `User ID` line in the header: the one after the first section is the body's.
+    let late = b"Process: x [1]\n\nThread 0 Crashed:\nUser ID: 771\n";
+    assert!(!names_uid(late, 771));
 }
 
 /// Catches a list of crash folders that misses one: the system folder and its `Retired`,
@@ -190,4 +222,21 @@ fn a_vanished_report_is_no_error_and_an_unreadable_one_is_not_the_uids() {
         Vec::<String>::new()
     );
     assert!(dir.join("a.ips").exists());
+}
+
+/// Catches a JSON report read by its head alone (a body longer than the first 16 KiB puts
+/// `userID` past it) and a report that is read whole without a bound: a 100 KB body with
+/// the key last is attributed, and a report that quotes the uid only deep in a nested
+/// array past the head is not.
+#[test]
+fn a_long_ips_report_is_read_whole() {
+    let dir = TestDir::under(std::env::temp_dir(), "kbf-driver-native-crash-long");
+    let pad = "x".repeat(100 * 1024);
+    let long = |inner: &str| format!("{{\"app_name\":\"k\"}}\n{{\"pad\":\"{pad}\",{inner}}}\n");
+    fs::write(dir.join("hers.ips"), long("\"userID\":771")).unwrap();
+    fs::write(dir.join("nested.ips"), long("\"t\":[{\"userID\":771}]")).unwrap();
+    let dirs = [dir.to_path_buf()];
+    assert_eq!(sweep(&dirs, 771), Vec::<String>::new());
+    assert!(!dir.join("hers.ips").exists());
+    assert!(dir.join("nested.ips").exists());
 }
