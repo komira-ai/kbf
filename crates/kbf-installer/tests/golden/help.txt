@@ -323,5 +323,6 @@ Options:
       --orders-dir <ORDERS_DIR>  The order spool the update API writes and the root half reads: owned by the service user. As `run --orders-dir`. Default: `orders` in the host's state directory
       --check                    Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing
       --update-dir <UPDATE_DIR>  Root's directory: the proxy reads `status.json` here, to start the installed release when no frontend child is running, and the update API reads its status. As `run --update-dir`. Default: the host's state directory (`/var/lib/kbf-installer`, `/var/db/kbf-installer` on a Mac)
+      --kbf-binary <KBF_BINARY>  The kbf the package installed (`/usr/bin/kbf`; an absolute path). With it the proxy keeps a verified copy of each kbf it runs in `releases` of its state directory, starts its children only from those copies, and keeps its installed and staged releases in `releases.json` there: root's `status.json` and order spool are not used (`--update-dir` and `--orders-dir` are ignored) and the update API orders nothing. Without it the proxy works as before
   -h, --help                     Print help
 

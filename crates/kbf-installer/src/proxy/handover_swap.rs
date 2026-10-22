@@ -20,9 +20,14 @@
 //! the slot; `admin` is [`Admin`] over the two ports of each slot of the upstream table (the
 //! secret on every call, the operator token read from its file on each `post_desired`);
 //! `recorder` is [`FileRecorder`] over the state directory; `orders` is [`SpoolRootOrders`]
-//! over a clone of the one order spool (it shares the counter, and never opens `orders/`);
-//! `migrator` is [`StateDbMigrator`], the [`DbMigrator`] over the state database `installer.toml`
-//! names, opened at each migration; `clock` is the system clock.
+//! over a clone of the one order spool (it shares the counter, and never opens `orders/`), or,
+//! for a proxy that keeps its own copies of `kbf` ([`Handover::local`]), the
+//! [`LocalOrders`] of the proxy's `releases.json`: staged facts, confirm and revert then touch
+//! no spool and no file of the root half; `migrator` is [`StateDbMigrator`], the
+//! [`DbMigrator`] over the state database `installer.toml` names, opened at each migration,
+//! with the staged facts read from `HandoverConfig::status_file` (the root half's
+//! `status.json`, or `releases.json`, which has the same shape and whose `state_schema` is
+//! that of the copied binary); `clock` is the system clock.
 //!
 //! `start_blocked` refuses while the start-up hold is in force ([`Host::held`]: no frontend
 //! child was adopted, so the active slot is a guess). It does not look at the database: an
@@ -43,8 +48,9 @@ use super::model::PortError;
 use super::model::{Mode, Phase, ProcIdent, Slot, Timing};
 use super::orders::OrderSpool;
 use super::ports::{Child, Gate};
-use super::ports::{ChildAdmin, Migrator};
+use super::ports::{ChildAdmin, Migrator, RootOrders};
 use super::record::FileRecorder;
+use super::releases::LocalOrders;
 use super::root_orders::{SpoolRootOrders, StatusFile};
 use super::runtime::{RequestQueue, SystemClock};
 use super::supervisor_swap::{Config, Parts, SwapSupervisor};
@@ -137,19 +143,25 @@ impl std::fmt::Debug for GateSlot {
     }
 }
 
-/// What a test replaces of the swap's ports; the verb never sets either.
+/// What a test replaces of the swap's ports and limits (`apply`, `admin`, `timing`); the verb
+/// sets none.
 #[derive(Clone, Default)]
 pub(super) struct Seams {
     /// Runs the migration in place of the database.
     pub(super) apply: Option<ApplyHook>,
     /// The admin client in place of [`Admin`] over the children's ports.
     pub(super) admin: Option<Arc<dyn ChildAdmin + Send + Sync>>,
+    /// The swap's limits in place of [`Timing::frontend`] (whose bake is minutes).
+    pub(super) timing: Option<Timing>,
 }
+
+/// The root half's orders as the swap holds them.
+type Orders = Arc<dyn RootOrders + Send + Sync>;
 
 /// The supervisor that is the swap once the proxy is bound. See the module documentation.
 pub struct Handover {
     cfg: HandoverConfig,
-    spool: OrderSpool,
+    orders: Orders,
     seams: Seams,
     inner: Mutex<Option<SwapSupervisor>>,
 }
@@ -158,9 +170,21 @@ impl Handover {
     /// `spool` is the clone of the spool the API writes with.
     #[must_use]
     pub fn new(cfg: &HandoverConfig, spool: OrderSpool) -> Handover {
+        let orders = SpoolRootOrders::new(spool, &cfg.status_file);
+        Handover::over(cfg, Arc::new(orders))
+    }
+
+    /// A handover over the proxy's own copies of `kbf`: `orders` (the ones of
+    /// [`Local`](super::releases::Local)) are the swap's, and nothing is spooled.
+    #[must_use]
+    pub fn local(cfg: &HandoverConfig, orders: Arc<LocalOrders>) -> Handover {
+        Handover::over(cfg, orders)
+    }
+
+    fn over(cfg: &HandoverConfig, orders: Orders) -> Handover {
         Handover {
             cfg: cfg.clone(),
-            spool,
+            orders,
             seams: Seams::default(),
             inner: Mutex::new(None),
         }
@@ -175,6 +199,19 @@ impl Handover {
         }
     }
 
+    /// [`local`](Self::local) with its ports replaced by `seams`.
+    #[cfg(test)]
+    pub(super) fn local_with_seams(
+        cfg: &HandoverConfig,
+        orders: Arc<LocalOrders>,
+        seams: Seams,
+    ) -> Handover {
+        Handover {
+            seams,
+            ..Handover::local(cfg, orders)
+        }
+    }
+
     /// Run `call` on the swap supervisor, building it first if the slot has just been filled;
     /// `None` while the proxy is not bound.
     fn with<R>(&self, call: impl FnOnce(&mut SwapSupervisor) -> R) -> Option<R> {
@@ -182,7 +219,7 @@ impl Handover {
             self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if inner.is_none() {
             let host = self.cfg.gate.get()?;
-            *inner = Some(build(&self.cfg, &self.spool, host, &self.seams));
+            *inner = Some(build(&self.cfg, &self.orders, host, &self.seams));
         }
         inner.as_mut().map(call)
     }
@@ -257,8 +294,8 @@ impl Migrator for StateDbMigrator {
 }
 
 /// The swap supervisor over `host`'s ports. Resumes an update that was in flight.
-fn build(cfg: &HandoverConfig, spool: &OrderSpool, host: &Host, seams: &Seams) -> SwapSupervisor {
-    let orders = Arc::new(SpoolRootOrders::new(spool.clone(), &cfg.status_file));
+fn build(cfg: &HandoverConfig, orders: &Orders, host: &Host, seams: &Seams) -> SwapSupervisor {
+    let orders = Arc::clone(orders);
     let admin: Arc<dyn ChildAdmin + Send + Sync> = seams.admin.clone().unwrap_or_else(|| {
         Arc::new(admin_of(
             cfg.slots,
@@ -287,7 +324,7 @@ fn build(cfg: &HandoverConfig, spool: &OrderSpool, host: &Host, seams: &Seams) -
         parts,
         Config {
             mode: Mode::Frontend,
-            timing: Timing::frontend(),
+            timing: seams.timing.unwrap_or_else(Timing::frontend),
             state_dir: cfg.state_dir.clone(),
             active: host.active,
             rollback_after_switch: false,

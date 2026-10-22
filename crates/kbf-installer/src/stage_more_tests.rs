@@ -460,3 +460,30 @@ fn a_frontend_update_does_not_wait_for_leases_and_an_activation_does() {
         assert!(rig.release().exists(), "{name}: the release is installed");
     }
 }
+
+/// Catches the move of the number check into `kbf-types` changing what the stage says: a number
+/// past the installer's is still `installer_too_old`, in the words it always had (the
+/// component, then the number and both values), and a component that declares no more is let
+/// through.
+///
+/// Asserts that the refusal names the component; that its word is `installer_too_old`; and
+/// that the check's text is carried into the refusal.
+#[test]
+fn a_number_past_the_installers_is_refused_in_the_words_the_stage_always_used() {
+    let ceiling = Supported {
+        protocol: 1,
+        min_protocol: 1,
+        state_schema: 5,
+    };
+    let declared = Supported {
+        protocol: 2,
+        ..ceiling
+    };
+    let err = understood(ceiling, "kbf", declared).expect_err("too new");
+    assert_eq!(err.word(), Some("installer_too_old"));
+    assert_eq!(
+        err.to_string(),
+        "kbf: the release needs a newer installer: protocol 2; this installer understands up to 1"
+    );
+    understood(ceiling, "kbf", ceiling).expect("no more than it understands");
+}

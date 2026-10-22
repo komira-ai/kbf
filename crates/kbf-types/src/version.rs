@@ -119,6 +119,56 @@ impl Version {
     }
 }
 
+/// The newest of each version number an installer understands: a release that declares more
+/// is refused (`installer_too_old`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Supported {
+    pub protocol: u64,
+    pub min_protocol: u64,
+    pub state_schema: u64,
+}
+
+/// A number a release declares that is past what an installer understands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{field} {got}; this installer understands up to {most}")]
+pub struct TooNew {
+    /// The number: `protocol`, `min_protocol` or `state_schema`.
+    pub field: &'static str,
+    /// What the release declares.
+    pub got: u64,
+    /// The most the installer understands.
+    pub most: u64,
+}
+
+/// Whether an installer that understands `supported` may take a component that declared
+/// `declared`: `Err` when any of its numbers is past what the installer understands, the first
+/// in the order `protocol`, `min_protocol`, `state_schema` (the rule behind upgrading the
+/// installer before a kbf that raises one).
+///
+/// # Errors
+/// [`TooNew`], naming the number.
+pub fn understood(supported: Supported, declared: Supported) -> Result<(), TooNew> {
+    let newer = [
+        ("protocol", declared.protocol, supported.protocol),
+        (
+            "min_protocol",
+            declared.min_protocol,
+            supported.min_protocol,
+        ),
+        (
+            "state_schema",
+            declared.state_schema,
+            supported.state_schema,
+        ),
+    ];
+    for (field, got, most) in newer {
+        if got > most {
+            return Err(TooNew { field, got, most });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +410,58 @@ mod tests {
             VersionFault::Failed(None).to_string(),
             "it did not exit 0 (status None)"
         );
+    }
+
+    fn numbers(protocol: u64, min_protocol: u64, state_schema: u64) -> Supported {
+        Supported {
+            protocol,
+            min_protocol,
+            state_schema,
+        }
+    }
+
+    /// Catches an installer that takes a component declaring more than it understands, in any
+    /// one of the three numbers (each tried alone, the others equal), and one that refuses a
+    /// component declaring no more (equal, or less: an installer ahead of the kbf it takes is
+    /// the order the rule asks for). The refusal names the number and both values.
+    ///
+    /// Asserts that each of the three comparisons is made; that equal numbers are understood;
+    /// that `got` and `most` are the declared and the supported number in the refusal; and
+    /// that `declared` and `supported` are not swapped.
+    #[test]
+    fn a_component_is_understood_when_it_declares_no_more_than_the_installer_does() {
+        let ceiling = numbers(2, 2, 4);
+        for declared in [ceiling, numbers(1, 1, 3), numbers(0, 0, 0)] {
+            assert_eq!(understood(ceiling, declared), Ok(()));
+        }
+        for (declared, field, got, most) in [
+            (numbers(3, 2, 4), "protocol", 3, 2),
+            (numbers(2, 3, 4), "min_protocol", 3, 2),
+            (numbers(2, 2, 5), "state_schema", 5, 4),
+        ] {
+            let refused = understood(ceiling, declared).expect_err(field);
+            let said = (refused.field, refused.got, refused.most);
+            assert_eq!(said, (field, got, most));
+        }
+        let refused = understood(ceiling, numbers(3, 2, 4)).expect_err("protocol");
+        assert_eq!(
+            refused.to_string(),
+            "protocol 3; this installer understands up to 2"
+        );
+    }
+
+    /// Catches the order of the checks changing under a refusal an operator reads: when more
+    /// than one number is past the installer's, the first of `protocol`, `min_protocol`,
+    /// `state_schema` is the one named.
+    ///
+    /// Asserts that the three checks run in the order `protocol`, `min_protocol`,
+    /// `state_schema`.
+    #[test]
+    fn the_first_number_past_the_installer_is_the_one_named() {
+        let ceiling = numbers(1, 1, 1);
+        let all = understood(ceiling, numbers(2, 2, 2)).expect_err("all three");
+        assert_eq!(all.field, "protocol");
+        let later = understood(ceiling, numbers(1, 2, 2)).expect_err("two");
+        assert_eq!(later.field, "min_protocol");
     }
 }
