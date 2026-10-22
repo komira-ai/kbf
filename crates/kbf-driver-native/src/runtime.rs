@@ -714,6 +714,11 @@ impl<C: Cas> NativeRuntime<C> {
             }
         };
         runner.hand_over(dir).await?;
+        // No canary refused, no lease: the slot's user is not given to this action, and
+        // the slot is cleaned and offered again (docs: slots/canary.rs).
+        runner
+            .canary(&self.config.isolation, prepared.network, &prepared.lease)
+            .await?;
         runner.allows_simulator(prepared.simulator.is_some())?;
         // Not stopped by a kill: a `simctl create` cut short could still make its
         // device after the end looked for the lease's devices.

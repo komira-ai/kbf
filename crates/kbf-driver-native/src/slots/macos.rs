@@ -21,10 +21,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::clean::{self, Mutant, Mutated, Outcome};
 use super::{AS_USER_ARG, Pool, SlotUser};
-use crate::network::{Isolation, Network};
+use crate::network::{Isolation, Network, ProfileMutant, slot_profile};
 use crate::procs;
 
 pub mod host;
+mod probe;
 
 /// The program that starts a process in a user's bootstrap namespace.
 pub const LAUNCHCTL: &str = kbf_mac_session::macos::gui::LAUNCHCTL;
@@ -64,6 +65,8 @@ struct Shared {
     free: Mutex<BTreeSet<usize>>,
     quarantined: AtomicUsize,
     cleaner: Cleaner,
+    /// A line dropped from the profile every launch generates: a test's mutant only.
+    profile_mutant: Option<ProfileMutant>,
 }
 
 impl std::fmt::Debug for Slots {
@@ -123,6 +126,24 @@ impl Slots {
         Ok(Self::with(ready, cleaner, program))
     }
 
+    /// [`Slots::start`] whose launches (the canaries' and the actions') run under the
+    /// profile without the line `mutant` names: for `tests/slot_canary.rs` alone.
+    ///
+    /// # Errors
+    /// As [`Slots::start`].
+    #[doc(hidden)]
+    pub fn start_profile_mutated(
+        pool: &Pool,
+        within: Duration,
+        mutant: ProfileMutant,
+    ) -> io::Result<Self> {
+        let mut slots = Self::start(pool, within)?;
+        if let Some(shared) = Arc::get_mut(&mut slots.shared) {
+            shared.profile_mutant = Some(mutant);
+        }
+        Ok(slots)
+    }
+
     /// Slots over `ready`, each cleaned by `cleaner` first: a slot whose clean
     /// quarantines it is never free.
     fn with(ready: Vec<Ready>, cleaner: Cleaner, program: PathBuf) -> Self {
@@ -140,6 +161,7 @@ impl Slots {
                 free: Mutex::new(free),
                 quarantined: AtomicUsize::new(quarantined),
                 cleaner,
+                profile_mutant: None,
             }),
             program,
         }
@@ -296,7 +318,7 @@ impl Slot {
 
     /// The program and arguments that run `program` with `args` as the slot's user:
     /// `launchctl asuser <uid> <this binary> __as-user <uid> <gid> -- ` and then the
-    /// sandbox's wrap ([`Isolation::wrap_slot`]), whose write rules add the slot's home
+    /// sandbox's wrap ([`Isolation::wrap_in`] with [`slot_profile`]), whose write rules add the slot's home
     /// and folders.
     ///
     /// # Errors
@@ -317,7 +339,10 @@ impl Slot {
                 "refusing to run an action as root".to_owned(),
             ));
         }
-        let (program, args) = isolation.wrap_slot(network, lease, &ready.rules, program, args);
+        let profile = slot_profile(network);
+        let profile = (self.shared.profile_mutant)
+            .map_or_else(|| profile.to_owned(), |mutant| mutant.apply(profile));
+        let (program, args) = isolation.wrap_in(&profile, lease, &ready.rules, program, args);
         let mut launch = vec![
             "asuser".to_owned(),
             uid.to_string(),
@@ -549,29 +574,13 @@ fn resolve(user: &SlotUser, program: &Path) -> io::Result<Ready> {
                 String::from_utf8_lossy(&out.stderr).trim()
             ))
         })?;
-    let rules = format!(
-        "(allow file-write* (subpath {}) (subpath {}))\n",
-        quoted(&home)?,
-        quoted(&folders)?
-    );
+    let rules = crate::network::slot_write_rules(&home, &folders)?;
     Ok(Ready {
         user: user.clone(),
         home,
         folders,
         rules,
     })
-}
-
-/// `path` as a sandbox profile string literal.
-fn quoted(path: &Path) -> io::Result<String> {
-    let text = path.to_str().unwrap_or("\"");
-    if text.contains(['"', '\\']) {
-        return Err(io::Error::other(format!(
-            "{} cannot be named in a sandbox profile",
-            path.display()
-        )));
-    }
-    Ok(format!("\"{text}\""))
 }
 
 /// The name and home directory the user database gives `uid`.

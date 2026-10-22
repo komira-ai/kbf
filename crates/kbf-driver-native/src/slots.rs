@@ -49,6 +49,7 @@ use kbf_daemon::RuntimeError;
 use crate::network::{Isolation, Network};
 use crate::record::KeeperFor;
 
+pub mod canary;
 pub mod clean;
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -292,6 +293,29 @@ impl Runner {
         }
     }
 
+    /// Runs the profile canaries as the slot's user under the profile of the lease in
+    /// `lease` ([`macos::Slot::canary`]); nothing for the daemon's user, which has no
+    /// slot profile.
+    ///
+    /// # Errors
+    /// A canary was not refused or could not run: the lease must not run.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(unused_variables, reason = "no slots off macOS")
+    )]
+    pub async fn canary(
+        &self,
+        isolation: &Isolation,
+        network: Network,
+        lease: &Path,
+    ) -> Result<(), RuntimeError> {
+        match self {
+            Self::Daemon => Ok(()),
+            #[cfg(target_os = "macos")]
+            Self::Slot(slot) => slot.canary(isolation, network, lease).await,
+        }
+    }
+
     /// The keeper the action gets.
     pub fn keeper(&self) -> KeeperFor {
         match self {
@@ -340,14 +364,25 @@ impl Runner {
 /// starts actions as pool users (`kbf-daemon`) calls this first in `main`.
 #[must_use]
 pub fn dispatch() -> Option<std::process::ExitCode> {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(code) = canary_exit(&args) {
+        return Some(std::process::ExitCode::from(
+            u8::try_from(code).unwrap_or(1),
+        ));
+    }
     #[cfg(target_os = "macos")]
     {
-        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
         if args.get(1).is_some_and(|a| a == AS_USER_ARG) {
             return Some(kbf_mac_session::macos::gui::as_user(&args[2..]));
         }
     }
     None
+}
+
+/// The profile canary's probe mode ([`canary::ARG`]) for `args`, printing to stdout:
+/// its exit code when they select it.
+fn canary_exit(args: &[std::ffi::OsString]) -> Option<i32> {
+    canary::dispatch(args, &canary::RealFs, &mut std::io::stdout())
 }
 
 /// [`dispatch`] for a test binary, which has no `main` of its own: when the arguments
@@ -356,6 +391,10 @@ pub fn dispatch() -> Option<std::process::ExitCode> {
 /// [`as_user_test_hook!`](crate::as_user_test_hook) before the test harness starts.
 #[doc(hidden)]
 pub fn hook() {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(code) = canary_exit(&args) {
+        std::process::exit(code);
+    }
     #[cfg(target_os = "macos")]
     if dispatch().is_some() {
         std::process::exit(127);
@@ -483,6 +522,13 @@ mod tests {
     fn only_the_as_user_argument_selects_the_mode() {
         assert!(dispatch().is_none());
         hook();
+        let args = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert_eq!(canary_exit(&args(&["kbf", AS_USER_ARG])), None);
+        assert_eq!(
+            canary_exit(&args(&["kbf", canary::ARG])),
+            Some(canary::USAGE),
+            "the canary mode answers for its own argument"
+        );
     }
 
     fn mode_of(path: &Path) -> u32 {
