@@ -22,7 +22,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use super::book::{Backoff, Book, Cleaner, CountHook, Held, Slotted};
 use super::clean::{self, Skipped, WithSkipped};
 use super::{AS_USER_ARG, Pool, SlotUser, probe};
-use crate::network::{Isolation, Network, ProfileMutant, slot_profile, slot_write_rules};
+use crate::network::{Isolation, Network, WeakenedProfile, slot_profile, slot_write_rules};
 use crate::procs;
 
 mod canaries;
@@ -74,8 +74,8 @@ pub struct Slots {
     book: Arc<Book<Ready>>,
     /// This binary, which a launch runs in its `__as-user` mode.
     program: PathBuf,
-    /// A change made to the profile every launch generates: a test's mutant only.
-    profile_mutant: Option<ProfileMutant>,
+    /// A change made to the profile every launch generates: a test's weakened profile only.
+    profile_change: Option<WeakenedProfile>,
 }
 
 impl std::fmt::Debug for Slots {
@@ -138,18 +138,18 @@ impl Slots {
     }
 
     /// [`Slots::start`] whose launches (the canaries' and the actions') run under the
-    /// profile with `mutant` applied: for `tests/slot_canary.rs` alone.
+    /// profile with `change` applied: for `tests/slot_canary.rs` alone.
     ///
     /// # Errors
     /// As [`Slots::start`].
     #[doc(hidden)]
-    pub fn start_profile_mutated(
+    pub fn start_with_profile_change(
         pool: &Pool,
         within: Duration,
-        mutant: ProfileMutant,
+        change: WeakenedProfile,
     ) -> io::Result<Self> {
         let mut slots = Self::start(pool, within)?;
-        slots.profile_mutant = Some(mutant);
+        slots.profile_change = Some(change);
         Ok(slots)
     }
 
@@ -159,7 +159,7 @@ impl Slots {
         Self {
             book: Book::start(ready, cleaner, Backoff::DAEMON),
             program,
-            profile_mutant: None,
+            profile_change: None,
         }
     }
 
@@ -189,7 +189,7 @@ impl Slots {
             index,
             permit: Some(permit),
             program: self.program.clone(),
-            profile_mutant: self.profile_mutant,
+            profile_change: self.profile_change,
         })
     }
 }
@@ -244,7 +244,7 @@ pub struct Slot {
     permit: Option<OwnedSemaphorePermit>,
     program: PathBuf,
     /// See [`Slots`].
-    profile_mutant: Option<ProfileMutant>,
+    profile_change: Option<WeakenedProfile>,
 }
 
 impl std::fmt::Debug for Slot {
@@ -296,8 +296,8 @@ impl Slot {
             ));
         }
         let profile = slot_profile(network);
-        let profile = (self.profile_mutant)
-            .map_or_else(|| profile.to_owned(), |mutant| mutant.apply(profile));
+        let profile = (self.profile_change)
+            .map_or_else(|| profile.to_owned(), |change| change.apply(profile));
         let (program, args) = isolation.wrap_in(&profile, lease, &ready.rules, program, args);
         let mut launch = vec![
             "asuser".to_owned(),

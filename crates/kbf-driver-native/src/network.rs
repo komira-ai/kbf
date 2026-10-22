@@ -194,7 +194,7 @@ fn quoted(path: &Path) -> std::io::Result<String> {
 /// tests of `tests/slot_canary.rs` alone, never set in production.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProfileMutant {
+pub enum WeakenedProfile {
     /// Drops every copy of this line.
     Drop(&'static str),
     /// Adds this line at the end of the profile constant (before the device and home
@@ -202,7 +202,7 @@ pub enum ProfileMutant {
     Add(&'static str),
 }
 
-impl ProfileMutant {
+impl WeakenedProfile {
     /// `profile` with the change made.
     #[must_use]
     pub fn apply(self, profile: &str) -> String {
@@ -648,12 +648,12 @@ mod tests {
 
     /// The profile a slot user's lease runs under, as the driver generates it for
     /// `network`: the text after `-p` of the sandbox command line.
-    fn generated(network: Network, mutant: Option<ProfileMutant>) -> String {
+    fn generated(network: Network, weakened: Option<WeakenedProfile>) -> String {
         let rules =
             slot_write_rules(Path::new("/h/slot"), Path::new("/v/f/xx/yyyy")).expect("rules");
-        let text = mutant.map_or_else(
+        let text = weakened.map_or_else(
             || slot_profile(network).to_owned(),
-            |m| m.apply(slot_profile(network)),
+            |w| w.apply(slot_profile(network)),
         );
         let sandbox = Isolation::Sandbox(PathBuf::from(SANDBOX_EXEC));
         let (_, args) = sandbox.wrap_in(&text, Path::new("/lease"), &rules, "p".into(), &[]);
@@ -703,7 +703,7 @@ mod tests {
 
     /// Catches a generated slot profile that lacks a deny or allow the code means it to
     /// carry (a dropped `(deny file-write*)` would let a pool user write anywhere, and
-    /// only the macOS canary would notice), on Linux and in every pull request. Mutant
+    /// only the macOS canary would notice), on Linux and in every pull request. Weakening
     /// seen red: deleting the `(deny file-write*)` line from `SLOT_PROFILE` fails the
     /// `On` and `Off` rows for it; dropping it from `SLOT_NO_NETWORK_PROFILE` alone
     /// fails `Off`.
@@ -725,18 +725,18 @@ mod tests {
     }
 
     /// Catches the check above passing when a rule is missing (a test that cannot go
-    /// red): drops each row in turn with [`ProfileMutant`] and sees the rule found
-    /// missing, and that the mutant removes that line alone.
+    /// red): drops each row in turn with [`WeakenedProfile`] and sees the rule found
+    /// missing, and that the weakening removes that line alone.
     #[test]
     fn dropping_any_one_rule_is_seen() {
         for network in [Network::On, Network::Off] {
             let whole = generated(network, None);
-            // The mutant edits the profile constants; the device and home rules are
+            // The weakening edits the profile constants; the device and home rules are
             // appended after it.
             let own = |r: &&str| slot_profile(network).lines().any(|l| l == *r);
             for rule in wanted(network).filter(|r| *r != "(version 1)").filter(own) {
-                let mutated = generated(network, Some(ProfileMutant::Drop(rule)));
-                let lines: Vec<&str> = mutated.lines().collect();
+                let changed = generated(network, Some(WeakenedProfile::Drop(rule)));
+                let lines: Vec<&str> = changed.lines().collect();
                 assert!(!lines.contains(&rule), "{rule} is still there");
                 let before = whole.lines().filter(|l| *l == rule).count();
                 assert_eq!(whole.lines().count() - lines.len(), before, "{rule}");
@@ -744,14 +744,14 @@ mod tests {
         }
     }
 
-    /// Catches a mutant that does not change the profile as it says (an added rule that
+    /// Catches a profile change that does not change the profile as it says (an added rule that
     /// is lost, or a drop that takes a neighbour).
     #[test]
-    fn a_profile_mutant_adds_or_drops_exactly_its_line() {
+    fn a_weakened_profile_adds_or_drops_exactly_its_line() {
         let base = "(a)\n(b)\n(a)\n";
-        assert_eq!(ProfileMutant::Drop("(a)").apply(base), "(b)\n");
+        assert_eq!(WeakenedProfile::Drop("(a)").apply(base), "(b)\n");
         assert_eq!(
-            ProfileMutant::Add("(c)").apply(base),
+            WeakenedProfile::Add("(c)").apply(base),
             "(a)\n(b)\n(a)\n(c)\n"
         );
     }

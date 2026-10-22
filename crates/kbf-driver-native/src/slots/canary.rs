@@ -23,7 +23,7 @@ use std::time::Duration;
 /// The argument after argv0 that selects this binary's canary probe mode.
 pub const ARG: &str = "__canary";
 
-/// How long one canary may take, launch included (the design measured 64 to 125 ms).
+/// How long one canary may take, launch included (a run took 45 to 125 ms on the macOS runner).
 pub const WITHIN: Duration = Duration::from_secs(10);
 
 /// The probe's exit code when the door was refused.
@@ -569,7 +569,7 @@ mod tests {
     }
 
     /// Catches a check that stops at the first failure (a second broken door is never
-    /// seen, so a mutant that breaks only the later canary cannot be shown red), that
+    /// seen, so a profile that breaks only the later canary cannot be shown red), that
     /// passes when one canary is allowed (the "not offered" branch) or cannot run (the
     /// "cannot run" branch), or that does not log the canary, its deny and the result.
     #[test]
@@ -707,8 +707,8 @@ mod tests {
     /// Catches a failed canary that does not make the slot dirty in the book (it would
     /// stay offered and counted), a lease that fails or runs on that slot instead of the
     /// next one, a recovery that offers the slot again without running its canaries at
-    /// the next hand-out, and a slot that stays dirty after its canaries pass. Mutants
-    /// seen red: `Book::set_aside` giving the permit back instead of making the slot
+    /// the next hand-out, and a slot that stays dirty after its canaries pass. Changes
+    /// seen to turn it red: `Book::set_aside` giving the permit back instead of making the slot
     /// dirty (the dirty-set and count assertions); `first_passing` returning a slot
     /// whose probe said aside (the lease runs on slot 0); `first_passing` skipping the
     /// probe (slot 0 is handed out without its canaries).

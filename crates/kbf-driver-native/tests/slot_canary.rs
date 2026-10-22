@@ -4,8 +4,8 @@
 //! fails them, and one that only lets a link through fails the link canary alone; a slot
 //! that fails is set aside.
 //!
-//! The canary latency is printed as `CANARY-LATENCY` lines (the design measured 64 to 125
-//! ms for a run).
+//! The canary latency is printed as `CANARY-LATENCY` lines (a run took 45 to 125
+//! ms on the macOS runner).
 //!
 //! Every test is `#[ignore]`: each needs root and real users. The macOS CI job runs them
 //! with `cargo xtask sudo-test -p kbf-driver-native --test slot_canary`, with the users of
@@ -19,7 +19,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use kbf_driver_native::network::{Isolation, Network, ProfileMutant};
+use kbf_driver_native::network::{Isolation, Network, WeakenedProfile};
 use kbf_driver_native::slots::canary::Report;
 use kbf_driver_native::slots::macos::{Slot, Slots};
 use kbf_driver_native::slots::{LEASES_ROOT_MODE, Pool};
@@ -44,15 +44,15 @@ async fn leased(slots: &Slots, scratch: &Scratch) -> (Slot, PathBuf) {
     (slot, real)
 }
 
-fn start(name: &str, mutant: Option<ProfileMutant>) -> (Users, Scratch, Slots) {
+fn start(name: &str, change: Option<WeakenedProfile>) -> (Users, Scratch, Slots) {
     assert_root();
     let users = Users::new(name, 1);
     let scratch = Scratch::new(name);
     let pool = Pool::new(users.0.clone()).expect("pool");
     let within = Duration::from_secs(10);
-    let slots = match mutant {
+    let slots = match change {
         None => Slots::start(&pool, within),
-        Some(m) => Slots::start_profile_mutated(&pool, within, m),
+        Some(c) => Slots::start_with_profile_change(&pool, within, c),
     };
     (users, scratch, slots.expect("slots"))
 }
@@ -76,7 +76,7 @@ fn left_in_tmp() -> Vec<String> {
 /// its home and its `/var/folders` entry, or hard-link a root-owned file into the lease
 /// directory (both with and without the network), and a canary that cannot run on the
 /// Mac at all (a probe mode the binary does not answer, a launch that fails): every
-/// canary must be refused, and each run is timed. Mutants seen red on the runner: the
+/// canary must be refused, and each run is timed. Weakened profiles seen red on the runner: the
 /// other tests of this file.
 #[ignore = "needs root and real users: cargo xtask sudo-test"]
 #[tokio::test(flavor = "multi_thread")]
@@ -112,14 +112,14 @@ async fn the_canaries_are_refused_under_the_real_profile() {
 #[ignore = "needs root and real users: cargo xtask sudo-test"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_profile_without_its_write_deny_fails_the_canaries() {
-    let mutant = ProfileMutant::Drop("(deny file-write*)");
-    let (_users, scratch, slots) = start("canary-mutant", Some(mutant));
+    let weakened = WeakenedProfile::Drop("(deny file-write*)");
+    let (_users, scratch, slots) = start("canary-weakened", Some(weakened));
     let (slot, lease) = leased(&slots, &scratch).await;
     let isolation = Isolation::detect();
     for network in [Network::On, Network::Off] {
         let report = slot.canary(&isolation, network, &lease).await.expect("ran");
         println!(
-            "CANARY-MUTANT drop-file-write-deny network={network:?}: {}",
+            "CANARY-WEAKENED drop-file-write-deny network={network:?}: {}",
             report.failures()
         );
         assert!(
@@ -152,14 +152,14 @@ async fn a_profile_without_its_write_deny_fails_the_canaries() {
 #[ignore = "needs root and real users: cargo xtask sudo-test"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_profile_that_allows_writes_to_the_link_source_fails_the_link_canary_alone() {
-    let mutant = ProfileMutant::Add("(allow file-write* (subpath \"/private/etc\"))");
-    let (_users, scratch, slots) = start("canary-link", Some(mutant));
+    let weakened = WeakenedProfile::Add("(allow file-write* (subpath \"/private/etc\"))");
+    let (_users, scratch, slots) = start("canary-link", Some(weakened));
     let (slot, lease) = leased(&slots, &scratch).await;
     let isolation = Isolation::detect();
     for network in [Network::On, Network::Off] {
         let report = slot.canary(&isolation, network, &lease).await.expect("ran");
         println!(
-            "CANARY-MUTANT allow-write-to-the-link-source network={network:?}: {}",
+            "CANARY-WEAKENED allow-write-to-the-link-source network={network:?}: {}",
             report.failures()
         );
         assert_eq!(failed(&report), ["link-outside"], "{}", report.failures());
@@ -176,13 +176,13 @@ async fn a_profile_that_allows_writes_to_the_link_source_fails_the_link_canary_a
 /// cleaned again, or is handed out again without its canaries run: it is marked dirty as
 /// a failed clean marks it (the count of slots drops to 0 and a lease waits, as when none
 /// is free), the recovery thread cleans it and offers it again (the count is 1 again),
-/// and the canaries run again at the next hand-out, where the same mutant fails them
+/// and the canaries run again at the next hand-out, where the same weakened profile fails them
 /// again.
 #[ignore = "needs root and real users: cargo xtask sudo-test"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slot_that_fails_its_canaries_is_dirty_and_recovery_offers_it_to_be_canaried_again() {
-    let mutant = ProfileMutant::Drop("(deny file-write*)");
-    let (_users, scratch, slots) = start("canary-aside", Some(mutant));
+    let weakened = WeakenedProfile::Drop("(deny file-write*)");
+    let (_users, scratch, slots) = start("canary-aside", Some(weakened));
     let (slot, lease) = leased(&slots, &scratch).await;
     let isolation = Isolation::detect();
     assert_eq!(slots.count(), 1);
