@@ -56,7 +56,7 @@
 //!   attestations` and `release check` hold a directory to one bundle per tarball,
 //!   each that tarball's (its one subject is the tarball's digest); `verify-assets
 //!   attestations` also has `gh` verify each tarball against its bundle.
-//! - `release {locate,main-control,check,verify,offer,notes,plan,identity,previous,fetch-previous,stage-offer,publish,bump-internal}` ([`release`]): a GitHub release of
+//! - `release {locate,main-control,check,verify,notes,plan,identity,previous,fetch-previous,publish,bump-internal}` ([`release`]): a GitHub release of
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
@@ -619,9 +619,6 @@ enum ReleaseVerb {
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// The checks that make a commit offerable to a farm; writes `offer.json`, sets
-    /// nothing on any farm.
-    Offer(release::offer::OfferArgs),
     /// Wait for the push runs of ci, beta and artifacts for `--sha` on `--branch` and
     /// require all three to succeed; print their run ids. Only reads.
     Gates(release::gates::GatesArgs),
@@ -629,13 +626,9 @@ enum ReleaseVerb {
     /// superseded refusals. Writes nothing but `--output`.
     Plan(release::plan::PlanArgs),
     /// The release before `--sha`: the highest release tag that names a strict ancestor of it,
-    /// downloaded, verified as `release offer` verifies one, and its named binaries taken
+    /// downloaded and verified (checksums, then attestations), and its named binaries taken
     /// out into `--out`. With no such tag, prints `previous-source=none`.
     FetchPrevious(release::fetch_previous::FetchPreviousArgs),
-    /// The offer for the release of `--sha`, for gamma only, and the bundle a gamma deploy is
-    /// handed: the release verified before any of it runs. A commit with no release is
-    /// `staged=false`, not an error.
-    StageOffer(release::stage_offer::StageOfferArgs),
     /// Open the pull request in the internal repository that moves its submodule to the
     /// released commit, with auto-merge on (the token is `GH_TOKEN`).
     BumpInternal(release::bump::BumpArgs),
@@ -1120,11 +1113,9 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 line,
             ])
         }
-        Verb::Release(ReleaseVerb::Offer(args)) => release::offer::run(&args),
         Verb::Release(ReleaseVerb::Gates(args)) => release::gates::run(&args),
         Verb::Release(ReleaseVerb::Plan(args)) => release::plan::run(&args),
         Verb::Release(ReleaseVerb::FetchPrevious(args)) => release::fetch_previous::run(&args),
-        Verb::Release(ReleaseVerb::StageOffer(args)) => release::stage_offer::run(&args),
         Verb::Release(ReleaseVerb::BumpInternal(args)) => release::bump::run(&args),
         Verb::Release(ReleaseVerb::Tag(args)) => release::tag::run(&args),
         Verb::Release(ReleaseVerb::VersionFacts(args)) => version_facts::run(&args),

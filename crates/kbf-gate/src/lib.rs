@@ -17,8 +17,6 @@
 //!   `SHA256SUMS` bytes. `cargo xtask` calls it, and so will the gamma verdict's producer
 //!   (Planned).
 //!
-//! - [`OfferDoc`] is `offer.json`: what a passed offer records for the deploy that follows.
-//!
 //! Time comes in as a [`Clock`] (unix seconds), so a test pins it and a golden file is stable.
 //! The crate does no I/O except the document's atomic write, and links no async runtime
 //! and no other kbf crate.
@@ -26,7 +24,6 @@
 mod doc;
 mod gate;
 mod metrics;
-mod offer;
 mod run;
 
 pub use doc::{
@@ -35,5 +32,4 @@ pub use doc::{
 };
 pub use gate::{GateResult, Limit, Verdict, judge};
 pub use metrics::{Metrics, MetricsError, Sample};
-pub use offer::{Beta, OFFER_VERSION, OfferDoc, Target};
 pub use run::{Clock, GateError, Run, system_clock, write_atomic};
