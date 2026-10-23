@@ -588,7 +588,7 @@ fn the_macos_plan_names_the_places_of_the_design() {
             .contains(&"/private/var/db/mds/messages/{uid}".to_owned())
     );
     // Only the two data-vault stores are skipped when root is denied them: not
-    // `/private/var/folders`, `/private/tmp`, `/Users/Shared` nor the schedules.
+    // `/private/var/folders`, `/private/tmp`, the shared user folder nor the schedules.
     assert_eq!(
         plan.protected,
         [
