@@ -1,8 +1,8 @@
 //! Authentication and authorization of every REAPI method, over gRPC.
 //!
-//! The methods are read from the vendored service definitions (`remote_execution.proto`
-//! and `bytestream.proto` in kbf-proto), the files the served routes are generated
-//! from, and the table below must name each one: a method added to a service (a
+//! The methods are read from the vendored service definitions (`remote_execution.proto`,
+//! `bytestream.proto` and `operations.proto` in kbf-proto), the files the served routes are
+//! generated from, and the table below must name each one: a method added to a service (a
 //! vendored-proto update) fails these tests until the table says which authorizer
 //! covers it. Each test then calls every method through a server built as kbf-server
 //! builds its REAPI listener ([`Farm::with_policy`]).
@@ -22,6 +22,11 @@ use kbf_auth::{
 };
 use kbf_front::{Dispatch, Stage, Submission, Ticket};
 use kbf_proto::google::bytestream::{QueryWriteStatusRequest, ReadRequest, WriteRequest};
+use kbf_proto::google::longrunning::operations_client::OperationsClient;
+use kbf_proto::google::longrunning::{
+    CancelOperationRequest, DeleteOperationRequest, GetOperationRequest, ListOperationsRequest,
+    WaitOperationRequest,
+};
 use kbf_proto::reapi::{
     BatchReadBlobsRequest, BatchUpdateBlobsRequest, ExecuteRequest, FindMissingBlobsRequest,
     GetActionResultRequest, GetCapabilitiesRequest, GetChunkMappingRequest, GetTreeRequest,
@@ -218,8 +223,54 @@ call!(query_write_status, |farm, instance| farm
         ),
     }));
 
-/// Every REAPI method: its gRPC path, the authorizer it asks (`None`: refused
-/// whatever the policy), and a call of it.
+/// GetOperation of the operation `ops/<instance>` the stub knows, which Execute authorizes
+/// like WaitExecution.
+fn get_operation<'a>(farm: &'a Farm, instance: &'a str) -> BoxFuture<'a, Result<(), Status>> {
+    Box::pin(async move {
+        let name = format!("ops/{instance}");
+        let mut client = OperationsClient::new(farm.channel());
+        let answer = client.get_operation(GetOperationRequest { name }).await;
+        answer.map(drop)
+    })
+}
+
+/// The other calls of the `Operations` service, which no authorizer is asked for: they are
+/// not served.
+fn list_operations<'a>(farm: &'a Farm, _: &'a str) -> BoxFuture<'a, Result<(), Status>> {
+    Box::pin(async move {
+        let mut client = OperationsClient::new(farm.channel());
+        let request = ListOperationsRequest::default();
+        client.list_operations(request).await.map(drop)
+    })
+}
+
+fn delete_operation<'a>(farm: &'a Farm, _: &'a str) -> BoxFuture<'a, Result<(), Status>> {
+    Box::pin(async move {
+        let mut client = OperationsClient::new(farm.channel());
+        let request = DeleteOperationRequest::default();
+        client.delete_operation(request).await.map(drop)
+    })
+}
+
+fn cancel_operation<'a>(farm: &'a Farm, _: &'a str) -> BoxFuture<'a, Result<(), Status>> {
+    Box::pin(async move {
+        let mut client = OperationsClient::new(farm.channel());
+        let request = CancelOperationRequest::default();
+        client.cancel_operation(request).await.map(drop)
+    })
+}
+
+fn wait_operation<'a>(farm: &'a Farm, _: &'a str) -> BoxFuture<'a, Result<(), Status>> {
+    Box::pin(async move {
+        let mut client = OperationsClient::new(farm.channel());
+        let request = WaitOperationRequest::default();
+        client.wait_operation(request).await.map(drop)
+    })
+}
+
+/// Every method of the services the REAPI routes serve: its gRPC path, the authorizer it
+/// asks (`None`: no authorizer is asked, because the call is refused whatever the policy or
+/// is not served), and a call of it.
 const METHODS: &[(&str, Option<Slot>, Call)] = &[
     (
         "/build.bazel.remote.execution.v2.Capabilities/GetCapabilities",
@@ -301,6 +352,31 @@ const METHODS: &[(&str, Option<Slot>, Call)] = &[
         Some(Slot::CasPut),
         query_write_status,
     ),
+    (
+        "/google.longrunning.Operations/GetOperation",
+        Some(Slot::Execute),
+        get_operation,
+    ),
+    (
+        "/google.longrunning.Operations/ListOperations",
+        None,
+        list_operations,
+    ),
+    (
+        "/google.longrunning.Operations/DeleteOperation",
+        None,
+        delete_operation,
+    ),
+    (
+        "/google.longrunning.Operations/CancelOperation",
+        None,
+        cancel_operation,
+    ),
+    (
+        "/google.longrunning.Operations/WaitOperation",
+        None,
+        wait_operation,
+    ),
 ];
 
 /// The gRPC path of every method of every service the REAPI routes serve, from the
@@ -310,6 +386,7 @@ fn served_methods() -> BTreeSet<String> {
     let files = [
         "build/bazel/remote/execution/v2/remote_execution.proto",
         "google/bytestream/bytestream.proto",
+        "google/longrunning/operations.proto",
     ];
     let set = protox::compile(files, [proto.join("remote-apis"), proto.join("googleapis")])
         .expect("the vendored protos compile");

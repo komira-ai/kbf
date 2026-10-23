@@ -52,6 +52,8 @@ mod intake;
 mod owner;
 #[path = "state_store/result_ack.rs"]
 mod result_ack;
+#[path = "state_store/results.rs"]
+mod results;
 #[path = "state_store/shared.rs"]
 mod shared;
 #[path = "state_store/subject.rs"]
@@ -1097,6 +1099,12 @@ use owner::{
     the_same_process_that_moves_loses_an_unlisted_lease_at_once,
     two_frontends_never_both_grant_to_the_same_worker,
 };
+use results::{
+    a_client_waiting_through_another_frontend_gets_the_result,
+    a_joiner_of_a_leased_operation_never_deletes_its_lease,
+    a_name_in_the_new_form_is_answered_by_every_frontend_at_every_stage,
+    an_old_form_name_is_answered_by_the_issuing_frontend,
+};
 use shared::{
     a_second_frontend_started_over_the_store_keeps_its_epoch,
     frontends_opening_an_empty_store_together_keep_one_epoch,
@@ -1166,7 +1174,11 @@ restarts!(
     a_cordon_set_through_one_frontend_stops_grants_on_the_other,
     a_drain_deadline_is_on_the_stores_clock_and_applied_by_the_other,
     starting_a_frontend_leaves_the_leases_of_the_others_alone,
-    the_epoch_an_operator_raised_is_reported_by_the_other_frontend
+    the_epoch_an_operator_raised_is_reported_by_the_other_frontend,
+    a_client_waiting_through_another_frontend_gets_the_result,
+    a_name_in_the_new_form_is_answered_by_every_frontend_at_every_stage,
+    a_joiner_of_a_leased_operation_never_deletes_its_lease,
+    an_old_form_name_is_answered_by_the_issuing_frontend
 );
 
 /// A state store opened as a start opens it: from the flag, over `dir`.
@@ -2120,11 +2132,12 @@ fn a_farm_without_a_store_has_no_stored_results() {
     );
 }
 
-/// Catches: operation names that repeat across starts that keep the epoch (the hand-over
-/// to a new process keeps it, so a daemon keeps its runs). The names carry the writer
-/// generation, which every start takes: a client holding the first process's name for its
-/// operation is told NOT_FOUND by the second, not handed whichever operation of the second
-/// got the same number (issue #154).
+/// Asserts that a name the first process gave names, in a process started over the same
+/// store that kept the epoch (a daemon keeps its runs), the operation it named and no other:
+/// the names are the store's operation ids, which no process takes twice, so a client
+/// holding the name is never handed whichever operation of the second process has the same
+/// number (issue #154). A new operation of the second process has a name of its own, and a
+/// name nobody gave names nothing.
 #[tokio::test(start_paused = true)]
 async fn a_kept_epoch_does_not_reuse_operation_names() {
     let dir = Scratch::new();
@@ -2148,8 +2161,18 @@ async fn a_kept_epoch_does_not_reuse_operation_names() {
     };
     let second = farm_over(kept);
     assert_eq!(second.lease_epoch(), epoch, "the epoch was kept");
-    assert!(
-        second.wait(&name).is_none(),
-        "the first process's name names an operation of the second"
-    );
+    let same = second.wait(&name).expect("the store holds the operation");
+    assert_eq!(same.action, request(1).key.action, "another operation");
+    let other = second
+        .submit(Submission {
+            request: request(2),
+            call: None,
+            described: Described::default(),
+            evidence: Default::default(),
+        })
+        .expect("submitted")
+        .name;
+    assert_ne!(other, name, "a name was given twice");
+    let nobody = second.wait("operations/9999999999");
+    assert!(nobody.is_none(), "a name nobody gave names an operation");
 }

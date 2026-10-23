@@ -349,7 +349,7 @@ frontend to keep its daemons.
 
 **Kept from #857, #879, #887:** the baton protocol on the control socket (`hello`, `offer <generation>`, `ready`, `released`) and its
 bounded quiesce; `Farm::fence`; `Store::demote` and the generation fence (right for a single writer); the next-generation open with
-the epoch kept; `done/` rows, the follower and `kbf_frontend_relay_untraced`; operation names that carry the generation;
+the epoch kept; `done/` rows, the follower and `kbf_frontend_relay_untraced`; operation names that are never reused (the store's operation ids, `operations/<id>`; they carried the generation before);
 cordon rows; `READY=1` and `Type=notify`; the existing drain (health `NOT_SERVING`, GOAWAY, exit at zero open streams, #793/#810);
 `kbf frontend handover` (now: start the other instance in standby and trigger the take); `kbf-frontend@.service` and the
 control socket's `RuntimeDirectoryPreserve`.
@@ -527,7 +527,7 @@ buck2**:
 
 So the plan cannot rely on reattach for buck2, and does not: Envoy never cuts a stream because a backend is draining, the old
 backend finishes it. Reattach is the safety net for **Bazel** if the old frontend crashes mid-drain: the new frontend must
-resolve the operation name from the store (**[F]** names carry the generation, #857; `op/` and `done/` rows) and answer, or
+resolve the operation name from the store (**[F]** a name is the store's operation id, `operations/<id>`, which any frontend answers from the `op/`, `doneof/` and `done/` rows; names carried the generation before, #857) and answer, or
 `NOT_FOUND` so Bazel re-executes. Test T20 proves it with the pinned Bazel and shows buck2 failing in the same case (documented).
 
 ### 4.2 An `Execute` in flight
@@ -536,7 +536,7 @@ resolve the operation name from the store (**[F]** names carry the generation, #
 shows "executing" while the operation holds a lease, and relays it until it closes, with no timeout: it ends when the operation
 finishes, the client cancels or the old process stops. An operation the store has no trace of is not answered; it is logged and
 counted (`kbf_frontend_relay_untraced`, a gauge that must be zero at every scrape of every test but the planted one). A
-`WaitExecution` is answered the same way. Operation names carry the store generation (**[F]** #857),
+`WaitExecution` is answered the same way. Operation names are the store's operation ids (**[F]**; they carried the store generation, #857),
 so a name is never reused. An operation queued but not leased shows what it showed; it is dispatched by the new frontend.
 **Lost, accepted:** memory-ladder history, usage line, recorder state of operations in flight (K13).
 

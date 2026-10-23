@@ -64,6 +64,10 @@
 //!   never as neither. The row is as large as the response, and the store sets no bound
 //!   on a row, so a very large response makes a large transaction, as it made a large
 //!   row before;
+//! - `doneof/<operation>`: the instance name and action of a finished or refused operation,
+//!   put in the same transaction as its `done/` row and kept as long, so that any frontend can
+//!   answer a client that asks for the operation by its name (`operations/<id>`), authorized
+//!   against the instance, after the `op/` row that held them is gone (the `named` module);
 //! - `cordon/<worker>`: how an operator placed a node (cordoned, or draining until a
 //!   deadline on the store's clock), kept until it is returned to placement, so a
 //!   successor process serves the node as the operator left it, and the other frontends
@@ -85,7 +89,8 @@
 //!   epoch row is created with an absent-only write, and a frontend that loses that race
 //!   reads the other's;
 //! - `meta/generation`: the writer generation ([`kbf_state::Fenced`]); every write of the
-//!   scheduler is checked against it, and operation names carry it.
+//!   scheduler is checked against it. Operation names do not carry it: a farm over a store
+//!   names its operations `operations/<id>`, and the ids are the store's.
 //!
 //! Several frontends may share one store. Each change of the rows above to an operation
 //! (a grant, a lease given up, a result, a refusal) is one transaction that is conditional
@@ -107,7 +112,14 @@
 //! its floors to theirs. A start takes up only the operations that wait for a lease: a
 //! leased one is taken up when its node says `Hello` to this frontend, and the `sweep`
 //! module requeues the lease of a node no frontend hears, so the work of a frontend that
-//! died is not stranded.
+//! died is not stranded. A request that joins an operation leased on another frontend's
+//! node takes up nothing: it follows the operation through the store until its `done/` row
+//! is there ([`Held::Elsewhere`]); only a lease on a node this frontend owns is taken up by
+//! a join.
+//!
+//! A client that asks for an operation by its name (`operations/<id>`) is answered by any
+//! frontend: by the caller it holds for the operation if its scheduler holds it, and from the
+//! `op/`, `queue/`, `done/` and `doneof/` rows if not (the `named` module).
 //!
 //! Values are the `kbf-log` encoding of the scheduler's own inputs (a `Submit`, the
 //! `Committed` lease, a `WorkerUp`), so the `kbf-log` codec the replicated log already runs
@@ -349,6 +361,18 @@ impl StoredOperation {
     }
 }
 
+/// Where a request that was queued or that joined an operation is held ([`State::queue`]).
+pub(super) enum Held {
+    /// By this frontend's scheduler: the request is a caller of an operation it holds.
+    Here,
+    /// By another frontend: the request joined this operation, which holds a lease on a
+    /// node that frontend owns. This one takes up nothing of it, not even the lease (that
+    /// would end in this scheduler giving up a lease it does not own, and deleting the
+    /// owner's `lease/` row): the request follows the operation through the store until its
+    /// result is there.
+    Elsewhere(OperationId),
+}
+
 mod blocks;
 mod estimate;
 mod fate;
@@ -356,6 +380,7 @@ mod floor;
 mod inflight;
 pub(super) mod intake;
 mod leases;
+mod named;
 mod opkey;
 mod owner;
 mod subject;
@@ -402,6 +427,12 @@ pub(super) struct Ending {
 }
 
 impl Ending {
+    /// How long the result is kept: the finished retention, and at least [`DONE_FLOOR`], so
+    /// that a client which reconnects to another frontend after the finish still finds it.
+    pub(super) fn ttl(&self) -> Duration {
+        self.retention.max(DONE_FLOOR)
+    }
+
     /// `txn`, then the removal of the operation's `op/`, `queue/`, `loss/`, `fate/`,
     /// `subject/` and `opkey/` rows and the put of its result, so one transaction carries
     /// all of it. The `opkey/` delete is made whatever `--learned-sizes` says: an operation
@@ -421,7 +452,7 @@ impl Ending {
     /// them, whoever left it) and the put of its result where `done` allows:
     /// [`Cond::Absent`] for a result no other writer has put.
     fn settle_rest(&self, txn: Txn, operation: OperationId, done: Cond) -> Txn {
-        let ttl = self.retention.max(DONE_FLOOR);
+        let ttl = self.ttl();
         txn.delete(loss_key(operation), Cond::Any)
             .delete(fate_key(operation), Cond::Any)
             .delete(subject_key(operation), Cond::Any)
@@ -1495,9 +1526,11 @@ impl State {
             .read_size_keys
             .store(self.learned.keys(), Ordering::SeqCst);
         let stored = durable.load()?;
-        // Operation names carry the writer generation, not the epoch: a kept epoch must
-        // not let a process name an operation another one named (issue #154). A store
-        // handed in without a fence has no generation, and the epoch names as it did.
+        // The farm hands out `operations/<id>` names, whose ids are the store's. The machine's
+        // term is the one of the old form, `operations/{term}-{waiter}`, which the farm still
+        // answers for a caller it holds: it carries the writer generation, not the epoch, so a
+        // kept epoch does not let a process answer a name another one wrote (issue #154). A
+        // store handed in without a fence has no generation, and the epoch is the term.
         self.machine = FarmMachine::new(durable.generation()?.unwrap_or(epoch));
         let now = SystemTime::now();
         let mut recovered = Vec::new();
@@ -1551,8 +1584,15 @@ impl State {
     }
 
     /// Writes `request`, about to be queued, to the state store, unless it will join a
-    /// twin already there. Not generic, unlike `Farm::submit`, so every test binary's
-    /// runs count toward the same function's coverage.
+    /// twin already there, and says where it is held ([`Held`]). Not generic, unlike
+    /// `Farm::submit`, so every test binary's runs count toward the same function's
+    /// coverage.
+    ///
+    /// A twin the store holds that this scheduler does not is taken up as an operation of
+    /// its own, queued or leased on a node this frontend owns (`now` is farm time, for the
+    /// look at the owner). One leased on a node another frontend owns is not taken up: the
+    /// lease is that frontend's, and this scheduler would give it up when the node did not
+    /// register here. The request follows the operation through the store instead.
     ///
     /// # Errors
     /// UNAVAILABLE if the store did not take it: the request is not queued, and the
@@ -1562,9 +1602,10 @@ impl State {
         request: &Request,
         subject: &Subject,
         size_key: Option<u64>,
-    ) -> Result<(), Status> {
+        now: FarmTime,
+    ) -> Result<Held, Status> {
         if self.sched.twin(request).is_some() {
-            return Ok(());
+            return Ok(Held::Here);
         }
         let wanted = self.sched.next_operation();
         let mut submitted = None;
@@ -1607,11 +1648,24 @@ impl State {
                         "the action's previous run is finishing; the request is not queued",
                     ));
                 }
+                if self.leased_elsewhere(&op, now) {
+                    return Ok(Held::Elsewhere(op.operation));
+                }
                 self.take_in_stored(*op);
             }
             None => {}
         }
-        Ok(())
+        Ok(Held::Here)
+    }
+
+    /// Whether `op` holds a lease on a node this frontend does not own at `now`: its daemon
+    /// is connected to another frontend, or to none (the daemon that ran it has not said
+    /// `Hello` anywhere since the lease was written, and the orphan sweep requeues the lease
+    /// if it never does). A store whose owner row cannot be read is the same: nothing is
+    /// taken up on a guess.
+    fn leased_elsewhere(&self, op: &StoredOperation, now: FarmTime) -> bool {
+        let lease = op.lease.as_ref();
+        lease.is_some_and(|grant| !self.owns_worker(now, &grant.worker))
     }
 
     /// Takes `op`, which the state store holds and the scheduler neither holds nor has
@@ -1659,7 +1713,11 @@ mod intake_tests;
 #[cfg(test)]
 mod leases_tests;
 #[cfg(test)]
+mod named_tests;
+#[cfg(test)]
 mod owner_tests;
+#[cfg(test)]
+mod results_tests;
 #[cfg(test)]
 mod submit_tests;
 #[cfg(test)]

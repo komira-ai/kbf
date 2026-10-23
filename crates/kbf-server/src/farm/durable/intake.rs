@@ -22,7 +22,14 @@
 //!   row is there ([`State::follow_elsewhere`]); the callers of a result or a refusal this
 //!   frontend could not write (it lost the race, or the node moved to another frontend)
 //!   follow it the same way. They are kept for the finished retention after, as the callers
-//!   of an operation this frontend finished are.
+//!   of an operation this frontend finished are. A recorded call among them is ended in the
+//!   invocation record when the result is shown ([`State::record_followed`]), with no lease
+//!   and no listing of the result.
+//! - **Joiners.** The callers of a request that joined an operation leased on a node another
+//!   frontend owns are followed the same way from the start ([`Held::Elsewhere`]): the
+//!   scheduler never held the operation.
+//! - **Watched operations.** The operations clients wait on or ask about by name that the
+//!   scheduler does not hold are looked at each poll too ([`State::follow_watched`]).
 //! - **A lost grant.** A grant this frontend wrote that the store refuses as stale was
 //!   taken by another frontend: the placement is undone ([`kbf_sched::Scheduler::unplace`]),
 //!   and the operation follows the store as above.
@@ -261,6 +268,7 @@ impl State {
         self.release_followed(now);
         self.take_queued(&polled.queued);
         self.follow_elsewhere(now);
+        self.follow_watched();
         self.apply_cordons(now, polled.cordons, polled.at);
         self.apply_floors(&polled.floors, &polled.key_floors);
         self.sweep_orphans();
@@ -339,7 +347,11 @@ impl State {
     }
 
     /// Keeps `callers`, who wait for `operation`, to be answered from the store.
-    fn keep_following(&mut self, operation: OperationId, callers: Vec<WaiterId>) {
+    pub(in crate::farm) fn keep_following(
+        &mut self,
+        operation: OperationId,
+        callers: Vec<WaiterId>,
+    ) {
         let followed = self.intake.elsewhere.entry(operation).or_default();
         followed.extend(callers);
     }
@@ -444,7 +456,8 @@ impl State {
                     show(channel, stage.clone());
                 }
             }
-            if matches!(stage, Some(Stage::Done(_))) {
+            if let Some(Stage::Done(finished)) = &stage {
+                self.record_followed(operation, finished);
                 self.retire(operation, callers, now);
             } else {
                 self.intake.elsewhere.insert(operation, callers);

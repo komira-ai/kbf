@@ -197,7 +197,9 @@ pub(super) async fn a_give_up_for_a_node_the_daemon_left_is_dropped_once(backing
 }
 
 /// Asserts that a request that joins an operation another frontend runs finds the
-/// operation's lease through its index row, and reads none of the `lease/` rows to do it.
+/// operation's lease through its index row, and reads none of the `lease/` rows to do it,
+/// and that it leaves the lease to the frontend that owns the node: it holds none, and the
+/// lease row stands.
 pub(super) async fn a_joined_submit_finds_its_lease_through_the_index(backing: Backing) {
     let disk = Disk::over(backing);
     let (a, b) = (disk.farm(EpochPolicy::Keep), disk.farm(EpochPolicy::Keep));
@@ -212,7 +214,9 @@ pub(super) async fn a_joined_submit_finds_its_lease_through_the_index(backing: B
 
     let read = disk.store.lease_scans.load(Ordering::SeqCst) - scans;
     assert_eq!(read, 0, "the lease rows were read to find the lease");
-    assert_eq!(held(&b), [lease], "the joined operation has no lease");
+    assert!(held(&b).is_empty(), "the joiner took the lease up");
+    assert_eq!(held(&a), [lease], "the owner lost its lease");
+    assert_eq!(disk.rows("lease/"), 1);
 }
 
 /// Asserts that a frontend stops acknowledging a daemon's heartbeats once its last write of
