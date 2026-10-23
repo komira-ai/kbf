@@ -72,6 +72,7 @@ checked by the package test.
 | `credential` | a key given to the unit any way but `kbf.toml`: an `EnvironmentFile=`, an `Environment=` naming a key, secret, token or password, a systemd credential, or an ordering after a MinIO unit |
 | `restart` | a node unit (`storage`, `daemon`, `storage-and-daemon`) without `RestartSec=5` and, in `[Unit]`, `StartLimitIntervalSec=0`: systemd's defaults (100 ms, 5 starts in 10 s) end a quickly repeating failure in `start-limit-hit` with the unit down. The frontend keeps `Restart=on-failure` without them: an old frontend that drained after a handover exits 0 and must stay down |
 | `stop` | a mode that drains on SIGTERM (every mode but `daemon`, which has a finite stop) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
+| `kill-mode` | a mode that runs builds (`daemon`, `storage-and-daemon`, `all-in-one`) without `KillMode=mixed`: with the default `control-group` a stop sends SIGTERM to the actions in their sub-cgroups together with the daemon, and the drain ends at once |
 
 The test has more rules than these (`install`, `network`, `gate-*`, `user`, `nofile`,
 `notify`, `handover`, `conflicts`, `memory`, ...); its header lists what each catches.
@@ -259,6 +260,13 @@ timeout to systemd as well, but reads as "at once" to a person. A daemon is not 
 it drains on SIGTERM up to `--drain-deadline-secs` (600 by default), then stops, so its
 unit has `KillSignal=SIGTERM` and a finite `TimeoutStopSec=660` (the deadline plus 60 s);
 a hung daemon still lets a reboot through.
+
+The three units that run the daemon (`daemon`, `storage-and-daemon`, `all-in-one`) also
+set `KillMode=mixed`. The actions run in sub-cgroups of the unit, and the default
+`control-group` sends SIGTERM to every process in it, so a stop would end them within
+seconds and defeat the drain. With `mixed` SIGTERM goes to the daemon alone; if the
+drain deadline passes, the daemon ends the leases still running itself, and systemd
+sends SIGKILL only to what remains after the main process has exited.
 
 ### storage-and-daemon and the cold store's key
 
