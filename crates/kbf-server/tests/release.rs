@@ -629,7 +629,7 @@ async fn the_list_names_what_is_stored_and_what_is_complete() {
 /// like the rest), so a platform is complete with `kbf` attested and nothing else, and not
 /// with `kbf-daemon` alone, on Linux or on a Mac.
 ///
-/// Mutant seen red: every platform wanting both components (a release is never complete).
+/// Catches: every platform wanting both components (a release is never complete).
 #[tokio::test]
 async fn a_platform_is_complete_with_the_tarball_its_hosts_need() {
     let served = serve().await;
@@ -922,7 +922,7 @@ fn named(description: &ReleaseDescription) -> Vec<(&str, &str)> {
 /// whose name in `files/` is gone (as one stored before the link existed has none) gets it
 /// back from a repeat of the same put.
 ///
-/// Mutants seen red: the link not made (the fetch is NOT_FOUND); the link made only for a
+/// Catches: the link not made (the fetch is NOT_FOUND); the link made only for a
 /// new key (the repair at the end stays NOT_FOUND).
 #[tokio::test]
 async fn a_bundle_is_served_by_its_digest() {
@@ -1008,7 +1008,7 @@ async fn a_bundle_is_served_by_its_digest() {
 /// then serves under the digest it names: its bytes hash to the digest and are as long as
 /// the size, for the tarball and for the bundle.
 ///
-/// Mutants seen red: the bundle omitted (empty `bundle_sha256`, size 0); the tarball's size
+/// Catches: the bundle omitted (empty `bundle_sha256`, size 0); the tarball's size
 /// off by one; the platforms in reverse order; the stray component included.
 #[tokio::test]
 async fn describe_names_every_file_of_a_complete_release_by_its_digest() {
@@ -1059,7 +1059,7 @@ async fn describe_names_every_file_of_a_complete_release_by_its_digest() {
 /// gets its components alone; a platform the release is complete for but that was not
 /// asked is absent.
 ///
-/// Mutant seen red: the filter dropped.
+/// Catches: the filter dropped.
 #[tokio::test]
 async fn describe_can_be_asked_for_one_platform() {
     let served = serve().await;
@@ -1111,7 +1111,7 @@ async fn describe_of_a_commit_the_store_does_not_hold_is_not_found() {
 /// with a path in it; a platform that is not one of the three, in another case, padded or
 /// with a prefix. Each is INVALID_ARGUMENT, even when a stored release would match.
 ///
-/// Mutant seen red: a commit of 12 hex digits accepted (it is NOT_FOUND, not
+/// Catches: a commit of 12 hex digits accepted (it is NOT_FOUND, not
 /// INVALID_ARGUMENT).
 #[tokio::test]
 async fn describe_refuses_a_request_that_is_not_exactly_a_commit_and_a_platform() {
@@ -1181,7 +1181,7 @@ async fn store_a_release_part_way(store: &ReleaseStore) {
 /// attestation, a platform with no tarball at all, and a platform that has one but not the
 /// one its hosts need.
 ///
-/// Mutant seen red: the attestation check skipped (the unattested tarball goes on to the
+/// Catches: the attestation check skipped (the unattested tarball goes on to the
 /// bundle read and the call is INTERNAL, not FAILED_PRECONDITION).
 #[tokio::test]
 async fn describe_of_a_platform_asked_for_says_what_it_lacks() {
@@ -1207,7 +1207,7 @@ async fn describe_of_a_platform_asked_for_says_what_it_lacks() {
 /// complete (an empty description reads as a release with no files): it fails
 /// FAILED_PRECONDITION and names what every stored platform lacks.
 ///
-/// Mutant seen red: a call with no complete platform answered with an empty description.
+/// Catches: a call with no complete platform answered with an empty description.
 #[tokio::test]
 async fn describe_with_no_complete_platform_names_what_each_lacks() {
     let served = serve().await;
@@ -1230,7 +1230,7 @@ async fn describe_with_no_complete_platform_names_what_each_lacks() {
 /// Linux x86_64 stored, a call for no platform describes it alone, while the Mac and Linux
 /// arm64, still incomplete, fail a call that names them.
 ///
-/// Mutant seen red: an incomplete platform failing a call that asked for none.
+/// Catches: an incomplete platform failing a call that asked for none.
 #[tokio::test]
 async fn describe_leaves_an_incomplete_platform_out_of_a_call_that_asks_for_none() {
     let served = serve().await;
@@ -1260,7 +1260,7 @@ async fn describe_leaves_an_incomplete_platform_out_of_a_call_that_asks_for_none
 /// `Describe` says the bundle is not served by its digest, and a repeat of the put (the same
 /// bytes, `200`) repairs it.
 ///
-/// Mutant seen red: the check left out (the bundle is described and is not fetchable).
+/// Catches: the check left out (the bundle is described and is not fetchable).
 #[tokio::test]
 async fn describe_does_not_name_a_bundle_that_has_no_name_in_files() {
     let served = serve().await;
@@ -1350,7 +1350,7 @@ fn path_of_commit(commit: &str) -> String {
 /// also pinned by hand for a small release, so the documented schema cannot drift with the
 /// code that renders it. It needs no credentials, like `GET /v1/releases`.
 ///
-/// Mutants seen red: `schema` omitted from the JSON; the bundle omitted from the description
+/// Catches: `schema` omitted from the JSON; the bundle omitted from the description
 /// (the hand-written first component differs); the platforms in reverse order.
 #[tokio::test]
 async fn the_url_source_json_is_what_describe_answers() {

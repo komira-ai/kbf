@@ -18,9 +18,11 @@
 //! 6. each `--probe` command exits 0 in the container and prints its text: the packaged
 //!    `gh` runs on the container's architecture, the binary names the commit.
 //!
-//! Remove must delete every packaged path and keep `/etc/kbf` and the installer tree
-//! (a file `setup` would have written) and the users; a purge (deb only, of a package
-//! installed again) must do the same and drop the package's record. The container is removed whatever the result.
+//! Remove must delete every packaged path (but a deb's conffiles, its files under `/etc`,
+//! which dpkg keeps until a purge) and keep `/etc/kbf` and the installer tree (a file
+//! `setup` would have written) and the users; a purge (deb only, of a package installed
+//! again) must delete every packaged path, conffiles included, keep the same files, and
+//! drop the package's record. The container is removed whatever the result.
 //!
 //! Every command is one `docker` argv run through a closure ([`Docker`]), so the checks
 //! are tested against a model of the container; [`process`] runs the real program.
@@ -310,14 +312,22 @@ fn kept(c: &mut Container, after: &str, problems: &mut Vec<String>) -> Result<()
     Ok(())
 }
 
-/// Every packaged path must be gone.
+/// Whether `after` deletes the packaged path `e`. A deb's `remove` keeps the package's
+/// conffiles, its files under `/etc` (nfpm's `config|noreplace`), as dpkg does, and its
+/// `purge` deletes them; an rpm's `remove` deletes an unchanged config file.
+fn deletes(format: Format, after: &str, e: &Entry) -> bool {
+    !(format == Format::Deb && after == "remove" && e.dst.starts_with("/etc/"))
+}
+
+/// Every packaged path that `after` deletes must be gone.
 fn gone(
     c: &mut Container,
     entries: &[Entry],
+    format: Format,
     after: &str,
     problems: &mut Vec<String>,
 ) -> Result<(), Error> {
-    for e in entries {
+    for e in entries.iter().filter(|e| deletes(format, after, e)) {
         if c.ok(&["test", "-e", &e.dst])? {
             problems.push(format!("{} is still there after {after}", e.dst));
         }
@@ -491,10 +501,11 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
         &[manager, yes, "remove", pkg_linux::NAME],
         &mut problems,
     )?;
-    gone(c, entries, "remove", &mut problems)?;
+    gone(c, entries, format, "remove", &mut problems)?;
     kept(c, "remove", &mut problems)?;
     if format == Format::Deb {
-        // A removed package without conffiles is gone, so purge acts on a fresh install.
+        // A removed deb keeps its conffiles (its record says config-files), so purge acts
+        // on a fresh install and must delete them.
         c.must(
             "reinstall",
             &[manager, yes, "install", &inside(t.package)],
@@ -505,6 +516,7 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
             &[manager, yes, "purge", pkg_linux::NAME],
             &mut problems,
         )?;
+        gone(c, entries, format, "purge", &mut problems)?;
         kept(c, "purge", &mut problems)?;
         let status = c.say(&["dpkg-query", "-W", "-f=${Status}", pkg_linux::NAME])?;
         if !(status.is_empty() || status.ends_with("not-installed")) {

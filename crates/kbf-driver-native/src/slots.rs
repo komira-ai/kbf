@@ -35,10 +35,12 @@
 //! ([`check_daemon_user`]). Linux native keeps its process-group tracking
 //! ([`crate::procs`]); a pool there is refused.
 //!
-//! Not yet: the scheduler does not book slots (a lease past `N` waits here for a free
-//! one); and nothing drains or reboots a node with a dirty slot. A dirty slot lowers the runtime's `action_slots` entry at once, through its
-//! own part of the driver watch ([`SOURCE`]), and a recovery thread cleans it again
-//! ([`book`]) with no Xcode survey and no lease needed.
+//! The scheduler holds a node to its `action_slots` count: it places no lease on the node
+//! once it holds that many, so a lease waits here for a slot only while the directory of
+//! the one that just ended is still being cleaned. Not yet: nothing drains or reboots a
+//! node with a dirty slot. A dirty slot lowers the runtime's `action_slots` entry at
+//! once, through its own part of the driver watch ([`SOURCE`]), and a recovery thread
+//! cleans it again ([`book`]) with no Xcode survey and no lease needed.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -52,6 +54,8 @@ pub mod canary;
 // The bookkeeping and the clean's rules over text and a fake `launchctl` run on every
 // platform; only a Mac uses them outside tests.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod assertion;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod book;
 pub mod clean;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -62,6 +66,8 @@ pub(crate) mod domain;
 pub mod macos;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod probe;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod tool;
 
 /// The lowest uid a pool user may have: every uid below it is root's, a system
 /// account's, or (from 501) one a Mac gives its first human users. The pool's uids
@@ -69,7 +75,7 @@ pub(crate) mod probe;
 pub const MIN_UID: u32 = 600;
 
 /// The most users a pool may have, as in provisioning.
-pub const MAX_USERS: u32 = 64;
+pub const MAX_USERS: u32 = 100;
 
 /// The mode of the root of the lease directories (`--data-dir`'s `leases`) when a pool
 /// runs actions: the daemon's (root's), searchable but not listable by others, so that a
@@ -84,7 +90,7 @@ pub const LEASES_ROOT_MODE: u32 = 0o711;
 pub const LEASE_DIR_MODE: u32 = 0o700;
 
 /// The name of the slots' part of the daemon's driver watch: the `action_slots` entry,
-/// pushed whenever the number of free slots changes.
+/// pushed whenever the number of usable (not dirty) slots changes.
 pub const SOURCE: &str = "slots";
 
 /// The node report entry that says how many actions run at once.
@@ -408,6 +414,24 @@ impl Runner {
         }
     }
 
+    /// The cheap probes of the assertion for the slot about to run the lease in `lease`
+    /// ([`macos::Slot::assert_ready`]): the lines that differ from the slot's baseline,
+    /// none for the daemon's user, which has no baseline.
+    ///
+    /// # Errors
+    /// The check did not finish.
+    #[cfg(target_os = "macos")]
+    pub async fn assert_ready(
+        &self,
+        lease: &Path,
+        cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<String>, RuntimeError> {
+        match self {
+            Self::Daemon => Ok(Vec::new()),
+            Self::Slot(slot) => slot.assert_ready_until(lease, cancel).await,
+        }
+    }
+
     /// Takes the lease directory `dir` back from the slot's user ([`macos::Slot::reclaim`]).
     #[cfg(target_os = "macos")]
     ///
@@ -581,13 +605,20 @@ mod tests {
                 vec![user("d", 700, 700), user("e", 700, 700)],
                 PoolError::Twice(700),
             ),
-            (vec![user("f", 700, 700); 65], PoolError::Size(65)),
+            (vec![user("f", 700, 700); 101], PoolError::Size(101)),
         ];
         for (users, want) in refused {
             assert_eq!(Pool::new(users), Err(want.clone()), "{want}");
         }
         let edge = Pool::new(vec![user("g", MIN_UID, 1)]).expect("the lowest uid");
         assert_eq!(edge.users(), [user("g", 600, 1)]);
+        let full = Pool::provisioned(MAX_USERS, 61000).expect("a full pool");
+        assert_eq!(full.users().len(), 100);
+        assert_eq!(full.users()[99], user("kbf-pool-99", 61099, 61000));
+        assert_eq!(
+            Pool::provisioned(MAX_USERS + 1, 61000),
+            Err(PoolError::Size(101))
+        );
         let pool = Pool::provisioned(2, 700).expect("pool");
         assert_eq!(
             pool.users(),

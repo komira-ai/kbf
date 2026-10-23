@@ -733,7 +733,7 @@ async fn the_storage_node_is_the_bootstrap_until_the_map_has_two_members() {
 /// one would answer nothing. The node holds the map of generation 5 with one member, and the
 /// frontend learns that map only after the backend and the proxy are made, so the tag cannot
 /// have been taken at construction: the backend's and the proxy's calls to the bootstrap node
-/// are answered, and tagged 5. Mutants: the backend not tagging before it uses the
+/// are answered, and tagged 5. Catches: the backend not tagging before it uses the
 /// bootstrap node; the proxy's fixed list not tagged.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_that_judges_its_map_is_called_at_the_generation_the_frontend_holds() {
@@ -789,7 +789,7 @@ impl kbf_storage::replicate::MapSource for Moving {
 /// Catches a frontend that takes the generation for its `--storage` calls once: the map moves
 /// from 5 to 6 (the node's and the frontend's), and the next call, made by the same backend
 /// and the same proxy, is tagged 6 and answered, not refused as behind (STALE_MAP naming 6).
-/// Mutant: the generation tagged on the first call only.
+/// Catches: the generation tagged on the first call only.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_bootstrap_calls_follow_a_map_bump() {
     let five = Farm::map(5, &[MemberState::Active], 1);
@@ -993,7 +993,7 @@ async fn a_down_primary_is_gone_around() {
 
 /// Catches a frontend router that gives up on a restarting storage node at once: the only
 /// member is a closed port, and a write through a `Routed` that holds for 300 ms is tried
-/// again until the bound has passed, and is then UNAVAILABLE. Mutant: `Routed::with_hold`
+/// again until the bound has passed, and is then UNAVAILABLE. Catches: `Routed::with_hold`
 /// not passing the bound on to the router (the call fails at once).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_no_owner_answers_is_held_for_the_bound() {
@@ -1017,7 +1017,7 @@ async fn a_call_no_owner_answers_is_held_for_the_bound() {
 /// Catches a CAS write failed for the whole member lease (15 s) by a writer that is dead but
 /// not yet marked down: node 3 is a closed port and the map has it active, and each blob of
 /// a batch whose first owner it is lands on the blob's other owner, with an OK status. The
-/// blobs whose owners are other nodes are written as before. Mutant: the router's write
+/// blobs whose owners are other nodes are written as before. Catches: the router's write
 /// ends at the first owner's failure (UNAVAILABLE for every blob owned first by node 3).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_batch_update_goes_on_to_the_next_owner_when_the_writer_is_dead_but_active() {
@@ -1054,7 +1054,7 @@ async fn a_batch_update_goes_on_to_the_next_owner_when_the_writer_is_dead_but_ac
 /// not marked it down: node 3 (the action's first owner) is a closed port, and the
 /// backend's prepare and commit go to the action's other owner, which receives the blobs the
 /// entry names, commits, and a client's GetActionResult through the proxy finds the entry
-/// (the dead owner is passed over by the read). Mutant: the commit ends at the first owner.
+/// (the dead owner is passed over by the read). Catches: the commit ends at the first owner.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_entry_is_committed_at_the_next_owner_when_the_actions_owner_is_dead() {
     let farm = Farm::new(None);

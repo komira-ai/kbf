@@ -110,7 +110,7 @@ fn sparse(path: &std::path::Path, size: u64) {
 
 /// Catches a file hashed or sent whole: a 2 GiB file is hashed, then read back in
 /// chunks of at most [`CHUNK`] bytes that add up to it, with no more than [`BOUND`]
-/// live at once (seen red with the hash pass reading the file into one buffer, and
+/// live at once (catches the hash pass reading the file into one buffer, and
 /// with `next_chunk` returning the rest of the file at once).
 #[test]
 fn a_2_gib_file_is_hashed_and_read_back_in_bounded_memory() {
@@ -136,7 +136,7 @@ fn a_2_gib_file_is_hashed_and_read_back_in_bounded_memory() {
 
 /// Catches an output past the byte limit read up to the limit before it is refused:
 /// a 2 GiB output against a 1 GiB `--output-max-bytes` fails the collection with no
-/// more than [`BOUND`] live at once (seen red with the output read into one buffer
+/// more than [`BOUND`] live at once (catches the output read into one buffer
 /// up to `limit + 1` bytes, as before).
 #[test]
 fn an_output_past_the_byte_limit_is_refused_in_bounded_memory() {
@@ -178,7 +178,7 @@ fn an_output_past_the_byte_limit_is_refused_in_bounded_memory() {
 
 /// Catches stdout read whole: an action whose stdout is 2 GiB fails against the
 /// default 1 GiB `--output-max-stdio-bytes` with no more than [`BOUND`] live at once
-/// in the daemon (seen red with the log read whole, as before), and the lease is
+/// in the daemon (catches the log read whole, as before), and the lease is
 /// cleaned.
 #[test]
 fn a_stdout_past_its_limit_is_refused_in_bounded_memory() {
@@ -272,7 +272,7 @@ impl Cas for Taking {
 /// Catches an output file held whole on its way to a store that takes it as it is
 /// read (the in-process plane): a 2 GiB output goes to the intake in chunks of at most
 /// [`CHUNK`] bytes that add up to it, finished once, with no more than [`BOUND`] live
-/// at once in the walk (mutant: the file read into one buffer and handed over whole, or
+/// at once in the walk (catches: the file read into one buffer and handed over whole, or
 /// handed over in chunks once read whole; the bound is the walk's own, as this intake
 /// keeps nothing).
 #[test]

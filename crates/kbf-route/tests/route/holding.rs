@@ -103,7 +103,7 @@ fn down_farm(clock: &Arc<FakeClock>) -> (Arc<Cluster>, Router, Vec<u8>, Digest) 
 }
 
 /// Catches a read that fails while the node that holds the blob is only restarting, the
-/// defect the hold is for (mutant: no hold). Both owners are down; the first try and the
+/// defect the hold is for (defect: no hold). Both owners are down; the first try and the
 /// second fail, node 2 is back before the third and serves the blob. The pauses are the
 /// first two of the backoff.
 #[tokio::test]
@@ -192,7 +192,7 @@ async fn a_hold_reads_the_map_again_on_each_try() {
     assert_eq!(cluster.dialled(), [(1, 2)]);
 }
 
-/// Catches a hold that never ends (mutant: unbounded) and one that ends late (a last
+/// Catches a hold that never ends (defect: unbounded) and one that ends late (a last
 /// pause that is not cut short at the bound): nobody comes back, the pauses double up to
 /// five seconds and the last is what is left of the bound, 60 s in all, the call is tried
 /// one time more than it paused, and it is UNAVAILABLE as it is without a hold. The fake
@@ -217,7 +217,7 @@ async fn a_hold_ends_at_the_bound() {
 }
 
 /// Catches a hold on a call an owner could answer, or on a failure that is an answer
-/// (mutant: hold on any failure): a blob every owner lacks is NOT_FOUND, a refused write
+/// (defect: hold on any failure): a blob every owner lacks is NOT_FOUND, a refused write
 /// is `Invalid`, and with owner 1 down a read is served by owner 2 and a write goes to it.
 /// None of them waits.
 #[tokio::test]
@@ -252,7 +252,7 @@ async fn a_call_an_owner_answers_is_not_held() {
     assert!(clock.pauses().is_empty());
 }
 
-/// Catches a hold applied to a read that is already passing bytes on (mutant: hold applied
+/// Catches a hold applied to a read that is already passing bytes on (defect: hold applied
 /// mid-stream): the first chunk arrives, the owner breaks, and the read goes on through
 /// the router; no owner answers it, and the stream fails at once with UNAVAILABLE instead
 /// of waiting. The other owner is asked once, and nothing sleeps.
@@ -278,7 +278,7 @@ async fn a_stream_past_its_first_frames_is_not_held() {
     assert_eq!(cluster.node(2).read_count(), 1);
 }
 
-/// Catches a failure that arrives as a stream's first frame going without a hold (mutant:
+/// Catches a failure that arrives as a stream's first frame going without a hold (defect:
 /// `open` hands the stream over without looking at its first frame): owner 1 accepts the
 /// read and breaks before any byte, owner 2 is down, so no owner answers. The read waits
 /// one pause, and owner 1 then serves the whole blob; unheld, the read would be resumed at
@@ -299,7 +299,7 @@ async fn a_read_whose_first_frame_fails_is_held() {
 }
 
 /// Catches a read held for a miss that an owner that is away could not confirm (the other
-/// side of mutant: hold on any failure): owner 2 says it lacks the blob and owner 1 is
+/// side of "hold on any failure"): owner 2 says it lacks the blob and owner 1 is
 /// restarting, so the blob may be on owner 1 and the read waits for it, one pause, and is
 /// served when it is back.
 #[tokio::test]
@@ -315,7 +315,7 @@ async fn a_miss_that_an_owner_away_could_not_confirm_is_held() {
     assert_eq!(clock.pauses(), [ms(250)]);
 }
 
-/// Catches a commit held twice over (mutant: the copy of a blob reads through the held
+/// Catches a commit held twice over (defect: the copy of a blob reads through the held
 /// router): the action's owner is down for the first try and back for the second, and an
 /// output of the entry cannot be read (owner 1 is down, owner 2 lacks it). The commit
 /// waits out its own bound and no more; a read that held for itself, from the second try,
@@ -352,7 +352,7 @@ async fn a_commit_is_held_for_one_bound_not_one_per_blob_it_reads() {
 /// Catches a hold a caller outside the router cannot use as the router does (the frontend's
 /// pass-through of a ByteStream holds with one): it reports its bound, pauses as the router
 /// does (250 ms doubling) by the clock it is given, ends exactly at the bound, and a hold of
-/// nothing ends at once. Mutants: a bound not kept, the clock not used, a hold that ends
+/// nothing ends at once. Catches: a bound not kept, the clock not used, a hold that ends
 /// early or late.
 #[tokio::test]
 async fn a_hold_of_its_own_pauses_and_ends_as_the_routers_does() {

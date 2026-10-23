@@ -1,6 +1,7 @@
 //! The write tier over the Raft metadata log ([`kbf_server::write_tier::attach`], as the
-//! binary calls it): the Raft log raised to machine version 2 once, only when a tier is
-//! configured, and staged, sealed and flushed objects kept across a restart.
+//! binary calls it): the tier's commands commit to the log as it is, with no raise, so a
+//! fresh log stays at machine version 1 and a log an earlier build raised is attached as it
+//! stands, and staged, sealed and flushed objects are kept across a restart.
 //!
 //! Each test runs the server's start on real directories (the raft directory and the
 //! tier's) and a store that outlives the restarts and can be taken down, so a read
@@ -15,7 +16,9 @@ use std::time::{Instant, SystemTime};
 use bytes::Bytes;
 use kbf_front::{Cache, MetaLog, TierStartup, VerifiedBlob};
 use kbf_log::MachineVersion;
-use kbf_meta::{BlobAnswer, ObjectId, Retention, StagedState, TierId};
+use kbf_meta::{
+    Applied, BlobAnswer, Command, Epoch, ObjectId, Retention, StagedPut, StagedState, TierId,
+};
 use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
@@ -153,6 +156,22 @@ async fn start(dirs: &Dirs, store: &Store, tier: bool) -> (TierCache, Option<Tie
         .expect("attach")
 }
 
+/// A `ReseatStaged`, the newest command of the tier. It names objects no log holds, so a
+/// log answers it with a refusal of its own, not an error.
+fn reseat() -> Command {
+    Command::ReseatStaged {
+        tier: TierId::new(1),
+        from: ObjectId::new(Epoch::new(1), 1),
+        to: StagedPut {
+            object: ObjectId::new(Epoch::new(1), 2),
+            end: 0,
+            seal: true,
+            blobs: Vec::new(),
+        },
+        stored: true,
+    }
+}
+
 fn blob(seed: u8) -> (VerifiedBlob, Bytes, Digest) {
     let bytes = Bytes::from(vec![seed; 4096]);
     let blob = VerifiedBlob::hashed(bytes.clone());
@@ -186,44 +205,77 @@ fn later() -> Instant {
     Instant::now() + TierOptions::SEAL_AFTER
 }
 
-/// Catches: a server whose tier attaches over a Raft log left at machine version 1
-/// (the tier's first commit, `AddTier`, cannot be encoded in format 1: the start is
-/// refused), a raise committed again at every start (each one an entry a version-1
-/// binary would also refuse, and a raise that is not idempotent), and a raised log that
-/// an older binary opens instead of refusing at the raise.
+/// Asserts that a fresh log with the write tier commits the tier's commands with no raise
+/// entry: the tier registers (`AddTier`), a blob is staged (`PutStaged`) and flushed
+/// (`SealStaged`, `ObjectFlushed`), and the log is at machine version 1 after it and after
+/// a restart, which registers nothing again. A binary that runs only version 1 or version
+/// 4 opens the log, skips nothing, stays at version 1, and finds the blob.
 #[tokio::test]
-async fn a_raft_server_with_a_tier_raises_its_log_once() {
-    let dirs = Dirs::new("raised-once");
+async fn a_fresh_log_with_a_tier_commits_tier_commands_with_no_raise() {
+    let dirs = Dirs::new("no-raise");
     let store = Store::new();
     let (cache, startup) = start(&dirs, &store, true).await;
     assert!(startup.expect("a tier").registered);
-    assert_eq!(cache.meta().machine_version(), MachineVersion::V5);
+    let (staged, _, digest) = blob(1);
+    cache.store_blobs(vec![staged]).await.expect("stored");
+    let object = object_of(&cache, digest).await;
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed, [object]);
+    assert_eq!(cache.meta().machine_version(), MachineVersion::V1);
     drop(cache);
 
     let (cache, startup) = start(&dirs, &store, true).await;
     assert!(!startup.expect("a tier").registered);
-    let log = cache.meta();
-    assert_eq!(log.machine_version(), MachineVersion::V5);
-    let applied = log.applied_index();
-    log.raise_machine_version(MachineVersion::V5)
-        .expect("raise");
-    assert_eq!(log.applied_index(), applied, "the raise committed again");
+    assert_eq!(cache.meta().machine_version(), MachineVersion::V1);
     drop(cache);
 
-    // A binary that runs only version 4 (every command but `ReseatStaged`) refuses the
-    // log at the raise, as one that runs version 1 does: it never applies an entry it
-    // cannot decode, or skips one.
     for runs in [MachineVersion::V1, MachineVersion::V4] {
-        let rolled_back = dirs.open_running(runs).await;
-        assert!(
-            matches!(rolled_back, Err(RaftLogError::Decode { .. })),
-            "{runs:?}: {rolled_back:?}"
-        );
+        let older = dirs.open_running(runs).await;
+        let older = older.expect("an older binary opens the log");
+        assert_eq!(older.skipped_entries(), 0, "{runs:?}");
+        assert_eq!(older.machine_version(), MachineVersion::V1, "{runs:?}");
+        let answer = older.query(move |s| s.blob(&digest)).await;
+        let present = matches!(answer, Ok(BlobAnswer::Present { .. }));
+        assert!(present, "{runs:?}");
     }
 }
 
-/// Catches: a raft server that raises its log without a tier (an older binary could no
-/// longer read the log of a server that never ran one).
+/// Asserts that a log an earlier build raised to machine version 5 (it holds the
+/// `MachineVersion` entry) still takes the tier: the attach registers it, a blob is staged
+/// and flushed, the log stays at version 5 and commits no second raise, and a binary that
+/// runs only version 1 or version 4 opens it, skips the one raise and stays at version 1.
+#[tokio::test]
+async fn a_log_an_earlier_build_raised_still_takes_the_tier() {
+    let dirs = Dirs::new("earlier-raise");
+    let store = Store::new();
+    let log = RaftMetaLog::open_dir(&dirs.raft, Retention::default(), "kbf/")
+        .await
+        .expect("open the Raft log");
+    log.raise_machine_version(MachineVersion::V5)
+        .expect("the earlier build's raise");
+    drop(log);
+
+    let (cache, startup) = start(&dirs, &store, true).await;
+    assert!(startup.expect("a tier").registered);
+    assert_eq!(cache.meta().machine_version(), MachineVersion::V5);
+    let (staged, _, digest) = blob(1);
+    cache.store_blobs(vec![staged]).await.expect("stored");
+    let object = object_of(&cache, digest).await;
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed, [object]);
+    assert_eq!(cache.meta().machine_version(), MachineVersion::V5);
+    drop(cache);
+
+    for runs in [MachineVersion::V1, MachineVersion::V4] {
+        let older = dirs.open_running(runs).await;
+        let older = older.expect("an older binary opens the raised log");
+        assert_eq!(older.skipped_entries(), 1, "{runs:?}");
+        assert_eq!(older.machine_version(), MachineVersion::V1, "{runs:?}");
+    }
+}
+
+/// Asserts that a server without a tier attaches nothing and leaves its log at version 1,
+/// which a binary that runs only version 1 opens.
 #[tokio::test]
 async fn a_raft_server_without_a_tier_leaves_its_log_at_version_1() {
     let dirs = Dirs::new("no-tier");
@@ -240,6 +292,21 @@ async fn a_raft_server_without_a_tier_leaves_its_log_at_version_1() {
             .machine_version(),
         MachineVersion::V1
     );
+}
+
+/// Asserts that the move of a conflicting staged object (`ReseatStaged`), the newest of the
+/// tier's commands, commits on a log at machine version 1 with a tier attached: the log
+/// answers it itself (a tier answer, here its own refusal, since the command names objects
+/// no log holds) and does not fail the call, and the log stays at version 1.
+#[tokio::test]
+async fn the_move_of_a_conflicting_object_commits_on_a_log_never_raised() {
+    let dirs = Dirs::new("reseat-no-raise");
+    let store = Store::new();
+    let (cache, startup) = start(&dirs, &store, true).await;
+    assert!(startup.is_some());
+    let answered = cache.meta().commit(reseat()).await;
+    assert!(matches!(answered, Ok(Applied::Tier(_))), "{answered:?}");
+    assert_eq!(cache.meta().machine_version(), MachineVersion::V1);
 }
 
 /// Catches: a raft server that clears the tier directory at a start, as the memory

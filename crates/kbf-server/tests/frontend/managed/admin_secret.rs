@@ -39,7 +39,7 @@ pub(super) async fn admin_call(
 /// presents the secret on every call and one rule is easier to hold than two, and a role and
 /// generation are not for every local process.
 ///
-/// Mutants: the admin router served with no secret (`None`) takes the call with no header
+/// Catches: the admin router served with no secret (`None`) takes the call with no header
 /// as direct and quiesces; a layer that also admits `Trust::Unverified` does the same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_admin_port_behind_the_proxy_needs_its_secret() {
@@ -105,7 +105,7 @@ async fn role_now(child: &Child, secret: &str) -> String {
 /// stays active. With the right secret the unknown path is `404`, so the `403` above is the
 /// gate and not routing.
 ///
-/// Mutant: `secured` dropped from `managed.rs` turns the first three calls into `404`/`404`/`200`.
+/// Catches: `secured` dropped from `managed.rs` turns the first three calls into `404`/`404`/`200`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_gate_wraps_the_fallback_and_unrouted_calls() {
     let scratch = Scratch::new("admin-secret-fallback");

@@ -22,7 +22,7 @@ use kbf_server::release::{Limits, ReleaseStore};
 use kbf_server::token::ApiToken;
 use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
 use kbf_state::fake::{Fake, Flaw};
-use kbf_state::{ManualClock, Store};
+use kbf_state::{Cond, ManualClock, Store, Txn};
 use serde_json::{Value, json};
 use support::{HELLO_WAIT, INTERVAL};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,17 +30,27 @@ use tokio::net::TcpStream;
 
 const TOKEN: &str = "kbf-test-token-0123456789abcdef0123456789";
 
-/// The tick of every server here: one that does not come within a test. The offers' poll and
-/// the update controller look at every tick, and their reads of the store meet the injections
+/// The tick of every server here: one that does not come within a test. The offers' poll
+/// looks at every tick, and its read of the store meets the injections
 /// of [`hooked::Hooked`] that a test arms for a request (`support/looks.rs` says why). No test
 /// here waits for a tick: they are HTTP calls against the rows.
 const TICK: Duration = Duration::from_secs(3600);
 
 /// The reads of `(update/desired, deny/)` the server makes by itself as it starts: the offers'
-/// poll and the update controller read `update/desired` once each (no release is desired yet),
+/// poll reads `update/desired` once (no release is desired yet),
 /// and the sweeper's refresh reads `deny/` ([`looks::Looks`]). A test that arms an injection
 /// first waits for them; the test below it holds the numbers.
-const START_LOOKS: (usize, usize) = (2, 1);
+const START_LOOKS: (usize, usize) = (1, 1);
+
+/// Replaces `update/policy` as an older build left it: `auto_nodes` and a limit of
+/// `max_hosts_out` places (field 5).
+fn put_policy(store: &Arc<dyn Store>, max_hosts_out: u8) {
+    let row = vec![0x08, 0x01, 0x28, max_hosts_out];
+    store
+        .txn(Txn::new().put("update/policy", row, Cond::Any))
+        .expect("the write")
+        .expect("no condition");
+}
 
 struct Dir(PathBuf);
 
@@ -76,6 +86,7 @@ fn listeners() -> Listeners {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -498,14 +509,7 @@ async fn the_policy_row_is_shown_when_it_exists() {
     let running = start(Some(store), Some(state), &dir);
     let (_, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
     assert_eq!(view["policy"], Value::Null);
-    let policy = kbf_server::update::Policy {
-        max_hosts_out: 2,
-        auto_nodes: true,
-        ..kbf_server::update::Policy::default()
-    };
-    kbf_server::update::Rows::new(rows_store)
-        .set_policy(&policy)
-        .expect("write");
+    put_policy(&rows_store, 2);
     let (_, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
     assert_eq!(view["policy"]["max_hosts_out"], 2);
     assert_eq!(view["policy"]["auto_nodes"], true);
@@ -520,7 +524,7 @@ async fn the_policy_row_is_shown_when_it_exists() {
 /// too; nothing is written by the offer that could not read.
 ///
 /// Each failure is armed for one read, which must be the handler's: the server's own readers
-/// of the store (the offers' poll, the update controller and the membership sweeper) look
+/// of the store (the offers' poll and the membership sweeper) look
 /// once each at start, which the test waits for (`START_LOOKS`), and not again within the
 /// test (`TICK` and the sweeper's beat).
 #[tokio::test]
@@ -581,12 +585,13 @@ async fn a_state_store_that_fails_is_a_500_not_an_empty_answer() {
 /// Catches the wait of `Looks::done` being wrong, which the failing-store test above cannot
 /// show by itself (it would flake, or hang): the server's own reads of `update/desired` and
 /// `deny/` are `START_LOOKS` at start, and it reads nothing at all by itself after the wait,
-/// for as long as a test runs. A reader added beside the poll, the controller and the sweeper,
+/// for as long as a test runs. A reader added beside the poll and the sweeper,
 /// a read added to one's look, or a tick that comes, makes the total more, and an injection
 /// armed after the wait would be met by one of them and not by its request; a read fewer
 /// makes a count less, and the wait never ends.
 ///
-/// Mutants seen red: `START_LOOKS` of `(1, 1)` and of `(2, 0)` (the counts after the wait).
+/// A `START_LOOKS` above the real counts never ends the wait; one below them lets a read
+/// through after it.
 #[tokio::test]
 async fn the_server_reads_the_rows_by_itself_only_at_start() {
     let dir = Dir::new();
@@ -764,14 +769,8 @@ async fn a_pause_does_not_lose_a_policy_written_under_it() {
     let hooked = hooked::Hooked::new();
     let running = start(Some(store), Some(state_over(hooked.clone())), &dir);
     let rows = kbf_server::update::Rows::new(hooked.clone());
-    let policy = kbf_server::update::Policy {
-        max_hosts_out: 3,
-        ..kbf_server::update::Policy::default()
-    };
-    let writer = rows.clone();
-    hooked.after_get("update/policy", move || {
-        writer.set_policy(&policy).expect("the other writer");
-    });
+    let writer: Arc<dyn Store> = hooked.clone();
+    hooked.after_get("update/policy", move || put_policy(&writer, 3));
     rows.set_paused(true).expect("the pause");
     let held = rows.policy().expect("read");
     assert_eq!((held.paused, held.max_hosts_out), (true, 3));
@@ -806,15 +805,20 @@ async fn proposals_are_listed_oldest_first_and_start_no_run() {
     let running = start(Some(store), Some(state), &dir);
     let (_, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
     assert_eq!(view["proposals"], json!([]));
-    let rows = kbf_server::update::Rows::new(rows_store);
+    // Rows the removed release poller wrote.
     for (commit, at) in [(B, 30), (A, 10)] {
-        let proposal = kbf_server::update::Proposal {
-            commit: commit.to_owned(),
-            tag: format!("v{at}"),
-            published_at_secs: at,
-            proposed_at_ms: 9,
-        };
-        assert!(rows.propose(&proposal).expect("proposal"));
+        let proposal = json!({
+            "commit": commit,
+            "tag": format!("v{at}"),
+            "published_at_secs": at,
+            "proposed_at_ms": 9,
+        });
+        let put = Txn::new().put(
+            kbf_server::update::proposal_key(commit),
+            proposal.to_string().into_bytes(),
+            Cond::Absent,
+        );
+        rows_store.txn(put).expect("store").expect("a new row");
     }
     let (code, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
     assert_eq!(code, 200);

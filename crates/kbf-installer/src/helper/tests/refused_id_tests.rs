@@ -16,7 +16,7 @@ fn memory_text(rig: &Rig) -> String {
 /// read by builds that refuse a key they do not know, and a host put back on an older package
 /// after a refusal would otherwise fail every pass.
 ///
-/// Mutants planted: the id never written; the id kept after an order that was carried out; the
+/// Catches: the id never written; the id kept after an order that was carried out; the
 /// id written for the order that came before; the id written to `helper.json`.
 #[test]
 fn a_refused_frontend_order_names_itself_until_another_order_is_carried_out() {
@@ -47,7 +47,7 @@ fn a_refused_frontend_order_names_itself_until_another_order_is_carried_out() {
 /// alone, so a node order 5 refused on a host that runs both would end the proxy's update 5 at
 /// once with a refusal that is not its own. The status of a refused node order names none.
 ///
-/// Mutants planted: the id written for the node's orders as well.
+/// Catches: the id written for the node's orders as well.
 #[test]
 fn a_refused_node_order_names_no_order_even_on_a_host_with_a_frontend() {
     let mut rig = Rig::frontend("refused-id-node");
@@ -63,7 +63,7 @@ fn a_refused_node_order_names_no_order_even_on_a_host_with_a_frontend() {
 /// Catches a node order refused for its epoch (before it is acted on) naming its id: the same
 /// rule as above, for the refusals made before an order is carried out.
 ///
-/// Mutant planted: the id written for the node's orders in the older-epoch refusal.
+/// Catches: the id written for the node's orders in the older-epoch refusal.
 #[test]
 fn a_node_order_refused_for_its_epoch_names_no_order() {
     let mut rig = Rig::new("refused-id-node-epoch");
@@ -84,7 +84,7 @@ fn a_node_order_refused_for_its_epoch_names_no_order() {
 /// Catches an id left on for a refusal that is no order's: a record the reader would not take
 /// answers nobody's order, and the id of the refusal before it must not stay on it.
 ///
-/// Mutant planted: the id not cleared by a refusal that names none.
+/// Catches: the id not cleared by a refusal that names none.
 #[test]
 fn a_refusal_with_no_order_clears_the_id_of_the_one_before() {
     let mut rig = Rig::frontend("refused-id-cleared");
@@ -105,7 +105,7 @@ fn a_refusal_with_no_order_clears_the_id_of_the_one_before() {
 /// acted on, or jumps too far above it) naming no order: they are the order's refusals too,
 /// and the update that wrote it would wait out its staging deadline for them.
 ///
-/// Mutants planted: the id left out of the older-epoch refusal; left out of the jump refusal.
+/// Catches: the id left out of the older-epoch refusal; left out of the jump refusal.
 #[test]
 fn an_order_refused_for_its_epoch_names_itself() {
     let mut rig = Rig::frontend("refused-id-epoch");

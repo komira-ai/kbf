@@ -329,7 +329,7 @@ fn the_secret_comes_from_stdin_or_a_private_file_without_its_line_ending() {
     assert_eq!(put(&["--secret-file", &f], ""), SENTINEL);
 }
 
-/// Catches a secret file anyone but its owner can read being used (the mutant: the
+/// Catches a secret file anyone but its owner can read being used (the defect: the
 /// mode check skipped), and a refusal that calls the server anyway or names no file.
 /// The address is one nothing listens at: a refusal that went on to call it would say
 /// so, naming the address instead of the file.
@@ -415,7 +415,7 @@ fn a_secret_that_is_missing_or_empty_is_refused_naming_its_source() {
 
 /// Catches the key being on the command line, in the output, or in an error. Where the
 /// server refuses the write (a 422, a 409, a 500), the CLI says the status and the
-/// server's reason and nothing of the request it sent (the mutant: the request body
+/// server's reason and nothing of the request it sent (the defect: the request body
 /// printed on an error). `--secret VALUE` is not a flag at all: a key in argv is in
 /// `ps` and in shell history.
 #[test]

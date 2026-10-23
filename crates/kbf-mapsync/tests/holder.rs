@@ -22,7 +22,7 @@ fn map(generation: u64) -> Map {
 
 /// Catches a holder that goes backwards: a late or repeated push of an older or the same
 /// generation must change nothing (not the map, not the generation, not the map it
-/// replaced), and a newer one is taken. Mutants: `>=` made `>` (the same generation
+/// replaced), and a newer one is taken. Catches: `>=` made `>` (the same generation
 /// replaces the map and the previous one), the comparison removed (the last offer wins).
 #[test]
 fn a_holder_never_goes_backwards() {
@@ -42,7 +42,7 @@ fn a_holder_never_goes_backwards() {
 }
 
 /// Catches a holder that keeps one map before the newest, or that keeps them without a
-/// bound: it retains the newest four it replaced, newest first. Mutants: a history of one
+/// bound: it retains the newest four it replaced, newest first. Catches: a history of one
 /// (`previous` is right and the rest is lost), no truncation.
 #[test]
 fn a_holder_retains_the_maps_it_replaced_up_to_a_cap() {

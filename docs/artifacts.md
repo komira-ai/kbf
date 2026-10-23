@@ -37,7 +37,8 @@ by `crates/kbf-integration-test/tests/release_artifacts`.
 
 Thirteen tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), two Debian packages of
-`kbf-installer` ([below](#the-kbf-installer-package-deb)) and one macOS package of it
+`kbf-installer` ([below](#the-kbf-installer-package-deb)), two of `kbf`
+([below](#the-kbf-package-deb)) and one macOS package of `kbf-installer`
 ([below](#the-kbf-installer-package-pkg-macos)), built by one job per platform:
 
 | Asset | Runner | Target |
@@ -60,17 +61,24 @@ and released like the others, so a package or an operator takes it by digest fro
 files. It is not a component of the release it installs on a host, and it does not
 update itself (the design's section 1).
 
-The packages are the two Linux jobs' debs and the macOS job's `.pkg`:
+The packages are the two Linux jobs' debs (two each) and the macOS job's `.pkg`:
 
 | Asset | Built by | Holds |
 |---|---|---|
-| `kbf-installer-<commit>-linux-x86_64.deb` | the `linux-x86_64` job (`ubuntu-24.04`, nfpm for amd64) | the `kbf-installer` of the tarball of the same name, the units, the pinned `gh` for amd64 and a trust directory |
+| `kbf-installer-<commit>-linux-x86_64.deb` | the `linux-x86_64` job (`ubuntu-24.04`, nfpm for amd64) | the `kbf-installer` of the tarball of the same name, the units of the proxy and of the installer, the pinned `gh` for amd64 and a trust directory |
 | `kbf-installer-<commit>-linux-arm64.deb` | the `linux-arm64` job (`ubuntu-24.04-arm`, nfpm for arm64) | the same for arm64 |
+| `kbf-<commit>-linux-x86_64.deb` | the `linux-x86_64` job | the `kbf` of the tarball of the same name at `/usr/bin/kbf`, the unit of every mode, a dependency on `kbf-installer` of the same version or later, and the replacement of `kbf-installer` (its files, not the package) |
+| `kbf-<commit>-linux-arm64.deb` | the `linux-arm64` job | the same for arm64 |
 | `kbf-installer-<commit>-darwin-arm64.pkg` | the `darwin-arm64` job (`macos-15`, `cargo xtask pkg build`) | the `kbf-installer` of the tarball of the same name, its LaunchDaemon property list, the pinned darwin `gh` and a trust directory |
 
 The set above is pinned: `crates/kbf-integration-test/tests/release_artifacts` fails a pull request
 that drops one of these files from the workflow, packages one that is not listed, or
 leaves this table describing another set.
+
+The `kbf-installer` package no longer holds the unit of a mode; the `kbf` package does. On a host
+that has the earlier `kbf-installer` package, upgrade the two together, in one `apt install` of
+both debs: the new `kbf-installer` alone drops the unit files of a running node, and `Replaces`
+takes effect only when the `kbf` package is unpacked.
 
 Every kit that changes a host changes a Linux one (systemd units, the MDM services, a
 systemd user service, or a cluster through `kubectl`), and `kbf-deploy` for macOS is
@@ -177,7 +185,8 @@ sorted by name.
   git checkout, or a `KBF_BUILD_COMMIT_OVERRIDE` stamp), and a build before this field prints
   none. `kbf_types::Version` reads it as optional.
 - `meta_log`: the highest metadata-log machine version the binary runs
-  (`kbf_server::raft_log::RUNS`). Going from release N to N-1 is reversible only if
+  (`kbf_server::raft_log::RUNS`). It is informational and frozen at 5: this build raises
+  no log, so it gates no feature. Going from release N to N-1 is reversible only if
   `meta_log(N) <= meta_log(N-1)`; a build that prints no `meta_log` is unknown, and
   unknown is not reversible.
 - `profile`: `release` for every asset here (the workflow refuses a `debug` one).
@@ -186,9 +195,9 @@ sorted by name.
   `min_protocol` through `protocol`.
 - `relay`: how far the build carries what its host's installer reports to the frontend. At
   `1` it reads `available` and `release_source` from the installer's `status.json` and sends
-  them in its `UpdateStatus`. `kbf-installer setup` takes `release_source = "bundled"` on a
-  host that has a release only beside a `kbf` that declares at least the level the installer
-  needs (`kbf_installer::binary::RELAY_NEEDED`); a build before this field prints none. An
+  them in its `UpdateStatus`. `kbf-installer rollback` on a host whose
+  `release_source` is `bundled` refuses a release whose `kbf` declares less than the level the
+  installer needs (`kbf_installer::binary::RELAY_NEEDED`); a build before this field prints none. An
   installer whose reader refuses keys it does not know refuses to stage a `kbf` that prints
   it, so the installers ship first.
 - `seq`: the number of commits behind the commit built (`git rev-list --count HEAD`), so
@@ -202,8 +211,8 @@ sorted by name.
   change on: an installer older than that refuses a kbf that prints it
   (`version-unreadable`), so the installer package that reads `seq` ships before the kbf
   that prints it.
-- `state_schema`: the schema version of the SQLite state file the binary creates and
-  reads.
+- `state_schema`: the newest Postgres state schema version the binary embeds a
+  migration for.
 - `version`: the package version.
 
 `--json` without `--version` is a usage error. The fields are a contract: the test
@@ -230,14 +239,14 @@ renamed.
 | Event | What happens |
 |---|---|
 | Pull request, merge queue | A build check: every asset is built, signed, packaged and summed, and `SHA256SUMS` is checked. Nothing is attested, so nothing is published. |
-| Push to `main` | The same, then, per platform group (Linux: `sums-linux`, `attest-linux`, `verify-linux`; macOS: `sums-darwin-arm64`, `attest-darwin-arm64`, `verify-darwin-arm64`, so the Linux files are attested as soon as the Linux builds finish, however long the macOS runners queue), the `attest-*` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`), an SBOM attestation for every tarball (`actions/attest-sbom`) and a build provenance attestation of each tarball alone, whose bundle it saves (artifact `bundles-linux` or `bundles-darwin-arm64`), and nothing else. The `verify-*` job of the group then assembles the group's `SHA256SUMS` (artifact `sha256sums-linux` or `sha256sums-darwin-arm64`, listing only that group's files, each with the same subject as in the commit's one `SHA256SUMS`) again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below, for the branch that was pushed (`--source-ref "$GITHUB_REF"`), and every tarball against its bundle, offline, for the commit (`--commit "$GITHUB_SHA"`). |
+| Push to `main` | The same, as the second stage of the one pipeline (`pipeline.yml`: `ci`, then `artifacts`, then `beta` on these files, then the release; `artifacts.yml` is called by it, and reads the push as its own event), then, per platform group (Linux: `sums-linux`, `attest-linux`, `verify-linux`; macOS: `sums-darwin-arm64`, `attest-darwin-arm64`, `verify-darwin-arm64`, so the Linux files are attested as soon as the Linux builds finish, however long the macOS runners queue), the `attest-*` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`), an SBOM attestation for every tarball (`actions/attest-sbom`) and a build provenance attestation of each tarball alone, whose bundle it saves (artifact `bundles-linux` or `bundles-darwin-arm64`), and nothing else. The `verify-*` job of the group then assembles the group's `SHA256SUMS` (artifact `sha256sums-linux` or `sha256sums-darwin-arm64`, listing only that group's files, each with the same subject as in the commit's one `SHA256SUMS`) again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below, for the branch that was pushed (`--source-ref "$GITHUB_REF"`), and every tarball against its bundle, offline, for the commit (`--commit "$GITHUB_SHA"`). |
 
 An attestation names the ref it was signed on, and only `refs/heads/main` signs now.
 Until main became the only integration branch, pushes to a development branch,
 `feature/arch-v2`, were attested too (historic: those assets and packages still exist,
 and a host that trusts one asks for that branch with `--source-ref`; an asset attested on
 `feature/arch-v2` never verifies as `main`'s). A release (below) verifies as `main` and
-only takes the files of a push run on `main`, so a file built from any other branch is
+only takes the files of the pipeline run of a push to `main`, so a file built from any other branch is
 never released.
 
 Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write`, and only
@@ -319,8 +328,8 @@ How a bundle is made, and what is checked of it:
   artifact `bundles-linux` or `bundles-darwin-arm64`.
 - **Not an SBOM's.** The SBOM attestation of a tarball carries the whole SBOM and can be
   larger than a bundle may be (below); it is not given to a host. A tarball has exactly
-  one bundle, a `kbf-installer` package has exactly one (`<package>.sigstore.json`, the
-  same kind of attestation over the one `.deb`), and nothing else has one.
+  one bundle, a package (`kbf-installer` or `kbf`) has exactly one (`<package>.sigstore.json`,
+  the same kind of attestation over the one `.deb`), and nothing else has one.
 - **Not in `SHA256SUMS`.** The bundle is made after the sums, from the files they list, so
   they cannot list it. `cargo xtask verify-assets sums` leaves out names that end
   `.sigstore.json`, and `cargo xtask release check` holds the directory to one
@@ -360,6 +369,8 @@ refusing it unless:
 
 - `usr/bin/kbf-installer` is byte for byte the binary in the tarball
   `build-commit check-asset` checked for the commit;
+- it holds neither `usr/bin/kbf` nor the unit of a mode: [the `kbf` package](#the-kbf-package-deb)
+  carries them;
 - its control file says the architecture of the platform;
 - `/usr/share/kbf-installer/trust/gh` is the pinned `gh` the job downloaded (checked by
   SHA-256 before use) and executable, `trusted_root.jsonl` is the Sigstore trusted root
@@ -403,6 +414,54 @@ file you give it, so the verification above is the operator's step; the package 
 signed with a key and is not published through an apt repository; and the trusted root
 inside it is a snapshot, which a later Sigstore key rotation outdates (no code reads its
 `valid_until` yet).
+
+## The kbf package (deb)
+
+`kbf` is the second package of a Linux host: the runtime `/usr/bin/kbf` and the systemd
+unit of every mode (`kbf-all-in-one.service`, `kbf-daemon.service`, `kbf-frontend.service`,
+`kbf-storage-and-daemon.service`, `kbf-storage.service`). Installing a newer one is the update
+of a host. The package has no maintainer script, so the package manager replaces the file and
+restarts nothing: the operator restarts the mode unit that runs it (a stop drains).
+`kbf-proxy.service` is the `kbf-installer` package's and is not changed by this package.
+Each mode unit runs `kbf boot-check --mode=<mode>` before it starts `kbf`: the check is the
+`kbf` file itself (it brings the state database to the schema that `kbf` needs, for the modes
+that keep state in it), so the package depends on no other package, `kbf-installer` included.
+
+The five mode units were files of the `kbf-installer` package before this one carried them, so
+the deb of `kbf` says `Replaces: kbf-installer` (any version of it, and no `Conflicts`): without
+it dpkg refuses to unpack `kbf` over the files an older `kbf-installer` owns. The rpm names no
+replacement, so an rpm host that has the installer of before the split upgrades it in the same
+transaction as `kbf`: that installer's rpm owns those files.
+
+The units of the `kbf` package of before this one ran the installer's `boot-check --kbf=<kbf>
+--mode=<mode>`, which now runs `<kbf> boot-check`; a `kbf` of before that verb exits 2 and the
+start fails with a line that says to upgrade the `kbf` package. So the `kbf` package is
+upgraded with the installer or before it; no package relation says so, because the versions
+compare as text.
+
+`cargo xtask pkg-config` writes both packages' configurations from one command line
+(`--binary` the `kbf-installer`, `--kbf` the `kbf` of the same job), and `pkg-build` builds the
+deb and the rpm of each twice and compares them. The `kbf` package is not installed in a
+container (the install test takes one package); its files are checked in the asset step.
+`cargo xtask pkg-kbf-asset` makes the deb the asset `kbf-<commit>-<platform>.deb` and lists it
+in `SHA256SUMS`, refusing it unless:
+
+- `usr/bin/kbf` is byte for byte the `kbf` in the tarball `kbf-<commit>-<platform>.tar.gz`
+  that `build-commit check-asset` checked for the commit, mode 0755;
+- it holds the unit of every mode, mode 0644, and no other file;
+- its control file says the package `kbf`, the architecture of the platform, no `Depends` on
+  `kbf-installer` and `Replaces: kbf-installer`.
+
+It is attested like the other deb: build provenance (as one subject of the `SHA256SUMS`
+attestation, and alone, with its bundle `kbf-<commit>-<platform>.deb.sigstore.json` in
+`bundles-linux`) and **no SBOM attestation**; the `kbf` it carries has the SBOM of its tarball.
+The verify job checks both offline and runs `cargo xtask pkg-kbf-asset --verify-only` on the
+signed file. The deb is verified like the installer's and installed with it (the dependency
+needs `kbf-installer` installed first, or both files given to one `apt install ./<file>` call):
+
+```text
+sudo apt install ./kbf-installer-<commit>-linux-x86_64.deb ./kbf-<commit>-linux-x86_64.deb
+```
 
 ## The kbf-installer package (pkg, macOS)
 
@@ -479,7 +538,7 @@ themselves do not expire with the artifacts.
 
 ## Releases
 
-A release is the files a push run of `artifacts.yml` on `main` left for one commit,
+A release is the files the `artifacts` stage of the pipeline run of a push to `main` left for one commit,
 attached unchanged to a GitHub release
 ([`.github/workflows/release.yml`](../.github/workflows/release.yml)). Nothing is
 rebuilt. Its assets are every tarball and SBOM in the table above, for that commit, the
@@ -487,17 +546,21 @@ rebuilt. Its assets are every tarball and SBOM in the table above, for that comm
 `SHA256SUMS`, and the provenance bundle of each tarball, `<tarball>.sigstore.json`, beside
 it.
 
-One run of `release.yml` cuts a release; nobody tags. It is started by hand
-(`workflow_dispatch`, no inputs: it releases the commit it runs on, as a dry run) and by every
-push to `main` (`push: branches: [main]`). A tag pushed by hand
+One run of `release.yml` cuts a release; nobody tags. A push to `main` runs one sequential pipeline
+(`pipeline.yml`, [design](design/kbf-cicd.md), section 8.0): `ci`, then `artifacts`, then `beta`, which installs and
+tests the `kbf` of the files `artifacts` built in that same run, each stage needing the one before it. `release.yml`
+is started by the completion of a pipeline run (`workflow_run`, `branches: [main]`) and acts only when that run
+succeeded for a push to `main`; it reads the files from that run's artifacts by the run's id and publishes those same
+files. It is a workflow of its own so that nothing a push does can cancel a
+release that has started: its group never cancels, and a pipeline run that is red starts it only to skip
+every job. There is no hand-started run: a failed job is re-run from the run's page (failed jobs only). A tag pushed by hand
 starts nothing, and only the release bot (a GitHub App, the one bypass of the `v*` tag ruleset)
 can create one. The jobs, each with the least token it needs:
 
 | job | does | scopes |
 |---|---|---|
-| `gates` | waits for the push runs of `ci`, `beta` and `artifacts` for the commit on `main` to succeed (`cargo xtask release gates`) | `contents: read`, `actions: read` |
-| `plan` | the next version from `VERSION` and the tags, and whether the push is code, the site or the pipeline itself (`release plan`); the stop switch `RELEASE_FREEZE` is read here | `contents: read` |
-| `verify` | finds the artifacts run, refuses a commit not on `main`, checks the files and every attestation (below), before anything is tagged | `contents`, `actions`, `attestations`: read |
+| `plan` | the next version from `VERSION` and the tags, and whether the push is code, the site or the pipeline itself (`release plan`, measured from the highest release tag that is an ancestor of the commit); the stop switch `RELEASE_FREEZE` is read here | `contents`, `actions`: read |
+| `verify` | refuses a commit not on `main` and a run that is not the successful push run for it (`release locate`), checks the files of that run and every attestation (below), before anything is tagged | `contents`, `actions`, `attestations`: read |
 | `tag` | writes the Beta record and creates the annotated tag at the commit, create-only, with the release bot's token (`release verdict-write`, `release tag`) | `contents: read`; environment `release` |
 | `notes` | checks the tag (`release verify`), the identity of this release and of the one before it, and writes the notes | read |
 | `publish` | creates the release with those files and notes (`release publish`) | `contents: write`; environment `release` |
@@ -506,16 +569,18 @@ can create one. The jobs, each with the least token it needs:
 Every job after `plan` runs only when `plan` says the push ships code and does not change the
 pipeline (`.github/`, `infra/`, `crates/xtask/` and the like): a push of docs only releases
 nothing and the run is green, and a push that changes the pipeline is released by the next one
-that does not. `tag`, `notes`, `publish` and `bump` also run only for a push to `main`, so a
-dispatch is a dry run through `verify`. No job runs after a red one (no `always()`, no
+that does not. `tag`, `notes`, `publish` and `bump` also repeat the condition on the run that started the
+workflow (conclusion `success`, event `push`, branch `main`, this repository). The pipeline run is never cancelled
+and the newest waiting push queues behind it; `plan` measures from the highest release tag that is an ancestor of the
+commit, so the code of a push that was replaced while waiting is released with the next one. No job runs after a red one (no `always()`, no
 `continue-on-error`). `release tag` and `release publish` both refuse a commit that is behind the
 highest release tag, so a re-run of an old run releases nothing; re-run the failed jobs only.
 `verify`, with read-only scopes, fails the run (and nothing is tagged) when:
 
 - the commit is not on `main` (GitHub's compare of `main...<commit>` is neither
   `identical` nor `behind`);
-- there is no successful `push` run of `artifacts.yml` on `main` for that exact commit,
-  or that run no longer holds every artifact a release needs (the assets, the sums and
+- the run that started the workflow is not the successful `push` run on `main` for that exact
+  commit, or it no longer holds every artifact a release needs (the assets, the sums and
   the bundles; they expire after 90 days, so a release is cut within 90 days of the
   commit);
 - a file does not match `SHA256SUMS` (`sha256sum --check --strict`), a file is not
@@ -537,8 +602,8 @@ fails and changes nothing; the files it lacks are uploaded (`cargo xtask release
 publish`).
 
 Two further verbs read the annotated `v*` tag. Its message is the Beta record (`docs/design/kbf-cicd.md`,
-section 8.1), which `release verdict-write` wrote after `release gates` saw the `ci`, `beta` and
-`artifacts` push runs of the commit succeed. The record is an audit record: **nothing gates on it**, and
+section 8.1), which `release verdict-write` wrote for the pipeline run (`ci`, `artifacts` and `beta` all succeeded) that
+started the release, and names that run. The record is an audit record: **nothing gates on it**, and
 no step of the release workflow judges a verdict. `notes` runs both verbs, on a checkout of the whole
 history (the tag object and `origin/main` must be there): `cargo xtask release verify` refuses a
 tag that names another commit than the release, a tag object named other than its ref, and a
@@ -548,14 +613,13 @@ verifies the same. It prints `set-hash=<hex>`, the SHA-256 of `SHA256SUMS`
 notes, which show the record as information and say when the tag carries none; `notes` uploads them
 as the artifact `release-notes`. `notes` passes the hash to `publish` as a
 job output, and `release publish` takes it as `--set-hash` and publishes nothing when the files are
-another set. What gates a release is `release gates` (the three runs green for the commit), then the
+another set. What gates a release is the successful pipeline run that started it, then the
 checks of the files themselves (`release check`, the attestations, the set hash) and the tag's
-commit. (The notes are written after the tag, because they read it, so a dry run does not show
-them.)
+commit. (The notes are written after the tag, because they read it.)
 
-`crates/kbf-integration-test/tests/release_workflow` holds the file to all of this: the events
-(a dispatch only), the job graph and the scopes, `if:` and environment of each job, the halt on
-red, a checkout of the run's commit alone, the release bot's key read in `tag` and `bump` only,
+`crates/kbf-integration-test/tests/release_workflow` holds the file to all of this (and `pipeline_workflow` holds the pipeline it follows to its order, its cancel and its triggers): the events
+(the completion of a `pipeline` run for `main` only), the job graph and the scopes, `if:` and environment of each job, the halt on
+red, a checkout of the commit the pipeline built alone, the release bot's key read in `tag` and `bump` only,
 the data that flows from job to job, pinned actions and an empty top-level `permissions`. The
 job list is pinned, `publish` among them (`gamma.yml`, which followed the workflow, is deleted). On every
 pull request into `main`, CI asks GitHub the same on-`main` question for the pull request's base

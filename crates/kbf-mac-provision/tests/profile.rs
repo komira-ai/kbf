@@ -6,10 +6,16 @@ mod support;
 use kbf_mac_provision::profile::{Profile, ProfileError};
 use support::FakeMac;
 
-/// The test profile with `edit` applied to its lines.
+/// The test profile, less the pool lines the fake Mac adds (so the pool keys are at
+/// their defaults), with `edit` applied to its lines.
 fn edited(edit: impl FnOnce(&mut Vec<String>)) -> String {
     let mac = FakeMac::fresh("profile-edit");
-    let mut lines: Vec<String> = mac.profile_text().lines().map(str::to_owned).collect();
+    let mut lines: Vec<String> = mac
+        .profile_text()
+        .lines()
+        .filter(|l| !l.starts_with("pool_users=") && !l.starts_with("pool_first_uid="))
+        .map(str::to_owned)
+        .collect();
     edit(&mut lines);
     lines.iter().map(|l| format!("{l}\n")).collect()
 }
@@ -591,8 +597,7 @@ fn blank_lines_and_comments_are_skipped() {
 /// SHA-256 wrong (the script's `t_print`).
 #[test]
 fn print_shows_the_resolved_profile_and_its_sha256() {
-    let mac = FakeMac::fresh("print");
-    let text = mac.profile_text();
+    let text = edited(|_| {});
     let sha = support::sha256_hex(text.as_bytes());
     let printed = Profile::parse(text.as_bytes()).unwrap().print();
     let lines: Vec<&str> = printed.lines().collect();
@@ -648,6 +653,7 @@ fn the_example_profile_is_accepted() {
     assert_eq!(p.get("profile"), "mac-arm64-pool");
     assert_eq!(p.role_id, 480);
     assert_eq!(p.lease_uids, 600..=699);
+    assert_eq!((p.pool_users, p.pool_first_uid), (100, 61000));
     assert_eq!(p.time_max_offset_ms, 250);
     assert!(!support::EXAMPLE.contains("kbf_labels"));
     assert_eq!(p.xcodes[1].app(), "/Applications/Xcode-27.0.app");
@@ -668,7 +674,7 @@ fn on_and_off_are_both_accepted() {
 }
 
 /// Catches: a pool, volume or daemon setting of the wrong shape accepted: a pool of
-/// none or of more than 64 users, pool uids below 600, above 65535 or inside
+/// none or of more than 100 users, pool uids below 600, above 65535 or inside
 /// `lease_uids` (the default, the uid after `lease_uids`, included), a volume that is
 /// not `/Volumes/<name>`, a `daemon_user` other than `role` or `root`, and, for a root
 /// daemon, a scratch or cache root off the volume.
@@ -678,22 +684,22 @@ fn every_malformed_pool_volume_or_daemon_setting_is_refused() {
         (
             "no pool user",
             edited(append("pool_users=0")),
-            "pool_users: 0 is not a number from 1 to 64",
+            "pool_users: 0 is not a number from 1 to 100",
         ),
         (
-            "65 pool users",
-            edited(append("pool_users=65")),
-            "pool_users: 65 is not a number from 1 to 64",
+            "101 pool users",
+            edited(append("pool_users=101")),
+            "pool_users: 101 is not a number from 1 to 100",
         ),
         (
             "pool users not a number",
             edited(append("pool_users=four")),
-            "pool_users: four is not a number from 1 to 64",
+            "pool_users: four is not a number from 1 to 100",
         ),
         (
             "pool users too large to parse",
             edited(append("pool_users=99999999999999999999999")),
-            "is not a number from 1 to 64",
+            "is not a number from 1 to 100",
         ),
         (
             "first pool uid below 600",
@@ -716,7 +722,7 @@ fn every_malformed_pool_volume_or_daemon_setting_is_refused() {
         (
             "pool inside lease_uids",
             edited(append("pool_first_uid=697")),
-            "pool uids 697-700 overlap lease_uids 600-699",
+            "pool uids 697-796 overlap lease_uids 600-699",
         ),
         (
             "pool running into lease_uids from below",
@@ -724,17 +730,25 @@ fn every_malformed_pool_volume_or_daemon_setting_is_refused() {
                 set("lease_uids", "650-699")(l);
                 l.push("pool_first_uid=648".into());
             }),
-            "pool uids 648-651 overlap lease_uids 650-699",
+            "pool uids 648-747 overlap lease_uids 650-699",
         ),
         (
             "pool above 65535",
             edited(append("pool_first_uid=65533")),
+            "pool uids 65533-65632 go above 65535",
+        ),
+        (
+            "pool of 4 above 65535",
+            edited(|l| {
+                l.push("pool_users=4".into());
+                l.push("pool_first_uid=65533".into());
+            }),
             "pool uids 65533-65536 go above 65535",
         ),
         (
-            "default pool above 65535",
-            edited(set("lease_uids", "600-65533")),
-            "pool uids 65534-65537 go above 65535",
+            "default pool inside lease_uids",
+            edited(set("lease_uids", "60000-62000")),
+            "pool uids 61000-61099 overlap lease_uids 60000-62000",
         ),
         (
             "volume outside /Volumes",
@@ -797,7 +811,7 @@ fn the_pool_volume_and_daemon_settings_are_accepted_and_printed() {
         set("kbf_data_dir", "/private/var/kbf")(l);
         l.extend(
             [
-                "pool_users=64",
+                "pool_users=100",
                 "pool_first_uid=700",
                 "kbf_volume=/Volumes/farm",
                 "kbf_cache=/private/var/cache",
@@ -809,7 +823,7 @@ fn the_pool_volume_and_daemon_settings_are_accepted_and_printed() {
     let printed = Profile::parse(text.as_bytes()).unwrap().print();
     assert!(
         printed.contains(
-            "pool_users=64\npool_first_uid=700\nkbf_volume=/Volumes/farm\nkbf_cache=/private/var/cache\ndaemon_user=role\n"
+            "pool_users=100\npool_first_uid=700\nkbf_volume=/Volumes/farm\nkbf_cache=/private/var/cache\ndaemon_user=role\n"
         ),
         "{printed}"
     );

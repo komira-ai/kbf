@@ -63,9 +63,9 @@ async fn text(response: Response) -> String {
 }
 
 /// Catches: a source that does not return the status, the body and the headers of the
-/// route it asked (mutants: the status fixed at 200, the headers dropped), one that
+/// route it asked (defects: the status fixed at 200, the headers dropped), one that
 /// reads a route with the caller's authority (the request must carry the lowest trust and
-/// the local address), an answer past its bound read whole (mutant: no `Limited`), and a
+/// the local address), an answer past its bound read whole (defect: no `Limited`), and a
 /// target that is not a request refused as a read error, not a panic.
 #[tokio::test]
 async fn the_source_asks_a_route_as_the_lowest_trust_and_bounds_the_answer() {
@@ -100,7 +100,7 @@ async fn the_source_asks_a_route_as_the_lowest_trust_and_bounds_the_answer() {
 
 /// Catches: a ranged read that sends no `Range` header (the route would send the whole
 /// log, read up to the bound), or one with the bounds swapped or exclusive (the route reads
-/// both ends inclusive); a plain read that sends one. Mutants: `get_range` calling `ask`
+/// both ends inclusive); a plain read that sends one. Catches: `get_range` calling `ask`
 /// with `None`; `last` written as `last + 1`.
 #[tokio::test]
 async fn a_ranged_read_sends_a_range_header_and_a_plain_read_sends_none() {
@@ -115,7 +115,7 @@ async fn a_ranged_read_sends_a_range_header_and_a_plain_read_sends_none() {
 
 /// Catches: a suffix read that sends no `Range` header (the Log page would read the head
 /// of a log, or all of it, when it asked for the end), or sends the span form
-/// `bytes=n-n`, or a bound that is not the one asked for. Mutants: `get_suffix` calling
+/// `bytes=n-n`, or a bound that is not the one asked for. Catches: `get_suffix` calling
 /// `ask` with `None`; the `-` dropped from the header; `get_suffix` delegating to
 /// `get_range`.
 #[tokio::test]
@@ -128,7 +128,7 @@ async fn a_suffix_read_sends_a_suffix_range_header() {
 }
 
 /// Catches: a method other than `GET` and `HEAD` served, or answered without the security
-/// headers (mutants: `post`, `any` for `get`; the `secure` layer dropped or placed inside
+/// headers (defects: `post`, `any` for `get`; the `secure` layer dropped or placed inside
 /// the limit); `HEAD` refused or sent with a body.
 #[tokio::test]
 async fn the_pages_serve_get_and_head_and_refuse_every_other_method_with_the_headers() {
@@ -218,7 +218,7 @@ fn assert_headers(response: &Response, what: &str) {
 }
 
 /// Catches: the security headers on a page but not on the stylesheet, a page the UI does
-/// not know, a refused target (`414`, `400`) or a `429` (mutants: the `secure` layer
+/// not know, a refused target (`414`, `400`) or a `429` (defects: the `secure` layer
 /// inside the limiter, so the limiter's own answers have none; set only on `200`); a
 /// header a handler set not overridden (the handler sets its own policy here).
 #[tokio::test]
@@ -250,7 +250,7 @@ async fn every_answer_under_ui_carries_the_security_headers() {
     assert_headers(&response, "a path too long");
 }
 
-/// Catches: the limiter missing from `/ui` (mutant: the layer removed), and one caller's
+/// Catches: the limiter missing from `/ui` (defect: the layer removed), and one caller's
 /// open pages refusing another's: a held answer is a `429` for its caller and nobody else.
 #[tokio::test]
 async fn ui_reads_are_bounded_per_caller_with_the_headers_on_the_429() {
@@ -289,7 +289,7 @@ async fn send_proxied(router: &Router, browser: &str) -> Response {
     response
 }
 
-/// Catches: every browser behind the proxy sharing one bound on `/ui` (mutant: the
+/// Catches: every browser behind the proxy sharing one bound on `/ui` (defect: the
 /// client address not read by the limiter: all callers are the proxy's loopback address, and
 /// the second browser's first page is a `429`).
 #[tokio::test]

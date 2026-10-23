@@ -17,7 +17,7 @@ fn with(doc: &Value) -> Fake {
 /// Catches: a part of the queue left off the page or shown under another's header: the
 /// depth and the oldest age in words, one row per platform and QoS (each number its own),
 /// the reason with its count and example, the avoided operation with each node as a link
-/// to that node's leases. Mutants: depth and oldest swapped; the QoS column dropped; the
+/// to that node's leases. Catches: depth and oldest swapped; the QoS column dropped; the
 /// reason or the count not written; the nodes written as plain text.
 #[test]
 fn the_page_shows_depth_groups_reasons_and_avoided_operations() {
@@ -93,7 +93,7 @@ fn the_page_shows_depth_groups_reasons_and_avoided_operations() {
 
 /// Catches: an empty queue shown as blank tables or as a guess: the page says nothing is
 /// queued, nothing waits (the API's null age), and that no operation is blocked or kept
-/// off a node. Mutant: a null `oldest_age_ms` shown as `0 ms`.
+/// off a node. Catches: a null `oldest_age_ms` shown as `0 ms`.
 #[test]
 fn an_empty_queue_says_so() {
     let doc = json!({"depth": 0, "oldest_age_ms": null, "by_platform": [], "waiting": [],
@@ -122,7 +122,7 @@ fn an_empty_queue_says_so() {
 
 /// Catches: the avoided list cut at the API's bound without saying so (it lists at most
 /// 100 of `avoided_total`), and the note shown when nothing is cut.
-/// Mutant: the comparison reversed.
+/// Catches: the comparison reversed.
 #[test]
 fn a_cut_avoided_list_says_how_many_there_are() {
     let mut doc = queue_doc();
@@ -153,7 +153,7 @@ fn an_avoided_node_is_encoded_in_its_link() {
 
 /// Catches (the red test of every page): any string the API sends written as markup: the
 /// platform, QoS, reason, operation, instance, digest and node ids.
-/// Mutant: `Html::text` writing raw.
+/// Catches: `Html::text` writing raw.
 #[test]
 fn hostile_strings_are_text() {
     let doc = json!({"depth": 1, "oldest_age_ms": 1,
@@ -174,7 +174,7 @@ fn hostile_strings_are_text() {
 /// Catches: the API's status hidden or guessed at: a `503` with its retry time, a route
 /// that cannot be reached or answers a document the page cannot read is `502`, and the
 /// page's own query is not handed to a route that takes none (it answers `400`).
-/// Mutants: the status forced to 200; the headers not passed on; the query forwarded.
+/// Catches: the status forced to 200; the headers not passed on; the query forwarded.
 #[test]
 fn a_failed_read_keeps_the_apis_status() {
     let fake = Fake::default().with_headers("/v1/queue", 503, &[("retry-after", "9")], "{}");

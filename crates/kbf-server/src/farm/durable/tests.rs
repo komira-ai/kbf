@@ -14,7 +14,8 @@ use kbf_state::{
 };
 use kbf_types::{
     ActionKey, Answer, Digest, DigestFunction, Failure, FarmFault, FarmRun, FencePolicy, LeaseKind,
-    LostWhy, MemoryKill, MemoryRun, Outcome, Qos, Refusal, RefusalRecord, Resources, Waiting,
+    LostWhy, MemoryKill, MemoryRun, Outcome, Qos, Refusal, RefusalRecord, Resources, StartLease,
+    Waiting,
 };
 
 use super::*;
@@ -216,6 +217,14 @@ fn put(store: &Flaky, key: &str, value: Vec<u8>) {
     store.txn(put).expect("store").expect("put");
 }
 
+/// Reserves the blocks of ids that operation `op` and the leases from `seq` are numbered in.
+fn reserve_ids(durable: &Durable, op: u64, seq: u64) {
+    let operation = durable.reserve_operation(OperationId(op));
+    assert_eq!(operation.expect("operation ids"), OperationId(op));
+    let block = durable.reserve_seqs(seq).expect("lease sequences");
+    assert_eq!(block.start, seq);
+}
+
 /// Catches: an epoch that is not kept across starts that keep it, not raised by one that
 /// bumps it (a daemon would keep the runs of leases from before a restored file), a new
 /// store that does not start from the seed it is given (two stores could both begin at
@@ -236,21 +245,24 @@ fn the_epoch_is_seeded_kept_and_bumped() {
     assert_eq!(epoch(EpochPolicy::Bump, 5), 102);
 }
 
-/// Catches: an operation not written at submit (a restart forgets work the client was
-/// told is queued), its place in the queue or its next id not kept, and a second write
-/// of the same operation accepted over the first.
+/// Asserts that an operation is written at submit (a restart remembers work the client was
+/// told is queued), that its place in the queue and the block of ids it was numbered in
+/// are kept (a start numbers past the block), and that a second write of the same
+/// operation is refused over the first.
 #[test]
 fn a_submitted_operation_is_loaded_queued() {
     let store = Flaky::new();
     let durable = open(&store);
+    let id = durable.reserve_operation(OperationId(4)).expect("an id");
+    assert_eq!(id, OperationId(4));
     durable
-        .submitted(OperationId(4), &request(1), &a_subject())
+        .submitted(id, &request(1), &a_subject())
         .expect("submit");
     let stored = durable.load().expect("load");
     assert_eq!(
         stored,
         Stored {
-            next_operation: 5,
+            next_operation: 4 + ID_BLOCK,
             next_seq: 0,
             operations: vec![StoredOperation {
                 operation: OperationId(4),
@@ -271,10 +283,10 @@ fn a_submitted_operation_is_loaded_queued() {
     assert!(matches!(again, Err(StateError::Conflict(_))), "{again:?}");
 }
 
-/// Catches: a grant whose lease is not in the store (a restart forgets the claim a
-/// daemon was told), whose operation stays queued, or whose lease sequence is not
-/// kept (a restart would grant the lease id again: a stale daemon's result taken as
-/// the new lease's).
+/// Asserts that a grant puts its lease in the store (a restart remembers the claim a
+/// daemon was told), that its operation leaves the queue, and that the block of lease
+/// sequences is kept (a restart would grant the lease id again: a stale daemon's result
+/// taken as the new lease's).
 #[test]
 fn a_grant_holds_the_lease_and_leaves_the_queue() {
     let store = Flaky::new();
@@ -282,11 +294,13 @@ fn a_grant_holds_the_lease_and_leaves_the_queue() {
     durable
         .submitted(OperationId(4), &request(1), &a_subject())
         .expect("submit");
+    let block = durable.reserve_seqs(7).expect("a block");
+    assert_eq!(block, 7..7 + ID_BLOCK);
     durable
         .persist(&[Effect::Start(start(4, 7))], None)
         .expect("grant");
     let stored = durable.load().expect("load");
-    assert_eq!(stored.next_seq, 8);
+    assert_eq!(stored.next_seq, block.end);
     let [held] = stored.operations.as_slice() else {
         panic!("{stored:?}");
     };
@@ -322,6 +336,7 @@ fn an_operation_never_holds_two_leases() {
 fn a_stale_complete_is_rejected() {
     let store = Flaky::new();
     let durable = open(&store);
+    reserve_ids(&durable, 4, 0);
     durable
         .submitted(OperationId(4), &request(1), &a_subject())
         .expect("submit");
@@ -351,18 +366,19 @@ fn a_stale_complete_is_rejected() {
     let stored = durable.load().expect("load");
     assert!(stored.operations.is_empty());
     assert_eq!(
-        stored.next_seq, 2,
+        stored.next_seq, ID_BLOCK,
         "a finished operation's ids are not reused"
     );
     assert_eq!(
         keys(&store),
         [
             "done/0000000000000004",
+            "doneof/0000000000000004",
             "meta/epoch",
             "meta/next_op",
             "meta/next_seq"
         ],
-        "a finished operation leaves its result and nothing else"
+        "a finished operation leaves its result, the row naming its action, and nothing else"
     );
 }
 
@@ -375,6 +391,7 @@ fn a_stale_complete_is_rejected() {
 fn an_operation_ends_in_one_transaction_that_puts_its_result() {
     let store = Flaky::new();
     let durable = open(&store);
+    reserve_ids(&durable, 4, 0);
     for operation in [4, 5] {
         durable
             .submitted(OperationId(operation), &request(1), &a_subject())
@@ -414,6 +431,8 @@ fn an_operation_ends_in_one_transaction_that_puts_its_result() {
         [
             "done/0000000000000004",
             "done/0000000000000005",
+            "doneof/0000000000000004",
+            "doneof/0000000000000005",
             "meta/epoch",
             "meta/next_op",
             "meta/next_seq"
@@ -574,7 +593,11 @@ fn a_refusal_removes_the_operation_and_other_effects_write_nothing() {
     assert!(durable.load().expect("load").operations.is_empty());
     assert_eq!(
         keys(&store),
-        ["done/0000000000000004", "meta/epoch", "meta/next_op"]
+        [
+            "done/0000000000000004",
+            "doneof/0000000000000004",
+            "meta/epoch"
+        ]
     );
 }
 
@@ -722,16 +745,8 @@ fn an_unreadable_row_is_refused_naming_it() {
     });
     let pair = kbf_log::encode(Format::V1, &pair).expect("encode");
     let big = u64::MAX.to_be_bytes().to_vec();
-    // A metadata command whose `oneof` arm (field 21) no message of this build names:
-    // it decodes as an unknown command, which is refused by its own text.
-    let unknown = vec![0x0a, 0x03, 0xaa, 0x01, 0x00];
-    let rows: [(&str, Vec<u8>, &str); 12] = [
+    let rows: [(&str, Vec<u8>, &str); 11] = [
         ("op/0000000000000001", vec![0xff, 0xff, 0xff], "malformed"),
-        (
-            "op/0000000000000001",
-            unknown,
-            "a command this binary does not know",
-        ),
         ("op/0000000000000001", lease.clone(), "not a request"),
         ("op/0000000000000001", other, "not a single scheduler input"),
         ("op/0000000000000001", pair, "not a single scheduler input"),
@@ -846,7 +861,12 @@ fn a_result_row_is_kept_for_the_longer_of_the_retention_and_the_floor() {
     clock.advance(seconds(2));
     assert_eq!(durable.ended(short).expect("read"), None, "past the floor");
     assert_eq!(durable.ended(long).expect("read"), Some(finished.clone()));
-    assert_eq!(store.reap_expired().expect("reap"), 1, "only the short row");
+    // The short operation's `done/` row and its `doneof/` row, which has the same life.
+    assert_eq!(
+        store.reap_expired().expect("reap"),
+        2,
+        "only the short operation's rows"
+    );
     clock.advance(seconds(3600));
     assert_eq!(
         durable.ended(long).expect("read"),
@@ -1364,24 +1384,15 @@ fn a_floor_row_that_is_not_one_is_refused() {
 }
 
 /// Catches: a floor store the farm loads on trust. A row whose key is not the key of the
-/// floor in it (a copied or edited row would floor another action), two floors with one
-/// stamp (the eviction order is undefined), and a row that is not a floor are refused
-/// naming the row.
+/// floor in it (a copied or edited row would floor another action), and a row that is not a
+/// floor, are refused naming the row.
 #[test]
 fn a_floor_store_that_contradicts_itself_is_refused() {
     let good = floor::encode(&a_floor(1, 5)).expect("encodes");
-    let same = floor::encode(&a_floor(2, 5)).expect("encodes");
     let cases = [
         (
             vec![(floor::row_key(&key_of(2)), good.clone())],
             "not the key of the floor it holds",
-        ),
-        (
-            vec![
-                (floor::row_key(&key_of(1)), good.clone()),
-                (floor::row_key(&key_of(2)), same),
-            ],
-            "a stamp another floor has",
         ),
         (
             vec![(floor::row_key(&key_of(1)), vec![9])],
@@ -1829,8 +1840,7 @@ fn a_store_with_size_key_rows_reads_as_it_did_without_them() {
 }
 
 /// Catches a key floor row read as anything but what was written: another version, a
-/// row cut short or with bytes after it, a row under another key's name, and two rows
-/// with one stamp.
+/// row cut short or with bytes after it, and a row under another key's name.
 #[test]
 fn a_key_floor_row_that_is_not_one_is_refused() {
     let floor = a_key_floor(7, 5);
@@ -1866,19 +1876,6 @@ fn a_key_floor_row_that_is_not_one_is_refused() {
         .expect("applied");
     let error = durable.load().expect_err("under another key's name");
     assert!(error.to_string().contains("not the key"), "{error}");
-    let store = Flaky::new();
-    let durable = open(&store);
-    for key in [7, 8] {
-        let mut same = row.clone();
-        same[1..9].copy_from_slice(&u64::to_be_bytes(key));
-        store
-            .inner
-            .txn(Txn::new().put(floor::key_row(key), same, Cond::Any))
-            .expect("write")
-            .expect("applied");
-    }
-    let error = durable.load().expect_err("one stamp twice");
-    assert!(error.to_string().contains("stamp"), "{error}");
 }
 
 fn size_key(instance: &str, cfg: Option<u64>) -> kbf_estimator::Key {

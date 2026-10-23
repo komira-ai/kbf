@@ -1165,7 +1165,7 @@ fn a_driver_missing_its_flags_refuses_to_start() {
 
 /// Catches the container driver starting on a node whose daemon user has no
 /// subordinate ids, or too few (every lease would fail at `crun`'s id mapping): the
-/// "drop the startup check" mutant. The daemon exits non-zero naming the file and
+/// "drop the startup check" defect. The daemon exits non-zero naming the file and
 /// the user, before it reaches the front.
 #[test]
 #[cfg_attr(

@@ -125,12 +125,12 @@ cache.
 
 ## 4. The shared transfer engine
 
-CEO ruling (2026-10-13): all bulk blob movement goes through one shared transfer engine
+Ruling (2026-10-13): all bulk blob movement goes through one shared transfer engine
 in kbf. That covers input fetch, output upload, cache fill, and later the server's
 object-store traffic. The engine speaks gRPC over HTTP/2 to kbf-server and runs many
 concurrent streams under one in-flight limit for the whole process. Small blobs are
 batched and large blobs are streamed in chunks. FindMissing runs before every upload.
-Never one file at a time. CEO decision (2026-10-13): **one** HTTP/2 connection per
+Never one file at a time. Decision (2026-10-13): **one** HTTP/2 connection per
 daemon, carrying many concurrent streams (4.2).
 
 ### 4.1 Where it lives and what it replaces
@@ -307,7 +307,7 @@ Heartbeat.
 
 ### 4.7 TLS
 
-kbf must not enforce TLS (CEO ruling: TLS optional in the open-source build; the farm's
+kbf must not enforce TLS (ruling: TLS optional in the open-source build; the farm's
 deployment uses it). The engine has no TLS policy: it connects to whatever `--cas`
 names. Today three places refuse plain text on blob traffic: `cas_client`
 (`kbf-node/src/main.rs:463`), `Server::parse` (`kbf-daemon/src/connect.rs:57-58`), and
@@ -544,7 +544,7 @@ the cache removes), and trusting entries after a restart without a verify, and w
 ### 6.5 Sizing, eviction and the link limit
 
 - **Budget.** `--cache-max-bytes` sets the budget; unset means no cache, which stays the
-  open-source default. CEO decision (2026-10-13): the farm runs the cache as an LRU with
+  open-source default. Decision (2026-10-13): the farm runs the cache as an LRU with
   a **400 GB maximum per node**, set in the farm's deploy config, not in kbf. C1 also has
   `--cache-min-free-bytes`, a floor on the filesystem's free space (`statvfs`). The farm's starting floor is 100 GB (*unmeasured*), tuned from
   `cache_evictions` and `cache_floor_unreachable`.
@@ -1005,7 +1005,7 @@ left open):
   file up before a rename or a link, and refuses to copy up one whose owner the caller's
   user namespace does not map (`EOVERFLOW`). Section 5.1 expected the rename to work. An
   input an output names is a private copy, so moving it into its output path works; an
-  action that renames another input fails. Decided (CEO): accept it, as Q1 accepted
+  action that renames another input fails. Decided: accept it, as Q1 accepted
   `EACCES`. An action that renames some other cached input into an output fails; Q1's
   private-copy opt-out (`kbf-writable-inputs=1`) is added only if a real build breaks.
 - `CacheUse` carries the cache's configuration, and `ContainerRuntime::new` opens it; a
@@ -1139,7 +1139,7 @@ driver, sized the same way; what it leaves out follows):
 | **Owner = subordinate id 1 for cache files** | `fs.protected_hardlinks` stops the daemon linking files it does not own. |
 | **A pool of connections to kbf-server** | One HTTP/2 connection carries many streams (4.2); a pool can be added later if a measurement ever shows the one connection is the limit. |
 | **Wipe the cache at start** (Buildbarn's hard-link cache) | Daemons restart on every deploy, so every node would go cold each time. `tmp/` plus a rename, the index and lazy verify make keeping it safe (6.8). |
-| **A startup scan of `blobs/`** (rebuild the LRU and total from the files, with the cache off until it ends) | Every restart would run uncached, or cold, for as long as listing 400 GB takes. CEO decision (2026-10-13): no blocking startup scan; a background adopt pass is allowed; an index loaded at start (6.9). The adopt pass never gates a lease. |
+| **A startup scan of `blobs/`** (rebuild the LRU and total from the files, with the cache off until it ends) | Every restart would run uncached, or cold, for as long as listing 400 GB takes. Decision (2026-10-13): no blocking startup scan; a background adopt pass is allowed; an index loaded at start (6.9). The adopt pass never gates a lease. |
 | **An append log over the snapshot** (revision 4) | A fresh or discarded index stayed cold until the first compaction; a short write mid-log lost every later record, and a dropped batch could double-count; the unindexed-file bound was false, and a deleting sweep made a lost index 400 GB to refetch (6.9). Adopting files makes one whole-file snapshot enough. |
 | **Deleting files the index does not list** | A lost snapshot would turn the whole cache into deletes and refetches, and a deleting pass races fills. The adopt pass adds them instead (6.9). |
 | **An embedded store for the index** (redb, SQLite, sled) | 6.9: a second recovery procedure to trust, repair on open after a crash; SQLite is not Rust. |
@@ -1155,7 +1155,7 @@ driver, sized the same way; what it leaves out follows):
   action cannot write; today the same open quietly gets a private copy. Compilers and
   linkers read inputs and write new outputs, so they never hit this. A tool that patches
   an input where it lies would. An output that is also an input still works (5.1).
-  Decided (CEO, 2026-10-13): accept it, as Buildbarn does. Buildbarn's virtual mode
+  Decided (2026-10-13): accept it, as Buildbarn does. Buildbarn's virtual mode
   refuses an open for write or truncate with EACCES
   (`pkg/filesystem/virtual/blob_access_cas_file_factory.go`, `VirtualOpenSelf`), a size
   change with EACCES and a chown with EPERM (`VirtualSetAttributes`; chmod is still
@@ -1165,6 +1165,6 @@ driver, sized the same way; what it leaves out follows):
   action private copies) only if a real build breaks.
 - **Q2. Locality placement (C5b).** *Recommendation:* ship C5a's report only, and decide
   with a week of `InputStats` from the farm.
-- **Q3. Default budget.** Decided (CEO, 2026-10-13): no default in kbf (no flag, no
+- **Q3. Default budget.** Decided (2026-10-13): no default in kbf (no flag, no
   cache). The farm's deploy config sets an LRU of 400 GB max per node and keeps the
   free-space floor (100 GB to start, tuned from `cache_evictions`).

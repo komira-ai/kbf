@@ -27,7 +27,7 @@
 //! ```
 //!
 //! writes `<work>/beta-result.json` and the logs in `<work>/logs`, and exits 0 only if every
-//! gate passed. `--mutant` makes the farm worse in one way each gate exists to catch.
+//! gate passed. `--fault` makes the farm worse in one way each gate exists to catch.
 //!
 //! The library spawns the binaries it is given by path and links neither `kbf-server`
 //! nor `kbf-node` today (tests/layering.rs fails a crate outside its joiners that links

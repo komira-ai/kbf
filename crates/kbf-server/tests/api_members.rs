@@ -32,9 +32,9 @@ use tokio::net::TcpStream;
 const TTL: Duration = Duration::from_secs(30);
 const DWELL: Duration = Duration::from_secs(120);
 
-/// The tick of every server here: one that does not come within a test. The update controller
-/// looks at every tick, and its reads of the store meet the faults that a test arms for a
-/// request (`support/looks.rs` says why). No test here waits for a tick.
+/// The tick of every server here: one that does not come within a test. A server task that
+/// looks at every tick would meet the faults that a test arms for a request (`support/looks.rs`
+/// says why). No test here waits for a tick.
 const TICK: Duration = Duration::from_secs(3600);
 
 fn config() -> MembershipConfig {
@@ -58,6 +58,7 @@ fn listeners() -> Listeners {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -633,10 +634,10 @@ async fn members_is_read_like_nodes_and_takes_no_write() {
 }
 
 /// The reads of `(update/desired, deny/)` the server makes by itself as it starts, with no
-/// release store: the update controller reads `update/desired` once (no release is desired),
-/// and the sweeper's refresh reads `deny/` ([`looks::Looks`]). A test that arms a fault first
+/// release store: nothing reads `update/desired`, and the sweeper's refresh reads `deny/`
+/// ([`looks::Looks`]). A test that arms a fault first
 /// waits for them; the test at the end holds the numbers.
-const START_LOOKS: (usize, usize) = (1, 1);
+const START_LOOKS: (usize, usize) = (0, 1);
 
 /// A server whose state store is the hooked fake, which the test makes fail.
 fn failing(hooked: &Arc<Hooked>) -> Server {
@@ -707,12 +708,13 @@ async fn a_store_that_fails_is_503_and_a_map_that_is_wrong_or_a_panic_is_500() {
 /// Catches the wait of `Looks::done` being wrong, which the failing-store test above cannot
 /// show by itself (it would flake, or hang): the server's own reads of `update/desired` and
 /// `deny/` are `START_LOOKS` at start, and it reads nothing at all by itself after the wait,
-/// for as long as a test runs. A reader added beside the controller and the sweeper, a read
-/// added to one's look, or a tick that comes, makes the total more, and a fault armed after
+/// for as long as a test runs. A reader added beside the sweeper, a read
+/// added to its look, or a tick that comes, makes the total more, and a fault armed after
 /// the wait would be met by one of them and not by its request; a read fewer makes a count
 /// less, and the wait never ends.
 ///
-/// Mutants seen red: `START_LOOKS` of `(0, 1)` and of `(1, 0)` (the counts after the wait).
+/// A `START_LOOKS` above the real counts never ends the wait; one below them lets a read
+/// through after it.
 #[tokio::test]
 async fn the_server_reads_the_store_by_itself_only_at_start() {
     let hooked = Hooked::new();
@@ -724,4 +726,47 @@ async fn the_server_reads_the_store_by_itself_only_at_start() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(looks.seen(), START_LOOKS);
     assert_eq!(every_read.load(Ordering::SeqCst), at_start);
+}
+
+/// Catches: a store written by an older build, which holds `update/*` rows for hosts, the
+/// places in use, a run and a policy, that the server cannot start on or reads and changes:
+/// the server starts over it, answers, and leaves every update row exactly as it was.
+#[tokio::test]
+async fn a_store_holding_old_update_rows_starts_serves_and_leaves_them_alone() {
+    let hooked = Hooked::new();
+    let old: [(&str, &[u8]); 5] = [
+        ("update/desired", &[0x08, 0x01, 0x12, 0x02, 0x76, 0x32]),
+        ("update/policy", &[0x08, 0x01, 0x20, 0x02]),
+        (
+            "update/slot",
+            &[0x0a, 0x08, 0x0a, 0x02, 0x73, 0x31, 0x10, 0x05, 0x18, 0x01],
+        ),
+        ("update/host/s1", &[0x08, 0x0d, 0x10, 0x09, 0x30, 0x07]),
+        ("update/host/d1", &[0x08, 0x01]),
+    ];
+    for (key, bytes) in old {
+        hooked
+            .fake
+            .txn(Txn::new().put(key, bytes.to_vec(), Cond::Absent))
+            .expect("store")
+            .expect("a new row");
+    }
+    let looks = looks::Looks::count(&hooked);
+    let server = failing(&hooked);
+    looks.done(START_LOOKS).await;
+    assert_eq!(members(server.api).await, empty());
+    let mut held: Vec<(String, Vec<u8>)> = hooked
+        .fake
+        .scan_prefix("update/")
+        .expect("scan")
+        .into_iter()
+        .map(|(key, row)| (key, row.value))
+        .collect();
+    let mut want: Vec<(String, Vec<u8>)> = old
+        .iter()
+        .map(|(key, bytes)| ((*key).to_owned(), bytes.to_vec()))
+        .collect();
+    held.sort();
+    want.sort();
+    assert_eq!(held, want);
 }

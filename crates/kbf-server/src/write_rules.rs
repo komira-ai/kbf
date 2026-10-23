@@ -142,6 +142,12 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
             "farm/durable (read by the old child's follower)",
             "done/0000000000000001",
         ),
+        // The action a result is of, beside its `done/` row (`farm/durable/named.rs`).
+        fenced(
+            Keys::Under("doneof/"),
+            "farm/durable/named",
+            "doneof/0000000000000001",
+        ),
         fenced(Keys::Under("cordon/"), "farm/durable", "cordon/node-a"),
         fenced(
             Keys::Under("lease/"),
@@ -149,6 +155,14 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
             "lease/0000000000000001.0000000000000001",
         ),
         fenced(Keys::Under("session/"), "farm/durable", "session/node-a"),
+        // Which frontend owns a node, and the index from an operation to its lease
+        // (`farm/durable/owner.rs`, `farm/durable/leases.rs`).
+        fenced(Keys::Under("owner/"), "farm/durable/owner", "owner/node-a"),
+        fenced(
+            Keys::Under("lease-by-op/"),
+            "farm/durable/leases",
+            "lease-by-op/0000000000000001",
+        ),
         // The pin of the operation that runs an action: the request's instance name, not the
         // writing process's id, so it is fenced with `op/` (`farm/durable/inflight.rs`).
         fenced(
@@ -217,21 +231,27 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
             "update/rows",
             "update/policy",
         ),
-        fenced(Keys::Exactly("update/slot"), "update/rows", "update/slot"),
+        // Rows an older build wrote and no code writes now; they stay fenced so a store
+        // holding them is classified, and are read only by `stored_update`.
+        fenced(
+            Keys::Exactly("update/slot"),
+            "retired, read-only",
+            "update/slot",
+        ),
         fenced(
             Keys::Under("update/host/"),
-            "update/rows",
+            "retired, read-only",
             "update/host/node-a",
         ),
-        // The release poller's proposals (`update/proposal.rs`): never `update/desired`.
+        // Proposals the release poller wrote; none is written now, the view still lists them.
         fenced(
             Keys::Under("update/proposed/"),
-            "update/proposal (release poller)",
+            "retired, read-only",
             "update/proposed/0000000000000000000000000000000000000000",
         ),
         fenced(
             Keys::Under("update/order/"),
-            "update/rows (counter)",
+            "retired, read-only",
             "update/order/0000000000000001",
         ),
         // Object-store registrations (`object_store/rows.rs`).

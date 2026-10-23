@@ -76,7 +76,7 @@ impl StatusReader for FakeStatus {
 }
 
 /// How long a read waits inside a closed [`Stall`] before it goes on anyway, so that a
-/// test that forgets to open it, or a mutant that blocks the test itself, ends.
+/// test that forgets to open it, or a defect that blocks the test itself, ends.
 const STALL_CAP: Duration = Duration::from_secs(3);
 
 struct StallInner {

@@ -1,6 +1,6 @@
 //! What a storage node tells its frontend of the build it runs and of its metadata log
 //! (`RegisterRequest` fields 10 to 12, `HeartbeatRequest` fields 24 to 26): the newest log
-//! version its build can raise the log to, the version the log is at now, and the commit
+//! version its build runs (informational), the version the log is at now, and the commit
 //! built. These tests run the node's own registration path (`Joiner`, and `start_storage`
 //! through to the open of its log), so a node that stops saying them, or says a constant,
 //! goes red here and not only in the tests that call the membership service directly.
@@ -18,13 +18,14 @@ use hooked::Hooked;
 use kbf_front::Cache;
 use kbf_log::MachineVersion;
 use kbf_map::MemberId;
+use kbf_meta::Retention;
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_server::{Membership, MembershipServer};
 use kbf_server::join::{Identity as NodeIdentity, Joiner, reported_commit};
 use kbf_server::members::{Members, MembershipConfig, NodeFacts};
 use kbf_server::raft_log::RUNS;
 use kbf_server::storage_node::{StorageFlags, command, parse, start_storage};
-use kbf_server::{EpochPolicy, Listeners, StateStore, bind_server_with_state};
+use kbf_server::{EpochPolicy, Listeners, RaftMetaLog, StateStore, bind_server_with_state};
 use kbf_state::Store;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Endpoint, Server};
@@ -60,6 +61,7 @@ fn frontend() -> (SocketAddr, Members) {
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -219,24 +221,30 @@ async fn a_joiner_says_what_its_node_runs_and_where_its_log_is_at_every_call() {
     assert_eq!(said[2], (None, None, commit));
 }
 
-/// Catches: a started storage node that does not report, or reports a constant: its
-/// frontend's row must hold `RUNS` for what its build runs, the commit it was built from,
-/// and the version its log was raised to. A registered node raises its log to 4 as it opens
-/// (`open_registered`), after the registration that said 1, so the row reads 4 only if the
-/// heartbeats follow the log. Mutants: no `with_log` in `open_cache` (the numbers stay
-/// absent); `log_version` reporting `RUNS` (5), or 1 (the version of the new log), whatever
-/// the log is at.
+/// Asserts that a started storage node reports what it runs and where its log is: its
+/// frontend's row holds `RUNS` for what its build runs, the commit it was built from, and
+/// the version its log is at. The log in the node's directory was raised to version 3 by an
+/// earlier build, and a registered node raises nothing as it opens (`open_registered`), so
+/// the row reads 3: not 1 (the version of a new log, which the registration would say for a
+/// constant) and not `RUNS` (5). A node that reported nothing would leave the numbers
+/// absent.
 #[tokio::test]
-async fn a_started_node_reports_what_it_runs_and_the_version_its_log_was_raised_to() {
+async fn a_started_node_reports_what_it_runs_and_the_version_its_log_is_at() {
     let (worker, members) = frontend();
     let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "node-facts-started");
+    let log = RaftMetaLog::open_dir(&dir.join("meta"), Retention::default(), "kbf/")
+        .await
+        .expect("open the log");
+    log.raise_machine_version(MachineVersion::V3)
+        .expect("the earlier build's raise");
+    drop(log);
     let node = start_storage(&flags(&dir, worker), never)
         .await
         .expect("starts");
     let serving = tokio::spawn(node.serve());
     let want = NodeFacts {
         runs_log: Some(RUNS.get()),
-        log_version: Some(MachineVersion::V4.get()),
+        log_version: Some(MachineVersion::V3.get()),
         build_commit: Some(reported_commit().to_owned()),
     };
     let mut seen = NodeFacts::default();

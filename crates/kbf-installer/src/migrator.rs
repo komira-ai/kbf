@@ -228,8 +228,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What the binary at `program` prints for `--version --json`: run as the caller with an
 /// empty environment in `/`, and read as strictly as the installer read it when it installed
-/// the release. Nothing says whose build it is: [`installed_schema`] adds that check, and a
-/// host that holds one binary and no release (a bundled one) has no commit to compare with.
+/// the release. Nothing says whose build it is: [`installed_schema`] adds that check.
 ///
 /// # Errors
 /// [`Refusal::SchemaUnknown`]: the program cannot run, runs past [`PROBE_TIMEOUT`], exits

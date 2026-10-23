@@ -93,6 +93,17 @@ pub struct State {
     /// and change nothing when they start with one of these, as a `pmset -a` or a
     /// `defaults write` refused by the system.
     pub fails: Vec<String>,
+    /// A `dscl .` fed commands exits 1 and runs none of them.
+    pub stdin_fails: bool,
+    /// A `dscl .` fed commands skips each line that has one of these in it, as for a
+    /// command it refuses, runs the others, and exits 1.
+    pub stdin_rejects: Vec<String>,
+    /// `dscl . -readall` exits 1 and prints nothing.
+    pub readall_fails: bool,
+    /// `dscl . -readall` exits 0 and prints nothing.
+    pub readall_empty: bool,
+    /// Directories that cannot be made.
+    pub mkdir_fails: Vec<String>,
     /// Calls that, starting with one of these, exit 0 and change nothing.
     pub no_effect: Vec<String>,
     /// Mounted volumes `diskutil info` reports: mount point, file system personality.
@@ -145,6 +156,8 @@ pub struct FakeMac {
     /// The programs' state; the programs `apply` runs change it.
     pub state: RefCell<State>,
     pub log: RefCell<Vec<String>>,
+    /// The text each program run with input was fed, in order.
+    pub inputs: RefCell<Vec<String>>,
     /// The test profile, made when the Mac is: a drift of the files it pins (an Xcode
     /// `.xip`, the probe) does not change it.
     profile: String,
@@ -202,6 +215,7 @@ impl FakeMac {
             root: root.to_str().unwrap().to_owned(),
             state: RefCell::new(state),
             log: RefCell::new(Vec::new()),
+            inputs: RefCell::new(Vec::new()),
             profile: String::new(),
         };
         mac.write(
@@ -360,6 +374,8 @@ impl FakeMac {
                 }
             })
             .collect();
+        // The tests' pool: 4 users from uid 700 (the profile's own default is 100 from 61000).
+        text.push_str("pool_users=4\npool_first_uid=700\n");
         let file_sha = |p: &str| sha256_hex(&fs::read(self.path(p)).unwrap());
         text.push_str(&format!(
             "xcode=17A000:/Applications/Xcode-26.6.app/Contents/Developer:{}\n",
@@ -392,6 +408,7 @@ impl FakeMac {
             "defaults read ",
             "dscl . -read ",
             "dscl . -list ",
+            "dscl . -readall ",
             "dseditgroup -o checkmember ",
             "systemsetup -get",
             "socketfilterfw --getglobalstate",
@@ -548,6 +565,25 @@ impl FakeMac {
                             .collect()
                     });
                 s.attr(&record, "GroupMembership", &members.join(" "));
+                // The user's `GeneratedUID` goes from `GroupMembers` too.
+                let guid = s
+                    .records
+                    .get(&format!("/Users/{user}"))
+                    .and_then(|a| a.iter().find(|(k, _)| k == "GeneratedUID"))
+                    .map(|(_, v)| v.clone());
+                if let Some(guid) = guid {
+                    let kept: Vec<String> = s
+                        .records
+                        .get(&record)
+                        .and_then(|a| a.iter().find(|(k, _)| k == "GroupMembers"))
+                        .map_or_else(Vec::new, |(_, v)| {
+                            v.split_whitespace()
+                                .filter(|m| *m != guid)
+                                .map(str::to_owned)
+                                .collect()
+                        });
+                    s.attr(&record, "GroupMembers", &kept.join(" "));
+                }
                 done(true)
             }
             _ => None,
@@ -598,6 +634,35 @@ impl FakeMac {
                             _ => out.push_str(&format!("{a}: {v}\n")),
                         }
                     }
+                }
+                ok(out)
+            }
+            ("dscl", [".", "-readall", ..]) if s.readall_fails => no(""),
+            ("dscl", [".", "-readall", ..]) if s.readall_empty => ok(String::new()),
+            ("dscl", [".", "-readall", dir, attrs @ ..]) => {
+                let prefix = format!("{dir}/");
+                let mut out = String::new();
+                for (record, found) in &s.records {
+                    let Some(name) = record.strip_prefix(&prefix) else {
+                        continue;
+                    };
+                    // Other names of the record are kept as a `RecordName` attribute.
+                    let others = found
+                        .iter()
+                        .find(|(k, _)| k == "RecordName")
+                        .map_or("", |(_, v)| v.as_str());
+                    out.push_str(&format!("RecordName: {name} {others}\n"));
+                    for a in attrs.iter().filter(|a| **a != "RecordName") {
+                        let Some((_, v)) = found.iter().find(|(k, _)| k == a) else {
+                            continue;
+                        };
+                        match *a {
+                            "AuthenticationAuthority" => out.push_str(&format!("{a}:\n {v}\n")),
+                            "IsHidden" => out.push_str(&format!("dsAttrTypeNative:{a}: {v}\n")),
+                            _ => out.push_str(&format!("{a}: {v}\n")),
+                        }
+                    }
+                    out.push_str("-\n");
                 }
                 ok(out)
             }
@@ -774,6 +839,54 @@ impl Host for FakeMac {
         }
     }
 
+    /// `dscl .` fed commands runs them in order, as dscl's interactive mode does:
+    /// `create RECORD [ATTR VALUE]` and `delete RECORD ATTR`. The log gets one entry for
+    /// the process, and `inputs` the text it was fed.
+    fn run_with_input(&self, program: &str, args: &[&str], input: &str) -> io::Result<Output> {
+        let name = program.rsplit('/').next().unwrap();
+        self.log
+            .borrow_mut()
+            .push(format!("{name} {} <stdin", args.join(" ")));
+        self.inputs.borrow_mut().push(input.to_owned());
+        if (name, args) != ("dscl", &["."][..]) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no fake for {program} {args:?} with input"),
+            ));
+        }
+        let mut s = self.state.borrow_mut();
+        if s.stdin_fails {
+            return Ok(Output {
+                success: false,
+                stdout: String::new(),
+            });
+        }
+        let rejects = s.stdin_rejects.clone();
+        let mut rejected = false;
+        for line in input.lines() {
+            if rejects.iter().any(|r| line.contains(r.as_str())) {
+                rejected = true;
+                continue;
+            }
+            match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+                ["create", record] => {
+                    s.records.entry((*record).into()).or_default();
+                }
+                ["create", record, attr, value] => s.attr(record, attr, value),
+                ["delete", record, attr] => {
+                    if let Some(attrs) = s.records.get_mut(*record) {
+                        attrs.retain(|(a, _)| a != attr);
+                    }
+                }
+                other => panic!("the fake dscl cannot run {other:?}"),
+            }
+        }
+        Ok(Output {
+            success: !rejected,
+            stdout: String::new(),
+        })
+    }
+
     fn lstat(&self, path: &str) -> Option<Stat> {
         let mut stat = Stat::of(&fs::symlink_metadata(self.path(path)).ok()?);
         if let Some(&(uid, gid)) = self.state.borrow().owners.get(path) {
@@ -804,6 +917,9 @@ impl Host for FakeMac {
 
     fn mkdir(&self, path: &str) -> io::Result<()> {
         self.log.borrow_mut().push(format!("mkdir {path}"));
+        if self.state.borrow().mkdir_fails.iter().any(|d| d == path) {
+            return Err(io::Error::other("cannot make it"));
+        }
         fs::create_dir_all(self.path(path))
     }
 

@@ -122,7 +122,7 @@ replaces the earlier one when it has one. An `all` needs at least one policy.
 | `contentAddressableStorage.getAuthorizer` | BatchReadBlobs, GetTree, ByteStream Read, SplitBlob, GetChunkMapping |
 | `contentAddressableStorage.putAuthorizer` | BatchUpdateBlobs, ByteStream Write, ByteStream QueryWriteStatus, SpliceBlob, RegisterChunkMapping |
 | `actionCache.getAuthorizer` | GetActionResult |
-| `executeAuthorizer` | Execute, and WaitExecution against the instance name the operation was submitted under |
+| `executeAuthorizer` | Execute, and WaitExecution and GetOperation against the instance name the operation was submitted under |
 | none | UpdateActionResult: always PERMISSION_DENIED |
 | `invocations.getAuthorizer` | not a REAPI call: `GET /v1/invocations/{id}` and below on the operator API listener ([api.md](api.md#get-v1invocationsid-and-below)), asked with every instance name the invocation used |
 | `blobs.getAuthorizer` | not a REAPI call: `GET /v1/blobs/{digest}` on the operator API listener ([api.md](api.md#get-v1blobsdigest)), asked with its `instance` parameter |
@@ -131,8 +131,12 @@ replaces the earlier one when it has one. An `all` needs at least one policy.
 Each call is authorized against its request's instance name: `instance_name` in the
 REAPI messages; for ByteStream, every segment of the resource name before `blobs/`
 (Read) or `uploads/` (Write, QueryWriteStatus); for RegisterChunkMapping, the first
-message's. WaitExecution looks the operation up first: an unknown name is NOT_FOUND,
-whoever asks. The chunking calls are authorized, then answer UNIMPLEMENTED as before.
+message's. WaitExecution and GetOperation look the operation up first: an unknown name is
+NOT_FOUND, whoever asks; the instance name is the one the operation was submitted under,
+which the state store keeps with a finished operation's result too. The other calls of the
+`google.longrunning.Operations` service (ListOperations, DeleteOperation, CancelOperation,
+WaitOperation) are not served: UNIMPLEMENTED, with no authorizer asked. The chunking calls
+are authorized, then answer UNIMPLEMENTED as before.
 
 The reads Execute makes for itself (the action cache lookup, the action, its input
 tree) are not authorized again, as in Buildbarn.

@@ -46,7 +46,7 @@ use crate::store_config::service::ColdStoreService;
 use crate::streams::{StreamLimits, flow_windows};
 use crate::token::ApiToken;
 use crate::ui_mount::bind_server_with_options;
-use crate::worker::WorkerService;
+use crate::worker::{HostFloor, WorkerService};
 use crate::worker_roles::WorkerRolesLayer;
 use kbf_mapsync::MapSource;
 use kbf_proto::kbf::enroll::v1::cold_store_server::ColdStoreServer;
@@ -86,6 +86,10 @@ pub struct Listeners {
     /// books, the others are what it climbs through when it passes its own memory
     /// limit, before a whole host (`--memory-ladder-gib`).
     pub memory_ladder: MemoryLadder,
+    /// What a node that reports VM slots keeps for the host: its CPUs and memory,
+    /// subtracted from what placement may book on it (`--vm-host-floor-cpus`,
+    /// `--vm-host-floor-mem-gib`).
+    pub vm_host_floor: HostFloor,
     /// Whether the farm shows `kbf-estimator` what finished (`--learned-sizes`).
     pub learned_sizes: crate::LearnedSizes,
     /// How long a finished operation is kept after its callers are answered, in which
@@ -754,8 +758,6 @@ where
     let update_rows = state
         .as_ref()
         .map(|s| crate::update::Rows::new(Arc::clone(&s.store)));
-    let update_store = state.as_ref().map(|s| Arc::clone(&s.store));
-    let update_members = members.clone();
     let farm = Arc::new(farm.with_state(state)?);
     // One start, one bind budget: the three listeners wait for a late interface together.
     let binder = Binder::new();
@@ -803,6 +805,8 @@ where
         Arc::clone(&farm),
         token.clone(),
         Arc::clone(&drain),
+        // A server with no frontend role has nothing to retire: its retire routes answer 409.
+        Arc::default(),
         members.clone(),
         update_rows.clone(),
         // A server with no frontend role has no enrollment.
@@ -869,7 +873,8 @@ where
         peers,
         listeners.heartbeat_interval,
         listeners.hello_wait,
-    );
+    )
+    .with_host_floor(listeners.vm_host_floor);
     // The map, if there is one: no branch in this generic function.
     let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
     // The offers, if there are a release store and a state store: no branch here either.
@@ -926,15 +931,6 @@ where
         // and they never delay it. It stops when the serving future does.
         let history = crate::history::spawn(history);
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
-        // The rolling-update controller; it starts hosts for the desired release unless the
-        // operator wrote `auto_nodes` false or paused it.
-        let _updates = crate::update::spawn_controller(
-            Arc::clone(&farm),
-            update_store,
-            update_members,
-            listeners.tick,
-        )
-        .map(AbortOnDrop);
         // `reapi_incoming` carries the REAPI TLS when there is any, so the health
         // service is served over the same TLS as the REAPI routes; the authenticator is
         // already applied to those routes alone (above).
@@ -973,6 +969,8 @@ where
                 farm.tick().await;
             }
         };
+        // What the other frontends of a shared state store did (`Farm::intake`).
+        let intaking = farm.poll_intake();
         // Completes when the drain has run out of time or was forced: the REAPI
         // listener, drained in time, completes first.
         let stopping = async {
@@ -991,6 +989,7 @@ where
             // for again below (`reapi_done` stays false).
             served = &mut api_serve => served.map_err(ServeError::Api),
             () = ticking => Ok(()),
+            () = intaking => Ok(()),
             () = sweeping => Ok(()),
             // One timer for every open stream's progress operation.
             () = ticker.run() => Ok(()),

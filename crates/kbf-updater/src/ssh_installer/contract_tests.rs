@@ -27,6 +27,9 @@ fn refusals() -> Vec<Refusal> {
         Refusal::ChannelUnsigned,
         Refusal::KeyUntrusted,
         Refusal::ChannelInsecure,
+        Refusal::UnknownRelease,
+        Refusal::AmbiguousRelease,
+        Refusal::FetchFailed,
     ];
     for r in &all {
         match r {
@@ -36,7 +39,10 @@ fn refusals() -> Vec<Refusal> {
             | Refusal::ConfigUnsafe
             | Refusal::ChannelUnsigned
             | Refusal::KeyUntrusted
-            | Refusal::ChannelInsecure => {}
+            | Refusal::ChannelInsecure
+            | Refusal::UnknownRelease
+            | Refusal::AmbiguousRelease
+            | Refusal::FetchFailed => {}
         }
     }
     all

@@ -32,7 +32,10 @@
 
 #[cfg(any(test, feature = "test-support"))]
 mod backend;
+pub mod boot;
 mod conn;
+#[cfg(feature = "test-database")]
+mod database;
 mod reach;
 pub mod schema;
 mod session;
@@ -51,6 +54,8 @@ use postgres::types::ToSql;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use backend::PostgresBackend;
+#[cfg(feature = "test-database")]
+pub use database::{TestDatabase, test_database};
 pub use reach::{Unreached, reach};
 use session::{Edge, Pool, RangeShape, Session};
 use tx::{Level, Row, Tx, micros};
@@ -974,8 +979,7 @@ mod tests {
     }
 
     fn url() -> String {
-        std::env::var("KBF_TEST_POSTGRES_URL")
-            .expect("KBF_TEST_POSTGRES_URL names a database the tests may create schemas in")
+        kbf_testkit::database::server_url()
     }
 
     /// A store on a schema of its own, and a client on the same database.
@@ -1019,7 +1023,6 @@ mod tests {
     // neither being retried, and a retry loop with no end. The server's words name the
     // state.
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn only_serialization_failures_and_deadlocks_are_run_again_and_not_for_ever() {
         let (store, mut client) = store_and_client("kbf_unit_retry");
         // One result type throughout: the coverage of a generic function is that of its
@@ -1060,7 +1063,6 @@ mod tests {
     // Catches an error that is not the server's (no connection, a closed one) being
     // described as the empty "db error", or with its cause dropped.
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn an_error_that_is_not_the_servers_is_described_with_its_cause() {
         let refused = postgres::Client::connect("postgres://nobody@127.0.0.1:1/x", postgres::NoTls)
             .err()
@@ -1098,7 +1100,6 @@ mod tests {
     // one (the store's sessions are all dead here, and a batch that begins a transaction
     // would fail).
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn an_empty_batch_answers_nothing_without_a_connection() {
         let config = PostgresConfig::parse(&url())
             .and_then(|config| config.with_schema("kbf_unit_empty"))
@@ -1143,7 +1144,6 @@ mod tests {
     /// page rather than failing it: a full page of only such rows is empty and its cursor
     /// still passes them, and the known rows after it are read.
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn the_feed_maps_each_kind_pages_and_skips_a_kind_it_does_not_know() {
         use super::{Change, Event, Flaw};
         let (store, mut client) = store_and_client("kbf_unit_kind");

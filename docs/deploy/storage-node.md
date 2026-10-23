@@ -21,7 +21,7 @@ takes two store URIs and, sometimes, a directory; the daemon takes one directory
 
 | Term | What it is | Set by |
 |---|---|---|
-| **Object store** (the cold store) | The durable home of every blob: an S3 bucket (MinIO, RustFS) or a directory on a disk. Nothing leaves it but by being deleted, and nothing is deleted yet. | `kbf-server --cold-store` |
+| **Object store** (the cold store) | The durable home of every blob: an S3 bucket (MinIO, RustFS) or a directory on a disk. A `file://` directory deletes its least recently used objects when its disk is short of room ([Eviction under disk pressure](../design/storage.md#eviction-under-disk-pressure)), and the start-up pass deletes orphan files; an `s3://` store is never evicted from. | `kbf-server --cold-store` |
 | **Write tier** (the hot store) | A fast local disk in front of the object store. Uploads land there first and are flushed to the object store in the background; reads are served from it while a blob is still there. Optional: without one, uploads go straight to the object store. | `kbf-server --hot-store` |
 | **Metadata log** | The index of what the object store holds (digest to segment object and offset) and the action cache: a single-voter Raft log on a local disk. Lose it and the blobs are unreachable. | in the hot store's directory (`<hot>/meta`), else `kbf-server --meta-dir` |
 | **Input cache** | The daemon's per-node cache of input files, from which each lease's inputs are linked. Evicts least recently used past its budget. | `kbf-daemon --data-dir` (`cache/`) |
@@ -310,21 +310,17 @@ kbf-server \
   - then forgets each indexed object, not staged, that has no file: its blobs leave
     the index, with every action-cache entry that needs one of them, so
     `FindMissingBlobs` reports them and the client uploads them again. Forgetting
-    needs the Raft log at machine version 3, which a server binary older than this
-    one refuses. Before it forgets the first, a log whose cell has a single voter (a
-    single-host farm) is raised to it. A cell of more voters is never raised by the
-    pass: until the operator raises it, once every replica runs version 3, the pass
-    marks each such object missing instead (its blobs are reported missing and its
-    action-cache entries miss, but stay in the index) and logs
-    `evict/forget needs log V3: N objects held` once.
+    commits `EvictObjects` to the Raft log as it is: the pass raises nothing and
+    asks nothing of the log's machine version or its voters. A binary that does not
+    know the command skips it, and loses what it did.
   - The guard: it forgets nothing unless the walk found the file of at least one
     indexed object. A directory with none is not the one the index was written over
     (a disk that is not mounted: the server creates the directory empty), and the
     pass logs an error instead of emptying the index.
 
   It logs one line at the end: files read, kept, orphans deleted, foreign, without a
-  header, objects, blobs and entries forgotten, objects marked missing for want of
-  version 3, objects held back by the guard, the bytes held and how long it took. A
+  header, objects, blobs and entries forgotten, objects held back by the guard, the
+  bytes held and how long it took. A
   pass that fails is logged and runs again at the next start; until then nothing is
   evicted.
 - Joining a farm that holds data (a node registered with `--frontend`): a node whose
@@ -382,12 +378,8 @@ kbf-server \
   come first, oldest file first. It never takes an object used in the last 60
   seconds, nor one staged on the write tier. It forgets them first (their blobs
   leave the index, with every action-cache entry that needs one, as in the start-up
-  pass, raising the Raft log to machine version 3 only in a single-voter cell), then
-  deletes their files; a crash between the two leaves files the next start-up pass
-  deletes. In a cell of more voters whose log is below version 3, eviction is off
-  until the operator raises the log: the evictor evicts nothing, logs
-  `evict/forget needs log V3: eviction off` once, and writes stay refused under the
-  floor. The directory
+  pass; nothing raises the Raft log first), then deletes their files; a crash between
+  the two leaves files the next start-up pass deletes. The directory
   is the store of record (an `s3://` cold store is never evicted from): nothing is behind it, so an evicted blob is gone, and
   `FindMissingBlobs` reports it missing so the client uploads it again (or the
   action runs again). Under pressure eviction cuts the retention's `min_ttl` short
@@ -510,7 +502,7 @@ metadata directory.
 
 ## A mode's units
 
-Each mode of the one `kbf` binary has a packaged unit, installed by `kbf-installer` and
+Each mode of the one `kbf` binary has a packaged unit, installed by the `kbf` package (which runs `/usr/bin/kbf`) and
 configured by `/etc/kbf/kbf.toml`; they are described, with the rules they are held to, in
 [kbf-units.md](kbf-units.md). `kbf-deploy linux render-units`, `check-units` and
 `install-units` (and the converged form of them, with `--restart-minio` and `--uninstall`)

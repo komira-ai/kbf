@@ -6,7 +6,7 @@ Mutating verbs only say what they would do unless --apply is given. Exit codes: 
 Usage: kbf-installer [OPTIONS] <COMMAND>
 
 Commands:
-  setup           First install: accounts, directories, installer.toml, the first release
+  setup           First install: accounts, directories, installer.toml, kbf.toml, the units
   status          What is installed, staged and pending, and the last refusal
   run             Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap
   confirm         Keep the pending swap, naming its activation
@@ -34,7 +34,7 @@ Options:
           Print version
 
 === kbf-installer setup --help ===
-First install: accounts, directories, installer.toml, the first release
+First install: accounts, directories, installer.toml, kbf.toml, the units
 
 Usage: kbf-installer setup [OPTIONS] --mode <MODE>
 
@@ -45,22 +45,8 @@ Options:
           The kbf mode this host runs (`kbf --mode=...`) [possible values: frontend, storage, daemon, storage-and-daemon, all-in-one]
       --apply
           Do what the verb says. Without it a mutating verb is a dry run
-      --release-source <RELEASE_SOURCE>
-          Where releases are fetched from. Default: the frontend for the modes that enroll, a file server (`url`) for `frontend` and `all-in-one`. `bundled` fetches nothing: it takes no --release-url and no --commit [possible values: url, frontend, bundled]
-      --release-url <RELEASE_URL>
-          The https base URL of the file server, for --release-source url
-      --release-ca <RELEASE_CA>
-          A PEM file of the CAs the file server's certificate is checked against instead of the system's (an absolute path, a copy owned by root): written to installer.toml as `release_ca`. For --release-source url. Not used by a fetch yet
-      --frontend-worker-url <FRONTEND_WORKER_URL>
-          The frontend's worker listener, where releases are served, as https://host[:port]: written to installer.toml as `frontend_url`. For --release-source frontend, with --frontend-ca and --frontend-ca-sha256. Not used by a fetch yet
-      --frontend-ca <FRONTEND_CA>
-          A PEM file of the CA the worker listener's certificate chains to (an absolute path, a copy owned by root): written to installer.toml as `frontend_ca`. For --release-source frontend, with --frontend-worker-url and --frontend-ca-sha256. Not used by a fetch yet
-      --frontend-ca-sha256 <FRONTEND_CA_SHA256>
-          The sha256 of --frontend-ca, 64 lowercase hex characters: written to installer.toml as `frontend_ca_sha256`. For --release-source frontend, with --frontend-worker-url and --frontend-ca. Not used by a fetch yet
       --min-generation <MIN_GENERATION>
           Refuse orders below this generation. A floor only goes up
-      --commit <COMMIT>
-          The first release to install (40 hex characters); needs --release-source url
       --frontend-url <FRONTEND_URL>
           The frontend to enroll with, as https://host[:port]. For `storage`, `daemon` and `storage-and-daemon`; written to kbf.toml
       --token-file <TOKEN_FILE>
@@ -121,6 +107,20 @@ Options:
           The loopback port of the kbf-storage-and-daemon sibling an all-in-one host runs, which the frontend child dials in plain text (1024 to 65535, clear of the children's ports). Default 8990. Only for `--mode=all-in-one`, with --proxy
       --installer-config <INSTALLER_CONFIG>
           The installer.toml `setup` writes (and reads, to keep what it does not set), under the host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which is the only value setup accepts. The same flag, with the same meaning, as on `run`
+      --release-source <RELEASE_SOURCE>
+          Retired: accepted and ignored for one release, with a warning (setup records no release source)
+      --release-url <RELEASE_URL>
+          Retired: accepted and ignored for one release, with a warning (setup records no release source)
+      --release-ca <RELEASE_CA>
+          Retired: accepted and ignored for one release, with a warning (setup writes no release keys)
+      --frontend-worker-url <FRONTEND_WORKER_URL>
+          Retired: accepted and ignored for one release, with a warning (setup writes no release keys)
+      --frontend-ca <FRONTEND_CA>
+          Retired: accepted and ignored for one release, with a warning (setup writes no release keys)
+      --frontend-ca-sha256 <FRONTEND_CA_SHA256>
+          Retired: accepted and ignored for one release, with a warning (setup writes no release keys)
+      --commit <COMMIT>
+          Retired: accepted and ignored for one release, with a warning (setup installs no release)
   -h, --help
           Print help
 
@@ -243,7 +243,7 @@ Options:
       --json                       Print the result as one JSON object on standard output
       --window-secs <WINDOW_SECS>  [default: 900]
       --apply                      Do what the verb says. Without it a mutating verb is a dry run
-      --kbf <KBF>                  The kbf this unit starts, on a bundled host (one with no releases and no state). It says the state schema it needs; the database is brought to it before the unit starts. Needs --mode
+      --kbf <KBF>                  The kbf this unit starts, on a bundled host (one with no releases and no state): the check runs `<kbf> boot-check --mode=<mode>` over the host's installer.toml (under --root), which migrates the state database, and ends as it ends. Needs --mode
       --mode <MODE>                The mode of the unit that runs the check: only frontend and all-in-one keep state in the database. Needs --kbf [possible values: frontend, storage, daemon, storage-and-daemon, all-in-one]
   -h, --help                       Print help
 

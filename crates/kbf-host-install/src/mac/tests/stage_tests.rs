@@ -8,7 +8,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::rc::Rc;
 
 use super::fx::{Fx, NEW, NEW_VERSION, Sim, digest, gzip, mkdir, mode, sha256, tarball, write};
-use crate::mac::channel::MacChannel;
+use crate::mac::channel::{MacChannel, Source};
 use crate::mac::release::{bundle_name, tarball_name};
 use crate::mac::stage::{Staged, stage, strip_quarantine};
 use crate::outcome::{FailureCode, Outcome, Refusal};
@@ -17,7 +17,7 @@ use crate::runner::Identity;
 
 fn channel(fx: &Fx) -> MacChannel {
     MacChannel {
-        dir: fx.channel_dir.clone(),
+        source: Source::Dir(fx.channel_dir.clone()),
         sums: Some(fx.sums.clone()),
         source_ref: "refs/heads/main".into(),
     }
@@ -247,6 +247,9 @@ fn the_accounts_must_exist_and_not_be_root() {
     sim.break_("dscl");
     assert!(verify_failure_of(&fx, &sim).contains("dscl: exit status"));
     let sim = Sim::new(&fx.host, 0, 0);
+    assert!(verify_failure_of(&fx, &sim).contains("no usable ids"));
+    // A real uid with group 0 (`wheel`) is refused as well.
+    let sim = Sim::new(&fx.host, 301, 0);
     assert!(verify_failure_of(&fx, &sim).contains("no usable ids"));
     let sim = fx.sim();
     sim.break_("launchctl"); // not used here: the accounts are asked with dscl

@@ -122,8 +122,8 @@ impl ObjectStore for Tampered {
     }
 }
 
-/// Catches a probe that leaves its object behind (mutant: the delete is skipped) and
-/// one that writes anywhere but under `.kbf-probe/` (mutant: the key drops `PROBE_DIR`).
+/// Catches a probe that leaves its object behind (defect: the delete is skipped) and
+/// one that writes anywhere but under `.kbf-probe/` (defect: the key drops `PROBE_DIR`).
 #[tokio::test]
 async fn a_working_key_pair_passes_and_leaves_nothing() {
     let fake = guarded().await;
@@ -153,7 +153,7 @@ async fn a_working_key_pair_passes_and_leaves_nothing() {
     );
 }
 
-/// Catches a fake that refuses a correctly signed request with a query string (mutant:
+/// Catches a fake that refuses a correctly signed request with a query string (defect:
 /// the query is signed as it arrived, escapes and all, so the signature differs): a
 /// listing, which carries `list-type`, `prefix` and `max-keys`, is not answered 403.
 #[tokio::test]
@@ -173,7 +173,7 @@ async fn a_signed_request_with_a_query_is_not_refused() {
 }
 
 /// Catches a fake that serves a request nobody signed or whose `Authorization` it cannot
-/// read, once it was told which key pair to accept (mutant: `signed_with` true for a
+/// read, once it was told which key pair to accept (defect: `signed_with` true for a
 /// missing or unreadable header): each is refused 403. (Here, not in the fake's own unit
 /// tests: the coverage ratchet counts the best single copy of `signed_with`, and the copy
 /// the integration tests share has to run its refusals as well as its acceptance.)
@@ -204,8 +204,8 @@ async fn a_request_with_no_readable_signature_is_refused_when_a_key_pair_is_requ
     }
 }
 
-/// Catches a probe that treats a refused write as success (mutant: the put error is
-/// dropped) and a fake that accepts any signature (mutant: `signed_with` returns true):
+/// Catches a probe that treats a refused write as success (defect: the put error is
+/// dropped) and a fake that accepts any signature (defect: `signed_with` returns true):
 /// a wrong secret and a wrong key id both fail at the write and write nothing.
 #[tokio::test]
 async fn a_wrong_key_pair_fails_at_the_write() {
@@ -219,8 +219,8 @@ async fn a_wrong_key_pair_fails_at_the_write() {
 }
 
 /// Catches a probe that trusts a read that returns other bytes than were written
-/// (mutant: the comparison is dropped), and one that gives up on a failed read without
-/// deleting (mutant: `?` on the read before the delete).
+/// (defect: the comparison is dropped), and one that gives up on a failed read without
+/// deleting (defect: `?` on the read before the delete).
 #[tokio::test]
 async fn a_read_that_fails_or_differs_fails_the_probe_and_still_cleans_up() {
     for (wrong, fails) in [(true, false), (false, true)] {
@@ -237,7 +237,7 @@ async fn a_read_that_fails_or_differs_fails_the_probe_and_still_cleans_up() {
     }
 }
 
-/// Catches a probe that reports success while its object stays (mutant: the delete's
+/// Catches a probe that reports success while its object stays (defect: the delete's
 /// result is ignored): the step names the delete.
 #[tokio::test]
 async fn a_delete_that_fails_fails_the_probe() {
@@ -252,7 +252,7 @@ async fn a_delete_that_fails_fails_the_probe() {
     );
 }
 
-/// Catches a nonce that reaches the key unchecked (mutant: `unwrap` the key): a nonce
+/// Catches a nonce that reaches the key unchecked (defect: `unwrap` the key): a nonce
 /// that is not a key gives the `Key` step, and nothing is written.
 #[tokio::test]
 async fn a_nonce_that_is_not_a_key_is_refused_before_any_write() {

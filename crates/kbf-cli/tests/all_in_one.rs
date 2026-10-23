@@ -321,7 +321,7 @@ fn a_port_taken_after_it_was_reserved_does_not_change_which_half_refuses() {
 }
 
 /// Catches the start-up pass or the evictor not run over the all-in-one's `file://`
-/// cold store (mutants: `kbf_server::start`'s `file://` arm passes no pass; the
+/// cold store (defects: `kbf_server::start`'s `file://` arm passes no pass; the
 /// evictor loop removed): a single-voter farm is this binary's main use, and the pass
 /// deletes its orphans and forgets its lost objects, the evictor keeps its disk from
 /// filling. Without a hot store (uploads go straight to the cold store), on a fake
@@ -544,7 +544,7 @@ fn on_disk_once(dir: &Path, input: &[u8], samples: &std::collections::BTreeMap<S
 }
 
 /// Catches the input cache and local storage keeping two copies of a blob on one disk
-/// (the "two directories" mutant: the hot store keeps flushed copies beside the input
+/// (the "two directories" defect: the hot store keeps flushed copies beside the input
 /// cache's entries), a fill metric that counts a blob twice or leaves the hot store
 /// out, and a restart after a crash that rebuilds the one index with a duplicate or a
 /// leak. A client uploads an input of 3 MiB (every blob its own block on the hot

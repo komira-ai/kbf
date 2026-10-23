@@ -422,31 +422,31 @@ async fn the_proxy_forwards_the_leafs_ips_and_no_others() {
     let forged = [("x-kbf-node-ips", "198.51.100.9")];
 
     let storage = pki.leaf_with_ips(
-        "spoolr-node-01",
+        "worker-node-01",
         "storage",
         &["192.0.2.10", "fd00:0:0:0:0:0:0:1", "192.0.2.1", "192.0.2.1"],
     );
     let answer = call(tls(proxy, &pki, &storage).await, &forged).await;
     assert_eq!(
         header(&answer, "x-trust"),
-        r#"Proxied(Identity { node_id: Some("spoolr-node-01"), role: Some(Storage), ips: [192.0.2.1, 192.0.2.10, fd00::1] })"#
+        r#"Proxied(Identity { node_id: Some("worker-node-01"), role: Some(Storage), ips: [192.0.2.1, 192.0.2.10, fd00::1] })"#
     );
     assert_eq!(header(&answer, "x-left"), "0");
 
     let via =
-        pki.leaf_via_intermediate("spoolr-node-02", "storage", &["192.0.2.2"], "198.51.100.7");
+        pki.leaf_via_intermediate("worker-node-02", "storage", &["192.0.2.2"], "198.51.100.7");
     let answer = call(tls(proxy, &pki, &via).await, &[]).await;
     assert_eq!(
         header(&answer, "x-trust"),
-        r#"Proxied(Identity { node_id: Some("spoolr-node-02"), role: Some(Storage), ips: [192.0.2.2] })"#,
+        r#"Proxied(Identity { node_id: Some("worker-node-02"), role: Some(Storage), ips: [192.0.2.2] })"#,
         "the intermediate's own address is not the caller's"
     );
 
-    let none = pki.leaf_via_intermediate("spoolr-node-03", "storage", &[], "198.51.100.7");
+    let none = pki.leaf_via_intermediate("worker-node-03", "storage", &[], "198.51.100.7");
     let answer = call(tls(proxy, &pki, &none).await, &[]).await;
     assert_eq!(
         header(&answer, "x-trust"),
-        r#"Proxied(Identity { node_id: Some("spoolr-node-03"), role: Some(Storage), ips: [] })"#,
+        r#"Proxied(Identity { node_id: Some("worker-node-03"), role: Some(Storage), ips: [] })"#,
         "a leaf with no IP name has none, whatever its issuer names"
     );
     handle.shutdown();
@@ -486,8 +486,8 @@ async fn a_storage_node_registers_by_its_ip_through_the_proxy() {
             .serve_with_incoming(incoming),
     );
 
-    let one = pki.leaf_with_ips("spoolr-node-01", "storage", &["192.0.2.1"]);
-    let two = pki.leaf_with_ips("spoolr-node-02", "storage", &["192.0.2.2"]);
+    let one = pki.leaf_with_ips("worker-node-01", "storage", &["192.0.2.1"]);
+    let two = pki.leaf_with_ips("worker-node-02", "storage", &["192.0.2.2"]);
     let mut first = MembershipClient::new(channel(proxy, &pki, &one).await);
     let mut second = MembershipClient::new(channel(proxy, &pki, &two).await);
     let by_ip = |at: &str| pb::RegisterRequest {

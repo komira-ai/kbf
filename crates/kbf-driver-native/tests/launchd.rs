@@ -110,7 +110,7 @@ fn action(script: &str, network: &str) -> Spec {
 /// the lease, outside the sandbox and with the network. Controls: each way reaches
 /// launchd from the same action run without a sandbox; and each is refused under a
 /// bare sandbox, so that refusal is launchd's own, and `(deny job-creation)` in the
-/// profile is defence in depth (its mutants stayed green).
+/// profile is defence in depth (its defects stayed green).
 #[tokio::test]
 async fn no_action_can_give_launchd_a_job() {
     let dir = scratch("launchd");

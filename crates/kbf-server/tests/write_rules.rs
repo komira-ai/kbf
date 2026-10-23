@@ -10,7 +10,7 @@ use std::time::Duration;
 use kbf_enroll_registry::{TokenSpec, bump_ca_generation, create_token};
 use kbf_history::IndexRoot;
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Progress, Registrant};
-use kbf_server::update::{Policy, Proposal, Release, Rows};
+use kbf_server::update::{Release, Rows};
 use kbf_server::write_rules::{Rule, classify};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
@@ -99,32 +99,16 @@ fn what_membership_writes_is_fenced() {
     assert!(assert_all_fenced(store.as_ref(), "membership") >= 5);
 }
 
-// Catches: the same for the rolling-update rows: the desired release, the generation
-// counter, the policy, the slot and a host's row.
+// Catches: the same for the rows of the desired release: the run and
+// the policy.
 #[test]
 fn what_the_update_rows_write_is_fenced() {
     let store = store();
     let rows = Rows::new(Arc::clone(&store));
     rows.offer(&Release::new("v2"), FarmTime::from_millis(1000))
         .expect("an offer");
-    rows.set_policy(&Policy::default()).expect("a policy");
+    rows.set_paused(true).expect("a pause");
     assert!(assert_all_fenced(store.as_ref(), "the update rows") >= 2);
-}
-
-// Catches: the release poller's proposal rows being written by a family the table does not
-// name as fenced: a handed-over child could then write them after a takeover (#1155, #1181).
-#[test]
-fn what_the_release_poller_writes_is_fenced() {
-    let store = store();
-    let rows = Rows::new(Arc::clone(&store));
-    let proposal = Proposal {
-        commit: "a".repeat(40),
-        tag: "v1".to_owned(),
-        published_at_secs: 1,
-        proposed_at_ms: 1,
-    };
-    assert!(rows.propose(&proposal).expect("a proposal"));
-    assert_eq!(assert_all_fenced(store.as_ref(), "the release poller"), 1);
 }
 
 // Catches: the same for enrollment: a token row and the CA generation. The registry's other
@@ -153,4 +137,32 @@ fn what_enrollment_writes_is_fenced() {
     .expect("a token");
     bump_ca_generation(store.as_ref()).expect("a CA generation");
     assert!(assert_all_fenced(store.as_ref(), "enrollment") >= 2);
+}
+
+// Catches: a family whose writer was deleted still labelled as written. The host, slot,
+// order and proposal rows are only read now (`stored_update`, the proposals view), and the
+// table must say so, while the run, counter and policy rows keep their live writer.
+#[test]
+fn the_families_with_no_writer_left_are_labelled_read_only() {
+    let retired = [
+        "update/slot",
+        "update/host/node-a",
+        "update/order/0000000000000001",
+        "update/proposed/0000000000000000000000000000000000000000",
+    ];
+    for key in retired {
+        let family = kbf_server::write_rules::FAMILIES
+            .iter()
+            .find(|f| f.example == key)
+            .unwrap_or_else(|| panic!("no family has the example {key}"));
+        assert_eq!(family.writer, "retired, read-only", "{key}");
+        assert_eq!(family.rule, Rule::Fenced, "{key}");
+    }
+    for key in ["update/desired", "update/policy", "update/generation"] {
+        let family = kbf_server::write_rules::FAMILIES
+            .iter()
+            .find(|f| f.example == key)
+            .unwrap_or_else(|| panic!("no family has the example {key}"));
+        assert!(family.writer.starts_with("update/rows"), "{key}");
+    }
 }

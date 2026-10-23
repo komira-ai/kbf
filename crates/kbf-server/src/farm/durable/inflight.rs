@@ -46,8 +46,9 @@ impl Durable {
     /// outcome the caller never learned has put the row, and the repeat finds the
     /// operation it wrote.
     ///
-    /// If the store's counter is ahead of `id` (another writer took the id), the next
-    /// free one is used; [`Submitted::Queued`] says which.
+    /// `id` comes from the block this handle reserved ([`Durable::reserve_operation`]),
+    /// where no other frontend numbers. If a row of an earlier writer is in the way of it,
+    /// the next id of the block is used; [`Submitted::Queued`] says which.
     ///
     /// # Errors
     /// The store cannot be read or written, or a row in the way does not go
@@ -92,10 +93,12 @@ impl Durable {
             }
             match self.submitted_pinned(id, request, subject, size_key, (&pin, cond)) {
                 Ok(()) => return Ok(Submitted::Queued(id)),
-                // Another writer took the id, or queued this action since the look.
+                // Another writer queued this action since the look, or a row of an earlier
+                // writer is in the way of the id: look again, and try the next id of the
+                // block.
                 Err(StateError::Conflict(_)) if looks < LOOKS => {
                     looks += 1;
-                    id = OperationId(self.counter(NEXT_OP)?.max(id.0));
+                    id = self.reserve_operation(OperationId(id.0 + 1))?;
                 }
                 Err(error) => return Err(error),
             }
@@ -103,22 +106,30 @@ impl Durable {
     }
 
     /// The operation `operation` as the store holds it, or `None` if it has no `op/` row.
+    /// Its lease is found through its `lease-by-op/` row ([`Durable::lease_of`]).
     fn stored_operation(
         &self,
         operation: OperationId,
+    ) -> Result<Option<StoredOperation>, StateError> {
+        self.stored_with(operation, None)
+    }
+
+    /// [`Durable::stored_operation`], given the lease the caller has read as the
+    /// operation's (`None` leaves the lookup to this call).
+    pub(super) fn stored_with(
+        &self,
+        operation: OperationId,
+        known: Option<LeaseGrant>,
     ) -> Result<Option<StoredOperation>, StateError> {
         let key = op_key(operation);
         let Some(row) = self.store.get(&key)? else {
             return Ok(None);
         };
         let request = request_row(&key, &row)?;
-        let mut lease = None;
-        for (key, row) in self.store.scan_prefix("lease/")? {
-            let grant = lease_row(&key, &row)?;
-            if grant.operation == operation {
-                lease = Some(grant);
-            }
-        }
+        let lease = match known {
+            Some(grant) => Some(grant),
+            None => self.lease_of(operation)?,
+        };
         let losses = match self.store.get(&loss_key(operation))? {
             Some(row) => u32::try_from(number("loss", &row)?)
                 .map_err(|_| corrupt(&loss_key(operation), "not a loss count"))?,

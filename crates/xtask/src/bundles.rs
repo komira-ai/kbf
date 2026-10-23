@@ -2,8 +2,8 @@
 //! the Sigstore bundle of the one build provenance attestation the `attest-*` job signed
 //! for that tarball alone, so a host can verify the tarball offline
 //! (`gh attestation verify <tarball> --bundle <bundle>`) without fetching anything from
-//! GitHub. The `kbf-installer` deb (`<binary>-<commit>-<platform>.deb`) has one too,
-//! and everything here says "tarball" of it as well ([`needs_bundle`]).
+//! GitHub. The `kbf-installer` and `kbf` debs (`<binary>-<commit>-<platform>.deb`) have one
+//! too, and everything here says "tarball" of them as well ([`needs_bundle`]).
 //!
 //! A bundle is made after `SHA256SUMS` (the attestation signs the sums' files), so the
 //! sums cannot list it: [`is_bundle`] is how `verify-assets sums` knows to leave it
@@ -53,15 +53,15 @@ pub fn is_bundle(name: &str) -> bool {
     name.ends_with(SUFFIX)
 }
 
-/// Whether the asset `name` is a `kbf-installer` package: the deb of a Linux job or the
-/// `.pkg` of the macOS one.
+/// Whether the asset `name` is a package: a deb of a Linux job (`kbf-installer` or `kbf`) or
+/// the `.pkg` of the macOS one.
 pub fn is_package(name: &str) -> bool {
     name.ends_with(".deb") || name.ends_with(".pkg")
 }
 
-/// Whether the asset `name` has a provenance bundle: a tarball, or a package (the
-/// `kbf-installer` deb or `.pkg`), but not an SBOM, which is a subject of the sums'
-/// attestation only.
+/// Whether the asset `name` has a provenance bundle: a tarball, or a package (a
+/// `kbf-installer` or `kbf` deb, or the `.pkg`), but not an SBOM, which is a subject of the
+/// sums' attestation only.
 pub fn needs_bundle(name: &str) -> bool {
     name.ends_with(".tar.gz") || is_package(name)
 }

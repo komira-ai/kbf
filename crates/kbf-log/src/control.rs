@@ -148,7 +148,10 @@ pub struct Checkpoint {
 }
 
 /// A machine version (docs/design/ha.md, section 4.7): which apply behavior runs.
-/// Never zero.
+/// Never zero. No binary of this build raises its log to one: formats change additively,
+/// so a new command needs no raise. The versions stay for the logs that hold a raise an
+/// earlier build wrote, which a replica still reads (and skips, when it names a version
+/// past what it runs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MachineVersion(NonZeroU32);
 
@@ -279,6 +282,7 @@ const fn resources(r: &Resources) -> proto::Resources {
         memory_bytes: r.memory_bytes,
         gpus: r.gpus,
         vms: r.vms,
+        leases: r.leases,
     }
 }
 
@@ -527,6 +531,7 @@ fn from_resources(
         memory_bytes: r.memory_bytes,
         gpus: r.gpus,
         vms: r.vms,
+        leases: r.leases,
     })
 }
 

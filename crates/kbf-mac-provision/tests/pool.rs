@@ -177,7 +177,11 @@ fn a_homes_directory_that_is_a_link_gets_no_home() {
 #[test]
 fn the_pool_size_and_first_uid_come_from_the_profile() {
     let mut mac = FakeMac::converged("pool-size");
-    add_to_profile(&mut mac, "pool_users=2\npool_first_uid=800\n");
+    let text = mac
+        .profile_text()
+        .replace("pool_users=4", "pool_users=2")
+        .replace("pool_first_uid=700", "pool_first_uid=800");
+    mac.set_profile(text);
     let r = check(&mac);
     assert!(
         r.text
@@ -197,19 +201,21 @@ fn the_pool_size_and_first_uid_come_from_the_profile() {
     );
 }
 
-/// Catches: a default first uid that is not 600 when `lease_uids` ends below it (the
-/// default is the uid after `lease_uids`, and never below 600).
+/// Catches: a first uid below 600 accepted for a pool, which a profile can no longer
+/// reach by default (the default is 61000, whatever `lease_uids` is): the profile that
+/// names 599 is refused (`profile.rs` holds the message), and one whose `lease_uids`
+/// end below 600 still gets 61000.
 #[test]
-fn the_first_pool_uid_is_never_below_600() {
-    let mut mac = FakeMac::converged("pool-600");
+fn the_default_first_pool_uid_does_not_depend_on_lease_uids() {
+    let mut mac = FakeMac::converged("pool-61000");
     let text = mac
         .profile_text()
         .replace("lease_uids=600-699", "lease_uids=501-550");
     mac.set_profile(text);
+    mac.set_pool(None);
     let r = check(&mac);
     assert!(
-        r.text
-            .contains("FAIL pool_users: group kbfpool: PrimaryGroupID=700, want 600; kbf-pool-0: UniqueID=700, want 600;"),
+        r.text.contains("FAIL pool_users: group kbfpool: PrimaryGroupID=700, want 61000; kbf-pool-0: UniqueID=700, want 61000;"),
         "{}",
         r.text
     );

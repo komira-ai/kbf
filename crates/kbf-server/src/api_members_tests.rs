@@ -47,6 +47,7 @@ fn api_over(members: Arc<Members>, store: Arc<dyn Store>) -> Arc<ApiState> {
         farm: Arc::new(farm),
         token: None,
         drain: Arc::new(drain),
+        retire: Arc::default(),
         members: Some(members),
         update: None,
     })

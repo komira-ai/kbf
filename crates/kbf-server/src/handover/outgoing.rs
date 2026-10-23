@@ -22,7 +22,7 @@ use crate::farm::Farm;
 const QUIET_LOOK: Duration = Duration::from_millis(10);
 
 /// What the holder tells a daemon whose stream it ends.
-const STANDING_DOWN: &str = "this frontend handed its work to a new process; connect again";
+const STANDING_DOWN: &str = "this frontend is standing down; connect again";
 
 /// What a holder serves, which a successor must be started with to take it over.
 #[derive(Clone, Debug)]
@@ -98,9 +98,10 @@ impl Stand {
     /// Stands down after another process took the generation (`POST stand-down`): the
     /// steps of [`Stand::run`] without giving up the store, then not ready. The REAPI
     /// and operator API listeners keep serving; the callers this process holds are
-    /// answered from the `done/` rows ([`Farm::follow`]).
+    /// answered from the `done/` rows ([`Farm::follow`]). A retire ([`crate::retire`]) takes
+    /// the same steps over a state store the other frontends keep writing.
     pub async fn release(&self) {
-        tracing::info!("standing down after a takeover");
+        tracing::info!("standing down");
         self.give_up().await;
         self.drain.unready();
     }

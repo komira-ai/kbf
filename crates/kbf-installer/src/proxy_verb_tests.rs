@@ -65,7 +65,7 @@ fn the_proxy_table_is_read_from_installer_toml() {
 /// `frontend_config` reaches `Loaded`, a file without the key leaves it none, and a relative
 /// path is a usage error naming the key.
 ///
-/// Mutants to plant: `frontend_config` left out of `Loaded` (red: none); the key left out of
+/// Catches: `frontend_config` left out of `Loaded` (red: none); the key left out of
 /// `TOLERANT_KEYS` (red: none).
 #[test]
 fn the_children_s_file_is_read_from_installer_toml() {
@@ -237,7 +237,7 @@ fn a_file_that_is_not_a_proxy_config_is_refused_with_its_path_and_reason() {
 /// public port down over a source key a later build wrote. The keys it does read are still
 /// checked, and the table is still closed; a value typed into a key it reads is not repeated.
 ///
-/// Mutants to plant: `loaded_from` back on the closed `InstallerToml::parse` (red: a usage error
+/// Catches: `loaded_from` back on the closed `InstallerToml::parse` (red: a usage error
 /// at line 1); the tolerant reader keeping the unread keys (the same); the bounds of
 /// `confirm_window_s` skipped.
 #[test]
@@ -1026,7 +1026,7 @@ fn check_refuses_a_file_without_a_database() {
 /// anywhere. A start that skipped the migration would run the stand-in and fail as
 /// `exited-before-ready`.
 ///
-/// Mutant seen red: `host_migrator` replaced by a hook that migrates nothing.
+/// Catches: `host_migrator` replaced by a hook that migrates nothing.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_start_migrates_the_installed_release_before_it_runs_it() {

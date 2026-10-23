@@ -14,7 +14,8 @@
 //!   [`crate::attested_assets`]' business, and its provenance bundle
 //!   [`crate::attested_bundles`]'.
 //! - **Who signs, and when.** The workflow runs for pull requests and the merge queue
-//!   (builds only) and for pushes to exactly [`PUSH_BRANCHES`]. The `attest` and `verify`
+//!   (builds only) and, called by the pipeline (`workflow_call`), for pushes to exactly
+//!   [`PUSH_BRANCHES`]. The `attest` and `verify`
 //!   jobs run under the one `if:` [`SIGNING_IF`], which no pull request satisfies, and
 //!   `attest` signs build provenance for every file in `SHA256SUMS` in a step that
 //!   cannot be skipped. (The scopes that sign are held to the same `if:` by the
@@ -49,6 +50,10 @@
 //!   check-asset` already checked. The verify job then runs `pkg-asset --verify-only` on
 //!   each signed deb with `--expect-ref "$GITHUB_REF"`, so the file that was attested is the
 //!   one checked.
+//! - **The `kbf` package.** The same jobs build a second package, `kbf` (`/usr/bin/kbf` and
+//!   the units of the modes, depending on the installer's package), from the same
+//!   `pkg-config` step, and make its deb an asset (`cargo xtask pkg-kbf-asset`); the verify
+//!   job checks each signed one (`kbf_package`'s rules).
 //! - **The installer's Mac package.** The darwin job builds the `kbf-installer` `.pkg`
 //!   (`cargo xtask pkg build`, with the pinned darwin `gh`, the trusted root and an
 //!   `installer.conf` from `pkg-trust`), installs it as root on the runner
@@ -88,7 +93,7 @@ pub const ASSETS: &[(&str, &str)] = &[
 /// packages one checks it before and after packaging, as [`problems`] says.
 pub const IDENTIFIED: &[&str] = &["kbf", "kbf-installer"];
 
-/// The branches whose pushes run the workflow: the ones a host's verification may name
+/// The branches whose pushes run the workflow (through the pipeline): the ones a host's verification may name
 /// as `--source-ref` (`refs/heads/<branch>`).
 pub const PUSH_BRANCHES: &[&str] = &["main"];
 
@@ -165,6 +170,7 @@ pub fn problems(workflow: &str) -> Result<Vec<String>, String> {
     identity(workflow, &mut out)?;
     facts::rules(workflow, &mut out)?;
     packages(workflow, &mut out)?;
+    kbf_package::rules(workflow, &mut out)?;
     mac_package(workflow, &mut out)?;
     darwin(workflow, &mut out)?;
     pull_request_gate(workflow, &mut out)?;
@@ -234,15 +240,14 @@ fn release_set(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
 
 fn signing(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
     let events = workflows::events(workflow)?;
-    for event in ["pull_request", "merge_group", "push"] {
+    for event in ["pull_request", "merge_group", "workflow_call"] {
         if !events.iter().any(|e| e == event) {
             out.push(format!("the workflow does not run on `{event}`"));
         }
     }
-    let branches = workflows::push_branches(workflow)?;
-    if branches != PUSH_BRANCHES {
+    if events.iter().any(|e| e == "push") {
         out.push(format!(
-            "`push` runs the workflow for {branches:?}, not exactly {PUSH_BRANCHES:?}"
+            "the workflow has a `push` trigger: a push to {PUSH_BRANCHES:?} reaches it as a called workflow of the pipeline (`workflow_call`), whose filter `pipeline_workflow` pins"
         ));
     }
     for job in ATTEST_JOBS.iter().chain(VERIFY_JOBS) {
@@ -834,9 +839,13 @@ fn the_docs_describe_the_release_set() {
         }
     }
     for platform in PACKAGES {
-        let file = format!("`kbf-installer-<commit>-{platform}.deb`");
-        if !doc.contains(&file) {
-            missing.push(format!("docs/artifacts.md does not list {file}"));
+        for file in [
+            format!("`kbf-installer-<commit>-{platform}.deb`"),
+            format!("`kbf-<commit>-{platform}.deb`"),
+        ] {
+            if !doc.contains(&file) {
+                missing.push(format!("docs/artifacts.md does not list {file}"));
+            }
         }
     }
     let file = format!("`kbf-installer-<commit>-{MAC_PACKAGE}.pkg`");
@@ -896,6 +905,26 @@ mod rules {
         )
     }
 
+    /// The steps that write the configuration of both Linux packages from the job's `kbf` and
+    /// build the `kbf` package, as the Linux jobs have them.
+    fn kbf_build_steps() -> String {
+        "      - name: Config\n        run: cargo xtask pkg-config --binary \"target/$TARGET/release/kbf-installer\" --kbf \"target/$TARGET/release/kbf\" --units u --trust t --sysusers s --tmpfiles f --platform p --version 0.0.0+ci --out target/pkg\n      - name: Build kbf\n        run: cargo xtask pkg-build --nfpm n --config target/pkg/kbf/nfpm.yaml --out target/pkg/kbf-out\n".to_owned()
+    }
+
+    /// The step that makes the `kbf` deb of `platform` an asset.
+    fn kbf_asset_step(platform: &str) -> String {
+        format!(
+            "      - name: Kbf asset\n        run: cargo xtask pkg-kbf-asset --package target/pkg/kbf-out --platform {platform} --commit \"$GITHUB_SHA\" --kbf-tarball \"dist/kbf-$GITHUB_SHA-{platform}.tar.gz\" --out dist\n"
+        )
+    }
+
+    /// The verify job's check of the signed `kbf` deb of `platform`.
+    fn verify_kbf_package_step(platform: &str) -> String {
+        format!(
+            "      - name: Kbf package {platform}\n        run: cargo xtask pkg-kbf-asset --verify-only --package \"dist/kbf-$GITHUB_SHA-{platform}.deb\" --platform {platform} --commit \"$GITHUB_SHA\" --kbf-tarball \"dist/kbf-$GITHUB_SHA-{platform}.tar.gz\"\n"
+        )
+    }
+
     /// The steps that make the Mac `.pkg` an asset, as the darwin job has them (after the
     /// tarball's identity and signature checks, which `good()` writes before).
     fn mac_package_steps() -> String {
@@ -928,7 +957,7 @@ mod rules {
     /// A workflow of the shape the rules read, meeting every one.
     fn good() -> String {
         let mut w = String::from(
-            "on:\n  pull_request:\n  merge_group:\n  push:\n    branches: [main]\npermissions: {}\nenv:\n  GH_SHA256_AARCH64_DARWIN: abababababababababababababababababababababababababababababababab\njobs:\n",
+            "on:\n  pull_request:\n  merge_group:\n  workflow_call:\npermissions: {}\nenv:\n  GH_SHA256_AARCH64_DARWIN: abababababababababababababababababababababababababababababababab\njobs:\n",
         );
         for job in BUILD_JOBS {
             w.push_str(&format!(
@@ -985,7 +1014,9 @@ mod rules {
                 }
             }
             if PACKAGES.contains(job) {
+                w.push_str(&kbf_build_steps());
                 w.push_str(&package_steps(platform));
+                w.push_str(&kbf_asset_step(platform));
             }
             if *job == MAC_PACKAGE {
                 w.push_str(&mac_package_steps());
@@ -998,11 +1029,12 @@ mod rules {
         }
         for platform in ["linux", "darwin-arm64"] {
             w.push_str(&format!(
-                "  verify-{platform}:\n    if: {SIGNING_IF}\n    runs-on: ubuntu-24.04\n    steps:\n      - run: gh attestation trusted-root > \"$RUNNER_TEMP/trusted_root.jsonl\"\n      - run: cargo xtask verify-assets attestations dist --repo \"$GITHUB_REPOSITORY\" --workflow-ref \"$GITHUB_WORKFLOW_REF\" --source-ref \"$GITHUB_REF\" --commit \"$GITHUB_SHA\" --trusted-root \"$RUNNER_TEMP/trusted_root.jsonl\"\n"
+                "  verify-{platform}:\n    if: {SIGNING_IF}\n    runs-on: ubuntu-24.04\n    steps:\n      - run: gh attestation trusted-root > \"$RUNNER_TEMP/trusted_root.jsonl\"\n      - run: cargo xtask verify-assets attestations dist --repo \"$GITHUB_REPOSITORY\" --workflow-ref \"$GITHUB_REPOSITORY/.github/workflows/artifacts.yml\" --source-ref \"$GITHUB_REF\" --commit \"$GITHUB_SHA\" --trusted-root \"$RUNNER_TEMP/trusted_root.jsonl\"\n"
             ));
             if platform == "linux" {
                 for p in PACKAGES {
                     w.push_str(&verify_package_step(p));
+                    w.push_str(&verify_kbf_package_step(p));
                 }
             } else {
                 w.push_str(&verify_mac_package_step());
@@ -1155,16 +1187,17 @@ mod rules {
         }
         let none = broken(&line, "");
         names(&none, &["has `if: (none)`"]);
-        for branches in [
-            "[main, feature/arch-v2]",
-            "[main, other]",
-            "[feature/arch-v2]",
-        ] {
-            names(
-                &broken("[main]", branches),
-                &["`push` runs the workflow for"],
-            );
-        }
+        names(
+            &broken(
+                "  workflow_call:\n",
+                "  workflow_call:\n  push:\n    branches: [main]\n",
+            ),
+            &["the workflow has a `push` trigger"],
+        );
+        names(
+            &broken("  workflow_call:\n", ""),
+            &["does not run on `workflow_call`"],
+        );
         names(
             &broken("  merge_group:\n", ""),
             &["does not run on `merge_group`"],
@@ -1895,8 +1928,11 @@ mod rules {
             ],
         );
     }
+
+    mod kbf_package_tests;
 }
 
 mod facts;
 #[cfg(test)]
 mod installer;
+mod kbf_package;

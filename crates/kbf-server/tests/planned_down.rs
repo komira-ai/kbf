@@ -239,7 +239,7 @@ fn router_over(farm: &Farm, primary: MemberId) -> (Router, [Arc<Node>; 2], Bytes
 // router moves on to b after dialling a, which is what the node's failure costs: a connection
 // attempt per write for up to a TTL), and an action-cache commit does not fail over and is
 // refused UNAVAILABLE. Planned, a is never dialled, the put and the commit both go to b, and
-// they still do after a stops. Mutants (planted locally): `plan_down` leaving the member
+// they still do after a stops. Catches: `plan_down` leaving the member
 // `Active` in the map; the router's write order not skipping `Down` members.
 #[tokio::test]
 async fn a_write_during_a_planned_restart_goes_to_the_other_owner() {
@@ -373,7 +373,7 @@ fn only_an_active_member_can_be_planned_down() {
 
 // Catches: a planned restart kept only in the frontend that made it. A second `Members` over
 // the same store (a frontend that restarted, or another) sees the member Down and planned,
-// and the shown view says so. Mutant: the mark left unwritten.
+// and the shown view says so. Catches: the mark left unwritten.
 #[test]
 fn a_planned_restart_survives_a_frontend_restart() {
     let farm = Farm::new();
@@ -491,7 +491,7 @@ fn the_member_returns_by_registering_or_by_an_undo() {
 // Catches: a controller that dies leaving a healthy node out of service for ever. A plan
 // lasts `for_`; the member keeps beating, and its first beat after that returns it to Active
 // in a new generation, the mark gone, and `node_idle` says the plan ran out before that. Before
-// that time a beat changes nothing. Mutants: the expiry not checked on a beat; checked
+// that time a beat changes nothing. Catches: the expiry not checked on a beat; checked
 // against the wrong clock (it returns at once).
 #[test]
 fn a_planned_restart_ends_by_the_next_beat_after_its_time() {
@@ -543,7 +543,7 @@ fn a_planned_restart_ends_by_the_next_beat_after_its_time() {
 // Catches: a second controller (or a retry) refused with an error, or a repeat that bumps the
 // map: asking again for a member already planned down is the same plan with its end moved
 // to a whole `for_` from now, in the same generation. The plan that would have ended is
-// still running after the repeat. Mutant: the repeat leaves the old end.
+// still running after the repeat. Catches: the repeat leaves the old end.
 #[test]
 fn planning_down_again_moves_the_end_and_changes_no_generation() {
     let farm = Farm::new();
@@ -581,7 +581,7 @@ fn planning_down_again_moves_the_end_and_changes_no_generation() {
 // tick ends the plan (a plan is in force until its end, not at it), and one a nanosecond
 // before does not. Each case is a farm of its own; the clock is set so that the member's beat is
 // the very next thing the store reads (a commit moves the fake's clock, so nothing may come
-// between). Mutant: the beat comparing with `>`.
+// between). Catches: the beat comparing with `>`.
 fn beat_at_the_end_plus(offset_ns: i64) -> Option<MemberState> {
     let farm = Farm::new();
     let a = farm.ids[0];
@@ -626,4 +626,64 @@ fn a_heartbeat_on_the_end_tick_ends_the_plan_and_one_before_it_does_not() {
         Some(MemberState::Active),
         "a beat on the end tick"
     );
+}
+
+/// Catches: an undo that promotes a member that is not planned down (a member that is `Active`
+/// would be written again under a new generation), one that changes nothing it says it
+/// changed, and one that is accepted for a member nobody registered. A planned member is made
+/// `Active` by the undo, in a new generation, and the answer is that it changed; a second
+/// undo changes nothing and says so.
+#[test]
+fn undoing_a_plan_changes_only_a_member_that_is_planned_down() {
+    let farm = Farm::new();
+    let [a, _] = farm.ids;
+    let before = farm.members.current_map().expect("read").expect("a map");
+
+    assert!(!farm.members.undo_plan(a).expect("nothing to undo"));
+    let same = farm.members.current_map().expect("read").expect("a map");
+    assert_eq!(same.generation(), before.generation());
+    assert_eq!(farm.state(a), Some(MemberState::Active));
+
+    let planned = farm.members.plan_down(a, PLAN).expect("planned");
+    assert!(farm.members.undo_plan(a).expect("undone"));
+    let after = farm.members.current_map().expect("read").expect("a map");
+    assert!(after.generation() > planned.generation());
+    assert_eq!(farm.state(a), Some(MemberState::Active));
+    assert!(!farm.members.planned_down(a).expect("read"));
+    assert!(!farm.members.undo_plan(a).expect("already undone"));
+
+    let stranger = farm.members.undo_plan(MemberId(9)).expect_err("nobody");
+    assert!(matches!(
+        stranger,
+        MembershipError::NotRegistered(MemberId(9))
+    ));
+}
+
+/// Catches: a plan that has run out still shown as a restart under way. The member keeps
+/// beating, so its row lives; between the end of the plan and its next beat the mark is still
+/// in the store, and the look says the member is not planned down and has no time since the
+/// mark.
+#[test]
+fn a_plan_that_ran_out_is_not_shown_as_marked() {
+    let farm = Farm::new();
+    let [a, _] = farm.ids;
+    farm.members
+        .plan_down(a, Duration::from_secs(100))
+        .expect("planned");
+    let marked = farm.members.look().expect("look");
+    let seen = marked.members.iter().find(|m| m.id == a).expect("listed");
+    assert!(seen.planned_down);
+    assert!(seen.marked_ago.is_some());
+
+    for _ in 0..4 {
+        farm.store.clock.advance(SECOND * 20);
+        farm.beat(0);
+    }
+    farm.store.clock.advance(SECOND * 20);
+    assert!(farm.store.fake.get("down/1").expect("read").is_some());
+    let ran_out = farm.members.look().expect("look");
+    let seen = ran_out.members.iter().find(|m| m.id == a).expect("listed");
+    assert_eq!(seen.state, MemberState::Down);
+    assert!(!seen.planned_down);
+    assert_eq!(seen.marked_ago, None);
 }

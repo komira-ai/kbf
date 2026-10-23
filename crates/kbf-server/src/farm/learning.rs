@@ -8,7 +8,7 @@ use kbf_invocation::Evidence;
 use kbf_sched::{Request, Requeue, RequeueReason};
 use std::sync::atomic::Ordering;
 
-use kbf_types::{Failure, LeaseId, LeaseKind, OperationId, Outcome, WorkerId};
+use kbf_types::{Failure, LeaseId, LeaseKind, OperationId, Outcome, WaiterId, WorkerId};
 
 use super::State;
 use crate::action_usage::Measured;
@@ -228,10 +228,11 @@ impl State {
         Vec::new()
     }
 
-    /// Logs what the estimator would book for `request`, the new operation `name`. A
-    /// caller that joined a twin (`joined`) is not a new operation.
+    /// Logs what the estimator would book for `request`, the new operation `name` that
+    /// `waiter` waits on. A caller that joined a twin (`joined`) is not a new operation.
     pub(super) fn learn_submit(
         &mut self,
+        waiter: WaiterId,
         name: &str,
         request: &Request,
         evidence: &Evidence,
@@ -245,7 +246,7 @@ impl State {
             self.learned.skip(Skip::Kind);
             return;
         }
-        let Some((_, waiter)) = self.machine.named(name) else {
+        let Some(waiter) = self.machine.waiter(waiter) else {
             return;
         };
         let (instance, platform, subject) = (

@@ -38,7 +38,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Verb {
-    /// First install: accounts, directories, installer.toml, the first release.
+    /// First install: accounts, directories, installer.toml, kbf.toml, the units.
     Setup(Box<SetupArgs>),
     /// What is installed, staged and pending, and the last refusal.
     Status,
@@ -94,36 +94,14 @@ impl Mode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum ReleaseSource {
-    Url,
-    Frontend,
-    Bundled,
-}
-
 #[derive(Args)]
 pub struct SetupArgs {
     /// The kbf mode this host runs (`kbf --mode=...`).
     #[arg(long, value_enum)]
     pub mode: Mode,
-    /// Where releases are fetched from. Default: the frontend for the modes that enroll,
-    /// a file server (`url`) for `frontend` and `all-in-one`. `bundled` fetches nothing: it
-    /// takes no --release-url and no --commit.
-    #[arg(long, value_enum)]
-    pub release_source: Option<ReleaseSource>,
-    /// The https base URL of the file server, for --release-source url.
-    #[arg(long)]
-    pub release_url: Option<String>,
-    /// The keys of the release source that go with it in installer.toml: the file server's CA
-    /// (`url`) and the frontend's worker listener with its CA (`frontend`).
-    #[command(flatten)]
-    pub release: crate::setup::release_keys::ReleaseFlags,
     /// Refuse orders below this generation. A floor only goes up.
     #[arg(long)]
     pub min_generation: Option<u64>,
-    /// The first release to install (40 hex characters); needs --release-source url.
-    #[arg(long)]
-    pub commit: Option<CommitId>,
     /// The frontend to enroll with, as https://host[:port]. For `storage`, `daemon` and
     /// `storage-and-daemon`; written to kbf.toml.
     #[arg(long)]
@@ -161,6 +139,10 @@ pub struct SetupArgs {
     /// is the only value setup accepts. The same flag, with the same meaning, as on `run`.
     #[arg(long, value_parser = kbf_host::HostPath::new)]
     pub installer_config: Option<kbf_host::HostPath>,
+    /// The flags that no longer do anything: the release source and its keys, and the first
+    /// release. Taken and ignored for one release, with a warning.
+    #[command(flatten)]
+    pub retired: crate::setup::retired::RetiredFlags,
 }
 
 #[derive(Args)]
@@ -340,9 +322,9 @@ impl ProxyArgs {
 pub struct BootArgs {
     #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(120..=1800))]
     pub window_secs: u64,
-    /// The kbf this unit starts, on a bundled host (one with no releases and no state). It
-    /// says the state schema it needs; the database is brought to it before the unit starts.
-    /// Needs --mode.
+    /// The kbf this unit starts, on a bundled host (one with no releases and no state): the
+    /// check runs `<kbf> boot-check --mode=<mode>` over the host's installer.toml (under
+    /// --root), which migrates the state database, and ends as it ends. Needs --mode.
     #[arg(long, requires = "mode")]
     pub kbf: Option<std::path::PathBuf>,
     /// The mode of the unit that runs the check: only frontend and all-in-one keep state in

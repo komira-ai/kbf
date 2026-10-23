@@ -85,7 +85,7 @@ fn the_document_has_the_designs_fields() {
 fn the_harness_commit_is_its_own_when_it_is_given_and_the_commit_under_test_otherwise() {
     // Catches: two fields that cannot differ (the attested beta runs released bytes with the
     // harness of another checkout, and the document must say which is which), and a harness
-    // commit that is lost when it is given. Mutant: `harness_commit` always the commit.
+    // commit that is lost when it is given. Catches: `harness_commit` always the commit.
     let both = Document::running("s", |key| match key {
         "GITHUB_SHA" => Some("aaa".to_owned()),
         "KBF_HARNESS_COMMIT" => Some("bbb".to_owned()),
@@ -195,7 +195,7 @@ fn the_summary_is_a_table_of_the_gates() {
 fn the_summary_spells_the_status_as_the_document_does_and_keeps_a_pipe_in_its_cell() {
     // Catches: `Passed` in the summary where the JSON says `PASSED` (a reader greps one for
     // the other), and a `|` in a measured value or detail ending its cell, which shifts every
-    // column after it. Mutants: `{:?}` for the status; no escape in `cell`.
+    // column after it. Catches: `{:?}` for the status; no escape in `cell`.
     let mut d = doc();
     d.status = Status::Passed;
     let mut g = gate("lost_blobs_gauge", Verdict::Pass);

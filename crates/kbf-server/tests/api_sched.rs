@@ -55,7 +55,7 @@ fn items(body: &Value) -> &Vec<Value> {
 /// operation, instance, digest, QoS, platform and a phase; the node filter keeps that
 /// node's and an unknown node's is empty (200); paging by 2 gives 2 then 1 with a
 /// `next_page` that leads to the rest and no repeat; `/v1/nodes` agrees on the count.
-/// Mutants: the filter ignored; the page not truncated; the next page repeating the last
+/// Catches: the filter ignored; the page not truncated; the next page repeating the last
 /// lease; the token not advancing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn leases_list_what_a_daemon_holds_and_page() {
@@ -138,7 +138,7 @@ async fn leases_list_what_a_daemon_holds_and_page() {
 /// Catches the queue view disagreeing with what waits: work no node can run shows its
 /// depth, its platform and QoS group with an age, a waiting reason with a count and an
 /// example the caller can look up, and an oldest age that is not null; a farm with
-/// nothing queued shows depth 0 and a null oldest age. Mutants: depth not counted;
+/// nothing queued shows depth 0 and a null oldest age. Catches: depth not counted;
 /// reasons left out; the platform label dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_queue_shows_work_no_node_can_run() {

@@ -37,7 +37,7 @@ const SECRET: &str = "frontend-test-secret-key";
 //   the heartbeat that says generation 2 `ok`, the status shows one expected, one applied,
 //   converged, the node named by the address it registered and standing `active`.
 //
-// Mutants seen red: the API's acks left as a source that knows no node, the wiring this replaced (the status lists no node and never converges); the
+// Catches: the API's acks left as a source that knows no node, the wiring this replaced (the status lists no node and never converges); the
 // `ColdStore` service not added to the worker listener (the fetch is UNIMPLEMENTED);
 // `Membership` built without the delivery (every answer carries generation 0).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -248,7 +248,7 @@ async fn status_of(
 // file and node B by the operator's `POST /v1/denied` row, and each fetch is PERMISSION_DENIED
 // naming the entry, while node C, listed nowhere, is served.
 //
-// Mutants seen red: `ColdStore` built with no deny list file; built without the `deny/` rows.
+// Catches: `ColdStore` built with no deny list file; built without the `deny/` rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_store_fetch_is_refused_to_denied_nodes() {
     let pki = Pki::new("object-stores-deny");
@@ -360,7 +360,7 @@ async fn fetch_with(
 //   with no secret, a role other than storage under the right secret, and a storage role with
 //   no node id; no refusal carries the secret.
 //
-// Mutant seen red: the handler reading the peer certificate instead of
+// Catches: the handler reading the peer certificate instead of
 // `identity::presented` (every proxied fetch is refused).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn behind_the_proxy_the_store_fetch_is_judged_by_the_forwarded_identity() {

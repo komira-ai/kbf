@@ -64,7 +64,7 @@ fn assert_unspent(f: &Farm, op: OperationId, why: &str) {
     );
 }
 
-/// Catches the mutant that charges every silent lease (the guard in
+/// Catches the defect that charges every silent lease (the guard in
 /// `Scheduler::unproven` deleted): a node that goes silent before the grant is
 /// committed, so the `Start` was never sent, ran nothing. The lease is requeued as
 /// silent and charged nothing, more often than the budget allows, and nothing is
@@ -396,7 +396,7 @@ fn a_session_switch_given_up_charges_nothing() {
     }
 }
 
-/// Catches one counter per path (the mutant: a restart, or a memory kill, counted
+/// Catches one counter per path (the defect: a restart, or a memory kill, counted
 /// apart from the rest): a proven restart's give-up, a busy node's kill and an infra
 /// result spend one budget, so the third ends the operation.
 #[test]
@@ -417,7 +417,7 @@ fn a_restart_a_memory_kill_and_an_infra_result_share_one_budget() {
     );
 }
 
-/// Catches a budget that depends on the order of the faults (the mutant: silence
+/// Catches a budget that depends on the order of the faults (the defect: silence
 /// counted only when it is the last): silence first, then an infra result, then a
 /// fenced run end the operation.
 #[test]
@@ -448,7 +448,7 @@ fn silence_an_infra_result_and_a_lost_run_share_one_budget() {
 }
 
 /// Catches a replacement that does not move the operation while the budget lasts (the
-/// mutant: `Replaced` requeued without recording the run, or without avoiding the
+/// defect: `Replaced` requeued without recording the run, or without avoiding the
 /// node): process `a2` replaces `a`'s daemon, the handover grace ends, and the lease is
 /// requeued as replaced, recorded as a fenced run on `a`, and rerun on `b`.
 #[test]
@@ -469,7 +469,7 @@ fn a_replacement_below_the_budget_reruns_on_another_node() {
     assert_eq!(next.worker, w("b"), "rerun on the node it was lost on");
 }
 
-/// Catches an action's own memory kill taken for the farm's fault (the mutant: the
+/// Catches an action's own memory kill taken for the farm's fault (the defect: the
 /// `Infra` arm widened to `OutOfMemory`): below the largest node it is run again with
 /// the booking doubled, and at the largest node it is answered, and neither is a farm
 /// run.

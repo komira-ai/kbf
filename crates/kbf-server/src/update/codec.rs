@@ -1,5 +1,5 @@
-//! The bytes of the `update/*` rows (`docs/design/split-mode-updates.md` section 6.1 and
-//! `docs/design/pull-updates.md` section 6.2, which agree on the fields).
+//! The bytes of the `update/desired` and `update/policy` rows (`docs/design/pull-updates.md`
+//! section 6.2).
 //!
 //! Each row is a protobuf message written with `prost`, as `member/<id>` is
 //! (`crate::members`): an unknown field is skipped, so a later version may add one, and a
@@ -8,21 +8,12 @@
 //! of section 3.4: a row is frozen across one step). `tests/update_rows.rs` holds the bytes
 //! of one value of each row, and fails if they move.
 //!
-//! The fields are the agreed ones, numbered in the order the design listed them when the rows
-//! were first written, and a few beyond them, each said where it is declared:
-//! `update/host.reason` (the reason of a `Held` phase), `update/host.order_epoch` (the epoch
-//! an order id was drawn under) and `update/host.commit` (the release the host's run drives
-//! it to), `update/desired.source` and `update/host.source` (where the run's release comes
-//! from), and the node step's limits in `update/policy`, each optional and absent when it is
-//! the default, so that a writer that knows only the agreed fields leaves them at the default
-//! instead of at zero. `paused` is an agreed field of `update/policy` (it was once
-//! `update/desired`'s); it took the next free number there, 18, because no field changes its
-//! number.
-//!
-//! The enums are numbered here, not by their Rust order, from 1: a zero (an absent field) is
-//! no phase and no reason, and a row that holds one is [`Corrupt`], never read as the first
-//! variant. A reader that meets a number it does not know refuses the row: every unknown
-//! fails closed.
+//! `update/desired.source` is where the run's release comes from, and the node step's limits
+//! in `update/policy` are each optional and absent when they are the default, so that a
+//! writer that knows only the agreed fields leaves them at the default instead of at zero.
+//! `paused` is an agreed field of `update/policy`; it took the next free number there, 18,
+//! because no field changes its number. The rows older builds kept for hosts and places are
+//! read by [`crate::stored_update`].
 //!
 //! **`source` is the one enum where zero is valid.** A row written before the field existed
 //! has no tag for it, and that row is a fetch, what every run meant then: 0 (or an absent tag)
@@ -32,14 +23,11 @@
 
 use std::time::Duration;
 
-use kbf_types::{FarmTime, WorkerId};
+use kbf_types::FarmTime;
 use prost::Message as _;
 
-use super::command::HoldReason;
-use super::facts::{Generation, HostRecord, OrderId, Release, Source};
-use super::node_step::HostPhase;
 use super::policy::Policy;
-use super::slot::{Holder, Slot};
+use super::run::{Generation, Release, Source};
 
 /// What is wrong with a row's bytes.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -65,35 +53,6 @@ pub struct Desired {
     pub source: Source,
 }
 
-/// `update/host/<id>`: a host's record, and the commit its run drives it to. A host started
-/// under an earlier generation finishes that step once it is past the activate order (a
-/// rollback walks it back afterwards), so the commit is kept with the row and not read from
-/// `update/desired`. `commit` and `source` are beyond the agreed fields.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HostRow {
-    /// Where the host is, as the pure step reads it.
-    pub record: HostRecord,
-    /// The release the run that started the host drives to; unread while the host is not in
-    /// a step.
-    pub commit: Release,
-    /// The source of the run that started the host, kept while the host is in a step: a run
-    /// that is offered again under another source does not change what a host past the
-    /// activate order is doing. Unread while the host is not in a step.
-    pub source: Source,
-}
-
-impl HostRow {
-    /// The row of a host nothing has been done to.
-    #[must_use]
-    pub fn unstarted() -> Self {
-        Self {
-            record: HostRecord::unstarted(),
-            commit: Release::new(""),
-            source: Source::Fetch,
-        }
-    }
-}
-
 /// Tag 4 was `paused` in an earlier draft of this row, which no release wrote (the pause is
 /// `update/policy`'s); the number is not reused. `source` is 0 (fetch, not written) or 1
 /// (staged).
@@ -107,51 +66,6 @@ struct DesiredMsg {
     set_at_ms: u64,
     #[prost(uint32, tag = "5")]
     source: u32,
-}
-
-/// The agreed fields are `phase`, `order_id`, `generation`, `since` and `boot_before`;
-/// `reason` is the hold reason of a `Held` phase, `order_epoch` the epoch the order id was
-/// drawn under (an order id is the pair), `commit` the run's release and `source` where it
-/// comes from (0 fetch, not written; 1 staged).
-#[derive(Clone, PartialEq, prost::Message)]
-struct HostMsg {
-    #[prost(uint32, tag = "1")]
-    phase: u32,
-    #[prost(uint64, tag = "2")]
-    order_id: u64,
-    #[prost(uint64, tag = "3")]
-    generation: u64,
-    #[prost(uint64, tag = "4")]
-    since_ms: u64,
-    #[prost(uint64, optional, tag = "5")]
-    boot_before: Option<u64>,
-    #[prost(uint32, tag = "6")]
-    reason: u32,
-    #[prost(uint64, tag = "7")]
-    order_epoch: u64,
-    #[prost(string, tag = "8")]
-    commit: String,
-    #[prost(uint32, tag = "9")]
-    source: u32,
-}
-
-/// One holder of a place: the agreed `{host, order_id, epoch}`.
-#[derive(Clone, PartialEq, prost::Message)]
-struct HolderMsg {
-    #[prost(string, tag = "1")]
-    host: String,
-    #[prost(uint64, tag = "2")]
-    order_id: u64,
-    #[prost(uint64, tag = "3")]
-    epoch: u64,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct SlotMsg {
-    #[prost(message, optional, tag = "1")]
-    storage: Option<HolderMsg>,
-    #[prost(message, repeated, tag = "2")]
-    hosts: Vec<HolderMsg>,
 }
 
 /// Fields 1 to 8 are the agreed ones, in the design's order of the time; 9 to 17 are the node
@@ -197,93 +111,6 @@ struct PolicyMsg {
     repair_wait_ms: Option<u64>,
     #[prost(bool, tag = "18")]
     paused: bool,
-}
-
-const fn phase_code(phase: &HostPhase) -> (u32, u32) {
-    match phase {
-        HostPhase::Pending => (1, 0),
-        HostPhase::Selected => (2, 0),
-        HostPhase::Cordoned => (3, 0),
-        HostPhase::WaitingLeases => (4, 0),
-        HostPhase::PlannedDown => (5, 0),
-        HostPhase::Gated => (6, 0),
-        HostPhase::Activating => (7, 0),
-        HostPhase::RejoiningStorage => (8, 0),
-        HostPhase::Repairing => (9, 0),
-        HostPhase::Confirming => (10, 0),
-        HostPhase::RejoiningWork => (11, 0),
-        HostPhase::Done => (12, 0),
-        HostPhase::Held { reason } => (13, reason_code(*reason)),
-        HostPhase::Deferred => (14, 0),
-    }
-}
-
-/// The number of a hold reason in a `Held` row. A number is never reused or moved. A build
-/// that does not know one reads the row as [`Corrupt`]: an older controller refuses the row
-/// of a host held for 12 (`ActivateRefused`) instead of guessing its reason.
-const fn reason_code(reason: HoldReason) -> u32 {
-    match reason {
-        HoldReason::SecondMemberDown => 1,
-        HoldReason::RestartDeadline => 2,
-        HoldReason::MemberGone => 3,
-        HoldReason::ActivateStalled => 4,
-        HoldReason::HealthLimit => 5,
-        HoldReason::RebuildLimit => 6,
-        HoldReason::RepairWait => 7,
-        HoldReason::ConfirmStalled => 8,
-        HoldReason::Reverted => 9,
-        HoldReason::RevertRefused => 10,
-        HoldReason::StillCordoned => 11,
-        HoldReason::ActivateRefused => 12,
-    }
-}
-
-fn reason_from(code: u32) -> Option<HoldReason> {
-    Some(match code {
-        1 => HoldReason::SecondMemberDown,
-        2 => HoldReason::RestartDeadline,
-        3 => HoldReason::MemberGone,
-        4 => HoldReason::ActivateStalled,
-        5 => HoldReason::HealthLimit,
-        6 => HoldReason::RebuildLimit,
-        7 => HoldReason::RepairWait,
-        8 => HoldReason::ConfirmStalled,
-        9 => HoldReason::Reverted,
-        10 => HoldReason::RevertRefused,
-        11 => HoldReason::StillCordoned,
-        12 => HoldReason::ActivateRefused,
-        _ => return None,
-    })
-}
-
-fn phase_from(code: u32, reason: u32) -> Result<HostPhase, Corrupt> {
-    let phase = match code {
-        1 => HostPhase::Pending,
-        2 => HostPhase::Selected,
-        3 => HostPhase::Cordoned,
-        4 => HostPhase::WaitingLeases,
-        5 => HostPhase::PlannedDown,
-        6 => HostPhase::Gated,
-        7 => HostPhase::Activating,
-        8 => HostPhase::RejoiningStorage,
-        9 => HostPhase::Repairing,
-        10 => HostPhase::Confirming,
-        11 => HostPhase::RejoiningWork,
-        12 => HostPhase::Done,
-        13 => {
-            let Some(reason) = reason_from(reason) else {
-                return corrupt(format!("hold reason {reason} is not one this build knows"));
-            };
-            return Ok(HostPhase::Held { reason });
-        }
-        14 => HostPhase::Deferred,
-        other => return corrupt(format!("phase {other} is not one this build knows")),
-    };
-    if reason == 0 {
-        Ok(phase)
-    } else {
-        corrupt(format!("{phase:?} carries the hold reason {reason}"))
-    }
 }
 
 /// The number a source is written as: a fetch is 0, which the row leaves out.
@@ -351,93 +178,6 @@ pub(super) fn decode_desired(bytes: &[u8]) -> Result<Desired, Corrupt> {
         set_at: FarmTime::from_millis(msg.set_at_ms),
         source: source_from(msg.source)?,
     })
-}
-
-/// The bytes of `update/host/<id>`.
-#[must_use]
-pub(super) fn encode_host(row: &HostRow) -> Vec<u8> {
-    let (phase, reason) = phase_code(&row.record.phase);
-    HostMsg {
-        phase,
-        order_id: row.record.order.seq,
-        generation: row.record.generation.0,
-        since_ms: row.record.since.as_millis(),
-        boot_before: row.record.boot_before,
-        reason,
-        order_epoch: row.record.order.epoch,
-        commit: row.commit.as_str().to_owned(),
-        source: source_code(row.source),
-    }
-    .encode_to_vec()
-}
-
-/// # Errors
-/// [`Corrupt`]: the bytes are not a message, or name a phase, reason or source this build
-/// does not know.
-pub(super) fn decode_host(bytes: &[u8]) -> Result<HostRow, Corrupt> {
-    let msg = HostMsg::decode(bytes).map_err(|e| Corrupt(e.to_string()))?;
-    Ok(HostRow {
-        record: HostRecord {
-            phase: phase_from(msg.phase, msg.reason)?,
-            since: FarmTime::from_millis(msg.since_ms),
-            generation: Generation(msg.generation),
-            order: OrderId::new(msg.order_epoch, msg.order_id),
-            boot_before: msg.boot_before,
-        },
-        commit: Release::new(msg.commit),
-        source: source_from(msg.source)?,
-    })
-}
-
-fn holder_msg(holder: &Holder) -> HolderMsg {
-    HolderMsg {
-        host: holder.host.as_str().to_owned(),
-        order_id: holder.order.seq,
-        epoch: holder.order.epoch,
-    }
-}
-
-fn holder_from(msg: HolderMsg) -> Result<Holder, Corrupt> {
-    if msg.host.is_empty() {
-        return corrupt("a holder has no host");
-    }
-    Ok(Holder {
-        host: WorkerId::new(msg.host),
-        order: OrderId::new(msg.epoch, msg.order_id),
-    })
-}
-
-/// The bytes of `update/slot`.
-#[must_use]
-pub(super) fn encode_slot(slot: &Slot) -> Vec<u8> {
-    SlotMsg {
-        storage: slot.storage.as_ref().map(holder_msg),
-        hosts: slot.hosts.iter().map(holder_msg).collect(),
-    }
-    .encode_to_vec()
-}
-
-/// # Errors
-/// [`Corrupt`]: the bytes are not a message, a holder has no host, or one host holds two
-/// places.
-pub(super) fn decode_slot(bytes: &[u8]) -> Result<Slot, Corrupt> {
-    let msg = SlotMsg::decode(bytes).map_err(|e| Corrupt(e.to_string()))?;
-    let slot = Slot {
-        storage: msg.storage.map(holder_from).transpose()?,
-        hosts: msg
-            .hosts
-            .into_iter()
-            .map(holder_from)
-            .collect::<Result<_, _>>()?,
-    };
-    let held = slot.holders().count();
-    let mut names: Vec<&WorkerId> = slot.holders().map(|(_, h)| &h.host).collect();
-    names.sort();
-    names.dedup();
-    if names.len() != held {
-        return corrupt("a host holds two places");
-    }
-    Ok(slot)
 }
 
 /// `Some` of the whole milliseconds of `value` when it is not `default`; the row leaves a

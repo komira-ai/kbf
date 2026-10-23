@@ -65,9 +65,9 @@ pub struct ActionKey {
 ///
 /// GPUs are whole and exclusive: a request books whole GPUs, and a booked GPU is
 /// another lease's only once the lease holding it ends. VM slots are counted the same
-/// way: a node's `vms` is how many VMs may run on it at once. Nothing books or fills
-/// `vms` yet: the VM lease kind (`kbf-lease=vm`) is planned and refused today, and no
-/// node's capacity carries VM slots.
+/// way: a node's `vms` is how many VMs may run on it at once. A node's `vms` is
+/// filled from its `vm.slots` report (at most two), and a VM lease (`kbf-lease=vm`) books
+/// one of them together with its CPUs and memory.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Resources {
     /// CPU in thousandths of a core (1000 = one core).
@@ -78,6 +78,10 @@ pub struct Resources {
     pub gpus: u64,
     /// VM slots.
     pub vms: u64,
+    /// On a node's capacity: the most Action and VM leases it holds at once, or `None`
+    /// for no cap. Each holds one, counted by the scheduler as the leases on the node; a request carries `None`, and [`Resources::fits`] and the arithmetic below
+    /// leave it alone (they keep `self`'s).
+    pub leases: Option<u64>,
 }
 
 impl Resources {
@@ -90,6 +94,16 @@ impl Resources {
             memory_bytes,
             gpus: 0,
             vms: 0,
+            leases: None,
+        }
+    }
+
+    /// `self` capping a node at `leases` concurrent Action leases.
+    #[must_use]
+    pub const fn with_lease_cap(self, leases: u64) -> Self {
+        Self {
+            leases: Some(leases),
+            ..self
         }
     }
 
@@ -132,6 +146,7 @@ impl Resources {
             memory_bytes: self.memory_bytes.saturating_add(other.memory_bytes),
             gpus: self.gpus.saturating_add(other.gpus),
             vms: self.vms.saturating_add(other.vms),
+            leases: self.leases,
         }
     }
 
@@ -143,6 +158,7 @@ impl Resources {
             memory_bytes: self.memory_bytes.saturating_sub(other.memory_bytes),
             gpus: self.gpus.saturating_sub(other.gpus),
             vms: self.vms.saturating_sub(other.vms),
+            leases: self.leases,
         }
     }
 }

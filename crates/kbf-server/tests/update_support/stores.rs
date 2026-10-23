@@ -5,8 +5,7 @@
 //! holds it is applied: the hook writes to the real store (not through the meddler), so the
 //! transaction that follows meets a row that moved, as it would under a second controller.
 //! [`Meddle::without_counters`] applies every transaction and answers it with no value for
-//! the counters it advanced. [`Meddle::failing_writes_to`] fails every batch that writes a
-//! key, the way a disk that is gone does, and applies nothing of it.
+//! the counters it advanced.
 
 #![allow(dead_code)]
 
@@ -24,7 +23,6 @@ pub struct Meddle {
     inner: Arc<dyn Store>,
     before: Mutex<Option<Hook>>,
     strip_counters: bool,
-    failing: Option<&'static str>,
 }
 
 impl Meddle {
@@ -37,7 +35,6 @@ impl Meddle {
             inner,
             before: Mutex::new(Some(Box::new(hook))),
             strip_counters: false,
-            failing: None,
         })
     }
 
@@ -47,17 +44,6 @@ impl Meddle {
             inner,
             before: Mutex::new(None),
             strip_counters: true,
-            failing: None,
-        })
-    }
-
-    /// `inner`, failing every batch with a transaction that writes `key`.
-    pub fn failing_writes_to(inner: Arc<dyn Store>, key: &'static str) -> Arc<dyn Store> {
-        Arc::new(Self {
-            inner,
-            before: Mutex::new(None),
-            strip_counters: false,
-            failing: Some(key),
         })
     }
 }
@@ -72,13 +58,6 @@ pub fn writes(txn: &Txn, key: &str) -> bool {
 
 impl Store for Meddle {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
-        if let Some(key) = self.failing
-            && batch.iter().any(|txn| writes(txn, key))
-        {
-            return Err(StoreError::Failed(format!(
-                "the disk holding {key} is gone"
-            )));
-        }
         if let Some(hook) = self
             .before
             .lock()

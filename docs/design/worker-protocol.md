@@ -331,7 +331,11 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
 
 The server acknowledges a heartbeat with `HeartbeatAck { seq }`, but only one from the
 node's newest stream. A heartbeat from a replaced stream is dropped unacknowledged, so
-a daemon still talking on an old stream fences on time.
+a daemon still talking on an old stream fences on time. When several frontends share one
+state store, a frontend also withholds the acknowledgement once the daemon has said
+`Hello` to another frontend, and while it has not written the node's session row to the
+store within the last half minute (`ACK_WINDOW`); it still hears the heartbeat. See
+[scheduler.md](scheduler.md#a-daemon-moving-between-frontends).
 
 The daemon fences on the **send** time of the newest acknowledged heartbeat (or of the
 `Hello` a `Welcome` answered): it kills self-fenced work T = 40 s after it. Counting

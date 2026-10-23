@@ -37,8 +37,8 @@ fn launchctl_print_of_each_real_state() {
 /// A real listing with nested blocks (`event triggers`, `endpoints`, `event channels`, each
 /// with fields of its own) is read at its top level. No real listing of the system's own
 /// services has `state`, `pid` or `last exit code` in a nested block (the workflow scanned
-/// them all); lines of those names are put into the nested blocks here, to show that they are
-/// not read: not as a state, not as a pid, not as an exit, and not when the top-level line
+/// them all), so the nested lines of those names used here are synthetic: no real listing
+/// carried them. They are put into the nested blocks to show that they are not read: not as a state, not as a pid, not as an exit, and not when the top-level line
 /// is the one that is missing.
 #[test]
 fn a_nested_block_is_never_read_as_the_services_own_field() {

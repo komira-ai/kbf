@@ -38,7 +38,7 @@ fn spellings_of_one_entry_are_equal_and_canonical() {
     assert_eq!(normalize_serial("000"), "0");
 }
 
-// Catches: a serial that is accepted when it is not hex (the mutant this test was
+// Catches: a serial that is accepted when it is not hex (the case this test was
 // written against), is empty, or is only colons.
 #[test]
 fn a_serial_that_is_not_hex_is_refused() {

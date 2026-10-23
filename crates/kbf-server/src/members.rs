@@ -50,7 +50,7 @@
 //! heartbeat, so a member that went `Down` has no version either.
 //!
 //! **Node facts.** The row also keeps what the node said of the build it runs and of its
-//! metadata log: the newest log version its build can raise it to, the version the log is at,
+//! metadata log: the newest log version its build runs (informational), the version the log is at,
 //! and the commit built ([`NodeFacts`]; row tags 7 to 9, [`Members::node_facts`], `GET
 //! /v1/members`). A registration replaces them, a heartbeat updates the log version and keeps
 //! the rest, and a node that says nothing reads as `None`, never 0. Nothing decides on them
@@ -683,7 +683,7 @@ impl Members {
         let (id, boot) = self.assign(&who.instance_id, last)?;
         let member = Member {
             id,
-            // The spelling enrollment stores, so the update controller can join a host to it.
+            // The spelling enrollment stores, so the update look can join a host to it.
             addr: kbf_enroll_registry::canonical_addr(&who.addr),
             zone: who.zone.clone(),
             weight: who.weight,

@@ -374,6 +374,34 @@ impl Cell {
         .await
     }
 
+    /// [`Cell::start_with_state`], whose operator API takes writes with [`API_TOKEN`].
+    pub async fn start_with_api_and_state(state: kbf_server::StateStore) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let api = Api {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            token: Some(api_token()),
+            local_cache: None,
+            releases: None,
+        };
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve_with_map(
+            cache,
+            store,
+            Some(api),
+            None,
+            wait,
+            retention,
+            small_ladder(),
+            StreamLimits::DEFAULT,
+            None,
+            Some(state),
+            kbf_front::DefaultPlatform::NONE,
+            kbf_server::LearnedSizes::Off,
+        )
+        .await
+    }
+
     /// A cell whose scheduler refuses queued work no live worker can run after `wait`,
     /// and keeps a finished operation for `retention`.
     pub async fn start_with(wait: Duration, retention: Duration) -> Self {
@@ -595,6 +623,7 @@ impl Cell {
             unservable_wait: wait,
             default_platform,
             memory_ladder: ladder,
+            vm_host_floor: kbf_server::HostFloor::default(),
             learned_sizes: learned,
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),

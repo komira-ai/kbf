@@ -30,15 +30,17 @@
 //!    With `--installer-dir`, the installer goes first: the installer of that release
 //!    must be able to stage the `kbf-server` and the `kbf-daemon` under test. An
 //!    installer refuses a release that declares a `protocol`, `min_protocol` or
-//!    `state_schema` above what it understands (`installer_too_old`,
-//!    [`kbf_installer::stage::understood`], the rule the installer's own staging applies),
-//!    and an installer is put on a host by hand, never updated by a release, so a kbf that
-//!    raises one of the three can only follow its installer. What an installer
-//!    understands is what the `kbf` of its release declares (decision D3 in
-//!    `kbf_installer::stage::supported`; the tip pins that its installer understands at
-//!    least what its kbf declares). The reverse order, a kbf staged by the installer
-//!    of an older release, fails when the newer declares more. When the three numbers are
-//!    equal in every build the order cannot fail and the run says so;
+//!    `state_schema` above what it understands (`installer_too_old`), and an installer is
+//!    put on a host by hand, never updated by a release, so a kbf that raises one of the
+//!    three can only follow its installer. This harness makes that comparison itself, on
+//!    the numbers the `kbf` of each build states ([`installer_problem`]): the release is
+//!    refused when any of the three is greater than the installer's, and the refusal names
+//!    the first such number in the order `protocol`, `min_protocol`, `state_schema`. What an
+//!    installer understands is what the `kbf` of its release declares (the tip pins that
+//!    its installer understands at least what its kbf declares). The reverse order, a kbf
+//!    staged by the installer of an older release, fails when the newer declares more.
+//!    When the three numbers are equal in every build the order cannot fail and the run
+//!    says so;
 //! 2. `kbf-server` (a cold store and a metadata log in the cell's directory, every
 //!    listener on 127.0.0.1 with a port the system picks) prints its ` reapi=` start
 //!    line, which names the worker listener and the operator API; it must not exit
@@ -76,7 +78,6 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
 use kbf_daemon::TlsFiles;
-use kbf_installer::stage::{Supported, understood};
 use kbf_proto::worker::worker_client::WorkerClient;
 use kbf_proto::worker::{Capability, DaemonMessage, Hello, daemon_message, server_message};
 use serde_json::Value;
@@ -195,29 +196,40 @@ impl Facts {
         })
     }
 
-    /// The numbers an installer checks a release by.
-    fn numbers(&self) -> Supported {
-        Supported {
-            protocol: u64::from(self.protocol),
-            min_protocol: u64::from(self.min_protocol),
-            state_schema: self.state_schema,
-        }
+    /// The numbers an installer checks a release by, named, in the order it checks them.
+    fn numbers(&self) -> [(&'static str, u64); 3] {
+        [
+            ("protocol", u64::from(self.protocol)),
+            ("min_protocol", u64::from(self.min_protocol)),
+            ("state_schema", self.state_schema),
+        ]
     }
 }
 
 /// Why the installer of `installer`'s release cannot stage the `component` of `release`,
-/// or `None` when it can.
+/// or `None` when it can: the release declares a number (`protocol`, `min_protocol` or
+/// `state_schema`) greater than the installer's. The first such number, in that order, is
+/// the one named.
 #[must_use]
 pub fn installer_problem(installer: &Facts, component: &str, release: &Facts) -> Option<String> {
-    understood(installer.numbers(), component, release.numbers())
-        .err()
-        .map(|refused| {
-            format!(
-                "the installer of build {} cannot stage the {component} of build {}: {refused} \
-                 (update the installer before the kbf that raises it)",
-                installer.commit, release.commit
-            )
-        })
+    let mut pairs = release.numbers().into_iter().zip(installer.numbers());
+    let too_new = pairs.find(|&((_, declared), (_, most))| declared > most);
+    too_new.map(|((field, declared), (_, most))| {
+        format!(
+            "the installer of build {} cannot stage the {component} of build {}: the release \
+             needs a newer installer: {field} {declared}; the installer understands up to \
+             {most} (update the installer before the kbf that raises it)",
+            installer.commit, release.commit
+        )
+    })
+}
+
+/// How far the numbers of `a` are from those of `b`: the sum of the three differences,
+/// which is 0 only when every number of both builds is the same (a sum of differences, not
+/// a comparison of tuples).
+fn apart(a: &Facts, b: &Facts) -> u64 {
+    let pairs = a.numbers().into_iter().zip(b.numbers());
+    pairs.map(|((_, x), (_, y))| x.abs_diff(y)).sum()
 }
 
 /// Why a daemon of `daemon`'s build cannot join a server of `server`'s build, or `None`
@@ -553,15 +565,7 @@ impl Cell {
             "OK: the installer of build {} can stage both builds",
             installer.commit
         );
-        // Sums of differences, not a comparison of tuples: the sum is 0 only when every
-        // number of both builds is the installer's.
-        let apart = |f: &Facts| {
-            let (ours, theirs) = (installer.numbers(), f.numbers());
-            ours.protocol.abs_diff(theirs.protocol)
-                + ours.min_protocol.abs_diff(theirs.min_protocol)
-                + ours.state_schema.abs_diff(theirs.state_schema)
-        };
-        if apart(server) + apart(daemon) == 0 {
+        if apart(&installer, server) + apart(&installer, daemon) == 0 {
             println!(
                 "NOTE: the installer and both builds declare the same protocols and state \
                  schema, so no order of their upgrade could fail: the order is not exercised"
@@ -799,12 +803,26 @@ impl Cell {
 mod tests {
     use super::*;
 
+    /// The `--version --json` line of a build that speaks protocols 1 to 2.
+    const OLD: &str = r#"{"commit":"old","min_protocol":1,"protocol":2,"state_schema":3}"#;
+    /// That of a build that speaks 2 to 3, which overlaps `OLD`'s range at 2.
+    const NEW: &str = r#"{"commit":"new","min_protocol":2,"protocol":3,"state_schema":3}"#;
+    /// That of a build that speaks 4 to 5, with no protocol in common with `OLD`.
+    const FAR: &str = r#"{"commit":"far","min_protocol":4,"protocol":5,"state_schema":3}"#;
+
     fn facts(commit: &str, min_protocol: u32, protocol: u32) -> Facts {
         Facts {
             commit: commit.to_owned(),
             min_protocol,
             protocol,
             state_schema: 3,
+        }
+    }
+
+    fn with_schema(facts: Facts, state_schema: u64) -> Facts {
+        Facts {
+            state_schema,
+            ..facts
         }
     }
 
@@ -882,11 +900,11 @@ mod tests {
         }
     }
 
-    /// Catches an installer that may stage a release declaring more than it understands, in
-    /// any one of the three numbers (each tried alone, the others equal), one that refuses
-    /// a release that declares no more (equal, or less: an installer ahead of the kbf it
-    /// stages is the order the rule asks for), and a refusal that names neither build, the
-    /// component nor the number.
+    /// Asserts that an installer may stage a release that declares no more than it
+    /// understands (equal, or less: an installer ahead of the kbf it stages is the order
+    /// the rule asks for), and is refused a release that declares more in any one of the
+    /// three numbers (each tried alone, the others equal), with a refusal that names both
+    /// builds, the component and the number.
     #[test]
     fn an_installer_stages_a_release_that_declares_no_more_than_it_understands() {
         let installer = facts("inst", 2, 4);
@@ -922,6 +940,60 @@ mod tests {
                 ],
             );
         }
+    }
+
+    /// Asserts that when a release raises several numbers past the installer's, the refusal
+    /// names the first of `protocol`, `min_protocol`, `state_schema`, with the release's
+    /// number and the installer's.
+    #[test]
+    fn the_first_number_a_release_raises_is_the_one_the_refusal_names() {
+        let installer = facts("inst", 2, 4);
+        let all_three = with_schema(facts("new", 3, 5), 9);
+        let why = installer_problem(&installer, "kbf-server", &all_three).expect("too old");
+        let named = "protocol 5; the installer understands up to 4";
+        holds(&why, &[named]);
+        let two = with_schema(facts("new", 3, 4), 9);
+        let why = installer_problem(&installer, "kbf-server", &two).expect("too old");
+        let named = "min_protocol 3; the installer understands up to 2";
+        holds(&why, &[named]);
+        let one = with_schema(facts("new", 2, 4), 9);
+        let why = installer_problem(&installer, "kbf-server", &one).expect("too old");
+        let named = "state_schema 9; the installer understands up to 3";
+        holds(&why, &[named]);
+    }
+
+    /// Asserts that two builds are 0 apart only when all three numbers are the same, and
+    /// that a difference in any one of them, in either direction, adds to the distance.
+    #[test]
+    fn builds_are_apart_by_the_sum_of_the_differences_of_their_numbers() {
+        let base = facts("a", 2, 4);
+        assert_eq!(apart(&base, &facts("b", 2, 4)), 0);
+        assert_eq!(apart(&base, &facts("b", 2, 6)), 2);
+        assert_eq!(apart(&facts("b", 2, 6), &base), 2);
+        assert_eq!(apart(&base, &facts("b", 1, 4)), 1);
+        assert_eq!(apart(&base, &with_schema(facts("b", 2, 4), 7)), 4);
+        assert_eq!(apart(&base, &facts("b", 5, 8)), 7);
+    }
+
+    /// Asserts that two builds whose `--version --json` lines are read as they are printed
+    /// are told apart by their numbers alone: builds whose protocol ranges overlap join
+    /// (the daemon to the server, either way round) and an installer that understands the
+    /// numbers of the release stages it; builds whose ranges do not overlap are refused,
+    /// whichever of the two is the newer, and an installer is refused a release that
+    /// declares a newer protocol.
+    #[test]
+    fn two_reported_builds_that_do_not_understand_each_other_are_refused() {
+        let report = |text| Facts::parse(text).expect("a report");
+        let (old, new, far) = (report(OLD), report(NEW), report(FAR));
+        assert_eq!(mismatch(&old, &new), None);
+        assert_eq!(mismatch(&new, &old), None);
+        let why = mismatch(&old, &far).expect("a daemon that needs a newer server");
+        holds(&why, &["speaks protocol 4 and newer", "up to protocol 2"]);
+        let why = mismatch(&far, &old).expect("a daemon older than the server accepts");
+        holds(&why, &["speaks protocol 2", "accepts protocol 4"]);
+        assert_eq!(installer_problem(&new, "kbf-daemon", &old), None);
+        let why = installer_problem(&old, "kbf-daemon", &new).expect("a newer release");
+        holds(&why, &["protocol 3; the installer understands up to 2"]);
     }
 
     /// Catches the server's `min_protocol` read as exclusive or as the daemon's, a daemon

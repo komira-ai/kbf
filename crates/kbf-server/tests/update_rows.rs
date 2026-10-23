@@ -1,32 +1,44 @@
-//! The `update/*` rows (`docs/design/split-mode-updates.md` section 6.1 and
-//! `docs/design/pull-updates.md` section 6.2): their bytes, frozen, and what reading and
-//! writing them does on the in-memory fake and on a SQLite file.
+//! The `update/*` rows of the desired release (`docs/design/pull-updates.md` section 6.2):
+//! their bytes, frozen, and what reading and writing them does on the in-memory fake and on a
+//! SQLite file. The host and place rows older builds wrote are read by
+//! `kbf_server::stored_update` (`tests/stored_update.rs`).
 //!
 //! The goldens below were worked out by hand from the protobuf wire format (a key is
 //! `tag << 3 | wire type`, a varint is seven bits at a time with the high bit saying more
 //! follow, a zero is not written), not copied from the code's output: a row that changes its
 //! bytes changes what a store written by the last release means to this one.
 //!
-//! Each test names the defect it would catch. The mutants that were planted to see each
-//! group go red are listed in the pull request.
+//! Each test names the defect it would catch.
 
 #[path = "update_support/mod.rs"]
 mod support;
 
-use kbf_server::update::{
-    Desired, Generation, HoldReason, Holder, HostPhase, HostRecord, HostRow, OrderId, Policy,
-    PolicyError, Release, RowError, Rows, Slot, SlotClass, Source, Stored,
-};
+use kbf_server::update::{Desired, Generation, Policy, Release, RowError, Rows, Source};
 use kbf_state::{Cond, Txn};
 use kbf_types::FarmTime;
 use std::time::Duration;
 use support::harness::{Backing, Cell};
-use support::id;
 
 const BACKINGS: [Backing; 2] = [Backing::Fake, Backing::Sqlite];
 
+/// A policy row with every agreed field set (the first eight, in the design's order of the
+/// time, 1 to 8), then two of the node step's limits (the write limit is 13, the rebuild
+/// limit 16), and not the pause, which came later and is 18.
+const POLICY_EVERY_FIELD: &str = "0801100118b0ea012002280430c0cf24380140016890bf058001a0f736";
+
+/// The pause as it is written: a varint key of two bytes (18 << 3 = 144 = 0x90 0x01) and the
+/// value 1.
+const PAUSED: &str = "900101";
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).expect("hex"))
+        .collect()
 }
 
 fn raw(cell: &Cell, key: &str) -> String {
@@ -46,39 +58,19 @@ fn put_raw(cell: &Cell, key: &str, value: &[u8]) {
         .expect("no condition");
 }
 
-fn row(phase: HostPhase) -> HostRow {
-    HostRow {
-        record: HostRecord {
-            phase,
-            since: FarmTime::from_millis(5000),
-            generation: Generation(3),
-            order: OrderId::new(2, 9),
-            boot_before: Some(10),
-        },
-        commit: Release::new("v2"),
-        source: Source::Fetch,
-    }
-}
-
 /// Offers `commit` from `source` at `at`, expecting no particular generation.
 fn offer_from(rows: &Rows, commit: &str, source: Source, at: FarmTime) -> Desired {
     let release = Release::new(commit);
     rows.offer_expecting(&release, source, at, None).unwrap()
 }
 
-fn write_host(rows: &Rows, name: &str, row: &HostRow) {
-    let absent = Stored {
-        value: HostRow::unstarted(),
-        version: None,
-    };
-    rows.put_host(&id(name), &absent, row).expect("a write");
-}
-
 // The bytes.
 
 /// Catches: a row whose bytes move: a field renumbered, a default written where it was
-/// left out, an enum numbered by its Rust order. Each row of the design, with a value that
-/// sets every field, against the bytes the wire format gives it.
+/// left out, an enum numbered by its Rust order. Each row, with a value that sets every
+/// field, against the bytes the wire format gives it. The policy is written only by a pause,
+/// which rewrites the row it read, so each policy below starts from the bytes an older build
+/// left and ends as the same bytes with the pause set or cleared.
 #[test]
 fn the_bytes_of_every_row_are_frozen() {
     for backing in BACKINGS {
@@ -91,58 +83,33 @@ fn the_bytes_of_every_row_are_frozen() {
         rows.offer(&Release::new("v2"), now).expect("an offer");
         assert_eq!(raw(&cell, "update/desired"), "08011202763218e807");
 
-        // update/host/<id> {phase, order_id, generation, since, boot_before}: Held (13),
-        // order number 9, generation 3, entered at 5000 ms, boot counter 10 at the mark;
-        // then the beyond-agreed fields: the hold reason (RepairWait is 7), the order's
-        // epoch 2, and the run's commit "v2".
-        let held = HostPhase::Held {
-            reason: HoldReason::RepairWait,
-        };
-        write_host(&rows, "s1", &row(held));
-        assert_eq!(
-            raw(&cell, "update/host/s1"),
-            "080d10091803208827280a3007380242027632"
-        );
-        // A host nothing was done to: only its phase (Pending is 1) is written.
-        write_host(&rows, "d1", &HostRow::unstarted());
-        assert_eq!(raw(&cell, "update/host/d1"), "0801");
+        // update/policy on a store with none: the defaults with the pause set, of which only
+        // `auto_nodes` (true by default, a plain bool in the row) is written besides it.
+        rows.set_paused(true).expect("a pause");
+        assert_eq!(raw(&cell, "update/policy"), format!("0801{PAUSED}"));
 
-        // update/slot: a storage holder and two others, each {host, order_id, epoch}.
-        let holder = |name: &str, seq: u64| Holder {
-            host: id(name),
-            order: OrderId::new(1, seq),
-        };
-        let slot = Slot {
-            storage: Some(holder("s1", 5)),
-            hosts: vec![holder("d1", 6), holder("m1", 7)],
-        };
-        let empty = rows.slot().expect("a read");
-        rows.put_slot(&empty, &slot).expect("a write");
-        assert_eq!(
-            raw(&cell, "update/slot"),
-            "0a080a02733110051801".to_owned() + "12080a02643110061801" + "12080a026d3110071801"
-        );
-
-        // update/policy, the defaults with a floor of one, three places and a Mac force:
-        // only the fields that are not the default are written. `auto_nodes` is true in the
-        // defaults and a plain bool in the row (absent is false, as every build has read it),
-        // so it is the first field.
-        let policy = Policy {
-            min_serving: 1,
-            max_hosts_out: 3,
-            mac_force_after: Some(Duration::from_secs(1800)),
-            ..Policy::default()
-        };
-        rows.set_policy(&policy).expect("a policy");
+        // The defaults with a floor of one, three places and a Mac force: only the fields
+        // that are not the default are written. `auto_nodes` is true in the defaults and a
+        // plain bool in the row (absent is false, as every build has read it), so it is the
+        // first field.
+        put_raw(&cell, "update/policy", &unhex("08012001280330c0ee6d"));
+        rows.set_paused(false).expect("a resume");
         assert_eq!(raw(&cell, "update/policy"), "08012001280330c0ee6d");
-        // Every agreed field set (the first eight, in the design's order of the time, 1 to
-        // 8), then two of the node step's limits (the write limit is 13, the rebuild limit
-        // 16), and the pause, which came later and is 18: a varint key of two bytes
-        // (18 << 3 = 144 = 0x90 0x01) and the value 1.
-        let all = Policy {
+
+        // Every agreed field set, then two limits: the pause is appended last, and cleared
+        // again it leaves the same bytes.
+        put_raw(&cell, "update/policy", &unhex(POLICY_EVERY_FIELD));
+        rows.set_paused(true).expect("a pause");
+        assert_eq!(
+            raw(&cell, "update/policy"),
+            format!("{POLICY_EVERY_FIELD}{PAUSED}")
+        );
+        rows.set_paused(false).expect("a resume");
+        assert_eq!(raw(&cell, "update/policy"), POLICY_EVERY_FIELD);
+        let every = Policy {
             auto_nodes: true,
             auto_frontend: true,
-            paused: true,
+            paused: false,
             idle_wait: Duration::from_secs(30),
             min_serving: 2,
             max_hosts_out: 4,
@@ -153,33 +120,13 @@ fn the_bytes_of_every_row_are_frozen() {
             rebuild_limit: Some(Duration::from_secs(900)),
             ..Policy::default()
         };
-        rows.set_policy(&all).expect("a policy");
-        assert_eq!(
-            raw(&cell, "update/policy"),
-            "0801".to_owned()
-                + "1001"
-                + "18b0ea01"
-                + "2002"
-                + "2804"
-                + "30c0cf24"
-                + "3801"
-                + "4001"
-                + "6890bf05"
-                + "8001a0f736"
-                + "900101"
-        );
-        assert_eq!(rows.policy().expect("a read"), all);
+        assert_eq!(rows.policy().expect("a read"), every);
     }
 }
 
 /// Catches: a staged source written under the wrong tag, number or place. The frozen bytes
-/// of the two rows above, each followed by the source: `28 01` on a desired row (tag 5, the
-/// next after the retired 4) and `48 01` on a host row (tag 9, the next after the commit's 8),
-/// and each reads back as staged. The fetch rows above are the same bytes without it.
-///
-/// Mutants: `source` on tag 4, the retired number (the desired bytes end `2001`); `source` on
-/// tag 10 of the host row, not the next number 9 (the host bytes end `5001`); staged written
-/// as 2 (the bytes end `02`).
+/// of the desired row above, followed by the source: `28 01` (tag 5, the next after the
+/// retired 4), which reads back as staged. The fetch row above is the same bytes without it.
 #[test]
 fn a_staged_row_ends_with_its_source_and_reads_back_staged() {
     for backing in BACKINGS {
@@ -190,29 +137,13 @@ fn a_staged_row_ends_with_its_source_and_reads_back_staged() {
         let offered = offer_from(&rows, "v2", Source::Staged, now);
         assert_eq!(raw(&cell, "update/desired"), "08011202763218e8072801");
         assert_eq!(rows.desired().unwrap().value.unwrap(), offered);
-
-        let held = HostPhase::Held {
-            reason: HoldReason::RepairWait,
-        };
-        let staged = HostRow {
-            source: Source::Staged,
-            ..row(held)
-        };
-        write_host(&rows, "s1", &staged);
-        assert_eq!(
-            raw(&cell, "update/host/s1"),
-            "080d10091803208827280a30073802420276324801"
-        );
-        assert_eq!(rows.hosts().expect("a read")[&id("s1")].value, staged);
     }
 }
 
 /// Catches: a row written before the source existed, or by a writer that does not know it,
 /// read as anything but a fetch; and a zero source made `Corrupt` (the rule for every other
-/// enum of these rows, which `source` deliberately does not follow). A desired row and a
-/// host row with no tag 5 or 9 read as fetch, and so do ones that say 0 outright.
-///
-/// Mutants: a zero source refused as `Corrupt`; an absent source read as staged.
+/// enum of these rows, which `source` deliberately does not follow). A desired row with no
+/// tag 5 reads as fetch, and so does one that says 0 outright.
 #[test]
 fn a_row_with_no_source_reads_as_a_fetch() {
     let cell = Cell::new(Backing::Fake, "legacy");
@@ -234,23 +165,11 @@ fn a_row_with_no_source_reads_as_a_fetch() {
     );
     let zero = rows.desired().unwrap().value.unwrap();
     assert_eq!(zero.source, Source::Fetch);
-
-    // A host row that is `Selected` with order number 7, and has no tag 9.
-    put_raw(&cell, "update/host/h", &[0x08, 0x02, 0x10, 0x07]);
-    let legacy = rows.hosts().expect("a read")[&id("h")].value.clone();
-    assert_eq!(legacy.source, Source::Fetch);
-    assert_eq!(legacy.record.phase, HostPhase::Selected);
-    put_raw(&cell, "update/host/h", &[0x08, 0x02, 0x48, 0x00]);
-    let zero = rows.hosts().expect("a read")[&id("h")].value.clone();
-    assert_eq!(zero.source, Source::Fetch);
 }
 
 /// Catches: a source serialized as anything but its lowercase word, or whose default is not
 /// a fetch (what a row that names none reads as). Both words are written and read, so each
 /// variant of the derived impls runs.
-///
-/// Mutants: the `rename_all` dropped (`"Staged"`); the default made staged; a variant dropped
-/// from the rename.
 #[test]
 fn a_source_is_its_lowercase_word_and_defaults_to_fetch() {
     let staged = serde_json::to_string(&Source::Staged).unwrap();
@@ -267,8 +186,8 @@ fn a_source_is_its_lowercase_word_and_defaults_to_fetch() {
 }
 
 /// Catches: a policy row that only knows the eight agreed fields, as the operator API
-/// writes it, read with the node step's limits at zero (a dwell of zero cannot be kept) or
-/// `max_hosts_out` at the invalid 0. Absent is the default; an explicit zero is a zero.
+/// wrote it, read with the node step's limits at zero or `max_hosts_out` at the invalid 0.
+/// Absent is the default; an explicit zero is a zero.
 #[test]
 fn a_policy_row_with_only_the_agreed_fields_leaves_the_limits_at_their_defaults() {
     let cell = Cell::new(Backing::Fake, "agreed");
@@ -285,12 +204,10 @@ fn a_policy_row_with_only_the_agreed_fields_leaves_the_limits_at_their_defaults(
         }
     );
     assert_eq!(read.max_hosts_out, 1, "absent is the default of one");
-    assert_eq!(read.validate(), Ok(()));
-    // An explicit zero is read as a zero, which the controller refuses.
+    // An explicit zero is read as a zero.
     put_raw(&cell, "update/policy", &[0x28, 0x00]);
     let zero = rows.policy().expect("a read");
     assert_eq!(zero.max_hosts_out, 0);
-    assert_eq!(zero.validate(), Err(PolicyError::NoHostsOut));
 }
 
 /// Catches: the default of `auto_nodes` moving from false to true changing what a policy row
@@ -299,9 +216,6 @@ fn a_policy_row_with_only_the_agreed_fields_leaves_the_limits_at_their_defaults(
 /// and a Mac force, `2001280330c0ee6d`, are the same row as before the change and must still
 /// read as `auto_nodes` false with every other field as it was: an operator who wrote
 /// manual is not switched to automatic by an upgrade.
-///
-/// Mutant seen red: `decode_policy` filling an absent `auto_nodes` from `Policy::default()`
-/// (it reads true).
 #[test]
 fn a_policy_row_written_before_auto_nodes_defaulted_true_still_reads_false() {
     let cell = Cell::new(Backing::Fake, "old-policy");
@@ -332,160 +246,36 @@ fn a_policy_row_written_before_auto_nodes_defaulted_true_still_reads_false() {
     assert_eq!((paused.paused, paused.auto_nodes), (true, false));
 }
 
-/// Catches: an enum numbered in a way a reordering of the Rust enum would move: every phase
-/// and every hold reason reads back as itself and has the number the design's table gives
-/// it (the phase's step order from 1, `Held` 13, `Deferred` 14).
-#[test]
-fn every_phase_and_hold_reason_round_trips_under_its_number() {
-    let reasons = [
-        HoldReason::SecondMemberDown,
-        HoldReason::RestartDeadline,
-        HoldReason::MemberGone,
-        HoldReason::ActivateStalled,
-        HoldReason::HealthLimit,
-        HoldReason::RebuildLimit,
-        HoldReason::RepairWait,
-        HoldReason::ConfirmStalled,
-        HoldReason::Reverted,
-        HoldReason::RevertRefused,
-        HoldReason::StillCordoned,
-        HoldReason::ActivateRefused,
-    ];
-    let phases = [
-        HostPhase::Pending,
-        HostPhase::Selected,
-        HostPhase::Cordoned,
-        HostPhase::WaitingLeases,
-        HostPhase::PlannedDown,
-        HostPhase::Gated,
-        HostPhase::Activating,
-        HostPhase::RejoiningStorage,
-        HostPhase::Repairing,
-        HostPhase::Confirming,
-        HostPhase::RejoiningWork,
-        HostPhase::Done,
-    ];
-    let cell = Cell::new(Backing::Fake, "phases");
-    let rows = Rows::new(cell.store());
-    let forget = |key: &str| {
-        let gone = Txn::new().delete(key, Cond::Any);
-        cell.store()
-            .txn(gone)
-            .expect("a write")
-            .expect("no condition");
-    };
-    // A phase is `08` and its number, then the order number (`10`); a reason, written only
-    // for `Held`, is field 6 (`30`), between the boot counter and the order's epoch.
-    for (n, phase) in phases.into_iter().enumerate() {
-        write_host(&rows, "h", &row(phase.clone()));
-        let bytes = raw(&cell, "update/host/h");
-        let number = n + 1;
-        // No reason is written for a step: the rest of the row is the same for every phase.
-        assert_eq!(
-            bytes,
-            format!("08{number:02x}10091803208827280a380242027632"),
-            "{phase:?}"
-        );
-        assert_eq!(
-            rows.hosts().expect("a read")[&id("h")].value,
-            row(phase.clone())
-        );
-        forget("update/host/h");
-    }
-    for (n, reason) in reasons.into_iter().enumerate() {
-        let held = HostPhase::Held { reason };
-        write_host(&rows, "r", &row(held.clone()));
-        let bytes = raw(&cell, "update/host/r");
-        let number = n + 1;
-        assert_eq!(
-            bytes,
-            format!("080d10091803208827280a30{number:02x}380242027632"),
-            "{reason:?}"
-        );
-        assert_eq!(rows.hosts().expect("a read")[&id("r")].value, row(held));
-        forget("update/host/r");
-    }
-    // The newest reason spelled out, not counted: 12 is `0c` after the reason key. The read
-    // of a number no build knows is `a_row_this_build_cannot_read_is_refused_not_guessed`.
-    let refused = HostPhase::Held {
-        reason: HoldReason::ActivateRefused,
-    };
-    write_host(&rows, "n", &row(refused.clone()));
-    assert_eq!(
-        raw(&cell, "update/host/n"),
-        "080d10091803208827280a300c380242027632"
-    );
-    let read = rows.hosts().expect("a read");
-    assert_eq!(read[&id("n")].value, row(refused));
-    forget("update/host/n");
-    write_host(&rows, "x", &row(HostPhase::Deferred));
-    assert!(raw(&cell, "update/host/x").starts_with("080e10"));
-}
-
-/// Catches: a reader that guesses. A number this build does not know, a zero (a field
-/// that is not there), a hold reason on a phase that has none, a `Held` with no reason, two
-/// places held by one host, an empty name, an empty commit, generation 0, a source above
-/// staged (2) on either row and bytes that are no message are each refused with the row's
-/// name, never read as the nearest phase or as a fetch.
-///
-/// Mutant: the limit of `source_from` moved from 1 to 2 (a source of 2 reads as staged).
+/// Catches: a reader that guesses. A run with no commit, one with no generation (generation
+/// 0 is what a host no run has touched carries, so a run of it would read every host as
+/// having finished it), a source above staged (2), and bytes that are no message are each
+/// refused with the row's name, never read as a fetch or as the nearest run.
 #[test]
 fn a_row_this_build_cannot_read_is_refused_not_guessed() {
     let cell = Cell::new(Backing::Fake, "corrupt");
     let rows = Rows::new(cell.store());
-    let bad_hosts: [(&str, &[u8]); 7] = [
-        ("no phase", &[0x10, 0x00]),
-        ("a phase from the future", &[0x08, 0x63]),
-        ("a reason on a step", &[0x08, 0x03, 0x30, 0x01]),
-        ("held with no reason", &[0x08, 0x0d]),
+    let bad_runs: [(&str, &[u8]); 4] = [
+        ("not a message", &[0xff]),
+        ("no commit", &[0x08, 0x01]),
+        ("no generation", &[0x12, 0x02, 0x76, 0x32]),
         (
-            "held for a reason from the future",
-            &[0x08, 0x0d, 0x30, 0x63],
+            "a source from the future",
+            &[0x08, 0x01, 0x12, 0x02, 0x76, 0x32, 0x28, 0x02],
         ),
-        ("an unknown source", &[0x08, 0x03, 0x48, 0x02]),
-        ("not a message", &[0xff, 0xff, 0xff]),
     ];
-    for (what, bytes) in bad_hosts {
-        put_raw(&cell, "update/host/h", bytes);
-        let Err(RowError::Corrupt { key, .. }) = rows.hosts() else {
+    for (what, bytes) in bad_runs {
+        put_raw(&cell, "update/desired", bytes);
+        let Err(RowError::Corrupt { key, .. }) = rows.desired() else {
             panic!("{what}: the row was read");
         };
-        assert_eq!(key, "update/host/h", "{what}");
+        assert_eq!(key, "update/desired", "{what}");
     }
-    cell.store()
-        .txn(Txn::new().delete("update/host/h", Cond::Any))
-        .expect("a write")
-        .expect("no condition");
-
-    // One host in two places, and a holder with no name.
-    let twice = [
-        0x0a, 0x04, 0x0a, 0x02, 0x73, 0x31, 0x12, 0x04, 0x0a, 0x02, 0x73, 0x31,
-    ];
-    put_raw(&cell, "update/slot", &twice);
-    assert!(matches!(rows.slot(), Err(RowError::Corrupt { .. })));
-    put_raw(&cell, "update/slot", &[0x0a, 0x02, 0x10, 0x01]);
-    assert!(matches!(rows.slot(), Err(RowError::Corrupt { .. })));
-    // Bytes that are no message at all, for the two rows the host loop above did not try.
-    put_raw(&cell, "update/slot", &[0xff]);
-    assert!(matches!(rows.slot(), Err(RowError::Corrupt { .. })));
-    put_raw(&cell, "update/desired", &[0xff]);
-    assert!(matches!(rows.desired(), Err(RowError::Corrupt { .. })));
-
-    // A run with no commit, and one with no generation (generation 0 is what a host no run
-    // has touched carries, so a run of it would read every host as having finished it).
-    put_raw(&cell, "update/desired", &[0x08, 0x01]);
-    assert!(matches!(rows.desired(), Err(RowError::Corrupt { .. })));
-    put_raw(&cell, "update/desired", &[0x12, 0x02, 0x76, 0x32]);
-    assert!(matches!(rows.desired(), Err(RowError::Corrupt { .. })));
-    // A run with a commit and a generation, and a source of 2.
-    put_raw(
-        &cell,
-        "update/desired",
-        &[0x08, 0x01, 0x12, 0x02, 0x76, 0x32, 0x28, 0x02],
-    );
-    assert!(matches!(rows.desired(), Err(RowError::Corrupt { .. })));
     put_raw(&cell, "update/policy", &[0xff]);
     assert!(matches!(rows.policy(), Err(RowError::Corrupt { .. })));
+    assert!(matches!(
+        rows.policy_if_set(),
+        Err(RowError::Corrupt { .. })
+    ));
 }
 
 /// Catches: a reader that cannot take a row a later release wrote with one more field
@@ -495,15 +285,13 @@ fn a_row_this_build_cannot_read_is_refused_not_guessed() {
 fn a_field_added_later_is_skipped() {
     let cell = Cell::new(Backing::Fake, "newer");
     let rows = Rows::new(cell.store());
-    write_host(&rows, "h", &row(HostPhase::Cordoned));
-    let mut bytes = cell.store().get("update/host/h").unwrap().unwrap().value;
+    let now = FarmTime::from_millis(1000);
+    let offered = offer_from(&rows, "v2", Source::Fetch, now);
+    let mut bytes = cell.store().get("update/desired").unwrap().unwrap().value;
     // Field 15, a varint, and field 16, a string.
     bytes.extend_from_slice(&[0x78, 0x2a, 0x82, 0x01, 0x02, 0x68, 0x69]);
-    put_raw(&cell, "update/host/h", &bytes);
-    assert_eq!(
-        rows.hosts().expect("a read")[&id("h")].value,
-        row(HostPhase::Cordoned)
-    );
+    put_raw(&cell, "update/desired", &bytes);
+    assert_eq!(rows.desired().unwrap().value.unwrap(), offered);
 }
 
 // The rows.
@@ -561,13 +349,7 @@ fn offers_grow_the_generation_and_leave_the_pause_alone() {
 /// drawn from is behind the row (a row written without the counter, or a counter restored
 /// from an older backup than the row). Setting the older commit again afterwards is a new
 /// run: that is the rollback. The run is the pair of commit and source: the same commit from
-/// another source is a new run (the hosts of the old one that have done nothing irreversible
-/// are given back), and the same pair again is not.
-///
-/// Mutants: a commit-only compare (the staged offer of the commit already desired as a fetch
-/// keeps generation 91); a source-only compare (`v1` offered after `v2`, both fetches, keeps
-/// generation 1); a compare that never matches (the repeat of the staged offer is generation
-/// 93, not 92); the source not stored in the new row (the staged offer reads back as a fetch).
+/// another source is a new run, and the same pair again is not.
 #[test]
 fn the_commit_already_desired_keeps_its_generation_and_a_generation_is_always_above_the_row() {
     for backing in BACKINGS {
@@ -637,50 +419,18 @@ fn the_commit_already_desired_keeps_its_generation_and_a_generation_is_always_ab
     }
 }
 
-/// Catches: a policy row written that the controller could not keep; a missing row read as
-/// anything but the design's defaults; a field lost in the round trip.
+/// Catches: a missing policy row read as anything but the design's defaults, and a pause
+/// that rewrites the policy it sits in (the other settings back at their defaults after a
+/// pause), or a resume that does not clear it. On an empty store a pause is the defaults with
+/// `paused` set; on a row an older build wrote, every other setting and limit stays as it was
+/// through a pause and a resume.
 #[test]
-fn the_policy_is_the_defaults_until_written_and_is_checked_when_written() {
-    for backing in BACKINGS {
-        let cell = Cell::new(backing, "policy");
-        let rows = Rows::new(cell.store());
-        assert_eq!(rows.policy().unwrap(), Policy::default());
-        let bad = Policy {
-            max_hosts_out: 0,
-            ..Policy::default()
-        };
-        assert_eq!(
-            rows.set_policy(&bad),
-            Err(RowError::Policy(PolicyError::NoHostsOut))
-        );
-        assert_eq!(
-            rows.policy().unwrap(),
-            Policy::default(),
-            "nothing was written"
-        );
-        let every = Policy {
-            ttl: Duration::from_millis(15_500),
-            min_serving: 2,
-            max_hosts_out: 4,
-            rebuild_limit: Some(Duration::from_secs(900)),
-            mac_force_after: Some(Duration::from_secs(60)),
-            ..Policy::default()
-        };
-        rows.set_policy(&every).unwrap();
-        assert_eq!(rows.policy().unwrap(), every);
-    }
-}
-
-/// Catches: a pause that rewrites the policy it sits in (the other settings back at their
-/// defaults after a pause), a resume that does not clear it, and a policy write that leaves
-/// an old pause standing: the pause is one field of `update/policy`, changed alone by
-/// `set_paused` and stated whole by `set_policy`. On an empty store a pause is the defaults
-/// with `paused` set.
-#[test]
-fn a_pause_changes_only_the_pause_and_a_policy_write_states_it() {
+fn a_pause_changes_only_the_pause() {
     for backing in BACKINGS {
         let cell = Cell::new(backing, "pause");
         let rows = Rows::new(cell.store());
+        assert_eq!(rows.policy().unwrap(), Policy::default());
+        assert_eq!(rows.policy_if_set().unwrap(), None);
         rows.set_paused(true).unwrap();
         let paused_defaults = Policy {
             paused: true,
@@ -690,15 +440,8 @@ fn a_pause_changes_only_the_pause_and_a_policy_write_states_it() {
         rows.set_paused(false).unwrap();
         assert_eq!(rows.policy().unwrap(), Policy::default());
 
-        let every = Policy {
-            auto_nodes: true,
-            min_serving: 2,
-            max_hosts_out: 4,
-            rebuild_limit: Some(Duration::from_secs(900)),
-            mac_force_after: Some(Duration::from_secs(60)),
-            ..Policy::default()
-        };
-        rows.set_policy(&every).unwrap();
+        put_raw(&cell, "update/policy", &unhex(POLICY_EVERY_FIELD));
+        let every = rows.policy().unwrap();
         rows.set_paused(true).unwrap();
         let paused = Policy {
             paused: true,
@@ -707,162 +450,11 @@ fn a_pause_changes_only_the_pause_and_a_policy_write_states_it() {
         assert_eq!(rows.policy().unwrap(), paused);
         rows.set_paused(false).unwrap();
         assert_eq!(rows.policy().unwrap(), every);
-
-        rows.set_paused(true).unwrap();
-        rows.set_policy(&every).unwrap();
-        assert!(
-            !rows.policy().unwrap().paused,
-            "a policy states the pause with the rest"
-        );
-    }
-}
-
-/// Catches: the storage place and the places for other hosts mixed; a claim granted when
-/// the kind is full; a claim that is not repeatable; a release of a place not held that
-/// changes the slot; a slot that loses its holders' claims; a count of places held that
-/// names the wrong kind.
-#[test]
-fn places_are_claimed_and_released_by_kind() {
-    for backing in BACKINGS {
-        let cell = Cell::new(backing, "slot");
-        let rows = Rows::new(cell.store());
-        let claim = |class, name: &str, seq, max| {
-            rows.claim(class, &id(name), OrderId::new(1, seq), max)
-                .unwrap()
-        };
-        let s1 = claim(SlotClass::Storage, "s1", 1, 2).expect("the storage place is free");
-        assert_eq!(s1.storage.as_ref().map(|h| h.host.clone()), Some(id("s1")));
-        assert!(
-            claim(SlotClass::Storage, "s2", 2, 2).is_none(),
-            "one storage place"
-        );
-        assert!(claim(SlotClass::Host, "d1", 3, 2).is_some());
-        assert!(claim(SlotClass::Host, "d2", 4, 2).is_some());
-        assert!(
-            claim(SlotClass::Host, "d3", 5, 2).is_none(),
-            "two places for hosts"
-        );
-        // Repeatable: the host keeps its place and its first claim.
-        let again = claim(SlotClass::Host, "d1", 9, 2).expect("held");
-        assert_eq!(again.hosts[0].order, OrderId::new(1, 3));
-        assert_eq!(rows.slot().unwrap().value, again);
-        let held = |slot: &Slot| (slot.held(SlotClass::Storage), slot.held(SlotClass::Host));
-        assert_eq!(held(&again), (1, 2), "one storage place, two for hosts");
-
-        let freed = rows.release(&id("s1")).unwrap();
-        assert!(freed.storage.is_none() && freed.hosts.len() == 2);
-        assert_eq!(held(&freed), (0, 2), "the count follows the kind freed");
-        assert_eq!(rows.release(&id("nobody")).unwrap(), freed);
-        let freed = rows.release(&id("d1")).unwrap();
-        assert_eq!(freed.hosts.len(), 1);
-        assert!(claim(SlotClass::Host, "d3", 6, 2).is_some());
-        assert!(claim(SlotClass::Storage, "s2", 7, 2).is_some());
-    }
-}
-
-/// Catches: a release decided from an older look that frees a place claimed since. `d1` held
-/// a place by claim 3, finished, and claimed again by claim 8; a controller that read the
-/// first claim and releases it by that claim leaves the second alone, and one that names the
-/// current claim frees it. A release by the host alone (the controller's own, after a row it
-/// wrote) frees whichever claim it holds.
-#[test]
-fn a_release_made_from_an_older_look_does_not_free_a_newer_claim() {
-    for backing in BACKINGS {
-        let cell = Cell::new(backing, "stale-release");
-        let rows = Rows::new(cell.store());
-        let claim = |seq| {
-            rows.claim(SlotClass::Host, &id("d1"), OrderId::new(1, seq), 2)
-                .unwrap()
-                .expect("a place")
-        };
-        claim(3);
-        rows.release(&id("d1")).unwrap();
-        let again = claim(8);
-        assert_eq!(again.hosts[0].order, OrderId::new(1, 8));
-
-        let stale = rows.release_claim(&id("d1"), OrderId::new(1, 3)).unwrap();
-        assert!(stale.holds(&id("d1")), "a newer claim was freed: {stale:?}");
-        assert_eq!(rows.slot().unwrap().value, again);
-        let fresh = rows.release_claim(&id("d1"), OrderId::new(1, 8)).unwrap();
-        assert!(!fresh.holds(&id("d1")));
-        assert!(rows.slot().unwrap().value.is_empty());
-
-        claim(9);
-        assert!(rows.release(&id("d1")).unwrap().is_empty());
-    }
-}
-
-/// Catches: a row write that overwrites a row that moved: a write from a stale read is
-/// refused with a conflict and changes nothing, a second creation of a row is refused, and
-/// the slot's claim loop re-reads instead of writing over a competitor.
-#[test]
-fn a_write_from_a_stale_read_is_refused_and_changes_nothing() {
-    for backing in BACKINGS {
-        let cell = Cell::new(backing, "cas");
-        let rows = Rows::new(cell.store());
-        let absent = Stored {
-            value: HostRow::unstarted(),
-            version: None,
-        };
-        let mine = row(HostPhase::Selected);
-        rows.put_host(&id("h"), &absent, &mine).unwrap();
-        // Created again from the same read: another controller got there first.
-        let theirs = row(HostPhase::Cordoned);
-        let err = rows.put_host(&id("h"), &absent, &theirs).unwrap_err();
-        assert!(matches!(err, RowError::Conflict(_)), "{err:?}");
-        let read = rows.hosts().unwrap()[&id("h")].clone();
-        assert_eq!(read.value, mine);
-        // Moved by someone, then written from the old read.
-        rows.put_host(&id("h"), &read, &theirs).unwrap();
-        let err = rows
-            .put_host(&id("h"), &read, &row(HostPhase::Done))
-            .unwrap_err();
-        assert!(matches!(err, RowError::Conflict(_)), "{err:?}");
-        assert_eq!(rows.hosts().unwrap()[&id("h")].value, theirs);
-
-        let slot_read = rows.slot().unwrap();
-        let held = Slot {
-            storage: Some(Holder {
-                host: id("s1"),
-                order: OrderId::new(1, 1),
-            }),
-            hosts: Vec::new(),
-        };
-        rows.put_slot(&slot_read, &held).unwrap();
-        let err = rows.put_slot(&slot_read, &Slot::default()).unwrap_err();
-        assert!(matches!(err, RowError::Conflict(_)), "{err:?}");
-        assert_eq!(rows.slot().unwrap().value, held);
-    }
-}
-
-/// Catches: an order id that repeats. Ids ascend within an epoch, a new epoch starts its own
-/// count and is greater than any id of an earlier epoch whatever the count, and on a SQLite
-/// file the count goes on where it was after the store is closed and opened again.
-#[test]
-fn order_ids_ascend_within_an_epoch_and_the_epoch_comes_first() {
-    for backing in BACKINGS {
-        let mut cell = Cell::new(backing, "orders");
-        let mint = |cell: &Cell, epoch| Rows::new(cell.store()).mint_order(epoch).unwrap();
-        let a: Vec<OrderId> = (0..5).map(|_| mint(&cell, 3)).collect();
-        assert!(a.windows(2).all(|w| w[0] < w[1]), "{a:?}");
-        assert!(a.iter().all(|o| o.epoch == 3));
-        let b = mint(&cell, 4);
-        assert_eq!(b, OrderId::new(4, 1), "an epoch of its own counts from 1");
-        assert!(
-            b > *a.last().unwrap(),
-            "a later epoch is above every id of an earlier one"
-        );
-        if backing == Backing::Sqlite {
-            cell.reopen();
-            let c = mint(&cell, 3);
-            assert!(c > *a.last().unwrap(), "{c:?} after a reopen, {a:?} before");
-            assert_eq!(c.seq, a.last().unwrap().seq + 1, "the count goes on");
-        }
     }
 }
 
 /// Catches: rows that do not survive the store being closed and opened again, which is
-/// what a frontend restart is: every row of the design comes back as written.
+/// what a frontend restart is: every row comes back as written.
 #[test]
 fn every_row_survives_the_store_being_reopened() {
     let mut cell = Cell::new(Backing::Sqlite, "reopen");
@@ -870,14 +462,7 @@ fn every_row_survives_the_store_being_reopened() {
         let rows = Rows::new(cell.store());
         rows.offer(&Release::new("v2"), FarmTime::from_millis(7))
             .unwrap();
-        write_host(&rows, "h", &row(HostPhase::Gated));
-        rows.claim(SlotClass::Host, &id("h"), OrderId::new(1, 1), 1)
-            .unwrap();
-        rows.set_policy(&Policy {
-            max_hosts_out: 2,
-            ..Policy::default()
-        })
-        .unwrap();
+        rows.set_paused(true).unwrap();
     }
     cell.reopen();
     let rows = Rows::new(cell.store());
@@ -885,7 +470,5 @@ fn every_row_survives_the_store_being_reopened() {
         rows.desired().unwrap().value.unwrap().commit,
         Release::new("v2")
     );
-    assert_eq!(rows.hosts().unwrap()[&id("h")].value, row(HostPhase::Gated));
-    assert!(rows.slot().unwrap().value.holds(&id("h")));
-    assert_eq!(rows.policy().unwrap().max_hosts_out, 2);
+    assert!(rows.policy().unwrap().paused);
 }

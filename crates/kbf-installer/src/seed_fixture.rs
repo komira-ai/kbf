@@ -1,5 +1,5 @@
-//! A package's seed on a scratch host, for the tests of the seed fetcher, the host fetcher,
-//! the cycle and `setup`: the files the package builder leaves (a manifest, a tarball of an
+//! A package's seed on a scratch host, for the tests of the seed fetcher, the host fetcher
+//! and the cycle: the files the package builder leaves (a manifest, a tarball of an
 //! honest x86-64 Linux `kbf`, its attestation bundle), the trust view that makes them root's,
 //! and a fake `gh` that accepts the attestation of exactly the bundle the signer made, the way
 //! the real one accepts only the bundle that attests the tarball's digest. A test changes a
@@ -70,7 +70,6 @@ fn earlier_probe(seq: u64) -> String {
 #[derive(Clone)]
 pub struct Seeded {
     pub layout: Layout,
-    pub root: PathBuf,
     pub commit: CommitId,
     /// The first 12 digits of the commit: the seed directory's name.
     pub build: String,
@@ -94,13 +93,13 @@ pub struct Seeded {
 impl Seeded {
     /// The seed of commit `B` on a host of its own.
     pub fn scratch(name: &str) -> Seeded {
-        let (layout, root) = host_root(name);
-        Seeded::on(layout, root, B)
+        let (layout, _) = host_root(name);
+        Seeded::on(layout, B)
     }
 
-    /// The seed of `commit` on the host `layout` is the layout of, whose root directory is
-    /// `root`, with its honest tarball written.
-    pub fn on(layout: Layout, root: PathBuf, commit: &str) -> Seeded {
+    /// The seed of `commit` on the host `layout` is the layout of, with its honest tarball
+    /// written.
+    pub fn on(layout: Layout, commit: &str) -> Seeded {
         let tarball = tar_gz(&[file("kbf", &elf(0x3e, "payload"))]);
         let build = commit[..12].to_owned();
         let manifest = json!({
@@ -123,7 +122,6 @@ impl Seeded {
         );
         let seeded = Seeded {
             layout,
-            root,
             commit: c(commit),
             build,
             tarball,

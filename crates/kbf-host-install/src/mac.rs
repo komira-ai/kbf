@@ -38,6 +38,7 @@
 pub mod apply;
 pub mod channel;
 pub mod conf;
+pub mod fetch;
 pub mod kit;
 pub mod layout;
 pub mod release;

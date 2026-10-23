@@ -17,7 +17,7 @@
 //!   the policy's `blobs.getAuthorizer` withholds.
 //!
 //! **Not redacted**: arguments and log bytes are shown as the build produced them
-//! (CEO ruling for the open UI). Values of environment variables are not in the answer;
+//! (ruling for the open UI). Values of environment variables are not in the answer;
 //! the Command blob that holds them is linked from the action's `blobs`.
 
 use std::time::Duration;

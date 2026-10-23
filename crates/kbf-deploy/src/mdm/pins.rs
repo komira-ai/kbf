@@ -268,7 +268,7 @@ mod tests {
 
     /// Catches a parser that takes a pin moved in part (a new version with the old
     /// URL, a hash cut short or upper-cased), an unknown or doubled tool, a missing
-    /// one, or a URL that is not an https archive. Each row is one planted defect.
+    /// one, or a URL that is not an https archive. Each row is one defect.
     #[test]
     fn a_pin_moved_in_part_or_a_bad_line_is_refused() {
         let good = all_but(Tool::Mdmctl);

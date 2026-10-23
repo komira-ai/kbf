@@ -16,8 +16,8 @@
 //! - `/var/db/kbf-installer` (0700), the installer's state directory, empty;
 //! - `/Library/Logs/kbf-installer` (0755), where the job writes.
 //!
-//! The package has no scripts and ships no kbf release: `kbf-installer setup` fetches,
-//! verifies and installs the first one under `/usr/local/kbf-installer/releases`, and
+//! The package has no scripts and ships no kbf release: `kbf-installer record-release`
+//! records the first one under `/usr/local/kbf-installer/releases`, and `kbf-installer setup`
 //! writes the configuration and creates the users. Installing the package places files
 //! and nothing else: no job is loaded, no process starts. The job is gated twice:
 //! Installer does not load a LaunchDaemon, and the property list, which [`gate_problems`]

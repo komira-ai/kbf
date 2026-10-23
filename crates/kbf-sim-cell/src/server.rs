@@ -26,9 +26,9 @@
 //!   starts again after its machine reboots.
 //! - **The local write tier** ([`TierPlan`], `server/tier.rs`), when the plan has one:
 //!   `kbf-tier`'s [`kbf_tier::Tier`] on a second fault-injecting disk, attached at each
-//!   start as `kbf-front`'s `Cache::attach_tier` attaches it (the log raised to
-//!   machine version 2 first). Uploads are staged and acknowledged once synced and
-//!   indexed; a flusher seals, PUTs each sealed block whole and commits
+//!   start as `kbf-front`'s `Cache::attach_tier` attaches it (the log is not raised: the
+//!   tier's commands commit to it as it is). Uploads are staged and acknowledged once
+//!   synced and indexed; a flusher seals, PUTs each sealed block whole and commits
 //!   `ObjectFlushed` every [`TICK`]; reads of present blobs are served from the tier or
 //!   the store. A crash or power cut takes both disks down together.
 

@@ -56,7 +56,7 @@ fn a_regular_file_is_opened_and_read() {
 /// directory, a hard link to a file that is elsewhere too, an empty file, one over its cap,
 /// and a name that is not there. Each has its own code, for both ways of opening.
 ///
-/// Mutants seen red: `O_NOFOLLOW` (and the `openat2` resolve flags) removed, which
+/// Catches: `O_NOFOLLOW` (and the `openat2` resolve flags) removed, which
 /// opens the link's target (the secret is read and the refusal is gone); the link count
 /// not checked; the type not checked (the FIFO is read as a file).
 #[test]
@@ -292,7 +292,7 @@ fn an_open_error_no_rule_names_is_reported_as_unreadable() {
 /// link to a file outside it, and removing the link by name leaves the target. Also a name
 /// that is not a single component is refused, and a name that is gone is not an error.
 ///
-/// Mutant seen red: the removal done through a path (`fs::remove_file(dir/name)`) with the
+/// Catches: the removal done through a path (`fs::remove_file(dir/name)`) with the
 /// name `../secret`: the BadName check dropped, the outside file goes.
 #[test]
 fn a_removal_takes_the_name_in_the_entry_and_nothing_else() {
@@ -325,7 +325,7 @@ fn a_removal_takes_the_name_in_the_entry_and_nothing_else() {
 /// directory elsewhere is refused, a real one opens and lists, and a name that is not one
 /// component is refused.
 ///
-/// Mutant seen red: the `NOFOLLOW` flag dropped from `sub` (the linked directory opens).
+/// Catches: the `NOFOLLOW` flag dropped from `sub` (the linked directory opens).
 #[test]
 fn a_sub_directory_is_opened_beneath_the_entry_and_a_link_is_refused() {
     let (dir, entry) = entry_with("inbox-sub", OpenMode::NoFollow);

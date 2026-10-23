@@ -6,7 +6,7 @@ use super::*;
 /// would be fenced by a process that serves nothing), that writes to the store at all
 /// (the commit counter moves), that binds a worker listener (daemons would dial a process
 /// that cannot schedule), or that runs the scheduler (an Execute is not refused). It
-/// answers `/readyz`, the health service and `GetCapabilities`. Mutant: the candidate's
+/// answers `/readyz`, the health service and `GetCapabilities`. Catches: the candidate's
 /// open takes the generation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_candidate_takes_nothing_schedules_nothing_and_answers_readiness() {
@@ -69,7 +69,7 @@ async fn a_candidate_takes_nothing_schedules_nothing_and_answers_readiness() {
 /// (a proxy would route to a process that schedules nothing), a taken generation not
 /// reported by the holder and the store, a quiesced process that says active, a stood
 /// down one that says anything else, and an instance id that is not a UUID or does not
-/// differ between processes. Mutant: `role` reports active for a candidate.
+/// differ between processes. Catches: `role` reports active for a candidate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn role_answers_truthfully_in_each_state() {
     let node = Node::start().await;
@@ -128,7 +128,7 @@ async fn role_answers_truthfully_in_each_state() {
 /// the epoch is kept (the daemon, ended by A's stand-down, redials B and keeps the lease
 /// it held), A's next write is `Fenced` (a cordon through its operator API leaves it
 /// superseded), the client's stream, still on A, is answered with the result B took from
-/// the daemon, and A refuses a resume (the store is not at its generation). Mutants: the
+/// the daemon, and A refuses a resume (the store is not at its generation). Catches: the
 /// takeover bumps the epoch; the stand-down not ending the daemon's stream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_takeover_after_a_quiesce_fences_the_old_holder_which_finishes_its_open_calls() {
@@ -194,7 +194,7 @@ async fn a_takeover_after_a_quiesce_fences_the_old_holder_which_finishes_its_ope
 /// is handed work), one that cannot be undone (after a takeover that did not happen the
 /// holder would never schedule again), and a resume that does not bring back what the
 /// store holds. A quiesced A refuses an Execute and assigns nothing; after `resume` the
-/// same action is queued and the daemon, connected the whole time, starts it. Mutants:
+/// same action is queued and the daemon, connected the whole time, starts it. Catches:
 /// quiesce does nothing; resume does not clear the fence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quiesce_then_resume_restores_scheduling_from_the_store() {
@@ -235,7 +235,7 @@ async fn quiesce_then_resume_restores_scheduling_from_the_store() {
 /// leaves the worker listener accepting (a daemon that redials reaches a process that
 /// schedules nothing), that stays ready (a proxy would keep choosing it), or that cuts the
 /// REAPI listener (open Execute and WaitExecution streams would end). A candidate or an
-/// unknown call is refused. Mutant: the stand-down leaves the worker listener up.
+/// unknown call is refused. Catches: the stand-down leaves the worker listener up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stand_down_ends_worker_streams_and_leaves_no_worker_listener() {
     let node = Node::start().await;
@@ -354,12 +354,11 @@ async fn the_admin_port_refuses_a_non_loopback_address() {
     assert!(error.to_string().contains("--admin-listen"), "{error}");
 }
 
-/// Catches: an epoch that does not follow the rule. A takeover from a live holder keeps
-/// it (daemons keep their leases), a candidate's open leaves it as it was, and a cold
-/// start over the same store bumps it (a start with no live holder cannot trust what the
-/// last one leased). Mutant: the takeover bumps the epoch.
+/// Asserts that no start moves the epoch: a takeover from a live holder keeps it (daemons
+/// keep their leases), a candidate's open leaves it as it was, and a cold start over the
+/// same store keeps it too (an operator raises the epoch, `POST /v1/epoch/bump`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_epoch_is_kept_by_a_takeover_and_bumped_by_a_cold_start() {
+async fn the_epoch_is_kept_by_a_takeover_and_by_a_cold_start() {
     let node = Node::start().await;
     let store = shared();
     let a = Child::start(&managed_flags(&node, &[]), &store).await;
@@ -371,6 +370,6 @@ async fn the_epoch_is_kept_by_a_takeover_and_bumped_by_a_cold_start() {
     assert_eq!(b.takeover(held).await.0, 200);
     assert_eq!(epoch(&store), first, "a takeover moved the epoch");
     let c = Child::start(&managed_flags(&node, &[]), &store).await;
-    assert_eq!(epoch(&store), first + 1, "a cold start kept the epoch");
+    assert_eq!(epoch(&store), first, "a cold start moved the epoch");
     assert_eq!(c.role().await["held_generation"], held + 2);
 }

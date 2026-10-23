@@ -185,7 +185,7 @@ fn the_temp_file_is_synced_before_the_rename_and_the_directory_after_it() {
 /// older build cannot read: the key is there only for a source that is not `fetch`, and a
 /// record written before the key reads as `fetch`.
 ///
-/// Mutants planted: `skip_serializing_if` removed; `default` removed.
+/// Catches: `skip_serializing_if` removed; `default` removed.
 #[test]
 fn a_staged_update_keeps_its_source_in_the_record_and_a_fetching_one_leaves_it_out() {
     let d = dir("source");

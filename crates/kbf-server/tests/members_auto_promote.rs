@@ -8,8 +8,8 @@
 //!
 //! Each condition has a test in which it is the only one that fails and promotion is
 //! withheld, then given and promoted: a test that only withholds could pass for any reason.
-//! The fence tests run the same story with the condition's check removed, which is how
-//! each was seen red (the mutants are named in the test comments).
+//! The fence tests run the same story with the condition's check removed, so
+//! each fails when its check is missing (the test comments name the defects).
 
 #[path = "support/hooked.rs"]
 mod hooked;
@@ -34,7 +34,7 @@ use promote_scene::{
 /// joiner, however it reports, stays `Joining`; then member 1 flushes, the fence opens,
 /// the joiner acknowledges the epoch, and it is promoted only after the settle time. At
 /// every step every blob of the farm before the join is found through each owner it had,
-/// and still is after two more bumps of the map. Mutants seen red: no flush barrier (the
+/// and still is after two more bumps of the map. Catches: no flush barrier (the
 /// fence opens at the first sweep); a one-deep previous map (the last assertion); a settle
 /// time of zero.
 #[test]
@@ -108,7 +108,7 @@ fn a_joiner_over_a_farm_with_data_is_promoted_only_when_filled_and_reads_never_m
 /// Catches: the flush barrier counting a member that has not flushed, or one that says it
 /// cannot (an older node, one with no gate): the epoch opens, the joiner is promoted, and a
 /// blob that member staged is found nowhere but its disk. Each is the only thing wrong.
-/// Mutants seen red: the generation comparison dropped; a report that cannot say counted as
+/// Catches: the generation comparison dropped; a report that cannot say counted as
 /// flushed.
 #[test]
 fn a_member_that_has_not_flushed_or_cannot_say_holds_the_fence_shut() {
@@ -135,7 +135,7 @@ fn a_member_that_has_not_flushed_or_cannot_say_holds_the_fence_shut() {
 }
 
 /// Catches: a report counted however old it is: a member that stopped reporting an hour ago
-/// (its row lives on) said it had flushed, and the barrier trusts that. Mutant seen red: the
+/// (its row lives on) said it had flushed, and the barrier trusts that. Catches: the
 /// freshness test dropped.
 #[test]
 fn a_report_that_is_not_fresh_does_not_count_at_the_barrier() {
@@ -162,7 +162,7 @@ fn a_report_that_is_not_fresh_does_not_count_at_the_barrier() {
 
 /// Catches: a joiner promoted while its index rebuild is not done (its beats say it is
 /// rebuilding): it would be an owner that can answer neither found nor missing. The beats
-/// are otherwise complete and go on for longer than the settle time. Mutant seen red: the
+/// are otherwise complete and go on for longer than the settle time. Catches: the
 /// beat's progress ignored.
 #[test]
 fn a_joiner_that_is_still_rebuilding_is_not_promoted() {
@@ -180,7 +180,7 @@ fn a_joiner_that_is_still_rebuilding_is_not_promoted() {
 /// Catches: a joiner promoted without having acknowledged the epoch (it has not adopted the
 /// objects other members flushed since its rebuild). It says no pass is done, then the
 /// epoch before the fence's (the fence is reopened once, by a change of placement), then
-/// the fence's. Mutant seen red: the acknowledgement not compared with the epoch.
+/// the fence's. Catches: the acknowledgement not compared with the epoch.
 #[test]
 fn a_joiner_that_has_not_acknowledged_the_epoch_is_not_promoted() {
     let s = scene();
@@ -222,7 +222,7 @@ fn a_joiner_that_has_not_acknowledged_the_epoch_is_not_promoted() {
 /// registered the restart) leaves the fence as it was, so the beat alone must refuse. Then
 /// the sweeper runs: it opens a newer epoch, records the new boot, the node acknowledges
 /// that under its new boot, and the join completes instead of stalling (the "fence boots
-/// liveness" of the design). Mutants seen red: the boot not compared (promoted at the first
+/// liveness" of the design). Catches: the boot not compared (promoted at the first
 /// settle); `fence_boots` never recorded again (the epoch stays 1 and the final promotion
 /// never comes).
 #[test]
@@ -266,7 +266,7 @@ fn a_restarted_owner_reopens_the_fence_and_then_completes() {
 /// Catches: a pass begun under another placement taken as the fill: the joiner's
 /// fingerprint (the map it held, itself assumed `Active`) differs from the frontend's, and
 /// the epoch is acknowledged. It reports a wrong one for longer than the settle time, then
-/// the right one. Mutant seen red: the report's fingerprint not compared.
+/// the right one. Catches: the report's fingerprint not compared.
 #[test]
 fn a_report_made_under_another_placement_is_not_taken_as_the_fill() {
     let s = scene();
@@ -289,7 +289,7 @@ fn a_report_made_under_another_placement_is_not_taken_as_the_fill() {
 /// the joiner's report, made under the new placement and complete, answers an epoch that was
 /// opened under the old: the frontend itself must see its mark is stale and open a newer one.
 /// The report is withheld until it does; then the joiner acknowledges the newer epoch and is
-/// promoted. Mutants seen red: the mark's fingerprint not compared (the first settle
+/// promoted. Catches: the mark's fingerprint not compared (the first settle
 /// promotes); a changed fingerprint not re-opening the fence (the epoch stays 1).
 #[test]
 fn a_change_of_placement_after_the_fence_opens_a_newer_one() {
@@ -312,7 +312,7 @@ fn a_change_of_placement_after_the_fence_opens_a_newer_one() {
 /// Catches: the settle time counted without the conditions holding: they hold, fail for one
 /// beat (a wrong fingerprint), and hold again; the time before the failure must not count.
 /// Beats at 0, 20 (failing), 40 (holding: the clock restarts), 69 (29 seconds on: no),
-/// 70 (30: yes). Mutant seen red: the settle start kept through a failing beat (the beat at
+/// 70 (30: yes). Catches: the settle start kept through a failing beat (the beat at
 /// 40 would promote).
 #[test]
 fn the_settle_time_restarts_when_a_condition_fails() {
@@ -335,7 +335,7 @@ fn the_settle_time_restarts_when_a_condition_fails() {
 
 /// Catches: a settle that does not wait (promotion at the first beat that finds the
 /// conditions holding). The conditions hold from the first beat; none promotes before 30
-/// seconds on. Mutant seen red: the settle time not compared (a zero settle).
+/// seconds on. Catches: the settle time not compared (a zero settle).
 #[test]
 fn a_joiner_waits_out_the_settle_time() {
     let s = scene();
@@ -353,7 +353,7 @@ fn a_joiner_waits_out_the_settle_time() {
 /// leaves a joiner whose every condition holds `Joining` for ever, writes no mark body and
 /// opens no epoch, and an operator's `active` still promotes it and deletes the mark (the
 /// override, and what an old frontend in a mixed rollout does: it never promotes by itself).
-/// Mutant seen red: `advance` or the beat's step running without the setting.
+/// Catches: `advance` or the beat's step running without the setting.
 #[test]
 fn without_the_setting_nothing_is_promoted_automatically_and_the_operator_still_can() {
     let s = scene_with(2, None);
@@ -388,8 +388,8 @@ fn without_the_setting_nothing_is_promoted_automatically_and_the_operator_still_
 /// Catches: a frontend that does not have the setting promoting a joiner whose fence another
 /// frontend opened (a mixed rollout, or the setting taken off): every condition holds and
 /// the settle time has passed, and the beats of the joiner that reach the frontend without
-/// the setting promote nothing. The frontend with it promotes at its next beat. Mutant seen
-/// red: the beat deciding without checking the setting.
+/// the setting promote nothing. The frontend with it promotes at its next beat. Catches:
+/// the beat deciding without checking the setting.
 #[test]
 fn a_frontend_without_the_setting_never_promotes_over_a_fence_another_opened() {
     let s = scene();
@@ -410,7 +410,7 @@ fn a_frontend_without_the_setting_never_promotes_over_a_fence_another_opened() {
 /// hold the only copy of a blob it staged. The fence stays shut while it is down; when it
 /// has left the map the fence opens, but the join is degraded and the joiner is withheld for
 /// as long as it keeps reporting complete; an operator's `active` still works, and with the
-/// degraded setting on the joiner is promoted. Mutants seen red: the `Down` member not
+/// degraded setting on the joiner is promoted. Catches: the `Down` member not
 /// holding the fence (the epoch opens while it is down); the degraded mark not kept (promoted
 /// once it has left); the setting ignored (never promoted with it on).
 #[test]
@@ -480,7 +480,7 @@ fn a_member_that_went_down_during_the_fill_withholds_promotion_unless_allowed() 
 /// its slot and its boot) leaving the fence as it was: a report made under the old placement
 /// would then be taken for the new. The sweeper must open a newer epoch for the fingerprint
 /// alone; the joiner acknowledges it and, the degraded setting being on, is promoted.
-/// Mutant seen red: the fingerprint left out of the test that reopens the fence.
+/// Catches: the fingerprint left out of the test that reopens the fence.
 #[test]
 fn a_member_going_down_reopens_the_fence_for_the_new_placement() {
     let s = scene_with(
@@ -517,7 +517,7 @@ fn a_member_going_down_reopens_the_fence_for_the_new_placement() {
 /// advance marks (so the mark does not say degraded yet), not holding the joiner back: the
 /// beat itself must see the `Down` member in the map. Then it returns (registers again,
 /// `Active`) after the sweeper marked the join degraded, and the joiner stays withheld: the
-/// farm was degraded while it filled. Mutant seen red: the degraded mark not kept by the
+/// farm was degraded while it filled. Catches: the degraded mark not kept by the
 /// sweeper. (The beat also refuses while a member is `Down`; that is a second guard, since
 /// a member going `Down` changes the placement, which holds the beat until the sweeper has
 /// reopened the fence and marked the join degraded: no test can tell the guards apart.)
@@ -559,7 +559,7 @@ fn a_member_down_after_the_fence_withholds_promotion_even_after_it_returns() {
 /// owns nothing while it is `Joining`, so a fingerprint of the map as it is names a placement
 /// the promotion then changes: the joiner's report must be of the map with it assumed
 /// `Active`. A report of the plain fingerprint is withheld; the assumed one promotes, and
-/// the promoted joiner owns digests. Mutant seen red: the frontend comparing with the
+/// the promoted joiner owns digests. Catches: the frontend comparing with the
 /// fingerprint of the map as it is.
 #[test]
 fn at_one_owner_the_fill_is_judged_against_the_map_with_the_joiner_active() {
@@ -583,7 +583,7 @@ fn at_one_owner_the_fill_is_judged_against_the_map_with_the_joiner_active() {
 /// Catches: a promotion that overwrites a drain requested between the beat's read and its
 /// commit: the joiner's beat that would promote it finds, when it commits, that an operator
 /// drained it; the row's version fails the commit, the beat reads `Draining` and promotes
-/// nothing, and the mark stays. Mutant seen red: the promoting write made without the row's
+/// nothing, and the mark stays. Catches: the promoting write made without the row's
 /// version and without the check on the map (either guard alone holds the commit back: an
 /// operator's drain moves both).
 #[test]

@@ -1,14 +1,22 @@
-//! `pkg-config` and `pkg-build`: the `kbf-installer` Linux packages (packaging/linux/README.md).
+//! `pkg-config` and `pkg-build`: the two Linux packages, `kbf-installer` and `kbf`
+//! (packaging/linux/README.md).
 //!
 //! The packages are built by nfpm, pinned in CI by SHA-256. This module is the one place
 //! that says what goes in them:
 //!
-//! - [`plan`] lists the files from the inputs and refuses what the contract
-//!   (docs/design/kbf-installer.md, section 3) does not ship: a unit that is not
-//!   `kbf-*.service` or `kbf-*.socket` (or the slice), a trust file other than the three, an empty unit directory;
-//! - [`config`] renders the list as the nfpm configuration, with the dependencies as
+//! - [`plan`] lists the files of the `kbf-installer` package from the inputs and refuses what
+//!   the contract (docs/design/kbf-installer.md, section 3) does not ship: a unit that is not
+//!   `kbf-*.service` or `kbf-*.socket` (or the slice), a trust file other than the three, an
+//!   empty unit directory. The mode units ([`KBF_UNITS`]) are not in it: the `kbf` package
+//!   carries them;
+//! - [`kbf_plan`] lists the files of the `kbf` package: the `kbf` binary at [`KBF_PATH`] and
+//!   the mode units, each of which must be in the unit directory;
+//! - [`config`] renders a list as the nfpm configuration, with the dependencies as
 //!   constants here (never Podman, never Envoy), no maintainer script, every file
-//!   `root:root`, and no time (nfpm takes it from `SOURCE_DATE_EPOCH`);
+//!   `root:root`, and no time (nfpm takes it from `SOURCE_DATE_EPOCH`). The `kbf` package
+//!   depends on no package: each mode unit runs `kbf boot-check`, which is the `kbf` file the
+//!   package carries. Its deb replaces `kbf-installer` ([`KBF_DEB_REPLACES`]), because the
+//!   mode units were files of the installer's deb;
 //! - [`listing`] renders the same list as the file the install test checks the
 //!   installed package against ([`parse_listing`]);
 //! - [`build`] runs nfpm for the deb and the rpm, then again, and refuses a package
@@ -25,6 +33,29 @@ use crate::package::{Platform, read};
 pub const NAME: &str = "kbf-installer";
 /// Where the binary goes.
 pub const BINARY_PATH: &str = "/usr/bin/kbf-installer";
+/// The name of the second package, which carries the `kbf` runtime and the units of its modes.
+pub const KBF_NAME: &str = "kbf";
+/// Where the `kbf` runtime goes: its own package's file, which the package manager replaces.
+pub const KBF_PATH: &str = "/usr/bin/kbf";
+/// The units of the modes `kbf` runs in, which the `kbf` package carries and the
+/// `kbf-installer` package does not. `kbf.slice` stays with the installer: `kbf-proxy.service`
+/// runs in it too.
+pub const KBF_UNITS: [&str; 5] = [
+    "kbf-all-in-one.service",
+    "kbf-daemon.service",
+    "kbf-frontend.service",
+    "kbf-storage-and-daemon.service",
+    "kbf-storage.service",
+];
+/// The directory of `pkg-config --out` that holds the `kbf` package's configuration and listing.
+pub const KBF_DIR: &str = "kbf";
+/// What the deb of the `kbf` package `Replaces`: the `kbf-installer` package, of any version,
+/// because the units of the modes were files of its deb and dpkg refuses to unpack `kbf` over
+/// files another package owns unless `kbf` says it replaces that package. The rpm names
+/// nothing: its only form, `Obsoletes`, would remove the installer, which a host still
+/// runs. An rpm host that has the installer of before the split must upgrade it in the same
+/// transaction as `kbf`, because that installer's rpm owns the files of the mode units.
+pub const KBF_DEB_REPLACES: [&str; 1] = [NAME];
 /// Where the unit files go.
 pub const UNIT_DIR: &str = "/usr/lib/systemd/system";
 /// The one packaged unit that is not a `kbf-*.service` or `kbf-*.socket`: the slice
@@ -38,6 +69,8 @@ pub const TRUST_DIR: &str = "/usr/share/kbf-installer/trust";
 pub const SYSUSERS_PATH: &str = "/usr/lib/sysusers.d/kbf-installer.conf";
 /// Where the directories file goes (`systemd-tmpfiles`).
 pub const TMPFILES_PATH: &str = "/usr/lib/tmpfiles.d/kbf-installer.conf";
+/// Where the needrestart drop-in goes: a host without needrestart ignores it.
+pub const NEEDRESTART_PATH: &str = "/etc/needrestart/conf.d/kbf.conf";
 /// The directory `setup` fills and the package never removes.
 pub const STATE_DIR: &str = "/var/lib/kbf-installer";
 /// The directories `tmpfiles.d` makes, with their modes (all `root:root`). The file is
@@ -75,6 +108,60 @@ pub const DEB_SUGGESTS: [&str; 1] = ["postgresql"];
 pub const RPM_SUGGESTS: [&str; 1] = ["postgresql-server"];
 /// The `Requires` of the rpm: Fedora's `uidmap` is `shadow-utils`.
 pub const RPM_DEPENDS: [&str; 4] = ["crun", "shadow-utils", "systemd", "ca-certificates"];
+
+/// One of the two packages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Package {
+    /// `kbf-installer`: the installer binary, the proxy's units, sysusers, tmpfiles and trust.
+    Installer,
+    /// `kbf`: the runtime binary and the units of its modes.
+    Kbf,
+}
+
+/// The lines of a YAML list of the strings `names`, each at `indent`.
+fn list(names: &[&str], indent: &str) -> String {
+    names
+        .iter()
+        .map(|n| format!("{indent}- {}\n", quoted(n)))
+        .collect()
+}
+
+impl Package {
+    /// The package's name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Package::Installer => NAME,
+            Package::Kbf => KBF_NAME,
+        }
+    }
+
+    /// The description the package carries.
+    fn description(self) -> &'static str {
+        match self {
+            Package::Installer => "Root setup and update tool for the kbf build farm.",
+            Package::Kbf => "The kbf build farm runtime and the systemd units of its modes.",
+        }
+    }
+
+    /// The `depends`, `suggests` and `overrides` keys of the configuration, as lines. The `kbf`
+    /// package has no `depends` or `suggests`, only the deb's `replaces`.
+    fn relations(self) -> String {
+        match self {
+            Package::Installer => format!(
+                "depends:\n{}suggests:\n{}overrides:\n  rpm:\n    depends:\n{}    suggests:\n{}",
+                list(&DEB_DEPENDS, "  "),
+                list(&DEB_SUGGESTS, "  "),
+                list(&RPM_DEPENDS, "      "),
+                list(&RPM_SUGGESTS, "      "),
+            ),
+            Package::Kbf => format!(
+                "overrides:\n  deb:\n    replaces:\n{}",
+                list(&KBF_DEB_REPLACES, "      ")
+            ),
+        }
+    }
+}
+
 /// The trust files and their modes: the pinned `gh` and the two data files.
 pub const TRUST_FILES: [(&str, u32); 3] = [
     ("gh", 0o755),
@@ -104,7 +191,10 @@ pub struct Entry {
 pub struct Inputs<'a> {
     /// The `kbf-installer` binary.
     pub binary: &'a Path,
-    /// The directory of `kbf-*.service` and `kbf-*.socket` files and the slice.
+    /// The `kbf` binary, which the `kbf` package carries at [`KBF_PATH`].
+    pub kbf: &'a Path,
+    /// The directory of `kbf-*.service` and `kbf-*.socket` files and the slice: the units of
+    /// the modes ([`KBF_UNITS`]) go in the `kbf` package, the others in `kbf-installer`.
     pub units: &'a Path,
     /// The directory of the three trust files.
     pub trust: &'a Path,
@@ -112,6 +202,8 @@ pub struct Inputs<'a> {
     pub sysusers: &'a Path,
     /// The tmpfiles.d file.
     pub tmpfiles: &'a Path,
+    /// The needrestart drop-in.
+    pub needrestart: &'a Path,
     /// The platform the binary was built for.
     pub platform: Platform,
     /// The package version.
@@ -186,13 +278,12 @@ pub struct Sources<'a> {
     pub sysusers: &'a Path,
     /// The tmpfiles.d file.
     pub tmpfiles: &'a Path,
+    /// The needrestart drop-in.
+    pub needrestart: &'a Path,
 }
 
-/// Everything the package installs, sorted by path.
-///
-/// # Errors
-/// [`Error::Refused`] with every problem with the inputs.
-pub fn plan(i: &Inputs) -> Result<Vec<Entry>, Error> {
+/// What is wrong with the version and the platform of `i`.
+fn input_problems(i: &Inputs) -> Vec<String> {
     let mut problems = Vec::new();
     if !version_ok(i.version) {
         problems.push(format!(
@@ -203,12 +294,50 @@ pub fn plan(i: &Inputs) -> Result<Vec<Entry>, Error> {
     if !matches!(i.platform, Platform::LinuxX86_64 | Platform::LinuxArm64) {
         problems.push(format!("{} is not a Linux platform", i.platform.name()));
     }
+    problems
+}
+
+/// Everything the `kbf` package installs, sorted by path: the `kbf` binary and the units of
+/// the modes ([`KBF_UNITS`]), each of which the unit directory must hold.
+///
+/// # Errors
+/// [`Error::Refused`] with every problem with the inputs.
+pub fn kbf_plan(i: &Inputs) -> Result<Vec<Entry>, Error> {
+    let mut problems = input_problems(i);
+    let mut entries = vec![file(KBF_PATH.to_owned(), 0o755, i.kbf, &mut problems)];
+    let units = files_in(i.units, &mut problems);
+    for name in KBF_UNITS {
+        let Some((_, src)) = units.iter().find(|(n, _)| *n == name) else {
+            problems.push(format!("unit file {name} is missing"));
+            continue;
+        };
+        entries.push(file(
+            format!("{UNIT_DIR}/{name}"),
+            0o644,
+            src,
+            &mut problems,
+        ));
+    }
+    if !problems.is_empty() {
+        return Err(Error::Refused(problems));
+    }
+    entries.sort_by(|a, b| a.dst.cmp(&b.dst));
+    Ok(entries)
+}
+
+/// Everything the `kbf-installer` package installs, sorted by path.
+///
+/// # Errors
+/// [`Error::Refused`] with every problem with the inputs.
+pub fn plan(i: &Inputs) -> Result<Vec<Entry>, Error> {
+    let problems = input_problems(i);
     let sources = Sources {
         binary: i.binary,
         units: i.units,
         trust: i.trust,
         sysusers: i.sysusers,
         tmpfiles: i.tmpfiles,
+        needrestart: i.needrestart,
     };
     entries(&sources, problems)
 }
@@ -227,10 +356,20 @@ fn entries(i: &Sources, mut problems: Vec<String>) -> Result<Vec<Entry>, Error> 
         file(BINARY_PATH.to_owned(), 0o755, i.binary, &mut problems),
         file(SYSUSERS_PATH.to_owned(), 0o644, i.sysusers, &mut problems),
         file(TMPFILES_PATH.to_owned(), 0o644, i.tmpfiles, &mut problems),
+        file(
+            NEEDRESTART_PATH.to_owned(),
+            0o644,
+            i.needrestart,
+            &mut problems,
+        ),
         dir(SHARE_DIR),
         dir(TRUST_DIR),
     ];
-    let units = files_in(i.units, &mut problems);
+    // The units of the modes are the `kbf` package's.
+    let units: Vec<(String, PathBuf)> = files_in(i.units, &mut problems)
+        .into_iter()
+        .filter(|(name, _)| !KBF_UNITS.contains(&name.as_str()))
+        .collect();
     if units.is_empty() {
         problems.push(format!("no unit files in {}", i.units.display()));
     }
@@ -280,17 +419,11 @@ fn quoted(s: &str) -> String {
     serde_json::Value::String(s.to_owned()).to_string()
 }
 
-/// The nfpm configuration for `entries`.
-pub fn config(entries: &[Entry], platform: Platform, version: &str) -> String {
+/// The nfpm configuration of `package` for `entries`.
+pub fn config(package: Package, entries: &[Entry], platform: Platform, version: &str) -> String {
     let arch = match platform {
         Platform::LinuxArm64 => "arm64",
         _ => "amd64",
-    };
-    let list = |names: &[&str], indent: &str| {
-        names
-            .iter()
-            .map(|n| format!("{indent}- {}\n", quoted(n)))
-            .collect::<String>()
     };
     let mut out = format!(
         "# Generated by `cargo xtask pkg-config`; do not edit.\n\
@@ -302,22 +435,18 @@ pub fn config(entries: &[Entry], platform: Platform, version: &str) -> String {
          section: \"admin\"\n\
          priority: \"optional\"\n\
          maintainer: \"Komira <noreply@komira.com>\"\n\
-         description: \"Root setup and update tool for the kbf build farm.\"\n\
+         description: {description}\n\
          homepage: \"https://github.com/komira-ai/kbf\"\n\
          license: \"Apache-2.0\"\n\
-         depends:\n{deb}\
-         suggests:\n{deb_s}\
-         overrides:\n  rpm:\n    depends:\n{rpm}    suggests:\n{rpm_s}\
+         {relations}\
          deb:\n  compression: \"gzip\"\n\
          rpm:\n  compression: \"gzip\"\n  buildhost: {host}\n\
          contents:\n",
-        name = quoted(NAME),
+        name = quoted(package.name()),
         arch = quoted(arch),
         version = quoted(version),
-        deb = list(&DEB_DEPENDS, "  "),
-        rpm = list(&RPM_DEPENDS, "      "),
-        deb_s = list(&DEB_SUGGESTS, "  "),
-        rpm_s = list(&RPM_SUGGESTS, "      "),
+        description = quoted(package.description()),
+        relations = package.relations(),
         host = quoted(BUILD_HOST),
     );
     for e in entries {
@@ -326,6 +455,10 @@ pub fn config(entries: &[Entry], platform: Platform, version: &str) -> String {
             out.push_str(&format!("    src: {}\n", quoted(&e.src.to_string_lossy())));
         } else {
             out.push_str("    type: \"dir\"\n");
+        }
+        // Under /etc a file is configuration: an upgrade keeps the host's edits.
+        if e.dst.starts_with("/etc/") {
+            out.push_str("    type: \"config|noreplace\"\n");
         }
         out.push_str(&format!(
             "    file_info: {{mode: 0{:o}, owner: root, group: root}}\n",
@@ -374,22 +507,30 @@ pub fn parse_listing(text: &str) -> Result<Vec<Entry>, Error> {
         .collect()
 }
 
-/// The `pkg-config` verb: writes `<out>/nfpm.yaml` and `<out>/listing.txt`.
+/// The `pkg-config` verb: writes `<out>/nfpm.yaml` and `<out>/listing.txt` for the
+/// `kbf-installer` package, and the same two files in `<out>/kbf` for the `kbf` package.
 ///
 /// # Errors
 /// The inputs are refused, or a file cannot be written.
 pub fn write_config(i: &Inputs, out: &Path) -> Result<Vec<String>, Error> {
-    let entries = plan(i)?;
-    std::fs::create_dir_all(out).map_err(Error::spawn(format!("create {}", out.display())))?;
-    let files = [
-        ("nfpm.yaml", config(&entries, i.platform, i.version)),
-        ("listing.txt", listing(&entries)),
-    ];
+    let installer = plan(i)?;
+    let kbf = kbf_plan(i)?;
     let mut printed = Vec::new();
-    for (name, text) in files {
-        let path = out.join(name);
-        std::fs::write(&path, text).map_err(Error::spawn(format!("write {}", path.display())))?;
-        printed.push(format!("wrote {}", path.display()));
+    for (package, entries, dir) in [
+        (Package::Installer, &installer, out.to_owned()),
+        (Package::Kbf, &kbf, out.join(KBF_DIR)),
+    ] {
+        std::fs::create_dir_all(&dir).map_err(Error::spawn(format!("create {}", dir.display())))?;
+        let files = [
+            ("nfpm.yaml", config(package, entries, i.platform, i.version)),
+            ("listing.txt", listing(entries)),
+        ];
+        for (name, text) in files {
+            let path = dir.join(name);
+            std::fs::write(&path, text)
+                .map_err(Error::spawn(format!("write {}", path.display())))?;
+            printed.push(format!("wrote {}", path.display()));
+        }
     }
     Ok(printed)
 }

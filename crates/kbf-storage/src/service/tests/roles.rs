@@ -463,7 +463,7 @@ pub(super) async fn call(endpoint: Endpoint, channel: &Channel) -> Result<(), St
 /// otherwise gets as far as the store (any other answer, including the store's own
 /// errors). A refused `Segments` call never reaches the store's handler.
 ///
-/// Mutants seen red: the check removed from `Segments.Commit` alone (frontend, storage,
+/// Catches: the check removed from `Segments.Commit` alone (frontend, storage,
 /// admin, no role and two roles all reach it); `contains` negated in
 /// `Admission::check_leaf`.
 #[tokio::test]
@@ -514,7 +514,7 @@ async fn every_method_refuses_an_unexpected_role_over_mutual_tls() {
 /// second, is refused on `ActionStore.Get` (frontend only) and gets past the check on
 /// `Segments`.
 ///
-/// Mutant seen red: `chain.first()` read as `chain.last()` in `Admission::guard`.
+/// Catches: `chain.first()` read as `chain.last()` in `Admission::guard`.
 #[tokio::test]
 async fn the_role_is_read_from_the_leaf_certificate_alone() {
     let pki = Pki::new();

@@ -1,13 +1,12 @@
 //! `installer.toml`'s database setting (no server), and `setup` and the update step against
-//! a real server (`KBF_TEST_POSTGRES_URL`, tests `#[ignore]`d like the state crate's).
+//! a real server (`KBF_TEST_POSTGRES_URL` names it; those tests fail without it).
 
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use kbf_state::postgres::schema::{self, Migration, Outcome, SchemaError};
-use kbf_state::postgres::{PostgresConfig, PostgresStore, Unreached};
+use kbf_state::postgres::{PostgresConfig, PostgresStore, TestDatabase, Unreached};
 use kbf_state::{Cond, Store, Txn};
 
 use super::{
@@ -110,30 +109,25 @@ fn the_database_setting_is_read_and_every_fault_is_refused_without_quoting_the_u
 
 // ---- against a server -----------------------------------------------------------------
 
+/// The test server's URL, which names its own role and the database it administers.
 fn url() -> String {
-    std::env::var("KBF_TEST_POSTGRES_URL").expect("KBF_TEST_POSTGRES_URL names a test database")
+    kbf_testkit::database::server_url()
 }
 
-struct Scratch(String);
+/// A database made for one test and dropped with it, with no schema.
+struct Scratch(TestDatabase);
 
 impl Scratch {
     fn new() -> Scratch {
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        Scratch(format!("kbf_i{}_{n}", std::process::id()))
+        Scratch(TestDatabase::empty())
+    }
+
+    fn url(&self) -> String {
+        self.0.url()
     }
 
     fn config(&self) -> PostgresConfig {
-        PostgresConfig::parse(&url())
-            .and_then(|c| c.with_schema(&self.0))
-            .expect("parses")
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        if let Ok(mut c) = postgres::Client::connect(&url(), postgres::NoTls) {
-            let _ = c.batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.0));
-        }
+        PostgresConfig::parse(&self.url()).expect("parses")
     }
 }
 
@@ -163,7 +157,6 @@ fn put(store: &PostgresStore, key: &str) {
 ///
 /// Mutant seen red: `plan` made to call `setup` (the dry run created the schema).
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn setup_creates_the_schema_once_and_a_dry_run_creates_nothing() {
     let s = Scratch::new();
     let db = Database::new(s.config(), schema::embedded());
@@ -188,7 +181,6 @@ fn setup_creates_the_schema_once_and_a_dry_run_creates_nothing() {
 /// Mutant seen red: the step applying the installer's newest instead of the release's
 /// (the schema moved past what the release asked for).
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn the_update_step_migrates_to_what_the_release_needs_while_the_old_child_serves() {
     let s = Scratch::new();
     Database::new(s.config(), schema::embedded())
@@ -217,41 +209,6 @@ fn the_update_step_migrates_to_what_the_release_needs_while_the_old_child_serves
     );
     assert!(!err.contains('\n'));
     assert_eq!(schema::current(&s.config()), Ok(2));
-}
-
-/// Catches the bounded step waiting behind another installer for ever: while a second session
-/// holds the schema lock, the step for a release that needs the next schema ends with the
-/// busy refusal after its wait (200 ms here) and applies nothing; once the lock is let go the
-/// same step migrates.
-///
-/// Mutant to plant: `Bounded::before_start` calling `schema::apply` (the unbounded one): the
-/// first call then waits on the held lock and the test does not end.
-#[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
-fn the_bounded_step_gives_up_on_a_held_schema_lock() {
-    let s = Scratch::new();
-    Database::new(s.config(), schema::embedded())
-        .setup()
-        .expect("installed");
-    let mut other = postgres::Client::connect(&url(), postgres::NoTls).expect("connects");
-    let mut held = other.transaction().expect("begins");
-    let lock = "SELECT pg_advisory_xact_lock(hashtext('kbf-state-schema'))";
-    held.batch_execute(lock).expect("holds the lock");
-    let mut db = Database::new(s.config(), next_release()).bounded(Duration::from_millis(200));
-    assert_eq!(
-        db.before_start(2).unwrap_err(),
-        SchemaError::Busy.to_string()
-    );
-    assert_eq!(schema::current(&s.config()), Ok(1));
-    held.commit().expect("lock let go");
-    // The schema lock is one key on the whole server, and the other database tests take it
-    // while they migrate their own schemas in parallel: once this test lets go, the step is
-    // given time to wait them out (200 ms was not always enough), and still migrates.
-    let mut db = Database::new(s.config(), next_release()).bounded(Duration::from_secs(30));
-    assert_eq!(
-        db.before_start(2).expect("migrates"),
-        "migrated the schema from 1 to 2"
-    );
 }
 
 /// Catches the plan and the update-step line mishandling what the server said, without a
@@ -290,25 +247,6 @@ fn setup_plan_and_the_update_step_report_an_unreachable_server() {
     assert!(db.setup().is_err());
     assert!(db.plan().is_err());
     assert!(!db.before_start(1).unwrap_err().is_empty());
-}
-
-/// Catches the bounded step hiding why it failed, or asking the database for something other
-/// than what the release needs, without a server: with no server behind the socket it
-/// returns the database's reason, and a release that needs a schema the installer does not
-/// embed is refused with the installer's one line before any connection is made.
-///
-/// Mutants to plant: the error swallowed into an `Ok` line; the release's schema replaced by
-/// the installer's newest (the second call then reaches for the socket and says something
-/// else).
-#[test]
-fn the_bounded_step_reports_an_unreachable_server_and_a_release_it_does_not_embed() {
-    let file = toml_file("database = \"postgres:///kbf?host=/nonexistent-kbf-test-socket\"\n");
-    let mut db = Database::from_installer_toml(&file)
-        .expect("a usable url")
-        .bounded(Duration::from_secs(1));
-    assert!(!db.before_start(1).unwrap_err().is_empty());
-    let err = db.before_start(99).unwrap_err();
-    assert!(err.contains("needs state schema 99"), "{err}");
 }
 
 /// Catches the database step's three dry-run lines and its apply line going wrong: a fresh
@@ -472,8 +410,10 @@ mod provisioned {
     use kbf_state::postgres::schema;
     use kbf_state::postgres::{PostgresConfig, reach};
 
-    /// Roles and databases belong to the whole server, and these tests make and drop them:
-    /// one at a time, like the farm's other tests on the shared server.
+    /// Roles and databases belong to the whole server, and these tests make and drop them.
+    /// What keeps the tests of different processes (nextest runs each test in one) apart is
+    /// the names: they carry the process id. This lock only makes the tests of one process
+    /// (`cargo test`) take turns.
     static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
     /// The server `KBF_TEST_POSTGRES_URL` names, in the pieces psql takes.
@@ -601,7 +541,6 @@ mod provisioned {
     /// Mutants seen red: the role made `SUPERUSER`; `OWNER` dropped from the database; the
     /// role-exists test inverted (the second plan makes the role again).
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn fresh_create_then_rerun_changes_nothing_and_the_schema_follows() {
         let names = Names::new();
         assert_eq!(names.make(), 2, "a role and a database");
@@ -633,7 +572,6 @@ mod provisioned {
     ///
     /// Mutants seen red: the class-28 operand dropped; `3D000` mapped to a login refusal.
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn a_missing_role_is_a_login_refusal_and_a_missing_database_is_told_apart() {
         let _one = ONE_AT_A_TIME
             .lock()
@@ -661,7 +599,6 @@ mod provisioned {
     /// Mutants seen red: the superuser check removed; the owner check removed; the login
     /// check removed; one of the four privilege columns dropped from the question.
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn a_role_that_is_not_plain_or_a_database_owned_by_another_is_refused_and_left_alone() {
         let names = Names::new();
         let (role, db) = (names.local.role.clone(), names.local.name.clone());

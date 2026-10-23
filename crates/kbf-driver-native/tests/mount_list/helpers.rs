@@ -50,7 +50,7 @@ mod tests {
 devfs on /dev (devfs, local, nobrowse)
 /dev/disk3s6 on /System/Volumes/VM (apfs, local, noexec, journaled, nobrowse)
 /dev/disk5s1 on /private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.6.42.x (apfs, local, nodev, nosuid, read-only, journaled, nobrowse)
-/dev/disk9s1 on /scratch/lease-1/home/my disk (copy) (hfs, local, nodev, nosuid, mounted by adi)
+/dev/disk9s1 on /scratch/lease-1/home/my disk (copy) (hfs, local, nodev, nosuid, mounted by user)
 /dev/disk4 on /Volumes/Mac on Disk (hfs, local)
 map auto_home on /System/Volumes/Data/home (autofs, automounted, nobrowse)
 not a mount line

@@ -3,12 +3,19 @@
 
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
+use std::time::Duration;
 
-use kbf_types::{FarmRun, LeaseId, LeaseKind, MemoryRun, OperationId, WaiterId, WorkerId};
+use kbf_types::{
+    FarmRun, FarmTime, LeaseId, LeaseKind, MemoryRun, OperationId, Resources, WaiterId, WorkerId,
+};
 
 use super::{Held, OpState, Operation, Scheduler, StartSent, Worker};
 use crate::fence::LEASE_GRACE;
 use crate::input::Request;
+
+/// The daemon process number a recovered lease is booked under when the process that ran
+/// it is not known to be the one that registers: no registered process has it.
+const OTHER_PROCESS: u64 = u64::MAX;
 
 /// An unfinished operation as the state store holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,7 +97,8 @@ impl Scheduler {
 
     /// Takes `operations` up in an empty scheduler, which grants leases under `term`
     /// from `next_seq` and operation ids from `next_operation` on (both past every id
-    /// the store ever named, finished operations' included, so no id names two).
+    /// the store ever named or reserved, finished operations' included, so no id names
+    /// two). Leases are placed without limit until [`Scheduler::use_seq_block`] sets one.
     ///
     /// An operation with no lease is queued. One with a lease holds it on its worker,
     /// which has not registered with this scheduler yet: for [`LEASE_GRACE`] the lease
@@ -174,12 +182,13 @@ impl Scheduler {
             Some(RecoveredLease { lease, worker }) => {
                 // A session no worker has: the heartbeat reconcile takes the lease
                 // for one that went to an earlier session of the process.
+                let process = self.workers.get(&worker).map_or(0, |w| w.process);
                 let sent = StartSent {
                     at: self.now,
                     session: u64::MAX,
-                    process: 0,
+                    process,
                 };
-                let held = Held {
+                let mut held = Held {
                     operation: id,
                     booked: request.resources,
                     device: None,
@@ -187,8 +196,14 @@ impl Scheduler {
                     granted_at: self.now,
                     started_at: None,
                 };
+                // A worker that registered already is not adopted again: the lease is
+                // booked on it now, or its end would release a booking it never made.
+                if let Some(registered) = self.workers.get_mut(&worker) {
+                    held.booked = book(registered, &request);
+                } else {
+                    self.awaited.entry(worker.clone()).or_insert(until);
+                }
                 self.held.insert(lease, held);
-                self.awaited.entry(worker.clone()).or_insert(until);
                 OpState::Leased {
                     lease,
                     worker,
@@ -220,10 +235,42 @@ impl Scheduler {
         );
     }
 
+    /// Keeps the recovered leases of `worker` for `wait` from `now` (after it registers,
+    /// if it has not), whatever its first heartbeat lists: they went to a daemon process
+    /// that may be another than the one that registers, and that process may still run
+    /// them until it fences. A lease the heartbeat leaves out is then given up as one lost
+    /// to another process ([`crate::RequeueReason::Replaced`]) once `wait` has passed, and
+    /// not at once.
+    ///
+    /// Does nothing for a worker that has not registered and no recovered lease waits
+    /// for, and is not remembered for one that gets a lease later.
+    pub fn hold_recovered_leases(&mut self, now: FarmTime, worker: &WorkerId, wait: Duration) {
+        let until = now.max(self.now).saturating_add(wait);
+        if let Some(registered) = self.workers.get_mut(worker) {
+            registered.handover_ends = registered.handover_ends.max(until);
+            for held in self.held.values_mut() {
+                let op = &self.ops[&held.operation];
+                let holds = op.state.holding().is_some_and(|(_, w)| w == worker);
+                if holds {
+                    held.start_sent = held.start_sent.map(|sent| StartSent {
+                        process: OTHER_PROCESS,
+                        ..sent
+                    });
+                }
+            }
+        } else if self.awaited.contains_key(worker) {
+            self.other_process.insert(worker.clone(), until);
+        }
+    }
+
     /// Books the recovered leases of `id`, which is registering as `worker`, on it.
     pub(super) fn adopt(&mut self, id: &WorkerId, worker: &mut Worker) {
         if self.awaited.remove(id).is_none() {
             return;
+        }
+        let other_process = self.other_process.remove(id);
+        if let Some(until) = other_process {
+            worker.handover_ends = until;
         }
         // A recovered lease books the request the store holds. A key floor is not raised
         // onto it: the store does not say what the lease was granted at, and a floor set
@@ -234,18 +281,31 @@ impl Scheduler {
             if op.state.holding().is_none_or(|(_, holder)| holder != id) {
                 continue;
             }
-            held.booked = match op.request.kind {
-                LeaseKind::WholeMachine => {
-                    worker.whole = true;
-                    worker.capacity
-                }
-                LeaseKind::Action | LeaseKind::Vm => {
-                    worker.whole |= worker.exclusive(&op.request);
-                    op.request.resources
-                }
-            };
-            worker.booked = worker.booked.saturating_add(held.booked);
-            worker.leases += 1;
+            if other_process.is_some() {
+                held.start_sent = held.start_sent.map(|sent| StartSent {
+                    process: OTHER_PROCESS,
+                    ..sent
+                });
+            }
+            held.booked = book(worker, &op.request);
         }
     }
+}
+
+/// Books the lease of `request`, which the state store holds, on `worker`: returns what it
+/// books.
+fn book(worker: &mut Worker, request: &Request) -> Resources {
+    let booked = match request.kind {
+        LeaseKind::WholeMachine => {
+            worker.whole = true;
+            worker.capacity
+        }
+        LeaseKind::Action | LeaseKind::Vm => {
+            worker.whole |= worker.exclusive(request);
+            request.resources
+        }
+    };
+    worker.booked = worker.booked.saturating_add(booked);
+    worker.leases += 1;
+    booked
 }

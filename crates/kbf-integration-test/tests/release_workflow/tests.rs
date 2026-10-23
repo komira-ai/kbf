@@ -67,64 +67,67 @@ fn the_real_release_workflow_meets_every_rule() {
 }
 
 #[test]
-fn only_a_push_to_main_and_a_dispatch_start_the_workflow() {
-    // Catches: a release started by a pull request, a schedule, a tag or a push of another
-    // branch; a dispatch dropped; a dispatch that takes an input a person could point at
-    // another commit with. Mutants: the push dropped; a `pull_request`; a schedule; a tag push;
-    // an unfiltered push; the dispatch dropped; an input added.
-    let on = "on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n";
+fn only_the_completion_of_a_pipeline_run_for_main_starts_the_workflow() {
+    // Catches: a release started by a pull request, a schedule, a tag, a push, a dispatch,
+    // by the completion of another workflow, by a run that is not yet complete, or by a
+    // pipeline run of another branch.
+    let on = "on:\n  workflow_run:\n    workflows: [pipeline]\n    types: [completed]\n    branches: [main]\n";
     red(
-        &plant_top(on, "on:\n  workflow_dispatch:\n"),
-        "does not run on `push`",
+        &plant_top(
+            on,
+            "on:\n  push:\n    branches: [main]\n  workflow_run:\n    workflows: [pipeline]\n    types: [completed]\n    branches: [main]\n",
+        ),
+        "runs on `push`",
     );
     red(
         &plant_top(
             on,
-            "on:\n  pull_request:\n  push:\n    branches: [main]\n  workflow_dispatch:\n",
+            "on:\n  workflow_dispatch:\n  workflow_run:\n    workflows: [pipeline]\n    types: [completed]\n    branches: [main]\n",
+        ),
+        "runs on `workflow_dispatch`",
+    );
+    red(
+        &plant_top(
+            on,
+            "on:\n  pull_request:\n  workflow_run:\n    workflows: [pipeline]\n    types: [completed]\n    branches: [main]\n",
         ),
         "runs on `pull_request`",
     );
     red(
         &plant_top(
             on,
-            "on:\n  schedule:\n    - cron: '0 0 * * *'\n  push:\n    branches: [main]\n  workflow_dispatch:\n",
+            "on:\n  schedule:\n    - cron: '0 0 * * *'\n  workflow_run:\n    workflows: [pipeline]\n    types: [completed]\n    branches: [main]\n",
         ),
         "runs on `schedule`",
     );
     red(
-        &plant_top(on, "on:\n  push:\n    tags: ['v*']\n  workflow_dispatch:\n"),
-        "not exactly `branches: [main]`",
+        &plant_top(on, "on:\n  workflow_dispatch:\n"),
+        "does not run on `workflow_run`",
     );
-    red(
-        &plant_top(on, "on:\n  push:\n  workflow_dispatch:\n"),
-        "not exactly `branches: [main]`",
-    );
-    red(
-        &plant_top(on, "on:\n  push:\n    branches: [main]\n"),
-        "has no `workflow_dispatch:` entry",
-    );
-    red(
-        &plant_top(
-            on,
-            "on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      commit:\n        required: true\n        type: string\n",
-        ),
-        "declares inputs",
-    );
+    for (from, to) in [
+        ("workflows: [pipeline]", "workflows: [ci]"),
+        ("workflows: [pipeline]", "workflows: [pipeline, ci]"),
+        ("types: [completed]", "types: [requested]"),
+        ("types: [completed]", "types: [completed, requested]"),
+        ("branches: [main]", "branches: ['**']"),
+        ("    branches: [main]\n", ""),
+    ] {
+        red(&plant_top(from, to), "is filtered by");
+    }
 }
 
 #[test]
-fn a_push_trigger_needs_the_whole_chain_of_jobs() {
-    // Catches: the push trigger present while a gate of the chain is missing, so a push to
-    // main would tag or publish without it. Mutants: each of gates, plan, verify, tag, publish
-    // and bump renamed away in turn (each must name the missing job, as the push is present).
-    // `triggers` is read alone: the later rules stop at a missing job with an error, and the
-    // chain rule must stand on its own when they do not.
-    // The list itself is pinned here, not read back from `CHAIN`: shrinking `CHAIN` must not
-    // shrink this test with it.
+fn a_workflow_run_trigger_needs_the_whole_chain_of_jobs() {
+    // Catches: the trigger present while a stage of the chain is missing, so a pipeline run
+    // would tag or publish without it. Each of plan, verify, tag, publish and bump is renamed
+    // away in turn (each must name the missing job, as the trigger is present). `triggers` is
+    // read alone: the later rules stop at a missing job with an error, and the chain rule must
+    // stand on its own when they do not. The list itself is pinned here, not read back from
+    // `CHAIN`: shrinking `CHAIN` must not shrink this test with it.
     assert_eq!(
         CHAIN,
-        ["gates", "plan", "verify", "tag", "publish", "bump"],
-        "the jobs a push needs"
+        ["plan", "verify", "tag", "publish", "bump"],
+        "the jobs a release needs"
     );
     let text = real();
     let mut control = Vec::new();
@@ -139,13 +142,34 @@ fn a_push_trigger_needs_the_whole_chain_of_jobs() {
             &mut found,
         )
         .expect("triggers read");
-        red(&found, &format!("runs on `push` but has no job `{job}`"));
+        red(
+            &found,
+            &format!("runs on `workflow_run` but has no job `{job}`"),
+        );
     }
 }
 
 #[test]
+fn no_gates_job_exists_and_nothing_polls_for_other_runs() {
+    // Catches: the retired wait on separate push runs of ci, beta and artifacts coming back:
+    // a job `gates`, its verb, or a search for a run by workflow and commit.
+    let text = real();
+    assert!(!JOBS.contains(&"gates"));
+    assert!(!text.contains("release gates"), "the retired verb");
+    assert!(!code(&text).contains("  gates:"), "a job named gates");
+    assert!(!code(&text).contains("needs.gates"), "a need of gates");
+    red(
+        &plant_top(
+            "  plan:\n",
+            "  gates:\n    runs-on: ubuntu-24.04\n    steps: []\n\n  plan:\n",
+        ),
+        "the jobs are",
+    );
+}
+
+#[test]
 fn the_job_list_is_pinned() {
-    // Catches: the chain changed without its rule. Mutants: the job `publish` renamed; a job
+    // Catches: the chain changed without its rule. In particular: the job `publish` renamed; a job
     // renamed; a job added.
     red(
         &plant_top("  publish:\n", "  publish-release:\n"),
@@ -163,55 +187,59 @@ fn the_job_list_is_pinned() {
 
 #[test]
 fn one_release_at_a_time_and_none_cancelled() {
-    // Catches: two releases racing for the same version, or a release cancelled half way.
-    // Mutants: the group without the per-run fallback of a dispatch; cancel-in-progress true.
+    // Catches: two releases racing for the same version, a release cancelled half way, and a
+    // pipeline run that did not succeed (it starts this workflow too, to skip every job)
+    // queued in the group of the releases, where it would replace a release waiting there.
     red(
         &plant_top(
-            "release-${{ github.event_name == 'push' && 'push' || github.run_id }}",
-            "release-push",
+            "release-${{ github.event.workflow_run.conclusion == 'success' && 'main' || github.run_id }}",
+            "release-main",
         ),
-        "concurrency group",
+        "the concurrency is",
+    );
+    red(
+        &plant_top(
+            "release-${{ github.event.workflow_run.conclusion == 'success' && 'main' || github.run_id }}",
+            "release-${{ github.run_id }}",
+        ),
+        "the concurrency is",
     );
     red(
         &plant_top("cancel-in-progress: false", "cancel-in-progress: true"),
         "cancel-in-progress: false",
     );
+    red(
+        &plant_top("  cancel-in-progress: false\n", ""),
+        "the concurrency is",
+    );
 }
 
 #[test]
 fn every_job_needs_exactly_what_the_graph_says() {
-    // Catches: a job that runs without a stage before it. Mutants: gates dropped from plan;
-    // plan from verify; verify from tag; tag from notes; notes from publish; publish from
-    // bump (and so the gates are no longer reached from bump through any other job).
+    // Catches: a job that runs without a stage before it. `plan` dropped from verify; verify
+    // from tag; tag from notes; notes from publish; publish from bump (and so the checks are
+    // no longer reached from bump through any other job).
     red(
-        &plant("plan", "needs: [gates]\n", "needs: []\n"),
-        "`plan` needs []",
-    );
-    red(
-        &plant("verify", "needs: [gates, plan]\n", "needs: [plan]\n"),
+        &plant("verify", "needs: [plan]\n", "needs: []\n"),
         "`verify` needs",
     );
     red(
-        &plant(
-            "tag",
-            "needs: [gates, plan, verify]\n",
-            "needs: [gates, plan]\n",
-        ),
+        &plant("tag", "needs: [plan, verify]\n", "needs: [plan]\n"),
         "`tag` needs",
     );
     red(
         &plant(
             "notes",
-            "needs: [gates, plan, verify, tag]\n",
-            "needs: [gates, plan, verify]\n",
+            "needs: [plan, verify, tag]\n",
+            "needs: [plan, verify]\n",
         ),
         "`notes` needs",
     );
     red(
         &plant(
             "publish",
-            "needs: [gates, plan, verify, tag, notes]\n",
-            "needs: [gates, plan, verify, tag]\n",
+            "needs: [plan, verify, tag, notes]\n",
+            "needs: [plan, verify, tag]\n",
         ),
         "`publish` needs",
     );
@@ -226,9 +254,9 @@ fn every_job_needs_exactly_what_the_graph_says() {
 #[test]
 fn only_publish_writes_and_no_job_signs() {
     // Catches: a write scope outside publish (a dry run could publish; a token that could
-    // push), and an OIDC token in a job that runs a third party's code. Mutants: verify,
+    // push), and an OIDC token in a job that runs a third party's code. Catches: verify,
     // tag and notes get `contents: write`; publish gets `packages: write`, then `id-token:
-    // write`; gates gets `id-token: write`; publish loses `contents: write`.
+    // write`; plan gets `id-token: write`; publish loses `contents: write`.
     red(
         &plant(
             "verify",
@@ -263,11 +291,11 @@ fn only_publish_writes_and_no_job_signs() {
     );
     red(
         &plant(
-            "gates",
+            "plan",
             "      actions: read\n",
             "      actions: read\n      id-token: write\n",
         ),
-        "`gates` holds `id-token: write`, which only",
+        "`plan` holds `id-token: write`, which only",
     );
     red(
         &plant(
@@ -280,10 +308,11 @@ fn only_publish_writes_and_no_job_signs() {
 }
 
 #[test]
-fn the_jobs_that_write_run_only_for_a_push_to_main_that_releases() {
-    // Catches: a dry run (a dispatch) that tags or publishes; a release of docs only or of
-    // the pipeline itself. Mutants per job: the `if:` dropped; widened to any push; the
-    // pipeline clause dropped; the code clause dropped; the branch clause dropped.
+fn the_jobs_that_write_run_only_for_a_successful_pipeline_run_that_releases() {
+    // Catches: a release of a pipeline run that was cancelled or red, of a pull request's run,
+    // of another branch or repository; a release of docs only or of the pipeline itself.
+    // Each clause of the condition of each writing job dropped in turn, the condition widened,
+    // or the condition dropped.
     for job in ["tag", "notes", "publish", "bump"] {
         let line = format!("    if: {RELEASE_IF}\n");
         red(
@@ -294,29 +323,32 @@ fn the_jobs_that_write_run_only_for_a_push_to_main_that_releases() {
             &plant(job, &line, "    if: ${{ github.event_name == 'push' }}\n"),
             &format!("the job `{job}` has `if:"),
         );
-        red(
-            &plant(job, " && needs.plan.outputs.pipeline != 'true' }}", " }}"),
-            &format!("the job `{job}` has `if:"),
-        );
-        red(
-            &plant(job, " && needs.plan.outputs.code == 'true'", ""),
-            &format!("the job `{job}` has `if:"),
-        );
-        red(
-            &plant(job, " && github.ref == 'refs/heads/main'", ""),
-            &format!("the job `{job}` has `if:"),
-        );
+        for clause in [
+            " && needs.plan.outputs.pipeline != 'true'",
+            " && needs.plan.outputs.code == 'true'",
+            "github.event.workflow_run.conclusion == 'success' && ",
+            "github.event.workflow_run.event == 'push' && ",
+            "github.event.workflow_run.head_branch == 'main' && ",
+            "github.event.workflow_run.head_repository.full_name == github.repository && ",
+        ] {
+            red(
+                &plant(job, clause, ""),
+                &format!("the job `{job}` has `if:"),
+            );
+        }
     }
     let verify = format!("    if: {VERIFY_IF}\n");
     red(
         &plant("verify", &verify, ""),
         "the job `verify` has `if: (none)`",
     );
+    let plan = format!("    if: {PLAN_IF}\n");
+    red(&plant("plan", &plan, ""), "the job `plan` has `if: (none)`");
     red(
         &plant(
             "plan",
-            "    needs: [gates]\n",
-            "    needs: [gates]\n    if: ${{ false }}\n",
+            "github.event.workflow_run.conclusion == 'success' && ",
+            "",
         ),
         "the job `plan` has `if:",
     );
@@ -325,7 +357,7 @@ fn the_jobs_that_write_run_only_for_a_push_to_main_that_releases() {
 #[test]
 fn the_environment_is_declared_where_the_key_is_read_and_where_writes_happen() {
     // Catches: a key move to an environment secret that would stop working, or a job that
-    // reads the key outside the environment. Mutants: the environment dropped from tag,
+    // reads the key outside the environment. Catches: the environment dropped from tag,
     // publish and bump; another environment; one added to notes.
     for job in ["tag", "publish", "bump"] {
         red(
@@ -349,12 +381,12 @@ fn the_environment_is_declared_where_the_key_is_read_and_where_writes_happen() {
 
 #[test]
 fn a_red_job_stops_the_release() {
-    // Catches: a stage that is skipped or ignored. Mutants: `always()` on publish;
+    // Catches: a stage that is skipped or ignored. In particular: `always()` on publish;
     // `failure()`; `cancelled()`; `continue-on-error` on a gate step and on the tag step; an
     // `if:` on a step of tag, of verify and of notes (not the previous release's).
     red(
         &plant_top(
-            "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}\n    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n",
+            &format!("    if: {RELEASE_IF}\n    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n"),
             "    if: ${{ always() && github.event_name == 'push' }}\n    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n",
         ),
         "uses `always()`",
@@ -410,26 +442,32 @@ fn a_red_job_stops_the_release() {
 }
 
 #[test]
-fn only_the_commit_of_the_run_is_checked_out_and_no_input_reaches_a_script() {
-    // Catches: a release of code a person or a pull request named. Mutants: a checkout of a
-    // ref, of another repository, with a token; without `persist-credentials: false`; two
-    // checkouts; an expression of an input, of a pull request, of `head_ref`.
-    let checkout = "        with:\n          persist-credentials: false\n";
-    for job in ["gates", "tag", "publish", "bump"] {
+fn only_the_commit_the_pipeline_built_is_checked_out_and_no_input_reaches_a_script() {
+    // Catches: a release of code a person or a pull request named, or of the latest commit of
+    // main (the `github.sha` of a `workflow_run` run) instead of the one the pipeline built.
+    // A checkout of another ref, of the default ref, of another repository, with a token;
+    // without `persist-credentials: false`; two checkouts; an expression of an input, of a
+    // pull request, of `head_ref`, of the title or branch name of the run that started this.
+    let checkout = "          ref: ${{ github.event.workflow_run.head_sha }}\n          persist-credentials: false\n";
+    for job in ["verify", "tag", "publish", "bump"] {
         red(
             &plant(
                 job,
                 checkout,
-                "        with:\n          ref: main\n          persist-credentials: false\n",
+                "          ref: main\n          persist-credentials: false\n",
             ),
-            &format!("the checkout of `{job}` is given `ref`"),
+            &format!("the checkout of `{job}` is not of `ref:"),
+        );
+        red(
+            &plant(job, checkout, "          persist-credentials: false\n"),
+            &format!("the checkout of `{job}` is not of `ref:"),
         );
     }
     red(
         &plant(
             "tag",
             checkout,
-            "        with:\n          repository: other/repo\n          persist-credentials: false\n",
+            "          ref: ${{ github.event.workflow_run.head_sha }}\n          repository: other/repo\n          persist-credentials: false\n",
         ),
         "is given `repository`",
     );
@@ -437,7 +475,7 @@ fn only_the_commit_of_the_run_is_checked_out_and_no_input_reaches_a_script() {
         &plant(
             "tag",
             checkout,
-            "        with:\n          token: ${{ github.token }}\n          persist-credentials: false\n",
+            "          ref: ${{ github.event.workflow_run.head_sha }}\n          token: ${{ github.token }}\n          persist-credentials: false\n",
         ),
         "is given `token`",
     );
@@ -445,7 +483,7 @@ fn only_the_commit_of_the_run_is_checked_out_and_no_input_reaches_a_script() {
         &plant(
             "publish",
             checkout,
-            "        with:\n          fetch-depth: 0\n",
+            "          ref: ${{ github.event.workflow_run.head_sha }}\n          fetch-depth: 0\n",
         ),
         "the checkout of `publish` is not `persist-credentials: false`",
     );
@@ -453,7 +491,7 @@ fn only_the_commit_of_the_run_is_checked_out_and_no_input_reaches_a_script() {
         &plant(
             "tag",
             "      - run: rustup toolchain install\n",
-            "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          persist-credentials: false\n      - run: rustup toolchain install\n",
+            "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          ref: ${{ github.event.workflow_run.head_sha }}\n          persist-credentials: false\n      - run: rustup toolchain install\n",
         ),
         "has 2 checkouts",
     );
@@ -462,25 +500,65 @@ fn only_the_commit_of_the_run_is_checked_out_and_no_input_reaches_a_script() {
         "${{ github.event.inputs.commit }}",
         "${{ github.event.pull_request.head.sha }}",
         "${{ github.head_ref }}",
+        "${{ github.event.workflow_run.head_commit.message }}",
+        "${{ github.event.workflow_run.display_title }}",
+        "${{ github.event.workflow_run.pull_requests[0].number }}",
     ] {
         red(
             &plant(
-                "gates",
+                "plan",
                 "          GH_TOKEN: ${{ github.token }}\n",
                 &format!("          GH_TOKEN: ${{{{ github.token }}}}\n          X: {expr}\n"),
             ),
             "the workflow reads `",
         );
     }
+    red(
+        &plant(
+            "plan",
+            "          GH_TOKEN: ${{ github.token }}\n",
+            "          GH_TOKEN: ${{ github.token }}\n          X: ${{ github.event.workflow_run.head_branch }}\n",
+        ),
+        "outside an `if:`",
+    );
+}
+
+#[test]
+fn the_commit_and_the_run_are_the_pipeline_runs_for_every_job() {
+    // Catches: a job acting on `github.sha` (the latest commit of main for a `workflow_run`
+    // run), or on a run other than the one that started this, because the workflow-level
+    // names point elsewhere or a job sets its own.
+    red(
+        &plant_top(
+            "  COMMIT: ${{ github.event.workflow_run.head_sha }}\n",
+            "  COMMIT: ${{ github.sha }}\n",
+        ),
+        "does not set `COMMIT:",
+    );
+    red(
+        &plant_top(
+            "  PIPELINE_RUN: ${{ github.event.workflow_run.id }}\n",
+            "  PIPELINE_RUN: ${{ github.run_id }}\n",
+        ),
+        "does not set `PIPELINE_RUN:",
+    );
+    red(
+        &plant(
+            "notes",
+            "    env:\n      TAG:",
+            "    env:\n      COMMIT: ${{ github.sha }}\n      TAG:",
+        ),
+        "sets `COMMIT` or `PIPELINE_RUN` itself",
+    );
 }
 
 #[test]
 fn the_release_bots_key_is_read_in_tag_and_bump_only() {
     // Catches: the one key that can create `v*` tags (and open pull requests in the internal
-    // repository) readable by a job that runs more code. Mutants: the key read in publish,
-    // notes, gates; the token minted in verify; the old `RELEASE_TAGGER_*` names; the freeze
+    // repository) readable by a job that runs more code. Catches: the key read in publish,
+    // notes, plan; the token minted in verify; the old `RELEASE_TAGGER_*` names; the freeze
     // read outside plan; another secret read; the key not read by tag and bump.
-    for job in ["publish", "notes", "gates", "verify"] {
+    for job in ["publish", "notes", "plan", "verify"] {
         let (from, to) = if job == "publish" {
             (
                 "          GH_TOKEN: ${{ github.token }}\n          TAG:",
@@ -536,58 +614,18 @@ fn the_release_bots_key_is_read_in_tag_and_bump_only() {
 }
 
 #[test]
-fn the_gates_job_waits_for_this_commit_on_main_and_hands_on_the_run_ids() {
-    // Catches: gates satisfied by another commit or branch, or run ids that go nowhere.
-    // Mutants: the sha dropped; the branch changed; the output file dropped; each output
-    // pointing at another step output.
-    let flags = "--sha \"$GITHUB_SHA\" --branch main --output";
-    red(
-        &plant("gates", flags, "--branch main --output"),
-        "not given `--sha $GITHUB_SHA`",
-    );
-    red(
-        &plant("gates", "--branch main", "--branch feature"),
-        "not given `--branch main`",
-    );
-    red(
-        &plant(
-            "gates",
-            "--sha \"$GITHUB_SHA\" --branch main --output \"$GITHUB_OUTPUT\"",
-            "--sha \"$GITHUB_SHA\" --branch main",
-        ),
-        "not given `--output $GITHUB_OUTPUT`",
-    );
-    red(
-        &plant(
-            "gates",
-            "beta-run: ${{ steps.gates.outputs.beta_run }}",
-            "beta-run: ${{ steps.gates.outputs.ci_run }}",
-        ),
-        "does not output `beta-run`",
-    );
-    red(
-        &plant(
-            "gates",
-            "      artifacts-run: ${{ steps.gates.outputs.artifacts_run }}\n",
-            "",
-        ),
-        "does not output `artifacts-run`",
-    );
-}
-
-#[test]
-fn the_plan_job_sees_the_push_and_the_freeze_and_hands_on_the_class() {
-    // Catches: a plan that cannot diff the push or see the tags, that ignores the stop
-    // switch, or whose classification never reaches the jobs that act on it. Mutants: no full
-    // history; `--before` another variable; the freeze dropped, then the variable; the
-    // dispatch fallback for `before` dropped; each output dropped.
+fn the_plan_job_sees_the_history_and_the_freeze_and_hands_on_the_class() {
+    // Catches: a plan that cannot see the history or the tags (it measures from the last
+    // release tag), that ignores the stop switch, or whose classification never reaches the
+    // jobs that act on it. No full history; the commit planned not the pipeline's; the
+    // freeze dropped, then the variable; each output dropped.
     red(
         &plant("plan", "          fetch-depth: 0\n", ""),
         "does not check out with `fetch-depth: 0`",
     );
     red(
-        &plant("plan", "--before \"$BEFORE\"", "--before \"$GITHUB_SHA\""),
-        "not given `--before $BEFORE`",
+        &plant("plan", "--sha \"$COMMIT\"", "--sha \"$GITHUB_SHA\""),
+        "not given `--sha $COMMIT`",
     );
     red(
         &plant("plan", " --freeze \"$FREEZE\"", ""),
@@ -596,10 +634,6 @@ fn the_plan_job_sees_the_push_and_the_freeze_and_hands_on_the_class() {
     red(
         &plant("plan", "FREEZE: ${{ vars.RELEASE_FREEZE }}", "FREEZE: ''"),
         "does not set `FREEZE:",
-    );
-    red(
-        &plant("plan", " || '0000000000000000000000000000000000000000'", ""),
-        "does not set `BEFORE:",
     );
     for name in ["version", "tag", "code", "site", "pipeline"] {
         let line = format!("      {name}: ${{{{ steps.plan.outputs.{name} }}}}\n");
@@ -611,11 +645,11 @@ fn the_plan_job_sees_the_push_and_the_freeze_and_hands_on_the_class() {
 }
 
 #[test]
-fn verify_checks_the_files_of_the_run_the_gates_saw_before_anything_is_tagged() {
-    // Catches: files from another run than the gates saw, or unchecked files uploaded for
-    // the tag to name. Mutants: locate dropped, or under `if:`; a download of another
-    // run; COMMIT not the sha; `release check` and the
-    // attestations dropped; the upload moved before them.
+fn verify_reads_the_artifacts_of_the_pipeline_run_that_started_the_release() {
+    // Catches: files from another run than the one that built the commit, or unchecked files
+    // uploaded for the tag to name. `locate` dropped, under `if:`, or without the run;
+    // a download of another run, or without the token that reads a run's artifacts;
+    // `release check` and the attestations dropped; the upload moved before them.
     red(
         &plant(
             "verify",
@@ -633,20 +667,24 @@ fn verify_checks_the_files_of_the_run_the_gates_saw_before_anything_is_tagged() 
         "`release locate` step of `verify` is under `if:`",
     );
     red(
-        &plant(
-            "verify",
-            "          name: sha256sums\n          path: dist\n          run-id: ${{ needs.gates.outputs.artifacts-run }}\n",
-            "          name: sha256sums\n          path: dist\n          run-id: 1\n",
-        ),
-        "a download of `verify` is not of run `${{ needs.gates.outputs.artifacts-run }}`",
+        &plant("verify", " --run-id \"$PIPELINE_RUN\"", ""),
+        "not given `--run-id $PIPELINE_RUN`",
     );
     red(
         &plant(
             "verify",
-            "      COMMIT: ${{ github.sha }}\n",
-            "      COMMIT: ${{ needs.plan.outputs.tag }}\n",
+            "          name: sha256sums\n          path: dist\n          run-id: ${{ github.event.workflow_run.id }}\n",
+            "          name: sha256sums\n          path: dist\n          run-id: 1\n",
         ),
-        "does not set `COMMIT: ${{ github.sha }}`",
+        "a download of `verify` is not of run `${{ github.event.workflow_run.id }}`",
+    );
+    red(
+        &plant(
+            "verify",
+            "          name: sha256sums\n          path: dist\n          run-id: ${{ github.event.workflow_run.id }}\n          github-token: ${{ github.token }}\n",
+            "          name: sha256sums\n          path: dist\n          run-id: ${{ github.event.workflow_run.id }}\n",
+        ),
+        "names a `run-id` without `github-token",
     );
     red(
         &plant(
@@ -677,28 +715,28 @@ fn verify_checks_the_files_of_the_run_the_gates_saw_before_anything_is_tagged() 
 #[test]
 fn tag_writes_the_record_then_mints_the_token_then_tags_the_commit_of_the_run() {
     // Catches: a tag of another commit or version, a token held longer or wider than the one
-    // step needs, a record that names other runs than the gates'. Mutants: the record's
-    // inputs from the wrong place; the order changed; the token given `issues: write`, no
+    // step needs, a record that names another run than the pipeline run that started this, a
+    // record whose inputs come from the wrong place; the order changed; the token given `issues: write`, no
     // repository scope, or the wrong one; a build after it; the tag step on the workflow's
     // own token, with another message file, tag or sha; another step holding the token.
-    let record = "--commit \"$GITHUB_SHA\" --tag \"$TAG\" --run-id";
+    let record = "--commit \"$COMMIT\" --tag \"$TAG\" --run-id";
     red(
-        &plant("tag", record, "--commit \"$GITHUB_SHA\" --run-id"),
+        &plant("tag", record, "--commit \"$COMMIT\" --run-id"),
         "not given `--tag $TAG`",
     );
     red(
         &plant(
             "tag",
-            "BETA_RUN: ${{ needs.gates.outputs.beta-run }}",
-            "BETA_RUN: ${{ needs.gates.outputs.ci-run }}",
+            "--pipeline-run \"$PIPELINE_RUN\"",
+            "--pipeline-run \"$GITHUB_RUN_ID\"",
         ),
-        "does not set `BETA_RUN:",
+        "not given `--pipeline-run $PIPELINE_RUN`",
     );
     red(
         &plant(
             "tag",
-            "TAG: ${{ needs.plan.outputs.tag }}\n          CI_RUN",
-            "TAG: v9.9.9\n          CI_RUN",
+            "TAG: ${{ needs.plan.outputs.tag }}\n        run: cargo xtask release verdict-write",
+            "TAG: v9.9.9\n        run: cargo xtask release verdict-write",
         ),
         "does not set `TAG:",
     );
@@ -745,10 +783,10 @@ fn tag_writes_the_record_then_mints_the_token_then_tags_the_commit_of_the_run() 
     red(
         &plant(
             "tag",
-            "--sha \"$GITHUB_SHA\" --tag \"$TAG\" --message-file",
+            "--sha \"$COMMIT\" --tag \"$TAG\" --message-file",
             "--tag \"$TAG\" --message-file",
         ),
-        "not given `--sha $GITHUB_SHA`",
+        "not given `--sha $COMMIT`",
     );
     red(
         &plant("tag", "cargo xtask release tag", "cargo xtask release tagx"),
@@ -796,7 +834,7 @@ fn tag_writes_the_record_then_mints_the_token_then_tags_the_commit_of_the_run() 
 #[test]
 fn notes_check_the_tag_and_hand_on_the_set_and_the_notes() {
     // Catches: notes for another release, a set hash that is not the one the tag check
-    // printed, a tag check before the files are checked or against another main. Mutants:
+    // printed, a tag check before the files are checked or against another main. Catches:
     // `release verify` dropped; its flags; its output; a main ref; the check order; the
     // notes dropped or for other flags; the upload.
     red(
@@ -895,7 +933,7 @@ fn notes_check_the_tag_and_hand_on_the_set_and_the_notes() {
 
 #[test]
 fn publish_is_given_the_planned_tag_the_set_the_run_and_the_notes() {
-    // Catches: a release of other files or notes than the ones checked. Mutants: the hash,
+    // Catches: a release of other files or notes than the ones checked. In particular: the hash,
     // run id or tag from nowhere; the flag dropped; the token not the workflow's; the notes
     // file another one, not downloaded, or downloaded elsewhere; the files not checked.
     red(
@@ -913,7 +951,7 @@ fn publish_is_given_the_planned_tag_the_set_the_run_and_the_notes() {
     red(
         &plant(
             "publish",
-            "RUN_ID: ${{ needs.gates.outputs.artifacts-run }}",
+            "RUN_ID: ${{ github.event.workflow_run.id }}",
             "RUN_ID: 1",
         ),
         "does not set `RUN_ID:",
@@ -927,8 +965,8 @@ fn publish_is_given_the_planned_tag_the_set_the_run_and_the_notes() {
         "does not set `TAG:",
     );
     red(
-        &plant("publish", "--commit \"$GITHUB_SHA\"", "--commit \"$TAG\""),
-        "not given `--commit $GITHUB_SHA`",
+        &plant("publish", "--commit \"$COMMIT\"", "--commit \"$TAG\""),
+        "not given `--commit $COMMIT`",
     );
     red(
         &plant(
@@ -987,7 +1025,7 @@ fn publish_is_given_the_planned_tag_the_set_the_run_and_the_notes() {
 #[test]
 fn bump_is_given_the_version_and_a_token_for_the_internal_repository_alone() {
     // Catches: a pull request opened for another version or by a token that reaches more.
-    // Mutants: the owner, repository or a permission changed or added; the version from
+    // Catches: the owner, repository or a permission changed or added; the version from
     // nowhere; the commit, internal repository or submodule changed; the workflow's token.
     red(
         &plant(
@@ -1018,16 +1056,12 @@ fn bump_is_given_the_version_and_a_token_for_the_internal_repository_alone() {
         "does not set `VERSION:",
     );
     red(
-        &plant(
-            "bump",
-            "--version \"$VERSION\"",
-            "--version \"$GITHUB_SHA\"",
-        ),
+        &plant("bump", "--version \"$VERSION\"", "--version \"$COMMIT\""),
         "not given `--version $VERSION`",
     );
     red(
-        &plant("bump", "--sha \"$GITHUB_SHA\"", "--sha \"$VERSION\""),
-        "not given `--sha $GITHUB_SHA`",
+        &plant("bump", "--sha \"$COMMIT\"", "--sha \"$VERSION\""),
+        "not given `--sha $COMMIT`",
     );
     red(
         &plant(
@@ -1061,7 +1095,7 @@ fn bump_is_given_the_version_and_a_token_for_the_internal_repository_alone() {
 
 #[test]
 fn actions_stay_pinned_and_the_token_starts_empty() {
-    // Catches: the shared rules loosened in this file. Mutants: an action pinned to a tag;
+    // Catches: the shared rules loosened in this file. In particular: an action pinned to a tag;
     // the App-token action pinned to a tag; the top-level `permissions: {}` removed; a
     // self-hosted runner.
     red(
@@ -1082,7 +1116,7 @@ fn actions_stay_pinned_and_the_token_starts_empty() {
     );
     red(&plant_top("permissions: {}\n", ""), "workflow lint:");
     red(
-        &plant("gates", "runs-on: ubuntu-24.04", "runs-on: self-hosted"),
+        &plant("plan", "runs-on: ubuntu-24.04", "runs-on: self-hosted"),
         "self-hosted",
     );
 }
@@ -1090,7 +1124,7 @@ fn actions_stay_pinned_and_the_token_starts_empty() {
 #[test]
 fn a_binary_runs_only_after_its_files_are_attested() {
     // Catches: an unattested binary executed in a job that sees the tag and the notes.
-    // Mutants: a binary run by hand; this release's attestation step lost before the run; the
+    // Catches: a binary run by hand; this release's attestation step lost before the run; the
     // previous release's step lost, or under another condition than the run it guards.
     red(
         &plant(
@@ -1159,7 +1193,7 @@ fn only_the_previous_releases_check_waives_the_version_facts() {
     // Catches: the first release with version facts failing on the release before it (which
     // has none) so that nothing is published, and the other way round: a waiver on the check
     // of the release being made, so a set without the facts of its kbf goes out.
-    // Mutants: the flag dropped from `previous`; the flag added to `dist`.
+    // Catches: the flag dropped from `previous`; the flag added to `dist`.
     red(
         &plant(
             "notes",
@@ -1180,12 +1214,12 @@ fn only_the_previous_releases_check_waives_the_version_facts() {
 
 #[test]
 fn a_workflow_of_another_shape_is_an_error_not_an_empty_answer() {
-    // Catches: a lint that passes because a rewritten key read as nothing. Mutant: the job
-    // `env` of verify a string.
+    // Catches: a lint that passes because a rewritten key read as nothing: the workflow's
+    // `env` a string.
     let text = real();
     let err = problems(&text.replacen(
-        "    env:\n      COMMIT: ${{ github.sha }}\n    steps:",
-        "    env: x\n    zz:\n      COMMIT: ${{ github.sha }}\n    steps:",
+        "\nenv:\n  CARGO_TERM_COLOR: always\n",
+        "\nenv: x\nzz:\n  CARGO_TERM_COLOR: always\n",
         1,
     ))
     .expect_err("env that is a string");
@@ -1206,7 +1240,7 @@ fn a_comment_naming_the_key_is_not_a_read_of_it() {
 #[test]
 fn the_files_are_checked_for_signer_repository_commit_and_sums_in_verify_and_notes() {
     // Catches: an attestation check that accepts another signing workflow, another
-    // repository or commit, or a set whose sums were never run. Mutants: in each of verify
+    // repository or commit, or a set whose sums were never run. Catches: in each of verify
     // and notes, `--workflow-ref` pointed at ci.yml, `--repo` at another repository,
     // `--commit` at a fixed sha, the `sha256sum` step replaced by `true`.
     let flags = [
@@ -1242,9 +1276,9 @@ fn the_files_are_checked_for_signer_repository_commit_and_sums_in_verify_and_not
 }
 
 #[test]
-fn only_verify_downloads_from_another_run() {
+fn only_plan_and_verify_download_from_another_run() {
     // Catches: tag, notes or publish taking files from a run `verify` never checked.
-    // Mutants: a `run-id` on the `release-assets` download of tag, of notes and of publish.
+    // A `run-id` on the `release-assets` download of tag, of notes and of publish.
     for job in ["tag", "notes", "publish"] {
         let found = plant(
             job,
@@ -1252,21 +1286,5 @@ fn only_verify_downloads_from_another_run() {
             "          name: release-assets\n          run-id: 1\n",
         );
         red(&found, &format!("a download of `{job}` names a `run-id`"));
-    }
-}
-
-#[test]
-fn the_gates_job_outlasts_its_own_wait() {
-    // Catches: the job killed at its timeout before the 3-hour wait for the gates reports.
-    // Mutant: `timeout-minutes: 180`, then 20.
-    for m in ["180", "20"] {
-        red(
-            &plant(
-                "gates",
-                "timeout-minutes: 200",
-                &format!("timeout-minutes: {m}"),
-            ),
-            "the job `gates` has no `timeout-minutes` above 180",
-        );
     }
 }

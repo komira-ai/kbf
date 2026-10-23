@@ -31,6 +31,8 @@ enum Defect {
     RemoveDeletesUser,
     PurgeDeletesConfig,
     PurgeLeavesRecord,
+    PurgeKeepsConffile,
+    RpmRemoveKeepsConffile,
     BuildFails,
     GhWrongVersion,
     GhNotRunnable,
@@ -45,6 +47,8 @@ struct World {
     users_made: bool,
     installed: bool,
     purged: bool,
+    /// The package is a deb: dpkg keeps a conffile on remove.
+    deb: bool,
     started: BTreeSet<String>,
     log: Vec<String>,
 }
@@ -92,6 +96,8 @@ fn entries() -> Vec<Entry> {
         // accounts (it has no bytes).
         entry_dir("/usr/lib/systemd/system/kbf-node.service.d"),
         entry_dir("/usr/share/kbf-installer"),
+        // A conffile: dpkg keeps it on remove and deletes it on purge.
+        entry_file("/etc/needrestart/conf.d/kbf.conf", 0o644, "conffile"),
     ]
 }
 
@@ -104,6 +110,7 @@ impl World {
             users_made: false,
             installed: false,
             purged: false,
+            deb: true,
             started: BTreeSet::new(),
             log: Vec::new(),
         }
@@ -250,7 +257,13 @@ impl World {
         self.installed = false;
         self.purged = purge;
         for e in &self.entries {
-            if !(self.defect == Defect::RemoveKeepsFile && e.dst.ends_with("kbf-installer")) {
+            let conffile = e.dst.starts_with("/etc/");
+            let keeps = (self.defect == Defect::RemoveKeepsFile && e.dst.ends_with("kbf-installer"))
+                // dpkg keeps a conffile until the purge.
+                || (conffile && self.deb && !purge)
+                || (conffile && purge && self.is(Defect::PurgeKeepsConffile))
+                || (conffile && !self.deb && self.is(Defect::RpmRemoveKeepsConffile));
+            if !keeps {
                 self.files.remove(&e.dst);
             }
         }
@@ -413,7 +426,9 @@ fn run_with(format: Format, defect: Defect) -> (World, Result<Vec<String>, Error
     // empty listing is no entries).
     let listing = dir.join("listing.txt");
     std::fs::write(&listing, pkg_linux::listing(&entries())).expect("listing");
-    let world = std::cell::RefCell::new(World::new(defect));
+    let mut model = World::new(defect);
+    model.deb = format == Format::Deb;
+    let world = std::cell::RefCell::new(model);
     let gates = gates();
     let probes = probes();
     let result = run(
@@ -574,6 +589,16 @@ fn remove_and_purge_must_leave_the_users_and_the_operators_files() {
     assert!(text.contains("remove deleted the user kbf"), "{text}");
     let text = problems(Format::Deb, Defect::PurgeDeletesConfig);
     assert!(text.contains("purge deleted /etc/kbf/kbf.toml"), "{text}");
+    let text = problems(Format::Deb, Defect::PurgeKeepsConffile);
+    assert!(
+        text.contains("/etc/needrestart/conf.d/kbf.conf is still there after purge"),
+        "{text}"
+    );
+    let text = problems(Format::Rpm, Defect::RpmRemoveKeepsConffile);
+    assert!(
+        text.contains("/etc/needrestart/conf.d/kbf.conf is still there after remove"),
+        "{text}"
+    );
     let text = problems(Format::Deb, Defect::PurgeLeavesRecord);
     assert!(
         text.contains("status is \"deinstall ok config-files\" after purge"),

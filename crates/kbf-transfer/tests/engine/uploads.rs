@@ -15,7 +15,7 @@ use super::front::{chunked, failing};
 /// holds is not uploaded, as bytes or as chunks (`outputs_present`); one the node read
 /// from the server earlier, but the server has since lost, is uploaded; a new one is.
 /// Catches FindMissing answered by anything but the server (the node's own copy of a
-/// blob says nothing about the server). Mutants seen red: skip the upload of a blob the
+/// blob says nothing about the server). Catches: skip the upload of a blob the
 /// lease has read (the lost blob was never uploaded); no FindMissing (the held blob was
 /// uploaded).
 #[tokio::test]
@@ -53,7 +53,7 @@ async fn c11_the_server_decides_what_is_uploaded() {
 /// (UNIMPLEMENTED), every blob is uploaded, held or not, and none fails; FindMissing is
 /// asked once for the life of the engine (the uploads queued behind that call are not
 /// asked either) and counted in `find_missing_unavailable`. Catches UNIMPLEMENTED
-/// failing the upload, and the engine asking again on every upload. Mutants seen red:
+/// failing the upload, and the engine asking again on every upload. Catches:
 /// UNIMPLEMENTED fails the upload; no FindMissing (no call reached the server).
 #[tokio::test]
 async fn c11_without_find_missing_every_blob_is_uploaded_and_none_fails() {
@@ -117,7 +117,7 @@ async fn a_find_missing_that_fails_leaves_the_blob_to_be_uploaded() {
 /// server at once, and answers the 1000 it lacks in the order asked, counted in the
 /// lease's `find_missing_digests` and `outputs_present`. Storing those 1000 asks
 /// nothing more. An answer is used once: a digest not asked about, or asked about and
-/// already stored, is asked again on its next put. Mutants seen red: puts ask
+/// already stored, is asked again on its next put. Catches: puts ask
 /// FindMissing again after `missing` (a 16th call, for the 1000 puts together); the
 /// chunks asked one at a time (1 call out at once); the answer kept after its put
 /// (the second put of `blobs[0]` asks nothing, 16 calls, not 17).
@@ -186,7 +186,7 @@ async fn a_whole_output_set_is_asked_about_in_chunks_at_once() {
 /// A whole set asked about against a worker listener without FindMissing: its three
 /// calls, out at once, are each answered UNIMPLEMENTED; every digest is answered
 /// missing (the one the server holds too) and stored without another question, and
-/// the first UNIMPLEMENTED alone is counted (and logged). Mutant seen red: each
+/// the first UNIMPLEMENTED alone is counted (and logged). Catches: each
 /// UNIMPLEMENTED counted (`find_missing_unavailable` 3).
 #[tokio::test]
 async fn without_find_missing_a_whole_set_is_answered_missing() {
@@ -226,7 +226,7 @@ async fn without_find_missing_a_whole_set_is_answered_missing() {
 /// failure is not UNIMPLEMENTED: `find_missing_unavailable` stays 0 and FindMissing
 /// stays on, so a later put still asks (and skips a held blob). The three calls are
 /// held at the server until all three arrive, so exactly one fails, whichever it is.
-/// Mutants seen red: a failed call turns FindMissing off for the process (the later put
+/// Catches: a failed call turns FindMissing off for the process (the later put
 /// asks nothing and stores the held blob); a failed call answered "present" (its new
 /// digests dropped from the answer).
 #[tokio::test]
@@ -349,7 +349,7 @@ async fn a_write_in_memory_is_retried_and_a_streamed_one_is_not() {
 
 /// Catches `written_blobs` left uncounted for a streamed write that stored a new blob
 /// (the native driver uploads outputs this way), and counted for a write before it is
-/// sent (a write refused on every attempt stores nothing). Mutants seen red: no
+/// sent (a write refused on every attempt stores nothing). Catches: no
 /// `written_blobs` add on `put_chunks`' success, `(1, 0, 3000)`; `put`'s add moved before
 /// the write, counting every attempt, `2` for the refused blob.
 #[tokio::test]

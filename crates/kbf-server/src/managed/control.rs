@@ -10,14 +10,14 @@
 //! for one.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
 
 use serde::Serialize;
 use tokio::sync::oneshot;
 
 use super::candidate::Candidate;
+use crate::farm::FOLLOW_EVERY;
 use crate::frontend::{FrontendFlags, FrontendHandle};
 use crate::handover::{Stand, Stop};
 use crate::state_store::generation_of;
@@ -25,10 +25,6 @@ use crate::state_store::generation_of;
 /// The version of the calls and of the `role` answer, which a proxy checks against
 /// `kbf --version --json`. Raised when a call or a field changes meaning.
 pub const ADMIN_PROTOCOL: u32 = 1;
-
-/// How often a stood-down process looks in the state store for the results of the calls
-/// it kept open.
-const FOLLOW_EVERY: Duration = Duration::from_millis(200);
 
 /// What a process is, as far as the store's generation goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -112,8 +108,8 @@ pub struct Control {
     stop: Stop,
     inner: Mutex<Inner>,
     moving: tokio::sync::Mutex<()>,
-    /// The follower of the kept calls runs ([`follow`]): once, whichever of a stand-down
-    /// and the first refused write starts it.
+    /// The follower of the kept calls runs ([`crate::farm::Farm::follow_every`]): once,
+    /// whichever of a stand-down and the first refused write starts it.
     following: Arc<AtomicBool>,
     /// Where the handle of the real frontend goes once a takeover has built it.
     handoff: Mutex<Option<Handoff>>,
@@ -285,7 +281,7 @@ impl Control {
         if role != Role::StoodDown {
             stand.release().await;
             self.set_role(Role::StoodDown);
-            let _ = follow(Arc::clone(&stand.farm), &self.following);
+            let _ = stand.farm.follow_every(&self.following, FOLLOW_EVERY);
         }
         Ok(self.view())
     }
@@ -344,25 +340,6 @@ impl Refusal {
     }
 }
 
-/// Answers the calls a farm kept from the `done/` rows another writer makes
-/// ([`crate::farm::Farm::follow`]), every [`FOLLOW_EVERY`], for as long as the process
-/// lives; started once per process. Whether this call started it.
-fn follow(farm: Arc<crate::farm::Farm>, started: &AtomicBool) -> bool {
-    if started.swap(true, Ordering::SeqCst) {
-        return false;
-    }
-    tokio::spawn(async move {
-        let mut look = tokio::time::interval(FOLLOW_EVERY);
-        loop {
-            look.tick().await;
-            // A store that cannot be read is looked at again at the next look; the farm
-            // reports what it finds no trace of (`kbf_frontend_relay_untraced`).
-            let _ = farm.follow();
-        }
-    });
-    true
-}
-
 /// Waits for the state store to refuse a write of `farm` because another writer holds the
 /// generation, and then does what a stand-down does for the calls it holds: fences the
 /// farm (nothing more is fed to the scheduler) and follows the `done/` rows, so a caller
@@ -376,7 +353,7 @@ fn watch(farm: Arc<crate::farm::Farm>, started: Arc<AtomicBool>) {
         }
         tracing::warn!("the state store has a newer writer: following its results");
         farm.fence();
-        let _ = follow(farm, &started);
+        let _ = farm.follow_every(&started, FOLLOW_EVERY);
     });
 }
 

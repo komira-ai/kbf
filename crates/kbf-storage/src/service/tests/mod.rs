@@ -539,7 +539,7 @@ async fn concurrent_writes_wait_for_room() {
 /// comes back as the store reported it, in order; an entry that needs nothing else comes
 /// back with an empty closure (`Some`, nothing to check); an entry from a store that
 /// reports no closure (a node from before the field) comes back with `None` (unchecked),
-/// not as an empty closure, and `action_result` still answers it. Mutants: the field
+/// not as an empty closure, and `action_result` still answers it. Catches: the field
 /// dropped (`None` for all), an absent closure read as empty, an empty one as absent.
 #[tokio::test]
 async fn an_entrys_closure_round_trips_and_absent_means_unchecked() {

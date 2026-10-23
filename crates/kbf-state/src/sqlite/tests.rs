@@ -163,7 +163,7 @@ fn a_probe_tells_a_held_lock_from_a_free_one_and_a_failure() {
 // another thread in that instant (here, held between fork and exec) carries a copy of the
 // probe's descriptor, and a store started meanwhile, in any process, is refused with
 // `Locked` until the child execs. The probe must let go as soon as it has its answer.
-// Mutant: the `Drop` of `LockFile` removed.
+// Catches: the `Drop` of `LockFile` removed.
 #[test]
 fn a_probe_lets_go_of_the_lock_it_took_though_a_forked_child_has_a_copy() {
     let dir = unit_dir("probe-forked");

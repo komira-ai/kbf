@@ -2,7 +2,9 @@
 //!
 //! The release files are untrusted bytes until they pass, and they are copied ONCE, into a
 //! directory only root can write (`<work>/stage`, mode 0700), and only that copy is
-//! checked, in this order:
+//! checked, in this order (for a channel whose source is GitHub, the two files are first
+//! fetched as `nobody` into a directory it owns inside the stage, [`super::fetch`], and the
+//! copy into the stage is the same one):
 //!
 //! 1. when the channel pins its releases, the sha256 of the copied tarball is the one its
 //!    sums list (the extra freeze list; a channel without sums skips this);
@@ -28,7 +30,8 @@ use std::path::Path;
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 
-use super::channel::MacChannel;
+use super::channel::{MacChannel, Source};
+use super::fetch::{FetchError, Fetcher, Limits};
 use super::layout::{BINARY, DAEMON_USER, MacHost, UNPRIVILEGED_USER};
 use super::release::{self, PickError};
 use super::tools;
@@ -39,8 +42,7 @@ use crate::request::Version;
 use crate::runner::{Exec, Identity, Runner};
 use crate::trust::nofollow;
 
-/// The repository whose workflow's attestation is accepted, and that workflow.
-const REPO: &str = "komira-ai/kbf";
+/// The workflow of the repository ([`release::REPO`]) whose attestation is accepted.
 const WORKFLOW: &str = "komira-ai/kbf/.github/workflows/artifacts.yml";
 
 /// The same pair under the name before the repository was renamed: a release attested then
@@ -55,7 +57,9 @@ const MACHO_ARM64: [u8; 8] = [0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01];
 /// The release a version picked out: its commit, and the sha256 the channel pins for its
 /// tarball when it pins any.
 struct Pick {
-    commit: String,
+    /// The commit (all 40 digits) of a channel with a directory or sums; for a channel on
+    /// GitHub with no sums, the version's 12 digits.
+    want: String,
     sha256: Option<String>,
 }
 
@@ -98,6 +102,12 @@ fn stage_inner(
     let prefix = release::commit_prefix(version.as_str())
         .ok_or_else(|| verify_failed("the version carries no commit (+g and 12 hex digits)"))?;
     let pick = pick_release(host, channel, prefix)?;
+    let token = match &channel.source {
+        Source::Github {
+            token_file: Some(file),
+        } => Some(read_token(host, file)?),
+        _ => None,
+    };
     // The pinned tools are root's, or nothing from them is believed.
     for tool in [&host.gh, &host.trusted_root] {
         host.trust.check_file(tool).map_err(|e| {
@@ -112,21 +122,33 @@ fn stage_inner(
 
     let stage = host.stage();
     make_stage(&stage).map_err(|e| fail(FailureCode::InstallFailed, format!("stage: {e}")))?;
-    let tarball = stage.join(release::tarball_name(&pick.commit));
-    let bundle = stage.join(release::bundle_name(&pick.commit));
+    let home = stage.join("gh-home");
     let tuning = &host.tuning;
-    copy_in(
-        &channel.dir.join(release::tarball_name(&pick.commit)),
-        &tarball,
-        tuning.tarball_max,
-    )
-    .map_err(|e| verify_failed(format!("tarball: {e}")))?;
-    copy_in(
-        &channel.dir.join(release::bundle_name(&pick.commit)),
-        &bundle,
-        tuning.bundle_max,
-    )
-    .map_err(|e| verify_failed(format!("attestation bundle: {e}")))?;
+    let commit = match &channel.source {
+        Source::Dir(dir) => {
+            let tarball = stage.join(release::tarball_name(&pick.want));
+            let bundle = stage.join(release::bundle_name(&pick.want));
+            copy_in(
+                &dir.join(release::tarball_name(&pick.want)),
+                &tarball,
+                tuning.tarball_max,
+            )
+            .map_err(|e| verify_failed(format!("tarball: {e}")))?;
+            copy_in(
+                &dir.join(release::bundle_name(&pick.want)),
+                &bundle,
+                tuning.bundle_max,
+            )
+            .map_err(|e| verify_failed(format!("attestation bundle: {e}")))?;
+            pick.want.clone()
+        }
+        Source::Github { .. } => {
+            make_home(&home, nobody)?;
+            fetch_release(host, runner, &pick.want, token.as_deref(), nobody, &home)?
+        }
+    };
+    let tarball = stage.join(release::tarball_name(&commit));
+    let bundle = stage.join(release::bundle_name(&commit));
 
     // 1. The copy is the pinned one, when the channel pins.
     if let Some(pinned) = &pick.sha256 {
@@ -137,21 +159,12 @@ fn stage_inner(
     }
 
     // 2. The copy was built by the workflow, for the commit.
-    let home = stage.join("gh-home");
-    fs::create_dir(&home)
-        .and_then(|()| fs::set_permissions(&home, fs::Permissions::from_mode(0o700)))
-        .and_then(|()| chown(&home, Some(nobody.uid), Some(nobody.gid)))
-        .map_err(|e| fail(FailureCode::InstallFailed, format!("stage: {e}")))?;
+    if !home.exists() {
+        make_home(&home, nobody)?;
+    }
     set_mode(&stage, 0o711)?;
     attest(
-        host,
-        runner,
-        channel,
-        &pick.commit,
-        &tarball,
-        &bundle,
-        nobody,
-        &home,
+        host, runner, channel, &commit, &tarball, &bundle, nobody, &home,
     )?;
     set_mode(&stage, 0o700)?;
 
@@ -183,23 +196,31 @@ fn stage_inner(
         .check_file(&binary)
         .map_err(|e| verify_failed(format!("{BINARY} in the stage: {e}")))?;
     Ok(Staged {
-        commit: pick.commit,
+        commit,
         binary_sha256,
     })
 }
 
-/// The release a version names in `channel`: from the pinned sums when it has some, else from
-/// the file names in its directory.
+/// The release a version names in `channel`: from the pinned sums when it has some, else
+/// from the file names in its directory, or, for a channel on GitHub with no sums, as the
+/// 12 digits alone (the listing of the releases decides, [`fetch`]).
 fn pick_release(host: &MacHost, channel: &MacChannel, prefix: &str) -> Result<Pick, Outcome> {
+    let github = matches!(channel.source, Source::Github { .. });
     let Some(sums_file) = &channel.sums else {
-        let listing = list_names(&channel.dir)
-            .map_err(|e| verify_failed(format!("the channel's directory: {e}")))?;
+        let Source::Dir(dir) = &channel.source else {
+            return Ok(Pick {
+                want: prefix.to_owned(),
+                sha256: None,
+            });
+        };
+        let listing =
+            list_names(dir).map_err(|e| verify_failed(format!("the channel's directory: {e}")))?;
         return release::pick_named(listing.iter().map(String::as_str), prefix)
             .map(|commit| Pick {
-                commit,
+                want: commit,
                 sha256: None,
             })
-            .map_err(|e| pick_failed(e, "the channel's directory"));
+            .map_err(|e| pick_failed(e, "the channel's directory", false));
     };
     let sums = host
         .trust
@@ -207,23 +228,114 @@ fn pick_release(host: &MacHost, channel: &MacChannel, prefix: &str) -> Result<Pi
         .map_err(|e| Outcome::Refused(refusal(e)))?;
     release::pick(&sums, prefix)
         .map(|pick| Pick {
-            commit: pick.commit,
+            want: pick.commit,
             sha256: Some(pick.sha256),
         })
-        .map_err(|e| pick_failed(e, "the channel's sums"))
+        .map_err(|e| pick_failed(e, "the channel's sums", github))
 }
 
-/// Why no release was picked, as an outcome.
-fn pick_failed(e: PickError, whence: &str) -> Outcome {
-    match e {
-        PickError::Malformed => Outcome::Refused(crate::outcome::Refusal::ConfigInvalid),
-        PickError::Unknown => verify_failed(format!(
+/// Why no release was picked, as an outcome. A channel on GitHub refuses with the closed
+/// codes of an unknown and an ambiguous release.
+fn pick_failed(e: PickError, whence: &str, github: bool) -> Outcome {
+    use crate::outcome::Refusal;
+    match (e, github) {
+        (PickError::Malformed, _) => Outcome::Refused(Refusal::ConfigInvalid),
+        (PickError::Unknown, true) => Outcome::Refused(Refusal::UnknownRelease),
+        (PickError::Ambiguous, true) => Outcome::Refused(Refusal::AmbiguousRelease),
+        (PickError::Unknown, false) => verify_failed(format!(
             "unknown release: {whence} hold none of that commit"
         )),
-        PickError::Ambiguous => verify_failed(format!(
+        (PickError::Ambiguous, false) => verify_failed(format!(
             "ambiguous release: {whence} hold two of that commit"
         )),
     }
+}
+
+/// The token for the API in `file`, which is root's alone to write: one line of letters,
+/// digits, `_` and `-`.
+fn read_token(host: &MacHost, file: &Path) -> Result<String, Outcome> {
+    let text = host
+        .trust
+        .read(file)
+        .map_err(|e| Outcome::Refused(refusal(e)))?;
+    let token = text.trim();
+    let plain = !token.is_empty()
+        && token.len() <= 255
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if plain {
+        Ok(token.to_owned())
+    } else {
+        Err(Outcome::Refused(crate::outcome::Refusal::ConfigInvalid))
+    }
+}
+
+/// A home for `gh` that `who` owns, inside the stage.
+fn make_home(home: &Path, who: Identity) -> Result<(), Outcome> {
+    fs::create_dir(home)
+        .and_then(|()| fs::set_permissions(home, fs::Permissions::from_mode(0o700)))
+        .and_then(|()| chown(home, Some(who.uid), Some(who.gid)))
+        .map_err(|e| fail(FailureCode::InstallFailed, format!("stage: {e}")))
+}
+
+/// Fetch the release that starts with `want` from GitHub as `nobody`, into a directory
+/// `nobody` owns, then copy its two files once, as root, into the stage. Nothing but
+/// the closed refusals comes out: the fetch changes nothing outside the stage.
+fn fetch_release(
+    host: &MacHost,
+    runner: &dyn Runner,
+    want: &str,
+    token: Option<&str>,
+    nobody: Identity,
+    home: &Path,
+) -> Result<String, Outcome> {
+    use crate::outcome::Refusal;
+    let stage = host.stage();
+    let scratch = stage.join("fetch");
+    make_home(&scratch, nobody)?;
+    let tuning = &host.tuning;
+    let fetcher = Fetcher {
+        runner,
+        gh: &host.gh,
+        who: nobody,
+        home,
+        token,
+        limits: Limits {
+            tool: tuning.tool,
+            download: tuning.fetch,
+            tarball_max: tuning.tarball_max,
+            bundle_max: tuning.bundle_max,
+        },
+    };
+    // The account `nobody` can pass through the stage while it fetches, and not after.
+    set_mode(&stage, 0o711)?;
+    let fetched = fetcher.fetch(want, &scratch);
+    set_mode(&stage, 0o700)?;
+    let commit = fetched.map_err(|e| {
+        Outcome::Refused(match e {
+            FetchError::Unknown => Refusal::UnknownRelease,
+            FetchError::Ambiguous => Refusal::AmbiguousRelease,
+            FetchError::Failed(_) => Refusal::FetchFailed,
+        })
+    })?;
+    let fetch_failed = |_: String| Outcome::Refused(Refusal::FetchFailed);
+    copy_in(
+        &scratch.join(release::tarball_name(&commit)),
+        &stage.join(release::tarball_name(&commit)),
+        tuning.tarball_max,
+    )
+    .map_err(fetch_failed)?;
+    copy_in(
+        &scratch.join(release::bundle_name(&commit)),
+        &stage.join(release::bundle_name(&commit)),
+        tuning.bundle_max,
+    )
+    .map_err(fetch_failed)?;
+    // What `nobody` wrote is no longer needed. The stage is sealed and root's, `nobody` cannot
+    // reach what stays, and the apply job removes the whole stage.
+    let _ = fs::remove_dir_all(&scratch);
+    Ok(commit)
 }
 
 /// The names (UTF-8 ones) in the untrusted directory `dir`. Only names are read here.
@@ -257,7 +369,7 @@ fn lookup(host: &MacHost, runner: &dyn Runner, name: &str) -> Result<Identity, O
     let exec =
         run_ok(runner, &tools::dscl_ids(name, host.tuning.tool), "dscl").map_err(verify_failed)?;
     tools::parse_ids(&exec.stdout_text())
-        .filter(|id| id.uid != 0)
+        .filter(|id| id.uid != 0 && id.gid != 0)
         .ok_or_else(|| verify_failed(format!("the account {name} has no usable ids")))
 }
 
@@ -334,7 +446,7 @@ fn attest(
     home: &Path,
 ) -> Result<(), Outcome> {
     let mut why = String::new();
-    for (repo, workflow) in [(REPO, WORKFLOW), (FORMER_REPO, FORMER_WORKFLOW)] {
+    for (repo, workflow) in [(release::REPO, WORKFLOW), (FORMER_REPO, FORMER_WORKFLOW)] {
         let attest = tools::Attest {
             gh: &host.gh,
             tarball,

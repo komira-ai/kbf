@@ -127,7 +127,8 @@ One JSON line on stdout.
 | failed | `{"result":"failed","reason":"<code>"}`, detail on stderr | 3 |
 
 Refusal codes: `bad_command`, `channel_not_allowed`, `config_invalid`, `config_unsafe`,
-`channel_unsigned`, `key_untrusted`, `channel_insecure`. Failure codes:
+`channel_unsigned`, `key_untrusted`, `channel_insecure`, and, on a Mac, for a channel whose source
+is GitHub, `unknown_release`, `ambiguous_release` and `fetch_failed`. Failure codes:
 `audit_unavailable`, `query_failed`, `installed_version_invalid`, `package_state_unclean`,
 `update_failed`, `install_failed`, `verify_failed`, `busy`, `lock_unavailable`.
 
@@ -189,8 +190,10 @@ and this document does not describe them.
 `<version>` is the version text of a build, `0.1.<seq>+g<12 hex digits>-<run>`. Its 12 digits
 pick the one tarball `kbf-<40 hex digits>-darwin-arm64.tar.gz` whose commit starts with them:
 among the file names of the channel's `dir`, or, when the channel pins its releases with
-`sums`, among the lines of its `SHA256SUMS`. No tarball is an unknown release and two are
-ambiguous (`verify_failed`, with the reason on stderr). The version text is kept in `VERSION`,
+`sums`, among the lines of its `SHA256SUMS`, or, for a channel whose source is GitHub, among the
+assets of the repository's releases. No tarball is an unknown release and two are ambiguous
+(`verify_failed`, with the reason on stderr; a channel on GitHub refuses with `unknown_release`
+and `ambiguous_release`). The version text is kept in `VERSION`,
 and `query` reports it as `installed_version`.
 
 ### The files, once per Mac (the operator's one root session)
@@ -229,7 +232,15 @@ Everything below is done once, as an administrator with `sudo`; this program doe
    dir = "/usr/local/kbf-host-install/stable"
    sums = "/usr/local/etc/kbf/host-install/stable.SHA256SUMS"   # optional
    source_ref = "refs/heads/main"      # optional; this is the default
+
+   [channels.online]                   # a channel on GitHub instead of a directory
+   source = "github"
+   token_file = "/usr/local/etc/kbf/host-install/github.token"   # optional; see below
    ```
+
+   A channel takes its releases from a `dir` or from `source = "github"`, never both (the
+   allowlist is `config_invalid` when it names both or neither). `sums` and `source_ref` go with
+   either. A channel on GitHub is described in [its own section](#a-channel-on-github).
 
    The trust anchor is the build attestation, which every release must pass (check 4 below).
    `sums` is optional. When it is set it is an extra freeze list: the pinned `SHA256SUMS` of the
@@ -265,7 +276,8 @@ stage):
 
 1. the request, the channel and its pinned sums (when it has any), and that `gh` and the trusted
    root are root's;
-2. the files of the channel's `dir` are copied once, into `/var/db/kbf-host-install/stage`
+2. the files of the channel's `dir` (or, for a channel on GitHub, the two files fetched as
+   `nobody` into a directory it owns inside the stage) are copied once, into `/var/db/kbf-host-install/stage`
    (root's, mode 0700), without following links, as regular files with one link and under a size
    limit; only that copy is checked from here on;
 3. when the channel has sums, the sha256 of the tarball is the one they list (a channel without
@@ -380,3 +392,67 @@ on one without, it is to remove its files from `dir`.
   closed codes of the Linux side (`verify_failed` for every check above, `install_failed` for a
   stage or launch that failed, `busy`, `package_state_unclean` for a missing kit); the words are
   on stderr.
+
+### A channel on GitHub
+
+A channel with `source = "github"` needs no file delivery and no edit of the allowlist for a new
+release: the install fetches the release itself, as `nobody`, from the GitHub releases of
+`komira-ai/kbf`, and then handles the two files exactly as it handles the files of a `dir`
+(copied once into the stage, `sums` checked when set, then the offline attestation check and
+everything after it). The build attestation is still the only trust anchor; the listing and the
+download only bring the bytes. A directory channel stays for a Mac that cannot reach GitHub.
+
+What the install does, in this order, with the pinned `gh`, run as `nobody` (the same privilege
+drop as the attestation check) in a directory that `nobody` owns inside the stage, with its
+own `HOME`:
+
+1. lists the repository's releases with `gh api`, 100 a page, newest first, page after page until
+   a page is empty, and at most 30 pages (an empty page ends it; a short one does not); never only the latest, so a rollback to an old release
+   works;
+2. finds the asset named `kbf-<40 hex>-darwin-arm64.tar.gz` whose commit starts with the 12 hex
+   digits of the version, across all the pages read. None is `unknown_release`; assets of two
+   different commits are `ambiguous_release`; the same commit in two releases is one release (the
+   newest). A listing cut at the 30-page limit without a match is `fetch_failed`, not
+   `unknown_release`, since not all of it was seen. When the channel has `sums`, the commit is
+   the one the sums list, and the listing must hold it;
+3. builds the download itself from the release's tag and the two asset names:
+   `gh release download <tag> --repo komira-ai/kbf --pattern <tarball> --pattern <bundle> --dir <dir>`.
+   The URLs in the listing (`browser_download_url`, `url`) are never read or followed, and an entry
+   whose tag is not letters, digits and `. _ + -` is not used;
+4. runs that download under a time limit (15 minutes) and a limit on what it may write (the
+   tarball limit plus the bundle limit, 512 MiB and 256 KiB, watched while it runs; the sizes the
+   listing gives are checked before it starts). A file over its limit, a timeout, a network
+   failure, an answer that is not a listing and a release without its bundle are `fetch_failed`;
+5. copies the two files once, as root, into the stage, and removes the directory `nobody` wrote
+   in. From here on nothing differs from a directory channel.
+
+Every one of these refusals is exit status 2 with no change to the kit, the status file or
+launchd, and no stage left behind.
+
+#### What the Mac needs
+
+- Outbound HTTPS to GitHub: `api.github.com` and `github.com`, and the host GitHub serves
+  release assets from. The child's environment is cleared, so no proxy variable reaches `gh`;
+  a Mac that can reach GitHub only through a proxy cannot use this source.
+- A token for the API. `gh api` refuses to run without one (`gh release download` does not), so
+  a channel names a `token_file`: a file that is root's alone to write (checked like the allowlist)
+  holding a GitHub token, one line of letters, digits, `_` and `-`. It needs no scope: the repository is
+  public and the token only has to exist. The root process reads it and gives it to `gh` as `GH_TOKEN`
+  for the listing and the download, and never to the attestation check. Without one the listing
+  fails and the install is `fetch_failed`.
+
+#### The residuals
+
+- The token is a credential on the Mac. It can read public data only, but it is an account's token,
+  and `nobody`'s `gh` process holds it in its environment while it runs.
+- The listing is read through GitHub's API and is not itself trusted: it can only choose among
+  releases (an old attested release is installable, as with a directory) or withhold one (the
+  install fails). What it picks must still pass the attestation for the full commit.
+- A request costs one API call per 100 releases plus the download's, against GitHub's rate limit
+  for the token (or the address, without one). A listing of about 3000 releases or more does not
+  show its oldest releases, so whoever can publish many releases can make a rollback to an old
+  one fail (`fetch_failed`); it cannot make a wrong release install.
+- The size limit is watched about every 10 ms, so a fast download can write a little past it
+  before it is killed; the copy then refuses the file, and the stage is removed.
+- A channel with `sums` pins the commit and the tarball's hash, and needs an edit of the sums file
+  for each new release; the point of this source is a channel without them.

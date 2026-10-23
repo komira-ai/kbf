@@ -1,0 +1,11 @@
+# TEST FIXTURE, not a shipped unit: stands in for the storage-and-daemon unit of the kbf
+# package (packaging/linux/units) in the unit tests of the packages. Gated as it is: it
+# cannot start before /etc/kbf/kbf.toml exists.
+[Unit]
+Description=kbf package test unit (storage and daemon)
+ConditionPathExists=/etc/kbf/kbf.toml
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/kbf-installer node
