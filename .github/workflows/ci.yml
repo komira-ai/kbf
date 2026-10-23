@@ -102,8 +102,8 @@ jobs:
   # `coverage-floors` (crates/kbf-coverage): every crate must reach 99.00% of lines and
   # 99.00% of branches, or the floor its line in that file lists for it (the crates under
   # 99% today, each with an open issue). A floor may only rise: the last step fails a pull
-  # request whose file lowers one. The gate is measured on the fast set plus the Postgres
-  # tests (a throwaway server, below): no S3, crun, root or Mac test is in it.
+  # request whose file lowers one. The fast set includes the Postgres tests (a throwaway
+  # server, below): no S3, crun, root or Mac test is in it.
   # Branch coverage (`--branch`, rustc's `-Zcoverage-options=branch`) is unstable, so this
   # job alone builds with a pinned nightly; every other job stays on the toolchain in
   # rust-toolchain.toml. The nightly may warn where stable does not, so `-D warnings` is off
@@ -113,7 +113,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    # The same throwaway server as beta.yml's state-postgres job, so the Postgres tests count.
+    # A throwaway Postgres server for every test that needs one, the same container as
+    # beta.yml's jobs use. KBF_TEST_POSTGRES_URL (below) names it; a test that needs it makes a
+    # database (kbf-testkit's `database`) or a schema of its own on it and drops it, and fails,
+    # not skips, without the variable.
     services:
       postgres:
         image: postgres@sha256:2a0d0fe14825b0939f78a8cad5cd4e6aa68bf94d0e5dd96e24b6d23af4315545
@@ -187,39 +190,8 @@ jobs:
         env:
           LLVM_COV_FLAGS: -skip-functions
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --profile pr
-      # The tests that need the server, as beta.yml's state-postgres job runs them (they are
-      # `#[ignore]`d, so the run above skips them); their counters join the run's in the
-      # report below. The kbf-state step builds with its `postgres` feature; the steps after
-      # it select tests of the workspace build by filter, not by `-p ... --test`: a build of
-      # one package leaves out the dev-dependency features of the others, so it would build
-      # kbf-installer again without `test-sandbox` and put a copy of its code in the report
-      # that no test runs. They run the `#[ignore]`d tests only (`--run-ignored only`): the
-      # others ran above, and some (the installer's database:: ones) write files in a scratch
-      # directory another test of the full run creates.
-      - name: Run the Postgres tests of kbf-state under coverage
-        env:
-          LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-state --features postgres -- --include-ignored
-      - name: Run the installer's Postgres tests under coverage
-        env:
-          LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-installer) & (test(database::) or test(setup_creates_the_schema))'
-      - name: Run the server's Postgres tests under coverage
-        env:
-          LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-server) & binary(state_store_postgres)'
-      - name: Run the server's restart tests over Postgres under coverage
-        env:
-          LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-server) & binary(state_store) & test(over_postgres)'
-      - name: Run the two-children swap over Postgres under coverage
-        env:
-          LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-server) & binary(frontend) & test(two_children::fifty_builds_across_a_takeover_over_postgres)'
-      - name: Run the frontend process test over Postgres under coverage
-        env:
-          LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-cli) & binary(frontend_process) & test(postgres_state_store)'
+      # No step below runs Postgres tests on their own: they are in the run above, which
+      # fails any of them when KBF_TEST_POSTGRES_URL (set for the job) names no server.
       - name: Report
         env:
           LLVM_COV_FLAGS: -skip-functions

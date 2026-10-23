@@ -4,8 +4,8 @@
 //! The store is the in-memory fake, which keeps a durable copy a restart reopens, and
 //! the farm's clock is tokio's, paused: nothing here waits. The tests that restart the
 //! farm over its store run a second time over a real SQLite file, closed and reopened, and
-//! a third time over a real Postgres schema when `KBF_TEST_POSTGRES_URL` names a server
-//! (those are `#[ignore]`d; the `state-postgres` CI job runs them).
+//! a third time over a real Postgres schema (`KBF_TEST_POSTGRES_URL` names the server; those
+//! tests fail without it).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -287,9 +287,6 @@ struct Disk {
     _postgres: Option<PostgresBackend>,
 }
 
-/// The variable naming a Postgres database the tests may create and drop schemas in.
-const POSTGRES_URL: &str = "KBF_TEST_POSTGRES_URL";
-
 impl Disk {
     fn new() -> Self {
         Self::over(Backing::Fake)
@@ -306,8 +303,7 @@ impl Disk {
             Backing::Postgres => (None, None),
         };
         let postgres = (matches!(backing, Backing::Postgres)).then(|| {
-            let url = std::env::var(POSTGRES_URL)
-                .unwrap_or_else(|_| panic!("{POSTGRES_URL} must name a database to test in"));
+            let url = kbf_testkit::database::server_url();
             PostgresBackend::new(&url, PgFlaw::None)
         });
         let inner = match &postgres {
@@ -1044,7 +1040,6 @@ macro_rules! restarts {
             }
 
             #[tokio::test(start_paused = true)]
-            #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
             async fn over_postgres() {
                 super::$name(Backing::Postgres).await;
             }

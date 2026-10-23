@@ -113,7 +113,19 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
+    # The throwaway Postgres server of ci.yml's test job (same image and settings): the default
+    # profile runs the tests that need one, each on a database or a schema of its own.
+    services:
+      postgres:
+        image: postgres@sha256:2a0d0fe14825b0939f78a8cad5cd4e6aa68bf94d0e5dd96e24b6d23af4315545
+        env:
+          POSTGRES_PASSWORD: kbf-ci-throwaway
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
     env:
+      KBF_TEST_POSTGRES_URL: postgres://postgres:kbf-ci-throwaway@127.0.0.1:5432/postgres
       # The GitHub CLI release a host pins to check a release's build attestation offline
       # (crates/kbf-installer/tests/real_gh.rs); the sha256 is the release's checksums file.
       GH_VERSION: 2.102.0
@@ -187,8 +199,18 @@ jobs:
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
-    # As test-x86; the sha256 is the release's aarch64 archive.
+    # As test-x86, with its Postgres service; the sha256 is the release's aarch64 archive.
+    services:
+      postgres:
+        image: postgres@sha256:2a0d0fe14825b0939f78a8cad5cd4e6aa68bf94d0e5dd96e24b6d23af4315545
+        env:
+          POSTGRES_PASSWORD: kbf-ci-throwaway
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
     env:
+      KBF_TEST_POSTGRES_URL: postgres://postgres:kbf-ci-throwaway@127.0.0.1:5432/postgres
       NEXTEST_VERSION: 0.9.146
       NEXTEST_SHA256: b2e33d7c72de7ade0ff7b3a948ac37516b24f8a836b7a8870c1f634a94be9de9
     steps:
@@ -224,9 +246,10 @@ jobs:
   # reject, the startup refusal of a server that does not flush commits, and the claim
   # path (crates/kbf-state/tests/postgres_conformance.rs), then the server over it
   # (crates/kbf-server/tests/state_store_postgres.rs and the `over_postgres` restart tests).
-  # kbf-server enables the feature, so the workspace jobs build and lint it too; they run
-  # none of the tests that need a server. The password is a throwaway for this container,
-  # which lives only for this job.
+  # The workspace jobs (test-x86, test-arm and ci.yml's test) run these tests too, each on a
+  # server of their own; this job is kept because release/stages.yml lists it as a gate, and
+  # it clippy-lints kbf-state with its feature on. The password is a throwaway for this
+  # container, which lives only for this job.
   state-postgres:
     runs-on: ubuntu-latest
     permissions:
@@ -493,7 +516,9 @@ jobs:
       - run: uname -m
       - run: sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
       - run: cargo build -p kbf-node --bin kbf-daemon --locked
-      - run: cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node -p kbf-testkit --locked
+      # Not the tests named `database::` (crates/kbf-testkit/tests/database.rs): they make
+      # databases on a Postgres server, which a hosted Mac has not.
+      - run: cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node -p kbf-testkit --locked -- --skip database::
       # `kbf daemon --driver native` started with the words the Mac's launchd unit
       # writes, against a fake front, and the helpers it re-runs itself as (each action's
       # keeper, the lease-user pool's `as-user` step) through the `kbf` binary
@@ -517,7 +542,11 @@ jobs:
       # The host installer's layout, offline attestation check and stage, compiled and run
       # on the platform they name, and the pinned gh for darwin-arm64 against a real
       # attestation (crates/kbf-installer, docs/deploy/host-releases.md).
-      - run: cargo test -p kbf-installer --locked
+      # Not the tests that need a Postgres server (a hosted Mac has none, and they fail, not
+      # skip, without one; the Linux jobs run them): those in a module named `database` (skipped
+      # by `::database::`), the `provisioned` module of database_tests.rs, and the three
+      # tests of that file and the one of setup/more_tests.rs that use `TestDatabase`.
+      - run: cargo test -p kbf-installer --locked -- --skip ::database:: --skip database::tests::provisioned:: --skip database::tests::setup_creates_the_schema_once --skip database::tests::the_update_step_migrates --skip database::tests::the_bounded_step_gives_up --skip setup_creates_the_schema_over_a_real_server
       - name: Fetch gh (pinned release, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_macOS_arm64.zip" --sha256 "$GH_SHA256" --out "$RUNNER_TEMP/tools/gh" --extract zip --member "gh_${GH_VERSION}_macOS_arm64/bin/gh"
       - name: The pinned gh verifies a real attestation offline

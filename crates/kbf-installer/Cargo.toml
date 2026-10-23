@@ -84,10 +84,13 @@ h2.workspace = true
 http.workspace = true
 kbf-host = { workspace = true, features = ["testkit"] }
 kbf-installer = { workspace = true, features = ["testkit", "test-sandbox"] }
+# A Postgres database of its own for each test that needs a server (`database` tests).
+kbf-state = { workspace = true, features = ["test-database"] }
 # The proxy verb's process test starts the binary under a guard that reaps it
 # (kbf_testkit::reaped); a child held between fork and exec (kbf_testkit::forked), and a
-# start that waits out a program still open for writing (kbf_testkit::spawn).
-kbf-testkit.workspace = true
+# start that waits out a program still open for writing (kbf_testkit::spawn); the test
+# Postgres server's URL (kbf_testkit::database).
+kbf-testkit = { workspace = true, features = ["postgres"] }
 kbf-update.workspace = true
 # The proxy verb's process test mints the OIDC tokens of a CI job (`remote_operator_file`).
 kbf-oidc = { workspace = true, features = ["testkit"] }
