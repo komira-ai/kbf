@@ -22,7 +22,7 @@ state store, protocol skew, upgrade order), [worker-protocol.md](worker-protocol
    Updates are **triggered externally** through the frontend's control API; for us the caller is the gamma deployment, which calls the API
    from our network. The frontend stores the desired release. Support is **on-prem only** for now; cloud update providers are deferred (section 12).
 2. Every host learns the desired release over the **mTLS session it already holds** with the frontend: an
-   `UpdateOffer` sent after `Welcome` and at every change. No new inbound port, no SSH, no CI credential that
+   `UpdateOffer` (the frontend no longer sends it; section 6.4). No new inbound port, no SSH, no CI credential that
    reaches a host.
 3. The order is "update to commit `<hash>`": `UpdateOrder{ACTIVATE}` over the session, carrying the commit, the
    generation, the epoch and the order id. The unprivileged `kbf` only relays it, as a small record, to the root
@@ -161,7 +161,7 @@ platform is **complete** for a commit when the frontend holds every component it
   already desired changes nothing and keeps the generation.
 - `platform` is the node's own, derived by the frontend from the node's `os` (`linux`, `macos`) and `arch`
   (`x86_64`, `arm64`) report entries. A node with any other pair gets no offer.
-- The offer is **level-triggered**: sent after `Welcome`, and to every connected node at every change. A node that
+- The offer (no longer sent; section 6.4) was **level-triggered**: sent after `Welcome`, and to every connected node at every change. A node that
   connects later gets the current offer too. A node whose platform is not complete gets none and is shown
   `unavailable`.
 - An offer with the generation the node already holds is a repeat (for example the platform became complete after
@@ -322,9 +322,9 @@ the disk index, never the reverse. The desired release, the slot, the per-host p
 
 ### 6.4 Sessions
 
-**As built.** The frontend sends no `UpdateOffer` over a session: the offer feed was deleted, and
-`ServerMessage.update_offer` (field 8) stays defined on the wire and is never sent. The passages
-below that describe offers are history.
+**As built.** The frontend sends no `UpdateOffer` over a session. `ServerMessage.update_offer` (field 8) stays
+defined on the wire so that the number is not reused, and a daemon ignores it. A host learns what to
+install from the `UpdateOrder` it is sent, and the desired release is read with `GET /v1/update`.
 The rollout controller (`kbf-server/src/update`) runs on the frontend with a state store, once a
 farm tick, and starts no host when an operator wrote `update/policy.auto_nodes` false or paused the
 run (a policy never written reads as `auto_nodes` true: the desired write is the click; hosts already
@@ -342,9 +342,8 @@ carry it reads false; a policy row that was never written reads as the defaults,
 `set_paused` on a never-written row stores a row without `auto_nodes`, so a new frontend reads `auto_nodes`
 off after the resume until an operator writes `true`.
 
-After `Welcome`, and to every connected node at every change of the desired release or of a platform's
-completeness, the frontend used to send an `UpdateOffer` for that node's platform (it no longer does). `UpdateStatus` is kept as the newest per
-node and ignored from a replaced stream, exactly as `NodeStatus` is.
+`UpdateStatus` is kept as the newest per node and ignored from a replaced stream, exactly as
+`NodeStatus` is.
 
 ### 6.5 Frontend self-update
 
