@@ -181,3 +181,23 @@ jobs:
       - run: rustup toolchain install
       - name: A pool lease's Metal state and the clean (root, real users)
         run: cargo xtask sudo-test -p kbf-driver-native --test slot_gpu -- --test-threads=1 --nocapture
+      # The test binary itself, for a hand run on a farm Mac that has no Rust toolchain (it
+      # still needs swiftc, root, and a Metal device). The build is the one the step above
+      # just made, so it is cached. A tar keeps the executable bit.
+      - name: Find the slot_gpu test binary and tar it
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p kbf-driver-native --test slot_gpu --no-run --locked --message-format=json > build.json
+          exe=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "slot_gpu" and .target.kind == ["test"] and .profile.test == true) | .executable' build.json)
+          test -x "$exe"
+          mkdir slot-gpu-bin
+          cp "$exe" slot-gpu-bin/slot_gpu
+          tar -C slot-gpu-bin -czf "slot_gpu-$GITHUB_SHA-darwin-arm64.tar.gz" slot_gpu
+          shasum -a 256 "slot_gpu-$GITHUB_SHA-darwin-arm64.tar.gz" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: slot-gpu-darwin-arm64
+          path: ./slot_gpu-*.tar.gz
+          retention-days: 14
+          if-no-files-found: error
