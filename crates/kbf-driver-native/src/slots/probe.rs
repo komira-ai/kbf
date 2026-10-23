@@ -74,9 +74,19 @@ pub(crate) fn plist_path(printed: &str) -> Option<&str> {
         .map(str::trim_end)
 }
 
+/// The program in what `launchctl print user/<uid>/<label>` says: its `program = ` line
+/// one level in. A job that names its program only in `arguments` has none.
+pub(crate) fn program_path(printed: &str) -> Option<&str> {
+    printed
+        .lines()
+        .find_map(|line| line.strip_prefix("\tprogram = "))
+        .map(str::trim_end)
+}
+
 /// The services `launchctl print user/<uid>` lists: `services = {`, one `<pid, 0 when
 /// not running> <last exit or -> <label>` per line, then `}`. A pid of 0 or less is
-/// `None`.
+/// `None`. The label is the rest of the line after the two columns, so a label with a
+/// space in it is whole.
 pub(crate) fn listed_services(domain: &str) -> Vec<(Option<i32>, String)> {
     domain
         .lines()
@@ -84,10 +94,11 @@ pub(crate) fn listed_services(domain: &str) -> Vec<(Option<i32>, String)> {
         .skip(1)
         .take_while(|line| line.trim() != "}")
         .filter_map(|line| {
-            let words: Vec<&str> = line.split_whitespace().collect();
-            let label = (*words.last()?).to_owned();
-            let pid = (words.first()?.parse().ok()).filter(|pid: &i32| *pid > 0);
-            Some((pid, label))
+            let (pid, rest) = line.trim_start().split_once(char::is_whitespace)?;
+            let (_, label) = rest.trim_start().split_once(char::is_whitespace)?;
+            let label = label.trim();
+            let pid = pid.parse().ok().filter(|pid: &i32| *pid > 0);
+            (!label.is_empty()).then(|| (pid, label.to_owned()))
         })
         .collect()
 }

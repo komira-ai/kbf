@@ -625,6 +625,26 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
+  # The assertion that a pool user holds nothing a lease left (crates/kbf-driver-native/
+  # tests/slot_assert.rs), in a job of its own because native-macos is close to its limit:
+  # the baseline recorded at the start, and each probe seeing the state planted for it
+  # (a process, a launchd job, a semaphore, an attached image, a file in the home, a file
+  # in /private/tmp, a cron job) and green again after the clean. One test at a time: they
+  # make users at free uids.
+  native-macos-assert:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_assert -- --test-threads=1 --nocapture
+
   # kbf-installer on a Mac as a user gets it (contract docs/design/kbf-installer.md section
   # 7): the `.pkg` built by `cargo xtask pkg build` (a stub stands in for the binary until
   # kbf-installer builds), opened by pkgutil and lsbom, installed by Installer and checked
