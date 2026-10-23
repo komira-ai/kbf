@@ -783,9 +783,9 @@ refusal at the stream's opening), and Bazel treats `UNAVAILABLE` as catastrophic
 
 - **Budget.** Each operation may run at most **3 times** in total (2 extra runs) after
   Farm or Ambiguous results. The operation keeps its place and its queue time. Leases
-  given up for silence, replacement, reconnection or not starting (`requeue.rs`) are
-  not results and do not use the budget, as today; bounding those is a separate
-  question (#22). Out-of-memory reruns have their own bound, the ladder of 6.1, and
+  given up for reconnection or a session switch (`requeue.rs`) are not results and do
+  not use the budget; not starting has its own budget, `NOT_STARTED_RERUNS`; silence
+  and replacement without proof after `Start` was sent are charged as a lost run. Out-of-memory reruns have their own bound, the ladder of 6.1, and
   do not use this budget either (decided 2026-10-10). Today the budget is built for
   three Farm results (`FARM_RERUNS`, [scheduler.md](scheduler.md#retries-of-farm-faults)):
   a busy node's memory kill, a lost run (fenced, or a whole-machine action whose result

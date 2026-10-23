@@ -467,8 +467,9 @@ turns it into one of two outcomes, and the scheduler decides on the committed re
   faults never stop the ladder short of the cap. An operation runs at most
   `1 + rungs above its first booking + 1 (the whole host) + FARM_RERUNS` times:
   `1 + 3 + FARM_RERUNS` for the default ladder. Leases given up for
-  silence, replacement without proof, reconnection or not starting count against
-  neither.
+  reconnection or a session switch count against neither; not starting has its own
+  budget, `NOT_STARTED_RERUNS`; silence and replacement without proof after `Start`
+  was sent are charged as a lost run.
 - A memory kill committed for a lease the operation no longer holds (it was given up
   and is queued again) changes nothing: no run is recorded and the booking stays.
 - Each rerun is a requeue the server logs with its reason ("passed its memory limit
