@@ -4,7 +4,7 @@ Status: design, nothing built beyond what is marked [F]. Data before visuals: th
 
 It builds on `invocations.md` and `invocations-api.md` (the per-build record and its read API) and on `architecture-v2.md` (frontend serves REAPI, scheduler and UI; a state store behind the `kbf-state` trait, SQLite and Postgres first; sharded storage). It does not redo them; it lists what the UI adds.
 
-The UI itself (pages, serving, tests, rollout) is designed in [kbf-ui-v1.md](kbf-ui-v1.md); where the two differ on serving or access, that document wins. CEO rulings of 2026-10-20 (recorded there) made the UI open: the TLS read listener, read tokens, a viewer credential and the `farm.get` and raw-Command gates described below are not part of the UI work and are marked dropped where they appear.
+The UI itself (pages, serving, tests, rollout) is designed in [kbf-ui-v1.md](kbf-ui-v1.md); where the two differ on serving or access, that document wins. Rulings of 2026-10-20 (recorded there) made the UI open: the TLS read listener, read tokens, a viewer credential and the `farm.get` and raw-Command gates described below are not part of the UI work and are marked dropped where they appear.
 
 ## Summary
 

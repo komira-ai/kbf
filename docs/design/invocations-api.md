@@ -153,7 +153,7 @@ GET /v1/invocations/{id}/failures?page_size=20
 
 ### 4.8 The client: `kbf build show`
 
-The CEO's ruling (2026-10-12): "I think we should just have show and then that returns
+The ruling (2026-10-12): "I think we should just have show and then that returns
 all the info / links to the logs, artifacts, metrics, etc." So the client is one
 command, in a new `kbf-cli` crate (one Rust binary, no interpreter or shell), so an
 agent never hand-writes HTTP:

@@ -1,6 +1,6 @@
 # kbf UI v1: design
 
-Status: approved with the CEO rulings below (amended 2026-10-21 from the proposal). Read-only web UI for operators and agents. Built marks were re-read against `main` on 2026-10-21, after every page and route merged, the Log page and the history-off page included: "built" means the code on `main`, "follow-up" means not built. The built and follow-up lists are in "Built on main" below; the operator guide is [deploy/kbf-ui.md](../deploy/kbf-ui.md). Where this document and `ui-data.md` differ on serving, access or tests, this one wins (`ui-data.md` carries the matching amendments).
+Status: approved with the rulings below (amended 2026-10-21 from the proposal). Read-only web UI for operators and agents. Built marks were re-read against `main` on 2026-10-21, after every page and route merged, the Log page and the history-off page included: "built" means the code on `main`, "follow-up" means not built. The built and follow-up lists are in "Built on main" below; the operator guide is [deploy/kbf-ui.md](../deploy/kbf-ui.md). Where this document and `ui-data.md` differ on serving, access or tests, this one wins (`ui-data.md` carries the matching amendments).
 
 ## Built on main
 
@@ -16,7 +16,7 @@ Differences from the page table in 3, as built:
 
 Follow-up, not built: the public-name SNI certificate setting; the 25 percent read-budget share and a ranged-log cap; the `ui-data.md` and `ARCHITECTURE.md` text listed under R0.
 
-## CEO rulings (2026-10-20)
+## Rulings (2026-10-20)
 
 These amend the proposal. Where an older sentence below contradicts them, the ruling wins; sentences that were dropped are marked "dropped".
 
@@ -57,7 +57,7 @@ These amend the proposal. Where an older sentence below contradicts them, the ru
 ### 1.2 Beyond the assignment
 
 - **Overview** (in scope): the one-screen answer to "is the farm healthy". It adds no data of its own, it reads `/readyz`, `/v1/health` and the build list.
-- **Targets and Target pages** (kept, re-scoped by the CEO): a target's recent runs as a pass/fail strip, to spot flakiness fast (P8). The routes are built.
+- **Targets and Target pages** (kept, re-scoped by the maintainers): a target's recent runs as a pass/fail strip, to spot flakiness fast (P8). The routes are built.
 - **`GET /v1/health`** (composed summary): without it the Overview would count nodes by state in the UI, which parity forbids.
 - Cut: the Grid page (TestGrid), the proxy-update row, `/llms.txt`.
 
@@ -288,7 +288,7 @@ Order: R4 and R5 (with R3) in either order; R-T1 after R5; routes R6 to R11 any 
 
 Independent security review before R4 and R5 merge: the check is that the new open surface reaches nothing beyond the declared GET reads.
 
-- **Open and unredacted by ruling.** Anyone who can reach the public port reads every build, log and failed-command argument, and a secret passed as `--token=...` is readable. Mitigation: the one-line note, the operator guide (D1), and the operator's network boundary. Owner: the CEO accepted this.
+- **Open and unredacted by ruling.** Anyone who can reach the public port reads every build, log and failed-command argument, and a secret passed as `--token=...` is readable. Mitigation: the one-line note, the operator guide (D1), and the operator's network boundary. Owner: the maintainers accepted this.
 - **The in-process `Source` widens a read path.** The open-policy router would be a hole if it were served on a socket or reached with a write. Mitigation: it is reachable only through `InProcess`, which sends GET. The UI also shows blobs and failures the network route refuses when `--reapi-auth-policy` names no authorizer for them.
 - **Open surface and the read budget.** One shared 1 GiB budget lets any page load starve agents. Mitigation: the per-client read limiter (R3, in #1373).
 - **Uploaded content rendered on the farm's origin.** Mitigation: the raw-route headers (R2b), built before the mount.
