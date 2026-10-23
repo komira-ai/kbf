@@ -9,7 +9,8 @@
 //! - [`ssh_installer`]: the install port over ssh to the `kbf-host-install` forced command;
 //! - [`record`]: `roll.json`, the durable record;
 //! - [`Updater`]: the state machine over all of the above. One roll at a time, the frontend
-//!   first, the first failure stops it, a restart asks the host before it installs again;
+//!   first, the first failure stops it, a restart asks the host before it installs again; a
+//!   `mac-daemon` host's install starts an apply that the roll polls until it is done;
 //! - [`fakes`]: a scripted fake of every port.
 //!
 //! And around it:
@@ -67,6 +68,8 @@ mod updater_drain_tests;
 mod updater_followup_tests;
 #[cfg(test)]
 mod updater_fresh_host_tests;
+#[cfg(test)]
+mod updater_mac_tests;
 #[cfg(test)]
 mod updater_restart_tests;
 #[cfg(test)]

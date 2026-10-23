@@ -5,7 +5,14 @@
 //! fe1       fe1.farm.example:22   frontend  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample
 //! st1       st1.farm.example      storage   ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample
 //! dm1       dm1.farm.example      daemon    ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample  dm1
+//! mac1      mac1.farm.example     mac-daemon ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample  mac1
 //! ```
+//!
+//! The roles are `frontend`, `storage`, `daemon` (a Linux host that runs only a daemon) and
+//! `mac-daemon` (a Mac that runs a daemon). A `mac-daemon` host is rolled like a `daemon`
+//! host (it needs a node id, and its node is drained and given back) except for the
+//! install: its `kbf-host-install` starts the apply and answers at once, and the roll then
+//! polls the host until the apply is done ([`Role::MacDaemon`]).
 //!
 //! Blank lines and `#` lines are skipped. A line is five words, or six: the alias, the
 //! address, the role, the key as its type and its base64, and optionally the node id the
@@ -33,8 +40,12 @@ pub enum Role {
     Frontend,
     /// A storage node, possibly with a daemon.
     Storage,
-    /// A daemon-only host.
+    /// A daemon-only Linux host.
     Daemon,
+    /// A Mac that runs a daemon. Like [`Role::Daemon`] in everything but the install: its
+    /// `install` answers `apply_started` and the apply goes on by itself, so the roll polls
+    /// the host's `query` until the apply is done (or has failed, or the bound is out).
+    MacDaemon,
 }
 
 impl Role {
@@ -43,8 +54,14 @@ impl Role {
             "frontend" => Some(Role::Frontend),
             "storage" => Some(Role::Storage),
             "daemon" => Some(Role::Daemon),
+            "mac-daemon" => Some(Role::MacDaemon),
             _ => None,
         }
+    }
+
+    /// A host whose node the frontend knows and the roll drains: a daemon of either kind.
+    pub fn is_daemon(self) -> bool {
+        matches!(self, Role::Daemon | Role::MacDaemon)
     }
 }
 
@@ -232,7 +249,7 @@ fn parse_line(line: &str) -> Result<Host, String> {
         return Err(format!("address {address:?} is not a host or host:port"));
     }
     let role = Role::parse(role)
-        .ok_or_else(|| format!("role {role:?} is not frontend, storage or daemon"))?;
+        .ok_or_else(|| format!("role {role:?} is not frontend, storage, daemon or mac-daemon"))?;
     if !KEY_TYPES.contains(&key_type) {
         return Err(format!(
             "host key type {key_type:?} is not a supported type"
@@ -330,12 +347,30 @@ mod tests {
             &format!("fe1 fe1.farm.example:2222 frontend {KEY}"),
             &format!("  dm1\tdm1.farm.example  daemon  {KEY}  dm-1  "),
             &format!("st2 st2.farm.example storage {KEY}"),
+            &format!("mac1 mac1.farm.example mac-daemon {KEY} mac-1"),
         ]))
         .expect("inventory")
     }
 
     fn aliases(plan: &[&Host]) -> Vec<String> {
         plan.iter().map(|h| h.alias.clone()).collect()
+    }
+
+    /// Catches the Mac role named wrongly or taken for a daemon: only `mac-daemon` is the Mac's
+    /// role (not `mac`, `macos` or `Mac-Daemon`), both daemon roles are the roll's daemons, and
+    /// a frontend and a storage host are not.
+    #[test]
+    fn the_mac_daemon_role_is_its_own() {
+        for word in ["mac", "macos", "Mac-Daemon", "mac_daemon", "mac-daemon2"] {
+            let e = line_error(&format!("m m.farm.example {word} {KEY} m-1"));
+            assert!(
+                e.contains("is not frontend, storage, daemon or mac-daemon"),
+                "{e}"
+            );
+        }
+        assert!(Role::MacDaemon.is_daemon() && Role::Daemon.is_daemon());
+        assert!(!Role::Storage.is_daemon() && !Role::Frontend.is_daemon());
+        assert_ne!(Role::MacDaemon, Role::Daemon);
     }
 
     /// The refusal as text: `line N: reason`.
@@ -353,6 +388,9 @@ mod tests {
         assert_eq!(fe.role, Role::Frontend);
         assert_eq!(fe.host_key, KEY);
         assert_eq!(inv.host("dm1").expect("dm1").role, Role::Daemon);
+        let mac = inv.host("mac1").expect("mac1");
+        assert_eq!(mac.role, Role::MacDaemon);
+        assert_eq!(mac.node_id.as_deref(), Some("mac-1"));
         assert_eq!(
             inv.host("dm1").expect("dm1").node_id.as_deref(),
             Some("dm-1")
@@ -381,7 +419,7 @@ mod tests {
     fn the_plan_puts_the_frontend_first_and_keeps_the_rest_in_order() {
         let inv = sample();
         let all = inv.plan(&Hosts::All(All::All)).expect("all");
-        assert_eq!(aliases(&all), ["fe1", "st1", "dm1", "st2"]);
+        assert_eq!(aliases(&all), ["fe1", "st1", "dm1", "st2", "mac1"]);
         let list = Hosts::Aliases(vec!["st2".into(), "fe1".into(), "st1".into()]);
         assert_eq!(
             aliases(&inv.plan(&list).expect("list")),

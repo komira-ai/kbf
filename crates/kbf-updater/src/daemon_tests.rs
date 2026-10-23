@@ -259,6 +259,69 @@ fn the_drain_deadline_is_an_optional_flag_of_at_least_a_second() {
     );
 }
 
+/// Catches the two bounds of a Mac's apply not being flags: both are optional, default to a
+/// 5 s poll and a 600 s deadline, take a number of seconds, and may not be zero (a poll with
+/// no interval spins; a deadline of nothing fails every apply). Each sets only itself.
+#[test]
+fn the_apply_poll_and_deadline_are_optional_flags_of_at_least_a_second() {
+    let cfg = parse(&FLAGS).expect("flags");
+    assert_eq!(
+        (cfg.apply_poll.as_secs(), cfg.apply_deadline.as_secs()),
+        (5, 600)
+    );
+    let with = [&FLAGS[..], &["--apply-poll-secs", "2"]].concat();
+    let cfg = parse(&with).expect("poll");
+    assert_eq!(
+        (cfg.apply_poll.as_secs(), cfg.apply_deadline.as_secs()),
+        (2, 600)
+    );
+    let with = [&FLAGS[..], &["--apply-deadline-secs=90"]].concat();
+    let cfg = parse(&with).expect("deadline");
+    assert_eq!(
+        (cfg.apply_poll.as_secs(), cfg.apply_deadline.as_secs()),
+        (5, 90)
+    );
+    for flag in ["--apply-poll-secs", "--apply-deadline-secs"] {
+        for bad in ["soon", "-1", "1.5", ""] {
+            let with = [&FLAGS[..], &[flag, bad]].concat();
+            assert_eq!(
+                parse(&with).expect_err(bad),
+                format!("{flag} must be a number of seconds")
+            );
+        }
+        let zero = [&FLAGS[..], &[flag, "0"]].concat();
+        assert_eq!(
+            parse(&zero).expect_err("zero"),
+            format!("{flag} must be at least 1")
+        );
+    }
+}
+
+/// Catches a flag that is parsed and never reaches the roll: the drain deadline and the apply
+/// poll and deadline are the timing's, and the rest of the timing is the default.
+#[test]
+fn the_flags_set_the_timing_of_the_roll() {
+    let with = [
+        &FLAGS[..],
+        &[
+            "--drain-deadline-secs=7",
+            "--apply-poll-secs=3",
+            "--apply-deadline-secs=11",
+        ],
+    ]
+    .concat();
+    let t = crate::daemon::timing(&parse(&with).expect("flags"));
+    assert_eq!(
+        (
+            t.drain_deadline.as_secs(),
+            t.apply_poll.as_secs(),
+            t.apply_deadline.as_secs()
+        ),
+        (7, 3, 11)
+    );
+    assert_eq!(t.poll, Timing::default().poll);
+}
+
 /// Catches the settings of the installer reaching it unchecked: a key path that is no file, a
 /// user or channel the host would not take and a zero timeout each stop the ports from being
 /// built, with the reason, and the key's contents are in no message.
@@ -362,6 +425,8 @@ fn config(name: &str, inventory: &str, api: &FakeApi) -> Config {
         ssh_connect_timeout: Duration::from_secs(5),
         ssh_command_timeout: Duration::from_secs(30),
         drain_deadline: Duration::from_secs(600),
+        apply_poll: Duration::from_secs(5),
+        apply_deadline: Duration::from_secs(600),
     }
 }
 
@@ -408,6 +473,8 @@ fn quick() -> Timing {
         healthy_storage: Duration::from_millis(300),
         healthy_daemon: Duration::from_millis(300),
         drain_deadline: Duration::from_millis(300),
+        apply_poll: Duration::from_millis(10),
+        apply_deadline: Duration::from_millis(300),
     }
 }
 
@@ -561,11 +628,11 @@ fn a_node_is_installed_over_ssh_with_the_configured_user_key_and_channel() {
     daemon.wait();
 }
 
-/// Catches a host that is not a frontend, storage or daemon being accepted: the inventory
-/// refuses the line (a Mac host, or any other role, is not rolled by this updater), so the
-/// updater does not start and no ssh runs.
+/// Catches a role that is not frontend, storage, daemon or mac-daemon being accepted: the
+/// inventory refuses the line (`mac` alone is not a role), so the updater does not start and
+/// no ssh runs.
 #[test]
-fn a_mac_host_is_refused_by_the_inventory() {
+fn an_unknown_role_is_refused_by_the_inventory() {
     let api = fake_api(vec![Some(http(200, "{}"))]);
     for role in ["mac", "macos", "homebrew"] {
         let cfg = config(
@@ -575,7 +642,8 @@ fn a_mac_host_is_refused_by_the_inventory() {
         );
         let e = start(&cfg).err().expect(role);
         assert!(
-            e.starts_with("inventory ") && e.contains("is not frontend, storage or daemon"),
+            e.starts_with("inventory ")
+                && e.contains("is not frontend, storage, daemon or mac-daemon"),
             "{e}"
         );
         assert!(!sock(&cfg).exists());

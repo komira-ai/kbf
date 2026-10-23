@@ -10,7 +10,7 @@ use kbf_testkit::dir::TestDir;
 
 use super::*;
 use crate::inventory::Role;
-use crate::ports::Installed;
+use crate::ports::{Apply, Installed};
 
 const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample";
 
@@ -480,7 +480,7 @@ fn every_install_answer_maps() {
     for out in ok {
         let r = rig();
         r.fake.says(exited(0, out));
-        assert_eq!(r.ssh.install(&host(), &version("1.2.3-1")), Ok(()), "{out}");
+        assert!(r.ssh.install(&host(), &version("1.2.3-1")).is_ok(), "{out}");
     }
     let r = rig();
     r.fake.says(exited(
@@ -597,7 +597,7 @@ fn oversize_output_is_refused() {
     // Exactly at the cap it is still parsed, and JSON allows the blanks.
     let r = rig();
     r.fake.says(exited(0, &at_cap));
-    assert_eq!(r.ssh.install(&host(), &version("1.2.3-1")), Ok(()));
+    assert!(r.ssh.install(&host(), &version("1.2.3-1")).is_ok());
     let over = padded(answer::MAX_STDOUT - INSTALLED.len() + 1);
     let r = rig();
     r.fake.says(exited(0, &over));
@@ -749,6 +749,112 @@ fn raw_stderr_never_reaches_an_error() {
             assert!(!shown.contains(w), "{shown}");
         }
     }
+}
+
+/// Catches a Mac's install answer being misread: `apply_started` for the version asked is the
+/// answer `ApplyStarted`; another version, a commit that is not hex, an apply that is not
+/// `running`, an extra field, a missing one, and the same line with a refusal's exit status
+/// are each a bad answer.
+#[test]
+fn a_mac_install_answers_apply_started() {
+    let line = |version: &str, commit: &str, apply: &str| {
+        format!(
+            "{{\"result\":\"apply_started\",\"version\":\"{version}\",\"commit\":\"{commit}\",\"apply\":\"{apply}\"}}\n"
+        )
+    };
+    let r = rig();
+    r.fake
+        .says(exited(0, &line("1.2.3-1", "0123456789ab", "running")));
+    assert_eq!(
+        r.ssh.install(&host(), &version("1.2.3-1")),
+        Ok(InstallAnswer::ApplyStarted)
+    );
+    let bad = [
+        (0, line("9.9", "0123456789ab", "running")),
+        (0, line("1.2.3-1", "not-hex", "running")),
+        (0, line("1.2.3-1", "", "running")),
+        (0, line("1.2.3-1", &"a".repeat(65), "running")),
+        (0, line("1.2.3-1", "0123456789ab", "done")),
+        (
+            0,
+            "{\"result\":\"apply_started\",\"version\":\"1.2.3-1\",\"commit\":\"ab\"}\n".to_owned(),
+        ),
+        (
+            0,
+            "{\"result\":\"apply_started\",\"version\":\"1.2.3-1\",\"commit\":\"ab\",\"apply\":\"running\",\"x\":1}\n"
+                .to_owned(),
+        ),
+        (3, line("1.2.3-1", "0123456789ab", "running")),
+    ];
+    for (code, out) in bad {
+        let r = rig();
+        r.fake.says(exited(code, &out));
+        assert_eq!(
+            r.ssh.install(&host(), &version("1.2.3-1")),
+            Err(PortError::other("bad answer")),
+            "{out}"
+        );
+    }
+}
+
+/// Catches a Mac's apply state being misread from its query: `running`, `done` and
+/// `failed:<reason>` (lower case, `_` and `:`, up to 64 bytes) are read; a line with no `apply`
+/// (a Linux host) and `null` read as none; any other text, an empty or over-long or upper-case
+/// reason, is a bad answer. The rest of the report is unchanged.
+#[test]
+fn a_mac_query_carries_the_apply_state() {
+    let q = |apply: &str| {
+        format!(
+            "{{\"result\":\"query\",\"installed_version\":\"1.2.3-1\",\"running_commit\":\"abc123\",\"node_id\":\"mac-1\",\"in_progress\":false,\"apply\":{apply}}}\n"
+        )
+    };
+    let good = [
+        ("\"running\"", Some(Apply::Running)),
+        ("\"done\"", Some(Apply::Done)),
+        (
+            "\"failed:health_timeout:rolled_back\"",
+            Some(Apply::Failed("health_timeout:rolled_back".to_owned())),
+        ),
+        ("null", None),
+    ];
+    for (text, want) in good {
+        let r = rig();
+        r.fake.says(exited(0, &q(text)));
+        let report = r.ssh.report(&host()).expect(text);
+        assert_eq!(report.apply, want, "{text}");
+        assert_eq!(report.installed, Installed::Version("1.2.3-1".into()));
+        assert_eq!(report.running_commit.as_deref(), Some("abc123"));
+    }
+    let r = rig();
+    r.fake.says(exited(
+        0,
+        "{\"result\":\"query\",\"installed_version\":\"1\",\"running_commit\":null,\"node_id\":null,\"in_progress\":false}\n",
+    ));
+    assert_eq!(r.ssh.report(&host()).expect("linux").apply, None);
+    let long = format!("\"failed:{}\"", "a".repeat(65));
+    let edge = format!("\"failed:{}\"", "a".repeat(64));
+    let bad = [
+        "\"paused\"",
+        "\"failed:\"",
+        "\"failed\"",
+        "\"failed:Upper\"",
+        "\"failed:a b\"",
+        "\"Running\"",
+        "7",
+        long.as_str(),
+    ];
+    for text in bad {
+        let r = rig();
+        r.fake.says(exited(0, &q(text)));
+        assert_eq!(
+            r.ssh.report(&host()),
+            Err(PortError::other("bad answer")),
+            "{text}"
+        );
+    }
+    let r = rig();
+    r.fake.says(exited(0, &q(&edge)));
+    assert!(r.ssh.report(&host()).is_ok());
 }
 
 /// Catches the query mapping: in progress wins, a version is the version, a null is "not

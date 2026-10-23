@@ -227,7 +227,7 @@ impl HealthCheck for NodeHealth {
     fn check(&self, host: &Host, target: &Version) -> Result<Health, PortError> {
         match host.role {
             Role::Frontend => Ok(Health::Abandoned(FRONTEND_REFUSAL.to_owned())),
-            Role::Daemon => self.daemon(host, target, false),
+            Role::Daemon | Role::MacDaemon => self.daemon(host, target, false),
             Role::Storage => self.storage(host, target),
         }
     }
@@ -235,7 +235,7 @@ impl HealthCheck for NodeHealth {
     /// As [`HealthCheck::check`], but a daemon is not asked to be serving.
     fn check_held(&self, host: &Host, target: &Version) -> Result<Health, PortError> {
         match host.role {
-            Role::Daemon => self.daemon(host, target, true),
+            Role::Daemon | Role::MacDaemon => self.daemon(host, target, true),
             Role::Frontend | Role::Storage => self.check(host, target),
         }
     }

@@ -414,6 +414,36 @@ fn a_daemon_must_run_the_targets_commit() {
     );
 }
 
+/// Catches a Mac host judged as something else than a daemon: connected and serving with the
+/// running process's commit (the host's `running_commit`) is healthy, a Mac on another commit
+/// waits with the reason, a node that is not connected waits, and a held Mac is not asked to be
+/// serving.
+#[test]
+fn a_mac_daemon_is_judged_as_a_daemon() {
+    let mac = Host {
+        role: Role::MacDaemon,
+        ..dm()
+    };
+    let serving = routes(vec![("/v1/nodes/dm-node", node(true, "serving"))]);
+    let health = adapter_running(&serving, "nh-mac-ok", Some(COMMIT));
+    assert_eq!(health.check(&mac, &target()), Ok(Health::Healthy));
+    assert_eq!(health.check_held(&mac, &target()), Ok(Health::Healthy));
+    let old = adapter_running(&serving, "nh-mac-old", Some(OTHER));
+    for got in [old.check(&mac, &target()), old.check_held(&mac, &target())] {
+        assert!(
+            waiting(&got).contains(&format!("dm runs build {OTHER}, not the target's")),
+            "{got:?}"
+        );
+    }
+    let cordoned = routes(vec![("/v1/nodes/dm-node", node(true, "cordoned"))]);
+    let health = adapter_running(&cordoned, "nh-mac-held", Some(COMMIT));
+    assert!(waiting(&health.check(&mac, &target())).contains("dm is cordoned, not serving"));
+    assert_eq!(health.check_held(&mac, &target()), Ok(Health::Healthy));
+    let down = routes(vec![("/v1/nodes/dm-node", node(false, "serving"))]);
+    let health = adapter_running(&down, "nh-mac-down", Some(COMMIT));
+    assert!(waiting(&health.check(&mac, &target())).contains("is not connected"));
+}
+
 /// Catches the node API's path built from anything but the node id the inventory lists (the
 /// alias when it lists none), and a daemon asked where it is not: the daemon is asked as
 /// `GET /v1/nodes/{node id}`.

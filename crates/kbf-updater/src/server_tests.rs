@@ -46,6 +46,8 @@ fn prepare(name: &str, proxy_uid: u32) -> Config {
         ssh_connect_timeout: std::time::Duration::from_secs(5),
         ssh_command_timeout: std::time::Duration::from_secs(30),
         drain_deadline: std::time::Duration::from_secs(600),
+        apply_poll: std::time::Duration::from_secs(5),
+        apply_deadline: std::time::Duration::from_secs(600),
     }
 }
 
