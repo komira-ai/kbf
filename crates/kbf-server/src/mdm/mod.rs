@@ -15,8 +15,8 @@
 //! node's own `Hello` with the target build (4.2 step 7), never the MDM's word.
 //!
 //! **Not wired yet:** the server's flags for the gate's address and certificates, the
-//! rollout driver's calls (enforce after drain, withdraw at startup reconciliation,
-//! 4.1), and the serial in `NodeStatus` that joins a node to its Mac. Each takes a
+//! calls that enforce a build after drain and withdraw it at startup reconciliation,
+//! and the serial in `NodeStatus` that joins a node to its Mac. Each takes a
 //! [`SharedGate`].
 
 pub mod client;

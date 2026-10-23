@@ -88,7 +88,7 @@ kbf-update.workspace = true
 # The proxy's `ChildAdmin`, run against the admin and operator ports of two managed
 # frontends (tests/frontend/managed/admin_client.rs).
 kbf-installer.workspace = true
-# The deterministic simulation kernel's seeded random stream (tests/sim_rollout.rs).
+# The deterministic simulation kernel's seeded random stream (src/machine.rs, tests/invocations_paging.rs).
 kbf-sim.workspace = true
 # The in-memory state store (src/start.rs, src/frontend, src/farm/durable and tests/), and a
 # Postgres database of its own for a test (tests/state_store_postgres.rs).

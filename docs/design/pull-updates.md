@@ -138,7 +138,7 @@ Residuals, stated plainly:
 | Release store, desired release, offers, `ReleaseService` | `kbf-server` | section 6 |
 | Update client | `kbf-update` (the node's side, unprivileged) | relays offers and orders, writes `activate`, `confirm` and `revert` order records to the spool (and refuses any wire order that names another verb), reports status, refuses an order while a lease is live. It fetches nothing and stages nothing |
 | Installer (fetch in a child, verify offline, install, flip, revert) | `kbf-installer`, a root unit on each host; `kbf-helper` is folded into it ([distribution.md](distribution.md) section 6) | verbs and the fetch child in section 7 |
-| Rollout controller | `kbf-server`, replaces the older record in `rollout.rs` | section 8 |
+| Rollout controller | `kbf-server` | section 8 |
 | Fleet view | read-only over `/v1/nodes` and `/v1/update`; the UI page is deferred | section 9 |
 
 ## 5. The wire contract (frozen)
