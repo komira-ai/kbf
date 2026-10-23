@@ -425,6 +425,17 @@ fn the_macos_plan_names_the_places_of_the_design() {
     );
     assert!(plan.owned.contains(&Path::new("/Users").join("Shared")));
     assert!(plan.owned.contains(&PathBuf::from("/private/var/folders")));
+    assert!(
+        plan.named
+            .contains(&"/private/var/db/mds/messages/{uid}".to_owned())
+    );
+    for store in ["sfanalytics", "trustd/private"] {
+        assert!(
+            plan.owned
+                .contains(&Path::new("/private/var/protected").join(store)),
+            "{store}"
+        );
+    }
 }
 
 /// Catches: an emptied folder that keeps an entry because the uid does not own it (a

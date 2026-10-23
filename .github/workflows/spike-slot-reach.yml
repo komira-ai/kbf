@@ -162,3 +162,22 @@ jobs:
       - run: rustup toolchain install
       - name: The profile canaries and the weakened profiles, on real users (root)
         run: cargo xtask sudo-test -p kbf-driver-native --test slot_canary -- --test-threads=1 --nocapture
+
+  # The GPU state of a pool lease (crates/kbf-driver-native/tests/slot_gpu.rs): a Metal run
+  # as a pool user, a second process holding its device, the files a framework import leaves
+  # outside the user's folders, then the clean, and a check that none of it is left. The same
+  # command as the native-macos job of beta.yml runs after a push to main.
+  slot-gpu:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: A pool lease's Metal state and the clean (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test slot_gpu -- --test-threads=1 --nocapture

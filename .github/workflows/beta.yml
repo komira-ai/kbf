@@ -545,6 +545,7 @@ jobs:
       # Mac cannot list afterwards; a process that ignores SIGTERM is named in the lease's
       # stderr (crates/kbf-driver-native/tests/slot_term.rs).
       - run: cargo xtask sudo-test -p kbf-driver-native --test slot_term -- --test-threads=1 --nocapture
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_gpu -- --test-threads=1 --nocapture
       # What this runner can do for the Mac legs of the isolation suites (T018, M0; a spike that
       # asserts nothing about isolation): two pool users made with dscl, the real `kbf daemon
       # --driver native --pool-users 2` as root behind a fake front, one action per question

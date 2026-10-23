@@ -48,9 +48,11 @@ pub(crate) fn unrestored(flags: u32) -> bool {
     flags & NOT_RESTORED != 0
 }
 
-/// The places the shared sweep covers: launchd's per-uid files, and every entry the uid
-/// owns in the `Shared` folder under `/Users`, `/private/tmp`, `/private/var/tmp` and
-/// `/Library/Caches`. Not all of `/private/var/folders`: the uid can write only its own
+/// The places the shared sweep covers: launchd's per-uid files, the uid's security-message
+/// folder, and every entry the uid owns in the `Shared` folder under `/Users`,
+/// `/private/tmp`, `/private/var/tmp`, `/Library/Caches` and the analytics and trust stores
+/// under `/private/var/protected` (what a GPU framework's first use leaves outside the
+/// uid's folders). Not all of `/private/var/folders`: the uid can write only its own
 /// entry there, which the contents step empties.
 pub(crate) fn shared_plan() -> SweepPlan {
     let mut plan = SweepPlan::macos();

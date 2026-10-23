@@ -66,13 +66,19 @@ impl SweepPlan {
     /// macOS's other places besides the home folder (which the helper adds from where
     /// it made it): launchd's per-uid overrides and login items, the shared user
     /// folder and the temporary folders (`/private/var/folders` holds each user's
-    /// `DARWIN_USER_TEMP_DIR` and cache folders).
+    /// `DARWIN_USER_TEMP_DIR` and cache folders), and what system daemons keep for a
+    /// uid outside its folders: the security-message folder of the uid under
+    /// `/private/var/db/mds/messages`, and the files the uid owns in the analytics and
+    /// trust stores under `/private/var/protected` (one folder per user, named by its
+    /// generated UID, made when a process of the user imports a framework that uses the
+    /// GPU). They are keyed by uid and outlive the user, so they are found by owner.
     #[must_use]
     pub fn macos() -> Self {
         Self {
             named: [
                 "/private/var/db/com.apple.xpc.launchd/disabled.{uid}.plist",
                 "/private/var/db/com.apple.xpc.launchd/loginitems.{uid}.plist",
+                "/private/var/db/mds/messages/{uid}",
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -82,6 +88,8 @@ impl SweepPlan {
                 PathBuf::from("/private/tmp"),
                 PathBuf::from("/private/var/tmp"),
                 PathBuf::from("/private/var/folders"),
+                PathBuf::from("/private/var/protected/sfanalytics"),
+                PathBuf::from("/private/var/protected/trustd/private"),
             ],
         }
     }
