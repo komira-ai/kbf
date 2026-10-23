@@ -5,14 +5,14 @@
 //! installed after host A was healthy, and that host C was never asked about at all. Unscripted
 //! answers are the happy path: safe to stop, install succeeds, healthy at once.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use crate::inventory::Host;
+use crate::inventory::{Host, Role};
 use crate::ports::{
-    Clock, Drain, Health, HealthCheck, Installed, Installer, PortError, Report, SafeToStop, Stop,
-    Verdict,
+    Apply, Clock, Drain, Health, HealthCheck, InstallAnswer, Installed, Installer, PortError,
+    Report, SafeToStop, Stop, Verdict,
 };
 use crate::version::Version;
 
@@ -95,6 +95,10 @@ impl<T: Clone> Script<T> {
 
     fn set(&self, alias: &str, first: Vec<T>, then: T) {
         lock(&self.map).insert(alias.to_owned(), (first.into(), then));
+    }
+
+    fn has(&self, alias: &str) -> bool {
+        lock(&self.map).contains_key(alias)
     }
 
     fn next(&self, alias: &str) -> T {
@@ -183,7 +187,13 @@ type Hook = Arc<dyn Fn(&Host) + Send + Sync>;
 pub struct FakeInstaller {
     log: Log,
     installed: Arc<Mutex<BTreeMap<String, Installed>>>,
-    installs: Arc<Script<Result<(), PortError>>>,
+    /// `None` answers as the host's role does: `Installed` for a Linux host, `ApplyStarted`
+    /// for a Mac.
+    installs: Arc<Script<Result<Option<InstallAnswer>, PortError>>>,
+    /// Per alias: the apply state a Mac reports on each query once an apply is going.
+    applies: Arc<Script<Option<Apply>>>,
+    /// The Macs whose apply has started: an install was answered, or a test said so.
+    applying: Arc<Mutex<BTreeSet<String>>>,
     queries: Arc<Script<Option<Result<Installed, PortError>>>>,
     /// Per alias: the node id and the running commit the host reports.
     identity: Arc<Mutex<BTreeMap<String, Identity>>>,
@@ -195,7 +205,9 @@ impl FakeInstaller {
         FakeInstaller {
             log: log.clone(),
             installed: Arc::default(),
-            installs: Arc::new(Script::new(Ok(()))),
+            installs: Arc::new(Script::new(Ok(None))),
+            applies: Arc::new(Script::new(None)),
+            applying: Arc::default(),
             queries: Arc::new(Script::new(None)),
             identity: Arc::default(),
             hook: Arc::default(),
@@ -222,7 +234,37 @@ impl FakeInstaller {
         first: Vec<Result<(), PortError>>,
         then: Result<(), PortError>,
     ) {
-        self.installs.set(alias, first, then);
+        let answer = |r: Result<(), PortError>| r.map(|()| None);
+        self.installs
+            .set(alias, first.into_iter().map(answer).collect(), answer(then));
+    }
+
+    /// As [`FakeInstaller::script_install`], with the answer each install gives.
+    pub fn script_install_answers(
+        &self,
+        alias: &str,
+        first: Vec<Result<InstallAnswer, PortError>>,
+        then: Result<InstallAnswer, PortError>,
+    ) {
+        let answer = |r: Result<InstallAnswer, PortError>| r.map(Some);
+        self.installs
+            .set(alias, first.into_iter().map(answer).collect(), answer(then));
+    }
+
+    /// The apply state a Mac host reports on each query once its apply has started: `first`
+    /// in order, then `then`. A Mac reports none before that (an install answered, or
+    /// [`FakeInstaller::begin_apply`]) and, unscripted, `done` after; a Linux host always
+    /// reports none.
+    pub fn script_apply(&self, alias: &str, first: Vec<Option<Apply>>, then: Option<Apply>) {
+        self.applies.set(alias, first, then);
+    }
+
+    /// The Mac's apply is going now, as if an install had started it before the test began.
+    pub fn begin_apply(&self, alias: &str) {
+        lock(&self.applying).insert(alias.to_owned());
+        if !self.applies.has(alias) {
+            self.applies.set(alias, Vec::new(), Some(Apply::Done));
+        }
     }
 
     /// Answers of `query` for a host: `first` in order, then what the host has installed.
@@ -250,7 +292,7 @@ impl FakeInstaller {
 }
 
 impl Installer for FakeInstaller {
-    fn install(&self, host: &Host, version: &Version) -> Result<(), PortError> {
+    fn install(&self, host: &Host, version: &Version) -> Result<InstallAnswer, PortError> {
         self.log
             .push(Event::Install(host.alias.clone(), version.to_string()));
         // Cloned out, so a hook that re-enters the installer does not deadlock on the slot.
@@ -258,11 +300,13 @@ impl Installer for FakeInstaller {
         if let Some(hook) = hook {
             hook(host);
         }
-        let result = self.installs.next(&host.alias);
-        if result.is_ok() {
-            self.set_installed(&host.alias, Installed::Version(version.to_string()));
-        }
-        result
+        let answer = self.installs.next(&host.alias)?.unwrap_or(match host.role {
+            Role::MacDaemon => InstallAnswer::ApplyStarted,
+            _ => InstallAnswer::Installed,
+        });
+        self.set_installed(&host.alias, Installed::Version(version.to_string()));
+        self.begin_apply(&host.alias);
+        Ok(answer)
     }
 
     fn report(&self, host: &Host) -> Result<Report, PortError> {
@@ -275,10 +319,17 @@ impl Installer for FakeInstaller {
             .get(&host.alias)
             .cloned()
             .unwrap_or_else(|| (Some(format!("{}-node", host.alias)), None));
+        let apply = match host.role {
+            Role::MacDaemon if lock(&self.applying).contains(&host.alias) => {
+                self.applies.next(&host.alias)
+            }
+            _ => None,
+        };
         Ok(Report {
             installed,
             running_commit,
             node_id,
+            apply,
         })
     }
 }
@@ -446,7 +497,7 @@ mod tests {
         inst.script_install("b", vec![Err(PortError("lock".into()))], Ok(()));
         assert_eq!(inst.install(&b, &v), Err(PortError("lock".into())));
         assert_eq!(inst.installed("b"), Installed::Version("0.0.0".into()));
-        assert_eq!(inst.install(&b, &v), Ok(()));
+        assert_eq!(inst.install(&b, &v), Ok(InstallAnswer::Installed));
         assert_eq!(inst.query(&b), Ok(Installed::Version("2.0".into())));
         inst.script_query("b", vec![Ok(Installed::InProgress)]);
         assert_eq!(inst.query(&b), Ok(Installed::InProgress));

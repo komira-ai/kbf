@@ -30,14 +30,21 @@
 //! - `--channel`: the package channel an install comes from;
 //! - optional `--ssh-connect-timeout-secs` (default 10) and `--ssh-command-timeout-secs`
 //!   (default 900, the time one install may take);
-//! - optional `--drain-deadline-secs` (default 600, at least 1).
+//! - optional `--drain-deadline-secs` (default 600, at least 1);
+//! - optional `--apply-poll-secs` (default 5, at least 1) and `--apply-deadline-secs` (default
+//!   600, at least 1), for `mac-daemon` hosts.
 //!
 //! A daemon host's node is drained at the frontend before its install and given back after
 //! it runs the target ([`crate::node_drain`]); `--drain-deadline-secs` (default 600) is how long
 //! its leases are waited for. The health check is real for storage and daemon hosts and refuses a frontend
 //! ([`crate::node_health`]); the roll asks it before it installs, so ssh is never run for a
-//! frontend. A Mac host is not supported: the inventory has no such role and refuses a line
-//! that names one.
+//! frontend.
+//!
+//! A `mac-daemon` host is rolled as a daemon host, except that its install only starts an
+//! apply on the Mac: the roll asks the host's `query` every `--apply-poll-secs` until the
+//! apply is `done` for the target, for at most `--apply-deadline-secs`, and then holds for the
+//! daemon's health as for any daemon host. A failed apply, or a deadline that runs out, ends
+//! the roll with the node left drained.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -68,11 +75,11 @@ pub const USAGE: &str = "usage: kbf-updater --version\n       kbf-updater --stat
 --inventory FILE --proxy-uid UID --operator-api http://IP:PORT --token-file FILE \
 --ssh-key-file FILE --ssh-user USER --channel NAME [--operator-proxy-auth-file FILE] \
 [--ssh-connect-timeout-secs N] [--ssh-command-timeout-secs N] [--drain-deadline-secs N] \
-[--socket PATH]\n\
+[--apply-poll-secs N] [--apply-deadline-secs N] [--socket PATH]\n\
 the socket comes from systemd socket activation (LISTEN_PID, LISTEN_FDS=1) or from --socket, \
 which is for tests and development\n";
 
-const FLAGS: [&str; 13] = [
+const FLAGS: [&str; 15] = [
     "--state-dir",
     "--inventory",
     "--socket",
@@ -86,6 +93,8 @@ const FLAGS: [&str; 13] = [
     "--ssh-connect-timeout-secs",
     "--ssh-command-timeout-secs",
     "--drain-deadline-secs",
+    "--apply-poll-secs",
+    "--apply-deadline-secs",
 ];
 
 /// How long ssh may take to connect, unless a flag says otherwise.
@@ -95,6 +104,10 @@ const DEFAULT_CONNECT_SECS: u64 = 10;
 const DEFAULT_COMMAND_SECS: u64 = 900;
 /// How long a daemon host's node is given to finish its leases, unless a flag says otherwise.
 const DEFAULT_DRAIN_SECS: u64 = 600;
+/// How often a Mac host is asked how its apply stands, unless a flag says otherwise.
+const DEFAULT_APPLY_POLL_SECS: u64 = 5;
+/// How long a Mac host's apply may take, unless a flag says otherwise.
+const DEFAULT_APPLY_DEADLINE_SECS: u64 = 600;
 
 /// The settings of a run.
 #[derive(Clone, Debug)]
@@ -119,12 +132,17 @@ pub struct Config {
     /// How long a daemon host's node is given to finish its leases once drained; its host is
     /// installed when that is out, leases or not.
     pub drain_deadline: Duration,
+    /// How often a `mac-daemon` host is asked how its apply stands.
+    pub apply_poll: Duration,
+    /// How long a `mac-daemon` host's apply may take to be done for the target.
+    pub apply_deadline: Duration,
 }
 
 /// The settings from the command line (without the program name) and from what the service
 /// manager passed. Each flag is given once, as `--flag value` or `--flag=value`; all but
-/// `--socket`, `--operator-proxy-auth-file` and the two ssh timeouts are required, and the socket is either
-/// `--socket` or the activated descriptor.
+/// `--socket`, `--operator-proxy-auth-file`, the two ssh timeouts, the drain deadline and the
+/// two apply bounds are required, and the socket is either `--socket` or the activated
+/// descriptor.
 pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, String> {
     let mut found: BTreeMap<&str, String> = BTreeMap::new();
     let mut rest = args.iter();
@@ -178,6 +196,14 @@ pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, S
     if drain_deadline.is_zero() {
         return Err("--drain-deadline-secs must be at least 1".to_owned());
     }
+    let apply_poll = seconds("--apply-poll-secs", DEFAULT_APPLY_POLL_SECS)?;
+    if apply_poll.is_zero() {
+        return Err("--apply-poll-secs must be at least 1".to_owned());
+    }
+    let apply_deadline = seconds("--apply-deadline-secs", DEFAULT_APPLY_DEADLINE_SECS)?;
+    if apply_deadline.is_zero() {
+        return Err("--apply-deadline-secs must be at least 1".to_owned());
+    }
     let listen = match (
         found.remove("--socket"),
         activation.passed_to(std::process::id())?,
@@ -211,6 +237,8 @@ pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, S
         ssh_connect_timeout,
         ssh_command_timeout,
         drain_deadline,
+        apply_poll,
+        apply_deadline,
     })
 }
 
@@ -319,15 +347,22 @@ pub fn build_ports_with_exec(cfg: &Config, exec: Arc<dyn Exec>) -> Result<Ports,
     })
 }
 
+/// The bounds of the roll: the defaults, and the three the flags set.
+pub fn timing(cfg: &Config) -> Timing {
+    Timing {
+        drain_deadline: cfg.drain_deadline,
+        apply_poll: cfg.apply_poll,
+        apply_deadline: cfg.apply_deadline,
+        ..Timing::default()
+    }
+}
+
 /// Start with the ports of this build.
 pub fn start(cfg: &Config) -> Result<Daemon, String> {
     start_with(
         cfg,
         build_ports(cfg)?,
-        Timing {
-            drain_deadline: cfg.drain_deadline,
-            ..Timing::default()
-        },
+        timing(cfg),
         Settings::new(cfg.proxy_uid),
         stderr_sink(),
     )

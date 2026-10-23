@@ -116,14 +116,40 @@ pub struct Report {
     pub running_commit: Option<String>,
     /// The node id from the host's kbf configuration (`node_id` of the query), if it has one.
     pub node_id: Option<String>,
+    /// How the host's last apply stands (`apply` of a Mac's query); none on a Linux host and
+    /// on a Mac that has had no apply.
+    pub apply: Option<Apply>,
+}
+
+/// How a Mac's last apply stands: the `apply` of its `query`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Apply {
+    Running,
+    Done,
+    /// `failed:<reason>`: the reason as the host spells it (lower case letters, `_` and `:`;
+    /// the tail says what became of the old release).
+    Failed(String),
+}
+
+/// What the host said to an install that it accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstallAnswer {
+    /// The package manager finished: the target is installed (a Linux host).
+    Installed,
+    /// The target was already installed and running; nothing ran.
+    AlreadyInstalled,
+    /// The release is checked and its apply is launched, and goes on by itself (a Mac): the
+    /// host's `query` says how it ends.
+    ApplyStarted,
 }
 
 /// The host-side install (the forced-command wrapper over ssh, later).
 pub trait Installer: Send + Sync {
-    /// Install `version` and return when the package manager is done. `Err` carries one line
+    /// Install `version`. A Linux host answers when the package manager is done; a Mac
+    /// answers [`InstallAnswer::ApplyStarted`] and finishes on its own. `Err` carries one line
     /// for a person: the wrapper's refusal or the failed install. An older version than the
     /// installed one is installed too: a rollback is an install.
-    fn install(&self, host: &Host, version: &Version) -> Result<(), PortError>;
+    fn install(&self, host: &Host, version: &Version) -> Result<InstallAnswer, PortError>;
     /// What the host reports, without changing anything.
     fn report(&self, host: &Host) -> Result<Report, PortError>;
     /// What is installed, without changing anything.
@@ -135,7 +161,7 @@ pub trait Installer: Send + Sync {
 /// A shared installer is an installer: the health check asks the host what it runs through
 /// the same one the roll installs with.
 impl<T: Installer + ?Sized> Installer for std::sync::Arc<T> {
-    fn install(&self, host: &Host, version: &Version) -> Result<(), PortError> {
+    fn install(&self, host: &Host, version: &Version) -> Result<InstallAnswer, PortError> {
         (**self).install(host, version)
     }
 

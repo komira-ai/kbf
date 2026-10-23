@@ -21,7 +21,9 @@
 //!   so no agent socket, no `SSH_ASKPASS`, no proxy variable.
 //!
 //! The answer is read by [`answer`]: one capped JSON line out of a closed set of shapes whose
-//! exit status must agree. An [`PortError`] holds one of a few fixed texts or a reason code,
+//! exit status must agree. An install answers `installed`, `already_installed` or, from a
+//! Mac, `apply_started` for the version asked ([`InstallAnswer`]); a Mac's `query` carries
+//! one more field, `apply` (`running`, `done` or `failed:<reason>`, or null). An [`PortError`] holds one of a few fixed texts or a reason code,
 //! never ssh's or apt's own words; stderr is only classified (exit 255, ssh's own failure,
 //! is the one kind the roll tells apart: [`PortError::is_unreachable`]) and then dropped.
 //!
@@ -47,7 +49,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub use exec::{Exec, ExecError, Exited, Spawn, SystemExec};
 
 use crate::inventory::{Host, valid_address, valid_host_key};
-use crate::ports::{Installer, PortError, Report};
+use crate::ports::{InstallAnswer, Installer, PortError, Report};
 use crate::version::Version;
 
 /// Where ssh is looked for when the caller names no other.
@@ -276,13 +278,13 @@ fn split_address(address: &str) -> (&str, Option<&str>) {
 }
 
 impl Installer for SshInstaller {
-    fn install(&self, host: &Host, version: &Version) -> Result<(), PortError> {
+    fn install(&self, host: &Host, version: &Version) -> Result<InstallAnswer, PortError> {
         if !host_accepts(version.as_str()) {
             return Err(PortError::other("refused: bad_version"));
         }
         let done = self.call(host, &self.install_command(version))?;
         let (code, stdout) = answer::checked(&done)?;
-        answer::install_answer(code, stdout)
+        answer::install_answer(code, stdout, version)
     }
 
     fn report(&self, host: &Host) -> Result<Report, PortError> {
