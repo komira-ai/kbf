@@ -1356,7 +1356,7 @@ fn get(api: SocketAddr, path: &str) -> String {
 /// `invocations.getAuthorizer` or `blobs.getAuthorizer` read by the binary but not
 /// given to its route, or a route on without its key (the empty blob, which every
 /// cache holds, is read: `200` only with both keys); blobs on with no `invocations`
-/// key; and (mutant "open does nothing") `--invocations-open` not turning both on,
+/// key; and (defect "open does nothing") `--invocations-open` not turning both on,
 /// with no policy file or with one that names `invocations` only.
 #[cfg(unix)]
 #[test]

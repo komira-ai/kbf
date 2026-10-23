@@ -58,7 +58,7 @@ fn the_installer_parses_what_kbf_prints() {
 ///
 /// Catches the two numbers drifting apart (the installer's raised, the build's not).
 ///
-/// Mutant to plant: `RELAY_NEEDED` raised to 2 (red on both assertions).
+/// Catches: `RELAY_NEEDED` raised to 2 (red on both assertions).
 #[test]
 fn the_build_declares_the_relay_its_installer_needs() {
     let parsed = Version::parse(kbf_cli::version::line().as_bytes()).expect("parses");
@@ -85,7 +85,7 @@ fn the_build_declares_the_relay_its_installer_needs() {
 /// together and that line cannot go red for it. It only catches `supported()` being changed to
 /// a number below `latest()`.
 ///
-/// Mutants planted: `kbf_installer::stage::supported()` with `protocol: 0` (red on the
+/// Catches: `kbf_installer::stage::supported()` with `protocol: 0` (red on the
 /// protocol line); with `state_schema: 0` (red on the schema line); the server's
 /// `PROTOCOL_VERSION` raised to 2 (red on the protocol line).
 #[test]

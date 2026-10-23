@@ -34,7 +34,7 @@ fn toml_file(body: &str) -> PathBuf {
 /// own with the counter at 0, so a name from the counter alone made two tests write (and
 /// `scratch` delete) the same `installer.toml`, and each read the other's or none.
 ///
-/// Mutant seen red: the thread name dropped from the directory name (the first file is gone).
+/// Catches: the thread name dropped from the directory name (the first file is gone).
 #[test]
 fn two_tests_starting_their_count_at_zero_get_their_own_files() {
     let make = |test: &str, body: &'static str| {
@@ -61,7 +61,7 @@ fn two_tests_starting_their_count_at_zero_get_their_own_files() {
 /// Catches an installer.toml read wrongly: the one key is found among keys other readers
 /// own, and every way it can be wrong is a refusal that does not quote the URL.
 ///
-/// Mutants seen red: the password check removed (`Password` never returned); the error
+/// Catches: the password check removed (`Password` never returned); the error
 /// for a bad URL formatted with the URL.
 #[test]
 fn the_database_setting_is_read_and_every_fault_is_refused_without_quoting_the_url() {
@@ -155,7 +155,7 @@ fn put(store: &PostgresStore, key: &str) {
 /// fresh database reports and creates nothing; `setup` creates the schema; a store opens
 /// on it; `setup` again changes nothing.
 ///
-/// Mutant seen red: `plan` made to call `setup` (the dry run created the schema).
+/// Catches: `plan` made to call `setup` (the dry run created the schema).
 #[test]
 fn setup_creates_the_schema_once_and_a_dry_run_creates_nothing() {
     let s = Scratch::new();
@@ -178,7 +178,7 @@ fn setup_creates_the_schema_once_and_a_dry_run_creates_nothing() {
 /// than the release) is refused and the schema stays at 2; a release that needs 1 changes
 /// nothing.
 ///
-/// Mutant seen red: the step applying the installer's newest instead of the release's
+/// Catches: the step applying the installer's newest instead of the release's
 /// (the schema moved past what the release asked for).
 #[test]
 fn the_update_step_migrates_to_what_the_release_needs_while_the_old_child_serves() {
@@ -253,7 +253,7 @@ fn setup_plan_and_the_update_step_report_an_unreachable_server() {
 /// database would be created, an older one migrated, a current one left alone, and an apply
 /// says what the schema runner did (the lines need no server, so they are tested here).
 ///
-/// Mutants to plant: the `v < newest` guard flipped (a behind schema says nothing to do).
+/// Catches: the `v < newest` guard flipped (a behind schema says nothing to do).
 #[test]
 fn the_database_step_lines_say_create_migrate_or_nothing() {
     assert_eq!(
@@ -304,7 +304,7 @@ impl SchemaOps for FakeSchema {
 /// nothing to do, and a runner's error is the failure. The fake answers an error to
 /// the question the step must not ask, so asking it fails the test.
 ///
-/// Mutants to plant: `apply` flipped; the error mapped to an empty line.
+/// Catches: `apply` flipped; the error mapped to an empty line.
 #[test]
 fn the_database_step_prints_what_the_schema_runner_answered() {
     let outcome = Outcome {
@@ -347,7 +347,7 @@ fn the_database_step_prints_what_the_schema_runner_answered() {
 /// not exist (so no server is needed), both the plan and the setup reach the database and
 /// answer with its own reason, never the URL.
 ///
-/// Mutants to plant: `Database::plan` or `Database::setup` swapped in `impl SchemaOps`.
+/// Catches: `Database::plan` or `Database::setup` swapped in `impl SchemaOps`.
 #[test]
 fn the_real_database_answers_the_schema_ops_with_its_own_error() {
     let url = "postgres:///kbf?host=/nonexistent-kbf-test-socket";
@@ -370,7 +370,7 @@ fn the_real_database_answers_the_schema_ops_with_its_own_error() {
 /// `reach` is `NoServer`; and a statement the server refused (its message quotes the role and
 /// the database) is printed without them, while every error about versions is kept whole.
 ///
-/// Mutants to plant: `reach` made to return `Ok`; the `Database` arm of `redacted` removed.
+/// Catches: `reach` made to return `Ok`; the `Database` arm of `redacted` removed.
 #[test]
 fn the_real_database_reaches_or_says_why_and_redacts_the_servers_words() {
     let url = "postgres:///kbf?host=/nonexistent-kbf-test-socket&user=kbf";
@@ -538,7 +538,7 @@ mod provisioned {
     /// empty; the role then logs in to its database, and `setup`'s schema step creates the
     /// schema there and again changes nothing.
     ///
-    /// Mutants seen red: the role made `SUPERUSER`; `OWNER` dropped from the database; the
+    /// Catches: the role made `SUPERUSER`; `OWNER` dropped from the database; the
     /// role-exists test inverted (the second plan makes the role again).
     #[test]
     fn fresh_create_then_rerun_changes_nothing_and_the_schema_follows() {
@@ -570,7 +570,7 @@ mod provisioned {
     /// answer; the text of each names neither. (Moved here from the state crate, whose
     /// coverage the real-server lines would lower.)
     ///
-    /// Mutants seen red: the class-28 operand dropped; `3D000` mapped to a login refusal.
+    /// Catches: the class-28 operand dropped; `3D000` mapped to a login refusal.
     #[test]
     fn a_missing_role_is_a_login_refusal_and_a_missing_database_is_told_apart() {
         let _one = ONE_AT_A_TIME
@@ -596,7 +596,7 @@ mod provisioned {
     /// superuser role are each refused, a database another role owns is refused, and in each
     /// case nothing is created and the refusal names neither the role nor the database.
     ///
-    /// Mutants seen red: the superuser check removed; the owner check removed; the login
+    /// Catches: the superuser check removed; the owner check removed; the login
     /// check removed; one of the four privilege columns dropped from the question.
     #[test]
     fn a_role_that_is_not_plain_or_a_database_owned_by_another_is_refused_and_left_alone() {

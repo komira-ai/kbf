@@ -12,7 +12,7 @@
 //! - a property list that is not gated on the macOS configuration directory of the layout, or
 //!   that restarts a launchd label `setup` does not bootstrap.
 //!
-//! `MUTANTS` plants one defect per rule in a copy of the real file; each must be reported.
+//! `DEFECTS` plants one defect per rule in a copy of the real file; each must be reported.
 
 use std::path::{Path, PathBuf};
 
@@ -191,7 +191,7 @@ fn the_runtime_units_exec_the_packaged_kbf() {
 }
 
 /// `(file, from, to, rule)`: one defect per rule, planted in a copy of the real file.
-const MUTANTS: &[(&str, &str, &str, &str)] = &[
+const DEFECTS: &[(&str, &str, &str, &str)] = &[
     (
         "kbf-installer.service",
         "ExecStart=/usr/bin/kbf-installer run",
@@ -250,7 +250,7 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
 
 #[test]
 fn each_planted_defect_is_reported() {
-    for (file, from, to, rule) in MUTANTS {
+    for (file, from, to, rule) in DEFECTS {
         let (is_plist, path) = if *file == PLIST {
             (true, packaging().join("macos").join(file))
         } else {
@@ -258,19 +258,19 @@ fn each_planted_defect_is_reported() {
         };
         let text = read(&path);
         assert!(text.contains(from), "{file}: `{from}` is not in the file");
-        let mutant = text.replacen(from, to, 1);
+        let broken = text.replacen(from, to, 1);
         let found = match (is_plist, *rule) {
-            (true, _) => plist_problems(&mutant),
-            (false, "exec") => exec_problems(file, &mutant),
-            (false, _) => unit_problems(file, &mutant).1,
+            (true, _) => plist_problems(&broken),
+            (false, "exec") => exec_problems(file, &broken),
+            (false, _) => unit_problems(file, &broken).1,
         };
         assert!(
             found.iter().any(|f| f.contains(&format!("{rule}: "))),
             "{file}: `{from}` -> `{to}` was not reported by {rule}: {found:?}"
         );
     }
-    // Every rule has a mutant.
+    // Every rule has a defect.
     for rule in ["verb", "exec", "label", "gate"] {
-        assert!(MUTANTS.iter().any(|m| m.3 == rule), "{rule}");
+        assert!(DEFECTS.iter().any(|m| m.3 == rule), "{rule}");
     }
 }

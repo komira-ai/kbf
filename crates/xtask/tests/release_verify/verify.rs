@@ -34,7 +34,7 @@ fn the_record_verdict_write_writes_verifies_and_prints_the_set_hash() {
 
 #[test]
 fn a_tag_with_an_empty_message_verifies() {
-    // Catches: verify gating on a record being there (mutant: refuse an empty message).
+    // Catches: verify gating on a record being there (defect: refuse an empty message).
     let fx = fx("empty");
     let object = format!("object {RELEASE}\ntype commit\ntag {TAG}\ntagger T <t@e.x> 0 +0000\n\n");
     let sha = git(&fx.repo(), &["mktag"], Some(&object));
@@ -51,7 +51,7 @@ fn a_tag_whose_message_is_prose_verifies() {
 
 #[test]
 fn a_lightweight_tag_is_refused() {
-    // Catches (mutant: accept `Tag::Lightweight` again): a ref straight at the right commit
+    // Catches (defect: accept `Tag::Lightweight` again): a ref straight at the right commit
     // verifying. The release tag is annotated; the fixture is a real lightweight tag, and
     // git says its object is a commit.
     let fx = fx("lightweight");
@@ -67,7 +67,7 @@ fn a_lightweight_tag_is_refused() {
 
 #[test]
 fn a_record_that_says_failed_or_names_something_else_does_not_block_verify() {
-    // Catches (mutant: re-add a verdict judgment in `verify`): any record content gating
+    // Catches (defect: re-add a verdict judgment in `verify`): any record content gating
     // the release. Each record would have failed the retired verdict check: red, extended
     // or running; another stage; another commit, set or tag; none of them is read.
     for status in [Status::Red, Status::Extended, Status::Running] {

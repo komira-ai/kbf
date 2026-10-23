@@ -290,7 +290,7 @@ fn wrong_audience() -> String {
 /// it, and an older commit offered after a newer one outranks both; a commit the store does
 /// not hold is the server's own 409. Operator and token calls are interleaved on one row.
 ///
-/// Mutants planted: the audience check skipped in `kbf_oidc` (the wrong-audience call in the
+/// Catches: the audience check skipped in `kbf_oidc` (the wrong-audience call in the
 /// next test changed the row); the OIDC token forwarded to the server instead of the
 /// operator's (401 from the server's gate, here a red 401 on the first offer).
 #[tokio::test]
