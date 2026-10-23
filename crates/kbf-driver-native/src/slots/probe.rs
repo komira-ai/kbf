@@ -125,7 +125,6 @@ pub(crate) fn kill_until_quiet(
     pause: &mut dyn FnMut(),
 ) -> Result<(), String> {
     let mut quiet = 0;
-    let mut extra = false;
     let mut left = Vec::new();
     for _ in 0..MAX_SCANS {
         kill()?;
@@ -138,7 +137,8 @@ pub(crate) fn kill_until_quiet(
         } else {
             quiet = 0;
         }
-        if expired() && (quiet != 1 || std::mem::replace(&mut extra, true)) {
+        // After the one more scan the count is 2 (returned) or 0, so this allows only one.
+        if expired() && quiet != 1 {
             break;
         }
         pause();
