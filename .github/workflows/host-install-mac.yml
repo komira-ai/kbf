@@ -53,3 +53,21 @@ jobs:
           name: host-install-mac-raw-output
           path: target/real-mac
           if-no-files-found: error
+
+  fetch-probe:
+    runs-on: macos-15
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - run: |
+          set +e
+          gh --version
+          H="$RUNNER_TEMP/probe-home"; mkdir -p "$H"
+          run() { echo "--- $*"; env -i HOME="$H" GH_CONFIG_DIR="$H" PATH=/usr/bin:/bin:/opt/homebrew/bin GH_NO_UPDATE_NOTIFIER=1 "$@" 2>&1 | head -c 600; echo "exit=${PIPESTATUS[0]}"; }
+          run gh api 'repos/komira-ai/kbf/releases?per_page=2'
+          run gh api 'repos/cli/cli/releases?per_page=1' --jq '.[0].tag_name'
+          mkdir -p "$H/dl"
+          run gh release download v2.50.0 -R cli/cli --pattern '*checksums.txt' --dir "$H/dl"
+          ls -l "$H/dl"
+        shell: bash
