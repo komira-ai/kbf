@@ -38,6 +38,8 @@ use tonic::{Code, Status};
 mod ack_reasons;
 #[path = "state_store/budgets.rs"]
 mod budgets;
+#[path = "state_store/conditional.rs"]
+mod conditional;
 #[path = "state_store/fate.rs"]
 mod fate;
 #[path = "state_store/floors.rs"]
@@ -970,9 +972,12 @@ async fn the_third_lost_lease_answers_the_caller_with_the_reason() {
     assert!(status.message.contains("lost"), "{}", status.message);
 }
 
-/// Catches: a lease given up for silence that stays in the store as held (a restart
-/// would re-bind a run nobody holds), and a refused operation that stays in it (it
-/// would be refused again, or run).
+/// Asserts that a lease given up for silence and a refusal are removed from the store: no
+/// lease is left as held (a restart would re-bind a run nobody holds), and no refused
+/// operation is left (it would be refused again, or run). The silent daemon's session row
+/// has expired by the time the operation is refused (the fake's clock stands still, so
+/// the test deletes it): a session row that is there is a daemon that could run the
+/// operation.
 #[tokio::test(start_paused = true)]
 async fn a_given_up_lease_and_a_refusal_are_written() {
     let disk = Disk::new();
@@ -989,6 +994,8 @@ async fn a_given_up_lease_and_a_refusal_are_written() {
         "the lease was kept"
     );
 
+    let expired = Txn::new().delete("session/node-a", kbf_state::Cond::Any);
+    disk.store.txn(expired).expect("store").expect("delete");
     tokio::time::advance(kbf_sched::UNSERVABLE_WAIT + Duration::from_secs(1)).await;
     farm.tick().await;
     assert_eq!(disk.rows("op/"), 0, "the refused operation was kept");
@@ -1025,6 +1032,13 @@ async fn a_store_with_an_unreadable_row_refuses_the_farm() {
     assert!(matches!(refused, StateError::Corrupt { .. }), "{refused:?}");
 }
 
+use conditional::{
+    a_daemon_of_another_frontend_holds_back_the_refusal,
+    a_refusal_loses_to_a_grant_made_by_another_frontend,
+    a_result_reaching_two_frontends_is_acknowledged_once,
+    a_second_give_up_queues_nothing_beside_the_new_lease,
+    daemon_sessions_that_cannot_be_read_hold_back_a_refusal,
+};
 use shared::{
     a_second_frontend_started_over_the_store_keeps_its_epoch,
     frontends_opening_an_empty_store_together_keep_one_epoch,
@@ -1065,6 +1079,11 @@ restarts!(
     a_second_frontend_started_over_the_store_keeps_its_epoch,
     the_operator_bump_raises_the_epoch_once,
     frontends_opening_an_empty_store_together_keep_one_epoch,
+    a_second_give_up_queues_nothing_beside_the_new_lease,
+    a_result_reaching_two_frontends_is_acknowledged_once,
+    a_daemon_of_another_frontend_holds_back_the_refusal,
+    a_refusal_loses_to_a_grant_made_by_another_frontend,
+    daemon_sessions_that_cannot_be_read_hold_back_a_refusal,
     lost_leases_are_counted_across_a_restart_and_the_third_is_refused,
     a_crash_at_any_write_of_a_finish_leaves_the_operation_or_its_result,
     a_crash_at_any_write_of_a_refusal_leaves_the_operation_or_its_refusal
@@ -1880,10 +1899,10 @@ async fn a_grant_waits_behind_a_held_answer_and_a_given_up_lease_is_not_written(
     assert!(disk.store.get(&key).expect("read").is_some(), "{key}");
 }
 
-/// Catches: a "row is gone" read as already applied for an effect that was never tried
-/// (the retry flag shared by the whole queue): the held `Start` that was refused is
-/// purged when its lease is given up, and the answer behind it, whose rows really are
-/// gone, was never written; it must be dropped, not delivered.
+/// Asserts that a stale write is dropped and not delivered. The old bug read a "row is gone"
+/// as already applied for an effect that was never tried: the held `Start` that was
+/// refused is purged when its lease is given up, and the answer behind it, whose rows
+/// really are gone, was never written; it must be dropped, not delivered.
 #[tokio::test(start_paused = true)]
 async fn a_stale_refusal_of_a_never_tried_effect_drops_it() {
     let disk = Disk::new();

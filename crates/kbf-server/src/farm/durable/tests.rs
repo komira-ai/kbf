@@ -14,7 +14,8 @@ use kbf_state::{
 };
 use kbf_types::{
     ActionKey, Answer, Digest, DigestFunction, Failure, FarmFault, FarmRun, FencePolicy, LeaseKind,
-    LostWhy, MemoryKill, MemoryRun, Outcome, Qos, Refusal, RefusalRecord, Resources, Waiting,
+    LostWhy, MemoryKill, MemoryRun, Outcome, Qos, Refusal, RefusalRecord, Resources, StartLease,
+    Waiting,
 };
 
 use super::*;

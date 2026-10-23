@@ -297,10 +297,6 @@ struct State {
     /// the operation: a copy of its `Result` is a duplicate, not an unknown lease
     /// ([`State::standing`]).
     answered: BTreeMap<LeaseId, OperationId>,
-    /// The held effect whose last try was refused as unreachable: a "row is gone" for
-    /// this effect and no other may be its own applied work
-    /// ([`State::release_unwritten`]).
-    retrying: Option<Effect>,
     /// Writes given up on for good: dropped as stale or fenced, or over the cap ([`Farm::dropped_writes`]).
     write_drops: u64,
     /// The most committed records `unwritten` holds before a new one is dropped.
@@ -416,7 +412,6 @@ impl Farm {
                 owed: BTreeMap::new(),
                 answered: BTreeMap::new(),
                 parked: BTreeMap::new(),
-                retrying: None,
                 write_drops: 0,
                 held_cap: HELD_CAP,
                 store_down: false,
@@ -1293,6 +1288,12 @@ impl State {
         while let Some(effect) = effects.pop_front() {
             match effect {
                 Effect::Commit(record) => {
+                    // A refusal for want of a daemon waits on if another frontend's could
+                    // run the operation: it is not committed, and is proposed again after
+                    // another unservable wait.
+                    if self.held_for_other_frontends(&record) {
+                        continue;
+                    }
                     if let ControlRecord::Lease(grant) = &record {
                         self.offer(grant);
                     }
