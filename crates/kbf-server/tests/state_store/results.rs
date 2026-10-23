@@ -125,8 +125,8 @@ pub(super) async fn a_name_in_the_new_form_is_answered_by_every_frontend_at_ever
 
 /// Asserts that a name in the old form, `operations/{term}-{waiter}`, is still answered by the
 /// frontend that issued it, for the caller that frontend holds, with the instance and action
-/// of its operation, and that a name of that form which no caller of the frontend has is not
-/// found.
+/// of its operation and the stage that caller shows, and that a name of that form which no
+/// caller of the frontend has is not found.
 pub(super) async fn an_old_form_name_is_answered_by_the_issuing_frontend(backing: Backing) {
     let disk = Disk::over(backing);
     let farm = disk.farm(EpochPolicy::Keep);
@@ -142,7 +142,13 @@ pub(super) async fn an_old_form_name_is_answered_by_the_issuing_frontend(backing
     assert_eq!(waited.name, old);
     assert_eq!(waited.instance, "main");
     assert_eq!(waited.action, request(1).key.action);
-    assert_eq!(shown(&waited), Stage::Queued);
+    // No worker is connected, so the caller is told why it waits; the old name shows the
+    // stage of that caller, not one of its own.
+    assert_eq!(
+        shown(&waited),
+        Stage::Waiting("no worker is connected".to_owned())
+    );
+    assert_eq!(shown(&waited), shown(&submitted));
     assert!(farm.wait(&format!("operations/{epoch}-9")).is_none());
 }
 

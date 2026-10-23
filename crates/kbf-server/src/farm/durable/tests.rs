@@ -869,7 +869,12 @@ fn a_result_row_is_kept_for_the_longer_of_the_retention_and_the_floor() {
     clock.advance(seconds(2));
     assert_eq!(durable.ended(short).expect("read"), None, "past the floor");
     assert_eq!(durable.ended(long).expect("read"), Some(finished.clone()));
-    assert_eq!(store.reap_expired().expect("reap"), 1, "only the short row");
+    // The short operation's `done/` row and its `doneof/` row, which has the same life.
+    assert_eq!(
+        store.reap_expired().expect("reap"),
+        2,
+        "only the short operation's rows"
+    );
     clock.advance(seconds(3600));
     assert_eq!(
         durable.ended(long).expect("read"),
