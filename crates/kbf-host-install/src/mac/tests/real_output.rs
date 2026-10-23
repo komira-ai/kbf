@@ -47,10 +47,10 @@ fn a_nested_block_is_never_read_as_the_services_own_field() {
     assert!(!tools::print_running(text) && !tools::print_finished(text));
     assert_eq!(tools::print_pid(text), None);
 
-    let planted = "\t\t\tstate = running\n\t\t\tpid = 99\n\t\t\tlast exit code = 7\n\t\t\tlast terminating signal = Killed: 9\n";
+    let nested_fields = "\t\t\tstate = running\n\t\t\tpid = 99\n\t\t\tlast exit code = 7\n\t\t\tlast terminating signal = Killed: 9\n";
     let nested = text.replace(
         "\t\t\twatching = 1\n",
-        &format!("\t\t\twatching = 1\n{planted}"),
+        &format!("\t\t\twatching = 1\n{nested_fields}"),
     );
     assert_ne!(nested, text);
     assert!(!tools::print_running(&nested));
