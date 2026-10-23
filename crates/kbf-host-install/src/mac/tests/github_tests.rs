@@ -11,7 +11,7 @@ use super::fx::{
     Fx, INSTALL, NEW, NEW_VERSION, OLD, OLD_VERSION, Sim, binary, mkdir, mode, tarball, write,
 };
 use crate::mac::channel::{MacAllowlist, MacChannel, Source};
-use crate::mac::fetch::{MAX_PAGE_BYTES, MAX_PAGES, PER_PAGE};
+use crate::mac::fetch::{FetchError, MAX_PAGE_BYTES, MAX_PAGES, PER_PAGE, page_body};
 use crate::mac::release::{bundle_name, tarball_name};
 use crate::mac::stage::{Staged, stage};
 use crate::outcome::{FailureCode, Outcome, Refusal};
@@ -100,7 +100,7 @@ fn run(fx: &Fx, sim: &Sim, channel: &MacChannel, version: &str) -> Result<Staged
 
 fn refusal(result: Result<Staged, Outcome>) -> Refusal {
     match result {
-        Err(Outcome::Refused(r)) => r,
+        Err(Outcome::Refused(r) | Outcome::RefusedBecause(r, _)) => r,
         other => panic!("not a refusal: {other:?}"),
     }
 }
@@ -748,8 +748,8 @@ fn a_writable_curl_is_refused_only_for_a_github_channel() {
 // ---- the listing with curl ----
 
 /// With no token the listing is the system `curl`, as `nobody`: the arguments are exactly
-/// these (`-q` first so no configuration file is read, HTTPS only, no redirect, HTTP errors
-/// fail, a time and a size limit, the fixed URL last), the command carries no environment of
+/// these (`-q` first so no configuration file is read, HTTPS only, no redirect, the status
+/// and headers printed with the body, a time and a size limit, the fixed URL last), the command carries no environment of
 /// its own (the runner adds only its fixed `PATH`, `LANG` and `DEBIAN_FRONTEND`), nothing is
 /// on its standard input, and nothing like a token is anywhere in the call.
 #[test]
@@ -768,7 +768,7 @@ fn the_listing_runs_curl_as_nobody_with_no_token_and_fixed_flags() {
                 "-q",
                 "--silent",
                 "--show-error",
-                "--fail",
+                "--include",
                 "--proto",
                 "=https",
                 "--tlsv1.2",
@@ -812,12 +812,32 @@ fn the_listing_runs_curl_as_nobody_with_no_token_and_fixed_flags() {
     );
 }
 
-/// An HTTP error and an exhausted rate limit (curl exits 22 for both) are `fetch_failed`
-/// through the whole verb: exit status 2, nothing downloaded, nothing staged, no change to
-/// the kit, the status or launchd.
+/// Every answer of GitHub that is not a listing is `fetch_failed` through the whole verb:
+/// exit status 2, nothing downloaded, nothing staged, no change to the kit, the status or
+/// launchd; the audit line has the closed reason, and stderr says why. An exhausted rate
+/// limit says when to retry and that a `token_file` raises the limit, whether the API shows it
+/// by `x-ratelimit-remaining: 0`, by `retry-after` or by its message alone; a 403 that is
+/// not a limit is an HTTP error like a 500.
 #[test]
 fn an_http_error_or_a_rate_limit_is_a_failed_fetch_and_stages_nothing() {
-    for broken in ["list-http", "list-rate"] {
+    let cases = [
+        ("list-http", "GitHub answered HTTP 500: Server Error"),
+        (
+            "list-rate",
+            "rate limited by GitHub, retry after 2026-09-21T14:13:20Z or set token_file",
+        ),
+        (
+            "list-rate-wait",
+            "rate limited by GitHub, retry after 60 seconds or set token_file",
+        ),
+        (
+            "list-rate-message",
+            "rate limited by GitHub, retry after a while or set token_file",
+        ),
+        ("list-forbidden", "GitHub answered HTTP 403: Forbidden"),
+        ("list-nohttp", "the answer is not an HTTP response"),
+    ];
+    for (broken, why) in cases {
         let fx = Fx::new("mac-gh-http");
         write_channel(&fx, "source = \"github\"\n");
         let sim = github(&fx);
@@ -829,11 +849,94 @@ fn an_http_error_or_a_rate_limit_is_a_failed_fetch_and_stages_nothing() {
             serde_json::json!({"result":"refused","reason":"fetch_failed"}),
             "{broken}"
         );
+        assert_eq!(answer.err.trim(), why, "{broken}");
+        assert_eq!(fx.audit_lines()[0]["reason"], "fetch_failed", "{broken}");
         assert_eq!(curl_calls(&fx, &sim).len(), 1, "{broken}");
         assert!(gh_calls(&fx, &sim, "release").is_empty(), "{broken}");
         assert_untouched(&fx);
         assert_eq!(sim.count("/bin/launchctl bootstrap"), 0);
     }
+}
+
+/// The pure reading of what `curl --include` printed: the body of a 200 (after interim
+/// answers, with header names in any case), and the reason for everything else.
+#[test]
+fn a_listing_response_is_split_into_status_headers_and_body() {
+    let ok = |raw: &str| page_body(raw.as_bytes()).map(<[u8]>::to_vec);
+    assert_eq!(ok("HTTP/2 200 \r\nA: b\r\n\r\n[]"), Ok(b"[]".to_vec()));
+    assert_eq!(ok("HTTP/1.1 200 OK\r\n\r\n[1]"), Ok(b"[1]".to_vec()));
+    assert_eq!(
+        ok("HTTP/1.1 100 Continue\r\n\r\nHTTP/2 200\r\nno colon here\r\n\r\n[]"),
+        Ok(b"[]".to_vec())
+    );
+    for bad in [
+        "",
+        "[]",
+        "HTTP/2 200\r\nno end of the headers",
+        "HTTP/2\r\n\r\n[]",
+        "HTTP/2 two\r\n\r\n[]",
+        "FTP/2 200\r\n\r\n[]",
+        "HTTP/1.1 100 Continue\r\n\r\nnothing after",
+    ] {
+        assert_eq!(
+            ok(bad),
+            Err(FetchError::Failed(
+                "the answer is not an HTTP response".into()
+            )),
+            "{bad:?}"
+        );
+    }
+    // Headers are read in any case, with and without a space after the colon.
+    assert_eq!(
+        ok("HTTP/2 403\r\nX-RateLimit-Remaining:0\r\nX-RateLimit-Reset: 0\r\n\r\n{}"),
+        Err(FetchError::RateLimited(
+            "rate limited by GitHub, retry after 1970-01-01T00:00:00Z or set token_file".into()
+        ))
+    );
+    // A reset that is no time is not used; a 403 with quota left is no limit.
+    assert_eq!(
+        ok("HTTP/2 429\r\nx-ratelimit-reset: soon\r\nretry-after: soon\r\n\r\n{}"),
+        Err(FetchError::RateLimited(
+            "rate limited by GitHub, retry after a while or set token_file".into()
+        ))
+    );
+    assert_eq!(
+        ok("HTTP/2 403\r\nx-ratelimit-remaining: 5\r\n\r\nnot json"),
+        Err(FetchError::Failed("GitHub answered HTTP 403".into()))
+    );
+    // Only 403 and 429 are limits; a message of any other status does not make one.
+    assert_eq!(
+        ok("HTTP/2 500\r\nx-ratelimit-remaining: 0\r\n\r\n{\"message\":\"API rate limit\"}"),
+        Err(FetchError::Failed(
+            "GitHub answered HTTP 500: API rate limit".into()
+        ))
+    );
+    // The message is cut.
+    let long = format!("HTTP/2 502\r\n\r\n{{\"message\":\"{}\"}}", "m".repeat(500));
+    assert_eq!(
+        ok(&long),
+        Err(FetchError::Failed(format!(
+            "GitHub answered HTTP 502: {}",
+            "m".repeat(200)
+        )))
+    );
+    // Output past the page limit is refused before it is read.
+    let big = vec![b'x'; MAX_PAGE_BYTES + 1];
+    assert_eq!(
+        page_body(&big),
+        Err(FetchError::Failed(
+            "a page of the listing is too large".into()
+        ))
+    );
+}
+
+/// An interim `100 Continue` before the page does not hide it.
+#[test]
+fn an_interim_response_before_the_listing_is_skipped() {
+    let fx = Fx::new("mac-gh-interim");
+    let sim = github(&fx);
+    sim.break_("list-interim");
+    run(&fx, &sim, &channel(&fx, false), NEW_VERSION).unwrap();
 }
 
 // ---- the token ----

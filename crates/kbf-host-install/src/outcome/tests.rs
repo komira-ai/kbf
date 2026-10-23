@@ -189,6 +189,19 @@ fn audit_fields() {
 #[test]
 fn stderr_detail_is_cleaned_and_bounded() {
     assert_eq!(Outcome::Refused(Refusal::BadCommand).stderr_detail(), None);
+    // A refusal with its reason: the same line, status and audit fields as without, and the
+    // reason (cleaned) on stderr.
+    let why = Outcome::RefusedBecause(Refusal::FetchFailed, "slow\x1b down".into());
+    assert_eq!(why.stderr_detail().as_deref(), Some("slow? down"));
+    assert_eq!(why.exit_code(), 2);
+    assert_eq!(
+        why.json_line(),
+        Outcome::Refused(Refusal::FetchFailed).json_line()
+    );
+    assert_eq!(
+        why.audit_fields(),
+        Outcome::Refused(Refusal::FetchFailed).audit_fields()
+    );
     assert_eq!(
         Outcome::Installed {
             version: "1".into()

@@ -6,7 +6,8 @@
 //! 1. The releases are listed with the system `curl` from the public REST endpoint
 //!    `https://api.github.com/repos/<repo>/releases`, a page of 100 at a time until a page
 //!    is empty, at most [`MAX_PAGES`] pages. No token is needed (the API allows 60 requests
-//!    an hour per address without one). Never only the latest: a rollback
+//!    an hour per address without one; a runner or a NAT shared with others can have used
+//!    them up, which is [`FetchError::RateLimited`]). Never only the latest: a rollback
 //!    names an old release. Every page is read, because two commits that start with the
 //!    version's 12 hex digits are an ambiguous release and only the whole listing shows it.
 //! 2. A release asset named `kbf-<40 hex>-darwin-arm64.tar.gz` whose commit starts with the
@@ -29,6 +30,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde::Deserialize;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use super::release::{self, REPO};
 use crate::runner::{Cmd, Identity, Runner, WriteCap};
@@ -51,6 +54,9 @@ pub enum FetchError {
     Ambiguous,
     /// The listing or the download did not work, and why.
     Failed(String),
+    /// GitHub refused the listing for its rate limit; the text says when to retry and
+    /// that a `token_file` raises the limit.
+    RateLimited(String),
 }
 
 fn failed<T>(why: impl Into<String>) -> Result<T, FetchError> {
@@ -133,8 +139,9 @@ impl Fetcher<'_> {
     }
 
     /// `curl` for page `page` of the repository's releases: no configuration file (`-q`),
-    /// HTTPS only, no redirect, a time limit and a size limit, errors of HTTP failing the
-    /// command. The command carries no environment of its own (the runner adds only its fixed
+    /// HTTPS only, no redirect, a time limit and a size limit, the status line and headers
+    /// printed before the body (`--include`; an HTTP error does not fail the command, so
+    /// that [`page_body`] can tell a rate limit from other errors). The command carries no environment of its own (the runner adds only its fixed
     /// `PATH`, `LANG` and `DEBIAN_FRONTEND`). The token, if any, is the only thing on its
     /// standard input.
     pub fn list_cmd(&self, page: u32) -> Cmd {
@@ -142,7 +149,7 @@ impl Fetcher<'_> {
             "-q",
             "--silent",
             "--show-error",
-            "--fail",
+            "--include",
             "--proto",
             "=https",
             "--tlsv1.2",
@@ -267,11 +274,119 @@ impl Fetcher<'_> {
                 exec.stderr_text()
             ));
         }
-        if exec.stdout.len() > MAX_PAGE_BYTES {
-            return failed("a page of the listing is too large");
-        }
-        serde_json::from_slice(&exec.stdout)
+        serde_json::from_slice(page_body(&exec.stdout)?)
             .or_else(|_| failed("the answer is not a listing of releases"))
+    }
+}
+
+/// The most characters of GitHub's `message` that go into a reason.
+const MESSAGE_MAX: usize = 200;
+
+/// A response as `curl --include` prints it: the status, the headers (names in lower case)
+/// and the body.
+struct Response<'a> {
+    status: u16,
+    headers: Vec<(String, &'a str)>,
+    body: &'a [u8],
+}
+
+impl Response<'_> {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| *v)
+    }
+
+    /// GitHub's `message` for an error, shortened.
+    fn message(&self) -> Option<String> {
+        let json: serde_json::Value = serde_json::from_slice(self.body).ok()?;
+        let text = json.get("message")?.as_str()?;
+        Some(text.chars().take(MESSAGE_MAX).collect())
+    }
+}
+
+/// Split what `curl --include` printed. Interim `1xx` responses before the final one are
+/// skipped. None when there is no complete status line and header block.
+fn split_response(mut raw: &[u8]) -> Option<Response<'_>> {
+    loop {
+        let end = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
+        let head = std::str::from_utf8(&raw[..end]).ok()?;
+        let body = &raw[end + 4..];
+        let mut lines = head.split("\r\n");
+        let mut first = lines.next()?.split(' ');
+        let status = match (first.next(), first.next()) {
+            (Some(version), Some(code)) if version.starts_with("HTTP/") => code.parse().ok()?,
+            _ => return None,
+        };
+        if (100..200).contains(&status) {
+            raw = body;
+            continue;
+        }
+        let headers = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim()))
+            .collect();
+        return Some(Response {
+            status,
+            headers,
+            body,
+        });
+    }
+}
+
+/// The body of a page of the listing, from what `curl --include` printed for it.
+///
+/// # Errors
+/// [`FetchError::RateLimited`] for GitHub's rate limit (a `403` or `429` that says so by
+/// `x-ratelimit-remaining: 0`, a `retry-after` or its message), [`FetchError::Failed`] for
+/// any other answer than `200`, and for output that is too large or not a response.
+pub fn page_body(stdout: &[u8]) -> Result<&[u8], FetchError> {
+    if stdout.len() > MAX_PAGE_BYTES {
+        return failed("a page of the listing is too large");
+    }
+    let Some(response) = split_response(stdout) else {
+        return failed("the answer is not an HTTP response");
+    };
+    if response.status == 200 {
+        return Ok(response.body);
+    }
+    let message = response.message();
+    let limited = matches!(response.status, 403 | 429)
+        && (response.header("x-ratelimit-remaining") == Some("0")
+            || response.header("retry-after").is_some()
+            || message
+                .as_deref()
+                .is_some_and(|m| m.to_ascii_lowercase().contains("rate limit")));
+    if limited {
+        return Err(FetchError::RateLimited(format!(
+            "rate limited by GitHub, retry after {} or set token_file",
+            retry_after(&response)
+        )));
+    }
+    match message {
+        Some(m) => failed(format!("GitHub answered HTTP {}: {m}", response.status)),
+        None => failed(format!("GitHub answered HTTP {}", response.status)),
+    }
+}
+
+/// When a rate-limited listing may be tried again: the reset time the API names (RFC 3339,
+/// UTC), else the wait it asks for, else a later time.
+fn retry_after(response: &Response<'_>) -> String {
+    let reset = response
+        .header("x-ratelimit-reset")
+        .and_then(|v| v.parse::<i64>().ok())
+        .and_then(|t| OffsetDateTime::from_unix_timestamp(t).ok())
+        .and_then(|t| t.format(&Rfc3339).ok());
+    if let Some(reset) = reset {
+        return reset;
+    }
+    match response
+        .header("retry-after")
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(seconds) => format!("{seconds} seconds"),
+        None => "a while".to_owned(),
     }
 }
 
