@@ -208,6 +208,7 @@ fn open_over(rig: &Rig, rec: &crate::record::Record) -> Result<Updater, StoreErr
         Ports {
             safe: Box::new(rig.stop.clone()),
             installer: Box::new(rig.inst.clone()),
+            drain: Box::new(rig.drain.clone()),
             health: Box::new(rig.health.clone()),
             clock: Box::new(rig.clock.clone()),
         },

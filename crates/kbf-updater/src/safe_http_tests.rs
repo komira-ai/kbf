@@ -20,6 +20,7 @@ fn host(alias: &str) -> Host {
         address: "secret-host.farm.example".to_owned(),
         role: Role::Storage,
         host_key: KEY.to_owned(),
+        node_id: None,
     }
 }
 

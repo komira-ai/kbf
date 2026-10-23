@@ -19,6 +19,7 @@
 //! - [`operator`], [`reply`] and [`secret`]: the client of the frontend's loopback operator
 //!   API, and the token files it reads;
 //! - [`safe_http`]: the real safe-to-stop, a call to the operator API;
+//! - [`node_drain`]: the real drain of a daemon host's node, over the operator API;
 //! - [`health`] and [`node_health`]: the real health check of a storage or daemon host, over
 //!   the operator API; a frontend host is refused until the kbf-proxy drain control exists;
 //! - [`daemon`]: the flags and the wiring of all of it.
@@ -30,6 +31,7 @@ pub mod health;
 pub mod http;
 pub mod inventory;
 pub mod listener;
+pub mod node_drain;
 pub mod node_health;
 pub mod operator;
 pub mod ports;
@@ -50,6 +52,8 @@ mod daemon_tests;
 #[cfg(test)]
 mod listener_tests;
 #[cfg(test)]
+mod node_drain_tests;
+#[cfg(test)]
 mod node_health_tests;
 #[cfg(test)]
 mod safe_http_tests;
@@ -57,6 +61,8 @@ mod safe_http_tests;
 mod server_tests;
 #[cfg(test)]
 mod testutil;
+#[cfg(test)]
+mod updater_drain_tests;
 #[cfg(test)]
 mod updater_followup_tests;
 #[cfg(test)]

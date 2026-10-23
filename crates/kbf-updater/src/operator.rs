@@ -1,7 +1,8 @@
-//! A client of the frontend's loopback operator API (`docs/api.md`): one `GET` with the
-//! operator bearer token from a file, and the proxy's per-boot secret when the frontend runs
+//! A client of the frontend's loopback operator API (`docs/api.md`): one `GET` or `POST` with
+//! the operator bearer token from a file, and the proxy's per-boot secret when the frontend runs
 //! behind kbf-proxy. Safe-to-stop ([`crate::safe_http`]) and node health
-//! ([`crate::node_health`]) are both calls of it.
+//! ([`crate::node_health`]) are reads of it; draining a node ([`crate::node_drain`]) is a read
+//! and two writes.
 //!
 //! A frontend that runs behind kbf-proxy (`--proxy-auth-file`) refuses an operator call that
 //! lacks the proxy's per-boot secret, 403 (`kbf-server` `api.rs` `operator_gate`). With
@@ -10,7 +11,7 @@
 //! to the rule of [`crate::secret`].
 //!
 //! The request has the headers of `kbf cluster`, including a JSON content type: the gated
-//! routes want one on every call, a `GET` too.
+//! routes want one on every call, a `GET` too. A `POST` carries a JSON body or none.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -76,13 +77,23 @@ impl OperatorApi {
     /// `GET path`. A refused or timed-out connection and a cut answer are
     /// [`PortError::unreachable`]; the status is the caller's to judge.
     pub fn get(&self, path: &str) -> Result<Reply, PortError> {
+        self.call("GET", path, "")
+    }
+
+    /// `POST path` with `body` (JSON text, or empty for none). Failures as for
+    /// [`OperatorApi::get`]; the status is the caller's to judge.
+    pub fn post(&self, path: &str, body: &str) -> Result<Reply, PortError> {
+        self.call("POST", path, body)
+    }
+
+    fn call(&self, method: &str, path: &str, body: &str) -> Result<Reply, PortError> {
         let token = read_token(&self.token_file).map_err(PortError::other)?;
         let secret = match &self.proxy_auth_file {
             Some(file) => Some(read_proxy_secret(file).map_err(PortError::other)?),
             None => None,
         };
         let raw = self
-            .exchange(path, &token, secret.as_deref())
+            .exchange(method, path, body, &token, secret.as_deref())
             .map_err(|e| PortError::unreachable(format!("{WHAT}: {}", e.kind())))?;
         Reply::parse(&raw, WHAT)
     }
@@ -90,7 +101,9 @@ impl OperatorApi {
     /// One request, one answer: the raw bytes, up to [`REPLY_MAX`].
     fn exchange(
         &self,
+        method: &str,
         path: &str,
+        body: &str,
         token: &str,
         proxy_secret: Option<&str>,
     ) -> std::io::Result<Vec<u8>> {
@@ -101,10 +114,11 @@ impl OperatorApi {
             .map(|secret| format!("{PROXY_AUTH_HEADER}: {secret}\r\n"))
             .unwrap_or_default();
         let request = format!(
-            "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\
              Accept: application/json\r\nAuthorization: Bearer {token}\r\n\
-             {proxy}Content-Type: application/json\r\nContent-Length: 0\r\n\r\n",
-            self.addr
+             {proxy}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            self.addr,
+            body.len()
         );
         stream.write_all(request.as_bytes())?;
         let mut raw = Vec::new();

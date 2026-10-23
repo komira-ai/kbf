@@ -1,9 +1,10 @@
 //! The roll state machine.
 //!
 //! One roll at a time, over the hosts of a plan: the frontend first, then one host at a time.
-//! Per host the turn is `pending`, `checking` (safe-to-stop, nodes only), `installing`,
-//! `waiting_healthy`, `done`. Every phase change is written to `roll.json` before the work of
-//! the new phase starts, so a restart finds the host where its work began and never earlier.
+//! Per host the turn is `pending`, `checking` (the node's identity, safe-to-stop and, for a
+//! daemon host, the drain; nodes only), `installing`, `waiting_healthy`, `done`. Every phase
+//! change is written to `roll.json` before the work of the new phase starts, so a restart
+//! finds the host where its work began and never earlier.
 //! The first failure stops the roll and no later host is asked about, let alone touched.
 //!
 //! The machine is deterministic: no clock but the [`Clock`] port, no randomness, no threads of
@@ -27,7 +28,9 @@ use crate::api::{
     ApiError, ErrorCode, Failure, HostRoll, Hosts, Phase, Roll, RollRequest, RollState,
 };
 use crate::inventory::{Host, Inventory, Role};
-use crate::ports::{Clock, Health, HealthCheck, Installed, Installer, SafeToStop, Stop};
+use crate::ports::{
+    Clock, Drain, Health, HealthCheck, Installed, Installer, PortError, SafeToStop, Stop,
+};
 use crate::record::{FORMAT, Record, RollStore, StoreError, roll_id};
 use crate::version::Version;
 
@@ -48,6 +51,9 @@ pub struct Timing {
     pub healthy_frontend: Duration,
     pub healthy_storage: Duration,
     pub healthy_daemon: Duration,
+    /// How long a daemon host's node is given to finish its leases once it is drained. When
+    /// the time is out the host is installed anyway, with the leases it still holds.
+    pub drain_deadline: Duration,
 }
 
 impl Default for Timing {
@@ -60,6 +66,7 @@ impl Default for Timing {
             healthy_frontend: Duration::from_secs(300),
             healthy_storage: Duration::from_secs(300),
             healthy_daemon: Duration::from_secs(780),
+            drain_deadline: Duration::from_secs(600),
         }
     }
 }
@@ -74,12 +81,24 @@ impl Timing {
     }
 }
 
-/// The four ports of a roll.
+/// The five ports of a roll.
 pub struct Ports {
     pub safe: Box<dyn SafeToStop>,
     pub installer: Box<dyn Installer>,
+    pub drain: Box<dyn Drain>,
     pub health: Box<dyn HealthCheck>,
     pub clock: Box<dyn Clock>,
+}
+
+/// `halt`, with the node it leaves drained named. A store error is not changed.
+fn left_drained(host: &Host, halt: Halt) -> Halt {
+    let node = host.node_id.as_deref().unwrap_or(&host.alias);
+    let note = |detail: String| format!("{detail}; node {node} ({}) is left drained", host.alias);
+    match halt {
+        Halt::Fail(code, detail) => Halt::Fail(code, note(detail)),
+        Halt::Interrupt(detail) => Halt::Interrupt(note(detail)),
+        Halt::Store(e) => Halt::Store(e),
+    }
 }
 
 /// The longest detail kept, in characters.
@@ -477,6 +496,11 @@ impl Updater {
     /// the loop is one a restart found: `pending` and `checking` begin (or repeat) the check,
     /// `installing` asks the host what happened to the install, `waiting_healthy` resumes
     /// the wait with a fresh bound, and a `failed` host is never resumed past.
+    ///
+    /// A daemon host's node is drained at the end of `checking` and given back after the host
+    /// is healthy. From `installing` on the roll holds it, whether this process drained it or
+    /// the one before a restart did: every failure on the way names the node and leaves it
+    /// drained, for an operator to look at.
     fn step(&self, idx: usize, target: &Version) -> Result<(), Halt> {
         let rec = self.snapshot()?;
         let h = &rec.roll.hosts[idx];
@@ -486,23 +510,51 @@ impl Updater {
                 format!("host {} is no longer in the inventory", h.alias),
             )
         })?;
-        match h.phase {
-            Phase::Failed => {
-                return Err(Halt::Fail(
-                    ErrorCode::StateLost,
-                    "the record holds a failed host on a running roll".to_owned(),
-                ));
+        let phase = h.phase;
+        if phase == Phase::Failed {
+            return Err(Halt::Fail(
+                ErrorCode::StateLost,
+                "the record holds a failed host on a running roll".to_owned(),
+            ));
+        }
+        if matches!(phase, Phase::Pending | Phase::Checking) {
+            // A host the health port will not judge is not installed on either: refused
+            // before the installer, so that nothing on it changes.
+            if let Some(why) = self.ports.health.refusal(host) {
+                return Err(Halt::Fail(ErrorCode::SwapAbandoned, why));
             }
+            if host.role != Role::Frontend {
+                self.mark(idx, Phase::Checking, false)?;
+                self.check_identity(host)?;
+                self.check_safe(host)?;
+                if host.role == Role::Daemon {
+                    self.drain(host)?;
+                }
+            }
+        }
+        let held = host.role == Role::Daemon;
+        self.install_and_wait(idx, host, target, phase, held)
+            .map_err(|halt| if held { left_drained(host, halt) } else { halt })?;
+        if held {
+            self.undrain(host)?;
+            self.wait_healthy(host, target, false)?;
+        }
+        self.mark(idx, Phase::Done, false)?;
+        Ok(())
+    }
+
+    /// The install of a host (or the check of what a restart left) and the wait for it to run
+    /// the target. `held`: its node is drained, so it is not asked to be serving.
+    fn install_and_wait(
+        &self,
+        idx: usize,
+        host: &Host,
+        target: &Version,
+        phase: Phase,
+        held: bool,
+    ) -> Result<(), Halt> {
+        match phase {
             Phase::Pending | Phase::Checking => {
-                // A host the health port will not judge is not installed on either: refused
-                // before the installer, so that nothing on it changes.
-                if let Some(why) = self.ports.health.refusal(host) {
-                    return Err(Halt::Fail(ErrorCode::SwapAbandoned, why));
-                }
-                if host.role != Role::Frontend {
-                    self.mark(idx, Phase::Checking, false)?;
-                    self.check_safe(host)?;
-                }
                 self.mark(idx, Phase::Installing, true)?;
                 match self.install(host, target) {
                     Ok(()) => self.mark(idx, Phase::WaitingHealthy, false)?,
@@ -512,12 +564,84 @@ impl Updater {
                 }
             }
             Phase::Installing => self.recover_install(idx, host, target)?,
-            Phase::WaitingHealthy | Phase::Done => {}
+            Phase::WaitingHealthy | Phase::Done | Phase::Failed => {}
         }
-        self.wait_healthy(host, target)?;
-        self.mark(idx, Phase::Done, false)?;
-        self.ports.health.settled(host, target);
-        Ok(())
+        self.wait_healthy(host, target, held)
+    }
+
+    /// The node the host's report names must be the one the inventory lists for it. A daemon
+    /// host without a node id is refused: it cannot be told from another, and a drain is
+    /// aimed by that id. A host that lists one has it checked, a daemon or not. Nothing has
+    /// been drained when this fails.
+    fn check_identity(&self, host: &Host) -> Result<(), Halt> {
+        let fail = |why: String| Err(Halt::Fail(ErrorCode::NodeIdentity, why));
+        let Some(listed) = host.node_id.as_deref() else {
+            return if host.role == Role::Daemon {
+                fail(format!(
+                    "{} is listed without a node id, so its node cannot be told from another; \
+                     add the id from its kbf configuration to the inventory",
+                    host.alias
+                ))
+            } else {
+                Ok(())
+            };
+        };
+        let report = self.ports.installer.report(host).map_err(|e| {
+            Halt::Fail(
+                ErrorCode::NodeIdentity,
+                format!("{} could not be asked its node id: {e}", host.alias),
+            )
+        })?;
+        match report.node_id.as_deref() {
+            Some(found) if found == listed => Ok(()),
+            Some(found) => fail(format!(
+                "{} reports node id {found}, not the {listed} the inventory lists for it",
+                host.alias
+            )),
+            None => fail(format!(
+                "{} reports no node id, not the {listed} the inventory lists for it",
+                host.alias
+            )),
+        }
+    }
+
+    /// Drain the host's node and wait until it holds no lease, or until the drain deadline
+    /// has passed (its leases then run on and the install goes ahead). A failure leaves the
+    /// node as the frontend has it, which may be drained.
+    fn drain(&self, host: &Host) -> Result<(), Halt> {
+        let fail = |why: &str, e: PortError| {
+            left_drained(
+                host,
+                Halt::Fail(ErrorCode::DrainFailed, format!("{why}: {e}")),
+            )
+        };
+        let deadline = self.timing.drain_deadline;
+        self.ports
+            .drain
+            .drain(host, deadline)
+            .map_err(|e| fail("the drain was refused", e))?;
+        let start = self.now();
+        loop {
+            let held = self
+                .ports
+                .drain
+                .leases(host)
+                .map_err(|e| fail("the node's leases could not be read", e))?;
+            if held == 0 || self.since(start) >= deadline {
+                return Ok(());
+            }
+            self.ports.clock.sleep(self.timing.poll);
+        }
+    }
+
+    /// Give the host's node back, now that the host runs the target.
+    fn undrain(&self, host: &Host) -> Result<(), Halt> {
+        self.ports.drain.undrain(host).map_err(|e| {
+            left_drained(
+                host,
+                Halt::Fail(ErrorCode::UndrainFailed, format!("the undrain failed: {e}")),
+            )
+        })
     }
 
     fn now(&self) -> Duration {
@@ -550,7 +674,6 @@ impl Updater {
     }
 
     fn install(&self, host: &Host, target: &Version) -> Result<(), InstallError> {
-        self.ports.health.installing(host, target);
         match self.ports.installer.install(host, target) {
             Ok(()) => Ok(()),
             Err(e) if e.is_unreachable() => Err(InstallError::Unreachable),
@@ -563,8 +686,8 @@ impl Updater {
 
     /// A host found `installing`: ask, do not install blindly. The target means the install
     /// finished; another version means it never started or did not finish, and one more
-    /// install is safe (it is idempotent and refuses to go older); "in progress" waits it
-    /// out; silence for [`Timing::query_bound`] interrupts the roll.
+    /// install is safe (it is idempotent, and an older version is installed like any other);
+    /// "in progress" waits it out; silence for [`Timing::query_bound`] interrupts the roll.
     fn recover_install(&self, idx: usize, host: &Host, target: &Version) -> Result<(), Halt> {
         let start = self.now();
         let mut last_answer = start;
@@ -641,11 +764,18 @@ impl Updater {
         }
     }
 
-    fn wait_healthy(&self, host: &Host, target: &Version) -> Result<(), Halt> {
+    /// Wait for `host` to run the target. `held`: its node is drained by the roll, which a
+    /// daemon is not asked to be serving through.
+    fn wait_healthy(&self, host: &Host, target: &Version, held: bool) -> Result<(), Halt> {
         let start = self.now();
         let bound = self.timing.healthy(host.role);
         loop {
-            let last = match self.ports.health.check(host, target) {
+            let asked = if held {
+                self.ports.health.check_held(host, target)
+            } else {
+                self.ports.health.check(host, target)
+            };
+            let last = match asked {
                 Ok(Health::Healthy) => return Ok(()),
                 Ok(Health::Abandoned(why)) => {
                     return Err(Halt::Fail(ErrorCode::SwapAbandoned, why));

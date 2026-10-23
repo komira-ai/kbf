@@ -47,7 +47,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub use exec::{Exec, ExecError, Exited, Spawn, SystemExec};
 
 use crate::inventory::{Host, valid_address, valid_host_key};
-use crate::ports::{Installed, Installer, PortError};
+use crate::ports::{Installer, PortError, Report};
 use crate::version::Version;
 
 /// Where ssh is looked for when the caller names no other.
@@ -285,7 +285,7 @@ impl Installer for SshInstaller {
         answer::install_answer(code, stdout)
     }
 
-    fn query(&self, host: &Host) -> Result<Installed, PortError> {
+    fn report(&self, host: &Host) -> Result<Report, PortError> {
         let done = self.call(host, "query")?;
         let (code, stdout) = answer::checked(&done)?;
         answer::query_answer(code, stdout)
