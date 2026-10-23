@@ -4,7 +4,7 @@
 //! listens at `base_port`, slot B ten ports above, and the operator listener is at offset 2
 //! of a slot (docs/design/frontend-proxy.md section 7; the offsets are the proxy's frozen
 //! contract and are copied here, as this module does not link the proxy). A test of the proxy
-//! verb (`proxy_verb_tests.rs`) checks the copy against the proxy's; the deploy verb's
+//! verb checks the copy against the proxy's; the deploy verb's
 //! observers read the child through it.
 
 use std::fmt;
