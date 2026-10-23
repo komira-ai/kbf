@@ -253,6 +253,8 @@ change the booking:
 - `kbf-book-cpus=N` books `N` whole cores.
 - `kbf-book-mem-gib=N` books `N` GiB of memory.
 
+Cores are reserved on the worker for the lease. Memory is the limit the action runs under: the worker's memory must be at least `N` GiB, but the memory other actions on the worker hold does not keep this one off it.
+
 Write `N` in plain digits with no sign or leading zero: `+4` and `04` are refused,
 because each would book the same as `4` under a different action digest. Either key may be
 given alone. The scheduler places the action only where that much is free.

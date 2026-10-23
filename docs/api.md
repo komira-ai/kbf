@@ -1066,7 +1066,10 @@ applied_generation, status, last_seen_secs}]}`.
 - `converged` is true only when at least one node is expected, every expected node has
   applied the current generation with status `ok`, and none is `unsupported`. It never claims
   more than the frontend knows: a frontend that has heard from no node says `false`.
-  **This build wires no source of node reports yet: `nodes` is empty and `converged` is `false`.**
+  The reports are the storage nodes' heartbeats: each accepted heartbeat writes a row in the
+  state store with a time to live of 15 seconds, so every frontend child reads the same reports, and a report
+  that is not renewed lapses and reads as `pending`. A farm restarted with an empty store shows
+  `pending` for every node until heartbeats arrive.
 
 **`GET /v1/object-stores/audit`** answers `{entries: [{seq, at, action, subject, outcome,
 generation}]}`, newest first. A row names what was touched and what happened, never a body
