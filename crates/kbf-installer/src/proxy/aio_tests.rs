@@ -46,7 +46,7 @@ fn the_old_process_stops_only_after_it_is_idle_and_the_held_streams_feed_the_new
     );
     assert_eq!(w.st.borrow().expired, 0);
     assert_eq!(w.st.borrow().fed, vec![(Slot::B, 200)]);
-    assert!(w.when("order confirm").is_some() && w.when("admin:desired B").is_some());
+    assert!(w.when("order confirm").is_some());
 }
 
 #[test]

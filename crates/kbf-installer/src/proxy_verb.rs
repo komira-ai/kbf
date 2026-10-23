@@ -228,7 +228,6 @@ fn handover_config(args: &ProxyArgs, loaded: &Loaded, layout: &Layout) -> Handov
             admin: [admin(Slot::A), admin(Slot::B)],
             operator: [operator(Slot::A), operator(Slot::B)],
         },
-        operator_token_file: loaded.proxy.operator_token_file.clone(),
         installer_toml: config_path(args, Platform::current()),
         gate: GateSlot::new(),
         state_dir: loaded.proxy.state_dir.clone(),
@@ -559,7 +558,6 @@ fn serve(
         state_dir: config.state_dir.clone(),
         proxy_auth_file: config.proxy_auth_file.clone(),
         upstream: config.upstream,
-        operator_token_file: config.operator_token_file.clone(),
         status: handover.status_file.clone(),
         local: handover.local.clone(),
         frontend_config,
@@ -643,7 +641,6 @@ struct Supervise {
     state_dir: std::path::PathBuf,
     proxy_auth_file: std::path::PathBuf,
     upstream: kbf_proxy::config::UpstreamTable,
-    operator_token_file: std::path::PathBuf,
     /// The root half's `status.json`; with `local`, the proxy's own `releases.json`.
     status: std::path::PathBuf,
     /// The proxy's own copies of `kbf` (`--kbf-binary`): the children are run from them and a
@@ -765,7 +762,7 @@ fn start_with(
     use crate::proxy::supervisor::{Adopt, Boot, adopt_children, child_admin, host_migrator};
     use crate::run::SystemRunner;
 
-    child_admin(handle, with.upstream, with.operator_token_file).map(|admin| {
+    child_admin(handle, with.upstream).map(|admin| {
         let report = FileReport::new(&with.state_dir);
         let facts = StatusFile::new(&with.status);
         let migrator = host_migrator(with.database, &facts, child);

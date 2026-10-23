@@ -82,7 +82,6 @@ fn the_start_with_copies_runs_the_copy_of_the_installed_release_and_migrates_it_
         state_dir: state_dir.clone(),
         proxy_auth_file: config.proxy_auth_file.clone(),
         upstream: config.upstream,
-        operator_token_file: config.operator_token_file.clone(),
         status: state_dir.join(releases::STATUS),
         local: Some(local),
         frontend_config: None,

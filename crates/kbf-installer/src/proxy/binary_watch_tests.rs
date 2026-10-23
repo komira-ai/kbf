@@ -775,7 +775,6 @@ fn config_for(local: &Local, root: &Path) -> HandoverConfig {
             admin: [addr, addr],
             operator: [addr, addr],
         },
-        operator_token_file: root.join("operator.token"),
         installer_toml: root.join("installer.toml"),
         gate: GateSlot::new(),
     };

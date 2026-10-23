@@ -397,7 +397,7 @@ only when both builds state `meta_log` (in `kbf --version --json`) and `meta_log
 
 The deploy (`kbf-installer deploy`, `gamma-deploy.md`) runs on the real farm with real builds in flight: it updates the
 frontend through the proxy's update API first (`frontend-proxy.md` sections 4, 5 and 9: a swap that drops no stream, a
-bake, then the new frontend offers the commit), and then watches the pull updater roll the nodes, one storage node at a
+bake, then the old child is drained), and then watches the pull updater roll the nodes, one storage node at a
 time. The deploy is a test because it is checked as one:
 
 - **No build failed from a dropped connection**: `kbf_frontend_relay_untraced` is 0 at every scrape of the deploy, and every
