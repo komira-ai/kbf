@@ -41,13 +41,6 @@ jobs:
           PY=/opt/homebrew/bin/python3; [ -x $PY ] || PY=python3
           ($PY -m venv $B/venv && perl -e 'alarm shift; exec @ARGV' 300 $B/venv/bin/pip install mlx 2>&1 | tail -3) || echo "MLX_INSTALL_FAILED"
           chmod -R a+rX $B
-      - name: Runner user arms (logged-in session)
-        continue-on-error: true
-        run: |
-          B=/private/tmp/kbf-spike-bin; L=/private/tmp/kbf-spike-logs
-          echo "=== runner gpu"; bash $B/probe_gpu.sh $B 2>&1 | tee $L/runner-gpu.out
-          echo "=== runner app"; bash $B/probe_app.sh $B $L runner 2>&1 | tee $L/runner-app.out
-          echo "=== runner ui"; bash $B/probe_ui.sh $B $L/runner-ui 2>&1 | tee $L/runner-ui.out
       - name: Pool user arms (root, real users)
         run: cargo xtask sudo-test -p kbf-driver-native --test apps_gpu_spike -- --test-threads=1 --nocapture 2>&1 | tee /private/tmp/kbf-spike-logs/pool-arms.out
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

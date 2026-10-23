@@ -3,7 +3,7 @@
 bin=$1
 echo "WHO $(id)"
 echo "SESSION $(launchctl managername 2>&1)"
-ml=""; [ -f "$bin/probe.metallib" ] && ml="$bin/probe.metallib"
+ml=""; [ "$2" != nometallib ] && [ -f "$bin/probe.metallib" ] && ml="$bin/probe.metallib"
 perl -e 'alarm shift; exec @ARGV' 120 "$bin/gpu_probe" $ml 2>&1 | sed 's/^/METAL /'
 echo "METAL_EXIT ${PIPESTATUS[0]}"
 if [ -x "$bin/venv/bin/python" ]; then

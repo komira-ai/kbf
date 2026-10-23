@@ -26,6 +26,11 @@ fn open_profile() -> String {
         .to_owned()
 }
 
+/// `profile` with one more rule before its file-write deny.
+fn plus_on(profile: &str, rule: &str) -> String {
+    profile.replace("(deny file-write*)", &format!("{rule}\n(deny file-write*)"))
+}
+
 /// The open profile plus one deny.
 fn plus(deny: &str) -> String {
     open_profile().replace("(deny file-write*)", &format!("{deny}\n(deny file-write*)"))
@@ -38,6 +43,7 @@ struct Ctx {
     bin: String,
     logs: PathBuf,
     scratch: PathBuf,
+    console_uid: u32,
 }
 
 fn local_time() -> String {
@@ -48,10 +54,11 @@ fn local_time() -> String {
     String::from_utf8(out.stdout).expect("utf8").trim().to_owned()
 }
 
-fn as_user_cmd(ctx: &Ctx, argv: &[String]) -> Command {
+fn as_user_cmd(ctx: &Ctx, argv: &[String], console: bool) -> Command {
     let (uid, gid) = (ctx.user.uid.to_string(), ctx.user.gid.to_string());
+    let session = if console { ctx.console_uid.to_string() } else { uid.clone() };
     let mut c = Command::new(LAUNCHCTL);
-    c.args(["asuser", &uid, &ctx.as_user, AS_USER_ARG, &uid, &gid, "--"])
+    c.args(["asuser", &session, &ctx.as_user, AS_USER_ARG, &uid, &gid, "--"])
         .args(argv)
         .env_clear()
         .current_dir("/")
@@ -88,7 +95,7 @@ fn log_window(ctx: &Ctx, label: &str, since: &str, predicate: &str, tag: &str, n
 
 /// One arm: `script` (a probe script) with `args` (`{lease}` is the arm's lease directory),
 /// as the pool user, under `profile` or, with None, with no sandbox.
-fn run_arm(ctx: &Ctx, label: &str, profile: Option<&str>, script: &str, args: &[&str], secs: u64, ui: bool) {
+fn run_arm(ctx: &Ctx, label: &str, profile: Option<&str>, script: &str, args: &[&str], secs: u64, ui: bool, console: bool) {
     let lease = ctx.scratch.join(format!("lease-{label}"));
     let _ = std::fs::create_dir_all(lease.join("tmp"));
     for p in [&lease, &lease.join("tmp")] {
@@ -126,11 +133,11 @@ fn run_arm(ctx: &Ctx, label: &str, profile: Option<&str>, script: &str, args: &[
     let since = local_time();
     let logfile = ctx.logs.join(format!("{label}.out"));
     let f = std::fs::File::create(&logfile).expect("out");
-    let status = as_user_cmd(ctx, &full)
+    let status = as_user_cmd(ctx, &full, console)
         .stdout(f.try_clone().expect("clone"))
         .stderr(f)
         .status();
-    println!("ARM {label} sandbox={} exit={:?}", profile.is_some(), status.map(|s| s.code()));
+    println!("ARM {label} sandbox={} console_session={console} exit={:?}", profile.is_some(), status.map(|s| s.code()));
     let text = std::fs::read_to_string(&logfile).unwrap_or_default();
     print_lines("ARMOUT", label, &text, |_| true, 150);
     // Whatever the arm left running ends here, by uid.
@@ -188,9 +195,13 @@ fn gpu_ui_and_app_arms_are_recorded() {
         bin,
         logs,
         scratch: scratch.0.clone(),
+        console_uid: 0,
     };
+    let st = Command::new("/usr/bin/stat").args(["-f", "%u", "/dev/console"]).output().expect("stat");
+    ctx.console_uid = String::from_utf8_lossy(&st.stdout).trim().parse().unwrap_or(501);
+    println!("CONSOLE uid={}", ctx.console_uid);
     // The user's /var/folders entry, as the driver resolves it.
-    let out = as_user_cmd(&ctx, &["/usr/bin/getconf".into(), "DARWIN_USER_DIR".into()])
+    let out = as_user_cmd(&ctx, &["/usr/bin/getconf".into(), "DARWIN_USER_DIR".into()], false)
         .output()
         .expect("getconf");
     let said = String::from_utf8_lossy(&out.stdout).trim().to_owned();
@@ -199,37 +210,34 @@ fn gpu_ui_and_app_arms_are_recorded() {
     ctx.rules = slot_write_rules(&home, &folders).expect("rules");
     println!("SETUP user={} uid={} home={} folders={}", user.name, user.uid, home.display(), folders.display());
 
-    let denies = ["(deny mach-register)", "(deny lsopen)", "(deny file-mount)"];
-    let gpu = |label: &str, profile: Option<&str>| run_arm(&ctx, label, profile, "probe_gpu.sh", &[], 400, false);
-    let app = |label: &str, profile: Option<&str>| {
-        run_arm(&ctx, label, profile, "probe_app.sh", &["{lease}", "{label}"], 200, false)
+    let slot = SLOT_PROFILE.to_owned();
+    let gpu = |label: &str, profile: Option<&str>, extra: &[&str]| {
+        run_arm(&ctx, label, profile, "probe_gpu.sh", extra, 400, false, false)
     };
-    // A. GPU (Metal and MLX).
-    gpu("gpu-control", None);
-    gpu("gpu-open", Some(&open_profile()));
-    for d in denies {
-        gpu(&format!("gpu-plus-{}", d.trim_matches(['(', ')']).replace("deny ", "")), Some(&plus(d)));
-    }
-    gpu("gpu-slot", Some(SLOT_PROFILE));
-    // C. Signed app through Launch Services.
-    app("app-control", None);
-    app("app-open", Some(&open_profile()));
-    for d in denies {
-        app(&format!("app-plus-{}", d.trim_matches(['(', ')']).replace("deny ", "")), Some(&plus(d)));
-    }
-    app("app-slot", Some(SLOT_PROFILE));
-    // B. UI tests, before and after the automation setting.
-    automation("");
-    automation("disable-automationmode-without-authentication");
+    // A2. Runtime shader compilation (no precompiled library), and what GPU needs of the profile.
+    gpu("gpu-jit-control", None, &["nometallib"]);
+    gpu("gpu-jit-slot", Some(&slot), &["nometallib"]);
+    gpu("gpu-slot-plus-deny-iokit-open", Some(&plus_on(&slot, "(deny iokit-open)")), &[]);
+    gpu(
+        "gpu-slot-plus-deny-mach-gpu",
+        Some(&plus_on(&slot, "(deny mach-lookup (global-name-regex #\"[Mm][Tt][Ll]|[Mm]etal|AGX|[Gg]pu\"))")),
+        &[],
+    );
+    gpu("gpu-slot-plus-deny-iokit-open-jit", Some(&plus_on(&slot, "(deny iokit-open)")), &["nometallib"]);
+    // B and C in the runner's console (Aqua) session, dropped to the pool uid: the session
+    // is the runner's, the uid and the profile are the pool user's.
+    let app = |label: &str, profile: Option<&str>| {
+        run_arm(&ctx, label, profile, "probe_app.sh", &["{lease}", "{label}"], 200, false, true)
+    };
+    app("app-session-control", None);
+    app("app-session-open", Some(&open_profile()));
+    app("app-session-plus-lsopen", Some(&plus("(deny lsopen)")));
+    app("app-session-slot", Some(&slot));
     automation("");
     let ui = |label: &str, profile: Option<&str>| {
-        run_arm(&ctx, label, profile, "probe_ui.sh", &["{lease}/ui"], 800, true)
+        run_arm(&ctx, label, profile, "probe_ui.sh", &["{lease}/ui"], 800, true, true)
     };
-    ui("ui-requires-control", None);
-    ui("ui-requires-slot", Some(SLOT_PROFILE));
-    automation("enable-automationmode-without-authentication");
-    automation("");
-    ui("ui-noauth-control", None);
-    ui("ui-noauth-slot", Some(SLOT_PROFILE));
+    ui("ui-session-control", None);
+    ui("ui-session-slot", Some(&slot));
     println!("DONE");
 }
