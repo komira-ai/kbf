@@ -660,8 +660,19 @@ pub fn leftover_processes(uid: u32) -> io::Result<Vec<i32>> {
 /// launchd's own agents ([`Service::own`]); read before a domain's bootout, which
 /// empties the list. Nothing is listed when no process of the uid is alive.
 pub(crate) fn launchds_own(uid: u32) -> Vec<i32> {
-    let pids = uid::processes(uid).unwrap_or_default();
-    own_pids(uid, &pids, &probe::OwnLabels::default())
+    let judged = probe::OwnLabels::default();
+    probe::own_of_uid(
+        uid::processes(uid),
+        |pids| own_pids(uid, pids, &judged),
+        || {
+            // The process table could not be read: every service launchd lists as
+            // running its own agent, as before the table was read first.
+            (services_of(uid, &judged).into_iter())
+                .filter(|s| s.own)
+                .filter_map(|s| s.pid)
+                .collect()
+        },
+    )
 }
 
 /// The members of `pids` that launchd lists as running one of its own agents. The
@@ -676,7 +687,7 @@ fn own_pids(uid: u32, pids: &[i32], judged: &probe::OwnLabels) -> Vec<i32> {
                 .map(|domain| probe::listed_services(&domain))
                 .unwrap_or_default()
         },
-        |label| judged.is_own(label, || is_own_service(uid, label, give_up)),
+        |pid, label| judged.is_own(label, Some(pid), || is_own_service(uid, label, give_up)),
     )
 }
 
@@ -724,7 +735,7 @@ fn services_of(uid: u32, judged: &probe::OwnLabels) -> Vec<Service> {
     probe::listed_services(&domain)
         .into_iter()
         .map(|(pid, label)| {
-            let own = judged.is_own(&label, || is_own_service(uid, &label, give_up));
+            let own = judged.is_own(&label, pid, || is_own_service(uid, &label, give_up));
             Service { pid, label, own }
         })
         .collect()
