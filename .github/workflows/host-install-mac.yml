@@ -59,15 +59,38 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - run: |
-          set +e
+      - name: Real inputs
+        run: |
+          set -e
+          id=$(gh run list -R komira-ai/kbf --workflow artifacts.yml --branch main --event push --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          echo "artifacts run $id"
+          gh run download "$id" -R komira-ai/kbf -n assets-darwin-arm64 -n bundles-darwin-arm64 -D "$RUNNER_TEMP/art"
+          ls "$RUNNER_TEMP/art" | head -40
+          gh attestation trusted-root > "$RUNNER_TEMP/trusted_root.jsonl"
+          wc -c "$RUNNER_TEMP/trusted_root.jsonl"
           gh --version
+        shell: bash
+      - name: With no credentials
+        env:
+          GH_TOKEN: ""
+        run: |
+          set +e
           H="$RUNNER_TEMP/probe-home"; mkdir -p "$H"
-          run() { echo "--- $*"; env -i HOME="$H" GH_CONFIG_DIR="$H" PATH=/usr/bin:/bin:/opt/homebrew/bin GH_NO_UPDATE_NOTIFIER=1 "$@" 2>&1 | head -c 600; echo "exit=${PIPESTATUS[0]}"; }
-          run gh api 'repos/komira-ai/kbf/releases?per_page=2'
-          run gh api 'repos/cli/cli/releases?per_page=1' --jq '.[0].tag_name'
-          mkdir -p "$H/dl"
-          run gh release download v2.50.0 -R cli/cli --pattern '*checksums.txt' --dir "$H/dl"
-          ls -l "$H/dl"
+          run() { echo "--- $*"; env -i HOME="$H" GH_CONFIG_DIR="$H" PATH=/usr/bin:/bin:/opt/homebrew/bin GH_NO_UPDATE_NOTIFIER=1 "$@" 2>&1 | head -c 700; echo "exit=${PIPESTATUS[0]}"; }
+          run gh release list -R komira-ai/kbf
+          run gh release view v2.50.0 -R cli/cli --json assets
+          run gh api -X GET repos/cli/cli/releases/tags/v2.50.0 --jq .id
+          run gh repo view cli/cli
+          T=$(ls "$RUNNER_TEMP"/art/kbf-????????????????????????????????????????-darwin-arm64.tar.gz | head -1)
+          C=$(basename "$T" | sed 's/^kbf-//; s/-darwin-arm64.tar.gz$//')
+          echo "tarball $T commit $C"
+          for P in http://127.0.0.1:9; do
+            run env HTTPS_PROXY=$P https_proxy=$P HTTP_PROXY=$P http_proxy=$P ALL_PROXY=$P all_proxy=$P gh attestation verify "$T" --bundle "$T.sigstore.json" --custom-trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --repo komira-ai/kbf --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml --cert-oidc-issuer https://token.actions.githubusercontent.com --source-ref refs/heads/main --source-digest "$C" --predicate-type https://slsa.dev/provenance/v1 --digest-alg sha256 --deny-self-hosted-runners
+          done
+          echo "--- with a token, the listing"
+          GH_TOKEN="${{ github.token }}" gh api 'repos/komira-ai/kbf/releases?per_page=2' | head -c 300
         shell: bash
