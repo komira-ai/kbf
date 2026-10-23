@@ -37,9 +37,9 @@ fn print_env() -> Vec<String> {
 }
 
 /// Catches `crun` started with the key in its environment (the "drop
-/// `without_credentials`" mutant at each start site the lease goes through): the
+/// `without_credentials`" defect at each start site the lease goes through): the
 /// stand-in hands it to the action, which prints it. That includes the OCI config's
-/// `process.env` (the "add this process's `AWS_*` to it" mutant in
+/// `process.env` (the "add this process's `AWS_*` to it" defect in
 /// `oci::spec::action_config`), what real `crun` gives the action. [`NODE_VARIABLE`] is
 /// the control: it reaches the action, so an `unset` for the key is the driver's doing,
 /// not a stand-in that hands nothing on, and `HOME=/root` in `process.env` shows the

@@ -92,8 +92,8 @@ fn left_in_tmp() -> Vec<String> {
 /// directory of the lease, or have launchd load an agent (both with and without the
 /// network), and a canary that cannot run on the Mac at all (a probe mode the binary
 /// does not answer, a launch that fails, a tool that is missing): every canary must be
-/// refused in its own form, and each run is timed. Weakened profiles seen red on the runner: the
-/// other tests of this file.
+/// refused in its own form, and each run is timed. Catches weakened profiles on the
+/// runner: the other tests of this file.
 #[ignore = "needs root and real users: cargo xtask sudo-test"]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_canaries_are_refused_under_the_real_profile() {

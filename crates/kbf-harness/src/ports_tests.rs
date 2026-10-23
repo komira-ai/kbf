@@ -17,7 +17,7 @@ fn floor() -> u16 {
 fn claims_held_at_once_never_share_a_block() {
     // Catches: two farms of one process (parallel tests) given one block, the failure of the
     // probe-and-close ports this replaces: a role dying with "address in use" or two roles
-    // sharing a port. Eight threads claim from the same place at the same moment. Mutant: no
+    // sharing a port. Eight threads claim from the same place at the same moment. Catches: no
     // `flock` in `try_block`.
     let barrier = Arc::new(Barrier::new(8));
     let claims: Vec<Claim> = (0..8)
@@ -45,7 +45,7 @@ fn claims_held_at_once_never_share_a_block() {
 fn two_farms_started_together_are_told_disjoint_ports_and_distinct_blocks() {
     // Catches: the farms of two tests of one process picking the same ports (the old
     // `ports()` probed the kernel for each, and `backend_base` walked from the process id).
-    // Mutant: `Claim::new` always claims block 0
+    // Catches: `Claim::new` always claims block 0
     // (the second claim then fails).
     let farm = || {
         std::thread::spawn(|| {
@@ -68,7 +68,7 @@ fn two_farms_started_together_are_told_disjoint_ports_and_distinct_blocks() {
 #[test]
 fn a_block_is_let_go_when_its_claim_is_dropped() {
     // Catches: a claim that is never released (the lock file leaked), which would use up
-    // the blocks of a host in a few hundred runs of one long-lived process. Mutant: the
+    // the blocks of a host in a few hundred runs of one long-lived process. Catches: the
     // claim is `mem::forget`-ten.
     let claim = Claim::starting_at(190);
     let index = claim.index();
@@ -81,7 +81,7 @@ fn a_block_is_let_go_when_its_claim_is_dropped() {
 fn a_block_with_a_busy_port_is_skipped() {
     // Catches: a block handed out although a program outside the harness listens on one of
     // its ports (on the second loopback address, a node's, which a probe of the first alone
-    // would not see). Mutant: `try_block` does not probe.
+    // would not see). Catches: `try_block` does not probe.
     let claim = Claim::starting_at(100);
     let (index, base) = (claim.index(), claim.base());
     drop(claim);
@@ -96,7 +96,7 @@ fn a_block_with_a_busy_port_is_skipped() {
 fn every_port_lies_in_the_block_below_the_ephemeral_range() {
     // Catches: ports in the range the kernel gives to connections (what binding port 0
     // yields), where a connection's source port can take one before its role binds it.
-    // Mutant: `FIRST` 20000 -> 40000.
+    // Catches: `FIRST` 20000 -> 40000.
     let claim = Claim::starting_at(120);
     let ports = Ports::of(&claim, MAX_NODES);
     let all = ports.all();
@@ -204,7 +204,8 @@ fn the_lock_directory_and_files_are_open_to_every_user_whatever_the_umask() {
     // read-write for all, under the umask this process has (022 here and in CI). Both are
     // first made narrow, as an older run (or a lock made by hand) left them, so the test
     // does not depend on what is in the temporary directory. A block from the end is claimed:
-    // the other tests claim from the first. Mutants: no mode set on the file; none on the directory.
+    // the other tests claim from the first. Catches: no mode set on the file; none on the
+    // directory.
     use std::os::unix::fs::PermissionsExt as _;
     let mode = |p: &std::path::Path| std::fs::metadata(p).expect("stat").permissions().mode();
     let narrow = std::fs::Permissions::from_mode(0o600);
@@ -252,7 +253,7 @@ fn a_harness_with_another_tmpdir_sees_the_lock() {
     // Catches: the lock directory following `TMPDIR`: two harnesses of one host with
     // different temporary directories lock different files and claim one block (the second
     // farm's roles then die with "address in use"). A second process, the test binary run
-    // again with another `TMPDIR`, asks for the block this one holds. Mutant: `lock_dir`
+    // again with another `TMPDIR`, asks for the block this one holds. Catches: `lock_dir`
     // is `std::env::temp_dir().join(..)` again (the other process finds the block free).
     let claim = Claim::starting_at(150);
     let dir = crate::scratch("ports-tmpdir");
