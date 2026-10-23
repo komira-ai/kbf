@@ -54,6 +54,8 @@
 //! - a test scratch directory made by joining a name onto the system temporary directory
 //!   instead of with `kbf_testkit::dir::TestDir`, outside a short list that says why each
 //!   does not leak (module `scratch_dirs`, whose docs say what it misses);
+//! - a `.rs` file under `crates/` whose comments or names narrate how a test was checked
+//!   instead of the defect it catches (module `test_wording`, whose docs state the rule);
 //! - the scans passing vacuously because git listed nothing, no Markdown file was
 //!   scanned or the workflows moved;
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
@@ -70,6 +72,7 @@ mod release_artifacts;
 mod release_workflow;
 mod scratch_dirs;
 mod test_spawns;
+mod test_wording;
 mod workflows;
 
 use std::path::{Path, PathBuf};

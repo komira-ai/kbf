@@ -248,7 +248,7 @@ async fn put(running: &Running, commit: &str, attested: bool) {
 /// second commit is 2 and the first again, a rollback, is 3. The desired release is read
 /// back by `GET /v1/update` with the stored releases.
 ///
-/// Mutants seen red: the completeness check dropped (the unattested commit is accepted);
+/// Catches: the completeness check dropped (the unattested commit is accepted);
 /// the generation not moved on a different commit.
 #[tokio::test]
 async fn a_complete_commit_is_offered_a_repeat_keeps_the_generation_a_rollback_outranks() {
@@ -350,7 +350,7 @@ async fn the_desired_release_is_a_gated_json_write() {
 /// new offer leaves it set), `GET /v1/update` shows it at the top and in the policy, resume
 /// clears it, and both need the token.
 ///
-/// Mutant seen red: pause written to nothing (the view still says false).
+/// Catches: pause written to nothing (the view still says false).
 #[tokio::test]
 async fn pause_and_resume_set_the_policy_flag() {
     let dir = Dir::new();
@@ -423,7 +423,7 @@ async fn without_a_state_store_or_a_release_store_the_update_routes_say_so() {
 /// stay); a repeat of the desired commit with the wrong expectation is refused too; and a
 /// field the route does not know is still 400.
 ///
-/// Mutant seen red: `expect_generation` ignored (the stale click is written).
+/// Catches: `expect_generation` ignored (the stale click is written).
 #[tokio::test]
 async fn an_offer_can_expect_the_generation_it_was_made_on() {
     let dir = Dir::new();
@@ -659,7 +659,7 @@ async fn the_writes_say_which_half_is_missing() {
 /// one is `200`; the others are `409`. Six rounds, each from the generation the last left. The
 /// sequential tests cannot see a check and a write that are not one conditional write.
 ///
-/// Mutant seen red: the row written with `Cond::Any` (several clicks win in a round).
+/// Catches: the row written with `Cond::Any` (several clicks win in a round).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_clicks_on_one_generation_have_one_winner() {
     let dir = Dir::new();
@@ -756,7 +756,7 @@ async fn pause_needs_only_the_state_store_and_is_repeatable() {
 /// retries on the new version and both changes stand. With every write to the row
 /// conflicting, a pause is `503` with `Retry-After`.
 ///
-/// Mutant seen red: `set_paused` written with `Cond::Any` (the policy comes back default).
+/// Catches: `set_paused` written with `Cond::Any` (the policy comes back default).
 #[tokio::test]
 async fn a_pause_does_not_lose_a_policy_written_under_it() {
     let dir = Dir::new();
@@ -791,7 +791,7 @@ async fn a_pause_does_not_lose_a_policy_written_under_it() {
 /// Catches proposals missing from `GET /v1/update`, listed out of release order, or a
 /// proposal making a run: the poller's rows are shown and `desired` stays null.
 ///
-/// Mutants seen red: the `proposals` field dropped; the sort removed.
+/// Catches: the `proposals` field dropped; the sort removed.
 #[tokio::test]
 async fn proposals_are_listed_oldest_first_and_start_no_run() {
     let dir = Dir::new();
