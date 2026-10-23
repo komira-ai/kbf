@@ -372,9 +372,9 @@ fn builds() -> Vec<Build> {
 /// below the build of `main` at its `seq` whatever its commit and run, and a re-run after
 /// the run it repeats (9 before 10), and so agree with each other.
 ///
-/// Mutants it is built to see go red, each planted by hand in `pkg_version.rs`: the `~` word
-/// put after the commit in the deb, or left out (the commit then decides, and `HIGH` is above
-/// `LOW`); the `seq` written in hex (15 and 16 swap).
+/// The defects it catches: the `~` word put after the commit in the deb, or left out
+/// (the commit then decides, and `HIGH` is above `LOW`); the `seq` written in hex (15 and
+/// 16 swap).
 #[test]
 fn dpkg_and_rpm_put_every_pair_of_builds_in_the_same_order() {
     let all = builds();

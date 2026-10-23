@@ -104,7 +104,7 @@ fn assert_subject_named(lines: &[String]) {
 
 /// Catches: a recovered operation whose usage line names the empty shape (`mnemonic=-`,
 /// `target=-`, the key of no program), so an action that ran across a handover cannot be
-/// followed from build to build. Mutant: the subject row not written.
+/// followed from build to build. Catches: the subject row not written.
 #[test]
 fn a_handed_over_operation_keeps_its_mnemonic_and_target() {
     let disk = Disk::new();

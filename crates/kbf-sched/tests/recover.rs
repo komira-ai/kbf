@@ -3,6 +3,8 @@
 //! that continue, a held lease waits for its worker to register again, and the worker's
 //! first heartbeat decides it.
 
+use std::time::Duration;
+
 use kbf_caps::NodeCaps;
 use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{
@@ -496,4 +498,158 @@ fn an_operation_the_scheduler_holds_is_not_taken_in_again() {
     assert_eq!(s.waiters(OperationId(12)), Some(&[WaiterId(12)][..]));
     assert_eq!(s.twin(&request(3)), None, "a finished operation is a twin");
     assert!(s.take_in(queued(13, request(4))), "a new one was refused");
+}
+
+/// The wait the held leases of these tests are kept for.
+const WAIT: Duration = Duration::from_secs(50);
+
+/// Asserts that a recovered lease held for another daemon process is kept past the first
+/// heartbeats that leave it out, and is given up as a lease lost to another process, charged
+/// as a run lost, by the first heartbeat after the wait.
+#[test]
+fn a_lease_held_for_another_process_is_given_up_only_after_the_wait() {
+    let mut s = recovered(vec![leased(3, request(3), 5, "node-a")]);
+    let lease = LeaseId::new(TERM, 5);
+    s.hold_recovered_leases(at(0), &node("node-a"), WAIT);
+    up(&mut s, 5, "node-a");
+    heartbeat(&mut s, 6, "node-a", Vec::new());
+    heartbeat(&mut s, 49, "node-a", Vec::new());
+    assert_eq!(committed_lease(s.state(OperationId(3))), Some(lease));
+    assert!(s.take_requeues().is_empty());
+    assert_eq!(s.booked(&node("node-a")), Some(Resources::new(1_000, GIB)));
+
+    heartbeat(&mut s, 51, "node-a", Vec::new());
+    assert_eq!(s.state(OperationId(3)), Some(&OpState::Queued));
+    assert_eq!(
+        s.take_requeues(),
+        vec![Requeue {
+            operation: OperationId(3),
+            lease,
+            worker: node("node-a"),
+            reason: RequeueReason::Replaced,
+        }]
+    );
+    assert_eq!(s.farm_runs(OperationId(3)).map(<[_]>::len), Some(1));
+}
+
+/// Asserts that a recovered lease held for another daemon process is kept for as long as
+/// the daemon lists it, whatever the wait.
+#[test]
+fn a_lease_held_for_another_process_stays_while_the_daemon_lists_it() {
+    let mut s = recovered(vec![leased(3, request(3), 5, "node-a")]);
+    let lease = LeaseId::new(TERM, 5);
+    s.hold_recovered_leases(at(0), &node("node-a"), WAIT);
+    up(&mut s, 5, "node-a");
+    for secs in [6, 49, 51, 90] {
+        heartbeat(&mut s, secs, "node-a", vec![lease]);
+    }
+    assert_eq!(committed_lease(s.state(OperationId(3))), Some(lease));
+    assert!(s.take_requeues().is_empty());
+}
+
+/// Asserts that the hold counts from the farm time it is made at, and not from the last
+/// input the scheduler was fed: a hold made later keeps the lease later.
+#[test]
+fn the_wait_of_a_held_lease_counts_from_the_time_of_the_hold() {
+    let mut s = recovered(vec![leased(3, request(3), 5, "node-a")]);
+    let lease = LeaseId::new(TERM, 5);
+    s.hold_recovered_leases(at(30), &node("node-a"), WAIT);
+    up(&mut s, 31, "node-a");
+    heartbeat(&mut s, 79, "node-a", Vec::new());
+    assert_eq!(committed_lease(s.state(OperationId(3))), Some(lease));
+    heartbeat(&mut s, 81, "node-a", Vec::new());
+    assert_eq!(s.state(OperationId(3)), Some(&OpState::Queued));
+}
+
+/// Asserts that a hold for a worker no recovered lease waits for does nothing and is not
+/// remembered: a lease taken in for the worker afterwards, which the worker leaves out of
+/// its first heartbeat, is given up at once as a lease of its own process is.
+#[test]
+fn a_hold_for_a_worker_nothing_waits_for_is_not_remembered() {
+    let mut s = recovered(Vec::new());
+    s.hold_recovered_leases(at(0), &node("node-a"), WAIT);
+    assert!(s.take_in(leased(3, request(3), 5, "node-a")));
+    up(&mut s, 5, "node-a");
+    heartbeat(&mut s, 6, "node-a", Vec::new());
+    assert_eq!(s.state(OperationId(3)), Some(&OpState::Queued));
+    let given_up = s.take_requeues();
+    let [requeue] = &given_up[..] else {
+        panic!("one lease expected to be given up: {given_up:?}");
+    };
+    assert_eq!(requeue.reason, RequeueReason::Reconnected);
+}
+
+/// Asserts that holding the leases of one worker leaves another worker's recovered leases
+/// as they were: a worker that is not held for gives its unlisted lease up at once.
+#[test]
+fn a_hold_applies_to_its_own_worker_only() {
+    let mut s = recovered(vec![
+        leased(3, request(3), 5, "node-a"),
+        leased(4, request(4), 6, "node-b"),
+    ]);
+    s.hold_recovered_leases(at(0), &node("node-a"), WAIT);
+    up(&mut s, 5, "node-b");
+    heartbeat(&mut s, 6, "node-b", Vec::new());
+    assert_eq!(s.state(OperationId(4)), Some(&OpState::Queued));
+    assert!(committed_lease(s.state(OperationId(3))).is_some());
+}
+
+/// Asserts that a lease taken in for a worker that has registered already is booked on it at
+/// once, and that the end of the lease releases the booking: the worker books the lease's
+/// request while it runs and nothing once its result is taken.
+#[test]
+fn a_lease_taken_in_for_a_registered_worker_is_booked_and_released() {
+    let mut s = recovered(Vec::new());
+    up(&mut s, 0, "node-a");
+    assert!(s.take_in(leased(3, request(3), 5, "node-a")));
+    assert_eq!(s.booked(&node("node-a")), Some(Resources::new(1_000, GIB)));
+
+    let lease = LeaseId::new(TERM, 5);
+    heartbeat(&mut s, 1, "node-a", vec![lease]);
+    let done = Event::Committed(ControlRecord::Result(ResultRecord {
+        lease,
+        operation: OperationId(3),
+        outcome: Outcome::Failed(Failure::Invalid),
+    }));
+    assert!(matches!(
+        feed(&mut s, 2, done).as_slice(),
+        [Effect::Answer(_)]
+    ));
+    assert_eq!(s.booked(&node("node-a")), Some(Resources::default()));
+}
+
+/// Asserts that a hold for a worker that has registered already keeps the leases taken in for
+/// it past the heartbeats that leave them out until the wait has passed, then gives them up
+/// as leases lost to another process, and that a lease taken in for another worker is given
+/// up at once as it is without a hold.
+#[test]
+fn a_lease_taken_in_for_a_registered_worker_is_held_for_another_process() {
+    let mut s = recovered(Vec::new());
+    up(&mut s, 0, "node-a");
+    up(&mut s, 0, "node-b");
+    assert!(s.take_in(leased(3, request(3), 5, "node-a")));
+    assert!(s.take_in(leased(4, request(4), 6, "node-b")));
+    s.hold_recovered_leases(at(10), &node("node-a"), WAIT);
+
+    heartbeat(&mut s, 11, "node-a", Vec::new());
+    heartbeat(&mut s, 11, "node-b", Vec::new());
+    assert_eq!(s.state(OperationId(4)), Some(&OpState::Queued));
+    let other = s.take_requeues();
+    let [requeue] = &other[..] else {
+        panic!("one lease expected to be given up: {other:?}");
+    };
+    assert_eq!(requeue.reason, RequeueReason::Reconnected);
+
+    heartbeat(&mut s, 40, "node-a", Vec::new());
+    heartbeat(&mut s, 59, "node-a", Vec::new());
+    assert!(committed_lease(s.state(OperationId(3))).is_some());
+    assert!(s.take_requeues().is_empty());
+
+    heartbeat(&mut s, 61, "node-a", Vec::new());
+    assert_eq!(s.state(OperationId(3)), Some(&OpState::Queued));
+    let held = s.take_requeues();
+    let [requeue] = &held[..] else {
+        panic!("one lease expected to be given up: {held:?}");
+    };
+    assert_eq!(requeue.reason, RequeueReason::Replaced);
 }

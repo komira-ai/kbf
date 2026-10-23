@@ -1270,7 +1270,7 @@ mod wiring {
     }
 
     /// Catches a preflight that refuses a node for want of `AWS_*` variables when the
-    /// frontend it registers with may give it the key pair (mutant: `s3` ignoring
+    /// frontend it registers with may give it the key pair (defect: `s3` ignoring
     /// `--frontend`): such a node needs none in its environment; the same node without a
     /// frontend still does.
     #[test]

@@ -75,25 +75,20 @@ fn node_writers_have_their_golden_bytes() {
     }
 }
 
-/// Asserts that the encoder refuses a node writer under every format before format 4
-/// (`SetWriter`, and a command that only names a node object), and that the decoder reads
-/// the format-4 bytes under those formats as the same command as under format 4,
-/// because decoding does not depend on the committed format.
+/// Asserts that the encoder writes a node writer (`SetWriter`, and a command that only
+/// names a node object) to the same bytes under every format, and that the decoder reads
+/// those bytes as the same command under every format, because neither depends on the
+/// committed format: a log of any format takes a node writer with no raise.
 #[test]
-fn node_writers_are_written_from_v4_and_read_under_every_format() {
+fn node_writers_are_written_and_read_under_every_format() {
     for (name, command, hex) in golden() {
         let bytes = hex::decode(hex).expect("hex");
-        for format in [Format::V1, Format::V2, Format::V3] {
-            assert_eq!(
-                enc(format, &command),
-                Err(EncodeError::Command(format)),
-                "{name} under {format:?}"
-            );
-            assert_eq!(
-                dec(format, &bytes).as_ref(),
-                Ok(&command),
-                "{name} under {format:?}"
-            );
+        for n in 1..=5 {
+            let format = Format::new(n);
+            let wrote = enc(format, &command);
+            assert_eq!(wrote, Ok(bytes.clone()), "{name} under {format:?}");
+            let read = dec(format, &bytes);
+            assert_eq!(read.as_ref(), Ok(&command), "{name} under {format:?}");
         }
     }
     // An epoch writer's object keeps its bytes under every format, format 4 included.
@@ -192,9 +187,9 @@ fn an_object_id_names_one_writer_or_is_refused() {
     }
 }
 
-/// Catches: a conversion that swaps member and boot, drops the seq, or reads a node
-/// object in a set or a put differently from a mark; over every command that names an
-/// object.
+/// Asserts that a conversion keeps member, boot and seq in place, and reads a node
+/// object in a set or a put as it does in a mark; over every command that names an
+/// object. Each is written to the same bytes under format 3 as under format 4.
 #[test]
 fn node_objects_round_trip_in_every_command_that_names_one() {
     let a = node_object(u64::MAX, 1, 0);
@@ -242,10 +237,7 @@ fn node_objects_round_trip_in_every_command_that_names_one() {
             Ok(&command),
             "{command:?}"
         );
-        assert_eq!(
-            enc(Format::V3, &command),
-            Err(EncodeError::Command(Format::V3)),
-            "{command:?}"
-        );
+        let before = enc(Format::V3, &command);
+        assert_eq!(before.as_ref(), Ok(&bytes), "{command:?}");
     }
 }

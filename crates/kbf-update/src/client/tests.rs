@@ -23,7 +23,7 @@ fn no_offer(commit: &str) -> String {
 /// remembered. The same generation again is remembered (a restart loses the memory) but
 /// changes nothing else.
 ///
-/// Mutant planted: the stale check `<` made `<=` (the repeat is then not remembered after
+/// Catches: the stale check `<` made `<=` (the repeat is then not remembered after
 /// a restart, and the activation is refused as having no offer).
 #[tokio::test]
 async fn an_older_generation_is_ignored_and_the_same_one_is_a_repeat() {
@@ -202,7 +202,7 @@ async fn the_helpers_status_maps_to_the_state() {
 /// them stops being read as having them; a seed with a commit that is not 40 hex digits
 /// refuses the whole file, as any other commit does.
 ///
-/// Mutants to plant: the keys read and not put in the status; `bundled` read as `url`; an unknown
+/// Catches: the keys read and not put in the status; `bundled` read as `url`; an unknown
 /// word refused; the commit not checked.
 #[tokio::test]
 async fn the_package_and_the_source_the_helper_reports_reach_the_status() {
@@ -318,7 +318,7 @@ async fn the_spool_is_orders_under_the_directory_and_private() {
 ///
 /// An order cannot be recorded either, and is refused, not written.
 ///
-/// Mutant planted: the save error propagated as a panic (the worker dies and the status
+/// Catches: the save error propagated as a panic (the worker dies and the status
 /// stops following the offer).
 #[tokio::test]
 async fn an_offer_is_kept_when_the_generation_floor_cannot_be_written() {

@@ -29,7 +29,7 @@ fn account(name: &str, uid: u32, home: &str) -> kbf_host::RunUser {
 /// Catches a plan that makes an account that is there, or none when it is missing: absent, the
 /// plan is the creation `setup` runs; present with the shape `setup` makes, it is empty.
 ///
-/// Mutants seen red: the lookup ignored (always created); the creation skipped.
+/// Catches: the lookup ignored (always created); the creation skipped.
 #[test]
 fn the_plan_creates_a_missing_account_and_leaves_a_good_one() {
     let mut os = FakeOs::linux();
@@ -46,7 +46,7 @@ fn the_plan_creates_a_missing_account_and_leaves_a_good_one() {
 /// range, another home, a login shell are each refused (exit 5) naming the field, on both
 /// platforms.
 ///
-/// Mutants seen red: each of the four checks removed in turn; the Mac's range taken from Linux.
+/// Catches: each of the four checks removed in turn; the Mac's range taken from Linux.
 #[test]
 fn a_wrong_shape_is_refused_naming_the_field() {
     for (mut os, name, home, shell) in [
@@ -98,7 +98,7 @@ fn a_wrong_shape_is_refused_naming_the_field() {
 /// seventh field of `getent passwd`, a Mac the value of `dscl -read ... UserShell`; a failing
 /// tool and an output with no such field are errors.
 ///
-/// Mutants seen red: the wrong field index; the Mac's separator.
+/// Catches: the wrong field index; the Mac's separator.
 #[test]
 fn the_system_os_reads_a_login_shell() {
     let mut exec = FakeExec::new(0);

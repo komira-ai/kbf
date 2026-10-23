@@ -229,7 +229,7 @@ async fn cache_io_errors_never_fail_a_lease() {
 }
 
 /// Catches a file another process made at a key's name during its fill being linked
-/// or indexed unhashed (the "on EEXIST, link it without hashing" mutant): the rename
+/// or indexed unhashed (defect "on EEXIST, link it without hashing"): the rename
 /// refuses, the lease gets the fetched bytes, the key is recorded, the next pass adopts
 /// the file unverified, and its first use re-hashes it, finds it wrong, and fetches the
 /// blob again.
@@ -622,8 +622,8 @@ async fn bytes_the_cache_could_not_keep_reach_private_names_too() {
     stop(cache, &gates);
 }
 
-/// Catches the files a previous run left fetched again, or served unhashed (the "link
-/// an existing name without hashing" mutant): a cache opened again on the same
+/// Catches the files a previous run left fetched again, or served unhashed (defect "link
+/// an existing name without hashing"): a cache opened again on the same
 /// directory, with no index of them, finds each at its key's name; a lease's fills
 /// re-hash them, adopt the one that is right, and fetch the one a byte was flipped in.
 #[tokio::test]
@@ -663,8 +663,8 @@ async fn files_a_previous_run_left_are_adopted_after_a_re_hash() {
 }
 
 /// Catches a link that finds its entry gone (`ENOENT`, an eviction or a deletion between
-/// the hit's check and the link) failing the lease (the "map `ENOENT` at link to a
-/// lease error" mutant): the key is settled again and the link retried.
+/// the hit's check and the link) failing the lease (defect "map `ENOENT` at link to a
+/// lease error"): the key is settled again and the link retried.
 #[tokio::test]
 async fn a_link_that_finds_the_entry_gone_refills_it() {
     let dir = scratch("cache-enoent");

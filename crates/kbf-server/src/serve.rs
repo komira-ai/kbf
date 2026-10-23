@@ -754,8 +754,6 @@ where
     let update_rows = state
         .as_ref()
         .map(|s| crate::update::Rows::new(Arc::clone(&s.store)));
-    let update_store = state.as_ref().map(|s| Arc::clone(&s.store));
-    let update_members = members.clone();
     let farm = Arc::new(farm.with_state(state)?);
     // One start, one bind budget: the three listeners wait for a late interface together.
     let binder = Binder::new();
@@ -926,15 +924,6 @@ where
         // and they never delay it. It stops when the serving future does.
         let history = crate::history::spawn(history);
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
-        // The rolling-update controller; it starts hosts for the desired release unless the
-        // operator wrote `auto_nodes` false or paused it.
-        let _updates = crate::update::spawn_controller(
-            Arc::clone(&farm),
-            update_store,
-            update_members,
-            listeners.tick,
-        )
-        .map(AbortOnDrop);
         // `reapi_incoming` carries the REAPI TLS when there is any, so the health
         // service is served over the same TLS as the REAPI routes; the authenticator is
         // already applied to those routes alone (above).
@@ -973,6 +962,8 @@ where
                 farm.tick().await;
             }
         };
+        // What the other frontends of a shared state store did (`Farm::intake`).
+        let intaking = farm.poll_intake();
         // Completes when the drain has run out of time or was forced: the REAPI
         // listener, drained in time, completes first.
         let stopping = async {
@@ -991,6 +982,7 @@ where
             // for again below (`reapi_done` stays false).
             served = &mut api_serve => served.map_err(ServeError::Api),
             () = ticking => Ok(()),
+            () = intaking => Ok(()),
             () = sweeping => Ok(()),
             // One timer for every open stream's progress operation.
             () = ticker.run() => Ok(()),

@@ -7,7 +7,7 @@
 //! on cue) and an [`AuditLog`] (which counts `PutBlobs` and checks each commits only
 //! over bytes the store holds). Most run under a paused clock, so the linger and the
 //! retry backoff are exact and nothing waits in real time. Each test names the defect
-//! it is there to catch, and the mutant that was planted to see it fail.
+//! it is there to catch.
 
 mod common;
 
@@ -132,7 +132,7 @@ fn config(edit: impl FnOnce(&mut WriteConfig)) -> WriteConfig {
 /// linger fires, so the count is exact.
 ///
 /// Catches: grouping not engaged (one PUT and one commit per caller, as before).
-/// Mutant seen red: seal on every push.
+/// Catches: seal on every push.
 #[tokio::test(start_paused = true)]
 async fn concurrent_single_blob_stores_share_one_put_and_one_commit() {
     let (cache, store) = default_cache().await;
@@ -158,7 +158,7 @@ async fn concurrent_single_blob_stores_share_one_put_and_one_commit() {
 /// commit goes through, all return and all are durable.
 ///
 /// Catches: acknowledging a caller on the PUT, or on its own push, before the commit.
-/// Mutant seen red: answer the waiters before `commit`.
+/// Catches: answer the waiters before `commit`.
 #[tokio::test(start_paused = true)]
 async fn no_caller_returns_before_its_segment_commits() {
     let (cache, store) = default_cache().await;
@@ -207,7 +207,7 @@ async fn no_caller_returns_before_its_segment_commits() {
 /// the other caller's segment commits and its blob is present.
 ///
 /// Catches: indexing a failed segment; a failure spreading to another segment; no
-/// retry, or a retry without the backoff. Mutants seen red: one attempt only; no sleep
+/// retry, or a retry without the backoff. Catches: one attempt only; no sleep
 /// between attempts.
 #[tokio::test(start_paused = true)]
 async fn a_failed_segment_fails_only_its_own_blobs() {
@@ -246,7 +246,7 @@ async fn a_failed_segment_fails_only_its_own_blobs() {
 ///
 /// Catches: one status smeared over the batch; the store's answers shifted by the
 /// invalid blob; the call counted ok in `kbf_batch_update_*` when only some of its
-/// blobs were stored. Mutants seen red: answer every verified blob with the first
+/// blobs were stored. Catches: answer every verified blob with the first
 /// failure; zip the store's answers with every response instead of the verified ones
 /// (`[OK, UNAVAILABLE, OK]`); count the call ok when any blob stored (`any` for `all`).
 #[tokio::test(start_paused = true)]
@@ -297,7 +297,7 @@ async fn a_batch_over_a_failed_and_a_good_segment_answers_each_blob() {
 /// segment fails UNAVAILABLE, none of the blobs is present, and the object is left in
 /// the store as an orphan.
 ///
-/// Catches: acknowledging on the PUT alone. Mutant seen red: ignore the commit's error.
+/// Catches: acknowledging on the PUT alone. Catches: ignore the commit's error.
 #[tokio::test(start_paused = true)]
 async fn a_refused_commit_fails_every_caller_in_the_segment() {
     let (cache, store) = default_cache().await;
@@ -332,7 +332,7 @@ async fn a_refused_commit_fails_every_caller_in_the_segment() {
 /// Each of the three attempts is observed in `kbf_segment_put_seconds`.
 ///
 /// Catches: a retry under the same key (it would fail `AlreadyExists` on the kept
-/// first PUT); timing only the PUT that succeeded. Mutants seen red: allocate the
+/// first PUT); timing only the PUT that succeeded. Catches: allocate the
 /// object id once, outside the retry loop; observe `segment_put` only on success.
 #[tokio::test(start_paused = true)]
 async fn a_put_retried_twice_takes_a_new_key_each_time() {
@@ -367,7 +367,7 @@ async fn a_put_retried_twice_takes_a_new_key_each_time() {
 /// A PUT the store answers 5xx is tried again; a 4xx answer is not (it would only be
 /// refused again), and fails the segment at once.
 ///
-/// Catches: retrying every error, or none. Mutants seen red: `transient` always true;
+/// Catches: retrying every error, or none. Catches: `transient` always true;
 /// the 5xx arm dropped; the range moved by one at either end.
 #[tokio::test(start_paused = true)]
 async fn only_a_put_that_did_not_reach_the_store_or_got_5xx_is_retried() {
@@ -394,7 +394,7 @@ async fn only_a_put_that_did_not_reach_the_store_or_got_5xx_is_retried() {
 /// and with 50 ms.
 ///
 /// Catches: waiting forever for a full segment (the timeout fires instead); sealing on
-/// a timer other than the linger. Mutant seen red: never seal on the linger.
+/// a timer other than the linger. Catches: never seal on the linger.
 #[tokio::test(start_paused = true)]
 async fn a_lone_write_is_sealed_at_the_linger() {
     for linger in [WriteConfig::DEFAULT.linger, Duration::from_millis(50)] {
@@ -422,7 +422,7 @@ async fn a_lone_write_is_sealed_at_the_linger() {
 /// one PUT only. `b` returns exactly one linger after it was stored, at t = 1.5 s.
 ///
 /// Catches: a linger timer that seals whichever segment is open, so a segment can be
-/// sealed before its oldest blob has waited the linger. Mutant seen red: the timer
+/// sealed before its oldest blob has waited the linger. Catches: the timer
 /// takes the open segment without checking its id (`open.take()` for
 /// `open.take_if(|open| open.id == id)`).
 #[tokio::test(start_paused = true)]
@@ -459,7 +459,7 @@ async fn a_full_segments_linger_does_not_seal_the_next_segment() {
 /// the small write is still waiting; a blob one byte smaller joins the open segment and
 /// returns with it at the linger.
 ///
-/// Catches: large blobs held up by small ones. Mutants seen red: `>` for `>=` at the
+/// Catches: large blobs held up by small ones. Catches: `>` for `>=` at the
 /// threshold; no own-segment path.
 #[tokio::test(start_paused = true)]
 async fn a_blob_at_the_own_segment_size_skips_the_linger() {
@@ -499,7 +499,7 @@ async fn a_blob_at_the_own_segment_size_skips_the_linger() {
 /// segment, one `PutBlobs` naming it once, and every caller answered OK.
 ///
 /// Catches: duplicate records or entries; a caller whose push was a no-op never
-/// answered. Mutant seen red: drop the waiter of a no-op push.
+/// answered. Catches: drop the waiter of a no-op push.
 #[tokio::test(start_paused = true)]
 async fn the_same_digest_from_two_callers_is_one_record() {
     let (cache, store) = default_cache().await;
@@ -524,7 +524,7 @@ async fn the_same_digest_from_two_callers_is_one_record() {
 ///
 /// Catches: a blob already stored written again (a second PUT and a second record, one
 /// more byte of storage for every re-upload), and a held blob left out of the answer
-/// (the call hangs or fails). Mutant seen red: `held` ignored in `submit` (the second
+/// (the call hangs or fails). Catches: `held` ignored in `submit` (the second
 /// call PUTs a segment of two records). This is also the one test that takes the
 /// held arm in this file's cache type, which the coverage ratchet counts per type.
 #[tokio::test(start_paused = true)]
@@ -559,7 +559,7 @@ async fn a_blob_already_stored_is_answered_and_not_written_again() {
 /// reach the store; once they are let go every caller succeeds, and no more than two
 /// were ever in flight.
 ///
-/// Catches: unbounded concurrent PUTs. Mutant seen red: no PUT slot.
+/// Catches: unbounded concurrent PUTs. Catches: no PUT slot.
 #[tokio::test(start_paused = true)]
 async fn segment_puts_are_bounded_by_the_puts_in_flight() {
     let two = NonZeroUsize::new(2).expect("two");
@@ -582,7 +582,7 @@ async fn segment_puts_are_bounded_by_the_puts_in_flight() {
 /// not fired) changes nothing: at the linger the segment is still written, and the
 /// blob indexed.
 ///
-/// Catches: a segment written only while a caller waits on it. Mutant seen red: skip
+/// Catches: a segment written only while a caller waits on it. Catches: skip
 /// the write when every waiter is gone.
 #[tokio::test(start_paused = true)]
 async fn a_caller_that_goes_away_before_the_seal_changes_nothing() {
@@ -615,7 +615,7 @@ async fn a_caller_that_goes_away_before_the_seal_changes_nothing() {
 /// 1-byte admission waits while the PUT is held, and gets in once it is let go.
 ///
 /// Catches: admission released when the caller goes rather than when its bytes are
-/// written. Mutant seen red: the admissions not carried with the segment.
+/// written. Catches: the admissions not carried with the segment.
 #[tokio::test(start_paused = true)]
 async fn a_caller_that_goes_away_keeps_its_bytes_admitted_until_they_are_written() {
     let (cache, store) = cache(
@@ -680,7 +680,7 @@ async fn one_admission_counts_all_its_bytes() {
 }
 
 /// Catches two admissions taken in parts each holding a part the other waits for
-/// (mutant: no lock around an admission over `u32::MAX`): under an 8 GiB bound, two
+/// (defect: no lock around an admission over `u32::MAX`): under an 8 GiB bound, two
 /// admissions of the largest upload asked at once would each take 4 GiB - 1 and wait
 /// forever for the rest; both are admitted, one after the other.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -711,8 +711,8 @@ async fn two_large_admissions_do_not_wait_on_each_other() {
 /// it does not finish, and once the bytes are released it stores its blob.
 ///
 /// Catches: a batch stored past the bound, and a batch admitted for less than its
-/// total (any amount up to the 4095 bytes left free would go through). Mutants seen
-/// red: no admission in BatchUpdateBlobs; `admit(1)` in place of `admit(total)`.
+/// total (any amount up to the 4095 bytes left free would go through). Catches:
+///  no admission in BatchUpdateBlobs; `admit(1)` in place of `admit(total)`.
 #[tokio::test(start_paused = true)]
 async fn a_batch_waits_for_admission_of_its_total() {
     const BOUND: u64 = 8 << 10;
@@ -771,7 +771,7 @@ async fn a_segment_write_that_panics_answers_internal() {
 /// `PutBlobs`, never more than the PUT slots in flight, and every blob reads back.
 ///
 /// Catches: per-blob PUTs and commits under load; segments sealed half-empty; a blob
-/// lost between segments. Mutant seen red: seal on every push.
+/// lost between segments. Catches: seal on every push.
 #[tokio::test(start_paused = true)]
 async fn fifteen_thousand_concurrent_writes_fill_segments_in_turn() {
     let limit: u64 = 4 << 20;

@@ -10,8 +10,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use kbf_front::{
-    Cache, CacheError, EvictReady, MemoryMetaLog, MetaLog, MetaLogError, ObjectKeys,
-    PASS_OPENS_PER_SEC, PassReport, VerifiedBlob,
+    Cache, CacheError, MemoryMetaLog, MetaLog, MetaLogError, ObjectKeys, PASS_OPENS_PER_SEC,
+    PassReport, VerifiedBlob,
 };
 use kbf_meta::{
     ActionAnswer, ActionRecord, Applied, Closure, Collected, Command, Epoch, MetaState, Miss,
@@ -34,6 +34,8 @@ struct Shared {
     flush_at: Mutex<Option<(usize, FsStore, ObjectKey, ObjectId)>>,
     /// Answers `EvictObjects` with another command's outcome: a broken log.
     misanswers: AtomicBool,
+    /// Refuses `EvictObjects` as unavailable: a stopped log.
+    refuses: AtomicBool,
 }
 
 impl Log {
@@ -43,6 +45,7 @@ impl Log {
             queries: AtomicUsize::new(0),
             flush_at: Mutex::new(None),
             misanswers: AtomicBool::new(false),
+            refuses: AtomicBool::new(false),
         }))
     }
 
@@ -75,6 +78,10 @@ impl Log {
 
 impl MetaLog for Log {
     async fn commit(&self, command: Command) -> Result<Applied, MetaLogError> {
+        if self.0.refuses.load(Ordering::Relaxed) && matches!(command, Command::EvictObjects { .. })
+        {
+            return Err(MetaLogError::Unavailable("stopped".to_owned()));
+        }
         if self.0.misanswers.load(Ordering::Relaxed)
             && matches!(command, Command::EvictObjects { .. })
         {
@@ -167,21 +174,9 @@ async fn open(log: &Log, files: &FsStore) -> Cache<Log, FsStore> {
         .expect("open a cache")
 }
 
-/// A log that needs no readying for `EvictObjects`.
-#[expect(clippy::unnecessary_wraps, reason = "the readiness hook's signature")]
-fn ready(_: &Log) -> Result<EvictReady, MetaLogError> {
-    Ok(EvictReady::Ready)
-}
-
-/// A log of a three-voter cell below the version that takes `EvictObjects`.
-#[expect(clippy::unnecessary_wraps, reason = "the readiness hook's signature")]
-fn needs_v3(_: &Log) -> Result<EvictReady, MetaLogError> {
-    Ok(EvictReady::NeedsV3 { voters: 3 })
-}
-
 async fn pass(cache: &Cache<Log, FsStore>, files: &FsStore) -> PassReport {
     cache
-        .consistency_pass(files, PASS_OPENS_PER_SEC, ready)
+        .consistency_pass(files, PASS_OPENS_PER_SEC)
         .await
         .expect("the pass")
 }
@@ -453,62 +448,6 @@ async fn pass_evicts_index_entry_without_file() {
     std::fs::remove_dir_all(&dir).expect("remove");
 }
 
-/// Catches a pass that forgets objects under a log that does not take `EvictObjects`
-/// (mutant: `NeedsV3` taken as ready), which would commit a command the other replicas
-/// of its cell refuse, or that leaves their blobs readable (mutant: nothing marked),
-/// so an action-cache hit names a blob no read can serve. Each lost object is marked
-/// missing: its blob reads as missing, an action needing it misses, and the index
-/// keeps it. The next pass, once the log takes the command, forgets them.
-#[tokio::test]
-async fn pass_marks_missing_until_the_log_takes_evict() {
-    let dir = scratch("needs-v3");
-    let files = FsStore::open(&dir, FLOOR).expect("open");
-    let log = Log::new();
-    let old = open(&log, &files).await;
-    for text in ["lost", "gone", "kept"] {
-        old.store_blobs(vec![blob(text)]).await.expect("store");
-    }
-    drop(old);
-    let needs_lost = digest("action needing lost");
-    put_action(&log, needs_lost, digest("lost")).await;
-    for seq in [1, 2] {
-        files.delete(&object_key(1, seq)).await.expect("delete");
-    }
-    let blobs = log.ask(MetaState::blob_count).await;
-
-    let cache = open(&log, &files).await;
-    let report = cache
-        .consistency_pass(&files, PASS_OPENS_PER_SEC, needs_v3)
-        .await
-        .expect("the pass");
-
-    assert_eq!((report.marked_missing, report.evicted_objects), (2, 0));
-    assert_eq!(
-        present(&cache, &["lost", "gone", "kept"]).await,
-        [false, false, true]
-    );
-    let found = log
-        .ask(|s| s.find_missing(&[digest("lost"), digest("kept")]))
-        .await;
-    assert_eq!(found.missing, [digest("lost")]);
-    let action = log.ask(|s| s.action(&needs_lost)).await;
-    assert_eq!(
-        action,
-        ActionAnswer::Miss(Miss::Unreachable(digest("lost")))
-    );
-    assert_eq!(log.ask(MetaState::blob_count).await, blobs);
-    drop(cache);
-
-    let cache = open(&log, &files).await;
-    let report = pass(&cache, &files).await;
-    assert_eq!((report.marked_missing, report.evicted_objects), (0, 2));
-    assert_eq!(log.ask(MetaState::blob_count).await, blobs - 2);
-    let action = log.ask(|s| s.action(&needs_lost)).await;
-    assert_eq!(action, ActionAnswer::Miss(Miss::NoEntry));
-    drop((cache, files));
-    std::fs::remove_dir_all(&dir).expect("remove");
-}
-
 /// Catches the pass wiping the index when the directory is not the one the index was
 /// written over (an unmounted disk: `FsStore::open` creates the directory empty), by
 /// forgetting every entry for want of its file (mutant: the guard removed). It must
@@ -592,7 +531,7 @@ async fn pass_keeps_its_pace_unless_under_the_floor() {
 
     let started = Instant::now();
     let paced = cache
-        .consistency_pass(&files, rate(6), ready)
+        .consistency_pass(&files, rate(6))
         .await
         .expect("the pass");
     assert!(started.elapsed() >= Duration::from_millis(900), "{paced:?}");
@@ -604,7 +543,7 @@ async fn pass_keeps_its_pace_unless_under_the_floor() {
     let cache = open(&log, &files).await;
     let started = Instant::now();
     cache
-        .consistency_pass(&files, rate(1), ready)
+        .consistency_pass(&files, rate(1))
         .await
         .expect("the pass");
     assert!(started.elapsed() < Duration::from_secs(3));
@@ -612,9 +551,9 @@ async fn pass_keeps_its_pace_unless_under_the_floor() {
     std::fs::remove_dir_all(&dir).expect("remove");
 }
 
-/// Catches failures turned into a quiet success: a log that cannot be readied for
-/// the eviction (a Raft log that cannot be raised to the format that carries it) fails
-/// the pass and forgets nothing; a shard that cannot be listed fails it.
+/// Asserts that failures are errors, not a quiet success: a log that refuses the eviction
+/// (a stopped Raft log) fails the pass and forgets nothing; a shard that cannot be listed
+/// fails it.
 #[tokio::test]
 async fn pass_failures_are_errors() {
     let dir = scratch("fails");
@@ -627,22 +566,18 @@ async fn pass_failures_are_errors() {
     files.delete(&object_key(1, 1)).await.expect("delete");
     let cache = open(&log, &files).await;
 
-    let refused = cache
-        .consistency_pass(&files, PASS_OPENS_PER_SEC, |_| {
-            Err(MetaLogError::Unavailable("not raised".into()))
-        })
-        .await;
+    log.0.refuses.store(true, Ordering::Relaxed);
+    let refused = cache.consistency_pass(&files, PASS_OPENS_PER_SEC).await;
     assert!(matches!(refused, Err(CacheError::Meta(_))), "{refused:?}");
     assert_eq!(present(&cache, &["lost"]).await, [true]);
+    log.0.refuses.store(false, Ordering::Relaxed);
 
     let empty_shard = std::fs::read_dir(dir.join("objects"))
         .expect("list the shards")
         .map(|e| e.expect("a shard").path())
         .find(|p| std::fs::remove_dir(p).is_ok());
     assert!(empty_shard.is_some(), "no empty shard to remove");
-    let failed = cache
-        .consistency_pass(&files, PASS_OPENS_PER_SEC, ready)
-        .await;
+    let failed = cache.consistency_pass(&files, PASS_OPENS_PER_SEC).await;
     assert!(matches!(failed, Err(CacheError::Store(_))), "{failed:?}");
     drop((cache, files));
     std::fs::remove_dir_all(&dir).expect("remove");
@@ -663,9 +598,7 @@ async fn pass_refuses_a_log_that_misanswers_the_eviction() {
     let cache = open(&log, &files).await;
     log.0.misanswers.store(true, Ordering::Relaxed);
 
-    let failed = cache
-        .consistency_pass(&files, PASS_OPENS_PER_SEC, ready)
-        .await;
+    let failed = cache.consistency_pass(&files, PASS_OPENS_PER_SEC).await;
 
     assert!(matches!(failed, Err(CacheError::Internal(_))), "{failed:?}");
     drop((cache, files));

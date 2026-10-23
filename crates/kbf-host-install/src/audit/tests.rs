@@ -15,6 +15,7 @@ fn entry(outcome: &'static str) -> Entry {
         channel: Some("candidate".into()),
         outcome,
         reason: None,
+        result: None,
         command: None,
     }
 }

@@ -518,7 +518,7 @@ async fn a_daemons_write_and_read_on_the_worker_listener_are_counted() {
 /// Catches: the worker listener's HTTP/2 windows left at the transport's defaults
 /// (`write_admission.rs` covers the REAPI listener only), with which the waiting
 /// Writes take the whole connection window and the admitted ones never receive their
-/// last bytes. Mutant seen red: `flow_control` not applied to the worker listener's
+/// last bytes. Catches: `flow_control` not applied to the worker listener's
 /// builder in `serve.rs` (the timeout fires with a few Writes done).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_writes_on_the_worker_listener_all_finish_under_the_bound() {
@@ -698,7 +698,7 @@ async fn a_certificate_must_name_exactly_one_node() {
 /// calls, the `Segments` calls and the chunking calls, is refused PERMISSION_DENIED; the
 /// control is the same node with the daemon role, served.
 ///
-/// Mutant seen red: the role table's layer left off the worker listener.
+/// Catches: the role table's layer left off the worker listener.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_blob_call_refuses_a_certificate_that_is_not_a_daemons() {
     let pki = Pki::new("roles");
@@ -736,7 +736,7 @@ async fn every_blob_call_refuses_a_certificate_that_is_not_a_daemons() {
 /// second, has every call refused PERMISSION_DENIED; daemon first, frontend second,
 /// is served.
 ///
-/// Mutant seen red: `chain.first()` read as `chain.last()` in the role table's layer.
+/// Catches: `chain.first()` read as `chain.last()` in the role table's layer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_blob_call_reads_the_role_from_the_leaf_certificate_alone() {
     let pki = Pki::new("leaf-role");
@@ -796,7 +796,7 @@ async fn a_node_certificate_finds_batches_and_walks_trees_on_the_worker_listener
     );
 }
 
-/// Catches (mutant "forward a chunking call without `admit`"): a chunking call passed
+/// Catches (defect "forward a chunking call without `admit`"): a chunking call passed
 /// to the cache's service before the caller is admitted. Admitted, each answers
 /// UNIMPLEMENTED as it does on the REAPI listener; from a denied node, each is refused
 /// PERMISSION_DENIED first.

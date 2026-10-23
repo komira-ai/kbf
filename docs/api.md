@@ -252,8 +252,8 @@ frontend, a daemon opens a worker stream.
 | `state` | `joining` (registered, a write owner, read last), `catching_up`, `active` (a full owner), `draining` (takes no new writes), `down` (its lease lapsed; kept in the map for the dwell, then it leaves the list) or `unknown` (a state a later build wrote that this one does not name; the member stays listed, takes no writes, is never read from and is not counted as `active`) |
 | `weight` | its share of the digests relative to the others |
 | `protocol` | the protocol version in the `RegisterRequest` that wrote the member's row (a heartbeat and a state change keep it; a new registration of the member replaces it). `null` when the row names none, as a row written before this field existed, and for a `down` member: its row expires with its heartbeats, and the version went with it |
-| `runs_log` | the newest metadata-log machine version the node's build can raise its log to, as the `RegisterRequest` that wrote the row said (a heartbeat never replaces it; it fills it only when the row holds none) |
-| `log_version` | the machine version the node's metadata log was at in its newest heartbeat (a registration says it too); it rises when the log is raised |
+| `runs_log` | the newest metadata-log machine version the node's build runs, as the `RegisterRequest` that wrote the row said (a heartbeat never replaces it; it fills it only when the row holds none). Informational: it is frozen at 5 and gates nothing |
+| `log_version` | the machine version the node's metadata log was at in its newest heartbeat (a registration says it too). Informational: no build raises a log any more, so it is the version an earlier build left, and 1 for a new log |
 | `build_commit` | the commit the node's binary was built from, as its registration said (a heartbeat never replaces it; it fills it only when the row holds none): 40 hex digits, or the 12-digit commit when the build did not know the full one, or the text `unknown` when the build had no git checkout; at most 64 bytes are kept |
 | `oldest_protocol` | the least `protocol` among the members whose `protocol` is not `null`; `null` if none is |
 | `protocol_unknown` | how many members have a `null` `protocol`. Never counted in `oldest_protocol`: read the two together, as for [`GET /v1/nodes`](#get-v1nodes) |
@@ -594,6 +594,32 @@ the drain, and the unit templates in `kbf-deploy` set it.
 restart it. `kbf cluster member <id> --state active|draining|planned-down [--for-secs N] --token-file F` calls
 `POST /v1/members/{id}`, and `kbf cluster denied --token-file F` calls `GET /v1/denied`.
 `kbf cluster object-store ...` calls the `/v1/object-stores/...` routes (below).
+`kbf cluster epoch-bump --token-file F` calls `POST /v1/epoch/bump`.
+
+## `POST /v1/epoch/bump`
+
+Raises the epoch the state store holds by one, for the day the store was restored from a
+backup and the daemons must drop the leases the lost history granted (the steps are in
+[kbf-units.md](deploy/kbf-units.md#the-state-store-postgres-for-the-frontend)). A write that
+passes every gate of [Who may write](#who-may-write) and takes no body (or `{}`). The epoch
+is the one `Welcome` names: a daemon that sees an epoch other than the one it knew kills the
+runs of its leases and lists none. A frontend that starts keeps the stored epoch, so a start
+no longer changes it; this call is the one way it changes.
+
+```json
+{ "previous": 41, "epoch": 42, "serving": 41 }
+```
+
+- `previous`: the epoch the store held before the call.
+- `epoch`: the epoch it holds now. The next frontend that starts serves it.
+- `serving`: the epoch the frontend that answered serves, the one it started under. The
+  call does not change it: restart the frontend for the new epoch to apply.
+
+`404` from a server with no `--state-store`, which keeps no epoch; `503` when the store
+cannot be reached or other writers kept changing the epoch for the whole of the call's tries
+(it changed nothing; call again); `409` when a newer frontend has taken the store's
+writer role from this one (it changed nothing, and calling again on this frontend cannot
+succeed: call the frontend that serves).
 
 ## `/v1/enroll/tokens` and `/v1/enroll/nodes`
 
@@ -967,8 +993,8 @@ without taking the generation, touches no epoch and writes nothing; it serves `/
 no scheduler or reconciler and binds no worker listener. It makes and changes no schema.
 A SQLite state file is held by one process (an exclusive file lock), so a candidate cannot
 run beside the process that holds the file: side by side needs the Postgres store.
-A start without `--await-takeover` takes the next generation and bumps the epoch, as any
-start does.
+A start without `--await-takeover` takes the next generation and keeps the epoch, as any
+start does; only `POST /v1/epoch/bump` changes it.
 
 ## `/v1/object-stores/...`
 
@@ -1066,7 +1092,10 @@ applied_generation, status, last_seen_secs}]}`.
 - `converged` is true only when at least one node is expected, every expected node has
   applied the current generation with status `ok`, and none is `unsupported`. It never claims
   more than the frontend knows: a frontend that has heard from no node says `false`.
-  **This build wires no source of node reports yet: `nodes` is empty and `converged` is `false`.**
+  The reports are the storage nodes' heartbeats: each accepted heartbeat writes a row in the
+  state store with a time to live of 15 seconds, so every frontend child reads the same reports, and a report
+  that is not renewed lapses and reads as `pending`. A farm restarted with an empty store shows
+  `pending` for every node until heartbeats arrive.
 
 **`GET /v1/object-stores/audit`** answers `{entries: [{seq, at, action, subject, outcome,
 generation}]}`, newest first. A row names what was touched and what happened, never a body

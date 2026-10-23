@@ -16,7 +16,7 @@ use cluster_support::{cluster, kbf, token_file};
 fn each_verb_sends_its_call_and_prints_the_answer() {
     let token = token_file("each", "kbf-test-token-0123456789abcdef0123456789");
     let bearer = "authorization: bearer kbf-test-token-0123456789abcdef0123456789";
-    let cases: [(&[&str], &str, &str); 9] = [
+    let cases: [(&[&str], &str, &str); 10] = [
         (&["status"], "GET /v1/nodes HTTP/1.1", ""),
         (
             &["status", "--frontend"],
@@ -81,6 +81,11 @@ fn each_verb_sends_its_call_and_prints_the_answer() {
             "POST /v1/members/7 HTTP/1.1",
             r#"{"for_secs":600,"state":"planned_down"}"#,
         ),
+        (
+            &["epoch-bump", "--token-file", &token],
+            "POST /v1/epoch/bump HTTP/1.1",
+            "",
+        ),
     ];
     for (args, line, body) in cases {
         let (code, out, err, request) = cluster("200 OK", r#"{"answer":1}"#, args);
@@ -115,7 +120,7 @@ fn each_verb_sends_its_call_and_prints_the_answer() {
 /// percent-encoded as one segment, behind the token and the JSON content type), and an exit
 /// status that does not follow the verdict: 0 and "safe to stop" when it is safe, 3 and the
 /// reasons on stdout when it is not (never 0, which would stop the host; never 1, which a
-/// script reads as a failed call), nothing on stderr for either. Mutants it catches: the
+/// script reads as a failed call), nothing on stderr for either. It catches: the
 /// exit status inverted; the reasons not printed.
 #[test]
 fn safe_to_stop_exits_0_when_safe_and_3_when_not() {
@@ -203,12 +208,14 @@ fn a_refusal_or_no_answer_exits_1_and_says_why() {
 /// Catches a command line that is accepted and means something else: `drain` with no
 /// target or with both, a deadline for the frontend (it has none), `undrain --frontend`
 /// (a frontend drain is not undone), a write with no token file, `safe-to-stop` with no id
-/// or no token file, and an unknown verb, all exit 2 with clap's message.
+/// or no token file, `epoch-bump` with no token file, and an unknown verb, all exit 2 with
+/// clap's message.
 #[test]
 fn a_command_line_that_names_no_single_call_exits_2() {
-    let rows: [&[&str]; 9] = [
+    let rows: [&[&str]; 10] = [
         &["cluster", "safe-to-stop", "--token-file", "t"],
         &["cluster", "safe-to-stop", "7"],
+        &["cluster", "epoch-bump"],
         &["cluster", "drain", "--token-file", "t"],
         &["cluster", "drain", "n1", "--frontend", "--token-file", "t"],
         &[
@@ -238,7 +245,8 @@ fn a_command_line_that_names_no_single_call_exits_2() {
 fn help_names_cluster_after_the_modes() {
     let (code, out, err) = kbf(&["--help"]);
     assert_eq!(code, Some(0), "{err}");
-    let verbs = "kbf cluster status|drain|undrain|member|safe-to-stop|denied|object-store";
+    let verbs =
+        "kbf cluster status|drain|undrain|member|safe-to-stop|denied|epoch-bump|object-store";
     assert!(out.contains(verbs), "{out}");
 }
 
@@ -249,14 +257,20 @@ fn the_cluster_help_and_the_hint_name_every_verb_group() {
     let (code, out, err) = kbf(&["cluster", "--help"]);
     assert_eq!(code, Some(0), "{err}");
     let about = out.lines().next().unwrap_or_default();
-    for word in ["member", "be stopped", "denied", "object store"] {
+    for word in ["member", "be stopped", "denied", "epoch", "object store"] {
         assert!(
             about.contains(word),
             "{word} missing from the about line: {out}"
         );
     }
     let (_, top, _) = kbf(&["--help"]);
-    for word in ["member", "safe-to-stop", "denied", "object-store"] {
+    for word in [
+        "member",
+        "safe-to-stop",
+        "denied",
+        "epoch-bump",
+        "object-store",
+    ] {
         assert!(top.contains(word), "{word} missing from the hint: {top}");
     }
 }

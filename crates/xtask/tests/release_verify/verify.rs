@@ -1,5 +1,5 @@
 //! `cargo xtask release verify` against real git repositories. Nothing here judges a verdict
-//! (CEO ruling, 2026-10-21): the tag's message is the Beta record `release verdict-write`
+//! (ruling, 2026-10-21): the tag's message is the Beta record `release verdict-write`
 //! wrote, an audit record that nothing gates on. `verify` checks the tag, the commit, main
 //! and the set; the tests that a record which says it failed, names another commit or set,
 //! or is not a record at all, changes none of that are `a_record_*` and `a_tag_*_verifies`.

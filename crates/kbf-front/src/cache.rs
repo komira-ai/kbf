@@ -414,12 +414,12 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// A registered storage node's cache over `meta` and `objects`: it commits
     /// [`Command::SetWriter`] for `writer` (the member id and boot counter its
     /// registration was given) and names every object it writes as that writer, under
-    /// `keys.root`, with no writer epoch. The log must take format 4.
+    /// `keys.root`, with no writer epoch. The log takes the command whatever machine
+    /// version it holds.
     ///
     /// # Errors
     /// [`CacheError::StaleWriter`] if the log has set this boot of the member, or a
-    /// later one, already; the metadata log is unavailable or does not take the
-    /// command.
+    /// later one, already; the metadata log is unavailable.
     pub async fn open_node(
         meta: M,
         objects: O,
@@ -875,9 +875,7 @@ mod write_group;
 
 pub use batch::BATCH_READS_IN_FLIGHT;
 pub use clear::FlushReport;
-pub use consistency::{
-    EVICT_BATCH, EvictReady, HeldObject, NEEDS_V3, PASS_OPENS_PER_SEC, PassReport,
-};
+pub use consistency::{EVICT_BATCH, HeldObject, PASS_OPENS_PER_SEC, PassReport};
 pub use evict::{EVICT_EVERY, EVICT_GRACE, EvictRound};
 pub use flush::{
     FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound,

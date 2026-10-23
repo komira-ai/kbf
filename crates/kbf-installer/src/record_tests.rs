@@ -63,7 +63,7 @@ fn an_unknown_key_is_refused_at_every_level() {
 /// Catches the three readers drifting apart on the key (this parser's `deny_unknown_fields`
 /// refused a staged record), and a staged record that carries claims being believed.
 ///
-/// Mutants to plant: the `Confirm | Revert if staged` arm of `check_shape` removed; its staged
+/// Catches: the `Confirm | Revert if staged` arm of `check_shape` removed; its staged
 /// `Activate` arm removed (the record then needs components).
 #[test]
 fn a_staged_record_is_a_locator_all_three_readers_accept_and_only_two_verbs_take_a_source() {
@@ -332,7 +332,7 @@ fn confirm_and_revert_carry_no_facts_either() {
 /// bare locator parses, and a record that adds components, expected facts or both is refused
 /// whole, each on its own. A verb spelled with a hyphen or in capitals is no verb.
 ///
-/// Mutants planted: the old rule restored (a `frontend_update` must carry components and
+/// Catches: the old rule restored (a `frontend_update` must carry components and
 /// facts: the locator and the golden are refused); components tolerated on a
 /// `frontend_update` (the `components` case is accepted); facts tolerated (the `facts` case).
 #[test]
@@ -386,7 +386,7 @@ fn a_frontend_update_is_a_locator_and_nothing_else() {
 /// and a locator whose verb is `activate` is no activation in any of them (it has no files
 /// to fetch).
 ///
-/// Mutants planted: `kbf-update`'s `check` letting a `frontend_update` carry components (its
+/// Catches: `kbf-update`'s `check` letting a `frontend_update` carry components (its
 /// refusal below is the one that goes red); the installer's `check_shape` doing the same;
 /// `helper::order::parse` mapping the locator to `Verb::Activate`.
 #[test]

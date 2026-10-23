@@ -41,7 +41,7 @@ fn inert(answer: &Answer, what: &str, content_type: &str, disposition: &str) {
     );
 }
 
-/// Catches (mutants: `attachment` dropped from the blob route or from the log route; the
+/// Catches (defects: `attachment` dropped from the blob route or from the log route; the
 /// content type of either set from the bytes; `nosniff` or the sandbox policy missing
 /// from either, or only from its errors; `inline=text` served as `text/html` or as an
 /// attachment of unknown type): an HTML file a build printed, read through the blob route,

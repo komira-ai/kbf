@@ -2,8 +2,8 @@
 //! `kbf-proxy.service` (docs/design/frontend-proxy.md, section 2; kbf-proxy-api.md, section
 //! 11). The generic rules of the parent module (placeholder, install, network, exec, reload,
 //! gate-file) apply to the service too; these are the ones that belong to a socket-activated
-//! service that supervises children it leaves running. Each rule has a planted defect in
-//! `MUTANTS`, and `every_proxy_rule_has_a_mutant` fails when one has none.
+//! service that supervises children it leaves running. Each rule has a broken unit in
+//! `BROKEN_UNITS`, and `every_proxy_rule_has_a_broken_unit` fails when one has none.
 
 use kbf_unitfile::UnitFile;
 
@@ -229,7 +229,7 @@ pub(super) fn service_rules(
 }
 
 /// One defect per rule: `(file, from, to, rule)`, as in the parent module.
-const MUTANTS: &[(&str, &str, &str, &str)] = &[
+const BROKEN_UNITS: &[(&str, &str, &str, &str)] = &[
     (
         "kbf-proxy.socket",
         "[Install]\n",
@@ -376,37 +376,37 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
-/// Catches a proxy rule that would pass a unit with its defect: each mutant is reported by
+/// Catches a proxy rule that would pass a unit with its defect: each broken unit is reported by
 /// the rule it names.
 #[test]
-fn each_proxy_defect_is_reported_by_its_rule() {
-    for (file, from, to, rule) in MUTANTS {
+fn each_broken_proxy_unit_is_reported_by_its_rule() {
+    for (file, from, to, rule) in BROKEN_UNITS {
         let text = read(file);
         assert!(
             text.contains(from),
-            "{file}: the mutant's `{from}` is not in the file"
+            "{file}: the broken unit's `{from}` is not in the file"
         );
-        let mutant = text.replacen(from, to, 1);
-        assert_ne!(mutant, text);
-        let found = violations(file, &mutant);
+        let broken = text.replacen(from, to, 1);
+        assert_ne!(broken, text);
+        let found = violations(file, &broken);
         assert!(
             rules_of(&found).contains(rule),
-            "{file}: mutant `{from}` -> `{to}` was not reported by rule {rule}: {found:?}"
+            "{file}: broken unit `{from}` -> `{to}` was not reported by rule {rule}: {found:?}"
         );
     }
 }
 
-/// Catches a proxy rule with no mutant, and a mutant for a rule that does not exist.
+/// Catches a proxy rule with no broken unit, and a broken unit for a rule that does not exist.
 #[test]
-fn every_proxy_rule_has_a_mutant() {
+fn every_proxy_rule_has_a_broken_unit() {
     for rule in RULES {
         assert!(
-            MUTANTS.iter().any(|m| m.3 == rule),
-            "rule {rule} has no mutant"
+            BROKEN_UNITS.iter().any(|m| m.3 == rule),
+            "rule {rule} has no broken unit"
         );
     }
-    for m in MUTANTS {
-        assert!(RULES.contains(&m.3), "mutant names no rule: {}", m.3);
+    for m in BROKEN_UNITS {
+        assert!(RULES.contains(&m.3), "broken unit names no rule: {}", m.3);
     }
 }
 

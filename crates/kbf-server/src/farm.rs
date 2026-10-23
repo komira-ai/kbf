@@ -11,8 +11,9 @@
 //! [`State::feed`]). The replicated log replaces exactly that step. Each process grants
 //! leases under its own term (and a store continues the sequence), so a lease id
 //! names one lease ever (issue #137). Under a state store the predecessor's own leases are
-//! restored (`take_stored`): its `Result` ends its own operation until the daemon's heartbeat omits
-//! the lease, and one naming another action is a MISMATCH; an id no row holds is UNKNOWN_LEASE.
+//! restored (`take_stored`) when their daemon says `Hello`: its `Result` ends its own
+//! operation until the daemon's heartbeat omits the lease, and one naming another action is
+//! a MISMATCH; an id no row holds is UNKNOWN_LEASE.
 //! Operations die with it too, so the term is part of every operation name (issue
 //! #154). The term, and the lease epoch `Welcome` names, come from the metadata log
 //! ([`MetaLog::leadership`]):
@@ -72,12 +73,16 @@ mod phase;
 mod record;
 pub mod sched_view;
 
-pub use durable::{DONE_FLOOR, EpochPolicy, SESSION_RENEWAL, StateError};
+pub use durable::{
+    ACK_WINDOW, DONE_FLOOR, EpochBump, EpochPolicy, ID_BLOCK, INTAKE_POLL, ORPHAN_WAIT,
+    OWNER_CACHE_TTL, SESSION_RENEWAL, StateError,
+};
 pub use handover::UNTRACED_LOOKS;
 pub use phase::Reported;
 
 use self::ack::{Verdict, refusal};
 use self::durable::Durable;
+use self::durable::intake::Intake;
 use crate::action_usage::{self, Measured, Shapes};
 use crate::fault;
 use crate::fleet::{NodeView, SoftwareView, attention_changes};
@@ -180,7 +185,7 @@ fn identity(caps: &kbf_caps::NodeCaps) -> (String, &'static str) {
     (os, caps.cpu.arch().name())
 }
 
-/// A node as the update controller reads it ([`Farm::update_look`]).
+/// A node as the update node step reads it ([`Farm::update_look`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeLook {
     /// Its id.
@@ -297,18 +302,22 @@ struct State {
     /// the operation: a copy of its `Result` is a duplicate, not an unknown lease
     /// ([`State::standing`]).
     answered: BTreeMap<LeaseId, OperationId>,
-    /// The held effect whose last try was refused as unreachable: a "row is gone" for
-    /// this effect and no other may be its own applied work
-    /// ([`State::release_unwritten`]).
-    retrying: Option<Effect>,
     /// Writes given up on for good: dropped as stale or fenced, or over the cap ([`Farm::dropped_writes`]).
     write_drops: u64,
     /// The most committed records `unwritten` holds before a new one is dropped.
     held_cap: usize,
     /// The scheduler was told the state store is unavailable ([`State::watch_store`]).
     store_down: bool,
-    /// When each node's session row in the state store was last written.
+    /// When each node's session row in the state store was last written, or renewed: the
+    /// next renewal falls due a renewal interval later.
     renewed: BTreeMap<WorkerId, FarmTime>,
+    /// When each node's session row was last written successfully, at its registration or
+    /// a renewal. Its heartbeats are acknowledged only while that was lately
+    /// ([`ACK_WINDOW`]).
+    session_ok: BTreeMap<WorkerId, FarmTime>,
+    /// The nodes whose `Hello` found the state store unreachable, so this frontend has not
+    /// claimed them, with the daemon process that said it ([`State::claim_pending`]).
+    unclaimed: BTreeMap<WorkerId, DaemonInstance>,
     /// A handover took the work from this farm ([`Farm::fence`]): it feeds the scheduler
     /// nothing and queues nothing.
     fenced: bool,
@@ -324,6 +333,9 @@ struct State {
     learned: Learned,
     /// Lowered key floors the state store has not taken yet ([`State::lower_key_floors`]).
     unwritten_floors: Vec<kbf_sched::KeyFloor>,
+    /// What the intake poll keeps between two looks at the state store
+    /// ([`Farm::intake`]).
+    intake: Intake,
 }
 
 /// How many committed records the farm holds for a state store that refuses them.
@@ -416,16 +428,18 @@ impl Farm {
                 owed: BTreeMap::new(),
                 answered: BTreeMap::new(),
                 parked: BTreeMap::new(),
-                retrying: None,
                 write_drops: 0,
                 held_cap: HELD_CAP,
                 store_down: false,
                 renewed: BTreeMap::new(),
+                session_ok: BTreeMap::new(),
+                unclaimed: BTreeMap::new(),
                 fenced: false,
                 untraced_kept: BTreeMap::new(),
                 untraced_relayed: BTreeMap::new(),
                 learned: Learned::new(LearnedSizes::Off, 0, 0),
                 unwritten_floors: Vec::new(),
+                intake: Intake::default(),
             }),
         }
     }
@@ -606,6 +620,9 @@ impl Farm {
             let cause = "the daemon restarted, or two daemons hold this node's certificate";
             tracing::warn!(%worker, cause, "another daemon process registered as this node");
         }
+        // Before the registration replaces the session row it reads, and before the
+        // scheduler hears of the worker, whose recovered leases it books.
+        state.claim_worker(now, worker, &instance);
         state.record_session(now, worker, &instance, stopped, &reported);
         let event = Event::WorkerUp {
             worker: worker.clone(),
@@ -720,7 +737,7 @@ impl Farm {
             .map_err(|_| SendError::NotConnected(worker.to_string()))
     }
 
-    /// Every node registered since this farm started, as the update controller reads it, in
+    /// Every node registered since this farm started, as the update node step reads it, in
     /// node-id order.
     pub fn update_look(&self) -> Vec<NodeLook> {
         let mut state = self.lock();
@@ -765,15 +782,20 @@ impl Farm {
     }
 
     /// Cordons, drains or uncordons `worker` (see `kbf_sched::Cordon`), and returns
-    /// the node as it is now. A drain's deadline counts from now.
+    /// the node as it is now. A drain's deadline counts from now, and is written on the
+    /// state store's clock. A node connected to another frontend of the state store is
+    /// placed too: that frontend applies the row at its next intake poll ([`Farm::intake`]).
     ///
     /// # Errors
-    /// `worker` has never registered.
+    /// `worker` has never registered with this frontend, and no frontend of the state store
+    /// has claimed it.
     pub fn place(&self, worker: &WorkerId, action: NodeAction) -> Result<NodeView, UnknownNode> {
         let now = self.now();
         let mut state = self.lock();
         state.note_closed_streams();
-        if state.machine.node(worker).is_none() {
+        // A node connected to another frontend of the state store is placed too: its
+        // `cordon/` row is the other frontend's to apply (the intake poll).
+        if state.machine.node(worker).is_none() && !state.known_elsewhere(worker) {
             return Err(UnknownNode(worker.as_str().to_owned()));
         }
         let name = worker.clone();
@@ -787,8 +809,11 @@ impl Farm {
         };
         tracing::info!(%worker, ?action, "operator action");
         state.feed_quiet(now, event);
-        let at = self.epoch_unix_ms.saturating_add(now.as_millis());
-        state.durably("a cordon", |d| d.cordoned(worker, action.stored(at)));
+        // A drain's deadline is written on the store's clock: the frontends that apply the
+        // row have clocks of their own.
+        state.durably("a cordon", |d| {
+            d.cordoned(worker, action.stored(d.store_ms()))
+        });
         Ok(self.node(&state, worker))
     }
 
@@ -1272,6 +1297,8 @@ impl State {
     /// answers, for the caller to deliver once the lock is released.
     fn carry_out(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
         self.watch_store(now);
+        self.claim_pending(now);
+        self.reserve_seqs();
         self.learned.clock(now);
         // Only the inputs whose callers deliver answers ([`State::feed_quiet`]) release
         // effects an earlier refusal held back: one of them may be an answer.
@@ -1292,6 +1319,12 @@ impl State {
         while let Some(effect) = effects.pop_front() {
             match effect {
                 Effect::Commit(record) => {
+                    // A refusal for want of a daemon waits on if another frontend's could
+                    // run the operation: it is not committed, and is proposed again after
+                    // another unservable wait.
+                    if self.held_for_other_frontends(&record) {
+                        continue;
+                    }
                     if let ControlRecord::Lease(grant) = &record {
                         self.offer(grant);
                     }
@@ -1390,10 +1423,10 @@ impl State {
     /// that the callers with a channel are exactly the callers the machine keeps: the
     /// same ids, not only as many.
     fn forget_dropped(&mut self) {
-        let sched = &self.sched;
-        let forgotten = self
-            .machine
-            .forget_dropped(|operation| sched.state(operation).is_some());
+        let (sched, intake) = (&self.sched, &self.intake);
+        let held =
+            |operation: OperationId| sched.state(operation).is_some() || intake.keeps(operation);
+        let forgotten = self.machine.forget_dropped(held);
         self.answered
             .retain(|_, operation| sched.state(*operation).is_some());
         for id in forgotten {

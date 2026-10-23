@@ -73,7 +73,7 @@ fn the_list_shows_each_node_with_its_state_leases_and_booking() {
 }
 
 /// Catches: markup from a node's strings (its id, software, attention items, phase
-/// reason) written as markup on either page (mutant: `Html::text` writing
+/// reason) written as markup on either page (catches: `Html::text` writing
 /// raw), and a node id not encoded as one path segment in its link and in the route read.
 #[test]
 fn hostile_node_strings_render_as_text() {

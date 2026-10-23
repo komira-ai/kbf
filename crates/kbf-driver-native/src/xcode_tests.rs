@@ -344,7 +344,7 @@ fn the_fake_sandbox_runs_a_program_held_open_for_writing() {
     kbf_outputs::remove_tree(&dir).expect("clean");
 }
 
-/// Catches (CEO decision on issue #164): a question of the survey, `xcrun`'s lookup
+/// Catches (decision on issue #164): a question of the survey, `xcrun`'s lookup
 /// above all (it reads and fills a cache leases can write), run outside the sandbox,
 /// with the network on, without the user-folder rules, in another lease directory or
 /// `TMPDIR`, or with `--no-cache` (the fake `xcrun` refuses it); the same of the Metal

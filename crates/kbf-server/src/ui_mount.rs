@@ -1,5 +1,5 @@
 //! The pages of `kbf-ui` on the operator API, under `/ui`, read-only and open
-//! (`docs/design/kbf-ui-v1.md`, R5; the CEO's ruling of 2026-10-20 made it open).
+//! (`docs/design/kbf-ui-v1.md`, R5; the ruling of 2026-10-20 made it open).
 //!
 //! - **On by default.** `--ui` is on unless `--ui=false`; with the operator API
 //!   (`--api-listen`) off there is nothing to mount on. Off, `/ui` is a plain `404`.

@@ -513,7 +513,7 @@ async fn uploads_are_refused_under_the_free_space_floor() {
 }
 
 /// Catches a full `file://` cold store that stops taking uploads: a write refused for want of
-/// room that does not wake the evictor (mutant: no nudge; the next round is the 10 s
+/// room that does not wake the evictor (defect: no nudge; the next round is the 10 s
 /// tick, after every retry of the PUT has failed), an evictor that frees nothing, or
 /// one that evicts what was used last. On a file system of 16 MiB that holds only the
 /// object files, with a 4 MiB floor and no grace window, twenty uploads of 1 MiB each

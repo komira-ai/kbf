@@ -4,8 +4,8 @@
 //! The store is the in-memory fake, which keeps a durable copy a restart reopens, and
 //! the farm's clock is tokio's, paused: nothing here waits. The tests that restart the
 //! farm over its store run a second time over a real SQLite file, closed and reopened, and
-//! a third time over a real Postgres schema when `KBF_TEST_POSTGRES_URL` names a server
-//! (those are `#[ignore]`d; the `state-postgres` CI job runs them).
+//! a third time over a real Postgres schema (`KBF_TEST_POSTGRES_URL` names the server; those
+//! tests fail without it).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use kbf_proto::worker::{self, ServerMessage, server_message};
 use kbf_sched::fence::START_GRACE;
 use kbf_sched::{DaemonInstance, Request};
 use kbf_server::farm::{Reported, StreamId};
-use kbf_server::{EpochPolicy, Farm, Listeners, ServeError, StateError, StateStore};
+use kbf_server::{EpochPolicy, Farm, ID_BLOCK, Listeners, ServeError, StateError, StateStore};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::postgres::{Flaw as PgFlaw, PostgresBackend, PostgresStore};
 use kbf_state::sqlite::{Options, SqliteStore};
@@ -38,14 +38,22 @@ use tonic::{Code, Status};
 mod ack_reasons;
 #[path = "state_store/budgets.rs"]
 mod budgets;
+#[path = "state_store/conditional.rs"]
+mod conditional;
 #[path = "state_store/fate.rs"]
 mod fate;
 #[path = "state_store/floors.rs"]
 mod floors;
 #[path = "state_store/handover.rs"]
 mod handover;
+#[path = "state_store/intake.rs"]
+mod intake;
+#[path = "state_store/owner.rs"]
+mod owner;
 #[path = "state_store/result_ack.rs"]
 mod result_ack;
+#[path = "state_store/shared.rs"]
+mod shared;
 #[path = "state_store/subject.rs"]
 mod subject;
 #[path = "state_store/takeover.rs"]
@@ -73,8 +81,12 @@ struct Flaky {
     lie_lease: AtomicBool,
     /// How many more reads of a `queue/` row fail before they succeed.
     fail_queue_get: AtomicI64,
+    /// How many times every `lease/` row has been read by a scan.
+    lease_scans: AtomicUsize,
     /// The writes that applied, oldest first, as the transaction prints.
     applied: std::sync::Mutex<Vec<String>>,
+    /// The fake's clock, which a test moves by hand; a real store's clock runs by itself.
+    clock: Option<Arc<ManualClock>>,
 }
 
 /// What the store is kept in.
@@ -149,8 +161,12 @@ fn open_sqlite(path: &std::path::Path) -> SqliteStore {
 
 impl Flaky {
     fn new() -> Self {
-        let inner = Fake::with_flaw(Arc::new(ManualClock::default()), Flaw::None);
-        Self::over(Inner::Fake(inner))
+        let clock = Arc::new(ManualClock::default());
+        let inner = Fake::with_flaw(Arc::clone(&clock), Flaw::None);
+        Self {
+            clock: Some(clock),
+            ..Self::over(Inner::Fake(inner))
+        }
     }
 
     fn over(inner: Inner) -> Self {
@@ -163,7 +179,9 @@ impl Flaky {
             lie: AtomicBool::new(false),
             lie_lease: AtomicBool::new(false),
             fail_queue_get: AtomicI64::new(0),
+            lease_scans: AtomicUsize::new(0),
             applied: std::sync::Mutex::new(Vec::new()),
+            clock: None,
         }
     }
 
@@ -195,6 +213,7 @@ impl Flaky {
 
     /// A crash and reopen: what the store acknowledged survives.
     fn restart(self) -> Self {
+        let clock = self.clock.clone();
         let inner = match self.inner {
             Inner::Fake(fake) => Inner::Fake(fake.restart()),
             Inner::Sqlite(tracked) => {
@@ -213,7 +232,10 @@ impl Flaky {
                 Inner::Postgres(Box::new(Tracked::new(reopened)))
             }
         };
-        Self::over(inner)
+        Self {
+            clock,
+            ..Self::over(inner)
+        }
     }
 }
 
@@ -253,6 +275,8 @@ impl Store for Flaky {
     }
 
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
+        let scans = &self.lease_scans;
+        scans.fetch_add(usize::from(prefix == "lease/"), Ordering::SeqCst);
         self.inner.store().scan_prefix(prefix)
     }
 
@@ -287,9 +311,6 @@ struct Disk {
     _postgres: Option<PostgresBackend>,
 }
 
-/// The variable naming a Postgres database the tests may create and drop schemas in.
-const POSTGRES_URL: &str = "KBF_TEST_POSTGRES_URL";
-
 impl Disk {
     fn new() -> Self {
         Self::over(Backing::Fake)
@@ -306,8 +327,7 @@ impl Disk {
             Backing::Postgres => (None, None),
         };
         let postgres = (matches!(backing, Backing::Postgres)).then(|| {
-            let url = std::env::var(POSTGRES_URL)
-                .unwrap_or_else(|_| panic!("{POSTGRES_URL} must name a database to test in"));
+            let url = kbf_testkit::database::server_url();
             PostgresBackend::new(&url, PgFlaw::None)
         });
         let inner = match &postgres {
@@ -403,6 +423,16 @@ impl Disk {
 
     fn rows(&self, prefix: &str) -> usize {
         self.store.scan_prefix(prefix).expect("scan").len()
+    }
+
+    /// Lets `by` pass on the store's clock: the fake's is moved by hand, and a real store's
+    /// runs by itself, so the test waits.
+    fn pass(&self, by: Duration) {
+        let waits = || std::thread::sleep(by);
+        self.store
+            .clock
+            .as_ref()
+            .map_or_else(waits, |clock| clock.advance(by));
     }
 }
 
@@ -566,8 +596,8 @@ async fn after_a_kill_running_leases_are_rebound_and_undelivered_ones_requeued(b
     let regranted = starts(&mut inbox);
     assert_eq!(
         regranted,
-        [LeaseId::new(running.term, 2)],
-        "a new lease for the second only"
+        [LeaseId::new(running.term, ID_BLOCK)],
+        "a new lease for the second only, numbered in the farm's own block"
     );
     assert!(
         !accepted(&after, undelivered).await,
@@ -578,10 +608,9 @@ async fn after_a_kill_running_leases_are_rebound_and_undelivered_ones_requeued(b
     assert_eq!(disk.rows("op/"), 0);
 }
 
-/// Catches: an epoch that does not follow the policy (a SQLite start that keeps it would
-/// let a daemon keep the runs of a restored file's leases; a Postgres start that bumps
-/// it would kill every run at each frontend start), and leases granted under another
-/// term than `Welcome` names.
+/// Asserts that the epoch follows the policy a start is given (kept by one that keeps it,
+/// raised by one by one that bumps it) and that the leases are granted under the term
+/// `Welcome` names, which is the epoch.
 async fn the_epoch_follows_the_policy_and_names_the_leases(backing: Backing) {
     let mut disk = Disk::over(backing);
     let first = disk.farm(EpochPolicy::Keep);
@@ -598,7 +627,9 @@ async fn the_epoch_follows_the_policy_and_names_the_leases(backing: Backing) {
     assert_eq!(bumped.lease_epoch(), epoch + 1);
     assert_eq!(bumped.term(), epoch + 1);
     let (_, mut inbox) = register(&bumped);
-    assert_eq!(starts(&mut inbox), [LeaseId::new(epoch + 1, 0)]);
+    // Each of the three starts reserved a block of lease sequences: the third numbers its
+    // leases from the third block.
+    assert_eq!(starts(&mut inbox), [LeaseId::new(epoch + 1, 2 * ID_BLOCK)]);
 }
 
 /// Catches: a request acknowledged to its client that the store did not take (a restart
@@ -744,7 +775,7 @@ async fn a_bumped_epoch_requeues_the_old_term_leases_the_daemon_killed(backing: 
     assert_eq!(after.lease_epoch(), epoch + 1);
     let (stream, mut inbox) = register(&after);
     assert!(after.heartbeat(&node(), stream, 1, Vec::new()).await);
-    assert_eq!(starts(&mut inbox), [LeaseId::new(epoch + 1, 1)]);
+    assert_eq!(starts(&mut inbox), [LeaseId::new(epoch + 1, ID_BLOCK)]);
     assert!(!accepted(&after, old).await, "the old term's result");
     assert_eq!(disk.rows("lease/"), 1);
 }
@@ -971,9 +1002,12 @@ async fn the_third_lost_lease_answers_the_caller_with_the_reason() {
     assert!(status.message.contains("lost"), "{}", status.message);
 }
 
-/// Catches: a lease given up for silence that stays in the store as held (a restart
-/// would re-bind a run nobody holds), and a refused operation that stays in it (it
-/// would be refused again, or run).
+/// Asserts that a lease given up for silence and a refusal are removed from the store: no
+/// lease is left as held (a restart would re-bind a run nobody holds), and no refused
+/// operation is left (it would be refused again, or run). The silent daemon's session row
+/// has expired by the time the operation is refused (the fake's clock stands still, so
+/// the test deletes it): a session row that is there is a daemon that could run the
+/// operation.
 #[tokio::test(start_paused = true)]
 async fn a_given_up_lease_and_a_refusal_are_written() {
     let disk = Disk::new();
@@ -990,6 +1024,8 @@ async fn a_given_up_lease_and_a_refusal_are_written() {
         "the lease was kept"
     );
 
+    let expired = Txn::new().delete("session/node-a", kbf_state::Cond::Any);
+    disk.store.txn(expired).expect("store").expect("delete");
     tokio::time::advance(kbf_sched::UNSERVABLE_WAIT + Duration::from_secs(1)).await;
     farm.tick().await;
     assert_eq!(disk.rows("op/"), 0, "the refused operation was kept");
@@ -1026,6 +1062,43 @@ async fn a_store_with_an_unreadable_row_refuses_the_farm() {
     assert!(matches!(refused, StateError::Corrupt { .. }), "{refused:?}");
 }
 
+use conditional::{
+    a_daemon_of_another_frontend_holds_back_the_refusal,
+    a_refusal_loses_to_a_grant_made_by_another_frontend,
+    a_result_reaching_the_frontend_a_daemon_left_finishes_nothing,
+    a_second_give_up_queues_nothing_beside_the_new_lease,
+    daemon_sessions_that_cannot_be_read_hold_back_a_refusal,
+};
+use intake::{
+    a_client_waiting_on_one_frontend_gets_the_result_another_recorded,
+    a_cordon_set_through_one_frontend_stops_grants_on_the_other,
+    a_drain_deadline_is_on_the_stores_clock_and_applied_by_the_other,
+    a_frontend_killed_mid_run_loses_nothing,
+    a_lost_grant_race_forgets_the_placement_and_the_operation_runs_once,
+    an_operation_queued_through_one_frontend_runs_on_a_daemon_of_another,
+    starting_a_frontend_leaves_the_leases_of_the_others_alone,
+    the_epoch_an_operator_raised_is_reported_by_the_other_frontend,
+};
+use owner::{
+    a_claim_the_store_refused_is_made_when_it_returns,
+    a_daemon_that_moves_to_another_frontend_keeps_its_lease,
+    a_give_up_for_a_node_the_daemon_left_is_dropped_once,
+    a_hello_to_the_frontend_that_holds_the_lease_takes_nothing_in,
+    a_joined_submit_finds_its_lease_through_the_index,
+    a_new_process_that_moves_waits_before_its_unlisted_lease_is_lost,
+    acks_stop_when_session_renewals_fail, acks_stop_when_the_daemon_moves,
+    an_ack_waits_for_the_session_row,
+    an_owner_row_that_cannot_be_read_blocks_the_claim_until_the_next_hello,
+    the_frontend_a_daemon_left_drops_only_that_nodes_writes,
+    the_same_process_that_moves_loses_an_unlisted_lease_at_once,
+    two_frontends_never_both_grant_to_the_same_worker,
+};
+use shared::{
+    a_second_frontend_started_over_the_store_keeps_its_epoch,
+    frontends_opening_an_empty_store_together_keep_one_epoch,
+    frontends_over_one_store_never_hand_out_the_same_id, the_operator_bump_raises_the_epoch_once,
+};
+
 /// Runs each restart test over the fake, over a SQLite file and over a Postgres schema: what the fake keeps
 /// across a crash is what the real store must.
 macro_rules! restarts {
@@ -1044,7 +1117,6 @@ macro_rules! restarts {
             }
 
             #[tokio::test(start_paused = true)]
-            #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
             async fn over_postgres() {
                 super::$name(Backing::Postgres).await;
             }
@@ -1057,9 +1129,39 @@ restarts!(
     after_a_kill_running_leases_are_rebound_and_undelivered_ones_requeued,
     the_epoch_follows_the_policy_and_names_the_leases,
     a_bumped_epoch_requeues_the_old_term_leases_the_daemon_killed,
+    frontends_over_one_store_never_hand_out_the_same_id,
+    a_second_frontend_started_over_the_store_keeps_its_epoch,
+    the_operator_bump_raises_the_epoch_once,
+    frontends_opening_an_empty_store_together_keep_one_epoch,
+    a_second_give_up_queues_nothing_beside_the_new_lease,
+    a_result_reaching_the_frontend_a_daemon_left_finishes_nothing,
+    a_daemon_of_another_frontend_holds_back_the_refusal,
+    a_refusal_loses_to_a_grant_made_by_another_frontend,
+    daemon_sessions_that_cannot_be_read_hold_back_a_refusal,
+    a_daemon_that_moves_to_another_frontend_keeps_its_lease,
+    a_give_up_for_a_node_the_daemon_left_is_dropped_once,
+    a_hello_to_the_frontend_that_holds_the_lease_takes_nothing_in,
+    the_frontend_a_daemon_left_drops_only_that_nodes_writes,
+    two_frontends_never_both_grant_to_the_same_worker,
+    a_joined_submit_finds_its_lease_through_the_index,
+    acks_stop_when_session_renewals_fail,
+    an_ack_waits_for_the_session_row,
+    acks_stop_when_the_daemon_moves,
+    a_new_process_that_moves_waits_before_its_unlisted_lease_is_lost,
+    the_same_process_that_moves_loses_an_unlisted_lease_at_once,
+    a_claim_the_store_refused_is_made_when_it_returns,
+    an_owner_row_that_cannot_be_read_blocks_the_claim_until_the_next_hello,
     lost_leases_are_counted_across_a_restart_and_the_third_is_refused,
     a_crash_at_any_write_of_a_finish_leaves_the_operation_or_its_result,
-    a_crash_at_any_write_of_a_refusal_leaves_the_operation_or_its_refusal
+    a_crash_at_any_write_of_a_refusal_leaves_the_operation_or_its_refusal,
+    an_operation_queued_through_one_frontend_runs_on_a_daemon_of_another,
+    a_lost_grant_race_forgets_the_placement_and_the_operation_runs_once,
+    a_client_waiting_on_one_frontend_gets_the_result_another_recorded,
+    a_frontend_killed_mid_run_loses_nothing,
+    a_cordon_set_through_one_frontend_stops_grants_on_the_other,
+    a_drain_deadline_is_on_the_stores_clock_and_applied_by_the_other,
+    starting_a_frontend_leaves_the_leases_of_the_others_alone,
+    the_epoch_an_operator_raised_is_reported_by_the_other_frontend
 );
 
 /// A state store opened as a start opens it: from the flag, over `dir`.
@@ -1083,7 +1185,7 @@ fn farm_over(state: StateStore) -> TestFarm {
 /// Catches: `--state-store=sqlite:///...` parsed and then not opened (the scheduler runs
 /// in memory while the operator believes its queue is kept): an operation submitted
 /// through a farm over the flag's store is granted by the farm a restart starts over the
-/// same file, with the term a SQLite start owes (one past the first's).
+/// same file, with the term the file holds: a SQLite start keeps the epoch.
 #[tokio::test(start_paused = true)]
 async fn an_operation_submitted_over_the_flag_survives_a_restart_of_the_file() {
     let dir = Scratch::new();
@@ -1093,11 +1195,11 @@ async fn an_operation_submitted_over_the_flag_survives_a_restart_of_the_file() {
     drop(before);
 
     let after = farm_over(store_from_flag(&dir.0).expect("a second start"));
-    assert_eq!(after.lease_epoch(), epoch + 1, "every SQLite start is new");
+    assert_eq!(after.lease_epoch(), epoch, "a SQLite start moved the epoch");
     let (_, mut inbox) = register(&after);
     let leases = starts(&mut inbox);
     assert_eq!(leases.len(), 1, "the queued operation was recovered");
-    assert_eq!(leases[0].term, epoch + 1);
+    assert_eq!(leases[0].term, epoch);
 }
 
 /// Catches: a second frontend started on a state file another holds (two schedulers
@@ -1323,8 +1425,12 @@ async fn a_crash_at_any_write_of_a_refusal_leaves_the_operation_or_its_refusal(b
             let (_, mut inbox) = lose_lease(&farm).await;
             assert_eq!(starts(&mut inbox).len(), 1);
         }
+        // The new session registers while the store takes writes (the frontend becomes the
+        // node's owner); the store then takes `writes` writes of the heartbeat that loses
+        // the lease for the third time, and the heartbeat may go unacknowledged.
+        let (stream, _inbox) = register(&farm);
         disk.store.fail_after(writes);
-        let _ = lose_lease(&farm).await;
+        let _ = farm.heartbeat(&node(), stream, 1, Vec::new()).await;
         disk.crash(farm);
         let (unfinished, ended) = standing(&disk);
         assert_eq!(
@@ -1872,10 +1978,10 @@ async fn a_grant_waits_behind_a_held_answer_and_a_given_up_lease_is_not_written(
     assert!(disk.store.get(&key).expect("read").is_some(), "{key}");
 }
 
-/// Catches: a "row is gone" read as already applied for an effect that was never tried
-/// (the retry flag shared by the whole queue): the held `Start` that was refused is
-/// purged when its lease is given up, and the answer behind it, whose rows really are
-/// gone, was never written; it must be dropped, not delivered.
+/// Asserts that a stale write is dropped and not delivered. The old bug read a "row is gone"
+/// as already applied for an effect that was never tried: the held `Start` that was
+/// refused is purged when its lease is given up, and the answer behind it, whose rows
+/// really are gone, was never written; it must be dropped, not delivered.
 #[tokio::test(start_paused = true)]
 async fn a_stale_refusal_of_a_never_tried_effect_drops_it() {
     let disk = Disk::new();

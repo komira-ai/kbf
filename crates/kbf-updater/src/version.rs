@@ -206,7 +206,7 @@ mod tests {
     }
 
     /// Catches the ERE drifting from the function: the pattern must stay anchored at both
-    /// ends (a mutant dropping `^` or `$` accepts a hostile prefix or suffix) and carry the
+    /// ends (a change dropping `^` or `$` accepts a hostile prefix or suffix) and carry the
     /// same bound and alphabet.
     #[test]
     fn the_ere_states_the_same_rule() {

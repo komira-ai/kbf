@@ -30,8 +30,9 @@
 //! `crate::helper::trusted_toml`, for the release fetcher. The `[proxy]` table and the
 //! release-source keys (`release_source`, `release_url`, `source_refs`, the frontend snapshot,
 //! `release_ca`, the node identity and the limits) are still read and checked here: hosts set
-//! up by an earlier build carry them, and `setup`, the fetcher and the stage policy still
-//! consume them until the release-fetching chain is removed.
+//! up by an earlier build carry them, and the fetcher and the stage policy still consume them
+//! until the release-fetching chain is removed. `setup` keeps the ones a file has and writes
+//! none of its own, except the node identity that goes with a `frontend` source.
 //!
 //! [`InstallerToml::render`] writes the one canonical form (every key but the unset optional
 //! ones, in a fixed order); the golden fixtures `testdata/golden/installer*.toml` are that form.
@@ -129,9 +130,8 @@ pub struct FrontendPull {
 
 impl FrontendPull {
     /// The three values as a snapshot, each held to its rule. `names` are what the address, the
-    /// CA path and the digest are called where they came from (the keys, or the flags of
-    /// `setup`); every bad value is a problem pushed to `problems`, which names it and does not
-    /// repeat its text.
+    /// CA path and the digest are called where they came from (the keys); every bad value is a
+    /// problem pushed to `problems`, which names it and does not repeat its text.
     pub(crate) fn checked(
         names: [&str; 3],
         url: &str,

@@ -8,6 +8,7 @@ One file per node class, in the exact format the OS prints:
 | `skylake_sp_platinum_8180.cpuinfo` | Intel Xeon Platinum 8180 (Skylake-SP) | Linux `/proc/cpuinfo` |
 | `ampere_altra_max_m128_30.cpuinfo` | Ampere Altra Max M128-30 (Neoverse N1) | Linux `/proc/cpuinfo` |
 | `apple_m3_ultra.sysctl` | Apple M3 Ultra | macOS `sysctl hw.optional` |
+| `apple_m3_ultra.ioreg` | Apple M3 Ultra | macOS `ioreg -r -d 1 -c AGXAccelerator` (the lines the GPU core count reads, in the registry's layout) |
 
 The cpuinfo files hold two processor blocks each, trimmed from a full listing; the
 parser keeps the features common to every block.

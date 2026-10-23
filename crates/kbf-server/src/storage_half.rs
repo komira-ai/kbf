@@ -210,7 +210,7 @@ where
     let meta = RaftMetaLog::open_dir(&stores.meta_dir, Retention::default(), prefix_root).await?;
     let (prefix, log) = (meta.store_prefix(), meta.log_id());
     let grace = Duration::from_millis(args.cold_store_evict_grace_ms);
-    let pass = files.map(|files| StartPass::over_raft(files, grace));
+    let pass = files.map(|files| StartPass::new(files, grace));
     // As `kbf storage` does ([`crate::storage_node::open_cache`]): bind, register with the
     // frontend if there is one, and only then open the cache, as the registration's member
     // and boot.

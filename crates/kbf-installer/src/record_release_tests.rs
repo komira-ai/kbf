@@ -309,7 +309,7 @@ fn staged(layout: &Layout) -> Option<CommitId> {
 /// making a release current drops a `staged` that names it, and `record-release` is one. A
 /// `staged` naming the recorded commit is cleared; one naming another commit is not touched.
 ///
-/// Mutants to plant: `staged` carried over by `first`; `staged` cleared whatever it names.
+/// Catches: `staged` carried over by `first`; `staged` cleared whatever it names.
 #[test]
 fn recording_a_staged_release_clears_it_and_another_staged_release_stays() {
     on_each_platform(|platform| {

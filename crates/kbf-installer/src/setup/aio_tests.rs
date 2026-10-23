@@ -54,7 +54,8 @@ fn children_file(exec: &mut FakeExec, text: &str) {
 /// of `kbf-server`, `installer.toml` points the children at theirs, the operator token and the
 /// spool belong to `kbf-server`, the sibling's account gets the rootless prerequisites, and the
 /// output says what is started in what order and what a restart of the sibling costs. The files
-/// are byte for byte the goldens.
+/// are byte for byte the goldens (`installer.toml`'s is a file an earlier setup wrote, so its
+/// release source is the default's here).
 #[test]
 fn an_all_in_one_host_gets_the_proxy_the_children_and_the_sibling() {
     let mut exec = aio_host();
@@ -67,7 +68,8 @@ fn an_all_in_one_host_gets_the_proxy_the_children_and_the_sibling() {
     assert_eq!(file_meta(&exec, KBF_TOML), (0o640, GROUP_KBF));
     assert_eq!(text(&exec, AIO_FRONTEND_TOML), FRONTEND_GOLDEN);
     assert_eq!(file_meta(&exec, AIO_FRONTEND_TOML), (0o640, GROUP_SERVER));
-    assert_eq!(text(&exec, INSTALLER_TOML), INSTALLER_GOLDEN);
+    let fresh = on_a_fresh_host(INSTALLER_GOLDEN);
+    assert_eq!(text(&exec, INSTALLER_TOML), fresh);
     assert_eq!(file_meta(&exec, INSTALLER_TOML), (0o644, ROOT));
     assert_eq!(text(&exec, API_TOKEN), format!("{SECRET}\n"));
     assert_eq!(file_meta(&exec, API_TOKEN), (0o600, KBF_SERVER));

@@ -35,10 +35,12 @@
 //! ([`check_daemon_user`]). Linux native keeps its process-group tracking
 //! ([`crate::procs`]); a pool there is refused.
 //!
-//! Not yet: the scheduler does not book slots (a lease past `N` waits here for a free
-//! one); and nothing drains or reboots a node with a dirty slot. A dirty slot lowers the runtime's `action_slots` entry at once, through its
-//! own part of the driver watch ([`SOURCE`]), and a recovery thread cleans it again
-//! ([`book`]) with no Xcode survey and no lease needed.
+//! The scheduler holds a node to its `action_slots` count: it places no lease on the node
+//! once it holds that many, so a lease waits here for a slot only while the directory of
+//! the one that just ended is still being cleaned. Not yet: nothing drains or reboots a
+//! node with a dirty slot. A dirty slot lowers the runtime's `action_slots` entry at
+//! once, through its own part of the driver watch ([`SOURCE`]), and a recovery thread
+//! cleans it again ([`book`]) with no Xcode survey and no lease needed.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -52,6 +54,8 @@ pub mod canary;
 // The bookkeeping and the clean's rules over text and a fake `launchctl` run on every
 // platform; only a Mac uses them outside tests.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod assertion;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod book;
 pub mod clean;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -62,6 +66,8 @@ pub(crate) mod domain;
 pub mod macos;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod probe;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod tool;
 
 /// The lowest uid a pool user may have: every uid below it is root's, a system
 /// account's, or (from 501) one a Mac gives its first human users. The pool's uids
@@ -84,7 +90,7 @@ pub const LEASES_ROOT_MODE: u32 = 0o711;
 pub const LEASE_DIR_MODE: u32 = 0o700;
 
 /// The name of the slots' part of the daemon's driver watch: the `action_slots` entry,
-/// pushed whenever the number of free slots changes.
+/// pushed whenever the number of usable (not dirty) slots changes.
 pub const SOURCE: &str = "slots";
 
 /// The node report entry that says how many actions run at once.
@@ -405,6 +411,24 @@ impl Runner {
         match self {
             Self::Daemon => Ok(canary::Report::default()),
             Self::Slot(slot) => slot.canary_until(isolation, network, lease, cancel).await,
+        }
+    }
+
+    /// The cheap probes of the assertion for the slot about to run the lease in `lease`
+    /// ([`macos::Slot::assert_ready`]): the lines that differ from the slot's baseline,
+    /// none for the daemon's user, which has no baseline.
+    ///
+    /// # Errors
+    /// The check did not finish.
+    #[cfg(target_os = "macos")]
+    pub async fn assert_ready(
+        &self,
+        lease: &Path,
+        cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<String>, RuntimeError> {
+        match self {
+            Self::Daemon => Ok(Vec::new()),
+            Self::Slot(slot) => slot.assert_ready_until(lease, cancel).await,
         }
     }
 

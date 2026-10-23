@@ -170,9 +170,10 @@ blob healed into another object stays), then every action entry whose result or
 closure names a removed blob. It clears the objects' unreachable marks, skips staged
 objects (their only copy is a block on a tier), and raises the loss count once per
 object that held a blob, which the input-tree skip cache reads. It is one scan of the
-index and one of the action cache, on the log's apply path. It is log format 3
-(`kbf_log::Format::V3`, machine version 3, `MetaCommand` field 15): a format-1 or
-format-2 log refuses it on encode and decode. Under a `file://` cold store the start-up pass
+index and one of the action cache, on the log's apply path. It was log format 3
+(`kbf_log::Format::V3`, machine version 3, `MetaCommand` field 15) and commits to a log at
+any format, with no raise: encode and decode do not depend on the format, and a binary that
+does not know the command skips it. Under a `file://` cold store the start-up pass
 commits it for index entries with no file behind them, and the evictor for the objects
 it evicts ([Eviction under disk pressure](#eviction-under-disk-pressure)).
 
@@ -241,8 +242,8 @@ A storage node registered with a frontend (`kbf storage --frontend`) names its o
 by the member id and boot counter its registration was given instead:
 `<root>cas/<member>/<boot>/<seq>`, where `<root>` is the prefix without the log id. The
 state store hands each boot out once, so the keys stay apart across a wiped metadata
-directory too; the node's log is at machine version 4 and has the writer set
-(`SetWriter`), and takes a put of no other node writer's object. Both layouts are read. An object the log never put (an old server's, under another log id; another node's; an earlier boot's) enters the index only when a rebuild adopts it from its footer (`AdoptSegment`); an epoch of another log is named with that log's id.
+directory too; the node's log has the writer set (`SetWriter`, committed to the log as it is:
+nothing raises its machine version), and takes a put of no other node writer's object. Both layouts are read. An object the log never put (an old server's, under another log id; another node's; an earlier boot's) enters the index only when a rebuild adopts it from its footer (`AdoptSegment`); an epoch of another log is named with that log's id.
 Under the in-memory metadata log (tests only) the metadata is in memory and starts again from epoch 1 at
 every start, so with an S3 cold store each server start writes under its own prefix (the
 configured prefix plus the start time), and keys never collide across restarts. Under

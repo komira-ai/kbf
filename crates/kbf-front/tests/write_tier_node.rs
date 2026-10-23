@@ -51,7 +51,7 @@ async fn start_as(
 /// has none: an id of 0, or the boot, could be a tier id the log retired), its blocks
 /// named as an epoch writer's, a later boot that cannot recover an earlier boot's
 /// staged block (the log must still take marks and flushes of it), and a flushed key
-/// that is not the node layout. Mutant seen red: `new_tier_id` answering the boot for a
+/// that is not the node layout. Catches: `new_tier_id` answering the boot for a
 /// node writer (boot 1 is the epoch writer's retired tier 1 here, and the start is
 /// refused).
 #[tokio::test]
@@ -138,7 +138,7 @@ async fn a_log_that_misanswers_a_node_start_refuses_it() {
 /// number, which the earlier lifetime used too, one conflict and one wasted upload per
 /// number. The first conflict must move the numbering past the earlier lifetime's, so
 /// the segment's next flush is the last; the earlier lifetime's objects stay as they were.
-/// Mutants seen red: `leave_numbering` doing nothing (the segment moves to number 2,
+/// Catches: `leave_numbering` doing nothing (the segment moves to number 2,
 /// one of the three taken), and a conflict that commits `FlushConflict` and leaves the
 /// object staged.
 #[tokio::test]

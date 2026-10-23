@@ -67,7 +67,7 @@ pub(crate) async fn run<M: MetaLog, O: ObjectStore>(
 pub(crate) fn spawn<M: MetaLog, O: ObjectStore + 'static>(
     cache: &Arc<Cache<M, O>>,
     catch_up: &CatchUp,
-    pass: Option<StartPass<M>>,
+    pass: Option<StartPass>,
     config: RebuildConfig,
 ) -> Background {
     let rebuild = catch_up

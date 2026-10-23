@@ -97,7 +97,7 @@ fn part<'a>(notes: &'a str, from: &str) -> &'a str {
 
 #[test]
 fn a_record_supplied_not_reversible_list_is_not_used_and_the_all_clear_opens_the_notes() {
-    // Catches (CEO ruling Q3: verify is the only source of the irreversible list): a notes
+    // Catches (ruling Q3: verify is the only source of the irreversible list): a notes
     // writer that unions in, or falls back to, the verdict's `not_reversible` lines. Proves
     // a verdict naming a line leaves the section at the all-clear when the builds agree, and
     // that the line appears nowhere in the notes. Mutant: re-add the union in `render`.

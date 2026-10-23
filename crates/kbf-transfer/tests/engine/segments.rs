@@ -239,7 +239,7 @@ async fn spooled(
     (spool, digests)
 }
 
-/// Catches per-blob calls and per-segment commits (mutant: one upload per segment):
+/// Catches per-blob calls and per-segment commits (defect: one upload per segment):
 /// 15,000 small outputs go as one `Begin`, one `Commit` and one `PutBlobs`, and every
 /// one is present after.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -263,7 +263,7 @@ async fn fifteen_thousand_outputs_are_one_upload_and_one_commit() {
     assert!(front.all_present(&digests).await);
 }
 
-/// Catches blobs the server holds sent again (mutant: the FindMissing answer ignored;
+/// Catches blobs the server holds sent again (defect: the FindMissing answer ignored;
 /// design step 4.1.1): a spool of 20 blobs, 10 of them uploaded by an earlier spool,
 /// declares only the 10 new ones in its `Begin`, and all 20 are present after.
 #[tokio::test]
@@ -289,7 +289,7 @@ async fn blobs_the_server_holds_are_not_sent_again() {
     assert!(front.all_present(&all).await);
 }
 
-/// Catches a new daemon failing against an old server (mutant: UNIMPLEMENTED is an
+/// Catches a new daemon failing against an old server (defect: UNIMPLEMENTED is an
 /// error): a front without `Segments` gets every blob by ByteStream (a large one
 /// streamed from the spool), and the next spool does not try `Segments` again.
 #[tokio::test]
@@ -333,7 +333,7 @@ impl std::io::Write for Log {
 }
 
 /// Catches the switch to blob-by-blob logged by every upload that meets UNIMPLEMENTED
-/// (mutant: the warning not guarded by the flag's swap): two uploads whose Begins are
+/// (defect: the warning not guarded by the flag's swap): two uploads whose Begins are
 /// both in flight when the answers come are both UNIMPLEMENTED, and one line says so.
 #[tokio::test]
 async fn uploads_in_flight_together_log_unimplemented_once() {
@@ -362,7 +362,7 @@ async fn uploads_in_flight_together_log_unimplemented_once() {
     assert_eq!(text.matches("Segments UNIMPLEMENTED").count(), 1, "{text}");
 }
 
-/// Catches a failed upload given up on, or retried forever (mutants: no retry; no
+/// Catches a failed upload given up on, or retried forever (defects: no retry; no
 /// fallback): a Commit that always fails is tried twice, then every blob goes by
 /// ByteStream and is present.
 #[tokio::test]
@@ -384,7 +384,7 @@ async fn a_failing_commit_is_retried_once_then_blobs_go_one_by_one() {
 /// upload: one 1 GiB upload, one failed PUT, every blob sent again): ten blobs of
 /// 10 MiB are four uploads of at most 32 MiB; the second fails twice, and only its three
 /// blobs go by ByteStream while the other seven stay committed by their own commits
-/// (mutant: `SEGMENT_UPLOAD_BYTES` back at 1 GiB + 1 MiB, one upload, no fall back).
+/// (defect: `SEGMENT_UPLOAD_BYTES` back at 1 GiB + 1 MiB, one upload, no fall back).
 #[tokio::test]
 async fn a_failed_upload_keeps_the_ones_committed_before_it() {
     // One upload at a time: which Commit is "the second" is only defined then.
@@ -409,7 +409,7 @@ async fn a_failed_upload_keeps_the_ones_committed_before_it() {
     assert!(front.all_present(&digests).await);
 }
 
-/// Catches fills still one call per blob (mutant: no coalescing): the 1,000 files of a
+/// Catches fills still one call per blob (defect: no coalescing): the 1,000 files of a
 /// tree, uploaded as segments, read back through `Locate` and `ReadRange` in at most
 /// ceil(bytes / 4 MiB) reads, every blob checked; a blob never uploaded is missing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -443,10 +443,10 @@ async fn a_tree_of_a_thousand_files_reads_back_in_few_ranges() {
     );
 }
 
-/// Catches a fill that fails, or hangs, when the server cannot locate or read (mutants:
+/// Catches a fill that fails, or hangs, when the server cannot locate or read (defects:
 /// a failed `Locate` or `ReadRange` returned as an error): every blob asked for comes
 /// back missing, so the caller fetches it another way. Also catches bytes from a
-/// range trusted unchecked (mutant: the per-blob digest check dropped): a range whose
+/// range trusted unchecked (defect: the per-blob digest check dropped): a range whose
 /// bytes were altered fails the read as corrupt.
 #[tokio::test]
 async fn reads_by_range_fall_back_to_missing_and_refuse_altered_bytes() {
@@ -478,7 +478,7 @@ async fn reads_by_range_fall_back_to_missing_and_refuse_altered_bytes() {
     }
 }
 
-/// Catches Locate answers paired to the asked digests by position (mutant: `zip` of
+/// Catches Locate answers paired to the asked digests by position (defect: `zip` of
 /// the batch and the answer): an answer one location short, or in another order,
 /// still accounts for every asked digest, each read blob under its own digest; a
 /// digest the answer does not name is missing, never dropped.
@@ -510,7 +510,7 @@ async fn a_short_or_reordered_locate_answer_loses_no_digest() {
     }
 }
 
-/// Catches a spool that cannot be read treated as a failed call (mutant: the spool
+/// Catches a spool that cannot be read treated as a failed call (defect: the spool
 /// error retried and then sent blob by blob, each read failing again): when the spool
 /// file is cut short after its blobs were spooled, `put_spool` fails with a read
 /// error after one `Begin` and no `Commit`. Linux only: the unlinked spool file is
@@ -551,8 +551,8 @@ async fn a_spool_cut_short_fails_the_upload_without_a_retry() {
 /// streams, an upload of five 4 MiB ranges whose `PutRange` calls the server holds
 /// (as a slow server holds them) must leave a permit for another lease's read: the
 /// ranges hold the uploads' share (3), and the read finishes while they are held.
-/// Before the fix the ranges took all 4 permits and the read waited for them. Mutant
-/// seen red: no share taken by `put_range` (4 held, the read stuck).
+/// Before the fix the ranges took all 4 permits and the read waited for them. Catches:
+///  no share taken by `put_range` (4 held, the read stuck).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn held_ranges_leave_a_permit_for_another_leases_read() {
     let config = TransferConfig {
@@ -600,7 +600,7 @@ async fn held_ranges_leave_a_permit_for_another_leases_read() {
 /// server holding every `PutRange` and `--segment-uploads-in-flight` 4, the four uploads
 /// of ten 10 MiB blobs all `Begin` while none has committed; with 1 only the first does
 /// (the test then opens the gate, so it ends). After the gate opens every blob is
-/// present and each upload committed once. Mutant seen red: the `for` loop over uploads
+/// present and each upload committed once. Catches: the `for` loop over uploads
 /// back (2 Begins at most, the wait below times out).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uploads_of_one_spool_are_in_flight_together() {
@@ -698,7 +698,7 @@ async fn records_are_sent_from_their_files_with_no_copy() {
 /// of what it held (the walk's one read is the only hash on the daemon, so this is the
 /// guard): each way a file can differ from what was hashed (rewritten, appended to,
 /// replaced by another file, removed, replaced by a symlink) fails the upload with a
-/// read error naming the file, and the blob is not stored. Mutants seen red: the
+/// read error naming the file, and the blob is not stored. Catches: the
 /// stamp comparison dropped from `FileSource::check` (rewritten and appended
 /// uploaded; the server, which hashes, refused them later with a different error),
 /// `NOFOLLOW` dropped from `OPEN_FILE` (symlink followed).
@@ -750,7 +750,7 @@ async fn a_file_changed_after_it_was_hashed_is_refused() {
 /// bytes that do not hash to the record's digest, in a file that looks unchanged (its
 /// stamp is taken after the content differs, as a write that raced the walk's hash would
 /// leave it), are refused by the server's per-record check at `Commit`, and by the
-/// ByteStream fallback's, so the upload fails and neither digest is stored (mutant: the
+/// ByteStream fallback's, so the upload fails and neither digest is stored (defect: the
 /// server's record check is in kbf-front, see its tests; this one pins that the daemon
 /// does not paper over a refused upload).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -785,7 +785,7 @@ async fn bytes_that_do_not_hash_to_their_digest_are_never_stored() {
 /// are refused when `d` is renamed away, replaced by a symlink to a directory holding the
 /// same files, or made unreadable (each way `descend` fails: a name that is gone, one that
 /// is no directory now, any other error). The upload fails with a read error and nothing
-/// is stored (mutants seen red: `NOFOLLOW` dropped from `OPEN_DIRECTORY`, the symlinked
+/// is stored (catches `NOFOLLOW` dropped from `OPEN_DIRECTORY`, the symlinked
 /// directory followed and its files uploaded).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_directory_changed_after_its_files_were_hashed_is_refused() {
@@ -855,7 +855,7 @@ async fn a_directory_changed_after_its_files_were_hashed_is_refused() {
 
 /// Catches a record whose bytes are fewer than its digest says being sent short, or its
 /// error lost: a blob held in memory that is shorter than the size in its digest fails
-/// the upload with a read error naming the blob, and nothing is stored (mutant: the
+/// the upload with a read error naming the blob, and nothing is stored (defect: the
 /// short read zero-filled).
 #[tokio::test]
 async fn a_record_shorter_than_its_digest_fails_with_a_read_error() {
@@ -914,7 +914,7 @@ fn sparse_record(name: &str, size: u64) -> Record {
 }
 
 /// Catches a large record refused without a write tier, or the upload retried before
-/// it falls back (mutants: FAILED_PRECONDITION at `Begin` taken for a failure, or for
+/// it falls back (defects: FAILED_PRECONDITION at `Begin` taken for a failure, or for
 /// a retry): a record one byte over 16 MiB (`MAX_UNSTAGED_BLOB_BYTES`) is sent by one
 /// ByteStream Write, which streams it to the store, and is held after; a record of
 /// exactly 16 MiB goes through the segment upload, with no ByteStream Write.

@@ -106,15 +106,8 @@ fn compare(commit: &str, status: &str) -> (String, serde_json::Value) {
     )
 }
 
-fn runs_path(commit: &str) -> String {
-    format!(
-        "repos/{REPO}/actions/workflows/artifacts.yml/runs?head_sha={commit}&event=push\
-         &branch=main&status=success&per_page=100"
-    )
-}
-
-/// A run of the artifacts workflow: `RUN` for `COMMIT`, a push on main that succeeded,
-/// with `changed` set on top.
+/// The pipeline run `RUN` for `COMMIT`: a push on main that succeeded, with `changed` set
+/// on top.
 fn run(changed: serde_json::Value) -> serde_json::Value {
     let mut r = serde_json::json!({
         "id": RUN, "head_sha": COMMIT, "head_branch": "main", "event": "push",
@@ -126,11 +119,9 @@ fn run(changed: serde_json::Value) -> serde_json::Value {
     r
 }
 
-fn runs(list: Vec<serde_json::Value>) -> (String, serde_json::Value) {
-    (
-        runs_path(COMMIT),
-        serde_json::json!({ "workflow_runs": list }),
-    )
+/// GitHub's answer for the run `RUN` itself.
+fn the_run(r: serde_json::Value) -> (String, serde_json::Value) {
+    (format!("repos/{REPO}/actions/runs/{RUN}"), r)
 }
 
 fn artifacts(list: &[(&str, bool)]) -> (String, serde_json::Value) {
@@ -159,6 +150,8 @@ fn locate(root: &Path, commit: &str, defect: Option<&str>) -> (Option<i32>, Stri
             REPO,
             "--commit",
             commit,
+            "--run-id",
+            &RUN.to_string(),
             "--output",
             s(&output),
         ],
@@ -167,31 +160,27 @@ fn locate(root: &Path, commit: &str, defect: Option<&str>) -> (Option<i32>, Stri
 }
 
 #[test]
-fn locate_finds_the_successful_main_push_run_of_the_commit() {
+fn locate_accepts_the_successful_main_push_run_of_the_commit() {
     // Control: catches a locate that refuses a commit on main (`main` ahead of it, or
-    // at it), takes a decoy run (another commit, branch or event, or a failed run)
-    // listed before the right one, or does not hand the run on to the next steps.
+    // at it), or does not hand the run on to the next steps. An expired artifact that is
+    // not one a release needs does not matter.
     for status in ["behind", "identical"] {
         let root = scratch(&format!("locate-{status}"));
-        let decoys = [
-            serde_json::json!({ "id": 1, "head_sha": OTHER }),
-            serde_json::json!({ "id": 2, "head_branch": "feature" }),
-            serde_json::json!({ "id": 3, "event": "workflow_dispatch" }),
-            serde_json::json!({ "id": 4, "conclusion": "failure" }),
-        ];
-        let mut list: Vec<serde_json::Value> = decoys.into_iter().map(run).collect();
-        list.push(run(serde_json::json!({})));
         let mut kept = ARTIFACTS.map(|a| (a, false)).to_vec();
-        kept.push(("sha256sums", true));
+        kept.push(("beta-b0-1", true));
         answers(
             &root,
-            &[compare(COMMIT, status), runs(list), artifacts(&kept)],
+            &[
+                compare(COMMIT, status),
+                the_run(run(serde_json::json!({}))),
+                artifacts(&kept),
+            ],
         );
         let (code, out, err) = locate(&root, COMMIT, None);
         assert_eq!(code, Some(0), "{err}");
         assert_eq!(
             out,
-            format!("{COMMIT} is on main; run {RUN} of artifacts.yml built it\nrun-id={RUN}\n")
+            format!("{COMMIT} is on main; run {RUN} built it\nrun-id={RUN}\n")
         );
         let output = std::fs::read_to_string(root.join("github-output")).expect("output");
         assert_eq!(output, format!("run-id={RUN}\n"));
@@ -206,13 +195,22 @@ fn locate_without_output_only_prints_the_run() {
         &root,
         &[
             compare(COMMIT, "behind"),
-            runs(vec![run(serde_json::json!({}))]),
+            the_run(run(serde_json::json!({}))),
             all_artifacts(),
         ],
     );
     let (code, out, err) = xtask(
         &root,
-        &["release", "locate", "--repo", REPO, "--commit", COMMIT],
+        &[
+            "release",
+            "locate",
+            "--repo",
+            REPO,
+            "--commit",
+            COMMIT,
+            "--run-id",
+            &RUN.to_string(),
+        ],
         None,
     );
     assert_eq!(code, Some(0), "{err}");
@@ -222,7 +220,7 @@ fn locate_without_output_only_prints_the_run() {
 #[test]
 fn locate_refuses_a_commit_that_is_not_on_main() {
     // Catches: a tag on a branch commit (`main` behind it or diverged from it) or on a
-    // commit GitHub does not know released, and a check made after looking for runs.
+    // commit GitHub does not know released, and a check made after looking at the run.
     for (name, status) in [
         ("ahead", Some("ahead")),
         ("diverged", Some("diverged")),
@@ -232,10 +230,7 @@ fn locate_refuses_a_commit_that_is_not_on_main() {
         if let Some(status) = status {
             answers(
                 &root,
-                &[
-                    compare(COMMIT, status),
-                    runs(vec![run(serde_json::json!({}))]),
-                ],
+                &[compare(COMMIT, status), the_run(run(serde_json::json!({})))],
             );
         }
         let (code, out, err) = locate(&root, COMMIT, None);
@@ -247,7 +242,10 @@ fn locate_refuses_a_commit_that_is_not_on_main() {
             ),
             "{name}"
         );
-        assert!(!gh_args(&root).contains("runs"), "{name}: looked for runs");
+        assert!(
+            !gh_args(&root).contains("runs"),
+            "{name}: looked at the run"
+        );
         assert!(
             !root.join("github-output").exists(),
             "{name}: wrote an output"
@@ -256,32 +254,39 @@ fn locate_refuses_a_commit_that_is_not_on_main() {
 }
 
 #[test]
-fn locate_refuses_a_commit_with_no_successful_main_push_run() {
-    // Catches: a decoy run (another commit, another branch, another event, a failed
-    // run) taken as the one that built the commit, and no runs at all taken for one.
+fn locate_refuses_a_run_that_did_not_build_the_commit_on_a_main_push() {
+    // Catches: a run of another commit, another branch, another event, a run that did not
+    // succeed (failed, cancelled, still going), or none at all taken as the one that built
+    // the commit.
     let decoys = [
         serde_json::json!({ "head_sha": OTHER }),
         serde_json::json!({ "head_branch": "feature" }),
         serde_json::json!({ "event": "pull_request" }),
+        serde_json::json!({ "event": "workflow_dispatch" }),
         serde_json::json!({ "conclusion": "cancelled" }),
-        serde_json::json!({ "id": "not a number" }),
+        serde_json::json!({ "conclusion": "failure" }),
+        serde_json::json!({ "conclusion": null }),
     ];
-    let mut cases: Vec<(String, Option<Vec<serde_json::Value>>)> =
-        vec![("none".to_owned(), Some(vec![])), ("404".to_owned(), None)];
+    let mut cases: Vec<(String, Option<serde_json::Value>)> = vec![("404".to_owned(), None)];
     for (i, d) in decoys.into_iter().enumerate() {
-        cases.push((format!("decoy-{i}"), Some(vec![run(d)])));
+        cases.push((format!("decoy-{i}"), Some(run(d))));
     }
-    for (name, list) in cases {
+    for (name, the) in cases {
         let root = scratch(&format!("locate-no-run-{name}"));
         let mut given = vec![compare(COMMIT, "behind")];
-        given.extend(list.map(runs));
+        given.extend(the.map(the_run));
+        given.push(all_artifacts());
         answers(&root, &given);
         let (code, _, err) = locate(&root, COMMIT, None);
         assert_eq!(code, Some(1), "{name}");
         assert_eq!(
             err,
-            format!("xtask: no successful push run of artifacts.yml on main for {COMMIT}\n"),
+            format!("xtask: run {RUN} is not a successful push run on main for {COMMIT}\n"),
             "{name}"
+        );
+        assert!(
+            !root.join("github-output").exists(),
+            "{name}: wrote an output"
         );
     }
 }
@@ -295,7 +300,7 @@ fn locate_refuses_a_run_whose_artifacts_are_gone() {
         &root,
         &[
             compare(COMMIT, "behind"),
-            runs(vec![run(serde_json::json!({}))]),
+            the_run(run(serde_json::json!({}))),
             artifacts(&[
                 ("assets-darwin-arm64", true),
                 ("assets-linux-x86_64", false),
@@ -309,9 +314,9 @@ fn locate_refuses_a_run_whose_artifacts_are_gone() {
     assert_eq!(
         err,
         format!(
-            "xtask: run {RUN} of artifacts.yml holds no unexpired artifact assets-darwin-arm64\n\
-             run {RUN} of artifacts.yml holds no unexpired artifact sha256sums\n\
-             run {RUN} of artifacts.yml holds no unexpired artifact bundles-linux\n"
+            "xtask: run {RUN} holds no unexpired artifact assets-darwin-arm64\n\
+             run {RUN} holds no unexpired artifact sha256sums\n\
+             run {RUN} holds no unexpired artifact bundles-linux\n"
         )
     );
     // No artifacts listing at all: every one is missing.
@@ -320,7 +325,7 @@ fn locate_refuses_a_run_whose_artifacts_are_gone() {
         &root,
         &[
             compare(COMMIT, "behind"),
-            runs(vec![run(serde_json::json!({}))]),
+            the_run(run(serde_json::json!({}))),
         ],
     );
     let (code, _, err) = locate(&root, COMMIT, None);
@@ -343,7 +348,7 @@ fn locate_refuses_a_run_whose_bundles_are_gone() {
         &root,
         &[
             compare(COMMIT, "behind"),
-            runs(vec![run(serde_json::json!({}))]),
+            the_run(run(serde_json::json!({}))),
             artifacts(&kept),
         ],
     );
@@ -352,8 +357,8 @@ fn locate_refuses_a_run_whose_bundles_are_gone() {
     assert_eq!(
         err,
         format!(
-            "xtask: run {RUN} of artifacts.yml holds no unexpired artifact bundles-darwin-arm64\n\
-             run {RUN} of artifacts.yml holds no unexpired artifact bundles-linux\n"
+            "xtask: run {RUN} holds no unexpired artifact bundles-darwin-arm64\n\
+             run {RUN} holds no unexpired artifact bundles-linux\n"
         )
     );
 }
@@ -405,6 +410,8 @@ fn a_gh_that_cannot_be_started_fails_the_run() {
             REPO,
             "--commit",
             COMMIT,
+            "--run-id",
+            "1",
             "--gh",
             s(&absent),
         ])
@@ -873,7 +880,7 @@ fn check_waives_the_version_facts_of_a_release_made_before_them_and_only_that() 
     // Catches: the first release after the facts were recorded failing at its check of the
     // previous release (a `kbf` tarball and no facts: nothing is published), and a waiver
     // that is a general pass: without the flag the same directory is refused, with it
-    // facts without their tarball are still refused, and so is a changed file. Mutants:
+    // facts without their tarball are still refused, and so is a changed file. Catches:
     // the flag ignored; the flag skipping the whole pairing; the flag skipping the sums.
     let root = scratch("check-waived");
     let d = dist_with_kbf(&root, "linux-arm64", false);
@@ -912,7 +919,7 @@ fn check_refuses_version_facts_that_are_not_kbfs_for_the_commit() {
     // Catches: any file ending `.version.json` taken as an asset (another binary's, an
     // unknown platform's, a renamed copy), when the set holds one name per platform.
     // Another commit's facts are refused earlier, by the sums (no tarball of it is listed);
-    // `is_facts_of` has a test of its own for that name. Mutant: the exact name replaced by
+    // `is_facts_of` has a test of its own for that name. Catches: the exact name replaced by
     // the suffix.
     for bad in [
         format!("kbf-daemon-{COMMIT}-linux-arm64.version.json"),
@@ -1139,7 +1146,7 @@ fn publish_makes_the_notes_file_the_start_of_the_release_body() {
     let body = create.split_once(" --notes ").expect("--notes").1;
     assert!(
         body.starts_with(&format!(
-            "{}\n## The files\n\nThe files run {RUN} of artifacts.yml built and attested",
+            "{}\n## The files\n\nThe files run {RUN} of the pipeline built and attested",
             NOTES.trim_end()
         )),
         "{body}"

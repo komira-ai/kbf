@@ -74,8 +74,9 @@ zeroize.workspace = true
 kbf-enroll.workspace = true
 # An S3 service on loopback that refuses any other key pair (tests/cold_apply.rs).
 kbf-objstore = { workspace = true, features = ["testkit"] }
-# Loopback ports nothing can take (kbf_testkit::port).
-kbf-testkit.workspace = true
+# Loopback ports nothing can take (kbf_testkit::port), and the test Postgres server's URL
+# (`database::server_url`).
+kbf-testkit = { workspace = true, features = ["postgres"] }
 # A connector that fails its first lookups, under a lazy channel (tests/storage_register.rs),
 # and the TLS reload tests' connector that dials once per attempt (tests/tls_reload.rs).
 hyper-util = { workspace = true, features = ["tokio"] }
@@ -89,11 +90,13 @@ kbf-update.workspace = true
 kbf-installer.workspace = true
 # The deterministic simulation kernel's seeded random stream (tests/sim_rollout.rs).
 kbf-sim.workspace = true
-# The in-memory state store (src/start.rs, src/frontend, src/farm/durable and tests/).
-kbf-state = { workspace = true, features = ["test-support"] }
+# The in-memory state store (src/start.rs, src/frontend, src/farm/durable and tests/), and a
+# Postgres database of its own for a test (tests/state_store_postgres.rs).
+kbf-state = { workspace = true, features = ["test-database", "test-support"] }
 # fcntl and kill for the test that holds the server at its start line (tests/binary.rs).
 libc.workspace = true
-# Makes and drops a database for each Postgres flag test (tests/state_store_postgres.rs).
+# The client the Postgres flag tests read the catalog and the sessions with
+# (tests/state_store_postgres.rs).
 postgres.workspace = true
 prost.workspace = true
 rcgen.workspace = true

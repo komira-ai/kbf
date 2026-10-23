@@ -8,7 +8,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use crate::trust::nofollow;
@@ -55,15 +55,17 @@ pub fn wait_lockable(lock_file: &Path) {
 /// Whether a lock is held on `lock_file`, reading the lock table at `proc_locks`. A
 /// missing lock file, or an unreadable table, is "not held".
 pub fn held(proc_locks: &Path, lock_file: &Path) -> bool {
-    let (Ok(meta), Ok(table)) = (fs::metadata(lock_file), fs::read_to_string(proc_locks)) else {
+    // `stat` through rustix: the device number has the platform's own type, which
+    // `major` and `minor` take.
+    let (Ok(stat), Ok(table)) = (rustix::fs::stat(lock_file), fs::read_to_string(proc_locks))
+    else {
         return false;
     };
-    let dev = meta.dev();
     table_holds(
         &table,
-        rustix::fs::major(dev),
-        rustix::fs::minor(dev),
-        meta.ino(),
+        rustix::fs::major(stat.st_dev),
+        rustix::fs::minor(stat.st_dev),
+        stat.st_ino,
     )
 }
 

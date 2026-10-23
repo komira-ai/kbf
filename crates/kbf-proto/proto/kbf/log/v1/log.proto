@@ -23,9 +23,10 @@
 // fields; a set is a repeated field). A refused entry is a decode error, which stops the
 // replica.
 //
-// Which commands a writer may put in a log is the log's format version, committed in the
-// log; the encoder refuses a command under a format before the one it joined. Format 1
-// is this file as it first was. Bootstrap and the control commands (`farm` to
+// The encoder writes every command it knows under every format: the log's format version
+// records the highest `machine_version` entry committed in the log, and no command
+// depends on it. A new command needs no raise; a reader that does not know it skips it.
+// Format 1 is this file as it first was. Bootstrap and the control commands (`farm` to
 // `machine_version`) joined format 1 before any log was written (the Raft metadata log of
 // kbf-server is the first writer, and it writes only `meta` and `bootstrap`).
 //
@@ -429,6 +430,8 @@ message Resources {
   uint64 memory_bytes = 2;
   uint64 gpus = 3;
   uint64 vms = 4;
+  // The most Action leases a node runs at once; unset: no cap.
+  optional uint64 leases = 5;
 }
 
 // A key and a value: a request property, or an exact capability a node reports.

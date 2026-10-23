@@ -28,7 +28,7 @@ const URL: &str = "release_source = \"url\"\nrelease_url = \"https://mirror.exam
 /// seed fetcher over a runner whose calls are kept.
 fn noticing(name: &str, plant: impl FnOnce(&mut Seeded)) -> (Rig, Seeded, Calls) {
     let mut rig = Rig::new(name);
-    let mut seeded = Seeded::on(rig.layout.clone(), rig.root.clone(), B);
+    let mut seeded = Seeded::on(rig.layout.clone(), B);
     plant(&mut seeded);
     seeded.write_tarball();
     let runner = seeded.runner();
@@ -406,7 +406,7 @@ fn the_floor_rises_at_a_confirm_not_at_a_swap_and_a_rollback_leaves_it() {
 #[test]
 fn a_frontend_flip_raises_the_floor_and_staging_does_not() {
     let mut rig = Rig::frontend("notice-flip");
-    let seeded = Seeded::on(rig.layout.clone(), rig.root.clone(), B);
+    let seeded = Seeded::on(rig.layout.clone(), B);
     rig.helper.set_fetcher(Box::new(seeded.fetcher()));
     rig.cycle(T0);
     assert_eq!(seeded.floor_text(), line(EARLIER_SEQ));
@@ -453,7 +453,7 @@ fn a_release_that_declares_no_seq_leaves_the_floor_unset_and_nothing_is_announce
 #[test]
 fn the_release_that_runs_is_asked_once_and_the_source_is_told() {
     let mut rig = Rig::new("notice-fake");
-    let seeded = Seeded::on(rig.layout.clone(), rig.root.clone(), B);
+    let seeded = Seeded::on(rig.layout.clone(), B);
     *rig.fetcher.seed.lock().expect("lock") = Some(SeedFacts {
         commit: c(B),
         seq: SEQ,
@@ -487,7 +487,7 @@ fn the_release_that_runs_is_asked_once_and_the_source_is_told() {
 #[test]
 fn a_release_that_cannot_be_asked_is_asked_again_and_the_trouble_is_said_once() {
     let mut rig = Rig::new("notice-probe-fails");
-    let seeded = Seeded::on(rig.layout.clone(), rig.root.clone(), B);
+    let seeded = Seeded::on(rig.layout.clone(), B);
     *rig.fetcher.seed.lock().expect("lock") = Some(SeedFacts {
         commit: c(B),
         seq: SEQ,
@@ -596,7 +596,7 @@ fn a_floor_that_cannot_be_raised_after_a_flip_is_said_and_the_flip_stands() {
 #[test]
 fn a_package_without_a_seed_says_nothing_and_the_floor_is_kept_all_the_same() {
     let mut rig = Rig::new("notice-no-seed");
-    let seeded = Seeded::on(rig.layout.clone(), rig.root.clone(), B);
+    let seeded = Seeded::on(rig.layout.clone(), B);
     let runner = seeded.runner();
     let calls = runner.log();
     let bare = crate::fixtures::trusted_host_on(rig.layout.platform());
@@ -656,7 +656,7 @@ fn a_package_upgrade_is_noticed_at_the_next_pass_and_touches_no_state() {
 fn a_host_tells_its_source_and_announces_its_seed_whatever_the_source() {
     for (file, word) in [(BUNDLED, "bundled"), (URL, "url")] {
         let mut rig = Rig::new(&format!("notice-source-{word}"));
-        let seeded = Seeded::on(rig.layout.clone(), rig.root.clone(), B);
+        let seeded = Seeded::on(rig.layout.clone(), B);
         rig.helper.set_fetcher(Box::new(seeded.host_fetcher(file)));
         rig.cycle(T0);
         let status = rig.status();

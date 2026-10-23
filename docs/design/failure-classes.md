@@ -115,9 +115,9 @@ exit code, or a non-OK status (`kbf-proto/proto/kbf/worker/v1/worker.proto:240-2
   `FAILED_PRECONDITION` without such a detail included. The server logs it: a WARN
   `lease failed` line with the lease, the node, the code and the reason, or for a
   missing input a WARN line with the number of missing blobs.
-- **Answer** (`settle` in `farm.rs`): Infra becomes `INTERNAL "the farm could not
-  run the action"`, the same fixed text for every cause, with no node name. A farm
-  fault past its reruns (a busy node's kill, a lost run) becomes `INTERNAL "kbf farm
+- **Answer** (`settle` in `farm.rs`): an Infra result is run again within the farm
+  budget (below); past it, like any farm fault past its reruns (a busy node's kill, a
+  lost run, an Infra result), it becomes `INTERNAL "kbf farm
   fault on <node>: <what ended the run>, and its reruns are used up. Operator fix:
   ... Runs: 3 (...)."`.
   MissingInput becomes the front's answer for inputs not in the CAS (below,
@@ -129,14 +129,15 @@ exit code, or a non-OK status (`kbf-proto/proto/kbf/worker/v1/worker.proto:240-2
   a `PreconditionFailure` with one `MISSING` violation per blob. That is the shape
   Bazel needs to re-upload (section 3); keep it.
 - **Retries**: farm faults only (#22; [scheduler.md](scheduler.md#retries-of-farm-faults)).
-  A busy node's memory kill, a lost run (`Failure::Lost`) and a lease of a daemon its
-  successor proved stopped (the requeue reason `Restarted`) run again from one budget,
-  at most 3 runs ending so per operation, preferring another node; past it the
-  operation is answered `INTERNAL` "kbf farm fault on <node>: ...", naming the runs.
-  Every other failed result (`Failure::Infra` among them) finishes the operation
-  (`result_committed` in `kbf-sched/src/scheduler.rs`). A lease given up for silence,
-  replacement without that proof, reconnection or not starting
-  (`kbf-sched/src/requeue.rs`) runs again with no limit. A MissingInput result
+  A busy node's memory kill, a lost run (`Failure::Lost`), a result the farm could not
+  produce (`Failure::Infra`, `result_committed` in `kbf-sched/src/scheduler.rs`) and a
+  lease of a daemon its successor proved stopped (the requeue reason `Restarted`) run
+  again from one budget, `FARM_RERUNS` = 2, so at most 3 runs ending so per operation,
+  preferring another node; past it the operation is answered `INTERNAL` "kbf farm fault
+  on <node>: ...", naming the runs. A lease given up as not started has its own budget,
+  `NOT_STARTED_RERUNS` = 3 per operation; past it the operation finishes with
+  `Failure::Infra`. A lease given up for reconnection or a session switch runs again with
+  no limit (`kbf-sched/src/requeue.rs`). A MissingInput result
   finishes its operation at once and is never rerun: the blob is the client's to
   upload, so it is not a farm fault and counts against no farm rerun budget.
 - **Cache**: written only for an OK result with exit 0 and not `do_not_cache`
@@ -782,9 +783,9 @@ refusal at the stream's opening), and Bazel treats `UNAVAILABLE` as catastrophic
 
 - **Budget.** Each operation may run at most **3 times** in total (2 extra runs) after
   Farm or Ambiguous results. The operation keeps its place and its queue time. Leases
-  given up for silence, replacement, reconnection or not starting (`requeue.rs`) are
-  not results and do not use the budget, as today; bounding those is a separate
-  question (#22). Out-of-memory reruns have their own bound, the ladder of 6.1, and
+  given up for reconnection or a session switch (`requeue.rs`) are not results and do
+  not use the budget; not starting has its own budget, `NOT_STARTED_RERUNS`; silence
+  and replacement without proof after `Start` was sent are charged as a lost run. Out-of-memory reruns have their own bound, the ladder of 6.1, and
   do not use this budget either (decided 2026-10-10). Today the budget is built for
   three Farm results (`FARM_RERUNS`, [scheduler.md](scheduler.md#retries-of-farm-faults)):
   a busy node's memory kill, a lost run (fenced, or a whole-machine action whose result
@@ -812,7 +813,7 @@ refusal at the stream's opening), and Bazel treats `UNAVAILABLE` as catastrophic
   - is server policy, not an action-cache entry: REAPI says a failed result must not
     be cached, and the memo stores no `ActionResult`.
 - **What it needs in code.** A `Failure::Farm` outcome the scheduler requeues from
-  (today `Failure::Infra` finishes the operation, `kbf-types/src/work.rs:138-147`), the
+  (today `Failure::Infra` is rerun within the farm budget, `kbf-sched/src/scheduler/fault.rs`), the
   excluded nodes and the run count in the operation's state, and the reason kept beside
   the outcome as `Detail::Invalid` keeps its reason today.
 

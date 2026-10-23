@@ -294,7 +294,7 @@ fn the_frontends_answer_keeps_each_field() {
 /// Catches the whole description refused for what the host does not take, the platform filter
 /// matching on a prefix or a case, and a faulty entry of the host's own platform let through.
 ///
-/// Mutants: the filter removed from `from_json` and from `from_proto` (red); `entry == Some(p)`
+/// Catches: the filter removed from `from_json` and from `from_proto` (red); `entry == Some(p)`
 /// replaced by `true` (red).
 #[test]
 fn the_platform_asked_for_is_all_that_is_read() {

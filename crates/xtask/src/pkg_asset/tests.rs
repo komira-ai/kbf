@@ -80,6 +80,8 @@ struct Fix {
     drop: Option<&'static str>,
     /// A directory entry ahead of the files, as nfpm writes `./usr/`.
     dirs: bool,
+    /// Files a good package does not hold, with their modes and bytes.
+    extra: Vec<(String, u32, Vec<u8>)>,
 }
 
 impl Fix {
@@ -94,6 +96,7 @@ impl Fix {
             arch: "amd64",
             drop: None,
             dirs: false,
+            extra: Vec::new(),
         }
     }
 
@@ -119,6 +122,9 @@ impl Fix {
             ),
         ];
         files.retain(|(p, _, _)| Some(*p) != self.drop);
+        for (path, mode, bytes) in &self.extra {
+            files.push((path.as_str(), *mode, bytes.as_slice()));
+        }
         if self.dirs {
             files.insert(0, ("usr/", 0o755, &[]));
         }
@@ -697,4 +703,50 @@ fn files_the_check_needs_that_are_not_there_are_errors_not_findings() {
     // A header cut short: 8 bytes of magic and 10 of a member header.
     let got = problems_of("short-header", &[&b"!<arch>\n"[..], &[b'x'; 10]].concat());
     assert_eq!(got, ["a truncated ar member header"]);
+}
+
+/// Asserts that the paths of the `kbf` package are the binary and each mode unit, as a data
+/// tarball names them: no leading slash, the binary first.
+#[test]
+fn the_kbf_package_paths_are_the_binary_and_the_mode_units() {
+    let paths = kbf_package_paths();
+    assert_eq!(paths.len(), 1 + KBF_UNITS.len());
+    assert_eq!(paths[0], "usr/bin/kbf");
+    for unit in KBF_UNITS {
+        let path = format!("usr/lib/systemd/system/{unit}");
+        assert!(paths.contains(&path), "{path} in {paths:?}");
+    }
+}
+
+/// Asserts that a `kbf-installer` deb that carries `usr/bin/kbf` or the unit of a mode is
+/// refused, once per such file and naming it, whatever else it holds.
+#[test]
+fn a_package_that_carries_the_kbf_binary_or_a_mode_unit_is_refused() {
+    for path in kbf_package_paths() {
+        let mut fix = Fix::new();
+        fix.extra.push((path.clone(), 0o755, b"x".to_vec()));
+        let got = found("carries-kbf", &fix, MAIN);
+        assert_eq!(
+            got,
+            [format!("holds {path}, which only the kbf package ships")]
+        );
+    }
+    let mut fix = Fix::new();
+    for path in kbf_package_paths() {
+        fix.extra.push((path, 0o644, Vec::new()));
+    }
+    let got = found("carries-all-kbf", &fix, MAIN);
+    assert_eq!(got.len(), 1 + KBF_UNITS.len(), "{got:?}");
+}
+
+/// Asserts that a `kbf-installer` deb with the files of its own package and `kbf.slice`,
+/// which `kbf-proxy.service` runs in and so stays with it, is not refused for holding them.
+#[test]
+fn the_slice_and_the_proxy_units_stay_in_the_installer_package() {
+    let mut fix = Fix::new();
+    for unit in ["kbf.slice", "kbf-proxy.service", "kbf-installer.service"] {
+        let path = format!("usr/lib/systemd/system/{unit}");
+        fix.extra.push((path, 0o644, Vec::new()));
+    }
+    assert_eq!(found("installer-units", &fix, MAIN), Vec::<String>::new());
 }

@@ -31,7 +31,7 @@ fn calm_seeds_keep_every_property() {
 }
 
 /// Catches a restart that loses or repeats an applied entry (property 1), refuses
-/// its own log (7, the mutant "a lost Bootstrap log id"), or answers a blob present
+/// its own log (7, the defect "a lost Bootstrap log id"), or answers a blob present
 /// that the store lacks (5).
 #[test]
 fn restart_seeds_keep_properties_1_2_5_6_7() {
@@ -39,7 +39,7 @@ fn restart_seeds_keep_properties_1_2_5_6_7() {
 }
 
 /// Catches an entry applied before it is durable, or a sync that reports durable
-/// what is not (property 1: the mutants "apply before commit" and "ack before
+/// what is not (property 1: the defects "apply before commit" and "ack before
 /// fsync"), across power cuts now and part-way through a commit.
 #[test]
 fn crash_seeds_keep_properties_1_2_5_6_7() {
@@ -63,13 +63,13 @@ fn partition_seeds_keep_properties_1_2_3_5_6_7() {
 
 /// All-in-one (its design, kbf#657, sections 7.3, 7.4 and 8): kills of
 /// the whole process, both halves, mid-build. Catches an action answered as succeeded with its
-/// output missing, now or after a kill (property 14: the mutant "the daemon half
+/// output missing, now or after a kill (property 14: the defect "the daemon half
 /// reports before the server acknowledged its output"), a log the kill does not keep
-/// (the mutant "the restarted process opens an empty log", as `--meta-log=memory`
+/// (the defect "the restarted process opens an empty log", as `--meta-log=memory`
 /// would, is caught first by 6: farm time goes back to 0 with the index), and an
-/// action whose run the kill cut never answered (7: the mutant "the client sends
+/// action whose run the kill cut never answered (7: the defect "the client sends
 /// `Execute` once and never again"). Not vacuous: kills
-/// cut the daemon half's work (the mutant "the daemon half outlives the kill" leaves
+/// cut the daemon half's work (the defect "the daemon half outlives the kill" leaves
 /// `lost` at 0), and the actions cut were run again by a later process, whose
 /// scheduler started empty.
 #[test]

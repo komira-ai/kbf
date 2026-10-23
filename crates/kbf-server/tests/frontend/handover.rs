@@ -175,7 +175,7 @@ async fn meanwhile() {
 /// client's stream, on the first frontend, is answered with that result; a call made
 /// after the handover is the second's, and is answered from the cache the result went to.
 /// The first never sends GOAWAY, goes not ready once the second serves, and ends once it
-/// holds nothing. Mutants: `Keep` replaced by a bump of the epoch (the lease is not
+/// holds nothing. Catches: `Keep` replaced by a bump of the epoch (the lease is not
 /// taken), the follower ignoring `done/` rows (the stream is never answered), the stand
 /// down not ending the daemon's stream (the daemon never reaches the second frontend), a
 /// holder that sends GOAWAY.
@@ -231,7 +231,7 @@ async fn a_build_in_flight_is_finished_across_a_handover() {
 /// through the first, a cached one and a new action whose daemon is on the second, all
 /// complete with no error, are counted as relayed in `kbf_handover_relayed_total`, none
 /// is counted on the second, and none is left open. Envoy's check is set to an hour so
-/// the first stays in rotation throughout. Mutants: the relay replaced by a refusal, by an
+/// the first stays in rotation throughout. Catches: the relay replaced by a refusal, by an
 /// answer from the first's own scheduler, or not counted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn calls_that_still_reach_the_first_frontend_are_relayed_with_no_error() {
@@ -288,7 +288,7 @@ async fn calls_that_still_reach_the_first_frontend_are_relayed_with_no_error() {
 /// (Envoy would have no host that can take a new stream: Buck2's open would fail), or
 /// before it is told the second serves (T-D). Between the successor's start and its
 /// serving the first stays ready, `/readyz` 200 though it has handed its roles over; it
-/// goes not ready only once the second answers `/readyz` 200 itself. Mutants: `unready`
+/// goes not ready only once the second answers `/readyz` 200 itself. Catches: `unready`
 /// at the cut; `unready` when the successor has only started.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_first_frontend_goes_unready_only_after_the_second_is_ready() {
@@ -452,7 +452,7 @@ async fn a_start_that_cannot_take_over_says_why_and_changes_nothing() {
 /// Catches: a handover over a Postgres state store, which cannot give up its writer role
 /// (`Store::demote` has no Postgres implementation until the takeover comes): the start
 /// is refused with its reason before the frontend serving is asked anything, whether or
-/// not one serves, and a frontend serving is untouched. Mutant: `state_uri` taking a
+/// not one serves, and a frontend serving is untouched. Catches: `state_uri` taking a
 /// Postgres store (the successor would knock, and the holder would fence itself and stop
 /// serving with nothing to hand to).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -484,10 +484,9 @@ async fn a_handover_over_a_postgres_store_is_refused_and_changes_nothing() {
 /// callers it kept without an answer, or Envoy still choosing a frontend that can start
 /// nothing: the first goes not ready as soon as its successor's connection closes, a
 /// start of the successor again finds nobody serving on the control socket (its file is
-/// stale), takes the store cold (the epoch is bumped, the daemon's runs are lost and run
-/// again), and the first, which kept the client's stream open, answers it from the result
-/// the new one writes, and ends. Mutants: no watch on the successor's connection; the
-/// holder exiting at the release.
+/// stale), takes the store cold (the epoch is kept; the daemon lists none of its runs, so
+/// they run again), and the first, which kept the client's stream open, answers it from
+/// the result the new one writes, and ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_successor_that_dies_after_the_release_is_started_again_and_the_streams_finish() {
     let node = Node::start().await;
@@ -514,12 +513,12 @@ async fn a_successor_that_dies_after_the_release_is_started_again_and_the_stream
     let new = Proc::taking_over(&flags).await;
     let reached = Client::connect(new.reapi, new.worker).await;
     let mut daemon = reached.daemon("node-a", 4, 8).await;
-    assert_ne!(
+    assert_eq!(
         daemon.epoch,
         first.lease_id.expect("a lease id").term,
-        "a cold start bumps the epoch"
+        "a cold start moved the epoch"
     );
-    // A daemon that sees a new epoch kills the runs it had and lists none.
+    // A daemon that starts again lists none of the runs it had.
     assert!(daemon.heartbeat(&[]).await);
     let second = daemon.start().await;
     assert_ne!(second.lease_id, first.lease_id, "the operation runs again");
@@ -534,7 +533,7 @@ async fn a_successor_that_dies_after_the_release_is_started_again_and_the_stream
 /// alive and never serves (it holds the store and has said nothing since): when
 /// `--handover-watchdog-secs` runs out the first goes not ready by itself, so Envoy has a
 /// clean answer to give. The successor here is started and not served, with its control
-/// connection open. Mutant: a watchdog that never fires.
+/// connection open. Catches: a watchdog that never fires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_successor_that_never_serves_is_given_up_on_at_the_watchdog() {
     let node = Node::start().await;
@@ -560,7 +559,7 @@ async fn a_successor_that_never_serves_is_given_up_on_at_the_watchdog() {
 /// existed (the golden): a frontend that has the handover flags but is asked to stop, not
 /// to hand over, drains as `kbf-server` does: not ready, new Execute refused, GOAWAY sent
 /// (so `is_draining`), and it ends once its connections have closed. The control socket
-/// and the relay change none of it. Mutant: the stop path going through `hand_over`.
+/// and the relay change none of it. Catches: the stop path going through `hand_over`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stop_without_a_handover_drains_as_before() {
     let node = Node::start().await;
@@ -609,7 +608,7 @@ async fn a_stop_without_a_handover_drains_as_before() {
 /// Catches: the Execute service taking a new call while the drain refuses (the staged
 /// `Drain::refuse`, with no GOAWAY): the call gets UNAVAILABLE from the service itself, on
 /// the connection that is still open, so no transport race can stand in for it (the stop
-/// test above accepts any failure). Mutant: the draining check dropped from `execute`.
+/// test above accepts any failure). Catches: the draining check dropped from `execute`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refusing_frontend_answers_a_new_execute_unavailable() {
     let node = Node::start().await;
@@ -685,7 +684,7 @@ async fn the_service_manager_is_told_when_the_frontend_serves() {
 /// where the node comes up after the frontend: the manager still gets `READY=1` (a frontend
 /// that is never ready is killed at `TimeoutStartSec` and restarts with a new epoch, in a
 /// loop), the listeners stay bound (the same REAPI address answers), and `/readyz` says
-/// 503 with `storage` failing until the node is back, then 200. Mutant: `Ready::run` waits
+/// 503 with `storage` failing until the node is back, then 200. Catches: `Ready::run` waits
 /// on every probe again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ready_does_not_wait_for_a_storage_node_that_is_down() {
@@ -931,7 +930,7 @@ mod enrolled {
     /// token; instance b takes over, binds the enroll listener of its block, and a node
     /// enrolls there with the token a made (the registry is in the shared state file) and
     /// pins the CA the token names (so b's listener certificate is issued by the CA a
-    /// served). A token b makes carries the same pin. Mutants: a successor that does not
+    /// served). A token b makes carries the same pin. Catches: a successor that does not
     /// start the enroll listener (the node cannot enrol); one that loads another CA
     /// directory (the pin differs, the node refuses the certificate).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -966,7 +965,7 @@ mod enrolled {
     /// replaces being let through: another `--enroll-listen` (its address, not its
     /// instance's port shift), another `--ca-dir` (another CA: every outstanding token's
     /// pin is wrong), enrollment left out, or enrollment where there was none. The holder
-    /// refuses each, naming the enroll flags, and keeps serving. Mutants: the enroll part
+    /// refuses each, naming the enroll flags, and keeps serving. Catches: the enroll part
     /// of `hello` dropped from the comparison.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_successor_with_other_enroll_flags_is_refused() {
@@ -1006,7 +1005,7 @@ mod enrolled {
     /// holder keeps its enroll listener open (Envoy-side callers still reach it, like the
     /// REAPI and API listeners) until it exits, and answers `NotSigner`, since its store
     /// handle is fenced; nothing is written (the node is not listed and the one-use token
-    /// is whole: it enrolls the node at the successor). Mutant: the holder's service over
+    /// is whole: it enrolls the node at the successor). Catches: the holder's service over
     /// a store that is not fenced.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_frontend_that_handed_over_commits_no_enrollment() {

@@ -11,7 +11,7 @@ test targets (the first: `tests/mac_pool_spike`, below).
 
 `tests/isolation/main.rs` (test binary `kbf-daemon-test::isolation`) holds both suites, in
 `no_residue.rs` and `no_cross_access.rs`, over one set of helpers (`common/`, below). Linux legs
-only; the Mac legs are jerry's (see "The Mac seam").
+only; the Mac legs are owned separately (see "The Mac seam").
 
 ### What a green run proves, and what it does not
 
@@ -84,7 +84,7 @@ and its existing knobs.
 
 Tests call `kbf_testkit::node_view::NodeView` and the probes built on it
 (`kbf_testkit::probe`), never `/proc` or cgroup paths. Both live in `kbf-testkit`, so a Mac
-leg imports them like any other crate: no `#[path]` include. Jerry's Mac legs add a test
+leg imports them like any other crate: no `#[path]` include. The Mac legs add a test
 target to THIS crate (`tests/<name>/main.rs`) with a `MacNode` implementing the trait
 (per-slot users, simulators, `whole-machine` lease directories, launchd jobs, the UI
 session) where the isolation suites pick `LinuxNode`, plus a `Rig` that starts a Mac farm;

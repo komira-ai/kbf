@@ -1827,7 +1827,7 @@ mod tests {
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
-    /// Catches (CEO decision on issue #164): the native daemon removing `xcrun`'s cache
+    /// Catches (decision on issue #164): the native daemon removing `xcrun`'s cache
     /// before its first survey. Every `xcrun` lookup of the survey then has nothing
     /// cached and takes seconds, while no Xcode is ready: on the macOS runner (15
     /// `Xcode*.app`) that survey took over 30 s, against about 7 s with the cache kept. The survey runs under the sandbox, so
@@ -1888,7 +1888,7 @@ mod tests {
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
-    /// Catches (CEO decision on issue #164): the native daemon's survey of its Xcodes
+    /// Catches (decision on issue #164): the native daemon's survey of its Xcodes
     /// asking a question outside the actions' sandbox, `xcrun`'s lookup above all (it
     /// reads and fills a cache leases can write), or with an `xcrun` other than the one
     /// the daemon warms. The sandbox program is a fake that marks what it runs (its

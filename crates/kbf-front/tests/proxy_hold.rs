@@ -227,8 +227,8 @@ async fn write(front: &harness::Front, kind: char, size: u64) -> Result<(), Stat
 }
 
 /// Catches a ByteStream Read that fails while every storage node of its blob is away, the
-/// defect the hold is for (mutant: no hold), and a hold that reads the placement once
-/// (mutant: the owners looked up before the loop): every owner is `Down` in the map, so
+/// defect the hold is for (defect: no hold), and a hold that reads the placement once
+/// (defect: the owners looked up before the loop): every owner is `Down` in the map, so
 /// the first try has nobody to call, and the map moves to a newer generation with the
 /// nodes active during the first pause. The second try is served by the first owner of
 /// the new map, the only node called, after one pause of 250 ms.
@@ -250,7 +250,7 @@ async fn a_read_is_held_until_an_owner_returns() {
 }
 
 /// Catches a Read that fails because every owner answers UNAVAILABLE before its first byte,
-/// as nodes do while they restart (mutant: no hold): the two owners of the blob each
+/// as nodes do while they restart (defect: no hold): the two owners of the blob each
 /// refuse their first call, so the first try gets nothing, and after one pause the first
 /// owner serves the whole blob. The third node is never called.
 #[tokio::test(flavor = "multi_thread")]
@@ -271,7 +271,7 @@ async fn a_read_every_owner_refuses_is_tried_again() {
 }
 
 /// Catches a Read held for a miss that an owner that is away could not confirm (the other
-/// side of mutant: hold on any failure): the first owner says it lacks the blob and the
+/// side of "hold on any failure"): the first owner says it lacks the blob and the
 /// second is restarting, so the blob may be on the second and the read waits one pause for
 /// it, then is served.
 #[tokio::test(flavor = "multi_thread")]
@@ -294,12 +294,12 @@ async fn a_miss_that_an_owner_away_could_not_confirm_is_held() {
     assert_eq!(calls(&farm.fakes), want);
 }
 
-/// Catches a hold that never ends (mutant: unbounded), and one that ends late (a last pause
+/// Catches a hold that never ends (defect: unbounded), and one that ends late (a last pause
 /// not cut short at the bound): no node ever answers a Read or an upload, the pauses are
 /// kbf-route's (250 ms doubling to 5 s, the last what is left of the bound), 60 s in all
 /// in 16 pauses, and the call then fails UNAVAILABLE with the first failure of a node, as
 /// it does without a hold. The fake clock panics if the hold runs past twice the bound, and
-/// each call has a real-time limit, for a hold that stops sleeping and never ends (mutant:
+/// each call has a real-time limit, for a hold that stops sleeping and never ends (defect:
 /// the result of the bound's check ignored).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_no_owner_answers_fails_at_the_bound() {
@@ -328,7 +328,7 @@ async fn a_call_no_owner_answers_fails_at_the_bound() {
 
 /// Catches a call held when the map has no owner for it and none comes back: with every
 /// member `Down` a Read and a Write each wait out the bound (the map is read again at each
-/// try, and is the same), call nobody, and are UNAVAILABLE. Mutant: a Read or Write with no
+/// try, and is the same), call nobody, and are UNAVAILABLE. Catches: a Read or Write with no
 /// owner fails at once, or the lookup of the writer is not held.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_with_every_owner_down_fails_at_the_bound() {
@@ -350,7 +350,7 @@ async fn a_call_with_every_owner_down_fails_at_the_bound() {
     assert_eq!(calls(&farm.fakes), vec![0, 0, 0]);
 }
 
-/// Catches a call held when an owner could answer it (mutant: hold on any failure): with
+/// Catches a call held when an owner could answer it (defect: hold on any failure): with
 /// the first owner of the blob a closed port the next serves a Read at once, and takes an
 /// upload whose writer is a closed port; a blob every owner says it lacks is NOT_FOUND, and
 /// a request every owner refuses (INVALID_ARGUMENT) is that, both at once. Nothing sleeps.
@@ -381,7 +381,7 @@ async fn a_call_an_owner_answers_is_not_held() {
     }
 }
 
-/// Catches a hold applied to a Read that has passed bytes on (mutant: hold mid-stream): the
+/// Catches a hold applied to a Read that has passed bytes on (defect: hold mid-stream): the
 /// first owner sends two chunks and breaks with UNAVAILABLE, and the client gets its two
 /// chunks and the error at once, to resume from `read_offset`; no other node is asked and
 /// nothing sleeps.
@@ -400,7 +400,7 @@ async fn a_read_past_its_first_frames_is_not_held() {
     assert_eq!(calls(&farm.fakes).iter().sum::<usize>(), 1);
 }
 
-/// Catches an upload that fails while its owners restart (mutant: no hold): both write
+/// Catches an upload that fails while its owners restart (defect: no hold): both write
 /// owners refuse their first call with UNAVAILABLE before reading a byte, so the whole
 /// upload (still only the frames the proxy keeps) has nowhere to go; after one pause the
 /// first owner takes it, with its bytes intact (the fake checks them).
@@ -420,7 +420,7 @@ async fn an_upload_is_held_until_an_owner_takes_it() {
     assert_eq!(calls(&farm.fakes), want);
 }
 
-/// Catches an upload held again with the writer it began with (mutant: the owner kept from
+/// Catches an upload held again with the writer it began with (defect: the owner kept from
 /// before the pause, or the first one tried): all three nodes refuse their first call, and
 /// during the first pause the map moves to a generation where the first writer is `Down`.
 /// The upload goes to the second writer, which has refused once and serves now; the first
@@ -445,7 +445,7 @@ async fn an_upload_held_again_goes_to_the_writer_of_the_map_by_then() {
 }
 
 /// Catches an upload told the lookup's status when its map loses every writer while it is
-/// held (mutant: the failure of the node dropped for the "no storage node" status, which
+/// held (defect: the failure of the node dropped for the "no storage node" status, which
 /// says nothing of why): the two write owners refuse their first call, and during the first
 /// pause every member goes `Down`. The upload waits out the bound against that map and is
 /// UNAVAILABLE with the node's own message.
@@ -465,7 +465,7 @@ async fn an_upload_whose_map_loses_its_writers_is_told_the_nodes_failure() {
     assert_eq!(calls(&farm.fakes).iter().sum::<usize>(), 2);
 }
 
-/// Catches an upload held with the owners it found at its first try (mutant: the writer
+/// Catches an upload held with the owners it found at its first try (defect: the writer
 /// looked up once): every member is `Down` when it begins, so it has no writer to send to,
 /// and the nodes are active again in a newer map after the first pause. The upload goes to
 /// the writer of the new map, the only node called.
@@ -484,7 +484,7 @@ async fn an_upload_with_no_writer_waits_for_the_map() {
     assert_eq!(calls(&farm.fakes), want);
 }
 
-/// Catches an upload held after its bytes went to a node (mutant: `Upload::again` ignoring
+/// Catches an upload held after its bytes went to a node (defect: `Upload::again` ignoring
 /// that a frame past the first ones was read, so the hold sends half of a blob): the writer
 /// reads the first message of a three-message upload and fails UNAVAILABLE. The proxy no
 /// longer has what it passed, so the call ends at once with that failure, for the client
@@ -540,7 +540,7 @@ async fn a_status_query_is_not_held() {
 }
 
 /// Catches a hold left out of the frontend that has no map, only the node `--storage`
-/// names (mutant: only routed owners hold): the node refuses its first call with
+/// names (defect: only routed owners hold): the node refuses its first call with
 /// UNAVAILABLE, a Read and then an Upload each wait one pause and are served by it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_farm_of_one_fixed_node_is_held_too() {

@@ -169,7 +169,7 @@ async fn farm_with(
 /// service's chain does that, so a daemon that called A's storage directly would leave one
 /// copy.
 ///
-/// Mutants: the in-process `put` calling the inner storage (the second blob is on A and
+/// Catches: the in-process `put` calling the inner storage (the second blob is on A and
 /// not on B); a node set that returns the local storage for every member (the dial counts
 /// are 0 and the first blob is on A only).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -227,7 +227,7 @@ async fn a_daemon_half_writes_where_the_map_says_and_in_process_for_its_own_node
 /// call ends when the router's bound on that ask does, a deadline that only ends a hang),
 /// and answers UNAVAILABLE.
 ///
-/// Mutants: `InProcess::at` ignoring its generation (the write lands on A and on B);
+/// Catches: `InProcess::at` ignoring its generation (the write lands on A and on B);
 /// `check_map` removed from the in-process write body (the same).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_half_behind_its_node_is_told_so_by_its_own_node() {
@@ -296,7 +296,7 @@ fn plane_over(
 /// blob's other owner (the router goes on to the next owner when one cannot answer) and
 /// never reaches it, and a blob owned by another member goes on to its owner.
 ///
-/// Mutants: the service's map check skipped on the in-process path (the second write is
+/// Catches: the service's map check skipped on the in-process path (the second write is
 /// taken in-process by the node with an empty map and B is never dialled); the router asked
 /// for a local write when no map is held (the first write lands on A).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -345,7 +345,7 @@ async fn a_daemon_half_writes_nowhere_until_it_and_its_node_hold_a_map() {
 /// whose primary is A, in-process: the write is answered (one copy, on A) and A's repair
 /// journal holds the copy owed to B for that digest and no other.
 ///
-/// Mutant: the in-process `put` calling the inner storage (`Storage::put`) instead of the
+/// Catches: the in-process `put` calling the inner storage (`Storage::put`) instead of the
 /// service's `write_in`: the write is answered, the blob is on A, and nothing is owed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_write_with_the_partner_down_is_answered_and_the_copy_is_owed() {
@@ -379,7 +379,7 @@ async fn a_write_with_the_partner_down_is_answered_and_the_copy_is_owed() {
 /// the same read is the miss. A's own wire listener is not asked: the read is A's
 /// in-process member, whose miss rule is the one under test.
 ///
-/// Mutant: the in-process `read_range` skipping `read_error` (the catch-up rule): the
+/// Catches: the in-process `read_range` skipping `read_error` (the catch-up rule): the
 /// `read_to` assertion fails with `Missing`. Both reads go through `read_range` at the
 /// plane, so this pins the `read_range` rule only; `read_blob`'s rule is pinned by the
 /// kbf-storage in-process tests, not here.

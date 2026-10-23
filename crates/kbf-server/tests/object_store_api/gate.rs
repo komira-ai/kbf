@@ -250,7 +250,7 @@ async fn every_answer_is_no_store_and_a_wrong_method_is_405() {
 // the token the same calls pass: the proxy's word is not the token, and the token is
 // still required (401 without it).
 //
-// Mutants seen red: each handler's `Caller` replaced by `Caller::direct(peer.addr)` (the
+// Catches: each handler's `Caller` replaced by `Caller::direct(peer.addr)` (the
 // forged-header calls were admitted); `operator_gate`'s `Unverified` refusal skipped.
 #[tokio::test]
 async fn behind_a_proxy_only_a_call_with_its_secret_and_the_token_passes_the_gate() {

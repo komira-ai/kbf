@@ -297,29 +297,33 @@ Each node keeps its metadata in a Raft log on its local disk, in `--meta-dir` or
 before it is answered. There are no snapshots yet, so the log is never compacted and it
 grows with every commit. A second server started on the same directory is refused.
 
-The log has a **machine version**, which says which commands it accepts. An operator does
-not choose a version; kbf raises it at start when a feature needs it. A new log is at
-version 1.
+The log has a **machine version**, which an earlier build used to say which commands it
+accepted. This build never raises it: a new log is at version 1 and stays there, and every
+command this build knows commits to a log at any version. Formats change additively, so a
+new command is written as it is, and a build that does not know it skips it. A log an
+earlier build raised keeps the version it reached, and this build applies it as before:
 
-| Version | Adds | Raised by |
+| Version | Added | Raised, by an earlier build, at |
 |---|---|---|
-| 2 | The write tier's commands | (see version 5) |
+| 2 | The write tier's commands | A start with a hot store |
 | 3 | `EvictObjects` | The start-up pass or the evictor on a `file://` cold store, on a single-voter log |
 | 4 | Node writers: objects named by member and boot | A node registered with a frontend |
 | 5 | `ReseatStaged`, which moves a conflicting staged object | A start with a hot store |
 
-A start with a hot store raises the log straight to version 5, so it takes the version 2
-commands with it.
+A binary that does not run the version of a raise entry in a log skips the entry and keeps
+the version the log had reached before it. Decoding does not depend on the version, so it
+applies every command it knows and skips any command it does not know (one that a later
+build added). An entry that is not a well-formed message still refuses the log. What a
+skipped entry did is lost to that binary, so **rolling back to an older build loses nothing
+only if the older build knows every command the log holds.** A build that predates skipping
+refuses the log at the first entry it does not know, so it cannot be rolled back to once
+the log holds one. `kbf --version --json` prints `meta_log`, the highest version a build
+runs. It is informational: it is frozen at 5 and no longer changes with a release.
 
-A raise is permanent. A binary that does not run the log's version refuses the log at that
-entry. So **rolling back to an older build is possible only if the older build runs the
-log's version.** Version 5, for example, cannot be opened by a build that runs version 4.
-`kbf --version --json` prints `meta_log`, the highest version a build runs; compare it
-across two builds before you go back.
-
-To roll back past a raise, restore a copy of the metadata directory that was taken before
-the raise. A byte copy of every file in the directory, taken while the server is stopped,
-is a valid backup. `kbf-deploy linux meta-backup` takes one and `meta-verify` checks it; see
+To roll back to a build that predates skipping, or past a raise an earlier build wrote, restore
+a copy of the metadata directory that was taken before it. A byte copy of every file
+in the directory, taken while the server is stopped, is a valid backup.
+`kbf-deploy linux meta-backup` takes one and `meta-verify` checks it; see
 [the storage node guide](../deploy/storage-node.md#metadata-backup-and-restore). A backup is
 refused unless the write tier has nothing unflushed. Never start a restored copy against a
 live server's object store: it shares the log's id and its object-key epochs.

@@ -33,11 +33,12 @@
 //! [`crate::replication`] says.
 //!
 //! **Object names.** A registered node writes as its registration's member id and boot
-//! counter (`kbf_meta::NodeWriter`): its metadata log is raised to machine version 4, it
-//! commits `SetWriter`, and its objects are `<root>cas/<member>/<boot>/<seq>`, so a node
-//! whose metadata directory was wiped never reuses a key (the state store hands each boot
-//! out once). A node without `--frontend` names its objects in a writer epoch of its log,
-//! `<root><log id>/cas/<epoch>/<seq>`, as a server does. Either reads both kinds.
+//! counter (`kbf_meta::NodeWriter`): it commits `SetWriter` to its metadata log as the log
+//! is (nothing raises the log's machine version), and its objects are
+//! `<root>cas/<member>/<boot>/<seq>`, so a node whose metadata directory was wiped never
+//! reuses a key (the state store hands each boot out once). A node without `--frontend`
+//! names its objects in a writer epoch of its log, `<root><log id>/cas/<epoch>/<seq>`, as
+//! a server does. Either reads both kinds.
 
 use std::error::Error;
 use std::future::Future;
@@ -55,7 +56,7 @@ use kbf_front::{
     Cache, CacheStorage, Hold, MetaLog, MetaLogError, ObjectKeys, RebuildConfig, SegmentsConfig,
     VerifiedBlob,
 };
-use kbf_log::{FarmLogId, MachineVersion};
+use kbf_log::FarmLogId;
 use kbf_mapsync::MapHolder;
 use kbf_meta::{NodeWriter, Retention};
 use kbf_objstore::{KeyPrefix, ObjectStore, StillHeld};
@@ -661,7 +662,7 @@ where
     let (prefix, log) = (meta.store_prefix(), meta.log_id());
     let grace = Duration::from_millis(args.cold_store_evict_grace_ms);
     let cold_released = files.as_ref().map(kbf_objstore::FsStore::released);
-    let pass = files.map(|files| StartPass::over_raft(files, grace));
+    let pass = files.map(|files| StartPass::new(files, grace));
     // After the log is open: it refuses a directory that holds files it did not write.
     let repair_dir = stores.meta_dir.join(REPAIR_DIR);
     assemble(
@@ -685,10 +686,7 @@ async fn assemble<C, S, F>(
     hot: Option<&Hot>,
     (meta, cold, prefix, log): (RaftMetaLog<StdFs>, C, KeyPrefix, FarmLogId),
     (shutdown, repair_dir): (S, &Path),
-    (pass, cold_released): (
-        Option<StartPass<RaftMetaLog<StdFs>>>,
-        Option<kbf_objstore::Released>,
-    ),
+    (pass, cold_released): (Option<StartPass>, Option<kbf_objstore::Released>),
     rebuild: RebuildConfig,
 ) -> Result<StorageHandle, Box<dyn Error>>
 where
@@ -775,8 +773,8 @@ where
 ///
 /// The [`CatchUp`] in [`Registered`] says whether the node owes a rebuild of its index: a
 /// registered node whose log has not finished one does, and tells the frontend so in its
-/// registration, so the map ranks it last until it is done. A node without `--frontend`
-/// owes none: it keeps its objects under its log's own prefix, which no other log's loss
+/// registration, so the map ranks it last until it is done ([`catch_up_for`]). A node without
+/// `--frontend` owes none: it keeps its objects under its log's own prefix, which no other log's loss
 /// can orphan.
 /// `kbf storage` and the storage half of `kbf storage-and-daemon` both open theirs here.
 ///
@@ -796,17 +794,12 @@ pub(crate) async fn open_cache<C: ColdPick>(
     Ok(match flags.joiner(socket.addr(), Arc::clone(&node))? {
         Some(joiner) => {
             let done = meta.query(|state| state.rebuild().is_done()).await?;
-            let catch_up = if done {
-                CatchUp::caught_up()
-            } else {
-                CatchUp::rebuilding()
-            };
+            let catch_up = catch_up_for(done);
             // The member and boot the log last wrote as: a store that counts from 1 gives
             // the node a boot above it, so the open below is not refused.
             let last = last_boot(&meta).await?;
             // What the node runs and what its log is at go to the frontend in the
-            // registration and every heartbeat; the handle follows the raise `open_registered`
-            // makes below.
+            // registration and every heartbeat.
             let mut joiner = joiner
                 .with_catch_up(catch_up.clone())
                 .with_last_boot(last)
@@ -841,6 +834,18 @@ pub(crate) async fn open_cache<C: ColdPick>(
     })
 }
 
+/// Whether a registered node owes a rebuild of its index: its log has not finished one
+/// (`done`). That is all it depends on: the rebuild's commands (`AdoptSegment`,
+/// `RebuildProgress`, `RebuildDone`) commit to a log at any machine version, so the
+/// log's version says nothing about whether the rebuild can run.
+fn catch_up_for(done: bool) -> CatchUp {
+    if done {
+        CatchUp::caught_up()
+    } else {
+        CatchUp::rebuilding()
+    }
+}
+
 /// The member and boot `meta` last wrote as (the node writer it set last), which the node
 /// tells the frontend when it registers; `None` for a log that has set none.
 ///
@@ -867,14 +872,14 @@ fn prefix_root(prefix: &KeyPrefix, log: FarmLogId) -> Result<KeyPrefix, Box<dyn 
     Ok(KeyPrefix::new(root.to_owned())?)
 }
 
-/// The cache of a node registered as `joined`: its log raised to machine version 4 (a
-/// storage node's log has one voter, so no other replica must run it first) and the
-/// node writer set, so every object it writes is named by `joined`'s member and boot.
+/// The cache of a node registered as `joined`: the node writer set on its log as the log
+/// is, whatever machine version it holds, so every object it writes is named by
+/// `joined`'s member and boot.
 ///
 /// # Errors
-/// The registration names a zero member or boot; the log has more than one voter, will
-/// not be raised, or has set this boot of the member already (a state store that handed
-/// the boot out again: [`kbf_front::CacheError::StaleWriter`]).
+/// The registration names a zero member or boot; the log has more than one voter, or has
+/// set this boot of the member already (a state store that handed the boot out again:
+/// [`kbf_front::CacheError::StaleWriter`]).
 pub(crate) async fn open_registered<O: ObjectStore>(
     meta: RaftMetaLog<StdFs>,
     store: O,
@@ -905,12 +910,11 @@ async fn open_among<O: ObjectStore>(
     voters: usize,
 ) -> Result<Cache<RaftMetaLog<StdFs>, O>, Box<dyn Error>> {
     one_voter(voters)?;
-    meta.raise_machine_version(MachineVersion::V4)?;
     Ok(Cache::open_node(meta, store, keys, NodeWriter::new(member, boot)).await?)
 }
 
-/// Refuses a log of more than one voter for a registered node: raising it to machine
-/// version 4 would make every replica that does not run it refuse the log.
+/// Refuses a log of more than one voter for a registered node: a replica that does not
+/// know `SetWriter` would skip it and lose it.
 fn one_voter(voters: usize) -> Result<(), String> {
     if voters > 1 {
         return Err(format!(

@@ -169,12 +169,10 @@ fn result_naming(lease: LeaseId, tag: u8) -> worker::Result {
 /// `Result` would finish whichever operation the new farm gave that id to), and one that
 /// applies a predecessor's `Result` to an operation other than the lease's own. The new
 /// process never grants X's id again: a bumped epoch gives it another term, and a kept
-/// one continues the persisted sequence. The farm still holds X's lease, restored from
+/// one numbers from the block of sequences it reserved past its predecessor's. The farm still holds X's lease, restored from
 /// its row (the daemon may still run it), so a `Result` of that id that names Y's action
 /// is a MISMATCH and ends nothing; the one that names X's action ends X alone, and Y is
-/// still open until Y's own lease reports; an id no row holds is UNKNOWN_LEASE. Mutants: a `Bump` that returns the old epoch,
-/// a grant that does not persist the next sequence, and a check that does not compare a
-/// `Result`'s action with its lease's.
+/// still open until Y's own lease reports; an id no row holds is UNKNOWN_LEASE.
 async fn a_predecessor_process_s_lease_id_never_names_another_operation(backing: Backing) {
     for epoch in [EpochPolicy::Bump, EpochPolicy::Keep] {
         let mut disk = Disk::over(backing);
@@ -191,7 +189,7 @@ async fn a_predecessor_process_s_lease_id_never_names_another_operation(backing:
         assert_ne!(y_lease, x_lease, "{epoch:?}: a lease id was granted twice");
         match epoch {
             EpochPolicy::Bump => assert_ne!(y_lease.term, x_lease.term, "the term was kept"),
-            EpochPolicy::Keep => assert_eq!(y_lease, LeaseId::new(x_lease.term, x_lease.seq + 1)),
+            EpochPolicy::Keep => assert_eq!(y_lease, LeaseId::new(x_lease.term, ID_BLOCK)),
         }
 
         // X's lease, with Y's action: refused, and nothing is answered.
