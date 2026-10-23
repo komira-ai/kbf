@@ -78,8 +78,6 @@ kbf-transfer.workspace = true
 kbf-daemon.workspace = true
 # tests/installer_reads_version.rs: the installer parses what this binary prints.
 kbf-installer.workspace = true
-# tests/setup_update_dirs.rs: the installer's layout of a host, for the paths `setup` writes.
-kbf-host.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tonic.workspace = true
 # The Postgres process test reads the frontend's tables back (tests/frontend_process.rs), in a
