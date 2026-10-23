@@ -283,7 +283,8 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
     let scratch = Scratch::new("slotgpu");
     let users = Users::new("slotgpu", 1);
     let pool = Pool::new(users.0.clone()).expect("pool");
-    let probes = std::env::temp_dir().join(format!("kbf-slot-gpu-{}", std::process::id()));
+    // Not `std::env::temp_dir()`: root's own folder, which the pool user cannot enter.
+    let probes = PathBuf::from("/private/tmp").join(format!("kbf-slot-gpu-{}", std::process::id()));
     let probe = build_probe(&probes);
     let user = users.0[0].clone();
     let uid = user.uid;
