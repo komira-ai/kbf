@@ -368,8 +368,9 @@ mod tests {
                 "{e}"
             );
         }
-        assert!(Role::MacDaemon.is_daemon() && Role::Daemon.is_daemon());
-        assert!(!Role::Storage.is_daemon() && !Role::Frontend.is_daemon());
+        let daemons =
+            [Role::Frontend, Role::Storage, Role::Daemon, Role::MacDaemon].map(Role::is_daemon);
+        assert_eq!(daemons, [false, false, true, true]);
         assert_ne!(Role::MacDaemon, Role::Daemon);
     }
 
