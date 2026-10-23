@@ -205,7 +205,7 @@ pub struct UpdateSpec {
     pub to: CommitId,
     pub nodes: bool,
     pub rollback: bool,
-    /// Where the release came from; the order for the nodes names the same.
+    /// Where the release came from.
     pub source: Source,
     pub facts: StagedFacts,
     pub order: Locator,

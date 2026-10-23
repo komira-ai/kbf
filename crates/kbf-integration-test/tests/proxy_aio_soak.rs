@@ -68,8 +68,8 @@ use std::time::{Duration, Instant};
 use kbf_installer::CommitId;
 use kbf_installer::proxy::gate_real::ProxyGate;
 use kbf_installer::proxy::model::{
-    AdoptError, DesiredError, Halt, Locator, Mode, OpenCounts, Phase, Plan, PortError, ProcIdent,
-    Readiness, Retired, RoleInfo, RoleState, Slot, Source, StagedFacts, Start, Timing,
+    AdoptError, Halt, Locator, Mode, OpenCounts, Phase, Plan, PortError, ProcIdent, Readiness,
+    Retired, RoleInfo, RoleState, Slot, Source, StagedFacts, Start, Timing,
 };
 use kbf_installer::proxy::ports::{Child, ChildAdmin, Clock, Gate, Migrator, Ports, RootOrders};
 use kbf_installer::proxy::runtime::{RequestQueue, SystemClock};
@@ -314,13 +314,6 @@ impl ChildAdmin for Stand {
         Ok(OpenCounts {
             open_streams: open_executions(&operator_api(self.base, slot)),
             open_sessions: 0,
-        })
-    }
-
-    fn post_desired(&self, _: Slot, _: &CommitId, _: Source) -> Result<(), DesiredError> {
-        Err(DesiredError::Refused {
-            code: "no_nodes".into(),
-            why: "the plan updates no nodes".into(),
         })
     }
 }

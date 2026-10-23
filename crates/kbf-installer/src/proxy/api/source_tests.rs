@@ -195,7 +195,7 @@ fn an_update_that_fetches_writes_no_source_anywhere() {
 }
 
 /// Catches a source that stops at the API: once the installer has staged the release, the
-/// supervisor is given the source, so that its record and the order for the nodes name it.
+/// supervisor is given the source, so that its record names it.
 /// A process that is restarted while the update waits for the installer goes on with the
 /// source of the entry it took the update from, and says it while it waits.
 ///
@@ -236,9 +236,8 @@ fn a_rollback_is_refused_for_a_staged_update() {
     left_no_trace(&rig, "r1");
 }
 
-/// Catches nodes being ordered from a release only this host has: the order for the nodes
-/// does not name its source yet, so a staged update that asks for the nodes is refused, and
-/// the same request without them is taken.
+/// Asserts that a staged update that asks for the nodes is refused (`source_refused`), and
+/// that the same request without them is accepted.
 ///
 /// Catches: the refusal dropped (a staged update with `nodes` is accepted).
 #[test]

@@ -113,8 +113,7 @@ fn the_update_apis_numbers_and_places_come_from_the_file_and_the_flags() {
     let (layout, _) = crate::testkit::host_root_on("places", Platform::Linux);
     let cfg = handover_config(&args, &loaded, &layout);
     // The children's ports are the upstream table's: in a slot the operator listener is at
-    // offset 2 and the admin calls at 3, slot B ten ports above slot A, all on loopback; and
-    // the operator token is the one the proxy checks callers against.
+    // offset 2 and the admin calls at 3, slot B ten ports above slot A, all on loopback.
     let at = |port| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     assert_eq!(
         cfg.slots,
@@ -122,10 +121,6 @@ fn the_update_apis_numbers_and_places_come_from_the_file_and_the_flags() {
             admin: [at(18003), at(18013)],
             operator: [at(18002), at(18012)],
         }
-    );
-    assert_eq!(
-        cfg.operator_token_file,
-        PathBuf::from("/etc/kbf/operator.token")
     );
     assert!(!cfg.gate.is_filled());
     assert_eq!(
@@ -454,7 +449,6 @@ pub(super) fn handover(name: &str) -> HandoverConfig {
             admin: [loopback(18003), loopback(18013)],
             operator: [loopback(18002), loopback(18012)],
         },
-        operator_token_file: root.join("operator.token"),
         installer_toml: root.join("installer.toml"),
         gate: GateSlot::new(),
     }
@@ -1078,7 +1072,6 @@ fn the_start_migrates_the_installed_release_before_it_runs_it() {
         state_dir: state_dir.clone(),
         proxy_auth_file: config.proxy_auth_file.clone(),
         upstream: config.slot_table(),
-        operator_token_file: config.operator_token_file.clone(),
         status,
         local: None,
         frontend_config: None,
