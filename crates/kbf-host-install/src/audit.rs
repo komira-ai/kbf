@@ -28,7 +28,7 @@ pub struct Entry {
     pub verb: Option<&'static str>,
     pub version: Option<String>,
     pub channel: Option<String>,
-    /// `installed`, `already_installed`, `query`, `refused` or `failed`.
+    /// `installed`, `already_installed`, `apply_started`, `query`, `refused` or `failed`.
     pub outcome: &'static str,
     /// The closed reason code of a refusal or a failure.
     pub reason: Option<&'static str>,

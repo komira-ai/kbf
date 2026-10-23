@@ -1873,10 +1873,13 @@ dependencies = [
 name = "kbf-host-install"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "kbf-testkit",
  "rustix",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "tar",
  "thiserror",
  "time",
  "toml",

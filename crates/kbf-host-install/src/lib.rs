@@ -26,6 +26,15 @@
 //! nothing ran) or 3 (failed). Every invocation appends one line to the audit log
 //! ([`audit`]).
 //!
+//! # A Mac
+//!
+//! On macOS ([`mac`]) the same two requests install the attested release tarball into the kit
+//! layout (`/usr/local/kbf/releases/<commit>/kbf`, links `current` and `previous`) and restart
+//! the daemon's launchd job on it. The install verb checks the release on one root-owned
+//! copy, launches a one-shot launchd job that does the swap and the restart, and returns; the
+//! result is the `apply` field of `query` (`docs/deploy/host-install.md`). The platform picks
+//! the side; both are compiled everywhere.
+//!
 //! The paths this program reads as root are constants of [`host::Host::production`]. The
 //! only way to point them elsewhere is a `cfg(test)` constructor: no environment variable
 //! and no argument does it. (One variable does exist, `KBF_HOST_INSTALL_UNIT`: it makes the
@@ -39,6 +48,7 @@ mod config;
 mod debver;
 mod host;
 mod locks;
+pub(crate) mod mac;
 mod node_id;
 mod outcome;
 mod plan;
@@ -80,6 +90,10 @@ pub mod contract {
 /// the status of the answer.
 #[must_use]
 pub fn main() -> ExitCode {
+    // Both sides are compiled everywhere, so the Linux build checks the Mac code.
+    if cfg!(target_os = "macos") {
+        return ExitCode::from(mac::main_process());
+    }
     let code = host::dispatch(
         &host::Host::production(),
         &runner::SystemRunner,

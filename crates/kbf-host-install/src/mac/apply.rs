@@ -1,0 +1,351 @@
+//! Putting a staged release in and restarting the daemon on it, as its own launchd job.
+//!
+//! The install verb returns once it has launched the job ([`launch`]), so a dropped ssh
+//! session cannot end the work between `bootout` and `bootstrap`. The job is this program
+//! again (`--apply`, [`run`]) under the one-shot label [`APPLY_LABEL`], started as root by
+//! launchd. Its steps:
+//!
+//! 1. lay the release out as `releases/<commit>/kbf` (owned by root, 0755, no quarantine
+//!    attribute) and `VERSION`; a release that is already there must be the same bytes;
+//! 2. move `previous` to the release that ran and `current` to the new one, each by an
+//!    atomic rename of a link made aside;
+//! 3. `launchctl bootout` the daemon, wait (bounded) until `launchctl print` no longer
+//!    finds it, `launchctl bootstrap` it, and wait (bounded) for its `welcomed` line in the
+//!    error log, counted from where the log ended before the bootstrap;
+//! 4. if step 3 fails, move the links back and do step 3 again on the old release.
+//!
+//! The result goes to the status file ([`status`]): `done`, or `failed:<reason>` with what
+//! became of the old release. The drain that keeps builds from being cut is the updater's,
+//! done before it asks for the install; nothing here waits for leases.
+
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
+use std::thread::sleep;
+use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
+
+use super::kit::{self, Links};
+use super::layout::{APPLY_LABEL, BINARY, DAEMON_LABEL, MacHost, VERSION_FILE};
+use super::stage::{Staged, run_ok, sha256_of, strip_quarantine};
+use super::status::{self, ApplyState};
+use super::tools;
+use crate::host::fail;
+use crate::outcome::{FailureCode, Outcome};
+use crate::request::Version;
+use crate::runner::Runner;
+use crate::trust::nofollow;
+
+/// What the apply job reads from the stage.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Plan {
+    pub commit: String,
+    pub version: String,
+    pub binary_sha256: String,
+}
+
+const PLAN_FILE: &str = "plan.json";
+
+/// The most of the daemon's error log read after a restart.
+const LOG_WINDOW: u64 = 1024 * 1024;
+
+fn launch_failed(detail: impl Into<String>) -> Outcome {
+    fail(FailureCode::InstallFailed, detail)
+}
+
+/// Write the plan and the job's plist, mark the apply `running` and start the job.
+///
+/// # Errors
+/// An install failure when the job cannot be started; the status then says
+/// `failed:launch_failed`.
+pub fn launch(
+    host: &MacHost,
+    runner: &dyn Runner,
+    staged: &Staged,
+    version: &Version,
+) -> Result<(), Outcome> {
+    let plan = Plan {
+        commit: staged.commit.clone(),
+        version: version.as_str().to_owned(),
+        binary_sha256: staged.binary_sha256.clone(),
+    };
+    let started = write_plan(host, &plan)
+        .and_then(|()| status::write(host, &ApplyState::Running))
+        .map_err(|e| launch_failed(format!("cannot record the plan: {e}")))
+        .and_then(|()| start_job(host, runner));
+    if let Err(outcome) = started {
+        let _ = status::write(host, &ApplyState::Failed("launch_failed".to_owned()));
+        return Err(outcome);
+    }
+    Ok(())
+}
+
+fn write_plan(host: &MacHost, plan: &Plan) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(host.stage().join(PLAN_FILE))?;
+    file.write_all(
+        serde_json::to_string(plan)
+            .map_err(io::Error::other)?
+            .as_bytes(),
+    )
+}
+
+/// The plist of the one-shot job: it runs once when loaded and is not kept alive. It lives
+/// in the work directory, not in `/Library/LaunchDaemons`, so a reboot does not run it again.
+pub fn plist_xml(host: &MacHost) -> String {
+    let escape = |text: &str| {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let log = host.work.join("apply.log");
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n<dict>\n\
+         \t<key>Label</key>\n\t<string>{APPLY_LABEL}</string>\n\
+         \t<key>ProgramArguments</key>\n\t<array>\n\
+         \t\t<string>{exe}</string>\n\t\t<string>--apply</string>\n\t\t<string>{stage}</string>\n\t</array>\n\
+         \t<key>RunAtLoad</key>\n\t<true/>\n\
+         \t<key>KeepAlive</key>\n\t<false/>\n\
+         \t<key>StandardErrorPath</key>\n\t<string>{log}</string>\n\
+         \t<key>StandardOutPath</key>\n\t<string>{log}</string>\n\
+         </dict>\n</plist>\n",
+        exe = escape(&host.self_exe.display().to_string()),
+        stage = escape(&host.stage().display().to_string()),
+        log = escape(&log.display().to_string()),
+    )
+}
+
+fn start_job(host: &MacHost, runner: &dyn Runner) -> Result<(), Outcome> {
+    let limit = host.tuning.tool;
+    let plist = host.apply_plist();
+    fs::write(&plist, plist_xml(host))
+        .and_then(|()| fs::set_permissions(&plist, fs::Permissions::from_mode(0o644)))
+        .map_err(|e| launch_failed(format!("cannot write the job: {e}")))?;
+    // A job that has finished stays loaded; it has to be gone before the next one is.
+    if loaded(host, runner, APPLY_LABEL) {
+        let _ = runner.run(&tools::bootout(APPLY_LABEL, limit));
+        if !wait_gone(host, runner, APPLY_LABEL) {
+            return Err(launch_failed("the last apply job cannot be unloaded"));
+        }
+    }
+    run_ok(
+        runner,
+        &tools::bootstrap(&plist, limit),
+        "launchctl bootstrap",
+    )
+    .map(drop)
+    .map_err(launch_failed)
+}
+
+/// Whether launchd has the service. One that cannot be asked about counts as loaded.
+fn loaded(host: &MacHost, runner: &dyn Runner, label: &str) -> bool {
+    runner
+        .run(&tools::print(label, host.tuning.tool))
+        .map_or(true, |exec| exec.success())
+}
+
+/// Wait, for at most the tuning's `gone`, until launchd no longer has the service:
+/// `launchctl bootout` returns before the service is gone, and a `bootstrap` in that gap
+/// fails with an input/output error.
+fn wait_gone(host: &MacHost, runner: &dyn Runner, label: &str) -> bool {
+    let deadline = Instant::now() + host.tuning.gone;
+    loop {
+        if !loaded(host, runner, label) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        sleep(host.tuning.poll);
+    }
+}
+
+/// The apply job's body: apply, record the result, clear the stage. The exit status is 0 for
+/// done and 1 for a failure.
+pub fn run(host: &MacHost, runner: &dyn Runner) -> u8 {
+    let result = apply(host, runner);
+    let state = match &result {
+        Ok(()) => ApplyState::Done,
+        Err(why) => ApplyState::Failed(why.clone()),
+    };
+    // The result stays in the status file; an unwritable file is all there is to tell.
+    let written = status::write(host, &state);
+    let _ = fs::remove_dir_all(host.stage());
+    u8::from(result.is_err() || written.is_err())
+}
+
+fn read_plan(host: &MacHost) -> Option<Plan> {
+    let text = host.trust.read(&host.stage().join(PLAN_FILE)).ok()?;
+    let plan: Plan = serde_json::from_str(&text).ok()?;
+    let sound = super::release::is_commit(&plan.commit)
+        && plan.binary_sha256.len() == 64
+        && Version::new(&plan.version).is_ok();
+    sound.then_some(plan)
+}
+
+/// The steps; an error is the status text.
+fn apply(host: &MacHost, runner: &dyn Runner) -> Result<(), String> {
+    let plan = read_plan(host).ok_or("plan_invalid")?;
+    // The staged file is what was checked.
+    let staged = host.stage().join(BINARY);
+    host.trust
+        .check_file(&staged)
+        .map_err(|_| "stage_untrusted")?;
+    if sha256_of(&staged).ok().as_deref() != Some(plan.binary_sha256.as_str()) {
+        return Err("stage_changed".to_owned());
+    }
+    let before = kit::links(host).map_err(|_| "links_unreadable")?;
+    lay_out(host, runner, &plan, &staged)?;
+    if flip(host, &before, &plan.commit).is_err() {
+        // A flip that stopped halfway must not leave `previous` naming the release that ran.
+        let _ = restore(host, &before);
+        return Err("links_failed".to_owned());
+    }
+    let Err(why) = restart(host, runner) else {
+        return Ok(());
+    };
+    // The new release did not come up: the links go back, and the old release must.
+    let restored = restore(host, &before).is_ok();
+    if before.current.is_none() {
+        return Err(format!("{why}:no_previous"));
+    }
+    let back = restored && restart(host, runner).is_ok();
+    Err(format!(
+        "{why}:{}",
+        if back {
+            "rolled_back"
+        } else {
+            "rollback_failed"
+        }
+    ))
+}
+
+/// `releases/<commit>/kbf` and its `VERSION`.
+fn lay_out(host: &MacHost, runner: &dyn Runner, plan: &Plan, staged: &Path) -> Result<(), String> {
+    let dest = host.release(&plan.commit);
+    let binary = dest.join(BINARY);
+    if fs::symlink_metadata(&dest).is_err() {
+        let aside = host.releases().join(format!(".{}.new", plan.commit));
+        let _ = fs::remove_dir_all(&aside);
+        fs::create_dir(&aside)
+            .and_then(|()| fs::copy(staged, aside.join(BINARY)))
+            .and_then(|_| {
+                fs::set_permissions(aside.join(BINARY), fs::Permissions::from_mode(0o755))?;
+                fs::set_permissions(&aside, fs::Permissions::from_mode(0o755))?;
+                fs::rename(&aside, &dest)
+            })
+            .map_err(|_| "layout_failed")?;
+    }
+    // A release is written once: what is there, laid out now or before, is the staged bytes.
+    if sha256_of(&binary).ok().as_deref() != Some(plan.binary_sha256.as_str()) {
+        return Err("release_differs".to_owned());
+    }
+    strip_quarantine(host, runner, &binary).map_err(|_| "quarantine")?;
+    write_version(&dest, &plan.version).map_err(|_| "layout_failed")?;
+    // The file that will run, and every directory above it up to the top of the kit, are
+    // root's and closed to others.
+    host.kit_trust
+        .check_file(&binary)
+        .map_err(|_| "release_untrusted")?;
+    Ok(())
+}
+
+fn write_version(release: &Path, version: &str) -> io::Result<()> {
+    let aside = release.join(format!(".{VERSION_FILE}.new"));
+    let _ = fs::remove_file(&aside);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&aside)?;
+    writeln!(file, "{version}")?;
+    file.sync_all()?;
+    fs::rename(&aside, release.join(VERSION_FILE))
+}
+
+/// `previous` becomes the release that ran (unless that is the new one), then `current` the
+/// new one.
+fn flip(host: &MacHost, before: &Links, commit: &str) -> io::Result<()> {
+    if let Some(ran) = before.current.as_deref().filter(|ran| *ran != commit) {
+        kit::set_link(&host.previous(), Some(ran))?;
+    }
+    kit::set_link(&host.current(), Some(commit))
+}
+
+/// Both links as they were.
+fn restore(host: &MacHost, before: &Links) -> io::Result<()> {
+    let current = kit::set_link(&host.current(), before.current.as_deref());
+    let previous = kit::set_link(&host.previous(), before.previous.as_deref());
+    current.and(previous)
+}
+
+/// Restart the daemon: out, gone, in, welcomed. The error is the reason.
+fn restart(host: &MacHost, runner: &dyn Runner) -> Result<(), &'static str> {
+    let limit = host.tuning.tool;
+    if loaded(host, runner, DAEMON_LABEL) {
+        // The service may not be loaded by the time it is asked to leave; the wait decides.
+        let _ = runner.run(&tools::bootout(DAEMON_LABEL, limit));
+        if !wait_gone(host, runner, DAEMON_LABEL) {
+            return Err("bootout_timeout");
+        }
+    }
+    let offset = fs::metadata(&host.err_log).map_or(0, |meta| meta.len());
+    run_ok(
+        runner,
+        &tools::bootstrap(&host.daemon_plist, limit),
+        "launchctl bootstrap",
+    )
+    .map_err(|_| "bootstrap_failed")?;
+    if wait_welcomed(host, offset) {
+        Ok(())
+    } else {
+        Err("not_welcomed")
+    }
+}
+
+/// Wait, for at most the tuning's `welcome`, for the `welcomed` line the new daemon writes
+/// once the frontend has taken it in. Only what the log gained since `offset` counts.
+fn wait_welcomed(host: &MacHost, offset: u64) -> bool {
+    let deadline = Instant::now() + host.tuning.welcome;
+    loop {
+        if is_welcomed(&log_since(&host.err_log, offset)) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        sleep(host.tuning.poll);
+    }
+}
+
+/// What the file at `path` gained after its first `offset` bytes, as text (a file that
+/// shrank is read whole; one that cannot be read gained nothing).
+fn log_since(path: &Path, offset: u64) -> String {
+    let read = || -> io::Result<String> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(nofollow())
+            .open(path)?;
+        let len = file.metadata()?.len();
+        file.seek(SeekFrom::Start(if len < offset { 0 } else { offset }))?;
+        let mut bytes = Vec::new();
+        file.take(LOG_WINDOW).read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    };
+    read().unwrap_or_default()
+}
+
+/// Whether `log` has the line the daemon writes when the frontend welcomed it:
+/// `... kbf_daemon: welcomed server=...`.
+pub fn is_welcomed(log: &str) -> bool {
+    log.lines()
+        .any(|line| line.contains("kbf_daemon") && line.contains(": welcomed"))
+}

@@ -680,13 +680,12 @@ fn the_running_build_has_a_limit() {
 fn in_progress_is_any_of_three_signals() {
     let fx = Fx::new("host-progress");
     write(&fx.host.dpkg_lock, 0o644, "");
-    let meta = fs::metadata(&fx.host.dpkg_lock).unwrap();
-    let dev = meta.dev();
+    let stat = rustix::fs::stat(&fx.host.dpkg_lock).unwrap();
     let line = format!(
         "1: POSIX  ADVISORY  WRITE 812 {:02x}:{:02x}:{} 0 EOF\n",
-        rustix::fs::major(dev),
-        rustix::fs::minor(dev),
-        meta.ino()
+        rustix::fs::major(stat.st_dev),
+        rustix::fs::minor(stat.st_dev),
+        stat.st_ino
     );
     let ask = |units: &str| {
         let runner = FakeRunner::new(vec![ok("ii  1.2.3-1\n"), exec(1, "", ""), ok(units)]);

@@ -4,7 +4,8 @@
 //! No shell is involved anywhere: a [`Cmd`] is a program path and its arguments, and the
 //! only environment a child sees is [`PATH`], [`LANG`] and [`DEBIAN_FRONTEND`].
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -19,13 +20,28 @@ pub const LANG: &str = "C";
 /// The only front end `debconf` and `dpkg` see: they never ask a question.
 pub const DEBIAN_FRONTEND: &str = "noninteractive";
 
+/// The user and group a command runs as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Identity {
+    pub uid: u32,
+    pub gid: u32,
+}
+
 /// A program (an absolute path) and its arguments.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cmd {
     pub program: String,
     pub args: Vec<String>,
     /// How long it may run before it is killed; none to wait for it however long it takes.
     pub timeout: Option<Duration>,
+    /// Variables the child sees besides the fixed three.
+    pub env: Vec<(String, String)>,
+    /// The user and group the child runs as; none for the caller's own. A root caller
+    /// drops its supplementary groups too.
+    pub run_as: Option<Identity>,
+    /// Bytes written to the child's standard input, which is then closed; none for an
+    /// input that is closed at once.
+    pub stdin: Vec<u8>,
 }
 
 /// How a child ended and what it wrote.
@@ -105,16 +121,34 @@ fn wait_within(child: &mut Child, limit: Duration) -> io::Result<Option<ExitStat
 
 impl Runner for SystemRunner {
     fn run(&self, cmd: &Cmd) -> io::Result<Exec> {
-        let mut child = Command::new(&cmd.program)
+        let mut command = Command::new(&cmd.program);
+        command
             .args(&cmd.args)
             .env_clear()
             .env("PATH", PATH)
             .env("LANG", LANG)
             .env("DEBIAN_FRONTEND", DEBIAN_FRONTEND)
-            .stdin(Stdio::null())
+            .envs(cmd.env.iter().map(|(k, v)| (k, v)))
+            .stdin(if cmd.stdin.is_empty() {
+                Stdio::null()
+            } else {
+                Stdio::piped()
+            })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        if let Some(id) = cmd.run_as {
+            command.uid(id.uid).gid(id.gid);
+        }
+        let mut child = command.spawn()?;
+        // The input is written from a thread, or a child that writes before it reads
+        // blocks on a full pipe while this waits for it.
+        if let Some(mut input) = child.stdin.take() {
+            let bytes = cmd.stdin.clone();
+            thread::spawn(move || {
+                // A child that stops reading closes the pipe; there is nobody to tell.
+                let _ = input.write_all(&bytes);
+            });
+        }
         // Both streams are read while the child runs, or it blocks on a full pipe.
         let stdout = drain(child.stdout.take());
         let stderr = drain(child.stderr.take());

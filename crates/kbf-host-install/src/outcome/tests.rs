@@ -322,3 +322,55 @@ fn other_lines_are_not_a_units_answer() {
         assert_eq!(Outcome::from_unit_line(line), None, "{line:?}");
     }
 }
+
+/// A Mac's two answers have their own lines, which the Linux ones never are: the apply
+/// started (exit 0), and the query with the standing of the last apply after the four fields
+/// of a query; neither is an install unit's answer.
+#[test]
+fn the_mac_answers() {
+    let started = Outcome::ApplyStarted {
+        version: "0.1.7+gbbbbbbbbbbbb-3".into(),
+        commit: "b".repeat(40),
+    };
+    assert_eq!(
+        started.json_line(),
+        format!(
+            r#"{{"result":"apply_started","version":"0.1.7+gbbbbbbbbbbbb-3","commit":"{}","apply":"running"}}"#,
+            "b".repeat(40)
+        )
+    );
+    assert_eq!(started.exit_code(), 0);
+    assert_eq!(started.audit_fields(), ("apply_started", None));
+    assert_eq!(started.stderr_detail(), None);
+    let report = || QueryReport {
+        installed_version: Some("1".into()),
+        running_commit: Some("abc".into()),
+        node_id: Some("mac-a".into()),
+        in_progress: false,
+    };
+    let done = Outcome::MacQueried {
+        report: report(),
+        apply: Some("failed:not_welcomed:rolled_back".into()),
+    };
+    assert_eq!(
+        done.json_line(),
+        r#"{"result":"query","installed_version":"1","running_commit":"abc","node_id":"mac-a","in_progress":false,"apply":"failed:not_welcomed:rolled_back"}"#
+    );
+    let none = Outcome::MacQueried {
+        report: report(),
+        apply: None,
+    };
+    assert!(
+        none.json_line()
+            .ends_with(r#""in_progress":false,"apply":null}"#)
+    );
+    assert_eq!(
+        (done.exit_code(), none.audit_fields()),
+        (0, ("query", None))
+    );
+    for outcome in [&started, &done] {
+        assert_eq!(Outcome::from_unit_line(&outcome.json_line()), None);
+    }
+    // The Linux query line is unchanged: it has no `apply`.
+    assert!(!Outcome::Queried(report()).json_line().contains("apply"));
+}
