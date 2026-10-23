@@ -38,7 +38,7 @@
 use std::collections::BTreeSet;
 
 use kbf_sched::{Cordon, Event, Input};
-use kbf_types::StartLease;
+use kbf_types::{StartLease, StateMachine};
 
 use super::owner::owner_key;
 use super::sweep::Orphan;
