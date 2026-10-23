@@ -52,10 +52,12 @@ pub(super) fn rig_with(
         schedules: SweepPlan {
             named: vec![format!("{}/tabs/{{user}}", dir.display())],
             owned: Vec::new(),
+            protected: Vec::new(),
         },
         sweep: SweepPlan {
             named: Vec::new(),
             owned: vec![dir.join("Shared")],
+            protected: Vec::new(),
         },
         grant_keys: Some(GrantKeys::parse(&key_line(7)).unwrap()),
         serial: "SERIAL1".to_owned(),

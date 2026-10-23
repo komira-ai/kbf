@@ -734,7 +734,7 @@ fn launchctl_print(target: &str, within: Duration) -> Option<String> {
 /// looked into: the sweep removes it whole), found as the sweep walks, never through
 /// a link, on one filesystem and to [`sweep::MAX_DEPTH`]. A place that cannot be read
 /// is listed too, as the sweep would fail there, unless root is denied the plan's base
-/// itself ([`sweep::base_denied`]).
+/// itself and it is a protected one ([`SweepPlan::denied_base`]).
 fn owned_entries(plan: &SweepPlan, name: &str, uid: u32) -> Vec<String> {
     let mut found = Vec::new();
     for template in &plan.named {
@@ -749,11 +749,8 @@ fn owned_entries(plan: &SweepPlan, name: &str, uid: u32) -> Vec<String> {
         if let Ok(meta) = std::fs::symlink_metadata(base)
             && meta.is_dir()
         {
-            // A base root is denied (the data-vault folders under `/private/var/protected`)
-            // is skipped as the sweep skips it.
-            if let Err(why) = std::fs::read_dir(base)
-                && sweep::base_denied(base, &why)
-            {
+            // A protected base root is denied is skipped as the sweep skips it.
+            if plan.denied_base(base) {
                 continue;
             }
             look(base, meta.dev(), uid, 0, &mut found);

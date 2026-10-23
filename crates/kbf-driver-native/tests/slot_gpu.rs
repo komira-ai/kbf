@@ -391,52 +391,63 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
     let caches = metal_caches(&folders);
     let clients = registry_clients_of(uid);
 
-    // The deny: a file of the uid's, readable by it, in each protected store (planted when
-    // root can write there; a store that refuses root holds nothing to read), which the
-    // lease must not read under the slot profile.
+    // The deny: a file of the uid's, readable by it, in each protected store root can write
+    // to, which the lease must not read under the slot profile, by either spelling of the
+    // path (`/var` is a link to `/private/var`). A store that refuses root cannot be planted
+    // into, and the deny is then not checked here.
     let mut denied = Vec::new();
+    let mut planted = 0;
+    let mut listable = 0;
     for store in PROTECTED {
+        listable += usize::from(std::fs::read_dir(store).is_ok());
         let file = Path::new(store).join(&guid).join("lease-readable");
         let folder = file.parent().expect("parent").to_owned();
         if std::fs::create_dir_all(&folder).is_err() {
-            println!("PROTECTED-CONTROL {store}: root cannot make a folder here");
+            println!("PROTECTED-NOT-PLANTED {store}: root cannot make a folder here");
             continue;
         }
         plant(&file, uid, 0, 0o644, &mut litter);
+        planted += 1;
         let cat = Path::new("/bin/cat");
-        let outside = lease
-            .command_with(
-                &slot,
-                &Isolation::None,
-                Network::Off,
-                &[],
-                (cat, &[file.to_str().unwrap()]),
-            )
-            .output()
-            .expect("cat");
+        let read = |isolation: &Isolation, path: &Path| {
+            lease
+                .command_with(
+                    &slot,
+                    isolation,
+                    Network::Off,
+                    &[],
+                    (cat, &[path.to_str().unwrap()]),
+                )
+                .output()
+                .expect("cat")
+        };
+        let outside = read(&Isolation::None, &file);
         println!(
             "PROTECTED-CONTROL {store}: unsandboxed read {}",
             if outside.status.success() {
                 "works"
             } else {
-                "is refused too"
+                "is refused"
             }
         );
-        let inside = lease
-            .command_with(
-                &slot,
-                &lease.isolation,
-                Network::Off,
-                &[],
-                (cat, &[file.to_str().unwrap()]),
-            )
-            .output()
-            .expect("cat");
-        denied.push((
-            store,
-            inside.status.success(),
-            String::from_utf8_lossy(&inside.stderr).into_owned(),
-        ));
+        let control = outside.status.success();
+        let link_spelling =
+            Path::new("/var").join(file.strip_prefix("/private/var").expect("prefix"));
+        for path in [file.clone(), link_spelling] {
+            let inside = read(&lease.isolation, &path);
+            denied.push((
+                path,
+                control,
+                inside.status.success(),
+                String::from_utf8_lossy(&inside.stderr).into_owned(),
+            ));
+        }
+    }
+    if planted == 0 {
+        println!(
+            "PROTECTED-DENY-NOT-CHECKED: root cannot plant into either protected store on this \
+             host; this test does not check the profile deny here (the read-protected canary does)"
+        );
     }
 
     // What a framework import makes in the security-message folder, planted as the system
@@ -491,13 +502,23 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
         !clients.is_empty(),
         "the registry shows no user client of uid {uid}"
     );
-    for (store, readable, why) in &denied {
+    for (path, control, readable, why) in &denied {
+        assert!(
+            control,
+            "the unsandboxed read of the planted {} was refused too: the deny is unproven",
+            path.display()
+        );
         assert!(
             !readable,
-            "a lease under the slot profile read a file in {store}"
+            "a lease under the slot profile read {}",
+            path.display()
         );
-        println!("PROTECTED-DENIED {store}: {}", why.trim());
+        println!("PROTECTED-DENIED {}: {}", path.display(), why.trim());
     }
+    assert!(
+        planted > 0 || listable == 0,
+        "root can list a protected store here but could plant into none: the deny went unchecked"
+    );
     assert_eq!(free, 1, "the clean left the slot dirty");
     assert!(
         residue_left.is_empty(),

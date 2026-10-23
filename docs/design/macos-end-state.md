@@ -323,12 +323,13 @@ root launchd job; the privacy database shows Full Disk Access denied for the kbf
 hosted runner hid this, because its agent process has Full Disk Access. A C8 that fails closed on any
 error would have failed every clean on such a Mac and set every slot dirty. So:
 
-- **The sweep skips a base it is denied.** When root cannot open or list a plan base itself
-  (`/private/var/protected/sfanalytics`, `/private/var/protected/trustd/private`) with `EPERM` or
-  `EACCES`, the base is skipped: not an error, not a dirty slot, and one warning per process and
+- **The sweep skips a protected base it is denied.** The plan names a `protected` set holding
+  only those two folders. When root cannot open, examine or list one of them (`/private/var/protected/sfanalytics`,
+  `/private/var/protected/trustd/private`) with `EPERM` or
+  `EACCES`, the base is skipped (a denial at any other base, `/private/var/folders` or `/private/tmp` say, is an error): not an error, not a dirty slot, and one warning per process and
   base (not per lease) says the slot profile denies leases access to it. Every other error at a base,
   and any error below a base that could be listed, still fails closed. The check after the sweep
-  (the listing of what the uid still owns) skips the same bases. `/private/var/db/mds/messages/<uid>`
+  (the listing of what the uid still owns) skips the same bases, classified by the same code. `/private/var/db/mds/messages/<uid>`
   keeps its sweep.
 - **The slot profile denies the two folders instead.** `SLOT_PROFILE` and `SLOT_NO_NETWORK_PROFILE`
   carry `(deny file-read* file-write* (subpath ".../sfanalytics") (subpath ".../trustd/private"))`
@@ -337,6 +338,15 @@ error would have failed every clean on such a Mac and set every slot dirty. So:
   for the uid. The `read-protected` canary asserts the deny ([slot profile canaries](#slot-profile-canaries)).
   Neither operation is one Metal needs, and the deny is not in the list of known GPU-breaking denies
   (`tests/gpu_profile.rs`); `tests/slot_gpu.rs` runs the Metal probe under the profile (MLX is not run: a test may not name a Python interpreter).
+
+  Two things are not proven. Security framework trust evaluation (`trustd`, a certificate chain
+  or a TLS handshake) under the new deny is **unmeasured**: no test runs an evaluation under the profile, so
+  whether it needs to read `trustd/private` is not known.
+  And on a Mac Studio `slot_gpu` cannot plant into the protected stores (root is refused), so it
+  prints `PROTECTED-DENY-NOT-CHECKED` there and **the `read-protected` canary is the only proof of
+  the deny**; the test checks the deny where root can plant, which the hosted runner allows (and
+  asserts, with an unsandboxed control read, that the file was readable without the profile,
+  through both the `/private/var` and the `/var` spelling).
 
 Known limits:
 

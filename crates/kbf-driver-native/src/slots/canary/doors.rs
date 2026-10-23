@@ -281,10 +281,14 @@ pub fn sandbox_denies(operation: &str) -> io::Result<bool> {
     }
     /// `SANDBOX_FILTER_NONE`: the operation alone, no object.
     const FILTER_NONE: c_int = 0;
+    /// `SANDBOX_CHECK_NO_REPORT`: a denial found by the check is not logged as a violation.
+    const NO_REPORT: c_int = 0x4000_0000;
     let operation = CString::new(operation).map_err(io::Error::other)?;
     // SAFETY: `operation` is a NUL-terminated string that outlives the call, the filter
-    // `SANDBOX_FILTER_NONE` takes no further argument, and the pid is our own.
-    let answer = unsafe { sandbox_check(libc::getpid(), operation.as_ptr(), FILTER_NONE) };
+    // `SANDBOX_FILTER_NONE` takes no further argument (the report flag is a modifier of the
+    // filter word), and the pid is our own.
+    let answer =
+        unsafe { sandbox_check(libc::getpid(), operation.as_ptr(), FILTER_NONE | NO_REPORT) };
     let errno = io::Error::last_os_error();
     read_sandbox_answer(answer, errno)
 }
@@ -305,6 +309,8 @@ pub fn sandbox_denies_path(operation: &str, path: &std::path::Path) -> io::Resul
     }
     /// `SANDBOX_FILTER_PATH`: the object is a path, passed as a C string.
     const FILTER_PATH: c_int = 1;
+    /// `SANDBOX_CHECK_NO_REPORT`: a denial found by the check is not logged as a violation.
+    const NO_REPORT: c_int = 0x4000_0000;
     let operation = CString::new(operation).map_err(io::Error::other)?;
     let path = CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
     // SAFETY: `operation` and `path` are NUL-terminated strings that outlive the call, the
@@ -314,7 +320,7 @@ pub fn sandbox_denies_path(operation: &str, path: &std::path::Path) -> io::Resul
         sandbox_check(
             libc::getpid(),
             operation.as_ptr(),
-            FILTER_PATH,
+            FILTER_PATH | NO_REPORT,
             path.as_ptr(),
         )
     };
