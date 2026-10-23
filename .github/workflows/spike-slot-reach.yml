@@ -1,17 +1,6 @@
-# What a pool action reaches of another slot (T026 M0): two pool users, two leases under the
-# driver's slot profile and a control with no sandbox, each cross-slot attempt recorded as a
-# `REACH` row (crates/kbf-driver-native/tests/slot_reach.rs). It asserts nothing about the
-# profile, only that the harness ran; the table in the log is the measurement the profile
-# change (M1) is decided on. The same test runs in beta.yml's native-macos job after a push
-# to main; this workflow runs it by hand on a branch first, so a probe change is measured
-# before it merges. A pull request does not run it (a pull request runs the fast gate of
-# ci.yml only; the macOS pool is small).
-#
-# The second job, `pool-spike`, is M0 of the Mac legs of the isolation suites (T018,
-# crates/kbf-daemon-test/tests/mac_pool_spike): the real daemon with a pool of two users as
-# root behind a fake front, and what the runner does for them (`launchctl asuser`, the
-# `user/<uid>` domain without a login, `security`, `pbcopy`, the lease directory), each fact a
-# `SPIKE` line. Also in beta.yml's native-macos job; here it runs by hand on a branch first.
+# SPIKE (spike/mac-apps-gpu, never merges): GPU, XCUITest and a signed app, as the runner user
+# and as a pool user, unsandboxed and under the slot profile
+# (crates/kbf-driver-native/tests/apps_gpu_spike.rs, tools/spike/macos-apps-gpu).
 name: spike-slot-reach
 
 on:
@@ -19,146 +8,51 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: spike-slot-reach-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  slot-reach:
+  apps-gpu:
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: sw_vers
-      - run: uname -m
+      - run: sw_vers; uname -m; xcodebuild -version; python3 --version; ls /opt/homebrew/bin | grep -i python | head
+      - run: system_profiler SPDisplaysDataType SPHardwareDataType | head -50
       - run: rustup toolchain install
-      - name: Cross-slot reach of a pool action, sandboxed and not (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test slot_reach -- --test-threads=1 --nocapture
-
-  # The usage a native lease reports on a Mac (crates/kbf-driver-native/src/usage.rs): a lease that
-  # holds 208 MiB and burns CPU for 1.5 s, as the daemon's user (the process-tree path) and as a pool
-  # user (the uid path, root). The `USAGE` lines carry the measured peak, CPU and wall time. Also run
-  # by beta.yml's native-macos job after a push to main; here by hand on a branch first.
-  native-usage:
-    runs-on: macos-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the probes
+        run: |
+          set -x
+          B=/private/tmp/kbf-spike-bin; L=/private/tmp/kbf-spike-logs
+          mkdir -p $B $L
+          D=tools/spike/macos-apps-gpu
+          swiftc -O $D/gpu_probe.swift -o $B/gpu_probe
+          cp $D/*.sh $D/mlx_probe.py $B/
+          cp -R tools/spike/macos/fixtures $B/fixtures
+          # The precompiled-library path needs the Metal toolchain; Xcode 26 ships it as a download.
+          (xcrun -sdk macosx metal -c $D/kernel.metal -o $B/k.air && xcrun -sdk macosx metallib $B/k.air -o $B/probe.metallib && echo METALLIB_OK) || echo "METALLIB_UNAVAILABLE"
+          # The ad hoc signed app.
+          mkdir -p $B/Hello.app/Contents/MacOS
+          swiftc -O $D/hello_app.swift -o $B/Hello.app/Contents/MacOS/hello
+          printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<plist version="1.0"><dict>' '<key>CFBundleExecutable</key><string>hello</string>' '<key>CFBundleIdentifier</key><string>test.kbf.hello</string>' '<key>CFBundleName</key><string>Hello</string>' '<key>CFBundlePackageType</key><string>APPL</string>' '</dict></plist>' > $B/Hello.app/Contents/Info.plist
+          codesign --force --sign - --deep $B/Hello.app
+          # MLX, if it installs fast.
+          PY=/opt/homebrew/bin/python3; [ -x $PY ] || PY=python3
+          ($PY -m venv $B/venv && perl -e 'alarm shift; exec @ARGV' 300 $B/venv/bin/pip install mlx 2>&1 | tail -3) || echo "MLX_INSTALL_FAILED"
+          chmod -R a+rX $B
+      - name: Runner user arms (logged-in session)
+        continue-on-error: true
+        run: |
+          B=/private/tmp/kbf-spike-bin; L=/private/tmp/kbf-spike-logs
+          echo "=== runner gpu"; bash $B/probe_gpu.sh $B 2>&1 | tee $L/runner-gpu.out
+          echo "=== runner app"; bash $B/probe_app.sh $B $L runner 2>&1 | tee $L/runner-app.out
+          echo "=== runner ui"; bash $B/probe_ui.sh $B $L/runner-ui 2>&1 | tee $L/runner-ui.out
+      - name: Pool user arms (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test apps_gpu_spike -- --test-threads=1 --nocapture 2>&1 | tee /private/tmp/kbf-spike-logs/pool-arms.out
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
         with:
-          persist-credentials: false
-      - run: sw_vers
-      - run: uname -m
-      - run: rustup toolchain install
-      - name: Usage of a lease run as a process tree
-        run: cargo test -p kbf-driver-native --test tree --locked -- usage --nocapture
-      - name: Usage of a lease run as a pool user (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test slots -- usage --test-threads=1 --nocapture
-
-  pool-spike:
-    runs-on: macos-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: sw_vers
-      - run: uname -m
-      - run: rustup toolchain install
-      # The daemon the test starts is found beside the test binary.
-      - run: cargo build -p kbf-cli --bin kbf --locked
-      - name: What the runner does for a root daemon with a pool of two users (root, real users)
-        run: cargo xtask sudo-test -p kbf-daemon-test --test mac_pool_spike -- --test-threads=1 --nocapture
-
-  # How a Mac behaves with a pool of 100 and of 1000 users (a measurement spike for the pool
-  # and reset design): as root on a hosted Mac, make the users `kbf-scale-<i>` in the uid
-  # block 61000 to 62023, time their creation, the first `getpwnam` that sees each, the
-  # pool's per-user check and opendirectoryd lookups before and after, time one full reset
-  # (`Slot::release`) for a sample of 20, and remove every user, home and /var/folders entry
-  # made, whatever the result (crates/kbf-driver-native/tests/pool_scale_spike). The log
-  # carries `MEASURE` lines and a closing `SUMMARY`; the test asserts only that the harness
-  # ran and left nothing behind. It makes up to 1000 real users and takes most of an hour,
-  # so it has a limit of its own. This workflow's `cancel-in-progress: true` would cancel a
-  # run in its clean-up when a second dispatch starts on the branch; do not dispatch it
-  # twice.
-  pool-scale:
-    runs-on: macos-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: sw_vers
-      - run: uname -m
-      - run: rustup toolchain install
-      - name: Pool of 100 then 1000 hidden users, and one full reset for 20 (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test pool_scale_spike -- --test-threads=1 --nocapture
-
-  # M2 of the Mac legs (crates/kbf-driver-native/tests/slot_clean.rs): the freshness
-  # scenario of the slot clean, and the mutant tests that run it with one step of the
-  # clean skipped and print which rows turn red. By hand on a branch, so what the mutants
-  # show on a Mac (the bootout's and the image detach's rows are printed, not asserted) is
-  # measured before the branch merges. The same command as the native-macos job of
-  # beta.yml runs after a push to main.
-  slot-clean-mutants:
-    runs-on: macos-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: sw_vers
-      - run: uname -m
-      - run: rustup toolchain install
-      - name: The slot clean and its mutants, on real users (root)
-        run: cargo xtask sudo-test -p kbf-driver-native --test slot_clean -- --test-threads=1 --nocapture
-
-  # SIGTERM before SIGKILL (crates/kbf-driver-native/tests/slot_term.rs): a pool lease whose
-  # workload keeps POSIX shared memory and semaphores through a tracker process, ended while
-  # it runs, with the grace on (no name is left), with none (all are left) and in the clean of
-  # a slot; and a workload that ignores SIGTERM, named in the lease's stderr. The same command
-  # as the native-macos job of beta.yml runs after a push to main.
-  slot-term:
-    runs-on: macos-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: sw_vers
-      - run: uname -m
-      - run: rustup toolchain install
-      - name: Ending a pool lease with SIGTERM first (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test slot_term -- --test-threads=1 --nocapture
-
-  # The profile canaries (crates/kbf-driver-native/tests/slot_canary.rs): refused under the
-  # real profile with their latency printed (`CANARY-LATENCY`), and red when the generated
-  # profile loses `(deny file-write*)` (`CANARY-WEAKENED`). The same command as the
-  # native-macos job of beta.yml runs after a push to main.
-  slot-canary:
-    runs-on: macos-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: sw_vers
-      - run: uname -m
-      - run: rustup toolchain install
-      - name: The profile canaries and the weakened profiles, on real users (root)
-        run: cargo xtask sudo-test -p kbf-driver-native --test slot_canary -- --test-threads=1 --nocapture
+          name: apps-gpu
+          path: /private/tmp/kbf-spike-logs
+          retention-days: 7
