@@ -303,3 +303,47 @@ fn a_vm_at_the_whole_macs_memory_runs_alone() {
     assert_eq!(grants.len(), 1, "the empty Mac takes it: {grants:?}");
     assert_eq!(h.booked("mac").memory_bytes, 24 * GIB);
 }
+
+/// Catches: a VM placed on a capped Mac that holds as many leases as its cap while a VM
+/// slot is free (the VM check skipping the lease cap `action_slots` sets), and a freed
+/// lease slot not taking the waiting VM. The Mac has two VM slots and one lease slot.
+#[test]
+fn a_vm_with_a_free_vm_slot_but_no_free_lease_slot_is_refused() {
+    let mut h = Harness::new();
+    h.mac("mac", MAC.with_lease_cap(1));
+    h.submit(1, action(1, 1));
+    h.submit(2, vm(2, 8));
+    let (grants, _) = h.tick();
+    assert_eq!(grants.len(), 1, "one lease slot, one lease: {grants:?}");
+    assert_eq!(h.booked("mac").vms, 0, "a VM slot is free");
+    assert!(h.tick().0.is_empty(), "a VM past the lease cap");
+    h.finish(&grants[0]);
+    let (next, _) = h.tick();
+    assert_eq!(next.len(), 1, "the freed lease slot goes to the VM");
+    assert_eq!(h.booked("mac").vms, 1);
+}
+
+/// Catches: a VM placed on a Mac whose only VM slot is taken because lease slots are
+/// free (the lease cap standing in for the VM slot count), and a VM that does not book its
+/// lease slot, which lets actions overrun the cap. The Mac has one VM slot and three lease
+/// slots.
+#[test]
+fn a_vm_with_a_free_lease_slot_but_no_free_vm_slot_is_refused() {
+    let mut h = Harness::new();
+    h.mac("mac", MAC.with_vms(1).with_lease_cap(3));
+    h.submit(1, vm(1, 8));
+    h.submit(2, vm(2, 8));
+    let (grants, _) = h.tick();
+    assert_eq!(grants.len(), 1, "one VM slot, one VM: {grants:?}");
+    assert_eq!(h.booked("mac").vms, 1);
+    assert!(h.tick().0.is_empty(), "a second VM on one VM slot");
+    h.submit(3, action(3, 1));
+    h.submit(4, action(4, 1));
+    h.submit(5, action(5, 1));
+    let (actions, _) = h.tick();
+    assert_eq!(
+        actions.len(),
+        2,
+        "the VM books one of the three lease slots: {actions:?}"
+    );
+}

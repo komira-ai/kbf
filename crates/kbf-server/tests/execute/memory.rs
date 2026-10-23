@@ -185,7 +185,7 @@ async fn the_ladder_flag_sets_the_first_booking_and_the_rungs() {
     rerun(&mut daemon, &second, MemoryKill::OwnLimit, 64).await;
 }
 
-/// Catches: a busy node's kill that raises the booking (the mutant: it is the node's
+/// Catches: a busy node's kill that raises the booking (defect: it is the node's
 /// fault), one answered at once, or rerun without end; a node whose pressure is not
 /// logged for operators; and the farm's error after the reruns that does not name the
 /// node and the kills, or is not INTERNAL.

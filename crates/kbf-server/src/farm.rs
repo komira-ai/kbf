@@ -72,7 +72,7 @@ mod phase;
 mod record;
 pub mod sched_view;
 
-pub use durable::{DONE_FLOOR, EpochPolicy, SESSION_RENEWAL, StateError};
+pub use durable::{DONE_FLOOR, EpochBump, EpochPolicy, ID_BLOCK, SESSION_RENEWAL, StateError};
 pub use handover::UNTRACED_LOOKS;
 pub use phase::Reported;
 
@@ -180,7 +180,7 @@ fn identity(caps: &kbf_caps::NodeCaps) -> (String, &'static str) {
     (os, caps.cpu.arch().name())
 }
 
-/// A node as the update controller reads it ([`Farm::update_look`]).
+/// A node as the update node step reads it ([`Farm::update_look`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeLook {
     /// Its id.
@@ -297,10 +297,6 @@ struct State {
     /// the operation: a copy of its `Result` is a duplicate, not an unknown lease
     /// ([`State::standing`]).
     answered: BTreeMap<LeaseId, OperationId>,
-    /// The held effect whose last try was refused as unreachable: a "row is gone" for
-    /// this effect and no other may be its own applied work
-    /// ([`State::release_unwritten`]).
-    retrying: Option<Effect>,
     /// Writes given up on for good: dropped as stale or fenced, or over the cap ([`Farm::dropped_writes`]).
     write_drops: u64,
     /// The most committed records `unwritten` holds before a new one is dropped.
@@ -416,7 +412,6 @@ impl Farm {
                 owed: BTreeMap::new(),
                 answered: BTreeMap::new(),
                 parked: BTreeMap::new(),
-                retrying: None,
                 write_drops: 0,
                 held_cap: HELD_CAP,
                 store_down: false,
@@ -720,7 +715,7 @@ impl Farm {
             .map_err(|_| SendError::NotConnected(worker.to_string()))
     }
 
-    /// Every node registered since this farm started, as the update controller reads it, in
+    /// Every node registered since this farm started, as the update node step reads it, in
     /// node-id order.
     pub fn update_look(&self) -> Vec<NodeLook> {
         let mut state = self.lock();
@@ -1272,6 +1267,7 @@ impl State {
     /// answers, for the caller to deliver once the lock is released.
     fn carry_out(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
         self.watch_store(now);
+        self.reserve_seqs();
         self.learned.clock(now);
         // Only the inputs whose callers deliver answers ([`State::feed_quiet`]) release
         // effects an earlier refusal held back: one of them may be an answer.
@@ -1292,6 +1288,12 @@ impl State {
         while let Some(effect) = effects.pop_front() {
             match effect {
                 Effect::Commit(record) => {
+                    // A refusal for want of a daemon waits on if another frontend's could
+                    // run the operation: it is not committed, and is proposed again after
+                    // another unservable wait.
+                    if self.held_for_other_frontends(&record) {
+                        continue;
+                    }
                     if let ControlRecord::Lease(grant) = &record {
                         self.offer(grant);
                     }

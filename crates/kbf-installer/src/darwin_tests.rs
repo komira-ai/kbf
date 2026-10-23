@@ -30,7 +30,7 @@ fn codesign(verify: i32, display_stderr: &'static str) -> Result<(), Refusal> {
 /// exit, a status from a signal, a message that is not that one, a tool that is not there
 /// or runs out of time) is an error, never read as "not quarantined".
 ///
-/// Mutant seen red: the exit 0 arm returning false (a quarantined file passes).
+/// Catches: the exit 0 arm returning false (a quarantined file passes).
 #[test]
 fn the_quarantine_attribute_is_read_from_xattrs_exit_and_message() {
     assert!(quarantine(ran(0, "0081;5f;Safari;\n", "")).expect("answers"));
@@ -97,7 +97,7 @@ fn xattr_is_asked_for_the_quarantine_attribute_of_the_file() {
 /// runtime, not ad hoc (a Developer ID signature has other flags), extra flags and no
 /// code directory line at all are each refused; the refusal says what the flags were.
 ///
-/// Mutants seen red: `--verify` result ignored; flags compared with `contains`.
+/// Catches: `--verify` result ignored; flags compared with `contains`.
 #[test]
 fn a_signature_must_verify_and_be_ad_hoc_with_the_hardened_runtime() {
     codesign(0, INFO).expect("the signature CI makes");

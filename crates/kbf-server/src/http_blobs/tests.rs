@@ -41,7 +41,7 @@ fn filename(kind: &str, header: &HeaderValue) -> Result<String, String> {
     decode_ext_value(rest)
 }
 
-/// Catches (mutant "splice the name raw", or `filename="<name>"`): a name with a
+/// Catches (defect "splice the name raw", or `filename="<name>"`): a name with a
 /// quote, a `;`, a line break, a `%` or non-ASCII that ends the value early, adds a
 /// parameter, or does not decode back to itself; and a disposition with a filename
 /// when no name is given.
@@ -272,7 +272,7 @@ async fn get_in_time<M: MetaLog, O: ObjectStore + 'static>(
         .expect("answered within twice the wait")
 }
 
-/// Catches (mutants "release the budget once the blob is read", "one permit per read
+/// Catches (defects "release the budget once the blob is read", "one permit per read
 /// instead of per byte", "no budget", "wait forever", "another wait", "a busy answer
 /// without Retry-After or `busy`"): reads that together hold more blob bytes than the
 /// budget, and a busy read not told so. With 10 bytes, an 8-byte answer not yet sent
@@ -312,7 +312,7 @@ async fn bytes_not_yet_sent_hold_the_read_budget() {
     );
 }
 
-/// Catches (mutant "take the budget only if it is free now", the first form): a large
+/// Catches (defect "take the budget only if it is free now", the first form): a large
 /// read starved by smaller ones. With 8 of 10 bytes held, a 10-byte read waits in
 /// line; a 2-byte read asked after it waits behind it although 2 bytes are free, and
 /// is served only once the 10-byte answer is dropped.
@@ -383,7 +383,7 @@ async fn a_large_digest_not_held_is_404_at_once() {
     }
 }
 
-/// Catches (mutant "a reader makes a budget of its own"): the blob route and the other
+/// Catches (defect "a reader makes a budget of its own"): the blob route and the other
 /// readers of the process (the failure-log route, the history writer's tail reads) each
 /// holding a whole budget of their own, so that together they hold more than the process
 /// may. A budget given to the route is the route's: what another reader holds of it, the
@@ -436,7 +436,7 @@ fn the_read_budget_holds_a_window() {
     assert!(kbf_front::READ_WINDOW_BYTES <= READ_BUDGET_BYTES as u64);
 }
 
-/// Catches (mutant "the budget is released only when the body's end is read"): an
+/// Catches (defect "the budget is released only when the body's end is read"): an
 /// answer the client never reads (it went away) keeping its blob's budget, so three
 /// abandoned 8-byte downloads under a 10-byte budget would shut the route for good.
 #[tokio::test(start_paused = true)]
@@ -453,7 +453,7 @@ async fn an_answer_dropped_unread_frees_its_budget() {
     );
 }
 
-/// Catches (mutant "a failed read keeps its permit"): a read that fails (here an
+/// Catches (defect "a failed read keeps its permit"): a read that fails (here an
 /// absent blob of 10 bytes, the whole budget) never giving its budget back.
 #[tokio::test(start_paused = true)]
 async fn a_failed_read_frees_its_budget() {
@@ -469,7 +469,7 @@ async fn a_failed_read_frees_its_budget() {
     );
 }
 
-/// Catches (mutant "a range answer copies its part"): a `206` that frees the whole
+/// Catches (defect "a range answer copies its part"): a `206` that frees the whole
 /// blob's budget while its part is still being sent, which `Range: bytes=0-` would
 /// turn into reads the budget never counts. The part holds the whole blob's share
 /// until it is dropped.
@@ -489,7 +489,7 @@ async fn a_part_holds_the_whole_blobs_budget() {
     );
 }
 
-/// Catches (mutant "`<` for `<=`"): a blob of exactly the whole budget answered
+/// Catches (defect "`<` for `<=`"): a blob of exactly the whole budget answered
 /// `503`. With a 10-byte budget a 10-byte blob is served.
 #[tokio::test(start_paused = true)]
 async fn a_blob_of_exactly_the_budget_is_served() {

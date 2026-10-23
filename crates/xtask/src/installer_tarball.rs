@@ -1,5 +1,5 @@
 //! `installer-tarball --binary <path> --platform <platform> --commit <sha> --units <dir>
-//! --trust <dir> --sysusers <file> --tmpfiles <file> --out <dir>`: the payload
+//! --trust <dir> --sysusers <file> --tmpfiles <file> --needrestart <file> --out <dir>`: the payload
 //! `packaging/install.sh` places: the files of the Debian package, at the same paths
 //! with the same modes, because it is made from the same list ([`crate::pkg_linux::files`],
 //! which the deb and the rpm are made from too) and cannot drift from it:

@@ -2,6 +2,8 @@
 
 mod fault;
 mod give_up;
+mod hold;
+mod ids;
 pub(crate) mod loss;
 pub(crate) mod memory;
 mod outage;
@@ -202,6 +204,14 @@ impl Worker {
         self.phase.switching() == Some(lease) && now < self.switch_ends
     }
 
+    /// Whether it holds fewer leases than its lease cap; a node that reports no cap
+    /// always does.
+    fn under_lease_cap(&self) -> bool {
+        self.capacity
+            .leases
+            .is_none_or(|cap| u64::try_from(self.leases).is_ok_and(|held| held < cap))
+    }
+
     /// Whether `request`, an action or a VM, is at the whole host's memory (the last step
     /// of the memory ladder, which the cap is): it runs with no other lease on the node,
     /// and none is placed beside it, as a whole-machine lease does. A request for no
@@ -213,9 +223,11 @@ impl Worker {
 
     /// Whether `request` can be placed on it now, platform and kind aside: an action
     /// if no whole-machine lease holds it, its free CPUs, GPUs and VM slots hold the
-    /// request, and its memory capacity is at least the request's memory; a VM if no
-    /// whole-machine lease holds it and its free CPUs, memory, GPUs and VM slots hold the
-    /// request; a whole-machine lease if it holds no lease and its capacity holds the request. A
+    /// request, it holds fewer leases (of any kind) than its lease cap (if it reports
+    /// one), and its memory capacity is at least the request's memory; a VM if no
+    /// whole-machine lease holds it, it holds fewer leases than its cap, and its free CPUs,
+    /// memory, GPUs and VM slots hold the request; a whole-machine lease if it holds no
+    /// lease and its capacity holds the request. A
     /// request for an iOS device also needs a free device that satisfies it
     /// ([`Worker::free_device`]).
     pub(crate) fn has_room(&self, request: &Request) -> bool {
@@ -231,6 +243,7 @@ impl Worker {
                 !self.whole
                     && self.free().fits(&request.resources.without_memory())
                     && request.resources.memory_bytes <= self.capacity.memory_bytes
+                    && self.under_lease_cap()
                     && (!self.exclusive(request) || self.leases == 0)
             }
             // A VM's memory is a booking: the guest holds it whole for as long as it runs,
@@ -241,6 +254,7 @@ impl Worker {
             LeaseKind::Vm => {
                 !self.whole
                     && self.free().fits(&request.resources)
+                    && self.under_lease_cap()
                     && (!self.exclusive(request) || self.leases == 0)
             }
         };
@@ -279,6 +293,8 @@ impl Worker {
 pub struct Scheduler {
     term: u64,
     next_seq: u64,
+    /// No lease gets a sequence at or past this one ([`Scheduler::use_seq_block`]).
+    seq_limit: u64,
     next_op: u64,
     now: FarmTime,
     ops: BTreeMap<OperationId, Operation>,
@@ -333,6 +349,7 @@ impl Scheduler {
         Self {
             term,
             next_seq: 0,
+            seq_limit: u64::MAX,
             next_op: 0,
             now: FarmTime::default(),
             ops: BTreeMap::new(),
@@ -529,6 +546,8 @@ impl Scheduler {
     /// only where its full request, memory included, fits what is free, so it can wait
     /// behind actions and nothing reserves a worker for it; a
     /// whole-machine lease only on a worker that holds no lease, and it books all of it.
+    /// A round places no more leases than the block of sequences the scheduler was given
+    /// has left ([`Scheduler::use_seq_block`]); the rest wait for the next round.
     ///
     /// A whole-machine operation that fits nowhere holds one worker that could run it
     /// (the one it held last round while that still could, else the one with fewest
@@ -554,6 +573,8 @@ impl Scheduler {
         // Before any operation is fitted: a floor raised since it was queued applies.
         self.apply_key_floors();
         let now = self.now;
+        let left = usize::try_from(self.seqs_left()).unwrap_or(usize::MAX);
+        let round = PLACEMENT_ROUND.min(left);
         let mut servable = Servable::new(&self.workers, &self.cordons, now);
         let mut placed = Vec::new();
         let mut verdicts = Vec::new();
@@ -568,7 +589,7 @@ impl Scheduler {
             let key_raised = op
                 .key_applied
                 .is_some_and(|a| !a.undone && a.applied == request.resources.memory_bytes);
-            let fitted = placed.len() < PLACEMENT_ROUND
+            let fitted = placed.len() < round
                 && servable
                     .fit(&mut self.workers, request, &reserved, &op.avoid, key_raised)
                     .map(|(name, booked, device)| placed.push((id, name, booked, device)))

@@ -37,7 +37,7 @@
 //!   now, when it holds one (the `map_push` module);
 //! - an `UpdateStatus` the deny list now refuses ends the stream. Otherwise it is kept
 //!   as the node's newest update status, unless a newer stream of the node has
-//!   registered since ([`Farm::update_status`]); the update controller reads it
+//!   registered since ([`Farm::update_status`]); the update session reads it
 //!   ([`crate::update_status`]);
 //! - an `Offer` from a daemon is not read: offers go the other way.
 //!
@@ -363,7 +363,7 @@ impl Session {
                 self.map.answer()
             }
             Some(daemon_message::Message::UpdateStatus(status)) => {
-                // A revoked daemon's status must not reach the update controller either.
+                // A revoked daemon's status must not reach the update session either.
                 self.peers
                     .admit(self.peer.as_ref(), worker.as_str())
                     .await?;
@@ -469,7 +469,10 @@ impl Default for HostFloor {
 
 /// What placement may book on a node: its `cpus` and `mem_gib` entries, its `gpu` entry
 /// (0 when absent: a daemon that does not detect GPUs has none to book) and its
-/// `vm.slots` entry (0 when absent), clamped to [`MAX_VM_SLOTS`]. A node that reports
+/// `vm.slots` entry (0 when absent), clamped to [`MAX_VM_SLOTS`]. Its
+/// `action_slots` entry, when reported (it counts the usable slots, busy ones
+/// included), caps how many Action and VM leases it holds at once
+/// (`Resources::leases`); a node that reports none has no cap. A node that reports
 /// at least one VM slot gives up `floor` of its CPUs and memory to the host; any other
 /// node books the whole machine. The other protected floors (planned,
 /// `docs/design/capabilities.md#planned`) are subtracted once they are reported.
@@ -490,9 +493,15 @@ pub fn capacity(hello: &Hello, floor: HostFloor) -> Result<Resources, String> {
         cpu_millis = cpu_millis.saturating_sub(floor.cpu_millis);
         memory_bytes = memory_bytes.saturating_sub(floor.memory_bytes);
     }
-    Ok(Resources::new(cpu_millis, memory_bytes)
+    let booked = Resources::new(cpu_millis, memory_bytes)
         .with_gpus(gpus)
-        .with_vms(vms))
+        .with_vms(vms);
+    // The entry counts usable slots, those running a lease included: it is a cap on the
+    // leases held, not a count of the free ones.
+    Ok(match entry(&hello.capabilities, "action_slots")? {
+        Some(slots) => booked.with_lease_cap(slots),
+        None => booked,
+    })
 }
 
 /// What placement matches an action's platform against: the node report read by

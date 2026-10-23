@@ -15,7 +15,7 @@ fn expand(body: &str) -> Result<Migration, SchemaError> {
 
 /// Catches an embedded migration that would break the release still serving, or a set with
 /// a hole in its numbering, shipping in a release: the lint is the review rule made
-/// mechanical. Mutant seen red: the embedded file given a `DROP` (`Destructive`).
+/// mechanical. Catches: the embedded file given a `DROP` (`Destructive`).
 #[test]
 fn every_embedded_migration_is_numbered_in_order_and_expand_only() {
     let set = embedded();
@@ -68,7 +68,7 @@ fn an_expand_migration_that_removes_or_changes_something_is_refused() {
 /// of rows, a function replaced under the callers of the old one, a changed default, and a
 /// NOT NULL column that a default on another clause of the same ALTER used to excuse.
 ///
-/// Mutants seen red: each of these statements passed before the rules were added.
+/// Catches: each of these statements passed before the rules were added.
 #[test]
 fn an_expand_migration_that_can_still_break_the_serving_release_is_refused() {
     for (sql, what) in [
@@ -222,7 +222,7 @@ fn rows(kinds: &[&str]) -> Vec<(u32, String)> {
 /// below the minimum, no rows, and a contract row above the maximum are refused; an expand
 /// row above it is accepted (a reverted release).
 ///
-/// Mutant seen red: `found < supported.min` changed to `found < supported.max`.
+/// Catches: `found < supported.min` changed to `found < supported.max`.
 #[test]
 fn a_schema_behind_the_newest_but_in_range_is_accepted() {
     let range = Supported { min: 2, max: 4 };
@@ -329,7 +329,7 @@ fn a_unique_index_on_a_table_with_a_quoted_name_is_refused() {
 /// and never answers: the bounded call carries a connect timeout of exactly 10 s, and an
 /// unbounded call (`apply`) carries none.
 ///
-/// Mutants seen red: the `connect_timeout` call removed; `CONNECT_LIMIT` made 3000 s; the
+/// Catches: the `connect_timeout` call removed; `CONNECT_LIMIT` made 3000 s; the
 /// bound applied to the unbounded call.
 #[test]
 fn a_bounded_call_connects_with_the_limit_and_an_unbounded_one_does_not() {

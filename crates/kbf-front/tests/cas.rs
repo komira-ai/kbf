@@ -469,7 +469,7 @@ async fn batch_update_refuses_a_compressed_blob_and_stores_the_others() {
 /// the capabilities: a `BatchUpdateBlobs` of exactly 16 MiB (four blobs) is stored, and
 /// a `BatchReadBlobs` of the same four comes back whole, each blob byte for byte. The
 /// literals are the contract, not `MAX_BATCH_TOTAL_BYTES`, so a constant left at 4 MiB
-/// fails here. Mutant seen red: `MAX_BATCH_TOTAL_BYTES = 4 << 20` (InvalidArgument).
+/// fails here. Catches: `MAX_BATCH_TOTAL_BYTES = 4 << 20` (InvalidArgument).
 #[tokio::test]
 async fn a_16_mib_batch_is_stored_and_read_back() {
     assert_eq!(kbf_front::MAX_MESSAGE_BYTES, 17 << 20);
@@ -497,7 +497,7 @@ async fn a_16_mib_batch_is_stored_and_read_back() {
 
 /// Catches an off-by-one in either refusal: one byte past 16 MiB is INVALID_ARGUMENT for
 /// `BatchUpdateBlobs` (nothing stored) and for `BatchReadBlobs`, while exactly 16 MiB
-/// (the test above) is served. Mutants seen red: `>=` instead of `>` in either check
+/// (the test above) is served. Catches: `>=` instead of `>` in either check
 /// (the exact-limit test above fails); the update check removed (the extra byte is stored).
 #[tokio::test]
 async fn one_byte_over_16_mib_is_refused_by_both_batch_calls() {

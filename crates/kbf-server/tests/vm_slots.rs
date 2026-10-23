@@ -129,3 +129,22 @@ async fn re_registering_a_node_replaces_its_vm_slots_and_floor() {
         json!({"cpu_millis": 8_000, "memory_bytes": 24 * GIB, "gpus": 0, "vms": 2})
     );
 }
+
+/// Catches: `capacity` filling only one of the two limits a Mac can report: the VM slots
+/// without the lease cap from `action_slots` (a capped Mac given more leases than users),
+/// or the cap without the VM slots (no VM ever placed), and the host floor lost with
+/// either.
+#[test]
+fn capacity_reads_vm_slots_and_the_action_slots_cap_together() {
+    let mut both = hello_with_slots("m", Some("2"));
+    both.capabilities.push(Capability {
+        key: "action_slots".to_owned(),
+        value: "3".to_owned(),
+    });
+    assert_eq!(
+        capacity(&both, HostFloor::default()),
+        Ok(Resources::new(8_000, 24 * GIB)
+            .with_vms(2)
+            .with_lease_cap(3))
+    );
+}

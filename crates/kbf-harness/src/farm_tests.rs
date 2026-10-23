@@ -136,7 +136,7 @@ fn a_restart_can_run_another_program_on_the_same_command_line() {
     // `kbf.toml`), and a program forgotten by the restart after it (the role is back on its
     // first build). The first program, `sleep 300`, runs until it is ended; `true` ends at
     // once with 0 whatever its arguments are.
-    // Mutants: `restart_with` stores the program after `restart`, or not at all.
+    // Catches: `restart_with` stores the program after `restart`, or not at all.
     let d = dir("restart-with");
     let role = Role::Node(1);
     let mut farm = Farm::supervise(&d, vec![sleeper(role, &d)]);
@@ -159,7 +159,7 @@ fn a_restart_can_run_another_program_on_the_same_command_line() {
 fn a_role_runs_the_kbf_the_topology_names_for_it_else_the_default() {
     // Catches: a `kbf` named for one role run by another (node 2 and daemon 2 are different
     // roles), the default lost for the roles with no entry, and the entry ignored.
-    // Mutant: `kbf_of` compares the roles' numbers only.
+    // Catches: `kbf_of` compares the roles' numbers only.
     let topology = Topology {
         binaries: vec![(Role::Node(2), PathBuf::from("/older/kbf"))],
         ..Topology::rehearsal(2)
@@ -553,7 +553,7 @@ fn a_farm_that_lost_a_node_a_member_or_its_frontend_is_not_whole() {
 fn the_control_socket_is_removed_when_the_farm_stops_and_when_it_is_dropped() {
     // Catches: the frontend's control socket left in the temporary directory by every run
     // (a killed process cannot remove its own), one more per run on a long-lived host.
-    // Mutant: `stop_all_within` or `Drop for Farm` does not remove it.
+    // Catches: `stop_all_within` or `Drop for Farm` does not remove it.
     let d = dir("socket");
     let socket = d.join("kbf-farm.sock");
     std::fs::write(&socket, b"").expect("socket");
@@ -571,7 +571,7 @@ fn the_control_socket_is_removed_when_the_farm_stops_and_when_it_is_dropped() {
 #[test]
 fn a_farm_that_is_dropped_leaves_no_process_running() {
     // Catches: a run that panics or returns early (the farm goes out of scope with no stop)
-    // leaving its processes running. Mutant: `Proc` has no `Drop`.
+    // leaving its processes running. Catches: `Proc` has no `Drop`.
     let d = dir("dropped");
     let farm = Farm::supervise(
         &d,
@@ -597,7 +597,7 @@ fn a_stop_is_bounded_as_a_whole_not_per_role() {
     // outlasts its job's timeout while "stopping". Three processes that ignore SIGTERM are
     // stopped within a budget of nothing: each is killed at once. The farm's own wait is an
     // hour, so a stop that ignored the budget would not return in the minute the thread is
-    // given (a liveness guard, not a measure of time). Mutant: `stop_all_within` waits
+    // given (a liveness guard, not a measure of time). Catches: `stop_all_within` waits
     // `hang` for each role.
     let d = dir("stop-bound");
     let stubborn = |role| spec(role, "env", &["--ignore-signal=TERM", "sleep", "300"], &d);
@@ -627,7 +627,7 @@ fn a_stop_is_bounded_as_a_whole_not_per_role() {
 #[test]
 fn a_wait_ends_at_once_when_the_run_is_asked_to_stop() {
     // Catches: a run that has been sent SIGTERM going on waiting for a farm to become ready
-    // (up to the farm's whole wait) before it notices. Mutant: `try_wait` does not look at
+    // (up to the farm's whole wait) before it notices. Catches: `try_wait` does not look at
     // the flag.
     let d = dir("interrupted");
     let mut farm =
@@ -783,7 +783,7 @@ fn a_farm_posts_with_its_token_and_finds_the_member_of_a_node_by_its_address() {
     // Catches: an operator call made without the farm's token (the API refuses it), a node
     // mapped to the member of another (node 2's address is `loopback(2)`, and
     // it must not match `loopback(2)` followed by another digit), and a member that is not listed taken for
-    // one. Mutants: `member_of` matching on the id; the prefix without its colon; `post`
+    // one. Catches: `member_of` matching on the id; the prefix without its colon; `post`
     // sending no token.
     let d = dir("operator-calls");
     let mut farm = Farm::supervise(&d, vec![sleeper(Role::Node(1), &d)]);
@@ -827,7 +827,7 @@ fn a_farm_posts_with_its_token_and_finds_the_member_of_a_node_by_its_address() {
 #[test]
 fn a_farm_scans_the_logs_of_every_generation_for_a_line() {
     // Catches: `Farm::log_hits` reading the farm's current generation only, or another
-    // directory than the one its logs are in. Mutant: scanning `Proc::log` instead.
+    // directory than the one its logs are in. Catches: scanning `Proc::log` instead.
     let d = dir("log-scan");
     let marker = d.join("marker");
     std::fs::write(&marker, "run dropped; cleaning up\n").expect("marker");

@@ -6,7 +6,8 @@
 //! - `--inventory`: the root-owned host file;
 //! - `--proxy-uid`: the one uid whose connections are served;
 //! - `--operator-api`: `http://<loopback ip>:<port>`, the frontend's operator API, for
-//!   safe-to-stop; a host that is not a loopback address is refused;
+//!   safe-to-stop and the health of storage and daemon hosts; a host that is not a loopback
+//!   address is refused;
 //! - `--token-file`: the file holding the operator bearer token.
 //!
 //! Optional: `--operator-proxy-auth-file`, the file holding the proxy's per-boot secret,
@@ -21,8 +22,9 @@
 //! - **tests and development**: `--socket`, a path the updater binds itself, mode 0600, its
 //!   own user.
 //!
-//! This build has no host installer and no health check ([`crate::not_built`]): a roll is
-//! accepted and fails at the first install, with no host touched.
+//! This build has no host installer ([`crate::not_built`]): a roll is accepted and fails at
+//! the first install, with no host touched. The health check is real for storage and daemon
+//! hosts and refuses a frontend ([`crate::node_health`]).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -36,9 +38,12 @@ use std::thread::JoinHandle;
 use serde_json::json;
 
 use crate::api::RollState;
+use crate::health::system_wall_clock;
 use crate::inventory::Inventory;
 use crate::listener::{Activation, Listen, open};
-use crate::not_built::{NotBuiltHealth, NotBuiltInstaller};
+use crate::node_health::NodeHealth;
+use crate::not_built::NotBuiltInstaller;
+use crate::operator::OperatorApi;
 use crate::ports::SystemClock;
 use crate::record::RollStore;
 use crate::safe_http::HttpSafeToStop;
@@ -210,17 +215,19 @@ pub fn stderr_sink() -> AuditSink {
     Arc::new(|line| eprintln!("{line}"))
 }
 
-/// The ports of this build: the real safe-to-stop and clock, and the refusing installer and
-/// health check.
+/// The ports of this build: the real safe-to-stop, health check and clock, and the refusing
+/// installer.
 pub fn build_ports(cfg: &Config) -> Result<Ports, String> {
+    // One client, checked once: both ports read the same token files.
+    let api = OperatorApi::new(
+        cfg.operator_api,
+        cfg.token_file.clone(),
+        cfg.operator_proxy_auth_file.clone(),
+    )?;
     Ok(Ports {
-        safe: Box::new(HttpSafeToStop::new(
-            cfg.operator_api,
-            cfg.token_file.clone(),
-            cfg.operator_proxy_auth_file.clone(),
-        )?),
+        safe: Box::new(HttpSafeToStop::from_api(api.clone())),
         installer: Box::new(NotBuiltInstaller),
-        health: Box::new(NotBuiltHealth),
+        health: Box::new(NodeHealth::with_api(api, system_wall_clock())),
         clock: Box::new(SystemClock::new()),
     })
 }

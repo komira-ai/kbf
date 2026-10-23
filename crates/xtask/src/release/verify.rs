@@ -5,7 +5,7 @@
 //! Nothing here judges a verdict. The annotated tag's message is the Beta record `release
 //! verdict-write` wrote; it is read for the notes ([`Verified::record`]) and is an audit
 //! record that nothing gates on: an annotated tag without one (empty or prose message), or with one that says it
-//! failed, verifies the same. A lightweight tag is refused. What gates a release is `release gates` (the runs) and the checks of the
+//! failed, verifies the same. A lightweight tag is refused. What gates a release is the pipeline run that succeeded (the release starts only from one) and the checks of the
 //! files themselves (`release check`, the attestations, the set hash).
 
 use std::path::Path;

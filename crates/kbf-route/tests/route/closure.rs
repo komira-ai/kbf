@@ -84,7 +84,7 @@ fn hold(node: &super::support::Node, digests: &[Digest]) {
 
 /// Catches a GetActionResult that is a hit when a closure blob is gone from both owners:
 /// the entry names two blobs, one held by both owners and one by neither; the hit becomes
-/// a miss (the action runs again). With every blob held it is a hit. Mutant: no check at
+/// a miss (the action runs again). With every blob held it is a hit. Catches: no check at
 /// read time.
 #[tokio::test]
 async fn a_closure_blob_gone_from_both_owners_is_a_miss() {
@@ -102,7 +102,7 @@ async fn a_closure_blob_gone_from_both_owners_is_a_miss() {
 
 /// Catches a check that asks the primary only: the blob is gone from the primary and held
 /// by the replica, so the entry is still a hit, and the replica is asked only for what the
-/// primary lacked. Mutant: a blob missing at the primary counts as gone.
+/// primary lacked. Catches: a blob missing at the primary counts as gone.
 #[tokio::test]
 async fn a_blob_missing_on_the_primary_and_held_by_the_replica_is_a_hit() {
     let rig = rig();
@@ -123,7 +123,7 @@ async fn a_blob_missing_on_the_primary_and_held_by_the_replica_is_a_hit() {
 /// Catches a check with no cache, or a fan-out per blob. Fifty blobs held by their
 /// primary are checked with one FindMissing call to that primary, none to the replica; a
 /// repeat makes no call at all. When the primary lacks them, the replica gets one call
-/// and the primary still got one: two per owner group. Mutants: no cache (the repeat
+/// and the primary still got one: two per owner group. Catches: no cache (the repeat
 /// asks again); a call per blob (fifty calls).
 #[tokio::test]
 async fn a_cached_check_makes_no_calls_and_an_uncached_one_at_most_two_per_group() {
@@ -186,7 +186,7 @@ async fn a_long_closure_is_asked_in_batches_the_node_takes() {
 
 /// Catches a stale cache: after the map's generation changes (here to one that leaves the
 /// members as they were), a blob is verified again, and a blob that went away in between
-/// is found gone. Mutant: entries survive a generation change.
+/// is found gone. Catches: entries survive a generation change.
 #[tokio::test]
 async fn a_generation_change_drops_what_was_verified() {
     let rig = rig();
@@ -211,7 +211,7 @@ async fn a_generation_change_drops_what_was_verified() {
 }
 
 /// Catches a mandatory field: a node from before the closure was reported answers an
-/// entry with none, and the router serves it as it did before, asking nobody. Mutant:
+/// entry with none, and the router serves it as it did before, asking nobody. Catches:
 /// an absent closure treated as an empty one that fails, or as a closure to look up.
 #[tokio::test]
 async fn an_older_node_without_the_closure_gives_todays_answer() {
@@ -227,7 +227,7 @@ async fn an_older_node_without_the_closure_gives_todays_answer() {
 
 /// Catches a miss answered, or remembered, for a blob no owner could be asked about. With
 /// both owners down the entry is a miss (it is safe: the action runs again); nothing is
-/// remembered, so once they answer and hold the blobs it is a hit at once. Mutant: an
+/// remembered, so once they answer and hold the blobs it is a hit at once. Catches: an
 /// unanswered owner counted as present (a hit) or as gone and cached.
 #[tokio::test]
 async fn blobs_nobody_could_answer_for_are_a_miss_and_not_remembered() {
@@ -270,7 +270,7 @@ async fn a_stale_map_during_the_check_runs_the_call_again() {
 
 /// Catches a verified blob that never expires: a blob verified once is trusted for the
 /// time to live and asked about again after it, so one that went away meanwhile (cold GC,
-/// eviction) is found. Mutant: no time to live.
+/// eviction) is found. Catches: no time to live.
 #[tokio::test(start_paused = true)]
 async fn what_was_verified_is_asked_again_after_the_time_to_live() {
     let mut rig = rig();
@@ -295,7 +295,7 @@ async fn what_was_verified_is_asked_again_after_the_time_to_live() {
 }
 
 /// Catches an unbounded cache: with room for two entries, three verified blobs push the
-/// least recently used one out, and only that one is asked about again. Mutant: no bound
+/// least recently used one out, and only that one is asked about again. Catches: no bound
 /// (nothing is asked again), or a bound that forgets everything (all are).
 #[tokio::test]
 async fn the_cache_forgets_the_least_recently_used_blob_first() {
@@ -358,7 +358,7 @@ async fn the_stats_count_checks_cache_hits_and_calls() {
 }
 
 /// Catches a cache of size zero that remembers anyway: with no room, every check asks the
-/// owners again. Mutant: the bound applied after the insert is read.
+/// owners again. Catches: the bound applied after the insert is read.
 #[tokio::test]
 async fn a_cache_with_no_room_remembers_nothing() {
     let mut rig = rig();
@@ -375,7 +375,7 @@ async fn a_cache_with_no_room_remembers_nothing() {
 /// Catches a caller working from an older map overwriting what a newer map verified: a
 /// check under generation 2 is remembered; a check under the older generation 1 asks again
 /// and neither reads nor replaces those entries, so generation 2 is still cached after.
-/// Mutant: entries of a newer generation dropped for an older caller.
+/// Catches: entries of a newer generation dropped for an older caller.
 #[tokio::test]
 async fn a_caller_on_an_older_map_does_not_disturb_what_a_newer_one_verified() {
     let rig = rig();
@@ -410,7 +410,7 @@ fn booted(boots: [u64; 3]) -> Vec<kbf_map::Member> {
 /// Catches a cache that survives a restart that lost RAM-only data: member 1 restarts
 /// (boot 1 to 2) and the map a caller holds says so, at the same generation. What member 1
 /// was verified to hold is asked about again, and the blob it lost is found gone (member 2
-/// does not hold it either). Mutant: entries keyed by generation alone.
+/// does not hold it either). Catches: entries keyed by generation alone.
 #[tokio::test]
 async fn a_member_whose_boot_changed_at_the_same_generation_is_asked_again() {
     let rig = rig();
@@ -436,7 +436,7 @@ async fn a_member_whose_boot_changed_at_the_same_generation_is_asked_again() {
 }
 
 /// Catches a boot change of one member dropping what other members verified: member 1
-/// restarts, member 2 does not; blobs verified at member 2 stay cached. Mutant: any boot
+/// restarts, member 2 does not; blobs verified at member 2 stay cached. Catches: any boot
 /// change clears the whole cache.
 #[tokio::test]
 async fn a_boot_change_drops_only_that_members_entries() {
@@ -460,7 +460,7 @@ async fn a_boot_change_drops_only_that_members_entries() {
 
 /// Catches the generation rule lost when the boot joined the key: the same boot at a new
 /// generation drops the entries as before (asked again), and the same boot at the same
-/// generation keeps them. Mutant: the generation dropped from the key.
+/// generation keeps them. Catches: the generation dropped from the key.
 #[tokio::test]
 async fn the_same_boot_at_a_new_generation_is_asked_again() {
     let rig = rig();
@@ -480,7 +480,7 @@ async fn the_same_boot_at_a_new_generation_is_asked_again() {
 
 /// Catches a caller with an older boot of a member overwriting a newer one: after a
 /// check under boot 2, a caller whose map says boot 1 (same generation) asks again and
-/// does not replace the entries, so boot 2 stays cached. Mutant: the older boot adopted.
+/// does not replace the entries, so boot 2 stays cached. Catches: the older boot adopted.
 #[tokio::test]
 async fn a_caller_with_an_older_boot_does_not_disturb_a_newer_one() {
     let rig = rig();
@@ -502,7 +502,7 @@ async fn a_caller_with_an_older_boot_does_not_disturb_a_newer_one() {
 /// Catches a cache trusting a member whose boot is unknown (0, a node from before the
 /// field): a restart cannot be told, so nothing is remembered and every check asks it,
 /// whether the boot later becomes known or not. Once the boot is known (1) it is cached.
-/// Mutant: boot 0 remembered like any other boot.
+/// Catches: boot 0 remembered like any other boot.
 #[tokio::test]
 async fn a_member_with_an_unknown_boot_is_never_remembered() {
     let rig = rig();
@@ -529,7 +529,7 @@ async fn a_member_with_an_unknown_boot_is_never_remembered() {
 /// Catches entries surviving a spell at an unknown boot: member 1 is verified at boot 5,
 /// a caller then checks it at boot 0 (a downgraded binary), and the next check at boot 5
 /// again must ask, since the member may have restarted and lost RAM-only data in between.
-/// Mutant: boot 0 returns without dropping the member's entries.
+/// Catches: boot 0 returns without dropping the member's entries.
 #[tokio::test]
 async fn a_spell_at_boot_zero_drops_what_boot_five_verified() {
     let rig = rig();
@@ -558,7 +558,7 @@ async fn a_spell_at_boot_zero_drops_what_boot_five_verified() {
 
 /// Catches the mixed pair (an older generation with a newer boot) being read or added:
 /// after a check at generation 2 boot 1, a caller at generation 1 boot 2 asks every time
-/// and leaves what generation 2 verified in place. Mutant: the pair compared per field.
+/// and leaves what generation 2 verified in place. Catches: the pair compared per field.
 #[tokio::test]
 async fn a_lower_generation_with_a_higher_boot_neither_reads_nor_adds() {
     let rig = rig();

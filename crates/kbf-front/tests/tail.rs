@@ -278,8 +278,8 @@ async fn rebuilt_node(bucket: &Bucket, member: u64) -> Cache<Log, Bucket> {
 /// flushes to the cold store afterwards is not readable here (the join case: a previous
 /// owner flushes what it had staged after the joiner rebuilt). Member 7 rebuilds an empty
 /// bucket; member 8 then writes 3 blobs. Before a tail pass member 7 reports them missing;
-/// after one it reads each byte for byte, and a second pass finds nothing new. Mutant seen
-/// red: `tail_pass` listing nothing (the blobs stay missing).
+/// after one it reads each byte for byte, and a second pass finds nothing new. Catches:
+///  `tail_pass` listing nothing (the blobs stay missing).
 #[tokio::test]
 async fn a_segment_flushed_by_another_member_after_the_rebuild_is_adopted() {
     let bucket = Bucket::new();
@@ -305,8 +305,8 @@ async fn a_segment_flushed_by_another_member_after_the_rebuild_is_adopted() {
 /// Catches: a tail that resumes after the last key it listed (one cursor), which never
 /// reads a segment that appears below it: uploads finish in no seq order, so seq 2 can
 /// land after seq 3 was listed. Member 8 has seqs 1 to 3; seq 2 is held back through the
-/// first pass and put after it. The second pass adopts exactly that one. Mutant seen
-/// red: `TailState::holds` answering true for any seq below a held range's end (seq 2 is
+/// first pass and put after it. The second pass adopts exactly that one. Catches:
+///  `TailState::holds` answering true for any seq below a held range's end (seq 2 is
 /// never read).
 #[tokio::test]
 async fn a_segment_that_lands_below_one_already_handled_is_still_found() {
@@ -333,7 +333,7 @@ async fn a_segment_that_lands_below_one_already_handled_is_still_found() {
 /// boot's from before its log was wiped): they are left to its puts and to the rebuild, so
 /// a pass lists them, reads none, and does not index an earlier boot's. Member 7 boot 1
 /// wrote 2 blobs under a log it lost; boot 2 passes, and the pass reads nothing, so the
-/// blobs are not held (a rebuild would hold them). Mutant seen red: no own-member filter
+/// blobs are not held (a rebuild would hold them). Catches: no own-member filter
 /// (2 objects read and adopted).
 #[tokio::test]
 async fn the_tail_leaves_its_own_members_objects_alone() {
@@ -352,7 +352,7 @@ async fn the_tail_leaves_its_own_members_objects_alone() {
 /// Catches: a tail that lists outside `<root>cas/`: a segment of a frozen old-layout
 /// prefix (`<root><log id>/cas/`, another log's epoch) is not read or adopted, while a
 /// segment under `<root>cas/` whose key names no object of the cache is read once,
-/// counted foreign, not adopted, and not read again. Mutant seen red: listing the root
+/// counted foreign, not adopted, and not read again. Catches: listing the root
 /// (the frozen segment is adopted and `objects` is 2).
 #[tokio::test]
 async fn frozen_prefixes_are_ignored_and_a_foreign_key_is_read_once() {
@@ -376,7 +376,7 @@ async fn frozen_prefixes_are_ignored_and_a_foreign_key_is_read_once() {
 /// Catches: a tail over a cache that names itself as an epoch writer (an old server's
 /// layout, `<root>cas/<epoch>/<seq>`) indexing its own puts a second time or reading them
 /// at every pass: the pass reads the 2 segments once, every record is kept (indexed
-/// already, none inserted), and the second pass reads nothing. Mutant seen red:
+/// already, none inserted), and the second pass reads nothing. Catches:
 /// `TailState::insert` forgetting what it is given (the second pass reads both again).
 #[tokio::test]
 async fn an_epoch_writers_own_objects_add_nothing_and_are_read_once() {
@@ -410,7 +410,7 @@ async fn an_epoch_writers_own_objects_add_nothing_and_are_read_once() {
 /// then drops a segment for good): the pass fails, remembers nothing, and the next pass
 /// reads and adopts it. Also an object too short to be a segment, and one with a torn tail, are counted skipped and
 /// not read again, and one deleted between the listing and the read is counted gone and
-/// read again if it comes back. Mutants seen red: `SkipReason::Read` counted as skipped
+/// read again if it comes back. Catches: `SkipReason::Read` counted as skipped
 /// (the first pass succeeds without the blobs); `Gone` remembered (the object that comes
 /// back is never adopted).
 #[tokio::test]
@@ -457,7 +457,7 @@ async fn failed_short_and_gone_objects_are_told_apart() {
 
 /// Catches: a failed listing call ending a pass as if the store were empty (the pass
 /// returns `Ok` with nothing adopted, and the caller reports the epoch done): the pass
-/// fails with the store's error, and the next one adopts what is there. Mutant seen red:
+/// fails with the store's error, and the next one adopts what is there. Catches:
 /// a listing error ended the stream quietly (the first pass is `Ok`).
 #[tokio::test]
 async fn a_failed_listing_fails_the_pass() {

@@ -53,6 +53,7 @@ http_invocations,http_sched,http_history,enroll/api,managed/http,ui_mount}.rs` a
 | list the denied entries | `GET /v1/denied` | [N] unit F | write |
 | frontend drain status | `GET /v1/frontend/drain` | [F] | open |
 | begin the frontend's drain | `POST /v1/frontend/drain` | [F] | write |
+| raise the stored epoch (after a restore from a backup) | `POST /v1/epoch/bump` | [F] | write |
 | storage health (under-replicated blobs) | `GET /v1/storage` | [F] | open |
 
 There is no rebalance verb: handoff of data between members is not built, and none is invented
@@ -178,7 +179,7 @@ section 8) and is not an operator verb of the farm.
 | frontend handover, enroll, `kbf node` | `kbf frontend handover`, `kbf enroll`, `kbf node` **[F]** | replaced by the installer's side-by-side children (#1054, #1062) and removed by #1049 **[V]** |
 | render, check, install units, swap, verify certificate (the `envoy render, check, apply` verbs are retired: no Envoy) | `kbf-deploy` **[F]** | become installer logic and package units; root |
 | `mdm`, `minio`, `pilot`, `erase-request` | `kbf-deploy` **[F]** | leave the product (distribution.md section 8); an erase request is signed with a security key on the operator's machine |
-| `kbf cluster status`, `drain`, `undrain`, `member`, `denied`, `object-store status\|audit\|connection\|bind\|unbind\|verify` | the `kbf` CLI **[F]** (the last two groups: unit G1) | a thin client of the routes above, no logic |
+| `kbf cluster status`, `drain`, `undrain`, `member`, `denied`, `epoch-bump`, `object-store status\|audit\|connection\|bind\|unbind\|verify` | the `kbf` CLI **[F]** (the last two groups: unit G1) | a thin client of the routes above, no logic |
 | frontend log tail | none | cut (Q4) |
 | update policy, image pull | none | no source verb exists (Q5) |
 | rotate the CA | its own unit | out of the object-store series (Q5) |

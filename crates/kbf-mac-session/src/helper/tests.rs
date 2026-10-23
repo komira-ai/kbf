@@ -738,7 +738,7 @@ fn kill_uid_removes_the_schedules_between_two_kills() {
 
 /// Catches a GUI run (or a readiness answer) for a lease whose user is not the one
 /// `session-login` logged in, a GUI run started before launchd has the user's
-/// `gui/<uid>` domain (the mutant "run before gui/<uid> exists": the action would start
+/// `gui/<uid>` domain (the defect "run before gui/<uid> exists": the action would start
 /// outside the session, with no window server), and a readiness answer that does not
 /// follow the domain.
 #[test]

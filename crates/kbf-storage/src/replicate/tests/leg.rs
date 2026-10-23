@@ -217,7 +217,7 @@ impl ByteStream for Holds {
 
 /// Catches a replica's early answer for the blob's whole size being an error: it holds the
 /// blob, so the leg is done, every message after it is dropped without error (far more than
-/// the queue holds are sent) and finishing it is a copy. Mutant: `ended` failing on any
+/// the queue holds are sent) and finishing it is a copy. Catches: `ended` failing on any
 /// early answer.
 #[tokio::test]
 async fn an_early_answer_for_the_whole_blob_is_a_copy() {
@@ -309,7 +309,7 @@ async fn replica_answering(code: tonic::Code) -> Result<Option<StorageError>, St
 /// would be answered with one copy and a debt over the replica's refusal): only the codes
 /// that say nothing was reached or answered in time are a lost replica; ABORTED, DATA_LOSS,
 /// RESOURCE_EXHAUSTED, CANCELLED and a bare FAILED_PRECONDITION are the write's failure.
-/// Mutant: `lift` mapping every code it does not know to `Unavailable`.
+/// Catches: `lift` mapping every code it does not know to `Unavailable`.
 #[tokio::test]
 async fn a_replica_that_declines_is_not_lost() {
     use tonic::Code;

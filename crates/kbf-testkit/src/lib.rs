@@ -11,6 +11,8 @@
 //!   `sandbox-exec` answers as that tool, from a rules file the test writes.
 //! - [`config`]: the empty `kbf.toml` a test hands to every `kbf` child it starts, so the child
 //!   never reads the host's settings file.
+//! - `database` (feature `postgres`): a Postgres database a test owns, made on the test server
+//!   `KBF_TEST_POSTGRES_URL` names and dropped on drop; a test without the variable fails.
 //! - [`dir`]: a scratch directory a test owns and that is removed on drop.
 //! - [`port`]: loopback ports a test can rely on (dead ones, and ones held until used).
 //! - [`forked`]: a child held between `fork` and `exec`, to show what a lock or a file
@@ -50,6 +52,8 @@ pub mod act;
 mod act_probe;
 pub mod canary;
 pub mod config;
+#[cfg(feature = "postgres")]
+pub mod database;
 pub mod dir;
 pub mod fake;
 pub mod forked;

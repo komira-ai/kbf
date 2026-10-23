@@ -231,7 +231,7 @@ async fn the_ledger_that_tells_no_one_returns_at_once() {
 /// began owing after the worker looked: `settle_evicted` leaves the debt while a write of the
 /// digest is in flight (however many: two writes of the same blob, one finished), and when
 /// any write began owing since `begun` was read; with neither, it settles and the journal
-/// forgets it. Mutants: the in-flight test removed; the `begun` comparison removed; the
+/// forgets it. Catches: the in-flight test removed; the `begun` comparison removed; the
 /// count of a digest's writes dropped to zero by the first.
 #[tokio::test]
 async fn an_evicted_debt_is_dropped_only_when_no_write_is_in_its_window() {
@@ -342,7 +342,7 @@ async fn an_evicted_debt_whose_settling_cannot_be_written_stays_owed() {
 /// Catches a debt dropped for a blob the store holds (a write committed after the worker
 /// read it absent), and one dropped when the store could not say: with the blob held, or the
 /// store failing, `settle_evicted` leaves the debt; with the blob absent it drops it.
-/// Mutants: the store not asked; its error read as "absent".
+/// Catches: the store not asked; its error read as "absent".
 #[tokio::test]
 async fn an_evicted_debt_stays_while_the_store_holds_the_blob_or_cannot_say() {
     let repairs =
@@ -413,7 +413,7 @@ impl RepairLedger for Told {
 /// after the new write's) needs a thread to be descheduled between two statements, which a
 /// test cannot arrange; this pins the property that rules it out, and the order of the two
 /// journal writes. The ledger is told the debt is settled all the same (the journal has
-/// forgotten it, so the frontend must not keep it). Mutants: `settle_evicted` taking the
+/// forgotten it, so the frontend must not keep it). Catches: `settle_evicted` taking the
 /// gate as a guard that its own future owns (the gate is free once the future is dropped);
 /// the ledger told from the future after the journal call (never, when it is cancelled).
 #[tokio::test]
@@ -489,7 +489,7 @@ async fn a_settle_cancelled_mid_write_keeps_the_gate_until_the_write_lands() {
 /// The look is bounded: `settle_evicted` answers UNAVAILABLE after the probe, the debt stays,
 /// and the gate is free (a write that owes goes through). The clock is paused: the probe is
 /// not waited out, and the outer bound is only there so that a look that is not bounded
-/// fails the test instead of hanging it. Mutant: the look unbounded.
+/// fails the test instead of hanging it. Catches: the look unbounded.
 #[tokio::test(start_paused = true)]
 async fn an_evicted_debt_whose_store_does_not_answer_stays_and_frees_the_gate() {
     let repairs =

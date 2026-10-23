@@ -2,8 +2,7 @@
 //! is a [`FakeRunner`] that says what a build prints for `--version --json`, so a test sees
 //! the copy as the probe saw it; the status file is read back through the real [`StatusFile`].
 //!
-//! Each "Mutants it catches" line names a change to the code that the test is written to turn
-//! red. They are the reason the test exists, not a record that anyone ran them.
+//! Each "Catches" line names a change to the code that the test is written to turn red.
 
 use std::cell::RefCell;
 use std::fs;
@@ -119,7 +118,7 @@ struct Seen {
 /// the source, the probe running the source instead of the copy, and the marker or the final
 /// directory existing before the probe has passed.
 ///
-/// Mutants it catches: the marker written before the probe; the rename done before the probe;
+/// Catches: the marker written before the probe; the rename done before the probe;
 /// the probe run on `src`; the copy loop dropping its last chunk; the copy taking the mode of
 /// a source of 0644.
 #[test]
@@ -173,7 +172,7 @@ fn a_copy_is_byte_identical_executable_and_marked_only_after_its_probe() {
 /// Catches a copy that stays when its probe fails (a binary that does not run, or that is
 /// not a `kbf`, would then be a release the proxy starts children from).
 ///
-/// Mutants it catches: the rename done before the probe; the probe's failure ignored; the
+/// Catches: the rename done before the probe; the probe's failure ignored; the
 /// partial directory left behind on an error; the migrator's own refusal word carried into
 /// the text.
 #[test]
@@ -194,7 +193,7 @@ fn a_failing_probe_leaves_no_release_directory() {
 /// Catches a binary being accepted for a commit it is not: another commit's build, or a
 /// debug build of the right one.
 ///
-/// Mutants it catches: the `check` of the version dropped; only the commit compared (not the
+/// Catches: the `check` of the version dropped; only the commit compared (not the
 /// profile).
 #[test]
 fn a_binary_that_reports_another_commit_or_a_debug_build_is_refused() {
@@ -215,7 +214,7 @@ fn a_binary_that_reports_another_commit_or_a_debug_build_is_refused() {
 /// the same bytes are the same release (nothing is run), other bytes are refused and change
 /// nothing.
 ///
-/// Mutants it catches: overwrite (copy over the existing directory); the existing directory
+/// Catches: overwrite (copy over the existing directory); the existing directory
 /// removed and rebuilt; the probe run again for the same bytes; `differs` not returned.
 #[test]
 fn the_same_bytes_are_idempotent_and_other_bytes_are_refused() {
@@ -245,7 +244,7 @@ fn the_same_bytes_are_idempotent_and_other_bytes_are_refused() {
 /// bytes, or with a binary that is gone or is no longer the one that was probed, it is not the
 /// release of the source in hand.
 ///
-/// Mutants it catches: the marker not required; the marker's sum not compared; the binary not
+/// Catches: the marker not required; the marker's sum not compared; the binary not
 /// hashed again; the two compared with `||` instead of both required.
 #[test]
 fn a_directory_without_its_marker_or_its_bytes_is_not_the_release() {
@@ -276,7 +275,7 @@ fn a_directory_without_its_marker_or_its_bytes_is_not_the_release() {
 /// does not exist, one that opens and then fails to read (a directory), and the same unread
 /// source for a commit that has a copy already.
 ///
-/// Mutants it catches: the partial directory not removed on an error; a read error ending the
+/// Catches: the partial directory not removed on an error; a read error ending the
 /// copy as if it were the end of the file; the open's error dropped.
 #[test]
 fn a_source_that_cannot_be_read_is_copy_failed_and_leaves_nothing() {
@@ -305,7 +304,7 @@ fn a_source_that_cannot_be_read_is_copy_failed_and_leaves_nothing() {
 /// Catches a copy that loses the race for its directory (another one was put in place while
 /// this one was probed) replacing the other, or leaving its partial behind.
 ///
-/// Mutants it catches: the rename's error ignored; the partial not removed after a failed
+/// Catches: the rename's error ignored; the partial not removed after a failed
 /// rename; the other copy's files removed first.
 #[test]
 fn a_copy_that_cannot_be_put_in_place_is_copy_failed_and_leaves_no_partial() {
@@ -331,7 +330,7 @@ fn a_copy_that_cannot_be_put_in_place_is_copy_failed_and_leaves_no_partial() {
 /// Catches a root that cannot be written to being reported as anything but `copy_failed`
 /// (CI runs the tests as an ordinary user, to whom a 0555 directory is closed).
 ///
-/// Mutants it catches: the creation of the partial directory not checked; the probe run
+/// Catches: the creation of the partial directory not checked; the probe run
 /// without a copy.
 #[test]
 fn a_root_that_cannot_be_written_is_copy_failed() {
@@ -351,7 +350,7 @@ fn a_root_that_cannot_be_written_is_copy_failed() {
 /// Catches a leftover of a killed copy staying (it would pile up, and a name that is reused
 /// would refuse), and the sweep removing more than that: releases and strangers stay.
 ///
-/// Mutants it catches: no sweep; a sweep of every entry; a sweep of directories only (the
+/// Catches: no sweep; a sweep of every entry; a sweep of directories only (the
 /// leftover file stays); a sweep of files only.
 #[test]
 fn new_sweeps_what_a_killed_copy_left_and_nothing_else() {
@@ -375,7 +374,7 @@ fn new_sweeps_what_a_killed_copy_left_and_nothing_else() {
 /// directory has no `releases/` until the first copy), and a root that cannot be made being
 /// taken for one.
 ///
-/// Mutants it catches: no creation; a non-recursive creation; a mode other than 0755.
+/// Catches: no creation; a non-recursive creation; a mode other than 0755.
 #[test]
 fn new_makes_the_root_and_refuses_one_that_cannot_be_made() {
     let dir = scratch_dir("releases-new");
@@ -437,7 +436,7 @@ fn read(file: &Path) -> (Option<StagedFacts>, Option<CommitId>) {
 /// the file: what `stage` writes reads back as the facts and commit it was given, `confirm`
 /// moves it to installed, `revert` drops it and leaves the installed one.
 ///
-/// Mutants it catches: `confirm` that does not clear `staged`; `confirm` that does not set
+/// Catches: `confirm` that does not clear `staged`; `confirm` that does not set
 /// `installed`; `stage` that forgets the installed commit; `revert` that clears `installed`;
 /// `staged_commit` written as another field.
 #[test]
@@ -463,7 +462,7 @@ fn stage_confirm_and_revert_round_trip_through_the_status_file() {
 /// (a restart between the confirm and its record sends it again) failing or rewriting the
 /// file (a rewrite is a rename, so the file would get another inode).
 ///
-/// Mutants it catches: `confirm` without clearing `staged`; `confirm` that accepts any
+/// Catches: `confirm` without clearing `staged`; `confirm` that accepts any
 /// commit; `confirm` that is an error the second time; `confirm` that rewrites the file when
 /// the release is installed already.
 #[test]
@@ -491,7 +490,7 @@ fn confirm_of_a_release_that_is_not_staged_is_refused_and_twice_is_fine() {
 /// staged), writing a file for nothing, and dropping the staging of a release other than the
 /// one it was asked about.
 ///
-/// Mutants it catches: `revert` that is an error with nothing staged; `revert` that clears
+/// Catches: `revert` that is an error with nothing staged; `revert` that clears
 /// `staged` whatever the commit; `revert` that writes the file when it changes nothing.
 #[test]
 fn revert_is_ok_with_nothing_staged_and_leaves_another_release_staged() {
@@ -513,7 +512,7 @@ fn revert_is_ok_with_nothing_staged_and_leaves_another_release_staged() {
 /// start a child from a file that is not there): no copy at all, a binary without its marker
 /// and a marker without its binary.
 ///
-/// Mutants it catches: no check; only the directory checked; only the binary checked; only
+/// Catches: no check; only the directory checked; only the binary checked; only
 /// the marker checked.
 #[test]
 fn stage_needs_the_copy_and_its_marker() {
@@ -538,7 +537,7 @@ fn stage_needs_the_copy_and_its_marker() {
 /// Catches `staged` and `installed` not reading the file the root half's reader reads: a file
 /// in the shape of `status.json` (with a word the proxy does not write) is read as its facts.
 ///
-/// Mutants it catches: `staged` that is always `None`; `installed` that reads `staged_commit`;
+/// Catches: `staged` that is always `None`; `installed` that reads `staged_commit`;
 /// `staged` that reads the commit from `installed_commit`.
 #[test]
 fn staged_and_installed_read_the_shape_the_root_half_writes() {
@@ -559,7 +558,7 @@ fn staged_and_installed_read_the_shape_the_root_half_writes() {
 /// Catches the file written in a shape another reader cannot read, with a mode other than
 /// 0644, or with its temporary file left beside it.
 ///
-/// Mutants it catches: a key renamed; `staged` nested differently; the facts' profile left
+/// Catches: a key renamed; `staged` nested differently; the facts' profile left
 /// out; the file written with another mode; the rename skipped.
 #[test]
 fn the_file_has_the_shape_of_status_json_and_mode_0644() {
@@ -590,7 +589,7 @@ fn the_file_has_the_shape_of_status_json_and_mode_0644() {
 
 /// Catches `frontend_update` doing anything: nothing is spooled and no file is written.
 ///
-/// Mutant it catches: `frontend_update` that returns `Ok`.
+/// Catches: `frontend_update` that returns `Ok`.
 #[test]
 fn frontend_update_is_refused() {
     let o = orders("frontend");
@@ -613,7 +612,7 @@ fn frontend_update_is_refused() {
 /// Catches a status file that cannot be read being taken for an empty one (the next write
 /// would erase what it said) and a file that cannot be written being taken for written.
 ///
-/// Mutants it catches: a parse error read as `None`; the write's error dropped; the file
+/// Catches: a parse error read as `None`; the write's error dropped; the file
 /// replaced without being read first.
 #[test]
 fn an_unreadable_file_is_an_error_and_is_not_overwritten_and_a_failed_write_is_one_too() {

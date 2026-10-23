@@ -27,7 +27,7 @@ fn label(word: &str, i: usize) -> String {
 
 /// Catches (the strip of P8): a flaky target whose pass and fail are not seen in run
 /// order. Builds b1 to b4 pass, fail, pass, fail; the route lists them newest first, the
-/// strip is oldest left. Mutants: the columns not reversed (newest left, so the labels
+/// strip is oldest left. Catches: the columns not reversed (newest left, so the labels
 /// come out b4 first); a fail given the pass glyph or class; a cell labelled with
 /// another build's outcome; the grid's row read for another target.
 #[test]
@@ -55,7 +55,7 @@ fn the_strip_alternates_in_run_order_oldest_left() {
 }
 
 /// Catches: a count line that is not the count of the cells drawn, or says nothing of
-/// the builds that did not run the target. Mutants: failures counted as passes; the
+/// the builds that did not run the target. Catches: failures counted as passes; the
 /// total taken over the builds that ran it, not the builds covered.
 #[test]
 fn the_count_line_counts_the_failures_of_the_builds_that_ran_it() {

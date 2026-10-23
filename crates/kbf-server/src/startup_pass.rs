@@ -45,7 +45,7 @@ fn ready_to_evict(log: &RaftMetaLog) -> Result<EvictReady, MetaLogError> {
 /// Whether a Raft log in a cell of `voters` voters takes `EvictObjects`: one at
 /// machine version 3 (whose format carries the command) does. One below it is raised
 /// to it here only if `voters` is one (a single-host farm): a raise in a cell of more
-/// would make every replica that does not run version 3 yet refuse the log, so there
+/// would leave every replica that does not run version 3 yet skipping its commands, so there
 /// the operator raises it once every replica does, and until then the answer is
 /// [`EvictReady::NeedsV3`]. Called only when something is to be forgotten, so a log
 /// with nothing to forget stays one an older binary reads.
@@ -271,13 +271,11 @@ mod tests {
         drop(files);
     }
 
-    /// Catches a pass that raises the log's machine version in a cell of more than
-    /// one voter (mutant: always raise), which would make every replica that does not
-    /// run version 3 yet refuse the log; one that forgets there anyway, or marks
-    /// nothing missing; and one that logs the refusal per object (mutant: in the
-    /// loop) rather than once. Three voters: the log stays at version 1, the two lost
-    /// objects' blobs read as missing and one line says so. Once the operator raises
-    /// the log, the next pass forgets them.
+    /// Asserts that in a cell of three voters the pass does not raise the log's machine
+    /// version, which would leave every replica that does not run version 3 yet skipping
+    /// its commands: the log stays at version 1, nothing is forgotten, the two lost
+    /// objects' blobs read as missing, and one line says so, not one per object. Once the
+    /// operator raises the log, the next pass forgets them.
     #[tokio::test(flavor = "current_thread")]
     async fn a_cell_of_three_marks_missing_until_the_operator_raises() {
         let logs = Capture::waiting_for(PASS_LINES);

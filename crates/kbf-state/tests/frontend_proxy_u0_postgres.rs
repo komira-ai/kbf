@@ -3,8 +3,8 @@
 //! design gives (section 11) opens a store. The report is
 //! `docs/design/frontend-proxy-u0.md`.
 //!
-//! The fence tests are `#[ignore]`d like the rest of this crate's server tests and run in the
-//! `state-postgres` CI job (`KBF_TEST_POSTGRES_URL`). The socket tests also need
+//! The fence tests need a server (`KBF_TEST_POSTGRES_URL` names it) and fail without one. The
+//! socket tests, which stay `#[ignore]`d, also need
 //! `KBF_TEST_POSTGRES_SOCKET_DIR`, the directory the same server's Unix socket is in; they
 //! print that they skipped when it is not set, because the CI service container shares no
 //! socket directory with the job.
@@ -19,11 +19,10 @@ use kbf_state::postgres::{Flaw, PostgresBackend, PostgresConfig, PostgresStore};
 use kbf_state::{Cond, Fenced, GENERATION, Store, StoreError, Txn};
 use postgres::{Client, NoTls};
 
-const URL_VAR: &str = "KBF_TEST_POSTGRES_URL";
 const SOCKET_VAR: &str = "KBF_TEST_POSTGRES_SOCKET_DIR";
 
 fn url() -> String {
-    std::env::var(URL_VAR).unwrap_or_else(|_| panic!("{URL_VAR} must name a postgres:// URL"))
+    kbf_testkit::database::server_url()
 }
 
 /// A store in a schema of its own (dropped with the backend).
@@ -82,7 +81,6 @@ fn waiting(schema: &str) -> i64 {
 // generation 2 and A is refused for good. Section 8's own test: "hold A's transaction open,
 // take over on B, assert A's commit fails or B's takeover waits" (here: waits).
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_takeover_waits_for_a_fenced_write_that_has_passed_its_check() {
     let backend = PostgresBackend::new(&url(), Flaw::None);
     let (store, schema) = store(&backend);
@@ -136,7 +134,6 @@ fn a_takeover_waits_for_a_fenced_write_that_has_passed_its_check() {
 // A write as fast as they can while B takes the generation. Every row A's handle managed to
 // commit must be ordered before B's takeover, and every write after it must be refused.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn no_write_of_the_old_handle_commits_after_the_takeover() {
     let backend = PostgresBackend::new(&url(), Flaw::None);
     let (store, _schema) = store(&backend);

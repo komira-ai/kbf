@@ -170,12 +170,14 @@ pub fn apt_update(source: &ChannelSource) -> Cmd {
     }
 }
 
-/// `apt-get install` of `kbf=<version>` from the channel's source alone.
+/// `apt-get install` of `kbf=<version>` (older than the installed one too) from the channel's source alone.
 pub fn apt_install(source: &ChannelSource, version: &Version) -> Cmd {
     let mut args: Vec<String> = [
         "install",
         "-y",
         "--no-install-recommends",
+        // A rollback installs an older version; without this `-y` refuses a downgrade.
+        "--allow-downgrades",
         "-o",
         "Dpkg::Options::=--force-confold",
         "-o",

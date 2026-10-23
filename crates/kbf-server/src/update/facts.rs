@@ -73,7 +73,7 @@ pub struct Generation(pub u64);
 ///
 /// The epoch comes first in the order, so a store restored from a backup, whose counters have
 /// gone back, still issues ids above every id of the store it replaced: it opens at a later
-/// epoch ([`super::Controller::new`]).
+/// epoch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OrderId {
     /// The epoch of the store that issued it.

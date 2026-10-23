@@ -314,7 +314,7 @@ fn link(rig: &Rig, name: &str) -> PathBuf {
 /// moves the links, restarts the unit once and reports a swap on trial; the same record put
 /// back (a replay) fetches nothing and restarts nothing.
 ///
-/// Mutants planted: no restart step; the acknowledged id not recorded (the replay restarts
+/// Catches: no restart step; the acknowledged id not recorded (the replay restarts
 /// again); the record not removed; the fetch skipped (the swap is refused as not installed).
 #[test]
 fn an_activate_order_fetches_swaps_restarts_once_and_is_not_replayed() {
@@ -348,7 +348,7 @@ fn an_activate_order_fetches_swaps_restarts_once_and_is_not_replayed() {
 /// through `fetch_activation` with exactly the facts the record carries, so the verify
 /// pipeline can hold the binary's own report against them before anything is installed.
 ///
-/// Mutants planted: the cycle calling plain `fetch` (the fetcher is given no facts); one fact
+/// Catches: the cycle calling plain `fetch` (the fetcher is given no facts); one fact
 /// of the five taken from the wrong field (`min_protocol` for `protocol`).
 #[test]
 fn an_activation_hands_the_fetcher_the_orders_facts() {
@@ -372,7 +372,7 @@ fn an_activation_hands_the_fetcher_the_orders_facts() {
 /// that is already installed is still handed to the fetcher, which verifies the directory
 /// (or says it is unverified) instead of the cycle trusting that it is there.
 ///
-/// Mutant planted: the fetch skipped when the directory exists (the fetcher is not called).
+/// Catches: the fetch skipped when the directory exists (the fetcher is not called).
 #[test]
 fn an_installed_release_is_still_handed_to_the_fetcher() {
     let mut rig = Rig::new("installed");
@@ -402,7 +402,7 @@ fn an_installed_release_is_still_handed_to_the_fetcher() {
 /// REFUSED with the fetch's reason, the order is spent (a person re-issues it, with a new
 /// id) and the next order still runs.
 ///
-/// Mutants planted: the restart owed before the fetch (a restart with nothing swapped);
+/// Catches: the restart owed before the fetch (a restart with nothing swapped);
 /// the error swallowed (the swap goes ahead with no release).
 #[test]
 fn a_failed_fetch_leaves_current_alone_and_reports_refused() {
@@ -434,7 +434,7 @@ fn a_failed_fetch_leaves_current_alone_and_reports_refused() {
 /// installed binary declares another protocol, another profile or another commit than the
 /// order expected is refused before any link moves.
 ///
-/// Mutants planted: the comparison dropped; only the protocol compared.
+/// Catches: the comparison dropped; only the protocol compared.
 #[test]
 fn a_fetched_release_that_declares_other_facts_is_refused_before_the_flip() {
     let cases: [(&str, crate::helper::fetcher::fake::Tamper); 4] = [
@@ -464,7 +464,7 @@ fn a_fetched_release_that_declares_other_facts_is_refused_before_the_flip() {
 /// source cannot answer is not even fetched. The one pending trial is another order's, so a
 /// second timer is never started.
 ///
-/// Mutants planted: the pending check dropped (the second activation reaches the installer's
+/// Catches: the pending check dropped (the second activation reaches the installer's
 /// own refusal after a wasted fetch); the live count compared with `> 1`.
 #[test]
 fn an_activation_is_refused_before_the_fetch_during_a_trial_or_with_leases_live() {
@@ -514,7 +514,7 @@ fn mac_rig(name: &str, setup: impl FnOnce(&mut MacHost)) -> Rig {
 /// `sandbox-exec`) refuses with the reason; and when only a stale directory remains with no
 /// daemon running the activation goes through and the pass logs which directory it let by.
 ///
-/// Mutants seen red: the keepers ignored; the `sandbox-exec` check dropped; the lease note not logged
+/// Catches: the keepers ignored; the `sandbox-exec` check dropped; the lease note not logged
 /// by the cycle; the note naming no directory.
 #[test]
 fn a_mac_activation_follows_the_mac_lease_source() {
@@ -568,7 +568,7 @@ fn a_mac_activation_follows_the_mac_lease_source() {
 /// Catches an unreadable lease source being read as "none": the installer refuses, and
 /// fetches nothing.
 ///
-/// Mutant planted: the error arm treated as zero leases (the activation goes through).
+/// Catches: the error arm treated as zero leases (the activation goes through).
 #[test]
 fn a_lease_source_that_cannot_answer_refuses_the_activation() {
     let mut rig = Rig::new("leases-unknown");
@@ -587,7 +587,7 @@ fn a_lease_source_that_cannot_answer_refuses_the_activation() {
 /// and no restart, for the template's instance and for the plain unit; the same order for the
 /// daemon's unit, with the same idle lease source, is taken.
 ///
-/// Mutants seen red: the check removed (both frontend units swap); the check refusing every
+/// Catches: the check removed (both frontend units swap); the check refusing every
 /// unit (the daemon's order is refused).
 #[test]
 fn an_activation_is_refused_when_the_restarted_unit_is_a_frontends() {
@@ -618,7 +618,7 @@ fn an_activation_is_refused_when_the_restarted_unit_is_a_frontends() {
 /// revert that does not go back and restart: the confirm record carries the commit, the
 /// helper finds the activation's own id.
 ///
-/// Mutant planted: the confirm passing the confirm order's id instead of the pending swap's.
+/// Catches: the confirm passing the confirm order's id instead of the pending swap's.
 #[test]
 fn a_confirm_order_keeps_the_swap_and_a_revert_order_goes_back() {
     let mut rig = Rig::new("confirm");
@@ -641,7 +641,7 @@ fn a_confirm_order_keeps_the_swap_and_a_revert_order_goes_back() {
 /// Catches a swap left on trial forever: the Linux boot check starts the window at the
 /// first start; the pass after the window reverts and restarts the unit.
 ///
-/// Mutant planted: `expire` not called in the pass.
+/// Catches: `expire` not called in the pass.
 #[test]
 fn a_swap_not_confirmed_in_its_window_is_reverted() {
     let mut rig = Rig::new("expire");
@@ -664,7 +664,7 @@ fn a_swap_not_confirmed_in_its_window_is_reverted() {
 /// Catches a restart lost on the way: when the restart fails, the owed restart stays in
 /// `helper.json` and the next pass retries, and the node is told why in the meantime.
 ///
-/// Mutant planted: `restart_due` cleared before the restart is tried.
+/// Catches: `restart_due` cleared before the restart is tried.
 #[test]
 fn a_failed_restart_is_owed_until_it_succeeds() {
     let mut rig = Rig::new("restart-owed");
@@ -695,7 +695,7 @@ fn a_failed_restart_is_owed_until_it_succeeds() {
 /// a commit; an activation with no release claims; one over the size cap; a directory. A link
 /// in the spool is refused as a link and removed as a link; what it points at is untouched.
 ///
-/// Mutants planted: acknowledging an unparsable file's id (the real order is then ignored as
+/// Catches: acknowledging an unparsable file's id (the real order is then ignored as
 /// old); removing through the link's target (the secret goes); `deny_unknown_fields` dropped
 /// (the extra field is accepted).
 #[test]
@@ -743,7 +743,7 @@ fn a_file_that_is_not_an_order_moves_nothing() {
 /// secret behind it never read (the refusal says symlink, not a parse error of the secret's
 /// content), and the order it would have been is not acted on.
 ///
-/// Mutant planted: `O_NOFOLLOW` dropped from the open (the secret is read; the reason is a
+/// Catches: `O_NOFOLLOW` dropped from the open (the secret is read; the reason is a
 /// parse error, not a symlink).
 #[test]
 fn a_symlinked_record_is_refused_as_a_link_and_not_read() {
@@ -775,7 +775,7 @@ fn a_symlinked_record_is_refused_as_a_link_and_not_read() {
 /// id) are acted on and the rest are deleted unread with a reason, so a stuck or hostile
 /// writer cannot grow the directory or the work of a pass.
 ///
-/// Mutants planted: the cap raised to 100 (the excess is acted on); the excess left on disk.
+/// Catches: the cap raised to 100 (the excess is acted on); the excess left on disk.
 #[test]
 fn the_spool_holds_at_most_64_records_and_the_excess_is_deleted() {
     let mut rig = Rig::new("count-cap");
@@ -801,7 +801,7 @@ fn the_spool_holds_at_most_64_records_and_the_excess_is_deleted() {
 /// `helper.json`: one whose file time is ancient but which root saw a second ago is acted on;
 /// one root saw 1801 s ago and which is still there is deleted unread.
 ///
-/// Mutants planted: expiry by the file's mtime (the ancient-mtime record is dropped and the
+/// Catches: expiry by the file's mtime (the ancient-mtime record is dropped and the
 /// stale one acted on); first-seen reset every pass (the stale record is acted on); the bound
 /// `>` made `>=` (the record exactly 1800 s old is dropped).
 #[test]
@@ -925,7 +925,7 @@ fn the_record_kbf_update_writes_is_the_order_this_side_reads() {
 /// staged order: the source survives the file, and the record carries no claims although the
 /// caller handed the writer an offer.
 ///
-/// Mutants planted: the writer ignoring the order's source; the writer consuming the offer
+/// Catches: the writer ignoring the order's source; the writer consuming the offer
 /// for a staged order.
 #[test]
 fn the_staged_record_kbf_update_writes_is_the_staged_order_this_side_reads() {
@@ -972,7 +972,7 @@ fn kbf_update_offer() -> kbf_update::Offer {
 /// Catches a restart that runs the wrong program or the wrong unit: argv is fixed by the
 /// helper's own flag, an absolute program, and nothing else.
 ///
-/// Mutant planted: the step returned as `None`.
+/// Catches: the step returned as `None`.
 #[test]
 fn the_restart_is_one_fixed_command() {
     let program = |r: Restart| match r.step() {
@@ -1006,7 +1006,7 @@ fn the_restart_is_one_fixed_command() {
 /// Catches a confirm window the order chooses: on macOS the window starts at the swap and
 /// the helper clamps the order's `window_s` to its own 120..=1800 seconds.
 ///
-/// Mutants planted: the clamp dropped; the bounds swapped.
+/// Catches: the clamp dropped; the bounds swapped.
 #[test]
 fn the_window_an_order_asks_for_is_clamped_on_macos() {
     for (asked, kept) in [(5_u32, 120_u64), (600, 600), (99_999, 1800)] {
@@ -1023,7 +1023,7 @@ fn the_window_an_order_asks_for_is_clamped_on_macos() {
 /// Catches orders taken in the order the directory lists them: three orders in one pass
 /// (activate, confirm, revert) end on the old release only if run by (epoch, id).
 ///
-/// Mutant planted: the sort dropped (with the files made in reverse id order).
+/// Catches: the sort dropped (with the files made in reverse id order).
 #[test]
 fn orders_are_acted_on_in_id_order() {
     let mut rig = Rig::new("order-sort");
@@ -1046,7 +1046,7 @@ fn orders_are_acted_on_in_id_order() {
 /// are replays dropped without a word (they move nothing); a newer epoch's lower id is
 /// acted on (the restored store counts again).
 ///
-/// Mutants planted: a jump cap on the id (the gap is refused); the epoch ignored (the stale
+/// Catches: a jump cap on the id (the gap is refused); the epoch ignored (the stale
 /// order runs, the newer epoch's lower id is dropped as a replay).
 #[test]
 fn orders_are_ordered_by_epoch_then_id_and_a_gap_is_no_reason_to_refuse() {
@@ -1083,7 +1083,7 @@ fn orders_are_ordered_by_epoch_then_id_and_a_gap_is_no_reason_to_refuse() {
 /// it as that user). The modes are set by the write itself, not by the umask of whoever
 /// runs the helper.
 ///
-/// Mutant planted: either mode swapped.
+/// Catches: either mode swapped.
 #[test]
 fn the_helpers_files_have_their_modes() {
     use std::os::unix::fs::PermissionsExt;
@@ -1102,7 +1102,7 @@ fn the_helpers_files_have_their_modes() {
 /// Catches fetched facts shown for a release that is neither current nor staged (an old
 /// fact kept after another release took over): only those bring their protocol numbers.
 ///
-/// Mutant planted: the filter dropped.
+/// Catches: the filter dropped.
 #[test]
 fn fetched_facts_are_shown_only_for_the_current_or_staged_release() {
     use crate::helper::memory::{Memory, StagedFacts};
@@ -1226,7 +1226,7 @@ fn an_expiry_that_cannot_revert_is_reported() {
 /// last acted on is refused with a reason in status.json and NOT acknowledged, and the next
 /// real order still runs. The first order a host acts on is measured from nothing.
 ///
-/// Mutants planted: the check dropped; the first-order exemption dropped.
+/// Catches: the check dropped; the first-order exemption dropped.
 #[test]
 fn an_epoch_far_above_the_last_is_refused_without_moving_the_floor() {
     let mut rig = Rig::new("epoch-jump");
@@ -1265,7 +1265,7 @@ fn an_epoch_far_above_the_last_is_refused_without_moving_the_floor() {
 /// in two epochs must be two different activations. With a swap of the first still on trial,
 /// the second is refused (a trial is pending) and restarts nothing.
 ///
-/// Mutant planted: `order_id: order.id.to_string()` (the second passes for the first's repeat).
+/// Catches: `order_id: order.id.to_string()` (the second passes for the first's repeat).
 #[test]
 fn the_same_id_in_two_epochs_is_two_activations() {
     let mut rig = Rig::new("same-id");
@@ -1314,7 +1314,7 @@ impl crate::database::SchemaStep for FakeStep {
 /// as they were and the status says why; an order for the release that is already current
 /// (nothing staged for it) asks nothing.
 ///
-/// Mutants seen red: the step's error dropped (the swap went through); the staged-commit
+/// Catches: the step's error dropped (the swap went through); the staged-commit
 /// filter removed (the current release asked for a schema); the skip's log line removed.
 #[test]
 fn the_database_is_migrated_before_the_links_move_and_a_refusal_stops_the_swap() {
@@ -1407,7 +1407,7 @@ fn a_repeat_order_for_the_staged_release_asks_the_step_again() {
 /// after the last one is refused before the fetch and moves nothing, and one 61 s after it
 /// goes through.
 ///
-/// Mutants planted: the interval check removed (the second swap goes through at +10);
+/// Catches: the interval check removed (the second swap goes through at +10);
 /// `last_activation_at` never recorded (same); `<` turned into `>` (the +61 swap refused).
 #[test]
 fn a_second_activation_inside_the_minimum_interval_is_refused() {
@@ -1438,7 +1438,7 @@ fn a_second_activation_inside_the_minimum_interval_is_refused() {
 /// Catches a clock that stepped back holding an activation up: the last swap is "in the
 /// future" of the pass, and the order is not held by the minimum interval.
 ///
-/// Mutant planted: the `last <= now` test dropped (the future swap holds every order for
+/// Catches: the `last <= now` test dropped (the future swap holds every order for
 /// the difference).
 #[test]
 fn a_clock_that_stepped_back_does_not_hold_an_activation_up() {
@@ -1458,7 +1458,7 @@ fn a_clock_that_stepped_back_does_not_hold_an_activation_up() {
 /// while the unit's main process still runs the old release, and while the first boot
 /// check has not run; it is kept once the new release runs.
 ///
-/// Mutants planted: `accept_confirm` not called; the executable compared with the old
+/// Catches: `accept_confirm` not called; the executable compared with the old
 /// release's directory; the boot-check condition dropped (the not-started confirm is kept).
 #[test]
 fn a_confirm_order_is_kept_only_when_the_new_release_runs() {
@@ -1504,7 +1504,7 @@ fn a_confirm_order_is_kept_only_when_the_new_release_runs() {
 /// and current, previous, the newest other and every release a process executes from stay.
 /// A confirm that is refused collects nothing.
 ///
-/// Mutants planted: the in-use set ignored (the oldest release, run by a process, is
+/// Catches: the in-use set ignored (the oldest release, run by a process, is
 /// removed); `gc_due` set by a refused confirm; previous not kept.
 #[test]
 fn a_confirm_collects_old_releases_but_not_one_a_process_runs() {
@@ -1550,7 +1550,7 @@ fn a_confirm_collects_old_releases_but_not_one_a_process_runs() {
 /// process table cannot be read, and when the releases directory cannot be listed, the
 /// confirm is still kept, nothing is removed, and the reason is in the log.
 ///
-/// Mutants planted: the `in_use` error treated as an empty set (everything unneeded goes);
+/// Catches: the `in_use` error treated as an empty set (everything unneeded goes);
 /// the collection's error returned from the pass.
 #[test]
 fn a_collection_that_cannot_run_is_logged_and_the_confirm_is_kept() {
@@ -1596,7 +1596,7 @@ fn a_collection_that_cannot_run_is_logged_and_the_confirm_is_kept() {
 /// the restart; once the verb lets go the same pass restarts the service once and removes the
 /// marker. A lock file that cannot be opened ends the pass with the error.
 ///
-/// Mutants planted: the busy arm restarting anyway; the marker left after the restart.
+/// Catches: the busy arm restarting anyway; the marker left after the restart.
 #[test]
 fn a_restart_an_operator_left_owed_waits_for_its_lock_then_is_done_and_cleared() {
     let mut rig = Rig::new("owed-marker");
@@ -1637,7 +1637,7 @@ impl crate::helper::serve::BinaryWatch for Flag {
 /// replaced, the turn says re-exec and the next order is left in the spool for the new
 /// program.
 ///
-/// Mutants planted: the watch consulted after the pass (the order is acted on);
+/// Catches: the watch consulted after the pass (the order is acted on);
 /// `Flow::Reexec` never returned.
 #[test]
 fn a_replaced_binary_is_re_executed_before_the_next_order_is_read() {
@@ -1676,7 +1676,7 @@ fn a_replaced_binary_is_re_executed_before_the_next_order_is_read() {
 /// changes nothing, is removed, and does not advance the acknowledged id or epoch, so a real
 /// order of a lower id in the same epoch still runs.
 ///
-/// Mutants planted: the `denied` arm in `take` removed (the order is staged); the arm placed
+/// Catches: the `denied` arm in `take` removed (the order is staged); the arm placed
 /// after the floors with the floor moved (the lower real order is then dropped as a replay).
 #[test]
 fn a_frontend_update_record_on_a_host_without_a_frontend_is_denied_and_moves_no_floor() {
@@ -1708,7 +1708,7 @@ fn a_frontend_update_record_on_a_host_without_a_frontend_is_denied_and_moves_no_
 /// of it (it is staged), and with the frontend floor seeded at (1, 7) a node order of id 3 is
 /// not dropped as a replay of the frontend's: each kind is ordered against its own pair.
 ///
-/// Mutants planted: the floor taken from the node pair whatever the kind (the frontend
+/// Catches: the floor taken from the node pair whatever the kind (the frontend
 /// record is dropped silently, and the node order after the seeded frontend floor too).
 #[test]
 fn node_and_frontend_orders_have_separate_floors() {
@@ -1747,7 +1747,7 @@ fn node_and_frontend_orders_have_separate_floors() {
 /// is a refusal with the entry's name and the stable code, and a spool of more than 256
 /// entries says so (the first 256 are looked at, the rest are not).
 ///
-/// Mutants planted: the listing error ignored (no refusal is recorded); the `crowded` flag
+/// Catches: the listing error ignored (no refusal is recorded); the `crowded` flag
 /// dropped (the spool of 257 junk files says nothing).
 #[test]
 fn a_spool_that_cannot_be_listed_is_refused_and_a_crowded_one_is_said() {
@@ -1792,7 +1792,7 @@ fn plain_order(verb: OrderVerb) -> Order {
 /// with no release claims is refused by the vetting itself (fail closed), and a
 /// `frontend_update` that reached the act step is refused, not carried out as a node verb.
 ///
-/// Mutants planted: the claims check removed (the vetting panics or passes); the frontend arm
+/// Catches: the claims check removed (the vetting panics or passes); the frontend arm
 /// of `act` made a revert (the links move).
 #[test]
 fn vetting_and_acting_refuse_what_parsing_already_refuses() {
@@ -1820,7 +1820,7 @@ fn vetting_and_acting_refuse_what_parsing_already_refuses() {
 /// exactly `kbf`; a second component is refused before the fetch, with both names in the
 /// reason.
 ///
-/// Mutant planted: the set compared as a prefix (an extra component passes).
+/// Catches: the set compared as a prefix (an extra component passes).
 #[test]
 fn an_activation_with_other_components_than_the_platform_takes_is_refused() {
     let mut rig = Rig::new("components");
@@ -1861,7 +1861,7 @@ impl Fetcher for Hollow {
 /// where they were, and no restart is owed. Also the fetcher of a build that has none refuses
 /// every fetch.
 ///
-/// Mutants planted: the swap error turned into `Ok(Done::quiet(..))` (the order is
+/// Catches: the swap error turned into `Ok(Done::quiet(..))` (the order is
 /// acknowledged without a swap); `NotWired` returning an empty release.
 #[test]
 fn a_swap_that_fails_is_refused_and_moves_nothing() {
@@ -1885,7 +1885,7 @@ fn a_swap_that_fails_is_refused_and_moves_nothing() {
 /// way (status.json cannot be written): the order is refused before the fetch, nothing moves,
 /// and the pass reports the failure to write instead of ending as if it had reported.
 ///
-/// Mutant planted: the report error ignored in the vetting (the fetch happens anyway).
+/// Catches: the report error ignored in the vetting (the fetch happens anyway).
 #[test]
 fn an_activation_stops_before_the_fetch_when_status_cannot_be_written() {
     let mut rig = Rig::new("status-unwritable");
@@ -1902,7 +1902,7 @@ fn an_activation_stops_before_the_fetch_when_status_cannot_be_written() {
 /// a refusal for a trial pending and not a second trial. The vetting lets it by; `activate`
 /// calls it a repeat.
 ///
-/// Mutant planted: the pending trial refused whatever its activation (the repeat is refused).
+/// Catches: the pending trial refused whatever its activation (the repeat is refused).
 #[test]
 fn the_same_activation_again_while_on_trial_is_a_repeat() {
     let mut rig = Rig::new("repeat");

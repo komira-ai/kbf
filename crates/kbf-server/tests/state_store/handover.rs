@@ -61,7 +61,7 @@ fn status(finished: &Finished) -> (i32, String) {
 /// (UNAVAILABLE, which Buck2 asks again), grant nothing, accept no result (the daemon
 /// sends it again to the successor), change nothing a heartbeat or a tick would, and
 /// write nothing to the store at all (not a renewal, not a ping), since from then on the
-/// successor's rows are the truth. Mutants: the fence flag not checked in `admit`, in
+/// successor's rows are the truth. Catches: the fence flag not checked in `admit`, in
 /// `feed`, or in the session renewal.
 #[tokio::test(start_paused = true)]
 async fn a_fenced_farm_queues_nothing_accepts_nothing_and_writes_nothing() {
@@ -147,7 +147,7 @@ async fn a_farm_is_quiet_when_no_call_is_between_its_request_and_its_queueing() 
 /// operation is only reported, in `kbf_frontend_relay_untraced`, once
 /// [`UNTRACED_LOOKS`] looks in a row found it so; a look that finds it again takes it off
 /// the report, and a caller that cancels (drops its stream) is no longer counted waiting.
-/// Each follow returns how many callers still wait. Mutants: a vanished operation answered
+/// Each follow returns how many callers still wait. Catches: a vanished operation answered
 /// (UNAVAILABLE) after some number of looks; the report not cleared by a look that finds
 /// the operation; a cancelled caller still counted; the report raised at the first look;
 /// the `done/` row ignored.
@@ -260,7 +260,7 @@ async fn a_farm_has_handed_over_when_it_is_fenced() {
 /// Catches: an operation the relay cannot find, or finds wrongly, by its action: it is the
 /// unfinished row naming the action and instance (the instance may be left out for a call
 /// that has none, then it must be the only one; two instances running one action are
-/// ambiguous and neither is guessed), and a farm with no state store finds none. Mutants:
+/// ambiguous and neither is guessed), and a farm with no state store finds none. Catches:
 /// the instance ignored; a finished operation (no `op/` row) still found.
 #[tokio::test(start_paused = true)]
 async fn an_operation_is_found_by_its_action_among_the_unfinished_rows() {
@@ -303,7 +303,7 @@ async fn an_operation_is_found_by_its_action_among_the_unfinished_rows() {
 /// executing, a finished one is answered from its `done/` row, and one with no trace is
 /// never answered, however many looks find it so (it shows nothing, is reported in
 /// `kbf_frontend_relay_untraced` from the second look, and leaves the report when the
-/// relay stops following it). Mutants: a look count that answers a relayed operation lost;
+/// relay stops following it). Catches: a look count that answers a relayed operation lost;
 /// the report not made, or not cleared by `release`.
 #[tokio::test(start_paused = true)]
 async fn a_relayed_operation_is_followed_from_the_rows_as_a_kept_caller_is() {
@@ -354,7 +354,7 @@ async fn a_relayed_operation_is_followed_from_the_rows_as_a_kept_caller_is() {
 /// Catches: rows the relay's fallback cannot read taken for "no such operation": a relayed
 /// call would then be counted lost, or sent again, on a store that is only corrupt. An
 /// `op/` row that holds some other input, one that does not decode, and a `done/` row
-/// that does not parse must each be an error naming the row. Mutants: the `not a request`
+/// that does not parse must each be an error naming the row. Catches: the `not a request`
 /// arm of `operations_of` skipping the row; an error of either lookup turned into `Ok(None)`.
 #[tokio::test(start_paused = true)]
 async fn rows_the_relay_cannot_read_are_errors_not_absence() {
@@ -397,7 +397,7 @@ fn placement(farm: &TestFarm) -> PlacementView {
 /// handover would offer leases to a node taken out of placement for an update), a drain
 /// that comes back without its deadline (a node drained for an hour paused at once, or
 /// never), one whose deadline had passed that does not pause at the first tick, and a
-/// node returned to placement that comes back cordoned. Mutants: no row written by
+/// node returned to placement that comes back cordoned. Catches: no row written by
 /// `place`; the deadline read as a duration; the row of an uncordon not deleted.
 async fn a_cordon_survives_a_restart(backing: Backing) {
     let mut disk = Disk::over(backing);
