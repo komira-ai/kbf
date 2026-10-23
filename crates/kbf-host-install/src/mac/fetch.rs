@@ -134,7 +134,8 @@ impl Fetcher<'_> {
 
     /// `curl` for page `page` of the repository's releases: no configuration file (`-q`),
     /// HTTPS only, no redirect, a time limit and a size limit, errors of HTTP failing the
-    /// command. The environment is empty. The token, if any, is the only thing on its
+    /// command. The command carries no environment of its own (the runner adds only its fixed
+    /// `PATH`, `LANG` and `DEBIAN_FRONTEND`). The token, if any, is the only thing on its
     /// standard input.
     pub fn list_cmd(&self, page: u32) -> Cmd {
         let mut args: Vec<String> = [

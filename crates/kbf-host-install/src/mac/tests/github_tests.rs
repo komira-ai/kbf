@@ -4,7 +4,7 @@
 
 use std::cell::RefCell;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::rc::Rc;
 
 use super::fx::{
@@ -722,11 +722,35 @@ fn a_directory_channel_never_talks_to_github() {
     assert!(!fx.host.stage().join("fetch").exists());
 }
 
+/// The system `curl` that lists the releases is held to the same standard as the pinned `gh`:
+/// a writable one is refused for a GitHub channel and nothing is run. A directory channel
+/// never uses `curl`, so it is not held to it.
+#[test]
+fn a_writable_curl_is_refused_only_for_a_github_channel() {
+    let fx = Fx::new("mac-gh-curl-trust");
+    let sim = github(&fx);
+    fs::set_permissions(&fx.host.curl, fs::Permissions::from_mode(0o777)).unwrap();
+    assert_eq!(
+        refusal(run(&fx, &sim, &channel(&fx, false), NEW_VERSION)),
+        Refusal::KeyUntrusted
+    );
+    assert!(sim.calls.borrow().is_empty());
+    let sim = fx.sim();
+    mkdir(&fx.host.work, 0o711);
+    let dir = MacChannel {
+        source: Source::Dir(fx.channel_dir.clone()),
+        sums: Some(fx.sums.clone()),
+        source_ref: "refs/heads/main".into(),
+    };
+    stage(&fx.host, &sim, &dir, &Version::new(NEW_VERSION).unwrap()).unwrap();
+}
+
 // ---- the listing with curl ----
 
 /// With no token the listing is the system `curl`, as `nobody`: the arguments are exactly
 /// these (`-q` first so no configuration file is read, HTTPS only, no redirect, HTTP errors
-/// fail, a time and a size limit, the fixed URL last), the environment is empty, nothing is
+/// fail, a time and a size limit, the fixed URL last), the command carries no environment of
+/// its own (the runner adds only its fixed `PATH`, `LANG` and `DEBIAN_FRONTEND`), nothing is
 /// on its standard input, and nothing like a token is anywhere in the call.
 #[test]
 fn the_listing_runs_curl_as_nobody_with_no_token_and_fixed_flags() {

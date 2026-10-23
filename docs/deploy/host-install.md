@@ -409,9 +409,9 @@ directory that `nobody` owns inside the stage, with its own `HOME`:
 1. lists the repository's releases with `/usr/bin/curl` from the public REST endpoint
    `https://api.github.com/repos/komira-ai/kbf/releases?per_page=100&page=N`, with no token. The
    flags are fixed: no configuration file (`-q` first), HTTPS only, no redirect, an HTTP error
-   fails the command, a time limit, a size limit, and an empty environment. It is 100 a page, newest first, page after page until
-   a page is empty, and at most 30 pages (an empty page ends it; a short one does not); never only the latest, so a rollback to an old release
-   works;
+   fails the command, a time limit, a size limit, and an empty environment. It is 100 a page, newest first, page
+   after page until a page is empty, and at most 30 pages (an empty page ends it; a short one
+   does not); never only the latest, so a rollback to an old release works;
 2. finds the asset named `kbf-<40 hex>-darwin-arm64.tar.gz` whose commit starts with the 12 hex
    digits of the version, across all the pages read. None is `unknown_release`; assets of two
    different commits are `ambiguous_release`; the same commit in two releases is one release (the
@@ -446,7 +446,8 @@ launchd, and no stage left behind.
   (never in its arguments, which every user can read), and gives it to `gh release download` as
   `GH_TOKEN`; the attestation check never gets it.
 - The system `curl` that macOS ships, `/usr/bin/curl`, which must be root's and not writable by
-  others (checked like the pinned `gh`).
+  others (checked like the pinned `gh`, and only for a GitHub channel: a directory channel never
+  runs it).
 
 #### The residuals
 
