@@ -1,5 +1,5 @@
-//! A package's seed on a scratch host, for the tests of the seed fetcher, the host fetcher,
-//! the cycle and `setup`: the files the package builder leaves (a manifest, a tarball of an
+//! A package's seed on a scratch host, for the tests of the seed fetcher, the host fetcher
+//! and the cycle: the files the package builder leaves (a manifest, a tarball of an
 //! honest x86-64 Linux `kbf`, its attestation bundle), the trust view that makes them root's,
 //! and a fake `gh` that accepts the attestation of exactly the bundle the signer made, the way
 //! the real one accepts only the bundle that attests the tarball's digest. A test changes a

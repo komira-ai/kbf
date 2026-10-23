@@ -17,6 +17,6 @@
   `kbf-*.service` and `kbf-*.socket` units and `kbf.slice`, exactly the three trust files, and
   `usr/lib/sysusers.d/kbf-installer.conf` and `usr/lib/tmpfiles.d/kbf-installer.conf`
   (the files under `packaging/linux/`), with fixed owners and times so the same inputs
-  are the same bytes. It holds no kbf release; `setup` installs the first one.
+  are the same bytes. It holds no kbf release; `record-release` records the first one.
 - Tested by `crates/xtask/tests/install_sh.rs` against a local HTTP server, with a stub
   installer (`xtask-fake`) and stub unit, trust, sysusers.d and tmpfiles.d files, and fake systemd tools.

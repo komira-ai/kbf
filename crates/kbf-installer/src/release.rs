@@ -97,7 +97,7 @@ pub enum ReleaseError {
         got: String,
     },
     #[error(
-        "release {0} is current already: the first release is the only one setup installs, use update"
+        "release {0} is current already: the first release is the only one record-release installs, use update"
     )]
     NotFirst(CommitId),
     #[error("no swap is pending, and {0} is not the current release")]

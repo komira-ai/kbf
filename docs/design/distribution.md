@@ -194,7 +194,7 @@ sections 4 and 5):
 - **Fetch identity.** With the `frontend` release source the installer fetches with the host's enrolled node
   certificate. A storage-and-daemon host holds two role pairs: `installer.toml` points at the daemon pair if
   present, else the storage pair, and `ReleaseService.Fetch` admits any enrolled role. An all-in-one host does
-  not enroll (it has no remote roles) and takes its first release from the `url` source or a release given to `setup`.
+  not enroll (it has no remote roles) and takes its first release from `record-release`.
 
 It grows from the existing `kbf-installer` and `kbf-helper` crates on `feature/pull-updates` [V]: the layout and
 verbs of the former, the root half of an update from the latter. The result is one root binary; there is no

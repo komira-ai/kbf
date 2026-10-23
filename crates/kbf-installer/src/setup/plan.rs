@@ -1,8 +1,7 @@
-//! The plan `setup` carries out, in two parts around the first release: before it the accounts,
-//! the directories, the tokens and `installer.toml` (the installer needs its settings to
-//! fetch); after it `kbf.toml` and the units. `kbf.toml` is the last file written and the
-//! units come after it, so a crash anywhere before leaves no config that passes the units'
-//! `ConditionPathExists=`.
+//! The plan `setup` carries out, in two parts around the state database's schema: before it the
+//! accounts, the directories, the tokens and `installer.toml`; after it `kbf.toml` and the
+//! units. `kbf.toml` is the last file written and the units come after it, so a crash anywhere
+//! before leaves no config that passes the units' `ConditionPathExists=`.
 //!
 //! Every step is added only where the host differs, so a second run with the same flags has
 //! an empty plan.
@@ -441,8 +440,8 @@ fn create_fetch_user(p: &mut Pl<'_, '_>, os: &dyn Os, name: &str) -> Result<(), 
     Ok(())
 }
 
-/// The part of the plan before the first release: accounts, directories, the tokens and
-/// `installer.toml`. Reads the host, changes nothing.
+/// The part of the plan before the state database's schema: accounts, directories, the tokens
+/// and `installer.toml`. Reads the host, changes nothing.
 pub fn before_release(
     os: &dyn Os,
     exec: &dyn Exec,
@@ -695,11 +694,9 @@ fn frontend_file(
     config_file(p, label, &path, existed, decision, owner, notes)
 }
 
-/// The part after the first release: `kbf.toml` (on an all-in-one host `frontend.toml` before
-/// it), then the units. `released` says whether a release is installed (or, in a dry run, would
-/// be). Reads the host, changes nothing.
-/// The part after the first release: `kbf.toml`, then the units. `released` says whether a
-/// release is installed (or, in a dry run, would be). Reads the host, changes nothing.
+/// The part after the state database's schema: `kbf.toml` (on an all-in-one host `frontend.toml`
+/// before it), then the units. `released` says whether a release is installed already: the units
+/// start only if it is. Reads the host, changes nothing.
 pub fn after_release(
     os: &dyn Os,
     exec: &dyn Exec,

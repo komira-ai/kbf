@@ -1,8 +1,8 @@
 # kbf-installer setup
 
 `kbf-installer setup` is the first configuration of a host. It makes the accounts and
-directories kbf needs, writes `installer.toml` and `kbf.toml`, installs the first release when it
-is given one, and enables the units for the host's mode. The contract is
+directories kbf needs, writes `installer.toml` and `kbf.toml`, and enables the units for the
+host's mode. It installs no release: kbf reaches a host as a package. The contract is
 [the installer design](../design/kbf-installer.md) (sections 2 and 3); this page is how the verb
 behaves in the code it describes. A host that has the old layout is not adopted by the installer: adoption = install the kbf and
 kbf-proxy packages (package-update design). A Mac has its own page,
@@ -10,11 +10,10 @@ kbf-proxy packages (package-update design). A Mac has its own page,
 
 ```text
 sudo kbf-installer setup --mode=daemon \
-    --frontend-url=https://frontend.example.invalid:8443 --token-file=/srv/kbf/enroll.token \
-    --release-source=url --release-url=https://releases.example.invalid/kbf --commit=<40 hex>   # dry run
+    --frontend-url=https://frontend.example.invalid:8443 --token-file=/srv/kbf/enroll.token   # dry run
 sudo kbf-installer --apply setup ...                                                          # do it
 
-sudo kbf-installer setup --mode=frontend --release-url=https://releases.example.invalid/kbf \
+sudo kbf-installer setup --mode=frontend \
     --database='postgres:///kbf?host=/run/postgresql&user=kbf' --create-local-database \
     --listen=192.0.2.10:8980 --worker-listen=192.0.2.10:8981 \
     --worker-tls-cert=/etc/kbf/worker.pem --worker-tls-key=/etc/kbf/worker.key \
@@ -36,10 +35,10 @@ holds a token.
 
 ## Which flags a mode takes
 
-| mode | `--frontend-url` | `--token-file` | `--database` | release source |
-|---|---|---|---|---|
-| `storage`, `daemon`, `storage-and-daemon` | required | required | refused | `frontend` (default), `url` or `bundled` |
-| `frontend`, `all-in-one` | refused | refused | required | `url` (default; `--release-url` required) or `bundled` |
+| mode | `--frontend-url` | `--token-file` | `--database` |
+|---|---|---|---|
+| `storage`, `daemon`, `storage-and-daemon` | required | required | refused |
+| `frontend`, `all-in-one` | refused | refused | required |
 
 The modes in the first row enroll with a frontend when they start, so they need its URL
 (`https://host[:port]`, nothing after it) and an enrollment token file (an absolute path, one
@@ -49,10 +48,7 @@ accepts only `--mode=daemon`.
 
 | flag | meaning |
 |---|---|
-| `--release-source url\|frontend\|bundled`, `--release-url` | where releases come from; `url` needs an `https` `--release-url`, `frontend` and `bundled` refuse one. `bundled` fetches nothing and takes no `--commit`: it writes `release_source = "bundled"`, and on a host with no release installs the one the package carries (checked by the same verify pipeline as a fetched one) between `installer.toml` and `kbf.toml`, and starts the floor on `seq` at that release's `seq`. On a host that has a release, `bundled` is refused (exit 2, before anything is written, a dry run too) unless the `kbf` that runs there declares the relay, `"relay": 1` or more in `kbf --version --json`: without it the frontend is never told that the host fetches nothing. Update `kbf` by the usual path first, then run setup again. Order of an upgrade: an installer whose reader refuses keys it does not know refuses to stage a `kbf` that prints `relay`, so the installers go first |
-| `--release-ca` | for `url`: a PEM file of the CAs the file server's certificate is checked against instead of the system's (an absolute path, a copy owned by root); written as `release_ca`, not read by a fetch yet; `setup` does not check the file's owner, so keep it root-owned in a root-owned directory |
-| `--frontend-worker-url`, `--frontend-ca`, `--frontend-ca-sha256` | for `frontend`, all three together: the frontend's worker listener (`https://host[:port]`), a copy of the CA that authenticates it and that copy's sha256; written as `frontend_url`, `frontend_ca`, `frontend_ca_sha256`, not read by a fetch yet; the CA copy must be root-owned in a root-owned directory (not checked by `setup`) |
-| `--commit` | the first release (40 hex); needs `--release-source url` |
+| `--release-source`, `--release-url`, `--release-ca`, `--frontend-worker-url`, `--frontend-ca`, `--frontend-ca-sha256`, `--commit` | retired: `setup` no longer installs a release or writes where releases come from. The flags are still taken, for one release, so a script that passes them goes on working: their values are not checked and not used, and `setup` prints one `warning: ignored: ...` line naming the ones given, ahead of its steps |
 | `--min-generation N` | the floor for orders; it only goes up, `0` is refused, and a lower value than `installer.toml` holds is refused (exit 5) |
 | `--database`, `--create-local-database` | the state database, see below |
 | `--no-start` | enable units without starting them |
@@ -154,26 +150,19 @@ not require them; a file that has them is left as it is. The other keys
 5. Frontend and all-in-one: the first operator token (32 random bytes as hex) in
    `/etc/kbf/api-token`, 0600, owned by the service user (on an all-in-one host `kbf-server`),
    only when that file is not there. The output names the file and never the secret.
-6. `/etc/kbf/installer.toml` (root, 0644): the release source, the floor, for the `frontend` source
-   the node certificate and key paths that enrollment writes (`pki/daemon.*` for `daemon` and
+6. `/etc/kbf/installer.toml` (root, 0644): the floor, for a `frontend` release source the node
+   certificate and key paths that enrollment writes (`pki/daemon.*` for `daemon` and
    `storage-and-daemon`, `pki/storage.*` for `storage`), and for the Postgres modes `database`.
-   Settings a flag does not cover are kept. The file is closed: one that does not parse is left
-   alone (exit 5). The operator's `[proxy]` table is kept.
+   The release source and the keys that go with it are not written: a file that has them (a host
+   set up by an earlier build) keeps them, and a host with no file gets `release_source =
+   "frontend"`, the default. Settings a flag does not cover are kept. The file is closed: one that
+   does not parse is left alone (exit 5). The operator's `[proxy]` table is kept.
 7. Frontend and all-in-one: the state database's schema is created or brought forward. With
    `--create-local-database` the role and the database are made first. A server that cannot be
    reached, or refuses a login, stops `setup` here (exit 1) with `installer.toml` written and no
-   release, `kbf.toml` or unit; running it again finishes.
-8. `--commit`: the first release, through the installer's fetcher (the fetch child and the verify
-   pipeline), then made `releases/current` with no trial. The fetcher is the host's own: it reads
-   `installer.toml` and `installer.conf` and looks up the fetch user when `--commit` asks, so the
-   files this run wrote count. A fetch that cannot be made (the `frontend` source, which has no
-   address or CA key in `installer.toml` yet; a missing fetch user) or that fails stops `setup`
-   here with exit 1, before `kbf.toml` and the units. The branches a release may be attested for
-   are `SOURCE_REFS` of `installer.conf` (default `refs/heads/main`); `source_refs` of
-   `installer.toml` can only narrow that list, and a list with no ref in common refuses the fetch.
-   When a release is installed already, `--commit` is not fetched and a note says so.
-9. `/etc/kbf/kbf.toml`, as above (on an all-in-one host `/etc/kbf/frontend.toml` first).
-10. The units, last. On Linux `systemctl enable`, with `--now` unless `--no-start`: the mode's unit
+   `kbf.toml` or unit; running it again finishes.
+8. `/etc/kbf/kbf.toml`, as above (on an all-in-one host `/etc/kbf/frontend.toml` first).
+9. The units, last. On Linux `systemctl enable`, with `--now` unless `--no-start`: the mode's unit
     (only when a release is installed), and `kbf-installer.service`. `kbf-frontend.service`,
     `kbf-all-in-one.service` (kept for a host of the earlier layout) and the proxy units, with
     `kbf-storage-and-daemon.service` beside them on an all-in-one host, are enabled and never started by `setup`: starting
@@ -363,9 +352,8 @@ and `kbf-installer` has no `backup` or `restore` verb.
 | code | meaning in `setup` |
 |---|---|
 | 0 | done, or a dry run that found nothing wrong |
-| 1 | failed: the database cannot be reached, `--commit` (the fetch could not be made or did not finish: a `frontend` source, no fetch user, a source that cannot be reached), a step failed, no free id for the fetch account or no subid room, an unreadable migration journal |
+| 1 | failed: the database cannot be reached, a step failed, no free id for the fetch account or no subid room, an unreadable migration journal |
 | 2 | usage or a missing prerequisite: not root (`setup writes /etc and manages services: run it with sudo`), a binary root does not own alone, bad flags, a bad token file, a missing `kbf` or `kbf-server` user, a Mac mode other than `daemon` |
-| 3 | the fetcher rejected the release: what arrived failed a check (size, digest, attestation, shape, the binary's report) |
 | 5 | only a person can go on: the old layout unmigrated, a shadowing unit, a `kbf.toml` or `installer.toml` `setup` will not overwrite, a floor that would go down, a wrong fetch account, a Mac `kbf.toml` that is not provisioned |
 
 `setup` does not take a lock, so it never exits 4.

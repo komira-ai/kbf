@@ -70,7 +70,7 @@ The four existing host-prep scripts (outside this repository), in order: **1** p
 
 | Artifact | For | Contents | Specified in |
 |---|---|---|---|
-| the `kbf-installer` package (`.deb`; rpm and apk later) | a Linux host of any mode | `kbf-installer`, the unit files (installed disabled), the trust files. **No kbf release**: `kbf-installer setup` fetches, verifies and installs the first one | distribution.md section 2; kbf-installer.md section 1 |
+| the `kbf-installer` package (`.deb`; rpm and apk later) | a Linux host of any mode | `kbf-installer`, the unit files (installed disabled), the trust files. **No kbf release**: `kbf-installer record-release` records the first one | distribution.md section 2; kbf-installer.md section 1 |
 | a signed `.pkg` under a Homebrew cask | a Mac (nodes only) | `kbf-installer`, the launchd plist, the trust files. There is no Homebrew formula for the installer: a formula cannot place a root LaunchDaemon (kbf-installer.md section 7) | distribution.md sections 2 and 7 |
 | the frontend container image | a frontend run by an orchestrator | the `kbf` binary only, entrypoint `kbf --mode=frontend` with flags; no installer, no Envoy | distribution.md section 2; 3.4 below |
 

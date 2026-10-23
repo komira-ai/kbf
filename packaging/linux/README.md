@@ -1,8 +1,8 @@
 # kbf-installer: the Linux packages
 
 `kbf-installer` is the one package of the farm. It is the root tool that installs, verifies
-and activates kbf releases; it ships no kbf runtime release (`kbf-installer setup`
-installs the first one into `/var/lib/kbf-installer/releases/<sha>/`). The contract is
+and activates kbf releases; it ships no kbf runtime release (`kbf-installer record-release`
+records the first one, placed in `/var/lib/kbf-installer/releases/<sha>/`). The contract is
 `docs/design/kbf-installer.md`, sections 3 (files and users), 7 (units and gating) and 9
 (P11). A deb and an rpm are built by [nfpm](https://nfpm.goreleaser.com), pinned in CI by
 SHA-256, from a configuration `cargo xtask pkg-config` writes: this directory holds the

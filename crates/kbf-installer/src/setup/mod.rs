@@ -4,8 +4,8 @@
 //! It validates its flags, then makes the host what they say: the fetch account (and for the
 //! modes that run actions, the `kbf` user's subid range and lingering), the installer's tree
 //! with its `orders/` directory, the enrollment token (node modes), the first operator token
-//! (frontend and all-in-one hosts, once), `installer.toml`, the first release
-//! (`--commit`), `kbf.toml` (both in `/etc/kbf`, `/usr/local/etc/kbf` on a Mac), and last the units enabled for the mode.
+//! (frontend and all-in-one hosts, once), `installer.toml`, `kbf.toml` (both in `/etc/kbf`,
+//! `/usr/local/etc/kbf` on a Mac), and last the units enabled for the mode.
 //!
 //! - It is root's: [`Os::euid`] is checked first, so only a fake that says 0 gets past it
 //!   without root. It refuses a regular file in `/etc/systemd/system` that shadows the
@@ -17,13 +17,11 @@
 //! - Idempotent: steps are planned only where the host differs. The same flags again is an
 //!   empty plan; changed flags rewrite the files atomically and never restart a running
 //!   service. An operator floor (`min_generation`) only goes up.
-//! - The first release comes through [`Releases`], the installer's one downloader (the
-//!   [`Fetcher`](crate::helper::fetcher::Fetcher); the binary's is
-//!   [`HostFetcher`](crate::helper::fetcher_host::HostFetcher), which reads `installer.toml`
-//!   when asked, so it sees the file this run wrote; a fetch that fails stops `--commit` before
-//!   `kbf.toml` with its reason). On a frontend or all-in-one host the
-//!   state database's schema is created or brought forward ([`Schemas`]) once `installer.toml`
-//!   is written, and a unit that makes a frontend is enabled and never started.
+//! - It installs no release: kbf updates are OS packages. A unit is started only where a release
+//!   is installed already (`releases/current`), and is otherwise enabled and left stopped. On a
+//!   frontend or all-in-one host the state database's schema is created or brought forward
+//!   ([`Schemas`]) once `installer.toml` is written, and a unit that makes a frontend is enabled
+//!   and never started.
 //! - `--mode=all-in-one` is always behind the proxy (`--proxy`): the host runs the proxy, its
 //!   frontend children and `kbf-storage-and-daemon.service` beside them. `kbf.toml` is the
 //!   sibling's (`mode = "storage-and-daemon"` on the loopback `--storage-port`) and
@@ -35,14 +33,11 @@
 //! - `[proxy] listen` of `installer.toml` (the operator's key) becomes the drop-in
 //!   `kbf-proxy.socket.d/listen.conf` on Linux, and no key removes the drop-in. Setup never
 //!   reloads systemd or restarts the socket: it says that is needed.
-//! - `--release-source bundled` writes `release_source = "bundled"` and fetches nothing: it
-//!   takes no `--release-url` and no `--commit`. The first release is the one the package
-//!   carries ([`backend::Releases::install_seed`]), verified as a fetched one is, and the floor on
-//!   `seq` starts at its `seq`; a host with a release already installs nothing, and is refused
-//!   unless the `kbf` that runs on it declares the relay (`kbf --version --json`), before
-//!   anything is written. The keys a source has of its own
-//!   (`--release-ca`, the frontend snapshot flags) are checked and written, never read
-//!   ([`release_keys`]); the flags decide them, so a run for another source leaves none behind.
+//! - It writes no release source and none of the keys that go with one: `installer.toml` keeps
+//!   the `release_source` and the keys a host set up by an earlier build has, and a host with no
+//!   file gets the default source. The flags that named them (`--release-source`,
+//!   `--release-url`, `--release-ca`, the frontend snapshot flags) and `--commit` are taken for
+//!   one more release and ignored, with one warning ([`retired`]).
 //! - `kbf.toml` is written after every file a unit needs, and the units after it.
 
 pub mod aio_migrate;
@@ -54,7 +49,7 @@ pub mod paths;
 pub mod plan;
 pub mod provision;
 pub mod proxy;
-pub mod release_keys;
+pub mod retired;
 pub mod validate;
 
 #[cfg(test)]
@@ -69,18 +64,14 @@ use std::path::PathBuf;
 
 use kbf_host::{Entry, Exec, HostError, HostExec, HostPath, PathError, Root, Untrusted};
 
-use self::backend::{Backend, Fetching, Postgres};
+use self::backend::{Backend, Postgres};
 use self::os::{Os, SystemOs};
 use self::validate::{Raw, Valid, mode_name};
 use crate::cli::{Mode, SetupArgs};
 use crate::database::database_step;
 use crate::exit::Exit;
-use crate::helper::fetcher::FetchError;
-use crate::helper::fetcher_host::HostFetcher;
-use crate::helper::leases;
 use crate::installer_toml::{InstallerToml, Source};
 use crate::layout::{Layout, Platform};
-use crate::release::ReleaseError;
 
 /// Why setup stopped.
 #[derive(Debug, thiserror::Error)]
@@ -107,10 +98,6 @@ pub enum SetupError {
         "{path} is a regular file and shadows the packaged unit {unit} (systemd reads /etc before /usr/lib, so enabling would keep its old flags): move it aside (mv {path} {path}.old; systemctl daemon-reload) and run setup again; setup never deletes a unit"
     )]
     ShadowUnit { path: String, unit: &'static str },
-    #[error("{0}")]
-    Fetch(#[from] FetchError),
-    #[error("{0}")]
-    Release(#[from] ReleaseError),
     #[error("database step: {0}")]
     Database(String),
     /// Only a person can go on: the reason, and what to do about it.
@@ -134,12 +121,9 @@ impl SetupError {
             | SetupError::Token(_)
             | SetupError::Unsupported(_)
             | SetupError::NoUser { .. } => Exit::Usage,
-            SetupError::Fetch(FetchError::Rejected(_) | FetchError::Order { .. }) => Exit::Refused,
             SetupError::NeedsOperator(_) | SetupError::ShadowUnit { .. } => Exit::NeedsOperator,
             SetupError::SubIdSpace(_)
             | SetupError::NoFreeId
-            | SetupError::Fetch(_)
-            | SetupError::Release(_)
             | SetupError::Database(_)
             | SetupError::Path(_)
             | SetupError::Io(_)
@@ -159,9 +143,6 @@ impl SetupError {
             SetupError::SubIdSpace(_) | SetupError::NoFreeId => "no_room",
             SetupError::NeedsOperator(_) => "needs_operator",
             SetupError::ShadowUnit { .. } => "unit_shadow",
-            SetupError::Fetch(FetchError::NotWired) => "not_implemented",
-            SetupError::Fetch(_) => "fetch",
-            SetupError::Release(_) => "release",
             SetupError::Database(_) => "database",
             SetupError::Path(_) | SetupError::Io(_) | SetupError::Host(_) => "failed",
         }
@@ -180,7 +161,9 @@ pub struct Options {
 /// The `installer.toml` this run leaves: the file that is there with the flags' settings put
 /// in, or the defaults with them. A file that is not valid is not overwritten (the operator
 /// decides), and a floor never goes down. Its `[proxy]` table is kept; on a `--proxy` host the
-/// keys the flags give are put in it ([`proxy::ProxyPlan::merge`]).
+/// keys the flags give are put in it ([`proxy::ProxyPlan::merge`]). The release source and the
+/// keys that go with it are not the flags' to set: the file's own are kept, and a host with no
+/// file gets the default source.
 pub fn installer_settings(
     exec: &dyn Exec,
     v: &Valid,
@@ -213,13 +196,9 @@ pub fn installer_settings(
         }
         settings.min_generation = floor;
     }
-    settings.source = v.source.clone();
-    // The flags decide the keys of the source: a key of a source the host no longer has is
-    // not kept, or the file would not read back.
-    settings.release_ca = v.release_ca.clone();
-    settings.frontend = v.frontend.clone();
     settings.database = v.database.clone();
-    (settings.node_cert, settings.node_key) = match (&v.source, node_role(v.mode)) {
+    // The node identity belongs to the frontend source, whichever way the file got it.
+    (settings.node_cert, settings.node_key) = match (&settings.source, node_role(v.mode)) {
         (Source::Frontend, Some(role)) => {
             let (cert, key) = paths::node_identity(platform, role);
             (Some(PathBuf::from(cert)), Some(PathBuf::from(key)))
@@ -246,12 +225,6 @@ fn node_role(mode: Mode) -> Option<&'static str> {
         Mode::Frontend | Mode::AllInOne => None,
     }
 }
-
-/// Why `bundled` is refused on a host whose running `kbf` declares no relay.
-const NO_RELAY: &str = "release_source = bundled needs the kbf that runs on this host to tell \
-                        the frontend what the package carries and that the host fetches nothing, \
-                        and the one that runs declares no relay in `kbf --version --json`: \
-                        update kbf by the usual path first, then run setup again";
 
 /// Whether a release is installed: `releases/current` is there (a link counts).
 fn released(exec: &dyn Exec, layout: &Layout) -> Result<bool, SetupError> {
@@ -314,6 +287,9 @@ pub fn run(
     if euid != 0 {
         return Err(SetupError::NotRoot { euid });
     }
+    if let Some(warning) = raw.retired.warning() {
+        writeln!(out, "{warning}")?;
+    }
     if options.apply {
         os.trusted_binary()?;
     }
@@ -337,16 +313,6 @@ pub fn run(
         earlier.check(&*exec, &ctx)?;
     }
     ctx.earlier = earlier;
-    // A host that fetches nothing is told so to the frontend by the `kbf` that runs on it, or the
-    // frontend orders it a fetch the installer can only refuse. A host with a release has such a
-    // `kbf`, and it must relay; a host with none installs the package's, which is this build's.
-    // This comes before anything is written, a dry run included.
-    if valid.source == Source::Bundled
-        && released(&*exec, &ctx.layout)?
-        && !backend.releases.running_relays()?
-    {
-        return Err(SetupError::Unsupported(NO_RELAY.to_owned()));
-    }
     if ctx.platform == Platform::Linux {
         find_shadows(&*exec, valid.mode, valid.proxy.is_some())?;
     }
@@ -368,8 +334,8 @@ pub fn run(
     let mut steps = emit(&before.plan, exec, options.apply, out)?;
     notes.extend(before.notes);
 
-    // The schema is made after `installer.toml` is in place and before anything is fetched or
-    // enabled: a database that cannot be reached stops setup with no release and no unit.
+    // The schema is made after `installer.toml` is in place and before `kbf.toml` is written or
+    // anything is enabled: a database that cannot be reached stops setup with no unit.
     if let Some(url) = &valid.database {
         let created = match &valid.local_database {
             Some(local) => provision::provision(os, exec, local, options.apply, out)?,
@@ -395,41 +361,8 @@ pub fn run(
         }
     }
 
-    let mut have_release = released(&*exec, &ctx.layout)?;
-    match (&valid.commit, have_release) {
-        (Some(commit), false) => {
-            steps += 1;
-            if options.apply {
-                writeln!(out, "+ fetch and verify release {commit}")?;
-                // It returns only once the release is installed, verified and current.
-                backend.releases.install_first(commit)?;
-                have_release = true;
-            } else {
-                writeln!(out, "DRY-RUN: fetch and verify release {commit}")?;
-                have_release = true;
-            }
-        }
-        (Some(commit), true) => notes.push(format!(
-            "a release is installed already: --commit {commit} is not fetched (setup installs the first release only; use update)"
-        )),
-        // A bundled host fetches nothing and names no commit: the first release is the one the
-        // package carries, through the same verify pipeline as a fetched one.
-        (None, false) if valid.source == Source::Bundled => {
-            steps += 1;
-            if options.apply {
-                writeln!(out, "+ install and verify the release the package carries")?;
-                backend.releases.install_seed()?;
-            } else {
-                writeln!(
-                    out,
-                    "DRY-RUN: install and verify the release the package carries"
-                )?;
-            }
-            have_release = true;
-        }
-        (None, _) => {}
-    }
-
+    // No release is installed here. The units start only where one is there already.
+    let have_release = released(&*exec, &ctx.layout)?;
     let after = plan::after_release(os, &*exec, &valid, &ctx, have_release, options.no_start)?;
     steps += emit(&after.plan, exec, options.apply, out)?;
     notes.extend(after.notes);
@@ -445,17 +378,6 @@ pub fn run(
     Ok(())
 }
 
-/// The fetcher of the first release (`--commit`): the host's own, which reads
-/// `installer_config` (else the platform's own `installer.toml`) when it is asked.
-///
-/// Its lease source is [`NotWired`](crate::helper::leases::NotWired), which is never asked:
-/// the setup fetch is `Fetcher::fetch`, a frontend update, and the verify pipeline skips the
-/// lease step for that kind (a host that has never run its unit has no cgroup to read).
-fn first_release_fetcher(layout: Layout, installer_config: Option<HostPath>) -> HostFetcher {
-    let installer_toml = installer_config.unwrap_or_else(|| layout.installer_toml());
-    HostFetcher::on_host(layout, installer_toml, || Box::new(leases::NotWired))
-}
-
 /// The verb as the binary runs it, on the host under `root`.
 pub fn cli(
     root: PathBuf,
@@ -468,33 +390,28 @@ pub fn cli(
     // `os` reads through its own copy of the host, so `run` can change the real one.
     let reader = exec.clone();
     let os = SystemOs::new(&reader, platform);
-    let raw = Raw {
+    let raw = raw_from(args);
+    let options = Options {
+        apply,
+        no_start: args.no_start,
+    };
+    let schemas = Postgres;
+    let backend = Backend { schemas: &schemas };
+    run(&os, &mut exec, &backend, &raw, options, out)
+}
+
+/// The command line's values as `run` takes them, unchecked.
+pub fn raw_from(args: &SetupArgs) -> Raw {
+    Raw {
         mode: args.mode,
         frontend_url: args.frontend_url.clone(),
         token_file: args.token_file.clone(),
-        release_source: args.release_source,
-        release_url: args.release_url.clone(),
-        release: args.release.clone(),
         min_generation: args.min_generation,
-        commit: args.commit.clone(),
+        retired: args.retired.clone(),
         database: args.database.clone(),
         kbf: args.kbf.clone(),
         proxy: args.proxy.clone(),
         create_local_database: args.create_local_database,
         installer_config: args.installer_config.as_ref().map(ToString::to_string),
-    };
-    let options = Options {
-        apply,
-        no_start: args.no_start,
-    };
-    // The first release is fetched after `installer.toml` is written and the fetch user made,
-    // both by this run, so the fetcher reads them when `--commit` asks, not now.
-    let layout = Layout::new(Root::new(&root)?, platform);
-    let fetcher = first_release_fetcher(layout.clone(), args.installer_config.clone());
-    let releases = Fetching::new(&fetcher, layout, HostExec::new(Root::new(&root)?));
-    let backend = Backend {
-        releases: &releases,
-        schemas: &Postgres,
-    };
-    run(&os, &mut exec, &backend, &raw, options, out)
+    }
 }
