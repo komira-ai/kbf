@@ -1,11 +1,12 @@
-//! `cargo xtask release`: a GitHub release of the exact files a push run of the
-//! artifacts workflow on `main` built and attested for one commit (docs/artifacts.md).
+//! `cargo xtask release`: a GitHub release of the exact files the artifacts stage of a push
+//! run of the pipeline on `main` built and attested for one commit (docs/artifacts.md).
 //! Nothing is rebuilt; `.github/workflows/release.yml` runs these verbs.
 //!
-//! - `release locate --repo <owner/repo> --commit <sha> [--output <file>] [--gh
+//! - `release locate --repo <owner/repo> --commit <sha> --run-id <id> [--output <file>] [--gh
 //!   <program>]` ([`locate`]): refuses a commit that is not on `main` (GitHub's compare
-//!   of `main...<sha>` is neither `identical` nor `behind`), then one with no successful
-//!   `push` run of `artifacts.yml` on `main` for that exact commit, then a run that no
+//!   of `main...<sha>` is neither `identical` nor `behind`), then a run that is not a
+//!   successful `push` run on `main` for that exact commit (the run id is the pipeline run
+//!   that started the release; nothing is searched for), then a run that no
 //!   longer holds every artifact a release needs ([`ARTIFACTS`]). Prints `run-id=<id>`,
 //!   and appends it to `--output` (on Actions, `GITHUB_OUTPUT`).
 //! - `release main-control --repo <owner/repo> --on-main <sha> --off-main <sha>`
@@ -22,11 +23,6 @@
 //!   commit and no other, and each tarball has exactly
 //!   one provenance bundle, `<tarball>.sigstore.json`, whose one subject is that
 //!   tarball's digest ([`bundles`]), and no bundle is there for anything else.
-//! - `release gates --repo <owner/repo> --sha <sha> --branch <name> [--timeout-s <n>]
-//!   [--poll-s <n>] [--output <file>] [--gh <program>]` ([`gates`]): waits for the push runs
-//!   of `ci`, `beta` and `artifacts` for that commit on that branch (by workflow path, the
-//!   latest run of each) and requires all three to have succeeded; a timeout is red.
-//!   Prints `ci_run=`, `beta_run=` and `artifacts_run=`, the ids `verdict-write` takes.
 //! - `release verify <dir> --repo-dir <checkout> --tag <tag> --commit <sha> [--main-ref
 //!   <ref>] [--output <file>]` ([`verify`]): the tag names that commit, which is on main.
 //!   It reads no verdict: the tag's message is an audit record that nothing gates on, and a
@@ -46,9 +42,10 @@
 //!   not reversible; the waivers; the tag's Beta record in a line), then the commits since the
 //!   previous release, the record, its escapes and what is withdrawn. Without the
 //!   identity of the previous release, when there is one, it refuses (fail closed).
-//! - `release plan --repo <owner/repo> --sha <sha> --before <sha> [--repo-dir <checkout>]
+//! - `release plan --repo <owner/repo> --sha <sha>
+//!   [--repo-dir <checkout>]
 //!   [--freeze <text>] [--output <file>] [--gh <program>]` ([`plan`]): the next version
-//!   (`VERSION` and the release tags), the push's class (code, site, pipeline), and the
+//!   (`VERSION` and the release tags), the class of what changed since the last release (code, site, pipeline), and the
 //!   refusals: a freeze, a base below an existing tag, a superseded commit ([`tags::superseded`]).
 //!   Prints `key=value` lines and appends them to `--output`.
 //! - `release fetch-previous --repo <owner/repo> --sha <sha> --platform <p> --binary <name>...
@@ -76,14 +73,13 @@
 //!   `--tag` at `--sha` through the GitHub API, create-only, after the same stale-run
 //!   guards as `publish`. A tag that already exists is reused only when it names this
 //!   commit with this message. Prints `tag=` and `created=true|false`.
-//! - `release verdict-write <dir> --commit <sha> --tag <tag> --run-id <id> --ci-run <id>
-//!   --beta-run <id> --artifacts-run <id> --out <file> [...]` ([`verdict_write`]): the
+//! - `release verdict-write <dir> --commit <sha> --tag <tag> --run-id <id> --pipeline-run <id>
+//!   --out <file> [...]` ([`verdict_write`]): the
 //!   Beta record the tag's message carries, which nothing gates on.
 
 pub mod attest_gh;
 pub mod bump;
 pub mod fetch_previous;
-pub mod gates;
 mod git;
 pub mod identity;
 mod identity_file;
@@ -111,7 +107,8 @@ use crate::version_facts::{self, Pairing};
 /// The branch a released commit must be on.
 pub const MAIN: &str = "main";
 
-/// The workflow whose push runs on `main` build and attest the assets.
+/// The workflow whose jobs, called by the pipeline on a push to `main`, build and attest the
+/// assets (the signer a deployment names).
 pub const ARTIFACTS_WORKFLOW: &str = "artifacts.yml";
 
 /// The artifacts such a run leaves, all of which a release needs: the files, the sums,
@@ -175,11 +172,13 @@ pub fn on_main(gh: &Path, repo: &str, commit: &str) -> Result<bool, Error> {
     Ok(matches!(status, Some("identical" | "behind")))
 }
 
-/// The `release locate` verb: the lines to print.
+/// The `release locate` verb: the lines to print. `run_id` is the pipeline run that built
+/// `commit` (on Actions, the id of the run the release workflow was started by).
 pub fn locate(
     gh: &Path,
     repo: &str,
     commit: &str,
+    run_id: u64,
     output: Option<&Path>,
 ) -> Result<Vec<String>, Error> {
     full_commit("--commit", commit)?;
@@ -188,25 +187,19 @@ pub fn locate(
             "{commit} is not on {MAIN}: a release is cut only from a commit on {MAIN}"
         )));
     }
-    let runs = api(
-        gh,
-        &format!(
-            "repos/{repo}/actions/workflows/{ARTIFACTS_WORKFLOW}/runs?head_sha={commit}\
-             &event=push&branch={MAIN}&status=success&per_page=100"
-        ),
-    )?;
-    let listed = runs.as_ref().and_then(|v| v["workflow_runs"].as_array());
-    let run = listed.into_iter().flatten().find(|r| {
+    let id = run_id;
+    let run = api(gh, &format!("repos/{repo}/actions/runs/{id}"))?;
+    let is_the_push_run = run.as_ref().is_some_and(|r| {
         r["head_sha"] == commit
             && r["head_branch"] == MAIN
             && r["event"] == "push"
             && r["conclusion"] == "success"
     });
-    let Some(id) = run.and_then(|r| r["id"].as_u64()) else {
+    if !is_the_push_run {
         return Err(Error::Failed(format!(
-            "no successful push run of {ARTIFACTS_WORKFLOW} on {MAIN} for {commit}"
+            "run {id} is not a successful push run on {MAIN} for {commit}"
         )));
-    };
+    }
     let artifacts = api(
         gh,
         &format!("repos/{repo}/actions/runs/{id}/artifacts?per_page=100"),
@@ -222,7 +215,7 @@ pub fn locate(
     let missing: Vec<String> = ARTIFACTS
         .iter()
         .filter(|a| !kept.contains(*a))
-        .map(|a| format!("run {id} of {ARTIFACTS_WORKFLOW} holds no unexpired artifact {a}"))
+        .map(|a| format!("run {id} holds no unexpired artifact {a}"))
         .collect();
     if !missing.is_empty() {
         return Err(Error::Refused(missing));
@@ -232,7 +225,7 @@ pub fn locate(
         append_output(output, std::slice::from_ref(&line))?;
     }
     Ok(vec![
-        format!("{commit} is on {MAIN}; run {id} of {ARTIFACTS_WORKFLOW} built it"),
+        format!("{commit} is on {MAIN}; run {id} built it"),
         line,
     ])
 }
@@ -389,7 +382,7 @@ impl Release<'_> {
     fn body(&self) -> Result<String, Error> {
         let repo = self.repo;
         let body = format!(
-            "{notes}\n## The files\n\nThe files run {id} of {ARTIFACTS_WORKFLOW} built and attested for {commit} on \
+            "{notes}\n## The files\n\nThe files run {id} of the pipeline built and attested for {commit} on \
              {MAIN} (https://github.com/{repo}/actions/runs/{id}), unchanged: a release \
              rebuilds nothing.\n\nVerify an asset before use:\n\n```text\ngh attestation \
              verify <asset> --repo {repo} --signer-workflow \

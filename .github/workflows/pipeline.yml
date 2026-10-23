@@ -1,0 +1,60 @@
+# The one pipeline of a push to main, in this order, each stage needing the one before it:
+#
+#   ci  ->  artifacts  ->  beta  ->  the release (release.yml)
+#
+# ci.yml is the pull-request gate, run again on the merged result. artifacts.yml builds, signs
+# and attests the files of the commit. beta.yml runs the full suite and installs and tests the
+# kbf of THOSE files, read from this run's artifacts (no run id, no rebuild). The release
+# (release.yml) publishes the same files; it starts from this workflow's success and from
+# nothing else (see "Cancelling" below). Each stage is a called workflow (`workflow_call`),
+# so the pull request and the merge queue keep running ci.yml and artifacts.yml as before and
+# a push to main runs each check exactly once: none of the three has a push trigger of its
+# own. A stage that is red or cancelled stops the stages after it.
+#
+# Queueing. A pipeline that has started always finishes: it is never cancelled, so a busy
+# main cannot starve it. Pushes that arrive meanwhile wait in the group, and GitHub keeps only
+# the newest waiting run (a pending run is replaced by a newer one). Nothing is lost by that:
+# `release plan` measures from the highest release tag, not from the push, so the code of a
+# push that was replaced is in the next release. A release is therefore made at least once per
+# pipeline length. The release is a separate workflow, started by the completion of this one
+# (`workflow_run`) and only when it succeeded; it has its own group that never cancels a run.
+#
+# Least privilege. A called workflow gets at most what its caller job grants. Every stage gets
+# `contents: read`; only the artifacts stage is also granted the two scopes that sign build
+# provenance (`id-token`, `attestations`), under the same exact `if:` the signing jobs of
+# artifacts.yml carry, and those jobs alone use them (the workflow lint, tests/workflows).
+name: pipeline
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+# One pipeline per ref; a running one is never cancelled, and the newest waiting push queues behind it.
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  artifacts:
+    needs: [ci]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    uses: ./.github/workflows/artifacts.yml
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+  # Installs and tests the files `artifacts` built and attested in this run.
+  beta:
+    needs: [artifacts]
+    uses: ./.github/workflows/beta.yml
+    permissions:
+      contents: read
+      attestations: read
