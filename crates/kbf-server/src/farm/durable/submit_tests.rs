@@ -370,10 +370,13 @@ fn a_farm_whose_next_id_has_a_row_takes_the_next_id() {
     assert_eq!(ids, [1, 2], "the farm's operations");
 }
 
-/// Catches: an operation another writer queued and leased that a joining farm takes up as
-/// queued (the action would run twice), or without the lease's start recorded.
+/// Asserts that a request that joins an operation another writer queued and leased on a
+/// node this farm does not own does not take the operation up, neither as queued (the action
+/// would run twice) nor with the lease (the farm would give up a lease it does not own, and
+/// delete the owner's lease row): the farm holds nothing of it, the store's rows stand, and
+/// the caller follows the operation through the store.
 #[test]
-fn a_joined_operation_keeps_its_lease() {
+fn a_joined_operation_leased_on_a_node_the_farm_does_not_own_is_followed_not_taken_up() {
     let store = LostAck::new();
     let farm = farm_over(&store);
     let other = durable_over(&store);
@@ -416,9 +419,13 @@ fn a_joined_operation_keeps_its_lease() {
     assert!(submit(&farm, 1).is_ok());
 
     let state = farm.lock();
-    assert!(state.machine.sent(kbf_types::LeaseId::new(5, 0)).is_some());
+    assert!(state.machine.sent(kbf_types::LeaseId::new(5, 0)).is_none());
     assert!(state.machine.sent(kbf_types::LeaseId::new(5, 1)).is_none());
-    assert!(!state.sched.queued().any(|op| op == OperationId(0)));
+    let held = state.sched.state(OperationId(0));
+    assert!(held.is_none(), "the farm holds it");
+    assert_eq!(state.intake.following(), 1);
+    drop(state);
+    assert_eq!((rows(&store, "lease/"), rows(&store, "queue/")), (2, 0));
 }
 
 /// Catches: a pin written over another writer's (the condition that it be absent dropped),

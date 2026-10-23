@@ -373,11 +373,12 @@ fn a_stale_complete_is_rejected() {
         keys(&store),
         [
             "done/0000000000000004",
+            "doneof/0000000000000004",
             "meta/epoch",
             "meta/next_op",
             "meta/next_seq"
         ],
-        "a finished operation leaves its result and nothing else"
+        "a finished operation leaves its result, the row naming its action, and nothing else"
     );
 }
 
@@ -430,6 +431,8 @@ fn an_operation_ends_in_one_transaction_that_puts_its_result() {
         [
             "done/0000000000000004",
             "done/0000000000000005",
+            "doneof/0000000000000004",
+            "doneof/0000000000000005",
             "meta/epoch",
             "meta/next_op",
             "meta/next_seq"
@@ -588,7 +591,14 @@ fn a_refusal_removes_the_operation_and_other_effects_write_nothing() {
         .persist(&[Effect::Refuse(refusal)], Some(&ended()))
         .expect("refused");
     assert!(durable.load().expect("load").operations.is_empty());
-    assert_eq!(keys(&store), ["done/0000000000000004", "meta/epoch"]);
+    assert_eq!(
+        keys(&store),
+        [
+            "done/0000000000000004",
+            "doneof/0000000000000004",
+            "meta/epoch"
+        ]
+    );
 }
 
 /// Catches: a loss count that is not written with the give-up that made it (a restart
@@ -851,7 +861,12 @@ fn a_result_row_is_kept_for_the_longer_of_the_retention_and_the_floor() {
     clock.advance(seconds(2));
     assert_eq!(durable.ended(short).expect("read"), None, "past the floor");
     assert_eq!(durable.ended(long).expect("read"), Some(finished.clone()));
-    assert_eq!(store.reap_expired().expect("reap"), 1, "only the short row");
+    // The short operation's `done/` row and its `doneof/` row, which has the same life.
+    assert_eq!(
+        store.reap_expired().expect("reap"),
+        2,
+        "only the short operation's rows"
+    );
     clock.advance(seconds(3600));
     assert_eq!(
         durable.ended(long).expect("read"),

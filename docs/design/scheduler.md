@@ -67,7 +67,9 @@ after its end (issue #165). While it is kept, `kbf-server` keeps its callers too
 WaitExecution on its name streams the done operation; once it is dropped the name is
 NOT_FOUND. A late input naming a dropped operation (a stale record, report or start)
 is ignored, as for any unknown one, so the scheduler holds only the unfinished
-operations and those finished within the retention.
+operations and those finished within the retention. Over a state store a name outlives
+the scheduler's copy: any server answers it from the store's `done/` row, which is kept at
+least ten minutes ([Results across frontends](#results-across-frontends)).
 
 **In-flight dedup.** Operations are keyed by `ActionKey`: the REAPI instance name and
 the action digest. A new request whose key matches an unfinished operation joins it
@@ -259,17 +261,19 @@ result for one. What the code does today:
   lease the operation holds (term and sequence, eight bytes each, big-endian). The grant
   writes it in its own transaction, and the end of the lease (a give-up, a result, a
   refusal) deletes it. A request for an action that is running on another frontend's
-  daemon joins the operation and needs its lease; it reads the operation's index row
-  and that lease's row instead of every lease row of the farm. An operation in the queue
+  daemon joins the operation and needs to know which node holds its lease (whether the
+  frontend owns the node decides what the join does, "Joining" below); it reads the
+  operation's index row and that lease's row instead of every lease row of the farm. An
+  operation in the queue
   holds no lease and is not looked up at all. A row that is missing, or names a lease that
   is not the operation's, is left by a release that predates the index, and the lookup
   then reads every lease row, as it always did.
 - **A daemon that moves.** When a daemon says `Hello` to a frontend, that frontend takes
   up the unfinished operations whose lease rows name the node and that its scheduler does
   not hold (it started before the grant, or did not run it). Besides a request that joins
-  an operation running on another frontend's daemon (above), this is the only way a
-  frontend takes up a lease it did not grant. The daemon's first heartbeat lists what it
-  runs, and a lease it lists is kept. A lease it leaves out is given up as above: at once
+  an operation leased on a node the frontend owns already ("Joining" below), this is the
+  only way a frontend takes up a lease it did not grant. The daemon's first heartbeat lists
+  what it runs, and a lease it lists is kept. A lease it leaves out is given up as above: at once
   if the daemon is the process the node's session row names (the same process moved, as a
   reconnect), and after `HANDOVER_GRACE` and `OWNER_CACHE_TTL` (47 s) from the `Hello` if
   the row names another
@@ -294,8 +298,8 @@ one a handover fenced, and one whose store cannot be read do nothing at a poll.
 
 - **A start.** A starting frontend takes up the operations that wait for a lease and none
   that holds one: the lease belongs to the frontend its node is connected to, and is taken
-  up when the node says `Hello` here (above), or by a request that joins its operation
-  (above). A lease whose node never says `Hello` again is requeued by the orphan sweep.
+  up when the node says `Hello` here (above). A lease whose node never says `Hello` again
+  is requeued by the orphan sweep.
 - **Taking in.** An operation another frontend queued (a `queue/` row the scheduler does
   not hold) is taken in with the `loss/`, `fate/`, `subject/` and size-key rows the store
   holds of it, and the ids this frontend numbers with go past it. One that holds a lease
@@ -314,6 +318,16 @@ one a handover fenced, and one whose store cannot be read do nothing at a poll.
   Callers who all cancelled are not followed. An operation the store has no trace of (its
   `done/` row outlived the retention) leaves its callers waiting and is reported as an
   untraced operation, as for a handover.
+- **Joining.** A request for an action the store holds an operation of (its `inflight/`
+  row) joins that operation. If it is queued, or holds a lease on a node this frontend owns,
+  the frontend takes it up and the request is a caller of its own scheduler. If it holds a
+  lease on a node another frontend owns, or one no frontend has heard from since the lease
+  was written, the frontend takes up nothing, the lease included: its scheduler would hold
+  a lease it does not own, expire it when the node did not register here, and delete the
+  owner's `lease/` row in the give-up. The request is shown the operation executing at once
+  and followed through the store as the callers above are, until the `done/` row is there. If
+  the node never comes back, the orphan sweep requeues the lease, the poll takes the
+  operation in as a queued one, and the joiner is followed on.
 - **A lost race.** A grant this frontend wrote that the store refuses as stale (the queue
   row is gone, or is another write) lost to another frontend. The scheduler undoes the
   placement (`Scheduler::unplace`: the booking is released and no give-up is recorded),
@@ -351,9 +365,42 @@ fence) past the last write of its session row, which was `LEASE_GRACE` before th
 look at the latest, and a compile-time check asserts that this is under `LEASE_GRACE` plus
 the wait.
 
+### Results across frontends
+
+A client that submitted through one frontend can ask any other for the result.
+
+- **Names.** A farm over a state store names an operation `operations/<id>`: its id in
+  decimal. The ids come from the blocks each frontend reserves in the store, so an id names
+  one operation on every frontend and across restarts, which the term in the older form
+  `operations/{term}-{waiter}` was there to guarantee (issue #154). Every caller of an
+  operation has the same name. A farm with no state store (tests only) numbers from 0 in every
+  process, and keeps the older form; it answers no name of the new one. A farm over a store
+  still answers a name of the older form, for a caller its process holds.
+- **Answers.** `WaitExecution` and `GetOperation` of any frontend answer a name. A frontend
+  whose scheduler holds the operation answers through the channel of its first caller there.
+  Any other answers from the store: the `op/` and `queue/` rows say it is queued or running
+  (executing, once a lease is held), and the `done/` row holds its result. The channel the
+  answer is made on is looked at again at every intake poll (`Progress`, the look
+  `Farm::follow` and the handover's `Handed::look` make for the callers of an operation they
+  did not run), until it shows the result, and is dropped when no stream or call holds it. A
+  store that cannot be read, or has no trace of the operation, answers NOT_FOUND.
+- **Whose result it is.** A call is authorized against the instance name the operation was
+  submitted under, and a `done/` row holds only the response. The transaction that finishes
+  an operation therefore puts a `doneof/<operation>` row beside the `done/` row, from the
+  request in the `op/` row it removes: the instance name and the action's digest, with the
+  same life. A result with no such row (written by an earlier release) is not found by name
+  once its `op/` row is gone.
+- **How long.** A `done/` row lasts the finished retention or `DONE_FLOOR` (600 s), whichever
+  is longer, so a client that reconnects to another frontend after the finish still gets
+  its result. After that the name is NOT_FOUND; the finish removed the operation's
+  `inflight/` row already, so the client's next `Execute` of the action is answered from the
+  action cache, or runs afresh.
+- **GetOperation.** It reads the stage the operation is at, once, from the same answer as
+  `WaitExecution`. It is the only call of the `Operations` service the server serves; the
+  others are UNIMPLEMENTED.
+
 Not done yet: a frontend still takes the writer generation at its start, so a second
-frontend over the store supersedes the first; and a caller asks for an operation by name
-only of the frontend that gave the name.
+frontend over the store supersedes the first.
 
 ### Node phases
 

@@ -214,7 +214,10 @@ long as the record is kept (3.6), after the ActionResult blob and the bytes it n
 left the CAS. Only the bytes then become `available: false`. A joined action's attempts are those of the
 operation it joined; the row stores the operation name and the attempts are copied into
 every invocation that waited on it, so each page stands alone after the operation is
-dropped.
+dropped. A farm over a state store gives every caller of an operation the operation's own
+name (`operations/<id>`), so a later Execute of an action in the same invocation that waits
+on the same operation replaces the row and takes it from the earlier call: the operation's
+end fills the row once.
 
 The record does not hold the Command (its arguments and environment can hold secrets);
 the action detail links the Action and Command blobs like any other blob.

@@ -16,7 +16,7 @@ use super::owner_tests::{grant, overwrite, remove, value_of};
 use super::transition_tests::{answer, ending, requeue, rows, subject};
 use super::*;
 
-type Inbox = mpsc::UnboundedReceiver<Result<ServerMessage, Status>>;
+pub(super) type Inbox = mpsc::UnboundedReceiver<Result<ServerMessage, Status>>;
 
 /// Queues operation `operation` through `durable`, as another frontend does.
 fn queue_on(durable: &Durable, operation: u64) {
@@ -25,7 +25,7 @@ fn queue_on(durable: &Durable, operation: u64) {
 }
 
 /// A caller of `farm` that waits for the action `tag`.
-fn caller(farm: &Farm, tag: u8) -> kbf_front::Ticket {
+pub(super) fn caller(farm: &Farm, tag: u8) -> kbf_front::Ticket {
     let submission = Submission {
         request: request(tag),
         call: None,
@@ -36,7 +36,7 @@ fn caller(farm: &Farm, tag: u8) -> kbf_front::Ticket {
 }
 
 /// Registers the daemon `name` with room for four actions, as a stream opening does.
-fn register(farm: &Farm, name: &str) -> Inbox {
+pub(super) fn register(farm: &Farm, name: &str) -> Inbox {
     let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
         .expect("caps")
         .with_drivers(["container"]);
@@ -64,7 +64,7 @@ fn starts(inbox: &mut Inbox) -> usize {
 }
 
 /// A result of `lease` the farm accepts without a cache write.
-fn invalid(lease: LeaseId) -> worker::Result {
+pub(super) fn invalid(lease: LeaseId) -> worker::Result {
     worker::Result {
         lease_id: Some(worker::LeaseId {
             term: lease.term,
@@ -82,7 +82,7 @@ fn invalid(lease: LeaseId) -> worker::Result {
     }
 }
 
-fn done_with(ticket: &kbf_front::Ticket) -> String {
+pub(super) fn done_with(ticket: &kbf_front::Ticket) -> String {
     let Stage::Done(Finished::Failed(status)) = ticket.stage.borrow().clone() else {
         panic!("the caller was not answered");
     };
@@ -160,7 +160,8 @@ async fn a_queued_operation_is_taken_in_with_the_rows_the_store_holds() {
 /// Asserts that an operation another frontend granted leaves the scheduler (nothing is
 /// recorded as given up), that its caller is shown it executing, and that the caller gets
 /// the result the other frontend recorded, kept for the finished retention like a result
-/// this frontend finished.
+/// this frontend finished, and that the name is answered from the store's result until it
+/// expires, after the callers are forgotten.
 #[tokio::test(start_paused = true)]
 async fn an_operation_another_frontend_took_leaves_the_scheduler_and_its_callers_follow() {
     let store = Racing::new();
@@ -197,7 +198,15 @@ async fn an_operation_another_frontend_took_leaves_the_scheduler_and_its_callers
     );
     tokio::time::advance(kbf_sched::FINISHED_RETENTION + Duration::from_secs(1)).await;
     farm.intake();
-    assert!(farm.wait(&name).is_none(), "the callers were kept for ever");
+    assert_eq!(
+        farm.lock().machine.waiter_ids().count(),
+        0,
+        "the callers were kept for ever"
+    );
+    // The name is answered from the store's result until that goes, long after the callers.
+    assert!(farm.wait(&name).is_some(), "the stored result is gone");
+    store.advance(DONE_FLOOR + Duration::from_secs(1));
+    assert!(farm.wait(&name).is_none(), "the result was kept for ever");
 }
 
 /// Asserts that a look at the store that fails shows the callers of an operation another

@@ -235,7 +235,10 @@ pub trait Dispatch: Send + Sync + 'static {
     fn submit(&self, submission: Submission) -> Result<Ticket, Status>;
 
     /// A new ticket on the operation called `name`, if it is unfinished or finished
-    /// within the dispatcher's retention (its ticket's stage is then already done).
+    /// within the dispatcher's retention (its ticket's stage is then already done). A
+    /// dispatcher over a state store shared by several frontends answers a name any of them
+    /// gave: a finished operation is kept as long as the store keeps its result. Also what
+    /// GetOperation reads the stage of.
     fn wait(&self, name: &str) -> Option<Ticket>;
 }
 

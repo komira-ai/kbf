@@ -14,7 +14,7 @@ use kbf_types::{Answer, Digest, FarmTime, OperationId, StateMachine as _, Waiter
 use tokio::sync::watch;
 use tonic::Status;
 
-use super::durable::{Durable, Progress, StateError, StoredCordon};
+use super::durable::{Durable, Held, Progress, StateError, StoredCordon};
 use super::{Farm, NodeAction, State};
 
 /// How many looks in a row at the state store may find an operation neither unfinished
@@ -159,7 +159,8 @@ impl Farm {
             .count()
     }
 
-    /// Answers, from the state store, the callers this fenced farm still holds: an
+    /// Answers, from the state store, the callers this fenced farm still holds, and the
+    /// clients that asked it for an operation by name ([`State::follow_watched`]): an
     /// operation the successor finished gets its result from the `done/` row, one it has
     /// leased is shown executing. A caller waits until its operation finishes, it cancels
     /// (its stream is dropped), or this process is killed: no look count or timer ends
@@ -228,7 +229,8 @@ impl State {
     }
 
     /// Writes `request`, about to be queued, to the state store (see
-    /// [`State::queue`]), unless the farm is fenced.
+    /// [`State::queue`]), unless the farm is fenced, and says where it is held. `now` is
+    /// farm time.
     ///
     /// # Errors
     /// UNAVAILABLE if the farm is fenced or the store did not take it.
@@ -237,11 +239,12 @@ impl State {
         request: &kbf_sched::Request,
         subject: &crate::action_usage::Subject,
         size_key: Option<u64>,
-    ) -> Result<(), Status> {
+        now: FarmTime,
+    ) -> Result<Held, Status> {
         if self.fenced {
             return Err(Status::unavailable(HANDING_OVER));
         }
-        self.queue(request, subject, size_key)
+        self.queue(request, subject, size_key, now)
     }
 
     /// The callers of `operation` still waiting: not answered, and with a stream open
@@ -289,6 +292,9 @@ impl State {
                 }
             }
         }
+        // The operations clients ask for by name that this farm does not hold are looked at
+        // too: a fenced farm takes no intake poll, and answers them from here.
+        self.follow_watched();
         Ok(waiting)
     }
 
@@ -338,7 +344,7 @@ pub(super) fn cordon_event(
 impl Progress {
     /// What the callers of an operation at this point are shown: `None` leaves them as
     /// they are (queued, or no trace: they wait).
-    fn stage(&self) -> Option<Stage> {
+    pub(super) fn stage(&self) -> Option<Stage> {
         match self {
             Self::Ended(finished) => Some(Stage::Done(finished.clone())),
             Self::Running => Some(Stage::Executing),

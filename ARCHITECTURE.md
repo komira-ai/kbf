@@ -270,14 +270,25 @@ client                      kbf-server                               kbf-daemon
 7. **Answer.** An accepted successful result (exit code 0, not `do_not_cache`) is
    written to the action cache *before* the callers are answered.
 
-`WaitExecution` streams the same stages for an operation name that Execute returned.
-A finished operation is kept for `--finished-retention-secs` (60 by default), in which
-WaitExecution streams its done operation, so a client whose Execute stream broke still
-gets a result the action cache does not keep; then it is forgotten, and the next
-Execute for it is answered from the action cache. An operation name is `operations/{term}-{n}`: the server process's term
-(the one its leases carry) and a count that starts at 0 in each process. A name from
-an earlier process, or any other name, is `NOT_FOUND`, so a client still holding one
-after a restart is never attached to another action's operation.
+`WaitExecution` streams the same stages for an operation name that Execute returned, and
+`GetOperation` reads the stage the name's operation is at, once. A finished operation is
+kept for `--finished-retention-secs` (60 by default), in which WaitExecution streams its
+done operation, so a client whose Execute stream broke still gets a result the action
+cache does not keep; then it is forgotten, and the next Execute for it is answered from
+the action cache.
+
+Over a state store, an operation name is `operations/<id>`:
+the operation's id, which the store numbers (each server reserves blocks of ids, so an id
+names one operation on every server of the store and across restarts). Any server answers
+the name: from its scheduler if it holds the operation, otherwise from the store's rows,
+and a result stays in the store for at least ten minutes (`DONE_FLOOR`, or the finished
+retention if that is longer), so a client that reconnects to another server after the finish still
+gets it. After that, or for a name nobody gave, the answer is `NOT_FOUND`. A server with no
+state store (tests only) names an operation `operations/{term}-{n}`: its process's term
+(the one its leases carry) and a count that starts at 0 in each process, and answers no
+other name, so a client still holding a name from an earlier process is never attached to
+another action's operation. A name of that form is answered over a store only by the
+process that issued it, while it holds the caller.
 
 See [scheduler.md](docs/design/scheduler.md) and
 [worker-protocol.md](docs/design/worker-protocol.md).

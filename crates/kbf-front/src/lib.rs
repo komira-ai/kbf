@@ -3,8 +3,9 @@
 //!
 //! The cache half: `Capabilities`, `ContentAddressableStorage`, `ByteStream` and
 //! `ActionCache`, served by [`routes`] over one [`Cache`]. The execution half adds
-//! `Execution` over a [`Dispatch`], the scheduler's seam ([`routes_with_execution`]). The cache keeps its
-//! index and action cache in a [`MetaLog`] and its bytes in a
+//! `Execution` over a [`Dispatch`], the scheduler's seam ([`routes_with_execution`]), and
+//! `Operations`, of which only GetOperation is served ([`OperationsService`]). The cache
+//! keeps its index and action cache in a [`MetaLog`] and its bytes in a
 //! [`kbf_objstore::ObjectStore`], packed into `kbf-segments` segments. Both are traits:
 //! [`Cache::memory`] runs them in this process ([`MemoryMetaLog`] and the fake store),
 //! and `kbf-server`'s Raft log and the S3 store slot in behind the same traits.
@@ -68,6 +69,7 @@ mod input_tree;
 mod input_walk;
 mod meta_log;
 pub mod metrics;
+mod operations;
 mod proxy;
 mod recorder;
 mod relay;
@@ -82,6 +84,7 @@ use std::sync::Arc;
 use kbf_auth::Authorizers;
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
+use kbf_proto::google::longrunning::operations_server::OperationsServer;
 use kbf_proto::reapi::action_cache_server::ActionCacheServer;
 use kbf_proto::reapi::capabilities_server::CapabilitiesServer;
 use kbf_proto::reapi::content_addressable_storage_server::ContentAddressableStorageServer;
@@ -120,6 +123,7 @@ pub use crate::execution::{
 };
 pub use crate::input_tree::{ENTRY_OVERHEAD, InputTreeConfig};
 pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
+pub use crate::operations::OperationsService;
 pub use crate::proxy::{Direction, Meter, Method, Owner, Owners, Proxy};
 pub use crate::recorder::{
     ActionLabel, DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording,
@@ -277,6 +281,7 @@ where
     O: ObjectStore + 'static,
     D: Dispatch,
 {
+    let operations = OperationsService::new(Arc::clone(&dispatch), Arc::clone(&authorizers));
     let execution = ExecutionServer::new(
         ExecutionService::with_authorizers(
             Arc::clone(&cache),
@@ -292,7 +297,9 @@ where
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let capabilities = CapabilitiesService::new(true, Arc::clone(&authorizers));
-    cache_routes(cache, capabilities, &authorizers, recorder).add_service(execution)
+    cache_routes(cache, capabilities, &authorizers, recorder)
+        .add_service(execution)
+        .add_service(OperationsServer::new(operations))
 }
 
 /// What keeps open Execute streams going: the drain that ends them and the tick that
@@ -396,6 +403,7 @@ where
     E: kbf_proto::reapi::execution_server::Execution,
 {
     let OpenStreams { closing, progress } = streams;
+    let operations = OperationsService::new(Arc::clone(&dispatch), Arc::clone(&authorizers));
     let service = ExecutionService::with_authorizers(
         backend,
         dispatch,
@@ -414,6 +422,7 @@ where
         .routes()
         .add_service(CapabilitiesServer::new(capabilities))
         .add_service(execution)
+        .add_service(OperationsServer::new(operations))
 }
 
 fn cache_routes<M, O>(

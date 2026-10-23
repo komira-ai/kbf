@@ -15,7 +15,10 @@
 //! operation until the daemon's heartbeat omits the lease, and one naming another action is
 //! a MISMATCH; an id no row holds is UNKNOWN_LEASE.
 //! Operations die with it too, so the term is part of every operation name (issue
-//! #154). The term, and the lease epoch `Welcome` names, come from the metadata log
+//! #154). A farm over a state store names its operations by their ids instead,
+//! `operations/<id>`: the ids are the store's, so a name means one operation on every
+//! frontend of the store and across restarts, and any frontend answers it (`named`
+//! module). The term, and the lease epoch `Welcome` names, come from the metadata log
 //! ([`MetaLog::leadership`]):
 //!
 //! - Under the in-memory metadata log (tests only) the log is this process's, so the term is a new
@@ -68,6 +71,7 @@ mod beat;
 mod durable;
 mod handover;
 mod learning;
+mod named;
 mod nodes;
 mod phase;
 mod record;
@@ -81,13 +85,13 @@ pub use handover::UNTRACED_LOOKS;
 pub use phase::Reported;
 
 use self::ack::{Verdict, refusal};
-use self::durable::Durable;
 use self::durable::intake::Intake;
+use self::durable::{Durable, Held};
 use crate::action_usage::{self, Measured, Shapes};
 use crate::fault;
 use crate::fleet::{NodeView, SoftwareView, attention_changes};
 use crate::learned::{Learned, LearnedSizes};
-use crate::machine::{FarmMachine, Platform, Sent, Waiter};
+use crate::machine::{FarmMachine, Platform, Sent, Waiter, parse_stored_name, stored_name};
 use crate::memory;
 use crate::missing;
 use crate::run_record;
@@ -336,6 +340,10 @@ struct State {
     /// What the intake poll keeps between two looks at the state store
     /// ([`Farm::intake`]).
     intake: Intake,
+    /// The channel of each operation clients ask for by name that the scheduler does not
+    /// hold, shown what the state store says of it at each intake poll while a ticket holds
+    /// the channel ([`State::follow_watched`]).
+    watched: BTreeMap<OperationId, watch::Sender<Stage>>,
 }
 
 /// How many committed records the farm holds for a state store that refuses them.
@@ -440,6 +448,7 @@ impl Farm {
                 learned: Learned::new(LearnedSizes::Off, 0, 0),
                 unwritten_floors: Vec::new(),
                 intake: Intake::default(),
+                watched: BTreeMap::new(),
             }),
         }
     }
@@ -1081,8 +1090,17 @@ impl Dispatch for Farm {
                 .key()
             })
             .flatten();
-        state.admit(&submission.request, &usage, size_key)?;
-        let joined = state.sched.twin(&submission.request).is_some();
+        let held = state.admit(&submission.request, &usage, size_key, now)?;
+        // The operation this submit queues or joins: the twin the scheduler holds, the one
+        // another frontend leases (which the scheduler does not hold), or the next it numbers.
+        let twin = state.sched.twin(&submission.request);
+        let (operation, joined) = match held {
+            Held::Elsewhere(operation) => (operation, true),
+            Held::Here => (
+                twin.unwrap_or_else(|| state.sched.next_operation()),
+                twin.is_some(),
+            ),
+        };
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
         let waiter = state.machine.submit(Waiter {
@@ -1093,8 +1111,9 @@ impl Dispatch for Farm {
             usage,
             platform,
         });
-        let name = state.machine.name(waiter);
+        let name = state.name_of(waiter, operation);
         state.learn_submit(
+            waiter,
             &name,
             &submission.request,
             &submission.evidence,
@@ -1103,7 +1122,7 @@ impl Dispatch for Farm {
         );
         if let Some((call, shape)) = submission.call.take().zip(shape) {
             let call = call.with_shape(shape).with_evidence(submission.evidence);
-            state.record_submit(call, &name, &submission.request);
+            state.record_submit(call, &name, operation, joined);
         }
         let (stage, receiver) = watch::channel(Stage::Queued);
         state.stages.insert(waiter, stage);
@@ -1113,21 +1132,28 @@ impl Dispatch for Farm {
             let next = state.sched.next_operation();
             state.sched.set_size_key(next, key);
         }
-        state.feed_quiet(
-            now,
-            Event::Submit {
-                waiter,
-                request: submission.request,
-            },
-        );
-        // A caller that joined a twin already started sees it executing.
+        match held {
+            Held::Here => state.feed_quiet(
+                now,
+                Event::Submit {
+                    waiter,
+                    request: submission.request,
+                },
+            ),
+            // The operation is another frontend's: this scheduler never holds it, and the
+            // caller is shown what the store says of it at the intake polls.
+            Held::Elsewhere(_) => state.keep_following(operation, vec![waiter]),
+        }
+        // A caller that joined a twin already started sees it executing, and so does one
+        // that follows an operation another frontend's daemon runs.
         let joined_started = state.machine.started_operations().any(|operation| {
             state
                 .sched
                 .waiters(operation)
                 .is_some_and(|w| w.contains(&waiter))
         });
-        if let Some(stage) = state.stages.get(&waiter).filter(|_| joined_started) {
+        let running = joined_started || matches!(held, Held::Elsewhere(_));
+        if let Some(stage) = state.stages.get(&waiter).filter(|_| running) {
             stage.send_replace(Stage::Executing);
         }
         self.publish(&state);
@@ -1139,8 +1165,15 @@ impl Dispatch for Farm {
         })
     }
 
+    /// A name `operations/<id>` is answered by any frontend of the state store, from the
+    /// scheduler if it holds the operation and from the store if not
+    /// ([`State::stored_ticket`]); a farm with no store answers none. A name of the old form,
+    /// `operations/{term}-{waiter}`, is answered only for a caller this process holds.
     fn wait(&self, name: &str) -> Option<Ticket> {
-        let state = self.lock();
+        let mut state = self.lock();
+        if let Some(operation) = parse_stored_name(name) {
+            return state.stored_ticket(operation);
+        }
         let (id, waiter) = state.machine.named(name)?;
         let stage = state.stages.get(&id)?;
         Some(Ticket {
@@ -1438,11 +1471,25 @@ impl State {
         );
     }
 
-    /// The REAPI name of `operation`, its first waiter's, as the log names it; empty
-    /// for an operation without one.
+    /// The REAPI name of `operation`, as the log names it: `operations/<id>` in a farm over
+    /// a state store; in a farm with none, its first waiter's, or empty for an operation
+    /// without one.
     fn operation_name(&self, operation: OperationId) -> String {
+        if self.durable.is_some() {
+            return stored_name(operation);
+        }
         self.first_waiter(operation)
             .map_or_else(String::new, |(id, _)| self.machine.name(id))
+    }
+
+    /// The REAPI name the caller `waiter` of `operation` is given: the operation's own
+    /// (`operations/<id>`, which any frontend of the store answers) in a farm over a state
+    /// store, and in a farm with none the caller's in this process's term.
+    fn name_of(&self, waiter: WaiterId, operation: OperationId) -> String {
+        if self.durable.is_some() {
+            return stored_name(operation);
+        }
+        self.machine.name(waiter)
     }
 
     /// The first waiter of `operation`: its key and lease kind are the operation's.

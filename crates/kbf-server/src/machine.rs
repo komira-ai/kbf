@@ -31,13 +31,37 @@ use crate::fleet::SoftwareView;
 use crate::stamp::Stamp;
 use crate::update_status::UpdateReport;
 
+/// The REAPI name of operation `operation` in a farm over a state store:
+/// `operations/<operation>`, the id in decimal.
+///
+/// A farm over a state store numbers its operations from blocks it reserves in the store,
+/// so an id names one operation across frontends and restarts, and no term is needed to
+/// keep the name from naming two (issue #154). Any frontend of the store can answer a
+/// call for the name from the store's rows. A farm with no state store numbers from 0 in
+/// every process and names its operations by [`FarmMachine::name`] instead.
+#[must_use]
+pub fn stored_name(operation: OperationId) -> String {
+    format!("operations/{}", operation.0)
+}
+
+/// The operation a name of the form [`stored_name`] writes names: `None` for any other
+/// spelling, a name of the form [`FarmMachine::name`] writes (it has a `-`) and a cached
+/// result's name (`operations/cached/...`) among them, and for a spelling [`stored_name`]
+/// does not write (signs, leading zeros, white space).
+#[must_use]
+pub fn parse_stored_name(name: &str) -> Option<OperationId> {
+    canonical_u64(name.strip_prefix("operations/")?).map(OperationId)
+}
+
 /// The REAPI name of the operation `waiter` waits on, in the process of `term`:
 /// `operations/{term}-{waiter}`.
 ///
 /// Waiter ids count from 0 in every process, so the term is what keeps a name from
 /// naming two operations: without it, a client's `WaitExecution` with a name from the
 /// process before a restart attaches to whichever operation of the new process got
-/// the same number, and hands it that action's result (issue #154).
+/// the same number, and hands it that action's result (issue #154). A farm over a state
+/// store names its operations by [`stored_name`] instead, and answers a name of this form
+/// only for a caller it holds.
 fn operation_name(term: u64, waiter: WaiterId) -> String {
     format!("operations/{term}-{}", waiter.0)
 }
@@ -660,5 +684,48 @@ mod tests {
             assert_eq!(parse_operation_name(refused, 7), None, "{refused:?}");
         }
         assert_eq!(parse_operation_name("operations/7-0", 7), Some(WaiterId(0)));
+    }
+
+    /// Asserts that a stored name is the operation id in decimal, that it parses back to
+    /// the id, and that no other spelling parses: not a name of the form with a term (which
+    /// would name two operations), not a cached result's name, not a signed, padded or
+    /// overlong number.
+    #[test]
+    fn a_stored_name_is_the_operation_id_and_no_other_spelling_parses() {
+        for n in [0, 1, 42, u64::MAX] {
+            let name = stored_name(OperationId(n));
+            assert_eq!(name, format!("operations/{n}"));
+            assert_eq!(parse_stored_name(&name), Some(OperationId(n)), "{name}");
+        }
+        for refused in [
+            "",
+            "operations/",
+            "operations",
+            "operations/-1",
+            "operations/+7",
+            "operations/07",
+            "operations/7 ",
+            " operations/7",
+            "operations/18446744073709551616",
+            "Operations/7",
+            "operation/7",
+            "operations/7-3",
+            "operations/cached/7",
+            "operations/cached/ab-3",
+            "7",
+        ] {
+            assert_eq!(parse_stored_name(refused), None, "{refused:?}");
+        }
+    }
+
+    /// Asserts that a name of the form a machine with a term writes is not a stored name,
+    /// and a stored name is not found as a kept caller of a machine: the two forms never
+    /// name each other's operations.
+    #[test]
+    fn the_two_name_forms_never_name_each_other() {
+        let mut m = FarmMachine::new(TERM);
+        let id = m.submit(waiter(1));
+        assert_eq!(parse_stored_name(&m.name(id)), None);
+        assert_eq!(m.named(&stored_name(OperationId(0))), None);
     }
 }

@@ -33,6 +33,10 @@
 //! A write the store applied and did not acknowledge is tried again, and finds its own work
 //! in the rows: the lease row of the grant, no lease row to give up, the result.
 //!
+//! A result and a refusal also put the `doneof/` row of the operation beside its `done/` row,
+//! from the request its `op/` row holds (the `named` module), so the transaction that
+//! removes the operation's rows leaves the instance and action a client can ask for it by.
+//!
 //! A grant, a lease given up and a result that finds its lease row also check the `owner/`
 //! row of the lease's node (the `owner` module): the transaction fails, whatever else it
 //! read, if the daemon has said `Hello` to another frontend since this one did. The grant
@@ -277,6 +281,7 @@ impl Durable {
         let txn = self.guard(Txn::new(), &worker)?;
         let txn = txn.delete(key.clone(), Cond::Version(row.version));
         let txn = self.unpin(txn, operation)?;
+        let txn = self.noting(txn, operation, ending)?;
         let committed = self.commit_owned(&worker, ending.settle(txn, operation));
         if matches!(committed, Err(StateError::Conflict(_))) && self.store.get(&key)?.is_none() {
             return self.end_queued(operation, ending, &key, |_| true);
@@ -321,6 +326,7 @@ impl Durable {
                 .delete(queue, Cond::Version(queued.version))
                 .delete(op, Cond::Version(unfinished.version));
             let txn = self.unpin(txn, operation)?;
+            let txn = self.noting(txn, operation, ending)?;
             let committed = self.commit(ending.settle_rest(txn, operation, Cond::Absent));
             if !matches!(committed, Err(StateError::Conflict(_))) {
                 return committed;

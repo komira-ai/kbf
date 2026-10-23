@@ -142,6 +142,12 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
             "farm/durable (read by the old child's follower)",
             "done/0000000000000001",
         ),
+        // The action a result is of, beside its `done/` row (`farm/durable/named.rs`).
+        fenced(
+            Keys::Under("doneof/"),
+            "farm/durable/named",
+            "doneof/0000000000000001",
+        ),
         fenced(Keys::Under("cordon/"), "farm/durable", "cordon/node-a"),
         fenced(
             Keys::Under("lease/"),
