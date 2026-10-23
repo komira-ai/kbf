@@ -49,6 +49,9 @@ impl Default for MemoryPolicy {
     }
 }
 
+/// The default of [`NativeConfig::term_grace`]: two seconds.
+pub const DEFAULT_TERM_GRACE: Duration = Duration::from_secs(2);
+
 /// Where and how the native driver runs actions.
 #[derive(Clone, Debug)]
 pub struct NativeConfig {
@@ -68,6 +71,14 @@ pub struct NativeConfig {
     /// How long ending an action's processes may take before the survivors fail the
     /// lease.
     pub kill_wait: Duration,
+    /// How long the processes of an action, and of a slot being cleaned, are given to
+    /// end after SIGTERM before they are killed; zero kills at once
+    /// ([`crate::grace`]). Extra to `kill_wait`, which bounds the kill that follows, and
+    /// outside the action's timeout and the memory watch, which have ended the action
+    /// before it starts and do not run during it; at most [`crate::grace::MAX_GRACE`]
+    /// (60 s). A lease past its memory limit gets none. A slot's clean gives at most its
+    /// own time limit. Applies on every platform.
+    pub term_grace: Duration,
     /// How long a lease's new simulator may take to be listed by Xcode, and how often
     /// the driver looks, before the action runs ([`crate::simulator`]).
     pub simulator_listing: Listing,
@@ -122,7 +133,7 @@ pub struct NativeConfig {
 
 impl NativeConfig {
     /// A configuration with a one hour default timeout, the default output limits,
-    /// upload deadline ([`kbf_daemon::UPLOAD_DEADLINE`]) and memory policy, a 250 ms poll, a 5 s kill wait, [`Listing::DEFAULT`], `simctl` given [`crate::simulator::ANSWER_WITHIN`], this node's isolation and user
+    /// upload deadline ([`kbf_daemon::UPLOAD_DEADLINE`]) and memory policy, a 250 ms poll, a 5 s kill wait after a 2 s SIGTERM grace, [`Listing::DEFAULT`], `simctl` given [`crate::simulator::ANSWER_WITHIN`], this node's isolation and user
     /// folders, leftovers swept after [`LEFTOVER_AGE`], no Xcode (see [`Self::xcodes`]),
     /// the system `xcrun`, no lease-user pool and no input cache.
     #[must_use]
@@ -135,6 +146,7 @@ impl NativeConfig {
             memory: MemoryPolicy::DEFAULT,
             poll: Duration::from_millis(250),
             kill_wait: Duration::from_secs(5),
+            term_grace: DEFAULT_TERM_GRACE,
             simulator_listing: Listing::DEFAULT,
             simulator_answer: crate::simulator::ANSWER_WITHIN,
             simulator_retry: crate::simulator::RETRY_AFTER,

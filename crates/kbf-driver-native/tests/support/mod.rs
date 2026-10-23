@@ -34,6 +34,11 @@ use prost::Message;
 /// How long a test waits for something that should happen promptly.
 pub const PROMPT: Duration = Duration::from_secs(10);
 
+/// What a run may take on top of its bound for the SIGTERM grace its end gives the
+/// processes (the default, two seconds), and for the clean of a slot, which gives the
+/// same grace again.
+const GRACE_ALLOWANCE: Duration = Duration::from_secs(10);
+
 /// A CAS in memory; `delay` holds every `get` back (to kill a lease mid-fetch).
 #[derive(Debug, Default)]
 pub struct MemoryCas {
@@ -325,9 +330,12 @@ pub async fn run(
     spec: &Spec,
 ) -> Result<ActionResult, RuntimeError> {
     let action = spec.store(cas);
-    tokio::time::timeout(PROMPT * 3, runtime.run(work(seq, action, 0)))
-        .await
-        .expect("the run ends")
+    tokio::time::timeout(
+        PROMPT * 3 + GRACE_ALLOWANCE,
+        runtime.run(work(seq, action, 0)),
+    )
+    .await
+    .expect("the run ends")
 }
 
 pub fn stdout(cas: &MemoryCas, result: &ActionResult) -> String {
