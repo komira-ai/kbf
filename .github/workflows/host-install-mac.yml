@@ -85,11 +85,11 @@ jobs:
           run gh release view v2.50.0 -R cli/cli --json assets
           run gh api -X GET repos/cli/cli/releases/tags/v2.50.0 --jq .id
           run gh repo view cli/cli
-          T=$(ls "$RUNNER_TEMP"/art/kbf-????????????????????????????????????????-darwin-arm64.tar.gz | head -1)
+          T=$(ls "$RUNNER_TEMP"/art/assets-darwin-arm64/kbf-????????????????????????????????????????-darwin-arm64.tar.gz | head -1)
           C=$(basename "$T" | sed 's/^kbf-//; s/-darwin-arm64.tar.gz$//')
           echo "tarball $T commit $C"
           for P in http://127.0.0.1:9; do
-            run env HTTPS_PROXY=$P https_proxy=$P HTTP_PROXY=$P http_proxy=$P ALL_PROXY=$P all_proxy=$P gh attestation verify "$T" --bundle "$T.sigstore.json" --custom-trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --repo komira-ai/kbf --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml --cert-oidc-issuer https://token.actions.githubusercontent.com --source-ref refs/heads/main --source-digest "$C" --predicate-type https://slsa.dev/provenance/v1 --digest-alg sha256 --deny-self-hosted-runners
+            run env HTTPS_PROXY=$P https_proxy=$P HTTP_PROXY=$P http_proxy=$P ALL_PROXY=$P all_proxy=$P gh attestation verify "$T" --bundle "$RUNNER_TEMP/art/bundles-darwin-arm64/$(basename "$T").sigstore.json" --custom-trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --repo komira-ai/kbf --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml --cert-oidc-issuer https://token.actions.githubusercontent.com --source-ref refs/heads/main --source-digest "$C" --predicate-type https://slsa.dev/provenance/v1 --digest-alg sha256 --deny-self-hosted-runners
           done
           echo "--- with a token, the listing"
           GH_TOKEN="${{ github.token }}" gh api 'repos/komira-ai/kbf/releases?per_page=2' | head -c 300
