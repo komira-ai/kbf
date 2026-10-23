@@ -1,10 +1,9 @@
 //! The `update/*` rows over a store that races or answers wrongly: a writer that wins between
-//! a reader's look and its write (the compare-and-set loops of `offer`, `set_paused`, `claim`
-//! and `release` read again, and give up when the writers do not stop), and a store that
-//! returns no value for a counter it advanced.
+//! a reader's look and its write (the compare-and-set loops of `offer` and `set_paused` read
+//! again, and give up when the writers do not stop), and a store that returns no value for a
+//! counter it advanced.
 //!
-//! Each test names the defect it would catch. The mutants that were planted to see each
-//! group go red are listed in the pull request.
+//! Each test names the defect it would catch.
 
 #[path = "update_support/mod.rs"]
 mod support;
@@ -12,16 +11,26 @@ mod support;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use kbf_server::update::{Desired, OrderId, Policy, Release, RowError, Rows, SlotClass};
-use kbf_state::{StoreError, Txn};
+use kbf_server::update::{Desired, Policy, Release, RowError, Rows};
+use kbf_state::{Cond, Store, StoreError, Txn};
 use support::harness::{Backing, Cell};
 use support::stores::{Meddle, writes};
-use support::{id, t};
+use support::t;
 
 const BACKINGS: [Backing; 2] = [Backing::Fake, Backing::Sqlite];
 
 /// A rival that is called more often than this means the loop under test never gave up.
 const NEVER_GAVE_UP: u64 = 500;
+
+/// The policy row an operator's older build wrote: `auto_nodes` and a capacity floor of
+/// `floor` (under 128, one byte), replacing the row whole.
+fn operator_writes(store: &Arc<dyn Store>, floor: u8) {
+    let row = vec![0x08, 0x01, 0x20, floor];
+    store
+        .txn(Txn::new().put("update/policy", row, Cond::Any))
+        .expect("the operator's write")
+        .expect("no condition");
+}
 
 /// Whether `error` is the store's own failure and its text names `what`.
 fn store_says(error: &RowError, what: &str) -> bool {
@@ -127,13 +136,7 @@ fn a_pause_that_loses_a_race_reads_again_and_keeps_the_winners_policy() {
             let (inner, calls) = (Arc::clone(&inner), Arc::clone(&calls));
             move |txn: &Txn| {
                 if writes(txn, "update/policy") && count(&calls) == 0 {
-                    let operator = Policy {
-                        min_serving: 3,
-                        ..Policy::default()
-                    };
-                    Rows::new(Arc::clone(&inner))
-                        .set_policy(&operator)
-                        .expect("the operator's policy");
+                    operator_writes(&inner, 3);
                 }
             }
         };
@@ -163,13 +166,7 @@ fn a_pause_that_keeps_losing_gives_up_and_the_run_is_not_paused() {
             move |txn: &Txn| {
                 if writes(txn, "update/policy") {
                     let n = count(&calls);
-                    let operator = Policy {
-                        min_serving: usize::try_from(n + 1).unwrap(),
-                        ..Policy::default()
-                    };
-                    Rows::new(Arc::clone(&inner))
-                        .set_policy(&operator)
-                        .expect("the operator's policy");
+                    operator_writes(&inner, u8::try_from(n + 1).unwrap());
                 }
             }
         };
@@ -181,144 +178,14 @@ fn a_pause_that_keeps_losing_gives_up_and_the_run_is_not_paused() {
     }
 }
 
-/// Catches: a claim that gives up, or claims a place it does not hold, when other claims
-/// keep landing between its read and its write. Another host claims a place before every
-/// write of the slot row: the claim reads again each time, gives up as contended, and the
-/// host holds no place.
-#[test]
-fn a_claim_that_keeps_losing_gives_up_and_holds_no_place() {
-    for backing in BACKINGS {
-        let cell = Cell::new(backing, "claim-contended");
-        let inner = cell.store();
-        let calls = Arc::new(AtomicU64::new(0));
-        let hook = {
-            let (inner, calls) = (Arc::clone(&inner), Arc::clone(&calls));
-            move |txn: &Txn| {
-                if writes(txn, "update/slot") {
-                    let n = count(&calls);
-                    let rival = id(&format!("r{n}"));
-                    Rows::new(Arc::clone(&inner))
-                        .claim(SlotClass::Host, &rival, OrderId::new(1, n + 1), 1_000)
-                        .expect("a rival's claim");
-                }
-            }
-        };
-        let rows = Rows::new(Meddle::before_each(Arc::clone(&inner), hook));
-        let mine = OrderId::new(1, 9_999);
-        let error = rows
-            .claim(SlotClass::Host, &id("me"), mine, 1_000)
-            .unwrap_err();
-        assert_eq!(error, RowError::Contended("update/slot"), "{backing:?}");
-        let slot = Rows::new(inner).slot().unwrap().value;
-        assert!(!slot.holds(&id("me")), "{backing:?}: {slot:?}");
-        assert!(slot.holds(&id("r0")), "{backing:?}: {slot:?}");
-    }
-}
-
-/// Catches: a release that gives up and says the place is free, or one that never stops, when
-/// other claims keep landing between its read and its write. `me` holds a place; another host
-/// claims one before every write of the slot row: the release gives up as contended and `me`
-/// still holds its place (the caller is told, and does not believe it is free).
-#[test]
-fn a_release_that_keeps_losing_gives_up_and_the_place_stays_held() {
-    for backing in BACKINGS {
-        let cell = Cell::new(backing, "release-contended");
-        let inner = cell.store();
-        Rows::new(Arc::clone(&inner))
-            .claim(SlotClass::Host, &id("me"), OrderId::new(1, 1), 1_000)
-            .unwrap();
-        let calls = Arc::new(AtomicU64::new(0));
-        let hook = {
-            let (inner, calls) = (Arc::clone(&inner), Arc::clone(&calls));
-            move |txn: &Txn| {
-                if writes(txn, "update/slot") {
-                    let n = count(&calls);
-                    let rival = id(&format!("r{n}"));
-                    Rows::new(Arc::clone(&inner))
-                        .claim(SlotClass::Host, &rival, OrderId::new(1, n + 2), 1_000)
-                        .expect("a rival's claim");
-                }
-            }
-        };
-        let rows = Rows::new(Meddle::before_each(Arc::clone(&inner), hook));
-        let error = rows.release(&id("me")).unwrap_err();
-        assert_eq!(error, RowError::Contended("update/slot"), "{backing:?}");
-        let slot = Rows::new(inner).slot().unwrap().value;
-        assert!(slot.holds(&id("me")), "{backing:?}: {slot:?}");
-        assert!(calls.load(Ordering::SeqCst) >= 2, "{backing:?}");
-    }
-}
-
-/// Catches: a release that stops at the first lost race, and says the place is free when the
-/// row it wrote was refused, or one that writes its stale view over the winner's claim.
-/// Another host claims a place just before the first write of the slot row: the release reads
-/// again and frees `me`, and the rival's place is still there.
-#[test]
-fn a_release_that_loses_a_race_reads_again_and_frees_the_place() {
-    for backing in BACKINGS {
-        let cell = Cell::new(backing, "release-lost");
-        let inner = cell.store();
-        Rows::new(Arc::clone(&inner))
-            .claim(SlotClass::Host, &id("me"), OrderId::new(1, 1), 1_000)
-            .unwrap();
-        let calls = Arc::new(AtomicU64::new(0));
-        let hook = {
-            let (inner, calls) = (Arc::clone(&inner), Arc::clone(&calls));
-            move |txn: &Txn| {
-                if writes(txn, "update/slot") && count(&calls) == 0 {
-                    Rows::new(Arc::clone(&inner))
-                        .claim(SlotClass::Host, &id("rival"), OrderId::new(1, 2), 1_000)
-                        .expect("the rival's claim");
-                }
-            }
-        };
-        let rows = Rows::new(Meddle::before_each(Arc::clone(&inner), hook));
-        let freed = rows.release(&id("me")).expect("a release");
-        assert!(!freed.holds(&id("me")), "{backing:?}: {freed:?}");
-        assert!(freed.holds(&id("rival")), "{backing:?}: {freed:?}");
-        let stored = Rows::new(inner).slot().unwrap().value;
-        assert_eq!(stored, freed, "{backing:?}: the answer is the row");
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "one lost write, one made");
-    }
-}
-
-/// Catches: a store that fails the write of the slot being read as a place claimed or freed.
-/// The store's error is the caller's, and the slot is as it was: the claim holds no place,
-/// and the release leaves the place held (the caller must not believe it is free).
-#[test]
-fn a_store_that_fails_the_slot_write_is_the_callers_error_and_the_slot_is_unchanged() {
-    for backing in BACKINGS {
-        let cell = Cell::new(backing, "slot-fails");
-        let inner = cell.store();
-        Rows::new(Arc::clone(&inner))
-            .claim(SlotClass::Host, &id("held"), OrderId::new(1, 1), 1_000)
-            .unwrap();
-        let rows = Rows::new(Meddle::failing_writes_to(Arc::clone(&inner), "update/slot"));
-
-        let error = rows
-            .claim(SlotClass::Host, &id("new"), OrderId::new(1, 2), 1_000)
-            .unwrap_err();
-        assert!(store_says(&error, "update/slot"), "{backing:?}: {error:?}");
-        let error = rows.release(&id("held")).unwrap_err();
-        assert!(store_says(&error, "update/slot"), "{backing:?}: {error:?}");
-
-        let slot = Rows::new(inner).slot().unwrap().value;
-        assert!(slot.holds(&id("held")), "{backing:?}: {slot:?}");
-        assert!(!slot.holds(&id("new")), "{backing:?}: {slot:?}");
-    }
-}
-
 /// Catches: a store that advanced a counter and answered with no value for it being read as
-/// the number zero. A generation of 0 is no run (a row that holds it is refused), and an
-/// order id of number 0 repeats the first id of its epoch. Both calls fail with the store's
-/// error, and no run is written from a generation nobody drew.
+/// the number zero. A generation of 0 is no run (a row that holds it is refused). The offer
+/// fails with the store's error, and no run is written from a generation nobody drew.
 #[test]
 fn a_counter_the_store_returns_no_value_for_is_an_error_not_a_zero() {
     for backing in BACKINGS {
         let cell = Cell::new(backing, "no-counter");
         let rows = Rows::new(Meddle::without_counters(cell.store()));
-        let error = rows.mint_order(3).unwrap_err();
-        assert!(store_says(&error, "counter"), "{backing:?}: {error:?}");
         let error = rows.offer(&Release::new("v2"), t(1)).unwrap_err();
         assert!(store_says(&error, "counter"), "{backing:?}: {error:?}");
         let stored = Rows::new(cell.store()).desired().unwrap().value;

@@ -22,7 +22,7 @@ use kbf_server::release::{Limits, ReleaseStore};
 use kbf_server::token::ApiToken;
 use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
 use kbf_state::fake::{Fake, Flaw};
-use kbf_state::{ManualClock, Store};
+use kbf_state::{Cond, ManualClock, Store, Txn};
 use serde_json::{Value, json};
 use support::{HELLO_WAIT, INTERVAL};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,6 +41,16 @@ const TICK: Duration = Duration::from_secs(3600);
 /// and the sweeper's refresh reads `deny/` ([`looks::Looks`]). A test that arms an injection
 /// first waits for them; the test below it holds the numbers.
 const START_LOOKS: (usize, usize) = (1, 1);
+
+/// Replaces `update/policy` as an older build left it: `auto_nodes` and a limit of
+/// `max_hosts_out` places (field 5).
+fn put_policy(store: &Arc<dyn Store>, max_hosts_out: u8) {
+    let row = vec![0x08, 0x01, 0x28, max_hosts_out];
+    store
+        .txn(Txn::new().put("update/policy", row, Cond::Any))
+        .expect("the write")
+        .expect("no condition");
+}
 
 struct Dir(PathBuf);
 
@@ -498,14 +508,7 @@ async fn the_policy_row_is_shown_when_it_exists() {
     let running = start(Some(store), Some(state), &dir);
     let (_, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
     assert_eq!(view["policy"], Value::Null);
-    let policy = kbf_server::update::Policy {
-        max_hosts_out: 2,
-        auto_nodes: true,
-        ..kbf_server::update::Policy::default()
-    };
-    kbf_server::update::Rows::new(rows_store)
-        .set_policy(&policy)
-        .expect("write");
+    put_policy(&rows_store, 2);
     let (_, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
     assert_eq!(view["policy"]["max_hosts_out"], 2);
     assert_eq!(view["policy"]["auto_nodes"], true);
@@ -765,14 +768,8 @@ async fn a_pause_does_not_lose_a_policy_written_under_it() {
     let hooked = hooked::Hooked::new();
     let running = start(Some(store), Some(state_over(hooked.clone())), &dir);
     let rows = kbf_server::update::Rows::new(hooked.clone());
-    let policy = kbf_server::update::Policy {
-        max_hosts_out: 3,
-        ..kbf_server::update::Policy::default()
-    };
-    let writer = rows.clone();
-    hooked.after_get("update/policy", move || {
-        writer.set_policy(&policy).expect("the other writer");
-    });
+    let writer: Arc<dyn Store> = hooked.clone();
+    hooked.after_get("update/policy", move || put_policy(&writer, 3));
     rows.set_paused(true).expect("the pause");
     let held = rows.policy().expect("read");
     assert_eq!((held.paused, held.max_hosts_out), (true, 3));
@@ -807,15 +804,20 @@ async fn proposals_are_listed_oldest_first_and_start_no_run() {
     let running = start(Some(store), Some(state), &dir);
     let (_, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
     assert_eq!(view["proposals"], json!([]));
-    let rows = kbf_server::update::Rows::new(rows_store);
+    // Rows the removed release poller wrote.
     for (commit, at) in [(B, 30), (A, 10)] {
-        let proposal = kbf_server::update::Proposal {
-            commit: commit.to_owned(),
-            tag: format!("v{at}"),
-            published_at_secs: at,
-            proposed_at_ms: 9,
-        };
-        assert!(rows.propose(&proposal).expect("proposal"));
+        let proposal = json!({
+            "commit": commit,
+            "tag": format!("v{at}"),
+            "published_at_secs": at,
+            "proposed_at_ms": 9,
+        });
+        let put = Txn::new().put(
+            kbf_server::update::proposal_key(commit),
+            proposal.to_string().into_bytes(),
+            Cond::Absent,
+        );
+        rows_store.txn(put).expect("store").expect("a new row");
     }
     let (code, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
     assert_eq!(code, 200);
