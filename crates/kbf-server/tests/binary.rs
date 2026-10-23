@@ -761,7 +761,7 @@ fn a_hot_store_attaches_a_tier_and_holds_the_metadata_log() {
         "the log is not in <hot>/meta"
     );
     assert!(
-        !opens_as_version_1(&hot.join("meta")),
+        skipped_by_version_1(&hot.join("meta")) > 0,
         "a log not raised for the tier"
     );
     let (child, line, _) = started(with_hot(None));
@@ -787,8 +787,9 @@ fn a_hot_store_attaches_a_tier_and_holds_the_metadata_log() {
     let raft = fresh_dir("write-tier-raft");
     let (child, _, _) = started(raft_server(&raft));
     interrupt(child);
-    assert!(
-        opens_as_version_1(&raft),
+    assert_eq!(
+        skipped_by_version_1(&raft),
+        0,
         "a raft log raised without a tier"
     );
     for dir in [&hot, &hot2, &meta, &raft] {
@@ -844,12 +845,12 @@ fn the_start_logs_every_resolved_store_path_and_budget() {
     );
 }
 
-/// Whether the Raft log in `dir` opens for a binary that runs machine version 1 only;
-/// a log raised to 2 is refused at the raise.
-fn opens_as_version_1(dir: &std::path::Path) -> bool {
+/// How many entries a binary that runs machine version 1 only skips when it opens the
+/// Raft log in `dir`: the raises past version 1, none in a log left at version 1.
+fn skipped_by_version_1(dir: &std::path::Path) -> u64 {
     use kbf_log::MachineVersion;
-    use kbf_server::{RaftLogError, RaftMetaLog};
-    let opened = tokio::runtime::Builder::new_current_thread()
+    use kbf_server::RaftMetaLog;
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("a runtime")
@@ -857,15 +858,12 @@ fn opens_as_version_1(dir: &std::path::Path) -> bool {
             let fs = kbf_store::StdFs::new(dir).expect("the raft dir");
             let exists = || Err(std::io::Error::other("the log exists"));
             let retention = kbf_meta::Retention::default();
-            RaftMetaLog::open_running(fs, retention, "kbf/", exists, MachineVersion::V1)
+            let runs = MachineVersion::V1;
+            let log = RaftMetaLog::open_running(fs, retention, "kbf/", exists, runs)
                 .await
-                .map(drop)
-        });
-    match opened {
-        Ok(()) => true,
-        Err(RaftLogError::Decode { .. }) => false,
-        Err(e) => panic!("{e}"),
-    }
+                .expect("a version-1 binary opens the log");
+            log.skipped_entries()
+        })
 }
 
 /// Catches: a store flag set that cannot run starting anyway. No `--cold-store`; a cold
@@ -1237,6 +1235,33 @@ fn the_default_platform_comes_from_its_flag() {
     ] {
         let err = parse(Some(bad)).expect_err(bad);
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{bad}");
+    }
+}
+
+/// Catches: `--learned-sizes` not parsed into the listeners (a farm that ignores it never
+/// keys a request), a default other than `off` (the flag changes a booking only when an
+/// operator sets it), a value other than `off`, `shadow` and `on` accepted.
+#[test]
+fn learned_sizes_come_from_their_flag() {
+    use clap::Parser;
+    use kbf_server::LearnedSizes;
+    let parse = |args: &[&str]| {
+        kbf_server::Args::try_parse_from(std::iter::once("kbf-server").chain(args.iter().copied()))
+    };
+    let sizes = |args: &[&str]| {
+        parse(args)
+            .expect("flags parse")
+            .listeners()
+            .expect("listeners")
+            .learned_sizes
+    };
+    assert_eq!(sizes(&[]), LearnedSizes::Off);
+    assert_eq!(sizes(&["--learned-sizes", "off"]), LearnedSizes::Off);
+    assert_eq!(sizes(&["--learned-sizes=shadow"]), LearnedSizes::Shadow);
+    assert_eq!(sizes(&["--learned-sizes", "on"]), LearnedSizes::On);
+    for bad in ["", "ON", "true", "yes", "1"] {
+        let err = parse(&["--learned-sizes", bad]).expect_err(bad);
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{bad}");
     }
 }
 

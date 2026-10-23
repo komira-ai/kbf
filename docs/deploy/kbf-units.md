@@ -180,15 +180,53 @@ because it learns a node's boot only when the node registers, after the frontend
 ### The state store: Postgres for the frontend
 
 The frontend's state store is Postgres (CEO ruling: SQLite is dropped for it). The frontend
-gets `--state-store`, a `postgres://` URI, from `kbf.toml`; the default is the host's socket,
-`postgres:///kbf?host=/run/postgresql`. The URI carries no password (kbf refuses one: the
-command line is readable by every user on the node), so the database is reached by the
-socket or by the server user's own role. The database and its schema are `kbf-installer`'s.
+gets `--state-store`, a `postgres://` URI, from `kbf.toml` (`kbf-installer setup` writes it,
+as `postgres:///kbf?host=/run/postgresql&user=kbf-server`), and it has no default: a
+frontend given none exits 2 naming the flag, and `kbf --mode=frontend --check`, which the
+unit runs before the start, exits 2 the same way. (`all-in-one` alone has a default, the
+host's socket, `postgres:///kbf?host=/run/postgresql`.) A `sqlite://` URI still starts in
+this release and logs a warning that SQLite is removed in the next (see the upgrade notes).
+The URI carries no password (kbf refuses one: the command line is readable by every user on
+the node), so the database is reached by the socket or by the server user's own role. The
+database and its schema are `kbf-installer`'s.
 
 The unit gives no `--handover-socket` (nor a `RuntimeDirectory=` for one): `kbf frontend`
 refuses a Postgres `--state-store` together with it (`HandoverError::PostgresStore`: a Postgres
 store cannot give up its writer role), and the bundled proxy of `docs/design/frontend-proxy.md`
 replaces the handover. An update of a Postgres frontend is a restart.
+
+**The epoch, and a restore from a backup.** The state store holds the farm's epoch
+(`meta/epoch`), and a frontend that starts keeps it: a restart of a frontend, or the start
+of another one over the same store (several frontends sharing one Postgres), does not change
+it, so a daemon that reconnects keeps the runs of the leases it holds. The ids are kept the
+same way: a frontend reserves blocks of 1024 operation ids and lease sequences in the store
+and numbers inside them, so a restarted or a second frontend never hands out an id another
+took, and a restart skips the unused rest of its block.
+
+A database restored from a backup holds the epoch of the backup, while the daemons may hold
+leases the lost history granted after it. Raise the epoch so they drop those leases:
+
+1. Restore the database and start the frontend over it. No daemon may reach any frontend
+   of the store until the restart in step 3 is done: keep the daemons' units stopped, or the
+   frontend's worker listener closed. The frontend serves the restored epoch and numbers
+   leases from the restored counters, so a daemon that reaches it meanwhile keeps its runs
+   and can be granted a lease id (epoch and sequence) that the lost history granted to
+   another run.
+2. On the frontend's host, run `kbf cluster epoch-bump --token-file F` (`POST
+   /v1/epoch/bump`, [api.md](../api.md#post-v1epochbump)). It answers the epoch before the
+   bump, the one stored now, and the one this frontend serves.
+3. Restart each frontend. A running frontend goes on serving the epoch it started under; the
+   one that starts after the bump serves the stored one, and a daemon that reaches it kills
+   the runs of the leases it held and lists none, and the operations run again from the
+   restored queue. Start the daemons' units after it.
+
+Bump only when the history was lost or replaced: a bump with no restore costs every run in
+flight.
+
+A SQLite state file (`all-in-one`, or a single frontend) is restored with `kbf-deploy state
+restore --apply`, and its start keeps the epoch too, so the same steps follow it: start the
+frontend over the restored file with no daemon able to reach it, run `kbf cluster
+epoch-bump`, then restart the frontend.
 
 ### Updating a frontend without failing a build
 

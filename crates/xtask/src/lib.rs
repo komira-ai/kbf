@@ -56,8 +56,8 @@
 //!   attestations` and `release check` hold a directory to one bundle per tarball,
 //!   each that tarball's (its one subject is the tarball's digest); `verify-assets
 //!   attestations` also has `gh` verify each tarball against its bundle.
-//! - `release {locate,main-control,check,verify,offer,notes,plan,identity,previous,fetch-previous,stage-offer,publish,bump-internal}` ([`release`]): a GitHub release of
-//!   the files a push run of the artifacts workflow on `main` built and attested for a
+//! - `release {locate,main-control,check,verify,notes,plan,identity,previous,fetch-previous,publish,bump-internal}` ([`release`]): a GitHub release of
+//!   the files the artifacts stage of a push run of the pipeline on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
 //! - `release version-facts --binary <kbf> --commit <sha> --platform <p> --out <dir>`
@@ -539,8 +539,8 @@ enum VerifyAssets {
 
 #[derive(Subcommand)]
 enum ReleaseVerb {
-    /// Refuse a commit not on main; find the successful push run of artifacts.yml on
-    /// main that built it, and print `run-id=<id>`.
+    /// Refuse a commit not on main, and a run that is not the successful push run on main
+    /// that built it; print `run-id=<id>`.
     Locate {
         /// The repository, `<owner>/<repo>` (on Actions, `GITHUB_REPOSITORY`).
         #[arg(long)]
@@ -548,6 +548,10 @@ enum ReleaseVerb {
         /// The commit to release, a full SHA.
         #[arg(long)]
         commit: String,
+        /// The pipeline run that built it (on Actions, the id of the run that started the
+        /// release).
+        #[arg(long)]
+        run_id: u64,
         /// Append `run-id=<id>` to this file (on Actions, `GITHUB_OUTPUT`).
         #[arg(long)]
         output: Option<PathBuf>,
@@ -596,7 +600,7 @@ enum ReleaseVerb {
         /// The commit the tag names, a full SHA.
         #[arg(long)]
         commit: String,
-        /// The artifacts workflow run that built and attested the files.
+        /// The pipeline run that built and attested the files.
         #[arg(long)]
         run_id: u64,
         /// The set hash of the verified files, as `release verify` printed it.
@@ -619,23 +623,13 @@ enum ReleaseVerb {
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// The checks that make a commit offerable to a farm; writes `offer.json`, sets
-    /// nothing on any farm.
-    Offer(release::offer::OfferArgs),
-    /// Wait for the push runs of ci, beta and artifacts for `--sha` on `--branch` and
-    /// require all three to succeed; print their run ids. Only reads.
-    Gates(release::gates::GatesArgs),
     /// What a push would release: the next version, the push's class, and the freeze and
     /// superseded refusals. Writes nothing but `--output`.
     Plan(release::plan::PlanArgs),
     /// The release before `--sha`: the highest release tag that names a strict ancestor of it,
-    /// downloaded, verified as `release offer` verifies one, and its named binaries taken
+    /// downloaded and verified (checksums, then attestations), and its named binaries taken
     /// out into `--out`. With no such tag, prints `previous-source=none`.
     FetchPrevious(release::fetch_previous::FetchPreviousArgs),
-    /// The offer for the release of `--sha`, for gamma only, and the bundle a gamma deploy is
-    /// handed: the release verified before any of it runs. A commit with no release is
-    /// `staged=false`, not an error.
-    StageOffer(release::stage_offer::StageOfferArgs),
     /// Open the pull request in the internal repository that moves its submodule to the
     /// released commit, with auto-merge on (the token is `GH_TOKEN`).
     BumpInternal(release::bump::BumpArgs),
@@ -1073,9 +1067,10 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::Release(ReleaseVerb::Locate {
             repo,
             commit,
+            run_id,
             output,
             gh,
-        }) => release::locate(&gh, &repo, &commit, output.as_deref()),
+        }) => release::locate(&gh, &repo, &commit, run_id, output.as_deref()),
         Verb::Release(ReleaseVerb::MainControl {
             repo,
             on_main,
@@ -1120,11 +1115,8 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 line,
             ])
         }
-        Verb::Release(ReleaseVerb::Offer(args)) => release::offer::run(&args),
-        Verb::Release(ReleaseVerb::Gates(args)) => release::gates::run(&args),
         Verb::Release(ReleaseVerb::Plan(args)) => release::plan::run(&args),
         Verb::Release(ReleaseVerb::FetchPrevious(args)) => release::fetch_previous::run(&args),
-        Verb::Release(ReleaseVerb::StageOffer(args)) => release::stage_offer::run(&args),
         Verb::Release(ReleaseVerb::BumpInternal(args)) => release::bump::run(&args),
         Verb::Release(ReleaseVerb::Tag(args)) => release::tag::run(&args),
         Verb::Release(ReleaseVerb::VersionFacts(args)) => version_facts::run(&args),

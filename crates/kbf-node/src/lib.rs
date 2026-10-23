@@ -237,6 +237,17 @@ pub struct Cli {
     /// How often a lease's memory is measured, in milliseconds (native).
     #[arg(long, default_value_t = 250)]
     memory_poll_ms: u64,
+    /// How long a lease's processes are given to end after SIGTERM before they are
+    /// killed, in milliseconds; 0 kills them at once (native). A workload that cleans up
+    /// when asked to end, such as Python's multiprocessing resource tracker with the
+    /// shared memory it made, does so in this time; one that ignores SIGTERM is named in
+    /// the lease's stderr. A slot's clean uses the same value (at most its own time
+    /// limit). More than 60000 is taken as 60000. The wait comes after the action's
+    /// timeout and its memory watch have ended it (neither runs during it), and on top
+    /// of the time given to the kill that follows. A lease past its memory limit is
+    /// killed at once. Applies on every platform.
+    #[arg(long, default_value_t = 2000)]
+    native_term_grace_ms: u64,
     /// The directory searched for `Xcode*.app` (native). Each Xcode whose own
     /// `xcodebuild` answers `-version`, `-license check` and `-checkFirstLaunchStatus`,
     /// and for which `xcrun --find clang` does (each within a minute, under the
@@ -1091,6 +1102,8 @@ fn native_config(cli: &Cli) -> Result<NativeConfig, Error> {
         headroom_bytes: cli.memory_headroom_mib.saturating_mul(1 << 20),
     };
     config.poll = Duration::from_millis(cli.memory_poll_ms.max(1));
+    config.term_grace =
+        Duration::from_millis(cli.native_term_grace_ms).min(kbf_driver_native::grace::MAX_GRACE);
     config.pool = (cli.pool_users.zip(cli.pool_first_uid))
         .map(|(count, first)| Pool::provisioned(count, first))
         .transpose()?;
@@ -1394,6 +1407,7 @@ mod tests {
             "--memory-limit-percent=200",
             "--memory-headroom-mib=64",
             "--memory-poll-ms=0",
+            "--native-term-grace-ms=750",
             "--output-max-bytes=99",
             "--output-upload-deadline-secs=7",
             "--xcode-apps=/var/kbf/apps",
@@ -1404,6 +1418,7 @@ mod tests {
         assert_eq!(config.scratch, PathBuf::from("/var/kbf/leases"));
         assert_eq!(config.memory.limit(1 << 20), Some((2 << 20) + (64 << 20)));
         assert_eq!(config.poll, Duration::from_millis(1));
+        assert_eq!(config.term_grace, Duration::from_millis(750));
         assert_eq!(config.outputs.max_bytes, 99);
         assert_eq!(config.upload_deadline, Duration::from_secs(7));
         assert_eq!(cli.xcode_apps, PathBuf::from("/var/kbf/apps"));
@@ -1427,6 +1442,30 @@ mod tests {
             MemoryPolicy::DEFAULT
         );
         assert_eq!(defaults.xcode_apps, PathBuf::from("/Applications"));
+        assert_eq!(
+            native_config(&defaults).expect("config").term_grace,
+            kbf_driver_native::DEFAULT_TERM_GRACE
+        );
+        let at_once = parse(&[
+            "--driver=native",
+            "--data-dir=/s",
+            "--native-term-grace-ms=0",
+        ])
+        .expect("flags");
+        assert_eq!(
+            native_config(&at_once).expect("config").term_grace,
+            Duration::ZERO
+        );
+        let forever = parse(&[
+            "--driver=native",
+            "--data-dir=/s",
+            "--native-term-grace-ms=18446744073709551615",
+        ])
+        .expect("flags");
+        assert_eq!(
+            native_config(&forever).expect("config").term_grace,
+            kbf_driver_native::grace::MAX_GRACE
+        );
         let relative = parse(&["--driver=native", "--data-dir=leases"]).expect("flags");
         assert!(native_config(&relative).is_err());
         let missing = parse(&["--driver=native"]).expect("flags");

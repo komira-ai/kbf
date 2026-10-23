@@ -536,15 +536,15 @@ impl Holding {
 }
 
 /// Whether `txn` is a submission: the one write that stores an operation's request and
-/// takes the next operation number. Other writes of `op/` rows (a scheduler failing an
-/// operation nothing can run) are not an Execute between its request and its queueing.
+/// puts it in the queue. Other writes of `op/` rows (a scheduler failing an operation
+/// nothing can run) are not an Execute between its request and its queueing.
 fn queues_an_operation(txn: &Txn) -> bool {
     let puts = |wanted: &dyn Fn(&str) -> bool| {
         txn.ops()
             .iter()
             .any(|op| matches!(op, Op::Put { key, .. } if wanted(key)))
     };
-    puts(&|key| key.starts_with("op/")) && puts(&|key| key == "meta/next_op")
+    puts(&|key| key.starts_with("op/")) && puts(&|key| key.starts_with("queue/"))
 }
 
 impl Store for Holding {
@@ -826,20 +826,18 @@ async fn a_child_the_store_refused_is_no_holder_though_the_generation_row_is_sti
     );
 }
 
-/// Pins TODAY's takeover over a holder that is gone (U2c ask: a way to start a candidate
-/// that bumps the epoch, or a `takeover` that does when the holder is dead). The proxy's
-/// recovery of a host whose both children died spawns the recorded release again and
-/// expects it to "take the generation and bump the epoch" (`recover.rs`). The child bumps
-/// the epoch only when it is started WITHOUT `--await-takeover` (a cold start); every
-/// start the proxy makes has the flag, and `takeover` keeps the epoch, whoever held the
-/// generation: so a candidate taking over from a dead holder leaves the epoch as it was,
-/// and daemons that redial believe their old leases are still theirs.
+/// Pins TODAY's takeover over a holder that is gone. The proxy's recovery of a host whose
+/// both children died spawns the recorded release again. No start moves the epoch: a
+/// `takeover` keeps it, whoever held the generation, and so does a cold start (a start
+/// without `--await-takeover`). A candidate taking over from a dead holder leaves the
+/// epoch as it was, and daemons that redial keep the leases they hold that the store
+/// still holds; an operator raises the epoch (`POST /v1/epoch/bump`).
 ///
-/// Catches: a client or a child that drifted so that `takeover` bumps the epoch (the
-/// swap's takeover would then drop every lease of a live fleet), and keeps the gap on the
-/// record next to the cold start that does bump it.
+/// Asserts that a `takeover` over a dead holder keeps the epoch (the swap's takeover would
+/// otherwise drop every lease of a live fleet), and that a cold start over the same store
+/// keeps it too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_takeover_over_a_dead_holder_keeps_the_epoch_and_only_a_cold_start_bumps_it() {
+async fn a_takeover_over_a_dead_holder_and_a_cold_start_keep_the_epoch() {
     let node = Node::start().await;
     let store = shared();
     let source = || StoreSource::Shared(Arc::clone(&store) as Arc<dyn Store>);
@@ -857,10 +855,9 @@ async fn a_takeover_over_a_dead_holder_keeps_the_epoch_and_only_a_cold_start_bum
     assert_eq!(generation(&store).0, held + 1);
     assert_eq!(epoch(&store), before, "a takeover bumped the epoch");
 
-    // The way to a bumped epoch is a start with no `--await-takeover`, which no call of
-    // `ChildAdmin` makes.
+    // A start with no `--await-takeover`, which no call of `ChildAdmin` makes.
     let c = Child::start(&managed_flags(&node, &[]), &store).await;
-    assert_eq!(epoch(&store), before + 1, "a cold start kept the epoch");
+    assert_eq!(epoch(&store), before, "a cold start moved the epoch");
     assert_eq!(c.role().await["held_generation"], held + 2);
 }
 

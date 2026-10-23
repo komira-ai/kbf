@@ -133,11 +133,8 @@ refuses a table written twice, and so does `kbf` (exit 2, `duplicate key`).
 ## The Mac path
 
 A Mac is a node (`--mode=daemon`) and `kbf-mac-provision` is the one writer of the daemon's
-`kbf.toml` there. `setup` does not write `[daemon] update-dir` or `orders-dir` on a Mac. It
-checks the file: `update-dir` must be there and be the installer's state directory
-(`/var/db/kbf-installer`), and `orders-dir` must be absent (the node uses `<update-dir>/orders`)
-or be the installer's. A missing or different key, or no file, is refused with exit 5, naming the
-key and saying that `kbf-mac-provision` renders it: run it again, then `setup`. The other keys
+`kbf.toml` there. `setup` does not write `[daemon] update-dir` or `orders-dir` on a Mac and does
+not require them; a file that has them is left as it is. The other keys
 `setup` owns follow the rule above.
 
 ## What it does, in this order

@@ -195,7 +195,7 @@ impl<'a> Swap<'a> {
     }
 
     /// Start `release` in `slot` where no child serves, wait until it is ready, make it
-    /// take the generation (with no live holder the child bumps the epoch: FP section 8)
+    /// take the generation (with no live holder the child keeps the epoch)
     /// and route to it. The process is recorded as soon as it exists. `Err` is the reason
     /// it did not come up. The steps are [`Cold`]'s, which the proxy's boot runs too.
     fn cold_start(&mut self, slot: Slot, release: &CommitId) -> Result<Result<(), String>, Halt> {

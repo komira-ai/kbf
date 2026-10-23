@@ -36,10 +36,6 @@ fn flags_of_the_profile(p: &Profile) -> Vec<OsString> {
         p.get("hostname"),
         "--data-dir",
         p.get("kbf_data_dir"),
-        "--update-dir",
-        "/var/db/kbf-installer",
-        "--orders-dir",
-        "/var/db/kbf-installer/orders",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -85,7 +81,6 @@ fn the_rendered_file_stands_for_the_flags_the_job_used_to_pass() {
         "kbf-mac-07",
         "https://farm.example.net:8981",
         "/Volumes/kbf/data",
-        "/var/db/kbf-installer",
     ] {
         assert!(text.contains(want), "{want} not in {text}");
     }
@@ -105,52 +100,4 @@ fn the_job_reads_the_file_the_tool_writes() {
     let args = kbf_mac_provision::launchd::daemon_args(&p);
     assert_eq!(args.last().map(String::as_str), Some(NODE_CONFIG));
     assert_eq!(args[args.len() - 2], "--config");
-}
-
-/// Catches: the update directory the Mac's daemon is given drifting from the one the
-/// installer keeps its state in and reads the order spool from (layout.rs, `setup`'s
-/// `orders/`): the daemon would write orders where the installer never looks. The
-/// installer's own layout is the source; the spool is where the node's update client puts
-/// it beneath the directory.
-#[test]
-fn the_update_directory_is_the_installers_state_directory() {
-    use kbf_host::path::Root;
-    use kbf_installer::layout::{Layout, Platform};
-
-    let mac = FakeMac::fresh("node-config-installer");
-    let p = Profile::parse(mac.profile_text().as_bytes()).unwrap();
-    let dir = support::scratch("node-config-installer-file");
-    let file = dir.join("kbf.toml");
-    fs::write(&file, render_config(&p)).unwrap();
-    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
-    let args = ["kbf", "--mode=daemon", "--config"]
-        .map(OsString::from)
-        .into_iter()
-        .chain([file.into()])
-        .collect::<Vec<_>>();
-    let parsed = kbf_cli::parse_with(args, None).expect("the daemon's loader reads the file");
-    let layout = Layout::new(Root::host(), Platform::MacOs);
-    let state = layout.state_dir();
-    let text = daemon(&parsed.invocation);
-    assert!(
-        text.contains(&format!("update_dir: Some(\"{}\")", state.as_str())),
-        "{text}"
-    );
-    assert!(
-        text.contains(&format!(
-            "orders_dir: Some(\"{}\")",
-            layout.orders_dir().as_str()
-        )),
-        "{text}"
-    );
-    assert_eq!(
-        layout.orders_dir().as_str(),
-        kbf_mac_provision::launchd::ORDERS_DIR
-    );
-    let client = kbf_update::Config::new(state.as_str().into(), "p".into(), "c".into());
-    assert_eq!(
-        client.orders_dir.to_str(),
-        Some(format!("{}/orders", state.as_str()).as_str())
-    );
-    assert_eq!(client.orders_dir.to_str(), Some(support::ORDERS));
 }

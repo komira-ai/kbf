@@ -1,7 +1,7 @@
 //! `release version-facts`: what `kbf --version --json` says of one platform's build, kept
 //! as the release asset `kbf-<commit>-<platform>.version.json` (docs/artifacts.md).
 //!
-//! A node's offer and the age check of a release need facts of each platform's `kbf` (its
+//! The age check of a release need facts of each platform's `kbf` (its
 //! `meta_log`, the protocols, `seq`). The binary states them and nothing on the frontend
 //! records them, and only a runner of a platform can run its binary: a Linux runner cannot
 //! run the macOS `kbf`. So each build job runs the `kbf` it has just built and keeps the
@@ -26,11 +26,11 @@
 //! A refusal writes nothing, not even `<dir>`.
 //!
 //! The release set holds the file because [`facts_of`] names it: `verify-assets sums`
-//! (and so `release check`, `release publish` and `release offer`) refuses a listed `kbf`
+//! (and so `release check` and `release publish`) refuses a listed `kbf`
 //! tarball whose facts are not listed ([`Pairing::Required`]; `release check
 //! --without-version-facts` is [`Pairing::Waived`], for the release made before the build
 //! jobs recorded them) and a listed facts file whose tarball is not ([`tarball_of`]),
-//! `release offer` calls a platform incomplete without them, and `verify-assets
+//! and `verify-assets
 //! attestations` checks the facts for build provenance, as an SBOM is (they have no
 //! bundle).
 

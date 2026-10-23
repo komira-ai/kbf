@@ -72,6 +72,9 @@ const DIRECTORY: OFlags = OFlags::RDONLY
 pub struct MacSlot<'a> {
     pub ready: &'a Ready,
     pub within: Duration,
+    /// How long C3 gives the processes to end after SIGTERM, before the kill
+    /// ([`crate::grace`]); zero kills at once.
+    pub grace: Duration,
     /// The uids of the pool's users: C9 does not walk a folder one of them owns a
     /// directory on the path of.
     pub pool: std::ops::RangeInclusive<u32>,
@@ -309,24 +312,39 @@ impl MacSlot<'_> {
         }
     }
 
-    /// C3: SIGKILL by real and effective uid until two scans 200 ms apart find nothing,
+    /// C3: SIGTERM, `grace` for the uid's processes to end (the ones that ignore it are
+    /// named in the log), then SIGKILL by real and effective uid until two scans 200 ms apart find nothing,
     /// within `within` and 100 scans ([`probe::kill_until_quiet`]). A scan does not count
     /// launchd's own agents, which launchd starts again on demand.
     fn kill(&self) -> Result<(), String> {
         let uid = self.ready.user.uid;
-        let give_up = Instant::now() + self.within;
-        probe::kill_until_quiet(
-            &mut || Instant::now() >= give_up,
-            &mut || uid::kill(uid).map_err(|e| e.to_string()),
-            &mut || {
-                let pids = uid::processes(uid).map_err(|e| e.to_string())?;
-                if pids.is_empty() {
-                    return Ok(pids);
-                }
-                Ok(not_launchds_own(pids, &services_of(uid)))
-            },
-            &mut || std::thread::sleep(probe::SCAN_PAUSE),
-        )
+        let mut scan = || {
+            let pids = uid::processes(uid).map_err(|e| e.to_string())?;
+            if pids.is_empty() {
+                return Ok(pids);
+            }
+            Ok(not_launchds_own(pids, &services_of(uid)))
+        };
+        let round = super::term_uid(
+            uid,
+            self.grace.min(self.within),
+            &mut scan,
+            probe::SCAN_PAUSE,
+        );
+        crate::grace::then_kill(round, "slot clean", |ignored| {
+            if let Some(brief) = crate::grace::brief(ignored) {
+                tracing::warn!(uid, "slot clean: {brief}");
+            }
+            // The grace is extra to `within`, which bounds the kill alone.
+            let give_up = Instant::now() + self.within;
+            probe::kill_until_quiet(
+                &mut || Instant::now() >= give_up,
+                &mut || uid::kill(uid).map_err(|e| e.to_string()),
+                &mut scan,
+                &mut || std::thread::sleep(probe::SCAN_PAUSE),
+            )
+        })
+        .map(|_| ())
     }
 }
 
@@ -634,6 +652,16 @@ pub fn leftover_processes(uid: u32) -> io::Result<Vec<i32>> {
     Ok(not_launchds_own(pids, &services_of(uid)))
 }
 
+/// The processes `launchctl print user/<uid>` lists as running one of launchd's own
+/// agents ([`Service::own`]); read before a domain's bootout, which empties the list.
+pub(crate) fn launchds_own(uid: u32) -> Vec<i32> {
+    services_of(uid)
+        .into_iter()
+        .filter(|s| s.own)
+        .filter_map(|s| s.pid)
+        .collect()
+}
+
 /// `pids` without those `services` lists as running one of launchd's own agents.
 fn not_launchds_own(mut pids: Vec<i32>, services: &[Service]) -> Vec<i32> {
     pids.retain(|pid| !services.iter().any(|s| s.own && s.pid == Some(*pid)));
@@ -653,17 +681,26 @@ struct Service {
     own: bool,
 }
 
+/// The longest one `launchctl print` is waited for.
+const PRINT_WITHIN: Duration = Duration::from_secs(5);
+
+/// The longest all the prints of one [`services_of`] are waited for together.
+const SERVICES_WITHIN: Duration = Duration::from_secs(15);
+
 /// The services `launchctl print user/<uid>` lists: none when the domain is gone (or
-/// cannot be printed, which the kill and the other checks then stand in for). Each is
-/// printed on its own for its plist's path ([`Service::own`]).
+/// cannot be printed, or the print does not answer in time, which the kill and the other
+/// checks then stand in for). Each is printed on its own for its plist's path
+/// ([`Service::own`]); one not printed in time is not launchd's own.
 fn services_of(uid: u32) -> Vec<Service> {
-    let Some(domain) = launchctl_print(&format!("user/{uid}")) else {
+    let give_up = Instant::now() + SERVICES_WITHIN;
+    let Some(domain) = launchctl_print(&format!("user/{uid}"), PRINT_WITHIN) else {
         return Vec::new();
     };
     probe::listed_services(&domain)
         .into_iter()
         .map(|(pid, label)| {
-            let printed = launchctl_print(&format!("user/{uid}/{label}"));
+            let left = give_up.saturating_duration_since(Instant::now());
+            let printed = launchctl_print(&format!("user/{uid}/{label}"), left.min(PRINT_WITHIN));
             let own = printed
                 .as_deref()
                 .and_then(probe::plist_path)
@@ -673,15 +710,23 @@ fn services_of(uid: u32) -> Vec<Service> {
         .collect()
 }
 
-/// What `launchctl print <target>` says, if it succeeds.
-fn launchctl_print(target: &str) -> Option<String> {
-    let out = Command::new(uid::LAUNCHCTL)
-        .args(["print", target])
-        .env_clear()
-        .stdin(Stdio::null())
-        .output();
-    let out = out.ok().filter(|out| out.status.success())?;
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+/// What `launchctl print <target>` says, if it succeeds within `within`; a print that
+/// does not answer is killed and logged at WARN.
+fn launchctl_print(target: &str, within: Duration) -> Option<String> {
+    let mut command = Command::new(uid::LAUNCHCTL);
+    command.args(["print", target]).env_clear();
+    match crate::bounded::stdout_within(&mut command, within) {
+        Ok(out) => Some(String::from_utf8_lossy(&out).into_owned()),
+        Err(true) => {
+            tracing::warn!(
+                target,
+                ?within,
+                "launchctl print did not answer; no services listed"
+            );
+            None
+        }
+        Err(false) => None,
+    }
 }
 
 /// What a sweep of `plan` for `name` and `uid` would remove, without removing it: the

@@ -38,7 +38,7 @@ kbf-gate.workspace = true
 # environment and a time limit (`run::SystemRunner`).
 kbf-installer.workspace = true
 # The platforms a release is built for and the tarballs a host of each needs
-# (`release stage-offer`): the one list the installer's bundle reader is checked against.
+# (`release check`): the one list the installer's bundle reader is checked against.
 kbf-types.workspace = true
 lzma-rs.workspace = true
 ruzstd.workspace = true

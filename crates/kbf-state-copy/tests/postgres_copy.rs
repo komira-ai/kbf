@@ -1,8 +1,7 @@
 //! The copy against a real Postgres server: what it writes, what it refuses, and what it
 //! does when the copy does not read back the same.
 //!
-//! The tests are `#[ignore]`d so `cargo test --workspace` stays hermetic; the Postgres jobs
-//! of CI run them with `--include-ignored` against a service container.
+//! They run in the normal test run and fail, not skip, without a server:
 //! `KBF_TEST_POSTGRES_URL` names a server on which they may make and drop databases. The
 //! store lives in the default schema of the URL it is given, so each test makes a database
 //! of its own: nextest runs every test in a process of its own, side by side.
@@ -74,7 +73,6 @@ fn next_sequence(client: &mut postgres::Client) -> i64 {
 /// is accepted, reports every family with its row count, and writes nothing: not to the
 /// target, not to the state file, not beside it.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_dry_run_reports_every_family_and_writes_nothing() {
     let dir = scratch("copy-dry-run");
     let db = golden_copy(&dir);
@@ -103,7 +101,6 @@ fn a_dry_run_reports_every_family_and_writes_nothing() {
 /// feed, sets the head to the file's head, leaves the state file as it was, and reports each
 /// family as matching.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_copy_keeps_every_row_counter_version_and_expiry() {
     let dir = scratch("copy-golden");
     let db = golden_copy(&dir);
@@ -127,7 +124,6 @@ fn a_copy_keeps_every_row_counter_version_and_expiry() {
 /// binary value, an empty value, a key with no slash, a non-ASCII family, an expiry that is
 /// not a whole number of microseconds, counters) copies row for row what was written to it.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_copy_of_a_file_with_every_kind_of_row_matches_what_was_written() {
     let dir = scratch("copy-built");
     let written = built(&dir);
@@ -144,7 +140,6 @@ fn a_copy_of_a_file_with_every_kind_of_row_matches_what_was_written() {
 /// succeeds and one on another version is a conflict on that key; that a counter goes on
 /// from the value the file held; and that the schema's revision sequence is past the head.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn writes_after_the_copy_continue_from_the_copied_versions() {
     let dir = scratch("copy-continue");
     let db = golden_copy(&dir);
@@ -177,7 +172,6 @@ fn writes_after_the_copy_continue_from_the_copied_versions() {
 /// Asserts that when the file records a head below its highest version, the target's head is
 /// the highest version and the first write is the revision after it.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn the_head_is_the_highest_version_when_the_file_records_a_lower_head() {
     let dir = scratch("copy-lower-head");
     let db = golden_copy(&dir);
@@ -193,7 +187,6 @@ fn the_head_is_the_highest_version_when_the_file_records_a_lower_head() {
 /// Asserts that a state file with nothing in it copies, leaves the head at 0, and that the
 /// first write to the target is revision 1.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_state_file_with_nothing_in_it_copies_and_the_first_write_is_revision_1() {
     let dir = scratch("copy-empty");
     let db = dir.join("state.db");
@@ -213,7 +206,6 @@ fn a_state_file_with_nothing_in_it_copies_and_the_first_write_is_revision_1() {
 /// Asserts that a copy of more rows and counters than one INSERT carries is complete and
 /// matches the file row for row.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_copy_of_more_rows_than_one_insert_carries_is_complete() {
     let dir = scratch("copy-bulk");
     let db = bulk(&dir, 1_203, 601);
@@ -232,7 +224,6 @@ fn a_copy_of_more_rows_than_one_insert_carries_is_complete() {
 /// Asserts that a target that holds anything (a row, only the feed and head a deleted row
 /// leaves, only a counter) is refused with status 2, and that it is as it was afterwards.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_target_that_holds_anything_is_refused_and_left_as_it_was() {
     let dir = scratch("copy-not-empty");
     let db = golden_copy(&dir);
@@ -266,7 +257,6 @@ fn a_target_that_holds_anything_is_refused_and_left_as_it_was() {
 /// Asserts that a second copy into a target a copy has filled is refused and changes
 /// nothing, with status 2.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_second_copy_is_refused_and_changes_nothing() {
     let dir = scratch("copy-twice");
     let db = golden_copy(&dir);
@@ -284,7 +274,6 @@ fn a_second_copy_is_refused_and_changes_nothing() {
 /// not built for, are each refused with status 2 naming the version found, and are left
 /// empty; and that the report of the file is printed before the refusal.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_store_whose_schema_is_not_current_is_refused() {
     let dir = scratch("copy-schema");
     let db = golden_copy(&dir);
@@ -315,7 +304,6 @@ fn epoch_clock() -> i64 {
 /// Asserts that a host clock far from the database's is refused with status 2 for a dry run
 /// and for a copy, and that nothing is written.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_clock_that_is_off_is_refused_and_nothing_is_written() {
     let dir = scratch("copy-clock");
     let db = golden_copy(&dir);
@@ -389,7 +377,6 @@ fn failed_copy(tamper: Tamper) -> (Error, Database) {
 /// inside the transaction, fails the copy with status 1 naming the family, and that the
 /// transaction is rolled back: the target is as empty as it was.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_value_that_changed_before_the_check_fails_the_copy_and_rolls_it_back() {
     let (error, target) = failed_copy(change_a_value);
     assert_eq!(error.code(), 1);
@@ -403,7 +390,6 @@ fn a_value_that_changed_before_the_check_fails_the_copy_and_rolls_it_back() {
 /// Asserts that a row missing when the rows are read back inside the transaction fails the
 /// copy naming the family as absent in the copy, and rolls it back.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_row_that_went_missing_before_the_check_fails_the_copy_and_rolls_it_back() {
     let (error, target) = failed_copy(remove_a_row);
     assert_eq!(error.code(), 1);
@@ -417,7 +403,6 @@ fn a_row_that_went_missing_before_the_check_fails_the_copy_and_rolls_it_back() {
 /// Asserts that a counter whose value is not the file's, found inside the transaction, fails
 /// the copy naming its family, and rolls it back.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_counter_out_of_date_before_the_check_fails_the_copy_and_rolls_it_back() {
     let (error, target) = failed_copy(age_the_counter);
     assert_eq!(error.code(), 1);
@@ -430,7 +415,6 @@ fn a_counter_out_of_date_before_the_check_fails_the_copy_and_rolls_it_back() {
 /// Asserts that a row the file does not hold, found inside the transaction, fails the copy
 /// naming its family as absent from the file, and rolls it back.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_row_the_file_does_not_hold_fails_the_copy_and_rolls_it_back() {
     let (error, target) = failed_copy(add_a_row);
     assert_eq!(error.code(), 1);
@@ -442,7 +426,6 @@ fn a_row_the_file_does_not_hold_fails_the_copy_and_rolls_it_back() {
 /// Asserts that a statement the server refuses fails the copy with status 1, naming the
 /// server's SQLSTATE, and rolls it back.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_statement_the_server_refuses_fails_the_copy_with_its_sqlstate() {
     let (error, target) = failed_copy(ask_for_a_table_that_is_not_there);
     assert_eq!(error.code(), 1);
@@ -455,7 +438,6 @@ fn a_statement_the_server_refuses_fails_the_copy_with_its_sqlstate() {
 /// back inside the transaction, fails the copy with status 1 naming both revisions, and rolls
 /// it back: the target is empty and its revision sequence is where it started.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_head_that_is_not_the_copied_one_fails_the_copy_and_rolls_it_back() {
     let (error, target) = failed_copy(unset_the_head);
     assert_eq!(error.code(), 1);
@@ -469,7 +451,6 @@ fn a_head_that_is_not_the_copied_one_fails_the_copy_and_rolls_it_back() {
 /// refuses) is reported with status 1 as a copy that was committed, naming the server's
 /// SQLSTATE, and that the committed copy is left in place.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_read_back_that_fails_after_the_commit_says_the_copy_is_committed() {
     let (error, target) = failed_copy(ask_for_a_table_that_is_not_there_after_the_commit);
     assert_eq!(error.code(), 1);
@@ -483,7 +464,6 @@ fn a_read_back_that_fails_after_the_commit_says_the_copy_is_committed() {
 /// reported as a failure with status 1 saying the target holds a copy that does not match,
 /// that the committed copy is left in place, and that the state file is untouched.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_copy_that_differs_after_the_commit_is_reported_and_left_in_place() {
     let (error, target) = failed_copy(change_a_version_after_the_commit);
     assert_eq!(error.code(), 1);
@@ -513,7 +493,6 @@ fn try_the_lock(stage: Stage) -> Option<&'static str> {
 /// Asserts that a copy holds the frontend lock until it is done: a take of the same lock from
 /// inside the copy is refused, and the lock is free again when the copy has ended.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn the_lock_is_held_while_the_copy_runs_and_free_afterwards() {
     let dir = scratch("copy-lock");
     let written = built(&dir);
@@ -539,7 +518,6 @@ fn tool(argv: &[&str]) -> Output {
 /// Asserts that the binary dry-runs with status 0 and writes nothing, copies with status 0,
 /// and then refuses a second copy with status 2 and the reason on the standard error.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn the_binary_dry_runs_then_copies_then_refuses_a_second_copy() {
     let dir = scratch("copy-binary");
     let db = golden_copy(&dir);

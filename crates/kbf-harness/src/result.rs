@@ -113,8 +113,8 @@ pub fn now() -> String {
 }
 
 /// The note every smoke document carries.
-pub const SMOKE_NOTE: &str =
-    "smoke: runs on its own cargo binaries, not the attested release bytes; unattested";
+pub const SMOKE_NOTE: &str = "smoke: farm processes are the kbf of the same run's release tarball, checked by the workflow; \
+     this document records no set hash; unattested";
 
 impl Document {
     /// A new `RUNNING` document for `scenario`, its identity from the CI environment
