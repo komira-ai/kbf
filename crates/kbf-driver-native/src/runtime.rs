@@ -318,7 +318,8 @@ impl<C: Cas> NativeRuntime<C> {
         entries
     }
 
-    /// Sends the daemon the number of free slots through `part` now and whenever it
+    /// Sends the daemon the number of usable slots (not dirty; a slot a lease
+    /// is running in counts) through `part` now and whenever it
     /// changes (a slot went dirty, or was cleaned again), so the node reports its slots
     /// without waiting for the Xcode survey to change. The survey's own report then
     /// leaves the `action_slots` entry out: this part owns it. Without a pool, or off a
