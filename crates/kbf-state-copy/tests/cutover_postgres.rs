@@ -2,8 +2,7 @@
 //! cutover writes the new URL and keeps the original byte for byte, that a copy which does
 //! not verify leaves the setting as it was, and that a rollback puts the original back.
 //!
-//! The tests are `#[ignore]`d so `cargo test --workspace` stays hermetic; the Postgres jobs
-//! of CI run them with `--include-ignored` against a service container.
+//! They run in the normal test run and fail, not skip, without a server:
 //! `KBF_TEST_POSTGRES_URL` names a server on which they may make and drop databases, each
 //! test in a database of its own. That URL carries a password, which the setting may not,
 //! so each test gives the setting the URL of `FRONTEND_URL` with `--frontend-url`.
@@ -46,7 +45,6 @@ fn args_to(farm: &Farm, target: &Database, apply: bool) -> CutoverArgs {
 /// reports the setting, the new value and every key family, and that it changes nothing: not
 /// the kbf.toml, not the state file, not the directory, not the target.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_dry_run_changes_no_file() {
     let farm = Farm::golden("cutover-pg-dry");
     let bytes = read(&farm.db);
@@ -73,7 +71,6 @@ fn a_dry_run_changes_no_file() {
 /// the kbf.toml (every other byte as it was), keeps the original byte for byte as
 /// `kbf.toml.pre-postgres`, leaves the state file as it was, and makes no other file.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_cutover_writes_the_new_url_and_keeps_the_original() {
     let farm = Farm::golden("cutover-pg-apply");
     let bytes = read(&farm.db);
@@ -98,7 +95,6 @@ fn a_cutover_writes_the_new_url_and_keeps_the_original() {
 /// `--state-store=` flag and nothing else, keeps the original byte for byte beside it, and
 /// says to reload systemd.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_cutover_of_a_unit_file_rewrites_its_flag_and_keeps_the_original() {
     let farm = Farm::golden("cutover-pg-unit");
     let file = farm.dir.join("override.conf");
@@ -126,7 +122,6 @@ fn a_cutover_of_a_unit_file_rewrites_its_flag_and_keeps_the_original() {
 /// fails the cutover with status 1, rolls the copy back, and leaves the kbf.toml, the state
 /// file and the directory as they were (no backup, no temporary file).
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_check_that_fails_before_the_commit_leaves_the_config_unchanged() {
     let farm = Farm::golden("cutover-pg-check");
     let bytes = read(&farm.db);
@@ -151,7 +146,6 @@ fn a_check_that_fails_before_the_commit_leaves_the_config_unchanged() {
 /// commit fails the cutover with status 1 saying the target holds a copy that does not
 /// match, and leaves the kbf.toml, the state file and the directory as they were.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_check_that_fails_after_the_commit_leaves_the_config_unchanged() {
     let farm = Farm::golden("cutover-pg-after");
     let bytes = read(&farm.db);
@@ -177,7 +171,6 @@ fn a_check_that_fails_after_the_commit_leaves_the_config_unchanged() {
 /// Asserts that a rollback after a cutover puts the kbf.toml back byte for byte, removes the
 /// backup, and leaves the state file as it was.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn a_rollback_after_a_cutover_restores_the_original_byte_for_byte() {
     let farm = Farm::golden("cutover-pg-rollback");
     let bytes = read(&farm.db);
@@ -205,7 +198,6 @@ fn tool(argv: &[&str]) -> Output {
 /// with status 0, refuses a second switch with status 2 (the backup is there) before it
 /// copies, rolls back with status 0, and refuses a second rollback with status 2.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the CI Postgres jobs run it"]
 fn the_binary_switches_refuses_a_second_switch_and_rolls_back() {
     let farm = Farm::golden("cutover-pg-binary");
     let target = Database::with_schema();
