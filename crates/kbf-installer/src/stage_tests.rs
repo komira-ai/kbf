@@ -225,7 +225,7 @@ mod more;
 /// cycle's view of the release is what the binary declared. (The state is left alone:
 /// `the_pipeline_installs_and_never_writes_the_state`.)
 ///
-/// Mutants seen red: the probe run with no `run_as`; the marker not written; `dl/` left in
+/// Catches: the probe run with no `run_as`; the marker not written; `dl/` left in
 /// the release.
 #[test]
 fn an_honest_release_is_verified_in_order_and_installed_with_its_marker() {
@@ -299,7 +299,7 @@ fn mode_of_dir(dir: &Path) -> u32 {
 /// parent that counted another number of bytes, and a component over the host's cap each
 /// end the stage as `size` before `gh` is asked or anything is unpacked.
 ///
-/// Mutant seen red: the on-disk length not compared; the received count not compared;
+/// Catches: the on-disk length not compared; the received count not compared;
 /// the cap not applied.
 #[test]
 fn a_component_of_another_size_than_ordered_is_refused_before_anything_runs() {
@@ -333,7 +333,7 @@ fn a_component_of_another_size_than_ordered_is_refused_before_anything_runs() {
 /// parent computed, and what is on the disk now (a tarball swapped after it was hashed has
 /// the right length and the wrong hash). Neither reaches `gh`.
 ///
-/// Mutants seen red: the claim not compared with the order; the file not hashed again.
+/// Catches: the claim not compared with the order; the file not hashed again.
 #[test]
 fn a_digest_other_than_the_orders_is_refused() {
     let bytes = tarball();
@@ -368,7 +368,7 @@ fn a_digest_other_than_the_orders_is_refused() {
 /// a second name, a FIFO (which must not block the open), another owner's file. Each is a
 /// `trust_chain` refusal, before a byte is read.
 ///
-/// Mutants seen red: `O_NOFOLLOW` dropped; the link-count check dropped; `O_NONBLOCK`
+/// Catches: `O_NOFOLLOW` dropped; the link-count check dropped; `O_NONBLOCK`
 /// dropped (the FIFO case hangs, so it is bounded by the test runner's timeout); the owner
 /// check dropped.
 #[test]
@@ -429,7 +429,7 @@ fn a_download_that_is_not_the_parents_plain_file_is_refused() {
 /// `attestation`, every allowed ref is tried before it does, nothing is unpacked or run
 /// (the binary is never started), and nothing is installed.
 ///
-/// Mutants seen red: `gh` not run; its exit status ignored.
+/// Catches: `gh` not run; its exit status ignored.
 #[test]
 fn a_release_gh_does_not_accept_is_refused_and_nothing_runs() {
     let mut rig = Rig::new("gh-no");
@@ -455,7 +455,7 @@ fn a_release_gh_does_not_accept_is_refused_and_nothing_runs() {
 /// garbage and is also not attested is refused as `attestation` (it was never opened), and
 /// an attested archive that is garbage is refused as `shape` without anything being run.
 ///
-/// Mutant seen red: the archive unpacked before the attestation is asked.
+/// Catches: the archive unpacked before the attestation is asked.
 #[test]
 fn nothing_is_unpacked_before_the_attestation_holds() {
     let rig = Rig::new("order");
@@ -494,7 +494,7 @@ fn nothing_is_unpacked_before_the_attestation_holds() {
 /// second entry, a path in the name, trailing bytes. Each is `shape`, after `gh` accepted
 /// it and before anything ran.
 ///
-/// Mutant seen red: the shape check dropped from the pipeline (the symlink entry installs).
+/// Catches: the shape check dropped from the pipeline (the symlink entry installs).
 #[test]
 fn an_attested_archive_of_the_wrong_shape_is_refused_unrun() {
     let link = Item {
@@ -535,7 +535,7 @@ fn an_attested_archive_of_the_wrong_shape_is_refused_unrun() {
 /// Catches an attested binary of another platform being run: a 64-bit ARM ELF on an x86-64
 /// host, a Mach-O on Linux and a script are `platform` refusals, before the probe.
 ///
-/// Mutant seen red: the header check dropped.
+/// Catches: the header check dropped.
 #[test]
 fn a_binary_for_another_platform_is_refused_unrun() {
     for (name, content) in [
@@ -565,7 +565,7 @@ fn a_binary_for_another_platform_is_refused_unrun() {
 /// min_protocol, state_schema, profile) that differs from what the binary declared is a
 /// `facts` refusal naming the field, and the release is not installed.
 ///
-/// Mutants seen red: one field dropped from the comparison (each field is tried alone).
+/// Catches: one field dropped from the comparison (each field is tried alone).
 #[test]
 fn each_expected_fact_must_equal_what_the_binary_declares() {
     for field in [
@@ -607,7 +607,7 @@ fn each_expected_fact_must_equal_what_the_binary_declares() {
 /// `facts` before any work (nothing is run, nothing created), while a `frontend_update`
 /// may leave them out and is then held to the commit and the release profile only.
 ///
-/// Mutants seen red: a missing `expected` skipping the comparison for an activation; the
+/// Catches: a missing `expected` skipping the comparison for an activation; the
 /// commit check skipped for a `frontend_update`.
 #[test]
 fn facts_are_required_for_an_activation_and_optional_for_a_frontend_update() {
@@ -647,7 +647,7 @@ fn facts_are_required_for_an_activation_and_optional_for_a_frontend_update() {
 /// each refused (`facts`); a build that declares the right one passes, and so does one
 /// carrying a field this installer does not know (a newer build's).
 ///
-/// Mutants seen red: the cap dropped; the declared platform not compared with the header;
+/// Catches: the cap dropped; the declared platform not compared with the header;
 /// unknown fields refused again (`probe-unknown` fails).
 #[test]
 fn the_probe_is_read_strictly() {
@@ -682,7 +682,7 @@ fn the_probe_is_read_strictly() {
 /// whose protocol is below `min_protocol` is `floor`; one whose protocol, min_protocol or
 /// state schema is above what this installer understands is `installer_too_old`.
 ///
-/// Mutants seen red: the floor comparison reversed; one of the three limits dropped.
+/// Catches: the floor comparison reversed; one of the three limits dropped.
 #[test]
 fn a_release_below_the_floor_or_beyond_the_installer_is_refused() {
     let mut rig = Rig::new("floor");
@@ -711,7 +711,7 @@ fn a_release_below_the_floor_or_beyond_the_installer_is_refused() {
 /// and a source that cannot tell, each refuse as `lease` after the binary was verified and
 /// before the release directory exists.
 ///
-/// Mutants seen red: the check dropped; the check after the rename.
+/// Catches: the check dropped; the check after the rename.
 #[test]
 fn a_live_lease_refuses_before_the_release_is_installed() {
     let rig = Rig::new("lease");
@@ -737,7 +737,7 @@ fn a_live_lease_refuses_before_the_release_is_installed() {
 /// directory in the partial tree, writing it fails, and then no release directory may
 /// exist (a `releases/<commit>/` is only ever made whole, with its marker).
 ///
-/// Mutant seen red: the rename before the marker.
+/// Catches: the rename before the marker.
 #[test]
 fn the_marker_is_written_before_the_directory_is_renamed_into_place() {
     let rig = Rig::new("marker");
@@ -766,7 +766,7 @@ fn the_marker_is_written_before_the_directory_is_renamed_into_place() {
 /// other bytes, or as a link is `release-differs` and left as it was. A new fetch is
 /// always fully verified first (the honest runner is asked every time).
 ///
-/// Mutants seen red: the marker not required; the bytes not compared; a component missing
+/// Catches: the marker not required; the bytes not compared; a component missing
 /// from the directory taken as the same.
 #[test]
 fn an_existing_release_directory_is_the_same_release_or_a_refusal() {
@@ -864,7 +864,7 @@ fn the_files_fetched_must_be_the_components_ordered() {
 /// Catches the trust list not being checked first: a `gh` that group or others may write
 /// ends the stage as `trust_chain` before any file of the download is opened.
 ///
-/// Mutant seen red: the trust check dropped.
+/// Catches: the trust check dropped.
 #[test]
 fn an_untrusted_gh_ends_the_stage_first() {
     let mut rig = Rig::new("trust");
@@ -950,7 +950,7 @@ fn gone(marker: &str) -> bool {
 /// and `facts`, in seconds, installing nothing. The stand-in (a long `sleep`) is dead too;
 /// that a program's whole group is killed is `run`'s test.
 ///
-/// Mutants seen red: the policy's limit not passed to `gh`; not passed to the probe.
+/// Catches: the policy's limit not passed to `gh`; not passed to the probe.
 #[test]
 fn a_hanging_gh_and_a_hanging_binary_are_killed_at_their_limits() {
     for (who, word) in [("gh", "attestation"), ("probe", "facts")] {
@@ -1034,7 +1034,7 @@ fn tuned() -> InstallerToml {
 /// taken from another field (`min_generation`, `fetch_timeout_s`), the floor lost, or the
 /// supported numbers replaced by anything but [`supported`] fails.
 ///
-/// Mutants planted: `min_protocol` read from `min_generation`; `max_component_bytes` from
+/// Catches: `min_protocol` read from `min_generation`; `max_component_bytes` from
 /// `fetch_timeout_s`; `supported` replaced by the test policy's 10/10/10.
 #[test]
 fn a_policy_is_the_installer_tomls_caps_and_floor_over_the_installers_own_numbers() {
@@ -1063,7 +1063,7 @@ fn a_policy_is_the_installer_tomls_caps_and_floor_over_the_installers_own_number
 /// changed on purpose (decision D3), and the schema is the database client's own newest, not
 /// a copy. `kbf-cli`'s test pins them against what the server declares.
 ///
-/// Mutants planted: `protocol` 2; `state_schema` 0.
+/// Catches: `protocol` 2; `state_schema` 0.
 #[test]
 fn the_supported_numbers_are_protocol_one_and_the_embedded_schema() {
     let s = supported();

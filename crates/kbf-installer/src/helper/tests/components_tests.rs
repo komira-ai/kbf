@@ -14,7 +14,7 @@ use super::*;
 /// was `kbf-daemon`, which the check refused ("this platform needs exactly [kbf]"), so no
 /// Mac could take a roll.
 ///
-/// Mutant planted: `DarwinArm64.components()` as `["kbf-daemon"]` (the Mac's order is refused
+/// Catches: `DarwinArm64.components()` as `["kbf-daemon"]` (the Mac's order is refused
 /// before the fetch).
 #[test]
 fn an_order_naming_the_components_the_store_needs_passes_the_name_check() {
