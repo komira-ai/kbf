@@ -181,3 +181,11 @@ jobs:
       - run: rustup toolchain install
       - name: A pool lease's Metal state and the clean (root, real users)
         run: cargo xtask sudo-test -p kbf-driver-native --test slot_gpu -- --test-threads=1 --nocapture
+      # The test binary the step above built, for a run by hand on a Mac with no Rust
+      # toolchain (it still needs root, swiftc and a Metal device).
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: slot-gpu-test-darwin-arm64
+          path: target/debug/deps/slot_gpu-*
+          retention-days: 14
+          if-no-files-found: error
