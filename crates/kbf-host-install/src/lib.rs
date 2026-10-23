@@ -91,7 +91,7 @@ pub mod contract {
 /// here is for production code.
 #[doc(hidden)]
 pub mod mac_tools {
-    pub use crate::mac::tools;
+    pub use crate::mac::{fetch, release, tools};
     pub use crate::runner::{Cmd, Exec, Identity, Runner, SystemRunner};
 }
 

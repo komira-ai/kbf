@@ -97,7 +97,8 @@ fn an_earlier_host_is_split_into_the_new_files_and_its_original_is_kept() {
     assert_eq!(file_meta(&exec, KBF_TOML), (0o640, GROUP_KBF));
     assert_eq!(text(&exec, AIO_FRONTEND_TOML), FRONTEND_GOLDEN);
     assert_eq!(file_meta(&exec, AIO_FRONTEND_TOML), (0o640, GROUP_SERVER));
-    assert_eq!(text(&exec, INSTALLER_TOML), INSTALLER_GOLDEN);
+    let fresh = on_a_fresh_host(INSTALLER_GOLDEN);
+    assert_eq!(text(&exec, INSTALLER_TOML), fresh);
     assert_eq!(text(&exec, COPY), EARLIER);
     assert_eq!(file_meta(&exec, COPY), (0o600, ROOT));
     assert_eq!(dir_meta(&exec, COPY_DIR), (0o700, ROOT));
@@ -203,7 +204,8 @@ fn a_flag_of_the_run_overrides_the_old_value_and_the_rest_is_carried() {
     assert_eq!(text(&exec, KBF_TOML), sibling);
     let children = FRONTEND_GOLDEN.replace(DATABASE, database);
     assert_eq!(text(&exec, AIO_FRONTEND_TOML), children);
-    let installer = INSTALLER_GOLDEN.replace(DATABASE, database);
+    let fresh = on_a_fresh_host(INSTALLER_GOLDEN);
+    let installer = fresh.replace(DATABASE, database);
     assert_eq!(text(&exec, INSTALLER_TOML), installer);
     assert_eq!(text(&exec, COPY), EARLIER);
 }

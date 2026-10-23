@@ -160,7 +160,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-estimator` | yes | per-key memory and CPU size summaries and estimates learned from earlier runs, with an OOM floor and raise-only state (only the offline replay calls it yet) |
 | `kbf-estimator-replay` | no | the read-only exporter of the farm's run history (`kbf-estimator-replay export`: GET routes only, one JSON line per attempt, one file per UTC day); and a memory-only replay of the export through the real scheduler and `kbf-estimator` (`kbf-estimator-replay replay`) |
 | `kbf-objstore` | no | the `ObjectStore` trait, an in-memory store, a local-directory store (`FsStore`, `kbf-server --cold-store=file://...`), an S3 store, the conformance suite |
-| `kbf-tier` | no | the local write tier's disk layer ([write-path.md](docs/design/write-path.md) section 6): block files in the hot store directory (`kbf-server --hot-store`) written in reserved ranges and synced (file and name) before a range may be committed, seals at the segment limit or after the seal-after interval, the hot store's budget, and the restart: the `TIER` check, staged blocks cut to their committed length, and the orphan sweep, against the committed state through `StagedIndex`; once flushed, blocks become `.seg` copies evicted least recently read first, only in what the budget leaves over. `kbf-front` (`Cache::attach_tier`, `Cache::flush_tier`) stages writes on it, reads staged blobs from it, and runs the flusher; `kbf-server` attaches it with `--hot-store` over either metadata log (under the Raft metadata log it first raises the log to machine version 5, once; a server without a tier never raises it) |
+| `kbf-tier` | no | the local write tier's disk layer ([write-path.md](docs/design/write-path.md) section 6): block files in the hot store directory (`kbf-server --hot-store`) written in reserved ranges and synced (file and name) before a range may be committed, seals at the segment limit or after the seal-after interval, the hot store's budget, and the restart: the `TIER` check, staged blocks cut to their committed length, and the orphan sweep, against the committed state through `StagedIndex`; once flushed, blocks become `.seg` copies evicted least recently read first, only in what the budget leaves over. `kbf-front` (`Cache::attach_tier`, `Cache::flush_tier`) stages writes on it, reads staged blobs from it, and runs the flusher; `kbf-server` attaches it with `--hot-store` over either metadata log (nothing raises the log: the tier's commands commit to the Raft metadata log as it is) |
 | `kbf-state` | no | the state store trait the scheduler writes every change through ([architecture-v2](docs/design/architecture-v2.md) section 4.1): compare-and-set with versions, multi-key transactions, counters, time-to-live keys on the store's own clock, a change feed a poller resumes without skipping a row, durable acknowledgements, group commit and a bounded range scan under a prefix, between two bounds, forward or in reverse, that pages with a resume token; an in-memory fake with an injectable clock; the SQLite backend (`sqlite`: one writer thread, WAL with a sync per group commit, a 5 ms commit window, `flock` on `<file>.lock`, a network filesystem refused (on Linux only), the epoch bumped on every open, the online `backup` (`VACUUM INTO` while the store writes, into a single file) and the check of a backup, the offline `restore` (also under a `StoreLock` the caller holds, the store's own lock), and the commit-latency figures); and, with the `postgres` feature, the Postgres backend (`SERIALIZABLE` batches, revisions from one locked head row, the database's `clock_timestamp()` for expiry, a `SKIP LOCKED` claim path; it refuses a server whose `synchronous_commit` is not on), run against a real server by the pull-request gate (every Postgres test makes a database or a schema of its own) and by the `state-postgres` CI job; and the conformance suite C1 to C8 every backend must pass |
 | `kbf-history` | no | build history in the object store ([ui-data.md](docs/design/ui-data.md) section 5), as a library not yet wired into the server: the one container format (a versioned header, zstd blocks of length-prefixed protobuf records, a footer with the block index and the family summary, a trailer with the footer's CRC-32C), object keys led by retention class (`r7`, `r30`, `r45`, `r400`) and the `ui/` index row keys; the run, hit and outcome records, tails, command renderings and failed-run sections, each with its `instance`; time-ordered run ids minted from memory (stream blocks from the `ui/streams` counter, a fallback range that never waits); the writer core (chunks cut by size, age, day, stream and close; object written first and index rows second through `kbf-state`; bounded queues and a bounded set of open invocations that drop and count; rows dropped past the bound restored from the object's footer with no LIST); the reader (a run id to its record, an invocation to its header and newest chunk summary, its records a bounded page of chunks at a time, all-must-allow across instances); the index seam (`HistoryIndex`: rows under an `IndexRoot`, every blocking state-store call through an `Offload` the server supplies); and `Scoped`, an object store that refuses every key outside `history/` |
 | `kbf-front` | no | the REAPI services over a `Cache` and a `Dispatch`, and the invocation `Recorder` the services and the farm send events to (a channel bounded in events and bytes that drops, never waits) |
@@ -270,14 +270,25 @@ client                      kbf-server                               kbf-daemon
 7. **Answer.** An accepted successful result (exit code 0, not `do_not_cache`) is
    written to the action cache *before* the callers are answered.
 
-`WaitExecution` streams the same stages for an operation name that Execute returned.
-A finished operation is kept for `--finished-retention-secs` (60 by default), in which
-WaitExecution streams its done operation, so a client whose Execute stream broke still
-gets a result the action cache does not keep; then it is forgotten, and the next
-Execute for it is answered from the action cache. An operation name is `operations/{term}-{n}`: the server process's term
-(the one its leases carry) and a count that starts at 0 in each process. A name from
-an earlier process, or any other name, is `NOT_FOUND`, so a client still holding one
-after a restart is never attached to another action's operation.
+`WaitExecution` streams the same stages for an operation name that Execute returned, and
+`GetOperation` reads the stage the name's operation is at, once. A finished operation is
+kept for `--finished-retention-secs` (60 by default), in which WaitExecution streams its
+done operation, so a client whose Execute stream broke still gets a result the action
+cache does not keep; then it is forgotten, and the next Execute for it is answered from
+the action cache.
+
+Over a state store, an operation name is `operations/<id>`:
+the operation's id, which the store numbers (each server reserves blocks of ids, so an id
+names one operation on every server of the store and across restarts). Any server answers
+the name: from its scheduler if it holds the operation, otherwise from the store's rows,
+and a result stays in the store for at least ten minutes (`DONE_FLOOR`, or the finished
+retention if that is longer), so a client that reconnects to another server after the finish still
+gets it. After that, or for a name nobody gave, the answer is `NOT_FOUND`. A server with no
+state store (tests only) names an operation `operations/{term}-{n}`: its process's term
+(the one its leases carry) and a count that starts at 0 in each process, and answers no
+other name, so a client still holding a name from an earlier process is never attached to
+another action's operation. A name of that form is answered over a store only by the
+process that issued it, while it holds the caller.
 
 See [scheduler.md](docs/design/scheduler.md) and
 [worker-protocol.md](docs/design/worker-protocol.md).

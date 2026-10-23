@@ -3,20 +3,16 @@
 //!
 //! The rules follow from which modes enroll (docs/design/kbf-installer.md section 3): the
 //! node modes `storage`, `daemon` and `storage-and-daemon` enroll with a frontend, so they
-//! need its URL and an enrollment token, and may fetch releases from it once enrolled; the
-//! `frontend` and `all-in-one` hosts do not enroll, so they take neither and fetch from a
-//! file server. Any mode may take `--release-source bundled`, which fetches nothing and so
-//! takes no URL and no first release to name.
-
-use std::path::PathBuf;
+//! need its URL and an enrollment token; the `frontend` and `all-in-one` hosts do not enroll,
+//! so they take neither. The flags that named a release source or a first release are not
+//! checked: they are taken and ignored ([`RetiredFlags`]).
 
 use super::kbf_settings::{KbfFlags, Setting};
 use super::paths;
 use super::proxy::{ProxyFlags, ProxyPlan};
-use super::release_keys::ReleaseFlags;
-use crate::CommitId;
-use crate::cli::{Mode, ReleaseSource};
-use crate::installer_toml::{FrontendPull, Source, https_authority_named, https_base_named};
+use super::retired::RetiredFlags;
+use crate::cli::Mode;
+use crate::installer_toml::https_authority_named;
 use crate::layout::Platform;
 use kbf_state::postgres::PostgresConfig;
 
@@ -26,12 +22,9 @@ pub struct Raw {
     pub mode: Mode,
     pub frontend_url: Option<String>,
     pub token_file: Option<String>,
-    pub release_source: Option<ReleaseSource>,
-    pub release_url: Option<String>,
-    /// `--release-ca` and the frontend snapshot flags: the keys a release source has of its own.
-    pub release: ReleaseFlags,
     pub min_generation: Option<u64>,
-    pub commit: Option<CommitId>,
+    /// The flags that no longer do anything; `setup` warns when any was given.
+    pub retired: RetiredFlags,
     /// `--database`: the state database's URL.
     pub database: Option<String>,
     /// The listener, certificate and storage-client flags of a frontend or all-in-one host.
@@ -52,15 +45,8 @@ pub struct Valid {
     pub frontend_url: Option<String>,
     /// The operator's enrollment token file, an absolute path, for the node modes.
     pub token_file: Option<String>,
-    pub source: Source,
-    /// The roots a `url` source is checked against instead of the system's.
-    pub release_ca: Option<PathBuf>,
-    /// The frontend's worker listener and CA, for a `frontend` source that pulls over the LAN.
-    pub frontend: Option<FrontendPull>,
     /// The operator floor the flag gives; the file's own is kept when there is none.
     pub min_generation: Option<u64>,
-    /// The first release to install.
-    pub commit: Option<CommitId>,
     /// The state database's `postgres://` URL, for the modes that keep their state there. It
     /// has no password and no character a TOML string would escape. No message quotes it.
     pub database: Option<String>,
@@ -162,41 +148,22 @@ impl Raw {
                 "setup writes {installer_toml}, where the installer's unit reads it: --installer-config is for run"
             ));
         }
-        let source = self.source(node, &mut problems);
-        match (&self.commit, &source) {
-            (Some(_), Some(Source::Frontend)) => problems.push(
-                "--commit installs the first release before the host has enrolled, so it cannot \
-                 come from the frontend: use --release-source url"
-                    .to_owned(),
-            ),
-            (Some(_), Some(Source::Bundled)) => problems.push(
-                "--release-source bundled takes no --commit: the release is the one the package \
-                 carries"
-                    .to_owned(),
-            ),
-            _ => {}
-        }
-        let (release_ca, frontend) = self.release.validate(source.as_ref(), &mut problems);
         if self.min_generation == Some(0) {
             problems.push("--min-generation 0 is no floor: leave it out".to_owned());
         }
-        match source {
-            Some(source) if problems.is_empty() => Ok(Valid {
-                mode: self.mode,
-                frontend_url,
-                token_file,
-                source,
-                release_ca,
-                frontend,
-                min_generation: self.min_generation,
-                commit: self.commit.clone(),
-                database,
-                kbf,
-                proxy,
-                local_database,
-            }),
-            _ => Err(problems),
+        if !problems.is_empty() {
+            return Err(problems);
         }
+        Ok(Valid {
+            mode: self.mode,
+            frontend_url,
+            token_file,
+            min_generation: self.min_generation,
+            database,
+            kbf,
+            proxy,
+            local_database,
+        })
     }
 
     /// The state database: required where the mode keeps its state in one, refused elsewhere.
@@ -273,37 +240,6 @@ impl Raw {
             None
         };
         (Some(url.clone()), local)
-    }
-
-    fn source(&self, node: bool, problems: &mut Vec<String>) -> Option<Source> {
-        let chosen = self.release_source.unwrap_or(if node {
-            ReleaseSource::Frontend
-        } else {
-            ReleaseSource::Url
-        });
-        match (chosen, &self.release_url) {
-            (ReleaseSource::Frontend, None) if node => Some(Source::Frontend),
-            (ReleaseSource::Frontend, None) => {
-                problems.push(format!(
-                    "--release-source frontend needs an enrolled node; --mode={} does not enroll: use --release-source url",
-                    mode_name(self.mode)
-                ));
-                None
-            }
-            (ReleaseSource::Bundled, None) => Some(Source::Bundled),
-            (ReleaseSource::Frontend | ReleaseSource::Bundled, Some(_)) => {
-                problems.push("--release-url is only for --release-source url".to_owned());
-                None
-            }
-            (ReleaseSource::Url, None) => {
-                problems.push("--release-source url needs --release-url".to_owned());
-                None
-            }
-            (ReleaseSource::Url, Some(u)) => https_base_named("--release-url", u)
-                .map(Source::Url)
-                .map_err(|e| problems.push(e))
-                .ok(),
-        }
     }
 }
 

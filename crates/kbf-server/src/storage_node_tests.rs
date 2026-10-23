@@ -15,7 +15,7 @@ use kbf_objstore::{
     ObjectStoreError, PageSize,
 };
 
-use super::{one_voter, open_among, open_registered, prefix_root};
+use super::{catch_up_for, one_voter, open_among, open_registered, prefix_root};
 use crate::RaftMetaLog;
 use crate::join::Joined;
 
@@ -125,6 +125,14 @@ async fn start_and_write(dir: &Path, bucket: &Bucket, who: &Joined, n: usize) ->
     bucket.written()[before..].to_vec()
 }
 
+/// The machine version of the log in `dir`, opened and closed again.
+async fn version_of(dir: &Path) -> MachineVersion {
+    let meta = RaftMetaLog::open_dir(dir, Retention::default(), "kbf/")
+        .await
+        .expect("open the log");
+    meta.machine_version()
+}
+
 /// Catches: a node whose keys repeat after its metadata directory is wiped (the new log
 /// starts its epochs, and any counter it keeps, from 1 again). The node registers
 /// (member 7, boot 1), writes, loses its directory, registers again (the state store
@@ -152,10 +160,10 @@ async fn a_wiped_node_never_reuses_its_keys() {
     }
 }
 
-/// Catches: a registration of member or boot zero taken (no `NodeWriter` can name it,
-/// and a default-filled answer would make every node one writer), a log left below the
-/// version that takes `SetWriter`, and a second start as a boot the log has set. Each
-/// refusal comes before anything is written.
+/// Asserts that a registration of member or boot zero is refused (no `NodeWriter` can
+/// name it, and a default-filled answer would make every node one writer), and so is a
+/// second start as a boot the log has set. Each refusal comes before anything is
+/// written, and no open raises the log.
 #[tokio::test]
 async fn a_registration_the_log_cannot_take_refuses_the_open() {
     let dir = meta_dir("refusals");
@@ -174,11 +182,7 @@ async fn a_registration_the_log_cannot_take_refuses_the_open() {
     let meta = RaftMetaLog::open_dir(&dir, Retention::default(), "kbf/")
         .await
         .expect("open the log");
-    assert_eq!(
-        meta.machine_version(),
-        MachineVersion::V1,
-        "a refusal raised nothing"
-    );
+    assert_eq!(meta.machine_version(), MachineVersion::V1);
     let keys = ObjectKeys::under(meta.store_prefix());
     let cache = open_registered(meta, bucket.clone(), keys, &joined(7, 3))
         .await
@@ -187,7 +191,7 @@ async fn a_registration_the_log_cannot_take_refuses_the_open() {
     let meta = RaftMetaLog::open_dir(&dir, Retention::default(), "kbf/")
         .await
         .expect("open the log again");
-    assert_eq!(meta.machine_version(), MachineVersion::V4);
+    assert_eq!(meta.machine_version(), MachineVersion::V1);
     let keys = ObjectKeys::under(meta.store_prefix());
     let refused = open_registered(meta, bucket.clone(), keys, &joined(7, 3))
         .await
@@ -242,10 +246,9 @@ fn the_root_is_the_logs_prefix_less_its_id() {
     );
 }
 
-/// Catches: a registered node that raises a log of a cell of several voters to version
-/// 4 (a replica that does not run it would skip its commands from then on).
+/// Asserts that `one_voter` accepts one voter and refuses three with the voters' message.
 #[test]
-fn only_a_single_voter_log_is_raised_for_a_node() {
+fn only_a_single_voter_log_is_taken_for_a_node() {
     assert_eq!(one_voter(1), Ok(()));
     assert_eq!(
         one_voter(3).err().as_deref(),
@@ -253,12 +256,12 @@ fn only_a_single_voter_log_is_raised_for_a_node() {
     );
 }
 
-/// Catches: a registered node's open that does not refuse a log of several voters
-/// (mutant: the [`one_voter`] call dropped from the open): the open fails with the
-/// voters' message before the log is raised or anything is written. A log this version
-/// creates has one voter, so the count is the open's argument.
+/// Asserts that a registered node's open refuses a log of several voters: the open fails
+/// with the voters' message before anything is written, and the log is left at machine
+/// version 1. A log this version creates has one voter, so the count is the open's
+/// argument.
 #[tokio::test]
-async fn a_log_of_several_voters_refuses_the_open_before_it_is_raised() {
+async fn a_log_of_several_voters_refuses_the_open() {
     let dir = meta_dir("voters");
     let bucket = Bucket::default();
     let meta = RaftMetaLog::open_dir(&dir, Retention::default(), "kbf/")
@@ -280,6 +283,60 @@ async fn a_log_of_several_voters_refuses_the_open_before_it_is_raised() {
         .expect("open the log again");
     assert_eq!(meta.machine_version(), MachineVersion::V1, "nothing raised");
     drop(meta);
+}
+
+/// Asserts that a registered node names its objects by writer (`cas/<member>/<boot>/<seq>`)
+/// on a log that was never raised, with no raise: on its first boot and on the next, the
+/// keys of each are under its own member and boot, and the log is still at machine version
+/// 1 after both, so a binary that runs only that version opens it.
+#[tokio::test]
+async fn a_registered_node_names_its_objects_by_writer_with_no_raise() {
+    let dir = meta_dir("no-raise");
+    let bucket = Bucket::default();
+    let first = start_and_write(&dir, &bucket, &joined(7, 1), 2).await;
+    let prefix = "kbf/cas/0000000000000007/0000000000000001/";
+    assert_eq!(first.len(), 2, "{first:?}");
+    assert!(first.iter().all(|k| k.starts_with(prefix)), "{first:?}");
+    let version = version_of(&dir).await;
+    assert_eq!(version, MachineVersion::V1, "raised by boot 1");
+
+    let second = start_and_write(&dir, &bucket, &joined(7, 2), 2).await;
+    let prefix = "kbf/cas/0000000000000007/0000000000000002/";
+    assert_eq!(second.len(), 2, "{second:?}");
+    assert!(second.iter().all(|k| k.starts_with(prefix)), "{second:?}");
+    let version = version_of(&dir).await;
+    assert_eq!(version, MachineVersion::V1, "raised by boot 2");
+}
+
+/// Asserts that a registered node opens a log an earlier build raised to machine version 4
+/// (it holds the `MachineVersion` entry) and names its objects by writer there as on any
+/// other log: the log stays at version 4.
+#[tokio::test]
+async fn a_registered_node_opens_a_log_an_earlier_build_raised() {
+    let dir = meta_dir("earlier-raise");
+    let bucket = Bucket::default();
+    let meta = RaftMetaLog::open_dir(&dir, Retention::default(), "kbf/")
+        .await
+        .expect("open the log");
+    meta.raise_machine_version(MachineVersion::V4)
+        .expect("the earlier build's raise");
+    drop(meta);
+
+    let keys = start_and_write(&dir, &bucket, &joined(7, 1), 2).await;
+    let prefix = "kbf/cas/0000000000000007/0000000000000001/";
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    assert!(keys.iter().all(|k| k.starts_with(prefix)), "{keys:?}");
+    assert_eq!(version_of(&dir).await, MachineVersion::V4);
+}
+
+/// Asserts that a registered node owes a rebuild of its index exactly when the rebuild has
+/// not finished: whether the log takes the rebuild's commands (`AdoptSegment`,
+/// `RebuildProgress`, `RebuildDone`) is no input to the answer, since the log takes them at
+/// any machine version.
+#[test]
+fn a_node_owes_a_rebuild_until_it_is_done() {
+    assert!(catch_up_for(false).is_catching_up());
+    assert!(!catch_up_for(true).is_catching_up());
 }
 
 // ---- unit U0 of docs/design/frontend-proxy.md, section 11: a node meets a FRESH state store

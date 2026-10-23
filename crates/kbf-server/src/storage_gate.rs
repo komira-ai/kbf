@@ -1,5 +1,5 @@
 //! G_S, the storage gate (`docs/design/split-mode-updates.md` section 2.7): may one
-//! storage member go out, or come back in, without leaving a blob with one copy?
+//! storage member go out without leaving a blob with one copy?
 //!
 //! "Never take both owners" cannot be checked per blob: under rendezvous hashing any two
 //! members co-own some blob. So the rule is about the whole fleet. With the host's own
@@ -54,24 +54,6 @@ impl MemberFacts {
     }
 }
 
-/// Which question the gate answers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GateMode {
-    /// Before a pick: the host's own member is `Active` and heard (it is not already
-    /// leaving or dead), and the rest as for [`GateMode::Out`] without a freshness mark.
-    Pick,
-    /// With the host's member marked out (step 1, and step 5 after the mark): its own
-    /// state is not asked, only its repair debt. With `fresh_since`, every other member
-    /// must also have reported at or after that time, so the answer is about the fleet
-    /// as it is with the node out, not before.
-    Out {
-        /// The time the node went out; `None` asks only for a report within the time to live.
-        fresh_since: Option<FarmTime>,
-    },
-    /// With the host's member back (step 8): every member, its own too, as for a pick.
-    In,
-}
-
 /// Why the gate is shut. The first thing found, the worst first: a second member down
 /// before a debt before a report not yet in.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -109,13 +91,6 @@ pub enum GateFail {
         /// The member.
         member: MemberId,
     },
-    /// A member has not reported since the node went out, so the answer would be about the
-    /// fleet before. Not a failure yet: the report is due within a heartbeat.
-    #[error("member {member} has not reported since the node went out")]
-    NotReportedSince {
-        /// The member.
-        member: MemberId,
-    },
     /// A member does not report its repair debt: unknown is not zero.
     #[error("member {member} does not report its repair debt")]
     DebtUnknown {
@@ -147,26 +122,14 @@ impl GateFail {
         )
     }
 
-    /// Whether waiting a heartbeat may open the gate: the report it needs is not in yet.
-    #[must_use]
-    pub const fn is_report_pending(&self) -> bool {
-        matches!(self, Self::NotReportedSince { .. })
-    }
-
-    /// 2: a second member down; 0: a report not yet in; 1: anything else.
+    /// 2: a second member down; 1: anything else.
     const fn rank(&self) -> u8 {
-        if self.is_second_member_down() {
-            2
-        } else if self.is_report_pending() {
-            0
-        } else {
-            1
-        }
+        if self.is_second_member_down() { 2 } else { 1 }
     }
 }
 
-/// Evaluates G_S for the storage member `own` (a member of `members`, or the gate is
-/// shut with [`GateFail::Unlinked`]).
+/// Evaluates G_S for the storage member `own` going out (a member of `members`, or the gate
+/// is shut with [`GateFail::Unlinked`]): its own state is not asked, only its repair debt.
 ///
 /// # Errors
 /// The worst thing that keeps the gate shut ([`GateFail`]); the first of equals, members
@@ -174,7 +137,6 @@ impl GateFail {
 pub fn storage_gate(
     members: &[MemberFacts],
     own: MemberId,
-    mode: GateMode,
     ttl: Duration,
     now: FarmTime,
 ) -> Result<(), GateFail> {
@@ -188,13 +150,7 @@ pub fn storage_gate(
             worst = Some(fail);
         }
     };
-    if !matches!(mode, GateMode::Out { .. })
-        && let Err(fail) = live(me, ttl, now)
-    {
-        note(fail);
-    }
-    // The debt it owes counts whatever the mode: a node going out with copies owed leaves
-    // them owed.
+    // The debt it owes counts: a node going out with copies owed leaves them owed.
     if let Err(fail) = debt_settled(me) {
         note(fail);
     }
@@ -206,14 +162,6 @@ pub fn storage_gate(
     for peer in peers {
         if let Err(fail) = live(peer, ttl, now) {
             note(fail);
-            continue;
-        }
-        if let GateMode::Out {
-            fresh_since: Some(since),
-        } = mode
-            && peer.heard_at.is_none_or(|heard| heard < since)
-        {
-            note(GateFail::NotReportedSince { member: peer.id });
             continue;
         }
         if let Err(fail) = debt_settled(peer) {
@@ -432,5 +380,69 @@ mod tests {
             link(&host(), &adverts("s1:7000"), &members),
             Link::Unlinked(_)
         ));
+    }
+
+    const NOW: u64 = 1_000_000;
+    const TTL: Duration = Duration::from_secs(15);
+
+    fn facts(id: u64) -> MemberFacts {
+        MemberFacts {
+            id: MemberId(id),
+            state: MemberState::Active,
+            planned_down: false,
+            heard_at: Some(FarmTime::from_millis(NOW)),
+            repair_debt: Some(0),
+            down_since: None,
+            boot: None,
+        }
+    }
+
+    fn gate(members: &[MemberFacts]) -> Result<(), GateFail> {
+        storage_gate(members, MemberId(1), TTL, FarmTime::from_millis(NOW))
+    }
+
+    /// Catches: a member heard at a time after the look counted fresh, so a clock that is wrong
+    /// makes a silent member look alive.
+    #[test]
+    fn a_member_heard_after_the_look_is_not_fresh() {
+        let now = FarmTime::from_millis(NOW);
+        let mut m = facts(2);
+        assert!(m.is_fresh(now, TTL));
+        m.heard_at = Some(FarmTime::from_millis(NOW + 1));
+        assert!(!m.is_fresh(now, TTL));
+        m.heard_at = Some(FarmTime::from_millis(NOW - 15_001));
+        assert!(!m.is_fresh(now, TTL));
+        m.heard_at = None;
+        assert!(!m.is_fresh(now, TTL));
+    }
+
+    /// Catches: the last failure found, or a debt, reported instead of a second member down,
+    /// and a later failure of the same rank replacing the first: the worst wins, and of equals
+    /// the member with the lowest id.
+    #[test]
+    fn the_worst_failure_is_reported_and_the_first_of_equals() {
+        assert_eq!(gate(&[facts(1), facts(2)]), Ok(()));
+        let mut down = facts(5);
+        down.state = MemberState::Down;
+        let mut owing3 = facts(3);
+        owing3.repair_debt = Some(5);
+        let mut owing4 = facts(4);
+        owing4.repair_debt = Some(9);
+        assert_eq!(
+            gate(&[facts(1), owing4.clone(), owing3.clone(), down.clone()]),
+            Err(GateFail::NotActive {
+                member: MemberId(5),
+                state: MemberState::Down
+            })
+        );
+        assert_eq!(
+            gate(&[facts(1), owing4, owing3]),
+            Err(GateFail::Debt {
+                member: MemberId(3),
+                blobs: 5
+            })
+        );
+        assert_eq!(gate(&[facts(2)]), Err(GateFail::Unlinked));
+        assert_eq!(gate(&[facts(1)]), Err(GateFail::NoPeer));
     }
 }

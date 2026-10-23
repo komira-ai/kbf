@@ -3,6 +3,8 @@
 //! compare-and-set on the counter rows, an epoch created once and kept, and the operator's
 //! raise of it.
 
+use std::sync::atomic::AtomicUsize;
+
 use kbf_front::{Cache, Dispatch, Submission};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{
@@ -21,18 +23,54 @@ const CAS_TRIES: usize = super::blocks::CAS_TRIES;
 /// frontend's read of a row and its own write of it.
 pub(super) struct Racing {
     inner: Fake,
+    clock: Arc<ManualClock>,
     landings: Mutex<Vec<(String, Txn)>>,
     down: AtomicBool,
+    lease_scans: AtomicUsize,
+    /// Rows whose key starts with one of these cannot be read.
+    unreadable: Mutex<Vec<String>>,
 }
 
 impl Racing {
     pub(super) fn new() -> Arc<Self> {
         let clock = Arc::new(ManualClock::default());
         Arc::new(Self {
-            inner: Fake::with_flaw(clock, Flaw::None),
+            inner: Fake::with_flaw(Arc::clone(&clock), Flaw::None),
+            clock,
             landings: Mutex::new(Vec::new()),
             down: AtomicBool::new(false),
+            lease_scans: AtomicUsize::new(0),
+            unreadable: Mutex::new(Vec::new()),
         })
+    }
+
+    /// How many times every `lease/` row has been read by a scan.
+    pub(super) fn lease_scans(&self) -> usize {
+        self.lease_scans.load(Ordering::SeqCst)
+    }
+
+    /// Moves the store's clock forward by `by`.
+    pub(super) fn advance(&self, by: Duration) {
+        self.clock.advance(by);
+    }
+
+    /// The store takes writes again, or not.
+    pub(super) fn set_down(&self, down: bool) {
+        self.down.store(down, Ordering::SeqCst);
+    }
+
+    /// Reads of the rows under `prefix` fail from now on, or work again (`None`).
+    pub(super) fn fail_reads(&self, prefix: Option<&str>) {
+        let mut unreadable = self.unreadable.lock().expect("lock");
+        unreadable.clear();
+        unreadable.extend(prefix.map(str::to_owned));
+    }
+
+    fn unreadable(&self, key: &str) -> Result<(), StoreError> {
+        let unreadable = self.unreadable.lock().expect("lock");
+        let failing = unreadable.iter().any(|prefix| key.starts_with(prefix));
+        let failed = || StoreError::Failed("the row cannot be read".to_owned());
+        failing.then(failed).map_or(Ok(()), Err)
     }
 
     /// `landing` is applied before the next write that names `key`.
@@ -61,10 +99,14 @@ impl Store for Racing {
     }
 
     fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {
+        self.unreadable(key)?;
         self.inner.get(key)
     }
 
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
+        self.unreadable(prefix)?;
+        let scans = &self.lease_scans;
+        scans.fetch_add(usize::from(prefix == "lease/"), Ordering::SeqCst);
         self.inner.scan_prefix(prefix)
     }
 
@@ -140,11 +182,11 @@ fn try_farm_over(store: &Arc<Racing>) -> Result<Farm, StateError> {
     }))
 }
 
-fn farm_over(store: &Arc<Racing>) -> Farm {
+pub(super) fn farm_over(store: &Arc<Racing>) -> Farm {
     try_farm_over(store).expect("a farm over the store")
 }
 
-fn submit(farm: &Farm, tag: u8) -> Result<(), Status> {
+pub(super) fn submit(farm: &Farm, tag: u8) -> Result<(), Status> {
     farm.submit(Submission {
         request: request(tag),
         call: None,
@@ -154,7 +196,7 @@ fn submit(farm: &Farm, tag: u8) -> Result<(), Status> {
     .map(drop)
 }
 
-fn unfinished(farm: &Farm) -> Vec<OperationId> {
+pub(super) fn unfinished(farm: &Farm) -> Vec<OperationId> {
     farm.lock().sched.unfinished().collect()
 }
 

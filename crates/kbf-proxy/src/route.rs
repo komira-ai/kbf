@@ -104,12 +104,13 @@ pub enum Idle {
 /// The silent-stream bound of every path but the two above (7200 s).
 pub const IDLE_DEFAULT: Duration = Duration::from_secs(7200);
 
-const REAPI_PREFIXES: [&str; 5] = [
+const REAPI_PREFIXES: [&str; 6] = [
     "/build.bazel.remote.execution.v2.Execution/",
     "/build.bazel.remote.execution.v2.ActionCache/",
     "/build.bazel.remote.execution.v2.ContentAddressableStorage/",
     "/build.bazel.remote.execution.v2.Capabilities/",
     "/google.bytestream.ByteStream/",
+    "/google.longrunning.Operations/",
 ];
 // `ColdStore` is the worker listener's (storage role only, which the child's role table
 // enforces; the proxy checks only that the caller is a worker or storage node).
@@ -296,6 +297,21 @@ mod tests {
         ] {
             assert!(!route.grpc(), "{route:?}");
         }
+    }
+
+    /// Asserts that a call of the `Operations` service (GetOperation reads an operation by
+    /// the name Execute returned) is routed to the REAPI listener of the child, with the
+    /// REAPI authentication, and not left to the table's unknown paths.
+    #[test]
+    fn operations_calls_go_to_the_reapi_listener() {
+        let get = "/google.longrunning.Operations/GetOperation";
+        assert_eq!(route_of(get), Route::Child(Target::Reapi));
+        assert_eq!(auth_class(route_of(get)), Some(AuthClass::Reapi));
+        assert!(route_of(get).grpc());
+        assert_eq!(
+            route_of("/google.longrunning.OperationsX/Get"),
+            Route::Unknown
+        );
     }
 
     #[test]

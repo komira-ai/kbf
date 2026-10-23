@@ -1,13 +1,16 @@
 //! Which child holds the operation a `WaitExecution` names (design note `frontend-proxy.md`,
 //! section 3, "Routing", and section 5 step 7).
 //!
-//! An operation's name is `operations/{term}-{waiter}`, and the term is the state-store writer
-//! generation of the child that named it. After a swap the new child answers `NOT_FOUND` to a
-//! name of another term, on purpose (issue #154), while the old child, which lives until its
-//! last stream ends, still holds the operation. So while the old child lives, a
-//! `WaitExecution` whose name carries its term is bound to it
+//! An operation's name, in the form a child with no state store writes and a child over one
+//! still answers for the callers it holds, is `operations/{term}-{waiter}`, and the term is
+//! the state-store writer generation of the child that named it. After a swap the new child
+//! answers `NOT_FOUND` to a name of that form of another term, on purpose (issue #154), while
+//! the old child, which lives until its last stream ends, still holds the operation. So while
+//! the old child lives, a `WaitExecution` whose name carries its term is bound to it
 //! ([`crate::slot::ActiveSlot::bind_preferring`]); every other call, and a name of any other
-//! term, goes to the active child as before.
+//! term, goes to the active child as before. A child over a state store names an operation
+//! `operations/<id>`, with no term: [`operation_term`] reads none from it, and any child
+//! answers it from the store, so it goes to the active child.
 //!
 //! Two halves:
 //!
@@ -19,8 +22,8 @@
 //! - **The child**: [`Terms`] keeps the term of each slot's child. The proxy learns it from
 //!   the child itself: [`poll`] asks every open slot's admin port for `GET /v1/admin/role`
 //!   once a second and keeps `held_generation`, the generation the child took, which is the
-//!   one its operation names carry (its farm machine is built from the generation of the
-//!   store it writes through). A slot's term is recorded with the slot's generation, so a slot
+//!   one the operation names of the old form carry (its farm machine is built from the
+//!   generation of the store it writes through). A slot's term is recorded with the slot's generation, so a slot
 //!   that was retired and opened again is a new child and inherits nothing.
 //!
 //! A term is learned within a poll interval of the child taking the generation (plus up to

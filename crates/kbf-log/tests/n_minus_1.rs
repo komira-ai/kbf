@@ -11,6 +11,8 @@
 //!   until the fixture holds an entry of it;
 //! - `decode` reads each entry the same under every format this build knows, 1 to 5: the
 //!   format number changes nothing in the reading;
+//! - `encode` writes each entry to the same bytes under every format this build knows: a log
+//!   of any format takes every command, so no command needs a raise;
 //! - a reader that does not know an entry skips it and reads on, and a field it does not
 //!   know after an entry changes nothing.
 //!
@@ -243,6 +245,20 @@ fn decode_reads_every_entry_the_same_under_every_known_format() {
         for n in 1..=5 {
             let read = decode(Format::new(n), &written);
             assert_eq!(read.as_ref(), Ok(&command), "format {n}");
+        }
+    }
+}
+
+/// Asserts that `encode` writes an entry of every kind to the same bytes under each format
+/// this build knows, from the first to the newest, so a log of any format takes every
+/// command and none of them needs the log raised first.
+#[test]
+fn encode_writes_every_entry_the_same_under_every_known_format() {
+    for command in every_kind() {
+        let written = encode(Format::V5, &command).expect("encode");
+        for n in 1..=5 {
+            let again = encode(Format::new(n), &command);
+            assert_eq!(again.as_ref(), Ok(&written), "format {n}");
         }
     }
 }

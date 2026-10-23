@@ -69,7 +69,8 @@ impl Hooked {
     /// read their answer (one that failed or panicked first is not counted). Unlike
     /// [`Hooked::after_get`], which one read takes, every read is counted, whichever
     /// thread makes it: for a test that has to know the server's own readers are done
-    /// before it arms a fault meant for one request.
+    /// before it arms a fault meant for one request. The farm's intake poll is not counted
+    /// (see `intake_poll_reads`).
     pub fn count(&self, prefix: &str) -> Arc<AtomicUsize> {
         let count = Arc::new(AtomicUsize::new(0));
         self.counts
@@ -114,6 +115,16 @@ impl Hooked {
             hook();
         }
     }
+}
+
+/// The rows a farm over the store reads every `INTAKE_POLL` by itself, to take in what the
+/// other frontends of the store did (`Farm::intake`): the epoch, and the queue, the cordons,
+/// the floors, the key floors, the sessions and the leases. That poll runs on a clock of its
+/// own, which a test cannot move, so a read of these rows is the farm's and never the read of
+/// a handler under test: it is not counted, and no injection waits for it.
+fn intake_poll_reads(key: &str) -> bool {
+    const ROWS: &str = "queue/ cordon/ floor/ keyfloor/ session/ lease/";
+    key == "meta/epoch" || ROWS.split(' ').any(|rows| key.starts_with(rows))
 }
 
 fn touches(txn: &Txn, prefix: &str) -> bool {
@@ -168,6 +179,9 @@ impl Store for Hooked {
     }
 
     fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {
+        if intake_poll_reads(key) {
+            return self.fake.get(key);
+        }
         if self
             .fail_gets
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -187,6 +201,9 @@ impl Store for Hooked {
     }
 
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
+        if intake_poll_reads(prefix) {
+            return self.fake.scan_prefix(prefix);
+        }
         if self
             .fail_scans
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))

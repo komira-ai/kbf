@@ -20,7 +20,7 @@
 # kbf.slice, usr/share/kbf-installer/trust/{gh,installer.conf,trusted_root.jsonl},
 # usr/lib/sysusers.d/kbf-installer.conf and usr/lib/tmpfiles.d/kbf-installer.conf,
 # etc/needrestart/conf.d/kbf.conf (keeps needrestart from restarting kbf units), and
-# no kbf release: `sudo kbf-installer setup` installs the first one. After placing, the
+# no kbf release (`kbf-installer record-release` records the first one). After placing, the
 # script makes the users and directories from those two files (systemd-sysusers and
 # systemd-tmpfiles, on those files only); a host without systemd is refused before
 # anything is placed. macOS has no payload: nodes there get the .pkg.

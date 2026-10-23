@@ -14,8 +14,8 @@ use kbf_types::{Answer, Digest, FarmTime, OperationId, StateMachine as _, Waiter
 use tokio::sync::watch;
 use tonic::Status;
 
-use super::durable::{Durable, Progress, StateError, StoredCordon};
-use super::{Farm, NodeAction, State, unix_ms};
+use super::durable::{Durable, Held, Progress, StateError, StoredCordon};
+use super::{Farm, NodeAction, State};
 
 /// How many looks in a row at the state store may find an operation neither unfinished
 /// nor ended before it is reported as untraced (a WARN, and `kbf_frontend_relay_untraced`).
@@ -43,8 +43,8 @@ impl Drop for Taking<'_> {
 }
 
 impl NodeAction {
-    /// How the cordon row keeps this action, `at` Unix milliseconds: `None` when the node
-    /// returns to placement.
+    /// How the cordon row keeps this action, `at` milliseconds on the state store's clock:
+    /// `None` when the node returns to placement.
     pub(super) fn stored(self, at: u64) -> Option<StoredCordon> {
         match self {
             Self::Cordon => Some(StoredCordon::Cordoned),
@@ -159,7 +159,8 @@ impl Farm {
             .count()
     }
 
-    /// Answers, from the state store, the callers this fenced farm still holds: an
+    /// Answers, from the state store, the callers this fenced farm still holds, and the
+    /// clients that asked it for an operation by name ([`State::follow_watched`]): an
     /// operation the successor finished gets its result from the `done/` row, one it has
     /// leased is shown executing. A caller waits until its operation finishes, it cancels
     /// (its stream is dropped), or this process is killed: no look count or timer ends
@@ -228,7 +229,8 @@ impl State {
     }
 
     /// Writes `request`, about to be queued, to the state store (see
-    /// [`State::queue`]), unless the farm is fenced.
+    /// [`State::queue`]), unless the farm is fenced, and says where it is held. `now` is
+    /// farm time.
     ///
     /// # Errors
     /// UNAVAILABLE if the farm is fenced or the store did not take it.
@@ -237,23 +239,29 @@ impl State {
         request: &kbf_sched::Request,
         subject: &crate::action_usage::Subject,
         size_key: Option<u64>,
-    ) -> Result<(), Status> {
+        now: FarmTime,
+    ) -> Result<Held, Status> {
         if self.fenced {
             return Err(Status::unavailable(HANDING_OVER));
         }
-        self.queue(request, subject, size_key)
+        self.queue(request, subject, size_key, now)
     }
 
     /// The callers of `operation` still waiting: not answered, and with a stream open
     /// (a caller that cancelled has dropped its end of the channel).
     fn callers_waiting(&self, operation: OperationId) -> Vec<WaiterId> {
+        let callers = self.sched.waiters(operation).unwrap_or_default();
+        self.waiting_among(callers)
+    }
+
+    /// The callers among `callers` still waiting: not answered, and with a stream open.
+    pub(super) fn waiting_among(&self, callers: &[WaiterId]) -> Vec<WaiterId> {
         let waiting = |caller: &WaiterId| {
             let stage = self.stages.get(caller);
             stage.is_some_and(|stage| {
                 !stage.is_closed() && !matches!(*stage.borrow(), Stage::Done(_))
             })
         };
-        let callers = self.sched.waiters(operation).unwrap_or_default();
         callers.iter().copied().filter(waiting).collect()
     }
 
@@ -284,6 +292,9 @@ impl State {
                 }
             }
         }
+        // The operations clients ask for by name that this farm does not hold are looked at
+        // too: a fenced farm takes no intake poll, and answers them from here.
+        self.follow_watched();
         Ok(waiting)
     }
 
@@ -296,29 +307,44 @@ impl State {
     }
 
     /// Takes up the cordons of the nodes an operator placed before this process started,
-    /// as the store holds them: a drain keeps its wall-clock deadline (already past:
-    /// paused at the first tick).
-    pub(super) fn restore_cordons(&mut self, cordons: Vec<(WorkerId, StoredCordon)>) {
-        let (now, at) = (FarmTime::default(), unix_ms());
+    /// as the store holds them: a drain keeps its deadline on the store's clock, `at` now
+    /// (already past: paused at the first tick). The rows are remembered as the intake
+    /// poll's last look at them.
+    pub(super) fn restore_cordons(&mut self, cordons: Vec<(WorkerId, StoredCordon)>, at: u64) {
+        let now = FarmTime::default();
         for (worker, cordon) in cordons {
-            let event = match cordon {
-                StoredCordon::Cordoned => Event::Cordon { worker },
-                StoredCordon::Draining { deadline_unix_ms } => Event::Drain {
-                    worker,
-                    deadline: now
-                        .saturating_add(Duration::from_millis(deadline_unix_ms.saturating_sub(at))),
-                },
-            };
-            let none = self.sched.apply(Input::new(now, event));
+            self.intake.cordons.insert(worker.clone(), cordon);
+            let none = self
+                .sched
+                .apply(Input::new(now, cordon_event(worker, cordon, now, at)));
             debug_assert!(none.is_empty(), "a cordon has no effect: {none:?}");
         }
+    }
+}
+
+/// The scheduler input that places a node as its `cordon/` row says, at farm time `now`
+/// when the store's clock reads `at` milliseconds: a drain ends as far from `now` as its
+/// deadline is from `at`, so frontends whose own clocks differ agree on when it ends.
+pub(super) fn cordon_event(
+    worker: WorkerId,
+    cordon: StoredCordon,
+    now: FarmTime,
+    at: u64,
+) -> Event {
+    match cordon {
+        StoredCordon::Cordoned => Event::Cordon { worker },
+        StoredCordon::Draining { deadline_unix_ms } => Event::Drain {
+            worker,
+            deadline: now
+                .saturating_add(Duration::from_millis(deadline_unix_ms.saturating_sub(at))),
+        },
     }
 }
 
 impl Progress {
     /// What the callers of an operation at this point are shown: `None` leaves them as
     /// they are (queued, or no trace: they wait).
-    fn stage(&self) -> Option<Stage> {
+    pub(super) fn stage(&self) -> Option<Stage> {
         match self {
             Self::Ended(finished) => Some(Stage::Done(finished.clone())),
             Self::Running => Some(Stage::Executing),
@@ -331,7 +357,7 @@ impl Progress {
 /// them as they are). An operation the store has no trace of is shown nothing: it is
 /// counted in `untraced`, reported once it has been untraced for [`UNTRACED_LOOKS`] looks
 /// in a row, and its callers go on waiting. A look that finds it starts the count over.
-fn note(
+pub(super) fn note(
     untraced: &mut BTreeMap<OperationId, u32>,
     operation: OperationId,
     progress: &Progress,
@@ -349,7 +375,7 @@ fn note(
 }
 
 /// Shows `stage` on `channel`, waking its watchers only if it changed.
-fn show(channel: &watch::Sender<Stage>, stage: Stage) {
+pub(super) fn show(channel: &watch::Sender<Stage>, stage: Stage) {
     channel.send_if_modified(|now| {
         let changed = *now != stage;
         if changed {

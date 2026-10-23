@@ -6,6 +6,7 @@
 
 use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -27,6 +28,28 @@ pub struct Identity {
     pub gid: u32,
 }
 
+/// A limit on what a command may write: the files directly in `dir` hold at most `max` bytes
+/// together, or the command is killed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteCap {
+    pub dir: PathBuf,
+    pub max: u64,
+}
+
+impl WriteCap {
+    /// Whether the files directly in the directory hold more than the limit. A directory that
+    /// cannot be read holds nothing.
+    fn exceeded(&self) -> bool {
+        let held = std::fs::read_dir(&self.dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.metadata().ok())
+            .fold(0_u64, |total, meta| total.saturating_add(meta.len()));
+        held > self.max
+    }
+}
+
 /// A program (an absolute path) and its arguments.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cmd {
@@ -43,6 +66,12 @@ pub struct Cmd {
     /// Bytes written to the child's standard input, which is then closed; none for an
     /// input that is closed at once.
     pub stdin: Vec<u8>,
+    /// What the command may write, watched while it runs; none for no limit.
+    pub write_cap: Option<WriteCap>,
+    /// How much of its standard output is kept: past this, one byte more is kept (so the
+    /// caller can see the output was longer) and the rest is read and dropped; none to keep
+    /// it all.
+    pub stdout_max: Option<usize>,
 }
 
 /// How a child ended and what it wrote.
@@ -91,32 +120,66 @@ const POLL: Duration = Duration::from_millis(10);
 /// the pipe open); what has not arrived by then is dropped.
 const DRAIN_GRACE: Duration = Duration::from_secs(1);
 
-/// A thread that reads `stream` to its end and sends what it read.
-fn drain<R: Read + Send + 'static>(stream: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+/// How much of a child's standard error is kept: it is only ever shown in a message.
+const STDERR_MAX: usize = 1024 * 1024;
+
+/// A thread that reads `stream` to its end and sends the first `keep` bytes and one more;
+/// the rest is read and dropped, so the child never blocks on a full pipe and memory stays
+/// bounded.
+fn drain<R: Read + Send + 'static>(stream: Option<R>, keep: usize) -> mpsc::Receiver<Vec<u8>> {
     let (send, receive) = mpsc::channel();
     thread::spawn(move || {
         let mut bytes = Vec::new();
         // A read that fails part way keeps what came before it.
         stream.into_iter().for_each(|mut stream| {
-            let _ = stream.read_to_end(&mut bytes);
+            let limit = u64::try_from(keep).map_or(u64::MAX, |k| k.saturating_add(1));
+            let _ = stream.by_ref().take(limit).read_to_end(&mut bytes);
+            let _ = io::copy(&mut stream, &mut io::sink());
         });
         let _ = send.send(bytes);
     });
     receive
 }
 
-/// Wait for `child` for at most `limit`; none when it is still running then.
-fn wait_within(child: &mut Child, limit: Duration) -> io::Result<Option<ExitStatus>> {
-    let deadline = Instant::now() + limit;
+/// How waiting for a child ended.
+enum Waited {
+    Exited(ExitStatus),
+    /// Still running at its time limit.
+    TimedOut,
+    /// Wrote more than its [`WriteCap`] allows.
+    OverCap,
+}
+
+/// Wait for `child`, for at most `limit` when there is one, killing nothing: a child that
+/// outlives the limit, or writes past `cap` (also by the time it exits), is reported and
+/// left to the caller.
+fn wait_watching(
+    child: &mut Child,
+    limit: Option<Duration>,
+    cap: Option<&WriteCap>,
+) -> io::Result<Waited> {
+    if limit.is_none() && cap.is_none() {
+        return child.wait().map(Waited::Exited);
+    }
+    let deadline = limit.map(|limit| Instant::now() + limit);
     loop {
         if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
+            // A child that wrote past the limit between two looks has still written it.
+            let over = cap.is_some_and(WriteCap::exceeded);
+            return Ok(if over {
+                Waited::OverCap
+            } else {
+                Waited::Exited(status)
+            });
         }
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Ok(None);
+        if cap.is_some_and(WriteCap::exceeded) {
+            return Ok(Waited::OverCap);
         }
-        thread::sleep(POLL.min(left));
+        let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        if left.is_some_and(|left| left.is_zero()) {
+            return Ok(Waited::TimedOut);
+        }
+        thread::sleep(left.map_or(POLL, |left| POLL.min(left)));
     }
 }
 
@@ -220,20 +283,27 @@ impl Runner for SystemRunner {
             });
         }
         // Both streams are read while the child runs, or it blocks on a full pipe.
-        let stdout = drain(child.stdout.take());
-        let stderr = drain(child.stderr.take());
-        let status = match cmd.timeout {
-            None => Some(child.wait()?),
-            Some(limit) => wait_within(&mut child, limit)?,
-        };
-        let Some(status) = status else {
+        let stdout = drain(child.stdout.take(), cmd.stdout_max.unwrap_or(usize::MAX));
+        let stderr = drain(child.stderr.take(), STDERR_MAX);
+        let status = match wait_watching(&mut child, cmd.timeout, cmd.write_cap.as_ref())? {
+            Waited::Exited(status) => status,
             // Past its limit: kill it and reap it. A kill that fails means it just ended.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("{} ran past its limit and was killed", cmd.program),
-            ));
+            Waited::TimedOut => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{} ran past its limit and was killed", cmd.program),
+                ));
+            }
+            Waited::OverCap => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    format!("{} wrote past its size limit and was killed", cmd.program),
+                ));
+            }
         };
         let collect =
             |bytes: mpsc::Receiver<Vec<u8>>| bytes.recv_timeout(DRAIN_GRACE).unwrap_or_default();

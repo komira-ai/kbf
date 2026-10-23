@@ -185,7 +185,8 @@ sorted by name.
   git checkout, or a `KBF_BUILD_COMMIT_OVERRIDE` stamp), and a build before this field prints
   none. `kbf_types::Version` reads it as optional.
 - `meta_log`: the highest metadata-log machine version the binary runs
-  (`kbf_server::raft_log::RUNS`). Going from release N to N-1 is reversible only if
+  (`kbf_server::raft_log::RUNS`). It is informational and frozen at 5: this build raises
+  no log, so it gates no feature. Going from release N to N-1 is reversible only if
   `meta_log(N) <= meta_log(N-1)`; a build that prints no `meta_log` is unknown, and
   unknown is not reversible.
 - `profile`: `release` for every asset here (the workflow refuses a `debug` one).
@@ -194,9 +195,9 @@ sorted by name.
   `min_protocol` through `protocol`.
 - `relay`: how far the build carries what its host's installer reports to the frontend. At
   `1` it reads `available` and `release_source` from the installer's `status.json` and sends
-  them in its `UpdateStatus`. `kbf-installer setup` takes `release_source = "bundled"` on a
-  host that has a release only beside a `kbf` that declares at least the level the installer
-  needs (`kbf_installer::binary::RELAY_NEEDED`); a build before this field prints none. An
+  them in its `UpdateStatus`. `kbf-installer rollback` on a host whose
+  `release_source` is `bundled` refuses a release whose `kbf` declares less than the level the
+  installer needs (`kbf_installer::binary::RELAY_NEEDED`); a build before this field prints none. An
   installer whose reader refuses keys it does not know refuses to stage a `kbf` that prints
   it, so the installers ship first.
 - `seq`: the number of commits behind the commit built (`git rev-list --count HEAD`), so

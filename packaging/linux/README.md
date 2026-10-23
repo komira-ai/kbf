@@ -1,9 +1,9 @@
 # kbf-installer and kbf: the Linux packages
 
 Two packages. `kbf-installer` is the root tool that sets a host up and the proxy that fronts
-it; it ships no `kbf` runtime. `kbf` is the runtime, `/usr/bin/kbf`, and the systemd units of
-its modes. Installing a newer `kbf` package is the update: the package manager replaces
-`/usr/bin/kbf`. The contract is `docs/design/kbf-installer.md`, sections 3 (files and users), 7
+it; it ships no `kbf` runtime and `setup` installs no first release. `kbf` is the runtime,
+`/usr/bin/kbf`, and the systemd units of its modes. Installing a newer `kbf` package is the
+update: the package manager replaces `/usr/bin/kbf`. The contract is `docs/design/kbf-installer.md`, sections 3 (files and users), 7
 (units and gating) and 9 (P11). A deb and an rpm of each are built by
 [nfpm](https://nfpm.goreleaser.com), pinned in CI by SHA-256, from a configuration `cargo xtask
 pkg-config` writes (for both packages): this directory holds the inputs, and

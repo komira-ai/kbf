@@ -1,7 +1,6 @@
 //! What the controller must do after a transition, and what it must tell people.
 
 use super::facts::OrderId;
-use crate::storage_gate::GateFail;
 
 /// An operation on `update/slot`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +37,7 @@ pub enum Command {
     /// timer. Section 5.1 also says "never retry", which this controller keeps in the sense
     /// that it never orders a second activation: it gives the *same* order id again at every
     /// look until the order is taken or the step's activate limit holds the run, and never
-    /// draws a new id for the host ([`super::Transport::activate`]). A helper acts on an id
+    /// draws a new id for the host. A helper acts on an id
     /// once, so the repeat cannot swap twice. That is a choice the design leaves open.
     Activate {
         /// The id of the order; the helper's status names it.
@@ -62,43 +61,6 @@ pub enum Severity {
     Warn,
     /// A page.
     Page,
-}
-
-/// Why a host was given back: uncordoned, the slot freed, back to `Pending` (or
-/// `Deferred` for a Mac whose leases outlasted the wait). Capacity beats update.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum GiveBack {
-    /// The host's daemon stream is closed before the restart: it cannot be told to update.
-    /// Not in the design's table; a host that cannot be sent the activate order is not
-    /// kept in a step.
-    Disconnected,
-    /// The claim on the slot did not show within the health limit.
-    ClaimNotVisible,
-    /// Fewer than `min_serving` other hosts of its platform would be left (section 2.8).
-    BelowMinServing {
-        /// How many were.
-        serving: usize,
-    },
-    /// Placement did not show the cordon within the health limit.
-    CordonNotTaken,
-    /// The leases did not end within their limit (step 3).
-    LeasesNotEnded,
-    /// The member does not report a boot counter, so its return cannot be told from the
-    /// old process still running (step 7).
-    BootUnknown,
-    /// The write sessions did not reach zero within their limit (step 4, C31).
-    WritesNotQuiet,
-    /// G_S is shut (steps 1, 3, 4 and 5).
-    GateClosed(GateFail),
-    /// A higher generation was offered (a rollback, or a newer release) while the host had
-    /// done nothing irreversible, so the release it was started for is not activated on it.
-    /// Not in the design's table: it says a rollback is a higher generation and walks the
-    /// hosts back, not what a host in steps 1 to 5 does meanwhile.
-    Superseded,
-    /// A staged run, and the host's package does not carry the run's release (it reports
-    /// none, or another commit): the host is put back before the activate order is minted.
-    /// Not persisted: an alert only.
-    NotAvailable,
 }
 
 /// Why a run is held for a person (section 5.1: a failure holds the run, never retried,
@@ -159,34 +121,11 @@ impl HoldReason {
             | Self::ActivateRefused => Severity::Warn,
         }
     }
-
-    /// Whether the node stays cordoned while the run is held ("Held, cordoned", section
-    /// 5.2), so the step re-orders a cordon that placement stops showing. Not after a
-    /// second member went down (the node was put back first), and not when the node is
-    /// already confirmed and step 10's uncordon is what did not take.
-    #[must_use]
-    pub const fn keeps_cordon(self) -> bool {
-        match self {
-            Self::SecondMemberDown | Self::StillCordoned => false,
-            Self::RestartDeadline
-            | Self::MemberGone
-            | Self::ActivateStalled
-            | Self::HealthLimit
-            | Self::RebuildLimit
-            | Self::RepairWait
-            | Self::ConfirmStalled
-            | Self::Reverted
-            | Self::RevertRefused
-            | Self::ActivateRefused => true,
-        }
-    }
 }
 
 /// Something to tell people (the failure cells of section 2.6).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Alert {
-    /// The host was given back.
-    GaveBack(GiveBack),
     /// The run is held.
     Held(HoldReason),
     /// A rebuilding node has been `CatchingUp` past the health limit, and the policy has no
@@ -199,7 +138,7 @@ impl Alert {
     #[must_use]
     pub const fn severity(&self) -> Severity {
         match self {
-            Self::GaveBack(_) | Self::RebuildWaiting => Severity::Warn,
+            Self::RebuildWaiting => Severity::Warn,
             Self::Held(reason) => reason.severity(),
         }
     }

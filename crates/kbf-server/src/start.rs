@@ -236,7 +236,7 @@ where
     let log = RaftMetaLog::open_dir(&stores.meta_dir, Retention::default(), prefix_root).await?;
     let (prefix, id) = (log.store_prefix(), log.log_id());
     let grace = Duration::from_millis(args.cold_store_evict_grace_ms);
-    let pass = files.map(|files| StartPass::over_raft(files, grace));
+    let pass = files.map(|files| StartPass::new(files, grace));
     let hot = stores.hot.as_ref();
     assemble(args, hot, log, store, prefix, id, shutdown, pass).await
 }
@@ -276,7 +276,7 @@ pub(crate) async fn assemble<O, S, F>(
     prefix: KeyPrefix,
     log: FarmLogId,
     shutdown: S,
-    pass: Option<StartPass<RaftMetaLog<StdFs>>>,
+    pass: Option<StartPass>,
 ) -> Result<ServerHandle, Box<dyn Error>>
 where
     O: ObjectStore + 'static,

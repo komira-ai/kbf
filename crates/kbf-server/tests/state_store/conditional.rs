@@ -53,12 +53,21 @@ pub(super) async fn a_second_give_up_queues_nothing_beside_the_new_lease(backing
     let [old] = starts(&mut inbox_a)[..] else {
         panic!("one lease expected");
     };
-    let second = disk.farm(EpochPolicy::Keep);
+    let second = disk
+        .farm(EpochPolicy::Keep)
+        .with_orphan_wait(Duration::ZERO);
     tokio::time::advance(kbf_sched::fence::LEASE_GRACE + Duration::from_secs(1)).await;
 
-    // The second frontend gives up the lease whose daemon it never heard, and runs the
-    // operation on a daemon of its own.
+    // The second frontend does not hear the daemon of the old lease (its session row has
+    // expired): the sweep requeues the lease, and the operation runs on a daemon of the
+    // second frontend's own.
+    expire_session(&disk, "node-a");
+    second.intake();
+    second.intake();
+    assert_eq!((disk.rows("lease/"), disk.rows("queue/")), (0, 1));
     let (_, mut inbox_b) = register_as(&second, &node_b);
+    second.intake();
+    second.tick().await;
     let [new] = starts(&mut inbox_b)[..] else {
         panic!("one lease expected");
     };
@@ -78,10 +87,13 @@ pub(super) async fn a_second_give_up_queues_nothing_beside_the_new_lease(backing
     assert_eq!((disk.rows("queue/"), disk.rows("done/")), (0, 1));
 }
 
-/// Asserts that a daemon's result that reaches two frontends finishes the operation once:
-/// the second frontend's finish finds the first's result and is acknowledged as a
-/// duplicate, and both frontends hold the one result.
-pub(super) async fn a_result_reaching_two_frontends_is_acknowledged_once(backing: Backing) {
+/// Asserts that a daemon's result that reaches the frontend the daemon has left finishes
+/// nothing: the write is refused as stale, the result is not acknowledged (the daemon keeps
+/// it), and the operation's rows stay. The frontend the daemon moved to takes the same
+/// result and finishes the operation once.
+pub(super) async fn a_result_reaching_the_frontend_a_daemon_left_finishes_nothing(
+    backing: Backing,
+) {
     let disk = Disk::over(backing);
     let first = disk.farm(EpochPolicy::Keep);
     let (_, mut inbox) = register(&first);
@@ -93,19 +105,21 @@ pub(super) async fn a_result_reaching_two_frontends_is_acknowledged_once(backing
     let (stream, _inbox) = register(&second);
     assert!(second.heartbeat(&node(), stream, 1, vec![lease]).await);
 
-    assert!(accepted(&first, lease).await);
+    assert!(!accepted(&first, lease).await, "the old frontend took it");
+    assert_eq!(first.dropped_writes(), 1, "the write was not refused");
+    assert_eq!((disk.rows("op/"), disk.rows("lease/")), (1, 1));
+    assert_eq!(disk.rows("done/"), 0);
+
     assert!(
         accepted(&second, lease).await,
-        "the duplicate was not acknowledged"
+        "the new owner did not take the result"
     );
-
     let operation = OperationId(0);
-    let sent = first.ended(operation).expect("read");
+    let sent = second.ended(operation).expect("read");
     let Some(Finished::Failed(status)) = &sent else {
         panic!("the result was not the original report");
     };
     assert_eq!(status.message, "test");
-    assert_eq!(second.ended(operation).expect("read"), sent);
     assert_eq!((disk.rows("op/"), disk.rows("lease/")), (0, 0));
     assert_eq!((disk.rows("queue/"), disk.rows("done/")), (0, 1));
 }
