@@ -139,6 +139,7 @@ pub mod storage_half;
 pub mod storage_health;
 pub mod storage_node;
 pub mod store_config;
+pub mod stored_update;
 pub mod stores;
 pub mod streams;
 #[cfg(test)]

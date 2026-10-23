@@ -1,59 +1,38 @@
-//! The `update/*` rows in the state store (`docs/design/split-mode-updates.md` section 6.1):
-//! what the controller resumes from, and what the operator's calls write.
+//! The `update/*` rows of the desired release in the state store
+//! (`docs/design/pull-updates.md` section 6.2): what the operator's calls write and the
+//! offers read.
 //!
 //! | key | value | written by |
 //! |---|---|---|
 //! | `update/desired` | `{generation, commit, set_at}`, and the source when it is not a fetch ([`Desired`]) | an offer |
-//! | `update/policy` | the nine settings (the pause among them), and the node step's limits when they are not the default ([`Policy`]) | the operator, the pause button |
-//! | `update/slot` | the places in use, `{host, order_id, epoch}` each ([`Slot`]): one storage, up to `max_hosts_out` others | the controller |
-//! | `update/host/<id>` | `{phase, order_id, generation, since, boot_before}`, and the run's commit and source ([`HostRow`]) | the controller |
+//! | `update/policy` | the nine settings (the pause among them), and the limits when they are not the default ([`Policy`]) | the pause button |
 //!
-//! and two counters: `update/generation`, from which generations are drawn, and
-//! `update/order/<epoch>`, from which order ids are drawn. (The release rows belong to the
-//! operator API.) No row has a time to live: a controller that dies leaves every row as it
-//! was, and the next one resumes from them. Every write the controller makes is a
-//! compare-and-set on the version read, so a controller that was overtaken (another one
-//! moved the row) gets a [`RowError::Conflict`] and re-reads; the controller writes over no
-//! row it did not read. The one write that is not conditional is the operator's:
-//! [`Rows::set_policy`] replaces the policy whole, the pause with it.
+//! and one counter, `update/generation`, from which generations are drawn. (The release
+//! rows belong to the operator API.) The rows older builds kept for hosts and places, and
+//! the order counters, are left in the store and only read ([`crate::stored_update`]). No row
+//! has a time to live. An offer and the pause are compare-and-set on the version read, so a
+//! writer that was overtaken re-reads; neither writes over a row it did not read.
 //!
 //! The rows are plain key-value rows of the state store, so they work on every backend and
 //! need no table of their own; `kbf-state` is unchanged.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use kbf_state::{Cond, Conflict, Store, StoreError, Txn, Version, Versioned};
-use kbf_types::{FarmTime, WorkerId};
+use kbf_types::FarmTime;
 
 use super::codec::{
-    Corrupt, Desired, HostRow, decode_desired, decode_host, decode_policy, decode_slot,
-    encode_desired, encode_host, encode_policy, encode_slot,
+    Corrupt, Desired, decode_desired, decode_policy, encode_desired, encode_policy,
 };
-use super::facts::{Generation, OrderId, Release, Source};
-use super::policy::{Policy, PolicyError};
-use super::slot::{Holder, Slot, SlotClass};
+use super::policy::Policy;
+use super::run::{Generation, Release, Source};
 
 const DESIRED: &str = "update/desired";
 /// The counter the generations are drawn from.
 const GENERATION: &str = "update/generation";
 const POLICY: &str = "update/policy";
-pub(super) const SLOT: &str = "update/slot";
-const HOSTS: &str = "update/host/";
 /// Reads and writes tried before a call gives up on writers it keeps racing.
 const ATTEMPTS: usize = 16;
-
-/// The key of host `id`'s row.
-pub(super) fn host_key(id: &WorkerId) -> String {
-    format!("{HOSTS}{id}")
-}
-
-/// The counter order ids of `epoch` are drawn from. A counter of its own per epoch: a store
-/// restored from a backup has its counters back where they were, so the epoch (which a
-/// restore moves forward) is what keeps its ids above the replaced store's.
-fn order_counter(epoch: u64) -> String {
-    format!("update/order/{epoch:016x}")
-}
 
 /// Why a row could not be read or written.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -75,9 +54,6 @@ pub enum RowError {
     /// Other writers kept changing the row for as long as the call tried.
     #[error("{0} kept changing under the writer")]
     Contended(&'static str),
-    /// The policy cannot be kept.
-    #[error(transparent)]
-    Policy(#[from] PolicyError),
     /// An offer expected another generation than the one desired now.
     #[error("the desired release is at generation {found}, not {expected}")]
     Stale {
@@ -139,8 +115,7 @@ impl Rows {
         Self { store }
     }
 
-    /// The state store the rows live in, for the other families the controller reads (the
-    /// enrollment registry that joins hosts to members).
+    /// The state store the rows live in, for the readers that look at other rows of it.
     pub(crate) fn store(&self) -> &Arc<dyn Store> {
         &self.store
     }
@@ -163,16 +138,13 @@ impl Rows {
     }
 
     /// Sets the desired release to `commit`, to be fetched ([`Source::Fetch`]), under a higher
-    /// generation. A rollback is the older commit offered the same way (section 2.11).
+    /// generation. A rollback is the older commit offered the same way.
     /// Setting the commit that is already desired, from the same source, changes nothing and
     /// keeps the generation (`pull-updates.md` section 5), so a repeated click is not a new
     /// run; the same commit from another source is a new run. The generation is drawn from
     /// the counter `update/generation`; it is never below the current run's plus one,
     /// whatever the counter says. The pause is in `update/policy` and an offer does not touch
     /// it.
-    ///
-    /// A host that has done nothing irreversible is given back when the generation moves;
-    /// a host past the activate order finishes its step.
     ///
     /// # Errors
     /// [`RowError`]: the store failed, the row cannot be read, or `commit` is empty.
@@ -233,10 +205,9 @@ impl Rows {
         Err(RowError::Contended(DESIRED))
     }
 
-    /// Pauses or resumes: while `update/policy.paused` is set no host is started and hosts in
-    /// a step finish. The rest of the policy stays as it was; the row is written by
+    /// Pauses or resumes: the flag `update/policy.paused`. The rest of the policy stays as it was; the row is written by
     /// compare-and-set on the version read, so a policy written in between is not lost.
-    /// A pause needs no run: it holds the next one that is offered.
+    /// A pause needs no run.
     ///
     /// # Errors
     /// [`RowError`]: the store failed, the row cannot be read, or writers kept racing.
@@ -267,7 +238,7 @@ impl Rows {
             .transpose()
     }
 
-    /// The policy: the row if there is one, else the design's defaults.
+    /// The policy: the row if there is one, else the defaults.
     ///
     /// # Errors
     /// [`RowError`]: the store failed or the row cannot be read.
@@ -286,174 +257,5 @@ impl Rows {
                 version: Some(row.version),
             }),
         }
-    }
-
-    /// Writes the policy, after checking it can be kept. The row is replaced whole, whatever
-    /// it held, the pause included: the policy is the operator's to state, and the one other
-    /// writer, [`Rows::set_paused`], changes only `paused`, by compare-and-set. The controller
-    /// only reads it.
-    ///
-    /// # Errors
-    /// [`RowError::Policy`] for a policy that cannot be kept; otherwise the store's.
-    pub fn set_policy(&self, policy: &Policy) -> Result<(), RowError> {
-        policy.validate()?;
-        self.store
-            .txn(Txn::new().put(POLICY, encode_policy(policy), Cond::Any))??;
-        Ok(())
-    }
-
-    /// The places in use.
-    ///
-    /// # Errors
-    /// [`RowError`]: the store failed or the row cannot be read.
-    pub fn slot(&self) -> Result<Stored<Slot>, RowError> {
-        match self.store.get(SLOT)? {
-            None => Ok(Stored {
-                value: Slot::default(),
-                version: None,
-            }),
-            Some(row) => Ok(Stored {
-                value: read(SLOT, &row, decode_slot)?,
-                version: Some(row.version),
-            }),
-        }
-    }
-
-    /// Every host's row, by host.
-    ///
-    /// # Errors
-    /// [`RowError`]: the store failed or a row cannot be read.
-    pub fn hosts(&self) -> Result<BTreeMap<WorkerId, Stored<HostRow>>, RowError> {
-        let mut hosts = BTreeMap::new();
-        for (key, row) in self.store.scan_prefix(HOSTS)? {
-            let id = WorkerId::new(key.strip_prefix(HOSTS).unwrap_or(&key));
-            let value = read(&key, &row, decode_host)?;
-            hosts.insert(
-                id,
-                Stored {
-                    value,
-                    version: Some(row.version),
-                },
-            );
-        }
-        Ok(hosts)
-    }
-
-    /// Replaces the row of `host` if it is still `current`.
-    ///
-    /// # Errors
-    /// [`RowError::Conflict`] when it is not (another controller moved: read again);
-    /// otherwise the store's.
-    pub fn put_host(
-        &self,
-        host: &WorkerId,
-        current: &Stored<HostRow>,
-        row: &HostRow,
-    ) -> Result<(), RowError> {
-        let txn = Txn::new().put(host_key(host), encode_host(row), current.cond());
-        self.store.txn(txn)??;
-        Ok(())
-    }
-
-    /// Replaces the slot if it is still `current`.
-    ///
-    /// # Errors
-    /// [`RowError::Conflict`] when it is not; otherwise the store's.
-    pub fn put_slot(&self, current: &Stored<Slot>, slot: &Slot) -> Result<(), RowError> {
-        let txn = Txn::new().put(SLOT, encode_slot(slot), current.cond());
-        self.store.txn(txn)??;
-        Ok(())
-    }
-
-    /// Draws the next order id of `epoch`. The counter is the store's, so the number is
-    /// durable the moment it is returned and no caller, on this handle or another, draws it
-    /// again; a number drawn and not used is skipped, never reused. Ids ascend within an
-    /// epoch and the epoch ascends across a restore ([`OrderId`]).
-    ///
-    /// # Errors
-    /// [`RowError::Store`] when the store fails.
-    pub fn mint_order(&self, epoch: u64) -> Result<OrderId, RowError> {
-        let commit = self.store.txn(Txn::new().next(order_counter(epoch)))??;
-        let seq = commit.counters.first().copied().ok_or_else(|| {
-            StoreError::Failed("the store returned no value for a counter".to_owned())
-        })?;
-        Ok(OrderId::new(epoch, seq))
-    }
-
-    /// Gives `host` a place of `class`, with the claim named by `order`, unless the class is
-    /// full. Repeatable: a host that holds a place keeps it. Returns the slot as written, or
-    /// `None` when the class is full.
-    ///
-    /// # Errors
-    /// [`RowError`]: the store failed, the row cannot be read, or writers kept racing.
-    pub fn claim(
-        &self,
-        class: SlotClass,
-        host: &WorkerId,
-        order: OrderId,
-        max_hosts_out: usize,
-    ) -> Result<Option<Slot>, RowError> {
-        for _ in 0..ATTEMPTS {
-            let current = self.slot()?;
-            let mut slot = current.value.clone();
-            let holder = Holder {
-                host: host.clone(),
-                order,
-            };
-            if !slot.claim(class, holder, max_hosts_out) {
-                return Ok(None);
-            }
-            if slot == current.value {
-                return Ok(Some(slot));
-            }
-            match self.put_slot(&current, &slot) {
-                Ok(()) => return Ok(Some(slot)),
-                // Another writer moved the slot: read it again, and judge the room by what
-                // it holds now. A lost race is not a full class.
-                Err(RowError::Conflict(_)) => {}
-                Err(other) => return Err(other),
-            }
-        }
-        Err(RowError::Contended(SLOT))
-    }
-
-    /// Frees the place `host` holds, if it holds one. Returns the slot as written.
-    ///
-    /// # Errors
-    /// [`RowError`]: the store failed, the row cannot be read, or writers kept racing.
-    pub fn release(&self, host: &WorkerId) -> Result<Slot, RowError> {
-        self.release_where(host, |_| true)
-    }
-
-    /// Frees the place `host` holds if it holds it by the claim `order`, and leaves it
-    /// alone if it holds one by another claim: a release decided from an older look must not
-    /// free the place of a claim made since. Returns the slot as written.
-    ///
-    /// # Errors
-    /// [`RowError`]: the store failed, the row cannot be read, or writers kept racing.
-    pub fn release_claim(&self, host: &WorkerId, order: OrderId) -> Result<Slot, RowError> {
-        self.release_where(host, |held| held.order == order)
-    }
-
-    fn release_where(
-        &self,
-        host: &WorkerId,
-        wanted: impl Fn(&Holder) -> bool,
-    ) -> Result<Slot, RowError> {
-        for _ in 0..ATTEMPTS {
-            let current = self.slot()?;
-            let mut slot = current.value.clone();
-            if !slot.holder(host).is_some_and(&wanted) {
-                return Ok(slot);
-            }
-            // The host holds a place (the test above), so this frees it and the slot changes.
-            slot.release(host);
-            match self.put_slot(&current, &slot) {
-                Ok(()) => return Ok(slot),
-                Err(RowError::Conflict(_)) => {}
-                Err(other) => return Err(other),
-            }
-        }
-        Err(RowError::Contended(SLOT))
     }
 }
