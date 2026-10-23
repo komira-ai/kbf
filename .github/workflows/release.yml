@@ -155,7 +155,7 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: sha256sums
-          path: dist
+          path: published
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
       # The provenance bundle of each tarball (`<tarball>.sigstore.json`), which the sums do
@@ -167,6 +167,11 @@ jobs:
           merge-multiple: true
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
+      # The assets artifacts carry the SHA256SUMS.<platform> files the sums were made from;
+      # assembling them must give the published SHA256SUMS, and removes them from dist (they
+      # are not release assets).
+      - name: Assemble SHA256SUMS, which must be the published one
+        run: cargo xtask sums assemble dist --expect published/SHA256SUMS
       - name: Check the files against SHA256SUMS
         working-directory: dist
         run: sha256sum --check --strict SHA256SUMS
