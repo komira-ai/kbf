@@ -182,6 +182,7 @@ pub use start_exit::{
 pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
 pub use streams::{StreamArgs, StreamLimits};
 pub use ui_mount::bind_server_with_options;
+pub use worker::HostFloor;
 pub use worker::WorkerService;
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build

@@ -205,6 +205,14 @@ impl Worker {
         self.phase.switching() == Some(lease) && now < self.switch_ends
     }
 
+    /// Whether it holds fewer leases than its lease cap; a node that reports no cap
+    /// always does.
+    fn under_lease_cap(&self) -> bool {
+        self.capacity
+            .leases
+            .is_none_or(|cap| u64::try_from(self.leases).is_ok_and(|held| held < cap))
+    }
+
     /// Whether `request`, an action or a VM, is at the whole host's memory (the last step
     /// of the memory ladder, which the cap is): it runs with no other lease on the node,
     /// and none is placed beside it, as a whole-machine lease does. A request for no
@@ -217,8 +225,10 @@ impl Worker {
     /// Whether `request` can be placed on it now, platform and kind aside: an action
     /// if no whole-machine lease holds it, its free CPUs, GPUs and VM slots hold the
     /// request, it holds fewer leases (of any kind) than its lease cap (if it reports
-    /// one), and its memory capacity is at least the request's memory; a whole-machine
-    /// lease if it holds no lease and its capacity holds the request. A
+    /// one), and its memory capacity is at least the request's memory; a VM if no
+    /// whole-machine lease holds it, it holds fewer leases than its cap, and its free CPUs,
+    /// memory, GPUs and VM slots hold the request; a whole-machine lease if it holds no
+    /// lease and its capacity holds the request. A
     /// request for an iOS device also needs a free device that satisfies it
     /// ([`Worker::free_device`]).
     pub(crate) fn has_room(&self, request: &Request) -> bool {
@@ -230,14 +240,22 @@ impl Worker {
             // pressure backstop pauses starts. The limit must still be one the node can
             // give. The one limit that is not a share is the whole host ([`Worker::exclusive`]):
             // that action runs alone.
-            LeaseKind::Action | LeaseKind::Vm => {
+            LeaseKind::Action => {
                 !self.whole
                     && self.free().fits(&request.resources.without_memory())
                     && request.resources.memory_bytes <= self.capacity.memory_bytes
-                    && self
-                        .capacity
-                        .leases
-                        .is_none_or(|cap| u64::try_from(self.leases).is_ok_and(|held| held < cap))
+                    && self.under_lease_cap()
+                    && (!self.exclusive(request) || self.leases == 0)
+            }
+            // A VM's memory is a booking: the guest holds it whole for as long as it runs,
+            // so what other leases hold of the node's memory keeps it out: a VM is placed
+            // only if its full request, memory included, fits the node's free capacity.
+            // Actions are not checked against memory, so a VM can wait behind a stream of
+            // them; nothing reserves a node for a queued VM.
+            LeaseKind::Vm => {
+                !self.whole
+                    && self.free().fits(&request.resources)
+                    && self.under_lease_cap()
                     && (!self.exclusive(request) || self.leases == 0)
             }
         };
@@ -530,7 +548,9 @@ impl Scheduler {
     /// instead of filling one worker after another. An action has room where its CPUs,
     /// GPUs and VM slots are free and no whole-machine lease is held; its memory is only
     /// checked against the worker's, never against what other leases hold
-    /// ([`Worker::has_room`]), though what they hold ranks the workers; a
+    /// ([`Worker::has_room`]), though what they hold ranks the workers; a VM has room
+    /// only where its full request, memory included, fits what is free, so it can wait
+    /// behind actions and nothing reserves a worker for it; a
     /// whole-machine lease only on a worker that holds no lease, and it books all of it.
     /// A round places no more leases than the block of sequences the scheduler was given
     /// has left ([`Scheduler::use_seq_block`]); the rest wait for the next round.
