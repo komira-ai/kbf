@@ -398,9 +398,8 @@ fn the_real_database_reaches_or_says_why_and_redacts_the_servers_words() {
 // ---- the role and database `--create-local-database` makes, on a real server -----------------
 
 mod provisioned {
-    use std::sync::Mutex;
-
     use kbf_host::{Exec, HostExec, Root};
+    use kbf_testkit::database::{CatalogGuard, batch_execute_retrying};
     use postgres::NoTls;
 
     use super::{NEXT, Ordering, url};
@@ -409,12 +408,6 @@ mod provisioned {
     use crate::setup::validate::LocalDatabase;
     use kbf_state::postgres::schema;
     use kbf_state::postgres::{PostgresConfig, reach};
-
-    /// Roles and databases belong to the whole server, and these tests make and drop them.
-    /// What keeps the tests of different processes (nextest runs each test in one) apart is
-    /// the names: they carry the process id. This lock only makes the tests of one process
-    /// (`cargo test`) take turns.
-    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
     /// The server `KBF_TEST_POSTGRES_URL` names, in the pieces psql takes.
     struct Server {
@@ -450,26 +443,31 @@ mod provisioned {
         ])
     }
 
+    /// Runs each statement of `statement` on the test server, again when the server answers
+    /// "tuple concurrently updated". Only a test that holds a [`Names`] calls it, and a
+    /// `Names` holds the guard of the shared catalogs.
     fn sql(statement: &str) {
         // One statement per call: several in one are a transaction, where CREATE and DROP
         // DATABASE are refused.
         let mut client = postgres::Client::connect(&url(), NoTls).expect("the test server");
         for one in statement.split(';').filter(|s| !s.trim().is_empty()) {
-            client.batch_execute(one).expect("statement");
+            batch_execute_retrying(&mut client, one).expect("statement");
         }
     }
 
-    /// A role and a database name unique to one test; both are dropped with it.
+    /// A role and a database name unique to one test; both are dropped with it. Roles and
+    /// databases belong to the whole server, and these tests make and drop them, with the
+    /// provisioning steps (psql, run for real) doing the same: the guard of the shared
+    /// catalogs is held from the names until the test ends, so no other test, in this process
+    /// or another, changes them meanwhile. The names carry the process id besides.
     struct Names {
         local: LocalDatabase,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: CatalogGuard,
     }
 
     impl Names {
         fn new() -> Names {
-            let lock = ONE_AT_A_TIME
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let lock = CatalogGuard::take();
             let n = NEXT.fetch_add(1, Ordering::Relaxed);
             let name = format!("kbf_b5_{}_{n}", std::process::id());
             let s = server();
@@ -573,9 +571,6 @@ mod provisioned {
     /// Mutants seen red: the class-28 operand dropped; `3D000` mapped to a login refusal.
     #[test]
     fn a_missing_role_is_a_login_refusal_and_a_missing_database_is_told_apart() {
-        let _one = ONE_AT_A_TIME
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let s = server();
         let at = |user: &str, db: &str| {
             let url = format!(

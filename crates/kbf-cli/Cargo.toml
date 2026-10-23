@@ -91,8 +91,9 @@ postgres.workspace = true
 # `kbf storage-and-daemon` running an action (tests/storage_and_daemon.rs): the act steps
 # it runs through this test binary, the REAPI messages (the node's certificates are made
 # with rcgen, below); the image store layout the stand-in `crun` runs over is
-# kbf-driver-container's, under the Linux-only section at the end.
-kbf-testkit.workspace = true
+# kbf-driver-container's, under the Linux-only section at the end. `postgres`: the databases
+# of tests/boot_check_postgres.rs are made through the guard of the shared catalogs.
+kbf-testkit = { workspace = true, features = ["postgres"] }
 prost.workspace = true
 # The certificate checks (`kbf_ca::verify_cert`) of tests/deploy_units.rs.
 kbf-ca.workspace = true
