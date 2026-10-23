@@ -29,9 +29,12 @@
 //! - `--ssh-user`: the user the host's forced command is installed for;
 //! - `--channel`: the package channel an install comes from;
 //! - optional `--ssh-connect-timeout-secs` (default 10) and `--ssh-command-timeout-secs`
-//!   (default 900, the time one install may take).
+//!   (default 900, the time one install may take);
+//! - optional `--drain-deadline-secs` (default 600, at least 1).
 //!
-//! The health check is real for storage and daemon hosts and refuses a frontend
+//! A daemon host's node is drained at the frontend before its install and given back after
+//! it runs the target ([`crate::node_drain`]); `--drain-deadline-secs` (default 600) is how long
+//! its leases are waited for. The health check is real for storage and daemon hosts and refuses a frontend
 //! ([`crate::node_health`]); the roll asks it before it installs, so ssh is never run for a
 //! frontend. A Mac host is not supported: the inventory has no such role and refuses a line
 //! that names one.
@@ -49,9 +52,9 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::api::RollState;
-use crate::health::system_wall_clock;
 use crate::inventory::Inventory;
 use crate::listener::{Activation, Listen, open};
+use crate::node_drain::NodeDrain;
 use crate::node_health::NodeHealth;
 use crate::operator::OperatorApi;
 use crate::ports::SystemClock;
@@ -64,11 +67,12 @@ use crate::{Ports, Timing, Updater};
 pub const USAGE: &str = "usage: kbf-updater --version\n       kbf-updater --state-dir DIR \
 --inventory FILE --proxy-uid UID --operator-api http://IP:PORT --token-file FILE \
 --ssh-key-file FILE --ssh-user USER --channel NAME [--operator-proxy-auth-file FILE] \
-[--ssh-connect-timeout-secs N] [--ssh-command-timeout-secs N] [--socket PATH]\n\
+[--ssh-connect-timeout-secs N] [--ssh-command-timeout-secs N] [--drain-deadline-secs N] \
+[--socket PATH]\n\
 the socket comes from systemd socket activation (LISTEN_PID, LISTEN_FDS=1) or from --socket, \
 which is for tests and development\n";
 
-const FLAGS: [&str; 12] = [
+const FLAGS: [&str; 13] = [
     "--state-dir",
     "--inventory",
     "--socket",
@@ -81,6 +85,7 @@ const FLAGS: [&str; 12] = [
     "--channel",
     "--ssh-connect-timeout-secs",
     "--ssh-command-timeout-secs",
+    "--drain-deadline-secs",
 ];
 
 /// How long ssh may take to connect, unless a flag says otherwise.
@@ -88,6 +93,8 @@ const DEFAULT_CONNECT_SECS: u64 = 10;
 /// How long one call may take, unless a flag says otherwise: as long as a restart waits for
 /// an install that is in progress.
 const DEFAULT_COMMAND_SECS: u64 = 900;
+/// How long a daemon host's node is given to finish its leases, unless a flag says otherwise.
+const DEFAULT_DRAIN_SECS: u64 = 600;
 
 /// The settings of a run.
 #[derive(Clone, Debug)]
@@ -109,6 +116,9 @@ pub struct Config {
     pub channel: String,
     pub ssh_connect_timeout: Duration,
     pub ssh_command_timeout: Duration,
+    /// How long a daemon host's node is given to finish its leases once drained; its host is
+    /// installed when that is out, leases or not.
+    pub drain_deadline: Duration,
 }
 
 /// The settings from the command line (without the program name) and from what the service
@@ -164,6 +174,10 @@ pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, S
     };
     let ssh_connect_timeout = seconds("--ssh-connect-timeout-secs", DEFAULT_CONNECT_SECS)?;
     let ssh_command_timeout = seconds("--ssh-command-timeout-secs", DEFAULT_COMMAND_SECS)?;
+    let drain_deadline = seconds("--drain-deadline-secs", DEFAULT_DRAIN_SECS)?;
+    if drain_deadline.is_zero() {
+        return Err("--drain-deadline-secs must be at least 1".to_owned());
+    }
     let listen = match (
         found.remove("--socket"),
         activation.passed_to(std::process::id())?,
@@ -196,6 +210,7 @@ pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, S
         channel,
         ssh_connect_timeout,
         ssh_command_timeout,
+        drain_deadline,
     })
 }
 
@@ -287,6 +302,8 @@ pub fn build_ports_with_exec(cfg: &Config, exec: Arc<dyn Exec>) -> Result<Ports,
     )
     .map_err(|e| e.to_string())?
     .with_exec(exec);
+    // Shared: the roll installs with it, and the health check asks it what a daemon runs.
+    let installer = Arc::new(installer);
     // One client, checked once: both ports read the same token files.
     let api = OperatorApi::new(
         cfg.operator_api,
@@ -295,8 +312,9 @@ pub fn build_ports_with_exec(cfg: &Config, exec: Arc<dyn Exec>) -> Result<Ports,
     )?;
     Ok(Ports {
         safe: Box::new(HttpSafeToStop::from_api(api.clone())),
-        installer: Box::new(installer),
-        health: Box::new(NodeHealth::with_api(api, system_wall_clock())),
+        installer: Box::new(Arc::clone(&installer)),
+        drain: Box::new(NodeDrain::with_api(api.clone())),
+        health: Box::new(NodeHealth::with_api(api, installer)),
         clock: Box::new(SystemClock::new()),
     })
 }
@@ -306,7 +324,10 @@ pub fn start(cfg: &Config) -> Result<Daemon, String> {
     start_with(
         cfg,
         build_ports(cfg)?,
-        Timing::default(),
+        Timing {
+            drain_deadline: cfg.drain_deadline,
+            ..Timing::default()
+        },
         Settings::new(cfg.proxy_uid),
         stderr_sink(),
     )

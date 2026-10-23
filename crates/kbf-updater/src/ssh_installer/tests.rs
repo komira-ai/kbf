@@ -10,6 +10,7 @@ use kbf_testkit::dir::TestDir;
 
 use super::*;
 use crate::inventory::Role;
+use crate::ports::Installed;
 
 const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample";
 
@@ -94,6 +95,7 @@ fn host() -> Host {
         address: "203.0.113.7".into(),
         role: Role::Storage,
         host_key: KEY.into(),
+        node_id: None,
     }
 }
 
@@ -802,6 +804,36 @@ fn every_query_answer_maps() {
     assert_eq!(got[12], Ok(Installed::Version("1".repeat(256))));
     assert_eq!(got[13], Err(PortError::other("bad answer")));
     assert_eq!(got[14], Err(PortError::other("bad answer")));
+}
+
+/// Catches a report that drops the node id or the running commit, and one that lets the
+/// host put free text there: a node id must be a DNS label and a commit hex digits, else the
+/// whole answer is bad.
+#[test]
+fn the_report_carries_the_node_id_and_the_running_commit() {
+    let line = |commit: &str, id: &str| {
+        format!(
+            "{{\"result\":\"query\",\"installed_version\":\"1\",\"running_commit\":{commit},\"node_id\":{id},\"in_progress\":false}}\n"
+        )
+    };
+    let r = rig();
+    r.fake.says(exited(0, &line("\"0123abcd\"", "\"dm-1\"")));
+    r.fake.says(exited(0, &line("null", "null")));
+    r.fake.says(exited(0, &line("\"xyz\"", "\"dm-1\"")));
+    r.fake
+        .says(exited(0, &line(&format!("\"{}\"", "a".repeat(65)), "null")));
+    r.fake.says(exited(0, &line("null", "\"Bad Id\"")));
+    r.fake.says(exited(0, &line("\"\"", "null")));
+    let got: Vec<_> = (0..6).map(|_| r.ssh.report(&host())).collect();
+    let first = got[0].clone().expect("read");
+    assert_eq!(first.running_commit.as_deref(), Some("0123abcd"));
+    assert_eq!(first.node_id.as_deref(), Some("dm-1"));
+    assert_eq!(first.installed, Installed::Version("1".into()));
+    let none = got[1].clone().expect("read");
+    assert_eq!((none.running_commit, none.node_id), (None, None));
+    for bad in &got[2..] {
+        assert_eq!(bad, &Err(PortError::other("bad answer")));
+    }
 }
 
 /// Catches a non-whole-second connect timeout rounded down, and a work directory whose
