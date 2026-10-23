@@ -2,6 +2,7 @@
 
 mod fault;
 mod give_up;
+mod ids;
 pub(crate) mod loss;
 pub(crate) mod memory;
 mod outage;
@@ -268,6 +269,8 @@ impl Worker {
 pub struct Scheduler {
     term: u64,
     next_seq: u64,
+    /// No lease gets a sequence at or past this one ([`Scheduler::use_seq_block`]).
+    seq_limit: u64,
     next_op: u64,
     now: FarmTime,
     ops: BTreeMap<OperationId, Operation>,
@@ -322,6 +325,7 @@ impl Scheduler {
         Self {
             term,
             next_seq: 0,
+            seq_limit: u64::MAX,
             next_op: 0,
             now: FarmTime::default(),
             ops: BTreeMap::new(),
@@ -516,6 +520,8 @@ impl Scheduler {
     /// checked against the worker's, never against what other leases hold
     /// ([`Worker::has_room`]), though what they hold ranks the workers; a
     /// whole-machine lease only on a worker that holds no lease, and it books all of it.
+    /// A round places no more leases than the block of sequences the scheduler was given
+    /// has left ([`Scheduler::use_seq_block`]); the rest wait for the next round.
     ///
     /// A whole-machine operation that fits nowhere holds one worker that could run it
     /// (the one it held last round while that still could, else the one with fewest
@@ -541,6 +547,8 @@ impl Scheduler {
         // Before any operation is fitted: a floor raised since it was queued applies.
         self.apply_key_floors();
         let now = self.now;
+        let left = usize::try_from(self.seqs_left()).unwrap_or(usize::MAX);
+        let round = PLACEMENT_ROUND.min(left);
         let mut servable = Servable::new(&self.workers, &self.cordons, now);
         let mut placed = Vec::new();
         let mut verdicts = Vec::new();
@@ -555,7 +563,7 @@ impl Scheduler {
             let key_raised = op
                 .key_applied
                 .is_some_and(|a| !a.undone && a.applied == request.resources.memory_bytes);
-            let fitted = placed.len() < PLACEMENT_ROUND
+            let fitted = placed.len() < round
                 && servable
                     .fit(&mut self.workers, request, &reserved, &op.avoid, key_raised)
                     .map(|(name, booked, device)| placed.push((id, name, booked, device)))

@@ -216,6 +216,14 @@ fn put(store: &Flaky, key: &str, value: Vec<u8>) {
     store.txn(put).expect("store").expect("put");
 }
 
+/// Reserves the blocks of ids that operation `op` and the leases from `seq` are numbered in.
+fn reserve_ids(durable: &Durable, op: u64, seq: u64) {
+    let operation = durable.reserve_operation(OperationId(op));
+    assert_eq!(operation.expect("operation ids"), OperationId(op));
+    let block = durable.reserve_seqs(seq).expect("lease sequences");
+    assert_eq!(block.start, seq);
+}
+
 /// Catches: an epoch that is not kept across starts that keep it, not raised by one that
 /// bumps it (a daemon would keep the runs of leases from before a restored file), a new
 /// store that does not start from the seed it is given (two stores could both begin at
@@ -236,21 +244,24 @@ fn the_epoch_is_seeded_kept_and_bumped() {
     assert_eq!(epoch(EpochPolicy::Bump, 5), 102);
 }
 
-/// Catches: an operation not written at submit (a restart forgets work the client was
-/// told is queued), its place in the queue or its next id not kept, and a second write
-/// of the same operation accepted over the first.
+/// Asserts that an operation is written at submit (a restart remembers work the client was
+/// told is queued), that its place in the queue and the block of ids it was numbered in
+/// are kept (a start numbers past the block), and that a second write of the same
+/// operation is refused over the first.
 #[test]
 fn a_submitted_operation_is_loaded_queued() {
     let store = Flaky::new();
     let durable = open(&store);
+    let id = durable.reserve_operation(OperationId(4)).expect("an id");
+    assert_eq!(id, OperationId(4));
     durable
-        .submitted(OperationId(4), &request(1), &a_subject())
+        .submitted(id, &request(1), &a_subject())
         .expect("submit");
     let stored = durable.load().expect("load");
     assert_eq!(
         stored,
         Stored {
-            next_operation: 5,
+            next_operation: 4 + ID_BLOCK,
             next_seq: 0,
             operations: vec![StoredOperation {
                 operation: OperationId(4),
@@ -259,8 +270,11 @@ fn a_submitted_operation_is_loaded_queued() {
                 losses: 0,
                 fate: None,
                 subject: Some(a_subject()),
+                size_key: None,
             }],
             floors: Vec::new(),
+            key_floors: Vec::new(),
+            key_names: Vec::new(),
             cordons: Vec::new(),
         }
     );
@@ -268,10 +282,10 @@ fn a_submitted_operation_is_loaded_queued() {
     assert!(matches!(again, Err(StateError::Conflict(_))), "{again:?}");
 }
 
-/// Catches: a grant whose lease is not in the store (a restart forgets the claim a
-/// daemon was told), whose operation stays queued, or whose lease sequence is not
-/// kept (a restart would grant the lease id again: a stale daemon's result taken as
-/// the new lease's).
+/// Asserts that a grant puts its lease in the store (a restart remembers the claim a
+/// daemon was told), that its operation leaves the queue, and that the block of lease
+/// sequences is kept (a restart would grant the lease id again: a stale daemon's result
+/// taken as the new lease's).
 #[test]
 fn a_grant_holds_the_lease_and_leaves_the_queue() {
     let store = Flaky::new();
@@ -279,11 +293,13 @@ fn a_grant_holds_the_lease_and_leaves_the_queue() {
     durable
         .submitted(OperationId(4), &request(1), &a_subject())
         .expect("submit");
+    let block = durable.reserve_seqs(7).expect("a block");
+    assert_eq!(block, 7..7 + ID_BLOCK);
     durable
         .persist(&[Effect::Start(start(4, 7))], None)
         .expect("grant");
     let stored = durable.load().expect("load");
-    assert_eq!(stored.next_seq, 8);
+    assert_eq!(stored.next_seq, block.end);
     let [held] = stored.operations.as_slice() else {
         panic!("{stored:?}");
     };
@@ -319,6 +335,7 @@ fn an_operation_never_holds_two_leases() {
 fn a_stale_complete_is_rejected() {
     let store = Flaky::new();
     let durable = open(&store);
+    reserve_ids(&durable, 4, 0);
     durable
         .submitted(OperationId(4), &request(1), &a_subject())
         .expect("submit");
@@ -348,7 +365,7 @@ fn a_stale_complete_is_rejected() {
     let stored = durable.load().expect("load");
     assert!(stored.operations.is_empty());
     assert_eq!(
-        stored.next_seq, 2,
+        stored.next_seq, ID_BLOCK,
         "a finished operation's ids are not reused"
     );
     assert_eq!(
@@ -372,6 +389,7 @@ fn a_stale_complete_is_rejected() {
 fn an_operation_ends_in_one_transaction_that_puts_its_result() {
     let store = Flaky::new();
     let durable = open(&store);
+    reserve_ids(&durable, 4, 0);
     for operation in [4, 5] {
         durable
             .submitted(OperationId(operation), &request(1), &a_subject())
@@ -569,10 +587,7 @@ fn a_refusal_removes_the_operation_and_other_effects_write_nothing() {
         .persist(&[Effect::Refuse(refusal)], Some(&ended()))
         .expect("refused");
     assert!(durable.load().expect("load").operations.is_empty());
-    assert_eq!(
-        keys(&store),
-        ["done/0000000000000004", "meta/epoch", "meta/next_op"]
-    );
+    assert_eq!(keys(&store), ["done/0000000000000004", "meta/epoch"]);
 }
 
 /// Catches: a loss count that is not written with the give-up that made it (a restart
@@ -1627,6 +1642,257 @@ fn a_fate_that_cannot_be_written_or_read_is_refused() {
     assert!(error.to_string().contains("not a version 1 or 2 fate"));
 }
 
+fn a_key_floor(key: u64, stamp: u64) -> kbf_sched::KeyFloor {
+    kbf_sched::KeyFloor {
+        key,
+        ask: 16 << 30,
+        stamp,
+    }
+}
+
+fn key_floor_rows(store: &Flaky) -> usize {
+    keys(store)
+        .iter()
+        .filter(|k| k.starts_with("keyfloor/"))
+        .count()
+}
+
+/// Catches: a key floor not written with the requeue that raises it (a successor would
+/// book the old size again), one lost because its operation ended first, a forgotten key
+/// not deleted (or deleted after being raised again), key floors read in another order
+/// than written, and a key floor row confused with a digest floor's (an older binary
+/// reads the `floor/` prefix and must never meet one).
+#[test]
+fn a_key_floor_is_written_with_the_requeue_and_forgotten_with_its_eviction() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted_keyed(OperationId(1), &request(1), &a_subject(), Some(7))
+        .expect("submit");
+    durable
+        .persist(&[Effect::Start(start(1, 10))], None)
+        .expect("grant");
+    let change = FloorChange {
+        raised: Some(a_floor(1, 0)),
+        key_raised: Some(a_key_floor(7, 0)),
+        ..FloorChange::default()
+    };
+    durable
+        .requeued(&killed(1, 10), None, None, &change)
+        .expect("a kill");
+    let stored = durable.load().expect("load");
+    assert_eq!(stored.key_floors, vec![a_key_floor(7, 0)]);
+    assert_eq!(stored.floors, vec![a_floor(1, 0)]);
+    assert_eq!(stored.operations[0].size_key, Some(7));
+    assert_eq!(floor_rows(&store), 1, "one digest floor row");
+    assert_eq!(key_floor_rows(&store), 1);
+
+    // Raised again, with another key: two rows; the operation has ended by now.
+    let both = FloorChange {
+        key_raised: Some(a_key_floor(8, 1)),
+        ..FloorChange::default()
+    };
+    durable
+        .requeued(&killed(9, 90), None, None, &both)
+        .expect("an operation that is gone");
+    assert_eq!(
+        durable.load().expect("load").key_floors,
+        vec![a_key_floor(7, 0), a_key_floor(8, 1)]
+    );
+
+    // Key 9 forgets key 7; key 8 is forgotten and raised again in one change, and keeps
+    // its row.
+    let forgetting = FloorChange {
+        key_raised: Some(a_key_floor(8, 3)),
+        key_evicted: vec![7, 8],
+        ..FloorChange::default()
+    };
+    durable
+        .requeued(&killed(9, 90), None, None, &forgetting)
+        .expect("a forgotten key");
+    assert_eq!(
+        durable.load().expect("load").key_floors,
+        vec![a_key_floor(8, 3)]
+    );
+    // A change with nothing to write writes nothing.
+    durable
+        .requeued(&requeue(9, 0), None, None, &FloorChange::default())
+        .expect("nothing");
+    assert_eq!(key_floor_rows(&store), 1);
+}
+
+/// The size key of an operation is a row of its own, written with the submission: it
+/// reads back with the operation, leaves the request row byte for byte what an unkeyed
+/// operation's is (an older reader sees the same request), and goes with the operation
+/// when it finishes, in the same transaction. An operation given no key has no row.
+#[test]
+fn a_size_key_is_a_row_of_its_own_written_with_the_submission_and_gone_with_the_operation() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted(OperationId(1), &request(1), &a_subject())
+        .expect("submit");
+    durable
+        .submitted_keyed(OperationId(2), &request(1), &a_subject(), Some(7))
+        .expect("submit");
+    let opkeys: Vec<String> = keys(&store)
+        .into_iter()
+        .filter(|k| k.starts_with("opkey/"))
+        .collect();
+    assert_eq!(opkeys, ["opkey/0000000000000002"]);
+    let rows = store.scan_prefix("op/").expect("scan");
+    assert_eq!(rows[0].1.value, rows[1].1.value, "the request is the same");
+    let stored = durable.load().expect("load");
+    let found: Vec<_> = stored.operations.iter().map(|o| o.size_key).collect();
+    assert_eq!(found, [None, Some(7)]);
+
+    durable
+        .persist(&[Effect::Start(start(2, 20))], None)
+        .expect("grant");
+    durable
+        .persist(&[Effect::Answer(answer(2, 20))], Some(&ended()))
+        .expect("finished");
+    assert!(!keys(&store).iter().any(|k| k.starts_with("opkey/")));
+}
+
+/// Catches a size key row read as anything but what was written: another version, a row
+/// cut short or with bytes after it, a name that is not an operation id.
+#[test]
+fn an_opkey_row_that_is_not_one_is_refused() {
+    let row = opkey::encode(0x0102_0304_0506_0708);
+    assert_eq!(opkey::decode(&row), Ok(0x0102_0304_0506_0708));
+    assert!(opkey::decode(&[2, 0, 0, 0, 0, 0, 0, 0, 1]).is_err());
+    for cut in 0..row.len() {
+        assert!(opkey::decode(&row[..cut]).is_err(), "{cut}");
+    }
+    let mut longer = row.clone();
+    longer.push(0);
+    assert!(opkey::decode(&longer).is_err());
+
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted(OperationId(1), &request(1), &a_subject())
+        .expect("submit");
+    store
+        .inner
+        .txn(Txn::new().put("opkey/not-an-id", row, Cond::Any))
+        .expect("write")
+        .expect("applied");
+    assert!(durable.load().is_err());
+}
+
+/// The release before this feature reads a store holding `opkey/` and `keyfloor/` rows and
+/// ignores them: the scheduler reads rows by prefix, and neither prefix is one of the
+/// others (nor begins with it), so every scan that release makes sees the store as it
+/// was, and everything else (an operation's request among them) is in the rows it always
+/// was in. The store here has an operation, a lease, a floor and both new kinds of row.
+#[test]
+fn a_store_with_size_key_rows_reads_as_it_did_without_them() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted_keyed(OperationId(1), &request(1), &a_subject(), Some(7))
+        .expect("submit");
+    durable
+        .persist(&[Effect::Start(start(1, 10))], None)
+        .expect("grant");
+    let change = FloorChange {
+        raised: Some(a_floor(1, 0)),
+        key_raised: Some(a_key_floor(7, 0)),
+        ..FloorChange::default()
+    };
+    durable
+        .requeued(&killed(1, 10), None, None, &change)
+        .expect("a kill");
+    let all = keys(&store);
+    assert!(all.iter().any(|k| k.starts_with("opkey/")));
+    assert!(all.iter().any(|k| k.starts_with("keyfloor/")));
+
+    // The prefixes the release without the feature scans.
+    let known = [
+        "op/",
+        "queue/",
+        "lease/",
+        "session/",
+        "loss/",
+        "fate/",
+        "floor/",
+        "subject/",
+        "done/",
+        "cordon/",
+        "inflight/",
+    ];
+    let new = |k: &String| k.starts_with("opkey/") || k.starts_with("keyfloor/");
+    for prefix in known {
+        let scanned = store.scan_prefix(prefix).expect("scan");
+        assert!(
+            scanned.iter().all(|(k, _)| !new(k)),
+            "a scan of {prefix} meets a new row"
+        );
+    }
+    // What those scans find is what a store without the feature holds: the request
+    // reads as a format-1 entry, the floor row as a digest floor.
+    let rows = store.scan_prefix("op/").expect("scan");
+    assert!(kbf_log::decode(kbf_log::Format::V1, &rows[0].1.value).is_ok());
+    let floors = store.scan_prefix("floor/").expect("scan");
+    assert_eq!(floors.len(), 1);
+    assert!(floor::decode(&floors[0].1.value).is_ok());
+}
+
+/// Catches a key floor row read as anything but what was written: another version, a
+/// row cut short or with bytes after it, a row under another key's name, and two rows
+/// with one stamp.
+#[test]
+fn a_key_floor_row_that_is_not_one_is_refused() {
+    let floor = a_key_floor(7, 5);
+    let row = floor::encode_key(&floor, Some("est/6d61696e/6c696e7578/c/0000000000000001/-"));
+    assert_eq!(
+        floor::decode_key(&row),
+        Ok((
+            floor.clone(),
+            Some("est/6d61696e/6c696e7578/c/0000000000000001/-".to_owned())
+        ))
+    );
+    let bare = floor::encode_key(&floor, None);
+    assert_eq!(floor::decode_key(&bare), Ok((floor, None)));
+    let mut other = row.clone();
+    other[0] = 2;
+    assert!(floor::decode_key(&other).is_err());
+    for cut in 0..row.len() {
+        assert!(floor::decode_key(&row[..cut]).is_err(), "{cut}");
+    }
+    let mut longer = row.clone();
+    longer.push(0);
+    assert!(floor::decode_key(&longer).is_err());
+    let mut mislen = bare.clone();
+    mislen[25..27].copy_from_slice(&5_u16.to_be_bytes());
+    assert!(floor::decode_key(&mislen).is_err());
+
+    let store = Flaky::new();
+    let durable = open(&store);
+    store
+        .inner
+        .txn(Txn::new().put(floor::key_row(8), row.clone(), Cond::Any))
+        .expect("write")
+        .expect("applied");
+    let error = durable.load().expect_err("under another key's name");
+    assert!(error.to_string().contains("not the key"), "{error}");
+    let store = Flaky::new();
+    let durable = open(&store);
+    for key in [7, 8] {
+        let mut same = row.clone();
+        same[1..9].copy_from_slice(&u64::to_be_bytes(key));
+        store
+            .inner
+            .txn(Txn::new().put(floor::key_row(key), same, Cond::Any))
+            .expect("write")
+            .expect("applied");
+    }
+    let error = durable.load().expect_err("one stamp twice");
+    assert!(error.to_string().contains("stamp"), "{error}");
+}
+
 fn size_key(instance: &str, cfg: Option<u64>) -> kbf_estimator::Key {
     use kbf_estimator::{Basis, Cfg, Instance, Key, PlatformClass, Shape};
     Key::new(
@@ -2232,4 +2498,60 @@ fn a_sweep_that_commits_nothing_does_not_ask_for_another_call() {
         durable.sweep_estimates(Day(200)).expect("sweep"),
         (SWEEP_TXNS * SWEEP_ROWS, true)
     );
+}
+
+fn summary_key() -> kbf_estimator::Key {
+    use kbf_estimator::{Basis, Instance, Key, PlatformClass, Shape};
+    Key::new(
+        Instance::new("main"),
+        PlatformClass::new("linux"),
+        Basis::Cgroup,
+        Shape(7),
+        None,
+    )
+}
+
+/// A write that does not know the size summary a key floor decays with leaves the name its
+/// row already holds, so a floor raised by a path that cannot name it does not lose the
+/// name.
+#[test]
+fn a_write_that_does_not_know_the_summary_keeps_the_name_the_row_has() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .put_key_floor(&a_key_floor(7, 0), Some(&summary_key()))
+        .expect("write");
+    durable
+        .put_key_floor(&a_key_floor(7, 1), None)
+        .expect("write");
+    let stored = durable.load().expect("load");
+    assert_eq!(stored.key_floors, vec![a_key_floor(7, 1)]);
+    assert_eq!(stored.key_names, vec![(7, summary_key())]);
+    // A row never named stays unnamed.
+    durable
+        .put_key_floor(&a_key_floor(8, 2), None)
+        .expect("write");
+    assert_eq!(durable.load().expect("load").key_names.len(), 1);
+}
+
+/// A summary name too long for the row is left out of it: the row still reads back, so a
+/// requeue is never refused for it.
+#[test]
+fn a_summary_name_that_does_not_fit_is_left_out_of_the_row() {
+    use kbf_estimator::{Basis, Instance, Key, PlatformClass, Shape};
+    let long = Key::new(
+        Instance::new("x".repeat(40_000)),
+        PlatformClass::new("linux"),
+        Basis::Cgroup,
+        Shape(7),
+        None,
+    );
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .put_key_floor(&a_key_floor(7, 0), Some(&long))
+        .expect("written without the name");
+    let stored = durable.load().expect("the row reads back");
+    assert_eq!(stored.key_floors, vec![a_key_floor(7, 0)]);
+    assert!(stored.key_names.is_empty());
 }

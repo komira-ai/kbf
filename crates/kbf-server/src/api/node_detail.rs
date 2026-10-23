@@ -15,7 +15,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use kbf_types::WorkerId;
 
-use super::{ApiState, desired_commit, error, json};
+use super::{ApiState, error, json};
 
 /// The verbs a `POST /v1/nodes/{node}:{verb}` takes (`write_request`), which a `GET`
 /// refuses at the end of an id.
@@ -37,13 +37,7 @@ pub(super) async fn one(State(api): State<Arc<ApiState>>, Path(target): Path<Str
         return error(StatusCode::NOT_FOUND, NO_NODE);
     }
     match api.farm.node_detail(&WorkerId::new(&target)) {
-        Some(mut detail) => {
-            detail
-                .node
-                .update
-                .judge(desired_commit(&api).await.as_deref());
-            json(StatusCode::OK, &detail)
-        }
+        Some(detail) => json(StatusCode::OK, &detail),
         None => error(StatusCode::NOT_FOUND, NO_NODE),
     }
 }

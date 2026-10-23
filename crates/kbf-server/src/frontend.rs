@@ -1147,11 +1147,6 @@ impl<'a> Prepared<'a> {
             token.clone(),
             object_stores.map(|stores| stores.api),
         ))
-        .merge(crate::update_hosts::router(
-            Arc::clone(&farm),
-            update_rows.clone(),
-            crate::update_hosts::FarmReaders::from_policy(&policy),
-        ))
         .merge(crate::release::desired::router(
             releases.clone(),
             update_rows,

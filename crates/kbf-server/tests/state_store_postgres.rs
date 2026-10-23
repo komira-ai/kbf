@@ -142,18 +142,19 @@ fn a_start_on_a_database_without_the_installers_schema_is_refused() {
     assert!(made.is_empty(), "the refused start created the schema");
 }
 
-/// Catches: a Postgres `--state-store` that is parsed and then not opened; a fresh store
-/// that is not given an epoch of its own, or one that is not bumped by the next start; an
-/// open after a handover that bumps the epoch or does not expect the generation it was
-/// told; and a store opened without the writer fence (a handle left over from an earlier
-/// writer could still write after its successor started).
+/// Asserts that a Postgres `--state-store` is parsed and then opened; that a fresh store is
+/// given an epoch of its own and the next start keeps it (every start keeps it, so a
+/// frontend started over the database leaves the daemons their runs); that an open after a
+/// handover expects the generation it was told; and that the store is opened with the
+/// writer fence (a handle left over from an earlier writer could otherwise still write
+/// after its successor started).
 #[test]
 #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
-fn a_flag_opened_postgres_store_takes_generations_and_epochs_as_sqlite_does() {
+fn a_flag_opened_postgres_store_takes_generations_and_keeps_epochs() {
     let db = Scratch::new();
     db.install_schema();
     let uri = uri(&db.url());
-    assert_eq!(uri.epoch_policy(), EpochPolicy::Bump);
+    assert_eq!(uri.epoch_policy(), EpochPolicy::Keep);
 
     let first = uri.open().expect("a first start on a fresh database");
     let named: i64 = postgres::Client::connect(&db.url(), postgres::NoTls)
@@ -168,7 +169,7 @@ fn a_flag_opened_postgres_store_takes_generations_and_epochs_as_sqlite_does() {
         named >= 1,
         "the server's connections are named kbf-server in pg_stat_activity"
     );
-    assert_eq!(first.epoch, EpochPolicy::Bump);
+    assert_eq!(first.epoch, EpochPolicy::Keep);
     assert_eq!(
         generation(&first),
         1,
@@ -196,12 +197,8 @@ fn a_flag_opened_postgres_store_takes_generations_and_epochs_as_sqlite_does() {
         .txn(write())
         .expect("the holder writes")
         .expect("commits");
-    let bumped = farm_over(second).lease_epoch();
-    assert_eq!(
-        bumped,
-        epoch + 1,
-        "every start but a handover is a new epoch"
-    );
+    let kept = farm_over(second).lease_epoch();
+    assert_eq!(kept, epoch, "a start moved the epoch");
 
     let refused = uri
         .open_after_handover(99)
@@ -218,9 +215,32 @@ fn a_flag_opened_postgres_store_takes_generations_and_epochs_as_sqlite_does() {
     assert_eq!(generation(&successor), 3);
     assert_eq!(
         farm_over(successor).lease_epoch(),
-        bumped,
+        kept,
         "a handover keeps the epoch"
     );
+}
+
+/// Asserts that the operator's bump raises the epoch of a flag-opened Postgres store by
+/// one, once, through the frontend that holds the generation; that the frontend goes on
+/// serving the epoch it started under; and that the next start serves the raised epoch
+/// and raises nothing more.
+#[test]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+fn a_bump_raises_the_epoch_of_a_flag_opened_postgres_store_once() {
+    let db = Scratch::new();
+    db.install_schema();
+    let uri = uri(&db.url());
+    let first = farm_over(uri.open().expect("a first start"));
+    let epoch = first.lease_epoch();
+
+    let bumped = first.bump_epoch().expect("a bump").expect("a state store");
+
+    assert_eq!((bumped.previous, bumped.epoch), (epoch, epoch + 1));
+    assert_eq!(first.lease_epoch(), epoch);
+    let second = farm_over(uri.open().expect("a second start"));
+    assert_eq!(second.lease_epoch(), epoch + 1);
+    let again = farm_over(uri.open().expect("a third start"));
+    assert_eq!(again.lease_epoch(), epoch + 1);
 }
 
 /// Catches: a Postgres server that acknowledges a commit before it is flushed

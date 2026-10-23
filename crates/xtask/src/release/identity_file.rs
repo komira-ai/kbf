@@ -1,5 +1,4 @@
-//! The `kbf --version --json` identity files of a release (read by `release notes` and
-//! `release offer`): one JSON object naming the build it is for.
+//! The `kbf --version --json` identity files of a release (read by `release notes`): one JSON object naming the build it is for.
 
 use std::path::Path;
 
