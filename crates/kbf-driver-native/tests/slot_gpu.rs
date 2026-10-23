@@ -96,14 +96,9 @@ struct Lease {
 
 impl Lease {
     /// `program` as the slot's user under the slot profile, with the lease's variables
-    /// and `extra` ones, ended by an alarm after `secs`.
-    fn command(&self, slot: &Slot, extra: &[&str], program: &Path, secs: u64) -> Command {
-        let mut inner: Vec<String> = vec![
-            "-e".into(),
-            "alarm shift; exec @ARGV".into(),
-            secs.to_string(),
-            "/usr/bin/env".into(),
-        ];
+    /// and `extra` ones. It ends on its own or when the test ends the uid's processes.
+    fn command(&self, slot: &Slot, extra: &[&str], program: &Path) -> Command {
+        let mut inner: Vec<String> = Vec::new();
         for (name, value) in &self.vars {
             inner.push(format!("{name}={}", value.to_string_lossy()));
         }
@@ -115,7 +110,7 @@ impl Lease {
                 &self.isolation,
                 Network::Off,
                 &self.dir,
-                PathBuf::from("/usr/bin/perl"),
+                PathBuf::from("/usr/bin/env"),
                 &inner,
             )
             .expect("launch");
@@ -309,10 +304,7 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
     let (home, folders) = (slot.ready().home.clone(), slot.ready().folders.clone());
 
     // The Metal arm, then a process that keeps its device open.
-    let out = lease
-        .command(&slot, &[], &probe, 300)
-        .output()
-        .expect("probe");
+    let out = lease.command(&slot, &[], &probe).output().expect("probe");
     let said = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
         said.contains("GPU_PROBE_PASS"),
@@ -321,7 +313,7 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
     );
     let holding = probes.join("holding.out");
     let mut holder = lease
-        .command(&slot, &["GPU_HOLD=1"], &probe, 600)
+        .command(&slot, &["GPU_HOLD=1"], &probe)
         .stdout(std::fs::File::create(&holding).expect("holder output"))
         .stderr(Stdio::null())
         .spawn()
