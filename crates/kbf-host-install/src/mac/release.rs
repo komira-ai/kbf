@@ -6,6 +6,9 @@
 //! names of the channel's directory ([`pick_named`]), or, when the channel pins its releases,
 //! among the lines of its `SHA256SUMS` ([`pick`]).
 
+/// The repository whose releases a Mac takes, and whose workflow's attestation it accepts.
+pub const REPO: &str = "komira-ai/kbf";
+
 /// The platform of a Mac's release.
 pub const PLATFORM: &str = "darwin-arm64";
 
@@ -34,7 +37,7 @@ pub fn is_commit(text: &str) -> bool {
 }
 
 /// The commit in a tarball's file name `kbf-<40 hex>-darwin-arm64.tar.gz`.
-fn commit_of_name(name: &str) -> Option<&str> {
+pub fn commit_of_name(name: &str) -> Option<&str> {
     name.strip_prefix("kbf-")
         .and_then(|rest| rest.strip_suffix(&format!("-{PLATFORM}.tar.gz")))
         .filter(|commit| is_commit(commit))

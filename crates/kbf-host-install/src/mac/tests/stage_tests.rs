@@ -8,7 +8,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::rc::Rc;
 
 use super::fx::{Fx, NEW, NEW_VERSION, Sim, digest, gzip, mkdir, mode, sha256, tarball, write};
-use crate::mac::channel::MacChannel;
+use crate::mac::channel::{MacChannel, Source};
 use crate::mac::release::{bundle_name, tarball_name};
 use crate::mac::stage::{Staged, stage, strip_quarantine};
 use crate::outcome::{FailureCode, Outcome, Refusal};
@@ -17,7 +17,7 @@ use crate::runner::Identity;
 
 fn channel(fx: &Fx) -> MacChannel {
     MacChannel {
-        dir: fx.channel_dir.clone(),
+        source: Source::Dir(fx.channel_dir.clone()),
         sums: Some(fx.sums.clone()),
         source_ref: "refs/heads/main".into(),
     }

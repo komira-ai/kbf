@@ -6,7 +6,7 @@ fn json(outcome: &Outcome) -> Value {
     serde_json::from_str(&outcome.json_line()).unwrap()
 }
 
-const ALL_REFUSALS: [(Refusal, &str); 7] = [
+const ALL_REFUSALS: [(Refusal, &str); 10] = [
     (Refusal::BadCommand, "bad_command"),
     (Refusal::ChannelNotAllowed, "channel_not_allowed"),
     (Refusal::ConfigInvalid, "config_invalid"),
@@ -14,6 +14,9 @@ const ALL_REFUSALS: [(Refusal, &str); 7] = [
     (Refusal::ChannelUnsigned, "channel_unsigned"),
     (Refusal::KeyUntrusted, "key_untrusted"),
     (Refusal::ChannelInsecure, "channel_insecure"),
+    (Refusal::UnknownRelease, "unknown_release"),
+    (Refusal::AmbiguousRelease, "ambiguous_release"),
+    (Refusal::FetchFailed, "fetch_failed"),
 ];
 
 const ALL_FAILURES: [(FailureCode, &str); 9] = [
