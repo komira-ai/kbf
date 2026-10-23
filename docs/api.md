@@ -594,6 +594,32 @@ the drain, and the unit templates in `kbf-deploy` set it.
 restart it. `kbf cluster member <id> --state active|draining|planned-down [--for-secs N] --token-file F` calls
 `POST /v1/members/{id}`, and `kbf cluster denied --token-file F` calls `GET /v1/denied`.
 `kbf cluster object-store ...` calls the `/v1/object-stores/...` routes (below).
+`kbf cluster epoch-bump --token-file F` calls `POST /v1/epoch/bump`.
+
+## `POST /v1/epoch/bump`
+
+Raises the epoch the state store holds by one, for the day the store was restored from a
+backup and the daemons must drop the leases the lost history granted (the steps are in
+[kbf-units.md](deploy/kbf-units.md#the-state-store-postgres-for-the-frontend)). A write that
+passes every gate of [Who may write](#who-may-write) and takes no body (or `{}`). The epoch
+is the one `Welcome` names: a daemon that sees an epoch other than the one it knew kills the
+runs of its leases and lists none. A frontend that starts keeps the stored epoch, so a start
+no longer changes it; this call is the one way it changes.
+
+```json
+{ "previous": 41, "epoch": 42, "serving": 41 }
+```
+
+- `previous`: the epoch the store held before the call.
+- `epoch`: the epoch it holds now. The next frontend that starts serves it.
+- `serving`: the epoch the frontend that answered serves, the one it started under. The
+  call does not change it: restart the frontend for the new epoch to apply.
+
+`404` from a server with no `--state-store`, which keeps no epoch; `503` when the store
+cannot be reached or other writers kept changing the epoch for the whole of the call's tries
+(it changed nothing; call again); `409` when a newer frontend has taken the store's
+writer role from this one (it changed nothing, and calling again on this frontend cannot
+succeed: call the frontend that serves).
 
 ## `/v1/enroll/tokens` and `/v1/enroll/nodes`
 
@@ -967,8 +993,8 @@ without taking the generation, touches no epoch and writes nothing; it serves `/
 no scheduler or reconciler and binds no worker listener. It makes and changes no schema.
 A SQLite state file is held by one process (an exclusive file lock), so a candidate cannot
 run beside the process that holds the file: side by side needs the Postgres store.
-A start without `--await-takeover` takes the next generation and bumps the epoch, as any
-start does.
+A start without `--await-takeover` takes the next generation and keeps the epoch, as any
+start does; only `POST /v1/epoch/bump` changes it.
 
 ## `/v1/object-stores/...`
 
