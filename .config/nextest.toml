@@ -27,8 +27,11 @@ test-group = 'mac-provision-scratch'
 #
 # The slow set is every test that took 10 seconds or more in the full run on a hosted x86
 # runner: 77 of 8960 tests, 70 percent of the run's test time (the 5 GiB blob test alone
-# is 898 s). A test that needs a service (Postgres, S3, crun, root, macOS) is `#[ignore]`d
-# and so is in neither run; the other jobs of beta.yml run those.
+# is 898 s). A test that needs Postgres is not ignored: both runs have a server, which
+# KBF_TEST_POSTGRES_URL names (the `postgres` service of ci.yml's test job and of beta.yml's
+# test-x86 and test-arm), and each such test makes a database or a schema of its own. A test
+# that needs another service (S3, crun, root, macOS) is `#[ignore]`d and so is in neither
+# run; the other jobs of beta.yml run those.
 # The black-box crates kbf-all-in-one-test and kbf-daemon-test (T009, their README.md files) are
 # excluded whole by `package(...)` below: they are beta suites, and run in the full run only.
 #

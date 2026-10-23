@@ -330,22 +330,18 @@ fn without_password(url: &str) -> String {
 /// a runtime from within a runtime"), or whose `/readyz` is not 200 over the schema the
 /// installer made, or that creates the tables itself: started on a database nobody ran
 /// `setup` on it must exit with the one line that says what to run, and leave no schema.
-/// Needs a Postgres server: `KBF_TEST_POSTGRES_URL` names a database the test may create
-/// the `kbf_state` schema in.
+/// Needs a Postgres server, and fails without one: `KBF_TEST_POSTGRES_URL` names a server the
+/// test may create a database on. The database is the test's own and starts with no schema.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_frontend_process_with_a_postgres_state_store_is_ready_over_the_installers_schema() {
-    let url = std::env::var("KBF_TEST_POSTGRES_URL")
-        .expect("KBF_TEST_POSTGRES_URL names a database the test may create schemas in");
+    let database = kbf_state::postgres::TestDatabase::empty();
+    let url = database.url();
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-postgres");
     let node = node(&dir);
     // The flag refuses a password (the command line is world-readable), so the process
     // gets the URL without one; the server the job runs trusts its loopback clients.
     let flag = format!("--state-store={}", without_password(&url));
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connect");
-    client
-        .batch_execute("DROP SCHEMA IF EXISTS kbf_state CASCADE")
-        .expect("start from a database with no schema");
 
     let storage = format!("--storage=http://{}", node.field("storage="));
     let refused = Command::new(BIN)

@@ -2510,7 +2510,9 @@ dependencies = [
 name = "kbf-testkit"
 version = "0.1.0"
 dependencies = [
+ "kbf-testkit",
  "libc",
+ "postgres",
  "rustix",
  "tokio",
 ]
