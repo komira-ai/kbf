@@ -7,9 +7,11 @@
 //! door gives ([`Op::refusals`]).
 
 use std::fmt;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use super::{Fs, Op, Seen};
 
@@ -62,29 +64,69 @@ impl Refusal {
     }
 }
 
+/// How long a tool the probe runs may take: a door that hangs is a door that proved
+/// nothing, and the daemon waits [`super::WITHIN`] for the whole probe.
+const TOOL_WITHIN: Duration = Duration::from_secs(4);
+
 /// What a tool the probe ran gave back.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Out {
-    /// The exit code; `None` if a signal ended it.
+    /// The exit code; `None` if a signal ended it, or it was killed for taking too long.
     pub code: Option<i32>,
-    pub stderr: String,
+    /// What it printed, on its output and its error output together.
+    pub text: String,
 }
 
-/// Runs `program` with `args`, no environment and no input, and waits.
+/// Runs `program` with `args`, no environment and no input, and waits for it at most
+/// [`TOOL_WITHIN`] (a tool still running then is killed and its code is `None`).
 ///
 /// # Errors
 /// The program could not be started.
 pub fn run(program: &str, args: &[String]) -> io::Result<Out> {
-    let out = Command::new(program)
+    run_within(program, args, TOOL_WITHIN)
+}
+
+/// [`run`] that waits for the tool at most `within`.
+///
+/// # Errors
+/// The program could not be started.
+pub fn run_within(program: &str, args: &[String], within: Duration) -> io::Result<Out> {
+    let (mut reader, writer) = io::pipe()?;
+    let mut child = Command::new(program)
         .args(args)
         .env_clear()
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()?;
+        .stdout(writer.try_clone()?)
+        .stderr(writer)
+        .spawn()?;
+    let (send, read) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = reader.read_to_end(&mut bytes);
+        let _ = send.send(bytes);
+    });
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if started.elapsed() > within {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let bytes = read
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap_or_default();
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if status.is_none() {
+        text.push_str("\n(killed: still running after the tool's time)");
+    }
     Ok(Out {
-        code: out.status.code(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        code: status.and_then(|s| s.code()),
+        text,
     })
 }
 
@@ -130,10 +172,16 @@ fn refused(op: Op, refusal: Refusal) -> Seen {
     }
 }
 
-/// The first line of what a tool said, for a failure.
+/// What a tool said, for a failure: its lines joined, the first 400 characters.
 fn said(out: &Out) -> String {
-    let line = out.stderr.lines().find(|l| !l.trim().is_empty());
-    format!("exit {:?}: {}", out.code, line.unwrap_or("").trim())
+    let lines: Vec<&str> = out
+        .text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let text: String = lines.join(" | ").chars().take(400).collect();
+    format!("exit {:?}: {text}", out.code)
 }
 
 /// The integer written right after `marker` in `text`.
@@ -161,7 +209,7 @@ fn read_open(out: &Out) -> Seen {
     if out.code == Some(0) {
         return Seen::Allowed;
     }
-    let status = number_after(&out.stderr, "Code=").or_else(|| number_after(&out.stderr, "error "));
+    let status = number_after(&out.text, "Code=").or_else(|| number_after(&out.text, "error "));
     status.map_or_else(
         || Seen::Failed(said(out)),
         |n| refused(Op::LsOpen, Refusal::OsStatus(n)),
@@ -181,7 +229,7 @@ pub fn ls_open(fs: &dyn Fs, app: &Path) -> Seen {
 fn read_attach(out: &Out) -> Seen {
     if out.code == Some(0) {
         Seen::Allowed
-    } else if out.stderr.contains("Operation not permitted") {
+    } else if out.text.contains("Operation not permitted") {
         refused(Op::Mount, Refusal::Errno(libc::EPERM))
     } else {
         Seen::Failed(said(out))
@@ -268,7 +316,7 @@ fn read_bootstrap(out: &Out) -> Seen {
     if out.code == Some(0) {
         return Seen::Allowed;
     }
-    number_after(&out.stderr, "Bootstrap failed: ").map_or_else(
+    number_after(&out.text, "Bootstrap failed: ").map_or_else(
         || Seen::Failed(said(out)),
         |n| refused(Op::LaunchdBootstrap, Refusal::Bootstrap(n)),
     )
@@ -303,10 +351,10 @@ pub fn bootstrap(fs: &dyn Fs, job: &Path) -> Seen {
 mod tests {
     use super::*;
 
-    fn out(code: i32, stderr: &str) -> Out {
+    fn out(code: i32, text: &str) -> Out {
         Out {
             code: Some(code),
-            stderr: stderr.to_owned(),
+            text: text.to_owned(),
         }
     }
 
@@ -346,7 +394,7 @@ mod tests {
         assert!(matches!(read_open(&out(1, "Code=-600")), Seen::Failed(_)));
         let killed = Out {
             code: None,
-            stderr: String::new(),
+            text: String::new(),
         };
         assert!(matches!(read_open(&killed), Seen::Failed(_)));
     }
@@ -377,5 +425,23 @@ mod tests {
             read_bootstrap(&out(1, "Bootstrap failed: 113")),
             Seen::Failed(_)
         ));
+    }
+
+    /// Catches a tool run that hangs the probe (a door that waits for a window server
+    /// holds the whole canary until the daemon gives up on it), that loses what the
+    /// tool printed on either output, or that reports a killed tool as one that exited.
+    #[test]
+    fn a_tool_is_waited_for_a_while_and_its_output_is_kept() {
+        let out =
+            run_within("/bin/ls", &["/nonexistent/kbf-door".into()], TOOL_WITHIN).expect("ls");
+        assert!(out.code.is_some_and(|c| c != 0), "{out:?}");
+        assert!(out.text.contains("kbf-door"), "{out:?}");
+        let started = Instant::now();
+        let slow =
+            run_within("/bin/sleep", &["30".into()], Duration::from_millis(100)).expect("sleep");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(slow.code, None);
+        assert!(slow.text.contains("killed"), "{slow:?}");
+        assert!(run("/nonexistent/tool", &[]).is_err());
     }
 }

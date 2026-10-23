@@ -594,7 +594,7 @@ mod tests {
             if args.first().is_some_and(|a| helper.contains(&a.as_str())) {
                 return Ok(Out {
                     code: Some(0),
-                    stderr: String::new(),
+                    text: String::new(),
                 });
             }
             Ok(self.out.clone())
@@ -623,7 +623,7 @@ mod tests {
     fn world(op: Op, world: World) -> Fake {
         let tool = |code: i32, stderr: &str| Out {
             code: Some(code),
-            stderr: stderr.to_owned(),
+            text: stderr.to_owned(),
         };
         let mut fake = Fake::new(match (op, world) {
             (_, World::Open) => || Ok(()),
@@ -871,7 +871,7 @@ mod tests {
             let mut fake = world(op, World::Shut);
             fake.out = Out {
                 code: Some(1),
-                stderr: said.to_owned(),
+                text: said.to_owned(),
             };
             let seen = probe(&fake, op, lease);
             assert!(matches!(seen, Seen::Failed(_)), "{op:?}: {seen:?}");
@@ -891,7 +891,7 @@ mod tests {
         let mut no_image = world(Op::Mount, World::Open);
         no_image.out = Out {
             code: Some(1),
-            stderr: "hdiutil: create failed".to_owned(),
+            text: "hdiutil: create failed".to_owned(),
         };
         assert!(matches!(
             probe(&no_image, Op::Mount, lease),
@@ -922,7 +922,7 @@ mod tests {
             .run("/bin/ls", &["/nonexistent/kbf-canary".into()])
             .expect("run");
         assert!(out.code.is_some_and(|c| c != 0), "{out:?}");
-        assert!(out.stderr.contains("kbf-canary"), "{out:?}");
+        assert!(out.text.contains("kbf-canary"), "{out:?}");
         let ok = RealFs.run("/bin/ls", &["/".into()]).expect("run");
         assert_eq!(ok.code, Some(0));
         assert!(RealFs.run("/nonexistent/tool", &[]).is_err());
