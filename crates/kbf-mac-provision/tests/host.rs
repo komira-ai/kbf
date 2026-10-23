@@ -165,7 +165,7 @@ fn a_program_is_fed_its_input_and_its_output_is_read_while_it_is() {
     let host = RealHost::new("/");
     let out = host.run_with_input("/usr/bin/env", &[], "ignored").unwrap();
     assert_eq!((out.success, out.stdout.as_str()), (true, "LC_ALL=C\n"));
-    let input = "create /Users/x UniqueID 7\n".repeat(150_000);
+    let input = "create /Groups/x PrimaryGroupID 7\n".repeat(150_000);
     let out = host.run_with_input("/bin/cat", &[], &input).unwrap();
     assert!(out.success);
     assert_eq!(out.stdout, input);

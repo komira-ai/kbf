@@ -188,7 +188,7 @@ mod tests {
     fn readall_output_is_split_into_records() {
         let text = "\
 AuthenticationAuthority: ;ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2>
-NFSHomeDirectory: /Users/a b
+NFSHomeDirectory: /opt/farm/a b
 PrimaryGroupID:
  20
 RecordName: farm farmadmin
@@ -211,7 +211,7 @@ UniqueID: 700";
         assert_eq!(farm.number("UniqueID"), Some(501));
         assert_eq!(farm.get("PrimaryGroupID"), "20");
         assert_eq!(farm.get("IsHidden"), "1");
-        assert_eq!(farm.get("NFSHomeDirectory"), "/Users/a b");
+        assert_eq!(farm.get("NFSHomeDirectory"), "/opt/farm/a b");
         assert!(farm.has("AuthenticationAuthority"));
         assert_eq!(
             farm.get("AuthenticationAuthority"),
@@ -240,13 +240,13 @@ UniqueID: 700";
     fn a_batch_is_one_command_per_line_in_the_order_queued() {
         let mut batch = Batch::default();
         assert!(batch.is_empty());
-        batch.create("/Users/u");
-        batch.set("/Users/u", "UniqueID", "7");
-        batch.delete("/Users/u", "AuthenticationAuthority");
+        batch.create("/Groups/u");
+        batch.set("/Groups/u", "UniqueID", "7");
+        batch.delete("/Groups/u", "AuthenticationAuthority");
         assert!(!batch.is_empty());
         assert_eq!(
             batch.0,
-            "create /Users/u\ncreate /Users/u UniqueID 7\ndelete /Users/u AuthenticationAuthority\n"
+            "create /Groups/u\ncreate /Groups/u UniqueID 7\ndelete /Groups/u AuthenticationAuthority\n"
         );
     }
 }

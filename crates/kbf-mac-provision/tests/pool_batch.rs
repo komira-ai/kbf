@@ -5,6 +5,9 @@ mod support;
 
 use support::{FakeMac, apply_keys, calls, check_keys, lines};
 
+/// The directory of user records.
+const USERS: &str = "/Users";
+
 /// The commands that make pool user `i` of a pool from `first` that is not there.
 fn make(i: u32, first: u32) -> String {
     let (name, uid) = (format!("kbf-pool-{i}"), first + i);
@@ -76,7 +79,7 @@ fn apply_feeds_dscl_the_commands_for_a_small_pool() {
     );
     assert_eq!(*mac.inputs.borrow(), [want]);
     assert!(
-        mac.inputs.borrow()[0].contains("create /Users/kbf-pool-2 UniqueID 802\n"),
+        mac.inputs.borrow()[0].contains(&format!("create {USERS}/kbf-pool-2 UniqueID 802\n")),
         "uid 802"
     );
     assert_eq!(calls(&mac, "dscl . <stdin").len(), 1);
@@ -158,12 +161,12 @@ fn a_second_apply_does_nothing_and_a_partial_pool_gets_only_what_is_missing() {
     let s = mac.state_mut();
     s.remove_user("kbf-pool-10");
     s.remove_user("kbf-pool-11");
-    s.user_attr("kbf-pool-20", "UserShell", "/bin/zsh");
+    s.user_attr("kbf-pool-20", "UserShell", "/usr/bin/login");
     s.user_attr("kbf-pool-30", "AuthenticationAuthority", ";ShadowHash;");
     let r = apply_keys(&mac, Some("pool_users"));
     assert_eq!(r.failed, 0, "{}", r.text);
     let want = format!(
-        "{}{}create /Users/kbf-pool-20 UserShell /usr/bin/false\ndelete /Users/kbf-pool-30 AuthenticationAuthority\n",
+        "{}{}create {USERS}/kbf-pool-20 UserShell /usr/bin/false\ndelete {USERS}/kbf-pool-30 AuthenticationAuthority\n",
         make(10, 61000),
         make(11, 61000)
     );
@@ -180,7 +183,7 @@ fn a_block_that_overlaps_a_user_outside_the_pool_is_refused_whole() {
     let mut mac = FakeMac::converged("batch-overlap");
     let s = mac.state_mut();
     s.user("kbf-pool-9", 702);
-    s.user_attr("kbf-pool-0", "UserShell", "/bin/zsh");
+    s.user_attr("kbf-pool-0", "UserShell", "/usr/bin/login");
     s.remove_user("kbf-pool-3");
     mac.log.borrow_mut().clear();
     let r = check_keys(&mac, Some("pool_users"));
@@ -199,7 +202,7 @@ fn a_block_that_overlaps_a_user_outside_the_pool_is_refused_whole() {
     );
     assert!(
         r.text
-            .contains("kbf-pool-0: UserShell=/bin/zsh, want /usr/bin/false"),
+            .contains("kbf-pool-0: UserShell=/usr/bin/login, want /usr/bin/false"),
         "{}",
         r.text
     );

@@ -62,6 +62,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_kbf-mac-provision");
 const EXAMPLE: &str = include_str!("../example.profile");
 /// The tests' own directory: the profile, the probe, a file a link names. Root's.
 const SCRATCH: &str = "/private/tmp/kbf-mac-provision-as-root";
+/// The directory of user records.
+const USERS: &str = "/Users";
 const LABEL: &str = "org.example.kbf-daemon";
 const LOG_DIR: &str = "/Library/Logs/kbf";
 const ERR_LOG: &str = "/Library/Logs/kbf/kbf-daemon.err.log";
@@ -646,7 +648,7 @@ struct PoolCleanup(u32);
 impl PoolCleanup {
     fn remove(&self) {
         for i in 0..self.0 {
-            let user = format!("/Users/kbf-pool-{i}");
+            let user = format!("{USERS}/kbf-pool-{i}");
             Command::new("/usr/bin/dscl")
                 .args([".", "-delete", user.as_str()])
                 .output()
@@ -695,7 +697,7 @@ fn a_small_pool_is_made_by_one_batch_made_again_and_checked() {
     };
     let gid = first.to_string();
     let attributes = |i: u32| {
-        let user = format!("/Users/kbf-pool-{i}");
+        let user = format!("{USERS}/kbf-pool-{i}");
         let uid = (first + i).to_string();
         let home = format!("/Volumes/kbf/home/kbf-pool-{i}");
         [
@@ -715,7 +717,7 @@ fn a_small_pool_is_made_by_one_batch_made_again_and_checked() {
                 assert_eq!(dscl_value(&user, attr), want, "{user} {attr}");
             }
             assert_eq!(
-                dscl_value(&format!("/Users/kbf-pool-{i}"), "AuthenticationAuthority"),
+                dscl_value(&format!("{USERS}/kbf-pool-{i}"), "AuthenticationAuthority"),
                 ""
             );
         }
@@ -777,10 +779,11 @@ fn a_small_pool_is_made_by_one_batch_made_again_and_checked() {
     }
 
     // Two users changed by hand are made again, the third left.
-    let one = "/Users/kbf-pool-1";
+    let one = format!("{USERS}/kbf-pool-1");
+    let two = format!("{USERS}/kbf-pool-2");
     for args in [
-        vec![".", "-delete", one],
-        vec![".", "-create", "/Users/kbf-pool-2", "UserShell", "/bin/zsh"],
+        vec![".", "-delete", one.as_str()],
+        vec![".", "-create", two.as_str(), "UserShell", "/usr/bin/login"],
     ] {
         let o = Command::new("/usr/bin/dscl")
             .args(&args)
