@@ -1,7 +1,6 @@
 use super::*;
 
-/// Catches: a guard that never gives its bytes back (a leak the gauge would report as
-/// load forever), and a drop that gives back the wrong amount after `add`.
+/// Dropping a guard gives back every byte it took, including those added after the hold.
 #[test]
 fn a_dropped_guard_gives_back_everything_it_took() {
     let gauge = Gauge::new();
@@ -12,8 +11,8 @@ fn a_dropped_guard_gives_back_everything_it_took() {
     assert_eq!(gauge.current(), 0);
 }
 
-/// Catches: a peak that is never raised, one that follows the current count down, and
-/// one that is the sum of every hold instead of the most at once.
+/// The peak is the most bytes held at once; it rises with the count and does not fall
+/// when the count does.
 #[test]
 fn the_peak_is_the_most_held_at_once_and_stays() {
     let gauge = Gauge::new();
@@ -26,8 +25,8 @@ fn the_peak_is_the_most_held_at_once_and_stays() {
     assert_eq!((gauge.current(), gauge.peak()), (0, 15));
 }
 
-/// Catches: concurrent holds losing an update (a peak below the sum of holds that were
-/// all alive together) or a count that does not return to 0.
+/// Concurrent holds are counted exactly: the peak reaches the sum of holds alive together
+/// and the count returns to 0.
 #[test]
 fn concurrent_holds_count_exactly() {
     let gauge = Gauge::new();
@@ -48,10 +47,9 @@ fn concurrent_holds_count_exactly() {
     assert_eq!(gauge.peak(), 800);
 }
 
-/// Catches: counted bytes given back while a slice or clone of them is alive (a buffer
-/// kept past its count), or never given back once the last one is dropped; and a buffer
-/// counted twice when its allocation was counted first (`counted_with` takes the guard
-/// over).
+/// Counted bytes stay counted while any slice or clone of them is alive and are given
+/// back once the last is dropped; `counted_with` takes over a guard taken for the
+/// allocation, so the buffer is not counted twice.
 #[test]
 fn counted_bytes_are_held_until_the_last_slice_is_dropped() {
     static GAUGE: Gauge = Gauge::new();
@@ -68,9 +66,8 @@ fn counted_bytes_are_held_until_the_last_slice_is_dropped() {
     assert_eq!((GAUGE.current(), GAUGE.peak()), (0, 1000));
 }
 
-/// Catches: `counted` counting in a gauge other than the process's, or at other than the
-/// bytes' length. Bounds from below only, since the process gauge is shared by every test
-/// of the crate that runs a write.
+/// `counted` counts the bytes' length in the process gauge. Bounds from below only, since
+/// the process gauge is shared by every test of the crate that runs a write.
 #[test]
 fn counted_counts_the_length_in_the_process_gauge() {
     let bytes = counted(vec![1u8; 4096]);
@@ -79,7 +76,7 @@ fn counted_counts_the_length_in_the_process_gauge() {
     drop(bytes);
 }
 
-/// Catches: an export that drops a family, renames it, or swaps the two values.
+/// The export names both gauge families, each with its own value.
 #[test]
 fn render_names_both_families_with_their_values() {
     let gauge = Gauge::new();

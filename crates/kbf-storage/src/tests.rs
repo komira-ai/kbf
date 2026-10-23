@@ -17,11 +17,10 @@ fn digest(byte: u8) -> Digest {
 #[error("the disk is gone")]
 struct Backend;
 
-/// Catches a code changed for any error: a store that could not answer reported as
-/// NOT_FOUND (which a caller takes as "absent, upload it") or a client's mistake as
-/// UNAVAILABLE (which it retries forever), and a refused action-cache write answered as
-/// anything but the code that says why, and a read offset past the end answered as a
-/// malformed request (INVALID_ARGUMENT) where ByteStream says OUT_OF_RANGE.
+/// Each storage error maps to its own status code, with the error's text as the message:
+/// a store that could not answer is UNAVAILABLE (not NOT_FOUND, which a caller takes as
+/// "absent, upload it"), a refused action-cache write carries the code that says why,
+/// and a read offset past the end is OUT_OF_RANGE, as ByteStream says.
 #[test]
 fn each_error_answers_its_code_and_message() {
     let (a, b) = (digest(1), digest(2));
@@ -81,17 +80,16 @@ fn each_error_answers_its_code_and_message() {
     }
 }
 
-/// Catches an unavailable store's error replaced by a message of its own: the
-/// backend's own words are what an operator reads.
+/// An unavailable store's error carries the backend's own words, which is what an
+/// operator reads.
 #[test]
 fn unavailable_says_what_the_backend_said() {
     let error = StorageError::Unavailable(Arc::new(Backend));
     assert_eq!(error.to_string(), "the disk is gone");
 }
 
-/// Catches a STALE_MAP answer that does not say which generation the node holds (the
-/// caller could not know how new a map to fetch), or that names it in a spelling other
-/// than the metadata entry every storage call already carries the caller's generation in.
+/// A STALE_MAP answer says which generation the node holds, in the same metadata entry
+/// that every storage call carries the caller's generation in; other refusals carry none.
 #[test]
 fn a_stale_map_status_carries_the_nodes_generation() {
     let status = tonic::Status::from(StorageError::StaleMap { current: 7 });

@@ -1,6 +1,5 @@
 //! The gate: which digests a node flushes under the map it holds: the rank-1 owner, and
-//! a node that owns none of it (an orphan). Each test's comment names the defect it
-//! catches.
+//! a node that owns none of it (an orphan).
 
 use std::sync::{Arc, Mutex};
 
@@ -80,8 +79,8 @@ fn split(map: &Arc<Map>) -> (usize, usize) {
     )
 }
 
-/// Catches: both owners flushing (the double PUT), or neither: every digest has exactly
-/// one flusher among the two members, and both members flush some.
+/// Every digest has exactly one flusher among the two members, and both members flush
+/// some.
 #[test]
 fn every_digest_has_exactly_one_flusher() {
     let map = map(5, &BOTH);
@@ -90,8 +89,7 @@ fn every_digest_has_exactly_one_flusher() {
     assert!(a > 0 && b > 0, "{a} {b}");
 }
 
-/// Catches: a node that flushes without a map, or without knowing its id (a late flush
-/// is cheap, a wrong one is a second PUT).
+/// A node flushes nothing while it has no map or does not know its own id.
 #[test]
 fn a_node_without_a_map_or_an_id_flushes_nothing() {
     let ds = digests();
@@ -100,9 +98,9 @@ fn a_node_without_a_map_or_an_id_flushes_nothing() {
     assert!(ds.iter().all(|d| !no_map.flushes(d) && !no_id.flushes(d)));
 }
 
-/// Catches: a replica that takes rank 1 while the primary is only `Down` (inside the
-/// dwell): the primary keeps its slot, so the replica still holds. And that, once the
-/// member has left the map, the replica flushes everything the primary never did.
+/// While the primary is only `Down` (inside the dwell) it keeps its slot and the replica
+/// does not take rank 1; once the primary has left the map, the replica flushes
+/// everything the primary never did.
 #[test]
 fn the_replica_takes_over_only_when_the_primary_has_left_the_map() {
     let down = map(6, &[(1, MemberState::Down), (2, MemberState::Active)]);
@@ -128,9 +126,8 @@ fn the_replica_takes_over_only_when_the_primary_has_left_the_map() {
     assert!(ds.iter().all(|d| two.flushes(d)));
 }
 
-/// Catches: a node behind the map flushing as rank 1 after a caller showed it a newer
-/// generation exists (a second flusher beside the real primary). It holds until its map
-/// is at least as new, then judges by that one.
+/// A node that a caller has shown a newer generation holds its flushes until its own map
+/// is at least as new, then judges by that map.
 #[tokio::test]
 async fn a_node_told_it_is_behind_flushes_nothing_until_it_has_the_new_map() {
     let old = map(5, &BOTH);
@@ -164,10 +161,9 @@ fn node_gate(me: u64, map: &Arc<Map>) -> Arc<OneFlusher> {
     OneFlusher::new(Node::new(Some(me), Some(Arc::clone(map))))
 }
 
-/// Catches: a Draining member stranding what it staged. It takes no writes, so it is in
-/// no digest's owner list and never rank 1; under the old gate it flushed nothing and
-/// its staged blobs waited for a flusher that does not hold them. Every digest it has
-/// is now flushed by it; the Active member (rank 1 of all of them) flushes them too.
+/// A Draining member takes no writes, so it is in no digest's owner list and never rank
+/// 1; it still flushes every digest it staged, and the Active member (rank 1 of all of
+/// them) flushes them too.
 #[test]
 fn a_draining_member_flushes_everything_it_staged() {
     let map = map(6, &[(1, MemberState::Draining), (2, MemberState::Active)]);
@@ -181,9 +177,9 @@ fn a_draining_member_flushes_everything_it_staged() {
     assert!(ds.iter().all(|d| drain.flushes(d) && active.flushes(d)));
 }
 
-/// Catches: an r = 1 joiner stranding what it staged. At r = 1 a joiner owns nothing
-/// while a settled writer exists, so a blob a caller routed to it by an older map is an
-/// orphan on it. The joiner flushes it; the settled owner (rank 1) keeps flushing its own.
+/// At r = 1 a joiner owns nothing while a settled writer exists, so a blob a caller
+/// routed to it by an older map is an orphan on it: the joiner flushes it, and the
+/// settled owner (rank 1) keeps flushing its own.
 #[test]
 fn an_r1_joiner_flushes_what_it_staged_and_the_owner_still_flushes() {
     let members = vec![
@@ -198,12 +194,9 @@ fn an_r1_joiner_flushes_what_it_staged_and_the_owner_still_flushes() {
     assert!(ds.iter().all(|d| owner.flushes(d)), "rank 1 flushes");
 }
 
-/// Catches: the rank-1 gate loosened to "owner flushes" (every replica PUTs too: double
-/// bytes, the defect the one-flusher rule prevents) or tightened back to rank 1 only
-/// (a displaced node stranding its blobs). With three members at r = 2, every digest has
-/// a rank-1 owner, a replica and a node owning none of it; for each, exactly the rank-1
-/// owner and the non-owner flush, and the replica never does. All three roles occur for
-/// every member, so no assertion below is vacuous.
+/// With three members at r = 2, every digest has a rank-1 owner, a replica and a node
+/// owning none of it; exactly the rank-1 owner and the non-owner flush, and the replica
+/// never does. All three roles occur for every member.
 #[test]
 fn only_the_rank_one_owner_and_non_owners_flush() {
     let all = [
@@ -237,8 +230,8 @@ fn only_the_rank_one_owner_and_non_owners_flush() {
     }
 }
 
-/// Catches: a node the map no longer names (its row lapsed, or it left) keeping what it
-/// staged: it owns nothing, so it flushes all of it.
+/// A node the map no longer names (its row lapsed, or it left) owns nothing, so it
+/// flushes all it staged.
 #[test]
 fn a_node_the_map_does_not_name_flushes_what_it_staged() {
     let map = map(5, &BOTH);
@@ -246,8 +239,8 @@ fn a_node_the_map_does_not_name_flushes_what_it_staged() {
     assert!(digests().iter().all(|d| gone.flushes(d)));
 }
 
-/// Catches: the orphan rule letting a node that is behind the map flush. A node told a
-/// newer generation exists holds even what it owns none of, until it holds that map.
+/// A node told a newer generation exists holds even what it owns none of, until it holds
+/// that map.
 #[tokio::test]
 async fn an_orphan_behind_the_map_still_waits_for_the_new_map() {
     let draining = map(6, &[(1, MemberState::Draining), (2, MemberState::Active)]);

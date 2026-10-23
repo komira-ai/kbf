@@ -209,11 +209,10 @@ async fn every_call(channel: &Channel, generation: u64) -> Vec<(&'static str, We
     ]
 }
 
-/// Catches a call that a node serves whatever map its caller routed by: each of the
-/// twelve calls (every method of the four services) from a caller behind the node, or
-/// with no map seen (0), is STALE_MAP naming the node's generation, and none reaches the
-/// store or the segments; the same calls under the node's generation all do. Catches:
-/// the check removed from any one call (the row for that call reads `Reached`).
+/// A node does not serve a call under any map its caller routed by: each of the twelve
+/// calls (every method of the four services) from a caller behind the node, or with no
+/// map seen (0), is STALE_MAP naming the node's generation, and none reaches the store or
+/// the segments; the same calls under the node's generation all do.
 #[tokio::test]
 async fn every_call_of_a_caller_behind_the_node_is_stale_map() {
     let (mem, _, channel) = node(7, Fetch::Nothing).await;
@@ -236,10 +235,10 @@ async fn every_call_of_a_caller_behind_the_node_is_stale_map() {
     );
 }
 
-/// Catches a node that refuses a caller that is ahead of it without trying to learn the
-/// map (a lost push would then fail every call to it until the next push), and one that
-/// serves it blind: a node at 7 asked under 9 fetches generation 9 once, and serves the
-/// call; a call that finds the node already there fetches nothing.
+/// A node asked by a caller ahead of it learns the map (so a lost push does not fail
+/// every call until the next push) rather than refusing or serving blind: a node at 7
+/// asked under 9 fetches generation 9 once, and serves the call; a call that finds the
+/// node already there fetches nothing.
 #[tokio::test]
 async fn a_caller_ahead_of_the_node_makes_it_fetch_the_map() {
     let (mem, source, channel) = node(7, Fetch::Arrives(9)).await;
@@ -257,8 +256,8 @@ async fn a_caller_ahead_of_the_node_makes_it_fetch_the_map() {
     assert_eq!(mem.puts.load(Ordering::SeqCst), 0);
 }
 
-/// Catches a node that serves a caller under a map that is not the caller's: the fetch
-/// brings generation 10 for a caller at 8, so the caller is now the stale one.
+/// When the fetch brings generation 10 for a caller at 8, the caller is now the stale
+/// one.
 #[tokio::test]
 async fn a_fetch_that_passes_the_caller_makes_it_stale() {
     let (_, source, channel) = node(7, Fetch::Arrives(10)).await;
@@ -270,9 +269,9 @@ async fn a_fetch_that_passes_the_caller_makes_it_stale() {
     assert_eq!(*source.asked.lock().expect("lock"), [8]);
 }
 
-/// Catches a node that serves, or calls stale, a caller ahead of it when it could not get
-/// the map: UNAVAILABLE (the caller's map may be the right one), naming both generations,
-/// and nothing reaches the store.
+/// When a node could not get the map for a caller ahead of it, the call is UNAVAILABLE
+/// (the caller's map may be the right one), naming both generations, and nothing reaches
+/// the store.
 #[tokio::test]
 async fn a_fetch_that_brings_nothing_is_unavailable() {
     let (_, source, channel) = node(7, Fetch::Nothing).await;
@@ -288,11 +287,10 @@ async fn a_fetch_that_brings_nothing_is_unavailable() {
     assert_eq!(*source.asked.lock().expect("lock"), [9]);
 }
 
-/// Catches a node with a map source and no map that serves whatever generation it is
-/// asked under (a multi-member node must not serve until it has learned its first map):
-/// each of the twelve calls, from a caller at any generation (0 included), is UNAVAILABLE
-/// and none reaches the store or the segments; the node tried to fetch a map for each.
-/// Catches: `check` returning `Ok(())` when the source has no map.
+/// A node with a map source and no map does not serve (a multi-member node must not serve
+/// until it has learned its first map): each of the twelve calls, from a caller at any
+/// generation (0 included), is UNAVAILABLE and none reaches the store or the segments; the
+/// node tried to fetch a map for each.
 #[tokio::test]
 async fn a_node_with_a_source_and_no_map_refuses_every_call() {
     let (mem, source, channel) = node_holding(Held::none(), Fetch::Nothing).await;
@@ -312,9 +310,9 @@ async fn a_node_with_a_source_and_no_map_refuses_every_call() {
     );
 }
 
-/// Catches a node that, having no map, never goes to get one (every call would fail until
-/// the next push): the fetch brings generation 7, the caller at 7 is served and the one
-/// at 5 is stale, and the node asked once, not again.
+/// A node with no map goes to get one (so calls do not fail until the next push): the
+/// fetch brings generation 7, the caller at 7 is served and the one at 5 is stale, and
+/// the node asked once, not again.
 #[tokio::test]
 async fn a_node_with_no_map_fetches_its_first_one() {
     let (_, source, channel) = node_holding(Held::none(), Fetch::Arrives(7)).await;
@@ -345,9 +343,9 @@ impl MapSource for Hung {
     }
 }
 
-/// Catches a node that ignores the wait it was given (`with_refetch_wait`): a fetch that
-/// never comes, with an hour allowed, ends the call after that hour on a paused clock,
-/// and not at the default bound.
+/// The wait for a fetch is the one given with `with_refetch_wait`: a fetch that never
+/// comes, with an hour allowed, ends the call after that hour on a paused clock, and not
+/// at the default bound.
 #[tokio::test(start_paused = true)]
 async fn the_wait_for_a_fetch_is_the_one_the_service_was_given() {
     let mem = Arc::new(Mem::default());
@@ -371,9 +369,9 @@ async fn the_wait_for_a_fetch_is_the_one_the_service_was_given() {
     assert_eq!(started.elapsed(), wait);
 }
 
-/// Catches a node whose call waits for a fetch for ever (a frontend that never answers
-/// would hold every caller ahead of it): on a paused clock the wait ends when the bound
-/// passes, UNAVAILABLE, and not before.
+/// A call does not wait for a fetch for ever (a frontend that never answers would
+/// otherwise hold every caller ahead of it): on a paused clock the wait ends when the
+/// bound passes, UNAVAILABLE, and not before.
 #[tokio::test(start_paused = true)]
 async fn a_fetch_that_never_comes_ends_at_the_bound() {
     let source = Hung(Held::at(7));

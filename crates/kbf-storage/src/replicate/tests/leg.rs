@@ -41,8 +41,8 @@ fn leg(channel: tonic::transport::Channel, size: u64) -> Leg {
     )
 }
 
-/// Catches an acknowledgement taken at its word: a replica that answers for other than the
-/// blob's size (here 0) is an INTERNAL error, not a copy.
+/// A replica that answers for other than the blob's size (here 0) gives an INTERNAL
+/// error, not a copy.
 #[tokio::test]
 async fn an_acknowledgement_of_the_wrong_size_is_not_a_copy() {
     let (_odd, channel) = serve_odd().await;
@@ -55,8 +55,8 @@ async fn an_acknowledgement_of_the_wrong_size_is_not_a_copy() {
     assert!(why.contains("3-byte write"), "{why}");
 }
 
-/// Catches a replica that answers before the blob is complete being waited on: the send
-/// that finds the call ended says so, INTERNAL.
+/// When a replica answers before the blob is complete, the send that finds the call
+/// ended says so, INTERNAL.
 #[tokio::test]
 async fn a_replica_that_answers_early_ends_the_leg() {
     let (_odd, channel) = serve_odd().await;
@@ -75,8 +75,7 @@ async fn a_replica_that_answers_early_ends_the_leg() {
     assert!(why.contains("before the blob was complete"), "{why}");
 }
 
-/// Catches a leg to an address nothing listens on succeeding, or failing for a reason other
-/// than the peer being unreachable: UNAVAILABLE.
+/// A leg to an address nothing listens on fails UNAVAILABLE, the peer being unreachable.
 #[tokio::test]
 async fn a_leg_to_nothing_is_unavailable() {
     let peers = Peers::plain();
@@ -93,7 +92,8 @@ async fn a_leg_to_nothing_is_unavailable() {
     );
 }
 
-/// Catches an address that is not one making a channel, or one that is made twice.
+/// Peers make one channel per address (a second request reuses it) and refuse an address
+/// that is not one.
 #[tokio::test]
 async fn peers_make_one_channel_per_address_and_refuse_a_bad_one() {
     let peers = Peers::plain();
@@ -158,8 +158,8 @@ impl ByteStream for Stuck {
     }
 }
 
-/// Catches a leg that outlives its write: when the primary's write ends (the writer left,
-/// or another part of it failed) the call to the replica is reset, so a replica that is
+/// A leg does not outlive its write: when the primary's write ends (the writer left, or
+/// another part of it failed) the call to the replica is reset, so a replica that is
 /// not answering does not hold the call, and its half-received blob, for ever.
 #[tokio::test]
 async fn a_dropped_leg_resets_its_call() {
@@ -215,10 +215,9 @@ impl ByteStream for Holds {
     }
 }
 
-/// Catches a replica's early answer for the blob's whole size being an error: it holds the
-/// blob, so the leg is done, every message after it is dropped without error (far more than
-/// the queue holds are sent) and finishing it is a copy. Catches: `ended` failing on any
-/// early answer.
+/// A replica's early answer for the blob's whole size is not an error: it holds the blob,
+/// so the leg is done, every message after it is dropped without error (far more than the
+/// queue holds are sent) and finishing it is a copy.
 #[tokio::test]
 async fn an_early_answer_for_the_whole_blob_is_a_copy() {
     let size = 2000 * 1024;
@@ -234,7 +233,7 @@ async fn an_early_answer_for_the_whole_blob_is_a_copy() {
     leg.finish().await.expect("a copy");
 }
 
-/// Catches an early answer for another size than the blob's being taken for a copy.
+/// An early answer for another size than the blob's is not a copy.
 #[tokio::test]
 async fn an_early_answer_for_another_size_is_not_a_copy() {
     let routes = tonic::service::Routes::new(ByteStreamServer::new(Holds(5)));
@@ -305,11 +304,10 @@ async fn replica_answering(code: tonic::Code) -> Result<Option<StorageError>, St
     leg.finish().await
 }
 
-/// Catches a replica that declined being taken for one that could not be reached (the write
-/// would be answered with one copy and a debt over the replica's refusal): only the codes
-/// that say nothing was reached or answered in time are a lost replica; ABORTED, DATA_LOSS,
+/// A replica that declined is not one that could not be reached (which would answer the
+/// write with one copy and a debt over the replica's refusal): only the codes that say
+/// nothing was reached or answered in time are a lost replica; ABORTED, DATA_LOSS,
 /// RESOURCE_EXHAUSTED, CANCELLED and a bare FAILED_PRECONDITION are the write's failure.
-/// Catches: `lift` mapping every code it does not know to `Unavailable`.
 #[tokio::test]
 async fn a_replica_that_declines_is_not_lost() {
     use tonic::Code;

@@ -67,10 +67,9 @@ fn hold_open(channel: &Channel) -> Held {
     Held { send, answer }
 }
 
-/// Catches a count that is not the writes open: it must be 1 from the write's first
-/// message until its answer (a write held open by a caller that has sent part of a blob),
-/// 2 with a second beside it, and 0 once both are answered. Catches: nothing counted; a
-/// write counted only from its last message; the count dropped at the first message.
+/// The count is the writes open: 1 from the write's first message until its answer (a
+/// write held open by a caller that has sent part of a blob), 2 with a second beside it,
+/// and 0 once both are answered.
 #[tokio::test]
 async fn a_write_is_open_from_its_first_message_to_its_answer() {
     let mem = Arc::new(Mem::default());
@@ -120,11 +119,10 @@ async fn a_write_is_open_from_its_first_message_to_its_answer() {
     count_reaches(&open, 0).await;
 }
 
-/// Catches a count left up by a write that does not end in an answer: a stream that stops
-/// before `finish_write` (the caller crashed or the connection broke), a blob that is not
-/// the one named, and a call the caller drops while the node waits for its next message.
-/// Each must bring the count back to 0, or a node that had one such write would never be
-/// idle. Catches: the decrement only on the success path.
+/// A write that does not end in an answer leaves no count up: a stream that stops before
+/// `finish_write` (the caller crashed or the connection broke), a blob that is not the
+/// one named, and a call the caller drops while the node waits for its next message each
+/// bring the count back to 0, so a node that had one such write is idle again.
 #[tokio::test]
 async fn a_write_that_fails_or_is_dropped_is_not_left_open() {
     let mem = Arc::new(Mem::default());
@@ -155,9 +153,8 @@ async fn a_write_that_fails_or_is_dropped_is_not_left_open() {
     count_reaches(&open, 0).await;
 }
 
-/// Catches an action-cache commit that is not counted: a commit held in the store is a
-/// write the node is still taking, over the wire and in-process. Catches: the guard
-/// missing from the `ActionStore` commit; missing from the in-process commit.
+/// An action-cache commit is counted: a commit held in the store is a write the node is
+/// still taking, over the wire and in-process.
 #[tokio::test]
 async fn a_commit_in_flight_is_an_open_write() {
     let mem = Arc::new(Mem::default());
@@ -195,10 +192,10 @@ async fn a_commit_in_flight_is_an_open_write() {
     count_reaches(&open, 0).await;
 }
 
-/// Catches a service whose segment uploads are not counted with the handle the node reports:
-/// the service asks its store for the `Segments` handlers counting in the very handle given
-/// to `with_open_writes` (the store's uploads then move that count; kbf-front's own test
-/// pins that). Catches: `with_open_writes` leaving the handlers it made at `new`.
+/// A service's segment uploads are counted in the handle the node reports: the service
+/// asks its store for the `Segments` handlers counting in the very handle given to
+/// `with_open_writes` (the store's uploads then move that count; kbf-front's own test
+/// pins that).
 #[tokio::test]
 async fn the_store_counts_its_segment_uploads_in_the_services_handle() {
     let mem = Arc::new(Mem::default());
@@ -263,11 +260,10 @@ async fn node_waiting_for_a_map(
     (RemoteStorage::new(channel, 9), service.in_process().at(9))
 }
 
-/// Catches a write that is not counted while it waits for the map: a caller ahead of the
-/// node makes it fetch the map, and that wait can be seconds with the call already taken in.
-/// A rollout that read zero then would stop the node under it. The write, over the wire and
-/// in-process, is open while it waits and gives the count back when it is refused. Catches:
-/// the guard taken after the map is judged.
+/// A write is counted while it waits for the map: a caller ahead of the node makes it
+/// fetch the map, and that wait can be seconds with the call already taken in. A rollout
+/// that read zero then would stop the node under it. The write, over the wire and
+/// in-process, is open while it waits and gives the count back when it is refused.
 #[tokio::test]
 async fn a_write_waiting_for_the_map_is_open() {
     let mem = Arc::new(Mem::default());
@@ -291,8 +287,8 @@ async fn a_write_waiting_for_the_map_is_open() {
     count_reaches(&open, 0).await;
 }
 
-/// Catches an action-cache commit that is not counted while it waits for the map, over the
-/// wire and in-process. Catches: the guard taken after the map is judged, in either path.
+/// An action-cache commit is counted while it waits for the map, over the wire and
+/// in-process.
 #[tokio::test]
 async fn a_commit_waiting_for_the_map_is_open() {
     let mem = Arc::new(Mem::default());
@@ -323,10 +319,10 @@ async fn a_commit_waiting_for_the_map_is_open() {
     count_reaches(&open, 0).await;
 }
 
-/// Catches a segment upload's `Begin` that is not counted while it waits for the map: the
-/// service judges the map before the store's handlers (which count the upload) see the call.
-/// A `Begin` from a caller ahead of the node is open while the node fetches the map, over the
-/// wire and in-process. Catches: the count taken after the map is judged.
+/// A segment upload's `Begin` is counted while it waits for the map: the service judges
+/// the map before the store's handlers (which count the upload) see the call. A `Begin`
+/// from a caller ahead of the node is open while the node fetches the map, over the wire
+/// and in-process.
 #[tokio::test]
 async fn a_segment_begin_waiting_for_the_map_is_open() {
     use kbf_proto::worker::BeginRequest;
@@ -351,7 +347,7 @@ async fn a_segment_begin_waiting_for_the_map_is_open() {
     count_reaches(&open, 0).await;
 }
 
-/// Catches a store that does not count its segment uploads being refused or breaking: the
+/// A store that does not count its segment uploads is neither refused nor broken: the
 /// default `segments_counted` answers the plain handlers (the client of a remote node is one),
 /// which count nothing, so a service over such a store still starts and under-reports only
 /// segment uploads (the trait documents it).

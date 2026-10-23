@@ -160,13 +160,9 @@ fn recover_and_extend(disk: &FaultFs, model: &Model, why: &str) -> BTreeMap<Dige
     recovered
 }
 
-/// Catches (each of these turns it red): `owed` that returns before its sync (an
-/// acknowledged debt is gone after the power cut); a compaction that renames before it
-/// syncs the new file, or skips the directory sync (a debt is lost, or an old file
-/// comes back); an open that accepts a torn frame or cuts past the torn tail (a debt
-/// that was never owed, or an acknowledged one lost); an open that leaves the torn bytes
-/// in place (the debt owed after recovery lands behind garbage and the reopen fails); an
-/// open that returns unsynced bytes without syncing them.
+/// A debt the journal acknowledged survives a power cut at any operation and any torn
+/// byte count: the model admits what the recovered journal holds, and a debt owed after
+/// recovery survives a further reopen.
 ///
 /// The script is crashed at every operation. Each crash is materialized as a power cut
 /// with every count of torn bytes kept, with and without the name changes since the last
@@ -216,11 +212,10 @@ fn crash_at_every_operation_and_tear_at_every_byte() {
     assert!(cases > 100, "only {cases} cases");
 }
 
-/// Catches: a journal that ignores a write or sync error (it returns `Ok`), hides which
-/// error it was (the I/O error is the source), or keeps writing after one (a retried
-/// fsync can succeed on bytes the kernel dropped). Every operation of the script fails
-/// once in turn: the call that hit it fails, every later call fails with `Failed`
-/// though the disk works again, and the disk after a crash holds what the model admits.
+/// A write or sync error stops the journal and names the I/O error as its source. Every
+/// operation of the script fails once in turn: the call that hit it fails, every later
+/// call fails with `Failed` though the disk works again (a retried fsync can succeed on
+/// bytes the kernel dropped), and the disk after a crash holds what the model admits.
 #[test]
 fn an_error_at_any_operation_stops_the_journal() {
     let total = clean_ops();
@@ -258,9 +253,8 @@ fn written(steps: &[Step]) -> FaultFs {
     copy(&fs)
 }
 
-/// Catches: an open that accepts a damaged frame in the middle of the file by cutting
-/// the file there as if it were a torn tail (the debts after it would vanish), and a
-/// damaged magic taken as a new file. Every byte of the file is flipped in turn: only a
+/// A damaged frame in the middle of the file, or a damaged magic, refuses the open
+/// instead of being cut as a torn tail. Every byte of the file is flipped in turn: only a
 /// flip inside the very last frame may open, and then the file is the whole file minus
 /// that frame.
 #[test]
@@ -310,10 +304,10 @@ fn open_error(fs: FaultFs) -> JournalError {
     }
 }
 
-/// Catches: an open that accepts what is not a journal or does not form one: a magic
-/// that differs, a file shorter than the magic that is not the start of it, a whole
-/// frame of a record this code does not know (a newer writer's: cutting it as a torn
-/// tail would forget debts), and a known record of the wrong length.
+/// An open refuses what is not this journal: a magic that differs, a file shorter than
+/// the magic that is not the start of it, a whole frame of a record this code does not
+/// know (a newer writer's, which is not cut as a torn tail), and a known record of the
+/// wrong length.
 #[test]
 fn open_refuses_files_that_are_not_this_journal() {
     let fs = FaultFs::new();
@@ -352,9 +346,9 @@ fn open_refuses_files_that_are_not_this_journal() {
     ));
 }
 
-/// Catches: a frame length taken at its word. A length of zero or over the largest
-/// payload is not a frame, whatever bytes follow, and as the tail of the file it is torn,
-/// not a reason to read past the end or allocate by it.
+/// A frame length of zero or over the largest payload is not a frame, whatever bytes
+/// follow, and as the tail of the file it is torn: the open succeeds without reading
+/// past the end or allocating by that length.
 #[test]
 fn an_impossible_frame_length_is_a_torn_tail() {
     for len in [0u32, 58, u32::MAX] {
@@ -372,9 +366,8 @@ fn an_impossible_frame_length_is_a_torn_tail() {
     }
 }
 
-/// Catches: an open that cannot start from a file a crash cut short while it was being
-/// created: empty, or part of the magic. It is rewritten, and a debt owed afterwards
-/// survives a power cut.
+/// A file a crash cut short while it was being created, empty or holding part of the
+/// magic, is rewritten at open, and a debt owed afterwards survives a power cut.
 #[test]
 fn a_file_cut_short_at_creation_is_started_again() {
     for stub in [&b""[..], &b"KBFR"[..]] {
@@ -388,8 +381,7 @@ fn a_file_cut_short_at_creation_is_started_again() {
     }
 }
 
-/// Catches: a leftover compaction file that stays (it would be read as a journal one
-/// day) or is taken for the journal.
+/// A leftover compaction file is removed at open and not taken for the journal.
 #[test]
 fn a_leftover_compaction_file_is_removed_at_open() {
     let fs = FaultFs::new();
@@ -399,11 +391,9 @@ fn a_leftover_compaction_file_is_removed_at_open() {
     assert!(!fs.list().expect("list").contains(&JOURNAL_TMP.to_owned()));
 }
 
-/// Catches: a debt that does not survive the primary restarting (owed returns before
-/// the disk has it), one owed twice that is written twice or whose record is replaced
-/// (the first replica named is kept), a settle of what was never owed that grows the
-/// file, a debt settled and owed again that is not owed, and a settled debt that is
-/// still reported.
+/// A debt survives the primary restarting; one owed twice is written once and keeps the
+/// first record; settling what was never owed writes nothing; a debt settled and owed
+/// again is owed, and a settled debt is no longer reported.
 #[test]
 fn owed_survives_a_restart_and_settling_is_exact() {
     let fs = FaultFs::new();
@@ -439,10 +429,9 @@ fn owed_survives_a_restart_and_settling_is_exact() {
     assert!(journal.is_owed(&digest(1)));
 }
 
-/// Catches: a journal that grows without bound as debts come and go (no compaction), a
-/// compaction that runs when most of the file is still debts, one that drops a debt or
-/// keeps a settled one, and one that is not durable once `done` returns (the rename or
-/// its directory sync skipped): a power cut after it must read exactly the debts owed.
+/// The journal is compacted as debts come and go, but not while most of the file is still
+/// debts; compaction keeps exactly the debts owed and is durable (rename and directory
+/// sync), so a power cut after it reads exactly the debts owed.
 #[test]
 fn compaction_keeps_exactly_the_debts_and_is_durable() {
     let fs = FaultFs::new();

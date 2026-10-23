@@ -70,8 +70,8 @@ fn refused_as_denied(answer: &Result<(), Status>) -> Option<&Status> {
         .filter(|status| status.code() == Code::PermissionDenied)
 }
 
-/// Catches a deny list that some method does not apply, or applies before the role: for
-/// each of the three roles, one certificate the map lists (by the hash of its public key)
+/// The deny list applies to every method, after the role: for each of the three roles,
+/// one certificate the map lists (by the hash of its public key)
 /// and one it does not, each calling every method over mutual TLS, `Segments` and the copy
 /// a storage node sends another among them. The listed certificate is refused
 /// PERMISSION_DENIED saying `denied: spki-sha256 <hash>` on every method its role may
@@ -79,10 +79,6 @@ fn refused_as_denied(answer: &Result<(), Status>) -> Option<&Status> {
 /// refused only on the methods its role may not call. A refused call reaches no store, and
 /// one that is admitted reaches the generation check (the caller carries none, so the node
 /// that holds generation 8 answers STALE_MAP).
-///
-/// Catches: `guard` passing no list (the role check alone); the `Segments`
-/// handlers calling `Admission::guard` with no list; `Admission::guard_leaf` judging the
-/// list before the role.
 #[tokio::test]
 async fn a_listed_certificate_is_refused_on_every_method_and_the_role_comes_first() {
     let pki = Pki::new();
@@ -140,14 +136,11 @@ async fn a_listed_certificate_is_refused_on_every_method_and_the_role_comes_firs
     }
 }
 
-/// Catches an entry kind that is not applied, or applied too widely: a certificate listed
-/// by its serial and one listed by a node id (the DNS name it carries) are refused on a
+/// Each kind of entry is applied, and no wider than it names: a certificate listed by its
+/// serial and one listed by a node id (the DNS name it carries) are refused on a
 /// method every role may call and on one only a daemon may call, saying the entry; a
 /// certificate whose only name is an IP address spelled like a listed node, and one that
 /// no entry names, are not refused.
-///
-/// Catches: `node` entries matched against nothing; a serial compared with the
-/// certificate's key hash.
 #[tokio::test]
 async fn a_serial_and_a_node_id_deny_as_a_key_hash_does() {
     let pki = Pki::new();
@@ -186,13 +179,11 @@ async fn a_serial_and_a_node_id_deny_as_a_key_hash_does() {
     }
 }
 
-/// Catches an entry that waits for anything but the node's map: one connection stays open
-/// while the node's map changes. The call before the map lists the certificate is admitted,
+/// An entry counts from the node's map and nothing else: one connection stays open while
+/// the node's map changes. The call before the map lists the certificate is admitted,
 /// the first call after it is refused (the connection is not reopened, the certificate is
 /// not read again), and once a later generation drops the entry the same connection is
 /// admitted again.
-///
-/// Catches: the list read once, when the service is built.
 #[tokio::test]
 async fn an_entry_counts_from_the_first_call_after_the_node_holds_its_generation() {
     let pki = Pki::new();
@@ -213,13 +204,10 @@ async fn an_entry_counts_from_the_first_call_after_the_node_holds_its_generation
     assert!(refused_as_denied(&after).is_none(), "{after:?}");
 }
 
-/// Catches a node that refuses what it has no list for: a node that has no map yet (it
-/// answers UNAVAILABLE, having none to judge by, and not PERMISSION_DENIED), and a
-/// plain-text node, which has no certificate to name whatever its map lists (it admits the
-/// call and reaches the generation check).
-///
-/// Catches: a missing map read as a list that denies every caller; an empty
-/// certificate read as one an entry names.
+/// A node denies nothing it has no list for: a node that has no map yet answers
+/// UNAVAILABLE, having none to judge by, and not PERMISSION_DENIED; a plain-text node has
+/// no certificate to name whatever its map lists, so it admits the call and reaches the
+/// generation check.
 #[tokio::test]
 async fn a_node_with_no_map_or_no_certificate_to_read_denies_nothing() {
     let pki = Pki::new();

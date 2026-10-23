@@ -41,16 +41,12 @@ fn is_stale<T>(answer: &Result<T, StorageError>, current: u64) -> bool {
     matches!(answer, Err(StorageError::StaleMap { current: c }) if *c == current)
 }
 
-/// Catches an in-process write that goes around the service: it must be judged by the map
-/// generation the caller names, as a call over the wire is. A caller behind the node (an
+/// An in-process write is judged by the map generation the caller names, as a call over
+/// the wire is. A caller behind the node (an
 /// older generation, or 0) gets STALE_MAP naming the node's generation and nothing is
 /// stored; one ahead of it is UNAVAILABLE; one at it is stored, with the digest returned.
 /// A blob the node holds is answered without a second store, and one of more than a
 /// chunk (two messages) is stored whole.
-///
-/// Catches: `put` calling the inner storage (no check: the stale write lands); the check
-/// removed from the write body; the generation read from the wrong field (the current
-/// write is refused).
 #[tokio::test]
 async fn a_write_is_judged_by_the_generation_the_caller_names_and_stored_once() {
     let mem = Arc::new(Mem::default());
@@ -99,8 +95,8 @@ async fn a_write_is_judged_by_the_generation_the_caller_names_and_stored_once() 
     assert_eq!(stored.as_ref(), large.as_slice());
 }
 
-/// Catches an in-process unowned write that skips the generation check or stores nothing:
-/// it is judged by the caller's generation like any write (STALE_MAP behind the node), and
+/// An in-process unowned write is judged by the caller's generation like any write
+/// (STALE_MAP behind the node), and
 /// at the node's generation the blob is stored. A store that does not distinguish the two
 /// (the default of `Storage::put_unowned`) takes it as a plain write.
 #[tokio::test]
@@ -129,8 +125,8 @@ async fn an_unowned_write_is_judged_by_the_generation_and_stored() {
     assert!(mem.blobs.lock().expect("lock").contains_key(&plain));
 }
 
-/// Catches a store failure taken for a stale map or swallowed: the store's failure is the
-/// write's, and reaches the caller as the store's error.
+/// A store failure is the write's failure and reaches the caller as the store's error,
+/// not as a stale map.
 #[tokio::test]
 async fn a_store_that_fails_fails_the_write() {
     let mem = Arc::new(Mem::default());
@@ -143,9 +139,9 @@ async fn a_store_that_fails_fails_the_write() {
     );
 }
 
-/// Catches the write body (the one a `Write` call and an in-process write both run) that
-/// answers a stream ending early with anything but INVALID_ARGUMENT naming how it ended:
-/// no message at all, or messages that stop before `finish_write`. Nothing is stored.
+/// The write body (the one a `Write` call and an in-process write both run) answers a
+/// stream ending early with INVALID_ARGUMENT naming how it ended: no message at all, or
+/// messages that stop before `finish_write`. Nothing is stored.
 #[tokio::test]
 async fn a_write_stream_that_ends_early_is_invalid_and_stores_nothing() {
     let mem = Arc::new(Mem::default());
@@ -191,9 +187,9 @@ async fn a_write_stream_that_ends_early_is_invalid_and_stores_nothing() {
     assert!(mem.blobs.lock().expect("lock").is_empty());
 }
 
-/// Catches a write that swallows or rewrites the error its own stream carries (a client
-/// that resets mid-upload): the status the stream yields, before the first message and
-/// after it, is the call's answer, and nothing is stored.
+/// When the stream of a write carries an error (a client that resets mid-upload), the
+/// status the stream yields, before the first message and after it, is the call's answer,
+/// and nothing is stored.
 #[tokio::test]
 async fn a_write_stream_that_fails_answers_with_its_own_status() {
     let mem = Arc::new(Mem::default());
@@ -232,13 +228,11 @@ async fn a_write_stream_that_fails_answers_with_its_own_status() {
     assert_eq!(mem.puts.load(Ordering::SeqCst), 0, "something was stored");
 }
 
-/// Catches an in-process read, find or action call that skips the generation check: a
-/// reader on a stale map must be told so (it refetches the map and reads from the right
+/// An in-process read, find or action call is judged by the generation the caller names:
+/// a reader on a stale map is told so (it refetches the map and reads from the right
 /// owner), not served from a node that no longer owns the blob. Every `Storage` call of a
 /// caller behind the node is STALE_MAP, and the same calls at the node's generation are
 /// the store's own answers.
-///
-/// Catches: the check removed from any one call (that call answers under generation 3).
 #[tokio::test]
 async fn every_call_is_judged_by_the_generation_the_caller_names() {
     let mem = Arc::new(Mem::default());
@@ -310,8 +304,8 @@ async fn every_call_is_judged_by_the_generation_the_caller_names() {
     assert!(current.stream(8).is_none());
 }
 
-/// Catches `Segments` handlers that skip the generation check, or that judge by the
-/// request's header instead of the caller's generation: a caller behind the node is
+/// The `Segments` handlers are judged by the caller's generation, not the request's
+/// header: a caller behind the node is
 /// FAILED_PRECONDITION on each of the five and the store's handler is not reached; at the
 /// node's generation each reaches the store's handler.
 #[tokio::test]
@@ -377,17 +371,13 @@ async fn the_segments_handlers_are_judged_too() {
     );
 }
 
-/// Catches an in-process call that takes a catching-up node's miss for a real one: while the
+/// An in-process call does not take a catching-up node's miss for a real one: while the
 /// node rebuilds its index, a read (whole, ranged), a FindMissing with a miss, an
 /// action-cache lookup with no entry, and a Prepare or Commit naming a closure blob the store
-/// did not find must be UNAVAILABLE, with the very text the same node answers over the wire
+/// did not find are UNAVAILABLE, with the very text the same node answers over the wire
 /// (the daemon then asks another owner instead of acting on a false miss). Once the rebuild
 /// is done the same calls are the store's own answers: NOT_FOUND, the digest listed, no entry,
 /// the Absent refusal.
-///
-/// Catches: the in-process read of either kind skipping the catch-up rule (NOT_FOUND comes
-/// back); FindMissing, the action lookup, or the write refusal skipping it; a rule applied
-/// after the rebuild is done.
 #[tokio::test]
 async fn a_miss_on_a_catching_up_node_is_unavailable_as_over_the_wire() {
     let mem = Arc::new(Mem::default());
@@ -502,11 +492,9 @@ async fn a_miss_on_a_catching_up_node_is_unavailable_as_over_the_wire() {
     );
 }
 
-/// Catches an in-process write of a blob past `STREAM_FROM_BYTES`, on a store that cannot
-/// write as bytes arrive, that is gathered whole (the store's `put` called instead of
-/// `put_streamed`, or the blob held in one buffer) or stored wrong: it reaches
-/// `put_streamed` once, in pieces of at most one write message (1 MiB), and is stored
-/// byte for byte.
+/// An in-process write of a blob past `STREAM_FROM_BYTES`, on a store that cannot write as
+/// bytes arrive, is not gathered whole: it reaches `put_streamed` once (not `put`), in
+/// pieces of at most one write message (1 MiB), and is stored byte for byte.
 #[tokio::test]
 async fn an_in_process_write_past_the_stream_size_is_streamed_in_pieces() {
     let mem = Arc::new(Mem::default());
@@ -535,9 +523,9 @@ async fn an_in_process_write_past_the_stream_size_is_streamed_in_pieces() {
     assert_eq!(mem.streamed.load(Ordering::SeqCst), 1);
 }
 
-/// Catches the messages of a write made all at once (a second whole copy of the blob held
-/// before the first message is sent): with one message taken, the rest are still to be
-/// made from the caller's bytes, which the messages therefore still share.
+/// The messages of a write are made as they are taken, not all at once: with one message
+/// taken, the rest are still to be made from the caller's bytes, which the messages
+/// therefore still share.
 #[test]
 fn write_messages_are_made_as_they_are_taken() {
     let bytes = Bytes::from(patterned(3 << 20));

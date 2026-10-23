@@ -24,10 +24,10 @@ fn placed(farm: &Farm, map: &kbf_map::Map) -> (Digest, usize, usize) {
     (digest, 0, 1)
 }
 
-/// Catches a node that takes a write it is not meant to: the primary plans a copy to the
-/// replica (named with the address the map gives it); the replica, a third node, and a
-/// non-owner receiving a client write refuse it; a copy is taken by an owner that is not
-/// the sender and refused by a non-owner or by the sender itself.
+/// Each node has one part in a write: the primary plans a copy to the replica (named with
+/// the address the map gives it); the replica, a third node, and a non-owner receiving a
+/// client write refuse it; a copy is taken by an owner that is not the sender and refused
+/// by a non-owner or by the sender itself.
 #[tokio::test]
 async fn each_node_has_one_part_in_a_write() {
     let farm = Farm::start(3, ChainConfig::default()).await;
@@ -71,9 +71,8 @@ async fn each_node_has_one_part_in_a_write() {
     ));
 }
 
-/// Catches a replication factor the chain cannot serve taken anyway: R = 1 is the primary
-/// alone (no leg), R = 3 is refused, and a map with fewer write owners than its factor
-/// (two of three draining) is UNAVAILABLE, not a single copy.
+/// R = 1 is the primary alone (no leg), R = 3 is refused, and a map with fewer write
+/// owners than its factor (two of three draining) is UNAVAILABLE, not a single copy.
 #[tokio::test]
 async fn the_replication_factor_decides_whether_there_is_a_replica() {
     let farm = Farm::start(3, ChainConfig::default()).await;
@@ -103,9 +102,8 @@ async fn the_replication_factor_decides_whether_there_is_a_replica() {
     assert!(why.to_string().contains("1 write owners"), "{why}");
 }
 
-/// Catches a chain node with no map serving a write (it is one of several, so it fails
-/// closed: UNAVAILABLE for any generation), and the view of a node with a map being taken
-/// for a stale one.
+/// A chain node with no map fails closed, UNAVAILABLE for any generation, since it is one
+/// of several; the view of a node with a map is not stale.
 #[tokio::test]
 async fn a_node_with_no_map_has_no_view() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -125,10 +123,9 @@ async fn a_node_with_no_map_has_no_view() {
     farm.nodes[0].chain.view(1, wait).await.expect("current");
 }
 
-/// Catches a placement re-check that is too strict or too loose: under a newer map that
-/// places the blob the same way the write stands; a different replica, or this node no
-/// longer an owner, is STALE_MAP naming the newer generation; the same generation, or no
-/// map, stands.
+/// Under a newer map that places the blob the same way the write stands; a different
+/// replica, or this node no longer an owner, is STALE_MAP naming the newer generation; the
+/// same generation, or no map, stands.
 #[tokio::test]
 async fn a_placement_is_confirmed_only_if_the_new_map_keeps_it() {
     let farm = Farm::start(3, ChainConfig::default()).await;
@@ -158,8 +155,7 @@ async fn a_placement_is_confirmed_only_if_the_new_map_keeps_it() {
     );
 }
 
-/// Catches a down primary leaving its blobs unwritable, or the wrong node taking over: with
-/// the primary down in the map, the next owner plans the write with the primary as the
+/// With the primary down in the map, the next owner plans the write with the primary as the
 /// copy owed (not called); while the primary is up the next owner plans it the same way,
 /// with the primary as the copy to send (a frontend whose write to a dead primary the map
 /// has not marked down yet goes to the next owner).
@@ -209,9 +205,9 @@ impl MapSource for Unregistered {
     }
 }
 
-/// Catches a node that does not know which member it is taking part in a chain: it cannot
-/// tell whether it is the primary, so a write is UNAVAILABLE (naming why) rather than
-/// served as a lone node, and it has no view to repair from either.
+/// A node that does not know which member it is cannot tell whether it is the primary, so
+/// a write is UNAVAILABLE (naming why) rather than served as a lone node, and it has no
+/// view to repair from either.
 #[tokio::test]
 async fn a_node_that_has_not_registered_cannot_take_part() {
     let farm = Farm::start(2, ChainConfig::default()).await;

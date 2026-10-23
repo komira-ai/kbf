@@ -89,9 +89,9 @@ async fn leg(
         .map(tonic::Response::into_inner)
 }
 
-/// Catches `--ram-ack-bytes` at its default changing a write: with no node acknowledging
-/// from RAM, both owners commit `Durable`, neither registers a digest with its confirmer,
-/// and no blob is held in RAM.
+/// At the default of `--ram-ack-bytes`, with no node acknowledging from RAM, both owners
+/// commit `Durable`, neither registers a digest with its confirmer, and no blob is held
+/// in RAM.
 #[tokio::test]
 async fn at_the_default_no_write_is_held_or_confirmed() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -107,9 +107,8 @@ async fn at_the_default_no_write_is_held_or_confirmed() {
     assert!(farm.nodes[0].confirmer.is_empty() && farm.nodes[1].confirmer.is_empty());
 }
 
-/// Catches the replica not being asked for a held answer, an owner that does not register
-/// the other with its confirmer, and a gauge that is not told: with the primary
-/// acknowledging from RAM and the replica's own flag off, both commit `Held` (the replica
+/// With the primary acknowledging from RAM and the replica's own flag off, both commit
+/// `Held` (the replica
 /// because the leg asked), the blob is held and not durable on both, the primary's
 /// confirmer keeps it for member 2 and the replica's for member 1, and each store was told
 /// it keeps one.
@@ -140,9 +139,9 @@ async fn both_owners_hold_and_each_confirms_the_other() {
     }
 }
 
-/// Catches the order replica, primary, client: the replica's commit is parked at its gate
-/// (a positive event: it arrived), and then the primary has committed nothing and the
-/// write is not answered; released, both commit `Held` and the write is answered.
+/// The order is replica, primary, client: the replica's commit is parked at its gate (a
+/// positive event: it arrived), and then the primary has committed nothing and the write
+/// is not answered; released, both commit `Held` and the write is answered.
 #[tokio::test]
 async fn the_replica_holds_before_the_primary_and_the_client_hear() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -171,10 +170,9 @@ async fn the_replica_holds_before_the_primary_and_the_client_hear() {
     assert_eq!(modes(&farm, 1), [CommitMode::Held]);
 }
 
-/// Catches a replica that is down being asked for a held answer, a write through that is
-/// not counted for its reason, and a digest registered for a peer that never held it: the
-/// replica is cut off, so the primary commits `Through(ReplicaLost)` after it journaled
-/// the debt, holds nothing in RAM, and registers no digest.
+/// A replica that is down is not asked for a held answer: it is cut off, so the primary
+/// commits `Through(ReplicaLost)` after it journaled the debt, holds nothing in RAM, and
+/// registers no digest.
 #[tokio::test]
 async fn a_lost_replica_is_a_write_through_with_its_debt() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -194,7 +192,6 @@ async fn a_lost_replica_is_a_write_through_with_its_debt() {
 }
 
 /// The same for a replica the map names down (no call is made): `ReplicaLost`, a debt.
-/// Catches a down replica that is asked for a held answer or skipped without the debt.
 #[tokio::test]
 async fn a_replica_the_map_names_down_is_a_write_through_with_its_debt() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -209,9 +206,8 @@ async fn a_replica_the_map_names_down_is_a_write_through_with_its_debt() {
     assert_eq!(farm.nodes[0].repairs.open_records().len(), 1);
 }
 
-/// Catches a one-owner write acknowledged from RAM, which would be one copy: with R = 1
-/// the node commits `Through(SingleOwner)`, nothing is held in RAM and nothing is
-/// registered.
+/// A one-owner write is not acknowledged from RAM, which would be one copy: with R = 1 the
+/// node commits `Through(SingleOwner)`, nothing is held in RAM and nothing is registered.
 #[tokio::test]
 async fn a_blob_with_one_owner_is_a_write_through() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -240,8 +236,8 @@ async fn a_blob_with_one_owner_is_a_write_through() {
     assert!(farm.nodes[primary].confirmer.is_empty());
 }
 
-/// Catches a copy from the repair worker (a leg that does not ask) being held in RAM, and
-/// its dedup counting a RAM blob: the replica holds the blob in RAM only; a plain leg
+/// A copy from the repair worker (a leg that does not ask) is not held in RAM, and its
+/// dedup does not count a RAM blob: the replica holds the blob in RAM only; a plain leg
 /// writes it (`Durable`, no longer RAM-only) and registers nothing; a leg that asks finds
 /// it held and writes nothing.
 #[tokio::test]
@@ -288,10 +284,9 @@ async fn only_a_leg_that_asks_dedups_on_a_blob_held_in_ram() {
     assert!(farm.nodes[1].confirmer.is_empty());
 }
 
-/// Catches a replica that obeys the header on a write that is not a leg: a client's write
-/// of the same header is a plain write, committed by the node's own mode, and a header that
-/// is not the one value is refused. A leg whose header says anything but `1` is
-/// INVALID_ARGUMENT and writes nothing.
+/// The held header is read from a leg only: a client's write with the same header is a
+/// plain write, committed by the node's own mode. A leg whose header says anything but
+/// `1` is INVALID_ARGUMENT and writes nothing.
 #[tokio::test]
 async fn the_held_header_is_read_from_a_leg_only_and_only_its_one_value() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -327,8 +322,8 @@ async fn the_held_header_is_read_from_a_leg_only_and_only_its_one_value() {
     assert_eq!(modes(&farm, 0), [CommitMode::Durable]);
 }
 
-/// Catches a confirmer pass that asks the peer before this node's own copy is on its disk,
-/// or never learns that it is: a registered digest whose own blob is still held in RAM is
+/// A confirmer pass asks the peer only after this node's own copy is on its disk: a
+/// registered digest whose own blob is still held in RAM is
 /// not asked about, even long after the grace; once the blob is on this node's disk the
 /// pass notes it (starting the grace), and after the grace asks the peer, which holds it
 /// on its disk: forgotten, nothing owed, and the store is told the set is empty.

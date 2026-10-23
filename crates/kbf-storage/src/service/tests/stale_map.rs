@@ -27,12 +27,9 @@ fn stale(current: u64) -> impl Fn(&Result<crate::Digest, StorageError>) -> bool 
     move |r| matches!(r, Err(StorageError::StaleMap { current: c }) if *c == current)
 }
 
-/// Catches a node that serves a write routed by a map it does not hold: a caller behind
-/// the node (an older generation, or 0 for "no map seen") must get STALE_MAP naming the
-/// node's generation, and the blob must not be stored; the same blob under the node's
-/// generation is stored. Catches: the check removed; `<` made `<=` (the current
-/// generation refused); the check moved after the store (the blob lands before the
-/// refusal).
+/// A caller behind the node (an older generation, or 0 for "no map seen") gets STALE_MAP
+/// naming the node's generation, and the blob is not stored; the same blob under the
+/// node's generation is stored.
 #[tokio::test]
 async fn a_caller_behind_the_node_gets_stale_map_and_nothing_is_stored() {
     let (mem, _, channel) = node(7).await;
@@ -56,10 +53,9 @@ async fn a_caller_behind_the_node_gets_stale_map_and_nothing_is_stored() {
     assert_eq!(mem.puts.load(Ordering::SeqCst), 1);
 }
 
-/// Catches a node that tells a caller that is ahead of it that it is stale (the caller's
-/// map may be the right one; the node has only not been told) or serves the write under a
-/// map it cannot compare. UNAVAILABLE, naming both generations, and nothing stored.
-/// Catches: `>` made `>=` or the arm returning STALE_MAP.
+/// A caller ahead of the node is not told it is stale (its map may be the right one; the
+/// node has only not been told) and is not served under a map the node cannot compare:
+/// the answer is UNAVAILABLE, naming both generations, and nothing is stored.
 #[tokio::test]
 async fn a_caller_ahead_of_the_node_is_unavailable_not_stale() {
     let (mem, _, channel) = node(7).await;
@@ -76,9 +72,9 @@ async fn a_caller_ahead_of_the_node_is_unavailable_not_stale() {
     assert_eq!(mem.puts.load(Ordering::SeqCst), 0);
 }
 
-/// Catches a node that reads its map once (at construction) instead of per call, and a
-/// client that keeps using a generation it was told is stale: after the node learns of
-/// generation 9 the same client is stale, and once it adopts 9 its write lands.
+/// The node judges each call by the map it holds now, not the one it had at construction:
+/// after the node learns of generation 9 the same client is stale, and once the client
+/// adopts 9 its write lands.
 #[tokio::test]
 async fn the_node_judges_by_the_map_it_holds_now() {
     let (mem, held, channel) = node(7).await;
@@ -98,10 +94,9 @@ async fn the_node_judges_by_the_map_it_holds_now() {
     assert_eq!(mem.puts.load(Ordering::SeqCst), 2);
 }
 
-/// Catches the held-blob shortcut answering a stale caller: a write the node would
+/// The held-blob shortcut does not answer a stale caller: a write the node would
 /// acknowledge unread ("already stored") is refused all the same, because the node no
-/// longer holds the placement the caller wrote under. Catches: the check after the
-/// `find_missing` shortcut.
+/// longer holds the placement the caller wrote under.
 #[tokio::test]
 async fn a_stale_caller_is_refused_even_for_a_blob_the_node_holds() {
     let (_, held, channel) = node(7).await;
@@ -115,11 +110,10 @@ async fn a_stale_caller_is_refused_even_for_a_blob_the_node_holds() {
     assert!(stale(8)(&answer), "{answer:?}");
 }
 
-/// Catches a node with a map source that serves before it has learned its first map: it
-/// is one of several, so it cannot tell a caller's placement is the current one. Every
+/// A node with a map source does not serve before it has learned its first map: it is one
+/// of several, so it cannot tell a caller's placement is the current one. Every
 /// generation is refused UNAVAILABLE and nothing is stored. (A node given no source at all
 /// is a one-member farm and serves every generation: the plain `StorageService` tests.)
-/// Catches: the no-map case answering `Ok`.
 #[tokio::test]
 async fn a_node_with_a_source_and_no_map_serves_no_generation() {
     let mem = std::sync::Arc::new(Mem::default());
@@ -147,12 +141,11 @@ async fn raw(channel: &Channel, header: Option<MetadataValue<tonic::metadata::As
         .expect_err("refused")
 }
 
-/// Catches the wire spelling of the answers: STALE_MAP is FAILED_PRECONDITION with the
-/// node's generation in the trailer (the only way to tell it from the FAILED_PRECONDITION
-/// of an action write whose closure is not held); a call with no generation entry is "no
-/// map seen", so stale; an entry that is not a decimal number is INVALID_ARGUMENT, not
-/// read as 0 or as current. Catches: the trailer dropped; an absent entry read as
-/// current; a malformed entry read as 0.
+/// STALE_MAP is spelled on the wire as FAILED_PRECONDITION with the node's generation in
+/// the trailer (the only way to tell it from the FAILED_PRECONDITION of an action write
+/// whose closure is not held); a call with no generation entry is "no map seen", so
+/// stale; an entry that is not a decimal number is INVALID_ARGUMENT, not read as 0 or as
+/// current.
 #[tokio::test]
 async fn the_wire_names_the_generation_and_refuses_a_malformed_one() {
     let (mem, _, channel) = node(7).await;
@@ -177,10 +170,9 @@ async fn the_wire_names_the_generation_and_refuses_a_malformed_one() {
     assert_eq!(mem.puts.load(Ordering::SeqCst), 0);
 }
 
-/// Catches `lift` reading STALE_MAP from anything but FAILED_PRECONDITION with a decimal
-/// trailer: the same code without one (an action write whose closure is missing), with
-/// text that is not a number, or another code carrying the trailer, must keep the error
-/// it had.
+/// `lift` reads STALE_MAP only from FAILED_PRECONDITION with a decimal trailer: the same
+/// code without one (an action write whose closure is missing), with text that is not a
+/// number, or another code carrying the trailer, keeps the error it had.
 #[test]
 fn only_failed_precondition_with_a_decimal_trailer_is_stale_map() {
     let with = |status: Status, value: &str| {

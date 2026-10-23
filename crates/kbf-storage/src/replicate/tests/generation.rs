@@ -3,8 +3,8 @@ use kbf_map::{Map, Member, MemberId, MemberState, Rule};
 use crate::StorageError;
 use crate::replicate::check_generation;
 
-/// Catches an off-by-one at the generation boundary, and 0 ("no map seen") treated as
-/// current: behind is stale, equal is served, ahead is unavailable.
+/// A caller behind the node's generation is stale, an equal one is served, and one ahead
+/// is unavailable; 0 ("no map seen") is not current.
 #[test]
 fn behind_is_stale_equal_is_served_ahead_is_unavailable() {
     let member = Member {

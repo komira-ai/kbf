@@ -96,11 +96,10 @@ fn upload_name(d: &Digest) -> String {
     format!("uploads/u-1/blobs/{}/{}", d.hash_hex(), d.size_bytes)
 }
 
-/// Catches a service or client that loses, repeats or reorders bytes, ignores the
-/// offset or the limit, mis-sizes a chunk (the blob is three messages at 2.5 MiB, each at
-/// most `READ_CHUNK_BYTES`), or answers a blob other than the one put: the empty blob, a
-/// small one and a large one go in with `put` and come out of `read_blob` equal, and
-/// ranges of them come out of `read_range` as the store would cut them.
+/// Blobs round-trip through the wire byte for byte (a blob of 2.5 MiB is three messages,
+/// each at most `READ_CHUNK_BYTES`): the empty blob, a small one and a large one go in
+/// with `put` and come out of `read_blob` equal, and ranges of them come out of
+/// `read_range` as the store would cut them.
 #[tokio::test]
 async fn blobs_round_trip_through_the_wire() {
     let (_mem, remote, _) = pair().await;
@@ -144,9 +143,8 @@ async fn blobs_round_trip_through_the_wire() {
     assert_eq!(collect(at_end).await, (Vec::new(), Vec::new()));
 }
 
-/// Catches a read that collects the blob before it sends a byte (an endless store would
-/// never answer; a streaming service answers its first chunks at once and stops when the
-/// client does).
+/// A read streams the blob and does not collect it first: an endless store still has its
+/// first chunks answered at once, and the read stops when the client does.
 #[tokio::test]
 async fn a_read_streams_and_is_not_collected() {
     let (mem, remote, _) = pair().await;
@@ -159,7 +157,7 @@ async fn a_read_streams_and_is_not_collected() {
     assert_eq!(first.expect("a chunk").expect("ok").len(), 1024);
 }
 
-/// Catches an error that loses its code on the way: a blob not held must be NOT_FOUND
+/// An error keeps its code across the wire: a blob not held is NOT_FOUND
 /// (the caller uploads it), an offset past the end OUT_OF_RANGE with the offset, a
 /// store that cannot answer UNAVAILABLE (never "absent"), a store whose records disagree
 /// INTERNAL, a malformed request INVALID_ARGUMENT, and a read that fails after its first
@@ -257,8 +255,8 @@ async fn errors_keep_their_codes_across_the_wire() {
     }
 }
 
-/// Catches every status code of the client's reading of a failed call changed: the
-/// table of what an in-process caller would have seen.
+/// A failed call's status becomes, for every status code, the error an in-process caller
+/// would have seen.
 #[test]
 fn a_status_becomes_the_error_a_store_would_give() {
     use super::client::lift;
@@ -318,9 +316,9 @@ fn a_status_becomes_the_error_a_store_would_give() {
     }
 }
 
-/// Catches FindMissing answering in another order than asked, dropping a held-but-empty
-/// blob into the missing, passing a malformed digest or another digest function, and a
-/// batch call answered when the node does not serve it.
+/// FindMissing answers in the order asked, does not list a held-but-empty blob as
+/// missing, refuses a malformed digest and another digest function, and refuses a batch
+/// call when the node does not serve it.
 #[tokio::test]
 async fn find_missing_answers_in_order_and_refuses_what_it_cannot() {
     let (_mem, remote, channel) = pair().await;
@@ -393,10 +391,9 @@ async fn find_missing_answers_in_order_and_refuses_what_it_cannot() {
     }
 }
 
-/// Catches a Write that accepts what it must not: no message, a name that is no upload,
-/// more bytes than the digest names, a stream that stops
-/// without `finish_write`, fewer bytes than named, other bytes than named (all
-/// INVALID_ARGUMENT, and nothing stored); and one that does not accept what it must: a
+/// A Write is checked against its digest: no message, a name that is no upload, more
+/// bytes than the digest names, a stream that stops without `finish_write`, fewer bytes
+/// than named, and other bytes than named are all INVALID_ARGUMENT and store nothing; a
 /// correct write is acknowledged with the blob's size.
 #[tokio::test]
 async fn a_write_is_checked_against_its_digest() {
@@ -434,8 +431,8 @@ async fn a_write_is_checked_against_its_digest() {
     );
 }
 
-/// Catches a Write whose stream ends early that is answered with anything but
-/// INVALID_ARGUMENT naming how it ended: a stream with no message at all, and one that
+/// A Write whose stream ends early is answered INVALID_ARGUMENT naming how it ended: a
+/// stream with no message at all, and one that
 /// stops before `finish_write` (after one message, and after two). Nothing is stored, and
 /// the same blob written whole afterwards is.
 #[tokio::test]
@@ -468,9 +465,9 @@ async fn a_write_that_ends_early_says_how() {
     assert_eq!(whole.expect("a whole write").committed_size, 12);
 }
 
-/// Catches a Write that reads and stores a blob the node already holds (the cheapest
-/// upload is the one skipped), and QueryWriteStatus that reports a blob not held as
-/// complete or one held as not.
+/// A Write of a blob the node already holds is not read or stored again (the cheapest
+/// upload is the one skipped), and QueryWriteStatus reports a held blob as complete and a
+/// blob not held as not.
 #[tokio::test]
 async fn a_held_blob_is_not_written_again() {
     let (mem, remote, channel) = pair().await;
@@ -510,10 +507,10 @@ async fn a_held_blob_is_not_written_again() {
     assert_eq!(refused.code(), Code::InvalidArgument);
 }
 
-/// Catches uploads that hold more than `write_bytes_in_flight` at once (two 6-byte blobs
-/// under a bound of 8 must not both be inside the store's put together), and a blob
-/// bigger than the bound that waits for room it can never have (it takes the whole
-/// bound and goes through).
+/// Uploads hold no more than `write_bytes_in_flight` at once (two 6-byte blobs under a
+/// bound of 8 are not both inside the store's put together), and a blob bigger than the
+/// bound does not wait for room it can never have: it takes the whole bound and goes
+/// through.
 #[tokio::test]
 async fn concurrent_writes_wait_for_room() {
     let mem = Arc::new(Mem::default());
@@ -535,12 +532,11 @@ async fn concurrent_writes_wait_for_room() {
     );
 }
 
-/// Catches a closure lost, invented or made mandatory on the wire. An entry's closure
+/// A closure is neither lost, invented nor made mandatory on the wire. An entry's closure
 /// comes back as the store reported it, in order; an entry that needs nothing else comes
 /// back with an empty closure (`Some`, nothing to check); an entry from a store that
 /// reports no closure (a node from before the field) comes back with `None` (unchecked),
-/// not as an empty closure, and `action_result` still answers it. Catches: the field
-/// dropped (`None` for all), an absent closure read as empty, an empty one as absent.
+/// not as an empty closure, and `action_result` still answers it.
 #[tokio::test]
 async fn an_entrys_closure_round_trips_and_absent_means_unchecked() {
     let (mem, remote, _) = pair().await;
@@ -593,10 +589,10 @@ async fn an_entrys_closure_round_trips_and_absent_means_unchecked() {
     assert!(remote.action_result(&needy).await.expect("a hit").is_some());
 }
 
-/// Catches the action cache losing something on the wire: a miss that becomes a hit or
-/// the reverse, the result blob's digest, a record's closure, a refusal that loses the
-/// blob it names (the three kinds), a client that commits (refused, whatever the store
-/// says), and a writer or record or result that is not named.
+/// The action cache loses nothing on the wire: a miss stays a miss and a hit a hit, and
+/// the result blob's digest, a record's closure and a refusal's named blob (the three
+/// kinds) come back; a client that commits is refused, whatever the store says; and a
+/// writer, record or result that is not named is refused.
 #[tokio::test]
 async fn the_action_cache_round_trips() {
     let (_mem, remote, channel) = pair().await;
@@ -704,8 +700,8 @@ async fn the_action_cache_round_trips() {
     );
 }
 
-/// Catches a store failure on the action cache that is answered in the message (a miss,
-/// or a refusal) rather than as the status its error has.
+/// A store failure on the action cache is answered as the status its error has, not in
+/// the message (as a miss or a refusal).
 #[tokio::test]
 async fn an_action_cache_failure_is_a_status() {
     let (mem, remote, _) = pair().await;
@@ -735,10 +731,10 @@ async fn an_action_cache_failure_is_a_status() {
     }
 }
 
-/// Catches an action-store request sent without the map generation in its field (section
-/// 6's STALE_MAP could not work), and a client that believes a node that contradicts
+/// An action-store request carries the map generation in its field (section 6's
+/// STALE_MAP depends on it), and a client does not believe a node that contradicts
 /// itself: a result digest or record that is not a digest, an empty answer to Prepare, a
-/// read of the wrong size, a write acknowledged as no bytes.
+/// read of the wrong size, and a write acknowledged as no bytes are errors.
 #[tokio::test]
 async fn a_client_does_not_trust_a_node_that_contradicts_itself() {
     let (odd, channel) = serve_odd().await;
@@ -809,8 +805,8 @@ async fn a_client_does_not_trust_a_node_that_contradicts_itself() {
     );
 }
 
-/// Catches a refusal the client cannot read becoming a success or a wrong error, and a
-/// refusal that lost any of its blobs.
+/// A refusal is read back as it was made, with every blob it names; one the client cannot
+/// read is an error, not a success.
 #[test]
 fn a_refusal_is_read_back_as_it_was_made() {
     use super::client::refused;
@@ -855,8 +851,8 @@ fn a_refusal_is_read_back_as_it_was_made() {
     assert!(matches!(unknown, StorageError::Internal(_)));
 }
 
-/// Catches the resource-name and digest parsing accepting what REAPI forbids or refusing
-/// a spelling it allows.
+/// Resource-name and digest parsing accepts every spelling REAPI allows and refuses what
+/// it forbids.
 #[test]
 fn resource_names_parse_every_spelling() {
     let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -892,12 +888,11 @@ fn resource_names_parse_every_spelling() {
     assert!(wire::write_resource(&format!("blobs/{hash}/7")).is_err());
 }
 
-/// Catches a resource name read at the wrong segment when the instance name holds a word
-/// of the grammar. An instance name is any path, so `a/uploads/b` and `blobs` are
+/// A resource name is read at the right segment when the instance name holds a word of
+/// the grammar. An instance name is any path, so `a/uploads/b` and `blobs` are
 /// instances, and `{instance}/uploads/{uuid}/blobs/{hash}/{size}` must be read at the
 /// `uploads/{uuid}/blobs/` that is followed by a digest (the first, for a metadata
-/// tail that holds another). A parser that takes the first `uploads` or `blobs` word, or
-/// the last, fails one of these; each case names the size it must come out with.
+/// tail that holds another); each case names the size it comes out with.
 #[test]
 fn an_instance_name_may_hold_the_words_of_the_grammar() {
     let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -955,8 +950,8 @@ fn an_instance_name_may_hold_the_words_of_the_grammar() {
     assert!(wire::read_resource(&format!("blobs/{hash}/7/extra/blobs")).is_err());
 }
 
-/// Catches a FindMissing that has no limit on the digests of a call, or the wrong one:
-/// a call at the limit is answered, one digest over it is INVALID_ARGUMENT (the code
+/// FindMissing limits the digests of a call: a call at the limit is answered, one digest
+/// over it is INVALID_ARGUMENT (the code
 /// that says splitting the call is the fix, and that a client does not retry), and
 /// nothing is looked up for it. The limit is under what a full message could hold (the
 /// smallest digest encodes to 68 bytes), so it is a bound on work, not on bytes.
@@ -994,9 +989,8 @@ async fn find_missing_refuses_a_call_over_the_digest_limit() {
     );
 }
 
-/// Catches a client that claims a streamed put it cannot make: the service has no
-/// streamed write to the object store, so `put_streamed` is refused as invalid (the
-/// caller then stores the blob with `put`), and nothing is stored.
+/// The service has no streamed write to the object store, so `put_streamed` is refused as
+/// invalid (the caller then stores the blob with `put`), and nothing is stored.
 #[tokio::test]
 async fn a_streamed_put_is_refused_over_the_wire() {
     let (_mem, remote, _) = pair().await;
@@ -1014,8 +1008,8 @@ async fn a_streamed_put_is_refused_over_the_wire() {
     );
 }
 
-/// Catches a limit that drifted from the front's (a test in kbf-server pins the front's
-/// to these): a full 16 MiB batch has to fit, and a blob is streamed from the same size.
+/// The limits match the front's (a test in kbf-server pins the front's to these): a full
+/// 16 MiB batch fits, and a blob is streamed from the same size.
 #[test]
 fn the_limits_hold_a_full_batch() {
     assert_eq!(MAX_MESSAGE_BYTES, (16 << 20) + (1 << 20));
@@ -1040,9 +1034,8 @@ fn blob_messages(name: &str, bytes: &[u8]) -> Vec<WriteRequest> {
         .collect()
 }
 
-/// Catches a Write of a blob past `STREAM_FROM_BYTES` that is gathered whole (the store's
-/// `put` called instead of `put_streamed`, or the blob held in one buffer), and one that
-/// is streamed but stored wrong: the blob is stored, byte for byte, by `put_streamed`
+/// A Write of a blob past `STREAM_FROM_BYTES` is streamed, not gathered whole: the blob is
+/// stored, byte for byte, by `put_streamed`
 /// alone, from pieces of at most one message; one `STREAM_FROM_BYTES` long is still
 /// gathered and put.
 #[tokio::test]
@@ -1074,8 +1067,8 @@ async fn a_large_write_is_streamed_to_the_store() {
     assert_eq!(mem.streamed.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
-/// Catches a streamed Write that stores what it must not or answers the wrong code: other
-/// bytes than the digest names, more or fewer bytes than it names, a stream that stops
+/// A streamed Write is checked against its digest: other bytes than the digest names,
+/// more or fewer bytes than it names, a stream that stops
 /// without `finish_write`, are all INVALID_ARGUMENT and store nothing; and a blob is not
 /// refused for its size (a digest naming 5 GiB gets as far as its bytes, which fall
 /// short).
@@ -1111,7 +1104,7 @@ async fn a_streamed_write_is_checked_against_its_digest() {
     assert!(mem.blobs.lock().expect("lock").is_empty());
 }
 
-/// Catches a streamed Write whose last message carries no bytes: the blob is complete
+/// A streamed Write may end with a message that carries no bytes: the blob is complete
 /// before it, and `finish_write` alone ends the write, as a sender that does not know
 /// which message is its last would send it. The blob is stored whole, once.
 #[tokio::test]
@@ -1135,9 +1128,8 @@ async fn a_streamed_write_may_finish_with_an_empty_message() {
     );
 }
 
-/// Catches a streamed Write whose sender goes away mid-stream (its connection closed after
-/// the store took a piece) that stores a partial blob or leaves the
-/// store waiting: the store's pieces end in an error and nothing is stored.
+/// When a streamed Write's sender goes away mid-stream (its connection closed after the
+/// store took a piece), the store's pieces end in an error and nothing is stored.
 #[tokio::test]
 async fn a_streamed_write_whose_sender_goes_away_stores_nothing() {
     let mem = Arc::new(Mem::default());
@@ -1161,8 +1153,8 @@ async fn a_streamed_write_whose_sender_goes_away_stores_nothing() {
     assert_eq!(mem.streamed.load(Ordering::SeqCst), 0);
 }
 
-/// Catches a streamed Write whose second message the server cannot decode (it is larger
-/// than the largest message): the broken stream is the sender's fault, answered with the
+/// When the server cannot decode a streamed Write's second message (it is larger than the
+/// largest message), the broken stream is the sender's fault, answered with the
 /// decoder's status, not INTERNAL, and nothing is stored.
 #[tokio::test]
 async fn a_streamed_write_with_an_oversized_message_stores_nothing() {
@@ -1183,9 +1175,8 @@ async fn a_streamed_write_with_an_oversized_message_stores_nothing() {
     assert_eq!(mem.streamed.load(Ordering::SeqCst), 0);
 }
 
-/// Catches a remote storage that gathers a streamed put or answers it as if stored: it
-/// takes none (it writes a blob through `put`), and says so as `Invalid`, consuming
-/// nothing.
+/// A remote storage takes no streamed put (it writes a blob through `put`), and says so as
+/// `Invalid`, consuming nothing.
 #[tokio::test]
 async fn a_remote_storage_takes_no_streamed_put() {
     let (mem, remote, _) = pair().await;

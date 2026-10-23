@@ -23,8 +23,8 @@ use crate::{Storage, StorageError};
 
 pub(super) const MIB: usize = 1 << 20;
 
-/// A write that should end, ended or hung: the deadline is for a defect that would wait for
-/// ever, not a speed.
+/// Runs a call that should end under a deadline; the deadline only stops a wait for ever
+/// and is not a speed.
 pub(super) async fn within<T>(call: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(30), call)
         .await
@@ -87,11 +87,10 @@ async fn raw(
         .map(tonic::Response::into_inner)
 }
 
-/// Catches an answer given before the second copy exists, and a copy on the primary that
-/// the replica does not have: the replica's commit is held, so the write must not be
-/// answered, and the primary must not hold the blob either (present on the primary means
-/// the replica has it or a repair is owed); released, both hold the same bytes and the
-/// write is answered. Catches: the primary commits before it waits for the replica.
+/// A write is answered only once the second copy exists: while the replica's commit is
+/// held the write is not answered and the primary does not hold the blob either (present
+/// on the primary means the replica has it or a repair is owed); released, both hold the
+/// same bytes and the write is answered.
 #[tokio::test]
 async fn a_write_is_answered_only_when_both_owners_hold_it() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -198,12 +197,11 @@ async fn stalled_pull(chunks: usize, replica_stalls: bool) -> (usize, usize, usi
     (pulled_at_rest, local, chunks, farm, digest)
 }
 
-/// Catches a primary that holds the blob whole, or queues it without bound, instead of
-/// passing it through: with the replica stalled, a 40 MiB blob must not be read from the
-/// writer beyond the few messages the pipeline holds (a writer that was not held back
-/// has all 40 pulled), and the primary's own store must not run ahead of the replica by
-/// more than that either. Catches: unbounded queues on the staging and the leg; the
-/// blob collected before it is forwarded.
+/// The primary passes a blob through in a bounded window instead of holding it whole or
+/// queueing it without bound: with the replica stalled, a 40 MiB blob is not read from
+/// the writer beyond the few messages the pipeline holds (a writer that was not held back
+/// has all 40 pulled), and the primary's own store does not run ahead of the replica by
+/// more than that either.
 #[tokio::test]
 async fn the_blob_passes_through_in_a_bounded_window() {
     let (pulled, local, chunks, _, _) = stalled_pull(40, true).await;
@@ -229,9 +227,8 @@ async fn an_unstalled_replica_takes_the_whole_blob() {
     );
 }
 
-/// Catches a stale writer served, and a replica contacted for a write that will be refused:
-/// a writer a generation behind the primary is refused STALE_MAP, and neither node stores
-/// or is sent a byte.
+/// A writer a generation behind the primary is refused STALE_MAP before the replica is
+/// contacted, and neither node stores or is sent a byte.
 #[tokio::test]
 async fn a_stale_view_is_refused_and_nothing_is_copied() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -253,11 +250,10 @@ async fn a_stale_view_is_refused_and_nothing_is_copied() {
         .expect("under the current map");
 }
 
-/// Catches a primary that is behind its replica and writes anyway: the replica holds a
-/// newer map, so its refusal is the answer (STALE_MAP naming the newer generation, for the
-/// writer to refetch), the primary does not hold the blob (no copy under a placement
-/// the farm has left), and nothing is acknowledged. Catches: a replica's STALE_MAP taken as
-/// the replica being down.
+/// When the replica holds a newer map than the primary, the replica's refusal is the
+/// answer (STALE_MAP naming the newer generation, for the writer to refetch), not a sign
+/// that the replica is down; the primary does not hold the blob (no copy under a
+/// placement the farm has left), and nothing is acknowledged.
 #[tokio::test]
 async fn a_primary_behind_its_replica_does_not_acknowledge_one_copy() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -277,10 +273,10 @@ async fn a_primary_behind_its_replica_does_not_acknowledge_one_copy() {
     );
 }
 
-/// Catches a write answered under a placement the map has left: the map turns (the replica
-/// is drained) while the replica's commit is held. When the write completes, the primary
-/// must not commit or answer, because the new map places the blob elsewhere; a map that
-/// turned without moving the blob changes nothing. Catches: no re-check before the commit.
+/// The map is checked again before the answer: when the map turns (the replica is
+/// drained) while the replica's commit is held, the primary neither commits nor answers
+/// once the write completes, because the new map places the blob elsewhere; a map that
+/// turned without moving the blob changes nothing.
 #[tokio::test]
 async fn a_map_that_turns_during_the_write_is_checked_before_the_answer() {
     let farm = Farm::start(3, ChainConfig::default()).await;
@@ -327,13 +323,11 @@ async fn a_map_that_turns_during_the_write_is_checked_before_the_answer() {
     );
 }
 
-/// Catches the copy an action-cache commit needs on the action's owner being refused: the
-/// owner of an action is usually not an owner of the blobs of its entry, a plain write
-/// there is refused as "not the primary", and the commit failed (a repeat of an action ran again on a farm of
-/// three). An unowned write to a node that owns nothing stores one copy there and none is
+/// An action-cache commit needs a copy on the action's owner, which is usually not an
+/// owner of the blobs of its entry, where a plain write is refused as "not the primary".
+/// An unowned write to a node that owns nothing stores one copy there and none is
 /// forwarded or owed; to the blob's primary it is a plain write (the replica holds it
-/// too). Catches: the unowned marker ignored by the node (refused); taken as local at the
-/// primary (no replica copy).
+/// too).
 #[tokio::test]
 async fn an_unowned_copy_is_stored_on_a_node_that_owns_nothing() {
     let farm = Farm::start(3, ChainConfig::default()).await;
@@ -368,11 +362,10 @@ async fn an_unowned_copy_is_stored_on_a_node_that_owns_nothing() {
     assert!(!held(&farm, 2, &other_digest));
 }
 
-/// Catches an unowned-copy marker honoured from any caller: it skips the chain (no forward,
-/// no repair debt), so only the frontend's identity may send it. A daemon or a storage node
-/// that sends the header gets the plain-write rule (INVALID_ARGUMENT, not the primary) and
-/// nothing is stored; a frontend's is stored as one copy. Catches: the node honouring the
-/// header whatever the certificate names.
+/// The unowned-copy marker skips the chain (no forward, no repair debt), so only the
+/// frontend's identity may send it. A daemon or a storage node that sends the header gets
+/// the plain-write rule (INVALID_ARGUMENT, not the primary) and nothing is stored; a
+/// frontend's is stored as one copy.
 #[tokio::test]
 async fn an_unowned_copy_is_honoured_only_for_the_frontends_identity() {
     let farm = Farm::start(3, ChainConfig::default()).await;
@@ -401,10 +394,10 @@ async fn an_unowned_copy_is_honoured_only_for_the_frontends_identity() {
     assert!(!held(&farm, 0, &digest) && !held(&farm, 1, &digest));
 }
 
-/// Catches a write taken by the wrong node: a client write to a node that owns nothing, or
-/// a copy sent to a node that owns nothing or by the node to itself, and a leg header that
-/// is not a member id; none stores anything. (A client write to the second owner is
-/// served: `the_second_owner_takes_a_write_while_the_map_has_the_first_up`.)
+/// A write is served only where the map places it: a client write to a node that owns
+/// nothing, a copy sent to a node that owns nothing or by the node to itself, and a leg
+/// header that is not a member id each store nothing. (A client write to the second owner
+/// is served: `the_second_owner_takes_a_write_while_the_map_has_the_first_up`.)
 #[tokio::test]
 async fn a_write_is_served_only_where_the_map_places_it() {
     let farm = Farm::start(3, ChainConfig::default()).await;
@@ -443,10 +436,9 @@ async fn a_write_is_served_only_where_the_map_places_it() {
     assert!(held(&farm, 1, &digest) && !held(&farm, 0, &digest) && !held(&farm, 2, &digest));
 }
 
-/// Catches a replica that acknowledges bytes it has not verified against the digest the
-/// copy names, and a primary that does: bad bytes sent to the replica as a copy are
-/// refused INVALID_ARGUMENT and not stored; bad bytes written to the primary are refused
-/// and stored on neither node. Catches: the digest check removed from the staging writer.
+/// Bytes are verified against the digest before they are acknowledged: bad bytes sent to
+/// the replica as a copy are refused INVALID_ARGUMENT and not stored; bad bytes written to
+/// the primary are refused and stored on neither node.
 #[tokio::test]
 async fn bytes_that_are_not_the_digest_are_stored_nowhere() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -481,10 +473,9 @@ async fn bytes_that_are_not_the_digest_are_stored_nowhere() {
     }
 }
 
-/// Catches a write that does not hold to the size its digest names, through the streamed
-/// path: more bytes than declared, a stream that ends before `finish_write`, and fewer
-/// bytes than declared all refuse INVALID_ARGUMENT and store nothing, on the primary and on
-/// a replica.
+/// A streamed write holds to the size its digest names: more bytes than declared, a
+/// stream that ends before `finish_write`, and fewer bytes than declared all refuse
+/// INVALID_ARGUMENT and store nothing, on the primary and on a replica.
 #[tokio::test]
 async fn a_streamed_write_holds_to_its_declared_size() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -507,10 +498,9 @@ async fn a_streamed_write_holds_to_its_declared_size() {
     }
 }
 
-/// Catches a node that keeps taking bytes past the size its digest names, until the writer
-/// chooses to stop: the call is refused as soon as the declared size is passed, though the
-/// writer would send more (a writer that never finishes could otherwise fill the store's
-/// write tier under a small digest). On a primary and on a replica.
+/// A call is refused as soon as the declared size is passed, though the writer would send
+/// more (a writer that never finishes could otherwise fill the store's write tier under a
+/// small digest). On a primary and on a replica.
 #[tokio::test]
 async fn a_writer_is_stopped_at_the_size_it_declared() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -540,9 +530,8 @@ async fn a_writer_is_stopped_at_the_size_it_declared() {
     }
 }
 
-/// Catches a blob the primary already holds being sent on again, or refused when the
-/// replica is down: a second write of a held blob is answered at once, unread, with the
-/// replica cut off.
+/// A second write of a blob the primary already holds is answered at once, unread, with
+/// the replica cut off.
 #[tokio::test]
 async fn a_blob_the_primary_holds_is_answered_without_the_replica() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -564,11 +553,10 @@ async fn a_blob_the_primary_holds_is_answered_without_the_replica() {
     );
 }
 
-/// Catches a replica that already holds a blob of several messages being treated as a
-/// protocol error (it answers on the first message, long before the blob is complete, and
-/// the write failed INTERNAL on every retry): the primary does not hold the 3 MiB blob, the
-/// replica does, and the write is answered; both then hold the same bytes. Catches: the
-/// early answer of the blob's whole size reported as an error again.
+/// A replica that already holds a blob of several messages answers on the first message,
+/// long before the blob is complete, and that is a copy, not a protocol error: the primary
+/// does not hold the 3 MiB blob, the replica does, and the write is answered; both then
+/// hold the same bytes.
 #[tokio::test]
 async fn a_replica_that_already_holds_a_large_blob_is_a_copy() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -592,10 +580,10 @@ async fn a_replica_that_already_holds_a_large_blob_is_a_copy() {
     }
 }
 
-/// Catches a primary whose own store failing is answered, or half-kept: every point at which
-/// the primary's streamed write can fail (an append, the end of the stream, the commit;
-/// an error or a panic; early in a long blob and in a short one) fails the write INTERNAL
-/// and the primary does not hold the blob.
+/// When the primary's own store fails, the write fails and nothing is half-kept: every
+/// point at which the primary's streamed write can fail (an append, the end of the stream,
+/// the commit; an error or a panic; early in a long blob and in a short one) fails the
+/// write INTERNAL and the primary does not hold the blob.
 #[tokio::test]
 async fn a_failure_of_the_primarys_own_store_fails_the_write() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -621,8 +609,8 @@ async fn a_failure_of_the_primarys_own_store_fails_the_write() {
     }
 }
 
-/// Catches a replica's store failing being taken for a down replica or an answer: the
-/// refusal (INTERNAL) is the writer's answer, and the primary does not hold the blob.
+/// A failure of the replica's store is not a down replica: the refusal (INTERNAL) is the
+/// writer's answer, and the primary does not hold the blob.
 #[tokio::test]
 async fn a_failure_of_the_replicas_store_fails_the_write() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -637,9 +625,9 @@ async fn a_failure_of_the_replicas_store_fails_the_write() {
     assert!(!held(&farm, 0, &sha(&bytes)));
 }
 
-/// Catches a primary whose store cannot stream being made to hold the blob whole to pass
-/// it on: it refuses (FAILED_PRECONDITION) and stores nothing; the same node, outside a
-/// chain, still takes a write the buffered way.
+/// A primary whose store cannot stream refuses (FAILED_PRECONDITION) rather than hold the
+/// blob whole to pass it on, and stores nothing; the same node, outside a chain, still
+/// takes a write the buffered way.
 #[tokio::test]
 async fn a_primary_that_cannot_stream_refuses_rather_than_buffer() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -659,9 +647,8 @@ async fn a_primary_that_cannot_stream_refuses_rather_than_buffer() {
     assert!(!held(&farm, 0, &digest) && !held(&farm, 1, &digest));
 }
 
-/// Catches a primary that keeps working for a writer that left: the writer's call is
-/// dropped part way through a long blob; nothing is stored, and both nodes take the
-/// next write.
+/// When the writer's call is dropped part way through a long blob, nothing is stored and
+/// both nodes take the next write.
 #[tokio::test]
 async fn a_writer_that_leaves_part_way_leaves_nothing() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -708,8 +695,8 @@ async fn a_writer_that_leaves_part_way_leaves_nothing() {
     assert!(held(&farm, 0, &digest) && held(&farm, 1, &digest));
 }
 
-/// Catches a node outside a chain that cannot take a streamed write, or that takes a copy:
-/// with a store that streams, the blob is written through the stream (chunks appended,
+/// A node outside a chain takes a streamed write but not a copy: with a store that
+/// streams, the blob is written through the stream (chunks appended,
 /// one commit) and checked against its digest; with a leg header the call is refused, as
 /// there is no chain it could be part of.
 #[tokio::test]
@@ -737,8 +724,8 @@ async fn a_node_outside_a_chain_streams_when_its_store_can() {
     assert!(!mem.blobs.lock().expect("lock").contains_key(&other));
 }
 
-/// Catches a certified node that is in no chain taking a copy another node sends: INTERNAL
-/// is wrong, and so is storing it (the sender would believe a second copy exists).
+/// A certified node that is in no chain refuses a copy another node sends, without
+/// INTERNAL and without storing it (the sender would believe a second copy exists).
 #[tokio::test]
 async fn a_copy_sent_to_a_node_in_no_chain_is_refused() {
     use crate::service::tests::fake::{Mem, serve_routes};
@@ -769,9 +756,9 @@ async fn a_copy_sent_to_a_node_in_no_chain_is_refused() {
     assert!(!mem.blobs.lock().expect("lock").contains_key(&other));
 }
 
-/// Catches a chain node that admits callers without a certificate: its replica would take a
-/// copy from anyone who names itself a storage node, so the service refuses to be built
-/// over `Admission::Open`. Catches: the check removed.
+/// A chain node must admit callers by certificate: its replica would take a copy from
+/// anyone who names itself a storage node, so the service refuses to be built over
+/// `Admission::Open`.
 #[test]
 fn a_chain_node_must_admit_callers_by_certificate() {
     use crate::repair::Repairs;
@@ -812,9 +799,9 @@ fn a_chain_node_must_admit_callers_by_certificate() {
     );
 }
 
-/// Catches a store whose blocking `stream` call fails being taken for one that has no
-/// stream (the write would then go the buffered way, or be refused as FAILED_PRECONDITION):
-/// the failure is INTERNAL, and nothing is stored.
+/// A store whose blocking `stream` call fails is not one that has no stream (which would
+/// go the buffered way, or be refused as FAILED_PRECONDITION): the failure is INTERNAL,
+/// and nothing is stored.
 #[tokio::test]
 async fn a_store_whose_stream_call_fails_fails_the_write() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -832,8 +819,8 @@ async fn a_store_whose_stream_call_fails_fails_the_write() {
     assert!(!held(&farm, 0, &digest) && !held(&farm, 1, &digest));
 }
 
-/// Catches a copy's dedup that keeps no blob alive : the replica already holds the blob on
-/// its disk, so the copy the primary sends is answered "held" at once (nothing is
+/// A copy's dedup keeps the blob alive: the replica already holds the blob on its disk,
+/// so the copy the primary sends is answered "held" at once (nothing is
 /// written), and the replica must have been asked the durable question about it, which is
 /// what refreshes the blob's retention there (the node's cache touches what it reports
 /// present). The primary's own client check is plain and runs on the primary, so a touch

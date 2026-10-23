@@ -67,9 +67,8 @@ pub(super) fn expected(endpoint: Endpoint) -> &'static [&'static str] {
     }
 }
 
-/// Catches an endpoint that takes a role it should not, or refuses one it should take:
-/// every role against every endpoint, the answer compared with the table the design
-/// gives, written out here.
+/// Each endpoint takes the roles the design gives it and no others: every role against
+/// every endpoint, the answer compared with the table the design gives, written out here.
 #[test]
 fn each_endpoint_takes_the_roles_the_design_gives_it() {
     let certified = Admission::Certified;
@@ -101,10 +100,10 @@ fn each_endpoint_takes_the_roles_the_design_gives_it() {
     }
 }
 
-/// Catches a certificate read wrongly: no certificate must be UNAUTHENTICATED, bytes that
-/// are not one UNAUTHENTICATED, and a certificate with no role, with two, or with a name
-/// that is not a role PERMISSION_DENIED (a DNS name that looks like a role is not one);
-/// and plain text, which has no identity, admitting every call.
+/// A certificate must name exactly one known role: no certificate is UNAUTHENTICATED,
+/// bytes that are not one UNAUTHENTICATED, and a certificate with no role, with two, or
+/// with a name that is not a role PERMISSION_DENIED (a DNS name that looks like a role is
+/// not one); and plain text, which has no identity, admitting every call.
 #[test]
 fn a_certificate_must_name_exactly_one_known_role() {
     let certified = Admission::Certified;
@@ -140,8 +139,8 @@ fn a_certificate_must_name_exactly_one_known_role() {
     }
 }
 
-/// Catches the unowned-copy marker honoured from a role other than the frontend: under
-/// mutual TLS only a certificate naming `frontend` may send it (every other role, no
+/// The unowned-copy marker is honoured only from the frontend: under mutual TLS only a
+/// certificate naming `frontend` may send it (every other role, no
 /// certificate and a certificate with no role may not); plain text has no identity and
 /// admits it as it admits every call but a copy.
 #[test]
@@ -160,10 +159,11 @@ fn only_the_frontend_may_ask_for_an_unowned_copy() {
     assert!(Admission::Open.permits_unowned_leaf(None));
 }
 
-/// Catches an unowned marker that changes what a chain copy is: a leg that carries the marker
-/// is still a leg (judged by a copy's rules: stored where the map says the node owns the blob,
-/// refused where it does not), never an unowned local write. Only a call with no leg, that asked,
-/// from a caller that may ask, is taken as an unowned copy. (Admission already refuses a leg
+/// An unowned marker does not change what a chain copy is: a leg that carries the marker
+/// is still a leg (judged by a copy's rules: stored where the map says the node owns the
+/// blob, refused where it does not), never an unowned local write. Only a call with no
+/// leg, that asked, from a caller that may ask, is taken as an unowned copy. (Admission
+/// already refuses a leg
 /// from any caller but a storage node, and a storage node may not ask for an unowned copy, so
 /// no call reaches the guard with both; it is tested where it is decided.)
 #[test]
@@ -454,18 +454,13 @@ pub(super) async fn call(endpoint: Endpoint, channel: &Channel) -> Result<(), St
     }
 }
 
-/// Catches an unexpected role admitted on any method, over real mutual TLS (the
-/// certificate really is the transport's, not a test's stand-in): each of the three
-/// roles, one that is not a role, a certificate with no role (a node's DNS name only)
-/// and one with two calls every method of [`RPCS`]; a call is refused
-/// PERMISSION_DENIED exactly when the certificate does not name one role the endpoint
-/// takes, and
-/// otherwise gets as far as the store (any other answer, including the store's own
-/// errors). A refused `Segments` call never reaches the store's handler.
-///
-/// Catches: the check removed from `Segments.Commit` alone (frontend, storage,
-/// admin, no role and two roles all reach it); `contains` negated in
-/// `Admission::check_leaf`.
+/// Every method refuses an unexpected role over real mutual TLS (the certificate really
+/// is the transport's, not a test's stand-in): each of the three roles, one that is not a
+/// role, a certificate with no role (a node's DNS name only) and one with two calls every
+/// method of [`RPCS`]; a call is refused PERMISSION_DENIED exactly when the certificate
+/// does not name one role the endpoint takes, and otherwise gets as far as the store (any
+/// other answer, including the store's own errors). A refused `Segments` call never
+/// reaches the store's handler.
 #[tokio::test]
 async fn every_method_refuses_an_unexpected_role_over_mutual_tls() {
     let pki = Pki::new();
@@ -506,15 +501,13 @@ async fn every_method_refuses_an_unexpected_role_over_mutual_tls() {
     assert!(mem.blobs.lock().expect("lock").contains_key(&sha(b"x")));
 }
 
-/// Catches the role read from a certificate of the presented chain other than the leaf
-/// (the last, or any of them): a peer holding a frontend key could append a daemon's
-/// public certificate after its own and write segments as a daemon. Over real mutual
+/// The role is read from the leaf of the presented chain alone: a peer holding a frontend
+/// key cannot append a daemon's public certificate after its own and write segments as a
+/// daemon. Over real mutual
 /// TLS, chains of two certificates from the same CA: frontend first, daemon second, is
 /// refused PERMISSION_DENIED on `Segments` (daemon only); daemon first, frontend
 /// second, is refused on `ActionStore.Get` (frontend only) and gets past the check on
 /// `Segments`.
-///
-/// Catches: `chain.first()` read as `chain.last()` in `Admission::guard`.
 #[tokio::test]
 async fn the_role_is_read_from_the_leaf_certificate_alone() {
     let pki = Pki::new();
@@ -544,7 +537,7 @@ async fn the_role_is_read_from_the_leaf_certificate_alone() {
     assert!(!refused(&answer), "daemon leaf on Segments: {answer:?}");
 }
 
-/// Catches `Daemon` among the roles of `ActionStore.Prepare` and `ActionStore.Commit`.
+/// `Daemon` is not among the roles of `ActionStore.Prepare` and `ActionStore.Commit`.
 /// `Writer` is a field of the request body, so the certificate's role is what decides who
 /// may write the action cache. Over real mutual TLS, a daemon's `Prepare` and a complete
 /// `Commit` are refused PERMISSION_DENIED and the store holds no entry afterwards; a

@@ -73,10 +73,9 @@ async fn settled_told(farm: &Farm, node: usize, digest: &Digest) -> bool {
     false
 }
 
-/// Catches a debt settled before its copy is made, or a copy never made: with the replica
-/// unreachable, the pass leaves the debt and nothing is sent; once it is back, the pass
-/// makes the copy (the same bytes), settles the debt, and tells the frontend; the next pass
-/// has nothing to do. Catches: the debt settled whatever happened; the copy not sent.
+/// A debt is settled only after its copy is made: with the replica unreachable, the pass
+/// leaves the debt and nothing is sent; once it is back, the pass makes the copy (the
+/// same bytes), settles the debt, and tells the frontend; the next pass has nothing to do.
 #[tokio::test]
 async fn the_copy_is_made_when_the_replica_returns() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -113,13 +112,11 @@ async fn the_copy_is_made_when_the_replica_returns() {
     assert_eq!(repairs.pass().await, Pass::default());
 }
 
-/// Catches a count that is not the journal. The frontend's under-replicated number is the
-/// sum of what each node reports, so a node must report exactly the copies it owes: a write
-/// answered with one copy is 1 once it has finished (the writes in flight are not the
-/// debts: none is in flight now), only on the node that holds the blob, still 1 after a
-/// restart (the journal is read when it is opened), and 0 once the worker has made the copy.
-/// Catches: the count taken from the writes in flight; the replica counted too; the count
-/// kept at 1 after the debt is settled; the count of a reopened journal 0.
+/// A node reports the copies it owes, which is the journal. The frontend's
+/// under-replicated number is the sum of what each node reports: a write answered with
+/// one copy is 1 once it has finished (the writes in flight are not the debts: none is in
+/// flight now), only on the node that holds the blob, still 1 after a restart (the
+/// journal is read when it is opened), and 0 once the worker has made the copy.
 #[tokio::test]
 async fn the_count_a_node_reports_is_the_copies_it_owes() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -152,10 +149,9 @@ async fn the_count_a_node_reports_is_the_copies_it_owes() {
     assert_eq!(farm.nodes[0].repairs.open_debt_count(), 0);
 }
 
-/// Catches a blob sent to an owner that already has it, and a read of the store for it:
-/// the replica gets the blob by other means (a copy sent to it directly) while the debt
-/// stands; the pass asks it, finds it there, and settles without reading the blob.
-/// Catches: the question skipped.
+/// An owner that already holds the blob is asked, not sent it: the replica gets the blob
+/// by other means (a copy sent to it directly) while the debt stands; the pass asks it,
+/// finds it there, and settles without reading the blob.
 #[tokio::test]
 async fn an_owner_that_already_holds_the_blob_is_asked_not_sent_it() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -178,9 +174,8 @@ async fn an_owner_that_already_holds_the_blob_is_asked_not_sent_it() {
     assert!(owed_digests(&farm, 0).is_empty());
 }
 
-/// Catches a down owner called, or a debt settled against it: named down in the map, the
-/// owner is not contacted (no stream opened on it), the debt stays, and when the map
-/// names it up again the copy is made.
+/// An owner named down in the map is not contacted (no stream opened on it) and the debt
+/// stays; when the map names it up again the copy is made.
 #[tokio::test]
 async fn a_down_owner_is_waited_for() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -207,7 +202,7 @@ async fn a_down_owner_is_waited_for() {
     assert!(held(&farm, 1, &digest));
 }
 
-/// Catches a repair aimed at the owner the record names instead of the owners now: the
+/// A repair goes to the owners the map names now, not the owner the record names: the
 /// replica of a debt is drained while it stands, so its slot goes to the third node, which
 /// gets the copy and the debt is settled; and when this node is itself no longer an
 /// owner, both owners get the copy before the debt is settled.
@@ -255,8 +250,7 @@ async fn the_copy_goes_to_the_owners_the_map_names_now() {
     assert!(held(&farm, 1, &digest) && held(&farm, 2, &digest));
 }
 
-/// Catches a debt kept for a blob that is gone, or a copy invented for it: the blob
-/// is no longer in the store, so the debt is dropped and nothing is sent.
+/// When the blob is no longer in the store, the debt is dropped and nothing is sent.
 #[tokio::test]
 async fn a_blob_no_longer_held_is_dropped_not_sent() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -279,9 +273,9 @@ async fn a_blob_no_longer_held_is_dropped_not_sent() {
     assert!(owed_digests(&farm, 0).is_empty());
 }
 
-/// Catches a failure taken for a copy made: the node's own store failing to read, an owner
-/// that refuses the copy part way (its store fails; a map newer than this node's), and a
-/// node with no map: the debt stays owed.
+/// The debt stays owed on a failure: the node's own store failing to read, an owner that
+/// refuses the copy part way (its store fails; a map newer than this node's), and a node
+/// with no map.
 #[tokio::test]
 async fn a_failure_leaves_the_debt_owed() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -351,7 +345,7 @@ async fn a_failure_leaves_the_debt_owed() {
     assert!(held(&farm, 1, &digest));
 }
 
-/// Catches an owner at an address that cannot be dialled settled for: the debt waits.
+/// A debt whose owner is at an address that cannot be dialled waits and is not settled.
 #[tokio::test]
 async fn an_owner_that_cannot_be_dialled_is_waited_for() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -387,9 +381,8 @@ async fn an_owner_that_cannot_be_dialled_is_waited_for() {
     assert_eq!(owed_digests(&farm, 0), [digest]);
 }
 
-/// Catches a settle that fails taken for success: the copy is made but the journal cannot
-/// write the settled frame, so the pass reports the debt as still owed (and so does the
-/// journal); the debt is not forgotten.
+/// When the copy is made but the journal cannot write the settled frame, the pass reports
+/// the debt as still owed (and so does the journal); the debt is not forgotten.
 #[tokio::test]
 async fn a_debt_whose_settling_cannot_be_written_stays_owed() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -408,9 +401,9 @@ async fn a_debt_whose_settling_cannot_be_written_stays_owed() {
     assert!(held(&farm, 1, &digest));
 }
 
-/// Catches debts lost to a restart: the primary's process dies and the machine loses power
-/// with a debt owed; a new node over the same disk and store reads the journal, and its
-/// worker makes the copy.
+/// A debt survives a restart: the primary's process dies and the machine loses power with
+/// a debt owed; a new node over the same disk and store reads the journal, and its worker
+/// makes the copy.
 #[tokio::test]
 async fn a_restarted_primary_repairs_what_it_owed() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -447,7 +440,7 @@ async fn a_restarted_primary_repairs_what_it_owed() {
     assert!(held(&farm, 1, &digest));
 }
 
-/// Catches repairs without a bound: six debts and a replica that holds every append; with a
+/// Repairs are bounded: with six debts, a replica that holds every append and a
 /// concurrency of two, no more than two copies are begun, and when it is released all six
 /// are made.
 #[tokio::test]
@@ -491,8 +484,7 @@ async fn at_most_the_concurrency_is_repaired_at_once() {
     }
 }
 
-/// Catches a default that would repair nothing, or everything at once: a pass every few
-/// seconds, a few blobs at a time.
+/// By default the worker runs a pass every few seconds and repairs a few blobs at a time.
 #[test]
 fn the_default_pace_is_a_few_blobs_every_few_seconds() {
     let pace = RepairConfig::default();
@@ -501,8 +493,8 @@ fn the_default_pace_is_a_few_blobs_every_few_seconds() {
     assert_eq!(pace.probe, Duration::from_secs(10));
 }
 
-/// Catches a worker that never runs on its own, or that does not tell the frontend what is
-/// owed when it starts: `run` announces the debts (the frontend is told of the record
+/// The worker runs on its own and tells the frontend what is owed when it starts: `run`
+/// announces the debts (the frontend is told of the record
 /// again, besides the first time), repairs on its ticks once the replica is back, and
 /// returns when told to stop.
 #[tokio::test]
@@ -573,12 +565,12 @@ async fn an_owner_killed_mid_build_is_repaired_when_it_returns() {
     }
 }
 
-/// Catches a debt settled as "evicted" while its write is still committing: the replica is
+/// A debt is not settled as "evicted" while its write is still committing: the replica is
 /// cut, the primary's commit is held, so the debt is journalled (the write is not yet
 /// answered) and the blob is not yet present here. A pass in that window reads NotFound, and
 /// must leave the debt owed; once the commit is released the write is answered, the blob is
 /// present with one copy, the debt is still owed, and the next pass (the replica back) makes
-/// the second copy. Catches: NotFound settles whatever is in flight.
+/// the second copy.
 #[tokio::test]
 async fn a_debt_is_not_settled_while_its_write_is_committing() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -713,10 +705,10 @@ impl Storage for CommitsAfterTheRead {
     }
 }
 
-/// Catches a storage that does not report closures (any [`Storage`] that only has
-/// `action_result`) answering a hit without its result or digest, or an empty closure that
-/// would pass for a real one: the default `action_entry` is the result with `closure:
-/// None` ("unchecked"), and a miss stays a miss.
+/// A storage that does not report closures (any [`Storage`] that only has
+/// `action_result`) answers a hit with its result and digest and no closure: the default
+/// `action_entry` is the result with `closure: None` ("unchecked"), and a miss stays a
+/// miss.
 #[tokio::test]
 async fn a_storage_without_its_own_action_entry_reports_no_closure() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -751,13 +743,13 @@ async fn a_storage_without_its_own_action_entry_reports_no_closure() {
     assert!(none.is_none());
 }
 
-/// Catches a debt dropped for an absent blob that is present by the time it is dropped: the
-/// write journals its debt (the replica is cut) with its commit held; the worker's pass has
+/// A debt is not dropped for a blob read as absent that is present by the time the debt
+/// would be dropped: the write journals its debt (the replica is cut) with its commit
+/// held; the worker's pass has
 /// begun counting the write (it began before the pass read `begun`, so the count is
 /// unchanged), asked the replica, and read NotFound locally; then the write commits and
 /// drops its in-flight mark; then the pass settles. The blob is held with one copy, so the
-/// debt must stay, and the next pass makes the copy. Catches: `settle_evicted` without the
-/// look at the store after the in-flight test.
+/// debt must stay, and the next pass makes the copy.
 #[tokio::test]
 async fn a_debt_is_not_dropped_for_a_blob_committed_after_the_worker_read_it_absent() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -812,8 +804,8 @@ async fn a_debt_is_not_dropped_for_a_blob_committed_after_the_worker_read_it_abs
     assert!(held(&farm, 1, &digest));
 }
 
-/// Catches a debt kept for a blob this node never came to hold: the replica is cut and the
-/// primary's commit fails, so the write fails after its debt was journalled. The blob is
+/// A write whose commit fails leaves no debt: the replica is cut and the primary's commit
+/// fails, so the write fails after its debt was journalled. The blob is
 /// not here and not in flight any more, so the next pass drops the debt (there is nothing
 /// to copy) and sends nothing.
 #[tokio::test]
@@ -849,10 +841,9 @@ async fn a_write_whose_commit_fails_leaves_no_debt() {
     assert_eq!(farm.nodes[1].mem.knobs.begun.load(Ordering::SeqCst), 0);
 }
 
-/// Catches a pass that waits for ever on an owner that is up and does not answer: the
-/// owner's durable `FindMissing` hangs, so the pass ends at the probe bound with the debt owed, and
-/// a pass over the owner answering again settles it. (A hang deadline, not a speed.)
-/// Catches: the question asked without the bound.
+/// A pass does not wait for ever on an owner that is up and does not answer: the owner's
+/// durable `FindMissing` hangs, so the pass ends at the probe bound with the debt owed,
+/// and a pass over the owner answering again settles it. (A hang deadline, not a speed.)
 #[tokio::test]
 async fn an_owner_that_does_not_answer_is_waited_for_not_hung_on() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -898,9 +889,8 @@ async fn an_owner_that_does_not_answer_is_waited_for_not_hung_on() {
     assert!(held(&farm, 1, &digest));
 }
 
-/// Catches a worker that cannot be stopped while a pass is stuck: the owner's durable
-/// `FindMissing` hangs and the probe bound is an hour, so only the stop can end `run`, and it does.
-/// Catches: `stop` polled only between passes.
+/// The worker can be stopped while a pass is stuck: the owner's durable `FindMissing`
+/// hangs and the probe bound is an hour, so only the stop can end `run`, and it does.
 #[tokio::test]
 async fn run_stops_in_the_middle_of_a_stuck_pass() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -968,8 +958,8 @@ fn in_ram_only(farm: &Farm, node: usize, digest: &Digest) -> bool {
         .contains(digest)
 }
 
-/// Catches a debt settled against a peer that holds the blob only in RAM (T12): the peer
-/// has it in RAM and not on its disk, so the worker's probe (`kbf-durable: only`) says it
+/// A peer that holds the blob only in RAM (T12) does not settle the debt: the peer has it
+/// in RAM and not on its disk, so the worker's probe (`kbf-durable: only`) says it
 /// is missing, the copy is sent, the peer (a copy asks for a durable one) writes it, and
 /// only then is the debt settled, the blob now on the peer's disk.
 #[tokio::test]
@@ -995,7 +985,7 @@ async fn a_peer_holding_the_blob_only_in_ram_is_given_the_copy_before_the_debt_i
     assert_eq!(farm.nodes[1].mem.knobs.begun.load(Ordering::SeqCst), 1);
 }
 
-/// Catches a debt settled on the peer's RAM copy when the copy it was sent cannot be
+/// A debt is not settled on the peer's RAM copy when the copy sent to it cannot be
 /// written: the peer holds the blob in RAM only and its disk refuses the write, so the
 /// pass leaves the debt owed (the peer is still not durable); with the disk back the next
 /// pass settles it and the blob is on the peer's disk.

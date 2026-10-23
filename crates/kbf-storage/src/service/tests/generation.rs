@@ -19,11 +19,10 @@ use super::fake::{Mem, pair, serve_odd, serve_spied, sha};
 use super::upload_name;
 use crate::{Storage, StorageError};
 
-/// Catches a STALE_MAP the client does not recognise (it would be retried as an outage,
-/// against the same stale owners), one it recognises from the code alone (any
-/// FAILED_PRECONDITION, such as a refused action-cache write, would send the caller to
-/// refetch the map), one it reads without checking the code, and a generation it
-/// misreads.
+/// A FAILED_PRECONDITION status carrying a numeric generation entry is lifted to
+/// `StaleMap` with the node's generation; the same words without the entry, an entry that
+/// is not a generation, and another code are not a stale map (a refused action-cache write
+/// is also FAILED_PRECONDITION and must not send the caller to refetch the map).
 #[test]
 fn a_stale_map_status_is_lifted_with_the_nodes_generation() {
     use super::super::client::lift;
@@ -54,8 +53,8 @@ fn a_stale_map_status_is_lifted_with_the_nodes_generation() {
     }
 }
 
-/// Catches a STALE_MAP that does not cross the wire as itself: over a real connection a
-/// node's answer reaches the caller as `StaleMap` with the generation, on a blob call
+/// A STALE_MAP crosses the wire as itself: over a real connection a node's answer reaches
+/// the caller as `StaleMap` with the generation, on a blob call
 /// and on an action-cache call, and is not NOT_FOUND, an outage or a refusal.
 #[tokio::test]
 async fn a_stale_map_crosses_the_wire() {
@@ -75,8 +74,8 @@ async fn a_stale_map_crosses_the_wire() {
     }
 }
 
-/// Catches `Segments` calls dropped, answered locally, or sent without the map
-/// generation: all five reach the store's own handlers, each carrying generation 5.
+/// `Segments` calls are forwarded with the map generation: all five reach the store's own
+/// handlers, each carrying generation 5.
 #[tokio::test]
 async fn segments_are_forwarded_with_the_map_generation() {
     let (mem, remote, _) = pair().await;
@@ -113,8 +112,8 @@ async fn segments_are_forwarded_with_the_map_generation() {
     assert_eq!(seen, expected);
 }
 
-/// Catches a map generation that cannot change after the client is built, or that does
-/// not reach every call: the header arrives at the server on every service the client
+/// The map generation can change after the client is built and reaches every call: the
+/// header arrives at the server on every service the client
 /// calls (FindMissing, ByteStream Read and Write, the action store, all five Segments
 /// calls), as 5 for the first of each and as 6 for each after `set_map_generation`,
 /// whichever clone made the update. (`RemoteStorage` makes no `QueryWriteStatus` call;
@@ -211,8 +210,8 @@ async fn the_map_generation_reaches_every_service_and_can_be_updated() {
     assert_eq!(second, want);
 }
 
-/// Catches an action-store call that keeps the generation the client was built with:
-/// the message's field, which section 6's STALE_MAP reads, is the updated one on `Get`,
+/// An updated generation reaches the action-store calls: the message's field, which
+/// section 6's STALE_MAP reads, is the updated one on `Get`,
 /// `Prepare` and `Commit`, and is the one the header carries (see above).
 #[tokio::test]
 async fn an_updated_generation_is_in_the_action_store_field() {

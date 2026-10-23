@@ -107,13 +107,12 @@ fn payload(pair: &Pair) -> Vec<u8> {
         .expect("a payload")
 }
 
-/// Catches a storage-to-storage call that does not authenticate as a storage node: the
-/// primary's copy reaches the replica with the primary's certificate (role `storage`,
-/// clientAuth and serverAuth on the one certificate) and is admitted, so both nodes hold the
-/// blob; the writer is a frontend. With the primary calling its peer under a `daemon`
-/// certificate, the replica refuses the copy (a daemon may not send one), the write fails
-/// and neither node holds the blob. Catches: `WriteLeg` open to every role; the leg sent
-/// without the primary's certificate.
+/// A storage-to-storage call authenticates as a storage node: the primary's copy reaches
+/// the replica with the primary's certificate (role `storage`, clientAuth and serverAuth
+/// on the one certificate) and is admitted, so both nodes hold the blob; the writer is a
+/// frontend. With the primary calling its peer under a `daemon` certificate, the replica
+/// refuses the copy (a daemon may not send one), the write fails and neither node holds
+/// the blob.
 #[tokio::test]
 async fn a_copy_is_admitted_only_from_a_storage_certificate() {
     let pki = Pki::new();

@@ -84,12 +84,9 @@ fn messages(
         .collect()
 }
 
-/// Catches: a streamed `Write` (the store takes bytes as they arrive) that holds the blob
-/// instead of a few messages (a collected body, a queue that grows: peak near 20 MiB), a
-/// message not counted (peak 0), and bytes not given back (current above 0 after).
-///
-/// Catches: the pieces of `receive` collected before staging; `counted` removed from
-/// `receive`; the guard of the counted bytes leaked.
+/// A streamed `Write` (the store takes bytes as they arrive) holds a few messages, not
+/// the blob (peak between one message and 4 MiB for a 20 MiB blob), counts the message in
+/// hand, and gives every byte back (current 0 after).
 #[tokio::test]
 async fn a_streamed_write_holds_a_few_messages_and_gives_them_back() {
     let Some(_turn) = turn().await else {
@@ -116,9 +113,9 @@ async fn a_streamed_write_holds_a_few_messages_and_gives_them_back() {
     given_back("after the write").await;
 }
 
-/// Catches: a buffered write (the store cannot stream, the blob is at most
-/// `STREAM_FROM_BYTES`) whose receive buffer is not counted at the size it is allocated
-/// at, or is given back before the store has the blob, or never.
+/// A buffered write (the store cannot stream, the blob is at most `STREAM_FROM_BYTES`)
+/// counts its receive buffer at the size it is allocated at, keeps it counted while the
+/// store holds the blob, and gives it back afterwards.
 #[tokio::test]
 async fn a_buffered_write_holds_its_blob_and_gives_it_back() {
     let Some(_turn) = turn().await else {
@@ -146,11 +143,8 @@ async fn a_buffered_write_holds_its_blob_and_gives_it_back() {
     given_back("after the write").await;
 }
 
-/// Catches: a blob over `STREAM_FROM_BYTES` on a store that cannot stream held whole
-/// (peak at the blob's size) instead of passed on a message at a time, and its messages
-/// not counted.
-///
-/// Catches: the pieces of `pieces` collected before `put_streamed`.
+/// A blob over `STREAM_FROM_BYTES` on a store that cannot stream is passed on a message at
+/// a time through `put_streamed`, not held whole, and its messages are counted.
 #[tokio::test]
 async fn a_large_buffered_write_is_passed_on_a_message_at_a_time() {
     let Some(_turn) = turn().await else {
@@ -179,9 +173,9 @@ async fn a_large_buffered_write_is_passed_on_a_message_at_a_time() {
     given_back("after the write").await;
 }
 
-/// Catches: bytes left counted by a write that failed or whose sender went away, on each
-/// of the three paths: a digest that is not the bytes', a sender that stops after some
-/// messages and a buffer allocated for a blob that never comes.
+/// A write that failed or whose sender went away leaves no bytes counted, on each of the
+/// paths: a digest that is not the bytes', a sender that stops after some messages and a
+/// buffer allocated for a blob that never comes.
 #[tokio::test]
 async fn a_write_that_fails_or_is_abandoned_gives_everything_back() {
     let Some(_turn) = turn().await else {
@@ -216,15 +210,11 @@ async fn a_write_that_fails_or_is_abandoned_gives_everything_back() {
     assert!(process().peak() >= MIB as u64);
 }
 
-/// Catches: a whole-blob read through a storage client (`RemoteStorage::read_blob`, what
-/// the proxy frontend reads a blob with) whose buffer is not counted (current 0 while the
-/// caller holds the blob), counted at the wrong size, or built twice: the chunks collected
-/// and then joined into a second whole-blob copy (the peak near twice the blob, where one
-/// buffer and a chunk or two reach the blob and a few MiB). Exact while the caller holds
-/// the blob, 0 once it is dropped.
-///
-/// Catches: the chunks collected and `concat`enated, as before; the joined `Bytes` made
-/// with `Bytes::from` (current 0); the buffer's hold made `hold(0)`.
+/// A whole-blob read through a storage client (`RemoteStorage::read_blob`, what the proxy
+/// frontend reads a blob with) counts its buffer once, at the blob's size, and builds it
+/// once: the peak is one buffer and a chunk or two (the blob and a few MiB), not two
+/// whole-blob copies. The count is exact while the caller holds the blob, 0 once it is
+/// dropped.
 #[tokio::test]
 async fn a_remote_whole_blob_read_is_held_once_and_given_back() {
     let Some(_turn) = turn().await else {

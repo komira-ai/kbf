@@ -180,9 +180,9 @@ impl FsFile for HookFile {
     }
 }
 
-/// Catches a panic in the journal's blocking call taken for success or for a journal error
-/// (it would then be told as "stopped" and so as a disk fault): the call fails INTERNAL, the
-/// debt is not recorded, and the debts already owed can still be read.
+/// A panic in the journal's blocking call is neither success nor a journal error (which
+/// would be told as "stopped", a disk fault): the call fails INTERNAL, the debt is not
+/// recorded, and the debts already owed can still be read.
 #[tokio::test]
 async fn a_panic_in_the_journal_fails_the_call_and_loses_no_debt() {
     let armed = Arc::new(AtomicBool::new(false));
@@ -219,20 +219,16 @@ async fn a_panic_in_the_journal_fails_the_call_and_loses_no_debt() {
     assert_eq!(repairs.open_records(), [record(1)]);
 }
 
-/// Catches a ledger that tells no one being asked for something: both of its reports return
-/// at once.
+/// The ledger that tells no one returns at once from both of its reports.
 #[tokio::test]
 async fn the_ledger_that_tells_no_one_returns_at_once() {
     NoLedger.owed(&record(1)).await;
     NoLedger.settled(&digest(1)).await;
 }
 
-/// Catches a debt dropped for an absent blob while a write of it is committing, or one that
-/// began owing after the worker looked: `settle_evicted` leaves the debt while a write of the
-/// digest is in flight (however many: two writes of the same blob, one finished), and when
-/// any write began owing since `begun` was read; with neither, it settles and the journal
-/// forgets it. Catches: the in-flight test removed; the `begun` comparison removed; the
-/// count of a digest's writes dropped to zero by the first.
+/// `settle_evicted` leaves the debt while a write of the digest is in flight (however
+/// many: two writes of the same blob, one finished), and when any write began owing since
+/// `begun` was read; with neither, it settles and the journal forgets the debt.
 #[tokio::test]
 async fn an_evicted_debt_is_dropped_only_when_no_write_is_in_its_window() {
     let store = Mem::default();
@@ -282,9 +278,8 @@ async fn an_evicted_debt_is_dropped_only_when_no_write_is_in_its_window() {
     assert_eq!(repairs.open_records(), [record(2)]);
 }
 
-/// Catches a write that fails to journal its debt leaving its blob marked in flight for ever
-/// (the worker would never look at the debt again): the journal fails, the call fails, and
-/// the digest is not in flight.
+/// When the journal fails to record a debt, the call fails and the digest is not marked
+/// in flight, so the worker is not kept from the debt for ever.
 #[tokio::test]
 async fn a_debt_that_could_not_be_journalled_is_not_in_flight() {
     let fs = FaultFs::new();
@@ -298,9 +293,9 @@ async fn a_debt_that_could_not_be_journalled_is_not_in_flight() {
     assert!(!repairs.is_in_flight(&digest(1)));
 }
 
-/// Catches an abandoned write (its task aborted between the debt and the commit) leaving its
-/// blob in flight: the `Pending` it held is dropped with it, so the worker may look at the
-/// debt again.
+/// A write abandoned between the debt and the commit (its task aborted) is no longer in
+/// flight: the `Pending` it held is dropped with it, so the worker may look at the debt
+/// again.
 #[tokio::test]
 async fn an_abandoned_write_is_no_longer_in_flight() {
     let repairs = Arc::new(
@@ -321,8 +316,8 @@ async fn an_abandoned_write_is_no_longer_in_flight() {
     assert!(!repairs.is_in_flight(&digest(3)));
 }
 
-/// Catches an evicted debt reported dropped when the journal could not write it: the call
-/// fails UNAVAILABLE and the debt is still owed.
+/// When the journal cannot write the settling of an evicted debt, the call fails
+/// UNAVAILABLE and the debt is still owed.
 #[tokio::test]
 async fn an_evicted_debt_whose_settling_cannot_be_written_stays_owed() {
     let fs = FaultFs::new();
@@ -339,10 +334,8 @@ async fn an_evicted_debt_whose_settling_cannot_be_written_stays_owed() {
     assert_eq!(repairs.open_records(), [record(1)]);
 }
 
-/// Catches a debt dropped for a blob the store holds (a write committed after the worker
-/// read it absent), and one dropped when the store could not say: with the blob held, or the
-/// store failing, `settle_evicted` leaves the debt; with the blob absent it drops it.
-/// Catches: the store not asked; its error read as "absent".
+/// With the blob held (a write committed after the worker read it absent), or the store
+/// failing, `settle_evicted` leaves the debt; with the blob absent it drops it.
 #[tokio::test]
 async fn an_evicted_debt_stays_while_the_store_holds_the_blob_or_cannot_say() {
     let repairs =
@@ -400,8 +393,8 @@ impl RepairLedger for Told {
     }
 }
 
-/// Catches a settle that is cancelled (the worker's stop) while its journal write is in
-/// progress releasing the gate with the write still to land. The gate is what keeps a new
+/// A settle cancelled (the worker's stop) while its journal write is in progress does not
+/// release the gate with the write still to land. The gate is what keeps a new
 /// degraded write's debt from being journalled between the settle's look and its write:
 /// a debt for a blob that is journalled and then erased by the late write is a blob with
 /// one copy and no debt. The write of `owed` for a blob already owed is a no-op, so the
@@ -413,9 +406,7 @@ impl RepairLedger for Told {
 /// after the new write's) needs a thread to be descheduled between two statements, which a
 /// test cannot arrange; this pins the property that rules it out, and the order of the two
 /// journal writes. The ledger is told the debt is settled all the same (the journal has
-/// forgotten it, so the frontend must not keep it). Catches: `settle_evicted` taking the
-/// gate as a guard that its own future owns (the gate is free once the future is dropped);
-/// the ledger told from the future after the journal call (never, when it is cancelled).
+/// forgotten it, so the frontend must not keep it).
 #[tokio::test]
 async fn a_settle_cancelled_mid_write_keeps_the_gate_until_the_write_lands() {
     let hold = Arc::new(Hold::default());
@@ -484,12 +475,11 @@ async fn a_settle_cancelled_mid_write_keeps_the_gate_until_the_write_lands() {
     assert_eq!(*ledger.settled.lock().expect("lock"), [digest(1)]);
 }
 
-/// Catches a store that never answers `find_missing` holding the gate for ever: every
-/// degraded write's `owe` waits for the gate, so one hung look at the store stalls them all.
-/// The look is bounded: `settle_evicted` answers UNAVAILABLE after the probe, the debt stays,
-/// and the gate is free (a write that owes goes through). The clock is paused: the probe is
-/// not waited out, and the outer bound is only there so that a look that is not bounded
-/// fails the test instead of hanging it. Catches: the look unbounded.
+/// A store that never answers `find_missing` does not hold the gate for ever, which would
+/// stall every degraded write's `owe`. The look is bounded: `settle_evicted` answers
+/// UNAVAILABLE after the probe, the debt stays, and the gate is free (a write that owes
+/// goes through). The clock is paused: the probe is not waited out, and the outer bound is
+/// only there so that a look that is not bounded fails the test instead of hanging it.
 #[tokio::test(start_paused = true)]
 async fn an_evicted_debt_whose_store_does_not_answer_stays_and_frees_the_gate() {
     let repairs =
@@ -520,11 +510,10 @@ async fn an_evicted_debt_whose_store_does_not_answer_stays_and_frees_the_gate() 
     assert_eq!(repairs.open_records(), [record(1), record(2)]);
 }
 
-/// Catches a debt dropped for a blob this node still holds, in RAM only (T12): a blob a
-/// write acknowledged from RAM and the disk has not got yet is not evicted, and it is the
-/// only copy a peer's debt can be paid from. `settle_evicted` asks this node's store the
-/// plain question (held counts as present), so the debt stays; a blob the store holds
-/// nowhere is dropped, as before.
+/// A blob this node holds in RAM only (T12), acknowledged from RAM and not yet on disk,
+/// is not evicted and is the only copy a peer's debt can be paid from. `settle_evicted`
+/// asks this node's store the plain question (held counts as present), so the debt stays;
+/// a blob the store holds nowhere is dropped.
 #[tokio::test]
 async fn an_evicted_debt_for_a_blob_held_only_in_ram_is_not_dropped() {
     let repairs =

@@ -28,9 +28,7 @@ fn held_in(mem: &Mem, disk: &[u8], ram: &[u8]) -> (kbf_types::Digest, kbf_types:
     (disk, ram)
 }
 
-/// Catches a client that does not send the header (the node would answer the plain
-/// question, and a blob held in RAM would be reported durable), a node that ignores it,
-/// and one that answers the plain question for a request without it: over the wire,
+/// The header `kbf-durable: only` selects the durable question: over the wire,
 /// `find_durable` names the RAM-held blob and the absent one missing and reaches the
 /// store's `find_durable` once; `find_missing` names only the absent one and reaches
 /// `find_missing`; neither touches the other's counter.
@@ -61,7 +59,7 @@ async fn the_header_selects_the_durable_question_over_the_wire() {
     assert_eq!(mem.knobs.asked.load(Ordering::SeqCst), 1);
 }
 
-/// Catches a header value other than `only` or `wait` being taken as the plain or the
+/// A header value other than `only` or `wait` is refused, not taken as the plain or the
 /// durable question: a wrong-case `Wait`, an empty value and a value that is not text are
 /// each INVALID_ARGUMENT, and the store is asked nothing. The value `only` is answered.
 #[tokio::test]
@@ -106,10 +104,9 @@ async fn any_other_value_of_the_header_is_refused() {
     assert_eq!(mem.durable_asked.load(Ordering::SeqCst), 1);
 }
 
-/// Catches an in-process call that goes around the durable question (it would answer the
-/// plain one, which counts a RAM-held blob present) and one that skips the catching-up
-/// rule: in-process, `find_durable` answers as the wire does, and while the node is
-/// catching up a durable answer with a digest missing is UNAVAILABLE, as the plain one is
+/// The durable question is judged as the plain one is, in process and while catching up:
+/// in-process, `find_durable` answers as the wire does, and while the node is catching up
+/// a durable answer with a digest missing is UNAVAILABLE, as the plain one is
 /// (an answer that left out only the missing ones would tell the caller they are held),
 /// over the wire and in process; a durable answer with nothing missing is served.
 #[tokio::test]
@@ -220,10 +217,9 @@ impl Storage for Plain {
     }
 }
 
-/// Catches a `find_durable` of such a storage that answers something other than the storage's own
-/// `find_missing` (a storage with nothing in RAM is durable wherever it is present), or
-/// reaches the store another way: it names the absent digest missing and
-/// the present one not, through `find_missing` alone.
+/// For a storage with nothing in RAM, which is durable wherever it is present,
+/// `find_durable` is the storage's own `find_missing`: it names the absent digest missing
+/// and the present one not, through `find_missing` alone.
 #[tokio::test]
 async fn a_storage_with_nothing_in_ram_answers_the_durable_question_as_the_plain_one() {
     let mem = Arc::new(Mem::default());
@@ -239,9 +235,9 @@ async fn a_storage_with_nothing_in_ram_answers_the_durable_question_as_the_plain
     assert_eq!(mem.durable_asked.load(Ordering::SeqCst), 0);
 }
 
-/// Catches `kbf-durable: wait` answered as `only` (the node would not wait for its held
-/// blobs), a client that does not send it, and one that sends it for the other questions:
-/// over the wire and in process, `find_durable_waiting` names the RAM-held blob and the
+/// `kbf-durable: wait` selects the waiting question, which is not answered as `only`, and
+/// the client sends it for that question alone: over the wire and in process,
+/// `find_durable_waiting` names the RAM-held blob and the
 /// absent one missing and reaches the store's `find_durable_waiting` once, and neither
 /// `find_durable` nor `find_missing`; the other two questions do not reach it. While the
 /// node is catching up a waiting answer with a digest missing is UNAVAILABLE as the others
@@ -316,10 +312,8 @@ async fn the_wait_header_selects_the_waiting_question_over_the_wire_and_in_proce
     }
 }
 
-/// Catches a storage that does not say how to wait answering a waiting question with the
-/// plain answer (it would count a RAM-held blob present): the default
-/// `find_durable_waiting` is the storage's `find_durable`, so a RAM-held blob is missing
-/// and nothing waits.
+/// For a storage that does not say how to wait, the default `find_durable_waiting` is the
+/// storage's `find_durable`, so a RAM-held blob is missing and nothing waits.
 #[tokio::test]
 async fn a_storage_that_does_not_wait_answers_a_waiting_question_as_the_durable_one() {
     let mem = Arc::new(Mem::default());

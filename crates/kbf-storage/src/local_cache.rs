@@ -111,10 +111,8 @@ mod tests {
 
     use super::{Fill, LocalCache};
 
-    /// Catches a fill that counts one half twice or leaves one out, a half read before
-    /// it attached as anything but 0, and a second attach replacing the first (a second
-    /// input cache on the same node would then take over the budget): the first
-    /// attach of each side wins and the fill is their sum, read live.
+    /// A half read before it attaches counts as 0; the first attach of each side wins over
+    /// a later one, and the fill is the sum of the two halves, read live.
     #[test]
     fn the_fill_is_each_half_once_and_the_first_attach_wins() {
         let cache = LocalCache::new();

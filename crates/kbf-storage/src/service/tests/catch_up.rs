@@ -47,14 +47,11 @@ fn store() -> (Arc<Mem>, Digest, Digest) {
     (mem, held, sha(b"in cold storage, not yet indexed"))
 }
 
-/// Catches a node that, while it rebuilds its index, tells a caller a blob it may hold is
-/// missing: a Read of it must be UNAVAILABLE (the gRPC code, and `Unavailable` through the
+/// While a node rebuilds its index it does not tell a caller that a blob it may hold is
+/// missing: a Read of it is UNAVAILABLE (the gRPC code, and `Unavailable` through the
 /// client a router uses), never NOT_FOUND; a FindMissingBlobs naming it beside a held blob
-/// must fail as a whole, UNAVAILABLE; an action-cache miss is UNAVAILABLE too. Catches:
-/// the gate removed (NOT_FOUND, a missing list, a `None` entry come back); a gate that
-/// drops only the missed digests from the FindMissing answer (an empty list comes back,
-/// which tells the caller the blob is held); the gate read after the lookup is not caught
-/// here (no rebuild finishes mid-call) but by the module docs' argument.
+/// fails as a whole, UNAVAILABLE, rather than answering with an empty list; an
+/// action-cache miss is UNAVAILABLE too.
 #[tokio::test]
 async fn no_false_miss_during_catch_up() {
     let (mem, held, unindexed) = store();
@@ -83,12 +80,11 @@ async fn no_false_miss_during_catch_up() {
     assert!(unavailable(&action), "an action-cache miss: {action:?}");
 }
 
-/// Catches an action-cache write, while the node rebuilds its index, refused for a
-/// closure blob the node did not find as if the blob were missing: Prepare and Commit
-/// must answer UNAVAILABLE (a caller retries) and never the Absent refusal (which a caller
-/// acts on by uploading, or gives up with FAILED_PRECONDITION). Refusals that are not
-/// about a blob's absence stand: Unreachable and NotDaemon are still refusals. Catches:
-/// the refusal passed through unchanged (FAILED_PRECONDITION / Absent leaks).
+/// While the node rebuilds its index, an action-cache write for a closure blob the node
+/// did not find is not refused as if the blob were missing: Prepare and Commit answer
+/// UNAVAILABLE (a caller retries) and never the Absent refusal (which a caller acts on by
+/// uploading, or gives up with FAILED_PRECONDITION). Refusals that are not about a blob's
+/// absence stand: Unreachable and NotDaemon are still refusals.
 #[tokio::test]
 async fn a_closure_write_during_catch_up_is_retryable() {
     let (mem, _, _) = store();
@@ -137,10 +133,9 @@ async fn a_closure_write_during_catch_up_is_retryable() {
     );
 }
 
-/// Catches a gate that refuses more than misses: while the node rebuilds, a held blob
-/// reads back whole, a FindMissing of held blobs answers none missing, a new blob is
-/// written and reads back, and an action-cache entry is written (Prepare, Commit) and
-/// read. Catches: every call refused while catching up.
+/// The gate refuses only misses: while the node rebuilds, a held blob reads back whole, a
+/// FindMissing of held blobs answers none missing, a new blob is written and reads back,
+/// and an action-cache entry is written (Prepare, Commit) and read.
 #[tokio::test]
 async fn hits_and_writes_are_served_while_catching_up() {
     let (mem, held, _) = store();
@@ -180,11 +175,10 @@ async fn hits_and_writes_are_served_while_catching_up() {
     assert_eq!(digest, record.result);
 }
 
-/// Catches a gate that outlives the rebuild: after [`CatchUp::finish`] a true miss is the
-/// store's answer again: NOT_FOUND for a read, the digest in the FindMissing answer, no
-/// entry for an action-cache miss, and the Absent refusal for a closure blob. The same
-/// calls are refused UNAVAILABLE first, so the test sees the gate lift. Catches: misses
-/// answered UNAVAILABLE whatever the state.
+/// After [`CatchUp::finish`] a true miss is the store's answer again: NOT_FOUND for a
+/// read, the digest in the FindMissing answer, no entry for an action-cache miss, and the
+/// Absent refusal for a closure blob. The same calls are refused UNAVAILABLE first, so the
+/// test sees the gate lift.
 #[tokio::test]
 async fn catch_up_done_lifts_the_gate() {
     let (mem, held, unindexed) = store();
@@ -221,8 +215,8 @@ async fn catch_up_done_lifts_the_gate() {
     );
 }
 
-/// Catches a service given no catch-up state, or one caught up from the start, that
-/// gates anyway: a miss is NOT_FOUND at once.
+/// A service given no catch-up state, or one caught up from the start, does not gate: a
+/// miss is NOT_FOUND at once.
 #[tokio::test]
 async fn a_node_caught_up_from_the_start_answers_misses() {
     let (mem, _, unindexed) = store();
@@ -233,11 +227,9 @@ async fn a_node_caught_up_from_the_start_answers_misses() {
     ));
 }
 
-/// Catches a `finished` that never returns once the rebuild is done (it waits for a
-/// notification sent before it registered: the flag read before the waiter is
-/// registered), or that returns while the rebuild is still going: a waiter that began
-/// before `finish` and one that began after both complete; a caught-up state completes
-/// at once. The hang guard is generous and asserts nothing about speed.
+/// `finished` returns once the rebuild is done, and only then: a waiter that began before
+/// `finish` and one that began after both complete; a caught-up state completes at once.
+/// The hang guard is generous and asserts nothing about speed.
 #[tokio::test]
 async fn finished_completes_once_and_only_once_the_rebuild_is_done() {
     const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
