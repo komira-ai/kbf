@@ -2,24 +2,27 @@
 //! kbf makes (`setup`, flag `--create-local-database`; docs/deploy/kbf-installer-setup.md,
 //! "The state database").
 //!
-//! With the flag, on a host whose Postgres runs locally, `setup` asks the server as its
-//! superuser and makes what is missing: a login role with no password and no privilege, and a
-//! database owned by it. The superuser is reached the way Postgres means it to be on the
-//! host: `psql` run as the operating-system user `postgres` over the Unix socket, peer
+//! With the flag, or on a mode that keeps its state in Postgres when `--database` is not given
+//! (then the URL is the local default), on a host whose Postgres runs locally, `setup` asks the
+//! server as its superuser and makes what is missing: a login role with no password and no
+//! privilege, and a database owned by it. The superuser is reached the way Postgres means it to
+//! be on the host: `psql` run as the operating-system user `postgres` over the Unix socket, peer
 //! authentication, no password anywhere. `setup` alters nothing that exists: a role that
 //! cannot log in or holds a privilege (superuser, CREATEROLE, CREATEDB, REPLICATION,
-//! BYPASSRLS), and a database another role owns, are refused. It never
-//! edits `pg_hba.conf` or `pg_ident.conf`; it tries the logins and, when the server refuses
-//! one, says which rule is missing.
+//! BYPASSRLS), and a database another role owns, are refused, and a rerun finds both there and
+//! makes nothing. A host without `psql` or a running server is refused with the command that
+//! installs one. It never edits `pg_hba.conf` or `pg_ident.conf`; it prints the lines the
+//! logins need ([`access_lines`]), tries the logins and, when the server refuses one, says
+//! which rule is missing.
 //!
 //! Every message, every printed step and every refusal is free of the URL, the role, the
-//! database and the socket directory: they travel to `psql` in its environment and in
-//! `\set` lines on its standard input, neither of which a step prints, and the tool's own
-//! words (which quote them) are dropped.
+//! database and the socket directory (but for [`access_lines`], which is for the operator to
+//! copy): they travel to `psql` in its environment and in `\set` lines on its standard input,
+//! neither of which a step prints, and the tool's own words (which quote them) are dropped.
 
 use std::io::Write;
 
-use kbf_host::{Cmd, Exec, HostPath, RunUser, Step};
+use kbf_host::{Cmd, Entry, Exec, HostPath, RunUser, Step};
 use kbf_state::postgres::Unreached;
 
 use super::SetupError;
@@ -36,6 +39,19 @@ pub const PSQL: &str = "/usr/bin/psql";
 pub const SUPERUSER: &str = "postgres";
 /// Where the recipe is written down.
 const DOCS: &str = "docs/deploy/kbf-installer-setup.md, \"The state database\"";
+/// Where a distribution says which family it is of, and the fallback (os-release(5)); on
+/// Debian, Ubuntu and Fedora the first is a link to the second.
+const OS_RELEASE: [&str; 2] = ["/etc/os-release", "/usr/lib/os-release"];
+/// What installs a Postgres server and client on Debian and Ubuntu.
+const INSTALL_APT: &str = "apt install postgresql";
+/// What installs them on Fedora and its relatives, where the data directory is made by hand.
+const INSTALL_DNF: &str = "dnf install postgresql-server, then postgresql-setup --initdb and systemctl enable --now postgresql";
+/// The `ID` and `ID_LIKE` words of the distributions that install with `apt`.
+const DEBIAN: [&str; 2] = ["debian", "ubuntu"];
+/// The `ID` and `ID_LIKE` words of the distributions that install with `dnf`.
+const FEDORA: [&str; 3] = ["fedora", "rhel", "centos"];
+/// Both, for a host that says nothing of its family.
+const INSTALL_EITHER: &str = "apt install postgresql on Debian or Ubuntu; dnf install postgresql-server, then postgresql-setup --initdb and systemctl enable --now postgresql on Fedora";
 
 /// Every psql here: no startup file, no prompts, bare values, and the first error stops it.
 const PSQL_ARGS: [&str; 5] = ["-X", "-q", "-A", "-t", "-v"];
@@ -119,6 +135,61 @@ fn needs_operator(text: &str) -> SetupError {
     SetupError::NeedsOperator(text.to_owned())
 }
 
+/// The words of the `ID` and `ID_LIKE` lines of an os-release file: the families a distribution
+/// belongs to.
+fn families(release: &str) -> Vec<&str> {
+    release
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(key, _)| matches!(*key, "ID" | "ID_LIKE"))
+        .flat_map(|(_, value)| value.trim_matches('"').split_whitespace())
+        .collect()
+}
+
+/// What installs a Postgres server and client on this host, from the family the first file of
+/// [`OS_RELEASE`] that is a file names (a link is not followed, so the fallback is read when the
+/// first is one); both commands when neither is a file, or the family is not known.
+fn install_command(exec: &dyn Exec) -> &'static str {
+    let found = OS_RELEASE.iter().find_map(|path| {
+        let entry = HostPath::new(path)
+            .ok()
+            .and_then(|path| exec.inspect(&path).ok().flatten());
+        match entry {
+            Some(Entry::File { bytes, .. }) => Some(bytes),
+            _ => None,
+        }
+    });
+    let Some(bytes) = found else {
+        return INSTALL_EITHER;
+    };
+    let release = String::from_utf8_lossy(&bytes);
+    let family = families(&release);
+    let is_of = |names: &[&str]| family.iter().any(|f| names.contains(f));
+    if is_of(&DEBIAN) {
+        INSTALL_APT
+    } else if is_of(&FEDORA) {
+        INSTALL_DNF
+    } else {
+        INSTALL_EITHER
+    }
+}
+
+/// What the server must say to admit the logins that follow, for the operator to read: the
+/// `pg_hba.conf` rule for the role on the database's local socket, with the map that lets root
+/// (setup) and the service account log in as the role, and the two lines of that map. Setup
+/// edits neither file. These lines name the role and the database: they are for the operator to
+/// copy, and each one names one of the two files.
+pub fn access_lines(local: &LocalDatabase, mode: Mode) -> [String; 5] {
+    let (db, role, service) = (&local.name, &local.role, database_user_name(mode));
+    [
+        "note: the server must admit setup (as root) and the service, both as the role, over its Unix socket. Setup never edits pg_hba.conf or pg_ident.conf; if no rule of the server's admits them, add these:".to_owned(),
+        format!("  pg_hba.conf, above the first `local` line: local  {db}  {role}  peer map=kbf"),
+        format!("  pg_ident.conf: kbf  root  {role}"),
+        format!("  pg_ident.conf: kbf  {service}  {role}"),
+        "  after editing pg_hba.conf or pg_ident.conf, reload the server (not restart); setup tries the logins next and, if the server refuses one, says which rule is missing".to_owned(),
+    ]
+}
+
 /// Runs `sql` and returns its output, or the refusal that says the local server could not be
 /// asked. Nothing of the tool's own words is kept.
 fn ask(
@@ -129,16 +200,18 @@ fn ask(
 ) -> Result<String, SetupError> {
     let out = exec.query(&conn.command(&script(local, sql))?).map_err(|e| {
         SetupError::NeedsOperator(format!(
-            "could not run {PSQL} ({}): install the Postgres client, or create the role and database by hand and run setup without --create-local-database ({DOCS})",
-            e.kind()
+            "could not run {PSQL} ({}): install the Postgres client and server ({}), or create the role and database by hand and pass --database without --create-local-database ({DOCS})",
+            e.kind(),
+            install_command(exec)
         ))
     })?;
     if !out.status.success() {
         return Err(SetupError::NeedsOperator(format!(
-            "{PSQL} could not ask the local Postgres server as its `{SUPERUSER}` user over the Unix socket --database names (exit status {}): start the server, check the socket directory, or create the role and database by hand and run setup without --create-local-database ({DOCS})",
+            "{PSQL} could not ask the local Postgres server as its `{SUPERUSER}` user over the Unix socket of the database URL (exit status {}): start the server, install it if it is not there ({}), check the socket directory, or create the role and database by hand and pass --database without --create-local-database ({DOCS})",
             out.status
                 .code()
-                .map_or_else(|| "none".to_owned(), |c| c.to_string())
+                .map_or_else(|| "none".to_owned(), |c| c.to_string()),
+            install_command(exec)
         )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
@@ -247,14 +320,16 @@ pub fn plan(
 /// What `setup` does next about the database.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Next {
-    /// The role and database are there (or now are): go on to log in and make the schema.
+    /// The role and database were there: go on to log in and make the schema.
     Schema,
     /// A dry run that would create them: there is nothing to log in to yet.
     Pending,
+    /// They were missing and now are made: go on to log in and make the schema.
+    Created,
 }
 
 /// Makes the role and database `local` names where missing (prints the steps, and with `apply`
-/// carries them out).
+/// carries them out). [`Next::Schema`] means both were there and nothing was done.
 ///
 /// # Errors
 /// [`SetupError`]: this is not a Linux host with a `postgres` account, the server cannot be
@@ -268,12 +343,13 @@ pub fn provision(
 ) -> Result<Next, SetupError> {
     if os.platform() != Platform::Linux {
         return Err(SetupError::Unsupported(
-            "--create-local-database is for a Linux host: it runs psql as the `postgres` account the distribution's package makes".to_owned(),
+            "making the state database (--create-local-database, and the default of a host that gives no --database) is for a Linux host: it runs psql as the `postgres` account the distribution's package makes".to_owned(),
         ));
     }
     let Some(superuser) = os.user(SUPERUSER)? else {
         return Err(SetupError::NeedsOperator(format!(
-            "--create-local-database runs psql as the operating-system user `{SUPERUSER}`, and this host has none: install the Postgres server (apt install postgresql), or create the role and database by hand and run setup without the flag ({DOCS})"
+            "setup makes the state database with psql run as the operating-system user `{SUPERUSER}`, and this host has none: install the Postgres server ({}), or create the role and database by hand and pass --database without --create-local-database ({DOCS})",
+            install_command(&*exec)
         )));
     };
     let steps = plan(&*exec, &Connection::local(local, superuser), local)?;
@@ -290,10 +366,10 @@ pub fn provision(
             writeln!(out, "DRY-RUN: {what}: {step}")?;
         }
     }
-    Ok(if !apply && !steps.is_empty() {
-        Next::Pending
-    } else {
-        Next::Schema
+    Ok(match (steps.is_empty(), apply) {
+        (true, _) => Next::Schema,
+        (false, true) => Next::Created,
+        (false, false) => Next::Pending,
     })
 }
 

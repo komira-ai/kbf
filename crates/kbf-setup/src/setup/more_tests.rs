@@ -179,22 +179,25 @@ fn a_run_that_stopped_at_the_database_is_finished_by_running_again() {
     assert!(out.contains("\nnothing to do\n"), "{out}");
 }
 
-/// Catches a database flag that is accepted where it must not be: it is required of the two
-/// modes that keep state in Postgres and refused of the others; a password (the file is
-/// world-readable), another scheme or a character a TOML string would escape is refused; and
-/// the message never quotes the URL.
-///
-/// Mutants to plant: the password check removed; the mode check removed.
+/// Asserts that a database flag is accepted only where it means something: the two modes that
+/// keep state in Postgres take the local default when it is left out (the database `kbf` on the
+/// local socket, as the account the frontend runs as, marked as defaulted), and a given URL is
+/// not marked; the other modes refuse the flag; a password (the file is world-readable), another
+/// scheme or a character a TOML string would escape is refused; and the message never quotes the
+/// URL.
 #[test]
-fn the_database_flag_is_required_where_there_is_state_and_refused_with_a_password() {
+fn the_database_flag_defaults_where_there_is_state_and_is_refused_with_a_password() {
     for mode in [Mode::Frontend, Mode::AllInOne] {
         let mut r = raw(mode);
+        let given = r.validate(Platform::Linux).expect("given");
+        assert_eq!(given.database.as_deref(), Some(DATABASE));
+        assert!(!given.database_defaulted);
+        assert!(given.local_database.is_none());
         r.database = None;
-        let why = r
-            .validate(Platform::Linux)
-            .expect_err("required")
-            .join("; ");
-        assert!(why.contains("--database is required"), "{why}");
+        let left_out = r.validate(Platform::Linux).expect("the local default");
+        assert_eq!(left_out.database.as_deref(), Some(DATABASE));
+        assert!(left_out.database_defaulted);
+        assert!(left_out.local_database.is_some());
     }
     let mut r = raw(Mode::Daemon);
     r.database = Some(DATABASE.to_owned());
