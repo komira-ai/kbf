@@ -546,7 +546,7 @@ jobs:
       # skip, without one; the Linux jobs run them): those in a module named `database` (skipped
       # by `::database::`), the `provisioned` module of database_tests.rs, and the three
       # tests of that file and the one of setup/more_tests.rs that use `TestDatabase`.
-      - run: cargo test -p kbf-installer --locked -- --skip ::database:: --skip database::tests::provisioned:: --skip database::tests::setup_creates_the_schema_once --skip database::tests::the_update_step_migrates --skip database::tests::the_bounded_step_gives_up --skip setup_creates_the_schema_over_a_real_server
+      - run: 'cargo test -p kbf-installer --locked -- --skip ::database:: --skip database::tests::provisioned:: --skip database::tests::setup_creates_the_schema_once --skip database::tests::the_update_step_migrates --skip database::tests::the_bounded_step_gives_up --skip setup_creates_the_schema_over_a_real_server'
       - name: Fetch gh (pinned release, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_macOS_arm64.zip" --sha256 "$GH_SHA256" --out "$RUNNER_TEMP/tools/gh" --extract zip --member "gh_${GH_VERSION}_macOS_arm64/bin/gh"
       - name: The pinned gh verifies a real attestation offline
