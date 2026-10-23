@@ -150,7 +150,9 @@ pub trait Drain: Send + Sync {
     fn drain(&self, host: &Host, deadline: Duration) -> Result<(), PortError>;
     /// How many leases the node of `host` holds now.
     fn leases(&self, host: &Host) -> Result<usize, PortError>;
-    /// Return the node of `host` to placement.
+    /// Return the node of `host` to placement. This is unconditional: a node an operator
+    /// cordoned before the roll is uncordoned after it, so cordon it again if it must stay out.
+    /// A storage host is never drained, even one that also runs a daemon, and needs no node id.
     fn undrain(&self, host: &Host) -> Result<(), PortError>;
 }
 

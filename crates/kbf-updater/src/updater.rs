@@ -2,8 +2,9 @@
 //!
 //! One roll at a time, over the hosts of a plan: the frontend first, then one host at a time.
 //! Per host the turn is `pending`, `checking` (the node's identity, safe-to-stop and, for a
-//! daemon host, the drain; nodes only), `installing`, `waiting_healthy`, `done`. Every phase change is written to `roll.json` before the work of
-//! the new phase starts, so a restart finds the host where its work began and never earlier.
+//! daemon host, the drain; nodes only), `installing`, `waiting_healthy`, `done`. Every phase
+//! change is written to `roll.json` before the work of the new phase starts, so a restart
+//! finds the host where its work began and never earlier.
 //! The first failure stops the roll and no later host is asked about, let alone touched.
 //!
 //! The machine is deterministic: no clock but the [`Clock`] port, no randomness, no threads of
@@ -685,8 +686,8 @@ impl Updater {
 
     /// A host found `installing`: ask, do not install blindly. The target means the install
     /// finished; another version means it never started or did not finish, and one more
-    /// install is safe (it is idempotent, and an older version is installed like any other); "in progress" waits it
-    /// out; silence for [`Timing::query_bound`] interrupts the roll.
+    /// install is safe (it is idempotent, and an older version is installed like any other);
+    /// "in progress" waits it out; silence for [`Timing::query_bound`] interrupts the roll.
     fn recover_install(&self, idx: usize, host: &Host, target: &Version) -> Result<(), Halt> {
         let start = self.now();
         let mut last_answer = start;
