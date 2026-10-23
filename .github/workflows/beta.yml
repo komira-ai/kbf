@@ -518,7 +518,7 @@ jobs:
       - run: cargo build -p kbf-node --bin kbf-daemon --locked
       # Not the tests named `database::` (crates/kbf-testkit/tests/database.rs): they make
       # databases on a Postgres server, which a hosted Mac has not.
-      - run: cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node -p kbf-testkit --locked -- --skip database::
+      - run: 'cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node -p kbf-testkit --locked -- --skip database::'
       # `kbf daemon --driver native` started with the words the Mac's launchd unit
       # writes, against a fake front, and the helpers it re-runs itself as (each action's
       # keeper, the lease-user pool's `as-user` step) through the `kbf` binary

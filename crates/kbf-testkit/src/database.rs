@@ -150,7 +150,6 @@ impl Drop for TestDatabase {
     /// behind is only clutter on a throwaway server.
     fn drop(&mut self) {
         let statement = format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", self.name);
-        let _ = connect(&self.server)
-            .and_then(|mut admin| admin.batch_execute(&statement));
+        let _ = connect(&self.server).and_then(|mut admin| admin.batch_execute(&statement));
     }
 }

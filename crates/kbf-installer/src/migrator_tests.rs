@@ -706,8 +706,7 @@ mod database {
     fn a_migrator_waits_for_the_schema_lock_and_gives_up_as_busy() {
         let s = Scratch::new();
         let hold = || {
-            let mut other =
-                postgres::Client::connect(&s.url(), postgres::NoTls).expect("connects");
+            let mut other = postgres::Client::connect(&s.url(), postgres::NoTls).expect("connects");
             other
                 .batch_execute("BEGIN; SELECT pg_advisory_xact_lock(hashtext('kbf-state-schema'))")
                 .expect("the lock is free");
