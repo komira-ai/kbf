@@ -105,10 +105,16 @@ jobs:
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
+          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
+          # file, so a restored target/ must hold none of the files a run writes there.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
+            !target/pkg
+            !target/pkg/**
+            !target/pkg-trust
+            !target/pkg-trust/**
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
           # On a push (to main: the build the attest job signs)
@@ -188,10 +194,16 @@ jobs:
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
+          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
+          # file, so a restored target/ must hold none of the files a run writes there.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
+            !target/pkg
+            !target/pkg/**
+            !target/pkg-trust
+            !target/pkg-trust/**
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # glibc: the binaries need the glibc of the runner image they were built on (Ubuntu
@@ -218,10 +230,16 @@ jobs:
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
+          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
+          # file, so a restored target/ must hold none of the files a run writes there.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
+            !target/pkg
+            !target/pkg/**
+            !target/pkg-trust
+            !target/pkg-trust/**
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
           # On a push (to main: the build the attest job signs)
@@ -300,10 +318,16 @@ jobs:
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
+          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
+          # file, so a restored target/ must hold none of the files a run writes there.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
+            !target/pkg
+            !target/pkg/**
+            !target/pkg-trust
+            !target/pkg-trust/**
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   linux-arm64:
@@ -328,10 +352,16 @@ jobs:
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
+          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
+          # file, so a restored target/ must hold none of the files a run writes there.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
+            !target/pkg
+            !target/pkg/**
+            !target/pkg-trust
+            !target/pkg-trust/**
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
           # On a push (to main: the build the attest job signs)
@@ -407,10 +437,16 @@ jobs:
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
+          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
+          # file, so a restored target/ must hold none of the files a run writes there.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
+            !target/pkg
+            !target/pkg/**
+            !target/pkg-trust
+            !target/pkg-trust/**
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # Attestation is per platform group, so the Linux files are attested and verifiable as
