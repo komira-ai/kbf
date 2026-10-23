@@ -483,14 +483,14 @@ fn every_install_answer_maps() {
     let r = rig();
     r.fake.says(exited(
         2,
-        "{\"result\":\"refused\",\"reason\":\"older_than_installed\"}\n",
+        "{\"result\":\"refused\",\"reason\":\"channel_not_allowed\"}\n",
     ));
     r.fake.says(exited(
         3,
         "{\"result\":\"failed\",\"reason\":\"install_failed\"}\n",
     ));
     let refused = r.ssh.install(&host(), &version("1")).expect_err("refused");
-    assert_eq!(refused, PortError::other("refused: older_than_installed"));
+    assert_eq!(refused, PortError::other("refused: channel_not_allowed"));
     let failed = r.ssh.install(&host(), &version("1")).expect_err("failed");
     assert_eq!(failed, PortError::other("failed: install_failed"));
     assert!(!refused.is_unreachable() && !failed.is_unreachable());
