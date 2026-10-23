@@ -30,10 +30,7 @@
 //! {digest}`; for a failed action its failure class, command and log tails from
 //! `/failures`, each tail with a link that downloads the whole log; else stdout and stderr
 //! shown as text when the blob route links them and they are small; a larger one is a
-//! link), and `/ui/updates` (Updates: the
-//! desired release, the releases, and each host's update, from `GET /v1/update`,
-//! `GET /v1/nodes` and, where it answers, `GET /v1/update/hosts`; read-only, with the
-//! operator-API command to set the desired release shown as text), `/ui/leases` (Leases:
+//! link), `/ui/leases` (Leases:
 //! `GET /v1/leases`, filtered by `?node=` and paged by the API's own links),
 //! `/ui/queue` (Queue: `GET /v1/queue`), `/ui/targets`
 //! (Targets: `GET /v1/tests` and, for the strips, `GET /v1/grid`),
@@ -271,7 +268,6 @@ pub async fn respond<S: Source + Sync>(source: &S, path: &str, query: &str) -> A
         {
             pages::run_log(source, run_id, stream, query).await
         }
-        ["updates"] => pages::updates(source).await,
         ["leases"] => pages::leases(source, query).await,
         ["queue"] => pages::queue(source).await,
         ["targets"] => pages::targets(source, query).await,

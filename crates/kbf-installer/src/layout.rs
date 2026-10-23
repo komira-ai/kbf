@@ -339,8 +339,8 @@ impl Layout {
         path_in(self.platform.state_dir(), STATE_BACKUP)
     }
 
-    /// The directory the node's update client reads `status.json` from: the state directory,
-    /// root's. A node's `kbf.toml` names it as `[daemon] update-dir`.
+    /// The state directory, root's: where `status.json` is written. The node no longer reads
+    /// it (the node's update client was removed; a node's `update-dir` is a retired flag).
     pub fn update_dir(&self) -> HostPath {
         self.state_dir()
     }

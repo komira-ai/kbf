@@ -28,11 +28,6 @@
 //!   It reads no verdict: the tag's message is an audit record that nothing gates on, and a
 //!   tag without one verifies. Prints `set-hash=<hex>`, the hash of the set `<dir>`'s
 //!   `SHA256SUMS` lists, which `publish --set-hash` must be given.
-//! - `release offer <dir> --repo <owner/repo> --commit <sha> --platform <p>... (--beta-result
-//!   <file> | --waive-beta <reason> --operator <name>) [--previous <sha> --version-json <file>
-//!   --previous-version-json <file>] [--plan] --out <offer.json>` ([`offer`]): the checks
-//!   that make a commit offerable, and `offer.json`, the record a deploy reads. It sets
-//!   nothing on any farm.
 //! - `release identity <dir> --commit <sha> --out <file>` ([`identity`]): runs `kbf --version
 //!   --json` from `<dir>`'s linux-x86_64 tarball of that commit and writes what it prints. It
 //!   runs a binary: only after `check` and `verify-assets attestations` on `<dir>`.
@@ -56,18 +51,10 @@
 //! - `release fetch-previous --repo <owner/repo> --sha <sha> --platform <p> --binary <name>...
 //!   --out <dir> [--trusted-root <file>] [--output <file>] [--gh <program>]` ([`fetch_previous`]):
 //!   the release before `--sha` for the tests that need an N-1: the highest release tag
-//!   that names a strict ancestor of it, its release downloaded and verified as `release
-//!   offer` verifies one, and only then the named binaries taken out into `--out`. With no
+//!   that names a strict ancestor of it, its release downloaded and verified
+//!   (checksums, then attestations), and only then the named binaries taken out into `--out`. With no
 //!   such tag it prints `previous-source=none`; a failed call is an error, never "no tags".
 //!   Prints `key=value` lines and appends them to `--output`.
-//! - `release stage-offer --repo <owner/repo> --sha <sha> --out <dir> [--output <file>]
-//!   [--trusted-root <file>] [--runner-platform <p>] [--gh <program>]` ([`stage_offer`]): for
-//!   gamma only, the offer for the release of `--sha` and the bundle a deploy is handed.
-//!   The release is downloaded and verified before any of its files runs; its `kbf` and its
-//!   N-1's (`release previous`) give the `meta_log` numbers; beta is waived for a fixed reason
-//!   by a fixed operator. A commit with no release is `staged=false` and exit 0; a commit a
-//!   newer release supersedes is an error. Prints `key=value` lines and appends them to
-//!   `--output`; `--out` is made last.
 //! - `release publish <dir> --repo <owner/repo> --tag <tag> --commit <sha> --run-id <id>
 //!   --set-hash <hex> --notes-file <file> [--gh <program>]` ([`publish`]): `check`, then
 //!   creates release `<tag>` with every file of `<dir>` (the bundles beside their
@@ -97,9 +84,7 @@ mod git;
 pub mod identity;
 mod identity_file;
 pub mod notes;
-pub mod offer;
 pub mod plan;
-pub mod stage_offer;
 pub mod tag;
 pub mod tags;
 pub mod verdict_write;

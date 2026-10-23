@@ -103,13 +103,13 @@ certificate is not looked at, and `--cold-store` and `--meta-dir` are checked as
 
 ### The node's update directory and orders directory
 
-A `daemon` or `storage-and-daemon` host runs a daemon that takes update orders from the
-frontend. On Linux `setup` writes two more keys into its `kbf.toml`, in the `[daemon]` table:
+The node no longer has an update client: a release reaches a host as a package that
+`kbf-updater` installs. `--update-dir` and `--orders-dir` (`update-dir` and `orders-dir` in
+`[daemon]`) are still accepted, hidden and ignored, with one warning at start, for one
+release, because a `kbf.toml` or a plist written before the removal carries them. On Linux
+`setup` still writes both keys into a `daemon` or `storage-and-daemon` host's `kbf.toml`:
 `update-dir = "/var/lib/kbf-installer"` and `orders-dir = "/var/lib/kbf-installer/orders"`.
-Without them the node updates by hand and ignores every order. The installer writes
-`status.json` into the first and reads the node's orders from the second. `all-in-one` gets
-neither key, because its in-process daemon refuses `--update-dir`. On a Mac `setup` writes neither
-key and checks them instead, see "The Mac path".
+On a Mac it writes neither key and checks them instead, see "The Mac path".
 
 ## The `kbf.toml` file
 
@@ -133,11 +133,8 @@ refuses a table written twice, and so does `kbf` (exit 2, `duplicate key`).
 ## The Mac path
 
 A Mac is a node (`--mode=daemon`) and `kbf-mac-provision` is the one writer of the daemon's
-`kbf.toml` there. `setup` does not write `[daemon] update-dir` or `orders-dir` on a Mac. It
-checks the file: `update-dir` must be there and be the installer's state directory
-(`/var/db/kbf-installer`), and `orders-dir` must be absent (the node uses `<update-dir>/orders`)
-or be the installer's. A missing or different key, or no file, is refused with exit 5, naming the
-key and saying that `kbf-mac-provision` renders it: run it again, then `setup`. The other keys
+`kbf.toml` there. `setup` does not write `[daemon] update-dir` or `orders-dir` on a Mac and does
+not require them; a file that has them is left as it is. The other keys
 `setup` owns follow the rule above.
 
 ## What it does, in this order

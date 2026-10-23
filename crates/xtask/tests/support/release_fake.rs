@@ -1,6 +1,6 @@
-//! The fake GitHub the process tests of the release verbs share (`release fetch-previous`,
-//! `release stage-offer`): `xtask-fake` linked as `gh`, its `gh-api.json` (the API as each
-//! test writes it), its `releases/<tag>/` (the files a release holds) and its `attested` (the
+//! The fake GitHub the process tests of the release verbs share (`release fetch-previous`
+//! and the other verbs that read a release): `xtask-fake` linked as `gh`, its `gh-api.json`
+//! (the API as each test writes it), its `releases/<tag>/` (the files a release holds) and its `attested` (the
 //! attestations the artifacts workflow made of them).
 //!
 //! A test file includes it with `#[path = "support/release_fake.rs"] mod release_fake;`.
