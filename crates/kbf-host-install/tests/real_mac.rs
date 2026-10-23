@@ -67,7 +67,7 @@ struct Job {
 
 impl Job {
     /// Load `program` with `args`, started at load or not.
-    fn load(scenario: &str, program: &str, args: &[&str], run_at_load: bool) -> Self {
+    fn load(scenario: &str, program: &str, args: &[&str], run_at_load: bool, extra: &str) -> Self {
         assert_root();
         let dir = TestDir::under("/private/var/tmp", &format!("kbf-real-mac-{scenario}"));
         let label = format!(
@@ -86,7 +86,7 @@ impl Job {
              \t<key>ProgramArguments</key>\n\t<array>\n{arguments}\t</array>\n\
              \t<key>RunAtLoad</key>\n\t<{run_at_load}/>\n\
              \t<key>KeepAlive</key>\n\t<false/>\n\
-             </dict>\n</plist>\n"
+             {extra}</dict>\n</plist>\n"
         );
         let path = dir.join("job.plist");
         fs::write(&path, plist).unwrap();
@@ -143,7 +143,7 @@ fn pid_of(text: &str) -> i32 {
 #[test]
 #[ignore = "needs a Mac and root: cargo xtask sudo-test"]
 fn print_of_a_job_loaded_and_not_started() {
-    let job = Job::load("idle", "/bin/sleep", &["600"], false);
+    let job = Job::load("idle", "/bin/sleep", &["600"], false, "");
     let exec = job.print();
     capture("print_idle", &exec);
     let text = exec.stdout_text();
@@ -173,7 +173,7 @@ fn print_of_a_job_loaded_and_not_started() {
 #[test]
 #[ignore = "needs a Mac and root: cargo xtask sudo-test"]
 fn print_and_lsof_of_a_running_job_and_after_kill_nine() {
-    let job = Job::load("running", "/bin/sleep", &["600"], true);
+    let job = Job::load("running", "/bin/sleep", &["600"], true, "");
     let exec = job.wait("print_running", "ran", tools::print_running);
     capture("print_running", &exec);
     let text = exec.stdout_text();
@@ -204,6 +204,25 @@ fn print_and_lsof_of_a_running_job_and_after_kill_nine() {
     assert_eq!(tools::print_pid(&text), None, "{text}");
 }
 
+/// A job that is loaded and has not started but has nested blocks (a Mach service, a watched
+/// path, a start interval): the readers see the top-level fields only.
+#[test]
+#[ignore = "needs a Mac and root: cargo xtask sudo-test"]
+fn print_of_a_job_with_nested_blocks() {
+    let extra = "\t<key>MachServices</key>\n\t<dict>\n\t\t<key>com.example.kbf-real-mac-test.service</key>\n\t\t<true/>\n\t</dict>\n\
+                 \t<key>WatchPaths</key>\n\t<array>\n\t\t<string>/private/var/tmp/kbf-real-mac-watched</string>\n\t</array>\n\
+                 \t<key>StartInterval</key>\n\t<integer>86400</integer>\n";
+    let job = Job::load("nested", "/bin/sleep", &["600"], false, extra);
+    let exec = job.print();
+    capture("print_nested", &exec);
+    let text = exec.stdout_text();
+    assert!(exec.success(), "{}", exec.stderr_text());
+    assert!(text.lines().any(|l| l.starts_with("\t\t")), "{text}");
+    assert!(!tools::print_running(&text), "{text}");
+    assert!(!tools::print_finished(&text), "{text}");
+    assert_eq!(tools::print_pid(&text), None, "{text}");
+}
+
 /// A job that exits 0 and one that exits 1 are both finished, not running.
 #[test]
 #[ignore = "needs a Mac and root: cargo xtask sudo-test"]
@@ -212,7 +231,7 @@ fn print_of_a_job_after_a_clean_exit_and_after_a_failure() {
         ("clean_exit", "/usr/bin/true", "0"),
         ("nonzero_exit", "/usr/bin/false", "1"),
     ] {
-        let job = Job::load(name, program, &[], true);
+        let job = Job::load(name, program, &[], true, "");
         let exec = job.wait(&format!("print_{name}"), "ended", tools::print_finished);
         capture(&format!("print_{name}"), &exec);
         let text = exec.stdout_text();
@@ -338,7 +357,7 @@ fn probe(copy: &Path) -> Cmd {
 }
 
 /// `dscl` gives the ids of `nobody`, the account the attestation check runs as, and the
-/// runner's privilege drop to it leaves no supplementary group.
+/// runner's privilege drop to it leaves no supplementary group but its own.
 #[test]
 #[ignore = "needs a Mac and root: cargo xtask sudo-test"]
 fn dscl_ids_of_nobody_and_a_drop_to_them() {
@@ -363,37 +382,12 @@ fn dscl_ids_of_nobody_and_a_drop_to_them() {
         as_root.len() > 1,
         "root belongs to several groups: {as_root:?}"
     );
-    // The runner's own drop (`Command::uid` and `gid`): what it leaves is recorded.
+    // The runner's drop leaves the one group. (Started with `Command::uid` and `gid` alone,
+    // the child kept group 0: the run that found it is in the pull request.)
     let mut dropped = probe(&copy);
     dropped.run_as = Some(ids);
     let by_runner = groups_of("runner_drop", &dropped);
-    // The same through chroot(8), which sets the groups itself.
-    let mut wrapped = probe(&copy);
-    let id_args = [
-        ids.uid.to_string(),
-        ids.gid.to_string(),
-        ids.gid.to_string(),
-    ];
-    wrapped.args = [
-        "-u",
-        &id_args[0],
-        "-g",
-        &id_args[1],
-        "-G",
-        &id_args[2],
-        "/",
-        &copy.display().to_string(),
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .chain(probe(&copy).args)
-    .collect();
-    wrapped.program = "/usr/sbin/chroot".to_owned();
-    let by_chroot = groups_of("chroot_drop", &wrapped);
-    assert!(
-        by_chroot.iter().all(|g| *g == ids.gid),
-        "the runner left {by_runner:?}, chroot left {by_chroot:?}"
-    );
+    assert_eq!(by_runner, [ids.gid], "the runner left {by_runner:?}");
 }
 
 /// The value of a field at the top of a service's listing: a line of exactly one tab, then
