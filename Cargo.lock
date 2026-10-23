@@ -2431,7 +2431,6 @@ dependencies = [
  "hex",
  "kbf-host",
  "kbf-proxy",
- "kbf-setup",
  "kbf-state",
  "kbf-testkit",
  "postgres",

@@ -716,8 +716,7 @@ fn the_kbf_binary_links_the_setup_library_and_not_the_proxy() {
 fn the_release_workflow_builds_the_kbf_binary_apart_from_the_installer() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../.github/workflows/artifacts.yml");
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
     let builds_kbf: Vec<&str> = text
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'))
@@ -727,7 +726,11 @@ fn the_release_workflow_builds_the_kbf_binary_apart_from_the_installer() {
     assert!(!builds_kbf.is_empty(), "no line of {path:?} builds kbf-cli");
     let together: Vec<&&str> = builds_kbf
         .iter()
-        .filter(|line| ["kbf-installer", "kbf-deploy"].iter().any(|n| line.contains(n)))
+        .filter(|line| {
+            ["kbf-installer", "kbf-deploy"]
+                .iter()
+                .any(|n| line.contains(n))
+        })
         .collect();
     assert!(
         together.is_empty(),

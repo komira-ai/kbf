@@ -84,9 +84,7 @@ fn host() -> FakeExec {
 /// Applies `setup` for `flags` on a Linux host, with no state database to ask.
 fn go(exec: &mut FakeExec, flags: &Raw) -> Result<String, SetupError> {
     let mut out = Vec::new();
-    let backend = Backend {
-        schemas: &NoServer,
-    };
+    let backend = Backend { schemas: &NoServer };
     let options = Options {
         apply: true,
         no_start: false,
