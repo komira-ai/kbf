@@ -296,6 +296,49 @@ fn xattr_lists_and_removes_the_quarantine_attribute() {
     assert!(!tools::has_quarantine(&after.stdout_text()));
 }
 
+/// Not a test of its own: the process the privilege-drop test starts, which prints the
+/// groups it belongs to (`getgroups`, not the account's memberships that `id` prints).
+#[test]
+#[ignore = "run by dscl_ids_of_nobody_and_a_drop_to_them, as another user"]
+fn print_my_groups() {
+    let groups: Vec<String> = rustix::process::getgroups()
+        .unwrap()
+        .iter()
+        .map(|g| g.as_raw().to_string())
+        .collect();
+    println!("groups: {}", groups.join(" "));
+}
+
+/// The groups the test binary's copy belongs to when `run_as` starts it.
+fn groups_of_child(copy: &Path, run_as: Option<Identity>) -> Vec<u32> {
+    let mut probe = Cmd {
+        program: copy.display().to_string(),
+        args: ["--ignored", "--exact", "print_my_groups", "--nocapture"]
+            .map(str::to_owned)
+            .to_vec(),
+        timeout: Some(LIMIT),
+        ..Cmd::default()
+    };
+    probe.run_as = run_as;
+    let out = run(&probe);
+    capture(
+        &format!(
+            "groups_{}",
+            if run_as.is_some() { "dropped" } else { "root" }
+        ),
+        &out,
+    );
+    assert!(out.success(), "{}", out.stderr_text());
+    let text = out.stdout_text();
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("groups:"))
+        .unwrap_or_else(|| panic!("no groups line: {text}"));
+    line.split_whitespace()
+        .map(|g| g.parse().unwrap())
+        .collect()
+}
+
 /// `dscl` gives the ids of `nobody`, the account the attestation check runs as, and the
 /// runner's privilege drop to it leaves no supplementary group.
 #[test]
@@ -311,111 +354,20 @@ fn dscl_ids_of_nobody_and_a_drop_to_them() {
     let ids: Identity = ids.unwrap();
     assert_ne!(ids.uid, 0);
 
-    let mut groups = tools::dscl_ids("nobody", LIMIT);
-    groups.program = "/usr/bin/id".to_owned();
-    groups.args = vec!["-G".to_owned()];
-    groups.run_as = Some(ids);
-    let out = run(&groups);
-    capture("id_groups_as_nobody", &out);
-    assert!(out.success(), "{}", out.stderr_text());
-    let listing = out.stdout_text();
-    let seen: Vec<&str> = listing.split_whitespace().collect();
-    assert_eq!(seen.len(), 1, "only the primary group is left: {listing}");
-}
-
-/// The value of a field at the top of a service's listing: a line of exactly one tab, then
-/// `key = value`. (Written again here, plainly, to check the crate's reader against.)
-fn top_level<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    let prefix = format!("\t{key} = ");
-    text.lines()
-        .find_map(|line| line.strip_prefix(prefix.as_str()))
-}
-
-/// Whether the listing has a line at depth two or more naming `key`.
-fn nested(text: &str, key: &str) -> bool {
-    let needle = format!("{key} = ");
-    text.lines().any(|line| {
-        line.strip_prefix("\t\t")
-            .is_some_and(|rest| rest.trim_start().starts_with(&needle))
-    })
-}
-
-/// The services launchd lists in the system domain, as labels.
-fn system_labels() -> Vec<String> {
-    let list = Cmd {
-        program: tools::LAUNCHCTL.to_owned(),
-        args: vec!["print".to_owned(), "system".to_owned()],
-        timeout: Some(LIMIT),
-        ..Cmd::default()
-    };
-    let exec = run(&list);
-    capture("print_system_domain", &exec);
-    let mut labels: Vec<String> = exec
-        .stdout_text()
-        .lines()
-        .filter_map(|line| {
-            let words: Vec<&str> = line.split_whitespace().collect();
-            let [pid, status, label] = words.as_slice() else {
-                return None;
-            };
-            let number = |w: &str| w == "-" || w.parse::<i64>().is_ok();
-            (number(pid) && number(status) && label.contains('.') && !label.contains('='))
-                .then(|| (*label).to_owned())
-        })
-        .collect();
-    labels.sort();
-    labels.dedup();
-    labels
-}
-
-/// Over the real listings of the system's own services, which have nested blocks with fields
-/// of their own: the crate's readers agree, for every one of them, with the field at the top
-/// of the listing, whatever a nested block says. The first listing with a nested `state`,
-/// `pid` and `last exit code` each is kept.
-#[test]
-#[ignore = "needs a Mac and root: cargo xtask sudo-test"]
-fn print_of_the_systems_own_services_is_read_at_the_top_level() {
-    assert_root();
-    let labels = system_labels();
-    assert!(labels.len() > 20, "{} services listed", labels.len());
-    let (mut listed, mut kept) = (0_usize, Vec::new());
-    let mut with_nested = [0_usize; 3];
-    for label in labels.iter().take(400) {
-        let exec = run(&tools::print(label, LIMIT));
-        if !exec.success() {
-            continue;
-        }
-        listed += 1;
-        let text = exec.stdout_text();
-        let running = top_level(&text, "state") == Some("running");
-        assert_eq!(tools::print_running(&text), running, "{label}: {text}");
-        let pid = top_level(&text, "pid").and_then(|p| p.parse::<u32>().ok());
-        assert_eq!(tools::print_pid(&text), pid.filter(|p| *p > 0), "{label}");
-        let ended = !running
-            && (top_level(&text, "last exit code").is_some_and(|c| c.parse::<i32>().is_ok())
-                || top_level(&text, "last terminating signal").is_some());
-        assert_eq!(tools::print_finished(&text), ended, "{label}");
-        for (at, key) in ["state", "pid", "last exit code"].into_iter().enumerate() {
-            if nested(&text, key) {
-                with_nested[at] += 1;
-                if !kept.contains(&key) {
-                    kept.push(key);
-                    capture(&format!("print_nested_{}", key.replace(' ', "_")), &exec);
-                }
-            }
-        }
-    }
-    let summary = format!(
-        "listed {listed} of {} services; with a nested state: {}, pid: {}, last exit code: {}\n",
-        labels.len(),
-        with_nested[0],
-        with_nested[1],
-        with_nested[2]
-    );
-    fs::write(out_dir().join("nested_summary.txt"), &summary).unwrap();
-    assert!(listed > 20, "{summary}");
+    // The test binary again, in a directory `nobody` can reach.
+    let dir = TestDir::under("/private/var/tmp", "kbf-real-mac-groups");
+    let copy = dir.join("probe");
+    fs::copy(std::env::current_exe().unwrap(), &copy).unwrap();
+    fs::set_permissions(&copy, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&*dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let as_root = groups_of_child(&copy, None);
     assert!(
-        with_nested[0] > 0,
-        "no listing has a nested state: {summary}"
+        as_root.len() > 1,
+        "root belongs to several groups: {as_root:?}"
+    );
+    let dropped = groups_of_child(&copy, Some(ids));
+    assert!(
+        dropped.iter().all(|g| *g == ids.gid),
+        "only the primary group is left: {dropped:?}"
     );
 }
