@@ -103,7 +103,10 @@ fn each_answer_of_a_try_lock_is_judged_as_what_it_says() {
     let blocked = lock::judged(lock_file, Err(TryLockError::WouldBlock));
     let err = blocked.expect_err("a held lock is refused");
     assert_eq!(err.code(), 2);
-    assert!(err.to_string().contains("/var/lib/kbf/state.db.lock is held"));
+    assert!(
+        err.to_string()
+            .contains("/var/lib/kbf/state.db.lock is held")
+    );
     let broken = TryLockError::Error(io::Error::other("no locks here"));
     let err = lock::judged(lock_file, Err(broken)).expect_err("a broken call fails");
     assert_eq!(err.code(), 1);

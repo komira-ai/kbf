@@ -31,12 +31,15 @@ fn row<'a>(snapshot: &'a Snapshot, key: &str) -> &'a Entry {
         .expect("the row is there")
 }
 
-/// A new SQLite file with a table and the given `user_version`.
+/// A new SQLite file with a table and the given `user_version`, named for that version so a
+/// test can make one file per version in the same directory.
 fn file_with_version(dir: &Path, version: i64) -> PathBuf {
-    let db = dir.join("other.db");
+    let db = dir.join(format!("other-{version}.db"));
     let conn = Connection::open(&db).expect("create the file");
-    conn.execute_batch(&format!("CREATE TABLE t (x); PRAGMA user_version = {version}"))
-        .expect("set the version");
+    conn.execute_batch(&format!(
+        "CREATE TABLE t (x); PRAGMA user_version = {version}"
+    ))
+    .expect("set the version");
     db
 }
 

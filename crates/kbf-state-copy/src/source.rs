@@ -102,7 +102,10 @@ pub fn read(db: &Path) -> Result<Snapshot, Error> {
 /// [`Error::Failed`] when the path is not UTF-8.
 pub fn uri(db: &Path) -> Result<String, Error> {
     let Some(text) = db.to_str() else {
-        return Err(Error::Failed(format!("{}: the path is not UTF-8", db.display())));
+        return Err(Error::Failed(format!(
+            "{}: the path is not UTF-8",
+            db.display()
+        )));
     };
     let escaped = text
         .replace('%', "%25")

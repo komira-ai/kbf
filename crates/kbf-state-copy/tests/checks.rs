@@ -107,7 +107,11 @@ fn a_read_back_that_differs_is_a_failure_naming_the_family() {
     assert!(text.contains("key family op/"), "{text}");
     assert!(text.contains("rolled back"), "{text}");
     let error = target::verify(&state, &other, target::AFTER_COMMIT).expect_err("differs");
-    assert!(error.to_string().contains("after the commit; the target holds a copy"));
+    assert!(
+        error
+            .to_string()
+            .contains("after the commit; the target holds a copy")
+    );
 }
 
 /// Asserts that a server that cannot be reached is a failure from every step that connects,

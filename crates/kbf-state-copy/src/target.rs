@@ -228,7 +228,9 @@ pub fn verify(want: &Summary, got: &Summary, when: &str) -> Result<(), Error> {
         return Ok(());
     }
     let list = problems.join("; ");
-    Err(Error::Failed(format!("the copy does not match the state file {when}: {list}")))
+    Err(Error::Failed(format!(
+        "the copy does not match the state file {when}: {list}"
+    )))
 }
 
 /// The head revision the store holds.
