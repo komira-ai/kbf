@@ -7,7 +7,8 @@
 //!   and its highest ISA level: an x86-64 psABI level ([`X86Level`]) or an Armv8
 //!   version ([`ArmVersion`]).
 //! - [`gpus_from_linux_pci`] and [`gpus_from_macos_sysctl`] count a node's GPUs, the
-//!   `gpu` capacity a request books whole and exclusively.
+//!   `gpu` capacity a request books whole and exclusively; [`gpu_cores_from_macos_ioreg`]
+//!   and [`metal_family_of_apple_chip`] describe a Mac's.
 //! - [`Request`] and [`NodeCaps`] match with typed comparisons: exact, at least for
 //!   ordered levels, subset for feature sets, membership for sets a node reports
 //!   (`xcode`, and `vm.image` on its digest), minimums for countable resources, and one
@@ -31,7 +32,10 @@ mod platform;
 mod report;
 
 pub use cpu::{Arch, CpuCaps, ParseError, UnknownArch};
-pub use gpu::{PciFunction, gpus_from_linux_pci, gpus_from_macos_sysctl};
+pub use gpu::{
+    GPU_KIND_NATIVE, PciFunction, gpu_cores_from_macos_ioreg, gpus_from_linux_pci,
+    gpus_from_macos_sysctl, metal_family_of_apple_chip,
+};
 pub use level::{ArmVersion, IsaLevel, UnknownIsaLevel, X86Level};
 pub use matching::{
     Consumable, DEVICE_ATTRIBUTES, NodeCaps, REPORT_ONLY_KEYS, RESERVED_KEYS, Request,

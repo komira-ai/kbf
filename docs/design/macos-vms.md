@@ -537,21 +537,28 @@ tokens/s against 286.71) and 6.5% (Gemma 4 12B), prompt processing 8.9% and 13.8
 **[V]** for their numbers, **[A]** for ours. MLX may not run in a stock guest at all
 **[A]**.
 
-So a GPU test is a whole-machine lease:
+So a GPU test runs on the Mac itself, as a pool user under the slot profile, and the
+Mac's GPU is one slot:
 
-- It asks for `kbf-lease=whole_machine` and `gpu=1`. No other lease, bare-metal or VM,
-  runs on the Mac while it does: the GPU and the unified memory are the test's alone,
-  macOS has no way to partition the GPU between processes **[A]**, and performance
-  numbers from a shared machine are noise. The scheduler drains the Mac first
-  ([section 5.3](#53-booking-and-placement-planned)); GPU tests on one Mac run one at a
-  time.
-- On macOS (a platform whose `OSFamily` or `os` names it) the front refuses `gpu`≥1
-  unless `kbf-lease=whole_machine`, with `INVALID_ARGUMENT`, so GPU work cannot land
-  beside other work; `kbf-lease=vm` is refused as a lease kind today. Built
-  (`crates/kbf-front/src/execution.rs`).
-- The scheduler does not model a Mac's GPU: the daemon reports `gpu` 0 on macOS
-  (`crates/kbf-daemon/src/report.rs`) **[V]**, and the front books no GPU on top of a
-  whole-machine lease on macOS. The lease books the whole Mac, its GPU with it.
+- A Mac reports `gpu` 1 with `gpu.kind` `native`, `gpu.cores` and `gpu.metal_family`
+  (`crates/kbf-daemon/src/report.rs`). A lease that asks for `gpu=1` on macOS books
+  the slot, so one GPU lease runs on a Mac at a time while the Mac's CPUs and memory
+  are shared with other work. macOS has no way to partition the GPU between processes
+  **[A]**, so the slot is a lock on the GPU for leases that ask, not isolation from
+  leases that do not, and not for different tenants. Built
+  (`crates/kbf-front/src/execution.rs`; the slot profile keeps `(allow default)`, so
+  the IOKit and Metal compiler service paths a GPU needs are open, and
+  `crates/kbf-driver-native/tests/gpu_profile.rs` and `tests/slot_gpu.rs` assert it).
+- A test whose numbers must not be noise (performance) asks for
+  `kbf-lease=whole_machine` and `gpu=1` instead. No other lease, bare-metal or VM,
+  runs on the Mac while it does. The scheduler drains the Mac first
+  ([section 5.3](#53-booking-and-placement-planned)). The front books no GPU on top
+  of a whole-machine lease on macOS: the lease has the whole Mac, its GPU with it.
+- On macOS (a platform whose `OSFamily` or `os` names it) the front refuses `gpu`≥2
+  with `INVALID_ARGUMENT`: a Mac has one GPU. `kbf-lease=vm` is refused as a lease
+  kind today.
+- A daemon in a guest (`kern.hv_vmm_present`) reports no GPU: a paravirtual device is
+  not the hardware.
 - The model must fit: weights + KV cache + activations + process. Example,
   Qwen2.5-7B-Instruct at 4 bits: 4.3 GB of weights; its KV cache is 2 × 28 layers ×
   4 KV heads × 128 × 2 bytes = 56 KiB per token, 0.47 GB at 8k tokens; about 8 GiB.
