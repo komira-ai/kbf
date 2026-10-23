@@ -70,7 +70,7 @@ async fn proxy() -> ContentAddressableStorageClient<tonic::transport::Channel> {
 /// of them, never 40), or never given back. The blobs of a batch are all in memory from
 /// the decoded request, so the count reaches the batch's size, and no further: held once.
 ///
-/// Mutants: `store_one` counting its blob (`Bytes::from(data)` made `counted`) in place of
+/// Catches: `store_one` counting its blob (`Bytes::from(data)` made `counted`) in place of
 /// the batch counted when it is decoded; the count removed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_proxied_batch_update_counts_every_blob_until_it_is_stored() {
@@ -119,7 +119,7 @@ async fn a_proxied_batch_update_counts_every_blob_until_it_is_stored() {
 /// most 32 sources are ever in flight, so only counting the copies reaches the batch's
 /// size), the blob a copy was made from kept counted after, and bytes never given back.
 ///
-/// Mutant: the copy's guard removed from `batch_read_blobs`.
+/// Catches: the copy's guard removed from `batch_read_blobs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_proxied_batch_read_counts_every_copy_it_answers_with() {
     let _turn = turn().await;

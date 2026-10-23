@@ -167,7 +167,7 @@ fn a_staged_blob_answers_present_on_its_tier_until_the_flush() {
 /// Catches: the committed length moving backwards when two groups' commits on one
 /// block apply out of order (write-path.md section 9, "two groups on one block whose
 /// commits finish out of order"): the later group's records would be past the length
-/// a restart truncates the block to. Mutant: set the length to `end`.
+/// a restart truncates the block to. Catches: set the length to `end`.
 #[test]
 fn commits_applied_out_of_order_never_shorten_the_object() {
     let mut m = tiered();
@@ -183,7 +183,7 @@ fn commits_applied_out_of_order_never_shorten_the_object() {
 /// Catches: a `PutStaged` accepted after `SealStaged` (write-path.md section 9, "a late
 /// `PutStaged` after `SealStaged` is refused"): the flusher builds the footer from the
 /// list it read at the seal, so a blob indexed after it would point into an object
-/// whose footer lacks it. Mutant: drop the sealed check.
+/// whose footer lacks it. Catches: drop the sealed check.
 #[test]
 fn a_put_that_adds_to_a_sealed_object_is_refused() {
     let mut m = tiered();
@@ -215,7 +215,7 @@ fn a_put_that_adds_to_a_sealed_object_is_refused() {
 /// Catches: a retried commit refused because its first apply sealed the object. A
 /// segment upload's `PutStaged` seals in the same commit; a forward retried across a
 /// leader change applies it twice, and the second must answer as the first did (each
-/// blob a duplicate of itself), not fail an upload whose blobs are indexed. Mutant:
+/// blob a duplicate of itself), not fail an upload whose blobs are indexed. Catches:
 /// refuse every `PutStaged` on a sealed object.
 #[test]
 fn a_repeated_sealing_put_is_accepted_as_a_repeat() {
@@ -241,7 +241,7 @@ fn a_repeated_sealing_put_is_accepted_as_a_repeat() {
 /// `PutStaged` after `ObjectFlushed` would mark a stored object staged, and a restart
 /// that finds no block file for it would mark it missing. The same holds for an object
 /// marked unreachable, which leaves the table at once (its bytes are not to be
-/// trusted, and its block is an orphan for the restart sweep). Mutant: record nothing
+/// trusted, and its block is an orphan for the restart sweep). Catches: record nothing
 /// when an object leaves.
 #[test]
 fn an_object_that_left_is_never_staged_again() {
@@ -274,7 +274,7 @@ fn an_object_that_left_is_never_staged_again() {
 /// Catches: an object state that moves backwards: a conflict cleared by a seal or a
 /// retried sealing put (the flusher would retry and overwrite an operator's view), a
 /// flush of an open object (its footer would miss later groups), a conflict or a
-/// staging after the flush. Mutants: `SealStaged` sets `Sealed` whatever the state;
+/// staging after the flush. Catches: `SealStaged` sets `Sealed` whatever the state;
 /// `ObjectFlushed` accepts an open object.
 #[test]
 fn an_object_state_never_moves_backwards() {
@@ -315,7 +315,7 @@ fn an_object_state_never_moves_backwards() {
 /// lists each digest once, at the offset first committed (a second group can write the
 /// same digest again before the first commits); a later commit that heals the blob
 /// (its entry pointed at an object since marked unreachable) must point it at the
-/// listed record, or the index names a location the footer lacks. Mutant: index at the
+/// listed record, or the index names a location the footer lacks. Catches: index at the
 /// commit's own offset.
 #[test]
 fn a_digest_committed_twice_is_indexed_where_it_is_listed() {
@@ -434,7 +434,7 @@ fn a_refused_put_changes_nothing() {
 /// flushed), and a retired id registered again (a stale `TIER` file on a remounted disk
 /// would pass the start check). A server's current tier registered again is a no-op.
 /// Only the server's own old tier counts: an object staged on another server's tier
-/// must not block it (mutant: refuse while any object is staged on any tier, which
+/// must not block it (defect: refuse while any object is staged on any tier, which
 /// would refuse one server's --hot-store-abandon whenever another has unflushed data).
 #[test]
 fn one_tier_per_server_and_an_id_is_never_reused() {

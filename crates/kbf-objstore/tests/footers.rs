@@ -587,7 +587,7 @@ async fn footers_come_in_key_order_and_resume_after_a_key() {
 /// or dropping one that it did not name (an object that appears below keys already
 /// seen is new, and must come back). Five segments are written; the caller has handled
 /// the first, third and last; only the second and fourth come back, in key order, and
-/// the store returns the bytes of those two alone. Mutant seen red: `skip` ignored (all
+/// the store returns the bytes of those two alone. Catches: `skip` ignored (all
 /// five come back and five objects are read).
 #[tokio::test]
 async fn footers_the_caller_has_handled_are_neither_read_nor_yielded() {

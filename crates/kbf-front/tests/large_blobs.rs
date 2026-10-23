@@ -517,8 +517,8 @@ async fn a_large_bytestream_write_holds_a_part_not_the_blob() {
 }
 
 /// Catches a large ByteStream Write sent past the write tier straight to the store
-/// (mutant: `store_streamed` whether or not there is a tier), or one staged whatever
-/// its bytes hash to (mutant: the digest check skipped): with a tier, a 40 MiB Write
+/// (defect: `store_streamed` whether or not there is a tier), or one staged whatever
+/// its bytes hash to (defect: the digest check skipped): with a tier, a 40 MiB Write
 /// whose last byte is not its digest's is refused INVALID_ARGUMENT and leaves nothing
 /// to flush; a sound one is present at once while the store holds nothing of it (no
 /// PUT, no part), and only the flush writes it there, as one multipart upload; it then
@@ -609,7 +609,7 @@ async fn a_large_bytestream_read_holds_a_window_not_the_blob() {
 }
 
 /// Catches a multipart upload completed before the blob's bytes are checked against its
-/// digest (mutant: the footer sent, and the upload completed, whatever the bytes hashed
+/// digest (defect: the footer sent, and the upload completed, whatever the bytes hashed
 /// to), or one left open when they fail: a ByteStream Write of 40 MiB whose last byte
 /// is not its digest's is refused INVALID_ARGUMENT after its parts were sent; the
 /// upload is aborted, never completed, none is left incomplete, and the blob is not
@@ -642,7 +642,7 @@ async fn a_large_write_whose_bytes_fail_its_digest_leaves_nothing_in_the_store()
 }
 
 /// Catches a Write a client dropped mid-way completed or left open in the store, and a
-/// cap on a blob's size (mutant: the 5 GiB cap restored, which refuses the Write at its
+/// cap on a blob's size (defect: the 5 GiB cap restored, which refuses the Write at its
 /// first message): a Write of a blob over 5 GiB, its client gone once a part of it
 /// reached the store, aborts its upload, leaves none incomplete, and stores nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -687,7 +687,7 @@ async fn a_write_its_client_dropped_mid_way_leaves_nothing_in_the_store() {
 }
 
 /// Catches an output over 16 MiB refused when the server has no write tier, or one with
-/// no room for it (mutant: the refusal restored, RESOURCE_EXHAUSTED at `Begin`): a
+/// no room for it (defect: the refusal restored, RESOURCE_EXHAUSTED at `Begin`): a
 /// segment upload `Begin` declaring a 17 MiB record is answered FAILED_PRECONDITION,
 /// the answer at which the daemon sends the record by ByteStream; that Write streams it
 /// to the store as a multipart upload, completed, none left incomplete, and the blob is
@@ -784,7 +784,7 @@ async fn a_bytestream_read_holds_one_window_and_one_message() {
 /// Catches a whole-blob read ([`Cache::read_blob`], what the server decodes a
 /// Directory or an ActionResult with) that keeps only its first window or joins the
 /// windows out of order: a 20 MiB blob is three windows (`READ_WINDOW_BYTES`, 8 MiB),
-/// and the bytes come whole, the last window short. Mutant: `gather` returning `first`
+/// and the bytes come whole, the last window short. Catches: `gather` returning `first`
 /// alone (a 8 MiB blob, and the digest check does not run on it).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_whole_read_of_a_blob_over_one_window_joins_every_window() {
@@ -800,7 +800,7 @@ async fn a_whole_read_of_a_blob_over_one_window_joins_every_window() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Catches a record stream refused without a write tier (mutant: `Cache::stream`
+/// Catches a record stream refused without a write tier (defect: `Cache::stream`
 /// answering `None` with no tier, which leaves a replicated write nowhere to go), or one
 /// that stores what it was not asked to: with no tier, `Cache::stream` of 40 MiB is a
 /// stream to the store, and its commit completes one multipart upload, the blob held

@@ -51,7 +51,7 @@ async fn let_the_engine_run() {
 /// half. In the task's next turn the fetch is out of the map, its read is dropped (the
 /// request permit and the byte budget are free, and the source finds its response
 /// dropped while it is still held), and the next caller starts a read of its own from
-/// byte 0, which it alone counts. Mutants seen red (the flight and its permits still
+/// byte 0, which it alone counts. Catches (the flight and its permits still
 /// held after A left): a `give_up` that never takes the flight; the deserted arm
 /// removed from the task's `select!`; `>` read as `>=` in `half_done` (exactly half
 /// kept); a `give_up` that says it took the flight and leaves it in the map (the
@@ -103,7 +103,7 @@ async fn a_fetch_nobody_waits_for_with_half_its_blob_in_is_dropped_and_read_afre
 /// blob all again): the only caller leaves when the first 1,501 of the 3,000 bytes
 /// have arrived, one past half. In the task's next turn the fetch is still in the map
 /// with its request permit and its byte budget; a later caller joins it, and once the
-/// source sends the rest gets the blob, which the source served once. Mutants seen red:
+/// source sends the rest gets the blob, which the source served once. Catches:
 /// a `give_up` that always takes an unwaited flight; `half_done` never true. The engine
 /// shows nothing when `give_up` says no, so this test alone cannot tell "more than half
 /// arrived" from "a caller is waiting" (it would pass the same if the task ran only
@@ -153,7 +153,7 @@ async fn a_fetch_nobody_waits_for_with_more_than_half_its_blob_in_goes_on_for_th
 /// of the 3,000 bytes have arrived, which alone would be given up. The caller leaves
 /// and B joins in one poll of this task, so the engine's task cannot run between them;
 /// it then runs, finds B waiting, and goes on, and B gets the blob, which the source
-/// served once. Mutants seen red: a `give_up` that ignores the waiters; one that
+/// served once. Catches: a `give_up` that ignores the waiters; one that
 /// always takes the flight.
 #[tokio::test]
 async fn a_caller_who_joins_before_the_task_looks_gets_the_blob_from_the_same_read() {
