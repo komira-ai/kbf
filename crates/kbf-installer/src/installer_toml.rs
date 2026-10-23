@@ -692,6 +692,9 @@ fn render_proxy(p: &ProxyConfig, out: &mut String) {
     out.push_str(&format!("state_dir = {}\n", path(&p.state_dir)));
     out.push_str(&format!("hold_max_s = {}\n", p.hold_max_s));
     out.push_str(&format!("ui = {}\n", p.ui));
+    if let Some(admin) = p.admin_listen {
+        out.push_str(&format!("admin_listen = \"{admin}\"\n"));
+    }
     for cert in &p.server_cert {
         out.push_str("\n[[proxy.server_cert]]\n");
         let names: Vec<String> = cert.names.iter().map(|n| toml_string(n)).collect();
@@ -702,8 +705,15 @@ fn render_proxy(p: &ProxyConfig, out: &mut String) {
             out.push_str("default = true\n");
         }
     }
-    out.push_str("\n[proxy.upstream]\n");
-    out.push_str(&format!("base_port = {}\n", p.upstream.base_port));
+    if let Some(upstream) = p.upstream {
+        out.push_str("\n[proxy.upstream]\n");
+        out.push_str(&format!("base_port = {}\n", upstream.base_port));
+    }
+    for frontend in &p.frontend {
+        out.push_str("\n[[proxy.frontend]]\n");
+        out.push_str(&format!("name = {}\n", toml_string(&frontend.name)));
+        out.push_str(&format!("base_port = {}\n", frontend.base_port));
+    }
     let l = &p.limits;
     out.push_str("\n[proxy.limits]\n");
     for (key, value) in [
@@ -742,3 +752,7 @@ mod tests;
 #[cfg(test)]
 #[path = "installer_toml_release_tests.rs"]
 mod release_tests;
+
+#[cfg(test)]
+#[path = "installer_toml_pool_tests.rs"]
+mod pool_tests;

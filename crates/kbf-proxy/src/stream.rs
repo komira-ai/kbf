@@ -4,6 +4,11 @@
 //! The permit rule (design note section 5): a stream binds to the slot active when its
 //! headers arrived (a `WaitExecution` naming the old child's term, to the old child) and keeps
 //! the permit until both upstream halves are finished.
+//!
+//! In pool mode there is no gate: no hold and no term routing. A stream is placed on a member
+//! of the pool, for as long as it lives, and a failure that is safe to try again (a refused
+//! connection, a refused stream, a GOAWAY) places it again on a member other than those that
+//! failed it.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -15,7 +20,7 @@ use hyper::body::Incoming;
 use tokio::sync::watch;
 
 use crate::auth::Refusal as AuthRefusal;
-use crate::body::{Activity, Down, Lifetime, ProxyBody, Source, idle_expired, pump};
+use crate::body::{Activity, Down, Lifetime, ProxyBody, Source, StreamPermit, idle_expired, pump};
 use crate::core::{Core, StreamCount, now};
 use crate::hold::Wake;
 use crate::identity::{Identity, forward_headers, strip_reserved};
@@ -103,8 +108,9 @@ pub(crate) async fn proxy_child(
     }
     let path = parts.uri.path().to_owned();
     let source = Source::new(body);
-    // Only a `WaitExecution` is read ahead; any other call is dispatched at its headers.
-    let term = if is_wait_execution(&path) {
+    // Only a `WaitExecution` is read ahead; any other call is dispatched at its headers. A pool
+    // has no old child to route it to, so nothing is read ahead there.
+    let term = if core.upstreams.is_none() && is_wait_execution(&path) {
         wait_term(&source).await
     } else {
         None
@@ -149,15 +155,19 @@ impl Stream {
         // The stream's first hold start, kept across attempts: a retry that is held again waits
         // out what is left of the first bound, not a new one.
         let mut since = None;
+        // Pool mode: the members that failed this stream, which it is not placed on again.
+        let mut failed: Vec<usize> = Vec::new();
         loop {
-            let permit = match admit(&self.core, self.term, &mut since).await {
+            let permit = match self.grant(&mut since, &failed).await {
                 Ok(permit) => permit,
                 Err(refusal) => return self.refuse(refusal),
             };
+            let member = permit.member();
             attempts += 1;
             match self.attempt(permit, attempts).await {
                 Ok(response) => return response,
                 Err(failure) => {
+                    self.note(member, failure, &mut failed);
                     if !self.source.may_retry(&self.path, failure, attempts) {
                         return self.refuse(Refusal::Retries);
                     }
@@ -177,13 +187,53 @@ impl Stream {
         unavailable(self.grpc, refusal.message())
     }
 
+    /// Binds the stream to a child: through the gate in slot mode, to a member of the pool that
+    /// is not in `failed` in pool mode (none to take is `UNAVAILABLE`).
+    async fn grant(
+        &self,
+        since: &mut Option<std::time::Instant>,
+        failed: &[usize],
+    ) -> Result<StreamPermit, Refusal> {
+        match &self.core.upstreams {
+            Some(members) => members
+                .pick(self.target, failed)
+                .map(StreamPermit::Member)
+                .ok_or(Refusal::NoActive),
+            None => admit(&self.core, self.term, since)
+                .await
+                .map(StreamPermit::Slot),
+        }
+    }
+
+    /// Pool mode: the member that failed a stream is not taken for it again, and one that could
+    /// not be connected to takes no stream until its probe passes. Slot mode: nothing.
+    fn note(&self, member: Option<usize>, failure: Failure, failed: &mut Vec<usize>) {
+        let (Some(members), Some(index)) = (&self.core.upstreams, member) else {
+            return;
+        };
+        members.failed(index, failure == Failure::Connect);
+        failed.push(index);
+    }
+
+    /// The upstream pool the permit's child is reached through.
+    fn pool_of(&self, permit: &StreamPermit) -> Arc<TargetPool> {
+        match permit {
+            StreamPermit::Slot(permit) => {
+                let (slot, generation) = (permit.slot(), permit.generation());
+                self.core.pool.target(slot, generation, self.target)
+            }
+            StreamPermit::Member(permit) => self.core.pool.member(permit.base(), self.target),
+        }
+    }
+
     /// One dispatch. On a failure before the upstream's response head, or on a fenced head that
     /// may be dispatched again, it returns the failure.
-    async fn attempt(&self, permit: Permit, attempts: u8) -> Result<Response<ProxyBody>, Failure> {
-        let pool = self
-            .core
-            .pool
-            .target(permit.slot(), permit.generation(), self.target);
+    async fn attempt(
+        &self,
+        permit: StreamPermit,
+        attempts: u8,
+    ) -> Result<Response<ProxyBody>, Failure> {
+        let pool = self.pool_of(&permit);
         let (reservation, mut send) = TargetPool::acquire(&pool).await?;
         let life = Lifetime::new(permit, reservation, Arc::clone(&self.count));
         let ended = self.source.bodiless();

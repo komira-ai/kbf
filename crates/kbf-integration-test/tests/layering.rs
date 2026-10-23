@@ -507,9 +507,10 @@ fn the_proxy_reaches_no_child_installer_or_runtime_crate() {
 /// children on the ports of the proxy's upstream table (`proxy/supervisor.rs`, which also
 /// holds the real gate), the verb's own tests (`proxy_verb_tests.rs`, which start a real
 /// proxy over a migrated database), and the table `setup --proxy` writes (`setup/proxy.rs`, which
-/// builds the table the proxy would read, with the proxy's own defaults and checks). The rest of
-/// `proxy/` is written against traits and names no proxy
-/// type. Everything else, the root helper
+/// builds the table the proxy would read, with the proxy's own defaults and checks), and the
+/// verb's pool mode (`proxy_pool.rs`, which binds and runs the proxy over frontends that run on
+/// their own, with no supervisor). The rest of `proxy/` is written against traits and names no
+/// proxy type. Everything else, the root helper
 /// (`helper/`, `run.rs`) first of all, runs as root and links a network stack it never runs
 /// if it names a proxy type.
 const MAY_NAME_THE_PROXY: &[&str] = &[
@@ -517,6 +518,7 @@ const MAY_NAME_THE_PROXY: &[&str] = &[
     "proxy/gate_real_tests.rs",
     "proxy/supervisor.rs",
     "proxy/supervisor_tests.rs",
+    "proxy_pool.rs",
     "proxy_verb.rs",
     "proxy_verb_tests.rs",
     "proxy_verb_copies_tests.rs",

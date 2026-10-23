@@ -50,6 +50,8 @@
 //! - [`proxy`]: the frontend proxy's update machinery, against traits (no socket, no child):
 //!   the swap orchestrator, and in `proxy::api` the update API (routes, bearer-token check,
 //!   the actor that owns one update, idempotent request ids).
+//! - `proxy_pool`: the proxy verb's other mode, a load balancer over frontends that run on
+//!   their own (`[[frontend]]` tables), with none of the above behind it.
 //! - [`run`]: the one place a process is started, behind a trait a test plays.
 //! - [`refusal`]: every way a stage is refused, one enum with a stable code per case.
 //!
@@ -81,6 +83,7 @@ pub mod meta_log;
 pub mod migrator;
 pub mod observe;
 pub mod proxy;
+mod proxy_pool;
 pub mod proxy_verb;
 pub mod record;
 pub mod record_release;

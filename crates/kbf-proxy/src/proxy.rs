@@ -4,8 +4,14 @@
 //! [`ProxyHandle::runtime`], so the supervisor's actor (U7a) runs on it and no second runtime
 //! exists. The gate starts holding, so a proxy that restarts under running children waits for
 //! the supervisor to adopt them instead of answering `UNAVAILABLE`.
+//!
+//! A config with `[[frontend]]` tables is pool mode: no supervisor and no gate to hold (there
+//! is no startup hold), the members are polled instead of the active child (`pool_probe`), and
+//! the admin API is served on `admin_listen` if it is set (`pool_admin`). The admin socket is
+//! bound by [`Proxy::bind`], so an address in use is a failed start.
 
 use std::io;
+use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -17,16 +23,19 @@ use tokio::sync::watch;
 use crate::auth::{Buck2Auth, Tokens};
 use crate::config::ProxyConfig;
 use crate::control::{ProxySnapshot, UpdateHandler};
-use crate::core::{Core, now};
+use crate::core::{Core, Mode, now};
 use crate::identity::{ProxySecret, SecretOrigin, admin_headers};
 use crate::metrics::Metrics;
 use crate::pool::tcp_connector;
+use crate::pool_admin;
+use crate::pool_probe;
 use crate::probe::poll;
 use crate::remote::RemoteCi;
 use crate::security::Security;
 use crate::serve::serve;
 use crate::slot::{ActiveSlot, HoldGuard};
 use crate::tls::{Acceptor, TlsPaths, TlsReloadError, TlsReloader};
+use crate::upstreams::Upstreams;
 
 /// The most worker threads of the runtime.
 const MAX_WORKERS: usize = 8;
@@ -39,7 +48,9 @@ impl Proxy {
     /// Takes the already-bound public listener (the activated socket), builds the runtime,
     /// and returns without serving. The gate starts holding for the configured frontend hold
     /// (`ActiveSlot::starting`); the supervisor takes [`ProxyHandle::startup_hold`] and ends
-    /// it with `release_into` once it has adopted the children.
+    /// it with `release_into` once it has adopted the children. In pool mode (`[[frontend]]`
+    /// tables) there is no supervisor and no hold: [`ProxyHandle::startup_hold`] is `None`, and
+    /// the socket of `admin_listen`, if set, is bound here too.
     ///
     /// The listener speaks TLS: the server certificate, key and client CA are read now (a
     /// proxy does not start on a bad file), as are the operator token and, for
@@ -48,7 +59,8 @@ impl Proxy {
     ///
     /// # Errors
     /// A token or TLS file is refused, the secret file cannot be read or created, the runtime
-    /// could not be built, or the socket could not be made non-blocking.
+    /// could not be built, the socket could not be made non-blocking, or the admin address is
+    /// in use.
     pub fn bind(cfg: ProxyConfig, listener: OwnedFd) -> io::Result<(ProxyHandle, ProxyRunner)> {
         // Read now, like the tokens: a proxy does not start on an allow-list it refuses.
         let remote = cfg
@@ -89,7 +101,18 @@ impl Proxy {
             TcpListener::from_std(std_listener)?
         };
         let hold_max = cfg.frontend_hold();
-        let (slots, startup) = ActiveSlot::starting(hold_max);
+        let (slots, startup, mode) = if cfg.frontend.is_empty() {
+            let (slots, startup) = ActiveSlot::starting(hold_max);
+            (slots, Some(startup), Mode::Slots(cfg.slot_table()))
+        } else {
+            let members = Upstreams::new(&cfg.frontend);
+            (ActiveSlot::new(), None, Mode::Pool(members))
+        };
+        // Bound before anything is created: an address in use is a start that failed.
+        let admin = cfg
+            .admin_listen
+            .map(|addr| admin_socket(addr, &runtime))
+            .transpose()?;
         let metrics = Arc::new(Metrics::default());
         let paths = TlsPaths {
             certs: cfg.cert_entries(),
@@ -105,7 +128,7 @@ impl Proxy {
             security = security.with_remote(remote);
         }
         let core = Core::with_metrics(
-            cfg.upstream,
+            mode,
             cfg.limits,
             slots,
             tcp_connector(),
@@ -118,7 +141,7 @@ impl Proxy {
             core: Arc::clone(&core),
             runtime: runtime.handle().clone(),
             stop: Arc::new(stop),
-            startup: Arc::new(Mutex::new(Some(startup))),
+            startup: Arc::new(Mutex::new(startup)),
             tls: Arc::clone(&tls),
             secret,
             origin,
@@ -127,6 +150,7 @@ impl Proxy {
             runtime,
             core,
             listener,
+            admin,
             tls,
             stopped,
             hold_max,
@@ -135,12 +159,22 @@ impl Proxy {
     }
 }
 
+/// The admin socket of pool mode, bound now and made known to the runtime.
+fn admin_socket(addr: SocketAddr, runtime: &Runtime) -> io::Result<TcpListener> {
+    let listener = std::net::TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    let _entered = runtime.enter();
+    TcpListener::from_std(listener)
+}
+
 /// Serves until [`ProxyHandle::shutdown`].
 #[derive(Debug)]
 pub struct ProxyRunner {
     runtime: Runtime,
     core: Arc<Core>,
     listener: TcpListener,
+    /// The admin API's socket, in pool mode with `admin_listen` set.
+    admin: Option<TcpListener>,
     tls: Arc<TlsReloader>,
     stopped: watch::Receiver<bool>,
     hold_max: std::time::Duration,
@@ -159,15 +193,28 @@ impl ProxyRunner {
             runtime,
             core,
             listener,
+            admin,
             tls,
             stopped,
             hold_max,
         } = self;
         runtime.block_on(async move {
-            let abandon = Arc::clone(&core);
-            tokio::spawn(async move { abandon.abandon_startup_after(hold_max).await });
-            tokio::spawn(poll(Arc::clone(&core)));
-            tokio::spawn(crate::term::poll(Arc::clone(&core)));
+            if let Some(members) = &core.upstreams {
+                // Pool mode: a poll of each member, and the admin API if it has a socket.
+                for index in 0..members.len() {
+                    let (core, members) = (Arc::clone(&core), Arc::clone(members));
+                    tokio::spawn(pool_probe::poll(core, members, index));
+                }
+                if let Some(admin) = admin {
+                    let members = Arc::clone(members);
+                    tokio::spawn(pool_admin::serve(admin, members, core.limits));
+                }
+            } else {
+                let abandon = Arc::clone(&core);
+                tokio::spawn(async move { abandon.abandon_startup_after(hold_max).await });
+                tokio::spawn(poll(Arc::clone(&core)));
+                tokio::spawn(crate::term::poll(Arc::clone(&core)));
+            }
             serve(core, updates, listener, Acceptor::Tls(tls), stopped).await;
         });
         Ok(())
@@ -224,10 +271,15 @@ impl ProxyHandle {
         self.core.snapshot()
     }
 
-    /// Streams in flight, for restart-on-idle; a hint, read for `== 0`.
+    /// Streams in flight, for restart-on-idle; a hint, read for `== 0`. In pool mode the
+    /// streams open on the members count too: a stream is on a member until it ends.
     #[must_use]
     pub fn open_streams(&self) -> u64 {
-        self.core.slots.open_streams()
+        let pooled = match &self.core.upstreams {
+            Some(members) => members.open_total(),
+            None => 0,
+        };
+        self.core.slots.open_streams() + pooled
     }
 
     /// Whether the secret file was there (`Existing`: children that read it earlier still

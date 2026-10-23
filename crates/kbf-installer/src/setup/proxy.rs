@@ -375,10 +375,8 @@ fn differing(a: &ProxyConfig, b: &ProxyConfig) -> Vec<&'static str> {
         (a.client_ca_file != b.client_ca_file, "client_ca_file"),
         (a.buck2_auth != b.buck2_auth, "buck2_auth"),
         (a.buck2_token_file != b.buck2_token_file, "buck2_token_file"),
-        (
-            a.upstream.base_port != b.upstream.base_port,
-            "upstream.base_port",
-        ),
+        (a.upstream != b.upstream, "upstream.base_port"),
+        (a.frontend != b.frontend, "frontend"),
     ]
     .into_iter()
     .filter_map(|(differs, key)| differs.then_some(key))
