@@ -218,7 +218,7 @@ fn a_healthy_mdm_passes_every_check() {
     assert!(text.ends_with("verify: all checks passed\n"), "{text}");
 }
 
-/// The planted mutant: a secret file others can read (0644) must fail its own check,
+/// Catches: a secret file others can read (0644) must fail its own check,
 /// and only that one. A `verify` that compares the mode loosely (any of the owner's
 /// bits, or "no more than") passes it.
 #[test]

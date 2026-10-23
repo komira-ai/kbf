@@ -254,7 +254,7 @@ mod tests {
     }
 
     /// Catches bytes that are not the pinned manifest being believed (the "wrong
-    /// manifest digest accepted" mutant).
+    /// manifest digest accepted" defect).
     #[test]
     fn bytes_that_do_not_hash_to_the_pin_are_refused() {
         let bytes = manifest("");
