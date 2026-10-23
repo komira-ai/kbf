@@ -128,6 +128,7 @@ mod run_record;
 pub mod serve;
 #[cfg(test)]
 mod serve_remote_tests;
+mod size_key;
 pub mod stamp;
 mod start;
 mod start_exit;

@@ -13,6 +13,7 @@ use kbf_types::{Failure, LeaseId, LeaseKind, OperationId, Outcome, WorkerId};
 use super::State;
 use crate::action_usage::Measured;
 use crate::learned::{Attempt, BATCH, Row, Skip, basis_of_os, hint_of, key_of, kill_run, run_of};
+use crate::machine::Platform;
 use crate::run_record;
 
 impl State {
@@ -26,6 +27,41 @@ impl State {
                 u32::try_from(c.cpu_millis).unwrap_or(u32::MAX)
             }),
         }
+    }
+
+    /// The bounds an attempt of `operation` on `worker` is judged against. With `on`, an
+    /// operation that has a size key is bounded as the scheduler bounds its key floor (the
+    /// largest node that could run the request, not the node that ran this attempt), so
+    /// that the estimator's floor and the scheduler's agree on what a kill raised.
+    pub(super) fn bounds_of(&self, operation: OperationId, worker: &WorkerId) -> Bounds {
+        let mut bounds = self.bounds_on(worker);
+        if self.learned.keys() && self.sched.size_key(operation).is_some() {
+            // Never below the worker's own memory (the bound is the largest worker, and
+            // the one that reported is among those that could run it).
+            bounds.host_memory = bounds
+                .host_memory
+                .max(self.sched.key_floor_bound_of(operation));
+        }
+        bounds
+    }
+
+    /// `floors` with its key-floor part as the scheduler holds it now, for a requeue
+    /// written (or written again) later than it was taken: the floor of the key as it
+    /// stands, and a key's row deleted only if it is still forgotten. A requeue retried
+    /// after a newer one therefore never puts an older floor over a higher row, nor deletes
+    /// the row of a key raised again since.
+    pub(super) fn current_key_floors(
+        &self,
+        floors: &kbf_sched::FloorChange,
+    ) -> kbf_sched::FloorChange {
+        let mut now = floors.clone();
+        now.key_raised = floors
+            .key_raised
+            .as_ref()
+            .and_then(|f| self.sched.key_floor_row(f.key));
+        now.key_evicted
+            .retain(|k| self.sched.key_floor(*k).is_none());
+        now
     }
 
     /// The bounds a new operation for `os` is asked about: the largest registered node of
@@ -97,13 +133,83 @@ impl State {
 
     /// The scheduler has answered the report of `lease`, run by `worker`; `taken`: it
     /// took it.
-    pub(super) fn finish_learning(&mut self, lease: LeaseId, worker: &WorkerId, taken: bool) {
+    pub(super) fn finish_learning(
+        &mut self,
+        operation: OperationId,
+        lease: LeaseId,
+        worker: &WorkerId,
+        taken: bool,
+    ) {
         if self.learned.off() {
             return;
         }
-        let bounds = self.bounds_on(worker);
+        let bounds = self.bounds_of(operation, worker);
         let rows = self.learned.finish(lease, taken, &bounds);
         self.write_estimates(&rows);
+        self.lower_key_floors();
+    }
+
+    /// Names the estimator key of a keyed operation read back from the store, so that the
+    /// decay of its summary reaches the operation's key floor again after a restart.
+    pub(super) fn register_stored(&mut self, op: &super::durable::StoredOperation, size_key: u64) {
+        let platform = Platform::of(&op.request.needs);
+        let Some(subject) = &op.subject else {
+            return;
+        };
+        let Some(basis) = basis_of_os(platform.os_family) else {
+            return;
+        };
+        if let Ok(key) = key_of(&op.request.key.instance, &platform, basis, subject) {
+            self.learned.register(&key, size_key);
+        }
+    }
+
+    /// Takes the key floors the estimator's decay lowered to the scheduler, and writes them
+    /// down on a best-effort basis, as the size summaries are: a row the store refuses is
+    /// kept and written again at a later tick (until then a restart books the higher
+    /// floor). A floor the scheduler holds above what the estimator saw before the decay
+    /// is left alone: a kill the estimator never saw raised it since.
+    pub(super) fn lower_key_floors(&mut self) {
+        for (size_key, before, ask) in self.learned.take_lowered() {
+            if self.sched.key_floor(size_key).is_some_and(|f| f > before) {
+                continue;
+            }
+            let Some(row) = self.sched.lower_key_floor(size_key, ask) else {
+                continue;
+            };
+            self.unwritten_floors.retain(|f| f.key != size_key);
+            self.unwritten_floors.push(row);
+        }
+        self.write_key_floors();
+    }
+
+    /// Writes the lowered key floors waiting for the store; those it refuses stay.
+    fn write_key_floors(&mut self) {
+        let Some(durable) = self
+            .durable
+            .as_ref()
+            .filter(|d| !self.fenced && !d.fenced.load(Ordering::SeqCst))
+        else {
+            // No store to write to, or a newer writer holds it: nothing is kept.
+            self.unwritten_floors.clear();
+            return;
+        };
+        let sched = &self.sched;
+        let learned = &self.learned;
+        // A pending row is written only while the scheduler still holds the floor it
+        // lowered to: a kill that raised it since has written the higher row (a restart
+        // loses what is pending, and the higher row it leaves is the safe side).
+        self.unwritten_floors
+            .retain(|row| sched.key_floor(row.key).unwrap_or(0) == row.ask);
+        self.unwritten_floors.retain(|row| {
+            let refused = durable
+                .put_key_floor(row, learned.summary_key(row.key).as_ref())
+                .err();
+            if let Some(error) = &refused {
+                tracing::warn!(%error, "a lowered key floor was not written");
+            }
+            refused.is_some()
+        });
     }
 
     /// The scheduler gave up `requeue`'s lease: the rows to write once the requeues are
@@ -113,8 +219,10 @@ impl State {
             return Vec::new();
         }
         if let RequeueReason::OutOfMemory { raised, .. } = requeue.reason {
-            let bounds = self.bounds_on(&requeue.worker);
-            return self.learned.requeued(requeue.lease, raised, &bounds);
+            let bounds = self.bounds_of(requeue.operation, &requeue.worker);
+            let rows = self.learned.requeued(requeue.lease, raised, &bounds);
+            self.lower_key_floors();
+            return rows;
         }
         self.learned.forget(requeue.lease);
         Vec::new()
@@ -128,6 +236,7 @@ impl State {
         request: &Request,
         evidence: &Evidence,
         joined: bool,
+        size_key: Option<u64>,
     ) {
         if self.learned.off() || joined {
             return;
@@ -154,6 +263,9 @@ impl State {
                 return;
             }
         };
+        if let Some(size_key) = size_key {
+            self.learned.register(&key, size_key);
+        }
         let bounds = self.bounds_for_os(platform.os_family);
         let hint = hint_of(
             evidence,
@@ -200,6 +312,9 @@ impl State {
         }
         let rows = self.learned.due();
         self.write_estimates(&rows);
+        if !self.unwritten_floors.is_empty() {
+            self.write_key_floors();
+        }
         let Some(today) = self.learned.sweep_due() else {
             return;
         };
