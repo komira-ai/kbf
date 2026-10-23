@@ -81,7 +81,7 @@ pub use durable::{
     ACK_WINDOW, DONE_FLOOR, EpochBump, EpochPolicy, ID_BLOCK, INTAKE_POLL, ORPHAN_WAIT,
     OWNER_CACHE_TTL, SESSION_RENEWAL, StateError,
 };
-pub use handover::UNTRACED_LOOKS;
+pub use handover::{FOLLOW_EVERY, UNTRACED_LOOKS};
 pub use phase::Reported;
 
 use self::ack::{Verdict, refusal};

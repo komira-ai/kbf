@@ -801,6 +801,8 @@ where
         Arc::clone(&farm),
         token.clone(),
         Arc::clone(&drain),
+        // A server with no frontend role has nothing to retire: its retire routes answer 409.
+        Arc::default(),
         members.clone(),
         update_rows.clone(),
         // A server with no frontend role has no enrollment.
