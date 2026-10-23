@@ -105,6 +105,11 @@ The SQLite file is never changed by any of them.
    `diff /etc/kbf/kbf.toml.pre-postgres /etc/kbf/kbf.toml` shows that one line), and the
    backup is there. For a unit file, run `systemctl daemon-reload` now: systemd reads the
    changed file only then.
+
+   This is also the place for any other change to the frontend's settings planned for its
+   next restart (for example a new history store, which needs the Postgres state store): make
+   it now, in the same file, so the frontend restarts once. Keep such changes out of the
+   `.pre-postgres` backup, which is the rollback; a rollback then also undoes them.
 8. **Start the frontend and verify it serves.** `systemctl start <unit>`, then check that
    the unit is active, that its journal shows no state-store error, and that the operator API
    answers: `curl -fsS http://127.0.0.1:8982/readyz` is `200` with `"ready": true` (use the
