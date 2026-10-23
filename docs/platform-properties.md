@@ -12,7 +12,7 @@ These properties change how kbf schedules an action today:
 | `kbf-lease` | `action`, `whole_machine` | `action` | The kind of lease the action runs under (see [`kbf-lease`](#kbf-lease)). |
 | `gpu` | a whole number | `0` | Whole GPUs the action needs. |
 | `kbf-book-cpus` | a whole number, at least 1, plain digits | `1` | Whole cores the lease books. |
-| `kbf-book-mem-gib` | a whole number, at least 1, plain digits | `4` | GiB of memory the lease books. |
+| `kbf-book-mem-gib` | a whole number, at least 1, plain digits | `4` (the first rung of `--memory-ladder-gib`) | GiB of memory the lease asks for: the limit it runs under, checked against the node's memory but not reserved (see [below](#kbf-book-cpus-and-kbf-book-mem-gib)). |
 | `OSFamily` | `linux`; `darwin`, `macos`, `macosx`, `osx` (any case) | any | The operating system of the worker. |
 | `ISA`, `Arch` | `x86-64`, `x86_64`, `amd64`; `arm-a64`, `arm64`, `aarch64`; an ISA level such as `x86-64-v3` (any case) | any | The CPU architecture, and level, of the worker. |
 
@@ -96,10 +96,18 @@ A worker reports how many GPUs it has in the `gpu` entry of its node report; a r
 without one has none. The daemon counts them on Linux from the PCI functions in
 `/sys/bus/pci/devices`: each NVIDIA or AMD VGA-compatible or 3D controller is one
 GPU. A server's management-controller VGA function and integrated graphics do not
-count. An Apple silicon Mac has one GPU, for the whole host, and reports none: on
-macOS (`OSFamily=darwin`, or any spelling that names macOS) a GPU comes only with the
-whole Mac, so `gpu` of 1 or more is refused unless the action also asks for
-`kbf-lease=whole_machine`, which then books no GPU on top: the lease has the whole Mac.
+count. An Apple silicon Mac has one GPU, shared by the whole host, and reports it as
+one slot: `gpu` 1, with `gpu.kind` `native`, its `gpu.cores` and its `gpu.metal_family`
+(the N of the highest `MTLGPUFamilyAppleN` its chip supports; see
+[capabilities.md](design/capabilities.md#the-node-report)). So on macOS
+(`OSFamily=darwin`, or any spelling that names macOS) `gpu=1` books the Mac's GPU slot:
+one GPU action runs on a Mac at a time, and the Mac's CPUs and memory still serve other
+work beside it. The GPU is shared hardware, not a partition: leases that book no GPU
+can still use it, and the tests that do are for one tenant. `gpu` of 2 or more on
+macOS is refused (a Mac has one). A `whole_machine` lease on macOS books no GPU on top:
+the lease has the whole Mac. A Mac whose daemon runs in a virtual machine reports no GPU
+at all, and neither does a Mac whose daemon predates the entry, so a GPU action waits
+for a Mac that does.
 
 In Bazel:
 
@@ -111,9 +119,19 @@ cc_test(
 )
 ```
 
+On a Mac:
+
+```starlark
+py_test(
+    name = "mlx_test",
+    exec_properties = {"OSFamily": "darwin", "gpu": "1"},
+    ...
+)
+```
+
 ## `kbf-lease`
 
-An `action` lease (the default) books a share of a worker: one core and 4 GiB (the first rung of
+An `action` lease (the default) books cores and GPUs of a worker and asks for memory: one core and 4 GiB (the first rung of
 the memory ladder), or what
 `kbf-book-cpus` and `kbf-book-mem-gib` name, plus its `gpu` GPUs. A `whole_machine`
 lease books every core, byte of memory and GPU of its worker, and runs there alone.
@@ -126,8 +144,9 @@ A lease goes only to a worker whose daemon runs a driver for its kind: `containe
 user in that user's GUI session, and the Mac is cleaned before the lease reports
 ([fleet-updates.md](design/fleet-updates.md#101-no-gpu-in-vms)). On a farm without such
 a Mac a `whole_machine` action waits with the reason and then fails, as described under
-[Where an action runs](#where-an-action-runs). A GPU test on a Mac is a
-`whole_machine` lease:
+[Where an action runs](#where-an-action-runs). A GPU test that needs the Mac to itself (a
+performance run, or an app installed in the GUI session) is a `whole_machine` lease;
+one that needs only the GPU asks for `gpu=1` (see [`gpu`](#gpu)):
 
 ```starlark
 py_test(
@@ -144,14 +163,20 @@ placed there. Running leases are never stopped for it.
 
 ## `kbf-book-cpus` and `kbf-book-mem-gib`
 
-Every action books one core and 4 GiB of memory on the worker it runs on (the first
+Every action asks for one core and 4 GiB of memory on the worker it runs on (the first
 rung of the server's memory ladder, `--memory-ladder-gib`), unless it
 names a size: `kbf-book-cpus=N` books `N` whole cores, and `kbf-book-mem-gib=N` books
 `N` GiB. `N` is written in plain digits with no leading zero: `+4` and `04` are
 refused, since each would book the same as `4` under a different action digest, and so
 miss the cache entries `4` made. Either may be given alone; the other stays at its
-default. The scheduler places the action only where that much is free, and holds it
-for the lease until the lease ends, as it does for the default booking.
+default. Cores (and `gpu` GPUs) are booked: the scheduler places the action only on a
+worker with that many free, and holds them for the lease until the lease ends. Memory is
+not booked the same way: the worker's memory capacity must be at least the action's
+memory, but what other leases on the worker hold of its memory never keeps the action
+out. The worker bounds how many actions run at once by their cores, and its
+memory-pressure backstop pauses new starts. An action that asks for the whole host's
+memory (the last rung of the ladder) runs alone on its worker. The memory is the limit the
+action runs under, below.
 
 The booking also sets the memory the action may use. The native driver (Macs) kills an
 action whose processes together hold more than 150% of its booked memory plus 512 MiB:

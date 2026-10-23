@@ -619,7 +619,7 @@ async fn a_tampered_image_is_refused_before_it_is_unpacked() {
     assert_eq!(unpacks(&fake), 0);
 }
 
-/// Catches an image index digest running (the "index accepted" mutant): the registry
+/// Catches an image index digest running (the "index accepted" defect): the registry
 /// serves an index under the pinned digest; the refusal is the action's (`Invalid`), is
 /// made before anything is fetched but the manifest, and unpacks nothing.
 #[tokio::test]

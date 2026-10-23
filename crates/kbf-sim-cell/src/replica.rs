@@ -311,7 +311,7 @@ mod tests {
         }
     }
 
-    /// Catches a time check that lets farm time go back (the mutant "`max(now)`
+    /// Catches a time check that lets farm time go back (the defect "`max(now)`
     /// dropped from apply" would need it).
     #[test]
     fn farm_time_going_back_breaks_monotone_time() {

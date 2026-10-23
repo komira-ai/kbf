@@ -1,0 +1,40 @@
+system/com.example.kbf-real-mac-test.idle.3110 = {
+	active count = 0
+	path = /private/var/tmp/kbf-real-mac-idle-3110-4/job.plist
+	type = LaunchDaemon
+	state = not running
+
+	program = /bin/sleep
+	arguments = {
+		/bin/sleep
+		600
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		XPC_SERVICE_NAME => com.example.kbf-real-mac-test.idle.3110
+	}
+
+	domain = system
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 0
+	last exit code = (never exited)
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	probabilistic guard malloc policy = {
+		activation rate = 1/1000
+		sample rate = 1/0
+	}
+
+	properties = inferred program | system service | tle system
+}

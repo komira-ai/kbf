@@ -69,7 +69,7 @@ fn cmd(program: &str, args: &[&str]) -> Cmd {
     Cmd {
         program: program.to_owned(),
         args: args.iter().map(|a| (*a).to_owned()).collect(),
-        timeout: None,
+        ..Cmd::default()
     }
 }
 
@@ -140,7 +140,7 @@ pub fn unit_install(self_exe: &Path, version: &Version, channel: &Channel) -> Cm
     Cmd {
         program: SYSTEMD_RUN.to_owned(),
         args,
-        timeout: None,
+        ..Cmd::default()
     }
 }
 
@@ -166,7 +166,7 @@ pub fn apt_update(source: &ChannelSource) -> Cmd {
     Cmd {
         program: APT_GET.to_owned(),
         args,
-        timeout: None,
+        ..Cmd::default()
     }
 }
 
@@ -195,7 +195,7 @@ pub fn apt_install(source: &ChannelSource, version: &Version) -> Cmd {
     Cmd {
         program: APT_GET.to_owned(),
         args,
-        timeout: None,
+        ..Cmd::default()
     }
 }
 

@@ -31,7 +31,7 @@ fn unreachable_db() -> Database {
 /// Catches a refusal word that moves: scripts and operators match them. Every variant of
 /// [`SchemaError`] has a word, and the words are these.
 ///
-/// Mutants seen red: `ContractPending` mapped to `database_error`; `Busy` mapped to
+/// Catches: `ContractPending` mapped to `database_error`; `Busy` mapped to
 /// `migration_failed`.
 #[test]
 fn every_schema_refusal_has_its_pinned_word() {
@@ -119,7 +119,7 @@ fn every_schema_refusal_has_its_pinned_word() {
 /// `status.json` being unreadable passing as "no migration needed". The database is
 /// unreachable here, so any attempt to use it would show as `database_error`.
 ///
-/// Mutant seen red: the `facts.commit == *release` guard removed.
+/// Catches: the `facts.commit == *release` guard removed.
 #[test]
 fn a_release_that_is_not_the_staged_one_is_refused_before_the_database_is_asked() {
     let (w, _) = World::with_old();
@@ -143,7 +143,7 @@ fn a_release_that_is_not_the_staged_one_is_refused_before_the_database_is_asked(
 /// neither it nor the database's `Debug` carries the password, the user, the database or
 /// the host of the URL.
 ///
-/// Mutants seen red: `PostgresConfig`'s `Debug` made to print its connection settings;
+/// Catches: `PostgresConfig`'s `Debug` made to print its connection settings;
 /// the refusal text made to carry the `Debug` of the database.
 #[test]
 fn an_unreachable_database_is_refused_without_the_url_in_any_message() {
@@ -172,7 +172,7 @@ fn an_unreachable_database_is_refused_without_the_url_in_any_message() {
 /// the day. The default wait handed to the schema code is exactly 30 s, a configured one
 /// is passed as it is, and the schema is the staged release's.
 ///
-/// Mutants seen red: `LOCK_WAIT` made 3000 s; `with_lock_wait` ignored.
+/// Catches: `LOCK_WAIT` made 3000 s; `with_lock_wait` ignored.
 #[test]
 fn the_lock_wait_is_handed_to_the_migration() {
     use kbf_state::postgres::schema::Outcome;
@@ -220,7 +220,7 @@ fn outcome(schema: u32) -> Result<Outcome, SchemaError> {
 /// refused without asking anyone; and with no probe given, even the installed one is
 /// refused as before. `status.json` unreadable or naming no installed release refuses too.
 ///
-/// Mutants seen red: the `installed` comparison dropped (C was asked); the probe called for
+/// Catches: the `installed` comparison dropped (C was asked); the probe called for
 /// the staged release too (B asked); the `Some(ask)` guard dropped (A refused).
 #[test]
 fn the_installed_release_is_migrated_for_the_schema_it_declares() {
@@ -280,7 +280,7 @@ fn the_installed_release_is_migrated_for_the_schema_it_declares() {
 /// Catches an installed release that cannot say what it needs being migrated for anyway:
 /// the probe's refusal is the migrator's, verbatim, and the database is not asked.
 ///
-/// Mutant seen red: the probe's error swallowed into a default schema.
+/// Catches: the probe's error swallowed into a default schema.
 #[test]
 fn a_release_that_cannot_say_its_schema_is_refused_and_the_database_untouched() {
     let (w, _) = World::with_old();
@@ -313,7 +313,7 @@ fn says(stdout: String) -> FakeRunner {
 /// user, or without a bound. It runs the release's own binary, `--version --json`, with an
 /// empty environment, in `/`, as the caller, for at most 10 s, and reads `state_schema`.
 ///
-/// Mutants seen red: env passed through; `run_as` set; the bound removed; `--json` dropped.
+/// Catches: env passed through; `run_as` set; the bound removed; `--json` dropped.
 #[test]
 fn the_probe_runs_the_release_with_nothing_but_its_flags_and_reads_the_schema() {
     let runner = says(version_json(A, "release"));
@@ -333,7 +333,7 @@ fn the_probe_runs_the_release_with_nothing_but_its_flags_and_reads_the_schema() 
 /// `schema_unknown`: it does not run; times out; exits non-zero; prints something else; is
 /// another commit's build; is a debug build; or declares a schema that is not a `u32`.
 ///
-/// Mutants seen red: exit status not looked at; `check` skipped (another commit's schema
+/// Catches: exit status not looked at; `check` skipped (another commit's schema
 /// used); the `u32` conversion saturating.
 #[test]
 fn every_way_a_release_fails_to_say_its_schema_is_schema_unknown() {
@@ -369,7 +369,7 @@ fn every_way_a_release_fails_to_say_its_schema_is_schema_unknown() {
 /// it before the candidate starts. A refusal ends the update at `migrate` with its word, the
 /// old child serving and nothing spawned. (The real schema version of this is in `database`.)
 ///
-/// Mutants seen red: the swap's `migrate_forward` call moved after the spawn; the refusal
+/// Catches: the swap's `migrate_forward` call moved after the spawn; the refusal
 /// ignored.
 #[test]
 fn the_swap_runs_the_db_migrator_before_the_candidate_and_stops_on_its_refusal() {
@@ -608,7 +608,7 @@ mod database {
     /// release's version and kbf opens on it. Again: nothing runs, the recorded row (and
     /// its time) is the same one.
     ///
-    /// Mutants seen red: `migrate_forward` returning `Ok` without migrating; the
+    /// Catches: `migrate_forward` returning `Ok` without migrating; the
     /// `schema_version` INSERT run twice (a second run changed the row).
     #[test]
     fn a_fresh_database_gets_the_schema_and_a_repeat_changes_nothing() {
@@ -629,7 +629,7 @@ mod database {
     /// migrates to 2 (a release that needs 2 while 3, a contract step, exists in the
     /// installer); N keeps reading what it wrote and writing; the schema is at 2, not 3.
     ///
-    /// Mutant seen red: the target taken as the installer's newest instead of the staged
+    /// Catches: the target taken as the installer's newest instead of the staged
     /// release's (the contract step was refused for a release that does not need it).
     #[test]
     fn an_additive_migration_leaves_the_serving_child_reading_and_writing() {
@@ -656,7 +656,7 @@ mod database {
     /// release needs 3, a contract step: the update is refused as `not_additive` and
     /// migration 2, which is additive and pending before it, is not run either.
     ///
-    /// Mutant seen red: the contract check removed from `apply` (3 ran: the column was
+    /// Catches: the contract check removed from `apply` (3 ran: the column was
     /// added and dropped, and the version was 3).
     #[test]
     fn a_release_that_needs_a_contract_step_is_refused_and_nothing_runs() {
@@ -699,7 +699,7 @@ mod database {
     /// creates nothing; a long wait stays blocked until the lock is released, then
     /// applies, and a third migrator (the one that raced) finds nothing to do.
     ///
-    /// Mutants seen red: `lock_wait` ignored in `Database::migrate_within` (the short wait
+    /// Catches: `lock_wait` ignored in `Database::migrate_within` (the short wait
     /// hung until the holder was released: the 5 s receive timed out); the schema lock
     /// statement removed from the migration transaction (the long wait did not block).
     #[test]
@@ -776,7 +776,7 @@ mod database {
     /// A role that does not exist and a database that does not exist are each refused as
     /// `database_error` with the SQLSTATE and neither name.
     ///
-    /// Mutant seen red: `describe_refusal` made to return `describe` (the FATAL text with
+    /// Catches: `describe_refusal` made to return `describe` (the FATAL text with
     /// both names in it).
     #[test]
     fn a_refused_connection_names_neither_role_nor_database() {
@@ -813,7 +813,7 @@ mod database {
     /// step `migrate` with the stable word, spawns nothing, and drops the staged release.
     /// Neither the swap's notes nor the recorded reason carry the URL.
     ///
-    /// Mutants seen red: `Refusal::of` mapping `Failed` to `database_error`; the swap
+    /// Catches: `Refusal::of` mapping `Failed` to `database_error`; the swap
     /// ignoring the migrator's error (the candidate spawned).
     #[test]
     fn a_failed_migration_rolls_back_and_the_swap_refuses_with_the_old_child_serving() {
@@ -862,7 +862,7 @@ mod database {
     /// migration not reaching the database: over the same real schema, a release that needs
     /// 2 migrates first, then the candidate starts, and the swap completes.
     ///
-    /// Mutant seen red: the swap's `migrate_forward` call moved after the spawn.
+    /// Catches: the swap's `migrate_forward` call moved after the spawn.
     #[test]
     fn the_swap_migrates_before_the_candidate_starts() {
         let s = Scratch::new();

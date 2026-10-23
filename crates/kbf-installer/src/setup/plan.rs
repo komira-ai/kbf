@@ -695,8 +695,8 @@ fn frontend_file(
 }
 
 /// The part after the state database's schema: `kbf.toml` (on an all-in-one host `frontend.toml`
-/// before it), then the units. `released` says whether a release is installed already: the units
-/// start only if it is. Reads the host, changes nothing.
+/// before it), then the units. `released` says whether there is a `kbf` to start: a release is
+/// installed already, or `/usr/bin/kbf` is present. Reads the host, changes nothing.
 pub fn after_release(
     os: &dyn Os,
     exec: &dyn Exec,
@@ -832,8 +832,8 @@ fn units(
     no_start: bool,
 ) -> Result<Vec<String>, SetupError> {
     let mut notes = Vec::new();
-    // The mode's units are started when the operator did not forbid it and a release is
-    // there to run. The installer's own service has nothing to wait for. A unit that makes a
+    // The mode's units are started when the operator did not forbid it and there is a `kbf`
+    // to start (a release is installed, or `/usr/bin/kbf` is present). The installer's own service has nothing to wait for. A unit that makes a
     // frontend is never started here: starting one takes the state database and the public
     // port, which only the operator decides.
     let start_mode = if v.mode.keeps_state_in_database() {

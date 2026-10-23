@@ -21,12 +21,7 @@
 //! - [`safe_http`]: the real safe-to-stop, a call to the operator API;
 //! - [`health`] and [`node_health`]: the real health check of a storage or daemon host, over
 //!   the operator API; a frontend host is refused until the kbf-proxy drain control exists;
-//! - [`not_built`]: the installer this build does not have yet, which refuses, so that a
-//!   roll fails at its first step with no host touched;
 //! - [`daemon`]: the flags and the wiring of all of it.
-//!
-//! The daemon still wires `not_built` for the installer; switching it to `ssh_installer` is
-//! a later change.
 
 pub mod api;
 pub mod daemon;
@@ -36,7 +31,6 @@ pub mod http;
 pub mod inventory;
 pub mod listener;
 pub mod node_health;
-pub mod not_built;
 pub mod operator;
 pub mod ports;
 pub mod record;

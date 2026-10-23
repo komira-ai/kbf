@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn the_leafs_ips_are_forwarded_sorted_and_canonical() {
         let id = identity_of(&cert_with_ips(
-            &["spoolr-node-01"],
+            &["worker-node-01"],
             Some("storage"),
             &[
                 "192.0.2.10",
@@ -389,7 +389,7 @@ mod tests {
             "192.0.2.1,192.0.2.10,fd00::1"
         );
 
-        let none = identity_of(&cert(&["spoolr-node-01"], Some("storage"))).expect("identity");
+        let none = identity_of(&cert(&["worker-node-01"], Some("storage"))).expect("identity");
         let mut h = HeaderMap::new();
         h.append(NODE_IPS, HeaderValue::from_static("198.51.100.9"));
         forward_headers(&mut h, Some(&none), None, &secret()).expect("forward");

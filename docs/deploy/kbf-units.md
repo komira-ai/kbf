@@ -180,7 +180,7 @@ because it learns a node's boot only when the node registers, after the frontend
 
 ### The state store: Postgres for the frontend
 
-The frontend's state store is Postgres (CEO ruling: SQLite is dropped for it). The frontend
+The frontend's state store is Postgres (ruling: SQLite is dropped for it). The frontend
 gets `--state-store`, a `postgres://` URI, from `kbf.toml` (`kbf-installer setup` writes it,
 as `postgres:///kbf?host=/run/postgresql&user=kbf-server`), and it has no default: a
 frontend given none exits 2 naming the flag, and `kbf --mode=frontend --check`, which the
@@ -398,7 +398,7 @@ themselves. There is no `node` mode and no `enroll` word.
 
 ## Installing a mode's unit
 
-`kbf-installer setup` installs the packaged unit of the host's mode and enables it
+The `kbf` package installs the unit of each mode; `kbf-installer setup` enables the one of the host's mode
 ([kbf-installer-setup.md](kbf-installer-setup.md)); `kbf-deploy linux install-units` is
 retired. There is no uninstall for a mode's unit yet. A node moving from the converged units
 (`kbf-server.service`) to `kbf-storage.service` stops the old ones first

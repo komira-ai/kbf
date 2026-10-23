@@ -15,7 +15,7 @@ use super::secure::{connect_tls, tls_rig};
 use crate::auth::Buck2Auth;
 use crate::reply::OWN_HEADERS;
 
-/// The five headers and values the CEO ruling names, written out here and not read from
+/// The five headers and values the ruling names, written out here and not read from
 /// `OWN_HEADERS`, so a change to the constant is a change to this test too.
 const WANT: [(&str, &str); 5] = [
     (

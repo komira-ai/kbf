@@ -340,7 +340,7 @@ fn the_exit_codes_are_the_contracts() {
     assert_eq!(codes, [0, 1, 2, 3, 4, 5]);
 }
 
-/// Catches a positional argument (CEO rule: every argument other than the verb is a named
+/// Catches a positional argument (rule: every argument other than the verb is a named
 /// flag), anywhere in the command tree, hidden verbs included; and clap's own consistency
 /// checks of the definition.
 #[test]

@@ -11,6 +11,17 @@
 //! hold; nothing was changed), 1 failed (a call failed or the copy did not verify; a mistake
 //! on the command line is 1 too).
 //!
+//! Two commands go with the copy ([`cutover`]): `cutover` runs the copy and then points the
+//! frontend's one state-store setting (the `[scheduler] state-store` key of `kbf.toml`, or a
+//! `--state-store=` flag of a unit file) at Postgres, keeping the original file as
+//! `<file>.pre-postgres`; `rollback` puts that file back. Both are dry runs without
+//! `--apply`, and neither changes the SQLite file.
+//!
+//! ```text
+//! kbf-state-copy cutover <state.db> <postgres-url> --config <kbf.toml> [--unit <name>] [--apply]
+//! kbf-state-copy rollback --config <kbf.toml> [--unit <name>] [--apply]
+//! ```
+//!
 //! # What is checked
 //!
 //! - **The frontend is stopped.** The single-writer lock beside the state file ([`lock`]) is
@@ -53,14 +64,17 @@
 
 pub mod app;
 pub mod cli;
+pub mod cutover;
 pub mod digest;
 pub mod error;
 pub mod lock;
 pub mod seams;
+pub mod setting;
 pub mod source;
 pub mod target;
+pub mod unit;
 
-pub use app::{main_with, run};
-pub use cli::Args;
+pub use app::{main_with, main_with_seams, run};
+pub use cli::{Args, CutoverArgs, PlaceArgs, RollbackArgs};
 pub use error::Error;
 pub use seams::{Seams, Stage};

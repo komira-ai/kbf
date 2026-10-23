@@ -33,10 +33,24 @@ What a Linux daemon reports today:
 
 A daemon on an Apple silicon Mac asks `sysctl` instead: `hw.optional` (which `kbf-caps`
 parses into `cpu.features` and `isa_level`), `hw.ncpu` (`cpus`), `hw.memsize`
-(`mem_gib`), `hw.pagesize` (`page_size`) and `machdep.cpu.brand_string` (`cpu.model`,
-reported on macOS only), with `os` = `macos` and `arch` = `arm64`. It reports `gpu` = 0:
-`kbf-caps` can count the integrated GPU (`gpus_from_macos_sysctl`), but the daemon does
-not offer it for booking. A daemon on any other operating system refuses to start.
+(`mem_gib`), `hw.pagesize` (`page_size`), `machdep.cpu.brand_string` (`cpu.model`,
+reported on macOS only) and `kern.hv_vmm_present`, with `os` = `macos` and
+`arch` = `arm64`. Its integrated GPU is one slot the scheduler books (see
+[platform-properties.md](../platform-properties.md#gpu)): `gpu` = 1
+(`gpus_from_macos_sysctl`), so one GPU lease runs on the Mac at a time, with these
+entries beside it:
+
+| Key | Value | Source |
+|---|---|---|
+| `gpu.kind` | `native`: the daemon runs on the hardware, so the GPU is the host's own | `kern.hv_vmm_present` is not 1 |
+| `gpu.cores` | the GPU's core count; left out when it cannot be read | `gpu-core-count` of `ioreg -r -d 1 -c AGXAccelerator` (the IOKit registry; `sysctl` has no GPU core count) |
+| `gpu.metal_family` | the N of the highest `MTLGPUFamilyAppleN` the chip supports (M1: 7, M2: 8, M3 and M4: 9); left out for a chip not in the table | the chip name in `machdep.cpu.brand_string` |
+
+A Mac whose daemon runs in a virtual machine (`kern.hv_vmm_present` is 1) reports `gpu`
+= 0 and none of these entries: its paravirtual GPU is not the hardware's. A request can
+name `gpu.kind` (exact, `gpu.kind=native`); `gpu.cores` and `gpu.metal_family` are
+reported and not yet requestable (they are **planned** as minimums). A daemon on any
+other operating system refuses to start.
 
 `cpus` and `mem_gib` are the whole machine. They are resources, not capabilities: the
 scheduler books against them and there are no slots (see

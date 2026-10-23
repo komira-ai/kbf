@@ -35,7 +35,7 @@ fn from_hostname(hostname: &Path) -> Option<String> {
 }
 
 /// `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`: a DNS label, which is what a node id is.
-fn is_label(id: &str) -> bool {
+pub(crate) fn is_label(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 63
         && !id.starts_with('-')

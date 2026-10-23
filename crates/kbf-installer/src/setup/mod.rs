@@ -17,8 +17,9 @@
 //! - Idempotent: steps are planned only where the host differs. The same flags again is an
 //!   empty plan; changed flags rewrite the files atomically and never restart a running
 //!   service. An operator floor (`min_generation`) only goes up.
-//! - It installs no release: kbf updates are OS packages. A unit is started only where a release
-//!   is installed already (`releases/current`), and is otherwise enabled and left stopped. On a
+//! - It installs no release: kbf updates are OS packages. A unit is started only where `kbf` is
+//!   there already (a release at `releases/current`, or `/usr/bin/kbf` from the kbf package),
+//!   and is otherwise enabled and left stopped. On a
 //!   frontend or all-in-one host the state database's schema is created or brought forward
 //!   ([`Schemas`]) once `installer.toml` is written, and a unit that makes a frontend is enabled
 //!   and never started.
@@ -231,6 +232,16 @@ fn released(exec: &dyn Exec, layout: &Layout) -> Result<bool, SetupError> {
     present(exec, &layout.current())
 }
 
+/// The `kbf` the kbf package installs, which every mode unit runs.
+const PACKAGED_KBF: &str = "/usr/bin/kbf";
+
+/// Whether the host has the `kbf` the kbf package installs: a host from the packages has no
+/// release tree, and this file is what its units run. A link counts, as it does for
+/// [`released`]: only its being there is asked.
+fn packaged_kbf(exec: &dyn Exec) -> Result<bool, SetupError> {
+    present(exec, &HostPath::new(PACKAGED_KBF)?)
+}
+
 /// Whether anything is at `path`: a link counts, whether or not it points at something.
 fn present(exec: &dyn Exec, path: &HostPath) -> Result<bool, SetupError> {
     Ok(exec.stat(path)?.is_some() || exec.inspect(path)?.is_some())
@@ -361,9 +372,10 @@ pub fn run(
         }
     }
 
-    // No release is installed here. The units start only where one is there already.
-    let have_release = released(&*exec, &ctx.layout)?;
-    let after = plan::after_release(os, &*exec, &valid, &ctx, have_release, options.no_start)?;
+    // No release is installed here. A unit has a `kbf` to run when a release is installed
+    // already or the kbf package is.
+    let runs = released(&*exec, &ctx.layout)? || packaged_kbf(&*exec)?;
+    let after = plan::after_release(os, &*exec, &valid, &ctx, runs, options.no_start)?;
     steps += emit(&after.plan, exec, options.apply, out)?;
     notes.extend(after.notes);
 

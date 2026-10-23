@@ -4,12 +4,11 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::Path;
 
-use clap::Parser;
-
-use crate::cli::Args;
+use crate::cli::{self, Args, Request};
+use crate::cutover;
 use crate::digest::Summary;
 use crate::error::Error;
-use crate::lock;
+use crate::lock::{self, Guard};
 use crate::seams::{Seams, Stage};
 use crate::source::{self, Snapshot};
 use crate::target::{self, Target};
@@ -24,16 +23,34 @@ pub fn main_with(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
-    let args = match Args::try_parse_from(argv) {
-        Ok(args) => args,
+    main_with_seams(argv, &Seams::default(), out, err)
+}
+
+/// [`main_with`] with the places a test reaches into passed in.
+pub fn main_with_seams(
+    argv: impl IntoIterator<Item = OsString>,
+    seams: &Seams,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let request = match cli::parse(argv.into_iter().collect()) {
+        Ok(request) => request,
         Err(usage) => return usage_exit(&usage, out, err),
     };
-    match run(&args, &Seams::default(), out) {
+    match dispatch(&request, seams, out) {
         Ok(()) => 0,
         Err(error) => {
             let _ = writeln!(err, "kbf-state-copy: {error}");
             error.code()
         }
+    }
+}
+
+fn dispatch(request: &Request, seams: &Seams, out: &mut dyn Write) -> Result<(), Error> {
+    match request {
+        Request::Copy(args) => run(args, seams, out),
+        Request::Cutover(args) => cutover::run(args, seams, out),
+        Request::Rollback(args) => cutover::rollback(args, seams, out),
     }
 }
 
@@ -64,10 +81,31 @@ fn usage_exit(usage: &clap::Error, out: &mut dyn Write, err: &mut dyn Write) -> 
 pub fn run(args: &Args, seams: &Seams, out: &mut dyn Write) -> Result<(), Error> {
     let db = lock::canonical(&args.state_db)?;
     let held = lock::take(&db)?;
-    let snapshot = source::read(&db)?;
-    let _held = args.apply.then_some(held);
+    copy(args, seams, out, &db, held)?;
+    if !args.apply {
+        out.write_all(DRY_RUN.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// The checks and the copy of [`run`], for a caller that holds the frontend's lock `held` on
+/// the state file `db` (its canonical name). After a copy the lock is handed back still
+/// held, for the caller to keep while it does what must follow; after a dry run there is
+/// none (the lock is let go of once the file is read).
+///
+/// # Errors
+/// As [`run`].
+pub(crate) fn copy(
+    args: &Args,
+    seams: &Seams,
+    out: &mut dyn Write,
+    db: &Path,
+    held: Guard,
+) -> Result<Option<Guard>, Error> {
+    let snapshot = source::read(db)?;
+    let kept = args.apply.then_some(held);
     let want = snapshot.summary();
-    let text = report(&db, args.apply, &snapshot, &want);
+    let text = report(db, args.apply, &snapshot, &want);
     out.write_all(text.as_bytes())?;
     let target = Target::new(&args.postgres_url)?;
     target.check_schema()?;
@@ -76,15 +114,14 @@ pub fn run(args: &Args, seams: &Seams, out: &mut dyn Write) -> Result<(), Error>
     target::require_clocks(probe.server_clock_us, (seams.local_now_us)())?;
     out.write_all(CHECKED.as_bytes())?;
     if !args.apply {
-        out.write_all(DRY_RUN.as_bytes())?;
-        return Ok(());
+        return Ok(kept);
     }
     target.apply(&snapshot, &want, seams)?;
     read_back(&target, &snapshot, &want, seams)?;
     // The copy is committed and has passed both checks: a report that cannot be written does
     // not undo that.
     let _ = out.write_all(done(&snapshot, &want).as_bytes());
-    Ok(())
+    Ok(kept)
 }
 
 /// Reads the committed copy back on a new connection and compares it with the file: its
