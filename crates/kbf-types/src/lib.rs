@@ -1,9 +1,9 @@
 //! Shared value types for kbf: the content digest (function, hash, size), an image named
 //! by manifest digest, platform properties, QoS levels, lease identifiers and kinds, node
 //! phases, farm time, the vocabulary of scheduled work (operations, workers, request
-//! vectors, control-log records), and the `StateMachine` trait and `Effect` enum that the
-//! pure cores implement and emit, and the
-//! enrollment vocabulary (tokens, node ids, roles, the reasons a frontend refuses a node).
+//! vectors, control-log records), the `StateMachine` trait and `Effect` enum that the
+//! pure cores implement and emit, and the enrollment vocabulary (tokens, node ids, roles,
+//! the reasons a frontend refuses a node).
 //!
 //! This is a pure crate: no async runtime, network, clock, randomness or hashed
 //! collections. The layering test in `kbf-integration-test` and the lists in `clippy.toml` enforce it.

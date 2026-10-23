@@ -264,19 +264,12 @@ OS packages driven by `kbf-updater`.
 |---|---|---|---|
 | F3.1 | The last worker of a platform cordoned | cordon the only arm64 worker, and the only Mac, for longer than the unservable wait | work for it waits with the cordon reason and is never refused (I10); other platforms run; it runs after the uncordon, placed by the uncordon itself, not the next tick |
 | F3.2 | Cordoned and then silent, and the reverse | the last arm64 worker cordoned, then silent past G; or silent, then back cordoned | the wait becomes refusable when the worker stops being live, and counts from then, not from the cordon; the refusal comes the unservable wait after that |
-| F3.3 | A worker dies while draining | drain, then silence past G | its leases are requeued for silence, not for the drain; the drain then reads `Drained`; the rollout driver keeps the node at `draining` while it is disconnected, and hands over the update once it is back, drained |
+| F3.3 | A worker dies while draining | drain, then silence past G | its leases are requeued for silence, not for the drain; the drain then reads `Drained` |
 | F3.4 | A paused drain whose leases end later | a deadline shorter than the leases | it stays `Paused`; a new drain with a new deadline goes to `Drained` at once |
-| F3.5 | A rollout over a mixed fleet, `max_unavailable` 1 to 3 | a rollout over 4 to 12 nodes with running work, driver steps at random times | at every step, at most `max_unavailable` nodes out of service by the record, and no more cordoned by the driver; each node goes `cordoned -> draining -> updating` in order; an `updating` node held no lease when handed over |
-| F3.6 | An operator acts during a rollout | uncordon a draining node; cordon another; drain one the rollout has not reached | the driver holds the rollout on the uncordoned node and nothing moves after; the operator's own cordon does not count toward `max_unavailable` (the record counts its own nodes) |
 | F3.7 | A node reboots during its update | a cordoned node registers again | it comes back cordoned (a cordon names the worker, not the session) and gets no grant |
 | F3.8 | Capabilities change while cordoned | a `Capacity` with new caps (an Xcode added) during a drain | after the uncordon, matching uses the new caps |
-| F3.9 | A refused hand-over or a failing store | the `Applier` refuses; the store fails a write | the node and the rollout are held; a failed write leaves the node untouched |
 
-Planned, not simulated: the last-of-class pre-gate with `min_serving` and
-`accept_outage` (today a rollout may cordon the last node of a class, and F3.1 checks
-what happens then: its work waits and is not refused), per-pool slots shared across
-rollouts (today two rollouts over one pool may each take `max_unavailable`), canary
-and soak, and the steps after `updating`.
+F3.5, F3.6 and F3.9 were the rollout driver's scenarios and went with it.
 
 **Mutants F3 must catch:**
 
@@ -286,7 +279,7 @@ and soak, and the steps after `updating`.
 | a `Cordoned` verdict counts toward refusal | `scheduler.rs` (`note`) | F3.1 (I10) |
 | the wait keeps its start across a cordon (`since` kept from cordoned to unservable) | `scheduler.rs` (`note`) | F3.2 (I10, L2) |
 | `progress` moves `Paused` to `Drained` when leases end | `cordon.rs` | F3.4 (I9) |
-| a drain requeues the worker's leases | `scheduler.rs` | F3.4, F3.5 (I9) |
+| a drain requeues the worker's leases | `scheduler.rs` | F3.3, F3.4 (I9) |
 | `uncordon` does not place at once | `scheduler.rs` | F3.1 |
 | the matching memo is keyed by the first request of the round only | `servable.rs` | F3.8, F4 (I7) |
 
@@ -332,9 +325,6 @@ seed and command that show it.
 - **A wait bound under load.** Should a large request, or `batch` work, have a bound on
   how long smaller or more urgent arrivals can pass it before scoring and fair turns
   land? Today neither has one (F1.5, F1.6).
-- **`max_unavailable` per pool or per rollout.** The record counts a rollout's own
-  nodes; section 4.1 of fleet-updates.md says per pool, shared by every rollout. The
-  per-pool slot is phase P2; until then F3.5 checks the per-rollout count.
 
 ## 8. The cell (`kbf-sim-cell`)
 
