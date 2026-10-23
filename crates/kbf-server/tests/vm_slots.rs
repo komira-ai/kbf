@@ -107,12 +107,13 @@ fn the_host_floor_comes_from_its_flags() {
     assert!(listeners(&["--vm-host-floor-mem-gib", "-1"]).is_err());
 }
 
-/// Catches: a server that books a node's slots from the report and also from a stream it
-/// replaced, so that one node name seen twice (a daemon restarted over its predecessor's
-/// stream) holds four VM slots, and a node whose `vm.slots` and floor do not reach the
-/// operator API's capacity.
+/// Catches: a server that adds a node's reported capacity to what it already holds when
+/// the same node name registers again (a daemon restarted over its predecessor's stream),
+/// so the node would hold four VM slots and twice the floored CPUs and memory; and a node
+/// whose `vm.slots` and floor do not reach the operator API's capacity. It proves one node
+/// name only: the server has no host identity, so two names on one host are not detected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn one_node_registered_twice_holds_two_vm_slots() {
+async fn re_registering_a_node_replaces_its_vm_slots_and_floor() {
     let cell = Cell::start_with_api().await;
     let api = cell.api.expect("an API address");
     let _first = FakeDaemon::connect(cell.worker_addr, hello_with_slots("mac-1", Some("2")))

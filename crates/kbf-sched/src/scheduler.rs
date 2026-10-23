@@ -234,8 +234,10 @@ impl Worker {
                     && (!self.exclusive(request) || self.leases == 0)
             }
             // A VM's memory is a booking: the guest holds it whole for as long as it runs,
-            // so what other leases hold of the node's memory keeps it out, and VMs never
-            // overcommit the node.
+            // so what other leases hold of the node's memory keeps it out: a VM is placed
+            // only if its full request, memory included, fits the node's free capacity.
+            // Actions are not checked against memory, so a VM can wait behind a stream of
+            // them; nothing reserves a node for a queued VM.
             LeaseKind::Vm => {
                 !self.whole
                     && self.free().fits(&request.resources)
@@ -523,7 +525,9 @@ impl Scheduler {
     /// instead of filling one worker after another. An action has room where its CPUs,
     /// GPUs and VM slots are free and no whole-machine lease is held; its memory is only
     /// checked against the worker's, never against what other leases hold
-    /// ([`Worker::has_room`]), though what they hold ranks the workers; a
+    /// ([`Worker::has_room`]), though what they hold ranks the workers; a VM has room
+    /// only where its full request, memory included, fits what is free, so it can wait
+    /// behind actions and nothing reserves a worker for it; a
     /// whole-machine lease only on a worker that holds no lease, and it books all of it.
     ///
     /// A whole-machine operation that fits nowhere holds one worker that could run it

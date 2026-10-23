@@ -249,6 +249,10 @@ Rules common to every option, all **[A]** design:
   [capabilities.md](capabilities.md#planned) and [scheduler.md](scheduler.md)).
 - **A running VM books** its vCPUs as cores and its memory plus 1 GiB for the helper
   process: 6 cores and 17 GiB by default, 4-12 cores and 9-33 GiB within the bounds.
+- **One Mac is one node id.** The server has no host identity, so it cannot tell that
+  two node ids run on one host: each would book its own 2 VM slots and its own host
+  floor, which is more than the Mac can run. Run each Mac as exactly one node id. A
+  host-identity report entry to key the slots per host is proposed in komira-ai/kbf#1589.
 - **An idle slot books nothing:** its CPU and memory serve bare-metal leases.
 - **No overcommit** of memory. CPU is booked in full too: a starved simulator makes UI
   tests time out, and quality comes before throughput. Booking is admission control;
