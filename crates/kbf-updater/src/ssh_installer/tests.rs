@@ -1022,3 +1022,5 @@ fn an_unwritable_work_directory_stops_the_call() {
     );
     assert!(r.fake.calls().is_empty());
 }
+
+mod restart;

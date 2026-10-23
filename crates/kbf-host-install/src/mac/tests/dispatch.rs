@@ -128,6 +128,23 @@ fn a_request_that_cannot_be_passed_on_is_refused_before_sudo() {
     );
 }
 
+/// Asserts that a Mac refuses a `restart` request as a bad command with exit status 2, runs
+/// no command, and audits it under the verb `restart` with no unit.
+#[test]
+fn a_mac_refuses_a_restart() {
+    let fx = Fx::new("mac-restart");
+    let sim = fx.sim();
+    let inv = invocation(&[], true, Some("restart frontend=a1"));
+    let answer = go(&fx, &sim, &inv, b"");
+    assert_eq!((answer.code, answer.out.as_str()), (2, REFUSED));
+    assert_eq!(sim.calls.borrow().len(), 0);
+    let audit = fx.audit_lines();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0]["verb"], "restart");
+    assert_eq!(audit[0]["reason"], "bad_command");
+    assert!(audit[0].get("unit").is_none());
+}
+
 /// A process that already is root handles the request itself, with no sudo.
 #[test]
 fn a_root_process_handles_the_request_itself() {

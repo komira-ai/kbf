@@ -9,9 +9,10 @@ publish.workspace = true
 
 # The root side of the host-driven package update: the forced command of the key that
 # `kbf-updater` holds (docs/deploy/host-install.md). sshd runs it with the command the
-# updater asked for in `SSH_ORIGINAL_COMMAND`; it accepts two verbs, checks them against a
-# root-owned allowlist and runs `apt-get` for the one package, one source, no shell. On a Mac
-# it installs the release tarball into the kit layout instead.
+# updater asked for in `SSH_ORIGINAL_COMMAND`; it accepts three verbs, checks an install
+# against a root-owned allowlist and runs `apt-get` for the one package, one source, no shell,
+# and restarts a frontend unit with `systemctl`. On a Mac it installs the release tarball into
+# the kit layout instead.
 [[bin]]
 name = "kbf-host-install"
 path = "src/main.rs"
