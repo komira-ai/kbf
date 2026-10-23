@@ -9,9 +9,9 @@
 //! as unknown.
 //!
 //! **Who writes what.** A registration replaces all three facts, so a node restarted on
-//! another build shows that build. A heartbeat replaces `log_version` (a log is raised while
-//! the node runs) and keeps what the row holds of the other two, which cannot change without
-//! a restart; a field the row does not hold takes the heartbeat's.
+//! another build shows that build. A heartbeat replaces `log_version` (which a build that
+//! raises its log changes while the node runs) and keeps what the row holds of the other two,
+//! which cannot change without a restart; a field the row does not hold takes the heartbeat's.
 //!
 //! **A row an older frontend rewrote.** A frontend built before these tags does not know
 //! them and drops them when it rewrites a row (a heartbeat, a state change), as it drops the
@@ -29,9 +29,11 @@ pub const MAX_BUILD_COMMIT: usize = 64;
 /// What a node said of itself: see the module docs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NodeFacts {
-    /// The newest metadata-log machine version the node's build can raise its log to.
+    /// The newest metadata-log machine version the node's build runs: informational, frozen
+    /// at 5, since no build raises a log any more.
     pub runs_log: Option<u32>,
-    /// The machine version its metadata log is at now.
+    /// The machine version its metadata log is at now: informational, the version an earlier
+    /// build left (1 for a new log).
     pub log_version: Option<u32>,
     /// The commit the node's binary was built from: at most [`MAX_BUILD_COMMIT`] bytes of
     /// what it said are kept.

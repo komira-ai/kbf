@@ -7,7 +7,7 @@ use super::*;
 /// older release (the swap was reverted before the new one ran) and `status.json` says
 /// `refused` with the reason `boot-check` left, once; the note is spent after it is reported.
 ///
-/// Mutants planted: the note not read by the helper; the note left in place after it is
+/// Catches: the note not read by the helper; the note left in place after it is
 /// reported (the next pass would report it again over a later event).
 #[test]
 fn an_activation_refused_for_want_of_a_log_copy_is_explained_in_status_json() {

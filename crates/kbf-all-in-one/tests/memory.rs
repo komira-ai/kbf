@@ -198,7 +198,7 @@ fn a_2_gib_output_streams_onto_the_tier_in_bounded_memory() {
 }
 
 /// Catches a large output refused without a write tier, or held whole on its way to
-/// the store (mutants: the refusal restored, the stream gathered before the store): a
+/// the store (defects: the refusal restored, the stream gathered before the store): a
 /// 256 MiB output streams straight to the cold store with no more than [`BOUND`] live
 /// at once (the walk's chunks, the queue to the store, and the store's piece).
 #[test]

@@ -11,8 +11,8 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use kbf_front::{
-    Cache, CacheError, EVICT_GRACE, EvictReady, EvictRound, HeldObject, MemoryMetaLog, MetaLog,
-    MetaLogError, VerifiedBlob,
+    Cache, CacheError, EVICT_GRACE, EvictRound, HeldObject, MemoryMetaLog, MetaLog, MetaLogError,
+    VerifiedBlob,
 };
 use kbf_meta::{
     Applied, BlobAnswer, Collected, Command, MetaState, ObjectId, Retention, Role, ServerId,
@@ -156,7 +156,7 @@ impl Fixture {
 
     /// One round with `grace`.
     async fn round(&self, grace: Duration) -> Result<EvictRound, CacheError> {
-        self.cache.evict_round(&self.files, grace, ready).await
+        self.cache.evict_round(&self.files, grace).await
     }
 
     async fn present(&self, texts: &[&str]) -> Vec<bool> {
@@ -207,18 +207,6 @@ fn digest(text: &str) -> Digest {
     kbf_segments::sha256(text.as_bytes())
 }
 
-/// A log that needs no readying for `EvictObjects`.
-#[expect(clippy::unnecessary_wraps, reason = "the readiness hook's signature")]
-fn ready(_: &Log) -> Result<EvictReady, MetaLogError> {
-    Ok(EvictReady::Ready)
-}
-
-/// A log of a three-voter cell below the version that takes `EvictObjects`.
-#[expect(clippy::unnecessary_wraps, reason = "the readiness hook's signature")]
-fn needs_v3(_: &Log) -> Result<EvictReady, MetaLogError> {
-    Ok(EvictReady::NeedsV3 { voters: 3 })
-}
-
 /// An action result whose one output file is `text`'s blob.
 fn result_of(text: &str) -> reapi::ActionResult {
     let d = digest(text);
@@ -258,36 +246,6 @@ async fn evicts_least_recently_used_first() {
         [true, false, true]
     );
     assert!(!f.holds(b).await);
-    f.remove();
-}
-
-/// Catches an evictor that evicts under a log that does not take `EvictObjects`
-/// (mutant: `NeedsV3` taken as ready), which would commit a command the other replicas
-/// of its cell refuse, or deletes the files without it (mutant: files only), leaving
-/// index entries with no file: round after round, nothing is evicted and the round
-/// says why and how short it stays. Once the log takes the command, the next round
-/// evicts.
-#[tokio::test]
-async fn evict_is_off_until_the_log_takes_evict() {
-    let f = Fixture::new("needs-v3").await;
-    let a = f.store("blob-a").await;
-    let len = f.len_of(a);
-    f.short_by(len);
-
-    for _ in 0..2 {
-        let off = f
-            .cache
-            .evict_round(&f.files, Duration::ZERO, needs_v3)
-            .await;
-        let off = off.expect("a round");
-        assert_eq!((off.objects, off.short, off.needs_v3), (0, len, Some(3)));
-        assert_eq!(f.present(&["blob-a"]).await, [true]);
-        assert!(f.holds(a).await);
-    }
-
-    let round = f.round(Duration::ZERO).await.expect("a round");
-    assert_eq!((round.objects, round.needs_v3), (1, None));
-    assert!(!f.holds(a).await);
     f.remove();
 }
 

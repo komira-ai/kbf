@@ -11,10 +11,14 @@
 //! [`State::feed`]). The replicated log replaces exactly that step. Each process grants
 //! leases under its own term (and a store continues the sequence), so a lease id
 //! names one lease ever (issue #137). Under a state store the predecessor's own leases are
-//! restored (`take_stored`): its `Result` ends its own operation until the daemon's heartbeat omits
-//! the lease, and one naming another action is a MISMATCH; an id no row holds is UNKNOWN_LEASE.
+//! restored (`take_stored`) when their daemon says `Hello`: its `Result` ends its own
+//! operation until the daemon's heartbeat omits the lease, and one naming another action is
+//! a MISMATCH; an id no row holds is UNKNOWN_LEASE.
 //! Operations die with it too, so the term is part of every operation name (issue
-//! #154). The term, and the lease epoch `Welcome` names, come from the metadata log
+//! #154). A farm over a state store names its operations by their ids instead,
+//! `operations/<id>`: the ids are the store's, so a name means one operation on every
+//! frontend of the store and across restarts, and any frontend answers it (`named`
+//! module). The term, and the lease epoch `Welcome` names, come from the metadata log
 //! ([`MetaLog::leadership`]):
 //!
 //! - Under the in-memory metadata log (tests only) the log is this process's, so the term is a new
@@ -67,25 +71,31 @@ mod beat;
 mod durable;
 mod handover;
 mod learning;
+mod named;
 mod nodes;
 mod phase;
 mod record;
 pub mod sched_view;
 
-pub use durable::{DONE_FLOOR, EpochPolicy, SESSION_RENEWAL, StateError};
+pub use durable::{
+    ACK_WINDOW, DONE_FLOOR, EpochBump, EpochPolicy, ID_BLOCK, INTAKE_POLL, ORPHAN_WAIT,
+    OWNER_CACHE_TTL, SESSION_RENEWAL, StateError,
+};
 pub use handover::UNTRACED_LOOKS;
 pub use phase::Reported;
 
 use self::ack::{Verdict, refusal};
-use self::durable::Durable;
+use self::durable::intake::Intake;
+use self::durable::{Durable, Held};
 use crate::action_usage::{self, Measured, Shapes};
 use crate::fault;
 use crate::fleet::{NodeView, SoftwareView, attention_changes};
 use crate::learned::{Learned, LearnedSizes};
-use crate::machine::{FarmMachine, Platform, Sent, Waiter};
+use crate::machine::{FarmMachine, Platform, Sent, Waiter, parse_stored_name, stored_name};
 use crate::memory;
 use crate::missing;
 use crate::run_record;
+use crate::size_key::Keyable;
 use crate::stamp::Stamp;
 use crate::update_status::UpdateReport;
 
@@ -285,18 +295,22 @@ struct State {
     /// the operation: a copy of its `Result` is a duplicate, not an unknown lease
     /// ([`State::standing`]).
     answered: BTreeMap<LeaseId, OperationId>,
-    /// The held effect whose last try was refused as unreachable: a "row is gone" for
-    /// this effect and no other may be its own applied work
-    /// ([`State::release_unwritten`]).
-    retrying: Option<Effect>,
     /// Writes given up on for good: dropped as stale or fenced, or over the cap ([`Farm::dropped_writes`]).
     write_drops: u64,
     /// The most committed records `unwritten` holds before a new one is dropped.
     held_cap: usize,
     /// The scheduler was told the state store is unavailable ([`State::watch_store`]).
     store_down: bool,
-    /// When each node's session row in the state store was last written.
+    /// When each node's session row in the state store was last written, or renewed: the
+    /// next renewal falls due a renewal interval later.
     renewed: BTreeMap<WorkerId, FarmTime>,
+    /// When each node's session row was last written successfully, at its registration or
+    /// a renewal. Its heartbeats are acknowledged only while that was lately
+    /// ([`ACK_WINDOW`]).
+    session_ok: BTreeMap<WorkerId, FarmTime>,
+    /// The nodes whose `Hello` found the state store unreachable, so this frontend has not
+    /// claimed them, with the daemon process that said it ([`State::claim_pending`]).
+    unclaimed: BTreeMap<WorkerId, DaemonInstance>,
     /// A handover took the work from this farm ([`Farm::fence`]): it feeds the scheduler
     /// nothing and queues nothing.
     fenced: bool,
@@ -310,6 +324,15 @@ struct State {
     /// The learned-sizes shadow ([`crate::learned`]); off unless `--learned-sizes`
     /// says otherwise.
     learned: Learned,
+    /// Lowered key floors the state store has not taken yet ([`State::lower_key_floors`]).
+    unwritten_floors: Vec<kbf_sched::KeyFloor>,
+    /// What the intake poll keeps between two looks at the state store
+    /// ([`Farm::intake`]).
+    intake: Intake,
+    /// The channel of each operation clients ask for by name that the scheduler does not
+    /// hold, shown what the state store says of it at each intake poll while a ticket holds
+    /// the channel ([`State::follow_watched`]).
+    watched: BTreeMap<OperationId, watch::Sender<Stage>>,
 }
 
 /// How many committed records the farm holds for a state store that refuses them.
@@ -402,15 +425,19 @@ impl Farm {
                 owed: BTreeMap::new(),
                 answered: BTreeMap::new(),
                 parked: BTreeMap::new(),
-                retrying: None,
                 write_drops: 0,
                 held_cap: HELD_CAP,
                 store_down: false,
                 renewed: BTreeMap::new(),
+                session_ok: BTreeMap::new(),
+                unclaimed: BTreeMap::new(),
                 fenced: false,
                 untraced_kept: BTreeMap::new(),
                 untraced_relayed: BTreeMap::new(),
                 learned: Learned::new(LearnedSizes::Off, 0, 0),
+                unwritten_floors: Vec::new(),
+                intake: Intake::default(),
+                watched: BTreeMap::new(),
             }),
         }
     }
@@ -591,6 +618,9 @@ impl Farm {
             let cause = "the daemon restarted, or two daemons hold this node's certificate";
             tracing::warn!(%worker, cause, "another daemon process registered as this node");
         }
+        // Before the registration replaces the session row it reads, and before the
+        // scheduler hears of the worker, whose recovered leases it books.
+        state.claim_worker(now, worker, &instance);
         state.record_session(now, worker, &instance, stopped, &reported);
         let event = Event::WorkerUp {
             worker: worker.clone(),
@@ -734,15 +764,20 @@ impl Farm {
     }
 
     /// Cordons, drains or uncordons `worker` (see `kbf_sched::Cordon`), and returns
-    /// the node as it is now. A drain's deadline counts from now.
+    /// the node as it is now. A drain's deadline counts from now, and is written on the
+    /// state store's clock. A node connected to another frontend of the state store is
+    /// placed too: that frontend applies the row at its next intake poll ([`Farm::intake`]).
     ///
     /// # Errors
-    /// `worker` has never registered.
+    /// `worker` has never registered with this frontend, and no frontend of the state store
+    /// has claimed it.
     pub fn place(&self, worker: &WorkerId, action: NodeAction) -> Result<NodeView, UnknownNode> {
         let now = self.now();
         let mut state = self.lock();
         state.note_closed_streams();
-        if state.machine.node(worker).is_none() {
+        // A node connected to another frontend of the state store is placed too: its
+        // `cordon/` row is the other frontend's to apply (the intake poll).
+        if state.machine.node(worker).is_none() && !state.known_elsewhere(worker) {
             return Err(UnknownNode(worker.as_str().to_owned()));
         }
         let name = worker.clone();
@@ -756,8 +791,11 @@ impl Farm {
         };
         tracing::info!(%worker, ?action, "operator action");
         state.feed_quiet(now, event);
-        let at = self.epoch_unix_ms.saturating_add(now.as_millis());
-        state.durably("a cordon", |d| d.cordoned(worker, action.stored(at)));
+        // A drain's deadline is written on the store's clock: the frontends that apply the
+        // row have clocks of their own.
+        state.durably("a cordon", |d| {
+            d.cordoned(worker, action.stored(d.store_ms()))
+        });
         Ok(self.node(&state, worker))
     }
 
@@ -995,17 +1033,47 @@ impl Farm {
 
 impl Dispatch for Farm {
     fn submit(&self, mut submission: Submission) -> Result<Ticket, Status> {
+        // An action with no program and no output names no shape: all such actions would
+        // share one key.
+        let shaped =
+            !submission.described.arguments.is_empty() || !submission.described.outputs.is_empty();
         // Outside the lock: hashes the action's shape and drops its argv and paths.
         let usage = self
             .shapes
             .subject(std::mem::take(&mut submission.described));
         let shape = submission.call.as_ref().map(|_| usage.recorded());
         let now = self.now();
+        let platform = Platform::of(&submission.request.needs);
         let waiting = std::time::Instant::now();
         let mut state = self.lock();
         self.cache.metrics().sched_lock_wait.since(waiting);
-        state.admit(&submission.request, &usage)?;
-        let joined = state.sched.twin(&submission.request).is_some();
+        let size_key = state
+            .learned
+            .keys()
+            .then(|| {
+                Keyable {
+                    instance: &submission.request.key.instance,
+                    platform: &platform,
+                    shape: usage.key,
+                    shaped,
+                    kind: submission.request.kind,
+                    gpus: submission.request.resources.gpus,
+                    memory: submission.evidence.memory_source,
+                }
+                .key()
+            })
+            .flatten();
+        let held = state.admit(&submission.request, &usage, size_key, now)?;
+        // The operation this submit queues or joins: the twin the scheduler holds, the one
+        // another frontend leases (which the scheduler does not hold), or the next it numbers.
+        let twin = state.sched.twin(&submission.request);
+        let (operation, joined) = match held {
+            Held::Elsewhere(operation) => (operation, true),
+            Held::Here => (
+                twin.unwrap_or_else(|| state.sched.next_operation()),
+                twin.is_some(),
+            ),
+        };
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
         let waiter = state.machine.submit(Waiter {
@@ -1014,31 +1082,51 @@ impl Dispatch for Farm {
             do_not_cache: submission.request.do_not_cache,
             queued: SystemTime::now(),
             usage,
-            platform: Platform::of(&submission.request.needs),
+            platform,
         });
-        let name = state.machine.name(waiter);
-        state.learn_submit(&name, &submission.request, &submission.evidence, joined);
+        let name = state.name_of(waiter, operation);
+        state.learn_submit(
+            waiter,
+            &name,
+            &submission.request,
+            &submission.evidence,
+            joined,
+            size_key,
+        );
         if let Some((call, shape)) = submission.call.take().zip(shape) {
             let call = call.with_shape(shape).with_evidence(submission.evidence);
-            state.record_submit(call, &name, &submission.request);
+            state.record_submit(call, &name, operation, joined);
         }
         let (stage, receiver) = watch::channel(Stage::Queued);
         state.stages.insert(waiter, stage);
-        state.feed_quiet(
-            now,
-            Event::Submit {
-                waiter,
-                request: submission.request,
-            },
-        );
-        // A caller that joined a twin already started sees it executing.
+        // The operation this submit allocates (none if it joins a twin, which keeps its
+        // own key) is named before the submit is fed: its first placement round follows.
+        if let Some(key) = size_key.filter(|_| !joined) {
+            let next = state.sched.next_operation();
+            state.sched.set_size_key(next, key);
+        }
+        match held {
+            Held::Here => state.feed_quiet(
+                now,
+                Event::Submit {
+                    waiter,
+                    request: submission.request,
+                },
+            ),
+            // The operation is another frontend's: this scheduler never holds it, and the
+            // caller is shown what the store says of it at the intake polls.
+            Held::Elsewhere(_) => state.keep_following(operation, vec![waiter]),
+        }
+        // A caller that joined a twin already started sees it executing, and so does one
+        // that follows an operation another frontend's daemon runs.
         let joined_started = state.machine.started_operations().any(|operation| {
             state
                 .sched
                 .waiters(operation)
                 .is_some_and(|w| w.contains(&waiter))
         });
-        if let Some(stage) = state.stages.get(&waiter).filter(|_| joined_started) {
+        let running = joined_started || matches!(held, Held::Elsewhere(_));
+        if let Some(stage) = state.stages.get(&waiter).filter(|_| running) {
             stage.send_replace(Stage::Executing);
         }
         self.publish(&state);
@@ -1050,8 +1138,15 @@ impl Dispatch for Farm {
         })
     }
 
+    /// A name `operations/<id>` is answered by any frontend of the state store, from the
+    /// scheduler if it holds the operation and from the store if not
+    /// ([`State::stored_ticket`]); a farm with no store answers none. A name of the old form,
+    /// `operations/{term}-{waiter}`, is answered only for a caller this process holds.
     fn wait(&self, name: &str) -> Option<Ticket> {
-        let state = self.lock();
+        let mut state = self.lock();
+        if let Some(operation) = parse_stored_name(name) {
+            return state.stored_ticket(operation);
+        }
         let (id, waiter) = state.machine.named(name)?;
         let stage = state.stages.get(&id)?;
         Some(Ticket {
@@ -1139,7 +1234,7 @@ impl State {
                 }
             }
         };
-        self.finish_learning(lease, worker, accepted || taken == Taken::Held);
+        self.finish_learning(operation, lease, worker, accepted || taken == Taken::Held);
         if accepted && let Some((subject, measured)) = &usage {
             action_usage::log(operation, subject, measured, outcome, lease, worker);
         }
@@ -1208,6 +1303,8 @@ impl State {
     /// answers, for the caller to deliver once the lock is released.
     fn carry_out(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
         self.watch_store(now);
+        self.claim_pending(now);
+        self.reserve_seqs();
         self.learned.clock(now);
         // Only the inputs whose callers deliver answers ([`State::feed_quiet`]) release
         // effects an earlier refusal held back: one of them may be an answer.
@@ -1228,6 +1325,12 @@ impl State {
         while let Some(effect) = effects.pop_front() {
             match effect {
                 Effect::Commit(record) => {
+                    // A refusal for want of a daemon waits on if another frontend's could
+                    // run the operation: it is not committed, and is proposed again after
+                    // another unservable wait.
+                    if self.held_for_other_frontends(&record) {
+                        continue;
+                    }
                     if let ControlRecord::Lease(grant) = &record {
                         self.offer(grant);
                     }
@@ -1326,10 +1429,10 @@ impl State {
     /// that the callers with a channel are exactly the callers the machine keeps: the
     /// same ids, not only as many.
     fn forget_dropped(&mut self) {
-        let sched = &self.sched;
-        let forgotten = self
-            .machine
-            .forget_dropped(|operation| sched.state(operation).is_some());
+        let (sched, intake) = (&self.sched, &self.intake);
+        let held =
+            |operation: OperationId| sched.state(operation).is_some() || intake.keeps(operation);
+        let forgotten = self.machine.forget_dropped(held);
         self.answered
             .retain(|_, operation| sched.state(*operation).is_some());
         for id in forgotten {
@@ -1341,11 +1444,25 @@ impl State {
         );
     }
 
-    /// The REAPI name of `operation`, its first waiter's, as the log names it; empty
-    /// for an operation without one.
+    /// The REAPI name of `operation`, as the log names it: `operations/<id>` in a farm over
+    /// a state store; in a farm with none, its first waiter's, or empty for an operation
+    /// without one.
     fn operation_name(&self, operation: OperationId) -> String {
+        if self.durable.is_some() {
+            return stored_name(operation);
+        }
         self.first_waiter(operation)
             .map_or_else(String::new, |(id, _)| self.machine.name(id))
+    }
+
+    /// The REAPI name the caller `waiter` of `operation` is given: the operation's own
+    /// (`operations/<id>`, which any frontend of the store answers) in a farm over a state
+    /// store, and in a farm with none the caller's in this process's term.
+    fn name_of(&self, waiter: WaiterId, operation: OperationId) -> String {
+        if self.durable.is_some() {
+            return stored_name(operation);
+        }
+        self.machine.name(waiter)
     }
 
     /// The first waiter of `operation`: its key and lease kind are the operation's.
@@ -1629,5 +1746,7 @@ fn unrun(outcome: Outcome, farm_runs: &[FarmRun]) -> Finished {
     }
 }
 
+#[cfg(test)]
+mod learned_tests;
 #[cfg(test)]
 mod tests;

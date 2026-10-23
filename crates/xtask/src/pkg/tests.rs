@@ -364,24 +364,24 @@ fn the_gate_accepts_the_committed_property_list_in_any_layout() {
 #[test]
 fn the_gate_refuses_a_job_that_starts_without_the_configuration() {
     let good = plist_text();
-    let mutant = |from: &str, to: &str| {
+    let broken = |from: &str, to: &str| {
         assert!(good.contains(from), "{from}");
         gate_problems(&good.replace(from, to))
     };
     // RunAtLoad true, or gone.
-    let p = mutant(
+    let p = broken(
         "<key>RunAtLoad</key>\n\t<false/>",
         "<key>RunAtLoad</key>\n\t<true/>",
     );
     assert_eq!(p.len(), 1);
     assert!(p[0].contains("is not started at load"), "{p:?}");
-    assert_eq!(mutant("<key>RunAtLoad</key>", "<key>Other</key>").len(), 1);
+    assert_eq!(broken("<key>RunAtLoad</key>", "<key>Other</key>").len(), 1);
     // Kept alive without a condition, on another path, or on its absence.
     for to in [
         "<key>KeepAlive</key>\n\t<true/>\n\t<key>Unused</key>\n\t<dict>",
         "<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>\n\t\t<key>X</key>\n\t\t<dict>",
     ] {
-        let p = mutant(
+        let p = broken(
             "<key>KeepAlive</key>\n\t<dict>\n\t\t<key>PathState</key>\n\t\t<dict>",
             to,
         );
@@ -391,18 +391,18 @@ fn the_gate_refuses_a_job_that_starts_without_the_configuration() {
             "{p:?}"
         );
     }
-    let p = mutant(
+    let p = broken(
         "<key>/usr/local/etc/kbf/installer.toml</key>",
         "<key>/etc/kbf/installer.toml</key>",
     );
     assert_eq!(p.len(), 1, "{p:?}");
-    let p = mutant(
+    let p = broken(
         "<key>/usr/local/etc/kbf/installer.toml</key>\n\t\t\t<true/>",
         "<key>/usr/local/etc/kbf/installer.toml</key>\n\t\t\t<false/>",
     );
     assert_eq!(p.len(), 1, "{p:?}");
     // Another job's label.
-    let p = mutant(
+    let p = broken(
         "<string>com.komira.kbf-installer</string>",
         "<string>com.komira.other</string>",
     );
@@ -410,7 +410,7 @@ fn the_gate_refuses_a_job_that_starts_without_the_configuration() {
     assert!(p[0].contains("is labelled"), "{p:?}");
     // Each way to start a job that the gate does not hold back.
     for key in TRIGGERS {
-        let p = mutant(
+        let p = broken(
             "</dict>\n</plist>",
             &format!("<key>{key}</key>\n<integer>5</integer>\n</dict>\n</plist>"),
         );
@@ -435,7 +435,7 @@ fn the_gate_refuses_a_job_that_starts_without_the_configuration() {
             "<string>--unit</string>",
         ),
     ] {
-        let p = mutant(from, to);
+        let p = broken(from, to);
         assert_eq!(p.len(), 1, "{to}: {p:?}");
         assert!(
             p[0].contains("runs the installed tool in its service mode"),

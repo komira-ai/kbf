@@ -15,6 +15,13 @@
 //!   instance, capacity and capabilities). It expires unless renewed: one write per
 //!   session per [`SESSION_RENEWAL`], however many leases the daemon holds (a lease row
 //!   is written at the grant and at the end, never to renew it);
+//! - `owner/<worker>`: the frontend that owns a daemon's node, and a counter that each
+//!   `Hello` of the daemon to a frontend raises by one (sixteen bytes, big-endian). A write
+//!   of a lease of the node is conditional on it, so a frontend the daemon has left
+//!   cannot grant, give up or finish a lease of the node (see the `owner` module);
+//! - `lease-by-op/<operation>`: the id of the lease the operation holds, put in the
+//!   transaction of the grant and deleted with the lease, so a request that joins a running
+//!   operation finds its lease without reading every `lease/` row (see the `leases` module);
 //! - `loss/<operation>`: how many of the operation's leases were lost, while it is
 //!   unfinished and has lost any ([`kbf_sched::LOSS_REQUEUES`] refuses it);
 //! - `fate/<operation>`: what the operation's faults changed: the raised booking and the
@@ -33,6 +40,16 @@
 //!   an operation. A successor loads them all, oldest stamp first, and raises past the
 //!   largest stamp, so the order of eviction survives a reload. They have no expiry;
 //!   in memory they have none either;
+//! - `keyfloor/<key>`: a key floor, the least memory a request carrying the size key
+//!   books at a placement round ([`kbf_sched::KeyFloor`]): the ask and a stamp, written
+//!   in the transaction of the requeue that raises it beside the `floor/` row, deleted
+//!   in the one that forgets it. A store that was never `--learned-sizes=on` has none,
+//!   and an older binary does not read the prefix;
+//! - `opkey/<operation>`: the size key of an operation ([`kbf_sched::Scheduler::set_size_key`]),
+//!   written in the submission's transaction beside `op/` and `queue/` and deleted with
+//!   them, only for an operation given one (`--learned-sizes=on`). It is in a row of its
+//!   own, not in the request, so no row of an older format changes and a binary that does
+//!   not know the prefix reads the store as it always did;
 //! - `subject/<operation>`: what the operation's `action usage:` line says it is (the
 //!   shape key, configuration hash, target and the client's mnemonic and target hint,
 //!   [`crate::action_usage::Subject`]), written in the submission's transaction beside
@@ -47,26 +64,82 @@
 //!   never as neither. The row is as large as the response, and the store sets no bound
 //!   on a row, so a very large response makes a large transaction, as it made a large
 //!   row before;
+//! - `doneof/<operation>`: the instance name and action of a finished or refused operation,
+//!   put in the same transaction as its `done/` row and kept as long, so that any frontend can
+//!   answer a client that asks for the operation by its name (`operations/<id>`), authorized
+//!   against the instance, after the `op/` row that held them is gone (the `named` module);
 //! - `cordon/<worker>`: how an operator placed a node (cordoned, or draining until a
-//!   wall-clock deadline), kept until it is returned to placement, so a successor
-//!   process serves the node as the operator left it;
+//!   deadline on the store's clock), kept until it is returned to placement, so a
+//!   successor process serves the node as the operator left it, and the other frontends
+//!   of the store apply it at their next intake poll;
 //! - `est/<instance>/<platform>/<basis>/<shape>/<cfg>`: one size summary of the learned-sizes
 //!   shadow ([`crate::learned`]): a version byte and the estimator's own checksummed row.
 //!   Never in the transaction of a requeue or a finish: a summary an own-limit kill changed
 //!   is written right after it, best effort, and the rest is written behind, in batches;
 //!   a sweep deletes the stale. Read only when the shadow is on;
-//! - `meta/epoch`, `meta/next_op`, `meta/next_seq`: the store incarnation and the first
-//!   operation id and lease sequence no earlier start used;
+//! - `meta/epoch`, `meta/next_op`, `meta/next_seq`: the store incarnation, and the first
+//!   operation id and lease sequence no frontend has reserved. A frontend reserves a block
+//!   of [`ID_BLOCK`] ids of either with one compare-and-set write of `max(stored, its own
+//!   next) + ID_BLOCK` (read again and tried again when another frontend wrote first) and
+//!   numbers inside the block, so the stored value never goes back and no two frontends,
+//!   and no restarted one, take an id twice. The `op/` and `lease/` rows of a finished
+//!   operation are deleted, so their absence guards no id. The value is eight bytes,
+//!   big-endian, as it was when each id was written as it was taken, so no new row or
+//!   format is needed: a store from that time reads as one whose blocks are spent. The
+//!   epoch row is created with an absent-only write, and a frontend that loses that race
+//!   reads the other's;
 //! - `meta/generation`: the writer generation ([`kbf_state::Fenced`]); every write of the
-//!   scheduler is checked against it, and operation names carry it.
+//!   scheduler is checked against it. Operation names do not carry it: a farm over a store
+//!   names its operations `operations/<id>`, and the ids are the store's.
+//!
+//! Several frontends may share one store. Each change of the rows above to an operation
+//! (a grant, a lease given up, a result, a refusal) is one transaction that is conditional
+//! on the versions of the rows it read, so a frontend that loses a race to another writes
+//! nothing and the other's work stands: an operation another frontend finished is not
+//! queued again, one another frontend runs is not refused, and a result that arrives twice
+//! is taken once. The write that loses is dropped as stale, and the callers waiting on its
+//! operation at that frontend are not answered by it. The `transitions` module says how
+//! each one is conditional. A write of a lease of a daemon's node is conditional on the
+//! node's `owner/` row too: the frontend the daemon last said `Hello` to is the only one
+//! that may write the node's leases, and one the daemon has left fails with
+//! [`StateError::StaleOwner`] for that node alone (the `owner` module). Whether an
+//! operation is unservable is judged from the `session/` rows, which hold every
+//! frontend's daemons, and not from the daemons of one frontend.
+//!
+//! A frontend learns what the others did by looking at the rows every [`INTAKE_POLL`] (the
+//! `intake` module): it takes in the operations they queued, forgets the ones they took
+//! (the callers it kept are answered from `done/`), applies their `cordon/` rows and raises
+//! its floors to theirs. A start takes up only the operations that wait for a lease: a
+//! leased one is taken up when its node says `Hello` to this frontend, and the `sweep`
+//! module requeues the lease of a node no frontend hears, so the work of a frontend that
+//! died is not stranded. A request that joins an operation leased on another frontend's
+//! node takes up nothing: it follows the operation through the store until its `done/` row
+//! is there ([`Held::Elsewhere`]); only a lease on a node this frontend owns is taken up by
+//! a join.
+//!
+//! A client that asks for an operation by its name (`operations/<id>`) is answered by any
+//! frontend: by the caller it holds for the operation if its scheduler holds it, and from the
+//! `op/`, `queue/`, `done/` and `doneof/` rows if not (the `named` module).
 //!
 //! Values are the `kbf-log` encoding of the scheduler's own inputs (a `Submit`, the
 //! `Committed` lease, a `WorkerUp`), so the `kbf-log` codec the replicated log already runs
 //! decides what a row may hold.
+//!
+//! A `lease/` or `op/` row that holds a command this binary does not know was written by
+//! a later binary: a scan skips it, and the rows it can read load. A start ([`Durable::load`])
+//! logs the key of each row it skips; the scans a request makes skip them silently, so one
+//! leftover row does not fill the log at request rate. A row that is malformed, or that
+//! holds a known command of the wrong kind, still refuses the scan, and so does a single
+//! row a write depends on, whatever it holds.
+//!
+//! A skipped `lease/` row leaves its operation with no lease: it loads queued, the
+//! scheduler can grant it again, and the action may run twice. Nothing names the skipped
+//! row's lease again, so the row is never deleted.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_estimator::{Day, Summaries};
@@ -74,13 +147,12 @@ use kbf_front::{Described, Finished, Stage};
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
 use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{
-    DaemonInstance, Fate, Floor, FloorChange, Recovered, RecoveredLease, Request, Requeue,
-    RequeueReason,
+    DaemonInstance, Fate, Floor, FloorChange, KeyFloor, Recovered, RecoveredLease, Request,
+    Requeue, RequeueReason,
 };
-use kbf_state::{Cond, Conflict, GENERATION, Store, StoreError, Txn, Versioned};
+use kbf_state::{Cond, Conflict, GENERATION, Store, StoreError, Txn, Version, Versioned};
 use kbf_types::{
-    ControlRecord, Digest, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, StartLease,
-    WaiterId, WorkerId,
+    ControlRecord, Digest, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, WaiterId, WorkerId,
 };
 
 use tokio::sync::watch;
@@ -96,6 +168,13 @@ use crate::machine::Platform;
 use crate::state_store::StateStore;
 
 use self::inflight::Submitted;
+use self::leases::lease_by_op_key;
+use self::owner::{Owner, Ownership};
+
+pub use self::blocks::ID_BLOCK;
+pub use self::intake::INTAKE_POLL;
+pub use self::owner::{ACK_WINDOW, OWNER_CACHE_TTL};
+pub use self::sweep::ORPHAN_WAIT;
 
 /// How often a daemon session's row in the store is renewed while the daemon heartbeats:
 /// a third of the lease grace, so the row outlives two missed renewals. One write per
@@ -107,8 +186,11 @@ const ALIVE: &str = "meta/alive";
 const NEXT_OP: &str = "meta/next_op";
 const NEXT_SEQ: &str = "meta/next_seq";
 const CORDON: &str = "cordon/";
+const SESSION: &str = "session/";
 const FATE: &str = "fate/";
 const FLOOR: &str = "floor/";
+const KEY_FLOOR: &str = "keyfloor/";
+const OPKEY: &str = "opkey/";
 const ESTIMATE: &str = "est/";
 /// Rows of one transaction of the size sweep, and the most transactions of one call.
 pub(super) const SWEEP_ROWS: usize = 256;
@@ -131,6 +213,15 @@ pub enum EpochPolicy {
     Bump,
 }
 
+/// An operator's raise of the stored epoch ([`Farm::bump_epoch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpochBump {
+    /// The epoch the store held before.
+    pub previous: u64,
+    /// The epoch it holds now.
+    pub epoch: u64,
+}
+
 /// Why the state store could not be read or written.
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
@@ -144,6 +235,11 @@ pub enum StateError {
     /// the operation no longer holds, a grant of an operation that is not queued).
     #[error("the state store has no {0}: the write is stale")]
     Missing(String),
+    /// The write is for a daemon's node that another frontend owns now (the daemon said
+    /// `Hello` there since this frontend did): the write is stale, and only this node's
+    /// writes are.
+    #[error("the node {0} belongs to another frontend: the write is stale")]
+    StaleOwner(WorkerId),
     /// A row cannot be read.
     #[error("the state store row {key} cannot be read: {why}")]
     Corrupt {
@@ -167,22 +263,27 @@ pub enum StateError {
 /// What a store holds of the scheduler, as a start reads it.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Stored {
-    /// The first operation id no earlier start used.
+    /// The first operation id no frontend has reserved.
     pub next_operation: u64,
-    /// The first lease sequence no earlier start used.
+    /// The first lease sequence no frontend has reserved.
     pub next_seq: u64,
     /// Every unfinished operation, in id order.
     pub operations: Vec<StoredOperation>,
-    /// Every memory floor, in key order.
+    /// Every memory floor, oldest stamp first (two floors with one stamp in key order, the
+    /// later with the next stamp).
     pub floors: Vec<Floor>,
+    /// Every key floor, in the same order.
+    pub key_floors: Vec<KeyFloor>,
+    /// The size summary each key floor decays with, for those whose row names one.
+    pub key_names: Vec<(u64, kbf_estimator::Key)>,
     /// Every node an operator placed, in node-id order.
     pub cordons: Vec<(WorkerId, StoredCordon)>,
 }
 
 /// How an operator placed a node, as its `cordon/` row keeps it: a tag byte, and for a
-/// drain the deadline as eight bytes, big-endian, milliseconds since the Unix epoch (a
-/// successor process has a clock of its own for farm time, and the wall clock is the
-/// one both share).
+/// drain the deadline as eight bytes, big-endian, milliseconds on the store's clock (a
+/// frontend has a clock of its own for farm time, and the store's is the one all share; for
+/// a store whose clock starts at the Unix epoch, the wall clock's own reading).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum StoredCordon {
     /// Placement skips the node.
@@ -250,6 +351,8 @@ pub(super) struct StoredOperation {
     pub fate: Option<Fate>,
     /// What its `action usage:` line says it is, if the writer recorded it.
     pub subject: Option<Subject>,
+    /// Its size key, if the writer named one (`opkey/` row).
+    pub size_key: Option<u64>,
 }
 
 impl StoredOperation {
@@ -269,11 +372,31 @@ impl StoredOperation {
     }
 }
 
+/// Where a request that was queued or that joined an operation is held ([`State::queue`]).
+pub(super) enum Held {
+    /// By this frontend's scheduler: the request is a caller of an operation it holds.
+    Here,
+    /// By another frontend: the request joined this operation, which holds a lease on a
+    /// node that frontend owns. This one takes up nothing of it, not even the lease (that
+    /// would end in this scheduler giving up a lease it does not own, and deleting the
+    /// owner's `lease/` row): the request follows the operation through the store until its
+    /// result is there.
+    Elsewhere(OperationId),
+}
+
+mod blocks;
 mod estimate;
 mod fate;
 mod floor;
 mod inflight;
+pub(super) mod intake;
+mod leases;
+mod named;
+mod opkey;
+mod owner;
 mod subject;
+mod sweep;
+mod transitions;
 
 /// The lease an effect starts, if it is a `Start`.
 fn started(effect: &Effect) -> Option<LeaseId> {
@@ -290,10 +413,16 @@ enum Attempt {
     Taken,
     /// The store could not be reached: the same write may succeed later.
     Transient,
-    /// A row the write depends on is gone or changed. On a first try the write is stale;
-    /// on a retry it is also what a write the store applied but did not acknowledge
-    /// leaves (the retry finds its own work done).
+    /// A row the write depends on is gone or changed: another writer got there first, and
+    /// the write is stale. A write the store applied but did not acknowledge is not this:
+    /// each write is written to find its own work done and take it as taken
+    /// ([`Durable::granted`], [`Durable::finished`], [`Durable::refused`] and
+    /// [`Durable::requeued`]), so a retry of it is `Taken`.
     Stale,
+    /// The write is for a daemon's node that another frontend owns now: it is dropped, as
+    /// a stale write is, and trying again cannot help. The node's other writes, held or to
+    /// come, meet the same refusal; the store as a whole is not superseded.
+    Disowned,
     /// The write cannot be encoded, or a newer writer holds the store: trying again
     /// cannot help.
     Dropped,
@@ -309,18 +438,38 @@ pub(super) struct Ending {
 }
 
 impl Ending {
-    /// `txn`, then the removal of the operation's `op/`, `queue/`, `loss/`, `fate/` and
-    /// `subject/` rows and the put of its result, so one transaction carries all of it.
-    /// The result goes over whatever is there: a row from an earlier try of the same
-    /// finish is its own.
+    /// How long the result is kept: the finished retention, and at least [`DONE_FLOOR`], so
+    /// that a client which reconnects to another frontend after the finish still finds it.
+    pub(super) fn ttl(&self) -> Duration {
+        self.retention.max(DONE_FLOOR)
+    }
+
+    /// `txn`, then the removal of the operation's `op/`, `queue/`, `loss/`, `fate/`,
+    /// `subject/` and `opkey/` rows and the put of its result, so one transaction carries
+    /// all of it. The `opkey/` delete is made whatever `--learned-sizes` says: an operation
+    /// an `on` run queued has the row, and a later `off` run cleans it up as it ends.
+    /// The result goes over whatever is there: the transaction also deletes the lease row
+    /// at the version read, which no other writer can have deleted first and written a
+    /// result after.
     fn settle(&self, txn: Txn, operation: OperationId) -> Txn {
-        let ttl = self.retention.max(DONE_FLOOR);
-        txn.delete(op_key(operation), Cond::Any)
-            .delete(queue_key(operation), Cond::Any)
-            .delete(loss_key(operation), Cond::Any)
+        let txn = txn
+            .delete(op_key(operation), Cond::Any)
+            .delete(queue_key(operation), Cond::Any);
+        self.settle_rest(txn, operation, Cond::Any)
+    }
+
+    /// `txn`, which already deletes the operation's `op/` and `queue/` rows at the versions
+    /// it read, then the removal of the rest of its rows (its `lease-by-op/` row among
+    /// them, whoever left it) and the put of its result where `done` allows:
+    /// [`Cond::Absent`] for a result no other writer has put.
+    fn settle_rest(&self, txn: Txn, operation: OperationId, done: Cond) -> Txn {
+        let ttl = self.ttl();
+        txn.delete(loss_key(operation), Cond::Any)
             .delete(fate_key(operation), Cond::Any)
             .delete(subject_key(operation), Cond::Any)
-            .put_ttl(done_key(operation), self.finished.to_row(), ttl, Cond::Any)
+            .delete(opkey_key(operation), Cond::Any)
+            .delete(lease_by_op_key(operation), Cond::Any)
+            .put_ttl(done_key(operation), self.finished.to_row(), ttl, done)
     }
 }
 
@@ -334,6 +483,29 @@ pub(super) struct Durable {
     /// scheduler was superseded and takes no more work. Never cleared; unlike an outage,
     /// the store coming back does not end it.
     pub(super) fenced: AtomicBool,
+    /// The operation ids this handle reserved last ([`Durable::reserve_operation`]):
+    /// numbered inside it, and no other frontend takes one of them.
+    ops: Mutex<Range<u64>>,
+    /// This frontend's id in the `owner/` rows it writes: the term it started under, which
+    /// differs from every other frontend's but for a chance of about one in 2^16 within
+    /// a millisecond. Ownership checks compare the counter too, so a shared id costs only
+    /// the detection of a move between the two frontends.
+    frontend: u64,
+    /// The nodes this frontend claimed, and what it holds of each ([`Ownership`]).
+    owners: Mutex<BTreeMap<WorkerId, Ownership>>,
+    /// The owner each node's newest claim found, for the claims whose arrival did not
+    /// complete (what the claim took over could not be read): the retry finds this
+    /// frontend's own row, and takes the owner named here as the one it replaced.
+    handovers: Mutex<BTreeMap<WorkerId, Option<Owner>>>,
+    /// The value of the newest session row this handle wrote for each node, so a renewal
+    /// that finds the row gone (it expired, or its write was refused) puts it again.
+    sessions: Mutex<BTreeMap<WorkerId, Vec<u8>>>,
+    /// Whether the `opkey/` and `keyfloor/` rows are read (`--learned-sizes=on`). A store
+    /// that never had the flag on holds none, and with it off a row an earlier `on` run
+    /// left is neither loaded nor allowed to fail a start. The finish transaction deletes
+    /// an operation's `opkey/` row whatever the flag says, so rows an `on` run left are
+    /// cleaned up as its operations end.
+    pub(super) read_size_keys: AtomicBool,
 }
 
 impl std::fmt::Debug for Durable {
@@ -356,6 +528,10 @@ fn loss_key(operation: OperationId) -> String {
 
 fn fate_key(operation: OperationId) -> String {
     format!("{FATE}{:016x}", operation.0)
+}
+
+fn opkey_key(operation: OperationId) -> String {
+    format!("{OPKEY}{:016x}", operation.0)
 }
 
 fn subject_key(operation: OperationId) -> String {
@@ -402,6 +578,11 @@ fn decode(key: &str, bytes: &[u8]) -> Result<FarmInput, StateError> {
     }
 }
 
+/// Whether `bytes` hold a command this binary does not know, which a later one wrote.
+fn is_unknown(bytes: &[u8]) -> bool {
+    matches!(kbf_log::decode(Format::V1, bytes), Ok(LogCommand::Unknown))
+}
+
 fn parse_operation(key: &str, prefix: &str) -> Result<OperationId, StateError> {
     let id = u64::from_str_radix(&key[prefix.len()..], 16)
         .map_err(|_| corrupt(key, "not an operation id"))?;
@@ -434,29 +615,49 @@ impl Durable {
     /// Opens the scheduler's rows in `store` and settles its epoch: a store that has
     /// none gets a first one that no other store's epoch is likely to equal (a daemon
     /// must not mistake a new store for the one it knew), `policy` decides for one that
-    /// has. Returns the handle and the epoch.
+    /// has. Returns the handle and the epoch. `first` is the process term, which also names
+    /// the handle's frontend in the `owner/` rows it writes: two frontends of a store start
+    /// under one only by a chance of about one in 2^16 within a millisecond.
     pub(super) fn open(
         store: Arc<dyn Store>,
         policy: EpochPolicy,
         first: u64,
     ) -> Result<(Self, u64), StateError> {
-        let row = store.get(EPOCH)?;
-        let (epoch, write) = match (&row, policy) {
-            (None, _) => (first, Some(Cond::Absent)),
-            (Some(row), EpochPolicy::Keep) => (number(EPOCH, row)?, None),
-            (Some(row), EpochPolicy::Bump) => {
-                (number(EPOCH, row)? + 1, Some(Cond::Version(row.version)))
-            }
-        };
         let durable = Self {
             store,
             unreachable: AtomicBool::new(false),
             fenced: AtomicBool::new(false),
+            ops: Mutex::new(0..0),
+            frontend: first,
+            owners: Mutex::new(BTreeMap::new()),
+            handovers: Mutex::new(BTreeMap::new()),
+            sessions: Mutex::new(BTreeMap::new()),
+            read_size_keys: AtomicBool::new(true),
         };
-        if let Some(cond) = write {
-            durable.commit(Txn::new().put(EPOCH, epoch.to_be_bytes(), cond))?;
-        }
+        let epoch = durable.settle_epoch(policy, first)?;
         Ok((durable, epoch))
+    }
+
+    /// The rows under `prefix` that a scan can use: a row that holds a command this
+    /// binary does not know is left out, and every other row stays, for the scan to read
+    /// or refuse. It logs nothing: a scan a request makes would repeat it per request.
+    fn scan_known(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StateError> {
+        let mut rows = self.store.scan_prefix(prefix)?;
+        rows.retain(|(_, row)| !is_unknown(&row.value));
+        Ok(rows)
+    }
+
+    /// [`Durable::scan_known`], logging the key of each row it leaves out: for a start.
+    fn scan_known_logged(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StateError> {
+        let mut rows = self.store.scan_prefix(prefix)?;
+        rows.retain(|(key, row)| {
+            let unknown = is_unknown(&row.value);
+            if unknown {
+                tracing::warn!(%key, "a row holds a command this binary does not know: skipped");
+            }
+            !unknown
+        });
+        Ok(rows)
     }
 
     /// The row at `key`, which the write that asks depends on.
@@ -474,7 +675,7 @@ impl Durable {
     /// first ids to hand out.
     pub(super) fn load(&self) -> Result<Stored, StateError> {
         let mut leases = std::collections::BTreeMap::new();
-        for (key, row) in self.store.scan_prefix("lease/")? {
+        for (key, row) in self.scan_known_logged("lease/")? {
             let grant = lease_row(&key, &row)?;
             leases.insert(grant.operation, grant);
         }
@@ -497,20 +698,63 @@ impl Durable {
             let subject = subject::decode(&row.value).map_err(|why| corrupt(&key, why))?;
             subjects.insert(operation, subject);
         }
+        let read_size_keys = self.read_size_keys.load(Ordering::SeqCst);
+        let mut opkeys = std::collections::BTreeMap::new();
+        for (key, row) in self
+            .store
+            .scan_prefix(OPKEY)?
+            .into_iter()
+            .filter(|_| read_size_keys)
+        {
+            let operation = parse_operation(&key, OPKEY)?;
+            let size_key = opkey::decode(&row.value).map_err(|why| corrupt(&key, why))?;
+            opkeys.insert(operation, size_key);
+        }
         let mut floors = Vec::new();
-        let mut stamps = std::collections::BTreeSet::new();
         for (key, row) in self.store.scan_prefix(FLOOR)? {
             let floor = floor::decode(&row.value).map_err(|why| corrupt(&key, why))?;
             if key != floor::row_key(&floor.key) {
                 return Err(corrupt(&key, "not the key of the floor it holds"));
             }
-            if !stamps.insert(floor.stamp) {
-                return Err(corrupt(&key, "a stamp another floor has"));
-            }
             floors.push(floor);
         }
+        // Frontends sharing a store stamp their raises from counters of their own, so two
+        // floors may carry one stamp: they are ordered by key, the later one a stamp on.
+        floors.sort_by_key(|floor| floor.stamp);
+        let mut next = 0;
+        for floor in &mut floors {
+            floor.stamp = floor.stamp.max(next);
+            next = floor.stamp.saturating_add(1);
+        }
+        let mut key_floors = Vec::new();
+        let mut key_names = Vec::new();
+        for (key, row) in self
+            .store
+            .scan_prefix(KEY_FLOOR)?
+            .into_iter()
+            .filter(|_| read_size_keys)
+        {
+            let (floor, name) = floor::decode_key(&row.value).map_err(|why| corrupt(&key, why))?;
+            match name.as_deref().map(estimate::parse_key) {
+                Some(Some(summary)) => key_names.push((floor.key, summary)),
+                Some(None) => {
+                    tracing::warn!(row = %key, "a key floor names a size summary that does not parse");
+                }
+                None => {}
+            }
+            if key != floor::key_row(floor.key) {
+                return Err(corrupt(&key, "not the key of the key floor it holds"));
+            }
+            key_floors.push(floor);
+        }
+        key_floors.sort_by_key(|floor| floor.stamp);
+        let mut next = 0;
+        for floor in &mut key_floors {
+            floor.stamp = floor.stamp.max(next);
+            next = floor.stamp.saturating_add(1);
+        }
         let mut operations = Vec::new();
-        for (key, row) in self.store.scan_prefix("op/")? {
+        for (key, row) in self.scan_known_logged("op/")? {
             let request = request_row(&key, &row)?;
             let operation = parse_operation(&key, "op/")?;
             let lease = leases.remove(&operation);
@@ -521,6 +765,7 @@ impl Durable {
                 losses: losses.remove(&operation).unwrap_or(0),
                 fate: fates.remove(&operation),
                 subject: subjects.remove(&operation),
+                size_key: opkeys.remove(&operation),
             });
         }
         Ok(Stored {
@@ -528,6 +773,8 @@ impl Durable {
             next_seq: self.counter(NEXT_SEQ)?,
             operations,
             floors,
+            key_floors,
+            key_names,
             cordons: self.cordons()?,
         })
     }
@@ -637,7 +884,7 @@ impl Durable {
         action: &Digest,
     ) -> Result<Vec<OperationId>, StateError> {
         let mut found = Vec::new();
-        for (key, row) in self.store.scan_prefix("op/")? {
+        for (key, row) in self.scan_known("op/")? {
             let request = request_row(&key, &row)?;
             let named = instance.is_none_or(|instance| request.key.instance == instance);
             if named && request.key.action == *action {
@@ -671,13 +918,26 @@ impl Durable {
 
     /// An operation submitted: its request, what its `action usage:` line says it is,
     /// and its place in the queue, in one transaction.
+    #[cfg(test)]
     pub(super) fn submitted(
         &self,
         operation: OperationId,
         request: &Request,
         subject: &Subject,
     ) -> Result<(), StateError> {
-        self.commit(self.submission(operation, request, subject)?)
+        self.submitted_keyed(operation, request, subject, None)
+    }
+
+    /// [`Durable::submitted`], with the operation's size key, if it has one, in an
+    /// `opkey/` row of the same transaction.
+    fn submitted_keyed(
+        &self,
+        operation: OperationId,
+        request: &Request,
+        subject: &Subject,
+        size_key: Option<u64>,
+    ) -> Result<(), StateError> {
+        self.commit(self.submission(operation, request, subject, size_key)?)
     }
 
     /// [`Durable::submitted`], with the action's in-flight row in the same transaction:
@@ -687,9 +947,10 @@ impl Durable {
         operation: OperationId,
         request: &Request,
         subject: &Subject,
+        size_key: Option<u64>,
         (pin, cond): (&str, Cond),
     ) -> Result<(), StateError> {
-        let txn = self.submission(operation, request, subject)?;
+        let txn = self.submission(operation, request, subject, size_key)?;
         self.commit(txn.put(pin, operation.0.to_be_bytes(), cond))
     }
 
@@ -698,132 +959,59 @@ impl Durable {
         operation: OperationId,
         request: &Request,
         subject: &Subject,
+        size_key: Option<u64>,
     ) -> Result<Txn, StateError> {
         let value = encode(FarmInput::Submit(request.clone()))?;
-        Ok(Txn::new()
+        let mut txn = Txn::new();
+        if let Some(key) = size_key {
+            txn = txn.put(opkey_key(operation), opkey::encode(key), Cond::Absent);
+        }
+        Ok(txn
             .put(op_key(operation), value, Cond::Absent)
             .put(
                 subject_key(operation),
                 subject::encode(subject),
                 Cond::Absent,
             )
-            .put(queue_key(operation), Vec::new(), Cond::Absent)
-            .put(NEXT_OP, (operation.0 + 1).to_be_bytes(), Cond::Any))
+            .put(queue_key(operation), Vec::new(), Cond::Absent))
     }
 
-    /// A grant committed: the operation leaves the queue and holds `grant`'s lease. The
-    /// operation must be queued, as the transaction reads it.
-    fn granted(&self, start: &StartLease) -> Result<(), StateError> {
-        let queued = queue_key(start.operation);
-        let row = self.row(&queued)?;
-        let grant = LeaseGrant {
-            lease: start.lease,
-            operation: start.operation,
-            worker: start.worker.clone(),
+    /// The value of the `keyfloor/` row of `floor`: it names the size summary `summary`
+    /// when it is known and fits, else the name the row already holds (a write that does
+    /// not know the summary leaves the name where it was).
+    fn key_floor_value(
+        &self,
+        floor: &KeyFloor,
+        summary: Option<&kbf_estimator::Key>,
+    ) -> Result<Vec<u8>, StateError> {
+        let named = summary.map(estimate::row_key);
+        let name = match named.filter(|n| n.len() <= usize::from(u16::MAX)) {
+            Some(name) => Some(name),
+            None => self
+                .store
+                .get(&floor::key_row(floor.key))?
+                .and_then(|row| floor::decode_key(&row.value).ok())
+                .and_then(|(_, name)| name),
         };
-        let value = encode(FarmInput::Committed(ControlRecord::Lease(grant)))?;
-        self.commit(
-            Txn::new()
-                .delete(queued, Cond::Version(row.version))
-                .put(lease_key(start.lease), value, Cond::Absent)
-                .put(NEXT_SEQ, (start.lease.seq + 1).to_be_bytes(), Cond::Any),
-        )
+        Ok(floor::encode_key(floor, name.as_deref()))
     }
 
-    /// A lease given up: the operation holds nothing and is queued again. Repeatable:
-    /// the farm writes a give-up the store refused again until the store takes it, so
-    /// the lease row may be gone already, and the queue row may be there. An operation
-    /// that has finished has nothing to put back.
-    ///
-    /// `losses` is the operation's count of lost leases, to write down if the give-up is
-    /// one ([`kbf_sched::RequeueReason::is_loss`]). `fate` is what the operation's faults
-    /// changed so far, if they changed anything: it goes in the same transaction as the
-    /// queue row.
-    pub(super) fn requeued(
+    /// Writes the key floor `floor` as it now stands, or deletes its row when it was
+    /// forgotten (an `ask` of 0): outside any requeue, after the estimator's decay lowered
+    /// it. Best effort for the caller; the row keeps its stamp and names the size summary
+    /// `summary` that its floor decays with.
+    pub(super) fn put_key_floor(
         &self,
-        requeue: &Requeue,
-        losses: Option<u32>,
-        fate: Option<&Fate>,
-        floors: &FloorChange,
+        floor: &KeyFloor,
+        summary: Option<&kbf_estimator::Key>,
     ) -> Result<(), StateError> {
-        let mut txn = Txn::new();
-        // The floor outlives the operation: a kill raises it, and the operation may end
-        // before the write is taken.
-        let raised = floors.raised.as_ref();
-        if let Some(floor) = raised {
-            let row = floor::encode(floor).ok_or_else(|| {
-                corrupt(&floor::row_key(&floor.key), "a floor is too large to write")
-            })?;
-            txn = txn.put(floor::row_key(&floor.key), row, Cond::Any);
-        }
-        // A key forgotten and raised again since keeps its row.
-        for key in floors
-            .evicted
-            .iter()
-            .filter(|k| raised.is_none_or(|f| &f.key != *k))
-        {
-            txn = txn.delete(floor::row_key(key), Cond::Any);
-        }
-        if self.store.get(&op_key(requeue.operation))?.is_none() {
-            return if raised.is_some() || !floors.evicted.is_empty() {
-                self.commit(txn)
-            } else {
-                Ok(())
-            };
-        }
-        let key = lease_key(requeue.lease);
-        if let Some(row) = self.store.get(&key)? {
-            txn = txn.delete(key, Cond::Version(row.version));
-        }
-        if let Some(count) = losses {
-            let count = u64::from(count).to_be_bytes();
-            txn = txn.put(loss_key(requeue.operation), count, Cond::Any);
-        }
-        if let Some(fate) = fate {
-            let row = fate::encode(fate).ok_or_else(|| {
-                corrupt(&fate_key(requeue.operation), "a fate is too large to write")
-            })?;
-            txn = txn.put(fate_key(requeue.operation), row, Cond::Any);
-        }
-        self.commit(txn.put(queue_key(requeue.operation), Vec::new(), Cond::Any))
-    }
-
-    /// A result accepted from `lease`: the operation is finished. The lease row goes if
-    /// it is there, compare-and-set on its version. It may be gone: the scheduler lets a
-    /// worker's result decide an operation whose lease it gave up in the same feed, and
-    /// that give-up ([`Durable::requeued`]) already deleted the row and put the queue row
-    /// back. The operation's own rows go either way, so a finished operation is never
-    /// left queued. A lease row gone with no queue row is not that give-up: `Missing`.
-    ///
-    /// The `done/` row of `ending` is put in the same transaction as the deletes, so the
-    /// store holds the operation's unfinished rows or its result, never neither.
-    fn finished(
-        &self,
-        operation: OperationId,
-        lease: LeaseId,
-        ending: &Ending,
-    ) -> Result<(), StateError> {
-        let key = lease_key(lease);
-        let mut txn = Txn::new();
-        match self.store.get(&key)? {
-            Some(row) => txn = txn.delete(key, Cond::Version(row.version)),
-            // Gone with the operation queued again is the farm's own give-up. Gone
-            // without is another writer's doing: the result is stale.
-            None => {
-                if self.store.get(&queue_key(operation))?.is_none() {
-                    return Err(StateError::Missing(key));
-                }
-            }
-        }
-        let txn = self.unpin(txn, operation)?;
-        self.commit(ending.settle(txn, operation))
-    }
-
-    /// A refusal committed: the operation is finished without a lease, and its `done/`
-    /// row goes in the same transaction as its rows are removed.
-    fn refused(&self, operation: OperationId, ending: &Ending) -> Result<(), StateError> {
-        let txn = self.unpin(Txn::new(), operation)?;
-        self.commit(ending.settle(txn, operation))
+        let row = floor::key_row(floor.key);
+        let txn = if floor.ask == 0 {
+            Txn::new().delete(row, Cond::Any)
+        } else {
+            Txn::new().put(row, self.key_floor_value(floor, summary)?, Cond::Any)
+        };
+        self.commit(txn)
     }
 
     /// Writes what the scheduler's effects of a committed record settle, in order.
@@ -871,17 +1059,27 @@ impl Durable {
             caps: reported.caps.clone(),
         };
         let value = encode(up)?;
-        let key = format!("session/{worker}");
+        let key = format!("{SESSION}{worker}");
+        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        sessions.insert(worker.clone(), value.clone());
+        drop(sessions);
         self.commit(Txn::new().put_ttl(key, value, LEASE_GRACE, Cond::Any))
     }
 
     /// Extends `worker`'s session row by the lease grace, from the store's clock. A
-    /// daemon with no row (its registration was not written, or the row expired) is left
-    /// for its next registration to write.
+    /// daemon with no row (its registration was not written, or the row expired) gets the
+    /// registration this handle wrote last put again, where there is still no row; a
+    /// daemon this handle never wrote a registration for is left for its next
+    /// registration to write.
     pub(super) fn renew(&self, worker: &WorkerId) -> Result<(), StateError> {
-        let key = format!("session/{worker}");
+        let key = format!("{SESSION}{worker}");
         let Some(row) = self.store.get(&key)? else {
-            return Ok(());
+            let sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(value) = sessions.get(worker).cloned() else {
+                return Ok(());
+            };
+            drop(sessions);
+            return self.commit(Txn::new().put_ttl(key, value, LEASE_GRACE, Cond::Absent));
         };
         let renewed = Txn::new().put_ttl(key, row.value, LEASE_GRACE, Cond::Version(row.version));
         self.commit(renewed)
@@ -955,8 +1153,13 @@ impl Farm {
     /// [`StateStore::epoch`] decides: kept, a daemon that reconnects keeps the runs of
     /// its leases; bumped, it kills them. Call it before the farm serves anything.
     ///
+    /// The farm numbers its operations and leases in blocks it reserves in the store
+    /// ([`ID_BLOCK`] ids at a time); the first blocks are reserved here, past every id any
+    /// frontend of the store reserved before.
+    ///
     /// # Errors
-    /// The store cannot be read, or holds a row that is not one the scheduler wrote.
+    /// The store cannot be read or written, or holds a row that is not one the scheduler
+    /// wrote.
     pub fn with_state(mut self, state: Option<StateStore>) -> Result<Self, StateError> {
         let state_of_farm = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         let epoch = state_of_farm.keep_in(state)?;
@@ -980,6 +1183,19 @@ impl Farm {
             .durable
             .as_ref()
             .map_or(Ok(None), |d| d.ended(operation))
+    }
+
+    /// Raises the epoch the state store holds by one, and returns the epoch before and the
+    /// one stored now; `None` if the farm has no state store. This farm keeps the epoch it
+    /// started under (its leases and its `Welcome` name it): the stored one is read by a
+    /// frontend when it starts, so the daemons drop the leases of the older epoch when
+    /// they reach a frontend started after the bump.
+    ///
+    /// # Errors
+    /// The store cannot be read or written, or holds no epoch.
+    pub fn bump_epoch(&self) -> Result<Option<EpochBump>, StateError> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.durable.as_ref().map(Durable::bump_epoch).transpose()
     }
 }
 
@@ -1015,6 +1231,7 @@ impl State {
                         Attempt::Transient
                     }
                     StateError::Missing(_) | StateError::Conflict(_) => Attempt::Stale,
+                    StateError::StaleOwner(_) => Attempt::Disowned,
                     _ => Attempt::Dropped,
                 }
             }
@@ -1035,8 +1252,11 @@ impl State {
     /// it wait for the next call, so no later row is written ahead of an earlier one (a
     /// result must not be written before the grant it follows, nor a grant after the
     /// result of the lease it names). A row the store refuses as stale drops its record's
-    /// remaining effects, as a refused record always did. Once a newer writer fences the
-    /// store, everything held is dropped and nothing is written.
+    /// remaining effects, as a refused record always did; so does one for a node another
+    /// frontend owns now ([`StateError::StaleOwner`]), and so does each later effect for
+    /// that node, one by one, as it meets the same refusal; the effects of other nodes are
+    /// written as before. Once a newer writer fences the store, everything held is dropped
+    /// and nothing is written.
     pub(super) fn release_unwritten(&mut self) -> Vec<Effect> {
         let mut ready = Vec::new();
         loop {
@@ -1051,7 +1271,6 @@ impl State {
                 for batch in std::mem::take(&mut self.unwritten) {
                     self.forget_details(batch);
                 }
-                self.retrying = None;
                 return ready;
             }
             let Some(front) = self.unwritten.front() else {
@@ -1062,33 +1281,36 @@ impl State {
                 continue;
             };
             let ending = self.ending(&effect);
-            let mut attempt = self.attempt("a committed record", |d| {
+            // A try that the store applied and did not acknowledge is tried again here,
+            // and finds its own work in the rows (the write says so: it is `Taken`); a
+            // `Stale` is another writer's work in the way, and the effect is dropped.
+            let attempt = self.attempt("a committed record", |d| {
                 d.persist(std::slice::from_ref(&effect), ending.as_ref())
             });
-            if attempt == Attempt::Stale && self.retrying.as_ref() == Some(&effect) {
-                // An earlier try of this very write was refused as unreachable; the
-                // store may have applied it all the same, and then the rows it
-                // depends on are gone. Its work is done: carry the effect out.
-                tracing::warn!("a retried write finds its work done; carrying the effect out");
-                attempt = Attempt::Taken;
-            }
             match attempt {
                 Attempt::Taken => {
-                    self.retrying = None;
                     self.unwritten.front_mut().and_then(VecDeque::pop_front);
                     ready.push(effect);
                 }
                 Attempt::Transient => {
-                    self.retrying = Some(effect);
                     let held: usize = self.unwritten.iter().map(VecDeque::len).sum();
                     tracing::warn!(held, "store holds back records; retried later");
                     return ready;
                 }
-                Attempt::Stale | Attempt::Dropped => {
-                    self.retrying = None;
+                Attempt::Stale | Attempt::Disowned | Attempt::Dropped => {
                     self.write_drops += 1;
                     tracing::error!("a committed record's remaining effects were dropped");
                     let dropped = self.unwritten.pop_front().unwrap_or_default();
+                    // Another frontend's work stands in its place: this one gives up what
+                    // it did for the operation and follows the store. A finish dropped for
+                    // another reason (the node moved to another frontend, and its daemon
+                    // keeps the result for that frontend) is followed too, but its grants
+                    // stay: nothing in the store says they lost.
+                    if attempt == Attempt::Stale {
+                        self.lost_race(&dropped);
+                    } else {
+                        self.follow_finishes(&dropped);
+                    }
                     self.forget_details(dropped);
                 }
             }
@@ -1103,6 +1325,13 @@ impl State {
             Effect::Refuse(refusal) => refusal.operation == operation,
             Effect::Start(_) | Effect::Commit(_) | Effect::Waiting(_) => false,
         })
+    }
+
+    /// Whether the scheduler holds `operation`, or finished it and holds the finish back,
+    /// unwritten. The store's rows of such an operation are no news: taking them in would
+    /// run the operation again.
+    pub(super) fn known_operation(&self, operation: OperationId) -> bool {
+        self.sched.state(operation).is_some() || self.finish_held(operation)
     }
 
     /// Forgets the details parked for the answers among `dropped` effects, which will
@@ -1214,19 +1443,61 @@ impl State {
                 FloorChange::default()
             };
             kills.extend(self.learned_requeue(requeue));
+            // A raise makes any lowered row still waiting for the store stale: the
+            // requeue writes the floor as it stands.
+            if let Some(raised) = &floors.key_raised {
+                self.unwritten_floors.retain(|f| f.key != raised.key);
+            }
             self.unsettled.push((requeue.clone(), losses, fate, floors));
         }
         let pending = std::mem::take(&mut self.unsettled);
+        // A give-up for a node another frontend owns now is not written again: the node's
+        // lease is that frontend's to give up, and the check would refuse it every time.
+        let mut disowned = 0;
         let refused: Vec<_> = pending
             .into_iter()
             .filter(|(requeue, losses, fate, floors)| {
-                !self.durably("a requeue", |d| {
-                    d.requeued(requeue, *losses, fate.as_ref(), floors)
-                })
+                let summary = floors
+                    .key_raised
+                    .as_ref()
+                    .and_then(|f| self.learned.summary_key(f.key));
+                let floors = self.current_key_floors(floors);
+                let attempt = self.attempt("a requeue", |d| {
+                    d.requeued_named(requeue, *losses, fate.as_ref(), &floors, summary.as_ref())
+                });
+                disowned += u64::from(attempt == Attempt::Disowned);
+                !matches!(attempt, Attempt::Taken | Attempt::Disowned)
             })
             .collect();
         self.unsettled = refused;
+        self.write_drops += disowned;
+        // The queue row a give-up writes is this frontend's own: the intake poll finds the
+        // operation queued as it left it, not queued again by another frontend.
+        for requeue in given_up {
+            self.intake.rewrote(requeue.operation);
+        }
         self.write_estimates(&kills);
+    }
+
+    /// Whether the refusal that `record` proposes is taken back because a daemon connected
+    /// to another frontend of the state store could run the operation. The scheduler judged
+    /// the operation unservable from its own daemons; the session rows of the store hold
+    /// every frontend's, so they decide whether the operation is refused. An operation
+    /// held waits again for the unservable wait, and the rows are read again then. A store
+    /// whose session rows cannot be read holds it too: a refusal is never final on a guess.
+    pub(super) fn held_for_other_frontends(&mut self, record: &ControlRecord) -> bool {
+        let ControlRecord::Refusal(refusal) = record else {
+            return false;
+        };
+        let Some(durable) = &self.durable else {
+            return false;
+        };
+        self.sched.hold_refusal(refusal.operation, |request| {
+            durable.session_could_run(request).unwrap_or_else(|error| {
+                tracing::warn!(%error, "the daemon sessions cannot be read: the refusal waits");
+                true
+            })
+        })
     }
 
     /// Renews `worker`'s session row if its last write is a renewal interval old: one
@@ -1242,6 +1513,7 @@ impl State {
             .is_none_or(|at| now >= at.saturating_add(SESSION_RENEWAL));
         if due && self.durably("a session renewal", |d| d.renew(worker)) {
             self.renewed.insert(worker.clone(), now);
+            self.session_ok.insert(worker.clone(), now);
         }
     }
 
@@ -1288,44 +1560,98 @@ impl State {
             return Ok(None);
         };
         let (durable, epoch) = Durable::open(store, epoch, process_term())?;
+        durable
+            .read_size_keys
+            .store(self.learned.keys(), Ordering::SeqCst);
         let stored = durable.load()?;
-        // Operation names carry the writer generation, not the epoch: a kept epoch must
-        // not let a process name an operation another one named (issue #154). A store
-        // handed in without a fence has no generation, and the epoch names as it did.
+        // The farm hands out `operations/<id>` names, whose ids are the store's. The machine's
+        // term is the one of the old form, `operations/{term}-{waiter}`, which the farm still
+        // answers for a caller it holds: it carries the writer generation, not the epoch, so a
+        // kept epoch does not let a process answer a name another one wrote (issue #154). A
+        // store handed in without a fence has no generation, and the epoch is the term.
         self.machine = FarmMachine::new(durable.generation()?.unwrap_or(epoch));
         let now = SystemTime::now();
         let mut recovered = Vec::new();
-        for op in stored.operations {
+        let mut keyed = Vec::new();
+        // A start takes up the operations that wait for a lease, and none that holds one:
+        // the lease belongs to the frontend its node is connected to, which may be another
+        // than this. A leased operation is taken up when its node says `Hello` here
+        // ([`State::claim_worker`]); if the node never does, the orphan sweep requeues it.
+        for op in stored
+            .operations
+            .into_iter()
+            .filter(|op| op.lease.is_none())
+        {
+            if let Some(size_key) = op.size_key.filter(|_| self.learned.keys()) {
+                keyed.push((op.operation, size_key));
+                self.register_stored(&op, size_key);
+            }
             recovered.push(self.take_stored(op, now));
         }
-        let next_operation = OperationId(stored.next_operation);
+        // The first blocks of ids are reserved here, past everything any frontend of the
+        // store reserved, and the scheduler numbers inside them from now on. Every start
+        // reserves, so a start never takes an id an earlier one took, whether or not the
+        // rows of the operations that used them are still there.
+        let first_operation = durable.reserve_operation(OperationId(stored.next_operation))?;
+        let seqs = durable.reserve_seqs(stored.next_seq)?;
         self.sched.restore_floors(stored.floors);
+        self.sched.restore_key_floors(stored.key_floors);
+        let stored_names = stored.key_names;
         // Off reads no size summaries and leaves them as they are.
         if !self.learned.off() {
             self.learned.restore(&durable.estimates()?);
         }
         self.sched
-            .recover(epoch, next_operation, stored.next_seq, recovered);
-        self.restore_cordons(stored.cordons);
+            .recover(epoch, first_operation, seqs.start, recovered);
+        self.sched.use_seq_block(seqs);
+        // The size keys come from the store's own rows, not from the requests: only `on`
+        // reads them. A recovered lease keeps the request the store holds; a key floor
+        // raises only the operations queued after it.
+        for (operation, key) in keyed {
+            self.sched.set_size_key(operation, key);
+        }
+        // A key whose operations have all finished still has its floor and its decay.
+        if self.learned.keys() {
+            for (size_key, summary) in &stored_names {
+                self.learned.register(summary, *size_key);
+            }
+        }
+        self.restore_cordons(stored.cordons, durable.store_ms());
         self.durable = Some(durable);
         Ok(Some(epoch))
     }
 
     /// Writes `request`, about to be queued, to the state store, unless it will join a
-    /// twin already there. Not generic, unlike `Farm::submit`, so every test binary's
-    /// runs count toward the same function's coverage.
+    /// twin already there, and says where it is held ([`Held`]). Not generic, unlike
+    /// `Farm::submit`, so every test binary's runs count toward the same function's
+    /// coverage.
+    ///
+    /// A twin the store holds that this scheduler does not is taken up as an operation of
+    /// its own, queued or leased on a node this frontend owns (`now` is farm time, for the
+    /// look at the owner). One leased on a node another frontend owns is not taken up: the
+    /// lease is that frontend's, and this scheduler would give it up when the node did not
+    /// register here. The request follows the operation through the store instead.
     ///
     /// # Errors
     /// UNAVAILABLE if the store did not take it: the request is not queued, and the
     /// client, who is told nothing is queued, asks again.
-    pub(super) fn queue(&mut self, request: &Request, subject: &Subject) -> Result<(), Status> {
+    pub(super) fn queue(
+        &mut self,
+        request: &Request,
+        subject: &Subject,
+        size_key: Option<u64>,
+        now: FarmTime,
+    ) -> Result<Held, Status> {
         if self.sched.twin(request).is_some() {
-            return Ok(());
+            return Ok(Held::Here);
         }
-        let id = self.sched.next_operation();
+        let wanted = self.sched.next_operation();
         let mut submitted = None;
         let taken = self.durably("a submission", |d| {
-            submitted = Some(d.submit(id, request, subject)?);
+            // The id comes from the block this frontend reserved: the operation's row
+            // is put under an id no other frontend takes.
+            let id = d.reserve_operation(wanted)?;
+            submitted = Some(d.submit_keyed(id, request, subject, size_key)?);
             Ok(())
         });
         if !taken {
@@ -1355,20 +1681,45 @@ impl State {
                 // The scheduler retires a finished operation after its retention
                 // whether or not the finish was written, so the held finish itself is
                 // asked too: while it waits, the operation's rows are not free.
-                if self.sched.state(op.operation).is_some() || self.finish_held(op.operation) {
+                if self.known_operation(op.operation) {
                     return Err(Status::unavailable(
                         "the action's previous run is finishing; the request is not queued",
                     ));
                 }
-                let recovered = self.take_stored(*op, SystemTime::now());
-                // The operation is neither in the scheduler nor finished (checked
-                // above), so `take_in` has nothing to refuse.
-                let taken = self.sched.take_in(recovered);
-                debug_assert!(taken, "the stored operation was already in the scheduler");
+                if self.leased_elsewhere(&op, now) {
+                    return Ok(Held::Elsewhere(op.operation));
+                }
+                self.take_in_stored(*op);
             }
             None => {}
         }
-        Ok(())
+        Ok(Held::Here)
+    }
+
+    /// Whether `op` holds a lease on a node this frontend does not own at `now`: its daemon
+    /// is connected to another frontend, or to none (the daemon that ran it has not said
+    /// `Hello` anywhere since the lease was written, and the orphan sweep requeues the lease
+    /// if it never does). A store whose owner row cannot be read is the same: nothing is
+    /// taken up on a guess.
+    fn leased_elsewhere(&self, op: &StoredOperation, now: FarmTime) -> bool {
+        let lease = op.lease.as_ref();
+        lease.is_some_and(|grant| !self.owns_worker(now, &grant.worker))
+    }
+
+    /// Takes `op`, which the state store holds and the scheduler neither holds nor has
+    /// finished (the caller checked), into the scheduler, held for a caller of its own that
+    /// no client waits on, with the size key its row names if the learned sizes read it.
+    pub(super) fn take_in_stored(&mut self, op: StoredOperation) {
+        let operation = op.operation;
+        let stored_key = op.size_key.filter(|_| self.learned.keys());
+        let recovered = self.take_stored(op, SystemTime::now());
+        // The operation is neither in the scheduler nor finished, so `take_in` has nothing
+        // to refuse.
+        let taken = self.sched.take_in(recovered);
+        if let Some(key) = stored_key {
+            self.sched.set_size_key(operation, key);
+        }
+        debug_assert!(taken, "the stored operation was already in the scheduler");
     }
 
     /// Writes the session row of a daemon that registered. Not generic, unlike
@@ -1381,14 +1732,37 @@ impl State {
         predecessor_stopped: bool,
         reported: &Reported,
     ) {
-        self.durably("a session", |d| {
+        let written = self.durably("a session", |d| {
             d.session(worker, instance, predecessor_stopped, reported)
         });
-        self.renewed.insert(worker.clone(), now);
+        // A registration the store refused is written at the next heartbeat, which
+        // renews: a daemon whose row is not there is not acknowledged.
+        if written {
+            self.renewed.insert(worker.clone(), now);
+            self.session_ok.insert(worker.clone(), now);
+        }
     }
 }
 
 #[cfg(test)]
+mod blocks_tests;
+#[cfg(test)]
+mod intake_tests;
+#[cfg(test)]
+mod leases_tests;
+#[cfg(test)]
+mod named_tests;
+#[cfg(test)]
+mod owner_tests;
+#[cfg(test)]
+mod results_tests;
+#[cfg(test)]
 mod submit_tests;
 #[cfg(test)]
+mod sweep_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod transition_tests;
+#[cfg(test)]
+mod unknown_tests;

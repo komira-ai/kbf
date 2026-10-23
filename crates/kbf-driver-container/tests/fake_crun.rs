@@ -347,7 +347,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Catches an image named by tag reaching `crun` (the "tag instead of a digest"
-/// mutant): refused as the client's error before anything is created.
+/// defect): refused as the client's error before anything is created.
 #[tokio::test]
 async fn a_tag_is_refused_before_anything_runs() {
     let fake = Fake::new("tag");
@@ -532,7 +532,7 @@ async fn a_dropped_run_kills_the_cgroup_before_the_delete_and_survives_a_failed_
 /// it started may still be there: the run would write into the removed directories
 /// after the clean, as the flake did. `conformance`'s dropped run, 200 times over with
 /// the CPUs busy (`support::CpuHog`), so a timing one run passes by luck shows up. The
-/// mutant skips `reap` in the lease's clean: `delete` then finds the run still there.
+/// defect skips `reap` in the lease's clean: `delete` then finds the run still there.
 #[tokio::test]
 async fn no_round_of_a_dropped_run_races_the_clean() {
     let _hog = support::CpuHog::start();
@@ -802,7 +802,7 @@ async fn an_action_cannot_upload_a_host_file_through_a_symlink() {
 
 /// Catches an action taking the daemon down through the depth of its outputs: an
 /// output directory 3000 levels deep overflowed the recursive walk's stack (SIGABRT,
-/// every lease on the node lost; seen red: this test binary aborts). It fails the
+/// every lease on the node lost, which aborts this test binary). It fails the
 /// action alone, naming the limit's flag, and the next action on the same runtime
 /// runs.
 #[tokio::test]

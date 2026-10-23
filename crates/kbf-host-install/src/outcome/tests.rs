@@ -6,7 +6,7 @@ fn json(outcome: &Outcome) -> Value {
     serde_json::from_str(&outcome.json_line()).unwrap()
 }
 
-const ALL_REFUSALS: [(Refusal, &str); 8] = [
+const ALL_REFUSALS: [(Refusal, &str); 10] = [
     (Refusal::BadCommand, "bad_command"),
     (Refusal::ChannelNotAllowed, "channel_not_allowed"),
     (Refusal::ConfigInvalid, "config_invalid"),
@@ -14,7 +14,9 @@ const ALL_REFUSALS: [(Refusal, &str); 8] = [
     (Refusal::ChannelUnsigned, "channel_unsigned"),
     (Refusal::KeyUntrusted, "key_untrusted"),
     (Refusal::ChannelInsecure, "channel_insecure"),
-    (Refusal::OlderThanInstalled, "older_than_installed"),
+    (Refusal::UnknownRelease, "unknown_release"),
+    (Refusal::AmbiguousRelease, "ambiguous_release"),
+    (Refusal::FetchFailed, "fetch_failed"),
 ];
 
 const ALL_FAILURES: [(FailureCode, &str); 9] = [
@@ -55,6 +57,7 @@ fn exit_codes() {
     let query = Outcome::Queried(QueryReport {
         installed_version: None,
         running_commit: None,
+        node_id: None,
         in_progress: false,
     });
     assert_eq!(
@@ -103,27 +106,29 @@ fn json_shapes() {
     }
 }
 
-/// The query line is `result` and then the three fields, in this order, with nulls spelled
+/// The query line is `result` and then the four fields, in this order, with nulls spelled
 /// out: every answer of the program has a `result`.
 #[test]
 fn query_line_shape_and_order() {
     let full = Outcome::Queried(QueryReport {
         installed_version: Some("1.0-1".into()),
         running_commit: Some("abc".into()),
+        node_id: Some("node-1".into()),
         in_progress: true,
     });
     assert_eq!(
         full.json_line(),
-        r#"{"result":"query","installed_version":"1.0-1","running_commit":"abc","in_progress":true}"#
+        r#"{"result":"query","installed_version":"1.0-1","running_commit":"abc","node_id":"node-1","in_progress":true}"#
     );
     let empty = Outcome::Queried(QueryReport {
         installed_version: None,
         running_commit: None,
+        node_id: None,
         in_progress: false,
     });
     assert_eq!(
         empty.json_line(),
-        r#"{"result":"query","installed_version":null,"running_commit":null,"in_progress":false}"#
+        r#"{"result":"query","installed_version":null,"running_commit":null,"node_id":null,"in_progress":false}"#
     );
 }
 
@@ -164,6 +169,7 @@ fn audit_fields() {
     let query = Outcome::Queried(QueryReport {
         installed_version: None,
         running_commit: None,
+        node_id: None,
         in_progress: false,
     });
     assert_eq!(query.audit_fields(), ("query", None));
@@ -318,4 +324,56 @@ fn other_lines_are_not_a_units_answer() {
     ] {
         assert_eq!(Outcome::from_unit_line(line), None, "{line:?}");
     }
+}
+
+/// A Mac's two answers have their own lines, which the Linux ones never are: the apply
+/// started (exit 0), and the query with the standing of the last apply after the four fields
+/// of a query; neither is an install unit's answer.
+#[test]
+fn the_mac_answers() {
+    let started = Outcome::ApplyStarted {
+        version: "0.1.7+gbbbbbbbbbbbb-3".into(),
+        commit: "b".repeat(40),
+    };
+    assert_eq!(
+        started.json_line(),
+        format!(
+            r#"{{"result":"apply_started","version":"0.1.7+gbbbbbbbbbbbb-3","commit":"{}","apply":"running"}}"#,
+            "b".repeat(40)
+        )
+    );
+    assert_eq!(started.exit_code(), 0);
+    assert_eq!(started.audit_fields(), ("apply_started", None));
+    assert_eq!(started.stderr_detail(), None);
+    let report = || QueryReport {
+        installed_version: Some("1".into()),
+        running_commit: Some("abc".into()),
+        node_id: Some("mac-a".into()),
+        in_progress: false,
+    };
+    let done = Outcome::MacQueried {
+        report: report(),
+        apply: Some("failed:not_welcomed:rolled_back".into()),
+    };
+    assert_eq!(
+        done.json_line(),
+        r#"{"result":"query","installed_version":"1","running_commit":"abc","node_id":"mac-a","in_progress":false,"apply":"failed:not_welcomed:rolled_back"}"#
+    );
+    let none = Outcome::MacQueried {
+        report: report(),
+        apply: None,
+    };
+    assert!(
+        none.json_line()
+            .ends_with(r#""in_progress":false,"apply":null}"#)
+    );
+    assert_eq!(
+        (done.exit_code(), none.audit_fields()),
+        (0, ("query", None))
+    );
+    for outcome in [&started, &done] {
+        assert_eq!(Outcome::from_unit_line(&outcome.json_line()), None);
+    }
+    // The Linux query line is unchanged: it has no `apply`.
+    assert!(!Outcome::Queried(report()).json_line().contains("apply"));
 }

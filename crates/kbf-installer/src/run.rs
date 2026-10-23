@@ -78,8 +78,8 @@ pub struct SystemRunner;
 
 impl Runner for SystemRunner {
     fn run(&self, spawn: &Spawn) -> io::Result<Ran> {
-        // The descriptors to mark are found here, in the parent, where listing a directory
-        // may allocate; the child only makes system calls on numbers copied in.
+        // What the child needs to mark descriptors is made here, in the parent, where
+        // allocating is allowed; the child only makes system calls.
         start(spawn, Inherited::of(FIRST_INHERITED)?)
     }
 }
@@ -204,9 +204,13 @@ pub(crate) enum Inherited {
     /// All of them, by one `close_range` in the child (Linux 5.11 and later, when the
     /// kernel and the sandbox allow it).
     Range(u32),
-    /// These, found by listing the process's descriptor directory in the parent (macOS, and
-    /// Linux without `close_range`).
+    /// These, found by listing the process's descriptor directory in the parent (Linux
+    /// without `close_range`). A descriptor another thread opens after the listing and before
+    /// the fork is not among them.
     Listed(Vec<libc::c_int>),
+    /// Every descriptor from the first up, found in the child after the fork, so none that
+    /// another thread opens meanwhile is missed (macOS, which has no `close_range`).
+    Sweep(Sweep),
     /// A marking that fails with this errno, for a test of what the start does then.
     #[cfg(test)]
     Fails(i32),
@@ -215,7 +219,7 @@ pub(crate) enum Inherited {
 impl Inherited {
     /// How to keep descriptors from `first` up from a program: the range call when it
     /// works (probed on a range that holds no descriptor, so nothing of this process is
-    /// changed), else the descriptors listed now.
+    /// changed), else on macOS a sweep in the child, else the descriptors listed now.
     pub(crate) fn of(first: u32) -> io::Result<Inherited> {
         Inherited::choose(first, range_cloexec(u32::MAX, u32::MAX), Path::new(FD_DIR))
     }
@@ -224,8 +228,115 @@ impl Inherited {
     fn choose(first: u32, probe: io::Result<()>, dir: &Path) -> io::Result<Inherited> {
         match probe {
             Ok(()) => Ok(Inherited::Range(first)),
+            Err(_) if cfg!(target_os = "macos") => Ok(Inherited::Sweep(Sweep::new(first, dir))),
             Err(_) => Ok(Inherited::Listed(listed_in(dir, first)?)),
         }
+    }
+}
+
+/// The fewest descriptors a sweep's listing has room for.
+#[cfg(target_vendor = "apple")]
+const SWEEP_MIN_ENTRIES: usize = 4096;
+
+/// The most numbers the walk of every descriptor covers. The walk makes system calls between
+/// fork and exec, so a limit in the millions (or none at all) would stall every start that
+/// reaches it; it is reached only when the kernel's list cannot be had.
+const SWEEP_WALK_MAX: libc::c_int = 65_536;
+
+/// Marking every descriptor from `first` up close-on-exec in the child, without a list made
+/// beforehand. A list made in the parent misses a descriptor that another thread opens
+/// between the listing and the fork (and one the standard library opens and marks with a
+/// second call), which the program would then inherit. All that is needed from the parent is
+/// made in [`Sweep::new`]; the child allocates nothing.
+pub(crate) struct Sweep {
+    first: u32,
+    /// One past the highest descriptor number a process may hold.
+    limit: libc::c_int,
+    /// Room for the kernel's list of the process's descriptors (macOS), allocated before
+    /// the fork.
+    #[cfg(target_vendor = "apple")]
+    room: Vec<libc::proc_fdinfo>,
+}
+
+impl Sweep {
+    /// A sweep from `first` up. The directory listed only sizes the room for the kernel's
+    /// answer: four times the descriptors open now, and not fewer than [`SWEEP_MIN_ENTRIES`].
+    fn new(first: u32, dir: &Path) -> Sweep {
+        #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
+        let open = std::fs::read_dir(dir).map_or(0, Iterator::count);
+        // SAFETY: sysconf reads no memory.
+        let limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        Sweep {
+            first,
+            limit: Self::walk_limit(limit),
+            #[cfg(target_vendor = "apple")]
+            room: vec![
+                libc::proc_fdinfo {
+                    proc_fd: 0,
+                    proc_fdtype: 0
+                };
+                SWEEP_MIN_ENTRIES.max(open.saturating_mul(4))
+            ],
+        }
+    }
+
+    /// How far the walk of every number goes for a `sysconf` answer: that answer, but at most
+    /// [`SWEEP_WALK_MAX`], and the maximum too when the answer is -1 (no limit known) or 0.
+    fn walk_limit(answer: libc::c_long) -> libc::c_int {
+        match libc::c_int::try_from(answer) {
+            Ok(n) if n > 0 => n.min(SWEEP_WALK_MAX),
+            _ => SWEEP_WALK_MAX,
+        }
+    }
+
+    /// Mark the descriptors from `first` up. Between fork and exec: system calls only.
+    fn mark(&mut self) -> io::Result<()> {
+        #[cfg(target_vendor = "apple")]
+        if self.mark_listed()? {
+            return Ok(());
+        }
+        self.mark_each()
+    }
+
+    /// Mark what the kernel lists as open; false when the answer may have been cut short by
+    /// the room given (or the call failed), so the caller marks every number instead.
+    #[cfg(target_vendor = "apple")]
+    fn mark_listed(&mut self) -> io::Result<bool> {
+        let size = std::mem::size_of::<libc::proc_fdinfo>();
+        let room = self.room.len() * size;
+        let Ok(bytes) = libc::c_int::try_from(room) else {
+            return Ok(false);
+        };
+        // SAFETY: proc_pidinfo writes at most `bytes` bytes into `room`, which is that long
+        // and was allocated before the fork; it allocates nothing here and only makes a
+        // system call.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDLISTFDS,
+                0,
+                self.room.as_mut_ptr().cast(),
+                bytes,
+            )
+        };
+        let Ok(got) = usize::try_from(got) else {
+            return Ok(false);
+        };
+        if got + size > room {
+            return Ok(false);
+        }
+        for entry in &self.room[..got / size] {
+            if u32::try_from(entry.proc_fd).is_ok_and(|fd| fd >= self.first) {
+                cloexec(entry.proc_fd)?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Mark every number from `first` below the limit; one that is not open is skipped.
+    fn mark_each(&self) -> io::Result<()> {
+        let first = libc::c_int::try_from(self.first).unwrap_or(libc::c_int::MAX);
+        (first..self.limit).try_for_each(cloexec)
     }
 }
 
@@ -315,12 +426,14 @@ pub(crate) fn before_exec_with<S: Creds + Confiner + Send + Sync + 'static>(
     confine: Option<Confine>,
     keep: Option<libc::c_int>,
 ) -> impl FnMut() -> io::Result<()> + Send + Sync + 'static {
+    let mut inherited = inherited;
     // Read here, in the parent, so that the child can tell whether it has been orphaned.
     let parent = sys.pid();
     move || {
-        match &inherited {
+        match &mut inherited {
             Inherited::Range(first) => range_cloexec(*first, u32::MAX)?,
             Inherited::Listed(fds) => fds.iter().try_for_each(|fd| cloexec(*fd))?,
+            Inherited::Sweep(sweep) => sweep.mark()?,
             #[cfg(test)]
             Inherited::Fails(errno) => return Err(io::Error::from_raw_os_error(*errno)),
         }

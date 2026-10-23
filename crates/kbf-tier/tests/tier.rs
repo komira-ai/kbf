@@ -173,7 +173,7 @@ fn a_block_is_sealed_at_the_segment_limit() {
 /// Catches: open reservations not counted against the budget (uploads in flight
 /// would overrun the disk), a refused range that still counts, bytes not released
 /// when an upload fails or a block is unstaged, disk use above the budget, and a
-/// range that exactly fills the budget refused (mutant: `>=` for `>`).
+/// range that exactly fills the budget refused (defect: `>=` for `>`).
 #[test]
 fn the_budget_counts_open_reservations_and_refuses_the_excess() {
     let (fs, tier) = fresh(100);

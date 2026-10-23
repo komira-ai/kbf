@@ -51,10 +51,10 @@ fn the_installer_parses_what_kbf_prints() {
     assert_eq!(parsed.platform, None);
 }
 
-/// The installer takes `release_source = "bundled"` only beside a `kbf` that declares the relay
+/// The installer rolls a `bundled` host back only to a `kbf` that declares the relay
 /// (`RELAY_NEEDED`), and `kbf` is shipped by the same build as the installer: the level this
-/// build declares must meet the level this build's installer needs, or `setup` would refuse the
-/// release it was shipped with.
+/// build declares must meet the level this build's installer needs, or `rollback` would refuse
+/// the release it was shipped with.
 ///
 /// Catches the two numbers drifting apart (the installer's raised, the build's not).
 ///

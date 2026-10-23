@@ -27,8 +27,8 @@
 //! The floor is the root-owned file `seq_floor` beside `state.json`: one decimal number, the
 //! highest `seq` that is not allowed: a seed's `seq` must be strictly above it. A host with none
 //! refuses every staged order (fail closed). [`crate::seq_floor`] writes it: it starts at the
-//! `seq` of the release that runs and rises when a swap is confirmed. `setup` installs the first
-//! release before any floor exists, so it asks none of the seed.
+//! `seq` of the release that runs and rises when a swap is confirmed. `record-release` installs
+//! the first release before any floor exists, so it asks none of the seed.
 //!
 //! Between orders the run loop looks at the seed
 //! ([`Fetcher::look`](crate::helper::fetcher::Fetcher::look)) and tells the frontend,

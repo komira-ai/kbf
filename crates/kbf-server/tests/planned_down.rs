@@ -239,7 +239,7 @@ fn router_over(farm: &Farm, primary: MemberId) -> (Router, [Arc<Node>; 2], Bytes
 // router moves on to b after dialling a, which is what the node's failure costs: a connection
 // attempt per write for up to a TTL), and an action-cache commit does not fail over and is
 // refused UNAVAILABLE. Planned, a is never dialled, the put and the commit both go to b, and
-// they still do after a stops. Mutants (planted locally): `plan_down` leaving the member
+// they still do after a stops. Catches: `plan_down` leaving the member
 // `Active` in the map; the router's write order not skipping `Down` members.
 #[tokio::test]
 async fn a_write_during_a_planned_restart_goes_to_the_other_owner() {
@@ -373,7 +373,7 @@ fn only_an_active_member_can_be_planned_down() {
 
 // Catches: a planned restart kept only in the frontend that made it. A second `Members` over
 // the same store (a frontend that restarted, or another) sees the member Down and planned,
-// and the shown view says so. Mutant: the mark left unwritten.
+// and the shown view says so. Catches: the mark left unwritten.
 #[test]
 fn a_planned_restart_survives_a_frontend_restart() {
     let farm = Farm::new();
@@ -491,7 +491,7 @@ fn the_member_returns_by_registering_or_by_an_undo() {
 // Catches: a controller that dies leaving a healthy node out of service for ever. A plan
 // lasts `for_`; the member keeps beating, and its first beat after that returns it to Active
 // in a new generation, the mark gone, and `node_idle` says the plan ran out before that. Before
-// that time a beat changes nothing. Mutants: the expiry not checked on a beat; checked
+// that time a beat changes nothing. Catches: the expiry not checked on a beat; checked
 // against the wrong clock (it returns at once).
 #[test]
 fn a_planned_restart_ends_by_the_next_beat_after_its_time() {
@@ -543,7 +543,7 @@ fn a_planned_restart_ends_by_the_next_beat_after_its_time() {
 // Catches: a second controller (or a retry) refused with an error, or a repeat that bumps the
 // map: asking again for a member already planned down is the same plan with its end moved
 // to a whole `for_` from now, in the same generation. The plan that would have ended is
-// still running after the repeat. Mutant: the repeat leaves the old end.
+// still running after the repeat. Catches: the repeat leaves the old end.
 #[test]
 fn planning_down_again_moves_the_end_and_changes_no_generation() {
     let farm = Farm::new();
@@ -581,7 +581,7 @@ fn planning_down_again_moves_the_end_and_changes_no_generation() {
 // tick ends the plan (a plan is in force until its end, not at it), and one a nanosecond
 // before does not. Each case is a farm of its own; the clock is set so that the member's beat is
 // the very next thing the store reads (a commit moves the fake's clock, so nothing may come
-// between). Mutant: the beat comparing with `>`.
+// between). Catches: the beat comparing with `>`.
 fn beat_at_the_end_plus(offset_ns: i64) -> Option<MemberState> {
     let farm = Farm::new();
     let a = farm.ids[0];

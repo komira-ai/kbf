@@ -27,6 +27,7 @@ use tokio::time::Instant;
 use crate::cas::CasStore;
 use crate::config::NativeConfig;
 use crate::denials;
+use crate::grace::{self, Survivor};
 use crate::network::{self, Network, network_of};
 use crate::procs::{self, Proc, Tracker};
 use crate::program::{Refused, Resolved, resolve};
@@ -184,7 +185,14 @@ impl<C: Cas> NativeRuntime<C> {
         // this ends what is left, as every lease's end does.
         #[cfg(target_os = "macos")]
         let slots = (config.pool.as_ref())
-            .map(|pool| crate::slots::macos::Slots::start_skipping(pool, config.kill_wait, skipped))
+            .map(|pool| {
+                crate::slots::macos::Slots::start_with_grace(
+                    pool,
+                    config.kill_wait,
+                    config.term_grace,
+                    skipped,
+                )
+            })
             .transpose()?;
         std::fs::create_dir_all(&config.scratch)?;
         let rules = config
@@ -310,7 +318,8 @@ impl<C: Cas> NativeRuntime<C> {
         entries
     }
 
-    /// Sends the daemon the number of free slots through `part` now and whenever it
+    /// Sends the daemon the number of usable slots (not dirty; a slot a lease
+    /// is running in counts) through `part` now and whenever it
     /// changes (a slot went dirty, or was cleaned again), so the node reports its slots
     /// without waiting for the Xcode survey to change. The survey's own report then
     /// leaves the `action_slots` entry out: this part owns it. Without a pool, or off a
@@ -656,13 +665,16 @@ impl<C: Cas> NativeRuntime<C> {
             pid: leader,
             // Held until the group has ended (the group's kill ends it too), and
             // dropped after the group: it ends the group if the daemon dies.
-            keeper: _keeper,
+            keeper,
         } = spawn(&mut command, exec, &record, runner.keeper())
             .await
             .map_err(failed(&prepared.program))?;
         let me = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
         let mut watch = match runner {
-            Runner::Daemon => Watch::Tree(Group::new(Tracker::new(leader, me), record)),
+            Runner::Daemon => Watch::Tree(
+                Group::new(Tracker::new(leader, me), record)
+                    .sparing(i32::try_from(keeper.pid()).ok()),
+            ),
             #[cfg(target_os = "macos")]
             Runner::Slot(slot) => Watch::Uid(slot.watch(record)),
         };
@@ -689,7 +701,14 @@ impl<C: Cas> NativeRuntime<C> {
         };
         // One more read before the processes are ended: what ran since the last poll.
         let _ = watch.measure().await;
-        watch.end(&mut child, self.config.kill_wait).await?;
+        let ignored = watch
+            .end(
+                &mut child,
+                self.config.kill_wait,
+                grace_after(&ended, self.config.term_grace),
+            )
+            .await?;
+        self.report_ignored_sigterm(work.lease_id, dir, &ignored);
         *measured = watch.usage(started.elapsed());
         let did_fail = match &ended {
             Ended::Exited(status) => status.as_ref().is_ok_and(|s| !s.success()),
@@ -762,14 +781,32 @@ impl<C: Cas> NativeRuntime<C> {
         let Some(note) = found.note() else {
             return;
         };
+        self.add_to_stderr(lease, dir, &note, "the sandbox's denials");
+    }
+
+    /// Names the processes that outlasted SIGTERM ([`grace::note`]) in the node's log and
+    /// at the end of the action's stderr: its own hermeticity failure, which does not
+    /// change its exit code.
+    fn report_ignored_sigterm(&self, lease: LeaseId, dir: &Path, ignored: &[Survivor]) {
+        let Some(note) = grace::note(ignored) else {
+            return;
+        };
+        if let Some(brief) = grace::brief(ignored) {
+            tracing::warn!(%lease, "{brief}");
+        }
+        self.add_to_stderr(lease, dir, &note, "the processes that outlasted SIGTERM");
+    }
+
+    /// Appends `note` to the action's stderr in `dir`, unless that pushes it past the
+    /// stdio limit, which would drop all of it: it stays in the node's log then. `what`
+    /// names the note in that log.
+    fn add_to_stderr(&self, lease: LeaseId, dir: &Path, note: &str, what: &str) {
         let stderr = dir.join("stderr");
-        // The note must not push the action's own stderr past the stdio limit, which
-        // would drop all of it: it stays in the node's log then.
         let max = self.config.outputs.max_stdio_bytes;
         let size = std::fs::metadata(&stderr).map_or(u64::MAX, |m| m.len());
         let note_len = u64::try_from(note.len()).unwrap_or(u64::MAX);
         if size.saturating_add(note_len) > max {
-            tracing::warn!(%lease, size, max, "the sandbox's denials do not fit in stderr; they are in the node's log");
+            tracing::warn!(%lease, size, max, "{what} do not fit in stderr; they are in the node's log");
             return;
         }
         let written = std::fs::OpenOptions::new()
@@ -777,7 +814,7 @@ impl<C: Cas> NativeRuntime<C> {
             .open(&stderr)
             .and_then(|mut file| std::io::Write::write_all(&mut file, note.as_bytes()));
         if let Err(why) = written {
-            tracing::warn!(%lease, %why, "the sandbox's denials could not be added to stderr");
+            tracing::warn!(%lease, %why, "{what} could not be added to stderr");
         }
     }
 
@@ -952,6 +989,18 @@ impl<C: Cas> crate::slots::canary::Offer for SlotOffer<'_, C> {
                 *self.killer = Some(by);
                 return Err(RuntimeError::Killed);
             }
+        }
+        // The state the user is in, before the canaries and the lease touch it.
+        let ready = slot.assert_ready(&made.lease, &cancel);
+        let red = match until_killed(ready, &cancel, &mut killed).await {
+            Raced::Done(done) => done?,
+            Raced::Killed(by) => {
+                *self.killer = Some(by);
+                return Err(RuntimeError::Killed);
+            }
+        };
+        if !red.is_empty() {
+            return Ok(Probe::Aside(format!("assertion: {}", red.join("; "))));
         }
         let isolation = &self.runtime.config.isolation;
         let ran = slot.canary(isolation, made.network, &made.lease, &cancel);
@@ -1243,11 +1292,18 @@ impl Watch {
         }
     }
 
-    async fn end(&mut self, child: &mut Child, wait: Duration) -> Result<(), RuntimeError> {
+    /// Ends every process: SIGTERM, up to `grace` for them to go, then SIGKILL
+    /// ([`crate::grace`]). The processes that ignored SIGTERM.
+    async fn end(
+        &mut self,
+        child: &mut Child,
+        wait: Duration,
+        grace: Duration,
+    ) -> Result<Vec<Survivor>, RuntimeError> {
         match self {
-            Self::Tree(group) => group.end(child, wait).await,
+            Self::Tree(group) => group.end(child, wait, grace).await,
             #[cfg(target_os = "macos")]
-            Self::Uid(uid) => uid.end(child, wait).await,
+            Self::Uid(uid) => uid.end(child, wait, grace).await,
         }
     }
 }
@@ -1267,6 +1323,9 @@ struct Group {
     record: PathBuf,
     /// How the process table is read: [`procs::snapshot`], but for tests.
     snapshot: Snapshot,
+    /// The action's keeper, which ignores SIGTERM by design ([`crate::keeper`]): not
+    /// asked to end, not waited for and not reported. The SIGKILL takes it with the rest.
+    keeper: Option<i32>,
     armed: bool,
 }
 
@@ -1285,8 +1344,15 @@ impl Group {
             meter: Arc::default(),
             record,
             snapshot,
+            keeper: None,
             armed: true,
         }
+    }
+
+    /// This group without `keeper` in the SIGTERM round of [`Group::end`].
+    fn sparing(mut self, keeper: Option<i32>) -> Self {
+        self.keeper = keeper;
+        self
     }
 
     /// The live processes of the action now, on the blocking pool.
@@ -1314,11 +1380,44 @@ impl Group {
         .map_err(failed(Path::new("memory")))
     }
 
-    /// Ends every process of the action: SIGKILL to the group and to each process
-    /// known to be the action's, again every [`KILL_PAUSE`] until a snapshot shows
-    /// none alive, then removes the run record and reaps the leader. Processes still
-    /// alive after `wait` fail the lease, and keep their record for the next sweep.
-    async fn end(&mut self, child: &mut Child, wait: Duration) -> Result<(), RuntimeError> {
+    /// Ends every process of the action: SIGTERM to the group and to each process known
+    /// to be the action's, and up to `grace` for them to end ([`grace::term_first`]);
+    /// then SIGKILL the same way, again every [`KILL_PAUSE`] until a snapshot shows none
+    /// alive, then removes the run record and reaps the leader. Processes still alive
+    /// after `wait` of SIGKILL fail the lease, and keep their record for the next sweep.
+    /// The processes that were alive when the grace ended.
+    async fn end(
+        &mut self,
+        child: &mut Child,
+        wait: Duration,
+        grace: Duration,
+    ) -> Result<Vec<Survivor>, RuntimeError> {
+        let (tracker, snapshot, spared) = (Arc::clone(&self.tracker), self.snapshot, self.keeper);
+        let polite = tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let members = || {
+                let mut members = members_now(&tracker, snapshot).map_err(|e| e.to_string())?;
+                members.retain(|p| Some(p.pid) != spared);
+                Ok::<_, String>(members)
+            };
+            grace::term_first(
+                grace,
+                &mut || {
+                    let members = members()?;
+                    procs::term_all(&lock(&tracker), &members);
+                    Ok(())
+                },
+                &mut || Ok(members()?.iter().map(|p| p.pid).collect()),
+                &mut |pid| Survivor::of(pid, procs::command_of(pid)),
+                &mut || started.elapsed(),
+                &mut || std::thread::sleep(KILL_PAUSE),
+            )
+        })
+        .await;
+        let survivors = grace::lenient(
+            polite.map_err(|e| e.to_string()).and_then(|round| round),
+            "the SIGTERM round",
+        );
         let give_up = Instant::now() + wait;
         loop {
             let members = self.members().await?;
@@ -1342,7 +1441,16 @@ impl Group {
             .wait()
             .await
             .map_err(failed(Path::new("reap the action")))?;
-        Ok(())
+        Ok(survivors)
+    }
+}
+
+/// The grace an ending gets: `grace`, except none for a lease past its memory limit: its
+/// processes must not keep growing while they are asked to end.
+fn grace_after(ended: &Ended, grace: Duration) -> Duration {
+    match ended {
+        Ended::Exited(_) | Ended::TimedOut | Ended::Killed => grace,
+        Ended::OutOfMemory { .. } => Duration::ZERO,
     }
 }
 
@@ -1565,6 +1673,19 @@ pub(crate) fn failed(path: &Path) -> impl FnOnce(std::io::Error) -> RuntimeError
 mod tests {
     use super::*;
 
+    /// Catches: a lease past its memory limit getting a grace in which its runaway
+    /// processes go on growing, and an exit, a timeout or a cancel losing the grace.
+    #[test]
+    fn a_lease_past_its_memory_limit_gets_no_grace() {
+        let grace = Duration::from_secs(2);
+        let exited = Ended::Exited(Ok(ExitStatus::default()));
+        assert_eq!(grace_after(&exited, grace), grace);
+        assert_eq!(grace_after(&Ended::TimedOut, grace), grace);
+        assert_eq!(grace_after(&Ended::Killed, grace), grace);
+        let oom = Ended::OutOfMemory { used: 2, limit: 1 };
+        assert_eq!(grace_after(&oom, grace), Duration::ZERO);
+    }
+
     /// Catches spool files a killed daemon left filling the disk, and a start refused
     /// over an entry it cannot remove: a leftover file goes, a directory that is not a
     /// spool stays (logged), and the spool directory is the daemon's alone.
@@ -1723,7 +1844,7 @@ mod tests {
 
     /// Catches a node with a pool and no `sandbox-exec` starting (the check exists but
     /// `NativeRuntime::new` does not call it, or calls it after something is made): the
-    /// start is refused for that reason, before the scratch root is made. Seen red with
+    /// start is refused for that reason, before the scratch root is made. It fails with
     /// the call removed from `build`: the start succeeds on macOS and is refused for the
     /// wrong reason elsewhere.
     #[test]
@@ -1761,7 +1882,7 @@ mod tests {
 
     /// Catches: a failed lease's usage lost (the daemon asks once, after `run` failed),
     /// handed out twice (a second lease with the same id would report the first's),
-    /// kept for a lease that succeeded, or kept without bound. Mutants seen red: `remove`
+    /// kept for a lease that succeeded, or kept without bound. Catches: `remove`
     /// replaced by `get().cloned()` (taken twice); the bound removed (300 kept);
     /// `pop_first` replaced by `pop_last` (the newest lease's usage dropped).
     #[test]
@@ -2072,6 +2193,42 @@ mod tests {
         assert!(record.exists(), "kept for the next start's sweep");
         drop(Group::reading(tracker(), record.clone(), nothing));
         assert!(!record.exists(), "removed once nothing survives");
+    }
+
+    /// Reads the process table, except that its first read fails: the SIGTERM round's.
+    fn table_fails_once() -> std::io::Result<Vec<Proc>> {
+        static READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            Err(std::io::Error::other("table"))
+        } else {
+            procs::snapshot()
+        }
+    }
+
+    /// Catches an action that outlives its lease because the SIGTERM round failed (the
+    /// process table could not be read): the end must still SIGKILL it, succeed, and
+    /// name no survivor. The leader is a real `sleep`, so only the kill ends it.
+    #[tokio::test]
+    async fn the_kill_runs_when_the_sigterm_round_fails() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let dir = crate::unit_dir("runtime-group-term-fails");
+        let record = dir.join("lease-6-6");
+        std::fs::write(&record, "x").expect("write");
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep");
+        let leader = i32::try_from(child.id().expect("pid")).expect("pid");
+        let me = i32::try_from(std::process::id()).expect("pid");
+        let mut group = Group::reading(Tracker::new(leader, me), record, table_fails_once);
+        let survivors = group
+            .end(&mut child, Duration::from_secs(10), Duration::from_secs(2))
+            .await
+            .expect("ended");
+        assert!(survivors.is_empty());
+        let status = child.try_wait().expect("wait").expect("reaped");
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
     }
 
     /// Catches a signal death reported as exit 0 or as the raw status.

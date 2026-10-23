@@ -21,7 +21,9 @@ fn refusals() -> Vec<Refusal> {
         Refusal::ChannelUnsigned,
         Refusal::KeyUntrusted,
         Refusal::ChannelInsecure,
-        Refusal::OlderThanInstalled,
+        Refusal::UnknownRelease,
+        Refusal::AmbiguousRelease,
+        Refusal::FetchFailed,
     ];
     for r in &all {
         match r {
@@ -32,7 +34,9 @@ fn refusals() -> Vec<Refusal> {
             | Refusal::ChannelUnsigned
             | Refusal::KeyUntrusted
             | Refusal::ChannelInsecure
-            | Refusal::OlderThanInstalled => {}
+            | Refusal::UnknownRelease
+            | Refusal::AmbiguousRelease
+            | Refusal::FetchFailed => {}
         }
     }
     all
@@ -114,13 +118,14 @@ fn every_install_outcome_of_the_host_is_read() {
 }
 
 /// Catches a drift of the query report: the field names and types, `null` for nothing
-/// installed, and in-progress taking precedence.
+/// installed (the answer `NotInstalled`, not an error), and in-progress taking precedence.
 #[test]
 fn every_query_outcome_of_the_host_is_read() {
     let report = |v: Option<&str>, c: Option<&str>, p: bool| {
         Outcome::Queried(QueryReport {
             installed_version: v.map(str::to_owned),
             running_commit: c.map(str::to_owned),
+            node_id: Some("node-1".to_owned()),
             in_progress: p,
         })
     };
@@ -143,7 +148,7 @@ fn every_query_outcome_of_the_host_is_read() {
     assert_eq!(read(&report(None, None, true)), Ok(Installed::InProgress));
     assert_eq!(
         read(&report(None, None, false)),
-        Err(PortError::other("not installed"))
+        Ok(Installed::NotInstalled)
     );
     // A query the host refuses or fails is read like an install's.
     for refusal in refusals() {
@@ -174,6 +179,7 @@ fn an_answer_of_the_other_verb_is_not_read() {
     let q = Outcome::Queried(QueryReport {
         installed_version: Some("1".into()),
         running_commit: None,
+        node_id: None,
         in_progress: false,
     });
     let (code, out) = printed(&q);

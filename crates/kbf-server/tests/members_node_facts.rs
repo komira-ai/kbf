@@ -1,7 +1,7 @@
 //! What a storage node says of the build it runs and of its metadata log, as its member row
 //! keeps it (`Members::register_reporting`, `Members::heartbeat_reporting`,
 //! `Members::node_facts`; `GET /v1/members` shows them, `api_members.rs`): the newest log
-//! version its build can raise the log to, the version the log is at, and the commit built.
+//! version its build runs (informational), the version the log is at, and the commit built.
 //! Nothing decides on them yet.
 
 #[path = "support/hooked.rs"]

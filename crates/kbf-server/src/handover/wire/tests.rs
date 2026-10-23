@@ -131,7 +131,7 @@ async fn a_link_carries_lines_and_says_how_a_read_ended() {
 
 /// Catches: a hello of another protocol version (protocol 2 has five fields, not six)
 /// parsing to nothing, so the holder drops the connection instead of refusing by name.
-/// Mutant: all six fields required before the version is read.
+/// Catches: all six fields required before the version is read.
 #[test]
 fn a_hello_of_another_protocol_parses_to_its_version_alone() {
     for line in [

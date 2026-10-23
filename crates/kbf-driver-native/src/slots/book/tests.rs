@@ -561,3 +561,26 @@ fn a_hook_that_panics_does_not_stop_the_recovery() {
     }
     assert!(book.dirty().is_empty());
 }
+
+/// Catches a start that cleans the slots one after the other (the first clean of a slot
+/// launches a command as its user, which at a hundred slots would be a hundred in a row),
+/// and one that has no bound: with twenty slots whose clean takes a moment, more than one
+/// and no more than the workers are in a clean at once, every slot is cleaned once and
+/// all are offered.
+#[test]
+fn the_slots_are_cleaned_at_start_several_at_a_time_and_within_a_bound() {
+    quiet();
+    let (now, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (inside, highest) = (Arc::clone(&now), Arc::clone(&most));
+    let cleaner: Cleaner<Stub> = Arc::new(move |_: &Stub| {
+        let here = inside.fetch_add(1, Ordering::SeqCst) + 1;
+        highest.fetch_max(here, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(30));
+        inside.fetch_sub(1, Ordering::SeqCst);
+        Outcome::Clean
+    });
+    let book = Book::start(stubs(20), cleaner, NEVER);
+    assert_eq!(book.count(), 20);
+    let most = most.load(Ordering::SeqCst);
+    assert!((2..=START_WORKERS).contains(&most), "{most} cleans at once");
+}

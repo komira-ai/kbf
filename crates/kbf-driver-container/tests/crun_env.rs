@@ -25,7 +25,7 @@ fn env_action(env: &[(&str, &str)]) -> Spec {
 }
 
 /// Catches anything but the `Command`'s variables reaching the action (the "add the
-/// image's `ENV`" and "pass the daemon's environment on" mutants): the image's `PATH` and
+/// image's `ENV`" and "pass the daemon's environment on" defects): the image's `PATH` and
 /// the daemon's own variables would each appear. A `Command` that sets `HOME` and
 /// `HOSTNAME` (with a value holding a space and an `=` besides) gets exactly its
 /// variables. One that sets neither gets the two the driver adds: `HOSTNAME=localhost`
@@ -81,7 +81,7 @@ fn expected(limits: ContainerLimits) -> String {
     format!("{pids}\n{shm_kib}k\n{nofile}\n{nofile}\n{nproc}\n{nproc}\n1000\n1000\n")
 }
 
-/// Catches a limit left to the runtime's defaults (the "drop the pids limit" mutant:
+/// Catches a limit left to the runtime's defaults (the "drop the pids limit" defect:
 /// `pids.max` then reads `max`, no limit at all), a limit that is not the configured one,
 /// and the action not running as uid and gid 1000.
 #[tokio::test]
@@ -165,8 +165,8 @@ const SANDBOX_FILES: &str = "id -u; id -g; \
 /// file is refused to a non-root user and read by root), resolves `localhost` through
 /// `getaddrinfo` (which reads `hosts`, and with no entry for a name asks the nameserver of
 /// `resolv.conf`, here 127.0.0.1 with nothing behind it: a refused query is `EAI_AGAIN`) is
-/// what a build worker runs. The "run as uid 0" mutant prints `0`, `0` and `closed-readable`;
-/// the "no `hosts`" and "no `resolv.conf`" mutants lose their sections.
+/// what a build worker runs. The "run as uid 0" defect prints `0`, `0` and `closed-readable`;
+/// the "no `hosts`" and "no `resolv.conf`" defects lose their sections.
 #[tokio::test]
 #[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 async fn the_action_is_unprivileged_and_has_a_hosts_file_and_a_loopback_resolver() {

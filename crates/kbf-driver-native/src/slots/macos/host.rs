@@ -43,6 +43,7 @@ use kbf_mac_session::sweep::{self, SweepPlan, Swept};
 use rustix::fs::{CWD, Mode, OFlags};
 
 use super::Ready;
+use crate::slots::assertion;
 use crate::slots::clean::{Left, Os, Step};
 use crate::slots::domain::{self, Launchd, Said};
 use crate::slots::{crash, probe};
@@ -72,9 +73,15 @@ const DIRECTORY: OFlags = OFlags::RDONLY
 pub struct MacSlot<'a> {
     pub ready: &'a Ready,
     pub within: Duration,
+    /// How long C3 gives the processes to end after SIGTERM, before the kill
+    /// ([`crate::grace`]); zero kills at once.
+    pub grace: Duration,
     /// The uids of the pool's users: C9 does not walk a folder one of them owns a
     /// directory on the path of.
     pub pool: std::ops::RangeInclusive<u32>,
+    /// What this clean has judged of launchd's services ([`probe::OwnLabels`]); a clean
+    /// reads each service's plist once.
+    pub(super) judged: probe::OwnLabels,
 }
 
 /// `launchctl`, run for real: each call is killed at its alarm.
@@ -198,7 +205,8 @@ impl Os for MacSlot<'_> {
                     if look > 0 {
                         std::thread::sleep(probe::SCAN_PAUSE);
                     }
-                    let left = leftover_processes(user.uid).map_err(|e| e.to_string())?;
+                    let pids = uid::processes(user.uid).map_err(|e| e.to_string())?;
+                    let left = not_launchds_own(pids, user.uid, &self.judged);
                     if !left.is_empty() {
                         return Err(format!("processes {:?}", named(&left)));
                     }
@@ -215,8 +223,8 @@ impl Os for MacSlot<'_> {
         // The processes first, then the services: a process started in between is in
         // neither list, never in the first alone.
         let pids = uid::processes(user.uid);
-        let services = services_of(user.uid);
-        match pids.map(|pids| not_launchds_own(pids, &services)) {
+        let services = services_of(user.uid, &self.judged);
+        match pids.map(|pids| not_launchds_own_in(pids, &services)) {
             Ok(pids) => {
                 if !pids.is_empty() {
                     note(Step::Kill, format!("processes {:?}", named(&pids)));
@@ -309,29 +317,44 @@ impl MacSlot<'_> {
         }
     }
 
-    /// C3: SIGKILL by real and effective uid until two scans 200 ms apart find nothing,
+    /// C3: SIGTERM, `grace` for the uid's processes to end (the ones that ignore it are
+    /// named in the log), then SIGKILL by real and effective uid until two scans 200 ms apart find nothing,
     /// within `within` and 100 scans ([`probe::kill_until_quiet`]). A scan does not count
     /// launchd's own agents, which launchd starts again on demand.
     fn kill(&self) -> Result<(), String> {
         let uid = self.ready.user.uid;
-        let give_up = Instant::now() + self.within;
-        probe::kill_until_quiet(
-            &mut || Instant::now() >= give_up,
-            &mut || uid::kill(uid).map_err(|e| e.to_string()),
-            &mut || {
-                let pids = uid::processes(uid).map_err(|e| e.to_string())?;
-                if pids.is_empty() {
-                    return Ok(pids);
-                }
-                Ok(not_launchds_own(pids, &services_of(uid)))
-            },
-            &mut || std::thread::sleep(probe::SCAN_PAUSE),
-        )
+        let mut scan = || {
+            let pids = uid::processes(uid).map_err(|e| e.to_string())?;
+            if pids.is_empty() {
+                return Ok(pids);
+            }
+            Ok(not_launchds_own(pids, uid, &self.judged))
+        };
+        let round = super::term_uid(
+            uid,
+            self.grace.min(self.within),
+            &mut scan,
+            probe::SCAN_PAUSE,
+        );
+        crate::grace::then_kill(round, "slot clean", |ignored| {
+            if let Some(brief) = crate::grace::brief(ignored) {
+                tracing::warn!(uid, "slot clean: {brief}");
+            }
+            // The grace is extra to `within`, which bounds the kill alone.
+            let give_up = Instant::now() + self.within;
+            probe::kill_until_quiet(
+                &mut || Instant::now() >= give_up,
+                &mut || uid::kill(uid).map_err(|e| e.to_string()),
+                &mut scan,
+                &mut || std::thread::sleep(probe::SCAN_PAUSE),
+            )
+        })
+        .map(|_| ())
     }
 }
 
 /// C9's folders: the system's, and one per user of `/Users`.
-fn crash_dirs() -> Vec<PathBuf> {
+pub(super) fn crash_dirs() -> Vec<PathBuf> {
     let users = list(Path::new("/Users")).unwrap_or_default();
     crash::crash_dirs(&users)
 }
@@ -452,7 +475,7 @@ fn run(program: &str, args: &[&str]) -> Result<(), String> {
 }
 
 /// `program`'s stdout, if it exited 0.
-fn output(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+pub(super) fn output(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     let out = Command::new(program)
         .args(args)
         .env_clear()
@@ -473,35 +496,12 @@ fn output(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
 /// `hdiutil info -plist`: each image's own entry, whose detach detaches its partitions.
 fn images_of(uid: u32) -> Result<Vec<String>, String> {
     let out = output(HDIUTIL, &["info", "-plist"])?;
-    let info = plist::Value::from_reader_xml(out.as_slice())
-        .map_err(|e| format!("{HDIUTIL} info -plist: {e}"))?;
-    let images = info
-        .as_dictionary()
-        .and_then(|d| d.get("images"))
-        .and_then(plist::Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
-    let mut devices = Vec::new();
-    for image in images.iter().filter_map(plist::Value::as_dictionary) {
-        let owner = image
-            .get("owner-uid")
-            .and_then(plist::Value::as_unsigned_integer);
-        if owner != Some(u64::from(uid)) {
-            continue;
-        }
-        let entities = image
-            .get("system-entities")
-            .and_then(plist::Value::as_array)
-            .map_or(&[][..], Vec::as_slice);
-        let whole = entities
-            .iter()
-            .filter_map(plist::Value::as_dictionary)
-            .filter_map(|e| e.get("dev-entry").and_then(plist::Value::as_string))
-            .min_by_key(|dev| dev.len());
-        if let Some(dev) = whole {
-            devices.push(dev.to_owned());
-        }
-    }
-    Ok(devices)
+    let images = assertion::hdiutil_images(&out)?;
+    Ok(images
+        .into_iter()
+        .filter(|image| image.owner == Some(u64::from(uid)))
+        .filter_map(|image| image.device)
+        .collect())
 }
 
 /// A System V IPC object's kind.
@@ -523,30 +523,22 @@ impl Ipc {
 }
 
 /// The System V IPC objects `ipcs -a` lists with `name` (or `uid`, for a name the
-/// user database does not give) as owner or creator: `T ID KEY MODE OWNER GROUP
-/// CREATOR CGROUP ...` per line.
+/// user database does not give) as owner or creator ([`assertion::ipc_rows`]).
 fn ipc_of(name: &str, uid: u32) -> Result<Vec<(Ipc, String)>, String> {
     let out = output(IPCS, &["-a"])?;
-    let text = String::from_utf8_lossy(&out);
-    let uid = uid.to_string();
-    let ours = |who: Option<&str>| who.is_some_and(|w| w == name || w == uid);
-    let mut objects = Vec::new();
-    for line in text.lines() {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        let kind = match words.first() {
-            Some(&"q") => Ipc::Queue,
-            Some(&"m") => Ipc::Memory,
-            Some(&"s") => Ipc::Semaphores,
-            _ => continue,
-        };
-        let Some(id) = words.get(1).filter(|id| id.parse::<i64>().is_ok()) else {
-            continue;
-        };
-        if ours(words.get(4).copied()) || ours(words.get(6).copied()) {
-            objects.push((kind, (*id).to_owned()));
-        }
-    }
-    Ok(objects)
+    let rows = assertion::ipc_rows(&String::from_utf8_lossy(&out), name, uid);
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let kind = match row.kind {
+                'q' => Ipc::Queue,
+                'm' => Ipc::Memory,
+                's' => Ipc::Semaphores,
+                _ => return None,
+            };
+            Some((kind, row.id))
+        })
+        .collect())
 }
 
 /// Whether the home is an empty directory of the user's, mode 0700, without flags.
@@ -588,15 +580,36 @@ fn open_dir(path: &Path) -> io::Result<OwnedFd> {
 }
 
 /// Gives the open directory `dir` to `uid`:`gid` with `mode` and the user flags `flags`
-/// (all it has otherwise are cleared).
+/// (all it has otherwise are cleared), and takes every extended attribute off it: the
+/// assertion compares them with the baseline's, which is read after a clean.
 fn own(dir: &OwnedFd, (uid, gid, mode): (u32, u32, u32), flags: u32) -> io::Result<()> {
     set_flags(dir, flags)?;
+    strip_xattrs(dir)?;
     rustix::fs::fchown(
         dir,
         Some(rustix::fs::Uid::from_raw(uid)),
         Some(rustix::fs::Gid::from_raw(gid)),
     )?;
     rustix::fs::fchmod(dir, Mode::from_raw_mode(mode as _))?;
+    Ok(())
+}
+
+/// Removes the extended attributes of the open directory `dir` that can be removed.
+fn strip_xattrs(dir: &OwnedFd) -> io::Result<()> {
+    for name in super::assert::xattrs_of(dir)? {
+        let name = std::ffi::CString::new(name).map_err(io::Error::other)?;
+        // SAFETY: `dir` is a descriptor this function borrows and `name` a NUL-terminated
+        // attribute name.
+        if unsafe { libc::fremovexattr(dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            let why = io::Error::last_os_error();
+            // One that went since the listing is removed. One the system protects (the
+            // entry's folders carry some) cannot be, and stays: the baseline records it,
+            // and the assertion finds any other that stays.
+            if !matches!(why.raw_os_error(), Some(libc::ENOATTR | libc::EPERM)) {
+                return Err(why);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -631,11 +644,53 @@ fn make_home(home: &Path, uid: u32, gid: u32) -> io::Result<()> {
 /// The process table could not be read.
 pub fn leftover_processes(uid: u32) -> io::Result<Vec<i32>> {
     let pids = uid::processes(uid)?;
-    Ok(not_launchds_own(pids, &services_of(uid)))
+    Ok(not_launchds_own(pids, uid, &probe::OwnLabels::default()))
+}
+
+/// The processes of `uid` that `launchctl print user/<uid>` lists as running one of
+/// launchd's own agents ([`Service::own`]); read before a domain's bootout, which
+/// empties the list. Nothing is listed when no process of the uid is alive.
+pub(crate) fn launchds_own(uid: u32) -> Vec<i32> {
+    let judged = probe::OwnLabels::default();
+    probe::own_of_uid(
+        uid::processes(uid),
+        |pids| own_pids(uid, pids, &judged),
+        || {
+            // The process table could not be read: every service launchd lists as
+            // running its own agent, as before the table was read first.
+            (services_of(uid, &judged).into_iter())
+                .filter(|s| s.own)
+                .filter_map(|s| s.pid)
+                .collect()
+        },
+    )
+}
+
+/// The members of `pids` that launchd lists as running one of its own agents. The
+/// domain is not printed for no pids, and only the services that run one of `pids` are
+/// printed for their plists, each once for `judged`.
+fn own_pids(uid: u32, pids: &[i32], judged: &probe::OwnLabels) -> Vec<i32> {
+    let give_up = Instant::now() + SERVICES_WITHIN;
+    probe::own_among(
+        pids,
+        || {
+            launchctl_print(&format!("user/{uid}"), PRINT_WITHIN)
+                .map(|domain| probe::listed_services(&domain))
+                .unwrap_or_default()
+        },
+        |pid, label| judged.is_own(label, Some(pid), || is_own_service(uid, label, give_up)),
+    )
+}
+
+/// `pids` without those launchd lists as running one of its own agents.
+fn not_launchds_own(mut pids: Vec<i32>, uid: u32, judged: &probe::OwnLabels) -> Vec<i32> {
+    let own = own_pids(uid, &pids, judged);
+    pids.retain(|pid| !own.contains(pid));
+    pids
 }
 
 /// `pids` without those `services` lists as running one of launchd's own agents.
-fn not_launchds_own(mut pids: Vec<i32>, services: &[Service]) -> Vec<i32> {
+fn not_launchds_own_in(mut pids: Vec<i32>, services: &[Service]) -> Vec<i32> {
     pids.retain(|pid| !services.iter().any(|s| s.own && s.pid == Some(*pid)));
     pids
 }
@@ -653,35 +708,56 @@ struct Service {
     own: bool,
 }
 
+/// The longest one `launchctl print` is waited for.
+const PRINT_WITHIN: Duration = Duration::from_secs(5);
+
+/// The longest all the prints of one [`services_of`] are waited for together.
+const SERVICES_WITHIN: Duration = Duration::from_secs(15);
+
 /// The services `launchctl print user/<uid>` lists: none when the domain is gone (or
-/// cannot be printed, which the kill and the other checks then stand in for). Each is
-/// printed on its own for its plist's path ([`Service::own`]).
-fn services_of(uid: u32) -> Vec<Service> {
-    let Some(domain) = launchctl_print(&format!("user/{uid}")) else {
+/// cannot be printed, or the print does not answer in time, which the kill and the other
+/// checks then stand in for). Each is printed on its own for its plist's path
+/// ([`Service::own`]), once for `judged`; one not printed in time is not launchd's own.
+fn services_of(uid: u32, judged: &probe::OwnLabels) -> Vec<Service> {
+    let give_up = Instant::now() + SERVICES_WITHIN;
+    let Some(domain) = launchctl_print(&format!("user/{uid}"), PRINT_WITHIN) else {
         return Vec::new();
     };
     probe::listed_services(&domain)
         .into_iter()
         .map(|(pid, label)| {
-            let printed = launchctl_print(&format!("user/{uid}/{label}"));
-            let own = printed
-                .as_deref()
-                .and_then(probe::plist_path)
-                .is_some_and(probe::is_own_plist);
+            let own = judged.is_own(&label, pid, || is_own_service(uid, &label, give_up));
             Service { pid, label, own }
         })
         .collect()
 }
 
-/// What `launchctl print <target>` says, if it succeeds.
-fn launchctl_print(target: &str) -> Option<String> {
-    let out = Command::new(uid::LAUNCHCTL)
-        .args(["print", target])
-        .env_clear()
-        .stdin(Stdio::null())
-        .output();
-    let out = out.ok().filter(|out| out.status.success())?;
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+/// Whether `user/<uid>/<label>`'s plist is launchd's own, from its own print, which is
+/// waited for until `give_up` (and [`PRINT_WITHIN`] at most); `None` when it was not
+/// printed.
+fn is_own_service(uid: u32, label: &str, give_up: Instant) -> Option<bool> {
+    let left = give_up.saturating_duration_since(Instant::now());
+    let printed = launchctl_print(&format!("user/{uid}/{label}"), left.min(PRINT_WITHIN))?;
+    Some(probe::plist_path(&printed).is_some_and(probe::is_own_plist))
+}
+
+/// What `launchctl print <target>` says, if it succeeds within `within`; a print that
+/// does not answer is killed and logged at WARN.
+fn launchctl_print(target: &str, within: Duration) -> Option<String> {
+    let mut command = Command::new(uid::LAUNCHCTL);
+    command.args(["print", target]).env_clear();
+    match crate::bounded::stdout_within(&mut command, within) {
+        Ok(out) => Some(String::from_utf8_lossy(&out).into_owned()),
+        Err(true) => {
+            tracing::warn!(
+                target,
+                ?within,
+                "launchctl print did not answer; no services listed"
+            );
+            None
+        }
+        Err(false) => None,
+    }
 }
 
 /// What a sweep of `plan` for `name` and `uid` would remove, without removing it: the
@@ -689,7 +765,7 @@ fn launchctl_print(target: &str) -> Option<String> {
 /// looked into: the sweep removes it whole), found as the sweep walks, never through
 /// a link, on one filesystem and to [`sweep::MAX_DEPTH`]. A place that cannot be read
 /// is listed too, as the sweep would fail there.
-fn owned_entries(plan: &SweepPlan, name: &str, uid: u32) -> Vec<String> {
+pub(super) fn owned_entries(plan: &SweepPlan, name: &str, uid: u32) -> Vec<String> {
     let mut found = Vec::new();
     for template in &plan.named {
         let path = template

@@ -3,7 +3,7 @@
 //!
 //! The command line is the shape of the packaged unit (`packaging/linux/units/kbf-<mode>.service`,
 //! `kbf-frontend.service` for the frontend): its `--mode=<name>` word, read with
-//! `kbf_unitfile`, and the test's `kbf` in place of `releases/current/kbf`. Every other
+//! `kbf_unitfile`, and the test's `kbf` in place of `/usr/bin/kbf`. Every other
 //! setting is a key of the process's `kbf.toml`, and a [`Unit`] is that file while a farm
 //! builds it.
 //!

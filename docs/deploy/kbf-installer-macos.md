@@ -66,18 +66,16 @@ restarts to ten seconds and writes to `/Library/Logs/kbf-installer/kbf-installer
 1. **Install the package** as above.
 2. **Provision the host.** `kbf-mac-provision apply --profile FILE` (as root) fixes the host
    settings and renders the worker profile: it writes `/usr/local/etc/kbf/kbf.toml` and the daemon
-   job's plist, makes `/var/db/kbf-installer` (root, 0755) and `/var/db/kbf-installer/orders` (the
-   daemon account's, 0700), and starts the job. It is the one writer of the daemon's `kbf.toml` on
-   a Mac. The `kbf.toml` it renders has `[daemon] update-dir = "/var/db/kbf-installer"`, which the node
-   accepts and ignores (it has no update client). Use the label `com.komira.kbf-daemon` for the daemon job
+   job's plist, and starts the job. It is the one writer of the daemon's `kbf.toml` on
+   a Mac. The `kbf.toml` it renders has no `update-dir` or `orders-dir`; a file that still has them
+   from an earlier run is accepted and left as it is. Use the label `com.komira.kbf-daemon` for the daemon job
    (`launchd_label` in the profile), because that is the label `setup` and the installer's job look
    for.
 3. **Run `setup`** as root:
 
    ```text
    sudo /usr/local/kbf-installer/bin/kbf-installer setup --mode=daemon \
-       --frontend-url=https://frontend.example.invalid:8443 --token-file=/srv/kbf/enroll.token \
-       --release-source=frontend                                   # dry run
+       --frontend-url=https://frontend.example.invalid:8443 --token-file=/srv/kbf/enroll.token   # dry run
    sudo /usr/local/kbf-installer/bin/kbf-installer --apply setup ...
    ```
 
@@ -91,11 +89,8 @@ On a Mac `setup`:
   `/usr/local/etc/kbf/enroll.token` (0600), and writes `/usr/local/etc/kbf/installer.toml` (0644),
   which is the file that releases the installer's job;
 - looks users up with `dscl`, not `getent`, and has no subid or lingering step;
-- **checks `kbf.toml` and never writes `update-dir` or `orders-dir` into it.** `update-dir` must be
-  there and be `/var/db/kbf-installer`; `orders-dir` must be absent (the node uses
-  `<update-dir>/orders`) or be `/var/db/kbf-installer/orders`. A missing or different key, or no
-  file, is refused with exit 5, naming the key and saying that `kbf-mac-provision` renders it; run
-  it again, then `setup`. The keys `setup` itself owns (`mode`, `[frontend] url`, `[enroll]
+- **never writes `update-dir` or `orders-dir` into `kbf.toml`**, and does not require them.
+  The keys `setup` itself owns (`mode`, `[frontend] url`, `[enroll]
   token_file`) follow the same rule as on Linux: a file with other settings is kept when they match
   and refused when they differ;
 - runs `launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-installer.plist` unless
@@ -107,12 +102,9 @@ has the flags, the dry run and the exit codes.
 
 ### The first release
 
-`setup --commit <40 hex>` fetches and verifies the first release with the installer's own fetcher,
-but only from the `url` source (`--release-source=url --release-url=https://...`). The `frontend`
-source, which the example above uses and which is the default for a node, has no address or CA key
-in `installer.toml` yet, so a fetch from it is refused and `setup --commit` stops with exit 1.
-Whether a Mac's directories and the `_kbf-fetch` account pass the fetcher's trust checks has not
-been tested. Without a working `url` source, place the first release by hand and record it: put the `kbf` binary in `/usr/local/kbf-installer/releases/<commit>/kbf` (root-owned,
+`setup` installs no release (it takes `--commit` and the flags of the release source for one more
+release, ignores them and says so). Place the first release by hand and record it: put the `kbf`
+binary in `/usr/local/kbf-installer/releases/<commit>/kbf` (root-owned,
 not writable by group or others, executable by others, a Mach-O file), then run
 
 ```text
@@ -136,7 +128,7 @@ kbf-proxy packages (package-update design, `design.md` section 12), then run `se
 - Running `kbf-mac-provision` with a profile, and everything in it that is check-only: the
   administrator account, FileVault, macOS and Xcode installs, the APFS volume for the lease users.
 - Creating the enrollment token on the frontend and putting the token file on the Mac.
-- Placing and recording the first release (above) when the host has no `url` source to fetch it from.
+- Placing and recording the first release (above).
 - Updating: a Mac takes no update order yet. `kbf-installer run` activates a release only after it
   has counted the live leases, and for a launchd job it has no lease source, so it refuses the
   order (`cannot tell whether leases are live`). Update by hand, see [updating a host](update-a-host.md).

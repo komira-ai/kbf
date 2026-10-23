@@ -97,7 +97,7 @@ async fn cordon(api: SocketAddr, headers: &[(&str, &str)]) -> u16 {
 /// the secret (no TLS flag is given), and its operator API must refuse a local write that
 /// lacks the secret even with the token, and a write through the proxy that lacks the token.
 ///
-/// Mutant seen red: the frontend's worker listener built with no proxy.
+/// Catches: the frontend's worker listener built with no proxy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_frontend_behind_the_proxy_takes_its_identity_and_gates_writes() {
     let dir = scratch_dir("proxy-auth");
@@ -183,7 +183,7 @@ async fn reapi_read(reapi: SocketAddr, claims: &[(&str, String)]) -> Code {
 /// refused `PERMISSION_DENIED` by the proxy layer before anything else reads it; without
 /// the layer it reaches the storage lookup and answers some other status.
 ///
-/// Mutant seen red: the frontend's REAPI listener built with `ProxyAuthLayer::new(None)`.
+/// Catches: the frontend's REAPI listener built with `ProxyAuthLayer::new(None)`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_frontends_reapi_listener_is_behind_the_proxy() {
     let dir = scratch_dir("proxy-auth-reapi");

@@ -1,14 +1,16 @@
 # kbf build farm node daemon: `kbf --mode=daemon`.
-# Static unit: shipped by the kbf-installer package (installed under /usr/lib/systemd/system/),
+# Static unit: shipped by the kbf package (installed under /usr/lib/systemd/system/),
 # disabled, with no rendering and no @PLACEHOLDER@ in it. It starts only once
 # /etc/kbf/kbf.toml exists (ConditionPathExists=), after kbf-installer's `boot-check` (which
-# counts the starts of a release on trial and reverts a release that spends its budget) and
-# `kbf --mode=<mode> --check` (which prints every missing prerequisite and exits 2). The checks
-# are ExecStartPre=, not ExecCondition=: ExecCondition= skips the start silently on exit 1
-# to 254, and a unit that cannot start must fail where an operator sees it. kbf reads
-# /etc/kbf/kbf.toml itself: no --config. The binary is the release kbf-installer flipped
-# to; only kbf-installer replaces it. Per-host values (MemoryMin=, ports, certificates,
-# the cold store) are kbf.toml's, or a drop-in kbf-installer writes from it.
+# brings the state database to the schema the kbf at --kbf declares, for the modes that keep
+# state in it, and fails the start if it cannot) and `kbf --mode=<mode> --check` (which prints
+# every missing prerequisite and exits 2). The checks are ExecStartPre=, not ExecCondition=:
+# ExecCondition= skips the start silently on exit 1 to 254, and a unit that cannot start must
+# fail where an operator sees it. kbf reads /etc/kbf/kbf.toml itself: no --config. The
+# binary is /usr/bin/kbf, the kbf package's own file; only the package manager replaces it,
+# and the kbf package depends on the kbf-installer package that holds boot-check. Per-host
+# values (MemoryMin=, ports, certificates, the cold store) are kbf.toml's, or a drop-in
+# kbf-installer writes from it.
 # kbf docs/design/architecture-v2.md, sections 1 and 11.
 [Unit]
 Description=kbf build farm node daemon
@@ -39,18 +41,23 @@ LimitNOFILE=1048576
 CPUWeight=200
 # No MemorySwapMax=: leases may swap (the host's swapfile is for them); the
 # daemon's swap watch kills a lease that swaps at its own cap.
-ExecStartPre=+/usr/bin/kbf-installer boot-check
+ExecStartPre=+/usr/bin/kbf-installer boot-check --kbf=/usr/bin/kbf --mode=daemon
 # `--check` validates kbf.toml and what a restart cannot change (a file, a user, a flag)
 # and exits 2 for those. Anything that can become ready later (a listen address, a peer,
 # a DNS name, a mount) is not refused here: it exits 75 (not ready, restarted), so a check
 # that runs before the bind retry never leaves the unit down for good (kbf#998, #1000).
-ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=daemon --check
-ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=daemon
+ExecStartPre=/usr/bin/kbf --mode=daemon --check
+ExecStart=/usr/bin/kbf --mode=daemon
 # The daemon drains on SIGTERM for up to --drain-deadline-secs (600 by default), then
 # stops. The stop timeout is that plus 60 s, so systemd never SIGKILLs a drain; it stays
 # finite, so a hung daemon still lets a reboot through (package-test rule `stop`).
 TimeoutStopSec=660
 KillSignal=SIGTERM
+# KillMode=mixed: systemd's default (control-group) sends SIGTERM to every process of the
+# unit at once, and the actions run in sub-cgroups of it, so a stop would end them in the
+# first seconds of the drain. mixed signals the main process alone; what is still left
+# once it has exited, or when the stop times out, gets SIGKILL.
+KillMode=mixed
 Restart=on-failure
 RestartSec=5
 # Exit 2 is a command line kbf refused (or a config or an image it cannot parse): a

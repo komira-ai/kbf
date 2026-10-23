@@ -69,7 +69,7 @@ fn cmd(program: &str, args: &[&str]) -> Cmd {
     Cmd {
         program: program.to_owned(),
         args: args.iter().map(|a| (*a).to_owned()).collect(),
-        timeout: None,
+        ..Cmd::default()
     }
 }
 
@@ -140,7 +140,7 @@ pub fn unit_install(self_exe: &Path, version: &Version, channel: &Channel) -> Cm
     Cmd {
         program: SYSTEMD_RUN.to_owned(),
         args,
-        timeout: None,
+        ..Cmd::default()
     }
 }
 
@@ -166,16 +166,18 @@ pub fn apt_update(source: &ChannelSource) -> Cmd {
     Cmd {
         program: APT_GET.to_owned(),
         args,
-        timeout: None,
+        ..Cmd::default()
     }
 }
 
-/// `apt-get install` of `kbf=<version>` from the channel's source alone.
+/// `apt-get install` of `kbf=<version>` (older than the installed one too) from the channel's source alone.
 pub fn apt_install(source: &ChannelSource, version: &Version) -> Cmd {
     let mut args: Vec<String> = [
         "install",
         "-y",
         "--no-install-recommends",
+        // A rollback installs an older version; without this `-y` refuses a downgrade.
+        "--allow-downgrades",
         "-o",
         "Dpkg::Options::=--force-confold",
         "-o",
@@ -193,7 +195,7 @@ pub fn apt_install(source: &ChannelSource, version: &Version) -> Cmd {
     Cmd {
         program: APT_GET.to_owned(),
         args,
-        timeout: None,
+        ..Cmd::default()
     }
 }
 

@@ -192,7 +192,7 @@ impl Host {
 /// Also pins that the takeover keeps the epoch (daemons that redial keep their leases) and
 /// takes exactly one generation, read from the store and not from the client.
 ///
-/// Mutants seen red: `StoodDown` and `Superseded` swapped in `admin.rs`; `holder` derived
+/// Catches: `StoodDown` and `Superseded` swapped in `admin.rs`; `holder` derived
 /// from the generation alone; the takeover sent without `expect`; the slot ignored by the
 /// admin reads (every read from A's port); `ready` asked on the admin port instead of the
 /// operator port; in the child, a takeover that bumps the epoch.
@@ -280,7 +280,7 @@ async fn a_swap_driven_through_the_admin_calls_moves_the_generation_and_the_hold
 /// a candidate is an answer, not a refusal: the admin role view says 0 streams and 0
 /// sessions.)
 ///
-/// Mutant seen red: the takeover sent without `expect` (the refusal is then a `400`, not
+/// Catches: the takeover sent without `expect` (the refusal is then a `400`, not
 /// the child's "needs a candidate").
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_call_that_does_not_apply_to_the_child_is_a_typed_refusal() {
@@ -342,7 +342,7 @@ async fn a_call_that_does_not_apply_to_the_child_is_a_typed_refusal() {
 /// stood-down child (the swap would roll back to a child with no worker listener), and a
 /// refusal the client cannot tell from any other 409.
 ///
-/// Mutants seen red: `StoodDown` and `Superseded` swapped in `admin.rs`; `holder` derived
+/// Catches: `StoodDown` and `Superseded` swapped in `admin.rs`; `holder` derived
 /// from the generation alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resume_gives_the_old_child_back_before_a_stand_down_and_never_after() {
@@ -409,8 +409,8 @@ async fn resume_gives_the_old_child_back_before_a_stand_down_and_never_after() {
 /// child and takes the generation), and a takeover that leaves the candidate changed when
 /// it timed out before it sent anything.
 ///
-/// Mutants seen red: the takeover sent without `expect`; the slot ignored by the role read.
-/// A mutant that survives, and that nothing a real child shows can tell from the original:
+/// Catches: the takeover sent without `expect`; the slot ignored by the role read.
+/// A defect that survives, and that nothing a real child shows can tell from the original:
 /// the limit not applied to the role read. A zero limit gives the same `Timeout` with
 /// nothing taken either way, since the POST gets what is left of the limit, which is
 /// nothing; the split of the limit between the two calls is pinned against a slow fixture
@@ -536,15 +536,15 @@ impl Holding {
 }
 
 /// Whether `txn` is a submission: the one write that stores an operation's request and
-/// takes the next operation number. Other writes of `op/` rows (a scheduler failing an
-/// operation nothing can run) are not an Execute between its request and its queueing.
+/// puts it in the queue. Other writes of `op/` rows (a scheduler failing an operation
+/// nothing can run) are not an Execute between its request and its queueing.
 fn queues_an_operation(txn: &Txn) -> bool {
     let puts = |wanted: &dyn Fn(&str) -> bool| {
         txn.ops()
             .iter()
             .any(|op| matches!(op, Op::Put { key, .. } if wanted(key)))
     };
-    puts(&|key| key.starts_with("op/")) && puts(&|key| key == "meta/next_op")
+    puts(&|key| key.starts_with("op/")) && puts(&|key| key.starts_with("queue/"))
 }
 
 impl Store for Holding {
@@ -629,7 +629,7 @@ async fn child_over(node: &Node, holding: &Arc<Holding>) -> (Child, SocketAddr) 
 /// U2c ask: answer `202` and report `Quiescing` until the farm is quiet, or bound the wait
 /// by what the swap gives it.
 ///
-/// Mutants seen red: the quiesce given the call's deadline instead of its own; in the child,
+/// Catches: the quiesce given the call's deadline instead of its own; in the child,
 /// a quiesce that does not wait for a call that is queueing (red in the second half: the
 /// farm is then fenced behind the Execute and the quiesce finishes after the client left;
 /// the first half alone does not see it, since the fence waits for the same write); a
@@ -784,7 +784,7 @@ async fn a_quiesce_blocks_while_a_call_is_queueing_and_is_dropped_with_a_client_
 /// store answers a writer a newer one replaced; nothing moves the generation row.
 ///
 /// Catches: a `holder` derived from the generation alone (a superseded child reported as the
-/// holder, and a swap that stands its successor down for it). Mutant seen red: `holder`
+/// holder, and a swap that stands its successor down for it). Catches: `holder`
 /// without the `superseded` test in `admin.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_child_the_store_refused_is_no_holder_though_the_generation_row_is_still_its_own() {
@@ -826,20 +826,18 @@ async fn a_child_the_store_refused_is_no_holder_though_the_generation_row_is_sti
     );
 }
 
-/// Pins TODAY's takeover over a holder that is gone (U2c ask: a way to start a candidate
-/// that bumps the epoch, or a `takeover` that does when the holder is dead). The proxy's
-/// recovery of a host whose both children died spawns the recorded release again and
-/// expects it to "take the generation and bump the epoch" (`recover.rs`). The child bumps
-/// the epoch only when it is started WITHOUT `--await-takeover` (a cold start); every
-/// start the proxy makes has the flag, and `takeover` keeps the epoch, whoever held the
-/// generation: so a candidate taking over from a dead holder leaves the epoch as it was,
-/// and daemons that redial believe their old leases are still theirs.
+/// Pins TODAY's takeover over a holder that is gone. The proxy's recovery of a host whose
+/// both children died spawns the recorded release again. No start moves the epoch: a
+/// `takeover` keeps it, whoever held the generation, and so does a cold start (a start
+/// without `--await-takeover`). A candidate taking over from a dead holder leaves the
+/// epoch as it was, and daemons that redial keep the leases they hold that the store
+/// still holds; an operator raises the epoch (`POST /v1/epoch/bump`).
 ///
-/// Catches: a client or a child that drifted so that `takeover` bumps the epoch (the
-/// swap's takeover would then drop every lease of a live fleet), and keeps the gap on the
-/// record next to the cold start that does bump it.
+/// Asserts that a `takeover` over a dead holder keeps the epoch (the swap's takeover would
+/// otherwise drop every lease of a live fleet), and that a cold start over the same store
+/// keeps it too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_takeover_over_a_dead_holder_keeps_the_epoch_and_only_a_cold_start_bumps_it() {
+async fn a_takeover_over_a_dead_holder_and_a_cold_start_keep_the_epoch() {
     let node = Node::start().await;
     let store = shared();
     let source = || StoreSource::Shared(Arc::clone(&store) as Arc<dyn Store>);
@@ -857,10 +855,9 @@ async fn a_takeover_over_a_dead_holder_keeps_the_epoch_and_only_a_cold_start_bum
     assert_eq!(generation(&store).0, held + 1);
     assert_eq!(epoch(&store), before, "a takeover bumped the epoch");
 
-    // The way to a bumped epoch is a start with no `--await-takeover`, which no call of
-    // `ChildAdmin` makes.
+    // A start with no `--await-takeover`, which no call of `ChildAdmin` makes.
     let c = Child::start(&managed_flags(&node, &[]), &store).await;
-    assert_eq!(epoch(&store), before + 1, "a cold start kept the epoch");
+    assert_eq!(epoch(&store), before, "a cold start moved the epoch");
     assert_eq!(c.role().await["held_generation"], held + 2);
 }
 
@@ -882,7 +879,7 @@ async fn a_takeover_over_a_dead_holder_keeps_the_epoch_and_only_a_cold_start_bum
 /// the takeover. (Red with `open_counts` pointed back at the drain route, which reports
 /// `queued_operations` 1 for good.)
 ///
-/// Mutants seen red: `open_counts` asked on the operator port's drain route (the
+/// Catches: `open_counts` asked on the operator port's drain route (the
 /// stood-down child never idle); the takeover sent without `expect`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn open_counts_are_the_childs_own_streams_and_a_stood_down_child_with_a_queue_is_idle() {
@@ -972,7 +969,7 @@ async fn open_counts_are_the_childs_own_streams_and_a_stood_down_child_with_a_qu
 ///
 /// A wrong token is the child's `401`, a `Status` the swap notes as a failed offer.
 ///
-/// Mutants seen red: the offer sent to the old slot; the bearer token dropped.
+/// Catches: the offer sent to the old slot; the bearer token dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn post_desired_reaches_the_new_childs_operator_port_with_its_own_release() {
     let host = Host::start("admin-desired").await;

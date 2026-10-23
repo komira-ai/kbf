@@ -363,7 +363,7 @@ fn queued(name: &str) -> Result<Operation, Status> {
 
 /// Catches: a relay whose `Debug` output leaks its parts (the farm, the channel) instead
 /// of naming only the type, which a log line of a service stack would then print.
-/// Mutant: `finish_non_exhaustive` replaced by a field listing.
+/// Catches: `finish_non_exhaustive` replaced by a field listing.
 #[tokio::test]
 async fn a_relay_debugs_as_its_name_only() {
     let rig = Rig::new(vec![], vec![]).await;
@@ -371,7 +371,7 @@ async fn a_relay_debugs_as_its_name_only() {
 }
 
 /// Catches: a relay that changes a frontend that has not handed over (a call answered by
-/// the successor, or counted), which would make the relay more than inert. Mutant: the
+/// the successor, or counted), which would make the relay more than inert. Catches: the
 /// handed check removed from `execute` and `wait_execution`: the successor is called.
 #[tokio::test]
 async fn before_the_handover_the_wrapped_service_answers() {
@@ -391,7 +391,7 @@ async fn before_the_handover_the_wrapped_service_answers() {
 /// stream cut before its done operation, an Execute that does not carry its instance, and
 /// the relay counters wrong (one call counted once; open until the stream ends). The
 /// operation is looked up once, by instance and action, while it is unfinished; the rows
-/// are never followed while the successor's stream holds. Mutant: `execute` answering
+/// are never followed while the successor's stream holds. Catches: `execute` answering
 /// `self.inner.execute` when handed.
 #[tokio::test]
 async fn an_execute_after_the_handover_is_the_successors_to_its_end() {
@@ -457,7 +457,7 @@ async fn a_done_first_operation_is_not_looked_up() {
 /// Catches: the caller's metadata dropped in the relay (the successor must authorize the
 /// caller, not the relay): a bearer token and a binary header reach it, and the deadline does not (the relay
 /// holds it).
-/// Mutant: `forwarded` building the call with empty metadata.
+/// Catches: `forwarded` building the call with empty metadata.
 #[tokio::test]
 async fn the_callers_metadata_reaches_the_successor() {
     let done = Ok(op(OP, ExecStage::Completed, 0));
@@ -522,7 +522,7 @@ impl Dispatch for Nothing {
 /// Catches: the successor not authorizing again: a relayed call without the caller's
 /// credentials is the successor's UNAUTHENTICATED (not an answer from this process), and
 /// the same call with them gets past the successor's authentication to its handler (here
-/// a WaitExecution of an operation it does not know: NOT_FOUND). Mutant: the metadata
+/// a WaitExecution of an operation it does not know: NOT_FOUND). Catches: the metadata
 /// dropped: the second call is UNAUTHENTICATED too.
 #[tokio::test]
 async fn the_successor_authorizes_a_relayed_call_again() {
@@ -555,7 +555,7 @@ async fn the_successor_authorizes_a_relayed_call_again() {
 /// the state store, found by its action while it was unfinished, with the successor's name
 /// kept, showing a stage when the rows change it, nothing while they say nothing or the
 /// same, and the done operation at the end, which ends the stream and the relay. Two ways
-/// to break: an error, and a clean end before done. Mutants: no fallback (the stream
+/// to break: an error, and a clean end before done. Catches: no fallback (the stream
 /// errors at the break); the rows followed under another operation id.
 #[tokio::test]
 async fn a_broken_stream_is_followed_from_the_done_rows() {
@@ -649,7 +649,7 @@ async fn a_stream_that_cannot_be_followed_ends_as_it_broke() {
 /// relay follows the rows at a one-hour interval, and the rows say nothing for five
 /// hundred looks (the operation takes about three weeks), fail to read for some, and then
 /// give the result: the stream carries the result, no UNAVAILABLE ever comes from the look
-/// counting or from an unreadable row. Mutants: the relay ending the stream after N
+/// counting or from an unreadable row. Catches: the relay ending the stream after N
 /// consecutive looks that show nothing; a failed read ending the stream.
 #[tokio::test(start_paused = true)]
 async fn a_followed_stream_outlives_any_number_of_looks_and_unreadable_rows() {
@@ -695,7 +695,7 @@ async fn a_followed_stream_outlives_any_number_of_looks_and_unreadable_rows() {
 /// Catches: a client cancel that does not end the relay (the old process would hold the
 /// stream, the open count and the follower's report for ever). A followed stream the rows
 /// never end is dropped by its client after a day of looks: the relay is no longer open and
-/// tells the farm it stopped following. Mutants: no `release` on drop; the open count kept.
+/// tells the farm it stopped following. Catches: no `release` on drop; the open count kept.
 #[tokio::test(start_paused = true)]
 async fn a_client_cancel_ends_a_followed_relay() {
     let rig = Rig::new(
@@ -806,7 +806,7 @@ async fn a_closing_server_ends_relayed_streams() {
 /// Catches: a call the successor never starts held past the caller's deadline (nothing
 /// bounds it otherwise: there is no queue and no flag): it ends DEADLINE_EXCEEDED, and
 /// leaves nothing counted open. A call with no deadline is not given one (the other tests
-/// open and finish with none). Mutant: the deadline not applied to the open.
+/// open and finish with none). Catches: the deadline not applied to the open.
 #[tokio::test]
 async fn the_callers_deadline_ends_a_call_that_never_starts() {
     let rig = Rig::over(vec![], vec![], |successor| Successor {
@@ -844,7 +844,7 @@ async fn an_unreachable_successor_refuses_the_call() {
 /// has said where it listens) that answers from the old scheduler, hangs, or counts a call
 /// it did not relay: it refuses UNAVAILABLE for both calls and counts nothing. Once the
 /// successor is named the same relay forwards, and a second naming changes nothing (a
-/// successor is named once). Mutants: `client` answering with the wrapped service while
+/// successor is named once). Catches: `client` answering with the wrapped service while
 /// the successor is unknown; counting before the client is made.
 #[tokio::test]
 async fn a_successor_named_late_is_dialled_from_then_on() {

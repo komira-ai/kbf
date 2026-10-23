@@ -134,7 +134,8 @@ impl Authorizer for InstanceNamePrefixAuthorizer {
 /// - `cas_find_missing`: FindMissingBlobs.
 /// - `ac_get`: GetActionResult. UpdateActionResult has no authorizer: clients never
 ///   write the action cache, whatever the policy.
-/// - `execute`: Execute, and WaitExecution against the operation's instance name.
+/// - `execute`: Execute, and WaitExecution and GetOperation against the operation's
+///   instance name.
 pub struct Authorizers {
     /// GetCapabilities.
     pub capabilities: Arc<dyn Authorizer>,
@@ -244,7 +245,7 @@ mod tests {
         }
     }
 
-    /// Catches: a deny that allows (mutant "deny allows"), answers that are not one
+    /// Catches: a deny that allows (defect "deny allows"), answers that are not one
     /// per instance name, and a refusal not wrapped as Buildbarn wraps it.
     #[tokio::test]
     async fn authorize_wraps_a_refusal_and_keeps_its_code() {

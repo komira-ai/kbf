@@ -13,10 +13,9 @@ use kbf_host::testkit::ScratchHost;
 use super::pipeline_fetcher_tests::PipelineFetcher;
 use super::*;
 use crate::helper::fetcher::fake::Tamper;
-use crate::setup::backend::{Fetching, Releases};
 
-/// A second handle on the rig's root, for `setup`: it is another program than the helper,
-/// with an executor of its own. Both remove the root when they go; the second removal
+/// A second handle on the rig's root, for the first release: it is another program than the
+/// helper, with an executor of its own. Both remove the root when they go; the second removal
 /// finds nothing and does not mind.
 fn second_handle(rig: &Rig) -> ScratchHost {
     ScratchHost {
@@ -50,10 +49,11 @@ fn real_frontend(name: &str) -> (Rig, PipelineFetcher) {
     (rig, fetcher)
 }
 
-/// Catches `setup`'s first release being left staged as well as current. The first release
-/// goes through the pipeline and `Fetching`, and the state says it is current and stages
-/// nothing: status.json says `idle` (not `staged`, for good), and the frontend's first update
-/// is taken, where a release both staged and current answers it `frontend_busy` for ever.
+/// Asserts that a first release is not left staged as well as current. The first release goes
+/// through the pipeline and `activate::first` (as `record-release` makes one), and the state
+/// says it is current and stages nothing: status.json says `idle` (not `staged`, for good), and
+/// the frontend's first update is taken, where a release both staged and current answers it
+/// `frontend_busy` for ever.
 ///
 /// Red on the code before the fix, where the pipeline wrote `staged` and `first` kept it.
 /// Each of the two alone is masked here by the other being right (a pipeline that does not
@@ -61,11 +61,17 @@ fn real_frontend(name: &str) -> (Rig, PipelineFetcher) {
 /// wrote), so each has its own test: `the_pipeline_installs_and_never_writes_the_state`
 /// and `a_first_release_that_was_staged_is_current_and_no_longer_staged`.
 #[test]
-fn setups_first_release_is_not_left_staged_and_a_frontend_update_follows() {
+fn a_first_release_is_not_left_staged_and_a_frontend_update_follows() {
     let mut rig = Rig::bare_frontend("first-then-update");
     let fetcher = PipelineFetcher::new(&rig.layout);
-    let setup = Fetching::new(&fetcher, rig.layout.clone(), second_handle(&rig));
-    setup.install_first(&c(A)).expect("the first release");
+    let locator = ReleaseLocator {
+        commit: c(A),
+        components: Vec::new(),
+        source: Source::Fetch,
+    };
+    fetcher.fetch(&locator).expect("fetched");
+    let mut first = second_handle(&rig);
+    activate::first(&mut first, &rig.layout, &c(A), &mut std::io::sink()).expect("the first");
     assert!(installed(&rig, A), "it came through the pipeline");
     let state = rig.state();
     assert_eq!(state.current, Some(c(A)));

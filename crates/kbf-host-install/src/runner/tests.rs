@@ -1,13 +1,13 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use super::{Cmd, DEBIAN_FRONTEND, Exec, LANG, PATH, Runner, SystemRunner, fake};
+use super::{Cmd, DEBIAN_FRONTEND, Exec, LANG, PATH, Runner, SystemRunner, WriteCap, fake};
 
 fn cmd(program: &str, args: &[&str]) -> Cmd {
     Cmd {
         program: program.into(),
         args: args.iter().map(|a| (*a).into()).collect(),
-        timeout: None,
+        ..Cmd::default()
     }
 }
 
@@ -184,4 +184,260 @@ fn a_missing_program_is_an_error_within_a_limit() {
         ))
         .unwrap_err();
     assert_ne!(error.kind(), std::io::ErrorKind::TimedOut);
+}
+
+/// Variables a command asks for are added to the fixed three, and nothing else.
+#[test]
+fn a_command_may_add_variables() {
+    let mut c = cmd("/usr/bin/env", &[]);
+    c.env = vec![("HOME".into(), "/h".into()), ("GH_X".into(), "1".into())];
+    let out = SystemRunner.run(&c).unwrap();
+    let seen: BTreeSet<String> = out.stdout_text().lines().map(str::to_owned).collect();
+    assert!(seen.contains("HOME=/h") && seen.contains("GH_X=1"));
+    assert_eq!(seen.len(), 5);
+}
+
+/// Bytes given to a command arrive on its standard input, which is then closed; they are
+/// written while the command runs, so more than a pipe holds does not block.
+#[test]
+fn a_command_may_be_given_standard_input() {
+    let mut c = cmd("/usr/bin/cat", &[]);
+    c.stdin = b"query".to_vec();
+    let out = SystemRunner.run(&c).unwrap();
+    assert_eq!(out.stdout, b"query");
+    c.stdin = vec![b'x'; 1 << 20];
+    assert_eq!(SystemRunner.run(&c).unwrap().stdout.len(), 1 << 20);
+    // A command that never reads does not hang the writer.
+    let mut c = cmd("/usr/bin/true", &[]);
+    c.stdin = vec![b'x'; 1 << 20];
+    assert!(SystemRunner.run(&c).unwrap().success());
+}
+
+/// A command runs as the user and group it is given: the caller's own is allowed, and
+/// another one is refused to a caller who is not root.
+#[test]
+fn a_command_may_run_as_a_user() {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata("/proc/self").unwrap();
+    let (uid, gid) = (meta.uid(), meta.gid());
+    let mut c = cmd("/usr/bin/id", &["-u"]);
+    c.run_as = Some(super::Identity { uid, gid });
+    assert_eq!(
+        SystemRunner.run(&c).unwrap().stdout_text().trim(),
+        uid.to_string()
+    );
+    if uid != 0 {
+        c.run_as = Some(super::Identity { uid: uid + 1, gid });
+        assert!(SystemRunner.run(&c).is_err());
+    }
+}
+
+/// A drop made by this process is refused when its effective uid is root and its real uid is
+/// not (the standard library would keep the caller's groups); a plain root, a plain user, a
+/// real root with another effective uid and a command that drops nothing pass.
+#[test]
+fn a_privilege_drop_needs_a_real_uid_of_root() {
+    use super::{Identity, refuse_setuid_drop};
+    let ids = Some(Identity {
+        uid: 65534,
+        gid: 65534,
+    });
+    let kind = |uid, euid| refuse_setuid_drop(ids, uid, euid).map_err(|e| e.kind());
+    assert_eq!(kind(1000, 0), Err(std::io::ErrorKind::PermissionDenied));
+    assert_eq!(kind(0, 0), Ok(()));
+    assert_eq!(kind(1000, 1000), Ok(()));
+    assert_eq!(kind(0, 1000), Ok(()));
+    // No drop, no matter who runs it.
+    assert!(refuse_setuid_drop(None, 1000, 0).is_ok());
+}
+
+/// A command with no `run_as` is started as it is. One with `run_as` is started by `chroot`
+/// on macOS, which sets the user, the group and the one supplementary group (the program
+/// and its arguments follow the root `/`); elsewhere this process sets the user and group.
+#[test]
+fn a_drop_goes_through_chroot_on_a_mac() {
+    use super::{Identity, Launch, launch};
+    let mut c = cmd("/usr/bin/gh", &["attestation", "verify"]);
+    for through_chroot in [false, true] {
+        assert_eq!(
+            launch(&c, through_chroot).unwrap(),
+            Launch {
+                program: "/usr/bin/gh".into(),
+                args: vec!["attestation".into(), "verify".into()],
+                set_ids: None
+            }
+        );
+    }
+    let id = Identity {
+        uid: 4_294_967_294,
+        gid: 4_294_967_293,
+    };
+    c.run_as = Some(id);
+    assert_eq!(
+        launch(&c, false).unwrap(),
+        Launch {
+            program: "/usr/bin/gh".into(),
+            args: vec!["attestation".into(), "verify".into()],
+            set_ids: Some(id)
+        }
+    );
+    assert_eq!(
+        launch(&c, true).unwrap(),
+        Launch {
+            program: "/usr/sbin/chroot".into(),
+            args: [
+                "-u",
+                "4294967294",
+                "-g",
+                "4294967293",
+                "-G",
+                "4294967293",
+                "/",
+                "/usr/bin/gh",
+                "attestation",
+                "verify"
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            set_ids: None
+        }
+    );
+}
+
+/// A command that writes `blocks` MiB to `file` with `dd`, held to `max` bytes in `dir`.
+fn writes(dir: &std::path::Path, file: &str, blocks: u32, max: u64) -> Cmd {
+    Cmd {
+        write_cap: Some(WriteCap {
+            dir: dir.to_path_buf(),
+            max,
+        }),
+        ..within(
+            "/usr/bin/dd",
+            &[
+                "if=/dev/zero",
+                &format!("of={}", dir.join(file).display()),
+                "bs=1048576",
+                &format!("count={blocks}"),
+            ],
+            Duration::from_secs(60),
+        )
+    }
+}
+
+/// Catches output that is held in memory whole: a child that prints far more than the cap
+/// still succeeds (it is not blocked on a full pipe), the caller gets the cap and one byte
+/// more, which shows the output was longer, and a quiet or short child is untouched.
+#[test]
+fn output_past_its_cap_is_dropped_and_the_child_still_finishes() {
+    let big = Cmd {
+        stdout_max: Some(1000),
+        ..within(
+            "/usr/bin/head",
+            &["-c", "50000000", "/dev/zero"],
+            Duration::from_secs(60),
+        )
+    };
+    let exec = SystemRunner.run(&big).unwrap();
+    assert!(exec.success());
+    assert_eq!(exec.stdout.len(), 1001);
+
+    let short = Cmd {
+        stdout_max: Some(1000),
+        ..within(
+            "/usr/bin/head",
+            &["-c", "1000", "/dev/zero"],
+            Duration::from_secs(60),
+        )
+    };
+    assert_eq!(SystemRunner.run(&short).unwrap().stdout.len(), 1000);
+
+    // Standard error is kept up to a fixed amount.
+    let noisy = within(
+        "/usr/bin/dd",
+        &["if=/dev/zero", "of=/dev/stderr", "bs=1048576", "count=20"],
+        Duration::from_secs(60),
+    );
+    let exec = SystemRunner.run(&noisy).unwrap();
+    assert!(exec.success());
+    assert_eq!(exec.stderr.len(), 1024 * 1024 + 1);
+}
+
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+    std::fs::create_dir_all(&target).unwrap();
+    kbf_testkit::dir::TestDir::under(target, name)
+}
+
+/// Catches a size cap that does not stop a command: one that would write far more than it
+/// is allowed is killed while it runs, with a "too large" error, and writes no more after.
+#[test]
+fn a_child_that_writes_past_its_cap_is_killed() {
+    let dir = scratch("kbf-runner-cap-kill");
+    // 100000 MiB if nothing stopped it.
+    let error = SystemRunner
+        .run(&writes(&dir, "big", 100_000, 1024 * 1024))
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge, "{error}");
+    let size = std::fs::metadata(dir.join("big")).unwrap().len();
+    assert!(size < 4 * 1024 * 1024 * 1024, "{size}");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(std::fs::metadata(dir.join("big")).unwrap().len(), size);
+}
+
+/// Catches a cap that a fast writer slips under: a command that is over the cap when it
+/// exits is refused too, and one within it is not touched.
+#[test]
+fn a_child_over_its_cap_at_exit_is_refused_and_one_within_it_is_not() {
+    let dir = scratch("kbf-runner-cap-exit");
+    let error = SystemRunner
+        .run(&writes(&dir, "over", 3, 1024 * 1024))
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge, "{error}");
+    let other = scratch("kbf-runner-cap-within");
+    let ok = SystemRunner
+        .run(&writes(&other, "within", 1, 3 * 1024 * 1024))
+        .unwrap();
+    assert!(ok.success(), "{}", ok.stderr_text());
+}
+
+/// Catches a cap that needs a time limit: without one the command is still watched, and a
+/// directory that is not there holds nothing.
+#[test]
+fn a_cap_works_without_a_time_limit_and_over_a_missing_directory() {
+    let dir = scratch("kbf-runner-cap-nolimit");
+    let mut over = writes(&dir, "over", 3, 1024 * 1024);
+    over.timeout = None;
+    let error = SystemRunner.run(&over).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge, "{error}");
+    let missing = Cmd {
+        write_cap: Some(WriteCap {
+            dir: dir.join("not-there"),
+            max: 1,
+        }),
+        ..cmd("/usr/bin/true", &[])
+    };
+    assert!(SystemRunner.run(&missing).unwrap().success());
+}
+
+/// A drop through `chroot` to uid 0 is refused, so `chroot` never runs a command as root.
+#[test]
+fn a_chroot_drop_to_uid_zero_is_refused() {
+    use super::{Identity, launch};
+    let mut c = cmd("/usr/bin/gh", &[]);
+    c.run_as = Some(Identity { uid: 0, gid: 20 });
+    let kind = launch(&c, true).map_err(|e| e.kind());
+    assert_eq!(kind, Err(std::io::ErrorKind::PermissionDenied));
+    // This process's own drop is not covered by this check.
+    assert!(launch(&c, false).is_ok());
+}
+
+/// A drop through `chroot` to gid 0 is refused, so the child never keeps group 0 (`wheel`).
+#[test]
+fn a_chroot_drop_to_gid_zero_is_refused() {
+    use super::{Identity, launch};
+    let mut c = cmd("/usr/bin/gh", &[]);
+    c.run_as = Some(Identity { uid: 501, gid: 0 });
+    let kind = launch(&c, true).map_err(|e| e.kind());
+    assert_eq!(kind, Err(std::io::ErrorKind::PermissionDenied));
+    assert!(launch(&c, false).is_ok());
 }

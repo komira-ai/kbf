@@ -2,13 +2,13 @@
 //! run as `kbf-front` runs it (`cache/tier.rs`, `cache/flush.rs`) over `kbf-tier`'s
 //! [`Tier`] on the server's second disk:
 //!
-//! - **Start** ([`Server::attach_tier`]): the log is raised to machine version 2, the
-//!   tier is the registered one or a new id (this start's writer epoch), the directory
-//!   is opened against the committed staged table ([`Tier::open`]: the `TIER` check,
-//!   each staged block cut to its committed length, the orphan sweep), `AddTier`
-//!   commits for a new tier, and each lost block is marked `Missing`. What the open
-//!   did is recorded, and the directory is checked against the committed state
-//!   (invariant E).
+//! - **Start** ([`Server::attach_tier`]): the log is not raised (the tier's commands
+//!   commit to it as it is), the tier is the registered one or a new id (this start's
+//!   writer epoch), the directory is opened against the committed staged table
+//!   ([`Tier::open`]: the `TIER` check, each staged block cut to its committed length,
+//!   the orphan sweep), `AddTier` commits for a new tier, and each lost block is marked
+//!   `Missing`. What the open did is recorded, and the directory is checked against the
+//!   committed state (invariant E).
 //! - **Writes** ([`Server::stage`]): an upload's bytes are written to a range of the
 //!   open block, synced, indexed with one `PutStaged`, and only then acknowledged. A
 //!   range the tier does not take (its budget, a disk error) goes down the direct path.
@@ -293,9 +293,6 @@ impl Server {
             return Ok(());
         };
         let up = self.up.as_mut().expect("attached at a start");
-        up.log
-            .raise_machine_version(MachineVersion::V2)
-            .map_err(|_| None)?;
         let current = up.query(|m| m.tier(SERVER));
         let id = current.unwrap_or_else(|| TierId::new(up.writer.get()));
         let snapshot = up.query(StagedSnapshot::of);
@@ -771,16 +768,17 @@ impl Server {
 }
 
 /// A rollback of the binary at the end of a run (scenario 30): the durable log opened
-/// by a binary that runs only machine version 1.
+/// by a binary that runs only machine version 1. The server raises no log, so that binary
+/// has no raise to skip.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rollback {
-    /// The index of the entry raising the log to machine version 2.
-    pub raised_at: Option<u64>,
     /// The index of the first write tier command.
     pub first_tier_command: Option<u64>,
-    /// Why the version-1 open was refused (`raft log: entry <index>: ..` when it
-    /// stopped at an entry); `None` if it opened.
-    pub refused: Option<String>,
+    /// How many entries the version-1 open skipped (any raise to a version it does not
+    /// run: none, since the log holds none); `None` if it was refused.
+    pub older_skipped: Option<u64>,
+    /// Whether the version-1 open reads the staged table the server holds.
+    pub older_reads_same: bool,
     /// Whether this binary still opens the log after that, to the same staged table.
     pub reopened: bool,
 }
@@ -793,25 +791,16 @@ impl Server {
         let up = self.up.as_ref()?;
         let durable = self.disk.crash(0);
         let entries = crate::replica::durable_entries(durable.restart()).ok()?;
-        let (mut raised_at, mut first_tier_command) = (None, None);
+        let mut first_tier_command = None;
         for entry in &entries {
             let Payload::Command(bytes) = &entry.payload else {
                 continue;
             };
             let index = entry.id.index.0;
-            match kbf_log::decode(Format::V1, bytes) {
-                // The one raise this binary commits: to version 2.
-                Ok(LogCommand::MachineVersion(_)) => {
-                    raised_at.get_or_insert(index);
-                }
-                // A metadata command the encoder refuses under format 1 (a command that
-                // joined a later format).
-                Ok(command @ LogCommand::Meta(_))
-                    if kbf_log::encode(Format::V1, &command).is_err() =>
-                {
-                    first_tier_command.get_or_insert(index);
-                }
-                _ => {}
+            if let Ok(LogCommand::Meta(command)) = kbf_log::decode(Format::V1, bytes)
+                && is_tier_command(&command)
+            {
+                first_tier_command.get_or_insert(index);
             }
         }
         let _context = self.runtime.enter();
@@ -824,18 +813,36 @@ impl Server {
                 runs,
             ))
         };
-        let refused = open(MachineVersion::V1).err().map(|e| e.to_string());
         let staged = up.query(StagedSnapshot::of);
-        let reopened = open(RUNS)
-            .ok()
-            .is_some_and(|log| super::ready(log.query(StagedSnapshot::of)) == Ok(staged));
+        let older = open(MachineVersion::V1).ok();
+        let older_skipped = older.as_ref().map(RaftMetaLog::skipped_entries);
+        let older_reads_same = older.is_some_and(|log| holds(&log, &staged));
+        let reopened = open(RUNS).ok().is_some_and(|log| holds(&log, &staged));
         Some(Rollback {
-            raised_at,
             first_tier_command,
-            refused,
+            older_skipped,
+            older_reads_same,
             reopened,
         })
     }
+}
+
+/// Whether `command` is one of the write tier's.
+fn is_tier_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::AddTier { .. }
+            | Command::PutStaged { .. }
+            | Command::SealStaged { .. }
+            | Command::ObjectFlushed { .. }
+            | Command::FlushConflict { .. }
+            | Command::ReseatStaged { .. }
+    )
+}
+
+/// Whether `log` holds the staged table `staged`.
+fn holds(log: &RaftMetaLog<FaultFs>, staged: &StagedSnapshot) -> bool {
+    super::ready(log.query(StagedSnapshot::of)) == Ok(staged.clone())
 }
 
 #[cfg(test)]
@@ -887,8 +894,8 @@ mod tests {
     }
 
     /// Catches a tier open that refuses (a block of a later epoch: a reused epoch)
-    /// yet leaves the server up, or goes unrecorded; and a start whose raise or
-    /// `AddTier` failed left up (the log has stopped).
+    /// yet leaves the server up, or goes unrecorded; and a start whose `AddTier`
+    /// failed left up (the log has stopped).
     #[test]
     fn a_refused_or_failed_tier_start_takes_the_server_down() {
         let mut s = tier_server(5);
@@ -900,11 +907,10 @@ mod tests {
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert!(refused[0].1.contains("write tier"), "{refused:?}");
         assert!(sent(&mut s).contains(&format!("tag: {T_START}")));
-        // The operations of an open and the writer epoch's commit, then the raise's
-        // and `AddTier`'s.
+        // The operations of an open and the writer epoch's commit, then `AddTier`'s.
         let mut probe = Server::new(ServerPlan::default(), NodeId::from("store"));
         probe.apply(input(0, Event::Start));
-        for at in 0..4 {
+        for at in 0..2 {
             let mut s = tier_server(5);
             s.disk.fail_at(probe.disk.ops() + at, Fault::Error);
             s.apply(input(0, Event::Start));

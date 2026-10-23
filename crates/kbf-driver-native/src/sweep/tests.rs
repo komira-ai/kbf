@@ -58,7 +58,7 @@ fn a_directory_that_cannot_be_removed_is_moved_aside() {
     assert!(aside[0].starts_with("lease-stuck."), "{aside:?}");
     let kept = dir.join(QUARANTINE).join(&aside[0]).join("root/out");
     assert_eq!(std::fs::read(kept).expect("moved whole"), b"x");
-    // The daemon's alone, whatever the umask ("made 0755" mutant).
+    // The daemon's alone, whatever the umask ("made 0755" defect).
     let mode = std::fs::symlink_metadata(dir.join(QUARANTINE)).expect("quarantine");
     assert_eq!(
         std::os::unix::fs::PermissionsExt::mode(&mode.permissions()) & 0o777,
@@ -177,7 +177,7 @@ fn sweep_within(dir: &Path) -> io::Result<()> {
 }
 
 /// Catches (issue #155) a sweep that removes the lease directories a killed daemon
-/// left but leaves their actions running (the "sweep skips the kill" mutant), one
+/// left but leaves their actions running (the "sweep skips the kill" defect), one
 /// that removes a directory before its action is dead, one that misses a process
 /// still in the group after its leader exited, and one that keeps the records.
 #[test]
@@ -215,7 +215,7 @@ fn a_recorded_run_is_killed_before_its_directory_goes() {
 }
 
 /// Catches a sweep that trusts a record's pid without its start time (the "kill
-/// without verifying identity" mutant), or without its boot: a process now under
+/// without verifying identity" defect), or without its boot: a process now under
 /// the recorded pid that started after the recorded leader, or a record of an
 /// earlier boot, names no action, and nothing is signalled. A torn record, written
 /// by a daemon that died mid-write before its action could start, is removed and
@@ -380,9 +380,9 @@ fn only_the_daemons_own_entries_are_read() {
 }
 
 /// Catches a `runs` or a record that another user could write (group or other write
-/// bits) read as the daemon's ("mode unchecked" mutant), and a `runs` that is a
+/// bits) read as the daemon's ("mode unchecked" defect), and a `runs` that is a
 /// symlink followed to a directory of records elsewhere ("ours follows links"
-/// mutant): each is set aside unread, the action it names keeps running, and the
+/// defect): each is set aside unread, the action it names keeps running, and the
 /// start goes on.
 #[test]
 fn a_runs_open_to_others_or_a_link_is_set_aside_unread() {
@@ -421,7 +421,7 @@ fn a_runs_open_to_others_or_a_link_is_set_aside_unread() {
 
 /// Catches a quarantine that is a symlink emptied through the link: an action that
 /// points it at a directory of the user's would get that directory's entries
-/// removed at the next start ("quarantine followed" mutant). The target is a
+/// removed at the next start ("quarantine followed" defect). The target is a
 /// directory the daemon would take for its own (0700, whatever the umask), so only
 /// the link check can refuse it.
 #[test]
@@ -443,7 +443,7 @@ fn a_quarantine_that_is_a_link_is_removed_not_followed() {
 /// Catches a quarantine emptied before the kill (an action left behind is still
 /// alive then), and one emptied by path after the check: an action that swaps it
 /// for a symlink to a directory of the user's while the sweep kills ("emptied by
-/// path" mutant) would get that directory's entries removed. The swap is done from
+/// path" defect) would get that directory's entries removed. The swap is done from
 /// the process table read, as the dying action would.
 #[test]
 fn the_quarantine_is_emptied_after_the_kill_through_what_was_checked() {
@@ -477,7 +477,7 @@ fn the_quarantine_is_emptied_after_the_kill_through_what_was_checked() {
 
 /// Catches what the sweep moves aside after the kill moved into the quarantine by
 /// path: an action that swaps the quarantine for a symlink to a directory of the
-/// user's while the sweep kills ("moved aside by path" mutant) would get its lease
+/// user's while the sweep kills ("moved aside by path" defect) would get its lease
 /// directory, a tree it shaped, written into that directory and left there. The stuck lease goes into the directory that was
 /// checked, through its descriptor, wherever the swap put it. An entry of `runs/`
 /// that is not a record is set aside the same way, whether before the kill or
@@ -533,7 +533,7 @@ fn what_is_moved_aside_after_the_kill_goes_into_what_was_checked() {
 
 /// Catches (issue #193) a `runs` swapped for a symlink after it was checked and
 /// listed: what the sweep reads, removes and moves aside of it afterwards was found by
-/// path ("runs by path" mutant), so it would remove the records of the directory the
+/// path ("runs by path" defect), so it would remove the records of the directory the
 /// link names and move its entries into the quarantine, where the next start removes
 /// them. The swap is done from the process table read of the first live record, as the
 /// action the record names would; the directory the link names holds an entry of every
@@ -594,7 +594,7 @@ fn a_runs_swapped_for_a_link_during_the_sweep_is_not_followed() {
 
 /// Catches a quarantine the sweep makes after the kill followed when it is a link:
 /// absent at the start, an action can plant a symlink under its name while the
-/// sweep kills ("made by path" mutant). Nothing is moved through the link; the
+/// sweep kills ("made by path" defect). Nothing is moved through the link; the
 /// stuck lease stays where it is, logged.
 #[test]
 fn a_quarantine_planted_during_the_kill_is_not_moved_into() {
@@ -624,7 +624,7 @@ fn a_quarantine_planted_during_the_kill_is_not_moved_into() {
 }
 
 /// Catches a quarantine that cannot be made reported as the open's error instead of
-/// the mkdir's ("mkdir error dropped" mutant: a scratch root the daemon may not write
+/// the mkdir's ("mkdir error dropped" catches: a scratch root the daemon may not write
 /// would read as a quarantine that is not there), and the entry moved anyway.
 #[test]
 fn a_quarantine_that_cannot_be_made_says_why() {
@@ -643,7 +643,7 @@ fn a_quarantine_that_cannot_be_made_says_why() {
 }
 
 /// Catches a quarantine that another user could write
-/// (group- or other-writable) emptied and kept ("owner and mode unchecked" mutant):
+/// (group- or other-writable) emptied and kept ("owner and mode unchecked" defect):
 /// what the sweep later moves aside would sit where others can reach it. It is
 /// removed itself, never emptied through.
 #[test]
@@ -663,7 +663,7 @@ fn a_quarantine_others_may_write_is_removed_itself() {
 }
 
 /// Catches a quarantine of another user's held as the daemon's ("owner unchecked"
-/// mutant): `/` (root's, for a test run as anyone else) stands in for it. It is
+/// defect): `/` (root's, for a test run as anyone else) stands in for it. It is
 /// handed to `remove` (a fake one here, which removes nothing), never listed.
 #[test]
 fn a_quarantine_of_another_user_is_not_held() {
@@ -709,9 +709,9 @@ fn a_pid_that_is_gone_is_not_another_users() {
 /// an action can read both in `/proc`) followed at all: walking that group's tree
 /// reaches the parent's other children, and its members, which the daemon never
 /// signals, would outlive the kill wait and stop the start ("the guarded group is
-/// walked" mutant). Also a process below a recorded group that the daemon never
+/// walked" defect). Also a process below a recorded group that the daemon never
 /// signals (its parent, a member of its own group) counted as a survivor ("guarded
-/// processes are survivors" mutant). The pids are above any kernel's limit.
+/// processes are survivors" defect). The pids are above any kernel's limit.
 #[test]
 fn what_the_daemon_never_signals_neither_stops_the_start_nor_is_walked() {
     let dir = scratch("guarded");

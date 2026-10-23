@@ -5,12 +5,14 @@
 //!   rename, symlink, chmod, wait-for, sleep-once, mkdir, cat, mtime, pgid, leads, write-lines,
 //!   copy, remove, mkfifo, truncate, zeros, ignore-signal, test, points-to, holds,
 //!   inode-links, and the probes try-read, try-write, try-list, tcp-listen,
-//!   tcp-connect, unix-listen, unix-connect, procargs, proc-sees, ps-sees) that a test puts in an action's or a child's argv where it would
+//!   tcp-connect, unix-listen, unix-connect, procargs, proc-sees, ps-sees, and shm-owner) that a test puts in an action's or a child's argv where it would
 //!   have written `sh -c`.
 //! - [`fake`]: the same binary run through a link named `xcrun`, `xcodebuild` or
 //!   `sandbox-exec` answers as that tool, from a rules file the test writes.
 //! - [`config`]: the empty `kbf.toml` a test hands to every `kbf` child it starts, so the child
 //!   never reads the host's settings file.
+//! - `database` (feature `postgres`): a Postgres database a test owns, made on the test server
+//!   `KBF_TEST_POSTGRES_URL` names and dropped on drop; a test without the variable fails.
 //! - [`dir`]: a scratch directory a test owns and that is removed on drop.
 //! - [`port`]: loopback ports a test can rely on (dead ones, and ones held until used).
 //! - [`forked`]: a child held between `fork` and `exec`, to show what a lock or a file
@@ -50,6 +52,8 @@ pub mod act;
 mod act_probe;
 pub mod canary;
 pub mod config;
+#[cfg(feature = "postgres")]
+pub mod database;
 pub mod dir;
 pub mod fake;
 pub mod forked;
@@ -58,6 +62,7 @@ pub mod node_view;
 pub mod port;
 pub mod probe;
 pub mod reaped;
+pub mod shm;
 pub mod spawn;
 pub mod switch;
 pub mod tree;

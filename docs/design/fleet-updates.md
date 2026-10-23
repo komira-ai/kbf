@@ -674,13 +674,14 @@ inference at about 4-14% **of** bare-metal speed (7 to 23 times slower): generat
 **[V]** for their machine, **[A]** for others. The same source's faster guest depends
 on injecting a library to change private Metal behaviour; not fit for a farm.
 
-So a GPU test, including a test that installs the desktop app and drives it with a
-local LLM, is a `kbf-lease=whole_machine` lease with `gpu=1`, as `macos-vms.md`
-section 8.1 defines: it empties the Mac, no other lease (bare-metal or VM) runs there
-at the same time, and GPU tests on one Mac run one at a time: the front refuses `gpu`
-on macOS for any other lease kind (#85 section 8.1), and books no GPU on top of a
-whole-machine lease on macOS, since a Mac reports none and the whole Mac is the test's.
-The whole-machine booking (all of the node's capacity) and the reservation that keeps
+So a GPU test that needs only the GPU (Metal or MLX, inference or training) runs on the
+Mac as a pool user under the slot profile, with `gpu=1`: a Mac reports one GPU slot, the
+lease books it, and GPU leases on one Mac run one at a time while its CPUs are shared
+(`macos-vms.md` section 8.1). A test that installs the desktop app and drives it with a
+local LLM, or whose numbers must not be noise, is a `kbf-lease=whole_machine` lease with
+`gpu=1`: it empties the Mac, no other lease (bare-metal or VM) runs there at the same
+time, and the front books no GPU on top of it, since the whole Mac is the test's. The
+whole-machine booking (all of the node's capacity) and the reservation that keeps
 one-core work from starving it ([scheduler.md](scheduler.md#placement)) are built, and
 so is the runtime that serves it, below. VMs remain for simulator and GUI tests that do
 not need the GPU.

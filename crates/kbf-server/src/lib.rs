@@ -128,6 +128,7 @@ mod run_record;
 pub mod serve;
 #[cfg(test)]
 mod serve_remote_tests;
+mod size_key;
 pub mod stamp;
 mod start;
 mod start_exit;
@@ -156,7 +157,10 @@ pub mod write_tier;
 
 pub use config::{Args, ConfigError, Role, SERVER, s3_store};
 pub use drain::{Drain, DrainStatus};
-pub use farm::{DONE_FLOOR, EpochPolicy, Farm, SESSION_RENEWAL, StateError};
+pub use farm::{
+    ACK_WINDOW, DONE_FLOOR, EpochBump, EpochPolicy, Farm, ID_BLOCK, INTAKE_POLL, ORPHAN_WAIT,
+    OWNER_CACHE_TTL, SESSION_RENEWAL, StateError,
+};
 pub use health::Readiness;
 pub use identity::{DenyList, DenyListError, Peers};
 pub use kbf_sched::MemoryLadder;

@@ -28,8 +28,9 @@ clap.workspace = true
 futures.workspace = true
 kbf-unitfile.workspace = true
 kbf-daemon.workspace = true
-# `kbf-cell cross-version`'s check that the installer goes first is the installer's own
-# (`stage::understood`).
+# The tests under `tests/` that call into the installer library: `package_trust` (settings,
+# layout, archive), `package_installer_verbs` (cli, layout, setup plan), `observe_ports`
+# (observe) and `proxy_aio_soak` (the proxy swap).
 kbf-installer.workspace = true
 kbf-objstore.workspace = true
 # The worker protocol's messages and client, for the same probe.
@@ -92,8 +93,6 @@ rustls.workspace = true
 saphyr-parser.workspace = true
 sha2.workspace = true
 syn.workspace = true
-# `tests/stage_offer_bundle.rs`: the tar the stager makes, read entry by entry, and edited.
-tar.workspace = true
 # The listeners, byte streams, channels and timers of the proxy, deploy and object-store tests.
 tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
 tokio-rustls.workspace = true

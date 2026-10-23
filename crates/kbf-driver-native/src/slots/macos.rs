@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kbf_daemon::RuntimeError;
 use kbf_daemon::uid;
@@ -23,9 +23,11 @@ use tokio::sync::OwnedSemaphorePermit;
 use super::book::{Backoff, Book, Cleaner, CountHook, Held, Slotted};
 use super::clean::{self, Skipped, WithSkipped};
 use super::{AS_USER_ARG, Pool, SlotUser, probe};
+use crate::grace::{self, Survivor};
 use crate::network::{Isolation, Network, WeakenedProfile, slot_profile, slot_write_rules};
 use crate::procs;
 
+mod assert;
 mod canaries;
 pub mod host;
 
@@ -48,6 +50,10 @@ pub struct Ready {
     /// What the system gave the `/var/folders` entry, as found when the slot was resolved.
     pub entry: Entry,
     rules: String,
+    /// What the user is when it is clean ([`assert`]), recorded when the daemon starts.
+    baseline: assert::Baseline,
+    /// The uids of the pool's users.
+    pool: std::ops::RangeInclusive<u32>,
 }
 
 /// The `/var/folders` entry of a slot as the system made it, found when the slot was
@@ -77,6 +83,9 @@ pub struct Slots {
     program: PathBuf,
     /// A change made to the profile every launch generates: a test's weakened profile only.
     profile_change: Option<WeakenedProfile>,
+    /// Whether the slots are asserted at slot-ready: not when a step of the clean is left
+    /// out for a test, which leaves what the step removes for the next lease to find.
+    asserted: bool,
 }
 
 impl std::fmt::Debug for Slots {
@@ -114,6 +123,22 @@ impl Slots {
         within: Duration,
         skipped: Option<Skipped>,
     ) -> io::Result<Self> {
+        Self::start_with_grace(pool, within, Duration::ZERO, skipped)
+    }
+
+    /// [`Slots::start_skipping`] with the clean sending SIGTERM first and giving the
+    /// processes of the uid `grace` to end before it kills them ([`crate::grace`]); what
+    /// the daemon starts with. [`Slots::start`] kills at once.
+    ///
+    /// # Errors
+    /// As [`Slots::start`].
+    #[doc(hidden)]
+    pub fn start_with_grace(
+        pool: &Pool,
+        within: Duration,
+        grace: Duration,
+        skipped: Option<Skipped>,
+    ) -> io::Result<Self> {
         let program = kbf_daemon::keeper::program()?;
         let mut ready = Vec::new();
         for user in pool.users() {
@@ -132,10 +157,15 @@ impl Slots {
             }
             warn_if_indexed(&slot.home);
         }
-        let pool = pool.users().iter().map(|u| u.uid);
-        let pool = pool.clone().min().unwrap_or(0)..=pool.max().unwrap_or(0);
-        let cleaner = mac_cleaner(within, pool, skipped);
-        Ok(Self::with(ready, cleaner, program))
+        let uids = pool.users().iter().map(|u| u.uid);
+        let uids = uids.clone().min().unwrap_or(0)..=uids.max().unwrap_or(0);
+        for slot in &mut ready {
+            slot.pool = uids.clone();
+        }
+        let cleaner = mac_cleaner(within, grace, uids, skipped, program.clone());
+        let mut slots = Self::with(ready, cleaner, program);
+        slots.asserted = skipped.is_none();
+        Ok(slots)
     }
 
     /// [`Slots::start`] whose launches (the canaries' and the actions') run under the
@@ -161,6 +191,7 @@ impl Slots {
             book: Book::start(ready, cleaner, Backoff::DAEMON),
             program,
             profile_change: None,
+            asserted: true,
         }
     }
 
@@ -191,27 +222,45 @@ impl Slots {
             permit: Some(permit),
             program: self.program.clone(),
             profile_change: self.profile_change,
+            asserted: self.asserted,
         })
     }
 }
 
+/// How long the recovery thread waits before its first pass over a slot that went dirty:
+/// for the tests of `tests/slot_assert.rs`, which time a lease held up by it.
+#[doc(hidden)]
+pub const FIRST_RECOVERY_PASS: Duration = Backoff::DAEMON.first;
+
 /// The cleaner of a root daemon's slots: [`host::MacSlot`] through [`clean::clean`],
-/// wrapped in [`WithSkipped`] when `skipped` is given (only a test gives one).
+/// wrapped in [`WithSkipped`] when `skipped` is given (only a test gives one), and then
+/// the assertion ([`assert::after_clean`]): the baseline recorded the first time a clean
+/// passes, every probe against it afterwards. A clean with a step left out is not
+/// asserted: it is meant to leave what the step removes.
 fn mac_cleaner(
     within: Duration,
+    grace: Duration,
     pool: std::ops::RangeInclusive<u32>,
     skipped: Option<Skipped>,
+    program: PathBuf,
 ) -> Cleaner<Ready> {
     Arc::new(move |ready: &Ready| {
         let slot = host::MacSlot {
             ready,
             within,
+            grace,
             pool: pool.clone(),
+            judged: probe::OwnLabels::default(),
         };
-        match skipped {
+        let run = || match skipped {
             None => clean::clean(&slot),
             Some(skipped) => clean::clean(&WithSkipped::new(&slot, skipped)),
+        };
+        let outcome = run();
+        if skipped.is_some() || outcome != clean::Outcome::Clean {
+            return outcome;
         }
+        assert::after_clean(ready, &program, &run)
     })
 }
 
@@ -246,6 +295,8 @@ pub struct Slot {
     program: PathBuf,
     /// See [`Slots`].
     profile_change: Option<WeakenedProfile>,
+    /// See [`Slots`].
+    asserted: bool,
 }
 
 impl std::fmt::Debug for Slot {
@@ -289,29 +340,16 @@ impl Slot {
         program: PathBuf,
         args: &[String],
     ) -> Result<(PathBuf, Vec<String>), RuntimeError> {
-        let ready = self.ready();
-        let (uid, gid) = (ready.user.uid, ready.user.gid);
-        if uid == 0 {
-            return Err(RuntimeError::Failed(
-                "refusing to run an action as root".to_owned(),
-            ));
-        }
-        let profile = slot_profile(network);
-        let profile = (self.profile_change)
-            .map_or_else(|| profile.to_owned(), |change| change.apply(profile));
-        let (program, args) = isolation.wrap_in(&profile, lease, &ready.rules, program, args);
-        let mut launch = vec![
-            "asuser".to_owned(),
-            uid.to_string(),
-            self.program.to_string_lossy().into_owned(),
-            AS_USER_ARG.to_owned(),
-            uid.to_string(),
-            gid.to_string(),
-            "--".to_owned(),
-            program.to_string_lossy().into_owned(),
-        ];
-        launch.extend(args);
-        Ok((PathBuf::from(LAUNCHCTL), launch))
+        launch_command(
+            self.ready(),
+            &self.program,
+            self.profile_change,
+            isolation,
+            network,
+            lease,
+            program,
+            args,
+        )
     }
 
     /// Makes the lease directory `dir`, and everything in it, the slot user's (no link
@@ -413,6 +451,46 @@ impl Drop for Slot {
     }
 }
 
+/// [`Slot::launch`]'s command for any slot: `launchctl asuser <uid> <this binary>
+/// __as-user <uid> <gid> -- ` and the sandbox's wrap of `program` and `args`, under the
+/// slot profile changed by `change` (a test's weakened profile).
+///
+/// # Errors
+/// The slot's uid is 0.
+#[allow(clippy::too_many_arguments)]
+fn launch_command(
+    ready: &Ready,
+    this: &Path,
+    change: Option<WeakenedProfile>,
+    isolation: &Isolation,
+    network: Network,
+    lease: &Path,
+    program: PathBuf,
+    args: &[String],
+) -> Result<(PathBuf, Vec<String>), RuntimeError> {
+    let (uid, gid) = (ready.user.uid, ready.user.gid);
+    if uid == 0 {
+        return Err(RuntimeError::Failed(
+            "refusing to run an action as root".to_owned(),
+        ));
+    }
+    let profile = slot_profile(network);
+    let profile = change.map_or_else(|| profile.to_owned(), |change| change.apply(profile));
+    let (program, args) = isolation.wrap_in(&profile, lease, &ready.rules, program, args);
+    let mut launch = vec![
+        "asuser".to_owned(),
+        uid.to_string(),
+        this.to_string_lossy().into_owned(),
+        AS_USER_ARG.to_owned(),
+        uid.to_string(),
+        gid.to_string(),
+        "--".to_owned(),
+        program.to_string_lossy().into_owned(),
+    ];
+    launch.extend(args);
+    Ok((PathBuf::from(LAUNCHCTL), launch))
+}
+
 /// The processes of an action that runs as a slot's user: every process of the uid.
 /// Dropped while armed (the daemon dropped the run), it ends them, blocking.
 #[derive(Debug)]
@@ -464,26 +542,54 @@ impl UidWatch {
             .map_err(|e| RuntimeError::Failed(format!("memory of uid {uid}: {e}")))
     }
 
-    /// Ends every process of the uid ([`uid::end`], `wait` at most), then reaps the
+    /// Ends every process of the uid: [`uid::bootout`] of its domain, SIGTERM and up to
+    /// `grace` for them to end ([`term_uid`]), then [`uid::kill_all`] (`wait` at most,
+    /// after the bootout and the grace, which come on top), then reaps the
     /// leader, `child`: once nothing of the uid is left the leader has exited too, or
     /// it is `launchctl`, which exits once its child has; one still there after `wait`
     /// is SIGKILLed by pid, safe because it is this process's unreaped child. Removes
-    /// the run record. Survivors fail the lease and keep their record; the slot's clean
-    /// kills again, and leaves the slot dirty if they still survive.
+    /// the run record. Survivors of the SIGKILL fail the lease and keep their record;
+    /// the slot's clean kills again, and leaves the slot dirty if they still survive.
+    /// Returns the processes that were alive when the grace ended.
     ///
     /// # Errors
     /// Processes of the uid survived, or the leader could not be reaped.
-    pub async fn end(&mut self, child: &mut Child, wait: Duration) -> Result<(), RuntimeError> {
+    pub async fn end(
+        &mut self,
+        child: &mut Child,
+        wait: Duration,
+        grace: Duration,
+    ) -> Result<Vec<Survivor>, RuntimeError> {
         let uid = self.uid;
-        let ended = tokio::task::spawn_blocking(move || uid::end(uid, wait)).await;
-        let ended = ended
-            .map_err(|e| e.to_string())
-            .and_then(|e| e.map_err(|e| e.to_string()));
+        let ended = tokio::task::spawn_blocking(move || {
+            // launchd's own agents run as the uid whatever the lease did (a system
+            // helper for the home's disk image, for one): they are not waited for or
+            // named, as in the slot's clean. They are listed before the bootout empties
+            // the list, and not at all without a grace, which looks at no process.
+            let own = grace::for_round(grace, || host::launchds_own(uid));
+            // The domain first, so that launchd starts none of its jobs again while the
+            // processes are asked to end: those would be taken for ones that ignored it.
+            uid::bootout(uid, wait.min(uid::BOOTOUT_WITHIN));
+            let round = term_uid(
+                uid,
+                grace,
+                &mut || {
+                    let mut pids = uid::processes(uid).map_err(|e| e.to_string())?;
+                    pids.retain(|pid| !own.contains(pid));
+                    Ok(pids)
+                },
+                LEASE_LOOK,
+            );
+            let (survivors, ()) = grace::then_kill(round, "the SIGTERM round", |_| {
+                uid::kill_all(uid, wait).map_err(|e| e.to_string())
+            })?;
+            Ok::<_, String>(survivors)
+        })
+        .await;
+        let ended = ended.map_err(|e| e.to_string()).and_then(|e| e);
         // Ended or not, the drop does not kill again: the slot's clean does.
         self.armed = false;
-        if let Err(why) = ended {
-            return Err(RuntimeError::Failed(why));
-        }
+        let survivors = ended.map_err(RuntimeError::Failed)?;
         let _ = std::fs::remove_file(&self.record);
         if tokio::time::timeout(wait, child.wait()).await.is_err() {
             tracing::warn!(
@@ -495,9 +601,45 @@ impl UidWatch {
         child
             .wait()
             .await
-            .map(drop)
+            .map(|_| survivors)
             .map_err(|e| RuntimeError::Failed(format!("reap the action: {e}")))
     }
+}
+
+/// The wait between two looks at the uid's processes while a lease's end waits for them
+/// to answer SIGTERM.
+const LEASE_LOOK: Duration = Duration::from_millis(20);
+
+/// SIGTERM to every process of `uid`, then `live` (the pids to wait for) every `look`
+/// until none is left or `grace` has passed ([`grace::term_first`]): the processes
+/// still alive then, named before the kill that follows; the system's own helpers
+/// ([`procs::is_system_binary`]) are not counted. Nothing is sent for a grace of
+/// zero.
+///
+/// # Errors
+/// The signal could not be sent, or `live` failed.
+pub(crate) fn term_uid(
+    uid: u32,
+    grace: Duration,
+    live: &mut dyn FnMut() -> Result<Vec<i32>, String>,
+    look: Duration,
+) -> Result<Vec<Survivor>, String> {
+    let started = Instant::now();
+    // The system's own helpers (an attached disk image's) do not end on SIGTERM and are
+    // not the action's: neither waited for nor named ([`procs::is_system_binary`]).
+    let mut actions = || {
+        let mut pids = live()?;
+        pids.retain(|pid| !procs::executable_of(*pid).is_some_and(|p| procs::is_system_binary(&p)));
+        Ok(pids)
+    };
+    grace::term_first(
+        grace,
+        &mut || uid::term(uid).map_err(|e| e.to_string()),
+        &mut actions,
+        &mut |pid| Survivor::of(pid, procs::command_of(pid)),
+        &mut || started.elapsed(),
+        &mut || std::thread::sleep(look),
+    )
 }
 
 impl Drop for UidWatch {
@@ -577,6 +719,8 @@ fn resolve(user: &SlotUser, program: &Path) -> io::Result<Ready> {
         folders,
         entry,
         rules,
+        baseline: assert::Baseline::new(),
+        pool: assert::no_pool(),
     })
 }
 
@@ -652,6 +796,8 @@ mod tests {
                 folders: PathBuf::from("/nonexistent"),
                 entry: Entry::default(),
                 rules: String::new(),
+                baseline: assert::Baseline::new(),
+                pool: 0..=0,
             })
             .collect()
     }
@@ -710,6 +856,34 @@ mod tests {
             "the drop cleaned the slot"
         );
         slot.release().await;
+    }
+
+    /// Catches a lease end (`UidWatch::end`) and a slot clean (C3) that stop at a SIGTERM
+    /// round that failed (the uid's process table could not be read): both run their
+    /// kill through `grace::then_kill` after `term_uid`, whose `live` fails here at its
+    /// first look, so that no signal is sent. The kill must still run, once, with no
+    /// survivor named. (The callers' bodies need a real uid and `launchctl`, so they are
+    /// covered by the Mac job `slot-term`; this is their shared sequence.)
+    #[test]
+    fn the_kill_runs_when_the_term_round_of_a_lease_end_or_a_slot_clean_fails() {
+        for what in ["the SIGTERM round", "slot clean"] {
+            let kills = std::cell::Cell::new(0);
+            let round = term_uid(
+                u32::MAX,
+                Duration::from_secs(2),
+                &mut || Err("process table".to_owned()),
+                Duration::from_millis(1),
+            );
+            assert!(round.is_err());
+            let (survivors, ()) = grace::then_kill(round, what, |ignored| {
+                assert!(ignored.is_empty());
+                kills.set(kills.get() + 1);
+                Ok(())
+            })
+            .expect("the kill ran");
+            assert!(survivors.is_empty());
+            assert_eq!(kills.get(), 1, "{what}");
+        }
     }
 
     /// Catches a slot lease handed a simulator (it would be made in root's device set,

@@ -35,7 +35,7 @@ fn record(result: Digest, closure: &[Digest]) -> ActionRecord {
 }
 
 /// Catches: an eviction that leaves the action-cache entries naming a removed blob
-/// (mutant: no action scan), so a hit would wait for the store to answer for an
+/// (defect: no action scan), so a hit would wait for the store to answer for an
 /// object it no longer has; one that removes only the first blob of an object, or a
 /// blob of an object not named; and one that drops an entry whose blobs all stay.
 #[test]
@@ -90,12 +90,12 @@ fn evict_drops_blobs_and_naming_actions() {
 }
 
 /// Catches: an eviction that matches a blob by anything but its current location:
-/// - one that compares only the sequence number (mutant `o.seq() == x.seq()`): a blob
+/// - one that compares only the sequence number (`o.seq() == x.seq()`): a blob
 ///   healed into the same sequence number of a later epoch, as a restarted writer
 ///   numbers its objects, would go with the object it left;
-/// - one that also drops the blobs of other unreachable objects (mutant: match on
+/// - one that also drops the blobs of other unreachable objects (defect: match on
 ///   "named or marked");
-/// - one that leaves the evicted object's mark (mutant: no clear), so a later
+/// - one that leaves the evicted object's mark (defect: no clear), so a later
 ///   `ObjectUnreachable` on it would count no loss.
 #[test]
 fn evict_keeps_blob_healed_elsewhere() {
@@ -160,7 +160,7 @@ fn evict_keeps_blob_healed_elsewhere() {
     );
 }
 
-/// Catches: an eviction that leaves `losses` (mutant: no bump), so a reader that
+/// Catches: an eviction that leaves `losses` (defect: no bump), so a reader that
 /// remembered "these blobs are held" before it would keep trusting that; one that
 /// counts per blob or per object named instead of per object that held a blob; and a
 /// retry that counts again.
@@ -180,7 +180,7 @@ fn evict_raises_losses() {
     assert_eq!(m.losses(), before + 2, "a retry counted again");
 }
 
-/// Catches: an eviction that removes a staged object's blobs (mutant: the staged guard
+/// Catches: an eviction that removes a staged object's blobs (defect: the staged guard
 /// removed). Its only copy is its block on the tier, which the store never held, so
 /// an evictor or a start-up pass that found no file must not take it away. An object
 /// named with it is still evicted.
@@ -335,7 +335,7 @@ fn evict_of_nothing_held_changes_nothing() {
 
 /// Catches the start-up pass's question "which objects does the index name?" answered
 /// wrongly: an object named only by a blob's old location kept after the blob healed
-/// elsewhere (mutant: names taken from the unreachable marks too), so the pass would
+/// elsewhere (defect: names taken from the unreachable marks too), so the pass would
 /// keep an orphan; a staged object left out, so the pass would delete a file the
 /// flusher just wrote; or an object a blob still names left out.
 #[test]

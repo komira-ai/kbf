@@ -84,7 +84,7 @@ fn adopted_records_are_indexed_at_their_object_and_offset() {
 /// Catches: an adoption that replaces an entry already indexed, which would point a blob
 /// written while the rebuild ran (or one a read healed) back at an older copy: a blob held
 /// at a reachable object, and one held at an unreachable one, are both left as they are,
-/// and counted as kept. Mutant seen red: `adopt_segment` inserting unconditionally.
+/// and counted as kept. Catches: `adopt_segment` inserting unconditionally.
 #[test]
 fn adopt_never_replaces_an_entry_already_indexed() {
     let mut m = meta();
@@ -126,7 +126,7 @@ fn adopt_never_replaces_an_entry_already_indexed() {
 /// Catches: a rebuild that indexes the objects its own node is writing (a race with its
 /// own puts, whose commit then reads `Duplicate` or fights the adoption): an object of the
 /// current node writer is refused and changes nothing; an object of an earlier boot of the
-/// same member, or of another member, is taken. Mutant seen red: no current-writer check.
+/// same member, or of another member, is taken. Catches: no current-writer check.
 #[test]
 fn adopt_is_refused_for_the_current_writer() {
     let mut m = meta();
@@ -153,7 +153,7 @@ fn adopt_is_refused_for_the_current_writer() {
 
 /// Catches: an adoption of an object of an epoch this log never allocated (epoch zero, or
 /// one past the last): a later `AllocEpoch` would hand its writer out again, and two keys
-/// would be named alike. Refused, and changes nothing. Mutant seen red: the epoch check
+/// would be named alike. Refused, and changes nothing. Catches: the epoch check
 /// removed.
 #[test]
 fn adopt_is_refused_for_an_unallocated_epoch() {
@@ -173,7 +173,7 @@ fn adopt_is_refused_for_an_unallocated_epoch() {
 /// Catches: an adopted object whose writer the log then refuses to hear about: a read
 /// that fails on it cannot be marked unreachable (the blob would be served as present for
 /// ever), and its loss cannot be forgotten. Both are accepted after an adoption, and
-/// refused before one. Mutant seen red: `adopted_writers` never filled.
+/// refused before one. Catches: `adopted_writers` never filled.
 #[test]
 fn an_adopted_objects_writer_is_known_afterwards() {
     let mut m = meta();

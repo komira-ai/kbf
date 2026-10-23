@@ -126,7 +126,7 @@ fn a_token_decodes_to_where_it_was_made_and_nothing_else_decodes() {
     }
 }
 
-/// Catches (mutant "skip the re-check": `still_authorized` always `Ok`): a page built
+/// Catches (defect "skip the re-check": `still_authorized` always `Ok`): a page built
 /// from a record that gained an instance name after the reader was allowed on its
 /// names, or from another record made under the key since.
 #[test]
@@ -157,7 +157,7 @@ fn a_record_that_changed_since_its_authorization_is_not_read() {
     assert_eq!(digest_text(&d(1)), format!("{}-1", "01".repeat(32)));
 }
 
-/// Catches (mutant "the record's instances only": `reader_names` without the rows'):
+/// Catches (defect "the record's instances only": `reader_names` without the rows'):
 /// a row whose instance the record does not hold left out of the names a reader is
 /// asked about, so a page of it is served on the record's names alone (the second
 /// layer: the recorder never sets such a row, `kbf-invocation`'s `tests/bound.rs`).

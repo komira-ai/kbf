@@ -26,11 +26,11 @@ async fn open(fs: &FaultFs, new: u64) -> Log {
 }
 
 /// Catches: a version handle that is not the log's version, which a node reports to its
-/// frontend at every heartbeat (`Joiner::with_log`). It reads 1 for a new log (mutant: a
-/// handle that starts at `RUNS`), follows a raise taken after the handle (mutant: no store
+/// frontend at every heartbeat (`Joiner::with_log`). It reads 1 for a new log (defect: a
+/// handle that starts at `RUNS`), follows a raise taken after the handle (defect: no store
 /// in `raise_machine_version`), stays put for a raise that commits nothing, and for one the
-/// disk refuses (mutant: the store before the proposal), and reads the raised version of a
-/// log opened again (mutant: the handle starting at 1 whatever the log replayed).
+/// disk refuses (defect: the store before the proposal), and reads the raised version of a
+/// log opened again (defect: the handle starting at 1 whatever the log replayed).
 #[tokio::test(start_paused = true)]
 async fn the_version_handle_follows_the_machine_version() {
     let fs = FaultFs::new();

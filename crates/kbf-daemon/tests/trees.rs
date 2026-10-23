@@ -250,7 +250,7 @@ async fn the_trees_files_are_not_writable_and_directories_are_readable() {
 }
 
 /// The measure: what a lease costs to set up no longer scales with the tree. Catches the
-/// tree being linked per lease (the "no classifier" mutant): the second lease over a
+/// tree being linked per lease (defect "no classifier"): the second lease over a
 /// 1,500-file tree makes the same number of link calls as over a 300-file tree, and that
 /// number is the small files; the control without trees makes one per file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -368,7 +368,7 @@ async fn a_leases_phases_count_its_reads_directories_links_and_copies() {
 }
 
 /// Catches a build per lease: two leases that want one tree at once share one build
-/// (the "no single flight" mutant builds twice and reads every blob twice). The CAS is
+/// (defect "no single flight" builds twice and reads every blob twice). The CAS is
 /// stalled so the second lease is certain to find the first one building.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_concurrent_leases_share_one_build() {
@@ -443,8 +443,8 @@ fn hidden(dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Nodes with an output or the working directory in them are not trees (the "ignore
-/// outputs" mutant mounts a tree the action must write to), but the nodes below and
+/// Nodes with an output or the working directory in them are not trees (defect "ignore
+/// outputs" mounts a tree the action must write to), but the nodes below and
 /// beside them still are when they are clean; a node under an output directory is not
 /// either; a working directory beside a tree leaves it alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -530,7 +530,7 @@ async fn a_hit_makes_a_tree_the_most_recent() {
 }
 
 /// The size rule is `>=` and counts files and symlinks, not directories: 255 files are
-/// linked, 256 are a tree (the off-by-one mutants of the comparison fail one side).
+/// linked, 256 are a tree (an off-by-one in the comparison fails one side).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_threshold_is_files_at_or_over_the_flag() {
     let kit = kit("trees-threshold", |_| {});
@@ -583,7 +583,7 @@ async fn a_node_the_store_cannot_hold_or_name_is_linked() {
 }
 
 /// Unpinned trees are evicted by recency once over budget, never one a lease holds
-/// (the "evict pinned" mutant removes a mounted tree), and the evicted tree is gone from
+/// (defect "evict pinned" removes a mounted tree), and the evicted tree is gone from
 /// disk. Each tree is 300 files of 2,890 bytes together; the budget holds two.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn eviction_takes_the_least_recent_unpinned_tree_and_never_a_pinned_one() {

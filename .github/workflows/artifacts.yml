@@ -10,21 +10,27 @@
 #
 # A pull request runs none of it unless it carries the label `needs-artifacts` (add the
 # label to get the files; every build and sums job carries the same condition, so an unlabelled
-# pull request's run is skipped without queueing a runner). The merge queue and pushes
-# are unchanged.
+# pull request's run is skipped without queueing a runner). The merge queue is unchanged.
 #
 # On a pull request or in the merge queue this is a build check: everything is built,
-# signed, packaged and summed, and nothing is attested. On a push to main, the attest jobs sign build provenance for every file and an SBOM
+# signed, packaged and summed, and nothing is attested. On a push to main this workflow is the
+# second stage of the one pipeline (pipeline.yml calls it, `workflow_call`, after ci): the
+# attest jobs sign build provenance for every file and an SBOM
 # attestation for every tarball, per platform group (Linux does not wait for the macOS
 # runners), and the verify jobs then check them, for the branch
-# that was pushed, as the planned deployment job is to. Only attest may hold `id-token:
+# that was pushed, as the planned deployment job is to. In a called workflow `github.event_name`
+# and `github.ref` are the caller's, so a call from the pipeline reads as the push it is. Only
+# attest may hold `id-token:
 # write` and `attestations: write`, and only under its exact `if:` (the workflow lint,
 # crates/kbf-integration-test/tests/workflows, requires both; crates/kbf-integration-test/tests/release_artifacts
-# pins the set of files built and attested).
+# pins the set of files built and attested). The pipeline grants the scopes to its call of this
+# workflow and no other; the jobs here still ask for only their own.
 #
-# The files are kept as workflow artifacts for 90 days, GitHub's limit. A release
-# (release.yml, on a pushed `v*` tag) attaches these exact files for a commit on main,
-# checked again against these attestations as refs/heads/main's, and never rebuilds. The
+# The files are kept as workflow artifacts for 90 days, GitHub's limit. The next stages of the
+# pipeline read them from the same run (beta installs and tests the kbf of the linux-x86_64
+# tarball), and the release (release.yml, started by the pipeline's success) attaches these
+# exact files for a commit on main, checked again against these attestations as
+# refs/heads/main's, and never rebuilds. The
 # deployment job and the node's SHA-256 check are planned, not built
 # (docs/design/mac-node-provisioning.md sections 4.1 and 4.2).
 name: artifacts
@@ -34,21 +40,18 @@ on:
     # `labeled`: adding `needs-artifacts` to an open pull request starts the build.
     types: [opened, synchronize, reopened, labeled]
   merge_group:
-  push:
-    branches: [main]
+  workflow_call:
 
 permissions: {}
 
-# The release pipeline runs one build at a time: every push and merge-queue run shares the one
-# group `artifacts-push`, and a RUNNING build is never cancelled. GitHub keeps one pending
-# run per group, so under a burst of merges a newer pending commit replaces an older one,
-# which is then never built here; release.yml refuses to release a commit that has no
-# successful main push run of this workflow (cargo xtask release locate), so a skipped
-# commit is never released, the next one is. A pull request's label build is a build check,
-# not the release pipeline: it has its own group per pull request, and a newer run of the
-# same pull request replaces its older one.
+# A merge-queue run shares the one group `artifacts-merge-queue` and a RUNNING build is never
+# cancelled (GitHub keeps one pending run per group). A pull request's label build is a build
+# check, not the release pipeline: it has its own group per pull request, and a newer run of the
+# same pull request replaces its older one. Called from the pipeline, the group is the run's
+# own: what cancels a superseded push is the pipeline's group (pipeline.yml), so this one never
+# holds up a newer push.
 concurrency:
-  group: artifacts-${{ github.event_name == 'pull_request' && format('pr-{0}', github.ref) || 'push' }}
+  group: artifacts-${{ github.event_name == 'pull_request' && format('pr-{0}', github.ref) || github.event_name == 'merge_group' && 'merge-queue' || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -60,8 +63,8 @@ env:
   CYCLONEDX_SHA256_AARCH64_DARWIN: 4c53dfa21e70b65bf7f8d2592aadde3bcb02c1a40b6ec63b877e5ca65a29e180
   CYCLONEDX_SHA256_X86_64_LINUX: fb8dbee9f182173e062a64a387b21a0badc6fab8b2abf9294973f012972bf6d8
   CYCLONEDX_SHA256_AARCH64_LINUX: 7bf131ca5389b07a4f10c182bcf8a5ad339d64408b6f0d8f6834a0bd6120a06a
-  # The kbf-installer package of each job (the deb of a Linux job, the .pkg of the macOS one): nfpm builds the deb, and its trust directory
-  # holds a pinned gh. Both are release archives checked against their SHA-256 before use (the
+  # The kbf-installer and kbf packages of each job (the debs of a Linux job, the .pkg of the macOS one): nfpm builds the debs, and the
+  # installer's trust directory holds a pinned gh. Both are release archives checked against their SHA-256 before use (the
   # values the projects publish with them, recomputed when pinned; the archive's, not the program's).
   GH_VERSION: 2.102.0
   GH_SHA256_X86_64_LINUX: bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
@@ -262,6 +265,10 @@ jobs:
       # pushed branch on a push). nfpm builds it twice and the bytes must match; a fresh Ubuntu
       # container installs, runs and removes it; `pkg-asset` then refuses it unless it holds the
       # binary of the tarball checked above and trusts that branch, and lists it in SHA256SUMS.
+      # The kbf package is built from the same configuration step: this job's `kbf` at /usr/bin/kbf
+      # and the units of the modes, depending on the kbf-installer package of the same version.
+      # nfpm builds it twice too, and `pkg-kbf-asset` refuses it unless its kbf is the one of the
+      # kbf tarball checked above, and lists it in SHA256SUMS.
       - name: Fetch the pinned gh, for the package's trust directory
         run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_amd64.tar.gz" --sha256 "$GH_SHA256_X86_64_LINUX" --out "$RUNNER_TEMP/tools/gh" --extract tar.gz --member "gh_${GH_VERSION}_linux_amd64/bin/gh"
       - name: Fetch nfpm (pinned version, checked by SHA-256)
@@ -273,13 +280,17 @@ jobs:
       - name: Write the package's trust directory
         run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
       - name: Write the nfpm configuration
-        run: cargo xtask pkg-config --binary "target/$TARGET/release/kbf-installer" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --platform linux-x86_64 --version-of "target/$TARGET/release/kbf-installer" --out target/pkg
-      - name: Build the deb and the rpm, each twice
+        run: cargo xtask pkg-config --binary "target/$TARGET/release/kbf-installer" --kbf "target/$TARGET/release/kbf" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --platform linux-x86_64 --version-of "target/$TARGET/release/kbf-installer" --out target/pkg
+      - name: Build the deb and the rpm of kbf-installer, each twice
         run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/nfpm.yaml --out target/pkg/out
+      - name: Build the deb and the rpm of kbf, each twice
+        run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/kbf/nfpm.yaml --out target/pkg/kbf-out
       - name: Install, run, remove and purge the deb in a fresh Ubuntu container
         run: cargo xtask pkg-install-test --package target/pkg/out --format deb --listing target/pkg/listing.txt --image-dir packaging/linux/test/ubuntu --probe "/usr/share/kbf-installer/trust/gh --version::gh version $GH_VERSION" --probe "kbf-installer --version --json::${GITHUB_SHA:0:12}"
       - name: The deb is the attested binary and trusts this branch, and is an asset
         run: cargo xtask pkg-asset --package target/pkg/out --platform linux-x86_64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-x86_64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --gh "$RUNNER_TEMP/tools/gh" --out dist
+      - name: The kbf deb is the attested kbf with the units of the modes, and is an asset
+        run: cargo xtask pkg-kbf-asset --package target/pkg/kbf-out --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" --out dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-x86_64
@@ -364,6 +375,7 @@ jobs:
       # pushed branch on a push). nfpm builds it twice and the bytes must match; a fresh Ubuntu
       # container installs, runs and removes it; `pkg-asset` then refuses it unless it holds the
       # binary of the tarball checked above and trusts that branch, and lists it in SHA256SUMS.
+      # The kbf package is built and made an asset beside it (see linux-x86_64).
       - name: Fetch the pinned gh, for the package's trust directory
         run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_arm64.tar.gz" --sha256 "$GH_SHA256_AARCH64_LINUX" --out "$RUNNER_TEMP/tools/gh" --extract tar.gz --member "gh_${GH_VERSION}_linux_arm64/bin/gh"
       - name: Fetch nfpm (pinned version, checked by SHA-256)
@@ -375,13 +387,17 @@ jobs:
       - name: Write the package's trust directory
         run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
       - name: Write the nfpm configuration
-        run: cargo xtask pkg-config --binary "target/$TARGET/release/kbf-installer" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --platform linux-arm64 --version-of "target/$TARGET/release/kbf-installer" --out target/pkg
-      - name: Build the deb and the rpm, each twice
+        run: cargo xtask pkg-config --binary "target/$TARGET/release/kbf-installer" --kbf "target/$TARGET/release/kbf" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --platform linux-arm64 --version-of "target/$TARGET/release/kbf-installer" --out target/pkg
+      - name: Build the deb and the rpm of kbf-installer, each twice
         run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/nfpm.yaml --out target/pkg/out
+      - name: Build the deb and the rpm of kbf, each twice
+        run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/kbf/nfpm.yaml --out target/pkg/kbf-out
       - name: Install, run, remove and purge the deb in a fresh Ubuntu container
         run: cargo xtask pkg-install-test --package target/pkg/out --format deb --listing target/pkg/listing.txt --image-dir packaging/linux/test/ubuntu --probe "/usr/share/kbf-installer/trust/gh --version::gh version $GH_VERSION" --probe "kbf-installer --version --json::${GITHUB_SHA:0:12}"
       - name: The deb is the attested binary and trusts this branch, and is an asset
         run: cargo xtask pkg-asset --package target/pkg/out --platform linux-arm64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --gh "$RUNNER_TEMP/tools/gh" --out dist
+      - name: The kbf deb is the attested kbf with the units of the modes, and is an asset
+        run: cargo xtask pkg-kbf-asset --package target/pkg/kbf-out --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" --out dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-arm64
@@ -609,6 +625,14 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-kbf-installer-deb-linux-x86_64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/kbf-installer-${GITHUB_SHA}-linux-x86_64.deb.sigstore.json"
+      - id: provenance-kbf-deb-linux-x86_64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-${{ github.sha }}-linux-x86_64.deb
+      - name: Name the bundle of the kbf package for linux-x86_64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-deb-linux-x86_64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-${GITHUB_SHA}-linux-x86_64.deb.sigstore.json"
       - id: provenance-kbf-daemon-linux-arm64
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -657,6 +681,14 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-kbf-installer-deb-linux-arm64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/kbf-installer-${GITHUB_SHA}-linux-arm64.deb.sigstore.json"
+      - id: provenance-kbf-deb-linux-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-${{ github.sha }}-linux-arm64.deb
+      - name: Name the bundle of the kbf package for linux-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-deb-linux-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-${GITHUB_SHA}-linux-arm64.deb.sigstore.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bundles-linux
@@ -790,11 +822,15 @@ jobs:
       - name: Verify as the planned deployment job is to
         env:
           GH_TOKEN: ${{ github.token }}
-        run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_WORKFLOW_REF" --source-ref "$GITHUB_REF" --commit "$GITHUB_SHA" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl"
+        run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_REPOSITORY/.github/workflows/artifacts.yml" --source-ref "$GITHUB_REF" --commit "$GITHUB_SHA" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl"
       - name: The signed linux-x86_64 package holds the attested binary and trusts this branch
         run: cargo xtask pkg-asset --verify-only --package "dist/kbf-installer-$GITHUB_SHA-linux-x86_64.deb" --platform linux-x86_64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-x86_64.tar.gz" --expect-ref "$GITHUB_REF"
       - name: The signed linux-arm64 package holds the attested binary and trusts this branch
         run: cargo xtask pkg-asset --verify-only --package "dist/kbf-installer-$GITHUB_SHA-linux-arm64.deb" --platform linux-arm64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$GITHUB_REF"
+      - name: The signed linux-x86_64 kbf package holds the attested kbf and the units of the modes
+        run: cargo xtask pkg-kbf-asset --verify-only --package "dist/kbf-$GITHUB_SHA-linux-x86_64.deb" --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz"
+      - name: The signed linux-arm64 kbf package holds the attested kbf and the units of the modes
+        run: cargo xtask pkg-kbf-asset --verify-only --package "dist/kbf-$GITHUB_SHA-linux-arm64.deb" --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz"
 
   # Push to main only, after attest-darwin-arm64: the checks the planned deployment
   # job is to make (cargo xtask verify-assets, crates/xtask/src/sums.rs), for the branch
@@ -840,6 +876,6 @@ jobs:
       - name: Verify as the planned deployment job is to
         env:
           GH_TOKEN: ${{ github.token }}
-        run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_WORKFLOW_REF" --source-ref "$GITHUB_REF" --commit "$GITHUB_SHA" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl"
+        run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_REPOSITORY/.github/workflows/artifacts.yml" --source-ref "$GITHUB_REF" --commit "$GITHUB_SHA" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl"
       - name: The signed darwin-arm64 package holds the attested binary and trusts this branch
         run: cargo xtask pkg-macos-asset --verify-only --package "dist/kbf-installer-$GITHUB_SHA-darwin-arm64.pkg" --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-darwin-arm64.tar.gz" --expect-ref "$GITHUB_REF"

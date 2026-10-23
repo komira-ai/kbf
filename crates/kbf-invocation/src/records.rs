@@ -150,7 +150,9 @@ struct Waiter {
 impl Waiter {
     /// The index of the waiter's row in `inv`, while the row still shows this call: a
     /// later Execute of the same action replaces the row, and this operation's events
-    /// no longer reach it.
+    /// no longer reach it. (A later Execute under the same name, as a farm over a state
+    /// store gives every caller of an operation, takes the row from the waiter itself:
+    /// `Records::detach_row`.)
     fn row(&self, inv: &Invocation) -> Option<usize> {
         let i = self.row?;
         (inv.rows[i].operation.as_deref() == Some(self.name.as_str())).then_some(i)
@@ -597,7 +599,13 @@ impl Records {
         let mut row = ActionRow::new(action, call, how, Some(name.clone()));
         row.operation_id = operation.ok();
         let index = match inv.row_of(&action) {
-            Some(i) => self.replace_row(key, i, row),
+            Some(i) => {
+                let replaced = self.replace_row(key, i, row);
+                if replaced.is_some() {
+                    self.detach_row(key, i);
+                }
+                replaced
+            }
             None => self.add_row(key, row),
         };
         // A cached answer is the action's end; any other waits on an operation.
@@ -673,6 +681,19 @@ impl Records {
         inv.refresh_row(i);
         self.recount(key);
         Some(i)
+    }
+
+    /// Stops the waiters of `key`'s record that show row `i` from reaching it, once a later
+    /// Execute has replaced the row: their name no longer tells them from the later call's,
+    /// since a farm over a state store gives every caller of an operation its name.
+    fn detach_row(&mut self, key: &RecordKey, i: usize) {
+        for op in self.operations.values_mut() {
+            for waiter in &mut op.waiters {
+                if (&waiter.key, waiter.row) == (key, Some(i)) {
+                    waiter.row = None;
+                }
+            }
+        }
     }
 
     /// Copies `attempts` into row `i` of `key`'s record if they fit; else the row

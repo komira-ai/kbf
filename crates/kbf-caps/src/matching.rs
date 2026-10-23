@@ -8,7 +8,7 @@
 //! | `isa_level` | at least, within the family (`x86-64-v3` is served by v3 and v4) |
 //! | `cpu.feature` (repeatable) | subset: every requested feature is present |
 //! | `cpus`, `mem_gib`, `nvme_gib`, `gpu` | countable: the node has at least the amount |
-//! | `os`, `os_image`, `cpu.model`, `page_size` | exact |
+//! | `os`, `os_image`, `cpu.model`, `page_size`, `gpu.kind` | exact |
 //! | `xcode` | membership: the node reports a set (one entry per installed Xcode build) and the request names one |
 //! | `vm.image` | membership on the digest: the request names `<name>@sha256:<64 hex>`, the node reports one entry in that form per image it holds, and only the `sha256:<hex>` parts are compared |
 //! | `ios.device` (`1`) with `ios.device.<attribute>` | one device: the node reports one `ios.device` entry per ready device, and **one** of them must satisfy every attribute (exact) |
@@ -84,7 +84,7 @@ impl fmt::Display for Consumable {
 }
 
 /// Keys compared as exact strings.
-const EXACT_KEYS: [&str; 4] = ["os", "os_image", "cpu.model", "page_size"];
+const EXACT_KEYS: [&str; 5] = ["os", "os_image", "cpu.model", "page_size", "gpu.kind"];
 
 /// Keys a node reports as a set and a request names one member of.
 const MEMBER_KEYS: [&str; 2] = ["xcode", VM_IMAGE_KEY];

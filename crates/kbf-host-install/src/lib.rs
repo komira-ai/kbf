@@ -12,12 +12,12 @@
 //! ([`request`]):
 //!
 //! - `install kbf=<version> from <channel>`: install that version of the `kbf` package
-//!   from a channel the root-owned allowlist names ([`config`]), never an older version
-//!   than the installed one ([`debver`]), through `apt-get` restricted to the channel's one
+//!   from a channel the root-owned allowlist names ([`config`]), older versions included (a rollback is an install; the
+//!   same version is a no-op, [`debver`]), through `apt-get` restricted to the channel's one
 //!   signed source. The process sshd starts checks the request and starts ONE transient
 //!   systemd unit an ssh drop cannot kill; the unit runs this program again, takes the install
 //!   lock and holds it for both apt steps ([`plan`], [`host`]);
-//! - `query`: print what is installed, what runs and whether an install is in progress (the
+//! - `query`: print what is installed, what runs, which node this is and whether an install is in progress (the
 //!   install lock held, an install unit not over, or the dpkg lock held).
 //!
 //! Nothing runs through a shell: every process is an `execve` with an explicit argument
@@ -25,6 +25,15 @@
 //! ([`outcome`], every line with a `result`); the exit status is 0 (done), 2 (refused:
 //! nothing ran) or 3 (failed). Every invocation appends one line to the audit log
 //! ([`audit`]).
+//!
+//! # A Mac
+//!
+//! On macOS ([`mac`]) the same two requests install the attested release tarball into the kit
+//! layout (`/usr/local/kbf/releases/<commit>/kbf`, links `current` and `previous`) and restart
+//! the daemon's launchd job on it. The install verb checks the release on one root-owned
+//! copy, launches a one-shot launchd job that does the swap and the restart, and returns; the
+//! result is the `apply` field of `query` (`docs/deploy/host-install.md`). The platform picks
+//! the side; both are compiled everywhere.
 //!
 //! The paths this program reads as root are constants of [`host::Host::production`]. The
 //! only way to point them elsewhere is a `cfg(test)` constructor: no environment variable
@@ -39,6 +48,8 @@ mod config;
 mod debver;
 mod host;
 mod locks;
+pub(crate) mod mac;
+mod node_id;
 mod outcome;
 mod plan;
 mod request;
@@ -75,10 +86,23 @@ pub mod contract {
     }
 }
 
+/// The Mac's tool command lines and the readers of what the tools print, with the runner
+/// that runs them, for the test that runs them on a real Mac (`tests/real_mac.rs`). Nothing
+/// here is for production code.
+#[doc(hidden)]
+pub mod mac_tools {
+    pub use crate::mac::{fetch, release, tools};
+    pub use crate::runner::{Cmd, Exec, Identity, Runner, SystemRunner};
+}
+
 /// The program: handle `SSH_ORIGINAL_COMMAND` against the production paths and exit with
 /// the status of the answer.
 #[must_use]
 pub fn main() -> ExitCode {
+    // Both sides are compiled everywhere, so the Linux build checks the Mac code.
+    if cfg!(target_os = "macos") {
+        return ExitCode::from(mac::main_process());
+    }
     let code = host::dispatch(
         &host::Host::production(),
         &runner::SystemRunner,

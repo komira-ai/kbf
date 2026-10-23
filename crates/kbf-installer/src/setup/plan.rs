@@ -1,8 +1,7 @@
-//! The plan `setup` carries out, in two parts around the first release: before it the accounts,
-//! the directories, the tokens and `installer.toml` (the installer needs its settings to
-//! fetch); after it `kbf.toml` and the units. `kbf.toml` is the last file written and the
-//! units come after it, so a crash anywhere before leaves no config that passes the units'
-//! `ConditionPathExists=`.
+//! The plan `setup` carries out, in two parts around the state database's schema: before it the
+//! accounts, the directories, the tokens and `installer.toml`; after it `kbf.toml` and the
+//! units. `kbf.toml` is the last file written and the units come after it, so a crash anywhere
+//! before leaves no config that passes the units' `ConditionPathExists=`.
 //!
 //! Every step is added only where the host differs, so a second run with the same flags has
 //! an empty plan.
@@ -441,8 +440,8 @@ fn create_fetch_user(p: &mut Pl<'_, '_>, os: &dyn Os, name: &str) -> Result<(), 
     Ok(())
 }
 
-/// The part of the plan before the first release: accounts, directories, the tokens and
-/// `installer.toml`. Reads the host, changes nothing.
+/// The part of the plan before the state database's schema: accounts, directories, the tokens
+/// and `installer.toml`. Reads the host, changes nothing.
 pub fn before_release(
     os: &dyn Os,
     exec: &dyn Exec,
@@ -695,11 +694,9 @@ fn frontend_file(
     config_file(p, label, &path, existed, decision, owner, notes)
 }
 
-/// The part after the first release: `kbf.toml` (on an all-in-one host `frontend.toml` before
-/// it), then the units. `released` says whether a release is installed (or, in a dry run, would
-/// be). Reads the host, changes nothing.
-/// The part after the first release: `kbf.toml`, then the units. `released` says whether a
-/// release is installed (or, in a dry run, would be). Reads the host, changes nothing.
+/// The part after the state database's schema: `kbf.toml` (on an all-in-one host `frontend.toml`
+/// before it), then the units. `released` says whether there is a `kbf` to start: a release is
+/// installed already, or `/usr/bin/kbf` is present. Reads the host, changes nothing.
 pub fn after_release(
     os: &dyn Os,
     exec: &dyn Exec,
@@ -730,7 +727,7 @@ pub fn after_release(
         token_file: v.token_file.as_ref().map(|_| paths::enroll_token(platform)),
         api_token_file: serves_api(node_mode).then_some(paths::api_token(platform)),
         state_store: v.database.as_deref().filter(|_| sibling.is_none()),
-        // A Mac's keys are kbf-mac-provision's: checked below, never written.
+        // A Mac's `kbf.toml` is kbf-mac-provision's, which renders no update keys.
         update: (takes_orders(v.mode) && platform != Platform::MacOs).then_some(UpdateDirs {
             update_dir: &update_dir,
             orders_dir: &orders_dir,
@@ -738,16 +735,6 @@ pub fn after_release(
         extra: &node_extra,
     };
     let current = read_current(exec, kbf_toml_path)?;
-    if platform == Platform::MacOs && takes_orders(v.mode) {
-        // No file: provision has not run. A file that is not TOML is `decide`'s to name.
-        let table = current
-            .as_deref()
-            .map_or_else(|| Some(toml::Table::new()), |t| t.parse().ok());
-        if let Some(table) = table {
-            kbf_toml::check_provisioned(&table, &update_dir, &orders_dir)
-                .map_err(SetupError::NeedsOperator)?;
-        }
-    }
     // The earlier layout's file is split, not decided on: its settings came in as flags, so
     // `ours` has them, and the original is kept below before this file is replaced.
     let decision = match &ctx.earlier {
@@ -845,8 +832,8 @@ fn units(
     no_start: bool,
 ) -> Result<Vec<String>, SetupError> {
     let mut notes = Vec::new();
-    // The mode's units are started when the operator did not forbid it and a release is
-    // there to run. The installer's own service has nothing to wait for. A unit that makes a
+    // The mode's units are started when the operator did not forbid it and there is a `kbf`
+    // to start (a release is installed, or `/usr/bin/kbf` is present). The installer's own service has nothing to wait for. A unit that makes a
     // frontend is never started here: starting one takes the state database and the public
     // port, which only the operator decides.
     let start_mode = if v.mode.keeps_state_in_database() {

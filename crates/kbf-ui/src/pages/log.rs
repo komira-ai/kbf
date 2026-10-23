@@ -3,7 +3,7 @@
 //! A log is untrusted: whatever a build printed. It is shown as text in a `<pre>`
 //! (escaped by [`Html`], like every string), with the control characters that a
 //! browser or a terminal acts on written as visible symbols, and with bytes that are
-//! not UTF-8 replaced. Nothing is redacted (CEO ruling: the UI is open and shows what
+//! not UTF-8 replaced. Nothing is redacted (ruling: the UI is open and shows what
 //! the farm recorded; the page says so). At most [`LOG_SHOWN_BYTES`] are read, with a
 //! `Range` header: the LAST that many by default (`bytes=-N`, because what a failed
 //! build says is at its end), the first with `?from=start`. The page says when the log

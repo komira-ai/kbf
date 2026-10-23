@@ -94,10 +94,23 @@ pub fn effective(uid: u32) -> io::Result<Vec<i32>> {
 /// `uid` is 0, the child could not be forked or waited for, or it could not become
 /// `uid` (the caller is not root).
 pub fn kill(uid: u32) -> io::Result<()> {
+    signal(uid, libc::SIGKILL)
+}
+
+/// One round of SIGTERM, as [`kill`] sends SIGKILL: asks every process of `uid` to end.
+/// The sender ignores the signal, since macOS delivers it to the sender too.
+///
+/// # Errors
+/// As [`kill`].
+pub fn term(uid: u32) -> io::Result<()> {
+    signal(uid, libc::SIGTERM)
+}
+
+fn signal(uid: u32, sig: libc::c_int) -> io::Result<()> {
     if uid == 0 {
         return Err(io::Error::other("refusing to kill every process of root"));
     }
-    // SAFETY: the child calls only async-signal-safe functions (setuid, kill, _exit)
+    // SAFETY: the child calls only async-signal-safe functions (setuid, signal, kill, _exit)
     // before it exits, as a fork of a threaded process must.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -111,7 +124,10 @@ pub fn kill(uid: u32) -> io::Result<()> {
             if libc::setuid(uid) != 0 {
                 libc::_exit(1);
             }
-            libc::kill(-1, libc::SIGKILL);
+            if sig != libc::SIGKILL {
+                libc::signal(sig, libc::SIG_IGN);
+            }
+            libc::kill(-1, sig);
             libc::_exit(0);
         }
     }
@@ -126,7 +142,7 @@ pub fn kill(uid: u32) -> io::Result<()> {
     // macOS's kill(-1) signals the sender too, so a killer that ended by SIGKILL
     // succeeded: the signals to every other process of the uid were posted in the same
     // call. An exit of 1 is a failed setuid.
-    let killed_itself = libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL;
+    let killed_itself = libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == sig;
     let exited_clean = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
     if killed_itself || exited_clean {
         Ok(())
