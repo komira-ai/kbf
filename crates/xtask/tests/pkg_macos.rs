@@ -360,7 +360,7 @@ fn installer_places_files_and_loads_nothing() {
     );
     // With it, it runs: the job's output is the stub's arguments. The file is made by hand
     // because the package holds the stub, which has no `setup`; its path is the one real
-    // `setup` writes (kbf-installer's `setup::tests` pins that the plist's gate is it).
+    // `setup` writes (kbf-setup's `setup::tests` pins that the plist's gate is it).
     std::fs::create_dir_all(gate_dir()).unwrap();
     std::fs::write(gate(), b"# configured\n").unwrap();
     assert!(

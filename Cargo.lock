@@ -1934,6 +1934,7 @@ dependencies = [
  "kbf-oidc",
  "kbf-proto",
  "kbf-proxy",
+ "kbf-setup",
  "kbf-state",
  "kbf-testkit",
  "kbf-types",
@@ -2418,6 +2419,24 @@ dependencies = [
  "tracing-subscriber",
  "x509-parser",
  "zeroize",
+]
+
+[[package]]
+name = "kbf-setup"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "kbf-host",
+ "kbf-proxy",
+ "kbf-state",
+ "kbf-testkit",
+ "postgres",
+ "rustix",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]

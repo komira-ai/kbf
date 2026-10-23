@@ -47,7 +47,9 @@
 //!   on a child's, the installer's or the runtime's crates (`PROXY_MUST_NOT_REACH`); and any
 //!   file of `kbf-installer/src` outside `MAY_NAME_THE_PROXY`, the root helper first of all,
 //!   naming `kbf_proxy` or `proxy_verb`: the root half shares the installer's binary with the proxy verb and
-//!   nothing else.
+//!   nothing else;
+//! - any file of the setup library (`kbf-setup/src`, which `kbf-installer` re-exports) outside
+//!   `SETUP_MAY_NAME_THE_PROXY` naming `kbf_proxy`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -453,12 +455,13 @@ fn route_reaches_neither_the_frontend_nor_the_daemon() {
 /// decodes a child's protocol (`kbf-proto`), runs none of the frontend, storage or node code
 /// (`kbf-server`, `kbf-front`, `kbf-storage`, `kbf-node`, `kbf-daemon`, the binaries
 /// `kbf-cli` and `kbf-all-in-one`), and does not know the installer, its host plan or its
-/// update types (`kbf-installer`, `kbf-host`, `kbf-update`, `kbf-deploy`): the admin calls to
-/// a child are the installer's, through a trait that lives there (the proxy's one is the
-/// read-only `GET role`, for the child's term, over plain HTTP), and the installer depends on
-/// the proxy, not the other way round.
+/// update types (`kbf-installer`, `kbf-setup`, `kbf-host`, `kbf-update`, `kbf-deploy`): the
+/// admin calls to a child are the installer's, through a trait that lives there (the proxy's
+/// one is the read-only `GET role`, for the child's term, over plain HTTP), and the installer
+/// and the setup library depend on the proxy, not the other way round.
 const PROXY_MUST_NOT_REACH: &[&str] = &[
     "kbf-installer",
+    "kbf-setup",
     "kbf-host",
     "kbf-update",
     "kbf-deploy",
@@ -502,16 +505,16 @@ fn the_proxy_reaches_no_child_installer_or_runtime_crate() {
 }
 
 /// The files of `kbf-installer/src` that may name the proxy: the verb that hosts it, the
-/// settings file whose `[proxy]` table the verb reads, and the swap's real gate over the
-/// proxy's handle (`proxy/gate_real.rs`, with its tests), and the supervisor that starts the
-/// children on the ports of the proxy's upstream table (`proxy/supervisor.rs`, which also
-/// holds the real gate), the verb's own tests (`proxy_verb_tests.rs`, which start a real
-/// proxy over a migrated database), and the table `setup --proxy` writes (`setup/proxy.rs`, which
-/// builds the table the proxy would read, with the proxy's own defaults and checks). The rest of
+/// swap's real gate over the proxy's handle (`proxy/gate_real.rs`, with its tests), and the
+/// supervisor that starts the children on the ports of the proxy's upstream table
+/// (`proxy/supervisor.rs`, which also holds the real gate), the verb's own tests
+/// (`proxy_verb_tests.rs`, which start a real proxy over a migrated database and compare the
+/// deploy's copy of the proxy's port layout in `observe.rs` with the proxy's). The rest of
 /// `proxy/` is written against traits and names no proxy
 /// type. Everything else, the root helper
 /// (`helper/`, `run.rs`) first of all, runs as root and links a network stack it never runs
-/// if it names a proxy type.
+/// if it names a proxy type. The settings file whose `[proxy]` table the verb reads and the
+/// table `setup --proxy` writes are in `kbf-setup` (`SETUP_MAY_NAME_THE_PROXY`).
 const MAY_NAME_THE_PROXY: &[&str] = &[
     "proxy/gate_real.rs",
     "proxy/gate_real_tests.rs",
@@ -520,9 +523,13 @@ const MAY_NAME_THE_PROXY: &[&str] = &[
     "proxy_verb.rs",
     "proxy_verb_tests.rs",
     "proxy_verb_copies_tests.rs",
-    "installer_toml.rs",
-    "setup/proxy.rs",
 ];
+
+/// The files of `kbf-setup/src` that may name the proxy: the settings file whose `[proxy]`
+/// table the proxy verb reads (`installer_toml.rs`) and the table `setup --proxy` writes
+/// (`setup/proxy.rs`, which builds the table the proxy would read, with the proxy's own
+/// defaults and checks). `setup` runs as root; the rest of the library names no proxy type.
+const SETUP_MAY_NAME_THE_PROXY: &[&str] = &["installer_toml.rs", "setup/proxy.rs"];
 
 /// The files that may name the verb's module (`proxy_verb`): the dispatch and its tests. A path
 /// into the verb from anywhere else, `crate::proxy_verb::FIRST_FD` in the root helper for one,
@@ -599,5 +606,44 @@ fn the_root_half_of_the_installer_names_nothing_of_the_proxy() {
         violations.is_empty(),
         "these installer files name kbf_proxy, but only {MAY_NAME_THE_PROXY:?} may (the root \
          half shares the binary and nothing else): {violations:?}"
+    );
+}
+
+/// Asserts that, of the files of `kbf-setup/src`, only those in `SETUP_MAY_NAME_THE_PROXY` name
+/// `kbf_proxy`, that each of those still does, and that the scan found the library's files.
+#[test]
+fn the_setup_library_names_the_proxy_only_where_it_writes_the_table() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kbf-setup/src");
+    let mut files = Vec::new();
+    rust_files(&src, &src, &mut files);
+    // The scan sees the library, and the allowed files still name the proxy: a moved
+    // directory or a renamed module would otherwise make the check pass with nothing in it.
+    assert!(
+        files.iter().any(|f| f == "setup/mod.rs"),
+        "the setup library's files were not found under {}",
+        src.display()
+    );
+    for allowed in SETUP_MAY_NAME_THE_PROXY {
+        let text = std::fs::read_to_string(src.join(allowed))
+            .unwrap_or_else(|e| panic!("read {allowed}: {e}"));
+        assert!(
+            text.contains("kbf_proxy"),
+            "{allowed} no longer names kbf_proxy"
+        );
+    }
+    let violations: Vec<&str> = files
+        .iter()
+        .map(String::as_str)
+        .filter(|f| !SETUP_MAY_NAME_THE_PROXY.contains(f))
+        .filter(|f| {
+            std::fs::read_to_string(src.join(f))
+                .unwrap_or_else(|e| panic!("read {f}: {e}"))
+                .contains("kbf_proxy")
+        })
+        .collect();
+    assert!(
+        violations.is_empty(),
+        "these setup files name kbf_proxy, but only {SETUP_MAY_NAME_THE_PROXY:?} may: \
+         {violations:?}"
     );
 }

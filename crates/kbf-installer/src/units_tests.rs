@@ -1,5 +1,5 @@
 //! The paths the packaged units and the launchd job files run, read against the layout
-//! (`layout.rs`) that the installer makes them true with.
+//! (`kbf-setup`'s `layout.rs`) that the installer makes them true with.
 
 use std::fs;
 use std::path::{Path, PathBuf};
