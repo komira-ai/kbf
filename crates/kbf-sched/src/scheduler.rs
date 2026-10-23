@@ -2,6 +2,7 @@
 
 mod fault;
 mod give_up;
+mod handoff;
 mod hold;
 mod ids;
 pub(crate) mod loss;

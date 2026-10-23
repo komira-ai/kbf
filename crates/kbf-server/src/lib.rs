@@ -158,8 +158,8 @@ pub mod write_tier;
 pub use config::{Args, ConfigError, Role, SERVER, s3_store};
 pub use drain::{Drain, DrainStatus};
 pub use farm::{
-    ACK_WINDOW, DONE_FLOOR, EpochBump, EpochPolicy, Farm, ID_BLOCK, OWNER_CACHE_TTL,
-    SESSION_RENEWAL, StateError,
+    ACK_WINDOW, DONE_FLOOR, EpochBump, EpochPolicy, Farm, ID_BLOCK, INTAKE_POLL, ORPHAN_WAIT,
+    OWNER_CACHE_TTL, SESSION_RENEWAL, StateError,
 };
 pub use health::Readiness;
 pub use identity::{DenyList, DenyListError, Peers};

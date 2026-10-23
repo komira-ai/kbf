@@ -24,6 +24,12 @@
 //!   running is not refused. A refusal that finds its own result in the store is a
 //!   duplicate too.
 //!
+//! The memory floors a lease given up raises are written with it, each at the version read
+//! of its row and with the larger ask of the row and its own: a frontend whose kills raised
+//! a floor less far than another's never lowers it, and one that finds the row changed
+//! between its read and its write loses, and writes the give-up again from the row as it
+//! stands.
+//!
 //! A write the store applied and did not acknowledge is tried again, and finds its own work
 //! in the rows: the lease row of the grant, no lease row to give up, the result.
 //!
@@ -124,10 +130,13 @@ impl Durable {
         // before the write is taken.
         let raised = floors.raised.as_ref();
         if let Some(floor) = raised {
-            let row = floor::encode(floor).ok_or_else(|| {
+            // Another frontend may have raised the floor further: the row keeps the larger
+            // ask, and is written at the version read.
+            let (merged, cond) = self.merged_floor(floor)?;
+            let row = floor::encode(&merged).ok_or_else(|| {
                 corrupt(&floor::row_key(&floor.key), "a floor is too large to write")
             })?;
-            txn = txn.put(floor::row_key(&floor.key), row, Cond::Any);
+            txn = txn.put(floor::row_key(&floor.key), row, cond);
         }
         // A key forgotten and raised again since keeps its row.
         for key in floors
@@ -140,8 +149,9 @@ impl Durable {
         // The same for the key floor, in the same transaction.
         let key_raised = floors.key_raised.as_ref();
         if let Some(floor) = key_raised {
-            let value = self.key_floor_value(floor, summary)?;
-            txn = txn.put(floor::key_row(floor.key), value, Cond::Any);
+            let (merged, cond) = self.merged_key_floor(floor)?;
+            let value = self.key_floor_value(&merged, summary)?;
+            txn = txn.put(floor::key_row(floor.key), value, cond);
         }
         for key in floors
             .key_evicted
@@ -200,9 +210,41 @@ impl Durable {
 
     /// What a write that replaces the row at `key` must find: the version it has now, or
     /// no row.
-    fn current(&self, key: &str) -> Result<Cond, StateError> {
+    pub(super) fn current(&self, key: &str) -> Result<Cond, StateError> {
         let row = self.store.get(key)?;
         Ok(row.map_or(Cond::Absent, |row| Cond::Version(row.version)))
+    }
+
+    /// `floor` with the larger ask of its own and the stored row's, and what a write of the
+    /// row must find: the version read, or no row. A row that cannot be read counts for
+    /// nothing, and is written over.
+    fn merged_floor(&self, floor: &Floor) -> Result<(Floor, Cond), StateError> {
+        let row = self.store.get(&floor::row_key(&floor.key))?;
+        let held = row
+            .as_ref()
+            .and_then(|row| floor::decode(&row.value).ok())
+            .map_or(0, |held| held.ask);
+        let cond = row.map_or(Cond::Absent, |row| Cond::Version(row.version));
+        let merged = Floor {
+            ask: held.max(floor.ask),
+            ..floor.clone()
+        };
+        Ok((merged, cond))
+    }
+
+    /// [`Durable::merged_floor`] for a key floor.
+    fn merged_key_floor(&self, floor: &KeyFloor) -> Result<(KeyFloor, Cond), StateError> {
+        let row = self.store.get(&floor::key_row(floor.key))?;
+        let held = row
+            .as_ref()
+            .and_then(|row| floor::decode_key(&row.value).ok())
+            .map_or(0, |(held, _)| held.ask);
+        let cond = row.map_or(Cond::Absent, |row| Cond::Version(row.version));
+        let merged = KeyFloor {
+            ask: held.max(floor.ask),
+            ..floor.clone()
+        };
+        Ok((merged, cond))
     }
 
     /// A result accepted from `lease`: the operation is finished. The lease row goes if

@@ -227,9 +227,8 @@ result for one. What the code does today:
   the whole store would mark it (the writer generation, which is unchanged). A held `Start`
   reads the counter when it is written, not when it was proposed, so a daemon that
   reconnects to the same frontend does not turn its held grants stale. A node whose
-  daemon has not yet said `Hello` to the frontend (a lease taken up at a start) has no
-  counter to check, and its writes are conditional on their lease rows alone, as they
-  were.
+  daemon has not yet said `Hello` to the frontend has no counter to check, and its
+  writes are conditional on their lease rows alone, as they were.
 - **Acknowledging heartbeats.** The frontend still hears every heartbeat it takes, but
   acknowledges one only while it owns the node and has written the node's session row
   lately. It looks at the owner row again when its last look is `OWNER_CACHE_TTL` (2 s)
@@ -243,8 +242,8 @@ result for one. What the code does today:
   fence. That is longer than a renewal interval and a heartbeat interval together (checked
   at compile time), so a frontend that renews on schedule never withholds an acknowledgement.
   By construction it is also short enough that a daemon's work ends before a reader that
-  waited one renewal interval beyond the row's expiry would give its leases up, but no code
-  waits on an expired session row yet, and nothing asserts that.
+  waited one renewal interval beyond the row's expiry would give its leases up; the orphan
+  sweep below is that reader, and a compile-time check asserts it.
 - **Claiming and the store.** A claim the store refuses because it cannot be reached is
   made again, while the daemon's stream is open, by the first feed that finds the store
   reachable; the heartbeats are not acknowledged until it is made. A claim that loses
@@ -267,11 +266,13 @@ result for one. What the code does today:
   then reads every lease row, as it always did.
 - **A daemon that moves.** When a daemon says `Hello` to a frontend, that frontend takes
   up the unfinished operations whose lease rows name the node and that its scheduler does
-  not hold (it started before the grant, or did not run it), as it takes up the leases it
-  finds at a start. The daemon's first heartbeat lists what it runs, and a lease it lists
-  is kept. A lease it leaves out is given up as above: at once if the daemon is the
-  process the node's session row names (the same process moved, as a reconnect), and after
-  `HANDOVER_GRACE` and `OWNER_CACHE_TTL` (47 s) from the `Hello` if the row names another
+  not hold (it started before the grant, or did not run it). Besides a request that joins
+  an operation running on another frontend's daemon (above), this is the only way a
+  frontend takes up a lease it did not grant. The daemon's first heartbeat lists what it
+  runs, and a lease it lists is kept. A lease it leaves out is given up as above: at once
+  if the daemon is the process the node's session row names (the same process moved, as a
+  reconnect), and after `HANDOVER_GRACE` and `OWNER_CACHE_TTL` (47 s) from the `Hello` if
+  the row names another
   process or is gone and the node's owner was another frontend. In that case the old
   process may still be running the lease, acknowledged by the frontend it left until that
   frontend looks at the owner row again, and it fences T after its last acknowledged
@@ -284,10 +285,75 @@ result for one. What the code does today:
   frontend holds its lock: a cost of the order of the leases of the farm for each
   reconnecting daemon, accepted until a `lease-by-worker/` index is worth its writes.
 
-Not done yet: a frontend takes up work other frontends queue only when a request joins it
-or a daemon moves, so a frontend the daemon left goes on believing it holds the node's
-leases until the node is silent for G, and its give-up of them is refused as stale and
-dropped; it does not yet put such leases back in its queue at once.
+### Frontends that share work
+
+A frontend schedules onto the daemons connected to it, and the store decides, by the
+conditional writes above, which frontend runs an operation. Each frontend also looks at the
+store every `INTAKE_POLL` (200 ms) to learn what the others did. A farm with no state store,
+one a handover fenced, and one whose store cannot be read do nothing at a poll.
+
+- **A start.** A starting frontend takes up the operations that wait for a lease and none
+  that holds one: the lease belongs to the frontend its node is connected to, and is taken
+  up when the node says `Hello` here (above), or by a request that joins its operation
+  (above). A lease whose node never says `Hello` again is requeued by the orphan sweep.
+- **Taking in.** An operation another frontend queued (a `queue/` row the scheduler does
+  not hold) is taken in with the `loss/`, `fate/`, `subject/` and size-key rows the store
+  holds of it, and the ids this frontend numbers with go past it. One that holds a lease
+  by the time the poll reads its rows (another frontend granted it meanwhile) is not taken
+  in: its lease is taken up only as above.
+- **Forgetting.** An operation the scheduler holds queued whose `queue/` row is gone was
+  granted, finished or refused by another frontend: it leaves the scheduler (no give-up, no
+  loss, no fault is recorded) and the callers it had are kept. An operation whose `queue/`
+  row is a newer write than the one the poll read last was granted elsewhere and queued
+  again: it is taken in again with the rows of now. An operation whose lease the scheduler
+  gave up and whose requeue the store has not taken yet has no `queue/` row for that reason
+  and stays.
+- **Callers.** The kept callers of an operation another frontend runs are shown it
+  executing, and given its result when the `done/` row is there; they stay known by name
+  for the finished retention, as the callers of an operation this frontend finished do.
+  Callers who all cancelled are not followed. An operation the store has no trace of (its
+  `done/` row outlived the retention) leaves its callers waiting and is reported as an
+  untraced operation, as for a handover.
+- **A lost race.** A grant this frontend wrote that the store refuses as stale (the queue
+  row is gone, or is another write) lost to another frontend. The scheduler undoes the
+  placement (`Scheduler::unplace`: the booking is released and no give-up is recorded),
+  and the operation follows the store as above, at once: the frontend starts nothing and
+  keeps no lease for it. A result or a refusal the store refuses as stale, or for a node
+  that moved to another frontend, does not leave its callers waiting either: they are
+  kept, and answered from the store's `done/` row.
+- **Operator state.** A cordon, drain or uncordon an operator sets through any frontend
+  (the node need only have been claimed by one, `owner/` row) is written to `cordon/`; the
+  other frontends apply a row that differs from the one the previous poll found, and
+  return a node to placement whose row is gone. A drain's deadline is written on the
+  store's clock, not the frontend's, and a frontend that applies it ends the drain as far
+  from now as the deadline is from the store's time, so frontends whose clocks differ
+  agree. A floor (the least memory a fresh submission books) a frontend raises is written
+  with the larger ask of its own and the row's, at the version read, so no frontend lowers
+  another's; the other frontends raise their floors to the stored ones, and floors that
+  frontends stamped alike load in key order with distinct stamps.
+- **The epoch.** A frontend serves the epoch it started under. The poll reads the stored
+  epoch, and a frontend whose own is behind (an operator raised it) reports that
+  (`Farm::epoch_ahead`) until it is restarted.
+
+The orphan sweep looks, at the same poll, for leases whose node has no `session/` row
+anywhere and is not connected to this frontend. The first look remembers the lease, with
+the store's clock reading, its row's version and its node's `owner/` row's version. A later
+look that finds the lease as it was, and the node still without a session,
+`ORPHAN_WAIT` (`SESSION_RENEWAL` plus the 5 s margin of the fence, 25 s) after the first on
+the store's clock (never the frontend's own), requeues it in one transaction that checks the
+rows read (the lease, the operation and the owner row), deletes the lease and its index row,
+queues the operation and counts the loss as a silent node's lease is counted. A lease
+that changed, or whose node came back, starts the wait over, and so does one whose requeue
+lost to another write between the look and the transaction (the pass goes on to the other
+leases). The wait is long enough that
+the daemon has stopped the work: it runs at most `ACK_WINDOW` and T (and the margin of the
+fence) past the last write of its session row, which was `LEASE_GRACE` before the first
+look at the latest, and a compile-time check asserts that this is under `LEASE_GRACE` plus
+the wait.
+
+Not done yet: a frontend still takes the writer generation at its start, so a second
+frontend over the store supersedes the first; and a caller asks for an operation by name
+only of the frontend that gave the name.
 
 ### Node phases
 

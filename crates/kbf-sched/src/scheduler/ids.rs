@@ -49,8 +49,8 @@ impl Scheduler {
     ///
     /// A method of the scheduler, not an [`crate::Event`], as [`Scheduler::use_seq_block`]
     /// is: the caller learns that the claim is lost from the state store, which no replay
-    /// of events shows, and calls it under the lock that serialises its inputs. Nothing
-    /// outside the tests calls it yet.
+    /// of events shows, and calls it under the lock that serialises its inputs. The farm
+    /// calls it when the grant it wrote loses to another frontend's.
     pub fn unplace(&mut self, lease: LeaseId) -> Option<OperationId> {
         let id = self.held.get(&lease)?.operation;
         if !matches!(self.ops[&id].state, OpState::Leased { .. }) {

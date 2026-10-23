@@ -11,8 +11,9 @@
 //! [`State::feed`]). The replicated log replaces exactly that step. Each process grants
 //! leases under its own term (and a store continues the sequence), so a lease id
 //! names one lease ever (issue #137). Under a state store the predecessor's own leases are
-//! restored (`take_stored`): its `Result` ends its own operation until the daemon's heartbeat omits
-//! the lease, and one naming another action is a MISMATCH; an id no row holds is UNKNOWN_LEASE.
+//! restored (`take_stored`) when their daemon says `Hello`: its `Result` ends its own
+//! operation until the daemon's heartbeat omits the lease, and one naming another action is
+//! a MISMATCH; an id no row holds is UNKNOWN_LEASE.
 //! Operations die with it too, so the term is part of every operation name (issue
 //! #154). The term, and the lease epoch `Welcome` names, come from the metadata log
 //! ([`MetaLog::leadership`]):
@@ -73,14 +74,15 @@ mod record;
 pub mod sched_view;
 
 pub use durable::{
-    ACK_WINDOW, DONE_FLOOR, EpochBump, EpochPolicy, ID_BLOCK, OWNER_CACHE_TTL, SESSION_RENEWAL,
-    StateError,
+    ACK_WINDOW, DONE_FLOOR, EpochBump, EpochPolicy, ID_BLOCK, INTAKE_POLL, ORPHAN_WAIT,
+    OWNER_CACHE_TTL, SESSION_RENEWAL, StateError,
 };
 pub use handover::UNTRACED_LOOKS;
 pub use phase::Reported;
 
 use self::ack::{Verdict, refusal};
 use self::durable::Durable;
+use self::durable::intake::Intake;
 use crate::action_usage::{self, Measured, Shapes};
 use crate::fault;
 use crate::fleet::{NodeView, SoftwareView, attention_changes};
@@ -331,6 +333,9 @@ struct State {
     learned: Learned,
     /// Lowered key floors the state store has not taken yet ([`State::lower_key_floors`]).
     unwritten_floors: Vec<kbf_sched::KeyFloor>,
+    /// What the intake poll keeps between two looks at the state store
+    /// ([`Farm::intake`]).
+    intake: Intake,
 }
 
 /// How many committed records the farm holds for a state store that refuses them.
@@ -434,6 +439,7 @@ impl Farm {
                 untraced_relayed: BTreeMap::new(),
                 learned: Learned::new(LearnedSizes::Off, 0, 0),
                 unwritten_floors: Vec::new(),
+                intake: Intake::default(),
             }),
         }
     }
@@ -776,15 +782,20 @@ impl Farm {
     }
 
     /// Cordons, drains or uncordons `worker` (see `kbf_sched::Cordon`), and returns
-    /// the node as it is now. A drain's deadline counts from now.
+    /// the node as it is now. A drain's deadline counts from now, and is written on the
+    /// state store's clock. A node connected to another frontend of the state store is
+    /// placed too: that frontend applies the row at its next intake poll ([`Farm::intake`]).
     ///
     /// # Errors
-    /// `worker` has never registered.
+    /// `worker` has never registered with this frontend, and no frontend of the state store
+    /// has claimed it.
     pub fn place(&self, worker: &WorkerId, action: NodeAction) -> Result<NodeView, UnknownNode> {
         let now = self.now();
         let mut state = self.lock();
         state.note_closed_streams();
-        if state.machine.node(worker).is_none() {
+        // A node connected to another frontend of the state store is placed too: its
+        // `cordon/` row is the other frontend's to apply (the intake poll).
+        if state.machine.node(worker).is_none() && !state.known_elsewhere(worker) {
             return Err(UnknownNode(worker.as_str().to_owned()));
         }
         let name = worker.clone();
@@ -798,8 +809,11 @@ impl Farm {
         };
         tracing::info!(%worker, ?action, "operator action");
         state.feed_quiet(now, event);
-        let at = self.epoch_unix_ms.saturating_add(now.as_millis());
-        state.durably("a cordon", |d| d.cordoned(worker, action.stored(at)));
+        // A drain's deadline is written on the store's clock: the frontends that apply the
+        // row have clocks of their own.
+        state.durably("a cordon", |d| {
+            d.cordoned(worker, action.stored(d.store_ms()))
+        });
         Ok(self.node(&state, worker))
     }
 
@@ -1409,10 +1423,11 @@ impl State {
     /// that the callers with a channel are exactly the callers the machine keeps: the
     /// same ids, not only as many.
     fn forget_dropped(&mut self) {
-        let sched = &self.sched;
-        let forgotten = self
-            .machine
-            .forget_dropped(|operation| sched.state(operation).is_some());
+        let (sched, intake) = (&self.sched, &self.intake);
+        let held = |operation: OperationId| {
+            sched.state(operation).is_some() || intake.keeps(operation)
+        };
+        let forgotten = self.machine.forget_dropped(held);
         self.answered
             .retain(|_, operation| sched.state(*operation).is_some());
         for id in forgotten {

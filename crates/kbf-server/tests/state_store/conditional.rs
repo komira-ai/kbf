@@ -53,12 +53,21 @@ pub(super) async fn a_second_give_up_queues_nothing_beside_the_new_lease(backing
     let [old] = starts(&mut inbox_a)[..] else {
         panic!("one lease expected");
     };
-    let second = disk.farm(EpochPolicy::Keep);
+    let second = disk
+        .farm(EpochPolicy::Keep)
+        .with_orphan_wait(Duration::ZERO);
     tokio::time::advance(kbf_sched::fence::LEASE_GRACE + Duration::from_secs(1)).await;
 
-    // The second frontend gives up the lease whose daemon it never heard, and runs the
-    // operation on a daemon of its own.
+    // The second frontend does not hear the daemon of the old lease (its session row has
+    // expired): the sweep requeues the lease, and the operation runs on a daemon of the
+    // second frontend's own.
+    expire_session(&disk, "node-a");
+    second.intake();
+    second.intake();
+    assert_eq!((disk.rows("lease/"), disk.rows("queue/")), (0, 1));
     let (_, mut inbox_b) = register_as(&second, &node_b);
+    second.intake();
+    second.tick().await;
     let [new] = starts(&mut inbox_b)[..] else {
         panic!("one lease expected");
     };

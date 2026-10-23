@@ -65,8 +65,9 @@
 //!   on a row, so a very large response makes a large transaction, as it made a large
 //!   row before;
 //! - `cordon/<worker>`: how an operator placed a node (cordoned, or draining until a
-//!   wall-clock deadline), kept until it is returned to placement, so a successor
-//!   process serves the node as the operator left it;
+//!   deadline on the store's clock), kept until it is returned to placement, so a
+//!   successor process serves the node as the operator left it, and the other frontends
+//!   of the store apply it at their next intake poll;
 //! - `est/<instance>/<platform>/<basis>/<shape>/<cfg>`: one size summary of the learned-sizes
 //!   shadow ([`crate::learned`]): a version byte and the estimator's own checksummed row.
 //!   Never in the transaction of a requeue or a finish: a summary an own-limit kill changed
@@ -100,6 +101,14 @@
 //! operation is unservable is judged from the `session/` rows, which hold every
 //! frontend's daemons, and not from the daemons of one frontend.
 //!
+//! A frontend learns what the others did by looking at the rows every [`INTAKE_POLL`] (the
+//! `intake` module): it takes in the operations they queued, forgets the ones they took
+//! (the callers it kept are answered from `done/`), applies their `cordon/` rows and raises
+//! its floors to theirs. A start takes up only the operations that wait for a lease: a
+//! leased one is taken up when its node says `Hello` to this frontend, and the `sweep`
+//! module requeues the lease of a node no frontend hears, so the work of a frontend that
+//! died is not stranded.
+//!
 //! Values are the `kbf-log` encoding of the scheduler's own inputs (a `Submit`, the
 //! `Committed` lease, a `WorkerUp`), so the `kbf-log` codec the replicated log already runs
 //! decides what a row may hold.
@@ -118,7 +127,7 @@ use kbf_sched::{
     DaemonInstance, Fate, Floor, FloorChange, KeyFloor, Recovered, RecoveredLease, Request,
     Requeue, RequeueReason,
 };
-use kbf_state::{Cond, Conflict, GENERATION, Store, StoreError, Txn, Versioned};
+use kbf_state::{Cond, Conflict, GENERATION, Store, StoreError, Txn, Version, Versioned};
 use kbf_types::{
     ControlRecord, Digest, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, WaiterId, WorkerId,
 };
@@ -140,7 +149,9 @@ use self::leases::lease_by_op_key;
 use self::owner::{Owner, Ownership};
 
 pub use self::blocks::ID_BLOCK;
+pub use self::intake::INTAKE_POLL;
 pub use self::owner::{ACK_WINDOW, OWNER_CACHE_TTL};
+pub use self::sweep::ORPHAN_WAIT;
 
 /// How often a daemon session's row in the store is renewed while the daemon heartbeats:
 /// a third of the lease grace, so the row outlives two missed renewals. One write per
@@ -235,9 +246,10 @@ pub(super) struct Stored {
     pub next_seq: u64,
     /// Every unfinished operation, in id order.
     pub operations: Vec<StoredOperation>,
-    /// Every memory floor, in key order.
+    /// Every memory floor, oldest stamp first (two floors with one stamp in key order, the
+    /// later with the next stamp).
     pub floors: Vec<Floor>,
-    /// Every key floor, in key order.
+    /// Every key floor, in the same order.
     pub key_floors: Vec<KeyFloor>,
     /// The size summary each key floor decays with, for those whose row names one.
     pub key_names: Vec<(u64, kbf_estimator::Key)>,
@@ -246,9 +258,9 @@ pub(super) struct Stored {
 }
 
 /// How an operator placed a node, as its `cordon/` row keeps it: a tag byte, and for a
-/// drain the deadline as eight bytes, big-endian, milliseconds since the Unix epoch (a
-/// successor process has a clock of its own for farm time, and the wall clock is the
-/// one both share).
+/// drain the deadline as eight bytes, big-endian, milliseconds on the store's clock (a
+/// frontend has a clock of its own for farm time, and the store's is the one all share; for
+/// a store whose clock starts at the Unix epoch, the wall clock's own reading).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum StoredCordon {
     /// Placement skips the node.
@@ -342,10 +354,12 @@ mod estimate;
 mod fate;
 mod floor;
 mod inflight;
+pub(super) mod intake;
 mod leases;
 mod opkey;
 mod owner;
 mod subject;
+mod sweep;
 mod transitions;
 
 /// The lease an effect starts, if it is a `Start`.
@@ -628,20 +642,23 @@ impl Durable {
             opkeys.insert(operation, size_key);
         }
         let mut floors = Vec::new();
-        let mut stamps = std::collections::BTreeSet::new();
         for (key, row) in self.store.scan_prefix(FLOOR)? {
             let floor = floor::decode(&row.value).map_err(|why| corrupt(&key, why))?;
             if key != floor::row_key(&floor.key) {
                 return Err(corrupt(&key, "not the key of the floor it holds"));
             }
-            if !stamps.insert(floor.stamp) {
-                return Err(corrupt(&key, "a stamp another floor has"));
-            }
             floors.push(floor);
+        }
+        // Frontends sharing a store stamp their raises from counters of their own, so two
+        // floors may carry one stamp: they are ordered by key, the later one a stamp on.
+        floors.sort_by_key(|floor| floor.stamp);
+        let mut next = 0;
+        for floor in &mut floors {
+            floor.stamp = floor.stamp.max(next);
+            next = floor.stamp.saturating_add(1);
         }
         let mut key_floors = Vec::new();
         let mut key_names = Vec::new();
-        let mut key_stamps = std::collections::BTreeSet::new();
         for (key, row) in self
             .store
             .scan_prefix(KEY_FLOOR)?
@@ -659,10 +676,13 @@ impl Durable {
             if key != floor::key_row(floor.key) {
                 return Err(corrupt(&key, "not the key of the key floor it holds"));
             }
-            if !key_stamps.insert(floor.stamp) {
-                return Err(corrupt(&key, "a stamp another key floor has"));
-            }
             key_floors.push(floor);
+        }
+        key_floors.sort_by_key(|floor| floor.stamp);
+        let mut next = 0;
+        for floor in &mut key_floors {
+            floor.stamp = floor.stamp.max(next);
+            next = floor.stamp.saturating_add(1);
         }
         let mut operations = Vec::new();
         for (key, row) in self.store.scan_prefix("op/")? {
@@ -1212,6 +1232,16 @@ impl State {
                     self.write_drops += 1;
                     tracing::error!("a committed record's remaining effects were dropped");
                     let dropped = self.unwritten.pop_front().unwrap_or_default();
+                    // Another frontend's work stands in its place: this one gives up what
+                    // it did for the operation and follows the store. A finish dropped for
+                    // another reason (the node moved to another frontend, and its daemon
+                    // keeps the result for that frontend) is followed too, but its grants
+                    // stay: nothing in the store says they lost.
+                    if attempt == Attempt::Stale {
+                        self.lost_race(&dropped);
+                    } else {
+                        self.follow_finishes(&dropped);
+                    }
                     self.forget_details(dropped);
                 }
             }
@@ -1372,6 +1402,11 @@ impl State {
             .collect();
         self.unsettled = refused;
         self.write_drops += disowned;
+        // The queue row a give-up writes is this frontend's own: the intake poll finds the
+        // operation queued as it left it, not queued again by another frontend.
+        for requeue in given_up {
+            self.intake.rewrote(requeue.operation);
+        }
         self.write_estimates(&kills);
     }
 
@@ -1467,7 +1502,15 @@ impl State {
         let now = SystemTime::now();
         let mut recovered = Vec::new();
         let mut keyed = Vec::new();
-        for op in stored.operations {
+        // A start takes up the operations that wait for a lease, and none that holds one:
+        // the lease belongs to the frontend its node is connected to, which may be another
+        // than this. A leased operation is taken up when its node says `Hello` here
+        // ([`State::claim_worker`]); if the node never does, the orphan sweep requeues it.
+        for op in stored
+            .operations
+            .into_iter()
+            .filter(|op| op.lease.is_none())
+        {
             if let Some(size_key) = op.size_key.filter(|_| self.learned.keys()) {
                 keyed.push((op.operation, size_key));
                 self.register_stored(&op, size_key);
@@ -1502,7 +1545,7 @@ impl State {
                 self.learned.register(summary, *size_key);
             }
         }
-        self.restore_cordons(stored.cordons);
+        self.restore_cordons(stored.cordons, durable.store_ms());
         self.durable = Some(durable);
         Ok(Some(epoch))
     }
@@ -1612,11 +1655,15 @@ impl State {
 #[cfg(test)]
 mod blocks_tests;
 #[cfg(test)]
+mod intake_tests;
+#[cfg(test)]
 mod leases_tests;
 #[cfg(test)]
 mod owner_tests;
 #[cfg(test)]
 mod submit_tests;
+#[cfg(test)]
+mod sweep_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

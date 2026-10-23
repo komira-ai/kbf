@@ -468,6 +468,31 @@ impl Scheduler {
         self.memory.key_floors.restore(rows);
     }
 
+    /// Raises the memory floor of `floor.key` to `floor.ask` if that is more than the
+    /// floor this scheduler holds, or holds none: the raise another scheduler of the same
+    /// state store made and wrote down. A floor never falls, so a stored floor at or below
+    /// the one held changes nothing. The raise is the newest in this scheduler's order, as
+    /// the scheduler's own is; the stamp the store keeps is the other scheduler's. Returns
+    /// whether the floor rose.
+    pub fn raise_floor(&mut self, floor: &Floor) -> bool {
+        let held = self.memory.floors.get(&floor.key);
+        let rises = held.is_none_or(|ask| ask < floor.ask);
+        if rises {
+            self.memory.floors.raise(&floor.key, floor.ask);
+        }
+        rises
+    }
+
+    /// [`Scheduler::raise_floor`] for the key floors.
+    pub fn raise_key_floor(&mut self, floor: &KeyFloor) -> bool {
+        let held = self.memory.key_floors.get(&floor.key);
+        let rises = held.is_none_or(|ask| ask < floor.ask);
+        if rises {
+            self.memory.key_floors.raise(&floor.key, floor.ask);
+        }
+        rises
+    }
+
     /// Names the key `operation`'s kill-driven memory floor is kept under, which the
     /// caller derives (from the instance, the platform class, the instrument and the
     /// action's shape) and keeps in its own rows: no scheduler input and no log record

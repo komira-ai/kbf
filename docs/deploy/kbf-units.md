@@ -210,7 +210,8 @@ leases the lost history granted after it. Raise the epoch so they drop those lea
 2. On the frontend's host, run `kbf cluster epoch-bump --token-file F` (`POST
    /v1/epoch/bump`, [api.md](../api.md#post-v1epochbump)). It answers the epoch before the
    bump, the one stored now, and the one this frontend serves.
-3. Restart each frontend. A running frontend goes on serving the epoch it started under; the
+3. Restart each frontend. A running frontend goes on serving the epoch it started under
+   (it logs a warning once its next look at the store finds the newer one); the
    one that starts after the bump serves the stored one, and a daemon that reaches it kills
    the runs of the leases it held and lists none, and the operations run again from the
    restored queue. Start the daemons' units after it.

@@ -973,6 +973,8 @@ where
                 farm.tick().await;
             }
         };
+        // What the other frontends of a shared state store did (`Farm::intake`).
+        let intaking = farm.poll_intake();
         // Completes when the drain has run out of time or was forced: the REAPI
         // listener, drained in time, completes first.
         let stopping = async {
@@ -991,6 +993,7 @@ where
             // for again below (`reapi_done` stays false).
             served = &mut api_serve => served.map_err(ServeError::Api),
             () = ticking => Ok(()),
+            () = intaking => Ok(()),
             () = sweeping => Ok(()),
             // One timer for every open stream's progress operation.
             () = ticker.run() => Ok(()),

@@ -46,6 +46,8 @@ mod fate;
 mod floors;
 #[path = "state_store/handover.rs"]
 mod handover;
+#[path = "state_store/intake.rs"]
+mod intake;
 #[path = "state_store/owner.rs"]
 mod owner;
 #[path = "state_store/result_ack.rs"]
@@ -83,6 +85,8 @@ struct Flaky {
     lease_scans: AtomicUsize,
     /// The writes that applied, oldest first, as the transaction prints.
     applied: std::sync::Mutex<Vec<String>>,
+    /// The fake's clock, which a test moves by hand; a real store's clock runs by itself.
+    clock: Option<Arc<ManualClock>>,
 }
 
 /// What the store is kept in.
@@ -157,8 +161,12 @@ fn open_sqlite(path: &std::path::Path) -> SqliteStore {
 
 impl Flaky {
     fn new() -> Self {
-        let inner = Fake::with_flaw(Arc::new(ManualClock::default()), Flaw::None);
-        Self::over(Inner::Fake(inner))
+        let clock = Arc::new(ManualClock::default());
+        let inner = Fake::with_flaw(Arc::clone(&clock), Flaw::None);
+        Self {
+            clock: Some(clock),
+            ..Self::over(Inner::Fake(inner))
+        }
     }
 
     fn over(inner: Inner) -> Self {
@@ -173,6 +181,7 @@ impl Flaky {
             fail_queue_get: AtomicI64::new(0),
             lease_scans: AtomicUsize::new(0),
             applied: std::sync::Mutex::new(Vec::new()),
+            clock: None,
         }
     }
 
@@ -204,6 +213,7 @@ impl Flaky {
 
     /// A crash and reopen: what the store acknowledged survives.
     fn restart(self) -> Self {
+        let clock = self.clock.clone();
         let inner = match self.inner {
             Inner::Fake(fake) => Inner::Fake(fake.restart()),
             Inner::Sqlite(tracked) => {
@@ -222,7 +232,10 @@ impl Flaky {
                 Inner::Postgres(Box::new(Tracked::new(reopened)))
             }
         };
-        Self::over(inner)
+        Self {
+            clock,
+            ..Self::over(inner)
+        }
     }
 }
 
@@ -414,6 +427,16 @@ impl Disk {
 
     fn rows(&self, prefix: &str) -> usize {
         self.store.scan_prefix(prefix).expect("scan").len()
+    }
+
+    /// Lets `by` pass on the store's clock: the fake's is moved by hand, and a real store's
+    /// runs by itself, so the test waits.
+    fn pass(&self, by: Duration) {
+        let waits = || std::thread::sleep(by);
+        self.store
+            .clock
+            .as_ref()
+            .map_or_else(waits, |clock| clock.advance(by));
     }
 }
 
@@ -1050,6 +1073,16 @@ use conditional::{
     a_second_give_up_queues_nothing_beside_the_new_lease,
     daemon_sessions_that_cannot_be_read_hold_back_a_refusal,
 };
+use intake::{
+    a_client_waiting_on_one_frontend_gets_the_result_another_recorded,
+    a_cordon_set_through_one_frontend_stops_grants_on_the_other,
+    a_drain_deadline_is_on_the_stores_clock_and_applied_by_the_other,
+    a_frontend_killed_mid_run_loses_nothing,
+    a_lost_grant_race_forgets_the_placement_and_the_operation_runs_once,
+    an_operation_queued_through_one_frontend_runs_on_a_daemon_of_another,
+    starting_a_frontend_leaves_the_leases_of_the_others_alone,
+    the_epoch_an_operator_raised_is_reported_by_the_other_frontend,
+};
 use owner::{
     a_claim_the_store_refused_is_made_when_it_returns,
     a_daemon_that_moves_to_another_frontend_keeps_its_lease,
@@ -1125,7 +1158,15 @@ restarts!(
     an_owner_row_that_cannot_be_read_blocks_the_claim_until_the_next_hello,
     lost_leases_are_counted_across_a_restart_and_the_third_is_refused,
     a_crash_at_any_write_of_a_finish_leaves_the_operation_or_its_result,
-    a_crash_at_any_write_of_a_refusal_leaves_the_operation_or_its_refusal
+    a_crash_at_any_write_of_a_refusal_leaves_the_operation_or_its_refusal,
+    an_operation_queued_through_one_frontend_runs_on_a_daemon_of_another,
+    a_lost_grant_race_forgets_the_placement_and_the_operation_runs_once,
+    a_client_waiting_on_one_frontend_gets_the_result_another_recorded,
+    a_frontend_killed_mid_run_loses_nothing,
+    a_cordon_set_through_one_frontend_stops_grants_on_the_other,
+    a_drain_deadline_is_on_the_stores_clock_and_applied_by_the_other,
+    starting_a_frontend_leaves_the_leases_of_the_others_alone,
+    the_epoch_an_operator_raised_is_reported_by_the_other_frontend
 );
 
 /// A state store opened as a start opens it: from the flag, over `dir`.
