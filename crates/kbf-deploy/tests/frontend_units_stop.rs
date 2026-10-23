@@ -55,7 +55,7 @@ fn starts_frontend(unit: &str) -> bool {
 
 /// Catches a frontend unit template that lets systemd kill a drain: the
 /// pilot template's `TimeoutStopSec=20`, a template with no stop timeout set (the
-/// default is 90 s), and a new frontend unit added without it. Mutants: the line removed
+/// default is 90 s), and a new frontend unit added without it. Catches: the line removed
 /// from the template, or set to a number. The expected one also keeps this
 /// from passing with nothing to check.
 #[test]
