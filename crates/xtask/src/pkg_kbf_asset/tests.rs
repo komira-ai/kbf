@@ -111,10 +111,8 @@ impl Fix {
         for (path, mode, bytes) in &self.extra {
             files.push((path.clone(), *mode, bytes.as_slice()));
         }
-        let listed: Vec<(&str, u32, &[u8])> = files
-            .iter()
-            .map(|(p, m, b)| (p.as_str(), *m, *b))
-            .collect();
+        let listed: Vec<(&str, u32, &[u8])> =
+            files.iter().map(|(p, m, b)| (p.as_str(), *m, *b)).collect();
         ar(&[
             ("debian-binary", b"2.0\n"),
             ("control.tar.gz", &control_tgz),

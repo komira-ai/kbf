@@ -430,7 +430,7 @@ fn the_host_payload_is_placed_where_the_package_puts_it_and_nothing_else() {
         std::fs::read(installer_binary()).expect("stub"),
     );
     assert_eq!(
-        std::fs::read_to_string(r.root.join(PAYLOAD[2])).expect("unit"),
+        std::fs::read_to_string(r.root.join(PAYLOAD[1])).expect("unit"),
         "stub kbf-installer.service\n"
     );
     assert!(

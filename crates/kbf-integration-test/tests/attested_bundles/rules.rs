@@ -843,9 +843,11 @@ fn a_kbf_package_without_its_own_provenance_step_or_bundle_name_is_named() {
     let mut cases = Cases::default();
     for platform in DEBS {
         let w = good_artifacts();
-        let dropped = w
-            .replacen(&provenance_kbf_deb(platform), "", 1)
-            .replacen(&naming_kbf_deb(platform), "", 1);
+        let dropped = w.replacen(&provenance_kbf_deb(platform), "", 1).replacen(
+            &naming_kbf_deb(platform),
+            "",
+            1,
+        );
         assert_ne!(dropped, w);
         let wanted = format!(
             "kbf package (deb) for {platform} is packaged, but `attest-linux` has no actions/attest-build-provenance step with subject-path dist/{}.deb",
