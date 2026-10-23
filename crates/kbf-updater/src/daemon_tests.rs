@@ -1,5 +1,5 @@
-//! Flags, start-up failures, and the binary's own wiring (the real safe-to-stop, the installer
-//! and health check that are not built) over a real socket.
+//! Flags, start-up failures, and the binary's own wiring (the real safe-to-stop and health
+//! check, the installer that is not built) over a real socket.
 
 use std::os::unix::net::UnixListener;
 
@@ -13,8 +13,8 @@ use crate::daemon::{
 use crate::fakes::{Event, FakeClock, FakeHealth, FakeInstaller, FakeSafeToStop, Log};
 use crate::inventory::{Host, Role};
 use crate::listener::{Activation, Listen};
-use crate::not_built::{NOT_BUILT, NotBuiltHealth, NotBuiltInstaller};
-use crate::ports::{HealthCheck, Installer, PortErrorKind};
+use crate::not_built::{NOT_BUILT, NotBuiltInstaller};
+use crate::ports::{Installer, PortErrorKind};
 use crate::record::RollStore;
 use crate::server::Recent;
 use crate::testutil::{
@@ -320,9 +320,9 @@ fn a_node_is_checked_with_the_token_and_then_refused_by_the_installer() {
     daemon.wait();
 }
 
-/// Catches the refusing ports answering with anything but a refusal.
+/// Catches the refusing installer answering with anything but a refusal.
 #[test]
-fn the_not_built_ports_refuse_everything() {
+fn the_not_built_installer_refuses_everything() {
     let host = Host {
         alias: "st1".into(),
         address: "st1.farm.example".into(),
@@ -342,8 +342,6 @@ fn the_not_built_ports_refuse_everything() {
             .to_string(),
         NOT_BUILT
     );
-    let e = NotBuiltHealth.check(&host, &v).expect_err("health");
-    assert!(e.to_string().contains("no health check yet"));
 }
 
 /// Catches start-up that goes on over something wrong: an inventory that is not owned by the

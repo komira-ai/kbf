@@ -167,7 +167,7 @@ pub fn query_answer(code: i32, stdout: &[u8]) -> Result<Installed, PortError> {
             match report.installed_version {
                 Some(v) if installed_ok(&v) => Ok(Installed::Version(v)),
                 Some(_) => Err(bad_answer()),
-                None => Err(PortError::other("not installed")),
+                None => Ok(Installed::NotInstalled),
             }
         }
         2 | 3 => Err(reason_line(line, code)?),
