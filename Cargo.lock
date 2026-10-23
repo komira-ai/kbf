@@ -2397,7 +2397,6 @@ dependencies = [
  "kbf-tls",
  "kbf-types",
  "kbf-ui",
- "kbf-update",
  "libc",
  "percent-encoding",
  "postgres",

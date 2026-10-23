@@ -1129,11 +1129,6 @@ impl<'a> Prepared<'a> {
             .map(|dir| open_object_stores(dir, state_store.clone().zip(members.clone())))
             .transpose()?;
         let delivery = object_stores.as_ref().map(|stores| stores.delivery.clone());
-        let offers = crate::release::offers::offers_of(
-            releases.clone(),
-            update_rows.clone(),
-            listeners.tick,
-        );
         // Set below, where the stand is built, if there is a state store to retire over.
         let retire = Arc::new(OnceLock::new());
         let api_routes = crate::api::router(
@@ -1186,9 +1181,6 @@ impl<'a> Prepared<'a> {
         .with_host_floor(listeners.vm_host_floor);
         // Daemons are sent the members' map: Welcome.map and a MapUpdate at each bump.
         let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
-        let sessions = offers
-            .into_iter()
-            .fold(sessions, WorkerService::with_offers);
         let worker_service = WorkerServer::new(sessions)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);

@@ -15,10 +15,6 @@
 //! authentication of their own: the wiring puts `Fetch` and `Describe` behind the worker
 //! listener's mutual TLS and role table.
 //!
-//! - The offers, [`offers::Offers`]: the `UpdateOffer` each platform is to be sent over its
-//!   nodes' sessions, built from the desired release and what the store holds, the platform's
-//!   version facts ([`facts`]) included. A platform without them is held and never offered.
-//!
 //! The frontend mounts the routers on its operator API and the service on its worker
 //! listener where it starts. Trust is the host's: the store neither opens a tarball nor
 //! checks an attestation.
@@ -29,7 +25,6 @@ pub mod facts;
 pub mod grpc;
 pub mod http;
 pub mod key;
-pub mod offers;
 pub mod store;
 pub mod target_seq;
 
