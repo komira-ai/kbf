@@ -590,7 +590,7 @@ mod tests {
     }
 
     /// Catches a cap that drifts from the native driver's limit (the "cap = booking"
-    /// mutant: no buffer above the booking), and a zero booking read as "512 MiB for
+    /// catches: no buffer above the booking), and a zero booking read as "512 MiB for
     /// everything".
     #[test]
     fn memory_max_is_one_and_a_half_times_plus_headroom() {
@@ -839,7 +839,7 @@ mod tests {
         assert_eq!(killed_at(&samples, 8 * MIB), None);
     }
 
-    /// Catches a kill on swap alone (the "ignores max events" mutant: host pressure
+    /// Catches a kill on swap alone (the "ignores max events" catches: host pressure
     /// moves a lease below its cap, or one that hit its cap once before, into swap) and
     /// on `max` events alone (a lease at its cap that reclaim keeps in RAM, or whose
     /// swap is flat at the threshold).

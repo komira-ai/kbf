@@ -44,7 +44,7 @@ fn a_unit_names_its_mode_as_its_one_mode_word_and_no_other_spelling_passes() {
     // positional spelling (`kbf storage`), `--mode <name>` as two words, a second `--mode=`,
     // or a prefix of the name (`--mode=storage-and-daemon` for `storage`): a unit that
     // starts something else than its name says would start a farm of the wrong processes.
-    // Mutants: `names_mode` accepts the mode name as any word; takes the first `--mode=`
+    // Catches: `names_mode` accepts the mode name as any word; takes the first `--mode=`
     // only; compares a prefix.
     assert!(names_mode(
         &["--mode=storage", "--cold-store=x"],

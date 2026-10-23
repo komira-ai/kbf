@@ -21,7 +21,7 @@ fn help_is_not_a_failure() {
 #[test]
 fn a_refused_command_line_exits_2() {
     // Catches: a missing required flag, an unknown flag, an unknown scenario or an unknown
-    // mutant starting a run (or exiting 1, which says a gate failed).
+    // fault starting a run (or exiting 1, which says a gate failed).
     for words in [
         &[][..],
         &["b1"],
@@ -37,7 +37,7 @@ fn a_refused_command_line_exits_2() {
             "p",
             "--work",
             "w",
-            "--mutant",
+            "--fault",
             "nope",
         ],
     ] {
@@ -64,18 +64,18 @@ fn a_work_directory_that_cannot_be_made_exits_2() {
 }
 
 #[test]
-fn the_mutants_are_the_scenarios() {
+fn the_faults_are_the_scenarios() {
     assert_eq!(
-        Mutant::from(MutantFlag::ShrinkNodeCap),
-        Mutant::ShrinkNodeCap
+        Fault::from(FaultFlag::ShrinkNodeCap),
+        Fault::ShrinkNodeCap
     );
     assert_eq!(
-        Mutant::from(MutantFlag::ShrinkEveryCap),
-        Mutant::ShrinkEveryCap
+        Fault::from(FaultFlag::ShrinkEveryCap),
+        Fault::ShrinkEveryCap
     );
     assert_eq!(
-        Mutant::from(MutantFlag::KillNodeMidway),
-        Mutant::KillNodeMidway
+        Fault::from(FaultFlag::KillNodeMidway),
+        Fault::KillNodeMidway
     );
 }
 
@@ -90,7 +90,7 @@ fn the_exit_code_wraps_the_status() {
 fn the_wall_bound_adds_up_and_saturates() {
     // Catches: `duration + build timeout + 60` overflowing (a panic in a debug build and a
     // bound of a few seconds in a release one) on a command line with absurd seconds.
-    // Mutant: plain `+`.
+    // Catches: plain `+`.
     assert_eq!(wall_bound(300, 300), Duration::from_secs(660));
     assert_eq!(wall_bound(u64::MAX, 300), Duration::from_secs(u64::MAX));
     assert_eq!(wall_bound(300, u64::MAX), Duration::from_secs(u64::MAX));
@@ -102,7 +102,7 @@ fn the_sentinels_command_line_is_the_one_the_harness_writes() {
     // Catches: the harness and the sentinel disagreeing on a flag (renamed on one side): the
     // sentinel then refuses its command line, exits at once, and a killed harness is not
     // cleaned up, which nothing else would show. Every flag is set, and the socket is
-    // optional. Mutant: `--kill-timeout-ms` written as `--kill-timeout`.
+    // optional. Catches: `--kill-timeout-ms` written as `--kill-timeout`.
     use clap::Parser as _;
     let reap = |socket: Option<&str>| Reap {
         buck2: PathBuf::from("/b/buck2"),

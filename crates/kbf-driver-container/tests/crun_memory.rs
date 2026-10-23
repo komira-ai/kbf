@@ -100,7 +100,7 @@ async fn wait_for(lease: &Path, comm: &str) {
 
 /// Catches a lease killed past its cap reported as anything but `OutOfMemory` with its
 /// cap, an OOM kill that takes a neighbour lease with it, and a missing OOM group (the
-/// "oom.group off" mutant, on the lease and the container: the kernel kills only `dd`,
+/// "oom.group off" defect, on the lease and the container: the kernel kills only `dd`,
 /// the action's other child `sleep 3600` lives on, and the run ends at its timeout).
 ///
 /// Lease 1 books 16 MiB (cap 536 MiB) and reads 700 MiB into one buffer; lease 2 sleeps
@@ -142,7 +142,7 @@ async fn past_its_cap_an_action_dies_alone_and_is_out_of_memory() {
 }
 
 /// Catches a busy node's kill read as the action's own (the "classify by exit code
-/// alone" mutant: both end with SIGKILL, 137), which would double the booking of an
+/// alone" catches: both end with SIGKILL, 137), which would double the booking of an
 /// action that never reached its cap. The action books 1 GiB (cap 2 GiB) and reads
 /// 200 MiB; the cell, standing in for `actions/`, allows 64 MiB, so the kernel's OOM
 /// killer runs for the cell's limit, not the lease's.
@@ -169,7 +169,7 @@ async fn killed_by_the_actions_backstop_within_its_cap_is_a_busy_node() {
     cell.assert_clean(1);
 }
 
-/// Catches a cap with no buffer above the booking (the "cap = booking" mutant): an
+/// Catches a cap with no buffer above the booking (the "cap = booking" defect): an
 /// action that books 64 MiB and holds 300 MiB, past its booking and within its cap of
 /// 608 MiB, runs to exit 0 with no swap to fall back on.
 #[tokio::test]
@@ -190,9 +190,9 @@ async fn past_its_booking_within_its_cap_an_action_runs() {
     cell.assert_clean(1);
 }
 
-/// Catches a lease past its cap left to swap (the "watch off" mutant: the action
+/// Catches a lease past its cap left to swap (the "watch off" catches: the action
 /// holds its buffer until its 60 s timeout), a kill reported as anything but the
-/// lease's own out-of-memory kill (the "busy node for an own-cap kill" mutant), a kill
+/// lease's own out-of-memory kill (the "busy node for an own-cap kill" defect), a kill
 /// that is slow, and one that takes a neighbour lease with it.
 ///
 /// With swap free, lease 1 books 16 MiB (cap 536 MiB) and fills one 900 MiB buffer
@@ -201,7 +201,7 @@ async fn past_its_booking_within_its_cap_an_action_runs() {
 /// watch samples every second. Lease 2 sleeps beside it and must still be running.
 /// The kill is checked as `assert_swap_kill` says: past its cap overall, with its own
 /// swap past the floor by the watch's log line. Also catches a threshold that drops the
-/// floor (the "0 floor" mutant: its kill line names the 4 MiB share of the booking).
+/// floor (the "0 floor" catches: its kill line names the 4 MiB share of the booking).
 /// RAM plus swap past the cap by the floor is no promise: the kill sample may find RAM
 /// below the cap.
 /// The buffer is random, not zeros: a kernel that splits huge pages under reclaim
@@ -266,7 +266,7 @@ async fn past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory() {
     cell.assert_clean(2);
 }
 
-/// Catches the swap watch killing on swap alone (the "ignores max events" mutant), as
+/// Catches the swap watch killing on swap alone (the "ignores max events" defect), as
 /// host pressure would have it: a lease well below its cap holds a 150 MiB buffer of
 /// random bytes (`dd` blocked writing it into a pipe nobody reads yet; random, so
 /// reclaim cannot drop it as zero pages), the test reclaims 100 MiB
@@ -274,7 +274,7 @@ async fn past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory() {
 /// for the host's), so its `memory.swap.current` rises with no `max` event, past the
 /// 8 MiB floor this cell's watch is given, and the action still exits 0 after the watch
 /// has sampled it for several seconds. Also catches a lease that reclaim cannot move
-/// to swap (a per-lease `memory.swap.max=0` mutant).
+/// to swap (a per-lease `memory.swap.max=0` defect).
 #[tokio::test]
 #[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 async fn swapped_below_its_cap_a_lease_is_not_killed() {
