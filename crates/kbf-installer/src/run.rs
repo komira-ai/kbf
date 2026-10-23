@@ -238,6 +238,11 @@ impl Inherited {
 #[cfg(target_vendor = "apple")]
 const SWEEP_MIN_ENTRIES: usize = 4096;
 
+/// The most numbers the walk of every descriptor covers. The walk makes system calls between
+/// fork and exec, so a limit in the millions (or none at all) would stall every start that
+/// reaches it; it is reached only when the kernel's list cannot be had.
+const SWEEP_WALK_MAX: libc::c_int = 65_536;
+
 /// Marking every descriptor from `first` up close-on-exec in the child, without a list made
 /// beforehand. A list made in the parent misses a descriptor that another thread opens
 /// between the listing and the fork (and one the standard library opens and marks with a
@@ -263,7 +268,7 @@ impl Sweep {
         let limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
         Sweep {
             first,
-            limit: libc::c_int::try_from(limit).unwrap_or(libc::c_int::MAX),
+            limit: Self::walk_limit(limit),
             #[cfg(target_vendor = "apple")]
             room: vec![
                 libc::proc_fdinfo {
@@ -272,6 +277,15 @@ impl Sweep {
                 };
                 SWEEP_MIN_ENTRIES.max(open.saturating_mul(4))
             ],
+        }
+    }
+
+    /// How far the walk of every number goes for a `sysconf` answer: that answer, but at most
+    /// [`SWEEP_WALK_MAX`], and the maximum too when the answer is -1 (no limit known) or 0.
+    fn walk_limit(answer: libc::c_long) -> libc::c_int {
+        match libc::c_int::try_from(answer) {
+            Ok(n) if n > 0 => n.min(SWEEP_WALK_MAX),
+            _ => SWEEP_WALK_MAX,
         }
     }
 

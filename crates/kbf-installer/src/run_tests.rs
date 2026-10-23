@@ -586,6 +586,17 @@ fn small_sweep(first: u32) -> Sweep {
     sweep
 }
 
+/// Catches a walk that covers nothing or too much: an unknown limit (-1) or none (0) walks the
+/// maximum instead of nothing, a huge one is cut to the maximum, a small one is kept.
+#[test]
+fn the_walk_of_every_descriptor_is_never_empty_and_never_unbounded() {
+    assert_eq!(Sweep::walk_limit(-1), 65_536);
+    assert_eq!(Sweep::walk_limit(0), 65_536);
+    assert_eq!(Sweep::walk_limit(10_000_000), 65_536);
+    assert_eq!(Sweep::walk_limit(i64::MAX as libc::c_long), 65_536);
+    assert_eq!(Sweep::walk_limit(256), 256);
+}
+
 /// Catches a sweep that marks the wrong descriptors: the one numbered `first` and those above
 /// are marked close-on-exec, the one below is left alone (`>=`, not `>`). The walk of every
 /// number is checked here in this process, the kernel's list (macOS) through a real child.
@@ -615,7 +626,15 @@ fn a_sweep_marks_the_descriptors_from_the_first_up_and_none_below() {
 /// which reports the descriptors it holds; each run holds 0, 1 and 2 and nothing else.
 #[test]
 fn a_descriptor_opened_by_another_thread_during_the_start_never_reaches_the_program() {
+    /// Stops the racer when the test ends, however it ends.
+    struct Stop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _stopper = Stop(std::sync::Arc::clone(&stop));
     let racer = {
         let stop = std::sync::Arc::clone(&stop);
         std::thread::spawn(move || {
