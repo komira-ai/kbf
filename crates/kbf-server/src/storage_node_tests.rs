@@ -15,7 +15,7 @@ use kbf_objstore::{
     ObjectStoreError, PageSize,
 };
 
-use super::{one_voter, open_among, open_registered, prefix_root};
+use super::{catch_up_for, one_voter, open_among, open_registered, prefix_root};
 use crate::RaftMetaLog;
 use crate::join::Joined;
 
