@@ -6,6 +6,8 @@ use kbf_types::{
     Outcome, Qos, Resources, WaiterId, WorkerId,
 };
 
+use crate::servable::serves;
+
 /// One execution request, as the front submits it after the cache missed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
@@ -46,6 +48,17 @@ impl Request {
     #[must_use]
     pub fn joinable(&self) -> bool {
         self.hermetic && !self.do_not_cache
+    }
+
+    /// Whether a worker that reports `caps` and has `capacity` could run this request once
+    /// its bookings end, which is what makes the request servable: the worker reports a
+    /// driver that serves the lease kind, its capabilities satisfy the platform, and its
+    /// whole capacity holds the request's resources. It is the same test the scheduler
+    /// applies to the workers it holds (`servable.rs`); a caller that knows workers of
+    /// other schedulers asks it of those.
+    #[must_use]
+    pub fn runnable_on(&self, caps: &NodeCaps, capacity: &Resources) -> bool {
+        serves(caps, self.kind) && self.needs.matches(caps) && capacity.fits(&self.resources)
     }
 }
 

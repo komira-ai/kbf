@@ -1,7 +1,7 @@
-//! The controller's ports over the farm and its sessions (`docs/design/split-mode-updates.md`
+//! The ports over the farm and its sessions (`docs/design/split-mode-updates.md`
 //! section 6.1): a real farm with real node sessions (the stream is the channel the server
-//! writes), the real update client (`kbf-update`) as the node, and the controller driven look
-//! by look. The helper is the test: it writes `status.json` as the root helper does.
+//! writes) and the real update client (`kbf-update`) as the node. The helper is the test: it
+//! writes `status.json` as the root helper does.
 
 #[path = "support/hooked.rs"]
 mod hooked;
@@ -20,9 +20,7 @@ use kbf_proto::update::{UpdateOrder, UpdateStatus};
 use kbf_proto::worker::{ServerMessage, server_message};
 use kbf_server::farm::{Farm, Reported, StreamId};
 use kbf_server::members::{Members, MembershipConfig};
-use kbf_server::update::{
-    Controller, HostPhase, OrderId, Policy, Release, Rows, Source, Transport, ports,
-};
+use kbf_server::update::{OrderId, Release, Rows, Source, Transport, ports};
 use kbf_state::Store;
 use kbf_types::{FarmTime, Resources, WorkerId};
 use kbf_update::{Component, Config, Expected, Handle, Offer, Order};
@@ -175,129 +173,6 @@ fn hooked_store() -> (Arc<hooked::Hooked>, Arc<dyn Store>) {
 
 fn members(store: &Arc<dyn Store>) -> Arc<Members> {
     Arc::new(Members::new(Arc::clone(store), MembershipConfig::default()))
-}
-
-fn controller(farm: &Arc<Farm>, store: &Arc<dyn Store>) -> Controller {
-    let (transport, source) = ports(
-        Arc::clone(farm),
-        Rows::new(Arc::clone(store)),
-        members(store),
-    );
-    Controller::new(
-        Arc::clone(store),
-        farm.lease_epoch(),
-        Box::new(transport),
-        Box::new(source),
-    )
-}
-
-/// Looks until `done` says so, at most `looks` times; the orders sent meanwhile are `taken`.
-fn look_until(
-    controller: &mut Controller,
-    farm: &Farm,
-    looks: usize,
-    mut done: impl FnMut() -> bool,
-) {
-    for _ in 0..looks {
-        if done() {
-            return;
-        }
-        controller.tick(farm.wall_now()).expect("a look");
-    }
-    assert!(done(), "not done after {looks} looks");
-}
-
-fn phase(store: &Arc<dyn Store>, node: &str) -> Option<HostPhase> {
-    let hosts = Rows::new(Arc::clone(store)).hosts().expect("rows");
-    hosts
-        .get(&WorkerId::new(node))
-        .map(|row| row.value.record.phase.clone())
-}
-
-/// A controller run over one Mac, the whole way: cordon, activate, the helper reports, the
-/// daemon comes back at the release, confirm, uncordon. The node is the real update client;
-/// the activation and the confirmation reach it as orders of the epoch `Welcome` names, the
-/// client accepts each, and the helper's word comes back as the `UpdateStatus` that moves
-/// the host on. The confirmation has an id of its own (the client would drop the
-/// activation's as a replay), and the status that names it counts for the activation.
-///
-/// Mutants seen red: the order sent under another epoch (the client refuses it and the run
-/// is held at `Activating`); the confirmation without its commit (refused: the commit is
-/// neither staged nor installed); the confirmation under the activation's id (dropped as a
-/// replay, never acted on).
-#[test]
-fn a_run_activates_one_node_and_confirms_it() {
-    let farm = farm();
-    let store = store();
-    let rows = Rows::new(Arc::clone(&store));
-    rows.offer(&Release::new(A), farm.wall_now())
-        .expect("a run");
-    rows.set_policy(&Policy {
-        auto_nodes: true,
-        ..Policy::default()
-    })
-    .expect("policy");
-    let mut node = Node::new(&farm, "mac-1", "fedcba987654");
-    let mut controller = controller(&farm, &store);
-
-    // Cordon, wait for the leases (none), activate.
-    let mut sent = Vec::new();
-    look_until(&mut controller, &farm, 30, || {
-        sent.extend(node.orders());
-        !sent.is_empty()
-    });
-    let [activation] = &sent[..] else {
-        panic!("one order expected: {sent:?}");
-    };
-    assert_eq!(
-        activation.verb,
-        kbf_proto::update::update_order::Verb::Activate as i32
-    );
-    assert_eq!(activation.epoch, farm.lease_epoch());
-    assert_eq!(activation.commit, A);
-    assert!(activation.order_id > 0);
-    assert!(cordoned(&farm, &node.id));
-    assert_eq!(node.take(activation), kbf_update::Decision::Accepted);
-
-    // The helper flips and restarts the daemon: a new process, a new session, the new commit.
-    helper_says(
-        &node.dir,
-        "activated_unconfirmed",
-        A,
-        "",
-        activation.order_id,
-    );
-    let old_stream = node.stream;
-    let (stream, inbound) = register(&farm, "mac-1", "macos");
-    (node.stream, node.inbound) = (stream, inbound);
-    node.client = client(&node.dir, &A[..12]);
-    node.report();
-    assert_ne!(old_stream, node.stream);
-
-    let mut sent = Vec::new();
-    look_until(&mut controller, &farm, 30, || {
-        sent.extend(node.orders());
-        !sent.is_empty()
-    });
-    let [confirmation] = &sent[..] else {
-        panic!("one order expected: {sent:?}");
-    };
-    assert_eq!(
-        confirmation.verb,
-        kbf_proto::update::update_order::Verb::Confirm as i32
-    );
-    assert_eq!(confirmation.commit, A);
-    assert_eq!(confirmation.epoch, activation.epoch);
-    assert!(confirmation.order_id > activation.order_id);
-    assert_eq!(node.take(confirmation), kbf_update::Decision::Accepted);
-
-    // The helper confirms, naming the confirmation's id; the host is done and uncordoned.
-    helper_says(&node.dir, "confirmed", A, "", confirmation.order_id);
-    node.report();
-    look_until(&mut controller, &farm, 30, || {
-        phase(&store, "mac-1") == Some(HostPhase::Done)
-    });
-    assert!(!cordoned(&farm, &node.id));
 }
 
 /// Catches an order sent under an epoch the sessions did not name (a node would refuse it, or

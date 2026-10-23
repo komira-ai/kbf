@@ -506,6 +506,17 @@ fn a_joined_operation_keeps_its_losses_and_fate() {
             .submit(OperationId(0), &request(1), &subject())
             .is_ok()
     );
+    let start = kbf_types::StartLease {
+        worker: kbf_types::WorkerId::new("node-a"),
+        lease: kbf_types::LeaseId::new(5, 0),
+        operation: OperationId(0),
+        key: request(1).key,
+        kind: LeaseKind::Action,
+        resources: Resources::new(1_000, 1 << 30),
+        fence: kbf_types::FencePolicy::RunOn,
+        device: None,
+    };
+    other.persist(&[Effect::Start(start)], None).expect("grant");
     let requeue = kbf_sched::Requeue {
         operation: OperationId(0),
         lease: kbf_types::LeaseId::new(5, 0),
@@ -532,13 +543,24 @@ fn a_joined_operation_keeps_its_losses_and_fate() {
     assert_eq!(state.sched.fate(OperationId(0)), Some(fate));
 }
 
-/// Catches: a finish of an operation whose rows are gone (a retry of a finish that
-/// landed) failing for want of a pin to look up.
+/// Asserts that a finish of an operation whose rows are gone (a retry of a finish that
+/// landed) is acknowledged without a pin to look up, and writes nothing more: the result
+/// of the first try stands.
 #[test]
-fn finishing_an_operation_with_no_rows_writes_its_result_alone() {
+fn finishing_an_operation_with_no_rows_writes_nothing_more() {
     let store = LostAck::new();
     let durable = durable_over(&store);
+    assert!(
+        durable
+            .submit(OperationId(7), &request(1), &subject())
+            .is_ok()
+    );
     refuse(&durable, 7);
+    let txns = store.commit_stats().txns;
+
+    refuse(&durable, 7);
+
+    assert_eq!(store.commit_stats().txns, txns);
     assert_eq!(rows(&store, "inflight/"), 0);
     assert_eq!(rows(&store, "done/"), 1);
 }

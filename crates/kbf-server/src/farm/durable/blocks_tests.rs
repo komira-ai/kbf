@@ -19,14 +19,14 @@ const CAS_TRIES: usize = super::blocks::CAS_TRIES;
 /// A store that applies a transaction of another frontend just before a write of this one
 /// that names the transaction's key, oldest first: a write landing between this
 /// frontend's read of a row and its own write of it.
-struct Racing {
+pub(super) struct Racing {
     inner: Fake,
     landings: Mutex<Vec<(String, Txn)>>,
     down: AtomicBool,
 }
 
 impl Racing {
-    fn new() -> Arc<Self> {
+    pub(super) fn new() -> Arc<Self> {
         let clock = Arc::new(ManualClock::default());
         Arc::new(Self {
             inner: Fake::with_flaw(clock, Flaw::None),
@@ -36,7 +36,7 @@ impl Racing {
     }
 
     /// `landing` is applied before the next write that names `key`.
-    fn land(&self, key: &str, landing: Txn) {
+    pub(super) fn land(&self, key: &str, landing: Txn) {
         let mut queued = self.landings.lock().expect("lock");
         queued.push((key.to_owned(), landing));
     }
@@ -90,7 +90,7 @@ impl Store for Racing {
 }
 
 /// A handle over `store` that kept the epoch it found or made (100 in an empty store).
-fn durable_over(store: &Arc<Racing>) -> Durable {
+pub(super) fn durable_over(store: &Arc<Racing>) -> Durable {
     let store: Arc<dyn Store> = store.clone();
     Durable::open(store, EpochPolicy::Keep, 100)
         .expect("open")
@@ -111,7 +111,7 @@ fn bump(previous: u64, epoch: u64) -> EpochBump {
     EpochBump { previous, epoch }
 }
 
-fn request(tag: u8) -> Request {
+pub(super) fn request(tag: u8) -> Request {
     Request {
         key: ActionKey {
             instance: "main".to_owned(),
