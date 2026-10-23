@@ -6,6 +6,7 @@
 //! by the workflow before this test.
 
 #![cfg(target_os = "macos")]
+#![allow(clippy::too_many_arguments)]
 
 mod support;
 

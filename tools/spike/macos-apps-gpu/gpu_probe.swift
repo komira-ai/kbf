@@ -42,12 +42,14 @@ if CommandLine.arguments.count > 1 {
     catch { stage("library-precompiled", false, "\(error)") }
 }
 if lib == nil {
-    do { lib = try dev.makeLibrary(source: src, options: nil); stage("library-runtime-compile", true) }
+    let tc = Date()
+    do { lib = try dev.makeLibrary(source: src, options: nil); stage("library-runtime-compile", true, "ms=\(Int(Date().timeIntervalSince(tc) * 1000))") }
     catch { stage("library-runtime-compile", false, "\(error)"); exit(5) }
 }
 guard let fn = lib?.makeFunction(name: "matmul") else { stage("function", false); exit(6) }
 let pso: MTLComputePipelineState
-do { pso = try dev.makeComputePipelineState(function: fn); stage("pipeline", true, "maxThreads=\(pso.maxTotalThreadsPerThreadgroup)") }
+let tp = Date()
+do { pso = try dev.makeComputePipelineState(function: fn); stage("pipeline", true, "ms=\(Int(Date().timeIntervalSince(tp) * 1000)) maxThreads=\(pso.maxTotalThreadsPerThreadgroup)") }
 catch { stage("pipeline", false, "\(error)"); exit(7) }
 
 var a = [Float](repeating: 0, count: n * n), b = a
@@ -78,4 +80,9 @@ for _ in 0..<2000 {
 }
 stage("result", bad == 0, "mismatches=\(bad)/2000")
 print(bad == 0 && cb.status == .completed ? "GPU_PROBE_PASS" : "GPU_PROBE_FAIL")
+// GPU_HOLD=1: keep the device, queue and buffers open until killed.
+if ProcessInfo.processInfo.environment["GPU_HOLD"] != nil {
+    print("HOLD_READY"); fflush(stdout)
+    withExtendedLifetime((dev, queue, ba, bb, bc, pso)) { sleep(900) }
+}
 exit(bad == 0 && cb.status == .completed ? 0 : 10)

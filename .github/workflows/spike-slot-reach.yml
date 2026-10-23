@@ -1,6 +1,5 @@
-# SPIKE (spike/mac-apps-gpu, never merges): GPU, XCUITest and a signed app, as the runner user
-# and as a pool user, unsandboxed and under the slot profile
-# (crates/kbf-driver-native/tests/apps_gpu_spike.rs, tools/spike/macos-apps-gpu).
+# SPIKE (spike/mac-apps-gpu, never merges): the GPU state a pool user leaves behind, and what the slot clean removes
+# (crates/kbf-driver-native/tests/gpu_state_spike.rs, tools/spike/macos-apps-gpu).
 name: spike-slot-reach
 
 on:
@@ -42,7 +41,7 @@ jobs:
           ($PY -m venv $B/venv && perl -e 'alarm shift; exec @ARGV' 300 $B/venv/bin/pip install mlx 2>&1 | tail -3) || echo "MLX_INSTALL_FAILED"
           chmod -R a+rX $B
       - name: Pool user arms (root, real users)
-        run: cargo xtask sudo-test -p kbf-driver-native --test apps_gpu_spike -- --test-threads=1 --nocapture 2>&1 | tee /private/tmp/kbf-spike-logs/pool-arms.out
+        run: cargo xtask sudo-test -p kbf-driver-native --test gpu_state_spike -- --test-threads=1 --nocapture 2>&1 | tee /private/tmp/kbf-spike-logs/pool-arms.out
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
