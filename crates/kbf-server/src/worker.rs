@@ -37,7 +37,7 @@
 //!   now, when it holds one (the `map_push` module);
 //! - an `UpdateStatus` the deny list now refuses ends the stream. Otherwise it is kept
 //!   as the node's newest update status, unless a newer stream of the node has
-//!   registered since ([`Farm::update_status`]); the update controller reads it
+//!   registered since ([`Farm::update_status`]); the update session reads it
 //!   ([`crate::update_status`]);
 //! - an `Offer` from a daemon is not read: offers go the other way.
 //!
@@ -350,7 +350,7 @@ impl Session {
                 self.map.answer()
             }
             Some(daemon_message::Message::UpdateStatus(status)) => {
-                // A revoked daemon's status must not reach the update controller either.
+                // A revoked daemon's status must not reach the update session either.
                 self.peers
                     .admit(self.peer.as_ref(), worker.as_str())
                     .await?;

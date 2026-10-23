@@ -14,10 +14,10 @@ mod support;
 use std::collections::BTreeSet;
 
 use kbf_server::update::{
-    Facts, HoldReason, HostPhase, Pick, Picked, PlatformClass, Policy, Skip, SlotClass, WaitReason,
-    pick,
+    Facts, HoldReason, Holder, HostPhase, Pick, Picked, PlatformClass, Policy, Skip, Slot,
+    SlotClass, WaitReason, pick,
 };
-use support::{NOW, facts, host_mut, id, linux, mac, members, policy, storage, t};
+use support::{NOW, facts, host_mut, id, linux, mac, members, order, policy, storage, t};
 
 fn pick_now(f: &Facts) -> Pick {
     pick(f, &policy(), t(NOW))
@@ -224,4 +224,25 @@ fn a_host_in_a_step_does_not_serve_the_floor_whatever_placement_shows() {
         panic!("a host was picked with nothing left to serve");
     };
     assert!(skips.contains(&(id("d2"), Skip::BelowMinServing { serving: 0 })));
+}
+
+/// Catches: a slot that reads as empty while either kind of place is held (a storage holder
+/// with no host beside it, or a host with no storage holder), or as held while it is empty.
+#[test]
+fn a_slot_is_empty_only_when_neither_kind_of_place_is_held() {
+    let holder = |name: &str| Holder {
+        host: id(name),
+        order: order(3),
+    };
+    assert!(Slot::default().is_empty());
+    let storage = Slot {
+        storage: Some(holder("s1")),
+        hosts: Vec::new(),
+    };
+    assert!(!storage.is_empty());
+    let hosts = Slot {
+        storage: None,
+        hosts: vec![holder("d1")],
+    };
+    assert!(!hosts.is_empty());
 }

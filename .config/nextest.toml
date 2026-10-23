@@ -75,7 +75,6 @@ not (
   | (binary_id(=kbf-sched::sim_f2_failures) & test(=f2_13_leases_of_other_terms_are_never_cancelled))
   | (binary_id(=kbf-sched::sim_whole_machine) & test(=whole_machine_leases_are_not_starved_by_a_stream_of_actions))
   | (binary_id(=kbf-server::restart) & (test(=a_lease_under_the_raft_log_carries_the_raft_term) | test(=a_restart_over_the_raft_log_does_not_answer_the_old_operation_names) | test(=a_restart_over_the_raft_log_refuses_the_old_process_s_results)))
-  | (binary_id(=kbf-server::update_sim) & (test(=a_run_and_its_rollback_end_the_same_way_on_a_sqlite_file) | test(=a_run_and_its_rollback_end_with_every_host_walked_under_lagging_facts)))
   | (binary_id(=kbf-server::worker_blobs) & test(=concurrent_writes_on_the_worker_listener_all_finish_under_the_bound))
   | (binary_id(=kbf-server::write_admission) & (test(=concurrent_writes_stay_under_the_bytes_in_flight) | test(=more_waiting_writes_than_a_fixed_window_holds_all_finish)))
   | (binary_id(=kbf-sim-cell::cell) & (test(=calm_seeds_keep_every_property) | test(=restart_seeds_keep_properties_1_2_5_6_7) | test(=whole_process_seeds_keep_every_property_and_rerun_what_the_kill_cut)))

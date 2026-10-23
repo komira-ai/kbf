@@ -180,7 +180,7 @@ fn identity(caps: &kbf_caps::NodeCaps) -> (String, &'static str) {
     (os, caps.cpu.arch().name())
 }
 
-/// A node as the update controller reads it ([`Farm::update_look`]).
+/// A node as the update node step reads it ([`Farm::update_look`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeLook {
     /// Its id.
@@ -720,7 +720,7 @@ impl Farm {
             .map_err(|_| SendError::NotConnected(worker.to_string()))
     }
 
-    /// Every node registered since this farm started, as the update controller reads it, in
+    /// Every node registered since this farm started, as the update node step reads it, in
     /// node-id order.
     pub fn update_look(&self) -> Vec<NodeLook> {
         let mut state = self.lock();
