@@ -140,7 +140,7 @@ fn crash(mode: &str, dir: &Path) {
 }
 
 /// R-1. Catches a partial or unhashed file under a final name and a `tmp/` not cleared
-/// (the "fill straight into `blobs/`" and "skip the `tmp/` clear" mutants): a daemon
+/// (defects "fill straight into `blobs/`" and "skip the `tmp/` clear"): a daemon
 /// killed between a fill's last write and its rename leaves its file in `tmp/` only;
 /// the next start clears it, and the next lease fetches the blob and gets its bytes.
 #[tokio::test]
@@ -182,9 +182,9 @@ async fn a_fill_killed_before_its_rename_leaves_no_entry() {
 }
 
 /// R-5. Catches an unindexed file served without a re-hash, and files inserted since
-/// the last snapshot deleted or never counted (the "adopt as verified", "link an
+/// the last snapshot deleted or never counted (defects "adopt as verified", "link an
 /// existing name without hashing", "make the pass unlink unknown files" and "adopt
-/// without adding the size" mutants). Set a is in the snapshot, set b was filled after
+/// without adding the size"). Set a is in the snapshot, set b was filled after
 /// it when the daemon was killed; one b file then has a byte flipped. With the pass
 /// held, a lease needing a good b file fetches nothing and re-hashes it; one needing
 /// the flipped file re-hashes it, fetches it once and gets its bytes. The pass then

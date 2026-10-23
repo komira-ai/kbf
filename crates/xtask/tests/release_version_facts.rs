@@ -112,7 +112,7 @@ fn it_keeps_the_exact_bytes_under_the_name_of_the_tarball_and_lists_them() {
     // and written again), under a name that is not the stem of the `kbf` tarball `package`
     // writes, or with no line in `SHA256SUMS.<platform>` (the sums job would refuse the
     // file), and a line that does not survive the `package` of the tarball after it, the
-    // assembly of the sums and their check. Mutants: the printed bytes replaced by a
+    // assembly of the sums and their check. Catches: the printed bytes replaced by a
     // re-serialisation; the name misspelled; the sums line not written.
     let said = says(COMMIT, "release");
     let f = fx("exact", &said);
@@ -174,7 +174,7 @@ fn it_refuses_what_is_no_release_build_of_the_commit_and_writes_nothing() {
     // taken as the facts of this build; and a refusal that leaves a file, the directory or a
     // sums line behind. A field this xtask does not know is a newer build's and is kept (the
     // installer's reader ignores it; `binary_tests` pins that), so it is no refusal here.
-    // Mutants: the commit not compared; the profile not compared; a required field made
+    // Catches: the commit not compared; the profile not compared; a required field made
     // optional; the cap dropped.
     let ok = says(COMMIT, "release");
     let other = says(OTHER, "release");
@@ -193,7 +193,7 @@ fn it_refuses_what_is_no_release_build_of_the_commit_and_writes_nothing() {
 #[test]
 fn a_binary_that_exits_with_an_error_is_refused_whatever_it_printed() {
     // Catches: the exit status ignored because the output reads as facts. The fake prints
-    // valid facts of the commit and then exits 1, so only the status can refuse it. Mutant:
+    // valid facts of the commit and then exits 1, so only the status can refuse it. Catches:
     // the status check dropped.
     let f = fx("fails", &says(COMMIT, "release"));
     std::fs::write(f.kbf.with_file_name("kbf.mode"), "fail").expect("mode");
@@ -206,7 +206,7 @@ fn a_binary_that_exits_with_an_error_is_refused_whatever_it_printed() {
 #[test]
 fn a_binary_that_does_not_answer_is_killed_when_the_time_is_up() {
     // Catches: no time limit (the job would wait for the runner's limit), and a limit
-    // that waits for the binary to end on its own. The fake sleeps for two minutes. Mutant:
+    // that waits for the binary to end on its own. The fake sleeps for two minutes. Catches:
     // the timeout flag of the run ignored.
     let f = fx("hangs", &says(COMMIT, "release"));
     std::fs::write(f.kbf.with_file_name("kbf.mode"), "hang").expect("mode");
@@ -232,7 +232,7 @@ fn the_binary_runs_with_an_empty_environment() {
     // Catches: the runner's environment (its tokens) handed to a binary the job has not yet
     // vouched for. The fake writes `ran` and then one line per variable it was given into
     // the file `kbf.env`, which holds nothing until it runs; this process has a secret of
-    // its own. Mutant: `env` filled from the caller's.
+    // its own. Catches: `env` filled from the caller's.
     let f = fx("env", &says(COMMIT, "release"));
     let log = f.kbf.with_file_name("kbf.env");
     std::fs::write(&log, "").expect("marker");
@@ -304,7 +304,7 @@ fn an_out_that_is_a_file_is_refused_and_left_alone() {
 #[test]
 fn it_replaces_nothing_and_lists_nothing_twice() {
     // Catches: a second run that replaces the facts or lists them twice; a file in the way
-    // that the sums do not list replaced. Mutants: `create_new` replaced by a plain write;
+    // that the sums do not list replaced. Catches: `create_new` replaced by a plain write;
     // the check of the sums file dropped (the first half would then name the write).
     let f = fx("twice", &says(COMMIT, "release"));
     let (code, _, err) = run(&f, COMMIT, PLATFORM);

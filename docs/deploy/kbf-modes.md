@@ -33,8 +33,11 @@ Linux only, container driver only: any other `--driver` is refused, and so is `-
 **`frontend`.** It serves REAPI (Execute, the scheduler, operations) and the worker
 listener's work streams, and it routes each cache call to a storage node. It holds no blobs
 and refuses every flag of a store. `--storage` is required: the URL of one storage node.
-With a state store and the TLS flags the frontend keeps the farm's storage map and routes
-every call by it; `--storage` is then only the bootstrap node.
+`--state-store` is required too, a Postgres URL (a `sqlite://` one still starts in this
+release; see "Growing from one host to many"): a frontend given none, by the flag or by `state-store` in `kbf.toml`, exits 2 naming the flag
+before it listens on anything, and `kbf --mode=frontend --check` exits 2 the same way. With
+the TLS flags the frontend keeps the farm's storage map and routes every call by it;
+`--storage` is then only the bootstrap node.
 
 **`storage`.** It serves the storage service over gRPC and nothing else: no REAPI, no
 scheduler, no operator API (only `GET /metrics`, on `--metrics-listen`, off unless given).
@@ -241,14 +244,16 @@ the `Planned:` paragraph.
 
 1. **The state store.** `all-in-one` defaults to `postgres:///kbf?host=/run/postgresql`,
    the database `kbf` on a local socket, reached as the process's own user. It also accepts
-   `sqlite:///absolute/path` for now. A farm's frontend uses Postgres: `kbf-installer setup`
-   provisions the role and database (`--create-local-database`) or refuses with the
-   `pg_hba.conf` and `pg_ident.conf` lines to add, and it never edits either file. Postgres
-   must flush commits before it acknowledges them (`synchronous_commit` on) or the start is
-   refused. A URL with a password is refused. The state store also holds the storage members,
-   the enrollment registry and the object-store registration, so a frontend that registers
-   nodes needs one; without it the scheduler's state is in memory and the members routes
-   answer 404.
+   `sqlite:///absolute/path` for this release only: a start on it works and logs a warning
+   that SQLite is removed in the next release (see the upgrade notes). A frontend has no
+   default and refuses to start without `--state-store`. A farm's frontend uses Postgres:
+   `kbf-installer setup` provisions the role and database (`--create-local-database`) or
+   refuses with the `pg_hba.conf` and `pg_ident.conf` lines to add, and it never edits either
+   file. Postgres must flush commits before it acknowledges them (`synchronous_commit` on) or
+   the start is refused. A URL with a password is refused: the command line is readable by
+   every user on the host, so the role is reached by the socket and peer authentication. The
+   state store also holds the storage members, the enrollment registry and the object-store
+   registration.
 2. **The CA and certificates.** `all-in-one` already needs mutual TLS between its two halves.
    A farm needs one CA and one certificate per node, each with exactly one role (`frontend`,
    `storage` or `daemon`, as `urn:kbf:role:<role>`). The frontend runs the enrollment
@@ -290,8 +295,9 @@ half gains `--frontend`, `--advertise-addr`, `--storage-zone` and `--storage-wei
 
 **Planned:** a conversion of the blobs, the action cache and the queue of an `all-in-one`
 host into a farm. Today the farm starts with an empty cache and its own scheduler state;
-in-flight work does not move, and every start of a frontend is a new epoch in which the
-daemons kill the runs of the leases they held before. Copying a joining member's slice to it
+in-flight work does not move, and the farm's new state store is given an epoch of its own,
+so the daemons that reconnect see an epoch they did not know and kill the runs of the
+leases they held before. Copying a joining member's slice to it
 (the join handoff, architecture-v2.md section 8.4) is not built either.
 
 ## Stopping and draining

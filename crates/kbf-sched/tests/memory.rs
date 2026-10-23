@@ -489,7 +489,7 @@ fn two_instances_with_the_same_action_keep_separate_floors() {
     );
 }
 
-/// Catches: a busy node's kill that raises the booking or the floor (the mutant: it
+/// Catches: a busy node's kill that raises the booking or the floor (the defect: it
 /// is the node's fault, not the action's), one that is answered at once or rerun
 /// without end, a node whose pressure is not counted (or counted against another
 /// node), a rerun on the node that killed it while another can run it, and runs not

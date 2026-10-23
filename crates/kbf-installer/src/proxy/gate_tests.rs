@@ -1,7 +1,7 @@
 //! The two calls the real gate added to U7a's `Gate`: `clear_active` and `retire`. A child
 //! that served is signalled only after the gate closed its slot, and an all-in-one host
 //! starts nothing until the stopped process's slot is closed. Each test names the defect it
-//! catches; the mutants planted to see it red are listed in the PR.
+//! catches.
 
 use super::fakes::*;
 use super::model::*;

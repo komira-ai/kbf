@@ -132,7 +132,7 @@ async fn outputs_are_stored_at_the_owner() {
 /// Catches one server name for every storage node (`--tls-server-name`, which the tests'
 /// TLS files set to `localhost`, applied to storage): node-03 is dialled as 127.0.0.1 and
 /// answers with the certificate of `localhost` (node-02's), signed by the farm's CA. It is
-/// refused before a request is made; the same node by its own name is read. Mutant:
+/// refused before a request is made; the same node by its own name is read. Catches:
 /// storage dialled with `TlsFiles::load()` (the frontend's name) accepts it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_nodes_certificate_for_another_host_is_refused() {
@@ -162,7 +162,7 @@ async fn a_nodes_certificate_for_another_host_is_refused() {
 /// `STALE_MAP` mid-fetch: node A (the only owner in generation 2) says it is at 3 while
 /// the daemon reads; the daemon asks for a map of 3 (`holder.asks`, which its session
 /// turns into a `MapRequest`), the frontend's answer arrives (offered here), and the read
-/// is made again against generation 3's owner, B. Mutants: a refetch that fails at once
+/// is made again against generation 3's owner, B. Catches: a refetch that fails at once
 /// (a lost fetch); one that returns the map held without waiting for the newer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stale_map_mid_fetch_is_refetched_and_the_fetch_goes_to_the_new_owner() {
@@ -345,7 +345,7 @@ async fn through<C: Cas>(
 /// the owner, and the frontend gets none), on a lease begun on each side, and on the
 /// plane's own calls. The two sides run different limits, so `in_flight` says which side
 /// answered. A lease keeps the side it began on after the map arrives, and leasing from
-/// it chooses again. Mutants: any one method of either impl forced to the server side.
+/// it chooses again. Catches: any one method of either impl forced to the server side.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_operation_follows_the_side_of_the_plane_and_of_its_lease() {
     let pki_ = pki("farm-cas-ops");

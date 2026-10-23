@@ -287,7 +287,7 @@ mod tests {
         }
     }
 
-    /// Catches: a footprint run read from the cgroup block (the mutant that always
+    /// Catches: a footprint run read from the cgroup block (a version that always
     /// reads cgroup), the footprint peak filed as `memory_peak_bytes` (a footprint and a
     /// cgroup peak pooled), and a cgroup block that rides beside a footprint basis
     /// leaking its counters.

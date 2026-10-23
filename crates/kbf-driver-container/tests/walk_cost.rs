@@ -97,7 +97,7 @@ async fn walk(upper: &std::path::Path, threads: usize) -> (ActionResult, MemoryC
 
 /// Catches a megabyte allocated per file: 3,000 files of about 400 bytes are walked,
 /// hashed and stored with at most a handful of allocations of a megabyte or more, not
-/// one per file (mutant: the hash buffer sized to a chunk for every file, or zeroed
+/// one per file (catches: the hash buffer sized to a chunk for every file, or zeroed
 /// afresh per file, as `FileBlob::hash` did: 3,000). The budget is the hashing threads'
 /// buffers (none for files this small) and the run's own, with room for the runtime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

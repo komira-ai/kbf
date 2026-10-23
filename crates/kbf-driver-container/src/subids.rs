@@ -286,7 +286,7 @@ mod tests {
         }
     }
 
-    /// Catches the "skip the check" mutant: a user with no range, in either file (or
+    /// Catches the "skip the check" catches: a user with no range, in either file (or
     /// with no file at all), starts a daemon whose every container fails. The message
     /// names the file, the user and the fix.
     #[test]

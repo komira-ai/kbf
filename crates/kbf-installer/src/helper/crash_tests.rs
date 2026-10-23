@@ -415,7 +415,7 @@ fn kill_at_every_step_of_an_activate() {
 /// restarted if the links moved, and the release is fetched once, or twice only when the
 /// kill came before the fetch had finished.
 ///
-/// Mutants planted: the restart owed before the fetch (a kill in between restarts the
+/// Catches: the restart owed before the fetch (a kill in between restarts the
 /// service with nothing swapped); the order file removed before the swap.
 #[test]
 fn kill_at_every_step_of_an_activate_that_fetches() {
@@ -439,7 +439,7 @@ fn kill_at_every_step_of_a_revert_in_a_new_epoch() {
 /// puts it, `status.json` names the same installed release, no unit was restarted (not by the
 /// repair either), and the order file is gone.
 ///
-/// Mutants planted: the repair owing a restart on a frontend host; the status not rewritten
+/// Catches: the repair owing a restart on a frontend host; the status not rewritten
 /// after a restart; the links moved before the state (the repair then restores the old ones).
 #[test]
 fn kill_at_every_step_of_a_frontend_update() {
@@ -466,7 +466,7 @@ fn kill_at_every_step_of_an_expiry() {
 /// unit's start check, the links and the state agree and the log is as the older release left
 /// it, with the file the newer one added gone.
 ///
-/// Mutant planted: the start check putting the log back only on the path that reverts itself
+/// Catches: the start check putting the log back only on the path that reverts itself
 /// (and not at a start after a revert some other pass made).
 #[test]
 fn kill_at_every_step_of_an_expiry_that_raised_the_log() {
@@ -475,7 +475,7 @@ fn kill_at_every_step_of_an_expiry_that_raised_the_log() {
 
 /// Catches orders read through a linked spool: the service user owns that directory's
 /// parent chain below the root tree and could point `orders` at one of its own anywhere.
-/// Mutant seen red: `orders` opened by a path that follows the link: the helper acted on the
+/// Catches: `orders` opened by a path that follows the link: the helper acted on the
 /// order and removed the file.
 #[test]
 fn a_spool_replaced_by_a_link_is_not_followed_for_orders() {

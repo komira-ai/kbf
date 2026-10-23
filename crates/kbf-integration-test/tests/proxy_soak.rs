@@ -55,7 +55,12 @@ use proxy_support::{
 };
 
 pub fn frontend(dir: &Path, name: &str, node: &Child, base: u16) -> Child {
-    Child::start(dir, name, &frontend_args(&node.field("storage="), base))
+    let state = dir.join(name).join("state.db");
+    Child::start(
+        dir,
+        name,
+        &frontend_args(&node.field("storage="), base, &state),
+    )
 }
 
 /// Streams opened before the swap and finished after it.

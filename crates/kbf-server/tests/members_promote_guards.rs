@@ -40,7 +40,7 @@ struct OnlyMember {
 /// and the one that reopens the epoch is the sweeper, which has not run: the promoting beat
 /// must refuse on the boots alone. It is the only thing wrong: the joiner is one second
 /// short of promoted, the owner restarts, the next beat would promote. Then the sweeper runs
-/// and the join completes under the newer epoch. Mutant seen red: the comparison of the
+/// and the join completes under the newer epoch. Catches: the comparison of the
 /// fence's boots with the map's removed from the beat (promoted at that beat).
 #[test]
 fn a_restarted_owner_that_is_not_the_joiner_blocks_the_beat_until_the_epoch_is_reopened() {
@@ -85,7 +85,7 @@ fn a_restarted_owner_that_is_not_the_joiner_blocks_the_beat_until_the_epoch_is_r
 /// that only its (fresh) report speaks for it: a planned restart began after the member
 /// reported it had flushed, and what it stages while it is down is flushed by nobody. The
 /// `Down` check is the only blocker: every member's report is fresh and at the generation
-/// the join needs. Then the plan is undone and the fence opens. Mutant seen red: the `Down`
+/// the join needs. Then the plan is undone and the fence opens. Catches: the `Down`
 /// branch of the barrier removed (the epoch opens at the third report).
 #[test]
 fn a_member_planned_down_after_its_fresh_flush_report_still_holds_the_fence_shut() {
@@ -110,7 +110,7 @@ fn a_member_planned_down_after_its_fresh_flush_report_still_holds_the_fence_shut
 /// `Down`: a frontend without this feature refreshed the map through the whole dwell, so
 /// when the handoff frontend first looks the member is no longer `Down` anywhere, and only
 /// the fence's recorded boots remember it. The join must be degraded then, and withheld for
-/// as long as the joiner keeps reporting complete. Mutant seen red: the clause of the
+/// as long as the joiner keeps reporting complete. Catches: the clause of the
 /// fence step that marks the join degraded when a recorded owner left the map removed
 /// (promoted after the settle time).
 #[test]
@@ -144,7 +144,7 @@ fn an_owner_that_left_the_map_unseen_by_the_sweeper_degrades_the_join() {
 /// operator's drain is half done (its row is written, its map not yet published: the two
 /// are separate commits): the map and the mark are as the beat read them, so only the
 /// version of the row stands in the way. The beat reads `Draining` at its next attempt and
-/// promotes nothing. Mutant seen red: the promoting row written without the version it
+/// promotes nothing. Catches: the promoting row written without the version it
 /// was read at (the joiner is `Active` after the drain was published).
 #[test]
 fn a_row_that_changed_under_the_promoting_beat_is_not_overwritten() {
@@ -174,7 +174,7 @@ fn a_row_that_changed_under_the_promoting_beat_is_not_overwritten() {
 /// is planned down by an operator between the beat's read of the map and its commit: the
 /// row of the joiner and its mark are as the beat read them, so only the check of the
 /// map's version stands in the way. The beat judges again and finds a member `Down`.
-/// Mutant seen red: the check of the map's version removed from the promoting write (the
+/// Catches: the check of the map's version removed from the promoting write (the
 /// joiner is `Active` with a member `Down`).
 #[test]
 fn a_map_that_moved_under_the_promoting_beat_is_judged_again() {
@@ -201,7 +201,7 @@ fn a_map_that_moved_under_the_promoting_beat_is_judged_again() {
 /// read of the map: the sweeper saw it `Down` (a newer epoch, the join degraded) but the
 /// map the beat then reads is back to the placement of the mark it holds, and the joiner's
 /// row and the map's version are as read. Only the mark's version stands in the way. The
-/// beat judges again by the new mark. Mutant seen red: the mark deleted without the
+/// beat judges again by the new mark. Catches: the mark deleted without the
 /// version it was read at (the joiner is `Active` on the old epoch, with the join
 /// degraded).
 #[test]
@@ -236,7 +236,7 @@ fn a_mark_the_sweeper_rewrote_under_the_promoting_beat_stops_the_promotion() {
 /// one's write, made on what it read, must not commit: the farm's generation moves once
 /// and `meta/members_formed` is written once. (The row's version, the mark's and the
 /// map's each hold the second write back: one removed leaves the test green, all three
-/// removed turn it red; the tests above take them one at a time.) Mutant seen red: the
+/// removed turn it red; the tests above take them one at a time.) Catches: the
 /// promoting write without any of the three guards (written twice).
 #[test]
 fn two_frontends_that_get_the_same_beat_promote_the_joiner_once() {

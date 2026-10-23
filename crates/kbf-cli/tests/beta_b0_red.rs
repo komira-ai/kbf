@@ -1,7 +1,7 @@
 //! Scenario B0 over a real farm, the runs that turn each gate red that tests/beta_b0.rs does
 //! not: a run asked to stop, a member drained, a failed Execute, a frontend that stops
 //! answering, a load of no builds, and the farms of one process told ports of their own. A gate
-//! that is never seen red is not a gate: `support::RED_IN_A_SCENARIO` names the test for each.
+//! that never fails is not a gate: `support::RED_IN_A_SCENARIO` names the test for each.
 
 #![cfg(target_os = "linux")]
 
@@ -281,7 +281,7 @@ fn farms_started_together_in_one_process_are_told_ports_of_their_own() {
             "{frontend}"
         );
         // Buck2 dials the frontend's REAPI port: the one told to the frontend, the one it
-        // printed. Mutant: `client_port: front.1` (the worker port).
+        // printed. Catches: `client_port: front.1` (the worker port).
         assert_eq!(farm.client_port(), ports.front.0);
         assert!(
             farm.reapi().ends_with(&format!(":{}", farm.client_port())),

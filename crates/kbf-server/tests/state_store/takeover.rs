@@ -35,7 +35,7 @@ async fn a_successor_takes_the_predecessors_lease_result_and_refuses_a_stale_one
     // The daemon received the first `Start` only: the other is given up and granted again.
     assert!(second.heartbeat(&node(), stream, 1, vec![held]).await);
     let regranted = starts(&mut inbox);
-    assert_eq!(regranted, [LeaseId::new(held.term, 2)]);
+    assert_eq!(regranted, [LeaseId::new(held.term, ID_BLOCK)]);
 
     let stale = second
         .report(&node(), invalid(undelivered))

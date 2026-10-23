@@ -325,7 +325,7 @@ async fn a_failed_pass_is_not_acknowledged_and_is_made_again() {
 
 /// Catches: an acknowledgement when no pass is quiet: an object that is listed and gone at
 /// every read (a store that lags a delete) keeps every pass finding something new, so the
-/// node never knows the listing stopped missing puts, and says nothing. Mutant seen red:
+/// node never knows the listing stopped missing puts, and says nothing. Catches:
 /// the first pass acknowledged without the repeat.
 #[tokio::test]
 async fn a_pass_that_never_goes_quiet_is_not_acknowledged() {

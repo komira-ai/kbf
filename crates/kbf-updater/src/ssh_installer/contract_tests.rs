@@ -112,7 +112,7 @@ fn every_install_outcome_of_the_host_is_read() {
 }
 
 /// Catches a drift of the query report: the field names and types, `null` for nothing
-/// installed, and in-progress taking precedence.
+/// installed (the answer `NotInstalled`, not an error), and in-progress taking precedence.
 #[test]
 fn every_query_outcome_of_the_host_is_read() {
     let report = |v: Option<&str>, c: Option<&str>, p: bool| {
@@ -142,7 +142,7 @@ fn every_query_outcome_of_the_host_is_read() {
     assert_eq!(read(&report(None, None, true)), Ok(Installed::InProgress));
     assert_eq!(
         read(&report(None, None, false)),
-        Err(PortError::other("not installed"))
+        Ok(Installed::NotInstalled)
     );
     // A query the host refuses or fails is read like an install's.
     for refusal in refusals() {

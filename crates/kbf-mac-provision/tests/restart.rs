@@ -14,7 +14,7 @@ fn restart(mac: &FakeMac) -> Result<String, Error> {
     cli::restart(&mac.profile_file(&mac.profile_text()), mac)
 }
 
-/// Catches: a restart that does not empty the error log (the script's mutant "restart
+/// Catches: a restart that does not empty the error log (the script's defect "restart
 /// does not truncate the error log"), that starts the job before it stops it ("restart
 /// starts before it stops"), or empties the log while the job runs.
 #[test]
@@ -91,7 +91,7 @@ fn a_job_that_will_not_load_fails_restart_and_apply_says_so() {
 }
 
 /// Catches: a restart that empties a file a link at the error log's path names, as
-/// root (the script's mutants "restart empties the error log without checking it", "a
+/// root (the script's defects "restart empties the error log without checking it", "a
 /// hard link at the error log path counts as safe"), that stops the job before it
 /// refuses, or an apply that keeps the link ("apply keeps whatever is at the error log
 /// path").

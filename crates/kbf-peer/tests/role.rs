@@ -44,7 +44,7 @@ fn each_role_is_read_from_its_one_uri() {
 /// Catches a certificate given a role it does not name exactly once: no role, two
 /// (also two of the same), a DNS name or a URI of another scheme that spells a role,
 /// a name that is no role or differs in case, the `urn:kbf:role:` prefix in another
-/// case (the prefix is compared byte for byte; mutant seen red: the prefix compared
+/// case (the prefix is compared byte for byte; catches the prefix compared
 /// ignoring ASCII case); and bytes that are no certificate.
 #[test]
 fn a_certificate_names_exactly_one_known_role_or_none() {

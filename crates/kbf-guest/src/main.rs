@@ -183,7 +183,7 @@ mod tests {
         "--outputs=/nonexistent/outputs",
     ];
 
-    /// Catches a root process that goes on to run its subcommand (mutants: the refusal
+    /// Catches a root process that goes on to run its subcommand (defects: the refusal
     /// dropped, or answered with another status): given the refusal, `session` and
     /// `serve` both exit 2, where without it `session` exits 0 and a `serve` with no
     /// token file exits 1, so the status shows the subcommand did not run.

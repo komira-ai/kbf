@@ -3,7 +3,7 @@
 //! change the old child was never retired and the drain waited for ever. Now the restart
 //! reconciles first: a failed switch rolls back (the intent is recorded before either
 //! child is touched), then retire runs on the dead or non-holder child. Each test names
-//! the defect it catches; the mutants planted are listed in the PR.
+//! the defect it catches.
 //!
 //! Which side of the confirm the crash is on decides the answer. `baking()` crashes before
 //! the root's confirm landed, so a dead or non-holder new child is a failed switch and the
@@ -236,7 +236,7 @@ fn a_crash_after_the_old_child_resumed_in_a_reconcile_finishes_it_on_the_next_re
 fn both_children_dead_after_the_switch_start_the_new_release_again_and_it_takes_the_generation() {
     // Defect: nobody serves and nobody starts anything. The cold start goes through the
     // spawn port, is recorded, and is the only process started while one lives: a
-    // mutant that starts fresh while the old child is alive spawns in the test above.
+    // change that starts fresh while the old child is alive spawns in the test above.
     let w = draining();
     w.kill_pid(100);
     w.kill_pid(101);
@@ -619,7 +619,7 @@ fn cold_restart(w: &World) -> Swap<'_> {
 /// the hold's limit expires them (UNAVAILABLE) and says how many in the update's notes, and the
 /// younger ones are fed to the new child.
 ///
-/// Mutants to plant: the note dropped; the count not compared with zero.
+/// Catches: the note dropped; the count not compared with zero.
 #[test]
 fn a_cold_start_notes_the_held_streams_that_expired_before_it_served() {
     use super::ports::Gate as _;

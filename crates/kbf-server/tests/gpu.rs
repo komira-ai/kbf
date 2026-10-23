@@ -192,3 +192,38 @@ async fn a_gpu_on_macos_outside_a_whole_machine_lease_is_refused() {
         "{refused:?}"
     );
 }
+
+/// A Hello for `node` with 4 CPUs, 8 GiB and an `action_slots` entry of `slots`.
+fn hello_with_slots(node: &str, slots: &str) -> Hello {
+    let mut hello = hello(node, 4, 8);
+    hello.capabilities.push(Capability {
+        key: "action_slots".to_owned(),
+        value: slots.to_owned(),
+    });
+    hello
+}
+
+/// Catches: a node report's `action_slots` entry dropped (a Mac with fewer pool users
+/// than cores given more leases than users), a report without one capped, zero taken for
+/// no cap, and a repeated or garbled entry taken as some count.
+#[test]
+fn capacity_reads_the_action_slots_entry() {
+    assert_eq!(
+        capacity(&hello_with_slots("m", "2")),
+        Ok(Resources::new(4_000, 8 * GIB).with_lease_cap(2))
+    );
+    assert_eq!(
+        capacity(&hello_with_slots("m", "0")),
+        Ok(Resources::new(4_000, 8 * GIB).with_lease_cap(0))
+    );
+    assert_eq!(capacity(&hello("c", 4, 8)).unwrap().leases, None);
+    let mut twice = hello_with_slots("m", "1");
+    twice.capabilities.push(Capability {
+        key: "action_slots".to_owned(),
+        value: "1".to_owned(),
+    });
+    for bad in [twice, hello_with_slots("m", "two")] {
+        let refused = capacity(&bad).expect_err("refused");
+        assert!(refused.contains("action_slots"), "{refused}");
+    }
+}

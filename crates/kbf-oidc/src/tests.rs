@@ -1,9 +1,9 @@
 //! The verifier against a fake issuer: a TLS server on loopback that serves a discovery
 //! document and a JWKS of keys generated in the test ([`super::testkit`]).
 //!
-//! Each refusal below is paired with the check that produces it, and the mutant that was
-//! planted (the check removed or loosened) to see the test go red is named in the doc
-//! comment. A refusal test asserts the exact [`Refusal`], not only `is_err`, so a mutant
+//! Each refusal below is paired with the check that produces it, and the defect it
+//! catches (the check removed or loosened) is named in the doc comment.
+//! A refusal test asserts the exact [`Refusal`], not only `is_err`, so a defect
 //! that lets the token fail some other check does not hide.
 
 use std::sync::atomic::Ordering;
@@ -35,7 +35,7 @@ async fn refused_mutating(mutate: impl FnOnce(&mut Value)) -> Refusal {
 }
 
 /// Proves the happy path, so every refusal below is a refusal of one change and not of
-/// a fixture that never worked. Mutants: `parse` rejecting RS256, the signature check
+/// a fixture that never worked. Catches: `parse` rejecting RS256, the signature check
 /// inverted, any claim check inverted (each turns this red).
 #[tokio::test]
 async fn a_good_token_passes_and_names_its_run() {
@@ -49,7 +49,7 @@ async fn a_good_token_passes_and_names_its_run() {
 }
 
 /// `iss` must be the configured issuer exactly, trailing slash included.
-/// Mutant: the `iss` comparison removed.
+/// Catches: the `iss` comparison removed.
 #[tokio::test]
 async fn a_wrong_issuer_is_refused() {
     let a = refused_mutating(|c| c["iss"] = json!("https://token.example")).await;
@@ -62,7 +62,7 @@ async fn a_wrong_issuer_is_refused() {
 }
 
 /// `aud` is accepted for the kbf audience and nothing else: a different one, a list that
-/// also names another, and a missing one. Mutants: the `aud` check removed (first), or
+/// also names another, and a missing one. Catches: the `aud` check removed (first), or
 /// loosened to "contains" (second).
 #[tokio::test]
 async fn a_wrong_audience_is_refused() {
@@ -97,7 +97,7 @@ async fn an_audience_list_of_one_is_accepted() {
 }
 
 /// Another repository (by id, and by name when the file names it) is refused.
-/// Mutants: `repository_id` unchecked; `repository` unchecked.
+/// Catches: `repository_id` unchecked; `repository` unchecked.
 #[tokio::test]
 async fn a_wrong_repository_is_refused() {
     assert_eq!(
@@ -112,7 +112,7 @@ async fn a_wrong_repository_is_refused() {
 
 /// The workflow actually running must be the deploy workflow at the allowed ref: another
 /// workflow file, the same file at another ref, and a prefix of the allowed value.
-/// Mutants: `job_workflow_ref` unchecked; compared with `starts_with`.
+/// Catches: `job_workflow_ref` unchecked; compared with `starts_with`.
 #[tokio::test]
 async fn a_wrong_workflow_is_refused() {
     for other in [
@@ -130,7 +130,7 @@ async fn a_wrong_workflow_is_refused() {
 }
 
 /// A run from another branch, and from another environment, is refused; both are
-/// configured, so both must match. Mutants: `ref` unchecked; `environment` unchecked.
+/// configured, so both must match. Catches: `ref` unchecked; `environment` unchecked.
 #[tokio::test]
 async fn a_wrong_ref_or_environment_is_refused() {
     assert_eq!(
@@ -152,7 +152,7 @@ async fn a_wrong_ref_or_environment_is_refused() {
 
 /// A pull request never deploys, and neither does a scheduled or other event; a
 /// self-hosted runner is refused unless the file allows it.
-/// Mutants: `event_name` unchecked; `runner_environment` unchecked.
+/// Catches: `event_name` unchecked; `runner_environment` unchecked.
 #[tokio::test]
 async fn a_wrong_event_or_runner_is_refused() {
     for event in [
@@ -188,7 +188,7 @@ async fn a_workflow_dispatch_is_accepted() {
 
 /// Times, against a clock the test sets: expired beyond the 60 s leeway, still accepted
 /// inside it; `nbf` and `iat` in the future likewise; a lifetime over the limit; `exp`
-/// not after `iat`. Mutants: `exp` unchecked (or leeway added instead of subtracted);
+/// not after `iat`. Catches: `exp` unchecked (or leeway added instead of subtracted);
 /// `nbf` unchecked; `iat` unchecked; the lifetime limit unchecked.
 #[tokio::test]
 async fn the_times_are_checked_with_a_leeway() {
@@ -243,7 +243,7 @@ async fn the_times_are_checked_with_a_leeway() {
 
 /// A token that has been used is refused the second time, even though its signature and
 /// claims still hold; one with another `jti` passes; and the entry is forgotten after the
-/// token could no longer pass anyway. Mutants: the `jti` check removed; the entry never
+/// token could no longer pass anyway. Catches: the `jti` check removed; the entry never
 /// pruned (the last assertion would then hold a stale entry, so the cap test below
 /// catches it too).
 #[tokio::test]
@@ -293,7 +293,7 @@ async fn a_refused_token_does_not_spend_its_jti() {
 }
 
 /// A full replay cache refuses new tokens instead of forgetting a live one.
-/// Mutant: the cap removed (the insert would evict or grow).
+/// Catches: the cap removed (the insert would evict or grow).
 #[tokio::test]
 async fn a_full_replay_cache_fails_closed() {
     let issuer = issuer().await;
@@ -309,7 +309,7 @@ async fn a_full_replay_cache_fails_closed() {
 }
 
 /// Signatures: another key under the same `kid`, a payload changed after signing, a
-/// truncated and an empty signature. Mutant: signature verification skipped (each of
+/// truncated and an empty signature. Catches: signature verification skipped (each of
 /// these then passes or fails on a later check).
 #[tokio::test]
 async fn a_bad_signature_is_refused() {
@@ -347,7 +347,7 @@ fn base64_of(value: &Value) -> String {
 
 /// The algorithm is fixed: `none`, HS256 keyed with the issuer's public modulus (the
 /// classic confusion), `RS384`, a lower-case name and a missing `alg` are all refused
-/// before any key is used. Mutant: `alg` taken from the header (HS256 or none accepted).
+/// before any key is used. Catches: `alg` taken from the header (HS256 or none accepted).
 #[tokio::test]
 async fn any_algorithm_but_rs256_is_refused() {
     let issuer = issuer().await;
@@ -380,7 +380,7 @@ async fn any_algorithm_but_rs256_is_refused() {
 }
 
 /// A header that tells the verifier where to find a key, or what it must understand, is
-/// refused. Mutant: the forbidden-header list emptied.
+/// refused. Catches: the forbidden-header list emptied.
 #[tokio::test]
 async fn key_locating_headers_are_refused() {
     let issuer = issuer().await;
@@ -431,7 +431,7 @@ async fn malformed_tokens_are_refused() {
 }
 
 /// An unknown `kid` makes one refetch and is refused; a second unknown `kid` inside the
-/// interval does not refetch; after the interval it does. Mutants: no refetch at all
+/// interval does not refetch; after the interval it does. Catches: no refetch at all
 /// (the rotation test fails); no rate limit (the second count is 3).
 #[tokio::test]
 async fn an_unknown_kid_refetches_once_per_interval() {
@@ -494,7 +494,7 @@ async fn a_rotated_key_is_picked_up() {
 }
 
 /// A key the issuer withdrew stops verifying after the next refetch (the cache is
-/// replaced, not merged). Mutant: new keys merged into the old set.
+/// replaced, not merged). Catches: new keys merged into the old set.
 #[tokio::test]
 async fn a_withdrawn_key_stops_verifying() {
     let issuer = issuer().await;
@@ -523,7 +523,7 @@ async fn a_withdrawn_key_stops_verifying() {
 }
 
 /// A failed fetch with keys held keeps verifying with them; a failed first fetch fails
-/// closed and says why (503 at the route). Mutants: the cache cleared on a failed fetch;
+/// closed and says why (503 at the route). Catches: the cache cleared on a failed fetch;
 /// a failed first fetch treated as "no keys, accept".
 #[tokio::test]
 async fn a_failed_fetch_keeps_the_keys_it_has_and_fails_closed_without() {
@@ -574,7 +574,7 @@ async fn a_failed_fetch_keeps_the_keys_it_has_and_fails_closed_without() {
 
 /// The discovery document's `jwks_uri` must be on the issuer's origin: a document that
 /// points keys at another host yields no keys, even when that host serves the right keys
-/// under a certificate the verifier trusts. Mutant: the origin comparison removed (the
+/// under a certificate the verifier trusts. Catches: the origin comparison removed (the
 /// token then verifies against the other host's keys).
 #[tokio::test]
 async fn a_jwks_uri_off_the_issuers_origin_is_not_followed() {
@@ -643,7 +643,7 @@ const FULL: &str = "issuer = \"https://i.example\"\naudience = \"a\"\nrepository
 
 /// Every value that decides who is let in is required: dropping each one is refused,
 /// and so is an unknown key, a non-numeric repository id, an http issuer, a trailing
-/// slash, and a pull_request event. Mutant: a default for any required key.
+/// slash, and a pull_request event. Catches: a default for any required key.
 #[test]
 fn the_allow_list_requires_every_deciding_value() {
     assert!(OidcConfig::parse(&config_with(FULL)).is_ok());

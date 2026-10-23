@@ -120,7 +120,7 @@ fn layers_apply_in_order() {
 }
 
 /// Catches ownership and mode applied in the wrong order (the "chown after chmod"
-/// mutant: `chown` clears setuid and setgid, so a mode set first is lost), and
+/// defect: `chown` clears setuid and setgid, so a mode set first is lost), and
 /// a directory's mode not holding its own contents back: the setuid, setgid and sticky
 /// bits survive, a read-only directory still receives its files, and times are the tar's.
 #[test]
@@ -217,7 +217,7 @@ fn the_headers_owner_is_applied_and_ids_beyond_the_namespace_are_refused() {
 
 /// Catches a whiteout that misses its file, takes a directory's subtree only in part,
 /// touches what its own layer wrote, or is itself written (the "skipped whiteout"
-/// mutant): the lower layer's file is gone, a whiteout of a directory removes it whole,
+/// defect): the lower layer's file is gone, a whiteout of a directory removes it whole,
 /// a whiteout beside a same-layer file leaves that file, a whiteout of nothing is
 /// fine, and no `.wh.` file is ever in the root.
 #[test]

@@ -66,7 +66,7 @@ async fn the_map_in_welcome_is_taken() {
 /// Catches a receiver that goes backwards: pushes of an older and of the same generation,
 /// in any order, change nothing, so a map that arrives late never replaces a newer one.
 /// The newest one after them is a barrier: the map it replaced is the newest of the
-/// earlier ones, 5, and not 4. Mutant: the holder takes any map.
+/// earlier ones, 5, and not 4. Catches: the holder takes any map.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_late_map_never_replaces_a_newer_one() {
     let (mut h, holder) = daemon("map-monotone").await;
@@ -143,7 +143,7 @@ async fn a_wanted_generation_is_asked_of_the_server() {
 
 /// Catches a daemon that asks again on every wake for a generation it has asked for on
 /// this stream (the server may answer with an older map, and a heartbeat every interval
-/// would be a request every interval): one request, then heartbeats. Mutant: `request`
+/// would be a request every interval): one request, then heartbeats. Catches: `request`
 /// without the generation last asked for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wanted_generation_is_asked_once_on_a_stream() {

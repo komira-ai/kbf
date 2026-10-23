@@ -109,7 +109,7 @@ fn a_healthy_run_with_a_sentinel_passes_and_the_sentinel_cleans_up_nothing() {
 /// sent SIGKILL under load (it runs no `Drop` and no handler). The farm's processes die with
 /// it (the parent-death signal), and the sentinel, which does not, kills both loops' daemons
 /// and removes the frontend's control socket. Nothing was killed while the run lived, so the
-/// markers are the sentinel's. Mutant: no sentinel started (`reaper: None` in the CLI).
+/// markers are the sentinel's. Catches: no sentinel started (`reaper: None` in the CLI).
 #[test]
 fn a_kbf_beta_killed_by_sigkill_leaves_no_daemon_socket_or_farm_process() {
     let _slot = take_slot();

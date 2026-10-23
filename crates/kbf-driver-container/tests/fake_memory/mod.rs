@@ -71,7 +71,7 @@ impl Steps {
 /// kinds of OOM kill not told apart by the lease cgroup's counters: a kill whose `oom`
 /// and `max` the lease counts is the lease's own (OutOfMemory, with `memory.peak` and
 /// the cap), one with `oom_kill` and no `oom` is a busy node's, whatever the exit
-/// code says (the "classify by exit code alone" mutant reads both the same).
+/// code says (the "classify by exit code alone" defect reads both the same).
 #[tokio::test]
 async fn exit_137_is_an_oom_only_with_a_kernel_oom_event() {
     let fake = Fake::new("oom");
@@ -337,7 +337,7 @@ fn reclaimed_below_the_cap() -> Vec<String> {
 /// check the arm job failed on a correct kill): at the kill sample this lease holds
 /// 1 MiB less than its cap in RAM and 1.25 MiB of its own swap, past the 1 MiB floor,
 /// so it is past its cap by only 256 KiB. Also catches the watch missing (exit 0) and a
-/// threshold that drops the floor (the "0 floor" mutant kills at the first 256 KiB of
+/// threshold that drops the floor (the "0 floor" defect kills at the first 256 KiB of
 /// own swap, below the cap and the floor).
 #[tokio::test]
 async fn a_lease_reclaimed_below_its_cap_is_killed_for_its_own_swap() {
@@ -355,11 +355,11 @@ async fn a_lease_reclaimed_below_its_cap_is_killed_for_its_own_swap() {
     fake.assert_clean(1);
 }
 
-/// Catches the watch killing on swap alone (the "ignores max events" mutant): a lease
+/// Catches the watch killing on swap alone (the "ignores max events" defect): a lease
 /// holding far more swap than the threshold whose `max` events do not grow (host
 /// pressure moved it out while it sat below its cap: never at its cap, or at it once
 /// before) runs to its exit. Catches the watch killing on swap that did not rise (the
-/// "swap rose dropped" mutant): a lease host pressure swapped out earlier whose `max`
+/// "swap rose dropped" defect): a lease host pressure swapped out earlier whose `max`
 /// events then grow with its swap held runs to its exit. Also catches a kill at the
 /// threshold rather than above it, and a lease that booked no memory (no cap) killed
 /// for its counters.
@@ -395,7 +395,7 @@ async fn swap_without_pressing_the_cap_kills_nothing() {
 }
 
 /// Catches a sample that cannot be read taken as a sample of zeros (the "zeros"
-/// mutant): the lease hit its cap once (`max` 2) and holds 1 TiB in swap from host
+/// defect): the lease hit its cap once (`max` 2) and holds 1 TiB in swap from host
 /// pressure; one stretch of samples cannot be read (`memory.swap.current` garbled for
 /// about 100 ms), and the samples on either side count the same `max` and swap. Read
 /// as zeros, the stretch would reset the previous sample, so the next good one would

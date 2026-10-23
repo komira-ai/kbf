@@ -151,7 +151,7 @@ fn named(result: &ActionResult, tree: &Tree) -> Vec<Digest> {
 /// thousands of small files took minutes per lease, the CAS idle), stores with no
 /// bound, and `collect` returning before every blob the result names is stored (the
 /// action cache refuses such a result). One file is larger than a chunk, so the
-/// streamed path is queued too. Mutants seen red: the store's `in_flight` passed as 1;
+/// streamed path is queued too. Catches: the store's `in_flight` passed as 1;
 /// no bound (`usize::MAX`).
 #[tokio::test]
 async fn many_blobs_are_stored_at_once_within_the_bound() {
@@ -184,7 +184,7 @@ async fn many_blobs_are_stored_at_once_within_the_bound() {
 
 /// Catches a blob stored once per file that holds it: each is a round trip to the CAS
 /// for bytes it already has. Also keeps a Directory that appears in three places
-/// stored once, as it was before uploads were queued. Mutant seen red: the queue's
+/// stored once, as it was before uploads were queued. Catches: the queue's
 /// digest check removed.
 #[tokio::test]
 async fn a_digest_named_many_times_is_stored_once() {
@@ -235,7 +235,7 @@ impl Drop for Held {
 /// descriptor per file; on the pilot, trees of thousands of files), however few are
 /// stored at a time. Every store waits on a gate the test opens only once
 /// `UPLOADS_IN_FLIGHT` stores have started and the walk had time to run ahead; a
-/// blob is counted from before it is queued until its store ends. Mutant seen red:
+/// blob is counted from before it is queued until its store ends. Catches:
 /// the queue's channel given room for 1_000_000 (`uploads.rs`, `mpsc::channel(0)`).
 #[tokio::test]
 async fn a_walk_holds_at_most_one_blob_past_the_stores_in_flight() {

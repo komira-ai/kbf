@@ -82,7 +82,7 @@ fn the_header_name_is_the_proxys() {
 /// [`PER_CALLER`] open reads; the fifth of each is `429`; a request with no address (an older
 /// proxy) and a node that the proxy named are other callers again.
 ///
-/// Mutants: `caller_of` not reading `ClientAddr` (every browser is loopback: the second
+/// Catches: `caller_of` not reading `ClientAddr` (every browser is loopback: the second
 /// browser's first read is `429`: the starvation this fixes); the address read but the node
 /// id not first (the node is keyed by its address, so it shares with the browser below).
 #[tokio::test]
@@ -121,7 +121,7 @@ async fn two_browsers_behind_the_proxy_each_get_their_own_bound() {
 /// `x-kbf-client-addr` is still one caller (its peer), so it cannot take a fresh bound by
 /// writing one.
 ///
-/// Mutants: both checks gone at once, `admit` recording the address whatever the trust and
+/// Catches: both checks gone at once, `admit` recording the address whatever the trust and
 /// `caller_of` not checking `Trust::Proxied` (the forged values are separate callers and no
 /// fifth read is refused). Each check alone is hidden by the other here, so each has its own
 /// test: `admit` below, `caller_of` in `read_limit/tests.rs`.
@@ -161,7 +161,7 @@ async fn a_forged_header_on_a_direct_request_does_not_change_the_key() {
 /// IPv4 form (not a second bound for it), and a value that is not an address is refused
 /// before the read, like any malformed identity header.
 ///
-/// Mutants: `to_canonical` dropped (the mapped spelling is a fifth-read escape); a value
+/// Catches: `to_canonical` dropped (the mapped spelling is a fifth-read escape); a value
 /// that does not parse taken as no address instead of refused (`403`).
 #[tokio::test]
 async fn the_address_is_canonical_and_a_bad_one_is_refused() {
@@ -196,7 +196,7 @@ async fn the_address_is_canonical_and_a_bad_one_is_refused() {
 /// What a handler can see of the address: only a proxied call has one in its extensions, and
 /// the header itself is gone for every call.
 ///
-/// Mutants: `admit` recording the address whatever the trust (the limiter's own
+/// Catches: `admit` recording the address whatever the trust (the limiter's own
 /// `Trust::Proxied` check would hide it from the key, so only the extension shows it);
 /// the header left in place for a handler.
 #[tokio::test]

@@ -123,7 +123,7 @@ async fn the_predecessor_is_told_once_the_probes_pass() {
 
 /// Catches: the frontend waiting on the `storage` probe for `READY=1` and for the
 /// predecessor's "serving": with only the storage probe failing both are sent; with
-/// another probe (the state store) failing neither is, until it passes. Mutant: `run`
+/// another probe (the state store) failing neither is, until it passes. Catches: `run`
 /// asks `failing` (every probe) again.
 #[tokio::test]
 async fn ready_does_not_wait_for_storage_but_waits_for_the_rest() {

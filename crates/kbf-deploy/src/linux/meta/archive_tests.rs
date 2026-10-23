@@ -51,7 +51,7 @@ fn manifest_of(archive: &Path) -> String {
 /// remove at start, so a verify of a restored copy could never match it), an archive
 /// holding a `*.tmp`, a line with a wrong hash, and entries in an order that varies
 /// with the directory's (two backups of one directory must list the same way). The
-/// mutant "archive every name, `*.tmp` included" goes red on both the entry list and
+/// defect "archive every name, `*.tmp` included" goes red on both the entry list and
 /// the manifest.
 #[test]
 fn the_manifest_covers_every_file_and_no_tmp() {
@@ -107,7 +107,7 @@ fn a_round_trip_restores_every_file_byte_for_byte() {
     assert_eq!(fs::read_dir(&into).expect("list").count(), 5);
 }
 
-/// Catches: a verify that trusts the archive's bytes without hashing them (the mutant
+/// Catches: a verify that trusts the archive's bytes without hashing them (the defect
 /// "skip the hash compare" restores the flipped byte and exits 0), and one that leaves
 /// the bad copy behind for someone to start a server over.
 #[test]

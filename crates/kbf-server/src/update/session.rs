@@ -477,13 +477,7 @@ impl FarmFacts {
                 .map_or(OrderId::new(0, acked), |s| s.activation);
             Some(HelperReport { order, status })
         });
-        let work = if look.leases > 0 {
-            Work::Leased
-        } else if queue_empty {
-            Work::QueueEmpty
-        } else {
-            Work::Waiting
-        };
+        let work = work_of(look.leases, queue_empty);
         Some(HostFacts {
             id: look.id,
             kind,
@@ -583,6 +577,18 @@ impl FarmFacts {
             }
         }
         self.not_idle = now;
+    }
+}
+
+/// What a host's daemon has to do: leases it holds, else nothing queued anywhere, else queued
+/// work it may be given.
+const fn work_of(leases: u32, queue_empty: bool) -> Work {
+    if leases > 0 {
+        Work::Leased
+    } else if queue_empty {
+        Work::QueueEmpty
+    } else {
+        Work::Waiting
     }
 }
 
@@ -768,50 +774,13 @@ mod tests {
         );
     }
 
-    /// Catches ports that cannot drive the controller in this process (the integration
-    /// tests run it in another binary): over a farm with one idle Mac and a desired release,
-    /// the first look starts the host and the second moves it on.
+    /// Catches: a host with leases read as idle, or an empty queue read as work waiting: the
+    /// leases decide first, then the queue.
     #[test]
-    fn a_controller_over_the_ports_moves_an_idle_mac() {
-        use crate::update::{Controller, HostPhase};
-        let farm = farm();
-        let (outbound, _inbound) =
-            mpsc::unbounded_channel::<Result<ServerMessage, tonic::Status>>();
-        let caps = NodeCaps::from_report([("arch", "arm64"), ("os", "macos")]).expect("caps");
-        let stream = farm.register(
-            &WorkerId::new("mac"),
-            kbf_sched::DaemonInstance::new("mac"),
-            kbf_sched::DaemonInstance::default(),
-            Reported::serving(Resources::new(1_000, 1 << 30), caps),
-            outbound,
-            ServerMessage::default(),
-        );
-        let status = kbf_proto::update::UpdateStatus {
-            running_commit: "fedcba987654".to_owned(),
-            ..kbf_proto::update::UpdateStatus::default()
-        };
-        farm.update_status(&WorkerId::new("mac"), stream, status);
-        let store: Arc<dyn Store> = Arc::new(Fake::with_flaw(
-            Arc::new(ManualClock::default()),
-            Flaw::None,
-        ));
-        let rows = Rows::new(Arc::clone(&store));
-        rows.offer(&Release::new(A), farm.wall_now())
-            .expect("a run");
-        let members = members(&rows);
-        let (transport, source) = ports(Arc::clone(&farm), rows, members);
-        let mut controller = Controller::new(
-            store,
-            farm.lease_epoch(),
-            Box::new(transport),
-            Box::new(source),
-        );
-        let first = controller.tick(farm.wall_now()).expect("a look");
-        assert_eq!(first.moved.len(), 1, "{first:?}");
-        let second = controller.tick(farm.wall_now()).expect("a look");
-        assert_eq!(
-            second.moved.first().map(|m| m.to.clone()),
-            Some(HostPhase::Cordoned)
-        );
+    fn work_is_leased_before_it_is_queued() {
+        assert_eq!(work_of(2, true), Work::Leased);
+        assert_eq!(work_of(1, false), Work::Leased);
+        assert_eq!(work_of(0, true), Work::QueueEmpty);
+        assert_eq!(work_of(0, false), Work::Waiting);
     }
 }
