@@ -258,14 +258,12 @@ fn the_service_must_be_named_exactly_once() {
     assert_eq!(out.status.code(), Some(1));
 }
 
-/// Catches a bundled unit's `boot-check` taking one of its two flags without the other, or a
-/// mode the binary does not have: each is a usage error (exit 2, the flag named on standard
-/// error, nothing on standard output) before anything is read. With both, the shipped binary
-/// runs the bundled path: a daemon passes (exit 0) over a state both of whose files are
-/// ruined, which the connected host's check refuses with exit 5.
-///
-/// Mutants it catches: either `requires` dropped from the flags (the lone flag runs the
-/// connected check); the bundled path falling through to `activate::boot_check`.
+/// Asserts that a bundled unit's `boot-check` takes one of its two flags only with the other,
+/// and a mode the binary has: each other command line is a usage error (exit 2, the flag named
+/// on standard error, nothing on standard output) before anything is read. With both, the
+/// shipped binary runs the bundled path: it runs the kbf named (here a file that is not
+/// there: exit 1, the file named) over a state both of whose files are ruined, which the
+/// connected host's check refuses with exit 5.
 #[test]
 fn boot_check_takes_kbf_and_mode_together_or_not_at_all() {
     let root = root("bundled-flags");
@@ -295,14 +293,12 @@ fn boot_check_takes_kbf_and_mode_together_or_not_at_all() {
         fs::write(in_state_dir(&root, name), b"not json").expect("ruin");
     }
     assert_eq!(helper(&root, &["boot-check"]).status.code(), Some(5));
-    let bundled = ["boot-check", "--kbf=/usr/bin/kbf", "--mode=daemon"];
+    let kbf = format!("--kbf={}", root.join("no-such-kbf").display());
+    let bundled = ["boot-check", kbf.as_str(), "--mode=daemon"];
     let out = helper(&root, &bundled);
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("no-such-kbf"), "{err}");
 }
 
 /// Catches a loop that does not loop or does not stop: two passes with a launchd label

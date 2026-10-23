@@ -116,7 +116,7 @@ these entries. No driver serves a VM and no daemon reports any of them yet, so t
 
 | Entry | Meaning | Kind | Read by the server on `main` |
 |---|---|---|---|
-| `vm.slots` | how many VMs may run at once; planned to fill the `vms` booking dimension | report-only | checked to be a whole number, once; not read into capacity yet |
+| `vm.slots` | how many VMs may run at once; fills the `vms` booking dimension | report-only | read into capacity as `min(2, slots)` (0 when absent), and a node that reports at least one slot keeps a host floor (2 cores and 8 GiB by default: `--vm-host-floor-cpus`, `--vm-host-floor-mem-gib`) out of its CPUs and memory |
 | `vm.max_cpus`, `vm.max_mem_gib` | the framework's bounds, read at start | report-only | checked to be a whole number, once |
 | `vm.image` (repeated) | the golden images on the node's disk whose file manifest re-verifies, as `<name>@sha256:<recipe digest>` ([macos-vm-guests.md](macos-vm-guests.md#5-image-identity)) | capability: a request names one, matched by membership on the digest | yes: the digest of each entry joins the node's `vm.image` set; an entry without a digest refuses the report |
 

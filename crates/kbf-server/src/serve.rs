@@ -46,7 +46,7 @@ use crate::store_config::service::ColdStoreService;
 use crate::streams::{StreamLimits, flow_windows};
 use crate::token::ApiToken;
 use crate::ui_mount::bind_server_with_options;
-use crate::worker::WorkerService;
+use crate::worker::{HostFloor, WorkerService};
 use crate::worker_roles::WorkerRolesLayer;
 use kbf_mapsync::MapSource;
 use kbf_proto::kbf::enroll::v1::cold_store_server::ColdStoreServer;
@@ -86,6 +86,10 @@ pub struct Listeners {
     /// books, the others are what it climbs through when it passes its own memory
     /// limit, before a whole host (`--memory-ladder-gib`).
     pub memory_ladder: MemoryLadder,
+    /// What a node that reports VM slots keeps for the host: its CPUs and memory,
+    /// subtracted from what placement may book on it (`--vm-host-floor-cpus`,
+    /// `--vm-host-floor-mem-gib`).
+    pub vm_host_floor: HostFloor,
     /// Whether the farm shows `kbf-estimator` what finished (`--learned-sizes`).
     pub learned_sizes: crate::LearnedSizes,
     /// How long a finished operation is kept after its callers are answered, in which
@@ -801,6 +805,8 @@ where
         Arc::clone(&farm),
         token.clone(),
         Arc::clone(&drain),
+        // A server with no frontend role has nothing to retire: its retire routes answer 409.
+        Arc::default(),
         members.clone(),
         update_rows.clone(),
         // A server with no frontend role has no enrollment.
@@ -867,7 +873,8 @@ where
         peers,
         listeners.heartbeat_interval,
         listeners.hello_wait,
-    );
+    )
+    .with_host_floor(listeners.vm_host_floor);
     // The map, if there is one: no branch in this generic function.
     let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
     // The offers, if there are a release store and a state store: no branch here either.

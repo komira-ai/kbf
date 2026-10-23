@@ -423,32 +423,34 @@ unit of every mode (`kbf-all-in-one.service`, `kbf-daemon.service`, `kbf-fronten
 of a host. The package has no maintainer script, so the package manager replaces the file and
 restarts nothing: the operator restarts the mode unit that runs it (a stop drains).
 `kbf-proxy.service` is the `kbf-installer` package's and is not changed by this package.
-Each mode unit runs the installer's `boot-check` before it starts `kbf`, so the package
-depends on `kbf-installer`: deb `kbf-installer (>= <version>)`, rpm `kbf-installer >=
-<version>`, with the version of the `kbf-installer` package built in the same job
-(`<version>+<12 of the commit>`). apt and dnf compare that version as text, so the dependency
-names the installer built with this `kbf` and does not order builds: a rollback to an older
-`kbf` can be refused and an older installer accepted (unsettled until `pkg-config` carries
-the version `crates/xtask/src/pkg_version.rs` describes).
+Each mode unit runs `kbf boot-check --mode=<mode>` before it starts `kbf`: the check is the
+`kbf` file itself (it brings the state database to the schema that `kbf` needs, for the modes
+that keep state in it), so the package depends on no other package, `kbf-installer` included.
 
 The five mode units were files of the `kbf-installer` package before this one carried them, so
 the deb of `kbf` says `Replaces: kbf-installer` (any version of it, and no `Conflicts`): without
 it dpkg refuses to unpack `kbf` over the files an older `kbf-installer` owns. The rpm names no
-replacement; installing it asks for the installer of the same version or later, which does not
-own those files.
+replacement, so an rpm host that has the installer of before the split upgrades it in the same
+transaction as `kbf`: that installer's rpm owns those files.
+
+The units of the `kbf` package of before this one ran the installer's `boot-check --kbf=<kbf>
+--mode=<mode>`, which now runs `<kbf> boot-check`; a `kbf` of before that verb exits 2 and the
+start fails with a line that says to upgrade the `kbf` package. So the `kbf` package is
+upgraded with the installer or before it; no package relation says so, because the versions
+compare as text.
 
 `cargo xtask pkg-config` writes both packages' configurations from one command line
 (`--binary` the `kbf-installer`, `--kbf` the `kbf` of the same job), and `pkg-build` builds the
 deb and the rpm of each twice and compares them. The `kbf` package is not installed in a
-container (the install test takes one package, and this one needs the other); its files are
-checked in the asset step. `cargo xtask pkg-kbf-asset` makes the deb the asset
-`kbf-<commit>-<platform>.deb` and lists it in `SHA256SUMS`, refusing it unless:
+container (the install test takes one package); its files are checked in the asset step.
+`cargo xtask pkg-kbf-asset` makes the deb the asset `kbf-<commit>-<platform>.deb` and lists it
+in `SHA256SUMS`, refusing it unless:
 
 - `usr/bin/kbf` is byte for byte the `kbf` in the tarball `kbf-<commit>-<platform>.tar.gz`
   that `build-commit check-asset` checked for the commit, mode 0755;
 - it holds the unit of every mode, mode 0644, and no other file;
-- its control file says the package `kbf`, the architecture of the platform,
-  `Depends: kbf-installer (>= <its own version>)` and `Replaces: kbf-installer`.
+- its control file says the package `kbf`, the architecture of the platform, no `Depends` on
+  `kbf-installer` and `Replaces: kbf-installer`.
 
 It is attested like the other deb: build provenance (as one subject of the `SHA256SUMS`
 attestation, and alone, with its bundle `kbf-<commit>-<platform>.deb.sigstore.json` in
@@ -470,7 +472,7 @@ job builds it from the signed binary it has just built and checked: the pinned d
 root that `gh` fetched, and an `installer.conf` from `cargo xtask pkg-trust`, then `cargo xtask
 pkg build` writes the package (the same bytes for the same inputs; `pkgbuild` is not
 deterministic). It installs these entries, all root:wheel, at the paths of the installer's macOS
-layout (`crates/kbf-installer/src/layout.rs`; a test compares the package's paths with it):
+layout (`crates/kbf-setup/src/layout.rs`; a test compares the package's paths with it):
 
 | Path | Mode | Layout |
 |---|---|---|

@@ -27,7 +27,7 @@
 //!
 //! This module reads text and checks its shape; it does not look at who owns the file. The
 //! read that holds the file to the trust files' rule (root's alone) is
-//! `crate::helper::trusted_toml`, for the release fetcher. The `[proxy]` table and the
+//! `kbf_installer::helper::trusted_toml`, for the release fetcher. The `[proxy]` table and the
 //! release-source keys (`release_source`, `release_url`, `source_refs`, the frontend snapshot,
 //! `release_ca`, the node identity and the limits) are still read and checked here: hosts set
 //! up by an earlier build carry them, and the fetcher and the stage policy still consume them
@@ -268,7 +268,7 @@ pub(crate) fn sha256_named(label: &str, text: &str) -> Result<Sha256Hex, String>
 
 /// `https://host[:port][/path]` with no user information, query or fragment, lower-cased
 /// host, no trailing `/`.
-pub(crate) fn https_base(url: &str) -> Result<String, String> {
+pub fn https_base(url: &str) -> Result<String, String> {
     https_base_named("release_url =", url)
 }
 

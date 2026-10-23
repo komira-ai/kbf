@@ -6,7 +6,7 @@
 //! a named flag: there is no positional argument. When the CLI moves to `--action=<verb>`,
 //! this file is the one that changes.
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 
 use crate::CommitId;
 use crate::record::ActivationId;
@@ -76,74 +76,9 @@ pub enum Verb {
     FetchChild(crate::fetch::child::ChildArgs),
 }
 
-/// The `kbf` modes a host can be set up for. There is no `node` mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Mode {
-    Frontend,
-    Storage,
-    Daemon,
-    StorageAndDaemon,
-    AllInOne,
-}
-
-impl Mode {
-    /// Whether this mode keeps its state in the Postgres database the installer owns (the
-    /// frontend and all-in-one modes; the others keep none).
-    pub fn keeps_state_in_database(self) -> bool {
-        matches!(self, Mode::Frontend | Mode::AllInOne)
-    }
-}
-
-#[derive(Args)]
-pub struct SetupArgs {
-    /// The kbf mode this host runs (`kbf --mode=...`).
-    #[arg(long, value_enum)]
-    pub mode: Mode,
-    /// Refuse orders below this generation. A floor only goes up.
-    #[arg(long)]
-    pub min_generation: Option<u64>,
-    /// The frontend to enroll with, as https://host[:port]. For `storage`, `daemon` and
-    /// `storage-and-daemon`; written to kbf.toml.
-    #[arg(long)]
-    pub frontend_url: Option<String>,
-    /// The enrollment token (a file of mode 0600 or tighter); setup keeps a copy that only
-    /// kbf reads. For the modes that enroll.
-    #[arg(long)]
-    pub token_file: Option<String>,
-    /// The state database, as postgres:///NAME?host=SOCKET_DIR&user=ROLE (no password).
-    /// Required for `frontend` and `all-in-one`: written to installer.toml and, as
-    /// `state-store`, to kbf.toml, and setup creates (or brings forward) its schema. The
-    /// server exists before setup runs, and so do the role and the database unless
-    /// --create-local-database makes them.
-    #[arg(long)]
-    pub database: Option<String>,
-    /// For a host whose Postgres runs locally: create the login role and the database the
-    /// `--database` URL names (owned by the role, no password), as the server's superuser over
-    /// its Unix socket (peer authentication, no password), if they are not there. Never
-    /// edits `pg_hba.conf`; refuses, saying which rule to add, when the server does not admit
-    /// the login. Without it, setup only checks that it can log in.
-    #[arg(long)]
-    pub create_local_database: bool,
-    /// Enable the units without starting them.
-    #[arg(long)]
-    pub no_start: bool,
-    /// The kbf.toml settings of a frontend or all-in-one host (listeners, certificates,
-    /// storage): each sets the kbf flag of its name.
-    #[command(flatten)]
-    pub kbf: crate::setup::kbf_settings::KbfFlags,
-    /// A frontend host behind `kbf-installer proxy`: the `[proxy]` table of installer.toml.
-    #[command(flatten)]
-    pub proxy: crate::setup::proxy::ProxyFlags,
-    /// The installer.toml `setup` writes (and reads, to keep what it does not set), under the
-    /// host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which
-    /// is the only value setup accepts. The same flag, with the same meaning, as on `run`.
-    #[arg(long, value_parser = kbf_host::HostPath::new)]
-    pub installer_config: Option<kbf_host::HostPath>,
-    /// The flags that no longer do anything: the release source and its keys, and the first
-    /// release. Taken and ignored for one release, with a warning.
-    #[command(flatten)]
-    pub retired: crate::setup::retired::RetiredFlags,
-}
+// The `kbf` modes a host can be set up for and the flags of `setup` are defined in
+// `kbf-setup`, the library behind that verb.
+pub use kbf_setup::cli::{Mode, SetupArgs};
 
 #[derive(Args)]
 pub struct ActivationArgs {
@@ -322,9 +257,9 @@ impl ProxyArgs {
 pub struct BootArgs {
     #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(120..=1800))]
     pub window_secs: u64,
-    /// The kbf this unit starts, on a bundled host (one with no releases and no state). It
-    /// says the state schema it needs; the database is brought to it before the unit starts.
-    /// Needs --mode.
+    /// The kbf this unit starts, on a bundled host (one with no releases and no state): the
+    /// check runs `<kbf> boot-check --mode=<mode>` over the host's installer.toml (under
+    /// --root), which migrates the state database, and ends as it ends. Needs --mode.
     #[arg(long, requires = "mode")]
     pub kbf: Option<std::path::PathBuf>,
     /// The mode of the unit that runs the check: only frontend and all-in-one keep state in

@@ -19,8 +19,8 @@
 //!   the host goes back to the release that ran before (a binary from before skipped entries
 //!   refuses a raised log).
 //! - [`migrator`]: brings the state database to the schema a release declares, and asks a
-//!   binary which schema that is (`--version --json`); the swap's migration and the schema
-//!   step of `boot-check` share it.
+//!   binary which schema that is (`--version --json`); the swap's migration uses it. (The
+//!   schema step of a bundled host's `boot-check` is `kbf boot-check`'s now.)
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
 //!
@@ -65,11 +65,8 @@ pub mod app;
 pub mod archive;
 pub mod attest;
 pub mod binary;
-pub mod boot_schema;
 pub mod cli;
 pub mod darwin;
-pub mod database;
-pub mod exit;
 pub mod fetch;
 #[cfg(any(test, feature = "testkit"))]
 pub mod fixtures;
@@ -77,8 +74,6 @@ pub mod fixtures;
 pub mod golden;
 pub mod helper;
 pub mod host_mode;
-pub mod installer_toml;
-pub mod layout;
 pub mod meta_log;
 pub mod migrator;
 pub mod observe;
@@ -95,8 +90,6 @@ pub mod seed;
 mod seed_fixture;
 pub mod seq_floor;
 pub mod settings;
-pub mod setup;
-pub mod sha256_hex;
 pub mod spool;
 pub mod stage;
 pub mod state;
@@ -107,70 +100,11 @@ pub mod testkit;
 pub mod trust;
 pub mod version;
 
-use std::fmt;
-
-use serde::{Deserialize, Serialize};
-
-/// A commit, as Git names it in full: exactly 40 lowercase hex characters. A release
-/// directory, a link target and the state name commits only in this form, so a short or
-/// upper-case id can never name a second copy of one release.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct CommitId(String);
-
-/// Why a string is not a [`CommitId`].
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{0:?} is not a commit id (40 lowercase hex characters)")]
-pub struct NotACommit(pub String);
-
-impl CommitId {
-    pub fn new(id: &str) -> Result<CommitId, NotACommit> {
-        let hex = |b: u8| matches!(b, b'0'..=b'9' | b'a'..=b'f');
-        if id.len() == 40 && id.bytes().all(hex) {
-            Ok(CommitId(id.to_owned()))
-        } else {
-            Err(NotACommit(id.to_owned()))
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<String> for CommitId {
-    type Error = NotACommit;
-
-    fn try_from(id: String) -> Result<CommitId, NotACommit> {
-        CommitId::new(&id)
-    }
-}
-
-impl From<CommitId> for String {
-    fn from(id: CommitId) -> String {
-        id.0
-    }
-}
-
-impl std::str::FromStr for CommitId {
-    type Err = NotACommit;
-
-    fn from_str(id: &str) -> Result<CommitId, NotACommit> {
-        CommitId::new(id)
-    }
-}
-
-impl AsRef<str> for CommitId {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl fmt::Display for CommitId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+// These live in `kbf-setup` (the library behind `setup`) and keep their old paths here:
+// `kbf_installer::layout`, `kbf_installer::setup`, `kbf_installer::CommitId`, ...
+pub use kbf_setup::{
+    CommitId, NotACommit, database, exit, installer_toml, layout, setup, sha256_hex,
+};
 
 #[cfg(test)]
 mod tests;

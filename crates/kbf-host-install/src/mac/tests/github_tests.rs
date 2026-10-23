@@ -4,7 +4,7 @@
 
 use std::cell::RefCell;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::rc::Rc;
 
 use super::fx::{
@@ -105,7 +105,22 @@ fn refusal(result: Result<Staged, Outcome>) -> Refusal {
     }
 }
 
-/// The calls of `gh` that ran `verb` (`api`, `release`, `attestation`).
+/// The calls of `curl`, which lists the releases.
+fn curl_calls(fx: &Fx, sim: &Sim) -> Vec<Cmd> {
+    sim.calls
+        .borrow()
+        .iter()
+        .filter(|c| c.program == fx.host.curl.to_str().unwrap())
+        .cloned()
+        .collect()
+}
+
+/// The URL a call of `curl` asked for.
+fn url_of(call: &Cmd) -> String {
+    call.args.last().unwrap().clone()
+}
+
+/// The calls of `gh` that ran `verb` (`release`, `attestation`).
 fn gh_calls(fx: &Fx, sim: &Sim, verb: &str) -> Vec<Cmd> {
     sim.calls
         .borrow()
@@ -154,13 +169,12 @@ fn the_listing_picks_the_unique_asset_across_pages() {
     publish(&sim, "v0.1", OLD, &binary("old"));
     let staged = run(&fx, &sim, &channel(&fx, false), OLD_VERSION).unwrap();
     assert_eq!(staged.commit, OLD);
-    let listed: Vec<String> = gh_calls(&fx, &sim, "api")
-        .iter()
-        .map(|c| c.args[1].clone())
-        .collect();
+    let listed: Vec<String> = curl_calls(&fx, &sim).iter().map(url_of).collect();
     assert_eq!(
         listed,
-        [1, 2, 3, 4].map(|n| format!("repos/komira-ai/kbf/releases?per_page=100&page={n}"))
+        [1, 2, 3, 4].map(|n| format!(
+            "https://api.github.com/repos/komira-ai/kbf/releases?per_page=100&page={n}"
+        ))
     );
     let download = &gh_calls(&fx, &sim, "release")[0];
     assert_eq!(download.args[2], "v0.1");
@@ -179,7 +193,7 @@ fn the_listing_picks_the_unique_asset_across_pages() {
             .commit,
         NEW
     );
-    assert_eq!(gh_calls(&fx, &sim, "api").len(), 3);
+    assert_eq!(curl_calls(&fx, &sim).len(), 3);
 }
 
 /// A page with fewer than 100 releases is not the end of the listing: a second commit that
@@ -281,7 +295,7 @@ fn the_listing_is_read_up_to_the_page_limit() {
     }
     let result = run(&fx, &sim, &channel(&fx, false), NEW_VERSION);
     assert_eq!(refusal(result), Refusal::FetchFailed);
-    assert_eq!(gh_calls(&fx, &sim, "api").len(), MAX_PAGES as usize);
+    assert_eq!(curl_calls(&fx, &sim).len(), MAX_PAGES as usize);
     assert_untouched(&fx);
 
     let sim = fx.sim();
@@ -295,7 +309,7 @@ fn the_listing_is_read_up_to_the_page_limit() {
     }
     publish(&sim, "v5.0", NEW, &fx.new_binary);
     run(&fx, &sim, &channel(&fx, false), NEW_VERSION).unwrap();
-    assert_eq!(gh_calls(&fx, &sim, "api").len(), MAX_PAGES as usize);
+    assert_eq!(curl_calls(&fx, &sim).len(), MAX_PAGES as usize);
 }
 
 /// The download is rebuilt from the tag and the asset names, whatever URL the listing
@@ -326,7 +340,9 @@ fn a_url_in_the_listing_is_ignored_and_the_download_is_rebuilt() {
     for call in sim.calls.borrow().iter() {
         let text = format!("{} {}", call.program, call.args.join(" "));
         assert!(!text.contains("evil.example.invalid"), "{text}");
-        if call.args[0] != "attestation" {
+        if call.program == fx.host.curl.to_str().unwrap() {
+            assert!(url_of(call).starts_with("https://api.github.com/repos/"));
+        } else if call.args[0] != "attestation" {
             assert!(!text.contains("http"), "{text}");
         }
     }
@@ -359,38 +375,44 @@ fn the_fetch_runs_as_nobody_with_a_size_cap_and_a_time_limit() {
             let scratch =
                 fs::metadata(stage_dir.join("fetch")).map(|m| (m.mode() & 0o777, m.uid()));
             let stage_mode = fs::metadata(&stage_dir).map_or(0, |m| m.mode() & 0o777);
-            seen.borrow_mut()
-                .push((cmd.args[0].clone(), stage_mode, scratch.ok()));
+            let verb = if cmd.program.ends_with("/curl") {
+                "list".to_owned()
+            } else {
+                cmd.args[0].clone()
+            };
+            seen.borrow_mut().push((verb, stage_mode, scratch.ok()));
         }));
     }
     run(&fx, &sim, &channel(&fx, false), NEW_VERSION).unwrap();
     let uid = me(&fx).uid;
     let seen = seen.borrow();
     let at = |verb: &str| seen.iter().find(|s| s.0 == verb).unwrap().clone();
-    assert_eq!(at("api").1, 0o711);
-    assert_eq!(at("api").2, Some((0o700, uid)));
+    assert_eq!(at("list").1, 0o711);
+    assert_eq!(at("list").2, Some((0o700, uid)));
     assert_eq!(at("release").1, 0o711);
     assert_eq!(at("release").2, Some((0o700, uid)));
 
     let tuning = fx.host.tuning;
     let home = fx.host.stage().join("gh-home").display().to_string();
-    let list = &gh_calls(&fx, &sim, "api")[0];
+    let list = &curl_calls(&fx, &sim)[0];
     let download = &gh_calls(&fx, &sim, "release")[0];
+    assert_eq!(list.program, fx.host.curl.display().to_string());
+    assert_eq!(download.program, fx.host.gh.display().to_string());
     for call in [list, download] {
-        assert_eq!(call.program, fx.host.gh.display().to_string());
         assert_eq!(call.run_as, Some(me(&fx)));
-        let env: Vec<(&str, &str)> = call
-            .env
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        assert!(env.contains(&("HOME", home.as_str())), "{env:?}");
-        assert!(env.contains(&("GH_CONFIG_DIR", home.as_str())), "{env:?}");
         assert!(
-            env.iter()
-                .all(|(k, _)| !k.to_lowercase().contains("proxy") && *k != "GH_TOKEN")
+            call.env
+                .iter()
+                .all(|(k, _)| !k.to_lowercase().contains("proxy") && k != "GH_TOKEN")
         );
     }
+    let env: Vec<(&str, &str)> = download
+        .env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assert!(env.contains(&("HOME", home.as_str())), "{env:?}");
+    assert!(env.contains(&("GH_CONFIG_DIR", home.as_str())), "{env:?}");
     assert_eq!(list.timeout, Some(tuning.tool));
     assert_eq!(download.timeout, Some(tuning.fetch));
     let cap = download.write_cap.as_ref().unwrap();
@@ -581,7 +603,8 @@ fn the_attestation_is_still_checked_offline_after_a_fetch() {
         .filter(|c| c.program == fx.host.gh.to_str().unwrap())
         .map(|c| c.args[0].clone())
         .collect();
-    assert_eq!(verbs, ["api", "api", "release", "attestation"]);
+    assert_eq!(verbs, ["release", "attestation"]);
+    assert_eq!(curl_calls(&fx, &sim).len(), 2);
     let attest = &gh_calls(&fx, &sim, "attestation")[0];
     let args = attest.args.join(" ");
     let stage_dir = fx.host.stage();
@@ -647,7 +670,7 @@ fn pinned_sums_still_apply_to_a_fetched_release() {
     );
     let result = run(&fx, &sim, &channel(&fx, true), NEW_VERSION);
     assert_eq!(refusal(result), Refusal::UnknownRelease);
-    assert!(gh_calls(&fx, &sim, "api").is_empty());
+    assert!(curl_calls(&fx, &sim).is_empty());
 
     // Sums that list two commits with the digits are ambiguous, as in a directory's.
     let fx = Fx::new("mac-gh-sums-ambiguous");
@@ -666,7 +689,7 @@ fn pinned_sums_still_apply_to_a_fetched_release() {
     );
     let result = run(&fx, &sim, &channel(&fx, true), NEW_VERSION);
     assert_eq!(refusal(result), Refusal::AmbiguousRelease);
-    assert!(gh_calls(&fx, &sim, "api").is_empty());
+    assert!(curl_calls(&fx, &sim).is_empty());
 
     // Of two commits with the digits in the listing, the sums name the one.
     let fx = Fx::new("mac-gh-sums-twin");
@@ -694,9 +717,123 @@ fn a_directory_channel_never_talks_to_github() {
         source_ref: "refs/heads/main".into(),
     };
     stage(&fx.host, &sim, &dir, &Version::new(NEW_VERSION).unwrap()).unwrap();
-    assert!(gh_calls(&fx, &sim, "api").is_empty());
+    assert!(curl_calls(&fx, &sim).is_empty());
     assert!(gh_calls(&fx, &sim, "release").is_empty());
     assert!(!fx.host.stage().join("fetch").exists());
+}
+
+/// The system `curl` that lists the releases is held to the same standard as the pinned `gh`:
+/// a writable one is refused for a GitHub channel and nothing is run. A directory channel
+/// never uses `curl`, so it is not held to it.
+#[test]
+fn a_writable_curl_is_refused_only_for_a_github_channel() {
+    let fx = Fx::new("mac-gh-curl-trust");
+    let sim = github(&fx);
+    fs::set_permissions(&fx.host.curl, fs::Permissions::from_mode(0o777)).unwrap();
+    assert_eq!(
+        refusal(run(&fx, &sim, &channel(&fx, false), NEW_VERSION)),
+        Refusal::KeyUntrusted
+    );
+    assert!(sim.calls.borrow().is_empty());
+    let sim = fx.sim();
+    mkdir(&fx.host.work, 0o711);
+    let dir = MacChannel {
+        source: Source::Dir(fx.channel_dir.clone()),
+        sums: Some(fx.sums.clone()),
+        source_ref: "refs/heads/main".into(),
+    };
+    stage(&fx.host, &sim, &dir, &Version::new(NEW_VERSION).unwrap()).unwrap();
+}
+
+// ---- the listing with curl ----
+
+/// With no token the listing is the system `curl`, as `nobody`: the arguments are exactly
+/// these (`-q` first so no configuration file is read, HTTPS only, no redirect, HTTP errors
+/// fail, a time and a size limit, the fixed URL last), the command carries no environment of
+/// its own (the runner adds only its fixed `PATH`, `LANG` and `DEBIAN_FRONTEND`), nothing is
+/// on its standard input, and nothing like a token is anywhere in the call.
+#[test]
+fn the_listing_runs_curl_as_nobody_with_no_token_and_fixed_flags() {
+    let fx = Fx::new("mac-gh-curl");
+    let sim = github(&fx);
+    run(&fx, &sim, &channel(&fx, false), NEW_VERSION).unwrap();
+    let calls = curl_calls(&fx, &sim);
+    assert_eq!(calls.len(), 2);
+    let tuning = fx.host.tuning;
+    for (i, call) in calls.iter().enumerate() {
+        assert_eq!(call.program, fx.host.curl.display().to_string());
+        assert_eq!(
+            call.args,
+            [
+                "-q",
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--proto",
+                "=https",
+                "--tlsv1.2",
+                "--max-redirs",
+                "0",
+                "--header",
+                "Accept: application/vnd.github+json",
+                "--header",
+                "X-GitHub-Api-Version: 2022-11-28",
+                "--user-agent",
+                "kbf-host-install",
+                "--max-time",
+                &tuning.tool.as_secs().to_string(),
+                "--max-filesize",
+                &MAX_PAGE_BYTES.to_string(),
+                "--url",
+                &format!(
+                    "https://api.github.com/repos/komira-ai/kbf/releases?per_page=100&page={}",
+                    i + 1
+                ),
+            ]
+        );
+        assert!(call.env.is_empty(), "{:?}", call.env);
+        assert!(call.stdin.is_empty());
+        assert_eq!(call.run_as, Some(me(&fx)));
+        assert_eq!(call.timeout, Some(tuning.tool));
+        assert_eq!(call.stdout_max, Some(MAX_PAGE_BYTES));
+        assert!(call.write_cap.is_none());
+        let text = format!("{call:?}").to_lowercase();
+        assert!(
+            !text.contains("token") && !text.contains("bearer"),
+            "{text}"
+        );
+    }
+    // The download has no token either.
+    assert!(
+        gh_calls(&fx, &sim, "release")[0]
+            .env
+            .iter()
+            .all(|(k, _)| k != "GH_TOKEN")
+    );
+}
+
+/// An HTTP error and an exhausted rate limit (curl exits 22 for both) are `fetch_failed`
+/// through the whole verb: exit status 2, nothing downloaded, nothing staged, no change to
+/// the kit, the status or launchd.
+#[test]
+fn an_http_error_or_a_rate_limit_is_a_failed_fetch_and_stages_nothing() {
+    for broken in ["list-http", "list-rate"] {
+        let fx = Fx::new("mac-gh-http");
+        write_channel(&fx, "source = \"github\"\n");
+        let sim = github(&fx);
+        sim.break_(broken);
+        let answer = fx.handle(&sim, INSTALL);
+        assert_eq!(answer.code, 2, "{broken}: {}", answer.err);
+        assert_eq!(
+            answer.json(),
+            serde_json::json!({"result":"refused","reason":"fetch_failed"}),
+            "{broken}"
+        );
+        assert_eq!(curl_calls(&fx, &sim).len(), 1, "{broken}");
+        assert!(gh_calls(&fx, &sim, "release").is_empty(), "{broken}");
+        assert_untouched(&fx);
+        assert_eq!(sim.count("/bin/launchctl bootstrap"), 0);
+    }
 }
 
 // ---- the token ----
@@ -713,10 +850,11 @@ fn token_channel(fx: &Fx, token: &str) -> (MacChannel, std::path::PathBuf) {
     (channel, file)
 }
 
-/// The token of a channel is read by the root process from its file and given to `gh` for
-/// the listing and the download only, never to the attestation check.
+/// The token of a channel is read by the root process from its file. The listing gets it
+/// through curl's standard input only (never an argument or the environment), the download
+/// as `GH_TOKEN`, and the attestation check not at all.
 #[test]
-fn the_token_goes_to_the_listing_and_the_download_only() {
+fn the_token_goes_to_the_listing_by_stdin_and_the_download_only() {
     let fx = Fx::new("mac-gh-token");
     let sim = github(&fx);
     let (channel, _) = token_channel(&fx, "ghp_exampleToken-0\n");
@@ -726,7 +864,14 @@ fn the_token_goes_to_the_listing_and_the_download_only() {
             .iter()
             .any(|(k, v)| k == "GH_TOKEN" && v == "ghp_exampleToken-0")
     };
-    assert!(has(&gh_calls(&fx, &sim, "api")[0]));
+    for list in curl_calls(&fx, &sim) {
+        assert_eq!(
+            String::from_utf8(list.stdin.clone()).unwrap(),
+            "header = \"Authorization: Bearer ghp_exampleToken-0\"\n"
+        );
+        assert_eq!(&list.args[list.args.len() - 4..][..2], ["--config", "-"]);
+        assert!(list.env.is_empty(), "{:?}", list.env);
+    }
     assert!(has(&gh_calls(&fx, &sim, "release")[0]));
     assert!(!has(&gh_calls(&fx, &sim, "attestation")[0]));
     for call in sim.calls.borrow().iter() {

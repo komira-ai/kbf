@@ -148,6 +148,15 @@ pub enum ErrorCode {
     HealthTimeout,
     /// The host's swap was abandoned.
     SwapAbandoned,
+    /// A daemon host is not the node the inventory lists for it, or lists none; nothing was
+    /// drained.
+    NodeIdentity,
+    /// The frontend could not drain the host's node, or did not answer; the node may be left
+    /// drained.
+    DrainFailed,
+    /// The host runs the target, but the frontend could not return its node to placement; the
+    /// node is left drained.
+    UndrainFailed,
 }
 
 impl ErrorCode {
@@ -169,7 +178,10 @@ impl ErrorCode {
             | ErrorCode::SafeToStopUnavailable
             | ErrorCode::InstallFailed
             | ErrorCode::HealthTimeout
-            | ErrorCode::SwapAbandoned => 500,
+            | ErrorCode::SwapAbandoned
+            | ErrorCode::NodeIdentity
+            | ErrorCode::DrainFailed
+            | ErrorCode::UndrainFailed => 500,
         }
     }
 }
@@ -386,6 +398,9 @@ mod tests {
             (ErrorCode::InstallFailed, "install_failed", 500),
             (ErrorCode::HealthTimeout, "health_timeout", 500),
             (ErrorCode::SwapAbandoned, "swap_abandoned", 500),
+            (ErrorCode::NodeIdentity, "node_identity", 500),
+            (ErrorCode::DrainFailed, "drain_failed", 500),
+            (ErrorCode::UndrainFailed, "undrain_failed", 500),
         ];
         for (c, name, status) in all {
             assert_eq!(

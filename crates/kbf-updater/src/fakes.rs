@@ -5,13 +5,14 @@
 //! installed after host A was healthy, and that host C was never asked about at all. Unscripted
 //! answers are the happy path: safe to stop, install succeeds, healthy at once.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use crate::inventory::Host;
+use crate::inventory::{Host, Role};
 use crate::ports::{
-    Clock, Health, HealthCheck, Installed, Installer, PortError, SafeToStop, Stop, Verdict,
+    Apply, Clock, Drain, Health, HealthCheck, InstallAnswer, Installed, Installer, PortError,
+    Report, SafeToStop, Stop, Verdict,
 };
 use crate::version::Version;
 
@@ -26,6 +27,11 @@ pub enum Event {
     Install(String, String),
     Query(String),
     Health(String),
+    /// A node drain was asked for, with the deadline in seconds.
+    Drain(String, u64),
+    /// The node's leases were read.
+    Leases(String),
+    Undrain(String),
 }
 
 /// The calls made to the fakes, in order.
@@ -57,9 +63,13 @@ impl Log {
         self.events()
             .into_iter()
             .filter(|e| match e {
-                Event::Check(a) | Event::Install(a, _) | Event::Query(a) | Event::Health(a) => {
-                    a == alias
-                }
+                Event::Check(a)
+                | Event::Install(a, _)
+                | Event::Query(a)
+                | Event::Health(a)
+                | Event::Drain(a, _)
+                | Event::Leases(a)
+                | Event::Undrain(a) => a == alias,
             })
             .collect()
     }
@@ -85,6 +95,10 @@ impl<T: Clone> Script<T> {
 
     fn set(&self, alias: &str, first: Vec<T>, then: T) {
         lock(&self.map).insert(alias.to_owned(), (first.into(), then));
+    }
+
+    fn has(&self, alias: &str) -> bool {
+        lock(&self.map).contains_key(alias)
     }
 
     fn next(&self, alias: &str) -> T {
@@ -164,14 +178,25 @@ impl SafeToStop for FakeSafeToStop {
     }
 }
 
+/// The node id and the running commit a host reports.
+type Identity = (Option<String>, Option<String>);
+
 type Hook = Arc<dyn Fn(&Host) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct FakeInstaller {
     log: Log,
     installed: Arc<Mutex<BTreeMap<String, Installed>>>,
-    installs: Arc<Script<Result<(), PortError>>>,
+    /// `None` answers as the host's role does: `Installed` for a Linux host, `ApplyStarted`
+    /// for a Mac.
+    installs: Arc<Script<Result<Option<InstallAnswer>, PortError>>>,
+    /// Per alias: the apply state a Mac reports on each query once an apply is going.
+    applies: Arc<Script<Option<Apply>>>,
+    /// The Macs whose apply has started: an install was answered, or a test said so.
+    applying: Arc<Mutex<BTreeSet<String>>>,
     queries: Arc<Script<Option<Result<Installed, PortError>>>>,
+    /// Per alias: the node id and the running commit the host reports.
+    identity: Arc<Mutex<BTreeMap<String, Identity>>>,
     hook: Arc<Mutex<Option<Hook>>>,
 }
 
@@ -180,8 +205,11 @@ impl FakeInstaller {
         FakeInstaller {
             log: log.clone(),
             installed: Arc::default(),
-            installs: Arc::new(Script::new(Ok(()))),
+            installs: Arc::new(Script::new(Ok(None))),
+            applies: Arc::new(Script::new(None)),
+            applying: Arc::default(),
             queries: Arc::new(Script::new(None)),
+            identity: Arc::default(),
             hook: Arc::default(),
         }
     }
@@ -206,13 +234,55 @@ impl FakeInstaller {
         first: Vec<Result<(), PortError>>,
         then: Result<(), PortError>,
     ) {
-        self.installs.set(alias, first, then);
+        let answer = |r: Result<(), PortError>| r.map(|()| None);
+        self.installs
+            .set(alias, first.into_iter().map(answer).collect(), answer(then));
+    }
+
+    /// As [`FakeInstaller::script_install`], with the answer each install gives.
+    pub fn script_install_answers(
+        &self,
+        alias: &str,
+        first: Vec<Result<InstallAnswer, PortError>>,
+        then: Result<InstallAnswer, PortError>,
+    ) {
+        let answer = |r: Result<InstallAnswer, PortError>| r.map(Some);
+        self.installs
+            .set(alias, first.into_iter().map(answer).collect(), answer(then));
+    }
+
+    /// The apply state a Mac host reports on each query once its apply has started: `first`
+    /// in order, then `then`. A Mac reports none before that (an install answered, or
+    /// [`FakeInstaller::begin_apply`]) and, unscripted, `done` after; a Linux host always
+    /// reports none.
+    pub fn script_apply(&self, alias: &str, first: Vec<Option<Apply>>, then: Option<Apply>) {
+        self.applies.set(alias, first, then);
+    }
+
+    /// The Mac's apply is going now, as if an install had started it before the test began.
+    pub fn begin_apply(&self, alias: &str) {
+        lock(&self.applying).insert(alias.to_owned());
+        if !self.applies.has(alias) {
+            self.applies.set(alias, Vec::new(), Some(Apply::Done));
+        }
     }
 
     /// Answers of `query` for a host: `first` in order, then what the host has installed.
     pub fn script_query(&self, alias: &str, first: Vec<Result<Installed, PortError>>) {
         self.queries
             .set(alias, first.into_iter().map(Some).collect(), None);
+    }
+
+    /// What the host reports as its node id and running commit. Unscripted hosts report the
+    /// node id `<alias>-node` and no commit.
+    pub fn set_identity(&self, alias: &str, node_id: Option<&str>, running_commit: Option<&str>) {
+        lock(&self.identity).insert(
+            alias.to_owned(),
+            (
+                node_id.map(str::to_owned),
+                running_commit.map(str::to_owned),
+            ),
+        );
     }
 
     /// Call `f` at the start of every install (a test reads the record from it).
@@ -222,7 +292,7 @@ impl FakeInstaller {
 }
 
 impl Installer for FakeInstaller {
-    fn install(&self, host: &Host, version: &Version) -> Result<(), PortError> {
+    fn install(&self, host: &Host, version: &Version) -> Result<InstallAnswer, PortError> {
         self.log
             .push(Event::Install(host.alias.clone(), version.to_string()));
         // Cloned out, so a hook that re-enters the installer does not deadlock on the slot.
@@ -230,18 +300,103 @@ impl Installer for FakeInstaller {
         if let Some(hook) = hook {
             hook(host);
         }
-        let result = self.installs.next(&host.alias);
-        if result.is_ok() {
-            self.set_installed(&host.alias, Installed::Version(version.to_string()));
-        }
-        result
+        let answer = self.installs.next(&host.alias)?.unwrap_or(match host.role {
+            Role::MacDaemon => InstallAnswer::ApplyStarted,
+            _ => InstallAnswer::Installed,
+        });
+        self.set_installed(&host.alias, Installed::Version(version.to_string()));
+        self.begin_apply(&host.alias);
+        Ok(answer)
     }
 
-    fn query(&self, host: &Host) -> Result<Installed, PortError> {
+    fn report(&self, host: &Host) -> Result<Report, PortError> {
         self.log.push(Event::Query(host.alias.clone()));
-        self.queries
+        let installed = self
+            .queries
             .next(&host.alias)
-            .unwrap_or_else(|| Ok(self.installed(&host.alias)))
+            .unwrap_or_else(|| Ok(self.installed(&host.alias)))?;
+        let (node_id, running_commit) = lock(&self.identity)
+            .get(&host.alias)
+            .cloned()
+            .unwrap_or_else(|| (Some(format!("{}-node", host.alias)), None));
+        let apply = match host.role {
+            Role::MacDaemon if lock(&self.applying).contains(&host.alias) => {
+                self.applies.next(&host.alias)
+            }
+            _ => None,
+        };
+        Ok(Report {
+            installed,
+            running_commit,
+            node_id,
+            apply,
+        })
+    }
+}
+
+/// A scripted drain of nodes: every call is in the [`Log`] by the host's alias.
+#[derive(Clone)]
+pub struct FakeDrain {
+    log: Log,
+    drains: Arc<Script<Result<(), PortError>>>,
+    leases: Arc<Script<Result<usize, PortError>>>,
+    undrains: Arc<Script<Result<(), PortError>>>,
+}
+
+impl FakeDrain {
+    pub fn new(log: &Log) -> FakeDrain {
+        FakeDrain {
+            log: log.clone(),
+            drains: Arc::new(Script::new(Ok(()))),
+            leases: Arc::new(Script::new(Ok(0))),
+            undrains: Arc::new(Script::new(Ok(()))),
+        }
+    }
+
+    pub fn script_drain(
+        &self,
+        alias: &str,
+        first: Vec<Result<(), PortError>>,
+        then: Result<(), PortError>,
+    ) {
+        self.drains.set(alias, first, then);
+    }
+
+    /// The lease counts a node reports, in order, then `then` for ever after.
+    pub fn script_leases(
+        &self,
+        alias: &str,
+        first: Vec<Result<usize, PortError>>,
+        then: Result<usize, PortError>,
+    ) {
+        self.leases.set(alias, first, then);
+    }
+
+    pub fn script_undrain(
+        &self,
+        alias: &str,
+        first: Vec<Result<(), PortError>>,
+        then: Result<(), PortError>,
+    ) {
+        self.undrains.set(alias, first, then);
+    }
+}
+
+impl Drain for FakeDrain {
+    fn drain(&self, host: &Host, deadline: Duration) -> Result<(), PortError> {
+        self.log
+            .push(Event::Drain(host.alias.clone(), deadline.as_secs()));
+        self.drains.next(&host.alias)
+    }
+
+    fn leases(&self, host: &Host) -> Result<usize, PortError> {
+        self.log.push(Event::Leases(host.alias.clone()));
+        self.leases.next(&host.alias)
+    }
+
+    fn undrain(&self, host: &Host) -> Result<(), PortError> {
+        self.log.push(Event::Undrain(host.alias.clone()));
+        self.undrains.next(&host.alias)
     }
 }
 
@@ -249,10 +404,8 @@ impl Installer for FakeInstaller {
 pub struct FakeHealth {
     log: Log,
     script: Arc<Script<Result<Health, PortError>>>,
-    /// The aliases the roll said it was about to install, in order (not in the [`Log`]: the
-    /// call sequences the roll tests pin do not change).
-    installing: Arc<Mutex<Vec<String>>>,
-    settled: Arc<Mutex<Vec<String>>>,
+    /// Answers for a host the roll holds drained; unscripted hosts answer as `script` does.
+    held: Arc<Script<Option<Result<Health, PortError>>>>,
 }
 
 impl FakeHealth {
@@ -260,19 +413,8 @@ impl FakeHealth {
         FakeHealth {
             log: log.clone(),
             script: Arc::new(Script::new(Ok(Health::Healthy))),
-            installing: Arc::default(),
-            settled: Arc::default(),
+            held: Arc::new(Script::new(None)),
         }
-    }
-
-    /// The aliases the roll reported done, in order.
-    pub fn settled_calls(&self) -> Vec<String> {
-        lock(&self.settled).clone()
-    }
-
-    /// The aliases the roll announced an install for, in order.
-    pub fn installing_calls(&self) -> Vec<String> {
-        lock(&self.installing).clone()
     }
 
     pub fn script(
@@ -283,24 +425,34 @@ impl FakeHealth {
     ) {
         self.script.set(alias, first, then);
     }
+
+    /// The answers of `check_held` for a host: `first` in order, then `then`.
+    pub fn script_held(
+        &self,
+        alias: &str,
+        first: Vec<Result<Health, PortError>>,
+        then: Result<Health, PortError>,
+    ) {
+        self.held
+            .set(alias, first.into_iter().map(Some).collect(), Some(then));
+    }
 }
 
 impl HealthCheck for FakeHealth {
-    fn installing(&self, host: &Host, _target: &Version) {
-        lock(&self.installing).push(host.alias.clone());
-    }
-
     fn refusal(&self, _host: &Host) -> Option<String> {
         None
-    }
-
-    fn settled(&self, host: &Host, _target: &Version) {
-        lock(&self.settled).push(host.alias.clone());
     }
 
     fn check(&self, host: &Host, _target: &Version) -> Result<Health, PortError> {
         self.log.push(Event::Health(host.alias.clone()));
         self.script.next(&host.alias)
+    }
+
+    fn check_held(&self, host: &Host, _target: &Version) -> Result<Health, PortError> {
+        self.log.push(Event::Health(host.alias.clone()));
+        self.held
+            .next(&host.alias)
+            .unwrap_or_else(|| self.script.next(&host.alias))
     }
 }
 
@@ -315,6 +467,7 @@ mod tests {
             address: "h.example".to_owned(),
             role: Role::Storage,
             host_key: "ssh-ed25519 AAAA".to_owned(),
+            node_id: None,
         }
     }
 
@@ -344,7 +497,7 @@ mod tests {
         inst.script_install("b", vec![Err(PortError("lock".into()))], Ok(()));
         assert_eq!(inst.install(&b, &v), Err(PortError("lock".into())));
         assert_eq!(inst.installed("b"), Installed::Version("0.0.0".into()));
-        assert_eq!(inst.install(&b, &v), Ok(()));
+        assert_eq!(inst.install(&b, &v), Ok(InstallAnswer::Installed));
         assert_eq!(inst.query(&b), Ok(Installed::Version("2.0".into())));
         inst.script_query("b", vec![Ok(Installed::InProgress)]);
         assert_eq!(inst.query(&b), Ok(Installed::InProgress));

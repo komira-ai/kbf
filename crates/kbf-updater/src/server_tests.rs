@@ -23,7 +23,7 @@ use crate::testutil::{
 use crate::{Ports, Timing};
 
 const INVENTORY: &str = "fe fe.farm.example frontend KEY\nst1 st1.farm.example storage KEY\n\
-                         dm dm.farm.example daemon KEY\n";
+                         dm dm.farm.example daemon KEY dm-node\n";
 
 /// A scratch directory with an inventory and an empty state directory, and the config over it.
 fn prepare(name: &str, proxy_uid: u32) -> Config {
@@ -45,6 +45,9 @@ fn prepare(name: &str, proxy_uid: u32) -> Config {
         channel: "stable".to_owned(),
         ssh_connect_timeout: std::time::Duration::from_secs(5),
         ssh_command_timeout: std::time::Duration::from_secs(30),
+        drain_deadline: std::time::Duration::from_secs(600),
+        apply_poll: std::time::Duration::from_secs(5),
+        apply_deadline: std::time::Duration::from_secs(600),
     }
 }
 
@@ -86,6 +89,7 @@ impl Farm {
         let ports = Ports {
             safe: Box::new(stop.clone()),
             installer: Box::new(inst.clone()),
+            drain: Box::new(crate::fakes::FakeDrain::new(&log)),
             health: Box::new(health),
             clock: Box::new(clock),
         };
@@ -581,6 +585,7 @@ fn bare_server(name: &str) -> (Server, std::sync::mpsc::Receiver<String>, Lines)
     let ports = Ports {
         safe: Box::new(FakeSafeToStop::new(&log)),
         installer: Box::new(FakeInstaller::new(&log)),
+        drain: Box::new(crate::fakes::FakeDrain::new(&log)),
         health: Box::new(FakeHealth::new(&log)),
         clock: Box::new(FakeClock::new()),
     };
@@ -718,6 +723,7 @@ fn a_running_roll_found_at_start_is_resumed() {
         let ports = Ports {
             safe: Box::new(FakeSafeToStop::new(&log)),
             installer: Box::new(FakeInstaller::new(&log)),
+            drain: Box::new(crate::fakes::FakeDrain::new(&log)),
             health: Box::new(FakeHealth::new(&log)),
             clock: Box::new(FakeClock::new()),
         };

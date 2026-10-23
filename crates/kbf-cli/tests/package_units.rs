@@ -6,7 +6,9 @@
 //! - a package unit for a mode `kbf` does not have (the files and `kbf_cli::names::MODES`
 //!   drifting apart);
 //! - a unit whose
-//!   `ExecStart=` or `ExecStartPre=` `kbf` line is a command line `kbf <mode>` refuses.
+//!   `ExecStart=` or `ExecStartPre=` `kbf` line is a command line `kbf <mode>` refuses;
+//! - a unit whose `kbf boot-check` line is not the one `kbf boot-check` takes, for the unit's
+//!   own mode, as the first `ExecStartPre=` and as root.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -32,19 +34,37 @@ fn units() -> Vec<(String, String)> {
     out
 }
 
-/// The `kbf` command lines of the unit (`ExecStart=` and `ExecStartPre=` that run the
-/// installer's `kbf`), as words after the program.
-fn kbf_lines(text: &str) -> Vec<Vec<String>> {
+/// Every `kbf` command line of the unit (`ExecStart=` and `ExecStartPre=` that run the
+/// package's `kbf`), as words after the program.
+fn exec_lines(text: &str) -> Vec<Vec<String>> {
     text.lines()
         .filter_map(|l| {
             let v = l
                 .strip_prefix("ExecStart=")
                 .or_else(|| l.strip_prefix("ExecStartPre="))?;
-            let mut w = v.split_whitespace().map(str::to_owned);
+            let mut w = v
+                .trim_start_matches('+')
+                .split_whitespace()
+                .map(str::to_owned);
             let program = w.next()?;
             program.ends_with("/kbf").then(|| w.collect())
         })
         .collect()
+}
+
+/// The command lines of the unit that start a mode or check it (`--mode=<mode> ...`): the
+/// unit's `kbf` lines but its `boot-check`.
+fn kbf_lines(text: &str) -> Vec<Vec<String>> {
+    let mut lines = exec_lines(text);
+    lines.retain(|w| w.first().is_none_or(|word| word != "boot-check"));
+    lines
+}
+
+/// The `kbf boot-check` command lines of the unit, as words after the program.
+fn boot_check_lines(text: &str) -> Vec<Vec<String>> {
+    let mut lines = exec_lines(text);
+    lines.retain(|w| w.first().is_some_and(|word| word == "boot-check"));
+    lines
 }
 
 /// Catches a package unit for a mode `kbf` lacks, and a mode of `kbf` with no unit.
@@ -54,6 +74,32 @@ fn the_package_has_a_unit_for_each_kbf_mode() {
     let mut want: Vec<String> = MODES.iter().map(|m| m.name.to_owned()).collect();
     want.sort();
     assert_eq!(have, want);
+}
+
+/// Asserts that every mode unit runs `kbf boot-check` exactly once, as root (`+`) and as the
+/// first `ExecStartPre=`, for its own mode and with no other flag, and that `kbf`'s own parser
+/// takes the line and reads the unit's mode and the default `installer.toml` from it.
+#[test]
+fn each_package_unit_runs_one_boot_check_for_its_own_mode_that_kbfs_own_parser_takes() {
+    let mut checked = 0;
+    for (mode, text) in units() {
+        let flag = format!("--mode={mode}");
+        let want = [["boot-check", flag.as_str()]];
+        assert_eq!(boot_check_lines(&text), want, "{mode}");
+        let first = text
+            .lines()
+            .find_map(|l| l.strip_prefix("ExecStartPre="))
+            .expect("a start check");
+        let line = format!("+/usr/bin/kbf boot-check {flag}");
+        assert_eq!(first, line, "{mode}");
+        let argv = ["kbf", "boot-check", flag.as_str()].map(OsString::from);
+        let parsed = kbf_cli::boot_check::parse(&argv).unwrap_or_else(|e| panic!("{mode}: {e}"));
+        assert_eq!(parsed.mode, mode);
+        let default = Path::new(kbf_cli::boot_check::DEFAULT_INSTALLER_CONFIG);
+        assert_eq!(parsed.installer_config, default, "{mode}");
+        checked += 1;
+    }
+    assert_eq!(checked, MODES.len(), "a mode unit was not checked");
 }
 
 /// Catches a unit command line `kbf <mode>` refuses: every `kbf` line of a package unit

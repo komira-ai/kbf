@@ -3,8 +3,10 @@
 //! `nobody` owns; what it leaves there is untrusted bytes until the root process has copied
 //! them once and checked the copy ([`super::stage`]).
 //!
-//! 1. The releases are listed with `gh api repos/<repo>/releases`, a page of 100 at a time
-//!    until a page is empty, at most [`MAX_PAGES`] pages. Never only the latest: a rollback
+//! 1. The releases are listed with the system `curl` from the public REST endpoint
+//!    `https://api.github.com/repos/<repo>/releases`, a page of 100 at a time until a page
+//!    is empty, at most [`MAX_PAGES`] pages. No token is needed (the API allows 60 requests
+//!    an hour per address without one). Never only the latest: a rollback
 //!    names an old release. Every page is read, because two commits that start with the
 //!    version's 12 hex digits are an ambiguous release and only the whole listing shows it.
 //! 2. A release asset named `kbf-<40 hex>-darwin-arm64.tar.gz` whose commit starts with the
@@ -16,10 +18,11 @@
 //!    listing (`browser_download_url`, `url`) is ever read, let alone followed.
 //!    The command has a time limit and a limit on what it may write.
 //!
-//! `gh api` refuses to run without a token (`gh release download` does not), so a channel
-//! may name a `token_file`: a token for the public API, no scopes needed, read by root and
-//! given to `gh` as `GH_TOKEN`. Nothing is trusted because the API said it; the attestation
-//! is the trust anchor.
+//! A channel may name a `token_file`: a token for the public API, no scopes needed, read by
+//! root for a higher rate limit. The listing sends it to `curl` as a header in a
+//! configuration on its standard input (never in the arguments, which every user can read),
+//! and the download gets it as `GH_TOKEN`. Nothing is trusted because the API said it; the
+//! attestation is the trust anchor.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -65,9 +68,12 @@ pub struct Limits {
     pub bundle_max: u64,
 }
 
-/// The pinned `gh`, run as `who` with `home` as its home.
+/// The system `curl` that lists and the pinned `gh` that downloads, run as `who` with `home`
+/// as the home of `gh`. `token`, when there is one, is one line of letters, digits, `_` and
+/// `-`.
 pub struct Fetcher<'a> {
     pub runner: &'a dyn Runner,
+    pub curl: &'a Path,
     pub gh: &'a Path,
     pub who: Identity,
     pub home: &'a Path,
@@ -126,17 +132,51 @@ impl Fetcher<'_> {
         env
     }
 
-    /// `gh api` for page `page` of the repository's releases.
+    /// `curl` for page `page` of the repository's releases: no configuration file (`-q`),
+    /// HTTPS only, no redirect, a time limit and a size limit, errors of HTTP failing the
+    /// command. The command carries no environment of its own (the runner adds only its fixed
+    /// `PATH`, `LANG` and `DEBIAN_FRONTEND`). The token, if any, is the only thing on its
+    /// standard input.
     pub fn list_cmd(&self, page: u32) -> Cmd {
+        let mut args: Vec<String> = [
+            "-q",
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "--max-redirs",
+            "0",
+            "--header",
+            "Accept: application/vnd.github+json",
+            "--header",
+            "X-GitHub-Api-Version: 2022-11-28",
+            "--user-agent",
+            "kbf-host-install",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        args.push("--max-time".to_owned());
+        args.push(self.limits.tool.as_secs().max(1).to_string());
+        args.push("--max-filesize".to_owned());
+        args.push(MAX_PAGE_BYTES.to_string());
+        let mut stdin = Vec::new();
+        if let Some(token) = self.token {
+            args.push("--config".to_owned());
+            args.push("-".to_owned());
+            stdin = format!("header = \"Authorization: Bearer {token}\"\n").into_bytes();
+        }
+        args.push("--url".to_owned());
+        args.push(format!(
+            "https://api.github.com/repos/{REPO}/releases?per_page={PER_PAGE}&page={page}"
+        ));
         Cmd {
-            program: self.gh.display().to_string(),
-            args: vec![
-                "api".to_owned(),
-                format!("repos/{REPO}/releases?per_page={PER_PAGE}&page={page}"),
-            ],
+            program: self.curl.display().to_string(),
+            args,
             timeout: Some(self.limits.tool),
-            env: self.env(),
             run_as: Some(self.who),
+            stdin,
             stdout_max: Some(MAX_PAGE_BYTES),
             ..Cmd::default()
         }
@@ -218,11 +258,11 @@ impl Fetcher<'_> {
     fn list_page(&self, page: u32) -> Result<Vec<Release>, FetchError> {
         let exec = match self.runner.run(&self.list_cmd(page)) {
             Ok(exec) => exec,
-            Err(e) => return failed(format!("gh api: {e}")),
+            Err(e) => return failed(format!("curl: {e}")),
         };
         if !exec.success() {
             return failed(format!(
-                "gh api: exit status {:?}: {}",
+                "curl: exit status {:?}: {}",
                 exec.code,
                 exec.stderr_text()
             ));

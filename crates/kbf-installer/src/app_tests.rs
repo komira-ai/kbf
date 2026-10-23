@@ -6,7 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::cli::ProxyArgs;
+use crate::fixtures::{FakeRunner, ran};
 use crate::layout::{Layout, Platform};
+use crate::run::Ran;
 use crate::setup::raw_from;
 use crate::state::{Locked, PendingConfirm, State};
 use crate::testkit::{A, B, c, host_root_on};
@@ -584,20 +586,13 @@ fn boot_check_counts_a_start_and_refuses_what_it_cannot_read() {
     }
 }
 
-/// Catches a bundled host's boot check reading a state the host does not have, or letting a
-/// unit start after its database step failed. With `--kbf` and `--mode` the verb never calls
-/// `activate::boot_check` (both state files are ruined here, which is exit 5 without the
-/// flags); a daemon passes and reads nothing (no `installer.toml` is there); a frontend with
-/// no `installer.toml` fails with exit 1 and the file named; an all-in-one whose
-/// `installer.toml` names a database, and whose kbf is not a file, fails with exit 1 and the
-/// binary named; one whose `installer.toml` names no database passes; a relative root fails
-/// with exit 1 before anything is read.
-///
-/// Mutants it catches: `activate::boot_check` called on the bundled path (the ruined state is
-/// exit 5); the failure arm returning `Ok`; the mode gate removed (the daemon fails on the
-/// missing file); the root error swallowed.
+/// Asserts that a bundled host's boot check reads no state the host does not have and runs the
+/// kbf its unit names. With `--kbf` and `--mode` the verb never calls `activate::boot_check`
+/// (both state files are ruined here, which is exit 5 without the flags), and a kbf that is
+/// not a file ends the check with exit 1, the kbf named, for a mode that keeps no state in
+/// the database as for one that does.
 #[test]
-fn a_bundled_boot_check_runs_the_schema_step_and_never_reads_the_state() {
+fn a_bundled_boot_check_runs_the_kbf_it_names_and_never_reads_the_state() {
     let (layout, root) = seeded("boot-bundled");
     for file in [layout.state_file(), layout.state_backup()] {
         fs::write(layout.join(&file), b"not json").expect("ruin");
@@ -606,34 +601,83 @@ fn a_bundled_boot_check_runs_the_schema_step_and_never_reads_the_state() {
     assert_eq!(exit, Exit::NeedsOperator, "{err}");
 
     let flag = format!("--kbf={}", root.join("no-such-kbf").display());
-    let bundled = |mode: &str| on(&root, &["boot-check", flag.as_str(), mode]);
-    let (exit, err) = bundled("--mode=daemon");
-    assert_eq!(exit, Exit::Ok, "{err}");
-    let (exit, err) = bundled("--mode=frontend");
-    assert_eq!(exit, Exit::Failed, "{err}");
-    assert!(err.contains("installer.toml"), "{err}");
+    for mode in ["--mode=daemon", "--mode=frontend"] {
+        let (exit, err) = on(&root, &["boot-check", flag.as_str(), mode]);
+        assert_eq!(exit, Exit::Failed, "{mode}: {err}");
+        assert!(err.contains("cannot run"), "{mode}: {err}");
+        assert!(err.contains("no-such-kbf"), "{mode}: {err}");
+    }
+}
 
+/// Asserts that a bundled host's boot check runs `<kbf> boot-check --mode=<mode>` once, for
+/// each of the five modes, with the host's `installer.toml` under the root named by
+/// `--installer-config`, as the caller with an empty environment in `/` and for at most 120 s,
+/// and passes when it exits 0. A relative root is refused before anything is run.
+#[test]
+fn the_bundled_boot_check_runs_kbf_boot_check_for_the_mode_and_passes_when_it_does() {
+    let (layout, root) = seeded("boot-bundled-args");
     let installer_toml = layout.join(&layout.installer_toml());
-    let dir = installer_toml.parent().expect("a directory");
-    crate::testkit::mkdirs(&root, dir, 0o755);
-    let database = "database = \"postgres:///kbf?host=/nonexistent-kbf-test-socket\"\n";
-    fs::write(&installer_toml, database).expect("installer.toml");
-    let (exit, err) = bundled("--mode=all-in-one");
-    assert_eq!(exit, Exit::Failed, "{err}");
-    assert!(err.contains("no-such-kbf did not say its schema"), "{err}");
-    fs::write(&installer_toml, "release_source = \"bundled\"\n").expect("installer.toml");
-    let (exit, err) = bundled("--mode=frontend");
-    assert_eq!(exit, Exit::Ok, "{err}");
-
-    let relative = [
-        "--root",
-        "relative",
-        "boot-check",
-        "--kbf=/usr/bin/kbf",
-        "--mode=daemon",
+    let config = format!("--installer-config={}", installer_toml.display());
+    let modes = [
+        (Mode::Frontend, "frontend"),
+        (Mode::Storage, "storage"),
+        (Mode::Daemon, "daemon"),
+        (Mode::StorageAndDaemon, "storage-and-daemon"),
+        (Mode::AllInOne, "all-in-one"),
     ];
-    let (exit, _, _) = run_as(1000, &relative);
-    assert_eq!(exit, Exit::Failed);
+    for (mode, name) in modes {
+        let runner = FakeRunner::new(|_| Ok(ran(0, "", "kbf boot-check: skipped\n")));
+        let kbf = Path::new("/usr/bin/kbf");
+        bundled_boot_check(root.clone(), &runner, kbf, mode).expect("passes");
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1, "{name}");
+        let spawn = &calls[0];
+        let flag = format!("--mode={name}");
+        assert_eq!(spawn.program, kbf);
+        assert_eq!(spawn.args, ["boot-check", flag.as_str(), config.as_str()]);
+        assert!(spawn.env.is_empty(), "{name}");
+        assert_eq!(spawn.cwd, Path::new("/"), "{name}");
+        assert_eq!(spawn.run_as, None, "{name}");
+        assert_eq!(spawn.timeout, Duration::from_secs(120), "{name}");
+    }
+    let runner = FakeRunner::new(|_| Ok(ran(0, "", "")));
+    let kbf = Path::new("/usr/bin/kbf");
+    let refused = bundled_boot_check("relative".into(), &runner, kbf, Mode::Daemon);
+    assert_eq!(refused.unwrap_err().exit, Exit::Failed);
+    assert!(runner.calls().is_empty());
+}
+
+/// Asserts that a bundled host's boot check ends as the kbf it ran ended: an exit status other
+/// than 0, a signal, a run past 120 s and a kbf that could not be started are each exit 1 with
+/// the kbf named and what happened, and an exit status 2 (a kbf without the verb) says to
+/// upgrade the kbf package.
+#[test]
+fn the_bundled_boot_check_fails_when_kbf_boot_check_does_not_exit_0() {
+    let (_, root) = seeded("boot-bundled-ended");
+    let mut timed_out = ran(0, "", "");
+    timed_out.timed_out = true;
+    let mut signalled = ran(0, "", "");
+    signalled.code = None;
+    let ended = |answer: Ran| FakeRunner::new(move |_| Ok(answer.clone()));
+    let cases = [
+        (ended(ran(1, "", "busy\n")), "ended with Some(1)"),
+        (ended(ran(2, "", "")), "upgrade the kbf package"),
+        (ended(signalled), "ended with None"),
+        (ended(timed_out), "did not end in 120 s"),
+        (
+            FakeRunner::new(|_| Err(std::io::ErrorKind::NotFound.into())),
+            "cannot run /usr/bin/kbf: entity not found",
+        ),
+    ];
+    let kbf = Path::new("/usr/bin/kbf");
+    for (runner, says) in cases {
+        let failure = bundled_boot_check(root.clone(), &runner, kbf, Mode::Frontend);
+        let failure = failure.unwrap_err();
+        assert_eq!(failure.exit, Exit::Failed, "{says}");
+        let why = &failure.why;
+        assert!(why.contains("/usr/bin/kbf"), "{says}: {why}");
+        assert!(why.contains(says), "{says}: {why}");
+    }
 }
 
 /// Catches the bundled flags of `boot-check` being taken singly or with a mode that does not

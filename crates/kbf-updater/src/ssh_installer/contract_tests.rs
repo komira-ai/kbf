@@ -9,6 +9,12 @@ use kbf_host_install::contract::{
 
 use super::answer::{install_answer, query_answer};
 use super::*;
+use crate::ports::{Apply, InstallAnswer, Installed};
+
+/// A version for the tests that do not care which.
+fn v1() -> Version {
+    Version::parse("1").expect("version")
+}
 
 /// Every refusal. The `match` is the guard: a new variant is a compile error here until the
 /// list below (and so the tests) name it.
@@ -94,12 +100,20 @@ fn every_install_outcome_of_the_host_is_read() {
             },
         ] {
             let (code, out) = printed(&outcome);
-            assert_eq!(install_answer(code, &out), Ok(()), "{outcome:?}");
+            let want = match outcome {
+                Outcome::Installed { .. } => InstallAnswer::Installed,
+                _ => InstallAnswer::AlreadyInstalled,
+            };
+            assert_eq!(
+                install_answer(code, &out, &Version::parse(version).expect("version")),
+                Ok(want),
+                "{outcome:?}"
+            );
         }
     }
     for refusal in refusals() {
         let (code, out) = printed(&Outcome::Refused(refusal));
-        let got = install_answer(code, &out).expect_err("refused");
+        let got = install_answer(code, &out, &v1()).expect_err("refused");
         assert_eq!(
             got,
             PortError::other(format!("refused: {}", refusal.code()))
@@ -111,10 +125,33 @@ fn every_install_outcome_of_the_host_is_read() {
             detail: "raw apt words".into(),
         });
         let (code, out) = printed(&outcome);
-        let got = install_answer(code, &out).expect_err("failed");
+        let got = install_answer(code, &out, &v1()).expect_err("failed");
         assert_eq!(got, PortError::other(format!("failed: {}", failure.code())));
         assert!(!got.to_string().contains("raw apt"));
     }
+}
+
+/// Catches a drift of the two query fields the roll acts on: the node id and the running
+/// commit are read as the host's own types print them, and an absent one is `None` (an old
+/// host that prints neither is still read).
+#[test]
+fn the_node_id_and_the_running_commit_of_the_host_are_read() {
+    let report = |c: Option<&str>, id: Option<&str>| {
+        let (code, out) = printed(&Outcome::Queried(QueryReport {
+            installed_version: Some("1.2.3-1".to_owned()),
+            running_commit: c.map(str::to_owned),
+            node_id: id.map(str::to_owned),
+            in_progress: false,
+        }));
+        query_answer(code, &out).expect("read")
+    };
+    let both = report(Some("0123456789ab"), Some("node-1"));
+    assert_eq!(both.running_commit.as_deref(), Some("0123456789ab"));
+    assert_eq!(both.node_id.as_deref(), Some("node-1"));
+    let neither = report(None, None);
+    assert_eq!((neither.running_commit, neither.node_id), (None, None));
+    let old = br#"{"result":"query","installed_version":"1","in_progress":false}"#;
+    assert_eq!(query_answer(0, old).expect("old host").node_id, None);
 }
 
 /// Catches a drift of the query report: the field names and types, `null` for nothing
@@ -131,7 +168,7 @@ fn every_query_outcome_of_the_host_is_read() {
     };
     let read = |o: &Outcome| {
         let (code, out) = printed(o);
-        query_answer(code, &out)
+        query_answer(code, &out).map(|r| r.installed)
     };
     assert_eq!(
         read(&report(Some("1.2.3-1"), Some("abc"), false)),
@@ -184,7 +221,7 @@ fn an_answer_of_the_other_verb_is_not_read() {
     });
     let (code, out) = printed(&q);
     assert_eq!(
-        install_answer(code, &out),
+        install_answer(code, &out, &v1()),
         Err(PortError::other("bad answer"))
     );
 }
@@ -288,4 +325,66 @@ fn the_channel_rule_agrees_with_the_host() {
         let host_says = install_request(&format!("install kbf={version} from {c}")).is_some();
         assert_eq!(Channel::parse(&c).is_ok(), host_says, "{c:?}");
     }
+}
+
+/// Catches a drift of the Mac answers: the host's own `apply_started` is read as that answer
+/// for the version it names and for no other, and its Mac query line (the report and the
+/// `apply` word, in every state the host writes) is read with the report intact.
+#[test]
+fn the_mac_answers_of_the_host_are_read() {
+    let started = Outcome::ApplyStarted {
+        version: "20261021.1+git9ba38c2-2".into(),
+        commit: "0123456789ab".into(),
+    };
+    let (code, out) = printed(&started);
+    let asked = Version::parse("20261021.1+git9ba38c2-2").expect("version");
+    assert_eq!(
+        install_answer(code, &out, &asked),
+        Ok(InstallAnswer::ApplyStarted)
+    );
+    assert_eq!(
+        install_answer(code, &out, &v1()),
+        Err(PortError::other("bad answer"))
+    );
+    let apply_states = [
+        ("running", Some(Apply::Running)),
+        ("done", Some(Apply::Done)),
+        (
+            "failed:health_timeout:rolled_back",
+            Some(Apply::Failed("health_timeout:rolled_back".to_owned())),
+        ),
+        (
+            "failed:apply_lost",
+            Some(Apply::Failed("apply_lost".to_owned())),
+        ),
+    ];
+    for (line, want) in apply_states {
+        let outcome = Outcome::MacQueried {
+            report: QueryReport {
+                installed_version: Some("1.2.3-1".to_owned()),
+                running_commit: Some("0123456789ab".to_owned()),
+                node_id: Some("mac-1".to_owned()),
+                in_progress: false,
+            },
+            apply: Some(line.to_owned()),
+        };
+        let (code, out) = printed(&outcome);
+        let got = query_answer(code, &out).expect(line);
+        assert_eq!(got.apply, want, "{line}");
+        assert_eq!(got.installed, Installed::Version("1.2.3-1".into()));
+        assert_eq!(got.running_commit.as_deref(), Some("0123456789ab"));
+        assert_eq!(got.node_id.as_deref(), Some("mac-1"));
+    }
+    let none = Outcome::MacQueried {
+        report: QueryReport {
+            installed_version: None,
+            running_commit: None,
+            node_id: Some("mac-1".to_owned()),
+            in_progress: false,
+        },
+        apply: None,
+    };
+    let (code, out) = printed(&none);
+    let got = query_answer(code, &out).expect("no apply yet");
+    assert_eq!((got.apply, got.installed), (None, Installed::NotInstalled));
 }

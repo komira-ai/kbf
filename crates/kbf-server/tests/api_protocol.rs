@@ -84,7 +84,7 @@ fn a_hellos_protocol_version_is_what_the_node_is_reported_speaking() {
             protocol_version: wire,
             ..hello("n", 8, 16)
         };
-        let got = reported(&hello).expect("a valid report");
+        let got = reported(&hello, kbf_server::HostFloor::default()).expect("a valid report");
         assert_eq!(got.protocol, named, "wire {wire}");
     }
 }

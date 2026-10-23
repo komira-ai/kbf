@@ -1,14 +1,11 @@
 //! The proposals of the removed release poller: `update/proposed/<commit>`, one row
 //! per release the poller found that could be run, for the operator to read in `GET
-//! /v1/update`.
+//! /v1/update`. Nothing writes them now; a store written by an older build still holds them.
 //!
-//! **A proposal is not a run.** Nothing here touches `update/desired`, `update/policy` or any
-//! host row: only an operator's `POST /v1/update/desired` starts a run. The row is JSON (a
-//! field added later must be valid absent: serde defaults), written once per commit with
-//! "must be absent", so a second poll that finds the same release writes nothing.
+//! **A proposal is not a run.** Only an operator's `POST /v1/update/desired` starts one. The
+//! row is JSON (a field added later must be valid absent: serde defaults).
 
-use kbf_state::{Cond, Txn};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use super::rows::{RowError, Rows};
 
@@ -23,7 +20,7 @@ pub fn proposal_key(commit: &str) -> String {
 
 /// A release the poller found: what the operator sees, and what a later poll compares the
 /// feed with.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Proposal {
     /// The 40-hex commit the release was built from (the commit its notes name).
     pub commit: String,
@@ -38,20 +35,6 @@ pub struct Proposal {
 }
 
 impl Rows {
-    /// Records `proposal` unless a proposal for its commit is already held (nothing is
-    /// changed then). `true` when the row is new.
-    ///
-    /// # Errors
-    /// [`RowError`]: the store failed, or this handle is no longer its writer.
-    pub fn propose(&self, proposal: &Proposal) -> Result<bool, RowError> {
-        let bytes = serde_json::to_vec(proposal).map_err(|e| RowError::Corrupt {
-            key: proposal_key(&proposal.commit),
-            why: e.to_string(),
-        })?;
-        let txn = Txn::new().put(proposal_key(&proposal.commit), bytes, Cond::Absent);
-        Ok(self.store().txn(txn)?.is_ok())
-    }
-
     /// Every proposal held, oldest release first. A row that cannot be read is left out and
     /// logged: one bad row does not hide the rest from the operator.
     ///
@@ -82,7 +65,7 @@ mod tests {
     use std::sync::Arc;
 
     use kbf_state::fake::{Fake, Flaw};
-    use kbf_state::{ManualClock, Store};
+    use kbf_state::{Cond, ManualClock, Store, Txn};
 
     use super::*;
 
@@ -94,25 +77,23 @@ mod tests {
         (Arc::clone(&store), Rows::new(store))
     }
 
-    fn proposal(commit: char, at: i64) -> Proposal {
-        Proposal {
-            commit: commit.to_string().repeat(40),
-            tag: format!("v{at}"),
-            published_at_secs: at,
-            proposed_at_ms: 7,
-        }
+    /// A proposal row as an older build wrote it.
+    fn seed(store: &Arc<dyn Store>, commit: char, at: i64) {
+        let key = proposal_key(&commit.to_string().repeat(40));
+        let row = serde_json::json!({
+            "commit": commit.to_string().repeat(40),
+            "tag": format!("v{at}"),
+            "published_at_secs": at,
+            "proposed_at_ms": 7,
+        });
+        put(store, &key, row.to_string().into_bytes());
     }
 
-    /// Catches a second proposal for one commit replacing the first (the idempotence the
-    /// poller relies on) or reporting itself new.
-    #[test]
-    fn a_commit_is_proposed_once_and_the_first_row_stays() {
-        let (_, rows) = rows();
-        assert!(rows.propose(&proposal('a', 10)).expect("first"));
-        let mut again = proposal('a', 10);
-        again.tag = "other".to_owned();
-        assert!(!rows.propose(&again).expect("second"));
-        assert_eq!(rows.proposals().expect("read"), vec![proposal('a', 10)]);
+    fn put(store: &Arc<dyn Store>, key: &str, value: Vec<u8>) {
+        store
+            .txn(Txn::new().put(key, value, Cond::Absent))
+            .expect("store")
+            .expect("no condition");
     }
 
     /// Catches proposals listed in key order instead of release order, and one unreadable row
@@ -120,13 +101,10 @@ mod tests {
     #[test]
     fn proposals_are_oldest_first_and_a_bad_row_is_skipped() {
         let (store, rows) = rows();
-        rows.propose(&proposal('b', 20)).expect("b");
-        rows.propose(&proposal('a', 30)).expect("a");
-        rows.propose(&proposal('c', 10)).expect("c");
-        store
-            .txn(Txn::new().put(proposal_key("junk"), b"not json".to_vec(), Cond::Absent))
-            .expect("store")
-            .expect("junk");
+        seed(&store, 'b', 20);
+        seed(&store, 'a', 30);
+        seed(&store, 'c', 10);
+        put(&store, &proposal_key("junk"), b"not json".to_vec());
         let order: Vec<i64> = rows
             .proposals()
             .expect("read")
@@ -136,18 +114,19 @@ mod tests {
         assert_eq!(order, [10, 20, 30]);
     }
 
-    /// Catches a proposal write touching the run's rows.
+    /// Catches a row written before `proposed_at_ms` existed being refused instead of read
+    /// with the field at zero.
     #[test]
-    fn a_proposal_writes_nothing_but_its_own_row() {
+    fn a_proposal_without_the_time_it_was_proposed_reads_as_zero() {
         let (store, rows) = rows();
-        rows.propose(&proposal('a', 10)).expect("proposed");
-        let keys: Vec<String> = store
-            .scan_prefix("")
-            .expect("scan")
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect();
-        assert_eq!(keys, [proposal_key(&"a".repeat(40))]);
-        assert!(rows.desired().expect("desired").value.is_none());
+        let key = proposal_key(&"a".repeat(40));
+        let row = format!(
+            "{{\"commit\":\"{}\",\"tag\":\"v1\",\"published_at_secs\":5}}",
+            "a".repeat(40)
+        );
+        put(&store, &key, row.into_bytes());
+        let held = rows.proposals().expect("read");
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].proposed_at_ms, 0);
     }
 }

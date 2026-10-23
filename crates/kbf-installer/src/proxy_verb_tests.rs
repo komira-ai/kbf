@@ -1113,3 +1113,16 @@ fn the_start_migrates_the_installed_release_before_it_runs_it() {
         assert!(!line.contains(part) && !boot.contains(part), "{part}");
     }
 }
+
+/// Asserts that the copy of the proxy's port layout in `observe` is the proxy's own
+/// (`kbf_proxy::config`, the same constants `setup --proxy` checks its flags against): the
+/// deploy verb finds the operator listener of each slot as `base + stride * slot + offset`
+/// without naming the proxy, so a layout that differs would send its gates to the wrong port.
+#[test]
+fn the_deploys_port_layout_is_the_proxys() {
+    use crate::observe::{MAX_BASE_PORT, OPERATOR_OFFSET, SLOT_STRIDE};
+
+    assert_eq!(SLOT_STRIDE, kbf_proxy::config::SLOT_STRIDE);
+    assert_eq!(OPERATOR_OFFSET, Target::Operator.offset());
+    assert_eq!(MAX_BASE_PORT, kbf_proxy::config::MAX_BASE_PORT);
+}
