@@ -82,6 +82,9 @@ pub struct Slots {
     program: PathBuf,
     /// A change made to the profile every launch generates: a test's weakened profile only.
     profile_change: Option<WeakenedProfile>,
+    /// Whether the slots are asserted at slot-ready: not when a step of the clean is left
+    /// out for a test, which leaves what the step removes for the next lease to find.
+    asserted: bool,
 }
 
 impl std::fmt::Debug for Slots {
@@ -143,7 +146,9 @@ impl Slots {
             slot.pool = uids.clone();
         }
         let cleaner = mac_cleaner(within, uids, skipped, program.clone());
-        Ok(Self::with(ready, cleaner, program))
+        let mut slots = Self::with(ready, cleaner, program);
+        slots.asserted = skipped.is_none();
+        Ok(slots)
     }
 
     /// [`Slots::start`] whose launches (the canaries' and the actions') run under the
@@ -169,6 +174,7 @@ impl Slots {
             book: Book::start(ready, cleaner, Backoff::DAEMON),
             program,
             profile_change: None,
+            asserted: true,
         }
     }
 
@@ -199,6 +205,7 @@ impl Slots {
             permit: Some(permit),
             program: self.program.clone(),
             profile_change: self.profile_change,
+            asserted: self.asserted,
         })
     }
 }
@@ -263,6 +270,8 @@ pub struct Slot {
     program: PathBuf,
     /// See [`Slots`].
     profile_change: Option<WeakenedProfile>,
+    /// See [`Slots`].
+    asserted: bool,
 }
 
 impl std::fmt::Debug for Slot {

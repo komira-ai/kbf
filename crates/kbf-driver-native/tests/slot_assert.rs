@@ -23,11 +23,14 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
+use kbf_driver_native::NativeRuntime;
 use kbf_driver_native::slots::macos::Slots;
 use kbf_driver_native::slots::{AS_USER_ARG, SlotUser};
-use support::pool::{Scratch, Users, home_of, wait_until};
+use support::pool::{Scratch, Users, config, home_of, wait_until};
+use support::{MemoryCas, Spec};
 
 fn assert_root() {
     support::pool::assert_root("slot_assert");
@@ -494,4 +497,37 @@ async fn a_slot_that_fails_the_check_at_slot_ready_is_set_aside_and_comes_back()
     let after = slot.assert_everything().await.expect("ran");
     assert!(after.is_empty(), "{after:?}");
     slot.release().await;
+}
+
+/// Catches a lease that runs on a user the slot-ready check would refuse (the runtime
+/// never calls the check, or ignores its answer): with one slot, a process of the user
+/// started after the start-up clean makes the first slot fail the check, the lease waits
+/// for the recovery thread (its first pass is 5 s after the slot goes dirty), and it
+/// runs only on the cleaned user: the process is already dead, killed by that clean and
+/// not by the clean after the lease, and the lease took longer than a lease that is not
+/// held up.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_assert"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_waits_for_a_slot_that_fails_the_check_to_be_cleaned() {
+    assert_root();
+    let users = Users::new("assert-lease", 1);
+    let scratch = Scratch::new("assert-lease");
+    let cas = Arc::new(MemoryCas::default());
+    let rt = NativeRuntime::new(config(&scratch, users.pool()), Arc::clone(&cas)).expect("runtime");
+    let mut sleeper = support::pool::sleeper(Some(&users.0[0]));
+    let started = std::time::Instant::now();
+    let ran = support::run(&rt, &cas, 1, &Spec::argv(&["/usr/bin/true"]))
+        .await
+        .expect("the lease ran");
+    let took = started.elapsed();
+    assert_eq!(ran.exit_code, 0);
+    let ended = sleeper.try_wait().expect("wait");
+    assert!(
+        ended.is_some_and(|status| !status.success()),
+        "the lease ran before the user was cleaned: {ended:?}"
+    );
+    assert!(
+        took >= Duration::from_secs(4),
+        "the lease was not held up for the recovery: {took:?}"
+    );
 }

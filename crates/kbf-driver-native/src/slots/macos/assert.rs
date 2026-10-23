@@ -387,11 +387,16 @@ impl Slot {
     /// the slot is handed to it: the processes and launchd's jobs, System V IPC, mounts
     /// and attached images, the home and the `/var/folders` entry, against the baseline.
     /// The lines that differ; empty when the user is as the baseline says. The slot is
-    /// then to be set aside ([`Slot::set_aside`]) if there are any.
+    /// then to be set aside ([`Slot::set_aside`]) if there are any. Always empty for slots
+    /// started with a step of the clean left out (a test's, [`super::Slots::start_skipping`]),
+    /// which are not asserted.
     ///
     /// # Errors
     /// The check did not finish.
     pub async fn assert_ready(&self, lease: &Path) -> Result<Lines, RuntimeError> {
+        if !self.asserted {
+            return Ok(Vec::new());
+        }
         self.assert_probes(&assertion::CHEAP, Some(lease.to_owned()))
             .await
     }
