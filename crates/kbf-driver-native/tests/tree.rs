@@ -399,8 +399,11 @@ async fn a_process_that_ignores_sigterm_is_named_in_the_result() {
         "{stderr}"
     );
     assert!(took >= Duration::from_millis(900), "no grace: {took:?}");
+    // An unbounded grace would wait out the child's `sleep 300`. The bound leaves room for
+    // what the lease end does after the grace on a failed action: on macOS, the read of the
+    // sandbox log for the action's own denials takes several seconds.
     assert!(
-        took < Duration::from_secs(5),
+        took < Duration::from_secs(60),
         "the grace was not bounded: {took:?}"
     );
     assert!(no_leases(&config));

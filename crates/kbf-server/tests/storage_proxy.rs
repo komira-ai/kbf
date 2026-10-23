@@ -162,7 +162,7 @@ fn the_storage_flag_is_a_url() {
 /// load balancer's idle timeout cuts it. The action is in the frontend's own cache (the
 /// scheduler still reads there); the node is unreachable and never asked. With
 /// `--progress-interval-secs 1` the idle stream is sent the same operation again, not
-/// done. Mutant: `routes_proxied` without `with_progress`: the read times out.
+/// done. Catches: `routes_proxied` without `with_progress`: the read times out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_proxied_execute_stream_is_sent_progress() {
     let args = args(&[

@@ -60,7 +60,7 @@ fn replicated(
 }
 
 /// Catches a node admitted by certificates that is not a link of the chain: it keeps a
-/// repair journal in the directory it was given and has a worker for it. Mutant: the TLS
+/// repair journal in the directory it was given and has a worker for it. Catches: the TLS
 /// case taking the plain-text arm (no journal, no worker).
 #[tokio::test]
 async fn a_node_with_a_certificate_keeps_a_repair_journal_and_has_a_worker() {
@@ -79,7 +79,7 @@ async fn a_node_with_a_certificate_keeps_a_repair_journal_and_has_a_worker() {
 
 /// Catches a node that admits callers in plain text copying blobs (a call over plain text
 /// carries no role, so a node's copy cannot be told from a client's) or opening a journal
-/// it has no use for: it judges by the map and makes no directory. Mutant: the plain-text
+/// it has no use for: it judges by the map and makes no directory. Catches: the plain-text
 /// case building a chain (the service refuses it, and the directory is made).
 #[tokio::test]
 async fn a_plain_text_node_judges_by_the_map_and_keeps_no_journal() {
@@ -171,7 +171,7 @@ async fn the_stop_follows_a_shutdown_that_is_dropped() {
 }
 
 /// Catches a repair worker that outlives the node's shutdown: the task `bind_node` starts
-/// ends when `stop` resolves. Mutant: the worker run with a stop that never resolves (the
+/// ends when `stop` resolves. Catches: the worker run with a stop that never resolves (the
 /// join never ends).
 #[tokio::test]
 async fn the_repair_worker_ends_when_it_is_stopped() {

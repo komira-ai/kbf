@@ -550,9 +550,12 @@ pub struct Args {
     /// flush commits before it acknowledges them (`synchronous_commit` on) or the start is
     /// refused; the tables are created if missing. Or `sqlite:///absolute/path`, a file on
     /// a local disk that this process owns (created, with its directory, if missing: 0600,
-    /// and 0700 for a directory it makes; a second frontend on it refuses to start). Every
-    /// start is a new epoch, so daemons kill the runs of the leases they held before. Left
-    /// out, the scheduler's state is in memory and a restart loses it
+    /// and 0700 for a directory it makes; a second frontend on it refuses to start); SQLite
+    /// is removed in the next release, so a start on it logs a warning (see the upgrade
+    /// notes). A start keeps the epoch the store holds, so daemons that reconnect keep the
+    /// runs of the leases they hold; an operator raises it with `kbf cluster epoch-bump`,
+    /// after a restore from a backup. `kbf frontend` refuses to start without it; left out
+    /// of `kbf-server`, the scheduler's state is in memory and a restart loses it
     // Listed beside `--meta-dir`, whose place in the help it takes without moving the
     // flags declared after it.
     #[arg(

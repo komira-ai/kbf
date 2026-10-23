@@ -1,7 +1,7 @@
 //! The state machine the log replicates: the metadata state, fed every committed
 //! command entry in index order.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
 
 use kbf_log::{Bootstrap, DecodeError, Format, LogCommand, MachineVersion};
@@ -17,11 +17,24 @@ pub struct NoSnapshots;
 /// format of the machine version committed before it, and applied in order. The first
 /// [`Bootstrap`] is kept and every later one is a no-op. A [`MachineVersion`] entry
 /// raises the version (a lower or equal one changes nothing), and with it the format
-/// of every later entry. An entry that does not decode, a command this binary does not
-/// know ([`LogCommand::Unknown`]), a version past the one this binary runs, or a control
-/// command (which this log does not apply), stops the machine: it applies nothing more,
-/// and the log refuses to open ([`MetaMachine::failed`] names the first such entry).
-/// Once open, the log applies only entries it encoded itself.
+/// of every later entry. An entry that does not decode stops the machine: it applies
+/// nothing more, and the log refuses to open ([`MetaMachine::failed`] names the first
+/// such entry). Once open, the log applies only entries it encoded itself.
+///
+/// Every format changes additively, and a binary skips what it does not know instead of
+/// refusing it. So the machine skips, and goes on with the next entry, each of:
+/// - a command this binary does not know ([`LogCommand::Unknown`]);
+/// - a control command, which this log does not use (`Farm`, `Report`, `Takeover` and
+///   `Checkpoint`);
+/// - a [`MachineVersion`] entry naming a version past the one this binary runs, or one it
+///   does not know. The machine keeps the version and format it has; decoding does not
+///   depend on the format, so every command it knows still applies.
+///
+/// A skipped entry changes nothing and sets no [`MetaMachine::failed`]. It is counted
+/// ([`MetaMachine::skipped`]), and the first of each kind is logged with its index. What
+/// the skipped entry would have done is lost to this replica, so a log with more than one
+/// voter needs every voter on releases that know the same commands (logs are single-voter
+/// today).
 ///
 /// The state sits behind its own lock ([`MetaMachine::state`]), so a query reads it
 /// without the host's lock, which a commit holds across its sync. The host applies an
@@ -42,6 +55,10 @@ pub struct MetaMachine {
     /// the entries a start replays have no caller to answer.
     answers: Option<BTreeMap<LogIndex, Applied>>,
     failed: Option<(LogIndex, DecodeError)>,
+    /// How many entries were skipped, of any kind.
+    skipped: u64,
+    /// The kinds of entry skipped so far: each is logged once, at its first.
+    skipped_kinds: BTreeSet<&'static str>,
     /// The last entry handed to [`Machine::apply`], blank entries included.
     applied: LogIndex,
 }
@@ -60,6 +77,8 @@ impl MetaMachine {
             format: Format::V1,
             answers: None,
             failed: None,
+            skipped: 0,
+            skipped_kinds: BTreeSet::new(),
             applied: LogIndex(0),
         })
     }
@@ -125,6 +144,25 @@ impl MetaMachine {
     pub const fn failed(&self) -> Option<&(LogIndex, DecodeError)> {
         self.failed.as_ref()
     }
+
+    /// How many entries the machine has skipped: commands this binary does not know,
+    /// control commands, and machine versions past the one it runs.
+    pub const fn skipped(&self) -> u64 {
+        self.skipped
+    }
+
+    /// Counts the entry at `index` as skipped, and logs it if it is the first of its
+    /// `kind`.
+    fn skip(&mut self, index: LogIndex, kind: &'static str) {
+        self.skipped += 1;
+        if self.skipped_kinds.insert(kind) {
+            tracing::warn!(
+                %kind,
+                index = index.0,
+                "skipped a log entry this binary does not apply (the kind is logged once)"
+            );
+        }
+    }
 }
 
 impl Machine for MetaMachine {
@@ -153,24 +191,20 @@ impl Machine for MetaMachine {
                 self.bootstraps += 1;
                 self.bootstrap.get_or_insert(bootstrap);
             }
-            Ok(LogCommand::MachineVersion(version)) => match version.format() {
-                Some(_) if version <= self.runs => {
-                    self.version = self.version.max(version);
-                    self.format = self.version.format().unwrap_or(self.format);
-                }
-                // A later binary raised the log past what this one runs: stop, as an
-                // older binary stops on any `MachineVersion` entry.
-                _ => {
-                    let refused = DecodeError::UnknownCommand("MachineVersion");
-                    self.failed = Some((entry.id.index, refused));
-                }
-            },
-            // A control command, or a command this binary does not know: this log
-            // applies only metadata commands and its `Bootstrap`, so a later binary
-            // wrote it. Stop, as for an entry that does not decode.
-            Ok(_) => {
-                self.failed = Some((entry.id.index, DecodeError::UnknownCommand("LogCommand")));
+            Ok(LogCommand::MachineVersion(version)) if version <= self.runs => {
+                self.version = self.version.max(version);
+                self.format = self.version.format().unwrap_or(self.format);
             }
+            // A later binary raised the log past what this one runs: skip the raise and
+            // go on at the version and format this machine has.
+            Ok(LogCommand::MachineVersion(_)) => self.skip(entry.id.index, "MachineVersion"),
+            // This log applies only metadata commands, its `Bootstrap` and the raises of
+            // its version, so a later binary wrote a control command.
+            Ok(LogCommand::Farm(_)) => self.skip(entry.id.index, "Farm"),
+            Ok(LogCommand::Report(_)) => self.skip(entry.id.index, "Report"),
+            Ok(LogCommand::Takeover(_)) => self.skip(entry.id.index, "Takeover"),
+            Ok(LogCommand::Checkpoint(_)) => self.skip(entry.id.index, "Checkpoint"),
+            Ok(LogCommand::Unknown) => self.skip(entry.id.index, "Unknown"),
             Err(e) => self.failed = Some((entry.id.index, e)),
         }
     }

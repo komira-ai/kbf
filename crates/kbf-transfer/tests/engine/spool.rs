@@ -35,7 +35,7 @@ async fn each_blob_is_spooled_once() {
 }
 
 /// Catches chunks that do not hash to their digest recorded, and a failed blob that
-/// can never be spooled again (mutant: the reservation kept): the bad put is
+/// can never be spooled again (defect: the reservation kept): the bad put is
 /// CORRUPT and records nothing, and the right bytes put later are recorded.
 #[tokio::test]
 async fn a_blob_whose_chunks_fail_their_digest_is_not_recorded() {
@@ -103,7 +103,7 @@ async fn the_default_put_spool_stores_every_blob() {
     }
 }
 
-/// Catches a failed spool write recorded or kept reserved (mutants: the reservation
+/// Catches a failed spool write recorded or kept reserved (defects: the reservation
 /// kept after a failed write, so the blob counts as spooled; the write error ignored),
 /// through the public API, so the engine's own build of the spool runs these paths:
 /// once a put has reserved the spool's offsets up to `i64::MAX` (its chunks then fail
@@ -138,7 +138,7 @@ async fn a_spool_write_past_the_largest_offset_records_nothing() {
 }
 
 /// Catches a chunk that fails to be read taken as the blob's end, or its blob left
-/// reserved (mutants: the chunk error skipped; the reservation kept): `put_chunks`
+/// reserved (defects: the chunk error skipped; the reservation kept): `put_chunks`
 /// whose second chunk fails is a read error naming the blob with the chunk's error,
 /// records nothing, and the blob's right chunks put later are recorded.
 #[tokio::test]

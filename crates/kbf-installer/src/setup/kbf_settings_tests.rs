@@ -2,7 +2,7 @@
 //! a golden, that every key is a real `kbf` flag in its real table, the rerun rules (the Keep
 //! and Refuse contract covers the new keys), a refusal for each invalid input, and the rule
 //! that no value of a flag appears in any message. The helpers are `tests.rs`'s. Each test says
-//! the defect it catches; the mutants planted to see them go red are in the pull request.
+//! the defect it catches.
 //!
 //! An all-in-one host has two such files: the sibling's `kbf.toml` (`AIO_SIBLING_GOLDEN`, a
 //! `storage-and-daemon` node) and the frontend children's `frontend.toml`
@@ -549,7 +549,7 @@ fn a_file_that_is_not_what_its_kind_needs_is_refused_before_anything_is_written(
 /// With the two owners swapped both keys are refused, naming their flags; with the right ones the
 /// host is set up.
 ///
-/// Mutants to plant: the proxy's files checked against the sibling's user (the service); the
+/// Catches: the proxy's files checked against the sibling's user (the service); the
 /// daemon half's against the proxy's.
 #[test]
 fn a_key_must_belong_to_the_user_that_reads_it() {

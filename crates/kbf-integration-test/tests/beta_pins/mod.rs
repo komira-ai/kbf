@@ -28,8 +28,10 @@ fn split(uses: &str) -> Option<(&str, &str)> {
 }
 
 /// Every way the smoke workflow's pins differ from `ci`'s, one sentence each; an error when
-/// either text does not parse.
-fn mismatches(beta: &str, ci: &str) -> Result<Vec<String>, String> {
+/// either text does not parse. The actions the other jobs of `also` (workflows that use the
+/// same actions, such as the artifacts workflow whose files the smoke downloads) use count as
+/// uses by another job.
+fn mismatches(beta: &str, ci: &str, also: &[&str]) -> Result<Vec<String>, String> {
     let mut problems = Vec::new();
     let beta_env = workflows::job_env(beta, JOB)?;
     let mut ci_env: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
@@ -44,6 +46,18 @@ fn mismatches(beta: &str, ci: &str) -> Result<Vec<String>, String> {
                     .entry(name.to_owned())
                     .or_default()
                     .push(commit.to_owned());
+            }
+        }
+    }
+    for text in also {
+        for job in workflows::job_names(text)? {
+            for step in workflows::job_steps(text, &job).unwrap_or_default() {
+                if let Some((name, commit)) = step.uses.as_deref().and_then(split) {
+                    ci_uses
+                        .entry(name.to_owned())
+                        .or_default()
+                        .push(commit.to_owned());
+                }
             }
         }
     }
@@ -90,7 +104,11 @@ fn the_beta_workflow_copies_the_pins_of_ci() {
     // the old pin.
     let root = super::repo_root();
     let read = |path: &str| std::fs::read_to_string(root.join(path)).expect(path);
-    assert_eq!(mismatches(&read(BETA), &read(BETA)), Ok(Vec::new()));
+    let artifacts = read(".github/workflows/artifacts.yml");
+    assert_eq!(
+        mismatches(&read(BETA), &read(BETA), &[&artifacts]),
+        Ok(Vec::new())
+    );
 }
 
 /// The job of the cross-version cell, which builds release N from a pinned commit.
@@ -209,7 +227,7 @@ mod rules {
             ),
             "  other:\n    runs-on: ubuntu-24.04\n    env:\n      BUCK2_VERSION: 1\n    steps:\n      - run: true\n"
         );
-        assert_eq!(mismatches(&beta, &ci), Ok(Vec::new()));
+        assert_eq!(mismatches(&beta, &ci, &[]), Ok(Vec::new()));
     }
 
     #[test]
@@ -219,7 +237,7 @@ mod rules {
         // sets, an action only the smoke job uses.
         let ci = workflow("test", &env("1"), &uses("actions/checkout", SHA_A));
         let beta = workflow("smoke", &env("2"), &uses("actions/checkout", SHA_A));
-        let found = mismatches(&beta, &ci).expect("both parse");
+        let found = mismatches(&beta, &ci, &[]).expect("both parse");
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(
             found[0].contains("BUCK2_VERSION is 2, but") && found[0].contains("has 1"),
@@ -227,7 +245,7 @@ mod rules {
         );
 
         let beta = workflow("smoke", &env("1"), &uses("actions/checkout", SHA_B));
-        let found = mismatches(&beta, &ci).expect("both parse");
+        let found = mismatches(&beta, &ci, &[]).expect("both parse");
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(
             found[0].contains("actions/checkout is at") && found[0].contains(SHA_A),
@@ -239,7 +257,7 @@ mod rules {
             "      BUCK2_VERSION: 1\n",
             &uses("actions/checkout", SHA_A),
         );
-        let found = mismatches(&beta, &ci).expect("both parse");
+        let found = mismatches(&beta, &ci, &[]).expect("both parse");
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(
             found.iter().all(|f| f.contains("does not set")),
@@ -248,12 +266,12 @@ mod rules {
 
         let bare = workflow("test", "      OTHER: 1\n", &uses("actions/checkout", SHA_A));
         let beta = workflow("smoke", &env("1"), &uses("actions/checkout", SHA_A));
-        let found = mismatches(&beta, &bare).expect("both parse");
+        let found = mismatches(&beta, &bare, &[]).expect("both parse");
         assert_eq!(found.len(), 2, "{found:?}");
         assert!(found.iter().all(|f| f.contains("no job sets")), "{found:?}");
 
         let beta = workflow("smoke", &env("1"), &uses("actions/new", SHA_A));
-        let found = mismatches(&beta, &ci).expect("both parse");
+        let found = mismatches(&beta, &ci, &[]).expect("both parse");
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("actions/new is used"), "{found:?}");
     }
@@ -268,7 +286,7 @@ mod rules {
             "  b:\n    runs-on: ubuntu-24.04\n    env:\n      BUCK2_VERSION: 0\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v1\n"
         );
         let beta = workflow("smoke", &env("1"), &uses("actions/checkout", SHA_A));
-        let found = mismatches(&beta, &ci).expect("both parse");
+        let found = mismatches(&beta, &ci, &[]).expect("both parse");
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("job b has 0"), "{found:?}");
     }
@@ -276,8 +294,8 @@ mod rules {
     #[test]
     fn a_workflow_that_does_not_parse_or_lacks_the_job_is_an_error_not_a_pass() {
         // Catches: a lint that passes because it read nothing.
-        assert!(mismatches("jobs: [", "on: push").is_err());
+        assert!(mismatches("jobs: [", "on: push", &[]).is_err());
         let ci = workflow("test", &env("1"), "");
-        assert!(mismatches(&ci, &ci).is_err(), "no smoke job");
+        assert!(mismatches(&ci, &ci, &[]).is_err(), "no smoke job");
     }
 }

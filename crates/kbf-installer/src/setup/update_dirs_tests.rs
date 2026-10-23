@@ -29,7 +29,7 @@ fn written(exec: &FakeExec, path: &str) -> [Option<String>; 2] {
 /// sibling takes no orders (it is restarted with its package), so it has no key; a frontend and a
 /// storage node have no daemon.
 ///
-/// Mutant seen red: `takes_orders` true for all-in-one (its file gets the keys).
+/// Catches: `takes_orders` true for all-in-one (its file gets the keys).
 #[test]
 fn the_modes_whose_daemon_takes_orders_get_the_installers_directories() {
     let l = layout(Platform::Linux);
@@ -70,7 +70,7 @@ fn the_modes_whose_daemon_takes_orders_get_the_installers_directories() {
 /// (`/var/db/kbf-installer`), and there the keys are `kbf-mac-provision`'s: setup leaves the
 /// file as it was and still makes the same spool.
 ///
-/// Mutant seen red: the spool made 0755.
+/// Catches: the spool made 0755.
 #[test]
 fn the_orders_key_names_the_directory_setup_makes() {
     let mut exec = released(host(), Platform::Linux);
@@ -135,7 +135,7 @@ fn a_mac_kbf_toml_that_is_not_toml_is_named_as_such() {
 /// file an earlier setup wrote without the keys (it holds only setup's keys) is brought
 /// forward to have them.
 ///
-/// Not run as a mutant: `has_other_settings` counting the update keys as foreign.
+/// Not covered: `has_other_settings` counting the update keys as foreign.
 #[test]
 fn a_rerun_changes_nothing_and_an_older_file_gains_the_keys() {
     let mut exec = released(host(), Platform::Linux);
@@ -170,7 +170,7 @@ fn a_rerun_changes_nothing_and_an_older_file_gains_the_keys() {
 /// key, is refused (exit 5) naming the key and never printing the path, so the operator edits
 /// it by hand; nothing is rewritten.
 ///
-/// Not run as mutants: the refusal message carrying the value; a missing key counted as a match.
+/// Not covered: the refusal message carrying the value; a missing key counted as a match.
 #[test]
 fn a_file_with_other_settings_is_kept_with_the_keys_and_refused_without_them() {
     let other = "\n[listener]\nstorage-listen = \"0.0.0.0:7000\"\n";

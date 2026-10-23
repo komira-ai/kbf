@@ -803,3 +803,30 @@ fn a_mac_waiting_for_its_leases_in_a_replaced_run_is_pending_not_deferred() {
     assert_eq!(moved.next, HostPhase::Pending);
     assert_eq!(moved.commands, gave_back(false, GiveBack::Superseded));
 }
+
+/// Catches: a host that holds no place while it is in a step or held (a second storage host
+/// could then start beside it), or one that holds a place when it is not started, finished or
+/// deferred.
+#[test]
+fn a_place_is_held_in_a_step_and_while_held_and_not_otherwise() {
+    for phase in [
+        HostPhase::Selected,
+        HostPhase::Cordoned,
+        HostPhase::WaitingLeases,
+        HostPhase::PlannedDown,
+        HostPhase::Gated,
+        HostPhase::Activating,
+        HostPhase::RejoiningStorage,
+        HostPhase::Repairing,
+        HostPhase::Confirming,
+        HostPhase::RejoiningWork,
+        HostPhase::Held {
+            reason: HoldReason::HealthLimit,
+        },
+    ] {
+        assert!(phase.holds_place(), "{phase:?}");
+    }
+    for phase in [HostPhase::Pending, HostPhase::Done, HostPhase::Deferred] {
+        assert!(!phase.holds_place(), "{phase:?}");
+    }
+}

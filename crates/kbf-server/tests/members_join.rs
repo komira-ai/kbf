@@ -84,7 +84,7 @@ fn old_farm(s: &Arc<Hooked>, m: &Members) -> (Registration, Registration) {
 /// it is rank 1 for about 1/N of the digests that exist and holds none of them (the
 /// `FindMissing` on its slice then says every blob is missing). The joiner must be
 /// `Joining`, primary for nothing, and still an owner of writes (its copy of new writes
-/// is how it fills). Mutant: admit `Active` whatever the farm holds turns this red.
+/// is how it fills). Catches: admit `Active` whatever the farm holds turns this red.
 #[test]
 fn a_node_joining_a_farm_with_data_is_never_primary() {
     let s = Hooked::new();
@@ -168,7 +168,7 @@ fn a_restarted_active_member_of_a_farm_with_data_stays_active() {
 /// Catches: the real new node, which registers `CatchingUp` (a new meta log has not
 /// rebuilt its index) and then beats caught up as soon as the empty rebuild is done, being
 /// made `Active` by that beat: it must be `Joining` from its first registration and stay
-/// so, primary for nothing. Mutant: the rebuilding check before the join check turns it red.
+/// so, primary for nothing. Catches: the rebuilding check before the join check turns it red.
 #[test]
 fn a_new_node_that_registers_rebuilding_joins_and_is_not_promoted_by_its_beat() {
     let s = Hooked::new();

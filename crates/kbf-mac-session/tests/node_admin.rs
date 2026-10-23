@@ -489,7 +489,7 @@ fn the_lock_is_taken_once_free_and_released_at_the_end() {
 /// held before exec until the lock has been tried again, so the interleaving is the
 /// failing one every time.
 ///
-/// Mutant: the `Drop` of `Lock` removed.
+/// Catches: the `Drop` of `Lock` removed.
 #[test]
 fn a_child_forked_under_the_lock_does_not_keep_it_after_the_verb() {
     let mac = FakeMac::new("lock-forked");

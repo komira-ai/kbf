@@ -30,17 +30,17 @@ use tokio::net::TcpStream;
 
 const TOKEN: &str = "kbf-test-token-0123456789abcdef0123456789";
 
-/// The tick of every server here: one that does not come within a test. The offers' poll and
-/// the update controller look at every tick, and their reads of the store meet the injections
+/// The tick of every server here: one that does not come within a test. The offers' poll
+/// looks at every tick, and its read of the store meets the injections
 /// of [`hooked::Hooked`] that a test arms for a request (`support/looks.rs` says why). No test
 /// here waits for a tick: they are HTTP calls against the rows.
 const TICK: Duration = Duration::from_secs(3600);
 
 /// The reads of `(update/desired, deny/)` the server makes by itself as it starts: the offers'
-/// poll and the update controller read `update/desired` once each (no release is desired yet),
+/// poll reads `update/desired` once (no release is desired yet),
 /// and the sweeper's refresh reads `deny/` ([`looks::Looks`]). A test that arms an injection
 /// first waits for them; the test below it holds the numbers.
-const START_LOOKS: (usize, usize) = (2, 1);
+const START_LOOKS: (usize, usize) = (1, 1);
 
 struct Dir(PathBuf);
 
@@ -520,7 +520,7 @@ async fn the_policy_row_is_shown_when_it_exists() {
 /// too; nothing is written by the offer that could not read.
 ///
 /// Each failure is armed for one read, which must be the handler's: the server's own readers
-/// of the store (the offers' poll, the update controller and the membership sweeper) look
+/// of the store (the offers' poll and the membership sweeper) look
 /// once each at start, which the test waits for (`START_LOOKS`), and not again within the
 /// test (`TICK` and the sweeper's beat).
 #[tokio::test]
@@ -581,12 +581,13 @@ async fn a_state_store_that_fails_is_a_500_not_an_empty_answer() {
 /// Catches the wait of `Looks::done` being wrong, which the failing-store test above cannot
 /// show by itself (it would flake, or hang): the server's own reads of `update/desired` and
 /// `deny/` are `START_LOOKS` at start, and it reads nothing at all by itself after the wait,
-/// for as long as a test runs. A reader added beside the poll, the controller and the sweeper,
+/// for as long as a test runs. A reader added beside the poll and the sweeper,
 /// a read added to one's look, or a tick that comes, makes the total more, and an injection
 /// armed after the wait would be met by one of them and not by its request; a read fewer
 /// makes a count less, and the wait never ends.
 ///
-/// Mutants seen red: `START_LOOKS` of `(1, 1)` and of `(2, 0)` (the counts after the wait).
+/// A `START_LOOKS` above the real counts never ends the wait; one below them lets a read
+/// through after it.
 #[tokio::test]
 async fn the_server_reads_the_rows_by_itself_only_at_start() {
     let dir = Dir::new();

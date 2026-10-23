@@ -204,7 +204,7 @@ fn segment_upload_flags_reach_the_listeners() {
 }
 
 /// Catches a server that starts with `--segment-upload-max-bytes` over
-/// `--write-bytes-in-flight` (mutant: the check removed). A segment upload holds its
+/// `--write-bytes-in-flight` (defect: the check removed). A segment upload holds its
 /// ranges in memory under the write bound, so an upload of the whole cap would hold
 /// more than the bound admits. A cap equal to the bound starts; one byte of bound
 /// less is refused, naming both flags.
@@ -279,7 +279,7 @@ fn the_ram_budget_and_its_stop_deadline_are_flags() {
 }
 
 /// Catches a server that starts with a `--segment-upload-max-bytes` larger than one
-/// admission counts (mutant: the flag's upper limit removed). `Cache::admit` counts
+/// admission counts (defect: the flag's upper limit removed). `Cache::admit` counts
 /// at most `kbf_front::MAX_ADMISSION_BYTES` (what its semaphore holds) for one call;
 /// a `Begin` over it would hold more ranges than it is counted for. A cap of exactly
 /// the most one admission counts starts; one byte more is refused.
@@ -488,7 +488,7 @@ fn plain_text_off_loopback_checks_each_listener_through_loopback_only() {
 /// is made, and one that cannot be (here a path under a regular file) is an error naming the
 /// flag and the directory, not an API without a store. A usable one gives the API its store.
 ///
-/// Mutant seen red: the open's error dropped (`.ok()`): the API starts store-less.
+/// Catches: the open's error dropped (`.ok()`): the API starts store-less.
 #[test]
 fn a_releases_dir_that_cannot_be_made_stops_the_start_naming_it() {
     let base = crate::test_dir::scratch_dir("config-releases");

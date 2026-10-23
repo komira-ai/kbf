@@ -203,7 +203,7 @@ fn check(disk: &FaultFs, acked: &Acked, why: &str) {
     assert!(has(next), "{why}: the extension was lost");
 }
 
-/// Catches (each a mutant that turns this red): a snapshot write that removes the
+/// Catches (each of these turns it red): a snapshot write that removes the
 /// segments it covers before its rename is durable (a power cut that keeps the
 /// removals but not the rename loses acknowledged entries); one that skips the
 /// directory sync after the rename (the same cut, once the call returned); a store

@@ -484,7 +484,7 @@ impl Stream for Conn {
 }
 
 /// Catches an agent that stops serving, or fails, because one connection could not be
-/// set up (mutant: `serve_accepted` returning the connection's error): the first
+/// set up (defects: `serve_accepted` returning the connection's error): the first
 /// host's handshake passes, the agent cannot duplicate its stream, that host sees the
 /// connection closed after `Ready`, and the next host still runs its command, after
 /// which `serve_accepted` returns `Ok` with the run used.
@@ -535,7 +535,7 @@ fn a_connection_that_cannot_be_set_up_does_not_stop_the_agent_serving() {
     assert!(agent.has_run());
 }
 
-/// Catches an `accept` failure swallowed or retried (mutant: the error ignored): the
+/// Catches an `accept` failure swallowed or retried (defects: the error ignored): the
 /// error reaches the caller as it was, and no command has run.
 #[test]
 fn a_failing_accept_ends_serving_with_its_error() {
@@ -547,7 +547,7 @@ fn a_failing_accept_ends_serving_with_its_error() {
     assert!(!agent.has_run());
 }
 
-/// Catches a run accepted when the inputs share is not there (mutant: the share's
+/// Catches a run accepted when the inputs share is not there (defects: the share's
 /// canonicalisation error ignored, so the command starts in a directory that does not
 /// exist): the request is refused as a bad request, the boot's run is not used, and a
 /// later connection is served.

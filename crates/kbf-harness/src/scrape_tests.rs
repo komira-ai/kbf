@@ -219,7 +219,7 @@ fn a_scraper_that_is_dropped_is_told_to_stop() {
     // Catches: a run that panics after the scrapers started leaving their threads scraping
     // a farm that is gone (for the rest of the process's life, and with the series file
     // open). The thread is taken out of the scraper so it can be waited for: dropping the
-    // flag must end it. A liveness guard, not a measure of time. Mutant: the flag's drop
+    // flag must end it. A liveness guard, not a measure of time. Catches: the flag's drop
     // does not set it.
     let dir = crate::scratch("scraper-drop");
     let Scraper { stop, handle } =

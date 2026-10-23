@@ -20,7 +20,7 @@ fn query(q: &str) -> Result<Query, String> {
 /// Catches a query read loosely: the defaults, the bounds of `page_size` (0, past the
 /// maximum, not a number), an empty or oversized node, a repeated key, an unknown key (a
 /// typo that silently filters nothing), and a token made for another filter or not made
-/// by this route. Mutants: the page-size bound off by one; a repeated key taken as the
+/// by this route. Catches: the page-size bound off by one; a repeated key taken as the
 /// last; the filter left out of the token.
 #[test]
 fn a_query_is_checked() {
@@ -108,7 +108,7 @@ fn view() -> LeaseView {
 
 /// Catches a lease item that renames, drops or mixes up a field, or shows a farm time
 /// as one: the exact shape, the times as the epoch plus the farm time, and an unstarted
-/// lease's start as `null`, not zero. Mutants: the epoch not added; `age_ms` and
+/// lease's start as `null`, not zero. Catches: the epoch not added; `age_ms` and
 /// `since_ms` swapped; the start of an unstarted lease shown as the grant.
 #[test]
 fn a_lease_item_has_the_documented_shape() {
@@ -226,7 +226,7 @@ async fn get(path: &str) -> (StatusCode, axum::http::HeaderMap, Value) {
 /// Catches routes that are not mounted, answer an empty farm with an error or a body of
 /// another shape, or can be cached: both answer 200 with `Cache-Control: no-store`, an
 /// empty lease list with no next page, an unknown node's leases as empty (not 404), and a
-/// quiet queue with a null oldest age. Mutants: `no-store` left off one route; an unknown
+/// quiet queue with a null oldest age. Catches: `no-store` left off one route; an unknown
 /// node answered 404.
 #[tokio::test]
 async fn an_empty_farm_answers_both_routes_uncached() {

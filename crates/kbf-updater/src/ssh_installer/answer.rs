@@ -89,6 +89,9 @@ struct Report {
     // The commit the host runs is for the health check; here it only has to be a string.
     #[serde(rename = "running_commit")]
     _running_commit: Option<String>,
+    // The node id is for the identity check; here it only has to be a string.
+    #[serde(rename = "node_id")]
+    _node_id: Option<String>,
     in_progress: bool,
 }
 
@@ -167,7 +170,7 @@ pub fn query_answer(code: i32, stdout: &[u8]) -> Result<Installed, PortError> {
             match report.installed_version {
                 Some(v) if installed_ok(&v) => Ok(Installed::Version(v)),
                 Some(_) => Err(bad_answer()),
-                None => Err(PortError::other("not installed")),
+                None => Ok(Installed::NotInstalled),
             }
         }
         2 | 3 => Err(reason_line(line, code)?),

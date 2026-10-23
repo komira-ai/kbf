@@ -12,7 +12,7 @@ fn mode(path: &Path) -> u32 {
 #[test]
 fn keys_are_private_to_this_user_and_so_are_the_directories_that_hold_them() {
     // Catches: private keys of a farm readable by the other users of a shared runner (a file
-    // written with the default 0644 in a 0755 directory). Mutants: `write_private` without
+    // written with the default 0644 in a 0755 directory). Catches: `write_private` without
     // `.mode(0o600)`; `private_dir` without `.mode(0o700)`.
     let root = crate::scratch("pki-modes");
     let etc = root.join("fresh/etc");

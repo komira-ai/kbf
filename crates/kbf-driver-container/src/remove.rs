@@ -115,10 +115,9 @@ mod tests {
     }
 
     /// Catches a recursive removal: 20,000 levels on a 256 KiB stack, an eighth of a
-    /// tokio blocking thread's, where `std::fs::remove_dir_all` overflows (seen red:
-    /// the test binary aborts). Also catches a removal that leaves anything behind,
-    /// at the bottom or beside the tree, and one that follows a symlink (`link` names
-    /// `/`).
+    /// tokio blocking thread's, where `std::fs::remove_dir_all` overflows (the test
+    /// binary aborts). Also catches a removal that leaves anything behind, at the bottom
+    /// or beside the tree, and one that follows a symlink (`link` names `/`).
     #[test]
     fn a_tree_of_any_depth_is_removed_without_recursion() {
         let dir = scratch("remove-deep");

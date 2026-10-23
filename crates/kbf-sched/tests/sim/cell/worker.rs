@@ -62,7 +62,7 @@ pub struct WorkerPlan {
     /// The chance a `Result` is sent twice.
     pub repeat_reports: Chance,
     /// Whether the `Start` window W is enforced. Off only to show the sim catches its
-    /// absence (a mutant of the model itself).
+    /// absence (a defect of the model itself).
     pub start_window: bool,
     /// When the daemon process dies and is started again at once (ms after boot): a
     /// SIGKILL, an OOM kill or a panic that aborts, then the service manager's restart.

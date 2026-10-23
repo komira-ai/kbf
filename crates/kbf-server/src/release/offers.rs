@@ -403,7 +403,7 @@ mod tests {
     /// has its own value in each platform's document, so a fact left at its default, one
     /// read from another field, or one taken from the other platform's document shows.
     ///
-    /// Mutant seen red: `min_protocol` left at the default.
+    /// Catches: `min_protocol` left at the default.
     #[tokio::test]
     async fn an_offer_carries_the_facts_of_its_platforms_document() {
         let (_dir, store) = store("facts-carried");
@@ -429,7 +429,7 @@ mod tests {
     /// with it: a complete Mac release without a document gets none while the Linux release
     /// beside it, with one, gets its offer.
     ///
-    /// Mutant seen red: the offer built with the facts at their defaults for a platform with
+    /// Catches: the offer built with the facts at their defaults for a platform with
     /// no document.
     #[tokio::test]
     async fn a_platform_without_facts_is_not_offered_and_the_others_still_are() {
@@ -446,7 +446,7 @@ mod tests {
     /// listed as complete without facts and are offered nowhere, and the store reports no
     /// facts for them.
     ///
-    /// Mutant seen red: an offer built for a platform whose listing has no facts.
+    /// Catches: an offer built for a platform whose listing has no facts.
     #[tokio::test]
     async fn a_release_stored_before_version_facts_is_held_and_never_offered() {
         let (dir, store) = store("facts-legacy");
@@ -482,7 +482,7 @@ mod tests {
     /// into a zeroed offer, or into a table that loses the offers already made: the look
     /// fails, and the table it kept is the one before.
     ///
-    /// Mutant seen red: a look that reads a failing facts document as none and skips the
+    /// Catches: a look that reads a failing facts document as none and skips the
     /// platform (the table then loses its offer).
     #[tokio::test]
     async fn a_stored_document_that_is_unreadable_keeps_the_table() {
@@ -520,7 +520,7 @@ mod tests {
     /// at that run's generation. The look is read directly, so the poll task's own first
     /// look cannot publish into the check.
     ///
-    /// Mutants it catches: the staged check removed (the table keeps an offer under the
+    /// Catches: the staged check removed (the table keeps an offer under the
     /// staged run); the check made on the fetch source (the fetch runs are offered nothing).
     #[tokio::test]
     async fn a_staged_run_is_offered_to_no_node_and_a_fetch_run_is() {

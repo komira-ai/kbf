@@ -98,7 +98,7 @@ const NODE: &str = "node mac-07\n";
 
 /// Catches: a deny list whose serial or key entries can never match, and nothing said.
 ///
-/// Mutants seen red: the warning dropped; the count left out of its condition for `serial`
+/// Catches: the warning dropped; the count left out of its condition for `serial`
 /// entries; for `spki-sha256` entries.
 #[test]
 fn serial_and_spki_entries_behind_the_proxy_are_warned_about() {
@@ -120,7 +120,7 @@ fn serial_and_spki_entries_behind_the_proxy_are_warned_about() {
 /// Catches: a warning for a list the proxy can apply (node entries only), and one without
 /// the flag, where serial and key entries match the certificate.
 ///
-/// Mutants seen red: the warning on node entries; the warning without the proxy flag.
+/// Catches: the warning on node entries; the warning without the proxy flag.
 #[test]
 fn a_list_the_proxy_can_apply_is_not_warned_about() {
     assert!(!logged(NODE, true).contains("WARN"));

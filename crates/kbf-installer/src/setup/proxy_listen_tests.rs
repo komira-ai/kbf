@@ -1,6 +1,5 @@
 //! Tests of the `kbf-proxy.socket` drop-in `setup` writes from `[proxy] listen` of
-//! `installer.toml`. The helpers are `tests.rs`'s. Each test says the defect it catches; the
-//! mutants planted to see them go red are in the pull request.
+//! `installer.toml`. The helpers are `tests.rs`'s. Each test says the defect it catches.
 
 use super::*;
 use crate::setup::paths::{PROXY_LISTEN_DROPIN, PROXY_SOCKET_DIR};
@@ -41,7 +40,7 @@ const WANT: &str = "[Socket]\nListenStream=\nListenStream=192.0.2.10:8443\n";
 /// root's 0755, or setup reaching for systemd (a reload or a restart of the public port) when
 /// it was not asked to: the output must tell the operator both are needed.
 ///
-/// Mutants to plant: the empty `ListenStream=` line left out; the mode 0600; a
+/// Catches: the empty `ListenStream=` line left out; the mode 0600; a
 /// `systemctl restart kbf-proxy.socket` step added; the note left out.
 #[test]
 fn a_listen_address_becomes_the_exact_dropin_and_nothing_is_restarted() {
@@ -83,7 +82,7 @@ fn an_ipv6_address_keeps_its_brackets() {
 /// run that had it: no `listen` writes nothing and removes what an earlier run wrote, and
 /// the output says a reload is due.
 ///
-/// Mutants to plant: the removal step left out; a drop-in written with the default port.
+/// Catches: the removal step left out; a drop-in written with the default port.
 #[test]
 fn no_listen_writes_no_dropin_and_removes_an_old_one() {
     let mut exec = with_toml(&table(""));
@@ -111,7 +110,7 @@ fn no_listen_writes_no_dropin_and_removes_an_old_one() {
 /// the key is removed. Also catches setup erasing the operator's `[proxy]` table while it
 /// rewrites `installer.toml` (the next run would then remove the drop-in).
 ///
-/// Mutants to plant: `proxy` left out of `InstallerToml::render`; the file compared by its
+/// Catches: `proxy` left out of `InstallerToml::render`; the file compared by its
 /// length only.
 #[test]
 fn a_rerun_changes_the_dropin_only_when_the_key_changed() {
@@ -145,7 +144,7 @@ fn a_rerun_changes_the_dropin_only_when_the_key_changed() {
 /// every bad `listen` stops setup with exit 5 before any step, naming the key and never
 /// echoing the value; a key `[proxy]` does not know is refused too.
 ///
-/// Mutants to plant: the port-0 check removed; the error built from the value.
+/// Catches: the port-0 check removed; the error built from the value.
 #[test]
 fn an_invalid_listen_is_refused_naming_the_key() {
     for bad in [
