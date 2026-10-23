@@ -56,7 +56,10 @@ fn a_dry_run_changes_no_file() {
     let (result, report) = run_cutover(&args, &Seams::default());
     result.expect("a dry run is accepted");
     has(&report, "kbf-state-copy cutover (dry run)");
-    has(&report, "then: postgres:///kbf?host=/run/postgresql&user=kbf");
+    has(
+        &report,
+        "then: postgres:///kbf?host=/run/postgresql&user=kbf",
+    );
     has(&report, "key families (rows, digest):");
     has(&report, "dry run: no file was changed");
     lacks(&report, "switched");
