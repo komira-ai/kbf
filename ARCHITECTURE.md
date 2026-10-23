@@ -45,9 +45,27 @@ directly.
 
 ## The two programs
 
-kbf ships two binaries.
+kbf ships three binaries: `kbf` (crate `kbf-cli`), which runs every role of a farm as a
+mode, and the two programs it is built from, `kbf-server` and `kbf-daemon`, which still
+build and run on their own.
 
-**`kbf-server`** (crate `kbf-server`) serves REAPI to build clients and
+**`kbf`** takes its mode from `--mode` (or `mode = "..."` in `kbf.toml`; the mode is a
+flag, never a word after `kbf`):
+
+- `frontend`: the REAPI front end. It takes the listener, scheduler, state-store and log
+  flags of `kbf-server`, requires `--storage`, and holds no blob stores;
+- `storage`: the storage node. It takes the store, write and log flags of `kbf-server`
+  and no state-store flag: a storage node reaches the state store only through a
+  frontend;
+- `daemon`: the build node, with exactly the flags of `kbf-daemon`;
+- `storage-and-daemon`: the storage node and the daemon in one process, the daemon
+  reading and writing the node's storage in-process;
+- `all-in-one`: the server and the daemon in one process (below).
+
+A mode refuses the flags that belong to another mode. `kbf cluster ...` is not a mode:
+it is a client of the frontend's operator API. Source: `crates/kbf-cli/src/lib.rs`.
+
+**`kbf-server`** (crate `kbf-server`) is the whole server in one process: it serves REAPI to build clients and
 `kbf.worker.v1` to daemons, on two separate listeners. It holds the cache, the
 scheduler and the record of which daemons are connected. Today one process runs every
 role (`--role=all`). The flags are:
@@ -77,10 +95,16 @@ role (`--role=all`). The flags are:
   heartbeat at;
 - `--finished-retention-secs` (default 60), how long a finished operation is kept
   for WaitExecution before its name is `NOT_FOUND`;
-- `--shutdown-timeout-secs` (default 10), how long a stop (SIGINT or SIGTERM) waits
+- `--shutdown-timeout-secs` (default 0, no deadline), how long a stop (SIGINT or SIGTERM) waits
   for REAPI clients to disconnect after their open Execute and WaitExecution streams
   that are not done are ended `UNAVAILABLE` (a finished operation a stream is waiting
   on is still sent first);
+- `--state-store`, where the scheduler keeps its state: `postgres:///kbf?host=/run/postgresql`
+  (a database on a local Unix socket, reached as the process's own user; a URL with a
+  password is refused) or `sqlite:///absolute/path`. Changes are written before they are
+  acknowledged and replayed at start, and every start is a new epoch, so daemons kill the
+  runs of the leases they held before. Left out, the scheduler's state is in memory and a
+  restart loses it ([architecture-v2.md](docs/design/architecture-v2.md) section 4.3);
 - `--invocation-memory` (bytes, default 268435456, 256 MiB), the memory the invocation
   records take together ([invocations.md](docs/design/invocations.md) section 3.5):
   each build's calls, leases and outcomes, kept in memory only and lost on restart;
@@ -108,7 +132,8 @@ the daemon half as `kbf-daemon` starts, each on an async runtime of its own, tak
 flag of both binaries. The daemon half's control plane is a remote daemon's (mutual TLS
 to the server half's worker listener on loopback); its blobs move through calls into the
 server half's cache and `Segments` handlers (`LocalDataPlane`), with no listener between.
-The scheduler's state is a SQLite file, so a restart keeps queued operations; the
+The scheduler's state is in `--state-store`, which defaults here to the local Postgres
+socket (`postgres:///kbf?host=/run/postgresql`; `sqlite:///absolute/path` is also accepted), so a restart keeps queued operations; the
 in-process plane's admission and `--reserve-cpus` across both halves are not done
 ([README](crates/kbf-all-in-one/README.md)). The same crate holds `kbf
 storage-and-daemon`: the storage node (`kbf_server::storage_half`, `kbf storage`'s start
@@ -263,7 +288,7 @@ See [scheduler.md](docs/design/scheduler.md) and
 |---|---|---|
 | CAS index, action cache, farm time | `MetaState` behind `RaftMetaLog`, applied from a single-voter Raft log on local disk (`--meta-dir`, or `<hot store>/meta`); behind `MemoryMetaLog`, in the process's memory, only in tests | the Raft log with three voters |
 | Blob bytes | segments in an object store (in memory, or an S3 bucket) | the same, with garbage collection and multiple stores |
-| Leases, operations, workers | `Scheduler` in the server's memory; a control record "commits" when appended | the same state machine fed from a replicated control log, kept on the servers' local disks |
+| Leases, operations, workers | `Scheduler` in the server's memory; with `--state-store` (Postgres or SQLite, through `kbf-state`; all-in-one always has one) each change is written to the store before it is acknowledged and replayed at start; without it a control record "commits" when appended and a restart loses them | the same state machine fed from a replicated control log, kept on the servers' local disks |
 | Memory kills | the scheduler's `MemoryState`, in the server's memory: each action key's memory floor and the order the floors were raised in, each held operation's memory-killed runs and busy-node reruns, each node's busy-node kill count; it compares with `Eq` | the same, inside the machine fed from the replicated control log |
 | Callers, started leases, node registry | `FarmMachine` (`kbf-server`'s `machine` module) in the server's memory: each caller's record, the finished operations whose callers are kept for the finished retention, the leases whose `Start` was sent, and each node that has registered with whether its newest stream is open and its newest `NodeStatus`; each caller's channel and each node's stream stay beside it in the farm core, which tells the machine when a stream has closed | the same machine fed from the replicated control log |
 | Node reports | read at `Hello`: `cpus`, `mem_gib` and `gpu` are booked; `arch`, `cpu.features`, `os` and the other exact keys are matched against each action's platform; held in memory, so a restart forgets every node | report changes noticed by hash; the node registry kept durable through the replicated control log, with alerts on absent nodes |

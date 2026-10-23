@@ -256,7 +256,7 @@ Decision C8: the modes do not combine. In `bearer` mode a certificate is neither
 
 ```toml
 [proxy]
-operator_token_file = "/etc/kbf/operator.token"   # read by the proxy; reloaded on SIGHUP
+operator_token_file = "/etc/kbf/api-token"   # read by the proxy; reloaded on SIGHUP
 client_ca_file   = "/etc/kbf/tls/ca.pem"   # verifies client certificates, whatever name they asked for
 # Server certificates, one of two forms (not both).
 # Single certificate, served for every name:

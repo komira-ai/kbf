@@ -741,8 +741,9 @@ Where it differs from the sections above, and why:
 - **The raise at the tier's start.** `kbf_server::write_tier::attach` asks the log to
   ready itself and the directory for the tier (`TierLog::ready_for_tier`) before
   `Cache::attach_tier`, and only when `--hot-store` is given. The Raft log raises
-  itself to machine version 2 (`RaftMetaLog::raise_machine_version`, which commits
-  nothing on a log already there); the memory log has nothing to raise and clears the
+  itself to machine version 5, the newest the tier's commands need
+  (`RaftMetaLog::raise_machine_version`, which commits nothing on a log already there;
+  `write_tier.rs`); the memory log has nothing to raise and clears the
   directory instead. A raft server without a tier never
   raises its log, so an older binary can still read it; once raised, a binary that
   runs only version 1 skips the raise from this build on, and refuses the log before it

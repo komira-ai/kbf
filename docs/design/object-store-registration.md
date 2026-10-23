@@ -1,10 +1,15 @@
 # ADR: object-store registration is durable desired state, fetched by storage nodes over mutual TLS
 
-Status: proposed; accepted when merged. Every decision in section 4 is an **engineering default**
-that stands until the owner answers the question beside it (section 14). Nothing here is built:
-this page, [operator-verbs.md](operator-verbs.md) and the drift guard
-`crates/kbf-server/tests/route_docs.rs` (section 17) make up the whole first change. Only the
-guard's check of the gate column is deferred.
+Status: the control API and the node-side apply are built. The routes are in
+`crates/kbf-server/src/object_store/api.rs` (`GET /v1/object-stores`, `/audit`,
+`/connections`; `GET`, `PUT`, `DELETE` and `POST` (verify) on `/connections/{target}`; `PUT`
+and `DELETE` on `/bindings/{role}`; they answer only when the frontend was started with
+`--object-store-secrets-dir`), and a storage node with an `s3://` `--cold-store` and
+`--frontend` fetches the registered store with `ColdStore.GetStoreConfig`, probes its keys
+and opens its cache on them at its start (`crates/kbf-server/src/cold_apply.rs`). This page is
+the design they follow; it was written as a proposal, and where it and the code differ, the
+code is what runs. Every decision in section 4 was an **engineering default** that stood
+until the maintainers answered the question beside it (section 14).
 
 Labels, as in the other design pages: **[F]** read in code on this branch, **[D]** a decision
 this page makes, **[V]** verify before building on it. A claim with none of them is a

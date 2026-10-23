@@ -12,7 +12,7 @@ These properties change how kbf schedules an action today:
 | `kbf-lease` | `action`, `whole_machine` | `action` | The kind of lease the action runs under (see [`kbf-lease`](#kbf-lease)). |
 | `gpu` | a whole number | `0` | Whole GPUs the action needs. |
 | `kbf-book-cpus` | a whole number, at least 1, plain digits | `1` | Whole cores the lease books. |
-| `kbf-book-mem-gib` | a whole number, at least 1, plain digits | `4` | GiB of memory the lease books. |
+| `kbf-book-mem-gib` | a whole number, at least 1, plain digits | `4` (the first rung of `--memory-ladder-gib`) | GiB of memory the lease asks for: the limit it runs under, checked against the node's memory but not reserved (see [below](#kbf-book-cpus-and-kbf-book-mem-gib)). |
 | `OSFamily` | `linux`; `darwin`, `macos`, `macosx`, `osx` (any case) | any | The operating system of the worker. |
 | `ISA`, `Arch` | `x86-64`, `x86_64`, `amd64`; `arm-a64`, `arm64`, `aarch64`; an ISA level such as `x86-64-v3` (any case) | any | The CPU architecture, and level, of the worker. |
 
@@ -131,7 +131,7 @@ py_test(
 
 ## `kbf-lease`
 
-An `action` lease (the default) books a share of a worker: one core and 4 GiB (the first rung of
+An `action` lease (the default) books cores and GPUs of a worker and asks for memory: one core and 4 GiB (the first rung of
 the memory ladder), or what
 `kbf-book-cpus` and `kbf-book-mem-gib` name, plus its `gpu` GPUs. A `whole_machine`
 lease books every core, byte of memory and GPU of its worker, and runs there alone.
@@ -163,14 +163,20 @@ placed there. Running leases are never stopped for it.
 
 ## `kbf-book-cpus` and `kbf-book-mem-gib`
 
-Every action books one core and 4 GiB of memory on the worker it runs on (the first
+Every action asks for one core and 4 GiB of memory on the worker it runs on (the first
 rung of the server's memory ladder, `--memory-ladder-gib`), unless it
 names a size: `kbf-book-cpus=N` books `N` whole cores, and `kbf-book-mem-gib=N` books
 `N` GiB. `N` is written in plain digits with no leading zero: `+4` and `04` are
 refused, since each would book the same as `4` under a different action digest, and so
 miss the cache entries `4` made. Either may be given alone; the other stays at its
-default. The scheduler places the action only where that much is free, and holds it
-for the lease until the lease ends, as it does for the default booking.
+default. Cores (and `gpu` GPUs) are booked: the scheduler places the action only on a
+worker with that many free, and holds them for the lease until the lease ends. Memory is
+not booked the same way: the worker's memory capacity must be at least the action's
+memory, but what other leases on the worker hold of its memory never keeps the action
+out. The worker bounds how many actions run at once by their cores, and its
+memory-pressure backstop pauses new starts. An action that asks for the whole host's
+memory (the last rung of the ladder) runs alone on its worker. The memory is the limit the
+action runs under, below.
 
 The booking also sets the memory the action may use. The native driver (Macs) kills an
 action whose processes together hold more than 150% of its booked memory plus 512 MiB:
