@@ -92,6 +92,51 @@ pub(crate) fn listed_services(domain: &str) -> Vec<(Option<i32>, String)> {
         .collect()
 }
 
+/// What one clean (or one lease end) has judged of launchd's services, by label: whether
+/// a service's plist is launchd's own ([`is_own_plist`]). A service is printed once for
+/// it, however many scans of the clean ask. Scoped to one clean: a later clean judges
+/// again, as a lease may have submitted a job under any label in between.
+#[derive(Default)]
+pub(crate) struct OwnLabels {
+    known: std::sync::Mutex<std::collections::HashMap<String, bool>>,
+}
+
+impl OwnLabels {
+    /// Whether the service `label` is launchd's own: what was judged before, else what
+    /// `judge` says (called without the lock held, so a slow print blocks no other).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn is_own(&self, label: &str, judge: impl FnOnce() -> bool) -> bool {
+        let lock = || self.known.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(own) = lock().get(label) {
+            return *own;
+        }
+        let own = judge();
+        lock().insert(label.to_owned(), own);
+        own
+    }
+}
+
+/// The members of `pids` that launchd lists as running one of its own agents. `list`
+/// (the domain's services) is not called when `pids` is empty, and `own` (is this label
+/// launchd's own) is asked only of the services that run one of `pids`: a service with
+/// no process of the uid cannot be one of them.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn own_among(
+    pids: &[i32],
+    list: impl FnOnce() -> Vec<(Option<i32>, String)>,
+    mut own: impl FnMut(&str) -> bool,
+) -> Vec<i32> {
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    list()
+        .into_iter()
+        .filter_map(|(pid, label)| Some((pid.filter(|pid| pids.contains(pid))?, label)))
+        .filter(|(_, label)| own(label))
+        .map(|(pid, _)| pid)
+        .collect()
+}
+
 /// The mount points in `mount`'s output (`<device> on <path> (<options>)` per line)
 /// that are one of `roots` or lie under one, the deepest first, so that a mount inside
 /// a mount comes off before the one it is in.

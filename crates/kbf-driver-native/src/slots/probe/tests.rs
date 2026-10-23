@@ -48,6 +48,65 @@ fn the_services_of_a_domain_are_the_table_between_its_braces() {
     assert_eq!(listed_services(""), []);
 }
 
+/// Catches a clean that lists launchd's services (one print of the domain and one per
+/// service, 40 or so) when no process of the uid is alive: with no pid, nothing is listed
+/// and nothing asked.
+#[test]
+fn no_service_is_listed_when_no_process_is_alive() {
+    let own = own_among(
+        &[],
+        || panic!("the domain was listed for no process"),
+        |label| panic!("{label} was judged for no process"),
+    );
+    assert_eq!(own, Vec::<i32>::new());
+}
+
+/// Catches a clean that prints every service for its plist: only a service that runs one
+/// of the live pids is judged (not one with no process, nor one of another pid), and the
+/// result is the live pids whose service is judged launchd's own.
+#[test]
+fn only_the_services_running_a_live_pid_are_judged() {
+    let services = vec![
+        (Some(10), "own.a".to_owned()),
+        (Some(11), "lease.b".to_owned()),
+        (None, "own.idle".to_owned()),
+        (Some(99), "own.other".to_owned()),
+        (Some(12), "own.c".to_owned()),
+    ];
+    let mut asked = Vec::new();
+    let own = own_among(&[10, 11, 12, 13], || services, |label| {
+        asked.push(label.to_owned());
+        label.starts_with("own.")
+    });
+    assert_eq!(own, [10, 12]);
+    assert_eq!(asked, ["own.a", "lease.b", "own.c"]);
+}
+
+/// Catches a clean that prints a service again for every scan of its kill loop and every
+/// look after it: a label is judged once, whatever the answer, and a new label is
+/// judged on its own; a new `OwnLabels` (the next clean) judges again.
+#[test]
+fn a_clean_judges_each_service_once() {
+    let judged = OwnLabels::default();
+    let calls = std::cell::Cell::new(0);
+    let calls = &calls;
+    let judge = |answer: bool| {
+        move || {
+            calls.set(calls.get() + 1);
+            answer
+        }
+    };
+    for _ in 0..3 {
+        assert!(judged.is_own("own.a", judge(true)));
+        assert!(!judged.is_own("lease.b", judge(false)));
+    }
+    assert_eq!(calls.get(), 2);
+    assert!(judged.is_own("own.c", judge(true)));
+    assert_eq!(calls.get(), 3);
+    assert!(!OwnLabels::default().is_own("own.a", judge(false)));
+    assert_eq!(calls.get(), 4);
+}
+
 /// Catches a shared sweep without `/Library/Caches` (a raw plant there by the uid survived
 /// the clean), one that still sweeps all of `/private/var/folders` (the other uids'
 /// entries are listed and searched), and one that lost a place or launchd's per-uid
