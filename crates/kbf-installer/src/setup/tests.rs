@@ -772,6 +772,43 @@ fn nothing_of_the_mode_starts_without_a_release_or_with_no_start() {
     assert!(out.contains("--no-start"), "{out}");
 }
 
+/// Asserts that a node host with the kbf package (`/usr/bin/kbf`) and no `releases/current`
+/// has its mode's unit started, as a host with a release has, and is not told that no release
+/// is installed; and that a frontend host with only the package still has its unit enabled and
+/// left stopped, because starting a frontend is the operator's.
+#[test]
+fn a_host_with_the_kbf_package_and_no_release_tree_starts_its_units() {
+    let mut exec = host();
+    put(&mut exec, "/usr/bin/kbf", 0o755, ROOT, "kbf");
+    let out = go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon));
+    let systemctl: Vec<String> = cmds(&exec)
+        .into_iter()
+        .filter(|c| c.contains("systemctl"))
+        .collect();
+    assert_eq!(
+        systemctl,
+        [
+            "run /usr/bin/systemctl enable --now -- kbf-daemon.service",
+            "run /usr/bin/systemctl enable --now -- kbf-installer.service",
+        ]
+    );
+    assert!(!out.contains("no release is installed yet"), "{out}");
+    let mut exec = host();
+    put(&mut exec, "/usr/bin/kbf", 0o755, ROOT, "kbf");
+    go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Frontend));
+    let systemctl: Vec<String> = cmds(&exec)
+        .into_iter()
+        .filter(|c| c.contains("systemctl"))
+        .collect();
+    assert_eq!(
+        systemctl,
+        [
+            "run /usr/bin/systemctl enable -- kbf-frontend.service",
+            "run /usr/bin/systemctl enable --now -- kbf-installer.service",
+        ]
+    );
+}
+
 /// Catches an enable of a unit that is already enabled (a `--now` would then start a unit
 /// the operator stopped).
 #[test]

@@ -5,7 +5,7 @@ This page is about a host that is already set up with [`kbf-installer setup`](kb
 
 | way | state in this build |
 |---|---|
-| by hand, with `kbf-deploy host install` and a restart | works |
+| by hand, with `kbf-deploy host install` and a restart | only a host of the earlier layout, whose units run `releases/current/kbf`; the `kbf` package's units run `/usr/bin/kbf` |
 | `kbf-installer update --frontend`, through the proxy's update API | the host fetches from its `url` source; a refused order is reported late (see below) |
 | pull updates, where the frontend offers and the host fetches | planned |
 
@@ -43,7 +43,8 @@ sudo kbf-deploy host status
   Installing the current release again changes no link. It refuses while a commit-confirm deploy is
   pending in the state.
 - **No verb restarts a service.** After `install --apply` the units still run the old binary until
-  you restart them. Restart the units that run `releases/current/kbf`.
+  you restart them. Restart the units that run `releases/current/kbf` (the mode units of the
+  `kbf` package run `/usr/bin/kbf`, which `host install` does not change).
 - `host status` prints the state and whether the `current` link matches it. It exits 0 when it does
   (or when there is neither), 1 when it does not, and 2 when the state cannot be read
   (`REFUSED: ...`). `--json` prints one object.

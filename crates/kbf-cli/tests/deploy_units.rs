@@ -1,4 +1,4 @@
-//! The units kbf ships (`packaging/linux/units/`, installed by kbf-installer) against this
+//! The units kbf ships (`packaging/linux/units/`, installed by the kbf package) against this
 //! binary's own parser, in-process, with the `kbf.toml` each mode is started with: the
 //! package's unit is `kbf --mode=<mode>` and nothing else, every setting is the file's.
 //! The file is the one `kbf-installer setup` writes for the mode
@@ -31,8 +31,8 @@ use kbf_cli::{Invocation, parse_with};
 use kbf_testkit::dir::TestDir;
 use kbf_unitfile::UnitFile;
 
-/// The program every packaged unit runs: the release `kbf-installer` flipped to.
-const PROGRAM: &str = "/var/lib/kbf-installer/releases/current/kbf";
+/// The program every packaged mode unit runs: the `kbf` the kbf package installs.
+const PROGRAM: &str = "/usr/bin/kbf";
 
 /// The `kbf.toml` `kbf-installer setup` writes for `mode`.
 fn setup_file(mode: &str) -> &'static str {
@@ -77,7 +77,7 @@ fn unit(name: &str) -> UnitFile {
 }
 
 /// The words after the program of the unit's `ExecStart=`, asserting the program is the
-/// installer's current release. The plain frontend unit names the host's file
+/// packaged `kbf`. The plain frontend unit names the host's file
 /// (`--config /etc/kbf/kbf.toml`); that pair is dropped, as the test gives its own.
 fn start_words(unit: &UnitFile, name: &str) -> Vec<String> {
     let argv = unit.exec_start();

@@ -140,7 +140,7 @@ fn argv_with(words: &[String], config: &Path) -> Vec<OsString> {
 fn the_plain_frontend_unit_command_lines_parse_with_kbfs_own_parser() {
     let (_, text) = units()
         .into_iter()
-        .find(|(m, t)| m == "frontend" && t.contains("releases/current/kbf"))
+        .find(|(m, t)| m == "frontend" && t.contains("/usr/bin/kbf --mode=frontend --config"))
         .expect("kbf-frontend.service");
     let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "plain-frontend-unit");
     let config = frontend_config(&dir);

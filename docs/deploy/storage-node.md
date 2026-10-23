@@ -510,7 +510,7 @@ metadata directory.
 
 ## A mode's units
 
-Each mode of the one `kbf` binary has a packaged unit, installed by `kbf-installer` and
+Each mode of the one `kbf` binary has a packaged unit, installed by the `kbf` package (which runs `/usr/bin/kbf`) and
 configured by `/etc/kbf/kbf.toml`; they are described, with the rules they are held to, in
 [kbf-units.md](kbf-units.md). `kbf-deploy linux render-units`, `check-units` and
 `install-units` (and the converged form of them, with `--restart-minio` and `--uninstall`)

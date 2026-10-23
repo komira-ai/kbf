@@ -53,10 +53,24 @@ pub fn packaged(workflow: &str) -> Result<Vec<(String, String)>, String> {
 /// the file the attest job signed), in file order. An error names a line without
 /// `--platform`.
 pub fn packaged_debs(workflow: &str) -> Result<Vec<String>, String> {
+    deb_platforms(workflow, "pkg-asset")
+}
+
+/// The platform of every `cargo xtask pkg-kbf-asset` line in the workflow's `run:` steps that
+/// makes the `kbf` deb an asset (it has no `--verify-only`: that one only checks the file the
+/// attest job signed), in file order. An error names a line without `--platform`.
+pub fn packaged_kbf_debs(workflow: &str) -> Result<Vec<String>, String> {
+    deb_platforms(workflow, "pkg-kbf-asset")
+}
+
+/// The platform of every `cargo xtask <verb>` line of the `run:` steps without
+/// `--verify-only`, in file order.
+fn deb_platforms(workflow: &str, verb: &str) -> Result<Vec<String>, String> {
+    let prefix = format!("cargo xtask {verb} ");
     let mut found = Vec::new();
     for step in workflows::run_steps(workflow)? {
         for line in step.script.lines().map(str::trim_start) {
-            let Some(args) = line.strip_prefix("cargo xtask pkg-asset ") else {
+            let Some(args) = line.strip_prefix(prefix.as_str()) else {
                 continue;
             };
             let words: Vec<&str> = args.split_whitespace().collect();
@@ -69,7 +83,7 @@ pub fn packaged_debs(workflow: &str) -> Result<Vec<String>, String> {
                 .and_then(|i| words.get(i + 1));
             let Some(platform) = platform else {
                 return Err(format!(
-                    "{}/{}: a pkg-asset line without --platform: {line}",
+                    "{}/{}: a {verb} line without --platform: {line}",
                     step.job, step.step
                 ));
             };
