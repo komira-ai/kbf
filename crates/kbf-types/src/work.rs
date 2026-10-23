@@ -78,9 +78,8 @@ pub struct Resources {
     pub gpus: u64,
     /// VM slots.
     pub vms: u64,
-    /// On a node's capacity: the most Action leases it runs at once, or `None` for no
-    /// cap. Each Action lease holds one, counted by the scheduler as the leases on the
-    /// node; a request carries `None`, and [`Resources::fits`] and the arithmetic below
+    /// On a node's capacity: the most Action and VM leases it holds at once, or `None`
+    /// for no cap. Each holds one, counted by the scheduler as the leases on the node; a request carries `None`, and [`Resources::fits`] and the arithmetic below
     /// leave it alone (they keep `self`'s).
     pub leases: Option<u64>,
 }

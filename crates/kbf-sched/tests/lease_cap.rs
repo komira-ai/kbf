@@ -44,7 +44,7 @@ impl Farm {
             capacity: capacity(cap),
             caps: NodeCaps::from_report([("arch", "arm64"), ("os", "macos")])
                 .unwrap()
-                .with_drivers(["native"]),
+                .with_drivers(["native", "native-whole-machine"]),
         });
         farm
     }
@@ -73,6 +73,10 @@ impl Farm {
     }
 
     fn submit(&mut self, count: u64) {
+        self.submit_kind(count, LeaseKind::Action, Resources::new(1_000, GIB));
+    }
+
+    fn submit_kind(&mut self, count: u64, kind: LeaseKind, resources: Resources) {
         for _ in 0..count {
             let n = self.next;
             self.next += 1;
@@ -82,8 +86,8 @@ impl Farm {
                     action: digest(n),
                 },
                 qos: Qos::Ci,
-                kind: LeaseKind::Action,
-                resources: Resources::new(1_000, GIB),
+                kind,
+                resources,
                 hermetic: true,
                 do_not_cache: false,
                 needs: kbf_caps::Request::default(),
@@ -104,7 +108,7 @@ impl Farm {
             capacity: capacity(cap),
             caps: NodeCaps::from_report([("arch", "arm64"), ("os", "macos")])
                 .unwrap()
-                .with_drivers(["native"]),
+                .with_drivers(["native", "native-whole-machine"]),
         });
         self.secs += 1;
         self.feed(Event::Tick);
@@ -196,4 +200,18 @@ fn a_lowered_cap_stops_new_placements_and_keeps_running_leases() {
     // Cleaned: three slots again.
     farm.report(Some(3));
     assert_eq!(farm.held(), 3);
+}
+
+/// Catches: the cap applied to a whole-machine lease (which needs an empty node, not a
+/// free slot, so a capped node would refuse it), or a whole-machine lease that lets
+/// Actions in beside it.
+#[test]
+fn a_whole_machine_lease_is_placed_on_an_empty_capped_node_and_blocks_actions() {
+    let mut farm = Farm::new(Some(2));
+    farm.submit_kind(1, LeaseKind::WholeMachine, Resources::new(8_000, 32 * GIB));
+    assert_eq!(farm.held(), 1);
+    farm.submit(2);
+    assert_eq!(farm.held(), 1, "no action beside a whole-machine lease");
+    farm.finish_one();
+    assert_eq!(farm.held(), 2, "the actions follow, up to the cap");
 }

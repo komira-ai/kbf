@@ -213,8 +213,9 @@ impl Worker {
 
     /// Whether `request` can be placed on it now, platform and kind aside: an action
     /// if no whole-machine lease holds it, its free CPUs, GPUs and VM slots hold the
-    /// request, it holds fewer leases than its lease cap (if it reports one), and its memory capacity is at least the request's memory; a
-    /// whole-machine lease if it holds no lease and its capacity holds the request. A
+    /// request, it holds fewer leases (of any kind) than its lease cap (if it reports
+    /// one), and its memory capacity is at least the request's memory; a whole-machine
+    /// lease if it holds no lease and its capacity holds the request. A
     /// request for an iOS device also needs a free device that satisfies it
     /// ([`Worker::free_device`]).
     pub(crate) fn has_room(&self, request: &Request) -> bool {

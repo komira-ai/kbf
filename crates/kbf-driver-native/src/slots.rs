@@ -35,10 +35,12 @@
 //! ([`check_daemon_user`]). Linux native keeps its process-group tracking
 //! ([`crate::procs`]); a pool there is refused.
 //!
-//! Not yet: the scheduler does not book slots (a lease past `N` waits here for a free
-//! one); and nothing drains or reboots a node with a dirty slot. A dirty slot lowers the runtime's `action_slots` entry at once, through its
-//! own part of the driver watch ([`SOURCE`]), and a recovery thread cleans it again
-//! ([`book`]) with no Xcode survey and no lease needed.
+//! The scheduler holds a node to its `action_slots` count: it places no lease on the node
+//! once it holds that many, so a lease waits here for a slot only while the directory of
+//! the one that just ended is still being cleaned. Not yet: nothing drains or reboots a
+//! node with a dirty slot. A dirty slot lowers the runtime's `action_slots` entry at
+//! once, through its own part of the driver watch ([`SOURCE`]), and a recovery thread
+//! cleans it again ([`book`]) with no Xcode survey and no lease needed.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -84,7 +86,7 @@ pub const LEASES_ROOT_MODE: u32 = 0o711;
 pub const LEASE_DIR_MODE: u32 = 0o700;
 
 /// The name of the slots' part of the daemon's driver watch: the `action_slots` entry,
-/// pushed whenever the number of free slots changes.
+/// pushed whenever the number of usable (not dirty) slots changes.
 pub const SOURCE: &str = "slots";
 
 /// The node report entry that says how many actions run at once.
