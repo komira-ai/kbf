@@ -11,7 +11,7 @@
 //!   and its takeover) is waited for, made to take the generation, and then routed to.
 //! - **No slot has one**: the root half's `installed_commit` (`status.json`) is brought to
 //!   the schema it needs ([`host_migrator`]; before any process starts), started in
-//!   slot A as a candidate, made to take the generation (a cold start with an epoch bump,
+//!   slot A as a candidate, made to take the generation (a cold start, which keeps the epoch,
 //!   FP sections 6 and 8: [`super::cold`], the same steps as a restart in the middle of an
 //!   update) and routed to. If `status.json` names no release, or its binary is missing or
 //!   not executable, nothing is started: no other release is picked. The one exception is a

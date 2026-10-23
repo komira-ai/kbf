@@ -6,7 +6,9 @@
 //! executed at its index, the first `Bootstrap` kept). The server's applied state must
 //! equal the replica's, and its log id the replica's `Bootstrap`'s: every entry the
 //! server has applied, and so answered from, was durable, and a restart or a follower
-//! would apply it alike.
+//! would apply it alike. An entry the machine skips (a command this binary does not know,
+//! a control command, a raise past the machine versions this binary knows) is skipped by
+//! the replica too, so equality holds; an entry that does not decode breaks it.
 
 use kbf_log::{FarmLogId, Format, LogCommand, MachineVersion};
 use kbf_meta::{MetaState, Retention};
@@ -114,7 +116,10 @@ impl Replica {
                 Ok(LogCommand::MachineVersion(v)) if v.format().is_some() => {
                     self.version = self.version.max(v);
                 }
-                other => return Err(equality(format!("entry {last} is {other:?}"))),
+                // What the server's metadata machine skips: a command this binary does not
+                // know, a control command, a raise past the versions it knows.
+                Ok(_) => {}
+                Err(e) => return Err(equality(format!("entry {last} does not decode: {e}"))),
             }
         }
         if self.last < applied {
@@ -148,7 +153,7 @@ pub(crate) fn same_as_live(
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
-    use kbf_log::{Bootstrap, MachineVersion};
+    use kbf_log::{Bootstrap, MachineVersion, Takeover};
     use kbf_meta::Command;
     use kbf_raft::{LogId, LogIndex, Term};
     use kbf_store::Fault;
@@ -157,6 +162,13 @@ mod tests {
 
     fn entry(index: u64, command: &LogCommand) -> Entry {
         let bytes = kbf_log::encode(Format::V1, command).expect("encode");
+        Entry {
+            id: LogId::new(Term(1), LogIndex(index)),
+            payload: Payload::Command(bytes),
+        }
+    }
+
+    fn raw(index: u64, bytes: Vec<u8>) -> Entry {
         Entry {
             id: LogId::new(Term(1), LogIndex(index)),
             payload: Payload::Command(bytes),
@@ -212,19 +224,18 @@ mod tests {
         assert!(same_as_live(&(meta.clone(), Some(id(7))), &meta, id(7)).is_ok());
     }
 
-    /// Catches each way property 1 can break going unreported: an applied entry the
-    /// disk lacks, an entry the metadata machine does not apply, a state or a log id
-    /// that differs, a durable log that does not open.
+    /// Asserts that each way property 1 can break is reported: an applied entry the disk
+    /// lacks, an entry that does not decode, a state or a log id that differs, a durable
+    /// log that does not open.
     #[test]
     fn each_difference_from_the_durable_log_breaks_replica_equality() {
         let broken = |r: Result<(), Broken>| r.expect_err("broken").0;
         let short = replay(&log(), 4).map(|_| ());
         assert_eq!(broken(short), Property::ReplicaEquality);
-        let version = MachineVersion::new(NonZeroU32::new(6).expect("non-zero"));
-        let mut control = log();
-        control.push(entry(4, &LogCommand::MachineVersion(version)));
+        let mut malformed = log();
+        malformed.push(raw(4, vec![0xff]));
         assert_eq!(
-            broken(replay(&control, 4).map(|_| ())),
+            broken(replay(&malformed, 4).map(|_| ())),
             Property::ReplicaEquality
         );
         let (meta, _) = replay(&log(), 3).expect("a replica");
@@ -274,18 +285,30 @@ mod tests {
         );
     }
 
-    /// Asserts that a command this binary does not know breaks replica equality: the
-    /// replica applies nothing for it, so it names the entry instead of skipping it.
+    /// Asserts that the replica skips a command this binary does not know, a control
+    /// command and a raise to a machine version this binary does not know, as the server's
+    /// metadata machine does, and applies the tick that follows each.
     #[test]
-    fn an_unknown_command_breaks_replica_equality() {
-        let mut unknown = log();
-        unknown.push(Entry {
-            id: LogId::new(Term(1), LogIndex(4)),
-            payload: Payload::Command(vec![0x0a, 0x03, 0xaa, 0x01, 0x00]),
+    fn the_replica_skips_what_the_machine_skips_and_applies_the_entries_after() {
+        let version = MachineVersion::new(NonZeroU32::new(6).expect("non-zero"));
+        let takeover = LogCommand::Takeover(Takeover {
+            term: NonZeroU64::MIN,
+            now: FarmTime::from_millis(1),
         });
-        let broken = replay(&unknown, 4).map(|_| ()).expect_err("broken");
-        assert_eq!(broken.0, Property::ReplicaEquality);
-        assert_eq!(broken.1, "entry 4 is Ok(Unknown)");
+        let skipped = [
+            raw(4, vec![0x0a, 0x03, 0xaa, 0x01, 0x00]),
+            entry(4, &takeover),
+            entry(4, &LogCommand::MachineVersion(version)),
+        ];
+        let tick = LogCommand::Meta(Command::Tick(FarmTime::from_millis(9)));
+        for skipped in skipped {
+            let mut entries = log();
+            entries.push(skipped);
+            entries.push(entry(5, &tick));
+            let (meta, log_id) = replay(&entries, 5).expect("the replica skips the entry");
+            assert_eq!(meta.now(), FarmTime::from_millis(9));
+            assert_eq!(log_id, Some(id(7)));
+        }
     }
 
     /// Catches a time check that lets farm time go back (the mutant "`max(now)`

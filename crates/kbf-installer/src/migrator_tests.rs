@@ -1,7 +1,7 @@
 //! The swap's database migrator ([`crate::migrator`]): its refusal words and its stored
 //! facts without a server, and the swap's whole path over a real schema in `database`
-//! (`KBF_TEST_POSTGRES_URL`, tests `#[ignore]`d like the state crate's; the `state-postgres`
-//! job runs them, and its filter `database::` finds them by their module name).
+//! (`KBF_TEST_POSTGRES_URL` names the server; those tests fail without it, and each makes a
+//! database of its own). The macOS job skips them by their module name, `::database::`.
 
 use kbf_state::postgres::PostgresConfig;
 use kbf_state::postgres::schema::{self, SchemaError};
@@ -417,13 +417,12 @@ fn the_swap_runs_the_db_migrator_before_the_candidate_and_stops_on_its_refusal()
 
 /// Real schema, real swap: the tests that need a server.
 mod database {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Mutex, PoisonError, mpsc};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
-    use kbf_state::postgres::PostgresStore;
     use kbf_state::postgres::schema::{self, Migration};
+    use kbf_state::postgres::{PostgresStore, TestDatabase};
     use kbf_state::{Cond, Store, Txn};
 
     use super::super::model::{Mode, Phase, PortError, StagedFacts, Step};
@@ -432,18 +431,9 @@ mod database {
     use super::*;
     use crate::CommitId;
 
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-
-    /// The schema lock is one per database, whatever the schema: the tests that hold it, or
-    /// that a held lock would turn into `database_busy`, take turns (process-wide, #1168).
-    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-
-    fn turn() -> std::sync::MutexGuard<'static, ()> {
-        ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
+    /// The test server's URL, which names its own database and role.
     fn url() -> String {
-        std::env::var("KBF_TEST_POSTGRES_URL").expect("KBF_TEST_POSTGRES_URL names a test database")
+        kbf_testkit::database::server_url()
     }
 
     /// What of the URL must never appear in a message: its user information.
@@ -454,8 +444,10 @@ mod database {
             .map(|(info, _)| info.to_owned())
     }
 
-    fn assert_no_url(text: &str) {
-        assert!(!text.contains(&url()), "the URL is in {text}");
+    /// `text` does not quote `url`, the URL of the database the migrator was given, nor the
+    /// user information or password of the server's.
+    fn assert_no_url(url: &str, text: &str) {
+        assert!(!text.contains(url), "the URL is in {text}");
         if let Some(info) = userinfo() {
             assert!(!text.contains(&info), "the user information is in {text}");
             if let Some((_, password)) = info.split_once(':') {
@@ -467,24 +459,29 @@ mod database {
         }
     }
 
-    struct Scratch(String);
+    /// A database made for one test and dropped with it, with no schema: the schema lock, an
+    /// advisory lock of the database, is the test's own, so a test that holds it stops no other.
+    struct Scratch(TestDatabase);
 
     impl Scratch {
         fn new() -> Scratch {
-            let n = NEXT.fetch_add(1, Ordering::Relaxed);
-            Scratch(format!("kbf_m{}_{n}", std::process::id()))
+            Scratch(TestDatabase::empty())
+        }
+
+        fn url(&self) -> String {
+            self.0.url()
         }
 
         fn config(&self) -> PostgresConfig {
-            PostgresConfig::parse(&url())
-                .and_then(|c| c.with_schema(&self.0))
-                .expect("parses")
+            PostgresConfig::parse(&self.url()).expect("parses")
         }
 
         fn rows(&self, query: &str) -> Vec<String> {
-            let mut client = postgres::Client::connect(&url(), postgres::NoTls).expect("connects");
+            let url = self.url();
+            let tables = PostgresConfig::DEFAULT_SCHEMA;
+            let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connects");
             client
-                .batch_execute(&format!("SET search_path TO {}", self.0))
+                .batch_execute(&format!("SET search_path TO {tables}"))
                 .ok();
             client
                 .query(query, &[])
@@ -492,14 +489,6 @@ mod database {
                 .iter()
                 .map(|r| r.get::<_, String>(0))
                 .collect()
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            if let Ok(mut c) = postgres::Client::connect(&url(), postgres::NoTls) {
-                let _ = c.batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.0));
-            }
         }
     }
 
@@ -622,9 +611,7 @@ mod database {
     /// Mutants seen red: `migrate_forward` returning `Ok` without migrating; the
     /// `schema_version` INSERT run twice (a second run changed the row).
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn a_fresh_database_gets_the_schema_and_a_repeat_changes_nothing() {
-        let _turn = turn();
         let s = Scratch::new();
         let orders = staged(1);
         let m = DbMigrator::new(Database::new(s.config(), releases()), &orders);
@@ -645,9 +632,7 @@ mod database {
     /// Mutant seen red: the target taken as the installer's newest instead of the staged
     /// release's (the contract step was refused for a release that does not need it).
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn an_additive_migration_leaves_the_serving_child_reading_and_writing() {
-        let _turn = turn();
         let s = Scratch::new();
         let first = staged(1);
         DbMigrator::new(Database::new(s.config(), releases()), &first)
@@ -674,9 +659,7 @@ mod database {
     /// Mutant seen red: the contract check removed from `apply` (3 ran: the column was
     /// added and dropped, and the version was 3).
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn a_release_that_needs_a_contract_step_is_refused_and_nothing_runs() {
-        let _turn = turn();
         let s = Scratch::new();
         let first = staged(1);
         DbMigrator::new(Database::new(s.config(), releases()), &first)
@@ -689,16 +672,14 @@ mod database {
             .0;
         assert!(refused.starts_with("not_additive: "), "{refused}");
         assert!(refused.contains("migration 3"), "{refused}");
-        assert_no_url(&refused);
+        assert_no_url(&s.url(), &refused);
         assert_eq!(schema::current(&s.config()), Ok(1));
     }
 
     /// Catches a release that needs a schema the installer does not embed being started on
     /// anyway: `installer_too_old`, nothing changed.
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn a_release_newer_than_the_installer_is_refused_as_installer_too_old() {
-        let _turn = turn();
         let s = Scratch::new();
         let orders = staged(9);
         let refused = DbMigrator::new(Database::new(s.config(), releases()), &orders)
@@ -722,12 +703,10 @@ mod database {
     /// hung until the holder was released: the 5 s receive timed out); the schema lock
     /// statement removed from the migration transaction (the long wait did not block).
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn a_migrator_waits_for_the_schema_lock_and_gives_up_as_busy() {
-        let _turn = turn();
         let s = Scratch::new();
         let hold = || {
-            let mut other = postgres::Client::connect(&url(), postgres::NoTls).expect("connects");
+            let mut other = postgres::Client::connect(&s.url(), postgres::NoTls).expect("connects");
             other
                 .batch_execute("BEGIN; SELECT pg_advisory_xact_lock(hashtext('kbf-state-schema'))")
                 .expect("the lock is free");
@@ -750,7 +729,7 @@ mod database {
         other.batch_execute("ROLLBACK").expect("released");
         let busy = short.expect("it gives up").unwrap_err().0;
         assert!(busy.starts_with("database_busy: "), "{busy}");
-        assert_no_url(&busy);
+        assert_no_url(&s.url(), &busy);
         assert_eq!(
             schema::current(&s.config()),
             Err(SchemaError::NotInitialised),
@@ -800,9 +779,7 @@ mod database {
     /// Mutant seen red: `describe_refusal` made to return `describe` (the FATAL text with
     /// both names in it).
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn a_refused_connection_names_neither_role_nor_database() {
-        let _turn = turn();
         let (w, _) = World::with_old();
         w.st.borrow_mut().staged_schema = 1;
         for (url, secret) in [
@@ -839,9 +816,7 @@ mod database {
     /// Mutants seen red: `Refusal::of` mapping `Failed` to `database_error`; the swap
     /// ignoring the migrator's error (the candidate spawned).
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn a_failed_migration_rolls_back_and_the_swap_refuses_with_the_old_child_serving() {
-        let _turn = turn();
         let s = Scratch::new();
         let first = staged(1);
         DbMigrator::new(Database::new(s.config(), broken()), &first)
@@ -863,9 +838,10 @@ mod database {
             failure.reason
         );
         assert!(failure.reason.contains("nosuch"), "{}", failure.reason);
-        assert_no_url(&failure.reason);
+        let own = s.url();
+        assert_no_url(&own, &failure.reason);
         for line in w.log() {
-            assert_no_url(&line);
+            assert_no_url(&own, &line);
         }
         assert_eq!(
             w.count("spawn"),
@@ -888,9 +864,7 @@ mod database {
     ///
     /// Mutant seen red: the swap's `migrate_forward` call moved after the spawn.
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn the_swap_migrates_before_the_candidate_starts() {
-        let _turn = turn();
         let s = Scratch::new();
         let first = staged(1);
         DbMigrator::new(Database::new(s.config(), releases()), &first)
