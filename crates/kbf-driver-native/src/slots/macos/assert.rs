@@ -12,6 +12,9 @@
 //! - After every clean the whole assertion runs against that baseline ([`after_clean`]);
 //!   when the slot is handed to a lease the cheap probes run again
 //!   ([`Slot::assert_ready`]), which sees what arrived after the clean's last look.
+//!   The cheap probes are the processes, launchd's jobs, IPC, mounts, the home and the
+//!   entry, within [`READY_WITHIN`]; the shared places and the schedules are read after
+//!   the clean only, not at slot-ready.
 //! - A red result is the same as a failed clean: the slot is not offered, the differing
 //!   lines are logged, and the recovery thread cleans and asserts it again.
 
@@ -36,6 +39,7 @@ use super::{Ready, Slot, launch_command};
 use crate::network::{Isolation, Network};
 use crate::slots::assertion::{self, Facts, Job, Lines, Probe, Reader, Snapshot};
 use crate::slots::clean::Outcome;
+use crate::slots::tool::run_within;
 use crate::slots::{crash, probe};
 
 const PS: &str = "/bin/ps";
@@ -59,6 +63,11 @@ const RECORD_ATTRS: [&str; 5] = [
 /// How long one tool the readers run may take: a hung `hdiutil` or `launchctl` is a probe
 /// that cannot run (red), never a lease or a recovery that waits for ever.
 const READ_WITHIN: Duration = Duration::from_secs(60);
+
+/// How long the slot-ready check may take in all, across its probes: a probe not begun by
+/// then is not read and the result is red, so a lease is never held up for ever by a
+/// string of slow tools (each of which is bounded by [`READ_WITHIN`]).
+const READY_WITHIN: Duration = Duration::from_secs(120);
 
 /// What `launchctl print` exits with for a target that is not there ("Could not find
 /// service"). Any other failure is not "gone".
@@ -92,7 +101,7 @@ impl<'a> MacReader<'a> {
         }
     }
 
-    /// The labels of launchd's own services the baseline noted: they are not printed again.
+    /// The label, plist path and program of each of launchd's own services the baseline noted.
     fn known(&self) -> &[String] {
         self.ready
             .baseline
@@ -231,7 +240,7 @@ impl Reader for MacReader<'_> {
         match probe {
             Probe::Processes => self.processes(),
             Probe::Domain => Ok(assertion::foreign_jobs(self.jobs()?)),
-            Probe::Services => Ok(assertion::own_labels(self.jobs()?)),
+            Probe::Services => Ok(assertion::own_services(self.jobs()?)),
             Probe::Ipc => self.ipc(),
             Probe::Mounts => self.mounts(),
             Probe::Home => self.home(),
@@ -248,9 +257,10 @@ impl Reader for MacReader<'_> {
 /// run or says anything but "not found", and a listed service that cannot be read and is
 /// still listed on a second look, are errors: a job that is not seen is never green.
 ///
-/// A service whose label the baseline noted (`known`) is launchd's own and is not printed
-/// again, which keeps the read to the few services that are new. Any other is printed and
-/// is launchd's own only if its plist is ([`assertion::own_plist`]).
+/// Every service is printed, the baseline's too: a job is launchd's own only if the file
+/// its plist path names is ([`assertion::own_plist`]) and, if the baseline (`known`)
+/// noted a service of its label, that plist path and program are the noted ones
+/// ([`assertion::is_own_job`]). A label is never enough.
 fn jobs_of(uid: u32, known: &[String]) -> Result<Vec<Job>, String> {
     let domain_target = format!("user/{uid}");
     let Some(domain) = print(&domain_target)? else {
@@ -258,14 +268,6 @@ fn jobs_of(uid: u32, known: &[String]) -> Result<Vec<Job>, String> {
     };
     let mut jobs = Vec::new();
     for (pid, label) in probe::listed_services(&domain) {
-        if known.contains(&label) {
-            jobs.push(Job {
-                pid,
-                label,
-                own: true,
-            });
-            continue;
-        }
         let Some(printed) = print(&format!("{domain_target}/{label}"))? else {
             // Gone since the listing, or not readable: the listing says which.
             let again = print(&domain_target)?.unwrap_or_default();
@@ -277,9 +279,17 @@ fn jobs_of(uid: u32, known: &[String]) -> Result<Vec<Job>, String> {
             }
             continue;
         };
-        let own = probe::plist_path(&printed)
-            .is_some_and(|path| assertion::own_plist(path, &label, &probe::OWN_PLISTS, 0));
-        jobs.push(Job { pid, label, own });
+        let (plist, program) = (probe::plist_path(&printed), probe::program_path(&printed));
+        let own = assertion::is_own_job((&label, plist, program), known, &|path| {
+            assertion::own_plist(path, &label, &probe::OWN_PLISTS, 0)
+        });
+        jobs.push(Job {
+            pid,
+            plist: plist.map(str::to_owned),
+            program: program.map(str::to_owned),
+            label,
+            own,
+        });
     }
     Ok(jobs)
 }
@@ -323,53 +333,6 @@ fn tool(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     ))
 }
 
-/// Runs `command` with a plain environment and no input; its status and output. It is
-/// killed, and the call fails, if it has not finished within `within`.
-fn run_within(
-    command: &mut Command,
-    within: Duration,
-) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
-    let mut child = command
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let out = drain(child.stdout.take());
-    let err = drain(child.stderr.take());
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < within => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            other => {
-                // The readers end with the pipes; they are not waited for here, as a
-                // child of the tool may hold them open.
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("did not finish within {within:?}: {other:?}"));
-            }
-        }
-    };
-    let join = |t: std::thread::JoinHandle<Vec<u8>>| t.join().unwrap_or_default();
-    Ok((status, join(out), join(err)))
-}
-
-/// Reads `pipe` to its end on a thread of its own, so that a tool that prints more than a
-/// pipe holds does not block.
-fn drain<R: io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut bytes);
-        }
-        bytes
-    })
-}
-
 /// Opens the directory `path` without following a link in its last component.
 fn open_dir(path: &Path) -> io::Result<OwnedFd> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
@@ -408,10 +371,50 @@ fn facts_and_names(path: &Path) -> Result<(Facts, Vec<String>), String> {
         mode: meta.mode() & 0o7777,
         flags: std::os::macos::fs::MetadataExt::st_flags(&meta),
         acl: assertion::acl_entries(&String::from_utf8_lossy(&listed)),
-        xattrs: xattrs_of(&fd).map_err(at)?,
+        xattrs: xattrs_with_values(&fd).map_err(at)?,
         entries: Vec::new(),
     };
     Ok((facts, names))
+}
+
+/// The extended attributes of the open directory `fd` as `name=value` lines, the value in
+/// hex: the baseline holds the values too, as a lease can change a value and keep the name.
+/// An attribute that went since the listing is left out.
+fn xattrs_with_values(fd: &OwnedFd) -> io::Result<Vec<String>> {
+    let mut lines = Vec::new();
+    for name in xattrs_of(fd)? {
+        if let Some(value) = xattr_value(fd, &name)? {
+            lines.push(assertion::xattr_line(&name, &value));
+        }
+    }
+    Ok(lines)
+}
+
+/// The value of the attribute `name` of the open directory `fd`; `None` if it has gone.
+fn xattr_value(fd: &OwnedFd, name: &str) -> io::Result<Option<Vec<u8>>> {
+    let raw = fd.as_raw_fd();
+    let key = std::ffi::CString::new(name).map_err(io::Error::other)?;
+    let gone = |e: io::Error| {
+        if e.raw_os_error() == Some(libc::ENOATTR) {
+            Ok(None)
+        } else {
+            Err(e)
+        }
+    };
+    // SAFETY: `raw` is a descriptor `fd` keeps open and `key` a NUL-terminated name; a
+    // null buffer of size 0 only asks for the size.
+    let size = unsafe { libc::fgetxattr(raw, key.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
+    let Ok(size) = usize::try_from(size) else {
+        return gone(io::Error::last_os_error());
+    };
+    let mut value = vec![0_u8; size];
+    // SAFETY: `value` is a writable buffer of `size` bytes, which the call fills at most.
+    let got = unsafe { libc::fgetxattr(raw, key.as_ptr(), value.as_mut_ptr().cast(), size, 0, 0) };
+    let Ok(got) = usize::try_from(got) else {
+        return gone(io::Error::last_os_error());
+    };
+    value.truncate(got);
+    Ok(Some(value))
 }
 
 /// The names of the extended attributes of the open directory `fd`.
@@ -443,7 +446,7 @@ pub(super) fn after_clean(ready: &Ready, program: &Path, clean: &dyn Fn() -> Out
     let dirty = |why: String| Outcome::Dirty { why };
     if let Some(baseline) = ready.baseline.get() {
         let reader = MacReader::new(ready, None);
-        let red = assertion::assert(&reader, Some(baseline), &assertion::ALL, &|| false);
+        let red = assertion::assert(&reader, Some(baseline), &assertion::ALL, (&|| false, None));
         return if red.is_empty() {
             Outcome::Clean
         } else {
@@ -544,8 +547,12 @@ impl Slot {
         if !self.asserted {
             return Ok(Vec::new());
         }
-        self.assert_probes(&assertion::CHEAP, Some(lease.to_owned()), cancel)
-            .await
+        self.assert_probes(
+            &assertion::CHEAP,
+            Some(lease.to_owned()),
+            (cancel, Some(READY_WITHIN)),
+        )
+        .await
     }
 
     /// Runs every probe of the assertion, as after a clean: for the tests of
@@ -555,15 +562,19 @@ impl Slot {
     /// As [`Slot::assert_ready`].
     #[doc(hidden)]
     pub async fn assert_everything(&self) -> Result<Lines, RuntimeError> {
-        self.assert_probes(&assertion::ALL, None, &Arc::new(AtomicBool::new(false)))
-            .await
+        self.assert_probes(
+            &assertion::ALL,
+            None,
+            (&Arc::new(AtomicBool::new(false)), None),
+        )
+        .await
     }
 
     async fn assert_probes(
         &self,
         probes: &'static [Probe],
         lease: Option<std::path::PathBuf>,
-        cancel: &Arc<AtomicBool>,
+        (cancel, until): (&Arc<AtomicBool>, Option<Duration>),
     ) -> Result<Lines, RuntimeError> {
         let (book, index) = (Arc::clone(&self.book), self.index);
         let cancel = Arc::clone(cancel);
@@ -571,7 +582,8 @@ impl Slot {
             let ready = book.ready(index);
             let reader = MacReader::new(ready, lease.as_deref());
             let stopped = || cancel.load(Ordering::SeqCst);
-            assertion::assert(&reader, ready.baseline.get(), probes, &stopped)
+            let until = until.map(|within| Instant::now() + within);
+            assertion::assert(&reader, ready.baseline.get(), probes, (&stopped, until))
         })
         .await;
         red.map_err(|e| RuntimeError::Failed(format!("the assertion did not finish: {e}")))

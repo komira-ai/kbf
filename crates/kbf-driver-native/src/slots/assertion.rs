@@ -16,16 +16,19 @@
 //! | [`Probe::Domain`] | `launchctl print user/<uid>` lists no job but launchd's own |
 //! | [`Probe::Ipc`] | `ipcs -a` lists no object it owns or made |
 //! | [`Probe::Mounts`] | nothing is mounted or attached under its home, its `/var/folders` entry or the lease directory, no mount anywhere is marked as mounted by it, and it attached no image |
-//! | [`Probe::Home`] | its home is an empty directory, mode 0700, its uid and gid, with no flags, and the ACL and extended attributes it had in the baseline |
-//! | [`Probe::Entry`] | its `/var/folders` entry is as recorded (root, and the mode and extended attributes of each folder), with every directory empty |
+//! | [`Probe::Home`] | its home is an empty directory, mode 0700, its uid and gid, with no flags, and the ACL and extended attributes (names and values) it had in the baseline |
+//! | [`Probe::Entry`] | its `/var/folders` entry is as recorded (root, and the mode and extended attributes, names and values, of each folder), with every directory empty |
 //! | [`Probe::Shared`] | it owns nothing in the shared places and the crash folders |
 //! | [`Probe::Schedules`] | it has no cron or `at` job |
 //! | [`Probe::Record`] | its directory record and `id` equal the baseline's |
 //!
 //! Launchd's own services differ from run to run (a service loaded on demand, a pid), so
-//! they are recorded ([`Probe::Services`]) and never compared: a job is launchd's own by
-//! where its plist lies ([`super::probe::is_own_plist`]), never by its label or a line
-//! of text that a lease can choose.
+//! the baseline notes each with its plist path and program ([`Probe::Services`]) and
+//! never compares the list. A job is launchd's own by the file its plist names
+//! ([`own_plist`]: under the system folders, root's, nobody else can write it, the same
+//! label), and, if the baseline noted a service of its label, only with the plist path
+//! and program it noted ([`is_own_job`]): never by its label or a line of text that a
+//! lease can choose. Every job is printed and judged at every look.
 //!
 //! Only the `user/<uid>` domain is read for jobs; a job loaded into another domain of
 //! the uid (`gui/<uid>`) runs as a process of the uid while it runs, which
@@ -199,17 +202,23 @@ fn baseline_defects(probe: Probe, lines: &[String]) -> Lines {
 /// line` for what is there and should not be, `probe: - line` for what the baseline has
 /// and is gone. Empty means the user is as the baseline says. `stopped` is asked before
 /// each probe: when it says so (the lease was killed) the rest are not read, and the
-/// result says that.
+/// result says that. `until` is the time the check may take in all: asked before each
+/// probe (one that has begun is not cut short; the tools it runs have their own limit),
+/// and a probe not begun by then is not read, which is red.
 pub(crate) fn assert(
     reader: &dyn Reader,
     baseline: Option<&Snapshot>,
     probes: &[Probe],
-    stopped: &dyn Fn() -> bool,
+    (stopped, until): (&dyn Fn() -> bool, Option<std::time::Instant>),
 ) -> Lines {
     let mut wrong = Vec::new();
     for &probe in probes {
         if stopped() {
             wrong.push(format!("{probe}: not read, the check was stopped"));
+            break;
+        }
+        if until.is_some_and(|t| std::time::Instant::now() >= t) {
+            wrong.push(format!("{probe}: not read, the check ran out of time"));
             break;
         }
         let now = match reader.read(probe) {
@@ -343,8 +352,46 @@ pub(crate) fn own_plist(path: &str, label: &str, roots: &[&str], owner: u32) -> 
 pub(crate) struct Job {
     pub pid: Option<i32>,
     pub label: String,
-    /// Its plist lies in launchd's own folders ([`probe::is_own_plist`]).
+    /// The plist and the program `launchctl print` says it has.
+    pub plist: Option<String>,
+    pub program: Option<String>,
+    /// Its plist is launchd's own ([`is_own_job`]).
     pub own: bool,
+}
+
+/// The line the baseline keeps of a service: `label`, plist path and program, apart by
+/// tabs (a missing plist or program is empty).
+pub(crate) fn service_line(label: &str, plist: Option<&str>, program: Option<&str>) -> String {
+    format!(
+        "{label}\t{}\t{}",
+        plist.unwrap_or_default(),
+        program.unwrap_or_default()
+    )
+}
+
+/// Whether a job is launchd's own: it has a plist, `on_file` (the check of the file,
+/// [`own_plist`]) accepts it for the job's label, and if the baseline (`known`, the lines
+/// of [`service_line`]) noted a service of that label, the plist path and the program are
+/// the ones it noted. A label alone never makes a job launchd's own: a lease that boots
+/// out a service and submits its own job under the label has a different plist (none) or
+/// program.
+pub(crate) fn is_own_job(
+    (label, plist, program): (&str, Option<&str>, Option<&str>),
+    known: &[String],
+    on_file: &dyn Fn(&str) -> bool,
+) -> bool {
+    let Some(path) = plist else {
+        return false;
+    };
+    let prefix = format!("{label}\t");
+    let mut noted = known.iter().filter(|k| k.starts_with(&prefix)).peekable();
+    if noted.peek().is_some() {
+        let now = service_line(label, plist, program);
+        if !noted.any(|k| *k == now) {
+            return false;
+        }
+    }
+    on_file(path)
 }
 
 /// The pids of launchd's own running services.
@@ -366,11 +413,11 @@ pub(crate) fn foreign_jobs(jobs: &[Job]) -> Lines {
         .collect()
 }
 
-/// The labels of launchd's own services: what the baseline notes.
-pub(crate) fn own_labels(jobs: &[Job]) -> Lines {
+/// The label, plist path and program of launchd's own services: what the baseline notes.
+pub(crate) fn own_services(jobs: &[Job]) -> Lines {
     jobs.iter()
         .filter(|j| j.own)
-        .map(|j| j.label.clone())
+        .map(|j| service_line(&j.label, j.plist.as_deref(), j.program.as_deref()))
         .collect()
 }
 
@@ -539,9 +586,17 @@ pub(crate) struct Facts {
     /// `st_flags`.
     pub flags: u32,
     pub acl: Lines,
+    /// `name=value` (the value in hex) each.
     pub xattrs: Lines,
     /// The names in it.
     pub entries: Lines,
+}
+
+/// The line for an extended attribute: `name=value`, the value in hex, so that a lease
+/// that changes a value and keeps the name is a difference.
+pub(crate) fn xattr_line(name: &str, value: &[u8]) -> String {
+    let hex: String = value.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{name}={hex}")
 }
 
 /// How the home `facts` differ from an empty directory of `uid`:`gid`, mode 0700, with no

@@ -201,3 +201,13 @@ fn a_failed_kill_or_scan_ends_the_loop_with_its_error() {
     );
     assert_eq!(result, Err("table".to_owned()));
 }
+
+/// Catches a program read from a nested dictionary of the printed job, or from a line
+/// that merely contains the word: only `program = ` one level in is the job's program.
+#[test]
+fn the_program_of_a_job_is_the_line_one_level_in() {
+    let printed = "x = {\n\tpath = /System/a.plist\n\tprogram = /usr/sbin/cfprefsd\n\n\tinherited environment = {\n\t\tprogram = /ignored\n\t}\n}\n";
+    assert_eq!(program_path(printed), Some("/usr/sbin/cfprefsd"));
+    assert_eq!(program_path("x = {\n\t\tprogram = /deeper\n}\n"), None);
+    assert_eq!(program_path("x = {\n\tpath = /p\n}\n"), None);
+}

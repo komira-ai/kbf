@@ -64,6 +64,8 @@ pub(crate) mod domain;
 pub mod macos;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod probe;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod tool;
 
 /// The lowest uid a pool user may have: every uid below it is root's, a system
 /// account's, or (from 501) one a Mac gives its first human users. The pool's uids
