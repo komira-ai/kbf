@@ -179,14 +179,12 @@ fn a_run_that_stopped_at_the_database_is_finished_by_running_again() {
     assert!(out.contains("\nnothing to do\n"), "{out}");
 }
 
-/// Catches a database flag that is accepted where it must not be: the two modes that keep
-/// state in Postgres take the local default when it is left out (the database `kbf` on the
+/// Asserts that a database flag is accepted only where it means something: the two modes that
+/// keep state in Postgres take the local default when it is left out (the database `kbf` on the
 /// local socket, as the account the frontend runs as, marked as defaulted) and a given URL is
 /// not marked; the other modes refuse the flag; a password (the file is world-readable),
 /// another scheme or a character a TOML string would escape is refused; and the message never
 /// quotes the URL.
-///
-/// Catches: the password check removed; the mode check removed.
 #[test]
 fn the_database_flag_defaults_where_there_is_state_and_is_refused_with_a_password() {
     for mode in [Mode::Frontend, Mode::AllInOne] {

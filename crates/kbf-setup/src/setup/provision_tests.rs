@@ -205,14 +205,10 @@ fn refusal(result: Result<impl std::fmt::Debug, SetupError>) -> String {
 
 // ---- the flag ---------------------------------------------------------------------------
 
-/// Catches a flag that takes a URL it cannot make something from, or one that makes
-/// something from a name it should refuse: the recipe's URL is accepted and yields the right
-/// role, database and socket; a remote host, a missing role, `postgres`, a `pg_` role, a name
+/// Asserts that the flag takes the recipe's URL and yields the right role, database and socket,
+/// and refuses what it cannot make: a remote host, a missing role, `postgres`, a `pg_` role, a name
 /// with a character setup will not create, one over 63 bytes and a mode with no state are each
 /// refused by the flag, and no refusal quotes the URL.
-///
-/// Catches: the socket check removed (a host name accepted); the `postgres` check
-/// removed; the 63-byte limit loosened to 64; the no-role check removed.
 #[test]
 fn the_flag_takes_the_recipe_url_and_refuses_what_it_cannot_make() {
     let ok = local();
@@ -1037,11 +1033,9 @@ impl std::io::Write for Closes {
     }
 }
 
-/// Catches a closed output being lost: a line setup cannot print about the database (the
+/// Asserts that a closed output is not lost: a line setup cannot print about the database (the
 /// dry run's "does not exist yet", a step it is about to run, a step it only plans, the rules
 /// the server needs) stops setup with an error instead of going on unseen.
-///
-/// Catches: any `?` dropped from one of those `writeln!` calls.
 #[test]
 fn a_closed_output_stops_setup_at_each_database_line() {
     for (needle, options) in [
