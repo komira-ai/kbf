@@ -91,3 +91,36 @@ fn the_unit_variable_selects_the_unit_body() {
         );
     }
 }
+
+/// The release pipeline signs the Mac binary and runs `--version` on it, before and after
+/// packaging; the answer is the name and the package version, whatever request the
+/// environment carries, and nothing runs.
+///
+/// Catches: a binary that treats `--version` as a refused request (exit 2, the closed
+/// refusal line), so the signed binary cannot be checked.
+#[test]
+fn version_prints_the_name_and_runs_nothing() {
+    for request in [None, Some("query"), Some("install kbf=1 from candidate")] {
+        let out = run(request.map(OsStr::new), &["--version"]);
+        assert_eq!(out.status.code(), Some(0), "{request:?}");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            concat!("kbf-host-install ", env!("CARGO_PKG_VERSION"), "\n"),
+            "{request:?}"
+        );
+        assert!(out.stderr.is_empty(), "{request:?}");
+    }
+}
+
+/// Only the one argument asks for the version: anything beside it is still not a request.
+#[test]
+fn version_with_anything_else_is_refused() {
+    if as_root() {
+        return;
+    }
+    for args in [&["--version", "query"][..], &["-V"], &["--version=1"]] {
+        let out = run(None, args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), REFUSED, "{args:?}");
+    }
+}

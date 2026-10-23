@@ -8,7 +8,9 @@
 //! ```
 //!
 //! sshd then runs it with no arguments, and the request is the one string in
-//! `SSH_ORIGINAL_COMMAND`. Exactly two requests are accepted, matched as a whole string
+//! `SSH_ORIGINAL_COMMAND`. (The one argument it takes anywhere is `--version`, which prints
+//! the name and the package version and runs nothing; the release checks the signed Mac
+//! binary with it.) Exactly two requests are accepted, matched as a whole string
 //! ([`request`]):
 //!
 //! - `install kbf=<version> from <channel>`: install that version of the `kbf` package
@@ -95,10 +97,27 @@ pub mod mac_tools {
     pub use crate::runner::{Cmd, Exec, Identity, Runner, SystemRunner};
 }
 
+/// The one line `--version` prints, which the release pipeline reads from the signed
+/// binary: the name and the package version.
+fn version_line() -> String {
+    format!("kbf-host-install {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Whether the arguments are exactly `--version`. sshd passes none, so this never answers
+/// a request; it is how the release checks the binary it signed runs.
+fn asks_for_version(args: &[std::ffi::OsString]) -> bool {
+    matches!(args, [only] if only == "--version")
+}
+
 /// The program: handle `SSH_ORIGINAL_COMMAND` against the production paths and exit with
 /// the status of the answer.
 #[must_use]
 pub fn main() -> ExitCode {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if asks_for_version(&args) {
+        println!("{}", version_line());
+        return ExitCode::SUCCESS;
+    }
     // Both sides are compiled everywhere, so the Linux build checks the Mac code.
     if cfg!(target_os = "macos") {
         return ExitCode::from(mac::main_process());
@@ -111,4 +130,36 @@ pub fn main() -> ExitCode {
         &mut std::io::stderr(),
     );
     ExitCode::from(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn args(words: &[&str]) -> Vec<OsString> {
+        words.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn only_the_lone_flag_asks_for_the_version() {
+        assert!(asks_for_version(&args(&["--version"])));
+        for other in [
+            &[][..],
+            &["-V"],
+            &["--version", "query"],
+            &["query"],
+            &["--versions"],
+        ] {
+            assert!(!asks_for_version(&args(other)), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn the_version_line_names_the_binary_and_the_package_version() {
+        assert_eq!(
+            version_line(),
+            format!("kbf-host-install {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
 }
