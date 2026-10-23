@@ -303,9 +303,11 @@ fn a_result_that_loses_the_lease_row_to_a_give_up_of_another_frontend_still_fini
         .persist(&[Effect::Start(start(4, 0, "node-a"))], None)
         .expect("grant");
     let lease = lease_key(LeaseId::new(5, 0));
-    let given_up = Txn::new()
-        .delete(lease.clone(), Cond::Any)
-        .put(queue_key(OperationId(4)), Vec::new(), Cond::Absent);
+    let given_up = Txn::new().delete(lease.clone(), Cond::Any).put(
+        queue_key(OperationId(4)),
+        Vec::new(),
+        Cond::Absent,
+    );
     store.land(&lease, given_up);
 
     first

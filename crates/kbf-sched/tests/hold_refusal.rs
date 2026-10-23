@@ -56,6 +56,15 @@ fn never(_: &Request) -> bool {
     panic!("asked about the workers elsewhere")
 }
 
+/// Asks `s` to take back the refusal of `operation`, `elsewhere` answering for the workers
+/// of other schedulers. Every test goes through this function, so `hold_refusal` (generic
+/// over the answer) has one instantiation in this binary and that one runs every branch:
+/// the coverage ratchet counts a generic function by its best-covered instantiation, not
+/// by the union of them.
+fn hold(s: &mut Scheduler, operation: OperationId, elsewhere: &dyn Fn(&Request) -> bool) -> bool {
+    s.hold_refusal(operation, elsewhere)
+}
+
 /// A scheduler with the short unservable wait and one Linux worker, named `linux`.
 fn with_a_linux_worker() -> Scheduler {
     let mut s = Scheduler::new(1).with_unservable_wait(WAIT);
@@ -104,7 +113,7 @@ fn a_refusal_is_taken_back_when_a_worker_elsewhere_could_run_the_operation() {
     assert_eq!(s.queued_len(), 0, "a proposed refusal leaves the queue");
     let elsewhere = Resources::new(4_000, 8 * GIB);
 
-    let held = s.hold_refusal(record.operation, |r| r.runnable_on(&mac(), &elsewhere));
+    let held = hold(&mut s, record.operation, &|r| r.runnable_on(&mac(), &elsewhere));
 
     assert!(held);
     assert_eq!(s.state(record.operation), Some(&OpState::Queued));
@@ -132,7 +141,7 @@ fn a_refusal_stands_when_no_worker_elsewhere_could_run_the_operation() {
     let mut s = with_a_linux_worker();
     let record = proposed_refusal(&mut s);
 
-    let held = s.hold_refusal(record.operation, |_| false);
+    let held = hold(&mut s, record.operation, &|_| false);
 
     assert!(!held);
     assert_eq!(s.queued_len(), 0);
@@ -156,14 +165,14 @@ fn a_refusal_stands_when_no_worker_elsewhere_could_run_the_operation() {
 #[test]
 fn an_operation_that_is_unknown_or_not_queued_is_not_held() {
     let mut s = with_a_linux_worker();
-    assert!(!s.hold_refusal(OperationId(9), never));
+    assert!(!hold(&mut s, OperationId(9), &never));
     submit(&mut s, 1, "linux");
     let placed = feed(&mut s, 0, Event::Tick);
     let [Effect::Commit(ControlRecord::Lease(_))] = placed.as_slice() else {
         panic!("{placed:?}");
     };
 
-    let held = s.hold_refusal(OperationId(0), never);
+    let held = hold(&mut s, OperationId(0), &never);
 
     assert!(!held);
     assert_eq!(s.queued_len(), 0, "a leased operation was queued again");
@@ -182,7 +191,7 @@ fn a_refusal_for_lost_leases_is_not_taken_back() {
         panic!("{proposed:?}");
     };
 
-    let held = s.hold_refusal(OperationId(0), never);
+    let held = hold(&mut s, OperationId(0), &never);
 
     assert!(!held);
     assert_eq!(s.queued_len(), 0);
@@ -196,7 +205,7 @@ fn an_operation_that_never_waited_stays_queued_once() {
     submit(&mut s, 1, "linux");
     assert_eq!(s.waiting(OperationId(0)), None);
 
-    let held = s.hold_refusal(OperationId(0), |_| true);
+    let held = hold(&mut s, OperationId(0), &|_| true);
 
     assert!(held);
     assert_eq!(s.queued_len(), 1);
