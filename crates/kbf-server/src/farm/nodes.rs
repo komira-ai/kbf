@@ -8,7 +8,6 @@ use super::{Farm, State};
 use crate::fleet::{
     NodeDetail, NodeView, NodesView, PhaseView, PlacementView, ResourcesView, needs_attention,
 };
-use crate::update_status::UpdateSummary;
 
 impl Farm {
     /// This build, and every node registered since this farm started, in node-id order,
@@ -87,11 +86,6 @@ impl Farm {
             protocol: state.links.get(worker).and_then(|link| link.protocol),
             needs_attention: needs_attention(software.as_ref(), &phase),
             software,
-            update: UpdateSummary::new(
-                node.and_then(|n| n.update.as_ref()),
-                connected,
-                node.is_some_and(|n| n.update_live),
-            ),
             placement,
             phase: PhaseView::new(&phase),
             lease_count: u32::try_from(held.len()).unwrap_or(u32::MAX),

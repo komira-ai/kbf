@@ -147,7 +147,7 @@ impl Sim {
     }
 
     /// The controller dies and a new one starts over the same rows, with the store's epoch
-    /// kept or moved on (a start over a SQLite file bumps it).
+    /// kept or moved on (the operator's bump of it).
     fn restart(&mut self) {
         self.stats.restarts += 1;
         self.epoch += u64::from(pct(&mut self.rng, 50));

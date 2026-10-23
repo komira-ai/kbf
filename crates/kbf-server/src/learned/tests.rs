@@ -725,3 +725,193 @@ fn a_sweep_with_more_to_do_goes_on_at_the_next_tick() {
     learned.swept(false);
     assert_eq!(learned.sweep_due(), None);
 }
+
+// ----------------------------------------------------------- key floor decay
+
+/// A farm in `on` mode that has seen an own-limit kill of the key: the estimator's floor
+/// for it is 16 GiB, and the operation of every attempt below has size key `SIZE_KEY`.
+const SIZE_KEY: u64 = 77;
+
+fn killed_once() -> Learned {
+    let mut learned = Learned::new(LearnedSizes::On, 4 * GIB, EPOCH);
+    learned.register(&key(), SIZE_KEY);
+    learned.stage(lease(1), Some(kill(None)));
+    learned.requeued(lease(1), 16 * GIB, &bounds());
+    assert!(learned.take_lowered().is_empty(), "a kill lowers nothing");
+    assert_eq!(l2_floor(&learned), 16 * GIB);
+    learned
+}
+
+fn l2_floor(learned: &Learned) -> u64 {
+    learned
+        .summaries()
+        .get(&key().l2())
+        .map_or(0, kbf_estimator::Summary::oom_floor)
+}
+
+/// Shows `learned` one finished success of `peak` bytes that was booked at `booked`, as
+/// the farm does for a result it took.
+fn run_success(learned: &mut Learned, seq: u64, peak: u64, booked: u64) {
+    let (_, run) = run_of(ok(), Some(&cgroup(Some(peak))), booked).expect("a run");
+    learned.stage(lease(seq), Some(Attempt { key: key(), run }));
+    learned.finish(lease(seq), true, &bounds());
+}
+
+fn at_day(learned: &mut Learned, days: u64) {
+    learned.clock(FarmTime::from_millis(days * DAY));
+}
+
+/// A floor holds while the heavy mode recurs: a run above half the floor every 30 runs,
+/// for 400 runs over ten days, never lowers it.
+#[test]
+fn a_key_floor_holds_while_heavy_runs_recur() {
+    let mut learned = killed_once();
+    for seq in 2..402 {
+        at_day(&mut learned, (seq - 2) / 40);
+        let peak = if seq % 30 == 0 { 9 * GIB } else { 500 * MIB };
+        run_success(&mut learned, seq, peak, 16 * GIB);
+        assert!(learned.take_lowered().is_empty(), "lowered at run {seq}");
+    }
+    assert_eq!(l2_floor(&learned), 16 * GIB);
+}
+
+/// A floor halves once its key has run 256 times and 7 days have passed without a run near
+/// the heavy mode, and only then: not at run 255, and once at run 256.
+#[test]
+fn a_key_floor_halves_after_256_quiet_runs_and_7_days() {
+    let mut learned = killed_once();
+    at_day(&mut learned, 8);
+    for seq in 2..257 {
+        run_success(&mut learned, seq, 500 * MIB, 16 * GIB);
+        assert!(learned.take_lowered().is_empty(), "lowered at run {seq}");
+    }
+    run_success(&mut learned, 257, 500 * MIB, 16 * GIB);
+    assert_eq!(learned.take_lowered(), vec![(SIZE_KEY, 16 * GIB, 8 * GIB)]);
+    assert_eq!(l2_floor(&learned), 8 * GIB);
+    // And once: the next quiet run lowers nothing more.
+    run_success(&mut learned, 258, 500 * MIB, 16 * GIB);
+    assert!(learned.take_lowered().is_empty());
+}
+
+/// Neither condition is enough alone: 300 quiet runs within a day, and 100 quiet runs
+/// after 8 days, leave the floor.
+#[test]
+fn a_key_floor_does_not_halve_before_both_256_runs_and_7_days() {
+    let mut learned = killed_once();
+    for seq in 2..302 {
+        run_success(&mut learned, seq, 500 * MIB, 16 * GIB);
+    }
+    assert!(learned.take_lowered().is_empty(), "300 runs in one day");
+    let mut learned = killed_once();
+    at_day(&mut learned, 30);
+    for seq in 2..102 {
+        run_success(&mut learned, seq, 500 * MIB, 16 * GIB);
+    }
+    assert!(learned.take_lowered().is_empty(), "100 runs in 30 days");
+    assert_eq!(l2_floor(&learned), 16 * GIB);
+}
+
+/// A floor that decays down to the first rung or below is reported as 0: the key keeps no
+/// floor that books less than the default.
+#[test]
+fn a_decayed_key_floor_is_never_kept_below_the_default() {
+    let mut learned = killed_once();
+    let mut kept = Vec::new();
+    let mut seq = 2;
+    for round in 1..=3 {
+        at_day(&mut learned, 8 * round);
+        for _ in 0..257 {
+            run_success(&mut learned, seq, 500 * MIB, 16 * GIB);
+            seq += 1;
+            kept.extend(learned.take_lowered().into_iter().map(|(_, _, ask)| ask));
+        }
+    }
+    // 16 -> 8 GiB is kept; 4 GiB is the default and 2 GiB is below it: nothing is kept.
+    assert_eq!(kept, vec![8 * GIB, 0, 0]);
+}
+
+/// After a decay a kill raises the floor again, and the estimator reports no lowering for
+/// it.
+#[test]
+fn a_kill_after_a_key_floor_decayed_raises_it_again() {
+    let mut learned = killed_once();
+    at_day(&mut learned, 8);
+    for seq in 2..258 {
+        run_success(&mut learned, seq, 500 * MIB, 16 * GIB);
+    }
+    assert_eq!(learned.take_lowered(), vec![(SIZE_KEY, 16 * GIB, 8 * GIB)]);
+    learned.stage(lease(300), Some(kill(None)));
+    learned.requeued(lease(300), 16 * GIB, &bounds());
+    assert_eq!(l2_floor(&learned), 16 * GIB);
+    assert!(learned.take_lowered().is_empty());
+}
+
+/// The decay is reported for the key whichever attempt of it crosses the threshold: the
+/// attempts here carry no size key of their own (an attempt whose client sized its memory
+/// is never keyed), and the floor of the keyed operation registered under the same
+/// estimator key is the one lowered.
+#[test]
+fn a_decay_caused_by_an_unkeyed_attempt_lowers_the_keyed_floor() {
+    let mut learned = killed_once();
+    // Another keyed operation under the same key, and one under another key.
+    learned.register(&key(), SIZE_KEY + 1);
+    let (other, _) = Subject::of(Described {
+        arguments: vec!["link".to_owned()],
+        ..Described::default()
+    });
+    let other = key_of("main", &linux(), Basis::Cgroup, &other).expect("a key");
+    learned.register(&other, SIZE_KEY + 2);
+    at_day(&mut learned, 8);
+    for seq in 2..258 {
+        run_success(&mut learned, seq, 500 * MIB, 16 * GIB);
+    }
+    let mut lowered = learned.take_lowered();
+    lowered.sort_unstable();
+    assert_eq!(
+        lowered,
+        vec![
+            (SIZE_KEY, 16 * GIB, 8 * GIB),
+            (SIZE_KEY + 1, 16 * GIB, 8 * GIB)
+        ]
+    );
+}
+
+/// Only `on` keeps the registry: with `shadow` a decay reports nothing.
+#[test]
+fn only_on_reports_a_decay() {
+    let mut learned = Learned::new(LearnedSizes::Shadow, 4 * GIB, EPOCH);
+    learned.register(&key(), SIZE_KEY);
+    learned.stage(lease(1), Some(kill(None)));
+    learned.requeued(lease(1), 16 * GIB, &bounds());
+    at_day(&mut learned, 8);
+    for seq in 2..258 {
+        run_success(&mut learned, seq, 500 * MIB, 16 * GIB);
+    }
+    assert_eq!(l2_floor(&learned), 8 * GIB, "the estimator still decays");
+    assert!(learned.take_lowered().is_empty());
+}
+
+/// The registry of size keys is bounded: past the cap the estimator key registered first
+/// is forgotten with its size keys, and the newest stay.
+#[test]
+fn the_registry_of_size_keys_is_bounded_and_forgets_the_oldest() {
+    let mut learned = Learned::new(LearnedSizes::On, 4 * GIB, EPOCH);
+    let shaped = |n: u64| {
+        Key::new(
+            Instance::new("main"),
+            PlatformClass::new("linux"),
+            Basis::Cgroup,
+            Shape(n),
+            None,
+        )
+    };
+    for n in 0..=STARTED_CAP as u64 {
+        learned.register(&shaped(n), n);
+    }
+    assert!(learned.named(&shaped(0)).is_empty(), "the oldest is gone");
+    assert_eq!(learned.summary_key(0), None);
+    let newest = STARTED_CAP as u64;
+    assert_eq!(learned.named(&shaped(newest)), vec![newest]);
+    assert_eq!(learned.summary_key(newest), Some(shaped(newest)));
+    assert_eq!(learned.named(&shaped(1)), vec![1]);
+}

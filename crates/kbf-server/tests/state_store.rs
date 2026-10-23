@@ -4,8 +4,8 @@
 //! The store is the in-memory fake, which keeps a durable copy a restart reopens, and
 //! the farm's clock is tokio's, paused: nothing here waits. The tests that restart the
 //! farm over its store run a second time over a real SQLite file, closed and reopened, and
-//! a third time over a real Postgres schema when `KBF_TEST_POSTGRES_URL` names a server
-//! (those are `#[ignore]`d; the `state-postgres` CI job runs them).
+//! a third time over a real Postgres schema (`KBF_TEST_POSTGRES_URL` names the server; those
+//! tests fail without it).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use kbf_proto::worker::{self, ServerMessage, server_message};
 use kbf_sched::fence::START_GRACE;
 use kbf_sched::{DaemonInstance, Request};
 use kbf_server::farm::{Reported, StreamId};
-use kbf_server::{EpochPolicy, Farm, Listeners, ServeError, StateError, StateStore};
+use kbf_server::{EpochPolicy, Farm, ID_BLOCK, Listeners, ServeError, StateError, StateStore};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::postgres::{Flaw as PgFlaw, PostgresBackend, PostgresStore};
 use kbf_state::sqlite::{Options, SqliteStore};
@@ -46,6 +46,8 @@ mod floors;
 mod handover;
 #[path = "state_store/result_ack.rs"]
 mod result_ack;
+#[path = "state_store/shared.rs"]
+mod shared;
 #[path = "state_store/subject.rs"]
 mod subject;
 #[path = "state_store/takeover.rs"]
@@ -287,9 +289,6 @@ struct Disk {
     _postgres: Option<PostgresBackend>,
 }
 
-/// The variable naming a Postgres database the tests may create and drop schemas in.
-const POSTGRES_URL: &str = "KBF_TEST_POSTGRES_URL";
-
 impl Disk {
     fn new() -> Self {
         Self::over(Backing::Fake)
@@ -306,8 +305,7 @@ impl Disk {
             Backing::Postgres => (None, None),
         };
         let postgres = (matches!(backing, Backing::Postgres)).then(|| {
-            let url = std::env::var(POSTGRES_URL)
-                .unwrap_or_else(|_| panic!("{POSTGRES_URL} must name a database to test in"));
+            let url = kbf_testkit::database::server_url();
             PostgresBackend::new(&url, PgFlaw::None)
         });
         let inner = match &postgres {
@@ -566,8 +564,8 @@ async fn after_a_kill_running_leases_are_rebound_and_undelivered_ones_requeued(b
     let regranted = starts(&mut inbox);
     assert_eq!(
         regranted,
-        [LeaseId::new(running.term, 2)],
-        "a new lease for the second only"
+        [LeaseId::new(running.term, ID_BLOCK)],
+        "a new lease for the second only, numbered in the farm's own block"
     );
     assert!(
         !accepted(&after, undelivered).await,
@@ -578,10 +576,9 @@ async fn after_a_kill_running_leases_are_rebound_and_undelivered_ones_requeued(b
     assert_eq!(disk.rows("op/"), 0);
 }
 
-/// Catches: an epoch that does not follow the policy (a SQLite start that keeps it would
-/// let a daemon keep the runs of a restored file's leases; a Postgres start that bumps
-/// it would kill every run at each frontend start), and leases granted under another
-/// term than `Welcome` names.
+/// Asserts that the epoch follows the policy a start is given (kept by one that keeps it,
+/// raised by one by one that bumps it) and that the leases are granted under the term
+/// `Welcome` names, which is the epoch.
 async fn the_epoch_follows_the_policy_and_names_the_leases(backing: Backing) {
     let mut disk = Disk::over(backing);
     let first = disk.farm(EpochPolicy::Keep);
@@ -598,7 +595,9 @@ async fn the_epoch_follows_the_policy_and_names_the_leases(backing: Backing) {
     assert_eq!(bumped.lease_epoch(), epoch + 1);
     assert_eq!(bumped.term(), epoch + 1);
     let (_, mut inbox) = register(&bumped);
-    assert_eq!(starts(&mut inbox), [LeaseId::new(epoch + 1, 0)]);
+    // Each of the three starts reserved a block of lease sequences: the third numbers its
+    // leases from the third block.
+    assert_eq!(starts(&mut inbox), [LeaseId::new(epoch + 1, 2 * ID_BLOCK)]);
 }
 
 /// Catches: a request acknowledged to its client that the store did not take (a restart
@@ -744,7 +743,7 @@ async fn a_bumped_epoch_requeues_the_old_term_leases_the_daemon_killed(backing: 
     assert_eq!(after.lease_epoch(), epoch + 1);
     let (stream, mut inbox) = register(&after);
     assert!(after.heartbeat(&node(), stream, 1, Vec::new()).await);
-    assert_eq!(starts(&mut inbox), [LeaseId::new(epoch + 1, 1)]);
+    assert_eq!(starts(&mut inbox), [LeaseId::new(epoch + 1, ID_BLOCK)]);
     assert!(!accepted(&after, old).await, "the old term's result");
     assert_eq!(disk.rows("lease/"), 1);
 }
@@ -1026,6 +1025,12 @@ async fn a_store_with_an_unreadable_row_refuses_the_farm() {
     assert!(matches!(refused, StateError::Corrupt { .. }), "{refused:?}");
 }
 
+use shared::{
+    a_second_frontend_started_over_the_store_keeps_its_epoch,
+    frontends_opening_an_empty_store_together_keep_one_epoch,
+    frontends_over_one_store_never_hand_out_the_same_id, the_operator_bump_raises_the_epoch_once,
+};
+
 /// Runs each restart test over the fake, over a SQLite file and over a Postgres schema: what the fake keeps
 /// across a crash is what the real store must.
 macro_rules! restarts {
@@ -1044,7 +1049,6 @@ macro_rules! restarts {
             }
 
             #[tokio::test(start_paused = true)]
-            #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
             async fn over_postgres() {
                 super::$name(Backing::Postgres).await;
             }
@@ -1057,6 +1061,10 @@ restarts!(
     after_a_kill_running_leases_are_rebound_and_undelivered_ones_requeued,
     the_epoch_follows_the_policy_and_names_the_leases,
     a_bumped_epoch_requeues_the_old_term_leases_the_daemon_killed,
+    frontends_over_one_store_never_hand_out_the_same_id,
+    a_second_frontend_started_over_the_store_keeps_its_epoch,
+    the_operator_bump_raises_the_epoch_once,
+    frontends_opening_an_empty_store_together_keep_one_epoch,
     lost_leases_are_counted_across_a_restart_and_the_third_is_refused,
     a_crash_at_any_write_of_a_finish_leaves_the_operation_or_its_result,
     a_crash_at_any_write_of_a_refusal_leaves_the_operation_or_its_refusal
@@ -1083,7 +1091,7 @@ fn farm_over(state: StateStore) -> TestFarm {
 /// Catches: `--state-store=sqlite:///...` parsed and then not opened (the scheduler runs
 /// in memory while the operator believes its queue is kept): an operation submitted
 /// through a farm over the flag's store is granted by the farm a restart starts over the
-/// same file, with the term a SQLite start owes (one past the first's).
+/// same file, with the term the file holds: a SQLite start keeps the epoch.
 #[tokio::test(start_paused = true)]
 async fn an_operation_submitted_over_the_flag_survives_a_restart_of_the_file() {
     let dir = Scratch::new();
@@ -1093,11 +1101,11 @@ async fn an_operation_submitted_over_the_flag_survives_a_restart_of_the_file() {
     drop(before);
 
     let after = farm_over(store_from_flag(&dir.0).expect("a second start"));
-    assert_eq!(after.lease_epoch(), epoch + 1, "every SQLite start is new");
+    assert_eq!(after.lease_epoch(), epoch, "a SQLite start moved the epoch");
     let (_, mut inbox) = register(&after);
     let leases = starts(&mut inbox);
     assert_eq!(leases.len(), 1, "the queued operation was recovered");
-    assert_eq!(leases[0].term, epoch + 1);
+    assert_eq!(leases[0].term, epoch);
 }
 
 /// Catches: a second frontend started on a state file another holds (two schedulers

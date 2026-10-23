@@ -348,11 +348,11 @@ fn a_request_that_cannot_join_has_no_pin() {
     assert_eq!(rows(&store, "op/"), 2);
 }
 
-/// Catches: a farm whose id counter is behind the store's (it never saw an operation
-/// another writer queued) that is refused for good, or that writes over the other's
-/// operation. It takes the store's next id, and its scheduler hands out ids past it.
+/// Asserts that a farm whose next id has a row in the way (an earlier writer's, which it
+/// never saw) is not refused for good and does not write over the other's operation: it
+/// takes the next id of its block, and its scheduler hands out ids past it.
 #[test]
-fn a_farm_behind_the_stores_counter_takes_the_next_id() {
+fn a_farm_whose_next_id_has_a_row_takes_the_next_id() {
     let store = LostAck::new();
     let farm = farm_over(&store);
     let other = durable_over(&store);
@@ -431,7 +431,7 @@ fn a_pin_that_lands_after_the_look_is_not_written_over() {
     let farm = farm_over(&store);
     let other = durable_over(&store);
     let landing = other
-        .submission(OperationId(5), &request(1), &subject())
+        .submission(OperationId(5), &request(1), &subject(), None)
         .expect("encode")
         .put(
             format!("inflight/6d61696e/{}", request(1).key.action),
@@ -567,15 +567,17 @@ fn a_store_that_is_down_refuses_the_submit_and_a_farm_without_one_queues() {
     assert_eq!(unfinished(&bare).len(), 1);
 }
 
-/// Catches: a submit that looks again for ever when a row stays in the way (the store's
-/// counter is stuck behind rows it holds): it gives up, refused, after a few looks, and
-/// writes nothing of its own.
+/// Asserts that a submit does not look again for ever when rows stay in the way (the ids of
+/// its block all have rows of an earlier writer): it gives up, refused, after a few looks,
+/// and writes nothing of its own.
 #[test]
 fn a_row_that_stays_in_the_way_ends_the_looks() {
     let store = LostAck::new();
     let farm = farm_over(&store);
-    let block = Txn::new().put("op/0000000000000000", Vec::new(), Cond::Any);
-    store.txn(block).expect("store").expect("put");
+    for id in 0..4 {
+        let block = Txn::new().put(format!("op/{id:016x}"), Vec::new(), Cond::Any);
+        store.txn(block).expect("store").expect("put");
+    }
 
     let refused = submit(&farm, 1);
 
@@ -627,7 +629,7 @@ fn a_submit_takes_three_conflicts_and_is_refused_at_the_fourth() {
         for id in 0..landed {
             let tag = 10 + u8::try_from(id).expect("a small id");
             let landing = other
-                .submission(OperationId(id), &request(tag), &subject())
+                .submission(OperationId(id), &request(tag), &subject(), None)
                 .expect("encode");
             store.before_submit.lock().expect("lock").push_back(landing);
         }
