@@ -15,6 +15,9 @@ kbf-outputs.workspace = true
 kbf-proto.workspace = true
 kbf-types.workspace = true
 libc.workspace = true
+# `hdiutil info -plist`, read by the clean and the assertion of a lease-user pool slot
+# (src/slots/assertion.rs).
+plist.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 rustix = { workspace = true, features = ["fs", "process"] }
@@ -23,11 +26,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "process", "rt", "sync", "time"] }
 tracing.workspace = true
-
-# `hdiutil info -plist` and `dscl -plist`, read by the clean of a lease-user pool slot
-# (src/slots/macos/host.rs).
-[target.'cfg(target_os = "macos")'.dependencies]
-plist.workspace = true
 
 [dev-dependencies]
 # What the tests run as actions and as fake Xcode tools: kbf-testkit's act verbs and

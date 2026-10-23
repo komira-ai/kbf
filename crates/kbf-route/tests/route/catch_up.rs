@@ -68,7 +68,7 @@ async fn farm(r: u8, members: Vec<Member>) -> (Router, Arc<Node>, Arc<Node>, Arc
 /// first), the read is served by the other owner and FindMissing does not call the blob
 /// missing; the rebuilding node was asked both times. With the map saying CatchingUp,
 /// the same holds. With R = 1 and the rebuilding node the only owner, the read is
-/// UNAVAILABLE, not NOT_FOUND, and FindMissing is UNAVAILABLE, not a miss. Mutants (in
+/// UNAVAILABLE, not NOT_FOUND, and FindMissing is UNAVAILABLE, not a miss. Catches (in
 /// the service): the gate removed (FindMissing calls the blob missing; the R = 1 read is
 /// NOT_FOUND); a gate that drops only the missed digests from FindMissing (the R = 1
 /// FindMissing answers "held").

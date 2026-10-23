@@ -526,7 +526,7 @@ fn a_row_never_takes_an_instance_name_the_record_does_not_hold() {
     assert!(!inv.complete());
 }
 
-/// Catches (security; mutant "a new row skips the check"): a new row of an instance
+/// Catches (security; defect "a new row skips the check"): a new row of an instance
 /// name the record could not take. The call's name and its first `tool` do not fit
 /// together, while its row alone does, so the record leaves the name out (the bound
 /// closes the larger open record `big` to rows, not this one) and would have added a
@@ -558,7 +558,7 @@ fn a_new_row_of_a_name_the_record_could_not_take_is_not_added() {
     assert!(!inv.complete());
 }
 
-/// Catches (security; mutant "count before the admit check"): a call whose instance
+/// Catches (security; defect "count before the admit check"): a call whose instance
 /// name the record could not take still applied to it. The name's bytes do not fit,
 /// while an operation and its waiter do; the call must change none of the counts,
 /// `last_seen`, the state (no operation in flight) or the operations held, and the

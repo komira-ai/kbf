@@ -379,7 +379,7 @@ fn the_table_names_every_served_method() {
     assert_eq!(table, served_methods());
 }
 
-/// Catches (per method, the planted mutant "a method skips the authorizer"): a method
+/// Catches (per method: "a method skips the authorizer"): a method
 /// that serves the call without asking its authorizer, and one that asks another
 /// authorizer than the one documented for it. With only its slot denying, each method
 /// is refused by authorization; with every other slot denying, it is not.

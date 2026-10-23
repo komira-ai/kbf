@@ -206,8 +206,7 @@ pub enum DecodeError {
     #[error("malformed entry: {0}")]
     Malformed(#[from] prost::DecodeError),
     /// A `oneof` is unset: a command or variant this binary does not know. [`decode`]
-    /// reads such an entry as [`LogCommand::Unknown`] and never returns this; a host
-    /// uses it to say why it stopped on an entry.
+    /// reads such an entry as [`LogCommand::Unknown`] and never returns this.
     #[error("{0} names no command or variant this binary knows")]
     UnknownCommand(&'static str),
     /// An enum value that is unspecified or that this binary does not know. [`decode`]

@@ -250,7 +250,7 @@ async fn released_with_a_leaked_clone_ends_at_the_limit_and_counts_the_handles()
 /// locked, on every run: a hook on the dropping thread, just before the unlock, polls the
 /// wait registered earlier, starts a fresh wait and tries the directory. Both waits must be
 /// pending and the directory must still refuse a second open; after the drop the first
-/// wait is over and the open works. Mutants: `Inner::drop` sets the flag before the unlock
+/// wait is over and the open works. Catches: `Inner::drop` sets the flag before the unlock
 /// (the fresh wait sees it), opens and wakes before it (both see it), or wakes before the
 /// unlock and sets the flag after (the registered wait looks, sleeps again and is never
 /// woken: it ends at its limit).
@@ -363,7 +363,7 @@ fn a_second_open_is_refused_until_the_first_store_closes() {
 /// every time. A clone is held across the fork too: the directory is unlocked when the
 /// last handle goes, not before.
 ///
-/// Mutant: the `Drop` of `DirLock` removed: `Locked` from the reopen.
+/// Catches: the `Drop` of `DirLock` removed: `Locked` from the reopen.
 #[test]
 fn a_child_forked_while_the_store_was_open_does_not_keep_the_dir_locked_after_the_drop() {
     let dir = scratch("lock-forked");
@@ -597,7 +597,7 @@ fn an_open_that_cannot_create_the_directory_says_where() {
 const GIB: u64 = 1 << 30;
 
 /// Catches a default floor that is not the file system's 5%, at least 1 GiB, never
-/// more than the file system (mutants: `Floor::KeepFree` a fixed 1 GiB, or any rule
+/// more than the file system (defects: `Floor::KeepFree` a fixed 1 GiB, or any rule
 /// but `kbf_threads::disk::keep_free`, which the daemon's caches keep too; there, no
 /// minimum, a percentage other than 5, the cap dropped), and a store that reads it
 /// from anywhere but its space source or
@@ -648,7 +648,7 @@ async fn keep_free_is_5_percent_and_at_least_1_gib() {
     drop(store);
 }
 
-/// Catches a refused write that wakes no evictor (mutant: no notify in the floor
+/// Catches a refused write that wakes no evictor (defect: no notify in the floor
 /// check), so a full store waits for the evictor's next tick while every upload fails:
 /// a waiter on `refused_full` wakes at the refusal, and a refusal with no one waiting
 /// yet wakes the next waiter at once. A stored write wakes no one.
@@ -693,7 +693,7 @@ async fn a_refused_write_wakes_refused_full() {
 }
 
 /// Catches a fake file system for eviction tests that does not count the store's own
-/// files as used (mutant: nothing counted): what it reports free is
+/// files as used (defect: nothing counted): what it reports free is
 /// its size less every object file's bytes, headers included, and a deleted file
 /// gives its bytes back.
 #[tokio::test]

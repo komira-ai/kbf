@@ -111,7 +111,7 @@ pub struct Topology {
     pub daemons: usize,
     pub driver: Driver,
     pub limits: Limits,
-    /// Flags to set on one role after everything else (a mutant's, or a test's).
+    /// Flags to set on one role after everything else (a fault's, or a test's).
     pub overrides: Vec<(Role, Vec<String>)>,
     /// The `kbf` to run for a role in place of [`Bins::kbf`]: an older release's, for a farm
     /// of two versions. A role not listed runs [`Bins::kbf`].

@@ -35,6 +35,7 @@ fn copy_inputs(dir: &Path) {
     for file in [
         "sysusers.d/kbf-installer.conf",
         "tmpfiles.d/kbf-installer.conf",
+        "needrestart/kbf.conf",
     ] {
         std::fs::copy(packaging.join(file), dir.join(file.replace('/', "-"))).expect("copy");
     }
@@ -69,6 +70,8 @@ fn config(dir: &Path, version: &str) -> Output {
         s(&dir.join("sysusers.d-kbf-installer.conf")),
         "--tmpfiles",
         s(&dir.join("tmpfiles.d-kbf-installer.conf")),
+        "--needrestart",
+        s(&dir.join("needrestart-kbf.conf")),
         "--platform",
         "linux-x86_64",
         "--version",
@@ -188,6 +191,8 @@ fn pkg_config_takes_the_version_from_the_binary_or_from_the_flag_and_not_both() 
             s(&dir.join("sysusers.d-kbf-installer.conf")).to_owned(),
             "--tmpfiles".to_owned(),
             s(&dir.join("tmpfiles.d-kbf-installer.conf")).to_owned(),
+            "--needrestart".to_owned(),
+            s(&dir.join("needrestart-kbf.conf")).to_owned(),
             "--platform".to_owned(),
             "linux-x86_64".to_owned(),
             "--out".to_owned(),

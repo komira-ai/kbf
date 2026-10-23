@@ -60,6 +60,24 @@ jobs:
       - name: Usage of a lease run as a pool user (root, real users)
         run: cargo xtask sudo-test -p kbf-driver-native --test slots -- usage --test-threads=1 --nocapture
 
+  # A descriptor another thread opens while a program is being started must not reach it
+  # (crates/kbf-installer/src/run.rs, the sweep in the child). The race test, then the fetch
+  # end-to-end test that once saw a stray descriptor, 20 times over.
+  child-descriptors:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: Descriptors of the child, in the run module
+        run: cargo test -p kbf-installer --locked --lib -- run::tests --nocapture
+
   pool-spike:
     runs-on: macos-latest
     timeout-minutes: 45
@@ -162,6 +180,25 @@ jobs:
       - run: rustup toolchain install
       - name: The profile canaries and the weakened profiles, on real users (root)
         run: cargo xtask sudo-test -p kbf-driver-native --test slot_canary -- --test-threads=1 --nocapture
+
+  # The assertion that a pool user holds nothing a lease left
+  # (crates/kbf-driver-native/tests/slot_assert.rs): a clean user is green at every look,
+  # and each probe is red on the state planted for it and green after the clean. The same
+  # command as the native-macos-assert job of beta.yml runs after a push to main.
+  slot-assert:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: The assertion and its positive controls, on real users (root)
+        run: cargo xtask sudo-test -p kbf-driver-native --test slot_assert -- --test-threads=1 --nocapture
 
   # kbf-mac-provision on a real Mac, as root (crates/kbf-mac-provision/tests/as_root.rs), with
   # the pool test that feeds `dscl .` a batch on standard input and reads `dscl -readall`. The

@@ -205,7 +205,7 @@ fn a_bare_process_exit_leaves_running_which_is_not_a_pass() {
     assert!(!d.passed());
 }
 
-/// Catches `fail_and_exit` that exits without writing (a `process::exit` mutant): the child
+/// Catches `fail_and_exit` that exits without writing (a `process::exit` defect): the child
 /// must exit with its code and leave FINISHED, red, with the reason.
 #[test]
 fn fail_and_exit_writes_finished_red_then_exits_with_the_code() {

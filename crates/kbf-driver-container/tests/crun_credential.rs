@@ -36,7 +36,7 @@ const SCRIPT: &str = "echo \"env: ${AWS_ACCESS_KEY_ID:-unset} ${AWS_SECRET_ACCES
         2>/dev/null | wc -l";
 
 /// Catches the key in the action's environment (the "start `crun` with the key"
-/// mutant: the key's variables are set in this process, which is the daemon's, and the
+/// catches: the key's variables are set in this process, which is the daemon's, and the
 /// action must not see them), and the key file reachable by the action: the key's file
 /// is mode `0600` and the daemon's, so it could not be read, and a search of the container's
 /// directories for the secret finds nothing. The control, a

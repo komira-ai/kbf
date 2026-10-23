@@ -37,10 +37,10 @@ fn routes(id: &str, action: &str) -> Vec<String> {
     .collect()
 }
 
-/// Catches (mutant "default allow": `InvocationReaders::from_policy` answering with an
+/// Catches (defect "default allow": `InvocationReaders::from_policy` answering with an
 /// `allow` when the policy names no `invocations.getAuthorizer`): any route answering
 /// without a policy file, with a policy that names other keys, or with `blobs` only;
-/// and a route not answering once the key is named. And (mutant "4.10's body for a
+/// and a route not answering once the key is named. And (defect "4.10's body for a
 /// route that is off") an off route's `404` without `"off": "invocations"`, or with
 /// the `no_record` body that means "no record of your build". The rest of the API
 /// answers either way.
@@ -90,7 +90,7 @@ async fn the_pages_are_off_unless_the_policy_names_their_authorizer() {
     }
 }
 
-/// Catches (mutant "href ignores the blob route": `Builder::href` linking with the
+/// Catches (defect "href ignores the blob route": `Builder::href` linking with the
 /// route off): a page linking `/v1/blobs` when the policy names `invocations` but no
 /// `blobs` key, where that route answers `404`; and (with both keys) links that are
 /// missing, or that the blob route does not answer with the blob's bytes, stdout as
@@ -151,7 +151,7 @@ async fn hrefs_are_null_without_the_blobs_key_and_resolve_with_it() {
     }
 }
 
-/// Catches (mutant "ask about the first instance only": the authorizer asked with
+/// Catches (defect "ask about the first instance only": the authorizer asked with
 /// `names[..1]`): a page served to a caller allowed on one of the invocation's
 /// instance names but not another; and a page refused to a caller allowed on all.
 /// Every route of the invocation is refused, `403`.
@@ -306,7 +306,7 @@ async fn a_name_without_an_answer_is_refused_and_so_is_an_unknown_caller() {
     server.stop().await;
 }
 
-/// Catches (mutants "skip the id check": any text taken as a key; and "percent-decode
+/// Catches (defects "skip the id check": any text taken as a key; and "percent-decode
 /// the path": `%6Fk` read as `ok`): a record served for an `{id}` that is not, as the
 /// bytes of the path, an id of section 2.2 or `<id>~<n>` (`<`, `%3C`, a `/` that makes
 /// another route). The records `a<b`, `a%3Cb`, `.` and `-x` are fed directly (the

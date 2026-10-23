@@ -171,7 +171,8 @@ fn a_package_that_is_not_the_attested_one_names_each_difference() {
     // is not the pinned bytes, a trusted root that is not JSON lines, a property list
     // that starts without its gate, a state directory open to others, files and
     // directories nobody listed, bytes in the state directory, the wrong commit in the
-    // version, and a wrong mode on the binary or on gh. Each is a mutant of the good package.
+    // version, and a wrong mode on the binary or on gh. Each is a broken variant of the good
+    // package.
     let case = |what: &str, f: &dyn Fn(&mut Parts), want: &str| {
         let mut parts = Parts::good();
         f(&mut parts);

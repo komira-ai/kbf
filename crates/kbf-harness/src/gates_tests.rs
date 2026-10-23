@@ -111,7 +111,7 @@ fn failed(run: &Run) -> Vec<String> {
 
 #[test]
 fn a_healthy_run_passes_every_gate() {
-    // Catches: a control that is red already, which would make every planted defect
+    // Catches: a control that is red already, which would make every broken run
     // below go red for the wrong reason.
     let run = pass();
     assert_eq!(failed(&run), Vec::<String>::new());
@@ -454,7 +454,7 @@ fn detail(run: &Run, name: &str) -> String {
 #[test]
 fn a_counter_that_falls_is_red_whatever_the_ends_say() {
     // Catches: a counter that went down (a restarted process: its counts began again from
-    // zero) read as "nothing happened". Mutants: the verdict `measured == 0.0` becomes
+    // zero) read as "nothing happened". Catches: the verdict `measured == 0.0` becomes
     // `<= 0.0` (a delta of -5 passes), or the fall is not looked for (the ends of
     // [5, ..., 5, 0, 5] agree, and so do a spike's: 0, 5, 0).
     let mut run = pass();
@@ -488,7 +488,7 @@ fn a_counter_that_falls_is_red_whatever_the_ends_say() {
 #[test]
 fn a_gauge_below_zero_is_not_zero() {
     // Catches: the verdict read as "not above zero": a lost-blob gauge of -1 is not a
-    // healthy reading but a defect of what exports it. Mutant: `measured == 0.0` becomes
+    // healthy reading but a defect of what exports it. Catches: `measured == 0.0` becomes
     // `<= 0.0` in `nodes_gate`.
     let mut run = pass();
     for s in &mut run.nodes[1].1.samples {
@@ -501,7 +501,7 @@ fn a_gauge_below_zero_is_not_zero() {
 fn a_counter_is_judged_by_its_last_reading_less_its_first() {
     // Catches: the first reading taken from the second scrape (a rise between the first two
     // scrapes, 0 then 7, hides) and the last taken from before the end; the existing delta
-    // tests change the last reading alone. Mutants: `v[0]` -> `v[1]`, `v[len - 1]` ->
+    // tests change the last reading alone. Catches: `v[0]` -> `v[1]`, `v[len - 1]` ->
     // `v[len - 2]` in `counter_delta`.
     let mut run = pass();
     execute_errors(
@@ -538,7 +538,7 @@ fn a_reading_that_is_not_a_finite_number_is_red() {
     // Catches: NaN and infinities passing by accident of comparison (`NaN == 0.0` is false
     // today, but `f64::max` skips a NaN, so the gauge's maximum would not see one, and a
     // difference of two infinities is NaN). Each is red, in the middle of a series as at its
-    // ends, with the reason. Mutant: `series` accepts every `f64`.
+    // ends, with the reason. Catches: `series` accepts every `f64`.
     for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         for at in [0, 5, 10] {
             let mut run = pass();
@@ -563,7 +563,7 @@ fn a_reading_that_is_not_a_finite_number_is_red() {
 #[test]
 fn the_scrape_coverage_threshold_is_inclusive_at_the_boundary() {
     // Catches: a threshold off by one in either direction. Nine scrapes of ten tries in a
-    // ten-second load are exactly 0.9: a pass; nine of eleven are 0.82: a fail. Mutant:
+    // ten-second load are exactly 0.9: a pass; nine of eleven are 0.82: a fail. Catches:
     // `coverage >= MIN_SCRAPE_COVERAGE` becomes `>`.
     assert!((MIN_SCRAPE_COVERAGE - 0.9).abs() < f64::EPSILON);
     let mut run = pass();
@@ -579,7 +579,7 @@ fn the_scrape_coverage_threshold_is_inclusive_at_the_boundary() {
     assert_eq!(failed(&run), ["scrape_coverage"]);
 }
 
-/// A run in which the gate `name`, and only it, fails: the planted defect for each gate.
+/// A run in which the gate `name`, and only it, fails: the broken run for each gate.
 /// A gate that is added without a case here fails [`every_gate_has_a_case_that_fails_it_alone`].
 fn broken(name: &str) -> Run {
     let mut run = pass();
@@ -610,10 +610,10 @@ fn broken(name: &str) -> Run {
 
 #[test]
 fn every_gate_has_a_case_that_fails_it_alone() {
-    // Catches: a gate that is never seen red, the kind that cannot fail: every gate the
-    // evidence produces must name a planted defect (`broken`) that turns it, and nothing
+    // Catches: a gate that never fails, the kind that cannot fail: every gate the
+    // evidence produces must name a broken run (`broken`) that turns it, and nothing
     // else, red; the control (`pass`) is green. A gate added without its case fails here.
-    // Mutant: any gate's verdict made constant `PASS` (or its row dropped, which the count
+    // Catches: any gate's verdict made constant `PASS` (or its row dropped, which the count
     // in `a_healthy_run_passes_every_gate` also sees).
     let names: Vec<String> = gates(&pass()).into_iter().map(|g| g.name).collect();
     let mut seen = std::collections::BTreeSet::new();

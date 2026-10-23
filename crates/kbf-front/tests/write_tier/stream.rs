@@ -41,7 +41,7 @@ async fn a_streamed_record_is_staged_read_back_and_flushed() {
     assert_eq!(farm.store.put_keys().len(), 1);
 }
 
-/// Catches a stream that ends unchecked (mutants: the length check, the CRC-32C check
+/// Catches a stream that ends unchecked (defects: the length check, the CRC-32C check
 /// skipped): a digest naming one byte more than was written, the stream ended short of
 /// what it was made for, and a CRC-32C other than the bytes' are each refused as
 /// invalid, and nothing is stored.

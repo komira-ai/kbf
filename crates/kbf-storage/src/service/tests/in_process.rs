@@ -48,7 +48,7 @@ fn is_stale<T>(answer: &Result<T, StorageError>, current: u64) -> bool {
 /// A blob the node holds is answered without a second store, and one of more than a
 /// chunk (two messages) is stored whole.
 ///
-/// Mutants: `put` calling the inner storage (no check: the stale write lands); the check
+/// Catches: `put` calling the inner storage (no check: the stale write lands); the check
 /// removed from the write body; the generation read from the wrong field (the current
 /// write is refused).
 #[tokio::test]
@@ -238,7 +238,7 @@ async fn a_write_stream_that_fails_answers_with_its_own_status() {
 /// caller behind the node is STALE_MAP, and the same calls at the node's generation are
 /// the store's own answers.
 ///
-/// Mutants: the check removed from any one call (that call answers under generation 3).
+/// Catches: the check removed from any one call (that call answers under generation 3).
 #[tokio::test]
 async fn every_call_is_judged_by_the_generation_the_caller_names() {
     let mem = Arc::new(Mem::default());
@@ -385,7 +385,7 @@ async fn the_segments_handlers_are_judged_too() {
 /// is done the same calls are the store's own answers: NOT_FOUND, the digest listed, no entry,
 /// the Absent refusal.
 ///
-/// Mutants: the in-process read of either kind skipping the catch-up rule (NOT_FOUND comes
+/// Catches: the in-process read of either kind skipping the catch-up rule (NOT_FOUND comes
 /// back); FindMissing, the action lookup, or the write refusal skipping it; a rule applied
 /// after the rebuild is done.
 #[tokio::test]

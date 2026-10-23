@@ -86,7 +86,7 @@ fn each_key_of_the_file_replaces_its_default() {
 /// would be an option to `gh`), a list with no ref, and the unprivileged user being root
 /// by uid or by gid.
 ///
-/// Mutants seen red: the repeated-key check dropped; root accepted as the user.
+/// Catches: the repeated-key check dropped; root accepted as the user.
 #[test]
 fn a_settings_file_is_closed_and_strict() {
     let cases = [
@@ -128,7 +128,7 @@ fn a_settings_file_is_closed_and_strict() {
 /// same chain as `gh` (owner, mode), a symlink in its place is refused, and so is a
 /// directory.
 ///
-/// Mutant seen red: the trust check on the file skipped.
+/// Catches: the trust check on the file skipped.
 #[test]
 fn a_settings_file_others_could_write_is_refused() {
     for (mode, uid, want) in [
@@ -214,7 +214,7 @@ fn wanted(names: &[&str]) -> Vec<String> {
 /// Catches a narrowing that replaces the list with the file's (a ref the package never
 /// allowed would be believed), and one that reorders it.
 ///
-/// Mutants planted: the retain replaced by the file's refs; the retain made a no-op.
+/// Catches: the retain replaced by the file's refs; the retain made a no-op.
 #[test]
 fn installer_toml_narrows_the_refs_and_never_adds_one() {
     let conf = allowing(&[
@@ -244,7 +244,7 @@ fn installer_toml_narrows_the_refs_and_never_adds_one() {
 /// refuse every release), and a file that names only refs the package does not allow
 /// leaving the list as it was, or widening it.
 ///
-/// Mutants planted: the empty case dropped (everything retained away); the empty result
+/// Catches: the empty case dropped (everything retained away); the empty result
 /// returned as `Ok`.
 #[test]
 fn an_empty_source_refs_narrows_nothing_and_a_disjoint_one_is_refused() {

@@ -252,7 +252,7 @@ fn running_on_a() -> (Farm, StartLease) {
 
 /// Catches a proven restart that waits for the handover grace like any other (the
 /// fast path missing: buck2 waits 45 s for the farm), a rerun placed on the node it
-/// was lost on while another can run it (the "avoid ignored" mutant), and a give-up
+/// was lost on while another can run it (the "avoid ignored" defect), and a give-up
 /// not charged to the farm budget. Process `a2` registers naming its predecessor
 /// stopped; its first heartbeat, which lists nothing, gives the lease up at once.
 #[test]
@@ -294,7 +294,7 @@ fn a_restart_without_proof_waits_for_the_handover_grace() {
     );
 }
 
-/// Catches a proof that clears every earlier process at once (the mutant "handover
+/// Catches a proof that clears every earlier process at once (the defect "handover
 /// ends now"): process 2 proves process 1 stopped, not process 0, which may still run
 /// on another machine (a cloned disk). Only the lease of process 1 goes at once.
 #[test]
@@ -325,7 +325,7 @@ fn a_proof_covers_the_named_predecessor_only() {
     assert_eq!(f.requeues(), [RequeueReason::Replaced]);
 }
 
-/// Catches the requeue done when the restarted daemon registers (the mutant "requeue
+/// Catches the requeue done when the restarted daemon registers (the defect "requeue
 /// at `WorkerUp`"): a whole-machine lease whose daemon restarted mid-action is still
 /// held, its phase `Restoring`, and its `Start` goes to the new process, which runs
 /// the restore. Giving it up before the phase is taken would place it again while the
@@ -358,7 +358,7 @@ fn a_restoring_whole_machine_lease_survives_a_proven_restart() {
     ));
 }
 
-/// Catches lost results not charged to the budget (the mutant: they would rerun for
+/// Catches lost results not charged to the budget (the defect: they would rerun for
 /// ever), an off-by-one in it (`<` for `<=`: answered after 2 runs, or after 4), and an
 /// answer that does not carry the runs. Three lost runs end the operation with the
 /// third's failure; two lost runs and then an OK one end it completed, the answer
@@ -398,7 +398,7 @@ fn three_lost_runs_use_up_the_budget_and_two_do_not() {
     assert_eq!(answer.farm_runs, [restarted("a"), restarted("b")]);
 }
 
-/// Catches a second counter for lost runs beside the busy-node one (the mutant: a
+/// Catches a second counter for lost runs beside the busy-node one (the defect: a
 /// busy node's kill and two lost runs would run 4 times): one budget, shared.
 #[test]
 fn busy_node_kills_and_lost_runs_share_one_budget() {
@@ -423,7 +423,7 @@ fn busy_node_kills_and_lost_runs_share_one_budget() {
     );
 }
 
-/// Catches `avoid` as a hard exclusion (the mutant: a one-node farm would never run
+/// Catches `avoid` as a hard exclusion (the defect: a one-node farm would never run
 /// the operation again) and `avoid` ignored (the rerun on the node it was lost on
 /// while another can run it).
 #[test]
@@ -643,7 +643,7 @@ impl Sim {
     }
 }
 
-/// Catches a run the farm could not do finishing its operation at once (the mutant:
+/// Catches a run the farm could not do finishing its operation at once (the defect:
 /// `Failure::Infra` answered on the first run), a budget off by one (`<` for `<=`:
 /// answered after 2 runs, or after 4), a rerun placed on the node it failed on while
 /// others fit, and an answer that does not carry the runs. Three infra results end the
@@ -683,7 +683,7 @@ fn three_infra_results_use_up_the_budget_and_two_do_not() {
 }
 
 /// Catches a node that goes silent with the lease every time holding an operation for
-/// ever (the mutant: silence requeues without charge), and an answer that does not
+/// ever (the defect: silence requeues without charge), and an answer that does not
 /// carry the runs. Three silent nodes in turn end the operation, answered as lost to a
 /// fence (the node's own fence ended the run within the grace), naming all three.
 #[test]
@@ -715,7 +715,7 @@ fn silent_nodes_use_up_the_budget_and_the_operation_is_answered() {
     assert!(f.s.state(start.operation).is_some_and(OpState::is_done));
 }
 
-/// Catches a replacement without proof outside the budget (the mutant: `Replaced`
+/// Catches a replacement without proof outside the budget (the defect: `Replaced`
 /// requeues without charge): a daemon process that keeps being replaced would hold the
 /// operation for ever. The third run is given up as replaced and answers the operation
 /// as a fenced run.
@@ -743,7 +743,7 @@ fn a_replacement_past_the_budget_answers_the_operation() {
     assert!(Farm::starts(&effects).is_empty(), "{effects:?}");
 }
 
-/// Catches one counter per fault kind (the mutant: silence and infra results counted
+/// Catches one counter per fault kind (the defect: silence and infra results counted
 /// apart from lost runs would allow 6 runs): a lost run, an infra result and a silence
 /// are one budget, so the third ends the operation, and the answer lists them in order.
 #[test]
@@ -805,7 +805,7 @@ const fn is_the_users(failure: Failure) -> bool {
     }
 }
 
-/// Catches the budget widened to failures that are not the farm's (the mutant: every
+/// Catches the budget widened to failures that are not the farm's (the defect: every
 /// `Failure` charged, or the `Infra` check widened to a user's failure): the user's
 /// action failing (timeout), an action that cannot run as written, and a missing input
 /// are answered by their first run, with no farm run and no requeue. Every [`Failure`]

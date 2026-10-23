@@ -348,11 +348,11 @@ fn a_request_that_cannot_join_has_no_pin() {
     assert_eq!(rows(&store, "op/"), 2);
 }
 
-/// Catches: a farm whose id counter is behind the store's (it never saw an operation
-/// another writer queued) that is refused for good, or that writes over the other's
-/// operation. It takes the store's next id, and its scheduler hands out ids past it.
+/// Asserts that a farm whose next id has a row in the way (an earlier writer's, which it
+/// never saw) is not refused for good and does not write over the other's operation: it
+/// takes the next id of its block, and its scheduler hands out ids past it.
 #[test]
-fn a_farm_behind_the_stores_counter_takes_the_next_id() {
+fn a_farm_whose_next_id_has_a_row_takes_the_next_id() {
     let store = LostAck::new();
     let farm = farm_over(&store);
     let other = durable_over(&store);
@@ -506,6 +506,17 @@ fn a_joined_operation_keeps_its_losses_and_fate() {
             .submit(OperationId(0), &request(1), &subject())
             .is_ok()
     );
+    let start = kbf_types::StartLease {
+        worker: kbf_types::WorkerId::new("node-a"),
+        lease: kbf_types::LeaseId::new(5, 0),
+        operation: OperationId(0),
+        key: request(1).key,
+        kind: LeaseKind::Action,
+        resources: Resources::new(1_000, 1 << 30),
+        fence: kbf_types::FencePolicy::RunOn,
+        device: None,
+    };
+    other.persist(&[Effect::Start(start)], None).expect("grant");
     let requeue = kbf_sched::Requeue {
         operation: OperationId(0),
         lease: kbf_types::LeaseId::new(5, 0),
@@ -532,13 +543,24 @@ fn a_joined_operation_keeps_its_losses_and_fate() {
     assert_eq!(state.sched.fate(OperationId(0)), Some(fate));
 }
 
-/// Catches: a finish of an operation whose rows are gone (a retry of a finish that
-/// landed) failing for want of a pin to look up.
+/// Asserts that a finish of an operation whose rows are gone (a retry of a finish that
+/// landed) is acknowledged without a pin to look up, and writes nothing more: the result
+/// of the first try stands.
 #[test]
-fn finishing_an_operation_with_no_rows_writes_its_result_alone() {
+fn finishing_an_operation_with_no_rows_writes_nothing_more() {
     let store = LostAck::new();
     let durable = durable_over(&store);
+    assert!(
+        durable
+            .submit(OperationId(7), &request(1), &subject())
+            .is_ok()
+    );
     refuse(&durable, 7);
+    let txns = store.commit_stats().txns;
+
+    refuse(&durable, 7);
+
+    assert_eq!(store.commit_stats().txns, txns);
     assert_eq!(rows(&store, "inflight/"), 0);
     assert_eq!(rows(&store, "done/"), 1);
 }
@@ -567,15 +589,17 @@ fn a_store_that_is_down_refuses_the_submit_and_a_farm_without_one_queues() {
     assert_eq!(unfinished(&bare).len(), 1);
 }
 
-/// Catches: a submit that looks again for ever when a row stays in the way (the store's
-/// counter is stuck behind rows it holds): it gives up, refused, after a few looks, and
-/// writes nothing of its own.
+/// Asserts that a submit does not look again for ever when rows stay in the way (the ids of
+/// its block all have rows of an earlier writer): it gives up, refused, after a few looks,
+/// and writes nothing of its own.
 #[test]
 fn a_row_that_stays_in_the_way_ends_the_looks() {
     let store = LostAck::new();
     let farm = farm_over(&store);
-    let block = Txn::new().put("op/0000000000000000", Vec::new(), Cond::Any);
-    store.txn(block).expect("store").expect("put");
+    for id in 0..4 {
+        let block = Txn::new().put(format!("op/{id:016x}"), Vec::new(), Cond::Any);
+        store.txn(block).expect("store").expect("put");
+    }
 
     let refused = submit(&farm, 1);
 

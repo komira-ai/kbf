@@ -27,7 +27,7 @@ fn row(html: &str, heading: &str, id: u64) -> String {
 /// Catches: a page missing a part. The replication answer (the number, the debts, the
 /// reasons), the member table (state, report freshness, debts, open writes, generation)
 /// and every one of the seven heartbeat values of the write-tier table, each in its
-/// unit. Mutants: the reasons list dropped; the used column written from the budget;
+/// unit. Catches: the reasons list dropped; the used column written from the budget;
 /// the flush counters swapped.
 #[test]
 fn the_page_shows_the_replication_the_members_and_the_write_tier() {
@@ -65,7 +65,7 @@ fn the_page_shows_the_replication_the_members_and_the_write_tier() {
 /// report says nothing shows "unknown" in every value cell (and the number of
 /// under-replicated blobs is "unknown", with no zero in the answer's words); a member that
 /// reports real zeros shows `0`, `0 B` and `0 ms`; and a known zero is the green answer,
-/// not the unknown one. Mutants: `null` rendered as `0`; zero rendered as unknown.
+/// not the unknown one. Catches: `null` rendered as `0`; zero rendered as unknown.
 #[test]
 fn null_is_unknown_never_zero_and_a_real_zero_stays_zero() {
     let (_, html) = page_of(&storage_doc());
@@ -113,7 +113,7 @@ fn null_is_unknown_never_zero_and_a_real_zero_stays_zero() {
 
 /// Catches: a stale report not marked as stale. The API's own lists decide: a silent
 /// member is "stale", one that cannot say is "cannot say", one that is not active is
-/// "not judged", and only an active member in none of them is "fresh". Mutant: the
+/// "not judged", and only an active member in none of them is "fresh". Catches: the
 /// silent list ignored, so a stale member reads fresh; "fresh" given to every member.
 #[test]
 fn a_stale_report_is_marked_in_words() {
@@ -158,7 +158,7 @@ fn a_stale_report_is_marked_in_words() {
 
 /// Catches: a member's state shown by colour alone, and a planned-down member shown as
 /// merely down. Every state is words in its pill; `planned_down` adds "(planned)".
-/// Mutant: the planned suffix dropped.
+/// Catches: the planned suffix dropped.
 #[test]
 fn a_state_is_in_words_and_a_planned_down_is_said() {
     let mut down = storage_node_unknown(2, "down");
@@ -176,7 +176,7 @@ fn a_state_is_in_words_and_a_planned_down_is_said() {
 
 /// Catches: an attacker-influenced string written as markup. A member state and a reason
 /// carry `<script>`, quotes and `&`; they reach the page as text, and no element they name
-/// exists. Mutant: a reason written through a raw write (none exists, so the mutant is a
+/// exists. Catches: a reason written through a raw write (none exists, so the defect is a
 /// reason written unescaped by hand in the page, which this assertion sees).
 #[test]
 fn hostile_strings_reach_the_page_as_text() {
@@ -200,7 +200,7 @@ fn hostile_strings_reach_the_page_as_text() {
 /// Catches: a document the page cannot read passing as an empty or zero page, and an
 /// API failure losing its status. A member id that is not a number is `502` with the
 /// reason as escaped text; the API's `404` (no state store) and `503` (membership
-/// unreadable) are the page's own status, with the error text. Mutant: a failed read
+/// unreadable) are the page's own status, with the error text. Catches: a failed read
 /// answered `200`.
 #[test]
 fn a_failed_or_unreadable_read_is_the_pages_status() {
@@ -225,7 +225,7 @@ fn a_failed_or_unreadable_read_is_the_pages_status() {
 }
 
 /// Catches: a farm with no member shown as a table of nothing or as healthy. It says no
-/// member is registered, and the under-replicated number is unknown. Mutant: the empty
+/// member is registered, and the under-replicated number is unknown. Catches: the empty
 /// case writing the table head only.
 #[test]
 fn a_farm_with_no_member_says_so() {
@@ -246,7 +246,7 @@ fn a_farm_with_no_member_says_so() {
 
 /// Catches: tables an assistive reader cannot navigate. Each table has column headers
 /// with `scope="col"`, each row a row header, and the page has the one `h1` and the
-/// section headings. Mutant: the row header written as a plain cell.
+/// section headings. Catches: the row header written as a plain cell.
 #[test]
 fn the_tables_have_headers_and_the_page_has_headings() {
     let a = render(&storage_farm(), "/ui/storage");
@@ -261,7 +261,7 @@ fn the_tables_have_headers_and_the_page_has_headings() {
 }
 
 /// Catches: a page nobody can reach. The Overview lists it, every page's navigation links
-/// it, and the path routes to it (a neighbouring path does not). Mutants: the Overview
+/// it, and the path routes to it (a neighbouring path does not). Catches: the Overview
 /// entry dropped; the route dropped (the page is a 404).
 #[test]
 fn the_page_is_reachable_from_the_overview_and_the_navigation() {
@@ -282,7 +282,7 @@ fn the_page_is_reachable_from_the_overview_and_the_navigation() {
 }
 
 /// Catches: an age written in the wrong unit at a boundary. Milliseconds below a second,
-/// seconds below a minute, minutes after; unknown for none. Mutant: the second boundary
+/// seconds below a minute, minutes after; unknown for none. Catches: the second boundary
 /// compared at 100 instead of 1000.
 #[test]
 fn an_age_is_in_the_unit_that_fits() {

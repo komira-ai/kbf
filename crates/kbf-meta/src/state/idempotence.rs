@@ -19,7 +19,7 @@
 //!   `PutBlob` of a held blob that moves the entry, a `PutAction` that is refused or
 //!   adds a second record, a second `ObjectUnreachable` that changes the reason, an
 //!   `AllocEpoch` that allocates more than one epoch;
-//! - a mark whose generation a retry does not restamp (the mutant that stamps only when
+//! - a mark whose generation a retry does not restamp (a defect that stamps only when
 //!   the reason rises), or one that stamps a generation on another object;
 //! - a second apply after a `Tick` that touches an entry the command does not name, or
 //!   touches a named one at a time other than the applying entry's;
@@ -415,7 +415,7 @@ fn a_forwarded_command_applied_twice_equals_once_but_for_generations_and_next_ep
         );
     }
     // Every exception and the touch-time rule must have been exercised, the same-reason
-    // retry (which a stamp-only-on-rise mutant leaves at i) included.
+    // retry (which a stamp-only-on-rise defect leaves at i) included.
     let counts = format!(
         "restamped {}, same reason {}, epochs {}, touched later {}, tier accepted {}, \
          staged repeats {}, evicted {}",

@@ -52,7 +52,7 @@ fn sharing(prefix: usize, count: usize) -> Vec<String> {
 
 /// Catches: a compare of the first byte of the digest (`presented[..1] == stored[..1]`).
 ///
-/// Mutants seen red: the compare cut to the first 1 byte, and to the first 2.
+/// Catches: the compare cut to the first 1 byte, and to the first 2.
 #[test]
 fn a_value_sharing_the_first_digest_byte_is_refused() {
     let secret = secret();
@@ -71,7 +71,7 @@ fn a_value_sharing_the_first_digest_byte_is_refused() {
 /// Catches: a compare of the first two bytes of the digest. About 65 thousand hashes find
 /// the first value, which is a fraction of a second.
 ///
-/// Mutant seen red: the compare cut to the first 2 bytes.
+/// Catches: the compare cut to the first 2 bytes.
 #[test]
 fn a_value_sharing_the_first_two_digest_bytes_is_refused() {
     let secret = secret();

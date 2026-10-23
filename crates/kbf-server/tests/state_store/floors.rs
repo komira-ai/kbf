@@ -54,7 +54,7 @@ fn handover(disk: &Disk, old: &TestFarm, bound: usize) -> (TestFarm, Inbox) {
 /// Catches: a floor that lives only in the old process. An action killed for memory at
 /// 4 GiB, finished at 16 GiB and submitted again after the handover is booked at 16 GiB
 /// by the successor, not at 4 GiB (one more kill per action at every handover); and an
-/// action never killed is not floored. Mutant: the floor row not written.
+/// action never killed is not floored. Catches: the floor row not written.
 #[tokio::test(start_paused = true)]
 async fn a_floor_is_offered_to_a_fresh_submission_after_a_handover() {
     let disk = Disk::new();

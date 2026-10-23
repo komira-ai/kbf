@@ -17,7 +17,8 @@
 //! says (`expect`: what the holder's `role` reports), keeps the epoch, and builds the
 //! frontend over the store as any start does: all state is read from the store, and the
 //! scheduler, the reconciler and the worker listener start, on the sockets the candidate
-//! already bound. A start with no `--await-takeover` is a cold start and bumps the epoch.
+//! already bound. A start with no `--await-takeover` is a cold start: it takes the
+//! generation and, like every start, keeps the epoch.
 //!
 //! **A SQLite state file** is held by one process (an exclusive file lock), so a candidate
 //! cannot be opened beside the process that holds it: running side by side needs the
@@ -101,7 +102,7 @@ pub struct Managed {
 
 impl Managed {
     /// Starts as the flags say: a candidate with `--await-takeover`, otherwise a frontend
-    /// that takes the generation as a start does (a cold start, which bumps the epoch).
+    /// that takes the generation as a start does (a cold start, which keeps the epoch).
     /// `shutdown` completing stops it.
     ///
     /// # Errors
@@ -155,7 +156,7 @@ impl Managed {
                 StoreSource::Shared(store) => {
                     let state = crate::StateStore {
                         store: Arc::new(kbf_state::Fenced::take(store, None)?),
-                        epoch: crate::farm::EpochPolicy::Bump,
+                        epoch: crate::farm::EpochPolicy::Keep,
                         members: crate::members::MembershipConfig::default(),
                         history: None,
                     };

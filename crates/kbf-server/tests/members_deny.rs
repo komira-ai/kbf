@@ -71,7 +71,7 @@ fn map_of(m: &Members) -> Map {
 /// not listed says so and changes nothing; an entry denied twice is one row and one
 /// generation.
 ///
-/// Mutants seen red: `plan` taking the deny list from the map it replaces (the entry never
+/// Catches: `plan` taking the deny list from the map it replaces (the entry never
 /// arrives); the "nothing changed" test of `plan` leaving the deny list out (no new
 /// generation).
 #[test]
@@ -123,7 +123,7 @@ fn an_entry_enters_the_map_and_a_change_of_the_list_alone_turns_the_generation()
 /// length compared, the map would keep the old list: storage would keep refusing the allowed
 /// entry and admit the denied one until some other change.
 ///
-/// Mutant seen red: the "nothing changed" test of `plan` comparing the lists' lengths.
+/// Catches: the "nothing changed" test of `plan` comparing the lists' lengths.
 #[test]
 fn a_swap_of_one_entry_for_another_turns_the_generation() {
     let s = Hooked::new();
@@ -149,7 +149,7 @@ fn a_swap_of_one_entry_for_another_turns_the_generation() {
 /// is a value with a control character; a name that merely looks like numbers, a wildcard
 /// and one with a slash are taken. A refusal writes nothing.
 ///
-/// Mutants seen red: the IP test removed; the colon test removed; the control-character
+/// Catches: the IP test removed; the colon test removed; the control-character
 /// test removed.
 #[test]
 fn a_node_entry_is_a_dns_name_and_no_value_holds_a_control_character() {
@@ -183,7 +183,7 @@ fn a_node_entry_is_a_dns_name_and_no_value_holds_a_control_character() {
 /// list, so the first map ever built carries them (generation 1), and not the empty list
 /// there is to copy forward from.
 ///
-/// Mutant seen red: `plan` taking the deny list from the current map even when there is
+/// Catches: `plan` taking the deny list from the current map even when there is
 /// none (an empty list for the first map).
 #[test]
 fn an_entry_denied_before_the_first_member_is_in_the_first_map() {
@@ -255,7 +255,7 @@ fn the_rows_are_one_per_entry_under_the_canonical_key() {
 /// row that is there (the entry is listed, as asked, and the call answers `Ok`), and the row
 /// keeps its first reason and time.
 ///
-/// Mutant seen red: the row written with `Cond::Any` instead of `Cond::Absent`.
+/// Catches: the row written with `Cond::Any` instead of `Cond::Absent`.
 #[test]
 fn a_deny_that_loses_a_race_for_the_same_entry_keeps_the_first_row() {
     let s = Hooked::new();

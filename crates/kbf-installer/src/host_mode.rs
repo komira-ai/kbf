@@ -86,7 +86,7 @@ mod tests {
     /// `storage-and-daemon`, `daemon`), an unknown one and a missing mode or file is refused,
     /// the refusal naming the mode it saw.
     ///
-    /// Mutant planted: `| "storage"` added to the accepted arm of `frontend_host` fails the
+    /// Catches: `| "storage"` added to the accepted arm of `frontend_host` fails the
     /// `storage` row; any other mode added fails its own row.
     #[test]
     fn exactly_frontend_and_all_in_one_are_frontend_hosts() {
@@ -125,7 +125,7 @@ mod tests {
     /// Catches a mode whose unit list is empty panicking `run` (or being given a default unit)
     /// instead of being refused with the file and the mode named.
     ///
-    /// Mutant planted: an empty list answered with a fixed unit.
+    /// Catches: an empty list answered with a fixed unit.
     #[test]
     fn a_mode_with_no_unit_is_refused_naming_the_file_and_the_mode() {
         let why = first_unit(&"/etc/kbf/kbf.toml", "storage", &[]).expect_err("no unit");

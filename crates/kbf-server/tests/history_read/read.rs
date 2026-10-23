@@ -235,7 +235,7 @@ async fn no_index_row_names_an_object_that_was_never_written() {
     b.stop().await;
 }
 
-/// Catches (security, mutant "authorize only the first instance"): an invocation that
+/// Catches (security, defect "authorize only the first instance"): an invocation that
 /// used `a` and `b` read back, after a restart, by a caller allowed on `a` alone; and one
 /// whose instances are all allowed refused. The refusal is the live one's: `403` and the
 /// same text.
@@ -266,7 +266,7 @@ async fn a_spanning_invocation_is_all_must_allow_after_restart() {
     b.stop().await;
 }
 
-/// Catches (mutant "the restore path ignores `truncated`"): a header whose instance list
+/// Catches (defect "the restore path ignores `truncated`"): a header whose instance list
 /// the writer cut at its bound read as whole, so a caller allowed on the names listed
 /// reads an invocation that used others. Nobody is answered, whoever they are, and an
 /// invocation whose header lists none is the same.
@@ -303,7 +303,7 @@ async fn a_truncated_instance_list_answers_no_caller() {
     b.stop().await;
 }
 
-/// Catches (mutant "skip the second-phase check"): an instance added to the invocation
+/// Catches (defect "skip the second-phase check"): an instance added to the invocation
 /// between the authorization of its names and the read of its records served to a caller
 /// who was never asked about it. The request answers `503`, to be sent again, as a live
 /// record's does.
@@ -414,7 +414,7 @@ async fn run_by_id_live_equals_run_by_id_durable() {
     b.stop().await;
 }
 
-/// Catches (security, mutant "the run lookup ignores the instance"): a run asked under
+/// Catches (security, defect "the run lookup ignores the instance"): a run asked under
 /// an instance the caller may not read answered, live or after a restart, to a caller
 /// allowed on another one; and a run of the allowed instance refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

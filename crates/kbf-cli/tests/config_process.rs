@@ -250,6 +250,8 @@ fn settings(mode: &str, dir: &Path, pki: &Pki, host: Host) -> Settings {
         }
         names::FRONTEND => {
             s.push(("storage", "http://127.0.0.1:1".to_owned()));
+            // A frontend starts only over a state store; `--check` opens none.
+            s.push(("state-store", format!("sqlite://{}", p("state.db"))));
             match host {
                 Host::Fine => {}
                 Host::Missing => s.push(("reapi-auth-policy", p("no-such-policy.json"))),

@@ -103,6 +103,22 @@ impl Version {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The commit this version names, as the hex digits it carries: those after the last `+`,
+    /// without the `g` of a build of `main` (`0.1.<seq>+g<sha12>-<run>`, `xtask`'s
+    /// `pkg_version`) or bare (`0.1.0+<sha12>`, the form before it). 12 to 40 digits, then the
+    /// end or a `-`. A version that names none (`2.0`, `1.2.3-1`) has no commit to verify a
+    /// host against.
+    pub fn commit(&self) -> Option<&str> {
+        let (_, tail) = self.0.rsplit_once('+')?;
+        let tail = tail.strip_prefix('g').unwrap_or(tail);
+        let end = tail
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(tail.len());
+        let (digits, rest) = tail.split_at(end);
+        let named = (12..=40).contains(&digits.len()) && (rest.is_empty() || rest.starts_with('-'));
+        named.then_some(digits)
+    }
 }
 
 fn allowed(b: u8) -> bool {
