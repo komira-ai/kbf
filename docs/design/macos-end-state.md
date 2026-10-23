@@ -325,6 +325,13 @@ Known limits:
   paths during a run) is not owned by the uid and was not attributed to GPU use. The clean leaves it.
 - Two defunct processes (zombies whose parent is not the lease) stayed after the kill. They hold
   nothing and the clean's process check passes.
+- The clean of the two `/private/var/protected` places runs as root and is checked on the runner only.
+  Whether a Mac with its own system integrity settings lets root remove the uid's files there is not
+  known. If it does not, step C8 fails with the path and the error (`<path>: <error>`), the slot stays
+  dirty and out of the pool, and the log names the step.
+- The files under `/private/var/protected` and `/private/var/db/mds` are planted by the test, so it
+  shows the sweep removes them, not that a system update keeps them in the same places. A check that a
+  real framework lease leaves no uid-owned file there belongs to the baseline assertion.
 - The test of this section runs on the VM. Whether a Mac Studio leaves other state (a different
   GPU driver, a persistent shader cache outside the user's folders) is not known.
 

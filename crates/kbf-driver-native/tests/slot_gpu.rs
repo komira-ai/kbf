@@ -40,6 +40,8 @@ const PROTECTED: [&str; 2] = [
     "/private/var/protected/sfanalytics",
     "/private/var/protected/trustd/private",
 ];
+/// A folder under the trust store made for the uid alone, as the sweep must find it.
+const UID_OWNED_FOLDER: &str = "00000000-0000-0000-0000-00000000F00D";
 const MDS_MESSAGES: &str = "/private/var/db/mds/messages";
 
 fn text(program: &str, args: &[&str]) -> String {
@@ -230,24 +232,55 @@ fn names(dir: &Path) -> Vec<String> {
     names
 }
 
-/// What the test puts where a framework import leaves it, and takes away at the end.
-#[derive(Default)]
-struct Planted {
-    /// Files owned by the uid.
+/// What the test puts where a framework import leaves it, and what it must take away
+/// whether the test ends or panics: the planted files and folders, the process that holds
+/// a device, and the probe folder.
+struct Litter {
+    uid: u32,
+    /// Every planted file, whoever owns it.
+    files: Vec<PathBuf>,
+    /// What the uid owns of it, which the clean must remove.
     residue: Vec<PathBuf>,
     /// The folders the test made, deepest first, removed when empty.
     made: Vec<PathBuf>,
+    holder: Option<std::process::Child>,
+    probes: PathBuf,
+}
+
+impl Drop for Litter {
+    fn drop(&mut self) {
+        let _ = Command::new("/usr/bin/pkill")
+            .args(["-KILL", "-U", &self.uid.to_string()])
+            .status();
+        if let Some(holder) = self.holder.as_mut() {
+            let _ = holder.kill();
+            let _ = holder.wait();
+        }
+        for file in &self.files {
+            let _ = std::fs::remove_file(file);
+        }
+        for dir in &self.made {
+            let _ = std::fs::remove_dir(dir);
+        }
+        let _ = std::fs::remove_dir_all(&self.probes);
+    }
 }
 
 /// Makes `file` with the given owner and mode, and the folders above it that are missing.
-fn plant(file: &Path, owner: u32, mode: u32, planted: &mut Planted) {
+/// The folders the test makes belong to `folder_owner`.
+fn plant(file: &Path, owner: u32, folder_owner: u32, mode: u32, litter: &mut Litter) {
     let folder = file.parent().expect("parent");
     let mut at = folder;
+    let first = litter.made.len();
     while !at.exists() {
-        planted.made.push(at.to_owned());
+        litter.made.push(at.to_owned());
         at = at.parent().expect("parent");
     }
     std::fs::create_dir_all(folder).expect("plant folder");
+    for made in &litter.made[first..] {
+        std::os::unix::fs::chown(made, Some(folder_owner), None).expect("chown folder");
+    }
+    litter.files.push(file.to_owned());
     std::fs::write(file, "x").expect("plant file");
     std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode)).expect("chmod");
     std::os::unix::fs::chown(file, Some(owner), None).expect("chown");
@@ -275,8 +308,8 @@ fn wait_for(file: &Path, needle: &str, secs: u64) -> bool {
 /// - after the clean the slot is free (the clean found nothing left), the entry holds its
 ///   four empty folders and nothing else, the home is empty, and the uid owns nothing under
 ///   `/private/var/protected`, `/private/var/db/mds` or `/private/var/folders`;
-/// - the uid's planted files in the analytics and trust stores and its security-message
-///   folder are gone, and root's file in the same folder stays (the sweep removes by
+/// - the uid's planted files in the analytics and trust stores, a trust-store folder it
+///   owns whole, and its security-message folder are gone, and root's file in the same folder stays (the sweep removes by
 ///   owner, not by folder).
 #[ignore = "needs root, real users, a Metal device and swiftc: see spike-slot-reach.yml job slot-gpu"]
 #[tokio::test(flavor = "multi_thread")]
@@ -287,9 +320,17 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
     let pool = Pool::new(users.0.clone()).expect("pool");
     // Not `std::env::temp_dir()`: root's own folder, which the pool user cannot enter.
     let probes = PathBuf::from("/private/tmp").join(format!("kbf-slot-gpu-{}", std::process::id()));
-    let probe = build_probe(&probes);
     let user = users.0[0].clone();
     let uid = user.uid;
+    let mut litter = Litter {
+        uid,
+        files: Vec::new(),
+        residue: Vec::new(),
+        made: Vec::new(),
+        holder: None,
+        probes: probes.clone(),
+    };
+    let probe = build_probe(&probes);
     let guid = generated_uid(&user.name);
 
     let slots =
@@ -312,12 +353,14 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
         String::from_utf8_lossy(&out.stderr)
     );
     let holding = probes.join("holding.out");
-    let mut holder = lease
-        .command(&slot, &["GPU_HOLD=1"], &probe)
-        .stdout(std::fs::File::create(&holding).expect("holder output"))
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("holder");
+    litter.holder = Some(
+        lease
+            .command(&slot, &["GPU_HOLD=1"], &probe)
+            .stdout(std::fs::File::create(&holding).expect("holder output"))
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("holder"),
+    );
     assert!(
         wait_for(&holding, "HOLD_READY", 180),
         "the holder never held a device"
@@ -326,9 +369,8 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
     let clients = registry_clients_of(uid);
 
     // What an MLX import makes outside the folders, planted as the system makes it.
-    let mut planted = Planted::default();
     let control = Path::new(PROTECTED[0]).join(&guid).join("root-owned");
-    plant(&control, 0, 0o600, &mut planted);
+    plant(&control, 0, 0, 0o600, &mut litter);
     for file in [
         Path::new(PROTECTED[0]).join(&guid).join("events.db"),
         Path::new(PROTECTED[1]).join(&guid).join("trust.db"),
@@ -336,9 +378,13 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
             .join(uid.to_string())
             .join("se_SecurityMessages"),
     ] {
-        plant(&file, uid, 0o600, &mut planted);
-        planted.residue.push(file);
+        plant(&file, uid, 0, 0o600, &mut litter);
+        litter.residue.push(file);
     }
+    // A folder the uid owns whole, which the sweep removes with what is in it.
+    let own = Path::new(PROTECTED[1]).join(UID_OWNED_FOLDER);
+    plant(&own.join("trust.db"), uid, uid, 0o600, &mut litter);
+    litter.residue.push(own);
 
     // The end of the lease as the driver makes it, the lease directory, the clean.
     let uid_arg = uid.to_string();
@@ -349,7 +395,9 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
     let _ = Command::new("/usr/bin/pkill")
         .args(["-KILL", "-U", &uid_arg])
         .status();
-    let _ = holder.wait();
+    if let Some(mut holder) = litter.holder.take() {
+        let _ = holder.wait();
+    }
     slot.reclaim(&lease.dir).await.expect("reclaim");
     std::fs::remove_dir_all(&lease.dir).expect("remove the lease directory");
     slot.release().await;
@@ -358,7 +406,10 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
     let free = slots.count();
     let outside = uid_files_outside(uid, &folders);
     let control_stays = control.exists();
-    let residue_left: Vec<&PathBuf> = planted.residue.iter().filter(|p| p.exists()).collect();
+    let residue_left: Vec<PathBuf> = (litter.residue.iter())
+        .filter(|p| p.exists())
+        .cloned()
+        .collect();
     let left_in_entry: Vec<String> = names(&folders)
         .into_iter()
         .filter_map(|name| {
@@ -369,14 +420,7 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
         .collect();
     let left_in_home = names(&home);
     let still = registry_clients_of(uid);
-    let _ = std::fs::remove_file(&control);
-    for file in &planted.residue {
-        let _ = std::fs::remove_file(file);
-    }
-    for dir in &planted.made {
-        let _ = std::fs::remove_dir(dir);
-    }
-    let _ = std::fs::remove_dir_all(&probes);
+    drop(litter);
 
     assert!(
         !caches.is_empty(),
