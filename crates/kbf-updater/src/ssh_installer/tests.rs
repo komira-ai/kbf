@@ -790,7 +790,7 @@ fn every_query_answer_maps() {
     assert_eq!(got[0], Ok(Installed::Version("1.2.3-1".into())));
     assert_eq!(got[1], Ok(Installed::InProgress));
     assert_eq!(got[2], Ok(Installed::InProgress));
-    assert_eq!(got[3], Err(PortError::other("not installed")));
+    assert_eq!(got[3], Ok(Installed::NotInstalled));
     assert_eq!(got[4], Ok(Installed::Version("1:2.0-1".into())));
     assert_eq!(got[5], Err(PortError::other("bad answer")));
     assert_eq!(got[6], Err(PortError::other("bad answer")));
