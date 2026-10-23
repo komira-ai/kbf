@@ -11,7 +11,7 @@
 //!
 //! What a fetch uses, and where each part comes from:
 //!
-//! - `installer.toml` ([`InstallerToml::read`]): the source, the component cap and the fetch
+//! - `installer.toml` ([`read_trusted`]): the source, the component cap and the fetch
 //!   timeout, the operator's `min_protocol` floor ([`Policy::of`], [`Limits::of`]), and the
 //!   refs it names, which can only narrow `installer.conf`'s list
 //!   ([`Settings::narrowed_to`]). The file is held to the trust files' rule: root's alone.
@@ -44,7 +44,8 @@ use crate::helper::fetcher::{FetchError, Fetcher, InstalledRelease, ReleaseLocat
 use crate::helper::fetcher_real::{Parts, RealFetcher};
 use crate::helper::fetcher_seed::SeedFetcher;
 use crate::helper::leases::LeaseSource;
-use crate::installer_toml::{InstallerToml, ReadError, Source as Configured};
+use crate::helper::trusted_toml::{ReadError, read_trusted};
+use crate::installer_toml::{InstallerToml, Source as Configured};
 use crate::layout::{Layout, Platform};
 use crate::refusal::Refusal;
 use crate::run::SystemRunner;
@@ -135,7 +136,7 @@ impl HostFetcher {
     /// and the settings it narrows.
     fn read(&self) -> Result<(Parts, InstallerToml, Settings), NotBuilt> {
         let parts = (self.parts)().map_err(NotBuilt::Host)?;
-        let toml = InstallerToml::read(&*parts.trust, &self.installer_toml)?;
+        let toml = read_trusted(&*parts.trust, &self.installer_toml)?;
         let settings = Settings::load(&*parts.trust, &self.host)
             .map_err(NotBuilt::Settings)?
             .narrowed_to(&toml.source_refs)?;

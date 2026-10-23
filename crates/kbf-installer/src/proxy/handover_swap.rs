@@ -43,7 +43,6 @@ use super::admin::{Admin, Deadlines};
 use super::api::traits::{Retired, Supervisor, SupervisorError, SupervisorStatus, UpdateSpec};
 use super::child_http::Headers;
 use super::handover::HandoverConfig;
-use super::migrator::DbMigrator;
 use super::model::PortError;
 use super::model::{Mode, Phase, ProcIdent, Slot, Timing};
 use super::orders::OrderSpool;
@@ -56,6 +55,7 @@ use super::runtime::{RequestQueue, SystemClock};
 use super::supervisor_swap::{Config, Parts, SwapSupervisor};
 use crate::CommitId;
 use crate::database::Database;
+use crate::migrator::DbMigrator;
 use kbf_state::postgres::schema::{Outcome, SchemaError};
 use std::time::Duration;
 
@@ -159,11 +159,16 @@ pub(super) struct Seams {
 type Orders = Arc<dyn RootOrders + Send + Sync>;
 
 /// The supervisor that is the swap once the proxy is bound. See the module documentation.
+///
+/// A clone is the same swap, not another one: the swap supervisor is built once and the clones
+/// share it. The update API holds one and the binary watch ([`super::binary_watch`]) another,
+/// and an update started through either is the one both see.
+#[derive(Clone)]
 pub struct Handover {
     cfg: HandoverConfig,
     orders: Orders,
     seams: Seams,
-    inner: Mutex<Option<SwapSupervisor>>,
+    inner: Arc<Mutex<Option<SwapSupervisor>>>,
 }
 
 impl Handover {
@@ -186,7 +191,7 @@ impl Handover {
             cfg: cfg.clone(),
             orders,
             seams: Seams::default(),
-            inner: Mutex::new(None),
+            inner: Arc::new(Mutex::new(None)),
         }
     }
 

@@ -1,8 +1,8 @@
 # `kbf-installer deploy`: the gamma trigger
 
-> RETIRED: `gamma.yml` is deleted and no release workflow run starts a gamma deploy; gamma moves to kbf-updater (package-update design, section 13). The `kbf-installer deploy` command below still exists until kbf-updater replaces it; no workflow calls it.
+> RETIRED: `gamma.yml`, the `kbf-installer deploy` verb and `cargo xtask gamma` are deleted. Hosts take releases from OS packages and kbf-updater. This page describes the retired deploy and is kept as history; nothing below exists.
 
-Status: built in `crates/kbf-installer/src/deploy/`. It drives the update API the frontend's
+Status: deleted (it was `crates/kbf-installer/src/deploy/`). It drives the update API the frontend's
 proxy serves (`docs/design/frontend-proxy.md`, sections 4, 5 and 9), frontend first.
 
 `kbf-installer deploy --commit <40hex> --stage gamma|prod --offer offer.json|- --apply [--json] [--bundle -]` runs on the frontend host, as root, and drives the frontend's public port through one release.

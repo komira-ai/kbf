@@ -1,7 +1,7 @@
 //! Offers over the worker session (`docs/design/pull-updates.md` sections 5 and 6.4), end to
 //! end: a real frontend over loopback with a release store and a state store, daemons that
 //! speak the session, and the node's own update client (`kbf-update`) taking the offers. What
-//! the server keeps of the statuses the nodes send is `tests/update_hosts.rs`.
+//! the server keeps of the statuses the nodes send is `src/update_status/tests.rs`.
 
 #[path = "support/hooked.rs"]
 mod hooked;
@@ -17,7 +17,7 @@ use std::time::Duration;
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_objstore::MemoryStore;
 use kbf_proto::update::UpdateOffer;
-use kbf_proto::worker::{daemon_message, server_message};
+use kbf_proto::worker::server_message;
 use kbf_server::members::MembershipConfig;
 use kbf_server::release::{Limits, ReleaseStore};
 use kbf_server::token::ApiToken;
@@ -68,6 +68,7 @@ fn listeners() -> Listeners {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         streams: kbf_server::StreamTiming::default(),
@@ -121,11 +122,8 @@ fn start_with(releases: bool, state: bool) -> Frontend {
         releases,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    // Allows everything, and names `farm.getAuthorizer`, which turns `GET /v1/update/hosts` on.
-    let policy = kbf_auth::Policy::from_json(
-        r#"{"authenticationPolicy": {"allow": {}}, "farm": {"getAuthorizer": {"allow": {}}}}"#,
-    )
-    .expect("a policy");
+    let policy = kbf_auth::Policy::from_json(r#"{"authenticationPolicy": {"allow": {}}}"#)
+        .expect("a policy");
     let bound = bind_server_with_state(
         Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory()),
         listeners(),
@@ -234,26 +232,6 @@ impl Frontend {
         assert_eq!(code, 200, "{desired}");
         desired["generation"].as_u64().expect("a generation")
     }
-
-    /// The entry of `node` in `GET /v1/update/hosts` once `ready` accepts it.
-    async fn host_until(&self, node: &str, ready: impl Fn(&Value) -> bool) -> Value {
-        let deadline = tokio::time::Instant::now() + PROMPT;
-        loop {
-            let (code, hosts) = http(self.api, "GET", "/v1/update/hosts", false, None, b"").await;
-            assert_eq!(code, 200, "{hosts}");
-            let listed = hosts["hosts"]
-                .as_array()
-                .and_then(|all| all.iter().find(|h| h["node_id"] == node));
-            if let Some(host) = listed.filter(|h| ready(h)) {
-                return host.clone();
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "no matching host {node}: {hosts}"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
 }
 
 /// The tarball bytes of `name` at `commit`: different for each, so a mix-up shows.
@@ -321,8 +299,7 @@ async fn mac_node(front: &Frontend, name: &str, arch: &str) -> FakeDaemon {
 /// one the node's own client cannot take. The Linux release also holds a `kbf-daemon`
 /// tarball, which a Linux host must not be told about. The node is a real `kbf-update`
 /// client: it takes the offer (it fetches nothing: the root installer pulls the release
-/// itself on an order), and the status it then reports is what `/v1/update/hosts` and
-/// `/v1/nodes` list.
+/// itself on an order) and reports the offered generation.
 ///
 /// Mutants seen red: no offer after `Welcome`; every stored component offered, not the
 /// platform's; the digest, the size or the attestation taken from another component (all
@@ -371,33 +348,15 @@ async fn a_node_is_offered_the_desired_release_after_welcome_and_its_client_take
     // The offer is taken as the server sent it: it carries the facts the client requires.
     handle.offer(kbf_update::Offer::from(offered));
     let mut changes = handle.status();
-    let reported = tokio::time::timeout(PROMPT, changes.wait_for(|s| s.offered_generation == 1))
+    tokio::time::timeout(PROMPT, changes.wait_for(|s| s.offered_generation == 1))
         .await
         .expect("the client takes the offer in time")
-        .expect("the client runs")
-        .clone();
+        .expect("the client runs");
     assert!(
         !client_dir.join("inbox").exists(),
         "no release bytes pass through the node"
     );
 
-    node.send(daemon_message::Message::UpdateStatus(
-        kbf_proto::update::UpdateStatus::from(&reported),
-    ));
-    let host = front
-        .host_until("n1", |h| h["offered_generation"] == 1)
-        .await;
-    assert_eq!(host["availability"], "ok");
-    assert_eq!(host["running_commit"], "0123456789ab");
-    assert_eq!(host["state"], "manual", "no helper reports on this host");
-    assert_eq!(host["helper_present"], false);
-    // It runs the prefix of the desired commit, as the open listing says too.
-    assert_eq!(host["up_to_date"], true, "{host}");
-    let (_, nodes) = http(front.api, "GET", "/v1/nodes", false, None, b"").await;
-    assert_eq!(
-        nodes["nodes"][0]["update"],
-        json!({ "state": "manual", "up_to_date": true, "availability": "ok" })
-    );
     running.abort();
 }
 

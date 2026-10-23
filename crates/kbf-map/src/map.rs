@@ -34,6 +34,11 @@ pub enum MemberState {
     Draining,
     /// Lease lapsed, kept in the map for the dwell.
     Down,
+    /// A state this build does not name, with the number it came with (a later build wrote
+    /// it; 0 is a member that named none). The member is inert: it takes no writes, is not a
+    /// settled owner, is never listed for reading and is not counted as `Active`. It stays
+    /// in the map, and a row or map that is written back says the number it came with.
+    Unknown(i32),
 }
 
 impl MemberState {
@@ -48,13 +53,14 @@ impl MemberState {
             Self::Active => "active",
             Self::Draining => "draining",
             Self::Down => "down",
+            Self::Unknown(_) => "unknown",
         }
     }
 
     /// Whether the member can be a write owner.
     #[must_use]
     pub const fn takes_writes(self) -> bool {
-        !matches!(self, Self::Draining)
+        !matches!(self, Self::Draining | Self::Unknown(_))
     }
 
     /// Whether the member is among the settled owners: it holds the data placed before
@@ -64,9 +70,10 @@ impl MemberState {
     }
 }
 
-/// How owners are chosen from the scores. One rule exists; zone-aware placement is a
-/// later addition (`architecture-v2.md` section 6); the enum is exhaustive, so a new rule
-/// fails to compile where the wire conversion and the owner functions match on it.
+/// How owners are chosen from the scores. One rule is named; zone-aware placement is a
+/// later addition (`architecture-v2.md` section 6). A rule a later build writes reads as
+/// [`Rule::Unknown`], which places nothing; the owner functions match on the enum, so a new
+/// rule fails to compile where they do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Rule {
     /// The top `r` members by weighted rendezvous score.
@@ -77,6 +84,11 @@ pub enum Rule {
     /// one of them is a NEW rule value (and a new wire value), never an edit of this one,
     /// because it remaps every blob in the farm.
     Rendezvous,
+    /// A rule this build does not name, with the number it came with (0 is a map that named
+    /// none). The map is read and everything else in it applies (members, replication, the
+    /// protocol floor, the deny list), but this build cannot place with a rule it does not
+    /// know, so [`Map::write_owners`] and [`Map::read_order`] list no one.
+    Unknown(i32),
 }
 
 /// One storage node as the map holds it.
@@ -237,8 +249,11 @@ impl Map {
     }
 
     /// Every member, best score first for this digest; equal scores go to the lower id.
+    /// None under a rule this build does not name.
     fn ranked(&self, digest: &Digest) -> Vec<&Member> {
-        let Rule::Rendezvous = self.rule;
+        let Rule::Rendezvous = self.rule else {
+            return Vec::new();
+        };
         let mut scored: Vec<(f64, &Member)> = self
             .members
             .iter()
@@ -264,7 +279,9 @@ impl Map {
     /// A `Down` member keeps its slot, so the caller checks [`Member::state`] and records
     /// a repair; with `r` = 1 and the only owner `Down` the caller refuses the write with
     /// `UNAVAILABLE`, as there is no second copy to make. A `Draining` member never
-    /// appears. Fewer than `r` come back only when too few members take writes.
+    /// appears, nor does a member in a state this build does not name
+    /// ([`MemberState::Unknown`]). Fewer than `r` come back only when too few members take
+    /// writes, and none under a rule this build does not name ([`Rule::Unknown`]).
     #[must_use]
     pub fn write_owners(&self, digest: &Digest) -> Vec<MemberId> {
         self.write_members(digest)
@@ -295,7 +312,8 @@ impl Map {
     /// settled owners in rank order, then the write owners not yet listed (the members
     /// that may not hold it yet, `Joining` and `CatchingUp` among them, last). `Down`
     /// members are left out: with every owner `Down` the list is empty and the caller
-    /// treats the blob as unavailable (`UNAVAILABLE`), not as missing.
+    /// treats the blob as unavailable (`UNAVAILABLE`), not as missing. So are members in a
+    /// state this build does not name, and every member under a rule it does not name.
     #[must_use]
     pub fn read_order(&self, digest: &Digest) -> Vec<MemberId> {
         self.read_members(digest)
@@ -398,9 +416,11 @@ impl Map {
     /// It covers the rule, the replication factor and, for each member in id order, the
     /// id, weight and the member's *placement class*. `Joining` and `CatchingUp`
     /// are one class (placement treats them alike); `Active`, `Draining` and `Down` are
-    /// each their own. It leaves out the generation, addresses, boot counters, zones, the
-    /// protocol floor, the deny list and the order the members were listed in, none of which
-    /// move a digest. Zone is left out because placement does not read it today (ranking
+    /// each their own. A member in a state this build does not name is left out, as
+    /// placement leaves it out. Under a rule this build does not name nothing is placed, so
+    /// the fingerprint is that of the rule alone. It leaves out the generation, addresses,
+    /// boot counters, zones, the protocol floor, the deny list and the order the members
+    /// were listed in, none of which move a digest. Zone is left out because placement does not read it today (ranking
     /// scores only digest, id and weight); when zone-aware placement exists it is a new
     /// layout, and the fingerprint (a new function, see below) adds zone then.
     ///
@@ -417,21 +437,32 @@ impl Map {
             u64::from_be_bytes(*b"kbf-plfp"),
             u64::from_be_bytes(*b"placemnt"),
         );
-        let Rule::Rendezvous = self.rule;
+        let Rule::Rendezvous = self.rule else {
+            h.write_u8(0);
+            return h.finish();
+        };
         h.write_u8(1); // rule: Rendezvous
         h.write_u8(self.r);
-        let mut members: Vec<&Member> = self.members.iter().collect();
-        members.sort_by_key(|m| m.id);
+        let mut members: Vec<(&Member, u8)> = self
+            .members
+            .iter()
+            .filter_map(|m| {
+                let class = match m.state {
+                    MemberState::Joining | MemberState::CatchingUp => 0,
+                    MemberState::Active => 1,
+                    MemberState::Draining => 2,
+                    MemberState::Down => 3,
+                    MemberState::Unknown(_) => return None,
+                };
+                Some((m, class))
+            })
+            .collect();
+        members.sort_by_key(|(m, _)| m.id);
         h.write_u64(members.len() as u64);
-        for m in members {
+        for (m, class) in members {
             h.write_u64(m.id.0);
             h.write_u32(m.weight);
-            h.write_u8(match m.state {
-                MemberState::Joining | MemberState::CatchingUp => 0,
-                MemberState::Active => 1,
-                MemberState::Draining => 2,
-                MemberState::Down => 3,
-            });
+            h.write_u8(class);
         }
         h.finish()
     }

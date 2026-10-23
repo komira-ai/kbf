@@ -103,13 +103,13 @@ certificate is not looked at, and `--cold-store` and `--meta-dir` are checked as
 
 ### The node's update directory and orders directory
 
-A `daemon` or `storage-and-daemon` host runs a daemon that takes update orders from the
-frontend. On Linux `setup` writes two more keys into its `kbf.toml`, in the `[daemon]` table:
+The node no longer has an update client: a release reaches a host as a package that
+`kbf-updater` installs. `--update-dir` and `--orders-dir` (`update-dir` and `orders-dir` in
+`[daemon]`) are still accepted, hidden and ignored, with one warning at start, for one
+release, because a `kbf.toml` or a plist written before the removal carries them. On Linux
+`setup` still writes both keys into a `daemon` or `storage-and-daemon` host's `kbf.toml`:
 `update-dir = "/var/lib/kbf-installer"` and `orders-dir = "/var/lib/kbf-installer/orders"`.
-Without them the node updates by hand and ignores every order. The installer writes
-`status.json` into the first and reads the node's orders from the second. `all-in-one` gets
-neither key, because its in-process daemon refuses `--update-dir`. On a Mac `setup` writes neither
-key and checks them instead, see "The Mac path".
+On a Mac it writes neither key and checks them instead, see "The Mac path".
 
 ## The `kbf.toml` file
 
@@ -133,38 +133,9 @@ refuses a table written twice, and so does `kbf` (exit 2, `duplicate key`).
 ## The Mac path
 
 A Mac is a node (`--mode=daemon`) and `kbf-mac-provision` is the one writer of the daemon's
-`kbf.toml` there. `setup` does not write `[daemon] update-dir` or `orders-dir` on a Mac. It
-checks the file: `update-dir` must be there and be the installer's state directory
-(`/var/db/kbf-installer`), and `orders-dir` must be absent (the node uses `<update-dir>/orders`)
-or be the installer's. A missing or different key, or no file, is refused with exit 5, naming the
-key and saying that `kbf-mac-provision` renders it: run it again, then `setup`. The other keys
+`kbf.toml` there. `setup` does not write `[daemon] update-dir` or `orders-dir` on a Mac and does
+not require them; a file that has them is left as it is. The other keys
 `setup` owns follow the rule above.
-
-### The deploy config of a frontend and an all-in-one host
-
-`--deploy-stage gamma|prod` makes `setup` write `/etc/kbf-installer/deploy.json` (root's, mode
-0644, written atomically), so `kbf-installer deploy` needs no flag naming the API, the token or
-the stage. Without `--deploy-stage` nothing is written, and every other `--deploy-*` flag needs
-it; a node mode takes none of them.
-
-| flag | key | default |
-|---|---|---|
-| `--deploy-stage` | `stage` | required to write the file |
-| `--deploy-api` | `api` | the proxy's public port: `[proxy] listen` of `installer.toml` (an unspecified address read as loopback), else `127.0.0.1:8980` |
-| `--deploy-token-file` | `token_file` | `[proxy] operator_token_file` of `installer.toml` |
-| `--deploy-api-ca` | `api_ca` | none (the system's roots) |
-| `--deploy-server-name` | `api_server_name` | none (the API address's IP) |
-
-The token and the CA are referenced by path and are the operator's: `setup` never copies or
-reads them, and creates none but the first operator token (the default token, which a first
-run may therefore name before it exists). Before it touches the host it checks that each exists, is a regular file
-(a link is not followed), is owned by root or the service user, and that the token is mode 0600
-or 0400 and the CA is not writable by group or others; a failure is exit 5 naming the flag and
-the one command that fixes it. The five keys above are `setup`'s and are rewritten from the
-flags on every run (a run again with the same flags changes nothing); any other key in the file
-(`cas`, `cas_ca`, `cas_server_name`) is kept. A file that is not a JSON object is left alone and
-named. The sudoers rule that lets the deploy account run `deploy` is a held step, written out in
-`docs/design/gamma-deploy.md`, "The host's config: who writes it, and the sudoers rule".
 
 ## What it does, in this order
 
@@ -201,9 +172,8 @@ named. The sudoers rule that lets the deploy account run `deploy` is a held step
    are `SOURCE_REFS` of `installer.conf` (default `refs/heads/main`); `source_refs` of
    `installer.toml` can only narrow that list, and a list with no ref in common refuses the fetch.
    When a release is installed already, `--commit` is not fetched and a note says so.
-9. `/etc/kbf-installer/deploy.json`, only when `--deploy-stage` is given (see "The deploy config of a frontend and an all-in-one host").
-10. `/etc/kbf/kbf.toml`, as above (on an all-in-one host `/etc/kbf/frontend.toml` first).
-11. The units, last. On Linux `systemctl enable`, with `--now` unless `--no-start`: the mode's unit
+9. `/etc/kbf/kbf.toml`, as above (on an all-in-one host `/etc/kbf/frontend.toml` first).
+10. The units, last. On Linux `systemctl enable`, with `--now` unless `--no-start`: the mode's unit
     (only when a release is installed), and `kbf-installer.service`. `kbf-frontend.service`,
     `kbf-all-in-one.service` (kept for a host of the earlier layout) and the proxy units, with
     `kbf-storage-and-daemon.service` beside them on an all-in-one host, are enabled and never started by `setup`: starting
@@ -313,10 +283,51 @@ refuses `frontend_update` orders here (the host "runs no frontend"), and the uni
 the sibling's. Until it reads the children's file from `installer.toml`, the children of an
 all-in-one host are not swapped through the update API.
 
-**Only a fresh host.** A `kbf.toml` that says `mode = "all-in-one"` is the earlier layout, one
-process for everything. `setup` does not rewrite it into this one: it refuses (exit 5,
-`needs_operator`), naming the file, and changes nothing. Keep such a host on
-`kbf-all-in-one.service`; moving it is a separate step that `setup` does not take.
+**A host of the earlier layout is moved.** A `kbf.toml` that says `mode = "all-in-one"` is the
+earlier layout, one process for everything (`kbf-all-in-one.service`). Run the same command as for
+a fresh host, with `--proxy`; without it `setup` refuses (exit 5, `needs_operator`), naming the
+file and saying what to add, and changes nothing. `setup` then splits the file:
+
+- The original is kept first, root's 0600, as `kbf.toml.all-in-one` in
+  `/var/lib/kbf-installer/migration-units/` (0700). It is made once and never overwritten. A copy
+  that is there and holds another file is refused (exit 5) before anything is written, since
+  neither may be lost.
+- The settings carry over as flags: a flag this run does not give takes the old file's value
+  (`--cold-store`, `--meta-dir`, the identity rows `--daemon-server`, `--daemon-ca-cert`,
+  `--daemon-cert`, `--daemon-key` and `--node-id`, the REAPI pair, `--worker-client-ca`, and
+  `[scheduler] state-store` for `--database`), and a flag that is given overrides it, except
+  `--cold-store` and `--meta-dir`: the move keeps both where they are, so a value other than the
+  file's is refused (exit 5, the flag named, no value printed) rather than starting the sibling on
+  a metadata directory with no log of the cold store. They are then checked as a fresh host's are,
+  so a value the file lacks is reported as its missing flag, and a carried key or certificate file
+  must belong to the user the new layout reads it as (the REAPI key to `kbf-server`, which the
+  earlier layout's did not; a REAPI certificate or client CA owned by `kbf` is refused too, since
+  a certificate must be root's or `kbf-server`'s). The stores go to the sibling's `kbf.toml`, the
+  state store to `frontend.toml`, the REAPI pair and the client CA to `[proxy]` of
+  `installer.toml`; the metadata directory and the cold store are the same.
+- The operator token stays the same token. If it is at `/etc/kbf/api-token` it is rewritten with
+  its own bytes as `kbf-server`'s (the earlier layout's belonged to `kbf`, and the proxy's
+  children could not read it); a token at another path that `[tls] api-token-file` names is
+  copied there and the old file is left. If both files are there and differ, the one at
+  `/etc/kbf/api-token` is kept and the output names the other as not used.
+- A key with no place in the new layout (the listeners, `worker-tls-cert` and `worker-tls-key`,
+  anything the operator added) is named in the output as `[table] key` and never printed; the
+  original keeps it.
+- `setup` stops and starts none of the services of the move (as on any run it enables
+  `kbf-installer.service` and starts it): the earlier unit drains without a time limit and holds
+  the metadata directory the sibling needs. It prints the commands, in order: stop
+  `kbf-all-in-one.service` and wait until it has exited, disable it, `systemctl daemon-reload`,
+  then start `kbf-storage-and-daemon.service` and the proxy units. A start that finds the metadata
+  directory still held exits 75 and is retried. Until the unit is disabled both the earlier unit
+  and the new ones are enabled, so do not reboot the host in between. Do not restart the earlier
+  unit once `kbf.toml` is replaced; for that reason the move does not print the note that a
+  running kbf keeps the old file until it is restarted.
+
+A moved host's `kbf.toml` no longer says `all-in-one`, so a second run is a fresh host's: it plans
+nothing new, does not look at the copy, and needs every flag, since the moved files are not read
+for values. That includes a run repeated after a stop part way (`kbf.toml` is written last of the
+files, before the units are enabled): give the flags of the first run again, or the missing ones
+are reported by name (exit 2). A dry run shows the plan, including the copy, and writes nothing.
 
 ## The state database
 

@@ -38,6 +38,12 @@
 //! - a memory watch: every poll, the physical footprint of all the action's processes
 //!   together ([`procs`]); past the lease's limit, the whole tree is killed and the
 //!   lease ends RESOURCE_EXHAUSTED ([`kbf_daemon::RuntimeError::OutOfMemory`]);
+//! - an end that asks first: SIGTERM to every process of the lease, up to
+//!   [`NativeConfig::term_grace`] for them to go, then SIGKILL ([`grace`]); the grace is
+//!   outside the timeout and the memory watch, and at most 60 s; a process that
+//!   ignored SIGTERM is named in the lease's stderr. Shared memory a workload made with no
+//!   tracker process to remove it cannot be detected or cleaned on macOS, and is not
+//!   reported;
 //! - a wall-clock timeout, and the daemon's kill, each ending the whole process tree;
 //!   a timeout still stores what the action wrote to stdout and stderr
 //!   ([`kbf_daemon::RuntimeError::TimedOut`]);
@@ -77,9 +83,10 @@
 //! keeper and the start-up are each "every process of the slot's uid"
 //! ([`kbf_daemon::uid`]), so the process-tree gaps below do not apply to it. A root
 //! daemon without a pool refuses to start. Between two leases the slot is cleaned
-//! ([`slots::clean`]): its home, folders, keychains, preferences, crontab, `at` jobs,
-//! disk images and IPC objects, checked after, with the user made again or the slot
-//! quarantined when the check fails. What the pool does not do yet: make simulators
+//! ([`slots::clean`]): its launchd domain, home, folders, keychains, preferences,
+//! crontab, `at` jobs, disk images, IPC objects and crash reports, in one pass, checked
+//! after; a slot whose clean fails is dirty (not offered, the node reports one slot
+//! fewer) and is cleaned again before it is offered. What the pool does not do yet: make simulators
 //! in the slot user's device set (a lease that asks for one fails).
 //!
 //! Known gaps, all of them closed only by running each lease as its own user:
@@ -130,9 +137,12 @@
 //! keep actions out of each other's files and the daemon's key, and close the gaps
 //! above), CPU limits, and network isolation on Linux.
 
+#[cfg(any(target_os = "macos", test))]
+mod bounded;
 mod cas;
 mod config;
 pub mod denials;
+pub mod grace;
 pub mod home;
 mod keeper;
 pub mod mounts;
@@ -190,5 +200,5 @@ kbf_testkit::act_test_hook!();
 #[cfg(test)]
 as_user_test_hook!();
 
-pub use config::{MemoryPolicy, NativeConfig};
+pub use config::{DEFAULT_TERM_GRACE, MemoryPolicy, NativeConfig};
 pub use runtime::{DRIVER, KIND, NativeRuntime, SURVEY_DIR, WARM_UP_DIR};

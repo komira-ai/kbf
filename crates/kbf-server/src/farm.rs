@@ -66,6 +66,7 @@ mod ack;
 mod beat;
 mod durable;
 mod handover;
+mod learning;
 mod nodes;
 mod phase;
 mod record;
@@ -80,12 +81,14 @@ use self::durable::Durable;
 use crate::action_usage::{self, Measured, Shapes};
 use crate::fault;
 use crate::fleet::{NodeView, SoftwareView, attention_changes};
+use crate::learned::{Learned, LearnedSizes};
 use crate::machine::{FarmMachine, Platform, Sent, Waiter};
 use crate::memory;
 use crate::missing;
 use crate::run_record;
+use crate::size_key::Keyable;
 use crate::stamp::Stamp;
-use crate::update_status::{HostUpdate, UpdateReport};
+use crate::update_status::UpdateReport;
 
 /// The scheduler term of a new single-node server process: the wall-clock time of its
 /// start in milliseconds since the Unix epoch, times 2^16, plus 16 random bits.
@@ -316,6 +319,11 @@ struct State {
     /// The same for the operations relays follow ([`kbf_front::Handed::look`]), until
     /// the relay lets go of them.
     untraced_relayed: BTreeMap<OperationId, u32>,
+    /// The learned-sizes shadow ([`crate::learned`]); off unless `--learned-sizes`
+    /// says otherwise.
+    learned: Learned,
+    /// Lowered key floors the state store has not taken yet ([`State::lower_key_floors`]).
+    unwritten_floors: Vec<kbf_sched::KeyFloor>,
 }
 
 /// How many committed records the farm holds for a state store that refuses them.
@@ -416,8 +424,21 @@ impl Farm {
                 fenced: false,
                 untraced_kept: BTreeMap::new(),
                 untraced_relayed: BTreeMap::new(),
+                learned: Learned::new(LearnedSizes::Off, 0, 0),
+                unwritten_floors: Vec::new(),
             }),
         }
+    }
+
+    /// This farm, with learned sizes `mode` (`--learned-sizes`) over a first rung of
+    /// `default_memory` bytes. Set before the farm takes a state store over: `off` reads
+    /// none of the size summaries it holds.
+    #[must_use]
+    pub fn with_learned_sizes(mut self, mode: LearnedSizes, default_memory: u64) -> Self {
+        let epoch_unix_ms = self.epoch_unix_ms;
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        state.learned = Learned::new(mode, default_memory, epoch_unix_ms);
+        self
     }
 
     /// This farm, whose scheduler climbs `ladder` for an action that passes its memory limit
@@ -475,6 +496,7 @@ impl Farm {
         let metrics = self.cache.metrics();
         metrics.sched_queued.set(state.sched.queued_len() as u64);
         metrics.sched_leases.set(state.sched.leases_held() as u64);
+        state.learned.publish(&metrics.estimator_shadow);
     }
 
     /// Operations waiting in the scheduler's queue for a lease, now (read under the
@@ -673,34 +695,13 @@ impl Farm {
     /// replaced (a newer stream sends its own), exactly as [`Self::node_status`] keeps a
     /// `NodeStatus`. Returns whether it was kept.
     pub fn update_status(&self, worker: &WorkerId, stream: StreamId, status: UpdateStatus) -> bool {
-        let report = UpdateReport::new(status, unix_ms());
+        let report = UpdateReport::new(status);
         let mut state = self.lock();
         if !state.is_current(worker, stream) {
             return false;
         }
         state.machine.report_update(worker, report);
         true
-    }
-
-    /// Every node registered since this farm started, in node-id order, with what each
-    /// last said about its update (`GET /v1/update/hosts`); judged against no desired
-    /// commit ([`HostUpdate::judge`]).
-    pub fn update_hosts(&self) -> Vec<HostUpdate> {
-        let mut state = self.lock();
-        state.note_closed_streams();
-        state
-            .machine
-            .nodes()
-            .filter_map(|worker| {
-                let node = state.machine.node(worker)?;
-                Some(HostUpdate::new(
-                    worker.as_str().to_owned(),
-                    node.connected,
-                    node.update_live,
-                    node.update.clone(),
-                ))
-            })
-            .collect()
     }
 
     /// Sends `order` to `worker` on its newest stream.
@@ -747,8 +748,8 @@ impl Farm {
                         state.sched.phase(worker),
                         Some(NodePhase::Preparing(_) | NodePhase::Restoring(_))
                     ),
-                    // The report is kept across streams for the operator's views; the
-                    // controller reads only one its node's current stream sent.
+                    // The report is kept across streams; the controller reads only one
+                    // its node's current stream sent.
                     update: node
                         .filter(|n| n.update_live)
                         .and_then(|n| n.update.clone()),
@@ -800,6 +801,7 @@ impl Farm {
         let settled = {
             let mut state = self.lock();
             let answers = state.feed(now, Event::Tick);
+            state.flush_learned();
             self.publish(&state);
             let paused: BTreeSet<WorkerId> = state
                 .machine
@@ -1024,16 +1026,38 @@ impl Farm {
 
 impl Dispatch for Farm {
     fn submit(&self, mut submission: Submission) -> Result<Ticket, Status> {
+        // An action with no program and no output names no shape: all such actions would
+        // share one key.
+        let shaped =
+            !submission.described.arguments.is_empty() || !submission.described.outputs.is_empty();
         // Outside the lock: hashes the action's shape and drops its argv and paths.
         let usage = self
             .shapes
             .subject(std::mem::take(&mut submission.described));
         let shape = submission.call.as_ref().map(|_| usage.recorded());
         let now = self.now();
+        let platform = Platform::of(&submission.request.needs);
         let waiting = std::time::Instant::now();
         let mut state = self.lock();
         self.cache.metrics().sched_lock_wait.since(waiting);
-        state.admit(&submission.request, &usage)?;
+        let size_key = state
+            .learned
+            .keys()
+            .then(|| {
+                Keyable {
+                    instance: &submission.request.key.instance,
+                    platform: &platform,
+                    shape: usage.key,
+                    shaped,
+                    kind: submission.request.kind,
+                    gpus: submission.request.resources.gpus,
+                    memory: submission.evidence.memory_source,
+                }
+                .key()
+            })
+            .flatten();
+        state.admit(&submission.request, &usage, size_key)?;
+        let joined = state.sched.twin(&submission.request).is_some();
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
         let waiter = state.machine.submit(Waiter {
@@ -1042,14 +1066,28 @@ impl Dispatch for Farm {
             do_not_cache: submission.request.do_not_cache,
             queued: SystemTime::now(),
             usage,
-            platform: Platform::of(&submission.request.needs),
+            platform,
         });
         let name = state.machine.name(waiter);
+        state.learn_submit(
+            &name,
+            &submission.request,
+            &submission.evidence,
+            joined,
+            size_key,
+        );
         if let Some((call, shape)) = submission.call.take().zip(shape) {
-            state.record_submit(call.with_shape(shape), &name, &submission.request);
+            let call = call.with_shape(shape).with_evidence(submission.evidence);
+            state.record_submit(call, &name, &submission.request);
         }
         let (stage, receiver) = watch::channel(Stage::Queued);
         state.stages.insert(waiter, stage);
+        // The operation this submit allocates (none if it joins a twin, which keeps its
+        // own key) is named before the submit is fed: its first placement round follows.
+        if let Some(key) = size_key.filter(|_| !joined) {
+            let next = state.sched.next_operation();
+            state.sched.set_size_key(next, key);
+        }
         state.feed_quiet(
             now,
             Event::Submit {
@@ -1129,6 +1167,9 @@ impl State {
             exit_code,
             run,
         } = report;
+        // Before the feed: an own-limit kill's requeue writes what it taught the
+        // estimator in its own transaction.
+        self.stage_learning(operation, lease, worker, outcome, measured.as_ref());
         // Taken first: a report that finishes the operation may drop its callers.
         let usage = measured.and_then(|measured| {
             let (_, waiter) = self.first_waiter(operation)?;
@@ -1162,6 +1203,7 @@ impl State {
                 }
             }
         };
+        self.finish_learning(operation, lease, worker, accepted || taken == Taken::Held);
         if accepted && let Some((subject, measured)) = &usage {
             action_usage::log(operation, subject, measured, outcome, lease, worker);
         }
@@ -1230,6 +1272,7 @@ impl State {
     /// answers, for the caller to deliver once the lock is released.
     fn carry_out(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
         self.watch_store(now);
+        self.learned.clock(now);
         // Only the inputs whose callers deliver answers ([`State::feed_quiet`]) release
         // effects an earlier refusal held back: one of them may be an answer.
         let answering = matches!(
@@ -1462,6 +1505,7 @@ impl State {
             },
         };
         self.machine.start(start.lease, sent);
+        self.learned.on_start(&start);
         self.record_started(&start);
     }
 
@@ -1649,5 +1693,7 @@ fn unrun(outcome: Outcome, farm_runs: &[FarmRun]) -> Finished {
     }
 }
 
+#[cfg(test)]
+mod learned_tests;
 #[cfg(test)]
 mod tests;

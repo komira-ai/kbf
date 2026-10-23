@@ -27,6 +27,13 @@
 //! | `Active`     | yes                                         | yes                           | rank order |
 //! | `Draining`   | no: its successor takes its slot at once    | yes                           | rank order, before the successor |
 //! | `Down`       | yes: it keeps its slot for the dwell; the caller skips it and records a repair | yes | never listed |
+//! | `Unknown`    | no                                          | not known                     | never listed |
+//!
+//! `Unknown` is a state this build does not name: a later build wrote it. The map is still
+//! read, as formats change by adding only; the member stays in it, takes no work and is not
+//! counted as `Active`, and the number it came with is kept so that writing the map or its
+//! row back says what it said. A placement [`Rule`] this build does not name reads as
+//! [`Rule::Unknown`] in the same way: the rest of the map applies, and no one is placed.
 //!
 //! Draining is the reverse of joining: join adds a write owner that is read last until
 //! it has caught up; drain removes a write owner that is read first until its successor

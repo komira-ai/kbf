@@ -20,7 +20,8 @@
 //! A commit that already has a directory is never rewritten: the same bytes are the same
 //! release (nothing is copied or run again), other bytes are refused. A directory is trusted
 //! only with its marker and when its binary still hashes to what the source hashes to.
-//! A killed copy leaves a `.partial-*` entry, which [`Copies::new`] removes.
+//! A killed copy leaves a `.partial-*` entry, which [`Copies::new`] removes. A copy that is no
+//! longer wanted is taken out by [`Copies::prune`], which is told which commits to keep.
 //!
 //! The words a [`Copies::ensure`] refusal starts with are `copy_failed`, `probe_failed`,
 //! `commit_mismatch` and `differs`.
@@ -53,12 +54,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::migrator::probe_version;
 use super::model::{Locator, PortError, StagedFacts};
 use super::ports::{RootOrders, StatusFacts};
 use super::root_orders::StatusFile;
 use crate::CommitId;
 use crate::layout::{RELEASE_BINARY, VERIFIED};
+use crate::migrator::{MigrateError, probe_version};
 use crate::run::Runner;
 
 /// The name a copy being made has in the root, up to its process id and number.
@@ -207,6 +208,40 @@ impl Copies {
         ctx(placed, "install", &dir)?;
         Ok(self.program(commit))
     }
+
+    /// Remove the copy of every commit that is not in `keep`; the commits removed. Entries
+    /// that are not a commit's directory (a `.partial-*` entry, a stray file or link, even one
+    /// named like a commit) are left alone.
+    ///
+    /// A copy is first renamed to a `.partial-gone-*` name, so a name that is a commit is never
+    /// a copy with some of its files gone (a later [`ensure`](Self::ensure) of the commit would
+    /// refuse that as `differs`); a removal that is cut short leaves an entry that
+    /// [`Copies::new`] sweeps.
+    ///
+    /// # Errors
+    /// The root cannot be listed, or a copy cannot be renamed or removed; the copies before it
+    /// are gone.
+    pub fn prune(&self, keep: &[CommitId]) -> io::Result<Vec<CommitId>> {
+        let pid = std::process::id();
+        let mut removed = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(commit) = name.to_str().and_then(|name| CommitId::new(name).ok()) else {
+                continue;
+            };
+            let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+            if !is_dir || keep.contains(&commit) {
+                continue;
+            }
+            let n = self.next.fetch_add(1, Ordering::Relaxed);
+            let gone = self.root.join(format!("{PARTIAL}gone-{pid}-{n}"));
+            fs::rename(entry.path(), &gone)?;
+            fs::remove_dir_all(&gone)?;
+            removed.push(commit);
+        }
+        Ok(removed)
+    }
 }
 
 /// A directory being made: removed when dropped. After the rename it is no longer there to
@@ -228,7 +263,7 @@ fn ctx<T>(result: io::Result<T>, what: &str, path: &Path) -> Result<T, CopyError
 }
 
 /// A failed probe, without the migrator's own word: the words here are this module's.
-fn probe_failed(e: PortError) -> CopyError {
+fn probe_failed(e: MigrateError) -> CopyError {
     let text = e.0.as_str();
     let why = text.split_once(": ").map_or(text, |(_, rest)| rest);
     CopyError::ProbeFailed(why.to_owned())

@@ -29,17 +29,18 @@
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::child_real::{Argv, ProcChild};
 use kbf_proxy::config::UpstreamTable;
 use kbf_proxy::route::Target;
 
 use super::admin::{Admin, Deadlines};
+use super::binary_watch::InUse;
 use super::boot::{Booted, ColdBoot, Reason, Report, Retry, Source};
 use super::child_http::Headers;
 use super::cold::{Cold, ReadyRule};
 use super::gate_real::{ProxyGate, gate_slot};
-use super::migrator::{DbMigrator, installed_schema};
 use super::model::{PortError, ProcIdent, RoleState, Slot, Start, Timing};
 use super::ports::{Child as _, ChildAdmin, Clock, Migrator, StatusFacts};
 use super::record::FileRecorder;
@@ -48,6 +49,7 @@ use super::root_orders::installed_commit;
 use crate::CommitId;
 use crate::database::Database;
 use crate::layout::Layout;
+use crate::migrator::{DbMigrator, installed_schema};
 use crate::run::{Runner, SystemRunner};
 
 /// How the start ended.
@@ -80,6 +82,22 @@ pub fn run_from_copies(child: ProcChild, local: Option<&Local>) -> ProcChild {
         Some(local) => child.with_releases(local.copies.root().to_owned()),
         None => child,
     }
+}
+
+/// The commits the records of the two slots name: what `child` started in a slot and no exit
+/// has cleared, so a process of that release may still run. Its copy is not to be removed.
+pub fn running_commits(child: &ProcChild) -> Vec<CommitId> {
+    [Slot::A, Slot::B]
+        .into_iter()
+        .filter_map(|slot| child.recorded(slot))
+        .map(|recorded| recorded.commit)
+        .collect()
+}
+
+/// What the binary watch asks for the commits a process may still run: [`running_commits`] of
+/// `child`, read at each prune.
+pub fn in_use(child: Arc<ProcChild>) -> InUse {
+    Box::new(move || running_commits(&child))
 }
 
 /// The command line of a frontend child after its program: its mode, the four loopback
@@ -206,7 +224,7 @@ impl Migrator for NoMigration {
 /// `--kbf-binary`, the proxy's own `releases.json`); the installed release's `state_schema`
 /// (which `status.json` does not keep across a restart of the root half) is asked of its own
 /// binary under `child`'s layout, run as the proxy's user.
-/// A refusal carries a stable word ([`super::migrator::Refusal::word`]) and no part of the
+/// A refusal carries a stable word ([`crate::migrator::Refusal::word`]) and no part of the
 /// database URL.
 pub fn host_migrator<'a>(
     database: Database,

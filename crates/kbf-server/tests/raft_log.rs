@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use kbf_front::{MetaLog, MetaLogError};
-use kbf_log::{Bootstrap, DecodeError, FarmLogId, Format, LogCommand, MachineVersion, Takeover};
+use kbf_log::{Bootstrap, FarmLogId, Format, LogCommand, MachineVersion, Takeover};
 use kbf_meta::{
     ActionAnswer, ActionRecord, Applied, BlobAnswer, BlobWrite, Closure, Command, Epoch, Evicted,
     Location, MetaState, NodeWriter, ObjectId, Retention, Role, ServerId, StagedObject, StagedPut,
@@ -467,29 +467,29 @@ async fn a_control_command_in_the_metadata_log_refuses_the_open() {
     );
 }
 
-/// Catches: a write-tier command in the metadata log applied, or skipped, by this
-/// binary, whose log is format 1 (docs/design/write-path.md section 9, "a log holding
-/// each new variant, opened by a reader without it, is refused"). Each of the five
-/// commands, alone at the end of the log, refuses the open with the entry's index.
-/// Mutant: the machine decodes under format 2.
+/// Asserts that a write-tier command at the end of a format-1 log is read and applied,
+/// not refused: decoding does not depend on the log's format. Each of the five
+/// commands, alone at the end of the log, lets the open succeed and the log stays at
+/// machine version 1; the `AddTier` entry gives its server the tier, and the others
+/// leave that server without one.
 #[tokio::test]
-async fn a_write_tier_command_in_a_format_1_log_refuses_the_open() {
+async fn a_write_tier_command_in_a_format_1_log_is_applied() {
     let object = ObjectId::new(Epoch::new(1), 1);
-    let tier = kbf_meta::TierId::new(1);
+    let tier = TierId::new(1);
     let commands = [
-        Command::AddTier {
-            server: kbf_meta::ServerId::new(1),
-            tier,
-        },
-        Command::PutStaged {
-            tier,
-            objects: Vec::new(),
-        },
-        Command::SealStaged { object },
-        Command::ObjectFlushed { object },
-        Command::FlushConflict { object },
+        (add_tier(), Some(tier)),
+        (
+            Command::PutStaged {
+                tier,
+                objects: Vec::new(),
+            },
+            None,
+        ),
+        (Command::SealStaged { object }, None),
+        (Command::ObjectFlushed { object }, None),
+        (Command::FlushConflict { object }, None),
     ];
-    for command in commands {
+    for (command, expected) in commands {
         let fs = FaultFs::new();
         drop(open(&fs, 2).await);
         let dir = fs.restart();
@@ -503,11 +503,13 @@ async fn a_write_tier_command_in_a_format_1_log_refuses_the_open() {
         };
         store.write_entries(&[entry]).expect("append");
         drop(store);
-        let refused = refusal(&dir.restart(), 2).await;
-        assert!(
-            matches!(&refused, RaftLogError::Decode { index, .. } if *index == last.index.0 + 1),
-            "{command:?}: {refused:?}"
+        let log = open(&dir.restart(), 2).await;
+        assert_eq!(
+            log.query(|m| m.tier(ServerId::new(1))).await,
+            Ok(expected),
+            "{command:?}"
         );
+        assert_eq!(log.machine_version(), MachineVersion::V1, "{command:?}");
     }
 }
 
@@ -852,17 +854,13 @@ async fn a_version_2_log_reopens_at_version_2_with_the_same_answers() {
     );
 }
 
-/// Format 3's second condition: a node whose log is at version 2 refuses an
-/// `EvictObjects` entry loudly, never skips it. The entry is appended by hand (this
-/// binary never encodes one into a version-2 log), in format-3 bytes, after a raise to
-/// 2 and a format-2 command; both this binary (which runs 3) and one that runs only 2
-/// refuse the open at the entry's index with `UnknownCommand("MetaCommand")`, and keep
-/// refusing it. Catches: a machine that decodes every entry under format 3 (mutant:
-/// `decode(Format::V3, ..)` in `MetaMachine::apply`; the evict then applies), and one
-/// that skips an entry it cannot decode (mutant: `Err(_) => {}`; the log opens without
-/// the entry).
+/// Asserts that an `EvictObjects` entry in a log at version 2 is read and applied, not
+/// refused: decoding does not depend on the log's format. The entry is appended by hand
+/// (this binary never encodes one into a version-2 log), in format-3 bytes, after a raise
+/// to 2 and a format-2 command; both this binary (which runs 3) and one that runs only 2
+/// open the log, evict the blob the entry names, and leave the log at version 2.
 #[tokio::test]
-async fn an_evict_entry_in_a_version_2_log_refuses_the_open() {
+async fn an_evict_entry_in_a_version_2_log_is_applied() {
     let fs = FaultFs::new();
     let log = open(&fs, 8).await;
     let e = epoch(&log).await;
@@ -873,28 +871,32 @@ async fn an_evict_entry_in_a_version_2_log_refuses_the_open() {
     log.raise_machine_version(MachineVersion::V2)
         .expect("a raise");
     assert_eq!(log.commit(add_tier()).await, Ok(Applied::Tier(Ok(()))));
+    assert_eq!(log.query(|m| m.blob_count()).await, Ok(1));
     drop(log);
     let dir = fs.restart();
     let evict = LogCommand::Meta(Command::EvictObjects {
         objects: [ObjectId::new(Epoch::new(e), 1)].into(),
     });
-    let index = append(&dir, Format::V3, &evict);
+    append(&dir, Format::V3, &evict);
     for runs in [MachineVersion::V3, MachineVersion::V2, MachineVersion::V3] {
-        let refused = RaftMetaLog::open_running(
+        let log = RaftMetaLog::open_running(
             dir.restart(),
             Retention::default(),
             "kbf/",
             || Ok(id(8)),
             runs,
         )
-        .await;
-        assert!(
-            matches!(
-                &refused,
-                Err(RaftLogError::Decode { index: i, source: DecodeError::UnknownCommand("MetaCommand") })
-                    if *i == index
-            ),
-            "running {runs:?}: {refused:?}"
+        .await
+        .expect("open the log");
+        assert_eq!(
+            log.query(|m| m.blob_count()).await,
+            Ok(0),
+            "blobs left after running {runs:?}"
+        );
+        assert_eq!(
+            log.machine_version(),
+            MachineVersion::V2,
+            "version after running {runs:?}"
         );
     }
 }

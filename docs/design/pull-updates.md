@@ -1,5 +1,7 @@
 # Pull-based updates: hosts update themselves over the session they already hold
 
+Retired: the node update client (`kbf-update`, the daemon's `update_status` reporting and the `--update-dir` and `--orders-dir` flags) was deleted; the flags parse, do nothing and warn for one release. Passages below that describe that client are history.
+
 Status: design; the wire contract (section 5) is frozen. Built or in review: `kbf-installer` (merged), `kbf-update` (the node client, #908) and `kbf-helper` (the root helper, #929). The rest is built in the units of section 11.
 **Revised for two rulings:** (1) node updates and the frontend's own update are decoupled (section 1 item 7, section 8); (2) the host's root tool pulls the release itself, in an unprivileged child, on the frontend's order, and kbf no longer stages release bytes into an inbox (sections 1, 2, 4, 5, 7 and 10). Where a built crate (`kbf-update`, `kbf-helper`) still has the inbox, this text is the target and section 7.5 lists what is removed. The root tool is `kbf-installer` as [distribution.md](distribution.md) section 6 describes; `kbf-helper` is folded into it. Where later text still says "the helper" (the as-built order rules, `helper.json`, `kbf-helper boot-check`), it means the root side of `kbf-installer`.
 Adapted from the pull-update design study; labels: **[F]** read in code at the time of writing,
@@ -316,7 +318,7 @@ the disk index, never the reverse. The desired release, the slot, the per-host p
 - `POST /v1/update/desired {commit, expect_generation?}` (write gates, JSON body, no other key): without `expect_generation` the write is as above. With it, the write happens only if the desired release is at that generation (0 before any offer); otherwise it is 409 with a message naming both generations and nothing is written. The answer is the desired release. The 409 has two causes, told apart only by the error text: the commit has no complete platform, or `expect_generation` is not the current generation. The stale check runs before the same-commit shortcut, so a stale `expect_generation` with the commit already desired is 409, not a 200 no-op; a missing or null `expect_generation` skips the check. A negative or non-integer value is 400. A malformed body or commit is 400; contended retries are 503 with `Retry-After: 1`.
 - `POST /v1/update/pause` and `POST /v1/update/resume` (write gates, no body) set `paused` in the policy row by compare-and-set of that field alone, need no run, and answer `{paused}` whatever the current value. The first pause or resume creates the policy row with the defaults, so `policy` in `GET /v1/update` is non-null from then on. While `paused` is set no host is started. An offer leaves the flag as it is. These two need only `--state-store`.
 - Updates are triggered externally: the deployment that rolls out a release calls `POST /v1/update/desired`. There is no auto-update endpoint. Planned: `POST /v1/update/policy` (admin), to set the other policy fields, and `GET /v1/update/plan?commit=`, a read that computes the plan (hosts and blockers) and stores nothing; neither route exists yet.
-- `GET /v1/nodes` gains, per node, `update: {state, up_to_date, availability}` (`up_to_date` is true, false or null; `availability` is `ok`, `unavailable` or `unsupported`). The three commits, the offered generation, the refusal (capped at 512 bytes) and `helper_present` are on `GET /v1/update/hosts` (off unless the policy names `farm.getAuthorizer`).
+- `GET /v1/nodes` lists no per-node `update` object, and there is no `GET /v1/update/hosts`: both were removed. The server keeps each host's `UpdateStatus` for the update controller only.
 
 ### 6.4 Sessions
 
@@ -334,7 +336,7 @@ from the farm and each node's `UpdateStatus` of its current stream. A Linux host
 is joined to its storage member by the address it advertised at enrollment, matched exactly; the
 mark is `Members::plan_down` and its undoing `Members::undo_plan`; a host that matches no member is
 never started. **Not yet:** no operator action starts a run with `auto_nodes` written off.
-`GET /v1/nodes` lists `update` per node and `GET /v1/update/hosts` its detail (`docs/api.md`).
+The server keeps each host's `UpdateStatus` for the update controller only: no route lists it.
 
 **Mixed versions.** `auto_nodes` is a plain bool in the `update/policy` row, so a row that does not
 carry it reads false; a policy row that was never written reads as the defaults, true. An old frontend's

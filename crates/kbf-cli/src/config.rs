@@ -233,6 +233,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "drain-deadline-secs",
             "driver",
             "image",
+            "native-term-grace-ms",
             "orders-dir",
             "reconnect-max-ms",
             "reconnect-ms",
@@ -267,6 +268,7 @@ const GROUPS: &[(&str, &[&str])] = &[
     (
         "memory",
         &[
+            "learned-sizes",
             "memory-headroom-mib",
             "memory-ladder-gib",
             "memory-limit-percent",

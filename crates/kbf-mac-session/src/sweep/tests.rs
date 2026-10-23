@@ -227,8 +227,9 @@ fn named_entries_go_whole_and_absent_ones_are_fine() {
     assert_eq!(swept.errors, ["/: not a path to an entry"]);
 }
 
-/// Catches: an error swallowed (a sweep reported complete with entries left), or a
-/// walk that stops at the first stuck entry.
+/// Catches: an error swallowed (a sweep reported complete with entries left), a walk that
+/// stops at the first stuck entry, and another owner's unreadable directory failing this
+/// uid's sweep (the shared places hold other leases' directories).
 #[test]
 fn places_that_cannot_be_read_are_errors_and_the_walk_goes_on() {
     if root() {
@@ -255,16 +256,15 @@ fn places_that_cannot_be_read_are_errors_and_the_walk_goes_on() {
         named: vec![format!("{}/tabs/{{user}}", dir.display())],
         owned: vec![locked.clone(), base.clone()],
     };
-    // Another uid: the walk descends, so every unreadable directory is an error (a
-    // directory without search permission cannot even be listed).
+    // Another uid: the walk descends, and a directory it cannot search below the plan's
+    // folders belongs to someone else (another lease may be flipping it): logged and
+    // skipped, never this uid's failure. The plan's own places are still errors.
     let swept = sweep(&plan, "u", other());
     let mut errors = swept.errors.clone();
     errors.sort();
-    assert_eq!(errors.len(), 4, "{errors:?}");
-    assert!(errors[0].contains("Shared/no-read:"), "{errors:?}");
-    assert!(errors[1].contains("Shared/no-search:"), "{errors:?}");
-    assert!(errors[2].contains("/locked"), "{errors:?}");
-    assert!(errors[3].contains("/tabs/u"), "{errors:?}");
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(errors[0].contains("/locked"), "{errors:?}");
+    assert!(errors[1].contains("/tabs/u"), "{errors:?}");
     assert_eq!(swept.removed, 0);
 
     // The departing uid: what it owns goes where it can, the rest is reported.
@@ -287,12 +287,12 @@ fn places_that_cannot_be_read_are_errors_and_the_walk_goes_on() {
     }
 }
 
-/// Catches: unbounded recursion, by which a lease user could exhaust the helper's
-/// stack or descriptors with a deep tree. The departing user's own deep tree fails
-/// its deletion closed; another user's deep tree is not searched below the limit, so
-/// it cannot stop every other lease's deletion (a CI run showed one doing just that).
+/// Catches a deep tree that makes the sweep fail (a lease builds 300 directories to cost
+/// its slot for good), a search of another owner's deep tree that fails or blocks, and a
+/// removal that recurses without a bound: another uid's view of the tree is searched to
+/// the limit with no error and no removal; the departing uid's own tree is removed whole.
 #[test]
-fn deep_trees_are_bounded_without_blocking_other_users() {
+fn deep_trees_are_removed_and_other_owners_are_searched_to_a_limit() {
     let _base_own = scratch("deep");
     let base = _base_own.join("Shared");
     let mut deep = base.clone();
@@ -304,16 +304,65 @@ fn deep_trees_are_bounded_without_blocking_other_users() {
     // Another uid's view: the tree is someone else's; searched to the limit, no error.
     let swept = sweep(&owned_plan(&base), "u", other());
     assert_eq!(swept, Swept::default());
-    // The departing uid's own tree: removing it would go below the limit.
+    // The departing uid's own tree: removed, whatever its depth.
     let swept = sweep(&owned_plan(&base), "u", me());
-    assert_eq!(swept.errors.len(), 1, "{:?}", swept.errors);
-    assert!(
-        swept.errors[0].contains("nested deeper than 256"),
-        "{:?}",
-        swept.errors
+    assert_eq!(swept.errors, Vec::<String>::new());
+    assert_eq!(names(&base), Vec::<String>::new());
+}
+
+/// Makes `levels` directories below `top`, one inside the next, with a file in the last,
+/// through descriptors (a path that long does not fit in one call).
+fn build_deep(top: &Path, levels: usize) {
+    let mut fd = rustix::fs::openat(rustix::fs::CWD, top, DIRECTORY, Mode::empty()).unwrap();
+    for _ in 0..levels {
+        rustix::fs::mkdirat(&fd, "d", Mode::from_raw_mode(0o700)).unwrap();
+        fd = rustix::fs::openat(&fd, "d", DIRECTORY, Mode::empty()).unwrap();
+    }
+    let leaf = rustix::fs::openat(
+        &fd,
+        "leaf",
+        OFlags::WRONLY | OFlags::CREATE | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
     );
-    assert!(deep.join("f").is_file());
-    fs::remove_dir_all(base.parent().unwrap()).unwrap();
+    drop(leaf.unwrap());
+}
+
+/// Catches a removal that cannot take a tree deeper than its recursion bound and one that
+/// loses part of it: a tree 1000 directories
+/// deep, with a file at every hundredth level, is removed by `empty`, by `sweep`, by a
+/// named entry, and by a kept folder, leaving nothing and nothing parked behind.
+#[test]
+fn a_tree_a_thousand_deep_is_removed_by_every_walk() {
+    for how in ["empty", "sweep", "named", "kept"] {
+        let dir = scratch(&format!("thousand-{how}"));
+        let top = dir.join("top");
+        fs::create_dir(&top).unwrap();
+        build_deep(&top, 1000);
+        let swept = match how {
+            "empty" => empty(&top, me()),
+            "sweep" => sweep(&owned_plan(&dir), "u", me()),
+            "named" => {
+                let plan = SweepPlan {
+                    named: vec![format!("{}/d", top.display())],
+                    owned: Vec::new(),
+                };
+                sweep(&plan, "u", me())
+            }
+            _ => empty_keeping(&dir, me(), &["top"]),
+        };
+        assert_eq!(swept.errors, Vec::<String>::new(), "{how}");
+        let left = match how {
+            "named" => names(&top),
+            "sweep" => names(&dir),
+            "kept" => names(&top),
+            _ => names(&top),
+        };
+        assert_eq!(
+            left,
+            Vec::<String>::new(),
+            "{how}: nothing is left or parked"
+        );
+    }
 }
 
 /// Catches: a walk that crosses into another mounted filesystem, or that removes a
@@ -328,12 +377,26 @@ fn another_filesystem_or_a_swapped_directory_is_not_entered() {
     let dev = rustix::fs::fstat(&dir).unwrap().st_dev;
     let mut swept = Swept::default();
     // Every entry looks as if it were on another filesystem: none is touched.
-    walk_owned(&dir, &base, me(), dev + 1, 0, &mut swept).unwrap();
+    walk_owned(
+        &dir,
+        &base,
+        (me(), dev + 1),
+        (0, &Park::new(&dir)),
+        &mut swept,
+    )
+    .unwrap();
     assert_eq!(swept, Swept::default());
     assert_eq!(names(&base), ["empty", "file", "tree"]);
 
     let stat = rustix::fs::statat(&dir, "tree", AtFlags::SYMLINK_NOFOLLOW).unwrap();
-    let error = remove_entry(&dir, OsStr::new("tree"), &stat, me(), dev + 1, 1).unwrap_err();
+    let error = remove_entry(
+        &dir,
+        OsStr::new("tree"),
+        &stat,
+        (me(), dev + 1, 1),
+        &Park::new(&dir),
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("another filesystem"), "{error}");
 
     let empty = rustix::fs::statat(&dir, "empty", AtFlags::SYMLINK_NOFOLLOW).unwrap();
@@ -540,8 +603,14 @@ fn an_entry_gone_since_it_was_examined_is_removed_already() {
     for name in ["file", "dir"] {
         let stat = rustix::fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW).unwrap();
         remove(&base.join(name));
-        remove_entry(&dir, OsStr::new(name), &stat, me(), dev, 1)
-            .unwrap_or_else(|why| panic!("{name}: {why}"));
+        remove_entry(
+            &dir,
+            OsStr::new(name),
+            &stat,
+            (me(), dev, 1),
+            &Park::new(&dir),
+        )
+        .unwrap_or_else(|why| panic!("{name}: {why}"));
     }
 }
 
@@ -584,4 +653,396 @@ fn a_vanished_entry_does_not_hide_a_real_error() {
     assert_eq!(swept.errors.len(), 1, "{swept:?}");
     assert!(swept.errors[0].contains("Shared/locked: "), "{swept:?}");
     assert!(!swept.errors[0].contains("No such file"), "{swept:?}");
+}
+
+/// A `/var/folders` entry as macOS makes it: the kept folders `0`, `C`, `T` and `X`,
+/// each holding a file and a tree, and the stray `junk` file, `stray` directory and
+/// `T`-named link the entry root must not keep.
+fn entry_root(dir: &Path) -> PathBuf {
+    let entry = dir.join("entry");
+    fs::create_dir(&entry).unwrap();
+    for kept in ["0", "C", "T", "X"] {
+        fs::create_dir_all(entry.join(kept).join("sub/deeper")).unwrap();
+        fs::write(entry.join(kept).join("file"), "x").unwrap();
+        fs::write(entry.join(kept).join("sub/deeper/leaf"), "x").unwrap();
+    }
+    fs::write(entry.join("junk"), "x").unwrap();
+    fs::create_dir_all(entry.join("stray/inside")).unwrap();
+    fs::write(entry.join("stray/inside/f"), "x").unwrap();
+    entry
+}
+
+/// Catches the entry sweep that removes the kept folders themselves (the next lease's
+/// `getconf DARWIN_USER_TEMP_DIR` would name a folder that is gone), the one that
+/// empties only the kept folders and leaves a file or folder of another name in the
+/// entry root (a pool user's file there survived the clean: `junk` and `stray` here), one that keeps a folder that is
+/// not named, and one that walks through a link planted under a kept name.
+#[test]
+fn empty_keeping_empties_the_named_folders_and_removes_everything_else() {
+    let dir = scratch("keeping");
+    let entry = entry_root(&dir);
+    let outside = dir.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("kept"), "x").unwrap();
+    // `Y` is not named: a link under a kept name is not a folder either.
+    fs::remove_dir_all(entry.join("X")).unwrap();
+    symlink(&outside, entry.join("X")).unwrap();
+    let swept = empty_keeping(&entry, me(), &["0", "C", "T", "X"]);
+    assert_eq!(swept.errors, Vec::<String>::new());
+    assert_eq!(names(&entry), ["0", "C", "T"]);
+    for kept in ["0", "C", "T"] {
+        assert_eq!(names(&entry.join(kept)), Vec::<String>::new(), "{kept}");
+    }
+    assert!(outside.join("kept").exists(), "the link was followed");
+    // Nothing named: the entry is emptied whole.
+    let swept = empty_keeping(&entry, me(), &[]);
+    assert_eq!(swept.errors, Vec::<String>::new());
+    assert!(names(&entry).is_empty());
+}
+
+/// Catches a kept folder whose contents the sweep cannot remove hiding behind the
+/// removal of the rest: the error names the kept folder's entry and the other entries
+/// still go.
+#[test]
+fn a_kept_folder_that_cannot_be_emptied_is_an_error_and_the_rest_goes() {
+    if root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = scratch("keeping-error");
+    let entry = entry_root(&dir);
+    fs::create_dir(entry.join("T/locked")).unwrap();
+    fs::write(entry.join("T/locked/f"), "x").unwrap();
+    chmod(&entry.join("T/locked"), 0o000);
+    let swept = empty_keeping(&entry, me(), &["0", "C", "T", "X"]);
+    chmod(&entry.join("T/locked"), 0o700);
+    assert_eq!(swept.errors.len(), 1, "{swept:?}");
+    assert!(swept.errors[0].contains("entry/T/locked:"), "{swept:?}");
+    assert_eq!(names(&entry), ["0", "C", "T", "X"]);
+    assert_eq!(names(&entry.join("T")), ["locked"]);
+    assert!(names(&entry.join("C")).is_empty());
+}
+
+/// Catches a kept folder removed under the sweep (gone since it was examined) read as an
+/// error, as the plain walk treats a vanished entry.
+#[test]
+fn a_kept_folder_gone_since_it_was_examined_holds_nothing() {
+    let dir = scratch("keeping-gone");
+    let entry = entry_root(&dir);
+    let gone = entry.join("C");
+    let swept = vanishing(after_examining("C", gone), || {
+        empty_keeping(&entry, me(), &["C"])
+    });
+    assert_eq!(swept.errors, Vec::<String>::new(), "{swept:?}");
+    assert!(names(&entry).is_empty());
+}
+
+/// Catches a mode that stays 0 (the owner's `u+rwx` is not set on what the departing
+/// uid owns, so the removal that follows could not enter it as that uid), a clear that
+/// changes what another uid owns (a hard link to a system file keeps its mode: here an
+/// entry the walk does not count as the uid's), one that follows a link out of the
+/// tree, one that walks into another mode's folder without listing it, and a walk that
+/// stops at the first error.
+#[test]
+fn clear_flags_makes_the_uids_entries_rwx_and_leaves_other_owners_alone() {
+    if root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = scratch("clear");
+    let home = dir.join("home");
+    fs::create_dir_all(home.join("a/b")).unwrap();
+    fs::write(home.join("a/b/f"), "x").unwrap();
+    fs::write(home.join("g"), "x").unwrap();
+    let outside = dir.join("outside");
+    fs::write(&outside, "x").unwrap();
+    chmod(&outside, 0o600);
+    symlink(&outside, home.join("link")).unwrap();
+    chmod(&home.join("a/b/f"), 0o400);
+    chmod(&home.join("g"), 0o400);
+    chmod(&home.join("a/b"), 0o500);
+    chmod(&home, 0o500);
+    let swept = clear_flags(&home, me());
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+    let modes = [
+        mode(&home.join("a/b/f")),
+        mode(&home.join("g")),
+        mode(&home.join("a/b")),
+        mode(&outside),
+    ];
+    // Another uid's entries: counted nowhere, changed nowhere.
+    let others = clear_flags(&home, other());
+    chmod(&home, 0o700);
+    chmod(&home.join("a/b"), 0o700);
+    assert_eq!(swept.errors, Vec::<String>::new());
+    assert_eq!(modes, [0o700, 0o700, 0o700, 0o600]);
+    assert_eq!(swept.removed, 5, "a, b, f, g and the link: {swept:?}");
+    assert_eq!(others.removed, 0, "{others:?}");
+    assert_eq!(clear_flags(&dir.join("absent"), me()), Swept::default());
+}
+
+/// Catches a flag clear that fails on a deep tree (a lease that builds one would cost its
+/// slot for good: the removal that follows clears the locks itself) or that recurses
+/// without a bound: past the limit it stops looking, with no error, for either owner.
+#[test]
+fn clear_flags_stops_at_its_depth_limit_without_an_error() {
+    let dir = scratch("clear-deep");
+    let home = dir.join("home");
+    fs::create_dir(&home).unwrap();
+    let mut deep = home.clone();
+    for _ in 0..=MAX_DEPTH + 1 {
+        deep.push("d");
+    }
+    fs::create_dir_all(&deep).unwrap();
+    let swept = clear_flags(&home, me());
+    assert_eq!(swept.errors, Vec::<String>::new(), "{swept:?}");
+    // Another owner's deep tree is nobody's to fail on: searched to the limit, no error.
+    assert_eq!(clear_flags(&home, other()), Swept::default());
+}
+
+/// Catches a kept folder that another process swaps for a link between the examination and
+/// the open being followed, or passing as emptied: the open refuses the link (it is
+/// opened without following) and the entry is an error naming the folder, the link's
+/// target untouched.
+#[test]
+fn a_kept_folder_swapped_for_a_link_since_it_was_examined_is_an_error() {
+    let dir = scratch("kept-swap");
+    let entry = dir.join("entry");
+    fs::create_dir_all(entry.join("C")).unwrap();
+    let outside = dir.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("kept"), "x").unwrap();
+    let (c, target) = (entry.join("C"), outside.clone());
+    let done = std::cell::Cell::new(false);
+    let swept = vanishing(
+        move |point, _| {
+            if matches!(point, Point::Examined(n) if *n == "C") && !done.replace(true) {
+                remove(&c);
+                symlink(&target, &c).unwrap();
+            }
+        },
+        || empty_keeping(&entry, me(), &["C"]),
+    );
+    assert_eq!(swept.errors.len(), 1, "{swept:?}");
+    assert!(swept.errors[0].contains("entry/C:"), "{swept:?}");
+    assert!(outside.join("kept").exists(), "the link was followed");
+}
+
+/// Catches an entry of a kept folder that vanishes between the listing and its examination
+/// read as an error: it is removed already, and the folder is emptied without one.
+#[test]
+fn an_entry_of_a_kept_folder_gone_since_the_listing_is_no_error() {
+    let dir = scratch("kept-gone-entry");
+    let entry = dir.join("entry");
+    fs::create_dir_all(entry.join("C")).unwrap();
+    fs::write(entry.join("C/only"), "x").unwrap();
+    let only = entry.join("C/only");
+    let swept = vanishing(after_listing(2, move || remove(&only)), || {
+        empty_keeping(&entry, me(), &["C"])
+    });
+    assert_eq!(swept.errors, Vec::<String>::new(), "{swept:?}");
+}
+
+/// Catches a flag clear that errors on an entry gone since the listing, and one that enters
+/// another filesystem: the first is passed over, and with every entry reported on another
+/// device none is changed or entered.
+#[test]
+fn clear_flags_passes_over_a_vanished_entry_and_never_crosses_a_device() {
+    let dir = scratch("clear-edges");
+    let home = dir.join("home");
+    fs::create_dir_all(home.join("a")).unwrap();
+    fs::write(home.join("b"), "x").unwrap();
+    chmod(&home.join("b"), 0o400);
+    let gone = home.join("b");
+    let swept = vanishing(after_listing(1, move || remove(&gone)), || {
+        clear_flags(&home, me())
+    });
+    assert_eq!(swept.errors, Vec::<String>::new(), "{swept:?}");
+    let opened = open_base(&home).unwrap().unwrap();
+    let dev = rustix::fs::fstat(&opened).unwrap().st_dev;
+    let mut other_device = Swept::default();
+    clear_below(&opened, &home, me(), dev + 1, 0, &mut other_device).unwrap();
+    assert_eq!(other_device, Swept::default());
+}
+
+/// Runs `body` in a child of this test binary whose soft limit of open descriptors is 120
+/// (a Mac's default is 256, and the daemon's soft limit can stay there): the parent runs
+/// the test again as the child (`name` is the test's own name) and asserts it passed.
+/// A walk that holds a descriptor per level to 256 fails in the child with `EMFILE`.
+fn with_few_descriptors(name: &str, body: impl FnOnce()) {
+    if std::env::var_os("KBF_FEW_DESCRIPTORS").is_some() {
+        let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        let lowered = rustix::process::Rlimit {
+            current: Some(120),
+            maximum: limit.maximum,
+        };
+        rustix::process::setrlimit(rustix::process::Resource::Nofile, lowered).unwrap();
+        body();
+        return;
+    }
+    let path = module_path!().split_once("::").map_or("", |(_, rest)| rest);
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            &format!("{path}::{name}"),
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("KBF_FEW_DESCRIPTORS", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "with 120 descriptors: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+        "the child ran the test: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// Catches a walk that holds a descriptor per level to the full depth limit (a lease's
+/// deep tree would then fail the flag clear with `EMFILE` on a Mac whose soft limit is
+/// 256, on every re-clean): with only 120 descriptors, a tree 1000 deep is cleared of
+/// flags and removed, each with no error.
+#[test]
+fn a_tree_a_thousand_deep_needs_few_descriptors() {
+    with_few_descriptors("a_tree_a_thousand_deep_needs_few_descriptors", || {
+        let dir = scratch("few-descriptors");
+        let home = dir.join("home");
+        fs::create_dir(&home).unwrap();
+        build_deep(&home, 1000);
+        let cleared = clear_flags(&home, me());
+        assert_eq!(cleared.errors, Vec::<String>::new(), "{cleared:?}");
+        let emptied = empty(&home, me());
+        assert_eq!(emptied.errors, Vec::<String>::new(), "{emptied:?}");
+        assert_eq!(names(&home), Vec::<String>::new());
+    });
+}
+
+/// Catches a subtree moved up although it is not the entry that was judged (a directory
+/// swapped in at its name since the judgement would be moved, and removed, as if it were
+/// the uid's): the entry is looked at again before the move, and a different one is an
+/// error that leaves it where it is.
+#[test]
+fn a_deep_subtree_replaced_since_it_was_judged_is_not_moved() {
+    let dir = scratch("park-replaced");
+    let top = dir.join("top");
+    fs::create_dir(&top).unwrap();
+    // Levels named l0 to l69, one inside the next, built through descriptors.
+    let mut fd = rustix::fs::openat(rustix::fs::CWD, &top, DIRECTORY, Mode::empty()).unwrap();
+    for level in 0..70 {
+        let name = format!("l{level}");
+        rustix::fs::mkdirat(&fd, name.as_str(), Mode::from_raw_mode(0o700)).unwrap();
+        fd = rustix::fs::openat(&fd, name.as_str(), DIRECTORY, Mode::empty()).unwrap();
+    }
+    let mut parent = top.clone();
+    for level in 0..64 {
+        parent.push(format!("l{level}"));
+    }
+    let victim = parent.join("l64");
+    let done = std::cell::Cell::new(false);
+    let moved = parent.join("moved");
+    let swept = vanishing(
+        {
+            let victim = victim.clone();
+            move |point, _| {
+                if matches!(point, Point::Examined(n) if *n == "l64") && !done.replace(true) {
+                    fs::rename(&victim, &moved).unwrap();
+                    fs::create_dir(&victim).unwrap();
+                }
+            }
+        },
+        || empty(&top, me()),
+    );
+    assert_eq!(swept.errors.len(), 1, "{swept:?}");
+    assert!(swept.errors[0].contains("replaced"), "{swept:?}");
+    assert!(victim.is_dir(), "the replacement was moved or removed");
+    assert!(parent.join("moved").is_dir(), "what was judged was lost");
+}
+
+/// Catches a move that replaces an entry already at the park's name (a name made ahead in
+/// the tree being emptied would be lost or would stop the move): the name is taken, so
+/// the next is used, and the entry made ahead is still there.
+#[test]
+fn a_name_made_ahead_at_the_parks_is_skipped_not_replaced() {
+    let dir = scratch("park-name");
+    let top = dir.join("top");
+    fs::create_dir(&top).unwrap();
+    build_deep(&top, 100);
+    let planted = top.join(format!(".kbf-deep-{}-0", std::process::id()));
+    let done = std::cell::Cell::new(false);
+    let swept = vanishing(
+        {
+            let planted = planted.clone();
+            move |point, _| {
+                if matches!(point, Point::Examined(n) if *n == "d") && !done.replace(true) {
+                    fs::create_dir(&planted).unwrap();
+                    fs::write(planted.join("kept"), "x").unwrap();
+                }
+            }
+        },
+        || empty(&top, me()),
+    );
+    assert_eq!(swept.errors, Vec::<String>::new(), "{swept:?}");
+    assert_eq!(
+        names(&top),
+        [planted.file_name().unwrap().to_string_lossy().into_owned()]
+    );
+    assert!(
+        planted.join("kept").exists(),
+        "the entry made ahead was replaced"
+    );
+}
+
+/// Catches a mode change that follows a link swapped in at an entry's name after it was
+/// judged, or lands on another file swapped in (the target, which the uid does not own,
+/// would be made writable by the owner bit): in either case the target's mode is as it
+/// was.
+#[test]
+fn an_entry_swapped_in_after_the_judgement_does_not_change_its_targets_mode() {
+    for swap in ["link", "file"] {
+        let dir = scratch(&format!("chmod-{swap}"));
+        let home = dir.join("home");
+        fs::create_dir(&home).unwrap();
+        fs::write(home.join("b"), "x").unwrap();
+        chmod(&home.join("b"), 0o400);
+        let target = dir.join("target");
+        fs::write(&target, "x").unwrap();
+        chmod(&target, 0o400);
+        let done = std::cell::Cell::new(false);
+        let (b, other) = (home.join("b"), target.clone());
+        let swept = vanishing(
+            move |point, _| {
+                if matches!(point, Point::Examined(n) if *n == "b") && !done.replace(true) {
+                    // Moved away, not removed: a freed inode number can be handed to the
+                    // file made next, which would then look like the one judged.
+                    fs::rename(&b, b.with_file_name("b.judged")).unwrap();
+                    if swap == "link" {
+                        symlink(&other, &b).unwrap();
+                    } else {
+                        fs::write(&b, "y").unwrap();
+                        chmod(&b, 0o400);
+                    }
+                }
+            },
+            || clear_flags(&home, me()),
+        );
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode(&target),
+            0o400,
+            "{swap}: the target was changed ({swept:?})"
+        );
+        if swap == "file" {
+            assert_eq!(
+                mode(&home.join("b")),
+                0o400,
+                "the file swapped in was changed"
+            );
+        }
+    }
 }

@@ -41,6 +41,8 @@
 //! [`HandoverConfig::local`]) owns no `orders/` and opens none, so there is nothing to fail:
 //! the swap's orders are the [`Local::orders`] over the proxy's `releases.json`, which
 //! `status_file` names, and the API's writer is one that refuses every order with the reason.
+//! The swap is then also started by the binary watch ([`super::binary_watch`]): [`parts_shared`]
+//! hands it a clone of the supervisor (the same swap, see [`Handover`]) beside the copies.
 
 use std::io;
 use std::path::PathBuf;
@@ -53,6 +55,7 @@ use super::api::idempotency::Idempotency;
 use super::api::traits::{
     JsonFileStatus, OrderError, OrderWriter, StubGate, Supervisor, SystemClock,
 };
+use super::binary_watch::Wiring;
 use super::handover_swap::{GateSlot, Handover, SlotAddrs};
 use super::model::{Locator, Verb};
 use super::orders::{OrderSpool, SpoolError};
@@ -129,10 +132,26 @@ pub fn staging_deadline(fetch_timeout_s: u32) -> StagingDeadline {
 /// [`HandoverError`]: the order spool cannot be opened, or the running program cannot be
 /// identified.
 pub fn parts(cfg: &HandoverConfig) -> Result<Parts, HandoverError> {
+    parts_shared(cfg).map(|(parts, _)| parts)
+}
+
+/// [`parts`], and for a proxy that keeps its own copies ([`HandoverConfig::local`]) the
+/// [`Wiring`] of the binary watch: its copies and a clone of the supervisor the API holds, so
+/// that an update the watch starts is the one the API reports. `None` without copies.
+///
+/// # Errors
+/// As [`parts`].
+pub fn parts_shared(cfg: &HandoverConfig) -> Result<(Parts, Option<Wiring>), HandoverError> {
     match &cfg.local {
         Some(local) => {
             let binary = RunningBinary::capture().map_err(HandoverError::Binary)?;
-            Ok(assemble_local(cfg, local, binary))
+            let swap = Handover::local(cfg, Arc::clone(&local.orders));
+            let wiring = Wiring {
+                local: local.clone(),
+                swap: swap.clone(),
+            };
+            let parts = wired(cfg, Box::new(swap), Box::new(NoOrders), binary);
+            Ok((parts, Some(wiring)))
         }
         None => {
             let spool = OrderSpool::open(&cfg.orders_dir, &cfg.state_dir).map_err(|source| {
@@ -142,7 +161,7 @@ pub fn parts(cfg: &HandoverConfig) -> Result<Parts, HandoverError> {
                 }
             })?;
             let binary = RunningBinary::capture().map_err(HandoverError::Binary)?;
-            Ok(assemble(cfg, spool, binary))
+            Ok((assemble(cfg, spool, binary), None))
         }
     }
 }
@@ -173,13 +192,6 @@ impl OrderWriter for NoOrders {
     ) -> Result<Locator, OrderError> {
         Err(OrderError(NO_ORDERS.to_owned()))
     }
-}
-
-/// [`parts`] over the proxy's own copies and a binary identity it is given: the swap's orders
-/// are `local`'s, and the API's order writer refuses.
-fn assemble_local(cfg: &HandoverConfig, local: &Local, binary: RunningBinary) -> Parts {
-    let supervisor = Handover::local(cfg, Arc::clone(&local.orders));
-    wired(cfg, Box::new(supervisor), Box::new(NoOrders), binary)
 }
 
 /// [`parts`] over a spool and a binary identity it is given.

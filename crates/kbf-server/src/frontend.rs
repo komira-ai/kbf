@@ -155,6 +155,7 @@ pub const ALLOWED: &[&str] = &[
     "unservable_wait_secs",
     "default_platform",
     "memory_ladder_gib",
+    "learned_sizes",
     "finished_retention_secs",
     "shutdown_timeout_secs",
     "invocation_memory",
@@ -1053,6 +1054,7 @@ impl<'a> Prepared<'a> {
             listeners.finished_retention,
         )
         .with_memory_ladder(listeners.memory_ladder.clone())
+        .with_learned_sizes(listeners.learned_sizes, listeners.memory_ladder.first())
         .recording(recorder.clone());
         let farm = Arc::new(farm.with_state(state)?);
         log_state(durable, farm.term(), farm.lease_epoch());
@@ -1142,11 +1144,6 @@ impl<'a> Prepared<'a> {
         .merge(crate::object_store::api::routes(
             token.clone(),
             object_stores.map(|stores| stores.api),
-        ))
-        .merge(crate::update_hosts::router(
-            Arc::clone(&farm),
-            update_rows.clone(),
-            crate::update_hosts::FarmReaders::from_policy(&policy),
         ))
         .merge(crate::release::desired::router(
             releases.clone(),

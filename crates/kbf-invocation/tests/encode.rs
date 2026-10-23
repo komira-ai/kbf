@@ -176,6 +176,7 @@ fn a_row_carries_every_field() {
             action: d(1),
             command: d(50),
             shape: None,
+            evidence: None,
         },
     ] {
         r.apply(e);

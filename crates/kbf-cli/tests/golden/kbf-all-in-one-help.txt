@@ -105,12 +105,6 @@ Options:
       --reapi-tls-cert <REAPI_TLS_CERT>
           PEM certificate (chain) of the REAPI listener. With `--reapi-tls-key` it serves TLS with this server certificate only; clients present no certificate. It is meant for a certificate from the farm's own internal CA, trusted by the front's proxy (its hop to this server) and by clients that dial this server directly; TLS for the farm's client-facing name still ends at the front. `--reapi-auth-policy` applies over TLS as over plain text
 
-      --update-dir <DIR>
-          The root installer's directory: the daemon reads its `status.json` there. The frontend's orders are written to `orders/` beneath it unless `--orders-dir` says otherwise. Left out, the node updates by hand: it says so and touches no directory. Not taken by the all-in-one binary yet
-
-      --orders-dir <DIR>
-          The order spool (owned by the service user, mode 0700): where the daemon writes the order records the root installer reads. With `--update-dir` only; default `<update-dir>/orders`
-
       --reapi-tls-key <REAPI_TLS_KEY>
           PEM private key of the REAPI listener; it must match `--reapi-tls-cert`, or the server refuses to start
 
@@ -260,46 +254,56 @@ Options:
           
           [default: 8388608]
 
-      --finished-retention-secs <FINISHED_RETENTION_SECS>
-          How long, in seconds, a finished operation is kept after its callers are answered. Within it, WaitExecution on the operation's name streams its result (a client whose Execute stream broke gets a result the action cache does not keep, such as a failure); after it, the name is NOT_FOUND. Every operation finished within it is held in memory
+      --learned-sizes <LEARNED_SIZES>
+          What the farm does with `kbf-estimator`, which predicts an action's memory from what its earlier runs used. `off` calls it never. `shadow` shows it every attempt that finishes and logs, for every new operation, a `size estimate:` line with what it would book, and counts how the attempts fall against its estimates (`kbf_estimator_shadow_total`); it books exactly what `off` books. `on` is `shadow` plus one change to a booking: a kill at an action's own memory limit leaves a floor under the action's key (instance, platform class, instrument and shape), which every later digest of the key, queued or new, books at least, strictly below the memory of the largest node that could run it. The floor falls only by the estimator's decay: it halves once the key has run 256 times and 7 days have passed without an own-limit kill or a sample above half of it, and a floor that falls to the first rung or below is dropped; a kill raises it again. Only an action whose memory the client did not name, on a platform that pins the OS, is keyed. The size summaries and the keys are kept in the state store, in rows of their own that a release without this flag never reads; `off` neither reads nor deletes the summaries, and ignores the keys. The memory a floor raised a queued operation to is not stored: a restart, or a rollback to `off`, books such an operation at its submitted memory until it ends
+
+          Possible values:
+          - off:    The estimator is never called and nothing is read from or written to the store
+          - shadow: The estimator hears of every finished attempt and is asked for every new operation; the answers are logged and counted. Bookings are unchanged
+          - on:     `shadow`, and one change to a booking: a kill at an action's own memory limit leaves a floor under the action's key that its later digests book at least, until the estimator's decay lowers it
           
-          [default: 60]
+          [default: off]
 
       --transfer-retries <TRANSFER_RETRIES>
           How many times a blob request is retried after UNAVAILABLE or a broken connection
           
           [default: 3]
 
+      --finished-retention-secs <FINISHED_RETENTION_SECS>
+          How long, in seconds, a finished operation is kept after its callers are answered. Within it, WaitExecution on the operation's name streams its result (a client whose Execute stream broke gets a result the action cache does not keep, such as a failure); after it, the name is NOT_FOUND. Every operation finished within it is held in memory
+          
+          [default: 60]
+
       --segment-upload-streams <SEGMENT_UPLOAD_STREAMS>
           How many `PutRange` calls one segment upload of an action's outputs has in flight at once, as HTTP/2 streams on the one connection to `--cas` (`docs/design/write-path.md`, section 4.1); also the parallel `ReadRange` calls of a segment-range read
           
           [default: 16]
-
-      --shutdown-timeout-secs <SHUTDOWN_TIMEOUT_SECS>
-          How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done. Buck2 never recovers a stream that breaks mid-action, so the default, 0, is no deadline; set one at least as long as the longest action. When it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off)
-          
-          [default: 0]
-
-      --progress-interval-secs <PROGRESS_INTERVAL_SECS>
-          How often, in seconds, every open Execute and WaitExecution stream is sent its operation again (same name, not done, current stage), so a load balancer's idle timeout never cuts a long action. 0 sends none
-          
-          [default: 30]
 
       --segment-uploads-in-flight <SEGMENT_UPLOADS_IN_FLIGHT>
           How many segment uploads of one action's outputs are in flight at once: the server checks and stages one upload while the next are sending (`docs/design/write-path.md`, section 4.1). Their `PutRange` calls still take permits of `--transfer-in-flight`'s uploads' share
           
           [default: 4]
 
+      --shutdown-timeout-secs <SHUTDOWN_TIMEOUT_SECS>
+          How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done. Buck2 never recovers a stream that breaks mid-action, so the default, 0, is no deadline; set one at least as long as the longest action. When it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off)
+          
+          [default: 0]
+
       --cgroup-parent <CGROUP_PARENT>
           The cgroup lease cgroups are made under, from the cgroup root (container). Left out, the daemon sets up its own cgroup, which its systemd unit must delegate (`Delegate=yes`): it moves itself into a `supervisor` leaf there and makes `actions` beside it, with cpu, memory and pids enabled. Given, it must already enable cpu, memory and pids for its children
 
-      --http2-keepalive-interval-secs <HTTP2_KEEPALIVE_INTERVAL_SECS>
-          How often, in seconds, the REAPI and worker listeners send an HTTP/2 PING on a quiet connection. 0 sends none (and `--http2-keepalive-timeout-secs` is unused)
+      --progress-interval-secs <PROGRESS_INTERVAL_SECS>
+          How often, in seconds, every open Execute and WaitExecution stream is sent its operation again (same name, not done, current stage), so a load balancer's idle timeout never cuts a long action. 0 sends none
           
           [default: 30]
 
       --actions-memory-max-gib <ACTIONS_MEMORY_MAX_GIB>
           Written to the actions cgroup's `memory.max` at start (container): the most memory all leases together may use, in GiB, so the rest stays for what else runs on the node. The node reports the lowest `memory.max` above its leases, or its memory when that is less, and the CPUs of their cpuset
+
+      --http2-keepalive-interval-secs <HTTP2_KEEPALIVE_INTERVAL_SECS>
+          How often, in seconds, the REAPI and worker listeners send an HTTP/2 PING on a quiet connection. 0 sends none (and `--http2-keepalive-timeout-secs` is unused)
+          
+          [default: 30]
 
       --http2-keepalive-timeout-secs <HTTP2_KEEPALIVE_TIMEOUT_SECS>
           How long, in seconds, a PING may go unanswered before the connection is closed
@@ -316,110 +320,115 @@ Options:
           
           [default: 8192]
 
-      --invocation-memory <INVOCATION_MEMORY>
-          The memory, in bytes, the invocation records may take together (`docs/design/invocations.md`, section 3.5). At the bound, records of a minted id go first, then idle ones, least recently seen first; with only open builds left, the largest stops taking rows. Records are kept in memory only and lost on restart. Their heap was measured at up to 1.08 times this at 200 kB and above, and 1.12 at 50 kB (section 3.5)
-          
-          [default: 268435456]
-
       --container-shm-mib <CONTAINER_SHM_MIB>
           The size of each container's `/dev/shm`, in MiB (container)
           
           [default: 64]
 
-      --segment-upload-max-bytes <BYTES>
-          The most bytes, records and footers together, one segment upload on the worker listener may hold in memory (`docs/design/write-path.md`, section 4.2): the segments it declares that are not written to the hot store as they arrive (all of them, without one). Not a limit on a blob's size: a segment held in memory holds no record over 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`), and an upload with a larger one and no room on the hot store is answered FAILED_PRECONDITION, so the daemon sends its records by ByteStream, which streams a large blob to the cold store. Those ranges are held until the upload commits, admitted under `--write-bytes-in-flight` with every other upload: a `Begin` waits while that is spent. At least 33 MiB (`kbf_front::MIN_SEGMENT_UPLOAD_BYTES`), a daemon's upload of small files with room to spare, and at most `--write-bytes-in-flight`, so any legal `Begin` can be admitted; the server refuses to start otherwise. At most `kbf_front::MAX_ADMISSION_BYTES`, the most one admission counts, so a `Begin` never holds more than it is counted for under the bound
+      --invocation-memory <INVOCATION_MEMORY>
+          The memory, in bytes, the invocation records may take together (`docs/design/invocations.md`, section 3.5). At the bound, records of a minted id go first, then idle ones, least recently seen first; with only open builds left, the largest stops taking rows. Records are kept in memory only and lost on restart. Their heap was measured at up to 1.08 times this at 200 kB and above, and 1.12 at 50 kB (section 3.5)
           
-          [default: 34603008]
+          [default: 268435456]
 
       --container-nofile <CONTAINER_NOFILE>
           Each container's open-file limit, soft and hard (container). Rootless, it cannot exceed the daemon's own hard limit
           
           [default: 65536]
 
-      --segment-upload-idle-secs <SEGMENT_UPLOAD_IDLE_SECS>
-          How long, in seconds, a segment upload may go without a call before it is dropped and its memory returned. An upload is also dropped when the connection that began it closes; one that is committing is kept until its commit ends
+      --segment-upload-max-bytes <BYTES>
+          The most bytes, records and footers together, one segment upload on the worker listener may hold in memory (`docs/design/write-path.md`, section 4.2): the segments it declares that are not written to the hot store as they arrive (all of them, without one). Not a limit on a blob's size: a segment held in memory holds no record over 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`), and an upload with a larger one and no room on the hot store is answered FAILED_PRECONDITION, so the daemon sends its records by ByteStream, which streams a large blob to the cold store. Those ranges are held until the upload commits, admitted under `--write-bytes-in-flight` with every other upload: a `Begin` waits while that is spent. At least 33 MiB (`kbf_front::MIN_SEGMENT_UPLOAD_BYTES`), a daemon's upload of small files with room to spare, and at most `--write-bytes-in-flight`, so any legal `Begin` can be admitted; the server refuses to start otherwise. At most `kbf_front::MAX_ADMISSION_BYTES`, the most one admission counts, so a `Begin` never holds more than it is counted for under the bound
           
-          [default: 60]
+          [default: 34603008]
 
       --container-nproc <CONTAINER_NPROC>
           The process limit, soft and hard, of each container's user (container). Every container's root is the same host id, so it bounds all the node's actions together
           
           [default: 32768]
 
-      --write-linger <WRITE_LINGER>
-          How long, in milliseconds, the oldest blob of an open segment waits for concurrent uploads to join it before the segment is sealed and written (`docs/design/write-path.md`, section 3.1). No caller is answered before its segment has committed, so this is added to an upload's latency at most
+      --segment-upload-idle-secs <SEGMENT_UPLOAD_IDLE_SECS>
+          How long, in seconds, a segment upload may go without a call before it is dropped and its memory returned. An upload is also dropped when the connection that began it closes; one that is committing is kept until its commit ends
           
-          [default: 2]
+          [default: 60]
 
       --lease-swap-kill-mib <LEASE_SWAP_KILL_MIB>
           A lease at its own memory cap is killed, and reported out of memory, once it has pushed more than this many MiB into swap at its cap... (container)
           
           [default: 512]
 
-      --write-own-segment-bytes <WRITE_OWN_SEGMENT_BYTES>
-          Blobs of this many bytes or more are written as a segment of their own, past the group, so they neither wait for the linger nor hold up small writes
+      --write-linger <WRITE_LINGER>
+          How long, in milliseconds, the oldest blob of an open segment waits for concurrent uploads to join it before the segment is sealed and written (`docs/design/write-path.md`, section 3.1). No caller is answered before its segment has committed, so this is added to an upload's latency at most
           
-          [default: 16777216]
+          [default: 2]
 
       --lease-swap-kill-percent <LEASE_SWAP_KILL_PERCENT>
           ...or this percentage of its booked memory, whichever is more. The kernel caps each lease's RAM at its booking x 1.5 + 512 MiB and lets it swap without limit; a lease is killed by this rule only while its own cap keeps being hit (its `memory.events` `max` grew since the last sample) and its swap rose since the last sample, and only swap that rose so counts, never swap that host pressure moved out of it
           
           [default: 25]
 
-      --write-bytes-in-flight <WRITE_BYTES_IN_FLIGHT>
-          The most bytes uploads may hold at once. A ByteStream Write is admitted before it reads past its first message, for its blob's size up to 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) and for 16 MiB above that (a larger blob is streamed onto the hot store, or to the cold store without room there, not held); a BatchUpdateBlobs for its total; a segment upload's Begin for what it holds in memory. A caller over the bound waits, nothing is refused for load. At least `--segment-upload-max-bytes` (by default 33 MiB, under the default 2 GiB). Not covered: each HTTP/2 stream's message as tonic decodes it, before the handler runs, up to 17 MiB per stream (about 3.4 GiB for 200 streams), times the streams one connection may open on each listener
+      --write-own-segment-bytes <WRITE_OWN_SEGMENT_BYTES>
+          Blobs of this many bytes or more are written as a segment of their own, past the group, so they neither wait for the linger nor hold up small writes
           
-          [default: 2147483648]
+          [default: 16777216]
 
       --memory-pressure-pause-percent <MEMORY_PRESSURE_PAUSE_PERCENT>
           The daemon takes no new lease while the node's memory stall time (the `some` line's `avg10` in `/proc/pressure/memory`, as a percentage) is above this and it runs a lease: it says so to the server, which places nothing on it until the stall falls, and the leases it runs go on. With no lease it serves whatever the stall, so it is never left idle for good. Off where the kernel reports no pressure stall information (macOS, a kernel built without it)
           
           [default: 10]
 
-      --reapi-max-streams <REAPI_MAX_STREAMS>
-          The most HTTP/2 streams one connection to the REAPI listener may have open. buck2 keeps one Execute stream open per outstanding action, idle until the action finishes, so this bounds how large a backlog one buck2 invocation can show the farm. The connection's flow-control window is this many streams' windows; above about 2000 streams each stream's window is smaller than 1 MiB so that the product stays under HTTP/2's largest window. At least 1, at most 32767
+      --write-bytes-in-flight <WRITE_BYTES_IN_FLIGHT>
+          The most bytes uploads may hold at once. A ByteStream Write is admitted before it reads past its first message, for its blob's size up to 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) and for 16 MiB above that (a larger blob is streamed onto the hot store, or to the cold store without room there, not held); a BatchUpdateBlobs for its total; a segment upload's Begin for what it holds in memory. A caller over the bound waits, nothing is refused for load. At least `--segment-upload-max-bytes` (by default 33 MiB, under the default 2 GiB). Not covered: each HTTP/2 stream's message as tonic decodes it, before the handler runs, up to 17 MiB per stream (about 3.4 GiB for 200 streams), times the streams one connection may open on each listener
           
-          [default: 10000]
+          [default: 2147483648]
 
       --drain-deadline-secs <DRAIN_DEADLINE_SECS>
           On the first SIGTERM or SIGINT the daemon drains: it takes no new lease, lets the running ones finish and report, waits for their acknowledgements, then exits 0. A second signal, or this many seconds after the first, stops it at once and abandons the leases still running. Used by `kbf daemon` and `kbf storage-and-daemon`; `kbf all-in-one` stops its daemon half with the server half
           
           [default: 600]
 
+      --reapi-max-streams <REAPI_MAX_STREAMS>
+          The most HTTP/2 streams one connection to the REAPI listener may have open. buck2 keeps one Execute stream open per outstanding action, idle until the action finishes, so this bounds how large a backlog one buck2 invocation can show the farm. The connection's flow-control window is this many streams' windows; above about 2000 streams each stream's window is smaller than 1 MiB so that the product stays under HTTP/2's largest window. At least 1, at most 32767
+          
+          [default: 10000]
+
       --worker-max-streams <WORKER_MAX_STREAMS>
           The most HTTP/2 streams one connection to the worker listener may have open: a daemon's persistent session stream and its short transfer streams. At least 1, at most 32767
           
           [default: 200]
-
-      --write-puts-in-flight <WRITE_PUTS_IN_FLIGHT>
-          The most segment PUTs, each with its footer read-back, in flight at once. A segment sealed while all are busy waits; new blobs go to a new open segment
-          
-          [default: 4]
 
       --lease-swap-poll-ms <LEASE_SWAP_POLL_MS>
           How often each lease's `max` events and swap are sampled, in milliseconds (container)
           
           [default: 1000]
 
-      --write-pool-writers <WRITE_POOL_WRITERS>
-          The writers of the write pool: the ByteStream and storage `Write`s of a node with a write tier are appended to shared segment files by this many writers, each holding one range open, so the node keeps at most this many block files (plus the open grouped block) open for writing for those blobs, however many uploads are in flight. At least 1
+      --write-puts-in-flight <WRITE_PUTS_IN_FLIGHT>
+          The most segment PUTs, each with its footer read-back, in flight at once. A segment sealed while all are busy waits; new blobs go to a new open segment
           
-          [default: 8]
+          [default: 4]
 
       --memory-limit-percent <MEMORY_LIMIT_PERCENT>
           A lease's processes are killed past this percentage of its booked memory...
           
           [default: 150]
 
-      --write-pool-queue <WRITE_POOL_QUEUE>
-          The most blobs waiting for a write-pool writer. A blob that finds the queue full goes straight to the object store, as one does when the write tier has no room. At least 1
+      --write-pool-writers <WRITE_POOL_WRITERS>
+          The writers of the write pool: the ByteStream and storage `Write`s of a node with a write tier are appended to shared segment files by this many writers, each holding one range open, so the node keeps at most this many block files (plus the open grouped block) open for writing for those blobs, however many uploads are in flight. At least 1
           
-          [default: 4096]
+          [default: 8]
 
       --memory-headroom-mib <MEMORY_HEADROOM_MIB>
           ...plus this many MiB (native). A lease that booked nothing has no limit
           
           [default: 512]
+
+      --write-pool-queue <WRITE_POOL_QUEUE>
+          The most blobs waiting for a write-pool writer. A blob that finds the queue full goes straight to the object store, as one does when the write tier has no room. At least 1
+          
+          [default: 4096]
+
+      --memory-poll-ms <MEMORY_POLL_MS>
+          How often a lease's memory is measured, in milliseconds (native)
+          
+          [default: 250]
 
       --write-pool-stream-idle <WRITE_POOL_STREAM_IDLE>
           How long, in seconds, a streamed blob may go without sending a chunk before its write-pool writer is taken back and the upload fails UNAVAILABLE (the client sends it again). Without it, a stalled but connected large upload would hold a writer for ever, and with all writers held every other blob would wait. It limits stalls only: an upload that sends a chunk more often than this (a trickle) can still hold a writer. At least 1
@@ -431,10 +440,10 @@ Options:
           
           [default: 10]
 
-      --memory-poll-ms <MEMORY_POLL_MS>
-          How often a lease's memory is measured, in milliseconds (native)
+      --native-term-grace-ms <NATIVE_TERM_GRACE_MS>
+          How long a lease's processes are given to end after SIGTERM before they are killed, in milliseconds; 0 kills them at once (native). A workload that cleans up when asked to end, such as Python's multiprocessing resource tracker with the shared memory it made, does so in this time; one that ignores SIGTERM is named in the lease's stderr. A slot's clean uses the same value (at most its own time limit). More than 60000 is taken as 60000. The wait comes after the action's timeout and its memory watch have ended it (neither runs during it), and on top of the time given to the kill that follows. A lease past its memory limit is killed at once. Applies on every platform
           
-          [default: 250]
+          [default: 2000]
 
       --ram-peer-grace <RAM_PEER_GRACE>
           How long, in seconds, after its own write of a blob it acknowledged from RAM a storage node waits before it asks the blob's other owner whether the blob is on its disk too, and journals a repair debt if it is not. Long enough that the usual answer is yes and nothing is journalled. Only a node that acknowledges from RAM (`--ram-ack-bytes`) asks. At least 1

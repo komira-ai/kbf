@@ -180,7 +180,6 @@ placement, and, after the list, the oldest protocol version among them:
 | `software.xcode_builds` | the Xcode builds actions can use on it: only these route work |
 | `software.xcodes` | every installed Xcode, ready or not: `app`, `build` (empty if not known), `state` (`ready`, `license_not_accepted`, `first_launch_not_run`, `metal_toolchain_missing`, `failed`, `not_surveyed` from the daemon's start until its first survey of its Xcodes ends (never advertised; the daemon sends its status again when the survey ends), or `unknown` for a state this server does not know), `reason` (the check that failed and its answer, from the daemon's last survey that changed this Xcode's `DEVELOPER_DIR`, build or state; a survey that differs only in its reason is not sent, so when another check later fails with the same build and state, this is still the earlier check's text) and `fix` (the command an administrator runs on the node, when one is known). Empty from a daemon that predates it |
 | `software.container_images` | the container images the node was pinned to (`kbf-daemon --image`, container driver), as `docker://<repo>@sha256:<digest>`, sorted: each was in its image store, as one architecture's manifest, when the daemon started (a daemon that finds one missing does not start). Status only: no work is placed by image. Empty when none is pinned, on a Mac, and from a daemon that predates it |
-| `update` | where its update is: `{"state", "up_to_date", "availability"}` and nothing more (the commits and the refusal text are on [`GET /v1/update/hosts`](#get-v1updatehosts)). `state` is the host's step state from its newest `UpdateStatus` (`idle`, `fetching`, `staged`, `activated_unconfirmed`, `confirmed`, `reverted`, `refused`, `manual`, or `unknown` for a state this server does not know), `null` unless `availability` is `ok`. `availability`: `unsupported` if the node never sent an `UpdateStatus` (never shown as idle), `unavailable` if it sent one but its newest stream is closed or has not sent its own yet (a restarted daemon is not judged by its previous process), `ok` otherwise. `up_to_date` is `true` or `false` against the desired commit of `GET /v1/update`, and `null` whenever the server cannot judge: no desired release (or no `--state-store`, or a row that cannot be read), a host that is not `ok`, or a running commit that is not a hex prefix of 12 digits or more |
 | `needs_attention` | what an operator must do on the node, one line per item: today each installed Xcode that is not ready, as `Xcode <build> (<app>) installed but not ready: <reason>; fix: <command>`. An Xcode `not_surveyed` keeps the item the same app had in the node's previous status (as when a restarted daemon sends its first status), until a survey reports it; one with no previous item has none. The server also logs each item once at `WARN` (target `kbf_server::attention`) when it appears, and at `INFO` when a status reports it gone (its Xcode ready, changed or removed); a status that repeats an item, or lists its Xcode `not_surveyed`, logs nothing. An item is the same while its Xcode's app, build, state and fix are, so a reason that changes alone is shown here but not logged again. The previous status is kept in the server's memory: after a server restart, each item is logged again when its node reports it; kbf has no alert delivery yet (issue #189) |
 | `lease_count` | how many leases it holds now (granted or running), the number of entries of `GET /v1/nodes/{id}`'s `leases`. In memory like the rest: after a server restart it is 0 until the daemon's leases are granted again |
 | `booked` | what those leases book of its capacity: `{"cpu_millis", "memory_bytes", "gpus", "vms"}`, CPU in thousandths of a core, memory in bytes. A record of the leases' limits, not a measurement of use |
@@ -203,7 +202,6 @@ the list:
 ```json
 { "node_id": "linux-1", "connected": true, "protocol": 1, "software": null,
   "needs_attention": [], "placement": { "state": "serving" }, "phase": { "state": "serving" },
-  "update": { "state": null, "up_to_date": null, "availability": "unsupported" },
   "lease_count": 1,
   "booked": { "cpu_millis": 1000, "memory_bytes": 1073741824, "gpus": 0, "vms": 0 },
   "capacity": { "cpu_millis": 8000, "memory_bytes": 17179869184, "gpus": 0, "vms": 0 },
@@ -251,7 +249,7 @@ frontend, a daemon opens a worker stream.
 | `generation` | the map's generation; `0` with an empty `members` before the first member has registered |
 | `id` | the member id the store assigned at registration (the `member_id` of `RegisterResponse`) |
 | `addr` | the address callers dial |
-| `state` | `joining` (registered, a write owner, read last), `catching_up`, `active` (a full owner), `draining` (takes no new writes) or `down` (its lease lapsed; kept in the map for the dwell, then it leaves the list) |
+| `state` | `joining` (registered, a write owner, read last), `catching_up`, `active` (a full owner), `draining` (takes no new writes), `down` (its lease lapsed; kept in the map for the dwell, then it leaves the list) or `unknown` (a state a later build wrote that this one does not name; the member stays listed, takes no writes, is never read from and is not counted as `active`) |
 | `weight` | its share of the digests relative to the others |
 | `protocol` | the protocol version in the `RegisterRequest` that wrote the member's row (a heartbeat and a state change keep it; a new registration of the member replaces it). `null` when the row names none, as a row written before this field existed, and for a `down` member: its row expires with its heartbeats, and the version went with it |
 | `runs_log` | the newest metadata-log machine version the node's build can raise its log to, as the `RegisterRequest` that wrote the row said (a heartbeat never replaces it; it fills it only when the row holds none) |
@@ -1831,7 +1829,7 @@ there is nothing to mount it on.
 - **Open.** No login, no certificate, no token, whatever the REAPI policy says: the pages
   are served to whoever reaches the port, and show everything unredacted, including the
   logs of builds and the arguments of failed commands. The routes the pages read that the
-  policy gates on the network (the build pages, run logs, blobs, `GET /v1/update/hosts`)
+  policy gates on the network (the build pages, run logs, blobs)
   are asked in process with every caller allowed; asked over the network they keep their
   gates. Keep the operator API on loopback, or behind the proxy and a network you trust.
 - **Read-only.** `GET` and `HEAD`; every other method is `405`. The write routes and their
@@ -1847,7 +1845,7 @@ there is nothing to mount it on.
   lists), `/ui/builds/{id}/actions/{digest}` (the action; for one that failed, its failure
   class, command arguments and environment names, exit code and the end of its stdout and
   stderr from `/failures`, each with a link that downloads the whole log, which the blob
-  route answers as an attachment), `/ui/updates`, `/ui/leases` (`GET /v1/leases`;
+  route answers as an attachment), `/ui/leases` (`GET /v1/leases`;
   `?node=`, `?page_size=` and `?page_token=` are handed to the route, and the next page is
   the route's own link on the page's path), `/ui/queue` (`GET /v1/queue`), and the
   stylesheet at `/ui/static/kbf.css`. Each page lists, at its foot, the `/v1` routes it read, each a link
@@ -1871,7 +1869,7 @@ there is nothing to mount it on.
   stricter set; see `docs/deploy/kbf-ui.md`.
 - **Bounds.** Each caller has at most 4 reads open at once on `/ui`, and 4 on the read
   routes the pages use (`/v1/blobs`, `/v1/invocations` and below, `/v1/runs` and the history
-  routes, `/v1/update/hosts`): the fifth is `429` with `Retry-After: 1`, before its handler
+  routes): the fifth is `429` with `Retry-After: 1`, before its handler
   runs, and a slot is held until the answer's body has been sent or dropped. A caller is
   the node the proxy named, else the client address the proxy forwarded in
   `x-kbf-client-addr` (believed only of a call that presented the proxy secret; the header
@@ -2100,42 +2098,6 @@ for the whole of its retries is `503` with `Retry-After: 1`: send it again.
 - `POST /v1/update/pause` and `POST /v1/update/resume` (the write gates, no body) set `paused` of the policy
   row, by compare-and-set of that field alone, and answer `{"paused": bool}`. No run is
   needed, and an offer leaves the flag as it is: while set, no host is started.
-
-## `GET /v1/update/hosts`
-
-What each host last said about its update, for the update page and for agents
-(`docs/design/update-ui.md` section 5). **Off unless the policy names `farm.getAuthorizer`**
-([reapi-auth.md](reapi-auth.md)): the request runs the policy's authenticator and then that
-authorizer (asked with the empty instance name), and without the key or a policy file every
-request is `404` with `"off": "farm"`. It carries what the open `GET /v1/nodes` must not: the
-commits a host runs, staged and installed, and its refusal text.
-
-```json
-{ "desired": { "generation": 3, "commit": "<40 hex>", "set_at_ms": 1791370000000 },
-  "paused": false,
-  "hosts": [
-    { "node_id": "linux-1", "connected": true, "availability": "ok", "state": "refused",
-      "up_to_date": false, "desired_commit": "<40 hex>", "running_commit": "0123456789ab",
-      "installed_commit": "<40 hex>", "staged_commit": "", "refusal": "no helper",
-      "offered_generation": 3, "helper_present": false, "reported_at_unix_ms": 1791370000000 } ],
-  "next_page_token": null }
-```
-
-- `desired` is the row of `GET /v1/update` (`null` before any offer, and without `--state-store`).
-  `paused` is the policy row's `paused` (the pause lives there alone), `false` without a policy
-  row (as on `GET /v1/update`), and `null` (unknown, never `false`) if the policy object has no
-  boolean `paused`.
-- Each host has `availability`, `state` and `up_to_date` as on `GET /v1/nodes`. The rest is as
-  the host last reported, even if it is no longer `ok` (`null` for a host that never sent an
-  `UpdateStatus`): `running_commit` (12 hex digits or `unknown`), `installed_commit` and
-  `staged_commit` (`""` if none or not known), `refusal`, `offered_generation`,
-  `helper_present` and `reported_at_unix_ms` (the server's clock).
-- **Text from a host is data.** Each string is kept cut to 64 bytes (a commit) or 512 bytes
-  (`refusal`) on a character boundary, with control characters replaced by U+FFFD. A reader
-  escapes it as it would any string from outside.
-- Hosts are in node-id order. `?page_size=` (100 by default, 1 to 1000) and `?page_token=` (the
-  `next_page_token` of the page before, null on the last page); any other query key or a bad
-  page size is `400`. A state store that fails is `500`, not hosts without a desired commit.
 
 ## `UNAVAILABLE` from a storage node that is catching up
 

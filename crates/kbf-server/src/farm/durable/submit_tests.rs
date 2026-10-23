@@ -135,6 +135,7 @@ fn submit(farm: &Farm, tag: u8) -> Result<Ticket, Status> {
         request: request(tag),
         call: None,
         described: Described::default(),
+        evidence: Default::default(),
     })
 }
 
@@ -430,7 +431,7 @@ fn a_pin_that_lands_after_the_look_is_not_written_over() {
     let farm = farm_over(&store);
     let other = durable_over(&store);
     let landing = other
-        .submission(OperationId(5), &request(1), &subject())
+        .submission(OperationId(5), &request(1), &subject(), None)
         .expect("encode")
         .put(
             format!("inflight/6d61696e/{}", request(1).key.action),
@@ -626,7 +627,7 @@ fn a_submit_takes_three_conflicts_and_is_refused_at_the_fourth() {
         for id in 0..landed {
             let tag = 10 + u8::try_from(id).expect("a small id");
             let landing = other
-                .submission(OperationId(id), &request(tag), &subject())
+                .submission(OperationId(id), &request(tag), &subject(), None)
                 .expect("encode");
             store.before_submit.lock().expect("lock").push_back(landing);
         }
