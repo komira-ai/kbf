@@ -11,76 +11,7 @@ use kbf_proto::kbf::log::v1 as proto;
 use kbf_types::{Digest, DigestFunction, FarmTime};
 use proto::meta_command::Command as P;
 
-use crate::{DecodeError, EncodeError, Format};
-
-/// Whether `command` joined the log in [`Format::V2`](crate::Format::V2).
-pub(crate) const fn since_v2(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::AddTier { .. }
-            | Command::PutStaged { .. }
-            | Command::SealStaged { .. }
-            | Command::ObjectFlushed { .. }
-            | Command::FlushConflict { .. }
-    )
-}
-
-/// Whether `command` joined the log in [`Format::V3`](crate::Format::V3).
-pub(crate) const fn since_v3(command: &Command) -> bool {
-    matches!(command, Command::EvictObjects { .. })
-}
-
-/// Whether `command` joined the log in [`Format::V4`](crate::Format::V4): `SetWriter`,
-/// the commands of a rebuild of the index, and any command that names an object of a
-/// node writer or of another log's epoch.
-pub(crate) fn since_v4(command: &Command) -> bool {
-    let node = |o: &ObjectId| matches!(o.writer(), Writer::Node(_) | Writer::Legacy(_));
-    match command {
-        Command::SetWriter(_)
-        | Command::AdoptSegment { .. }
-        | Command::RebuildProgress { .. }
-        | Command::RebuildDone => true,
-        Command::PutBlob { location, .. } => node(&location.object),
-        Command::PutBlobs(blobs) => blobs.iter().any(|(_, l)| node(&l.object)),
-        Command::PutStaged { objects, .. } => objects.iter().any(|p| node(&p.object)),
-        Command::ObjectUnreachable { object, .. }
-        | Command::ObjectReachable { object, .. }
-        | Command::SealStaged { object }
-        | Command::ObjectFlushed { object }
-        | Command::FlushConflict { object } => node(object),
-        Command::EvictObjects { objects } => objects.iter().any(node),
-        Command::Tick(_)
-        | Command::ReseatStaged { .. }
-        | Command::AllocEpoch
-        | Command::PutAction { .. }
-        | Command::Touch(_)
-        | Command::Collect
-        | Command::AddTier { .. } => false,
-    }
-}
-
-/// Whether `command` joined the log in [`Format::V5`](crate::Format::V5).
-pub(crate) const fn since_v5(command: &Command) -> bool {
-    matches!(command, Command::ReseatStaged { .. })
-}
-
-/// Whether `format` takes `command` when it is encoded: format 1 takes neither the
-/// format-2 nor the format-3 commands, format 2 takes no format-3 command, and no format
-/// before 4 takes a format-4 one (`SetWriter`, or a node writer's object in any command).
-/// Decoding does not ask: it reads every command this binary knows under every format.
-pub(crate) fn takes(format: Format, command: &Command) -> bool {
-    if since_v5(command) {
-        format.get() >= Format::V5.get()
-    } else if since_v4(command) {
-        format.get() >= Format::V4.get()
-    } else if since_v3(command) {
-        format.get() >= Format::V3.get()
-    } else if since_v2(command) {
-        format.get() >= Format::V2.get()
-    } else {
-        true
-    }
-}
+use crate::{DecodeError, EncodeError};
 
 pub(crate) fn to_proto(command: &Command) -> Result<proto::MetaCommand, EncodeError> {
     let c = match command {

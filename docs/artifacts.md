@@ -185,7 +185,8 @@ sorted by name.
   git checkout, or a `KBF_BUILD_COMMIT_OVERRIDE` stamp), and a build before this field prints
   none. `kbf_types::Version` reads it as optional.
 - `meta_log`: the highest metadata-log machine version the binary runs
-  (`kbf_server::raft_log::RUNS`). Going from release N to N-1 is reversible only if
+  (`kbf_server::raft_log::RUNS`). It is informational and frozen at 5: this build raises
+  no log, so it gates no feature. Going from release N to N-1 is reversible only if
   `meta_log(N) <= meta_log(N-1)`; a build that prints no `meta_log` is unknown, and
   unknown is not reversible.
 - `profile`: `release` for every asset here (the workflow refuses a `debug` one).

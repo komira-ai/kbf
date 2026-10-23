@@ -26,16 +26,17 @@ fn count(swept: &Sweep, met: impl Fn(&RunReport) -> bool) -> usize {
 /// The tier with only the network's faults: uploads are staged and acknowledged from
 /// the tier, blocks are sealed and flushed, reads are served, some of them while
 /// their object's flush PUT is outstanding (scenario 17), nothing is left staged
-/// (13), and a binary that runs only machine version 1 opens the log, skips the raise
-/// (which comes before every tier command) and reads the staged table the server holds,
-/// while this one opens it again to the same staged table (scenario 30). No tier disk
-/// fault is injected, so every local read error is a bug the run reports (property 8),
-/// never "unavailable for now".
+/// (13), and a binary that runs only machine version 1 opens the log, skips nothing (the
+/// server raises no log) and reads the staged table the server holds, while this one
+/// opens it again to the same staged table (scenario 30). No tier disk fault is injected,
+/// so every local read error is a bug the run reports (property 8), never "unavailable
+/// for now".
 ///
 /// Asserts that every seed stages and acknowledges writes from the tier, flushes blocks
-/// and serves reads without an error; that the version-1 open skips exactly the one raise
-/// and reads the same staged table; that this binary reads it again; and that reads land
-/// during a flush PUT in at least 2 seeds.
+/// and serves reads without an error; that the log holds tier commands and the
+/// version-1 open skips no entry (the server wrote no raise) and reads the same staged
+/// table; that this binary reads it again; and that reads land during a flush PUT in at
+/// least 2 seeds.
 #[test]
 fn the_tier_stages_flushes_and_survives_a_rollback() {
     let swept = swept(Kind::TierCalm, 16);
@@ -46,11 +47,9 @@ fn the_tier_stages_flushes_and_survives_a_rollback() {
         assert!(r.tier.reads > 0, "nothing read: {at}");
         assert_eq!(r.tier.read_errors, 0, "{at}");
         let rollback = r.rollback.as_ref().expect("the server is up at the end");
-        let raised = rollback.raised_at.expect("the log was raised");
-        let first = rollback.first_tier_command.expect("a tier command");
-        assert!(raised < first, "seed {seed}: {rollback:?}");
         let at = format!("seed {seed}: {rollback:?}");
-        assert_eq!(rollback.older_skipped, Some(1), "{at}");
+        assert!(rollback.first_tier_command.is_some(), "{at}");
+        assert_eq!(rollback.older_skipped, Some(0), "{at}");
         assert!(rollback.older_reads_same, "{at}");
         assert!(rollback.reopened, "{at}");
     }

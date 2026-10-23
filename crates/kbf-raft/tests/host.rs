@@ -219,8 +219,8 @@ fn elect(host: &mut TestHost) {
 /// send lets the voter grant a second vote in the term), and one that syncs once per
 /// write instead of once per run of writes.
 /// Catches a host that reports another membership than the one it was opened with
-/// (a caller counts its voters: kbf-server raises the log's machine version itself
-/// only when it is the only one).
+/// (a caller counts its voters: a registered storage node's open refuses a log with more
+/// than one).
 #[test]
 fn a_host_reports_the_membership_it_was_opened_with() {
     let trace = Trace::default();

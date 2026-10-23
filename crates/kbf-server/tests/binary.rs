@@ -732,9 +732,8 @@ fn raft_mode_keeps_its_log_id_across_starts() {
 /// never written, and every write would still go to the cold store); the metadata log
 /// not kept in `<hot>/meta` (so a restart would draw a new log id, or the log would
 /// land where the operator did not point) or in `--meta-dir` when that is given
-/// (which wins); the tier attached without the log raised to machine version 2 (its
-/// first commit cannot be encoded: the start fails); and a server without a hot store
-/// that raises its log anyway (an older binary could no longer read it).
+/// (which wins); and a server that raises its log, with or without a hot store (this
+/// build raises none: a binary that runs only version 1 skips nothing in either log).
 #[cfg(unix)]
 #[test]
 fn a_hot_store_attaches_a_tier_and_holds_the_metadata_log() {
@@ -760,9 +759,10 @@ fn a_hot_store_attaches_a_tier_and_holds_the_metadata_log() {
         hot.join("meta/log-record").is_file(),
         "the log is not in <hot>/meta"
     );
-    assert!(
-        skipped_by_version_1(&hot.join("meta")) > 0,
-        "a log not raised for the tier"
+    assert_eq!(
+        skipped_by_version_1(&hot.join("meta")),
+        0,
+        "a log raised for the tier"
     );
     let (child, line, _) = started(with_hot(None));
     assert_eq!(log_id(&line), first, "a restart drew a new log id");
@@ -783,7 +783,7 @@ fn a_hot_store_attaches_a_tier_and_holds_the_metadata_log() {
         "<hot>/meta made beside --meta-dir"
     );
 
-    // Without a hot store the log is left at version 1.
+    // Without a hot store the log is at version 1 too.
     let raft = fresh_dir("write-tier-raft");
     let (child, _, _) = started(raft_server(&raft));
     interrupt(child);
@@ -846,7 +846,7 @@ fn the_start_logs_every_resolved_store_path_and_budget() {
 }
 
 /// How many entries a binary that runs machine version 1 only skips when it opens the
-/// Raft log in `dir`: the raises past version 1, none in a log left at version 1.
+/// Raft log in `dir`: the raises past version 1, none in a log this build wrote.
 fn skipped_by_version_1(dir: &std::path::Path) -> u64 {
     use kbf_log::MachineVersion;
     use kbf_server::RaftMetaLog;

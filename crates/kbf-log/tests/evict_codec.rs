@@ -117,24 +117,19 @@ fn generated_evict_objects_round_trip_and_reencode_to_the_same_bytes() {
     }
 }
 
-/// Asserts that `EvictObjects` is refused by the encoder under format 1 and format 2,
-/// and that its format-3 bytes decode to the same command under format 1 and format 2
-/// as under format 3, because decoding does not depend on the committed format.
+/// Asserts that the encoder writes `EvictObjects` to the same bytes under every format,
+/// and that the decoder reads those bytes as the same command under every format, because
+/// neither depends on the committed format: a log of format 1 or 2 takes it with no raise.
 #[test]
-fn evict_is_written_from_v3_and_read_under_every_format() {
+fn evict_is_written_and_read_under_every_format() {
     for (name, command, hex) in golden() {
         let bytes = hex::decode(hex).expect("hex");
-        for format in [Format::V1, Format::V2] {
-            assert_eq!(
-                enc(format, &command),
-                Err(EncodeError::Command(format)),
-                "{name} under {format:?}"
-            );
-            assert_eq!(
-                dec(format, &bytes).as_ref(),
-                Ok(&command),
-                "{name} under {format:?}"
-            );
+        for n in 1..=5 {
+            let format = Format::new(n);
+            let wrote = enc(format, &command);
+            assert_eq!(wrote, Ok(bytes.clone()), "{name} under {format:?}");
+            let read = dec(format, &bytes);
+            assert_eq!(read.as_ref(), Ok(&command), "{name} under {format:?}");
         }
     }
     // Format 3 still reads and writes the format-1 and format-2 commands, with their
@@ -224,7 +219,7 @@ fn a_format_2_binary_sees_no_command_in_an_evict_entry() {
 /// `MetaCommand` empty) decodes as an unknown command under every format, so a reader
 /// without `EvictObjects` skips the entry instead of refusing it or reading it as
 /// another command. The raw entry under formats 1 and 2 is
-/// `evict_is_written_from_v3_and_read_under_every_format`.
+/// `evict_is_written_and_read_under_every_format`.
 #[test]
 fn an_unset_meta_command_decodes_as_unknown_under_every_format() {
     for (name, command, _) in golden() {
