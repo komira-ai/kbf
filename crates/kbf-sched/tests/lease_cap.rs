@@ -210,8 +210,9 @@ fn a_whole_machine_lease_is_placed_on_an_empty_capped_node_and_blocks_actions() 
     let mut farm = Farm::new(Some(2));
     farm.submit_kind(1, LeaseKind::WholeMachine, Resources::new(8_000, 32 * GIB));
     assert_eq!(farm.held(), 1);
-    farm.submit(2);
+    farm.submit(4);
     assert_eq!(farm.held(), 1, "no action beside a whole-machine lease");
     farm.finish_one();
-    assert_eq!(farm.held(), 2, "the actions follow, up to the cap");
+    assert_eq!(farm.held(), 2, "the actions follow, up to the cap, not to the cores");
+    assert_eq!(farm.s.queued().count(), 2);
 }
