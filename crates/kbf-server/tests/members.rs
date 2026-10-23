@@ -420,7 +420,7 @@ fn rebuilding(i: u32) -> Registrant {
 /// "still rebuilding" that demotes. A member reporting done stays Draining, Joining (the
 /// join handoff promotes it, not its own report) and Active; one reporting it is
 /// rebuilding stays Active; a CatchingUp member whose row expired is Down, and its report
-/// is NOT_REGISTERED and leaves it Down. No such beat bumps the generation. Mutants: the
+/// is NOT_REGISTERED and leaves it Down. No such beat bumps the generation. Catches: the
 /// promotion without the CatchingUp condition (Draining and Joining become Active); the
 /// report written as the state (Active demoted to CatchingUp).
 #[test]
@@ -828,7 +828,7 @@ fn states(map: &Map) -> Vec<MemberState> {
 /// a registration that does not bump the map: three nodes register in a row; every one is
 /// Active in the map its registration returned, and each advanced the generation. The
 /// cluster is formed from the first, so the second and third are the formed case.
-/// Mutant: `CaughtUp` mapped back to `Joining` in `register` turns this red.
+/// Catches: `CaughtUp` mapped back to `Joining` in `register` turns this red.
 #[test]
 fn a_caught_up_registration_is_active_in_a_formed_cluster() {
     let s = Hooked::new();
@@ -849,7 +849,7 @@ fn a_caught_up_registration_is_active_in_a_formed_cluster() {
 /// CaughtUp) left Joining, or demoted, or the restart costing a generation: the node
 /// re-registers while its old row is alive and again after the row lapsed and the node
 /// is Down; both times it is Active with the same id and a larger boot, and only the
-/// lapse-and-return moves the map. Mutant: `CaughtUp` mapped to `Joining` turns this red.
+/// lapse-and-return moves the map. Catches: `CaughtUp` mapped to `Joining` turns this red.
 #[test]
 fn a_restarted_active_member_is_active_again() {
     let s = Hooked::new();
@@ -889,7 +889,7 @@ fn boot_of(map: &Map, id: MemberId) -> Option<u64> {
 /// would then outlive a restart that lost the node's RAM-only data. The restarted member
 /// must change the published generation, by one, and the map must carry the boot it
 /// registered with; a second restart does the same again, and the other member's entry
-/// keeps its own boot. Mutant seen red: `register` leaves `Member::boot` at 0, so the
+/// keeps its own boot. Catches: `register` leaves `Member::boot` at 0, so the
 /// restart changes nothing the map holds and the generation stays.
 #[test]
 fn a_member_restarted_within_its_lease_bumps_the_generation_and_carries_its_new_boot() {
@@ -935,7 +935,7 @@ fn a_member_restarted_within_its_lease_bumps_the_generation_and_carries_its_new_
 /// administrator setting the state a member already has, a second frontend's refresh)
 /// would empty those caches for nothing. Ten rounds of heartbeats of the same boot, with
 /// refreshes through two frontends and a no-op `set_state`, leave the generation and the
-/// published boots as they were. Mutant seen red: `touch` bumping the boot (or the
+/// published boots as they were. Catches: `touch` bumping the boot (or the
 /// generation) on a beat.
 #[test]
 fn heartbeats_of_the_same_boot_do_not_bump_the_generation() {
@@ -993,7 +993,7 @@ fn a_down_member_keeps_its_boot_and_a_return_publishes_the_next() {
 
 /// Catches: a rolling restart that leaves members Joining: three members register, then
 /// each in turn registers again (a new boot, CaughtUp, as a node with its index intact
-/// does), and after every step all three are Active. Mutant: `CaughtUp` mapped to
+/// does), and after every step all three are Active. Catches: `CaughtUp` mapped to
 /// `Joining` turns this red at the first re-registration.
 #[test]
 fn a_rolling_restart_leaves_every_member_active() {
@@ -1017,7 +1017,7 @@ fn a_rolling_restart_leaves_every_member_active() {
 /// not whole), and a cluster not marked formed when its first Active member comes from a
 /// caught-up beat instead of a registration: the catching-up registration stays
 /// CatchingUp and writes no formed mark; its CaughtUp beat makes it Active and writes the
-/// mark. Mutant: the `FORMED` put dropped from `touch` turns this red.
+/// mark. Catches: the `FORMED` put dropped from `touch` turns this red.
 #[test]
 fn a_catching_up_registration_becomes_active_on_its_caught_up_beat() {
     let s = Hooked::new();
@@ -1045,7 +1045,7 @@ fn a_catching_up_registration_becomes_active_on_its_caught_up_beat() {
 /// `CatchingUp` member is not promoted by a refused caller's report). An accepting holder
 /// beats and promotes, and is asked the same address.
 ///
-/// Mutants seen red: the holder asked after the boot comparison; the holder not asked.
+/// Catches: the holder asked after the boot comparison; the holder not asked.
 #[test]
 fn a_heartbeat_is_asked_whether_the_caller_holds_the_address_before_the_boot_is_compared() {
     let s = Hooked::new();

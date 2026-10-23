@@ -153,7 +153,7 @@ fn a_dry_run_runs_nothing() {
 
 /// Catches: a backup taken while the write tier still holds acknowledged bytes (the
 /// copy would index blocks only this node's disk has), or after a flush conflict. Each
-/// reading alone refuses, before any step; the mutants "check bytes only", "check
+/// reading alone refuses, before any step; the defects "check bytes only", "check
 /// blocks only" and "skip the conflict check" each pass one row.
 #[test]
 fn the_metrics_refuse_unflushed_bytes_blocks_and_conflicts() {
@@ -333,7 +333,7 @@ fn the_hot_dir_must_match_the_server() {
 }
 
 /// Catches: an archive taken over blocks that landed between the metrics read and the
-/// stop, and a refusal after the stop that leaves the server down (the mutant "return
+/// stop, and a refusal after the stop that leaves the server down (the defect "return
 /// the error before the start" leaves only the stop in the log).
 #[test]
 fn a_block_after_the_stop_refuses_and_restarts() {

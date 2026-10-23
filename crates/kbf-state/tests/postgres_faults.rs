@@ -2,11 +2,10 @@
 //! killed by the server, a connection refused for a role's limit, a pool all in use.
 //! Each fault is made on a real server, by a second connection or a role's settings.
 //!
-//! The tests are `#[ignore]`d so `cargo test --workspace` stays hermetic; the
-//! `state-postgres` job in ci.yml runs them with `--include-ignored` against a service
-//! container. `KBF_TEST_POSTGRES_URL` names a database whose user may create roles and
-//! schemas (a superuser). Waits are on conditions read from the server; a wait the test
-//! expects to end has a bound so a lost wake-up fails the test and does not hang it.
+//! The tests need a server and fail without one, so the pull-request gate runs them with the
+//! rest. `KBF_TEST_POSTGRES_URL` names a database whose user may create roles and schemas (a
+//! superuser). Waits are on conditions read from the server; a wait the test expects to end
+//! has a bound so a lost wake-up fails the test and does not hang it.
 #![cfg(feature = "postgres")]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,9 +21,7 @@ use postgres::{Client, NoTls};
 const BOUND: Duration = Duration::from_secs(60);
 
 fn url() -> String {
-    std::env::var("KBF_TEST_POSTGRES_URL").unwrap_or_else(|_| {
-        panic!("KBF_TEST_POSTGRES_URL must name a postgres:// URL the tests may create schemas in")
-    })
+    kbf_testkit::database::server_url()
 }
 
 fn admin() -> Client {
@@ -191,7 +188,6 @@ fn limited_config(url: &str, schema: &str) -> PostgresConfig {
 // session fails, and the next calls must run on a new connection. A store that handed
 // the dead session out again would fail every call after.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_session_the_server_killed_fails_one_call_and_is_replaced() {
     let backend = PostgresBackend::new(&url(), Flaw::None);
     let config = config(&backend);
@@ -213,7 +209,6 @@ fn a_session_the_server_killed_fails_one_call_and_is_replaced() {
 // Catches a write on a dead session that reports success or leaves a half-open
 // transaction: the call fails, nothing is written, and the store takes the next write.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_write_on_a_killed_session_fails_writes_nothing_and_the_store_recovers() {
     let backend = PostgresBackend::new(&url(), Flaw::None);
     let config = config(&backend);
@@ -239,7 +234,6 @@ fn a_write_on_a_killed_session_fails_writes_nothing_and_the_store_recovers() {
 // believe a write that never happened): it is an error, the row is absent, and the
 // session is not reused.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_commit_that_loses_its_connection_is_an_error_and_writes_nothing() {
     let backend = PostgresBackend::new(&url(), Flaw::None);
     let config = config(&backend);
@@ -265,7 +259,6 @@ fn a_commit_that_loses_its_connection_is_an_error_and_writes_nothing() {
 // Catches a transaction left open on a session whose connection died: dropping it must
 // not panic or hang, and the store must take writes after.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_held_transaction_dropped_after_its_connection_died_does_not_poison_the_store() {
     let backend = PostgresBackend::new(&url(), Flaw::None);
     let config = config(&backend);
@@ -285,7 +278,6 @@ fn a_held_transaction_dropped_after_its_connection_died_does_not_poison_the_stor
 // session held by a commit in progress, a second call opens the second connection, and
 // a third waits for a session to come back and gets it when it does.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_pool_of_two_opens_a_second_connection_and_makes_a_third_call_wait() {
     let backend = PostgresBackend::new(&url(), Flaw::None);
     let config = config(&backend).with_max_connections(2);
@@ -337,7 +329,6 @@ fn a_pool_of_two_opens_a_second_connection_and_makes_a_third_call_wait() {
 // the third connection is refused twice running, both times with the server's words, and
 // a call that waits on the pool would never have been woken had the slot leaked.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_connection_the_server_refuses_does_not_take_a_pool_slot() {
     let mut admin = admin();
     let url = limited_role(&mut admin, "kbf_fault_pool", 2);
@@ -373,7 +364,6 @@ fn a_connection_the_server_refuses_does_not_take_a_pool_slot() {
 // holder connection is the store's own and the role's limit refuses it, so the call must
 // fail with the server's words and not hand out a guard.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_liveness_lock_whose_connection_is_refused_is_an_error() {
     let mut admin = admin();
     let url = limited_role(&mut admin, "kbf_fault_hold", 1);
@@ -392,7 +382,6 @@ fn a_liveness_lock_whose_connection_is_refused_is_an_error() {
 // answers 0, with a row due answers 1, and a guard that does not hold answers the
 // conflict and deletes nothing.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_reap_answers_what_it_deleted_and_a_guard_that_fails_deletes_nothing() {
     let backend = PostgresBackend::new(&url(), Flaw::None);
     let store = PostgresStore::open(&config(&backend)).expect("opens");
@@ -450,7 +439,6 @@ fn pids(admin: &mut Client, app: &str) -> Vec<i32> {
 // taken (a pool of two would block for good on a leaked slot), so the store works again
 // once they are.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_store_whose_tables_were_dropped_fails_its_calls_and_recovers_when_they_return() {
     let backend = PostgresBackend::new(&url(), Flaw::None);
     let config = config(&backend).with_max_connections(2);
@@ -478,7 +466,6 @@ fn a_store_whose_tables_were_dropped_fails_its_calls_and_recovers_when_they_retu
 // reported as success, a session that survived a refusal being thrown away (a refusal
 // leaves the connection usable), and a refusal that leaves the row behind.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_commit_the_server_refuses_is_an_error_and_the_session_is_kept() {
     let backend = PostgresBackend::new(&url(), Flaw::None);
     let config = config(&backend);
@@ -523,7 +510,6 @@ fn a_commit_the_server_refuses_is_an_error_and_the_session_is_kept() {
 // reported revision is the last one written. A store with sequence revisions has no
 // head to report and says 0.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_transaction_that_writes_nothing_commits_at_the_head_and_adds_no_feed_row() {
     let backend = PostgresBackend::new(&url(), Flaw::None);
     let store = PostgresStore::open(&config(&backend)).expect("opens");
@@ -561,7 +547,6 @@ fn a_transaction_that_writes_nothing_commits_at_the_head_and_adds_no_feed_row() 
 // no-op wait, or one that filters on a column that never matches, returns while `freed` is
 // still false.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn the_wait_for_a_roles_backends_ends_only_after_they_are_gone() {
     let waiter_admin = admin();
     let mut admin = admin();
@@ -603,7 +588,6 @@ fn the_wait_for_a_roles_backends_ends_only_after_they_are_gone() {
 // freed, so the open must have retried and then succeeded. A helper that does not retry
 // panics on the first refusal.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn an_open_refused_for_the_roles_limit_is_retried_until_the_slot_is_free() {
     let mut admin = admin();
     let url = limited_role(&mut admin, "kbf_slot_retry", 1);
@@ -629,7 +613,6 @@ fn an_open_refused_for_the_roles_limit_is_retried_until_the_slot_is_free() {
 // Catches a retry that hides other failures: an open that fails for another reason (a
 // schema this store does not support, here a role that does not exist) fails at once.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn an_open_refused_for_another_reason_is_not_retried() {
     let mut admin = admin();
     let url = limited_role(&mut admin, "kbf_slot_other", 1);

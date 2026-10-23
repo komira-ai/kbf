@@ -1,5 +1,5 @@
 //! The erase rules of M4 and S5.2, one behaviour per test. Each names the planted
-//! mutant (M10, S10) that turns it red.
+//! defect (M10, S10) that turns it red.
 
 use super::*;
 use crate::clock::{DAY, HOUR};
@@ -37,7 +37,7 @@ async fn erase_now_runs_at_once_and_alerts() {
 
 #[tokio::test]
 async fn a_bad_signature_erases_nothing_and_alerts() {
-    // Catches: an unsigned erase verb left for the server (S10 mutant "keep an unsigned
+    // Catches: an unsigned erase verb left for the server (S10 defect "keep an unsigned
     // erase verb").
     let mut f = Fixture::new("erase-bad-sig");
     let mut request = f.signed("MAC0", Purpose::EraseNow);
@@ -94,7 +94,7 @@ async fn an_untouched_or_unverified_signature_is_refused() {
 #[tokio::test]
 async fn a_request_forwarded_under_another_serial_erases_nothing() {
     // Catches: taking the serial from the server's request instead of the signed
-    // message (M10 mutant).
+    // message (M10 defect).
     let mut f = Fixture::new("erase-mismatch");
     let request = f.signed("MAC0", Purpose::EraseNow);
     assert_eq!(
@@ -164,7 +164,7 @@ async fn a_nonce_is_spent_even_when_the_caps_refuse_the_request() {
 
 #[tokio::test]
 async fn one_erase_at_a_time_across_the_fleet() {
-    // Catches: dropping the outstanding-erase check (S10 mutant).
+    // Catches: dropping the outstanding-erase check (S10 defect).
     let mut f = Fixture::new("erase-one");
     let first = f.signed("MAC0", Purpose::EraseNow);
     f.gate.erase("MAC0", &first).await.unwrap();
@@ -212,7 +212,7 @@ async fn an_outstanding_erase_clears_after_24_hours_but_the_mac_stays_out_of_the
 
 #[tokio::test]
 async fn the_daily_cap_holds_whatever_the_signature() {
-    // Catches: letting a signature lift the caps (M10 mutant); the cap is a rolling 24
+    // Catches: letting a signature lift the caps (M10 defect); the cap is a rolling 24
     // hours.
     let mut f = Fixture::new("erase-cap");
     for (serial, udid) in [("MAC0", "UDID-0"), ("MAC1", "UDID-1")] {
@@ -259,7 +259,7 @@ async fn an_erase_below_the_mac_floor_is_refused() {
 
 #[tokio::test]
 async fn erase_now_is_never_held_and_never_makes_a_grant() {
-    // Catches: holding every request (M10 mutant), and ignoring `purpose` so an
+    // Catches: holding every request (M10 defect), and ignoring `purpose` so an
     // erase-now request makes a grant.
     let mut f = Fixture::new("erase-never-held");
     let busy = f.signed("MAC1", Purpose::EraseNow);
@@ -281,7 +281,7 @@ async fn erase_now_is_never_held_and_never_makes_a_grant() {
 
 #[tokio::test]
 async fn a_held_request_makes_only_its_own_leases_grant_once() {
-    // Catches: ignoring `purpose` (M10 mutant): a request held for lease L1 must not
+    // Catches: ignoring `purpose` (M10 defect): a request held for lease L1 must not
     // grant lease L2, and is used up by its grant.
     let mut f = Fixture::new("erase-held");
     let request = f.signed("MAC0", lease("L1"));
@@ -380,8 +380,8 @@ async fn bring_forward_matches_the_lease_and_reports_the_macs_own_earlier_erase(
 
 #[tokio::test]
 async fn the_gate_erases_a_granted_mac_on_time_whatever_the_requests_not_after() {
-    // Catches: re-checking not-after when the held erase runs (M10 mutant), and
-    // leaving the erase to the server (S10 mutant): no call from the server is needed.
+    // Catches: re-checking not-after when the held erase runs (M10 defect), and
+    // leaving the erase to the server (S10 defect): no call from the server is needed.
     let mut f = Fixture::new("erase-scheduled");
     let request = f.signed("MAC0", lease("L1"));
     f.gate.erase("MAC0", &request).await.unwrap();
@@ -441,7 +441,7 @@ async fn a_scheduled_erase_waits_for_the_outstanding_one_and_is_never_dropped() 
 
 #[tokio::test]
 async fn a_held_request_with_no_grant_is_discarded_after_24_hours_with_an_alert() {
-    // Catches: keeping held requests forever (M10 mutant).
+    // Catches: keeping held requests forever (M10 defect).
     let mut f = Fixture::new("erase-discard");
     let request = f.signed("MAC0", lease("L1"));
     f.gate.erase("MAC0", &request).await.unwrap();
@@ -460,7 +460,7 @@ async fn a_held_request_with_no_grant_is_discarded_after_24_hours_with_an_alert(
 
 #[tokio::test]
 async fn bring_forward_needs_a_grant() {
-    // Catches: running any held request on bring-forward (M10 mutant).
+    // Catches: running any held request on bring-forward (M10 defect).
     let mut f = Fixture::new("erase-bring-no-grant");
     let request = f.signed("MAC0", lease("L1"));
     f.gate.erase("MAC0", &request).await.unwrap();

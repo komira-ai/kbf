@@ -42,7 +42,7 @@ async fn a_flushed_copy_damaged_past_its_first_window_fails_the_read_unmarked() 
 
 /// Catches a whole-blob read over a write tier that keeps one window or joins the
 /// windows out of order: a 12 MiB blob staged and not yet flushed is a window of 8 MiB
-/// and one of 4 MiB, and `read_blob` returns all of it, in order. Mutant: `gather`
+/// and one of 4 MiB, and `read_blob` returns all of it, in order. Catches: `gather`
 /// answering its first window (an 8 MiB blob).
 #[tokio::test]
 async fn a_whole_read_of_a_staged_blob_over_one_window_joins_the_windows() {
@@ -56,7 +56,7 @@ async fn a_whole_read_of_a_staged_blob_over_one_window_joins_the_windows() {
 /// Catches a whole-blob read (`Cache::read_blob`) that hands over the first window of
 /// a blob whose later window fails, as if it were the whole (a decoder would then take a
 /// truncated Directory for a sound one): a flushed 12 MiB copy damaged in its second
-/// window fails the read UNAVAILABLE, with no bytes, and marks nothing. Mutant: `gather`
+/// window fails the read UNAVAILABLE, with no bytes, and marks nothing. Catches: `gather`
 /// ignoring a failed later window.
 #[tokio::test]
 async fn a_whole_read_whose_second_window_fails_is_unavailable() {

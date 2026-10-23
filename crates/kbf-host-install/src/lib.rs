@@ -12,12 +12,12 @@
 //! ([`request`]):
 //!
 //! - `install kbf=<version> from <channel>`: install that version of the `kbf` package
-//!   from a channel the root-owned allowlist names ([`config`]), never an older version
-//!   than the installed one ([`debver`]), through `apt-get` restricted to the channel's one
+//!   from a channel the root-owned allowlist names ([`config`]), older versions included (a rollback is an install; the
+//!   same version is a no-op, [`debver`]), through `apt-get` restricted to the channel's one
 //!   signed source. The process sshd starts checks the request and starts ONE transient
 //!   systemd unit an ssh drop cannot kill; the unit runs this program again, takes the install
 //!   lock and holds it for both apt steps ([`plan`], [`host`]);
-//! - `query`: print what is installed, what runs and whether an install is in progress (the
+//! - `query`: print what is installed, what runs, which node this is and whether an install is in progress (the
 //!   install lock held, an install unit not over, or the dpkg lock held).
 //!
 //! Nothing runs through a shell: every process is an `execve` with an explicit argument
@@ -39,6 +39,7 @@ mod config;
 mod debver;
 mod host;
 mod locks;
+mod node_id;
 mod outcome;
 mod plan;
 mod request;

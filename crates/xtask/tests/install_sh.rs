@@ -34,7 +34,7 @@ const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
 const COMMIT: &str = "c0ffee0123456789c0ffee0123456789c0ffee01";
 const SCRIPT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../packaging/install.sh");
 /// Where the package puts things, and so the payload.
-const PAYLOAD: [&str; 9] = [
+const PAYLOAD: [&str; 10] = [
     "usr/bin/kbf-installer",
     "usr/lib/systemd/system/kbf-installer.service",
     "usr/lib/systemd/system/kbf-proxy.service",
@@ -44,6 +44,7 @@ const PAYLOAD: [&str; 9] = [
     "usr/share/kbf-installer/trust/gh",
     "usr/share/kbf-installer/trust/installer.conf",
     "usr/share/kbf-installer/trust/trusted_root.jsonl",
+    "etc/needrestart/conf.d/kbf.conf",
 ];
 
 /// The mode the deb gives `path`: the installer and the pinned `gh` execute, the rest
@@ -108,6 +109,8 @@ fn release() -> &'static Release {
         let tmpfiles = dir.join("tmpfiles.conf");
         std::fs::write(&sysusers, "stub sysusers\n").expect("sysusers");
         std::fs::write(&tmpfiles, "stub tmpfiles\n").expect("tmpfiles");
+        let needrestart = dir.join("needrestart.conf");
+        std::fs::write(&needrestart, "stub needrestart\n").expect("needrestart");
         let out = dir.join("out");
         for p in [Platform::LinuxX86_64, Platform::LinuxArm64] {
             xtask(&[
@@ -126,6 +129,8 @@ fn release() -> &'static Release {
                 utf8(&sysusers),
                 "--tmpfiles",
                 utf8(&tmpfiles),
+                "--needrestart",
+                utf8(&needrestart),
                 "--out",
                 utf8(&out),
             ]);
@@ -408,6 +413,9 @@ fn the_host_payload_is_placed_where_the_package_puts_it_and_nothing_else() {
     );
     let mut want = BTreeMap::new();
     for dir in [
+        "etc/",
+        "etc/needrestart/",
+        "etc/needrestart/conf.d/",
         "usr/",
         "usr/bin/",
         "usr/lib/",

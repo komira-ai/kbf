@@ -91,7 +91,7 @@ async fn raw(
 /// the replica does not have: the replica's commit is held, so the write must not be
 /// answered, and the primary must not hold the blob either (present on the primary means
 /// the replica has it or a repair is owed); released, both hold the same bytes and the
-/// write is answered. Mutant: the primary commits before it waits for the replica.
+/// write is answered. Catches: the primary commits before it waits for the replica.
 #[tokio::test]
 async fn a_write_is_answered_only_when_both_owners_hold_it() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -202,7 +202,7 @@ async fn stalled_pull(chunks: usize, replica_stalls: bool) -> (usize, usize, usi
 /// passing it through: with the replica stalled, a 40 MiB blob must not be read from the
 /// writer beyond the few messages the pipeline holds (a writer that was not held back
 /// has all 40 pulled), and the primary's own store must not run ahead of the replica by
-/// more than that either. Mutants: unbounded queues on the staging and the leg; the
+/// more than that either. Catches: unbounded queues on the staging and the leg; the
 /// blob collected before it is forwarded.
 #[tokio::test]
 async fn the_blob_passes_through_in_a_bounded_window() {
@@ -256,7 +256,7 @@ async fn a_stale_view_is_refused_and_nothing_is_copied() {
 /// Catches a primary that is behind its replica and writes anyway: the replica holds a
 /// newer map, so its refusal is the answer (STALE_MAP naming the newer generation, for the
 /// writer to refetch), the primary does not hold the blob (no copy under a placement
-/// the farm has left), and nothing is acknowledged. Mutant: a replica's STALE_MAP taken as
+/// the farm has left), and nothing is acknowledged. Catches: a replica's STALE_MAP taken as
 /// the replica being down.
 #[tokio::test]
 async fn a_primary_behind_its_replica_does_not_acknowledge_one_copy() {
@@ -280,7 +280,7 @@ async fn a_primary_behind_its_replica_does_not_acknowledge_one_copy() {
 /// Catches a write answered under a placement the map has left: the map turns (the replica
 /// is drained) while the replica's commit is held. When the write completes, the primary
 /// must not commit or answer, because the new map places the blob elsewhere; a map that
-/// turned without moving the blob changes nothing. Mutant: no re-check before the commit.
+/// turned without moving the blob changes nothing. Catches: no re-check before the commit.
 #[tokio::test]
 async fn a_map_that_turns_during_the_write_is_checked_before_the_answer() {
     let farm = Farm::start(3, ChainConfig::default()).await;
@@ -332,7 +332,7 @@ async fn a_map_that_turns_during_the_write_is_checked_before_the_answer() {
 /// there is refused as "not the primary", and the commit failed (a repeat of an action ran again on a farm of
 /// three). An unowned write to a node that owns nothing stores one copy there and none is
 /// forwarded or owed; to the blob's primary it is a plain write (the replica holds it
-/// too). Mutants: the unowned marker ignored by the node (refused); taken as local at the
+/// too). Catches: the unowned marker ignored by the node (refused); taken as local at the
 /// primary (no replica copy).
 #[tokio::test]
 async fn an_unowned_copy_is_stored_on_a_node_that_owns_nothing() {
@@ -371,7 +371,7 @@ async fn an_unowned_copy_is_stored_on_a_node_that_owns_nothing() {
 /// Catches an unowned-copy marker honoured from any caller: it skips the chain (no forward,
 /// no repair debt), so only the frontend's identity may send it. A daemon or a storage node
 /// that sends the header gets the plain-write rule (INVALID_ARGUMENT, not the primary) and
-/// nothing is stored; a frontend's is stored as one copy. Mutant: the node honouring the
+/// nothing is stored; a frontend's is stored as one copy. Catches: the node honouring the
 /// header whatever the certificate names.
 #[tokio::test]
 async fn an_unowned_copy_is_honoured_only_for_the_frontends_identity() {
@@ -446,7 +446,7 @@ async fn a_write_is_served_only_where_the_map_places_it() {
 /// Catches a replica that acknowledges bytes it has not verified against the digest the
 /// copy names, and a primary that does: bad bytes sent to the replica as a copy are
 /// refused INVALID_ARGUMENT and not stored; bad bytes written to the primary are refused
-/// and stored on neither node. Mutant: the digest check removed from the staging writer.
+/// and stored on neither node. Catches: the digest check removed from the staging writer.
 #[tokio::test]
 async fn bytes_that_are_not_the_digest_are_stored_nowhere() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -567,7 +567,7 @@ async fn a_blob_the_primary_holds_is_answered_without_the_replica() {
 /// Catches a replica that already holds a blob of several messages being treated as a
 /// protocol error (it answers on the first message, long before the blob is complete, and
 /// the write failed INTERNAL on every retry): the primary does not hold the 3 MiB blob, the
-/// replica does, and the write is answered; both then hold the same bytes. Mutant: the
+/// replica does, and the write is answered; both then hold the same bytes. Catches: the
 /// early answer of the blob's whole size reported as an error again.
 #[tokio::test]
 async fn a_replica_that_already_holds_a_large_blob_is_a_copy() {
@@ -771,7 +771,7 @@ async fn a_copy_sent_to_a_node_in_no_chain_is_refused() {
 
 /// Catches a chain node that admits callers without a certificate: its replica would take a
 /// copy from anyone who names itself a storage node, so the service refuses to be built
-/// over `Admission::Open`. Mutant: the check removed.
+/// over `Admission::Open`. Catches: the check removed.
 #[test]
 fn a_chain_node_must_admit_callers_by_certificate() {
     use crate::repair::Repairs;

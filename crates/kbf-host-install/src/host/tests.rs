@@ -471,7 +471,7 @@ fn an_unintelligible_unit_is_an_install_failure() {
 
 /// Two installs cannot overlap: while the install lock is held (by the unit of another
 /// install) a second request is answered `busy` and starts nothing, so a second, older
-/// target cannot pass the not-older check against the same old version and then install over
+/// target cannot pass the same-version check against the same old version and then install over
 /// the first; and a repeat of the running install is `busy` and not a unit that systemd
 /// refuses by name. A lock file that cannot be asked about is busy too (idle is not
 /// proved). Once the holder is gone the same install goes through. A query takes no lock.
@@ -539,7 +539,7 @@ fn query_does_not_read_the_allowlist() {
     assert_eq!(answer.code, 0);
     assert_eq!(
         answer.json(),
-        json!({"result": "query", "installed_version": null, "running_commit": null, "in_progress": false})
+        json!({"result": "query", "installed_version": null, "running_commit": null, "node_id": null, "in_progress": false})
     );
     assert_eq!(
         runner.calls(),
@@ -572,7 +572,7 @@ fn query_reports_version_commit_and_progress() {
     let answer = fx.run(&runner, "query");
     assert_eq!(
         answer.json(),
-        json!({"result": "query", "installed_version": "1.2.3-1", "running_commit": full, "in_progress": true})
+        json!({"result": "query", "installed_version": "1.2.3-1", "running_commit": full, "node_id": null, "in_progress": true})
     );
     assert_eq!(
         runner.calls(),
@@ -582,6 +582,23 @@ fn query_reports_version_commit_and_progress() {
             plan::units_running()
         ]
     );
+}
+
+/// `query` reports the node id from the node's configuration, on one line beside the
+/// running commit, and `null` when the host has no configuration to read it from.
+#[test]
+fn query_reports_the_node_id() {
+    let fx = Fx::new("host-query-node-id");
+    write(&fx.host.node_config, 0o640, "[node]\nid = \"build-7\"\n");
+    let runner = FakeRunner::new(vec![ok("un  \n"), ok("")]);
+    let answer = fx.run(&runner, "query");
+    assert_eq!(answer.code, 0);
+    assert_eq!(answer.json()["node_id"], "build-7");
+    assert_eq!(answer.out.matches('\n').count(), 1, "one line");
+
+    fs::remove_file(&fx.host.node_config).unwrap();
+    let runner = FakeRunner::new(vec![ok("un  \n"), ok("")]);
+    assert_eq!(fx.run(&runner, "query").json()["node_id"], Value::Null);
 }
 
 /// The running commit falls back to the short commit, and is null when the build did not
@@ -736,7 +753,7 @@ fn query_does_not_report_a_package_in_error() {
         assert_eq!(answer.code, 0, "{status}");
         assert_eq!(
             answer.json(),
-            json!({"result": "query", "installed_version": null, "running_commit": null, "in_progress": false}),
+            json!({"result": "query", "installed_version": null, "running_commit": null, "node_id": null, "in_progress": false}),
             "{status}"
         );
         assert_eq!(

@@ -24,7 +24,7 @@ fn scratch(name: &str) -> PathBuf {
 /// and each read resumes at offset 1,000: every blob hashes right, `retries` is 4 (one
 /// per stream in flight), the server saw each blob read at 0 and then at 1,000, and two
 /// connections were made. Catches no retry, and a resume that repeats or skips bytes.
-/// Mutants seen red: resume at offset 0 while appending (corrupt: "more than 3000
+/// Catches: resume at offset 0 while appending (corrupt: "more than 3000
 /// bytes"); no retry (UNKNOWN, "h2 protocol error: error reading a body from
 /// connection").
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

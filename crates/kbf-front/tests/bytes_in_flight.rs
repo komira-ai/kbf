@@ -86,7 +86,7 @@ async fn write(farm: &Farm, blob: &Blob, chunk: usize) -> Result<(), tonic::Stat
 /// cache has stored it. Held once: between its size and its size plus the messages in
 /// flight.
 ///
-/// Mutants: the capacity of the receive buffer not counted (peak 0); the guard leaked
+/// Catches: the capacity of the receive buffer not counted (peak 0); the guard leaked
 /// (current above 0 after).
 #[tokio::test]
 async fn a_small_blob_is_held_at_its_size_and_given_back() {
@@ -106,7 +106,7 @@ async fn a_small_blob_is_held_at_its_size_and_given_back() {
 /// before they are written: peak near 48 MiB), a piece not counted (peak 0) and a leak.
 /// Streamed, it is held a piece at a time: the 6 MiB bound is three 2 MiB pieces.
 ///
-/// Mutant: whole-buffer, `write_streamed` collecting `body` before the store.
+/// Catches: whole-buffer, `write_streamed` collecting `body` before the store.
 #[tokio::test]
 async fn a_large_blob_is_streamed_not_held_whole() {
     let _turn = turn().await;
@@ -125,9 +125,9 @@ async fn a_large_blob_is_streamed_not_held_whole() {
 /// Catches: a read that holds more than a window at a time (a blob gathered before it is
 /// sent), a window not counted, and one still counted after the stream is drained.
 ///
-/// Mutants: a window kept (a clone stashed) until the next is read, so two are held at
+/// Catches: a window kept (a clone stashed) until the next is read, so two are held at
 /// once (peak 16 MiB, over the 12 MiB bound). Removing the `drop(take(window))` in
-/// `bytestream.rs` alone is not a mutant today: `Bytes::split_to` of a whole window
+/// `bytestream.rs` alone changes no outcome today: `Bytes::split_to` of a whole window
 /// already releases its buffer (bytes 1.12), so the drop is belt and braces.
 #[tokio::test]
 async fn a_read_holds_one_window_and_gives_it_back() {
@@ -177,7 +177,7 @@ async fn a_read_holds_one_window_and_gives_it_back() {
 /// joined, so what is counted once the read returns is the blob, exactly, and the most
 /// counted at once reached the blob's size.
 ///
-/// Mutant: `gather` holding 0 bytes for the joined buffer (`hold(self.range_len())` made
+/// Catches: `gather` holding 0 bytes for the joined buffer (`hold(self.range_len())` made
 /// `hold(0)`: the count after the read is 0).
 #[tokio::test]
 async fn a_whole_read_of_several_windows_counts_the_joined_blob() {
@@ -245,7 +245,7 @@ async fn a_failed_or_abandoned_write_gives_everything_back() {
 /// Catches: a BatchUpdateBlobs whose blobs are not counted (the request's data is in
 /// memory until its segment is stored), or are never given back.
 ///
-/// Mutant: `verify_upload` not counting (peak 0).
+/// Catches: `verify_upload` not counting (peak 0).
 #[tokio::test]
 async fn a_batch_update_is_counted_and_given_back() {
     let _turn = turn().await;
@@ -267,7 +267,7 @@ async fn a_batch_update_is_counted_and_given_back() {
 /// handler has built its answer both are alive, so the peak is the batch twice over; the
 /// run alone, or the copies alone, is the batch once. All of it is given back.
 ///
-/// Mutants: `read_joined` returning the GET's bytes uncounted (peak one batch); the
+/// Catches: `read_joined` returning the GET's bytes uncounted (peak one batch); the
 /// response copies not held (peak one batch).
 #[tokio::test]
 async fn a_batch_read_counts_the_joined_get_and_the_response_copies() {

@@ -110,7 +110,7 @@ fn two_runs_in_one_project_have_daemons_of_their_own() {
     // `beta-<loop>`: the cleanup of one run, at its end or after its death, would kill the
     // other's daemons in the middle of its builds. The same loop of two runs has two
     // isolation directories, and the kill of one run's loop names the same one as its builds.
-    // Mutant: `isolation` ignores the run id (the old fixed `beta-<loop>`).
+    // Catches: `isolation` ignores the run id (the old fixed `beta-<loop>`).
     let other = LoadConfig {
         run_id: "r2".to_owned(),
         ..cfg()
@@ -316,7 +316,7 @@ fn a_load_that_is_dropped_kills_the_daemon_of_every_loop() {
     // daemon per loop behind: the daemon leads a session of its own and outlives its client,
     // holding the farm's connection and a port, and a runner's next job meets it. The load
     // here is ten minutes long and the stand-in's builds take a moment, so no loop has ended
-    // by itself when it is dropped in a panic. Mutant: no `Drop` on the load's guard.
+    // by itself when it is dropped in a panic. Catches: no `Drop` on the load's guard.
     let c = stand_in_load("load-drop", "ok", 2, 600);
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _load = Load::start(&c);
@@ -337,7 +337,7 @@ fn a_load_that_is_dropped_kills_the_daemon_of_every_loop() {
 fn a_load_that_was_joined_is_not_killed_again() {
     // Catches: the drop's kill running after a normal end as well, where each loop has
     // already killed its own daemon (a second `buck2 kill` per loop, and with a wedged daemon
-    // a second wait on it). Mutant: the guard is armed after `join`.
+    // a second wait on it). Catches: the guard is armed after `join`.
     let c = stand_in_load("load-joined", "ok", 1, 1);
     let outcomes = Load::start(&c).join();
     assert!(!outcomes.is_empty());
@@ -364,7 +364,7 @@ fn a_loop_that_cannot_start_buck2_ends_with_the_one_failed_build() {
     // Catches: a loop whose builds cannot be started (the program is not there) spinning for
     // the whole load, which is 300 seconds in CI, pushing an outcome per turn: it filled a
     // box's memory (tens of GB) in minutes. Each loop ends with the one failed build; one that
-    // went on would have thousands by the end of the load's three seconds. Mutant: the loop
+    // went on would have thousands by the end of the load's three seconds. Catches: the loop
     // goes on after a build that was not started.
     let mut c = cfg();
     c.concurrency = 2;

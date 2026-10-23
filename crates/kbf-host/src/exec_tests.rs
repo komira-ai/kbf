@@ -110,7 +110,7 @@ fn a_write_replaces_the_file_through_a_fresh_copy() {
 /// token. A root process's chown does not fail, so there is nothing to look at and the test
 /// says so.
 ///
-/// Mutant seen red: the copy created 0644.
+/// Catches: the copy created 0644.
 #[test]
 fn a_copy_left_by_a_failed_write_is_private() {
     let (mut exec, dir) = host("private-copy");
@@ -533,7 +533,7 @@ fn names_in(dir: &Path) -> Vec<String> {
 /// behind, or a plan made again after the apply that is not empty (a real `inspect`
 /// that loses the target would plan the flip on every run).
 ///
-/// Mutant seen red: `Planner::symlink` comparing nothing (`done = false`).
+/// Catches: `Planner::symlink` comparing nothing (`done = false`).
 #[test]
 fn a_link_flips_to_its_new_target_and_a_rerun_plans_nothing() {
     let mut exec = ScratchHost::new("exec-link-flip");
@@ -573,7 +573,7 @@ fn a_link_flips_to_its_new_target_and_a_rerun_plans_nothing() {
 /// restart, would find no link): here making the new link fails (its target is longer
 /// than the system takes), and the old link must still be there, unchanged.
 ///
-/// Mutant seen red: remove `path`, then make the link at `path` (no temporary link and
+/// Catches: remove `path`, then make the link at `path` (no temporary link and
 /// rename).
 #[test]
 fn a_flip_that_fails_leaves_the_old_link() {
@@ -594,7 +594,7 @@ fn a_flip_that_fails_leaves_the_old_link() {
 /// Catches a flip with a window in which the path names nothing: a reader polls the link
 /// while it flips between two targets, and must see one of them every time.
 ///
-/// Mutant seen red: remove `path`, then make the link at `path`.
+/// Catches: remove `path`, then make the link at `path`.
 #[test]
 fn a_reader_always_finds_the_link_while_it_flips() {
     let (mut exec, dir) = host("link-reader");
@@ -625,7 +625,7 @@ fn a_reader_always_finds_the_link_while_it_flips() {
 /// over a file, losing it) instead of refusing, a planner that plans that step instead of
 /// refusing first, and errors other than "not found" at the path read as absent.
 ///
-/// Mutant seen red: the step's not-a-link check removed (the file is replaced).
+/// Catches: the step's not-a-link check removed (the file is replaced).
 #[test]
 fn a_link_never_replaces_a_file_or_a_directory() {
     let (mut exec, dir) = host("link-refuses");
@@ -686,7 +686,7 @@ fn only_einval_reads_as_not_a_link() {
 /// Catches a flip done as remove-then-create (the service's `ExecStart` path would not exist
 /// for an instant), which is also what an interrupted flip would leave.
 ///
-/// Mutant seen red: `symlink` removing `full` before creating the link.
+/// Catches: `symlink` removing `full` before creating the link.
 #[test]
 fn a_flipped_link_is_never_missing_for_a_reader() {
     let (mut exec, dir) = host("link-atomic");
@@ -733,7 +733,7 @@ fn a_flipped_link_is_never_missing_for_a_reader() {
 /// Catches a different temporary name (the contract names `current.new`), and a stale one
 /// that blocks the next flip.
 ///
-/// Mutant seen red: `new_beside` naming `.<name>.kbf-host-tmp`.
+/// Catches: `new_beside` naming `.<name>.kbf-host-tmp`.
 #[test]
 fn a_flip_goes_through_name_dot_new_and_leaves_none() {
     let (mut exec, dir) = host("link-dot-new");
@@ -753,8 +753,8 @@ fn a_flip_goes_through_name_dot_new_and_leaves_none() {
 /// directory is removed and the directory stays), that goes outside the root, and that
 /// reports success for a path that is not there.
 ///
-/// Mutant seen red: `remove_dir` (the empty-directory call) in place of `remove_dir_all`. Not run
-/// as a mutant: the `is_dir` test dropped so a link to a directory is walked into.
+/// Catches: `remove_dir` (the empty-directory call) in place of `remove_dir_all`. Also
+/// meant to catch the `is_dir` test dropped so a link to a directory is walked into.
 #[test]
 fn remove_tree_removes_the_tree_and_never_follows_a_link() {
     let (mut exec, dir) = host("remove-tree");

@@ -14,7 +14,8 @@
 //!   [`crate::attested_assets`]' business, and its provenance bundle
 //!   [`crate::attested_bundles`]'.
 //! - **Who signs, and when.** The workflow runs for pull requests and the merge queue
-//!   (builds only) and for pushes to exactly [`PUSH_BRANCHES`]. The `attest` and `verify`
+//!   (builds only) and, called by the pipeline (`workflow_call`), for pushes to exactly
+//!   [`PUSH_BRANCHES`]. The `attest` and `verify`
 //!   jobs run under the one `if:` [`SIGNING_IF`], which no pull request satisfies, and
 //!   `attest` signs build provenance for every file in `SHA256SUMS` in a step that
 //!   cannot be skipped. (The scopes that sign are held to the same `if:` by the
@@ -92,7 +93,7 @@ pub const ASSETS: &[(&str, &str)] = &[
 /// packages one checks it before and after packaging, as [`problems`] says.
 pub const IDENTIFIED: &[&str] = &["kbf", "kbf-installer"];
 
-/// The branches whose pushes run the workflow: the ones a host's verification may name
+/// The branches whose pushes run the workflow (through the pipeline): the ones a host's verification may name
 /// as `--source-ref` (`refs/heads/<branch>`).
 pub const PUSH_BRANCHES: &[&str] = &["main"];
 
@@ -239,15 +240,14 @@ fn release_set(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
 
 fn signing(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
     let events = workflows::events(workflow)?;
-    for event in ["pull_request", "merge_group", "push"] {
+    for event in ["pull_request", "merge_group", "workflow_call"] {
         if !events.iter().any(|e| e == event) {
             out.push(format!("the workflow does not run on `{event}`"));
         }
     }
-    let branches = workflows::push_branches(workflow)?;
-    if branches != PUSH_BRANCHES {
+    if events.iter().any(|e| e == "push") {
         out.push(format!(
-            "`push` runs the workflow for {branches:?}, not exactly {PUSH_BRANCHES:?}"
+            "the workflow has a `push` trigger: a push to {PUSH_BRANCHES:?} reaches it as a called workflow of the pipeline (`workflow_call`), whose filter `pipeline_workflow` pins"
         ));
     }
     for job in ATTEST_JOBS.iter().chain(VERIFY_JOBS) {
@@ -957,7 +957,7 @@ mod rules {
     /// A workflow of the shape the rules read, meeting every one.
     fn good() -> String {
         let mut w = String::from(
-            "on:\n  pull_request:\n  merge_group:\n  push:\n    branches: [main]\npermissions: {}\nenv:\n  GH_SHA256_AARCH64_DARWIN: abababababababababababababababababababababababababababababababab\njobs:\n",
+            "on:\n  pull_request:\n  merge_group:\n  workflow_call:\npermissions: {}\nenv:\n  GH_SHA256_AARCH64_DARWIN: abababababababababababababababababababababababababababababababab\njobs:\n",
         );
         for job in BUILD_JOBS {
             w.push_str(&format!(
@@ -1029,7 +1029,7 @@ mod rules {
         }
         for platform in ["linux", "darwin-arm64"] {
             w.push_str(&format!(
-                "  verify-{platform}:\n    if: {SIGNING_IF}\n    runs-on: ubuntu-24.04\n    steps:\n      - run: gh attestation trusted-root > \"$RUNNER_TEMP/trusted_root.jsonl\"\n      - run: cargo xtask verify-assets attestations dist --repo \"$GITHUB_REPOSITORY\" --workflow-ref \"$GITHUB_WORKFLOW_REF\" --source-ref \"$GITHUB_REF\" --commit \"$GITHUB_SHA\" --trusted-root \"$RUNNER_TEMP/trusted_root.jsonl\"\n"
+                "  verify-{platform}:\n    if: {SIGNING_IF}\n    runs-on: ubuntu-24.04\n    steps:\n      - run: gh attestation trusted-root > \"$RUNNER_TEMP/trusted_root.jsonl\"\n      - run: cargo xtask verify-assets attestations dist --repo \"$GITHUB_REPOSITORY\" --workflow-ref \"$GITHUB_REPOSITORY/.github/workflows/artifacts.yml\" --source-ref \"$GITHUB_REF\" --commit \"$GITHUB_SHA\" --trusted-root \"$RUNNER_TEMP/trusted_root.jsonl\"\n"
             ));
             if platform == "linux" {
                 for p in PACKAGES {
@@ -1187,16 +1187,17 @@ mod rules {
         }
         let none = broken(&line, "");
         names(&none, &["has `if: (none)`"]);
-        for branches in [
-            "[main, feature/arch-v2]",
-            "[main, other]",
-            "[feature/arch-v2]",
-        ] {
-            names(
-                &broken("[main]", branches),
-                &["`push` runs the workflow for"],
-            );
-        }
+        names(
+            &broken(
+                "  workflow_call:\n",
+                "  workflow_call:\n  push:\n    branches: [main]\n",
+            ),
+            &["the workflow has a `push` trigger"],
+        );
+        names(
+            &broken("  workflow_call:\n", ""),
+            &["does not run on `workflow_call`"],
+        );
         names(
             &broken("  merge_group:\n", ""),
             &["does not run on `merge_group`"],

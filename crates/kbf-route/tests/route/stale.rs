@@ -110,7 +110,7 @@ async fn a_second_stale_answer_fetches_again() {
 
 /// Catches a write that fails when the map moves several times during it (each member's
 /// promotion is a new generation): three promotions, each answered STALE_MAP by the owner,
-/// three fetches, and the write lands against the newest map. Mutant: one refetch only.
+/// three fetches, and the write lands against the newest map. Catches: one refetch only.
 #[tokio::test]
 async fn a_write_across_three_promotions_lands() {
     let maps: Vec<Arc<Map>> = (1..=4).map(|g| map(g, 1, active(&[1]))).collect();

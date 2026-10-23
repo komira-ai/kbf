@@ -42,11 +42,11 @@ async fn begin(cell: &Cell, token: bool, body: &'static str) -> Reply {
 /// - the status names `draining`, `open_executions` and `queued_operations`, as a
 ///   count of each (an orchestrator tells idle from queued-with-no-worker by them);
 /// - a `POST` without the token (401) or with a body that is not `{}` (400) changes
-///   nothing (mutant: the gate left out of `begin_drain`);
+///   nothing (defect: the gate left out of `begin_drain`);
 /// - a `POST` with the token begins the drain and answers its status, again and again
 ///   (idempotent): `/readyz` is 503, a new Execute is refused, and the
 ///   stream opened before it still gets its operation's end, from a daemon that
-///   registers after the drain (mutant: the stream ended by the drain).
+///   registers after the drain (defect: the stream ended by the drain).
 ///   The REAPI connection is sent GOAWAY (`Drain::begin`'s unit tests pin each effect).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_drain_by_the_endpoint_keeps_the_open_stream_and_refuses_the_next() {
@@ -118,7 +118,7 @@ async fn a_drain_by_the_endpoint_keeps_the_open_stream_and_refuses_the_next() {
 /// Catches an idle frontend whose drain answer is lost: with no REAPI connection the
 /// listener finishes the moment it is sent GOAWAY, and the serving future then ends
 /// the process, so the operator API must finish answering what it is answering first.
-/// Repeated, since the loss is a race. Mutant: the serving future returning as soon as
+/// Repeated, since the loss is a race. Catches: the serving future returning as soon as
 /// the REAPI listener is done, with no wait for the operator API.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_idle_frontend_answers_the_drain_that_ends_it() {
@@ -133,7 +133,7 @@ async fn an_idle_frontend_answers_the_drain_that_ends_it() {
 
 /// Catches an escalation that does not end the streams: a drain that began (by the
 /// endpoint, as here, or by a signal) waits for the stream's action, and
-/// `Drain::close`, which a second signal calls, ends it UNAVAILABLE now. Mutant:
+/// `Drain::close`, which a second signal calls, ends it UNAVAILABLE now. Catches:
 /// `Drain::close` not closing (the read times out).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn close_ends_the_streams_of_a_drain() {

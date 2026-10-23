@@ -344,7 +344,7 @@ fn a_wrong_file_is_refused_at_the_mistake() {
 }
 
 /// Catches: blob reads over HTTP left on when the file names no `blobs` key, or with
-/// no file at all (mutant "default allow": `None` read as an `allow`); a `blobs` key
+/// no file at all (defect "default allow": `None` read as an `allow`); a `blobs` key
 /// read into another slot or another slot's key read into it; and prefixes not
 /// passed through to it.
 #[tokio::test]
@@ -371,7 +371,7 @@ async fn blob_reads_are_off_unless_the_file_names_their_authorizer() {
 }
 
 /// Catches: invocation pages left on when the file names no `invocations` key, or
-/// with no file at all (mutant "default allow": `None` read as an `allow`); the
+/// with no file at all (defect "default allow": `None` read as an `allow`); the
 /// `invocations` key read into the `blobs` slot or the other way round; and an
 /// `invocations` object without `getAuthorizer`, or with another key, accepted.
 #[tokio::test]
@@ -416,7 +416,7 @@ async fn invocation_pages_are_off_unless_the_file_names_their_authorizer() {
 }
 
 /// Catches: farm reads left on when the file names no `farm` key, or with no file at all
-/// (mutant "default allow": `None` read as an `allow`); the `farm` key read into the
+/// (defect "default allow": `None` read as an `allow`); the `farm` key read into the
 /// `invocations` or `blobs` slot or either's key read into `farm_get`; and a `farm`
 /// object without `getAuthorizer`, or with another key, accepted.
 #[tokio::test]

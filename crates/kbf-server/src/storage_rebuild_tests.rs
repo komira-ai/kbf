@@ -429,7 +429,7 @@ async fn wipe_and_rebuild<O: ObjectStore + Clone>(store: O, dir: &Path) {
 /// 5 blobs (a segment each) to an object store with conditional puts (the shape of S3),
 /// and is killed; a new node with no metadata log registers (boot 2) over the same store:
 /// once its rebuild is done every blob reads back with its bytes and FindMissing is empty.
-/// Mutants seen red: `rebuild_index` that returns done without adopting (every read is
+/// Catches: `rebuild_index` that returns done without adopting (every read is
 /// NOT_FOUND once the gate lifts); a rebuild that stops after the first page (small
 /// pages: 2 of the 5 held).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -453,7 +453,7 @@ async fn wipe_rebuild_holds_blobs_in_a_directory() {
 /// handled) and the node is killed; the second start (the same log) registers as
 /// rebuilding again, is still catching up while its listing is held, resumes after a key
 /// of the first start's progress (not from the top), answers every read of a blob not yet
-/// indexed UNAVAILABLE (never NOT_FOUND), and once released holds all 6. Mutants seen red:
+/// indexed UNAVAILABLE (never NOT_FOUND), and once released holds all 6. Catches:
 /// progress not persisted (the first listing call has no token); `RebuildDone` committed
 /// before the listing (the second start registers as caught up, and its reads of the two
 /// unindexed blobs are NOT_FOUND).
@@ -525,7 +525,7 @@ async fn a_restart_mid_rebuild_resumes_and_stays_catching_up() {
 /// and registers as catching up each time): a log that finished one is done. The first
 /// start rebuilds (an empty store), writes, and is killed; the second over the same log
 /// registers as caught up, is not catching up when it returns, answers a miss NOT_FOUND
-/// (not UNAVAILABLE), and never lists the store. Mutant seen red: the marker not read
+/// (not UNAVAILABLE), and never lists the store. Catches: the marker not read
 /// (the second start registers as rebuilding and lists).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_finished_rebuild_is_not_run_again_by_a_restart() {
@@ -556,8 +556,8 @@ async fn a_finished_rebuild_is_not_run_again_by_a_restart() {
 /// listed: the node would then serve misses as NOT_FOUND over an index it never built. The
 /// listing fails (every call); the rebuild is attempted again after a back-off (the second
 /// attempt is seen), the node is still catching up and still answers a miss UNAVAILABLE;
-/// once the store lists again the rebuild completes and every blob is held. Mutants seen
-/// red: the failure arm lifting the gate (the node is not catching up after the first
+/// once the store lists again the rebuild completes and every blob is held. Catches:
+/// the failure arm lifting the gate (the node is not catching up after the first
 /// failure); the failure arm ending the task (no second listing call).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_rebuild_is_tried_again_and_the_node_stays_catching_up() {
@@ -596,7 +596,7 @@ async fn a_failed_rebuild_is_tried_again_and_the_node_stays_catching_up() {
 /// Catches: a node without `--frontend` that rebuilds (it keeps its objects under its own
 /// log's prefix, and nothing registers it as catching up, so a rebuild there would only
 /// hold its misses back): it is not catching up when it returns, answers a miss NOT_FOUND
-/// at once, and never lists the store. Mutant seen red: `open_cache` taking every node as
+/// at once, and never lists the store. Catches: `open_cache` taking every node as
 /// rebuilding.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_node_without_a_frontend_owes_no_rebuild() {

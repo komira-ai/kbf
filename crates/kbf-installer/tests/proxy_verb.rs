@@ -176,7 +176,7 @@ fn check_is_exit_0_for_a_valid_table_and_2_for_every_refusal() {
 /// is exit 0 with nothing printed, as the verb's own load is, so a host a later setup wrote
 /// for can still run its proxy.
 ///
-/// Mutant to plant: `loaded_from` back on `InstallerToml::parse` (red: exit 2).
+/// Catches: `loaded_from` back on `InstallerToml::parse` (red: exit 2).
 #[test]
 fn check_ignores_keys_the_verb_does_not_read() {
     for (name, extra) in [

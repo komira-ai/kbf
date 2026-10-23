@@ -170,7 +170,7 @@ fn run_out_the_starts(rig: &mut Rig) -> Boot {
 /// saves the log as the release that ran left it, in that release's directory, with the
 /// release it was saved for, and every file with its mode.
 ///
-/// Mutants planted: the save not made at the start; the modes not carried; the copy made
+/// Catches: the save not made at the start; the modes not carried; the copy made
 /// from the wrong directory.
 #[test]
 fn the_first_start_saves_the_log_in_the_older_releases_directory() {
@@ -205,7 +205,7 @@ fn the_first_start_saves_the_log_in_the_older_releases_directory() {
 /// release (its log raised, the copy lost) must not make a copy of the raised log, which
 /// would be taken for the one before.
 ///
-/// Mutant planted: the save made at every start, not the first.
+/// Catches: the save made at every start, not the first.
 #[test]
 fn a_later_start_does_not_save_a_log_the_release_has_changed() {
     let mut rig = rig("later");
@@ -226,7 +226,7 @@ fn a_later_start_does_not_save_a_log_the_release_has_changed() {
 /// of its starts; the log is as the older release left it before that one starts, nothing the
 /// newer release added is left, and an older binary opens it. Before, it could not.
 ///
-/// Mutants planted: the log not put back after a revert; the files the new release added left
+/// Catches: the log not put back after a revert; the files the new release added left
 /// in place; the modes not carried back.
 #[test]
 fn a_revert_puts_the_log_back_before_the_older_release_starts() {
@@ -259,7 +259,7 @@ fn a_revert_puts_the_log_back_before_the_older_release_starts() {
 /// Catches a rollback of a swap that was confirmed (no trial, no pending): the next start of the
 /// older release puts the log back.
 ///
-/// Mutant planted: the log put back only in the pending branch of the start check.
+/// Catches: the log put back only in the pending branch of the start check.
 #[test]
 fn a_rollback_of_a_confirmed_release_puts_the_log_back_at_the_next_start() {
     let mut rig = rig("rollback");
@@ -282,7 +282,7 @@ fn a_rollback_of_a_confirmed_release_puts_the_log_back_at_the_next_start() {
 /// Catches a log rewritten for nothing: the swap is reverted before the release started, so
 /// the log is as it was, and it is left alone (not one file written again).
 ///
-/// Mutant planted: the log put back whether or not it differs.
+/// Catches: the log put back whether or not it differs.
 #[test]
 fn a_release_that_never_started_leaves_the_log_untouched() {
     let rig = rig("never");
@@ -301,7 +301,7 @@ fn a_release_that_never_started_leaves_the_log_untouched() {
 /// (a link in it) reverts the swap at the first start, before the release runs; the reason is
 /// left for the helper, nothing is left half made, and the log is as it was.
 ///
-/// Mutants planted: the failure ignored; the swap not reverted; the reason not left.
+/// Catches: the failure ignored; the swap not reverted; the reason not left.
 #[test]
 fn a_log_that_cannot_be_saved_reverts_the_swap_before_the_release_starts() {
     let mut rig = rig("refuse");
@@ -336,7 +336,7 @@ fn a_log_that_cannot_be_saved_reverts_the_swap_before_the_release_starts() {
 /// Catches a rerun that overwrites the copy: a second save for the same transition keeps the
 /// first, though the log has changed since.
 ///
-/// Mutant planted: the existing copy not recognised.
+/// Catches: the existing copy not recognised.
 #[test]
 fn a_second_save_for_the_same_transition_keeps_the_first_copy() {
     let rig = rig("again");
@@ -353,7 +353,7 @@ fn a_second_save_for_the_same_transition_keeps_the_first_copy() {
 /// Catches a copy of a raised log taken for the one before: when the copy that is there is for
 /// another release (its restore never ran), the log is put back first, then copied.
 ///
-/// Mutant planted: the older copy replaced without being put back.
+/// Catches: the older copy replaced without being put back.
 #[test]
 fn a_copy_owed_for_another_release_is_put_back_before_a_new_one_is_made() {
     let rig = rig("owed");
@@ -378,7 +378,7 @@ fn a_copy_owed_for_another_release_is_put_back_before_a_new_one_is_made() {
 /// built (under its temporary name) is removed and made again, and a copy that is whole is
 /// kept; either way the revert that follows puts the log back.
 ///
-/// Mutants planted: the temporary copy not removed first; a whole copy replaced.
+/// Catches: the temporary copy not removed first; a whole copy replaced.
 #[test]
 fn a_kill_between_the_copy_and_the_state_converges() {
     // Killed while building: a half-made copy under the temporary name.
@@ -416,7 +416,7 @@ fn rig_with_copy_made(name: &str) -> Rig {
 /// Catches copies that pile up: making one removes the others, a link in `releases/` is not
 /// followed to remove one, and `gc` takes the copy with its release.
 ///
-/// Mutants planted: no prune; the prune following `previous`; the copy kept outside the release.
+/// Catches: no prune; the prune following `previous`; the copy kept outside the release.
 #[test]
 fn only_one_copy_is_kept_and_gc_takes_it_with_its_release() {
     let mut rig = rig("prune");
@@ -487,7 +487,7 @@ fn only_one_copy_is_kept_and_gc_takes_it_with_its_release() {
 /// none, and putting it back leaves the directory empty (a release that made the log is
 /// reverted to the state where an older binary makes its own).
 ///
-/// Mutant planted: an absent log treated as an error.
+/// Catches: an absent log treated as an error.
 #[test]
 fn a_node_that_had_no_log_gets_none_back() {
     let rig = rig("nolog");
@@ -507,7 +507,7 @@ fn a_node_that_had_no_log_gets_none_back() {
 /// Catches a log that went missing: a copy with contents is put back where the directory is
 /// gone, with the directory's own mode.
 ///
-/// Mutant planted: the directory not made.
+/// Catches: the directory not made.
 #[test]
 fn a_log_directory_that_is_gone_is_made_again() {
     let rig = rig("gone");
@@ -527,7 +527,7 @@ fn a_log_directory_that_is_gone_is_made_again() {
 /// gives the directory its node reads, and a file that names none, a path that is no path or
 /// `/` is refused rather than guessed.
 ///
-/// Mutants planted: the default state directory dropped; a mode without a log given one.
+/// Catches: the default state directory dropped; a mode without a log given one.
 #[test]
 fn the_log_is_where_the_modes_kbf_toml_names_it() {
     let rig = rig("dir");
@@ -571,7 +571,7 @@ fn the_log_is_where_the_modes_kbf_toml_names_it() {
 /// Catches a host with no log taking part: a mode that keeps none saves nothing, and its start
 /// check goes on as before.
 ///
-/// Mutant planted: a copy made whatever the mode.
+/// Catches: a copy made whatever the mode.
 #[test]
 fn a_mode_with_no_log_saves_nothing() {
     let mut rig = rig("nolog-mode");
@@ -590,7 +590,7 @@ fn a_mode_with_no_log_saves_nothing() {
 /// Catches errors made into silence: a copy that names no release, a copy held where the
 /// `kbf.toml` names no log, and a log that is not a directory are refused with the reason.
 ///
-/// Mutants planted: an unreadable `for` taken as no copy; a missing log directory name ignored.
+/// Catches: an unreadable `for` taken as no copy; a missing log directory name ignored.
 #[test]
 fn a_copy_that_cannot_be_read_or_placed_is_refused() {
     let rig = rig("bad-copy");
@@ -621,7 +621,7 @@ fn a_copy_that_cannot_be_read_or_placed_is_refused() {
 /// compares only names: a log that differs in a file's bytes, in its kind, or in a name is put
 /// back.
 ///
-/// Mutants planted: names compared and not bytes; lengths compared and not bytes; kinds not
+/// Catches: names compared and not bytes; lengths compared and not bytes; kinds not
 /// compared.
 #[test]
 fn a_log_that_differs_in_bytes_kind_or_name_is_put_back() {
@@ -665,7 +665,7 @@ fn a_log_that_differs_in_bytes_kind_or_name_is_put_back() {
 /// Catches a start check that assumes a state: a host with none (nothing installed yet) has no
 /// release that could hold a copy, and the start goes on.
 ///
-/// Mutant planted: the missing release unwrapped.
+/// Catches: the missing release unwrapped.
 #[test]
 fn a_host_with_no_state_has_nothing_to_put_back() {
     let mut rig = rig("empty");
@@ -679,7 +679,7 @@ fn a_host_with_no_state_has_nothing_to_put_back() {
 /// Catches a first release saved against nothing: a swap with no release before it (a host
 /// that had none current) has no older binary to go back to and no log to keep for it.
 ///
-/// Mutant planted: a copy made in the directory of the release itself.
+/// Catches: a copy made in the directory of the release itself.
 #[test]
 fn a_swap_with_no_older_release_saves_nothing() {
     let mut rig = rig("first-release");
@@ -704,7 +704,7 @@ fn a_swap_with_no_older_release_saves_nothing() {
 /// Catches a restore that takes a link for the log's directory: a log that was replaced by a
 /// link is refused, not emptied through the link.
 ///
-/// Mutant planted: the log's kind not checked before it is emptied.
+/// Catches: the log's kind not checked before it is emptied.
 #[test]
 fn a_log_that_became_a_link_is_not_emptied() {
     let rig = rig("linked");
@@ -729,7 +729,7 @@ fn a_log_that_became_a_link_is_not_emptied() {
 /// start would then go on to run an older binary on a raised log. It is an error naming the
 /// path.
 ///
-/// Mutant planted: any error looking for the copy taken for its absence.
+/// Catches: any error looking for the copy taken for its absence.
 #[test]
 fn a_copy_that_cannot_be_looked_for_is_an_error_not_an_absent_one() {
     let rig = rig("not-a-dir");

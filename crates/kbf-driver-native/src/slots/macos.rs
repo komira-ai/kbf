@@ -27,6 +27,7 @@ use crate::grace::{self, Survivor};
 use crate::network::{Isolation, Network, WeakenedProfile, slot_profile, slot_write_rules};
 use crate::procs;
 
+mod assert;
 mod canaries;
 pub mod host;
 
@@ -49,6 +50,10 @@ pub struct Ready {
     /// What the system gave the `/var/folders` entry, as found when the slot was resolved.
     pub entry: Entry,
     rules: String,
+    /// What the user is when it is clean ([`assert`]), recorded when the daemon starts.
+    baseline: assert::Baseline,
+    /// The uids of the pool's users.
+    pool: std::ops::RangeInclusive<u32>,
 }
 
 /// The `/var/folders` entry of a slot as the system made it, found when the slot was
@@ -78,6 +83,9 @@ pub struct Slots {
     program: PathBuf,
     /// A change made to the profile every launch generates: a test's weakened profile only.
     profile_change: Option<WeakenedProfile>,
+    /// Whether the slots are asserted at slot-ready: not when a step of the clean is left
+    /// out for a test, which leaves what the step removes for the next lease to find.
+    asserted: bool,
 }
 
 impl std::fmt::Debug for Slots {
@@ -149,10 +157,15 @@ impl Slots {
             }
             warn_if_indexed(&slot.home);
         }
-        let pool = pool.users().iter().map(|u| u.uid);
-        let pool = pool.clone().min().unwrap_or(0)..=pool.max().unwrap_or(0);
-        let cleaner = mac_cleaner(within, grace, pool, skipped);
-        Ok(Self::with(ready, cleaner, program))
+        let uids = pool.users().iter().map(|u| u.uid);
+        let uids = uids.clone().min().unwrap_or(0)..=uids.max().unwrap_or(0);
+        for slot in &mut ready {
+            slot.pool = uids.clone();
+        }
+        let cleaner = mac_cleaner(within, grace, uids, skipped, program.clone());
+        let mut slots = Self::with(ready, cleaner, program);
+        slots.asserted = skipped.is_none();
+        Ok(slots)
     }
 
     /// [`Slots::start`] whose launches (the canaries' and the actions') run under the
@@ -178,6 +191,7 @@ impl Slots {
             book: Book::start(ready, cleaner, Backoff::DAEMON),
             program,
             profile_change: None,
+            asserted: true,
         }
     }
 
@@ -208,17 +222,27 @@ impl Slots {
             permit: Some(permit),
             program: self.program.clone(),
             profile_change: self.profile_change,
+            asserted: self.asserted,
         })
     }
 }
 
+/// How long the recovery thread waits before its first pass over a slot that went dirty:
+/// for the tests of `tests/slot_assert.rs`, which time a lease held up by it.
+#[doc(hidden)]
+pub const FIRST_RECOVERY_PASS: Duration = Backoff::DAEMON.first;
+
 /// The cleaner of a root daemon's slots: [`host::MacSlot`] through [`clean::clean`],
-/// wrapped in [`WithSkipped`] when `skipped` is given (only a test gives one).
+/// wrapped in [`WithSkipped`] when `skipped` is given (only a test gives one), and then
+/// the assertion ([`assert::after_clean`]): the baseline recorded the first time a clean
+/// passes, every probe against it afterwards. A clean with a step left out is not
+/// asserted: it is meant to leave what the step removes.
 fn mac_cleaner(
     within: Duration,
     grace: Duration,
     pool: std::ops::RangeInclusive<u32>,
     skipped: Option<Skipped>,
+    program: PathBuf,
 ) -> Cleaner<Ready> {
     Arc::new(move |ready: &Ready| {
         let slot = host::MacSlot {
@@ -226,11 +250,17 @@ fn mac_cleaner(
             within,
             grace,
             pool: pool.clone(),
+            judged: probe::OwnLabels::default(),
         };
-        match skipped {
+        let run = || match skipped {
             None => clean::clean(&slot),
             Some(skipped) => clean::clean(&WithSkipped::new(&slot, skipped)),
+        };
+        let outcome = run();
+        if skipped.is_some() || outcome != clean::Outcome::Clean {
+            return outcome;
         }
+        assert::after_clean(ready, &program, &run)
     })
 }
 
@@ -265,6 +295,8 @@ pub struct Slot {
     program: PathBuf,
     /// See [`Slots`].
     profile_change: Option<WeakenedProfile>,
+    /// See [`Slots`].
+    asserted: bool,
 }
 
 impl std::fmt::Debug for Slot {
@@ -308,29 +340,16 @@ impl Slot {
         program: PathBuf,
         args: &[String],
     ) -> Result<(PathBuf, Vec<String>), RuntimeError> {
-        let ready = self.ready();
-        let (uid, gid) = (ready.user.uid, ready.user.gid);
-        if uid == 0 {
-            return Err(RuntimeError::Failed(
-                "refusing to run an action as root".to_owned(),
-            ));
-        }
-        let profile = slot_profile(network);
-        let profile = (self.profile_change)
-            .map_or_else(|| profile.to_owned(), |change| change.apply(profile));
-        let (program, args) = isolation.wrap_in(&profile, lease, &ready.rules, program, args);
-        let mut launch = vec![
-            "asuser".to_owned(),
-            uid.to_string(),
-            self.program.to_string_lossy().into_owned(),
-            AS_USER_ARG.to_owned(),
-            uid.to_string(),
-            gid.to_string(),
-            "--".to_owned(),
-            program.to_string_lossy().into_owned(),
-        ];
-        launch.extend(args);
-        Ok((PathBuf::from(LAUNCHCTL), launch))
+        launch_command(
+            self.ready(),
+            &self.program,
+            self.profile_change,
+            isolation,
+            network,
+            lease,
+            program,
+            args,
+        )
     }
 
     /// Makes the lease directory `dir`, and everything in it, the slot user's (no link
@@ -430,6 +449,46 @@ impl Drop for Slot {
             tracing::error!(%why, "no thread to clean a dropped slot: it is dirty");
         }
     }
+}
+
+/// [`Slot::launch`]'s command for any slot: `launchctl asuser <uid> <this binary>
+/// __as-user <uid> <gid> -- ` and the sandbox's wrap of `program` and `args`, under the
+/// slot profile changed by `change` (a test's weakened profile).
+///
+/// # Errors
+/// The slot's uid is 0.
+#[allow(clippy::too_many_arguments)]
+fn launch_command(
+    ready: &Ready,
+    this: &Path,
+    change: Option<WeakenedProfile>,
+    isolation: &Isolation,
+    network: Network,
+    lease: &Path,
+    program: PathBuf,
+    args: &[String],
+) -> Result<(PathBuf, Vec<String>), RuntimeError> {
+    let (uid, gid) = (ready.user.uid, ready.user.gid);
+    if uid == 0 {
+        return Err(RuntimeError::Failed(
+            "refusing to run an action as root".to_owned(),
+        ));
+    }
+    let profile = slot_profile(network);
+    let profile = change.map_or_else(|| profile.to_owned(), |change| change.apply(profile));
+    let (program, args) = isolation.wrap_in(&profile, lease, &ready.rules, program, args);
+    let mut launch = vec![
+        "asuser".to_owned(),
+        uid.to_string(),
+        this.to_string_lossy().into_owned(),
+        AS_USER_ARG.to_owned(),
+        uid.to_string(),
+        gid.to_string(),
+        "--".to_owned(),
+        program.to_string_lossy().into_owned(),
+    ];
+    launch.extend(args);
+    Ok((PathBuf::from(LAUNCHCTL), launch))
 }
 
 /// The processes of an action that runs as a slot's user: every process of the uid.
@@ -660,6 +719,8 @@ fn resolve(user: &SlotUser, program: &Path) -> io::Result<Ready> {
         folders,
         entry,
         rules,
+        baseline: assert::Baseline::new(),
+        pool: assert::no_pool(),
     })
 }
 
@@ -735,6 +796,8 @@ mod tests {
                 folders: PathBuf::from("/nonexistent"),
                 entry: Entry::default(),
                 rules: String::new(),
+                baseline: assert::Baseline::new(),
+                pool: 0..=0,
             })
             .collect()
     }

@@ -403,7 +403,7 @@ fn f2_1_a_dead_worker_s_leases_are_requeued_at_g_and_answered_elsewhere() {
 
 /// Asserts that `op`, answered by an `Infra` result, had used up its farm budget: an
 /// `Infra` result answers only the run past [`FARM_RERUNS`] reruns, else the operation
-/// runs again under a newer lease. Catches the mutant that charges nothing (the
+/// runs again under a newer lease. Catches the defect that charges nothing (the
 /// operation answered by its first `Infra` result, with one run recorded).
 fn spent_budget(scenario: &str, seed: u64, check: &cell::check::Check, op: OperationId) {
     let runs = check.answered_farm_runs.get(&op).copied();
@@ -812,7 +812,7 @@ fn f2_14_a_crashed_daemon_s_runs_end_before_its_work_is_retried() {
     );
 }
 
-/// F2.14 without the start-up sweep (a mutant of the daemon model, as it was before
+/// F2.14 without the start-up sweep (a defect of the daemon model, as it was before
 /// issue #155): the crashed daemon's runs go on unlisted while their retries run. The
 /// end-of-run check must catch it on some seed as I12, or F2.14 proves nothing.
 #[test]

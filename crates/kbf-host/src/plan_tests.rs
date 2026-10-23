@@ -339,7 +339,7 @@ fn the_planner_says_whether_it_planned_a_step() {
 /// over a file, directory or socket (which the step would refuse half-way through an
 /// apply) instead of refusing before any step.
 ///
-/// Mutants seen red: `done` always false; a non-link planned as a flip.
+/// Catches: `done` always false; a non-link planned as a flip.
 #[test]
 fn a_link_is_planned_only_when_it_points_elsewhere_or_is_missing() {
     let mut exec = FakeExec::new(0);

@@ -20,7 +20,7 @@ fn the_binary_runs_the_library_command_line() {
         "--project",
         "--work",
         "--duration-secs",
-        "--mutant",
+        "--fault",
     ] {
         assert!(text.contains(flag), "{flag} in {text}");
     }

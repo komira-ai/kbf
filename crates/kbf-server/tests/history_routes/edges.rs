@@ -56,7 +56,7 @@ async fn two_instances(world: &World) -> Server {
     a
 }
 
-/// Catches (security, ui-data 8; mutants "authorize only the query's `instance=`" and "a
+/// Catches (security, ui-data 8; defects "authorize only the query's `instance=`" and "a
 /// fan-out that skips the all-must-allow check on spanning invocations"): a list, a shape
 /// list, a test list, a status list, a key's rows or a ring that holds a row of an instance
 /// the caller may not read (read from the instance's own rows, or from a global status
@@ -186,7 +186,7 @@ async fn a_caller_sees_only_its_instances_on_every_route() {
     b.stop().await;
 }
 
-/// Catches (mutant "`slower` mapped to an empty page"): a status the index cannot answer
+/// Catches (defect "`slower` mapped to an empty page"): a status the index cannot answer
 /// that is answered with no tests (a reader told that nothing is slower), and filters on
 /// what the catalog does not keep that are ignored. `slower` needs the day-close fold,
 /// `target` and `program` need the catalog's body: each says so, by a name, as `400`.

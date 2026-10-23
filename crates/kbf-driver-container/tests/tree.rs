@@ -660,7 +660,7 @@ fn a_tree_of_any_depth_is_walked_without_recursion() {
 /// Catches an output limit not enforced, off by one, or counted per output instead
 /// of per action: outputs that reach each limit exactly are collected, and one past
 /// it fails as `TreeError::Limit`, naming the limit, its flag and where it was passed.
-/// Seen red with the depth check removed.
+/// Catches the depth check being removed.
 #[tokio::test]
 async fn outputs_past_a_limit_fail_the_collection() {
     let upper = support::scratch("collect-limits");
@@ -844,7 +844,7 @@ impl kbf_daemon::cas::Cas for Racing {
 /// handed to the CAS, one is rewritten (same size, other bytes), appended to, replaced by
 /// another file, or removed: the call fails with a read error naming the file, and the
 /// bytes it held then are in the CAS under no digest. A tree left alone is stored whole.
-/// Mutants seen red: the stamp comparison dropped from `FileSource` (rewritten and
+/// Catches: the stamp comparison dropped from `FileSource` (rewritten and
 /// appended stored under the old digest by a CAS that does not check; this one does,
 /// so it fails as `Corrupt` instead), the rename case with the device/inode compare
 /// dropped.

@@ -318,7 +318,8 @@ impl<C: Cas> NativeRuntime<C> {
         entries
     }
 
-    /// Sends the daemon the number of free slots through `part` now and whenever it
+    /// Sends the daemon the number of usable slots (not dirty; a slot a lease
+    /// is running in counts) through `part` now and whenever it
     /// changes (a slot went dirty, or was cleaned again), so the node reports its slots
     /// without waiting for the Xcode survey to change. The survey's own report then
     /// leaves the `action_slots` entry out: this part owns it. Without a pool, or off a
@@ -988,6 +989,18 @@ impl<C: Cas> crate::slots::canary::Offer for SlotOffer<'_, C> {
                 *self.killer = Some(by);
                 return Err(RuntimeError::Killed);
             }
+        }
+        // The state the user is in, before the canaries and the lease touch it.
+        let ready = slot.assert_ready(&made.lease, &cancel);
+        let red = match until_killed(ready, &cancel, &mut killed).await {
+            Raced::Done(done) => done?,
+            Raced::Killed(by) => {
+                *self.killer = Some(by);
+                return Err(RuntimeError::Killed);
+            }
+        };
+        if !red.is_empty() {
+            return Ok(Probe::Aside(format!("assertion: {}", red.join("; "))));
         }
         let isolation = &self.runtime.config.isolation;
         let ran = slot.canary(isolation, made.network, &made.lease, &cancel);

@@ -51,7 +51,7 @@
 //!   reversed; `resume` answers 409). A rollback would stand the new child down and fail to
 //!   bring the old one back. [`Config::rollback_after_switch`] stays off until the child can
 //!   resume after a stand-down; the swap's own rollback is tested against fake children only.
-//! - **Both children dead on a cold start** needs the child to bump its epoch, which
+//! - **Both children dead on a cold start** needs the child to take the generation, which
 //!   `--await-takeover` does not do: the swap records `restart` and fails.
 //! - **A thread that dies takes the proxy with it** ([`Parts::on_death`]); the restart goes
 //!   through the adopt path above, with the startup hold in force until it decides.

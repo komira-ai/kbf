@@ -160,7 +160,7 @@ fn recover_and_extend(disk: &FaultFs, model: &Model, why: &str) -> BTreeMap<Dige
     recovered
 }
 
-/// Catches (each a mutant that turns this red): `owed` that returns before its sync (an
+/// Catches (each of these turns it red): `owed` that returns before its sync (an
 /// acknowledged debt is gone after the power cut); a compaction that renames before it
 /// syncs the new file, or skips the directory sync (a debt is lost, or an old file
 /// comes back); an open that accepts a torn frame or cuts past the torn tail (a debt

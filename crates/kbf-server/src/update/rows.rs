@@ -171,8 +171,8 @@ impl Rows {
     /// whatever the counter says. The pause is in `update/policy` and an offer does not touch
     /// it.
     ///
-    /// A host that has done nothing irreversible is given back when the generation moves
-    /// (see [`super::Controller`]); a host past the activate order finishes its step.
+    /// A host that has done nothing irreversible is given back when the generation moves;
+    /// a host past the activate order finishes its step.
     ///
     /// # Errors
     /// [`RowError`]: the store failed, the row cannot be read, or `commit` is empty.

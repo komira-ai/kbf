@@ -26,18 +26,18 @@ fn count(swept: &Sweep, met: impl Fn(&RunReport) -> bool) -> usize {
 /// The tier with only the network's faults: uploads are staged and acknowledged from
 /// the tier, blocks are sealed and flushed, reads are served, some of them while
 /// their object's flush PUT is outstanding (scenario 17), nothing is left staged
-/// (13), and a binary that runs only machine version 1 refuses the log at the raise,
-/// before any tier command, while this one opens it again to the same staged table
-/// (scenario 30). No tier disk fault is planted, so every local read error is a bug
-/// the run reports (property 8), never "unavailable for now".
+/// (13), and a binary that runs only machine version 1 opens the log, skips the raise
+/// (which comes before every tier command) and reads the staged table the server holds,
+/// while this one opens it again to the same staged table (scenario 30). No tier disk
+/// fault is injected, so every local read error is a bug the run reports (property 8),
+/// never "unavailable for now".
 ///
-/// Catches a log that is never raised (mutant "the machine keeps format 1": no
-/// `PutStaged` commits, so nothing is staged), a flusher that never runs, and a
-/// rollback that opens a raised log (mutant "a version past what this binary runs is
-/// skipped"). The read check catches a tier whose reads fail where no fault was
-/// planted (verifier mutant "a partial read of a staged block answers an I/O error").
+/// Asserts that every seed stages and acknowledges writes from the tier, flushes blocks
+/// and serves reads without an error; that the version-1 open skips exactly the one raise
+/// and reads the same staged table; that this binary reads it again; and that reads land
+/// during a flush PUT in at least 2 seeds.
 #[test]
-fn the_tier_stages_flushes_and_refuses_a_rollback() {
+fn the_tier_stages_flushes_and_survives_a_rollback() {
     let swept = swept(Kind::TierCalm, 16);
     for (seed, r) in &swept.reports {
         let at = format!("seed {seed}: {:?}", r.tier);
@@ -49,10 +49,10 @@ fn the_tier_stages_flushes_and_refuses_a_rollback() {
         let raised = rollback.raised_at.expect("the log was raised");
         let first = rollback.first_tier_command.expect("a tier command");
         assert!(raised < first, "seed {seed}: {rollback:?}");
-        let refused = rollback.refused.as_deref().unwrap_or("opened");
-        let at_raise = format!("raft log: entry {raised}: ");
-        assert!(refused.starts_with(&at_raise), "seed {seed}: {refused}");
-        assert!(rollback.reopened, "seed {seed}: {rollback:?}");
+        let at = format!("seed {seed}: {rollback:?}");
+        assert_eq!(rollback.older_skipped, Some(1), "{at}");
+        assert!(rollback.older_reads_same, "{at}");
+        assert!(rollback.reopened, "{at}");
     }
     let in_flush = count(&swept, |r| r.tier.reads_in_flush > 0);
     assert!(

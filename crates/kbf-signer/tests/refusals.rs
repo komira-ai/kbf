@@ -59,7 +59,7 @@ fn the_farms_own_certificates_are_accepted_on_their_routes() {
         Ok(())
     );
     assert_eq!(check(&support::frontend_tbs(ca), Route::Frontend), Ok(()));
-    assert_eq!(node(|_| {}), Ok(()), "the base of the mutants below");
+    assert_eq!(node(|_| {}), Ok(()), "the base of the defects below");
 }
 
 // Catches: a validator that signs the root's own structure (CA:TRUE, keyCertSign): a

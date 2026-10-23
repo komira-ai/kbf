@@ -46,8 +46,9 @@
 //! not ready itself, at once when the control connection closes and after
 //! `--handover-watchdog-secs` when the successor is alive but never serves, so Envoy
 //! answers cleanly instead of choosing a holder that can answer nothing new. The
-//! successor is started again as any start is (a cold start bumps the epoch, so daemons
-//! rerun their leases), and the holder still answers its callers from the rows.
+//! successor is started again as any start is (a cold start keeps the epoch, and the
+//! leases the daemons do not list are queued again), and the holder still answers its
+//! callers from the rows.
 
 use std::path::PathBuf;
 use std::str::FromStr;

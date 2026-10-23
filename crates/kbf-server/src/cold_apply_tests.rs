@@ -45,7 +45,7 @@ fn config(bucket: &str, prefix: &str, endpoint: &str) -> StoreConfig {
     }
 }
 
-/// Catches an identity that ignores a part of the address (mutants: the bucket, the
+/// Catches an identity that ignores a part of the address (defects: the bucket, the
 /// prefix or the endpoint left out of the comparison), one that takes keys, region or the
 /// put settings for identity (the same store re-keyed would be refused), and one that
 /// reads spellings of the same address as different stores (a trailing slash, a capital in
@@ -71,7 +71,7 @@ fn a_store_is_its_endpoint_bucket_and_prefix() {
     ));
 }
 
-/// Catches heartbeats that say the wrong thing about the registration (mutants: a stale
+/// Catches heartbeats that say the wrong thing about the registration (defects: a stale
 /// status kept when the frontend moved on, in either direction; a node that reports
 /// nothing made to report; `0` taken as a new generation): a node says what it decided,
 /// `pending` for any other generation the frontend announces, and keeps its word when the
@@ -148,8 +148,8 @@ fn answer(generation: u64) -> GetStoreConfigResponse {
     }
 }
 
-/// Catches a fetch that hammers a frontend that is down (mutant: no sleep between
-/// tries: every gap is zero), one that tries the wrong number of times (mutants: one too
+/// Catches a fetch that hammers a frontend that is down (defect: no sleep between
+/// tries: every gap is zero), one that tries the wrong number of times (defects: one too
 /// few or too many), and one that forgets how many tries it has had (the waits double
 /// from the first): four tries wait 1 s, 2 s and 4 s on the paused clock.
 #[tokio::test(start_paused = true)]
@@ -178,7 +178,7 @@ async fn a_fetch_waits_between_tries_and_stops_when_the_tries_are_spent() {
     );
 }
 
-/// Catches a fetch that keeps asking after the frontend refused the node (mutant: every
+/// Catches a fetch that keeps asking after the frontend refused the node (defect: every
 /// code is retried), which would hold a denied node in a loop: one call, no wait.
 #[tokio::test(start_paused = true)]
 async fn a_refusal_ends_the_fetch_at_once() {
@@ -199,7 +199,7 @@ async fn a_refusal_ends_the_fetch_at_once() {
     assert_eq!(Instant::now(), before);
 }
 
-/// Catches a fetch with no limit that stops anyway (mutant: `None` treated as a bound of
+/// Catches a fetch with no limit that stops anyway (defect: `None` treated as a bound of
 /// one): a node that must have the registration asks until the frontend answers, and the
 /// answer it gets is the one it returns.
 #[tokio::test(start_paused = true)]
@@ -295,8 +295,8 @@ fn flag() -> S3Uri {
 }
 
 /// Catches a node with a key pair of its own that waits for ever on a frontend that is
-/// down (mutant: no bound for a node with its own store), or that starts on its own store
-/// and says nothing of why (mutant: `ok` instead of `pending`): it asks four times, on the
+/// down (defect: no bound for a node with its own store), or that starts on its own store
+/// and says nothing of why (defect: `ok` instead of `pending`): it asks four times, on the
 /// jittered waits, then starts on its own store and reports the generation `pending`.
 #[tokio::test(start_paused = true)]
 async fn a_node_with_its_own_keys_starts_on_them_when_the_frontend_is_down() {
@@ -324,9 +324,9 @@ async fn a_node_with_its_own_keys_starts_on_them_when_the_frontend_is_down() {
     assert_eq!(Instant::now() - before, waits);
 }
 
-/// Catches a node with nothing of its own that starts anyway or gives up (mutants: the
+/// Catches a node with nothing of its own that starts anyway or gives up (defects: the
 /// bound applied to every node; the own store assumed), and one that asks without
-/// waiting (mutant: no sleep between tries, which a paused clock turns into a loop that
+/// waiting (defect: no sleep between tries, which a paused clock turns into a loop that
 /// never lets the time move, so the clock is moved by hand): after ten virtual minutes it
 /// is still asking, on the jittered waits, a few dozen times and not thousands.
 #[tokio::test(start_paused = true)]
@@ -346,7 +346,7 @@ async fn a_node_with_no_keys_asks_until_the_frontend_answers() {
     assert!(dialled < 100, "{dialled} tries in ten minutes");
 }
 
-/// Catches a node that calls the frontend although nothing is registered (mutant: the
+/// Catches a node that calls the frontend although nothing is registered (defect: the
 /// zero generation fetched), and one whose missing keys are no error when nothing is
 /// registered to supply them: it keeps its flags' own store, says nothing is wrong, and
 /// dials nobody; without keys it says which variable is missing.
@@ -405,7 +405,7 @@ fn a_node_with_no_frontend_needs_its_own_keys() {
     assert!(Registrable::new(&bad, keys).is_err());
 }
 
-/// Catches a `file://` node that reports a registration as its own (mutant: `running`) or
+/// Catches a `file://` node that reports a registration as its own (defect: `running`) or
 /// stays silent about one.
 #[tokio::test(start_paused = true)]
 async fn a_directory_store_is_never_a_registration() {
@@ -431,7 +431,7 @@ async fn a_directory_store_is_never_a_registration() {
 }
 
 /// Catches registered keys that cannot be built into a store being called a failed probe
-/// (mutant: `Config` mapped to `Probe`), a store address the client refuses (https) or a
+/// (defect: `Config` mapped to `Probe`), a store address the client refuses (https) or a
 /// prefix that is not a key passing as usable, and the refusal a node with no key pair
 /// of its own is given changing with the reason.
 #[tokio::test]
@@ -563,8 +563,8 @@ async fn takes_registered_writes(store: &S3Store, name: &str) -> bool {
 }
 
 /// Catches a node that opens its cache on the registered keys without having probed
-/// them (mutant: the probe left out of `registered_store`), reports a generation other
-/// than the snapshot's (mutant: the announced one), or keeps its own store (mutant:
+/// them (defect: the probe left out of `registered_store`), reports a generation other
+/// than the snapshot's (defect: the announced one), or keeps its own store (defect:
 /// `registered` returns `self.own`): the returned store takes writes signed with the
 /// registered pair and the node says it runs on it.
 #[tokio::test]
@@ -584,7 +584,7 @@ async fn registered_keys_that_pass_the_probe_are_the_store_the_node_runs_on() {
 }
 
 /// Catches a registration whose put settings do not reach the store the node runs on
-/// (mutants: `conditional_put` taken from the flag, `false`, or negated; `min_put_rate`
+/// (defects: `conditional_put` taken from the flag, `false`, or negated; `min_put_rate`
 /// taken from the flag): for each setting of the registration, with the flag set the
 /// other way, the address the store is opened on carries the registration's, and a rate
 /// of 0 (not set) falls back to the flag's.
@@ -606,7 +606,7 @@ fn the_registered_put_settings_are_the_stores_not_the_flags() {
     }
 }
 
-/// Catches the same defect one step on, where it matters (mutants as above, in
+/// Catches the same defect one step on, where it matters (defects as above, in
 /// `registered_store`): a registration that says conditional puts gives a store that
 /// refuses a second `put_new` of a key, and one that says not gives a store that
 /// replaces it, whatever the node's flag says.
@@ -635,7 +635,7 @@ async fn the_registered_store_puts_as_the_registration_says() {
     }
 }
 
-/// Catches keys that fail the probe being used or reported ok (mutant: the failure arm
+/// Catches keys that fail the probe being used or reported ok (defect: the failure arm
 /// returns the registered store; `Applied::running`): a node with a pair of its own keeps
 /// that store, which the service refuses here, and says `probe_failed` with nothing
 /// applied; one without ends with the probe's step.
@@ -660,7 +660,7 @@ async fn registered_keys_that_fail_the_probe_leave_the_node_on_its_own_or_stop_i
     ));
 }
 
-/// Catches a registration for another store being opened (mutant: `same_store` true):
+/// Catches a registration for another store being opened (defect: `same_store` true):
 /// the node keeps its flag's store, says `identity_mismatch`, and with no pair of its own
 /// has nothing to run on.
 #[tokio::test]
@@ -686,7 +686,7 @@ async fn a_registration_for_another_bucket_leaves_the_node_on_its_flag_or_stops_
     );
 }
 
-/// Catches a registration taken back before the fetch being treated as one (mutant: the
+/// Catches a registration taken back before the fetch being treated as one (defect: the
 /// empty answer opens the registered store): the node runs on its flags and says it
 /// applied none of the announced generation; with no pair of its own it says which
 /// variable is missing.
@@ -710,7 +710,7 @@ async fn a_registration_taken_back_leaves_the_node_on_its_flag_or_stops_it() {
 }
 
 /// Catches a node denied by the frontend retrying for ever, or starting as if it had the
-/// registration (mutant: a refusal treated as a retry): with a pair of its own it starts
+/// registration (defect: a refusal treated as a retry): with a pair of its own it starts
 /// on that and says `pending`; without one the refusal ends the start.
 #[tokio::test]
 async fn a_frontend_that_refuses_the_node_leaves_it_on_its_own_keys_or_stops_it() {

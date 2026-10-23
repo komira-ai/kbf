@@ -36,7 +36,7 @@ const E: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 /// on the running release, no trial is armed, no unit is restarted, and the order is
 /// acknowledged and removed.
 ///
-/// Mutants planted: `staged` not written; `current` written too; a restart owed; the order's
+/// Catches: `staged` not written; `current` written too; a restart owed; the order's
 /// `window_s` turned into a trial; the profile left out of `staged{}`.
 #[test]
 fn a_frontend_update_fetches_by_commit_and_stages_without_flipping() {
@@ -66,7 +66,7 @@ fn a_frontend_update_fetches_by_commit_and_stages_without_flipping() {
 /// put back is dropped (no second fetch), and a fresh order for the staged commit stages it
 /// again (the fetcher re-verifies) and keeps it staged.
 ///
-/// Mutants planted: the frontend floor not recorded (the replay fetches again); a repeat of
+/// Catches: the frontend floor not recorded (the replay fetches again); a repeat of
 /// the staged commit refused as busy.
 #[test]
 fn a_replayed_frontend_update_is_a_no_op_and_a_new_one_for_the_same_commit_stages_again() {
@@ -87,7 +87,7 @@ fn a_replayed_frontend_update_is_a_no_op_and_a_new_one_for_the_same_commit_stage
 /// reports a release it did not put on the host; each is refused with its word, nothing is
 /// staged, `current` stays, and the floor still moved (the proxy sees its order answered).
 ///
-/// Mutants planted: the fetch error ignored; the commit comparison dropped; the platform
+/// Catches: the fetch error ignored; the commit comparison dropped; the platform
 /// comparison dropped; the presence of the release not checked under the lock.
 #[test]
 fn a_frontend_update_for_a_release_that_does_not_verify_stages_nothing() {
@@ -130,7 +130,7 @@ fn a_frontend_update_for_a_release_that_does_not_verify_stages_nothing() {
 /// for C is refused `frontend_busy` before anything is fetched and B stays staged; an order
 /// for the installed release is refused `commit_or_ref`, also before a fetch.
 ///
-/// Mutants planted: the busy check dropped (C replaces B); the check made after the fetch
+/// Catches: the busy check dropped (C replaces B); the check made after the fetch
 /// (the fetcher is called); the installed-release check dropped (A is staged).
 #[test]
 fn a_second_frontend_update_and_one_for_the_installed_release_are_refused_before_a_fetch() {
@@ -150,7 +150,7 @@ fn a_second_frontend_update_and_one_for_the_installed_release_are_refused_before
 /// does: status.json cannot be written, so the order is refused before the fetch and nothing
 /// is staged; the pass reports the failure to write.
 ///
-/// Mutant planted: the report error ignored (the fetch happens anyway).
+/// Catches: the report error ignored (the fetch happens anyway).
 #[test]
 fn a_frontend_update_stops_before_the_fetch_when_status_cannot_be_written() {
     let mut rig = Rig::frontend("frontend-status-unwritable");
@@ -168,7 +168,7 @@ fn a_frontend_update_stops_before_the_fetch_when_status_cannot_be_written() {
 /// again, by a new order, changes nothing: `previous` stays the first release (it is not
 /// overwritten by the new current).
 ///
-/// Mutants planted: `previous` not moved; `current` link not moved; `staged` kept; a restart
+/// Catches: `previous` not moved; `current` link not moved; `staged` kept; a restart
 /// owed; the repeat flipping again (`previous` becomes B).
 #[test]
 fn a_confirm_of_the_staged_commit_flips_previous_then_current_and_is_idempotent() {
@@ -200,7 +200,7 @@ fn a_confirm_of_the_staged_commit_flips_previous_then_current_and_is_idempotent(
 /// removed after staging, so the confirm is refused (`stage`) and `current`, `previous`, the
 /// links and `staged` stay as they were.
 ///
-/// Mutant planted: the presence check dropped (`current` names a release with no binary).
+/// Catches: the presence check dropped (`current` names a release with no binary).
 #[test]
 fn a_confirm_of_a_staged_release_whose_directory_is_gone_flips_nothing() {
     let mut rig = staged("confirm-gone", B, 1);
@@ -217,7 +217,7 @@ fn a_confirm_of_a_staged_release_whose_directory_is_gone_flips_nothing() {
 /// staged) is refused `commit_or_ref`; with nothing staged, a confirm of an unknown commit is
 /// refused too; in both `current`, `previous` and `staged` are as they were.
 ///
-/// Mutants planted: the staged comparison dropped (C becomes current); `NotStaged` returned
+/// Catches: the staged comparison dropped (C becomes current); `NotStaged` returned
 /// only when nothing is staged.
 #[test]
 fn a_confirm_of_a_commit_that_is_not_staged_flips_nothing() {
@@ -242,7 +242,7 @@ fn a_confirm_of_a_commit_that_is_not_staged_flips_nothing() {
 /// the proxy's: with B on trial and C staged, a confirm of C is refused `pending` and nothing
 /// moves; a confirm of B, the release on trial, is the node's, and keeps the swap.
 ///
-/// Mutants planted: the pending check dropped (C becomes current over the trial); `kind_of`
+/// Catches: the pending check dropped (C becomes current over the trial); `kind_of`
 /// ignoring the release on trial (the confirm of B is the proxy's and is refused as not
 /// staged, the trial stays).
 #[test]
@@ -275,7 +275,7 @@ fn a_confirm_is_refused_while_a_node_swap_is_on_trial_and_the_swap_s_own_confirm
 /// swap), a `revert` naming B is the swap's own and goes back to A, restarting the unit; a
 /// `revert` naming another commit is the proxy's and leaves the trial alone.
 ///
-/// Mutant planted: `kind_of` ignoring the release on trial for a revert (B's revert drops a
+/// Catches: `kind_of` ignoring the release on trial for a revert (B's revert drops a
 /// staging that is not there and the trial stays).
 #[test]
 fn on_a_frontend_host_a_revert_naming_the_release_on_trial_is_the_node_s() {
@@ -299,7 +299,7 @@ fn on_a_frontend_host_a_revert_naming_the_release_on_trial_is_the_node_s() {
 /// After a confirm landed, a late revert of the confirmed commit leaves `current` and
 /// `previous` where they are: it is not the node's revert, which would go back.
 ///
-/// Mutants planted: revert falls through to the node's (`current` goes back to `previous`);
+/// Catches: revert falls through to the node's (`current` goes back to `previous`);
 /// `staged` not cleared; the commit comparison dropped (C drops B's staging).
 #[test]
 fn a_revert_drops_only_the_staged_release_and_never_touches_current() {
@@ -353,7 +353,7 @@ fn a_revert_drops_only_the_staged_release_and_never_touches_current() {
 /// `gc` (the confirm because `previous` moved on, the revert because a staging was dropped),
 /// which removes the releases nothing needs beyond the newest one.
 ///
-/// Mutants planted: `kept` false after a flip; `kept` false after a drop.
+/// Catches: `kept` false after a flip; `kept` false after a drop.
 #[test]
 fn a_confirm_and_a_drop_each_collect_the_releases_nothing_needs() {
     let releases = |rig: &Rig, name: &str| {
@@ -386,7 +386,7 @@ fn a_confirm_and_a_drop_each_collect_the_releases_nothing_needs() {
 /// `floor` and a jump of more than 1000 epochs likewise; a later epoch counts its ids again.
 /// `status.json` reports the id of the order acted on.
 ///
-/// Mutants planted: confirm and revert floored with the node pair (the low-id confirm flips);
+/// Catches: confirm and revert floored with the node pair (the low-id confirm flips);
 /// the older-epoch arm or the jump arm dropped for the frontend kind; the word missing.
 #[test]
 fn the_proxy_s_three_orders_share_the_frontend_floor_and_stale_ones_are_refused() {
@@ -418,7 +418,7 @@ fn the_proxy_s_three_orders_share_the_frontend_floor_and_stale_ones_are_refused(
 /// trial goes back to `previous`), and on a frontend host the node floor is not moved by the
 /// proxy's orders.
 ///
-/// Mutant planted: `kind_of` ignoring the host's flag (the revert on a plain host is the
+/// Catches: `kind_of` ignoring the host's flag (the revert on a plain host is the
 /// proxy's and drops nothing).
 #[test]
 fn on_a_host_without_a_frontend_confirm_and_revert_stay_the_node_s() {
@@ -465,7 +465,7 @@ fn on_a_host_without_a_frontend_confirm_and_revert_stay_the_node_s() {
 /// `installed_commit`); on any other host it does; and on a frontend host with a node swap on
 /// trial it does too.
 ///
-/// Mutants planted: `restart_due` set whatever the host; the pending check dropped.
+/// Catches: `restart_due` set whatever the host; the pending check dropped.
 #[test]
 fn recover_owes_a_restart_after_a_repair_unless_a_frontend_host_has_no_swap_on_trial() {
     let lagging = |rig: &mut Rig, pending: bool| {
@@ -506,7 +506,7 @@ fn recover_owes_a_restart_after_a_repair_unless_a_frontend_host_has_no_swap_on_t
 /// (a directory stands in its place) each of the three orders is refused with the word
 /// `stage`, the pass goes on, and nothing is staged, flipped or dropped.
 ///
-/// Mutant planted: the error of any of the three verbs turned into a fatal one (the pass
+/// Catches: the error of any of the three verbs turned into a fatal one (the pass
 /// ends in an error).
 #[test]
 fn a_state_lock_that_cannot_be_opened_is_a_refusal_of_each_of_the_three_orders() {
@@ -540,7 +540,7 @@ fn a_state_lock_that_cannot_be_opened_is_a_refusal_of_each_of_the_three_orders()
 /// `denied` with the reason in `status.json`, the pass goes on, no floor moves and nothing is
 /// staged.
 ///
-/// Mutant planted: `frontend_host` ignoring the mode (always `Ok`) fails every refused row;
+/// Catches: `frontend_host` ignoring the mode (always `Ok`) fails every refused row;
 /// always `Err` fails every accepted row.
 #[test]
 fn a_frontend_update_is_taken_by_the_mode_in_the_hosts_kbf_toml() {
@@ -593,7 +593,7 @@ fn a_frontend_update_is_taken_by_the_mode_in_the_hosts_kbf_toml() {
 /// write and before the link). A new confirm order for B reports it kept, makes `current`
 /// point at B, and leaves `previous` on A, in the state and on disk.
 ///
-/// Mutant planted: `converge` removed from the repeat-confirm path of `confirm_frontend`
+/// Catches: `converge` removed from the repeat-confirm path of `confirm_frontend`
 /// (`current` stays on A).
 #[test]
 fn a_replayed_frontend_confirm_makes_a_lagging_link_match_the_state() {
@@ -618,7 +618,7 @@ fn a_replayed_frontend_confirm_makes_a_lagging_link_match_the_state() {
 /// frontend: bytes that are not text, a file over the cap and a directory where the file
 /// should be are each `denied` with their own reason, and the pass goes on.
 ///
-/// Mutant planted: the size check dropped (the oversized file, a comment, parses and is
+/// Catches: the size check dropped (the oversized file, a comment, parses and is
 /// refused for having no mode, not for its size).
 #[test]
 fn a_kbf_toml_that_cannot_be_read_whole_is_denied_with_its_reason() {

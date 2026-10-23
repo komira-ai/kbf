@@ -40,8 +40,8 @@ impl Write for Log {
 /// node holds it) and that the log is being read, so a scan that finds nothing is not a
 /// scan of nothing.
 ///
-/// Mutants: `registered_store` logging the config with `{:?}` of a copy that prints the
-/// secret (the proto's `Debug` prints `Secret(..)`, so the mutant writes the field), and
+/// Catches: `registered_store` logging the config with `{:?}` of a copy that prints the
+/// secret (the proto's `Debug` prints `Secret(..)`, so a copy that writes the field leaks it), and
 /// the probe failure carrying the store's message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_secret_is_in_the_node_and_in_no_log_line() {
