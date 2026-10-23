@@ -276,7 +276,7 @@ fn name_verify(routes: Vec<Route>) -> Vec<Route> {
 }
 
 /// The exact number of `(method, path)` routes, verbs expanded. A new route moves it.
-const ROUTES: usize = 63;
+const ROUTES: usize = 62;
 
 fn server_routes() -> Vec<Route> {
     let mut files = Vec::new();
@@ -461,5 +461,14 @@ fn the_probe_route_needs_its_verify_row() {
             "POST".to_string(),
             "/v1/object-stores/connections/{}:verify".to_string()
         )]
+    );
+}
+
+#[test]
+fn the_ui_design_names_no_route_the_server_dropped() {
+    let text = fs::read_to_string(root().join("docs/design/kbf-ui-v1.md")).unwrap();
+    assert!(
+        !text.contains("update/hosts"),
+        "docs/design/kbf-ui-v1.md names `update/hosts`, a route the server no longer serves"
     );
 }

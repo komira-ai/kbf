@@ -420,7 +420,6 @@ pub(crate) fn fleet_node(id: &str, placement: &str, leases: u64, cpu: u64) -> Va
         "needs_attention": [],
         "placement": {"state": placement},
         "phase": {"state": "serving"},
-        "update": {"state": "confirmed", "up_to_date": true, "availability": "ok"},
         "lease_count": leases,
         "booked": {"cpu_millis": cpu, "memory_bytes": 2_147_483_648_u64, "gpus": 1, "vms": 4},
     })
@@ -435,7 +434,6 @@ pub(crate) fn hostile_node() -> Value {
     n["needs_attention"] = json!([HOSTILE]);
     n["placement"] = json!({"state": HOSTILE});
     n["phase"] = json!({"state": "quarantined", "reason": HOSTILE});
-    n["update"] = json!({"state": HOSTILE, "up_to_date": null, "availability": HOSTILE});
     n
 }
 

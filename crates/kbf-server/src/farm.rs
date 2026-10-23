@@ -88,7 +88,7 @@ use crate::missing;
 use crate::run_record;
 use crate::size_key::Keyable;
 use crate::stamp::Stamp;
-use crate::update_status::{HostUpdate, UpdateReport};
+use crate::update_status::UpdateReport;
 
 /// The scheduler term of a new single-node server process: the wall-clock time of its
 /// start in milliseconds since the Unix epoch, times 2^16, plus 16 random bits.
@@ -695,34 +695,13 @@ impl Farm {
     /// replaced (a newer stream sends its own), exactly as [`Self::node_status`] keeps a
     /// `NodeStatus`. Returns whether it was kept.
     pub fn update_status(&self, worker: &WorkerId, stream: StreamId, status: UpdateStatus) -> bool {
-        let report = UpdateReport::new(status, unix_ms());
+        let report = UpdateReport::new(status);
         let mut state = self.lock();
         if !state.is_current(worker, stream) {
             return false;
         }
         state.machine.report_update(worker, report);
         true
-    }
-
-    /// Every node registered since this farm started, in node-id order, with what each
-    /// last said about its update (`GET /v1/update/hosts`); judged against no desired
-    /// commit ([`HostUpdate::judge`]).
-    pub fn update_hosts(&self) -> Vec<HostUpdate> {
-        let mut state = self.lock();
-        state.note_closed_streams();
-        state
-            .machine
-            .nodes()
-            .filter_map(|worker| {
-                let node = state.machine.node(worker)?;
-                Some(HostUpdate::new(
-                    worker.as_str().to_owned(),
-                    node.connected,
-                    node.update_live,
-                    node.update.clone(),
-                ))
-            })
-            .collect()
     }
 
     /// Sends `order` to `worker` on its newest stream.
@@ -769,8 +748,8 @@ impl Farm {
                         state.sched.phase(worker),
                         Some(NodePhase::Preparing(_) | NodePhase::Restoring(_))
                     ),
-                    // The report is kept across streams for the operator's views; the
-                    // controller reads only one its node's current stream sent.
+                    // The report is kept across streams; the controller reads only one
+                    // its node's current stream sent.
                     update: node
                         .filter(|n| n.update_live)
                         .and_then(|n| n.update.clone()),
