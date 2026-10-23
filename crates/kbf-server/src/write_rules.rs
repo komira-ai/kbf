@@ -8,14 +8,30 @@
 //!
 //! | rule | who writes, after a takeover | what it is |
 //! |---|---|---|
-//! | [`Rule::Fenced`] | the generation holder only; every write is checked against the generation in its own transaction | the scheduler's rows, the member map, `update/*`, enrollment and object-store registrations, and the history index rows that every writer shares (the stream counter, the shape and status rows) |
+//! | [`Rule::Fenced`] | the generation holder only; every write is checked against the generation in its own transaction (a store the frontends share holds no generation: see below) | the scheduler's rows, the member map, `update/*`, enrollment and object-store registrations, and the history index rows that every writer shares (the stream counter, the shape and status rows) |
 //! | [`Rule::OwnInstance`] | the process whose id the key carries, unchecked | a history chunk row and a history header row, keyed by the writer id (`WriterId::from_instance` of the process's instance id) |
 //! | [`Rule::UniqueInsert`] | any process, unchecked, as an insert (`Cond::Absent`) | a history stream row and object row, unique by allocation (the key holds a stream id from a counter block, or a run id, which no other process is given), and a list entry, whose value is empty so the same row from two writers is one row |
+//! | [`Rule::Conditional`] | any frontend of the store, at any time, with the checks the write carries (the scheduler's transitions are conditional on the versions of the rows they read) | what [`Rule::Fenced`] is for a store whose frontends take no generation: see below |
 //!
 //! The history rows follow from `kbf_history::RowKind`; [`classify`] asks it. A history
 //! writer writes its rows through a handle that applies exactly the unchecked rules above
 //! and sends everything else through the fence (`kbf_state::OwnKeys`), so a key of a fenced
 //! family cannot reach the store unchecked, whatever a caller does.
+//!
+//! **A store the frontends share.** A Postgres store opened by [`crate::StateStoreUri::open`]
+//! holds no generation: its `meta/generation` row holds `kbf_state::SHARED_WRITERS`, no
+//! frontend is fenced by another, and nothing refuses a write for want of a generation. The
+//! families [`classify`] calls [`Rule::Fenced`] are then written by every frontend, with the
+//! checks the writes already carry: a transition of the scheduler is conditional on the
+//! versions of the rows it read, a lease of a node on the node's `owner/` row too, and a
+//! counter by a block reserved with a compare-and-set. Some writes of those families carry no
+//! such check and are still written with `Cond::Any`: the cordon rows, the key floors, the
+//! estimate rows, the `meta/alive` row, the member map's `down` and `pin` rows, the join rows
+//! and the enrollment node rows. [`classify_shared`] is [`classify`] for such a store, and says
+//! [`Rule::Conditional`] where [`classify`] says [`Rule::Fenced`]; it states which rule holds
+//! for the families and nothing in the server consults it. [`classify`] stays what it was,
+//! for a store whose writer holds a generation (a SQLite file, and a store a takeover or a
+//! handover opened).
 //!
 //! Not in the table, because they are not state-store keys of the frontend: the object
 //! store's history objects (`history/...`, named by the writer id), the cold store, and
@@ -35,6 +51,10 @@ pub enum Rule {
     /// Written unchecked by any process, as an insert whose key no other process is given
     /// (or whose value is empty).
     UniqueInsert,
+    /// Written by every frontend of a store that holds no generation, with the checks the
+    /// write already carries, which are on the versions of the rows it read for the
+    /// scheduler's transitions and not for every row of the family ([`classify_shared`]).
+    Conditional,
 }
 
 impl Rule {
@@ -42,6 +62,17 @@ impl Rule {
     #[must_use]
     pub fn survives_a_takeover(self) -> bool {
         self != Rule::Fenced
+    }
+
+    /// The rule the family follows in a store whose frontends take no generation: a family
+    /// that is [`Rule::Fenced`] is written conditionally by every frontend, and the other
+    /// rules are as they were (they never depended on a generation).
+    #[must_use]
+    pub fn when_shared(self) -> Rule {
+        match self {
+            Rule::Fenced => Rule::Conditional,
+            other => other,
+        }
     }
 }
 
@@ -81,7 +112,9 @@ fn fenced(keys: Keys, writer: &'static str, example: &'static str) -> Family {
 /// is a flag.
 pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
     vec![
-        // The generation row itself: written by `Fenced::take`, which is the fence.
+        // The generation row itself: written by `Fenced::take`, which is the fence. A store
+        // the frontends share holds the marker there, which `kbf_state::share` puts at an
+        // open with a write conditional on the row it read.
         fenced(
             Keys::Exactly("meta/generation"),
             "kbf-state fence",
@@ -323,6 +356,17 @@ pub fn classify(key: &str, index: &IndexRoot) -> Option<Classified> {
         })
 }
 
+/// [`classify`] for a store whose frontends take no generation (a Postgres store opened by
+/// [`crate::StateStoreUri::open`]): the rule `key` follows there, so [`Rule::Conditional`]
+/// where [`classify`] says [`Rule::Fenced`].
+#[must_use]
+pub fn classify_shared(key: &str, index: &IndexRoot) -> Option<Classified> {
+    classify(key, index).map(|kind| Classified {
+        rule: kind.rule.when_shared(),
+        ..kind
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use kbf_history::{InvKey, WriterId};
@@ -387,5 +431,49 @@ mod tests {
         assert_eq!(classify("ui/streams", &root), None, "another root's row");
         assert_eq!(classify("no-such/key", &root), None);
         assert_eq!(classify("", &root), None);
+    }
+
+    /// Asserts that for a store whose frontends take no generation every family of the table
+    /// is conditional; that a history row of one writer, and a history insert, keep their
+    /// rules; that a history row every writer shares is conditional; and that a key of no
+    /// family still has no rule.
+    #[test]
+    fn a_store_without_a_generation_calls_the_fenced_families_conditional() {
+        for family in FAMILIES.iter() {
+            let got = classify_shared(family.example, &IndexRoot::default()).expect("classified");
+            let want = (Rule::Conditional, family.keys.name());
+            assert_eq!((got.rule, got.family), want);
+        }
+        let root = IndexRoot::under("farm-a/").expect("a prefix");
+        let (inv, writer) = (
+            InvKey::from_record_id("b"),
+            WriterId::from_instance("child"),
+        );
+        let stream = root.stream(
+            kbf_history::Day::from_number(20_261_019),
+            kbf_history::StreamId(1),
+            1,
+        );
+        let cases = [
+            (root.ichunk(&inv, writer, 1), Rule::OwnInstance),
+            (stream, Rule::UniqueInsert),
+            (root.streams_counter(), Rule::Conditional),
+            (root.shape("main", 1, "cfg"), Rule::Conditional),
+        ];
+        for (key, rule) in cases {
+            let got = classify_shared(&key, &root).map(|c| c.rule);
+            assert_eq!(got, Some(rule), "{key}");
+        }
+        assert_eq!(classify_shared("no-such/key", &root), None);
+    }
+
+    /// Asserts that only the fenced rule changes for a store without a generation.
+    #[test]
+    fn only_the_fenced_rule_changes_when_the_store_is_shared() {
+        assert_eq!(Rule::Fenced.when_shared(), Rule::Conditional);
+        for rule in [Rule::OwnInstance, Rule::UniqueInsert, Rule::Conditional] {
+            assert_eq!(rule.when_shared(), rule);
+        }
+        assert!(Rule::Conditional.survives_a_takeover());
     }
 }

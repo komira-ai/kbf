@@ -271,7 +271,7 @@ mod tests {
 
     /// Catches: a member whose peers are all fine answered unsafe, and a safe answer that
     /// still carries a reason or says the member is planned down, or that does not survive
-    /// the JSON the CLI reads it back from. Mutants it catches: the verdict's `safe` taken
+    /// the JSON the CLI reads it back from. It catches: the verdict's `safe` taken
     /// from `shut.is_some()` (the gate inverted), which turns this and every test below that
     /// asks for a verdict red.
     #[test]
@@ -292,7 +292,7 @@ mod tests {
     /// each thing the storage gate shuts on in another member (not `Active`, catching up,
     /// planned down, silent, an unreported or a non-zero repair debt) makes `safe` false
     /// with the gate's own line, the member's own debt does too, and so does a lone member
-    /// (no second copy). Mutants it catches: `reasons` left empty; a reason text changed;
+    /// (no second copy). It catches: `reasons` left empty; a reason text changed;
     /// the peers' debt not read (the gate asked about the member alone).
     #[test]
     fn each_thing_the_gate_shuts_on_makes_the_stop_unsafe_with_its_reason() {
@@ -373,7 +373,7 @@ mod tests {
     }
 
     /// Catches: a worse reason hidden behind a lesser one: a second member down is named
-    /// before another member's debt, as the storage gate ranks them. Mutants it
+    /// before another member's debt, as the storage gate ranks them. It
     /// catches: the first reason found given instead of the worst.
     #[test]
     fn the_worst_reason_is_the_one_given() {
@@ -441,7 +441,7 @@ mod tests {
     /// judged; a node whose storage half is a member is `200` with that member's verdict, the
     /// gate run; a node that cannot be told from one with a member is `409` with the reason;
     /// and the membership failing is `503`, a row that does not decode and a panicked task
-    /// `500`. Mutants it catches: a node with a member answered as a daemon; an unsure node
+    /// `500`. It catches: a node with a member answered as a daemon; an unsure node
     /// answered safe.
     #[tokio::test]
     async fn each_outcome_is_answered_with_its_status() {

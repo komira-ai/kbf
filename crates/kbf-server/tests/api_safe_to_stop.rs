@@ -220,7 +220,7 @@ async fn ask(server: &Server, node: Node) -> Value {
 /// reason; a peer that owes blobs, then a peer planned down, make the stop of the others
 /// unsafe with the gate's own line; the planned-down member itself is safe to stop and says
 /// it is planned down; and asking changes nothing (the map's generation moves once, by the
-/// plan, and not by the queries). Mutants it catches: the gate inverted; the reasons
+/// plan, and not by the queries). It catches: the gate inverted; the reasons
 /// dropped; the planned-down mark left out of the answer; a query that writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_verdict_follows_the_members() {
@@ -261,7 +261,7 @@ async fn the_verdict_follows_the_members() {
 
 /// Catches: the query skipping a gate the member write passes: no token, a wrong token, a
 /// browser's `Origin`, or no JSON content type must each be refused, with nothing of the
-/// verdict in the answer. Mutants it catches: the `gate` call removed from the handler.
+/// verdict in the answer. It catches: the `gate` call removed from the handler.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_query_is_refused_without_the_gates() {
     let (server, _other, [one, _, _]) = three_members();
@@ -305,7 +305,7 @@ async fn an_id_that_names_nothing_is_404() {
 /// Catches: a daemon asked about as if it were a storage member that is unknown (404), or a
 /// name that is no daemon answered safe: on a server without a state store (which keeps no
 /// members) a node that registered with the farm is safe to stop with the line that says
-/// only the daemon was judged, a node that did not is 404. Mutants it catches: the farm's
+/// only the daemon was judged, a node that did not is 404. It catches: the farm's
 /// node lookup inverted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_daemon_is_safe_to_stop() {
@@ -391,7 +391,7 @@ async fn ask_by(server: &Server, id: &str) -> (u16, Value) {
 /// judged as member 1 (unsafe while member 2 owes blobs, and the same body as asking by
 /// member 1); a node enrolled with no storage address, and a Mac, are safe with the daemon
 /// line; a Linux node whose address no member registered, and one the registry does not know,
-/// are `409` with why; a node that never registered is `404`. Mutants it catches: the node
+/// are `409` with why; a node that never registered is `404`. It catches: the node
 /// answered as a daemon without asking the registry; an unlinked node answered safe.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_node_is_judged_as_the_storage_member_it_enrolled_with() {

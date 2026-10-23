@@ -1,7 +1,8 @@
 use super::{
-    BadCommand, Channel, MAX_CHANNEL_LEN, MAX_UNIT_VERSION_LEN, MAX_VERSION_LEN, Request, Version,
-    in_grammar,
+    BadCommand, Channel, MAX_CHANNEL_LEN, MAX_FRONTEND_LEN, MAX_UNIT_VERSION_LEN, MAX_VERSION_LEN,
+    Request, Unit, Version, in_grammar,
 };
+use crate::contract;
 
 fn parse(text: &str) -> Result<Request, BadCommand> {
     Request::parse(text)
@@ -16,7 +17,8 @@ fn install(text: &str) -> (String, String) {
     }
 }
 
-/// The two forms parse, and give back exactly the version and channel in them.
+/// The install and query forms parse, and the install gives back exactly the version and
+/// channel in it (the restart form is read in its own tests).
 #[test]
 fn the_two_forms_are_accepted() {
     assert_eq!(
@@ -271,4 +273,122 @@ fn a_leading_hyphen_is_no_request() {
             "{version}"
         );
     }
+}
+
+fn restart(text: &str) -> String {
+    match parse(text) {
+        Ok(Request::Restart { unit }) => unit.as_str().to_owned(),
+        other => panic!("{text:?}: {other:?}"),
+    }
+}
+
+/// Asserts that `restart frontend=-` names the plain frontend unit, that an instance name
+/// names `kbf-frontend@<name>.service`, that the longest name is accepted, and that the
+/// verb of the request is `restart`.
+#[test]
+fn the_restart_forms_are_accepted() {
+    assert_eq!(restart("restart frontend=-"), "kbf-frontend.service");
+    assert_eq!(restart("restart frontend=a1"), "kbf-frontend@a1.service");
+    assert_eq!(restart("restart frontend=a"), "kbf-frontend@a.service");
+    assert_eq!(restart("restart frontend=b-"), "kbf-frontend@b-.service");
+    let longest = format!("f{}", "0".repeat(MAX_FRONTEND_LEN - 1));
+    let unit = restart(&format!("restart frontend={longest}"));
+    assert_eq!(unit, format!("kbf-frontend@{longest}.service"));
+    assert_eq!(parse("restart frontend=-").unwrap().verb(), "restart");
+}
+
+/// Asserts that every restart request below is refused: a name that is empty, starts with
+/// anything but a lower-case letter, holds anything but lower-case letters, digits and
+/// hyphens, or is over the bound; any key but `frontend`; and any space, line end, extra
+/// word or case change around the request.
+#[test]
+fn refused_restart_inputs() {
+    let long = format!("restart frontend=a{}", "b".repeat(MAX_FRONTEND_LEN));
+    let cases: Vec<(&str, String)> = vec![
+        ("empty name", "restart frontend=".into()),
+        ("upper-case name", "restart frontend=A".into()),
+        ("upper-case inside", "restart frontend=aB".into()),
+        ("semicolon", "restart frontend=a;b".into()),
+        ("dollar", "restart frontend=a$HOME".into()),
+        ("backtick", "restart frontend=a`id`".into()),
+        ("dot-dot", "restart frontend=../x".into()),
+        ("slash", "restart frontend=a/b".into()),
+        ("at sign", "restart frontend=a@b".into()),
+        ("a unit name", "restart frontend=kbf-frontend@a".into()),
+        ("a unit suffix", "restart frontend=a.service".into()),
+        ("underscore", "restart frontend=a_b".into()),
+        ("glob", "restart frontend=*".into()),
+        ("glob after a letter", "restart frontend=a*".into()),
+        ("digit first", "restart frontend=1a".into()),
+        ("hyphen first", "restart frontend=-a".into()),
+        ("two hyphens", "restart frontend=--".into()),
+        ("non-ASCII", "restart frontend=\u{e9}".into()),
+        ("non-ASCII second", "restart frontend=a\u{e9}".into()),
+        ("over-long name", long),
+        ("another key", "restart unit=kbf-daemon.service".into()),
+        ("another key, a name", "restart unit=a1".into()),
+        ("no key", "restart a1".into()),
+        ("key without a value", "restart frontend".into()),
+        ("only the verb", "restart".into()),
+        ("the verb and a space", "restart ".into()),
+        ("trailing space", "restart frontend=a1 ".into()),
+        ("trailing space, dash", "restart frontend=- ".into()),
+        ("leading space", " restart frontend=a1".into()),
+        ("double space", "restart  frontend=a1".into()),
+        ("tab for space", "restart\tfrontend=a1".into()),
+        ("extra word", "restart frontend=a1 now".into()),
+        ("extra assignment", "restart frontend=a1 unit=x".into()),
+        ("two names", "restart frontend=a1 frontend=a2".into()),
+        (
+            "an install after it",
+            "restart frontend=a1 install kbf=1 from c".into(),
+        ),
+        ("trailing newline", "restart frontend=a1\n".into()),
+        ("trailing CR", "restart frontend=a1\r".into()),
+        ("trailing NUL", "restart frontend=a1\0".into()),
+        ("newline inside", "restart frontend=a\nb".into()),
+        ("upper-case verb", "Restart frontend=a1".into()),
+        ("upper-case key", "restart Frontend=a1".into()),
+    ];
+    for (what, text) in &cases {
+        assert_eq!(parse(text).map(|_| ()), Err(BadCommand), "{what}: {text:?}");
+    }
+}
+
+/// Asserts that the contract a client tests against gives the unit of an accepted restart
+/// request and nothing for a refused restart, an install or a query.
+#[test]
+fn the_contract_reads_a_restart_request() {
+    assert_eq!(
+        contract::restart_request("restart frontend=a1").as_deref(),
+        Some("kbf-frontend@a1.service")
+    );
+    assert_eq!(
+        contract::restart_request("restart frontend=-").as_deref(),
+        Some("kbf-frontend.service")
+    );
+    for text in [
+        "restart frontend=A",
+        "restart",
+        "query",
+        "install kbf=1 from c",
+    ] {
+        assert_eq!(contract::restart_request(text), None, "{text}");
+    }
+}
+
+/// Asserts that the frontend unit is built from the checked name alone: `-` gives the plain
+/// unit, an instance name gives the instance of the template, and the bound is inclusive.
+#[test]
+fn the_unit_is_made_from_a_checked_name() {
+    let plain = Unit::frontend("-").unwrap();
+    assert_eq!(plain.as_str(), "kbf-frontend.service");
+    let instance = Unit::frontend("a1-b").unwrap();
+    assert_eq!(instance.as_str(), "kbf-frontend@a1-b.service");
+    assert!(Unit::frontend("").is_err());
+    assert!(Unit::frontend("a b").is_err());
+    let longest = "a".repeat(MAX_FRONTEND_LEN);
+    assert!(Unit::frontend(&longest).is_ok());
+    let over = "a".repeat(MAX_FRONTEND_LEN + 1);
+    assert!(Unit::frontend(&over).is_err());
 }

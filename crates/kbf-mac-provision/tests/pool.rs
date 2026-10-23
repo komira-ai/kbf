@@ -21,7 +21,7 @@ fn add_to_profile(mac: &mut FakeMac, extra: &str) {
     mac.set_profile(text);
 }
 
-/// Catches: a pool user that is an administrator passing `pool_users` (the mutant:
+/// Catches: a pool user that is an administrator passing `pool_users` (the defect:
 /// drop the admin check; `admin_user` still fails, so this asserts the pool line), and
 /// an `apply` that leaves it an administrator.
 #[test]
@@ -133,7 +133,7 @@ fn a_pool_home_that_is_a_link_is_left() {
 
 /// Catches: `apply` making the pool's homes through a link at the homes directory
 /// (the link target would hold directories owned by the pool uids). `dir_of` leaves
-/// the link; the mutant is `fix_user` making the homes anyway, as it did before.
+/// the link; the defect is `fix_user` making the homes anyway, as it did before.
 #[test]
 fn a_homes_directory_that_is_a_link_gets_no_home() {
     let mac = FakeMac::converged("pool-homes-link");
@@ -308,7 +308,7 @@ const ROOT_DRIFTS: &[Drift] = &[
     ),
 ];
 
-/// Catches: a node key of the wrong mode, owner or link count passing (mutant: drop
+/// Catches: a node key of the wrong mode, owner or link count passing (defect: drop
 /// the key mode check), a scratch root a lease uid could write, and a fix that does
 /// not take or that changes a key it cannot make safe.
 #[test]

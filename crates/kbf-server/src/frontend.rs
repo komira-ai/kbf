@@ -1544,9 +1544,6 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
 }
 
 mod handoff;
-mod over;
-
-pub use over::start_frontend_over;
 
 #[cfg(test)]
 mod tests;

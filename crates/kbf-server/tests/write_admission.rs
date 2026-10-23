@@ -131,7 +131,7 @@ fn listeners() -> Listeners {
 /// Catches: an admission taken after buffering, which lets every Write buffer at once;
 /// a connection window smaller than every stream's window, with which the Writes
 /// waiting for admission take the whole window and the admitted ones never finish (the
-/// timeout fires). Mutants seen red: the permit taken in `store_blobs` instead of after
+/// timeout fires). Catches: the permit taken in `store_blobs` instead of after
 /// the first message; the listener's flow-control windows left at the transport's defaults.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_writes_stay_under_the_bytes_in_flight() {
@@ -182,7 +182,7 @@ async fn concurrent_writes_stay_under_the_bytes_in_flight() {
 /// the stream window. 1500 waiting Writes leave 1500 x 214,748 B (about 307 MiB) unread,
 /// more than a connection window fixed at 200 MiB holds (a fixed window starves at
 /// about 977 waiting Writes), so with it the admitted ones never get their last message.
-/// Mutant: the REAPI listener's connection window fixed at 200 MiB again
+/// Catches: the REAPI listener's connection window fixed at 200 MiB again
 /// (`flow_windows`: `connection: 200 * STREAM_WINDOW_BYTES`). Without the admitted
 /// Writes held, they finish before the waiting ones pile up and the test passes on the
 /// old code.
@@ -232,7 +232,7 @@ async fn more_waiting_writes_than_a_fixed_window_holds_all_finish() {
     }
     let window = u64::from(kbf_server::streams::flow_windows(10_000).stream);
     // What the windows hold, less 5%: the streams send a little under their window (a
-    // run measured 99.7%), and the mutant's connection window stops them at 65%.
+    // run measured 99.7%), and a connection window fixed at 200 MiB stops them at 65%.
     let held_in_windows = WAITING as u64 * (SMALL_CHUNK as u64 + window);
     let expected = held_in_windows - held_in_windows / 20;
     let deadline = Instant::now() + Duration::from_secs(60);

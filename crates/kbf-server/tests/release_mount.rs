@@ -144,7 +144,7 @@ async fn http(addr: SocketAddr, method: &str, path: &str, auth: bool, body: &[u8
 /// listener's `ReleaseService`; the same put without the token is refused, and nothing
 /// of it is served.
 ///
-/// Mutants seen red: the router not merged (the PUT is 404); the service not added to the
+/// Catches: the router not merged (the PUT is 404); the service not added to the
 /// worker server (the fetch is UNIMPLEMENTED).
 #[tokio::test]
 async fn a_release_put_on_the_api_is_fetched_through_the_worker_listener() {
@@ -176,7 +176,7 @@ async fn a_release_put_on_the_api_is_fetched_through_the_worker_listener() {
 /// the upload route says the store is off, and the service refuses a fetch rather than
 /// serving an empty answer.
 ///
-/// Mutant seen red: the routes mounted over a store made out of nothing.
+/// Catches: the routes mounted over a store made out of nothing.
 #[tokio::test]
 async fn without_a_store_the_update_endpoints_say_so() {
     let dir = Dir::new();
@@ -215,7 +215,7 @@ async fn without_a_store_the_update_endpoints_say_so() {
 /// its bundle is FAILED_PRECONDITION, with it the digests of both files), the route answers
 /// 200, and the bundle digest the description names is served by `Fetch`.
 ///
-/// Mutants seen red: the `Describe` row left out of the worker role table (the call is
+/// Catches: the `Describe` row left out of the worker role table (the call is
 /// PERMISSION_DENIED, "not served"); the bundle omitted from the description.
 #[tokio::test]
 async fn a_release_put_on_the_api_is_described_on_both_listeners() {

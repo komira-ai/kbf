@@ -219,7 +219,7 @@ fn names(list: &DeniedList) -> Vec<(&str, &str)> {
 /// path with `POST` and `DELETE` (a merge that lost one method would answer 405). The empty
 /// list is `{"denied":[]}`, never 404, and every answer is `no-store`.
 ///
-/// Mutants seen red: the listing reading only `node` rows; the reason left out (empty); the
+/// Catches: the listing reading only `node` rows; the reason left out (empty); the
 /// route merged so that `GET` was never reached (405); `at_ms` a constant; `no_store` missing
 /// from the 401/403/415, 404, 503 and 500 answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -276,7 +276,7 @@ async fn the_deny_list_is_read_back_with_every_kind_and_reason() {
 /// on a `GET` too, as for `/v1/enroll`), and a server started without `--api-token-file`
 /// (403). A refused request lists no entry, though one is denied.
 ///
-/// Mutants seen red: the `gate` call removed from the listing; the content-type check
+/// Catches: the `gate` call removed from the listing; the content-type check
 /// skipped on the `GET`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_listing_passes_the_write_gate() {
@@ -312,7 +312,7 @@ async fn the_listing_passes_the_write_gate() {
 /// Catches a server without members answering anything but 404 (after the gate), and a
 /// 500 for a missing store.
 ///
-/// Mutant seen red: the missing-members answer a 500.
+/// Catches: the missing-members answer a 500.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_listing_without_members_answers_404() {
     let none = serve_routes(Some(token()), None).await;
@@ -325,7 +325,7 @@ async fn a_listing_without_members_answers_404() {
 /// (two `Members` on the same rows, no writer role between them) each list an entry the
 /// other denied, at once.
 ///
-/// Mutant seen red: the listing read from a copy taken at start.
+/// Catches: the listing read from a copy taken at start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_frontends_over_one_store_list_each_others_entries() {
     let store = live_store();
@@ -352,7 +352,7 @@ async fn two_frontends_over_one_store_list_each_others_entries() {
 /// decode is 500 (the list is never guessed at), and a store call that panics is 500, each
 /// without the store's own message or the row's bytes in the answer.
 ///
-/// Mutants seen red: the store's error text echoed (`injected` in the body); a corrupt row
+/// Catches: the store's error text echoed (`injected` in the body); a corrupt row
 /// skipped instead of refused (200 with the other entries); the panic left to drop the
 /// connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

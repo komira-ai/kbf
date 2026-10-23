@@ -252,7 +252,7 @@ async fn session_as(to: SocketAddr, node: &str, claims: &[(String, String)]) -> 
 /// role of a caller the proxy vouched for as a frontend, and a proxied daemon that is not
 /// admitted at all.
 ///
-/// Mutant seen red: the headers accepted without the secret check.
+/// Catches: the headers accepted without the secret check.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_worker_session_needs_the_proxys_word() {
     let server = start(true);
@@ -306,7 +306,7 @@ async fn a_worker_session_needs_the_proxys_word() {
 /// secret with a role that is not a role is refused `PERMISSION_DENIED` by the layer
 /// before the REAPI service reads it, and one with a well-formed identity is not.
 ///
-/// Mutant seen red: the REAPI listener built with `ProxyAuthLayer::new(None)`.
+/// Catches: the REAPI listener built with `ProxyAuthLayer::new(None)`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_reapi_listener_is_behind_the_proxy() {
     let server = start(true);
@@ -347,7 +347,7 @@ async fn the_reapi_listener_is_behind_the_proxy() {
 /// Catches: `Hello.node_id` not bound to the node the proxy named: a daemon vouched for as
 /// `node-a` that says `node-b` in its `Hello` takes over another node's session.
 ///
-/// Mutant seen red: the `Hello.node_id` binding skipped.
+/// Catches: the `Hello.node_id` binding skipped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_forged_node_id_is_refused() {
     let server = start(true);
@@ -367,7 +367,7 @@ async fn a_forged_node_id_is_refused() {
 /// Catches: the deny list not applied to the node a proxy names (a denied node admitted),
 /// or applied to every node.
 ///
-/// Mutant seen red: `Behind::deny_list` dropped when the listener has no TLS.
+/// Catches: `Behind::deny_list` dropped when the listener has no TLS.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_denied_node_is_refused_behind_the_proxy() {
     // Bound: the list is read again at every call, so its file outlives the server.
@@ -456,7 +456,7 @@ async fn http_status(api: SocketAddr, method: &str, path: &str, headers: &[(&str
 /// a local caller (they stay open, as documented). 404 for an unknown node is "past every
 /// gate".
 ///
-/// Mutant seen red: an operator write admitted without the token when proxied.
+/// Catches: an operator write admitted without the token when proxied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_operator_write_through_the_proxy_needs_the_token() {
     let server = start(true);
@@ -609,7 +609,7 @@ async fn register(
 /// is the case with the header); the role must be `storage`, and without the secret the
 /// caller is anonymous.
 ///
-/// Mutants seen red: the role not checked; the node name widened to any host.
+/// Catches: the role not checked; the node name widened to any host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn membership_takes_the_proxys_storage_node_and_covers_by_its_name() {
     let mut client = membership(secret()).await;
@@ -730,7 +730,7 @@ async fn beat(
 /// the same (`.10` against `.1`, either way), not the same address spelled as IPv4-mapped
 /// IPv6, not a different port's host, and nothing when the header is absent.
 ///
-/// Mutants seen red: `PeerIdentity::proxied` drops the addresses; the heartbeat's `holds`
+/// Catches: `PeerIdentity::proxied` drops the addresses; the heartbeat's `holds`
 /// ignores them (another node's beat on this member passes); a prefix or substring match; the
 /// mapped form equated with the IPv4 one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -816,7 +816,7 @@ async fn membership_covers_the_ips_the_proxy_forwarded_from_the_leaf() {
 /// header malformed, repeated or too long it is refused PERMISSION_DENIED before Membership
 /// reads it, and the address of a well-formed header that does not match is not covered.
 ///
-/// Mutants seen red: the header read without the secret; a malformed element skipped.
+/// Catches: the header read without the secret; a malformed element skipped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_forged_or_malformed_ips_header_registers_nothing() {
     let mut client = membership(secret()).await;
@@ -900,7 +900,7 @@ fn address(line: &str, key: &str) -> SocketAddr {
 /// with the secret), and the operator API must refuse a write without it, even with the
 /// token. Over the real binary, so the flag, its file and the wiring are all in the path.
 ///
-/// Mutant seen red: the secret read but the listeners built without it.
+/// Catches: the secret read but the listeners built without it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_binary_serves_behind_the_proxy_when_given_the_flag() {
     use std::io::BufRead as _;
@@ -963,7 +963,7 @@ async fn the_binary_serves_behind_the_proxy_when_given_the_flag() {
 /// which flag, which file and which mode, and promptly: one that starts instead is killed
 /// and fails the test rather than hanging it).
 ///
-/// Mutant seen red: `owner_only` accepting 0644.
+/// Catches: `owner_only` accepting 0644.
 #[test]
 fn the_binary_refuses_a_readable_secret_file() {
     use std::io::Read as _;

@@ -217,6 +217,7 @@ fn record(host: &MacHost, plan: Option<&Plan>, state: &ApplyState) {
         verb: Some("apply"),
         version: plan.map(|plan| plan.version.clone()),
         channel: None,
+        unit: None,
         outcome: if *state == ApplyState::Done {
             "applied"
         } else {

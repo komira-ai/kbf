@@ -53,7 +53,7 @@ fn status(root: &Path) -> serde_json::Value {
 /// status.json and exits 0 (here as a non-root user, so with the installer's refusal); with an order it cannot
 /// carry out (no cgroup of the unit's leases exists on this root), the pass ends and the refusal is the node's to read, not a crash.
 ///
-/// Mutant seen red: `leases::NotWired` left in `build_helper` (the refusal says there is no
+/// Catches: `leases::NotWired` left in `build_helper` (the refusal says there is no
 /// lease source wired in, not that the unit's cgroup is missing).
 #[test]
 fn one_pass_reports_the_host_and_a_refused_order() {
@@ -305,7 +305,7 @@ fn boot_check_takes_kbf_and_mode_together_or_not_at_all() {
 /// (the label is taken, and no unit is needed) end on their own; a helper.json the helper
 /// cannot read ends the run with an exit of 1 and a message, not a guess.
 ///
-/// Mutant seen red: `passes` ignored (the run never ends; the test would hang), the
+/// Catches: `passes` ignored (the run never ends; the test would hang), the
 /// decrement dropped.
 #[test]
 fn passes_end_the_run_and_an_unreadable_memory_stops_it() {
@@ -343,7 +343,7 @@ fn passes_end_the_run_and_an_unreadable_memory_stops_it() {
 /// `quiesce` is exit 5 and a dry-run `revert` leaves the state alone; `gc` without
 /// `--apply` removes nothing.
 ///
-/// Mutants planted: `Failure::exit_code` returning 1 for every case; `quiesce` not reading
+/// Catches: `Failure::exit_code` returning 1 for every case; `quiesce` not reading
 /// the pending swap.
 #[test]
 fn the_operator_verbs_exit_by_the_contract() {
@@ -409,7 +409,7 @@ fn the_operator_verbs_exit_by_the_contract() {
 /// verb that needs root with exit 2 and the reason, `--json` puts one object on standard
 /// output, and a verb that needs no root and is not built yet says which pull request builds it.
 ///
-/// Mutant planted: the root check of `setup` skipped (it then fails on the first thing it
+/// Catches: the root check of `setup` skipped (it then fails on the first thing it
 /// writes, exit 1, or writes under `--root`).
 #[test]
 fn the_shipped_binary_refuses_a_verb_that_needs_root_and_names_the_unbuilt_ones() {
@@ -431,7 +431,7 @@ fn the_shipped_binary_refuses_a_verb_that_needs_root_and_names_the_unbuilt_ones(
 /// one in its place; here the new file is no program, so the start fails and the service
 /// ends with the reason (exit 1) instead of running on or hanging.
 ///
-/// Mutants planted: the watch never consulted (the loop runs all its passes and exits 0);
+/// Catches: the watch never consulted (the loop runs all its passes and exits 0);
 /// the failed start not reported.
 #[test]
 fn a_service_whose_file_was_replaced_says_so_and_ends_when_the_new_one_cannot_start() {
@@ -492,7 +492,7 @@ fn a_service_whose_file_was_replaced_says_so_and_ends_when_the_new_one_cannot_st
 /// the lock held by another process, `quiesce` waits its time and then ends busy (exit 4),
 /// which tells a maintainer script to ask again.
 ///
-/// Mutant planted: the busy error mapped to a plain failure (exit 1).
+/// Catches: the busy error mapped to a plain failure (exit 1).
 #[test]
 fn a_verb_that_finds_the_lock_held_ends_busy() {
     let root = root("busy");
@@ -519,7 +519,7 @@ fn a_verb_that_finds_the_lock_held_ends_busy() {
 /// binary: both state files damaged is an operator's job (exit 5), and a lock file that cannot
 /// even be opened is a plain failure (exit 1).
 ///
-/// Mutants planted: the unusable state mapped to a plain failure; the lock error to busy.
+/// Catches: the unusable state mapped to a plain failure; the lock error to busy.
 #[test]
 fn the_operators_verbs_end_by_the_state_error_they_met() {
     let root = root("state-errors");

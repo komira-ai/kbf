@@ -314,12 +314,12 @@ fn fetch_release(
     set_mode(&stage, 0o711)?;
     let fetched = fetcher.fetch(want, &scratch);
     set_mode(&stage, 0o700)?;
-    let commit = fetched.map_err(|e| {
-        Outcome::Refused(match e {
-            FetchError::Unknown => Refusal::UnknownRelease,
-            FetchError::Ambiguous => Refusal::AmbiguousRelease,
-            FetchError::Failed(_) => Refusal::FetchFailed,
-        })
+    let commit = fetched.map_err(|e| match e {
+        FetchError::Unknown => Outcome::Refused(Refusal::UnknownRelease),
+        FetchError::Ambiguous => Outcome::Refused(Refusal::AmbiguousRelease),
+        FetchError::Failed(why) | FetchError::RateLimited(why) => {
+            Outcome::RefusedBecause(Refusal::FetchFailed, why)
+        }
     })?;
     let fetch_failed = |_: String| Outcome::Refused(Refusal::FetchFailed);
     copy_in(

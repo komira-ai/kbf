@@ -1,8 +1,7 @@
 //! Tests of `setup --proxy` (B-g): the `[proxy]` table written into `installer.toml`, the
 //! units enabled instead of `kbf-frontend.service`, what a rerun does with a table that is
 //! there, and a refusal for each flag that would write a value nothing reads. The helpers
-//! are `tests.rs`'s. Each test says the defect it catches; the mutants planted to see them go
-//! red are in the pull request.
+//! are `tests.rs`'s. Each test says the defect it catches.
 
 use super::*;
 use crate::installer_toml::InstallerToml;

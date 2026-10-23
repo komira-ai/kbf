@@ -83,7 +83,7 @@ async fn a_new_log_records_its_id_and_commits_one_bootstrap() {
 }
 
 /// Catches: a start that draws a new log id although the directory records one (the
-/// mutant "draw a new log id on every start": the restart then names another log, and
+/// defect "draw a new log id on every start": the restart then names another log, and
 /// either commits a second `Bootstrap` or refuses its own log), and a restart that
 /// applies an entry twice or loses one (the second `AllocEpoch` after the restart
 /// must be exactly one past the first).

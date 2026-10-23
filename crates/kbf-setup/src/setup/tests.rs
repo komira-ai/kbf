@@ -1,5 +1,4 @@
-//! Tests of `setup` on a fake host. Each says the defect it catches; the mutants planted to
-//! see them go red are in the pull request.
+//! Tests of `setup` on a fake host. Each says the defect it catches.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -1430,9 +1429,9 @@ fn a_mac_refuses_the_frontend_and_waits_for_a_release() {
 /// not bootstrapped again but is still enabled (it can carry an override while loaded), and
 /// `--no-start` still clears the override (without bootstrapping) so the next boot loads the job.
 ///
-/// Mutants seen red: the `enable` removed (the order and the count); the `enable` dropped under
+/// Catches: the `enable` removed (the order and the count); the `enable` dropped under
 /// `--no-start`; the `enable` skipped for a loaded job (red before the change that made it
-/// unconditional). Not run as mutants: the `enable` put after the bootstrap; the `enable` given
+/// unconditional). Variants not checked against the test: the `enable` put after the bootstrap; the `enable` given
 /// to every label.
 #[test]
 fn a_mac_clears_the_installer_jobs_disable_before_it_bootstraps_it() {
