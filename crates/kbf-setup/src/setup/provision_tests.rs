@@ -205,10 +205,14 @@ fn refusal(result: Result<impl std::fmt::Debug, SetupError>) -> String {
 
 // ---- the flag ---------------------------------------------------------------------------
 
-/// Asserts that the flag takes the recipe's URL and yields the right role, database and socket,
-/// and refuses what it cannot make: a remote host, a missing role, `postgres`, a `pg_` role, a
-/// name with a character setup will not create, one over 63 bytes and a mode with no state are
-/// each refused by the flag, and no refusal quotes the URL.
+/// Catches a flag that takes a URL it cannot make something from, or one that makes
+/// something from a name it should refuse: the recipe's URL is accepted and yields the right
+/// role, database and socket; a remote host, a missing role, `postgres`, a `pg_` role, a name
+/// with a character setup will not create, one over 63 bytes and a mode with no state are each
+/// refused by the flag, and no refusal quotes the URL.
+///
+/// Catches: the socket check removed (a host name accepted); the `postgres` check
+/// removed; the 63-byte limit loosened to 64; the no-role check removed.
 #[test]
 fn the_flag_takes_the_recipe_url_and_refuses_what_it_cannot_make() {
     let ok = local();
@@ -326,7 +330,7 @@ fn the_flag_takes_the_recipe_url_and_refuses_what_it_cannot_make() {
 /// Catches a URL with no role being accepted: setup runs as root and the service as its own
 /// account, so each would be a different role (the process's user) in one database.
 ///
-/// Mutant seen red: the no-role check removed.
+/// Catches: the no-role check removed.
 #[test]
 fn a_database_url_names_its_role() {
     let mut r = raw(Mode::Frontend);
@@ -343,7 +347,7 @@ fn a_database_url_names_its_role() {
 /// step prints a name (they ride in the environment and on the script's `\set` lines); the
 /// role has no password and no privilege, and the database is the role's.
 ///
-/// Mutants seen red: the two steps swapped (the database needs its owner); `LOGIN` dropped;
+/// Catches: the two steps swapped (the database needs its owner); `LOGIN` dropped;
 /// `NOSUPERUSER` dropped; the step run as the invoking user.
 #[test]
 fn a_fresh_server_gets_a_plain_login_role_then_its_database() {
@@ -397,7 +401,7 @@ fn a_fresh_server_gets_a_plain_login_role_then_its_database() {
 /// database there and the database the role's, setup creates nothing and goes on to the
 /// schema; with only the role there, it makes only the database.
 ///
-/// Mutants seen red: the role always created; the database always created.
+/// Catches: the role always created; the database always created.
 #[test]
 fn a_rerun_creates_only_what_is_missing() {
     let world = Shared::default();
@@ -419,7 +423,7 @@ fn a_rerun_creates_only_what_is_missing() {
 /// superuser, is refused (setup alters no role); a database another role owns is refused
 /// (setup changes no owner); in each case nothing is created and no refusal names the role.
 ///
-/// Mutants seen red: the superuser test removed; the login test removed; the owner test removed.
+/// Catches: the superuser test removed; the login test removed; the owner test removed.
 #[test]
 fn a_role_or_database_that_is_not_the_roles_own_is_refused_and_altered_not() {
     for (role, why) in [
@@ -470,7 +474,7 @@ fn a_role_or_database_that_is_not_the_roles_own_is_refused_and_altered_not() {
 /// Catches an answer setup does not know being taken for a state: a role or a database row it
 /// cannot read refuses instead of creating on a guess.
 ///
-/// Mutants seen red: the catch-all arm of either parser returning a state; the column-count
+/// Catches: the catch-all arm of either parser returning a state; the column-count
 /// or the column-value check of the role's answer removed.
 #[test]
 fn an_answer_it_cannot_read_is_a_refusal() {
@@ -500,7 +504,7 @@ fn an_answer_it_cannot_read_is_a_refusal() {
 /// as `DRY-RUN:`, creates nothing, asks no schema question (there is nothing to log in to),
 /// and says so.
 ///
-/// Mutants seen red: the dry run applying the steps; the schema asked in a dry run.
+/// Catches: the dry run applying the steps; the schema asked in a dry run.
 #[test]
 fn a_dry_run_names_the_steps_and_creates_nothing() {
     let world = Shared::default();
@@ -553,7 +557,7 @@ const DRY: Options = Options {
 /// database and the socket), one that cannot be started, a host with no `postgres` account
 /// and a Mac are each a refusal with the cause in setup's own words and none of the names.
 ///
-/// Mutants seen red: stderr appended to the refusal; the account check removed.
+/// Catches: stderr appended to the refusal; the account check removed.
 #[test]
 fn a_server_that_cannot_be_asked_is_refused_in_setups_words() {
     let world = Shared::default();
@@ -600,7 +604,7 @@ fn a_server_that_cannot_be_asked_is_refused_in_setups_words() {
 /// exit status it never had: it has no exit code, so the refusal says `none` and still gives
 /// the way out, and names none of the operator's values.
 ///
-/// Mutant seen red: the missing code worded as `0`.
+/// Catches: the missing code worded as `0`.
 #[test]
 fn a_psql_killed_by_a_signal_is_refused_with_no_exit_code() {
     use std::os::unix::process::ExitStatusExt as _;
@@ -644,7 +648,7 @@ fn the_flag_is_for_linux() {
 /// leaving the operator no way forward: the refusal says what failed and that setup can run
 /// again, and names nothing.
 ///
-/// Mutant seen red: the step's error shown instead of setup's.
+/// Catches: the step's error shown instead of setup's.
 #[test]
 fn a_creation_the_server_refuses_is_reported_without_its_words() {
     let world = Shared::default();
@@ -665,7 +669,7 @@ fn a_creation_the_server_refuses_is_reported_without_its_words() {
 /// its SQLSTATE. All are exit 5 and none names a value from the URL; nothing is fetched or
 /// written after one.
 ///
-/// Mutants seen red: the pg_ident line for root dropped; the map name dropped from the
+/// Catches: the pg_ident line for root dropped; the map name dropped from the
 /// hba line; the NoServer and NoDatabase texts swapped.
 #[test]
 fn each_refused_login_has_its_recipe_and_names_nothing() {
@@ -729,7 +733,7 @@ fn each_refused_login_has_its_recipe_and_names_nothing() {
 /// account's login is tried (psql as that account, with the role and database of the URL);
 /// a refusal is the pg_ident recipe, and no schema is made.
 ///
-/// Mutants seen red: the service check removed; run as the invoking user; against the wrong
+/// Catches: the service check removed; run as the invoking user; against the wrong
 /// account.
 #[test]
 fn the_services_own_login_is_tried_and_its_refusal_is_the_recipe() {
@@ -787,7 +791,7 @@ const DANGEROUS: [(&str, &str); 8] = [
 /// role or a database name holding any of these is refused by the flag, in either place and
 /// in either spelling, and no refusal quotes the name.
 ///
-/// Mutant seen red: `'` added to the characters a name may hold.
+/// Catches: `'` added to the characters a name may hold.
 #[test]
 fn a_name_that_could_leave_its_quotes_is_refused_for_the_role_and_the_database() {
     for (what, c) in DANGEROUS {
@@ -825,7 +829,7 @@ fn a_name_that_could_leave_its_quotes_is_refused_for_the_role_and_the_database()
 /// the state needs; setup refuses it as it does a superuser, saying why and quoting no value,
 /// and alters nothing (no create runs, and no ALTER ever).
 ///
-/// Mutants seen red: each of the four columns dropped from the question or the test.
+/// Catches: each of the four columns dropped from the question or the test.
 #[test]
 fn a_role_with_a_privilege_it_does_not_need_is_refused_and_left_alone() {
     let rows = [
@@ -889,7 +893,7 @@ fn a_role_with_a_privilege_it_does_not_need_is_refused_and_left_alone() {
 /// refuses a URL with more than one host or more than one port, with or without
 /// `--create-local-database`.
 ///
-/// Mutant seen red: the count check removed.
+/// Catches: the count check removed.
 #[test]
 fn a_database_url_with_more_than_one_host_or_port_is_refused() {
     for url in [
@@ -959,7 +963,7 @@ fn both_schemes_give_the_same_settings_and_no_ident_map_name_is_read() {
 /// Catches the flag's own platform check being dropped: `provision` itself refuses a Mac, as
 /// a usage error and before it asks anything, whatever the plan did before it.
 ///
-/// Mutant seen red: the platform check removed.
+/// Catches: the platform check removed.
 #[test]
 fn provision_refuses_a_mac_by_itself() {
     let world = Shared::default();
@@ -974,7 +978,7 @@ fn provision_refuses_a_mac_by_itself() {
 /// Catches a port in the URL being dropped on the way to psql: provisioning would go to the
 /// default port while the login check uses the URL's.
 ///
-/// Mutant seen red: the `PGPORT` variable not set.
+/// Catches: the `PGPORT` variable not set.
 #[test]
 fn the_urls_port_reaches_psql() {
     let mut r = flags();
@@ -1003,7 +1007,7 @@ fn the_urls_port_reaches_psql() {
 
 /// Catches an empty role or database name being taken for a name: each is refused by the flag.
 ///
-/// Mutant seen red: the non-empty check removed.
+/// Catches: the non-empty check removed.
 #[test]
 fn an_empty_role_or_database_name_is_refused() {
     for url in [
@@ -1033,9 +1037,11 @@ impl std::io::Write for Closes {
     }
 }
 
-/// Asserts that a closed output is not lost: a line setup cannot print about the database (the
+/// Catches a closed output being lost: a line setup cannot print about the database (the
 /// dry run's "does not exist yet", a step it is about to run, a step it only plans, the rules
 /// the server needs) stops setup with an error instead of going on unseen.
+///
+/// Catches: any `?` dropped from one of those `writeln!` calls.
 #[test]
 fn a_closed_output_stops_setup_at_each_database_line() {
     for (needle, options) in [

@@ -464,7 +464,7 @@ fn shared_port(text: &str) -> Option<(String, String)> {
 /// Catches two listeners of one mode on one port (the retired `ports` rule of
 /// `check-units`, now that the listeners are `kbf.toml`'s): every file `kbf-installer setup`
 /// writes, and the by-hand storage file, gives each listener its own port. The planted file
-/// is the mutant: the checker must see two listeners on one port, and there must be
+/// is the defect: the checker must see two listeners on one port, and there must be
 /// listeners to check.
 #[test]
 fn no_two_listeners_of_a_mode_share_a_port() {

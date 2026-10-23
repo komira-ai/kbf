@@ -223,7 +223,7 @@ fn result_of(text: &str) -> reapi::ActionResult {
     }
 }
 
-/// Catches an evictor that ranks by when objects were written, not last used (mutant:
+/// Catches an evictor that ranks by when objects were written, not last used (defect:
 /// reads do not count, so the order is first in, first out): of three objects written
 /// a, b, c and then a read, b is the least recently used, and a shortfall of one
 /// object's length takes b alone.
@@ -249,7 +249,7 @@ async fn evicts_least_recently_used_first() {
     f.remove();
 }
 
-/// Catches recency bumped only where the store is read (mutant: FindMissing's present
+/// Catches recency bumped only where the store is read (defect: FindMissing's present
 /// answers do not count): a client that asks whether a blob is present and is told yes
 /// relies on it as much as one that reads it. Of a and b, written in that order, a
 /// FindMissing that reports a present makes b the least recently used.
@@ -271,7 +271,7 @@ async fn lru_counts_find_missing_reports() {
     f.remove();
 }
 
-/// Catches an evictor that takes an object used within the grace window (mutant: the
+/// Catches an evictor that takes an object used within the grace window (defect: the
 /// window removed), cutting short a client that was just told its blob is present:
 /// with a 60 s window, two objects written just now stay whatever the shortfall, and
 /// only an object not used since the start (seeded by the start-up pass) goes. What the
@@ -302,7 +302,7 @@ async fn evict_spares_grace_window() {
     f.remove();
 }
 
-/// Catches an evictor that frees more than the shortfall (mutants: everything not in
+/// Catches an evictor that frees more than the shortfall (defect: everything not in
 /// the window evicted; `>` for `>=` in the "covered" check, one object too many) or
 /// works when nothing is short: with four objects of one length and a shortfall of
 /// exactly two lengths, the two least recently used go; once twice the floor is free a
@@ -335,7 +335,7 @@ async fn eviction_stops_at_target() {
     f.remove();
 }
 
-/// Catches files deleted before the index forgets them (mutant: the order swapped),
+/// Catches files deleted before the index forgets them (defect: the order swapped),
 /// so a crash between the two leaves index entries, and action-cache hits, for files
 /// that are gone: the log checks at each `EvictObjects` that the files are still
 /// there, and after the round the action entry that needed the blob is gone with the
@@ -376,7 +376,7 @@ async fn evict_commits_before_delete() {
     f.remove();
 }
 
-/// Catches an evictor that deletes a staged object's file (mutant: the staged check
+/// Catches an evictor that deletes a staged object's file (defect: the staged check
 /// dropped): the index keeps a staged object, so its file must stay too.
 #[tokio::test]
 async fn evict_skips_staged_objects() {

@@ -980,7 +980,8 @@ are versioned by `admin_protocol` in `kbf --version --json` (`docs/artifacts.md`
 - `instance_id`: a UUID, new for each process.
 - `generation`: the generation the state store is at now (`null` if it cannot be read);
   `held_generation`: the one this process took (`null` for a candidate). A takeover passes
-  the holder's `generation` as `expect`.
+  the holder's `generation` as `expect`. A process over a Postgres store, which the
+  frontends share and which holds no generation, answers `null` for both.
 - `superseded`: the store has refused a write of this process because another writer holds
   the generation.
 - `open_streams`: Execute and WaitExecution streams open; `open_sessions`: worker streams
@@ -1000,10 +1001,14 @@ heartbeat is not applied. It writes the requeues the store refused. Idempotent. 
 streams and worker sessions stay open. While quiesced, a worker's heartbeat or result is not
 applied, so a quiesce is meant to last seconds (a takeover's limit is 10): one longer than
 the leases' expiry lets the scheduler expire the leases of work still running and requeue it
-when the process resumes. Nothing bounds it.
+when the process resumes. Nothing bounds it. Refused with `409` when the store holds no
+generation (a Postgres store shared by frontends): nothing could take over, and nothing is
+stopped.
 
 **`POST /v1/admin/resume`** (quiesced or active): undoes a quiesce, for a takeover that did
-not happen. Refused with `409` when the store is no longer at `held_generation` or the
+not happen. A process over a store that holds no generation is never quiesced, so a resume
+of it changes nothing. Refused with `409` when the store is no longer at `held_generation` or
+the
 store has refused a write of this process (another writer holds it: only `stand-down`
 applies). The farm fed the scheduler nothing while it was quiesced, so its memory is the
 store's as of the quiesce; nothing is reloaded.
@@ -1013,7 +1018,8 @@ which must be exactly `N` (a store at another generation is refused with `409` a
 is written), keeps the epoch (daemons that redial keep the runs of their leases), reads all
 state from the store, and starts the scheduler, the reconciler and the worker listener on
 the sockets the candidate already bound. `500` if the generation was taken and the
-frontend could not start; the process then ends.
+frontend could not start; the process then ends. Refused with `409` when the store holds no
+generation (a Postgres store shared by frontends).
 
 **`POST /v1/admin/stand-down`** (active, quiesced or stood-down): the old holder's step
 after a takeover elsewhere. It ends the worker streams with `UNAVAILABLE` ("connect

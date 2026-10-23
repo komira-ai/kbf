@@ -516,7 +516,7 @@ mod tests {
         drop(files);
     }
 
-    /// Catches a start-up pass that runs before the rebuild of the index is done (mutant:
+    /// Catches a start-up pass that runs before the rebuild of the index is done (defect:
     /// the pass not held for the rebuild): it would walk the directory against an index
     /// that does not name the old server's objects yet, keep none of them, and seed the
     /// evictor with none, so the objects the rebuild then adopts would never be evicted.

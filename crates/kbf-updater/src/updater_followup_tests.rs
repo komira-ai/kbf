@@ -191,7 +191,7 @@ fn a_second_store_over_one_directory_is_refused() {
     ));
 }
 
-/// Fail fast, not hang, when a mutant reinstalls without end: panic on the `max`+1st install.
+/// Fail fast, not hang, when a defect reinstalls without end: panic on the `max`+1st install.
 fn at_most_installs(rig: &Rig, max: usize) {
     let seen = Arc::new(AtomicUsize::new(0));
     rig.inst.on_install(move |h| {

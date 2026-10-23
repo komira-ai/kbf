@@ -171,7 +171,7 @@ fn broken(from: &str, to: &str) -> String {
     w.replacen(from, to, 1)
 }
 
-/// Planted defects checked one after the other, every one that goes unnamed reported
+/// Defects checked one after the other, every one that goes unnamed reported
 /// together at the end, so a lint that stops naming one shows which rules it broke
 /// rather than the first.
 #[derive(Default)]
@@ -217,7 +217,7 @@ impl Cases {
 fn workflows_meeting_every_rule_pass() {
     // Catches: a rule misreading a correct workflow (ids, expressions in `env:`, the
     // quoted copy command, two groups, a glob in the upload), so every real change is
-    // refused, and every planted defect below would go red for the wrong reason.
+    // refused, and every defect below would go red for the wrong reason.
     assert_eq!(
         found(&good_artifacts(), GOOD_RELEASE, &LISTED),
         Vec::<String>::new()

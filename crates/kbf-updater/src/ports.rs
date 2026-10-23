@@ -156,6 +156,13 @@ pub trait Installer: Send + Sync {
     fn query(&self, host: &Host) -> Result<Installed, PortError> {
         self.report(host).map(|r| r.installed)
     }
+    /// Restart the frontend unit `name` on a Linux host and return when it is active: `-` is
+    /// the plain frontend unit, anything else an instance name. A package install restarts
+    /// no `kbf` unit, so this is asked for after one. An installer that cannot do it says so,
+    /// and `Err` carries one line for a person otherwise.
+    fn restart_frontend(&self, _host: &Host, _name: &str) -> Result<(), PortError> {
+        Err(PortError::other("unsupported: restart_frontend"))
+    }
 }
 
 /// A shared installer is an installer: the health check asks the host what it runs through
@@ -167,6 +174,10 @@ impl<T: Installer + ?Sized> Installer for std::sync::Arc<T> {
 
     fn report(&self, host: &Host) -> Result<Report, PortError> {
         (**self).report(host)
+    }
+
+    fn restart_frontend(&self, host: &Host, name: &str) -> Result<(), PortError> {
+        (**self).restart_frontend(host, name)
     }
 }
 
@@ -299,6 +310,49 @@ mod tests {
         assert_eq!(report.installed, Installed::Version("2.0".into()));
         assert_eq!(report.node_id.as_deref(), Some("a-node"));
         assert_eq!(shared.query(&host), Ok(Installed::Version("2.0".into())));
+    }
+
+    /// An installer that does only the restart, and answers success to it.
+    struct Restarts;
+
+    impl Installer for Restarts {
+        fn install(&self, _host: &Host, _version: &Version) -> Result<InstallAnswer, PortError> {
+            Err(PortError::other("install"))
+        }
+
+        fn report(&self, _host: &Host) -> Result<Report, PortError> {
+            Err(PortError::other("report"))
+        }
+
+        fn restart_frontend(&self, _host: &Host, _name: &str) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
+    /// Asserts that an installer that does not implement `restart_frontend` answers that it is
+    /// unsupported, and that a shared installer passes the call on to the one it holds, whether
+    /// that one answers the default or its own answer.
+    #[test]
+    fn restarting_a_frontend_is_unsupported_unless_the_installer_does_it() {
+        let log = crate::fakes::Log::default();
+        let inner = crate::fakes::FakeInstaller::new(&log);
+        let shared: std::sync::Arc<dyn Installer> = std::sync::Arc::new(inner);
+        let host = Host {
+            alias: "a".to_owned(),
+            address: "h.example".to_owned(),
+            role: crate::inventory::Role::Daemon,
+            host_key: "ssh-ed25519 AAAA".to_owned(),
+            node_id: None,
+        };
+        assert_eq!(
+            shared.restart_frontend(&host, "-"),
+            Err(PortError::other("unsupported: restart_frontend"))
+        );
+        let own: std::sync::Arc<dyn Installer> = std::sync::Arc::new(Restarts);
+        assert_eq!(own.restart_frontend(&host, "-"), Ok(()));
+        let v = Version::parse("2.0").expect("v");
+        assert_eq!(own.install(&host, &v), Err(PortError::other("install")));
+        assert_eq!(own.report(&host), Err(PortError::other("report")));
     }
 
     /// Catches a kind that is lost or shown wrongly: the tuple-style call is `Other`, the

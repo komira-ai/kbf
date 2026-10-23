@@ -26,8 +26,9 @@ thiserror.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
-# A scratch directory per test, removed on drop.
-kbf-testkit.workspace = true
+# A scratch directory per test, removed on drop, and (`postgres`) the guard of the shared
+# catalogs that the tests' databases are made and dropped through (kbf_testkit::database).
+kbf-testkit = { workspace = true, features = ["postgres"] }
 
 [lints]
 workspace = true

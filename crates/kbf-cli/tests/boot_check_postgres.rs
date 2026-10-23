@@ -20,6 +20,7 @@ use cluster_support::kbf;
 use kbf_state::StoreError;
 use kbf_state::postgres::schema::{self, Migration, SchemaError};
 use kbf_state::postgres::{PostgresConfig, PostgresStore};
+use kbf_testkit::database::ddl;
 use kbf_testkit::dir::TestDir;
 use postgres::{Client, NoTls};
 
@@ -43,14 +44,6 @@ fn url_of(admin: &str, database: &str, role: Option<&str>) -> String {
     format!("{scheme}://{user}@{host}/{database}")
 }
 
-/// Runs one statement on the server's own database.
-fn sql(statement: &str) {
-    Client::connect(&admin_url(), NoTls)
-        .expect("connects to the test server")
-        .batch_execute(statement)
-        .expect("the statement runs");
-}
-
 /// A database on the server no other test uses, with an `installer.toml` that names it; the
 /// database is dropped and the file removed with the guard.
 struct Database {
@@ -65,7 +58,8 @@ impl Database {
     fn new(test: &str, role: Option<&str>) -> Database {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let name = format!("kbf_bc{}_{n}", std::process::id());
-        sql(&format!("CREATE DATABASE {name}"));
+        // A database belongs to the whole server: `ddl` makes it under the shared-catalog guard.
+        ddl(&admin_url(), &format!("CREATE DATABASE {name}")).expect("creates the database");
         let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("boot-check-{test}"));
         let installer_toml = dir.join("installer.toml");
         let url = url_of(&admin_url(), &name, role);
@@ -108,7 +102,7 @@ impl Database {
 impl Drop for Database {
     fn drop(&mut self) {
         let statement = format!("DROP DATABASE IF EXISTS {}", self.name);
-        let _ = Client::connect(&admin_url(), NoTls).and_then(|mut c| c.batch_execute(&statement));
+        let _ = ddl(&admin_url(), &statement);
     }
 }
 
