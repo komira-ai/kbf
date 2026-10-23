@@ -11,12 +11,13 @@
 //! read them.
 //!
 //! One of them (`a_real_release_is_fetched_as_nobody_and_verified`) goes to GitHub: it lists
-//! the repository's releases with the pinned-style `gh` as `nobody`, fetches the newest
-//! release that has a darwin tarball through the same code the install uses, and runs the real
-//! `gh attestation verify` on it with the production bindings, offline. The workflow leaves a
-//! token for the API in `/private/var/tmp/kbf-real-fetch-token`; the test gets the Sigstore
-//! trusted root from `gh` and, for the case that no release has been published yet, the
-//! newest attested build of `main`.
+//! the repository's releases with the system `/usr/bin/curl` as `nobody` and no token (the
+//! install's own listing), fetches the newest release that has a darwin tarball through the
+//! same code the install uses, and runs the real `gh attestation verify` on it with the
+//! production bindings, offline. The listing and the download use no token. The workflow
+//! leaves one in `/private/var/tmp/kbf-real-fetch-token` for the test's own `gh` calls as
+//! root (the Sigstore trusted root, and, for the case that no release has been published yet,
+//! the newest attested build of `main`).
 //!
 //! Each test captures first and asserts after, so a parser that does not read the real
 //! output still leaves the output to look at.
@@ -535,8 +536,8 @@ fn print_of_the_systems_own_services_is_read_at_the_top_level() {
 
 // ---- the fetch from GitHub, and the real attestation check ----
 
-/// Where the workflow left a token for the GitHub API (the sudo that runs these tests clears
-/// the environment).
+/// Where the workflow left a token for the test's own `gh` calls as root (the sudo that runs
+/// these tests clears the environment). The install's listing and download do not get it.
 const TOKEN_FILE: &str = "/private/var/tmp/kbf-real-fetch-token";
 
 /// `gh` as root, with the workflow's token and a home of its own.
@@ -610,7 +611,8 @@ fn darwin_commits(page: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// The code the install uses lists the repository's releases as `nobody` and fetches the
+/// The code the install uses lists the repository's releases with the system `curl`, as
+/// `nobody` and with no token, and fetches the
 /// newest one that has a darwin tarball, picked by the first 12 digits of its commit; the
 /// real `gh attestation verify` accepts the fetched tarball with the production bindings,
 /// offline and as `nobody`, and refuses it for another commit, another signer workflow, and
@@ -653,10 +655,11 @@ fn a_real_release_is_fetched_as_nobody_and_verified() {
 
     let fetcher = Fetcher {
         runner: &SystemRunner,
+        curl: Path::new("/usr/bin/curl"),
         gh: &gh,
         who: ids,
         home: &home,
-        token: Some(token),
+        token: None,
         limits: Limits {
             tool: LIMIT,
             download: Duration::from_secs(600),
@@ -673,7 +676,7 @@ fn a_real_release_is_fetched_as_nobody_and_verified() {
         if page == 1 {
             capture("releases_page1", &exec);
         }
-        assert!(exec.success(), "gh api: {}", exec.stderr_text());
+        assert!(exec.success(), "curl: {}", exec.stderr_text());
         let listing: serde_json::Value = serde_json::from_slice(&exec.stdout).unwrap();
         newest = darwin_commits(&listing).into_iter().next();
         let count = listing.as_array().map_or(0, Vec::len);
@@ -683,6 +686,7 @@ fn a_real_release_is_fetched_as_nobody_and_verified() {
             .flatten()
             .filter(|release| release["draft"] != true)
             .count();
+        println!("real listing, page {page}: {count} releases, no token");
         if newest.is_some() || count < 100 {
             break;
         }

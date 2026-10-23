@@ -235,7 +235,7 @@ Everything below is done once, as an administrator with `sudo`; this program doe
 
    [channels.online]                   # a channel on GitHub instead of a directory
    source = "github"
-   token_file = "/usr/local/etc/kbf/host-install/github.token"   # optional; see below
+   token_file = "/usr/local/etc/kbf/host-install/github.token"   # optional: a higher rate limit; see below
    ```
 
    A channel takes its releases from a `dir` or from `source = "github"`, never both (the
@@ -402,13 +402,16 @@ release: the install fetches the release itself, as `nobody`, from the GitHub re
 everything after it). The build attestation is still the only trust anchor; the listing and the
 download only bring the bytes. A directory channel stays for a Mac that cannot reach GitHub.
 
-What the install does, in this order, with the pinned `gh`, run as `nobody` (the same privilege
-drop as the attestation check) in a directory that `nobody` owns inside the stage, with its
-own `HOME`:
+What the install does, in this order, with the system `curl` (listing) and the pinned `gh`
+(download), both run as `nobody` (the same privilege drop as the attestation check) in a
+directory that `nobody` owns inside the stage, with its own `HOME`:
 
-1. lists the repository's releases with `gh api`, 100 a page, newest first, page after page until
-   a page is empty, and at most 30 pages (an empty page ends it; a short one does not); never only the latest, so a rollback to an old release
-   works;
+1. lists the repository's releases with `/usr/bin/curl` from the public REST endpoint
+   `https://api.github.com/repos/komira-ai/kbf/releases?per_page=100&page=N`, with no token. The
+   flags are fixed: no configuration file (`-q` first), HTTPS only, no redirect, an HTTP error
+   fails the command, a time limit, a size limit, and an empty environment. It is 100 a page, newest first, page
+   after page until a page is empty, and at most 30 pages (an empty page ends it; a short one
+   does not); never only the latest, so a rollback to an old release works;
 2. finds the asset named `kbf-<40 hex>-darwin-arm64.tar.gz` whose commit starts with the 12 hex
    digits of the version, across all the pages read. None is `unknown_release`; assets of two
    different commits are `ambiguous_release`; the same commit in two releases is one release (the
@@ -434,22 +437,33 @@ launchd, and no stage left behind.
 - Outbound HTTPS to GitHub: `api.github.com` and `github.com`, and the host GitHub serves
   release assets from. The child's environment is cleared, so no proxy variable reaches `gh`;
   a Mac that can reach GitHub only through a proxy cannot use this source.
-- A token for the API. `gh api` refuses to run without one (`gh release download` does not), so
-  a channel names a `token_file`: a file that is root's alone to write (checked like the allowlist)
-  holding a GitHub token, one line of letters, digits, `_` and `-`. It needs no scope: the repository is
-  public and the token only has to exist. The root process reads it and gives it to `gh` as `GH_TOKEN`
-  for the listing and the download, and never to the attestation check. Without one the listing
-  fails and the install is `fetch_failed`.
+- No token. The listing and the download of a public repository need none, and by default
+  no secret is on the Mac.
+- Optionally, a token for a higher rate limit. A channel may name a `token_file`: a file that is
+  root's alone to write (checked like the allowlist) holding a GitHub token, one line of letters,
+  digits, `_` and `-`. It needs no scope: the repository is public. The root process reads it and
+  sends it to `curl` as an `Authorization` header in a configuration on `curl`'s standard input
+  (never in its arguments, which every user can read), and gives it to `gh release download` as
+  `GH_TOKEN`; the attestation check never gets it.
+- The system `curl` that macOS ships, `/usr/bin/curl`, which must be root's and not writable by
+  others (checked like the pinned `gh`, and only for a GitHub channel: a directory channel never
+  runs it).
 
 #### The residuals
 
-- The token is a credential on the Mac. It can read public data only, but it is an account's token,
-  and `nobody`'s `gh` process holds it in its environment while it runs.
+- A token, when a channel names one, is a credential on the Mac. It can read public data only,
+  but it is an account's token; `nobody`'s `curl` process holds it in memory and `gh release
+  download` in its environment while they run. Without a `token_file` there is none.
 - The listing is read through GitHub's API and is not itself trusted: it can only choose among
   releases (an old attested release is installable, as with a directory) or withhold one (the
   install fails). What it picks must still pass the attestation for the full commit.
-- A request costs one API call per 100 releases plus the download's, against GitHub's rate limit
-  for the token (or the address, without one). A listing of about 3000 releases or more does not
+- Without a token GitHub's API allows 60 requests an hour per IP address, shared by every
+  machine behind the same address. One install costs one request per 100 releases listed (a
+  repository with fewer than 100 releases: one request for the releases and one for the empty
+  page that ends the listing, so two), and the download is not counted against the API limit.
+  Past the limit GitHub answers 403, and the install is `fetch_failed` with nothing staged:
+  retry later (the limit resets within the hour), or name a `token_file`, which raises it to
+  the token's own. A listing of about 3000 releases or more does not
   show its oldest releases, so whoever can publish many releases can make a rollback to an old
   one fail (`fetch_failed`); it cannot make a wrong release install.
 - The size limit is watched about every 10 ms, so a fast download can write a little past it
