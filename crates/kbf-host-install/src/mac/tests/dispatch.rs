@@ -274,6 +274,7 @@ fn the_production_paths() {
         host.trusted_root.to_str(),
         Some("/usr/local/kbf-installer/trust/trusted_root.jsonl")
     );
+    assert_eq!(host.curl.to_str(), Some("/usr/bin/curl"));
     assert_eq!(
         host.release("x").to_str(),
         Some("/usr/local/kbf/releases/x")

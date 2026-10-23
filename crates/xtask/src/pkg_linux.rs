@@ -14,10 +14,9 @@
 //! - [`config`] renders a list as the nfpm configuration, with the dependencies as
 //!   constants here (never Podman, never Envoy), no maintainer script, every file
 //!   `root:root`, and no time (nfpm takes it from `SOURCE_DATE_EPOCH`). The `kbf` package
-//!   depends on the `kbf-installer` package of the same version or a later one, because
-//!   each mode unit runs the installer's `boot-check` before it starts `kbf`, and its deb
-//!   replaces `kbf-installer` ([`KBF_DEB_REPLACES`]), because the mode units were files of
-//!   the installer's deb;
+//!   depends on no package: each mode unit runs `kbf boot-check`, which is the `kbf` file the
+//!   package carries. Its deb replaces `kbf-installer` ([`KBF_DEB_REPLACES`]), because the
+//!   mode units were files of the installer's deb;
 //! - [`listing`] renders the same list as the file the install test checks the
 //!   installed package against ([`parse_listing`]);
 //! - [`build`] runs nfpm for the deb and the rpm, then again, and refuses a package
@@ -53,9 +52,9 @@ pub const KBF_DIR: &str = "kbf";
 /// What the deb of the `kbf` package `Replaces`: the `kbf-installer` package, of any version,
 /// because the units of the modes were files of its deb and dpkg refuses to unpack `kbf` over
 /// files another package owns unless `kbf` says it replaces that package. The rpm names
-/// nothing: its only form, `Obsoletes`, would remove the installer, which `kbf` needs. The
-/// rpm's `Requires` of the installer of the same version or later makes the transaction that
-/// installs `kbf` upgrade an older installer, which no longer owns the files.
+/// nothing: its only form, `Obsoletes`, would remove the installer, which a host still
+/// runs. An rpm host that has the installer of before the split must upgrade it in the same
+/// transaction as `kbf`, because that installer's rpm owns the files of the mode units.
 pub const KBF_DEB_REPLACES: [&str; 1] = [NAME];
 /// Where the unit files go.
 pub const UNIT_DIR: &str = "/usr/lib/systemd/system";
@@ -110,17 +109,6 @@ pub const RPM_SUGGESTS: [&str; 1] = ["postgresql-server"];
 /// The `Requires` of the rpm: Fedora's `uidmap` is `shadow-utils`.
 pub const RPM_DEPENDS: [&str; 4] = ["crun", "shadow-utils", "systemd", "ca-certificates"];
 
-/// What the deb of the `kbf` package depends on: the `kbf-installer` package of `version` or a
-/// later one (each mode unit runs the installer's `boot-check`).
-pub fn kbf_depends_deb(version: &str) -> String {
-    format!("{NAME} (>= {version})")
-}
-
-/// What the rpm of the `kbf` package requires: as [`kbf_depends_deb`], in rpm's spelling.
-pub fn kbf_depends_rpm(version: &str) -> String {
-    format!("{NAME} >= {version}")
-}
-
 /// One of the two packages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Package {
@@ -155,8 +143,9 @@ impl Package {
         }
     }
 
-    /// The `depends`, `suggests` and `overrides` keys of the configuration, as lines.
-    fn relations(self, version: &str) -> String {
+    /// The `depends`, `suggests` and `overrides` keys of the configuration, as lines. The `kbf`
+    /// package has no `depends` or `suggests`, only the deb's `replaces`.
+    fn relations(self) -> String {
         match self {
             Package::Installer => format!(
                 "depends:\n{}suggests:\n{}overrides:\n  rpm:\n    depends:\n{}    suggests:\n{}",
@@ -166,10 +155,8 @@ impl Package {
                 list(&RPM_SUGGESTS, "      "),
             ),
             Package::Kbf => format!(
-                "depends:\n{}overrides:\n  rpm:\n    depends:\n{}  deb:\n    replaces:\n{}",
-                list(&[kbf_depends_deb(version).as_str()], "  "),
-                list(&[kbf_depends_rpm(version).as_str()], "      "),
-                list(&KBF_DEB_REPLACES, "      "),
+                "overrides:\n  deb:\n    replaces:\n{}",
+                list(&KBF_DEB_REPLACES, "      ")
             ),
         }
     }
@@ -459,7 +446,7 @@ pub fn config(package: Package, entries: &[Entry], platform: Platform, version: 
         arch = quoted(arch),
         version = quoted(version),
         description = quoted(package.description()),
-        relations = package.relations(version),
+        relations = package.relations(),
         host = quoted(BUILD_HOST),
     );
     for e in entries {

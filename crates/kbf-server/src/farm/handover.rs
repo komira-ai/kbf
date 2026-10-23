@@ -5,7 +5,8 @@
 //! operator's cordons across the change.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use kbf_front::{Handed, Stage};
@@ -25,6 +26,10 @@ use super::{Farm, NodeAction, State};
 /// gone. Only a report: an untraced operation's callers are not
 /// answered, they keep waiting (see [`Farm::follow`]).
 pub const UNTRACED_LOOKS: u32 = 2;
+
+/// How often a fenced farm that was given to [`Farm::follow_every`] looks in the state
+/// store for the results of the calls it kept open.
+pub const FOLLOW_EVERY: Duration = Duration::from_millis(200);
 
 /// Why a request that raced the handover is refused (UNAVAILABLE: Buck2 asks again, and
 /// the successor answers).
@@ -174,6 +179,29 @@ impl Farm {
         let waiting = self.lock().follow()?;
         self.report_untraced();
         Ok(waiting)
+    }
+
+    /// Runs [`Farm::follow`] every `every`, for as long as the process lives, so the
+    /// callers this fenced farm holds are answered when the state store has their results.
+    /// `started` is the caller's once flag: the first call that finds it clear sets it and
+    /// starts the follower, and no later call with the same flag starts another (calls with
+    /// flags of their own each start one). Returns whether this call started it. Call it
+    /// inside a Tokio runtime.
+    pub fn follow_every(self: &Arc<Self>, started: &AtomicBool, every: Duration) -> bool {
+        if started.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        let farm = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut look = tokio::time::interval(every);
+            loop {
+                look.tick().await;
+                // A store that cannot be read is looked at again at the next look; the farm
+                // reports what it finds no trace of (`kbf_frontend_relay_untraced`).
+                let _ = farm.follow();
+            }
+        });
+        true
     }
 
     /// Sets `kbf_frontend_relay_untraced` to the operations the last looks found no trace

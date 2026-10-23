@@ -313,7 +313,7 @@ pub struct Cli {
     /// action runs as one of `kbf-pool-0` .. `kbf-pool-<N-1>`, one lease per user at a
     /// time, as kbf-mac-provision makes them (`pool_users`). Required of a root daemon,
     /// which runs no action as root; refused for any other.
-    #[arg(long, requires = "pool_first_uid", value_parser = clap::value_parser!(u32).range(1..=64))]
+    #[arg(long, requires = "pool_first_uid", value_parser = clap::value_parser!(u32).range(1..=100))]
     pool_users: Option<u32>,
     /// The uid of `kbf-pool-0`, and the group id of all the pool users (`pool_first_uid`
     /// in kbf-mac-provision's profile); at least 600.
@@ -1556,7 +1556,7 @@ mod tests {
         for one in ["--pool-users=2", "--pool-first-uid=700"] {
             assert!(pooled(&[one]).is_err(), "{one} alone");
         }
-        for count in ["0", "65"] {
+        for count in ["0", "101"] {
             assert!(pooled(&[&format!("--pool-users={count}"), "--pool-first-uid=700"]).is_err());
         }
         let root = pooled(&["--pool-users=1", "--pool-first-uid=0"]).expect("flags");

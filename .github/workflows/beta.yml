@@ -713,8 +713,8 @@ jobs:
   # writes, with the test-only kbf-installer-stub standing for both binaries and the real
   # units; `cargo xtask pkg-install-test` installs the kbf-installer deb into a fresh Ubuntu
   # container and its rpm into a fresh Fedora one, with systemd as PID 1, and checks them
-  # (crates/xtask/src/pkg_install.rs). The kbf package is built here and not installed: it
-  # depends on the kbf-installer package.
+  # (crates/xtask/src/pkg_install.rs). The kbf package is built here and not installed: the
+  # install test takes one package.
   packages:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

@@ -24,6 +24,13 @@ pub fn is_registered(name: &str) -> bool {
     matches!(name, STORAGE | DAEMON | STORAGE_AND_DAEMON)
 }
 
+/// Whether `name` is a mode that keeps its state in the Postgres database: the frontend and
+/// all-in-one. The others keep none, so `kbf boot-check` has nothing to migrate for them.
+#[must_use]
+pub fn keeps_state_in_database(name: &str) -> bool {
+    matches!(name, FRONTEND | ALL_IN_ONE)
+}
+
 /// What a mode runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Entry {

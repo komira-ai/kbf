@@ -623,6 +623,7 @@ impl Cell {
             unservable_wait: wait,
             default_platform,
             memory_ladder: ladder,
+            vm_host_floor: kbf_server::HostFloor::default(),
             learned_sizes: learned,
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),

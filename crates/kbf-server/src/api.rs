@@ -40,6 +40,9 @@
 //!   sent GOAWAY, open streams run until their action is done, and the server exits
 //!   when they have. It is not undone: a drained frontend is restarted.
 //!
+//! - `GET /v1/frontend/retire` reads the retire mode of a frontend over a state store, and
+//!   `POST /v1/frontend/retire` begins it ([`crate::retire`]); any other server answers `409`.
+//!
 //! - `POST /v1/epoch/bump`: raises the epoch the state store holds by one ([`Farm::bump_epoch`])
 //!   and answers `{"previous", "epoch", "serving"}`. A frontend reads the stored epoch when
 //!   it starts and keeps it, so daemons drop the leases of the older epoch when they reach a
@@ -65,7 +68,7 @@
 //! (the peer address and what the proxy layer decided), never the `x-kbf-*` headers, which
 //! the layer removes.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::Router;
@@ -86,10 +89,12 @@ use crate::farm::{EpochBump, Farm, NodeAction, StateError};
 use crate::fleet::ProtocolSummary;
 use crate::members::{Members, MembershipError};
 use crate::proxy_auth::{Caller, Trust};
+use crate::retire::Retire;
 use crate::token::ApiToken;
 use crate::update::Rows;
 
 mod node_detail;
+mod retire;
 mod safe_to_stop;
 
 pub use safe_to_stop::{Verdict, safe_to_stop_path};
@@ -103,6 +108,9 @@ pub const DRAIN_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 /// The path of the frontend's drain: `GET` reads it, `POST` begins it.
 pub const FRONTEND_DRAIN: &str = "/v1/frontend/drain";
+
+/// The path of the frontend's retire: `GET` reads it, `POST` begins it.
+pub const FRONTEND_RETIRE: &str = "/v1/frontend/retire";
 
 /// The path of `POST /v1/epoch/bump`.
 pub const EPOCH_BUMP: &str = "/v1/epoch/bump";
@@ -145,6 +153,9 @@ struct ApiState {
     farm: Arc<Farm>,
     token: Option<ApiToken>,
     drain: Arc<Drain>,
+    /// What `POST /v1/frontend/retire` begins: set once by a frontend over a state store,
+    /// empty (the routes answer 409) on any other server.
+    retire: Arc<OnceLock<Retire>>,
     members: Option<Arc<Members>>,
     /// The update rows `safe_to_stop` reads (`None`: no state store).
     update: Option<Rows>,
@@ -163,6 +174,7 @@ pub fn router(
     farm: Arc<Farm>,
     token: Option<ApiToken>,
     drain: Arc<Drain>,
+    retire: Arc<OnceLock<Retire>>,
     members: Option<Arc<Members>>,
     update: Option<Rows>,
     enroll: Option<Arc<EnrollApi>>,
@@ -177,11 +189,13 @@ pub fn router(
         .route("/v1/members/{id}/safe-to-stop", get(safe_to_stop::check))
         .route(DENIED, post(deny_entry).delete(allow_entry))
         .route(FRONTEND_DRAIN, get(drain_status).post(begin_drain))
+        .route(FRONTEND_RETIRE, get(retire::status).post(retire::begin))
         .route(EPOCH_BUMP, post(bump_epoch))
         .with_state(Arc::new(ApiState {
             farm,
             token,
             drain,
+            retire,
             members,
             update,
         }))
@@ -202,7 +216,7 @@ async fn drain_status(State(api): State<Arc<ApiState>>) -> Response {
     json(StatusCode::OK, &status(&api))
 }
 
-/// The body a frontend drain may carry: none, or `{}`.
+/// The body a frontend drain or retire may carry: none, or `{}`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NoBody {}

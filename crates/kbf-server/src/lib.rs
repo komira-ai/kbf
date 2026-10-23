@@ -122,6 +122,7 @@ pub mod read_limit;
 mod rebuild;
 pub mod release;
 pub mod replication;
+pub mod retire;
 pub mod retired;
 pub mod rollout;
 mod run_record;
@@ -139,6 +140,7 @@ pub mod storage_half;
 pub mod storage_health;
 pub mod storage_node;
 pub mod store_config;
+pub mod stored_update;
 pub mod stores;
 pub mod streams;
 #[cfg(test)]
@@ -182,6 +184,7 @@ pub use start_exit::{
 pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
 pub use streams::{StreamArgs, StreamLimits};
 pub use ui_mount::bind_server_with_options;
+pub use worker::HostFloor;
 pub use worker::WorkerService;
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build

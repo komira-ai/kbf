@@ -33,29 +33,30 @@
 //!
 //! # A daemon host
 //!
-//! The daemon reports no build commit (`Hello` carries only `daemon_version`), so **the
-//! version is not verified for a daemon**. It is **healthy** when `GET /v1/nodes/{id}` says
-//! it is `connected` and its placement is `serving`, and, when this process made the install
-//! call, its newest `NodeStatus` arrived after that call. So `Healthy` for a daemon says only
-//! "connected, serving, and spoke after the first install call for this version": any status
-//! (a reconnect, a resend by the old process) counts. After an updater restart the install
-//! time is unknown and `connected` plus `serving` alone is `Healthy`, with no freshness at
-//! all. A daemon sends `NodeStatus` on
-//! every stream (`docs/design/worker-protocol.md`), so a status newer than the install is a
-//! daemon that restarted and reconnected; a daemon still running its old process shows an
-//! older one. The status time is the server's clock and the install time the updater's; the
-//! two run on the frontend host.
+//! The daemon reports no build commit to the frontend (`Hello` carries only
+//! `daemon_version`), so the commit comes from the host itself: the `running_commit` of its
+//! `kbf-host-install query`, asked over ssh through the installer the roll installs with.
+//! A daemon host is **healthy** when `GET /v1/nodes/{id}` (the node id the inventory lists
+//! for it, else the alias) says it is `connected` and its placement is `serving`, and the
+//! host's `running_commit` is the target's by the rule storage uses ([`names`]).
+//!
+//! A node the roll holds drained is judged by [`NodeHealth::check_held`]: the same, without
+//! `serving`, which it cannot be until the roll undrains it. The roll then undrains it and
+//! asks [`NodeHealth::check`], so `serving` is shown too before the host is done.
 //!
 //! The roll waits while the node has not registered with this frontend since it started
-//! (404), is not connected, is not serving, or has sent no status after the install.
+//! (404), is not connected, is not serving (unless held), or the host has not reported a
+//! commit or reports another. It fails at once for a version that names no commit.
+
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use crate::health::{InstallTimes, WallClock, commit_of, names};
+use crate::health::{commit_of, names};
 use crate::inventory::{Host, Role};
 use crate::operator::{CHECK, OperatorApi, WHAT};
-use crate::ports::{Health, HealthCheck, PortError};
+use crate::ports::{Health, HealthCheck, Installer, PortError};
 use crate::version::Version;
 
 /// What the check says of a frontend host.
@@ -90,7 +91,6 @@ struct Member {
 struct DaemonNode {
     connected: bool,
     placement: Placement,
-    software: Option<Software>,
 }
 
 #[derive(Deserialize)]
@@ -98,25 +98,18 @@ struct Placement {
     state: String,
 }
 
-#[derive(Deserialize)]
-struct Software {
-    received_at_unix_ms: u64,
-}
-
 /// Health of storage and daemon hosts, over the frontend's operator API.
 pub struct NodeHealth {
     api: OperatorApi,
-    installs: InstallTimes,
+    /// Asked what commit a daemon host runs.
+    installer: Arc<dyn Installer>,
 }
 
 impl NodeHealth {
-    /// A health check over a client that was made (and its files checked) already, with the
-    /// wall clock the install times are read from.
-    pub fn with_api(api: OperatorApi, now: WallClock) -> NodeHealth {
-        NodeHealth {
-            api,
-            installs: InstallTimes::new(now),
-        }
+    /// A health check over a client that was made (and its files checked) already, and the
+    /// installer that tells what commit a daemon host runs.
+    pub fn with_api(api: OperatorApi, installer: Arc<dyn Installer>) -> NodeHealth {
+        NodeHealth { api, installer }
     }
 
     /// `GET path` and its JSON: `None` for a 404, an error for any other status than 200.
@@ -192,44 +185,41 @@ impl NodeHealth {
         })
     }
 
-    fn daemon(&self, host: &Host, target: &Version) -> Result<Health, PortError> {
+    /// `held`: the roll holds the node drained, so it is not asked to be serving.
+    fn daemon(&self, host: &Host, target: &Version, held: bool) -> Result<Health, PortError> {
+        let commit = match commit_of(target) {
+            Ok(commit) => commit,
+            Err(health) => return Ok(health),
+        };
         let alias = &host.alias;
         let waiting = |why: &str| Ok(Health::Waiting(format!("{alias} {why}")));
-        let Some(node) = self.read::<DaemonNode>(&format!("/v1/nodes/{alias}"))? else {
+        let node_id = host.node_id.as_deref().unwrap_or(alias);
+        let Some(node) = self.read::<DaemonNode>(&format!("/v1/nodes/{node_id}"))? else {
             return waiting("has not registered with the frontend since it started");
         };
         if !node.connected {
             return waiting("is not connected");
         }
-        if node.placement.state != "serving" {
+        if !held && node.placement.state != "serving" {
             return Ok(Health::Waiting(format!(
                 "{alias} is {}, not serving",
                 node.placement.state
             )));
         }
-        let Some(installed) = self.installs.at(alias, target) else {
-            return Ok(Health::Healthy);
-        };
-        match node.software {
-            Some(software) if software.received_at_unix_ms >= installed => Ok(Health::Healthy),
-            Some(_) => waiting("has sent no status since the install, so it has not restarted"),
-            None => waiting("has sent no status"),
+        match self.installer.report(host)?.running_commit {
+            Some(built) if names(&built, commit) => Ok(Health::Healthy),
+            Some(built) => Ok(Health::Waiting(format!(
+                "{alias} runs build {built}, not the target's"
+            ))),
+            None => waiting("has not reported the commit it runs"),
         }
     }
 }
 
 impl HealthCheck for NodeHealth {
-    fn installing(&self, host: &Host, target: &Version) {
-        self.installs.note(&host.alias, target);
-    }
-
     /// A frontend is refused before it is installed, not after (see [`FRONTEND_REFUSAL`]).
     fn refusal(&self, host: &Host) -> Option<String> {
         (host.role == Role::Frontend).then(|| FRONTEND_REFUSAL.to_owned())
-    }
-
-    fn settled(&self, host: &Host, _target: &Version) {
-        self.installs.forget(&host.alias);
     }
 
     /// A daemon-only host is judged as a daemon, a storage host as a storage node, and a
@@ -237,8 +227,16 @@ impl HealthCheck for NodeHealth {
     fn check(&self, host: &Host, target: &Version) -> Result<Health, PortError> {
         match host.role {
             Role::Frontend => Ok(Health::Abandoned(FRONTEND_REFUSAL.to_owned())),
-            Role::Daemon => self.daemon(host, target),
+            Role::Daemon => self.daemon(host, target, false),
             Role::Storage => self.storage(host, target),
+        }
+    }
+
+    /// As [`HealthCheck::check`], but a daemon is not asked to be serving.
+    fn check_held(&self, host: &Host, target: &Version) -> Result<Health, PortError> {
+        match host.role {
+            Role::Daemon => self.daemon(host, target, true),
+            Role::Frontend | Role::Storage => self.check(host, target),
         }
     }
 }

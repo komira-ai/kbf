@@ -1,7 +1,8 @@
 //! The state database the installer owns: it creates the schema at `setup` and brings it
 //! forward before each new release starts. kbf only checks the version at its own start
 //! (`kbf_state::postgres::schema`), so a database nobody set up is refused there with one
-//! line.
+//! line. (`kbf boot-check`, which the units of the kbf package run first, brings it forward
+//! too, with `kbf_state::postgres::boot`.)
 //!
 //! Where the database is: the `database` key of `installer.toml`, a `postgres://` URL
 //! (`postgres:///kbf?host=/run/postgresql`). The file is world-readable, so a URL that
@@ -185,32 +186,6 @@ impl SchemaStep for Database {
             &self.migrations,
             release_schema,
         ))
-    }
-}
-
-/// A [`Database`] whose step waits at most `lock_wait` for any lock
-/// ([`Database::migrate_within`]), for a caller that must end inside a time it was given (a
-/// unit's start): a busy schema is a refusal, not a wait without end.
-#[derive(Debug)]
-pub struct Bounded {
-    database: Database,
-    lock_wait: Duration,
-}
-
-impl Database {
-    /// This database with every lock wait of its [`SchemaStep`] bounded by `lock_wait`.
-    #[must_use]
-    pub fn bounded(self, lock_wait: Duration) -> Bounded {
-        Bounded {
-            database: self,
-            lock_wait,
-        }
-    }
-}
-
-impl SchemaStep for Bounded {
-    fn before_start(&mut self, schema: u32) -> Result<String, String> {
-        step_line(self.database.migrate_within(schema, self.lock_wait))
     }
 }
 

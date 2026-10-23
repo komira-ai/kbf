@@ -62,6 +62,32 @@ impl FakeMac {
         }
     }
 
+    /// The profile's pool: `Some((users, first_uid))` sets `pool_users` and
+    /// `pool_first_uid`, `None` leaves both out (the defaults: 100 users from 61000).
+    /// The users and group already on the Mac stay as they are.
+    pub fn set_pool(&mut self, pool: Option<(u32, u32)>) {
+        let mut text: String = self
+            .profile
+            .lines()
+            .filter(|l| !l.starts_with("pool_users=") && !l.starts_with("pool_first_uid="))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        if let Some((users, first)) = pool {
+            text.push_str(&format!("pool_users={users}\npool_first_uid={first}\n"));
+        }
+        self.set_profile(text);
+    }
+
+    /// Takes the pool's group and users `kbf-pool-0..n` out of the directory, as on a
+    /// Mac that has none (their homes stay).
+    pub fn remove_pool(&mut self, n: u32) {
+        let s = self.state_mut();
+        s.records.remove("/Groups/kbfpool");
+        for i in 0..n {
+            s.remove_user(&format!("kbf-pool-{i}"));
+        }
+    }
+
     /// Replaces the test profile of a converged Mac with `text`, and its property list
     /// with the golden one for `text` (without `UserName` when it sets
     /// `daemon_user=root`), and its `kbf.toml` with the golden one.

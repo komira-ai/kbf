@@ -9,6 +9,7 @@ use kbf_host_install::contract::{
 
 use super::answer::{install_answer, query_answer};
 use super::*;
+use crate::ports::Installed;
 
 /// Every refusal. The `match` is the guard: a new variant is a compile error here until the
 /// list below (and so the tests) name it.
@@ -117,6 +118,29 @@ fn every_install_outcome_of_the_host_is_read() {
     }
 }
 
+/// Catches a drift of the two query fields the roll acts on: the node id and the running
+/// commit are read as the host's own types print them, and an absent one is `None` (an old
+/// host that prints neither is still read).
+#[test]
+fn the_node_id_and_the_running_commit_of_the_host_are_read() {
+    let report = |c: Option<&str>, id: Option<&str>| {
+        let (code, out) = printed(&Outcome::Queried(QueryReport {
+            installed_version: Some("1.2.3-1".to_owned()),
+            running_commit: c.map(str::to_owned),
+            node_id: id.map(str::to_owned),
+            in_progress: false,
+        }));
+        query_answer(code, &out).expect("read")
+    };
+    let both = report(Some("0123456789ab"), Some("node-1"));
+    assert_eq!(both.running_commit.as_deref(), Some("0123456789ab"));
+    assert_eq!(both.node_id.as_deref(), Some("node-1"));
+    let neither = report(None, None);
+    assert_eq!((neither.running_commit, neither.node_id), (None, None));
+    let old = br#"{"result":"query","installed_version":"1","in_progress":false}"#;
+    assert_eq!(query_answer(0, old).expect("old host").node_id, None);
+}
+
 /// Catches a drift of the query report: the field names and types, `null` for nothing
 /// installed (the answer `NotInstalled`, not an error), and in-progress taking precedence.
 #[test]
@@ -131,7 +155,7 @@ fn every_query_outcome_of_the_host_is_read() {
     };
     let read = |o: &Outcome| {
         let (code, out) = printed(o);
-        query_answer(code, &out)
+        query_answer(code, &out).map(|r| r.installed)
     };
     assert_eq!(
         read(&report(Some("1.2.3-1"), Some("abc"), false)),

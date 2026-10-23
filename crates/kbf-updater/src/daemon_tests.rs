@@ -230,6 +230,35 @@ fn the_ssh_timeouts_are_optional_flags_in_seconds() {
     }
 }
 
+/// Catches a drain deadline that is not a flag, that defaults to something else than 600 s,
+/// that takes a non-number, or that may be zero (a drain that waits for nothing is no
+/// drain): the flag sets only the deadline.
+#[test]
+fn the_drain_deadline_is_an_optional_flag_of_at_least_a_second() {
+    assert_eq!(parse(&FLAGS).expect("flags").drain_deadline.as_secs(), 600);
+    let with = [&FLAGS[..], &["--drain-deadline-secs", "90"]].concat();
+    let cfg = parse(&with).expect("deadline");
+    assert_eq!(
+        (
+            cfg.drain_deadline.as_secs(),
+            cfg.ssh_command_timeout.as_secs()
+        ),
+        (90, 900)
+    );
+    for bad in ["soon", "-1", "1.5", ""] {
+        let with = [&FLAGS[..], &["--drain-deadline-secs", bad]].concat();
+        assert_eq!(
+            parse(&with).expect_err(bad),
+            "--drain-deadline-secs must be a number of seconds"
+        );
+    }
+    let zero = [&FLAGS[..], &["--drain-deadline-secs", "0"]].concat();
+    assert_eq!(
+        parse(&zero).expect_err("zero"),
+        "--drain-deadline-secs must be at least 1"
+    );
+}
+
 /// Catches the settings of the installer reaching it unchecked: a key path that is no file, a
 /// user or channel the host would not take and a zero timeout each stop the ports from being
 /// built, with the reason, and the key's contents are in no message.
@@ -332,6 +361,7 @@ fn config(name: &str, inventory: &str, api: &FakeApi) -> Config {
         channel: "stable".to_owned(),
         ssh_connect_timeout: Duration::from_secs(5),
         ssh_command_timeout: Duration::from_secs(30),
+        drain_deadline: Duration::from_secs(600),
     }
 }
 
@@ -377,6 +407,7 @@ fn quick() -> Timing {
         healthy_frontend: Duration::from_millis(300),
         healthy_storage: Duration::from_millis(300),
         healthy_daemon: Duration::from_millis(300),
+        drain_deadline: Duration::from_millis(300),
     }
 }
 
@@ -609,6 +640,7 @@ fn the_driver_loop_audits_what_it_cannot_drive_and_goes_on() {
     let ports = Ports {
         safe: Box::new(FakeSafeToStop::new(&log)),
         installer: Box::new(FakeInstaller::new(&log)),
+        drain: Box::new(crate::fakes::FakeDrain::new(&log)),
         health: Box::new(FakeHealth::new(&log)),
         clock: Box::new(FakeClock::new()),
     };

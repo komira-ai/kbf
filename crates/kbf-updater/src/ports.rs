@@ -1,6 +1,6 @@
 //! The ports of the roll: everything the state machine asks of the outside world. The real
-//! adapters are [`crate::safe_http`] (safe-to-stop), [`crate::ssh_installer`] (install) and
-//! [`crate::node_health`] (health). [`crate::fakes`] has one scripted fake per port.
+//! adapters are [`crate::safe_http`] (safe-to-stop), [`crate::ssh_installer`] (install),
+//! [`crate::node_drain`] (drain) and [`crate::node_health`] (health). [`crate::fakes`] has one scripted fake per port.
 //!
 //! The traits are synchronous: a roll is one host at a time and waits on each answer, so
 //! there is nothing to overlap, and a caller runs [`crate::Updater::drive`] on its own thread.
@@ -108,13 +108,52 @@ pub enum Installed {
     NotInstalled,
 }
 
+/// What the host's `query` reported: the installed package, and who the host says it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Report {
+    pub installed: Installed,
+    /// The commit of the kbf build on the host (`running_commit` of the query), if it says.
+    pub running_commit: Option<String>,
+    /// The node id from the host's kbf configuration (`node_id` of the query), if it has one.
+    pub node_id: Option<String>,
+}
+
 /// The host-side install (the forced-command wrapper over ssh, later).
 pub trait Installer: Send + Sync {
     /// Install `version` and return when the package manager is done. `Err` carries one line
-    /// for a person: the wrapper's refusal or the failed install.
+    /// for a person: the wrapper's refusal or the failed install. An older version than the
+    /// installed one is installed too: a rollback is an install.
     fn install(&self, host: &Host, version: &Version) -> Result<(), PortError>;
+    /// What the host reports, without changing anything.
+    fn report(&self, host: &Host) -> Result<Report, PortError>;
     /// What is installed, without changing anything.
-    fn query(&self, host: &Host) -> Result<Installed, PortError>;
+    fn query(&self, host: &Host) -> Result<Installed, PortError> {
+        self.report(host).map(|r| r.installed)
+    }
+}
+
+/// A shared installer is an installer: the health check asks the host what it runs through
+/// the same one the roll installs with.
+impl<T: Installer + ?Sized> Installer for std::sync::Arc<T> {
+    fn install(&self, host: &Host, version: &Version) -> Result<(), PortError> {
+        (**self).install(host, version)
+    }
+
+    fn report(&self, host: &Host) -> Result<Report, PortError> {
+        (**self).report(host)
+    }
+}
+
+/// Taking a daemon host's node out of placement at the frontend, and giving it back.
+pub trait Drain: Send + Sync {
+    /// Cordon the node of `host` and ask the frontend to wait for its leases for `deadline`.
+    fn drain(&self, host: &Host, deadline: Duration) -> Result<(), PortError>;
+    /// How many leases the node of `host` holds now.
+    fn leases(&self, host: &Host) -> Result<usize, PortError>;
+    /// Return the node of `host` to placement. This is unconditional: a node an operator
+    /// cordoned before the roll is uncordoned after it, so cordon it again if it must stay out.
+    /// A storage host is never drained, even one that also runs a daemon, and needs no node id.
+    fn undrain(&self, host: &Host) -> Result<(), PortError>;
 }
 
 /// Whether a host runs the target yet.
@@ -132,20 +171,15 @@ pub enum Health {
 
 /// The health of a host, by its role (frontend or node).
 pub trait HealthCheck: Send + Sync {
-    /// The roll is about to call the installer to put `target` on `host` (each attempt). An
-    /// adapter that must tell what happened after the install from what was there before
-    /// notes the time of the first attempt for the pair.
-    fn installing(&self, host: &Host, target: &Version);
-
     /// Why `host` must not be installed on at all, if the adapter could not judge it after:
     /// asked before the installer is called for the host, and a reason fails the roll there.
     fn refusal(&self, host: &Host) -> Option<String>;
 
-    /// `host` reached `Done` on `target`: whatever the adapter noted for the install is over,
-    /// so that a later roll (to the same version again, after another) starts its own bar.
-    fn settled(&self, host: &Host, target: &Version);
-
     fn check(&self, host: &Host, target: &Version) -> Result<Health, PortError>;
+
+    /// [`HealthCheck::check`] for a host whose node the roll holds drained: the node is
+    /// not asked to be serving, which it cannot be until the roll gives it back.
+    fn check_held(&self, host: &Host, target: &Version) -> Result<Health, PortError>;
 }
 
 /// Time. A roll waits only through this port, so a test runs hours of timeouts in no time.
@@ -215,6 +249,30 @@ mod tests {
             }
         );
         assert_eq!(PortError("down".into()).to_string(), "down");
+    }
+
+    /// Catches a shared installer that does not reach the one it holds: install and report
+    /// through an `Arc` are the inner installer's, and its default `query` is the report's
+    /// installed part.
+    #[test]
+    fn a_shared_installer_is_the_installer_it_holds() {
+        let log = crate::fakes::Log::default();
+        let inner = crate::fakes::FakeInstaller::new(&log);
+        let shared: std::sync::Arc<dyn Installer> = std::sync::Arc::new(inner.clone());
+        let host = Host {
+            alias: "a".to_owned(),
+            address: "h.example".to_owned(),
+            role: crate::inventory::Role::Daemon,
+            host_key: "ssh-ed25519 AAAA".to_owned(),
+            node_id: None,
+        };
+        let v = Version::parse("2.0").expect("v");
+        shared.install(&host, &v).expect("install");
+        assert_eq!(inner.installed("a"), Installed::Version("2.0".into()));
+        let report = shared.report(&host).expect("report");
+        assert_eq!(report.installed, Installed::Version("2.0".into()));
+        assert_eq!(report.node_id.as_deref(), Some("a-node"));
+        assert_eq!(shared.query(&host), Ok(Installed::Version("2.0".into())));
     }
 
     /// Catches a kind that is lost or shown wrongly: the tuple-style call is `Other`, the

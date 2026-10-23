@@ -110,6 +110,8 @@ const GROUPS: &[(&str, &[&str])] = &[
             "readyz-store-timeout-ms",
             "state-store",
             "unservable-wait-secs",
+            "vm-host-floor-cpus",
+            "vm-host-floor-mem-gib",
         ],
     ),
     (

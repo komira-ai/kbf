@@ -257,9 +257,9 @@ impl ProxyArgs {
 pub struct BootArgs {
     #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(120..=1800))]
     pub window_secs: u64,
-    /// The kbf this unit starts, on a bundled host (one with no releases and no state). It
-    /// says the state schema it needs; the database is brought to it before the unit starts.
-    /// Needs --mode.
+    /// The kbf this unit starts, on a bundled host (one with no releases and no state): the
+    /// check runs `<kbf> boot-check --mode=<mode>` over the host's installer.toml (under
+    /// --root), which migrates the state database, and ends as it ends. Needs --mode.
     #[arg(long, requires = "mode")]
     pub kbf: Option<std::path::PathBuf>,
     /// The mode of the unit that runs the check: only frontend and all-in-one keep state in

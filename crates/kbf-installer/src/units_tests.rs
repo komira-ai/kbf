@@ -71,10 +71,10 @@ fn every_linux_unit_runs_the_kbf_the_package_installs() {
             }
         }
     }
-    // kbf-daemon, kbf-storage, kbf-storage-and-daemon, kbf-all-in-one: a check and a
-    // start each; kbf-frontend: a check and a start.
+    // kbf-daemon, kbf-storage, kbf-storage-and-daemon, kbf-all-in-one: a boot check, a
+    // check and a start each; kbf-frontend: a boot check, a check and a start.
     assert!(
-        checked >= 10,
+        checked >= 15,
         "only {checked} kbf commands found in {dir:?}"
     );
 }

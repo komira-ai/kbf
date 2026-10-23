@@ -109,7 +109,8 @@ fn stage_inner(
         _ => None,
     };
     // The pinned tools are root's, or nothing from them is believed.
-    for tool in [&host.gh, &host.trusted_root] {
+    let lister = matches!(channel.source, Source::Github { .. }).then_some(&host.curl);
+    for tool in [&host.gh, &host.trusted_root].into_iter().chain(lister) {
         host.trust.check_file(tool).map_err(|e| {
             Outcome::Refused(match refusal(e) {
                 crate::outcome::Refusal::ConfigUnsafe => crate::outcome::Refusal::KeyUntrusted,
@@ -297,6 +298,7 @@ fn fetch_release(
     let tuning = &host.tuning;
     let fetcher = Fetcher {
         runner,
+        curl: &host.curl,
         gh: &host.gh,
         who: nobody,
         home,

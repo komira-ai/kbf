@@ -96,6 +96,8 @@ pub struct MacHost {
     /// The pinned `gh` and Sigstore trusted root the installer package carries.
     pub(crate) gh: PathBuf,
     pub(crate) trusted_root: PathBuf,
+    /// The system `curl`, which lists the releases of a GitHub channel.
+    pub(crate) curl: PathBuf,
     /// The daemon's working directory (its `HOME`).
     pub(crate) daemon_home: PathBuf,
     /// This program, as the sudoers rule and the apply job name it.
@@ -121,6 +123,7 @@ impl MacHost {
             daemon_config: PathBuf::from("/usr/local/etc/kbf/kbf.toml"),
             gh: PathBuf::from("/usr/local/kbf-installer/trust/gh"),
             trusted_root: PathBuf::from("/usr/local/kbf-installer/trust/trusted_root.jsonl"),
+            curl: PathBuf::from("/usr/bin/curl"),
             daemon_home: kit.join("work/daemon"),
             self_exe: PathBuf::from(SELF_EXE),
             trust: Trust::root(),
@@ -145,6 +148,7 @@ impl MacHost {
             daemon_config: dir.join("kbf.toml"),
             gh: dir.join("trust/gh"),
             trusted_root: dir.join("trust/trusted_root.jsonl"),
+            curl: dir.join("trust/curl"),
             daemon_home: kit.join("work/daemon"),
             self_exe: PathBuf::from(SELF_EXE),
             kit_trust: trust.clone(),

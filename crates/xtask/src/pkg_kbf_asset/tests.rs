@@ -88,18 +88,24 @@ impl Fix {
             package: "kbf",
             version: VERSION,
             arch: "amd64",
-            depends: format!("kbf-installer (>= {VERSION})"),
+            depends: String::new(),
             replaces: "kbf-installer".to_owned(),
             drop: None,
             extra: Vec::new(),
         }
     }
 
-    /// The deb: nfpm's layout, gzip members, `./` paths.
+    /// The deb: nfpm's layout, gzip members, `./` paths. The control file has a `Depends` line
+    /// only when the fixture depends on something.
     fn deb(&self) -> Vec<u8> {
+        let depends = if self.depends.is_empty() {
+            String::new()
+        } else {
+            format!("Depends: {}\n", self.depends)
+        };
         let control = format!(
-            "Package: {}\nVersion: {}\nArchitecture: {}\nDepends: {}\nReplaces: {}\n",
-            self.package, self.version, self.arch, self.depends, self.replaces
+            "Package: {}\nVersion: {}\nArchitecture: {}\n{depends}Replaces: {}\n",
+            self.package, self.version, self.arch, self.replaces
         );
         let control_tgz = tgz(&[("control", 0o644, control.as_bytes())]);
         let binary = "usr/bin/kbf".to_owned();
@@ -149,9 +155,9 @@ fn found(name: &str, fix: &Fix) -> Vec<String> {
     .expect("problems")
 }
 
-/// Asserts that a package of the attested `kbf`, depending on its own installer and replacing
-/// it, with the unit of every mode, is accepted as the asset for either platform: copied under
-/// a name of the commit and platform, with its digest in the sums file.
+/// Asserts that a package of the attested `kbf`, depending on no package and replacing the
+/// installer, with the unit of every mode, is accepted as the asset for either platform: copied
+/// under a name of the commit and platform, with its digest in the sums file.
 #[test]
 fn a_package_of_the_attested_kbf_with_the_mode_units_is_accepted_as_the_asset() {
     for (platform, arch) in [
@@ -269,45 +275,41 @@ fn the_control_file_names_the_package_and_the_architecture() {
     assert_eq!(got, [want]);
 }
 
-/// Asserts that the control file must depend on `kbf-installer (>= <the package's own
-/// version>)`: no dependency, another package, an older or other version and another name
-/// are refused, each alone, and the same dependency among others, and spelled with other
-/// spaces, is not.
+/// Asserts that the control file must not depend on `kbf-installer`: the name alone, with a
+/// version, with no space before the version, among other packages, with an architecture and
+/// as one of several alternatives are each refused alone, and no `Depends` line, other
+/// packages, a name that only starts like it and another version of the package's own name are
+/// not.
 #[test]
-fn the_control_file_depends_on_the_installer_of_the_packages_version() {
+fn the_control_file_does_not_depend_on_the_installer() {
     let with_depends = |depends: &str| {
         let mut fix = Fix::new();
         fix.depends = depends.to_owned();
         found("depends", &fix)
     };
-    let hold = format!("which does not hold \"kbf-installer (>= {VERSION})\"");
+    let names = "but the kbf package depends on no \"kbf-installer\"";
+    for depends in [
+        "kbf-installer",
+        "kbf-installer (>= 0.1.0+0123456789ab)",
+        "kbf-installer(>= 0.1.0+0123456789ab)",
+        "systemd, kbf-installer (= 0.1.0+0123456789ab), crun",
+        "kbf-installer:any",
+        "crun | kbf-installer",
+    ] {
+        let got = with_depends(depends);
+        assert_eq!(got.len(), 1, "{depends:?}: {got:?}");
+        assert!(got[0].contains(names), "{depends:?}: {got:?}");
+    }
     for depends in [
         "",
         "systemd",
-        "kbf-installer",
-        "kbf-installer (>= 0.0.1+0123456789ab)",
-        "kbf-installer (= 0.1.0+0123456789ab)",
+        "systemd, crun (>= 1.0)",
         "kbf-installer-extra (>= 0.1.0+0123456789ab)",
         "kbf (>= 0.1.0+0123456789ab)",
     ] {
         let got = with_depends(depends);
-        assert_eq!(got.len(), 1, "{depends:?}: {got:?}");
-        assert!(got[0].contains(&hold), "{depends:?}: {got:?}");
-    }
-    for depends in [
-        "kbf-installer(>=0.1.0+0123456789ab)",
-        "systemd, kbf-installer (>= 0.1.0+0123456789ab), crun",
-        "kbf-installer  ( >=  0.1.0+0123456789ab )",
-    ] {
-        let got = with_depends(depends);
         assert_eq!(got, Vec::<String>::new(), "{depends:?}");
     }
-    let mut fix = Fix::new();
-    fix.version = "0.2.0+fedcba987654";
-    let got = found("version", &fix);
-    assert_eq!(got.len(), 1, "{got:?}");
-    let want = "which does not hold \"kbf-installer (>= 0.2.0+fedcba987654)\"";
-    assert!(got[0].contains(want), "{got:?}");
 }
 
 /// Asserts that the control file must say that the package replaces `kbf-installer`, of any
@@ -334,9 +336,9 @@ fn the_control_file_replaces_the_installer() {
     }
 }
 
-/// Asserts that a control file without the `Package` line, and one without the `Depends` and
-/// `Replaces` lines, are refused, the missing `Package` shown as `(none)` and the missing
-/// others as empty values.
+/// Asserts that a control file without the `Package` line, and one without the `Replaces`
+/// line, are refused, the missing `Package` shown as `(none)` and the missing `Replaces` as an
+/// empty value, and that the missing `Depends` line is not a problem.
 #[test]
 fn a_control_file_without_its_lines_is_refused() {
     let fix = Fix::new();
@@ -348,10 +350,8 @@ fn a_control_file_without_its_lines_is_refused() {
     let got = problems(&deb, &c).expect("problems");
     let package = "control says Package \"(none)\", not \"kbf\"".to_owned();
     assert!(got.contains(&package), "{got:?}");
-    let depends = got
-        .iter()
-        .any(|p| p.starts_with("control says Depends \"\""));
-    assert!(depends, "{got:?}");
+    let depends = got.iter().any(|p| p.starts_with("control says Depends"));
+    assert!(!depends, "{got:?}");
     let replaces = got
         .iter()
         .any(|p| p.starts_with("control says Replaces \"\""));
@@ -435,7 +435,7 @@ fn verify_only_checks_the_asset_by_its_name_and_writes_nothing() {
     assert!(printed[0].starts_with(&start), "{printed:?}");
     assert_eq!(std::fs::read_dir(&dir).expect("ls").count(), before);
     let mut bad = Fix::new();
-    bad.depends = String::new();
+    bad.depends = "kbf-installer".to_owned();
     std::fs::write(&named, bad.deb()).expect("bad deb");
     let err = asset(&named, COMMIT, &Mode::VerifyOnly, &c).expect_err("refused");
     assert!(matches!(err, Error::Refused(_)), "{err:?}");
