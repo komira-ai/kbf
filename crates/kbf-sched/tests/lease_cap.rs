@@ -213,6 +213,10 @@ fn a_whole_machine_lease_is_placed_on_an_empty_capped_node_and_blocks_actions() 
     farm.submit(4);
     assert_eq!(farm.held(), 1, "no action beside a whole-machine lease");
     farm.finish_one();
-    assert_eq!(farm.held(), 2, "the actions follow, up to the cap, not to the cores");
+    assert_eq!(
+        farm.held(),
+        2,
+        "the actions follow, up to the cap, not to the cores"
+    );
     assert_eq!(farm.s.queued().count(), 2);
 }
