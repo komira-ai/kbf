@@ -87,8 +87,6 @@ pub struct HandoverConfig {
     pub fetch_timeout_s: u32,
     /// The loopback ports of the two children's admin and operator listeners, by slot.
     pub slots: SlotAddrs,
-    /// The operator token the swap presents to a child's operator API (`desired`).
-    pub operator_token_file: PathBuf,
     /// `installer.toml`: the `database` the swap's migrator brings forward before a candidate
     /// starts.
     pub installer_toml: PathBuf,

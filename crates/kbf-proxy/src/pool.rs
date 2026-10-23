@@ -12,6 +12,9 @@
 //! A pool is keyed by the slot's generation ([`crate::slot::Permit::generation`]): a slot that
 //! was retired and opened again is a new child, and the first stream after the restart never
 //! meets a connection of the dead process.
+//!
+//! In pool mode a member is a process that runs on its own, so its pools are keyed by where it
+//! listens: (base address, target). They are made when first asked for and kept.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -50,6 +53,12 @@ pub(crate) const fn upstream_addr(table: UpstreamTable, slot: Slot, target: Targ
         std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
         table.port(slot, target),
     )
+}
+
+/// Where a pool member listens for `target`: the target's port offset from the member's base
+/// address.
+pub(crate) fn member_addr(base: SocketAddr, target: Target) -> SocketAddr {
+    SocketAddr::new(base.ip(), base.port() + target.offset())
 }
 
 #[derive(Debug)]
@@ -289,12 +298,16 @@ impl TargetPool {
 /// A pool's key: the slot's name, its generation, the target's port offset.
 type PoolKey = (&'static str, u64, u16);
 
-/// Every pool, by (slot, generation, target).
+/// A pool member's pool key: the address its listeners start at, the target's port offset.
+type MemberKey = (SocketAddr, u16);
+
+/// Every pool, by (slot, generation, target), and in pool mode by (member address, target).
 pub(crate) struct Pool {
     table: UpstreamTable,
     metrics: Arc<Metrics>,
     connector: Connector,
     pools: Mutex<HashMap<PoolKey, Arc<TargetPool>>>,
+    members: Mutex<HashMap<MemberKey, Arc<TargetPool>>>,
 }
 
 impl Pool {
@@ -304,7 +317,21 @@ impl Pool {
             metrics,
             connector,
             pools: Mutex::new(HashMap::new()),
+            members: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The pool of `target` on the pool member whose listeners start at `base`.
+    pub(crate) fn member(&self, base: SocketAddr, target: Target) -> Arc<TargetPool> {
+        let mut pools = self.members.lock().unwrap_or_else(PoisonError::into_inner);
+        let make = || {
+            TargetPool::new(
+                member_addr(base, target),
+                Arc::clone(&self.metrics),
+                Arc::clone(&self.connector),
+            )
+        };
+        Arc::clone(pools.entry((base, target.offset())).or_insert_with(make))
     }
 
     /// The pool of `target` in `slot` at `generation`. Asking for a generation drops the pools

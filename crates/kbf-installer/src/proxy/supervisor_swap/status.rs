@@ -24,8 +24,9 @@ pub(super) fn active_after(intent: &Intent, new_holds: &dyn Fn() -> bool) -> Slo
         Phase::Done => true,
         Phase::RolledBack => false,
         Phase::Failed => match intent.failure.as_ref().map(|f| f.step) {
-            // A confirm that failed after the switch, a rollback that did not land, or an order
-            // for the nodes the new child would not take: the new child keeps serving.
+            // A confirm that failed after the switch, a rollback that did not land, or (in a
+            // record an earlier build wrote) an order for the nodes the new child would not
+            // take: the new child keeps serving.
             Some(Step::Confirm | Step::Rollback | Step::Nodes) => true,
             Some(Step::Restart) => new_holds(),
             _ => false,

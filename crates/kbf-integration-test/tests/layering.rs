@@ -512,9 +512,10 @@ fn the_proxy_reaches_no_child_installer_or_runtime_crate() {
 /// supervisor that starts the children on the ports of the proxy's upstream table
 /// (`proxy/supervisor.rs`, which also holds the real gate), the verb's own tests
 /// (`proxy_verb_tests.rs`, which start a real proxy over a migrated database and compare the
-/// deploy's copy of the proxy's port layout in `observe.rs` with the proxy's). The rest of
-/// `proxy/` is written against traits and names no proxy
-/// type. Everything else, the root helper
+/// deploy's copy of the proxy's port layout in `observe.rs` with the proxy's), and the verb's
+/// pool mode (`proxy_pool.rs`, which binds and runs the proxy over frontends that run on
+/// their own, with no supervisor). The rest of `proxy/` is written against traits and names
+/// no proxy type. Everything else, the root helper
 /// (`helper/`, `run.rs`) first of all, runs as root and links a network stack it never runs
 /// if it names a proxy type. The settings file whose `[proxy]` table the verb reads and the
 /// table `setup --proxy` writes are in `kbf-setup` (`SETUP_MAY_NAME_THE_PROXY`).
@@ -523,6 +524,7 @@ const MAY_NAME_THE_PROXY: &[&str] = &[
     "proxy/gate_real_tests.rs",
     "proxy/supervisor.rs",
     "proxy/supervisor_tests.rs",
+    "proxy_pool.rs",
     "proxy_verb.rs",
     "proxy_verb_tests.rs",
     "proxy_verb_copies_tests.rs",
@@ -536,10 +538,17 @@ const MAY_NAME_THE_PROXY: &[&str] = &[
 /// not turn on.
 const SETUP_MAY_NAME_THE_PROXY: &[&str] = &["installer_toml.rs", "setup/proxy.rs"];
 
-/// The files that may name the verb's module (`proxy_verb`): the dispatch and its tests. A path
-/// into the verb from anywhere else, `crate::proxy_verb::FIRST_FD` in the root helper for one,
-/// reaches the proxy without ever writing `kbf_proxy`.
-const MAY_NAME_THE_VERB: &[&str] = &["app.rs", "app_tests.rs", "lib.rs", "proxy_verb.rs"];
+/// The files that may name the verb's module (`proxy_verb`): the dispatch and its tests, and the
+/// verb's pool mode (`proxy_pool.rs`, which shares the verb's stop flag and signal handling). A
+/// path into the verb from anywhere else, `crate::proxy_verb::FIRST_FD` in the root helper for
+/// one, reaches the proxy without ever writing `kbf_proxy`.
+const MAY_NAME_THE_VERB: &[&str] = &[
+    "app.rs",
+    "app_tests.rs",
+    "lib.rs",
+    "proxy_pool.rs",
+    "proxy_verb.rs",
+];
 
 /// Source files under `dir`, as paths relative to `base`, with `/` as the separator.
 fn rust_files(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {

@@ -305,7 +305,7 @@ pub(super) struct Child {
 }
 
 impl Child {
-    fn start(net: &Arc<MemNet>, addrs: Vec<SocketAddr>, script: &Script) -> Self {
+    pub(super) fn start(net: &Arc<MemNet>, addrs: Vec<SocketAddr>, script: &Script) -> Self {
         let state = Arc::new(ChildState::default());
         let accepting = addrs
             .iter()

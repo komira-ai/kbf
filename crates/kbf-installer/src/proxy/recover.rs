@@ -130,7 +130,7 @@ impl<'a> Swap<'a> {
     /// Ask the root whether the confirm landed, for an update that stopped at `baking` or
     /// later (before that no confirm was sent). The store wins over `update.json`, which is
     /// written after the confirm and so can lag it (a crash between them leaves `baking`
-    /// or `nodes` unrecorded) or, if it disagrees the other way, is simply wrong. The
+    /// as the last phase) or, if it disagrees the other way, is simply wrong. The
     /// disagreement is noted. A `confirm` failure recorded earlier is cleared when the root
     /// holds the release: a later try landed. If the root cannot be read nothing is guessed:
     /// the update ends `failed` at `restart` with both children as they are.

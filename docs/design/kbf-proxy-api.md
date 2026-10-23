@@ -289,6 +289,23 @@ max_header_list_bytes = 16384   keepalive_interval_s = 30   keepalive_ack_s = 20
 
 **Server certificates.** `server_cert_file` + `server_key_file` is the same as one `[[proxy.server_cert]]` with no names and `default = true`, so a config written before SNI stays valid. With a list, a ClientHello whose server name equals a `names` entry (case-insensitive, trailing dot ignored) gets that entry's certificate; no server name, or a name that is in no entry, gets the entry marked `default = true`. Two or more entries need exactly one default; an entry without `names` must be the default. At start, and at every reload, each pair is checked: the key is the certificate's, every configured name is a DNS subject alternative name of the leaf (a `*.rest` SAN covers one label), no name appears twice, and the shape rules above hold; a reload also refuses an expired leaf. Any failure refuses the whole list: a start does not proceed, and a reload keeps the previous one. Client certificates are verified against `client_ca_file` and the per-path rules apply, the same on every name.
 
+**Pool mode.** The children are given one of two ways, never both. The `[proxy.upstream]` table is slot mode, described in this document: two slots, A and B, that the supervisor starts and swaps between. `[[proxy.frontend]]` tables are pool mode: frontends that run on their own, which the proxy balances over, with no supervisor, no swap and no hold.
+
+```toml
+[proxy]
+admin_listen = "127.0.0.1:18090"     # optional, pool mode only, loopback only, plain HTTP, no credential
+[[proxy.frontend]]
+name = "a"                           # 1 to 64 of letters, digits, '-' and '_'; unique
+base_port = 18000                    # 1024 to 65531; the same offsets as a slot (REAPI 0, worker 1, operator 2, admin 3, enroll 4)
+[[proxy.frontend]]
+name = "b"
+base_port = 18010                    # at least 5 above or below any other frontend's
+```
+
+A stream goes to the frontend with the fewest streams open among those that are up (not draining) and ready; frontends with as many are taken in turn. A frontend is ready while its last `GET /readyz` on its operator listener, asked once a second, passed; a frontend that is up but not ready is taken only when none is ready, and one that cannot be connected to is not ready until a poll passes again. A draining frontend is never taken and its open streams run to their end. A stream that fails before any answer (a refused connection, `REFUSED_STREAM`, a GOAWAY that proves it unprocessed, a fenced answer) is placed once more on a frontend that has not failed it, if the request is whole (the rules of section 10). `/readyz` is 200 while some frontend is up and ready. With every frontend draining or failed, a call is `UNAVAILABLE`. A `WaitExecution` is not read for the term of an old child. `GET /metrics` has the series `kbf_proxy_member_up`, `kbf_proxy_member_ready`, `kbf_proxy_member_open_streams` (by `member` and `target`), `kbf_proxy_member_picked_total` and `kbf_proxy_member_failed_total` for each frontend, and no child series.
+
+The admin API is served on `admin_listen` and on no other socket: `GET /v1/proxy/upstreams` lists `{"name", "state": "up"|"draining", "ready", "open_streams": {"reapi", "worker", "operator", "enroll"}}` for each frontend; `POST /v1/proxy/upstreams/{name}:drain` and `...:undrain` change the state, are idempotent and answer the same list; an unknown name is a 404 and changes nothing. The API asks for no credential, and a request a web page could have sent is a 403: one with an `Origin` header, or whose `Host` is not an IP literal on loopback (use the address of `admin_listen`; a DNS name that was made to point at it does not pass). `admin_listen` must not be a port of a frontend (`base_port` to `base_port + 4`). A frontend leaves the pool for an update by being drained, waited for until its `open_streams` are 0, restarted, waited for until it is ready, and undrained.
+
 Unknown keys are refused at start. U4b-3 adds `proxy: Option<ProxyConfig>` to the installer's settings and keeps the installer's own deny-unknown rule. The operator token and update credential (C9) are read by the proxy; U8 injects a different `UpdateHandler`, not a different token source.
 
 ## 10. Keepalive, retry, GOAWAY and resets

@@ -27,6 +27,15 @@
 //! A `WaitExecution` whose operation name carries the term of the old child, which the proxy
 //! learns from each child's admin `role` answer, is routed to the old child while it lives
 //! and to the active child otherwise (`term`).
+//!
+//! **Pool mode.** A config with `[[frontend]]` tables in place of the `upstream` table makes the
+//! proxy a plain load balancer over frontends that run on their own: no child is started, no
+//! swap and no hold. `upstreams` holds the members (up or draining, ready or not, streams
+//! open) and picks the least busy ready one for each stream; [`config::Frontend`] is a member's
+//! table. A poll of each member's operator listener sets its readiness (`pool_probe`) and
+//! `/readyz` is 200 while some member is up and ready. An admin API on `admin_listen` lists
+//! the members and drains or undrains one (`pool_admin`). Slot mode is the code above and is
+//! unchanged.
 
 // The I/O modules are not part of the loom build (`--cfg kbf_loom`): the models cover only
 // `slot`, and tokio and hyper are not loom-aware.
@@ -53,6 +62,10 @@ mod metrics;
 #[cfg(not(kbf_loom))]
 mod pool;
 #[cfg(not(kbf_loom))]
+mod pool_admin;
+#[cfg(not(kbf_loom))]
+mod pool_probe;
+#[cfg(not(kbf_loom))]
 mod probe;
 #[cfg(not(kbf_loom))]
 mod proxy;
@@ -75,6 +88,8 @@ mod sync;
 mod term;
 #[cfg(not(kbf_loom))]
 mod tls;
+#[cfg(not(kbf_loom))]
+mod upstreams;
 
 #[cfg(not(kbf_loom))]
 pub use proxy::{Proxy, ProxyHandle, ProxyRunner};

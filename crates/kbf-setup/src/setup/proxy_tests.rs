@@ -68,7 +68,7 @@ fn a_proxy_host_gets_the_proxy_table_and_a_kbf_toml_without_tls_files() {
     assert_eq!(text(&exec, KBF_TOML), FRONTEND_TOML);
     let parsed = InstallerToml::parse(PROXY_GOLDEN).expect("the golden parses");
     let table = parsed.proxy.expect("a proxy table");
-    assert_eq!(table.upstream.base_port, DEFAULT_BASE_PORT);
+    assert_eq!(table.slot_table().base_port, DEFAULT_BASE_PORT);
     assert_eq!(table.operator_token_file.to_str(), Some(API_TOKEN));
     assert!(table.ui, "the browser UI is on by default");
     assert!(text(&exec, INSTALLER_TOML).contains("\nui = true\n"));
@@ -375,6 +375,26 @@ fn a_differing_key_in_an_untuned_table_is_rewritten() {
     }
 }
 
+/// Asserts that `setup --proxy` over an `installer.toml` whose `[proxy]` table is a pool
+/// (`[[proxy.frontend]]` tables in place of the upstream table) is refused (exit 5) with
+/// `frontend` named among the keys that differ from the flags, and that it writes nothing.
+#[test]
+fn a_pool_table_is_refused_naming_its_frontends() {
+    let slot = "[proxy.upstream]\nbase_port = 18000";
+    let frontends = "[[proxy.frontend]]\nname = \"a\"\nbase_port = 18000\n\n\
+                     [[proxy.frontend]]\nname = \"b\"\nbase_port = 18010";
+    assert!(PROXY_GOLDEN.contains(slot));
+    let there = PROXY_GOLDEN.replacen(slot, frontends, 1);
+    let mut exec = proxy_host();
+    put(&mut exec, INSTALLER_TOML, 0o644, ROOT, &there);
+    let err = go(&FakeOs::linux(), &mut exec, &proxy_raw(), APPLY).expect_err("refused");
+    assert_eq!(err.exit(), Exit::NeedsOperator);
+    let shown = err.to_string();
+    assert!(shown.contains("; frontend)"), "{shown}");
+    assert_eq!(text(&exec, INSTALLER_TOML), there);
+    assert!(exec.log.is_empty(), "{:?}", exec.log);
+}
+
 /// Catches a Keep that is not one: for every owned key, the same flags over a tuned table that
 /// holds the flags' value leave the file byte for byte, so no key of `differing` can report a
 /// difference where there is none.
@@ -640,7 +660,7 @@ fn the_buck2_policy_reaches_the_table() {
         .expect("parses")
         .proxy
         .expect("table");
-    assert_eq!(table.upstream.base_port, 19_000);
+    assert_eq!(table.slot_table().base_port, 19_000);
 }
 
 /// Catches `--buck2-auth mtls` lost on the way to the file (the third spelling of the flag).

@@ -180,8 +180,8 @@ fn the_temp_file_is_synced_before_the_rename_and_the_directory_after_it() {
     );
 }
 
-/// Catches the source of an update lost from `update.json` (a restarted proxy would then send
-/// the order for the nodes as for a fetch), and a record of an update that fetches that an
+/// Catches the source of an update lost from `update.json` (a restarted proxy would then take
+/// the update for a fetch), and a record of an update that fetches that an
 /// older build cannot read: the key is there only for a source that is not `fetch`, and a
 /// record written before the key reads as `fetch`.
 ///
