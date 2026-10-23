@@ -301,7 +301,7 @@ impl<'a> Swap<'a> {
     // ---- steps ----
 
     /// The staged release is the one this update names, and the forward migrations are
-    /// applied before any candidate exists (CEO 14:58Z).
+    /// applied before any candidate exists.
     pub(super) fn preflight(&mut self) -> Result<Flow, Halt> {
         match self.ports.orders.staged() {
             Ok(Some(facts)) if facts.commit == self.plan.to => {}

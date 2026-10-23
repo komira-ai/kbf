@@ -179,7 +179,7 @@ because it learns a node's boot only when the node registers, after the frontend
 
 ### The state store: Postgres for the frontend
 
-The frontend's state store is Postgres (CEO ruling: SQLite is dropped for it). The frontend
+The frontend's state store is Postgres (ruling: SQLite is dropped for it). The frontend
 gets `--state-store`, a `postgres://` URI, from `kbf.toml`; the default is the host's socket,
 `postgres:///kbf?host=/run/postgresql`. The URI carries no password (kbf refuses one: the
 command line is readable by every user on the node), so the database is reached by the

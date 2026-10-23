@@ -164,7 +164,7 @@ fn a_pin_verified_signature_says_so() {
 #[test]
 fn the_gate_verifies_and_parses_the_written_pair() {
     let key = SkKey::new(3);
-    let line = key.allowed_line("ceo");
+    let line = key.allowed_line("admin");
     let mut exec = host(key, FLAG_USER_PRESENT | FLAG_USER_VERIFIED);
     run_on(&mut exec, &args(), Mode::Apply).0.expect("signed");
     let (text, sig) = (bytes_at(&exec, OUT), bytes_at(&exec, SIG));
@@ -174,7 +174,7 @@ fn the_gate_verifies_and_parses_the_written_pair() {
         let signer = signers
             .verify(&text, &sig, NOW, require_pin)
             .expect("verifies");
-        assert_eq!(signer.principals, "ceo");
+        assert_eq!(signer.principals, "admin");
     }
     let parsed = request::parse(std::str::from_utf8(&text).unwrap()).expect("parses");
     assert_eq!(parsed.purpose, Purpose::EraseNow);
@@ -189,7 +189,7 @@ fn openssh_verifies(dir: &Path, allowed: &str, text: &[u8], sig: &[u8]) -> (bool
     std::fs::write(dir.join("allowed"), allowed).unwrap();
     std::fs::write(dir.join("req.sig"), sig).unwrap();
     let mut child = Command::new(keygen)
-        .args(["-Y", "verify", "-I", "ceo", "-n", NAMESPACE, "-f"])
+        .args(["-Y", "verify", "-I", "admin", "-n", NAMESPACE, "-f"])
         .arg(dir.join("allowed"))
         .arg("-s")
         .arg(dir.join("req.sig"))
@@ -212,7 +212,7 @@ fn openssh_verifies(dir: &Path, allowed: &str, text: &[u8], sig: &[u8]) -> (bool
 #[test]
 fn real_ssh_keygen_verify_accepts_the_signed_request() {
     let key = SkKey::new(3);
-    let allowed = key.allowed_line("ceo");
+    let allowed = key.allowed_line("admin");
     let mut exec = host(key, FLAG_USER_PRESENT);
     run_on(&mut exec, &args(), Mode::Apply).0.expect("signed");
     let (text, sig) = (bytes_at(&exec, OUT), bytes_at(&exec, SIG));
@@ -220,7 +220,7 @@ fn real_ssh_keygen_verify_accepts_the_signed_request() {
     let (good, said) = openssh_verifies(&dir, &allowed, &text, &sig);
     assert!(good, "{said}");
     assert!(
-        said.contains("Good \"kbf-mdm-erase\" signature for ceo"),
+        said.contains("Good \"kbf-mdm-erase\" signature for admin"),
         "{said}"
     );
     let mut changed = text.clone();
@@ -257,7 +257,7 @@ fn the_signing_argv_signs_standard_input_with_the_real_ssh_keygen() {
     );
     let sig = (ARMORED.apply)(&out.stdout).expect("an armored signature on stdout");
     let public = std::fs::read_to_string(format!("{key}.pub")).unwrap();
-    let allowed = format!("ceo namespaces=\"{NAMESPACE}\" {public}");
+    let allowed = format!("admin namespaces=\"{NAMESPACE}\" {public}");
     let (good, said) = openssh_verifies(&dir, &allowed, GOLDEN.as_bytes(), &sig);
     assert!(good, "{said}");
 }
@@ -368,7 +368,7 @@ fn each_refusal_comes_before_anything_is_signed() {
         (
             "software key",
             |_, e| {
-                let (line, _) = software_signature("ceo", b"x");
+                let (line, _) = software_signature("admin", b"x");
                 let public = line.split_once("\" ").unwrap().1.to_owned();
                 e.entries
                     .insert(p("/srv/op/id_erase_sk.pub"), file(public.as_bytes()));
@@ -455,7 +455,7 @@ fn a_signature_the_gate_refuses_fails_the_check() {
         ),
         (
             "software key",
-            answering(|m| software_signature("ceo", m).1),
+            answering(|m| software_signature("admin", m).1),
             VerifyError::SoftwareKey("ssh-ed25519".to_owned()),
         ),
     ];

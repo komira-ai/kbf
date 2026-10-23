@@ -541,7 +541,7 @@ and the notes (items 1 to 3) are built. It has no dependency on any earlier stag
 
 The additions:
 
-1. **No verdict gates the release (CEO ruling).** Release gating is `release gates` (the `ci`, `beta` and `artifacts` push runs
+1. **No verdict gates the release (ruling).** Release gating is `release gates` (the `ci`, `beta` and `artifacts` push runs
    green for the commit) and `release verify` in the `verify` job: the attestations and the release set, and the tag (annotated,
    on main, naming this commit). This is a release-process check in GitHub; it is **not host-update trust** (hosts never read
    the tag, and verify only the artifact attestation). Nothing judges a verdict document: the annotated tag's message carries
