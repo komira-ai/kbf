@@ -26,7 +26,8 @@
 //!   (default `refs/heads/main`; a value that is not `refs/heads/<branch>` is a usage
 //!   error), on a GitHub-hosted runner, and every tarball has an SBOM attestation from
 //!   the same workflow: the `gh attestation verify` commands docs/artifacts.md gives.
-//!   A `.deb` or `.pkg` (the `kbf-installer` package, [`crate::pkg_asset`], [`crate::pkg_macos_asset`]) is listed and verified
+//!   A `.deb` or `.pkg` (the `kbf-installer` package, [`crate::pkg_asset`], the `kbf` package,
+//!   [`crate::pkg_kbf_asset`], and [`crate::pkg_macos_asset`]) is listed and verified
 //!   like a tarball except that it has no SBOM attestation: build provenance and its own
 //!   bundle. The version facts of a `kbf` ([`crate::version_facts`]) are verified like an
 //!   SBOM: build provenance, and nothing else.

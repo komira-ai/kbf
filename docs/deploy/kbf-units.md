@@ -352,7 +352,7 @@ themselves. There is no `node` mode and no `enroll` word.
 
 ## Installing a mode's unit
 
-`kbf-installer setup` installs the packaged unit of the host's mode and enables it
+The `kbf` package installs the unit of each mode; `kbf-installer setup` enables the one of the host's mode
 ([kbf-installer-setup.md](kbf-installer-setup.md)); `kbf-deploy linux install-units` is
 retired. There is no uninstall for a mode's unit yet. A node moving from the converged units
 (`kbf-server.service`) to `kbf-storage.service` stops the old ones first

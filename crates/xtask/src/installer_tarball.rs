@@ -5,7 +5,9 @@
 //! which the deb and the rpm are made from too) and cannot drift from it:
 //!
 //! - `usr/bin/kbf-installer` (0755);
-//! - `usr/lib/systemd/system/<file>` (0644): `kbf-*.service`, `kbf-*.socket` and `kbf.slice` only;
+//! - `usr/lib/systemd/system/<file>` (0644): `kbf-*.service`, `kbf-*.socket` and `kbf.slice`
+//!   only, and not the units of the modes ([`crate::pkg_linux::KBF_UNITS`]), which the `kbf`
+//!   package carries;
 //! - `usr/share/kbf-installer/trust/<file>`: exactly the three trust files, the pinned
 //!   `gh` 0755 and the two data files 0644;
 //! - `usr/lib/sysusers.d/kbf-installer.conf` and `usr/lib/tmpfiles.d/kbf-installer.conf`

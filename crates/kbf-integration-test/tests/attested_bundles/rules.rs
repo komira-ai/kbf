@@ -16,7 +16,7 @@ const PACKAGES: [(&str, &str); 4] = [
     ("kbf", "darwin-arm64"),
 ];
 
-/// The platforms whose job makes the installer deb an asset.
+/// The platforms whose job makes the installer deb, and the `kbf` deb, an asset.
 const DEBS: [&str; 2] = ["linux-x86_64", "linux-arm64"];
 
 /// The artifacts `release locate` lists for the fixture.
@@ -56,6 +56,21 @@ fn provenance_deb(platform: &str) -> String {
 fn naming_deb(platform: &str) -> String {
     format!(
         "      - name: Name the bundle of the package for {platform}\n        env:\n          BUNDLE: ${{{{ steps.provenance-kbf-installer-deb-{platform}.outputs.bundle-path }}}}\n        run: cp \"$BUNDLE\" \"dist/kbf-installer-${{GITHUB_SHA}}-{platform}.deb.sigstore.json\"\n"
+    )
+}
+
+/// The provenance step of the `kbf` deb of `platform`.
+fn provenance_kbf_deb(platform: &str) -> String {
+    format!(
+        "      - id: provenance-kbf-deb-{platform}\n        uses: actions/attest-build-provenance@{ATTEST_PIN}\n        with:\n          subject-path: dist/{}.deb\n",
+        attested_assets::stem("kbf", platform)
+    )
+}
+
+/// The step after it, which names its bundle.
+fn naming_kbf_deb(platform: &str) -> String {
+    format!(
+        "      - name: Name the bundle of the kbf package for {platform}\n        env:\n          BUNDLE: ${{{{ steps.provenance-kbf-deb-{platform}.outputs.bundle-path }}}}\n        run: cp \"$BUNDLE\" \"dist/kbf-${{GITHUB_SHA}}-{platform}.deb.sigstore.json\"\n"
     )
 }
 
@@ -101,6 +116,11 @@ fn good_artifacts() -> String {
             "      - name: Package {platform}\n        run: cargo xtask pkg-asset --package p.deb --platform {platform} --commit \"$GITHUB_SHA\" --binary-tarball t.tar.gz --expect-ref \"$PKG_SOURCE_REF\" --gh gh --out dist\n      - name: Check {platform}\n        run: cargo xtask pkg-asset --verify-only --package p.deb --platform {platform} --commit \"$GITHUB_SHA\" --binary-tarball t.tar.gz --expect-ref \"$GITHUB_REF\"\n"
         ));
     }
+    for platform in DEBS {
+        w.push_str(&format!(
+            "      - name: Package kbf {platform}\n        run: cargo xtask pkg-kbf-asset --package k.deb --platform {platform} --commit \"$GITHUB_SHA\" --kbf-tarball t.tar.gz --out dist\n      - name: Check kbf {platform}\n        run: cargo xtask pkg-kbf-asset --verify-only --package k.deb --platform {platform} --commit \"$GITHUB_SHA\" --kbf-tarball t.tar.gz\n"
+        ));
+    }
     w.push_str("      - name: Package macos\n        run: cargo xtask pkg-macos-asset --package p.pkg --commit \"$GITHUB_SHA\" --binary-tarball t.tar.gz --expect-ref \"$PKG_SOURCE_REF\" --gh gh --out dist\n      - name: Check macos\n        run: cargo xtask pkg-macos-asset --verify-only --package p.pkg --commit \"$GITHUB_SHA\" --binary-tarball t.tar.gz --expect-ref \"$GITHUB_REF\"\n");
     for g in ["linux", "darwin-arm64"] {
         w.push_str(&format!(
@@ -113,6 +133,10 @@ fn good_artifacts() -> String {
         for platform in DEBS.iter().filter(|p| group(p) == g) {
             w.push_str(&provenance_deb(platform));
             w.push_str(&naming_deb(platform));
+        }
+        for platform in DEBS.iter().filter(|p| group(p) == g) {
+            w.push_str(&provenance_kbf_deb(platform));
+            w.push_str(&naming_kbf_deb(platform));
         }
         if g == "darwin-arm64" {
             w.push_str(&provenance_pkg());
@@ -809,4 +833,102 @@ fn a_verify_only_line_is_not_a_package_made_an_asset() {
         1,
     );
     assert!(attested_assets::packaged_debs(&no_platform).is_err());
+}
+
+/// Asserts that the `kbf` deb made an asset is held to the same two rules as the installer's:
+/// one provenance step of its own and the step that names its bundle `.deb.sigstore.json`, for
+/// each architecture, and that a step left behind for a `kbf` deb no job makes is named.
+#[test]
+fn a_kbf_package_without_its_own_provenance_step_or_bundle_name_is_named() {
+    let mut cases = Cases::default();
+    for platform in DEBS {
+        let w = good_artifacts();
+        let dropped = w
+            .replacen(&provenance_kbf_deb(platform), "", 1)
+            .replacen(&naming_kbf_deb(platform), "", 1);
+        assert_ne!(dropped, w);
+        let wanted = format!(
+            "kbf package (deb) for {platform} is packaged, but `attest-linux` has no actions/attest-build-provenance step with subject-path dist/{}.deb",
+            attested_assets::stem("kbf", platform)
+        );
+        cases.artifacts(&format!("kbf deb {platform}"), &dropped, &wanted, true);
+    }
+    let platform = DEBS[0];
+    let bundle = format!("dist/kbf-${{GITHUB_SHA}}-{platform}.deb.sigstore.json");
+    let wanted = "the step after the provenance step for kbf package (deb) for linux-x86_64 in `attest-linux` does not name its bundle";
+    let tarballs = format!("dist/kbf-${{GITHUB_SHA}}-{platform}.tar.gz.sigstore.json");
+    cases.artifacts(
+        "the bundle named as the tarball's",
+        &broken(&bundle, &tarballs),
+        wanted,
+        false,
+    );
+    let installers = format!("dist/kbf-installer-${{GITHUB_SHA}}-{platform}.deb.sigstore.json");
+    cases.artifacts(
+        "the bundle named as the installer's",
+        &broken(&bundle, &installers),
+        wanted,
+        false,
+    );
+    let subject = format!(
+        "subject-path: dist/{}.deb",
+        attested_assets::stem("kbf", platform)
+    );
+    cases.artifacts(
+        "a glob subject",
+        &broken(&subject, "subject-path: dist/*.deb"),
+        "kbf package (deb) for linux-x86_64 is packaged, but",
+        false,
+    );
+    let id = format!("      - id: provenance-kbf-deb-{platform}\n");
+    cases.artifacts(
+        "the step skippable",
+        &broken(&id, &format!("{id}        if: always()\n")),
+        "the provenance step for kbf package (deb) for linux-x86_64 in `attest-linux` is under `if:`",
+        false,
+    );
+    cases.artifacts("no id", &broken(&id, ""), "has no `id:`", false);
+    cases.artifacts(
+        "the pkg-kbf-asset line removed",
+        &broken(
+            "cargo xtask pkg-kbf-asset --package k.deb --platform linux-arm64",
+            "echo linux-arm64",
+        ),
+        "`attest-linux` attests dist/kbf-${{ github.sha }}-linux-arm64.deb with a provenance step of its own",
+        true,
+    );
+    cases.done();
+}
+
+/// Asserts that the lines that make the `kbf` deb an asset are read apart from the installer's
+/// and from the lines that only check a signed deb: each verb's platforms are its own, a
+/// `--verify-only` line is not one, and a line without a platform is an error.
+#[test]
+fn the_kbf_deb_lines_are_read_apart_from_the_installers() {
+    let w = good_artifacts();
+    assert_eq!(
+        attested_assets::packaged_kbf_debs(&w).expect("readable"),
+        DEBS
+    );
+    assert_eq!(attested_assets::packaged_debs(&w).expect("readable"), DEBS);
+    let no_installer = w.replace("cargo xtask pkg-asset ", "echo ");
+    assert!(
+        attested_assets::packaged_debs(&no_installer)
+            .expect("readable")
+            .is_empty()
+    );
+    assert_eq!(
+        attested_assets::packaged_kbf_debs(&no_installer).expect("readable"),
+        DEBS
+    );
+    let no_platform = w.replacen(
+        "pkg-kbf-asset --package k.deb --platform linux-arm64",
+        "pkg-kbf-asset --package k.deb",
+        1,
+    );
+    let said = attested_assets::packaged_kbf_debs(&no_platform).expect_err("no platform");
+    assert!(
+        said.contains("a pkg-kbf-asset line without --platform"),
+        "{said}"
+    );
 }
