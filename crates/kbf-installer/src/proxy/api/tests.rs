@@ -680,7 +680,7 @@ fn force_retire_works_on_an_old_child_left_by_an_ended_update() {
 /// Catches a status that ignores the restart seam (always false, always true, or read once
 /// at construction): the answer follows the seam on every request, idle or not.
 ///
-/// Mutants planted: `restart_pending` fixed to `false`; fixed to `true`.
+/// Catches: `restart_pending` fixed to `false`; fixed to `true`.
 #[test]
 fn status_restart_pending_follows_the_restart_seam_on_every_request() {
     use std::sync::atomic::Ordering::SeqCst;
@@ -1042,7 +1042,7 @@ fn a_revived_request_is_checked_again_like_a_new_one() {
 /// would read a child that is not serving yet) or still reports the new child after a
 /// rollback (it would read a child that was stood down).
 ///
-/// Mutants planted: the fake supervisor's rollback leaving the new child's slot.
+/// Catches: the fake supervisor's rollback leaving the new child's slot.
 #[test]
 fn active_slot_is_the_serving_slot_through_switch_and_rollback() {
     let rig = Rig::new("active-slot");

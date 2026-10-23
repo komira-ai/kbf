@@ -88,7 +88,7 @@ fn assert_secure(answer: &Answer, what: &str) {
     assert_eq!(answer.header("strict-transport-security"), None, "{what}");
 }
 
-/// Catches (the CEO's ruling: the UI is open): a page that asks the policy-gated reads
+/// Catches (the ruling that the UI is open): a page that asks the policy-gated reads
 /// as the network does, so the policy's authenticator refuses it (mutant: the UI's
 /// routes built over the server's policy instead of the open one: every page is a `502`
 /// or `404`); the policy's gates removed from the network route instead (the same

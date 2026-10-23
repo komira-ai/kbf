@@ -128,7 +128,7 @@ cd infra/site && npm ci --ignore-scripts
    prints three `gh variable set ... --env prod-site` commands (`KBF_SITE_BUCKET`, `KBF_SITE_DISTRIBUTION_ID`,
    `KBF_SITE_PUBLISH_ROLE_ARN`). You run them. Nothing is committed.
 
-### Held for the CEO when this change lands
+### Held for the maintainers when this change lands
 
 If the stack `kbf-prod-site` was already deployed (trusting environment `prod`), its role trust must change to `prod-site`:
 re-run step 3 (`site`, diff, then `--apply`; the diff shows the one changed `sub` string), then step 0 (`github`) for

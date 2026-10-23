@@ -41,10 +41,10 @@
 //! resolved.
 //!
 //! `--hot-store` attaches the local write tier before anything is bound
-//! (`kbf_server::write_tier`): it first raises the log to machine version 5 (once; a
-//! server without a tier never does, so its log stays one an older binary reads). A
-//! start the tier refuses (a wrong or missing `TIER` while objects are staged, a log
-//! that cannot be raised) exits 2. Its flusher runs every second until the server stops.
+//! (`kbf_server::write_tier`): the tier's commands commit to the log as it is, and
+//! nothing raises its machine version. A start the tier refuses (a wrong or missing `TIER`
+//! while objects are staged) exits 2. Its flusher runs every second until the server
+//! stops.
 
 use std::error::Error;
 use std::process::ExitCode;

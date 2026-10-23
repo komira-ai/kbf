@@ -807,7 +807,19 @@ async fn a_process_the_kill_cannot_end_fails_the_clean_within_its_deadline() {
     let mut config = config(&scratch, users.pool());
     config.kill_wait = Duration::from_secs(2);
     let rt = NativeRuntime::new(config, Arc::clone(&cas)).expect("runtime");
+    // The start-up clean can fail on a slow host (the lease would then wait for a slot
+    // forever, as the stuck process below keeps every later clean from passing): the
+    // test starts from a slot that is offered.
+    let offered = Instant::now() + PROMPT;
+    while slots_reported(&rt).as_deref() != Some("1") && Instant::now() < offered {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let before = slots_reported(&rt);
+    assert_eq!(
+        before.as_deref(),
+        Some("1"),
+        "the slot was dirty at start-up"
+    );
     // After the slot-ready check, which would refuse the slot on it: planted while the
     // lease runs, as a process the action left behind would be.
     let act = scratch.act();

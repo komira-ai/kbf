@@ -15,18 +15,21 @@
 //!   `KBF_BUILD_COMMIT_OVERRIDE` stamp), and a build before this field prints none;
 //! - `meta_log`: the highest metadata-log machine version this build runs
 //!   ([`kbf_server::raft_log::RUNS`], read through `.get()`; there is no second copy of the
-//!   number). A rollout compares it across two builds: going from N to N-1 is reversible
-//!   only if `meta_log(N) <= meta_log(N-1)`, because a build from before skipped entries
-//!   cannot open a log raised past what it runs (a later build opens it, skips the raise and
-//!   loses the commands it does not know). A build that does not print the field is unknown,
-//!   and unknown is not reversible;
+//!   number). It is informational: the constant is frozen and gates no feature, because
+//!   this build raises no log and writes every command it knows to a log of any version.
+//!   It stays in the line because a rollout compares it across two builds: going from N to
+//!   N-1 is reversible only if `meta_log(N) <= meta_log(N-1)`, since a build from before
+//!   skipped entries cannot open a log raised past what it runs (a later build opens it,
+//!   skips the raise and loses the commands it does not know). A build that does not print
+//!   the field is unknown, and unknown is not reversible;
 //! - `min_protocol` and `protocol`: the oldest and the newest `kbf.worker.v1` protocol
 //!   version this binary speaks ([`kbf_server::worker`]); the daemon half speaks exactly
 //!   `protocol` (a test pins the two halves equal);
 //! - `profile`: the Cargo profile, `release` or `debug` ([`PROFILE`]);
 //! - `relay`: how far this build carries what its host's installer reports to the frontend
-//!   ([`RELAY`]); the installer reads it before it takes `release_source = "bundled"`, which
-//!   only a `kbf` that relays can be run beside. A build before this field prints none;
+//!   ([`RELAY`]); the installer reads it before it rolls a `release_source = "bundled"` host back
+//!   to a release, which only a `kbf` that relays can be run beside. A build before this field
+//!   prints none;
 //! - `seq`: the number of commits behind the commit built (`git rev-list --count HEAD`,
 //!   [`build_seq`]), so two builds of one branch are put in order by it: a later commit has
 //!   the larger number. It is 0 when the build could not count them (a shallow checkout,
@@ -49,8 +52,8 @@ pub const PROFILE: &str = env!("KBF_BUILD_PROFILE");
 
 /// How far this build relays what its host's installer reports to the frontend: at level 1 it
 /// reads `available` and `release_source` from the installer's `status.json` and sends them in
-/// its `UpdateStatus`. The installer will not take `release_source = "bundled"` beside a `kbf`
-/// that declares less (`kbf_installer::binary::RELAY_NEEDED`; a test pins that this build
+/// its `UpdateStatus`. The installer will not roll a `release_source = "bundled"` host back to a
+/// `kbf` that declares less (`kbf_installer::binary::RELAY_NEEDED`; a test pins that this build
 /// meets it). Raised when a later change relays more.
 pub const RELAY: u64 = 1;
 

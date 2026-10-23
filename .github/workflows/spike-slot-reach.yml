@@ -200,6 +200,28 @@ jobs:
       - name: The assertion and its positive controls, on real users (root)
         run: cargo xtask sudo-test -p kbf-driver-native --test slot_assert -- --test-threads=1 --nocapture
 
+  # The GPU under the slot profile (crates/kbf-driver-native/tests/slot_gpu.rs): a pool user
+  # finds a Metal device, compiles a kernel at run time and runs it on the GPU, and each
+  # deny that takes the GPU away fails the probe at its step (`GPU-STAGE` lines). The runner
+  # is a virtual machine with a paravirtual GPU, not a farm Mac. The same command as the
+  # native-macos job of beta.yml runs after a push to main.
+  slot-gpu:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: What this Mac reports of its GPU (the detection the daemon runs)
+        run: cargo test -p kbf-daemon --lib --locked -- this_mac_reports_its_gpu --nocapture
+      - name: The GPU under the slot profile, on real users (root)
+        run: cargo xtask sudo-test -p kbf-driver-native --test slot_gpu -- --test-threads=1 --nocapture
+
   # kbf-mac-provision on a real Mac, as root (crates/kbf-mac-provision/tests/as_root.rs), with
   # the pool test that feeds `dscl .` a batch on standard input and reads `dscl -readall`. The
   # same command as the native-macos job of beta.yml runs after a push to main.

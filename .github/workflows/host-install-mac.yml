@@ -1,0 +1,65 @@
+# kbf-host-install's Mac side against the real tools: `launchctl print` of a throwaway
+# LaunchDaemon in each state the install tells apart, `lsof -F n`, `codesign -d`, `xattr`,
+# `dscl` and a privilege drop, each output read with the crate's own parsers
+# (crates/kbf-host-install/tests/real_mac.rs). A GitHub-hosted macOS runner has passwordless
+# sudo, which `launchctl bootstrap system` and the privilege drop need; nothing here runs on
+# any other machine.
+#
+# Every raw output is uploaded as an artifact (`gh run download`). The files under
+# crates/kbf-host-install/tests/fixtures/mac are those outputs, committed, and the crate's
+# ordinary unit tests read them. One test also goes to GitHub: it fetches a published
+# release through the install's own code and runs the real `gh attestation verify` on it.
+# It runs on a pull request that touches the crate, by hand, and on a push to main.
+name: host-install-mac
+
+on:
+  pull_request:
+    paths:
+      - crates/kbf-host-install/**
+      - .github/workflows/host-install-mac.yml
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - crates/kbf-host-install/**
+
+permissions: {}
+
+concurrency:
+  group: host-install-mac-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  real-mac:
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: sw_vers
+      # The fetch test goes to GitHub as root, and sudo clears the environment: it reads the
+      # workflow's own read-only token from this file.
+      - name: Token file of the fetch test, readable by its owner alone
+        run: install -m 0600 /dev/null /private/var/tmp/kbf-real-fetch-token
+      - name: Token of the fetch test
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" > /private/var/tmp/kbf-real-fetch-token
+      # The real tests, as root (they bootstrap launchd jobs and drop privileges); the
+      # crate's own unit tests run in ci.yml.
+      - run: cargo xtask sudo-test -p kbf-host-install --test real_mac -- --nocapture
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: host-install-mac-raw-output
+          path: target/real-mac
+          if-no-files-found: error

@@ -133,7 +133,7 @@ fn status_prints_the_state_and_the_link_verdict() {
 /// release's first start) printed with a deadline that is not there, and the order and
 /// the start budget of the swap left out of what a script parses.
 ///
-/// Mutant seen red: the `None` deadline printed as `0`.
+/// Catches: the `None` deadline printed as `0`.
 #[test]
 fn status_says_when_the_window_to_confirm_has_not_started() {
     let (root, dir) = host_root("deploy-host-status-window");
@@ -205,7 +205,7 @@ fn host_cli(args: &[&OsStr]) -> (ExitCode, String, String) {
 /// running user's). The dry run of `host install` is what the operator reads before
 /// `--apply`, so it is pinned whole, with root as the owner of every step.
 ///
-/// Mutants seen red: the binary planned 0775, and planned with no owner.
+/// Catches: the binary planned 0775, and planned with no owner.
 #[test]
 fn install_plans_a_release_only_root_can_change() {
     let dir = kbf_host::testkit::scratch("deploy-host-install-cli");
@@ -297,7 +297,7 @@ impl Procs for Blind {
 /// fails (exit 1), says so on standard error, prints no plan and leaves a stray release in
 /// place; with a readable table the same release goes.
 ///
-/// Mutants planted: the in-use error treated as "nothing runs" (the release is removed).
+/// Catches: the in-use error treated as "nothing runs" (the release is removed).
 #[test]
 fn gc_removes_nothing_where_it_cannot_tell_what_runs() {
     let (layout, dir) = host_root("deploy-host-gc-blind");

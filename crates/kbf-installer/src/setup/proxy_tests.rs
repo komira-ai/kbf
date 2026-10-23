@@ -56,13 +56,14 @@ fn systemctl(exec: &FakeExec) -> Vec<String> {
 
 /// Catches a proxy host that is not written as the proxy reads it: the whole `installer.toml`
 /// byte for byte (the flags' keys in `[proxy]`, `[proxy.upstream] base_port` at the default,
-/// the operator token setup makes, every default spelled out), root-owned 0644, and a
+/// the operator token setup makes, every default spelled out; the golden is a file an earlier
+/// setup wrote, so its release source is the default's here), root-owned 0644, and a
 /// `kbf.toml` with none of the proxy's TLS keys: the children speak plain h2c behind it.
 #[test]
 fn a_proxy_host_gets_the_proxy_table_and_a_kbf_toml_without_tls_files() {
     let mut exec = proxy_host();
     go_ok(&FakeOs::linux(), &mut exec, &proxy_raw());
-    assert_eq!(text(&exec, INSTALLER_TOML), PROXY_GOLDEN);
+    assert_eq!(text(&exec, INSTALLER_TOML), on_a_fresh_host(PROXY_GOLDEN));
     assert_eq!(file_meta(&exec, INSTALLER_TOML), (0o644, ROOT));
     assert_eq!(text(&exec, KBF_TOML), FRONTEND_TOML);
     let parsed = InstallerToml::parse(PROXY_GOLDEN).expect("the golden parses");

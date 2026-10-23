@@ -148,7 +148,7 @@ fn every_tier_command_has_its_golden_bytes() {
 
 /// Every tier command is in the golden set, and only tier commands are: a variant added
 /// to `kbf_meta::Command` fails to compile here until it is placed (the match is
-/// exhaustive), and a format-1 command in this set would hide that format 1 refuses to encode it.
+/// exhaustive).
 #[test]
 fn the_golden_set_names_every_tier_command() {
     let mut seen = [false; 5];
@@ -266,18 +266,16 @@ fn generated_tier_commands_round_trip_and_reencode_to_the_same_bytes() {
     }
 }
 
-/// Asserts that the encoder refuses every tier command under format 1, and that the
-/// decoder reads each tier command's bytes under format 1 as the same command as under
-/// format 2, because decoding does not depend on the committed format.
+/// Asserts that the encoder writes every tier command under format 1 to the same bytes as
+/// under format 2, and that the decoder reads those bytes as the same command under
+/// format 1, because neither depends on the committed format: a log of format 1 takes the
+/// tier's commands with no raise.
 #[test]
-fn a_format_1_log_is_written_without_tier_commands_and_read_with_them() {
+fn a_format_1_log_is_written_and_read_with_tier_commands() {
     for (name, command, hex) in golden() {
-        assert_eq!(
-            enc(Format::V1, &command),
-            Err(EncodeError::Command(Format::V1)),
-            "{name}"
-        );
         let bytes = hex::decode(hex).expect("hex");
+        let wrote = enc(Format::V1, &command);
+        assert_eq!(wrote, Ok(bytes.clone()), "{name}");
         assert_eq!(dec(Format::V1, &bytes).as_ref(), Ok(&command), "{name}");
     }
     // Format 2 still reads and writes every format-1 command, with format 1's bytes.

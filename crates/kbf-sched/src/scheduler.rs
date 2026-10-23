@@ -2,6 +2,7 @@
 
 mod fault;
 mod give_up;
+mod handoff;
 mod hold;
 mod ids;
 pub(crate) mod loss;
@@ -314,6 +315,10 @@ pub struct Scheduler {
     /// Workers a recovered scheduler holds leases for that have not registered yet, and
     /// until when they may take to ([`Scheduler::recover`]).
     awaited: BTreeMap<WorkerId, FarmTime>,
+    /// Awaited workers whose recovered leases went to a daemon process that may not be the
+    /// one that registers, and until when those leases are kept once it does
+    /// ([`Scheduler::hold_recovered_leases`]).
+    other_process: BTreeMap<WorkerId, FarmTime>,
     /// The state store refused a write and has not taken one since
     /// ([`Scheduler::store_unavailable`]).
     store_down: bool,
@@ -349,6 +354,7 @@ impl Scheduler {
             size_keys: BTreeMap::new(),
             ladder: MemoryLadder::default(),
             awaited: BTreeMap::new(),
+            other_process: BTreeMap::new(),
             store_down: false,
             grace_until: FarmTime::default(),
             loss_cap: u32::MAX,
@@ -897,7 +903,10 @@ impl StateMachine for Scheduler {
                                 w.stopped_process = Some(w.process);
                             }
                             w.process += 1;
-                            w.handover_ends = w.last_heard.saturating_add(HANDOVER_GRACE);
+                            // Not before a hold made for the leases taken in for it
+                            // ([`Scheduler::hold_recovered_leases`]).
+                            let ends = w.last_heard.saturating_add(HANDOVER_GRACE);
+                            w.handover_ends = w.handover_ends.max(ends);
                         }
                         w.instance = instance;
                         w.capacity = capacity;

@@ -74,7 +74,7 @@ fn unchanged(path: &Path, bytes: &[u8]) {
 }
 
 /// C-1. Catches a cached inode a container can write or re-own (the "`chown -hR 1001:1001`
-/// over `root`, files included" mutant): an action appends to, truncates, chmods,
+/// over `root`, files included" defect): an action appends to, truncates, chmods,
 /// opens for read and write, and links-then-appends a cached input. Each write is
 /// refused (in place, the action gets EACCES), the entry is unchanged, and a second
 /// lease reads its bytes. The graph driver and the overlay's mount options are
@@ -104,7 +104,7 @@ async fn a_container_cannot_write_or_re_own_a_cached_input() {
 }
 
 /// C-2. Catches an input an output names linked to the cache (the "keep
-/// `prepare_outputs`' rename of a link, with the upper directory's chown" mutant: the
+/// `prepare_outputs`' rename of a link, with the upper directory's chown" defect: the
 /// chown would give the cached inode to the container's root): the action appends to
 /// it, the output has the new bytes, and the entry has the old.
 #[tokio::test]
@@ -129,7 +129,7 @@ async fn an_output_that_is_an_input_is_a_private_copy() {
 /// 2 with the same input root sees it pristine. In place, the rewrite gets `EACCES`
 /// and the rename `EOVERFLOW`: overlayfs refuses to copy up a file whose owner the
 /// container does not map, which a rename needs (`worker-cache.md`, "C1 as built").
-/// Mutant: the input root mounted without the overlay and its files given to the
+/// Catches: the input root mounted without the overlay and its files given to the
 /// container's root, so the rewrite lands in the cache's inode.
 #[tokio::test]
 #[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
@@ -263,7 +263,7 @@ async fn a_container_cannot_change_a_shared_tree_or_lift_its_read_only_flag() {
 }
 
 /// Catches a cache or tree store that an earlier run of a test leaves for the next (the
-/// "do not empty them in `with_cache`/`with_trees`" mutant: `Cell` removes only its
+/// "do not empty them in `with_cache`/`with_trees`" defect: `Cell` removes only its
 /// scratch directory, and CI keeps `target` between runs). The same cell runs twice in
 /// one process, each time from `Cell::with`; the second run's first lease builds the
 /// tree again and finds none of its inputs in the cache, as the first run's did.

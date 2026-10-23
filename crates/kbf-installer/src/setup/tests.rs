@@ -10,16 +10,14 @@ use kbf_host::{Entry, Exec, HostPath, Owner, Perms, Step};
 use kbf_state::postgres::Unreached;
 use kbf_state::postgres::schema::Outcome;
 
-use super::backend::{Backend, Releases, Schemas};
+use super::backend::{Backend, Schemas};
 use super::fake::{FakeOs, user};
+use super::retired::RetiredFlags;
 use super::validate::Raw;
 use super::{Options, SetupError, run};
-use crate::CommitId;
-use crate::cli::{Mode, ReleaseSource};
+use crate::cli::Mode;
 use crate::database::SchemaOps;
 use crate::exit::Exit;
-use crate::helper::fetcher::FetchError;
-use crate::installer_toml::Source;
 use crate::layout::{Layout, Platform};
 
 const DATABASE: &str = "postgres:///kbf?host=/run/postgresql&user=kbf-server";
@@ -32,6 +30,12 @@ const KBF_TOML: &str = "/etc/kbf/kbf.toml";
 /// The frontend children's file on an all-in-one host, beside the sibling's `kbf.toml`.
 const AIO_FRONTEND_TOML: &str = "/etc/kbf/frontend.toml";
 const INSTALLER_TOML: &str = "/etc/kbf/installer.toml";
+/// The release source an earlier setup wrote for a host that fetched from a file server, as the
+/// goldens of `installer.toml` keep it.
+const EARLIER_SOURCE: &str =
+    "release_source = \"url\"\nrelease_url = \"https://releases.example/kbf\"\n";
+/// The release source setup writes where the host has no `installer.toml`: the default.
+const DEFAULT_SOURCE: &str = "release_source = \"frontend\"\n";
 const ENROLL_TOKEN: &str = "/etc/kbf/enroll.token";
 const API_TOKEN: &str = "/etc/kbf/api-token";
 const ROOT: Owner = Owner { uid: 0, gid: 0 };
@@ -45,11 +49,8 @@ fn raw(mode: Mode) -> Raw {
         mode,
         frontend_url: node.then(|| "https://farm.example:8443".to_owned()),
         token_file: node.then(|| SRC.to_owned()),
-        release_source: None,
-        release_url: (!node).then(|| "https://releases.example/kbf".to_owned()),
-        release: Default::default(),
         min_generation: None,
-        commit: None,
+        retired: RetiredFlags::default(),
         database: mode.keeps_state_in_database().then(|| DATABASE.to_owned()),
         kbf: serving_flags(mode),
         proxy: proxy_flags(mode),
@@ -106,6 +107,13 @@ fn hp(p: &str) -> HostPath {
     HostPath::new(p).expect("a path")
 }
 
+/// A golden `installer.toml` of an earlier setup, as setup writes it where the host has no file:
+/// the same, but for the release source, which is the default.
+fn on_a_fresh_host(golden: &str) -> String {
+    assert!(golden.starts_with(EARLIER_SOURCE), "{golden}");
+    golden.replacen(EARLIER_SOURCE, DEFAULT_SOURCE, 1)
+}
+
 fn put(exec: &mut FakeExec, path: &str, perms: u32, owner: Owner, bytes: &str) {
     exec.entries.insert(
         hp(path),
@@ -159,20 +167,6 @@ const APPLY: Options = Options {
     apply: true,
     no_start: false,
 };
-
-/// A downloader that has no fetcher behind it, as the binary's own has none yet.
-struct Unwired;
-
-impl Releases for Unwired {
-    fn install_first(&self, _: &CommitId) -> Result<(), SetupError> {
-        Err(SetupError::Fetch(FetchError::NotWired))
-    }
-
-    /// The release that runs is taken to relay: these tests are about what `setup` writes.
-    fn running_relays(&self) -> Result<bool, SetupError> {
-        Ok(true)
-    }
-}
 
 /// What the fake server was asked, in order: `plan` and `setup`, each with the URL.
 type Asked = Rc<RefCell<Vec<String>>>;
@@ -249,32 +243,18 @@ impl Schemas for Server {
 }
 
 fn go(os: &FakeOs, exec: &mut FakeExec, raw: &Raw, options: Options) -> Result<String, SetupError> {
-    go_with(os, exec, &Unwired, raw, options)
-}
-
-fn go_with(
-    os: &FakeOs,
-    exec: &mut FakeExec,
-    releases: &dyn Releases,
-    raw: &Raw,
-    options: Options,
-) -> Result<String, SetupError> {
-    go_on(os, exec, releases, &Server::fresh(), raw, options)
+    go_on(os, exec, &Server::fresh(), raw, options)
 }
 
 fn go_on(
     os: &FakeOs,
     exec: &mut FakeExec,
-    releases: &dyn Releases,
     server: &Server,
     raw: &Raw,
     options: Options,
 ) -> Result<String, SetupError> {
     let mut out = Vec::new();
-    let backend = Backend {
-        releases,
-        schemas: server,
-    };
+    let backend = Backend { schemas: server };
     run(os, exec, &backend, raw, options, &mut out)?;
     Ok(String::from_utf8(out).expect("text"))
 }
@@ -772,6 +752,43 @@ fn nothing_of_the_mode_starts_without_a_release_or_with_no_start() {
     assert!(out.contains("--no-start"), "{out}");
 }
 
+/// Asserts that a node host with the kbf package (`/usr/bin/kbf`) and no `releases/current`
+/// has its mode's unit started, as a host with a release has, and is not told that no release
+/// is installed; and that a frontend host with only the package still has its unit enabled and
+/// left stopped, because starting a frontend is the operator's.
+#[test]
+fn a_host_with_the_kbf_package_and_no_release_tree_starts_its_units() {
+    let mut exec = host();
+    put(&mut exec, "/usr/bin/kbf", 0o755, ROOT, "kbf");
+    let out = go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon));
+    let systemctl: Vec<String> = cmds(&exec)
+        .into_iter()
+        .filter(|c| c.contains("systemctl"))
+        .collect();
+    assert_eq!(
+        systemctl,
+        [
+            "run /usr/bin/systemctl enable --now -- kbf-daemon.service",
+            "run /usr/bin/systemctl enable --now -- kbf-installer.service",
+        ]
+    );
+    assert!(!out.contains("no release is installed yet"), "{out}");
+    let mut exec = host();
+    put(&mut exec, "/usr/bin/kbf", 0o755, ROOT, "kbf");
+    go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Frontend));
+    let systemctl: Vec<String> = cmds(&exec)
+        .into_iter()
+        .filter(|c| c.contains("systemctl"))
+        .collect();
+    assert_eq!(
+        systemctl,
+        [
+            "run /usr/bin/systemctl enable -- kbf-frontend.service",
+            "run /usr/bin/systemctl enable --now -- kbf-installer.service",
+        ]
+    );
+}
+
 /// Catches an enable of a unit that is already enabled (a `--now` would then start a unit
 /// the operator stopped).
 #[test]
@@ -843,10 +860,10 @@ fn subid_space_exhaustion_is_a_refusal() {
 
 // installer.toml
 
-/// Catches the settings a host is given going wrong: a frontend host fetches from the file
-/// server it was told (url source, no node identity), a node's frontend source lends the
-/// pair enrollment writes for its role (daemon's for storage-and-daemon, as the contract
-/// says), and `min_generation` reaches the file.
+/// Asserts that the settings a host is given follow its mode and flags: a frontend host gets the
+/// default source and no node identity, a node's frontend source lends the pair enrollment
+/// writes for its role (daemon's for storage-and-daemon, as the contract says), and
+/// `min_generation` reaches the file.
 #[test]
 fn installer_toml_follows_the_mode_and_the_flags() {
     let mut exec = host();
@@ -854,14 +871,9 @@ fn installer_toml_follows_the_mode_and_the_flags() {
     r.min_generation = Some(7);
     go_ok(&FakeOs::linux(), &mut exec, &r);
     let t = text(&exec, INSTALLER_TOML);
-    assert!(
-        t.starts_with("release_source = \"url\"\nrelease_url = \"https://releases.example/kbf\"\n"),
-        "{t}"
-    );
-    assert!(
-        t.contains("min_generation = 7\n") && !t.contains("node_cert"),
-        "{t}"
-    );
+    assert!(t.starts_with(DEFAULT_SOURCE), "{t}");
+    assert!(t.contains("min_generation = 7\n"), "{t}");
+    assert!(!t.contains("node_cert"), "{t}");
 
     for (mode, role) in [
         (Mode::Storage, "storage"),
@@ -880,14 +892,48 @@ fn installer_toml_follows_the_mode_and_the_flags() {
             "{mode:?}: {t}"
         );
     }
-    // Moving a node to the url source drops the pair, which the file refuses beside it.
+}
+
+/// Asserts that the release source an earlier setup wrote is kept: over an `installer.toml` with
+/// a `url` source and the file server's CA, setup leaves the source and the key as they are, in a
+/// node mode and in a frontend mode alike, and a node whose file has a source other than the
+/// frontend's gets no node identity, which only the frontend source takes.
+#[test]
+fn the_release_source_an_earlier_setup_wrote_is_kept() {
+    let earlier = format!("{EARLIER_SOURCE}release_ca = \"/var/lib/kbf-installer/ca.pem\"\n");
+    for mode in [Mode::Daemon, Mode::Frontend] {
+        let mut exec = host();
+        put(&mut exec, INSTALLER_TOML, 0o644, ROOT, &earlier);
+        go_ok(&FakeOs::linux(), &mut exec, &raw(mode));
+        let t = text(&exec, INSTALLER_TOML);
+        assert!(t.starts_with(&earlier), "{mode:?}: {t}");
+        assert!(!t.contains("node_"), "{mode:?}: {t}");
+    }
+}
+
+/// Asserts that setup on a host with no release installs none: the file `releases/current` is
+/// not made, nothing is fetched or announced, and the files it writes are the same as before,
+/// with the release source at its default (a node's two files byte for byte).
+#[test]
+fn setup_on_a_host_with_no_release_installs_none_and_writes_the_same_files() {
+    for mode in [Mode::Daemon, Mode::Frontend, Mode::AllInOne] {
+        let mut exec = host();
+        let out = go_ok(&FakeOs::linux(), &mut exec, &raw(mode));
+        let current = current_release(Platform::Linux);
+        assert!(!exec.entries.contains_key(&hp(&current)), "{mode:?}");
+        let paths: Vec<&str> = exec.entries.keys().map(HostPath::as_str).collect();
+        assert!(
+            paths.iter().all(|path| !path.contains("releases")),
+            "{mode:?}: {paths:?}"
+        );
+        assert!(!out.contains("fetch and verify"), "{mode:?}: {out}");
+        assert!(!out.contains("package carries"), "{mode:?}: {out}");
+    }
     let mut exec = host();
-    go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon));
-    let mut r = raw(Mode::Daemon);
-    r.release_source = Some(ReleaseSource::Url);
-    r.release_url = Some("https://m.example".to_owned());
-    go_ok(&settled(&["kbf-daemon.service"]), &mut exec, &r);
-    assert!(!text(&exec, INSTALLER_TOML).contains("node_"));
+    let out = go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon));
+    assert_eq!(text(&exec, KBF_TOML), DAEMON_TOML);
+    assert_eq!(text(&exec, INSTALLER_TOML), DAEMON_INSTALLER_TOML);
+    assert!(out.contains("no release is installed yet"), "{out}");
 }
 
 /// Catches a re-run that wipes what the operator tuned: the keys setup has no flag for
@@ -1050,130 +1096,89 @@ fn a_config_with_the_right_text_and_the_wrong_mode_is_corrected() {
     assert_eq!(file_meta(&exec, KBF_TOML), (0o640, owner));
 }
 
-// The first release
+// The retired flags
 
-struct Installs(RefCell<Vec<String>>);
-
-impl Releases for Installs {
-    fn install_first(&self, commit: &CommitId) -> Result<(), SetupError> {
-        self.0.borrow_mut().push(commit.to_string());
-        Ok(())
-    }
-
-    fn install_seed(&self) -> Result<CommitId, SetupError> {
-        self.0.borrow_mut().push("the package's release".to_owned());
-        Ok(COMMIT.parse().expect("a commit"))
-    }
-
-    fn running_relays(&self) -> Result<bool, SetupError> {
-        Ok(true)
+/// The flags of the release source, the release keys and the first release, every one given.
+fn retired() -> RetiredFlags {
+    let some = |text: &str| Some(text.to_owned());
+    RetiredFlags {
+        release_source: some("url"),
+        release_url: some("https://releases.example/kbf"),
+        release_ca: some("/var/lib/kbf-installer/release-ca.pem"),
+        frontend_worker_url: some("https://frontend.lan:8981"),
+        frontend_ca: some("/var/lib/kbf-installer/frontend-ca.pem"),
+        frontend_ca_sha256: some("ab"),
+        commit: some(COMMIT),
     }
 }
 
-fn first_release(mode: Mode) -> Raw {
-    let mut r = raw(mode);
-    r.commit = Some(COMMIT.parse().expect("a commit"));
-    r.release_source = Some(ReleaseSource::Url);
-    r.release_url = Some("https://releases.example/kbf".to_owned());
-    r
+/// Asserts that the flags of the release source, the release keys and the first release change
+/// nothing: setup with all of them plans the steps, writes the files and prints the notes that
+/// setup without them does, installs no release, and says once, ahead of everything else, that
+/// it ignored them.
+#[test]
+fn the_retired_flags_are_ignored_and_warned_about_once() {
+    let warning = retired().warning().expect("a warning");
+    for mode in [Mode::Daemon, Mode::Frontend] {
+        let mut plain = host();
+        let said = go_ok(&FakeOs::linux(), &mut plain, &raw(mode));
+        let mut flagged = host();
+        let with = Raw {
+            retired: retired(),
+            ..raw(mode)
+        };
+        let out = go_ok(&FakeOs::linux(), &mut flagged, &with);
+        assert_eq!(out, format!("{warning}\n{said}"), "{mode:?}");
+        let steps =
+            |exec: &FakeExec| -> Vec<String> { exec.log.iter().map(ToString::to_string).collect() };
+        assert_eq!(steps(&flagged), steps(&plain), "{mode:?}");
+        for path in [INSTALLER_TOML, KBF_TOML] {
+            let want = text(&plain, path);
+            assert_eq!(text(&flagged, path), want, "{mode:?}: {path}");
+        }
+        let current = current_release(Platform::Linux);
+        assert!(!flagged.entries.contains_key(&hp(&current)), "{mode:?}");
+        assert_eq!(out.matches("warning:").count(), 1, "{mode:?}: {out}");
+    }
 }
 
-/// Catches a first release fetched at the wrong time or from the wrong place: it comes after
-/// `installer.toml` (which says where from) and before `kbf.toml`; the mode's units start
-/// because it is there; the source is the one `installer.toml` got.
+/// Asserts that a dry run warns too, and that a run that gives none of the retired flags does
+/// not.
 #[test]
-fn the_first_release_is_installed_between_the_settings_and_the_config() {
-    let installs = Installs(RefCell::default());
-    let mut exec = host();
-    let out = go_with(
-        &FakeOs::linux(),
-        &mut exec,
-        &installs,
-        &first_release(Mode::Daemon),
-        APPLY,
-    )
-    .expect("setup");
-    assert_eq!(*installs.0.borrow(), [COMMIT]);
-    // The order the output shows: the settings, the fetch, then the config.
-    let at = |needle: &str| {
-        out.find(needle)
-            .unwrap_or_else(|| panic!("{needle}: {out}"))
-    };
-    let fetch = at(&format!("+ fetch and verify release {COMMIT}"));
-    assert!(at(INSTALLER_TOML) < fetch && fetch < at(KBF_TOML), "{out}");
-    assert!(
-        cmds(&exec)
-            .contains(&"run /usr/bin/systemctl enable --now -- kbf-daemon.service".to_owned())
-    );
-    assert!(
-        out.contains(&format!("+ fetch and verify release {COMMIT}")),
-        "{out}"
-    );
-}
-
-/// Catches a setup that says it is done when the release could not be installed: this
-/// build has no fetcher, so `--commit` fails (exit 1, saying why) after the settings and
-/// before `kbf.toml`, and no unit is enabled.
-#[test]
-fn a_failed_first_release_leaves_no_config_and_no_unit() {
-    let mut exec = host();
-    let err = go(
-        &FakeOs::linux(),
-        &mut exec,
-        &first_release(Mode::Daemon),
-        APPLY,
-    )
-    .expect_err("fails");
-    assert!(
-        matches!(err, SetupError::Fetch(FetchError::NotWired)),
-        "{err:?}"
-    );
-    assert_eq!((err.exit(), err.code()), (Exit::Failed, "not_implemented"));
-    assert!(exec.entries.contains_key(&hp(INSTALLER_TOML)));
-    assert!(!exec.entries.contains_key(&hp(KBF_TOML)));
-    assert!(cmds(&exec).iter().all(|c| !c.contains("systemctl")));
-}
-
-/// Catches a release fetched twice or replaced by setup: with one installed, `--commit` is
-/// not fetched (updates are the update path's) and the run says so; a dry run names the
-/// fetch without doing it and plans the units as starting.
-#[test]
-fn a_release_already_installed_is_not_fetched_and_a_dry_run_only_names_the_fetch() {
-    let installs = Installs(RefCell::default());
-    let mut exec = released(host(), Platform::Linux);
-    let out = go_with(
-        &FakeOs::linux(),
-        &mut exec,
-        &installs,
-        &first_release(Mode::Daemon),
-        APPLY,
-    )
-    .expect("setup");
-    assert!(installs.0.borrow().is_empty());
-    assert!(out.contains("a release is installed already"), "{out}");
-
-    let mut exec = host();
+fn the_warning_comes_with_a_dry_run_and_only_when_a_retired_flag_was_given() {
     let dry = Options {
         apply: false,
         no_start: false,
     };
-    let out = go_with(
-        &FakeOs::linux(),
-        &mut exec,
-        &installs,
-        &first_release(Mode::Daemon),
-        dry,
-    )
-    .expect("dry run");
-    assert!(installs.0.borrow().is_empty());
+    let with = Raw {
+        retired: retired(),
+        ..raw(Mode::Daemon)
+    };
+    let out = go(&FakeOs::linux(), &mut host(), &with, dry).expect("dry run");
     assert!(
-        out.contains(&format!("DRY-RUN: fetch and verify release {COMMIT}")),
+        out.starts_with("warning: ignored: --release-source"),
         "{out}"
     );
-    assert!(
-        out.contains("DRY-RUN: run /usr/bin/systemctl enable --now -- kbf-daemon.service"),
-        "{out}"
-    );
+    let out = go(&FakeOs::linux(), &mut host(), &raw(Mode::Daemon), dry).expect("dry run");
+    assert!(!out.contains("warning"), "{out}");
+}
+
+/// Asserts that the warning names the retired flags that were given, and only those, in the
+/// order the help lists them, and that there is no warning when none was given.
+#[test]
+fn the_warning_names_the_retired_flags_that_were_given_and_only_those() {
+    assert_eq!(RetiredFlags::default().given(), Vec::<&str>::new());
+    assert_eq!(RetiredFlags::default().warning(), None);
+    assert_eq!(retired().given().len(), 7);
+    let some = RetiredFlags {
+        commit: Some("0123".to_owned()),
+        release_url: Some("https://r.example".to_owned()),
+        ..RetiredFlags::default()
+    };
+    assert_eq!(some.given(), ["--release-url", "--commit"]);
+    let said = some.warning().expect("a warning");
+    assert!(said.contains(": --release-url, --commit: "), "{said}");
+    assert!(!said.contains("--release-source"), "{said}");
 }
 
 // Flags
@@ -1192,11 +1197,8 @@ fn every_bad_flag_is_named_and_nothing_is_written() {
         mode: Mode::Daemon,
         frontend_url: Some("http://user@farm.example/x?y#z".to_owned()),
         token_file: Some("rel/token".to_owned()),
-        release_source: Some(ReleaseSource::Url),
-        release_url: None,
-        release: Default::default(),
         min_generation: Some(0),
-        commit: None,
+        retired: RetiredFlags::default(),
         database: Some(DATABASE.to_owned()),
         kbf: super::kbf_settings::KbfFlags::default(),
         proxy: Default::default(),
@@ -1208,14 +1210,14 @@ fn every_bad_flag_is_named_and_nothing_is_written() {
     let SetupError::Invalid(found) = &err else {
         panic!("{err:?}");
     };
-    assert_eq!(found.len(), 6, "{found:#?}");
+    assert_eq!(found.len(), 5, "{found:#?}");
     assert_eq!(err.exit(), Exit::Usage);
     assert!(exec.log.is_empty() && exec.queries.borrow().is_empty());
 }
 
-/// Catches the flags of the modes that enroll and of those that do not drifting apart: a
-/// node needs its frontend and token; a frontend or all-in-one host takes neither (it does
-/// not enroll), and neither may name the frontend as its release source.
+/// Asserts that the flags of the modes that enroll and of those that do not stay apart: a node
+/// needs its frontend and token; a frontend or all-in-one host takes neither (it does not
+/// enroll).
 #[test]
 fn the_modes_that_enroll_need_a_frontend_and_a_token_and_the_others_refuse_them() {
     assert!(problems(|r| r.frontend_url = None).contains("--frontend-url is required"));
@@ -1232,19 +1234,6 @@ fn the_modes_that_enroll_need_a_frontend_and_a_token_and_the_others_refuse_them(
         assert!(
             found.contains("--token-file is for the modes that enroll"),
             "{found}"
-        );
-        let mut r = raw(mode);
-        r.release_source = Some(ReleaseSource::Frontend);
-        r.release_url = None;
-        let found = r.validate(Platform::Linux).expect_err("refused").join("; ");
-        assert!(found.contains("does not enroll"), "{found}");
-        let mut r = raw(mode);
-        r.release_url = None;
-        assert!(
-            r.validate(Platform::Linux)
-                .expect_err("url needed")
-                .join(";")
-                .contains("needs --release-url")
         );
     }
 }
@@ -1285,37 +1274,30 @@ fn urls_are_https_with_nothing_hidden() {
     );
 }
 
+/// Asserts that the retired flags are not checked: values that were refused before (a source
+/// that does not fit the mode, a URL that is not https, a commit that is not 40 hex digits, a
+/// first release beside the bundled source) are accepted now, and nothing of them reaches the
+/// flags that are valid.
 #[test]
-fn the_release_source_flags_agree() {
-    let check = |s: ReleaseSource, u: Option<&str>| {
-        let mut r = raw(Mode::Daemon);
-        r.release_source = Some(s);
-        r.release_url = u.map(str::to_owned);
-        r.validate(Platform::Linux)
+fn the_retired_flags_are_not_checked() {
+    let junk = RetiredFlags {
+        release_source: Some("frontend".to_owned()),
+        release_url: Some("http://m.example/a/../b".to_owned()),
+        release_ca: Some("relative.pem".to_owned()),
+        frontend_worker_url: Some("not a url".to_owned()),
+        frontend_ca: Some("relative.pem".to_owned()),
+        frontend_ca_sha256: Some("ABC".to_owned()),
+        commit: Some("HEAD".to_owned()),
     };
-    assert!(check(ReleaseSource::Url, None).is_err());
-    assert!(check(ReleaseSource::Frontend, Some("https://m.example")).is_err());
-    assert!(check(ReleaseSource::Url, Some("http://m.example")).is_err());
-    assert!(check(ReleaseSource::Url, Some("https://m.example/a/../b")).is_err());
-    let ok = check(ReleaseSource::Url, Some("https://M.example:8443/releases/")).expect("valid");
-    assert_eq!(
-        ok.source,
-        Source::Url("https://m.example:8443/releases".to_owned())
-    );
-    assert_eq!(
-        check(ReleaseSource::Frontend, None).expect("valid").source,
-        Source::Frontend
-    );
-}
-
-/// Catches `--commit` with the frontend as source: before the host has enrolled there is
-/// no identity to fetch with, so the first release must come from a file server.
-#[test]
-fn a_first_release_cannot_come_from_the_frontend() {
-    let mut r = raw(Mode::Daemon);
-    r.commit = Some(COMMIT.parse().expect("commit"));
-    let found = r.validate(Platform::Linux).expect_err("refused").join("; ");
-    assert!(found.contains("cannot come from the frontend"), "{found}");
+    for mode in [Mode::Daemon, Mode::Frontend, Mode::AllInOne] {
+        let plain = raw(mode).validate(Platform::Linux);
+        let with = Raw {
+            retired: junk.clone(),
+            ..raw(mode)
+        };
+        assert_eq!(with.validate(Platform::Linux), plain, "{mode:?}");
+        assert!(plain.is_ok(), "{mode:?}: {plain:?}");
+    }
 }
 
 /// The exit code and word of each way setup stops, which scripts branch on.
@@ -1332,32 +1314,12 @@ fn each_failure_has_its_exit_code_and_word() {
             "needs_operator",
         ),
         (
-            SetupError::Fetch(FetchError::NotWired),
-            Exit::Failed,
-            "not_implemented",
-        ),
-        (
-            SetupError::Fetch(FetchError::Rejected("x".into())),
-            Exit::Refused,
-            "fetch",
-        ),
-        (
-            SetupError::Fetch(FetchError::Unavailable("x".into())),
-            Exit::Failed,
-            "fetch",
-        ),
-        (
             SetupError::ShadowUnit {
                 path: "/x".into(),
                 unit: "u",
             },
             Exit::NeedsOperator,
             "unit_shadow",
-        ),
-        (
-            SetupError::Release(crate::release::ReleaseError::NoPrevious),
-            Exit::Failed,
-            "release",
         ),
         (SetupError::Database("x".into()), Exit::Failed, "database"),
         (SetupError::NoFreeId, Exit::Failed, "no_room"),
@@ -1643,19 +1605,11 @@ fn every_failure_reads_as_a_sentence() {
         (SetupError::NoFreeId, "between 300 and 399"),
         (SetupError::NeedsOperator("fix it".into()), "fix it"),
         (
-            SetupError::Fetch(FetchError::NotWired),
-            "no release fetcher",
-        ),
-        (
             SetupError::ShadowUnit {
                 path: "/etc/systemd/system/a.service".into(),
                 unit: "a.service",
             },
             "shadows the packaged unit a.service",
-        ),
-        (
-            SetupError::Release(crate::release::ReleaseError::NoPrevious),
-            "no previous release",
         ),
         (SetupError::Database("down".into()), "database step: down"),
         (
@@ -1716,12 +1670,6 @@ mod old_backup;
 
 #[path = "update_dirs_tests.rs"]
 mod update_dirs;
-
-#[path = "release_config_tests.rs"]
-mod release_config;
-
-#[path = "seed_tests.rs"]
-mod seed;
 
 #[path = "aio_tests.rs"]
 mod aio;

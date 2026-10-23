@@ -5,8 +5,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kbf_front::{Cache, FlushRound, MetaLog, MetaLogError, TierStartError, TierStartup};
-use kbf_log::MachineVersion;
+use kbf_front::{Cache, FlushRound, MetaLog, TierStartError, TierStartup};
 use kbf_objstore::ObjectStore;
 use kbf_store::{Fs, StdFs};
 use kbf_tier::TierOptions;
@@ -21,10 +20,6 @@ pub const FLUSH_EVERY: Duration = Duration::from_secs(1);
 /// Why the write tier could not be attached; the server does not start.
 #[derive(Debug, thiserror::Error)]
 pub enum WriteTierError {
-    /// The metadata log could not be raised to machine version 5, the newest the tier's
-    /// commands need.
-    #[error("--hot-store: {0}")]
-    Log(MetaLogError),
     /// The directory could not be created.
     #[error("--hot-store: {0}")]
     Dir(std::io::Error),
@@ -37,13 +32,12 @@ pub enum WriteTierError {
 /// `cache` with the hot store's tier attached, and what its start found; the cache as it
 /// was when there is no hot store.
 ///
-/// With a tier, the Raft log is first raised to machine version 5, whose format carries
-/// the tier's commands, including the move of a conflicting staged object's records
-/// ([`RaftMetaLog::raise_machine_version`]; a log already there commits nothing; from
-/// then on a binary that runs only an earlier version skips the raise), then
-/// the tier's start recovers the directory against the committed staged table, which
-/// outlives the process ([`Cache::attach_tier`]). Without a tier the log is not touched,
-/// so it stays one an older binary reads.
+/// With a tier, the tier's start recovers the directory against the committed staged
+/// table, which outlives the process ([`Cache::attach_tier`]). The tier's commands (the
+/// move of a conflicting staged object's records included) commit to the Raft log as it
+/// is, whatever machine version it holds: attaching raises nothing, and a log an earlier
+/// binary wrote is attached as it stands. A binary that does not know one of the
+/// commands skips it, and loses what that command did.
 ///
 /// # Errors
 /// [`WriteTierError`].
@@ -82,10 +76,6 @@ where
         flushed_copies,
         ..TierOptions::new(hot.budget)
     };
-    cache
-        .meta()
-        .raise_machine_version(MachineVersion::V5)
-        .map_err(WriteTierError::Log)?;
     let (cache, startup) = cache.attach_tier(fs, options, SERVER, hot.abandon).await?;
     tracing::info!(
         tier = %startup.tier,

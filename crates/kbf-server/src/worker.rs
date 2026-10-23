@@ -19,7 +19,10 @@
 //! - a `Heartbeat` the deny list now refuses ends the stream. Otherwise it is fed to
 //!   the scheduler and acknowledged, unless a newer stream of
 //!   the same node has registered since: then it is dropped unacknowledged, so a
-//!   daemon still talking on the old stream fences on time. A lease it lists that the
+//!   daemon still talking on the old stream fences on time. Over a state store it is
+//!   fed but not acknowledged either when this frontend no longer owns the node (the daemon
+//!   said `Hello` to another) or has not written the node's session row lately
+//!   ([`crate::farm::ACK_WINDOW`]). A lease it lists that the
 //!   scheduler no longer holds on the node is sent a `Cancel` (issue #23). A lease it
 //!   leaves out that was lost to a restart past its farm reruns answers the
 //!   operation's callers;

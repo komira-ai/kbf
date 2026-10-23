@@ -24,11 +24,28 @@
 //!   running is not refused. A refusal that finds its own result in the store is a
 //!   duplicate too.
 //!
+//! The memory floors a lease given up raises are written with it, each at the version read
+//! of its row and with the larger ask of the row and its own: a frontend whose kills raised
+//! a floor less far than another's never lowers it, and one that finds the row changed
+//! between its read and its write loses, and writes the give-up again from the row as it
+//! stands.
+//!
 //! A write the store applied and did not acknowledge is tried again, and finds its own work
 //! in the rows: the lease row of the grant, no lease row to give up, the result.
+//!
+//! A result and a refusal also put the `doneof/` row of the operation beside its `done/` row,
+//! from the request its `op/` row holds (the `named` module), so the transaction that
+//! removes the operation's rows leaves the instance and action a client can ask for it by.
+//!
+//! A grant, a lease given up and a result that finds its lease row also check the `owner/`
+//! row of the lease's node (the `owner` module): the transaction fails, whatever else it
+//! read, if the daemon has said `Hello` to another frontend since this one did. The grant
+//! puts the operation's `lease-by-op/` row beside the lease row (the `leases` module), and
+//! the lease given up, like every ending, deletes it.
 
 use kbf_types::StartLease;
 
+use super::leases::lease_by_op_row;
 use super::*;
 
 impl Durable {
@@ -39,8 +56,11 @@ impl Durable {
     ///
     /// # Errors
     /// [`StateError::Missing`] if the operation is not queued and holds no such lease,
-    /// [`StateError::Conflict`] if its rows changed under the write.
+    /// [`StateError::Conflict`] if its rows changed under the write,
+    /// [`StateError::StaleOwner`] if the worker is another frontend's.
     pub(super) fn granted(&self, start: &StartLease) -> Result<(), StateError> {
+        // First: a node another frontend owns is granted nothing, whatever the rows say.
+        let txn = self.guard(Txn::new(), &start.worker)?;
         let queued = queue_key(start.operation);
         let grant = LeaseGrant {
             lease: start.lease,
@@ -51,11 +71,13 @@ impl Durable {
             return self.granted_before(&grant, queued);
         };
         let value = encode(FarmInput::Committed(ControlRecord::Lease(grant)))?;
-        self.commit(Txn::new().delete(queued, Cond::Version(row.version)).put(
-            lease_key(start.lease),
-            value,
-            Cond::Absent,
-        ))
+        let lease = lease_key(start.lease);
+        let index = lease_by_op_key(start.operation);
+        let txn = txn
+            .delete(queued, Cond::Version(row.version))
+            .put(lease, value, Cond::Absent)
+            .put(index, lease_by_op_row(start.lease), Cond::Any);
+        self.commit_owned(&start.worker, txn)
     }
 
     /// The grant of an operation that is not queued: written already if the lease row is
@@ -112,10 +134,13 @@ impl Durable {
         // before the write is taken.
         let raised = floors.raised.as_ref();
         if let Some(floor) = raised {
-            let row = floor::encode(floor).ok_or_else(|| {
+            // Another frontend may have raised the floor further: the row keeps the larger
+            // ask, and is written at the version read.
+            let (merged, cond) = self.merged_floor(floor)?;
+            let row = floor::encode(&merged).ok_or_else(|| {
                 corrupt(&floor::row_key(&floor.key), "a floor is too large to write")
             })?;
-            txn = txn.put(floor::row_key(&floor.key), row, Cond::Any);
+            txn = txn.put(floor::row_key(&floor.key), row, cond);
         }
         // A key forgotten and raised again since keeps its row.
         for key in floors
@@ -128,8 +153,9 @@ impl Durable {
         // The same for the key floor, in the same transaction.
         let key_raised = floors.key_raised.as_ref();
         if let Some(floor) = key_raised {
-            let value = self.key_floor_value(floor, summary)?;
-            txn = txn.put(floor::key_row(floor.key), value, Cond::Any);
+            let (merged, cond) = self.merged_key_floor(floor)?;
+            let value = self.key_floor_value(&merged, summary)?;
+            txn = txn.put(floor::key_row(floor.key), value, cond);
         }
         for key in floors
             .key_evicted
@@ -153,9 +179,21 @@ impl Durable {
                 Ok(())
             };
         };
+        // The lease is the node's owner's to give up. The floors are the farm's, and are
+        // written whoever owns the node: a give-up refused for the owner is not tried again.
+        txn = match self.guard(txn.clone(), &requeue.worker) {
+            Ok(guarded) => guarded,
+            Err(refused) => {
+                if floors_changed {
+                    self.commit(txn)?;
+                }
+                return Err(refused);
+            }
+        };
         txn = txn
             .check(op, Cond::Version(unfinished.version))
-            .delete(lease, Cond::Version(held.version));
+            .delete(lease, Cond::Version(held.version))
+            .delete(lease_by_op_key(requeue.operation), Cond::Any);
         if let Some(count) = losses {
             let key = loss_key(requeue.operation);
             let cond = self.current(&key)?;
@@ -170,14 +208,47 @@ impl Durable {
             txn = txn.put(key, row, cond);
         }
         let queue = queue_key(requeue.operation);
-        self.commit(txn.put(queue, Vec::new(), Cond::Absent))
+        let txn = txn.put(queue, Vec::new(), Cond::Absent);
+        self.commit_owned(&requeue.worker, txn)
     }
 
     /// What a write that replaces the row at `key` must find: the version it has now, or
     /// no row.
-    fn current(&self, key: &str) -> Result<Cond, StateError> {
+    pub(super) fn current(&self, key: &str) -> Result<Cond, StateError> {
         let row = self.store.get(key)?;
         Ok(row.map_or(Cond::Absent, |row| Cond::Version(row.version)))
+    }
+
+    /// `floor` with the larger ask of its own and the stored row's, and what a write of the
+    /// row must find: the version read, or no row. A row that cannot be read counts for
+    /// nothing, and is written over.
+    fn merged_floor(&self, floor: &Floor) -> Result<(Floor, Cond), StateError> {
+        let row = self.store.get(&floor::row_key(&floor.key))?;
+        let held = row
+            .as_ref()
+            .and_then(|row| floor::decode(&row.value).ok())
+            .map_or(0, |held| held.ask);
+        let cond = row.map_or(Cond::Absent, |row| Cond::Version(row.version));
+        let merged = Floor {
+            ask: held.max(floor.ask),
+            ..floor.clone()
+        };
+        Ok((merged, cond))
+    }
+
+    /// [`Durable::merged_floor`] for a key floor.
+    fn merged_key_floor(&self, floor: &KeyFloor) -> Result<(KeyFloor, Cond), StateError> {
+        let row = self.store.get(&floor::key_row(floor.key))?;
+        let held = row
+            .as_ref()
+            .and_then(|row| floor::decode_key(&row.value).ok())
+            .map_or(0, |(held, _)| held.ask);
+        let cond = row.map_or(Cond::Absent, |row| Cond::Version(row.version));
+        let merged = KeyFloor {
+            ask: held.max(floor.ask),
+            ..floor.clone()
+        };
+        Ok((merged, cond))
     }
 
     /// A result accepted from `lease`: the operation is finished. The lease row goes if
@@ -205,9 +276,13 @@ impl Durable {
         let Some(row) = self.store.get(&key)? else {
             return self.end_queued(operation, ending, &key, |_| true);
         };
-        let txn = Txn::new().delete(key.clone(), Cond::Version(row.version));
+        // The result of a lease is taken by the owner of the node that holds it.
+        let worker = lease_row(&key, &row)?.worker;
+        let txn = self.guard(Txn::new(), &worker)?;
+        let txn = txn.delete(key.clone(), Cond::Version(row.version));
         let txn = self.unpin(txn, operation)?;
-        let committed = self.commit(ending.settle(txn, operation));
+        let txn = self.noting(txn, operation, ending)?;
+        let committed = self.commit_owned(&worker, ending.settle(txn, operation));
         if matches!(committed, Err(StateError::Conflict(_))) && self.store.get(&key)?.is_none() {
             return self.end_queued(operation, ending, &key, |_| true);
         }
@@ -251,6 +326,7 @@ impl Durable {
                 .delete(queue, Cond::Version(queued.version))
                 .delete(op, Cond::Version(unfinished.version));
             let txn = self.unpin(txn, operation)?;
+            let txn = self.noting(txn, operation, ending)?;
             let committed = self.commit(ending.settle_rest(txn, operation, Cond::Absent));
             if !matches!(committed, Err(StateError::Conflict(_))) {
                 return committed;

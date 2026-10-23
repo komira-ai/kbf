@@ -134,7 +134,8 @@ impl Authorizer for InstanceNamePrefixAuthorizer {
 /// - `cas_find_missing`: FindMissingBlobs.
 /// - `ac_get`: GetActionResult. UpdateActionResult has no authorizer: clients never
 ///   write the action cache, whatever the policy.
-/// - `execute`: Execute, and WaitExecution against the operation's instance name.
+/// - `execute`: Execute, and WaitExecution and GetOperation against the operation's
+///   instance name.
 pub struct Authorizers {
     /// GetCapabilities.
     pub capabilities: Arc<dyn Authorizer>,

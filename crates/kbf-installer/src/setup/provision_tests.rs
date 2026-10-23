@@ -174,7 +174,7 @@ fn setup_on(
     options: Options,
 ) -> (FakeExec, Result<String, SetupError>) {
     let mut exec = exec_on(world);
-    let out = go_on(&linux(), &mut exec, &Unwired, server, r, options);
+    let out = go_on(&linux(), &mut exec, server, r, options);
     (exec, out)
 }
 
@@ -575,14 +575,7 @@ fn a_server_that_cannot_be_asked_is_refused_in_setups_words() {
             Ok(reply(0, "", ""))
         }
     });
-    let out = go_on(
-        &linux(),
-        &mut exec,
-        &Unwired,
-        &Server::fresh(),
-        &flags(),
-        APPLY,
-    );
+    let out = go_on(&linux(), &mut exec, &Server::fresh(), &flags(), APPLY);
     let text = refusal(out);
     assert!(
         text.contains("could not run /usr/bin/psql (entity not found)"),
@@ -593,7 +586,6 @@ fn a_server_that_cannot_be_asked_is_refused_in_setups_words() {
     let out = go_on(
         &FakeOs::linux(),
         &mut exec,
-        &Unwired,
         &Server::fresh(),
         &flags(),
         APPLY,
@@ -624,14 +616,7 @@ fn a_psql_killed_by_a_signal_is_refused_with_no_exit_code() {
             stderr: b"secretrole secretdb /run/secretsock".to_vec(),
         })
     });
-    let out = go_on(
-        &linux(),
-        &mut exec,
-        &Unwired,
-        &Server::fresh(),
-        &flags(),
-        APPLY,
-    );
+    let out = go_on(&linux(), &mut exec, &Server::fresh(), &flags(), APPLY);
     let text = refusal(out);
     assert!(text.contains("(exit status none)"), "{text}");
     assert!(
@@ -649,14 +634,8 @@ fn the_flag_is_for_linux() {
     let mut exec = released(host(), Platform::MacOs);
     let w = Rc::clone(&world);
     exec.answer = Box::new(move |cmd| psql_answer(&w, cmd));
-    let out = go_on(
-        &FakeOs::mac(),
-        &mut exec,
-        &Unwired,
-        &Server::fresh(),
-        &flags(),
-        APPLY,
-    );
+    let os = FakeOs::mac();
+    let out = go_on(&os, &mut exec, &Server::fresh(), &flags(), APPLY);
     let err = out.expect_err("refused");
     assert_eq!(err.exit(), Exit::Usage, "{err}");
     assert!(world.borrow().ran.is_empty());
@@ -1071,10 +1050,7 @@ fn a_closed_output_stops_setup_at_each_database_line() {
         let world = Shared::default();
         let mut exec = exec_on(&world);
         let server = Server::fresh();
-        let backend = Backend {
-            releases: &Unwired,
-            schemas: &server,
-        };
+        let backend = Backend { schemas: &server };
         let result = run(
             &linux(),
             &mut exec,

@@ -28,13 +28,19 @@
 //!   modes (one list, [`pkg_linux::files`]), in a tarball that is the same bytes on every
 //!   runner, for `packaging/install.sh`.
 //! - `pkg-config`, `pkg-build`, `pkg-install-test` ([`pkg_linux`], [`pkg_install`]): the
-//!   `kbf-installer` deb and rpm: the nfpm configuration from the inputs, the packages
-//!   built twice to prove the bytes, and an install, remove and purge in a container.
+//!   `kbf-installer` deb and rpm and the `kbf` deb and rpm (`/usr/bin/kbf` and the units of
+//!   the modes): the nfpm configuration of both from the inputs, a package built twice to
+//!   prove the bytes, and, for `kbf-installer`, an install, remove and purge in a container.
 //! - `pkg-trust` and `pkg-asset` ([`pkg_trust`], [`pkg_asset`]): the trust directory of the
 //!   package from the pinned `gh`, `gh`'s trusted root and the branch the package is
 //!   attested on, and the built deb as the release asset
 //!   `kbf-installer-<commit>-<platform>.deb`, refused unless it holds the binary of the
-//!   attested tarball and trusts the branch it is attested for.
+//!   attested tarball and trusts the branch it is attested for, and holds nothing of the
+//!   `kbf` package.
+//! - `pkg-kbf-asset` ([`pkg_kbf_asset`]): the `kbf` deb as the release asset
+//!   `kbf-<commit>-<platform>.deb`, refused unless its `/usr/bin/kbf` is the `kbf` of the
+//!   attested tarball, it depends on `kbf-installer` of its own version or later and replaces
+//!   `kbf-installer`, and it holds the units of the modes and nothing else.
 //! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf-installer` package
 //!   carries, in the one form a deb and an rpm put in the same order, and the most a package
 //!   that carries a kbf release may weigh. `pkg-config` and `pkg-asset` take them up with
@@ -98,6 +104,7 @@ pub mod package;
 pub mod pkg;
 pub mod pkg_asset;
 pub mod pkg_install;
+pub mod pkg_kbf_asset;
 pub mod pkg_linux;
 pub mod pkg_macos_asset;
 #[cfg(target_os = "macos")]
@@ -237,12 +244,17 @@ enum Verb {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Write the nfpm configuration and the file listing of the kbf-installer packages.
+    /// Write the nfpm configuration and the file listing of the kbf-installer packages, and of
+    /// the kbf packages in `<out>/kbf`.
     PkgConfig {
         /// The kbf-installer binary.
         #[arg(long)]
         binary: PathBuf,
-        /// The directory of `kbf-*.service` files.
+        /// The kbf binary the kbf packages carry at `/usr/bin/kbf` (mode 0755).
+        #[arg(long)]
+        kbf: PathBuf,
+        /// The directory of `kbf-*.service` files: the units of the modes go in the kbf
+        /// packages, the others in the kbf-installer packages.
         #[arg(long)]
         units: PathBuf,
         /// The directory of the three trust files.
@@ -267,7 +279,8 @@ enum Verb {
         /// Take the version from this binary's `--version` (`<version>+<12 of the commit>`).
         #[arg(long)]
         version_of: Option<PathBuf>,
-        /// The directory `nfpm.yaml` and `listing.txt` go in; created when missing.
+        /// The directory `nfpm.yaml` and `listing.txt` go in; created when missing. The kbf
+        /// package's pair goes in `<out>/kbf`.
         #[arg(long)]
         out: PathBuf,
     },
@@ -324,6 +337,34 @@ enum Verb {
         /// The pinned `gh` the deb's must be byte for byte (optional with --verify-only).
         #[arg(long)]
         gh: Option<PathBuf>,
+        /// The directory the asset and its line of `SHA256SUMS.<platform>` go in.
+        #[arg(
+            long,
+            required_unless_present = "verify_only",
+            conflicts_with = "verify_only"
+        )]
+        out: Option<PathBuf>,
+        /// Only check `--package`, which must be named as the asset; write nothing.
+        #[arg(long)]
+        verify_only: bool,
+    },
+    /// The kbf deb as a release asset, refused unless its `/usr/bin/kbf` is the attested
+    /// `kbf`, it depends on the kbf-installer of its own version or later and replaces it,
+    /// and it holds the units of the modes and nothing else.
+    PkgKbfAsset {
+        /// The deb nfpm built, or the directory holding the one (with `--verify-only`: the
+        /// asset itself).
+        #[arg(long)]
+        package: PathBuf,
+        /// The platform it was built for (`linux-x86_64`, `linux-arm64`).
+        #[arg(long, value_enum)]
+        platform: package::Platform,
+        /// The commit it was built from (`$GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// The `kbf-<commit>-<platform>.tar.gz` whose `kbf` the deb must hold.
+        #[arg(long)]
+        kbf_tarball: PathBuf,
         /// The directory the asset and its line of `SHA256SUMS.<platform>` go in.
         #[arg(
             long,
@@ -896,6 +937,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         ),
         Verb::PkgConfig {
             binary,
+            kbf,
             units,
             trust,
             sysusers,
@@ -914,6 +956,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             pkg_linux::write_config(
                 &pkg_linux::Inputs {
                     binary: &binary,
+                    kbf: &kbf,
                     units: &units,
                     trust: &trust,
                     sysusers: &sysusers,
@@ -965,6 +1008,25 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 binary_tarball: &binary_tarball,
                 expect_ref: &expect_ref,
                 gh: gh.as_deref(),
+            },
+        ),
+        Verb::PkgKbfAsset {
+            package,
+            platform,
+            commit,
+            kbf_tarball,
+            out,
+            verify_only,
+        } => pkg_kbf_asset::asset(
+            &pkg_asset::sole(&package, "deb")?,
+            &commit,
+            &match (&out, verify_only) {
+                (Some(out), false) => pkg_asset::Mode::Add(out),
+                _ => pkg_asset::Mode::VerifyOnly,
+            },
+            &pkg_kbf_asset::Check {
+                platform,
+                kbf_tarball: &kbf_tarball,
             },
         ),
         Verb::PkgMacosAsset {

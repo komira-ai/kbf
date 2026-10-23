@@ -1319,6 +1319,8 @@ impl<'a> Prepared<'a> {
                     farm.tick().await;
                 }
             };
+            // What the other frontends of a shared state store did (`Farm::intake`).
+            let intaking = farm.poll_intake();
             let stopping = async {
                 shutdown.await;
                 drain_and_stop(&stopper, listeners.shutdown_timeout).await;
@@ -1337,6 +1339,7 @@ impl<'a> Prepared<'a> {
                 Err(e) = &mut api_serve => Err(ServeError::Api(e)),
                 Err(e) = &mut enroll_serve => Err(ServeError::from(e)),
                 () = ticking => Ok(()),
+                () = intaking => Ok(()),
                 () = ticker.run() => Ok(()),
                 () = stopping => Ok(()),
                 Ok(departure) = departed => departure.map_err(ServeError::Handover),

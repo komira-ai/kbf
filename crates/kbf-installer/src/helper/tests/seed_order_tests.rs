@@ -28,7 +28,7 @@ fn staged(rig: &Rig, id: u64, verb: Verb, commit: &str) -> OrderRecord {
 /// has changed.
 fn seeded_node(name: &str, plant: impl FnOnce(&mut Seeded)) -> (Rig, Seeded) {
     let mut rig = Rig::new(name);
-    let mut seeded = Seeded::on(rig.layout.clone(), rig.root.clone(), B);
+    let mut seeded = Seeded::on(rig.layout.clone(), B);
     plant(&mut seeded);
     rig.helper.set_fetcher(Box::new(seeded.fetcher()));
     (rig, seeded)
@@ -81,7 +81,7 @@ fn a_staged_activation_installs_the_seed_and_swaps_to_it_on_trial() {
 #[test]
 fn an_order_that_fetches_on_a_bundled_host_is_denied_before_any_child_and_moves_the_floor() {
     let mut rig = Rig::new("seedcyc-bundled-fetch");
-    let seeded = Seeded::on(rig.layout.clone(), rig.root.clone(), B);
+    let seeded = Seeded::on(rig.layout.clone(), B);
     rig.helper
         .set_fetcher(Box::new(seeded.host_fetcher(BUNDLED)));
     rig.order(5, Verb::Activate, B);
@@ -106,7 +106,7 @@ fn an_order_that_fetches_on_a_bundled_host_is_denied_before_any_child_and_moves_
 #[test]
 fn a_frontend_update_that_fetches_on_a_bundled_host_is_denied_and_stages_nothing() {
     let mut rig = Rig::frontend("seedcyc-bundled-update");
-    let seeded = Seeded::on(rig.layout.clone(), rig.root.clone(), B);
+    let seeded = Seeded::on(rig.layout.clone(), B);
     rig.helper
         .set_fetcher(Box::new(seeded.host_fetcher(BUNDLED)));
     rig.order(9, Verb::FrontendUpdate, B);
@@ -291,7 +291,7 @@ fn a_staged_order_is_refused_when_the_package_or_the_floor_cannot_be_read() {
     assert_eq!(rig.fetcher.count(), 0);
 
     let mut rig = Rig::new("seedcyc-bad-floor");
-    let seeded = Seeded::on(rig.layout.clone(), rig.root.clone(), B);
+    let seeded = Seeded::on(rig.layout.clone(), B);
     *rig.fetcher.seed.lock().expect("lock") = Some(SeedFacts {
         commit: c(B),
         seq: SEQ,
@@ -331,7 +331,7 @@ fn a_repeated_staged_order_for_the_running_commit_is_idempotent_not_refused() {
     assert_eq!(rig.current(), Some(c(B)), "{}", rig.refusal());
     assert!(rig.state().pending_confirm.is_none());
 
-    let seeded = Seeded::on(rig.layout.clone(), rig.root.clone(), B);
+    let seeded = Seeded::on(rig.layout.clone(), B);
     seeded.set_floor(SEQ);
     *rig.fetcher.seed.lock().expect("lock") = Some(SeedFacts {
         commit: c(B),
@@ -373,7 +373,7 @@ fn a_seed_the_pipeline_refuses_is_not_activated_or_staged() {
     assert!(!seeded.installed());
 
     let mut rig = Rig::frontend("seedcyc-unattested-frontend");
-    let mut seeded = Seeded::on(rig.layout.clone(), rig.root.clone(), B);
+    let mut seeded = Seeded::on(rig.layout.clone(), B);
     unattested(&mut seeded);
     seeded.set_floor(SEQ - 1);
     rig.helper.set_fetcher(Box::new(seeded.fetcher()));
@@ -396,7 +396,7 @@ fn a_seed_the_pipeline_refuses_is_not_activated_or_staged() {
 #[test]
 fn a_staged_frontend_update_stages_the_seed_without_flipping() {
     let mut rig = Rig::frontend("seedcyc-frontend");
-    let seeded = Seeded::on(rig.layout.clone(), rig.root.clone(), B);
+    let seeded = Seeded::on(rig.layout.clone(), B);
     seeded.set_floor(SEQ - 1);
     rig.helper.set_fetcher(Box::new(seeded.fetcher()));
     rig.put(&staged(&rig, 9, Verb::FrontendUpdate, B));
@@ -423,7 +423,7 @@ fn a_staged_frontend_update_meets_the_same_rules() {
     let cases = [(C, SEQ - 1, "seed_mismatch"), (B, SEQ, below.as_str())];
     for (index, (commit, floor, want)) in cases.into_iter().enumerate() {
         let mut rig = Rig::frontend(&format!("seedcyc-frontend-refused-{index}"));
-        let seeded = Seeded::on(rig.layout.clone(), rig.root.clone(), B);
+        let seeded = Seeded::on(rig.layout.clone(), B);
         seeded.set_floor(floor);
         rig.helper.set_fetcher(Box::new(seeded.fetcher()));
         rig.put(&staged(&rig, 9, Verb::FrontendUpdate, commit));
@@ -440,7 +440,7 @@ fn a_staged_frontend_update_meets_the_same_rules() {
 /// facts the fake's releases declare.
 fn packaged_node(name: &str) -> Rig {
     let rig = Rig::new(name);
-    Seeded::on(rig.layout.clone(), rig.root.clone(), B).set_floor(SEQ - 1);
+    Seeded::on(rig.layout.clone(), B).set_floor(SEQ - 1);
     *rig.fetcher.seed.lock().expect("lock") = Some(SeedFacts {
         commit: c(B),
         seq: SEQ,

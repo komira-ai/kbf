@@ -4,7 +4,8 @@ use std::path::Path;
 
 use kbf_caps::{
     Consumable, CpuCaps, NodeCaps, ParseError, PciFunction, Request, RequestError, Unmet,
-    gpus_from_linux_pci, gpus_from_macos_sysctl,
+    gpu_cores_from_macos_ioreg, gpus_from_linux_pci, gpus_from_macos_sysctl,
+    metal_family_of_apple_chip,
 };
 
 /// `(class, vendor)` file text of every PCI function under `fixtures/pci/<node>`, as
@@ -97,6 +98,71 @@ fn an_apple_silicon_mac_has_one_gpu() {
     );
 }
 
+/// Catches: a Mac's GPU core count read from the wrong line (the `model` or
+/// `IOClass` line, the first number in the text), a count that is not a whole number
+/// or is zero taken as the cores, and text with no such line (a guest's paravirtual GPU,
+/// a Mac whose `ioreg` printed nothing) given a count instead of none; and a count
+/// missed because the registry's tree art (`| `) stands before the property, or taken from
+/// inside a dictionary value.
+#[test]
+fn a_macs_gpu_core_count_is_the_registry_line() {
+    let ioreg = include_str!("fixtures/apple_m3_ultra.ioreg");
+    assert_eq!(gpu_cores_from_macos_ioreg(ioreg), Some(80));
+    for text in [
+        "",
+        "+-o AGXAcceleratorG15X\n  \"model\" = 80\n",
+        "\"gpu-core-count\" = many\n",
+        "\"gpu-core-count\" = 0\n",
+        "\"gpu-core-count\"\n",
+        "\"gpu-core-count-extra\" = 7\n",
+    ] {
+        assert_eq!(gpu_cores_from_macos_ioreg(text), None, "{text:?}");
+    }
+    // Property lines under tree art, and a count nested in another node's dict.
+    let tree = "+-o AGXAcceleratorG15X  <class AGXAcceleratorG15X>\n  | {\n  |   \"model\" = \"Apple M3 Ultra\"\n  |   \"gpu-core-count\" = 80\n  | | \"x\" = 1\n  | }\n";
+    assert_eq!(gpu_cores_from_macos_ioreg(tree), Some(80));
+    let deep = "  | | | \"gpu-core-count\" = 60\n";
+    assert_eq!(gpu_cores_from_macos_ioreg(deep), Some(60));
+    let nested = "  \"IOKitDiagnostics\" = {\"gpu-core-count\"=7}\n";
+    assert_eq!(
+        gpu_cores_from_macos_ioreg(nested),
+        None,
+        "inside a dict, not a property"
+    );
+    let two = "\"gpu-core-count\" = 10\n\"gpu-core-count\" = 40\n";
+    assert_eq!(gpu_cores_from_macos_ioreg(two), Some(10), "the first");
+}
+
+/// Catches: a Metal family taken from the wrong chip generation (M3 and M4 are both
+/// family 9, so a table keyed on the digit alone gets one wrong), the tier suffix
+/// (`Pro`, `Ultra`) changing the answer, and a name that is not an Apple chip, or a
+/// generation not in the table, given a family: the node reports none, never a guess.
+#[test]
+fn a_chips_metal_family_follows_its_generation() {
+    for (brand, family) in [
+        ("Apple M1", 7),
+        ("Apple M1 Max", 7),
+        ("Apple M2 Pro", 8),
+        ("Apple M3 Ultra", 9),
+        ("Apple M4", 9),
+    ] {
+        assert_eq!(metal_family_of_apple_chip(brand), Some(family), "{brand}");
+    }
+    for brand in [
+        "",
+        "Apple M",
+        "Apple M0",
+        "Apple M5 Max",
+        "Apple M6",
+        "Apple M12",
+        "Intel(R) Xeon(R)",
+        "Apple A17 Pro",
+        "Apple Mx",
+    ] {
+        assert_eq!(metal_family_of_apple_chip(brand), None, "{brand:?}");
+    }
+}
+
 fn node(gpus: u64) -> NodeCaps {
     let cpu = include_str!("fixtures/skylake_sp_platinum_8180.cpuinfo");
     let mut n = NodeCaps::new(CpuCaps::from_linux_cpuinfo(cpu).unwrap());
@@ -144,4 +210,51 @@ fn gpu_takes_one_count() {
         err(&[("gpu", "1"), ("gpu", "1")]),
         RequestError::Repeated("gpu".to_owned())
     );
+}
+
+/// Catches: `gpu.kind` unknown to the matcher (a request for it refused, or ignored so a
+/// Linux node with a GPU serves a request for a native one), matched as a minimum, and a
+/// node that does not report it (a Linux GPU node, a guest) taken for a native one. A Mac
+/// reports `gpu.cores` and `gpu.metal_family` too; the report is read without them
+/// failing, and a request cannot name them yet.
+#[test]
+fn gpu_kind_is_an_exact_key_only_a_native_gpu_reports() {
+    let read = |extra: &[(&'static str, &'static str)]| {
+        let mut entries = vec![("arch", "arm64"), ("os", "macos"), ("gpu", "1")];
+        entries.extend_from_slice(extra);
+        NodeCaps::from_report(entries).expect("a report")
+    };
+    let mac = read(&[
+        ("gpu.kind", "native"),
+        ("gpu.cores", "80"),
+        ("gpu.metal_family", "9"),
+    ]);
+    assert_eq!(
+        mac.exact.get("gpu.kind").map(String::as_str),
+        Some("native")
+    );
+    let native = Request::parse([("gpu.kind", "native")]).expect("a known key");
+    assert!(native.matches(&mac));
+    assert!(!native.matches(&read(&[])), "no gpu.kind reported");
+    assert!(!native.matches(&read(&[("gpu.kind", "virtual")])));
+    assert_eq!(
+        native
+            .unmet(&read(&[]))
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["gpu.kind=native"]
+    );
+    for key in ["gpu.cores", "gpu.metal_family"] {
+        assert_eq!(
+            Request::parse([(key, "1")]),
+            Err(RequestError::UnknownKey(key.to_owned()))
+        );
+    }
+    let twice = [
+        ("arch", "arm64"),
+        ("gpu.kind", "native"),
+        ("gpu.kind", "native"),
+    ];
+    assert!(NodeCaps::from_report(twice).is_err());
 }

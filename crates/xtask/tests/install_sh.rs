@@ -36,8 +36,8 @@ const SCRIPT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../packaging/insta
 /// Where the package puts things, and so the payload.
 const PAYLOAD: [&str; 10] = [
     "usr/bin/kbf-installer",
-    "usr/lib/systemd/system/kbf-frontend.service",
     "usr/lib/systemd/system/kbf-installer.service",
+    "usr/lib/systemd/system/kbf-proxy.service",
     "usr/lib/systemd/system/kbf.slice",
     "usr/lib/sysusers.d/kbf-installer.conf",
     "usr/lib/tmpfiles.d/kbf-installer.conf",
@@ -97,7 +97,7 @@ fn release() -> &'static Release {
         std::fs::create_dir_all(&trust).expect("trust");
         for (d, name) in [
             (&units, "kbf-installer.service"),
-            (&units, "kbf-frontend.service"),
+            (&units, "kbf-proxy.service"),
             (&units, "kbf.slice"),
             (&trust, "gh"),
             (&trust, "installer.conf"),
@@ -438,7 +438,7 @@ fn the_host_payload_is_placed_where_the_package_puts_it_and_nothing_else() {
         std::fs::read(installer_binary()).expect("stub"),
     );
     assert_eq!(
-        std::fs::read_to_string(r.root.join(PAYLOAD[2])).expect("unit"),
+        std::fs::read_to_string(r.root.join(PAYLOAD[1])).expect("unit"),
         "stub kbf-installer.service\n"
     );
     assert!(

@@ -27,6 +27,8 @@ pub enum TrustError {
     Io(#[from] io::Error),
     #[error("not a regular file")]
     NotRegular,
+    #[error("not a directory")]
+    NotDirectory,
     #[error("not owned by the trusted user")]
     NotOwned,
     #[error("writable by its group or by others")]
@@ -54,6 +56,15 @@ impl Trust {
         Self {
             uid: 0,
             anchor: PathBuf::from("/"),
+        }
+    }
+
+    /// Root's files, trusting the directories above a path only up to `anchor` (the last
+    /// one checked): a tree such as `/usr/local/kbf` that must be root's from its top down.
+    pub fn root_below(anchor: &Path) -> Self {
+        Self {
+            uid: 0,
+            anchor: anchor.to_path_buf(),
         }
     }
 
@@ -119,6 +130,26 @@ impl Trust {
     /// [`TrustError`] for a file that is missing or not trusted.
     pub fn check_file(&self, path: &Path) -> Result<(), TrustError> {
         self.check_meta(&fs::metadata(path)?)?;
+        self.check_parents(path)
+    }
+
+    /// Check the directory at `path`, following a symbolic link to its target: it and every
+    /// directory above it must be owned by the trusted user and closed to its group and
+    /// to others.
+    ///
+    /// # Errors
+    /// [`TrustError`] for a directory that is missing or not trusted.
+    pub fn check_dir(&self, path: &Path) -> Result<(), TrustError> {
+        let meta = fs::metadata(path)?;
+        if !meta.is_dir() {
+            return Err(TrustError::NotDirectory);
+        }
+        if !self.owns(&meta) {
+            return Err(TrustError::NotOwned);
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(TrustError::Writable);
+        }
         self.check_parents(path)
     }
 

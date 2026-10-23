@@ -617,35 +617,35 @@ Crash and conflict points in the flusher:
 ### 6.5 Log format
 
 `PutStaged`, `SealStaged`, `ObjectFlushed`, `FlushConflict` and `AddTier` are new
-`kbf-log` command variants (built), `MetaCommand` fields 10 to 14, and they make **log
-format 2** (`kbf_log::Format::V2`), as `log.proto` requires of any added command. From this
-build on, a binary built before the commands existed skips them: an unset command decodes
-as `LogCommand::Unknown` (`kbf-log/src/meta.rs`), the Raft machine counts it and goes on
+`kbf-log` command variants (built), `MetaCommand` fields 10 to 14, which made **log
+format 2** (`kbf_log::Format::V2`). Formats change additively now, and a format gates no
+command: encode writes them, and decode reads them, under every format, and no build raises
+a log to use them (`kbf-log/tests/tier_codec.rs`). A binary built before the commands
+existed skips them: an unset command decodes as `LogCommand::Unknown`
+(`kbf-log/src/meta.rs`), the Raft machine counts it and goes on
 (`kbf-server/src/raft_log/machine.rs`), and the log opens. A shipped build from before
 skipping still refuses them: the machine stops on the entry and opening the log returns
-`RaftLogError::Decode`. In this binary encode refuses them under format 1 and decode reads
-them under every format; from this build on, a binary that runs only version 1 skips the
-raise entry and applies the tier commands after it. A Raft log enters
-format 2 by one committed `MachineVersion` entry naming machine version 2
-(`kbf_log::MachineVersion::V2`, whose format is `Format::V2`), which
-`RaftMetaLog::raise_machine_version` commits (rollout stage 5, section 6.8); every later
-entry is encoded as format 2, and a binary of this build on that runs only version 1 skips
-that entry and stays at version 1, where a shipped build refuses the log at that entry.
-Tests in `kbf-log/tests/tier_codec.rs` and `kbf-server/tests/raft_log_unknown.rs` pin both.
-The snapshot
+`RaftLogError::Decode`. An earlier build entered format 2 by one committed `MachineVersion`
+entry naming machine version 2 (`kbf_log::MachineVersion::V2`, whose format is
+`Format::V2`), which `RaftMetaLog::raise_machine_version` committed (rollout stage 5,
+section 6.8). A log that holds such an entry is replayed as it was: the machine version
+moves, nothing else depends on it, and a binary that runs only version 1 skips the entry
+and stays at version 1. This build writes no such entry, so its logs stay at version 1
+(`raise_machine_version` remains for the tests, which build the logs earlier builds left).
+Tests in `kbf-log/tests/tier_codec.rs`, `kbf-server/tests/write_tier_raft.rs` and
+`kbf-server/tests/raft_log_unknown.rs` pin both. The snapshot
 encoding ([metadata-snapshots.md](metadata-snapshots.md)), not built yet, gains the
 staged table, the tier registry and the record of objects that left.
 
-`ReseatStaged` (`MetaCommand` field 20) makes **log format 5** (`Format::V5`,
-`MachineVersion::V5`) the same way: from this build on, a binary that runs only version 4
-skips the raise to 5
-(`kbf-server/tests/write_tier_raft.rs` opens one as version 4 and counts one skipped
-entry), and a format-4 log refuses the command on encode, while decode reads it under
-every format (`kbf-log/tests/reseat_codec.rs`). A server or storage node raises its log to
-version 5 when its write tier attaches. A build from this one on that predates the command
-skips it, so its staged table differs from that of a build that applies it; a shipped
-build from before skipping refuses the raised log (a rollback of one node's binary needs
-its log restored; nodes' logs are separate, so nodes on either version run side by side).
+`ReseatStaged` (`MetaCommand` field 20) was **log format 5** (`Format::V5`,
+`MachineVersion::V5`) and is written the same way, to a log of any format
+(`kbf-log/tests/reseat_codec.rs`): a server or storage node does not raise its log when its
+write tier attaches (`kbf-server/tests/write_tier_raft.rs` opens such a log as version 4
+and counts no skipped entry, and one an earlier build raised to 5 as version 4 and counts
+one). A build that predates the command skips it, so its staged table differs from that
+of a build that applies it; a build from before skipping refuses the log at the entry (a
+rollback of one node's binary may need its log restored; nodes' logs are separate, so
+nodes on either version run side by side).
 
 ### 6.6 A server and a daemon on one host
 
@@ -717,18 +717,18 @@ Where it differs from the sections above, and why:
 [write-tier-scenarios.md](write-tier-scenarios.md) that stage 4b makes testable
 (section 4 of that file lists each test and the planted defect it caught).
 
-- **The format raise.** A log is raised by one `MachineVersion` entry: machine version
-  2 implies format 2 (the entry carries the version alone; metadata-snapshots.md
-  section 4 left the choice open). `RaftMetaLog::raise_machine_version(V2)` commits
-  it if the log is below 2 and commits nothing otherwise; the metadata machine replays
-  it on every start, so the format comes from the log, never from the process. A new
-  log stays at version 1 until something raises it: a server that never attaches a
-  tier writes a log an older binary still reads. `RaftMetaLog::open_running(.., runs)`
-  opens as a binary that runs versions up to `runs` would; the server runs
-  `raft_log::RUNS` (version 3 since `EvictObjects`, [storage.md](storage.md)). A
-  version past `runs`, committed or asked for, is refused.
+- **The format raise** (as built at this stage; no build raises a log any more, section
+  6.5). A log was raised by one `MachineVersion` entry: machine version 2 implies format 2
+  (the entry carries the version alone; metadata-snapshots.md section 4 left the choice
+  open). `RaftMetaLog::raise_machine_version(V2)` commits it if the log is below 2 and
+  commits nothing otherwise; the metadata machine replays it on every start, so the format
+  comes from the log, never from the process. A new log stays at version 1.
+  `RaftMetaLog::open_running(.., runs)` opens as a binary that runs versions up to `runs`
+  would; the server runs `raft_log::RUNS` (frozen at 5: it gates nothing new, and says
+  only which raise entries an earlier build left are applied). A version past `runs`,
+  committed or asked for, is refused.
 - **The cell's server attaches the tier at each start** as `Cache::attach_tier` does,
-  after the raise, and stages, flushes and reads as `cache/tier.rs` and
+  with no raise, and stages, flushes and reads as `cache/tier.rs` and
   `cache/flush.rs` do, over `kbf-tier`'s `Tier` on a second `FaultFs` that a crash
   takes down with the raft disk. The cell drives `kbf-tier`, `kbf-meta` and
   `RaftMetaLog` themselves; the order of steps in `kbf-front`'s cache (sync before
@@ -738,15 +738,13 @@ Where it differs from the sections above, and why:
 
 ### 6.9 As built (the tier over the Raft log in `kbf-server`)
 
-- **The raise at the tier's start.** `kbf_server::write_tier::attach` asks the log to
-  ready itself and the directory for the tier (`TierLog::ready_for_tier`) before
-  `Cache::attach_tier`, and only when `--hot-store` is given. The Raft log raises
-  itself to machine version 2 (`RaftMetaLog::raise_machine_version`, which commits
-  nothing on a log already there); the memory log has nothing to raise and clears the
-  directory instead. A raft server without a tier never
-  raises its log, so an older binary can still read it; once raised, a binary that
-  runs only version 1 skips the raise from this build on, and refuses the log before it
-  (section 6.5).
+- **No raise at the tier's start.** `kbf_server::write_tier::attach` calls
+  `Cache::attach_tier` when `--hot-store` is given, and nothing before it: the Raft log
+  is not raised (the tier's commands commit to it as it is, at any machine version), so a
+  raft server with or without a tier writes a log that a binary that runs only version 1
+  opens, skipping nothing (section 6.5). The memory log clears the directory instead.
+  An earlier build raised the log to machine version 2 here
+  (`TierLog::ready_for_tier`); a log that build left is attached as it stands.
 - **No clearing under the Raft log.** The tier's directory is recovered against the
   committed staged table at each start (section 6.4); only the memory log, whose index
   starts empty, clears it (section 6.7).
@@ -757,8 +755,9 @@ Where it differs from the sections above, and why:
   error. If the state cannot be read either, the range is answered as failed, as
   before; that cannot happen with the single-voter Raft log, whose queries read the
   state it has applied even after it stopped.
-- Tests: `kbf-server/tests/write_tier_raft.rs` (the raise once, none without a tier,
-  staged, sealed and flushed objects across a restart), the tier over each log in
+- Tests: `kbf-server/tests/write_tier_raft.rs` (tier commands with no raise entry, a log
+  an earlier build raised, none without a tier, staged, sealed and flushed objects across
+  a restart), the tier over each log in
   `kbf-server/tests/binary.rs`, and
   `kbf-front/tests/write_tier_flush.rs::a_put_staged_that_applied_but_lost_its_answer_is_read_and_flushed`.
 

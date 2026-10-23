@@ -1,7 +1,7 @@
 //! What an invocation did, as the one JSON line on stdout and the exit status.
 //!
 //! Every line has a `result` (`installed`, `already_installed`, `query`, `refused` or
-//! `failed`).
+//! `failed`; a Mac also answers `apply_started`).
 //!
 //! Exit 0: done (installed, already installed, or a query answered). Exit 2: refused, and
 //! nothing ran. Exit 3: failed after a step started (or the audit log could not be
@@ -31,11 +31,19 @@ pub enum Refusal {
     /// The source switches signature checking off or weakens it (`trusted`,
     /// `allow-insecure`, `allow-weak`, `allow-downgrade-to-insecure`), even if it names a key.
     ChannelInsecure,
+    /// A Mac's `github` channel: no release asset of the repository starts with the version's
+    /// 12 hex digits.
+    UnknownRelease,
+    /// A Mac's `github` channel: the assets of two different commits start with them.
+    AmbiguousRelease,
+    /// A Mac's `github` channel: the release could not be fetched (the network, a time limit,
+    /// a file over its size limit, an answer that is not a listing). Nothing was staged.
+    FetchFailed,
 }
 
 impl Refusal {
     /// Every refusal.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 10] = [
         Self::BadCommand,
         Self::ChannelNotAllowed,
         Self::ConfigInvalid,
@@ -43,6 +51,9 @@ impl Refusal {
         Self::ChannelUnsigned,
         Self::KeyUntrusted,
         Self::ChannelInsecure,
+        Self::UnknownRelease,
+        Self::AmbiguousRelease,
+        Self::FetchFailed,
     ];
 
     /// The refusal whose closed code this is.
@@ -60,6 +71,9 @@ impl Refusal {
             Self::ChannelUnsigned => "channel_unsigned",
             Self::KeyUntrusted => "key_untrusted",
             Self::ChannelInsecure => "channel_insecure",
+            Self::UnknownRelease => "unknown_release",
+            Self::AmbiguousRelease => "ambiguous_release",
+            Self::FetchFailed => "fetch_failed",
         }
     }
 }
@@ -148,6 +162,15 @@ pub enum Outcome {
     AlreadyInstalled { version: String },
     /// `query`.
     Queried(QueryReport),
+    /// A Mac's install is checked and its apply job is launched; the apply goes on by
+    /// itself and `query` reports how it ends. Only a Mac gives this answer.
+    ApplyStarted { version: String, commit: String },
+    /// A Mac's `query`: the same report, and how the last apply stands (`running`, `done`
+    /// or `failed:<reason>`; none when there has been none). Only a Mac gives this answer.
+    MacQueried {
+        report: QueryReport,
+        apply: Option<String>,
+    },
     /// Refused.
     Refused(Refusal),
     /// Failed.
@@ -158,7 +181,11 @@ impl Outcome {
     /// The exit status: 0, 2 or 3.
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::Installed { .. } | Self::AlreadyInstalled { .. } | Self::Queried(_) => 0,
+            Self::Installed { .. }
+            | Self::AlreadyInstalled { .. }
+            | Self::Queried(_)
+            | Self::ApplyStarted { .. }
+            | Self::MacQueried { .. } => 0,
             Self::Refused(_) => 2,
             Self::Failed(_) => 3,
         }
@@ -183,6 +210,22 @@ impl Outcome {
                 running_commit: report.running_commit.as_deref(),
                 node_id: report.node_id.as_deref(),
                 in_progress: report.in_progress,
+            }),
+            Self::ApplyStarted { version, commit } => to_json(&Started {
+                result: "apply_started",
+                version,
+                commit,
+                apply: "running",
+            }),
+            Self::MacQueried { report, apply } => to_json(&MacQueried {
+                query: Queried {
+                    result: "query",
+                    installed_version: report.installed_version.as_deref(),
+                    running_commit: report.running_commit.as_deref(),
+                    node_id: report.node_id.as_deref(),
+                    in_progress: report.in_progress,
+                },
+                apply: apply.as_deref(),
             }),
             Self::Refused(refusal) => to_json(&Reason {
                 result: "refused",
@@ -230,7 +273,8 @@ impl Outcome {
         match self {
             Self::Installed { .. } => ("installed", None),
             Self::AlreadyInstalled { .. } => ("already_installed", None),
-            Self::Queried(_) => ("query", None),
+            Self::Queried(_) | Self::MacQueried { .. } => ("query", None),
+            Self::ApplyStarted { .. } => ("apply_started", None),
             Self::Refused(refusal) => ("refused", Some(refusal.code())),
             Self::Failed(failure) => ("failed", Some(failure.code.code())),
         }
@@ -264,6 +308,21 @@ struct Queried<'a> {
     running_commit: Option<&'a str>,
     node_id: Option<&'a str>,
     in_progress: bool,
+}
+
+#[derive(Serialize)]
+struct MacQueried<'a> {
+    #[serde(flatten)]
+    query: Queried<'a>,
+    apply: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct Started<'a> {
+    result: &'static str,
+    version: &'a str,
+    commit: &'a str,
+    apply: &'static str,
 }
 
 /// A line an install unit printed, as `Outcome::from_unit_line` reads it.

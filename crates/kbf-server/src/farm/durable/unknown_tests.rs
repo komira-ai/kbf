@@ -163,6 +163,11 @@ fn a_request_joins_an_operation_past_an_unknown_lease_row() {
         matches!(queued, Ok(Submitted::Queued(OperationId(1)))),
         "{queued:?}"
     );
+    // A granted operation has left the queue: the lease is looked up only then.
+    store
+        .txn(Txn::new().delete(queue_key(OperationId(1)), Cond::Any))
+        .expect("the store answers")
+        .expect("the queue row goes");
     let record = FarmInput::Committed(ControlRecord::Lease(grant()));
     put(&store, LEASE_KNOWN, encode(record).expect("encode"));
     put(&store, LEASE_UNKNOWN, unknown());

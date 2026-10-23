@@ -117,7 +117,7 @@ pub trait Gate {
 }
 
 /// Forward, backward-compatible Postgres migrations. The kbf child never alters tables
-/// (CEO 14:58Z), so this runs before the candidate starts. The real one is
+///, so this runs before the candidate starts. The real one is
 /// [`crate::migrator::DbMigrator`].
 pub trait Migrator {
     /// Apply every forward migration release `release` needs. Idempotent: running it

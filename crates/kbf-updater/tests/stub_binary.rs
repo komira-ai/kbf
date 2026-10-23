@@ -32,12 +32,14 @@ fn version_goes_to_stdout_with_zero_and_usage_to_stderr_with_two() {
 }
 
 /// Catches a binary that starts without a root-owned inventory it can read, or one that
-/// takes a non-loopback operator API: a missing inventory is exit 1 with the reason on
+/// takes a non-loopback operator API or an ssh key that is no file: a missing inventory is exit 1 with the reason on
 /// stderr and nothing on stdout; a non-loopback API is a usage error before anything opens.
 #[test]
 fn a_bad_start_exits_nonzero_with_the_reason_on_stderr() {
     let dir = std::env::temp_dir();
-    let flags = |api: &str| {
+    // Any file will do as the key: nothing connects.
+    let key = env!("CARGO_BIN_EXE_kbf-updater");
+    let flags = |api: &str, key: &str| {
         vec![
             "--state-dir".to_owned(),
             dir.display().to_string(),
@@ -51,12 +53,24 @@ fn a_bad_start_exits_nonzero_with_the_reason_on_stderr() {
             api.to_owned(),
             "--token-file".to_owned(),
             "/nonexistent/token".to_owned(),
+            "--ssh-key-file".to_owned(),
+            key.to_owned(),
+            "--ssh-user".to_owned(),
+            "kbf".to_owned(),
+            "--channel".to_owned(),
+            "stable".to_owned(),
         ]
     };
-    let (code, out, err) = run(&flags("http://192.0.2.7:8080"));
+    let (code, out, err) = run(&flags("http://192.0.2.7:8080", key));
     assert_eq!((code, out.as_str()), (Some(2), ""));
     assert!(err.contains("loopback"), "{err}");
-    let (code, out, err) = run(&flags("http://127.0.0.1:8080"));
+    let (code, out, err) = run(&flags("http://127.0.0.1:8080", key));
     assert_eq!((code, out.as_str()), (Some(1), ""));
     assert!(err.starts_with("kbf-updater: --token-file: "), "{err}");
+    let (code, out, err) = run(&flags("http://127.0.0.1:8080", "/nonexistent/key"));
+    assert_eq!((code, out.as_str()), (Some(1), ""));
+    assert!(
+        err.starts_with("kbf-updater: --ssh-key-file /nonexistent/key is not a file"),
+        "{err}"
+    );
 }
