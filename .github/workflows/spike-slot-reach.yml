@@ -142,3 +142,22 @@ jobs:
       - run: rustup toolchain install
       - name: The profile canaries and the weakened profiles, on real users (root)
         run: cargo xtask sudo-test -p kbf-driver-native --test slot_canary -- --test-threads=1 --nocapture
+
+  # The assertion that a pool user holds nothing a lease left
+  # (crates/kbf-driver-native/tests/slot_assert.rs): a clean user is green at every look,
+  # and each probe is red on the state planted for it and green after the clean. The same
+  # command as the native-macos-assert job of beta.yml runs after a push to main.
+  slot-assert:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: The assertion and its positive controls, on real users (root)
+        run: cargo xtask sudo-test -p kbf-driver-native --test slot_assert -- --test-threads=1 --nocapture

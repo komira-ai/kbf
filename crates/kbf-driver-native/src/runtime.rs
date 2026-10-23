@@ -953,6 +953,18 @@ impl<C: Cas> crate::slots::canary::Offer for SlotOffer<'_, C> {
                 return Err(RuntimeError::Killed);
             }
         }
+        // The state the user is in, before the canaries and the lease touch it.
+        let ready = slot.assert_ready(&made.lease);
+        let red = match until_killed(ready, &cancel, &mut killed).await {
+            Raced::Done(done) => done?,
+            Raced::Killed(by) => {
+                *self.killer = Some(by);
+                return Err(RuntimeError::Killed);
+            }
+        };
+        if !red.is_empty() {
+            return Ok(Probe::Aside(format!("assertion: {}", red.join("; "))));
+        }
         let isolation = &self.runtime.config.isolation;
         let ran = slot.canary(isolation, made.network, &made.lease, &cancel);
         let report = match until_killed(ran, &cancel, &mut killed).await {

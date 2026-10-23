@@ -2,9 +2,10 @@
 //! Mac in it so that it runs under test on every platform.
 //!
 //! A slot is free, held by one lease, or dirty. A slot is **dirty** when its clean
-//! failed ([`Outcome::Dirty`]), its profile canaries failed ([`Book::set_aside`]), or it
-//! never finished (the clean panicked, or its thread or task never ran): it is not offered to a lease, the node reports one slot fewer
-//! ([`Book::count`]), and nothing is written to disk about it.
+//! failed ([`Outcome::Dirty`]), its slot-ready check (the assertion or the profile
+//! canaries) failed ([`Book::set_aside`]), or it never finished (the clean panicked, or
+//! its thread or task never ran): it is not offered to a lease, the node reports one slot
+//! fewer ([`Book::count`]), and nothing is written to disk about it.
 //!
 //! A dirty slot is cleaned again, and offered when that clean passes, by the **recovery
 //! thread** ([`Book::start`]): one thread of its own, with no runtime and no lease
@@ -241,9 +242,9 @@ impl<R: Slotted + Send + Sync + 'static> Book<R> {
         outcome == Outcome::Clean
     }
 
-    /// Logs that slot `index` is dirty because `failed` ("clean" or "canary") failed for
-    /// `why`: at `ERROR` the first time for that reason, then at `DEBUG`. One shape for
-    /// both ways a slot goes dirty.
+    /// Logs that slot `index` is dirty because `failed` ("clean" or "slot-ready check")
+    /// failed for `why`: at `ERROR` the first time for that reason, then at `DEBUG`. One
+    /// shape for both ways a slot goes dirty.
     fn log_dirty(&self, index: usize, uid: u32, failed: &str, why: &str, took: Option<Duration>) {
         if self.note_failure(index, &format!("{failed}: {why}")) {
             tracing::error!(
@@ -259,17 +260,24 @@ impl<R: Slotted + Send + Sync + 'static> Book<R> {
         }
     }
 
-    /// Marks the taken slot `index` (its `permit`) dirty because its profile canaries
-    /// failed for `why`, as a failed clean does: its permit is forgotten (one slot fewer
-    /// is offered and counted), the hook is told and the recovery thread cleans it again.
-    /// Its canaries run again at the lease it is next handed to.
+    /// Marks the taken slot `index` (its `permit`) dirty because its check at slot-ready
+    /// (the assertion, or the profile canaries) failed for `why`, as a failed clean does:
+    /// its permit is forgotten (one slot fewer is offered and counted), the hook is told
+    /// and the recovery thread cleans it again. Its checks run again at the lease it is
+    /// next handed to.
     pub(crate) fn set_aside(
         self: &Arc<Self>,
         index: usize,
         permit: OwnedSemaphorePermit,
         why: &str,
     ) {
-        self.log_dirty(index, self.ready[index].uid(), "canary", why, None);
+        self.log_dirty(
+            index,
+            self.ready[index].uid(),
+            "slot-ready check",
+            why,
+            None,
+        );
         drop(self.held(index, permit));
     }
 

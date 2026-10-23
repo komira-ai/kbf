@@ -43,6 +43,7 @@ use kbf_mac_session::sweep::{self, SweepPlan, Swept};
 use rustix::fs::{CWD, Mode, OFlags};
 
 use super::Ready;
+use crate::slots::assertion;
 use crate::slots::clean::{Left, Os, Step};
 use crate::slots::domain::{self, Launchd, Said};
 use crate::slots::{crash, probe};
@@ -331,7 +332,7 @@ impl MacSlot<'_> {
 }
 
 /// C9's folders: the system's, and one per user of `/Users`.
-fn crash_dirs() -> Vec<PathBuf> {
+pub(super) fn crash_dirs() -> Vec<PathBuf> {
     let users = list(Path::new("/Users")).unwrap_or_default();
     crash::crash_dirs(&users)
 }
@@ -452,7 +453,7 @@ fn run(program: &str, args: &[&str]) -> Result<(), String> {
 }
 
 /// `program`'s stdout, if it exited 0.
-fn output(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+pub(super) fn output(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     let out = Command::new(program)
         .args(args)
         .env_clear()
@@ -473,35 +474,12 @@ fn output(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
 /// `hdiutil info -plist`: each image's own entry, whose detach detaches its partitions.
 fn images_of(uid: u32) -> Result<Vec<String>, String> {
     let out = output(HDIUTIL, &["info", "-plist"])?;
-    let info = plist::Value::from_reader_xml(out.as_slice())
-        .map_err(|e| format!("{HDIUTIL} info -plist: {e}"))?;
-    let images = info
-        .as_dictionary()
-        .and_then(|d| d.get("images"))
-        .and_then(plist::Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
-    let mut devices = Vec::new();
-    for image in images.iter().filter_map(plist::Value::as_dictionary) {
-        let owner = image
-            .get("owner-uid")
-            .and_then(plist::Value::as_unsigned_integer);
-        if owner != Some(u64::from(uid)) {
-            continue;
-        }
-        let entities = image
-            .get("system-entities")
-            .and_then(plist::Value::as_array)
-            .map_or(&[][..], Vec::as_slice);
-        let whole = entities
-            .iter()
-            .filter_map(plist::Value::as_dictionary)
-            .filter_map(|e| e.get("dev-entry").and_then(plist::Value::as_string))
-            .min_by_key(|dev| dev.len());
-        if let Some(dev) = whole {
-            devices.push(dev.to_owned());
-        }
-    }
-    Ok(devices)
+    let images = assertion::hdiutil_images(&out)?;
+    Ok(images
+        .into_iter()
+        .filter(|image| image.owner == Some(u64::from(uid)))
+        .filter_map(|image| image.device)
+        .collect())
 }
 
 /// A System V IPC object's kind.
@@ -523,30 +501,22 @@ impl Ipc {
 }
 
 /// The System V IPC objects `ipcs -a` lists with `name` (or `uid`, for a name the
-/// user database does not give) as owner or creator: `T ID KEY MODE OWNER GROUP
-/// CREATOR CGROUP ...` per line.
+/// user database does not give) as owner or creator ([`assertion::ipc_rows`]).
 fn ipc_of(name: &str, uid: u32) -> Result<Vec<(Ipc, String)>, String> {
     let out = output(IPCS, &["-a"])?;
-    let text = String::from_utf8_lossy(&out);
-    let uid = uid.to_string();
-    let ours = |who: Option<&str>| who.is_some_and(|w| w == name || w == uid);
-    let mut objects = Vec::new();
-    for line in text.lines() {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        let kind = match words.first() {
-            Some(&"q") => Ipc::Queue,
-            Some(&"m") => Ipc::Memory,
-            Some(&"s") => Ipc::Semaphores,
-            _ => continue,
-        };
-        let Some(id) = words.get(1).filter(|id| id.parse::<i64>().is_ok()) else {
-            continue;
-        };
-        if ours(words.get(4).copied()) || ours(words.get(6).copied()) {
-            objects.push((kind, (*id).to_owned()));
-        }
-    }
-    Ok(objects)
+    let rows = assertion::ipc_rows(&String::from_utf8_lossy(&out), name, uid);
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let kind = match row.kind {
+                'q' => Ipc::Queue,
+                'm' => Ipc::Memory,
+                's' => Ipc::Semaphores,
+                _ => return None,
+            };
+            Some((kind, row.id))
+        })
+        .collect())
 }
 
 /// Whether the home is an empty directory of the user's, mode 0700, without flags.
@@ -689,7 +659,7 @@ fn launchctl_print(target: &str) -> Option<String> {
 /// looked into: the sweep removes it whole), found as the sweep walks, never through
 /// a link, on one filesystem and to [`sweep::MAX_DEPTH`]. A place that cannot be read
 /// is listed too, as the sweep would fail there.
-fn owned_entries(plan: &SweepPlan, name: &str, uid: u32) -> Vec<String> {
+pub(super) fn owned_entries(plan: &SweepPlan, name: &str, uid: u32) -> Vec<String> {
     let mut found = Vec::new();
     for template in &plan.named {
         let path = template

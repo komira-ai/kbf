@@ -82,6 +82,8 @@ jobs:
     stage: beta
   - job: beta.yml#native-macos
     stage: beta
+  - job: beta.yml#native-macos-assert
+    stage: beta
   - job: beta.yml#pkg-macos
     stage: beta
   - job: beta.yml#packages

@@ -52,6 +52,8 @@ pub mod canary;
 // The bookkeeping and the clean's rules over text and a fake `launchctl` run on every
 // platform; only a Mac uses them outside tests.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod assertion;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod book;
 pub mod clean;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -405,6 +407,20 @@ impl Runner {
         match self {
             Self::Daemon => Ok(canary::Report::default()),
             Self::Slot(slot) => slot.canary_until(isolation, network, lease, cancel).await,
+        }
+    }
+
+    /// The cheap probes of the assertion for the slot about to run the lease in `lease`
+    /// ([`macos::Slot::assert_ready`]): the lines that differ from the slot's baseline,
+    /// none for the daemon's user, which has no baseline.
+    ///
+    /// # Errors
+    /// The check did not finish.
+    #[cfg(target_os = "macos")]
+    pub async fn assert_ready(&self, lease: &Path) -> Result<Vec<String>, RuntimeError> {
+        match self {
+            Self::Daemon => Ok(Vec::new()),
+            Self::Slot(slot) => slot.assert_ready(lease).await,
         }
     }
 
