@@ -9,7 +9,8 @@ use crate::accounts::DSCL;
 use crate::items::Ctx;
 
 /// The attributes read of each user.
-const USER_KEYS: [&str; 8] = [
+const USER_KEYS: [&str; 9] = [
+    "GeneratedUID",
     "RecordName",
     "UniqueID",
     "PrimaryGroupID",
@@ -20,7 +21,12 @@ const USER_KEYS: [&str; 8] = [
     "AuthenticationAuthority",
 ];
 /// The attributes read of each group.
-const GROUP_KEYS: [&str; 3] = ["RecordName", "PrimaryGroupID", "GroupMembership"];
+const GROUP_KEYS: [&str; 4] = [
+    "RecordName",
+    "PrimaryGroupID",
+    "GroupMembership",
+    "GroupMembers",
+];
 
 /// The prefix `dscl` puts on an attribute outside its standard set:
 /// `dsAttrTypeNative:IsHidden: 1`.
@@ -95,15 +101,25 @@ pub(crate) struct Directory {
 
 impl Directory {
     /// Reads `/Users` and `/Groups`: two `dscl` runs, however many records there are.
-    pub(crate) fn read(c: &Ctx<'_>) -> Self {
+    ///
+    /// # Errors
+    /// A run fails, or the directory has no user or no group: an empty read is never
+    /// taken for an empty directory (root is always there).
+    pub(crate) fn read(c: &Ctx<'_>) -> Result<Self, String> {
         let all = |dir: &str, keys: &[&str]| {
             let mut args = vec![".", "-readall", dir];
             args.extend_from_slice(keys);
-            parse(&c.mac.out(DSCL, &args))
+            let records = parse(&c.mac.try_out(DSCL, &args)?);
+            if records.is_empty() {
+                Err(format!("dscl read no record of {dir}"))
+            } else {
+                Ok(records)
+            }
         };
-        Self {
-            users: all("/Users", &USER_KEYS),
-            groups: all("/Groups", &GROUP_KEYS),
+        let read = || Ok::<_, String>((all("/Users", &USER_KEYS)?, all("/Groups", &GROUP_KEYS)?));
+        match read() {
+            Ok((users, groups)) => Ok(Self { users, groups }),
+            Err(why) => Err(format!("could not read the directory: {why}")),
         }
     }
 
@@ -131,14 +147,17 @@ impl Directory {
             .map(|g| g.name.as_str())
     }
 
-    /// Whether `user` is in `group`: listed in its `GroupMembership`, or having `gid`
-    /// (the group's fixed id) as its primary group.
+    /// Whether `user` is in `group`: having `gid` (the group's fixed id) as its primary
+    /// group, listed by name in its `GroupMembership`, or by `GeneratedUID` in its
+    /// `GroupMembers`. A membership through another group nested in it is not seen.
     pub(crate) fn is_member(&self, user: &Record, group: &str, gid: u64) -> bool {
+        let guid = user.get("GeneratedUID");
         user.number("PrimaryGroupID") == Some(gid)
             || self.group(group).is_some_and(|g| {
-                g.get("GroupMembership")
-                    .split_whitespace()
-                    .any(|m| m == user.name)
+                let listed = |attr: &str, who: &str| {
+                    !who.is_empty() && g.get(attr).split_whitespace().any(|m| m == who)
+                };
+                listed("GroupMembership", &user.name) || listed("GroupMembers", guid)
             })
     }
 }

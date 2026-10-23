@@ -95,6 +95,15 @@ pub struct State {
     pub fails: Vec<String>,
     /// A `dscl .` fed commands exits 1 and runs none of them.
     pub stdin_fails: bool,
+    /// A `dscl .` fed commands skips each line that has one of these in it, as for a
+    /// command it refuses, runs the others, and exits 1.
+    pub stdin_rejects: Vec<String>,
+    /// `dscl . -readall` exits 1 and prints nothing.
+    pub readall_fails: bool,
+    /// `dscl . -readall` exits 0 and prints nothing.
+    pub readall_empty: bool,
+    /// Directories that cannot be made.
+    pub mkdir_fails: Vec<String>,
     /// Calls that, starting with one of these, exit 0 and change nothing.
     pub no_effect: Vec<String>,
     /// Mounted volumes `diskutil info` reports: mount point, file system personality.
@@ -556,6 +565,25 @@ impl FakeMac {
                             .collect()
                     });
                 s.attr(&record, "GroupMembership", &members.join(" "));
+                // The user's `GeneratedUID` goes from `GroupMembers` too.
+                let guid = s
+                    .records
+                    .get(&format!("/Users/{user}"))
+                    .and_then(|a| a.iter().find(|(k, _)| k == "GeneratedUID"))
+                    .map(|(_, v)| v.clone());
+                if let Some(guid) = guid {
+                    let kept: Vec<String> = s
+                        .records
+                        .get(&record)
+                        .and_then(|a| a.iter().find(|(k, _)| k == "GroupMembers"))
+                        .map_or_else(Vec::new, |(_, v)| {
+                            v.split_whitespace()
+                                .filter(|m| *m != guid)
+                                .map(str::to_owned)
+                                .collect()
+                        });
+                    s.attr(&record, "GroupMembers", &kept.join(" "));
+                }
                 done(true)
             }
             _ => None,
@@ -609,6 +637,8 @@ impl FakeMac {
                 }
                 ok(out)
             }
+            ("dscl", [".", "-readall", ..]) if s.readall_fails => no(""),
+            ("dscl", [".", "-readall", ..]) if s.readall_empty => ok(String::new()),
             ("dscl", [".", "-readall", dir, attrs @ ..]) => {
                 let prefix = format!("{dir}/");
                 let mut out = String::new();
@@ -826,7 +856,13 @@ impl Host for FakeMac {
                 stdout: String::new(),
             });
         }
+        let rejects = s.stdin_rejects.clone();
+        let mut rejected = false;
         for line in input.lines() {
+            if rejects.iter().any(|r| line.contains(r.as_str())) {
+                rejected = true;
+                continue;
+            }
             match line.split_whitespace().collect::<Vec<_>>().as_slice() {
                 ["create", record] => {
                     s.records.entry((*record).into()).or_default();
@@ -841,7 +877,7 @@ impl Host for FakeMac {
             }
         }
         Ok(Output {
-            success: true,
+            success: !rejected,
             stdout: String::new(),
         })
     }
@@ -876,6 +912,9 @@ impl Host for FakeMac {
 
     fn mkdir(&self, path: &str) -> io::Result<()> {
         self.log.borrow_mut().push(format!("mkdir {path}"));
+        if self.state.borrow().mkdir_fails.iter().any(|d| d == path) {
+            return Err(io::Error::other("cannot make it"));
+        }
         fs::create_dir_all(self.path(path))
     }
 

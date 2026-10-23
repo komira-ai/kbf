@@ -32,8 +32,9 @@ What the script did not do:
     shell `/usr/bin/false`, home `kbf-pool-<i>` in the `home` directory of
     `kbf_volume` (theirs, mode 700, in a directory of root's, mode 755), hidden,
     `Password` `*` and no
-    `AuthenticationAuthority`; none an administrator or in `wheel` (primary group, or listed in the group's
-    `GroupMembership`), and no other account holding a pool uid or the gid. The pool's
+    `AuthenticationAuthority`; none an administrator or in `wheel` (primary group, listed by name in the group's
+    `GroupMembership`, or by `GeneratedUID` in its `GroupMembers`; a membership through
+    another group nested in it is not seen), and no other account holding a pool uid or the gid. The pool's
     uids must be at most 65535 and outside `lease_uids`. `check` reads `/Users` and
     `/Groups` once each (`dscl . -readall`) and judges every user from that: the cost
     does not grow with a spawn for each user. `apply` makes the group and the users in
@@ -43,7 +44,12 @@ What the script did not do:
     `dseditgroup -o edit -d`, and makes the homes only while the volume is mounted and
     its `home` directory is a directory of root's, mode 755 (never through a link
     there). It changes nothing while another group holds the gid or an account that is
-    not one of the pool's users holds a uid of the block.
+    not one of the pool's users holds a uid of the block, and when it cannot read the
+    directory (a failed `dscl`, or no user in the answer) it changes nothing and
+    says so. The default `pool_first_uid` is fixed, no longer the end of `lease_uids` plus 1: a Mac
+    whose pool was made under the old default (a profile with no pool keys) has it remade at 61000 by the next
+    `apply`, and the daemon's `--pool-first-uid` must change with it; a profile
+    that sets `pool_users` and `pool_first_uid` is not affected.
   - `daemon_user` (`role`, the default, or `root`; `kbf_cache`, an absolute path):
     with `role` nothing changes and nothing is checked. With `root` the property list
     has no `UserName` or `GroupName`, the error log is root's, the node key (`kbf_key`)

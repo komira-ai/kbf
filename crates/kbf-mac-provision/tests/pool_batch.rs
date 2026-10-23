@@ -136,8 +136,8 @@ fn the_check_reads_the_directory_twice_whatever_the_pool_size() {
         assert_eq!(
             *mac.log.borrow(),
             [
-                "dscl . -readall /Users RecordName UniqueID PrimaryGroupID UserShell NFSHomeDirectory IsHidden Password AuthenticationAuthority",
-                "dscl . -readall /Groups RecordName PrimaryGroupID GroupMembership"
+                "dscl . -readall /Users GeneratedUID RecordName UniqueID PrimaryGroupID UserShell NFSHomeDirectory IsHidden Password AuthenticationAuthority",
+                "dscl . -readall /Groups RecordName PrimaryGroupID GroupMembership GroupMembers"
             ],
             "{n} users"
         );
@@ -226,4 +226,142 @@ fn a_batch_that_dscl_refuses_leaves_the_item_failing() {
         r.text
     );
     assert_eq!(mac.inputs.borrow().len(), 1);
+}
+
+/// Catches: a directory that could not be read being taken for an empty one, so that
+/// the overlap guard passes and a batch is written over a user outside the pool. With
+/// `dscl -readall` failing, or printing nothing, `check` fails saying so, and `apply`
+/// writes nothing and fails, though a user outside the pool holds a pool uid.
+#[test]
+fn a_directory_that_cannot_be_read_is_not_an_empty_one() {
+    for (fails, empty) in [(true, false), (false, true)] {
+        let mut mac = FakeMac::converged(&format!("batch-unread-{fails}"));
+        let s = mac.state_mut();
+        s.user("kbf-pool-9", 702);
+        s.remove_user("kbf-pool-3");
+        s.readall_fails = fails;
+        s.readall_empty = empty;
+        mac.log.borrow_mut().clear();
+        let r = check_keys(&mac, Some("pool_users"));
+        assert_eq!(r.failed, 1, "{}", r.text);
+        assert!(
+            r.text
+                .contains("FAIL pool_users: could not read the directory: "),
+            "{}",
+            r.text
+        );
+        let r = apply_keys(&mac, Some("pool_users"));
+        assert_eq!(r.failed, 1, "{}", r.text);
+        assert!(
+            r.text.contains("could not read the directory: "),
+            "{}",
+            r.text
+        );
+        assert!(mac.inputs.borrow().is_empty());
+        assert!(mac.writes().is_empty(), "{:?}", mac.writes());
+    }
+}
+
+/// Catches: a gid held by another group not stopping `apply`, and not named by
+/// `check`: nothing is written, not even for a user that is missing.
+#[test]
+fn a_gid_held_by_another_group_refuses_the_block_whole() {
+    let mut mac = FakeMac::converged("batch-gid");
+    let s = mac.state_mut();
+    s.attr("/Groups/staff2", "PrimaryGroupID", "700");
+    s.remove_user("kbf-pool-3");
+    mac.log.borrow_mut().clear();
+    let r = check_keys(&mac, Some("pool_users"));
+    assert!(r.text.contains("gid 700 belongs to staff2"), "{}", r.text);
+    let r = apply_keys(&mac, Some("pool_users"));
+    assert_eq!(r.failed, 1, "{}", r.text);
+    assert!(
+        r.text
+            .contains("NOTE pool_users: gid 700 belongs to staff2: no pool user changed"),
+        "{}",
+        r.text
+    );
+    assert!(mac.inputs.borrow().is_empty());
+    assert!(mac.writes().is_empty(), "{:?}", mac.writes());
+}
+
+/// Catches: an administrator listed in `admin` only by `GeneratedUID` (in
+/// `GroupMembers`, not by name) passing the check, and `apply` not removing it.
+#[test]
+fn a_member_listed_by_generated_uid_is_seen_and_removed() {
+    let mut mac = FakeMac::converged("batch-guid");
+    let s = mac.state_mut();
+    s.user_attr("kbf-pool-1", "GeneratedUID", "ABCD-1234");
+    s.user_attr("kbf-pool-2", "GeneratedUID", "EFGH-5678");
+    s.attr("/Groups/admin", "GroupMembers", "ABCD-1234");
+    s.attr("/Groups/wheel", "GroupMembers", "EFGH-5678");
+    let r = check_keys(&mac, Some("pool_users"));
+    assert!(
+        r.text.contains("kbf-pool-1: an administrator"),
+        "{}",
+        r.text
+    );
+    assert!(r.text.contains("kbf-pool-2: in wheel"), "{}", r.text);
+    assert!(!r.text.contains("kbf-pool-0:"), "{}", r.text);
+    let r = apply_keys(&mac, Some("pool_users"));
+    assert_eq!(r.failed, 0, "{}", r.text);
+    assert_eq!(
+        calls(&mac, "dseditgroup"),
+        [
+            "dseditgroup -o edit -d kbf-pool-1 -t user admin",
+            "dseditgroup -o edit -d kbf-pool-2 -t user wheel"
+        ]
+    );
+    assert_eq!(check_keys(&mac, Some("pool_users")).failed, 0);
+}
+
+/// Catches: a batch in which `dscl` refuses some commands being counted as made, and
+/// a resumed `apply` that redoes more than what is left: two users missing and a
+/// refusal of one shell, the check names exactly the refused value, and the next
+/// `apply` feeds only that command.
+#[test]
+fn a_batch_dscl_half_runs_is_finished_by_the_next_apply() {
+    let mut mac = FakeMac::converged("batch-half");
+    let s = mac.state_mut();
+    s.remove_user("kbf-pool-1");
+    s.remove_user("kbf-pool-2");
+    s.stdin_rejects = vec!["kbf-pool-1 UserShell".to_owned()];
+    let r = apply_keys(&mac, Some("pool_users"));
+    assert_eq!(r.failed, 1, "{}", r.text);
+    assert!(
+        r.text
+            .contains("FAIL pool_users: kbf-pool-1: UserShell=absent, want /usr/bin/false"),
+        "{}",
+        r.text
+    );
+    assert!(!r.text.contains("kbf-pool-2:"), "{}", r.text);
+    mac.state_mut().stdin_rejects.clear();
+    let r = apply_keys(&mac, Some("pool_users"));
+    assert_eq!(r.failed, 0, "{}", r.text);
+    assert_eq!(
+        mac.inputs.borrow()[1],
+        format!("create {USERS}/kbf-pool-1 UserShell /usr/bin/false\n")
+    );
+}
+
+/// Catches: a home that cannot be made stopping the batch, so that the users after it
+/// are not made: the home of `kbf-pool-1` is the wrong owner and cannot be made again,
+/// and `kbf-pool-3` is missing; `apply` fails on the home and still makes the user.
+#[test]
+fn a_home_that_cannot_be_made_does_not_stop_the_users_after_it() {
+    let mut mac = FakeMac::converged("batch-home");
+    let home = "/Volumes/kbf/home/kbf-pool-1";
+    let s = mac.state_mut();
+    s.owners.insert(home.to_owned(), (0, 0));
+    s.mkdir_fails.push(home.to_owned());
+    s.remove_user("kbf-pool-3");
+    let r = apply_keys(&mac, Some("pool_users"));
+    assert_eq!(r.failed, 1, "{}", r.text);
+    assert!(r.text.contains("cannot make it"), "{}", r.text);
+    assert_eq!(mac.inputs.borrow().len(), 1, "{}", r.text);
+    assert!(
+        mac.inputs.borrow()[0].starts_with(&format!("create {USERS}/kbf-pool-3\n")),
+        "{:?}",
+        mac.inputs.borrow()
+    );
 }

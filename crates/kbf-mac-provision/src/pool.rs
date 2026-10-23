@@ -247,7 +247,10 @@ fn user_problems(c: &Ctx<'_>, dir: &Directory, u: &PoolUser) -> Vec<String> {
 /// The group's id and its holder, the homes directory and every pool user, all judged
 /// from one read of the directory.
 fn problems(c: &Ctx<'_>) -> Vec<String> {
-    let dir = Directory::read(c);
+    let dir = match Directory::read(c) {
+        Ok(dir) => dir,
+        Err(why) => return vec![why],
+    };
     let gid = c.profile.pool_first_uid;
     let mut wrong = Vec::new();
     let found = dir.group(GROUP).map_or("", |g| g.get("PrimaryGroupID"));
@@ -303,7 +306,7 @@ pub(crate) fn pool_users_item(c: &Ctx<'_>) -> Outcome {
 /// at a home's path and is not a directory is left.
 pub(crate) fn fix_pool_users(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
     let gid = c.profile.pool_first_uid;
-    let dir = Directory::read(c);
+    let dir = Directory::read(c).map_err(io::Error::other)?;
     if let Some(other) = dir.gid_holder(gid.into(), GROUP) {
         return Err(io::Error::other(format!(
             "gid {gid} belongs to {other}: no pool user changed"
@@ -342,11 +345,18 @@ pub(crate) fn fix_pool_users(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
     // would land, owned by a pool uid, wherever the link points.
     let found = c.mac.ls(&homes);
     let homes_ok = mounted && found == ROOT_DIR;
+    // A home that cannot be made does not keep the users after it from being made: the
+    // batch runs whatever happened, and the first error is returned after it.
+    let mut failed = None;
     for u in &users {
-        fix_user(c, out, (&dir, &mut batch), u, homes_ok)?;
+        if let Err(e) = fix_user(c, out, (&dir, &mut batch), u, homes_ok) {
+            failed.get_or_insert(e);
+        }
     }
     batch.run(c);
-    if !mounted {
+    if let Some(e) = failed {
+        Err(e)
+    } else if !mounted {
         Err(unmounted(c, "no home made"))
     } else if homes_ok {
         Ok(())

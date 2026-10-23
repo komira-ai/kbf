@@ -661,6 +661,22 @@ impl PoolCleanup {
     }
 }
 
+/// Stops the test, before it changes anything, when this Mac has a pool: the test
+/// removes `kbf-pool-0..2` and `kbfpool` when it ends, and must never remove a live one.
+fn assert_no_pool() {
+    let users = output("/usr/bin/dscl", &[".", "-list", USERS]);
+    let groups = output("/usr/bin/dscl", &[".", "-list", "/Groups"]);
+    let held: Vec<&str> = users
+        .lines()
+        .filter(|u| u.starts_with("kbf-pool-"))
+        .chain(groups.lines().filter(|g| g.trim() == "kbfpool"))
+        .collect();
+    assert!(
+        held.is_empty(),
+        "this Mac has a pool already ({held:?}): the test would remove it"
+    );
+}
+
 impl Drop for PoolCleanup {
     fn drop(&mut self) {
         self.remove();
@@ -677,6 +693,7 @@ impl Drop for PoolCleanup {
 #[ignore = "needs root: run by `cargo xtask sudo-test -p kbf-mac-provision --test as_root`"]
 fn a_small_pool_is_made_by_one_batch_made_again_and_checked() {
     let (_serial, host) = host();
+    assert_no_pool();
     let first = free_block(61000, 3);
     let profile = format!("{SCRATCH}/profile-pool");
     let text = fs::read_to_string(&host.profile).expect("read the profile");

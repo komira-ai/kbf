@@ -320,6 +320,16 @@ impl<'a> Mac<'a> {
             .unwrap_or_default()
     }
 
+    /// What `program args` prints on stdout, as [`Mac::out`] gives it, when it runs and
+    /// exits 0; the reason when it does not.
+    pub(crate) fn try_out(&self, program: &str, args: &[&str]) -> Result<String, String> {
+        match self.host.run(program, args) {
+            Ok(o) if o.success => Ok(o.stdout.trim_end_matches('\n').to_owned()),
+            Ok(_) => Err(format!("{program} exited non-zero")),
+            Err(e) => Err(format!("{program} did not run: {e}")),
+        }
+    }
+
     /// Whether `program args` runs, is fed `input` and exits 0.
     pub(crate) fn succeeds_with_input(&self, program: &str, args: &[&str], input: &str) -> bool {
         self.host
