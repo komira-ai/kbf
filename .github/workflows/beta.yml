@@ -654,7 +654,7 @@ jobs:
       - name: Fetch nfpm (pinned version, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" --sha256 "$NFPM_SHA256" --out "$RUNNER_TEMP/tools/nfpm" --extract tar.gz --member nfpm
       - name: Write the nfpm configuration
-        run: cargo xtask pkg-config --binary target/debug/kbf-installer-stub --units packaging/linux/units --trust packaging/linux/testdata/trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --platform linux-x86_64 --version 0.0.0+ci --out target/pkg
+        run: cargo xtask pkg-config --binary target/debug/kbf-installer-stub --units packaging/linux/units --trust packaging/linux/testdata/trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --platform linux-x86_64 --version 0.0.0+ci --out target/pkg
       - name: Build the deb and the rpm, each twice
         run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/nfpm.yaml --out target/pkg/out
       - name: Install, gate, remove and purge the deb in a fresh Ubuntu container
