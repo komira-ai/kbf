@@ -45,6 +45,8 @@ fn the_pool_tables_survive_a_render() {
 #[test]
 fn a_table_with_both_modes_is_refused_when_the_file_is_read() {
     let both = format!("{POOL}\n[proxy.upstream]\nbase_port = 19000\n");
-    let why = InstallerToml::parse(&both).expect_err("refused").to_string();
+    let why = InstallerToml::parse(&both)
+        .expect_err("refused")
+        .to_string();
     assert!(why.contains("not both"), "{why}");
 }

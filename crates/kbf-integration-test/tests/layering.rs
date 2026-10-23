@@ -526,10 +526,17 @@ const MAY_NAME_THE_PROXY: &[&str] = &[
     "setup/proxy.rs",
 ];
 
-/// The files that may name the verb's module (`proxy_verb`): the dispatch and its tests. A path
-/// into the verb from anywhere else, `crate::proxy_verb::FIRST_FD` in the root helper for one,
-/// reaches the proxy without ever writing `kbf_proxy`.
-const MAY_NAME_THE_VERB: &[&str] = &["app.rs", "app_tests.rs", "lib.rs", "proxy_verb.rs"];
+/// The files that may name the verb's module (`proxy_verb`): the dispatch and its tests, and the
+/// verb's pool mode (`proxy_pool.rs`, which shares the verb's stop flag and signal handling). A
+/// path into the verb from anywhere else, `crate::proxy_verb::FIRST_FD` in the root helper for
+/// one, reaches the proxy without ever writing `kbf_proxy`.
+const MAY_NAME_THE_VERB: &[&str] = &[
+    "app.rs",
+    "app_tests.rs",
+    "lib.rs",
+    "proxy_pool.rs",
+    "proxy_verb.rs",
+];
 
 /// Source files under `dir`, as paths relative to `base`, with `/` as the separator.
 fn rust_files(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {

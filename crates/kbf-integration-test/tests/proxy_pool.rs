@@ -1,14 +1,16 @@
-//! The front-door proxy in pool mode in front of two real `kbf` frontends that share one real
-//! Postgres: one `Execute` is held open on a frontend, that frontend is drained through the
-//! proxy's admin API (`admin_listen`), and the open `Execute` is left alone while every new one
-//! goes to the other frontend.
+//! The front-door proxy in pool mode in front of two real `kbf` frontends, each over a real
+//! Postgres database of its own (a state store has one writer): one `Execute` is held open on a
+//! frontend, that frontend is drained through the proxy's admin API (`admin_listen`), and the
+//! open `Execute` is left alone while every new one goes to the other frontend.
 //!
 //! Everything but the proxy library, which runs in this process the way the installer's verb
 //! runs it, is a child process: a `kbf storage` node (shared by both frontends) and two `kbf
 //! frontend` processes, which are this test binary run through a link named `kbf` (the trick of
-//! `proxy_soak.rs`). The frontends keep their state in a Postgres database of the test's own,
-//! with the installer's schema applied. Like every Postgres test it needs a server and fails
-//! without one: `KBF_TEST_POSTGRES_URL` names a server the test may create a database on.
+//! `proxy_soak.rs`). Each frontend keeps its state in a Postgres database of the test's own,
+//! with the installer's schema applied: over one database the later frontend would take the
+//! store's generation and fence the first, which would refuse every `Execute`. Like every
+//! Postgres test it needs a server and fails without one: `KBF_TEST_POSTGRES_URL` names a server
+//! the test may create a database on.
 //!
 //! The streams are `Execution.Execute` calls, the stream a Buck2 build holds open per action: no
 //! worker runs them, so each is queued on its frontend and the stream stays open and idle. The
@@ -35,7 +37,7 @@ use std::os::fd::OwnedFd;
 use kbf_proxy::Proxy;
 use kbf_proxy::config::Frontend;
 use kbf_proxy::control::NoUpdates;
-use kbf_state::postgres::{PostgresConfig, TestDatabase, schema};
+use kbf_state::postgres::test_database;
 use kbf_testkit::dir::TestDir;
 use proxy_support::{
     Child, Open, actions, api_get, connect, free_base, frontend_args, link_kbf, open_executions,
@@ -90,7 +92,7 @@ fn proxy_count(admin_addr: SocketAddr, name: &str) -> u64 {
         .expect("a count")
 }
 
-/// A `kbf frontend` on the ports from `base`, over the shared Postgres database `flag` names.
+/// A `kbf frontend` on the ports from `base`, over the Postgres database `flag` names.
 fn frontend(dir: &std::path::Path, name: &str, storage: &str, base: u16, flag: &str) -> Child {
     // `frontend_args` gives a SQLite file, which this test does not use: its flag is swapped.
     let mut args = frontend_args(storage, base, &dir.join(name).join("unused.db"));
@@ -99,17 +101,16 @@ fn frontend(dir: &std::path::Path, name: &str, storage: &str, base: u16, flag: &
     Child::start(dir, name, &args)
 }
 
-/// Asserts that, with real frontends on one real Postgres, a drained frontend keeps its open
-/// `Execute` (no reset, not moved, counted until it ends), that new `Execute`s go to the other
-/// frontend, and that an undrain lists it as `up` again. The open `Execute` ends by the client
-/// cancelling it: no worker runs it, so it has no result of its own to complete with.
+/// Asserts that, with real frontends on a real Postgres database each, a drained frontend keeps
+/// its open `Execute` (no reset, not moved, counted until it ends), that new `Execute`s go to the
+/// other frontend, and that an undrain lists it as `up` again. The open `Execute` ends by the
+/// client cancelling it: no worker runs it, so it has no result of its own to complete with.
 #[test]
 fn a_drained_frontend_keeps_its_execute_and_new_ones_go_to_the_other() {
-    let database = TestDatabase::empty();
-    let url = database.url();
-    let config = PostgresConfig::parse(&url).expect("the URL parses");
-    let set = schema::embedded();
-    schema::apply(&config, &set, schema::latest()).expect("the installer's step");
+    // One database for each frontend, with the installer's schema: a state store has one writer
+    // (the generation fence), so a second frontend over the same database would fence the first,
+    // which would then refuse every Execute it is given (FAILED_PRECONDITION).
+    let (database_a, database_b) = (test_database(), test_database());
 
     // Declared before the children, so it drops after them: they are reaped before it is removed.
     let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "proxy-pool");
@@ -118,9 +119,10 @@ fn a_drained_frontend_keeps_its_execute_and_new_ones_go_to_the_other() {
     let node = storage_node(&dir, "node");
     let storage = node.field("storage=");
     let base = free_base();
-    let flag = format!("--state-store={}", without_password(&url));
-    let mut a = frontend(&dir, "frontend-a", &storage, base, &flag);
-    let mut b = frontend(&dir, "frontend-b", &storage, base + 10, &flag);
+    let flag_a = format!("--state-store={}", without_password(&database_a.url()));
+    let flag_b = format!("--state-store={}", without_password(&database_b.url()));
+    let mut a = frontend(&dir, "frontend-a", &storage, base, &flag_a);
+    let mut b = frontend(&dir, "frontend-b", &storage, base + 10, &flag_b);
     let (api_a, api_b) = (
         format!("127.0.0.1:{}", base + 2),
         format!("127.0.0.1:{}", base + 12),
@@ -150,7 +152,10 @@ fn a_drained_frontend_keeps_its_execute_and_new_ones_go_to_the_other() {
     proxy.admin_listen = Some(admin_addr);
     proxy.check().expect("a valid pool table");
     let (handle, runner) = Proxy::bind(proxy, OwnedFd::from(public)).expect("bind");
-    assert!(handle.startup_hold().is_none(), "a pool starts with no hold");
+    assert!(
+        handle.startup_hold().is_none(),
+        "a pool starts with no hold"
+    );
     let serving = std::thread::spawn(move || runner.run(NoUpdates));
 
     let client_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -200,7 +205,10 @@ fn a_drained_frontend_keeps_its_execute_and_new_ones_go_to_the_other() {
         assert_eq!((code, &again), (200, &list));
 
         // The open Execute is left alone, where it is.
-        assert!(first.quiet().await, "the drain ended or woke the open Execute");
+        assert!(
+            first.quiet().await,
+            "the drain ended or woke the open Execute"
+        );
         assert_eq!(open_executions(held_api), 1);
         assert_eq!(open_executions(other_api), 0);
 
@@ -209,7 +217,11 @@ fn a_drained_frontend_keeps_its_execute_and_new_ones_go_to_the_other() {
             .await
             .expect("a new Execute starts on the other frontend");
         assert_eq!(open_executions(other_api), 1);
-        assert_eq!(open_executions(held_api), 1, "the drained frontend took one more");
+        assert_eq!(
+            open_executions(held_api),
+            1,
+            "the drained frontend took one more"
+        );
         assert_eq!(proxy_count(admin_addr, other), 1);
         assert!(first.quiet().await);
 
@@ -253,5 +265,5 @@ fn a_drained_frontend_keeps_its_execute_and_new_ones_go_to_the_other() {
         .expect("the proxy ran");
     assert!(a.stop().is_some_and(|status| status.success()), "A exits 0");
     assert!(b.stop().is_some_and(|status| status.success()), "B exits 0");
-    drop((node, database));
+    drop((node, database_a, database_b));
 }

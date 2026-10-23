@@ -118,12 +118,19 @@ fn admin_listen_is_a_loopback_socket_address() {
     assert_eq!(v4.admin_listen, Some("127.0.0.1:18090".parse().unwrap()));
     let v6 = with("\"[::1]:18090\"").expect("v6");
     assert_eq!(v6.admin_listen, Some("[::1]:18090".parse().unwrap()));
-    for bad in ["\"localhost:18090\"", "\"127.0.0.1\"", "\"127.0.0.1:0\"", "8090"] {
+    for bad in [
+        "\"localhost:18090\"",
+        "\"127.0.0.1\"",
+        "\"127.0.0.1:0\"",
+        "8090",
+    ] {
         // Through `from_value`, as `installer.toml` is read: `from_toml_str` adds the source
         // line to a parse error.
         let text = pool(&format!("admin_listen = {bad}\n"));
         let table: toml::Value = toml::from_str(&text).expect("toml");
-        let why = ProxyConfig::from_value(table).expect_err("refused").to_string();
+        let why = ProxyConfig::from_value(table)
+            .expect_err("refused")
+            .to_string();
         assert!(why.contains("admin_listen"), "{bad}: {why}");
         assert!(!why.contains("127.0.0.1"), "{bad}: {why} echoes it");
     }
@@ -146,7 +153,10 @@ fn admin_listen_must_not_use_a_frontend_port() {
     let with = |port: u16| pool(&format!("admin_listen = \"127.0.0.1:{port}\"\n"));
     for taken in [18_000, 18_004, 18_010, 18_014] {
         let why = refused(&with(taken));
-        assert!(why.contains("not use a port of a frontend"), "{taken}: {why}");
+        assert!(
+            why.contains("not use a port of a frontend"),
+            "{taken}: {why}"
+        );
     }
     for free in [17_999, 18_005, 18_009, 18_015] {
         assert!(ProxyConfig::from_toml_str(&with(free)).is_ok(), "{free}");
