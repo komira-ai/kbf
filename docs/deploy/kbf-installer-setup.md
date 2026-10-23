@@ -22,6 +22,19 @@ sudo kbf-installer setup --mode=frontend \
     --storage-client-cert=/etc/kbf/worker.pem --storage-client-key=/etc/kbf/worker.key
 ```
 
+## `kbf setup` on a host from the packages
+
+A host that has the `kbf` package has the verb in the `kbf` binary too: `sudo kbf setup ...`
+is `kbf-installer setup ...` with the same flags, the same steps, files, accounts and state
+database, and the same exit statuses. Its `--apply` and `--json` go after the verb
+(`sudo kbf setup --apply --mode=daemon ...`), and an error is `kbf setup: <why>` on standard
+error. It has no `--proxy` flags: `kbf` does not link the proxy, so a frontend behind the proxy
+and an all-in-one host (always behind it) are set up with `kbf-installer setup --proxy`, and
+`kbf setup` refuses an `installer.toml` that has a `[proxy]` table rather than rewrite it (it
+tells you to run `kbf-installer setup` and to leave the table in the file). The lines that
+report the database step are the library's own text and name `kbf-installer setup (<mode>)`
+whichever program printed them. The rest of this page is about both.
+
 ## Dry run and `--apply`
 
 `--apply` is a flag of `kbf-installer` itself, so it goes before or after the verb. Without it

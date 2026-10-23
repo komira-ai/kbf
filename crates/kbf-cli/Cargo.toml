@@ -58,6 +58,10 @@ tracing.workspace = true
 rustix = { workspace = true, features = ["process", "system"] }
 # The Postgres state schema version, which `kbf --version --json` reports.
 kbf-state = { workspace = true, features = ["postgres"] }
+# `kbf setup` (src/setup.rs): the first configuration of a host from the packages. Without the
+# library's `proxy` feature, so this binary links no kbf-proxy: the host behind the proxy is
+# `kbf-installer setup`'s (tests/layering.rs in kbf-integration-test checks the tree).
+kbf-setup.workspace = true
 # The identity `kbf --version --json` prints (src/version.rs), and the bodies of
 # `kbf cluster` (src/cluster.rs).
 serde_json.workspace = true
@@ -92,6 +96,8 @@ kbf-testkit.workspace = true
 prost.workspace = true
 # The certificate checks (`kbf_ca::verify_cert`) of tests/deploy_units.rs.
 kbf-ca.workspace = true
+# tests/setup.rs runs `kbf setup` over a recording host (`FakeExec`) instead of a real one.
+kbf-host = { workspace = true, features = ["testkit"] }
 # The packaged units (`packaging/linux/units`) parsed with kbf's own parser
 # (tests/deploy_units.rs, tests/package_units.rs).
 kbf-unitfile.workspace = true

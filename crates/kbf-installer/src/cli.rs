@@ -39,7 +39,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Verb {
     /// First install: accounts, directories, installer.toml, kbf.toml, the units.
-    Setup(Box<SetupArgs>),
+    Setup(Box<InstallerSetupArgs>),
     /// What is installed, staged and pending, and the last refusal.
     Status,
     /// Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap.
@@ -79,6 +79,18 @@ pub enum Verb {
 // The `kbf` modes a host can be set up for and the flags of `setup` are defined in
 // `kbf-setup`, the library behind that verb.
 pub use kbf_setup::cli::{Mode, SetupArgs};
+
+/// The flags of `kbf-installer setup`: those `kbf setup` takes too (`SetupArgs`), and the proxy's,
+/// which only this program has.
+#[derive(Args)]
+pub struct InstallerSetupArgs {
+    /// The flags both programs take.
+    #[command(flatten)]
+    pub setup: SetupArgs,
+    /// A frontend host behind `kbf-installer proxy`: the `[proxy]` table of installer.toml.
+    #[command(flatten)]
+    pub proxy: kbf_setup::setup::proxy::ProxyFlags,
+}
 
 #[derive(Args)]
 pub struct ActivationArgs {

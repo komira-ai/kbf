@@ -39,6 +39,7 @@
 
 use std::path::PathBuf;
 
+#[cfg(feature = "proxy")]
 use kbf_proxy::config::ProxyConfig;
 use serde::Deserialize;
 
@@ -73,7 +74,8 @@ struct Raw {
     frontend_ca_sha256: Option<String>,
     release_ca: Option<String>,
     /// The proxy's table, checked by `kbf_proxy::config::ProxyConfig::from_value`; its own
-    /// keys are closed the same way.
+    /// keys are closed the same way. A build without the `proxy` feature cannot check it and
+    /// refuses a file that has one.
     proxy: Option<toml::Value>,
     database: Option<String>,
     frontend_config: Option<String>,
@@ -179,7 +181,9 @@ pub struct InstallerToml {
     pub frontend: Option<FrontendPull>,
     /// The `[proxy]` table, read by `kbf-installer proxy`. `setup` writes the keys it has
     /// flags for on a `--proxy` host and keeps the rest; [`InstallerToml::render`] writes the
-    /// whole table, so a file that is read and rendered keeps every key of it.
+    /// whole table, so a file that is read and rendered keeps every key of it. Only a build with
+    /// the `proxy` feature has it: without, a file with a `[proxy]` table is not read at all.
+    #[cfg(feature = "proxy")]
     pub proxy: Option<ProxyConfig>,
     /// The state database of a frontend or all-in-one host: a `postgres://` URL without a
     /// password (the file is world-readable). `crate::database` reads this file a second time,
@@ -208,6 +212,7 @@ impl Default for InstallerToml {
             node_key: None,
             release_ca: None,
             frontend: None,
+            #[cfg(feature = "proxy")]
             proxy: None,
             database: None,
             frontend_config: None,
@@ -223,6 +228,7 @@ pub struct Tolerant {
     /// `fetch_timeout_s`, checked as the closed reader checks it.
     pub fetch_timeout_s: u32,
     /// The `[proxy]` table, which is closed whoever reads it.
+    #[cfg(feature = "proxy")]
     pub proxy: Option<ProxyConfig>,
     /// `frontend_config`, checked as the closed reader checks it.
     pub frontend_config: Option<PathBuf>,
@@ -456,6 +462,7 @@ impl InstallerToml {
         Ok(Tolerant {
             confirm_window_s: file.confirm_window_s,
             fetch_timeout_s: file.fetch_timeout_s,
+            #[cfg(feature = "proxy")]
             proxy: file.proxy,
             frontend_config: file.frontend_config,
         })
@@ -570,11 +577,21 @@ impl InstallerToml {
         if not_url && raw.release_ca.is_some() {
             problems.push("release_ca is for release_source = \"url\"".to_owned());
         }
+        #[cfg(feature = "proxy")]
         let proxy = raw.proxy.and_then(|table| {
             ProxyConfig::from_value(table)
                 .map_err(|e| problems.push(format!("proxy: {e}")))
                 .ok()
         });
+        // A build without the proxy cannot check the table, and a rewrite would drop it.
+        #[cfg(not(feature = "proxy"))]
+        {
+            if raw.proxy.is_some() {
+                problems.push(
+                    "proxy: a host behind the proxy is set up by kbf-installer setup, which keeps this table; this setup does not read it".to_owned(),
+                );
+            }
+        }
         match source {
             Some(source) if problems.is_empty() => Ok(InstallerToml {
                 source,
@@ -590,6 +607,7 @@ impl InstallerToml {
                 node_key,
                 release_ca,
                 frontend,
+                #[cfg(feature = "proxy")]
                 proxy,
                 database: raw.database,
                 frontend_config,
@@ -598,9 +616,10 @@ impl InstallerToml {
         }
     }
 
-    /// The canonical text: every key in a fixed order, the unset optional ones left out. The
-    /// `[proxy]` table, when there is one, comes last with every key it has, defaults
-    /// included, so what an operator hand-edited in it survives a rewrite.
+    /// The canonical text: every key in a fixed order, the unset optional ones left out. With the
+    /// `proxy` feature the `[proxy]` table, when there is one, comes last with every key it has,
+    /// defaults included, so what an operator hand-edited in it survives a rewrite; a build
+    /// without the feature has no table to write (it refuses a file that has one).
     pub fn render(&self) -> String {
         let mut out = String::new();
         match &self.source {
@@ -655,15 +674,43 @@ impl InstallerToml {
         if let Some(p) = &self.frontend_config {
             out.push_str(&format!("frontend_config = \"{}\"\n", p.display()));
         }
-        if let Some(proxy) = &self.proxy {
-            render_proxy(proxy, &mut out);
+        #[cfg(feature = "proxy")]
+        {
+            if let Some(proxy) = &self.proxy {
+                render_proxy(proxy, &mut out);
+            }
         }
         out
+    }
+
+    /// The address the `[proxy]` table moves the public socket to, when it gives one.
+    #[cfg(feature = "proxy")]
+    pub fn proxy_listen(&self) -> Option<std::net::SocketAddr> {
+        self.proxy.as_ref().and_then(|p| p.listen)
+    }
+
+    /// Without the `proxy` feature there is no table, so no address.
+    #[cfg(not(feature = "proxy"))]
+    pub fn proxy_listen(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
+
+    /// Whether the file has a `[proxy]` table.
+    #[cfg(feature = "proxy")]
+    pub fn has_proxy_table(&self) -> bool {
+        self.proxy.is_some()
+    }
+
+    /// Without the `proxy` feature a file with a `[proxy]` table is not read, so none has one.
+    #[cfg(not(feature = "proxy"))]
+    pub fn has_proxy_table(&self) -> bool {
+        false
     }
 }
 
 /// The `[proxy]` table, every key, in the order of `kbf_proxy::config::ProxyConfig`; its
 /// sub-tables follow its plain keys. Paths go through [`toml_string`].
+#[cfg(feature = "proxy")]
 fn render_proxy(p: &ProxyConfig, out: &mut String) {
     let path = |p: &std::path::Path| toml_string(&p.display().to_string());
     out.push_str("\n[proxy]\n");
@@ -745,14 +792,20 @@ pub(crate) fn toml_string(text: &str) -> String {
     out
 }
 
-#[cfg(test)]
+// These tests build `InstallerToml` with its `[proxy]` table, so they run with the `proxy`
+// feature; the build without it has `no_proxy_tests`.
+#[cfg(all(test, feature = "proxy"))]
 #[path = "installer_toml_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "proxy"))]
 #[path = "installer_toml_release_tests.rs"]
 mod release_tests;
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "proxy")))]
+#[path = "installer_toml_no_proxy_tests.rs"]
+mod no_proxy_tests;
+
+#[cfg(all(test, feature = "proxy"))]
 #[path = "installer_toml_pool_tests.rs"]
 mod pool_tests;

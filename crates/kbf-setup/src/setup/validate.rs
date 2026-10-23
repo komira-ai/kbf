@@ -9,6 +9,7 @@
 
 use super::kbf_settings::{KbfFlags, Setting};
 use super::paths;
+#[cfg(feature = "proxy")]
 use super::proxy::{ProxyFlags, ProxyPlan};
 use super::retired::RetiredFlags;
 use crate::cli::Mode;
@@ -29,7 +30,9 @@ pub struct Raw {
     pub database: Option<String>,
     /// The listener, certificate and storage-client flags of a frontend or all-in-one host.
     pub kbf: KbfFlags,
-    /// `--proxy` and what goes with it.
+    /// `--proxy` and what goes with it. Only a build with the `proxy` feature (kbf-installer's)
+    /// has them.
+    #[cfg(feature = "proxy")]
     pub proxy: ProxyFlags,
     /// `--create-local-database`.
     pub create_local_database: bool,
@@ -53,6 +56,7 @@ pub struct Valid {
     /// The `kbf.toml` settings the listener, certificate and storage flags give.
     pub kbf: Vec<Setting>,
     /// The proxy host's settings: `Some` for `--proxy`. The files it names are not in `kbf`.
+    #[cfg(feature = "proxy")]
     pub proxy: Option<ProxyPlan>,
     /// With `--create-local-database`: what to create, from the URL.
     pub local_database: Option<LocalDatabase>,
@@ -61,8 +65,40 @@ pub struct Valid {
 impl Valid {
     /// The loopback port of the `kbf-storage-and-daemon` sibling an all-in-one host runs; none
     /// on every other host. Its presence is what makes a host the new all-in-one layout.
+    #[cfg(feature = "proxy")]
     pub fn storage_port(&self) -> Option<u16> {
         self.proxy.as_ref().and_then(|plan| plan.storage_port)
+    }
+
+    /// Without the `proxy` feature no host has a sibling: all-in-one is refused.
+    #[cfg(not(feature = "proxy"))]
+    pub fn storage_port(&self) -> Option<u16> {
+        None
+    }
+
+    /// Whether the host is set up behind the proxy (`--proxy`).
+    #[cfg(feature = "proxy")]
+    pub fn behind_proxy(&self) -> bool {
+        self.proxy.is_some()
+    }
+
+    /// Without the `proxy` feature no host is set up behind the proxy.
+    #[cfg(not(feature = "proxy"))]
+    pub fn behind_proxy(&self) -> bool {
+        false
+    }
+
+    /// The settings that name files the proxy reads, for `check_files`: none unless the host is
+    /// set up behind the proxy.
+    #[cfg(feature = "proxy")]
+    pub fn proxy_files(&self) -> Vec<Setting> {
+        self.proxy.as_ref().map_or_else(Vec::new, ProxyPlan::files)
+    }
+
+    /// Without the `proxy` feature the proxy reads no file.
+    #[cfg(not(feature = "proxy"))]
+    pub fn proxy_files(&self) -> Vec<Setting> {
+        Vec::new()
     }
 }
 
@@ -90,6 +126,29 @@ pub fn enrolls(mode: Mode) -> bool {
 }
 
 impl Raw {
+    /// Whether `--proxy` was given.
+    #[cfg(feature = "proxy")]
+    pub fn behind_proxy(&self) -> bool {
+        self.proxy.proxy
+    }
+
+    /// Without the `proxy` feature there is no `--proxy`.
+    #[cfg(not(feature = "proxy"))]
+    pub fn behind_proxy(&self) -> bool {
+        false
+    }
+
+    /// An all-in-one host is always behind the proxy, which a build without the `proxy` feature
+    /// does not set up: the problem is said once, for the program that has no `--proxy`.
+    #[cfg(not(feature = "proxy"))]
+    fn check_all_in_one(&self, problems: &mut Vec<String>) {
+        if self.mode == Mode::AllInOne {
+            problems.push(
+                "--mode=all-in-one runs behind the proxy, which this setup does not take: use kbf-installer setup with --proxy".to_owned(),
+            );
+        }
+    }
+
     /// Check every flag; the `Err` lists each problem.
     pub fn validate(&self, platform: Platform) -> Result<Valid, Vec<String>> {
         let mut problems = Vec::new();
@@ -132,12 +191,20 @@ impl Raw {
         };
 
         let (database, local_database) = self.database(&mut problems);
+        #[cfg(feature = "proxy")]
         let mut kbf = self
             .kbf
-            .validate(self.mode, self.proxy.proxy, &mut problems);
+            .validate(self.mode, self.behind_proxy(), &mut problems);
+        #[cfg(feature = "proxy")]
         let proxy = self
             .proxy
             .validate(platform, self.mode, &self.kbf, &mut kbf, &mut problems);
+        #[cfg(not(feature = "proxy"))]
+        let kbf = self
+            .kbf
+            .validate(self.mode, self.behind_proxy(), &mut problems);
+        #[cfg(not(feature = "proxy"))]
+        self.check_all_in_one(&mut problems);
         let installer_toml = paths::installer_toml(platform);
         if self
             .installer_config
@@ -161,6 +228,7 @@ impl Raw {
             min_generation: self.min_generation,
             database,
             kbf,
+            #[cfg(feature = "proxy")]
             proxy,
             local_database,
         })

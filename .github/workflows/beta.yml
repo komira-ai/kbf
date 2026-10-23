@@ -307,7 +307,7 @@ jobs:
       - run: cargo clippy -p kbf-state --features postgres --all-targets --locked -- -D warnings
       - run: cargo test -p kbf-state --features postgres --locked -- --include-ignored
       # The installer's `setup` and update step over a real schema (crates/kbf-setup/src/database_tests.rs).
-      - run: 'cargo test -p kbf-setup --locked --lib -- --include-ignored database:: setup_creates_the_schema'
+      - run: 'cargo test -p kbf-setup --features proxy --locked --lib -- --include-ignored database:: setup_creates_the_schema'
       - run: 'cargo test -p kbf-installer --locked --lib --test binary -- --include-ignored database:: setup_creates_the_schema'
       # The server over Postgres: the flag opens it (tests/state_store_postgres.rs), and the
       # farm's restart tests run on a schema of their own (`over_postgres` in tests/state_store.rs).
@@ -576,7 +576,7 @@ jobs:
       - run: 'cargo test -p kbf-installer --locked -- --skip ::database:: --skip database::tests::provisioned:: --skip database::tests::setup_creates_the_schema_once --skip database::tests::the_update_step_migrates --skip database::tests::the_bounded_step_gives_up --skip setup_creates_the_schema_over_a_real_server'
       # The same for the setup library (crates/kbf-setup), which holds the `database` module and
       # setup/more_tests.rs.
-      - run: 'cargo test -p kbf-setup --locked -- --skip database::tests::provisioned:: --skip database::tests::setup_creates_the_schema_once --skip database::tests::the_update_step_migrates --skip database::tests::the_bounded_step_gives_up --skip setup_creates_the_schema_over_a_real_server'
+      - run: 'cargo test -p kbf-setup --features proxy --locked -- --skip database::tests::provisioned:: --skip database::tests::setup_creates_the_schema_once --skip database::tests::the_update_step_migrates --skip database::tests::the_bounded_step_gives_up --skip setup_creates_the_schema_over_a_real_server'
       - name: Fetch gh (pinned release, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_macOS_arm64.zip" --sha256 "$GH_SHA256" --out "$RUNNER_TEMP/tools/gh" --extract zip --member "gh_${GH_VERSION}_macOS_arm64/bin/gh"
       - name: The pinned gh verifies a real attestation offline

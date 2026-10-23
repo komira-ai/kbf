@@ -49,7 +49,10 @@
 //!   naming `kbf_proxy` or `proxy_verb`: the root half shares the installer's binary with the proxy verb and
 //!   nothing else;
 //! - any file of the setup library (`kbf-setup/src`, which `kbf-installer` re-exports) outside
-//!   `SETUP_MAY_NAME_THE_PROXY` naming `kbf_proxy`.
+//!   `SETUP_MAY_NAME_THE_PROXY` naming `kbf_proxy`;
+//! - the `kbf` binary (`kbf-cli`) linking the proxy: `kbf setup` is built on the setup library
+//!   without its `proxy` feature (`kbf-installer` turns it on), so the tree of
+//!   `cargo build -p kbf-cli` holds `kbf-setup` and no `kbf-proxy`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -531,6 +534,8 @@ const MAY_NAME_THE_PROXY: &[&str] = &[
 /// table the proxy verb reads (`installer_toml.rs`) and the table `setup --proxy` writes
 /// (`setup/proxy.rs`, which builds the table the proxy would read, with the proxy's own
 /// defaults and checks). `setup` runs as root; the rest of the library names no proxy type.
+/// Both are behind the library's `proxy` feature, which `kbf setup` (the `kbf` binary) does
+/// not turn on.
 const SETUP_MAY_NAME_THE_PROXY: &[&str] = &["installer_toml.rs", "setup/proxy.rs"];
 
 /// The files that may name the verb's module (`proxy_verb`): the dispatch and its tests, and the
@@ -654,5 +659,91 @@ fn the_setup_library_names_the_proxy_only_where_it_writes_the_table() {
         violations.is_empty(),
         "these setup files name kbf_proxy, but only {SETUP_MAY_NAME_THE_PROXY:?} may: \
          {violations:?}"
+    );
+}
+
+/// The names of the crates `cargo build -p <package>` links, from `cargo tree` over the normal
+/// edges. Unlike the `cargo metadata` graph above, whose features are those of the whole
+/// workspace (the installer turns the setup library's `proxy` feature on for everyone), this
+/// resolves the features of the one package, as building it alone does.
+fn linked_by(package: &str) -> BTreeSet<String> {
+    let cargo = std::env::var("CARGO").expect("CARGO is set when cargo runs a test");
+    let out = Command::new(cargo)
+        .args(["tree", "--locked", "--edges", "normal", "--prefix", "none"])
+        .args(["--format", "{p}", "--package", package])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run cargo tree");
+    assert!(
+        out.status.success(),
+        "cargo tree failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .expect("cargo tree prints text")
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Asserts that the tree of `cargo build -p kbf-cli` holds the setup library (`kbf setup` is
+/// built on it) and neither the proxy nor the installer: the `kbf` binary takes the library
+/// without its `proxy` feature. The installer's tree does hold the proxy, so the walk can see
+/// the edge it guards.
+#[test]
+fn the_kbf_binary_links_the_setup_library_and_not_the_proxy() {
+    let kbf = linked_by("kbf-cli");
+    assert!(
+        kbf.contains("kbf-setup"),
+        "kbf-cli's tree must hold kbf-setup, or this walk proves nothing: {kbf:?}"
+    );
+    let installer = linked_by("kbf-installer");
+    for name in ["kbf-setup", "kbf-proxy"] {
+        assert!(
+            installer.contains(name),
+            "the installer's tree must hold {name}: {installer:?}"
+        );
+    }
+    let reached: Vec<&str> = ["kbf-proxy", "kbf-installer"]
+        .into_iter()
+        .filter(|name| kbf.contains(*name))
+        .collect();
+    assert!(
+        reached.is_empty(),
+        "the kbf binary links {reached:?}: kbf-cli must depend on kbf-setup without its \
+         `proxy` feature, and on no crate that turns it on"
+    );
+}
+
+/// Asserts that the release workflow builds the `kbf` binary in a `cargo build` of its own: no
+/// build line that names `kbf-cli` also names `kbf-installer` or `kbf-deploy` (which depends on
+/// it). Built in one command with either, cargo would build the setup library once for both,
+/// with the installer's `proxy` feature, and `kbf` would link the proxy whatever its own tree
+/// says. At least one line builds `kbf-cli`, or the check proves nothing.
+#[test]
+fn the_release_workflow_builds_the_kbf_binary_apart_from_the_installer() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.github/workflows/artifacts.yml");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    let builds_kbf: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter(|line| line.contains("cargo build"))
+        .filter(|line| line.contains("-p kbf-cli"))
+        .collect();
+    assert!(!builds_kbf.is_empty(), "no line of {path:?} builds kbf-cli");
+    let together: Vec<&&str> = builds_kbf
+        .iter()
+        .filter(|line| {
+            ["kbf-installer", "kbf-deploy"]
+                .iter()
+                .any(|n| line.contains(n))
+        })
+        .collect();
+    assert!(
+        together.is_empty(),
+        "kbf-cli is built with the installer, which turns the setup library's `proxy` feature \
+         on for it: {together:?}"
     );
 }
