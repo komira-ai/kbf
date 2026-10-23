@@ -2471,6 +2471,7 @@ dependencies = [
  "rustix",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
