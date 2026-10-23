@@ -2,9 +2,9 @@
 //! host goes back to the release that ran before.
 //!
 //! A new release may raise the log's machine version the first time it starts (kbf#1278), and
-//! an older binary refuses a raised log. So a rollback that only moves the links would leave a
-//! node that cannot start. The installer therefore keeps a copy of the log as the older
-//! release left it, and puts it back before the older release starts again.
+//! a binary from before skipped entries refuses a raised log. So a rollback that only moves the
+//! links would leave a node that cannot start. The installer therefore keeps a copy of the
+//! log as the older release left it, and puts it back before the older release starts again.
 //!
 //! Where the copy is made: at the first start of a release on trial, from `boot-check`, which
 //! the unit runs as `ExecStartPre=` after the old process has stopped and before the new one
