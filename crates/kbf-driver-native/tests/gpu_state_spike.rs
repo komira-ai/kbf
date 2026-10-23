@@ -153,7 +153,7 @@ struct Where {
     logs: PathBuf,
 }
 
-fn snapshot(w: &Where, label: &str) -> Snap {
+fn snapshot(w: &Where, label: &str, full: bool) -> Snap {
     let started = Instant::now();
     let uid = w.uid;
     let all = |_: &Path, _: u32| true;
@@ -177,25 +177,31 @@ fn snapshot(w: &Where, label: &str) -> Snap {
         "var-folders-owned-by-uid",
         tree(Path::new("/private/var/folders"), &[], &|_, u| u == uid),
     ));
-    let db = |p: &Path, u: u32| p.starts_with("/private/var/db") || u == uid;
-    let skip: [&Path; 3] = [
-        Path::new("/private/var/vm"),
-        Path::new("/private/var/folders"),
-        &w.home,
-    ];
     let mut rest = Tree::new();
-    for root in ["/private/var", "/Library", "/Users", "/private/tmp", "/cores", "/Applications"] {
-        walk(Path::new(root), &skip, &|p, u| db(p, u) || p.starts_with("/Library/Caches"), &mut rest);
+    if full {
+        let db = |p: &Path, u: u32| p.starts_with("/private/var/db") || u == uid;
+        let skip: [&Path; 3] = [
+            Path::new("/private/var/vm"),
+            Path::new("/private/var/folders"),
+            &w.home,
+        ];
+        for root in ["/private/var", "/Library", "/Users", "/private/tmp", "/cores"] {
+            walk(Path::new(root), &skip, &|p, u| db(p, u) || p.starts_with("/Library/Caches"), &mut rest);
+        }
+    } else {
+        for root in ["/private/var/protected", "/private/var/db/mds", "/private/tmp", "/private/var/tmp"] {
+            walk(Path::new(root), &[], &|_, u| u == uid, &mut rest);
+        }
     }
     let split = |keep: &dyn Fn(&str) -> bool| -> Tree {
         rest.iter().filter(|(k, _)| keep(k)).map(|(k, v)| (k.clone(), v.clone())).collect()
     };
-    places.push(("var-db", split(&|k| k.starts_with("/private/var/db"))));
+    places.push(("var-db", split(&|k| k.starts_with("/private/var/db") && full)));
     places.push(("Library-Caches", split(&|k| k.starts_with("/Library/Caches"))));
     places.push((
         "owned-by-uid-elsewhere",
         rest.iter()
-            .filter(|(k, v)| v.uid == uid && !k.starts_with("/private/var/db") && !k.starts_with("/Library/Caches"))
+            .filter(|(k, v)| v.uid == uid && !k.starts_with("/Library/Caches") && !(full && k.starts_with("/private/var/db") && !k.contains("/mds/")))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
     ));
@@ -269,7 +275,7 @@ fn new_in<'a>(base: &Snap, now: &'a Snap, ignore: &Path) -> Vec<(&'static str, &
     out
 }
 
-fn report_new(label: &str, base: &Snap, now: &Snap, ignore: &Path) -> Vec<String> {
+fn report_new(label: &str, uid: u32, base: &Snap, now: &Snap, ignore: &Path) -> Vec<(String, bool)> {
     let found = new_in(base, now, ignore);
     let mut by_place: BTreeMap<&str, usize> = BTreeMap::new();
     for (place, path, item) in &found {
@@ -280,7 +286,12 @@ fn report_new(label: &str, base: &Snap, now: &Snap, ignore: &Path) -> Vec<String
         }
     }
     println!("NEWCOUNT {label} {by_place:?}");
-    found.iter().map(|(_, p, _)| (*p).clone()).collect()
+    let needle = format!("/{uid}");
+    found
+        .iter()
+        .filter(|(_, p, i)| i.uid == uid || p.contains(&needle) || p.to_lowercase().contains("metal") || p.to_lowercase().contains("mlx"))
+        .map(|(_, p, i)| ((*p).clone(), i.dir))
+        .collect()
 }
 
 struct Env {
@@ -356,6 +367,7 @@ fn end_processes(uid: u32, label: &str) {
     let _ = Command::new("/usr/bin/pkill").args(["-TERM", "-U", &u]).status();
     std::thread::sleep(GRACE);
     println!("KILL {label} after_term_and_grace processes_of_uid={}", uid_pids(uid));
+    show_processes(uid, &format!("{label}-after-term-grace"));
     let _ = Command::new("/usr/bin/pkill").args(["-KILL", "-U", &u]).status();
     std::thread::sleep(Duration::from_secs(2));
     println!("KILL {label} after_kill processes_of_uid={}", uid_pids(uid));
@@ -371,6 +383,43 @@ async fn lease(slots: &Slots, scratch: &Scratch, n: u32) -> (Slot, PathBuf, Vec<
     let slot = slots.take().await.expect("a slot");
     slot.hand_over(&dir).await.expect("hand over");
     (slot, std::fs::canonicalize(&dir).expect("real"), vars)
+}
+
+fn show_processes(uid: u32, label: &str) {
+    let out = text("/bin/ps", &["-U", &uid.to_string(), "-o", "pid=,ppid=,stat=,comm="]);
+    for l in out.lines() {
+        println!("PS {label} | {}", l.trim());
+    }
+}
+
+/// What the next lease on the same uid reaches of `left`: `ls -ld` on each, `wc -c` on each file.
+fn seen_by(slot: &Slot, env: &Env, dir: &Path, vars: &[(&str, std::ffi::OsString)], tag: &str, left: &[(String, bool)]) {
+    let all: Vec<&str> = left.iter().take(300).map(|(p, _)| p.as_str()).collect();
+    let files: Vec<&str> = left.iter().filter(|(_, d)| !*d).take(300).map(|(p, _)| p.as_str()).collect();
+    if all.is_empty() {
+        println!("SEEN-COUNT {tag} survivors=0");
+        return;
+    }
+    let ls = launch(slot, env, dir, vars, &[], "/bin/ls", &[&["-ld"][..], &all[..]].concat(), 60)
+        .stderr(Stdio::null())
+        .output()
+        .expect("ls");
+    let seen = String::from_utf8_lossy(&ls.stdout).into_owned();
+    let wc = launch(slot, env, dir, vars, &[], "/usr/bin/wc", &[&["-c"][..], &files[..]].concat(), 60)
+        .stderr(Stdio::null())
+        .output()
+        .expect("wc");
+    let read = String::from_utf8_lossy(&wc.stdout).into_owned();
+    println!(
+        "SEEN-COUNT {tag} survivors={} stat_visible={} files={} readable={}",
+        all.len(),
+        seen.lines().count(),
+        files.len(),
+        read.lines().filter(|l| !l.trim_end().ends_with("total")).count()
+    );
+    for l in seen.lines().take(40) {
+        println!("SEEN {tag} | {l}");
+    }
 }
 
 #[ignore = "needs root, real users and the probes: see spike-slot-reach.yml job apps-gpu"]
@@ -391,56 +440,68 @@ async fn gpu_state_after_the_kill_and_after_the_clean_is_recorded() {
     println!("HW {}", text("/usr/sbin/sysctl", &["-n", "hw.model", "hw.memsize", "hw.ncpu"]).replace('\n', " "));
     let slots = Slots::start_with_grace(&pool, Duration::from_secs(20), GRACE, None).expect("slots");
     let user = users.0[0].clone();
+    let uid = user.uid;
 
-    // The first lease only to learn the slot's folders; the baseline is taken before any GPU use.
+    // A first lease only to learn the slot's folders.
     let probe = lease(&slots, &scratch, 0).await;
     let ready = probe.0.ready();
-    let w = Where { home: ready.home.clone(), folders: ready.folders.clone(), uid: user.uid, logs: logs.clone() };
-    println!("SETUP user={} uid={} home={} folders={}", user.name, user.uid, w.home.display(), w.folders.display());
+    let w = Where { home: ready.home.clone(), folders: ready.folders.clone(), uid, logs: logs.clone() };
+    println!("SETUP user={} uid={} home={} folders={}", user.name, uid, w.home.display(), w.folders.display());
     probe.0.release().await;
     let _ = kbf_outputs::remove_tree(&probe.1);
-    let baseline = snapshot(&w, "00-baseline");
+    let baseline = snapshot(&w, "00-baseline", true);
 
     let metal = format!("{}/gpu_probe", env.bin);
     let mlx_py = format!("{}/venv/bin/python", env.bin);
     let mlx_script = format!("{}/mlx_probe.py", env.bin);
-    let mut survivors: Vec<String> = Vec::new();
-    for round in 1..=2u32 {
+
+    // The control: a lease that runs a program with no GPU and Python without MLX, so that
+    // what any process of the uid leaves (security daemons, launch services) is told apart.
+    {
+        let (slot, dir, vars) = lease(&slots, &scratch, 1).await;
+        run_arm(&slot, &env, &dir, &vars, "C-true", "/usr/bin/true", &[]);
+        drop(snapshot(&w, "C1-after-true", false));
+        run_arm(&slot, &env, &dir, &vars, "C-python", &mlx_py, &["-c", "print('no gpu')"]);
+        let after = snapshot(&w, "C2-after-python", false);
+        report_new("C-after-python", uid, &baseline, &after, &dir);
+        end_processes(uid, "C");
+        slot.reclaim(&dir).await.expect("reclaim");
+        let _ = kbf_outputs::remove_tree(&dir);
+        slot.release().await;
+        let cleaned = snapshot(&w, "C3-after-clean", false);
+        report_new("C-after-clean", uid, &baseline, &cleaned, &dir);
+    }
+
+    let mut survivors: Vec<(String, bool)> = Vec::new();
+    for round in 1..=3u32 {
         let tag = format!("L{round}");
-        let (slot, dir, vars) = lease(&slots, &scratch, round).await;
-        if round == 2 && !survivors.is_empty() {
-            // What the next lease on the same uid can reach of what survived the clean.
-            let list: Vec<&str> = survivors.iter().take(300).map(String::as_str).collect();
-            let out = launch(&slot, &env, &dir, &vars, &[], "/bin/ls", &[&["-ld"][..], &list[..]].concat(), 60)
-                .stderr(Stdio::null())
-                .output()
-                .expect("ls");
-            let seen = String::from_utf8_lossy(&out.stdout);
-            println!("SEEN-COUNT {tag} survivors={} stat_visible={}", list.len(), seen.lines().count());
-            for l in seen.lines().take(60) {
-                println!("SEEN {tag} | {l}");
-            }
+        let (slot, dir, vars) = lease(&slots, &scratch, round + 1).await;
+        if round > 1 {
+            seen_by(&slot, &env, &dir, &vars, &tag, &survivors);
         }
         for arm in ["a", "b"] {
             run_arm(&slot, &env, &dir, &vars, &format!("{tag}-metal-{arm}"), &metal, &[]);
+            let s = snapshot(&w, &format!("{round}0-{tag}-after-metal-{arm}"), false);
+            report_new(&format!("{tag}-after-metal-{arm}"), uid, &baseline, &s, &dir);
         }
         for arm in ["a", "b"] {
             run_arm(&slot, &env, &dir, &vars, &format!("{tag}-mlx-{arm}"), &mlx_py, &[&mlx_script]);
+            let s = snapshot(&w, &format!("{round}1-{tag}-after-mlx-{arm}"), false);
+            report_new(&format!("{tag}-after-mlx-{arm}"), uid, &baseline, &s, &dir);
         }
-        let after_arms = snapshot(&w, &format!("{round}1-{tag}-after-arms-processes-ended"));
-        report_new(&format!("{tag}-after-arms"), &baseline, &after_arms, &dir);
 
         let (mut h1, f1) = start_holder(&slot, &env, &dir, &vars, &format!("{tag}-hold-metal"), &metal, &[]);
         let (mut h2, f2) = start_holder(&slot, &env, &dir, &vars, &format!("{tag}-hold-mlx"), &mlx_py, &[&mlx_script]);
         println!("HOLDERS {tag} metal_ready={} mlx_ready={}", wait_for(&f1, "HOLD_READY", 180), wait_for(&f2, "HOLD_READY", 240));
-        let during = snapshot(&w, &format!("{round}2-{tag}-during"));
-        report_new(&format!("{tag}-during"), &baseline, &during, &dir);
+        let during = snapshot(&w, &format!("{round}2-{tag}-during"), round == 1);
+        report_new(&format!("{tag}-during"), uid, &baseline, &during, &dir);
 
-        end_processes(user.uid, &tag);
+        end_processes(uid, &tag);
+        show_processes(uid, &format!("{tag}-after-kill"));
         let _ = h1.wait();
         let _ = h2.wait();
-        let killed = snapshot(&w, &format!("{round}3-{tag}-after-kill"));
-        report_new(&format!("{tag}-after-kill"), &baseline, &killed, &dir);
+        let killed = snapshot(&w, &format!("{round}3-{tag}-after-kill"), round == 1);
+        report_new(&format!("{tag}-after-kill"), uid, &baseline, &killed, &dir);
 
         // The lease directory goes first, as the daemon does, then the clean.
         slot.reclaim(&dir).await.expect("reclaim");
@@ -448,13 +509,13 @@ async fn gpu_state_after_the_kill_and_after_the_clean_is_recorded() {
         let t = Instant::now();
         slot.release().await;
         println!("CLEAN {tag} ms={} free_slots={}", t.elapsed().as_millis(), slots.count());
-        let cleaned = snapshot(&w, &format!("{round}4-{tag}-after-clean"));
-        survivors = report_new(&format!("{tag}-after-clean"), &baseline, &cleaned, &dir);
+        let cleaned = snapshot(&w, &format!("{round}4-{tag}-after-clean"), true);
+        survivors = report_new(&format!("{tag}-after-clean"), uid, &baseline, &cleaned, &dir);
         println!("SURVIVORS {tag} {}", survivors.len());
     }
     drop(slots);
     drop(users);
-    let last = snapshot(&Where { uid: user.uid, ..w }, "99-after-users-deleted");
-    report_new("after-users-deleted", &baseline, &last, Path::new("/nonexistent"));
+    let last = snapshot(&Where { uid, ..w }, "99-after-users-deleted", true);
+    report_new("after-users-deleted", uid, &baseline, &last, Path::new("/nonexistent"));
     println!("LEASES_ROOT_MODE {LEASES_ROOT_MODE:o} DONE");
 }
