@@ -422,7 +422,7 @@ mod tests {
     #[test]
     fn the_worst_failure_is_reported_and_the_first_of_equals() {
         assert_eq!(gate(&[facts(1), facts(2)]), Ok(()));
-        let mut down = facts(2);
+        let mut down = facts(5);
         down.state = MemberState::Down;
         let mut owing3 = facts(3);
         owing3.repair_debt = Some(5);
@@ -431,7 +431,7 @@ mod tests {
         assert_eq!(
             gate(&[facts(1), owing4.clone(), owing3.clone(), down.clone()]),
             Err(GateFail::NotActive {
-                member: MemberId(2),
+                member: MemberId(5),
                 state: MemberState::Down
             })
         );

@@ -178,7 +178,7 @@ fn a_policy_whose_waits_outlast_the_restart_deadline_is_refused() {
 
 /// Catches: a restart re-running a step it already took: only entering
 /// `Activating` orders the activation, so a resume re-issues it for that phase and for no
-/// other (C20: no host activated twice), and with the row's own order id, not a new one.
+/// other (no host is activated twice), and with the row's own order id, not a new one.
 #[test]
 fn entry_commands_name_the_activate_order_for_one_phase_only() {
     let phases = [
