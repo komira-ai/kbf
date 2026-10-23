@@ -413,6 +413,7 @@ fn workflow_run_is_refused_in_every_trigger_form() {
         "on: workflow_run",
         "on: [push, workflow_run]",
         "on:\n  workflow_run:\n    workflows: [ci]",
+        "on:\n  workflow_run:\n    workflows: [pipeline]\n    types: [completed]",
         "on: {Workflow_Run: {workflows: [ci]}}",
     ] {
         refused_text(
@@ -538,7 +539,7 @@ fn signing_scopes_are_allowed_for_a_push_to_main_only() {
 }
 
 /// The `if:` line under which a job may create a release, as the lint requires it.
-const TAG_PUSH_IF: &str = "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}\n";
+const TAG_PUSH_IF: &str = "    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}\n";
 
 #[test]
 fn contents_write_needs_a_job_that_runs_only_for_a_release_push_to_main() {
@@ -551,12 +552,14 @@ fn contents_write_needs_a_job_that_runs_only_for_a_release_push_to_main() {
     for cond in [
         "",
         SIGNING_PUSH_IF,
-        "    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true'\n",
+        "    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true'\n",
         "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}\n",
         "    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}\n",
         "    if: ${{ github.event_name == 'workflow_dispatch' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}\n",
-        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' || true }}\n",
-        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' }}\n",
+        "    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' || true }}\n",
+        "    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' }}\n",
+        "    if: ${{ github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}\n",
     ] {
         let body =
             format!("    runs-on: ubuntu-latest\n{cond}    permissions: {{contents: write}}\n");

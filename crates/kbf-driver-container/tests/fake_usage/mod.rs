@@ -321,7 +321,7 @@ async fn a_timed_out_lease_reports_its_cpu_and_peak_memory() {
     assert!(!line.contains("oom="), "{line}");
 }
 
-/// Catches: the lease path not recording what the lease started under (the mutant that
+/// Catches: the lease path not recording what the lease started under (the defect that
 /// replaces the start's reading with the default): the CPU booked for the lease and the
 /// node's CPU pressure at its start must ride in the result's usage, on the cgroup basis;
 /// and a node without a pressure file must report the pressure absent, not zero.

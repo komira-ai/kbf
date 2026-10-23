@@ -252,7 +252,7 @@ fn every_case() -> Vec<(&'static str, Refusal)> {
 /// empty or runs over a line: every case is built, its code must be the one listed
 /// for it, and no two are alike.
 ///
-/// Mutant seen red: two variants given the same code string.
+/// Catches: two variants given the same code string.
 #[test]
 fn every_refusal_has_its_own_stable_code_and_a_one_line_message() {
     let cases = every_case();
@@ -302,7 +302,7 @@ fn a_release_that_differs_is_its_own_refusal_and_other_errors_keep_their_cause()
 /// a verdict on the release (a tool that would not start) reported as one. Every case is
 /// listed with its word; a case with `None` is a failure, exit 1, not a refusal, exit 3.
 ///
-/// Mutant seen red: `attestation` and `hash` swapped.
+/// Catches: `attestation` and `hash` swapped.
 #[test]
 fn every_refusal_is_reported_under_the_word_of_the_contract() {
     let expected = [

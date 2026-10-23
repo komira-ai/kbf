@@ -198,7 +198,7 @@ async fn sigterm_ends_open_execute_streams_unavailable() {
 /// action is in flight (Buck2 never reconnects, so the action would fail). With no
 /// deadline (the default) the stream stays open and the server keeps running after the
 /// signal; here it is still there after a pause and nothing has been sent on it. The
-/// planted mutant is the signal handler closing the streams as it drains.
+/// defect it catches is the signal handler closing the streams as it drains.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sigterm_keeps_an_open_stream_when_there_is_no_deadline() {
     let (mut server, reapi, worker) = Running::start(&[]);
@@ -234,8 +234,8 @@ async fn sigterm_keeps_an_open_stream_when_there_is_no_deadline() {
 
 /// Catches (kbf#791): a server that sends nothing on an idle Execute
 /// stream, so a load balancer's idle timeout cuts it. With `--progress-interval-secs 1`
-/// an operation waiting for a worker is sent again, same name, not done. The planted
-/// mutant is a server that never runs the progress ticker (the read times out).
+/// an operation waiting for a worker is sent again, same name, not done. The
+/// defect it catches is a server that never runs the progress ticker (the read times out).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_idle_execute_stream_is_sent_progress() {
     let (_server, reapi, worker) = Running::start(&["--progress-interval-secs", "1"]);
@@ -325,7 +325,7 @@ async fn expects_a_ping_from(addr: SocketAddr, what: &str) {
 
 /// Catches (kbf#791): a REAPI listener built without HTTP/2 keepalive.
 /// A client that connects, says nothing and answers nothing is sent a PING frame by
-/// the server within `--http2-keepalive-interval-secs`. The planted mutant is
+/// the server within `--http2-keepalive-interval-secs`. The defect it catches is
 /// `keepalive` not applied to the REAPI builder (no PING arrives).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_reapi_listener_pings_an_idle_connection() {
@@ -340,7 +340,7 @@ async fn the_reapi_listener_pings_an_idle_connection() {
 }
 
 /// The same for the worker listener, which a daemon's stream (a lease's whole life)
-/// crosses a proxy on. The planted mutant is `keepalive` not applied to the worker
+/// crosses a proxy on. The defect it catches is `keepalive` not applied to the worker
 /// builder: the REAPI test above stays green, this one gets no PING.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_worker_listener_pings_an_idle_connection() {
@@ -454,7 +454,7 @@ async fn not_ready(addr: SocketAddr) {
 /// end the drain, and with no shutdown timeout (the default) nothing else would.
 /// The first SIGTERM drains and the stream is kept (the status names it: one stream
 /// open, one operation queued); the second ends the stream UNAVAILABLE and the server
-/// exits 0. The planted mutant is `serve_escalating` not spawning the escalation.
+/// exits 0. The defect it catches is `serve_escalating` not spawning the escalation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_sigterm_ends_the_drain() {
     let (mut server, line) = Running::start_line(&["--api-listen", "127.0.0.1:0"]);
@@ -503,7 +503,7 @@ async fn a_second_sigterm_ends_the_drain() {
 /// Catches a drain endpoint that does not drain the binary: `POST /v1/frontend/drain`
 /// takes it out of `/readyz`, refuses a new Execute, and keeps the open stream; the
 /// server then exits 0 by itself when the stream is gone, with no signal (so the run
-/// writes its coverage). The planted mutant is the endpoint answering 200 and doing
+/// writes its coverage). The defect it catches is the endpoint answering 200 and doing
 /// nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_drain_endpoint_drains_the_binary_and_it_exits_when_the_streams_are_done() {

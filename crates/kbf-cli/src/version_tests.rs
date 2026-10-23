@@ -35,7 +35,7 @@ fn seq_is_the_rule_applied_to_the_checkout_built() {
 /// does not declare the relay is one the frontend cannot learn from that a host fetches nothing.
 /// The line carries it in the sorted place between `protocol` and `seq`.
 ///
-/// Mutants to plant: the key removed; the key written as `0`; the key written as text.
+/// Catches: the key removed; the key written as `0`; the key written as text.
 #[test]
 fn relay_is_the_level_this_build_declares() {
     assert_eq!(identity()["relay"], serde_json::json!(RELAY));
@@ -52,7 +52,7 @@ fn relay_is_the_level_this_build_declares() {
 /// printed as something other than what the build knows (shortened, quoted twice, another
 /// field's text). The line carries it in the sorted place between `commit` and `meta_log`.
 ///
-/// Mutants to plant: the key never inserted; the key written as `BUILD_COMMIT` (12 digits).
+/// Catches: the key never inserted; the key written as `BUILD_COMMIT` (12 digits).
 #[test]
 fn commit_full_is_printed_when_the_build_knows_it() {
     let said = identity_for(FULL);
@@ -71,7 +71,7 @@ fn commit_full_is_printed_when_the_build_knows_it() {
 /// commit, where an absent field says the build does not know it. Every other field is still
 /// printed.
 ///
-/// Mutant to plant: the `is_empty` test dropped (the key is then printed as `""`).
+/// Catches: the `is_empty` test dropped (the key is then printed as `""`).
 #[test]
 fn commit_full_is_absent_when_the_build_does_not_know_it() {
     let said = identity_for("");
@@ -86,7 +86,7 @@ fn commit_full_is_absent_when_the_build_does_not_know_it() {
 /// (`KBF_BUILD_COMMIT_OVERRIDE`) embeds none, so the empty text and the constant agree there
 /// and only a build from a checkout tells them apart.
 ///
-/// Mutant to plant: `identity` calling `identity_for("")` (red in a build from a checkout).
+/// Catches: `identity` calling `identity_for("")` (red in a build from a checkout).
 #[test]
 fn identity_prints_the_full_commit_the_server_embeds() {
     assert_eq!(identity(), identity_for(kbf_server::BUILD_COMMIT_FULL));

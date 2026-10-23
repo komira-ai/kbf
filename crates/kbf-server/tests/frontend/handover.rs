@@ -484,10 +484,9 @@ async fn a_handover_over_a_postgres_store_is_refused_and_changes_nothing() {
 /// callers it kept without an answer, or Envoy still choosing a frontend that can start
 /// nothing: the first goes not ready as soon as its successor's connection closes, a
 /// start of the successor again finds nobody serving on the control socket (its file is
-/// stale), takes the store cold (the epoch is bumped, the daemon's runs are lost and run
-/// again), and the first, which kept the client's stream open, answers it from the result
-/// the new one writes, and ends. Mutants: no watch on the successor's connection; the
-/// holder exiting at the release.
+/// stale), takes the store cold (the epoch is kept; the daemon lists none of its runs, so
+/// they run again), and the first, which kept the client's stream open, answers it from
+/// the result the new one writes, and ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_successor_that_dies_after_the_release_is_started_again_and_the_streams_finish() {
     let node = Node::start().await;
@@ -514,12 +513,12 @@ async fn a_successor_that_dies_after_the_release_is_started_again_and_the_stream
     let new = Proc::taking_over(&flags).await;
     let reached = Client::connect(new.reapi, new.worker).await;
     let mut daemon = reached.daemon("node-a", 4, 8).await;
-    assert_ne!(
+    assert_eq!(
         daemon.epoch,
         first.lease_id.expect("a lease id").term,
-        "a cold start bumps the epoch"
+        "a cold start moved the epoch"
     );
-    // A daemon that sees a new epoch kills the runs it had and lists none.
+    // A daemon that starts again lists none of the runs it had.
     assert!(daemon.heartbeat(&[]).await);
     let second = daemon.start().await;
     assert_ne!(second.lease_id, first.lease_id, "the operation runs again");

@@ -104,7 +104,7 @@ fn counter_of(high_water: u64) -> String {
 /// Catches an id that is not the wall clock in milliseconds (the real clock is the one
 /// path no other test uses), and a counter another user could read or change.
 ///
-/// Mutants planted: the clock read in seconds (the id is below the lower bound); the
+/// Catches: the clock read in seconds (the id is below the lower bound); the
 /// counter written with mode 0644 (the mode assertion fails).
 #[test]
 fn an_id_is_the_wall_clock_in_milliseconds_and_the_counter_is_private() {
@@ -135,7 +135,7 @@ fn an_id_is_the_wall_clock_in_milliseconds_and_the_counter_is_private() {
 /// that ignore the clock (the counter alone, so they restart from 1 and sort below what an
 /// earlier root half acted on), and a counter that does not hold the last id.
 ///
-/// Mutants planted: `id = wall` (7000 three times); `id = high_water + 1` (1, 2, 3).
+/// Catches: `id = wall` (7000 three times); `id = high_water + 1` (1, 2, 3).
 #[test]
 fn ids_follow_the_clock_and_never_repeat_inside_a_millisecond() {
     let d = dirs("follow");
@@ -153,7 +153,7 @@ fn ids_follow_the_clock_and_never_repeat_inside_a_millisecond() {
 /// the root half has already acted on, which it drops without a word. At the high-water
 /// mark exactly, the id is still one above it.
 ///
-/// Mutants planted: `max` dropped from the id (4000 after 5000); `max` turned into `min`
+/// Catches: `max` dropped from the id (4000 after 5000); `max` turned into `min`
 /// (4000 after 5000).
 #[test]
 fn a_clock_stepped_back_still_increases() {
@@ -171,7 +171,7 @@ fn a_clock_stepped_back_still_increases() {
 /// Catches a restart that numbers again from the clock while the clock is behind the
 /// counter, and a counter that is not read at open.
 ///
-/// Mutant planted: the counter not read at open (the first id after the restart is 1000).
+/// Catches: the counter not read at open (the first id after the restart is 1000).
 #[test]
 fn ids_keep_growing_across_a_restart_with_the_clock_behind_the_counter() {
     let d = dirs("restart");
@@ -192,7 +192,7 @@ fn ids_keep_growing_across_a_restart_with_the_clock_behind_the_counter() {
 /// between the two (a crash cannot be staged, its state can). The restart must not hand
 /// the reserved id out again; the id is a gap.
 ///
-/// Mutant planted: the record written before the counter (the failed write reserved
+/// Catches: the record written before the counter (the failed write reserved
 /// nothing, so the restart hands out 101).
 #[test]
 fn a_crash_between_the_counter_and_the_record_leaves_a_gap_and_no_id_is_reused() {
@@ -223,7 +223,7 @@ fn a_crash_between_the_counter_and_the_record_leaves_a_gap_and_no_id_is_reused()
 /// replay. The temp file of the counter cannot be made, the write fails, no record exists,
 /// and nothing was reserved.
 ///
-/// Mutant planted: the record written before the counter (a record is in `orders/` after
+/// Catches: the record written before the counter (a record is in `orders/` after
 /// the failed write).
 #[test]
 fn no_record_is_written_when_the_counter_cannot_be_made_durable() {
@@ -285,7 +285,7 @@ impl Durable for Spy {
 /// is synced no record is visible yet, so a crash at any point leaves the counter at or
 /// ahead of every record. A sync dropped, or moved across the rename, changes the log.
 ///
-/// Mutants planted: the record written before the counter (one record visible at the
+/// Catches: the record written before the counter (one record visible at the
 /// file sync); the directory sync dropped; the file sync dropped; the rename moved after
 /// the directory sync.
 #[test]
@@ -337,7 +337,7 @@ impl Durable for Flaky {
 /// id the counter may not hold): whether the data sync or the directory sync fails, the
 /// write fails, no record is visible, and once the disk recovers the same id is free.
 ///
-/// Mutants planted: the result of the data sync discarded; the result of the directory
+/// Catches: the result of the data sync discarded; the result of the directory
 /// sync discarded (a record is written in each case).
 #[test]
 fn a_failed_sync_of_the_counter_stops_the_write_before_the_record() {
@@ -364,8 +364,8 @@ fn a_failed_sync_of_the_counter_stops_the_write_before_the_record() {
 }
 
 /// Catches an `orders/` that cannot be made being accepted: a file stands where it belongs.
-/// No mutant: this covers the error path of the spool's open, which cannot be ignored
-/// without a spool to hand on.
+/// This covers the error path of the spool's open, which cannot be ignored without a
+/// spool to hand on.
 #[test]
 fn an_orders_path_that_is_a_file_is_refused_at_open() {
     let d = dirs("orders-file");
@@ -394,7 +394,7 @@ impl Durable for Slow {
 /// clock is fixed, so with the writers serialised the ids are exactly 1000..1040: any
 /// repeat is a missing file, and a counter written out of order is a counter below 1039.
 ///
-/// Mutants planted, each red in 3 of 3 runs (a worker's write fails on the counter's shared
+/// Catches (a worker's write fails on the counter's shared
 /// temp file, or an id repeats): the lock held only while the high-water mark is read, and
 /// taken again to store the id; the lock held while the id is chosen and released before
 /// the counter is written.
@@ -431,7 +431,7 @@ fn two_writers_never_share_an_id_and_the_counter_ends_on_the_last() {
 /// once, while the lock is held, and the next write still works (nothing was reserved, so
 /// the counter is as it was).
 ///
-/// Mutant planted: `lock().unwrap()` in place of taking the guard back from the poison.
+/// Catches: `lock().unwrap()` in place of taking the guard back from the poison.
 #[test]
 fn a_panic_inside_a_write_does_not_stop_the_writes_after_it() {
     let d = dirs("poison");
@@ -453,7 +453,7 @@ fn a_panic_inside_a_write_does_not_stop_the_writes_after_it() {
 /// cleared): the ids start again from the clock, which is ahead of the old ones, and the
 /// open writes the counter anew.
 ///
-/// Mutant planted: a missing file treated as an error (the open fails).
+/// Catches: a missing file treated as an error (the open fails).
 #[test]
 fn a_lost_counter_starts_again_from_the_clock() {
     let d = dirs("lost");
@@ -475,7 +475,7 @@ fn a_lost_counter_starts_again_from_the_clock() {
 /// spool would sort below what the root half acted on) or cannot be read at all; and a
 /// state directory that is not there, which fails at open and not at the first update.
 ///
-/// Mutants planted: `deny_unknown_fields` dropped (the extra key is accepted); the epoch
+/// Catches: `deny_unknown_fields` dropped (the extra key is accepted); the epoch
 /// check dropped (epoch 2 is accepted); a read error treated as a missing file (the link
 /// loop is replaced by a new counter and the open succeeds).
 #[test]
@@ -517,7 +517,7 @@ fn a_counter_that_cannot_be_trusted_is_refused_at_open() {
 /// Catches a counter at the largest id wrapping to zero: the next id would be one already
 /// used. The write is refused, no record is written, the counter is as it was.
 ///
-/// Mutant planted: `checked_add` replaced by `wrapping_add` (the write succeeds, with the
+/// Catches: `checked_add` replaced by `wrapping_add` (the write succeeds, with the
 /// clock's id).
 #[test]
 fn the_largest_id_is_refused_and_not_wrapped() {
@@ -538,7 +538,7 @@ fn the_largest_id_is_refused_and_not_wrapped() {
 /// refusal that reserves an id. The limit is [`MAX_PENDING`]; a record the root half has
 /// taken makes room again. Both writers report it, and the reason names the count.
 ///
-/// Mutants planted: the guard removed; `>=` turned into `>` (the 49th is written);
+/// Catches: the guard removed; `>=` turned into `>` (the 49th is written);
 /// every file counted, not only records (the fill stops short).
 #[test]
 fn a_full_orders_dir_refuses_and_reserves_nothing() {
@@ -578,7 +578,7 @@ fn a_full_orders_dir_refuses_and_reserves_nothing() {
 /// reserves an id: the directory is gone, the write fails naming it, the counter is as it
 /// was, and when the directory is back the same id is free.
 ///
-/// Mutant planted: the listing error ignored (the count is taken as zero, the counter
+/// Catches: the listing error ignored (the count is taken as zero, the counter
 /// moves and the record write then fails).
 #[test]
 fn an_orders_dir_that_cannot_be_listed_refuses_and_reserves_nothing() {
@@ -598,7 +598,7 @@ fn an_orders_dir_that_cannot_be_listed_refuses_and_reserves_nothing() {
 /// Catches an `activate` order being written: it would carry no components, which the root
 /// half refuses for it, and the proxy has nothing to activate.
 ///
-/// Mutant planted: `Activate` mapped to the activate record verb (a record is written).
+/// Catches: `Activate` mapped to the activate record verb (a record is written).
 #[test]
 fn an_activate_is_never_written() {
     let d = dirs("activate");
@@ -616,7 +616,7 @@ fn an_activate_is_never_written() {
 /// under the file name its scan keys on, and with no claims. The `frontend_update`'s bytes
 /// are pinned as well: a locator and nothing else, the six keys.
 ///
-/// Mutants planted: `generation` written as 0 (the parsed order differs); the confirm
+/// Catches: `generation` written as 0 (the parsed order differs); the confirm
 /// written with the revert verb; the epoch written as 2 (the file is not under its key);
 /// a `components` key written (the reader refuses the record, and the bytes differ);
 /// `window_s` written as 0 for every record (the parsed windows differ).
@@ -675,7 +675,7 @@ fn what_the_root_half_reads_is_what_was_written() {
 /// input that does is built by hand: an activation, which needs components and facts that
 /// a locator does not carry. The three verbs the proxy writes pass.
 ///
-/// Mutant planted: the `check` call removed from `record` (the activation is built).
+/// Catches: the `check` call removed from `record` (the activation is built).
 #[test]
 fn a_record_the_reader_would_refuse_is_not_built() {
     let locator = |verb| Locator {
@@ -709,7 +709,7 @@ fn a_record_the_reader_would_refuse_is_not_built() {
 /// was, source included: the swap rewrites a record the root half has not yet taken, and a
 /// staged order rewritten as a fetch would fetch.
 ///
-/// Mutants planted: the record built with source `fetch`; the key written for a fetch; the
+/// Catches: the record built with source `fetch`; the key written for a fetch; the
 /// source dropped from the locator that is written again.
 #[test]
 fn a_frontend_update_record_names_its_source_only_when_it_is_not_a_fetch() {
@@ -749,7 +749,7 @@ fn a_frontend_update_record_names_its_source_only_when_it_is_not_a_fetch() {
 /// `revert` with a source is refused when it is built, before the counter moves, and the
 /// `frontend_update` with the same source is built.
 ///
-/// Mutant planted: the source left out of the record (the `confirm` is built).
+/// Catches: the source left out of the record (the `confirm` is built).
 #[test]
 fn a_record_that_names_a_source_for_a_verb_that_takes_none_is_not_built() {
     let locator = |verb| Locator {
@@ -783,7 +783,7 @@ fn a_record_that_names_a_source_for_a_verb_that_takes_none_is_not_built() {
 /// is not; the spool does not claim more than that, since it keeps no list of what it
 /// issued.
 ///
-/// Mutants planted: the `has` check dropped (the sentinel is overwritten); the guard on the
+/// Catches: the `has` check dropped (the sentinel is overwritten); the guard on the
 /// id dropped (101 is written); the id guard `>` turned into `>=` (the locator just issued
 /// is refused); the guard on the verb dropped (the confirm locator is written); the guard
 /// on the epoch dropped; the room check dropped from the rewrite.

@@ -123,7 +123,7 @@ fn activate_pair(
 /// holds an executable (the fake ELF in `releases/<commit>/`), which a coverage run would
 /// scan as an object and fail on. Dropping the rig removes the root, installed or not.
 ///
-/// Defect seen red: the rig without a `Drop`.
+/// Catches: the rig without a `Drop`.
 #[test]
 fn a_rig_takes_its_scratch_root_with_it() {
     let rig = Rig::new("drop");
@@ -139,7 +139,7 @@ fn a_rig_takes_its_scratch_root_with_it() {
 /// handed to `gh` (each its own tarball), unpacked and run, and one bad component, the
 /// second, ends the stage with nothing installed. The macOS set is two components.
 ///
-/// Mutants seen red: the attestation loop over the first component only; the unpack and
+/// Catches: the attestation loop over the first component only; the unpack and
 /// probe loop over the first only.
 #[test]
 fn every_component_of_an_order_is_attested_and_probed() {
@@ -186,7 +186,7 @@ fn every_component_of_an_order_is_attested_and_probed() {
 /// Catches the platform of an arm64 Linux host spelled another way: the order says
 /// `linux-arm64`, and the header the stage accepts is the ELF of machine 183.
 ///
-/// Mutant seen red: the platform derived from the host alone (`linux-x86_64`).
+/// Catches: the platform derived from the host alone (`linux-x86_64`).
 #[test]
 fn an_arm64_linux_release_is_linux_arm64() {
     let rig = rig_on("arm64", Platform::Linux, Arch::Aarch64);
@@ -213,7 +213,7 @@ fn mac_pair() -> [(&'static str, Vec<u8>); 2] {
 /// the release is `darwin-arm64`, and a quarantined or badly signed second component ends
 /// the stage before its binary runs.
 ///
-/// Mutants seen red: the quarantine check dropped; the signature check dropped; either
+/// Catches: the quarantine check dropped; the signature check dropped; either
 /// applied to the first component only.
 #[test]
 fn a_macos_release_is_checked_for_quarantine_and_signature_per_component() {
@@ -263,8 +263,8 @@ fn a_macos_release_is_checked_for_quarantine_and_signature_per_component() {
 /// Catches a stage that cannot tell whether a release is already there going on: a
 /// `releases/<commit>` that cannot be examined (its directory is closed) ends the stage
 /// with the OS error and nothing installed. This covers the examination's error arm; a
-/// mutant that treats the error as "not there" is equivalent here (the rename into the
-/// closed directory fails too), so none is claimed.
+/// change that treats the error as "not there" is equivalent here (the rename into the
+/// closed directory fails too), so it is not claimed.
 #[test]
 fn a_release_directory_that_cannot_be_examined_is_an_error() {
     if me().uid == 0 {
@@ -288,7 +288,7 @@ fn a_release_directory_that_cannot_be_examined_is_an_error() {
 /// release) is its asker's to record, after its own checks; a pipeline that wrote `staged`
 /// left it behind when the asker then refused the release.
 ///
-/// Mutant planted: the install setting `staged` under the lock, as it did.
+/// Catches: the install setting `staged` under the lock, as it did.
 #[test]
 fn the_pipeline_installs_and_never_writes_the_state() {
     let rig = Rig::new("no-state");
@@ -313,7 +313,7 @@ fn the_pipeline_installs_and_never_writes_the_state() {
 /// place) leaves `state.json` byte for byte as it was and makes no backup of it (a write
 /// would make one).
 ///
-/// Mutant planted: the install setting `staged` under the lock, as it did (the other
+/// Catches: the install setting `staged` under the lock, as it did (the other
 /// order's staged release is displaced).
 #[test]
 fn the_pipeline_leaves_a_state_it_finds_as_it_was() {
@@ -341,7 +341,7 @@ fn the_pipeline_leaves_a_state_it_finds_as_it_was() {
 /// the tool-failed code (a failure of the host, so it carries no refusal word), says what
 /// could not run, and nothing is installed.
 ///
-/// Mutant planted: the start error mapped to `Ok` with an empty report.
+/// Catches: the start error mapped to `Ok` with an empty report.
 #[test]
 fn a_binary_that_cannot_be_started_is_a_facts_refusal() {
     let rig = Rig::new("probe-cannot-start");
@@ -362,7 +362,7 @@ fn a_binary_that_cannot_be_started_is_a_facts_refusal() {
 /// Catches a component of size 0 being read (the order's cap check is `0 < size <= max`): it
 /// is refused as `size` before a byte of the file is read or `gh` is run.
 ///
-/// Mutant planted: the zero test dropped.
+/// Catches: the zero test dropped.
 #[test]
 fn a_component_of_size_zero_is_refused_before_it_is_read() {
     let rig = Rig::new("size-zero");
@@ -387,7 +387,7 @@ fn a_component_of_size_zero_is_refused_before_it_is_read() {
 /// and refuses on an unusable one), and neither file is touched (S21: an unusable state is
 /// never overwritten as if empty).
 ///
-/// Mutant planted: the install taking the lock and recording `staged`, as it did (it ended
+/// Catches: the install taking the lock and recording `staged`, as it did (it ended
 /// as `install-failed`).
 #[test]
 fn an_unusable_state_is_left_untouched_by_the_install() {
@@ -407,7 +407,7 @@ fn an_unusable_state_is_left_untouched_by_the_install() {
 /// child does not, so the child handed over something other than it read; the stage ends as
 /// `hash` and runs nothing.
 ///
-/// Mutant planted: the parent's digest not compared with the order's (the on-disk hash alone
+/// Catches: the parent's digest not compared with the order's (the on-disk hash alone
 /// decides).
 #[test]
 fn a_stream_the_parent_hashed_differently_from_the_file_is_a_hash_refusal() {
@@ -435,7 +435,7 @@ fn a_stream_the_parent_hashed_differently_from_the_file_is_a_hash_refusal() {
 /// activation of the same release with the same source is refused as `lease` before
 /// anything is installed, so the skip is the frontend update's alone.
 ///
-/// Mutants seen red: the check skipped for every kind (the activation installs); the check
+/// Catches: the check skipped for every kind (the activation installs); the check
 /// kept for the frontend update (the update is refused as `lease`).
 #[test]
 fn a_frontend_update_does_not_wait_for_leases_and_an_activation_does() {

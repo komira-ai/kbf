@@ -85,8 +85,8 @@ fn the_action(cas: &MemoryCas) -> Digest {
 }
 
 /// Catches the session switch out of order around the action: an action run before the
-/// helper says the user's GUI session is up (the mutant "run before gui/<uid> exists"),
-/// a cleanup that skips `session-idle` (the mutant: the Mac would stay logged in as a
+/// helper says the user's GUI session is up (the defect "run before gui/<uid> exists"),
+/// a cleanup that skips `session-idle` (the catches: the Mac would stay logged in as a
 /// deleted user) or deletes the user before its processes are killed, a phase that does
 /// not say `preparing` before the switch and `restoring` after the action, and a node
 /// not back to `serving`, its record and lease directory gone, when the lease reports.
@@ -213,7 +213,7 @@ async fn the_outcome_survives_the_restart_back() {
     assert_eq!(phase(&after), NodePhase::Serving);
 }
 
-/// Catches a failed cleanup that releases the node (the mutant "release the node after
+/// Catches a failed cleanup that releases the node (the defect "release the node after
 /// a failed cleanup": the next lease would start beside a user that could not be
 /// deleted), a quarantine that does not say why, does not refuse the next lease, or
 /// does not outlive the daemon. The lease itself still reports its action's result. A
@@ -663,7 +663,7 @@ async fn restart_mid_action(
     start(config, fake, cas)
 }
 
-/// Catches a restart mid-action that is taken up instead of ended: the mutant that drops
+/// Catches a restart mid-action that is taken up instead of ended: the defect that drops
 /// the `started` record (the restarted runtime waits for the session and runs the action
 /// again), and the one that skips the `kill-uid` at start (the first copy runs on until
 /// the server's `Start` or `Cancel` comes, if it ever does). The restarted runtime kills
@@ -767,7 +767,7 @@ async fn a_restart_mid_action_after_the_reset_deleted_the_user_kills_nothing() {
 }
 
 /// Catches a session wait counted from when this daemon took the lease up rather than
-/// from when the lease was first taken (the mutant "deadline from now": each restart
+/// from when the lease was first taken (the defect "deadline from now": each restart
 /// would start the wait again, and the action could start after the server's switch
 /// grace has given the lease up). A record taken longer ago than the wait fails the
 /// lease at the first `session-ready` that says not yet.

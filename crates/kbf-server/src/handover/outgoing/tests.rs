@@ -175,7 +175,7 @@ async fn a_holder_stands_down_in_order_and_leaves_only_once_its_successor_serves
 /// something else than a hello; and a holder started without `--instance`, which cannot
 /// tell its peer from itself. Each refusal names why and leaves the frontend untouched
 /// (nothing is handed over, and no successor is named for the relay), and a good
-/// successor still takes over after them all. Mutants: a comparison dropped.
+/// successor still takes over after them all. Catches: a comparison dropped.
 #[tokio::test]
 async fn a_successor_started_with_other_flags_is_refused_and_nothing_changes() {
     let rig = Rig::new();
@@ -281,7 +281,7 @@ async fn a_holder_that_cannot_reach_or_tell_its_successor_refuses() {
 /// `ready` (the frontend would be handed over with nobody to serve): a successor that
 /// closes after its hello, after the offer, says something else than `ready`, or sends
 /// what is not a message. In each the frontend is untouched, and the next successor takes
-/// over. Mutant: the stand down starting at the offer.
+/// over. Catches: the stand down starting at the offer.
 #[tokio::test]
 async fn a_successor_that_fails_before_ready_changes_nothing() {
     let rig = Rig::new();
@@ -469,7 +469,7 @@ fn released_holder(
 /// Catches: a holder that is still in Envoy's rotation when its successor is gone (T-12:
 /// it would go on being chosen while it can start nothing): the successor's connection
 /// closing before it served makes the holder go not ready at once, and a holder that
-/// then holds nothing leaves. Mutant: no watch on the connection.
+/// then holds nothing leaves. Catches: no watch on the connection.
 #[tokio::test]
 async fn a_successor_that_closes_its_connection_makes_the_holder_unready() {
     let rig = Rig::new();
@@ -487,7 +487,7 @@ async fn a_successor_that_closes_its_connection_makes_the_holder_unready() {
 /// Catches: a holder that waits for ever for a successor that is alive and never serves
 /// (T-12: the successor wedged, or never reached ready): when `--handover-watchdog-secs`
 /// runs out the holder goes not ready by itself, and leaves when it holds nothing.
-/// Mutant: a watchdog that never fires.
+/// Catches: a watchdog that never fires.
 #[tokio::test]
 async fn a_successor_that_never_serves_is_given_up_on_at_the_watchdog() {
     let rig = Rig::new();
@@ -511,7 +511,7 @@ async fn something_other_than_serving_is_not_serving() {
 /// Catches: a holder that exits while it still holds a stream, a relay or a caller (a build
 /// fails: the relay is the only path of a forwarded call), and one that never exits once
 /// it holds none. Each of the three is held alone, after the holder went not ready; it
-/// leaves only when that one is let go. Mutants: the exit check without the relays, or
+/// leaves only when that one is let go. Catches: the exit check without the relays, or
 /// without the open streams, or without the callers.
 #[tokio::test]
 async fn a_holder_leaves_only_when_it_holds_no_stream_no_relay_and_no_caller() {
@@ -575,7 +575,7 @@ async fn a_holder_whose_store_cannot_be_read_goes_on_looking() {
 /// Catches: a holder that drops the connection of a protocol-2 successor, whose hello has
 /// no enroll field, so that it only sees "the other process closed the control
 /// connection". The holder answers with the refusal that names both protocols, changes
-/// nothing, and a good successor still takes over. Mutant: the hello requires all six
+/// nothing, and a good successor still takes over. Catches: the hello requires all six
 /// fields before the version is read (the old successor then hears a close).
 #[tokio::test]
 async fn a_protocol_2_successor_is_refused_by_name_and_nothing_changes() {

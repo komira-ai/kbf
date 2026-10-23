@@ -61,7 +61,7 @@ mod tests {
     }
 
     /// Catches: a safe verdict that exits non-zero (an updater would never stop the host),
-    /// or one that hides its reason line. Mutants it catches: the exit status inverted.
+    /// or one that hides its reason line. Catches: the exit status inverted.
     #[test]
     fn a_safe_verdict_exits_0() {
         let (code, out, err) = reported(r#"{"safe":true,"reasons":[],"planned_down":false}"#);
@@ -74,7 +74,7 @@ mod tests {
 
     /// Catches: an unsafe verdict that exits 0 (a host stopped with a blob on one copy), one
     /// that exits 1 (taken for a failed call, not an answer), and reasons that are not all
-    /// printed, in order, or a planned-down member that is not said. Mutants it catches: the
+    /// printed, in order, or a planned-down member that is not said. Catches: the
     /// exit status inverted; the reasons loop dropped.
     #[test]
     fn an_unsafe_verdict_exits_3_and_prints_every_reason() {

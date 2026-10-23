@@ -114,7 +114,7 @@ mod tests {
     }
 
     /// Catches a tag being accepted: a tag can move, so one action digest could mean
-    /// two images (the "tag instead of a digest" mutant).
+    /// two images (the "tag instead of a digest" defect).
     #[test]
     fn a_tag_is_refused() {
         let tag_only = image("docker.io/library/busybox:1.37");

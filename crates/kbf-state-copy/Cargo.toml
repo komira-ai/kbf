@@ -1,0 +1,30 @@
+[package]
+name = "kbf-state-copy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The cutover tool that moves a frontend's SQLite state file into Postgres. It is its own
+# binary, never part of `kbf`: the SQLite reader it carries must not ship in the farm's
+# binary. It reads the file through rusqlite alone, so the SQLite backend of kbf-state can
+# be deleted without touching this crate, and writes through its own SQL because the
+# Postgres store assigns a new revision to every write and a copy has to keep the old ones.
+[dependencies]
+clap.workspace = true
+hex.workspace = true
+# The URL check, the schema version and the names of the tables of the Postgres store.
+kbf-state = { workspace = true, features = ["postgres"] }
+postgres.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# A scratch directory per test, removed on drop.
+kbf-testkit.workspace = true
+
+[lints]
+workspace = true

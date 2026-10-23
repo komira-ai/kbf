@@ -245,7 +245,7 @@ fn a_partial_list_and_an_unreadable_grid_are_said() {
 /// Catches: the API's refusals shown as another page: a bad token is its own status, an
 /// overloaded API keeps its `Retry-After`, and a farm with no history (the route answers as
 /// an unknown route: `404`, no body) is a page that says so and names the flag, not a `404`.
-/// Mutant: `is_history_off` always false.
+/// Catches: `is_history_off` always false.
 #[test]
 fn the_apis_refusals_are_the_pages() {
     let off = Fake::default().with(LIST_URL, 404, "");

@@ -46,7 +46,7 @@ fn sent(taking: &Taking) -> usize {
 /// Catches a batch held until the walk ends, or sent before it is full, and files lost
 /// at the end: with a 10-byte batch, a 4-byte file waits, a 6-byte one fills the batch
 /// and both are sent at once, a 3-byte one waits for `finish`, which sends it and
-/// answers once all three are held (mutants: the size never compared, `finish` not
+/// answers once all three are held (defects: the size never compared, `finish` not
 /// sending the rest). Each file's bytes are the chunks handed over, in order.
 #[test]
 fn a_full_batch_is_sent_at_once_and_the_rest_at_the_finish() {
@@ -70,7 +70,7 @@ fn a_full_batch_is_sent_at_once_and_the_rest_at_the_finish() {
 
 /// Catches a batch of many small files held until it reaches its size: 16,384 files
 /// (the server's most records in one upload) are sent as one batch however few bytes
-/// they hold (mutant: the record count not compared).
+/// they hold (defects: the record count not compared).
 #[test]
 fn a_batch_of_the_most_records_is_sent_however_small() {
     let server = server();
@@ -95,7 +95,7 @@ fn plane_of(taking: &Taking) -> LocalDataPlane {
 /// Catches more batches in flight than the bound, and a walk that waits for a batch
 /// that ended without being told: with one batch in flight at most, while the server
 /// half's one worker is held the second file's finish does not return, and once the
-/// worker is free it does (mutants: no wait, an ended upload not counted down or not
+/// worker is free it does (defects: no wait, an ended upload not counted down or not
 /// signalled, which hangs).
 #[test]
 fn a_walk_past_the_batches_in_flight_waits_for_one_to_end() {
@@ -134,7 +134,7 @@ fn a_walk_past_the_batches_in_flight_waits_for_one_to_end() {
 
 /// Catches one digest stored twice, and a file left unfinished stored anyway: two files
 /// with the same bytes make one batch of one record, and a file handed over but never
-/// finished (the walk found it changed) is in no batch (mutants: no `seen` check, an
+/// finished (the walk found it changed) is in no batch (defects: no `seen` check, an
 /// unfinished file added on drop).
 #[test]
 fn one_digest_is_stored_once_and_an_unfinished_file_not_at_all() {
@@ -155,7 +155,7 @@ fn one_digest_is_stored_once_and_an_unfinished_file_not_at_all() {
     });
 }
 
-/// Catches a large file held whole in memory, or not taken (mutants: a file over the
+/// Catches a large file held whole in memory, or not taken (defects: a file over the
 /// threshold taken into memory, the refusal restored when there is no write tier): a
 /// file of [`MAX_UNSTAGED_BLOB_BYTES`] is taken into memory, and one byte more is taken
 /// as a stream, with a write tier and without one, however large.
@@ -282,7 +282,7 @@ fn a_large_file_streams_onto_the_tier_and_is_stored_once() {
 
 /// Catches a streamed file that ends wrong taken for stored: one written past the size
 /// it was opened with, and one finished with another CRC-32C, each fail the walk's
-/// finish UNAVAILABLE, and neither is held (mutants: a write the tier refused ignored,
+/// finish UNAVAILABLE, and neither is held (defects: a write the tier refused ignored,
 /// the server's check skipped).
 #[test]
 fn a_streamed_file_that_ends_wrong_fails_the_finish() {
@@ -337,7 +337,7 @@ fn without_a_tier_a_file_at_the_threshold_is_stored_from_memory() {
 }
 
 /// Catches a large file refused without a write tier, stored twice, or stored when it
-/// should not be (mutants: the refusal restored, no `seen` check on the store's path, a
+/// should not be (defects: the refusal restored, no `seen` check on the store's path, a
 /// file left unfinished completed): without a tier, a file one byte over
 /// [`MAX_UNSTAGED_BLOB_BYTES`] streams to the store and is held after `finish`; the same
 /// bytes again in the same walk are withdrawn, and in another walk, finding them held,
@@ -372,7 +372,7 @@ fn without_a_tier_a_large_file_streams_to_the_store_and_is_stored_once() {
 }
 
 /// Catches a file streamed to the store taken for stored when its bytes are not its
-/// digest's, or a walk left waiting on an upload that failed (mutants: the digest check
+/// digest's, or a walk left waiting on an upload that failed (defects: the digest check
 /// skipped, a failed upload's queue written to forever): without a tier, a file
 /// finished under another digest fails the walk's finish and is not held; one written
 /// far past its size fails it too, the walk's later writes dropped once the upload

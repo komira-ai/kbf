@@ -13,7 +13,7 @@ use support::fake::{Fake, image};
 use support::{Spec, ended, exists, store_action, work};
 
 /// Catches (issue #155) a restarted daemon that leaves its killed predecessor's
-/// action running (the "sweep skipped" mutant: the scheduler would run the lease again
+/// action running (the "sweep skipped" catches: the scheduler would run the lease again
 /// beside it), its container, lease cgroup or scratch directory behind. The killed
 /// daemon is modelled by forgetting its run: nothing of it is dropped, so nothing of it
 /// is cleaned.
@@ -59,7 +59,7 @@ fn a_delete_that_meets_state_being_removed_is_a_removed_lease() {
 /// directory (2000 empty files in a subdirectory) makes its removal take long enough
 /// to overlap the orphaned run's last writes, which land in the state directory
 /// after the delete listed it. The removal must not fail, and nothing of that fake may run
-/// once it is done (it waited). The mutant drops the wait in the Fake's `Drop`.
+/// once it is done (it waited). The defect drops the wait in the Fake's `Drop`.
 #[tokio::test]
 async fn no_round_of_kill_and_restart_races_the_removal() {
     let _hog = support::CpuHog::start();

@@ -59,7 +59,7 @@ fn the_limits_are_flags() {
 /// Catches the walk's old per-file hand-off to the blocking pool (5.4 s of a 7.8 s
 /// walk of 15,189 files): the number of tasks sent to the pool does not grow with
 /// the files. A tree of 8 files and one of 800, in the same four directories, send
-/// the same number (mutant: a `blocking` call per job in `collect`: 800 more).
+/// the same number (catches: a `blocking` call per job in `collect`: 800 more).
 #[tokio::test]
 async fn the_walk_sends_no_task_to_the_blocking_pool_per_file() {
     let mut hops = Vec::new();
@@ -95,7 +95,7 @@ async fn the_walk_sends_no_task_to_the_blocking_pool_per_file() {
 /// Catches the byte limit held per file but not over the files together, and the
 /// wrong file named: the files are added up in job order whatever order they were
 /// hashed in. Sizes 5 and 4 fit 9; 5, 5 and 1 do not, and it is the second that
-/// passes the limit (mutant: the running total not checked, which only a race
+/// passes the limit (catches: the running total not checked, which only a race
 /// between threads could show in `collect`). A file that did not fit the bytes left
 /// is the limit at its own path, and the first failure in job order ends the check
 /// before a job no thread reached.
@@ -150,7 +150,7 @@ fn the_files_together_are_held_to_the_byte_limit_in_job_order() {
 /// Catches a log that is no regular file being read or hung on, a log past its limit
 /// stored, and a log within it lost: a FIFO where the action's stdout should be fails with
 /// the reason, a log of 11 bytes against a limit of 10 fails with the stdio limit, and a
-/// log of 10 is stored (mutant: the type not checked on the descriptor, which would block
+/// log of 10 is stored (catches: the type not checked on the descriptor, which would block
 /// or read nothing). All three here, so one copy of `collect_log` covers every line.
 #[tokio::test]
 async fn logs_are_stored_within_their_limit_and_only_if_regular() {
@@ -207,7 +207,7 @@ async fn a_blocking_task_that_panicked_is_an_error() {
 /// Catches the files an intake took being sent again, or the intake not finished
 /// before the messages that name them: outputs collected into a store that takes files
 /// as they are read hand every file to the intake once, finish it once, and give
-/// `put_records` only the Directory messages and the Tree (mutants: taken files kept
+/// `put_records` only the Directory messages and the Tree (catches: taken files kept
 /// in the records, the intake never finished). Every blob the result names is held.
 #[tokio::test]
 async fn files_an_intake_took_are_not_sent_again() {
@@ -265,7 +265,7 @@ async fn files_an_intake_took_are_not_sent_again() {
 /// Catches a log read twice, or offered to the intake past its limit: into a store that
 /// takes files, a log is handed over once, the intake finished, and the digest is the
 /// log's, with nothing sent through `put_chunks`; a log past the limit is refused and
-/// never offered; a log the intake declines is hashed and sent as before (mutants: the
+/// never offered; a log the intake declines is hashed and sent as before (catches: the
 /// intake not asked, a log past the limit offered, the intake not finished). All three
 /// here, so one copy of `collect_log` covers them.
 #[tokio::test]

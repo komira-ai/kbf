@@ -89,7 +89,7 @@ fn the_overview_shows_health_counts_and_the_latest_builds() {
 
 /// Catches: markup from the API written as markup anywhere on the page (a failing
 /// check's reason, a build id and its instance names), and a build id not encoded as one
-/// path segment in its link. Mutant: `Html::text` writing raw.
+/// path segment in its link. Catches: `Html::text` writing raw.
 #[test]
 fn hostile_strings_render_as_text() {
     let (_, html) = page(&fleet_farm(), "/ui");
@@ -102,7 +102,7 @@ fn hostile_strings_render_as_text() {
     assert!(html.contains(&format!("<a href=\"{link}\">")), "{html}");
 }
 
-/// Catches: a ready farm shown as not ready or the reverse (mutant: the condition
+/// Catches: a ready farm shown as not ready or the reverse (catches: the condition
 /// inverted), and a failing table kept when nothing fails.
 #[test]
 fn a_ready_farm_says_ready_and_lists_no_failing_check() {
@@ -121,7 +121,7 @@ fn a_ready_farm_says_ready_and_lists_no_failing_check() {
 }
 
 /// Catches: an unknown storage state shown as zero or as healthy: a null
-/// `under_replicated_blobs` is "unknown" and a real zero is "0" (mutant: the count
+/// `under_replicated_blobs` is "unknown" and a real zero is "0" (catches: the count
 /// defaulted to 0); a storage that cannot be read shown without its reason, or with
 /// the reason as markup; a server with no storage members shown as unreadable.
 #[test]

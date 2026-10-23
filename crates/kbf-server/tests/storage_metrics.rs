@@ -104,7 +104,7 @@ async fn a_storage_node_serves_the_lost_blob_series_on_its_metrics_listener() {
 /// Catches the node's metrics listener served around `serve_api` (the handler reads the
 /// gate's `Caller`, so a listener without the `gate_requests` layer answers 500), and one
 /// given a proxy secret (the node is not behind the proxy, so a loopback call carrying
-/// none would be refused with 403). Mutants: serve the routes with plain `axum::serve`;
+/// none would be refused with 403). Catches: serve the routes with plain `axum::serve`;
 /// pass `Some(secret)` to `serve_api`.
 #[tokio::test]
 async fn the_metrics_listener_admits_a_direct_loopback_call_through_the_gate() {
@@ -218,7 +218,7 @@ async fn first_life_with(d: &Path, more: &[&str], before_stop: impl FnOnce()) {
 /// error (a flush creates its file there), and stops with `--ram-drain-deadline=1`: the
 /// flush fails until the one second ends, and the blob is left on the tier. The mode is
 /// restored before the second start, which abandons that tier. Needs a user the mode
-/// binds (not root). Mutant: the route renders `Losses::default()`.
+/// binds (not root). Catches: the route renders `Losses::default()`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_blob_the_nodes_cache_lost_is_scraped_from_its_metrics_listener() {
     let d = dir("loss");
@@ -253,7 +253,7 @@ async fn a_blob_the_nodes_cache_lost_is_scraped_from_its_metrics_listener() {
 /// next polled) and its write-pool threads (they end after the queue closes) hold the
 /// writer, and so the directory's lock, past the return. A restart on the same
 /// directories failed `Locked { WouldBlock }`. Fifty lives, each restarted the moment
-/// `serve()` returns, with no clock in the test. Mutant: `StorageHandle::serve` does
+/// `serve()` returns, with no clock in the test. Catches: `StorageHandle::serve` does
 /// not wait for `cold_released` (7 of 10 runs red).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_returned_serve_has_released_the_stores() {

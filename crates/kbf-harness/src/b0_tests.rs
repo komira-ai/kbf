@@ -1,4 +1,4 @@
-//! The parts of B0 that need no farm: its choices, its mutants, how it reads the processes
+//! The parts of B0 that need no farm: its choices, its faults, how it reads the processes
 //! and reports a farm that did not come up. The whole scenario is run by kbf-cli's
 //! tests/beta_b0.rs, over real `kbf` processes.
 
@@ -23,7 +23,7 @@ fn args() -> B0 {
         fill_kib: 1,
         scrape_every: Duration::from_secs(1),
         summary: Some(PathBuf::from("summary")),
-        mutant: None,
+        fault: None,
         extra_flags: Vec::new(),
         farm_hang: Duration::from_secs(1),
         interrupt: Interrupt::new(),
@@ -51,23 +51,23 @@ fn every_path_is_made_absolute() {
 }
 
 #[test]
-fn the_cap_mutants_change_flags_on_the_nodes_they_name() {
-    // Catches: a mutant that changes nothing (the gate it exists to prove is never seen red),
+fn the_cap_faults_change_flags_on_the_nodes_they_name() {
+    // Catches: a fault that changes nothing (the gate it exists to prove never fails),
     // one that changes the wrong node, keeps the evict grace (an object just written is
     // never evicted) or the floor, or one that touches a farm without being asked.
     assert!(overrides(None).is_empty());
-    assert!(overrides(Some(Mutant::KillNodeMidway)).is_empty());
+    assert!(overrides(Some(Fault::KillNodeMidway)).is_empty());
     let flags = [
         "--cold-store-size-bytes=1048576",
         "--cold-store-floor-bytes=0",
         "--cold-store-evict-grace-ms=0",
         "--hot-store-max-bytes=1048576",
     ];
-    let one = overrides(Some(Mutant::ShrinkNodeCap));
+    let one = overrides(Some(Fault::ShrinkNodeCap));
     assert_eq!(one.len(), 1);
     assert_eq!(one[0].0, Role::Node(1));
     assert_eq!(one[0].1, flags);
-    let every = overrides(Some(Mutant::ShrinkEveryCap));
+    let every = overrides(Some(Fault::ShrinkEveryCap));
     let nodes: Vec<Role> = every.iter().map(|(r, _)| *r).collect();
     assert_eq!(nodes, [Role::Node(1), Role::Node(2), Role::Node(3)]);
     assert!(every.iter().all(|(_, f)| *f == flags));
@@ -104,7 +104,7 @@ fn the_version_is_the_first_line_or_the_reason_there_is_none() {
 fn a_version_that_is_never_answered_is_given_up_on() {
     // Catches: `buck2 --version` without a bound: a wedged Buck2 client would hold the run
     // before it started anything, with no gate and no document to say why (the stand-in
-    // sleeps thirty seconds when told to). Mutant: the wait has no deadline.
+    // sleeps thirty seconds when told to). Catches: the wait has no deadline.
     let d = crate::scratch("version-hangs");
     std::fs::write(d.join(".fake-buck2"), "version-hangs").expect("mode");
     let fake = crate::stand_in::sibling_bin(crate::stand_in::FAKE_BUCK2);

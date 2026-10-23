@@ -102,7 +102,7 @@ fn granted_to(successor: &TestFarm) -> u64 {
 /// killed at 4 GiB and raised to 16 GiB is granted again by the successor at 16 GiB, not
 /// at 4 GiB (one more kill, and the ladder restarts at every handover), and the
 /// successor holds the same memory runs for it, so the failure text it ends with names
-/// every run. Mutant: the fate row not written.
+/// every run. Catches: the fate row not written.
 #[tokio::test(start_paused = true)]
 async fn a_raised_booking_and_its_kills_survive_a_handover() {
     let disk = Disk::new();

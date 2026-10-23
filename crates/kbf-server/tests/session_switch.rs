@@ -117,7 +117,7 @@ async fn a_switching_lease_not_held_here_is_cancelled() {
     assert_eq!(daemon.cancelled().await, Some(lease));
 }
 
-/// Catches a quarantined node that is offered work (the mutant "release the node
+/// Catches a quarantined node that is offered work (the defect "release the node
 /// after a failed cleanup", seen from the server), a quarantine that is not taken on
 /// the stream's first `Hello` before placement, and one that cannot be lifted: once
 /// the node reports serving again, the queued work starts.

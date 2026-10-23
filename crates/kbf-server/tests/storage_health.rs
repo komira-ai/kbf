@@ -350,7 +350,7 @@ fn a_member_that_expired_makes_the_number_unknown() {
 
 // Catches: a report kept after the member went quiet. The row is still live (the time to
 // live is longer than the window), but b has not reported for longer than the window.
-// Mutant: the last report kept for ever.
+// Catches: the last report kept for ever.
 #[test]
 fn a_member_whose_row_is_live_but_whose_report_is_old_is_silent() {
     let pair = Pair::new(Debts::Known(0), Debts::Known(0));
@@ -401,7 +401,7 @@ fn a_member_that_is_not_active_in_the_rows_makes_the_number_unknown() {
 
 // Catches: a report that survives a registration. A node that restarts registers again
 // with a larger boot counter; whatever it reported before is not what it owes now, so
-// even once an administrator has promoted it, it is silent until it reports. Mutant: the
+// even once an administrator has promoted it, it is silent until it reports. Catches: the
 // registration keeps the old row's report.
 #[test]
 fn a_member_that_registers_again_starts_without_a_report() {

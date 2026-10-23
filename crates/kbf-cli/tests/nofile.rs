@@ -5,7 +5,7 @@
 use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 
 /// With the soft limit at 256, `raise` takes it to the hard limit (at most the ceiling),
-/// and 600 files can then be open at once. Mutants: `raise` a no-op (the soft limit
+/// and 600 files can then be open at once. Catches: `raise` a no-op (the soft limit
 /// stays 256 and the 257th `open` fails with EMFILE), a raise to a fixed 1024 (the
 /// soft-limit assertion fails).
 #[test]

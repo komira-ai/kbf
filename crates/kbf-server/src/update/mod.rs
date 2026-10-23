@@ -1,11 +1,11 @@
 //! Node rolling for a split-mode farm (`docs/design/split-mode-updates.md` sections 2.6 to
 //! 2.11, 5.3 and 6.1; the design is #898): which hosts go next ([`pick()`]), the one move a
-//! host makes next in its ten steps ([`step()`]), the durable rows both are driven from
-//! ([`Rows`]) and the [`Controller`] that drives them.
+//! host makes next in its ten steps ([`step()`]) and the durable rows both are driven from
+//! ([`Rows`]). No controller runs them: updates are OS packages, driven by `kbf-updater`.
 //!
 //! **Pure decisions.** [`pick()`] and [`step()`] read nothing and write nothing: no clock, no
 //! store, no socket, nothing async. Time is an argument ([`kbf_types::FarmTime`]). The
-//! controller fills [`Facts`] from the `Farm`, `Members`, the hosts' heartbeats (through
+//! caller fills [`Facts`] from the `Farm`, `Members`, the hosts' heartbeats (through
 //! [`FactsSource`]) and the `update/*` rows, calls them on every look, records the phase (and
 //! the row fields) a [`Transition`] names, and then gives its [`Command`]s (through
 //! [`Transport`]). A restart re-reads the rows and gives the entry commands of the phase it
@@ -14,7 +14,7 @@
 //! **Rules the code keeps** (section 2.1, and the corrections made to the first plan by
 //! review):
 //! - One storage host in a step at a time, and up to [`Policy::max_hosts_out`] daemon-only
-//!   hosts and Macs beside it. "Out" is read from the rows and the slot the controller
+//!   hosts and Macs beside it. "Out" is read from the rows and the slot the caller
 //!   wrote, never from member state, which lags.
 //! - Every gate fails closed. An absent metric is `None`, never zero.
 //! - A planned restart is `MarkDown`, never `Draining` (which starts a handoff of the
@@ -31,13 +31,11 @@
 //! - A helper's status counts only if it names the host's current activation order, and a
 //!   restart counts only with a larger boot counter than the one recorded at the mark.
 //! - The row is written before the orders it calls for, and never over a row that moved. The
-//!   exception is a host that leaves its step: the orders that undo the step come first
-//!   ([`Controller`]).
+//!   exception is a host that leaves its step: the orders that undo the step come first.
 //!
 //! **The farm side.** [`ports`] gives a [`Transport`] over the worker sessions and the
 //! members and a [`FactsSource`] over the `Farm`, the members and the enrollment registry
-//! (`session`), and [`spawn_controller`] runs the controller where the frontend starts,
-//! starting hosts unless an operator wrote `update/policy.auto_nodes` false or paused the run.
+//! (`session`); nothing starts hosts on them now.
 //! A Linux host is joined to its storage member by the address it advertised at enrollment,
 //! matched on its lower-cased spelling; a host that matches no member is never started and `FarmFacts::unlinked`
 //! says why.
@@ -45,17 +43,13 @@
 pub mod age;
 mod codec;
 mod command;
-mod controller;
 mod facts;
-mod moves;
 mod node_step;
 mod pick;
 mod policy;
 mod ports;
 mod proposal;
-mod report;
 mod rows;
-mod runner;
 mod session;
 mod slot;
 mod steps;
@@ -65,7 +59,6 @@ pub use crate::storage_gate::{
 };
 pub use codec::{Desired, HostRow};
 pub use command::{Alert, Command, GiveBack, HoldReason, Severity, SlotOp};
-pub use controller::Controller;
 pub use facts::{
     AvailableFact, DaemonLoad, Facts, Generation, HelperReport, HelperStatus, HostFacts, HostKind,
     HostRecord, Observations, OrderId, Platform, PlatformClass, Release, SlotView, Source, Work,
@@ -75,8 +68,6 @@ pub use pick::{Pick, Picked, Skip, WaitReason, pick};
 pub use policy::{Policy, PolicyError};
 pub use ports::{FactsSource, FarmView, SourceError, Transport, TransportError};
 pub use proposal::{PROPOSED, Proposal, proposal_key};
-pub use report::{CommandError, ControllerError, Moved, Tick};
 pub use rows::{RowError, Rows, Stored};
-pub use runner::spawn as spawn_controller;
 pub use session::{FarmFacts, SessionTransport, ports};
 pub use slot::{Holder, Slot, SlotClass};

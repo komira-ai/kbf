@@ -13,7 +13,7 @@ fn page(fake: &Fake, path: &str) -> (u16, String) {
 /// sentence, or `200` with no word of the flag; the lookup form lost with the list (a live
 /// build can still be looked up); a filter dropped from the read; a missing single build
 /// (its own `404` with `no_record`) said to be history off, or an API error with a message
-/// on the list route. Mutants: `is_history_off` always false; the status in `builds` left
+/// on the list route. Catches: `is_history_off` always false; the status in `builds` left
 /// as the API's; the history note replaced by `problem`.
 #[test]
 fn the_builds_list_of_a_farm_with_no_history_says_so() {
@@ -49,7 +49,7 @@ fn the_builds_list_of_a_farm_with_no_history_says_so() {
 }
 
 /// Catches: the Target page of a farm with no history answered `404`, and a shape the
-/// history does not hold (`no_shape`) said to be history off. Mutant: `is_history_off`
+/// history does not hold (`no_shape`) said to be history off. Catches: `is_history_off`
 /// always true or always false.
 #[test]
 fn the_target_page_of_a_farm_with_no_history_says_so_and_a_missing_shape_is_a_404() {

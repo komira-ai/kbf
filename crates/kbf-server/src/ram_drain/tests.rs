@@ -258,10 +258,10 @@ async fn with_no_budget_a_stop_drains_nothing() {
 /// not before, with no RAM budget: `served` stages a blob (a call that was in flight) and
 /// ends, and the block is in the store when `after` returns only because the stop's flush
 /// took it, with the 30 s seal delay of the open block not passed. The output of `served`
-/// comes through. Catches a stop that does not flush the tier (mutant: `after` returns
+/// comes through. Catches a stop that does not flush the tier (defect: `after` returns
 /// `served`'s output at once: one block is still staged), one that flushes before `served`
-/// ends (mutant: the flush is awaited first: the blob staged by `served` is missed), and one
-/// that flushes only with a RAM budget (mutant: the flush is inside `if self.holds`).
+/// ends (defect: the flush is awaited first: the blob staged by `served` is missed), and one
+/// that flushes only with a RAM budget (defect: the flush is inside `if self.holds`).
 #[tokio::test]
 async fn the_stop_flushes_what_is_staged_after_serving_ends() {
     let (cache, _) = tiered().await;
@@ -286,9 +286,9 @@ async fn the_stop_flushes_what_is_staged_after_serving_ends() {
 /// A stop whose store keeps refusing ends at its deadline with the block still staged,
 /// says how much was left, and the output of `served` comes through; the block is not
 /// dropped: it is flushed when the store answers again. Catches a stop that waits without
-/// end (the test would hang), one that drops what it could not flush (mutant: the block
+/// end (the test would hang), one that drops what it could not flush (defect: the block
 /// is discarded when the deadline passes: it is gone, and so is the blob) and one that
-/// ends without a line saying what was left (mutant: the timed-out arm does not log).
+/// ends without a line saying what was left (defect: the timed-out arm does not log).
 #[tokio::test]
 async fn a_stop_that_cannot_flush_ends_at_its_deadline_and_says_what_is_left() {
     let log = Log::default();
@@ -321,7 +321,7 @@ async fn a_stop_that_cannot_flush_ends_at_its_deadline_and_says_what_is_left() {
 }
 
 /// A flush that works logs one line saying so and nothing at ERROR. Catches a stop that
-/// reports a flush that finished as one that did not (mutant: the arms are swapped).
+/// reports a flush that finished as one that did not (defect: the arms are swapped).
 #[tokio::test]
 async fn a_stop_that_flushes_says_so() {
     let log = Log::default();

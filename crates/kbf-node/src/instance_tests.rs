@@ -52,7 +52,7 @@ async fn each_daemon_that_starts_claims_the_scratch_directory() {
     assert_eq!(claimed(&dir), claim_of(second.instance_id()));
 }
 
-/// Catches the claim written before every runtime is built (the mutant "claim first"):
+/// Catches the claim written before every runtime is built (the defect "claim first"):
 /// a daemon that fails to start after its first driver's sweep would leave its own id,
 /// and the next daemon would name a process that never ran a lease as the one whose
 /// runs it killed, while the runs of the one before are taken as alive. The failing
