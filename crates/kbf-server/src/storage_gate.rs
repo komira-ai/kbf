@@ -11,7 +11,7 @@
 //! The same module holds what the gate is asked over: [`MemberFacts`], the members as
 //! [`member_facts`] reads them from a look, and [`storage_half`], which joins a node to its
 //! member by the address it enrolled with. The operator API's safe-to-stop query asks all
-//! of them, and the update controller reads the same ones.
+//! of them, and the update look reads the same ones.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -94,7 +94,8 @@ pub enum GateFail {
         /// The member.
         member: MemberId,
     },
-    /// A member is in a state other than `Active` (`Down`, `Draining`, `Joining`).
+    /// A member is in a state other than `Active` (`Down`, `Draining`, `Joining`, or one this
+    /// build does not name).
     #[error("member {member} is {state:?}")]
     NotActive {
         /// The member.
@@ -307,7 +308,7 @@ pub(crate) fn advertised(store: &dyn Store) -> Result<BTreeMap<String, String>, 
 }
 
 /// The storage member that is the storage half of the host `host`, joined by the address it
-/// enrolled with as the update controller joins it; `None` if it has no
+/// enrolled with as the update look joins it; `None` if it has no
 /// storage half.
 /// The operator API's safe-to-stop query asks it of a node id (`crate::api`).
 ///

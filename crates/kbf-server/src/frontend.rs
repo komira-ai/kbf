@@ -35,11 +35,13 @@
 //! calls cannot differ. Without them the URL must be `http://` to a loopback host, for
 //! tests and one machine; [`parse`] refuses a plain-text URL to any other host.
 //!
-//! **The state store** is optional, as `kbf-server`'s is (`--state-store`): without it
-//! the scheduler's state is in memory and the start logs the same warning. It becomes
-//! required when the backends do (the design's deploy shapes all have one); a flag
-//! given is opened, probed by `/readyz` and refused at start if this build has no
-//! backend for it.
+//! **The state store** is required of the process, not of this module: `kbf frontend`
+//! given no `--state-store` (and no `state-store` key in `kbf.toml`) exits 2 naming the
+//! flag, `--check` included, before anything is bound (`kbf-cli`'s startup checks). The
+//! entry points here still start without one, with the scheduler's state in memory and
+//! the same warning as `kbf-server`'s, for the tests that need none. A store given is
+//! opened and probed by `/readyz`; a `sqlite://` one starts and logs that SQLite is
+//! removed in the next release ([`crate::StateStoreUri::open`]).
 //!
 //! **Readiness** (`GET /readyz`, `grpc.health.v1`) fails when the storage node does not
 //! answer an action-cache lookup within `--readyz-store-timeout-ms`, when the state store (if
@@ -1117,8 +1119,6 @@ impl<'a> Prepared<'a> {
             }
             None => (None, futures::future::pending().boxed(), None, None),
         };
-        let update_store = state_store.clone();
-        let update_members = members.clone();
         let update_rows = state_store.clone().map(crate::update::Rows::new);
         let object_stores = flags
             .object_store_secrets_dir
@@ -1144,11 +1144,6 @@ impl<'a> Prepared<'a> {
         .merge(crate::object_store::api::routes(
             token.clone(),
             object_stores.map(|stores| stores.api),
-        ))
-        .merge(crate::update_hosts::router(
-            Arc::clone(&farm),
-            update_rows.clone(),
-            crate::update_hosts::FarmReaders::from_policy(&policy),
         ))
         .merge(crate::release::desired::router(
             releases.clone(),
@@ -1292,15 +1287,6 @@ impl<'a> Prepared<'a> {
         let serving = async move {
             let history = crate::history::spawn(history);
             let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
-            // The rolling-update controller; it starts hosts for the desired release unless the
-            // operator wrote `auto_nodes` false or paused it.
-            let _updates = crate::update::spawn_controller(
-                Arc::clone(&farm),
-                update_store,
-                update_members,
-                listeners.tick,
-            )
-            .map(AbortOnDrop);
             let reapi_serve = reapi_server
                 .add_routes(reapi_routes)
                 .serve_with_incoming_shutdown(reapi_incoming, async {

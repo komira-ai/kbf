@@ -283,7 +283,6 @@ the node's certificate is in [kbf-modes.md](../deploy/kbf-modes.md#a-nodes-certi
 
 ```text
 kbf all-in-one \
-    --state-store=sqlite:///var/lib/kbf/state.db \
     --cold-store=file:///var/lib/kbf/cold \
     --meta-dir=/var/lib/kbf/meta \
     --listen=127.0.0.1:8980 \
@@ -313,8 +312,9 @@ kbf all-in-one \
   Add `--hot-store=file:///fast/kbf` to put a fast disk in front of it. In all-in-one the
   single cache keeps no flushed copies on the hot store, so it holds only blobs not yet
   flushed.
-- `--state-store` names the scheduler's state. The default of `kbf all-in-one` is Postgres
-  on the host's socket; this example names a SQLite file instead.
+- `--state-store` names the scheduler's state; the default is Postgres on the host's socket.
+  A `sqlite://` store still starts in this release and logs a warning that it is removed in
+  the next.
 - `--api-token-file` must be a file of mode 0600 or 0400 holding one token of at least 32
   characters. The operator API refuses writes without it.
 - The daemon runs rootless containers with `crun`. It needs the user's subordinate ids,

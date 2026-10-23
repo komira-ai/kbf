@@ -8,10 +8,10 @@
 //! a uid or gid of the block, or is named like a test user but disagrees, is "foreign":
 //! never changed, never removed, and a reason for [`start`] to refuse to run.
 //!
-//! The reset the spike times (`Slot::release`) may recreate a user, and then moves its
-//! home and its `/var/folders` entry aside, renamed `.kbf-recreated-<user>-<secs>.<nanos>`
-//! beside them, root's, mode 0700 (`kbf-driver-native` `slots/macos/host.rs`, `ASIDE`;
-//! nothing there removes them). Those of a test user (`<user>` is `kbf-scale-<i>`, the
+//! The reset the spike times (`Slot::release`) no longer makes a user again. An earlier
+//! version did, and moved its home and its `/var/folders` entry aside, renamed
+//! `.kbf-recreated-<user>-<secs>.<nanos>` beside them, root's, mode 0700 (nothing
+//! removed them). A Mac that ran that version may still hold some. Those of a test user (`<user>` is `kbf-scale-<i>`, the
 //! stamp in that shape) are the spike's too: [`aside_index`] names them, in [`HOMES`] and
 //! in `/var/folders/<xx>/`, and the sweep removes them with the user's own.
 //!
@@ -65,8 +65,10 @@ pub fn index_of(name: &str) -> Option<u32> {
     (i < BLOCK && i.to_string() == digits).then_some(i)
 }
 
-/// The prefix of the name a recreate moves a home or `/var/folders` entry aside to
-/// (`host.rs` `ASIDE` in `kbf-driver-native`, which this must equal).
+/// The prefix of the name an earlier version of the slot clean moved a home or
+/// `/var/folders` entry aside to when it made a user again. The clean no longer does;
+/// this finds what a run of that version left on a Mac, so the check can refuse it and
+/// the sweep remove it.
 pub const ASIDE: &str = ".kbf-recreated-";
 
 /// `i` for `.kbf-recreated-kbf-scale-<i>-<secs>.<nanos>`: the name a recreate gives what

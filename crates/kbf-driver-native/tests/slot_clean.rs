@@ -1,19 +1,21 @@
 //! The clean of a slot between two leases, for real (docs/design/macos-end-state.md,
-//! step 4): after every lease the daemon cleans its slot's user, checks the clean, makes
-//! the user again when the check fails, and quarantines the slot when that fails too.
+//! step 4): after every lease the daemon cleans its slot's user in one pass, checks the
+//! clean, and leaves the slot dirty (not offered, cleaned again before it is) when a step
+//! fails or the check finds something.
 //!
 //! The gate is [`a_lease_finds_nothing_the_lease_before_it_left_on_its_slot`]: with
 //! one slot, lease A leaves a marker in each place a lease can leave state, and lease B,
 //! on the same user, looks for each through the tool that would use it and finds none.
 //! The other tests: a process the uid cannot kill fails the clean within its deadline
-//! and quarantines the slot; a home the wipe cannot empty gets the user made again; a
-//! user that cannot be made again quarantines the slot; the start cleans what a
-//! killed daemon left; and a lease's job labelled like launchd's own is still counted.
+//! and leaves the slot dirty; the start cleans what a killed daemon left; a lease's job
+//! labelled like launchd's own is still counted; and the single-pass tests
+//! (`tests/slot_clean/single_pass.rs`: a home locked by its user, a file in the entry
+//! root, `/Library/Caches`, a crash report under another user's folder, a failed clean).
 //!
-//! The mutant tests (`tests/slot_clean/mutants.rs`) run the same scenario with one step
-//! of the clean skipped and the clean's own check blind, and see which rows turn red; the
-//! table is `tests/support/slot_rows.rs`, its model `tests/slot_mutants.rs` (every
-//! platform).
+//! The tests of necessity (`tests/slot_clean/steps_needed.rs`) run the same scenario with
+//! one step of the clean left out and the clean's own check blind, and see which rows
+//! lease B then finds; the table is `tests/support/slot_rows.rs`, its model
+//! `tests/slot_steps.rs` (every platform).
 //!
 //! Every test is `#[ignore]`: each needs root and real users. The macOS CI job runs them
 //! with `cargo xtask sudo-test -p kbf-driver-native --test slot_clean`, after
@@ -24,7 +26,7 @@
 mod support;
 
 use std::collections::BTreeSet;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -35,17 +37,14 @@ use kbf_daemon::Runtime as _;
 use kbf_daemon::uid;
 use kbf_driver_native::NativeRuntime;
 use kbf_driver_native::slots::SlotUser;
-use kbf_driver_native::slots::clean::Mutant;
-use support::pool::{Scratch, Users, config, home_of, ids_of, name_of};
+use kbf_driver_native::slots::clean::Skipped;
+use support::pool::{Scratch, Users, config, home_of, ids_of};
 use support::slot_rows::ROWS;
 use support::{MemoryCas, PROMPT, Spec, stdout};
 
 fn assert_root() {
     support::pool::assert_root("slot_clean");
 }
-
-/// Where a recreate moves a home it could not empty: `<homes>/<prefix><user>-...`.
-const ASIDE: &str = ".kbf-recreated-";
 
 /// Lease A's part inside the sandbox, as the slot user: `$1` the marker. Each place
 /// written prints `planted <row>`; then it waits for the test's `go`.
@@ -294,22 +293,22 @@ impl Fresh {
 /// root reads the process table and `hdiutil info`. Background Task Management entries
 /// of the uid, if the agent made any, are among the findings too.
 ///
-/// `mutant` makes the clean of the slot wrong on purpose ([`Mutant`]); `None` is the
+/// `skipped` leaves one step out of the clean of the slot ([`Skipped`]); `None` is the
 /// clean as the daemon runs it. `name` names the scratch directory and the user.
-async fn freshness(name: &str, mutant: Option<Mutant>) -> Fresh {
+async fn freshness(name: &str, skipped: Option<Skipped>) -> Fresh {
     assert_root();
     let scratch = Scratch::new(name);
     let users = Users::new(name, 1);
     let user = users.0[0].clone();
     let cas = Arc::new(MemoryCas::default());
     let config = config(&scratch, users.pool());
-    let rt = match mutant {
+    let rt = match skipped {
         None => NativeRuntime::new(config, Arc::clone(&cas)),
-        Some(mutant) => NativeRuntime::with_clean_mutant(config, Arc::clone(&cas), mutant),
+        Some(skipped) => NativeRuntime::with_skipped_step(config, Arc::clone(&cas), skipped),
     };
     let rt = rt.expect("runtime");
     // The test's name is in the marker: every run in this process has the same pid, and
-    // what a mutant run leaves on the runner (an attached image, files in the shared
+    // what a run without a step leaves on the runner (an attached image, files in the shared
     // places) would be found by the runs after it if their markers were the same.
     let mark = format!("kbf-fresh-{name}-{}", std::process::id());
     // Declared after `users`, so it is dropped first: the user is still there to remove
@@ -433,9 +432,9 @@ async fn freshness(name: &str, mutant: Option<Mutant>) -> Fresh {
 /// The freshness test. Lease A leaves a marker in each place of [`ROWS`], and after the
 /// clean that follows it lease B, on the same user, finds none ([`freshness`]).
 ///
-/// The test of the clean as the daemon runs it; the mutant tests below run the same
-/// scenario with one step of the clean skipped and show which rows then turn red. This
-/// one fails if a row was not planted, so a row cannot pass by never having been left.
+/// The test of the clean as the daemon runs it; the tests of necessity run the same
+/// scenario with one step of the clean left out and show which rows lease B then finds.
+/// This one fails if a row was not planted, so a row cannot pass by never having been left.
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
 #[tokio::test]
 async fn a_lease_finds_nothing_the_lease_before_it_left_on_its_slot() {
@@ -450,8 +449,40 @@ async fn a_lease_finds_nothing_the_lease_before_it_left_on_its_slot() {
     );
 }
 
-#[path = "slot_clean/mutants.rs"]
-mod mutants;
+/// A lease, as lease `1.seq`, whose action says `started` in its directory and then waits
+/// for `go`; `plant` runs in between and its result is returned with the lease's.
+///
+/// Whatever is in a free slot when a lease is handed it is refused at slot-ready (the
+/// assertion, `tests/slot_assert.rs`), so a state that the clean after the lease is to
+/// remove, or to fail on, is made while the lease runs, as a lease would make it.
+async fn lease_planting<T>(
+    rt: &NativeRuntime<MemoryCas>,
+    cas: &Arc<MemoryCas>,
+    scratch: &Scratch,
+    seq: u64,
+    plant: impl FnOnce() -> T,
+) -> (kbf_proto::reapi::ActionResult, T) {
+    let act = scratch.act();
+    let spec = Spec::argv(&[&act, "write-lines", "started", ";", "wait-for", "go", "60"]);
+    let root = scratch.lease_root(seq);
+    let planting = async {
+        let give_up = Instant::now() + PROMPT * 3;
+        while !root.join("started").exists() {
+            assert!(Instant::now() < give_up, "the lease never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let planted = plant();
+        std::fs::write(root.join("go"), b"").expect("go");
+        planted
+    };
+    let (ran, planted) = tokio::join!(support::run(rt, cas, seq, &spec), planting);
+    (ran.expect("the lease ran"), planted)
+}
+
+#[path = "slot_clean/single_pass.rs"]
+mod single_pass;
+#[path = "slot_clean/steps_needed.rs"]
+mod steps_needed;
 
 /// `go` in lease A's directory: it ends lease A's wait.
 fn scratch_go(a_root: &Path) -> PathBuf {
@@ -635,7 +666,7 @@ fn images(uid: u32, mark: &str) -> Vec<String> {
 }
 
 /// What a run of [`freshness`] can leave on the runner when a step of the clean is
-/// skipped, removed when it is dropped (so also when the test panics): the clean that
+/// left out, removed when it is dropped (so also when the test panics): the clean that
 /// should have removed it did not run, and the next test, or the next run on the same
 /// runner, must start clean. The user's own state (its home, preferences, keychain, and
 /// its processes and jobs) goes with the user ([`Users`]); what is here is what
@@ -777,24 +808,36 @@ async fn a_process_the_kill_cannot_end_fails_the_clean_within_its_deadline() {
     config.kill_wait = Duration::from_secs(2);
     let rt = NativeRuntime::new(config, Arc::clone(&cas)).expect("runtime");
     let before = slots_reported(&rt);
-    // After the start, which would fail on it.
-    let stuck = Unkillable::new(user.uid);
-    let mut ids = None;
-    let give_up = Instant::now() + PROMPT;
-    while ids != Some((user.uid, 0)) && Instant::now() < give_up {
-        std::thread::sleep(Duration::from_millis(20));
-        ids = ids_of(stuck.0);
-    }
-    let listed = uid::processes(user.uid).expect("list").contains(&stuck.0);
-    // Killed by its guard after 120 s at the latest: a kill with no deadline, which
-    // waits for it forever (on the runtime's thread too, as the dropped run ends its
-    // uid), then ends, and the test fails instead of hanging the job.
-    let (release, guard) = stuck.guard(Duration::from_secs(120));
+    // After the slot-ready check, which would refuse the slot on it: planted while the
+    // lease runs, as a process the action left behind would be.
     let act = scratch.act();
-    let action = Spec::argv(&[&act, "id"]).store(&cas);
+    let waiting = Spec::argv(&[&act, "write-lines", "started", ";", "wait-for", "go", "60"]);
+    let action = waiting.store(&cas);
+    let root = scratch.lease_root(1);
     let started = Instant::now();
-    let ended =
-        tokio::time::timeout(Duration::from_secs(90), rt.run(support::work(1, action, 0))).await;
+    let lease = tokio::time::timeout(Duration::from_secs(90), rt.run(support::work(1, action, 0)));
+    let planting = async {
+        let give_up = Instant::now() + PROMPT * 3;
+        while !root.join("started").exists() {
+            assert!(Instant::now() < give_up, "the lease never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let stuck = Unkillable::new(user.uid);
+        let mut ids = None;
+        let give_up = Instant::now() + PROMPT;
+        while ids != Some((user.uid, 0)) && Instant::now() < give_up {
+            std::thread::sleep(Duration::from_millis(20));
+            ids = ids_of(stuck.0);
+        }
+        let listed = uid::processes(user.uid).expect("list").contains(&stuck.0);
+        // Killed by its guard after 120 s at the latest: a kill with no deadline, which
+        // waits for it forever (on the runtime's thread too, as the dropped run ends its
+        // uid), then ends, and the test fails instead of hanging the job.
+        let (release, guard) = stuck.guard(Duration::from_secs(120));
+        std::fs::write(root.join("go"), b"").expect("go");
+        (ids, listed, release, guard)
+    };
+    let (ended, (ids, listed, release, guard)) = tokio::join!(lease, planting);
     let took = started.elapsed();
     let after = slots_reported(&rt);
     let _ = release.send(());
@@ -875,152 +918,6 @@ fn entries(dir: &Path) -> Vec<String> {
                 .collect()
         },
     )
-}
-
-/// The homes a recreate moved aside for `user`.
-fn moved_aside(user: &SlotUser) -> Vec<PathBuf> {
-    let prefix = format!("{ASIDE}{}-", user.name);
-    let homes = Path::new(support::pool::HOMES);
-    std::fs::read_dir(homes)
-        .expect("homes")
-        .filter_map(Result::ok)
-        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
-        .map(|e| e.path())
-        .collect()
-}
-
-/// Removes what [`moved_aside`] finds, its flags cleared first.
-fn remove_aside(user: &SlotUser) {
-    for dir in moved_aside(user) {
-        let _ = Command::new("/usr/bin/chflags")
-            .args(["-R", "nouchg"])
-            .arg(&dir)
-            .status();
-        let _ = kbf_outputs::remove_tree(&dir);
-    }
-}
-
-/// A root-owned file in `user`'s home, locked (`uchg`): the wipe clears flags only on
-/// the departing uid's own entries, so it cannot remove it.
-fn plant_stuck(user: &SlotUser) -> PathBuf {
-    let stuck = home_of(user).join("kbf-ci-stuck");
-    std::fs::write(&stuck, b"stuck").expect("stuck file");
-    support::pool::run("/usr/bin/chflags", &["uchg", &stuck.to_string_lossy()]);
-    stuck
-}
-
-/// A failed clean makes the user again. Catches a clean that ignores its check (the
-/// file it could not remove stays in the home for the next lease), and a slot
-/// quarantined although the user could be made again: with a root-owned locked file in
-/// the home, the lease's clean fails, the user is made again with the same name and uid
-/// and an empty home of its own (the old one moved aside, root's, mode 0700), and the
-/// next lease runs on the slot as that uid.
-#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
-#[tokio::test]
-async fn a_slot_whose_home_cannot_be_emptied_gets_its_user_made_again() {
-    assert_root();
-    let scratch = Scratch::new("recreate");
-    let users = Users::new("recreate", 1);
-    let user = users.0[0].clone();
-    remove_aside(&user);
-    let cas = Arc::new(MemoryCas::default());
-    let rt = NativeRuntime::new(config(&scratch, users.pool()), Arc::clone(&cas)).expect("runtime");
-    plant_stuck(&user);
-    let act = scratch.act();
-    let first = support::run(&rt, &cas, 1, &Spec::argv(&[&act, "id"])).await;
-    let home = home_of(&user);
-    let meta = std::fs::symlink_metadata(&home);
-    let in_home = entries(&home);
-    let aside = moved_aside(&user);
-    let aside_meta: Vec<(u32, u32, Vec<String>)> = aside
-        .iter()
-        .map(|dir| {
-            let m = std::fs::symlink_metadata(dir).expect("aside");
-            (m.uid(), m.mode() & 0o7777, entries(dir))
-        })
-        .collect();
-    let named = name_of(user.uid);
-    let reported = slots_reported(&rt);
-    let second = tokio::time::timeout(
-        PROMPT * 3,
-        support::run(&rt, &cas, 2, &Spec::argv(&[&act, "id"])),
-    )
-    .await;
-    remove_aside(&user);
-    let first = first.expect("the first lease ran");
-    assert_eq!(first.exit_code, 0, "{}", stdout(&cas, &first));
-    let meta = meta.expect("no home after the recreate");
-    assert!(meta.is_dir(), "the home is not a directory");
-    assert_eq!(
-        (meta.uid(), meta.gid(), meta.mode() & 0o7777),
-        (user.uid, user.gid, 0o700),
-        "the new home is not the user's, mode 0700"
-    );
-    assert!(
-        in_home.is_empty(),
-        "the home after the recreate holds {in_home:?}"
-    );
-    assert_eq!(
-        aside_meta,
-        vec![(0, 0o700, vec!["kbf-ci-stuck".to_owned()])],
-        "the old home was not moved aside, root's, mode 0700, with the stuck file: {aside:?}"
-    );
-    assert_eq!(
-        named.as_deref(),
-        Some(user.name.as_str()),
-        "uid {} lost its name",
-        user.uid
-    );
-    assert_eq!(reported.as_deref(), Some("1"), "the slot was quarantined");
-    let second = second
-        .expect("the next lease never got the slot")
-        .expect("the next lease ran");
-    assert_eq!(second.exit_code, 0, "{}", support::stderr(&cas, &second));
-    assert_eq!(stdout(&cas, &second), format!("{}\n", user.uid));
-}
-
-/// A failed recreate quarantines the slot. Catches a slot given back although its user
-/// could not be made again (the next lease would find what the clean could not
-/// remove): with the home itself root's and locked, so it can be neither emptied nor
-/// moved aside, the node reports no slot after the lease, and the next lease waits.
-#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
-#[tokio::test]
-async fn a_slot_whose_user_cannot_be_made_again_is_quarantined() {
-    assert_root();
-    let scratch = Scratch::new("quarantine");
-    let users = Users::new("quarantine", 1);
-    let user = users.0[0].clone();
-    remove_aside(&user);
-    let cas = Arc::new(MemoryCas::default());
-    let rt = NativeRuntime::new(config(&scratch, users.pool()), Arc::clone(&cas)).expect("runtime");
-    let home = home_of(&user);
-    plant_stuck(&user);
-    std::os::unix::fs::chown(&home, Some(0), Some(0)).expect("chown");
-    support::pool::run("/usr/bin/chflags", &["uchg", &home.to_string_lossy()]);
-    let act = scratch.act();
-    let first = support::run(&rt, &cas, 1, &Spec::argv(&[&act, "id"])).await;
-    let reported = slots_reported(&rt);
-    let second = tokio::time::timeout(
-        Duration::from_secs(3),
-        support::run(&rt, &cas, 2, &Spec::argv(&[&act, "id"])),
-    )
-    .await;
-    support::pool::run(
-        "/usr/bin/chflags",
-        &["-R", "nouchg", &home.to_string_lossy()],
-    );
-    remove_aside(&user);
-    let first = first.expect("the first lease ran");
-    assert_eq!(first.exit_code, 0, "{}", stdout(&cas, &first));
-    assert_eq!(
-        reported.as_deref(),
-        Some("0"),
-        "a slot whose user could not be made again is still reported"
-    );
-    assert!(
-        second.is_err(),
-        "a lease ran on the quarantined slot: {second:?}"
-    );
 }
 
 /// The start. Catches a start that ends a killed daemon's processes but leaves its

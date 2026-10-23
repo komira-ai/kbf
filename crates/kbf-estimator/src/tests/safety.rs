@@ -268,3 +268,48 @@ fn a_late_kill_with_a_higher_rung_raises_the_floor_in_the_same_event() {
     assert_eq!(floor(&s, &k), 20 * GIB);
     assert!(!s.get(&k).unwrap().raise_only(DAY));
 }
+
+/// The pure kill rule the scheduler's key floors use: a kill opens an event unless its
+/// attempt was booked below the floor in force; the floor takes the retry's rung, never
+/// falls, and stays under the host.
+#[test]
+fn the_kill_floor_rule_counts_events_and_stays_under_the_host() {
+    let first = kill_floor(0, 4 * GIB, Some(16 * GIB), 64 * GIB);
+    assert_eq!(
+        first,
+        KillFloor {
+            floor: 16 * GIB,
+            raised: true,
+            new_event: true
+        }
+    );
+    // Booked below the floor in force: the same event, and no higher floor.
+    let burst = kill_floor(16 * GIB, 4 * GIB, Some(16 * GIB), 64 * GIB);
+    assert_eq!(
+        burst,
+        KillFloor {
+            floor: 16 * GIB,
+            raised: false,
+            new_event: false
+        }
+    );
+    // Booked at the floor: a new event, one rung up.
+    let next = kill_floor(16 * GIB, 16 * GIB, Some(32 * GIB), 64 * GIB);
+    assert_eq!(
+        (next.floor, next.raised, next.new_event),
+        (32 * GIB, true, true)
+    );
+    // No rung given: one step above the booking.
+    assert_eq!(
+        kill_floor(0, 4 * GIB, None, 64 * GIB).floor,
+        4 * GIB + 256 * MIB
+    );
+    // The rung is the whole host: the floor stays strictly below it.
+    let capped = kill_floor(0, 32 * GIB, Some(64 * GIB), 64 * GIB);
+    assert_eq!(capped.floor, 64 * GIB - 256 * MIB);
+    assert_eq!(floor_ceiling(64 * GIB), 64 * GIB - 256 * MIB);
+    assert_eq!(floor_ceiling(64 * GIB + 1), 64 * GIB);
+    // A node with no memory leaves no floor.
+    assert_eq!(kill_floor(0, 4 * GIB, Some(16 * GIB), 0).floor, 0);
+    assert_eq!(floor_ceiling(0), 0);
+}

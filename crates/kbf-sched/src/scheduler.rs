@@ -2,6 +2,8 @@
 
 mod fault;
 mod give_up;
+mod hold;
+mod ids;
 pub(crate) mod loss;
 pub(crate) mod memory;
 mod outage;
@@ -94,6 +96,22 @@ struct Operation {
     /// When it last entered the queue: its submission, or the give-up of its lease
     /// ([`Scheduler::queue_snapshot`] ages the queue from it).
     queued_at: FarmTime,
+    /// While its memory is one a key floor raised: what it booked before and the raise
+    /// ([`Scheduler::reclamp_key_floor`] undoes the raise when no live worker is large
+    /// enough for it).
+    key_applied: Option<KeyApplied>,
+}
+
+/// A memory raise a key floor made to a queued operation.
+#[derive(Clone, Copy, Debug)]
+struct KeyApplied {
+    /// The memory the operation booked before the first raise.
+    base: u64,
+    /// The memory the raise gave it.
+    applied: u64,
+    /// The raise was taken back because no worker could take it without owning the worker
+    /// whole: the operation books what it asked for, and the floor does not raise it again.
+    undone: bool,
 }
 
 /// A queued operation no live worker can run: since when, why, and whether the wait
@@ -252,6 +270,8 @@ impl Worker {
 pub struct Scheduler {
     term: u64,
     next_seq: u64,
+    /// No lease gets a sequence at or past this one ([`Scheduler::use_seq_block`]).
+    seq_limit: u64,
     next_op: u64,
     now: FarmTime,
     ops: BTreeMap<OperationId, Operation>,
@@ -281,6 +301,9 @@ pub struct Scheduler {
     /// kills ([`memory`]). Boxed: most schedulers hold none, and the scheduler is
     /// moved by value.
     memory: Box<MemoryState>,
+    /// The size key of each operation the caller named one for ([`Scheduler::set_size_key`]),
+    /// until the operation is retired. Not in the request, the log or the `Eq` memory state.
+    size_keys: BTreeMap<OperationId, u64>,
     /// The rungs of an action's memory booking ([`memory`]).
     ladder: MemoryLadder,
     /// Workers a recovered scheduler holds leases for that have not registered yet, and
@@ -303,6 +326,7 @@ impl Scheduler {
         Self {
             term,
             next_seq: 0,
+            seq_limit: u64::MAX,
             next_op: 0,
             now: FarmTime::default(),
             ops: BTreeMap::new(),
@@ -317,6 +341,7 @@ impl Scheduler {
             requeues: None,
             reservations: BTreeMap::new(),
             memory: Box::default(),
+            size_keys: BTreeMap::new(),
             ladder: MemoryLadder::default(),
             awaited: BTreeMap::new(),
             store_down: false,
@@ -377,6 +402,7 @@ impl Scheduler {
             self.finished.pop_front();
             self.ops.remove(&id);
             self.memory.forget(id);
+            self.size_keys.remove(&id);
         }
     }
 
@@ -431,6 +457,7 @@ impl Scheduler {
                 losses: 0,
                 avoid: BTreeSet::new(),
                 queued_at: self.now,
+                key_applied: None,
             },
         );
         Vec::new()
@@ -494,6 +521,8 @@ impl Scheduler {
     /// checked against the worker's, never against what other leases hold
     /// ([`Worker::has_room`]), though what they hold ranks the workers; a
     /// whole-machine lease only on a worker that holds no lease, and it books all of it.
+    /// A round places no more leases than the block of sequences the scheduler was given
+    /// has left ([`Scheduler::use_seq_block`]); the rest wait for the next round.
     ///
     /// A whole-machine operation that fits nowhere holds one worker that could run it
     /// (the one it held last round while that still could, else the one with fewest
@@ -516,18 +545,28 @@ impl Scheduler {
             return;
         }
         self.refuse_lost(effects);
+        // Before any operation is fitted: a floor raised since it was queued applies.
+        self.apply_key_floors();
         let now = self.now;
+        let left = usize::try_from(self.seqs_left()).unwrap_or(usize::MAX);
+        let round = PLACEMENT_ROUND.min(left);
         let mut servable = Servable::new(&self.workers, &self.cordons, now);
         let mut placed = Vec::new();
         let mut verdicts = Vec::new();
+        let mut stuck = Vec::new();
         let mut reserved = BTreeSet::new();
         let mut reservations = BTreeMap::new();
         for &(_, id) in &self.queue {
             let op = &self.ops[&id];
             let request = &op.request;
-            let fitted = placed.len() < PLACEMENT_ROUND
+            // A memory a key floor gave it never owns a worker whole while another could
+            // take it.
+            let key_raised = op
+                .key_applied
+                .is_some_and(|a| !a.undone && a.applied == request.resources.memory_bytes);
+            let fitted = placed.len() < round
                 && servable
-                    .fit(&mut self.workers, request, &reserved, &op.avoid)
+                    .fit(&mut self.workers, request, &reserved, &op.avoid, key_raised)
                     .map(|(name, booked, device)| placed.push((id, name, booked, device)))
                     .is_some();
             let verdict = if fitted {
@@ -549,12 +588,29 @@ impl Scheduler {
                 reserved.insert(name.clone());
                 reservations.insert(id, name);
             }
+            if !fitted
+                && key_raised
+                && verdict == Verdict::Servable
+                && !servable.roomy(&self.workers, request)
+            {
+                // Only a worker the raise would own whole is left: it books what it
+                // asked for before the floor instead.
+                stuck.push(id);
+            }
             if op.unservable.is_some() || verdict != Verdict::Servable {
                 verdicts.push((id, verdict));
             }
         }
+        for id in stuck {
+            self.undo_key_raise(id);
+        }
         self.reservations = reservations;
         for (id, verdict) in verdicts {
+            // A size a key floor gave it and no live worker can hold is lowered, not
+            // waited on: the next round judges the smaller request.
+            if matches!(verdict, Verdict::Unservable(_)) && self.reclamp_key_floor(id) {
+                continue;
+            }
             self.note(id, verdict, effects);
         }
         for (id, worker, booked, device) in placed {

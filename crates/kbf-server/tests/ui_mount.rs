@@ -106,12 +106,6 @@ async fn the_ui_is_open_whatever_the_policy_says_of_the_network_routes() {
             network.code,
             network.head
         );
-        let hosts = server.get("/v1/update/hosts").await;
-        assert_eq!(
-            hosts.code, 404,
-            "the per-host detail stays off: {}",
-            hosts.head
-        );
 
         // The UI is not gated by it.
         let overview = server.get("/ui").await;
@@ -137,15 +131,6 @@ async fn the_ui_is_open_whatever_the_policy_says_of_the_network_routes() {
             action.text()
         );
         assert!(!action.text().contains("<script"), "{}", action.text());
-        // No state store here, so the update state is off: the page says so, from the
-        // route's own answer (a gate that refused it would say `401` or `404`).
-        let updates = server.get("/ui/updates").await;
-        assert_eq!(updates.code, 503, "{}", updates.text());
-        assert!(
-            updates.text().contains("update state is off"),
-            "{}",
-            updates.text()
-        );
         let css = server.get("/ui/static/kbf.css").await;
         assert_eq!(css.code, 200);
         assert_eq!(css.header("content-type"), Some("text/css; charset=utf-8"));
@@ -170,6 +155,33 @@ async fn ui_false_leaves_no_ui_and_every_other_route() {
     server.stop().await;
 }
 
+/// Catches: the removed Updates page still answering: `/ui/updates` and a path below it
+/// must answer exactly as a UI path that never existed, and the Overview must not link it.
+#[tokio::test]
+async fn the_updates_page_is_gone_and_answers_like_any_unknown_ui_path() {
+    let (server, _) = with_a_failed_build(pages::OPEN).await;
+    let unknown = server.get("/ui/never-a-page").await;
+    assert_eq!(unknown.code, 404, "{}", unknown.head);
+    for path in ["/ui/updates", "/ui/updates/plan"] {
+        let answer = server.get(path).await;
+        assert_eq!(answer.code, unknown.code, "{path}: {}", answer.head);
+        // The not-found page names the path it was asked for; the rest is the same.
+        assert_eq!(
+            answer.text().replace(path, "PATH"),
+            unknown.text().replace("/ui/never-a-page", "PATH"),
+            "{path}"
+        );
+    }
+    let overview = server.get("/ui").await;
+    assert_eq!(overview.code, 200);
+    assert!(
+        !overview.text().contains("/ui/updates"),
+        "{}",
+        overview.text()
+    );
+    server.stop().await;
+}
+
 /// Catches: a mount that serves a method other than `GET` and `HEAD` (mutant: `any`
 /// for `get`), `HEAD` with a body or refused, and any answer, a `405` or `404` included,
 /// without the headers (mutant: the `secure` layer removed).
@@ -183,7 +195,6 @@ async fn the_ui_answers_get_and_head_only_and_every_answer_is_secured() {
         "/ui/builds?id=b1",
         "/ui/builds/b1",
         action_page.as_str(),
-        "/ui/updates",
         "/ui/static/kbf.css",
         "/ui/missing",
         "/ui/builds/none",

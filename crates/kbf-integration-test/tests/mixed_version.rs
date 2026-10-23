@@ -258,6 +258,8 @@ fn an_n_frontend_works_with_n_minus_1_nodes_and_daemon() {
 ///
 /// Catches what the test above catches, from the other side: nodes and daemons that send a
 /// message an older frontend does not read, or a map it cannot use.
+/// The daemon of N sends no `UpdateStatus` (its update client is gone), so the older
+/// frontend sees a node with no update report; that must not keep the node out of the farm.
 #[test]
 fn an_n_minus_1_frontend_works_with_n_nodes_and_daemon() {
     let Some(previous) = previous_kbf() else {

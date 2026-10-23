@@ -45,7 +45,7 @@ Options:
           A stable name for this node, unique within the cell
 
       --state-store <URI>
-          Where the scheduler keeps its state, written before each change is acknowledged and replayed at start: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a local Unix socket, reached as this process's own user (peer authentication; a URL with a password is refused, and the server must flush commits before it acknowledges them, `synchronous_commit` on, or the start is refused), or `sqlite:///absolute/path`, a file on a local disk that this process owns (created, with its directory, if missing; the file is 0600 and a directory it makes 0700). Every start is a new epoch, so the daemon kills the runs of the leases it held before. Left out, it is `postgres:///kbf?host=/run/postgresql`
+          Where the scheduler keeps its state, written before each change is acknowledged and replayed at start: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a local Unix socket, reached as this process's own user (peer authentication; a URL with a password is refused, and the server must flush commits before it acknowledges them, `synchronous_commit` on, or the start is refused), or `sqlite:///absolute/path`, a file on a local disk that this process owns (created, with its directory, if missing; the file is 0600 and a directory it makes 0700); SQLite is removed in the next release, so a start on it logs a warning (see the upgrade notes). A start keeps the epoch the store holds, so work the earlier process leased is queued again when the daemon half's first heartbeat leaves it out. Left out, it is `postgres:///kbf?host=/run/postgresql`
 
       --reconnect-ms <RECONNECT_MS>
           The wait, in milliseconds, after a session ends and after the first round of connection attempts that all failed. It doubles with each further failed round
@@ -104,12 +104,6 @@ Options:
 
       --reapi-tls-cert <REAPI_TLS_CERT>
           PEM certificate (chain) of the REAPI listener. With `--reapi-tls-key` it serves TLS with this server certificate only; clients present no certificate. It is meant for a certificate from the farm's own internal CA, trusted by the front's proxy (its hop to this server) and by clients that dial this server directly; TLS for the farm's client-facing name still ends at the front. `--reapi-auth-policy` applies over TLS as over plain text
-
-      --update-dir <DIR>
-          The root installer's directory: the daemon reads its `status.json` there. The frontend's orders are written to `orders/` beneath it unless `--orders-dir` says otherwise. Left out, the node updates by hand: it says so and touches no directory. Not taken by the all-in-one binary yet
-
-      --orders-dir <DIR>
-          The order spool (owned by the service user, mode 0700): where the daemon writes the order records the root installer reads. With `--update-dir` only; default `<update-dir>/orders`
 
       --reapi-tls-key <REAPI_TLS_KEY>
           PEM private key of the REAPI listener; it must match `--reapi-tls-cert`, or the server refuses to start
@@ -261,11 +255,12 @@ Options:
           [default: 8388608]
 
       --learned-sizes <LEARNED_SIZES>
-          What the farm does with `kbf-estimator`, which predicts an action's memory from what its earlier runs used. `off` calls it never. `shadow` shows it every attempt that finishes and logs, for every new operation, a `size estimate:` line with what it would book, and counts how the attempts fall against its estimates (`kbf_estimator_shadow_total`); it books exactly what `off` books. The size summaries are kept in the state store; `off` neither reads nor deletes them
+          What the farm does with `kbf-estimator`, which predicts an action's memory from what its earlier runs used. `off` calls it never. `shadow` shows it every attempt that finishes and logs, for every new operation, a `size estimate:` line with what it would book, and counts how the attempts fall against its estimates (`kbf_estimator_shadow_total`); it books exactly what `off` books. `on` is `shadow` plus one change to a booking: a kill at an action's own memory limit leaves a floor under the action's key (instance, platform class, instrument and shape), which every later digest of the key, queued or new, books at least, strictly below the memory of the largest node that could run it. The floor falls only by the estimator's decay: it halves once the key has run 256 times and 7 days have passed without an own-limit kill or a sample above half of it, and a floor that falls to the first rung or below is dropped; a kill raises it again. Only an action whose memory the client did not name, on a platform that pins the OS, is keyed. The size summaries and the keys are kept in the state store, in rows of their own that a release without this flag never reads; `off` neither reads nor deletes the summaries, and ignores the keys. The memory a floor raised a queued operation to is not stored: a restart, or a rollback to `off`, books such an operation at its submitted memory until it ends
 
           Possible values:
           - off:    The estimator is never called and nothing is read from or written to the store
           - shadow: The estimator hears of every finished attempt and is asked for every new operation; the answers are logged and counted. Bookings are unchanged
+          - on:     `shadow`, and one change to a booking: a kill at an action's own memory limit leaves a floor under the action's key that its later digests book at least, until the estimator's decay lowers it
           
           [default: off]
 
@@ -445,42 +440,41 @@ Options:
           
           [default: 10]
 
-      --xcode-apps <XCODE_APPS>
-          The directory searched for `Xcode*.app` (native). Each Xcode whose own `xcodebuild` answers `-version`, `-license check` and `-checkFirstLaunchStatus`, and for which `xcrun --find clang` does (each within a minute, under the actions' sandbox), is ready: it is reported as an `xcode` entry, and an action that names its build runs with it as `DEVELOPER_DIR`. One that is not is listed in the node's status with why and the command that fixes it, and logged at WARN. The daemon says Hello without waiting for its first survey, which runs in the background: until it ends, each Xcode is listed as not surveyed yet and none is reported
+      --native-term-grace-ms <NATIVE_TERM_GRACE_MS>
+          How long a lease's processes are given to end after SIGTERM before they are killed, in milliseconds; 0 kills them at once (native). A workload that cleans up when asked to end, such as Python's multiprocessing resource tracker with the shared memory it made, does so in this time; one that ignores SIGTERM is named in the lease's stderr. A slot's clean uses the same value (at most its own time limit). More than 60000 is taken as 60000. The wait comes after the action's timeout and its memory watch have ended it (neither runs during it), and on top of the time given to the kill that follows. A lease past its memory limit is killed at once. Applies on every platform
           
-          [default: /Applications]
+          [default: 2000]
 
       --ram-peer-grace <RAM_PEER_GRACE>
           How long, in seconds, after its own write of a blob it acknowledged from RAM a storage node waits before it asks the blob's other owner whether the blob is on its disk too, and journals a repair debt if it is not. Long enough that the usual answer is yes and nothing is journalled. Only a node that acknowledges from RAM (`--ram-ack-bytes`) asks. At least 1
           
           [default: 5]
 
-      --xcode-recheck-secs <XCODE_RECHECK_SECS>
-          How often, in seconds, the Xcodes are asked again (native), so one fixed while the daemon runs becomes ready without a restart
+      --xcode-apps <XCODE_APPS>
+          The directory searched for `Xcode*.app` (native). Each Xcode whose own `xcodebuild` answers `-version`, `-license check` and `-checkFirstLaunchStatus`, and for which `xcrun --find clang` does (each within a minute, under the actions' sandbox), is ready: it is reported as an `xcode` entry, and an action that names its build runs with it as `DEVELOPER_DIR`. One that is not is listed in the node's status with why and the command that fixes it, and logged at WARN. The daemon says Hello without waiting for its first survey, which runs in the background: until it ends, each Xcode is listed as not surveyed yet and none is reported
           
-          [default: 180]
+          [default: /Applications]
 
       --ram-ack-bytes <RAM_ACK_BYTES>
           How many bytes of blobs a storage node may hold in RAM, acknowledged to the writer and not yet written to its disk. 0, the default, is off: a write is acknowledged from disk, as before. Over 0, a blob of at most 4 MiB written to two owners is acknowledged once both hold it verified in RAM, and written to each disk afterwards: losing both owners' RAM before then loses the blob. A blob that finds the budget full is written through to the disk before it is acknowledged, never waited for. Set it on every storage node or none. A node that does hold blobs counts them in `kbf_storage_ram_unwritten_bytes`, writes them to its disk in the background and, when it stops, within `--ram-drain-deadline`. A node can hold this many bytes beside the `--write-bytes-in-flight` it receives. Storage nodes only: a server with no replica to hold a second copy holds nothing
           
           [default: 0]
 
-      --require-metal-toolchain
-          This node's actions use Metal (native): an Xcode whose Metal toolchain is not installed (`xcodebuild -showComponent MetalToolchain`) is not ready
-
-      --image <IMAGE>
-          A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon makes sure each is in the node's image store, as the prepare step of every lease does: it fetches the image from its registry by that digest, checks every byte against a digest, and unpacks it once. It exits with status 2 if one cannot be fetched, fails a check, or names an image index. The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
+      --xcode-recheck-secs <XCODE_RECHECK_SECS>
+          How often, in seconds, the Xcodes are asked again (native), so one fixed while the daemon runs becomes ready without a restart
+          
+          [default: 180]
 
       --ram-drain-deadline <RAM_DRAIN_DEADLINE>
           How long, in seconds, a storage node that is stopping waits, after its calls have ended, for the blobs it holds in RAM to be written to its disk (`--ram-ack-bytes`) and then for the blocks staged on its hot store to be flushed to the cold store: one bound for both. The blobs left in RAM when it ends are lost to the stop; the blocks left on the hot store are on its disk, flushed by the next start. Both are counted in the log. At least 1
           
           [default: 30]
 
-      --lease-placement <none|numa-node>
-          Where each lease runs among the node's CPUs (container, Linux): `none`, the default, lets a lease use any CPU the daemon may; `numa-node` puts each lease on one NUMA node, its CPUs (`cpuset.cpus`) and memory (`cpuset.mems`), the node with the least CPU booked by running leases (the lowest id on a tie). `--reserve-cpus` is a quota on all leases together, so it still applies; it removes no CPU from a node. Needs the `cpuset` controller delegated to the daemon (the start fails and says how when it is not); a host with fewer than two NUMA nodes that hold CPUs runs as `none`, which the start logs. Refused with a driver other than `container` (macOS has no such driver)
-          
-          [default: none]
-          [possible values: none, numa-node]
+      --require-metal-toolchain
+          This node's actions use Metal (native): an Xcode whose Metal toolchain is not installed (`xcodebuild -showComponent MetalToolchain`) is not ready
+
+      --image <IMAGE>
+          A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon makes sure each is in the node's image store, as the prepare step of every lease does: it fetches the image from its registry by that digest, checks every byte against a digest, and unpacks it once. It exits with status 2 if one cannot be fetched, fails a check, or names an image index. The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
 
       --store-put-attempts <STORE_PUT_ATTEMPTS>
           How many times a segment PUT is tried. Only a PUT that did not complete (connect, reset, timeout) or that the store answered 5xx is tried again, after 100 ms and then four times longer each time, under a new object key; if every attempt fails, the segment's blobs are answered UNAVAILABLE
@@ -492,35 +486,41 @@ Options:
           
           [default: 1048576]
 
+      --lease-placement <none|numa-node>
+          Where each lease runs among the node's CPUs (container, Linux): `none`, the default, lets a lease use any CPU the daemon may; `numa-node` puts each lease on one NUMA node, its CPUs (`cpuset.cpus`) and memory (`cpuset.mems`), the node with the least CPU booked by running leases (the lowest id on a tie). `--reserve-cpus` is a quota on all leases together, so it still applies; it removes no CPU from a node. Needs the `cpuset` controller delegated to the daemon (the start fails and says how when it is not); a host with fewer than two NUMA nodes that hold CPUs runs as `none`, which the start logs. Refused with a driver other than `container` (macOS has no such driver)
+          
+          [default: none]
+          [possible values: none, numa-node]
+
       --input-tree-cache-bytes <INPUT_TREE_CACHE_BYTES>
           The most bytes of decoded Directories the input check keeps (each costs its digests, 40 bytes apiece, and 160 bytes)
           
           [default: 268435456]
-
-      --oci-runtime <OCI_RUNTIME>
-          The OCI runtime that runs each action's container (container): `crun`, run directly. Each action gets a fresh rootless sandbox. It needs the daemon user's subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on `PATH`, and every directory down to `--data-dir` searchable by others
-          
-          [default: /usr/bin/crun]
 
       --input-tree-reads-in-flight <INPUT_TREE_READS_IN_FLIGHT>
           The most Directory blobs the input check reads from the store at once, across all Executes
           
           [default: 64]
 
+      --oci-runtime <OCI_RUNTIME>
+          The OCI runtime that runs each action's container (container): `crun`, run directly. Each action gets a fresh rootless sandbox. It needs the daemon user's subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on `PATH`, and every directory down to `--data-dir` searchable by others
+          
+          [default: /usr/bin/crun]
+
       --mac-session-socket <MAC_SESSION_SOCKET>
           The socket `kbf-mac-session` serves (native-whole-machine)
           
           [default: /var/run/kbf-mac-session/socket]
 
-      --daemon-user <DAEMON_USER>
-          This daemon's own user, which keeps read and remove access to what a whole-machine lease's user writes in its lease directory (native-whole-machine)
-          
-          [default: _kbf]
-
       --member-ttl-secs <SECONDS>
           How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
           
           [default: 15]
+
+      --daemon-user <DAEMON_USER>
+          This daemon's own user, which keeps read and remove access to what a whole-machine lease's user writes in its lease directory (native-whole-machine)
+          
+          [default: _kbf]
 
       --member-dwell-secs <SECONDS>
           How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners

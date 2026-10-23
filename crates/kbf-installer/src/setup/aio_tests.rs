@@ -1,8 +1,8 @@
 //! Tests of `setup --mode=all-in-one`, which is always behind the proxy: the files of the proxy,
 //! of its frontend children and of the `kbf-storage-and-daemon` sibling, the units, the one
-//! `installer.toml` key that points the children at their file, `--storage-port`, and the refusal
-//! of a host that has the earlier layout. The helpers are `tests.rs`'s. Each test says the defect
-//! it catches and names the mutants to plant to see it go red; none is claimed to have run.
+//! `installer.toml` key that points the children at their file, `--storage-port`, and what tells
+//! a host of the earlier layout (its move is `aio_migrate_tests.rs`'s). The helpers are
+//! `tests.rs`'s. Each test says the behaviour it asserts.
 
 use super::proxy_tests::{proxy_host, proxy_raw};
 use super::*;
@@ -55,10 +55,6 @@ fn children_file(exec: &mut FakeExec, text: &str) {
 /// spool belong to `kbf-server`, the sibling's account gets the rootless prerequisites, and the
 /// output says what is started in what order and what a restart of the sibling costs. The files
 /// are byte for byte the goldens.
-///
-/// Mutants to plant: the owners of the two files swapped; `[frontend]` or `api-listen` written
-/// into the node file; the token or the spool owned by `kbf`; `frontend_config` left out of
-/// `installer_settings`.
 #[test]
 fn an_all_in_one_host_gets_the_proxy_the_children_and_the_sibling() {
     let mut exec = aio_host();
@@ -112,8 +108,6 @@ fn an_all_in_one_host_gets_the_proxy_the_children_and_the_sibling() {
 /// Catches the files written in an order a crash can turn into a host that starts wrongly:
 /// `installer.toml` (which names the children's file) first, then `frontend.toml`, then
 /// `kbf.toml` last, which the sibling's unit waits for, and no unit before it.
-///
-/// Mutants to plant: `frontend.toml` planned after `kbf.toml`; the units before the files.
 #[test]
 fn kbf_toml_is_the_last_file_and_the_units_come_after_it() {
     let mut exec = aio_host();
@@ -132,8 +126,6 @@ fn kbf_toml_is_the_last_file_and_the_units_come_after_it() {
 /// Catches a rerun that does work, or a file whose text is right and whose owner is not being
 /// trusted: the same flags on the finished host plan nothing, and the two files with their
 /// owners swapped are put right with one step each.
-///
-/// Mutants to plant: the owner left out of the comparison of a file; a file written on every run.
 #[test]
 fn a_rerun_changes_nothing_and_a_file_with_the_wrong_owner_is_corrected() {
     let mut exec = aio_host();
@@ -158,8 +150,6 @@ fn a_rerun_changes_nothing_and_a_file_with_the_wrong_owner_is_corrected() {
 
 /// Catches a dry run that writes, or one that leaves a file out of the plan: both files are
 /// named with `DRY-RUN:` and the host is as it was.
-///
-/// Mutant to plant: the dry run applying a step.
 #[test]
 fn a_dry_run_names_both_files_and_changes_nothing() {
     let mut exec = aio_host();
@@ -170,57 +160,14 @@ fn a_dry_run_names_both_files_and_changes_nothing() {
     assert!(exec.log.is_empty(), "{:?}", exec.log);
 }
 
-/// Catches an existing `kbf.toml` of the earlier layout being rewritten into the new one without
-/// the move that goes with it (the old service stopped, its state looked after): setup refuses
-/// (exit 5) naming the file and the mode, plans nothing, and leaves the file and the children's
-/// file as they were, dry run or apply. The same file under another mode is not this refusal's.
-///
-/// Mutants to plant: the check dropped (red: the file is rewritten); the check made for every
-/// mode (red: the daemon run is refused); the check after the first plan is applied; the check
-/// after the flags are validated (red: the run without `--proxy` exits 2 for the flag).
-#[test]
-fn a_kbf_toml_of_the_earlier_layout_is_refused_and_nothing_is_touched() {
-    for options in [APPLY, DRY] {
-        let mut exec = aio_host();
-        put(&mut exec, KBF_TOML, 0o640, ROOT, EARLIER_KBF_TOML);
-        let r = raw(Mode::AllInOne);
-        let err = go(&FakeOs::linux(), &mut exec, &r, options).expect_err("refused");
-        assert_eq!(
-            (err.exit(), err.code()),
-            (Exit::NeedsOperator, "needs_operator")
-        );
-        let said = err.to_string();
-        assert!(said.contains(KBF_TOML), "{said}");
-        assert!(said.contains("mode = \"all-in-one\""), "{said}");
-        assert!(said.contains("kbf-all-in-one.service"), "{said}");
-        assert!(exec.log.is_empty(), "{:?}", exec.log);
-        assert_eq!(text(&exec, KBF_TOML), EARLIER_KBF_TOML);
-        assert!(!exec.entries.contains_key(&hp(AIO_FRONTEND_TOML)));
-
-        // The command line that set the earlier layout up has no `--proxy`: the host is named, not
-        // the missing flag.
-        let mut bare = raw(Mode::AllInOne);
-        bare.proxy.proxy = false;
-        let err = go(&FakeOs::linux(), &mut exec, &bare, options).expect_err("refused");
-        assert_eq!(err.exit(), Exit::NeedsOperator);
-        assert!(exec.log.is_empty(), "{:?}", exec.log);
-    }
-
-    let mut exec = aio_host();
-    put(&mut exec, KBF_TOML, 0o640, ROOT, "mode = \"all-in-one\"\n");
-    go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon));
-    assert_eq!(text(&exec, KBF_TOML), DAEMON_TOML);
-}
-
 /// Catches the test of the earlier layout taking more than it should, or less: only a TOML file
 /// whose top-level `mode` is `all-in-one` is it. Another mode, a mode that is not text, no mode,
-/// and a text that is not TOML are not.
-///
-/// Mutants to plant: the mode compared by prefix; a file that does not parse counted as it.
+/// and a text that is not TOML are not. A run of another mode over such a file does not move it:
+/// the file is decided on as any other (here it holds the mode only, so the daemon's is written).
 #[test]
 fn only_a_toml_file_with_the_mode_all_in_one_is_the_earlier_layout() {
-    assert!(kbf_toml::says_all_in_one("mode = \"all-in-one\"\n"));
-    assert!(kbf_toml::says_all_in_one(EARLIER_KBF_TOML));
+    assert!(kbf_toml::all_in_one_table("mode = \"all-in-one\"\n").is_some());
+    assert!(kbf_toml::all_in_one_table(EARLIER_KBF_TOML).is_some());
     for other in [
         "mode = \"storage-and-daemon\"\n",
         "mode = \"all-in-one-x\"\n",
@@ -229,16 +176,20 @@ fn only_a_toml_file_with_the_mode_all_in_one_is_the_earlier_layout() {
         "mode = [",
         "",
     ] {
-        assert!(!kbf_toml::says_all_in_one(other), "{other:?}");
+        assert!(kbf_toml::all_in_one_table(other).is_none(), "{other:?}");
     }
+
+    let mut exec = aio_host();
+    put(&mut exec, KBF_TOML, 0o640, ROOT, "mode = \"all-in-one\"\n");
+    go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon));
+    assert_eq!(text(&exec, KBF_TOML), DAEMON_TOML);
+    let copy = "/var/lib/kbf-installer/migration-units/kbf.toml.all-in-one";
+    assert!(!exec.entries.contains_key(&hp(copy)));
 }
 
 /// Catches the unit list of the proxy layout drifting from the proxy's: an all-in-one host behind
 /// the proxy has the proxy's two units, in their order, then the sibling; without the proxy the
 /// earlier layout's unit, which hosts that have not moved still run.
-///
-/// Mutants to plant: the sibling first; the proxy's units left out; the earlier layout's unit
-/// returned for the proxy layout.
 #[test]
 fn the_units_of_an_all_in_one_host_are_the_proxys_then_the_sibling() {
     let units = mode_units(Mode::AllInOne, true);
@@ -254,8 +205,6 @@ fn the_units_of_an_all_in_one_host_are_the_proxys_then_the_sibling() {
 /// sibling's `storage-listen` and the address the children dial, both from the one flag, and
 /// without it both say 8990 (the port the documentation and the packaged examples use). A
 /// frontend host has no such port.
-///
-/// Mutants to plant: the port written to one of the files only; the default changed.
 #[test]
 fn the_storage_port_is_the_siblings_listener_and_the_childrens_storage_node() {
     let mut flags = raw(Mode::AllInOne);
@@ -283,10 +232,6 @@ fn the_storage_port_is_the_siblings_listener_and_the_childrens_storage_node() {
 /// ranges and the highest port pass; an invalid base port is refused for itself and does not
 /// overflow the check; a frontend host and a host without `--proxy` refuse the flag, and an
 /// all-in-one host without `--proxy` is refused for that.
-///
-/// Mutants to plant: the lower bound 1024 to 1023; the proxy's ports left out of the refusal (red:
-/// 8980 and 8982 pass); slot B left out of the cover test; the end of a slot's range off by one;
-/// the all-in-one refusal of a missing `--proxy` dropped.
 #[test]
 fn the_storage_port_is_checked_and_belongs_to_all_in_one() {
     const RANGE: &str = "--storage-port: must be 1024 to 65535";
@@ -347,9 +292,9 @@ fn the_storage_port_is_checked_and_belongs_to_all_in_one() {
 /// proxy owns the public addresses and gives its children theirs): each is refused by name, as
 /// on a frontend behind the proxy.
 ///
-/// Mutants to plant: a flag removed from `PROXY_REFUSED` (red: the refusal says the mode does not
-/// take it instead). A `Takes` entry moved back to all-in-one is caught by `kbf_settings_tests`
-/// (the row count, and no `api-listen` in either file), not here.
+/// The refusal names the flag and is the proxy layout's, not the generic one that says the mode
+/// does not take it. The `Takes` table of the flags is asserted by `kbf_settings_tests` (the row
+/// count, and no `api-listen` in either file), not here.
 #[test]
 fn the_listener_flags_are_refused_on_an_all_in_one_host() {
     type Edit = fn(&mut KbfFlags);
@@ -382,8 +327,6 @@ fn the_listener_flags_are_refused_on_an_all_in_one_host() {
 
 /// Catches a host set up without the proxy's user or the sibling's: the package makes both
 /// accounts, and an all-in-one host needs both, so each missing one is named before any write.
-///
-/// Mutant to plant: the proxy's user not looked up (red: the second run goes on).
 #[test]
 fn an_all_in_one_host_needs_both_accounts() {
     for name in ["kbf", "kbf-server"] {
@@ -403,8 +346,6 @@ fn an_all_in_one_host_needs_both_accounts() {
 /// the key as they decide `database`, so a frontend run over the all-in-one `installer.toml`
 /// leaves the proxy host's file, without the line that would point its children at a file
 /// `kbf.toml` no longer makes room for.
-///
-/// Mutant to plant: `frontend_config` kept from the file that is there.
 #[test]
 fn a_frontend_run_drops_the_childrens_file_from_installer_toml() {
     let mut exec = proxy_host();
@@ -420,9 +361,6 @@ fn a_frontend_run_drops_the_childrens_file_from_installer_toml() {
 /// holds the operator's own settings is kept when the keys setup writes match (said in the
 /// output) and refused (exit 5) when one differs, naming the file and the key and never its
 /// value, and nothing is written after it.
-///
-/// Mutants to plant: the file decided as if it were `kbf.toml`'s text; the refusal quoting the
-/// storage address.
 #[test]
 fn the_childrens_file_follows_the_keep_and_refuse_rules_of_kbf_toml() {
     let theirs = format!("{FRONTEND_GOLDEN}\n[log]\nlog-files = 3\n");

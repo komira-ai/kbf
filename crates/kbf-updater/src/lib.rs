@@ -6,6 +6,7 @@
 //! - [`version`]: the one rule for a version, shared with the host-side wrapper;
 //! - [`inventory`]: the root-owned host file, and the order a roll touches the hosts in;
 //! - [`ports`]: safe-to-stop, install and query, health, and the clock, as traits;
+//! - [`ssh_installer`]: the install port over ssh to the `kbf-host-install` forced command;
 //! - [`record`]: `roll.json`, the durable record;
 //! - [`Updater`]: the state machine over all of the above. One roll at a time, the frontend
 //!   first, the first failure stops it, a restart asks the host before it installs again;
@@ -15,24 +16,35 @@
 //!
 //! - [`server`] and [`http`]: the roll API on a unix socket behind kbf-proxy;
 //! - [`listener`]: where that socket comes from (systemd socket activation in production);
-//! - [`safe_http`]: the real safe-to-stop, a call to the frontend's loopback operator API;
-//! - [`not_built`]: the installer and health check this build does not have yet, which
-//!   refuse, so that a roll fails at its first step with no host touched;
+//! - [`operator`], [`reply`] and [`secret`]: the client of the frontend's loopback operator
+//!   API, and the token files it reads;
+//! - [`safe_http`]: the real safe-to-stop, a call to the operator API;
+//! - [`health`] and [`node_health`]: the real health check of a storage or daemon host, over
+//!   the operator API; a frontend host is refused until the kbf-proxy drain control exists;
+//! - [`not_built`]: the installer this build does not have yet, which refuses, so that a
+//!   roll fails at its first step with no host touched;
 //! - [`daemon`]: the flags and the wiring of all of it.
 //!
-//! The ssh installer and the health check come in later changes.
+//! The daemon still wires `not_built` for the installer; switching it to `ssh_installer` is
+//! a later change.
 
 pub mod api;
 pub mod daemon;
 pub mod fakes;
+pub mod health;
 pub mod http;
 pub mod inventory;
 pub mod listener;
+pub mod node_health;
 pub mod not_built;
+pub mod operator;
 pub mod ports;
 pub mod record;
+pub mod reply;
 pub mod safe_http;
+pub mod secret;
 pub mod server;
+pub mod ssh_installer;
 pub mod version;
 
 mod updater;
@@ -44,6 +56,8 @@ mod daemon_tests;
 #[cfg(test)]
 mod listener_tests;
 #[cfg(test)]
+mod node_health_tests;
+#[cfg(test)]
 mod safe_http_tests;
 #[cfg(test)]
 mod server_tests;
@@ -51,6 +65,8 @@ mod server_tests;
 mod testutil;
 #[cfg(test)]
 mod updater_followup_tests;
+#[cfg(test)]
+mod updater_fresh_host_tests;
 #[cfg(test)]
 mod updater_restart_tests;
 #[cfg(test)]

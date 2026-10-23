@@ -598,14 +598,14 @@ issuer = "https://token.actions.githubusercontent.com"
 audience = "kbf-gamma"
 repository_id = "1234567"
 repository = "komira-ai/kbf"
-job_workflow_ref = ["komira-ai/kbf/.github/workflows/gamma.yml@refs/heads/main"]
+job_workflow_ref = ["komira-ai/kbf/.github/workflows/farm-check.yml@refs/heads/main"]
 environments = ["gamma"]
 event_names = ["workflow_run"]
 "#;
 
-/// The gamma allow-list accepts the token of a `workflow_run` job of `gamma.yml` on main in the
+/// The gamma allow-list accepts the token of a `workflow_run` job of `farm-check.yml` on main in the
 /// `gamma` environment, and refuses the same token as a `pull_request_target` (which runs fork
-/// code with secrets), a `gamma.yml` of another branch, and another environment.
+/// code with secrets), a `farm-check.yml` of another branch, and another environment.
 ///
 /// Kills: an event list that does not take `workflow_run`, one that takes any event, a workflow
 /// pin that does not include the ref.
@@ -624,7 +624,8 @@ async fn the_gamma_allow_list_takes_a_workflow_run_and_not_a_pull_request_target
         c["aud"] = json!("kbf-gamma");
         c["repository_id"] = json!("1234567");
         c["repository"] = json!("komira-ai/kbf");
-        c["job_workflow_ref"] = json!("komira-ai/kbf/.github/workflows/gamma.yml@refs/heads/main");
+        c["job_workflow_ref"] =
+            json!("komira-ai/kbf/.github/workflows/farm-check.yml@refs/heads/main");
         c["event_name"] = json!("workflow_run");
         edit(&mut c);
         mint(&keys()[0], &c)
@@ -643,7 +644,7 @@ async fn the_gamma_allow_list_takes_a_workflow_run_and_not_a_pull_request_target
         (
             |c: &mut Value| {
                 c["job_workflow_ref"] =
-                    json!("komira-ai/kbf/.github/workflows/gamma.yml@refs/heads/topic");
+                    json!("komira-ai/kbf/.github/workflows/farm-check.yml@refs/heads/topic");
             },
             Refusal::Workflow,
         ),

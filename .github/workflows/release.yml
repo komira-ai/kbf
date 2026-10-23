@@ -1,26 +1,39 @@
-# A GitHub release of the exact files the artifacts workflow built and attested for one
-# commit of main (docs/artifacts.md), cut by one run that owns the whole chain. Nothing is
-# rebuilt: the files are the ones the push run of artifacts.yml left for that commit, checked
-# again here, so a held script can pin a release asset, which outlives the run's 90-day
+# A GitHub release of the exact files the artifacts stage of the pipeline (pipeline.yml) built
+# and attested for one commit of main (docs/artifacts.md), cut by one run that owns the whole
+# chain. Nothing is rebuilt: the files are the ones the pipeline run left for that commit,
+# checked again here, so a held script can pin a release asset, which outlives the run's 90-day
 # workflow artifacts.
 #
-# The run is started by every push to main and by hand (workflow_dispatch), and nothing else: no
-# tag starts it (a tag the release bot makes would start a second run, and a hand-pushed `v*`
-# tag starts nothing, since only the release bot may create one). The workflow lint
-# (crates/kbf-integration-test/tests/release_workflow) pins the events, and refuses `push`
-# unless every job of the chain below is present. The jobs that write run only for a push to
-# main, so a dispatch is a dry run through `verify`.
+# The run is started by one event and nothing else: the completion of a run of the pipeline
+# (`workflow_run`), and only a pipeline run that succeeded, for a push to main of this
+# repository. The pipeline is ci, then artifacts, then beta on those artifacts, each needing the
+# one before, so a release is cut only from a commit all three passed. No tag starts this
+# workflow (a tag the release bot makes would start a second run, and a hand-pushed `v*` tag
+# starts nothing, since only the release bot may create one), and there is no hand-started dry
+# run: a failed release job is re-run from this run's page. The workflow lint
+# (crates/kbf-integration-test/tests/release_workflow) pins the trigger, the condition every
+# job carries, and the chain below.
 #
-# gates    waits for the push runs of ci, beta and artifacts for this commit on main to have
-#          succeeded (cargo xtask release gates). Read-only.
+# Why a second workflow. A newer push cancels the pipeline run it replaces, whole (a
+# workflow-level cancel stops every job of the run). The release is the one part that must
+# never be stopped half way, so it is not a job of that run: this workflow has its own
+# concurrency group that never cancels, and nothing but the success of a pipeline run starts it.
+# A pipeline run cancelled at any point starts no release; a release run that has started is
+# never cancelled by a push. `workflow_run` runs the copy of this file on main and holds this
+# repository's token and the `release` environment, which is why the lint allows the trigger
+# here and nowhere else, and why every job tests the run that started it: its conclusion, its
+# event, its branch and its repository. A run started by `workflow_run` has the latest commit of
+# main as `github.sha`; every job uses the commit the pipeline run built (COMMIT) instead.
+#
 # plan     reads VERSION and the tags: the next version, and whether the push is code (it
 #          ships in a release), the site, or the pipeline itself (cargo xtask release plan).
-#          A push of docs only makes no release and the run stays green; a push that changes
-#          the pipeline does not release itself, the next push that does not releases both.
-# verify   refuses a commit not on main, downloads the files of the artifacts run the gates saw, checks
-#          the files against SHA256SUMS and the commit's assets, and verifies every attestation
-#          as a deployment does and every bundle offline as a host does. Read-only, and it
-#          runs before anything is tagged.
+#          A range of docs only (since the last release tag) makes no release and the run stays
+#          green; a commit that changes the pipeline does not release itself, the next one that
+#          does not releases both.
+# verify   refuses a commit not on main, downloads the files of the pipeline run that started
+#          this one, checks the files against SHA256SUMS and the commit's assets, and verifies
+#          every attestation as a deployment does and every bundle offline as a host does.
+#          Read-only, and it runs before anything is tagged.
 # tag      writes the Beta record (an audit record nothing gates on) and creates the annotated
 #          tag, create-only, naming exactly this commit, with a token of the release bot,
 #          the only identity the `v*` tag ruleset lets create one. The token is minted in
@@ -39,63 +52,51 @@
 # release tag must name this commit or an ancestor of it: `release tag` and `release publish`
 # both refuse otherwise). Re-run the failed jobs only: a re-run of all jobs writes another
 # Beta record, and a tag that exists must carry the record it was made with.
+#
+# `plan` measures from the highest release tag that is an ancestor of the commit, not from the
+# push: the code of a push that was queued behind another or replaced while waiting is released
+# with the next one, and a docs-only push after code still releases that code.
 name: release
 
 on:
-  push:
+  workflow_run:
+    workflows: [pipeline]
+    types: [completed]
     branches: [main]
-  workflow_dispatch:
 
 permissions: {}
 
-# One release at a time across the repository, none cancelled: every push shares the one group
-# `release-push` (a second push waits for the first; a third pending one replaces the second
-# while it waits, as GitHub keeps one pending run per group; `plan` diffs each push from its own
-# `before`, so a replaced code push is released with the next code push, not by a docs-only one).
-# A dry run by hand publishes nothing, so each has its own group and never holds a release.
+# One release at a time across the repository, none cancelled: a second one waits for the first
+# (GitHub keeps one pending run per group, so a third replaces the second while it waits). Only a
+# pipeline run that succeeded joins the group `release-main`. Any other (cancelled by a newer
+# push, or red) starts this workflow too, to skip every job, and takes a group of its own: in
+# the shared group it would replace the release waiting there.
 concurrency:
-  group: release-${{ github.event_name == 'push' && 'push' || github.run_id }}
+  group: release-${{ github.event.workflow_run.conclusion == 'success' && 'main' || github.run_id }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # The commit the pipeline run built and the run itself (not `github.sha`, which for a
+  # `workflow_run` is the latest commit of main).
+  COMMIT: ${{ github.event.workflow_run.head_sha }}
+  PIPELINE_RUN: ${{ github.event.workflow_run.id }}
 
 defaults:
   run:
     shell: bash
 
 jobs:
-  gates:
-    runs-on: ubuntu-24.04
-    # `release gates` gives up, red, after 3 hours.
-    timeout-minutes: 200
-    permissions:
-      contents: read
-      actions: read
-    outputs:
-      ci-run: ${{ steps.gates.outputs.ci_run }}
-      beta-run: ${{ steps.gates.outputs.beta_run }}
-      artifacts-run: ${{ steps.gates.outputs.artifacts_run }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      # Built before any step holds a token, so no build script runs beside one.
-      - run: cargo build -p xtask --locked
-      - name: The push runs of ci, beta and artifacts for this commit on main have succeeded
-        id: gates
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: cargo xtask release gates --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --branch main --output "$GITHUB_OUTPUT"
-
   plan:
-    needs: [gates]
+    # The run that started this one succeeded, for a push to main of this repository: the only
+    # event this workflow acts on (the condition every job below repeats or needs this job for).
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
+      actions: read
     outputs:
       version: ${{ steps.plan.outputs.version }}
       tag: ${{ steps.plan.outputs.tag }}
@@ -103,9 +104,10 @@ jobs:
       site: ${{ steps.plan.outputs.site }}
       pipeline: ${{ steps.plan.outputs.pipeline }}
     steps:
-      # The whole history and every tag: the files the push changed, and the highest tag.
+      # The whole history and every tag: the files changed since the highest release tag.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
           persist-credentials: false
       - run: rustup toolchain install
@@ -114,14 +116,12 @@ jobs:
         id: plan
         env:
           GH_TOKEN: ${{ github.token }}
-          # A dispatch has no commit before it: all zeros reads as the first push, which is code.
-          BEFORE: ${{ github.event.before || '0000000000000000000000000000000000000000' }}
           # The stop switch: any value refuses every release until an admin clears it.
           FREEZE: ${{ vars.RELEASE_FREEZE }}
-        run: cargo xtask release plan --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --before "$BEFORE" --freeze "$FREEZE" --output "$GITHUB_OUTPUT"
+        run: cargo xtask release plan --repo "$GITHUB_REPOSITORY" --sha "$COMMIT" --freeze "$FREEZE" --output "$GITHUB_OUTPUT"
 
   verify:
-    needs: [gates, plan]
+    needs: [plan]
     # Not for a push that ships nothing, nor one that changes the pipeline.
     if: ${{ needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
     runs-on: ubuntu-24.04
@@ -130,34 +130,33 @@ jobs:
       contents: read
       actions: read
       attestations: read
-    env:
-      COMMIT: ${{ github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - run: rustup toolchain install
       # Built before any step holds a token, so no build script runs beside one.
       - run: cargo build -p xtask --locked
-      # Refuses a commit not on main, and a main push run that no longer holds every artifact a
-      # release needs. The files are downloaded from the artifacts run the gates saw, so the
-      # Beta record names the run that built them.
+      # Refuses a commit not on main, a pipeline run that is not the successful push run that
+      # built it, and one that no longer holds every artifact a release needs. The files are
+      # downloaded from that run, so the Beta record names the run that built them.
       - name: Refuse a commit not on main, or a build that lost an artifact
         env:
           GH_TOKEN: ${{ github.token }}
-        run: cargo xtask release locate --repo "$GITHUB_REPOSITORY" --commit "$COMMIT"
+        run: cargo xtask release locate --repo "$GITHUB_REPOSITORY" --commit "$COMMIT" --run-id "$PIPELINE_RUN"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: assets-*
           path: dist
           merge-multiple: true
-          run-id: ${{ needs.gates.outputs.artifacts-run }}
+          run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: sha256sums
           path: dist
-          run-id: ${{ needs.gates.outputs.artifacts-run }}
+          run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
       # The provenance bundle of each tarball (`<tarball>.sigstore.json`), which the sums do
       # not list: the attestation that made it signed the files they list.
@@ -166,7 +165,7 @@ jobs:
           pattern: bundles-*
           path: dist
           merge-multiple: true
-          run-id: ${{ needs.gates.outputs.artifacts-run }}
+          run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
       - name: Check the files against SHA256SUMS
         working-directory: dist
@@ -189,8 +188,8 @@ jobs:
           if-no-files-found: error
 
   tag:
-    needs: [gates, plan, verify]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
+    needs: [plan, verify]
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     # The release bot's key is read only by jobs of this environment; a branch policy that
@@ -201,6 +200,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - run: rustup toolchain install
       # Built before any step holds a token, so no build script runs beside one.
@@ -213,10 +213,7 @@ jobs:
       - name: Write the Beta record
         env:
           TAG: ${{ needs.plan.outputs.tag }}
-          CI_RUN: ${{ needs.gates.outputs.ci-run }}
-          BETA_RUN: ${{ needs.gates.outputs.beta-run }}
-          ARTIFACTS_RUN: ${{ needs.gates.outputs.artifacts-run }}
-        run: cargo xtask release verdict-write dist --commit "$GITHUB_SHA" --tag "$TAG" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --ci-run "$CI_RUN" --beta-run "$BETA_RUN" --artifacts-run "$ARTIFACTS_RUN" --out verdict.json
+        run: cargo xtask release verdict-write dist --commit "$COMMIT" --tag "$TAG" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --pipeline-run "$PIPELINE_RUN" --out verdict.json
       # The token of the release bot, for this repository alone and for contents only.
       - name: The release bot's token
         id: bot
@@ -230,11 +227,11 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
           TAG: ${{ needs.plan.outputs.tag }}
-        run: cargo xtask release tag --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --tag "$TAG" --message-file verdict.json
+        run: cargo xtask release tag --repo "$GITHUB_REPOSITORY" --sha "$COMMIT" --tag "$TAG" --message-file verdict.json
 
   notes:
-    needs: [gates, plan, verify, tag]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
+    needs: [plan, verify, tag]
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -242,7 +239,6 @@ jobs:
       actions: read
       attestations: read
     env:
-      COMMIT: ${{ github.sha }}
       TAG: ${{ needs.plan.outputs.tag }}
     outputs:
       set-hash: ${{ steps.verify-tag.outputs.set-hash }}
@@ -251,6 +247,7 @@ jobs:
       # message is the Beta record) and origin/main, which the tag check and the notes read.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
           persist-credentials: false
       - run: rustup toolchain install
@@ -328,8 +325,8 @@ jobs:
 
   # The files the earlier jobs checked, as a release of the tag.
   publish:
-    needs: [gates, plan, verify, tag, notes]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
+    needs: [plan, verify, tag, notes]
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: release
@@ -338,6 +335,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - run: rustup toolchain install
       # Built before any step holds the token, so no build script runs beside it.
@@ -357,13 +355,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.plan.outputs.tag }}
-          RUN_ID: ${{ needs.gates.outputs.artifacts-run }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
           SET_HASH: ${{ needs.notes.outputs.set-hash }}
-        run: cargo xtask release publish dist --repo "$GITHUB_REPOSITORY" --tag "$TAG" --commit "$GITHUB_SHA" --run-id "$RUN_ID" --set-hash "$SET_HASH" --notes-file release-notes.md
+        run: cargo xtask release publish dist --repo "$GITHUB_REPOSITORY" --tag "$TAG" --commit "$COMMIT" --run-id "$RUN_ID" --set-hash "$SET_HASH" --notes-file release-notes.md
 
   bump:
     needs: [plan, tag, publish]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: release
@@ -372,6 +370,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - run: rustup toolchain install
       # Built before any step holds a token, so no build script runs beside one.
@@ -391,4 +390,4 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
           VERSION: ${{ needs.plan.outputs.version }}
-        run: cargo xtask release bump-internal --repo "$GITHUB_REPOSITORY" --version "$VERSION" --sha "$GITHUB_SHA" --internal-repo komira-ai/komira-internal --submodule kbf
+        run: cargo xtask release bump-internal --repo "$GITHUB_REPOSITORY" --version "$VERSION" --sha "$COMMIT" --internal-repo komira-ai/komira-internal --submodule kbf

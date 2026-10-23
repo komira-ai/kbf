@@ -754,8 +754,6 @@ where
     let update_rows = state
         .as_ref()
         .map(|s| crate::update::Rows::new(Arc::clone(&s.store)));
-    let update_store = state.as_ref().map(|s| Arc::clone(&s.store));
-    let update_members = members.clone();
     let farm = Arc::new(farm.with_state(state)?);
     // One start, one bind budget: the three listeners wait for a late interface together.
     let binder = Binder::new();
@@ -796,8 +794,6 @@ where
         recorder: recorder.clone(),
         history: history.as_ref().map(crate::history::History::reads),
         budget,
-        farm: Arc::clone(&farm),
-        rows: update_rows.clone(),
     };
     let offers =
         crate::release::offers::offers_of(releases.clone(), update_rows.clone(), listeners.tick);
@@ -928,15 +924,6 @@ where
         // and they never delay it. It stops when the serving future does.
         let history = crate::history::spawn(history);
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
-        // The rolling-update controller; it starts hosts for the desired release unless the
-        // operator wrote `auto_nodes` false or paused it.
-        let _updates = crate::update::spawn_controller(
-            Arc::clone(&farm),
-            update_store,
-            update_members,
-            listeners.tick,
-        )
-        .map(AbortOnDrop);
         // `reapi_incoming` carries the REAPI TLS when there is any, so the health
         // service is served over the same TLS as the REAPI routes; the authenticator is
         // already applied to those routes alone (above).

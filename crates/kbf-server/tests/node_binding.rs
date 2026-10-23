@@ -702,23 +702,13 @@ async fn a_revoked_daemon_cannot_report_its_status() {
 }
 
 /// Catches an `UpdateStatus` not checked against the deny list, so a node revoked while
-/// its stream is open goes on writing the update state the operator API reports for it.
-/// The control: the same stream's status before the revocation is recorded.
+/// its stream is open goes on writing the update state the update controller reads for it.
+/// The control: the same stream's `UpdateStatus` before the revocation is accepted (the
+/// stream stays open, and a `NodeStatus` sent after it is recorded in order).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_revoked_daemon_cannot_report_its_update_status() {
     use kbf_proto::update::UpdateStatus;
     use kbf_proto::update::update_status::State;
-    /// `GET /v1/update/hosts` at `api`, as JSON.
-    async fn hosts(api: SocketAddr) -> serde_json::Value {
-        let mut stream = TcpStream::connect(api).await.expect("connect to the API");
-        let request = "GET /v1/update/hosts HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n";
-        stream.write_all(request.as_bytes()).await.expect("send");
-        let mut response = String::new();
-        stream.read_to_string(&mut response).await.expect("read");
-        let (head, body) = response.split_once("\r\n\r\n").expect("a head and a body");
-        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
-        serde_json::from_str(body).expect("JSON")
-    }
     let status = |running: &str, state: State| {
         daemon_message::Message::UpdateStatus(UpdateStatus {
             running_commit: running.to_owned(),
@@ -738,28 +728,20 @@ async fn a_revoked_daemon_cannot_report_its_update_status() {
         local_cache: None,
         releases: None,
     };
-    let farm_get = kbf_auth::Policy::from_json(
-        r#"{"authenticationPolicy": {"allow": {}}, "farm": {"getAuthorizer": {"allow": {}}}}"#,
-    )
-    .expect("a policy");
-    let bound = kbf_server::bind_server_with_state(
-        Arc::new(Cache::memory()),
-        listeners,
-        Some(api),
-        farm_get,
-        None,
-        pending(),
-    )
-    .expect("bind");
+    let bound = bind_server_with_api(Arc::new(Cache::memory()), listeners, Some(api), pending())
+        .expect("bind");
     let (worker, api) = (bound.worker, bound.api.expect("an API address"));
     tokio::spawn(async move { bound.serving.await.expect("serve") });
     let mut open = Session::open(worker, &pki, pki.client(&["mac-08"], 9), "mac-08")
         .await
         .expect("welcomed");
 
+    // Messages on a stream are handled in order: once the `NodeStatus` is listed, the
+    // `UpdateStatus` before it has been handled, and the stream took it.
     open.send(status("0123456789ab", State::Idle));
+    open.send(macos("15.1"));
     let deadline = tokio::time::Instant::now() + PROMPT;
-    while nodes(api).await["nodes"][0]["update"]["state"] != "idle" {
+    while nodes(api).await["nodes"][0]["software"]["os_version"] != "15.1" {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the status never arrived"
@@ -774,8 +756,9 @@ async fn a_revoked_daemon_cannot_report_its_update_status() {
         .await
         .expect_err("the UpdateStatus ended the stream");
     assert_eq!(ended.code(), Code::PermissionDenied, "{ended:?}");
-    // Its stream is gone, so what the farm kept is only what it said before.
-    let got = hosts(api).await;
-    assert_eq!(got["hosts"][0]["node_id"], "mac-08", "{got}");
-    assert_eq!(got["hosts"][0]["running_commit"], "0123456789ab", "{got}");
+    assert!(
+        ended.message().contains("node mac-08"),
+        "{}",
+        ended.message()
+    );
 }

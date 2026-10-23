@@ -57,7 +57,7 @@ use std::sync::LazyLock;
 
 use kbf_estimator::{
     Basis, Bounds, Cfg, Day, Estimate, Fallback, Hint, Instance, Key, Level, Outcome as RunOutcome,
-    PlatformClass, Run, Shape, Summaries, memory_max,
+    PlatformClass, Run, Shape, Summaries, Summary, memory_max,
 };
 use kbf_front::metrics::{ShadowBucket, ShadowLevel, ShadowTotals};
 use kbf_invocation::{BookSource, Evidence, RunUsage, UsageBasis};
@@ -77,6 +77,10 @@ pub enum LearnedSizes {
     /// The estimator hears of every finished attempt and is asked for every new
     /// operation; the answers are logged and counted. Bookings are unchanged.
     Shadow,
+    /// `shadow`, and one change to a booking: a kill at an action's own memory limit leaves
+    /// a floor under the action's key that its later digests book at least, until the
+    /// estimator's decay lowers it.
+    On,
 }
 
 const DAY_MS: u64 = 86_400_000;
@@ -142,6 +146,15 @@ pub struct Learned {
     swept: Option<FarmTime>,
     /// A sweep of the store that has more to do at the next tick, for this day.
     sweeping: Option<Day>,
+    /// The size keys of the keyed operations seen under each estimator key (level 2): the
+    /// key floors a decay of that key's summary lowers, whichever attempt causes it
+    /// ([`Learned::register`]).
+    named: BTreeMap<Key, BTreeSet<u64>>,
+    /// The estimator key (level 2) of each size key in `named`, for the row of its floor.
+    names: BTreeMap<u64, Key>,
+    /// Key floors the estimator's decay has lowered since they were last taken: the size
+    /// key, the floor the summary held before and the one it holds now.
+    lowered: Vec<(u64, u64, u64)>,
 }
 
 impl Learned {
@@ -164,6 +177,9 @@ impl Learned {
             flushed: FarmTime::default(),
             swept: None,
             sweeping: None,
+            named: BTreeMap::new(),
+            names: BTreeMap::new(),
+            lowered: Vec::new(),
         }
     }
 
@@ -171,6 +187,12 @@ impl Learned {
     #[must_use]
     pub fn off(&self) -> bool {
         self.mode == LearnedSizes::Off
+    }
+
+    /// Whether requests are keyed for the kill-driven floor (`on`).
+    #[must_use]
+    pub fn keys(&self) -> bool {
+        self.mode == LearnedSizes::On
     }
 
     /// How many times the estimator was asked or shown a run. Always 0 while off.
@@ -263,6 +285,51 @@ impl Learned {
         self.started.remove(&lease);
     }
 
+    /// Records that a keyed operation with size key `size_key` was submitted for the
+    /// estimator key `key` (any level): when the decay lowers that key's floor, the floor
+    /// under `size_key` is reported, whichever attempt of the key causes the decay (one the
+    /// client sized, which is never keyed, included). Only with `on`.
+    pub fn register(&mut self, key: &Key, size_key: u64) {
+        if !self.keys() {
+            return;
+        }
+        if self.named.len() >= STARTED_CAP
+            && let Some((_, gone)) = self.named.pop_first()
+        {
+            self.names.retain(|size_key, _| !gone.contains(size_key));
+        }
+        self.named.entry(key.l2()).or_default().insert(size_key);
+        self.names.insert(size_key, key.l2());
+    }
+
+    /// The estimator key (level 2) the keyed operations with `size_key` were registered
+    /// under, if any.
+    #[must_use]
+    pub fn summary_key(&self, size_key: u64) -> Option<Key> {
+        self.names.get(&size_key).cloned()
+    }
+
+    /// The size keys registered under the estimator key `key`, for a test.
+    #[must_use]
+    pub fn named(&self, key: &Key) -> Vec<u64> {
+        self.named
+            .get(&key.l2())
+            .map_or_else(Vec::new, |keys| keys.iter().copied().collect())
+    }
+
+    /// The key floors the estimator's decay lowered since the last call: the size key, the
+    /// floor the summary held before, and the floor to keep, which is `0` when what is
+    /// left is no more than the first rung (a floor that low changes no booking). The
+    /// decay is the estimator's: a floor halves only once its key has run 256 times and 7
+    /// days have passed without a kill or a sample above half of it.
+    pub fn take_lowered(&mut self) -> Vec<(u64, u64, u64)> {
+        let default = self.default_memory;
+        std::mem::take(&mut self.lowered)
+            .into_iter()
+            .map(|(key, before, after)| (key, before, if after > default { after } else { 0 }))
+            .collect()
+    }
+
     /// Keeps `attempt`, the report of `lease`, until the scheduler has said whether it
     /// took the report ([`Learned::finish`]) or the kill it caused is requeued
     /// ([`Learned::requeued`]). `None`: nothing to show for the lease.
@@ -284,7 +351,7 @@ impl Learned {
             return Vec::new();
         };
         attempt.run.raised_memory_bytes = Some(raised);
-        self.observe(&attempt, bounds);
+        self.observe_keyed(&attempt, bounds);
         let touched = BTreeSet::from([attempt.key.clone(), attempt.key.l2()]);
         self.rows_of(touched)
     }
@@ -299,11 +366,25 @@ impl Learned {
         let Some(attempt) = self.staged.remove(&lease).filter(|_| taken) else {
             return Vec::new();
         };
-        self.observe(&attempt, bounds);
+        self.observe_keyed(&attempt, bounds);
         if attempt.run.outcome != RunOutcome::OwnLimitKill {
             return Vec::new();
         }
         self.rows_of(BTreeSet::from([attempt.key.clone(), attempt.key.l2()]))
+    }
+
+    /// [`Learned::observe`], noting the key floors its decay lowered.
+    fn observe_keyed(&mut self, attempt: &Attempt, bounds: &Bounds) {
+        let l2 = attempt.key.l2();
+        let floor = |learned: &Self| learned.summaries.get(&l2).map_or(0, Summary::oom_floor);
+        let before = floor(self);
+        self.observe(attempt, bounds);
+        let after = floor(self);
+        if after < before {
+            let named = self.named.get(&l2).into_iter().flatten().copied();
+            let lowered: Vec<_> = named.map(|size_key| (size_key, before, after)).collect();
+            self.lowered.extend(lowered);
+        }
     }
 
     /// Shows the estimator `attempt`: asks it first what it would have booked, then

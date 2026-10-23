@@ -6,9 +6,16 @@
 //
 // The map is the farm's placement: a frontend builds it, every storage node, daemon and
 // frontend routes by it, and it must mean the same thing everywhere, so the decoder
-// (kbf-proto's `kbf_map::Map` conversion) is strict:
-// - Enums are closed. Every enum's zero value is UNSPECIFIED and is refused, and so is any
-//   value this file does not name; it is never read as a default.
+// (kbf-proto's `kbf_map::Map` conversion) skips what it does not know and refuses a map
+// it knows to be wrong:
+// - MemberState, Rule and Role skip what they do not know. Their zero value is UNSPECIFIED
+//   and a value this file does not name is read like it, as an inert value, never as a
+//   default. A member in a MemberState the reader does not name stays in the map, is given
+//   no work and is not counted as active. A Rule the reader does not name places no one,
+//   and the rest of the map (members, replication, protocol floor, denied entries)
+//   applies. The number is kept, so a map or a stored member written back says what it
+//   said. A Register naming a Role the frontend does not name is answered UNIMPLEMENTED
+//   (UNSPECIFIED: INVALID_ARGUMENT) and leaves no member behind.
 // - A map the domain refuses (generation 0, replication 0 or above the member count, a
 //   repeated member id, a zero weight, an empty address, a malformed or repeated denied entry) is refused.
 // - `replication` is a uint32 on the wire (proto has no smaller integer); above 255 is
@@ -17,9 +24,8 @@
 // `generation` is field 1, as `map_generation` is field 1 of every storage request
 // (kbf.storage.v1), so a reader that wants only the number reads the first field.
 //
-// Extending: add fields and enum values, never reuse a number. A new enum value is read
-// by an older decoder as an error, so it ships only after every reader has the old
-// decoder's refusal handled (a new MemberState needs a map generation floor).
+// Extending: formats change by adding only. Add fields and enum values, never reuse a number,
+// never change what a number means. A reader that does not know a field or a value skips it.
 syntax = "proto3";
 
 package kbf.map.v1;

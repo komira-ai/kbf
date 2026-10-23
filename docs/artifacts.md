@@ -231,14 +231,14 @@ renamed.
 | Event | What happens |
 |---|---|
 | Pull request, merge queue | A build check: every asset is built, signed, packaged and summed, and `SHA256SUMS` is checked. Nothing is attested, so nothing is published. |
-| Push to `main` | The same, then, per platform group (Linux: `sums-linux`, `attest-linux`, `verify-linux`; macOS: `sums-darwin-arm64`, `attest-darwin-arm64`, `verify-darwin-arm64`, so the Linux files are attested as soon as the Linux builds finish, however long the macOS runners queue), the `attest-*` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`), an SBOM attestation for every tarball (`actions/attest-sbom`) and a build provenance attestation of each tarball alone, whose bundle it saves (artifact `bundles-linux` or `bundles-darwin-arm64`), and nothing else. The `verify-*` job of the group then assembles the group's `SHA256SUMS` (artifact `sha256sums-linux` or `sha256sums-darwin-arm64`, listing only that group's files, each with the same subject as in the commit's one `SHA256SUMS`) again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below, for the branch that was pushed (`--source-ref "$GITHUB_REF"`), and every tarball against its bundle, offline, for the commit (`--commit "$GITHUB_SHA"`). |
+| Push to `main` | The same, as the second stage of the one pipeline (`pipeline.yml`: `ci`, then `artifacts`, then `beta` on these files, then the release; `artifacts.yml` is called by it, and reads the push as its own event), then, per platform group (Linux: `sums-linux`, `attest-linux`, `verify-linux`; macOS: `sums-darwin-arm64`, `attest-darwin-arm64`, `verify-darwin-arm64`, so the Linux files are attested as soon as the Linux builds finish, however long the macOS runners queue), the `attest-*` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`), an SBOM attestation for every tarball (`actions/attest-sbom`) and a build provenance attestation of each tarball alone, whose bundle it saves (artifact `bundles-linux` or `bundles-darwin-arm64`), and nothing else. The `verify-*` job of the group then assembles the group's `SHA256SUMS` (artifact `sha256sums-linux` or `sha256sums-darwin-arm64`, listing only that group's files, each with the same subject as in the commit's one `SHA256SUMS`) again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below, for the branch that was pushed (`--source-ref "$GITHUB_REF"`), and every tarball against its bundle, offline, for the commit (`--commit "$GITHUB_SHA"`). |
 
 An attestation names the ref it was signed on, and only `refs/heads/main` signs now.
 Until main became the only integration branch, pushes to a development branch,
 `feature/arch-v2`, were attested too (historic: those assets and packages still exist,
 and a host that trusts one asks for that branch with `--source-ref`; an asset attested on
 `feature/arch-v2` never verifies as `main`'s). A release (below) verifies as `main` and
-only takes the files of a push run on `main`, so a file built from any other branch is
+only takes the files of the pipeline run of a push to `main`, so a file built from any other branch is
 never released.
 
 Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write`, and only
@@ -480,7 +480,7 @@ themselves do not expire with the artifacts.
 
 ## Releases
 
-A release is the files a push run of `artifacts.yml` on `main` left for one commit,
+A release is the files the `artifacts` stage of the pipeline run of a push to `main` left for one commit,
 attached unchanged to a GitHub release
 ([`.github/workflows/release.yml`](../.github/workflows/release.yml)). Nothing is
 rebuilt. Its assets are every tarball and SBOM in the table above, for that commit, the
@@ -488,17 +488,21 @@ rebuilt. Its assets are every tarball and SBOM in the table above, for that comm
 `SHA256SUMS`, and the provenance bundle of each tarball, `<tarball>.sigstore.json`, beside
 it.
 
-One run of `release.yml` cuts a release; nobody tags. It is started by hand
-(`workflow_dispatch`, no inputs: it releases the commit it runs on, as a dry run) and by every
-push to `main` (`push: branches: [main]`). A tag pushed by hand
+One run of `release.yml` cuts a release; nobody tags. A push to `main` runs one sequential pipeline
+(`pipeline.yml`, [design](design/kbf-cicd.md), section 8.0): `ci`, then `artifacts`, then `beta`, which installs and
+tests the `kbf` of the files `artifacts` built in that same run, each stage needing the one before it. `release.yml`
+is started by the completion of a pipeline run (`workflow_run`, `branches: [main]`) and acts only when that run
+succeeded for a push to `main`; it reads the files from that run's artifacts by the run's id and publishes those same
+files. It is a workflow of its own so that nothing a push does can cancel a
+release that has started: its group never cancels, and a pipeline run that is red starts it only to skip
+every job. There is no hand-started run: a failed job is re-run from the run's page (failed jobs only). A tag pushed by hand
 starts nothing, and only the release bot (a GitHub App, the one bypass of the `v*` tag ruleset)
 can create one. The jobs, each with the least token it needs:
 
 | job | does | scopes |
 |---|---|---|
-| `gates` | waits for the push runs of `ci`, `beta` and `artifacts` for the commit on `main` to succeed (`cargo xtask release gates`) | `contents: read`, `actions: read` |
-| `plan` | the next version from `VERSION` and the tags, and whether the push is code, the site or the pipeline itself (`release plan`); the stop switch `RELEASE_FREEZE` is read here | `contents: read` |
-| `verify` | finds the artifacts run, refuses a commit not on `main`, checks the files and every attestation (below), before anything is tagged | `contents`, `actions`, `attestations`: read |
+| `plan` | the next version from `VERSION` and the tags, and whether the push is code, the site or the pipeline itself (`release plan`, measured from the highest release tag that is an ancestor of the commit); the stop switch `RELEASE_FREEZE` is read here | `contents`, `actions`: read |
+| `verify` | refuses a commit not on `main` and a run that is not the successful push run for it (`release locate`), checks the files of that run and every attestation (below), before anything is tagged | `contents`, `actions`, `attestations`: read |
 | `tag` | writes the Beta record and creates the annotated tag at the commit, create-only, with the release bot's token (`release verdict-write`, `release tag`) | `contents: read`; environment `release` |
 | `notes` | checks the tag (`release verify`), the identity of this release and of the one before it, and writes the notes | read |
 | `publish` | creates the release with those files and notes (`release publish`) | `contents: write`; environment `release` |
@@ -507,16 +511,18 @@ can create one. The jobs, each with the least token it needs:
 Every job after `plan` runs only when `plan` says the push ships code and does not change the
 pipeline (`.github/`, `infra/`, `crates/xtask/` and the like): a push of docs only releases
 nothing and the run is green, and a push that changes the pipeline is released by the next one
-that does not. `tag`, `notes`, `publish` and `bump` also run only for a push to `main`, so a
-dispatch is a dry run through `verify`. No job runs after a red one (no `always()`, no
+that does not. `tag`, `notes`, `publish` and `bump` also repeat the condition on the run that started the
+workflow (conclusion `success`, event `push`, branch `main`, this repository). The pipeline run is never cancelled
+and the newest waiting push queues behind it; `plan` measures from the highest release tag that is an ancestor of the
+commit, so the code of a push that was replaced while waiting is released with the next one. No job runs after a red one (no `always()`, no
 `continue-on-error`). `release tag` and `release publish` both refuse a commit that is behind the
 highest release tag, so a re-run of an old run releases nothing; re-run the failed jobs only.
 `verify`, with read-only scopes, fails the run (and nothing is tagged) when:
 
 - the commit is not on `main` (GitHub's compare of `main...<commit>` is neither
   `identical` nor `behind`);
-- there is no successful `push` run of `artifacts.yml` on `main` for that exact commit,
-  or that run no longer holds every artifact a release needs (the assets, the sums and
+- the run that started the workflow is not the successful `push` run on `main` for that exact
+  commit, or it no longer holds every artifact a release needs (the assets, the sums and
   the bundles; they expire after 90 days, so a release is cut within 90 days of the
   commit);
 - a file does not match `SHA256SUMS` (`sha256sum --check --strict`), a file is not
@@ -538,8 +544,8 @@ fails and changes nothing; the files it lacks are uploaded (`cargo xtask release
 publish`).
 
 Two further verbs read the annotated `v*` tag. Its message is the Beta record (`docs/design/kbf-cicd.md`,
-section 8.1), which `release verdict-write` wrote after `release gates` saw the `ci`, `beta` and
-`artifacts` push runs of the commit succeed. The record is an audit record: **nothing gates on it**, and
+section 8.1), which `release verdict-write` wrote for the pipeline run (`ci`, `artifacts` and `beta` all succeeded) that
+started the release, and names that run. The record is an audit record: **nothing gates on it**, and
 no step of the release workflow judges a verdict. `notes` runs both verbs, on a checkout of the whole
 history (the tag object and `origin/main` must be there): `cargo xtask release verify` refuses a
 tag that names another commit than the release, a tag object named other than its ref, and a
@@ -549,14 +555,13 @@ verifies the same. It prints `set-hash=<hex>`, the SHA-256 of `SHA256SUMS`
 notes, which show the record as information and say when the tag carries none; `notes` uploads them
 as the artifact `release-notes`. `notes` passes the hash to `publish` as a
 job output, and `release publish` takes it as `--set-hash` and publishes nothing when the files are
-another set. What gates a release is `release gates` (the three runs green for the commit), then the
+another set. What gates a release is the successful pipeline run that started it, then the
 checks of the files themselves (`release check`, the attestations, the set hash) and the tag's
-commit. (The notes are written after the tag, because they read it, so a dry run does not show
-them.)
+commit. (The notes are written after the tag, because they read it.)
 
-`crates/kbf-integration-test/tests/release_workflow` holds the file to all of this: the events
-(a dispatch only), the job graph and the scopes, `if:` and environment of each job, the halt on
-red, a checkout of the run's commit alone, the release bot's key read in `tag` and `bump` only,
+`crates/kbf-integration-test/tests/release_workflow` holds the file to all of this (and `pipeline_workflow` holds the pipeline it follows to its order, its cancel and its triggers): the events
+(the completion of a `pipeline` run for `main` only), the job graph and the scopes, `if:` and environment of each job, the halt on
+red, a checkout of the commit the pipeline built alone, the release bot's key read in `tag` and `bump` only,
 the data that flows from job to job, pinned actions and an empty top-level `permissions`. The
 job list is pinned, `publish` among them (`gamma.yml`, which followed the workflow, is deleted). On every
 pull request into `main`, CI asks GitHub the same on-`main` question for the pull request's base

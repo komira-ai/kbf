@@ -17,8 +17,10 @@
 //!   reader stays open, so a successor process can open the file and write while this one
 //!   goes on reading the change feed. Every write after it is `StoreError::Fenced`.
 //! - **Epoch.** Every open bumps the epoch recorded in the file ([`SqliteStore::epoch`]);
-//!   [`restore`] does too, so a restored or swapped file never resumes the old file's
-//!   leases.
+//!   [`restore`] does too, so a restored or swapped file never reuses an epoch the replaced
+//!   file issued. The farm's epoch, the one `Welcome` names, is not this one: a frontend
+//!   keeps the `meta/epoch` row, and after a restore the operator raises it with
+//!   `POST /v1/epoch/bump`.
 //! - **Backup and restore.** [`backup`] copies the file while a store writes it, into a
 //!   single file that [`check_backup`] checks; [`restore`] (or [`restore_locked`], under
 //!   a [`StoreLock`] the caller took) puts one back while no store has the file open.
