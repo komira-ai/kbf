@@ -27,7 +27,6 @@ mod storage;
 mod strip;
 mod target;
 mod targets;
-mod updates;
 
 #[cfg(test)]
 pub(crate) use builds::BUILDS;
@@ -65,19 +64,15 @@ pub(crate) use target::target;
 #[cfg(test)]
 pub(crate) use targets::TARGETS;
 pub(crate) use targets::targets;
-#[cfg(test)]
-pub(crate) use updates::UPDATES;
-use updates::UPDATES_PATH;
-pub(crate) use updates::updates;
 
 /// The Builds page's path: the build id lookup, moved here from the prefix itself.
 pub(crate) const BUILDS_PATH: &str = "/ui/builds";
 
 /// Every page, for the contract test.
 #[cfg(test)]
-pub(crate) const PAGES: [&Page; 13] = [
-    &OVERVIEW, &BUILDS, &BUILD, &ACTION, &LOG, &NODES, &NODE, &UPDATES, &LEASES, &QUEUE, &TARGETS,
-    &TARGET, &STORAGE,
+pub(crate) const PAGES: [&Page; 12] = [
+    &OVERVIEW, &BUILDS, &BUILD, &ACTION, &LOG, &NODES, &NODE, &LEASES, &QUEUE, &TARGETS, &TARGET,
+    &STORAGE,
 ];
 
 /// What a path segment keeps unencoded: RFC 3986's unreserved characters.

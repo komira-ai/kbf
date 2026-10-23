@@ -67,8 +67,9 @@ impl Fake {
     }
 }
 
-/// What a recreate of test user `i` names the home and the folder it moves aside
-/// (`host.rs`: `.kbf-recreated-<user>-<secs>.<nanos, nine digits>`).
+/// What an earlier version of the slot clean, when it made a user again, named the home
+/// and the folder it moved aside: `.kbf-recreated-<user>-<secs>.<nanos, nine digits>`.
+/// The clean no longer does; a Mac that ran that version may still hold such names.
 fn aside(i: u32) -> String {
     format!(".kbf-recreated-{}-1760000000.000000042", user_name(i))
 }

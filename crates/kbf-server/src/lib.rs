@@ -128,6 +128,7 @@ mod run_record;
 pub mod serve;
 #[cfg(test)]
 mod serve_remote_tests;
+mod size_key;
 pub mod stamp;
 mod start;
 mod start_exit;
@@ -146,7 +147,6 @@ mod timeout;
 pub mod token;
 pub mod ui_mount;
 pub mod update;
-pub mod update_hosts;
 pub mod update_status;
 pub mod verbs;
 pub mod vitals;

@@ -91,7 +91,7 @@ async fn a_server_that_never_welcomes_is_given_up_on() {
 
 /// Catches a daemon that ends its stream on messages it has no use for: a second Welcome
 /// on the stream, a message with no content, an update offer and an update order (it has
-/// no update client yet), and an offer that names no lease. It goes on
+/// no update client), and an offer that names no lease. It goes on
 /// heartbeating, and the offer after them is still handled (events come in order, so the
 /// first `Offered` is the lease the offer after them names).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

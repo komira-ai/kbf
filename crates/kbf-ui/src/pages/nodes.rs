@@ -51,7 +51,6 @@ struct NodeRow {
     needs_attention: Vec<String>,
     placement: Tagged,
     phase: Tagged,
-    update: Update,
     lease_count: u64,
     booked: Resources,
 }
@@ -81,14 +80,6 @@ struct Tagged {
     state: String,
     /// A quarantine's why.
     reason: Option<String>,
-}
-
-/// Where the node's update is.
-#[derive(Debug, Deserialize)]
-struct Update {
-    state: Option<String>,
-    up_to_date: Option<bool>,
-    availability: String,
 }
 
 /// A resource vector.
@@ -142,7 +133,6 @@ fn table(h: &mut Html, nodes: &[NodeRow]) {
                     "Placement",
                     "Phase",
                     "Software",
-                    "Update",
                     "Leases",
                     "Booked",
                     "Needs attention",
@@ -173,9 +163,6 @@ fn row(h: &mut Html, node: &NodeRow) {
         h.el("td", &[], |h| phase(h, &node.phase));
         h.el("td", &[], |h| {
             h.text(&software(node.software.as_ref()));
-        });
-        h.el("td", &[], |h| {
-            h.text(&update(&node.update));
         });
         h.el("td", &[], |h| {
             h.text(&node.lease_count.to_string());
@@ -248,9 +235,6 @@ fn summary(h: &mut Html, node: &NodeRow) {
         });
         field(h, "Software", |h| {
             h.text(&software(node.software.as_ref()));
-        });
-        field(h, "Update", |h| {
-            h.text(&update(&node.update));
         });
         field(h, "Leases held", |h| {
             h.text(&node.lease_count.to_string());
@@ -379,19 +363,6 @@ fn software(s: Option<&Software>) -> String {
             )
         },
     )
-}
-
-/// Where the node's update is, in words; a verdict the server cannot give is "not judged".
-fn update(u: &Update) -> String {
-    let verdict = match u.up_to_date {
-        Some(true) => "up to date",
-        Some(false) => "behind",
-        None => "not judged",
-    };
-    match &u.state {
-        Some(state) => format!("{verdict}, step {state}"),
-        None => format!("{verdict} ({})", u.availability),
-    }
 }
 
 /// A resource vector in words.

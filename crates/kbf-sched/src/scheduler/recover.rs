@@ -216,6 +216,7 @@ impl Scheduler {
                 not_started,
                 losses,
                 queued_at: self.now,
+                key_applied: None,
             },
         );
     }
@@ -225,6 +226,10 @@ impl Scheduler {
         if self.awaited.remove(id).is_none() {
             return;
         }
+        // A recovered lease books the request the store holds. A key floor is not raised
+        // onto it: the store does not say what the lease was granted at, and a floor set
+        // after the grant (by a sibling's kill) would book more than the lease runs under,
+        // so its own kill would step the ladder past a rung and count as a new event.
         for held in self.held.values_mut() {
             let op = &self.ops[&held.operation];
             if op.state.holding().is_none_or(|(_, holder)| holder != id) {

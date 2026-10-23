@@ -81,6 +81,12 @@ md-5 = "0.11.0"
 objc2 = "0.6.5"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
 objc2-open-directory = { version = "0.3.2", default-features = false, features = ["std"] }
+# macOS only (kbf-vmm): Virtualization.framework, with the block and dispatch crates its
+# completion handlers and queues use. Licences: objc2 family Zlib OR Apache-2.0 OR MIT,
+# block2 and dispatch2 MIT OR Apache-2.0 OR Zlib; all on deny.toml's allow list.
+block2 = "0.6.2"
+dispatch2 = { version = "0.3.1", default-features = false, features = ["std", "objc2"] }
+objc2-virtualization = { version = "0.3.2", features = ["block2", "dispatch2", "bitflags"] }
 # Typed OCI runtime configuration (`config.json`) for the container driver's crun
 # backend. The 0.7 line is the one `runc` (below) uses, so the tree holds one copy.
 oci-spec = "0.7.1"

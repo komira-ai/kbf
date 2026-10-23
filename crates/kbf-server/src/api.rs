@@ -3,8 +3,7 @@
 //! `docs/api.md`).
 //!
 //! - `GET /v1/nodes`: every node registered since the server started, with the newest
-//!   software status each sent, where its update is (state, `up_to_date` against the
-//!   desired commit, availability: [`crate::update_status`]) and where it is in
+//!   software status each sent and where it is in
 //!   placement ([`crate::fleet`]), the protocol version each speaks, and the oldest of
 //!   those ([`ProtocolSummary`]).
 //! - `GET /v1/members`: the storage members of the current map, as the gRPC
@@ -87,7 +86,6 @@ use crate::farm::{EpochBump, Farm, NodeAction, StateError};
 use crate::fleet::ProtocolSummary;
 use crate::members::{Members, MembershipError};
 use crate::proxy_auth::{Caller, Trust};
-use crate::release::desired::blocking;
 use crate::token::ApiToken;
 use crate::update::Rows;
 
@@ -148,16 +146,15 @@ struct ApiState {
     token: Option<ApiToken>,
     drain: Arc<Drain>,
     members: Option<Arc<Members>>,
-    /// Where the desired release is read for each node's `update.up_to_date` (`None`:
-    /// no state store, so no desired release).
+    /// The update rows `safe_to_stop` reads (`None`: no state store).
     update: Option<Rows>,
 }
 
 /// The API's routes over `farm`; writes need `token`, and without one are refused.
 /// `drain` is what `POST /v1/frontend/drain` begins; `members` is what
 /// `GET /v1/members` reads and `POST /v1/members/{id}` changes (the same value the
-/// `Membership` service registers into). `update` is where the desired release is read
-/// to judge each node's `update.up_to_date`. `enroll` is what the `/v1/enroll/...` routes
+/// `Membership` service registers into). `update` is where the update rows are read
+/// for `safe_to_stop`. `enroll` is what the `/v1/enroll/...` routes
 /// call ([`crate::enroll::api`]); `None` when this server has no enrollment, which those
 /// routes answer, behind the gate, with 404.
 /// Writes read the peer address from
@@ -290,27 +287,8 @@ const fn epoch_failure(e: &StateError) -> StatusCode {
     }
 }
 
-/// The commit the farm wants, for judging each node's `update.up_to_date`; `None` when
-/// there is none, there is no state store, or the row cannot be read (logged: a node
-/// list that names no verdict is better than none).
-async fn desired_commit(api: &ApiState) -> Option<String> {
-    let rows = api.update.clone()?;
-    match blocking(move || rows.desired()).await {
-        Ok(stored) => stored.value.map(|d| d.commit.as_str().to_owned()),
-        Err(e) => {
-            tracing::warn!("update rows: the desired release is not read for the node list: {e}");
-            None
-        }
-    }
-}
-
 async fn nodes(State(api): State<Arc<ApiState>>) -> Response {
-    let desired = desired_commit(&api).await;
-    let mut view = api.farm.nodes();
-    for node in &mut view.nodes {
-        node.update.judge(desired.as_deref());
-    }
-    json(StatusCode::OK, &view)
+    json(StatusCode::OK, &api.farm.nodes())
 }
 
 /// One storage member of the map.
@@ -424,10 +402,7 @@ async fn act(
     };
     match write_request(api.token.as_ref(), &request) {
         Ok((node, action)) => match api.farm.place(&node, action) {
-            Ok(mut view) => {
-                view.update.judge(desired_commit(&api).await.as_deref());
-                json(StatusCode::OK, &view)
-            }
+            Ok(view) => json(StatusCode::OK, &view),
             Err(unknown) => error(StatusCode::NOT_FOUND, &unknown.to_string()),
         },
         Err((code, why)) => error(code, &why),

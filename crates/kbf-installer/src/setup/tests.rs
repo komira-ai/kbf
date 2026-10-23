@@ -131,11 +131,11 @@ fn host() -> FakeExec {
 }
 
 /// A host with a release installed: `releases/current` is a link.
-/// A Mac's `kbf.toml` as `kbf-mac-provision` leaves it for `raw(Mode::Daemon)`: the keys setup
-/// writes, and `[daemon] update-dir`, which setup only checks on a Mac.
+/// A Mac's `kbf.toml` for `raw(Mode::Daemon)`: the keys setup writes, and no `[daemon]` update
+/// keys, which a Mac's file does not have.
 fn provisioned(mut exec: FakeExec) -> FakeExec {
     let text = format!(
-        "mode = \"daemon\"\n\n[frontend]\nurl = \"https://farm.example:8443\"\n\n[enroll]\ntoken_file = \"{}\"\n\n[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\n",
+        "mode = \"daemon\"\n\n[frontend]\nurl = \"https://farm.example:8443\"\n\n[enroll]\ntoken_file = \"{}\"\n",
         Platform::MacOs.enroll_token()
     );
     put(&mut exec, Platform::MacOs.kbf_toml(), 0o640, ROOT, &text);

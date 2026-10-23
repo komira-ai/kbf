@@ -41,7 +41,6 @@ use super::boot::{Booted, ColdBoot, Reason, Report, Retry, Source};
 use super::child_http::Headers;
 use super::cold::{Cold, ReadyRule};
 use super::gate_real::{ProxyGate, gate_slot};
-use super::migrator::{DbMigrator, installed_schema};
 use super::model::{PortError, ProcIdent, RoleState, Slot, Start, Timing};
 use super::ports::{Child as _, ChildAdmin, Clock, Migrator, StatusFacts};
 use super::record::FileRecorder;
@@ -50,6 +49,7 @@ use super::root_orders::installed_commit;
 use crate::CommitId;
 use crate::database::Database;
 use crate::layout::Layout;
+use crate::migrator::{DbMigrator, installed_schema};
 use crate::run::{Runner, SystemRunner};
 
 /// How the start ended.
@@ -224,7 +224,7 @@ impl Migrator for NoMigration {
 /// `--kbf-binary`, the proxy's own `releases.json`); the installed release's `state_schema`
 /// (which `status.json` does not keep across a restart of the root half) is asked of its own
 /// binary under `child`'s layout, run as the proxy's user.
-/// A refusal carries a stable word ([`super::migrator::Refusal::word`]) and no part of the
+/// A refusal carries a stable word ([`crate::migrator::Refusal::word`]) and no part of the
 /// database URL.
 pub fn host_migrator<'a>(
     database: Database,

@@ -51,6 +51,47 @@ fn round_up(value: u64, step: u64) -> u64 {
     value.div_ceil(step).saturating_mul(step)
 }
 
+/// What an own-limit kill does to a floor: the new floor, and whether the kill opens a
+/// new kill event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KillFloor {
+    /// The floor after the kill: never below the one before it.
+    pub floor: u64,
+    /// Whether the kill raised the floor.
+    pub raised: bool,
+    /// Whether the kill is a new event. A kill of an attempt booked below the floor
+    /// already in force was granted before that floor was set, so it belongs to the
+    /// event that set it.
+    pub new_event: bool,
+}
+
+/// The floor after an own-limit kill of an attempt booked at `booked`, when `current`
+/// is the floor in force (0: none), the caller's ladder retries at `raised`, and the
+/// largest live node that could run the attempt has `host_memory`. The retry books the
+/// ladder's next rung; with none given, the first step above the booking. The floor
+/// stays strictly below `host_memory` ([`floor_ceiling`]): a booking at a node's whole
+/// memory owns the node, and that stays the digest floor's business.
+#[must_use]
+pub fn kill_floor(current: u64, booked: u64, raised: Option<u64>, host_memory: u64) -> KillFloor {
+    let above = round_up(booked.saturating_add(1), MEMORY_STEP);
+    let candidate = raised
+        .unwrap_or(0)
+        .max(above)
+        .min(floor_ceiling(host_memory));
+    KillFloor {
+        floor: current.max(candidate),
+        raised: candidate > current,
+        new_event: booked >= current,
+    }
+}
+
+/// The largest key floor under a node of `host_memory` bytes: the biggest 256 MiB step
+/// strictly below it (0 for a node of no memory).
+#[must_use]
+pub fn floor_ceiling(host_memory: u64) -> u64 {
+    host_memory.saturating_sub(1) / MEMORY_STEP * MEMORY_STEP
+}
+
 /// Everything the estimator keeps for one key (about 700 bytes). Fields are crate
 /// private; [`Summary::encode`] and [`Summary::decode`] are the storage form.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,22 +297,18 @@ impl Summary {
     /// was granted before that floor was set: it belongs to the event that set it, so
     /// 50 concurrent operations killed together are one event, not 50.
     fn record_kill(&mut self, run: &Run, now: Day, bounds: &Bounds) {
-        // The retry books the ladder's next rung; if the caller did not say, the first
-        // step above the booking the run died at.
-        let above = round_up(run.booked_memory_bytes.saturating_add(1), MEMORY_STEP);
-        let candidate = run
-            .raised_memory_bytes
-            .unwrap_or(0)
-            .max(above)
-            .min(bounds.floor_ceiling());
-        let new_event = run.booked_memory_bytes >= self.oom_floor;
-        let raised = candidate > self.oom_floor;
-        self.oom_floor = self.oom_floor.max(candidate);
-        if raised || new_event {
+        let kill = kill_floor(
+            self.oom_floor,
+            run.booked_memory_bytes,
+            run.raised_memory_bytes,
+            bounds.host_memory,
+        );
+        self.oom_floor = kill.floor;
+        if kill.raised || kill.new_event {
             self.floor_anchor = self.n_total;
             self.floor_day = now;
         }
-        if new_event {
+        if kill.new_event {
             if self
                 .last_kill_n
                 .is_some_and(|p| self.n_total - p < KILL_WINDOW_RUNS)
