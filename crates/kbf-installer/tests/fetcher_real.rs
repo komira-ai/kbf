@@ -2,7 +2,7 @@
 //! host: the fetch child is the stand-in of `tests/stub/fetch_stub.rs` (it serves a file the
 //! test names, or dies as told), started by `fetch_component` exactly as on a host; the verify
 //! pipeline is the real one, with `gh` and the binary's `--version --json` played by a fake
-//! runner. What each test proves is named on it, with the mutant that turns it red.
+//! runner. What each test proves is named on it, with the defect it catches.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -288,7 +288,7 @@ impl Rig {
 /// given no expected facts (an activation without them is refused), the files handed over
 /// under the wrong name, an installed release without its marker, or scratch left behind.
 ///
-/// Mutants: `expected` passed as `None` (red: an activation without facts is refused);
+/// Catches: `expected` passed as `None` (red: an activation without facts is refused);
 /// `Pipeline::verify` skipped (red: no `VERIFIED` marker).
 #[test]
 fn an_activation_is_fetched_verified_and_installed() {
@@ -312,7 +312,7 @@ fn an_activation_is_fetched_verified_and_installed() {
 /// Catches the digest not compared (the pipeline would refuse later, and still leave the
 /// directory if cleanup failed) and the scratch directory kept after a refusal.
 ///
-/// Mutants: a digest mismatch classed as an outage (red); the partial directory forgotten on a
+/// Catches: a digest mismatch classed as an outage (red); the partial directory forgotten on a
 /// failed pull (`std::mem::forget`; red: scratch left).
 #[test]
 fn a_download_with_the_wrong_digest_is_refused_and_leaves_nothing() {
@@ -339,7 +339,7 @@ fn a_download_with_the_wrong_digest_is_refused_and_leaves_nothing() {
 /// Catches a short read taken for a download, and the directory kept when the pull fails after
 /// the file was made.
 ///
-/// Mutant: the partial directory forgotten on a failed pull (red: scratch left).
+/// Catches: the partial directory forgotten on a failed pull (red: scratch left).
 #[test]
 fn a_child_killed_mid_stream_is_an_outage_and_leaves_nothing() {
     let rig = Rig::new("killed");
@@ -384,7 +384,7 @@ fn a_child_that_cannot_start_leaves_nothing() {
 ///
 /// Catches a fetcher that installs what the child brought without the pipeline's checks.
 ///
-/// Mutant: `Pipeline::verify` skipped (the partial renamed into `releases/` and the order's
+/// Catches: `Pipeline::verify` skipped (the partial renamed into `releases/` and the order's
 /// own facts reported as installed): this test, the facts test and the lease test go red.
 #[test]
 fn a_release_the_attestation_does_not_accept_is_refused_and_not_installed() {
@@ -412,7 +412,7 @@ fn a_release_the_attestation_does_not_accept_is_refused_and_not_installed() {
 /// and the value the order expected, not say that the order carried none), and a binary
 /// installed whatever it says.
 ///
-/// Mutants: `expected` passed as `None` (red: "the order carries no expected facts");
+/// Catches: `expected` passed as `None` (red: "the order carries no expected facts");
 /// `Pipeline::verify` skipped (red).
 #[test]
 fn a_binary_that_declares_other_facts_is_refused() {
@@ -447,7 +447,7 @@ fn a_binary_that_declares_other_facts_is_refused() {
 /// that is fetched and then not handed to `gh` (an empty attestation would be checked), and
 /// scratch left behind.
 ///
-/// Mutants: the bundle text dropped (`attestation` left empty; red: `gh` was given nothing);
+/// Catches: the bundle text dropped (`attestation` left empty; red: `gh` was given nothing);
 /// the describe step in the root process instead of the child (`child::fetch` called in place:
 /// red, as the stand-in is never asked); `plan` returning no pieces (red).
 #[test]
@@ -480,7 +480,7 @@ fn a_frontend_update_is_described_fetched_verified_and_installed() {
 /// Catches the platform filter missing (the arm64 tarball would be asked for, and the stand-in
 /// has none), or the first listed component taken whatever its platform.
 ///
-/// Mutant: the platform filter removed in `Description::select` (red: kbf twice, or a refusal
+/// Catches: the platform filter removed in `Description::select` (red: kbf twice, or a refusal
 /// of the arm64 entry).
 #[test]
 fn only_the_hosts_platform_is_fetched() {
@@ -511,7 +511,7 @@ fn only_the_hosts_platform_is_fetched() {
 /// Catches the refusal taken for a verdict on what arrived (the frontend would report `stage`),
 /// the source's words lost, and scratch made before the answer is known.
 ///
-/// Mutant: `FetchError::Describe` classed with the verdicts (`Rejected`; red).
+/// Catches: `FetchError::Describe` classed with the verdicts (`Rejected`; red).
 #[test]
 fn a_commit_the_source_will_not_describe_is_refused_with_its_words() {
     for said in [
@@ -542,7 +542,7 @@ fn a_commit_the_source_will_not_describe_is_refused_with_its_words() {
 /// Catches a description's fault carried to the frontend as `stage`, a too-long description worded
 /// as a size the source "declared" (nothing declares one), and a parse fault lost on the way.
 ///
-/// Mutant: `Oversize` left to the pipe's error (red: `Rejected`).
+/// Catches: `Oversize` left to the pipe's error (red: `Rejected`).
 #[test]
 fn a_description_that_cannot_be_read_is_a_refused_fetch() {
     let long = "component ".repeat(1700);
@@ -578,7 +578,7 @@ fn a_description_that_cannot_be_read_is_a_refused_fetch() {
 /// Catches an incomplete or foreign description reaching the pipeline (a release with no binary
 /// for this host, or another release installed under this commit's name).
 ///
-/// Mutants: the completeness check removed (red: no refusal, then an empty set reaches the
+/// Catches: the completeness check removed (red: no refusal, then an empty set reaches the
 /// pipeline); the commit check removed (red).
 #[test]
 fn a_description_that_is_not_the_hosts_release_is_refused() {
@@ -626,7 +626,7 @@ fn a_description_that_is_not_the_hosts_release_is_refused() {
 /// Catches a described digest trusted without hashing what arrived (the tarball, which the
 /// pipeline would catch later with another word, and the bundle, which nothing else checks).
 ///
-/// Mutants: the digest comparison removed from `fetch_component` (red: the tarball case reports
+/// Catches: the digest comparison removed from `fetch_component` (red: the tarball case reports
 /// the pipeline's refusal, the bundle case installs); the bundle pulled with the digest of what
 /// arrived (red: installed).
 #[test]
@@ -678,7 +678,7 @@ fn bytes_that_do_not_match_the_described_digest_are_refused() {
 /// Catches a lossy conversion of the bundle (the replacement characters would be checked in its
 /// place).
 ///
-/// Mutant: `read_to_string` replaced by a lossy read (red: installed).
+/// Catches: `read_to_string` replaced by a lossy read (red: installed).
 #[test]
 fn a_bundle_that_is_not_text_is_refused() {
     let rig = Rig::new("update-binary-bundle");
@@ -708,7 +708,7 @@ fn a_bundle_that_is_not_text_is_refused() {
 /// Catches the describe step done in the root process (a program path that does not exist would
 /// not matter to it), and a silent child taken for an empty answer.
 ///
-/// Mutant: the describe done in-process (red: no "cannot start" message).
+/// Catches: the describe done in-process (red: no "cannot start" message).
 #[test]
 fn a_source_that_cannot_be_asked_is_an_outage_and_makes_nothing() {
     let rig = Rig::new("update-outage");
@@ -754,7 +754,7 @@ fn a_host_no_release_is_built_for_is_refused_before_anything_is_asked() {
 /// fetcher does not rely on that, and it does not ask the source: an activation's components
 /// come from its offer).
 ///
-/// Mutant: the empty-components check removed (red: a panic in the pipeline, or a describe).
+/// Catches: the empty-components check removed (red: a panic in the pipeline, or a describe).
 #[test]
 fn an_activation_without_components_is_refused_and_makes_nothing() {
     let rig = Rig::new("empty-activation");
@@ -770,7 +770,7 @@ fn an_activation_without_components_is_refused_and_makes_nothing() {
 ///
 /// Catches the routing resting on `HostFetcher` alone.
 ///
-/// Mutant to plant: the source check removed from `RealFetcher::pull`.
+/// Catches: the source check removed from `RealFetcher::pull`.
 #[test]
 fn a_staged_locator_is_refused_by_the_fetching_fetcher_and_makes_nothing() {
     let rig = Rig::new("staged-locator");
@@ -797,7 +797,7 @@ fn a_staged_locator_is_refused_by_the_fetching_fetcher_and_makes_nothing() {
 /// Catches the two entry points sharing one kind (an activation with no expectation, or a
 /// frontend update held to facts it was never given).
 ///
-/// Mutant: `fetch` verifying as `OrderKind::Activate` (red: the facts are then required).
+/// Catches: `fetch` verifying as `OrderKind::Activate` (red: the facts are then required).
 #[test]
 fn a_frontend_update_with_components_is_verified_without_facts() {
     let rig = Rig::new("update-components");
@@ -817,7 +817,7 @@ fn a_frontend_update_with_components_is_verified_without_facts() {
 /// Catches a name with a separator reaching `dl/<name>.tar.gz` (the file would land outside
 /// the directory).
 ///
-/// Mutant: the plain-name check removed (red).
+/// Catches: the plain-name check removed (red).
 #[test]
 fn a_component_named_by_a_path_is_refused_before_a_file_is_made() {
     let rig = Rig::new("path-name");
@@ -840,7 +840,7 @@ fn a_component_named_by_a_path_is_refused_before_a_file_is_made() {
 ///
 /// Catches the lease step skipped on the real path (a host with work running would be swapped).
 ///
-/// Mutant: `Pipeline::verify` skipped (red: the release is installed).
+/// Catches: `Pipeline::verify` skipped (red: the release is installed).
 #[test]
 fn a_lease_source_that_cannot_tell_refuses_after_the_download() {
     let rig = Rig::new("leases");
@@ -862,7 +862,7 @@ fn a_lease_source_that_cannot_tell_refuses_after_the_download() {
 ///
 /// Catches a fetch that goes on into a directory it did not make, or removes one it did not.
 ///
-/// Mutant: the fetcher removing `work/<commit>.partial` before it makes its own (red: the
+/// Catches: the fetcher removing `work/<commit>.partial` before it makes its own (red: the
 /// directory is gone, and the fetch goes on).
 #[test]
 fn a_directory_a_crashed_stage_left_is_refused_and_kept() {
@@ -885,7 +885,7 @@ fn a_directory_a_crashed_stage_left_is_refused_and_kept() {
 /// Catches a second component overwriting the first's file (the pipeline would then hash
 /// another tarball than the one the child delivered).
 ///
-/// Mutant: `create_new` replaced by `create` (red: the second pull overwrites the first and
+/// Catches: `create_new` replaced by `create` (red: the second pull overwrites the first and
 /// the fetch goes on to the pipeline, which refuses the set instead).
 #[test]
 fn a_component_named_twice_is_refused_before_it_overwrites_the_first() {

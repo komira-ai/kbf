@@ -40,7 +40,7 @@ fn same_build_other_commit() -> CommitId {
 /// ignored), a digest or commit taken in a shape the rest of the installer refuses, and a
 /// platform that would name a file the seed does not have.
 ///
-/// Mutants to plant: `deny_unknown_fields` removed; the platform check removed; the size cap
+/// Catches: `deny_unknown_fields` removed; the platform check removed; the size cap
 /// raised past the oversize file.
 #[test]
 fn a_manifest_is_a_closed_set_of_keys_and_reads_back_as_what_it_says() {
@@ -130,7 +130,7 @@ fn a_manifest_is_a_closed_set_of_keys_and_reads_back_as_what_it_says() {
 /// Catches a floor read as 0 where the file is garbled (every seed is then above it), and an
 /// unreadable file taken for an absent one.
 ///
-/// Mutants to plant: a parse error mapped to `Ok(None)`; the read error mapped to `Ok(None)`;
+/// Catches: a parse error mapped to `Ok(None)`; the read error mapped to `Ok(None)`;
 /// the text not trimmed (the line end after the number is refused).
 #[test]
 fn the_floor_is_one_number_in_a_file_or_none() {
@@ -177,7 +177,7 @@ fn refusal_of(got: Result<(), FetchError>) -> (&'static str, String) {
 /// that is running would be stageable again), a seed below the floor admitted, and a missing
 /// floor taken for zero.
 ///
-/// Mutants to plant: the commit compared by its first 12 digits; `<=` made `<` (equal admitted);
+/// Catches: the commit compared by its first 12 digits; `<=` made `<` (equal admitted);
 /// `None` made `Some(0)`; the floor judged before the commit.
 #[test]
 fn an_order_is_admitted_for_the_seeds_commit_with_a_seq_above_the_floor() {
@@ -254,7 +254,7 @@ fn the_seed_is_beside_the_trust_directory_and_the_floor_beside_the_state() {
 /// Catches the run loop announcing a seed the order would refuse (two copies of the rule that
 /// drifted), an equal `seq` taken as above, and no floor taken as a floor of 0.
 ///
-/// Mutants to plant: `>` made `>=`; `None` made `Some(0)`; the stub's `Ok(())` for every case.
+/// Catches: `>` made `>=`; `None` made `Some(0)`; the stub's `Ok(())` for every case.
 #[test]
 fn a_seq_is_above_a_floor_only_when_higher_and_there_is_one() {
     assert_eq!(above_floor(SEQ, Some(SEQ - 1)), Ok(()));
@@ -277,7 +277,7 @@ fn a_seq_is_above_a_floor_only_when_higher_and_there_is_one() {
 /// Catches a key renamed (every reader of `status.json` would stop seeing the seed) and the
 /// facts leaking into it.
 ///
-/// Mutant to plant: the facts added to `Available`.
+/// Catches: the facts added to `Available`.
 #[test]
 fn an_available_seed_is_told_by_its_commit_and_seq() {
     let seed = SeedFacts {

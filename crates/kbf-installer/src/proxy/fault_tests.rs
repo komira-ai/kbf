@@ -1,7 +1,6 @@
 //! The failure arms of the swap: a port that refuses, a child that is gone, a restart in
 //! the middle of a rollback or a drain. Each test drives one arm through the fakes of
-//! [`super::fakes`] and names the defect it catches; the mutants planted to see each one
-//! red are listed in the PR.
+//! [`super::fakes`] and names the defect it catches.
 
 use std::time::Duration;
 

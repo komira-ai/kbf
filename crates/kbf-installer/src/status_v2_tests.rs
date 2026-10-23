@@ -7,7 +7,7 @@ use crate::golden::{STATUS, status};
 /// golden bytes are the writer's (`helper/status_tests.rs`), and here they decode strictly to the
 /// host they describe and encode back to the same bytes, key for key and in the same order.
 ///
-/// Mutants to plant: a key of the type renamed or moved; a key the writer writes missing from the
+/// Catches: a key of the type renamed or moved; a key the writer writes missing from the
 /// type (the strict decode refuses the golden).
 #[test]
 fn the_golden_status_decodes_and_encodes_to_itself() {
@@ -24,7 +24,7 @@ fn the_golden_status_decodes_and_encodes_to_itself() {
 /// Catches a host with no seed and no source encoded with the two keys as `null`, and a
 /// status written before they existed refused: both are left out, and a file without them reads.
 ///
-/// Mutants to plant: the `skip_serializing_if` of either key removed; the `default` of either
+/// Catches: the `skip_serializing_if` of either key removed; the `default` of either
 /// removed.
 #[test]
 fn a_status_without_a_seed_or_a_source_has_neither_key_and_still_reads() {

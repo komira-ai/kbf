@@ -201,7 +201,7 @@ fn an_update_goes_through_every_phase_in_the_order_of_the_design() {
 /// record in `update.json` says so (a restarted proxy has no other source to read), the status
 /// reads it from that record, and the order for the nodes names it.
 ///
-/// Mutants planted: the plan built with source `fetch`; the status always `fetch`.
+/// Catches: the plan built with source `fetch`; the status always `fetch`.
 #[test]
 fn the_source_of_an_update_is_kept_in_its_record_and_named_in_the_order_for_the_nodes() {
     let mut h = harness("sw-source");

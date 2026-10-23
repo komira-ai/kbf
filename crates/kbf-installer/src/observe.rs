@@ -75,7 +75,7 @@ mod tests {
     /// answering is an error. Catches a swapped slot, a wrong offset, and a guess between
     /// two live children.
     ///
-    /// Mutants planted: slot B's port computed as slot A's; the probe consulted when the API
+    /// Catches: slot B's port computed as slot A's; the probe consulted when the API
     /// names a slot; two live children resolved to the first.
     #[test]
     fn the_serving_slot_is_named_or_the_only_one_alive() {

@@ -196,7 +196,7 @@ fn the_real_gh_accepts_the_real_attestation() {
 /// subject, another commit, another branch (and a pull request's merge ref), another
 /// repository and another workflow are each refused, with `gh` as the judge.
 ///
-/// Mutants seen red: `--source-digest` dropped (the other commit is accepted);
+/// Catches: `--source-digest` dropped (the other commit is accepted);
 /// `--source-ref` dropped (the other branch is accepted).
 #[test]
 #[ignore = "needs the pinned gh: KBF_TEST_GH"]

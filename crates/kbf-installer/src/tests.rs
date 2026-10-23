@@ -87,7 +87,7 @@ fn the_layout_names_every_path_under_its_directory() {
 /// directory. Linux keeps its state in the install root; macOS keeps the tree under
 /// `/usr/local/kbf-installer` and the state in `/var/db/kbf-installer`.
 ///
-/// Mutant seen red: the macOS lock path returning the Linux one.
+/// Catches: the macOS lock path returning the Linux one.
 #[test]
 fn the_platforms_differ_in_the_tree_the_state_the_lock_and_the_trust_directory() {
     use kbf_host::path::Root;
