@@ -54,12 +54,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::migrator::probe_version;
 use super::model::{Locator, PortError, StagedFacts};
 use super::ports::{RootOrders, StatusFacts};
 use super::root_orders::StatusFile;
 use crate::CommitId;
 use crate::layout::{RELEASE_BINARY, VERIFIED};
+use crate::migrator::{MigrateError, probe_version};
 use crate::run::Runner;
 
 /// The name a copy being made has in the root, up to its process id and number.
@@ -263,7 +263,7 @@ fn ctx<T>(result: io::Result<T>, what: &str, path: &Path) -> Result<T, CopyError
 }
 
 /// A failed probe, without the migrator's own word: the words here are this module's.
-fn probe_failed(e: PortError) -> CopyError {
+fn probe_failed(e: MigrateError) -> CopyError {
     let text = e.0.as_str();
     let why = text.split_once(": ").map_or(text, |(_, rest)| rest);
     CopyError::ProbeFailed(why.to_owned())

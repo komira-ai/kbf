@@ -730,7 +730,7 @@ pub fn after_release(
         token_file: v.token_file.as_ref().map(|_| paths::enroll_token(platform)),
         api_token_file: serves_api(node_mode).then_some(paths::api_token(platform)),
         state_store: v.database.as_deref().filter(|_| sibling.is_none()),
-        // A Mac's keys are kbf-mac-provision's: checked below, never written.
+        // A Mac's `kbf.toml` is kbf-mac-provision's, which renders no update keys.
         update: (takes_orders(v.mode) && platform != Platform::MacOs).then_some(UpdateDirs {
             update_dir: &update_dir,
             orders_dir: &orders_dir,
@@ -738,16 +738,6 @@ pub fn after_release(
         extra: &node_extra,
     };
     let current = read_current(exec, kbf_toml_path)?;
-    if platform == Platform::MacOs && takes_orders(v.mode) {
-        // No file: provision has not run. A file that is not TOML is `decide`'s to name.
-        let table = current
-            .as_deref()
-            .map_or_else(|| Some(toml::Table::new()), |t| t.parse().ok());
-        if let Some(table) = table {
-            kbf_toml::check_provisioned(&table, &update_dir, &orders_dir)
-                .map_err(SetupError::NeedsOperator)?;
-        }
-    }
     // The earlier layout's file is split, not decided on: its settings came in as flags, so
     // `ours` has them, and the original is kept below before this file is replaced.
     let decision = match &ctx.earlier {

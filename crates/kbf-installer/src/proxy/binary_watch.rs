@@ -55,12 +55,12 @@ use kbf_update::Source;
 use super::api::model::UpdateId;
 use super::api::traits::{RunningUpdate, Supervisor, SupervisorError, UpdateSpec};
 use super::handover_swap::Handover;
-use super::migrator::probe_version;
 use super::model::{Locator, StagedFacts, Verb};
 use super::ports::{Clock, RootOrders};
 use super::releases::Local;
 use crate::CommitId;
 use crate::binary::Version;
+use crate::migrator::probe_version;
 use crate::run::{Runner, SystemRunner};
 
 /// The time between polls of the binary's identity. Fixed: it is not a setting.

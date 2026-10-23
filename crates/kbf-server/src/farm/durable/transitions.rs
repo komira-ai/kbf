@@ -86,12 +86,26 @@ impl Durable {
     ///
     /// The memory floors the give-up changes are written whether or not the operation is
     /// queued again: a floor is the farm's, and outlives the operation.
+    #[cfg(test)]
     pub(super) fn requeued(
         &self,
         requeue: &Requeue,
         losses: Option<u32>,
         fate: Option<&Fate>,
         floors: &FloorChange,
+    ) -> Result<(), StateError> {
+        self.requeued_named(requeue, losses, fate, floors, None)
+    }
+
+    /// [`Durable::requeued`], with the size summary the raised key floor decays with, if
+    /// it is known: its row names it.
+    pub(super) fn requeued_named(
+        &self,
+        requeue: &Requeue,
+        losses: Option<u32>,
+        fate: Option<&Fate>,
+        floors: &FloorChange,
+        summary: Option<&kbf_estimator::Key>,
     ) -> Result<(), StateError> {
         let mut txn = Txn::new();
         // The floor outlives the operation: a kill raises it, and the operation may end
@@ -111,12 +125,29 @@ impl Durable {
         {
             txn = txn.delete(floor::row_key(key), Cond::Any);
         }
+        // The same for the key floor, in the same transaction.
+        let key_raised = floors.key_raised.as_ref();
+        if let Some(floor) = key_raised {
+            let value = self.key_floor_value(floor, summary)?;
+            txn = txn.put(floor::key_row(floor.key), value, Cond::Any);
+        }
+        for key in floors
+            .key_evicted
+            .iter()
+            .filter(|k| key_raised.is_none_or(|f| f.key != **k))
+        {
+            txn = txn.delete(floor::key_row(*key), Cond::Any);
+        }
+        let floors_changed = raised.is_some()
+            || !floors.evicted.is_empty()
+            || key_raised.is_some()
+            || !floors.key_evicted.is_empty();
         let (op, lease) = (op_key(requeue.operation), lease_key(requeue.lease));
         let rows = (self.store.get(&op)?, self.store.get(&lease)?);
         let (Some(unfinished), Some(held)) = rows else {
             // The operation ended, or its lease is not held in the store any more: nothing
             // is put back in the queue.
-            return if raised.is_some() || !floors.evicted.is_empty() {
+            return if floors_changed {
                 self.commit(txn)
             } else {
                 Ok(())

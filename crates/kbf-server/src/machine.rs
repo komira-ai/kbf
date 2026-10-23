@@ -370,18 +370,12 @@ mod tests {
 
     fn update(n: u8) -> UpdateReport {
         UpdateReport {
-            state: "idle",
             running_commit: format!("{n:012x}"),
             installed_commit: String::new(),
-            staged_commit: String::new(),
-            refusal: String::new(),
-            offered_generation: u64::from(n),
-            helper_present: false,
             acked_order_id: 0,
             kind: kbf_proto::update::update_status::State::Idle,
             available: None,
             release_source: crate::update_status::ReleaseSource::Unreported,
-            received_at_unix_ms: u64::from(n),
         }
     }
 

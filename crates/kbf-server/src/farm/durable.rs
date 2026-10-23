@@ -33,6 +33,16 @@
 //!   an operation. A successor loads them all, oldest stamp first, and raises past the
 //!   largest stamp, so the order of eviction survives a reload. They have no expiry;
 //!   in memory they have none either;
+//! - `keyfloor/<key>`: a key floor, the least memory a request carrying the size key
+//!   books at a placement round ([`kbf_sched::KeyFloor`]): the ask and a stamp, written
+//!   in the transaction of the requeue that raises it beside the `floor/` row, deleted
+//!   in the one that forgets it. A store that was never `--learned-sizes=on` has none,
+//!   and an older binary does not read the prefix;
+//! - `opkey/<operation>`: the size key of an operation ([`kbf_sched::Scheduler::set_size_key`]),
+//!   written in the submission's transaction beside `op/` and `queue/` and deleted with
+//!   them, only for an operation given one (`--learned-sizes=on`). It is in a row of its
+//!   own, not in the request, so no row of an older format changes and a binary that does
+//!   not know the prefix reads the store as it always did;
 //! - `subject/<operation>`: what the operation's `action usage:` line says it is (the
 //!   shape key, configuration hash, target and the client's mnemonic and target hint,
 //!   [`crate::action_usage::Subject`]), written in the submission's transaction beside
@@ -95,8 +105,8 @@ use kbf_front::{Described, Finished, Stage};
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
 use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{
-    DaemonInstance, Fate, Floor, FloorChange, Recovered, RecoveredLease, Request, Requeue,
-    RequeueReason,
+    DaemonInstance, Fate, Floor, FloorChange, KeyFloor, Recovered, RecoveredLease, Request,
+    Requeue, RequeueReason,
 };
 use kbf_state::{Cond, Conflict, GENERATION, Store, StoreError, Txn, Versioned};
 use kbf_types::{
@@ -132,6 +142,8 @@ const CORDON: &str = "cordon/";
 const SESSION: &str = "session/";
 const FATE: &str = "fate/";
 const FLOOR: &str = "floor/";
+const KEY_FLOOR: &str = "keyfloor/";
+const OPKEY: &str = "opkey/";
 const ESTIMATE: &str = "est/";
 /// Rows of one transaction of the size sweep, and the most transactions of one call.
 pub(super) const SWEEP_ROWS: usize = 256;
@@ -207,6 +219,10 @@ pub(super) struct Stored {
     pub operations: Vec<StoredOperation>,
     /// Every memory floor, in key order.
     pub floors: Vec<Floor>,
+    /// Every key floor, in key order.
+    pub key_floors: Vec<KeyFloor>,
+    /// The size summary each key floor decays with, for those whose row names one.
+    pub key_names: Vec<(u64, kbf_estimator::Key)>,
     /// Every node an operator placed, in node-id order.
     pub cordons: Vec<(WorkerId, StoredCordon)>,
 }
@@ -282,6 +298,8 @@ pub(super) struct StoredOperation {
     pub fate: Option<Fate>,
     /// What its `action usage:` line says it is, if the writer recorded it.
     pub subject: Option<Subject>,
+    /// Its size key, if the writer named one (`opkey/` row).
+    pub size_key: Option<u64>,
 }
 
 impl StoredOperation {
@@ -306,6 +324,7 @@ mod estimate;
 mod fate;
 mod floor;
 mod inflight;
+mod opkey;
 mod subject;
 mod transitions;
 
@@ -345,8 +364,10 @@ pub(super) struct Ending {
 }
 
 impl Ending {
-    /// `txn`, then the removal of the operation's `op/`, `queue/`, `loss/`, `fate/` and
-    /// `subject/` rows and the put of its result, so one transaction carries all of it.
+    /// `txn`, then the removal of the operation's `op/`, `queue/`, `loss/`, `fate/`,
+    /// `subject/` and `opkey/` rows and the put of its result, so one transaction carries
+    /// all of it. The `opkey/` delete is made whatever `--learned-sizes` says: an operation
+    /// an `on` run queued has the row, and a later `off` run cleans it up as it ends.
     /// The result goes over whatever is there: the transaction also deletes the lease row
     /// at the version read, which no other writer can have deleted first and written a
     /// result after.
@@ -365,6 +386,7 @@ impl Ending {
         txn.delete(loss_key(operation), Cond::Any)
             .delete(fate_key(operation), Cond::Any)
             .delete(subject_key(operation), Cond::Any)
+            .delete(opkey_key(operation), Cond::Any)
             .put_ttl(done_key(operation), self.finished.to_row(), ttl, done)
     }
 }
@@ -382,6 +404,12 @@ pub(super) struct Durable {
     /// The operation ids this handle reserved last ([`Durable::reserve_operation`]):
     /// numbered inside it, and no other frontend takes one of them.
     ops: Mutex<Range<u64>>,
+    /// Whether the `opkey/` and `keyfloor/` rows are read (`--learned-sizes=on`). A store
+    /// that never had the flag on holds none, and with it off a row an earlier `on` run
+    /// left is neither loaded nor allowed to fail a start. The finish transaction deletes
+    /// an operation's `opkey/` row whatever the flag says, so rows an `on` run left are
+    /// cleaned up as its operations end.
+    pub(super) read_size_keys: AtomicBool,
 }
 
 impl std::fmt::Debug for Durable {
@@ -404,6 +432,10 @@ fn loss_key(operation: OperationId) -> String {
 
 fn fate_key(operation: OperationId) -> String {
     format!("{FATE}{:016x}", operation.0)
+}
+
+fn opkey_key(operation: OperationId) -> String {
+    format!("{OPKEY}{:016x}", operation.0)
 }
 
 fn subject_key(operation: OperationId) -> String {
@@ -493,6 +525,7 @@ impl Durable {
             unreachable: AtomicBool::new(false),
             fenced: AtomicBool::new(false),
             ops: Mutex::new(0..0),
+            read_size_keys: AtomicBool::new(true),
         };
         let epoch = durable.settle_epoch(policy, first)?;
         Ok((durable, epoch))
@@ -536,6 +569,18 @@ impl Durable {
             let subject = subject::decode(&row.value).map_err(|why| corrupt(&key, why))?;
             subjects.insert(operation, subject);
         }
+        let read_size_keys = self.read_size_keys.load(Ordering::SeqCst);
+        let mut opkeys = std::collections::BTreeMap::new();
+        for (key, row) in self
+            .store
+            .scan_prefix(OPKEY)?
+            .into_iter()
+            .filter(|_| read_size_keys)
+        {
+            let operation = parse_operation(&key, OPKEY)?;
+            let size_key = opkey::decode(&row.value).map_err(|why| corrupt(&key, why))?;
+            opkeys.insert(operation, size_key);
+        }
         let mut floors = Vec::new();
         let mut stamps = std::collections::BTreeSet::new();
         for (key, row) in self.store.scan_prefix(FLOOR)? {
@@ -547,6 +592,31 @@ impl Durable {
                 return Err(corrupt(&key, "a stamp another floor has"));
             }
             floors.push(floor);
+        }
+        let mut key_floors = Vec::new();
+        let mut key_names = Vec::new();
+        let mut key_stamps = std::collections::BTreeSet::new();
+        for (key, row) in self
+            .store
+            .scan_prefix(KEY_FLOOR)?
+            .into_iter()
+            .filter(|_| read_size_keys)
+        {
+            let (floor, name) = floor::decode_key(&row.value).map_err(|why| corrupt(&key, why))?;
+            match name.as_deref().map(estimate::parse_key) {
+                Some(Some(summary)) => key_names.push((floor.key, summary)),
+                Some(None) => {
+                    tracing::warn!(row = %key, "a key floor names a size summary that does not parse");
+                }
+                None => {}
+            }
+            if key != floor::key_row(floor.key) {
+                return Err(corrupt(&key, "not the key of the key floor it holds"));
+            }
+            if !key_stamps.insert(floor.stamp) {
+                return Err(corrupt(&key, "a stamp another key floor has"));
+            }
+            key_floors.push(floor);
         }
         let mut operations = Vec::new();
         for (key, row) in self.store.scan_prefix("op/")? {
@@ -560,6 +630,7 @@ impl Durable {
                 losses: losses.remove(&operation).unwrap_or(0),
                 fate: fates.remove(&operation),
                 subject: subjects.remove(&operation),
+                size_key: opkeys.remove(&operation),
             });
         }
         Ok(Stored {
@@ -567,6 +638,8 @@ impl Durable {
             next_seq: self.counter(NEXT_SEQ)?,
             operations,
             floors,
+            key_floors,
+            key_names,
             cordons: self.cordons()?,
         })
     }
@@ -710,13 +783,26 @@ impl Durable {
 
     /// An operation submitted: its request, what its `action usage:` line says it is,
     /// and its place in the queue, in one transaction.
+    #[cfg(test)]
     pub(super) fn submitted(
         &self,
         operation: OperationId,
         request: &Request,
         subject: &Subject,
     ) -> Result<(), StateError> {
-        self.commit(self.submission(operation, request, subject)?)
+        self.submitted_keyed(operation, request, subject, None)
+    }
+
+    /// [`Durable::submitted`], with the operation's size key, if it has one, in an
+    /// `opkey/` row of the same transaction.
+    fn submitted_keyed(
+        &self,
+        operation: OperationId,
+        request: &Request,
+        subject: &Subject,
+        size_key: Option<u64>,
+    ) -> Result<(), StateError> {
+        self.commit(self.submission(operation, request, subject, size_key)?)
     }
 
     /// [`Durable::submitted`], with the action's in-flight row in the same transaction:
@@ -726,9 +812,10 @@ impl Durable {
         operation: OperationId,
         request: &Request,
         subject: &Subject,
+        size_key: Option<u64>,
         (pin, cond): (&str, Cond),
     ) -> Result<(), StateError> {
-        let txn = self.submission(operation, request, subject)?;
+        let txn = self.submission(operation, request, subject, size_key)?;
         self.commit(txn.put(pin, operation.0.to_be_bytes(), cond))
     }
 
@@ -737,9 +824,14 @@ impl Durable {
         operation: OperationId,
         request: &Request,
         subject: &Subject,
+        size_key: Option<u64>,
     ) -> Result<Txn, StateError> {
         let value = encode(FarmInput::Submit(request.clone()))?;
-        Ok(Txn::new()
+        let mut txn = Txn::new();
+        if let Some(key) = size_key {
+            txn = txn.put(opkey_key(operation), opkey::encode(key), Cond::Absent);
+        }
+        Ok(txn
             .put(op_key(operation), value, Cond::Absent)
             .put(
                 subject_key(operation),
@@ -747,6 +839,44 @@ impl Durable {
                 Cond::Absent,
             )
             .put(queue_key(operation), Vec::new(), Cond::Absent))
+    }
+
+    /// The value of the `keyfloor/` row of `floor`: it names the size summary `summary`
+    /// when it is known and fits, else the name the row already holds (a write that does
+    /// not know the summary leaves the name where it was).
+    fn key_floor_value(
+        &self,
+        floor: &KeyFloor,
+        summary: Option<&kbf_estimator::Key>,
+    ) -> Result<Vec<u8>, StateError> {
+        let named = summary.map(estimate::row_key);
+        let name = match named.filter(|n| n.len() <= usize::from(u16::MAX)) {
+            Some(name) => Some(name),
+            None => self
+                .store
+                .get(&floor::key_row(floor.key))?
+                .and_then(|row| floor::decode_key(&row.value).ok())
+                .and_then(|(_, name)| name),
+        };
+        Ok(floor::encode_key(floor, name.as_deref()))
+    }
+
+    /// Writes the key floor `floor` as it now stands, or deletes its row when it was
+    /// forgotten (an `ask` of 0): outside any requeue, after the estimator's decay lowered
+    /// it. Best effort for the caller; the row keeps its stamp and names the size summary
+    /// `summary` that its floor decays with.
+    pub(super) fn put_key_floor(
+        &self,
+        floor: &KeyFloor,
+        summary: Option<&kbf_estimator::Key>,
+    ) -> Result<(), StateError> {
+        let row = floor::key_row(floor.key);
+        let txn = if floor.ask == 0 {
+            Txn::new().delete(row, Cond::Any)
+        } else {
+            Txn::new().put(row, self.key_floor_value(floor, summary)?, Cond::Any)
+        };
+        self.commit(txn)
     }
 
     /// Writes what the scheduler's effects of a committed record settle, in order.
@@ -1147,14 +1277,24 @@ impl State {
                 FloorChange::default()
             };
             kills.extend(self.learned_requeue(requeue));
+            // A raise makes any lowered row still waiting for the store stale: the
+            // requeue writes the floor as it stands.
+            if let Some(raised) = &floors.key_raised {
+                self.unwritten_floors.retain(|f| f.key != raised.key);
+            }
             self.unsettled.push((requeue.clone(), losses, fate, floors));
         }
         let pending = std::mem::take(&mut self.unsettled);
         let refused: Vec<_> = pending
             .into_iter()
             .filter(|(requeue, losses, fate, floors)| {
+                let summary = floors
+                    .key_raised
+                    .as_ref()
+                    .and_then(|f| self.learned.summary_key(f.key));
+                let floors = self.current_key_floors(floors);
                 !self.durably("a requeue", |d| {
-                    d.requeued(requeue, *losses, fate.as_ref(), floors)
+                    d.requeued_named(requeue, *losses, fate.as_ref(), &floors, summary.as_ref())
                 })
             })
             .collect();
@@ -1242,6 +1382,9 @@ impl State {
             return Ok(None);
         };
         let (durable, epoch) = Durable::open(store, epoch, process_term())?;
+        durable
+            .read_size_keys
+            .store(self.learned.keys(), Ordering::SeqCst);
         let stored = durable.load()?;
         // Operation names carry the writer generation, not the epoch: a kept epoch must
         // not let a process name an operation another one named (issue #154). A store
@@ -1249,7 +1392,12 @@ impl State {
         self.machine = FarmMachine::new(durable.generation()?.unwrap_or(epoch));
         let now = SystemTime::now();
         let mut recovered = Vec::new();
+        let mut keyed = Vec::new();
         for op in stored.operations {
+            if let Some(size_key) = op.size_key.filter(|_| self.learned.keys()) {
+                keyed.push((op.operation, size_key));
+                self.register_stored(&op, size_key);
+            }
             recovered.push(self.take_stored(op, now));
         }
         // The first blocks of ids are reserved here, past everything any frontend of the
@@ -1259,6 +1407,8 @@ impl State {
         let first_operation = durable.reserve_operation(OperationId(stored.next_operation))?;
         let seqs = durable.reserve_seqs(stored.next_seq)?;
         self.sched.restore_floors(stored.floors);
+        self.sched.restore_key_floors(stored.key_floors);
+        let stored_names = stored.key_names;
         // Off reads no size summaries and leaves them as they are.
         if !self.learned.off() {
             self.learned.restore(&durable.estimates()?);
@@ -1266,6 +1416,18 @@ impl State {
         self.sched
             .recover(epoch, first_operation, seqs.start, recovered);
         self.sched.use_seq_block(seqs);
+        // The size keys come from the store's own rows, not from the requests: only `on`
+        // reads them. A recovered lease keeps the request the store holds; a key floor
+        // raises only the operations queued after it.
+        for (operation, key) in keyed {
+            self.sched.set_size_key(operation, key);
+        }
+        // A key whose operations have all finished still has its floor and its decay.
+        if self.learned.keys() {
+            for (size_key, summary) in &stored_names {
+                self.learned.register(summary, *size_key);
+            }
+        }
         self.restore_cordons(stored.cordons);
         self.durable = Some(durable);
         Ok(Some(epoch))
@@ -1278,7 +1440,12 @@ impl State {
     /// # Errors
     /// UNAVAILABLE if the store did not take it: the request is not queued, and the
     /// client, who is told nothing is queued, asks again.
-    pub(super) fn queue(&mut self, request: &Request, subject: &Subject) -> Result<(), Status> {
+    pub(super) fn queue(
+        &mut self,
+        request: &Request,
+        subject: &Subject,
+        size_key: Option<u64>,
+    ) -> Result<(), Status> {
         if self.sched.twin(request).is_some() {
             return Ok(());
         }
@@ -1288,7 +1455,7 @@ impl State {
             // The id comes from the block this frontend reserved: the operation's row
             // is put under an id no other frontend takes.
             let id = d.reserve_operation(wanted)?;
-            submitted = Some(d.submit(id, request, subject)?);
+            submitted = Some(d.submit_keyed(id, request, subject, size_key)?);
             Ok(())
         });
         if !taken {
@@ -1323,10 +1490,15 @@ impl State {
                         "the action's previous run is finishing; the request is not queued",
                     ));
                 }
+                let operation = op.operation;
+                let stored_key = op.size_key.filter(|_| self.learned.keys());
                 let recovered = self.take_stored(*op, SystemTime::now());
                 // The operation is neither in the scheduler nor finished (checked
                 // above), so `take_in` has nothing to refuse.
                 let taken = self.sched.take_in(recovered);
+                if let Some(key) = stored_key {
+                    self.sched.set_size_key(operation, key);
+                }
                 debug_assert!(taken, "the stored operation was already in the scheduler");
             }
             None => {}

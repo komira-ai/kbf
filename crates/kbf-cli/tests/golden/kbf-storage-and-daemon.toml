@@ -62,7 +62,10 @@ drain-deadline-secs = 600
 # driver = []
 # A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon makes sure each is in the node's image store, as the prepare step of every lease does: it fetches the image from its registry by that digest, checks every byte against a digest, and unpacks it once. It exits with status 2 if one cannot be fetched, fails a check, or names an image index. The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
 # image = []
-# The order spool (owned by the service user, mode 0700): where the daemon writes the order records the root installer reads. With `--update-dir` only; default `<update-dir>/orders`
+# How long a lease's processes are given to end after SIGTERM before they are killed, in milliseconds; 0 kills them at once (native). A workload that cleans up when asked to end, such as Python's multiprocessing resource tracker with the shared memory it made, does so in this time; one that ignores SIGTERM is named in the lease's stderr. A slot's clean uses the same value (at most its own time limit). More than 60000 is taken as 60000. The wait comes after the action's timeout and its memory watch have ended it (neither runs during it), and on top of the time given to the kill that follows. A lease past its memory limit is killed at once. Applies on every platform
+native-term-grace-ms = 2000
+# Retired: no longer read, the node's update client was removed. Accepted and ignored for one release
+# (not in --help)
 # orders-dir = "DIR"
 # The longest wait between rounds of connection attempts, in milliseconds. Each wait is jittered down by up to half
 reconnect-max-ms = 30000
@@ -72,7 +75,8 @@ reconnect-ms = 1000
 # reserve-cpus = "N"
 # How many of the farm's processes on this host share the reserve: the daemon sizes its pools from `reserve / share` CPUs. Default 1
 # reserve-share = "N"
-# The root installer's directory: the daemon reads its `status.json` there. The frontend's orders are written to `orders/` beneath it unless `--orders-dir` says otherwise. Left out, the node updates by hand: it says so and touches no directory. Not taken by the all-in-one binary yet
+# Retired: no longer read, the node's update client was removed. Accepted and ignored for one release
+# (not in --help)
 # update-dir = "DIR"
 
 [identity]

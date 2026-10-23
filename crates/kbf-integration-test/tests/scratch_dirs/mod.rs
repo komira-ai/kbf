@@ -58,19 +58,9 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         "product code: the bump verb's clone when no --workdir is given, removed after the run whatever its result",
     ),
     (
-        "crates/xtask/src/release/offer.rs",
-        1,
-        "product code: the offer verb's scratch, removed once the plan is made whatever its result",
-    ),
-    (
         "crates/xtask/src/release/fetch_previous.rs",
         1,
         "product code: the fetch-previous verb's scratch, removed after the run whatever its result",
-    ),
-    (
-        "crates/xtask/src/release/stage_offer.rs",
-        1,
-        "product code: the stage-offer verb's scratch, removed after the run whatever its result",
     ),
 ];
 

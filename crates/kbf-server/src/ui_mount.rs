@@ -12,7 +12,7 @@
 //! - **The same read handlers, asked in process.** A page reads the API through
 //!   [`InProcess`]: a `GET` of one of the server's own routes, called as a service on a
 //!   router that is not on any listener. Its policy-gated reads (the build pages, the run
-//!   logs, the blobs, the per-host update detail) are built a second time from the same
+//!   logs, the blobs) are built a second time from the same
 //!   state with every caller allowed ([`Reads::routes`]), so the REAPI policy's
 //!   authenticator and authorizers keep gating the same routes on the network and do not
 //!   gate the UI. The in-process request carries the address `127.0.0.1:0` and
@@ -55,7 +55,6 @@ use kbf_objstore::ObjectStore;
 use kbf_ui::{Fetched, Source, SourceError};
 use tower_service::Service;
 
-use crate::farm::Farm;
 use crate::history::HistoryReads;
 use crate::http_blobs::{BlobReaders, ReadBudget};
 use crate::http_invocations::InvocationReaders;
@@ -63,7 +62,6 @@ use crate::proxy_auth::Trust;
 use crate::read_limit::{PER_CALLER, ReadLimit, limited};
 use crate::serve::{Api, Behind, Bound, Listeners, ServeError, bind_server_with_ui};
 use crate::state_store::StateStore;
-use crate::update::Rows;
 
 /// [`bind_server_with_policy`](crate::bind_server_with_policy) with all of its options: the
 /// scheduler's state in `state` ([`crate::bind_server_with_state`]), the client's CAS,
@@ -113,9 +111,6 @@ pub(crate) struct Reads<M, O> {
     /// `None` without `--history-objects`.
     pub(crate) history: Option<Arc<HistoryReads>>,
     pub(crate) budget: ReadBudget,
-    pub(crate) farm: Arc<Farm>,
-    /// `None` without a state store.
-    pub(crate) rows: Option<Rows>,
 }
 
 impl<M, O> Reads<M, O>
@@ -123,9 +118,8 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    /// The routes `policy` gates: the blob route, the build pages with the run, log and
-    /// history routes, and the per-host update detail. Each is off (`404`) where `policy`
-    /// names no authorizer for it.
+    /// The routes `policy` gates: the blob route and the build pages with the run, log and
+    /// history routes. Each is off (`404`) where `policy` names no authorizer for it.
     pub(crate) fn routes(&self, policy: &Policy) -> Router {
         let blobs = crate::http_blobs::router(
             Arc::clone(&self.cache),
@@ -139,12 +133,7 @@ where
             self.history.clone(),
             self.budget.clone(),
         );
-        let hosts = crate::update_hosts::router(
-            Arc::clone(&self.farm),
-            self.rows.clone(),
-            crate::update_hosts::FarmReaders::from_policy(policy),
-        );
-        blobs.merge(pages).merge(hosts)
+        blobs.merge(pages)
     }
 }
 
@@ -155,7 +144,6 @@ fn open_policy() -> Policy {
     let mut policy = Policy::allow_all();
     policy.invocations_get = Some(allow());
     policy.blobs_get = Some(allow());
-    policy.farm_get = Some(allow());
     policy
 }
 

@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::pages::{
     ACTION, BUILD, BUILDS, LEASES, LOG, NODE, NODES, OVERVIEW, PAGES, QUEUE, STORAGE, TARGET,
-    TARGETS, UPDATES, sched_farm,
+    TARGETS, sched_farm,
 };
 use crate::read::Page;
 use crate::{Answer, CONTENT_SECURITY_POLICY, Fetched, Source, SourceError, respond};
@@ -360,71 +360,7 @@ fn retried_action() -> Value {
     a
 }
 
-pub(crate) const COMMIT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub(crate) const COMMIT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-
-/// `GET /v1/update`: desired `COMMIT_B` at generation 7 (not paused), no policy row,
-/// two releases: `COMMIT_A` with a complete linux platform and an incomplete darwin
-/// one, `COMMIT_B` complete on both.
-pub(crate) fn update_doc() -> Value {
-    json!({
-        "desired": {"generation": 7, "commit": COMMIT_B, "set_at_ms": 1_791_370_000_000_u64},
-        "paused": false,
-        "policy": null,
-        "releases": {"releases": [
-            {"commit": COMMIT_A, "platforms": [
-                {"platform": "linux-x86_64", "complete": true, "components": []},
-                {"platform": "darwin-arm64", "complete": false, "components": []}]},
-            {"commit": COMMIT_B, "platforms": [
-                {"platform": "linux-arm64", "complete": true, "components": []},
-                {"platform": "darwin-arm64", "complete": true, "components": []}]}]},
-    })
-}
-
-/// A node of `GET /v1/nodes`.
-pub(crate) fn node(id: &str, os: Option<&str>, update: &Value) -> Value {
-    json!({
-        "node_id": id, "connected": true,
-        "software": os.map(|os| json!({"os_name": os, "xcodes": []})),
-        "update": update, "needs_attention": [], "placement": {"state": "serving"},
-    })
-}
-
-/// `GET /v1/nodes`: the frontend's server at `COMMIT_B`, a current Linux host, a
-/// Mac that refused, and a host that never sent an `UpdateStatus`.
-pub(crate) fn nodes_doc() -> Value {
-    json!({"server": {"version": "0.1.0+bbbbbbbbbbbb", "commit": COMMIT_B}, "nodes": [
-        node("linux-1", Some("Linux"),
-            &json!({"state": "confirmed", "up_to_date": true, "availability": "ok"})),
-        node("mac-1", Some("macOS"),
-            &json!({"state": "refused", "up_to_date": false, "availability": "ok"})),
-        node("old-1", None,
-            &json!({"state": null, "up_to_date": null, "availability": "unsupported"}))]})
-}
-
-/// `GET /v1/update/hosts` for `nodes_doc`.
-pub(crate) fn hosts_doc() -> Value {
-    json!({"desired": null, "paused": false, "next_page_token": null, "hosts": [
-        {"node_id": "linux-1", "connected": true, "availability": "ok", "state": "confirmed",
-         "up_to_date": true, "desired_commit": COMMIT_B, "running_commit": "bbbbbbbbbbbb",
-         "installed_commit": COMMIT_B, "staged_commit": "", "refusal": "",
-         "offered_generation": 7, "helper_present": true, "reported_at_unix_ms": 1},
-        {"node_id": "mac-1", "connected": true, "availability": "ok", "state": "refused",
-         "up_to_date": false, "desired_commit": COMMIT_B, "running_commit": "aaaaaaaaaaaa",
-         "installed_commit": COMMIT_A, "staged_commit": "", "refusal": "no helper installed",
-         "offered_generation": 7, "helper_present": false, "reported_at_unix_ms": 2}]})
-}
-
-/// The URL of the per-host detail, as the page asks for it.
-pub(crate) const HOSTS_URL: &str = "/v1/update/hosts?page_size=1000";
-
-/// A read API that answers all three routes of the Updates page.
-pub(crate) fn updates_farm() -> Fake {
-    Fake::default()
-        .json("/v1/update", &update_doc())
-        .json("/v1/nodes", &nodes_doc())
-        .json(HOSTS_URL, &hosts_doc())
-}
 
 /// One storage member of `GET /v1/storage`, every report value known.
 pub(crate) fn storage_node(id: u64, state: &str) -> Value {
@@ -484,7 +420,6 @@ pub(crate) fn fleet_node(id: &str, placement: &str, leases: u64, cpu: u64) -> Va
         "needs_attention": [],
         "placement": {"state": placement},
         "phase": {"state": "serving"},
-        "update": {"state": "confirmed", "up_to_date": true, "availability": "ok"},
         "lease_count": leases,
         "booked": {"cpu_millis": cpu, "memory_bytes": 2_147_483_648_u64, "gpus": 1, "vms": 4},
     })
@@ -499,7 +434,6 @@ pub(crate) fn hostile_node() -> Value {
     n["needs_attention"] = json!([HOSTILE]);
     n["placement"] = json!({"state": HOSTILE});
     n["phase"] = json!({"state": "quarantined", "reason": HOSTILE});
-    n["update"] = json!({"state": HOSTILE, "up_to_date": null, "availability": HOSTILE});
     n
 }
 
@@ -570,9 +504,7 @@ pub(crate) fn fleet_farm() -> Fake {
 
 /// The fake that makes `page` answer `200` on its contract paths.
 fn fake_for(page: &Page) -> Fake {
-    if page.name == UPDATES.name {
-        updates_farm()
-    } else if page.name == TARGETS.name || page.name == TARGET.name {
+    if page.name == TARGETS.name || page.name == TARGET.name {
         crate::pages::history_fixtures::farm()
     } else if page.name == LEASES.name || page.name == QUEUE.name {
         sched_farm()
@@ -762,7 +694,6 @@ fn contract_table() -> Vec<(&'static Page, Vec<String>)> {
         ),
         (&NODES, vec!["/ui/nodes".to_owned()]),
         (&NODE, vec!["/ui/nodes/mac-1".to_owned()]),
-        (&UPDATES, vec!["/ui/updates".to_owned()]),
         (
             &LEASES,
             vec!["/ui/leases".to_owned(), "/ui/leases?node=node-a".to_owned()],

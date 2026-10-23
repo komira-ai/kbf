@@ -86,8 +86,9 @@ use crate::machine::{FarmMachine, Platform, Sent, Waiter};
 use crate::memory;
 use crate::missing;
 use crate::run_record;
+use crate::size_key::Keyable;
 use crate::stamp::Stamp;
-use crate::update_status::{HostUpdate, UpdateReport};
+use crate::update_status::UpdateReport;
 
 /// The scheduler term of a new single-node server process: the wall-clock time of its
 /// start in milliseconds since the Unix epoch, times 2^16, plus 16 random bits.
@@ -317,6 +318,8 @@ struct State {
     /// The learned-sizes shadow ([`crate::learned`]); off unless `--learned-sizes`
     /// says otherwise.
     learned: Learned,
+    /// Lowered key floors the state store has not taken yet ([`State::lower_key_floors`]).
+    unwritten_floors: Vec<kbf_sched::KeyFloor>,
 }
 
 /// How many committed records the farm holds for a state store that refuses them.
@@ -417,6 +420,7 @@ impl Farm {
                 untraced_kept: BTreeMap::new(),
                 untraced_relayed: BTreeMap::new(),
                 learned: Learned::new(LearnedSizes::Off, 0, 0),
+                unwritten_floors: Vec::new(),
             }),
         }
     }
@@ -686,34 +690,13 @@ impl Farm {
     /// replaced (a newer stream sends its own), exactly as [`Self::node_status`] keeps a
     /// `NodeStatus`. Returns whether it was kept.
     pub fn update_status(&self, worker: &WorkerId, stream: StreamId, status: UpdateStatus) -> bool {
-        let report = UpdateReport::new(status, unix_ms());
+        let report = UpdateReport::new(status);
         let mut state = self.lock();
         if !state.is_current(worker, stream) {
             return false;
         }
         state.machine.report_update(worker, report);
         true
-    }
-
-    /// Every node registered since this farm started, in node-id order, with what each
-    /// last said about its update (`GET /v1/update/hosts`); judged against no desired
-    /// commit ([`HostUpdate::judge`]).
-    pub fn update_hosts(&self) -> Vec<HostUpdate> {
-        let mut state = self.lock();
-        state.note_closed_streams();
-        state
-            .machine
-            .nodes()
-            .filter_map(|worker| {
-                let node = state.machine.node(worker)?;
-                Some(HostUpdate::new(
-                    worker.as_str().to_owned(),
-                    node.connected,
-                    node.update_live,
-                    node.update.clone(),
-                ))
-            })
-            .collect()
     }
 
     /// Sends `order` to `worker` on its newest stream.
@@ -760,8 +743,8 @@ impl Farm {
                         state.sched.phase(worker),
                         Some(NodePhase::Preparing(_) | NodePhase::Restoring(_))
                     ),
-                    // The report is kept across streams for the operator's views; the
-                    // controller reads only one its node's current stream sent.
+                    // The report is kept across streams; the controller reads only one
+                    // its node's current stream sent.
                     update: node
                         .filter(|n| n.update_live)
                         .and_then(|n| n.update.clone()),
@@ -1038,16 +1021,37 @@ impl Farm {
 
 impl Dispatch for Farm {
     fn submit(&self, mut submission: Submission) -> Result<Ticket, Status> {
+        // An action with no program and no output names no shape: all such actions would
+        // share one key.
+        let shaped =
+            !submission.described.arguments.is_empty() || !submission.described.outputs.is_empty();
         // Outside the lock: hashes the action's shape and drops its argv and paths.
         let usage = self
             .shapes
             .subject(std::mem::take(&mut submission.described));
         let shape = submission.call.as_ref().map(|_| usage.recorded());
         let now = self.now();
+        let platform = Platform::of(&submission.request.needs);
         let waiting = std::time::Instant::now();
         let mut state = self.lock();
         self.cache.metrics().sched_lock_wait.since(waiting);
-        state.admit(&submission.request, &usage)?;
+        let size_key = state
+            .learned
+            .keys()
+            .then(|| {
+                Keyable {
+                    instance: &submission.request.key.instance,
+                    platform: &platform,
+                    shape: usage.key,
+                    shaped,
+                    kind: submission.request.kind,
+                    gpus: submission.request.resources.gpus,
+                    memory: submission.evidence.memory_source,
+                }
+                .key()
+            })
+            .flatten();
+        state.admit(&submission.request, &usage, size_key)?;
         let joined = state.sched.twin(&submission.request).is_some();
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
@@ -1057,16 +1061,28 @@ impl Dispatch for Farm {
             do_not_cache: submission.request.do_not_cache,
             queued: SystemTime::now(),
             usage,
-            platform: Platform::of(&submission.request.needs),
+            platform,
         });
         let name = state.machine.name(waiter);
-        state.learn_submit(&name, &submission.request, &submission.evidence, joined);
+        state.learn_submit(
+            &name,
+            &submission.request,
+            &submission.evidence,
+            joined,
+            size_key,
+        );
         if let Some((call, shape)) = submission.call.take().zip(shape) {
             let call = call.with_shape(shape).with_evidence(submission.evidence);
             state.record_submit(call, &name, &submission.request);
         }
         let (stage, receiver) = watch::channel(Stage::Queued);
         state.stages.insert(waiter, stage);
+        // The operation this submit allocates (none if it joins a twin, which keeps its
+        // own key) is named before the submit is fed: its first placement round follows.
+        if let Some(key) = size_key.filter(|_| !joined) {
+            let next = state.sched.next_operation();
+            state.sched.set_size_key(next, key);
+        }
         state.feed_quiet(
             now,
             Event::Submit {
@@ -1182,7 +1198,7 @@ impl State {
                 }
             }
         };
-        self.finish_learning(lease, worker, accepted || taken == Taken::Held);
+        self.finish_learning(operation, lease, worker, accepted || taken == Taken::Held);
         if accepted && let Some((subject, measured)) = &usage {
             action_usage::log(operation, subject, measured, outcome, lease, worker);
         }
@@ -1679,5 +1695,7 @@ fn unrun(outcome: Outcome, farm_runs: &[FarmRun]) -> Finished {
     }
 }
 
+#[cfg(test)]
+mod learned_tests;
 #[cfg(test)]
 mod tests;

@@ -5,7 +5,7 @@
 //!   rename, symlink, chmod, wait-for, sleep-once, mkdir, cat, mtime, pgid, leads, write-lines,
 //!   copy, remove, mkfifo, truncate, zeros, ignore-signal, test, points-to, holds,
 //!   inode-links, and the probes try-read, try-write, try-list, tcp-listen,
-//!   tcp-connect, unix-listen, unix-connect, procargs, proc-sees, ps-sees) that a test puts in an action's or a child's argv where it would
+//!   tcp-connect, unix-listen, unix-connect, procargs, proc-sees, ps-sees, and shm-owner) that a test puts in an action's or a child's argv where it would
 //!   have written `sh -c`.
 //! - [`fake`]: the same binary run through a link named `xcrun`, `xcodebuild` or
 //!   `sandbox-exec` answers as that tool, from a rules file the test writes.
@@ -58,6 +58,7 @@ pub mod node_view;
 pub mod port;
 pub mod probe;
 pub mod reaped;
+pub mod shm;
 pub mod spawn;
 pub mod switch;
 pub mod tree;

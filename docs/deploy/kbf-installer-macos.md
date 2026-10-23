@@ -66,10 +66,9 @@ restarts to ten seconds and writes to `/Library/Logs/kbf-installer/kbf-installer
 1. **Install the package** as above.
 2. **Provision the host.** `kbf-mac-provision apply --profile FILE` (as root) fixes the host
    settings and renders the worker profile: it writes `/usr/local/etc/kbf/kbf.toml` and the daemon
-   job's plist, makes `/var/db/kbf-installer` (root, 0755) and `/var/db/kbf-installer/orders` (the
-   daemon account's, 0700), and starts the job. It is the one writer of the daemon's `kbf.toml` on
-   a Mac. The `kbf.toml` it renders has `[daemon] update-dir = "/var/db/kbf-installer"`, which turns
-   on the node's update client. Use the label `com.komira.kbf-daemon` for the daemon job
+   job's plist, and starts the job. It is the one writer of the daemon's `kbf.toml` on
+   a Mac. The `kbf.toml` it renders has no `update-dir` or `orders-dir`; a file that still has them
+   from an earlier run is accepted and left as it is. Use the label `com.komira.kbf-daemon` for the daemon job
    (`launchd_label` in the profile), because that is the label `setup` and the installer's job look
    for.
 3. **Run `setup`** as root:
@@ -91,11 +90,8 @@ On a Mac `setup`:
   `/usr/local/etc/kbf/enroll.token` (0600), and writes `/usr/local/etc/kbf/installer.toml` (0644),
   which is the file that releases the installer's job;
 - looks users up with `dscl`, not `getent`, and has no subid or lingering step;
-- **checks `kbf.toml` and never writes `update-dir` or `orders-dir` into it.** `update-dir` must be
-  there and be `/var/db/kbf-installer`; `orders-dir` must be absent (the node uses
-  `<update-dir>/orders`) or be `/var/db/kbf-installer/orders`. A missing or different key, or no
-  file, is refused with exit 5, naming the key and saying that `kbf-mac-provision` renders it; run
-  it again, then `setup`. The keys `setup` itself owns (`mode`, `[frontend] url`, `[enroll]
+- **never writes `update-dir` or `orders-dir` into `kbf.toml`**, and does not require them.
+  The keys `setup` itself owns (`mode`, `[frontend] url`, `[enroll]
   token_file`) follow the same rule as on Linux: a file with other settings is kept when they match
   and refused when they differ;
 - runs `launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-installer.plist` unless

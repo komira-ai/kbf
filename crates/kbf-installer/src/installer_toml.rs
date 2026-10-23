@@ -25,19 +25,23 @@
 //! [`InstallerToml::parse_tolerant`], which ignores every other key, whatever its value, so a
 //! file a later build wrote does not stop it after a package downgrade.
 //!
+//! This module reads text and checks its shape; it does not look at who owns the file. The
+//! read that holds the file to the trust files' rule (root's alone) is
+//! `crate::helper::trusted_toml`, for the release fetcher. The `[proxy]` table and the
+//! release-source keys (`release_source`, `release_url`, `source_refs`, the frontend snapshot,
+//! `release_ca`, the node identity and the limits) are still read and checked here: hosts set
+//! up by an earlier build carry them, and `setup`, the fetcher and the stage policy still
+//! consume them until the release-fetching chain is removed.
+//!
 //! [`InstallerToml::render`] writes the one canonical form (every key but the unset optional
 //! ones, in a fixed order); the golden fixtures `testdata/golden/installer*.toml` are that form.
 
 use std::path::PathBuf;
 
-use kbf_host::exec::{Entry, Exec, Kind};
-use kbf_host::path::HostPath;
 use kbf_proxy::config::ProxyConfig;
 use serde::Deserialize;
 
-use crate::record::Sha256Hex;
-use crate::refusal::{Refusal, TrustFault};
-use crate::trust::trusted_chain;
+use crate::sha256_hex::Sha256Hex;
 
 /// The largest file read.
 pub const MAX_FILE_BYTES: usize = 64 * 1024;
@@ -235,17 +239,6 @@ pub enum ConfigError {
     Invalid(Vec<String>),
 }
 
-/// Why the file at a path could not be taken as the installer's settings.
-#[derive(Debug, thiserror::Error)]
-pub enum ReadError {
-    /// It is missing, not a plain file, owned by someone but root, writable by group or
-    /// others, or in a directory that is ([`trusted_chain`]).
-    #[error("{0}")]
-    Untrusted(Refusal),
-    #[error("{0}")]
-    Invalid(ConfigError),
-}
-
 fn absolute(key: &str, value: &Option<String>, problems: &mut Vec<String>) -> Option<PathBuf> {
     let v = value.as_deref()?;
     absolute_path(key, v).map_err(|e| problems.push(e)).ok()
@@ -421,39 +414,6 @@ fn syntax_line(text: &str, error: &toml::de::Error) -> String {
 }
 
 impl InstallerToml {
-    /// The settings in `file`, read through `trust` (the host's own executor, or a test's).
-    ///
-    /// The file decides where a release comes from and which versions the host refuses, so
-    /// it is held to the rule of the trust files ([`trusted_chain`]): a plain file of root's
-    /// that group and others cannot write, in directories of root's that they cannot write.
-    /// `setup` leaves it so (root:root 0644 in a root-owned 0755 directory).
-    ///
-    /// # Errors
-    /// [`ReadError::Untrusted`] when the rule is not met (or the file cannot be read),
-    /// [`ReadError::Invalid`] when its content is not an `installer.toml`.
-    pub fn read(trust: &dyn Exec, file: &HostPath) -> Result<InstallerToml, ReadError> {
-        let untrusted = |fault| {
-            ReadError::Untrusted(Refusal::Untrusted {
-                path: file.as_str().into(),
-                fault,
-            })
-        };
-        let read = trust
-            .inspect(file)
-            .map_err(|e| untrusted(TrustFault::Unreadable(e)))?;
-        let Some(entry) = read else {
-            return Err(untrusted(TrustFault::Missing));
-        };
-        // A link, a directory or a device where the file should be.
-        let Entry::File { bytes, .. } = entry else {
-            return Err(untrusted(TrustFault::Link));
-        };
-        trusted_chain(trust, file, Kind::File).map_err(ReadError::Untrusted)?;
-        let text = String::from_utf8(bytes)
-            .map_err(|_| ReadError::Invalid(ConfigError::Syntax("it is not UTF-8".to_owned())))?;
-        InstallerToml::parse(&text).map_err(ReadError::Invalid)
-    }
-
     /// The closed reader: every key of the file is known, every value is the right type and
     /// inside its bounds, and the keys of one source are not beside another's, or it is
     /// refused with every problem found.
