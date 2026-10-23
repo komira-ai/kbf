@@ -16,12 +16,15 @@
 //! package database before and after. Both apt commands read the one source file of the
 //! channel and no other, and run with the fixed environment of every process here
 //! ([`crate::runner::PATH`], `LANG=C`, `DEBIAN_FRONTEND=noninteractive`).
+//!
+//! A restart is two `systemctl` commands, `restart -- <unit>` and then `is-active -- <unit>`
+//! until the unit says `active`, run by the process sshd starts under the install lock.
 
 use std::path::Path;
 use std::time::Duration;
 
 use crate::config::ChannelSource;
-use crate::request::{Channel, Version};
+use crate::request::{Channel, Unit, Version};
 use crate::runner::Cmd;
 
 /// The prefix of every unit this program starts; `query` asks systemd about `<prefix>*`.
@@ -79,6 +82,51 @@ pub const UNIT_ENV: &str = "KBF_HOST_INSTALL_UNIT";
 
 /// Seconds `kbf --version --json` may run before `query` gives up on it.
 pub const RUNNING_BUILD_TIMEOUT_SECS: u64 = 10;
+
+/// Seconds `systemctl restart` may run before it is killed: it returns when the unit's stop
+/// and start jobs are over.
+pub const RESTART_TIMEOUT_SECS: u64 = 120;
+
+/// Seconds one `systemctl is-active` may run before it is killed.
+pub const IS_ACTIVE_TIMEOUT_SECS: u64 = 10;
+
+/// Seconds after a restart that the unit has to be active.
+pub const ACTIVE_WAIT_SECS: u64 = 120;
+
+/// Milliseconds between two looks at whether the unit is active.
+pub const ACTIVE_POLL_MILLIS: u64 = 500;
+
+/// How long a restart waits for its unit to be active, and how often it looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wait {
+    pub timeout: Duration,
+    pub interval: Duration,
+}
+
+/// The wait of a real restart.
+pub const ACTIVE_WAIT: Wait = Wait {
+    timeout: Duration::from_secs(ACTIVE_WAIT_SECS),
+    interval: Duration::from_millis(ACTIVE_POLL_MILLIS),
+};
+
+/// Restart `unit`. The runner kills it after [`RESTART_TIMEOUT_SECS`]. The unit name is the
+/// only argument that is not fixed, and it is built from a checked name (`Unit::frontend`).
+pub fn restart_unit(unit: &Unit) -> Cmd {
+    Cmd {
+        timeout: Some(Duration::from_secs(RESTART_TIMEOUT_SECS)),
+        ..cmd(SYSTEMCTL, &["restart", "--", unit.as_str()])
+    }
+}
+
+/// Ask whether `unit` is active: the exit status is 0 for `active` and `reloading`, and not
+/// for `activating` (a unit that is starting), `inactive` or `failed`. The runner kills it after
+/// [`IS_ACTIVE_TIMEOUT_SECS`].
+pub fn unit_active(unit: &Unit) -> Cmd {
+    Cmd {
+        timeout: Some(Duration::from_secs(IS_ACTIVE_TIMEOUT_SECS)),
+        ..cmd(SYSTEMCTL, &["is-active", "--", unit.as_str()])
+    }
+}
 
 /// Read the installed version and package state of `kbf`: `<status> <version>`.
 pub fn installed_version() -> Cmd {
