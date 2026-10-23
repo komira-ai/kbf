@@ -49,16 +49,28 @@ fn the_services_of_a_domain_are_the_table_between_its_braces() {
 }
 
 /// Catches a clean that lists launchd's services (one print of the domain and one per
-/// service, 40 or so) when no process of the uid is alive: with no pid, nothing is listed
-/// and nothing asked.
+/// service, 40 or so) when no process of the uid is alive: with live pids the list is
+/// read and the services judged (counted), with none nothing is listed or judged.
 #[test]
 fn no_service_is_listed_when_no_process_is_alive() {
-    let own = own_among(
-        &[],
-        || panic!("the domain was listed for no process"),
-        |label| panic!("{label} was judged for no process"),
-    );
-    assert_eq!(own, Vec::<i32>::new());
+    let (listed, judged) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+    let own = |pids: &[i32]| {
+        own_among(
+            pids,
+            || {
+                listed.set(listed.get() + 1);
+                vec![(Some(7), "own.a".to_owned())]
+            },
+            |_| {
+                judged.set(judged.get() + 1);
+                true
+            },
+        )
+    };
+    assert_eq!(own(&[7]), [7]);
+    assert_eq!((listed.get(), judged.get()), (1, 1));
+    assert_eq!(own(&[]), Vec::<i32>::new());
+    assert_eq!((listed.get(), judged.get()), (1, 1));
 }
 
 /// Catches a clean that prints every service for its plist: only a service that runs one
