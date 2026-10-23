@@ -162,8 +162,9 @@ fn owned_below(root: &Path, uid: u32, found: &mut Vec<PathBuf>) {
 }
 
 /// What the uid owns in the system places the clean sweeps outside its own folders, and
-/// in all of `/private/var/folders`.
-fn uid_files_outside(uid: u32) -> Vec<PathBuf> {
+/// in all of `/private/var/folders` except its entry's root and four folders, which are
+/// the uid's by design (the test looks inside them on its own).
+fn uid_files_outside(uid: u32, folders: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for root in PROTECTED.iter().map(Path::new).chain([
         Path::new("/private/var/db/mds"),
@@ -171,6 +172,12 @@ fn uid_files_outside(uid: u32) -> Vec<PathBuf> {
     ]) {
         owned_below(root, uid, &mut found);
     }
+    found.retain(|path| {
+        path != folders
+            && !["0", "C", "T", "X"]
+                .iter()
+                .any(|name| path == &folders.join(name))
+    });
     found
 }
 
@@ -357,7 +364,7 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
 
     // Everything is read before anything can end the test, then the plants are removed.
     let free = slots.count();
-    let outside = uid_files_outside(uid);
+    let outside = uid_files_outside(uid, &folders);
     let control_stays = control.exists();
     let residue_left: Vec<&PathBuf> = planted.residue.iter().filter(|p| p.exists()).collect();
     let left_in_entry: Vec<String> = names(&folders)
