@@ -11,9 +11,9 @@ use std::collections::BTreeSet;
 
 use kbf_map::{MemberId, MemberState};
 use kbf_server::update::{
-    AvailableFact, Command, DaemonLoad, Facts, Generation, HelperReport, HelperStatus, Holder,
-    HostFacts, HostKind, HostPhase, HostRecord, MemberFacts, OrderId, Platform, PlatformClass,
-    Policy, Release, Slot, SlotClass, Source,
+    AvailableFact, Command, DaemonLoad, Facts, Generation, HelperReport, HelperStatus, HostFacts,
+    HostKind, HostPhase, HostRecord, MemberFacts, OrderId, Platform, PlatformClass, Policy,
+    Release, Slot, Source,
 };
 use kbf_server::update_status::ReleaseSource;
 use kbf_types::{FarmTime, WorkerId};
@@ -166,27 +166,6 @@ pub fn facts(hosts: Vec<HostFacts>, members: Vec<MemberFacts>) -> Facts {
         queued_classes: Some(BTreeSet::new()),
         wait_since: t(NOW),
     }
-}
-
-/// Gives `name` a place in the slot, of the kind the host in `facts` takes. A name that is
-/// not a host of the run takes a place of `class_if_unknown`.
-pub fn hold_as(facts: &mut Facts, name: &str, class_if_unknown: SlotClass) {
-    let class = facts
-        .host(&id(name))
-        .map_or(class_if_unknown, HostFacts::slot_class);
-    let holder = Holder {
-        host: id(name),
-        order: ORDER,
-    };
-    assert!(
-        facts.slot.claim(class, holder, usize::MAX),
-        "{name} could not take a place"
-    );
-}
-
-/// [`hold_as`] for a host of the run.
-pub fn hold(facts: &mut Facts, name: &str) {
-    hold_as(facts, name, SlotClass::Host);
 }
 
 /// The host `name` of `facts`, to change.

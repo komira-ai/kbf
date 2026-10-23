@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use kbf_server::members::MembershipConfig;
 use kbf_server::update::{
-    Alert, Command, Generation, HoldReason, HostPhase, HostRecord, OrderId, Policy, PolicyError,
-    Release, Severity,
+    Alert, Command, Generation, HoldReason, Holder, HostPhase, HostRecord, OrderId, Policy,
+    PolicyError, Release, Severity, Slot,
 };
-use support::{EPOCH, GENERATION, NOW, ORDER, policy, t};
+use support::{EPOCH, GENERATION, NOW, ORDER, id, policy, t};
 
 const MIN: u64 = 60;
 
@@ -218,4 +218,25 @@ fn entry_commands_name_the_activate_order_for_one_phase_only() {
             .any(|c| matches!(c, Command::Activate { .. } | Command::Confirm { .. }));
         assert_eq!(any, activates || confirms, "{phase:?}: another order id");
     }
+}
+
+/// Catches: a slot with a holder read as free, or one that holds only a place of the other
+/// kind read as free: the slot is empty only with no storage holder and no other holder.
+#[test]
+fn a_slot_is_empty_only_with_no_holder_of_either_kind() {
+    let holder = |name| Holder {
+        host: id(name),
+        order: ORDER,
+    };
+    assert!(Slot::default().is_empty());
+    let storage = Slot {
+        storage: Some(holder("s1")),
+        ..Slot::default()
+    };
+    assert!(!storage.is_empty());
+    let hosts = Slot {
+        hosts: vec![holder("d1")],
+        ..Slot::default()
+    };
+    assert!(!hosts.is_empty());
 }

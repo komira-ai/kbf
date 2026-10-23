@@ -22,9 +22,7 @@ mod rows;
 mod session;
 mod slot;
 
-pub use crate::storage_gate::{
-    GateFail, GateMode, MemberFacts, member_facts, storage_gate, storage_half,
-};
+pub use crate::storage_gate::{GateFail, MemberFacts, member_facts, storage_gate, storage_half};
 pub use codec::{Desired, HostRow};
 pub use command::{Alert, Command, HoldReason, Severity, SlotOp};
 pub use facts::{

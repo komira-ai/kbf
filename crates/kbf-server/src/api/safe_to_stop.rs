@@ -2,7 +2,7 @@
 //! without leaving a blob with one copy? The updater of a host asks it before it stops the
 //! host's process (`docs/api.md`).
 //!
-//! It is the storage gate ([`storage_gate`], mode [`GateMode::Out`]) asked about one member,
+//! It is the storage gate ([`storage_gate`]) asked about one member,
 //! over a look at the members ([`crate::members`]): with this member out, every other member
 //! must be `Active`, heard within the time to live of the membership, not planned down, and report a repair debt of zero; and
 //! at least one other member must exist. The member's own state is not asked (a stop does not
@@ -36,7 +36,7 @@ use super::{ApiState, encode_segment, error, gate, json, member_failure};
 use crate::farm::Farm;
 use crate::members::{MemberLook, Members, MembersLook, MembershipError};
 use crate::proxy_auth::Caller;
-use crate::storage_gate::{GateMode, member_facts, storage_gate, storage_half};
+use crate::storage_gate::{member_facts, storage_gate, storage_half};
 
 /// The instant a look is judged at. The gate reads only how long ago each member was heard,
 /// and a look carries those ages, so any instant later than the oldest age serves; this one
@@ -82,8 +82,7 @@ pub fn safe_to_stop_path(id: &str) -> String {
 /// membership.
 fn verdict(look: &MembersLook, own: &MemberLook, ttl: Duration) -> Verdict {
     let members = member_facts(look, LOOK_AT);
-    let mode = GateMode::Out { fresh_since: None };
-    let shut = storage_gate(&members, own.id, mode, ttl, LOOK_AT).err();
+    let shut = storage_gate(&members, own.id, ttl, LOOK_AT).err();
     Verdict {
         safe: shut.is_none(),
         reasons: shut.into_iter().map(|fail| fail.to_string()).collect(),

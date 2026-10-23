@@ -1,4 +1,4 @@
-//! What the picker and the node step read: plain data a controller fills from the
+//! The facts of a split-mode update: plain data filled from the
 //! `Farm`, `Members`, the hosts' heartbeats and the `update/*` rows. Nothing here reads
 //! a clock or a store.
 //!
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use super::command::Command;
 use super::node_step::HostPhase;
-use super::slot::{Slot, SlotClass};
+use super::slot::Slot;
 use crate::storage_gate::MemberFacts;
 use crate::update_status::ReleaseSource;
 
@@ -87,15 +87,6 @@ impl OrderId {
     pub const fn new(epoch: u64, seq: u64) -> Self {
         Self { epoch, seq }
     }
-
-    /// The id after this one in the same epoch.
-    #[must_use]
-    pub const fn next(self) -> Self {
-        Self {
-            epoch: self.epoch,
-            seq: self.seq.saturating_add(1),
-        }
-    }
 }
 
 /// What kind of Mac a host is: the class a queued operation asks for (`os`, hardware and
@@ -148,15 +139,6 @@ pub struct DaemonLoad {
     /// A whole-machine hold, as a Mac's `Preparing` and `Restoring` phases take (section
     /// 2.10: a Mac with no leases may still be switching its session).
     pub whole_machine_hold: bool,
-}
-
-impl DaemonLoad {
-    /// The load D3 ranks hosts by: leases and undelivered claims. A whole-machine hold
-    /// weighs as one lease.
-    #[must_use]
-    pub fn weight(&self) -> u64 {
-        u64::from(self.leases) + u64::from(self.undelivered) + u64::from(self.whole_machine_hold)
-    }
 }
 
 /// What the host's root helper last reported about the order it was given (section 2.6,
@@ -311,24 +293,6 @@ pub struct HostFacts {
     pub record: HostRecord,
 }
 
-impl HostFacts {
-    /// Whether it has a storage half.
-    #[must_use]
-    pub const fn is_storage(&self) -> bool {
-        matches!(self.kind, HostKind::StorageAndDaemon)
-    }
-
-    /// Which slot the host takes when a run claims one for it.
-    #[must_use]
-    pub const fn slot_class(&self) -> SlotClass {
-        if self.is_storage() {
-            SlotClass::Storage
-        } else {
-            SlotClass::Host
-        }
-    }
-}
-
 /// The whole fleet at one look.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Facts {
@@ -353,21 +317,7 @@ pub struct Facts {
     pub slot: Slot,
     /// The Mac classes some queued operation asks for; `None` if unknown.
     pub queued_classes: Option<BTreeSet<PlatformClass>>,
-    /// When the picker started waiting for an idle host: the run's start (E8) or the last
+    /// When the run started waiting for an idle host: the run's start (E8) or the last
     /// host's uncordon. The D3 and `mac_force_after` windows count from here.
     pub wait_since: FarmTime,
-}
-
-impl Facts {
-    /// The host `id`, if the run has it.
-    #[must_use]
-    pub fn host(&self, id: &WorkerId) -> Option<&HostFacts> {
-        self.hosts.iter().find(|h| &h.id == id)
-    }
-
-    /// The storage member `id`, if `Members` lists it.
-    #[must_use]
-    pub fn member(&self, id: MemberId) -> Option<&MemberFacts> {
-        self.members.iter().find(|m| m.id == id)
-    }
 }
