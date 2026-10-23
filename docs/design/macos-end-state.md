@@ -21,7 +21,7 @@ this document is about Macs only.
 | **One volume** | The worker cache, the scratch root and the pool homes are on a **dedicated APFS volume** (one per Mac, made at provisioning), with `.metadata_never_index` and the backup exclusion on its roots. | macOS has no `protected_hardlinks`: on the system volume a slot could `link()` a root-owned cache inode into `/private/tmp`, where no uid sweep finds it and it pins cache bytes. Across volumes that `link()` gets EXDEV, and a home wipe unlinks everything the home holds. Spotlight off keeps `mdworker` from starting under a slot uid. |
 | **Clean between leases** | Pool users are reused. After every lease the daemon cleans the slot in **one pass**, in this order (C1 to C11, `slots/clean.rs`): (1) end the uid's launchd domains, `user/<uid>` and `gui/<uid>`, **whole** (never a job by its label: inside a domain that is going down that answers 124, "tearing down"), then poll `launchctl print user/<uid>` until it lists no job but launchd's own (told by where the job's plist lies, under `/System` or `/Library/Apple`, never by its label), waiting out 124, within a bound; (2) remove the uid's crontab and `at` jobs, so no job starts after the kill; (3) **kill every process of the uid**: first `kill(-1, SIGTERM)` and up to `--native-term-grace-ms` (default 2 s, 0 for none) for the uid's processes to end, so that a workload's resource tracker can unlink the POSIX shared memory and semaphores it made (a Mac cannot list those names, so nothing could remove them later); then a child drops to the uid and execs `kill(-1, SIGKILL)` (no Rust runs after `fork()` in the threaded daemon), repeated until two scans 200 ms apart find none, within 100 scans and a deadline; (4) detach the disk images the uid attached (owner from `hdiutil info -plist`) and unmount every mount under its home or `/var/folders` entry; (5) remove its System V IPC objects; (6) clear the user flags (`uchg`, `uappnd`, `nodump`, `opaque`, `hidden`), remove ACLs and make the owner's mode `u+rwx`, on the **roots first** (the home and the `/var/folders` entry themselves, because a locked directory cannot lose an entry) and then below them; (7) empty the real home (keychains included) and the uid's `/var/folders` entry, keeping `0`, `C`, `T` and `X` emptied and removing anything else in the entry root; (8) remove the uid's files in `/private/tmp`, `/private/var/tmp`, `/Library/Caches` and the `Shared` folder under `/Users`, and launchd's per-uid `disabled` and `loginitems` plists; (9) remove the crash reports about the uid in the crash folders, `/cores` and every `/Users/*/Library/Logs/DiagnosticReports`: a file the uid owns, or an `.ips` report with the uid as the `userID` of its JSON header or body (a text report is attributed by its owner alone, since a newline in a process path can forge its lines; how a report is otherwise attributed is not known), found by walking each folder by descriptor without following a link; (10) give the home back to the user, mode 0700, no flags, and the entry's roots what they had when the slot was resolved, with no lock and not `hidden`; (11) a second look at the uid's processes, 200 ms after the first; then a **post-clean check**: no process whose effective *or* real uid is the slot's (`PROC_UID_ONLY` union `PROC_RUID_ONLY`, so a setuid-root binary the slot started is seen), checked once more after a short wait; no job in `user/<uid>`; no image of the uid; the home empty, the user's, mode 0700, without flags; none of the uid's files in the swept places. | A kill by uid is exact: it ignores process groups, `setsid` and pid reuse. Ending the domain first stops the respawn loop. The deadline turns a process stuck in uninterruptible wait into a failed clean, not a hung slot. Every item in (4) and (5) outlives a kill and a home wipe. The flags go before the removal because the shipped order (remove, then clear the flag on the home root) failed on a home locked by its user, and the retry that followed hid it. |
 | **When a clean fails** | The user is left **dirty**: the slot is not offered to a lease, the node reports one slot fewer, and the reason is logged (at `ERROR` the first time, at `DEBUG` while it stays the same); nothing is written to disk. There is no retry inside the pass, and the user is never deleted or made again. One **recovery thread** of the daemon is the only thing that cleans a dirty slot again: while any slot is dirty it re-cleans the dirty ones, one at a time, after 5 s, then 10 s, doubling to 5 min while a pass frees none, and starting again from 5 s after a pass that frees a slot or when another slot goes dirty. It needs no lease and no Xcode survey, so a node whose every slot is dirty comes back by itself. Each change in the number of usable slots is pushed to the daemon through its own part of the driver watch (the count and the push under one lock, so an older count never overwrites a newer one), and does not wait for anything else to change. | A failure that still happens has a cause the step order does not remove; it should be seen in the log, not hidden by a second attempt. Deleting a user is an OpenDirectory write (slow, the most likely to fail) and under a user's own processes would leave them running as an orphan uid. A node that takes no lease and reports nothing new would otherwise stay at zero slots until restart. |
-| **Sandbox** | Today's `sandbox-exec` profile stays, **as a hermeticity aid only**. It denies file writes outside the lease directory, `/dev`, the slot user's real home and its `/var/folders` entry. The deny rules for the network, `job-creation`, `lsopen` and `user-preference-write` go: the clean covers what they protected. `NO_DEVICE_RULES` stays (`network.rs`). | The write rule still catches a build that writes into the source tree or `/usr/local`. The removed rules only existed because all leases shared one uid, and they break real tests today (`defaults write`, embedded XPC services, the network). |
+| **Sandbox** | Today's `sandbox-exec` profile stays, **as a hermeticity aid only**. It denies file writes outside the lease directory, `/dev`, the slot user's real home and its `/var/folders` entry. The deny rules for the network, `job-creation` and `user-preference-write` go: the clean covers what they protected. `lsopen` stays, and `mach-register` and `file-mount` are added: the clean does not reach an application Launch Services starts outside the sandbox, a Mach service name checked in with launchd, or a file system mounted on a directory. Each has a profile canary that the slot passes before a lease runs ([slot profile canaries](#slot-profile-canaries)). `NO_DEVICE_RULES` stays (`network.rs`). | The write rule still catches a build that writes into the source tree or `/usr/local`. The removed rules only existed because all leases shared one uid, and they break real tests today (`defaults write`, embedded XPC services, the network). |
 | **Network** | Open: internet and the LAN. The default for `network` becomes `on`; `network=off` stays as an opt-in (D2); under `off` a connect to the node's own non-loopback address is still allowed, so a service on the node's LAN address stays reachable. | Tests need the internet and the LAN. |
 | **Inputs and the worker cache (C2)** | With `--cache-dir` set: the cache is root-owned (directories `root:wheel 0755`, files `0444`/`0555`); inputs are **hard links** to cache entries, as on Linux ([worker-cache.md](worker-cache.md) 5.1); an input that missed the cache is written root-owned and read-only too. Lease users are never root or admin, have no `sudo`, are not in `wheel` or `admin`, get no ACL write, and no cache file has a group or other write bit. **Every directory** of the input tree is made by the daemon and owned by the slot uid, mode 0700; only files are links. **An input that an output names is a private copy** (`clonefile`), never a link, as on Linux. `remove_tree` and the clean only **unlink** an inode the slot does not own; they never `chmod`, `chflags` or strip its ACL. Without `--cache-dir`, inputs keep today's writable modes. | One cache, hard-linked, behaves the same on both platforms; the kernel, not the sandbox, keeps a slot from writing a cache inode. Hit and miss give the same modes, so a result never depends on cache state. Slot-owned directories let SwiftPM write `.build/` and `.swiftpm/` next to `Package.swift`, and `xcodebuild` its `build/` and `xcuserdata`. Atomic replace (write a temp file, rename over a root-owned input, as with `Package.resolved`) works in a slot-owned directory and is intended. |
 | **Simulators** | Each lease makes its devices in **its slot user's own default device set** (`~/Library/Developer/CoreSimulator/Devices`). The wipe removes them. The `kbf-lease-` name prefix and the start-up sweep of the shared set go. `KBF_SIMULATOR_UDID` stays. | A lease sees only its own devices; a killed daemon's devices go with the next clean of that slot. |
@@ -121,8 +121,8 @@ The daemon takes a free slot per lease and starts the action through `launchctl 
 the `as-user` drop; it refuses uid 0; it reports `N` slots, and the scheduler books them. (b)
 The kill execs `/bin/kill -9 -1` as the uid. The keeper switches to uid mode: on end-of-file
 it becomes the slot uid and runs the same kill. The memory watch sums the uid's processes. (c)
-The sandbox write rule adds the slot's real home and `/var/folders` entry; the `job-creation`,
-`lsopen` and `user-preference-write` denies go. `procs::Tracker` stays for Linux native only.
+The sandbox write rule adds the slot's real home and `/var/folders` entry; the `job-creation`
+and `user-preference-write` denies go, and `mach-register` and `file-mount` are denied besides. `procs::Tracker` stays for Linux native only.
 - **Exact kill.** The action double-forks a `setsid` sleeper, then exits. After the lease no
   process of the uid remains, and a `sleep` started by root, or as another slot, still lives.
   Mutants: kill by process group; kill from root by a pid list.
@@ -289,3 +289,53 @@ Open:
   keychain file that actions pass to `codesign --keychain`.
 - **D6. SIP off as the fallback.** If U5 shows one-click grants do not last: is SIP off on farm
   Macs (one recoveryOS visit each) acceptable, with the health check as the guard?
+
+## Slot profile canaries
+
+Before a lease is handed a slot, the daemon runs one probe per row below as the slot's user,
+under the exact profile generated for the lease (`crates/kbf-driver-native/src/slots/canary.rs`).
+A row not refused in its own form sets the slot aside. The profile rows are
+`SLOT_PROFILE` and `SLOT_NO_NETWORK_PROFILE` in `network.rs`.
+
+| canary | profile rule | the call | refused as |
+|---|---|---|---|
+| `write-outside` | `(deny file-write*)` | create a file in `/private/tmp` | `EPERM` or `EACCES` |
+| `link-outside` | `(deny file-write*)` | hard-link `/etc/hosts` into the lease | `EPERM` or `EACCES` |
+| `mach-register` | `(deny mach-register)` | `bootstrap_check_in` of a service name no job declares | `kern_return` 1100 (`BOOTSTRAP_NOT_PRIVILEGED`) |
+| `lsopen` | `(deny lsopen)` | `sandbox_check` of `lsopen`, the question Launch Services asks before it starts an application | denied (`sandbox=1`) |
+| `file-mount` | `(deny file-mount)` | `mount(2)` of a `devfs` on a directory of the lease | `EPERM` |
+| `launchd-bootstrap` | none: `(allow default)` | `launchctl bootstrap user/<uid>` of a `Background` `KeepAlive` agent whose file is in the lease | `Bootstrap failed: 5` |
+
+A slot user has no login session on a node, so `lsopen` cannot be seen working by opening an
+application: `open` and `LSOpenCFURLRef` failed or waited with the rule dropped as with it kept
+(measured on the runner). The canary asks the sandbox the question Launch Services asks. The
+`file-mount` canary mounts a `devfs` itself: a user may mount one on a directory it owns, and
+the runner showed that succeed with the rule dropped and fail with `EPERM` with it kept. On a
+node where `vfs.generic.usermount` is 0 a user cannot mount at all, so `EPERM` comes either way
+and the canary cannot see a missing rule there; the slot cannot mount either.
+
+For `mach-register` the service name is one no job declares, so with the rule dropped launchd
+answers 1102 (`BOOTSTRAP_UNKNOWN_SERVICE`), never success: the sandbox refuses before launchd
+looks the name up, with 1100 instead of 1102. The canary depends on that split, and a dropped
+rule is reported as a failure (not a refusal of this door), not as an open door: the log reads
+`could not run`, with `not a refusal of this door: kern=1102`, and `NOT refused: the call succeeded` is
+what a check-in answering 0 reads as. The `lsopen`
+canary shows that the rule is in the profile the process runs under, not that Launch Services
+refused an open. The `launchd-bootstrap` canary writes its job file with mode 0644, so the
+refusal is not a file launchd rejects for its permissions.
+
+Left open on purpose:
+
+- `job-creation`: launchd refuses a bootstrap from any sandboxed process, `(allow default)`
+  alone included, so there is no rule to add; the `launchd-bootstrap` canary asserts the
+  refusal whatever its cause, and a test shows it refused under a profile with no deny. The row proves that a bootstrap is refused in the slot environment, not that the sandbox is the reason: no profile rule governs it, so no change to the profile turns this canary red.
+- `ipc-posix*`: denying it breaks Python's `multiprocessing` and `xcodebuild`.
+- `hdiutil attach` with no mount point: it still mounts under `/Volumes` through
+  `diskimages-helper`, even with `(deny file-mount)`. The clean's unmount step and the death
+  of the helper remove it; the `file-mount` canary names a mount point, which the rule refuses.
+
+Measured once on a hosted macOS runner, not guarded by a kept test: cargo, clang, swiftc, git, a
+Python virtual environment and `swift build --disable-sandbox` ran with the three added denies.
+Not measured: anything that registers a Mach port by name (`CFMessagePort`, `NSMachPort`, an
+XCTest host), tools that attach a disk image on a named mount point, and macOS UI tests, which
+`lsopen` denial fails (error -54); a slot is back to not running them.
