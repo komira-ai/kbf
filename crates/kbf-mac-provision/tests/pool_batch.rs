@@ -333,9 +333,9 @@ fn a_half_made_pool_with_our_names_is_finished_not_refused() {
     let s = mac.state_mut();
     s.records.remove("/Groups/kbfpool");
     s.attr("/Groups/kbfpool", "Password", "*");
-    s.records.remove("/Users/kbf-pool-3");
+    s.remove_user("kbf-pool-3");
     s.user_attr("kbf-pool-3", "UserShell", "/usr/bin/false");
-    s.user_attr("kbf-pool-1", "UserShell", "/bin/zsh");
+    s.user_attr("kbf-pool-1", "UserShell", "/usr/bin/login");
     let r = apply_keys(&mac, Some("pool_users"));
     assert_eq!(r.failed, 0, "{}", r.text);
     assert!(!r.text.contains("no pool user changed"), "{}", r.text);
