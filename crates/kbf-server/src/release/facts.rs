@@ -90,7 +90,7 @@ mod tests {
     /// facts has its own value in the document, and the platform it names may be absent or
     /// the upload's own.
     ///
-    /// Mutant seen red: `min_protocol` taken from `protocol`.
+    /// Catches: `min_protocol` taken from `protocol`.
     #[test]
     fn the_facts_are_the_documents_fields() {
         let want = Facts {
@@ -108,7 +108,7 @@ mod tests {
     /// `Version` does not name (a newer kbf adds fields): the facts are the same with or
     /// without it. A malformed or contradicting document is still refused (the test below).
     ///
-    /// Mutant seen red: `deny_unknown_fields` on `kbf_types::Version`.
+    /// Catches: `deny_unknown_fields` on `kbf_types::Version`.
     #[test]
     fn a_field_a_newer_kbf_adds_does_not_change_the_facts() {
         let plain = of(&doc(|d| d)).expect("plain");
@@ -121,7 +121,7 @@ mod tests {
     /// zeros, a number past 32 bits and a minimum above the protocol. A minimum equal to
     /// the protocol and a zero minimum are fine.
     ///
-    /// Mutants seen red: the platform comparison dropped; `min_protocol > protocol` made
+    /// Catches: the platform comparison dropped; `min_protocol > protocol` made
     /// `>=`; the zero check dropped.
     #[test]
     fn a_document_that_contradicts_the_upload_or_the_node_is_refused() {

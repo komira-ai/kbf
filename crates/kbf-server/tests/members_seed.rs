@@ -57,7 +57,7 @@ fn a_report_with_a_zero_names_nothing() {
 
 /// Catches: a new instance that is not given the id its log names, or a boot not above the
 /// log's. Member 3 free, boot 5 reported: id 3 and boot 6; the next registration is 7.
-/// Mutant: the seed without the plus one (a loop of `floor` nexts) gives boot 5, red.
+/// Catches: the seed without the plus one (a loop of `floor` nexts) gives boot 5, red.
 #[test]
 fn a_new_instance_gets_the_id_its_log_names_and_a_boot_above_the_logs() {
     let s = Hooked::new();
@@ -88,7 +88,7 @@ fn a_reported_id_that_a_live_instance_holds_is_not_handed_out() {
 
 /// Catches: the free-id check that reads only the claim rows. A row written before claims
 /// existed (`instance/<name>` with the id, no `member-owner/` row) still holds its id.
-/// Mutant: `id_is_free` without the scan, red.
+/// Catches: `id_is_free` without the scan, red.
 #[test]
 fn an_id_held_by_a_row_without_a_claim_is_not_handed_out() {
     let s = Hooked::new();
@@ -116,7 +116,7 @@ fn two_nodes_naming_one_id_do_not_share_it() {
 
 /// Catches: a counter lowered by a report, and an instance's id changed by one. A known
 /// instance at boot 10 that reports boot 3 gets 11, and one that reports another id keeps
-/// its own. Mutant: the boot taken from the report (`last.boot + 1`) gives 4, red.
+/// its own. Catches: the boot taken from the report (`last.boot + 1`) gives 4, red.
 #[test]
 fn a_known_instance_is_never_given_a_lower_boot_or_another_id() {
     let s = Hooked::new();
@@ -134,7 +134,7 @@ fn a_known_instance_is_never_given_a_lower_boot_or_another_id() {
 
 /// Catches: a known instance (a store restored from an older copy) whose boot is not raised
 /// above its log's: id 1 at boot 2 in the store, the log at boot 9: the next boot is 10.
-/// Mutant: the raise lowered to `floor - boot` nexts gives 9, red.
+/// Catches: the raise lowered to `floor - boot` nexts gives 9, red.
 #[test]
 fn a_known_instance_behind_its_log_is_raised_above_it() {
     let s = Hooked::new();
@@ -219,7 +219,7 @@ fn a_known_instance_that_changes_under_a_registration_is_read_again() {
 /// (`ATTEMPTS` is 16). Every claim raises the counter to its id, so an honest first
 /// registration draws a free id at once instead of failing `Contended`. An id more than
 /// `MAX_SEED` ahead is not named.
-/// Mutant: the counter not raised in the claiming transaction (the `for _ in drawn..id.0`
+/// Catches: the counter not raised in the claiming transaction (the `for _ in drawn..id.0`
 /// loop removed), red: the honest node's 16 draws all land on claimed ids.
 #[test]
 fn a_registrant_cannot_squat_ids_ahead_of_the_counter() {

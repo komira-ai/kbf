@@ -105,7 +105,7 @@ fn capture(log: &Log) -> tracing::subscriber::DefaultGuard {
 
 /// Catches a `serve` that warns, or waits, when the cold store is released in time: the
 /// only handle on the store is the node's, dropped by `serve`, so it returns with no
-/// virtual time passed and nothing logged. Mutant: the warning is unconditional.
+/// virtual time passed and nothing logged. Catches: the warning is unconditional.
 #[tokio::test(start_paused = true)]
 async fn serve_returns_at_once_and_quietly_when_the_store_is_released() {
     let dir = scratch("quiet");
@@ -128,7 +128,7 @@ async fn serve_returns_at_once_and_quietly_when_the_store_is_released() {
 /// Catches a `serve` that waits for a leaked handle with no end (a production stop that
 /// never finishes), one that gives up early or late, and one that does not say so: with
 /// a clone of the cold store kept, `serve` returns after exactly the deadline of virtual
-/// time with one warning naming the directory and the live handles. Mutant: the deadline
+/// time with one warning naming the directory and the live handles. Catches: the deadline
 /// arm never warns.
 #[tokio::test(start_paused = true)]
 async fn serve_gives_up_at_the_deadline_with_one_warning_naming_the_handles() {
@@ -152,7 +152,7 @@ async fn serve_gives_up_at_the_deadline_with_one_warning_naming_the_handles() {
 /// Catches the variant the tests call reporting a leaked handle as released (a leak that
 /// then passes unseen), or ignoring its limit: with a clone kept it returns `StillHeld`
 /// naming the one handle, after exactly the limit given, and says nothing in the log.
-/// Mutant: the variant turns the `StillHeld` into `Ok`.
+/// Catches: the variant turns the `StillHeld` into `Ok`.
 #[tokio::test(start_paused = true)]
 async fn serve_checked_reports_a_leaked_handle_at_its_own_limit() {
     let dir = scratch("checked");
@@ -176,7 +176,7 @@ async fn serve_checked_reports_a_leaked_handle_at_its_own_limit() {
 /// still be running then and finish, with no warning, once the clone is gone. No clock
 /// but the runtime's: it only moves when every task is idle, and `serve` is idle at its
 /// wait. The drop is on the test's own task, so no thread's timing decides anything.
-/// Mutant: `serve` skips the wait.
+/// Catches: `serve` skips the wait.
 #[tokio::test(start_paused = true)]
 async fn serve_waits_for_a_held_clone_and_returns_when_it_is_dropped() {
     let dir = scratch("held");
