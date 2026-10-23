@@ -22,9 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use super::command::Command;
 use super::node_step::HostPhase;
-use super::policy::Policy;
 use super::slot::{Slot, SlotClass};
-use crate::storage_gate::{GateFail, GateMode, MemberFacts, storage_gate};
+use crate::storage_gate::MemberFacts;
 use crate::update_status::ReleaseSource;
 
 /// A release, by whatever the controller compares: a commit or a software-set digest.
@@ -152,12 +151,6 @@ pub struct DaemonLoad {
 }
 
 impl DaemonLoad {
-    /// A host with nothing to wait for (section 2.7, daemon half).
-    #[must_use]
-    pub const fn is_idle(&self) -> bool {
-        self.leases == 0 && self.undelivered == 0 && !self.whole_machine_hold
-    }
-
     /// The load D3 ranks hosts by: leases and undelivered claims. A whole-machine hold
     /// weighs as one lease.
     #[must_use]
@@ -259,13 +252,6 @@ impl HostRecord {
         }
     }
 
-    /// Whether the host was deferred in the run `run` (it missed its lease wait once, and
-    /// is not forced again). A `Deferred` row of an earlier run is a fresh start.
-    #[must_use]
-    pub fn was_deferred_in(&self, run: Generation) -> bool {
-        self.phase == HostPhase::Deferred && self.generation >= run
-    }
-
     /// The commands a controller that restarted runs again for the phase it reads: the
     /// phase's entry commands, with this row's own activation order.
     #[must_use]
@@ -332,53 +318,6 @@ impl HostFacts {
         matches!(self.kind, HostKind::StorageAndDaemon)
     }
 
-    /// Whether it is a Mac.
-    #[must_use]
-    pub const fn is_mac(&self) -> bool {
-        matches!(self.platform, Platform::Mac(_))
-    }
-
-    /// Whether it reports both write counts.
-    #[must_use]
-    pub const fn writes_reported(&self) -> bool {
-        self.open_writes.is_some() && self.routed_writes.is_some()
-    }
-
-    /// Whether no write is open on it or on its way to it. An unreported count is not
-    /// zero.
-    #[must_use]
-    pub fn writes_quiet(&self) -> bool {
-        self.open_writes == Some(0) && self.routed_writes == Some(0)
-    }
-
-    /// Whether it reports `target` as its release and its stream is open: the daemon half
-    /// is back, at the release, and can take work (section 2.6, step 7 and 2.10).
-    #[must_use]
-    pub fn is_back_at(&self, target: &Release) -> bool {
-        self.connected && self.release.as_ref() == Some(target)
-    }
-
-    /// The release its package carries, if it reports one ([`HostFacts::available`]).
-    #[must_use]
-    pub fn packaged(&self) -> Option<&Release> {
-        self.available.as_ref().map(|have| &have.commit)
-    }
-
-    /// Whether its package carries `target`: the whole name of one equals the whole name of
-    /// the other, so a prefix of the commit is not the release.
-    #[must_use]
-    pub fn carries(&self, target: &Release) -> bool {
-        self.packaged() == Some(target)
-    }
-
-    /// Whether it can take work now, as the capacity floor counts it: connected, placement
-    /// shows it uncordoned (unknown is not), and its record says it is not in a step. The
-    /// record counts as well as placement because placement lags a cordon that was ordered.
-    #[must_use]
-    pub fn is_serving(&self) -> bool {
-        self.connected && self.cordoned == Some(false) && !self.record.phase.in_step()
-    }
-
     /// Which slot the host takes when a run claims one for it.
     #[must_use]
     pub const fn slot_class(&self) -> SlotClass {
@@ -420,24 +359,6 @@ pub struct Facts {
 }
 
 impl Facts {
-    /// The facts of no run: only the storage `members`, with no host and the defaults for
-    /// the rest. It is what the storage gate is asked over when no run is under way (the
-    /// operator API's safe-to-stop query), so that the API names none of the fields.
-    #[must_use]
-    pub fn of_members(members: Vec<MemberFacts>) -> Self {
-        Self {
-            target: Release::new(""),
-            source: Source::default(),
-            generation: Generation(0),
-            next_order: OrderId::new(0, 0),
-            hosts: Vec::new(),
-            members,
-            slot: Slot::default(),
-            queued_classes: None,
-            wait_since: FarmTime::from_millis(0),
-        }
-    }
-
     /// The host `id`, if the run has it.
     #[must_use]
     pub fn host(&self, id: &WorkerId) -> Option<&HostFacts> {
@@ -448,129 +369,5 @@ impl Facts {
     #[must_use]
     pub fn member(&self, id: MemberId) -> Option<&MemberFacts> {
         self.members.iter().find(|m| m.id == id)
-    }
-
-    /// How many hosts other than `host`, of its platform (a Linux host or a Mac of its
-    /// class), can take work now: connected, not cordoned and not in a step
-    /// ([`HostFacts::is_serving`]). Placement unknown does not count. This is what remains
-    /// if `host` is cordoned (section 2.8, `min_serving`).
-    #[must_use]
-    pub fn serving_peers(&self, host: &HostFacts) -> usize {
-        self.serving_peers_without(host, &[])
-    }
-
-    /// [`Facts::serving_peers`] with the hosts `gone` counted out as well: the hosts the
-    /// picker has already chosen in the same look, which are not yet shown cordoned.
-    #[must_use]
-    pub fn serving_peers_without(&self, host: &HostFacts, gone: &[&WorkerId]) -> usize {
-        self.hosts
-            .iter()
-            .filter(|other| {
-                other.id != host.id
-                    && other.platform == host.platform
-                    && other.is_serving()
-                    && !gone.contains(&&other.id)
-            })
-            .count()
-    }
-
-    /// What the node step reads about host `id`; `None` if the run does not have it.
-    #[must_use]
-    pub fn observe(&self, id: &WorkerId) -> Option<Observations<'_>> {
-        self.host(id).map(|host| self.observe_host(host))
-    }
-
-    /// What the node step reads of `host`, a host the caller already holds.
-    pub(crate) const fn observe_host<'a>(&'a self, host: &'a HostFacts) -> Observations<'a> {
-        Observations { facts: self, host }
-    }
-}
-
-/// Who holds `update/slot`, from one host's side.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SlotView {
-    /// This host.
-    Mine,
-    /// Others: the slot of the host's class is full, so the claim was lost.
-    Other,
-    /// Room in the host's class, or the claim is not yet visible.
-    Free,
-}
-
-/// What the node step reads about one host: its own facts, its row and the fleet's. A view
-/// of a [`Facts`], so the two cannot disagree.
-#[derive(Clone, Copy, Debug)]
-pub struct Observations<'a> {
-    facts: &'a Facts,
-    host: &'a HostFacts,
-}
-
-impl<'a> Observations<'a> {
-    /// The host.
-    #[must_use]
-    pub const fn host(&self) -> &'a HostFacts {
-        self.host
-    }
-
-    /// The host's row.
-    #[must_use]
-    pub const fn record(&self) -> &'a HostRecord {
-        &self.host.record
-    }
-
-    /// The fleet.
-    #[must_use]
-    pub const fn facts(&self) -> &'a Facts {
-        self.facts
-    }
-
-    /// The release the run drives to.
-    #[must_use]
-    pub const fn target(&self) -> &'a Release {
-        &self.facts.target
-    }
-
-    /// The host's storage member, if it is linked and `Members` lists it.
-    #[must_use]
-    pub fn member(&self) -> Option<&'a MemberFacts> {
-        self.host.member.and_then(|id| self.facts.member(id))
-    }
-
-    /// Whether the host holds a slot: it does, or the slot of its class is full of others
-    /// (`max_hosts_out` is the room for daemon-only hosts and Macs), or there is room and
-    /// the claim is not visible yet.
-    #[must_use]
-    pub fn slot(&self, max_hosts_out: usize) -> SlotView {
-        let slot = &self.facts.slot;
-        if slot.holds(&self.host.id) {
-            SlotView::Mine
-        } else if slot.has_room(self.host.slot_class(), max_hosts_out) {
-            SlotView::Free
-        } else {
-            SlotView::Other
-        }
-    }
-
-    /// What the helper reported about this update's activation order. A status that names
-    /// another order, an older update's or one this row does not know, is no report.
-    #[must_use]
-    pub fn report(&self) -> Option<HelperStatus> {
-        self.host
-            .helper
-            .filter(|report| report.order == self.host.record.order)
-            .map(|report| report.status)
-    }
-
-    /// G_S with this host out (or in), if it has a storage half; a daemon-only host has
-    /// no gate (section 2.6).
-    ///
-    /// # Errors
-    /// The first thing that keeps the gate shut, the worst first ([`GateFail`]).
-    pub fn gate(&self, mode: GateMode, policy: &Policy, now: FarmTime) -> Result<(), GateFail> {
-        if !self.host.is_storage() {
-            return Ok(());
-        }
-        let own = self.host.member.ok_or(GateFail::Unlinked)?;
-        storage_gate(&self.facts.members, own, mode, policy.ttl, now)
     }
 }

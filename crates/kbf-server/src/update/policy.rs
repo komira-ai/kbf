@@ -3,8 +3,6 @@
 
 use std::time::Duration;
 
-use super::facts::Platform;
-
 /// Every setting and limit of a node update. [`Policy::default`] is the design's defaults, but
 /// for `auto_nodes`, which the design leaves false until two click-through runs are clean
 /// (`split-mode-updates.md` Q7) and which is true here (see the field).
@@ -136,15 +134,6 @@ pub enum PolicyError {
 }
 
 impl Policy {
-    /// How long step 3 waits for the leases of a host on `platform`.
-    #[must_use]
-    pub const fn lease_limit_for(&self, platform: &Platform) -> Duration {
-        match platform {
-            Platform::Linux => self.lease_limit,
-            Platform::Mac(_) => self.mac_lease_limit,
-        }
-    }
-
     /// How long a planned-down node may take to be back: the dwell less two time-to-lives
     /// (section 2.6: "alerts at dwell minus two TTLs instead of waiting for the dwell to
     /// decide"), because the dwell's end drops the member and starts re-replication.

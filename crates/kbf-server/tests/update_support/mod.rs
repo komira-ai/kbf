@@ -1,5 +1,5 @@
-//! Builders for the node-step and picker tests: hosts and members with healthy defaults,
-//! and a test changes the one field it is about.
+//! Builders for the update tests: hosts and members with healthy defaults, and a test
+//! changes the one field it is about.
 //!
 //! Every test reads the world at [`NOW`]. Time passes by moving the other end: `since`
 //! earlier for a step that has waited, `wait_since` earlier for a picker that has waited,
@@ -11,9 +11,9 @@ use std::collections::BTreeSet;
 
 use kbf_map::{MemberId, MemberState};
 use kbf_server::update::{
-    Alert, AvailableFact, Command, DaemonLoad, Facts, Generation, GiveBack, HelperReport,
-    HelperStatus, Holder, HostFacts, HostKind, HostPhase, HostRecord, MemberFacts, OrderId,
-    Platform, PlatformClass, Policy, Release, Slot, SlotClass, SlotOp, Source, Transition, step,
+    AvailableFact, Command, DaemonLoad, Facts, Generation, HelperReport, HelperStatus, Holder,
+    HostFacts, HostKind, HostPhase, HostRecord, MemberFacts, OrderId, Platform, PlatformClass,
+    Policy, Release, Slot, SlotClass, Source,
 };
 use kbf_server::update_status::ReleaseSource;
 use kbf_types::{FarmTime, WorkerId};
@@ -75,11 +75,6 @@ pub const fn report(status: HelperStatus) -> Option<HelperReport> {
         order: ORDER,
         status,
     })
-}
-
-/// What a helper reports about some other order.
-pub const fn report_of(order: OrderId, status: HelperStatus) -> Option<HelperReport> {
-    Some(HelperReport { order, status })
 }
 
 /// The activate order a move issues when it enters `Activating`: the fleet's next id.
@@ -194,15 +189,6 @@ pub fn hold(facts: &mut Facts, name: &str) {
     hold_as(facts, name, SlotClass::Host);
 }
 
-/// The member `n` of `facts`, to change.
-pub fn member_mut(facts: &mut Facts, n: u64) -> &mut MemberFacts {
-    facts
-        .members
-        .iter_mut()
-        .find(|m| m.id == MemberId(n))
-        .expect("the member is in the facts")
-}
-
 /// The host `name` of `facts`, to change.
 pub fn host_mut<'a>(facts: &'a mut Facts, name: &str) -> &'a mut HostFacts {
     facts
@@ -227,118 +213,4 @@ pub fn package(facts: &mut Facts, name: &str, commit: &str, release_source: Rele
 /// The defaults of the design.
 pub fn policy() -> Policy {
     Policy::default()
-}
-
-/// Three storage hosts `s1..s3` on members `1..3`, `s1` cordoned and holding the slot.
-pub fn storage_fleet() -> Facts {
-    let hosts = vec![storage("s1", 1), storage("s2", 2), storage("s3", 3)];
-    let mut f = facts(hosts, members(3));
-    hold(&mut f, "s1");
-    host_mut(&mut f, "s1").cordoned = Some(true);
-    f
-}
-
-/// Two Linux daemon-only hosts, `d1` cordoned and holding the slot, over three healthy
-/// members that no host is linked to.
-pub fn linux_fleet() -> Facts {
-    let mut f = facts(vec![linux("d1"), linux("d2")], members(3));
-    hold(&mut f, "d1");
-    host_mut(&mut f, "d1").cordoned = Some(true);
-    f
-}
-
-/// A world in which `s1` is in `phase` (a step from 2 to 9) and every condition lets it
-/// stay: nothing it waits for has happened, and it is cordoned.
-pub fn waiting_in(phase: &HostPhase) -> Facts {
-    let mut f = storage_fleet();
-    match phase {
-        HostPhase::Cordoned => host_mut(&mut f, "s1").cordoned = Some(false),
-        HostPhase::WaitingLeases => host_mut(&mut f, "s1").load = Some(busy(1)),
-        HostPhase::PlannedDown => {
-            member_mut(&mut f, 1).planned_down = true;
-            host_mut(&mut f, "s1").open_writes = Some(2);
-        }
-        HostPhase::Gated => {
-            member_mut(&mut f, 1).planned_down = true;
-            member_mut(&mut f, 2).heard_at = Some(t(NOW - 12));
-        }
-        HostPhase::Activating => {
-            member_mut(&mut f, 1).planned_down = true;
-            member_mut(&mut f, 1).down_since = Some(t(NOW - 20));
-        }
-        HostPhase::RejoiningStorage => {
-            member_mut(&mut f, 1).planned_down = true;
-            member_mut(&mut f, 1).down_since = Some(t(NOW - 20));
-            host_mut(&mut f, "s1").helper = report(HelperStatus::ActivatedUnconfirmed);
-        }
-        HostPhase::Repairing => {
-            member_mut(&mut f, 1).boot = Some(BOOT + 1);
-            member_mut(&mut f, 2).repair_debt = Some(4);
-            host_mut(&mut f, "s1").helper = report(HelperStatus::ActivatedUnconfirmed);
-            host_mut(&mut f, "s1").release = Some(Release::new(NEW));
-        }
-        HostPhase::Confirming => {
-            host_mut(&mut f, "s1").helper = report(HelperStatus::ActivatedUnconfirmed);
-        }
-        other => panic!("{other:?} is not a waiting step"),
-    }
-    f
-}
-
-/// One call of [`step`] for host `name`, whose row is made to say it entered `phase`
-/// `waited` seconds before [`NOW`], under `policy`.
-pub fn step_for(
-    facts: &Facts,
-    name: &str,
-    phase: &HostPhase,
-    waited: u64,
-    policy: &Policy,
-) -> Transition {
-    let mut f = facts.clone();
-    let record = &mut host_mut(&mut f, name).record;
-    record.phase = phase.clone();
-    record.since = t(NOW - waited);
-    let obs = f.observe(&id(name)).expect("the host is in the facts");
-    step(&obs, policy, t(NOW))
-}
-
-/// [`step_for`] under the default policy.
-pub fn run(facts: &Facts, name: &str, phase: &HostPhase, waited: u64) -> Transition {
-    step_for(facts, name, phase, waited, &policy())
-}
-
-/// [`step`] for host `name` as its row stands, under the default policy, at [`NOW`].
-pub fn run_row(facts: &Facts, name: &str) -> Transition {
-    let obs = facts.observe(&id(name)).expect("the host is in the facts");
-    step(&obs, &policy(), t(NOW))
-}
-
-/// Records a move in the row of `name` the way the controller does: the phase, the time it
-/// was entered, and the order and boot counter the move names (counting the order used).
-pub fn record_move(facts: &mut Facts, name: &str, moved: &Transition, now: FarmTime) {
-    let host = host_mut(facts, name);
-    if moved.next != host.record.phase {
-        host.record.since = now;
-    }
-    host.record.phase = moved.next.clone();
-    if let Some(boot) = moved.boot {
-        host.record.boot_before = Some(boot);
-    }
-    if let Some(order) = moved.order {
-        host.record.order = order;
-        facts.next_order = order.next();
-    }
-}
-
-/// The commands of giving a host back: the mark undone if it was written, uncordon, the
-/// slot freed, the alert.
-pub fn gave_back(undo_mark: bool, why: GiveBack) -> Vec<Command> {
-    let mut commands = Vec::new();
-    if undo_mark {
-        commands.push(Command::Undown);
-    }
-    commands.push(Command::Uncordon);
-    commands.push(Command::CasSlot(SlotOp::Release));
-    commands.push(Command::Alert(Alert::GaveBack(why)));
-    commands
 }
