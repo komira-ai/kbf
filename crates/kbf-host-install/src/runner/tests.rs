@@ -353,8 +353,8 @@ fn output_past_its_cap_is_dropped_and_the_child_still_finishes() {
 
     // Standard error is kept up to a fixed amount.
     let noisy = within(
-        "/bin/sh",
-        &["-c", "/usr/bin/head -c 20000000 /dev/zero >&2"],
+        "/usr/bin/dd",
+        &["if=/dev/zero", "of=/dev/stderr", "bs=1048576", "count=20"],
         Duration::from_secs(60),
     );
     let exec = SystemRunner.run(&noisy).unwrap();
