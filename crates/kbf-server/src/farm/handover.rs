@@ -236,11 +236,12 @@ impl State {
         &mut self,
         request: &kbf_sched::Request,
         subject: &crate::action_usage::Subject,
+        size_key: Option<u64>,
     ) -> Result<(), Status> {
         if self.fenced {
             return Err(Status::unavailable(HANDING_OVER));
         }
-        self.queue(request, subject)
+        self.queue(request, subject, size_key)
     }
 
     /// The callers of `operation` still waiting: not answered, and with a stream open

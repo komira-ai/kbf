@@ -42,6 +42,22 @@
 //! costs one more killed run per key, never a wrong answer. At most [`MEMORY_FLOORS`] are
 //! kept; past that the one raised longest ago is forgotten first. A floor never falls.
 //!
+//! **Key floors.** An operation given a size key ([`Scheduler::set_size_key`], fed by the
+//! caller while the farm learns sizes) also leaves a floor under that key when it is
+//! killed at its own limit, so a changed digest of the same key starts where the
+//! last one ended instead of climbing the ladder again. The floor is the rung the kill
+//! retries at, kept strictly below the memory of the largest live node that could run
+//! the request ([`Scheduler::key_floor_bound`]): a booking at a node's whole memory owns
+//! the node, and above that bound the digest floor and the ladder decide as they do
+//! without a key floor. A raise never books a smaller worker whole either: a worker whose
+//! memory it equals is skipped, and with no other worker the operation books what it
+//! asked for. It is applied at every placement round, to every queued
+//! operation of the key, writing the operation's request (so the lease books it); a joined twin or an operation queued before
+//! the kill gets it too. A kill of an attempt booked below the floor already in force
+//! belongs to the event that set it (`kbf_estimator::kill_floor`), so a burst of kills
+//! of one key raises it one rung, not one per kill. A key floor never falls and is
+//! written down with the requeue, as a digest floor is.
+//!
 //! **One value.** Everything this module keeps (the floors and the order they were
 //! raised in, each held operation's memory runs, each node's busy-node kills) is one
 //! [`MemoryState`], which compares with `Eq`: two schedulers
@@ -50,9 +66,11 @@
 use std::collections::BTreeMap;
 
 use kbf_types::{
-    ActionKey, Failure, FarmFault, MemoryKill, MemoryRun, OperationId, ResultRecord, WorkerId,
+    ActionKey, Failure, FarmFault, LeaseKind, MemoryKill, MemoryRun, OperationId, ResultRecord,
+    WorkerId,
 };
 
+use super::KeyApplied;
 use super::Scheduler;
 use crate::input::Request;
 use crate::requeue::RequeueReason;
@@ -186,7 +204,9 @@ impl Default for MemoryLadder {
 /// differ.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryState {
-    floors: Floors,
+    floors: Floors<ActionKey>,
+    /// The floors by size key, with the order they were raised in.
+    key_floors: Floors<u64>,
     /// The operations with a memory kill, while the scheduler holds them.
     ops: BTreeMap<OperationId, OpKills>,
     /// How many leases each node has killed under memory pressure, for every node
@@ -205,6 +225,7 @@ impl MemoryState {
     const fn new(bound: usize) -> Self {
         Self {
             floors: Floors::new(bound),
+            key_floors: Floors::new(bound),
             ops: BTreeMap::new(),
             pressure: BTreeMap::new(),
         }
@@ -247,22 +268,22 @@ struct OpKills {
     runs: Vec<MemoryRun>,
 }
 
-/// The memory floors by action key, each with the order it was raised in, and the keys
-/// in that order, so the oldest is forgotten first once there are too many.
+/// The memory floors by key, each with the order it was raised in, and the keys in that
+/// order, so the oldest is forgotten first once there are too many.
 ///
 /// `evicted` holds the keys forgotten since the caller last took them
 /// ([`Scheduler::take_floor_change`]), for the state store to forget too. It is
 /// bookkeeping for that write and takes no part in equality.
 #[derive(Clone, Debug)]
-struct Floors {
-    asks: BTreeMap<ActionKey, (u64, u64)>,
-    order: BTreeMap<u64, ActionKey>,
+struct Floors<K> {
+    asks: BTreeMap<K, (u64, u64)>,
+    order: BTreeMap<u64, K>,
     next: u64,
     bound: usize,
-    evicted: Vec<ActionKey>,
+    evicted: Vec<K>,
 }
 
-impl PartialEq for Floors {
+impl<K: PartialEq> PartialEq for Floors<K> {
     fn eq(&self, other: &Self) -> bool {
         // `order` is `asks` read the other way round (each stamp to its key), so it
         // is equal whenever `asks` is and takes no part here.
@@ -270,9 +291,9 @@ impl PartialEq for Floors {
     }
 }
 
-impl Eq for Floors {}
+impl<K: Eq> Eq for Floors<K> {}
 
-impl Floors {
+impl<K: Clone + Ord> Floors<K> {
     const fn new(bound: usize) -> Self {
         Self {
             asks: BTreeMap::new(),
@@ -283,21 +304,17 @@ impl Floors {
         }
     }
 
-    fn get(&self, key: &ActionKey) -> Option<u64> {
+    fn get(&self, key: &K) -> Option<u64> {
         self.asks.get(key).map(|&(ask, _)| ask)
     }
 
     /// `key`'s floor with the stamp it was raised under.
-    fn row(&self, key: &ActionKey) -> Option<Floor> {
-        self.asks.get(key).map(|&(ask, stamp)| Floor {
-            key: key.clone(),
-            ask,
-            stamp,
-        })
+    fn stamped(&self, key: &K) -> Option<(u64, u64)> {
+        self.asks.get(key).copied()
     }
 
     /// Raises `key`'s floor to `ask` (it never falls), and makes it the newest.
-    fn raise(&mut self, key: &ActionKey, ask: u64) {
+    fn raise(&mut self, key: &K, ask: u64) {
         let stamp = self.next;
         self.next += 1;
         let before = self.asks.remove(key).map_or(0, |(before, at)| {
@@ -307,6 +324,22 @@ impl Floors {
         self.asks.insert(key.clone(), (before.max(ask), stamp));
         self.order.insert(stamp, key.clone());
         self.evict();
+    }
+
+    /// Lowers `key`'s floor to `ask` (0 forgets it), keeping its place in the order; never
+    /// raises. The stamp it keeps, if the floor changed.
+    fn lower(&mut self, key: &K, ask: u64) -> Option<u64> {
+        let &(before, stamp) = self.asks.get(key)?;
+        if ask >= before {
+            return None;
+        }
+        if ask == 0 {
+            self.asks.remove(key);
+            self.order.remove(&stamp);
+        } else {
+            self.asks.insert(key.clone(), (ask, stamp));
+        }
+        Some(stamp)
     }
 
     /// Forgets the floors raised longest ago until no more than the bound remain.
@@ -320,8 +353,8 @@ impl Floors {
 
     /// Takes up `floors` (empty so far, with stamps no two alike) in the order their
     /// stamps give, and raises later floors past the largest stamp.
-    fn restore(&mut self, floors: Vec<Floor>) {
-        for Floor { key, ask, stamp } in floors {
+    fn restore(&mut self, floors: impl IntoIterator<Item = (K, u64, u64)>) {
+        for (key, ask, stamp) in floors {
             self.asks.insert(key.clone(), (ask, stamp));
             self.order.insert(stamp, key);
             self.next = self.next.max(stamp.saturating_add(1));
@@ -342,6 +375,19 @@ pub struct Floor {
     pub stamp: u64,
 }
 
+/// One key floor as the state store keeps it: the floor an operation with size key `key`
+/// books at least.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyFloor {
+    /// The size key.
+    pub key: u64,
+    /// The least memory a request of `key` books, in bytes.
+    pub ask: u64,
+    /// When it was raised, among the key floors: a larger stamp is a later raise. Equal
+    /// for no two key floors.
+    pub stamp: u64,
+}
+
 /// What a memory kill changed in the scheduler's floors, to write down with the requeue
 /// that follows it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -351,6 +397,12 @@ pub struct FloorChange {
     pub raised: Option<Floor>,
     /// The keys forgotten since the last change was taken, to forget in the store too.
     pub evicted: Vec<ActionKey>,
+    /// The key floor of the operation's `size_key`, as it stands now; `None` when the
+    /// operation has none.
+    pub key_raised: Option<KeyFloor>,
+    /// The size keys forgotten since the last change was taken, to forget in the store
+    /// too.
+    pub key_evicted: Vec<u64>,
 }
 
 impl Scheduler {
@@ -377,17 +429,28 @@ impl Scheduler {
     }
 
     /// The floor change `operation`'s newest requeue made, to write down for a successor:
-    /// the floor of its action as it stands, and every floor forgotten since the last
-    /// call (the caller owns those now). Empty for an operation the scheduler no longer
-    /// holds.
+    /// the floors of its action and of its size key as they stand, and every floor
+    /// forgotten since the last call (the caller owns those now). Empty for an operation
+    /// the scheduler no longer holds.
     pub fn take_floor_change(&mut self, operation: OperationId) -> FloorChange {
-        let raised = self
-            .ops
-            .get(&operation)
-            .and_then(|op| self.memory.floors.row(&op.request.key));
+        let request = self.ops.get(&operation).map(|op| &op.request);
+        let raised = request.and_then(|r| {
+            let (ask, stamp) = self.memory.floors.stamped(&r.key)?;
+            Some(Floor {
+                key: r.key.clone(),
+                ask,
+                stamp,
+            })
+        });
+        let key_raised = self.floor_key(operation).and_then(|key| {
+            let (ask, stamp) = self.memory.key_floors.stamped(&key)?;
+            Some(KeyFloor { key, ask, stamp })
+        });
         FloorChange {
             raised,
             evicted: std::mem::take(&mut self.memory.floors.evicted),
+            key_raised,
+            key_evicted: std::mem::take(&mut self.memory.key_floors.evicted),
         }
     }
 
@@ -395,7 +458,191 @@ impl Scheduler {
     /// [`Scheduler::recover`]. Past the bound, the ones raised longest ago are forgotten
     /// (and reported by [`Scheduler::take_floor_change`]).
     pub fn restore_floors(&mut self, floors: Vec<Floor>) {
-        self.memory.floors.restore(floors);
+        let rows = floors.into_iter().map(|f| (f.key, f.ask, f.stamp));
+        self.memory.floors.restore(rows);
+    }
+
+    /// [`Scheduler::restore_floors`] for the key floors.
+    pub fn restore_key_floors(&mut self, floors: Vec<KeyFloor>) {
+        let rows = floors.into_iter().map(|f| (f.key, f.ask, f.stamp));
+        self.memory.key_floors.restore(rows);
+    }
+
+    /// Names the key `operation`'s kill-driven memory floor is kept under, which the
+    /// caller derives (from the instance, the platform class, the instrument and the
+    /// action's shape) and keeps in its own rows: no scheduler input and no log record
+    /// carries it. Set it for an operation the scheduler is about to allocate (its
+    /// [`Scheduler::next_operation`], when the caller knows the submit will not join a
+    /// twin) before the submit is fed, so the first placement round sees it, and again for
+    /// one taken up after a restart. A recovered lease keeps the request the store holds:
+    /// the floor raises queued operations only. Dropped with the operation.
+    pub fn set_size_key(&mut self, operation: OperationId, size_key: u64) {
+        self.size_keys.insert(operation, size_key);
+    }
+
+    /// The key of the floor `operation` is subject to: its size key, for a plain `action`
+    /// without GPUs. Other kinds book a share of the worker or all of it, not a size
+    /// learned from earlier runs.
+    fn floor_key(&self, operation: OperationId) -> Option<u64> {
+        let request = &self.ops.get(&operation)?.request;
+        self.size_keys
+            .get(&operation)
+            .copied()
+            .filter(|_| request.kind == LeaseKind::Action && request.resources.gpus == 0)
+    }
+
+    /// Lowers the key floor of `size_key` to `ask` bytes, or forgets it for 0, once the
+    /// caller has decided it is no longer needed (a floor never falls on its own). Never
+    /// raises. Operations already raised keep what they were given. Returns the floor as
+    /// it stands, for the caller to write down (an `ask` of 0: the row to delete), or
+    /// `None` if there was no floor above `ask`.
+    pub fn lower_key_floor(&mut self, size_key: u64, ask: u64) -> Option<KeyFloor> {
+        let stamp = self.memory.key_floors.lower(&size_key, ask)?;
+        Some(KeyFloor {
+            key: size_key,
+            ask,
+            stamp,
+        })
+    }
+
+    /// The key floor of `size_key`, in bytes: the memory a queued operation with it
+    /// books at least at a placement round, within [`Scheduler::key_floor_bound`].
+    #[must_use]
+    pub fn key_floor(&self, size_key: u64) -> Option<u64> {
+        self.memory.key_floors.get(&size_key)
+    }
+
+    /// The key floor of `size_key` as the state store keeps it (with its stamp), if the
+    /// scheduler holds one.
+    #[must_use]
+    pub fn key_floor_row(&self, size_key: u64) -> Option<KeyFloor> {
+        let (ask, stamp) = self.memory.key_floors.stamped(&size_key)?;
+        Some(KeyFloor {
+            key: size_key,
+            ask,
+            stamp,
+        })
+    }
+
+    /// The bound a key floor of `request` stays strictly below, in bytes: the memory of
+    /// the largest live node (cordoned or not) that serves its lease kind, satisfies its
+    /// platform and holds its CPU and GPU request. A booking at or above a node's memory
+    /// owns the node, so a key floor never reaches it. 0 when no live node could run
+    /// the request: it then has no key floor.
+    #[must_use]
+    pub fn key_floor_bound(&self, request: &Request) -> u64 {
+        let wanted = request.resources;
+        self.workers
+            .values()
+            .filter(|w| {
+                w.alive(self.now)
+                    && serves(&w.caps, request.kind)
+                    && request.needs.matches(&w.caps)
+                    && w.capacity.cpu_millis >= wanted.cpu_millis
+                    && w.capacity.gpus >= wanted.gpus
+            })
+            .map(|w| w.capacity.memory_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// [`Scheduler::key_floor_bound`] for the request of `operation`; 0 for one the
+    /// scheduler does not hold.
+    #[must_use]
+    pub fn key_floor_bound_of(&self, operation: OperationId) -> u64 {
+        self.ops
+            .get(&operation)
+            .map_or(0, |op| self.key_floor_bound(&op.request))
+    }
+
+    /// Raises the queued or leased `operation`'s memory to its key's floor, kept under
+    /// `bound` (the live bound of [`Scheduler::key_floor_bound`] when `None`;
+    /// [`kbf_estimator::floor_ceiling`]), and remembers what it booked before so
+    /// [`Scheduler::reclamp_key_floor`] can undo it. Writes the operation's request: the
+    /// lease books it, and a successor recomputes the same booking.
+    pub(super) fn raise_to_key_floor(&mut self, id: OperationId, bound: Option<u64>) {
+        let op = &self.ops[&id];
+        let Some(ask) = self
+            .floor_key(id)
+            .and_then(|key| self.memory.key_floors.get(&key))
+        else {
+            return;
+        };
+        if op.key_applied.is_some_and(|a| a.undone) {
+            return;
+        }
+        let held = op.request.resources.memory_bytes;
+        if ask <= held {
+            return;
+        }
+        let bound = bound.unwrap_or_else(|| self.key_floor_bound(&op.request));
+        let to = ask.min(kbf_estimator::floor_ceiling(bound));
+        if to <= held {
+            return;
+        }
+        let op = self.ops.get_mut(&id).expect("checked above");
+        let base = op.key_applied.map_or(held, |applied| applied.base);
+        op.key_applied = Some(KeyApplied {
+            base,
+            applied: to,
+            undone: false,
+        });
+        op.request.resources.memory_bytes = to;
+    }
+
+    /// A placement round's key floor raise for every queued operation, within the live
+    /// bound of each ([`Scheduler::key_floor_bound`]). Nothing to do while no key floor
+    /// is held.
+    pub(super) fn apply_key_floors(&mut self) {
+        if self.memory.key_floors.asks.is_empty() {
+            return;
+        }
+        let queued: Vec<OperationId> = self.queue.iter().map(|&(_, id)| id).collect();
+        for id in queued {
+            self.raise_to_key_floor(id, None);
+        }
+    }
+
+    /// A queued operation whose memory a key floor raised and that no live worker is
+    /// large enough for (the node that made the floor possible left): lowers it to the
+    /// largest size a live node could give, not below what it booked before the floor,
+    /// and returns whether it changed. Anything else that raised its memory since (a
+    /// kill's rung) is left alone.
+    pub(super) fn reclamp_key_floor(&mut self, id: OperationId) -> bool {
+        let op = &self.ops[&id];
+        let Some(applied) = op
+            .key_applied
+            .filter(|a| a.applied == op.request.resources.memory_bytes)
+        else {
+            return false;
+        };
+        let live = kbf_estimator::floor_ceiling(self.key_floor_bound(&op.request));
+        let to = applied.applied.min(live).max(applied.base);
+        // Whether it was lowered. A raise is lowered here only when no live worker is
+        // large enough for it, so `to` is below it; were it not, the write below changes
+        // nothing and the caller is told so.
+        let lowered = to < applied.applied;
+        let op = self.ops.get_mut(&id).expect("checked above");
+        op.request.resources.memory_bytes = to;
+        op.key_applied = (to > applied.base).then_some(KeyApplied {
+            base: applied.base,
+            applied: to,
+            undone: false,
+        });
+        lowered
+    }
+
+    /// Takes back the raise a key floor made to a queued operation that only a worker it
+    /// would own whole could take: it books what it asked for, and is not raised again.
+    pub(super) fn undo_key_raise(&mut self, id: OperationId) {
+        let op = self.ops.get_mut(&id).expect("queued operations exist");
+        let raised = op.key_applied.expect("a raised operation");
+        op.request.resources.memory_bytes = raised.base;
+        op.key_applied = Some(KeyApplied {
+            base: raised.base,
+            applied: raised.base,
+            undone: true,
+        });
     }
 
     /// The runs of `operation` killed for memory, oldest first; `None` once the
@@ -465,10 +712,21 @@ impl Scheduler {
             let Some(raised) = raised else {
                 return false;
             };
+            let key_bound = self
+                .floor_key(id)
+                .map(|k| (k, self.key_floor_bound(&op.request)));
             let op = self.ops.get_mut(&id).expect("checked above");
             op.request.resources.memory_bytes = raised;
+            op.key_applied = None;
             let key = op.request.key.clone();
             self.memory.floors.raise(&key, raised);
+            if let Some((size_key, bound)) = key_bound {
+                let current = self.memory.key_floors.get(&size_key).unwrap_or(0);
+                let kill = kbf_estimator::kill_floor(current, booked, Some(raised), bound);
+                if kill.raised {
+                    self.memory.key_floors.raise(&size_key, kill.floor);
+                }
+            }
             self.requeue(id, RequeueReason::OutOfMemory { booked, raised });
             return true;
         }
@@ -633,20 +891,32 @@ mod tests {
         // Stamps 30, 10, 20 for keys 1, 2, 3.
         let stored = vec![floor(1, 4, 30), floor(2, 8, 10), floor(3, 16, 20)];
         let mut floors = Floors::new(3);
-        floors.restore(stored.clone());
-        assert_eq!(floors.row(&key(2)), Some(floor(2, 8, 10)));
-        assert_eq!(floors.row(&key(9)), None);
+        let rows = |v: &[Floor]| {
+            v.iter()
+                .map(|f| (f.key.clone(), f.ask, f.stamp))
+                .collect::<Vec<_>>()
+        };
+        let row = |floors: &Floors<ActionKey>, k: &ActionKey| {
+            floors.stamped(k).map(|(ask, stamp)| Floor {
+                key: k.clone(),
+                ask,
+                stamp,
+            })
+        };
+        floors.restore(rows(&stored));
+        assert_eq!(row(&floors, &key(2)), Some(floor(2, 8, 10)));
+        assert_eq!(row(&floors, &key(9)), None);
         assert_eq!(
             floors.order.keys().copied().collect::<Vec<_>>(),
             [10, 20, 30]
         );
         floors.raise(&key(4), GIB);
         assert_eq!(floors.get(&key(2)), None, "the oldest stamp goes first");
-        assert_eq!(floors.row(&key(4)).map(|f| f.stamp), Some(31));
+        assert_eq!(row(&floors, &key(4)).map(|f| f.stamp), Some(31));
         assert_eq!(floors.evicted, vec![key(2)]);
 
         let mut small = Floors::new(1);
-        small.restore(stored);
+        small.restore(rows(&stored));
         assert_eq!(small.get(&key(1)), Some(4 * GIB), "the newest stamp stays");
         assert_eq!(small.asks.len(), 1);
         assert_eq!(small.evicted, vec![key(2), key(3)]);

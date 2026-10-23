@@ -11,11 +11,16 @@
 //! - [`client`]: the host side.
 //! - [`session`]: the launchd session type `Ready` reports, and the root refusal.
 //!
+//! - [`probe`]: the probe modes `kbf-vmm probe g2` and `g3` read, which run as any user.
+//!
 //! It serves a Unix socket. The virtio socket a VM gives it, the relay through
 //! `kbf-vmm`, the image that installs it and the VM driver that calls it are planned and
 //! not built.
 
 pub mod client;
+pub mod probe;
+#[cfg(target_os = "macos")]
+pub mod probe_host;
 pub mod run;
 pub mod server;
 pub mod session;

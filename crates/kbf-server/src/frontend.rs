@@ -35,11 +35,13 @@
 //! calls cannot differ. Without them the URL must be `http://` to a loopback host, for
 //! tests and one machine; [`parse`] refuses a plain-text URL to any other host.
 //!
-//! **The state store** is optional, as `kbf-server`'s is (`--state-store`): without it
-//! the scheduler's state is in memory and the start logs the same warning. It becomes
-//! required when the backends do (the design's deploy shapes all have one); a flag
-//! given is opened, probed by `/readyz` and refused at start if this build has no
-//! backend for it.
+//! **The state store** is required of the process, not of this module: `kbf frontend`
+//! given no `--state-store` (and no `state-store` key in `kbf.toml`) exits 2 naming the
+//! flag, `--check` included, before anything is bound (`kbf-cli`'s startup checks). The
+//! entry points here still start without one, with the scheduler's state in memory and
+//! the same warning as `kbf-server`'s, for the tests that need none. A store given is
+//! opened and probed by `/readyz`; a `sqlite://` one starts and logs that SQLite is
+//! removed in the next release ([`crate::StateStoreUri::open`]).
 //!
 //! **Readiness** (`GET /readyz`, `grpc.health.v1`) fails when the storage node does not
 //! answer an action-cache lookup within `--readyz-store-timeout-ms`, when the state store (if
@@ -1144,11 +1146,6 @@ impl<'a> Prepared<'a> {
         .merge(crate::object_store::api::routes(
             token.clone(),
             object_stores.map(|stores| stores.api),
-        ))
-        .merge(crate::update_hosts::router(
-            Arc::clone(&farm),
-            update_rows.clone(),
-            crate::update_hosts::FarmReaders::from_policy(&policy),
         ))
         .merge(crate::release::desired::router(
             releases.clone(),

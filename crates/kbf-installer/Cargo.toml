@@ -22,11 +22,6 @@ publish.workspace = true
 # socket and no network, and a staged binary is never run as root. The one exception is
 # the `proxy` verb (the `kbf-proxy` runtime: the frontend host's public port), which runs as the
 # unprivileged service user and shares nothing with the root half (tests/layering.rs in kbf-integration-test).
-# `deploy`'s CAS smoke is a small gRPC client of the local REAPI listener (kbf-proto, tonic, a
-# current-thread tokio runtime built for the one check); toml and x509-parser read the
-# frontend's own config for the listener's address and certificate name. Its other calls (the
-# release store, the update API, the node and member lists) are HTTP/1.1 over rustls to the
-# same port.
 
 # The child the pipe tests start: a program that does what a list of operations says (send these
 # bytes, flood, stall, report its limits). Built only with `test-sandbox`, so never in a release.
@@ -51,8 +46,6 @@ futures.workspace = true
 hex.workspace = true
 httparse.workspace = true
 hyper.workspace = true
-# `deploy --offer` reads `offer.json` through the gate library's validated type.
-kbf-gate.workspace = true
 kbf-host.workspace = true
 kbf-proxy.workspace = true
 kbf-proto.workspace = true
@@ -82,7 +75,6 @@ tonic = { workspace = true, features = ["tls-native-roots", "tls-ring"] }
 toml.workspace = true
 tracing.workspace = true
 ureq.workspace = true
-x509-parser.workspace = true
 
 [dev-dependencies]
 # The proxy verb's process test is an h2c client of the real binary.
@@ -92,10 +84,13 @@ h2.workspace = true
 http.workspace = true
 kbf-host = { workspace = true, features = ["testkit"] }
 kbf-installer = { workspace = true, features = ["testkit", "test-sandbox"] }
+# A Postgres database of its own for each test that needs a server (`database` tests).
+kbf-state = { workspace = true, features = ["test-database"] }
 # The proxy verb's process test starts the binary under a guard that reaps it
 # (kbf_testkit::reaped); a child held between fork and exec (kbf_testkit::forked), and a
-# start that waits out a program still open for writing (kbf_testkit::spawn).
-kbf-testkit.workspace = true
+# start that waits out a program still open for writing (kbf_testkit::spawn); the test
+# Postgres server's URL (kbf_testkit::database).
+kbf-testkit = { workspace = true, features = ["postgres"] }
 kbf-update.workspace = true
 # The proxy verb's process test mints the OIDC tokens of a CI job (`remote_operator_file`).
 kbf-oidc = { workspace = true, features = ["testkit"] }

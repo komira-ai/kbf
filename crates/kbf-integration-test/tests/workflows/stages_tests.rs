@@ -65,7 +65,11 @@ fn a_pull_request_trigger_on_the_release_workflow_is_refused() {
     // allow. Control: the real text above.
     let (stages, workflows) = real();
     let bad = planted(&workflows, "release.yml", |t| {
-        t.replacen("on:\n  push:", "on:\n  pull_request:\n  push:", 1)
+        t.replacen(
+            "on:\n  workflow_run:",
+            "on:\n  pull_request:\n  workflow_run:",
+            1,
+        )
     });
     refused(
         &check(&stages, &bad),
@@ -106,7 +110,7 @@ fn a_stage_whose_only_job_is_deleted_is_refused() {
     // go, the workflow keeps its jobs).
     let (stages, workflows) = real();
     let cut = stages
-        .split("  - job: release.yml#gates")
+        .split("  - job: release.yml#plan")
         .next()
         .expect("text");
     let found = check(cut, &workflows);

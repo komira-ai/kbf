@@ -54,7 +54,6 @@ fn raw(mode: Mode) -> Raw {
         kbf: serving_flags(mode),
         proxy: proxy_flags(mode),
         create_local_database: false,
-        deploy: Default::default(),
         installer_config: None,
     }
 }
@@ -132,11 +131,11 @@ fn host() -> FakeExec {
 }
 
 /// A host with a release installed: `releases/current` is a link.
-/// A Mac's `kbf.toml` as `kbf-mac-provision` leaves it for `raw(Mode::Daemon)`: the keys setup
-/// writes, and `[daemon] update-dir`, which setup only checks on a Mac.
+/// A Mac's `kbf.toml` for `raw(Mode::Daemon)`: the keys setup writes, and no `[daemon]` update
+/// keys, which a Mac's file does not have.
 fn provisioned(mut exec: FakeExec) -> FakeExec {
     let text = format!(
-        "mode = \"daemon\"\n\n[frontend]\nurl = \"https://farm.example:8443\"\n\n[enroll]\ntoken_file = \"{}\"\n\n[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\n",
+        "mode = \"daemon\"\n\n[frontend]\nurl = \"https://farm.example:8443\"\n\n[enroll]\ntoken_file = \"{}\"\n",
         Platform::MacOs.enroll_token()
     );
     put(&mut exec, Platform::MacOs.kbf_toml(), 0o640, ROOT, &text);
@@ -1202,7 +1201,6 @@ fn every_bad_flag_is_named_and_nothing_is_written() {
         kbf: super::kbf_settings::KbfFlags::default(),
         proxy: Default::default(),
         create_local_database: false,
-        deploy: Default::default(),
         installer_config: Some("/tmp/i.toml".to_owned()),
     };
     let mut exec = host();
@@ -1702,8 +1700,6 @@ fn a_view_forwards_reads_and_refuses_steps() {
 #[path = "more_tests.rs"]
 mod more;
 
-#[path = "deploy_config_tests.rs"]
-mod deploy_config_tests;
 #[path = "kbf_settings_tests.rs"]
 mod kbf_settings_tests;
 #[path = "provision_tests.rs"]
@@ -1729,3 +1725,6 @@ mod seed;
 
 #[path = "aio_tests.rs"]
 mod aio;
+
+#[path = "aio_migrate_tests.rs"]
+mod aio_migrate_tests;

@@ -163,8 +163,7 @@ pub struct EvictRound {
     /// if eviction is off.
     pub short: u64,
     /// The voters of a cell whose log does not take [`Command::EvictObjects`] yet
-    /// ([`EvictReady::NeedsV3`]; a single voter's log can be held below 3 by the
-    /// release's start ceiling): eviction is off, nothing was evicted.
+    /// ([`EvictReady::NeedsV3`]): eviction is off, nothing was evicted.
     pub needs_v3: Option<usize>,
 }
 

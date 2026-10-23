@@ -233,6 +233,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "drain-deadline-secs",
             "driver",
             "image",
+            "native-term-grace-ms",
             "orders-dir",
             "reconnect-max-ms",
             "reconnect-ms",

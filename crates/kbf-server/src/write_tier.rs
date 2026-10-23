@@ -25,14 +25,6 @@ pub enum WriteTierError {
     /// commands need.
     #[error("--hot-store: {0}")]
     Log(MetaLogError),
-    /// The metadata log is below machine version 2, which carries the tier's commands,
-    /// and this release's start ceiling does not raise it that far.
-    #[error(
-        "--hot-store: the metadata log is at machine version {}, and the write tier needs 2 \
-         or later, which this release does not raise it to at start",
-        .0.get()
-    )]
-    LogTooOld(MachineVersion),
     /// The directory could not be created.
     #[error("--hot-store: {0}")]
     Dir(std::io::Error),
@@ -47,18 +39,11 @@ pub enum WriteTierError {
 ///
 /// With a tier, the Raft log is first raised to machine version 5, whose format carries
 /// the tier's commands, including the move of a conflicting staged object's records
-/// ([`RaftMetaLog::raise_at_start`]; a log already there commits nothing; from
+/// ([`RaftMetaLog::raise_machine_version`]; a log already there commits nothing; from
 /// then on a binary that runs only an earlier version skips the raise), then
 /// the tier's start recovers the directory against the committed staged table, which
 /// outlives the process ([`Cache::attach_tier`]). Without a tier the log is not touched,
 /// so it stays one an older binary reads.
-///
-/// The raise stops at the log's start ceiling, and the tier works with what the log
-/// takes: from version 2 on it stages, seals and flushes; below version 5 only the move
-/// of a conflicting staged object is refused by the log, so such an object stays staged
-/// and its flush fails (a WARN, `flush_failures`) and is retried after the wait until
-/// the log is raised to 5. Below version 2 the start is refused
-/// ([`WriteTierError::LogTooOld`]).
 ///
 /// # Errors
 /// [`WriteTierError`].
@@ -97,16 +82,12 @@ where
         flushed_copies,
         ..TierOptions::new(hot.budget)
     };
-    let meta = cache.meta();
-    meta.raise_at_start(MachineVersion::V5)
+    cache
+        .meta()
+        .raise_machine_version(MachineVersion::V5)
         .map_err(WriteTierError::Log)?;
-    let version = meta.machine_version();
-    if version < MachineVersion::V2 {
-        return Err(WriteTierError::LogTooOld(version));
-    }
     let (cache, startup) = cache.attach_tier(fs, options, SERVER, hot.abandon).await?;
     tracing::info!(
-        machine_version = version.get(),
         tier = %startup.tier,
         registered = startup.registered,
         abandoned = startup.abandoned.len(),

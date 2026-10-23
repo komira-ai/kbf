@@ -218,7 +218,8 @@ pub struct StorageHealth {
     pub members_total: usize,
     /// Of them, the `Active` ones.
     pub members_active: usize,
-    /// Members that are not `Active` (`Joining`, `CatchingUp`, `Draining`, `Down`).
+    /// Members that are not `Active` (`Joining`, `CatchingUp`, `Draining`, `Down`, or a state
+    /// this build does not name).
     pub not_active: Vec<MemberId>,
     /// `Active` members with no report, or none within the freshness window.
     pub silent: Vec<MemberId>,

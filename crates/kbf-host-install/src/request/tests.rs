@@ -48,9 +48,8 @@ fn the_length_limits_are_inclusive() {
     assert_eq!((v.len(), c.len()), (MAX_VERSION_LEN, MAX_CHANNEL_LEN));
 }
 
-/// Every input below is refused, and each needs its own defect to get through. The
-/// defect each one catches is in the comment above it; the mutant that was planted for
-/// it is in the pull request.
+/// Every input below is refused. The reason each one must be refused is in the comment
+/// above it.
 #[test]
 fn refused_inputs() {
     let long_version = format!("1{}", "0".repeat(MAX_VERSION_LEN));

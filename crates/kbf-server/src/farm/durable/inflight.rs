@@ -46,20 +46,34 @@ impl Durable {
     /// outcome the caller never learned has put the row, and the repeat finds the
     /// operation it wrote.
     ///
-    /// If the store's counter is ahead of `id` (another writer took the id), the next
-    /// free one is used; [`Submitted::Queued`] says which.
+    /// `id` comes from the block this handle reserved ([`Durable::reserve_operation`]),
+    /// where no other frontend numbers. If a row of an earlier writer is in the way of it,
+    /// the next id of the block is used; [`Submitted::Queued`] says which.
     ///
     /// # Errors
     /// The store cannot be read or written, or a row in the way does not go
     /// ([`StateError::Conflict`]).
+    #[cfg(test)]
     pub(super) fn submit(
+        &self,
+        id: OperationId,
+        request: &Request,
+        subject: &Subject,
+    ) -> Result<Submitted, StateError> {
+        self.submit_keyed(id, request, subject, None)
+    }
+
+    /// [`Durable::submit`], with the size key the operation is given, if any: written in
+    /// an `opkey/` row of the transaction that queues it.
+    pub(super) fn submit_keyed(
         &self,
         mut id: OperationId,
         request: &Request,
         subject: &Subject,
+        size_key: Option<u64>,
     ) -> Result<Submitted, StateError> {
         if !request.joinable() {
-            self.submitted(id, request, subject)?;
+            self.submitted_keyed(id, request, subject, size_key)?;
             return Ok(Submitted::Queued(id));
         }
         let pin = inflight_key(&request.key);
@@ -77,12 +91,14 @@ impl Durable {
                 // The operation it names is gone: the row is left over, and goes.
                 cond = Cond::Version(row.version);
             }
-            match self.submitted_pinned(id, request, subject, (&pin, cond)) {
+            match self.submitted_pinned(id, request, subject, size_key, (&pin, cond)) {
                 Ok(()) => return Ok(Submitted::Queued(id)),
-                // Another writer took the id, or queued this action since the look.
+                // Another writer queued this action since the look, or a row of an earlier
+                // writer is in the way of the id: look again, and try the next id of the
+                // block.
                 Err(StateError::Conflict(_)) if looks < LOOKS => {
                     looks += 1;
-                    id = OperationId(self.counter(NEXT_OP)?.max(id.0));
+                    id = self.reserve_operation(OperationId(id.0 + 1))?;
                 }
                 Err(error) => return Err(error),
             }
@@ -121,6 +137,14 @@ impl Durable {
             Some(row) => Some(subject::decode(&row.value).map_err(|why| corrupt(&key, why))?),
             None => None,
         };
+        let read = self.read_size_keys.load(Ordering::SeqCst);
+        let size_key = match self.store.get(&opkey_key(operation))?.filter(|_| read) {
+            Some(row) => {
+                let key = opkey_key(operation);
+                Some(opkey::decode(&row.value).map_err(|why| corrupt(&key, why))?)
+            }
+            None => None,
+        };
         Ok(Some(StoredOperation {
             operation,
             request,
@@ -128,6 +152,7 @@ impl Durable {
             losses,
             fate,
             subject,
+            size_key,
         }))
     }
 

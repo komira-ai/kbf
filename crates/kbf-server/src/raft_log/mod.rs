@@ -51,10 +51,7 @@
 //!   A raise commits alone, under the host's lock; a batch is
 //!   encoded under that lock too, in the format committed when it commits, so no
 //!   batch holds a `MachineVersion` entry and a command the format does not take is
-//!   refused alone while the rest of its batch commits. A start raises a log only up to
-//!   its start ceiling ([`START_CEILING`]; [`RaftMetaLog::raise_at_start`]), and each
-//!   feature that needs a version checks the log's [`RaftMetaLog::machine_version`] where
-//!   it uses it.
+//!   refused alone while the rest of its batch commits.
 //! - **Skipped entries.** Every format changes additively, and a binary skips what it does
 //!   not know instead of refusing it. An entry that holds a command this binary does not
 //!   know, a control command (which this log does not use), or a raise to a machine
@@ -117,15 +114,6 @@ pub const LOCK: &str = "log.lock";
 /// tier's commands, `EvictObjects`, node writers (`SetWriter`) and `ReseatStaged`. A log
 /// stays at the version it was raised to; a new one starts at [`MachineVersion::V1`].
 pub const RUNS: MachineVersion = MachineVersion::V5;
-
-/// The highest machine version a start raises a log to: what the previous release runs.
-/// A release that adds a new machine version sets this one below [`RUNS`], so the raise
-/// waits for `kbf finalize`. It is [`RUNS`] today, so every start raises as it always has.
-pub const START_CEILING: MachineVersion = RUNS;
-
-// A ceiling past what the binary runs would have every start ask for a version the log
-// refuses ("past the one this binary runs").
-const _: () = assert!(START_CEILING.get() <= RUNS.get());
 
 /// How often the log commits farm time.
 pub const TICK: Duration = Duration::from_secs(1);
@@ -220,9 +208,6 @@ pub struct RaftMetaLog<F: Fs = StdFs> {
     /// [`RaftMetaLog::open_dir`]); released when the log is dropped, after its handle
     /// on the store (fields drop in order).
     lock: Option<DirLock>,
-    /// How far a start raises this log's machine version
-    /// ([`RaftMetaLog::raise_at_start`]); [`START_CEILING`] unless a test lowered it.
-    start_ceiling: MachineVersion,
 }
 
 struct Shared<F: Fs> {
@@ -418,7 +403,6 @@ where
             shared,
             ticker,
             lock: None,
-            start_ceiling: START_CEILING,
         })
     }
 
@@ -457,33 +441,6 @@ where
         Ok(())
     }
 
-    /// Raises the log's machine version to `target` or `ceiling`, whichever is lower, and
-    /// never above `ceiling`: [`RaftMetaLog::raise_machine_version`] to the lower of the
-    /// two, so a log already there (or past it, as a log finalized to a higher version
-    /// is) commits nothing and is never lowered. Every raise a start makes goes through
-    /// here, with the log's own ceiling ([`RaftMetaLog::raise_at_start`]).
-    ///
-    /// # Errors
-    /// As [`RaftMetaLog::raise_machine_version`].
-    pub fn raise_up_to(
-        &self,
-        target: MachineVersion,
-        ceiling: MachineVersion,
-    ) -> Result<(), MetaLogError> {
-        self.raise_machine_version(target.min(ceiling))
-    }
-
-    /// [`RaftMetaLog::raise_up_to`] `target`, up to the log's start ceiling
-    /// ([`START_CEILING`]). What the log's machine version is after it is the caller's to
-    /// check ([`RaftMetaLog::machine_version`]): a feature that needs more than the
-    /// ceiling lets is off, or takes its degraded path.
-    ///
-    /// # Errors
-    /// As [`RaftMetaLog::raise_machine_version`].
-    pub fn raise_at_start(&self, target: MachineVersion) -> Result<(), MetaLogError> {
-        self.raise_up_to(target, self.start_ceiling)
-    }
-
     /// Commits `Tick(now)` and returns the committed farm time after it.
     ///
     /// # Errors
@@ -494,21 +451,6 @@ where
 }
 
 impl<F: Fs> RaftMetaLog<F> {
-    /// This log with `ceiling` as its start ceiling in place of [`START_CEILING`]: how a
-    /// test stands in for a release whose ceiling is below [`RUNS`]. It is not a flag; a
-    /// server always starts at [`START_CEILING`].
-    #[must_use]
-    pub fn with_start_ceiling(mut self, ceiling: MachineVersion) -> Self {
-        self.start_ceiling = ceiling;
-        self
-    }
-
-    /// The highest machine version a start raises this log to.
-    #[must_use]
-    pub fn start_ceiling(&self) -> MachineVersion {
-        self.start_ceiling
-    }
-
     /// The log's id, from its record.
     #[must_use]
     pub fn log_id(&self) -> FarmLogId {

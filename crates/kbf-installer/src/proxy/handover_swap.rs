@@ -43,7 +43,6 @@ use super::admin::{Admin, Deadlines};
 use super::api::traits::{Retired, Supervisor, SupervisorError, SupervisorStatus, UpdateSpec};
 use super::child_http::Headers;
 use super::handover::HandoverConfig;
-use super::migrator::DbMigrator;
 use super::model::PortError;
 use super::model::{Mode, Phase, ProcIdent, Slot, Timing};
 use super::orders::OrderSpool;
@@ -56,6 +55,7 @@ use super::runtime::{RequestQueue, SystemClock};
 use super::supervisor_swap::{Config, Parts, SwapSupervisor};
 use crate::CommitId;
 use crate::database::Database;
+use crate::migrator::DbMigrator;
 use kbf_state::postgres::schema::{Outcome, SchemaError};
 use std::time::Duration;
 

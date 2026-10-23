@@ -90,7 +90,8 @@ impl Scheduler {
 
     /// Takes `operations` up in an empty scheduler, which grants leases under `term`
     /// from `next_seq` and operation ids from `next_operation` on (both past every id
-    /// the store ever named, finished operations' included, so no id names two).
+    /// the store ever named or reserved, finished operations' included, so no id names
+    /// two). Leases are placed without limit until [`Scheduler::use_seq_block`] sets one.
     ///
     /// An operation with no lease is queued. One with a lease holds it on its worker,
     /// which has not registered with this scheduler yet: for [`LEASE_GRACE`] the lease
@@ -215,6 +216,7 @@ impl Scheduler {
                 not_started,
                 losses,
                 queued_at: self.now,
+                key_applied: None,
             },
         );
     }
@@ -224,6 +226,10 @@ impl Scheduler {
         if self.awaited.remove(id).is_none() {
             return;
         }
+        // A recovered lease books the request the store holds. A key floor is not raised
+        // onto it: the store does not say what the lease was granted at, and a floor set
+        // after the grant (by a sibling's kill) would book more than the lease runs under,
+        // so its own kill would step the ladder past a rung and count as a new event.
         for held in self.held.values_mut() {
             let op = &self.ops[&held.operation];
             if op.state.holding().is_none_or(|(_, holder)| holder != id) {

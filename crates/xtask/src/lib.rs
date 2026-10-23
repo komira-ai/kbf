@@ -56,16 +56,10 @@
 //!   attestations` and `release check` hold a directory to one bundle per tarball,
 //!   each that tarball's (its one subject is the tarball's digest); `verify-assets
 //!   attestations` also has `gh` verify each tarball against its bundle.
-//! - `release {locate,main-control,check,verify,offer,notes,plan,identity,previous,fetch-previous,stage-offer,publish,bump-internal}` ([`release`]): a GitHub release of
-//!   the files a push run of the artifacts workflow on `main` built and attested for a
+//! - `release {locate,main-control,check,verify,notes,plan,identity,previous,fetch-previous,publish,bump-internal}` ([`release`]): a GitHub release of
+//!   the files the artifacts stage of a push run of the pipeline on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
-//! - `gamma {evidence,deploy,check-build,summary,sudoers-line,held-steps}` ([`gamma`]): the
-//!   steps of `gamma.yml`, which follows a cut release to the one gamma host: whether the
-//!   release run published, the deploy through `tailscale ssh` and `sudo` (refused unless the
-//!   commit is the highest release), the build of komira's main against the updated farm (with
-//!   the farm's cache; it must run nothing locally), the summary with no node or host in it,
-//!   the sudoers line, and the settings a person makes once (printed, never applied).
 //! - `release version-facts --binary <kbf> --commit <sha> --platform <p> --out <dir>`
 //!   ([`version_facts`]): the `kbf` just built, run with `--version --json`, and what it
 //!   printed kept unchanged as the release asset `kbf-<commit>-<platform>.version.json`
@@ -99,7 +93,6 @@ pub mod crun_tests;
 pub mod darwin;
 pub mod entitlements;
 pub mod fetch;
-pub mod gamma;
 pub mod installer_tarball;
 pub mod package;
 pub mod pkg;
@@ -428,10 +421,6 @@ enum Verb {
     /// A GitHub release of a `main` commit's attested assets, never rebuilt.
     #[command(subcommand)]
     Release(ReleaseVerb),
-    /// The steps of `gamma.yml`: the release run's evidence, the deploy on the gamma host,
-    /// its table, the sudoers line and the settings a person makes once.
-    #[command(subcommand)]
-    Gamma(GammaVerb),
     /// Run the container driver's real-crun tests on a hosted Linux runner, each
     /// test target in its own Delegate=yes system unit as this user.
     CrunTests {
@@ -550,8 +539,8 @@ enum VerifyAssets {
 
 #[derive(Subcommand)]
 enum ReleaseVerb {
-    /// Refuse a commit not on main; find the successful push run of artifacts.yml on
-    /// main that built it, and print `run-id=<id>`.
+    /// Refuse a commit not on main, and a run that is not the successful push run on main
+    /// that built it; print `run-id=<id>`.
     Locate {
         /// The repository, `<owner>/<repo>` (on Actions, `GITHUB_REPOSITORY`).
         #[arg(long)]
@@ -559,6 +548,10 @@ enum ReleaseVerb {
         /// The commit to release, a full SHA.
         #[arg(long)]
         commit: String,
+        /// The pipeline run that built it (on Actions, the id of the run that started the
+        /// release).
+        #[arg(long)]
+        run_id: u64,
         /// Append `run-id=<id>` to this file (on Actions, `GITHUB_OUTPUT`).
         #[arg(long)]
         output: Option<PathBuf>,
@@ -607,7 +600,7 @@ enum ReleaseVerb {
         /// The commit the tag names, a full SHA.
         #[arg(long)]
         commit: String,
-        /// The artifacts workflow run that built and attested the files.
+        /// The pipeline run that built and attested the files.
         #[arg(long)]
         run_id: u64,
         /// The set hash of the verified files, as `release verify` printed it.
@@ -630,23 +623,13 @@ enum ReleaseVerb {
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// The checks that make a commit offerable to a farm; writes `offer.json`, sets
-    /// nothing on any farm.
-    Offer(release::offer::OfferArgs),
-    /// Wait for the push runs of ci, beta and artifacts for `--sha` on `--branch` and
-    /// require all three to succeed; print their run ids. Only reads.
-    Gates(release::gates::GatesArgs),
     /// What a push would release: the next version, the push's class, and the freeze and
     /// superseded refusals. Writes nothing but `--output`.
     Plan(release::plan::PlanArgs),
     /// The release before `--sha`: the highest release tag that names a strict ancestor of it,
-    /// downloaded, verified as `release offer` verifies one, and its named binaries taken
+    /// downloaded and verified (checksums, then attestations), and its named binaries taken
     /// out into `--out`. With no such tag, prints `previous-source=none`.
     FetchPrevious(release::fetch_previous::FetchPreviousArgs),
-    /// The offer for the release of `--sha`, for gamma only, and the bundle a gamma deploy is
-    /// handed: the release verified before any of it runs. A commit with no release is
-    /// `staged=false`, not an error.
-    StageOffer(release::stage_offer::StageOfferArgs),
     /// Open the pull request in the internal repository that moves its submodule to the
     /// released commit, with auto-merge on (the token is `GH_TOKEN`).
     BumpInternal(release::bump::BumpArgs),
@@ -732,112 +715,6 @@ impl SubjectArgs {
             main_ref: &self.main_ref,
         }
     }
-}
-
-#[derive(Subcommand)]
-enum GammaVerb {
-    /// Whether run `--run-id` of the release workflow released `--sha`: a push to main that
-    /// succeeded, whose publish job succeeded. Prints `released=<true|false>`.
-    Evidence {
-        /// The repository, `<owner>/<repo>` (on Actions, `GITHUB_REPOSITORY`).
-        #[arg(long)]
-        repo: String,
-        /// The commit the run is for, a full SHA (the triggering run's `head_sha`).
-        #[arg(long)]
-        sha: String,
-        /// The release run (the triggering run's `id`).
-        #[arg(long)]
-        run_id: u64,
-        /// Append `released=<true|false>` to this file (on Actions, `GITHUB_OUTPUT`).
-        #[arg(long)]
-        output: PathBuf,
-        /// The `gh` program.
-        #[arg(long, default_value = "gh")]
-        gh: PathBuf,
-    },
-    /// Run `kbf-installer deploy` on the gamma host over Tailscale SSH, for the highest
-    /// release only, and write the summary without any node or host in it.
-    Deploy {
-        /// The repository, `<owner>/<repo>`.
-        #[arg(long)]
-        repo: String,
-        /// The released commit, a full SHA.
-        #[arg(long)]
-        sha: String,
-        /// The gamma host's tailnet name: a short name, never an address. Masked in what
-        /// this prints, but a variable is shown by GitHub in the step's own header.
-        #[arg(long)]
-        host: String,
-        /// The deploy account on it (masked the same way).
-        #[arg(long)]
-        user: String,
-        /// The tar `release stage-offer` wrote, sent on standard input.
-        #[arg(long)]
-        bundle: PathBuf,
-        /// Where the installer's own summary goes; it names nodes and is never uploaded.
-        #[arg(long)]
-        raw: PathBuf,
-        /// Where the redacted summary goes.
-        #[arg(long)]
-        summary: PathBuf,
-        /// The `tailscale` program.
-        #[arg(long, default_value = "tailscale")]
-        tailscale: PathBuf,
-        /// The `gh` program.
-        #[arg(long, default_value = "gh")]
-        gh: PathBuf,
-    },
-    /// Build komira's main against the farm just updated, with its normal caching. Passes
-    /// only for `BUILD SUCCEEDED` and `local: 0`; the farm's buckconfig is the environment
-    /// variable `GAMMA_FARM_BUCKCONFIG`. Prints the `Commands:` line and the verdict, and
-    /// nothing buck2 wrote.
-    CheckBuild {
-        /// The checkout of komira's main (its `buck2` launcher is at the top).
-        #[arg(long)]
-        komira_dir: PathBuf,
-        /// The targets to build, separated by white space (the variable
-        /// `GAMMA_CHECK_TARGETS`). A flag, such as `--no-remote-cache`, is refused.
-        #[arg(long)]
-        targets: String,
-        /// Where the farm's buckconfig is written: an absolute path, given to buck2.
-        #[arg(long)]
-        buckconfig_file: PathBuf,
-        /// Where buck2's whole output goes. It is never printed.
-        #[arg(long)]
-        log: PathBuf,
-        /// Append the `Commands:` line and the verdict to this file (on Actions,
-        /// `GITHUB_STEP_SUMMARY`).
-        #[arg(long)]
-        summary: PathBuf,
-    },
-    /// Append a table of the redacted summary to a file (`GITHUB_STEP_SUMMARY`).
-    Summary {
-        #[arg(long)]
-        file: PathBuf,
-        #[arg(long)]
-        output: PathBuf,
-    },
-    /// The sudoers line that lets the deploy account run the deploy command as root.
-    SudoersLine {
-        /// The deploy account on the gamma host.
-        #[arg(long)]
-        user: String,
-    },
-    /// Print the settings a person makes once. It changes nothing.
-    HeldSteps {
-        /// The repository, `<owner>/<repo>`.
-        #[arg(long)]
-        repo: String,
-        /// The gamma host's tailnet name.
-        #[arg(long)]
-        host: String,
-        /// The deploy account on it.
-        #[arg(long)]
-        user: String,
-        /// The Tailscale tag the runner joins as (never the host's own tag).
-        #[arg(long, default_value = "tag:kbf-gamma-ci")]
-        tag: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -1187,65 +1064,13 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::VerifyAssets(VerifyAssets::Sums { dir }) => {
             Ok(vec![sums::verify_sums(&dir, fetch::Sha256::of)?])
         }
-        Verb::Gamma(GammaVerb::Evidence {
-            repo,
-            sha,
-            run_id,
-            output,
-            gh,
-        }) => gamma::evidence(&gh, &repo, &sha, run_id, &output),
-        Verb::Gamma(GammaVerb::Deploy {
-            repo,
-            sha,
-            host,
-            user,
-            bundle,
-            raw,
-            summary,
-            tailscale,
-            gh,
-        }) => gamma::deploy(&gamma::Deploy {
-            gh: &gh,
-            tailscale: &tailscale,
-            repo: &repo,
-            sha: &sha,
-            host: &host,
-            user: &user,
-            bundle: &bundle,
-            raw: &raw,
-            summary: &summary,
-        }),
-        Verb::Gamma(GammaVerb::CheckBuild {
-            komira_dir,
-            targets,
-            buckconfig_file,
-            log,
-            summary,
-        }) => {
-            let config = std::env::var(gamma::BUCKCONFIG_ENV).unwrap_or_default();
-            gamma::check_build(&gamma::CheckBuild {
-                komira_dir: &komira_dir,
-                targets: &targets,
-                config: &config,
-                buckconfig_file: &buckconfig_file,
-                log: &log,
-                summary: &summary,
-            })
-        }
-        Verb::Gamma(GammaVerb::Summary { file, output }) => gamma::summary(&file, &output),
-        Verb::Gamma(GammaVerb::SudoersLine { user }) => Ok(vec![gamma::sudoers_line(&user)?]),
-        Verb::Gamma(GammaVerb::HeldSteps {
-            repo,
-            host,
-            user,
-            tag,
-        }) => gamma::held_steps(&repo, &host, &user, &tag),
         Verb::Release(ReleaseVerb::Locate {
             repo,
             commit,
+            run_id,
             output,
             gh,
-        }) => release::locate(&gh, &repo, &commit, output.as_deref()),
+        }) => release::locate(&gh, &repo, &commit, run_id, output.as_deref()),
         Verb::Release(ReleaseVerb::MainControl {
             repo,
             on_main,
@@ -1290,11 +1115,8 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 line,
             ])
         }
-        Verb::Release(ReleaseVerb::Offer(args)) => release::offer::run(&args),
-        Verb::Release(ReleaseVerb::Gates(args)) => release::gates::run(&args),
         Verb::Release(ReleaseVerb::Plan(args)) => release::plan::run(&args),
         Verb::Release(ReleaseVerb::FetchPrevious(args)) => release::fetch_previous::run(&args),
-        Verb::Release(ReleaseVerb::StageOffer(args)) => release::stage_offer::run(&args),
         Verb::Release(ReleaseVerb::BumpInternal(args)) => release::bump::run(&args),
         Verb::Release(ReleaseVerb::Tag(args)) => release::tag::run(&args),
         Verb::Release(ReleaseVerb::VersionFacts(args)) => version_facts::run(&args),

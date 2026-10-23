@@ -18,3 +18,13 @@ fn every_state_has_its_own_operator_name() {
         assert_eq!(state.name(), name, "{state:?}");
     }
 }
+
+/// Asserts that a state this build does not name is shown as `unknown`, whatever number it
+/// came with, so an operator sees that the member is in a state this build cannot read.
+#[test]
+fn a_state_this_build_does_not_name_is_shown_as_unknown() {
+    for number in [0, 6, 99, -1] {
+        let state = MemberState::Unknown(number);
+        assert_eq!(state.name(), "unknown", "{number}");
+    }
+}

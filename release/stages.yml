@@ -12,37 +12,56 @@
 # stage workflow's triggers are checked as a whole), and that the operator stages are
 # verified before release (the release workflow's own steps do that).
 stages:
-  # artifacts.yml builds, tests and (on a push) attests the files every later stage uses.
-  # It also runs for pull requests and the merge queue, which attest nothing.
-  - name: build
+  # pipeline.yml, on a push to main, runs the stages in order, each needing the one before:
+  # ci (the pull-request gate, ci.yml, run again on the merged result), build, beta, and then
+  # the release (prod), which is a workflow of its own started by the pipeline's success.
+  # The pipeline's own jobs are the callers of the three stage workflows, and `push`, which
+  # leaves the commit the push replaced for the release run.
+  - name: ci
     runs: actions
     after: []
+    result: ci green
+    events: [push]
+  # artifacts.yml builds, tests and (on a push to main, called by the pipeline) attests the files
+  # every later stage uses. It also runs for pull requests and the merge queue, which attest
+  # nothing.
+  - name: build
+    runs: actions
+    after: [ci]
     result: SHA256SUMS
-    events: [pull_request, merge_group, push]
-  # The full run, on a push: everything the pull-request gate (ci.yml) leaves out. The whole
-  # nextest run with its slow tests, the Arm run, the jobs that need a service, root, crun
-  # or a Mac, the Linux packages, and the end-to-end smoke of beta.yml (scenario B0, the farm
-  # under Buck2 load), which builds its own binaries, so its result says it is unattested.
-  # The full run on the attested bytes (a job of artifacts.yml, after `verify`), and the
-  # `signing: true` job that attests its result, are added to `jobs` by the changes that
-  # build them. beta.yml runs on a push only: no pull request and no merge queue entry.
+    events: [pull_request, merge_group, workflow_call]
+  # The full run, called by the pipeline after build: everything the pull-request gate (ci.yml)
+  # leaves out. The whole nextest run with its slow tests, the Arm run, the jobs that need a
+  # service, root, crun or a Mac, the Linux packages, and the end-to-end smoke of beta.yml
+  # (scenario B0, the farm under Buck2 load), whose farm runs the kbf of build's linux-x86_64
+  # tarball of the same run; its result document records no set hash and so says it is
+  # unattested. The full run on the attested bytes with the update and kill scenarios, and the
+  # `signing: true` job that attests its result, are added to `jobs` by the changes that build
+  # them. beta.yml has no trigger of its own: no pull request, no merge queue entry, no push.
   - name: beta
     runs: actions
     after: [build]
     result: beta-result.json
-    events: [push]
+    events: [workflow_call]
   # Gamma has no stage here: gamma.yml is deleted, and gamma moves to kbf-updater (the
   # package-update design, section 13). The 24 hour bake and its verdict run outside Actions.
-  # release.yml gates, plans, verifies, tags with the release bot, publishes and bumps the
-  # internal repository, in one run. It is started by hand (a dry run through `verify`); the push
-  # event is allowed here for the change that adds `push: branches: [main]`, which the workflow
-  # lint (tests/release_workflow) pins until then.
+  # release.yml plans, verifies, tags with the release bot, publishes and bumps the internal
+  # repository, in one run. It is started by the completion of a successful pipeline run
+  # (`workflow_run`), the one workflow that is, so that a newer push cancelling the pipeline
+  # never cancels a release that has started.
   - name: prod
     runs: actions
     after: [beta]
     result: release.json
-    events: [push, workflow_dispatch]
+    events: [workflow_run]
 jobs:
+  - job: pipeline.yml#ci
+    stage: ci
+  - job: pipeline.yml#artifacts
+    stage: build
+    signing: true
+  - job: pipeline.yml#beta
+    stage: beta
   - job: artifacts.yml#darwin-arm64
     stage: build
   - job: artifacts.yml#linux-x86_64
@@ -93,8 +112,6 @@ jobs:
     stage: beta
   - job: beta.yml#mixed-version
     stage: beta
-  - job: release.yml#gates
-    stage: prod
   - job: release.yml#plan
     stage: prod
   - job: release.yml#verify

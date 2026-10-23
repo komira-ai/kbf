@@ -53,6 +53,7 @@ http_invocations,http_sched,http_history,enroll/api,managed/http,ui_mount}.rs` a
 | list the denied entries | `GET /v1/denied` | [N] unit F | write |
 | frontend drain status | `GET /v1/frontend/drain` | [F] | open |
 | begin the frontend's drain | `POST /v1/frontend/drain` | [F] | write |
+| raise the stored epoch (after a restore from a backup) | `POST /v1/epoch/bump` | [F] | write |
 | storage health (under-replicated blobs) | `GET /v1/storage` | [F] | open |
 
 There is no rebalance verb: handoff of data between members is not built, and none is invented
@@ -109,7 +110,6 @@ All answer 404 when the feature is off.
 | preview what a commit would change | `GET /v1/update/plan` | [V] #985 (design) | open |
 | pause updates | `POST /v1/update/pause` | [V] #976 | write |
 | resume updates | `POST /v1/update/resume` | [V] #976 | write |
-| per-host update state | `GET /v1/update/hosts` | [V] #1007 | policy (`farm.getAuthorizer`) |
 | the frontend's own update order, read | `GET /v1/update/frontend` | [V] #1062 | open |
 | the frontend's own update order, write | `POST /v1/update/frontend` | [V] #1062 | write |
 
@@ -149,7 +149,7 @@ default, `--ui=false` turns them off. Open: no gate, whatever the REAPI policy s
 |---|---|---|---|
 | the Overview page | `GET /ui` | [F] | none (open) |
 | the same, with a trailing slash | `GET /ui/` | [F] | none (open) |
-| every other page and the stylesheet (`/ui/nodes`, `/ui/nodes/{id}`, `/ui/builds`, `/ui/builds/{id}`, `/ui/updates`, `/ui/leases`, `/ui/queue`, `/ui/static/kbf.css`) | `GET /ui/{*rest}` | [F] | none (open) |
+| every other page and the stylesheet (`/ui/nodes`, `/ui/nodes/{id}`, `/ui/builds`, `/ui/builds/{id}`, `/ui/leases`, `/ui/queue`, `/ui/static/kbf.css`) | `GET /ui/{*rest}` | [F] | none (open) |
 
 ### Health
 
@@ -179,7 +179,7 @@ section 8) and is not an operator verb of the farm.
 | frontend handover, enroll, `kbf node` | `kbf frontend handover`, `kbf enroll`, `kbf node` **[F]** | replaced by the installer's side-by-side children (#1054, #1062) and removed by #1049 **[V]** |
 | render, check, install units, swap, verify certificate (the `envoy render, check, apply` verbs are retired: no Envoy) | `kbf-deploy` **[F]** | become installer logic and package units; root |
 | `mdm`, `minio`, `pilot`, `erase-request` | `kbf-deploy` **[F]** | leave the product (distribution.md section 8); an erase request is signed with a security key on the operator's machine |
-| `kbf cluster status`, `drain`, `undrain`, `member`, `denied`, `object-store status\|audit\|connection\|bind\|unbind\|verify` | the `kbf` CLI **[F]** (the last two groups: unit G1) | a thin client of the routes above, no logic |
+| `kbf cluster status`, `drain`, `undrain`, `member`, `denied`, `epoch-bump`, `object-store status\|audit\|connection\|bind\|unbind\|verify` | the `kbf` CLI **[F]** (the last two groups: unit G1) | a thin client of the routes above, no logic |
 | frontend log tail | none | cut (Q4) |
 | update policy, image pull | none | no source verb exists (Q5) |
 | rotate the CA | its own unit | out of the object-store series (Q5) |

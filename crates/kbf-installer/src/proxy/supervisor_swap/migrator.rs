@@ -2,7 +2,7 @@
 //! migration is needed, and refuses every other one with a stable word.
 //!
 //! The proxy's swap does not use it (the handover driver wires
-//! [`super::super::migrator::DbMigrator`]); it is the migrator of the API tests over a real
+//! [`crate::migrator::DbMigrator`]); it is the migrator of the API tests over a real
 //! supervisor, where a release at the schema the host runs must pass and any other must stop
 //! at step `migrate`. It never opens a database.
 //!

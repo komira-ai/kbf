@@ -15,10 +15,9 @@ use kbf_objstore::{
     ObjectStoreError, PageSize,
 };
 
-use super::{catch_up_for, one_voter, open_among, open_registered, prefix_root};
+use super::{one_voter, open_among, open_registered, prefix_root};
 use crate::RaftMetaLog;
 use crate::join::Joined;
-use crate::raft_log::START_CEILING;
 
 /// One bucket for every start of a test, which records the keys written to it.
 #[derive(Clone, Default)]
@@ -106,24 +105,10 @@ fn meta_dir(name: &str) -> kbf_testkit::dir::TestDir {
 /// it: the keys from the log's prefix, then [`open_registered`]. Writes `n` blobs one at
 /// a time and returns the keys written.
 async fn start_and_write(dir: &Path, bucket: &Bucket, who: &Joined, n: usize) -> Vec<String> {
-    let (keys, _) = start_and_write_under(dir, bucket, who, n, START_CEILING).await;
-    keys
-}
-
-/// [`start_and_write`] over a log whose start ceiling is `ceiling`, also returning the
-/// log's machine version once the node has opened.
-async fn start_and_write_under(
-    dir: &Path,
-    bucket: &Bucket,
-    who: &Joined,
-    n: usize,
-    ceiling: MachineVersion,
-) -> (Vec<String>, MachineVersion) {
     let before = bucket.written().len();
     let meta = RaftMetaLog::open_dir(dir, Retention::default(), "kbf/")
         .await
-        .expect("open the log")
-        .with_start_ceiling(ceiling);
+        .expect("open the log");
     let prefix = meta.store_prefix();
     let keys = ObjectKeys {
         root: prefix_root(&prefix, meta.log_id()).expect("a root"),
@@ -132,13 +117,12 @@ async fn start_and_write_under(
     let cache = open_registered(meta, bucket.clone(), keys, who)
         .await
         .expect("open as the registration");
-    let version = cache.meta().machine_version();
     for i in 0..n {
         let text = format!("boot {} blob {i}", who.boot);
         let blob = VerifiedBlob::hashed(Bytes::from(text));
         cache.store_blobs(vec![blob]).await.expect("store");
     }
-    (bucket.written()[before..].to_vec(), version)
+    bucket.written()[before..].to_vec()
 }
 
 /// Catches: a node whose keys repeat after its metadata directory is wiped (the new log
@@ -296,72 +280,6 @@ async fn a_log_of_several_voters_refuses_the_open_before_it_is_raised() {
         .expect("open the log again");
     assert_eq!(meta.machine_version(), MachineVersion::V1, "nothing raised");
     drop(meta);
-}
-
-/// Catches: a registered node that raises its log past the start ceiling (mutant: the
-/// raise ignores the ceiling, so the log reaches version 4); one that asks a log below 4
-/// to take `SetWriter`, which the log refuses, so the node does not start (mutant: the
-/// version check before the open dropped); one that names its objects as a node when the
-/// log is below 4 (they would sit under `cas/<member>/<boot>/`, with no `SetWriter`
-/// committed to guard the boot); and a ceiling that lowers or holds back a log already
-/// at 4 (mutant: the ceiling decides the naming, not the log's version). At a ceiling of
-/// 3 the node starts, the log stays at 3 and the keys are an epoch of the log's own; at
-/// 4 the next boot is named by member and boot; back at 3 over the log now at 4, the
-/// next boot still is.
-#[tokio::test]
-async fn a_node_under_a_lower_ceiling_names_its_objects_by_log_epoch() {
-    let dir = meta_dir("ceiling");
-    let bucket = Bucket::default();
-    let (v3, v4) = (MachineVersion::V3, MachineVersion::V4);
-    let (low, version) = start_and_write_under(&dir, &bucket, &joined(7, 1), 2, v3).await;
-    assert_eq!(version, v3, "the node raised the log past its ceiling");
-    assert_eq!(low.len(), 2, "{low:?}");
-    assert!(low.iter().all(|k| !k.starts_with("kbf/cas/")), "{low:?}");
-
-    let prefix = "kbf/cas/0000000000000007/0000000000000002/";
-    let (node, version) = start_and_write_under(&dir, &bucket, &joined(7, 2), 2, v4).await;
-    assert_eq!(version, v4);
-    assert_eq!(node.len(), 2, "{node:?}");
-    assert!(node.iter().all(|k| k.starts_with(prefix)), "{node:?}");
-
-    let prefix = "kbf/cas/0000000000000007/0000000000000003/";
-    let (again, version) = start_and_write_under(&dir, &bucket, &joined(7, 3), 2, v3).await;
-    assert_eq!(version, v4, "the ceiling lowered the log");
-    assert_eq!(again.len(), 2, "{again:?}");
-    assert!(again.iter().all(|k| k.starts_with(prefix)), "{again:?}");
-}
-
-/// Whether a node over the log in `dir`, whose start ceiling is `ceiling` and whose
-/// rebuild of the index is `done` or not, owes a rebuild ([`catch_up_for`]).
-async fn owes_rebuild(dir: &Path, ceiling: MachineVersion, done: bool) -> bool {
-    let meta = RaftMetaLog::open_dir(dir, Retention::default(), "kbf/")
-        .await
-        .expect("open the log")
-        .with_start_ceiling(ceiling);
-    catch_up_for(done, &meta).is_catching_up()
-}
-
-/// Catches: a node whose log the start ceiling holds below 4 that owes a rebuild (mutant:
-/// the ceiling ignored), which would commit `AdoptSegment`, `RebuildProgress` and
-/// `RebuildDone`, all refused by the log, and keep the node catching up for good; a node
-/// whose log takes them that owes none (mutant: always caught up); a finished rebuild
-/// run again (mutant: `done` ignored); and a log already at 4 that a lower ceiling stops
-/// from rebuilding (mutant: the ceiling alone decides, not the log's version).
-#[tokio::test]
-async fn a_node_owes_a_rebuild_only_when_its_log_takes_one() {
-    let dir = meta_dir("owes-rebuild");
-    let (v3, v4) = (MachineVersion::V3, MachineVersion::V4);
-    assert!(!owes_rebuild(&dir, v3, false).await, "held below 4");
-    assert!(owes_rebuild(&dir, v4, false).await, "raisable to 4");
-    assert!(
-        !owes_rebuild(&dir, v4, true).await,
-        "a rebuild that finished"
-    );
-
-    let bucket = Bucket::default();
-    let (_, version) = start_and_write_under(&dir, &bucket, &joined(7, 1), 0, v4).await;
-    assert_eq!(version, v4, "the node raised the log to 4");
-    assert!(owes_rebuild(&dir, v3, false).await, "a log already at 4");
 }
 
 // ---- unit U0 of docs/design/frontend-proxy.md, section 11: a node meets a FRESH state store

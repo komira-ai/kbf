@@ -107,7 +107,6 @@ Overview, Nodes and Node; any other value or parameter is a `400`.
 | Queue | `/ui/queue` | Depth, oldest age, the queue per platform and QoS, and why operations wait or are kept off nodes |
 | Storage | `/ui/storage` | Under-replicated blobs, each member's state, repair debts and open writes, and its write-tier flush backlog |
 | Log | `/ui/runs/{run_id}/logs/{stream}` | One run's log (`stdout`, `stderr` or `result`) as escaped text, the last 1 MiB (`?from=start` for the first), with a note that names the end shown when it is cut, a link to the other end and a link that downloads the whole log; reached from the Action page |
-| Updates | `/ui/updates` | The desired release, the releases, and each host's update state; the command that sets the release is shown as text only |
 
 Nodes, leases and the queue live in the server's memory: after a restart or a frontend
 swap they are empty until the daemons reconnect, and the pages say so, with the time the
