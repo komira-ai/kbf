@@ -94,6 +94,8 @@ pub struct WorkerService {
     peers: Peers,
     heartbeat_interval: Duration,
     hello_wait: Duration,
+    /// What a node that reports VM slots keeps for itself ([`capacity`]).
+    host_floor: HostFloor,
     map: MapFeed,
     offers: OfferFeed,
     /// The oldest and the newest `Hello` version a session accepts.
@@ -115,6 +117,7 @@ impl WorkerService {
             peers,
             heartbeat_interval,
             hello_wait,
+            host_floor: HostFloor::DEFAULT,
             map: MapFeed::NONE,
             offers: OfferFeed::NONE,
             protocols: (OLDEST_PROTOCOL_VERSION, PROTOCOL_VERSION),
@@ -128,6 +131,14 @@ impl WorkerService {
     #[must_use]
     pub const fn with_protocols(mut self, oldest: u32, newest: u32) -> Self {
         self.protocols = (oldest, newest);
+        self
+    }
+
+    /// The service keeping `floor` of the CPUs and memory of each node that reports VM
+    /// slots for the node itself ([`capacity`]).
+    #[must_use]
+    pub const fn with_host_floor(mut self, floor: HostFloor) -> Self {
+        self.host_floor = floor;
         self
     }
 
@@ -174,7 +185,7 @@ impl Worker for WorkerService {
             return Err(Status::invalid_argument("Hello has no node_id"));
         }
         self.peers.admit(peer.as_ref(), &hello.node_id).await?;
-        let mut reported = reported(&hello).map_err(Status::invalid_argument)?;
+        let mut reported = reported(&hello, self.host_floor).map_err(Status::invalid_argument)?;
         // The stream speaks what `Welcome` names, which a newer daemon's `Hello` may exceed.
         reported.protocol = Some(version);
         let worker = WorkerId::new(hello.node_id);
@@ -212,6 +223,7 @@ impl Worker for WorkerService {
             peer,
             worker,
             stream,
+            host_floor: self.host_floor,
         };
         tokio::spawn(session.serve(inbound, outbound));
         Ok(Response::new(Box::pin(stream::unfold(
@@ -250,6 +262,7 @@ struct Session {
     peer: Option<PeerCert>,
     worker: WorkerId,
     stream: StreamId,
+    host_floor: HostFloor,
 }
 
 impl Session {
@@ -295,7 +308,7 @@ impl Session {
                 self.peers
                     .admit(self.peer.as_ref(), worker.as_str())
                     .await?;
-                match reported(&hello) {
+                match reported(&hello, self.host_floor) {
                     Ok(reported) => farm.resize(worker, stream, reported),
                     Err(e) => tracing::warn!(%worker, error = %e, "a resent Hello ignored"),
                 }
@@ -381,9 +394,9 @@ pub(crate) fn message(message: server_message::Message) -> ServerMessage {
 ///
 /// # Errors
 /// Any of the three is malformed.
-pub fn reported(hello: &Hello) -> Result<Reported, String> {
+pub fn reported(hello: &Hello, floor: HostFloor) -> Result<Reported, String> {
     Ok(Reported {
-        capacity: capacity(hello)?,
+        capacity: capacity(hello, floor)?,
         caps: caps(hello)?,
         phase: phase(hello)?,
         protocol: named_protocol(hello.protocol_version),
@@ -420,20 +433,66 @@ pub fn phase(hello: &Hello) -> Result<NodePhase, String> {
     })
 }
 
-/// What placement may book on a node: its `cpus` and `mem_gib` entries, and its `gpu`
-/// entry (0 when absent: a daemon that does not detect GPUs has none to book). v0 books
-/// the whole machine; the protected floors (planned,
-/// `docs/design/capabilities.md#planned`) are subtracted once they are
-/// reported.
+/// The most macOS guests one Mac runs at once (Apple's limit); a node's `vm.slots` is
+/// clamped to it.
+pub const MAX_VM_SLOTS: u64 = 2;
+
+/// What a node that reports VM slots keeps for the host itself: subtracted from its
+/// capacity so that guests cannot take the host's own share of cores and memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostFloor {
+    /// CPU, in thousandths of a core.
+    pub cpu_millis: u64,
+    /// Memory, in bytes.
+    pub memory_bytes: u64,
+}
+
+impl HostFloor {
+    /// The floor of `cpus` cores and `mem_gib` GiB.
+    #[must_use]
+    pub const fn new(cpus: u64, mem_gib: u64) -> Self {
+        Self {
+            cpu_millis: cpus.saturating_mul(1_000),
+            memory_bytes: mem_gib.saturating_mul(1 << 30),
+        }
+    }
+
+    /// 2 cores and 8 GiB.
+    pub const DEFAULT: Self = Self::new(2, 8);
+}
+
+impl Default for HostFloor {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// What placement may book on a node: its `cpus` and `mem_gib` entries, its `gpu` entry
+/// (0 when absent: a daemon that does not detect GPUs has none to book) and its
+/// `vm.slots` entry (0 when absent), clamped to [`MAX_VM_SLOTS`]. A node that reports
+/// at least one VM slot gives up `floor` of its CPUs and memory to the host; any other
+/// node books the whole machine. The other protected floors (planned,
+/// `docs/design/capabilities.md#planned`) are subtracted once they are reported.
 ///
 /// # Errors
 /// `cpus` or `mem_gib` is missing; an entry is repeated or not a whole number.
-pub fn capacity(hello: &Hello) -> Result<Resources, String> {
+pub fn capacity(hello: &Hello, floor: HostFloor) -> Result<Resources, String> {
     let required = |key| entry(&hello.capabilities, key)?.ok_or_else(|| missing(key));
     let cpus = required("cpus")?;
     let mem_gib = required("mem_gib")?;
     let gpus = entry(&hello.capabilities, "gpu")?.unwrap_or(0);
-    Ok(Resources::new(cpus.saturating_mul(1_000), mem_gib.saturating_mul(1 << 30)).with_gpus(gpus))
+    let vms = entry(&hello.capabilities, "vm.slots")?
+        .unwrap_or(0)
+        .min(MAX_VM_SLOTS);
+    let mut cpu_millis = cpus.saturating_mul(1_000);
+    let mut memory_bytes = mem_gib.saturating_mul(1 << 30);
+    if vms > 0 {
+        cpu_millis = cpu_millis.saturating_sub(floor.cpu_millis);
+        memory_bytes = memory_bytes.saturating_sub(floor.memory_bytes);
+    }
+    Ok(Resources::new(cpu_millis, memory_bytes)
+        .with_gpus(gpus)
+        .with_vms(vms))
 }
 
 /// What placement matches an action's platform against: the node report read by

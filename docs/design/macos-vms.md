@@ -363,8 +363,10 @@ Otherwise placement goes to the least loaded feasible worker (the least booked s
 of its CPU or memory, then the fewest leases, then worker-name order) **[V]**. The
 changes still planned:
 
-1. **A `vms` dimension** in `Resources`, filled from `vm.slots`, checked by `fits` like
-   `gpus`. A VM lease books `vms=1`, `kbf-book-cpus` and `kbf-book-mem-gib`. The
+1. **A `vms` dimension** in `Resources`, filled from `vm.slots` (on `main`: the server
+   books `min(2, slots)` and keeps the host floor out of the node's CPUs and memory),
+   checked by `fits` like `gpus`. A VM's memory is checked against the node's free
+   memory, not only its capacity as for an action. A VM lease books `vms=1`, `kbf-book-cpus` and `kbf-book-mem-gib`. The
    scheduler therefore never asks for a third VM, and the driver still maps
    `VZErrorVirtualMachineLimitExceeded` to an infrastructure failure that is retried
    elsewhere.

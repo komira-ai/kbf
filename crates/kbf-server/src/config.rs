@@ -26,6 +26,7 @@ use crate::proxy_auth::{ProxySecret, ProxySecretError};
 use crate::serve::{Api, Behind, Listeners, StreamTiming, WorkerTls};
 use crate::stores::{S3Uri, StoreFlags, StoreUri, Stores, StoresError};
 use crate::token::{ApiToken, TokenFileError};
+use crate::worker::HostFloor;
 
 /// The default of `--tls-reload-interval-secs`.
 const DEFAULT_TLS_RELOAD_SECS: u64 = 30;
@@ -311,6 +312,15 @@ pub struct Args {
         default_values_t = kbf_sched::MemoryLadder::DEFAULT_GIB
     )]
     pub memory_ladder_gib: Vec<u64>,
+    /// The cores a node that reports VM slots (`vm.slots`) keeps for the host itself:
+    /// subtracted from the CPUs placement may book on it, so that guests cannot take the
+    /// host's own share. A node that reports none books the whole machine.
+    #[arg(long, default_value_t = 2)]
+    pub vm_host_floor_cpus: u64,
+    /// The memory, in GiB, a node that reports VM slots (`vm.slots`) keeps for the host
+    /// itself, subtracted as `--vm-host-floor-cpus` subtracts cores.
+    #[arg(long, default_value_t = 8)]
+    pub vm_host_floor_mem_gib: u64,
     /// What the farm does with `kbf-estimator`, which predicts an action's memory from
     /// what its earlier runs used. `off` calls it never. `shadow` shows it every attempt
     /// that finishes and logs, for every new operation, a `size estimate:` line with what
@@ -819,6 +829,7 @@ impl Args {
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
             default_platform: self.default_platform,
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
+            vm_host_floor: HostFloor::new(self.vm_host_floor_cpus, self.vm_host_floor_mem_gib),
             learned_sizes: self.learned_sizes,
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: match self.shutdown_timeout_secs {

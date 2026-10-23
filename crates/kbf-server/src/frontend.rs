@@ -155,6 +155,8 @@ pub const ALLOWED: &[&str] = &[
     "unservable_wait_secs",
     "default_platform",
     "memory_ladder_gib",
+    "vm_host_floor_cpus",
+    "vm_host_floor_mem_gib",
     "learned_sizes",
     "finished_retention_secs",
     "shutdown_timeout_secs",
@@ -1176,7 +1178,8 @@ impl<'a> Prepared<'a> {
             peers,
             listeners.heartbeat_interval,
             listeners.hello_wait,
-        );
+        )
+        .with_host_floor(listeners.vm_host_floor);
         // Daemons are sent the members' map: Welcome.map and a MapUpdate at each bump.
         let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
         let sessions = offers

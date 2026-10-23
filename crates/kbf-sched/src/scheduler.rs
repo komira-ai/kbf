@@ -213,8 +213,9 @@ impl Worker {
 
     /// Whether `request` can be placed on it now, platform and kind aside: an action
     /// if no whole-machine lease holds it, its free CPUs, GPUs and VM slots hold the
-    /// request, and its memory capacity is at least the request's memory; a
-    /// whole-machine lease if it holds no lease and its capacity holds the request. A
+    /// request, and its memory capacity is at least the request's memory; a VM if no
+    /// whole-machine lease holds it and its free CPUs, memory, GPUs and VM slots hold the
+    /// request; a whole-machine lease if it holds no lease and its capacity holds the request. A
     /// request for an iOS device also needs a free device that satisfies it
     /// ([`Worker::free_device`]).
     pub(crate) fn has_room(&self, request: &Request) -> bool {
@@ -226,10 +227,18 @@ impl Worker {
             // pressure backstop pauses starts. The limit must still be one the node can
             // give. The one limit that is not a share is the whole host ([`Worker::exclusive`]):
             // that action runs alone.
-            LeaseKind::Action | LeaseKind::Vm => {
+            LeaseKind::Action => {
                 !self.whole
                     && self.free().fits(&request.resources.without_memory())
                     && request.resources.memory_bytes <= self.capacity.memory_bytes
+                    && (!self.exclusive(request) || self.leases == 0)
+            }
+            // A VM's memory is a booking: the guest holds it whole for as long as it runs,
+            // so what other leases hold of the node's memory keeps it out, and VMs never
+            // overcommit the node.
+            LeaseKind::Vm => {
+                !self.whole
+                    && self.free().fits(&request.resources)
                     && (!self.exclusive(request) || self.leases == 0)
             }
         };
