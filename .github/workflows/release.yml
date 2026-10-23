@@ -167,6 +167,14 @@ jobs:
           merge-multiple: true
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
+      # The assets artifacts carry the SHA256SUMS.<platform> files the sums were made from;
+      # assembling them must give the published SHA256SUMS, and removes them from dist (they
+      # are not release assets).
+      - name: Set the published SHA256SUMS aside
+        run: mkdir published
+      - run: mv dist/SHA256SUMS published/SHA256SUMS
+      - name: Assemble SHA256SUMS, which must be the published one
+        run: cargo xtask sums assemble dist --expect published/SHA256SUMS
       - name: Check the files against SHA256SUMS
         working-directory: dist
         run: sha256sum --check --strict SHA256SUMS

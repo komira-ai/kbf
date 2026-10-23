@@ -85,6 +85,13 @@ jobs:
         with:
           name: sha256sums
           path: dist
+      # The assets artifacts carry the SHA256SUMS.<platform> files the sums were made from;
+      # assembling them must give the published SHA256SUMS, and removes them from dist.
+      - name: Set the published SHA256SUMS aside
+        run: mkdir published
+      - run: mv dist/SHA256SUMS published/SHA256SUMS
+      - name: Assemble SHA256SUMS, which must be the published one
+        run: cargo xtask sums assemble dist --expect published/SHA256SUMS
       - name: Every file is the one SHA256SUMS lists
         run: cargo xtask verify-assets sums dist
       - name: The kbf in the tarball names this commit and a release build
