@@ -19,6 +19,7 @@ use crate::audit::{self, Audit};
 use crate::config::Allowlist;
 use crate::debver::DebVersion;
 use crate::locks;
+use crate::node_id;
 use crate::outcome::{Failure, FailureCode, Outcome, QueryReport, Refusal};
 use crate::plan;
 use crate::request::{BadCommand, Channel, Request, Version};
@@ -124,6 +125,10 @@ pub struct Host {
     pub(crate) install_lock: PathBuf,
     pub(crate) proc_locks: PathBuf,
     pub(crate) dpkg_lock: PathBuf,
+    /// The node's configuration, where its id is.
+    pub(crate) node_config: PathBuf,
+    /// The kernel's host name, the node id when the configuration names none.
+    pub(crate) hostname: PathBuf,
     /// This program, as the install unit runs it again.
     pub(crate) self_exe: PathBuf,
     pub(crate) trust: Trust,
@@ -138,6 +143,8 @@ impl Host {
             install_lock: PathBuf::from("/run/kbf-host-install.lock"),
             proc_locks: PathBuf::from("/proc/locks"),
             dpkg_lock: PathBuf::from("/var/lib/dpkg/lock-frontend"),
+            node_config: PathBuf::from("/etc/kbf/kbf.toml"),
+            hostname: PathBuf::from("/proc/sys/kernel/hostname"),
             self_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from(SELF_EXE)),
             trust: Trust::root(),
         }
@@ -152,6 +159,8 @@ impl Host {
             install_lock: dir.join("install.lock"),
             proc_locks: dir.join("proc-locks"),
             dpkg_lock: dir.join("lock-frontend"),
+            node_config: dir.join("kbf.toml"),
+            hostname: dir.join("hostname"),
             self_exe: PathBuf::from(SELF_EXE),
             trust,
         }
@@ -268,6 +277,7 @@ fn query(host: &Host, runner: &dyn Runner) -> Outcome {
     Outcome::Queried(QueryReport {
         installed_version: installed,
         running_commit,
+        node_id: node_id::read(&host.trust, &host.node_config, &host.hostname),
         in_progress: unit_listed
             || locks::flock_held(&host.install_lock)
             || locks::held(&host.proc_locks, &host.dpkg_lock),
@@ -434,8 +444,9 @@ fn relay(started: io::Result<Exec>, version: &Version) -> Outcome {
     }
 }
 
-/// The body of the install unit: allowlist again, the lock, the not-older check, the two
-/// apt steps, and the package database read back. The lock is held by this process from
+/// The body of the install unit: allowlist again, the lock, the same-version check, the two
+/// apt steps, and the package database read back. An older version installs like a newer
+/// one: a rollback is an install. The lock is held by this process from
 /// before the first read until the function returns, which is until the process exits.
 fn install_body(
     host: &Host,
@@ -447,7 +458,7 @@ fn install_body(
     let source = allowlist
         .channel(&host.trust, channel)
         .map_err(Outcome::Refused)?;
-    // One install at a time: the not-older check and the install are one critical
+    // One install at a time: the same-version check and the install are one critical
     // section. The lock is dropped (and so released) when this function returns.
     let _lock = take_install_lock(host)?;
     if let Installed::Present {
@@ -456,14 +467,10 @@ fn install_body(
         clean,
     } = read_installed(runner)?
     {
-        match version.parsed().cmp(&parsed) {
-            std::cmp::Ordering::Less => return Err(Outcome::Refused(Refusal::OlderThanInstalled)),
-            // The same version is done, unless dpkg flags the package: then apt installs it
-            // again.
-            std::cmp::Ordering::Equal if clean => {
-                return Ok(Outcome::AlreadyInstalled { version: text });
-            }
-            std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {}
+        // The same version is done, unless dpkg flags the package: then apt installs it
+        // again. Any other version, older or newer, is installed.
+        if clean && *version.parsed() == parsed {
+            return Ok(Outcome::AlreadyInstalled { version: text });
         }
     }
     step(

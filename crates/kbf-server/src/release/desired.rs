@@ -305,7 +305,7 @@ async fn set_desired(
         }
         Err(e) => return store_failed(&e),
     }
-    // The wall clock: the controller counts its waits from this, across restarts.
+    // The wall clock: the update waits are counted from this, across restarts.
     let now = update.farm.wall_now();
     let release = Release::new(commit);
     match blocking(move || rows.offer_expecting(&release, Source::Fetch, now, expect_generation))

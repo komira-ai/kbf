@@ -103,6 +103,17 @@
 //! Values are the `kbf-log` encoding of the scheduler's own inputs (a `Submit`, the
 //! `Committed` lease, a `WorkerUp`), so the `kbf-log` codec the replicated log already runs
 //! decides what a row may hold.
+//!
+//! A `lease/` or `op/` row that holds a command this binary does not know was written by
+//! a later binary: a scan skips it, and the rows it can read load. A start ([`Durable::load`])
+//! logs the key of each row it skips; the scans a request makes skip them silently, so one
+//! leftover row does not fill the log at request rate. A row that is malformed, or that
+//! holds a known command of the wrong kind, still refuses the scan, and so does a single
+//! row a write depends on, whatever it holds.
+//!
+//! A skipped `lease/` row leaves its operation with no lease: it loads queued, the
+//! scheduler can grant it again, and the action may run twice. Nothing names the skipped
+//! row's lease again, so the row is never deleted.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::Range;
@@ -522,6 +533,11 @@ fn decode(key: &str, bytes: &[u8]) -> Result<FarmInput, StateError> {
     }
 }
 
+/// Whether `bytes` hold a command this binary does not know, which a later one wrote.
+fn is_unknown(bytes: &[u8]) -> bool {
+    matches!(kbf_log::decode(Format::V1, bytes), Ok(LogCommand::Unknown))
+}
+
 fn parse_operation(key: &str, prefix: &str) -> Result<OperationId, StateError> {
     let id = u64::from_str_radix(&key[prefix.len()..], 16)
         .map_err(|_| corrupt(key, "not an operation id"))?;
@@ -577,6 +593,28 @@ impl Durable {
         Ok((durable, epoch))
     }
 
+    /// The rows under `prefix` that a scan can use: a row that holds a command this
+    /// binary does not know is left out, and every other row stays, for the scan to read
+    /// or refuse. It logs nothing: a scan a request makes would repeat it per request.
+    fn scan_known(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StateError> {
+        let mut rows = self.store.scan_prefix(prefix)?;
+        rows.retain(|(_, row)| !is_unknown(&row.value));
+        Ok(rows)
+    }
+
+    /// [`Durable::scan_known`], logging the key of each row it leaves out: for a start.
+    fn scan_known_logged(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StateError> {
+        let mut rows = self.store.scan_prefix(prefix)?;
+        rows.retain(|(key, row)| {
+            let unknown = is_unknown(&row.value);
+            if unknown {
+                tracing::warn!(%key, "a row holds a command this binary does not know: skipped");
+            }
+            !unknown
+        });
+        Ok(rows)
+    }
+
     /// The row at `key`, which the write that asks depends on.
     fn row(&self, key: &str) -> Result<Versioned, StateError> {
         let row = self.store.get(key)?;
@@ -592,7 +630,7 @@ impl Durable {
     /// first ids to hand out.
     pub(super) fn load(&self) -> Result<Stored, StateError> {
         let mut leases = std::collections::BTreeMap::new();
-        for (key, row) in self.store.scan_prefix("lease/")? {
+        for (key, row) in self.scan_known_logged("lease/")? {
             let grant = lease_row(&key, &row)?;
             leases.insert(grant.operation, grant);
         }
@@ -665,7 +703,7 @@ impl Durable {
             key_floors.push(floor);
         }
         let mut operations = Vec::new();
-        for (key, row) in self.store.scan_prefix("op/")? {
+        for (key, row) in self.scan_known_logged("op/")? {
             let request = request_row(&key, &row)?;
             let operation = parse_operation(&key, "op/")?;
             let lease = leases.remove(&operation);
@@ -795,7 +833,7 @@ impl Durable {
         action: &Digest,
     ) -> Result<Vec<OperationId>, StateError> {
         let mut found = Vec::new();
-        for (key, row) in self.store.scan_prefix("op/")? {
+        for (key, row) in self.scan_known("op/")? {
             let request = request_row(&key, &row)?;
             let named = instance.is_none_or(|instance| request.key.instance == instance);
             if named && request.key.action == *action {
@@ -1621,3 +1659,5 @@ mod submit_tests;
 mod tests;
 #[cfg(test)]
 mod transition_tests;
+#[cfg(test)]
+mod unknown_tests;

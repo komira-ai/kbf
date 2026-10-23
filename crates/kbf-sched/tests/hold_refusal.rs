@@ -113,7 +113,9 @@ fn a_refusal_is_taken_back_when_a_worker_elsewhere_could_run_the_operation() {
     assert_eq!(s.queued_len(), 0, "a proposed refusal leaves the queue");
     let elsewhere = Resources::new(4_000, 8 * GIB);
 
-    let held = hold(&mut s, record.operation, &|r| r.runnable_on(&mac(), &elsewhere));
+    let held = hold(&mut s, record.operation, &|r| {
+        r.runnable_on(&mac(), &elsewhere)
+    });
 
     assert!(held);
     assert_eq!(s.state(record.operation), Some(&OpState::Queued));

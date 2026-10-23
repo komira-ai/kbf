@@ -45,7 +45,7 @@
       "finished": 5000
     }
   ],
-  "note": "gate runs: ci 111, beta 222, artifacts 333; tested_bytes: rebuilt",
+  "note": "gate run: pipeline 111 (ci, artifacts, beta); beta smoke on the attested kbf",
   "tag": "v0.3.7",
   "not_reversible": [
     "meta-log format"

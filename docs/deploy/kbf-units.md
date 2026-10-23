@@ -180,10 +180,15 @@ because it learns a node's boot only when the node registers, after the frontend
 ### The state store: Postgres for the frontend
 
 The frontend's state store is Postgres (CEO ruling: SQLite is dropped for it). The frontend
-gets `--state-store`, a `postgres://` URI, from `kbf.toml`; the default is the host's socket,
-`postgres:///kbf?host=/run/postgresql`. The URI carries no password (kbf refuses one: the
-command line is readable by every user on the node), so the database is reached by the
-socket or by the server user's own role. The database and its schema are `kbf-installer`'s.
+gets `--state-store`, a `postgres://` URI, from `kbf.toml` (`kbf-installer setup` writes it,
+as `postgres:///kbf?host=/run/postgresql&user=kbf-server`), and it has no default: a
+frontend given none exits 2 naming the flag, and `kbf --mode=frontend --check`, which the
+unit runs before the start, exits 2 the same way. (`all-in-one` alone has a default, the
+host's socket, `postgres:///kbf?host=/run/postgresql`.) A `sqlite://` URI still starts in
+this release and logs a warning that SQLite is removed in the next (see the upgrade notes).
+The URI carries no password (kbf refuses one: the command line is readable by every user on
+the node), so the database is reached by the socket or by the server user's own role. The
+database and its schema are `kbf-installer`'s.
 
 The unit gives no `--handover-socket` (nor a `RuntimeDirectory=` for one): `kbf frontend`
 refuses a Postgres `--state-store` together with it (`HandoverError::PostgresStore`: a Postgres

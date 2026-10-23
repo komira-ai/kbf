@@ -227,14 +227,17 @@ pub fn storage_node(dir: &Path, name: &str) -> Child {
 }
 
 /// The arguments of a `kbf frontend` on the ports of the slot whose base is `base`, in front
-/// of the storage node at `storage` (its `host:port`).
-pub fn frontend_args(storage: &str, base: u16) -> Vec<String> {
+/// of the storage node at `storage` (its `host:port`), keeping its state in the SQLite file
+/// `state` (a frontend starts only over a state store, and a file is held by one process, so
+/// each slot has its own).
+pub fn frontend_args(storage: &str, base: u16, state: &Path) -> Vec<String> {
     vec![
         "frontend".to_owned(),
         format!("--listen=127.0.0.1:{base}"),
         format!("--worker-listen=127.0.0.1:{}", base + 1),
         format!("--api-listen=127.0.0.1:{}", base + 2),
         format!("--storage=http://{storage}"),
+        format!("--state-store=sqlite://{}", state.display()),
     ]
 }
 

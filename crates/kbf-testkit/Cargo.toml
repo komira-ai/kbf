@@ -15,17 +15,25 @@ name = "kbf-act"
 path = "src/bin/kbf-act.rs"
 test = false
 
+[features]
+# `database`: a Postgres database a test owns. Off by default, so the crates that take this one
+# as a normal dependency (the test-only bins) carry no database client.
+postgres = ["dep:postgres"]
+
 # No kbf dependency: every crate may take this one as a dev-dependency (or a
 # dependency of a test-only bin) without a cycle. rustix makes its system calls
 # directly on Linux; libc is for the two calls rustix has no portable form of
 # (mkfifo, and signal to ignore one). `kbf-m2-act` still links statically.
 [dependencies]
 libc.workspace = true
+postgres = { workspace = true, optional = true }
 rustix = { workspace = true, features = ["process", "net"] }
 # `switch`: the forwarder tokio runs on the caller's runtime.
 tokio = { workspace = true, features = ["io-util", "net", "rt"] }
 
 [dev-dependencies]
+# This crate's own tests of `database` (the files in tests/ see only the features that are on).
+kbf-testkit = { workspace = true, features = ["postgres"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
 
 [lints]
