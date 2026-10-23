@@ -317,7 +317,9 @@ and the canary cannot see a missing rule there; the slot cannot mount either.
 For `mach-register` the service name is one no job declares, so with the rule dropped launchd
 answers 1102 (`BOOTSTRAP_UNKNOWN_SERVICE`), never success: the sandbox refuses before launchd
 looks the name up, with 1100 instead of 1102. The canary depends on that split, and a dropped
-rule is reported as a failure (not a refusal of this door), not as an open door. The `lsopen`
+rule is reported as a failure (not a refusal of this door), not as an open door: the log reads
+`could not run`, with `not a refusal of this door: kern=1102`, and `NOT refused: the call succeeded` is
+what a check-in answering 0 reads as. The `lsopen`
 canary shows that the rule is in the profile the process runs under, not that Launch Services
 refused an open. The `launchd-bootstrap` canary writes its job file with mode 0644, so the
 refusal is not a file launchd rejects for its permissions.
@@ -326,7 +328,7 @@ Left open on purpose:
 
 - `job-creation`: launchd refuses a bootstrap from any sandboxed process, `(allow default)`
   alone included, so there is no rule to add; the `launchd-bootstrap` canary asserts the
-  refusal whatever its cause, and a test shows it refused under a profile with no deny.
+  refusal whatever its cause, and a test shows it refused under a profile with no deny. The row proves that a bootstrap is refused in the slot environment, not that the sandbox is the reason: no profile rule governs it, so no change to the profile turns this canary red.
 - `ipc-posix*`: denying it breaks Python's `multiprocessing` and `xcodebuild`.
 - `hdiutil attach` with no mount point: it still mounts under `/Volumes` through
   `diskimages-helper`, even with `(deny file-mount)`. The clean's unmount step and the death

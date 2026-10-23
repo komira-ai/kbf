@@ -342,8 +342,11 @@ pub struct Ran {
 pub enum Verdict {
     #[error("refused ({0})")]
     Refused(Refusal),
+    /// The call succeeded (a check-in answered 0, a mount was made, a bootstrap loaded).
     #[error("NOT refused: the call succeeded")]
     Allowed,
+    /// Anything else, including an answer that is no refusal of its door (a Mach
+    /// check-in answering 1102 with the rule dropped): the log says what was seen.
     #[error("could not run: {0}")]
     CannotRun(String),
 }
@@ -890,6 +893,34 @@ mod tests {
         let (seen, got) = calls(Op::LaunchdBootstrap, World::Shut);
         assert_eq!(seen, Seen::Refused(Refusal::Bootstrap(5)));
         assert_eq!(got.len(), 3, "a shut door boots out nothing: {got:?}");
+        // A tool killed after it may have loaded the job, and a failure of another
+        // kind, are not refusals: the job is booted out all the same.
+        let killed = {
+            let mut f = world(Op::LaunchdBootstrap, World::Shut);
+            f.out = Out {
+                code: None,
+                text: "\n(killed: still running after the tool's time)".to_owned(),
+            };
+            f
+        };
+        let other = {
+            let mut f = world(Op::LaunchdBootstrap, World::Shut);
+            f.out = Out {
+                code: Some(1),
+                text: "no".to_owned(),
+            };
+            f
+        };
+        for fake in [other, killed] {
+            let seen = probe(&fake, Op::LaunchdBootstrap, lease);
+            assert!(matches!(seen, Seen::Failed(_)), "{seen:?}");
+            let got = fake.calls.into_inner();
+            assert!(
+                got.contains(&format!("run /bin/launchctl bootout user/501/{label}")),
+                "a failed bootstrap still boots its job out: {got:?}"
+            );
+            assert_eq!(got.last(), Some(&format!("remove {job}")));
+        }
     }
 
     /// Catches a door canary that reads a failure that is not a refusal as one (a tool
@@ -925,10 +956,13 @@ mod tests {
         assert!(matches!(probe(&fake, Op::Mount, lease), Seen::Failed(_)));
         let mut fake = world(Op::MachRegister, World::Shut);
         fake.kern = 1102;
-        assert!(matches!(
-            probe(&fake, Op::MachRegister, lease),
-            Seen::Failed(_)
-        ));
+        // Not "NOT refused: the call succeeded", which is what a check-in answering 0
+        // reads as: 1102 is a failure that names the answer.
+        let seen = probe(&fake, Op::MachRegister, lease);
+        assert!(
+            matches!(&seen, Seen::Failed(t) if t.contains("not a refusal of this door: kern=1102")),
+            "{seen:?}"
+        );
         // A tool that cannot be started, and a platform without the call.
         let mut fake = world(Op::LaunchdBootstrap, World::Shut);
         fake.no_tools = true;

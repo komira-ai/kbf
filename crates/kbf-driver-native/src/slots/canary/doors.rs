@@ -394,7 +394,13 @@ fn read_bootstrap(out: &Out) -> Seen {
 }
 
 /// Writes the job file `job` and asks launchd to bootstrap it into the user's domain;
-/// an agent an open door loaded is booted out, and the file is removed.
+/// the job is booted out after every result but a refusal (an open door loaded it, and
+/// a tool killed for taking too long may have loaded it before it was killed), and the
+/// file is removed.
+///
+/// No profile rule governs this door: a bootstrap from a sandboxed process is refused
+/// whatever the profile says. So a refusal proves a bootstrap is refused in the slot
+/// environment, not that the sandbox is the reason.
 pub fn bootstrap(fs: &dyn Fs, job: &Path) -> Seen {
     let label = job_label();
     if let Err(e) = fs.write(job, &job_plist(&label)) {
@@ -408,7 +414,7 @@ pub fn bootstrap(fs: &dyn Fs, job: &Path) -> Seen {
         Ok(out) => read_bootstrap(&out),
         Err(e) => Seen::Failed(format!("could not start launchctl: {e}")),
     };
-    if seen == Seen::Allowed {
+    if !matches!(seen, Seen::Refused(_)) {
         let _ = fs.run(
             "/bin/launchctl",
             &["bootout".into(), format!("{domain}/{label}")],
