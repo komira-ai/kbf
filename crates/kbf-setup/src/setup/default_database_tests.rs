@@ -41,11 +41,18 @@ fn creates(world: &Shared) -> Vec<String> {
         .collect()
 }
 
-/// A host whose `psql` is not installed, with this `os-release`.
+/// A host whose `psql` is not installed, with this `os-release`. Every other program runs: the
+/// account steps that come before the database step must be able to succeed.
 fn no_psql(os_release: &str) -> FakeExec {
     let mut exec = released(host(), Platform::Linux);
     put(&mut exec, OS_RELEASE, 0o644, ROOT, os_release);
-    exec.answer = Box::new(|_| Err(io::Error::from(io::ErrorKind::NotFound)));
+    exec.answer = Box::new(|cmd| {
+        if cmd.program.as_str() == provision::PSQL {
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        } else {
+            Ok(reply(0, "", ""))
+        }
+    });
     exec
 }
 
