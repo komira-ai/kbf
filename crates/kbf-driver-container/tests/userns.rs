@@ -24,11 +24,11 @@ fn chowns(fake: &Fake) -> Vec<String> {
 }
 
 /// Catches the overlay not being handed to the container's root before the container
-/// starts (the action could write nothing: the "drop the pre-chown" mutant), not being
+/// starts (the action could write nothing: the "drop the pre-chown" defect), not being
 /// handed back after it exits (an output the action made `0600` could not be read:
-/// the "drop the chown-back" mutant), handed back after the outputs are read (the
+/// the "drop the chown-back" defect), handed back after the outputs are read (the
 /// fake's upper directory is still unreadable then: the "hand back after collect"
-/// mutant), either one naming the wrong directories, and the hand-back running before
+/// defect), either one naming the wrong directories, and the hand-back running before
 /// the container has exited.
 #[tokio::test]
 async fn the_overlay_is_the_containers_while_it_runs_and_the_daemons_after() {

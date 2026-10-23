@@ -29,7 +29,7 @@ fn one_cache() -> (Arc<LocalCache>, Arc<AtomicU64>) {
 }
 
 /// Catches a budget that leaves local storage's bytes out (the input cache and the hot
-/// store would together hold more than the disk's share: the "two budgets" mutant), the
+/// store would together hold more than the disk's share: the "two budgets" defect), the
 /// one cache's fill missing the entries, and a fill that does not make room: with a
 /// budget of 300 bytes, three entries of 100 fit until local storage holds 150; then the
 /// two least recently used go, the stats say what local storage holds, and the fill is
@@ -203,7 +203,7 @@ impl Cas for Chunked {
     }
 }
 
-/// Catches a fill that reads the blob whole (the "fetch, then write" mutant: a blob as
+/// Catches a fill that reads the blob whole (the "fetch, then write" defect: a blob as
 /// large as the disk's share would be held in memory) or writes it anywhere but its
 /// file: a blob of 5 MiB and 3 bytes (more than any buffer of the read path) arrives in
 /// 81 chunks of 64 KiB, each in the entry's file before the next, with no whole read of
@@ -243,7 +243,7 @@ async fn a_fill_writes_the_blob_into_its_file_as_it_arrives() {
 
 /// Catches a fill whose write into `tmp/` fails (a full disk) failing the lease or
 /// leaving its file, and a lease's own fetch that reads the blob whole (the "fetch,
-/// then write" mutant of the fallback): the lease fetches the blob into its own file,
+/// then write" defect of the fallback): the lease fetches the blob into its own file,
 /// for a blob of one chunk and one of 81 chunks of 64 KiB each in the file before the
 /// next, with no whole read; each of its names is right and linked to one inode,
 /// nothing is indexed, and `tmp/` is empty.
@@ -448,7 +448,7 @@ async fn in_clone_mode_every_fill_gives_each_name_its_own_writable_file() {
 }
 
 /// Catches a budget that reacts to local storage only when an input is fetched (the
-/// "no room check" mutant: on a node that only uploads, the hot store would grow past
+/// "no room check" defect: on a node that only uploads, the hot store would grow past
 /// the share the budget leaves it while the entries stay): once the first adopt pass
 /// (and its eviction round) is over, three entries of 100 fill a budget of 300; local
 /// storage then grows to 150 with no lease running, and within seconds the two least

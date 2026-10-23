@@ -1844,7 +1844,7 @@ mod tests {
 
     /// Catches a node with a pool and no `sandbox-exec` starting (the check exists but
     /// `NativeRuntime::new` does not call it, or calls it after something is made): the
-    /// start is refused for that reason, before the scratch root is made. Seen red with
+    /// start is refused for that reason, before the scratch root is made. It fails with
     /// the call removed from `build`: the start succeeds on macOS and is refused for the
     /// wrong reason elsewhere.
     #[test]
@@ -1882,7 +1882,7 @@ mod tests {
 
     /// Catches: a failed lease's usage lost (the daemon asks once, after `run` failed),
     /// handed out twice (a second lease with the same id would report the first's),
-    /// kept for a lease that succeeded, or kept without bound. Mutants seen red: `remove`
+    /// kept for a lease that succeeded, or kept without bound. Catches: `remove`
     /// replaced by `get().cloned()` (taken twice); the bound removed (300 kept);
     /// `pop_first` replaced by `pop_last` (the newest lease's usage dropped).
     #[test]

@@ -120,7 +120,7 @@ fn each_verb_sends_its_call_and_prints_the_answer() {
 /// percent-encoded as one segment, behind the token and the JSON content type), and an exit
 /// status that does not follow the verdict: 0 and "safe to stop" when it is safe, 3 and the
 /// reasons on stdout when it is not (never 0, which would stop the host; never 1, which a
-/// script reads as a failed call), nothing on stderr for either. Mutants it catches: the
+/// script reads as a failed call), nothing on stderr for either. It catches: the
 /// exit status inverted; the reasons not printed.
 #[test]
 fn safe_to_stop_exits_0_when_safe_and_3_when_not() {
