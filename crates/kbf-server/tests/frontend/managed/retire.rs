@@ -1,14 +1,14 @@
 //! Retire mode (`GET` and `POST /v1/frontend/retire`, `kbf_server::retire`): two frontends
-//! in this process over one real Postgres schema (the server `KBF_TEST_POSTGRES_URL` names;
-//! those tests fail without it), each on a store handle of its own and with no generation
-//! taken, as the frontends of one farm hold the store. A fake daemon and a client play the
-//! farm's node and Buck2. The routes' answers on a frontend with no state store need no
-//! Postgres.
+//! in this process over one real Postgres database (the server `KBF_TEST_POSTGRES_URL` names;
+//! those tests fail without it), each started as a start is, from `--state-store`, so each
+//! on a store handle of its own and with no generation taken, as the frontends of one farm
+//! hold the store. A fake daemon and a client play the farm's node and Buck2. The routes'
+//! answers on a frontend with no state store need no Postgres.
 
 use kbf_server::api::FRONTEND_RETIRE;
-use kbf_server::frontend::start_frontend_over;
-use kbf_server::{EpochPolicy, ServeError, StateStore};
-use kbf_state::postgres::{Flaw as PgFlaw, PostgresBackend, PostgresStore};
+use kbf_server::frontend::start_frontend;
+use kbf_server::{ServeError, StateStoreUri};
+use kbf_state::postgres::{PostgresConfig, PostgresStore, TestDatabase, test_database};
 use serde_json::json;
 
 use super::*;
@@ -23,16 +23,10 @@ struct Member {
 }
 
 impl Member {
-    /// Starts a frontend over `store`, a handle of its own on the schema.
-    fn start(flags: &FrontendFlags, store: Arc<PostgresStore>) -> Self {
+    /// Starts a frontend as a start does, over the `--state-store` the flags name.
+    fn start(flags: &FrontendFlags) -> Self {
         let (stop, stopped) = oneshot::channel::<()>();
-        let state = StateStore {
-            store,
-            epoch: EpochPolicy::Keep,
-            members: Default::default(),
-            history: None,
-        };
-        let handle = start_frontend_over(flags, state, || {
+        let handle = start_frontend(flags, || {
             Ok(async move {
                 let _ = stopped.await;
             })
@@ -57,16 +51,50 @@ impl Member {
     }
 }
 
-/// Two frontends over one Postgres schema, a storage node they share, and a handle of
-/// the test's own on the schema.
+/// Runs `f` on a thread of its own, which is in no runtime, and returns its result; a panic
+/// in `f` is raised again in the caller. The test server's client (`TestDatabase`) blocks on
+/// a runtime of its own to make and to drop a database, and tokio refuses that on a thread
+/// that is running tasks.
+fn off_runtime<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    std::thread::scope(|scope| match scope.spawn(f).join() {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    })
+}
+
+/// A database of its own on the test server, with the state schema, made and dropped off
+/// the runtime (see [`off_runtime`]), so that it is also dropped when a test fails.
+struct Database(Option<TestDatabase>);
+
+impl Database {
+    fn new() -> Self {
+        Self(Some(off_runtime(test_database)))
+    }
+
+    /// The URL of the database.
+    fn url(&self) -> String {
+        self.0.as_ref().expect("held until dropped").url()
+    }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        if let Some(database) = self.0.take() {
+            off_runtime(move || drop(database));
+        }
+    }
+}
+
+/// Two frontends started over one Postgres database, a storage node they share, and a handle
+/// of the test's own on the database.
 struct Pair {
     a: Member,
     b: Member,
     store: Arc<PostgresStore>,
     _node: Node,
     _scratch: Scratch,
-    /// Declared last, so the schema is dropped after the stores of this struct.
-    _schema: PostgresBackend,
+    /// Declared last, so the database is dropped after the stores of this struct.
+    _database: Database,
 }
 
 impl Pair {
@@ -74,20 +102,22 @@ impl Pair {
         let node = Node::start().await;
         let scratch = Scratch::new(name);
         let token = scratch.token_flag();
-        let schema = PostgresBackend::new(&kbf_testkit::database::server_url(), PgFlaw::None);
-        let config = schema.fresh_config();
-        let open = || Arc::new(PostgresStore::open(&config).expect("a connection"));
+        let database = Database::new();
         let storage = format!("--storage=http://{}", node.addr);
-        let given = flags(&[&storage, &token, "--heartbeat-interval-ms=100"]).expect("flags");
-        let a = Member::start(&given, open());
-        let b = Member::start(&given, open());
+        let mut given = flags(&[&storage, &token, "--heartbeat-interval-ms=100"]).expect("flags");
+        // The flag refuses a URL that carries a password, which the test server's does.
+        let uri: StateStoreUri = database.url().parse().expect("a state store URL");
+        given.server.state_store = Some(uri);
+        let a = Member::start(&given);
+        let b = Member::start(&given);
+        let config = PostgresConfig::parse(&database.url()).expect("a config");
         Self {
             a,
             b,
-            store: open(),
+            store: Arc::new(PostgresStore::open(&config).expect("a connection")),
             _node: node,
             _scratch: scratch,
-            _schema: schema,
+            _database: database,
         }
     }
 

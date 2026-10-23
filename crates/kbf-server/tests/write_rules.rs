@@ -11,7 +11,7 @@ use kbf_enroll_registry::{TokenSpec, bump_ca_generation, create_token};
 use kbf_history::IndexRoot;
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Progress, Registrant};
 use kbf_server::update::{Release, Rows};
-use kbf_server::write_rules::{Rule, classify};
+use kbf_server::write_rules::{Rule, classify, classify_shared};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
 use kbf_types::{FarmTime, Role, RoleSet, TokenId, TokenSecret};
@@ -23,7 +23,8 @@ fn store() -> Arc<dyn Store> {
     ))
 }
 
-/// Every key in `store`, and that each is of a family the table names, fenced.
+/// Every key in `store`, and that each is of a family the table names, fenced under a
+/// generation and conditional in a store whose frontends take none.
 fn assert_all_fenced(store: &dyn Store, what: &str) -> usize {
     let keys: Vec<String> = store
         .scan_prefix("")
@@ -38,6 +39,12 @@ fn assert_all_fenced(store: &dyn Store, what: &str) -> usize {
             got.map(|c| c.rule),
             Some(Rule::Fenced),
             "{what} wrote {key}, which the table does not name as fenced"
+        );
+        let shared = classify_shared(key, &IndexRoot::default());
+        assert_eq!(
+            shared.map(|c| c.rule),
+            Some(Rule::Conditional),
+            "{what} wrote {key}, which the table does not name as conditional"
         );
     }
     keys.len()

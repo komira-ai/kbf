@@ -7,8 +7,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, Fenced, GENERATION, Revision, ScanPage, ScanRange,
-    Store, StoreError, StoreTime, Txn, Versioned,
+    Changes, Commit, CommitStats, Conflict, Fenced, GENERATION, Revision, SHARED_WRITERS, ScanPage,
+    ScanRange, Store, StoreError, StoreTime, Txn, Versioned,
 };
 
 use crate::farm::{EpochPolicy, StateError};
@@ -21,8 +21,9 @@ pub enum StateStoreUri {
     /// `sqlite:///absolute/path`: a database file on a local disk, owned by one process.
     Sqlite(PathBuf),
     /// `postgres:///kbf?host=/run/postgresql`: a database on a Unix socket, reached as the
-    /// process's own user (peer authentication). Several processes may open it; the
-    /// generation fence ([`Fenced`]) lets one write at a time.
+    /// process's own user (peer authentication). Several frontends may open it at once and
+    /// all write: none takes a generation ([`Fenced`]), and the generation row holds a marker
+    /// instead ([`StateStoreUri::open`]).
     Postgres(PostgresUrl),
 }
 
@@ -221,25 +222,52 @@ impl StateStoreUri {
         }
     }
 
-    /// Opens the store. The file is created, with its directory, if missing (directories
-    /// it makes are 0700 and the file 0600: the scheduler's state is for this user alone),
-    /// and held by this process alone: a second open of it (a second frontend) is
-    /// refused.
+    /// Opens the store as a frontend that shares it with others.
+    ///
+    /// A Postgres store takes no generation: any number of frontends open it and write,
+    /// each conditionally on the rows it read (the transitions of `farm::durable`), and none
+    /// fences another. What the open does write is the generation row, once: it ensures
+    /// that `meta/generation` holds [`kbf_state::SHARED_WRITERS`], with a write conditional
+    /// on the row read, so frontends that open together agree. A store that holds the marker
+    /// opens as it is. A store that holds a generation (one that a build which takes
+    /// generations last opened) gets the marker in its place, which is the cold cutover: it
+    /// is only right when every such frontend is stopped first, for the marker fences the
+    /// last holder's writes and a build that takes generations fails to start on the store
+    /// ([`kbf_state::TakeError::Corrupt`]).
+    ///
+    /// A SQLite file is created, with its directory, if missing (directories it makes are
+    /// 0700 and the file 0600: the scheduler's state is for this user alone), and held by
+    /// this process alone: a second open of it (a second frontend) is refused. It takes
+    /// the next generation, which a handover reads ([`StateStoreUri::open_after_handover`]).
     ///
     /// This blocks, as the store's calls do, and may be called from an async task.
     ///
     /// # Errors
     /// [`StateError::Open`]: the file is held by another process, is on a network
-    /// filesystem or is not a state store.
+    /// filesystem or is not a state store; or the generation row of a Postgres store cannot
+    /// be set to the marker.
     pub fn open(&self) -> Result<StateStore, StateError> {
-        self.open_at(None, self.epoch_policy())
+        match self {
+            Self::Sqlite(_) => self.open_at(None, self.epoch_policy()),
+            Self::Postgres(_) => {
+                let store = self.open_backend()?;
+                kbf_state::share(store.as_ref()).map_err(open_error)?;
+                Ok(StateStore {
+                    store,
+                    epoch: self.epoch_policy(),
+                    members: MembershipConfig::default(),
+                    history: None,
+                })
+            }
+        }
     }
 
     /// Opens the store as the successor of the process that held generation `generation`
     /// and has let go of it, and keeps its epoch: the daemons that reconnect keep the runs
     /// of the leases they hold. Nothing is written unless the store is at exactly that
     /// generation, so a file that was restored or swapped since is refused, and so is one
-    /// another writer has taken.
+    /// another writer has taken, and so is a store that holds the marker of shared
+    /// frontends ([`StateStoreUri::open`]), which has no generation to succeed.
     ///
     /// # Errors
     /// [`StateError::Open`]: as [`StateStoreUri::open`], or the store is not at
@@ -347,6 +375,16 @@ pub fn generation_of(store: &dyn Store) -> Result<u64, StateError> {
         why: "not an 8-byte number".to_owned(),
     })?;
     Ok(u64::from_be_bytes(bytes))
+}
+
+/// Whether the generation row of `store` holds [`SHARED_WRITERS`]: the frontends share the
+/// store and none holds a generation. False when the store cannot be read.
+pub(crate) fn holds_no_generation(store: &dyn Store) -> bool {
+    store
+        .get(GENERATION)
+        .ok()
+        .flatten()
+        .is_some_and(|row| row.value == SHARED_WRITERS)
 }
 
 /// A store handle that reads and writes nothing: what a candidate probes.
