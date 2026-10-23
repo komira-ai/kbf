@@ -18,6 +18,43 @@ use crate::mac::stage::sha256_of;
 use crate::runner::{Cmd, Exec, Runner};
 use crate::trust::Trust;
 
+/// What the Mac's tools printed (`tests/fixtures/mac/README.md`).
+pub mod real {
+    pub const IDLE: &str = include_str!("../../../tests/fixtures/mac/print_idle.stdout");
+    pub const RUNNING: &str = include_str!("../../../tests/fixtures/mac/print_running.stdout");
+    pub const CLEAN_EXIT: &str =
+        include_str!("../../../tests/fixtures/mac/print_clean_exit.stdout");
+    pub const NONZERO_EXIT: &str =
+        include_str!("../../../tests/fixtures/mac/print_nonzero_exit.stdout");
+    pub const KILLED: &str = include_str!("../../../tests/fixtures/mac/print_killed.stdout");
+    pub const NESTED: &str = include_str!("../../../tests/fixtures/mac/print_nested.stdout");
+    pub const MISSING_STDERR: &str =
+        include_str!("../../../tests/fixtures/mac/print_missing.stderr");
+    pub const MISSING_CODE: &str = include_str!("../../../tests/fixtures/mac/print_missing.code");
+    pub const LSOF: &str = include_str!("../../../tests/fixtures/mac/lsof_running.stdout");
+    pub const CODESIGN_HARDENED: &str =
+        include_str!("../../../tests/fixtures/mac/codesign_describe_hardened.stderr");
+    pub const CODESIGN_PLAIN: &str =
+        include_str!("../../../tests/fixtures/mac/codesign_describe_plain.stderr");
+    pub const DSCL_NOBODY: &str = include_str!("../../../tests/fixtures/mac/dscl_nobody.stdout");
+    pub const XATTR_QUARANTINED: &str =
+        include_str!("../../../tests/fixtures/mac/xattr_quarantined.stdout");
+    pub const XATTR_CLEAN: &str = include_str!("../../../tests/fixtures/mac/xattr_clean.stdout");
+
+    /// The listing `text` of some service as the listing of service `label` (its first line).
+    pub fn as_service(text: &str, label: &str) -> String {
+        let (_, rest) = text.split_once('\n').unwrap();
+        format!("system/{label} = {{\n{rest}")
+    }
+
+    /// The pid in a running listing.
+    pub fn pid_of(text: &str) -> &str {
+        text.lines()
+            .find_map(|line| line.strip_prefix("\tpid = "))
+            .unwrap()
+    }
+}
+
 pub const OLD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub const NEW: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 pub const OLD_VERSION: &str = "0.1.5+gaaaaaaaaaaaa-2";
@@ -376,27 +413,31 @@ impl Sim {
                     loaded = true;
                 }
                 if !loaded {
-                    return exec(113, "", "Could not find service");
+                    let stderr = real::MISSING_STDERR
+                        .replace("com.example.kbf-real-mac-test.idle.3110", &label);
+                    return exec(real::MISSING_CODE.trim().parse().unwrap(), "", &stderr);
                 }
-                let (state, last) = if label != APPLY_LABEL || self.apply_running.get() {
-                    ("running", "(never exited)")
+                // Real listings (the fixtures), as this service and with this pid.
+                let listing = if label != APPLY_LABEL || self.apply_running.get() {
+                    real::RUNNING.to_owned()
                 } else if self.apply_spawning.get() {
-                    ("spawn scheduled", "(never exited)")
+                    // Not captured: a real "not running" listing in the state launchd names
+                    // for a job that is scheduled to start.
+                    real::IDLE.replace("\tstate = not running\n", "\tstate = spawn scheduled\n")
                 } else {
-                    ("not running", "0")
+                    real::CLEAN_EXIT.to_owned()
                 };
-                let pid = if self.is_broken("no-pid") {
-                    ""
-                } else {
-                    "\tpid = 4242\n"
-                };
-                exec(
-                    0,
-                    &format!(
-                        "system/{label} = {{\n{pid}\tstate = {state}\n\tlast exit code = {last}\n}}\n"
-                    ),
-                    "",
-                )
+                let mut text = real::as_service(&listing, &label);
+                if listing == real::RUNNING {
+                    let pid_line = format!("\tpid = {}\n", real::pid_of(&listing));
+                    let ours = if self.is_broken("no-pid") {
+                        String::new()
+                    } else {
+                        "\tpid = 4242\n".to_owned()
+                    };
+                    text = text.replace(&pid_line, &ours);
+                }
+                exec(0, &text, "")
             }
             Some("bootout") => {
                 let label = label_of(&args[1]);
@@ -430,6 +471,13 @@ impl Sim {
                         return exec(5, "", "Bootstrap failed: 5: Input/output error");
                     }
                     self.loaded.borrow_mut().insert(DAEMON_LABEL.to_owned());
+                    // The daemon executes the release `current` names, unless a test says
+                    // the file it runs is not that one.
+                    let named = fs::read_link(self.host.current()).ok();
+                    if let (false, Some(target)) = (self.is_broken("runs-stale"), named) {
+                        *self.running_path.borrow_mut() =
+                            Some(self.host.kit.join(target).join("kbf"));
+                    }
                     if self.welcome.get() && self.daemon_bootstraps.get() >= self.welcome_from.get()
                     {
                         use std::io::Write;
@@ -494,16 +542,9 @@ impl Runner for Sim {
                     exec(1, "", "invalid signature")
                 }
                 Some("--verify") => exec(0, "", ""),
-                _ if self.is_broken("no-runtime") => exec(
-                    0,
-                    "",
-                    "CodeDirectory v=20500 size=1 flags=0x2(adhoc) hashes=1\nSignature=adhoc\n",
-                ),
-                _ => exec(
-                    0,
-                    "",
-                    "CodeDirectory v=20500 size=1 flags=0x10002(adhoc,runtime) hashes=1\nSignature=adhoc\n",
-                ),
+                // `codesign -d` describes on stderr.
+                _ if self.is_broken("no-runtime") => exec(0, "", real::CODESIGN_PLAIN),
+                _ => exec(0, "", real::CODESIGN_HARDENED),
             },
             crate::mac::tools::DSCL if self.is_broken("dscl") => exec(1, "", "no such user"),
             crate::mac::tools::DSCL => {
@@ -518,12 +559,28 @@ impl Runner for Sim {
                 )
             }
             crate::mac::tools::LSOF if self.is_broken("lsof") => exec(1, "", ""),
+            crate::mac::tools::LSOF if self.is_broken("lsof-start") => {
+                Err(io::Error::other("lsof cannot start"))
+            }
             crate::mac::tools::LSOF => {
                 let path = self.running_path.borrow().clone();
+                // The real listing of a running process, with this pid and program.
                 let text = path.map_or_else(
                     || "p4242\n".to_owned(),
-                    |p| format!("p4242\nftxt\nn{}\nn/usr/lib/dyld\n", p.display()),
+                    |p| {
+                        real::LSOF
+                            .replace("p3114", "p4242")
+                            .replace("n/bin/sleep", &format!("n{}", p.display()))
+                    },
                 );
+                // lsof exits 1 when it only warns, with its listing whole.
+                if self.is_broken("lsof-warns") {
+                    return exec(
+                        1,
+                        &text,
+                        "lsof: WARNING: can't stat() apfs file system /x\n",
+                    );
+                }
                 exec(0, &text, "")
             }
             crate::mac::tools::SUDO => self

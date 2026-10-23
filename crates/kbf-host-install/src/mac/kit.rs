@@ -84,7 +84,8 @@ pub fn installed_version(host: &MacHost, commit: &str) -> Option<String> {
 /// `launchctl print`) has the file `releases/<commit>/kbf` open as its program (from `lsof`,
 /// which names the file the kernel mapped, links resolved). Not the link, and not the file
 /// on disk: a daemon that was not restarted still runs the old release. None when any step
-/// does not say.
+/// does not say. (`lsof` exits 1 when it only warns, with its listing intact, so its output
+/// is read whatever its status; a listing with no such file says nothing.)
 pub fn running_commit(host: &MacHost, runner: &dyn Runner) -> Option<String> {
     let limit = host.tuning.tool;
     let print = runner
@@ -92,10 +93,7 @@ pub fn running_commit(host: &MacHost, runner: &dyn Runner) -> Option<String> {
         .ok()
         .filter(crate::runner::Exec::success)?;
     let pid = tools::print_pid(&print.stdout_text())?;
-    let open = runner
-        .run(&tools::lsof_text(pid, limit))
-        .ok()
-        .filter(crate::runner::Exec::success)?;
+    let open = runner.run(&tools::lsof_text(pid, limit)).ok()?;
     let text = open.stdout_text();
     tools::lsof_paths(&text)
         .into_iter()

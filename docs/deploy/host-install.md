@@ -156,7 +156,9 @@ guess.
 
 Every invocation, refused ones included, appends one JSON line to
 `/var/log/kbf-host-install.log` (created root-owned, mode 0600, never through a symbolic
-link): the time, the verb, the version, the channel, the outcome and the reason. A request
+link): the time, the verb, the version, the channel, the outcome and the reason. On a Mac the
+apply job appends one more line when it ends: verb `apply`, the version, outcome `applied` or
+`failed`, and `result`, the status line (`done`, `failed:not_welcomed:rolled_back`, ...). A request
 that was not understood is recorded escaped and cut at 200 characters. An install is not
 started when the log cannot be opened.
 
@@ -180,9 +182,16 @@ Nothing here is a Homebrew formula or a `kbf-installer` order.
 /Library/LaunchDaemons/com.komira.kbf-daemon.plist    the daemon's job, run as _kbf
 ```
 
+The error-log path is the `StandardErrorPath` of the kit's daemon plist. The `/Library/Logs/kbf`
+paths of `kbf-mac-provision` belong to that tool's own layout; this program does not read them
+and this document does not describe them.
+
 `<version>` is the version text of a build, `0.1.<seq>+g<12 hex digits>-<run>`. Its 12 digits
-pick the one tarball of the channel's pinned `SHA256SUMS` whose commit starts with them; the
-version text is kept in `VERSION`, and `query` reports it as `installed_version`.
+pick the one tarball `kbf-<40 hex digits>-darwin-arm64.tar.gz` whose commit starts with them:
+among the file names of the channel's `dir`, or, when the channel pins its releases with
+`sums`, among the lines of its `SHA256SUMS`. No tarball is an unknown release and two are
+ambiguous (`verify_failed`, with the reason on stderr). The version text is kept in `VERSION`,
+and `query` reports it as `installed_version`.
 
 ### The files, once per Mac (the operator's one root session)
 
@@ -210,18 +219,23 @@ Everything below is done once, as an administrator with `sudo`; this program doe
 
    It allows one program with one argument, to one account. The program then reads the
    request from its standard input and checks it against the grammar again, so the rule does
-   not widen what the key can ask for.
+   not widen what the key can ask for. The sudoers entry, not the ssh key, is what bounds
+   `kbfupdate`; a `Defaults:kbfupdate !setenv, env_reset` line keeps its environment out of the
+   program.
 4. `/usr/local/etc/kbf/host-install.toml`, root's alone to write:
 
    ```toml
    [channels.stable]
    dir = "/usr/local/kbf-host-install/stable"
-   sums = "/usr/local/etc/kbf/host-install/stable.SHA256SUMS"
+   sums = "/usr/local/etc/kbf/host-install/stable.SHA256SUMS"   # optional
    source_ref = "refs/heads/main"      # optional; this is the default
    ```
 
-   `sums` is the pinned `SHA256SUMS` of the releases the channel offers, root's alone to write;
-   a tarball is taken only when its sha256 is listed there. `dir` is where the release files
+   The trust anchor is the build attestation, which every release must pass (check 4 below).
+   `sums` is optional. When it is set it is an extra freeze list: the pinned `SHA256SUMS` of the
+   releases the channel offers, root's alone to write, and a release it does not list is
+   refused, and a tarball is taken only when its sha256 is listed there. When it is absent the
+   attestation alone decides. `dir` is where the release files
    are put: `kbf-<commit>-darwin-arm64.tar.gz` and `kbf-<commit>-darwin-arm64.tar.gz.sigstore.json`.
    Whoever puts them there is not trusted; they are copied once and checked. Putting them there
    is not done by this program.
@@ -249,13 +263,19 @@ stage but the program's own.
 Before anything on the Mac changes, in this order (a failure changes nothing and removes the
 stage):
 
-1. the request, the channel and the pinned sums, and that `gh` and the trusted root are root's;
+1. the request, the channel and its pinned sums (when it has any), and that `gh` and the trusted
+   root are root's;
 2. the files of the channel's `dir` are copied once, into `/var/db/kbf-host-install/stage`
    (root's, mode 0700), without following links, as regular files with one link and under a size
    limit; only that copy is checked from here on;
-3. the sha256 of the tarball is the one the pinned sums list;
-4. `gh attestation verify` accepts the tarball and its bundle, offline, for the commit and the
-   channel's branch (the same arguments the installer passes), run as `nobody` and never as root;
+3. when the channel has sums, the sha256 of the tarball is the one they list (a channel without
+   sums skips this);
+4. `gh attestation verify` accepts the tarball and its bundle, offline, run as `nobody` and
+   never as root. This is the trust anchor, and it binds: the tarball's sha256 as a subject
+   (`gh` hashes the staged copy), the build's source digest to the full 40-digit commit (not the
+   version's 12 digits), its source ref to the channel's branch, the signer to
+   `komira-ai/kbf`'s `artifacts.yml` workflow (the repository's former name is still accepted,
+   for releases attested under it), and GitHub-hosted runners only;
 5. the tarball holds exactly one regular file named `kbf`, a Mach-O file for arm64;
 6. the binary carries no `com.apple.quarantine` attribute (it is removed, and proven gone);
 7. `codesign --verify --strict` accepts it and its signature has the hardened runtime;
@@ -263,10 +283,16 @@ stage):
    (`kbf --mode=daemon --config /usr/local/etc/kbf/kbf.toml --check`);
 9. the staged binary is root's, in directories only root can write.
 
+Steps 4 and 8 start their program through `/usr/sbin/chroot -u <uid> -g <gid> -G <gid> / ...`:
+started by `Command::uid` and `gid` alone, a child on macOS keeps the old effective gid (group 0,
+`wheel`) as a supplementary group, and `chroot` sets the one group itself. The real-Mac test
+checks that the child's groups are its own gid and nothing else.
+
 The stage is opened to traverse-only (0711) for steps 4 and 8, which run as other users, and
 is 0700 otherwise. While it is 0711 the users `nobody` and `_kbf` can pass through it but
-cannot list it or write to it, and every file in it is root's and not writable by them; the
-files are public release bytes. It is closed to 0700 again before `plan.json` is written. The same version already installed and running is `already_installed`; an
+cannot list it or write to it. Every file in it is root's and not writable by them except
+`gh-home`, the directory of `gh`'s own home, which belongs to `nobody`; the files are public
+release bytes. It is closed to 0700 again before `plan.json` is written. The same version already installed and running is `already_installed`; an
 older version is installed like a newer one.
 
 ### The apply
@@ -280,9 +306,12 @@ end the work between `launchctl bootout` and `launchctl bootstrap`. It answers
 
 and exits 0. The job:
 
+0. starts from the links the install saw: `current` and `previous` as they were when the install
+   was accepted are in `plan.json` (so the job, a rollback, and whoever has to repair a job that
+   was killed halfway work from the same facts; the next install repairs the kit too);
 1. lays out `releases/<commit>/kbf` and `VERSION` (a release already there must be the same
-   bytes), again without a quarantine attribute, and checks that the file and every directory
-   above it up to `/usr/local/kbf` are root's and closed to others;
+   bytes), after checking that the file and every directory above it up to `/usr/local/kbf` are
+   root's and closed to others, again without a quarantine attribute;
 2. moves `previous` to the release that ran and `current` to the new one, each by renaming a
    link made aside;
 3. runs `launchctl bootout system/com.komira.kbf-daemon`, waits (at most 60 seconds) until
@@ -290,9 +319,13 @@ and exits 0. The job:
    a bootstrap in that gap fails with an input/output error), then
    `launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-daemon.plist`;
 4. waits (at most 180 seconds) for the `welcomed` line of the NEW process in the daemon's error
-   log, counting only what the log gained since before the bootstrap;
-5. if step 3 or 4 fails, moves both links back, restarts the old release the same way and
-   records what became of it.
+   log, counting only what the log gained since before the bootstrap, and then requires (for at
+   most 60 seconds) that the daemon's process runs the release that was started: the same reading
+   `query` reports as `running_commit`;
+5. if step 3 or 4 fails, moves both links back, checks that the old release's file is root's,
+   restarts it the same way (with the same two checks) and records what became of it;
+6. removes the stage, then writes the result line, so that the status leaves `running` only when
+   nothing of the job is left to remove; and appends the outcome to the audit log.
 
 Nothing here waits for leases: the drain that keeps builds from being cut is the updater's, done
 before it asks for the install. `bootout` is synchronous and launchd kills the daemon after its
@@ -305,8 +338,8 @@ The result is one line in `/var/db/kbf-host-install/status` and the `apply` fiel
 | `null` | no apply has been recorded |
 | `running` | the job is running (`in_progress` is true) |
 | `done` | the new daemon logged `welcomed`; `running_commit` is the new commit |
-| `failed:<reason>` | before anything restarted: `plan_invalid`, `stage_untrusted`, `stage_changed`, `links_unreadable`, `release_differs`, `quarantine`, `layout_failed`, `release_untrusted`, `links_failed`, `launch_failed`; and `apply_lost` for a `running` status whose job is gone |
-| `failed:<reason>:rolled_back` | the restart failed (`bootout_timeout`, `bootstrap_failed`, `not_welcomed`) and the previous release is running again |
+| `failed:<reason>` | before anything restarted: `plan_invalid`, `stage_untrusted`, `stage_changed`, `release_differs`, `quarantine`, `layout_failed`, `release_untrusted`, `links_failed`, `launch_failed`; and `apply_lost` for a `running` status whose job is gone |
+| `failed:<reason>:rolled_back` | the restart failed (`bootout_timeout`, `bootstrap_failed`, `not_welcomed`, `wrong_release`) and the previous release is running again |
 | `failed:<reason>:rollback_failed` | the previous release did not come up either |
 | `failed:<reason>:no_previous` | there was no release before this one to go back to |
 
@@ -324,8 +357,9 @@ channel that offers it; it takes the same path, and `previous` is only where the
 from.
 
 The other side of this is that whoever holds the updater's key can install any release the
-channel's pinned `SHA256SUMS` lists, including an old one with a known defect. The only way to
-make a release uninstallable is to remove its line from that file.
+channel offers that passes the attestation, including an old one with a known defect. On a
+channel with `sums` the way to make a release uninstallable is to remove its line from that file;
+on one without, it is to remove its files from `dir`.
 
 ### `query` on a Mac
 

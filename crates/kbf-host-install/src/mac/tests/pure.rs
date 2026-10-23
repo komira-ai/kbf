@@ -2,7 +2,7 @@
 //! node's settings, the allowlist, the status line, the links.
 
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::time::Duration;
 
@@ -10,7 +10,9 @@ use super::fx::{Fx, NEW, NEW_VERSION, OLD, OLD_VERSION, mkdir, write};
 use crate::mac::channel::{DEFAULT_SOURCE_REF, MacAllowlist, is_branch_ref};
 use crate::mac::conf::{node_id, parse_node_id};
 use crate::mac::kit::{self, Links};
-use crate::mac::release::{PickError, bundle_name, commit_prefix, is_commit, pick, tarball_name};
+use crate::mac::release::{
+    PickError, bundle_name, commit_prefix, is_commit, pick, pick_named, tarball_name,
+};
 use crate::mac::status::{self, ApplyState};
 use crate::mac::tools;
 use crate::outcome::Refusal;
@@ -117,7 +119,7 @@ fn the_command_lines() {
     );
     assert_eq!(
         tools::lsof_text(7, LIMIT).args,
-        strings(&["-nP", "-a", "-p", "7", "-d", "txt", "-F", "n"])
+        strings(&["-nPw", "-a", "-p", "7", "-d", "txt", "-F", "n"])
     );
     assert_eq!(tools::xattr_list(p, LIMIT).args, strings(&["/p/kbf"]));
     assert_eq!(
@@ -188,6 +190,8 @@ fn the_attestation_command() {
             NEW,
             "--predicate-type",
             "https://slsa.dev/provenance/v1",
+            "--digest-alg",
+            "sha256",
             "--deny-self-hosted-runners",
         ])
     );
@@ -294,6 +298,40 @@ fn the_sums_pick_the_one_tarball_of_the_commit() {
         (NEW, "2".repeat(64))
     );
     assert_eq!(pick(&sums, "cccccccccccc"), Err(PickError::Unknown));
+}
+
+/// Without sums the release is picked among the file names of the directory: the one
+/// tarball of the platform whose commit starts with the digits; other names are ignored,
+/// and a name listed twice is one commit.
+#[test]
+fn a_listing_picks_the_one_tarball_of_the_commit() {
+    let other = tarball_name(&format!("{}c", &NEW[..39]));
+    let names = [
+        tarball_name(OLD),
+        tarball_name(NEW),
+        format!("{}.sigstore.json", tarball_name(NEW)),
+        format!("kbf-{NEW}-linux-x86_64.tar.gz"),
+        format!("kbf-installer-{NEW}-darwin-arm64.tar.gz"),
+        format!("kbf-{}-darwin-arm64.tar.gz", &NEW[..39]),
+        "SHA256SUMS".to_owned(),
+    ];
+    let listed = || names.iter().map(String::as_str);
+    assert_eq!(pick_named(listed(), "bbbbbbbbbbbb"), Ok(NEW.to_owned()));
+    assert_eq!(pick_named(listed(), "aaaaaaaaaaaa"), Ok(OLD.to_owned()));
+    assert_eq!(
+        pick_named(listed(), "cccccccccccc"),
+        Err(PickError::Unknown)
+    );
+    assert_eq!(pick_named([], "bbbbbbbbbbbb"), Err(PickError::Unknown));
+    assert_eq!(
+        pick_named(listed().chain([other.as_str()]), "bbbbbbbbbbbb"),
+        Err(PickError::Ambiguous)
+    );
+    // The same name twice is still one release.
+    assert_eq!(
+        pick_named(listed().chain([names[1].as_str()]), "bbbbbbbbbbbb"),
+        Ok(NEW.to_owned())
+    );
 }
 
 #[test]
@@ -432,7 +470,7 @@ fn a_channel_names_a_drop_directory_and_pinned_sums() {
     .unwrap();
     let channel = list.channel(&fx.host.trust, &stable()).unwrap();
     assert_eq!(channel.dir, Path::new("/d"));
-    assert_eq!(channel.sums, fx.sums);
+    assert_eq!(channel.sums, Some(fx.sums.clone()));
     assert_eq!(channel.source_ref, DEFAULT_SOURCE_REF);
     let list = allowlist(
         &fx,
@@ -449,6 +487,37 @@ fn a_channel_names_a_drop_directory_and_pinned_sums() {
     );
 }
 
+/// A channel needs no sums: the attestation is the trust anchor. Sums that are named are
+/// still checked to be root's, and a channel without them reads as having none.
+#[test]
+fn a_channel_may_have_no_sums() {
+    let fx = Fx::new("mac-channel-nosums");
+    let list = allowlist(&fx, "[channels.stable]\ndir = \"/d\"\n").unwrap();
+    let channel = list.channel(&fx.host.trust, &stable()).unwrap();
+    assert_eq!(
+        (
+            channel.dir.as_path(),
+            channel.sums,
+            channel.source_ref.as_str()
+        ),
+        (Path::new("/d"), None, DEFAULT_SOURCE_REF)
+    );
+    // Named sums that others can write are unsafe; sums that are not there are invalid.
+    let list = allowlist(
+        &fx,
+        &format!(
+            "[channels.stable]\ndir = \"/d\"\nsums = \"{}\"\n",
+            fx.sums.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fx.sums, fs::Permissions::from_mode(0o666)).unwrap();
+    assert_eq!(
+        list.channel(&fx.host.trust, &stable()),
+        Err(Refusal::ConfigUnsafe)
+    );
+}
+
 #[test]
 fn an_allowlist_that_is_not_plain_is_refused() {
     let fx = Fx::new("mac-channel-bad");
@@ -460,7 +529,7 @@ fn an_allowlist_that_is_not_plain_is_refused() {
             "an unknown key",
             format!("[channels.stable]\ndir = \"/d\"\nsums = \"{s}\"\nurl = \"x\"\n"),
         ),
-        ("no sums", "[channels.stable]\ndir = \"/d\"\n".to_owned()),
+        ("no dir", format!("[channels.stable]\nsums = \"{s}\"\n")),
         (
             "a relative dir",
             format!("[channels.stable]\ndir = \"d\"\nsums = \"{s}\"\n"),
@@ -794,6 +863,17 @@ fn the_running_commit_is_the_release_the_daemon_process_executes() {
     assert_eq!(kit::running_commit(&fx.host, &sim).as_deref(), Some(NEW));
     sim.break_("lsof");
     assert_eq!(kit::running_commit(&fx.host, &sim), None);
+    let sim = fx.sim();
+    sim.break_("lsof-start");
+    assert_eq!(
+        kit::running_commit(&fx.host, &sim),
+        None,
+        "lsof cannot start"
+    );
+    // lsof exits 1 on a warning (a file system it cannot stat) with the listing whole.
+    let sim = fx.sim();
+    sim.break_("lsof-warns");
+    assert_eq!(kit::running_commit(&fx.host, &sim).as_deref(), Some(OLD));
     let sim = fx.sim();
     sim.break_("no-pid");
     assert_eq!(kit::running_commit(&fx.host, &sim), None, "no process");

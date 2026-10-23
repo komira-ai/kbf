@@ -7,4 +7,5 @@ mod fx;
 mod install;
 mod pure;
 mod query;
+mod real_output;
 mod stage_tests;

@@ -82,6 +82,8 @@ fn a_good_apply_lays_out_flips_restarts_and_waits_for_welcome() {
             format!("bootout system/{DAEMON_LABEL}"),
             format!("print system/{DAEMON_LABEL}"),
             format!("bootstrap system {}", fx.host.daemon_plist.display()),
+            // What the daemon then runs is asked of launchd and lsof.
+            format!("print system/{DAEMON_LABEL}"),
         ]
     );
     assert!(!fx.host.stage().exists(), "the stage is cleared");
@@ -110,13 +112,13 @@ fn the_daemon_is_bootstrapped_only_after_it_is_gone() {
     let lines = launchctl(&sim);
     assert_eq!(
         lines.iter().filter(|l| l.starts_with("print")).count(),
-        1 + 1 + 3
+        1 + 1 + 3 + 1
     );
     assert_eq!(
         lines.iter().filter(|l| l.starts_with("bootstrap")).count(),
         1
     );
-    assert!(lines.last().unwrap().starts_with("bootstrap"));
+    assert!(lines[lines.len() - 2].starts_with("bootstrap"));
 }
 
 /// The apply is done only on the welcomed line of the NEW process, counted from where the
@@ -247,9 +249,9 @@ fn a_daemon_that_will_not_go_stops_the_apply() {
 fn a_first_install_that_fails_has_nothing_to_go_back_to() {
     let fx = Fx::new("mac-apply-first");
     let sim = fx.sim();
-    launched(&fx, &sim);
     fs::remove_file(fx.host.current()).unwrap();
     sim.loaded.borrow_mut().clear();
+    launched(&fx, &sim);
     sim.bootstrap_fails.set(1);
     assert_eq!(
         apply(&fx, &sim),
@@ -260,9 +262,9 @@ fn a_first_install_that_fails_has_nothing_to_go_back_to() {
     // And a good first install: no `previous` to move.
     let fx = Fx::new("mac-apply-first-ok");
     let sim = fx.sim();
-    launched(&fx, &sim);
     fs::remove_file(fx.host.current()).unwrap();
     sim.loaded.borrow_mut().clear();
+    launched(&fx, &sim);
     assert_eq!(apply(&fx, &sim).1, "done\n");
     assert_eq!((current(&fx).as_deref(), previous(&fx)), (Some(NEW), None));
 }
@@ -273,9 +275,9 @@ fn a_first_install_that_fails_has_nothing_to_go_back_to() {
 fn a_release_is_written_once() {
     let fx = Fx::new("mac-apply-once");
     let sim = fx.sim();
-    launched(&fx, &sim);
     fx.install_release(NEW, "0.0.1+gbbbbbbbbbbbb-1", &fx.new_binary);
     kit::set_link(&fx.host.previous(), Some(OLD)).unwrap();
+    launched(&fx, &sim);
     let before = fs::metadata(fx.host.release(NEW).join("kbf")).unwrap();
     assert_eq!(apply(&fx, &sim).1, "done\n");
     assert_eq!(
@@ -417,6 +419,14 @@ fn a_plan_or_stage_that_is_not_what_was_checked_is_refused() {
             Box::new(|p| p["version"] = "not a version".into()),
         ),
         ("an extra field", Box::new(|p| p["extra"] = 1.into())),
+        (
+            "a before link that names no release",
+            Box::new(|p| p["before_current"] = "abc".into()),
+        ),
+        (
+            "a before previous that names no release",
+            Box::new(|p| p["before_previous"] = "abc".into()),
+        ),
     ] {
         assert_eq!(
             plan_with(&*change),
@@ -451,13 +461,6 @@ fn a_plan_or_stage_that_is_not_what_was_checked_is_refused() {
     )
     .unwrap();
     assert_eq!(apply(&fx, &sim).1, "failed:stage_untrusted\n");
-    // Links that name no release.
-    let fx = Fx::new("mac-apply-links");
-    let sim = fx.sim();
-    launched(&fx, &sim);
-    fs::remove_file(fx.host.current()).unwrap();
-    mkdir(&fx.host.current(), 0o755);
-    assert_eq!(apply(&fx, &sim).1, "failed:links_unreadable\n");
 }
 
 /// An apply that is done but whose status cannot be written exits 1.
@@ -509,4 +512,182 @@ fn the_job_plist_is_a_one_shot() {
     assert!(plist.contains("<key>KeepAlive</key>\n\t<false/>"));
     assert!(!plist.contains("LaunchDaemons"));
     assert!(plist.starts_with("<?xml"));
+}
+
+fn audit_tail(fx: &Fx) -> serde_json::Value {
+    fx.audit_lines().pop().unwrap()
+}
+
+/// A `welcomed` line is not enough: the daemon must be running the release that was
+/// started. A daemon whose process still executes the old file is rolled back, and a
+/// rollback that is welcomed but runs another file is not a rollback.
+#[test]
+fn a_welcomed_daemon_must_run_the_release_that_was_started() {
+    let fx = Fx::new("mac-apply-wrongrelease");
+    let sim = fx.sim();
+    launched(&fx, &sim);
+    sim.break_("runs-stale");
+    assert_eq!(
+        apply(&fx, &sim),
+        (1, "failed:wrong_release:rolled_back\n".to_owned())
+    );
+    assert_eq!(current(&fx).as_deref(), Some(OLD));
+    assert_eq!(
+        sim.daemon_bootstraps.get(),
+        2,
+        "the old release was started again"
+    );
+
+    let fx = Fx::new("mac-apply-wrongrollback");
+    let sim = fx.sim();
+    launched(&fx, &sim);
+    sim.break_("runs-stale");
+    *sim.running_path.borrow_mut() = Some("/opt/other/kbf".into());
+    assert_eq!(
+        apply(&fx, &sim),
+        (1, "failed:wrong_release:rollback_failed\n".to_owned())
+    );
+}
+
+/// The old release is checked to be root's before the daemon is stopped for the rollback.
+#[test]
+fn a_rollback_target_that_is_not_roots_is_not_started() {
+    let fx = Fx::new("mac-apply-badold");
+    let sim = fx.sim();
+    launched(&fx, &sim);
+    sim.welcome_from.set(2);
+    let old = fx.host.release(OLD).join("kbf");
+    *sim.on_daemon_bootstrap.borrow_mut() = Some(Box::new(move || {
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o777)).unwrap();
+    }));
+    assert_eq!(
+        apply(&fx, &sim),
+        (1, "failed:not_welcomed:rollback_failed\n".to_owned())
+    );
+    assert_eq!(
+        sim.daemon_bootouts.get(),
+        1,
+        "the daemon was not stopped again"
+    );
+    assert_eq!(
+        current(&fx).as_deref(),
+        Some(OLD),
+        "the links are back all the same"
+    );
+
+    let fx = Fx::new("mac-apply-goneold");
+    let sim = fx.sim();
+    launched(&fx, &sim);
+    sim.welcome_from.set(2);
+    let old = fx.host.release(OLD).join("kbf");
+    *sim.on_daemon_bootstrap.borrow_mut() = Some(Box::new(move || {
+        fs::remove_file(&old).unwrap();
+    }));
+    assert_eq!(apply(&fx, &sim).1, "failed:not_welcomed:rollback_failed\n");
+}
+
+/// The links as the install saw them are what a rollback restores, whatever a killed
+/// earlier run of the job left: here `current` and `previous` already moved.
+#[test]
+fn a_rollback_restores_the_links_the_install_saw() {
+    let fx = Fx::new("mac-apply-planlinks");
+    let sim = fx.sim();
+    launched(&fx, &sim);
+    kit::set_link(&fx.host.previous(), Some(OLD)).unwrap();
+    kit::set_link(&fx.host.current(), Some(NEW)).unwrap();
+    sim.bootstrap_fails.set(1);
+    assert_eq!(
+        apply(&fx, &sim),
+        (1, "failed:bootstrap_failed:rolled_back\n".to_owned())
+    );
+    assert_eq!((current(&fx).as_deref(), previous(&fx)), (Some(OLD), None));
+}
+
+/// The end of the apply is appended to the audit log with the status line: the version,
+/// `applied` or `failed`, and what became of the old release.
+#[test]
+fn the_apply_outcome_is_audited() {
+    let fx = Fx::new("mac-apply-audit");
+    let sim = fx.sim();
+    launched(&fx, &sim);
+    assert_eq!(apply(&fx, &sim).1, "done\n");
+    let line = audit_tail(&fx);
+    assert_eq!(line["verb"], "apply");
+    assert_eq!(line["version"], NEW_VERSION);
+    assert_eq!(
+        (line["outcome"].as_str(), line["result"].as_str()),
+        (Some("applied"), Some("done"))
+    );
+    assert!(line["reason"].is_null() && line["channel"].is_null() && line.get("command").is_none());
+
+    let fx = Fx::new("mac-apply-audit-failed");
+    let sim = fx.sim();
+    launched(&fx, &sim);
+    sim.welcome_from.set(2);
+    apply(&fx, &sim);
+    let line = audit_tail(&fx);
+    assert_eq!(line["outcome"], "failed");
+    assert_eq!(line["result"], "failed:not_welcomed:rolled_back");
+
+    // A plan that cannot be read is audited too, without a version.
+    let fx = Fx::new("mac-apply-audit-noplan");
+    let sim = fx.sim();
+    launched(&fx, &sim);
+    fs::remove_file(fx.host.stage().join("plan.json")).unwrap();
+    apply(&fx, &sim);
+    let line = audit_tail(&fx);
+    assert_eq!(line["result"], "failed:plan_invalid");
+    assert!(line["version"].is_null());
+
+    // A log that cannot be opened loses the line and nothing else.
+    let fx = Fx::new("mac-apply-audit-lost");
+    let sim = fx.sim();
+    launched(&fx, &sim);
+    fs::remove_file(&fx.host.audit).unwrap();
+    mkdir(&fx.host.audit, 0o700);
+    assert_eq!(apply(&fx, &sim).1, "done\n");
+}
+
+/// The stage is gone before the status leaves `running`: a reader that sees the end can
+/// never find the old job's stage still there to be removed under a newer install. The stage
+/// is made big so that removing it takes long enough for a reader to look meanwhile.
+#[test]
+fn the_stage_is_removed_before_the_status_says_done() {
+    let fx = Fx::new("mac-apply-order");
+    let sim = fx.sim();
+    launched(&fx, &sim);
+    for dir in 0..40 {
+        let path = fx.host.stage().join(format!("junk{dir}"));
+        mkdir(&path, 0o700);
+        for file in 0..200 {
+            write(&path.join(format!("f{file}")), 0o600, b"");
+        }
+    }
+    let (status, stage) = (fx.host.status_file(), fx.host.stage());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut seen_done_with_stage = false;
+            let mut seen_done = false;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // The stage is looked at first: a stage seen after `done` is a stage that
+                // outlived it.
+                let done = fs::read_to_string(&status).is_ok_and(|text| text == "done\n");
+                let there = stage.exists();
+                seen_done |= done;
+                seen_done_with_stage |= done && there;
+            }
+            (seen_done, seen_done_with_stage)
+        })
+    };
+    assert_eq!(apply(&fx, &sim).1, "done\n");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (seen_done, seen_done_with_stage) = watcher.join().unwrap();
+    assert!(seen_done, "the watcher saw the end");
+    assert!(
+        !seen_done_with_stage,
+        "the stage was still there when the status said done"
+    );
 }

@@ -4,9 +4,12 @@
 //! directory only root can write (`<work>/stage`, mode 0700), and only that copy is
 //! checked, in this order:
 //!
-//! 1. the sha256 of the copied tarball is the one the channel's pinned sums list;
-//! 2. `gh attestation verify` accepts the copied tarball and its bundle, offline, for the
-//!    commit and the channel's branch, run as `nobody` and never as root;
+//! 1. when the channel pins its releases, the sha256 of the copied tarball is the one its
+//!    sums list (the extra freeze list; a channel without sums skips this);
+//! 2. `gh attestation verify` accepts the copied tarball and its bundle, offline: the
+//!    tarball's sha256 is a subject, the signer is this repository's `artifacts.yml` on a
+//!    GitHub-hosted runner, and the build was of the full 40-digit commit on the channel's
+//!    branch. It runs as `nobody` and never as root. This is the trust anchor;
 //! 3. the tarball holds exactly one regular file, `kbf`, a Mach-O file for arm64;
 //! 4. no `com.apple.quarantine` attribute is left on it;
 //! 5. `codesign --verify --strict` accepts it and its signature has the hardened runtime;
@@ -49,6 +52,13 @@ const FORMER_WORKFLOW: &str = "komira-ai/komira-build-farm/.github/workflows/art
 /// The Mach-O header of a 64-bit arm64 executable: magic, then cputype.
 const MACHO_ARM64: [u8; 8] = [0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01];
 
+/// The release a version picked out: its commit, and the sha256 the channel pins for its
+/// tarball when it pins any.
+struct Pick {
+    commit: String,
+    sha256: Option<String>,
+}
+
 /// A release that passed every check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Staged {
@@ -87,15 +97,7 @@ fn stage_inner(
 ) -> Result<Staged, Outcome> {
     let prefix = release::commit_prefix(version.as_str())
         .ok_or_else(|| verify_failed("the version carries no commit (+g and 12 hex digits)"))?;
-    let sums = host
-        .trust
-        .read(&channel.sums)
-        .map_err(|e| Outcome::Refused(refusal(e)))?;
-    let pick = release::pick(&sums, prefix).map_err(|e| match e {
-        PickError::Malformed => Outcome::Refused(crate::outcome::Refusal::ConfigInvalid),
-        PickError::Unknown => verify_failed("the channel's sums list no release of that commit"),
-        PickError::Ambiguous => verify_failed("the commit digits fit two releases of the sums"),
-    })?;
+    let pick = pick_release(host, channel, prefix)?;
     // The pinned tools are root's, or nothing from them is believed.
     for tool in [&host.gh, &host.trusted_root] {
         host.trust.check_file(tool).map_err(|e| {
@@ -126,10 +128,12 @@ fn stage_inner(
     )
     .map_err(|e| verify_failed(format!("attestation bundle: {e}")))?;
 
-    // 1. The copy is the pinned one.
-    let digest = sha256_of(&tarball).map_err(|e| verify_failed(format!("tarball: {e}")))?;
-    if digest != pick.sha256 {
-        return Err(verify_failed("the tarball's sha256 is not the pinned one"));
+    // 1. The copy is the pinned one, when the channel pins.
+    if let Some(pinned) = &pick.sha256 {
+        let digest = sha256_of(&tarball).map_err(|e| verify_failed(format!("tarball: {e}")))?;
+        if digest != *pinned {
+            return Err(verify_failed("the tarball's sha256 is not the pinned one"));
+        }
     }
 
     // 2. The copy was built by the workflow, for the commit.
@@ -182,6 +186,55 @@ fn stage_inner(
         commit: pick.commit,
         binary_sha256,
     })
+}
+
+/// The release a version names in `channel`: from the pinned sums when it has some, else from
+/// the file names in its directory.
+fn pick_release(host: &MacHost, channel: &MacChannel, prefix: &str) -> Result<Pick, Outcome> {
+    let Some(sums_file) = &channel.sums else {
+        let listing = list_names(&channel.dir)
+            .map_err(|e| verify_failed(format!("the channel's directory: {e}")))?;
+        return release::pick_named(listing.iter().map(String::as_str), prefix)
+            .map(|commit| Pick {
+                commit,
+                sha256: None,
+            })
+            .map_err(|e| pick_failed(e, "the channel's directory"));
+    };
+    let sums = host
+        .trust
+        .read(sums_file)
+        .map_err(|e| Outcome::Refused(refusal(e)))?;
+    release::pick(&sums, prefix)
+        .map(|pick| Pick {
+            commit: pick.commit,
+            sha256: Some(pick.sha256),
+        })
+        .map_err(|e| pick_failed(e, "the channel's sums"))
+}
+
+/// Why no release was picked, as an outcome.
+fn pick_failed(e: PickError, whence: &str) -> Outcome {
+    match e {
+        PickError::Malformed => Outcome::Refused(crate::outcome::Refusal::ConfigInvalid),
+        PickError::Unknown => verify_failed(format!(
+            "unknown release: {whence} hold none of that commit"
+        )),
+        PickError::Ambiguous => verify_failed(format!(
+            "ambiguous release: {whence} hold two of that commit"
+        )),
+    }
+}
+
+/// The names (UTF-8 ones) in the untrusted directory `dir`. Only names are read here.
+fn list_names(dir: &Path) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        if let Ok(name) = entry?.file_name().into_string() {
+            names.push(name);
+        }
+    }
+    Ok(names)
 }
 
 fn set_mode(dir: &Path, mode: u32) -> Result<(), Outcome> {

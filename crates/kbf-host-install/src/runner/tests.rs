@@ -231,3 +231,75 @@ fn a_command_may_run_as_a_user() {
         assert!(SystemRunner.run(&c).is_err());
     }
 }
+
+/// A drop made by this process is refused when its effective uid is root and its real uid is
+/// not (the standard library would keep the caller's groups); a plain root, a plain user, a
+/// real root with another effective uid and a command that drops nothing pass.
+#[test]
+fn a_privilege_drop_needs_a_real_uid_of_root() {
+    use super::{Identity, refuse_setuid_drop};
+    let ids = Some(Identity {
+        uid: 65534,
+        gid: 65534,
+    });
+    let kind = |uid, euid| refuse_setuid_drop(ids, uid, euid).map_err(|e| e.kind());
+    assert_eq!(kind(1000, 0), Err(std::io::ErrorKind::PermissionDenied));
+    assert_eq!(kind(0, 0), Ok(()));
+    assert_eq!(kind(1000, 1000), Ok(()));
+    assert_eq!(kind(0, 1000), Ok(()));
+    // No drop, no matter who runs it.
+    assert!(refuse_setuid_drop(None, 1000, 0).is_ok());
+}
+
+/// A command with no `run_as` is started as it is. One with `run_as` is started by `chroot`
+/// on macOS, which sets the user, the group and the one supplementary group (the program
+/// and its arguments follow the root `/`); elsewhere this process sets the user and group.
+#[test]
+fn a_drop_goes_through_chroot_on_a_mac() {
+    use super::{Identity, Launch, launch};
+    let mut c = cmd("/usr/bin/gh", &["attestation", "verify"]);
+    for through_chroot in [false, true] {
+        assert_eq!(
+            launch(&c, through_chroot),
+            Launch {
+                program: "/usr/bin/gh".into(),
+                args: vec!["attestation".into(), "verify".into()],
+                set_ids: None
+            }
+        );
+    }
+    let id = Identity {
+        uid: 4_294_967_294,
+        gid: 4_294_967_293,
+    };
+    c.run_as = Some(id);
+    assert_eq!(
+        launch(&c, false),
+        Launch {
+            program: "/usr/bin/gh".into(),
+            args: vec!["attestation".into(), "verify".into()],
+            set_ids: Some(id)
+        }
+    );
+    assert_eq!(
+        launch(&c, true),
+        Launch {
+            program: "/usr/sbin/chroot".into(),
+            args: [
+                "-u",
+                "4294967294",
+                "-g",
+                "4294967293",
+                "-G",
+                "4294967293",
+                "/",
+                "/usr/bin/gh",
+                "attestation",
+                "verify"
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            set_ids: None
+        }
+    );
+}

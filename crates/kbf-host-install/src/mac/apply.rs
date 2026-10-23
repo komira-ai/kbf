@@ -10,12 +10,20 @@
 //! 2. move `previous` to the release that ran and `current` to the new one, each by an
 //!    atomic rename of a link made aside;
 //! 3. `launchctl bootout` the daemon, wait (bounded) until `launchctl print` no longer
-//!    finds it, `launchctl bootstrap` it, and wait (bounded) for its `welcomed` line in the
-//!    error log, counted from where the log ended before the bootstrap;
-//! 4. if step 3 fails, move the links back and do step 3 again on the old release.
+//!    finds it, `launchctl bootstrap` it, wait (bounded) for its `welcomed` line in the
+//!    error log, counted from where the log ended before the bootstrap, and require that
+//!    the daemon now runs the release that was started (the same reading `query` reports as
+//!    `running_commit`);
+//! 4. if step 3 fails, move the links back and do step 3 again on the old release, which
+//!    is checked to be root's first.
 //!
-//! The result goes to the status file ([`status`]): `done`, or `failed:<reason>` with what
-//! became of the old release. The drain that keeps builds from being cut is the updater's,
+//! The links as they were before step 2 are in the plan, so that the apply (and whoever
+//! has to repair a job that was killed halfway) works from what the install saw, not from
+//! what a half-moved flip left.
+//!
+//! The stage is removed, then the result goes to the status file ([`status`]): `done`, or
+//! `failed:<reason>` with what became of the old release. The same line is appended to the
+//! audit log. The drain that keeps builds from being cut is the updater's,
 //! done before it asks for the install; nothing here waits for leases.
 
 use std::fs::{self, OpenOptions};
@@ -32,6 +40,7 @@ use super::layout::{APPLY_LABEL, BINARY, DAEMON_LABEL, MacHost, VERSION_FILE};
 use super::stage::{Staged, run_ok, sha256_of, strip_quarantine};
 use super::status::{self, ApplyState};
 use super::tools;
+use crate::audit::{self, Audit};
 use crate::host::fail;
 use crate::outcome::{FailureCode, Outcome};
 use crate::request::Version;
@@ -45,6 +54,10 @@ pub struct Plan {
     pub commit: String,
     pub version: String,
     pub binary_sha256: String,
+    /// The release `current` named when the install was accepted.
+    pub before_current: Option<String>,
+    /// The release `previous` named then.
+    pub before_previous: Option<String>,
 }
 
 const PLAN_FILE: &str = "plan.json";
@@ -66,11 +79,14 @@ pub fn launch(
     runner: &dyn Runner,
     staged: &Staged,
     version: &Version,
+    before: &Links,
 ) -> Result<(), Outcome> {
     let plan = Plan {
         commit: staged.commit.clone(),
         version: version.as_str().to_owned(),
         binary_sha256: staged.binary_sha256.clone(),
+        before_current: before.current.clone(),
+        before_previous: before.previous.clone(),
     };
     let started = write_plan(host, &plan)
         .and_then(|()| status::write(host, &ApplyState::Running))
@@ -168,18 +184,49 @@ fn wait_gone(host: &MacHost, runner: &dyn Runner, label: &str) -> bool {
     }
 }
 
-/// The apply job's body: apply, record the result, clear the stage. The exit status is 0 for
+/// The apply job's body: apply, clear the stage, record the result. The exit status is 0 for
 /// done and 1 for a failure.
+///
+/// The stage goes first: the status leaves `running` only when nothing of this apply is
+/// left, so an install that sees the end cannot make a stage this job then removes.
 pub fn run(host: &MacHost, runner: &dyn Runner) -> u8 {
-    let result = apply(host, runner);
+    let plan = read_plan(host);
+    let result = plan
+        .as_ref()
+        .ok_or_else(|| "plan_invalid".to_owned())
+        .and_then(|plan| apply(host, runner, plan));
     let state = match &result {
         Ok(()) => ApplyState::Done,
         Err(why) => ApplyState::Failed(why.clone()),
     };
+    let _ = fs::remove_dir_all(host.stage());
     // The result stays in the status file; an unwritable file is all there is to tell.
     let written = status::write(host, &state);
-    let _ = fs::remove_dir_all(host.stage());
+    record(host, plan.as_ref(), &state);
     u8::from(result.is_err() || written.is_err())
+}
+
+/// Append the end of the apply to the audit log; a log that cannot be opened loses the line
+/// (the status file has the result).
+fn record(host: &MacHost, plan: Option<&Plan>, state: &ApplyState) {
+    let Ok(mut log) = Audit::open(&host.trust, &host.audit) else {
+        return;
+    };
+    let entry = audit::Entry {
+        time: audit::now(),
+        verb: Some("apply"),
+        version: plan.map(|plan| plan.version.clone()),
+        channel: None,
+        outcome: if *state == ApplyState::Done {
+            "applied"
+        } else {
+            "failed"
+        },
+        reason: None,
+        result: Some(state.line()),
+        command: None,
+    };
+    let _ = log.append(&entry);
 }
 
 fn read_plan(host: &MacHost) -> Option<Plan> {
@@ -187,13 +234,16 @@ fn read_plan(host: &MacHost) -> Option<Plan> {
     let plan: Plan = serde_json::from_str(&text).ok()?;
     let sound = super::release::is_commit(&plan.commit)
         && plan.binary_sha256.len() == 64
-        && Version::new(&plan.version).is_ok();
+        && Version::new(&plan.version).is_ok()
+        && [&plan.before_current, &plan.before_previous]
+            .into_iter()
+            .flatten()
+            .all(|commit| super::release::is_commit(commit));
     sound.then_some(plan)
 }
 
 /// The steps; an error is the status text.
-fn apply(host: &MacHost, runner: &dyn Runner) -> Result<(), String> {
-    let plan = read_plan(host).ok_or("plan_invalid")?;
+fn apply(host: &MacHost, runner: &dyn Runner, plan: &Plan) -> Result<(), String> {
     // The staged file is what was checked.
     let staged = host.stage().join(BINARY);
     host.trust
@@ -202,22 +252,31 @@ fn apply(host: &MacHost, runner: &dyn Runner) -> Result<(), String> {
     if sha256_of(&staged).ok().as_deref() != Some(plan.binary_sha256.as_str()) {
         return Err("stage_changed".to_owned());
     }
-    let before = kit::links(host).map_err(|_| "links_unreadable")?;
-    lay_out(host, runner, &plan, &staged)?;
+    let before = Links {
+        current: plan.before_current.clone(),
+        previous: plan.before_previous.clone(),
+    };
+    lay_out(host, runner, plan, &staged)?;
     if flip(host, &before, &plan.commit).is_err() {
         // A flip that stopped halfway must not leave `previous` naming the release that ran.
         let _ = restore(host, &before);
         return Err("links_failed".to_owned());
     }
-    let Err(why) = restart(host, runner) else {
+    let Err(why) = restart(host, runner, &plan.commit) else {
         return Ok(());
     };
     // The new release did not come up: the links go back, and the old release must.
     let restored = restore(host, &before).is_ok();
-    if before.current.is_none() {
+    let Some(old) = before.current.as_deref() else {
         return Err(format!("{why}:no_previous"));
-    }
-    let back = restored && restart(host, runner).is_ok();
+    };
+    // The daemon is not restarted on a file that is not root's to run, nor one that is gone.
+    let back = restored
+        && host
+            .kit_trust
+            .check_file(&host.release(old).join(BINARY))
+            .is_ok()
+        && restart(host, runner, old).is_ok();
     Err(format!(
         "{why}:{}",
         if back {
@@ -248,13 +307,13 @@ fn lay_out(host: &MacHost, runner: &dyn Runner, plan: &Plan, staged: &Path) -> R
     if sha256_of(&binary).ok().as_deref() != Some(plan.binary_sha256.as_str()) {
         return Err("release_differs".to_owned());
     }
-    strip_quarantine(host, runner, &binary).map_err(|_| "quarantine")?;
-    write_version(&dest, &plan.version).map_err(|_| "layout_failed")?;
     // The file that will run, and every directory above it up to the top of the kit, are
-    // root's and closed to others.
+    // root's and closed to others; nothing is written into the release before that is so.
     host.kit_trust
         .check_file(&binary)
         .map_err(|_| "release_untrusted")?;
+    strip_quarantine(host, runner, &binary).map_err(|_| "quarantine")?;
+    write_version(&dest, &plan.version).map_err(|_| "layout_failed")?;
     Ok(())
 }
 
@@ -287,8 +346,9 @@ fn restore(host: &MacHost, before: &Links) -> io::Result<()> {
     current.and(previous)
 }
 
-/// Restart the daemon: out, gone, in, welcomed. The error is the reason.
-fn restart(host: &MacHost, runner: &dyn Runner) -> Result<(), &'static str> {
+/// Restart the daemon: out, gone, in, welcomed, and running `commit`. The error is the
+/// reason.
+fn restart(host: &MacHost, runner: &dyn Runner, commit: &str) -> Result<(), &'static str> {
     let limit = host.tuning.tool;
     if loaded(host, runner, DAEMON_LABEL) {
         // The service may not be loaded by the time it is asked to leave; the wait decides.
@@ -304,10 +364,28 @@ fn restart(host: &MacHost, runner: &dyn Runner) -> Result<(), &'static str> {
         "launchctl bootstrap",
     )
     .map_err(|_| "bootstrap_failed")?;
-    if wait_welcomed(host, offset) {
+    if !wait_welcomed(host, offset) {
+        return Err("not_welcomed");
+    }
+    // A `welcomed` line is the log's word; the process is the proof.
+    if wait_running(host, runner, commit) {
         Ok(())
     } else {
-        Err("not_welcomed")
+        Err("wrong_release")
+    }
+}
+
+/// Wait, for at most the tuning's `gone`, until the daemon runs the release `commit`.
+fn wait_running(host: &MacHost, runner: &dyn Runner, commit: &str) -> bool {
+    let deadline = Instant::now() + host.tuning.gone;
+    loop {
+        if kit::running_commit(host, runner).as_deref() == Some(commit) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        sleep(host.tuning.poll);
     }
 }
 

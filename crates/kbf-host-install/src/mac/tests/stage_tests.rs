@@ -3,6 +3,7 @@
 
 use std::cell::RefCell;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::rc::Rc;
 
@@ -17,9 +18,27 @@ use crate::runner::Identity;
 fn channel(fx: &Fx) -> MacChannel {
     MacChannel {
         dir: fx.channel_dir.clone(),
-        sums: fx.sums.clone(),
+        sums: Some(fx.sums.clone()),
         source_ref: "refs/heads/main".into(),
     }
+}
+
+/// The channel with no sums: the attestation alone decides.
+fn unpinned(fx: &Fx) -> MacChannel {
+    MacChannel {
+        sums: None,
+        ..channel(fx)
+    }
+}
+
+fn run_unpinned(fx: &Fx, sim: &Sim, version: &str) -> Result<Staged, Outcome> {
+    mkdir(&fx.host.work, 0o711);
+    stage(
+        &fx.host,
+        sim,
+        &unpinned(fx),
+        &Version::new(version).unwrap(),
+    )
 }
 
 fn run(fx: &Fx, sim: &Sim, version: &str) -> Result<Staged, Outcome> {
@@ -168,7 +187,7 @@ fn a_version_that_names_no_listed_release_is_not_staged() {
     );
     let (code, detail) = failure(run(&fx, &sim, "0.1.7+gcccccccccccc-3"));
     assert_eq!(
-        (code, detail.contains("list no release")),
+        (code, detail.contains("unknown release")),
         (FailureCode::VerifyFailed, true)
     );
     // Two releases of the sums start with the digits.
@@ -181,7 +200,7 @@ fn a_version_that_names_no_listed_release_is_not_staged() {
     );
     let (code, detail) = failure(run(&fx, &sim, NEW_VERSION));
     assert_eq!(
-        (code, detail.contains("two releases")),
+        (code, detail.contains("ambiguous release")),
         (FailureCode::VerifyFailed, true)
     );
     assert_eq!(sim.calls.borrow().len(), 0, "nothing ran");
@@ -528,4 +547,172 @@ fn a_stage_that_cannot_be_prepared_is_an_install_failure() {
     }));
     let (code, detail) = failure(run(&fx, &sim, NEW_VERSION));
     assert_eq!(code, FailureCode::InstallFailed, "{detail}");
+}
+
+/// A channel with no sums takes the release the attestation accepts, whatever its tarball
+/// hashes to: the sums are not read. `gh` is asked to bind the full 40-digit commit as the
+/// source digest, the channel's branch as the source ref, this repository's workflow as the
+/// signer on hosted runners only, and to hash the staged tarball (its sha256 must be a
+/// subject), all on the stage's copy.
+#[test]
+fn an_unpinned_channel_takes_what_the_attestation_accepts() {
+    let fx = Fx::new("mac-stage-unpinned");
+    let sim = fx.sim();
+    // Sums that would refuse this tarball are not consulted.
+    write(&fx.sums, 0o644, b"not sums at all");
+    let staged = run_unpinned(&fx, &sim, NEW_VERSION).unwrap();
+    assert_eq!(staged.commit, NEW);
+    assert_eq!(staged.binary_sha256, sha256(&fx.new_binary));
+    let calls = sim.calls.borrow();
+    let gh = calls
+        .iter()
+        .find(|c| c.program == fx.host.gh.to_str().unwrap())
+        .unwrap();
+    let stage_dir = fx.host.stage();
+    let args = &gh.args;
+    let value_of = |flag: &str| {
+        let at = args.iter().position(|a| a == flag).unwrap();
+        args[at + 1].clone()
+    };
+    assert_eq!(args[..2], ["attestation", "verify"]);
+    assert_eq!(
+        args[2],
+        stage_dir.join(tarball_name(NEW)).display().to_string()
+    );
+    assert_eq!(value_of("--source-digest"), NEW);
+    assert_eq!(
+        NEW.len(),
+        40,
+        "the whole commit, not the version's 12 digits"
+    );
+    assert_eq!(value_of("--source-ref"), "refs/heads/main");
+    assert_eq!(value_of("--repo"), "komira-ai/kbf");
+    assert_eq!(
+        value_of("--signer-workflow"),
+        "komira-ai/kbf/.github/workflows/artifacts.yml"
+    );
+    assert_eq!(value_of("--digest-alg"), "sha256");
+    assert_eq!(
+        value_of("--cert-oidc-issuer"),
+        "https://token.actions.githubusercontent.com"
+    );
+    assert!(args.iter().any(|a| a == "--deny-self-hosted-runners"));
+}
+
+/// The branch the attestation must have been made for is the channel's own.
+#[test]
+fn the_attestation_is_bound_to_the_channels_branch() {
+    let fx = Fx::new("mac-stage-ref");
+    let sim = fx.sim();
+    mkdir(&fx.host.work, 0o711);
+    let release = MacChannel {
+        source_ref: "refs/heads/release/1".into(),
+        ..unpinned(&fx)
+    };
+    stage(
+        &fx.host,
+        &sim,
+        &release,
+        &Version::new(NEW_VERSION).unwrap(),
+    )
+    .unwrap();
+    let args = sim.calls.borrow()[2].args.join(" ");
+    assert!(args.contains("--source-ref refs/heads/release/1"), "{args}");
+}
+
+/// With no sums, an attestation that does not verify refuses the release, and says it was
+/// the attestation; nothing past it ran.
+#[test]
+fn an_unpinned_release_the_attestation_refuses_is_refused() {
+    let fx = Fx::new("mac-stage-unattested");
+    let sim = fx.sim();
+    sim.break_("gh");
+    let (code, detail) = failure(run_unpinned(&fx, &sim, NEW_VERSION));
+    assert_eq!(code, FailureCode::VerifyFailed);
+    assert!(
+        detail.starts_with("not attested: gh attestation verify"),
+        "{detail}"
+    );
+    assert_eq!(tags(&fx, &sim), ["dscl", "dscl", "gh", "gh"]);
+    assert!(!fx.host.stage().exists());
+}
+
+/// With no sums, a version picks its tarball from the directory by the 12 digits: none is an
+/// unknown release, two are ambiguous, and neither starts anything.
+#[test]
+fn an_unpinned_version_picks_its_tarball_from_the_directory() {
+    let fx = Fx::new("mac-stage-listing");
+    let sim = fx.sim();
+    let (code, detail) = failure(run_unpinned(&fx, &sim, "0.1.7+gcccccccccccc-3"));
+    assert_eq!(code, FailureCode::VerifyFailed);
+    assert!(detail.starts_with("unknown release"), "{detail}");
+    let twin = format!("{}c", &NEW[..39]);
+    write(&fx.channel_dir.join(tarball_name(&twin)), 0o644, b"x");
+    let (code, detail) = failure(run_unpinned(&fx, &sim, NEW_VERSION));
+    assert_eq!(code, FailureCode::VerifyFailed);
+    assert!(detail.starts_with("ambiguous release"), "{detail}");
+    assert_eq!(sim.calls.borrow().len(), 0, "nothing ran");
+    // A name that is not text and a file of another kind are not releases.
+    fs::remove_file(fx.channel_dir.join(tarball_name(&twin))).unwrap();
+    let odd = std::ffi::OsStr::from_bytes(b"kbf-\xff-darwin-arm64.tar.gz");
+    write(&fx.channel_dir.join(odd), 0o644, b"x");
+    assert_eq!(run_unpinned(&fx, &sim, NEW_VERSION).unwrap().commit, NEW);
+}
+
+/// A directory that cannot be listed is a failure of the check, not of the host.
+#[test]
+fn an_unpinned_channel_whose_directory_cannot_be_listed_fails() {
+    let fx = Fx::new("mac-stage-nolisting");
+    let sim = fx.sim();
+    fs::remove_dir_all(&fx.channel_dir).unwrap();
+    let (code, detail) = failure(run_unpinned(&fx, &sim, NEW_VERSION));
+    assert_eq!(code, FailureCode::VerifyFailed);
+    assert!(detail.starts_with("the channel's directory"), "{detail}");
+}
+
+/// Sums that are set are a freeze list on top of the attestation: a release the sums do not
+/// list is refused although its attestation would pass, and listing it lets it through.
+#[test]
+fn pinned_sums_are_a_freeze_list() {
+    let fx = Fx::new("mac-stage-freeze");
+    let sim = fx.sim();
+    let kept = format!(
+        "{}  {}\n",
+        sha256(b"another release"),
+        tarball_name(super::fx::OLD)
+    );
+    write(&fx.sums, 0o644, kept.as_bytes());
+    let (code, detail) = failure(run(&fx, &sim, NEW_VERSION));
+    assert_eq!(code, FailureCode::VerifyFailed);
+    assert!(detail.starts_with("unknown release"), "{detail}");
+    assert_eq!(sim.calls.borrow().len(), 0, "nothing ran");
+    let tar = fs::read(fx.tarball_path()).unwrap();
+    write(
+        &fx.sums,
+        0o644,
+        format!("{kept}{}  {}\n", sha256(&tar), tarball_name(NEW)).as_bytes(),
+    );
+    assert_eq!(run(&fx, &sim, NEW_VERSION).unwrap().commit, NEW);
+}
+
+/// An older release stages like a newer one, with or without sums.
+#[test]
+fn an_older_release_stages_with_and_without_sums() {
+    let fx = Fx::new("mac-stage-older");
+    let old = super::fx::OLD;
+    fx.offer_release(old, &super::fx::binary("old release"));
+    for pinned in [true, false] {
+        let sim = fx.sim();
+        let staged = if pinned {
+            run(&fx, &sim, super::fx::OLD_VERSION)
+        } else {
+            run_unpinned(&fx, &sim, super::fx::OLD_VERSION)
+        }
+        .unwrap();
+        assert_eq!(staged.commit, old);
+        assert_eq!(
+            staged.binary_sha256,
+            sha256(&super::fx::binary("old release"))
+        );
+    }
 }

@@ -31,6 +31,9 @@ fn an_install_launches_the_apply_job() {
     assert_eq!(plan["commit"], NEW);
     assert_eq!(plan["version"], NEW_VERSION);
     assert_eq!(plan["binary_sha256"].as_str().unwrap().len(), 64);
+    // The links as they were are in the plan.
+    assert_eq!(plan["before_current"], OLD);
+    assert!(plan["before_previous"].is_null());
     assert_eq!(mode(&fx.host.stage().join("plan.json")), 0o600);
     assert_eq!(mode(&fx.host.stage()), 0o700);
     assert_eq!(mode(&fx.host.work), 0o711);
@@ -400,6 +403,67 @@ fn an_older_version_is_installed_like_a_newer_one() {
     // Older than anything: only a release the sums list is wanted.
     let answer = fx.handle(&sim, "install kbf=0.0.1+gaaaaaaaaaaaa-1 from stable");
     assert_eq!(answer.json()["result"], "apply_started");
+}
+
+/// A channel with no sums installs through the whole verb: the release is the tarball in the
+/// directory that the attestation accepts, an older version installs like a newer one, a
+/// version no tarball matches is refused with nothing staged, and one the attestation
+/// refuses starts nothing.
+#[test]
+fn a_channel_without_sums_installs_what_the_attestation_accepts() {
+    let fx = Fx::new("mac-install-nosums");
+    write(
+        &fx.host.allowlist,
+        0o644,
+        format!(
+            "[channels.stable]\ndir = \"{}\"\n",
+            fx.channel_dir.display()
+        )
+        .as_bytes(),
+    );
+    let sim = fx.sim();
+    let answer = fx.handle(&sim, INSTALL);
+    assert_eq!(answer.code, 0, "{}", answer.err);
+    assert_eq!(answer.json()["commit"], NEW);
+    assert_eq!(fx.status(), "running\n");
+    // Older, and installed: the same path.
+    let fx_old = Fx::new("mac-install-nosums-older");
+    write(
+        &fx_old.host.allowlist,
+        0o644,
+        format!(
+            "[channels.stable]\ndir = \"{}\"\n",
+            fx_old.channel_dir.display()
+        )
+        .as_bytes(),
+    );
+    fx_old.offer_release(OLD, &binary("old"));
+    fx_old.install_release(NEW, NEW_VERSION, &fx_old.new_binary);
+    let sim = fx_old.sim();
+    *sim.running_path.borrow_mut() = Some(fx_old.host.release(NEW).join("kbf"));
+    let answer = fx_old.handle(&sim, &format!("install kbf={OLD_VERSION} from stable"));
+    assert_eq!(answer.json()["commit"], OLD, "{}", answer.err);
+    // No tarball starts with the digits: nothing is staged.
+    let fx = Fx::new("mac-install-nosums-unknown");
+    write(
+        &fx.host.allowlist,
+        0o644,
+        format!(
+            "[channels.stable]\ndir = \"{}\"\n",
+            fx.channel_dir.display()
+        )
+        .as_bytes(),
+    );
+    let sim = fx.sim();
+    let answer = fx.handle(&sim, "install kbf=0.1.7+gcccccccccccc-3 from stable");
+    assert_eq!((answer.code, reason(&answer)), (3, "verify_failed".into()));
+    assert!(answer.err.contains("unknown release"), "{}", answer.err);
+    assert!(!fx.host.stage().exists());
+    // The attestation refuses.
+    sim.break_("gh");
+    let answer = fx.handle(&sim, INSTALL);
+    assert!(answer.err.contains("not attested"), "{}", answer.err);
+    assert_eq!(fx.status(), "");
 }
 
 /// A release that fails a check starts nothing and leaves no status, no job and no stage.
