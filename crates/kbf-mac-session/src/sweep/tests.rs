@@ -258,13 +258,11 @@ fn places_that_cannot_be_read_are_errors_and_the_walk_goes_on() {
     };
     // Another uid: the walk descends, and a directory it cannot search below the plan's
     // folders belongs to someone else (another lease may be flipping it): logged and
-    // skipped, never this uid's failure. The plan's own places are still errors.
+    // skipped, never this uid's failure. A named place that cannot be removed is still
+    // an error; a base that cannot be opened is skipped (see the next test).
     let swept = sweep(&plan, "u", other());
-    let mut errors = swept.errors.clone();
-    errors.sort();
-    assert_eq!(errors.len(), 2, "{errors:?}");
-    assert!(errors[0].contains("/locked"), "{errors:?}");
-    assert!(errors[1].contains("/tabs/u"), "{errors:?}");
+    assert_eq!(swept.errors.len(), 1, "{:?}", swept.errors);
+    assert!(swept.errors[0].contains("/tabs/u"), "{:?}", swept.errors);
     assert_eq!(swept.removed, 0);
 
     // The departing uid: what it owns goes where it can, the rest is reported.
@@ -285,6 +283,120 @@ fn places_that_cannot_be_read_are_errors_and_the_walk_goes_on() {
     ] {
         chmod(path, 0o700);
     }
+}
+
+/// Catches a sweep that fails a clean because root is refused a plan base itself (on a
+/// Mac, `sfanalytics` and `trustd/private` answer `EPERM` to root in the daemon's
+/// context, so every clean would fail and every slot go dirty), and the opposite: a skip
+/// that is too wide. A base that opens with `EACCES` is skipped with no error and the
+/// next base is still swept; a base that is no directory (`ENOTDIR`), a link (`ELOOP`) and
+/// an error below a base that could be listed are all still errors.
+#[test]
+fn a_base_root_is_denied_is_skipped_and_every_other_error_still_fails() {
+    if root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = scratch("denied-base");
+    let denied_base = dir.join("denied");
+    fs::create_dir(&denied_base).unwrap();
+    chmod(&denied_base, 0o000);
+    let swept_base = dir.join("swept");
+    fs::create_dir(&swept_base).unwrap();
+    fs::write(swept_base.join("mine"), "x").unwrap();
+    fs::create_dir(swept_base.join("no-read")).unwrap();
+    fs::write(swept_base.join("no-read/f"), "x").unwrap();
+    chmod(&swept_base.join("no-read"), 0o000);
+    let file = dir.join("file");
+    fs::write(&file, "x").unwrap();
+    let link = dir.join("link");
+    symlink(&swept_base, &link).unwrap();
+
+    let plan = SweepPlan {
+        named: Vec::new(),
+        owned: vec![denied_base.clone(), swept_base.clone()],
+    };
+    let swept = sweep(&plan, "u", me());
+    // Only the entry below the base that could be listed is an error.
+    assert_eq!(swept.errors.len(), 1, "{:?}", swept.errors);
+    assert!(
+        swept.errors[0].contains("swept/no-read"),
+        "{:?}",
+        swept.errors
+    );
+    assert_eq!(swept.removed, 1);
+    assert!(!swept_base.join("mine").exists());
+
+    for bad in [&file, &link] {
+        let swept = sweep(&owned_plan(bad), "u", me());
+        assert_eq!(swept.errors.len(), 1, "{bad:?}: {:?}", swept.errors);
+        assert_eq!(swept.removed, 0);
+    }
+    chmod(&denied_base, 0o700);
+    chmod(&swept_base.join("no-read"), 0o700);
+}
+
+/// Catches a denial read too widely or too narrowly: only `EPERM` and `EACCES` (the
+/// two answers a protected folder gives root) are a skip. And the warning once per base:
+/// the first skip of a base says so, a second skip of it does not, and another base does.
+#[test]
+fn only_eperm_and_eacces_are_a_denial_and_each_base_is_named_once() {
+    let dir = scratch("first-denial");
+    for n in [libc::EPERM, libc::EACCES] {
+        assert!(
+            base_denied(&dir.join("x"), &io::Error::from_raw_os_error(n)),
+            "{n}"
+        );
+    }
+    for n in [
+        libc::ENOENT,
+        libc::ENOTDIR,
+        libc::ELOOP,
+        libc::EIO,
+        libc::EBUSY,
+    ] {
+        assert!(
+            !base_denied(&dir.join("y"), &io::Error::from_raw_os_error(n)),
+            "{n}"
+        );
+    }
+    assert!(!base_denied(&dir.join("y"), &io::Error::other("no errno")));
+    let (a, b) = (dir.join("a"), dir.join("b"));
+    assert!(first_denial(&a));
+    assert!(!first_denial(&a));
+    assert!(first_denial(&b));
+    assert!(!first_denial(&b));
+
+    // What is logged: one warning naming the base for two skips of it, one more for another.
+    #[derive(Clone, Default)]
+    struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl io::Write for Log {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let log = Log::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let (c, d) = (dir.join("c"), dir.join("d"));
+    tracing::subscriber::with_default(subscriber, || {
+        let eperm = io::Error::from_raw_os_error(libc::EPERM);
+        assert!(base_denied(&c, &eperm));
+        assert!(base_denied(&c, &eperm));
+        assert!(base_denied(&d, &eperm));
+    });
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(text.lines().count(), 2, "{text}");
+    assert!(text.contains(&c.display().to_string()), "{text}");
+    assert!(text.contains(&d.display().to_string()), "{text}");
+    assert!(text.contains("slot profile denies leases access"), "{text}");
 }
 
 /// Catches a deep tree that makes the sweep fail (a lease builds 300 directories to cost

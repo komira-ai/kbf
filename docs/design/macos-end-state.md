@@ -301,7 +301,7 @@ kernels and MLX under the slot profile. What such a lease leaves, measured on a 
 | Metal shader caches (`com.apple.metal`, `com.apple.metalfe`, `com.apple.gpuarchiver`) and the front-end module cache of MLX | `C/` of the uid's `/var/folders` entry | C7 |
 | `com.apple.MTLCompilerService` and Launch Services caches | `T/` and `0/` of the same entry | C7 |
 | Keychain, container-manager and quarantine files | the home | C7 |
-| Analytics and trust-store files the uid owns | `/private/var/protected/sfanalytics/<GUID>` and `/private/var/protected/trustd/private/<GUID>`, `<GUID>` the user's generated UID | C8 |
+| Analytics and trust-store files the uid owns | `/private/var/protected/sfanalytics/<GUID>` and `/private/var/protected/trustd/private/<GUID>`, `<GUID>` the user's generated UID | C8 where root can list the folder; on a Mac Studio nothing (see below), and the slot profile denies leases access to them |
 | The uid's security-message folder | `/private/var/db/mds/messages/<uid>` | C8 |
 | I/O Registry user clients of the uid's processes | the kernel | C3: they end with the processes |
 
@@ -315,6 +315,30 @@ UID, owned by the uid, and outlive the user, so C8 finds them by owner, never by
 user, and `user-delete` sweeps the same places. They appeared after a lease imported MLX, not after
 plain Metal use. A folder `<GUID>` the uid does not own stays, empty, after the sweep.
 
+**Measured on a Mac Studio (macOS 27, system integrity protection on).** In the daemon's context (a
+root launchd job; the privacy database shows Full Disk Access denied for the kbf binaries), listing
+`/private/var/protected/sfanalytics` and `/private/var/protected/trustd/private` fails with `EPERM`.
+`trustd/private` is refused even to root with Full Disk Access (over ssh); neither folder carries the
+`restricted` flag, so the protection is a data vault's. `/private/var/db/mds/messages` lists fine. The
+hosted runner hid this, because its agent process has Full Disk Access. A C8 that fails closed on any
+error would have failed every clean on such a Mac and set every slot dirty. So:
+
+- **The sweep skips a base it is denied.** When root cannot open or list a plan base itself
+  (`/private/var/protected/sfanalytics`, `/private/var/protected/trustd/private`) with `EPERM` or
+  `EACCES`, the base is skipped: not an error, not a dirty slot, and one warning per process and
+  base (not per lease) says the slot profile denies leases access to it. Every other error at a base,
+  and any error below a base that could be listed, still fails closed. The check after the sweep
+  (the listing of what the uid still owns) skips the same bases. `/private/var/db/mds/messages/<uid>`
+  keeps its sweep.
+- **The slot profile denies the two folders instead.** `SLOT_PROFILE` and `SLOT_NO_NETWORK_PROFILE`
+  carry `(deny file-read* file-write* (subpath ".../sfanalytics") (subpath ".../trustd/private"))`
+  after the write allows, so a lease cannot read what a system daemon left there for the same uid
+  while an earlier lease ran. The daemons are not sandboxed by the lease's profile and keep writing
+  for the uid. The `read-protected` canary asserts the deny ([slot profile canaries](#slot-profile-canaries)).
+  Neither operation is one Metal needs, and the deny is not in the list of known GPU-breaking denies
+  (`tests/gpu_profile.rs`); `tests/slot_gpu.rs` runs the Metal probe, and MLX when it installs,
+  under the profile.
+
 Known limits:
 
 - Wired memory and GPU driver memory cannot be cleaned per uid. On the runner the holders added 40
@@ -325,11 +349,11 @@ Known limits:
   paths during a run) is not owned by the uid and was not attributed to GPU use. The clean leaves it.
 - Two defunct processes (zombies whose parent is not the lease) stayed after the kill. They hold
   nothing and the clean's process check passes.
-- The clean of the two `/private/var/protected` places runs as root and is checked on the runner only.
-  Whether a Mac with its own system integrity settings lets root remove the uid's files there is not
-  known. If it does not, step C8 fails with the path and the error (`<path>: <error>`), the slot stays
-  dirty and out of the pool, and the log names the step.
-- The files under `/private/var/protected` and `/private/var/db/mds` are planted by the test, so it
+- Root cannot remove the uid's files in the two `/private/var/protected` places on a Mac Studio (the
+  finding above), so they stay after a clean and accumulate per uid; the profile deny keeps a later
+  lease from reading them. A system daemon can still read them for the same uid. Whether they grow
+  without bound is not measured.
+- The files under `/private/var/db/mds` are planted by the test, so it
   shows the sweep removes them, not that a system update keeps them in the same places. A check that a
   real framework lease leaves no uid-owned file there belongs to the baseline assertion.
 - The test of this section runs on the VM. Whether a Mac Studio leaves other state (a different
@@ -348,6 +372,7 @@ A row not refused in its own form sets the slot aside. The profile rows are
 | `link-outside` | `(deny file-write*)` | hard-link `/etc/hosts` into the lease | `EPERM` or `EACCES` |
 | `mach-register` | `(deny mach-register)` | `bootstrap_check_in` of a service name no job declares | `kern_return` 1100 (`BOOTSTRAP_NOT_PRIVILEGED`) |
 | `lsopen` | `(deny lsopen)` | `sandbox_check` of `lsopen`, the question Launch Services asks before it starts an application | denied (`sandbox=1`) |
+| `read-protected` | `(deny file-read* file-write* (subpath ...))` of the two stores under `/private/var/protected` | `sandbox_check` of `file-read-data` and `file-write-data` on each store (the profile is asked: the stores refuse a user whatever it says, and may not exist) | denied (`sandbox=1`) for all four |
 | `file-mount` | `(deny file-mount)` | `mount(2)` of a `devfs` on a directory of the lease | `EPERM` |
 | `launchd-bootstrap` | none: `(allow default)` | `launchctl bootstrap user/<uid>` of a `Background` `KeepAlive` agent whose file is in the lease | `Bootstrap failed: 5` |
 

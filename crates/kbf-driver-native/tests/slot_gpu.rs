@@ -6,9 +6,15 @@
 //! compiled at run time, a compute kernel), then a second copy that keeps its device
 //! open, so that the I/O Registry has a user client of the uid. The lease ends as the
 //! driver ends it, the lease directory goes, and the clean runs. The files that a
-//! framework import (MLX) makes outside the user's folders, which the Metal probe does
-//! not, are planted the way the system makes them: owned by the uid, in a folder named
-//! by the user's generated UID, beside a file of root's that must stay.
+//! framework import (MLX) makes in the security-message folder, which the Metal probe
+//! does not, are planted the way the system makes them: owned by the uid.
+//!
+//! The analytics and trust stores under `/private/var/protected` are not swept in the
+//! daemon's context on a real Mac (root is refused there, even with Full Disk Access for
+//! the trust store); the slot profile denies leases access to them instead. The test
+//! checks that the deny holds for a lease (a readable file of the uid's in each store is
+//! unreadable under the profile), that the Metal probe still runs under it, and that an
+//! MLX matrix product still runs under it when MLX can be installed on the runner.
 //!
 //! The test is `#[ignore]`: it needs root, real users, a Metal device and `swiftc`. The
 //! macOS CI job runs it with `cargo xtask sudo-test -p kbf-driver-native --test slot_gpu
@@ -40,8 +46,6 @@ const PROTECTED: [&str; 2] = [
     "/private/var/protected/sfanalytics",
     "/private/var/protected/trustd/private",
 ];
-/// A folder under the trust store made for the uid alone, as the sweep must find it.
-const UID_OWNED_FOLDER: &str = "00000000-0000-0000-0000-00000000F00D";
 const MDS_MESSAGES: &str = "/private/var/db/mds/messages";
 
 fn text(program: &str, args: &[&str]) -> String {
@@ -100,6 +104,19 @@ impl Lease {
     /// `program` as the slot's user under the slot profile, with the lease's variables
     /// and `extra` ones. It ends on its own or when the test ends the uid's processes.
     fn command(&self, slot: &Slot, extra: &[&str], program: &Path) -> Command {
+        self.command_with(slot, &self.isolation, Network::Off, extra, (program, &[]))
+    }
+
+    /// `program` with `args` as the slot's user under `isolation` and the slot profile of
+    /// `network`.
+    fn command_with(
+        &self,
+        slot: &Slot,
+        isolation: &Isolation,
+        network: Network,
+        extra: &[&str],
+        (program, args): (&Path, &[&str]),
+    ) -> Command {
         let mut inner: Vec<String> = Vec::new();
         for (name, value) in &self.vars {
             inner.push(format!("{name}={}", value.to_string_lossy()));
@@ -107,10 +124,11 @@ impl Lease {
         inner.push(format!("PATH={PATH}"));
         inner.extend(extra.iter().map(|e| (*e).to_owned()));
         inner.push(program.to_string_lossy().into_owned());
+        inner.extend(args.iter().map(|a| (*a).to_owned()));
         let (launcher, args) = slot
             .launch(
-                &self.isolation,
-                Network::Off,
+                isolation,
+                network,
                 &self.dir,
                 PathBuf::from("/usr/bin/env"),
                 &inner,
@@ -286,6 +304,61 @@ fn plant(file: &Path, owner: u32, folder_owner: u32, mode: u32, litter: &mut Lit
     std::os::unix::fs::chown(file, Some(owner), None).expect("chown");
 }
 
+/// The MLX arm: `Ok` with what the matrix product printed, or `Err` with why MLX could not
+/// be set up on this runner (no `python3`, no wheel, no network), which the test prints
+/// as `MLX_SKIPPED`. A product that fails once MLX is installed is a failure of the
+/// profile, not a skip: it is returned as `Ok` with its output for the test to judge.
+fn mlx_arm(slot: &Slot, lease: &Lease, venv: &Path, python: &Path) -> Result<String, String> {
+    let ran = |network, program: &Path, args: &[&str]| {
+        lease
+            .command_with(slot, &lease.isolation, network, &[], (program, args))
+            .output()
+            .map_err(|e| e.to_string())
+    };
+    let step = |what: &str, network, program: &Path, args: &[&str]| {
+        let out = ran(network, program, args)?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let tail: Vec<&str> = err.lines().rev().take(3).collect();
+            Err(format!("{what}: {tail:?}"))
+        }
+    };
+    step(
+        "venv",
+        Network::Off,
+        Path::new("/usr/bin/python3"),
+        &["-m", "venv", venv.to_str().unwrap()],
+    )?;
+    step(
+        "pip install mlx",
+        Network::On,
+        python,
+        &[
+            "-m",
+            "pip",
+            "install",
+            "--quiet",
+            "--disable-pip-version-check",
+            "mlx",
+        ],
+    )?;
+    let product = ran(
+        Network::Off,
+        python,
+        &[
+            "-c",
+            "import mlx.core as mx; a = mx.ones((256, 256)); b = a @ a; mx.eval(b); print('MLX_PASS', float(b[0, 0]))",
+        ],
+    )?;
+    Ok(format!(
+        "{}{}",
+        String::from_utf8_lossy(&product.stdout),
+        String::from_utf8_lossy(&product.stderr)
+    ))
+}
+
 fn wait_for(file: &Path, needle: &str, secs: u64) -> bool {
     let until = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < until {
@@ -308,9 +381,15 @@ fn wait_for(file: &Path, needle: &str, secs: u64) -> bool {
 /// - after the clean the slot is free (the clean found nothing left), the entry holds its
 ///   four empty folders and nothing else, the home is empty, and the uid owns nothing under
 ///   `/private/var/protected`, `/private/var/db/mds` or `/private/var/folders`;
-/// - the uid's planted files in the analytics and trust stores, a trust-store folder it
-///   owns whole, and its security-message folder are gone, and root's file in the same folder stays (the sweep removes by
-///   owner, not by folder).
+/// - the uid's planted file in its security-message folder is gone (the sweep keeps that
+///   folder, which is readable in the daemon's context);
+/// - a file of the uid's that it could read in each protected store (planted when root can
+///   write there) cannot be read by a lease under the slot profile, and the same read
+///   outside the sandbox is printed as `PROTECTED-CONTROL`, so the deny is seen to be the
+///   profile's when the store lets the uid in;
+/// - the Metal probe passes under the slot profile with that deny, and so does an MLX
+///   matrix product (`MLX_PASS`) when MLX installs on the runner (`MLX_SKIPPED` says why
+///   not).
 #[ignore = "needs root, real users, a Metal device and swiftc: see spike-slot-reach.yml job slot-gpu"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
@@ -368,23 +447,67 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
     let caches = metal_caches(&folders);
     let clients = registry_clients_of(uid);
 
-    // What an MLX import makes outside the folders, planted as the system makes it.
-    let control = Path::new(PROTECTED[0]).join(&guid).join("root-owned");
-    plant(&control, 0, 0, 0o600, &mut litter);
-    for file in [
-        Path::new(PROTECTED[0]).join(&guid).join("events.db"),
-        Path::new(PROTECTED[1]).join(&guid).join("trust.db"),
-        Path::new(MDS_MESSAGES)
-            .join(uid.to_string())
-            .join("se_SecurityMessages"),
-    ] {
-        plant(&file, uid, 0, 0o600, &mut litter);
-        litter.residue.push(file);
+    // The deny: a file of the uid's, readable by it, in each protected store (planted when
+    // root can write there; a store that refuses root holds nothing to read), which the
+    // lease must not read under the slot profile.
+    let mut denied = Vec::new();
+    for store in PROTECTED {
+        let file = Path::new(store).join(&guid).join("lease-readable");
+        let folder = file.parent().expect("parent").to_owned();
+        if std::fs::create_dir_all(&folder).is_err() {
+            println!("PROTECTED-CONTROL {store}: root cannot make a folder here");
+            continue;
+        }
+        plant(&file, uid, 0, 0o644, &mut litter);
+        let cat = Path::new("/bin/cat");
+        let outside = lease
+            .command_with(
+                &slot,
+                &Isolation::None,
+                Network::Off,
+                &[],
+                (cat, &[file.to_str().unwrap()]),
+            )
+            .output()
+            .expect("cat");
+        println!(
+            "PROTECTED-CONTROL {store}: unsandboxed read {}",
+            if outside.status.success() {
+                "works"
+            } else {
+                "is refused too"
+            }
+        );
+        let inside = lease
+            .command_with(
+                &slot,
+                &lease.isolation,
+                Network::Off,
+                &[],
+                (cat, &[file.to_str().unwrap()]),
+            )
+            .output()
+            .expect("cat");
+        denied.push((
+            store,
+            inside.status.success(),
+            String::from_utf8_lossy(&inside.stderr).into_owned(),
+        ));
     }
-    // A folder the uid owns whole, which the sweep removes with what is in it.
-    let own = Path::new(PROTECTED[1]).join(UID_OWNED_FOLDER);
-    plant(&own.join("trust.db"), uid, uid, 0o600, &mut litter);
-    litter.residue.push(own);
+
+    // MLX under the profile, when it installs: a venv in the lease, mlx from the network
+    // (the profile with the network on), then a matrix product on the GPU with it off.
+    let venv = lease.dir.join("venv");
+    let python = venv.join("bin/python");
+    let mlx = mlx_arm(&slot, &lease, &venv, &python);
+
+    // What a framework import makes in the security-message folder, planted as the system
+    // makes it.
+    let message = Path::new(MDS_MESSAGES)
+        .join(uid.to_string())
+        .join("se_SecurityMessages");
+    plant(&message, uid, 0, 0o600, &mut litter);
+    litter.residue.push(message);
 
     // The end of the lease as the driver makes it, the lease directory, the clean.
     let uid_arg = uid.to_string();
@@ -405,7 +528,6 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
     // Everything is read before anything can end the test, then the plants are removed.
     let free = slots.count();
     let outside = uid_files_outside(uid, &folders);
-    let control_stays = control.exists();
     let residue_left: Vec<PathBuf> = (litter.residue.iter())
         .filter(|p| p.exists())
         .cloned()
@@ -431,14 +553,24 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
         !clients.is_empty(),
         "the registry shows no user client of uid {uid}"
     );
+    for (store, readable, why) in &denied {
+        assert!(
+            !readable,
+            "a lease under the slot profile read a file in {store}"
+        );
+        println!("PROTECTED-DENIED {store}: {}", why.trim());
+    }
+    match &mlx {
+        Ok(said) => assert!(
+            said.contains("MLX_PASS 256.0"),
+            "an MLX matrix product under the slot profile: {said}"
+        ),
+        Err(why) => println!("MLX_SKIPPED {why}"),
+    }
     assert_eq!(free, 1, "the clean left the slot dirty");
     assert!(
         residue_left.is_empty(),
         "planted residue survived: {residue_left:?}"
-    );
-    assert!(
-        control_stays,
-        "the sweep removed root's file in the uid's folder"
     );
     assert!(outside.is_empty(), "the uid still owns {outside:?}");
     assert!(

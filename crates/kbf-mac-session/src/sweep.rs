@@ -268,8 +268,55 @@ fn remove_named(path: &Path, uid: u32, swept: &mut Swept) -> io::Result<()> {
     Ok(())
 }
 
-/// Removes every entry the uid owns below the plan directory `base`.
+/// Removes every entry the uid owns below the plan directory `base`, unless root is
+/// denied the base itself ([`base_denied`]). Any other error at the base, and every
+/// error below a base that could be listed, leaves the sweep incomplete.
 fn sweep_base(base: &Path, uid: u32, swept: &mut Swept) -> io::Result<()> {
+    match sweep_listed_base(base, uid, swept) {
+        Err(why) if base_denied(base, &why) => Ok(()),
+        other => other,
+    }
+}
+
+/// Whether `why`, the error of opening or listing the plan base `base` itself, is the
+/// refusal of a protected folder to root (`EPERM` or `EACCES`); if so the base is skipped,
+/// not failed, and the first skip of it in this process is logged.
+///
+/// On a Mac, `/private/var/protected/sfanalytics` and `trustd/private` answer `EPERM`
+/// to root in the daemon's context (the daemon has no Full Disk Access, and
+/// `trustd/private` refuses root even with it). The slot's sandbox profile denies leases
+/// access to them instead (docs/design/macos-end-state.md, "GPU state"), so a lease
+/// leaves nothing there to sweep. One warning per process and base, not per lease.
+#[must_use]
+pub fn base_denied(base: &Path, why: &io::Error) -> bool {
+    let refused = matches!(
+        why.raw_os_error(),
+        Some(n) if n == libc::EPERM || n == libc::EACCES
+    );
+    if refused && first_denial(base) {
+        tracing::warn!(
+            base = %base.display(),
+            "not swept, the slot profile denies leases access to it: {why}"
+        );
+    }
+    refused
+}
+
+/// Whether this is the first time this process skips `base`.
+fn first_denial(base: &Path) -> bool {
+    static SKIPPED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let mut skipped = SKIPPED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if skipped.iter().any(|seen| seen == base) {
+        return false;
+    }
+    skipped.push(base.to_path_buf());
+    true
+}
+
+/// [`sweep_base`] without the skip: an `Err` is the base not opening or not listing.
+fn sweep_listed_base(base: &Path, uid: u32, swept: &mut Swept) -> io::Result<()> {
     let Some(dir) = open_base(base)? else {
         return Ok(());
     };
