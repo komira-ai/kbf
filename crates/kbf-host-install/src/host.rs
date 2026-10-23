@@ -109,7 +109,7 @@ pub fn handle_unit(
 
 /// Write the answer: the detail of a failure to `err`, the line to `out`; the exit status.
 /// The writes ignore a closed pipe: the client is gone and there is nobody to tell.
-fn respond(outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+pub(crate) fn respond(outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     if let Some(detail) = outcome.stderr_detail() {
         let _ = writeln!(err, "{detail}");
     }
@@ -221,7 +221,7 @@ pub fn handle(
     respond(&outcome, out, err)
 }
 
-fn fail(code: FailureCode, detail: impl Into<String>) -> Outcome {
+pub(crate) fn fail(code: FailureCode, detail: impl Into<String>) -> Outcome {
     Outcome::Failed(Failure {
         code,
         detail: detail.into(),
@@ -500,16 +500,21 @@ fn install_body(
 /// Take the install lock without waiting: an advisory `flock` on a root-owned file under
 /// `/run`, opened without following a symbolic link. Held by the returned file.
 fn take_install_lock(host: &Host) -> Result<File, Outcome> {
+    take_lock(&host.install_lock)
+}
+
+/// Take the advisory lock on the file at `path` without waiting, creating it root-only.
+pub(crate) fn take_lock(path: &std::path::Path) -> Result<File, Outcome> {
     let file = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
         .custom_flags(trust::nofollow())
-        .open(&host.install_lock)
+        .open(path)
         .map_err(|e| {
             fail(
                 FailureCode::LockUnavailable,
-                format!("{}: {e}", host.install_lock.display()),
+                format!("{}: {e}", path.display()),
             )
         })?;
     // Anything but a lock taken means another install is running (or the lock cannot be

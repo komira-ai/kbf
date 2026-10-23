@@ -7,7 +7,7 @@ fn cmd(program: &str, args: &[&str]) -> Cmd {
     Cmd {
         program: program.into(),
         args: args.iter().map(|a| (*a).into()).collect(),
-        timeout: None,
+        ..Cmd::default()
     }
 }
 
@@ -184,4 +184,50 @@ fn a_missing_program_is_an_error_within_a_limit() {
         ))
         .unwrap_err();
     assert_ne!(error.kind(), std::io::ErrorKind::TimedOut);
+}
+
+/// Variables a command asks for are added to the fixed three, and nothing else.
+#[test]
+fn a_command_may_add_variables() {
+    let mut c = cmd("/usr/bin/env", &[]);
+    c.env = vec![("HOME".into(), "/h".into()), ("GH_X".into(), "1".into())];
+    let out = SystemRunner.run(&c).unwrap();
+    let seen: BTreeSet<String> = out.stdout_text().lines().map(str::to_owned).collect();
+    assert!(seen.contains("HOME=/h") && seen.contains("GH_X=1"));
+    assert_eq!(seen.len(), 5);
+}
+
+/// Bytes given to a command arrive on its standard input, which is then closed; they are
+/// written while the command runs, so more than a pipe holds does not block.
+#[test]
+fn a_command_may_be_given_standard_input() {
+    let mut c = cmd("/usr/bin/cat", &[]);
+    c.stdin = b"query".to_vec();
+    let out = SystemRunner.run(&c).unwrap();
+    assert_eq!(out.stdout, b"query");
+    c.stdin = vec![b'x'; 1 << 20];
+    assert_eq!(SystemRunner.run(&c).unwrap().stdout.len(), 1 << 20);
+    // A command that never reads does not hang the writer.
+    let mut c = cmd("/usr/bin/true", &[]);
+    c.stdin = vec![b'x'; 1 << 20];
+    assert!(SystemRunner.run(&c).unwrap().success());
+}
+
+/// A command runs as the user and group it is given: the caller's own is allowed, and
+/// another one is refused to a caller who is not root.
+#[test]
+fn a_command_may_run_as_a_user() {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata("/proc/self").unwrap();
+    let (uid, gid) = (meta.uid(), meta.gid());
+    let mut c = cmd("/usr/bin/id", &["-u"]);
+    c.run_as = Some(super::Identity { uid, gid });
+    assert_eq!(
+        SystemRunner.run(&c).unwrap().stdout_text().trim(),
+        uid.to_string()
+    );
+    if uid != 0 {
+        c.run_as = Some(super::Identity { uid: uid + 1, gid });
+        assert!(SystemRunner.run(&c).is_err());
+    }
 }

@@ -135,7 +135,7 @@ fn the_query_commands() {
                 "--showformat=${db:Status-Abbrev} ${Version}\\n",
                 "kbf"
             ]),
-            timeout: None,
+            ..Cmd::default()
         }
     );
     // The binary runs as root and may hang: it gets a limit; nothing else here does.
@@ -145,6 +145,7 @@ fn the_query_commands() {
             program: KBF.into(),
             args: strings(&["--version", "--json"]),
             timeout: Some(Duration::from_secs(10)),
+            ..Cmd::default()
         }
     );
     assert_eq!(RUNNING_BUILD_TIMEOUT_SECS, 10);
@@ -164,7 +165,7 @@ fn the_query_commands() {
                 "--",
                 "kbf-host-install-*"
             ]),
-            timeout: None,
+            ..Cmd::default()
         }
     );
 }
