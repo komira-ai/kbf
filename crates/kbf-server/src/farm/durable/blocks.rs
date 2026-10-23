@@ -35,7 +35,9 @@ pub(super) const CAS_TRIES: usize = 8;
 /// Runs `attempt`, and again while it loses a compare-and-set to another writer (it reads
 /// the rows it depends on again each time), at most [`CAS_TRIES`] times in all. The last
 /// conflict is returned.
-fn contended<T>(mut attempt: impl FnMut() -> Result<T, StateError>) -> Result<T, StateError> {
+pub(super) fn contended<T>(
+    mut attempt: impl FnMut() -> Result<T, StateError>,
+) -> Result<T, StateError> {
     let mut tried = 1;
     loop {
         match attempt() {

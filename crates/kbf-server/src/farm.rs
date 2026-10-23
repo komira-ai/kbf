@@ -72,7 +72,10 @@ mod phase;
 mod record;
 pub mod sched_view;
 
-pub use durable::{DONE_FLOOR, EpochBump, EpochPolicy, ID_BLOCK, SESSION_RENEWAL, StateError};
+pub use durable::{
+    ACK_WINDOW, DONE_FLOOR, EpochBump, EpochPolicy, ID_BLOCK, OWNER_CACHE_TTL, SESSION_RENEWAL,
+    StateError,
+};
 pub use handover::UNTRACED_LOOKS;
 pub use phase::Reported;
 
@@ -303,8 +306,16 @@ struct State {
     held_cap: usize,
     /// The scheduler was told the state store is unavailable ([`State::watch_store`]).
     store_down: bool,
-    /// When each node's session row in the state store was last written.
+    /// When each node's session row in the state store was last written, or renewed: the
+    /// next renewal falls due a renewal interval later.
     renewed: BTreeMap<WorkerId, FarmTime>,
+    /// When each node's session row was last written successfully, at its registration or
+    /// a renewal. Its heartbeats are acknowledged only while that was lately
+    /// ([`ACK_WINDOW`]).
+    session_ok: BTreeMap<WorkerId, FarmTime>,
+    /// The nodes whose `Hello` found the state store unreachable, so this frontend has not
+    /// claimed them, with the daemon process that said it ([`State::claim_pending`]).
+    unclaimed: BTreeMap<WorkerId, DaemonInstance>,
     /// A handover took the work from this farm ([`Farm::fence`]): it feeds the scheduler
     /// nothing and queues nothing.
     fenced: bool,
@@ -416,6 +427,8 @@ impl Farm {
                 held_cap: HELD_CAP,
                 store_down: false,
                 renewed: BTreeMap::new(),
+                session_ok: BTreeMap::new(),
+                unclaimed: BTreeMap::new(),
                 fenced: false,
                 untraced_kept: BTreeMap::new(),
                 untraced_relayed: BTreeMap::new(),
@@ -601,6 +614,9 @@ impl Farm {
             let cause = "the daemon restarted, or two daemons hold this node's certificate";
             tracing::warn!(%worker, cause, "another daemon process registered as this node");
         }
+        // Before the registration replaces the session row it reads, and before the
+        // scheduler hears of the worker, whose recovered leases it books.
+        state.claim_worker(now, worker, &instance);
         state.record_session(now, worker, &instance, stopped, &reported);
         let event = Event::WorkerUp {
             worker: worker.clone(),
@@ -1267,6 +1283,7 @@ impl State {
     /// answers, for the caller to deliver once the lock is released.
     fn carry_out(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
         self.watch_store(now);
+        self.claim_pending(now);
         self.reserve_seqs();
         self.learned.clock(now);
         // Only the inputs whose callers deliver answers ([`State::feed_quiet`]) release

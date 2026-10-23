@@ -80,12 +80,14 @@ async fn with_an_unsettled_requeue(rig: &Rig) -> String {
     assert_eq!(keys(rig, "lease/").len(), 1, "the operation is leased");
     let operation = keys(rig, "op/").remove(0).replace("op/", "");
 
-    // The daemon's process is proven stopped, and the store refuses what follows.
+    // The daemon's process is proven stopped and its replacement registers, the frontend
+    // becoming the node's owner and writing its session row; the store refuses what follows.
     drop(inbox);
-    rig.store.refuse_next.store(usize::MAX, Ordering::SeqCst);
     let (outbound, _kept) = mpsc::unbounded_channel();
     let stream = register(rig, "daemon-2", "daemon", outbound);
-    // The new process lists no lease: the one the old process held is given up.
+    rig.store.refuse_next.store(usize::MAX, Ordering::SeqCst);
+    // The new process lists no lease: the one the old process held is given up. Its
+    // heartbeat is acknowledged, for the frontend owns the node and wrote its session row.
     assert!(rig.farm.heartbeat(&node(), stream, 1, Vec::new()).await);
     rig.store.refuse_next.store(0, Ordering::SeqCst);
     assert_eq!(

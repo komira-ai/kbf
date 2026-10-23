@@ -3,6 +3,8 @@
 //! compare-and-set on the counter rows, an epoch created once and kept, and the operator's
 //! raise of it.
 
+use std::sync::atomic::AtomicUsize;
+
 use kbf_front::{Cache, Dispatch, Submission};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{
@@ -23,6 +25,7 @@ pub(super) struct Racing {
     inner: Fake,
     landings: Mutex<Vec<(String, Txn)>>,
     down: AtomicBool,
+    lease_scans: AtomicUsize,
 }
 
 impl Racing {
@@ -32,7 +35,13 @@ impl Racing {
             inner: Fake::with_flaw(clock, Flaw::None),
             landings: Mutex::new(Vec::new()),
             down: AtomicBool::new(false),
+            lease_scans: AtomicUsize::new(0),
         })
+    }
+
+    /// How many times every `lease/` row has been read by a scan.
+    pub(super) fn lease_scans(&self) -> usize {
+        self.lease_scans.load(Ordering::SeqCst)
     }
 
     /// `landing` is applied before the next write that names `key`.
@@ -65,6 +74,8 @@ impl Store for Racing {
     }
 
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
+        let scans = &self.lease_scans;
+        scans.fetch_add(usize::from(prefix == "lease/"), Ordering::SeqCst);
         self.inner.scan_prefix(prefix)
     }
 

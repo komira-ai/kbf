@@ -207,6 +207,88 @@ restarted daemon's sweep is the second line, when a daemon is started again on t
 node with the same scratch directory. What neither reaches is listed in
 [daemon.md](daemon.md#when-the-daemon-is-killed).
 
+### A daemon moving between frontends
+
+Several frontends can share one state store, each with the daemons connected to it. A
+daemon is connected to one frontend at a time, and the frontend it last said `Hello` to
+owns its node: only that frontend may grant the node a lease, give one up, or take a
+result for one. What the code does today:
+
+- **The owner row.** `owner/<node>` holds the id of a frontend and a counter (eight bytes
+  each, big-endian). A `Hello` makes the frontend it is said to the owner, with one
+  compare-and-set write that adds one to the counter. The frontend remembers the counter
+  it wrote. Each write of a lease of that node (a grant, a lease given up, a result) reads
+  the row, and its transaction carries a check that the row is still the one read, so the
+  write fails if the daemon said `Hello` elsewhere in between. A write that finds another
+  name or counter writes nothing and fails with a "stale owner" error for that node. That
+  error drops only what the frontend holds for that node (the node's held grants and
+  results, and its later ones as they meet the same refusal): the frontend's work for its
+  other nodes goes on, and the frontend is not marked as superseded, as a newer writer of
+  the whole store would mark it (the writer generation, which is unchanged). A held `Start`
+  reads the counter when it is written, not when it was proposed, so a daemon that
+  reconnects to the same frontend does not turn its held grants stale. A node whose
+  daemon has not yet said `Hello` to the frontend (a lease taken up at a start) has no
+  counter to check, and its writes are conditional on their lease rows alone, as they
+  were.
+- **Acknowledging heartbeats.** The frontend still hears every heartbeat it takes, but
+  acknowledges one only while it owns the node and has written the node's session row
+  lately. It looks at the owner row again when its last look is `OWNER_CACHE_TTL` (2 s)
+  old; a frontend whose look says the daemon has gone elsewhere stops acknowledging and no
+  longer renews the node's session row, so the daemon fences on time (T after the last
+  acknowledged heartbeat, as above). The session row is the sign other frontends have that
+  the daemon is alive, so a frontend that cannot write it (the store refuses writes, or a
+  registration or renewal failed) stops acknowledging when the last write is `ACK_WINDOW`
+  (30 s) old. The window is the session row's life (`LEASE_GRACE` from its last write) and
+  one more renewal interval (`SESSION_RENEWAL`), less T and twice the 5 s margin of the
+  fence. That is longer than a renewal interval and a heartbeat interval together (checked
+  at compile time), so a frontend that renews on schedule never withholds an acknowledgement.
+  By construction it is also short enough that a daemon's work ends before a reader that
+  waited one renewal interval beyond the row's expiry would give its leases up, but no code
+  waits on an expired session row yet, and nothing asserts that.
+- **Claiming and the store.** A claim the store refuses because it cannot be reached is
+  made again, while the daemon's stream is open, by the first feed that finds the store
+  reachable; the heartbeats are not acknowledged until it is made. A claim that loses
+  every try to others writing the row gives the node up (nothing is written for it until
+  it says `Hello` here again), and a row that cannot be read is not claimed or tried
+  again until the next `Hello`. A node whose claim failed for any reason, or whose
+  arrival (the leases and session row the claim takes over) could not be read after the
+  claim was written, is lost to the frontend in the same way until a claim succeeds, so
+  no grant for it is written meanwhile. A claim made again after an arrival that could not
+  be read finds the frontend's own row, so the frontend keeps the owner the first claim
+  replaced and reports that one.
+- **Finding a lease by its operation.** `lease-by-op/<operation>` holds the id of the
+  lease the operation holds (term and sequence, eight bytes each, big-endian). The grant
+  writes it in its own transaction, and the end of the lease (a give-up, a result, a
+  refusal) deletes it. A request for an action that is running on another frontend's
+  daemon joins the operation and needs its lease; it reads the operation's index row
+  and that lease's row instead of every lease row of the farm. An operation in the queue
+  holds no lease and is not looked up at all. A row that is missing, or names a lease that
+  is not the operation's, is left by a release that predates the index, and the lookup
+  then reads every lease row, as it always did.
+- **A daemon that moves.** When a daemon says `Hello` to a frontend, that frontend takes
+  up the unfinished operations whose lease rows name the node and that its scheduler does
+  not hold (it started before the grant, or did not run it), as it takes up the leases it
+  finds at a start. The daemon's first heartbeat lists what it runs, and a lease it lists
+  is kept. A lease it leaves out is given up as above: at once if the daemon is the
+  process the node's session row names (the same process moved, as a reconnect), and after
+  `HANDOVER_GRACE` and `OWNER_CACHE_TTL` (47 s) from the `Hello` if the row names another
+  process or is gone and the node's owner was another frontend. In that case the old
+  process may still be running the lease, acknowledged by the frontend it left until that
+  frontend looks at the owner row again, and it fences T after its last acknowledged
+  heartbeat; the wait covers both. The hold applies whether or not this frontend's
+  scheduler has registered the node before (a daemon that went to another frontend and
+  came back is registered here already; the leases taken in for it are booked on it at
+  once, and kept for the wait). A node with no earlier owner, and a daemon that says
+  `Hello` again to the frontend that owns it (its owner row names this frontend), keep the
+  rules above. The `Hello` reads every `lease/` row to find the node's leases, while the
+  frontend holds its lock: a cost of the order of the leases of the farm for each
+  reconnecting daemon, accepted until a `lease-by-worker/` index is worth its writes.
+
+Not done yet: a frontend takes up work other frontends queue only when a request joins it
+or a daemon moves, so a frontend the daemon left goes on believing it holds the node's
+leases until the node is silent for G, and its give-up of them is refused as stale and
+dropped; it does not yet put such leases back in its queue at once.
+
 ### Node phases
 
 A worker's `Hello` says what it is doing besides running leases
