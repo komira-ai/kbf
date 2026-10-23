@@ -322,10 +322,9 @@ the disk index, never the reverse. The desired release, the slot, the per-host p
 
 ### 6.4 Sessions
 
-**As built.** The frontend looks at the desired row and the release store once a farm tick and
-keeps one offer per complete platform; each session sends its node's platform offer after
-`Welcome` and whenever that offer changes (the same offer is never sent twice on a session).
-A look that fails keeps the table. The node's platform is read from its first `Hello`.
+**As built.** The frontend sends no `UpdateOffer` over a session: the offer feed was deleted, and
+`ServerMessage.update_offer` (field 8) stays defined on the wire and is never sent. The passages
+below that describe offers are history.
 The rollout controller (`kbf-server/src/update`) runs on the frontend with a state store, once a
 farm tick, and starts no host when an operator wrote `update/policy.auto_nodes` false or paused the
 run (a policy never written reads as `auto_nodes` true: the desired write is the click; hosts already
@@ -344,7 +343,7 @@ carry it reads false; a policy row that was never written reads as the defaults,
 off after the resume until an operator writes `true`.
 
 After `Welcome`, and to every connected node at every change of the desired release or of a platform's
-completeness, the frontend sends an `UpdateOffer` for that node's platform. `UpdateStatus` is kept as the newest per
+completeness, the frontend used to send an `UpdateOffer` for that node's platform (it no longer does). `UpdateStatus` is kept as the newest per
 node and ignored from a replaced stream, exactly as `NodeStatus` is.
 
 ### 6.5 Frontend self-update
