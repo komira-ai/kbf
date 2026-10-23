@@ -96,10 +96,18 @@ A worker reports how many GPUs it has in the `gpu` entry of its node report; a r
 without one has none. The daemon counts them on Linux from the PCI functions in
 `/sys/bus/pci/devices`: each NVIDIA or AMD VGA-compatible or 3D controller is one
 GPU. A server's management-controller VGA function and integrated graphics do not
-count. An Apple silicon Mac has one GPU, for the whole host, and reports none: on
-macOS (`OSFamily=darwin`, or any spelling that names macOS) a GPU comes only with the
-whole Mac, so `gpu` of 1 or more is refused unless the action also asks for
-`kbf-lease=whole_machine`, which then books no GPU on top: the lease has the whole Mac.
+count. An Apple silicon Mac has one GPU, shared by the whole host, and reports it as
+one slot: `gpu` 1, with `gpu.kind` `native`, its `gpu.cores` and its `gpu.metal_family`
+(the N of the highest `MTLGPUFamilyAppleN` its chip supports; see
+[capabilities.md](design/capabilities.md#the-node-report)). So on macOS
+(`OSFamily=darwin`, or any spelling that names macOS) `gpu=1` books the Mac's GPU slot:
+one GPU action runs on a Mac at a time, and the Mac's CPUs and memory still serve other
+work beside it. The GPU is shared hardware, not a partition: leases that book no GPU
+can still use it, and the tests that do are for one tenant. `gpu` of 2 or more on
+macOS is refused (a Mac has one). A `whole_machine` lease on macOS books no GPU on top:
+the lease has the whole Mac. A Mac whose daemon runs in a virtual machine reports no GPU
+at all, and neither does a Mac whose daemon predates the entry, so a GPU action waits
+for a Mac that does.
 
 In Bazel:
 
@@ -107,6 +115,16 @@ In Bazel:
 cc_test(
     name = "kernel_test",
     exec_properties = {"gpu": "1"},
+    ...
+)
+```
+
+On a Mac:
+
+```starlark
+py_test(
+    name = "mlx_test",
+    exec_properties = {"OSFamily": "darwin", "gpu": "1"},
     ...
 )
 ```
@@ -126,8 +144,9 @@ A lease goes only to a worker whose daemon runs a driver for its kind: `containe
 user in that user's GUI session, and the Mac is cleaned before the lease reports
 ([fleet-updates.md](design/fleet-updates.md#101-no-gpu-in-vms)). On a farm without such
 a Mac a `whole_machine` action waits with the reason and then fails, as described under
-[Where an action runs](#where-an-action-runs). A GPU test on a Mac is a
-`whole_machine` lease:
+[Where an action runs](#where-an-action-runs). A GPU test that needs the Mac to itself (a
+performance run, or an app installed in the GUI session) is a `whole_machine` lease;
+one that needs only the GPU asks for `gpu=1` (see [`gpu`](#gpu)):
 
 ```starlark
 py_test(

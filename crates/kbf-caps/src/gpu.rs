@@ -6,7 +6,12 @@
 //!   NVIDIA (`0x10de`) or AMD (`0x1002`). Other display functions do not count: a
 //!   server's management controller exposes a VGA function, and integrated graphics
 //!   is not a device to hand to an action.
-//! - macOS: an Apple silicon Mac has one GPU, shared by the whole host.
+//! - macOS: an Apple silicon Mac has one GPU, shared by the whole host. The node books
+//!   it as one slot (`gpu` = 1), so one GPU lease runs on a Mac at a time. A Mac also
+//!   reports what kind of GPU that is: [`GPU_KIND_NATIVE`] (the daemon runs on the
+//!   hardware, not in a guest), its core count ([`gpu_cores_from_macos_ioreg`], read from
+//!   the IOKit registry, which `sysctl` has no entry for) and its Metal GPU family
+//!   ([`metal_family_of_apple_chip`], from the chip's name).
 
 use crate::cpu::ParseError;
 use crate::macos;
@@ -53,6 +58,43 @@ where
 /// [`crate::CpuCaps::from_macos_sysctl`].
 pub fn gpus_from_macos_sysctl(text: &str) -> Result<u64, ParseError> {
     macos::features(text).map(|_| 1)
+}
+
+/// The value of the `gpu.kind` report entry of a Mac whose daemon runs on the hardware:
+/// the GPU is the host's own, not a guest's paravirtual device. A node in a guest never
+/// reports it, and reports no GPU.
+pub const GPU_KIND_NATIVE: &str = "native";
+
+/// The core count of a Mac's GPU from `ioreg -r -d 1 -c AGXAccelerator`: the number in
+/// the first `"gpu-core-count" = <n>` line. `None` when no such line has a number (a
+/// guest's paravirtual GPU, or a Mac whose `ioreg` printed nothing).
+#[must_use]
+pub fn gpu_cores_from_macos_ioreg(text: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        if key.trim() != "\"gpu-core-count\"" {
+            return None;
+        }
+        value.trim().parse().ok().filter(|&n| n > 0)
+    })
+}
+
+/// The Metal GPU family of an Apple silicon chip, from its name as
+/// `machdep.cpu.brand_string` gives it (`Apple M3 Ultra`): the N of the highest
+/// `MTLGPUFamilyAppleN` the chip supports. M1 is 7, M2 is 8, M3 and M4 are 9, M5 is 10.
+/// `None` for a name that is not `Apple M<n>` or a generation this table does not know
+/// yet: the node then reports no family, and a newer chip is added here.
+#[must_use]
+pub fn metal_family_of_apple_chip(brand: &str) -> Option<u32> {
+    let generation = brand.strip_prefix("Apple M")?;
+    let digits = generation.split(|c: char| !c.is_ascii_digit()).next()?;
+    match digits.parse::<u32>().ok()? {
+        1 => Some(7),
+        2 => Some(8),
+        3 | 4 => Some(9),
+        5 => Some(10),
+        _ => None,
+    }
 }
 
 /// `text` as `0x` and exactly `digits` hex digits, one trailing newline allowed.

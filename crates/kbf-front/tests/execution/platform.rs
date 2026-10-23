@@ -278,8 +278,7 @@ async fn the_platform_says_which_workers_may_run_it() {
 /// Catches: a property kbf reads ignored because of its case, so `osfamily=linux`
 /// runs anywhere, `GPU=1` on a node without a GPU, `KBF-LEASE=whole_machine` beside
 /// other work; and one property sent in two spellings resolved silently by order.
-/// (On macOS a GPU is the whole Mac's and is not booked on top; see
-/// `a_gpu_on_macos_is_the_whole_macs`.)
+/// (On macOS a GPU is the Mac's one slot; see `a_gpu_on_macos_is_the_macs_one_slot`.)
 #[tokio::test]
 async fn property_names_are_read_in_any_case() {
     let script = Arc::new(Script::default());
@@ -398,13 +397,16 @@ async fn ios_device_requests_reach_the_scheduler_and_bad_ones_are_refused() {
     }
 }
 
-/// Catches a GPU on macOS booked on top of a whole-machine lease (no Mac reports one,
-/// so the GPU test would wait for ever), and a GPU on macOS taken outside a
-/// whole-machine lease (it would run beside other work on a shared Mac; the front
-/// refuses it, naming `kbf-lease=whole_machine`). An `os` property names macOS as
-/// `OSFamily` does.
+/// Catches a GPU on macOS booked on top of a whole-machine lease (the lease has the
+/// whole Mac, so a booked GPU slot would wait behind other GPU work for a GPU it
+/// already holds); an `action` lease for a GPU on macOS refused (the Mac's one GPU slot
+/// is bookable, so a GPU test runs beside the Mac's other work) or booked as none (two
+/// GPU tests would share the GPU); more than the Mac's one GPU accepted (no node could
+/// serve it and it would wait for ever; it is refused, naming the one GPU); and the same
+/// request for Linux booked differently (`gpu=2` stays a booking of two). An `os`
+/// property names macOS as `OSFamily` does.
 #[tokio::test]
-async fn a_gpu_on_macos_is_the_whole_macs() {
+async fn a_gpu_on_macos_is_the_macs_one_slot() {
     let script = Arc::new(Script::default());
     let farm = Farm::with_execution(Arc::clone(&script)).await;
     for os in [("OSFamily", "darwin"), ("os", "macos")] {
@@ -415,23 +417,35 @@ async fn a_gpu_on_macos_is_the_whole_macs() {
         );
         farm.upload(&whole.blobs.iter().collect::<Vec<_>>()).await;
         start(&farm, &whole.action).await.expect("Execute");
-        let shared = job(&format!("shared {os:?}"), &[os, ("gpu", "1")], false);
+        let shared = job(&format!("action {os:?}"), &[os, ("gpu", "1")], false);
         farm.upload(&shared.blobs.iter().collect::<Vec<_>>()).await;
-        let status = start(&farm, &shared.action)
-            .await
-            .expect_err("a shared GPU");
+        start(&farm, &shared.action).await.expect("Execute");
+        let two = job(&format!("two {os:?}"), &[os, ("gpu", "2")], false);
+        farm.upload(&two.blobs.iter().collect::<Vec<_>>()).await;
+        let status = start(&farm, &two.action).await.expect_err("two GPUs");
         assert_eq!(status.code(), Code::InvalidArgument);
-        assert!(
-            status.message().contains("kbf-lease=whole_machine"),
-            "{status:?}"
-        );
+        assert!(status.message().contains("one GPU"), "{status:?}");
     }
+    let linux = job("linux", &[("os", "linux"), ("gpu", "2")], false);
+    farm.upload(&linux.blobs.iter().collect::<Vec<_>>()).await;
+    start(&farm, &linux.action).await.expect("Execute");
     let submitted = script.submitted();
-    assert_eq!(submitted.len(), 2);
-    for s in &submitted {
-        assert_eq!(s.request.kind, LeaseKind::WholeMachine);
+    assert_eq!(submitted.len(), 5);
+    let booked = |i: usize| {
+        (
+            submitted[i].request.kind,
+            submitted[i].request.resources.gpus,
+        )
+    };
+    // Per spelling: the whole-machine lease, then the action lease.
+    assert_eq!(booked(0), (LeaseKind::WholeMachine, 0));
+    assert_eq!(booked(1), (LeaseKind::Action, 1));
+    assert_eq!(booked(2), (LeaseKind::WholeMachine, 0));
+    assert_eq!(booked(3), (LeaseKind::Action, 1));
+    assert_eq!(booked(4), (LeaseKind::Action, 2));
+    for i in [0, 2] {
         assert_eq!(
-            s.request.resources,
+            submitted[i].request.resources,
             Resources::new(1_000, 1 << 30),
             "a whole_machine lease's least worker is not the action default"
         );
