@@ -1,5 +1,7 @@
-//! The flags of `kbf-installer setup` and the modes it sets a host up for. The rest of the
-//! installer's command line is in `kbf_installer::cli`, which re-exports these two.
+//! The flags of `kbf-installer setup` and `kbf setup`, and the modes they set a host up for. The
+//! rest of the installer's command line is in `kbf_installer::cli`, which re-exports these two
+//! and adds the proxy's flags (`--proxy` and the ones that go with it) to these: they are not
+//! here, so that the `kbf` binary's `setup` takes none of them whatever features are built.
 
 use clap::{Args, ValueEnum};
 
@@ -58,9 +60,6 @@ pub struct SetupArgs {
     /// storage): each sets the kbf flag of its name.
     #[command(flatten)]
     pub kbf: crate::setup::kbf_settings::KbfFlags,
-    /// A frontend host behind `kbf-installer proxy`: the `[proxy]` table of installer.toml.
-    #[command(flatten)]
-    pub proxy: crate::setup::proxy::ProxyFlags,
     /// The installer.toml `setup` writes (and reads, to keep what it does not set), under the
     /// host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which
     /// is the only value setup accepts. The same flag, with the same meaning, as on `run`.

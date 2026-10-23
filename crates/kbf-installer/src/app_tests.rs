@@ -1334,9 +1334,10 @@ fn setup_still_takes_the_flags_of_the_release_source_and_the_first_release() {
         "--commit",
         "0123456789abcdef0123456789abcdef01234567",
     ]);
-    let Verb::Setup(args) = &cli.verb else {
+    let Verb::Setup(all) = &cli.verb else {
         panic!("not the setup verb");
     };
+    let args = &all.setup;
     assert_eq!(args.retired.release_source.as_deref(), Some("bundled"));
     assert_eq!(
         args.retired.release_url.as_deref(),
@@ -1351,9 +1352,10 @@ fn setup_still_takes_the_flags_of_the_release_source_and_the_first_release() {
     assert_eq!(args.retired.frontend_ca_sha256.as_deref(), Some("ab"));
     assert_eq!(args.retired.given().len(), 7);
     let plain = parse(&["setup", "--mode=daemon"]);
-    let Verb::Setup(args) = &plain.verb else {
+    let Verb::Setup(all) = &plain.verb else {
         panic!("not the setup verb");
     };
+    let args = &all.setup;
     let none = crate::setup::retired::RetiredFlags::default();
     assert_eq!(args.retired, none);
 }
@@ -1371,9 +1373,9 @@ fn the_retired_flags_on_the_command_line_reach_the_values_setup_runs_with() {
         "--release-url",
         "https://r.example/kbf",
     ]);
-    let Verb::Setup(args) = &cli.verb else {
+    let Verb::Setup(all) = &cli.verb else {
         panic!("not the setup verb");
     };
-    let raw = raw_from(args);
+    let raw = raw_from(&all.setup);
     assert_eq!(raw.retired.given(), ["--release-url", "--commit"]);
 }

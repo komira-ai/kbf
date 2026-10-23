@@ -440,6 +440,39 @@ fn create_fetch_user(p: &mut Pl<'_, '_>, os: &dyn Os, name: &str) -> Result<(), 
     Ok(())
 }
 
+/// Refuses a `--proxy` host whose `kbf.toml` still has the `[tls]` keys of a host before the
+/// proxy: the children would serve TLS behind a proxy that speaks h2c.
+#[cfg(feature = "proxy")]
+fn refuse_leftover_tls(
+    exec: &dyn Exec,
+    v: &Valid,
+    ctx: &Ctx,
+    platform: Platform,
+) -> Result<(), SetupError> {
+    // The earlier layout's file has these keys and is replaced by this run, so it is not refused.
+    if v.behind_proxy()
+        && ctx.earlier.is_none()
+        && let Some(Entry::File { bytes, .. }) = exec.inspect(&hp(paths::kbf_toml(platform))?)?
+    {
+        let left = super::proxy::leftover_tls_keys(&String::from_utf8_lossy(&bytes));
+        if !left.is_empty() {
+            return Err(SetupError::NeedsOperator(format!(
+                "{} has [tls] keys ({}) that a --proxy host does not take: the proxy holds the certificates and the children speak plain h2c behind it; remove them by hand, then run setup again",
+                paths::kbf_toml(platform),
+                left.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Without the `proxy` feature no host is behind the proxy, so none has a `--proxy` host's
+/// leftovers.
+#[cfg(not(feature = "proxy"))]
+fn refuse_leftover_tls(_: &dyn Exec, _: &Valid, _: &Ctx, _: Platform) -> Result<(), SetupError> {
+    Ok(())
+}
+
 /// The part of the plan before the state database's schema: accounts, directories, the tokens
 /// and `installer.toml`. Reads the host, changes nothing.
 pub fn before_release(
@@ -457,23 +490,10 @@ pub fn before_release(
         .map(|file| read_token(exec, file))
         .transpose()?;
     let settings = installer_settings(exec, v, platform)?;
-    let listen = settings.proxy.as_ref().and_then(|p| p.listen);
-    // The earlier layout's file has these keys and is replaced by this run, so it is not refused.
-    if v.proxy.is_some()
-        && ctx.earlier.is_none()
-        && let Some(Entry::File { bytes, .. }) = exec.inspect(&hp(paths::kbf_toml(platform))?)?
-    {
-        let left = super::proxy::leftover_tls_keys(&String::from_utf8_lossy(&bytes));
-        if !left.is_empty() {
-            return Err(SetupError::NeedsOperator(format!(
-                "{} has [tls] keys ({}) that a --proxy host does not take: the proxy holds the certificates and the children speak plain h2c behind it; remove them by hand, then run setup again",
-                paths::kbf_toml(platform),
-                left.join(", ")
-            )));
-        }
-    }
+    let listen = settings.proxy_listen();
+    refuse_leftover_tls(exec, v, ctx, platform)?;
     let mut notes = Vec::new();
-    if v.proxy.is_none() && settings.proxy.is_some() {
+    if !v.behind_proxy() && settings.has_proxy_table() {
         notes.push(
             "installer.toml has a [proxy] table and --proxy was not given: the table is kept, and the frontend unit is enabled as on a host without the proxy; give --proxy if this host runs the proxy"
                 .to_owned(),
@@ -810,7 +830,7 @@ fn remove_old_backup_timer(
 /// operator decides. On an all-in-one host the sibling goes first, since the frontend child
 /// dials it, and a restart of it later is felt by the clients: the proxy holds nothing for it.
 fn not_started_note(v: &Valid) -> &'static str {
-    match (v.mode, v.proxy.is_some()) {
+    match (v.mode, v.behind_proxy()) {
         (Mode::AllInOne, _) => {
             "the proxy units and kbf-storage-and-daemon.service are enabled, not started: start kbf-storage-and-daemon.service first (the frontend child dials it), then kbf-proxy.socket and kbf-proxy.service, when the database, the TLS files and the ports are ready; a later restart of kbf-storage-and-daemon.service leaves clients with UNAVAILABLE until it is back, because the proxy holds no request for it"
         }
@@ -888,13 +908,13 @@ fn units(
             }
         }
         Platform::Linux => {
-            if v.proxy.is_some() && os.unit_enabled(FRONTEND_UNIT)? {
+            if v.behind_proxy() && os.unit_enabled(FRONTEND_UNIT)? {
                 notes.push(format!(
                     "{FRONTEND_UNIT} is enabled and the proxy starts the frontend itself: setup does not stop or disable it; do both (systemctl disable --now) before starting the proxy, since the two never run together"
                 ));
             }
             let backup_gone = remove_old_backup_timer(p, os, &mut notes)?;
-            let wanted = mode_units(v.mode, v.proxy.is_some())
+            let wanted = mode_units(v.mode, v.behind_proxy())
                 .iter()
                 .map(|u| (*u, start_mode))
                 .chain([(INSTALLER_UNIT, !no_start)]);

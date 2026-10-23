@@ -16,11 +16,15 @@
 //!
 //! `kbf-installer` re-exports these modules under the paths it has always had
 //! (`kbf_installer::layout`, `kbf_installer::setup`, ...); this crate does not depend on it.
+//!
+//! Two programs run the verb: `kbf-installer setup` and `kbf setup`. The proxy's side of it
+//! (`--proxy` and its flags, the `[proxy]` table of `installer.toml`) is the `proxy` feature,
+//! which `kbf-installer` turns on and `kbf` does not, so the `kbf` binary links no proxy code.
 
 pub mod cli;
 pub mod database;
 pub mod exit;
-#[cfg(test)]
+#[cfg(all(test, feature = "proxy"))]
 mod golden;
 pub mod installer_toml;
 pub mod layout;

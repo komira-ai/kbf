@@ -13,12 +13,23 @@ publish.workspace = true
 # (`database`) and the exit codes it ends with (`exit`). Every change to the host goes
 # through kbf-host's plan of steps. kbf-installer re-exports these modules under their old
 # paths; this crate never depends on it.
+#
+# Two programs run this library: `kbf-installer setup` and `kbf setup` (crates/kbf-cli). Only the
+# first sets a host up behind `kbf-installer proxy`, so the proxy's side is the `proxy` feature,
+# which kbf-installer turns on and kbf-cli does not: the `kbf` binary links no kbf-proxy
+# (tests/layering.rs in kbf-integration-test checks the tree of `cargo build -p kbf-cli`).
+
+[features]
+# `proxy`: `setup --proxy` and its flags (`setup::proxy`), the `[proxy]` table of installer.toml
+# (`installer_toml`) and the host's proxy units. Without it a `[proxy]` table is refused, never
+# rewritten, and `--mode=all-in-one` (always behind the proxy) is refused.
+proxy = ["dep:kbf-proxy"]
 
 [dependencies]
 clap.workspace = true
 hex.workspace = true
 kbf-host.workspace = true
-kbf-proxy.workspace = true
+kbf-proxy = { workspace = true, optional = true }
 # `postgres`: the schema's migrations and the client that applies them (`database` module).
 kbf-state = { workspace = true, features = ["postgres"] }
 serde.workspace = true
