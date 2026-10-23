@@ -65,10 +65,7 @@ fn a_work_directory_that_cannot_be_made_exits_2() {
 
 #[test]
 fn the_faults_are_the_scenarios() {
-    assert_eq!(
-        Fault::from(FaultFlag::ShrinkNodeCap),
-        Fault::ShrinkNodeCap
-    );
+    assert_eq!(Fault::from(FaultFlag::ShrinkNodeCap), Fault::ShrinkNodeCap);
     assert_eq!(
         Fault::from(FaultFlag::ShrinkEveryCap),
         Fault::ShrinkEveryCap
