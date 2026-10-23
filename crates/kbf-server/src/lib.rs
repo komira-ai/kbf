@@ -136,7 +136,6 @@ pub mod storage_half;
 pub mod storage_health;
 pub mod storage_node;
 pub mod store_config;
-pub mod stored_update;
 pub mod stores;
 pub mod streams;
 #[cfg(test)]
@@ -144,7 +143,6 @@ mod test_dir;
 mod timeout;
 pub mod token;
 pub mod ui_mount;
-pub mod update;
 pub mod update_status;
 pub mod verbs;
 pub mod vitals;

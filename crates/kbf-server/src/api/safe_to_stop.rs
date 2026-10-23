@@ -200,7 +200,7 @@ pub(super) async fn check(
     }
     // A server without a state store keeps no members: every host it knows is a daemon.
     let members = api.members.clone();
-    let store = api.update.as_ref().map(|rows| Arc::clone(rows.store()));
+    let store = api.store.clone();
     let (farm, name) = (Arc::clone(&api.farm), id.clone());
     let job = move || read(&name, &farm, members.as_deref(), store.as_deref());
     let looked = tokio::task::spawn_blocking(job).await;

@@ -1122,7 +1122,6 @@ impl<'a> Prepared<'a> {
             }
             None => (None, futures::future::pending().boxed(), None, None),
         };
-        let update_rows = state_store.clone().map(crate::update::Rows::new);
         let object_stores = flags
             .object_store_secrets_dir
             .as_deref()
@@ -1137,7 +1136,7 @@ impl<'a> Prepared<'a> {
             Arc::clone(&drain),
             Arc::clone(&retire),
             members.clone(),
-            update_rows.clone(),
+            state_store.clone(),
             enroll_api,
         )
         .merge(crate::verbs::routes(token.clone(), members.clone()))
@@ -1145,12 +1144,6 @@ impl<'a> Prepared<'a> {
         .merge(crate::object_store::api::routes(
             token.clone(),
             object_stores.map(|stores| stores.api),
-        ))
-        .merge(crate::release::desired::router(
-            releases.clone(),
-            update_rows,
-            token,
-            Arc::clone(&farm),
         ))
         .merge(crate::health::routes(&checks, &farm, members.as_ref()))
         .merge(metrics_route(
