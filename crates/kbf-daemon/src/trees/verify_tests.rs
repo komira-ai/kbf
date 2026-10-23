@@ -157,7 +157,7 @@ fn a_directory_that_is_not_loaded_is_refused() {
     assert!(matches!(err, crate::tree::TreeError::Invalid(_)), "{err}");
 }
 
-/// Catches `publish` replacing a tree already named (the "plain rename" mutant would
+/// Catches `publish` replacing a tree already named (defect "plain rename" would
 /// swap a tree a lease has mounted), reporting a refusal as a success, or hiding another
 /// error: the first rename names the tree, a second onto a non-empty directory is
 /// reported as "not named by this call", a missing source is an error.

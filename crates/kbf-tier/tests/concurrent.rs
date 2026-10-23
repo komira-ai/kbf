@@ -198,7 +198,7 @@ fn io_error() -> io::Result<()> {
 /// Catches: a sync that succeeds while another sync of the same block is failing.
 /// All ranges of a block share one handle, and the kernel reports a write-back error
 /// to one `fdatasync` of it: range A's failing sync can take the error of B's pages,
-/// so B's sync returning 0 then proves nothing. Mutants: the per-block sync lock
+/// so B's sync returning 0 then proves nothing. Catches: the per-block sync lock
 /// removed (B's `fdatasync` returns at once, before A poisons the block: B is
 /// acknowledged), and the poison taken after the lock is released.
 #[test]
@@ -226,7 +226,7 @@ fn a_sync_never_succeeds_while_another_sync_of_its_block_is_failing() {
 
 /// Catches: a range acknowledged while the block's first directory sync (the one
 /// that makes its name durable) is still running or has failed, and a block whose
-/// name is synced more than once. Mutants: `dir_synced` set before `sync_dir` returns
+/// name is synced more than once. Catches: `dir_synced` set before `sync_dir` returns
 /// together with the sync lock released before it (B sees the flag and returns
 /// `Synced` while A's `sync_dir` is blocked); the sync lock released before
 /// `sync_dir` alone (B runs a second `sync_dir`, counted).
@@ -279,8 +279,8 @@ fn no_range_is_synced_before_its_block_name_is_durable() {
 /// Catches: concurrent reservations in one open block that overlap or leave a gap,
 /// and acknowledged ranges that do not read back, live and after a power cut that
 /// keeps no unsynced byte, when many callers reserve, write, sync and commit at once.
-/// This is the many-writer form of the single-threaded tests; no planted mutant is
-/// caught by it alone (the out-of-order commit mutant is caught deterministically by
+/// This is the many-writer form of the single-threaded tests; it catches no defect
+/// alone (the out-of-order commit defect is caught deterministically by
 /// `out_of_order_commits_never_move_the_committed_length_back`, not reliably here).
 #[test]
 fn concurrent_ranges_in_one_block_all_read_back_after_a_power_cut() {

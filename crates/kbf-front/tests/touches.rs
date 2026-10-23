@@ -223,7 +223,7 @@ async fn flushed(cache: &TestCache) {
     .expect("the recorded touches are committed within 10 s");
 }
 
-/// Catches (red before this change; mutant "commit the touch on the reply path"):
+/// Catches (red before this change; defect "commit the touch on the reply path"):
 /// FindMissingBlobs waiting for a metadata commit before it answers. The blobs are two
 /// days old, so the report owes a touch, and every touch commit is held as a commit
 /// stalled in its disk sync would be. The answer must come within 5 s regardless, and
@@ -255,7 +255,7 @@ async fn find_missing_answers_while_a_touch_commit_is_held() {
     );
 }
 
-/// Catches (mutants "a recorded touch is dropped", "a digest recorded twice is
+/// Catches (defect "a recorded touch is dropped", "a digest recorded twice is
 /// committed twice", "a batch larger than the bound"): five blobs reported twice each
 /// are committed as touches exactly once each, in commits of at most two, without a
 /// collection or another read forcing them; and the touches keep the blobs past the
@@ -302,7 +302,7 @@ async fn recorded_touches_are_committed_once_each_in_bounded_batches() {
     assert_eq!(cache.find_missing(&ask).await.expect("find"), [unreported]);
 }
 
-/// Catches (mutant "a batch whose commit failed is not put back"): a touch whose
+/// Catches (defect "a batch whose commit failed is not put back"): a touch whose
 /// commit the log refused being lost. The first touch commit fails with an error, the
 /// second is answered with another command's outcome; the touch is committed by a
 /// later flush all the same.
@@ -323,7 +323,7 @@ async fn a_touch_whose_commit_fails_is_committed_later() {
     assert!(touches.iter().all(|t| t == &BTreeSet::from([blob])));
 }
 
-/// Catches (mutant "collect without committing pending touches"): a collection that
+/// Catches (defect "collect without committing pending touches"): a collection that
 /// removes a blob reported present whose touch is still pending, so a client that
 /// skipped its upload finds it gone. The flusher waits an hour, so the touch is only
 /// recorded when the collection runs; the blob must survive it, and its unreported
@@ -357,7 +357,7 @@ async fn a_collection_keeps_a_blob_whose_touch_is_pending() {
     assert_eq!(missing, [unreported]);
 }
 
-/// Catches (mutants "a collection goes ahead when its flush fails", "a failed flush
+/// Catches (defect "a collection goes ahead when its flush fails", "a failed flush
 /// reports success"): a collection whose commit of the pending touches fails, yet
 /// commits `Collect` anyway and removes a blob a read reported present while its touch
 /// was only recorded. The first collection's touch commit gets an error and the
@@ -402,7 +402,7 @@ async fn a_collection_whose_touch_commit_fails_collects_nothing() {
     assert_eq!(log.touches(), vec![BTreeSet::from([reported]); 3]);
 }
 
-/// Catches (mutant "a read records its touch outside the gate"): a read that reports a
+/// Catches (defect "a read records its touch outside the gate"): a read that reports a
 /// blob present while a collection is applying, after the collection committed what
 /// was pending: its touch reaches the log after the `Collect` that removes the blob,
 /// so a client is told "present" about a blob that is gone. The `Collect` commit is
@@ -438,8 +438,8 @@ async fn a_read_during_a_collection_never_reports_what_it_removes() {
     assert_eq!(answer, [blob], "reported present, then collected");
 }
 
-/// Catches (mutant "the collection flushes before it takes the exclusive gate"): a read
-/// that is inside its query when a collection starts. Under the mutant the collection
+/// Catches (defect "the collection flushes before it takes the exclusive gate"): a read
+/// that is inside its query when a collection starts. In that case the collection
 /// flushes first (nothing is pending yet), then waits for the gate; the read reports the
 /// expired blob present and records its touch after that flush, and the `Collect` that
 /// follows removes the blob. The read is held inside its query, the collection is
@@ -480,7 +480,7 @@ async fn a_collection_waits_for_a_read_inside_its_query() {
     );
 }
 
-/// Catches (mutant "the flusher commits without holding the gate"): a collection that
+/// Catches (defect "the flusher commits without holding the gate"): a collection that
 /// runs while the flusher's batch has left the pending set but is not committed yet.
 /// Its own flush then finds nothing, its `Collect` lands before the touch, and a blob a
 /// read reported present is removed. The flusher's touch commit is held; the blob
@@ -523,7 +523,7 @@ async fn a_collection_waits_for_the_touch_batch_being_committed() {
     );
 }
 
-/// Catches (mutant "a recorded touch drops its actions"): an action-cache hit whose
+/// Catches (defect "a recorded touch drops its actions"): an action-cache hit whose
 /// touch is never committed, so a result used every day still expires 30 days after it
 /// was written. Written on day 0, hit on day 5: the flusher must commit a touch naming
 /// the action, and a collection on day 33 must keep it (untouched, it goes after day 30).
@@ -561,7 +561,7 @@ async fn an_action_cache_hit_is_touched_and_kept_by_a_collection() {
     );
 }
 
-/// Catches (mutant "a batch's actions fill a whole batch of their own"): a batch that
+/// Catches (defect "a batch's actions fill a whole batch of their own"): a batch that
 /// mixes blobs and actions exceeding the bound, up to twice it. Two blobs and three
 /// actions are recorded with a bound of two; outside a runtime no flusher runs, so the
 /// collection's flush commits all five in batches, each of at most two entries, each
@@ -613,7 +613,7 @@ fn a_batch_of_blobs_and_actions_together_stays_within_the_bound() {
     );
 }
 
-/// Catches (mutant "put a lost entry back"): a touch whose entry a collection outside
+/// Catches (defect "put a lost entry back"): a touch whose entry a collection outside
 /// [`Cache::collect`] removed being retried for ever; it is logged and dropped.
 #[tokio::test]
 async fn a_touch_whose_entry_is_gone_is_dropped_not_retried() {

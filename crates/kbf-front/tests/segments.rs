@@ -20,7 +20,7 @@ use tonic::Code;
 
 use support::{Front, Seg, blob, put_all, seg, seg_with, try_put_all};
 
-/// Catches per-segment commits (mutant: commit per segment): an upload of three
+/// Catches per-segment commits (defect: commit per segment): an upload of three
 /// segments is stored as three objects and indexed by **one** `PutBlobs`, and every
 /// blob is present after.
 #[tokio::test]
@@ -56,8 +56,8 @@ async fn an_upload_of_three_segments_is_one_commit() {
     }
 }
 
-/// Catches trusting the daemon's footer (mutant: no SHA-256 check), and a check that
-/// skips some record (mutants: only the first record in digest order hashed; the first
+/// Catches trusting the daemon's footer (defect: no SHA-256 check), and a check that
+/// skips some record (defects: only the first record in digest order hashed; the first
 /// never hashed): each record in turn, in digest order (first, middle and last), is
 /// altered after `Begin`; each such upload's range that completes it, and its commit,
 /// are INVALID_ARGUMENT naming that record, and nothing of it is stored or indexed, the
@@ -127,10 +127,10 @@ async fn each_record_altered_after_begin_fails_the_commit_and_indexes_nothing() 
     front.assert_present(&s.digests, true).await;
 }
 
-/// Catches indexing bytes never received (mutant: no coverage check at commit): a
+/// Catches indexing bytes never received (defect: no coverage check at commit): a
 /// commit with a record's bytes missing is FAILED_PRECONDITION and the upload stays
 /// open, so sending the rest lets it commit; and a range overlapping a received one
-/// with other bounds is refused (mutant: no overlap check).
+/// with other bounds is refused (defect: no overlap check).
 #[tokio::test]
 async fn a_missing_range_is_refused_at_commit_and_an_overlap_at_once() {
     let front = Front::start(SegmentsConfig::DEFAULT).await;
@@ -164,7 +164,7 @@ async fn a_missing_range_is_refused_at_commit_and_an_overlap_at_once() {
     front.assert_present(&s.digests, true).await;
 }
 
-/// Catches verified bytes rewritten after the check (mutant: a resend overwrites): a
+/// Catches verified bytes rewritten after the check (defect: a resend overwrites): a
 /// resend of a received range with other bytes is OK and writes nothing, a range sent
 /// while the commit runs is FAILED_PRECONDITION, and the indexed records hash to
 /// their digests.
@@ -199,7 +199,7 @@ async fn a_resend_writes_nothing_and_a_range_during_commit_is_refused() {
 }
 
 /// Catches a lost-reply retry storing and committing twice, or answered otherwise
-/// than the first (mutant: a second Commit refused): two Commits of one upload, the
+/// than the first (defect: a second Commit refused): two Commits of one upload, the
 /// second sent while the first is storing, get the same reply; one object, one
 /// `PutBlobs`.
 #[tokio::test]
@@ -235,7 +235,7 @@ async fn two_commits_of_one_upload_store_once_and_answer_alike() {
     assert_eq!(front.cache.metrics().segment_commit.count(), 1);
 }
 
-/// Catches a daemon's CRC-32C reaching the store (mutant: the declared CRC kept): a
+/// Catches a daemon's CRC-32C reaching the store (defect: the declared CRC kept): a
 /// footer whose CRC for one record is false commits, and the stored footer parses and
 /// holds the true CRC, so every record passes `IndexEntry::verify`.
 #[tokio::test]
@@ -255,7 +255,7 @@ async fn a_false_crc_in_begin_never_reaches_the_stored_footer() {
     front.assert_stored_records_check(&s.digests).await;
 }
 
-/// Catches a dead daemon stalling every write (mutant: the connection's close not
+/// Catches a dead daemon stalling every write (defect: the connection's close not
 /// watched): an upload whose connection closes after `Begin` gives its memory back at
 /// once, long before the idle time.
 #[tokio::test]
@@ -284,10 +284,10 @@ async fn a_closed_connection_frees_its_upload_at_once() {
     assert_eq!(front.cache.bytes_admitted(), 0);
 }
 
-/// Catches unbounded server memory per read (mutant: no length check): a `ReadRange`
+/// Catches unbounded server memory per read (defect: no length check): a `ReadRange`
 /// over 4 MiB, or of nothing, or naming no object, is INVALID_ARGUMENT before the
 /// store is asked. Also catches a range whose end overflows `u64` sent to the store
-/// (mutant: `ByteRange::new` without its overflow check): such a range of a committed
+/// (defect: `ByteRange::new` without its overflow check): such a range of a committed
 /// object is NOT_FOUND while the store's next GET would fail, so only a refusal
 /// before the store answers NOT_FOUND. A range of an absent object is NOT_FOUND.
 #[tokio::test]
@@ -357,7 +357,7 @@ async fn a_read_range_over_the_limit_is_refused() {
     assert_eq!(absent.code(), Code::NotFound);
 }
 
-/// Catches assuming ranges arrive in order (mutant: a range must start where the last
+/// Catches assuming ranges arrive in order (defect: a range must start where the last
 /// ended): ranges sent last to first commit, and every blob reads back.
 #[tokio::test]
 async fn ranges_in_reverse_order_commit() {
@@ -374,7 +374,7 @@ async fn ranges_in_reverse_order_commit() {
     front.assert_stored_records_check(&s.digests).await;
 }
 
-/// Catches leaked uploads (mutant: the idle timer never drops one): an upload no call
+/// Catches leaked uploads (defect: the idle timer never drops one): an upload no call
 /// names for the idle time is dropped, its memory returned, nothing indexed, and a
 /// later call naming it is NOT_FOUND.
 #[tokio::test]
@@ -403,7 +403,7 @@ async fn an_idle_upload_is_dropped() {
 /// Catches a `Begin` the server cannot hold, or one it would wait on forever: a footer
 /// that does not parse for its length, overlapping records, and a total over the cap
 /// are INVALID_ARGUMENT; an upload of exactly the cap is admitted. Also catches bytes
-/// sent in front of a footer read as if absent (mutant: the footer length unchecked):
+/// sent in front of a footer read as if absent (defect: the footer length unchecked):
 /// a footer with one byte prepended is INVALID_ARGUMENT.
 #[tokio::test]
 async fn begin_refuses_what_it_cannot_take() {
@@ -481,7 +481,7 @@ async fn begin_refuses_what_it_cannot_take() {
         .expect("an upload of exactly the cap");
 }
 
-/// Catches an upload of more records than one commit indexes (mutant: the record
+/// Catches an upload of more records than one commit indexes (defect: the record
 /// limit unchecked): a `Begin` of `MAX_UPLOAD_RECORDS` one-byte records is admitted,
 /// and one of that many plus one, split over two segments so the limit is on the
 /// upload and not the segment, is INVALID_ARGUMENT.
@@ -590,7 +590,7 @@ async fn a_begin_waits_for_the_budget(release: Release) {
     }
 }
 
-/// Catches a `Begin` refused for load (mutant: `try_acquire` for `acquire`, so
+/// Catches a `Begin` refused for load (defect: `try_acquire` for `acquire`, so
 /// concurrent daemons fall back to ByteStream): a second `Begin` waits while the
 /// budget is held and is admitted once the first upload commits.
 #[tokio::test]
@@ -642,12 +642,12 @@ async fn locate_and_read_range_return_a_blob() {
     }
 }
 
-/// Catches a committing upload dropped with its connection (mutant: the drop ignores a
-/// running commit), and a commit tied to the call that started it (mutant: the commit
+/// Catches a committing upload dropped with its connection (defect: the drop ignores a
+/// running commit), and a commit tied to the call that started it (defect: the commit
 /// runs in the handler): a connection closed while the commit's PUT is held leaves the
 /// upload open until the commit ends, and the commit still indexes every record. Also
 /// catches the memory budget returned while the commit still holds the buffers
-/// (mutant: the budget dropped before the check and PUT): while the PUT is held the
+/// (defect: the budget dropped before the check and PUT): while the PUT is held the
 /// upload's length stays counted.
 #[tokio::test]
 async fn a_connection_closed_during_the_commit_leaves_the_commit_to_finish() {
@@ -680,7 +680,7 @@ async fn a_connection_closed_during_the_commit_leaves_the_commit_to_finish() {
     assert_eq!(front.cache.bytes_admitted(), 0);
 }
 
-/// Catches a segment upload admitted apart from the cache's other uploads (mutant:
+/// Catches a segment upload admitted apart from the cache's other uploads (defect:
 /// `Begin` keeps its own memory budget, as before it moved onto `Cache::admit`): with
 /// `--write-bytes-in-flight` at 4 KiB and 2 KiB of it admitted elsewhere (what a
 /// ByteStream `Write` or a `BatchUpdateBlobs` takes), a `Begin` of 2.5 KiB waits in the
@@ -739,7 +739,7 @@ async fn a_begin_waits_for_bytes_other_uploads_hold() {
     assert_eq!(front.cache.bytes_admitted(), 0);
 }
 
-/// Catches an upload's segment PUT tried once (mutant: `store_upload` PUTs through the
+/// Catches an upload's segment PUT tried once (defect: `store_upload` PUTs through the
 /// store itself, as before it moved onto the cache's writer): the commit's first PUT
 /// fails as a reset connection; the commit still succeeds, after a second PUT under
 /// another key, and every record is indexed where the stored footer says.
@@ -763,7 +763,7 @@ async fn a_commit_retries_a_failed_put_under_a_new_key() {
     front.assert_stored_records_check(&s.digests).await;
 }
 
-/// Catches an upload's segments PUT past `--write-puts-in-flight` (mutant: the PUT
+/// Catches an upload's segments PUT past `--write-puts-in-flight` (defect: the PUT
 /// slot not taken for an upload's segments): with 2 slots, a commit of three segments
 /// whose PUTs are held has exactly 2 at the store. Weak: a 200 ms wall-clock wait, so
 /// a third PUT slower than that would go unseen.
@@ -800,7 +800,7 @@ async fn an_uploads_segment_puts_take_the_put_slots() {
 }
 
 /// The "a 1 GiB single-record segment commits" row of section 9, scaled: catches a
-/// commit that asks for admission again while its `Begin` still holds it (mutant:
+/// commit that asks for admission again while its `Begin` still holds it (defect:
 /// `commit_task` admits one more byte before storing), which waits forever when the
 /// upload is as large as the bound. With the tightest bound `kbf-server`
 /// starts with (`--write-bytes-in-flight` equal to the default 5 GiB + 1 MiB cap), a
@@ -853,11 +853,11 @@ async fn an_upload_as_large_as_the_bound_is_admitted_and_commits() {
     assert_eq!(front.cache.bytes_admitted(), 0);
 }
 
-/// Catches a range the upload cannot hold being written (mutants: no length check on
+/// Catches a range the upload cannot hold being written (defects: no length check on
 /// `PutRange`; a segment index not checked; no bounds check): a range over 4 MiB
 /// (inside a record area larger than that), one for a segment the upload lacks, an
 /// empty one and one past the record area are INVALID_ARGUMENT. Also catches a coverage check that skips gaps between received
-/// ranges (mutant: `from > at` never true): a record whose first and last bytes
+/// ranges (defect: `from > at` never true): a record whose first and last bytes
 /// arrived, but not its middle, is FAILED_PRECONDITION at commit.
 #[tokio::test]
 async fn put_range_refuses_what_the_upload_cannot_hold() {
@@ -911,9 +911,9 @@ async fn put_range_refuses_what_the_upload_cannot_hold() {
 }
 
 /// Catches a store failure on `ReadRange` answered as anything but a retryable error
-/// (mutant: every store error is NOT_FOUND, as an absent object is): a range of a
+/// (defect: every store error is NOT_FOUND, as an absent object is): a range of a
 /// stored object whose GET fails as a reset connection is UNAVAILABLE. Also catches
-/// a short answer passed on as the range (mutant: the length check dropped): a range
+/// a short answer passed on as the range (defect: the length check dropped): a range
 /// past the object's end is NOT_FOUND.
 #[tokio::test]
 async fn a_store_failure_on_read_range_is_unavailable() {
@@ -949,7 +949,7 @@ async fn a_store_failure_on_read_range_is_unavailable() {
     assert_eq!(overrun.code(), Code::NotFound, "{overrun:?}");
 }
 
-/// Catches an upload dropped while its daemon is still sending (mutant: the idle timer
+/// Catches an upload dropped while its daemon is still sending (defect: the idle timer
 /// drops at its first deadline, whatever calls came since): with a 1 s idle time, an
 /// upload that gets a call every 250 ms for 2 s is still open and commits.
 #[tokio::test]
@@ -980,7 +980,7 @@ async fn an_upload_with_calls_is_not_idle() {
     front.assert_present(&s.digests, true).await;
 }
 
-/// Catches indexing what the footer read back does not list (mutant: the read-back's
+/// Catches indexing what the footer read back does not list (defect: the read-back's
 /// entries not checked against the records put): the store keeps another segment of
 /// the same length under the key (a valid footer, other records), so the commit is
 /// INTERNAL and nothing is indexed.
@@ -1020,7 +1020,7 @@ async fn open_reaches(open: &kbf_storage::service::OpenWrites, want: u64) {
 /// a refused one gives back), through its ranges, and past the end of the `Commit` call that
 /// started the commit: that commit runs detached and goes on when the caller is gone, so the
 /// count falls only when it has stored the segments. Then an upload nobody commits is
-/// dropped when idle and stops counting. Mutants: the upload not counted; counted only until
+/// dropped when idle and stops counting. Catches: the upload not counted; counted only until
 /// `Begin` returns; the count given back when the `Commit` call ends instead of when the
 /// detached commit does; a refused `Begin` left counted.
 #[tokio::test]
@@ -1077,7 +1077,7 @@ async fn an_upload_is_an_open_write_until_its_commit_ends() {
 /// Catches a `Begin` that waits for admission (the memory budget another upload holds) and
 /// is not counted: it has been taken in and a daemon is waiting on it, so a node that read
 /// zero then would be stopped under it. The second `Begin` is an open write while it waits
-/// (two with the first), and the count falls with it when its connection goes. Mutant: the
+/// (two with the first), and the count falls with it when its connection goes. Catches: the
 /// count taken after the admission.
 #[tokio::test]
 async fn a_begin_waiting_for_admission_is_an_open_write() {
@@ -1115,7 +1115,7 @@ async fn a_begin_waiting_for_admission_is_an_open_write() {
 
 /// Catches the cache-as-a-store (what a storage node runs) handing out `Segments` handlers
 /// that do not count: `segments_counted` is the one a node's service asks for, and its uploads
-/// move the node's handle, while the plain `segments` leaves a handle alone. Mutant:
+/// move the node's handle, while the plain `segments` leaves a handle alone. Catches:
 /// `segments_counted` returning the plain handlers.
 #[tokio::test]
 async fn the_cache_as_a_store_counts_the_uploads_of_its_counted_handlers_only() {

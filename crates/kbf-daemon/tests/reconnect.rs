@@ -332,7 +332,7 @@ impl Resolve for Failing {
 /// resolver that is not up yet) that ends, or counts the failure as nothing and never
 /// tries again. The first three lookups fail with an error; each is reported as a failed
 /// attempt naming the resolver's error and is followed by a wait, and the fourth round
-/// resolves and connects. Mutant: the resolver-error arm of `resolve_all` panics.
+/// resolves and connects. Catches: the resolver-error arm of `resolve_all` panics.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_name_that_fails_to_resolve_is_retried_until_it_does() {
     let pki = pki("reconnect-resolve-error");

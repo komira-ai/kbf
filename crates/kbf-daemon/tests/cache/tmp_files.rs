@@ -97,8 +97,8 @@ async fn tmp_empties(dir: &std::path::Path) -> bool {
     true
 }
 
-/// Catches a fill that leaves its file in `tmp/` when the CAS read fails (the
-/// "only a write error removes the file" mutant, and the guard that removes nothing):
+/// Catches a fill that leaves its file in `tmp/` when the CAS read fails (defect
+/// "only a write error removes the file", and the guard that removes nothing):
 /// for each error a read can end with, after half the blob is written, `tmp/` is
 /// empty and nothing is indexed; the lease fails with the CAS's error, except on a
 /// write error (the cache's disk), where it fetches the blob into its own file.

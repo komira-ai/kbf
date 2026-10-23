@@ -88,7 +88,7 @@ fn messages(
 /// instead of a few messages (a collected body, a queue that grows: peak near 20 MiB), a
 /// message not counted (peak 0), and bytes not given back (current above 0 after).
 ///
-/// Mutants: the pieces of `receive` collected before staging; `counted` removed from
+/// Catches: the pieces of `receive` collected before staging; `counted` removed from
 /// `receive`; the guard of the counted bytes leaked.
 #[tokio::test]
 async fn a_streamed_write_holds_a_few_messages_and_gives_them_back() {
@@ -150,7 +150,7 @@ async fn a_buffered_write_holds_its_blob_and_gives_it_back() {
 /// (peak at the blob's size) instead of passed on a message at a time, and its messages
 /// not counted.
 ///
-/// Mutant: the pieces of `pieces` collected before `put_streamed`.
+/// Catches: the pieces of `pieces` collected before `put_streamed`.
 #[tokio::test]
 async fn a_large_buffered_write_is_passed_on_a_message_at_a_time() {
     let Some(_turn) = turn().await else {
@@ -223,7 +223,7 @@ async fn a_write_that_fails_or_is_abandoned_gives_everything_back() {
 /// buffer and a chunk or two reach the blob and a few MiB). Exact while the caller holds
 /// the blob, 0 once it is dropped.
 ///
-/// Mutants: the chunks collected and `concat`enated, as before; the joined `Bytes` made
+/// Catches: the chunks collected and `concat`enated, as before; the joined `Bytes` made
 /// with `Bytes::from` (current 0); the buffer's hold made `hold(0)`.
 #[tokio::test]
 async fn a_remote_whole_blob_read_is_held_once_and_given_back() {
