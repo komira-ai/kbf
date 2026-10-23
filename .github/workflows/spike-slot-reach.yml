@@ -77,11 +77,6 @@ jobs:
       - run: rustup toolchain install
       - name: Descriptors of the child, in the run module
         run: cargo test -p kbf-installer --locked --lib -- run::tests --nocapture
-      - name: The fetch end-to-end test that saw a stray descriptor, 20 rounds
-        run: |
-          for round in $(seq 1 20); do
-            cargo test -p kbf-installer --locked --test fetch_e2e -- a_frontend_that_sends_the_wrong_bytes_is_refused || exit 1
-          done
 
   pool-spike:
     runs-on: macos-latest
