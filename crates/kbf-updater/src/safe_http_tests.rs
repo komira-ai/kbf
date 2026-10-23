@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use crate::inventory::{Host, Role};
 use crate::ports::{PortErrorKind, SafeToStop, Stop, Verdict};
-use crate::safe_http::{HttpSafeToStop, file_rule, read_proxy_secret, read_token};
+use crate::safe_http::HttpSafeToStop;
+use crate::secret::{file_rule, read_proxy_secret, read_token};
 use crate::testutil::{
     FakeApi, KEY, TOKEN, closed_port, eventually, fake_api, fake_api_by, file, http, scratch,
 };

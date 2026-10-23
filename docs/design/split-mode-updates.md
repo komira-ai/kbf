@@ -803,7 +803,7 @@ T5, T6 and E1 prove the model's one unproven step: if either cannot be made reli
 - **Q4** State-schema migration (3.4) is a `kbf-state` change of a few days and is on the critical path of the first release that changes a column. Until then the planner refuses such a release.
 - **Q5** Planned-down member state: **decided and built** (#914, `planned_down` with `for_secs`; 2.6 step 4); the router-failover alternative is not taken.
 - **Q6** Node graceful stop and a `Leave` call. **Lean yes.**
-- **Q7 [owner]** `auto_nodes` default false until two click-through runs are clean. **Changed (updfeed U1, CEO-visible):** a policy never written reads `auto_nodes` true. Only an operator's write of `update/desired` starts a run (the poller proposes and never writes it), so that write is the click; `pause` is the stop, and `auto_nodes` written false still stops it.
+- **Q7 [owner]** `auto_nodes` default false until two click-through runs are clean. **Changed (updfeed U1, maintainer-visible):** a policy never written reads `auto_nodes` true. Only an operator's write of `update/desired` starts a run (the poller proposes and never writes it), so that write is the click; `pause` is the stop, and `auto_nodes` written false still stops it.
 - **Q8** One rollout record (K11). **Lean durable `update/*` rows.**
 - **Q9** A nightly mixed-version job against the release before the last tag (T10), a precondition for auto.
 - **Q10** The handover wire frozen at 1 (K12); say so in the doc that owns `handover.rs`.

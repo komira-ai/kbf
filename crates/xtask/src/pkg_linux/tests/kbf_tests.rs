@@ -183,6 +183,7 @@ fn the_fixtures_make_a_kbf_plan_with_the_real_files() {
         trust: &root.join("testdata/trust"),
         sysusers: &root.join("sysusers.d/kbf-installer.conf"),
         tmpfiles: &root.join("tmpfiles.d/kbf-installer.conf"),
+        needrestart: &root.join("needrestart/kbf.conf"),
         platform: Platform::LinuxX86_64,
         version: "0.0.0+ci",
     })

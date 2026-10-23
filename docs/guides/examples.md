@@ -253,6 +253,8 @@ change the booking:
 - `kbf-book-cpus=N` books `N` whole cores.
 - `kbf-book-mem-gib=N` books `N` GiB of memory.
 
+Cores are reserved on the worker for the lease. Memory is the limit the action runs under: the worker's memory must be at least `N` GiB, but the memory other actions on the worker hold does not keep this one off it.
+
 Write `N` in plain digits with no sign or leading zero: `+4` and `04` are refused,
 because each would book the same as `4` under a different action digest. Either key may be
 given alone. The scheduler places the action only where that much is free.
@@ -283,7 +285,6 @@ the node's certificate is in [kbf-modes.md](../deploy/kbf-modes.md#a-nodes-certi
 
 ```text
 kbf all-in-one \
-    --state-store=sqlite:///var/lib/kbf/state.db \
     --cold-store=file:///var/lib/kbf/cold \
     --meta-dir=/var/lib/kbf/meta \
     --listen=127.0.0.1:8980 \
@@ -313,8 +314,9 @@ kbf all-in-one \
   Add `--hot-store=file:///fast/kbf` to put a fast disk in front of it. In all-in-one the
   single cache keeps no flushed copies on the hot store, so it holds only blobs not yet
   flushed.
-- `--state-store` names the scheduler's state. The default of `kbf all-in-one` is Postgres
-  on the host's socket; this example names a SQLite file instead.
+- `--state-store` names the scheduler's state; the default is Postgres on the host's socket.
+  A `sqlite://` store still starts in this release and logs a warning that it is removed in
+  the next.
 - `--api-token-file` must be a file of mode 0600 or 0400 holding one token of at least 32
   characters. The operator API refuses writes without it.
 - The daemon runs rootless containers with `crun`. It needs the user's subordinate ids,

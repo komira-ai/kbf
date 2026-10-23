@@ -166,7 +166,7 @@ impl Harness {
 }
 
 /// Catches a scheduler that gives up a switching whole-machine lease at the lease
-/// grace G, as for any silent worker (the mutant "requeue on any disconnect"): the
+/// grace G, as for any silent worker (the defect "requeue on any disconnect"): the
 /// daemon's userspace restart would requeue every GUI lease and run it twice. Also
 /// catches a grace that never ends: past the session switch grace a worker that never
 /// came back loses the lease, with its own reason.

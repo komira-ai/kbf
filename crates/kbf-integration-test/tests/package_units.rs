@@ -13,7 +13,7 @@
 //! can be one that cannot fail.
 //!
 //! Catches:
-//! - a unit missing a rule that its mode needs (`restart`, `stop`,
+//! - a unit missing a rule that its mode needs (`restart`, `stop`, `kill-mode`,
 //!   `delegate`, `credential`, `caps`, `swap`, `oom`, `cpuset`, user, slice,
 //!   `LimitNOFILE`), each named below;
 //! - a unit that runs a program other than `/usr/bin/kbf` and the installer's binary (the
@@ -76,7 +76,7 @@ const RUNTIME: [&str; 6] = [
 ];
 
 /// The rules, by the tag a violation starts with.
-const RULES: [&str; 34] = [
+const RULES: [&str; 35] = [
     "install",
     "network",
     "positional",
@@ -97,6 +97,7 @@ const RULES: [&str; 34] = [
     "restart-limit",
     "restart-exit",
     "stop",
+    "kill-mode",
     "delegate",
     "notify",
     "conflicts",
@@ -525,6 +526,20 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         }
         if !matches!(signal, Some("SIGTERM" | "TERM" | "15")) {
             v("stop", format!("KillSignal= is {signal:?}, not SIGTERM"));
+        }
+    }
+
+    // Catches a node unit that signals the actions with the daemon: with KillMode=
+    // control-group (the default) a stop sends SIGTERM to every process of the unit, the
+    // actions in their sub-cgroups among them, and the daemon's drain ends in seconds.
+    // process would leave them for ever, so only mixed is accepted.
+    if matches!(mode, "daemon" | "storage-and-daemon" | "all-in-one") {
+        let kill_mode = unit.get_in("Service", "KillMode").map(trim);
+        if kill_mode != Some("mixed") {
+            v(
+                "kill-mode",
+                format!("KillMode= is {kill_mode:?}, not mixed"),
+            );
         }
     }
 
@@ -1010,6 +1025,42 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "stop",
     ),
     (
+        "kbf-daemon.service",
+        "\nKillMode=mixed\n",
+        "\n",
+        "kill-mode",
+    ),
+    (
+        "kbf-daemon.service",
+        "\nKillMode=mixed\n",
+        "\nKillMode=control-group\n",
+        "kill-mode",
+    ),
+    (
+        "kbf-storage-and-daemon.service",
+        "\nKillMode=mixed\n",
+        "\n",
+        "kill-mode",
+    ),
+    (
+        "kbf-storage-and-daemon.service",
+        "\nKillMode=mixed\n",
+        "\nKillMode=control-group\n",
+        "kill-mode",
+    ),
+    (
+        "kbf-all-in-one.service",
+        "\nKillMode=mixed\n",
+        "\n",
+        "kill-mode",
+    ),
+    (
+        "kbf-all-in-one.service",
+        "\nKillMode=mixed\n",
+        "\nKillMode=control-group\n",
+        "kill-mode",
+    ),
+    (
         "kbf-storage-and-daemon.service",
         "\nDelegate=yes\n",
         "\nDelegate=memory pids\n",
@@ -1382,6 +1433,30 @@ fn a_daemon_stop_timeout_must_exceed_the_drain_deadline() {
     }
     let none = text.replacen(shipped, "\n", 1);
     assert_eq!(stop(&none), 1, "no TimeoutStopSec= was accepted");
+}
+
+/// Proves each unit that hosts the node daemon stops by signalling its main process alone
+/// with SIGTERM: KillMode=mixed and KillSignal=SIGTERM, read from the shipped file.
+#[test]
+fn units_that_host_the_daemon_signal_only_the_main_process_on_stop() {
+    for name in [
+        "kbf-daemon.service",
+        "kbf-storage-and-daemon.service",
+        "kbf-all-in-one.service",
+    ] {
+        let text = read(name);
+        let unit = UnitFile::parse(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(
+            unit.get_in("Service", "KillMode").map(trim),
+            Some("mixed"),
+            "{name}: KillMode="
+        );
+        assert_eq!(
+            unit.get_in("Service", "KillSignal").map(trim),
+            Some("SIGTERM"),
+            "{name}: KillSignal="
+        );
+    }
 }
 
 /// Catches a rule with no mutant (a check that cannot be shown to fail), and a mutant

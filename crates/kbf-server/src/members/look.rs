@@ -1,4 +1,4 @@
-//! The members as the update controller reads them: one look at the map and the rows, with
+//! The members as the update node step reads them: one look at the map and the rows, with
 //! what the controller joins hosts to (the address a member registered) and what it gates
 //! on (state, boot counter, the plan's mark, the newest report).
 

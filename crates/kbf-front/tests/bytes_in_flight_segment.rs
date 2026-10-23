@@ -31,7 +31,7 @@ use tonic::Request;
 /// know), or counted by a guard that is gone before `store_segment` has PUT it. The PUT is
 /// held at the store: while it is held the segment is counted at its length, once.
 ///
-/// Mutant: the body `verify_built` returns made with `Bytes::from` (the count is 0 while
+/// Catches: the body `verify_built` returns made with `Bytes::from` (the count is 0 while
 /// the PUT is held).
 #[tokio::test]
 async fn a_segment_with_no_tier_room_is_counted_until_its_put_is_done_with_it() {

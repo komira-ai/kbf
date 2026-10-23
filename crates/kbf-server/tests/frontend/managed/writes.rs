@@ -260,7 +260,7 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
 /// Catches: the old child's history lost at a swap (every write through its handle was
 /// refused, the history rows included); a history key without the writer's id (the rows
 /// would carry a clock, not the process); a shared row written around the fence (two
-/// children racing on one row); a key no family names. Mutants: the permit accepting the
+/// children racing on one row); a key no family names. Catches: the permit accepting the
 /// shape row; the writer named by its start time and not its instance id.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_old_child_writes_only_keys_that_carry_its_id_after_a_takeover() {

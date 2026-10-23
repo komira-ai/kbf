@@ -49,11 +49,11 @@ async fn ok(router: &Router, peer: &str) -> Response {
     response
 }
 
-/// Catches: no bound at all (mutant: the check `n >= per_caller` dropped, so the fifth
-/// request is served); a bound shared by every caller (mutant: one key for all, so a second
+/// Catches: no bound at all (defect: the check `n >= per_caller` dropped, so the fifth
+/// request is served); a bound shared by every caller (defect: one key for all, so a second
 /// caller is refused while the first is full: the starvation this guards); a slot that
-/// does not return when its answer is dropped (mutant: the decrement dropped); a table
-/// that keeps callers that have nothing open (mutant: the removal at zero dropped).
+/// does not return when its answer is dropped (defect: the decrement dropped); a table
+/// that keeps callers that have nothing open (defect: the removal at zero dropped).
 #[tokio::test]
 async fn a_caller_holds_at_most_its_share_and_gets_the_slot_back() {
     let limit = ReadLimit::new(PER_CALLER);
@@ -83,7 +83,7 @@ async fn a_caller_holds_at_most_its_share_and_gets_the_slot_back() {
     assert_eq!(limit.callers(), 0, "an idle server remembers no caller");
 }
 
-/// Catches: a slot given back when the handler returns, not when the body is done (mutant:
+/// Catches: a slot given back when the handler returns, not when the body is done (defect:
 /// the guard dropped before the body is built): a blob streams after its handler is
 /// finished, so the bound would hold nothing; and a body that lost its size (a sized
 /// answer sent chunked, which breaks a client that reads to the end of a plain answer).
@@ -107,10 +107,10 @@ async fn the_slot_is_held_until_the_body_is_dropped_and_the_size_is_kept() {
     ok(&router, "192.0.2.1").await;
 }
 
-/// Catches: the caller taken from the address when the proxy named a node (mutant:
+/// Catches: the caller taken from the address when the proxy named a node (defect:
 /// the `Node` key never used): an agent behind the proxy would share the browsers'
-/// bound; a node's bound that follows its address (mutant: the address first); an
-/// identity with no node taken for a caller of its own (mutant: `Peer` skipped when
+/// bound; a node's bound that follows its address (defect: the address first); an
+/// identity with no node taken for a caller of its own (defect: `Peer` skipped when
 /// the identity is proxied); and a request with no connection info refused or
 /// panicking instead of keyed on the unspecified address.
 #[tokio::test]
@@ -164,7 +164,7 @@ async fn a_node_the_proxy_named_has_a_bound_of_its_own() {
     assert_eq!(limit.callers(), 0);
 }
 
-/// Catches: each bound of a request target dropped or moved (mutants: the path length,
+/// Catches: each bound of a request target dropped or moved (defects: the path length,
 /// the query length, the segment length and the control-character check each removed; a
 /// bound off by one, `>` for `>=`, which the exact-size cases below would turn red), and
 /// a refused request that still takes a slot (the table is empty after).
@@ -255,9 +255,9 @@ async fn call_as(router: &Router, peer: &str, trust: Trust, client: &str) -> Res
 }
 
 /// Catches: the client address the proxy reported keying a call the proxy did not vouch for
-/// (mutant: the `Trust::Proxied` check dropped, so an `Unverified` or `Direct` call with a
+/// (defect: the `Trust::Proxied` check dropped, so an `Unverified` or `Direct` call with a
 /// `ClientAddr` in its extensions takes a bound of its own); and a proxied call's bound not
-/// following the address (mutant: the address ignored, so two browsers share the proxy's
+/// following the address (defect: the address ignored, so two browsers share the proxy's
 /// peer address).
 #[tokio::test]
 async fn a_client_address_keys_a_proxied_call_and_no_other() {

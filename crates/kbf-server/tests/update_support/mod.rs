@@ -20,7 +20,6 @@ use kbf_types::{FarmTime, WorkerId};
 
 pub mod harness;
 pub mod stores;
-pub mod world;
 
 /// The release every host runs at the start.
 pub const OLD: &str = "v1";

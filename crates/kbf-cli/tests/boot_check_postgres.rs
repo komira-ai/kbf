@@ -5,8 +5,9 @@
 //! refuses refuses the start (exit 1). Each test makes a database of its own on the server and
 //! drops it.
 //!
-//! The tests are `#[ignore]`d; the `state-postgres` job runs them with `--include-ignored`.
-//! `KBF_TEST_POSTGRES_URL` names a server where they may create and drop databases. As in the
+//! The tests run in every test run (none is `#[ignore]`d), and fail, not skip, when
+//! `KBF_TEST_POSTGRES_URL` names no server; it names a server where they may create and drop
+//! databases. As in the
 //! frontend process test, the process is given the URL without its password (the `database`
 //! key refuses one), so the server the job runs must trust its loopback clients.
 
@@ -115,7 +116,6 @@ impl Drop for Database {
 /// which says it created the schema at this build's version, and that a store of this build
 /// then opens on it: the unit starts on the schema it needs.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_database_with_no_schema_is_given_it_and_the_unit_starts() {
     let created = "created the schema at version 1";
     for mode in ["frontend", "all-in-one"] {
@@ -132,7 +132,6 @@ fn a_database_with_no_schema_is_given_it_and_the_unit_starts() {
 /// says there is nothing to apply, and the rows of `schema_version` are the same, with the
 /// time they were applied, before and after.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_database_at_the_schema_of_this_build_is_left_alone() {
     let db = Database::new("current", None);
     schema::apply(&db.config(), &schema::embedded(), schema::latest()).expect("installed");
@@ -149,7 +148,6 @@ fn a_database_at_the_schema_of_this_build_is_left_alone() {
 /// line says nothing was applied and names no installer package, the schema is still 2, and a
 /// store of this build opens on it.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_database_ahead_by_an_expand_step_passes_the_check_and_is_left_alone() {
     let db = Database::new("ahead", None);
     let later = Migration::new(
@@ -173,7 +171,6 @@ fn a_database_ahead_by_an_expand_step_passes_the_check_and_is_left_alone() {
 /// build) still does not start: the check leaves it as it was, and the store of this build
 /// refuses to open on it with the line that names the release to run.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_contract_step_above_this_build_is_refused_when_the_store_opens() {
     let db = Database::new("contract", None);
     schema::apply(&db.config(), &schema::embedded(), 1).expect("installed");
@@ -196,7 +193,6 @@ fn a_contract_step_above_this_build_is_refused_when_the_store_opens() {
 /// Asserts that a role the server does not know refuses the start without naming the role: exit
 /// 1, the reason reduced to the server's SQLSTATE, and no schema made.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_login_the_server_refuses_refuses_the_start_without_naming_the_role() {
     let role = "kbf_no_such_role_zz";
     let db = Database::new("login", Some(role));

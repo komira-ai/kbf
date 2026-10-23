@@ -67,7 +67,7 @@ fn accepted(peer: Option<SocketAddr>) -> (Peer, DuplexStream) {
 }
 
 /// Catches a closed connection that unregisters whichever connection now has its
-/// peer address (mutant: the registration removes its address without checking the
+/// peer address (defect: the registration removes its address without checking the
 /// id): two connections from one address, the older closed first, leave the newer
 /// registered and open; closing the newer unregisters the address and ends its
 /// `closed` wait.

@@ -812,7 +812,7 @@ mod pool {
         )
     }
 
-    /// Catches (mutant "copy successful runs too"): a run that passed sent through the pool
+    /// Catches (defect "copy successful runs too"): a run that passed sent through the pool
     /// (it would be held for reads of logs nobody will want), and a run that failed offered
     /// to the writer at once with no tails (the pool would be bypassed). The failed run is
     /// minted, remembered and its id returned, and its invocation is open, as any run's.

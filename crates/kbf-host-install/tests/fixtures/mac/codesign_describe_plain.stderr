@@ -1,0 +1,23 @@
+Executable=/private/var/tmp/kbf-real-mac-codesign-3110-0/plain
+Identifier=plain-55554944d37d1fef022f34f7bb5c8d2270a9ace0
+Format=Mach-O thin (arm64)
+CodeDirectory v=20400 size=15527 flags=0x2(adhoc) hashes=479+2 location=embedded
+VersionPlatform=1
+VersionMin=720896
+VersionSDK=984320
+Hash type=sha256 size=32
+CandidateCDHash sha256=c2ddb8451db8cd377f3837dbf46b792c45bc6aa1
+CandidateCDHashFull sha256=c2ddb8451db8cd377f3837dbf46b792c45bc6aa17a1671ddff5016c16420c3a4
+Hash choices=sha256
+CMSDigest=c2ddb8451db8cd377f3837dbf46b792c45bc6aa17a1671ddff5016c16420c3a4
+CMSDigestType=2
+Executable Segment base=0
+Executable Segment limit=1114112
+Executable Segment flags=0x1
+Page size=4096
+CDHash=c2ddb8451db8cd377f3837dbf46b792c45bc6aa1
+Signature=adhoc
+Info.plist=not bound
+TeamIdentifier=not set
+Sealed Resources=none
+Internal requirements count=0 size=12

@@ -1,6 +1,5 @@
 //! The client's orders: what it accepts, what it refuses, what it writes, and the gate.
-//! Each test names the defect it catches; the planted mutant for each is listed in the
-//! pull request.
+//! Each test names the defect it catches.
 
 use std::cell::Cell;
 use std::fs;
@@ -43,7 +42,7 @@ fn rig_with_helper(name: &str, installed: &str, _staged: &str) -> Rig {
 /// Catches an activation accepted while a lease is live (running, or finished with a
 /// Result the server has not acknowledged: the daemon counts both in `live`), and one
 /// that is accepted when the count moves between the first look and the write: nothing is
-/// written and the reason is stated. (Mutant: no check; or only the first look.)
+/// written and the reason is stated. (Catches: no check; or only the first look.)
 #[tokio::test]
 async fn an_activation_with_a_lease_live_is_refused() {
     let target = commit(9);
@@ -113,7 +112,7 @@ async fn the_order_file_is_the_frozen_json() {
 /// Catches a revert refused for live leases, a revert that leaves the gate closed, a gate
 /// that opens on a stale word of the helper (the status file says "reverted" from an
 /// earlier try, which proves nothing about this order), and one that opens when the
-/// helper's word cannot be read. (Mutant: lift on state alone.)
+/// helper's word cannot be read. (Catches: lift on state alone.)
 #[tokio::test]
 async fn the_gate_opens_when_the_helper_settles_the_order() {
     let target = commit(9);
@@ -155,7 +154,7 @@ async fn the_gate_opens_when_the_helper_settles_the_order() {
 
 /// Catches an order that is not replayed safely: the same id again is answered and
 /// writes nothing (the file is not rewritten); one below the newest, id 0 and one of
-/// another epoch are refused. (Mutant: no floor; no dedup, which rewrites the file.)
+/// another epoch are refused. (Catches: no floor; no dedup, which rewrites the file.)
 #[tokio::test]
 async fn an_order_is_deduplicated_and_ordered() {
     let target = commit(9);
@@ -273,7 +272,7 @@ async fn an_order_needs_an_offer_or_a_release_the_installer_holds() {
 /// expected facts (a frontend that predates them) is refused here and writes nothing:
 /// fail closed.
 ///
-/// Mutants planted: the facts copied as zeros; the generation taken from the offer.
+/// Catches: the facts copied as zeros; the generation taken from the offer.
 #[tokio::test]
 async fn an_activation_record_carries_the_locators_the_facts_and_the_orders_generation() {
     let target = commit(9);
@@ -313,7 +312,7 @@ async fn an_activation_record_carries_the_locators_the_facts_and_the_orders_gene
 /// activation is refused naming the facts and writes no record (fail closed). A `min_protocol`
 /// of 0 is a real minimum (a build that speaks every version) and is accepted.
 ///
-/// Mutant seen red: the refusal loosened (`protocol == 0 || state_schema == 0` made `&&`:
+/// Catches: the refusal loosened (`protocol == 0 || state_schema == 0` made `&&`:
 /// a zero `state_schema` is accepted).
 #[tokio::test]
 async fn an_offer_with_every_fact_is_activated_and_one_missing_any_is_refused() {
@@ -388,7 +387,7 @@ async fn an_order_that_cannot_be_recorded_is_refused() {
 /// epoch 7 id 7 is accepted, epoch 8 id 3 is too (the restored store counts again), then
 /// epoch 7 is older whatever its id, and the floor survives a restart as the pair.
 ///
-/// Mutant seen red: the floor compared by id alone (epoch 8 id 3 is refused as below 7).
+/// Catches: the floor compared by id alone (epoch 8 id 3 is refused as below 7).
 #[tokio::test]
 async fn a_new_epoch_with_a_lower_id_is_newer_and_an_old_epoch_is_not() {
     let target = commit(9);
@@ -422,7 +421,7 @@ async fn a_new_epoch_with_a_lower_id_is_newer_and_an_old_epoch_is_not() {
 /// own reason (not the record's), nothing is written, no gate closes and the floor does not
 /// move, so the next real order is taken.
 ///
-/// Mutant planted: the guard in `decide` removed (the record's own refusal gives another
+/// Catches: the guard in `decide` removed (the record's own refusal gives another
 /// message, and the floor has moved).
 #[tokio::test]
 async fn a_frontend_update_order_is_refused_by_a_node_and_moves_nothing() {
@@ -449,7 +448,7 @@ async fn a_frontend_update_order_is_refused_by_a_node_and_moves_nothing() {
 /// for), and one that is accepted only on a bundled host (a host that fetches from a URL and
 /// carries a package seed takes it too). The record is the frozen JSON with `source` last.
 ///
-/// Mutants planted: an offer required for a staged order; the record writer consuming the held
+/// Catches: an offer required for a staged order; the record writer consuming the held
 /// offer for a staged order (the held-offer half of the test sees components and facts in the
 /// file); the bundled check applied to a staged order; the staged accept requiring a bundled
 /// host.
@@ -500,7 +499,7 @@ async fn a_staged_activation_needs_no_offer_and_is_a_locator_even_with_one_held(
 /// accepted: had any refusal recorded its id, the later and lower ones would have read "not
 /// above the newest accepted", and 1 would be refused.
 ///
-/// Mutants planted: each check moved after the floor is saved; an unknown source read as a
+/// Catches: each check moved after the floor is saved; an unknown source read as a
 /// fetch; a source allowed on a confirm; a staged order accepted on any `available`; a staged
 /// order accepted on a prefix of the commit.
 #[tokio::test]
@@ -555,7 +554,7 @@ async fn an_order_the_installer_cannot_carry_out_is_refused_before_the_floor_mov
 /// reports a package: the seed excuses a staged order from an offer, and a fetching order for
 /// the seed's commit still has none held and is refused.
 ///
-/// Mutant planted: the offer requirement dropped for every activation.
+/// Catches: the offer requirement dropped for every activation.
 #[tokio::test]
 async fn a_seed_does_not_excuse_a_fetch_from_its_offer() {
     let target = commit(9);

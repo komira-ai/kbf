@@ -40,7 +40,7 @@ pub(crate) fn serve(answer: &'static str) -> (u16, JoinHandle<String>) {
 fn a_post_carries_the_token_the_body_and_its_length_and_no_origin() {
     // Catches: a POST the API refuses for what it lacks (the bearer token, the JSON content
     // type, the length of the body) or for what a browser's request has (an `Origin`), and an
-    // answer whose status and body are not both returned. Mutants: the `Authorization` line
+    // answer whose status and body are not both returned. Catches: the `Authorization` line
     // dropped; `Content-Length` of the wrong size; the body dropped from the answer.
     let (port, server) = serve("HTTP/1.1 409 Conflict\r\nContent-Length: 6\r\n\r\nnot up");
     let got = post(port, "tok-of-32", "/v1/members/a", r#"{"state":"x"}"#);

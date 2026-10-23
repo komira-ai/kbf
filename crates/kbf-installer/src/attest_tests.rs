@@ -49,7 +49,7 @@ fn strings(args: &[OsString]) -> Vec<&str> {
 /// `--deny-self-hosted-runners` would accept a build from a runner anyone can register; a
 /// missing `--signer-workflow` or `--repo` would accept another workflow or repository.
 ///
-/// Mutants seen red: `--source-digest` dropped; `--deny-self-hosted-runners` dropped;
+/// Catches: `--source-digest` dropped; `--deny-self-hosted-runners` dropped;
 /// the `--signer-workflow` value changed.
 #[test]
 fn gh_is_asked_for_exactly_the_pinned_attestation() {
@@ -100,7 +100,7 @@ fn gh_is_asked_for_exactly_the_pinned_attestation() {
 /// all three proxy variables name the dead proxy (the check must be offline whatever the
 /// host's network does); no token is in it.
 ///
-/// Mutants seen red: the proxy variables dropped; a `GH_TOKEN` from the process
+/// Catches: the proxy variables dropped; a `GH_TOKEN` from the process
 /// environment added; `PATH` taken from the process.
 #[test]
 fn gh_gets_a_fixed_environment_and_a_dead_proxy() {
@@ -170,7 +170,7 @@ fn pair(args: &[OsString]) -> (String, String) {
 /// each as a pair (never the repository of one with the workflow of the other); a
 /// release only the former name vouches for is accepted on the second call.
 ///
-/// Mutants seen red: the former signer left out of `pinned` (a release attested under
+/// Catches: the former signer left out of `pinned` (a release attested under
 /// the old name is `not-attested`); the pair's repository taken from one signer and its
 /// workflow from the other.
 #[test]
@@ -198,7 +198,7 @@ fn a_release_attested_under_the_former_name_is_accepted_in_the_transition() {
 /// neither the current nor the former name is never asked for it, so the release is
 /// `not-attested` after exactly the two pinned signers.
 ///
-/// Mutant seen red: `signers` taken from the settings or the environment.
+/// Catches: `signers` taken from the settings or the environment.
 #[test]
 fn a_third_name_is_refused() {
     let other = FakeRunner::new(|s| {
@@ -215,7 +215,7 @@ fn a_third_name_is_refused() {
 /// every ref is `NotAttested`, naming the file and `gh`'s first line of complaint with
 /// control characters replaced; a `gh` killed by a signal (no exit code) is refused too.
 ///
-/// Mutant seen red: the exit status not read (any run accepted).
+/// Catches: the exit status not read (any run accepted).
 #[test]
 fn a_gh_verdict_other_than_success_is_not_attested() {
     let runner = FakeRunner::new(|_| Ok(ran(1, "", "verification failed\u{1b}[0m\nsecond line")));
@@ -266,7 +266,7 @@ fn a_gh_that_cannot_run_or_runs_out_of_time_is_its_own_refusal() {
 /// Catches a trust list that is checked after `gh` ran, or not at all: with a `gh` whose
 /// directory others can write the run never happens, and the refusal names the path.
 ///
-/// Mutant seen red: the trust check removed from `verify`.
+/// Catches: the trust check removed from `verify`.
 #[test]
 fn an_untrusted_gh_is_refused_before_it_runs() {
     let runner = FakeRunner::new(|_| Ok(ran(0, "", "")));
@@ -323,7 +323,7 @@ fn an_untrusted_gh_is_refused_before_it_runs() {
 /// path out of `refs/heads`, a space, an empty name, a doubled or trailing `/` and an
 /// empty component are refused; branch names with `/`, `.`, `_` and `-` are not.
 ///
-/// Mutant seen red: the character check dropped (a ref with a space passes).
+/// Catches: the character check dropped (a ref with a space passes).
 #[test]
 fn only_a_plain_branch_ref_is_a_source_ref() {
     for ok in [

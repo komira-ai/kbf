@@ -377,7 +377,7 @@ mod tests {
     /// Catches: a `ps` that failed read as "not seen" (a listing that could not be had
     /// must not pass for a refusal), and a marker seen read as anything but `ok`.
     ///
-    /// Mutants seen red: the `ps` failure mapped to `ESRCH`; `seen` ignored.
+    /// Catches: the `ps` failure mapped to `ESRCH`; `seen` ignored.
     #[test]
     fn ps_sees_reports_seen_not_seen_and_a_failed_ps_apart() {
         assert_eq!(ps_verdict(true, true), Outcome::Ok);

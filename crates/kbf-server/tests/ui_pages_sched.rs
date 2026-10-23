@@ -124,7 +124,7 @@ fn next_link(html: &str) -> Option<String> {
 /// `502`); a lease missing from the page or shown twice across pages; the node filter
 /// not reaching the route; the page's next link not leading to the rest; a node id
 /// written as markup (the daemon's id is `<b>`-and-quote text); a page that reads a
-/// route it does not declare. Mutants: the node not forwarded; the token dropped from
+/// route it does not declare. Catches: the node not forwarded; the token dropped from
 /// the next link; the node written raw.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_leases_page_lists_what_a_daemon_holds_and_pages() {
@@ -234,7 +234,7 @@ async fn the_leases_page_lists_what_a_daemon_holds_and_pages() {
 /// Catches: a queue key the page reads that the route does not send (`502`); work no
 /// node can run missing from the page, or without its reason and count; a quiet farm
 /// shown as anything but empty; the page's own query reaching a route that takes none.
-/// Mutants: the reason not written; the oldest age shown for an empty queue.
+/// Catches: the reason not written; the oldest age shown for an empty queue.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_queue_page_shows_work_no_node_can_run() {
     let cell = Cell::start_with_api().await;

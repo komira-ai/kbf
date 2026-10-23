@@ -245,14 +245,14 @@ async fn with_a_tier_a_file_over_1_gib_is_read_once() {
     a_file_over_1_gib_is_read_once(true).await;
 }
 
-/// Catches a file over 16 MiB refused without a write tier (mutant: the refusal
+/// Catches a file over 16 MiB refused without a write tier (defects: the refusal
 /// restored), or read again to be stored: it streams to the store from its one read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_a_tier_a_file_over_1_gib_is_read_once() {
     a_file_over_1_gib_is_read_once(false).await;
 }
 
-/// Catches a largest blob on the local plane (mutant: the 5 GiB cap restored): a
+/// Catches a largest blob on the local plane (defects: the 5 GiB cap restored): a
 /// record over 5 GiB, S3's single-PUT limit, is taken like any other with a write tier
 /// (a range of its own reserved for it) and its bytes are read; here its source has
 /// none, so the read, not its size, fails it.
@@ -303,7 +303,7 @@ async fn collect_small_file(
     .await
 }
 
-/// Catches a test plane that ignores the floor it is given (mutant: the default always
+/// Catches a test plane that ignores the floor it is given (defects: the default always
 /// used), which would leave `a_blob_over_5_gib_is_not_refused_for_its_size` needing the
 /// big disk again without any test noticing: a floor no disk meets refuses a small
 /// file, a floor of one byte stores it.

@@ -302,8 +302,13 @@ What the code does today:
   admission does not (below), and is not capped at 1: a worker booked past its memory is
   still more loaded than one booked less. A whole-machine lease, and an action at a
   worker's whole memory, go only to a worker with no lease, so their candidates tie and
-  the first by name is taken. An action has room where its free room (capacity minus
-  bookings) fits the whole request on every axis and no whole-machine lease is held. A
+  the first by name is taken. An action has room where no whole-machine lease is held,
+  its free CPUs and GPUs (capacity minus bookings) hold the request's, and the request's
+  memory is at most the worker's memory capacity (`Worker::has_room`). CPUs and GPUs are
+  booked; memory is only checked against capacity: what other leases hold of the node's
+  memory never keeps an action out. The node bounds how many actions run at once by their
+  CPUs, and its memory-pressure backstop pauses new starts. An action at the worker's
+  whole memory runs alone. A
   `whole_machine` lease has room only on a worker that holds no lease and is at least
   its request large; it books the worker's whole capacity, which its `Start` carries.
   A worker is live if it was heard from within G. Matches are memoised per platform
@@ -344,11 +349,21 @@ What the code does today:
   committed the operation is `Refused` and its waiters are answered (`Refuse`). The wait
   counts from the first round at which the operation was unservable, through changes
   of its reason, and the refusal is proposed at the first round at or after that time
-  plus the wait. It restarts whenever the operation is servable again. It is not zero because a worker
-  that can run the work is often a moment away: daemons reconnect within seconds of a
-  server restart, and a Mac that reboots is gone for minutes. Work that no kbf daemon
-  could ever run is refused by the front before it is queued (see
-  [capabilities.md](capabilities.md#what-the-code-enforces-today)).
+  plus the wait. It restarts whenever the operation is servable again. It is not zero
+  because a worker that can run the work is often a moment away: daemons reconnect
+  within seconds of a server restart, and a Mac that reboots is gone for minutes. Work
+  that no kbf daemon could ever run is refused by the front before it is queued (see
+  [capabilities.md](capabilities.md#what-the-code-enforces-today)). When several
+  frontends share one state store, each knows only the daemons connected to it, so
+  before such a refusal is committed the frontend reads the `session/` rows of the store,
+  which hold the capabilities and capacity of every frontend's daemons. If a daemon of
+  another frontend could run the operation, the refusal is taken back (the scheduler
+  puts the operation in the queue again, `Scheduler::hold_refusal`) and comes due again
+  after another wait; a store whose session rows cannot be read holds it too. A refusal
+  that is committed is written only while the operation is still queued in the store, so
+  it never removes an operation another frontend has granted. The frontend that loses
+  such a race drops its write as stale, and the callers waiting on it at that frontend
+  are not answered by it.
 
 **Planned**, in roughly the order they are needed:
 
@@ -365,7 +380,8 @@ What the code does today:
   preempted at once when more urgent work needs it.
 - **Retries.** Every infrastructure failure retried on another worker a bounded
   number of times before callers see `INTERNAL`. Today the farm faults of
-  [Retries of farm faults](#retries-of-farm-faults) are; `Failed(Infra)` is not. A
+  [Retries of farm faults](#retries-of-farm-faults) are, and so is `Failed(Infra)`, within
+  the same `FARM_RERUNS` budget. A
   missing input (`Failed(MissingInput)`, [Outcomes](#outcomes)) is not an
   infrastructure failure and will not count against that budget: rerunning it fails
   the same way until the client uploads the blob.
@@ -373,7 +389,7 @@ What the code does today:
 ## Retries of farm faults
 
 What the code does today (issue #22; the policy is
-[failure-classes.md](failure-classes.md), 6.5). Three kinds of run end as the farm's
+[failure-classes.md](failure-classes.md), 6.5). Four kinds of run end as the farm's
 fault, and each is recorded on its operation as a `FarmRun` (the node, and why):
 
 - a busy node's memory kill (`Failed(NodeMemoryPressure)`, [Memory kills](#memory-kills));
@@ -381,10 +397,12 @@ fault, and each is recorded on its operation as a `FarmRun` (the node, and why):
   acknowledged heartbeat within T), or a whole-machine action whose result a daemon
   restart took;
 - a lease given up because its daemon was proven stopped (the requeue reason
-  `Restarted`, [above](#reconciling-with-what-workers-say-they-run)).
+  `Restarted`, [above](#reconciling-with-what-workers-say-they-run));
+- a run the farm could not do (`Failed(Infra)`): the daemon's driver failed around the
+  action, or its outputs were not all stored.
 
 They share one budget: the operation runs again while at most `FARM_RERUNS` = 2 runs
-have ended so, so at most 3 runs end as farm faults, whatever mix of the three. A
+have ended so, so at most 3 runs end as farm faults, whatever mix of the four. A
 rerun prefers a node none of its farm runs ended on: placement skips those nodes while
 a live, serving node outside them could run the request once its bookings end, and
 waits for it; when none could (a farm of one node), it takes one of them. The run past
@@ -394,9 +412,17 @@ the committed record finishes the operation, as every result does. Callers then 
 `INTERNAL`: "kbf farm fault on <last node>: <what ended its run>, and its reruns are
 used up. Operator fix: <fix>. Runs: 3 (node-a, fenced; node-b, daemon restarted; ...)."
 
-Not charged: leases given up for silence (G), replacement without proof (the handover
-grace), reconnection, not starting or a session switch. The last three never ran; the
-first two are left for a later change, which needs a tick that answers callers. Nothing
+Not charged to that budget: leases given up for reconnection or a session switch (they
+never ran) and leases given up as not started (the node heartbeats but never listed the
+lease within the start grace). A not-started give-up has a budget of its own,
+`NOT_STARTED_RERUNS` = 3 per operation: each one adds the node to those placement avoids
+and runs the operation again; the give-up past the budget finishes the operation with
+`Failed(Infra)` (the farm never started the action), and its callers get `INTERNAL`
+"kbf farm fault: the farm never started the action; 4 leases were not listed by their
+nodes within the start grace" (`kbf-server/src/fault.rs`). That result is the
+scheduler's own, so it is not run again as an `Infra` farm fault. A lease given up for
+silence (G) or replacement without proof (the handover grace) is charged as a lost run
+(fenced) once it had been sent its `Start`. Nothing
 a lost run produced reaches the action cache: a killed run sends no `Result`, a lost
 `Result` never completes an operation, and a late `Result` of a lease given up is
 refused once the operation holds a new lease.
@@ -451,8 +477,9 @@ turns it into one of two outcomes, and the scheduler decides on the committed re
   faults never stop the ladder short of the cap. An operation runs at most
   `1 + rungs above its first booking + 1 (the whole host) + FARM_RERUNS` times:
   `1 + 3 + FARM_RERUNS` for the default ladder. Leases given up for
-  silence, replacement without proof, reconnection or not starting count against
-  neither.
+  reconnection or a session switch count against neither; not starting has its own
+  budget, `NOT_STARTED_RERUNS`; silence and replacement without proof after `Start`
+  was sent are charged as a lost run.
 - A memory kill committed for a lease the operation no longer holds (it was given up
   and is queued again) changes nothing: no run is recorded and the booking stays.
 - Each rerun is a requeue the server logs with its reason ("passed its memory limit
@@ -467,21 +494,21 @@ to the scheduler's outcome and to what callers see:
 | Report | Scheduler outcome | Callers get | Action cache |
 |---|---|---|---|
 | `OK`, all outputs stored | `Completed` | the `ActionResult` | written if exit code 0 and not `do_not_cache` |
-| `OK`, an output not stored | `Failed(Infra)` | `INTERNAL` | not written |
+| `OK`, an output not stored | `Failed(Infra)`: run again from the farm budget | past the budget, `INTERNAL`: "kbf farm fault on <node>: ..." | not written |
 | `DEADLINE_EXCEEDED` | `Failed(Timeout)` | `DEADLINE_EXCEEDED`, with the partial stdout and stderr digests the CAS holds, if any | not written |
 | `INVALID_ARGUMENT` | `Failed(Invalid)` | `INVALID_ARGUMENT`, with the daemon's reason | not written |
 | not `OK`, `memory_kill` own limit | `Failed(OutOfMemory)`: run again one rung up (4, 16, 32 GiB, a whole host) below the cap | at the cap, `FAILED_PRECONDITION`: "kbf: the action needs more memory than any node offers: ...", with an `ErrorInfo` of reason `ACTION_OUT_OF_MEMORY` | not written |
 | not `OK`, `memory_kill` node pressure | `Failed(NodeMemoryPressure)`: run again with the same memory, from the farm budget | past the budget, `INTERNAL`: "kbf farm fault on <node>: ..." | not written |
 | not `OK`, `lost` set (fenced, or daemon restarted) | `Failed(Lost)`: run again from the farm budget, preferring another node | past the budget, `INTERNAL`: "kbf farm fault on <node>: ...", naming every farm run | not written |
 | `FAILED_PRECONDITION`, every `PreconditionFailure` violation `MISSING` with a `blobs/<hash>/<size>` subject | `Failed(MissingInput)`: answered at once, never run again, no farm rerun spent | `FAILED_PRECONDITION`: "N input blob(s) are not in the CAS", with the `PreconditionFailure` listing each blob as its only detail, as the front answers before queueing; Bazel re-uploads and executes again | not written |
-| anything else | `Failed(Infra)` | `INTERNAL`: "the farm could not run the action"; the daemon's reason goes only to the server's log, a WARN `lease failed` line with the lease, the node, the code and the reason | not written |
+| anything else | `Failed(Infra)`: run again from the farm budget | past the budget, `INTERNAL`: "kbf farm fault on <node>: ..."; the daemon's reason goes only to the server's log, a WARN `lease failed` line with the lease, the node, the code and the reason | not written |
 | (none: refused unrun) | `Refused` | `FAILED_PRECONDITION`, with the reason | not written |
 
 A run that exits non-zero (a failing test) is still `Completed`: callers get its
 result, but it is not cached. The action-cache entry is committed before the callers
 are answered, so a caller that asks again at once gets a hit. Today an infrastructure
-failure other than a farm fault ([Retries of farm faults](#retries-of-farm-faults)) is
-answered at once; retrying it is planned (above).
+failure is rerun within the farm budget ([Retries of farm faults](#retries-of-farm-faults));
+past the budget it is answered `INTERNAL` naming its runs.
 
 ## Accounting
 

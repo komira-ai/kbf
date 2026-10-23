@@ -258,7 +258,7 @@ fn assert_heavy(usage: &ResourceUsage, least_wall: Duration) {
 /// its high-water mark, CPU time not read (zero or the time of one poll), a wall time
 /// that is not the action's, and, off macOS, a usage invented for a platform with no
 /// footprint counters. Green on a macOS runner (peak 224 MB, user CPU 1.5 s to 1.9 s
-/// for 208 MiB and a 1.5 s burn); no mutant was run against it (macOS only).
+/// for 208 MiB and a 1.5 s burn); macOS only.
 #[tokio::test]
 async fn a_lease_reports_its_usage_on_macos_only() {
     let dir = scratch("usage-success");
@@ -282,7 +282,7 @@ async fn a_lease_reports_its_usage_on_macos_only() {
 /// Catches: a lease that ended in an error (here a timeout) reporting no usage through
 /// `failed_usage`, the usage handed out twice, and one kept under another lease's id.
 /// The action held its memory and burned CPU for over a second before the timeout.
-/// Mutant seen red (Linux unit test of the same map): `remove` replaced by `get().cloned()`;
+/// Catches (Linux unit test of the same map): `remove` replaced by `get().cloned()`;
 /// this test itself ran green on a macOS runner.
 #[tokio::test]
 async fn a_timed_out_lease_tells_its_usage_once() {
@@ -399,8 +399,11 @@ async fn a_process_that_ignores_sigterm_is_named_in_the_result() {
         "{stderr}"
     );
     assert!(took >= Duration::from_millis(900), "no grace: {took:?}");
+    // An unbounded grace would wait out the child's `sleep 300`. The bound leaves room for
+    // what the lease end does after the grace on a failed action: on macOS, the read of the
+    // sandbox log for the action's own denials takes several seconds.
     assert!(
-        took < Duration::from_secs(5),
+        took < Duration::from_secs(60),
         "the grace was not bounded: {took:?}"
     );
     assert!(no_leases(&config));

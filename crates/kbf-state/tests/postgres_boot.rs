@@ -4,8 +4,9 @@
 //! by another session. Each test makes a schema of its own and
 //! drops it.
 //!
-//! The tests are `#[ignore]`d; the `state-postgres` job runs them with `--include-ignored`.
-//! `KBF_TEST_POSTGRES_URL` names a database they may create and drop schemas in.
+//! The tests run in every test run (none is `#[ignore]`d), and fail, not skip, when
+//! `KBF_TEST_POSTGRES_URL` names no server; it names a database they may create and drop
+//! schemas in.
 #![cfg(feature = "postgres")]
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,7 +86,6 @@ fn at(s: &Scratch) -> Result<u32, SchemaError> {
 /// Asserts that a database with no schema gets the schema of this build before the unit
 /// starts, and that a store then opens on it.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_database_with_no_schema_gets_it_and_a_store_opens_on_it() {
     let s = Scratch::new();
     let step = BootStep::of_this_build(s.config());
@@ -98,7 +98,6 @@ fn a_database_with_no_schema_gets_it_and_a_store_opens_on_it() {
 /// Asserts that a database one migration behind the build is migrated to the build's schema,
 /// and that a store of the build opens on it: the unit starts on the schema it needs.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_schema_behind_the_build_is_migrated_before_the_unit_starts() {
     let s = Scratch::new();
     schema::apply(&s.config(), &schema::embedded(), 1).expect("the earlier release is installed");
@@ -114,7 +113,6 @@ fn a_schema_behind_the_build_is_migrated_before_the_unit_starts() {
 /// Asserts that a database already at the build's schema is left alone: the step says there is
 /// nothing to apply, and the schema is where it was.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_schema_at_the_build_is_left_alone() {
     let s = Scratch::new();
     schema::apply(&s.config(), &schema::embedded(), 1).expect("installed");
@@ -129,7 +127,6 @@ fn a_schema_at_the_build_is_left_alone() {
 /// still 2, and a store of the build opens on it. A kbf package rolled back to an earlier
 /// release starts on the schema its successor left.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_schema_ahead_of_the_build_by_an_expand_step_is_left_alone() {
     let s = Scratch::new();
     schema::apply(&s.config(), &with(expand()), 2).expect("the later release is installed");
@@ -146,7 +143,6 @@ fn a_schema_ahead_of_the_build_by_an_expand_step_is_left_alone() {
 /// and that a store of the build refuses to open on it with the line that names the release
 /// to run: the unit does not serve a schema something was removed from.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_contract_step_above_the_build_is_refused_when_the_store_opens() {
     let s = Scratch::new();
     schema::apply(&s.config(), &schema::embedded(), 1).expect("installed");
@@ -169,7 +165,6 @@ fn a_contract_step_above_the_build_is_refused_when_the_store_opens() {
 /// Asserts that a pending migration that is a contract step is refused and not run: an update
 /// never removes anything, so the schema stays where it was.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_pending_contract_step_is_refused_and_not_run() {
     let s = Scratch::new();
     schema::apply(&s.config(), &schema::embedded(), 1).expect("installed");
@@ -183,7 +178,6 @@ fn a_pending_contract_step_is_refused_and_not_run() {
 /// its wait (200 ms here) and applies nothing, and that once the lock is let go the same step
 /// migrates: the unit is not held for ever behind another migration.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_held_schema_lock_is_a_refusal_after_the_wait() {
     let s = Scratch::new();
     schema::apply(&s.config(), &schema::embedded(), 1).expect("installed");

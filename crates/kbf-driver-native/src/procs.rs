@@ -796,7 +796,7 @@ mod tests {
     }
 
     /// Catches a group signalled by its id once a snapshot showed it empty (the id may
-    /// be someone else's by then): the "ignore `group_gone`" mutant.
+    /// be someone else's by then): the "ignore `group_gone`" defect.
     #[test]
     fn a_group_seen_empty_is_not_signalled_by_its_id() {
         use std::os::unix::process::CommandExt as _;

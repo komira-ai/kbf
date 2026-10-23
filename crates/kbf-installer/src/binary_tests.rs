@@ -6,7 +6,7 @@ use crate::fixtures::{elf, macho};
 /// one, a ELF for another machine (RISC-V 243), a fat Mach-O, a Mach-O for another CPU,
 /// a script, a truncated header and nothing.
 ///
-/// Mutant seen red: e_machine read from the wrong offset (17).
+/// Catches: e_machine read from the wrong offset (17).
 #[test]
 fn a_header_says_what_kind_of_binary_a_file_is() {
     assert_eq!(
@@ -90,7 +90,7 @@ fn the_kinds_print_for_an_operator() {
 /// `bundled` needs taken for it, and a comparison off by one at the boundary. (That the field
 /// is read at all is `kbf-types`'s test.)
 ///
-/// Mutants to plant: `relays` true for any declared level; `>=` made `>`.
+/// Catches: `relays` true for any declared level; `>=` made `>`.
 #[test]
 fn bundled_needs_a_build_that_relays_far_enough() {
     let shape = |relay: &str| {

@@ -11,9 +11,9 @@ fn flags(more: &[&str]) -> StorageFlags {
     parse(&command().try_get_matches_from(argv).expect("flags")).expect("taken")
 }
 
-/// Catches a node that registers for an S3 store and keeps core dumps on (mutant:
+/// Catches a node that registers for an S3 store and keeps core dumps on (defect:
 /// `may_hold_keys` false, or `harden` doing nothing), and a node that cannot hold keys
-/// being hardened for nothing (mutant: `may_hold_keys` always true): the process is
+/// being hardened for nothing (defect: `may_hold_keys` always true): the process is
 /// dumpable until a node that may hold keys is hardened, and not after.
 #[test]
 fn only_a_node_that_may_hold_keys_turns_off_core_dumps() {

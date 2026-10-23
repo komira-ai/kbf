@@ -233,7 +233,7 @@ mod tests {
     /// Catches a drain that leaves any of its four effects out: `/readyz` still
     /// ready (a front keeps sending work), new Execute calls still taken, no GOAWAY
     /// for the REAPI listener (it keeps accepting), and a drain that does not say it
-    /// has begun. Mutants: each line of [`Drain::begin`]'s effects removed in turn.
+    /// has begun. Catches: each line of [`Drain::begin`]'s effects removed in turn.
     #[test]
     fn begin_does_all_of_a_drain_and_says_it_began() {
         let (drain, closing, readiness, mut goaway) = fresh();
@@ -334,7 +334,7 @@ mod tests {
     /// The golden of the stop signal: what `begin` changes, and that it changes the same
     /// whichever stages ran before it (a signal that arrives mid-update), and nothing a
     /// second time. Catches a split of `begin` that loses an effect or adds one (such
-    /// as `handed_over`, which the signal's path must not set). Mutants: `begin` not
+    /// as `handed_over`, which the signal's path must not set). Catches: `begin` not
     /// calling `unready`, `refuse` or `goaway`; `begin` setting `hand_over`; `begin`
     /// returning early once `goaway` has been sent.
     #[test]
@@ -381,7 +381,7 @@ mod tests {
     /// Catches `refuse` that is not reversible (an update that fails its prepare would
     /// leave the old process refusing calls), an `unrefuse` that touches readiness or
     /// sends GOAWAY, and an `unrefuse` that undoes a drain that has begun or closed.
-    /// Mutants: `unrefuse` without the `began` check; `refuse` also calling `unready`;
+    /// Catches: `unrefuse` without the `began` check; `refuse` also calling `unready`;
     /// `unrefuse` returning `true` when nothing was refused.
     #[test]
     fn refuse_is_reversible_until_the_drain_begins() {
@@ -414,7 +414,7 @@ mod tests {
     /// after it (a probe through a frozen or forwarding store can wait out its timeout
     /// or fail while the old process still answers calls), the same through the gRPC
     /// health service, and `unready` that does not flip both. The probe here never
-    /// answers, which is longer than any store-probe timeout. Mutants: `hand_over`
+    /// answers, which is longer than any store-probe timeout. Catches: `hand_over`
     /// calling `unready`; `Checks::failing` asking the probes after a hand-over;
     /// `unready` not reaching the health service.
     #[tokio::test(start_paused = true)]
@@ -476,7 +476,7 @@ mod tests {
     }
 
     /// Catches a hand-over pin that hides a failing probe from a server that has not
-    /// handed over (the pin must be the hand-over's alone). Mutant: `is_handed_over`
+    /// handed over (the pin must be the hand-over's alone). Catches: `is_handed_over`
     /// true from the start.
     #[tokio::test]
     async fn a_failing_probe_still_fails_readiness_before_the_hand_over() {
@@ -490,7 +490,7 @@ mod tests {
 
     /// `goaway` alone: catches one that does not say the drain began (the listener
     /// would keep accepting), one that flips readiness or refuses calls, and a second
-    /// call that is a first. Mutants: `goaway` not firing `begins`; `goaway` calling
+    /// call that is a first. Catches: `goaway` not firing `begins`; `goaway` calling
     /// `refuse`.
     #[tokio::test(start_paused = true)]
     async fn goaway_alone_is_one_way_and_touches_nothing_else() {
@@ -509,7 +509,7 @@ mod tests {
     }
 
     /// Catches a `stop` or `set_handed_over` that reports "first" every time, and one
-    /// that wakes health watchers when nothing changed. Mutant: the `first` guard
+    /// that wakes health watchers when nothing changed. Catches: the `first` guard
     /// removed from either.
     #[test]
     fn readiness_stages_announce_only_a_change() {

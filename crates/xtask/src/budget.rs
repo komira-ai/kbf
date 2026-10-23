@@ -12,7 +12,7 @@
 //! the list may only shrink, so a row a change adds is refused, whatever its file is.
 //! One exception is a section the base list has no header for: the change that
 //! adds the header brings the section's first rows. The other exception is
-//! [`SANCTIONED`], rows the CEO ruled in by name. A path git reports as renamed
+//! [`SANCTIONED`], rows the maintainers ruled in by name. A path git reports as renamed
 //! (`git diff --find-renames`) keeps its base row: a row for the new path is compared
 //! as the old path's, so a pure rename is no growth and a rename that also adds a row
 //! is still refused. A header the base has may not go
@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 /// The budget file, relative to the repository root.
 pub const BUDGET: &str = "tools/interpreter_budget.tsv";
 
-/// Rows a change may add although the list only shrinks, each ruled in by the CEO by
+/// Rows a change may add although the list only shrinks, each ruled in by the maintainers by
 /// name (and nothing else is: a row here is as much a ruling as a row of the list):
 ///
 /// - `packaging/install.sh`, ruled in with the installer packaging work: the curl|sh

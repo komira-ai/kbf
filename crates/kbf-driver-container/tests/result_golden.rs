@@ -56,7 +56,7 @@ fn digest(hash: &str, size_bytes: i64) -> Option<Digest> {
 /// Tree names, every file, and the Tree itself are in the CAS with the bytes on disk. A
 /// Directory built with a file's digest or executable bit unset, nodes out of order, or
 /// a child's digest taken before the child's own files were filled in would change the
-/// root and Tree digests (mutants seen red: the executable bit not copied to the node;
+/// root and Tree digests (catches: the executable bit not copied to the node;
 /// the children's digests filled in pre-order instead of last first).
 #[tokio::test]
 async fn a_mixed_tree_collects_to_what_it_always_did() {

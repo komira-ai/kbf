@@ -18,7 +18,7 @@ use kbf_testkit::forked::ForkedChild;
 /// ([`Locked::acquire`]) and the one that gives up ([`Locked::acquire_within`], with no
 /// time to wait, so a lock still held says so at once).
 ///
-/// Mutant: the `Drop` of `Locked` removed (the close alone releases the lock): the
+/// Catches: the `Drop` of `Locked` removed (the close alone releases the lock): the
 /// retake is refused as busy, with the child between fork and exec.
 #[test]
 fn a_child_forked_while_the_lock_was_held_does_not_keep_it_after_the_drop() {

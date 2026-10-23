@@ -24,13 +24,13 @@ use node::{
 };
 use support::{Source, farm_beating};
 
-/// Catches a node that ignores the registration (mutant: `registered` returns the node's
+/// Catches a node that ignores the registration (defect: `registered` returns the node's
 /// own store, which this node does not have: it cannot start), one that opens its cache
 /// on the flag's keys instead of the registered ones (the service refuses any other
-/// pair, so the write fails), one whose heartbeats omit the two fields (mutant:
+/// pair, so the write fails), one whose heartbeats omit the two fields (defect:
 /// `for_beat` returns `(0, Unspecified)`: the frontend shows the node `unsupported`), one
 /// that reports the generation before it ran the probe (the probe object is gone and the
-/// signed requests are the registered pair's), and a probe that leaves its object (mutant:
+/// signed requests are the registered pair's), and a probe that leaves its object (defect:
 /// the delete is skipped).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_node_with_no_keys_of_its_own_runs_on_the_registered_ones_and_reports_it() {
@@ -74,7 +74,7 @@ async fn a_node_with_no_keys_of_its_own_runs_on_the_registered_ones_and_reports_
 }
 
 /// Catches a node that reports the registered generation although its keys failed the
-/// probe (mutant: `registered` returns `Applied::running` before the probe's result is
+/// probe (defect: `registered` returns `Applied::running` before the probe's result is
 /// read), and one that opens the cache on the keys that failed (the service takes only the
 /// flag's pair): the node keeps the store its own keys open, writes and reads through it,
 /// and tells the frontend `probe_failed` with nothing applied.
@@ -109,7 +109,7 @@ async fn registered_keys_that_fail_the_probe_leave_the_node_on_its_own_store() {
     assert!(rig.s3.keys().iter().all(|k| !k.contains(".kbf-probe")));
 }
 
-/// Catches a node that starts without any working keys (mutant: the failed probe falls
+/// Catches a node that starts without any working keys (defect: the failed probe falls
 /// through to the cache): it refuses, with the probe's step, as an error a restart can
 /// clear (75), and holds the wrong secret in no text of the error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -127,7 +127,7 @@ async fn registered_keys_that_fail_the_probe_and_no_keys_of_its_own_is_a_start_t
 }
 
 /// Catches a node re-pointed at the registered store when its flag names another
-/// (mutant: `same_store` returns true): the node keeps its flag store and reports
+/// (defect: `same_store` returns true): the node keeps its flag store and reports
 /// `identity_mismatch`; the registered bucket gets no request at all, not even a probe.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_registration_for_another_store_leaves_the_node_on_its_flag() {
@@ -151,7 +151,7 @@ async fn a_registration_for_another_store_leaves_the_node_on_its_flag() {
 }
 
 /// Catches a node with no keys of its own and a mismatching flag that starts anyway
-/// (mutant: `MismatchNoKeys` replaced by opening the registered store): it has nothing to
+/// (defect: `MismatchNoKeys` replaced by opening the registered store): it has nothing to
 /// run on that its flag names, so it refuses, and a restart reads the same (2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_registration_for_another_store_and_no_keys_of_its_own_is_refused() {
@@ -166,7 +166,7 @@ async fn a_registration_for_another_store_and_no_keys_of_its_own_is_refused() {
     assert_eq!(class(error.as_ref()), StartFailure::Refused);
 }
 
-/// Catches a node with a `file://` cold store that takes an S3 registration (mutant:
+/// Catches a node with a `file://` cold store that takes an S3 registration (defect:
 /// `Fixed::registered` reports `running`): it keeps its directory and says
 /// `identity_mismatch`; with nothing registered it says nothing is wrong.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -213,7 +213,7 @@ async fn rig_with_nothing() -> Rig {
 }
 
 /// Catches a frontend that went back to a lower generation being ignored by a node
-/// (mutant: `for_beat` marks only a higher announcement pending): a node that runs on 5
+/// (defect: `for_beat` marks only a higher announcement pending): a node that runs on 5
 /// is told the frontend is at 2, says `pending` for it and still names what it runs on; a
 /// node started after the drop fetches 2 whole, and the farm shows it applied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -259,7 +259,7 @@ async fn a_lowered_generation_is_pending_for_a_running_node_and_applied_by_a_new
     assert_eq!(two.nodes[1].applied_generation, Some(2));
 }
 
-/// Catches a node that reports before it has opened its store (mutant: a heartbeat sent
+/// Catches a node that reports before it has opened its store (defect: a heartbeat sent
 /// from `register`), or whose crash half way claims a generation: while the fetch is held
 /// the frontend has the registration of the node and no ack of it; the start is dropped
 /// (a crash), the frontend still has no ack; a node that starts afterwards fetches again
@@ -320,7 +320,7 @@ async fn a_start_cut_off_between_the_fetch_and_the_report_claims_nothing() {
     assert!(got.nodes.iter().any(|n| n.status == NodeStatus::Ok));
 }
 
-/// Catches keys written where they can be found (mutant: the registered secret written to
+/// Catches keys written where they can be found (defect: the registered secret written to
 /// a cache file in the node's directory), and keys in the process's arguments or
 /// environment. The test first reads the secret from the answer and from the store's
 /// requests (signed with it, so the service accepted it), so a scan that finds nothing is
@@ -372,8 +372,8 @@ fn scan(dir: &Path, needle: &[u8], found: &mut Vec<PathBuf>) {
     }
 }
 
-/// Catches a registered region that is not the one the requests are signed in (mutant:
-/// the flag's region always used), and an empty one that is used as it is (mutant: the
+/// Catches a registered region that is not the one the requests are signed in (defect:
+/// the flag's region always used), and an empty one that is used as it is (defect: the
 /// fallback to the flag's region removed): the registration names `eu-west-1` and the
 /// service sees only that; a registration with no region leaves the flag's `us-east-1`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -398,7 +398,7 @@ async fn the_registered_region_signs_and_an_empty_one_takes_the_flags() {
 }
 
 /// Catches a node that fails, or claims a generation, when the registration is taken back
-/// between the frontend's announcement and the fetch (mutant: the empty answer treated as
+/// between the frontend's announcement and the fetch (defect: the empty answer treated as
 /// a registration): with a key pair of its own it runs on that and says the announced
 /// generation is pending (it applied none of it); with none it says which variable is
 /// missing.

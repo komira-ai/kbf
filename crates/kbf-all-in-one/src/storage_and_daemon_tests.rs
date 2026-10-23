@@ -247,7 +247,7 @@ fn a_starter_starts_the_daemon_half_over_the_storage_half_in_either_mode() {
 /// over the network (or not at all). With the flag the member is the advertised address, a
 /// routable-looking one that nothing is bound to; without it, the bound address.
 ///
-/// Mutant: `local_member` registering `half.addr.to_string()` whatever the flag says.
+/// Catches: `local_member` registering `half.addr.to_string()` whatever the flag says.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_local_member_is_registered_under_the_advertised_address() {

@@ -98,7 +98,7 @@ fn v1_mentions(html: &str) -> Vec<&str> {
 }
 
 /// Catches: a page that writes the id or the digest it was asked for into a `/v1` URL
-/// without encoding it (a mutant of `segment` that encodes nothing reads
+/// without encoding it (a `segment` that encodes nothing reads
 /// `/v1/invocations/../../v1/nodes`, which a URL client resolves to `/v1/nodes`), or one
 /// that does not refuse a dot segment before it is written into one: whatever the path or
 /// the query, every URL the page asks the real routes for is one of its declared routes
@@ -155,7 +155,7 @@ async fn a_crafted_path_or_query_reads_only_the_declared_routes() {
 }
 
 /// Catches: the mounted `/ui` answering a crafted raw path from a route it does not
-/// declare, or any method but `GET` and `HEAD` (mutants: `post` for `get` on the page
+/// declare, or any method but `GET` and `HEAD` (defects: `post` for `get` on the page
 /// route; a page that reads the decoded path whole). The paths are sent raw over TCP to
 /// the real server, as a client that does not normalize them would.
 #[tokio::test]

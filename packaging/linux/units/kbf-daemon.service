@@ -53,6 +53,11 @@ ExecStart=/usr/bin/kbf --mode=daemon
 # finite, so a hung daemon still lets a reboot through (package-test rule `stop`).
 TimeoutStopSec=660
 KillSignal=SIGTERM
+# KillMode=mixed: systemd's default (control-group) sends SIGTERM to every process of the
+# unit at once, and the actions run in sub-cgroups of it, so a stop would end them in the
+# first seconds of the drain. mixed signals the main process alone; what is still left
+# once it has exited, or when the stop times out, gets SIGKILL.
+KillMode=mixed
 Restart=on-failure
 RestartSec=5
 # Exit 2 is a command line kbf refused (or a config or an image it cannot parse): a

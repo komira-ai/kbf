@@ -186,7 +186,7 @@ mod tests {
         a.authenticate(&call()).await
     }
 
-    /// Catches: a deny that accepts (mutant "deny allows"), or refuses with a code
+    /// Catches: a deny that accepts (defect "deny allows"), or refuses with a code
     /// other than UNAUTHENTICATED or without its configured message.
     #[tokio::test]
     async fn deny_refuses_unauthenticated_with_its_message() {
@@ -195,7 +195,7 @@ mod tests {
         assert_eq!(e.message(), "go away");
     }
 
-    /// Catches: an `any` that behaves as `all` (mutant: one refusing child refuses the
+    /// Catches: an `any` that behaves as `all` (defects: one refusing child refuses the
     /// call), one that asks children after the first that accepts, and one that
     /// answers with a later child's metadata.
     #[tokio::test]

@@ -2,9 +2,8 @@
 //! connection of its own, visible from every other session, released when the guard is
 //! dropped and when the server loses the connection.
 //!
-//! The tests need a server and are `#[ignore]`d; the `state-postgres` job runs them with
-//! `--include-ignored`. Waits are on the condition (the lock being released), polled with
-//! a bound, never on a fixed delay.
+//! The tests need a server (`KBF_TEST_POSTGRES_URL` names it) and fail without one. Waits are
+//! on the condition (the lock being released), polled with a bound, never on a fixed delay.
 #![cfg(feature = "postgres")]
 
 use std::sync::Arc;
@@ -15,12 +14,8 @@ use kbf_state::postgres::{Flaw, PostgresBackend, PostgresStore};
 use kbf_state::{Fenced, GENERATION, Store, StoreError, TakeError};
 use postgres::{Client, NoTls};
 
-const URL_VAR: &str = "KBF_TEST_POSTGRES_URL";
-
 fn url() -> String {
-    std::env::var(URL_VAR).unwrap_or_else(|_| {
-        panic!("{URL_VAR} must name a postgres:// URL the tests may create schemas in")
-    })
+    kbf_testkit::database::server_url()
 }
 
 /// A store, and a second store (another set of sessions) on the same schema, the way
@@ -60,7 +55,6 @@ fn becomes(store: &PostgresStore, generation: u64, want: bool) {
 // taken and let go, or at transaction level): while the guard lives, another session
 // sees the holder alive; with nothing announced it sees it dead.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_held_announcement_is_seen_from_another_session() {
     let pair = Pair::new();
     assert_eq!(
@@ -85,7 +79,6 @@ fn a_held_announcement_is_seen_from_another_session() {
 // (as it does when the process dies) while the guard is still held, and the holder reads
 // as dead. A pid probe or a lock held on a pooled connection would not follow.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn the_announcement_goes_when_the_connection_dies() {
     let pair = Pair::new();
     let _guard = pair.holder.hold_liveness(1).expect("announces");
@@ -106,7 +99,6 @@ fn the_announcement_goes_when_the_connection_dies() {
 // Catches two live holders of one generation: a second announcement of a generation that
 // is announced is refused, and is accepted once the first is gone.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_generation_has_one_live_holder() {
     let pair = Pair::new();
     let first = pair.holder.hold_liveness(1).expect("announces");
@@ -122,7 +114,6 @@ fn a_generation_has_one_live_holder() {
 // Catches announcements that collide: generations are announced independently of one
 // another, and one schema's holder is not another schema's.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn generations_and_schemas_are_independent() {
     let pair = Pair::new();
     let other = Pair::new();
@@ -139,7 +130,6 @@ fn generations_and_schemas_are_independent() {
 // generation a rival has already announced fails with the row unwritten, and the old
 // holder's generation is still announced until its guard goes.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn take_holding_announces_before_it_writes() {
     let pair = Pair::new();
     let (first, first_guard) =
@@ -175,7 +165,6 @@ fn take_holding_announces_before_it_writes() {
 // connection (a network failure, an idle timeout, a terminate) and other sessions see the
 // holder dead; the guard's own `is_held` must say so too, so the holder can fence itself.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn the_guard_notices_when_its_connection_was_ended() {
     let pair = Pair::new();
     let guard = pair.holder.hold_liveness(1).expect("announces");
@@ -202,7 +191,6 @@ fn the_guard_notices_when_its_connection_was_ended() {
 // transaction is held open until the hold has made (and lost) its first attempt, then
 // released, and the hold must succeed on a later attempt.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_probe_racing_a_hold_does_not_make_the_hold_fail() {
     let pair = Pair::new();
     let mut probe = Client::connect(&url(), NoTls).expect("connects");

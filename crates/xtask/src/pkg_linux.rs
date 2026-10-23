@@ -69,6 +69,8 @@ pub const TRUST_DIR: &str = "/usr/share/kbf-installer/trust";
 pub const SYSUSERS_PATH: &str = "/usr/lib/sysusers.d/kbf-installer.conf";
 /// Where the directories file goes (`systemd-tmpfiles`).
 pub const TMPFILES_PATH: &str = "/usr/lib/tmpfiles.d/kbf-installer.conf";
+/// Where the needrestart drop-in goes: a host without needrestart ignores it.
+pub const NEEDRESTART_PATH: &str = "/etc/needrestart/conf.d/kbf.conf";
 /// The directory `setup` fills and the package never removes.
 pub const STATE_DIR: &str = "/var/lib/kbf-installer";
 /// The directories `tmpfiles.d` makes, with their modes (all `root:root`). The file is
@@ -200,6 +202,8 @@ pub struct Inputs<'a> {
     pub sysusers: &'a Path,
     /// The tmpfiles.d file.
     pub tmpfiles: &'a Path,
+    /// The needrestart drop-in.
+    pub needrestart: &'a Path,
     /// The platform the binary was built for.
     pub platform: Platform,
     /// The package version.
@@ -274,6 +278,8 @@ pub struct Sources<'a> {
     pub sysusers: &'a Path,
     /// The tmpfiles.d file.
     pub tmpfiles: &'a Path,
+    /// The needrestart drop-in.
+    pub needrestart: &'a Path,
 }
 
 /// What is wrong with the version and the platform of `i`.
@@ -331,6 +337,7 @@ pub fn plan(i: &Inputs) -> Result<Vec<Entry>, Error> {
         trust: i.trust,
         sysusers: i.sysusers,
         tmpfiles: i.tmpfiles,
+        needrestart: i.needrestart,
     };
     entries(&sources, problems)
 }
@@ -349,6 +356,12 @@ fn entries(i: &Sources, mut problems: Vec<String>) -> Result<Vec<Entry>, Error> 
         file(BINARY_PATH.to_owned(), 0o755, i.binary, &mut problems),
         file(SYSUSERS_PATH.to_owned(), 0o644, i.sysusers, &mut problems),
         file(TMPFILES_PATH.to_owned(), 0o644, i.tmpfiles, &mut problems),
+        file(
+            NEEDRESTART_PATH.to_owned(),
+            0o644,
+            i.needrestart,
+            &mut problems,
+        ),
         dir(SHARE_DIR),
         dir(TRUST_DIR),
     ];
@@ -442,6 +455,10 @@ pub fn config(package: Package, entries: &[Entry], platform: Platform, version: 
             out.push_str(&format!("    src: {}\n", quoted(&e.src.to_string_lossy())));
         } else {
             out.push_str("    type: \"dir\"\n");
+        }
+        // Under /etc a file is configuration: an upgrade keeps the host's edits.
+        if e.dst.starts_with("/etc/") {
+            out.push_str("    type: \"config|noreplace\"\n");
         }
         out.push_str(&format!(
             "    file_info: {{mode: 0{:o}, owner: root, group: root}}\n",

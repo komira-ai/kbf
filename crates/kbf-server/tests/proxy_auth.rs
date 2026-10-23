@@ -110,7 +110,7 @@ fn an_owner_only_file_of_32_bytes_is_the_secret() {
 /// Catches: the mode check removed or loosened for the proxy secret (a secret that group or
 /// others can read lets any local user claim to be the proxy).
 ///
-/// Mutant seen red: `owner_only` accepting 0644.
+/// Catches: `owner_only` accepting 0644.
 #[test]
 fn a_secret_file_others_can_reach_is_refused() {
     for mode in [0o644, 0o640, 0o604, 0o660, 0o700, 0o4600] {
@@ -148,7 +148,7 @@ fn a_file_that_is_not_32_bytes_is_refused() {
 /// whole 64 digits, lower case): none, a truncation, an extension, upper case, the raw
 /// bytes, the bearer scheme.
 ///
-/// Mutant seen red: `admits` as `presented.starts_with(secret)`.
+/// Catches: `admits` as `presented.starts_with(secret)`.
 #[test]
 fn the_secret_is_matched_whole() {
     let secret = ProxySecret::from_file(&file(&SECRET, 0o600)).expect("usable");
@@ -183,7 +183,7 @@ fn proxied_headers() -> HeaderMap {
 /// secret, or with a wrong one, is `Unverified` whatever identity it claims, and only
 /// loopback with the secret is `Proxied` with the identity named.
 ///
-/// Mutants seen red: the headers believed without the secret check; believed from a
+/// Catches: the headers believed without the secret check; believed from a
 /// non-loopback peer (192.0.2.10); no refusal of an unknown peer.
 #[test]
 fn only_loopback_with_the_secret_is_believed() {
@@ -299,7 +299,7 @@ fn the_identity_is_the_node_and_the_role_or_it_is_refused() {
 /// port, a repeated address, a non-canonical spelling (leading zeros, uncompressed IPv6),
 /// more than 16 addresses, a repeated header, bytes that are not ASCII.
 ///
-/// Mutants seen red: a malformed element skipped; a repeated header read as its first
+/// Catches: a malformed element skipped; a repeated header read as its first
 /// value; the count unbounded; non-canonical spellings accepted; a duplicate kept.
 #[test]
 fn the_leafs_ips_are_a_list_of_canonical_addresses_or_the_call_is_refused() {
@@ -389,7 +389,7 @@ fn the_leafs_ips_are_a_list_of_canonical_addresses_or_the_call_is_refused() {
 /// peer with a wrong, empty or absent secret it is `Unverified` (a malformed value included:
 /// the header is not read at all), with no addresses in it.
 ///
-/// Mutants seen red: the header read before the secret is checked; the secret check skipped
+/// Catches: the header read before the secret is checked; the secret check skipped
 /// when the header is present; the loopback check skipped when it is present.
 #[test]
 fn the_leafs_ips_are_believed_only_from_loopback_with_the_secret() {
@@ -438,7 +438,7 @@ fn a_refusal_has_its_grpc_code() {
 /// Catches: `x-kbf-*` headers left in place (a handler could read one), or a header that
 /// merely looks like one removed (`x-kbf` alone, `kbf-map-generation`, `x-kbfx`).
 ///
-/// Mutant seen red: no strip.
+/// Catches: no strip.
 #[test]
 fn strip_removes_every_reserved_header_and_no_other() {
     let mut map = headers(&[
@@ -534,7 +534,7 @@ fn grpc_status(response: &http::Response<String>) -> Option<&str> {
 /// gRPC status), and an identity or trust that reaches the service wrongly: every call
 /// reaches it with every `x-kbf-*` header gone, and with the trust the decision gave.
 ///
-/// Mutants seen red: headers not stripped from an unverified request; a non-loopback peer
+/// Catches: headers not stripped from an unverified request; a non-loopback peer
 /// let through.
 #[tokio::test]
 async fn the_grpc_layer_applies_the_decision_and_strips_the_headers() {
@@ -644,7 +644,7 @@ fn gated(caller: &Caller, with_token: bool) -> Result<(), StatusCode> {
 /// secret when a proxy is configured, or a proxied call from a remote address; and, with
 /// no proxy, any change from the loopback-and-token rule.
 ///
-/// Mutants seen red: a proxied request admitted without the token; an unverified loopback
+/// Catches: a proxied request admitted without the token; an unverified loopback
 /// request admitted.
 #[test]
 fn a_write_through_the_proxy_needs_the_token_and_the_secret() {
@@ -727,7 +727,7 @@ async fn call(router: &mut Router, peer: Option<&str>, h: &HeaderMap) -> (Status
 /// otherwise, `Direct` with no proxy; a handler behind no layer and a connection with no
 /// address rejected by the extractor itself.
 ///
-/// Mutant seen red: a non-loopback peer let through.
+/// Catches: a non-loopback peer let through.
 #[tokio::test]
 async fn the_http_layer_applies_the_decision() {
     let mut proxied = echo(Some(secret()), true);
@@ -790,7 +790,7 @@ fn args(extra: &[&str]) -> Args {
 /// not turned into a proxy: the message names the flag, the path and the mode; with a good
 /// file the listeners are behind the proxy and the worker listener needs no TLS flag.
 ///
-/// Mutant seen red: a 0644 secret file accepted.
+/// Catches: a 0644 secret file accepted.
 #[test]
 fn a_secret_file_with_mode_0644_stops_the_start() {
     let open = file(&SECRET, 0o644);
@@ -846,7 +846,7 @@ fn the_deny_list_applies_behind_the_proxy() {
 /// (it fails, rather than warn and go on with no list), and the failure carrying the proxy
 /// secret: the error names the flag, the list path and the line, nothing of the secret.
 ///
-/// Mutant seen red: the `DenyList::open` error dropped (`.and_then(|p| ...ok())`). The `?` on
+/// Catches: the `DenyList::open` error dropped (`.and_then(|p| ...ok())`). The `?` on
 /// `certificate_entries` after it is reached only by a list that goes bad between the two
 /// reads; `tests/identity.rs` covers that call.
 #[test]
@@ -880,7 +880,7 @@ fn a_deny_list_that_cannot_be_read_or_parsed_stops_a_proxied_start_without_the_s
 /// UNAUTHENTICATED), under no admission only the path is checked, and a method the listener
 /// does not serve is refused for a proxy as for a certificate.
 ///
-/// Mutants seen red: the unserved-path check dropped for a proxied call; the open
+/// Catches: the unserved-path check dropped for a proxied call; the open
 /// admission not honoured for one.
 #[test]
 fn the_role_table_judges_a_proxied_call_by_its_forwarded_role() {

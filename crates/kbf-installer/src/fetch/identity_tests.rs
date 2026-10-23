@@ -44,7 +44,7 @@ fn the_identity_survives_framing() {
 /// Catches a decoder that accepts a short section, trailing bytes, an empty section or a blob
 /// over the cap.
 ///
-/// Mutants seen red: the trailing-bytes check removed; the empty-section check removed.
+/// Catches: the trailing-bytes check removed; the empty-section check removed.
 #[test]
 fn a_malformed_blob_is_refused() {
     let good = sample().encode();
@@ -96,7 +96,7 @@ fn a_pem_is_read_only_from_a_plain_file_of_a_sane_size() {
 ///
 /// Catches the open following a link.
 ///
-/// Mutant seen red: `O_NOFOLLOW` left out of `read_pem`.
+/// Catches: `O_NOFOLLOW` left out of `read_pem`.
 #[test]
 fn a_linked_pem_is_not_followed() {
     let dir = scratch_dir("identity-link");
@@ -196,7 +196,7 @@ fn a_file_that_fails_to_read_is_refused() {
 /// Catches a path walked through a link in a directory component (only the last component was
 /// checked), and a plain path refused with it.
 ///
-/// Mutant: `NO_SYMLINKS` left out of the resolve flags of `read_pem`.
+/// Catches: `NO_SYMLINKS` left out of the resolve flags of `read_pem`.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_pem_behind_a_linked_directory_is_not_followed() {
@@ -219,7 +219,7 @@ fn a_pem_behind_a_linked_directory_is_not_followed() {
 ///
 /// Catches the link count not asked.
 ///
-/// Mutant: the `nlink` check removed from `read_pem`.
+/// Catches: the `nlink` check removed from `read_pem`.
 #[test]
 fn a_pem_with_another_name_is_refused() {
     let dir = scratch_dir("identity-hardlink");
@@ -243,7 +243,7 @@ fn a_pem_with_another_name_is_refused() {
 ///
 /// Catches a relative path opened (this crate's own manifest is a readable file of a sane size).
 ///
-/// Mutant: the absolute-path check removed from `read_pem`.
+/// Catches: the absolute-path check removed from `read_pem`.
 #[test]
 fn a_relative_path_is_refused() {
     assert!(
@@ -265,7 +265,7 @@ fn a_relative_path_is_refused() {
 /// fallback that follows a final link, and a fallback taken for a real refusal (the old way would
 /// then open a file the resolving open refused).
 ///
-/// Mutants: `PERM` dropped from the fallback's errors; the fallback taken for every error.
+/// Catches: `PERM` dropped from the fallback's errors; the fallback taken for every error.
 #[cfg(target_os = "linux")]
 #[test]
 fn without_the_resolving_open_the_last_component_is_still_not_followed() {

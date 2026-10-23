@@ -415,7 +415,7 @@ async fn closing_ends_open_streams_unavailable() {
 /// recover a broken Execute stream, so every action in flight would fail) instead of
 /// leaving them open until their action is done; a drain that lets a new Execute in;
 /// and a drain that refuses a WaitExecution on an operation still running. The
-/// planted mutant is `Closer::drain` closing: the open stream then ends UNAVAILABLE
+/// The defect is `Closer::drain` closing: the open stream then ends UNAVAILABLE
 /// at its first read after the drain.
 #[tokio::test]
 async fn a_drain_keeps_open_streams_and_refuses_new_executes() {
@@ -502,7 +502,7 @@ impl Dispatch for Gated {
 /// drain, so its stream is kept until its action is done, like every stream open at the
 /// drain (kbf#791: Buck2 does not recover a stream that breaks). The
 /// drain begins, and the next Execute is refused, while the first is inside `submit`.
-/// Mutant: a second `closing.draining()` check after `submit` (returning UNAVAILABLE)
+/// Catches: a second `closing.draining()` check after `submit` (returning UNAVAILABLE)
 /// fails the first `expect` below. `Dispatch::submit` is synchronous, so the test needs
 /// a thread for the blocked handler and one for itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -555,7 +555,7 @@ async fn a_drain_that_begins_during_submit_keeps_the_stream() {
 /// was taken (a cache hit is one), or counting a WaitExecution; and
 /// `kbf_front_open_executions` not following the streams a client holds over the wire
 /// (a WaitExecution counts, one the client drops lowers it) or missing from `/metrics`.
-/// Mutants: the counter raised before the drain check; raised in `wait_execution`.
+/// Catches: the counter raised before the drain check; raised in `wait_execution`.
 #[tokio::test]
 async fn started_counts_the_executes_taken_and_open_executions_follows_the_streams() {
     let script = Arc::new(Script::default());

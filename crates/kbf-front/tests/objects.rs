@@ -348,7 +348,7 @@ async fn a_blob_too_large_to_share_a_segment_is_a_segment_of_one_record() {
 
 /// Catches: a whole-blob read that keeps only the first window of a blob over one
 /// window (`READ_WINDOW_BYTES`, 8 MiB) or joins the windows out of order, over a cache
-/// with no write tier: a 9 MiB blob of distinct bytes comes back whole. Mutant:
+/// with no write tier: a 9 MiB blob of distinct bytes comes back whole. Catches:
 /// `gather` answering its first window.
 #[tokio::test]
 async fn a_whole_read_of_a_blob_over_one_window_comes_back_whole() {

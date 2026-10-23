@@ -379,7 +379,7 @@ async fn the_half_with_a_ram_budget_writes_what_it_holds_when_it_stops() {
 /// put through the handle is acknowledged from the open block of the half's write tier,
 /// which the flusher seals only 30 s after it opened, so the cold store holds none of its
 /// bytes until the stop and holds them when `serve` returns, with no RAM budget set.
-/// Mutants: the half's assembly leaves out `ram.after(..)`; the stop flushes only when
+/// Catches: the half's assembly leaves out `ram.after(..)`; the stop flushes only when
 /// `--ram-ack-bytes` is set.
 #[tokio::test]
 async fn the_half_with_a_hot_store_flushes_what_it_staged_when_it_stops() {

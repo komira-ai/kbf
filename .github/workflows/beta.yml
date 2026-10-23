@@ -1,19 +1,25 @@
 # Everything the pull-request gate (ci.yml: lint, and test on the fast set) leaves out, run
-# on a push to main and never on a pull request: the whole nextest run
+# on a push to main as the third stage of the one pipeline (pipeline.yml calls this workflow,
+# `workflow_call`, after ci and artifacts) and never on a pull request: the whole nextest run
 # with its slow tests, the Arm run, the jobs that need a service or a root or a Mac
 # (Postgres, S3 stores, crun, the M1, M2, cross-version and mixed-version cells, macOS), the Linux
 # packages, and the beta smoke below. The stage lint
-# (crates/kbf-integration-test/tests/workflows/stages.rs) allows `push` only.
+# (crates/kbf-integration-test/tests/workflows/stages.rs) allows `workflow_call` only.
 #
 # The beta smoke is a whole farm of real kbf processes (a frontend, three storage nodes, two
 # daemons; Buck2 dials the frontend's REAPI port) under real Buck2 builds, for five minutes,
 # on a hosted runner (docs/design/kbf-cicd.md, sections 3 and 4; scenario B0,
 # `farm_under_build_load`, crates/kbf-harness). It fails on one failed build, one failed
 # action, one lost blob, a process that exits, or a hang, and it writes `beta-result.json`.
-# It builds its own binaries and so is not an attested run: the result says
-# `"attested": false`. The full run of the design, on the attested bytes of artifacts.yml
-# with the update and kill scenarios, is later work; the job that attests its result is not
-# here either, so this workflow holds no `id-token` or `attestations` permission.
+# The `kbf` of the farm is the one in the linux-x86_64 tarball the artifacts stage built and
+# attested earlier in this same run (downloaded from the run, checked against its SHA256SUMS
+# and for the commit and a release build); the release that follows publishes those same
+# files. Only the driver (`kbf-beta`) and the program the sample project's actions run
+# (`kbf-m2-act`) are built here. The result document records no set hash and says
+# `"attested": false`; the full run of the design, with the update and kill scenarios, is later
+# work, and the job that attests its result is not here either, so this workflow holds no
+# `id-token` or `attestations` permission. The other jobs test the commit's source: they
+# build what they run.
 #
 # There is no Envoy in the farm (the no-Envoy ruling): B0 moves behind the kbf-installer's
 # proxy in a later change.
@@ -26,22 +32,12 @@
 name: beta
 
 on:
-  push:
-    branches: [main]
+  workflow_call:
 
 permissions: {}
 
-# One beta run at a time in the whole repository. GitHub
-# keeps at most one running and one pending run per concurrency group: a run queued while
-# another runs waits as pending, and a newer pending run replaces (cancels) the older
-# pending one, so the newest push waits its turn and a run in progress is never cancelled
-# (docs.github.com, "Control the concurrency of workflows and jobs": "any previously pending
-# job or workflow in the concurrency group will be canceled"; a running one is cancelled only
-# with `cancel-in-progress: true`). A pending run that is replaced is "not run", never
-# "passed".
-concurrency:
-  group: beta
-  cancel-in-progress: false
+# No concurrency group: a superseded push is cancelled by the pipeline's group (pipeline.yml),
+# whose run this workflow is a part of.
 
 env:
   CARGO_TERM_COLOR: always
@@ -76,14 +72,34 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      # kbf (every role of the farm), kbf-beta (the scenario) and kbf-m2-act (the program
-      # the sample project's actions run, as plain processes: no container runtime here).
-      - run: cargo build -p kbf-cli -p kbf-harness -p kbf-integration-test --bins --locked
+      # kbf-beta (the scenario) and kbf-m2-act (the program the sample project's actions run,
+      # as plain processes: no container runtime here). The kbf of the farm is not built here.
+      - run: cargo build -p kbf-harness -p kbf-integration-test --bins --locked
+      # The files of the artifacts stage of this run (no run id: the same run), not rebuilt.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: assets-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sha256sums
+          path: dist
+      - name: Every file is the one SHA256SUMS lists
+        run: cargo xtask verify-assets sums dist
+      - name: The kbf in the tarball names this commit and a release build
+        run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" "$GITHUB_SHA"
+      - name: The farm's bin directory
+        run: mkdir -p "$RUNNER_TEMP/bin"
+      - name: The farm's kbf, out of the tarball
+        run: tar -xzf "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" -C "$RUNNER_TEMP/bin" kbf
+      - name: The program the sample project's actions run, built here
+        run: cp target/debug/kbf-m2-act "$RUNNER_TEMP/bin/kbf-m2-act"
       - name: Fetch buck2 (pinned version, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst" --sha256 "$BUCK2_SHA256" --out "$RUNNER_TEMP/tools/buck2" --extract zst
       - run: $RUNNER_TEMP/tools/buck2 --version
       - name: B0, the farm under build load
-        run: target/debug/kbf-beta b0 --bin-dir target/debug --buck2 "$RUNNER_TEMP/tools/buck2" --project crates/kbf-integration-test/beta/buck2 --work "$RUNNER_TEMP/beta" --duration-secs 300 --concurrency 4 --summary "$GITHUB_STEP_SUMMARY"
+        run: target/debug/kbf-beta b0 --bin-dir "$RUNNER_TEMP/bin" --buck2 "$RUNNER_TEMP/tools/buck2" --project crates/kbf-integration-test/beta/buck2 --work "$RUNNER_TEMP/beta" --duration-secs 300 --concurrency 4 --summary "$GITHUB_STEP_SUMMARY"
       # The process logs, the scraped series, every build's console output and event log,
       # and the result document, kept 90 days whether the run passed or not; a re-run of
       # the same commit keeps its own (the attempt is in the name).
@@ -113,7 +129,19 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
+    # The throwaway Postgres server of ci.yml's test job (same image and settings): the default
+    # profile runs the tests that need one, each on a database or a schema of its own.
+    services:
+      postgres:
+        image: postgres@sha256:2a0d0fe14825b0939f78a8cad5cd4e6aa68bf94d0e5dd96e24b6d23af4315545
+        env:
+          POSTGRES_PASSWORD: kbf-ci-throwaway
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
     env:
+      KBF_TEST_POSTGRES_URL: postgres://postgres:kbf-ci-throwaway@127.0.0.1:5432/postgres
       # The GitHub CLI release a host pins to check a release's build attestation offline
       # (crates/kbf-installer/tests/real_gh.rs); the sha256 is the release's checksums file.
       GH_VERSION: 2.102.0
@@ -187,8 +215,18 @@ jobs:
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
-    # As test-x86; the sha256 is the release's aarch64 archive.
+    # As test-x86, with its Postgres service; the sha256 is the release's aarch64 archive.
+    services:
+      postgres:
+        image: postgres@sha256:2a0d0fe14825b0939f78a8cad5cd4e6aa68bf94d0e5dd96e24b6d23af4315545
+        env:
+          POSTGRES_PASSWORD: kbf-ci-throwaway
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
     env:
+      KBF_TEST_POSTGRES_URL: postgres://postgres:kbf-ci-throwaway@127.0.0.1:5432/postgres
       NEXTEST_VERSION: 0.9.146
       NEXTEST_SHA256: b2e33d7c72de7ade0ff7b3a948ac37516b24f8a836b7a8870c1f634a94be9de9
     steps:
@@ -224,9 +262,10 @@ jobs:
   # reject, the startup refusal of a server that does not flush commits, and the claim
   # path (crates/kbf-state/tests/postgres_conformance.rs), then the server over it
   # (crates/kbf-server/tests/state_store_postgres.rs and the `over_postgres` restart tests).
-  # kbf-server enables the feature, so the workspace jobs build and lint it too; they run
-  # none of the tests that need a server. The password is a throwaway for this container,
-  # which lives only for this job.
+  # The workspace jobs (test-x86, test-arm and ci.yml's test) run these tests too, each on a
+  # server of their own; this job is kept because release/stages.yml lists it as a gate, and
+  # it clippy-lints kbf-state with its feature on. The password is a throwaway for this
+  # container, which lives only for this job.
   state-postgres:
     runs-on: ubuntu-latest
     permissions:
@@ -271,8 +310,9 @@ jobs:
       - run: cargo test -p kbf-server --locked --test frontend -- --include-ignored two_children::fifty_builds_across_a_takeover_over_postgres
       # A frontend process started with a Postgres --state-store reaches /readyz.
       - run: cargo test -p kbf-cli --locked --test frontend_process -- --include-ignored postgres_state_store
-      # `kbf boot-check`, the schema step a unit runs before it starts kbf, over a real server.
-      - run: cargo test -p kbf-cli --locked --test boot_check_postgres -- --include-ignored
+      # The cutover tool copies a SQLite state file into an empty database made for each test
+      # (crates/kbf-state-copy/tests/postgres_copy.rs).
+      - run: cargo test -p kbf-state-copy --locked -- --include-ignored
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
@@ -495,7 +535,9 @@ jobs:
       - run: uname -m
       - run: sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
       - run: cargo build -p kbf-node --bin kbf-daemon --locked
-      - run: cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node -p kbf-testkit --locked
+      # Not the tests named `database::` (crates/kbf-testkit/tests/database.rs): they make
+      # databases on a Postgres server, which a hosted Mac has not.
+      - run: 'cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node -p kbf-testkit --locked -- --skip database::'
       # `kbf daemon --driver native` started with the words the Mac's launchd unit
       # writes, against a fake front, and the helpers it re-runs itself as (each action's
       # keeper, the lease-user pool's `as-user` step) through the `kbf` binary
@@ -519,7 +561,11 @@ jobs:
       # The host installer's layout, offline attestation check and stage, compiled and run
       # on the platform they name, and the pinned gh for darwin-arm64 against a real
       # attestation (crates/kbf-installer, docs/deploy/host-releases.md).
-      - run: cargo test -p kbf-installer --locked
+      # Not the tests that need a Postgres server (a hosted Mac has none, and they fail, not
+      # skip, without one; the Linux jobs run them): those in a module named `database` (skipped
+      # by `::database::`), the `provisioned` module of database_tests.rs, and the three
+      # tests of that file and the one of setup/more_tests.rs that use `TestDatabase`.
+      - run: 'cargo test -p kbf-installer --locked -- --skip ::database:: --skip database::tests::provisioned:: --skip database::tests::setup_creates_the_schema_once --skip database::tests::the_update_step_migrates --skip database::tests::the_bounded_step_gives_up --skip setup_creates_the_schema_over_a_real_server'
       - name: Fetch gh (pinned release, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_macOS_arm64.zip" --sha256 "$GH_SHA256" --out "$RUNNER_TEMP/tools/gh" --extract zip --member "gh_${GH_VERSION}_macOS_arm64/bin/gh"
       - name: The pinned gh verifies a real attestation offline
@@ -547,6 +593,13 @@ jobs:
       # Mac cannot list afterwards; a process that ignores SIGTERM is named in the lease's
       # stderr (crates/kbf-driver-native/tests/slot_term.rs).
       - run: cargo xtask sudo-test -p kbf-driver-native --test slot_term -- --test-threads=1 --nocapture
+      # The GPU under the slot profile (crates/kbf-driver-native/tests/slot_gpu.rs): a pool user
+      # finds a Metal device, compiles a kernel at run time and runs it on the GPU, and each
+      # deny that takes the GPU away (`iokit-open`, the Metal compiler service) fails the
+      # probe at its step. This runner is a virtual machine with a paravirtual GPU, not a
+      # farm Mac: a pass shows the profile leaves the Metal path open, not a real GPU's
+      # speed or family.
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_gpu -- --test-threads=1 --nocapture
       # What this runner can do for the Mac legs of the isolation suites (T018, M0; a spike that
       # asserts nothing about isolation): two pool users made with dscl, the real `kbf daemon
       # --driver native --pool-users 2` as root behind a fake front, one action per question
@@ -578,6 +631,26 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  # The assertion that a pool user holds nothing a lease left (crates/kbf-driver-native/
+  # tests/slot_assert.rs), in a job of its own because native-macos is close to its limit:
+  # the baseline recorded at the start, and each probe seeing the state planted for it
+  # (a process, a launchd job, a semaphore, an attached image, a file in the home, a file
+  # in /private/tmp, a cron job) and green again after the clean. One test at a time: they
+  # make users at free uids.
+  native-macos-assert:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_assert -- --test-threads=1 --nocapture
 
   # kbf-installer on a Mac as a user gets it (contract docs/design/kbf-installer.md section
   # 7): the `.pkg` built by `cargo xtask pkg build` (a stub stands in for the binary until
@@ -657,7 +730,7 @@ jobs:
       - name: Fetch nfpm (pinned version, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" --sha256 "$NFPM_SHA256" --out "$RUNNER_TEMP/tools/nfpm" --extract tar.gz --member nfpm
       - name: Write the nfpm configuration
-        run: cargo xtask pkg-config --binary target/debug/kbf-installer-stub --kbf target/debug/kbf-installer-stub --units packaging/linux/units --trust packaging/linux/testdata/trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --platform linux-x86_64 --version 0.0.0+ci --out target/pkg
+        run: cargo xtask pkg-config --binary target/debug/kbf-installer-stub --kbf target/debug/kbf-installer-stub --units packaging/linux/units --trust packaging/linux/testdata/trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --platform linux-x86_64 --version 0.0.0+ci --out target/pkg
       - name: Build the deb and the rpm of kbf-installer, each twice
         run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/nfpm.yaml --out target/pkg/out
       - name: Build the deb and the rpm of kbf, each twice
@@ -803,11 +876,15 @@ jobs:
   # docs/design/kbf-cicd.md, N/N-1 compatibility in CI): real kbf processes of the tip (N) and of
   # the release before this commit (N-1) in one farm, a frontend of one version over the nodes and
   # the daemon of the other both ways, two storage nodes of different versions replicating to each
-  # other, and a loaded node restarted under the other version. N-1 is not built here: `cargo xtask
-  # release fetch-previous` downloads the previous release's assets, verifies them as a deployment
-  # does (SHA256SUMS, one bundle per tarball, provenance and SBOM attestations, the bundles again
-  # offline against the Sigstore trusted root) and only then unpacks its `kbf` into
-  # target/tmp/n-1, where the test looks for it. This is a push job and not a pull-request job: it
+  # other, a loaded node restarted under the other version, and (every format changes additively)
+  # each storage node of a farm of one version stopped and started again as the other on the files
+  # it had, so that N-1 starts on the data N wrote and N on the data N-1 wrote
+  # (`n_minus_1_restarts_on_data_n_wrote`, `n_restarts_on_data_n_minus_1_wrote`). N-1 is not built
+  # here: `cargo xtask release fetch-previous` downloads the previous release's assets, verifies
+  # them as a deployment does (SHA256SUMS, one bundle per tarball, provenance and SBOM
+  # attestations, the bundles again offline against the Sigstore trusted root) and only then
+  # unpacks its `kbf` into target/tmp/n-1, where the test looks for it. This is a push job and
+  # not a pull-request job: it
   # needs the token's attestations scope and GitHub's release API, a pull request from a fork has
   # neither, and the farm takes minutes. A release is cut only from a commit whose beta run
   # succeeded (release.yml, `gates`), so a break in N/N-1 stops the release it would ship in.
@@ -858,7 +935,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: cargo xtask release fetch-previous --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --platform linux-x86_64 --binary kbf --out target/tmp/n-1 --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --output target/n-1.source
       # One test at a time: each starts a farm of its own, and the output says what each did (or
-      # that it was skipped).
+      # that it was skipped). The two N/N-1 data-restart tests are among them, run by this same
+      # command.
       - name: The farm of N and N-1
         run: cargo test -p kbf-integration-test --test mixed_version --locked -- --test-threads=1 --nocapture
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

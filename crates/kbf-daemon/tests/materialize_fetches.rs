@@ -102,7 +102,7 @@ fn file(name: String, digest: Digest, is_executable: bool) -> FileNode {
 /// thousands of small files took about 14 minutes per lease, the CAS idle), and a
 /// walk with no bound, or one of its own rather than the CAS's (a tree of a million
 /// files would queue a million requests). The files are all in the root, which is
-/// fetched alone first, so what is counted is the file fetches. Mutants seen red: the
+/// fetched alone first, so what is counted is the file fetches. Catches: the
 /// file fetches given a bound of 1; no bound (`usize::MAX`).
 #[tokio::test]
 async fn many_blobs_are_fetched_at_once_within_the_bound() {
@@ -130,7 +130,7 @@ async fn many_blobs_are_fetched_at_once_within_the_bound() {
 /// same small files in many places), a Directory fetched once per place it appears,
 /// and the copies written from the one fetch sharing an inode (a write to one would
 /// change the others, and the executable bit is per copy).
-/// Mutant seen red: the files grouped by path rather than by digest.
+/// Catches: the files grouped by path rather than by digest.
 #[tokio::test]
 async fn a_digest_named_many_times_is_fetched_once() {
     let cas = CountingCas::default();
@@ -178,7 +178,7 @@ async fn a_digest_named_many_times_is_fetched_once() {
 /// the failure, whatever the order the blocking pool creates their files in. Exactly
 /// the root and those `BOUND` blobs are read: no other blob may start. Without the hold
 /// a sibling could finish before the missing blob's file was created and let one more
-/// start before the failure (kbf#676). Mutants seen red: the check that
+/// start before the failure (kbf#676). Catches: the check that
 /// a blob failed removed (201 reads); the hold replaced by the missing read waiting for
 /// `BOUND + 1` present reads, the schedule of #676 (more than `1 + BOUND` reads).
 #[tokio::test]
@@ -299,8 +299,8 @@ fn listing(dir: &Path) -> Vec<(String, u64)> {
 /// queued on tokio's blocking pool: dropping a `tokio::fs` future does not stop the
 /// call, so the file's bytes would appear after the error, while the caller clears the
 /// lease directory. Here the write of `held` is queued behind a blocked pool thread when
-/// `failing` fails; `materialize` must not return before the write ran. Mutant seen
-/// red: the first error returned at once (the `try_for_each` drain this replaced).
+/// `failing` fails; `materialize` must not return before the write ran. Catches:
+///  the first error returned at once (the `try_for_each` drain this replaced).
 #[test]
 fn no_file_appears_after_materialize_failed() {
     let runtime = tokio::runtime::Builder::new_current_thread()

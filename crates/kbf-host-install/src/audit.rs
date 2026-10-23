@@ -24,14 +24,19 @@ pub const MAX_RAW_CHARS: usize = 200;
 pub struct Entry {
     /// RFC 3339, UTC.
     pub time: String,
-    /// `install` or `query`; none when the request was not understood.
+    /// `install`, `query` or `apply` (the Mac's apply job); none when the request was not understood.
     pub verb: Option<&'static str>,
     pub version: Option<String>,
     pub channel: Option<String>,
-    /// `installed`, `already_installed`, `query`, `refused` or `failed`.
+    /// `installed`, `already_installed`, `apply_started`, `applied` (the end of an apply job),
+    /// `query`, `refused` or `failed`.
     pub outcome: &'static str,
     /// The closed reason code of a refusal or a failure.
     pub reason: Option<&'static str>,
+    /// What became of an apply job (`done`, `failed:<reason>[:<what became of the old
+    /// release>]`, the status file's line), only on the line the job appends when it ends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
     /// The request as received, only when it was not understood.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,

@@ -145,7 +145,7 @@ mod tests {
 
     /// Catches a gate that opens, or wakes a waiter, before the unlock has run: at the
     /// moment `unlock` runs, the gate is shut and a registered waiter is not woken; after
-    /// `release` both have happened. Mutant: `release` opens and notifies before `unlock`.
+    /// `release` both have happened. Catches: `release` opens and notifies before `unlock`.
     #[tokio::test(start_paused = true)]
     async fn the_gate_opens_after_the_unlock() {
         let holder = Arc::new(());
@@ -167,7 +167,7 @@ mod tests {
 
     /// Catches a wait that registers after its check: a release that lands between the
     /// two is then never seen and the wait runs to its limit. The seam opens the gate
-    /// exactly there, so the answer does not depend on a race. Mutant: `enable()` and the
+    /// exactly there, so the answer does not depend on a race. Catches: `enable()` and the
     /// `notified()` it enables moved below `between()`.
     #[tokio::test(start_paused = true)]
     async fn a_release_between_the_check_and_the_wait_is_not_lost() {
@@ -197,7 +197,7 @@ mod tests {
 
     /// Catches a wait that returns on any wake: one that finds the gate shut (a wake sent
     /// before the unlock, or by anything else) goes back to sleep, and the release that
-    /// follows ends it. Mutant: the loop is gone and the first wake returns.
+    /// follows ends it. Catches: the loop is gone and the first wake returns.
     #[tokio::test(start_paused = true)]
     async fn a_wake_with_the_gate_shut_is_not_a_release() {
         let holder = Arc::new(());

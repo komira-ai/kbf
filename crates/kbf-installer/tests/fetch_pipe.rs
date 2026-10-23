@@ -97,7 +97,7 @@ fn the_bytes_are_written_counted_and_hashed() {
 /// Catches the parent reading on past the declared size (the fetch would end at the whole
 /// time cap with `TimedOut`, and the file would grow) and a child left running.
 ///
-/// Mutant seen red: the `count > caps.size` return replaced by `continue`.
+/// Catches: the `count > caps.size` return replaced by `continue`.
 #[test]
 fn a_source_that_sends_too_much_is_killed_and_refused() {
     let mut caps = caps(1000);
@@ -130,7 +130,7 @@ fn the_killed_child_is_gone() {
 ///
 /// Catches the quiet limit not being applied (the fetch would sit until the whole limit).
 ///
-/// Mutant seen red: `quiet` stretched a thousandfold in the pipe's deadline.
+/// Catches: `quiet` stretched a thousandfold in the pipe's deadline.
 #[test]
 fn a_stalled_child_is_killed_at_the_no_byte_limit() {
     let mut caps = caps(10);
@@ -213,7 +213,7 @@ fn a_child_that_will_not_close_after_all_the_bytes_is_judged_on_them() {
 /// Catches standard error not being read (the child stalls, the fetch fails), and a log
 /// without a bound.
 ///
-/// Mutant seen red: the `capture` of standard error left out.
+/// Catches: the `capture` of standard error left out.
 #[test]
 fn standard_error_is_drained_and_kept_to_four_kib() {
     let mut caps = caps(5);
@@ -231,7 +231,7 @@ fn standard_error_is_drained_and_kept_to_four_kib() {
 /// Catches a child that inherits the root parent's environment, a descriptor (the lent key,
 /// the download file) or the ability to write files.
 ///
-/// Mutants seen red: each of `RLIMIT_FSIZE`, `RLIMIT_NOFILE` and `no_new_privs` left out.
+/// Catches: each of `RLIMIT_FSIZE`, `RLIMIT_NOFILE` and `no_new_privs` left out.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_child_is_confined() {
@@ -277,7 +277,7 @@ fn a_child_that_cannot_start_is_a_spawn_error() {
 /// reading the source. (The parent here is a throwaway process: this test binary, started
 /// again with a marker in its environment.)
 ///
-/// Mutant seen red: `PR_SET_PDEATHSIG` left out.
+/// Catches: `PR_SET_PDEATHSIG` left out.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_child_dies_with_its_parent() {
@@ -321,7 +321,7 @@ fn the_child_dies_with_its_parent() {
 /// Catches a lent descriptor that is closed on exec (the child gets nothing), one positioned
 /// at its end, and a leaked one.
 ///
-/// Mutant seen red: the `fcntl(fd, F_SETFD, 0)` in `before_exec_confined` removed.
+/// Catches: the `fcntl(fd, F_SETFD, 0)` in `before_exec_confined` removed.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_lent_descriptor_reaches_the_child_and_no_other_does() {
@@ -381,7 +381,7 @@ fn run_up_to(ops: &[&str], caps: Caps) -> (Result<Received, PipeFault>, Vec<u8>)
 /// Catches a reader that still wants the cap's worth of bytes (a short description would be a
 /// short read).
 ///
-/// Mutant: `Length::UpTo` read as `Exactly` (red: a "short body" for three bytes of ten).
+/// Catches: `Length::UpTo` read as `Exactly` (red: a "short body" for three bytes of ten).
 #[test]
 fn undeclared_output_is_taken_whole_up_to_the_cap() {
     let (got, out) = run_up_to(&["emit:abc"], caps(10));
@@ -401,7 +401,7 @@ fn undeclared_output_is_taken_whole_up_to_the_cap() {
 ///
 /// Catches silence taken for an answer (an empty description), and the child's reason lost.
 ///
-/// Mutant: the `count == 0` check removed (red: `Ok` with no bytes).
+/// Catches: the `count == 0` check removed (red: `Ok` with no bytes).
 #[test]
 fn a_child_that_says_nothing_is_a_fault_with_its_words() {
     let (got, out) = run_up_to(&["err:the source is down", "exit:1"], caps(10));
@@ -433,7 +433,7 @@ fn undeclared_output_over_the_cap_is_refused() {
 ///
 /// Catches a truncated description being taken as whole because the child went quiet.
 ///
-/// Mutant: the early completion at `count == size` applied to undeclared output (red: `Ok`).
+/// Catches: the early completion at `count == size` applied to undeclared output (red: `Ok`).
 #[test]
 fn undeclared_output_that_does_not_end_is_stalled() {
     let mut caps = caps(3);
@@ -463,7 +463,7 @@ fn undeclared_output_that_does_not_end_is_stalled() {
 /// root helper that built its `ChildSpec` badly (a failed user lookup turned into `None`, or a
 /// user table that says uid 0) from running the child as root with only the limits left.
 ///
-/// Mutant: the `refuse_root` call removed from `receive` (the start then fails as a `Spawn`
+/// Catches: the `refuse_root` call removed from `receive` (the start then fails as a `Spawn`
 /// error, or, run as root, succeeds).
 #[test]
 fn a_child_named_as_root_is_not_started() {
@@ -487,7 +487,7 @@ fn a_child_named_as_root_is_not_started() {
 /// Catches the refusal placed in `receive` alone, which would leave the description's child to
 /// be started as root by a caller that named none.
 ///
-/// Mutant: the `refuse_root` call moved out of the shared reader into `receive` (red).
+/// Catches: the `refuse_root` call moved out of the shared reader into `receive` (red).
 #[test]
 fn a_description_child_named_as_root_is_not_started() {
     for (uid, gid) in [(0, 0), (0, 5), (5, 0)] {
