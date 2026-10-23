@@ -223,7 +223,7 @@ async fn corrupt(cache: &MemoryCache, digest: Digest) {
     objects.put_new(&key, bytes, None).await.expect("put");
 }
 
-/// Catches (mutant "skip verification": the cache's read serves the store's bytes
+/// Catches (defect "skip verification": the cache's read serves the store's bytes
 /// without hashing them): a store returning corrupt bytes answered `200` with those
 /// bytes, here or on a second read.
 #[tokio::test]
@@ -284,7 +284,7 @@ async fn a_byte_range_is_honoured() {
     server.stop().await;
 }
 
-/// Catches (mutant "splice the name raw"): a `name` with a quote, a `;` and
+/// Catches (defect "splice the name raw"): a `name` with a quote, a `;` and
 /// non-ASCII sent other than percent-encoded in `filename*`, so it could end the
 /// value or add a parameter; and `name` lost between the query and the header.
 #[tokio::test]
@@ -318,7 +318,7 @@ fn assert_never_a_page(what: &str, answer: &Answer) {
     );
 }
 
-/// Catches (mutants "drop nosniff", "drop the CSP", "only on attachments", "only on
+/// Catches (defects "drop nosniff", "drop the CSP", "only on attachments", "only on
 /// success"): an answer of the route without `X-Content-Type-Options: nosniff` and
 /// `Content-Security-Policy: sandbox`, so stdout holding HTML could be sniffed or run
 /// as a page on the API's origin. Every kind of answer is asked: inline text, an
@@ -398,7 +398,7 @@ async fn every_answer_carries_nosniff_and_sandbox() {
     }
 }
 
-/// Catches (mutants "no inline limit" and "the limit excluded", `>=` for `>`):
+/// Catches (defects "no inline limit" and "the limit excluded", `>=` for `>`):
 /// `inline=text` serving a blob over 4 MiB, or refusing one of exactly 4 MiB; and the
 /// refusal leaking into the attachment, which serves any size.
 #[tokio::test]
@@ -426,10 +426,10 @@ async fn inline_is_refused_over_4_mib() {
     server.stop().await;
 }
 
-/// Catches (mutant "default allow"): the route answering without a policy file, or
+/// Catches (defect "default allow"): the route answering without a policy file, or
 /// with a policy that names no `blobs.getAuthorizer` (a missing key read as allow, as
 /// every other slot is), and the route not answering once the key is named. And
-/// (mutant "blobs without the pages": the `invocations` check dropped from
+/// (defect "blobs without the pages": the `invocations` check dropped from
 /// `BlobReaders::from_policy`) the route answering with `blobs` named but no
 /// `invocations` key: blobs are what the pages link to, and are off with them
 /// (`docs/design/invocations.md` section 4.3).
@@ -479,7 +479,7 @@ async fn blob_reads_are_off_unless_the_policy_names_their_authorizer() {
     }
 }
 
-/// Catches (mutants "skip the authorizer" and "ask about the empty instance"): a
+/// Catches (defects "skip the authorizer" and "ask about the empty instance"): a
 /// read the authorizer would refuse served anyway, and the authorizer asked about
 /// another instance name than the `instance` parameter (decoded, `/` included).
 #[tokio::test]
@@ -534,7 +534,7 @@ fn days(n: u64) -> FarmTime {
     FarmTime::from_millis(n * 24 * 60 * 60 * 1000)
 }
 
-/// Catches (mutant "read without the touch"): a read over HTTP that does not count
+/// Catches (defect "read without the touch"): a read over HTTP that does not count
 /// as a use, so a log a person is reading is collected at the end of its TTL. A blob
 /// read on day 5 outlives a collection on day 10; its unread neighbour, stored with
 /// it, does not.
@@ -557,7 +557,7 @@ async fn each_read_is_a_touch() {
     server.stop().await;
 }
 
-/// Catches (mutant "authorize after the read"): a caller the authorizer refuses
+/// Catches (defect "authorize after the read"): a caller the authorizer refuses
 /// learning whether a blob is held (`404` for an absent one, `403` for a present one),
 /// or keeping a blob alive by asking for it. Both asks are `403`, and the asked-for
 /// blob is collected on day 10 as if nobody had asked; its neighbour, read on day 5 by

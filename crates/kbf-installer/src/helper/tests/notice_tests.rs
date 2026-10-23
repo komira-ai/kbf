@@ -1,8 +1,8 @@
 //! What the run loop tells of the host's package and its source, each pass, through the real
 //! cycle over a scratch host: `available` in `status.json` when the package's seed is whole
 //! and above the floor of `seq`, `release_source`, and the floor itself (where it starts, when
-//! it rises, what leaves it alone). What each test proves is named on it, with the mutant to
-//! plant to turn it red.
+//! it rises, what leaves it alone). What each test proves is named on it, with the defect that
+//! turns it red.
 //!
 //! The host runs release A, which declares `EARLIER_SEQ`; the package carries the seed of B,
 //! which declares `SEQ`. The seed fetcher is the real one over the package's files, with `gh`
@@ -106,7 +106,7 @@ fn line(seq: u64) -> Option<String> {
 /// state written), a package checked every five seconds, and a host the announcement leaves
 /// changed.
 ///
-/// Mutants to plant: the look made by installing the seed through `pull` (red on the release
+/// Catches: the look made by installing the seed through `pull` (red on the release
 /// installed and on the state); the cache by digest removed (red on `gh` runs).
 #[test]
 fn an_upgrade_is_noticed_and_the_pass_moves_nothing() {
@@ -147,7 +147,7 @@ fn an_upgrade_is_noticed_and_the_pass_moves_nothing() {
 /// Catches `available` written from the manifest alone, which any package can make say
 /// anything.
 ///
-/// Mutants to plant: the announcement made before the checks (red on both cases); the
+/// Catches: the announcement made before the checks (red on both cases); the
 /// complaint said at every pass (red on the second log).
 #[test]
 fn a_seed_nobody_has_checked_is_not_announced_and_the_reason_is_said_once() {
@@ -186,7 +186,7 @@ fn a_seed_nobody_has_checked_is_not_announced_and_the_reason_is_said_once() {
 ///
 /// Catches a package announced never because the first look found it mid-upgrade.
 ///
-/// Mutant to plant: the failure stored as the answer for the manifest's digest.
+/// Catches: the failure stored as the answer for the manifest's digest.
 #[test]
 fn a_seed_that_becomes_whole_is_announced_at_the_next_pass() {
     let flip = |s: &mut Seeded| {
@@ -215,7 +215,7 @@ fn a_seed_that_becomes_whole_is_announced_at_the_next_pass() {
 /// Catches the announcement of a seed the order would refuse, an equal `seq` taken as above, and
 /// a floor lowered to the release that runs.
 ///
-/// Mutants to plant: the floor not consulted; `>` made `>=`; the floor written as the
+/// Catches: the floor not consulted; `>` made `>=`; the floor written as the
 /// running release's `seq`.
 #[test]
 fn a_seed_at_or_below_the_floor_is_not_announced_and_one_above_it_is() {
@@ -242,7 +242,7 @@ fn a_seed_at_or_below_the_floor_is_not_announced_and_one_above_it_is() {
 /// Catches a floor that starts at 0 (an older package than the farm, ordered by whoever can
 /// write the spool, would be installed over it) and an announcement of that package.
 ///
-/// Mutant to plant: the floor started at 0 (the seed is announced and the order installs it).
+/// Catches: the floor started at 0 (the seed is announced and the order installs it).
 #[test]
 fn a_farm_ahead_of_the_package_starts_its_floor_at_the_release_that_runs() {
     let (mut rig, seeded, _) = noticing("notice-ahead", |s| {
@@ -272,7 +272,7 @@ fn a_farm_ahead_of_the_package_starts_its_floor_at_the_release_that_runs() {
 ///
 /// Catches a downgrade by a staged order in the window before the pass's own catch-up.
 ///
-/// Mutant to plant: the catch-up removed from the admission of a staged order (the order is
+/// Catches: the catch-up removed from the admission of a staged order (the order is
 /// admitted for 450 over 100 and the seed is installed).
 #[test]
 fn an_order_is_judged_against_a_floor_caught_up_with_the_release_that_runs() {
@@ -297,7 +297,7 @@ fn an_order_is_judged_against_a_floor_caught_up_with_the_release_that_runs() {
 ///
 /// Catches a look that clears a stage's checks from under it, which fails closed but fails.
 ///
-/// Mutant to plant: the look made in `work/<commit>.check` (the other directory is removed).
+/// Catches: the look made in `work/<commit>.check` (the other directory is removed).
 #[test]
 fn a_look_leaves_the_checks_of_a_stage_alone() {
     let (mut rig, _, _) = noticing("notice-scratch", |_| {});
@@ -319,7 +319,7 @@ fn a_look_leaves_the_checks_of_a_stage_alone() {
 /// Catches a tarball and a `gh` run every five seconds for a package that stays broken, which
 /// holds up the status of the orders behind it.
 ///
-/// Mutants to plant: the wait removed (the second pass runs `gh` again); the wait made for ever
+/// Catches: the wait removed (the second pass runs `gh` again); the wait made for ever
 /// (the third pass does not).
 #[test]
 fn a_package_that_fails_its_look_is_looked_at_again_only_after_a_minute() {
@@ -349,7 +349,7 @@ fn a_package_that_fails_its_look_is_looked_at_again_only_after_a_minute() {
 /// Catches a floor raised at the swap, one never raised once the swap is confirmed (a seed
 /// older than a confirmed release stays orderable), and one lowered by a rollback.
 ///
-/// Mutants to plant: the floor caught up while the swap is on trial (red on the floor of the
+/// Catches: the floor caught up while the swap is on trial (red on the floor of the
 /// trial); the raise at the confirm and the catch-up at the end of the pass both removed (red
 /// on the floor after the confirm; either alone leaves this test green, since the other makes
 /// the same floor); the floor set to the `seq` of the release that runs after a rollback. The
@@ -397,7 +397,7 @@ fn the_floor_rises_at_a_confirm_not_at_a_swap_and_a_rollback_leaves_it() {
 /// Catches a floor raised by the stage (a release staged and dropped would burn the seed) and
 /// one the frontend's confirm never raises.
 ///
-/// Mutants to plant: the floor raised to the `seq` of the release that is staged (red on the
+/// Catches: the floor raised to the `seq` of the release that is staged (red on the
 /// floor after the stage); the raise at the flip and the catch-up at the end of the pass both
 /// removed (red on the floor after the flip). Each of the two alone leaves this test green,
 /// since the other makes the same floor: the raise at the flip alone is the one
@@ -428,7 +428,7 @@ fn a_frontend_flip_raises_the_floor_and_staging_does_not() {
 ///
 /// Catches an unset floor taken for 0 and a seed announced to a host that cannot judge it.
 ///
-/// Mutants to plant: a release with no `seq` taken as `seq` 0 (the floor becomes 0); the
+/// Catches: a release with no `seq` taken as `seq` 0 (the floor becomes 0); the
 /// announcement made when there is no floor.
 #[test]
 fn a_release_that_declares_no_seq_leaves_the_floor_unset_and_nothing_is_announced() {
@@ -449,7 +449,7 @@ fn a_release_that_declares_no_seq_leaves_the_floor_unset_and_nothing_is_announce
 ///
 /// Catches a binary run every five seconds, and a source left out of the status.
 ///
-/// Mutants to plant: the answer not remembered (two questions); the source left out.
+/// Catches: the answer not remembered (two questions); the source left out.
 #[test]
 fn the_release_that_runs_is_asked_once_and_the_source_is_told() {
     let mut rig = Rig::new("notice-fake");
@@ -483,7 +483,7 @@ fn the_release_that_runs_is_asked_once_and_the_source_is_told() {
 ///
 /// Catches a failed question remembered for ever, and one said at every pass.
 ///
-/// Mutants to plant: the failure stored with the answer; the complaint said at every pass.
+/// Catches: the failure stored with the answer; the complaint said at every pass.
 #[test]
 fn a_release_that_cannot_be_asked_is_asked_again_and_the_trouble_is_said_once() {
     let mut rig = Rig::new("notice-probe-fails");
@@ -513,7 +513,7 @@ fn a_release_that_cannot_be_asked_is_asked_again_and_the_trouble_is_said_once() 
 ///
 /// Catches a floor that cannot be read taken for one that is not there.
 ///
-/// Mutant to plant: the read error mapped to `None` (the floor is made over the directory's
+/// Catches: the read error mapped to `None` (the floor is made over the directory's
 /// place or the seed announced).
 #[test]
 fn a_floor_that_cannot_be_read_withholds_the_announcement_and_is_said() {
@@ -532,7 +532,7 @@ fn a_floor_that_cannot_be_read_withholds_the_announcement_and_is_said() {
 ///
 /// Catches a confirm undone, or a failure to raise the floor passed over without a word.
 ///
-/// Mutants to plant: the error of the raise dropped; the confirm refused when the raise fails;
+/// Catches: the error of the raise dropped; the confirm refused when the raise fails;
 /// the raise dropped from the confirm (nothing is said: the pass's own catch-up has no seed to
 /// complain of, and it is not asked to say what the confirm's raise has).
 #[test]
@@ -562,7 +562,7 @@ fn a_floor_that_cannot_be_raised_after_a_confirm_is_said_and_the_confirm_stands(
 ///
 /// Catches a flip undone, or a failure to raise the floor passed over without a word.
 ///
-/// Mutants to plant: the error of the raise dropped; the flip refused when the raise fails; the
+/// Catches: the error of the raise dropped; the flip refused when the raise fails; the
 /// raise dropped from the flip (nothing is said).
 #[test]
 fn a_floor_that_cannot_be_raised_after_a_flip_is_said_and_the_flip_stands() {
@@ -591,7 +591,7 @@ fn a_floor_that_cannot_be_raised_after_a_flip_is_said_and_the_flip_stands() {
 /// Catches a host with no seed complaining at every pass, and a floor that is kept only where a
 /// seed is carried (a seed arriving later would find none).
 ///
-/// Mutants to plant: the absent seed directory reported as missing; the floor kept only when a
+/// Catches: the absent seed directory reported as missing; the floor kept only when a
 /// seed is found.
 #[test]
 fn a_package_without_a_seed_says_nothing_and_the_floor_is_kept_all_the_same() {
@@ -618,7 +618,7 @@ fn a_package_without_a_seed_says_nothing_and_the_floor_is_kept_all_the_same() {
 /// Catches a seed announced for ever as the first one found (the cache keyed by anything but
 /// the manifest's digest), and an upgrade that writes the state.
 ///
-/// Mutants to plant: the cache returned whatever the digest; the new seed announced without
+/// Catches: the cache returned whatever the digest; the new seed announced without
 /// being checked (red on the second runner's `gh` runs).
 #[test]
 fn a_package_upgrade_is_noticed_at_the_next_pass_and_touches_no_state() {
@@ -650,7 +650,7 @@ fn a_package_upgrade_is_noticed_at_the_next_pass_and_touches_no_state() {
 /// Catches the announcement made only where nothing is fetched, and the source left to the
 /// frontend to guess.
 ///
-/// Mutants to plant: the announcement made only on a `bundled` host; the source not put in the
+/// Catches: the announcement made only on a `bundled` host; the source not put in the
 /// status.
 #[test]
 fn a_host_tells_its_source_and_announces_its_seed_whatever_the_source() {

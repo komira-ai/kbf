@@ -754,7 +754,7 @@ mod tests {
     /// Catches a lease scope that frees the slot before the lease directory is removed
     /// (a slot dropped first is cleaned and offered again while its user still owns the
     /// directory): a scope that ends, one dropped on a panic, and one where the runner
-    /// is replaced in the middle all drop the directory first. Seen red with the fields
+    /// is replaced in the middle all drop the directory first. Catches: the fields
     /// of `Scope` swapped.
     #[test]
     fn the_directory_drops_before_the_slot_even_on_a_panic() {

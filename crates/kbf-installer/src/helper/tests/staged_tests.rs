@@ -100,7 +100,7 @@ fn a_first_release_is_not_left_staged_and_a_frontend_update_follows() {
 /// word, `staged` stays empty, status.json does not say `staged`, and the next update, of
 /// another commit, is taken, where a leftover would answer it `frontend_busy`.
 ///
-/// Mutants planted: the pipeline writing `staged` after its install; a refused update
+/// Catches: the pipeline writing `staged` after its install; a refused update
 /// clearing `staged` whatever it names (see the next test).
 #[test]
 fn a_frontend_update_refused_after_its_fetch_leaves_nothing_staged() {
@@ -133,7 +133,7 @@ fn a_frontend_update_refused_after_its_fetch_leaves_nothing_staged() {
 /// takes: a repeat is verified again) is refused after the fetch. B is still the release
 /// the first order staged, so it stays staged and the proxy can still confirm it.
 ///
-/// Mutant planted: the refusal after the fetch clearing `staged` whatever it names.
+/// Catches: the refusal after the fetch clearing `staged` whatever it names.
 #[test]
 fn a_repeat_of_the_staged_update_refused_after_its_fetch_keeps_it_staged() {
     let (mut rig, fetcher) = real_frontend("repeat-refused");
@@ -160,7 +160,7 @@ fn a_repeat_of_the_staged_update_refused_after_its_fetch_keeps_it_staged() {
 /// C (the report is not what the order expected) is refused after the fetch; B stays
 /// staged through both, and a successful node activation of C swaps and still leaves B.
 ///
-/// Mutants planted: the pipeline writing `staged` (C displaces B, and the swap then clears
+/// Catches: the pipeline writing `staged` (C displaces B, and the swap then clears
 /// it as C); a refusal after the fetch clearing `staged` whatever it names.
 #[test]
 fn another_orders_staged_release_survives_a_refused_stage_and_a_node_swap() {
@@ -201,7 +201,7 @@ fn another_orders_staged_release_survives_a_refused_stage_and_a_node_swap() {
 /// `staged` stays empty, so the frontend's next update is taken (a leftover would answer
 /// `frontend_busy`).
 ///
-/// Mutant planted: the pipeline writing `staged` after its install.
+/// Catches: the pipeline writing `staged` after its install.
 #[test]
 fn a_node_activation_refused_after_its_fetch_stages_nothing() {
     let (mut rig, fetcher) = real_frontend("activation-refused");
