@@ -32,11 +32,13 @@ const GROUP_KEYS: [&str; 4] = [
 /// `dsAttrTypeNative:IsHidden: 1`.
 const NATIVE: &str = "dsAttrTypeNative:";
 
-/// One directory record: its name and the attributes read, each as the words `dscl`
-/// printed for it.
+/// One directory record: its name (the first value of `RecordName`), the other names
+/// it answers to (the remaining values) and the attributes read, each as the words
+/// `dscl` printed for it.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Record {
     pub(crate) name: String,
+    pub(crate) aliases: Vec<String>,
     attrs: BTreeMap<String, String>,
 }
 
@@ -65,12 +67,17 @@ pub(crate) fn parse(text: &str) -> Vec<Record> {
     let mut attrs: BTreeMap<String, String> = BTreeMap::new();
     let mut last = String::new();
     let mut end = |attrs: &mut BTreeMap<String, String>| {
-        let name = attrs
-            .remove("RecordName")
-            .and_then(|v| v.split_whitespace().next().map(str::to_owned));
+        let names = attrs.remove("RecordName").unwrap_or_default();
+        let mut names = names.split_whitespace().map(str::to_owned);
+        let name = names.next();
+        let aliases = names.collect();
         let attrs = std::mem::take(attrs);
         if let Some(name) = name {
-            records.push(Record { name, attrs });
+            records.push(Record {
+                name,
+                aliases,
+                attrs,
+            });
         }
     };
     for line in text.lines() {
@@ -131,6 +138,16 @@ impl Directory {
         self.groups.iter().find(|g| g.name == name)
     }
 
+    /// The user other than `name` that has `name` among its other names.
+    pub(crate) fn user_aliased(&self, name: &str) -> Option<&str> {
+        aliased(&self.users, name)
+    }
+
+    /// The group other than `name` that has `name` among its other names.
+    pub(crate) fn group_aliased(&self, name: &str) -> Option<&str> {
+        aliased(&self.groups, name)
+    }
+
     /// The user other than those `ours` accepts that has uid `uid`.
     pub(crate) fn uid_holder(&self, uid: u64, ours: impl Fn(&str) -> bool) -> Option<&str> {
         self.users
@@ -160,6 +177,13 @@ impl Directory {
                 listed("GroupMembership", &user.name) || listed("GroupMembers", guid)
             })
     }
+}
+
+fn aliased<'a>(records: &'a [Record], name: &str) -> Option<&'a str> {
+    records
+        .iter()
+        .find(|r| r.name != name && r.aliases.iter().any(|a| a == name))
+        .map(|r| r.name.as_str())
 }
 
 /// Commands for one `dscl .` process to run in order, as it reads them on standard
@@ -243,6 +267,21 @@ UniqueID: 700";
         assert_eq!(pool.get("GroupMembership"), "x y");
         assert_eq!(pool.get("UniqueID"), "700");
         assert!(!pool.has("RecordName"));
+    }
+
+    /// Catches: only the first value of `RecordName` read, so that a record answering
+    /// to a second name is taken for having one: the other values are its aliases,
+    /// whether on the key's line or on the lines after it.
+    #[test]
+    fn every_value_of_record_name_is_read() {
+        let records = parse(
+            "RecordName: farm farmadmin\nUniqueID: 501\n-\nRecordName:\n pool\n kbf-pool-3\nUniqueID: 9\n-\n",
+        );
+        assert_eq!(records[0].name, "farm");
+        assert_eq!(records[0].aliases, ["farmadmin"]);
+        assert_eq!(records[1].name, "pool");
+        assert_eq!(records[1].aliases, ["kbf-pool-3"]);
+        assert!(!records[0].has("RecordName"));
     }
 
     /// Catches: a blank read (a failed `dscl`) producing a record, and a continuation

@@ -658,6 +658,7 @@ impl PoolCleanup {
             .args([".", "-delete", "/Groups/kbfpool"])
             .output()
             .expect("ran dscl");
+        let _ = fs::remove_file(format!("{SCRATCH}/profile-pool"));
     }
 }
 

@@ -646,7 +646,12 @@ impl FakeMac {
                     let Some(name) = record.strip_prefix(&prefix) else {
                         continue;
                     };
-                    out.push_str(&format!("RecordName: {name}\n"));
+                    // Other names of the record are kept as a `RecordName` attribute.
+                    let others = found
+                        .iter()
+                        .find(|(k, _)| k == "RecordName")
+                        .map_or("", |(_, v)| v.as_str());
+                    out.push_str(&format!("RecordName: {name} {others}\n"));
                     for a in attrs.iter().filter(|a| **a != "RecordName") {
                         let Some((_, v)) = found.iter().find(|(k, _)| k == a) else {
                             continue;

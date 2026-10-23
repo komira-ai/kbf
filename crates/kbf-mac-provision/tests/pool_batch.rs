@@ -285,6 +285,99 @@ fn a_gid_held_by_another_group_refuses_the_block_whole() {
     assert!(mac.writes().is_empty(), "{:?}", mac.writes());
 }
 
+/// Runs `apply` on the pool with `refuse` done to a converged Mac that also lacks
+/// `kbf-pool-3` (so that `apply` would write if it went on), and requires it to fail
+/// with a note containing `why` and to write nothing at all.
+fn refused(name: &str, refuse: impl FnOnce(&mut support::State), why: &str) {
+    let mut mac = FakeMac::converged(name);
+    let s = mac.state_mut();
+    s.remove_user("kbf-pool-3");
+    refuse(s);
+    mac.log.borrow_mut().clear();
+    let r = apply_keys(&mac, Some("pool_users"));
+    assert_eq!(r.failed, 1, "{}", r.text);
+    assert!(r.text.contains(why), "want {why:?} in {}", r.text);
+    assert!(r.text.contains("no pool user changed"), "{}", r.text);
+    assert!(mac.inputs.borrow().is_empty());
+    assert!(mac.writes().is_empty(), "{:?}", mac.writes());
+}
+
+/// Catches: `apply` rewriting an existing account that has a pool user's name but a
+/// uid outside the pool's block (someone's account, handed to the pool): nothing is
+/// written, not even for the pool user that is missing, and the note names the record.
+#[test]
+fn a_user_named_like_a_pool_user_with_a_uid_outside_the_block_is_refused() {
+    refused(
+        "batch-foreign-uid",
+        |s| s.user_attr("kbf-pool-1", "UniqueID", "501"),
+        "user kbf-pool-1 has uid 501, outside the pool's block 700-703",
+    );
+}
+
+/// Catches: `apply` rewriting a `kbfpool` group whose gid is not the pool's.
+#[test]
+fn a_kbfpool_group_with_another_gid_is_refused() {
+    refused(
+        "batch-foreign-gid",
+        |s| s.attr("/Groups/kbfpool", "PrimaryGroupID", "20"),
+        "group kbfpool has gid 20, not the pool's 700",
+    );
+}
+
+/// Catches: a refusal that also stops the finish of a half-run: the group and a user
+/// were created, their ids not yet set, and a user's uid is in the block with its
+/// other attributes wrong. `apply` sets what is missing and `check` then passes.
+#[test]
+fn a_half_made_pool_with_our_names_is_finished_not_refused() {
+    let mut mac = FakeMac::converged("batch-half-names");
+    let s = mac.state_mut();
+    s.records.remove("/Groups/kbfpool");
+    s.attr("/Groups/kbfpool", "Password", "*");
+    s.records.remove("/Users/kbf-pool-3");
+    s.user_attr("kbf-pool-3", "UserShell", "/usr/bin/false");
+    s.user_attr("kbf-pool-1", "UserShell", "/bin/zsh");
+    let r = apply_keys(&mac, Some("pool_users"));
+    assert_eq!(r.failed, 0, "{}", r.text);
+    assert!(!r.text.contains("no pool user changed"), "{}", r.text);
+    assert_eq!(mac.inputs.borrow().len(), 1);
+    assert_eq!(check_keys(&mac, Some("pool_users")).failed, 0);
+}
+
+/// Catches: only the first name of a record being compared with the pool's names: a
+/// user whose second name is `kbf-pool-3`, and a group whose second name is `kbfpool`,
+/// each make `check` fail and `apply` write nothing. The directory read has the record
+/// names on one line, as `dscl -readall` prints them.
+#[test]
+fn a_record_with_a_pool_name_as_another_name_is_refused() {
+    let mut mac = FakeMac::converged("batch-alias-user");
+    let s = mac.state_mut();
+    s.remove_user("kbf-pool-3");
+    s.user("someone", 5000);
+    s.user_attr("someone", "RecordName", "kbf-pool-3");
+    let r = check_keys(&mac, Some("pool_users"));
+    assert!(
+        r.text.contains("kbf-pool-3: also a name of user someone"),
+        "{}",
+        r.text
+    );
+    refused(
+        "batch-alias-user-apply",
+        |s| {
+            s.user("someone", 5000);
+            s.user_attr("someone", "RecordName", "kbf-pool-3");
+        },
+        "user someone is also named kbf-pool-3",
+    );
+    refused(
+        "batch-alias-group",
+        |s| {
+            s.attr("/Groups/staff2", "PrimaryGroupID", "5000");
+            s.attr("/Groups/staff2", "RecordName", "kbfpool");
+        },
+        "group staff2 is also named kbfpool",
+    );
+}
+
 /// Catches: an administrator listed in `admin` only by `GeneratedUID` (in
 /// `GroupMembers`, not by name) passing the check, and `apply` not removing it.
 #[test]

@@ -234,6 +234,9 @@ fn user_problems(c: &Ctx<'_>, dir: &Directory, u: &PoolUser) -> Vec<String> {
     if let Some(other) = dir.uid_holder(u.uid.into(), |name| name == u.name) {
         wrong.push(format!("uid {} belongs to {other}", u.uid));
     }
+    if let Some(other) = dir.user_aliased(&u.name) {
+        wrong.push(format!("also a name of user {other}"));
+    }
     let (found, want) = (c.mac.ls(&u.home), home_want(c, u));
     if found != want {
         wrong.push(format!("home {} is {found}, want {want}", u.home));
@@ -262,6 +265,9 @@ fn problems(c: &Ctx<'_>) -> Vec<String> {
     }
     if let Some(other) = dir.gid_holder(gid.into(), GROUP) {
         wrong.push(format!("gid {gid} belongs to {other}"));
+    }
+    if let Some(other) = dir.group_aliased(GROUP) {
+        wrong.push(format!("group {GROUP}: also a name of group {other}"));
     }
     let homes = homes(c);
     let found = c.mac.ls(&homes);
@@ -296,13 +302,57 @@ pub(crate) fn pool_users_item(c: &Ctx<'_>) -> Outcome {
     ))
 }
 
+/// Why `apply` must not touch the directory, or `None`: a record that holds a name of
+/// the pool (`kbf-pool-<i>`, `kbfpool`), as its name or as another of its names, but is
+/// not the pool's. A user named like a pool user whose uid is outside the block, a
+/// `kbfpool` whose gid is not the pool's, or a record answering to a pool name is
+/// someone else's account: rewriting its ids would hand it to the pool. An id that is
+/// absent is a half-run (the record was created, its attributes not yet set) and is
+/// finished.
+fn foreign_record(c: &Ctx<'_>, dir: &Directory, users: &[PoolUser]) -> Option<String> {
+    let first = c.profile.pool_first_uid;
+    let block = first..first + c.profile.pool_users;
+    if let Some(g) = dir.group(GROUP)
+        && g.has("PrimaryGroupID")
+        && g.number("PrimaryGroupID") != Some(first.into())
+    {
+        return Some(format!(
+            "group {GROUP} has gid {}, not the pool's {first}: it is not the pool's group",
+            g.get("PrimaryGroupID")
+        ));
+    }
+    if let Some(other) = dir.group_aliased(GROUP) {
+        return Some(format!("group {other} is also named {GROUP}"));
+    }
+    for u in users {
+        if let Some(record) = dir.user(&u.name)
+            && record.has("UniqueID")
+            && !record
+                .number("UniqueID")
+                .is_some_and(|uid| u32::try_from(uid).is_ok_and(|uid| block.contains(&uid)))
+        {
+            return Some(format!(
+                "user {} has uid {}, outside the pool's block {first}-{}: it is not a pool user",
+                u.name,
+                record.get("UniqueID"),
+                block.end - 1
+            ));
+        }
+        if let Some(other) = dir.user_aliased(&u.name) {
+            return Some(format!("user {other} is also named {}", u.name));
+        }
+    }
+    None
+}
+
 /// Makes the group and each pool user what [`pool_users_item`] wants, in one `dscl`
 /// process fed the commands: sets the attributes that differ (a user that is right is
 /// not touched, so a second run, or a run on a part of a pool, does only what is left),
 /// removes a password hash and the memberships of `admin` and `wheel`, and makes the
 /// homes, only on the mounted volume and only in a homes directory that is (or that it
 /// makes) a directory of root's, mode 755, never through a link. Nothing is changed
-/// while another group holds the gid or another user holds a uid of the block. What is
+/// while another group holds the gid or another user holds a uid of the block, or while
+/// a record that is not the pool's holds one of its names ([`foreign_record`]). What is
 /// at a home's path and is not a directory is left.
 pub(crate) fn fix_pool_users(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
     let gid = c.profile.pool_first_uid;
@@ -313,6 +363,9 @@ pub(crate) fn fix_pool_users(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
         )));
     }
     let users = pool_users(c);
+    if let Some(why) = foreign_record(c, &dir, &users) {
+        return Err(io::Error::other(format!("{why}: no pool user changed")));
+    }
     for u in &users {
         let ours = |name: &str| users.iter().any(|p| p.name == name);
         if let Some(other) = dir.uid_holder(u.uid.into(), ours) {
