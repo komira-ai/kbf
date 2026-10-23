@@ -964,13 +964,14 @@ fn gpus(platform: &Platform) -> Result<u64, Status> {
 /// reports as `gpu` 1 (`docs/design/macos-vms.md` section 8): an `action` lease on
 /// macOS that asks for it books it, so one GPU lease runs on a Mac at a time while the
 /// Mac's other work shares the rest; a `whole_machine` lease on macOS books none on top,
-/// because it has the whole Mac, its GPU included. Any other request books what it asks.
+/// because it has the whole Mac, its GPU included; a `vm` lease is refused. Any other
+/// request books what it asks.
 /// A request that names no OS (an `arch` and a `gpu`, say) is not a request for a Mac:
 /// it books what it asks, and a Mac, which reports a GPU, can serve it.
 ///
 /// # Errors
-/// INVALID_ARGUMENT for more than one GPU on macOS, of either lease kind: a Mac has one, so no node could
-/// serve it.
+/// INVALID_ARGUMENT for more than one GPU on macOS, of any lease kind: a Mac has one, so no
+/// node could serve it; and for any GPU on a macOS `vm` lease, which has no host GPU.
 fn mac_gpus(kind: LeaseKind, gpus: u64, needs: &kbf_caps::Request) -> Result<u64, Status> {
     if gpus == 0 || needs.exact("os") != Some("macos") {
         return Ok(gpus);
@@ -981,10 +982,16 @@ fn mac_gpus(kind: LeaseKind, gpus: u64, needs: &kbf_caps::Request) -> Result<u64
              has one GPU, booked by one lease at a time"
         )));
     }
-    if kind == LeaseKind::WholeMachine {
-        return Ok(0);
+    match kind {
+        LeaseKind::Action => Ok(gpus),
+        LeaseKind::WholeMachine => Ok(0),
+        // A guest's GPU is not the host's: the host's slot is not the guest's to book.
+        LeaseKind::Vm => Err(Status::invalid_argument(format!(
+            "platform property {GPU_KEY}={gpus} on a macOS {:?} lease: the Mac's GPU is not \
+             passed to a guest",
+            kind.name()
+        ))),
     }
-    Ok(gpus)
 }
 
 /// What the lease books: one core and `default_memory` bytes for an `action` (the least
@@ -1258,6 +1265,10 @@ fn operations(
         }
     }))
 }
+
+#[cfg(test)]
+#[path = "execution_gpu_tests.rs"]
+mod gpu_tests;
 
 #[cfg(test)]
 #[path = "execution_progress_tests.rs"]

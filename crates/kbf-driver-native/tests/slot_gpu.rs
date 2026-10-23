@@ -211,8 +211,8 @@ async fn probe_under(name: &str, change: WeakenedProfile) -> (Option<i32>, Strin
 }
 
 /// Catches a probe that passes whatever the profile says (a device found by another
-/// route, a step that never runs the kernel, an exit code that is always 0): each planted
-/// deny, added to the end of the slot profile the driver generates, makes the probe fail at
+/// route, a step that never runs the kernel, an exit code that is always 0): each deny
+/// added to the end of the slot profile the driver generates makes the probe fail at
 /// the step that needs what the deny removed, with that step's exit code, and no step
 /// after it runs. Seen on the hosted runner (a paravirtual GPU) before this test: the
 /// `iokit-open` deny leaves no device, and the `MTLCompilerService` deny leaves the device

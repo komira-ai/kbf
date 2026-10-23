@@ -242,7 +242,10 @@ fn run(program: &'static str, args: &[&str]) -> Result<String, DetectError> {
 /// has no core count, and the node still starts.
 #[cfg(target_os = "macos")]
 fn ioreg() -> String {
-    run(IOREG, &["-r", "-d", "1", "-c", "AGXAccelerator"]).unwrap_or_default()
+    run(IOREG, &["-r", "-d", "1", "-c", "AGXAccelerator"]).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "ioreg failed: gpu.cores is not reported");
+        String::new()
+    })
 }
 
 /// The report of an Apple silicon Mac from `sysctl hw.optional` (`optional`),
