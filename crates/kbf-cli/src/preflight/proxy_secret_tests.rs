@@ -51,7 +51,7 @@ fn the_flag_names_a_secret_of_32_bytes() {
 
 /// Catches: the size check dropped or off by one, in either direction.
 ///
-/// Mutants seen red: the size check removed; `!=` as `<`; `!=` as `>`.
+/// Catches: the size check removed; `!=` as `<`; `!=` as `>`.
 #[test]
 fn a_secret_that_is_not_32_bytes_is_refused_with_its_size_and_the_fix() {
     for size in [0, 1, 31, 33, 64] {
@@ -91,7 +91,7 @@ fn a_secret_of_32_bytes_passes_at_0600_and_at_0400() {
 
 /// Catches: the mode check dropped, or loosened to part of the group and others bits.
 ///
-/// Mutants seen red: the mode test removed; its mask cut to the others bits; its mask cut
+/// Catches: the mode test removed; its mask cut to the others bits; its mask cut
 /// to the group bits.
 #[test]
 fn a_secret_the_group_or_others_can_reach_is_refused_with_the_chmod() {
@@ -117,7 +117,7 @@ fn a_secret_the_owner_cannot_read_is_refused_once() {
 /// after a root-run renewal) reported as well as, or instead of, its size: the read error is
 /// the one problem, it says why, and no length is made up for bytes never read.
 ///
-/// Mutants seen red: the read failure ignored (no problem at all); the size check run on an
+/// Catches: the read failure ignored (no problem at all); the size check run on an
 /// empty read (a second problem, "holds 0 bytes").
 #[test]
 fn a_secret_that_stats_but_cannot_be_read_is_refused_once_with_the_read_error() {

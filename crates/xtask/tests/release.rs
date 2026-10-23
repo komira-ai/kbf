@@ -880,7 +880,7 @@ fn check_waives_the_version_facts_of_a_release_made_before_them_and_only_that() 
     // Catches: the first release after the facts were recorded failing at its check of the
     // previous release (a `kbf` tarball and no facts: nothing is published), and a waiver
     // that is a general pass: without the flag the same directory is refused, with it
-    // facts without their tarball are still refused, and so is a changed file. Mutants:
+    // facts without their tarball are still refused, and so is a changed file. Catches:
     // the flag ignored; the flag skipping the whole pairing; the flag skipping the sums.
     let root = scratch("check-waived");
     let d = dist_with_kbf(&root, "linux-arm64", false);
@@ -919,7 +919,7 @@ fn check_refuses_version_facts_that_are_not_kbfs_for_the_commit() {
     // Catches: any file ending `.version.json` taken as an asset (another binary's, an
     // unknown platform's, a renamed copy), when the set holds one name per platform.
     // Another commit's facts are refused earlier, by the sums (no tarball of it is listed);
-    // `is_facts_of` has a test of its own for that name. Mutant: the exact name replaced by
+    // `is_facts_of` has a test of its own for that name. Catches: the exact name replaced by
     // the suffix.
     for bad in [
         format!("kbf-daemon-{COMMIT}-linux-arm64.version.json"),

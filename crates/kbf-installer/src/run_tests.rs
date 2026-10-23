@@ -29,7 +29,7 @@ fn text(bytes: &[u8]) -> String {
 /// the host sets): the test process has `PATH` and more, and the child must see exactly
 /// the variables it was given, nothing else.
 ///
-/// Mutant seen red: `env_clear()` removed from [`SystemRunner::run`].
+/// Catches: `env_clear()` removed from [`SystemRunner::run`].
 #[test]
 fn a_program_gets_exactly_the_environment_it_is_given() {
     let mut s = spawn("/usr/bin/env", &[]);
@@ -86,7 +86,7 @@ fn the_exit_status_and_both_outputs_are_reported_apart() {
 /// and reported as timed out with no exit code. (The test asserts the outcome, not how
 /// long it took.)
 ///
-/// Mutant seen red: the timeout branch removed, which leaves the test waiting on the
+/// Catches: the timeout branch removed, which leaves the test waiting on the
 /// sleep until the harness kills it.
 #[test]
 fn a_program_past_its_timeout_is_killed_and_reported() {
@@ -205,7 +205,7 @@ impl Creds for FakeCreds {
 /// root cannot change its group), and a call that fails stops the switch before the next
 /// (a process left root with its old group is never run).
 ///
-/// Mutants seen red: the group set after the user; the supplementary groups not cleared;
+/// Catches: the group set after the user; the supplementary groups not cleared;
 /// the result of the group call dropped (the user is then set after a failed group).
 #[test]
 fn the_switch_clears_groups_then_sets_the_group_then_the_user_and_stops_at_a_failure() {
@@ -336,7 +336,7 @@ fn child_holds(fd: libc::c_int, how: Inherited) -> bool {
 /// sandbox without `close_range`), which finds `>= first` and nothing lower. Run in this
 /// process on descriptors at fixed numbers, whatever other tests hold, then in a real child.
 ///
-/// Mutants seen red: both ways doing nothing; `>` for `>=` in the listing.
+/// Catches: both ways doing nothing; `>` for `>=` in the listing.
 #[test]
 fn the_child_inherits_no_descriptor_from_the_first_up() {
     let fixed = Fixed::new();
@@ -394,7 +394,7 @@ fn descriptors_from_three_up_are_not_inherited() {
 /// that error; a range call the kernel refuses is an error of its own; a failed probe falls
 /// back to the listing, and a listing that fails ends the choice with its error, not a guess.
 ///
-/// Mutants seen red: the marking's `?` dropped; the listing's error replaced by `Range`.
+/// Catches: the marking's `?` dropped; the listing's error replaced by `Range`.
 #[test]
 fn a_failure_to_keep_descriptors_from_the_program_ends_the_start() {
     let err =
@@ -430,7 +430,7 @@ fn a_failure_to_keep_descriptors_from_the_program_ends_the_start() {
 /// started a `sleep` that stays in the group (this test binary, run as the program, starts
 /// it and exits); the run kills the group before returning, so the sleeper is gone.
 ///
-/// Mutant seen red: the group not killed after a normal exit.
+/// Catches: the group not killed after a normal exit.
 #[cfg(target_os = "linux")]
 #[test]
 fn what_a_program_leaves_in_its_group_dies_with_the_run() {
@@ -498,7 +498,7 @@ fn a_relative_program_is_refused() {
 /// itself ends, and the run still returns within the read grace instead of when the sleep
 /// does.
 ///
-/// Mutant seen red: the readers joined with no grace (the run takes the sleep's thirty
+/// Catches: the readers joined with no grace (the run takes the sleep's thirty
 /// seconds).
 #[cfg(target_os = "linux")]
 #[test]
@@ -520,7 +520,7 @@ fn a_descendant_that_left_the_group_cannot_hold_the_run() {
 /// fork and exec is not measured, and a failed start reports only its error): the step
 /// returns the marking's error and does not go on to switch user.
 ///
-/// Mutant seen red: the `Fails` arm made to succeed.
+/// Catches: the `Fails` arm made to succeed.
 #[test]
 fn the_step_before_exec_returns_the_markings_error() {
     let err = before_exec(None, Inherited::Fails(libc::EPERM))().expect_err("fails");
@@ -531,7 +531,7 @@ fn the_step_before_exec_returns_the_markings_error() {
 /// that is not this process's child has no state to look at, so the call is an error
 /// (`ECHILD`) the run passes on, not an answer.
 ///
-/// Mutant seen red: the error answered `Ok(false)`.
+/// Catches: the error answered `Ok(false)`.
 #[test]
 fn looking_at_a_process_that_is_not_a_child_is_an_error() {
     let err = exited(1).expect_err("pid 1 is not a child of the test");
@@ -553,7 +553,7 @@ fn the_capture_sink_flushes_without_effect() {
 /// after the child is gone. The write end stays open for the whole test, so the reader
 /// can only end by the deadline, never by the pipe ending.
 ///
-/// Mutant seen red: the `Timeout | Disconnected` arm of [`Capture::finish`] returning
+/// Catches: the `Timeout | Disconnected` arm of [`Capture::finish`] returning
 /// `Err(io::ErrorKind::TimedOut.into())`.
 #[test]
 fn a_capture_whose_pipe_outlives_its_grace_returns_what_it_kept() {

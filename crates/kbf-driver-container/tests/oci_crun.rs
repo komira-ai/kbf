@@ -169,7 +169,7 @@ async fn every_exit_code_is_the_actions_own() {
 /// The action starts a session leader in the background from a subshell that exits
 /// at once, so the leader is an orphan; the action kills it, and 2 s later it must not
 /// be in `/proc` at all (a zombie is, and so is a group that `kill(-pgid, 0)` finds).
-/// Pid 1 must be the init and the leader its child. The mutant: an init that waits only
+/// Pid 1 must be the init and the leader its child. The defect: an init that waits only
 /// for the action leaves `Z` and exit 3.
 #[tokio::test]
 #[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
