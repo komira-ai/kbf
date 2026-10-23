@@ -103,14 +103,22 @@ pub(crate) struct OwnLabels {
 
 impl OwnLabels {
     /// Whether the service `label` is launchd's own: what was judged before, else what
-    /// `judge` says (called without the lock held, so a slow print blocks no other).
+    /// `judge` says (called without the lock held, so a slow print blocks no other). A
+    /// `judge` that could not tell (`None`: the print failed or timed out) counts as not
+    /// own, and is not kept: the next ask judges again.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub(crate) fn is_own(&self, label: &str, judge: impl FnOnce() -> bool) -> bool {
-        let lock = || self.known.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    pub(crate) fn is_own(&self, label: &str, judge: impl FnOnce() -> Option<bool>) -> bool {
+        let lock = || {
+            self.known
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
         if let Some(own) = lock().get(label) {
             return *own;
         }
-        let own = judge();
+        let Some(own) = judge() else {
+            return false;
+        };
         lock().insert(label.to_owned(), own);
         own
     }

@@ -74,37 +74,50 @@ fn only_the_services_running_a_live_pid_are_judged() {
         (Some(12), "own.c".to_owned()),
     ];
     let mut asked = Vec::new();
-    let own = own_among(&[10, 11, 12, 13], || services, |label| {
-        asked.push(label.to_owned());
-        label.starts_with("own.")
-    });
+    let own = own_among(
+        &[10, 11, 12, 13],
+        || services,
+        |label| {
+            asked.push(label.to_owned());
+            label.starts_with("own.")
+        },
+    );
     assert_eq!(own, [10, 12]);
     assert_eq!(asked, ["own.a", "lease.b", "own.c"]);
 }
 
 /// Catches a clean that prints a service again for every scan of its kill loop and every
 /// look after it: a label is judged once, whatever the answer, and a new label is
-/// judged on its own; a new `OwnLabels` (the next clean) judges again.
+/// judged on its own; a new `OwnLabels` (the next clean) judges again. A print that
+/// told nothing counts as not own and is asked again, not kept (a timeout must not make
+/// a launchd agent a stray for the rest of the clean).
 #[test]
 fn a_clean_judges_each_service_once() {
     let judged = OwnLabels::default();
     let calls = std::cell::Cell::new(0);
     let calls = &calls;
-    let judge = |answer: bool| {
+    let judge = |answer: Option<bool>| {
         move || {
             calls.set(calls.get() + 1);
             answer
         }
     };
     for _ in 0..3 {
-        assert!(judged.is_own("own.a", judge(true)));
-        assert!(!judged.is_own("lease.b", judge(false)));
+        assert!(judged.is_own("own.a", judge(Some(true))));
+        assert!(!judged.is_own("lease.b", judge(Some(false))));
     }
     assert_eq!(calls.get(), 2);
-    assert!(judged.is_own("own.c", judge(true)));
+    assert!(judged.is_own("own.c", judge(Some(true))));
     assert_eq!(calls.get(), 3);
-    assert!(!OwnLabels::default().is_own("own.a", judge(false)));
+    assert!(!OwnLabels::default().is_own("own.a", judge(Some(false))));
     assert_eq!(calls.get(), 4);
+    for asked in 5..=7 {
+        assert!(!judged.is_own("slow.d", judge(None)));
+        assert_eq!(calls.get(), asked);
+    }
+    assert!(judged.is_own("slow.d", judge(Some(true))));
+    assert!(judged.is_own("slow.d", judge(Some(false))));
+    assert_eq!(calls.get(), 8);
 }
 
 /// Catches a shared sweep without `/Library/Caches` (a raw plant there by the uid survived

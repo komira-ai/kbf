@@ -329,16 +329,13 @@ impl MacSlot<'_> {
             }
             Ok(not_launchds_own(pids, uid, &self.judged))
         };
-        let t0 = Instant::now();
         let round = super::term_uid(
             uid,
             self.grace.min(self.within),
             &mut scan,
             probe::SCAN_PAUSE,
         );
-        tracing::info!(uid, ms = t0.elapsed().as_millis(), "TIMING clean term round");
-        let t1 = Instant::now();
-        let r = crate::grace::then_kill(round, "slot clean", |ignored| {
+        crate::grace::then_kill(round, "slot clean", |ignored| {
             if let Some(brief) = crate::grace::brief(ignored) {
                 tracing::warn!(uid, "slot clean: {brief}");
             }
@@ -351,9 +348,7 @@ impl MacSlot<'_> {
                 &mut || std::thread::sleep(probe::SCAN_PAUSE),
             )
         })
-        .map(|_| ());
-        tracing::info!(uid, ms = t1.elapsed().as_millis(), "TIMING clean kill phase");
-        r
+        .map(|_| ())
     }
 }
 
@@ -673,13 +668,6 @@ pub(crate) fn launchds_own(uid: u32) -> Vec<i32> {
 /// domain is not printed for no pids, and only the services that run one of `pids` are
 /// printed for their plists, each once for `judged`.
 fn own_pids(uid: u32, pids: &[i32], judged: &probe::OwnLabels) -> Vec<i32> {
-    let t0 = Instant::now();
-    let r = own_pids_timed(uid, pids, judged);
-    tracing::info!(uid, pids = pids.len(), ms = t0.elapsed().as_millis(), "TIMING own_pids");
-    r
-}
-
-fn own_pids_timed(uid: u32, pids: &[i32], judged: &probe::OwnLabels) -> Vec<i32> {
     let give_up = Instant::now() + SERVICES_WITHIN;
     probe::own_among(
         pids,
@@ -729,13 +717,6 @@ const SERVICES_WITHIN: Duration = Duration::from_secs(15);
 /// checks then stand in for). Each is printed on its own for its plist's path
 /// ([`Service::own`]), once for `judged`; one not printed in time is not launchd's own.
 fn services_of(uid: u32, judged: &probe::OwnLabels) -> Vec<Service> {
-    let t0 = Instant::now();
-    let r = services_of_timed(uid, judged);
-    tracing::info!(uid, n = r.len(), ms = t0.elapsed().as_millis(), "TIMING services_of");
-    r
-}
-
-fn services_of_timed(uid: u32, judged: &probe::OwnLabels) -> Vec<Service> {
     let give_up = Instant::now() + SERVICES_WITHIN;
     let Some(domain) = launchctl_print(&format!("user/{uid}"), PRINT_WITHIN) else {
         return Vec::new();
@@ -750,13 +731,12 @@ fn services_of_timed(uid: u32, judged: &probe::OwnLabels) -> Vec<Service> {
 }
 
 /// Whether `user/<uid>/<label>`'s plist is launchd's own, from its own print, which is
-/// waited for until `give_up` (and [`PRINT_WITHIN`] at most).
-fn is_own_service(uid: u32, label: &str, give_up: Instant) -> bool {
+/// waited for until `give_up` (and [`PRINT_WITHIN`] at most); `None` when it was not
+/// printed.
+fn is_own_service(uid: u32, label: &str, give_up: Instant) -> Option<bool> {
     let left = give_up.saturating_duration_since(Instant::now());
-    launchctl_print(&format!("user/{uid}/{label}"), left.min(PRINT_WITHIN))
-        .as_deref()
-        .and_then(probe::plist_path)
-        .is_some_and(probe::is_own_plist)
+    let printed = launchctl_print(&format!("user/{uid}/{label}"), left.min(PRINT_WITHIN))?;
+    Some(probe::plist_path(&printed).is_some_and(probe::is_own_plist))
 }
 
 /// What `launchctl print <target>` says, if it succeeds within `within`; a print that

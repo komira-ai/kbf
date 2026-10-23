@@ -508,9 +508,7 @@ impl UidWatch {
             // helper for the home's disk image, for one): they are not waited for or
             // named, as in the slot's clean. They are listed before the bootout empties
             // the list, and not at all without a grace, which looks at no process.
-            let t0 = Instant::now();
             let own = grace::for_round(grace, || host::launchds_own(uid));
-            tracing::info!(uid, ms = t0.elapsed().as_millis(), "TIMING lease launchds_own");
             // The domain first, so that launchd starts none of its jobs again while the
             // processes are asked to end: those would be taken for ones that ignored it.
             uid::bootout(uid, wait.min(uid::BOOTOUT_WITHIN));
