@@ -170,13 +170,19 @@ pub fn dscl_ids(name: &str, limit: Duration) -> Cmd {
     )
 }
 
-/// The user and group ids in `dscl -read` output (`UniqueID: 4294967294`).
+/// The user and group ids in `dscl -read` output (`UniqueID: 501`). The unprivileged
+/// accounts have ids that are negative as 32-bit numbers: `nobody` is `-2`, which is the id
+/// 4294967294.
 pub fn parse_ids(text: &str) -> Option<Identity> {
     let value = |key: &str| {
-        text.lines()
+        let number: i64 = text
+            .lines()
             .find_map(|line| line.strip_prefix(key)?.strip_prefix(':'))?
             .trim()
-            .parse::<u32>()
+            .parse()
+            .ok()?;
+        u32::try_from(number)
+            .or_else(|_| i32::try_from(number).map(|n| u32::from_ne_bytes(n.to_ne_bytes())))
             .ok()
     };
     Some(Identity {

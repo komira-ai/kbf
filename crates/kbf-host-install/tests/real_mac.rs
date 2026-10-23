@@ -322,3 +322,100 @@ fn dscl_ids_of_nobody_and_a_drop_to_them() {
     let seen: Vec<&str> = listing.split_whitespace().collect();
     assert_eq!(seen.len(), 1, "only the primary group is left: {listing}");
 }
+
+/// The value of a field at the top of a service's listing: a line of exactly one tab, then
+/// `key = value`. (Written again here, plainly, to check the crate's reader against.)
+fn top_level<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("\t{key} = ");
+    text.lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+}
+
+/// Whether the listing has a line at depth two or more naming `key`.
+fn nested(text: &str, key: &str) -> bool {
+    let needle = format!("{key} = ");
+    text.lines().any(|line| {
+        line.strip_prefix("\t\t")
+            .is_some_and(|rest| rest.trim_start().starts_with(&needle))
+    })
+}
+
+/// The services launchd lists in the system domain, as labels.
+fn system_labels() -> Vec<String> {
+    let list = Cmd {
+        program: tools::LAUNCHCTL.to_owned(),
+        args: vec!["print".to_owned(), "system".to_owned()],
+        timeout: Some(LIMIT),
+        ..Cmd::default()
+    };
+    let exec = run(&list);
+    capture("print_system_domain", &exec);
+    let mut labels: Vec<String> = exec
+        .stdout_text()
+        .lines()
+        .filter_map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let [pid, status, label] = words.as_slice() else {
+                return None;
+            };
+            let number = |w: &str| w == "-" || w.parse::<i64>().is_ok();
+            (number(pid) && number(status) && label.contains('.') && !label.contains('='))
+                .then(|| (*label).to_owned())
+        })
+        .collect();
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
+/// Over the real listings of the system's own services, which have nested blocks with fields
+/// of their own: the crate's readers agree, for every one of them, with the field at the top
+/// of the listing, whatever a nested block says. The first listing with a nested `state`,
+/// `pid` and `last exit code` each is kept.
+#[test]
+#[ignore = "needs a Mac and root: cargo xtask sudo-test"]
+fn print_of_the_systems_own_services_is_read_at_the_top_level() {
+    assert_root();
+    let labels = system_labels();
+    assert!(labels.len() > 20, "{} services listed", labels.len());
+    let (mut listed, mut kept) = (0_usize, Vec::new());
+    let mut with_nested = [0_usize; 3];
+    for label in labels.iter().take(400) {
+        let exec = run(&tools::print(label, LIMIT));
+        if !exec.success() {
+            continue;
+        }
+        listed += 1;
+        let text = exec.stdout_text();
+        let running = top_level(&text, "state") == Some("running");
+        assert_eq!(tools::print_running(&text), running, "{label}: {text}");
+        let pid = top_level(&text, "pid").and_then(|p| p.parse::<u32>().ok());
+        assert_eq!(tools::print_pid(&text), pid.filter(|p| *p > 0), "{label}");
+        let ended = !running
+            && (top_level(&text, "last exit code").is_some_and(|c| c.parse::<i32>().is_ok())
+                || top_level(&text, "last terminating signal").is_some());
+        assert_eq!(tools::print_finished(&text), ended, "{label}");
+        for (at, key) in ["state", "pid", "last exit code"].into_iter().enumerate() {
+            if nested(&text, key) {
+                with_nested[at] += 1;
+                if !kept.contains(&key) {
+                    kept.push(key);
+                    capture(&format!("print_nested_{}", key.replace(' ', "_")), &exec);
+                }
+            }
+        }
+    }
+    let summary = format!(
+        "listed {listed} of {} services; with a nested state: {}, pid: {}, last exit code: {}\n",
+        labels.len(),
+        with_nested[0],
+        with_nested[1],
+        with_nested[2]
+    );
+    fs::write(out_dir().join("nested_summary.txt"), &summary).unwrap();
+    assert!(listed > 20, "{summary}");
+    assert!(
+        with_nested[0] > 0,
+        "no listing has a nested state: {summary}"
+    );
+}
