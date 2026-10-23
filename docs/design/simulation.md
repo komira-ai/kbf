@@ -41,7 +41,6 @@ What the existing sims do not cover:
   in memory and a restart loses it (issue
   [#137](https://github.com/komira-ai/kbf/issues/137) was found while
   writing this catalog).
-- **Platform and cordon together**, and **rollouts**: no sim drives `RolloutDriver`.
 - **Scale.** At most three workers and 40 operations.
 - **A uniform checker.** Each file checks its own invariants, some at the end of a run
   only, and failures print the seed but no replay command.
@@ -69,8 +68,6 @@ carry it out:
 | Daemon: self-fence T = 40 s from the newest acknowledged send; `Start` valid for W = 14 s from the heartbeat it names; a `Start` for an unacknowledged lease ignored; results resent until acknowledged | `fence.rs`, `kbf-daemon` | modelled in the worker node |
 | Server: only the newest stream counts; a replaced stream's heartbeats are dropped | `farm.rs` (`is_current`) | modelled in the leader node |
 | Node identity bound to the certificate, deny list | `kbf-server/src/identity.rs` | no: not scheduler state (a duplicate node id is simulated, F2.12) |
-| Rollout record: steps, `max_unavailable` counted per rollout | `kbf-types/src/rollout.rs` | yes |
-| Rollout driver: cordon up to `max_unavailable`, drain, hand a drained, connected node its update; hold on anything else | `kbf-server/src/rollout.rs` | yes, through its `Fleet` trait |
 
 **Planned, so not simulated** (a scenario for any of these waits for the code): the
 infra retry budget (issue
@@ -259,11 +256,9 @@ inheriting the queue.
 ### F3. Platform routing, cordon, drain and rollouts together
 
 **Harness.** Two parts. In `kbf-sched`, one in-process world that joins `sim_platform`'s
-platforms and outages with `sim_cordon`'s operator, as family file `f3_fleet.rs`. In
-`kbf-server`, a new `tests/sim_rollout.rs` that runs the real `RolloutDriver` and
-`MemoryRolloutStore` over a `Fleet` implemented on a `kbf_sched::Scheduler` fed with
-virtual time (the trait is public; `kbf-sim` becomes a dev-dependency of
-`kbf-server`), with an `Applier` that records hand-overs and refuses some.
+platforms and outages with `sim_cordon`'s operator, as family file `f3_fleet.rs`. The
+rollout half (a driver over the scheduler) went with the rollout record: updates are
+OS packages driven by `kbf-updater`.
 
 | # | Scenario | Generator | Checks beyond the invariants |
 |---|---|---|---|
@@ -294,9 +289,6 @@ and soak, and the steps after `updating`.
 | a drain requeues the worker's leases | `scheduler.rs` | F3.4, F3.5 (I9) |
 | `uncordon` does not place at once | `scheduler.rs` | F3.1 |
 | the matching memo is keyed by the first request of the round only | `servable.rs` | F3.8, F4 (I7) |
-| `Rollout::advance` counts with `>` instead of `>=` (one node too many out) | `kbf-types/src/rollout.rs` | F3.5 |
-| the driver acts on the node before recording the step | `kbf-server/src/rollout.rs` | F3.9 |
-| the driver hands over an update without reading the placement again | `kbf-server/src/rollout.rs` | F3.6, with the operator's uncordon injected between the driver's two reads |
 
 ### F4. Large randomized fleets
 
@@ -327,7 +319,7 @@ each PR that adds it reports which of the F1 to F3 mutants it catches on its own
 1. This catalog.
 2. The shared checker and the in-process world (`tests/sim/`), with `sim_platform`
    and `sim_cordon` moved onto them unchanged in what they check, then F1.
-3. F3 in `kbf-sched`, then `sim_rollout` in `kbf-server`.
+3. F3 in `kbf-sched`.
 4. The cell nodes moved out of `sim_cell`, the daemon model completed, then F2 (F2.9
    ignored on issue #137 until it was fixed).
 5. F4.
