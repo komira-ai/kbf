@@ -36,8 +36,8 @@ pub struct Cmd {
     pub timeout: Option<Duration>,
     /// Variables the child sees besides the fixed three.
     pub env: Vec<(String, String)>,
-    /// The user and group the child runs as; none for the caller's own. A root caller
-    /// drops its supplementary groups too.
+    /// The user and group the child runs as; none for the caller's own. A drop is made only
+    /// by a process whose real uid is root, which empties the child's supplementary groups.
     pub run_as: Option<Identity>,
     /// Bytes written to the child's standard input, which is then closed; none for an
     /// input that is closed at once.
@@ -119,8 +119,27 @@ fn wait_within(child: &mut Child, limit: Duration) -> io::Result<Option<ExitStat
     }
 }
 
+/// Refuse a privilege drop from a process whose effective uid is root and real uid is not
+/// (a setuid-style launch). The standard library empties the supplementary groups only when
+/// the REAL uid is root, so such a drop would keep the caller's groups (`wheel`, `admin`).
+/// (`CommandExt::groups` would set them empty explicitly; it is not stable.)
+fn refuse_setuid_drop(cmd: &Cmd, uid: u32, euid: u32) -> io::Result<()> {
+    if cmd.run_as.is_some() && euid == 0 && uid != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "a privilege drop needs a real uid of root: the supplementary groups would stay",
+        ));
+    }
+    Ok(())
+}
+
 impl Runner for SystemRunner {
     fn run(&self, cmd: &Cmd) -> io::Result<Exec> {
+        refuse_setuid_drop(
+            cmd,
+            rustix::process::getuid().as_raw(),
+            rustix::process::geteuid().as_raw(),
+        )?;
         let mut command = Command::new(&cmd.program);
         command
             .args(&cmd.args)

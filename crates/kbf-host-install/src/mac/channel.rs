@@ -4,16 +4,19 @@
 //! ```toml
 //! [channels.stable]
 //! dir = "/usr/local/kbf-host-install/stable"
-//! sums = "/usr/local/etc/kbf/host-install/stable.SHA256SUMS"
+//! sums = "/usr/local/etc/kbf/host-install/stable.SHA256SUMS"   # optional
 //! source_ref = "refs/heads/main"          # optional; this is the default
 //! ```
 //!
 //! - `dir` is where the release files are put: `kbf-<commit>-darwin-arm64.tar.gz` and its
 //!   `.sigstore.json` bundle. Whoever puts them there is not trusted; they are copied
 //!   once and checked.
-//! - `sums` is the pinned `SHA256SUMS` of the releases the channel offers: root's alone to
-//!   write, like the allowlist itself. A tarball is taken only when its sha256 is listed
-//!   there.
+//! - `sums` is optional. The trust anchor is the build attestation, which every release
+//!   must pass whether or not the channel has sums. When the channel sets `sums`, it is an
+//!   extra freeze list: the pinned `SHA256SUMS` of the releases the channel offers, root's
+//!   alone to write like the allowlist itself, and a release is taken only when its
+//!   tarball's sha256 is listed there. When it does not, the release is the one tarball in
+//!   `dir` whose commit starts with the version's 12 hex digits.
 //! - `source_ref` is the branch the attestation must have been made for.
 
 use std::collections::BTreeMap;
@@ -33,7 +36,7 @@ pub const DEFAULT_SOURCE_REF: &str = "refs/heads/main";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MacChannel {
     pub dir: PathBuf,
-    pub sums: PathBuf,
+    pub sums: Option<PathBuf>,
     pub source_ref: String,
 }
 
@@ -47,7 +50,7 @@ struct File {
 #[serde(deny_unknown_fields)]
 struct Entry {
     dir: PathBuf,
-    sums: PathBuf,
+    sums: Option<PathBuf>,
     source_ref: Option<String>,
 }
 
@@ -75,7 +78,7 @@ impl MacAllowlist {
         let well_formed = file.channels.iter().all(|(name, entry)| {
             Channel::new(name).is_ok()
                 && plain(&entry.dir)
-                && plain(&entry.sums)
+                && entry.sums.as_deref().is_none_or(plain)
                 && entry.source_ref.as_deref().is_none_or(is_branch_ref)
         });
         if !well_formed {
@@ -86,7 +89,7 @@ impl MacAllowlist {
         })
     }
 
-    /// The channel `name`, once its pinned sums are known to be root's.
+    /// The channel `name`, once its pinned sums (if it has any) are known to be root's.
     ///
     /// # Errors
     /// [`Refusal::ChannelNotAllowed`], [`Refusal::ConfigUnsafe`] or
@@ -96,7 +99,9 @@ impl MacAllowlist {
             .channels
             .get(name.as_str())
             .ok_or(Refusal::ChannelNotAllowed)?;
-        trust.check_file(&entry.sums).map_err(refusal)?;
+        if let Some(sums) = &entry.sums {
+            trust.check_file(sums).map_err(refusal)?;
+        }
         Ok(MacChannel {
             dir: entry.dir.clone(),
             sums: entry.sums.clone(),

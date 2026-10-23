@@ -430,6 +430,13 @@ impl Sim {
                         return exec(5, "", "Bootstrap failed: 5: Input/output error");
                     }
                     self.loaded.borrow_mut().insert(DAEMON_LABEL.to_owned());
+                    // The daemon executes the release `current` names, unless a test says
+                    // the file it runs is not that one.
+                    let named = fs::read_link(self.host.current()).ok();
+                    if let (false, Some(target)) = (self.is_broken("runs-stale"), named) {
+                        *self.running_path.borrow_mut() =
+                            Some(self.host.kit.join(target).join("kbf"));
+                    }
                     if self.welcome.get() && self.daemon_bootstraps.get() >= self.welcome_from.get()
                     {
                         use std::io::Write;
@@ -518,12 +525,23 @@ impl Runner for Sim {
                 )
             }
             crate::mac::tools::LSOF if self.is_broken("lsof") => exec(1, "", ""),
+            crate::mac::tools::LSOF if self.is_broken("lsof-start") => {
+                Err(io::Error::other("lsof cannot start"))
+            }
             crate::mac::tools::LSOF => {
                 let path = self.running_path.borrow().clone();
                 let text = path.map_or_else(
                     || "p4242\n".to_owned(),
                     |p| format!("p4242\nftxt\nn{}\nn/usr/lib/dyld\n", p.display()),
                 );
+                // lsof exits 1 when it only warns, with its listing whole.
+                if self.is_broken("lsof-warns") {
+                    return exec(
+                        1,
+                        &text,
+                        "lsof: WARNING: can't stat() apfs file system /x\n",
+                    );
+                }
                 exec(0, &text, "")
             }
             crate::mac::tools::SUDO => self

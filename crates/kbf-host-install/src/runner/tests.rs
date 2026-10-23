@@ -231,3 +231,23 @@ fn a_command_may_run_as_a_user() {
         assert!(SystemRunner.run(&c).is_err());
     }
 }
+
+/// A privilege drop is refused to a process whose effective uid is root and real uid is
+/// not (the standard library would keep the caller's groups); a plain root, a plain user and
+/// a command that drops nothing pass.
+#[test]
+fn a_privilege_drop_needs_a_real_uid_of_root() {
+    use super::{Identity, refuse_setuid_drop};
+    let mut drop = cmd("/usr/bin/id", &[]);
+    drop.run_as = Some(Identity {
+        uid: 65534,
+        gid: 65534,
+    });
+    let kind = |uid, euid| refuse_setuid_drop(&drop, uid, euid).map_err(|e| e.kind());
+    assert_eq!(kind(1000, 0), Err(std::io::ErrorKind::PermissionDenied));
+    assert_eq!(kind(0, 0), Ok(()));
+    assert_eq!(kind(1000, 1000), Ok(()));
+    assert_eq!(kind(0, 1000), Ok(()));
+    // No drop, no matter who runs it.
+    assert!(refuse_setuid_drop(&cmd("/usr/bin/id", &[]), 1000, 0).is_ok());
+}

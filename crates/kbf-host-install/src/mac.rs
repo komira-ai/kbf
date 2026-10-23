@@ -200,6 +200,7 @@ fn handle_root(
         channel,
         outcome: outcome_word,
         reason,
+        result: None,
         command: request
             .is_err()
             .then(|| command.map(audit::truncate_raw))
@@ -293,7 +294,7 @@ fn install_front(
         }
     }
     let staged = stage::stage(host, runner, &channel, version)?;
-    apply::launch(host, runner, &staged, version)?;
+    apply::launch(host, runner, &staged, version, &links)?;
     Ok(Outcome::ApplyStarted {
         version: version.as_str().to_owned(),
         commit: staged.commit,

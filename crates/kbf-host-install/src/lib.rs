@@ -86,6 +86,15 @@ pub mod contract {
     }
 }
 
+/// The Mac's tool command lines and the readers of what the tools print, with the runner
+/// that runs them, for the test that runs them on a real Mac (`tests/real_mac.rs`). Nothing
+/// here is for production code.
+#[doc(hidden)]
+pub mod mac_tools {
+    pub use crate::mac::tools;
+    pub use crate::runner::{Cmd, Exec, Identity, Runner, SystemRunner};
+}
+
 /// The program: handle `SSH_ORIGINAL_COMMAND` against the production paths and exit with
 /// the status of the answer.
 #[must_use]

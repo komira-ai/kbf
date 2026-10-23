@@ -206,6 +206,7 @@ pub fn handle(
         channel,
         outcome: outcome_word,
         reason,
+        result: None,
         command: request
             .is_err()
             .then(|| command.map(|c| audit::truncate_raw(&c.to_string_lossy())))

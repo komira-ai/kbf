@@ -31,6 +31,9 @@ fn an_install_launches_the_apply_job() {
     assert_eq!(plan["commit"], NEW);
     assert_eq!(plan["version"], NEW_VERSION);
     assert_eq!(plan["binary_sha256"].as_str().unwrap().len(), 64);
+    // The links as they were are in the plan.
+    assert_eq!(plan["before_current"], OLD);
+    assert!(plan["before_previous"].is_null());
     assert_eq!(mode(&fx.host.stage().join("plan.json")), 0o600);
     assert_eq!(mode(&fx.host.stage()), 0o700);
     assert_eq!(mode(&fx.host.work), 0o711);

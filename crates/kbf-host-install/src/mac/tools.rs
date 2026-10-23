@@ -54,10 +54,17 @@ pub fn bootstrap(plist: &Path, limit: Duration) -> Cmd {
     }
 }
 
-/// The lines of `launchctl print` that name a value, as `key = value`.
+/// The value of a top-level field of a `launchctl print` listing: a line of one tab, then
+/// `key = value`. The job's nested blocks (`arguments`, `endpoints`, `event triggers`, ...)
+/// are indented further and carry fields of their own, `state` among them; they are never
+/// read.
 fn print_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     text.lines().find_map(|line| {
-        let (name, value) = line.trim().split_once(" = ")?;
+        let field = line.strip_prefix('\t')?;
+        if field.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let (name, value) = field.split_once(" = ")?;
         (name == key).then_some(value.trim())
     })
 }
@@ -88,7 +95,7 @@ pub fn print_finished(text: &str) -> bool {
 pub fn lsof_text(pid: u32, limit: Duration) -> Cmd {
     cmd(
         LSOF,
-        &["-nP", "-a", "-p", &pid.to_string(), "-d", "txt", "-F", "n"],
+        &["-nPw", "-a", "-p", &pid.to_string(), "-d", "txt", "-F", "n"],
         limit,
     )
 }
@@ -233,6 +240,9 @@ impl Attest<'_> {
             args.push(flag.into());
             args.push(value.into());
         }
+        // The tarball is hashed by `gh` itself: its sha256 must be a subject of the statement.
+        args.push("--digest-alg".into());
+        args.push("sha256".into());
         args.push("--deny-self-hosted-runners".into());
         Cmd {
             program: path_arg(self.gh),
