@@ -37,7 +37,7 @@
 
 use std::collections::BTreeSet;
 
-use kbf_sched::Event;
+use kbf_sched::{Cordon, Event, Input};
 use kbf_types::StartLease;
 
 use super::owner::owner_key;
@@ -478,6 +478,30 @@ impl State {
             let worker = worker.clone();
             self.feed_quiet(now, Event::Uncordon { worker });
         }
+    }
+
+    /// Puts `worker` back in the drain its `cordon/` row says, if the drain ended for want of
+    /// a lease. A start takes up no leased operation, so a drain taken up at the start finds
+    /// its node holding no lease and ends; the node's leases are taken up when it says
+    /// `Hello` ([`State::claim_worker`], which calls this after taking them up), and a node
+    /// that runs work is not drained.
+    pub(super) fn resume_drain(&mut self, now: FarmTime, worker: &WorkerId) {
+        if self.sched.cordon(worker) != Some(&Cordon::Drained) {
+            return;
+        }
+        let mut stored = None;
+        self.durably("a cordon look", |d| {
+            stored = Some((d.cordons()?, d.store_ms()));
+            Ok(())
+        });
+        let drain = stored.and_then(|(rows, at)| {
+            let row = rows.into_iter().find(|(named, _)| named == worker);
+            row.map(|(named, cordon)| cordon_event(named, cordon, now, at))
+        });
+        drain.into_iter().for_each(|event| {
+            let none = self.sched.apply(Input::new(now, event));
+            debug_assert!(none.is_empty(), "a cordon has no effect: {none:?}");
+        });
     }
 
     /// Raises the memory floors the scheduler holds lower than the store's: another

@@ -1424,9 +1424,8 @@ impl State {
     /// same ids, not only as many.
     fn forget_dropped(&mut self) {
         let (sched, intake) = (&self.sched, &self.intake);
-        let held = |operation: OperationId| {
-            sched.state(operation).is_some() || intake.keeps(operation)
-        };
+        let held =
+            |operation: OperationId| sched.state(operation).is_some() || intake.keeps(operation);
         let forgotten = self.machine.forget_dropped(held);
         self.answered
             .retain(|_, operation| sched.state(*operation).is_some());

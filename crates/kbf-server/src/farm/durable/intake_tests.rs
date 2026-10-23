@@ -214,9 +214,12 @@ async fn callers_follow_an_operation_through_a_failed_look_until_they_cancel() {
     let other = durable_over(&store);
     grant(&other, operation.0, 0, "node-b").expect("granted by another frontend");
 
+    // The farm has no daemon, so its callers were told at the submit that no worker can run
+    // the operation: that is what a look that fails must leave them showing.
+    assert!(matches!(*ticket.stage.borrow(), Stage::Waiting(_)));
     store.fail_reads(Some("done/"));
     farm.intake();
-    assert!(matches!(*ticket.stage.borrow(), Stage::Queued));
+    assert!(matches!(*ticket.stage.borrow(), Stage::Waiting(_)));
     assert_eq!(farm.lock().intake.following(), 1);
 
     store.fail_reads(None);
@@ -502,11 +505,7 @@ fn a_key_floor_row_keeps_the_larger_ask_and_its_name() {
     let store = Racing::new();
     let durable = durable_over(&store);
     let row_key = floor::key_row(9);
-    let held = |ask: u64, stamp: u64| KeyFloor {
-        key: 9,
-        ask,
-        stamp,
-    };
+    let held = |ask: u64, stamp: u64| KeyFloor { key: 9, ask, stamp };
     overwrite(
         &store,
         &row_key,

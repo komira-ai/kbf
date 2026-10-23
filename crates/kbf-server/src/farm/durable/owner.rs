@@ -350,8 +350,9 @@ impl Durable {
 impl State {
     /// A daemon said `Hello` here as `worker`, whose newest stream is `instance`'s: this
     /// frontend becomes its owner, takes up the leases the store holds for it that the
-    /// scheduler does not hold, and reads what the node's session row said before the
-    /// registration replaces it. Call it before the registration is written and the worker
+    /// scheduler does not hold (a drain of the node that ended at the start, for want of a
+    /// lease, is put back in force: [`State::resume_drain`]), and reads what the node's
+    /// session row said before the registration replaces it. Call it before the registration is written and the worker
     /// is fed to the scheduler.
     ///
     /// The leases the scheduler recovered for the node wait for it to register, as they
@@ -380,6 +381,7 @@ impl State {
                 self.take_in_stored(op);
             }
         }
+        self.resume_drain(now, worker);
         let moved = match arrival.previous {
             Some(owner) => owner.frontend != arrival.frontend,
             None => false,
