@@ -5,8 +5,9 @@ use super::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::cli::{ProxyArgs, ReleaseSource};
+use crate::cli::ProxyArgs;
 use crate::layout::{Layout, Platform};
+use crate::setup::raw_from;
 use crate::state::{Locked, PendingConfirm, State};
 use crate::testkit::{A, B, c, host_root_on};
 
@@ -394,8 +395,8 @@ fn the_visible_verbs_are_the_contracts() {
     assert_eq!(hidden, ["stage", "activate", "fetch-child"]);
 }
 
-/// Catches required flags becoming optional: a confirm without the activation it names, a
-/// bad id, an unknown mode or a mirror flag value.
+/// Asserts that required flags stay required: a confirm without the activation it names, a
+/// bad id, an unknown mode or a flag value that is not a number.
 #[test]
 fn flags_are_required_and_checked_by_the_parser() {
     let bad: [&[&str]; 6] = [
@@ -403,7 +404,7 @@ fn flags_are_required_and_checked_by_the_parser() {
         &["confirm", "--id", "42"],
         &["setup"],
         &["setup", "--mode=node"],
-        &["setup", "--mode=daemon", "--release-source=ftp"],
+        &["setup", "--mode=daemon", "--min-generation=x"],
         &["confirm", "3-42"],
     ];
     for args in bad {
@@ -1266,19 +1267,18 @@ fn a_path_is_not_joined_to_a_relative_root() {
     );
 }
 
-/// Catches the release keys' flags missing from the command line of `setup`: `bundled` is a
-/// value of `--release-source`, and the four flags that write `release_ca` and the frontend
-/// snapshot reach the arguments `setup` validates, each by its own name. (The checks and the
-/// writing are `setup/release_config_tests.rs`'s.)
-///
-/// Mutants to plant: `Bundled` removed from `ReleaseSource`; a flag renamed; the flattened
-/// `ReleaseFlags` removed from `SetupArgs`.
+/// Asserts that `setup` still takes the flags of the release source, the release keys and the
+/// first release, each by its own name and with the values it took before (a script that passes
+/// them keeps working for one release), and that they reach the retired flags, which are what
+/// the warning is made from; without them nothing is retired.
 #[test]
-fn setup_takes_bundled_and_the_release_key_flags() {
+fn setup_still_takes_the_flags_of_the_release_source_and_the_first_release() {
     let cli = parse(&[
         "setup",
         "--mode=daemon",
         "--release-source=bundled",
+        "--release-url",
+        "https://r.example/kbf",
         "--release-ca",
         "/ca.pem",
         "--frontend-worker-url",
@@ -1287,24 +1287,49 @@ fn setup_takes_bundled_and_the_release_key_flags() {
         "/fe.pem",
         "--frontend-ca-sha256",
         "ab",
+        "--commit",
+        "0123456789abcdef0123456789abcdef01234567",
     ]);
     let Verb::Setup(args) = &cli.verb else {
         panic!("not the setup verb");
     };
-    assert_eq!(args.release_source, Some(ReleaseSource::Bundled));
-    assert_eq!(args.release.release_ca.as_deref(), Some("/ca.pem"));
+    assert_eq!(args.retired.release_source.as_deref(), Some("bundled"));
     assert_eq!(
-        args.release.frontend_worker_url.as_deref(),
+        args.retired.release_url.as_deref(),
+        Some("https://r.example/kbf")
+    );
+    assert_eq!(args.retired.release_ca.as_deref(), Some("/ca.pem"));
+    assert_eq!(
+        args.retired.frontend_worker_url.as_deref(),
         Some("https://w.example:8981")
     );
-    assert_eq!(args.release.frontend_ca.as_deref(), Some("/fe.pem"));
-    assert_eq!(args.release.frontend_ca_sha256.as_deref(), Some("ab"));
+    assert_eq!(args.retired.frontend_ca.as_deref(), Some("/fe.pem"));
+    assert_eq!(args.retired.frontend_ca_sha256.as_deref(), Some("ab"));
+    assert_eq!(args.retired.given().len(), 7);
     let plain = parse(&["setup", "--mode=daemon"]);
     let Verb::Setup(args) = &plain.verb else {
         panic!("not the setup verb");
     };
-    assert_eq!(
-        args.release,
-        crate::setup::release_keys::ReleaseFlags::default()
-    );
+    let none = crate::setup::retired::RetiredFlags::default();
+    assert_eq!(args.retired, none);
+}
+
+/// Asserts that the values `setup` is run with carry the retired flags the command line gave,
+/// named in the order they are declared in: the warning is made from them, so a command line
+/// whose retired flags were dropped on the way would run without one.
+#[test]
+fn the_retired_flags_on_the_command_line_reach_the_values_setup_runs_with() {
+    let cli = parse(&[
+        "setup",
+        "--mode=daemon",
+        "--commit",
+        "0123456789abcdef0123456789abcdef01234567",
+        "--release-url",
+        "https://r.example/kbf",
+    ]);
+    let Verb::Setup(args) = &cli.verb else {
+        panic!("not the setup verb");
+    };
+    let raw = raw_from(args);
+    assert_eq!(raw.retired.given(), ["--release-url", "--commit"]);
 }
