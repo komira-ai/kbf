@@ -572,7 +572,7 @@ fn own(dir: &OwnedFd, (uid, gid, mode): (u32, u32, u32), flags: u32) -> io::Resu
     Ok(())
 }
 
-/// Removes every extended attribute of the open directory `dir`.
+/// Removes the extended attributes of the open directory `dir` that can be removed.
 fn strip_xattrs(dir: &OwnedFd) -> io::Result<()> {
     for name in super::assert::xattrs_of(dir)? {
         let name = std::ffi::CString::new(name).map_err(io::Error::other)?;
@@ -580,8 +580,10 @@ fn strip_xattrs(dir: &OwnedFd) -> io::Result<()> {
         // attribute name.
         if unsafe { libc::fremovexattr(dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
             let why = io::Error::last_os_error();
-            // One that went since the listing is removed.
-            if why.raw_os_error() != Some(libc::ENOATTR) {
+            // One that went since the listing is removed. One the system protects (the
+            // entry's folders carry some) cannot be, and stays: the baseline records it,
+            // and the assertion finds any other that stays.
+            if !matches!(why.raw_os_error(), Some(libc::ENOATTR | libc::EPERM)) {
                 return Err(why);
             }
         }
