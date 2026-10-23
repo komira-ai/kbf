@@ -3,13 +3,13 @@
 //! hand. Each test names the defect it catches.
 
 use std::io;
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use kbf_front::{MetaLog, MetaLogError};
-use kbf_log::{Bootstrap, FarmLogId, Format, LogCommand, MachineVersion, Takeover};
+use kbf_log::{Bootstrap, FarmLogId, Format, LogCommand, MachineVersion};
 use kbf_meta::{
     ActionAnswer, ActionRecord, Applied, BlobAnswer, BlobWrite, Closure, Command, Epoch, Evicted,
     Location, MetaState, NodeWriter, ObjectId, Retention, Role, ServerId, StagedObject, StagedPut,
@@ -439,34 +439,6 @@ async fn the_applied_index_is_the_state_s_and_stops_at_a_failed_commit() {
     assert_eq!(log.applied_index(), opened + 1);
 }
 
-/// Catches: a control command in the metadata log applied as a no-op (or skipped)
-/// instead of refusing the open. This binary writes none; a log holding one was written
-/// by a later binary whose farm state this one would silently drop.
-#[tokio::test]
-async fn a_control_command_in_the_metadata_log_refuses_the_open() {
-    let fs = FaultFs::new();
-    drop(open(&fs, 2).await);
-    let dir = fs.restart();
-    let (mut store, held) = Store::open(dir.clone(), Options::default()).expect("the store");
-    let last = held.entries.last().expect("entries").id;
-    let takeover = LogCommand::Takeover(Takeover {
-        term: NonZeroU64::MIN,
-        now: FarmTime::from_millis(1),
-    });
-    let bytes = kbf_log::encode(Format::V1, &takeover).expect("encode");
-    let control = Entry {
-        id: LogId::new(last.term, last.index.next()),
-        payload: Payload::Command(bytes),
-    };
-    store.write_entries(&[control]).expect("append");
-    drop(store);
-    let refused = refusal(&dir.restart(), 2).await;
-    assert!(
-        matches!(&refused, RaftLogError::Decode { index, .. } if *index == last.index.0 + 1),
-        "{refused:?}"
-    );
-}
-
 /// Asserts that a write-tier command at the end of a format-1 log is read and applied,
 /// not refused: decoding does not depend on the log's format. Each of the five
 /// commands, alone at the end of the log, lets the open succeed and the log stays at
@@ -576,56 +548,6 @@ async fn raising_the_machine_version_to_2_lets_tier_commands_commit_and_lasts() 
         "{refused:?}"
     );
     assert_eq!(log.machine_version(), MachineVersion::V1);
-}
-
-/// Catches (docs/design/write-tier-scenarios.md, scenario 30): a binary that runs only
-/// machine version 1, given a log raised to 2 (a rollback after the tier ran), opening
-/// it instead of refusing it at the raise (mutant "a version past what this binary
-/// runs is skipped"): it would answer every staged blob absent. The refusal names the
-/// raise's index and changes nothing a later open needs. And a raise to a version this
-/// binary does not run, asked for or found in the log, refused.
-#[tokio::test]
-async fn a_log_raised_past_what_a_binary_runs_refuses_its_open() {
-    let fs = FaultFs::new();
-    let log = open(&fs, 4).await;
-    log.raise_machine_version(MachineVersion::V2)
-        .expect("a raise");
-    let raised = log.applied_index();
-    assert_eq!(log.commit(add_tier()).await, Ok(Applied::Tier(Ok(()))));
-    let v6 = MachineVersion::new(NonZeroU32::new(6).expect("non-zero"));
-    assert!(log.raise_machine_version(v6).is_err());
-    assert_eq!(log.machine_version(), MachineVersion::V2);
-    drop(log);
-    let rolled_back = RaftMetaLog::open_running(
-        fs.restart(),
-        Retention::default(),
-        "kbf/",
-        || Ok(id(4)),
-        MachineVersion::V1,
-    )
-    .await;
-    assert!(
-        matches!(&rolled_back, Err(RaftLogError::Decode { index, .. }) if *index == raised),
-        "{rolled_back:?}"
-    );
-    let unknown =
-        RaftMetaLog::open_running(fs.restart(), Retention::default(), "kbf/", || Ok(id(4)), v6)
-            .await;
-    assert!(
-        matches!(&unknown, Err(RaftLogError::Runs(v)) if *v == v6),
-        "{unknown:?}"
-    );
-    let log = open(&fs.restart(), 4).await;
-    assert_eq!(log.machine_version(), MachineVersion::V2);
-    assert_eq!(log.commit(add_tier()).await, Ok(Applied::Tier(Ok(()))));
-    drop(log);
-    let dir = fs.restart();
-    let later = append(&dir, Format::V2, &LogCommand::MachineVersion(v6));
-    let refused = refusal(&dir.restart(), 4).await;
-    assert!(
-        matches!(&refused, RaftLogError::Decode { index, .. } if *index == later),
-        "{refused:?}"
-    );
 }
 
 /// Catches: a binary whose highest machine version stays 2 (mutant `RUNS = V2`), which

@@ -116,7 +116,7 @@ impl Durable {
         };
         let request = request_row(&key, &row)?;
         let mut lease = None;
-        for (key, row) in self.store.scan_prefix("lease/")? {
+        for (key, row) in self.scan_known("lease/")? {
             let grant = lease_row(&key, &row)?;
             if grant.operation == operation {
                 lease = Some(grant);

@@ -771,16 +771,18 @@ impl Server {
 }
 
 /// A rollback of the binary at the end of a run (scenario 30): the durable log opened
-/// by a binary that runs only machine version 1.
+/// by a binary that runs only machine version 1, which skips the raise to version 2.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rollback {
     /// The index of the entry raising the log to machine version 2.
     pub raised_at: Option<u64>,
     /// The index of the first write tier command.
     pub first_tier_command: Option<u64>,
-    /// Why the version-1 open was refused (`raft log: entry <index>: ..` when it
-    /// stopped at an entry); `None` if it opened.
-    pub refused: Option<String>,
+    /// How many entries the version-1 open skipped (the raise to version 2, which it does
+    /// not run); `None` if it was refused.
+    pub older_skipped: Option<u64>,
+    /// Whether the version-1 open reads the staged table the server holds.
+    pub older_reads_same: bool,
     /// Whether this binary still opens the log after that, to the same staged table.
     pub reopened: bool,
 }
@@ -824,18 +826,24 @@ impl Server {
                 runs,
             ))
         };
-        let refused = open(MachineVersion::V1).err().map(|e| e.to_string());
         let staged = up.query(StagedSnapshot::of);
-        let reopened = open(RUNS)
-            .ok()
-            .is_some_and(|log| super::ready(log.query(StagedSnapshot::of)) == Ok(staged));
+        let older = open(MachineVersion::V1).ok();
+        let older_skipped = older.as_ref().map(RaftMetaLog::skipped_entries);
+        let older_reads_same = older.is_some_and(|log| holds(&log, &staged));
+        let reopened = open(RUNS).ok().is_some_and(|log| holds(&log, &staged));
         Some(Rollback {
             raised_at,
             first_tier_command,
-            refused,
+            older_skipped,
+            older_reads_same,
             reopened,
         })
     }
+}
+
+/// Whether `log` holds the staged table `staged`.
+fn holds(log: &RaftMetaLog<FaultFs>, staged: &StagedSnapshot) -> bool {
+    super::ready(log.query(StagedSnapshot::of)) == Ok(staged.clone())
 }
 
 #[cfg(test)]

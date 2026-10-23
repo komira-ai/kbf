@@ -8,9 +8,9 @@
 //! the ones A leased on the daemon's report, the ones A queued on new leases. Every stream
 //! open on A ends with the result B committed, through A's follower of the `done/` rows.
 //!
-//! The body runs over the in-memory store in every test run and over a real Postgres
-//! schema in the `state-postgres` CI job (`two_children` is its name filter there); the
-//! store is the only thing that differs between the two.
+//! The body runs over the in-memory store and over a real Postgres schema (the server
+//! `KBF_TEST_POSTGRES_URL` names; that test fails without it); the store is the only thing
+//! that differs between the two.
 
 use std::collections::HashMap;
 
@@ -263,10 +263,8 @@ async fn fifty_builds_across_a_takeover_over_the_fake() {
 /// is the installer's, made for this test alone (the other tests of the binary share none
 /// of it).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 async fn fifty_builds_across_a_takeover_over_postgres() {
-    let url = std::env::var("KBF_TEST_POSTGRES_URL")
-        .expect("KBF_TEST_POSTGRES_URL names a database the test may create schemas in");
+    let url = kbf_testkit::database::server_url();
     // Declared first, so the schema is dropped after both stores are gone.
     let backend = PostgresBackend::new(&url, PgFlaw::None);
     let config = backend.fresh_config();

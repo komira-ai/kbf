@@ -21,7 +21,9 @@
 //!   certificate's public key ([`certs`]);
 //! - the cold store's S3 key pair is in the environment ([`env`]);
 //! - the container driver's `crun` ([`env`]);
-//! - the open-file limit in force is the floor the units set ([`env`], a warning).
+//! - the open-file limit in force is the floor the units set ([`env`], a warning);
+//! - a frontend names its state store, with `--state-store` or the `state-store` key
+//!   ([`state_store`]; a function of the flags alone, not of [`Needs`]).
 //! - the host rules `kbf-deploy linux check-units` had (re-homed here; the verb is retired): the directories above a `file://` `--hot-store`
 //!   can be entered by the user kbf runs as ([`traverse`]); the cgroup kbf runs in keeps
 //!   every CPU and NUMA node of the node, for a daemon on the container driver
@@ -47,6 +49,9 @@ mod files;
 mod needs;
 #[cfg(test)]
 mod proxy_secret_tests;
+mod state_store;
+#[cfg(test)]
+mod state_store_tests;
 #[cfg(test)]
 mod tests;
 mod traverse;
@@ -257,12 +262,21 @@ pub fn check(needs: &Needs, host: &dyn Host) -> Report {
     report
 }
 
+/// What a start of `invocation` is checked on: its needs against this host, and the flags
+/// it must be given. A start and `--check` both print this report, so they agree.
+fn findings(invocation: &Invocation, config: &Path) -> (Needs, Report) {
+    let needs = needs_in(invocation, config);
+    let mut report = check(&needs, &System);
+    state_store::check(invocation, &mut report);
+    (needs, report)
+}
+
 /// The refusal of `invocation`, printed to standard error, if its host does not meet
-/// what it needs; `None` to go on and start.
+/// what it needs or its flags leave out a store it cannot start without; `None` to go on
+/// and start.
 #[must_use]
 pub fn refusal(invocation: &Invocation, config: &Path) -> Option<ExitCode> {
-    let needs = needs_in(invocation, config);
-    let report = check(&needs, &System);
+    let (needs, report) = findings(invocation, config);
     eprint!("{}", report.render(needs.mode));
     report.exit_status().map(ExitCode::from)
 }
@@ -273,8 +287,7 @@ pub fn refusal(invocation: &Invocation, config: &Path) -> Option<ExitCode> {
 /// 0, [`REFUSED`] or [`NOT_READY`].
 #[must_use]
 pub fn check_only(invocation: &Invocation, config: &Path) -> ExitCode {
-    let needs = needs_in(invocation, config);
-    let report = check(&needs, &System);
+    let (needs, report) = findings(invocation, config);
     eprint!("{}", report.render(needs.mode));
     match report.exit_status() {
         Some(code) => ExitCode::from(code),
