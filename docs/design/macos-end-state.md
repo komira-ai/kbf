@@ -302,9 +302,15 @@ A row not refused in its own form sets the slot aside. The profile rows are
 | `write-outside` | `(deny file-write*)` | create a file in `/private/tmp` | `EPERM` or `EACCES` |
 | `link-outside` | `(deny file-write*)` | hard-link `/etc/hosts` into the lease | `EPERM` or `EACCES` |
 | `mach-register` | `(deny mach-register)` | `bootstrap_check_in` of a service name | `kern_return` 1100 (`BOOTSTRAP_NOT_PRIVILEGED`) |
-| `lsopen` | `(deny lsopen)` | `open -g -j -n` of an application | `OSStatus` -54 |
-| `file-mount` | `(deny file-mount)` | `hdiutil attach -mountpoint` of an image on a directory of the lease | `EPERM` |
+| `lsopen` | `(deny lsopen)` | `sandbox_check` of `lsopen`, the question Launch Services asks before it starts an application | denied (`sandbox=1`) |
+| `file-mount` | `(deny file-mount)` | `mount(2)` of a `devfs` on a directory of the lease | `EPERM` |
 | `launchd-bootstrap` | none: `(allow default)` | `launchctl bootstrap user/<uid>` of a `Background` `KeepAlive` agent whose file is in the lease | `Bootstrap failed: 5` |
+
+A slot user has no login session on a node, so `lsopen` cannot be seen working by opening an
+application: `open` and `LSOpenCFURLRef` failed or waited with the rule dropped as with it kept
+(measured on the runner). The canary asks the sandbox the question Launch Services asks. The
+`file-mount` canary mounts a `devfs` itself: a user may mount one on a directory it owns, and
+the runner showed that succeed with the rule dropped and fail with `EPERM` with it kept.
 
 Left open on purpose:
 

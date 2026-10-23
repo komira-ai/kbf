@@ -1,6 +1,6 @@
 //! The doors the profile canaries try beyond a plain file write: a Mach service name
-//! checked in with launchd, an application opened through Launch Services, a disk image
-//! attached on a mount point of the lease, and a launchd agent bootstrapped from a file
+//! checked in with launchd, the sandbox's answer for Launch Services, a file system
+//! mounted on a directory of the lease, and a launchd agent bootstrapped from a file
 //! of the lease. Each is a call (or a system tool) that exists on a Mac alone; what it
 //! says is read back as a [`Seen`] by a function that does not need a Mac, so the
 //! reading is tested on Linux, and a [`Refusal`] is accepted only in the one form the
@@ -21,8 +21,6 @@ pub const BOOTSTRAP_NOT_PRIVILEGED: i32 = 1100;
 /// The error `launchctl bootstrap` prints for a job launchd will not take from a
 /// sandboxed process: `Bootstrap failed: 5: Input/output error`.
 pub const BOOTSTRAP_IO_ERROR: i32 = 5;
-/// `permErr` (-54): what Launch Services answers when the sandbox refuses it.
-pub const PERM_ERR: i32 = -54;
 
 /// How a door says no.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,8 +31,8 @@ pub enum Refusal {
     Kern(i32),
     /// `launchctl bootstrap` failed with this error.
     Bootstrap(i32),
-    /// Launch Services answered this `OSStatus`.
-    OsStatus(i32),
+    /// `sandbox_check` answered this: the operation is denied.
+    Sandbox(i32),
 }
 
 impl fmt::Display for Refusal {
@@ -43,7 +41,7 @@ impl fmt::Display for Refusal {
             Self::Errno(n) => write!(f, "errno={n}"),
             Self::Kern(n) => write!(f, "kern={n}"),
             Self::Bootstrap(n) => write!(f, "bootstrap={n}"),
-            Self::OsStatus(n) => write!(f, "osstatus={n}"),
+            Self::Sandbox(n) => write!(f, "sandbox={n}"),
         }
     }
 }
@@ -58,7 +56,7 @@ impl Refusal {
             "errno" => Some(Self::Errno(n)),
             "kern" => Some(Self::Kern(n)),
             "bootstrap" => Some(Self::Bootstrap(n)),
-            "osstatus" => Some(Self::OsStatus(n)),
+            "sandbox" => Some(Self::Sandbox(n)),
             _ => None,
         }
     }
@@ -66,7 +64,7 @@ impl Refusal {
 
 /// How long a tool the probe runs may take: a door that hangs is a door that proved
 /// nothing, and the daemon waits [`super::WITHIN`] for the whole probe.
-const TOOL_WITHIN: Duration = Duration::from_secs(4);
+const TOOL_WITHIN: Duration = Duration::from_secs(3);
 
 /// What a tool the probe ran gave back.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -164,11 +162,14 @@ pub fn check_in(_name: &str) -> io::Result<i32> {
 
 /// `refusal` as a refusal of `op` if that is how `op`'s door says no; otherwise a
 /// failure that names it, which proves nothing about the door.
-fn refused(op: Op, refusal: Refusal) -> Seen {
+fn refused(op: Op, refusal: Refusal, out: &Out) -> Seen {
     if op.refusals().contains(&refusal) {
         Seen::Refused(refusal)
     } else {
-        Seen::Failed(format!("not a refusal of this door: {refusal}"))
+        Seen::Failed(format!(
+            "not a refusal of this door: {refusal}; {}",
+            said(out)
+        ))
     }
 }
 
@@ -199,94 +200,138 @@ pub fn mach_register(fs: &dyn Fs) -> Seen {
     let name = format!("com.kbf.canary.{}", std::process::id());
     match fs.check_in(&name) {
         Ok(0) => Seen::Allowed,
-        Ok(n) => refused(Op::MachRegister, Refusal::Kern(n)),
+        Ok(n) => refused(Op::MachRegister, Refusal::Kern(n), &Out::default()),
         Err(e) => Seen::Failed(e.to_string()),
     }
 }
 
-/// What `open` said about `app`: opened, or answered with an `OSStatus`.
-fn read_open(out: &Out) -> Seen {
-    if out.code == Some(0) {
-        return Seen::Allowed;
-    }
-    let status = number_after(&out.text, "Code=").or_else(|| number_after(&out.text, "error "));
-    status.map_or_else(
-        || Seen::Failed(said(out)),
-        |n| refused(Op::LsOpen, Refusal::OsStatus(n)),
-    )
-}
+/// Mounts a `devfs` on `dir`.
+///
+/// # Errors
+/// The call's error (`EPERM` when the sandbox denies `file-mount`).
+#[cfg(target_os = "macos")]
+pub fn mount_devfs(dir: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
 
-/// Asks Launch Services, through `open`, to open `app` hidden and in the background.
-pub fn ls_open(fs: &dyn Fs, app: &Path) -> Seen {
-    let args = ["-g", "-j", "-n", &app.to_string_lossy()].map(str::to_owned);
-    match fs.run("/usr/bin/open", &args) {
-        Ok(out) => read_open(&out),
-        Err(e) => Seen::Failed(format!("could not start open: {e}")),
-    }
-}
-
-/// What `hdiutil attach` said: attached, or refused with `EPERM`.
-fn read_attach(out: &Out) -> Seen {
-    if out.code == Some(0) {
-        Seen::Allowed
-    } else if out.text.contains("Operation not permitted") {
-        refused(Op::Mount, Refusal::Errno(libc::EPERM))
+    let dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    // SAFETY: both strings are NUL-terminated and outlive the call; `devfs` takes no data.
+    let made = unsafe { libc::mount(c"devfs".as_ptr(), dir.as_ptr(), 0, std::ptr::null_mut()) };
+    if made == 0 {
+        Ok(())
     } else {
-        Seen::Failed(said(out))
+        Err(io::Error::last_os_error())
     }
 }
 
-/// Makes a disk image at `image` and attaches it on the new directory `mount`; what an
-/// open door attached is detached, and the image and the directory are removed.
-pub fn mount(fs: &dyn Fs, image: &Path, mount: &Path) -> Seen {
-    let seen = mount_image(fs, image, mount);
-    if seen == Seen::Allowed {
-        let _ = fs.run(
-            "/usr/bin/hdiutil",
-            &["detach".into(), "-force".into(), path(mount)],
-        );
+/// Mounts a `devfs` on `dir`.
+///
+/// # Errors
+/// Always: there is no such mount off a Mac.
+#[cfg(not(target_os = "macos"))]
+pub fn mount_devfs(_dir: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "devfs can be mounted on macOS only",
+    ))
+}
+
+/// Unmounts what is mounted on `dir`, by force.
+///
+/// # Errors
+/// The call's error.
+#[cfg(target_os = "macos")]
+pub fn unmount(dir: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    // SAFETY: the string is NUL-terminated and outlives the call.
+    if unsafe { libc::unmount(dir.as_ptr(), libc::MNT_FORCE) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
+}
+
+/// Unmounts what is mounted on `dir`.
+///
+/// # Errors
+/// Always: there is nothing to unmount off a Mac.
+#[cfg(not(target_os = "macos"))]
+pub fn unmount(_dir: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "devfs can be mounted on macOS only",
+    ))
+}
+
+/// Whether this process's sandbox denies `operation` (`sandbox_check`, the question
+/// Launch Services and the kernel ask the sandbox before they act).
+///
+/// # Errors
+/// The operation name cannot be passed; elsewhere there is no sandbox to ask.
+#[cfg(target_os = "macos")]
+pub fn sandbox_denies(operation: &str) -> io::Result<bool> {
+    use std::ffi::{CString, c_char, c_int};
+
+    unsafe extern "C" {
+        fn sandbox_check(pid: libc::pid_t, operation: *const c_char, filter: c_int, ...) -> c_int;
+    }
+    /// `SANDBOX_FILTER_NONE`: the operation alone, no object.
+    const FILTER_NONE: c_int = 0;
+    let operation = CString::new(operation).map_err(io::Error::other)?;
+    // SAFETY: `operation` is a NUL-terminated string that outlives the call, the filter
+    // `SANDBOX_FILTER_NONE` takes no further argument, and the pid is our own.
+    let denied = unsafe { sandbox_check(libc::getpid(), operation.as_ptr(), FILTER_NONE) };
+    Ok(denied != 0)
+}
+
+/// Whether this process's sandbox denies `operation`.
+///
+/// # Errors
+/// Always: there is no sandbox to ask off a Mac.
+#[cfg(not(target_os = "macos"))]
+pub fn sandbox_denies(_operation: &str) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the sandbox can be asked on macOS only",
+    ))
+}
+
+/// Asks the sandbox whether Launch Services may open anything (`lsopen`). A slot user
+/// has no login session on a node, so an application cannot be opened to see the rule
+/// work (`open` and `LSOpenCFURLRef` fail or wait with the rule dropped as with it
+/// kept); the question Launch Services asks before it starts one is asked instead.
+pub fn ls_open(fs: &dyn Fs) -> Seen {
+    match fs.sandbox_denies("lsopen") {
+        Ok(true) => Seen::Refused(Refusal::Sandbox(1)),
+        Ok(false) => Seen::Allowed,
+        Err(e) => Seen::Failed(e.to_string()),
+    }
+}
+
+/// Mounts a `devfs` on the new directory `mount`, which a user may do on a directory
+/// it owns when the sandbox lets it (`mount(2)` is `EPERM` otherwise); what an open
+/// door mounted is unmounted, and the directory is removed.
+pub fn mount(fs: &dyn Fs, mount: &Path) -> Seen {
+    if let Err(e) = fs.make_dir(mount) {
+        return Seen::Failed(format!("mount point: {e}"));
+    }
+    let seen = match fs.mount_devfs(mount) {
+        Ok(()) => {
+            let _ = fs.unmount(mount);
+            Seen::Allowed
+        }
+        Err(e) => e.raw_os_error().map_or_else(
+            || Seen::Failed(e.to_string()),
+            |n| refused(Op::Mount, Refusal::Errno(n), &Out::default()),
+        ),
+    };
     fs.remove(mount);
-    fs.remove(image);
     seen
 }
 
 fn path(p: &Path) -> String {
     p.to_string_lossy().into_owned()
-}
-
-fn mount_image(fs: &dyn Fs, image: &Path, mount: &Path) -> Seen {
-    let make = [
-        "create", "-size", "2m", "-fs", "HFS+", "-volname", "kbf", "-quiet",
-    ]
-    .map(str::to_owned)
-    .into_iter()
-    .chain([path(image)])
-    .collect::<Vec<_>>();
-    match fs.run("/usr/bin/hdiutil", &make) {
-        Ok(out) if out.code == Some(0) => {}
-        Ok(out) => return Seen::Failed(format!("hdiutil create: {}", said(&out))),
-        Err(e) => return Seen::Failed(format!("could not start hdiutil: {e}")),
-    }
-    if let Err(e) = fs.make_dir(mount) {
-        return Seen::Failed(format!("mount point: {e}"));
-    }
-    let attach = [
-        "attach",
-        "-nobrowse",
-        "-noverify",
-        "-noautoopen",
-        "-quiet",
-        "-mountpoint",
-    ]
-    .map(str::to_owned)
-    .into_iter()
-    .chain([path(mount), path(image)])
-    .collect::<Vec<_>>();
-    match fs.run("/usr/bin/hdiutil", &attach) {
-        Ok(out) => read_attach(&out),
-        Err(e) => Seen::Failed(format!("could not start hdiutil: {e}")),
-    }
 }
 
 /// The label of the job the bootstrap canary offers launchd.
@@ -318,7 +363,7 @@ fn read_bootstrap(out: &Out) -> Seen {
     }
     number_after(&out.text, "Bootstrap failed: ").map_or_else(
         || Seen::Failed(said(out)),
-        |n| refused(Op::LaunchdBootstrap, Refusal::Bootstrap(n)),
+        |n| refused(Op::LaunchdBootstrap, Refusal::Bootstrap(n), out),
     )
 }
 
@@ -373,47 +418,10 @@ mod tests {
         assert_eq!(number_after("none", "Code="), None);
     }
 
-    /// Catches an `open` that is refused in a form this reads as open (it exited 0 on a
-    /// refusal), a refusal read from text that holds no status, and the two spellings
-    /// of the status `open` prints.
+    /// Catches a bootstrap read as refused for the wrong text, and a failure report that
+    /// loses what the tool said.
     #[test]
-    fn open_is_read_as_opened_or_refused_with_its_status() {
-        assert_eq!(read_open(&out(0, "")), Seen::Allowed);
-        let domain =
-            "The application cannot be opened. Error Domain=NSOSStatusErrorDomain Code=-54";
-        assert_eq!(
-            read_open(&out(1, domain)),
-            Seen::Refused(Refusal::OsStatus(-54))
-        );
-        let old = "_LSOpenURLsWithRole() failed with error -54.";
-        assert_eq!(
-            read_open(&out(1, old)),
-            Seen::Refused(Refusal::OsStatus(-54))
-        );
-        assert!(matches!(read_open(&out(1, "no status")), Seen::Failed(_)));
-        assert!(matches!(read_open(&out(1, "Code=-600")), Seen::Failed(_)));
-        let killed = Out {
-            code: None,
-            text: String::new(),
-        };
-        assert!(matches!(read_open(&killed), Seen::Failed(_)));
-    }
-
-    /// Catches an attach or a bootstrap read as refused for the wrong text, and a failure
-    /// report that loses what the tool said.
-    #[test]
-    fn attach_and_bootstrap_are_read_by_their_own_words() {
-        assert_eq!(read_attach(&out(0, "")), Seen::Allowed);
-        let no = "hdiutil: attach failed - Operation not permitted";
-        assert_eq!(
-            read_attach(&out(1, no)),
-            Seen::Refused(Refusal::Errno(libc::EPERM))
-        );
-        let busy = read_attach(&out(1, "\nhdiutil: attach failed - Resource busy\n"));
-        assert_eq!(
-            busy,
-            Seen::Failed("exit Some(1): hdiutil: attach failed - Resource busy".to_owned())
-        );
+    fn bootstrap_is_read_by_its_own_words() {
         assert_eq!(read_bootstrap(&out(0, "")), Seen::Allowed);
         let five = "Bootstrap failed: 5: Input/output error";
         assert_eq!(
@@ -421,10 +429,14 @@ mod tests {
             Seen::Refused(Refusal::Bootstrap(5))
         );
         assert!(matches!(read_bootstrap(&out(1, "usage")), Seen::Failed(_)));
-        assert!(matches!(
-            read_bootstrap(&out(1, "Bootstrap failed: 113")),
-            Seen::Failed(_)
-        ));
+        let other = read_bootstrap(&out(1, "\nBootstrap failed: 113\nCould not find\n"));
+        assert_eq!(
+            other,
+            Seen::Failed(
+                "not a refusal of this door: bootstrap=113; exit Some(1): Bootstrap failed: 113 | Could not find"
+                    .to_owned()
+            )
+        );
     }
 
     /// Catches a tool run that hangs the probe (a door that waits for a window server

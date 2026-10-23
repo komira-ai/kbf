@@ -50,12 +50,8 @@ const LINK_SOURCE: &str = "/etc/hosts";
 const LINK_NAME: &str = ".kbf-canary-link";
 /// The launchd job file the bootstrap canary writes in the lease directory.
 const JOB_NAME: &str = ".kbf-canary-job.plist";
-/// The disk image the mount canary makes in the lease directory.
-const IMAGE_NAME: &str = ".kbf-canary-image.dmg";
-/// The directory the mount canary mounts the image on, in the lease directory.
+/// The directory the mount canary mounts a file system on, in the lease directory.
 const MOUNT_NAME: &str = ".kbf-canary-mount";
-/// The application the open canary asks Launch Services to open.
-const APP: &str = "/System/Applications/Calculator.app";
 
 /// What a canary does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,9 +62,10 @@ pub enum Op {
     LinkOutside,
     /// Check in a Mach service name with launchd (`bootstrap_check_in`).
     MachRegister,
-    /// Open [`APP`] through Launch Services (`open(1)`).
+    /// Ask the sandbox whether Launch Services may open an application (`sandbox_check`
+    /// of `lsopen`).
     LsOpen,
-    /// Attach a disk image to a mount point in the lease directory (`hdiutil attach`).
+    /// Mount a `devfs` on a directory of the lease (`mount(2)`).
     Mount,
     /// Bootstrap a `Background` `KeepAlive` launchd agent whose file is in the lease
     /// directory into the user's domain (`launchctl bootstrap`).
@@ -84,7 +81,7 @@ impl Op {
                 &[Refusal::Errno(libc::EPERM), Refusal::Errno(libc::EACCES)]
             }
             Self::MachRegister => &[Refusal::Kern(doors::BOOTSTRAP_NOT_PRIVILEGED)],
-            Self::LsOpen => &[Refusal::OsStatus(doors::PERM_ERR)],
+            Self::LsOpen => &[Refusal::Sandbox(1)],
             Self::Mount => &[Refusal::Errno(libc::EPERM)],
             Self::LaunchdBootstrap => &[Refusal::Bootstrap(doors::BOOTSTRAP_IO_ERROR)],
         }
@@ -171,6 +168,21 @@ pub trait Fs {
     /// # Errors
     /// The call does not exist on this platform.
     fn check_in(&self, name: &str) -> io::Result<i32>;
+    /// Whether the sandbox of this process denies `operation` (`sandbox_check`).
+    ///
+    /// # Errors
+    /// The question cannot be asked on this platform.
+    fn sandbox_denies(&self, operation: &str) -> io::Result<bool>;
+    /// Mounts a `devfs` on the directory `dir` (`mount(2)`).
+    ///
+    /// # Errors
+    /// The call's error.
+    fn mount_devfs(&self, dir: &Path) -> io::Result<()>;
+    /// Unmounts what is mounted on `dir`, by force.
+    ///
+    /// # Errors
+    /// The call's error.
+    fn unmount(&self, dir: &Path) -> io::Result<()>;
     /// The real uid of this process.
     fn uid(&self) -> u32;
 }
@@ -219,6 +231,18 @@ impl Fs for RealFs {
         doors::check_in(name)
     }
 
+    fn sandbox_denies(&self, operation: &str) -> io::Result<bool> {
+        doors::sandbox_denies(operation)
+    }
+
+    fn mount_devfs(&self, dir: &Path) -> io::Result<()> {
+        doors::mount_devfs(dir)
+    }
+
+    fn unmount(&self, dir: &Path) -> io::Result<()> {
+        doors::unmount(dir)
+    }
+
     fn uid(&self) -> u32 {
         // SAFETY: `getuid` takes no arguments and cannot fail.
         unsafe { libc::getuid() }
@@ -261,10 +285,8 @@ pub fn probe(fs: &dyn Fs, op: Op, lease: &Path) -> Seen {
             (fs.link(Path::new(LINK_SOURCE), &path), path)
         }
         Op::MachRegister => return doors::mach_register(fs),
-        Op::LsOpen => return doors::ls_open(fs, Path::new(APP)),
-        Op::Mount => {
-            return doors::mount(fs, &lease.join(IMAGE_NAME), &lease.join(MOUNT_NAME));
-        }
+        Op::LsOpen => return doors::ls_open(fs),
+        Op::Mount => return doors::mount(fs, &lease.join(MOUNT_NAME)),
         Op::LaunchdBootstrap => return doors::bootstrap(fs, &lease.join(JOB_NAME)),
     };
     let seen = classify(made);
@@ -527,11 +549,11 @@ pub async fn until_killed<T, K>(
 }
 
 /// What a canary can leave in the lease directory: the link the link canary made, the
-/// job file, the image and the mount point of the others. The daemon removes them itself
+/// job file and the mount point of the others. The daemon removes them itself
 /// after the canaries, without following them, so that a link to a file of the
 /// daemon's is never left in a tree that is handed to the slot's user.
 pub fn remove_leftovers(fs: &dyn Fs, lease: &Path) {
-    for name in [LINK_NAME, JOB_NAME, IMAGE_NAME, MOUNT_NAME] {
+    for name in [LINK_NAME, JOB_NAME, MOUNT_NAME] {
         fs.remove(&lease.join(name));
     }
 }
@@ -550,6 +572,10 @@ mod tests {
         answer: Answer,
         out: Out,
         kern: i32,
+        /// What the sandbox is asked: denies, allows, or cannot be asked.
+        denies: Option<bool>,
+        /// What mounting a `devfs` answers.
+        mount: Answer,
         calls: RefCell<Vec<String>>,
     }
 
@@ -559,6 +585,8 @@ mod tests {
                 answer,
                 out: Out::default(),
                 kern: 0,
+                denies: Some(false),
+                mount: || Ok(()),
                 calls: RefCell::default(),
             }
         }
@@ -590,7 +618,7 @@ mod tests {
         }
         fn run(&self, program: &str, args: &[String]) -> io::Result<Out> {
             self.note(format!("run {program} {}", args.join(" ")));
-            let helper = ["create", "detach", "bootout"];
+            let helper = ["bootout"];
             if args.first().is_some_and(|a| helper.contains(&a.as_str())) {
                 return Ok(Out {
                     code: Some(0),
@@ -602,6 +630,18 @@ mod tests {
         fn check_in(&self, name: &str) -> io::Result<i32> {
             self.note(format!("check_in {name}"));
             Ok(self.kern)
+        }
+        fn sandbox_denies(&self, operation: &str) -> io::Result<bool> {
+            self.note(format!("sandbox_denies {operation}"));
+            self.denies.ok_or_else(|| io::Error::other("cannot ask"))
+        }
+        fn mount_devfs(&self, dir: &Path) -> io::Result<()> {
+            self.note(format!("mount_devfs {}", dir.display()));
+            (self.mount)()
+        }
+        fn unmount(&self, dir: &Path) -> io::Result<()> {
+            self.note(format!("unmount {}", dir.display()));
+            Ok(())
         }
         fn uid(&self) -> u32 {
             501
@@ -634,19 +674,15 @@ mod tests {
         match (op, world) {
             (Op::MachRegister, World::Shut) => fake.kern = 1100,
             (Op::MachRegister, World::Broken) => fake.kern = 1102,
-            (Op::LsOpen, World::Shut) => {
-                fake.out = tool(1, "error=Error Domain=NSOSStatusErrorDomain Code=-54")
-            }
-            (Op::Mount, World::Shut) => {
-                fake.out = tool(1, "hdiutil: attach failed - Operation not permitted")
-            }
+            (Op::LsOpen, World::Shut) => fake.denies = Some(true),
+            (Op::LsOpen, World::Broken) => fake.denies = None,
+            (Op::Mount, World::Shut) => fake.mount = || errno(libc::EPERM),
+            (Op::Mount, World::Broken) => fake.mount = || errno(libc::ENOENT),
             (Op::LaunchdBootstrap, World::Shut) => {
                 fake.out = tool(5, "Bootstrap failed: 5: Input/output error");
             }
-            (Op::LsOpen | Op::Mount | Op::LaunchdBootstrap, World::Broken) => {
-                fake.out = tool(1, "no")
-            }
-            (Op::LsOpen | Op::Mount | Op::LaunchdBootstrap, World::Open) => fake.out = tool(0, ""),
+            (Op::LaunchdBootstrap, World::Broken) => fake.out = tool(1, "no"),
+            (Op::LaunchdBootstrap, World::Open) => fake.out = tool(0, ""),
             _ => {}
         }
         fake
@@ -758,7 +794,7 @@ mod tests {
 
     /// Catches a door canary that makes another call than its door (a different service
     /// name per process is needed, so that two probes do not meet), an open door left
-    /// open (an agent still loaded, an image still attached, files left), a refused one
+    /// open (an agent still loaded, a mount still there, files left), a refused one
     /// "cleaned up" with calls that were never needed, and a job that is not a
     /// `Background` agent that would be kept alive.
     #[test]
@@ -774,29 +810,24 @@ mod tests {
         assert_eq!(seen, Seen::Allowed);
         assert_eq!(got, [format!("check_in com.kbf.canary.{pid}")]);
 
-        let open_app = "run /usr/bin/open -g -j -n /System/Applications/Calculator.app";
         let (seen, got) = calls(Op::LsOpen, World::Open);
-        assert_eq!((seen, got), (Seen::Allowed, vec![open_app.to_owned()]));
-
-        let image = "/lease/.kbf-canary-image.dmg";
-        let mount = "/lease/.kbf-canary-mount";
-        let hdiutil = "run /usr/bin/hdiutil";
-        let made = format!("{hdiutil} create -size 2m -fs HFS+ -volname kbf -quiet {image}");
-        let dir = format!("make_dir {mount}");
-        let attach = format!(
-            "{hdiutil} attach -nobrowse -noverify -noautoopen -quiet -mountpoint {mount} {image}"
+        assert_eq!(
+            (seen, got),
+            (Seen::Allowed, vec!["sandbox_denies lsopen".to_owned()])
         );
+        let (seen, _) = calls(Op::LsOpen, World::Shut);
+        assert_eq!(seen, Seen::Refused(Refusal::Sandbox(1)));
+
+        let mount = "/lease/.kbf-canary-mount";
         let (seen, got) = calls(Op::Mount, World::Open);
         assert_eq!(seen, Seen::Allowed);
         assert_eq!(
             got,
             [
-                made.clone(),
-                dir.clone(),
-                attach.clone(),
-                format!("{hdiutil} detach -force {mount}"),
+                format!("make_dir {mount}"),
+                format!("mount_devfs {mount}"),
+                format!("unmount {mount}"),
                 format!("remove {mount}"),
-                format!("remove {image}"),
             ]
         );
         let (seen, got) = calls(Op::Mount, World::Shut);
@@ -804,13 +835,11 @@ mod tests {
         assert_eq!(
             got,
             [
-                made,
-                dir,
-                attach,
+                format!("make_dir {mount}"),
+                format!("mount_devfs {mount}"),
                 format!("remove {mount}"),
-                format!("remove {image}")
             ],
-            "a shut door detaches nothing"
+            "a shut door unmounts nothing"
         );
 
         let job = "/lease/.kbf-canary-job.plist";
@@ -844,7 +873,7 @@ mod tests {
 
     /// Catches a door canary that reads a failure that is not a refusal as one (a tool
     /// that is missing, a file that cannot be written, a service that is unknown, an
-    /// error code of another door, an image that cannot be made), which would let a
+    /// error code of another door, a mount point that cannot be made), which would let a
     /// slot pass on a canary that proved nothing.
     #[test]
     fn a_door_that_fails_otherwise_proves_nothing() {
@@ -860,43 +889,31 @@ mod tests {
             assert!(matches!(seen, Seen::Failed(_)), "{op:?}: {seen:?}");
         }
         // A real refusal text with a code that is not the door's.
-        for (op, said) in [
-            (Op::LsOpen, "Code=-43"),
-            (
-                Op::LaunchdBootstrap,
-                "Bootstrap failed: 113: Could not find service",
-            ),
-            (Op::Mount, "hdiutil: attach failed - Resource busy"),
-        ] {
-            let mut fake = world(op, World::Shut);
-            fake.out = Out {
-                code: Some(1),
-                text: said.to_owned(),
-            };
-            let seen = probe(&fake, op, lease);
-            assert!(matches!(seen, Seen::Failed(_)), "{op:?}: {seen:?}");
-        }
-        // The wrong Mach error, and the failures before the door is tried.
+        let mut fake = world(Op::LaunchdBootstrap, World::Shut);
+        fake.out = Out {
+            code: Some(1),
+            text: "Bootstrap failed: 113: Could not find service".to_owned(),
+        };
+        let seen = probe(&fake, Op::LaunchdBootstrap, lease);
+        assert!(matches!(seen, Seen::Failed(_)), "{seen:?}");
+        // The wrong errno for a mount, one that is no errno, and the wrong Mach error.
+        let mut fake = world(Op::Mount, World::Shut);
+        fake.mount = || errno(libc::ENODEV);
+        assert!(matches!(probe(&fake, Op::Mount, lease), Seen::Failed(_)));
+        fake.mount = || Err(io::Error::other("no errno"));
+        assert!(matches!(probe(&fake, Op::Mount, lease), Seen::Failed(_)));
         let mut fake = world(Op::MachRegister, World::Shut);
         fake.kern = 1102;
         assert!(matches!(
             probe(&fake, Op::MachRegister, lease),
             Seen::Failed(_)
         ));
+        // Failures before the door is tried.
         let writes = Fake::new(|| errno(libc::EROFS));
         for op in [Op::Mount, Op::LaunchdBootstrap] {
             let seen = probe(&writes, op, lease);
             assert!(matches!(seen, Seen::Failed(_)), "{op:?}: {seen:?}");
         }
-        let mut no_image = world(Op::Mount, World::Open);
-        no_image.out = Out {
-            code: Some(1),
-            text: "hdiutil: create failed".to_owned(),
-        };
-        assert!(matches!(
-            probe(&no_image, Op::Mount, lease),
-            Seen::Failed(_)
-        ));
     }
 
     /// Catches the real calls that do not write a new file only, make a directory, remove
@@ -926,6 +943,17 @@ mod tests {
         let ok = RealFs.run("/bin/ls", &["/".into()]).expect("run");
         assert_eq!(ok.code, Some(0));
         assert!(RealFs.run("/nonexistent/tool", &[]).is_err());
+        #[cfg(not(target_os = "macos"))]
+        for off_a_mac in [
+            RealFs.sandbox_denies("lsopen").map(drop),
+            RealFs.mount_devfs(dir),
+            RealFs.unmount(dir),
+        ] {
+            assert_eq!(
+                off_a_mac.expect_err("off a Mac").kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
         #[cfg(not(target_os = "macos"))]
         assert_eq!(
             RealFs.check_in("x").expect_err("off a Mac").kind(),
@@ -1017,8 +1045,8 @@ mod tests {
             Refusal::Kern(1102),
             Refusal::Bootstrap(5),
             Refusal::Bootstrap(113),
-            Refusal::OsStatus(-54),
-            Refusal::OsStatus(-43),
+            Refusal::Sandbox(1),
+            Refusal::Sandbox(0),
         ];
         for canary in CANARIES {
             let mut accepted = 0;
@@ -1036,7 +1064,7 @@ mod tests {
         }
         let exact = |name: &str| row(name).op.refusals();
         assert_eq!(exact("mach-register"), [Refusal::Kern(1100)]);
-        assert_eq!(exact("lsopen"), [Refusal::OsStatus(-54)]);
+        assert_eq!(exact("lsopen"), [Refusal::Sandbox(1)]);
         assert_eq!(exact("file-mount"), [Refusal::Errno(libc::EPERM)]);
         assert_eq!(exact("launchd-bootstrap"), [Refusal::Bootstrap(5)]);
     }
@@ -1049,7 +1077,7 @@ mod tests {
             Refusal::Errno(1),
             Refusal::Kern(1100),
             Refusal::Bootstrap(5),
-            Refusal::OsStatus(-54),
+            Refusal::Sandbox(1),
         ] {
             assert_eq!(Refusal::parse(&refusal.to_string()), Some(refusal));
         }
@@ -1066,7 +1094,7 @@ mod tests {
             assert_eq!(Refusal::parse(bad), None, "{bad:?}");
         }
         assert_eq!(Refusal::Kern(1100).to_string(), "kern=1100");
-        assert_eq!(Refusal::OsStatus(-54).to_string(), "osstatus=-54");
+        assert_eq!(Refusal::Sandbox(1).to_string(), "sandbox=1");
     }
 
     /// Catches a judge that passes a canary on the exit code alone (a probe that died

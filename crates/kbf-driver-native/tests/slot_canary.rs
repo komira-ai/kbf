@@ -1,7 +1,7 @@
 //! The profile canaries for real: a pool user, under the exact profile generated for a
 //! lease, is refused a write outside the four allowed paths, a hard link of a
-//! root-owned file into the lease directory, a Mach service name, an application opened
-//! through Launch Services, a mount on a directory of the lease, and a launchd agent
+//! root-owned file into the lease directory, a Mach service name, the sandbox's answer
+//! for Launch Services (`lsopen`), a `devfs` mounted on a directory of the lease, and a launchd agent
 //! bootstrapped from a file of the lease; a profile that lacks `(deny file-write*)`
 //! fails the first, one that only lets a link through fails the link canary alone, one
 //! that lacks `(deny mach-register)`, `(deny lsopen)` or `(deny file-mount)` fails its
@@ -88,7 +88,7 @@ fn left_in_tmp() -> Vec<String> {
 
 /// Catches a generated profile that lets a pool user write outside the lease, `/dev`,
 /// its home and its `/var/folders` entry, or hard-link a root-owned file into the lease
-/// directory, register a Mach service, open an application, mount a disk image on a
+/// directory, register a Mach service, open an application, mount a file system on a
 /// directory of the lease, or have launchd load an agent (both with and without the
 /// network), and a canary that cannot run on the Mac at all (a probe mode the binary
 /// does not answer, a launch that fails, a tool that is missing): every canary must be
@@ -109,6 +109,14 @@ async fn the_canaries_are_refused_under_the_real_profile() {
                 "CANARY-LATENCY network={network:?} round={round} all_canaries_ms={}",
                 started.elapsed().as_millis()
             );
+            for passed in &report.passed {
+                println!(
+                    "CANARY-LATENCY network={network:?} round={round} canary={} refused={} ms={}",
+                    passed.name,
+                    passed.refusal,
+                    passed.took.as_millis()
+                );
+            }
             assert!(report.all_refused(), "{network:?}: {}", report.failures());
             assert_eq!(report.passed.len(), CANARIES.len());
         }
@@ -221,9 +229,9 @@ async fn a_profile_without_its_mach_register_deny_fails_that_canary_alone() {
     assert_eq!(seen, [["mach-register"], ["mach-register"]]);
 }
 
-/// Catches an open canary that cannot fail, or a profile in which dropping
-/// `(deny lsopen)` goes unseen: the user can have Launch Services open an application,
-/// so that canary alone must be reported as not refused.
+/// Catches an `lsopen` canary that cannot fail, or a profile in which dropping
+/// `(deny lsopen)` goes unseen: the sandbox then allows Launch Services to open an
+/// application, so that canary alone must be reported as not refused.
 #[ignore = "needs root and real users: cargo xtask sudo-test"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_profile_without_its_lsopen_deny_fails_that_canary_alone() {
@@ -232,9 +240,9 @@ async fn a_profile_without_its_lsopen_deny_fails_that_canary_alone() {
 }
 
 /// Catches a mount canary that cannot fail, or a profile in which dropping
-/// `(deny file-mount)` goes unseen: the user can attach a disk image on a directory of
-/// its lease, so that canary alone must be reported as not refused, and the image it
-/// attached must not stay.
+/// `(deny file-mount)` goes unseen: the user can mount a `devfs` on a directory of its
+/// lease, so that canary alone must be reported as not refused, and what it mounted
+/// must not stay.
 #[ignore = "needs root and real users: cargo xtask sudo-test"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_profile_without_its_file_mount_deny_fails_that_canary_alone() {
