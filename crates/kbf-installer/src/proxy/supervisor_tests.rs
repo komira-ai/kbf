@@ -306,15 +306,6 @@ impl ChildAdmin for ScriptAdmin<'_> {
     fn open_counts(&self, _: Slot) -> Result<crate::proxy::model::OpenCounts, PortError> {
         unreachable!("the boot never counts")
     }
-
-    fn post_desired(
-        &self,
-        _: Slot,
-        _: &CommitId,
-        _: kbf_update::Source,
-    ) -> Result<(), crate::proxy::model::DesiredError> {
-        unreachable!("the boot never posts a desired release")
-    }
 }
 
 /// Time that moves only when the boot sleeps, plus a real millisecond so a process that
@@ -876,44 +867,38 @@ fn serve_once(listener: TcpListener) -> std::thread::JoinHandle<String> {
     })
 }
 
-/// Catches an admin client wired to the wrong place: the desired-release offer of each slot goes
-/// to that slot's operator port, with the proxy's secret and the operator token read from the
-/// file at the call (a missing file is the error of the token, not of the network).
+/// Asserts that the admin client of the proxy's start is wired to the ports of the slot it is
+/// asked about: the readiness read of each slot goes to that slot's operator port, and the role
+/// read of each slot to that slot's admin port, with the proxy's secret.
 #[test]
-fn the_child_admin_offers_a_release_to_the_operator_port_of_its_slot() {
-    use crate::proxy::admin::AdminError;
+fn the_child_admin_reads_the_operator_port_and_the_admin_port_of_its_slot() {
     let (gate, _runner) = gate();
-    let token_file = kbf_host::testkit::scratch("supervisor-child-admin").join("operator.token");
-    let offset = UpstreamTable { base_port: 0 }.port(kbf_proxy::slot::Slot::A, Target::Operator);
-    let stride =
-        UpstreamTable { base_port: 0 }.port(kbf_proxy::slot::Slot::B, Target::Operator) - offset;
-
-    let table = UpstreamTable { base_port: 20_000 };
-    let missing = child_admin(&gate.handle, table, token_file.clone()).expect("admin");
-    assert!(
-        matches!(
-            missing.try_post_desired(Slot::A, &c(A)),
-            Err(AdminError::Token(std::io::ErrorKind::NotFound))
-        ),
-        "no token file"
-    );
-
-    std::fs::write(&token_file, "operator-token\n").expect("token");
+    let (first, second) = (kbf_proxy::slot::Slot::A, kbf_proxy::slot::Slot::B);
+    let flat = UpstreamTable { base_port: 0 };
+    let stride = flat.port(second, Target::Operator) - flat.port(first, Target::Operator);
     for (slot, extra) in [(Slot::A, 0), (Slot::B, stride)] {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
+        let offset = flat.port(first, Target::Operator);
         let table = UpstreamTable {
             base_port: port - offset - extra,
         };
-        let admin = child_admin(&gate.handle, table, token_file.clone()).expect("admin");
+        let admin = child_admin(&gate.handle, table).expect("admin");
         let seen = serve_once(listener);
-        admin.try_post_desired(slot, &c(A)).expect("offered");
+        assert!(admin.try_ready(slot).expect("answered").readyz);
         let head = seen.join().expect("fixture");
-        assert!(head.starts_with("POST /v1/update/desired "), "{head}");
-        assert!(
-            head.contains("authorization: Bearer operator-token\r\n"),
-            "{head}"
-        );
+        assert!(head.starts_with("GET /readyz "), "{head}");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let table = UpstreamTable {
+            base_port: port - flat.admin_port(first) - extra,
+        };
+        let admin = child_admin(&gate.handle, table).expect("admin");
+        let seen = serve_once(listener);
+        assert!(admin.try_role(slot).is_err(), "an empty answer is no role");
+        let head = seen.join().expect("fixture");
+        assert!(head.starts_with("GET /v1/admin/role "), "{head}");
         for (name, value) in gate.handle.admin_headers().iter() {
             let line = format!("{}: {}\r\n", name.as_str(), value.to_str().expect("ASCII"));
             assert!(head.contains(&line), "{line:?} in {head}");

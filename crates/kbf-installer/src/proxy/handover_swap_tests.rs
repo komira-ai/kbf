@@ -51,7 +51,6 @@ fn config(name: &str) -> (HandoverConfig, OrderSpool, PathBuf) {
         confirm_window_s: 900,
         fetch_timeout_s: 900,
         slots: ports_of([addr(1), addr(1)], [addr(1), addr(1)]),
-        operator_token_file: root.join("operator.token"),
         installer_toml: root.join("installer.toml"),
         gate: GateSlot::new(),
     };
@@ -578,15 +577,11 @@ fn serve_once(answer: &'static str) -> (SocketAddr, JoinHandle<String>) {
     (at, seen)
 }
 
-/// Catches an admin client pointed at the wrong slot's port, without the proxy's secret, or
-/// with the wrong token: a call to slot B's admin port reaches B's (and not A's) with the
-/// secret header, and an offer to slot A reaches A's operator port with the token the file
-/// holds (the file's newline dropped) and the secret.
+/// Asserts that the admin client is bound to each slot's ports: a call to slot B's admin port
+/// reaches B's (and not A's) with the proxy's secret header, and a readiness read of slot A
+/// reaches A's operator port, which it asks without the secret.
 #[test]
-fn the_admin_client_is_bound_to_each_slots_ports_with_the_secret_and_the_token() {
-    let dir = kbf_host::testkit::scratch("handover-swap-admin");
-    let token = dir.join("token");
-    fs::write(&token, "tok-123\n").expect("token");
+fn the_admin_client_is_bound_to_each_slots_ports_with_the_secret() {
     let secret = Headers::new()
         .with("x-kbf-proxy-auth", SECRET.as_bytes())
         .expect("header");
@@ -598,7 +593,7 @@ fn the_admin_client_is_bound_to_each_slots_ports_with_the_secret_and_the_token()
         serve_once(r#"{"admin_protocol":1,"open_streams":4,"open_sessions":2}"#);
     let (operator_a, seen_operator_a) = serve_once("{}");
     let slots = ports_of([nothing, admin_b], [operator_a, nothing]);
-    let admin = admin_of(slots, token, secret);
+    let admin = admin_of(slots, secret);
 
     let counts = admin.try_open_counts(Slot::B).expect("answered");
     assert_eq!((counts.open_streams, counts.open_sessions), (4, 2));
@@ -609,16 +604,13 @@ fn the_admin_client_is_bound_to_each_slots_ports_with_the_secret_and_the_token()
         "{head}"
     );
 
-    admin.try_post_desired(Slot::A, &c(A)).expect("answered");
+    let readiness = admin.try_ready(Slot::A).expect("answered");
+    assert!(readiness.readyz);
     let head = seen_operator_a
         .join()
         .expect("A's operator port was called");
-    assert!(head.starts_with("POST /v1/update/desired"), "{head}");
-    assert!(head.contains("authorization: Bearer tok-123\r\n"), "{head}");
-    assert!(
-        head.contains(&format!("x-kbf-proxy-auth: {SECRET}")),
-        "{head}"
-    );
+    assert!(head.starts_with("GET /readyz"), "{head}");
+    assert!(!head.contains("x-kbf-proxy-auth"), "{head}");
 }
 
 // ----- how the swap learns that a release is staged -----
@@ -705,7 +697,6 @@ fn config_local(name: &str) -> (HandoverConfig, Local, PathBuf) {
         confirm_window_s: 900,
         fetch_timeout_s: 900,
         slots: ports_of([addr(1), addr(1)], [addr(1), addr(1)]),
-        operator_token_file: root.join("operator.token"),
         installer_toml: root.join("installer.toml"),
         gate: GateSlot::new(),
     };

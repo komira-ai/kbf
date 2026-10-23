@@ -226,11 +226,12 @@ Each is a named entry in the summary's `steps`, with its duration.
    - **Only `done` is success.** Any earlier phase is an update still going on. `failed` and
      `rolled_back` are failures (exit 1, `frontend_failed`, `frontend_rolled_back`) whose
      detail and `frontend.failure` carry the step and the reason the API gave. One `failed`
-     at step `nodes` is different: the new frontend was swapped and serves, and the order for
-     the nodes did not land. If the new frontend answered and refused it, the deploy exits 3
-     (`nodes_refused`: the same order fails the same way); if it never answered in the time
-     the proxy allows, exit 1 (`nodes_unreached`). Either way the detail says the nodes were
-     not told, and running the same command again does not tell them: the frontend already
+     at step `nodes` is different, and only a record an earlier build of the proxy wrote has
+     it (the swap no longer sends the order for the nodes): the new frontend was swapped and
+     serves, and the order for the nodes did not land. If the new frontend answered and
+     refused it, the deploy exits 3 (`nodes_refused`: the same order fails the same way); if
+     it never answered in the time the proxy allows, exit 1 (`nodes_unreached`). Either way
+     the detail says the nodes were not told, and running the same command again does not tell them: the frontend already
      runs the commit (`same_commit` below), so `update` exits 0 and a repeated `deploy` waits
      for nodes that are never offered it. Gate F does not read it as a reverted frontend. A
      status that cannot be had right now is asked for again; a `200` that is not an update
@@ -246,7 +247,9 @@ Each is a named entry in the summary's `steps`, with its duration.
      failures (`api_error`). `409 same_commit` (the frontend already runs the commit) is no
      update: the step records `already_running` and the deploy goes on to the nodes, so a run
      repeated after a node was fixed can finish.
-5. `nodes`: the new frontend offers the commit to the nodes in the `nodes` phase of its update
+5. `nodes`: **no longer sent by the swap, which posts no desired release to the new frontend; the
+   nodes take their release from the host's packages. What follows is the design as it was.** The
+   new frontend offers the commit to the nodes in the `nodes` phase of its update
    (`nodes: true`); its controller rolls them. The deploy sets nothing: it reads
    `GET /v1/update` until the desired release is the commit (a node's budget; otherwise
    exit 1, `nodes_not_offered`, saying what the desired release is), then polls `GET /v1/nodes`
@@ -326,9 +329,8 @@ document instead, and is removed on 2026-12-01. Exit 0 is a `green` document, ex
 (`smoke_skipped`) is `extended` (no decision, not a pass), every other exit is `red`.
 
 The order of the old nodes-first deploy (`--order`, and a `POST /v1/update/desired` made by
-the deploy) is gone: the desired release is the new frontend's to set, after it has baked,
-and a post of it to the old frontend would be refused when the commit is not that frontend's
-own. A caller that still sends `--order` gets exit 2.
+the deploy) is gone: the swap sets no desired release, and the nodes take their release from
+the host's packages. A caller that still sends `--order` gets exit 2.
 
 ## Exit codes
 
