@@ -213,7 +213,7 @@ impl Worker {
 
     /// Whether `request` can be placed on it now, platform and kind aside: an action
     /// if no whole-machine lease holds it, its free CPUs, GPUs and VM slots hold the
-    /// request, and its memory capacity is at least the request's memory; a
+    /// request, it holds fewer leases than its lease cap (if it reports one), and its memory capacity is at least the request's memory; a
     /// whole-machine lease if it holds no lease and its capacity holds the request. A
     /// request for an iOS device also needs a free device that satisfies it
     /// ([`Worker::free_device`]).
@@ -230,6 +230,10 @@ impl Worker {
                 !self.whole
                     && self.free().fits(&request.resources.without_memory())
                     && request.resources.memory_bytes <= self.capacity.memory_bytes
+                    && self
+                        .capacity
+                        .leases
+                        .is_none_or(|cap| u64::try_from(self.leases).is_ok_and(|held| held < cap))
                     && (!self.exclusive(request) || self.leases == 0)
             }
         };

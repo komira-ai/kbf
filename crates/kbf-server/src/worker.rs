@@ -421,7 +421,9 @@ pub fn phase(hello: &Hello) -> Result<NodePhase, String> {
 }
 
 /// What placement may book on a node: its `cpus` and `mem_gib` entries, and its `gpu`
-/// entry (0 when absent: a daemon that does not detect GPUs has none to book). v0 books
+/// entry (0 when absent: a daemon that does not detect GPUs has none to book). Its
+/// `action_slots` entry, when reported, caps how many Action leases it holds at once
+/// (`Resources::leases`); a node that reports none has no cap. v0 books
 /// the whole machine; the protected floors (planned,
 /// `docs/design/capabilities.md#planned`) are subtracted once they are
 /// reported.
@@ -433,7 +435,12 @@ pub fn capacity(hello: &Hello) -> Result<Resources, String> {
     let cpus = required("cpus")?;
     let mem_gib = required("mem_gib")?;
     let gpus = entry(&hello.capabilities, "gpu")?.unwrap_or(0);
-    Ok(Resources::new(cpus.saturating_mul(1_000), mem_gib.saturating_mul(1 << 30)).with_gpus(gpus))
+    let booked =
+        Resources::new(cpus.saturating_mul(1_000), mem_gib.saturating_mul(1 << 30)).with_gpus(gpus);
+    Ok(match entry(&hello.capabilities, "action_slots")? {
+        Some(slots) => booked.with_lease_cap(slots),
+        None => booked,
+    })
 }
 
 /// What placement matches an action's platform against: the node report read by
