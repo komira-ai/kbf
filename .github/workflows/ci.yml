@@ -220,6 +220,10 @@ jobs:
         env:
           LLVM_COV_FLAGS: -skip-functions
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-cli) & binary(frontend_process) & test(postgres_state_store)'
+      - name: Run the state copy tool's Postgres tests under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-state-copy)'
       - name: Report
         env:
           LLVM_COV_FLAGS: -skip-functions
