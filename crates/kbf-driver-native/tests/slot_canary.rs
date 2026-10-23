@@ -1,8 +1,12 @@
 //! The profile canaries for real: a pool user, under the exact profile generated for a
-//! lease, is refused a write outside the four allowed paths and a hard link of a
-//! root-owned file into the lease directory; a profile that lacks `(deny file-write*)`
-//! fails them, and one that only lets a link through fails the link canary alone; a slot
-//! that fails is set aside.
+//! lease, is refused a write outside the four allowed paths, a hard link of a
+//! root-owned file into the lease directory, a Mach service name, an application opened
+//! through Launch Services, a mount on a directory of the lease, and a launchd agent
+//! bootstrapped from a file of the lease; a profile that lacks `(deny file-write*)`
+//! fails the first, one that only lets a link through fails the link canary alone, one
+//! that lacks `(deny mach-register)`, `(deny lsopen)` or `(deny file-mount)` fails its
+//! canary alone, and the launchd canary is refused even under a profile with no deny at
+//! all but the write rules; a slot that fails is set aside.
 //!
 //! The canary latency is printed as `CANARY-LATENCY` lines (a run took about 50 to 125
 //! ms on the macOS runner).
@@ -20,7 +24,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use kbf_driver_native::network::{Isolation, Network, WeakenedProfile};
-use kbf_driver_native::slots::canary::Report;
+use kbf_driver_native::slots::canary::{CANARIES, Report};
 use kbf_driver_native::slots::macos::{Slot, Slots};
 use kbf_driver_native::slots::{LEASES_ROOT_MODE, Pool};
 use support::pool::{Scratch, Users};
@@ -62,6 +66,16 @@ fn failed(report: &Report) -> Vec<&'static str> {
     report.failed.iter().map(|f| f.name).collect()
 }
 
+/// What a canary left in the lease directory (its names start with `.kbf-canary-`).
+fn left_in_lease(lease: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(lease)
+        .expect("lease")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".kbf-canary-"))
+        .collect()
+}
+
 /// Leftovers of an open door in /private/tmp.
 fn left_in_tmp() -> Vec<String> {
     std::fs::read_dir("/private/tmp")
@@ -74,9 +88,11 @@ fn left_in_tmp() -> Vec<String> {
 
 /// Catches a generated profile that lets a pool user write outside the lease, `/dev`,
 /// its home and its `/var/folders` entry, or hard-link a root-owned file into the lease
-/// directory (both with and without the network), and a canary that cannot run on the
-/// Mac at all (a probe mode the binary does not answer, a launch that fails): every
-/// canary must be refused, and each run is timed. Weakened profiles seen red on the runner: the
+/// directory, register a Mach service, open an application, mount a disk image on a
+/// directory of the lease, or have launchd load an agent (both with and without the
+/// network), and a canary that cannot run on the Mac at all (a probe mode the binary
+/// does not answer, a launch that fails, a tool that is missing): every canary must be
+/// refused in its own form, and each run is timed. Weakened profiles seen red on the runner: the
 /// other tests of this file.
 #[ignore = "needs root and real users: cargo xtask sudo-test"]
 #[tokio::test(flavor = "multi_thread")]
@@ -90,17 +106,14 @@ async fn the_canaries_are_refused_under_the_real_profile() {
             let started = Instant::now();
             let report = slot.canary(&isolation, network, &lease).await.expect("ran");
             println!(
-                "CANARY-LATENCY network={network:?} round={round} both_canaries_ms={}",
+                "CANARY-LATENCY network={network:?} round={round} all_canaries_ms={}",
                 started.elapsed().as_millis()
             );
             assert!(report.all_refused(), "{network:?}: {}", report.failures());
-            assert_eq!(report.passed.len(), 2);
+            assert_eq!(report.passed.len(), CANARIES.len());
         }
     }
-    assert!(
-        !lease.join(".kbf-canary-link").exists(),
-        "the link canary left its link"
-    );
+    assert_eq!(left_in_lease(&lease), Vec::<String>::new());
     slot.release().await;
 }
 
@@ -163,13 +176,99 @@ async fn a_profile_that_allows_writes_to_the_link_source_fails_the_link_canary_a
             report.failures()
         );
         assert_eq!(failed(&report), ["link-outside"], "{}", report.failures());
-        assert_eq!(report.passed.len(), 1);
+        assert_eq!(report.passed.len(), CANARIES.len() - 1);
     }
-    assert!(
-        !lease.join(".kbf-canary-link").exists(),
-        "the open door's link stayed"
+    assert_eq!(left_in_lease(&lease), Vec::<String>::new());
+    slot.release().await;
+}
+
+/// Runs the canaries under the generated profile weakened by `change`, with and without
+/// the network, and returns the names of the canaries not refused, once per network.
+async fn failing_under(name: &str, change: WeakenedProfile) -> Vec<Vec<&'static str>> {
+    let (_users, scratch, slots) = start(name, Some(change));
+    let (slot, lease) = leased(&slots, &scratch).await;
+    let isolation = Isolation::detect();
+    let mut seen = Vec::new();
+    for network in [Network::On, Network::Off] {
+        let report = slot.canary(&isolation, network, &lease).await.expect("ran");
+        println!(
+            "CANARY-WEAKENED {name} network={network:?}: {}",
+            report.failures()
+        );
+        assert_eq!(report.passed.len() + report.failed.len(), CANARIES.len());
+        seen.push(failed(&report));
+    }
+    assert_eq!(
+        left_in_lease(&lease),
+        Vec::<String>::new(),
+        "the open door's files stayed"
     );
     slot.release().await;
+    seen
+}
+
+/// Catches a Mach-service canary that cannot fail, or a profile in which dropping
+/// `(deny mach-register)` goes unseen: the user can check in a service name with
+/// launchd, so that canary alone must be reported as not refused.
+#[ignore = "needs root and real users: cargo xtask sudo-test"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_profile_without_its_mach_register_deny_fails_that_canary_alone() {
+    let seen = failing_under(
+        "canary-no-mach",
+        WeakenedProfile::Drop("(deny mach-register)"),
+    )
+    .await;
+    assert_eq!(seen, [["mach-register"], ["mach-register"]]);
+}
+
+/// Catches an open canary that cannot fail, or a profile in which dropping
+/// `(deny lsopen)` goes unseen: the user can have Launch Services open an application,
+/// so that canary alone must be reported as not refused.
+#[ignore = "needs root and real users: cargo xtask sudo-test"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_profile_without_its_lsopen_deny_fails_that_canary_alone() {
+    let seen = failing_under("canary-no-lsopen", WeakenedProfile::Drop("(deny lsopen)")).await;
+    assert_eq!(seen, [["lsopen"], ["lsopen"]]);
+}
+
+/// Catches a mount canary that cannot fail, or a profile in which dropping
+/// `(deny file-mount)` goes unseen: the user can attach a disk image on a directory of
+/// its lease, so that canary alone must be reported as not refused, and the image it
+/// attached must not stay.
+#[ignore = "needs root and real users: cargo xtask sudo-test"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_profile_without_its_file_mount_deny_fails_that_canary_alone() {
+    let seen = failing_under(
+        "canary-no-mount",
+        WeakenedProfile::Drop("(deny file-mount)"),
+    )
+    .await;
+    assert_eq!(seen, [["file-mount"], ["file-mount"]]);
+}
+
+/// Catches a launchd canary that depends on a rule of the profile (it must hold whatever
+/// the profile says, as launchd refuses a job from any sandboxed process) and the other
+/// canaries passing without their rules: with every deny removed but the profile's
+/// `(allow default)` and write allows, every other canary is open and the launchd one
+/// alone is refused.
+#[ignore = "needs root and real users: cargo xtask sudo-test"]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_launchd_canary_is_refused_under_a_profile_that_is_only_allow_default() {
+    let bare = WeakenedProfile::DropAll(&[
+        "(deny mach-register)",
+        "(deny lsopen)",
+        "(deny file-mount)",
+        "(deny file-write*)",
+    ]);
+    let seen = failing_under("canary-bare", bare).await;
+    let others = [
+        "write-outside",
+        "link-outside",
+        "mach-register",
+        "lsopen",
+        "file-mount",
+    ];
+    assert_eq!(seen, [others, others]);
 }
 
 /// Catches a slot that fails its canaries and stays offered, stays counted, is never
