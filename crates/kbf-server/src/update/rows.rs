@@ -365,19 +365,6 @@ impl Rows {
         Ok(())
     }
 
-    /// Whether this handle can still write: a transaction that changes nothing. A handle
-    /// that another writer has fenced out fails it, so a controller that was superseded
-    /// gives no order that is not preceded by a write of its own, or by this (see
-    /// `Controller`). It relies on the store judging the fence in every transaction, an
-    /// empty one included, as [`kbf_state::Fenced`] does.
-    ///
-    /// # Errors
-    /// [`RowError::Store`], [`StoreError::Fenced`] among them, when it cannot.
-    pub fn check_writer(&self) -> Result<(), RowError> {
-        self.store.txn(Txn::new())??;
-        Ok(())
-    }
-
     /// Draws the next order id of `epoch`. The counter is the store's, so the number is
     /// durable the moment it is returned and no caller, on this handle or another, draws it
     /// again; a number drawn and not used is skipped, never reused. Ids ascend within an

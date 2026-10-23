@@ -29,9 +29,9 @@
 //!   begins, a second signal escalates, and `kbf cluster` calls through [`api_client`].
 //! - Rollouts ([`rollout`]): the record's store (in memory for now) and the driver that
 //!   cordons, drains and hands drained nodes their update, as far as `updating`.
-//! - Node rolling ([`update`]): the pure picker and node step of a split-mode update
-//!   (`docs/design/split-mode-updates.md`, sections 2.6 to 2.11), which host goes next and
-//!   its one next move. Nothing drives them yet.
+//! - Node rolling ([`update`]): the durable rows and facts of a split-mode update
+//!   (`docs/design/split-mode-updates.md`, sections 2.6 to 2.11). Nothing picks hosts or
+//!   steps them: updates are OS packages, driven by `kbf-updater`.
 //! - The MDM gate ([`mdm`]): the server's verbs at `kbf-mdm-gate` (inventory, enforce
 //!   and withdraw a macOS build, install an allowlisted profile; no erase), a client
 //!   over mutual TLS, and the polling of an update's DDM progress. Not yet called by

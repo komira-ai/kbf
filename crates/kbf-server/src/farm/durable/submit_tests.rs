@@ -816,3 +816,13 @@ fn refused_while_the_finish_of_a_retired_operation_is_held(lag_millis: u64) {
     assert!(submit(&farm, 1).is_ok(), "the retry after the finish went");
     assert_eq!(unfinished(&farm), [OperationId(1)]);
 }
+
+/// Catches: an unpin of an operation whose rows are already gone failing the finish, or
+/// putting a delete in its transaction.
+#[test]
+fn unpinning_an_operation_with_no_rows_changes_nothing() {
+    let store = LostAck::new();
+    let durable = durable_over(&store);
+    let unpinned = durable.unpin(Txn::new(), OperationId(7)).expect("unpin");
+    assert!(unpinned.ops().is_empty());
+}

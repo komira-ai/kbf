@@ -110,3 +110,16 @@ fn a_full_running_commit_tells_two_commits_with_one_prefix_apart() {
     assert_eq!(check(OWN, Some(500), OWN_FULL), Ok(()));
     assert_eq!(check(OWN, Some(500), sibling), Ok(()));
 }
+
+/// Catches: the commit compare taking the longer text as the prefix, or the other way round:
+/// a running build named in full is the same commit as a target named by 12 digits of it, and
+/// a target named by fewer than 12 digits is no commit at all.
+#[test]
+fn the_shorter_commit_text_may_be_either_one_and_must_be_12_digits() {
+    let full = Build {
+        seq: 500,
+        commit: OWN_FULL,
+    };
+    assert_eq!(check(full, Some(500), "aaaaaaaaaaaa"), Ok(()));
+    assert_eq!(check(full, Some(500), "aaaaaaaaaaa"), Err(Refusal::SeqTie));
+}
