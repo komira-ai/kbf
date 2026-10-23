@@ -92,8 +92,6 @@ rustls.workspace = true
 saphyr-parser.workspace = true
 sha2.workspace = true
 syn.workspace = true
-# `tests/stage_offer_bundle.rs`: the tar the stager makes, read entry by entry, and edited.
-tar.workspace = true
 # The listeners, byte streams, channels and timers of the proxy, deploy and object-store tests.
 tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
 tokio-rustls.workspace = true
