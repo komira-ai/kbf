@@ -6,7 +6,7 @@ fn json(outcome: &Outcome) -> Value {
     serde_json::from_str(&outcome.json_line()).unwrap()
 }
 
-const ALL_REFUSALS: [(Refusal, &str); 8] = [
+const ALL_REFUSALS: [(Refusal, &str); 7] = [
     (Refusal::BadCommand, "bad_command"),
     (Refusal::ChannelNotAllowed, "channel_not_allowed"),
     (Refusal::ConfigInvalid, "config_invalid"),
@@ -14,7 +14,6 @@ const ALL_REFUSALS: [(Refusal, &str); 8] = [
     (Refusal::ChannelUnsigned, "channel_unsigned"),
     (Refusal::KeyUntrusted, "key_untrusted"),
     (Refusal::ChannelInsecure, "channel_insecure"),
-    (Refusal::OlderThanInstalled, "older_than_installed"),
 ];
 
 const ALL_FAILURES: [(FailureCode, &str); 9] = [
@@ -55,6 +54,7 @@ fn exit_codes() {
     let query = Outcome::Queried(QueryReport {
         installed_version: None,
         running_commit: None,
+        node_id: None,
         in_progress: false,
     });
     assert_eq!(
@@ -103,27 +103,29 @@ fn json_shapes() {
     }
 }
 
-/// The query line is `result` and then the three fields, in this order, with nulls spelled
+/// The query line is `result` and then the four fields, in this order, with nulls spelled
 /// out: every answer of the program has a `result`.
 #[test]
 fn query_line_shape_and_order() {
     let full = Outcome::Queried(QueryReport {
         installed_version: Some("1.0-1".into()),
         running_commit: Some("abc".into()),
+        node_id: Some("node-1".into()),
         in_progress: true,
     });
     assert_eq!(
         full.json_line(),
-        r#"{"result":"query","installed_version":"1.0-1","running_commit":"abc","in_progress":true}"#
+        r#"{"result":"query","installed_version":"1.0-1","running_commit":"abc","node_id":"node-1","in_progress":true}"#
     );
     let empty = Outcome::Queried(QueryReport {
         installed_version: None,
         running_commit: None,
+        node_id: None,
         in_progress: false,
     });
     assert_eq!(
         empty.json_line(),
-        r#"{"result":"query","installed_version":null,"running_commit":null,"in_progress":false}"#
+        r#"{"result":"query","installed_version":null,"running_commit":null,"node_id":null,"in_progress":false}"#
     );
 }
 
@@ -164,6 +166,7 @@ fn audit_fields() {
     let query = Outcome::Queried(QueryReport {
         installed_version: None,
         running_commit: None,
+        node_id: None,
         in_progress: false,
     });
     assert_eq!(query.audit_fields(), ("query", None));

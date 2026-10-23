@@ -99,7 +99,7 @@ pub(super) fn beat(joined: &pb::RegisterResponse, boot: u64) -> pb::HeartbeatReq
 /// Node B's certificate (`node-b`) is member 2, and its beat for A's member, with A's
 /// boot and with another, is PERMISSION_DENIED; A's own beat is admitted.
 ///
-/// Mutant seen red: the frontend's membership service built open (`Peers::Unauthenticated`
+/// Catches: the frontend's membership service built open (`Peers::Unauthenticated`
 /// handed to it whatever the listener's TLS): A's first registration is admitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_frontend_binds_a_storage_certificate_to_the_names_it_carries() {
@@ -155,7 +155,7 @@ async fn a_frontend_binds_a_storage_certificate_to_the_names_it_carries() {
 /// by one that names the node `node-a`: A's certificate is refused `Register` and
 /// `Heartbeat` PERMISSION_DENIED, saying `denied: node node-a`, and B goes on.
 ///
-/// Mutant seen red: the frontend's membership service built with no deny list whatever
+/// Catches: the frontend's membership service built with no deny list whatever
 /// the listener has one: A is admitted after the list names it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_frontend_applies_its_deny_list_to_storage_certificates() {
@@ -236,7 +236,7 @@ async fn operator(api: SocketAddr, method: &str, path: &str, body: &str) -> (u16
 /// the map before it answered, so the beat sees the entry at once), B goes on. The operator
 /// takes the entry off and A registers again.
 ///
-/// Mutant seen red: the frontend's API router given no members (the routes answer 404).
+/// Catches: the frontend's API router given no members (the routes answer 404).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_frontends_operator_routes_write_the_list_its_membership_service_reads() {
     use std::os::unix::fs::PermissionsExt as _;

@@ -65,7 +65,7 @@ fn a_facts_file_names_the_tarball_it_states_the_facts_of() {
 #[test]
 fn only_the_facts_of_kbf_for_the_commit_are_its_assets() {
     // Catches: any `.version.json` taken as an asset of the commit (another commit's,
-    // another binary's, an unknown platform's, a renamed copy). Mutant: the exact name
+    // another binary's, an unknown platform's, a renamed copy). Catches: the exact name
     // replaced by the suffix.
     let other = "badbad0123456789badbad0123456789badbad01";
     for platform in Platform::ALL {

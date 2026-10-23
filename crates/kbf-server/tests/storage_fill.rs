@@ -90,7 +90,7 @@ fn registrant(instance: &str) -> Registrant {
 /// data for over a minute; a real node joins it. The member's own report is the one thing
 /// the test says (it is a node that is not run here). The joiner is `Joining`; the
 /// barrier opens only when the member has reported; the node then makes its pass and is
-/// promoted by its own heartbeat, and the mark goes. Mutants seen red: the registered
+/// promoted by its own heartbeat, and the mark goes. Catches: the registered
 /// node's gate not installed (the node says it cannot say: the join stays blocked on it
 /// until the test gives up); the node not learning the epoch from the answer (it never
 /// acknowledges); `fill::run` not spawned (the same).

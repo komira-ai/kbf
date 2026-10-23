@@ -227,7 +227,8 @@ fn two_processes_taking_one_scratch_name_do_not_share_it() {
 /// everything below it, leaves a sibling whose name only starts the same (`/a/bc` beside
 /// `/a/b`), and fails for a path that is not there, as the real one does.
 ///
-/// Not run as a mutant: the `/` dropped from the prefix it removes by (`/a/bc` goes with `/a/b`).
+/// Also meant to catch the `/` dropped from the prefix it removes by (`/a/bc` goes
+/// with `/a/b`).
 #[test]
 fn the_fake_removes_a_tree_and_not_its_namesake() {
     let mut exec = FakeExec::new(0);

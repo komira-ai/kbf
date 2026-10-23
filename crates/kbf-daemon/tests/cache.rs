@@ -43,7 +43,7 @@ fn meta(path: &Path) -> std::fs::Metadata {
     std::fs::symlink_metadata(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
-/// C-4. Catches fills not merged per key (the "remove the fill map" mutant: every miss
+/// C-4. Catches fills not merged per key (defect "remove the fill map": every miss
 /// fetches): 32 leases at once over one tree, through a CAS that yields on every read
 /// so their misses overlap, read each file blob exactly once, and each lease's files
 /// are right.
@@ -96,7 +96,7 @@ async fn concurrent_leases_fetch_each_blob_once() {
     stop(cache, &gates);
 }
 
-/// C-7. Catches a hit served without the stat check (the "skip the `fstatat`" mutant):
+/// C-7. Catches a hit served without the stat check (defect "skip the `fstatat`"):
 /// an entry chmodded to 0644 after it was filled is evicted at its next use, fetched
 /// again, and back at 0444; the failure is counted.
 #[tokio::test]
@@ -127,7 +127,7 @@ async fn an_entry_whose_mode_changed_is_evicted_at_its_next_use() {
     stop(cache, &gates);
 }
 
-/// C-8. Catches eviction of a key a lease is writing (the "ignore pins" mutant) and a
+/// C-8. Catches eviction of a key a lease is writing (defect "ignore pins") and a
 /// byte total that drifts from what is on disk (an entry counted twice). The budget
 /// holds three 100-byte entries. `old` is the least recently used when a lease that
 /// needs `c`, `d` and `old`, one key at a time and in that order, runs: its inserts of
@@ -193,7 +193,7 @@ async fn the_budget_evicts_least_recently_used_but_never_a_pinned_key() {
 }
 
 /// C-8, two leases. Catches a pin count dropped when the first of two leases that pin
-/// one key finishes (the "remove the pin on any release" mutant): the budget holds one
+/// one key finishes (defect "remove the pin on any release"): the budget holds one
 /// 100-byte entry; of two pins on `old`, the first is released, and the other keeps
 /// `old` through an insert that puts the cache over the budget, so the round after the
 /// insert's lease evicts the new key instead. Once both pins are released, the next
@@ -237,7 +237,7 @@ async fn a_key_two_leases_pin_stays_until_both_release_it() {
     stop(cache, &gates);
 }
 
-/// C-10. Catches a key without the executable bit (the "drop `.x`" mutant): one blob
+/// C-10. Catches a key without the executable bit (defect "drop `.x`"): one blob
 /// named plain twice and executable once is two entries, 0444 and 0555, the plain names
 /// one inode and the executable name the other; the second key is a local copy of the
 /// first, not a second fetch.
@@ -275,7 +275,7 @@ async fn one_blob_plain_and_executable_is_two_entries() {
 }
 
 /// C-13. Catches a cache on another filesystem than the scratch directory failing
-/// leases instead of copying (the "remove the fallback" mutant: no copy mode). The
+/// leases instead of copying (defect "remove the fallback": no copy mode). The
 /// scratch directory here is `/proc`'s filesystem; the lease's files are copies, one
 /// inode per key, and still fetched once.
 #[tokio::test]
@@ -311,8 +311,8 @@ async fn a_cache_on_another_filesystem_copies() {
     stop(cache, &gates);
 }
 
-/// C-13. Catches `EMLINK` or `EXDEV` from a link failing the lease (the "remove the
-/// fallback" mutant), through a link operation that fails as a full link count or
+/// C-13. Catches `EMLINK` or `EXDEV` from a link failing the lease (defect "remove the
+/// fallback"), through a link operation that fails as a full link count or
 /// another filesystem would: the lease gets one private copy per key. A link refused
 /// for another reason fails the lease, naming the path.
 #[tokio::test]
@@ -358,8 +358,8 @@ async fn a_link_refused_for_the_link_count_or_filesystem_falls_back_to_a_copy() 
     stop(cache, &gates);
 }
 
-/// C-17. Catches the cache not consulted on the hot path (the "`materialize` ignoring
-/// the cache" mutant): a second lease of a toolchain-shaped tree of 20,000 files
+/// C-17. Catches the cache not consulted on the hot path (defect "`materialize` ignoring
+/// the cache"): a second lease of a toolchain-shaped tree of 20,000 files
 /// fetches no byte, and every file but the empty ones is a hit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_lease_of_a_toolchain_tree_fetches_nothing() {
@@ -437,7 +437,7 @@ async fn identical_files_are_one_inode_even_when_a_link_fails() {
 }
 
 /// C-20. Catches a free-space floor that empties the cache without freeing space (the
-/// "ignore `st_nlink`" mutant): with a floor no eviction can reach, only entries no
+/// "ignore `st_nlink`" defect): with a floor no eviction can reach, only entries no
 /// lease links are evicted; those a lease still links survive, and the round counts
 /// `floor_unreachable`.
 #[tokio::test]
@@ -639,8 +639,8 @@ async fn a_failed_fill_fails_every_waiter_with_its_error() {
 }
 
 /// C-16. Catches two owners of one cache directory and a start-up that cleans before it
-/// holds the lock (the "shared lock", "clear `tmp/` before the lock" and "recreate the
-/// lock file" mutants): while the first cache holds a fill open in `tmp/`, a second
+/// holds the lock (defects "shared lock", "clear `tmp/` before the lock" and "recreate the
+/// lock file"): while the first cache holds a fill open in `tmp/`, a second
 /// open is refused as `locked`, and the lock file (same inode), the entries and the
 /// fill are untouched; the fill then completes, and a third open is still refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -690,8 +690,8 @@ async fn a_second_owner_is_refused_and_changes_nothing() {
     stop(cache, &gates);
 }
 
-/// R-9 (a). Catches the evictor removing a key without its slot (the "evict without
-/// the slot" mutant: a fill would adopt the file the evictor then unlinks, leaving an
+/// R-9 (a). Catches the evictor removing a key without its slot (defect "evict without
+/// the slot": a fill would adopt the file the evictor then unlinks, leaving an
 /// entry with no file): the evictor is held between the index removal and the unlink
 /// of K while a lease needs K; the lease waits on the slot, then fetches and inserts K.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]

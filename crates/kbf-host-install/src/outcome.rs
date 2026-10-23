@@ -31,13 +31,11 @@ pub enum Refusal {
     /// The source switches signature checking off or weakens it (`trusted`,
     /// `allow-insecure`, `allow-weak`, `allow-downgrade-to-insecure`), even if it names a key.
     ChannelInsecure,
-    /// The target is older than the installed version.
-    OlderThanInstalled,
 }
 
 impl Refusal {
     /// Every refusal.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 7] = [
         Self::BadCommand,
         Self::ChannelNotAllowed,
         Self::ConfigInvalid,
@@ -45,7 +43,6 @@ impl Refusal {
         Self::ChannelUnsigned,
         Self::KeyUntrusted,
         Self::ChannelInsecure,
-        Self::OlderThanInstalled,
     ];
 
     /// The refusal whose closed code this is.
@@ -63,7 +60,6 @@ impl Refusal {
             Self::ChannelUnsigned => "channel_unsigned",
             Self::KeyUntrusted => "key_untrusted",
             Self::ChannelInsecure => "channel_insecure",
-            Self::OlderThanInstalled => "older_than_installed",
         }
     }
 }
@@ -133,11 +129,13 @@ pub struct Failure {
     pub detail: String,
 }
 
-/// What `query` found. Its line is `result: "query"` and then these three fields.
+/// What `query` found. Its line is `result: "query"` and then these four fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryReport {
     pub installed_version: Option<String>,
     pub running_commit: Option<String>,
+    /// The node's id from its configuration; none when the host has none to report.
+    pub node_id: Option<String>,
     pub in_progress: bool,
 }
 
@@ -183,6 +181,7 @@ impl Outcome {
                 result: "query",
                 installed_version: report.installed_version.as_deref(),
                 running_commit: report.running_commit.as_deref(),
+                node_id: report.node_id.as_deref(),
                 in_progress: report.in_progress,
             }),
             Self::Refused(refusal) => to_json(&Reason {
@@ -263,6 +262,7 @@ struct Queried<'a> {
     result: &'static str,
     installed_version: Option<&'a str>,
     running_commit: Option<&'a str>,
+    node_id: Option<&'a str>,
     in_progress: bool,
 }
 

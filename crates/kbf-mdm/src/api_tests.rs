@@ -147,7 +147,7 @@ async fn the_erase_relay_takes_only_the_signed_request() {
 
 #[tokio::test]
 async fn a_profile_is_named_by_digest_and_never_sent() {
-    // Catches: accepting profile bytes from the server (M10 mutant).
+    // Catches: accepting profile bytes from the server (M10 defect).
     let api = Api::new("api-profile").await;
     let digest = "a".repeat(64);
     let (status, _) = api

@@ -88,9 +88,15 @@ impl Rng {
     }
 
     fn resources(&mut self) -> Resources {
-        Resources::new(self.number(), self.number())
+        let resources = Resources::new(self.number(), self.number())
             .with_gpus(self.number())
-            .with_vms(self.number())
+            .with_vms(self.number());
+        // A node's lease cap, set half the time: unset (no cap) and zero must round-trip apart.
+        if self.below(2) == 0 {
+            resources.with_lease_cap(self.number() % 3)
+        } else {
+            resources
+        }
     }
 
     fn names(&mut self) -> BTreeSet<String> {

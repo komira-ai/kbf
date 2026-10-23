@@ -418,7 +418,7 @@ fn take_owned(from: &ProxyConfig, to: &mut ProxyConfig) {
 /// proxy, so a change to either side would send the gates to the wrong port. Here (one of the
 /// files that may name `kbf_proxy`) is where both can be read.
 ///
-/// Mutants planted: `SLOT_STRIDE` 10 to 11 in `kbf_proxy::config`; the operator offset 2 to 3
+/// Catches: `SLOT_STRIDE` 10 to 11 in `kbf_proxy::config`; the operator offset 2 to 3
 /// in `kbf_proxy::route`; each turned this test red.
 #[cfg(test)]
 mod layout_tests {

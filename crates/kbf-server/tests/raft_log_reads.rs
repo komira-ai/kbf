@@ -164,13 +164,13 @@ fn blob_at(epoch: Epoch) -> (Digest, Command) {
     (digest, Command::PutBlob { digest, location })
 }
 
-/// Catches (red before this change; mutant "`query` takes the host lock"): a query
+/// Catches (red before this change; defect "`query` takes the host lock"): a query
 /// waiting for a commit's disk sync. That is how FindMissingBlobs queued behind each
 /// second's `Tick` and every `PutBlobs` on a node whose fsyncs took seconds. A commit
 /// is stalled in its sync; a query must still answer within 2 s, and must not see the
 /// stalled command, which it must see once the commit has answered. (The store syncs
 /// inside each persist, so moving the host's apply ahead of its own sync call is an
-/// equivalent mutant here.)
+/// equivalent change here.)
 #[test]
 fn a_query_answers_while_a_commit_is_stalled_in_its_sync() {
     let runtime = tokio::runtime::Builder::new_multi_thread()

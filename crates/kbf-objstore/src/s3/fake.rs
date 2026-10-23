@@ -646,7 +646,7 @@ fn get(state: &State, key: &str, range: Option<&String>) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// Catches: a request signed over an escaped query (mutant: `unescape` leaves `%2F`
+    /// Catches: a request signed over an escaped query (defect: `unescape` leaves `%2F`
     /// alone, so the fake signs the escape again and refuses a request it should take).
     #[test]
     fn escapes_are_decoded_and_what_is_not_one_stays() {

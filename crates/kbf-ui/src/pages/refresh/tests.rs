@@ -10,7 +10,7 @@ const PAGES: [&str; 3] = ["/ui", "/ui/nodes", "/ui/nodes/mac-1"];
 /// Catches: a query that is not exactly one `refresh` of an allowed interval accepted
 /// (clamped, defaulted or ignored): a value outside the set, empty, negative, with a
 /// sign or a space, a repeated `refresh`, an unknown parameter, and one parameter
-/// besides a good one (mutants: the set check dropped; the duplicate check dropped; the
+/// besides a good one (catches: the set check dropped; the duplicate check dropped; the
 /// key check dropped).
 #[test]
 fn only_one_refresh_of_an_allowed_interval_is_accepted() {

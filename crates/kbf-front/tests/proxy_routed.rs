@@ -300,7 +300,7 @@ fn calls(fakes: &[Arc<Fake>]) -> Vec<usize> {
 /// Catches an upload that fails for the whole member lease (15 s) when its writer is dead
 /// and the map has not marked it down: the writer is a closed port, active in the map, and
 /// the upload is answered by the blob's other write owner (and by nobody else), with the
-/// bytes intact (the fake checks them) and the frontend's map generation. Mutant: the
+/// bytes intact (the fake checks them) and the frontend's map generation. Catches: the
 /// retry loop in `RawByteStream::write` removed (`continue` dropped).
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upload_goes_to_the_next_owner_when_the_writer_cannot_be_reached() {
@@ -355,7 +355,7 @@ async fn an_upload_a_writer_answers_unavailable_is_sent_to_the_next_owner() {
 
 /// Catches an answer passed over for the next owner: a writer that is reached and refuses
 /// the upload (INVALID_ARGUMENT, as a node refuses a write it is not the primary of, or one
-/// whose blob is wrong) is the answer, and the other owner is not called. Mutant: every
+/// whose blob is wrong) is the answer, and the other owner is not called. Catches: every
 /// code retried.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_writer_that_refuses_an_upload_is_not_gone_around() {
@@ -378,7 +378,7 @@ async fn a_writer_that_refuses_an_upload_is_not_gone_around() {
 
 /// Catches an upload failed with the last owner's failure, or one that never tries the
 /// second: both owners dead gives the first writer's failure (it names the node), no third
-/// node is called. Mutant: the last failure returned.
+/// node is called. Catches: the last failure returned.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upload_no_owner_can_take_fails_with_the_first_writers_failure() {
     let probe = map([MemberState::Active; 3]);
@@ -405,7 +405,7 @@ async fn an_upload_no_owner_can_take_fails_with_the_first_writers_failure() {
 /// Catches an upload sent on after bytes of it went to the first owner: the writer reads
 /// the first message of a three-message upload, then fails UNAVAILABLE. The proxy no
 /// longer has the bytes it passed, so the call ends with that failure (the client starts it
-/// again), and the other owner is never called with half a blob. Mutant: `Upload::again`
+/// again), and the other owner is never called with half a blob. Catches: `Upload::again`
 /// ignoring that a frame past the first ones was read.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upload_that_was_passed_on_is_not_sent_to_another_owner() {

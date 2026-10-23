@@ -339,7 +339,7 @@ async fn a_segment_on_the_tier_is_written_there_and_built_as_its_range() {
 /// this test has the process to itself: the copy alone is counted once the original is
 /// gone, and nothing is left counted once the copy is dropped.
 ///
-/// Mutants: `Receiving::new` not holding the buffer; the body `verify_built` returns
+/// Catches: `Receiving::new` not holding the buffer; the body `verify_built` returns
 /// made with `Bytes::from` (the copy uncounted).
 #[tokio::test]
 async fn a_received_segment_is_counted_while_it_is_held() {

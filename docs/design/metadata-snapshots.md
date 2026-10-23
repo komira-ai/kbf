@@ -39,9 +39,10 @@ numbers say *measured* and estimates say *estimate*.
 - **The log's lock is a `std::sync::Mutex`.** Each commit (`execute`, and `tick` once a
   second from the `tick_every` tokio task) takes it once, and so does `async fn query`.
   A caller that waits for it blocks its runtime thread; it does not yield.
-- **The machine decodes every entry as format 1.** `MetaMachine::apply` calls
-  `kbf_log::decode(Format::V1, ..)`, and any command other than a metadata command or a
-  `Bootstrap` (a `MachineVersion`, say) stops the machine as an unknown command.
+- **The machine skips what it does not apply.** `MetaMachine::apply` applies a metadata
+  command, a `Bootstrap` and a `MachineVersion` it runs; a command it does not know, a
+  control command and a `MachineVersion` past what it runs are counted and skipped, and
+  only an entry that does not decode stops the machine.
 - **The disk store can already hold a snapshot.** `kbf-store` writes one file,
   `snapshot`. It holds a header record (base index, base term and state length) and
   then the state in CRC-32C records of at most 1 MiB (`SNAPSHOT_CHUNK`,
@@ -254,10 +255,11 @@ beside it) is `ha.md` 4.7's to settle; PR 4 follows it. As built (write-path.md
 section 6.8): the entry carries the machine version alone, version 2 implies format 2,
 and the raise is committed when the tier is attached
 (`RaftMetaLog::raise_machine_version`), not by every open, so a log that never ran the
-tier stays readable by an older binary. A binary that reads only format
-1 already refuses that log: it decodes the `MachineVersion` entry, which its machine
-does not apply, so the machine stops and the open is refused (section 1). It also
-refuses a format-2 snapshot header (`UnknownFormat(2)`).
+tier stays readable by an older binary. From this build on, a binary that runs only
+version 1 opens that log: it skips the `MachineVersion` entry, which its machine does
+not run, counts it and goes on at version 1 (section 1); a shipped build from before
+skipping refuses the log at that entry. It still refuses a format-2 snapshot header
+(`UnknownFormat(2)`).
 
 ## 5. Taking a snapshot and compacting
 

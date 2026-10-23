@@ -22,7 +22,7 @@ fn lease(actions: &std::path::Path, name: &str, events: Option<&str>) {
 /// leases, and the answer is read from `cgroup.events` (the container is a child cgroup,
 /// so the lease's own process list is empty while its action runs).
 ///
-/// Mutants seen red: `populated 0` counted; the prefix not required; a lease whose action
+/// Catches: `populated 0` counted; the prefix not required; a lease whose action
 /// runs in a child counted by its own `cgroup.procs`.
 #[test]
 fn a_lease_cgroup_is_live_while_it_is_populated() {
@@ -43,7 +43,7 @@ fn a_lease_cgroup_is_live_while_it_is_populated() {
 /// with no `actions/` is idle (the daemon delegated none), but a unit cgroup that does not
 /// exist at all is an error, since a wrong path would otherwise say "no lease is live".
 ///
-/// Mutants seen red: a missing events file counted as not populated; `NotFound` of
+/// Catches: a missing events file counted as not populated; `NotFound` of
 /// `actions/` an error even in a unit that exists; `NotFound` with no unit cgroup idle.
 #[test]
 fn a_cgroup_that_cannot_be_read_is_an_error_and_an_unused_unit_is_idle() {
@@ -76,7 +76,7 @@ fn a_cgroup_that_cannot_be_read_is_an_error_and_an_unused_unit_is_idle() {
 /// mode's unit names its own, and a lease under a different unit or directly in the slice
 /// is not this daemon's.
 ///
-/// Mutants seen red: the unit left out of the path (`kbf.slice/actions`, the earlier
+/// Catches: the unit left out of the path (`kbf.slice/actions`, the earlier
 /// default); the slice left out.
 #[test]
 fn the_actions_cgroup_is_under_the_modes_unit_in_the_slice() {
@@ -122,7 +122,7 @@ fn pool(runner: &FakeRunner) -> PoolLeases<'_> {
 /// it has, and uids outside `first ..< first + users` (root, a person, the uid just past
 /// the pool, the one just below it) are not leases.
 ///
-/// Mutants seen red: processes counted instead of uids; the upper bound inclusive; the
+/// Catches: processes counted instead of uids; the upper bound inclusive; the
 /// lower bound exclusive.
 #[test]
 fn a_pool_uid_with_a_process_is_one_live_lease() {
@@ -190,7 +190,7 @@ fn busy(root: &Path, unit: &str) {
 /// and a unit whose cgroup does not exist cannot tell (the unit never ran, or the path is
 /// wrong: neither is "idle").
 ///
-/// Mutants seen red: a missing cgroup read as idle; every unit's source reading
+/// Catches: a missing cgroup read as idle; every unit's source reading
 /// `kbf-daemon.service`; the classification narrowed to the daemon's unit (the combined
 /// unit is then refused as no mode's).
 #[test]
@@ -216,7 +216,7 @@ fn the_daemons_lease_source_reads_its_units_cgroup_and_a_missing_one_cannot_tell
 /// refuses when the cgroup is absent. The table is the one in `setup::plan`; this test
 /// breaks, rather than the host, when a mode's unit is renamed or a mode is added.
 ///
-/// Mutants seen red: classification narrowed to the daemon's unit only; a unit's source
+/// Catches: classification narrowed to the daemon's unit only; a unit's source
 /// reading `kbf-daemon.service` for every unit; a missing cgroup read as idle.
 #[test]
 fn every_unit_a_mode_can_name_is_classified_and_reads_its_own_cgroup() {
@@ -249,7 +249,7 @@ fn every_unit_a_mode_can_name_is_classified_and_reads_its_own_cgroup() {
 /// instance and an instance that would leave the slice (a populated cgroup planted at the
 /// path it would read) are each refused with the unit named, whatever cgroup exists.
 ///
-/// Mutants seen red (each one makes exactly the units named in the failure wrong): an
+/// Catches (each one makes exactly the units named in the failure wrong): an
 /// unknown unit given a source that reads no actions (every one reads idle); the instance's
 /// characters not checked (the two instances with a `/` read the planted directories); the
 /// empty instance accepted; a prefix match instead of the family's stem (the two names that
@@ -325,7 +325,7 @@ fn on(root: &Path) -> LeaseHost {
 /// cgroup source (a populated cgroup planted for the label is not a lease) or the
 /// not-wired one.
 ///
-/// Mutants seen red: a label given `NotWired` (the message names no sandbox); an empty label
+/// Catches: a label given `NotWired` (the message names no sandbox); an empty label
 /// given the Mac source (it names no label problem).
 #[test]
 fn a_launchd_label_gets_the_mac_source_and_an_empty_one_cannot_tell() {
@@ -351,7 +351,7 @@ fn a_launchd_label_gets_the_mac_source_and_an_empty_one_cannot_tell() {
 /// that is the family's only by prefix, an instance that is empty or would leave the slice,
 /// another mode's instance and a launchd label are not.
 ///
-/// Mutants seen red: every unit given as a frontend's (the other modes' read as frontends);
+/// Catches: every unit given as a frontend's (the other modes' read as frontends);
 /// none (the frontend's reads as not); the family not matched (the template's instances and
 /// the plain unit read as not); a prefix match instead of the family (the two names that only
 /// start with it); the instance's characters not checked.

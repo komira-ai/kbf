@@ -1,4 +1,4 @@
-//! `kbf cluster status|drain|undrain|member|safe-to-stop|denied|object-store`: a thin client of the operator API
+//! `kbf cluster status|drain|undrain|member|safe-to-stop|denied|epoch-bump|object-store`: a thin client of the operator API
 //! (`docs/api.md`) on the frontend's host. It holds no cluster logic: each verb is one
 //! call, and the answer is the API's JSON, printed as it came.
 //!
@@ -18,6 +18,11 @@
 //!   needs `--token-file`. Exit 0 if it may, 3 if not (the reasons on stdout), 1 if the call
 //!   failed.
 //! - `kbf cluster denied`: `GET /v1/denied`, the storage deny list with its reasons.
+//! - `kbf cluster epoch-bump`: `POST /v1/epoch/bump`, raises the epoch the state store
+//!   holds by one, for a store restored from a backup (the frontends that start after it
+//!   serve the new epoch, so the daemons drop the leases the lost history granted; a
+//!   frontend that runs keeps the one it started under). The answer names the epoch
+//!   before, the epoch stored now and the epoch the frontend serves.
 //! - `kbf cluster object-store ...`: the object-store registration routes
 //!   ([`object_store`]). `denied` and `object-store` pass the whole write gate with a
 //!   `GET`, so they need `--token-file` too.
@@ -37,7 +42,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand, ValueEnum};
-use kbf_server::api::{DENIED, FRONTEND_DRAIN, NODES, safe_to_stop_path};
+use kbf_server::api::{DENIED, EPOCH_BUMP, FRONTEND_DRAIN, NODES, safe_to_stop_path};
 use kbf_server::api_client::{ClientError, OperatorClient, Reply};
 use serde::Serialize;
 use zeroize::Zeroizing;
@@ -47,8 +52,8 @@ use zeroize::Zeroizing;
 pub const DEFAULT_API: &str = "127.0.0.1:8982";
 
 /// Show, drain and undrain the cluster, set a member's state, ask whether a member's host may
-/// be stopped, list the denied hosts and manage the object store, through the frontend's
-/// operator API.
+/// be stopped, list the denied hosts, raise the state store's epoch and manage the object
+/// store, through the frontend's operator API.
 #[derive(Args, Clone, Debug, PartialEq, Eq)]
 pub struct Cluster {
     /// The operator API (the server's `--api-listen`).
@@ -134,6 +139,15 @@ pub enum Verb {
     Denied {
         #[command(flatten)]
         token: object_store::Token,
+    },
+    /// Raise the epoch the state store holds by one, after a restore from a backup: the
+    /// frontends that start after it serve the new epoch, so the daemons drop the leases the
+    /// lost history granted. The frontend that answers goes on serving its own until it is
+    /// restarted.
+    EpochBump {
+        /// The file holding the server's operator API token.
+        #[arg(long, value_name = "FILE")]
+        token_file: PathBuf,
     },
     /// Register the farm's object store: connections, the `cold` binding, probes, status
     /// and audit.
@@ -261,6 +275,7 @@ impl Verb {
             }
             Self::SafeToStop { id, .. } => Call::GetGated(safe_to_stop_path(id)),
             Self::Denied { .. } => Call::GetGated(DENIED.to_owned()),
+            Self::EpochBump { .. } => Call::Post(EPOCH_BUMP.to_owned(), Body::empty()),
             Self::ObjectStore { verb } => verb.call(stdin)?,
         })
     }
@@ -273,7 +288,8 @@ impl Verb {
             Self::Drain { token_file, .. }
             | Self::Undrain { token_file, .. }
             | Self::Member { token_file, .. }
-            | Self::SafeToStop { token_file, .. } => Some(token_file),
+            | Self::SafeToStop { token_file, .. }
+            | Self::EpochBump { token_file } => Some(token_file),
             Self::Denied { token } => Some(&token.token_file),
             Self::ObjectStore { verb } => Some(verb.token_file()),
         }

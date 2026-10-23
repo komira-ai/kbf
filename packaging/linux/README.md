@@ -12,6 +12,7 @@ inputs, and `crates/xtask/src/pkg_linux.rs` is the one place that says what goes
 |---|---|
 | `sysusers.d/kbf-installer.conf` | the users `kbf`, `kbf-server`, `kbf-fetch`, `kbf-signer` (no login); installed to `/usr/lib/sysusers.d` |
 | `tmpfiles.d/kbf-installer.conf` | `/run/kbf-installer` (0755), `/var/cache/kbf-fetch` (0711); the units author's file, packaged unchanged; installed to `/usr/lib/tmpfiles.d` |
+| `needrestart/kbf.conf` | tells needrestart never to restart a unit named `kbf-*`, `kbf.*` or `kbf@*`; installed to `/etc/needrestart/conf.d/kbf.conf` (0644, a config file the host may edit) |
 | `units/` | the unit files (`kbf-*.service`, `kbf-*.socket`, `kbf.slice`), installed to `/usr/lib/systemd/system`; `testdata/units` is the fixture for the unit tests only |
 | `testdata/` | fixtures for the install test only: two gated units and three stand-in trust files |
 | `test/ubuntu`, `test/fedora` | the fresh systems the install test uses, systemd as PID 1, pinned by digest |
@@ -25,6 +26,10 @@ inputs, and `crates/xtask/src/pkg_linux.rs` is the one place that says what goes
 - `/usr/share/kbf-installer/trust/`: `gh` (0755), `trusted_root.jsonl`, `installer.conf` (0644);
 - the sysusers.d file (this package's) and the tmpfiles.d file (the unit author's, packaged
   unchanged; `/var/lib/kbf-installer` is made by `kbf-installer setup`, not at install);
+- `/etc/needrestart/conf.d/kbf.conf` (0644): on Ubuntu, needrestart restarts every service that maps a library an
+  unattended upgrade replaced. A restart of a storage member in the middle of a build leaves the blobs only that
+  member holds unreadable for the restart, and the client's build fails. This drop-in sets needrestart's
+  `override_rc` for kbf units to 0, so only kbf's own update path restarts them. A host without needrestart ignores it.
 - all of it `root:root`, with one time (`SOURCE_DATE_EPOCH`) on every file and the package.
 
 ### Which frontend unit
@@ -107,6 +112,7 @@ cargo xtask pkg-config --binary <kbf-installer> --units packaging/linux/units \
   --trust <dir of gh, installer.conf, trusted_root.jsonl> \
   --sysusers packaging/linux/sysusers.d/kbf-installer.conf \
   --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf \
+  --needrestart packaging/linux/needrestart/kbf.conf \
   --platform linux-x86_64 --version <v> --out <dir>      # nfpm.yaml, listing.txt
 cargo xtask pkg-build --nfpm <nfpm> --config <dir>/nfpm.yaml --out <pkgs>
 cargo xtask pkg-install-test --package <file> --format deb|rpm --listing <dir>/listing.txt \

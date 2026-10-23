@@ -372,7 +372,7 @@ async fn get_action_result_misses_when_the_store_lost_an_output_object() {
 /// Catches an entry answered without the closure it was committed with (or with the result
 /// blob in it, which the entry's owner reads itself): the closure of a hit is the output
 /// file and stdout, in digest order, read in the same step as the hit; a miss has none.
-/// Mutant: `action_entry` answers an empty closure.
+/// Catches: `action_entry` answers an empty closure.
 #[tokio::test]
 async fn action_entry_reports_the_closure_the_entry_was_committed_with() {
     let farm = Farm::start().await;

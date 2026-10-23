@@ -252,7 +252,7 @@ async fn hundred_apart() -> (Farm, Vec<Blob>) {
     (farm, blobs)
 }
 
-/// Test C-15 (`docs/design/worker-cache.md#10-test-plan`). Catches (mutant "revert to
+/// Test C-15 (`docs/design/worker-cache.md#10-test-plan`). Catches (defect "revert to
 /// the serial loop", `buffer_unordered(1)`): a batch read that waits for each blob's
 /// GET before it starts the next, so a 100-blob batch costs 100 store round trips. At
 /// 10 ms a GET that is 1,000 ms; 32 at a time it is 4 rounds, 40 ms.
@@ -273,9 +273,9 @@ async fn a_hundred_blob_batch_read_is_not_a_hundred_gets_in_a_row() {
     );
 }
 
-/// Catches (mutant "unbounded", `buffer_unordered(usize::MAX)` or a `join_all`): one
+/// Catches (defect "unbounded", `buffer_unordered(usize::MAX)` or a `join_all`): one
 /// BatchReadBlobs call opening a GET per blob at once, so a client's batch sets how
-/// many requests the store sees; and (mutant "bound 1") no concurrency at all. The
+/// many requests the store sees; and (defect "bound 1") no concurrency at all. The
 /// design's bound is 32 (`docs/design/worker-cache.md#9-rollout`, stage S1).
 #[tokio::test(start_paused = true)]
 async fn a_batch_read_keeps_at_most_thirty_two_gets_in_flight() {
@@ -285,7 +285,7 @@ async fn a_batch_read_keeps_at_most_thirty_two_gets_in_flight() {
     assert_eq!(farm.store.script().most_in_flight, 32);
 }
 
-/// Catches (mutant "never extend a run"): blobs stored back to back in one segment
+/// Catches (defect "never extend a run"): blobs stored back to back in one segment
 /// read with one GET each instead of one GET for the lot; a run that spans a record
 /// the batch did not ask for (a gap must split it); and answers that lose request
 /// order or a digest asked twice. The empty blob needs no GET, a blob never stored is
@@ -331,7 +331,7 @@ async fn blobs_back_to_back_in_one_segment_are_read_with_one_get() {
     assert_eq!(farm.store.gets() - gets, 2, "the second record is a gap");
 }
 
-/// Catches (mutant "fail every blob of a failed joined GET"): one failed GET for a
+/// Catches (defect "fail every blob of a failed joined GET"): one failed GET for a
 /// run of blobs failing them all, where reading each alone (as `read_blob` would)
 /// still serves them.
 #[tokio::test]
@@ -346,11 +346,11 @@ async fn a_failed_joined_get_reads_each_blob_alone() {
     assert_eq!(farm.store.gets() - gets, 4, "the joined GET, then one each");
 }
 
-/// Catches (mutant "no digest check on a record of a joined GET"): bytes damaged in
+/// Catches (defect "no digest check on a record of a joined GET"): bytes damaged in
 /// the store served for one blob of a run because the GET as a whole succeeded. The
 /// damaged blob must fail UNAVAILABLE and mark its object unreachable (so all three
 /// are then reported missing and get uploaded again), while its neighbours, whose
-/// bytes check, are served. And (mutant "an unreachable blob answers NOT_FOUND"): the
+/// bytes check, are served. And (defect "an unreachable blob answers NOT_FOUND"): the
 /// next batch answers all three UNAVAILABLE without reading the store.
 #[tokio::test]
 async fn a_damaged_record_in_a_joined_get_fails_alone_and_marks_its_object() {
@@ -375,7 +375,7 @@ async fn a_damaged_record_in_a_joined_get_fails_alone_and_marks_its_object() {
     assert_eq!(farm.store.gets(), gets);
 }
 
-/// Catches (mutant "no store check before a joined GET"): blobs indexed in a store
+/// Catches (defect "no store check before a joined GET"): blobs indexed in a store
 /// this cache does not have read from the configured store anyway. Each must fail
 /// INTERNAL with no GET made, as `read_blob` fails one.
 #[tokio::test]
@@ -403,7 +403,7 @@ async fn blobs_in_another_store_are_internal_and_never_read() {
     assert_eq!(farm.store.gets(), gets);
 }
 
-/// Catches (mutant "`?` on the batch's metadata query"): a log that cannot answer
+/// Catches (defect "`?` on the batch's metadata query"): a log that cannot answer
 /// failing the whole call, or answering some blob as NOT_FOUND (which a client reads
 /// as "upload it again"). Each blob answers UNAVAILABLE, as one read alone would.
 #[tokio::test]
@@ -422,7 +422,7 @@ fn days(n: u64) -> FarmTime {
     FarmTime::from_millis(n * 24 * 60 * 60 * 1000)
 }
 
-/// Catches (mutant "batch read without the touch", `touch_for(&[])`): blobs that are
+/// Catches (defect "batch read without the touch", `touch_for(&[])`): blobs that are
 /// only ever read through BatchReadBlobs (buck2 reads small inputs that way) not
 /// counting as used, so they are collected at the end of their TTL while builds still
 /// read them. A blob batch-read on day 5 outlives a collection on day 10; its unread

@@ -269,7 +269,7 @@ mod planted {
 
     #[test]
     fn a_new_unflagged_spawn_is_refused_in_every_spelling() {
-        // Catches (planted defect): a test or harness file that starts `kbf` by the cargo
+        // Catches: a test or harness file that starts `kbf` by the cargo
         // path, a `bin/kbf` path or a link, with no flag and no row, in a tests/ directory
         // and in the harness sources.
         let q = '"';
@@ -301,7 +301,7 @@ mod planted {
 
     #[test]
     fn a_helper_that_loses_its_flag_is_refused() {
-        // Catches (planted defect): a flagged helper edited to start the child bare.
+        // Catches: a flagged helper edited to start the child bare.
         let mut t = tree();
         t.insert(HELPER.to_owned(), spawn(""));
         let got = problems(&t);
@@ -311,7 +311,7 @@ mod planted {
 
     #[test]
     fn a_stale_row_is_refused() {
-        // Catches (planted defect): a row for a file that is gone or no longer names the
+        // Catches: a row for a file that is gone or no longer names the
         // binary, so the allowance stops shrinking with the code.
         let mut gone = tree();
         gone.remove(OLD);
@@ -374,7 +374,7 @@ mod planted {
 
     #[test]
     fn a_host_path_opened_by_a_test_is_refused_and_an_extra_allowed_use_too() {
-        // Catches (planted defects): a test reading the host's real directory, in each
+        // Catches: a test reading the host's real directory, in each
         // spelling, and a second use in a file with a one-use row.
         let plants = [
             (
@@ -404,7 +404,7 @@ mod planted {
 
     #[test]
     fn a_stale_host_path_row_is_refused() {
-        // Catches (planted defect): a row for a file that is gone, which would let a
+        // Catches: a row for a file that is gone, which would let a
         // future file of that name use the host path.
         let mut t = host_tree();
         t.remove("crates/k/tests/default.rs");

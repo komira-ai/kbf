@@ -149,7 +149,7 @@ fn chunked(bytes: &[u8]) -> Chunks {
     Box::pin(futures::stream::iter(chunks))
 }
 
-/// Catches a blob too large to gather refused, or gathered whole (mutants: the refusal
+/// Catches a blob too large to gather refused, or gathered whole (defects: the refusal
 /// restored, the size check dropped): without a write tier, `put_chunks` of a blob one
 /// byte over `MAX_UNSTAGED_BLOB_BYTES` is streamed to the store and held after; again,
 /// once held, it is not read at all; one whose bytes are not its digest's is `Corrupt`
@@ -226,7 +226,7 @@ fn put_chunks_streams_a_large_blob_and_stores_a_small_one() {
 }
 
 /// Catches an upload with a large record refused without a write tier, or failed
-/// (mutant: FAILED_PRECONDITION at `Begin` taken for a failure): `put_records` of a
+/// (defects: FAILED_PRECONDITION at `Begin` taken for a failure): `put_records` of a
 /// record one byte over `MAX_UNSTAGED_BLOB_BYTES` and a small one, with no tier, stores
 /// both, each by itself.
 #[test]
@@ -281,7 +281,7 @@ fn parts(parts: &[&[u8]]) -> Chunks {
 }
 
 /// Catches a streamed store that drops a blob, re-reads one the cache holds, or says
-/// stored for bytes it did not keep (mutants: the held-blob return removed, so the
+/// stored for bytes it did not keep (defects: the held-blob return removed, so the
 /// chunks are read again; the result taken for `Ok` whatever the store answered): a
 /// blob streamed in two chunks is `Ok`, is held after and reads back; the same blob
 /// again is `Ok` without one chunk read. `put_streamed` is called directly with small
@@ -312,7 +312,7 @@ fn a_streamed_blob_is_stored_and_not_read_again_once_held() {
 }
 
 /// Catches bytes stored under a digest that is not theirs, or too many bytes taken for
-/// the blob (mutants: the `DigestMismatch` arm answering `Unavailable`, or the other
+/// the blob (defects: the `DigestMismatch` arm answering `Unavailable`, or the other
 /// store errors answering `Corrupt`): a blob whose bytes hash to another digest is
 /// `Corrupt`, naming the claimed digest and the one its bytes have, and is not held; one
 /// with more bytes than its digest's size, which the store refuses, is `Unavailable`
@@ -349,7 +349,7 @@ fn a_streamed_blob_with_other_bytes_than_its_digest_is_refused() {
 }
 
 /// Catches a chunk that could not be read reported as the store's failure, or the
-/// upload taken for stored (mutant: the note of the failed chunk dropped): a stream
+/// upload taken for stored (defects: the note of the failed chunk dropped): a stream
 /// whose second chunk fails is `Read` with the chunk's error, and the blob is not held.
 #[test]
 fn a_streamed_blob_whose_chunk_cannot_be_read_is_a_read_failure() {
@@ -403,7 +403,7 @@ fn a_streamed_blob_is_unavailable_for_a_bad_digest_or_a_gone_server_half() {
 }
 
 /// Catches a small blob stored with other bytes than its digest's, or a failed read taken
-/// for stored (mutants: the digest compare dropped; a chunk's error answered as the
+/// for stored (defects: the digest compare dropped; a chunk's error answered as the
 /// store's): `put_chunks` of a small blob in two chunks is `Ok` and held; one whose
 /// bytes hash to another digest is `Corrupt` naming the claimed digest and the actual
 /// one, and is not held; one whose chunk fails is `Read` with the chunk's error. (The
@@ -452,7 +452,7 @@ fn put_chunks_gathers_a_small_blob_and_refuses_one_that_is_not_its_digest() {
 }
 
 /// Catches a blob over `MAX_UNSTAGED_BLOB_BYTES` gathered in memory, and a small blob
-/// reported stored when the server half is gone (mutants: the size test dropped, so every
+/// reported stored when the server half is gone (defects: the size test dropped, so every
 /// blob is gathered; the store's error dropped): a digest of one byte over the limit is
 /// handed to the streamed store (its answer for a hash that is not hex, with no chunk
 /// read, where a gathered blob would be `Corrupt`); a small blob with the server half's

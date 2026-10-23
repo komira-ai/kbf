@@ -18,7 +18,8 @@
 # The payload (`cargo xtask installer-tarball`) is the Debian package's file list, made
 # from the same Rust list: usr/bin/kbf-installer, usr/lib/systemd/system/kbf-*.service and
 # kbf.slice, usr/share/kbf-installer/trust/{gh,installer.conf,trusted_root.jsonl},
-# usr/lib/sysusers.d/kbf-installer.conf and usr/lib/tmpfiles.d/kbf-installer.conf, and
+# usr/lib/sysusers.d/kbf-installer.conf and usr/lib/tmpfiles.d/kbf-installer.conf,
+# etc/needrestart/conf.d/kbf.conf (keeps needrestart from restarting kbf units), and
 # no kbf release (`kbf-installer record-release` records the first one). After placing, the
 # script makes the users and directories from those two files (systemd-sysusers and
 # systemd-tmpfiles, on those files only); a host without systemd is refused before
@@ -153,6 +154,7 @@ while read -r entry; do
     usr/share/kbf-installer/trust/gh | usr/share/kbf-installer/trust/installer.conf) ;;
     usr/share/kbf-installer/trust/trusted_root.jsonl) ;;
     usr/lib/sysusers.d/kbf-installer.conf | usr/lib/tmpfiles.d/kbf-installer.conf) ;;
+    etc/needrestart/conf.d/kbf.conf) ;;
     *) die "$name holds '$entry', which the package does not" ;;
   esac
 done <"$tmp/names"

@@ -4,7 +4,7 @@
 //! run as root), and talks to a local HTTPS file server (the `url` source) or a local gRPC
 //! `ReleaseService` over mutual TLS (the `frontend` source).
 //!
-//! Each test names the rule of contract section 5 it holds and the mutant that turns it red.
+//! Each test names the rule of contract section 5 it holds and the defect that fails it.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -521,7 +521,7 @@ fn the_url_source_serves_the_bytes_at_files_sha256() {
 /// Rule: "The child follows no redirect at all; any 3xx is a failed fetch." A followed redirect
 /// is how a compromised mirror sends a host to another source than the one configured.
 ///
-/// Mutant seen red: `.max_redirects(0)` removed from the ureq agent (the fetch then succeeds
+/// Catches: `.max_redirects(0)` removed from the ureq agent (the fetch then succeeds
 /// from the second server).
 #[test]
 fn a_redirect_is_a_failed_fetch_and_is_not_followed() {
@@ -569,7 +569,7 @@ fn only_a_200_is_a_fetch() {
 ///
 /// Rule: "at most `size` bytes (one more kills the child)".
 ///
-/// Mutants seen red: `count > caps.size` in the pipe made `>=` (the exact fetch fails); the
+/// Catches: `count > caps.size` in the pipe made `>=` (the exact fetch fails); the
 /// parent passing `size` instead of `size + 1` as the child's limit (a source that sends too
 /// much is then silently cut to size and accepted if the prefix hashes right, which here it
 /// does not, so the test names the cause in the error type too).
@@ -639,7 +639,7 @@ fn a_short_body_is_a_failed_fetch() {
 ///
 /// Rule: verification step 2 ("the SHA-256 computed while reading equals the record's").
 ///
-/// Mutant seen red: the `got.sha256 != component.sha256` comparison removed in
+/// Catches: the `got.sha256 != component.sha256` comparison removed in
 /// `fetch_component`.
 #[test]
 fn bytes_of_the_right_size_and_the_wrong_digest_are_refused() {
@@ -660,7 +660,7 @@ fn bytes_of_the_right_size_and_the_wrong_digest_are_refused() {
 ///
 /// Rule: "bounded time" (no byte for 60 s, `fetch_timeout_s` in all; shortened here).
 ///
-/// Mutant seen red: the `quiet` deadline removed from the pipe's wait (the fetch then ends at
+/// Catches: the `quiet` deadline removed from the pipe's wait (the fetch then ends at
 /// the whole-fetch limit instead, which the bound below also catches when the limit is long).
 #[test]
 fn a_source_that_stalls_is_cut_off() {
@@ -697,7 +697,7 @@ fn a_source_that_stalls_is_cut_off() {
 /// Catches a child that leaves itself dumpable after its `exec`, which a `prctl` before the exec
 /// cannot prevent (the exec makes it dumpable again).
 ///
-/// Mutant: the `forbid_inspection` call removed from `main`.
+/// Catches: the `forbid_inspection` call removed from `main`.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_fetch_child_cannot_be_looked_into_by_its_users_other_processes() {
@@ -807,7 +807,7 @@ fn a_server_under_another_name_is_not_trusted() {
 ///
 /// Rule: "closes every descriptor but 0, 1, 2 and 4".
 ///
-/// Mutant seen red: the `range_cloexec` marking left out of the child's start (the child then
+/// Catches: the `range_cloexec` marking left out of the child's start (the child then
 /// finds the stray descriptor and the fetch fails).
 #[test]
 fn a_descriptor_the_parent_holds_does_not_reach_the_child() {
@@ -835,7 +835,7 @@ fn a_descriptor_the_parent_holds_does_not_reach_the_child() {
 /// Rule: "for the `frontend` source the parent lends the node certificate and key ... over
 /// descriptor 4".
 ///
-/// Mutants seen red: the parent not lending (`lend` passed as `None`: the child has no
+/// Catches: the parent not lending (`lend` passed as `None`: the child has no
 /// identity and the fetch fails); the child not presenting the identity (`.identity(..)` left
 /// out: the server's handshake fails).
 #[test]
@@ -880,7 +880,7 @@ fn a_node_certificate_from_another_ca_is_refused_by_the_frontend() {
 ///
 /// Rule: the `frontend` source "authenticates the server with the pinned CA".
 ///
-/// Mutant seen red: the child trusting any certificate, or adding the system roots to the
+/// Catches: the child trusting any certificate, or adding the system roots to the
 /// pinned CA when the pinned one fails.
 #[test]
 fn a_frontend_under_another_ca_is_not_trusted() {
@@ -903,7 +903,7 @@ fn a_frontend_under_another_ca_is_not_trusted() {
 ///
 /// Rule: "the frontend name checked against the certificate SAN".
 ///
-/// Mutant seen red: `.domain_name(host)` pointing at the certificate's own name instead of the
+/// Catches: `.domain_name(host)` pointing at the certificate's own name instead of the
 /// URL's host.
 #[test]
 fn a_frontend_whose_certificate_names_another_host_is_not_trusted() {
@@ -989,7 +989,7 @@ fn a_frontend_that_stalls_is_cut_off() {
 ///
 /// Rule: "the installer opens them `O_NOFOLLOW` at each fetch".
 ///
-/// Mutant seen red: `O_NOFOLLOW` removed from `read_pem` (the link is followed and the fetch
+/// Catches: `O_NOFOLLOW` removed from `read_pem` (the link is followed and the fetch
 /// succeeds).
 #[test]
 fn a_linked_key_file_is_refused_before_any_child_starts() {
@@ -1208,7 +1208,7 @@ fn an_unreachable_source_is_one_line_on_standard_error() {
 /// Rule: "No proxy environment" (the parent starts the child with an empty environment; the child
 /// must not depend on that). A proxy would see the request path and could answer for the mirror.
 ///
-/// Mutant seen red: `.proxy(None)` removed from the ureq agent (the child then connects to the
+/// Catches: `.proxy(None)` removed from the ureq agent (the child then connects to the
 /// listener named by `HTTPS_PROXY` and the fetch fails).
 #[test]
 fn a_proxy_in_the_environment_is_not_used() {
@@ -1291,7 +1291,7 @@ fn said(out: &std::process::Output) -> String {
 
 /// Whatever the source sends beyond the limit the child is given is not written.
 ///
-/// Mutant seen red: `.take(limit)` removed from `copy_limited` (all 1000 bytes are written).
+/// Catches: `.take(limit)` removed from `copy_limited` (all 1000 bytes are written).
 #[test]
 fn the_child_writes_no_more_than_its_limit() {
     let (pki, leaf) = pki_and_server();
@@ -1468,7 +1468,7 @@ fn identity_of(pki: &Pki, node: &Leaf) -> kbf_installer::fetch::identity::Identi
 /// A child lent an identity on descriptor 4 or any other number fetches over mutual TLS and
 /// writes the bytes, no more than its limit.
 ///
-/// Mutants seen red: the identity not presented; the limit not applied to the stream (the loop
+/// Catches: the identity not presented; the limit not applied to the stream (the loop
 /// condition `written < limit` removed).
 #[cfg(target_os = "linux")]
 #[test]
@@ -1523,7 +1523,7 @@ fn a_frontend_that_fails_is_a_failed_fetch() {
 /// What the child says when the descriptor it is told to adopt is not a lent identity: a
 /// standard stream, one that is not open, a descriptor the parent left open besides it.
 ///
-/// Mutant seen red: the check that the child holds nothing else removed.
+/// Catches: the check that the child holds nothing else removed.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_lent_descriptor_the_child_cannot_adopt_is_a_failed_start() {
@@ -1706,7 +1706,7 @@ impl Rig {
 /// path, a reader that fails on an added key, and another platform's entry leaking into the
 /// answer.
 ///
-/// Mutants: `releases/` spelt `release/` in the child (red: 404); `deny_unknown_fields` on the
+/// Catches: `releases/` spelt `release/` in the child (red: 404); `deny_unknown_fields` on the
 /// JSON types (red: refused).
 #[test]
 fn the_url_source_is_described_from_its_json() {
@@ -1728,7 +1728,7 @@ fn the_url_source_is_described_from_its_json() {
 /// Catches the whole description refused for another platform's entry (the file would be read as
 /// a whole, or the child would render every entry), which is the property the docs state.
 ///
-/// Mutants: the platform not sent to the `url` child (red); the entries of other platforms kept by
+/// Catches: the platform not sent to the `url` child (red); the entries of other platforms kept by
 /// the child (red).
 #[test]
 fn a_malformed_entry_of_another_platform_is_not_read() {
@@ -1771,7 +1771,7 @@ fn a_malformed_entry_of_another_platform_is_not_read() {
 /// Catches a refusal of the source taken for a failure of the child, and a server error taken
 /// for a refusal.
 ///
-/// Mutant: the `404 | 409` arm of the child removed (red: both are failures of the child).
+/// Catches: the `404 | 409` arm of the child removed (red: both are failures of the child).
 #[test]
 fn a_url_source_that_has_no_such_release_says_so() {
     let (pki, leaf) = pki_and_server();
@@ -1836,7 +1836,7 @@ fn a_url_file_that_cannot_be_used_is_refused_with_the_reason() {
 /// Catches the platform not being asked for (a frontend would describe every one), and a
 /// describe sent without the identity.
 ///
-/// Mutants: `platform` left empty in the child's request (red: asked for ""); the identity not
+/// Catches: `platform` left empty in the child's request (red: asked for ""); the identity not
 /// presented (red).
 #[test]
 fn the_frontend_source_is_described_over_mutual_tls() {
@@ -1860,7 +1860,7 @@ fn the_frontend_source_is_described_over_mutual_tls() {
 /// Catches the two refusals taken for failures of the child, a failure taken for a refusal, and
 /// the server's message (which names what is lacking) lost.
 ///
-/// Mutant: `Code::FailedPrecondition` removed from the child's match (red).
+/// Catches: `Code::FailedPrecondition` removed from the child's match (red).
 #[test]
 fn a_frontend_that_will_not_describe_is_a_refusal_or_a_failure_by_its_status() {
     use tonic::Code;
@@ -2010,7 +2010,7 @@ fn the_child_writes_the_description_in_the_form() {
 /// Catches the platform not reaching the `url` reader (the `--platform` flag taken for a
 /// frontend's alone), and the child choosing among platforms by reading all of them first.
 ///
-/// Mutant: `args.platform` passed as `None` to the JSON reader (red: refused).
+/// Catches: `args.platform` passed as `None` to the JSON reader (red: refused).
 #[test]
 fn the_child_writes_only_the_platform_it_is_told() {
     let (pki, leaf) = pki_and_server();
@@ -2052,7 +2052,7 @@ fn the_child_writes_only_the_platform_it_is_told() {
 /// A file cut at the child's limit is not a description: it is read as far as the limit and
 /// refused, with the child's words, as one line and success.
 ///
-/// Mutant: `.take(args.limit)` removed from the body read (red: the whole file is read).
+/// Catches: `.take(args.limit)` removed from the body read (red: the whole file is read).
 #[test]
 fn a_file_longer_than_the_limit_is_read_only_that_far() {
     let (pki, leaf) = pki_and_server();
@@ -2077,7 +2077,7 @@ fn a_file_longer_than_the_limit_is_read_only_that_far() {
 /// The `404` and `409` of a `url` source are written as refusals (and the child succeeds: it
 /// did what it was asked, and the answer is no); a `500` is a failure with the status named.
 ///
-/// Mutant: the `404 | 409` arm removed (red: both fail).
+/// Catches: the `404 | 409` arm removed (red: both fail).
 #[test]
 fn the_child_writes_a_refusal_for_404_and_409_and_fails_for_the_rest() {
     let (pki, leaf) = pki_and_server();
@@ -2107,7 +2107,7 @@ fn the_child_writes_a_refusal_for_404_and_409_and_fails_for_the_rest() {
 /// A file that ends before its declared length is a failed fetch with the transport's words, and
 /// nothing is written: half a description is not one.
 ///
-/// Mutant: the body read's error taken for the end of the file (red: the half is parsed and
+/// Catches: the body read's error taken for the end of the file (red: the half is parsed and
 /// refused as a file without a schema).
 #[test]
 fn a_description_cut_short_is_a_failed_fetch() {
@@ -2200,7 +2200,7 @@ fn the_frontend_child_writes_what_describe_answered() {
 /// `NOT_FOUND` and `FAILED_PRECONDITION` are written as refusals with the status named, and the
 /// child succeeds; any other status fails it.
 ///
-/// Mutant: either code removed from the match (red).
+/// Catches: either code removed from the match (red).
 #[cfg(target_os = "linux")]
 #[test]
 fn the_frontend_child_writes_a_refusal_for_two_statuses() {
@@ -2288,7 +2288,7 @@ impl LeaseSource for NoLeases {
 /// fetcher reads, the layout of the `url` source), a bundle fetched under another name than its
 /// digest, and a file fetched twice.
 ///
-/// Mutant: the bundle fetched by the tarball's digest (red: 404 on a second tarball fetch).
+/// Catches: the bundle fetched by the tarball's digest (red: 404 on a second tarball fetch).
 #[test]
 fn a_frontend_update_is_installed_from_a_url_source_end_to_end() {
     let (pki, leaf) = pki_and_server();

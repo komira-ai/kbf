@@ -2,10 +2,9 @@
 //! without leaving a blob with one copy? The updater of a host asks it before it stops the
 //! host's process (`docs/api.md`).
 //!
-//! It is the storage gate of the update controller ([`storage_gate`], mode
-//! [`GateMode::Out`]) asked about one member, over a look at the members as the controller
-//! reads them: with this member out, every other member must be `Active`, heard within the
-//! time to live of the membership, not planned down, and report a repair debt of zero; and
+//! It is the storage gate ([`storage_gate`], mode [`GateMode::Out`]) asked about one member,
+//! over a look at the members ([`crate::members`]): with this member out, every other member
+//! must be `Active`, heard within the time to live of the membership, not planned down, and report a repair debt of zero; and
 //! at least one other member must exist. The member's own state is not asked (a stop does not
 //! need it healthy), only its own repair debt. A read: it changes no member, no row and no
 //! placement, and it passes the same gates as the member write, because it tells an operator
@@ -132,7 +131,7 @@ fn node_of(farm: &Farm, store: Option<&dyn Store>, id: &str, look: &MembersLook)
     let Some(seen) = farm.update_look().into_iter().find(|n| n.id == worker) else {
         return Node::Unknown;
     };
-    // Only a Linux host has a storage half, as the update controller reads the farm.
+    // Only a Linux host has a storage half, as the node step reads the farm.
     let Some(store) = store.filter(|_| seen.os == "linux") else {
         return Node::Daemon;
     };
@@ -375,7 +374,7 @@ mod tests {
     }
 
     /// Catches: a worse reason hidden behind a lesser one: a second member down is named
-    /// before another member's debt, as the controller's gate ranks them. Mutants it
+    /// before another member's debt, as the storage gate ranks them. Mutants it
     /// catches: the first reason found given instead of the worst.
     #[test]
     fn the_worst_reason_is_the_one_given() {

@@ -44,7 +44,7 @@ fn a_root_owned_chain_closed_to_writes_is_trusted() {
 /// above it, up to the top-level one, for an owner that is not root and a mode group or
 /// others can write (0775, 0757 and a sticky 1777 are all refused).
 ///
-/// Mutants seen red: the group-write bit left out of the mask (0775 passes); the walk
+/// Catches: the group-write bit left out of the mask (0775 passes); the walk
 /// stopping at the first directory (a bad `/usr` passes); the owner not checked.
 #[test]
 fn a_path_or_directory_others_could_replace_is_refused_naming_it() {
@@ -153,7 +153,7 @@ fn the_parent_of_a_path_is_its_directory_and_a_top_level_path_has_none() {
 /// installs to): on a Mac the pinned `gh` and the trusted root are under
 /// `/usr/local/kbf-installer/trust`, and a host laid out as the package leaves it is trusted.
 ///
-/// Mutant planted: the layout's macOS trust directory made `/usr/local/share/kbf-installer/trust`.
+/// Catches: the layout's macOS trust directory made `/usr/local/share/kbf-installer/trust`.
 #[test]
 fn the_macs_trust_list_is_the_packages_and_is_trusted() {
     let exec = trusted_host_on(crate::layout::Platform::MacOs);

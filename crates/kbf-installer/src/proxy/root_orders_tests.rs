@@ -62,7 +62,7 @@ fn staged_json() -> String {
 /// Catches `status.json` with no release staged being read as one (a swap that goes on to
 /// bake nothing).
 ///
-/// Mutants planted: the commit of the facts read from `installed_commit`; `staged` always `None`
+/// Catches: the commit of the facts read from `installed_commit`; `staged` always `None`
 /// (the latter is also caught by the next test).
 #[test]
 fn staged_is_none_when_status_names_no_staged_release() {
@@ -80,7 +80,7 @@ fn staged_is_none_when_status_names_no_staged_release() {
 /// Catches the facts being taken from the wrong field: the commit must be `staged_commit`
 /// (not the installed or previous one) and the numbers must be the three of `staged{}`.
 ///
-/// Mutants planted: the commit read from `installed_commit`; `staged` returning `None`.
+/// Catches: the commit read from `installed_commit`; `staged` returning `None`.
 #[test]
 fn staged_is_the_staged_commit_with_its_facts() {
     let rig = rig("staged");
@@ -100,7 +100,7 @@ fn staged_is_the_staged_commit_with_its_facts() {
 /// Catches `installed` ignoring the file, or reading the staged or previous commit: after
 /// a `confirm` landed it is the one fact that says so.
 ///
-/// Mutants planted: `installed` returning `None` always; reading `staged_commit`.
+/// Catches: `installed` returning `None` always; reading `staged_commit`.
 #[test]
 fn installed_is_the_installed_commit() {
     let rig = rig("installed");
@@ -112,7 +112,7 @@ fn installed_is_the_installed_commit() {
 
 /// Catches a cached read: the file is read again on every call, so a rewrite shows.
 ///
-/// Planted `installed` mutants (always `None`, reading `staged_commit`) also go red here.
+/// Also catches an `installed` that is always `None` or reads `staged_commit`.
 #[test]
 fn every_call_reads_the_file_again() {
     let rig = rig("fresh");
@@ -129,7 +129,7 @@ fn every_call_reads_the_file_again() {
 /// Catches a missing file being an error (a host whose root half has not written yet is
 /// not a failed swap).
 ///
-/// Mutant planted: `NotFound` falling into the error arm.
+/// Catches: `NotFound` falling into the error arm.
 #[test]
 fn a_missing_file_reads_as_nothing() {
     let rig = rig("missing");
@@ -140,7 +140,7 @@ fn a_missing_file_reads_as_nothing() {
 /// Catches a malformed file being read as empty (the swap would then see "not confirmed"
 /// and could revert a confirmed release) or as a guess.
 ///
-/// Mutant planted: a parse error mapped to `Ok(None)`.
+/// Catches: a parse error mapped to `Ok(None)`.
 #[test]
 fn a_malformed_file_is_an_error() {
     let rig = rig("malformed");
@@ -162,7 +162,7 @@ fn a_malformed_file_is_an_error() {
 /// Catches the cap being off by one in either direction: a file of exactly `MAX_STATUS`
 /// bytes is read, one byte more is refused without being parsed.
 ///
-/// Mutants planted: `>` turned `>=`; `take(MAX_STATUS)` without the extra byte.
+/// Catches: `>` turned `>=`; `take(MAX_STATUS)` without the extra byte.
 #[test]
 fn the_file_is_size_capped() {
     let rig = rig("cap");
@@ -183,7 +183,7 @@ fn the_file_is_size_capped() {
 /// Catches an unreadable file (not just a missing one) being treated as absent: a status
 /// path that is a directory fails at the read, a symlink loop fails at the open.
 ///
-/// Mutants planted: the open's error arm returning `Ok(None)`; the read error dropped.
+/// Catches: the open's error arm returning `Ok(None)`; the read error dropped.
 #[test]
 fn an_unreadable_file_is_an_error() {
     let rig = rig("unreadable");
@@ -199,7 +199,7 @@ fn an_unreadable_file_is_an_error() {
 /// Catches the adapter and the root half's writer disagreeing on the shape: the bytes
 /// `helper/status.rs` renders are read back as the commit and facts it was given.
 ///
-/// Mutants planted: the staged and installed mutants above go red here too.
+/// Also catches the staged and installed defects above.
 #[test]
 fn the_root_halfs_own_rendering_reads_back() {
     let rig = rig("render");
@@ -239,7 +239,7 @@ fn read_order(rig: &Rig, id: u64) -> order::Order {
 /// Catches a write that does not reach `orders/`, or reaches it with another verb or
 /// commit, and ids that are not from the one counter the spool clone shares.
 ///
-/// Mutants planted: `confirm` writing a revert; `revert` writing a confirm; `confirm` and
+/// Catches: `confirm` writing a revert; `revert` writing a confirm; `confirm` and
 /// `revert` each returning `Ok(())` unwritten.
 #[test]
 fn confirm_and_revert_are_written_through_the_shared_spool() {
@@ -272,7 +272,7 @@ fn confirm_and_revert_are_written_through_the_shared_spool() {
 /// Catches `frontend_update` not reaching the spool: a locator the spool issued whose
 /// record was consumed is written again, and one it never issued is refused.
 ///
-/// Mutant planted: `frontend_update` returning `Ok(())`.
+/// Catches: `frontend_update` returning `Ok(())`.
 #[test]
 fn frontend_update_goes_to_the_spool() {
     let mut rig = rig("frontend");

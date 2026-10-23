@@ -189,9 +189,10 @@ impl Child for Procs {
         let name = format!("frontend-{slot:?}");
         let out = std::fs::File::create(self.dir.join(format!("{name}.log")))
             .map_err(|e| PortError(e.to_string()))?;
+        let state = self.dir.join(&name).join("state.db");
         let mut command = kbf_command(
             &self.dir,
-            &frontend_args(&self.storage, slot_base(self.base, slot)),
+            &frontend_args(&self.storage, slot_base(self.base, slot), &state),
         );
         command
             .stdout(Stdio::from(

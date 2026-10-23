@@ -382,7 +382,7 @@ fn failed_at_nodes(i: &Intent) -> bool {
 /// good: the refusal is in `update.json`, so the new proxy goes on to drain and retire, and the
 /// update ends `failed` at `nodes` as it would have, with the order sent once in all.
 ///
-/// Mutant planted: the restart's `settle` not looking at the recorded failure.
+/// Catches: the restart's `settle` not looking at the recorded failure.
 #[test]
 fn a_restart_after_a_refusal_of_the_order_for_the_nodes_does_not_send_it_again() {
     let (w, old) = draining_world();

@@ -80,7 +80,7 @@ fn refused_as_denied(answer: &Result<(), Status>) -> Option<&Status> {
 /// one that is admitted reaches the generation check (the caller carries none, so the node
 /// that holds generation 8 answers STALE_MAP).
 ///
-/// Mutants seen red: `guard` passing no list (the role check alone); the `Segments`
+/// Catches: `guard` passing no list (the role check alone); the `Segments`
 /// handlers calling `Admission::guard` with no list; `Admission::guard_leaf` judging the
 /// list before the role.
 #[tokio::test]
@@ -146,7 +146,7 @@ async fn a_listed_certificate_is_refused_on_every_method_and_the_role_comes_firs
 /// certificate whose only name is an IP address spelled like a listed node, and one that
 /// no entry names, are not refused.
 ///
-/// Mutants seen red: `node` entries matched against nothing; a serial compared with the
+/// Catches: `node` entries matched against nothing; a serial compared with the
 /// certificate's key hash.
 #[tokio::test]
 async fn a_serial_and_a_node_id_deny_as_a_key_hash_does() {
@@ -192,7 +192,7 @@ async fn a_serial_and_a_node_id_deny_as_a_key_hash_does() {
 /// not read again), and once a later generation drops the entry the same connection is
 /// admitted again.
 ///
-/// Mutant seen red: the list read once, when the service is built.
+/// Catches: the list read once, when the service is built.
 #[tokio::test]
 async fn an_entry_counts_from_the_first_call_after_the_node_holds_its_generation() {
     let pki = Pki::new();
@@ -218,7 +218,7 @@ async fn an_entry_counts_from_the_first_call_after_the_node_holds_its_generation
 /// plain-text node, which has no certificate to name whatever its map lists (it admits the
 /// call and reaches the generation check).
 ///
-/// Mutants seen red: a missing map read as a list that denies every caller; an empty
+/// Catches: a missing map read as a list that denies every caller; an empty
 /// certificate read as one an entry names.
 #[tokio::test]
 async fn a_node_with_no_map_or_no_certificate_to_read_denies_nothing() {

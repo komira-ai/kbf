@@ -9,10 +9,10 @@
 //! competes with a busy writer can use up its attempts. The store therefore queues on a
 //! table lock before its snapshot is taken.
 //!
-//! The test is `#[ignore]`d with the rest of the server tests; the `state-postgres` job
-//! runs it with `--include-ignored`. It holds a transaction open on the server, so the
-//! interleaving is the one under test and not a lucky schedule, and it waits on a
-//! condition (the waiters are queued), never on elapsed time.
+//! The test needs a server (`KBF_TEST_POSTGRES_URL` names it) and fails without one. It holds
+//! a transaction open on the server, so the interleaving is the one under test and not a
+//! lucky schedule, and it waits on a condition (the waiters are queued), never on elapsed
+//! time.
 #![cfg(feature = "postgres")]
 
 use std::sync::Arc;
@@ -22,13 +22,10 @@ use kbf_state::postgres::{Flaw, PostgresBackend, PostgresStore};
 use kbf_state::{Cond, Store, Txn};
 use postgres::{Client, NoTls};
 
-const URL_VAR: &str = "KBF_TEST_POSTGRES_URL";
 const WAITERS: usize = 4;
 
 fn url() -> String {
-    std::env::var(URL_VAR).unwrap_or_else(|_| {
-        panic!("{URL_VAR} must name a postgres:// URL the tests may create schemas in")
-    })
+    kbf_testkit::database::server_url()
 }
 
 // Catches a batch that waits for the commit head inside a snapshot that predates the wait:
@@ -36,7 +33,6 @@ fn url() -> String {
 // writer must then commit on its first attempt. With the head row as the only lock, all
 // four are rolled back for a serialization failure and the store's retry counter is not 0.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn writers_queued_behind_the_head_commit_without_a_retry() {
     let backend = PostgresBackend::new(&url(), Flaw::None);
     let config = backend.fresh_config();
@@ -108,7 +104,6 @@ fn writers_queued_behind_the_head_commit_without_a_retry() {
 // pool must open. The server's lock timeout turns a connection that would wait into an
 // error (3 s: the bound of a failure, not something the passing test waits for).
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_connection_opens_while_a_writer_holds_the_head() {
     let base = url();
     let sep = if base.contains('?') { '&' } else { '?' };
