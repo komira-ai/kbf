@@ -127,7 +127,9 @@ impl Subject for Through {
         let mut procs = self.procs.lock().expect("lock");
         let n = procs.len();
         let node = node(&self.scratch.join(format!("node-{n}")));
-        let front = frontend(&node.field("storage="), &[]);
+        let state = self.scratch.join(format!("state-{n}")).join("state.db");
+        let state = format!("--state-store=sqlite://{}", state.display());
+        let front = frontend(&node.field("storage="), &[&state]);
         let endpoint =
             Endpoint::from_shared(format!("http://{}", front.field("reapi="))).expect("endpoint");
         procs.push(node);
@@ -177,7 +179,12 @@ fn get(api: &str, path: &str) -> (u16, String) {
 fn the_frontend_process_is_ready_with_its_node_and_stops_on_sigterm() {
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-health");
     let mut node = node(&dir);
-    let mut front = frontend(&node.field("storage="), &["--readyz-store-timeout-ms=500"]);
+    let state = dir.join("state").join("state.db");
+    let state = format!("--state-store=sqlite://{}", state.display());
+    let mut front = frontend(
+        &node.field("storage="),
+        &["--readyz-store-timeout-ms=500", &state],
+    );
     let api = front.field("api=");
     assert_eq!(get(&api, "/healthz").0, 200);
     let (code, body) = get(&api, "/readyz");
@@ -227,6 +234,42 @@ fn a_refused_frontend_start_exits_2() {
         assert!(!err.contains("hunter2"), "{args:?}: {err}");
         assert!(out.stdout.is_empty(), "{args:?}");
     }
+}
+
+/// Asserts that a frontend given neither `--state-store` nor a settings file with the key
+/// exits 2 naming the flag, at a start and under `--check` alike and with the same text,
+/// and that it prints nothing on standard output: the start line, which comes once the
+/// listeners are bound, is absent, so nothing listened.
+#[test]
+fn a_frontend_with_no_state_store_is_refused_at_a_start_and_by_check() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-no-state-store");
+    let config = kbf_testkit::config::flag(&dir);
+    let flags = [
+        config.as_str(),
+        "--listen=127.0.0.1:0",
+        "--worker-listen=127.0.0.1:0",
+        "--storage=http://127.0.0.1:1",
+    ];
+    let run = |extra: &[&str]| {
+        Command::new(BIN)
+            .arg("frontend")
+            .args(flags)
+            .args(extra)
+            .output()
+            .expect("run kbf")
+    };
+    let started = run(&[]);
+    let checked = run(&["--check"]);
+    for (how, out) in [("a start", &started), ("--check", &checked)] {
+        assert_eq!(out.status.code(), Some(2), "{how}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("kbf frontend: --state-store is not set"),
+            "{how}: {err}"
+        );
+        assert!(out.stdout.is_empty(), "{how}");
+    }
+    assert_eq!(started.stderr, checked.stderr);
 }
 
 /// Catches a frontend process that takes `--state-store=sqlite://...` and does not open

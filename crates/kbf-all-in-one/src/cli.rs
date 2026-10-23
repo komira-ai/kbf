@@ -29,8 +29,9 @@ const STATE_STORE_HELP: &str = "Where the scheduler keeps its state, written bef
     URL with a password is refused, and the server must flush commits before it acknowledges \
     them, `synchronous_commit` on, or the start is refused), or `sqlite:///absolute/path`, a \
     file on a local disk that this process owns (created, with its directory, if missing; the \
-    file is 0600 and a directory it makes 0700). Every start is a new epoch, so the daemon \
-    kills the runs of the leases it held before. Left out, it is \
+    file is 0600 and a directory it makes 0700); SQLite is removed in the next release, so a \
+    start on it logs a warning (see the upgrade notes). Every start is a new epoch, so the \
+    daemon kills the runs of the leases it held before. Left out, it is \
     `postgres:///kbf?host=/run/postgresql`";
 
 /// The one command: the daemon's flags, then the server's that do not share a name with

@@ -176,6 +176,10 @@ impl clap::builder::TypedValueParser for StateStoreParser {
 /// the OS package's socket directory, reached by peer authentication.
 const LOCAL_POSTGRES: &str = "postgres:///kbf?host=/run/postgresql";
 
+/// What a start on a `sqlite://` store logs, once: SQLite is on its way out.
+const SQLITE_REMOVED: &str = "the SQLite state store is removed in the next release: move the \
+     scheduler's state to Postgres before upgrading (see the upgrade notes)";
+
 fn has_password(url: &PostgresUrl) -> bool {
     url.config.has_password()
 }
@@ -251,10 +255,14 @@ impl StateStoreUri {
         Ok(Candidate::over(self.open_backend()?))
     }
 
-    /// The backend's store, opened as it is: no generation taken, nothing written here.
+    /// The backend's store, opened as it is: no generation taken, nothing written here. A
+    /// SQLite store opens, and the start logs [`SQLITE_REMOVED`] once.
     fn open_backend(&self) -> Result<Arc<dyn Store>, StateError> {
         match self {
-            Self::Sqlite(path) => open_sqlite(path),
+            Self::Sqlite(path) => {
+                tracing::warn!("{SQLITE_REMOVED}");
+                open_sqlite(path)
+            }
             Self::Postgres(url) => open_postgres(url),
         }
     }
