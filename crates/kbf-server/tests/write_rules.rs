@@ -138,3 +138,31 @@ fn what_enrollment_writes_is_fenced() {
     bump_ca_generation(store.as_ref()).expect("a CA generation");
     assert!(assert_all_fenced(store.as_ref(), "enrollment") >= 2);
 }
+
+// Catches: a family whose writer was deleted still labelled as written. The host, slot,
+// order and proposal rows are only read now (`stored_update`, the proposals view), and the
+// table must say so, while the run, counter and policy rows keep their live writer.
+#[test]
+fn the_families_with_no_writer_left_are_labelled_read_only() {
+    let retired = [
+        "update/slot",
+        "update/host/node-a",
+        "update/order/0000000000000001",
+        "update/proposed/0000000000000000000000000000000000000000",
+    ];
+    for key in retired {
+        let family = kbf_server::write_rules::FAMILIES
+            .iter()
+            .find(|f| f.example == key)
+            .unwrap_or_else(|| panic!("no family has the example {key}"));
+        assert_eq!(family.writer, "retired, read-only", "{key}");
+        assert_eq!(family.rule, Rule::Fenced, "{key}");
+    }
+    for key in ["update/desired", "update/policy", "update/generation"] {
+        let family = kbf_server::write_rules::FAMILIES
+            .iter()
+            .find(|f| f.example == key)
+            .unwrap_or_else(|| panic!("no family has the example {key}"));
+        assert!(family.writer.starts_with("update/rows"), "{key}");
+    }
+}

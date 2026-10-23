@@ -14,8 +14,8 @@ pub struct Policy {
     pub auto_nodes: bool,
     /// As `auto_nodes`, for the frontend's own update.
     pub auto_frontend: bool,
-    /// No run is started or continued while this is set ([`super::Rows::set_paused`]). False
-    /// by default.
+    /// The operator's pause flag, set and cleared by [`super::Rows::set_paused`]. Nothing in
+    /// this crate starts or continues a run, so it is only stored and shown. False by default.
     pub paused: bool,
     /// New work went only to hosts at the target release.
     pub new_work_only_to_updated: bool,

@@ -207,21 +207,27 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
             "update/rows",
             "update/policy",
         ),
-        fenced(Keys::Exactly("update/slot"), "update/rows", "update/slot"),
+        // Rows an older build wrote and no code writes now; they stay fenced so a store
+        // holding them is classified, and are read only by `stored_update`.
+        fenced(
+            Keys::Exactly("update/slot"),
+            "retired, read-only",
+            "update/slot",
+        ),
         fenced(
             Keys::Under("update/host/"),
-            "update/rows",
+            "retired, read-only",
             "update/host/node-a",
         ),
-        // The release poller's proposals (`update/proposal.rs`): never `update/desired`.
+        // Proposals the release poller wrote; none is written now, the view still lists them.
         fenced(
             Keys::Under("update/proposed/"),
-            "update/proposal (release poller)",
+            "retired, read-only",
             "update/proposed/0000000000000000000000000000000000000000",
         ),
         fenced(
             Keys::Under("update/order/"),
-            "update/rows (counter)",
+            "retired, read-only",
             "update/order/0000000000000001",
         ),
         // Object-store registrations (`object_store/rows.rs`).
