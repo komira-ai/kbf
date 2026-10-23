@@ -8,8 +8,6 @@
 //!   `GET /v1/releases` and `GET /v1/releases/{commit}`.
 //! - The service, [`grpc::service`], is `ReleaseService.Fetch` and `Describe`; the
 //!   description both `Describe` and `GET /v1/releases/{commit}` give is [`describe`].
-//! - The desired release, [`desired::router`]: `GET /v1/update`, `POST /v1/update/desired`,
-//!   `pause` and `resume`, over the `update/desired` row.
 //!
 //! `GET /v1/releases`, `GET /v1/releases/{commit}`, `Fetch` and `Describe` carry no
 //! authentication of their own: the wiring puts `Fetch` and `Describe` behind the worker
@@ -19,8 +17,8 @@
 //! listener where it starts. Trust is the host's: the store neither opens a tarball nor
 //! checks an attestation.
 
+pub mod age;
 mod describe;
-pub mod desired;
 pub mod facts;
 pub mod grpc;
 pub mod http;

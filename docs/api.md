@@ -2115,56 +2115,13 @@ frontend's store: copy its `files/` directory and save the route's body for each
 (`curl -fsS "$API/v1/releases/$COMMIT" > releases/$COMMIT.json`); a commit that is not
 complete for any platform has no file to save (`409`).
 
-## `GET /v1/update` and `POST /v1/update/{desired,pause,resume}`
+## `GET /v1/update` and `POST /v1/update/{desired,pause,resume}` (removed)
 
-The desired release (`docs/design/pull-updates.md` section 6.3), kept in the `update/desired`
-row of the state store. Without `--state-store` every answer is `503` naming it; without
-`--releases-dir`, `GET /v1/update` and `POST /v1/update/desired` are `503` naming that flag
-(`pause` and `resume` need only the state store). A write that other writers kept racing
-for the whole of its retries is `503` with `Retry-After: 1`: send it again.
-
-- `GET /v1/update` is open: `{"desired": null | {"generation", "commit", "set_at_ms"},
-  "paused": bool, "policy": null | {...}, "proposals": [...], "releases": <the body of GET /v1/releases>}`.
-  `proposals` are the rows under `update/proposed/` (the release poller that wrote them was
-  removed; the list is empty on a new farm and keeps the rows an older one wrote), oldest
-  first, each `{"commit", "tag", "published_at_secs", "proposed_at_ms"}`: the newest published
-  GitHub release of a `v*` tag whose notes name an allowed ref and a commit and that lists
-  `SHA256SUMS` and a provenance bundle for each tarball. Nothing is verified and nothing is
-  started: a proposal is a suggestion, and the run starts when an operator offers the commit
-  with `POST /v1/update/desired`. The poller asks GitHub's public API with no credential, on
-  the active frontend only, with a conditional request, and backs off after a failure. `policy`
-  is the `update/policy` row when the operator wrote one (`paused`, `auto_nodes`,
-  `auto_frontend`, `new_work_only_to_updated`, `accept_failing_builds`, `max_hosts_out`,
-  `min_serving` and the limits in seconds), else `null`; `paused` is its flag (false without
-  a row).
-- `POST /v1/update/desired` with `{"commit": "<40 lowercase hex>"}` and, optionally,
-  `"expect_generation": N` and `"rollback": bool` (JSON content type, the write gates) offers the commit. With
-  `expect_generation` it is a compare-and-set: it writes only if the desired release is at
-  generation N (0 before any offer), else `409` naming both and nothing is written. `409` unless the release store holds some platform of it complete
-  (see above); `400` for a body that is not exactly that. The answer is the desired release.
-  The generation moves only when the commit differs from the desired one, so a repeated click is
-  not a new run; a rollback is the older commit offered the same way and gets a higher
-  generation. Generations increase, but may skip numbers: each write that loses a race has
-  already drawn a counter value.
-  **R4, the age check.** Before the write, the offer is compared with the build of this server
-  (`seq` of `kbf --version --json`, the number of commits behind its commit), using the `seq`
-  the release store holds for the commit. `409` naming both builds, and nothing is written, when
-  the target's `seq` is below the server's (`older`), when it equals the server's and the commit
-  is another one (`seq_tie`: two branches cannot be ordered; a repeat of the running commit is
-  allowed; the commits are compared in full when the build knows its own, else by the 12
-  digits it has as a prefix), or when the server's `seq` is known and the target's is not (`seq_unknown`: a
-  release stored before `seq` was recorded). A server built where commits could not be counted
-  (`seq` 0) does not apply R4. The release store does not record `seq` yet, so today R4 allows
-  every offer. A release naming the running build's own commit is never refused by R4, and the
-  store is not asked about it. The answer is `{"error": "<code>: ...", "code": "older" | "seq_tie" | "seq_unknown"}`;
-  the other `409`s of this route have no `code`.
-  `"rollback": true` (optional, default false; spelled as `rollback` of the proxy's
-  `POST /v1/update/frontend`) skips this check and no other: the release must still be complete,
-  `expect_generation` still applies, and so will the own-commit rule of `source=staged`.
-  The codes `older`, `seq_unknown` and `seq_tie` are stable: a client may key on them.
-- `POST /v1/update/pause` and `POST /v1/update/resume` (the write gates, no body) set `paused` of the policy
-  row, by compare-and-set of that field alone, and answer `{"paused": bool}`. No run is
-  needed, and an offer leaves the flag as it is: while set, no host is started.
+`kbf-server` no longer serves these routes: they answer `404`. It keeps no desired release,
+no update policy and no proposals. Updates are
+OS packages installed by `kbf-updater` on each host. The `update/*` rows that older builds
+left in a state store are not read and not changed; a store that holds them opens and serves
+as before.
 
 ## `UNAVAILABLE` from a storage node that is catching up
 
