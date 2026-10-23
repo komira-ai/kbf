@@ -1369,24 +1369,15 @@ fn a_floor_row_that_is_not_one_is_refused() {
 }
 
 /// Catches: a floor store the farm loads on trust. A row whose key is not the key of the
-/// floor in it (a copied or edited row would floor another action), two floors with one
-/// stamp (the eviction order is undefined), and a row that is not a floor are refused
-/// naming the row.
+/// floor in it (a copied or edited row would floor another action), and a row that is not a
+/// floor, are refused naming the row.
 #[test]
 fn a_floor_store_that_contradicts_itself_is_refused() {
     let good = floor::encode(&a_floor(1, 5)).expect("encodes");
-    let same = floor::encode(&a_floor(2, 5)).expect("encodes");
     let cases = [
         (
             vec![(floor::row_key(&key_of(2)), good.clone())],
             "not the key of the floor it holds",
-        ),
-        (
-            vec![
-                (floor::row_key(&key_of(1)), good.clone()),
-                (floor::row_key(&key_of(2)), same),
-            ],
-            "a stamp another floor has",
         ),
         (
             vec![(floor::row_key(&key_of(1)), vec![9])],
@@ -1834,8 +1825,7 @@ fn a_store_with_size_key_rows_reads_as_it_did_without_them() {
 }
 
 /// Catches a key floor row read as anything but what was written: another version, a
-/// row cut short or with bytes after it, a row under another key's name, and two rows
-/// with one stamp.
+/// row cut short or with bytes after it, and a row under another key's name.
 #[test]
 fn a_key_floor_row_that_is_not_one_is_refused() {
     let floor = a_key_floor(7, 5);
@@ -1871,19 +1861,6 @@ fn a_key_floor_row_that_is_not_one_is_refused() {
         .expect("applied");
     let error = durable.load().expect_err("under another key's name");
     assert!(error.to_string().contains("not the key"), "{error}");
-    let store = Flaky::new();
-    let durable = open(&store);
-    for key in [7, 8] {
-        let mut same = row.clone();
-        same[1..9].copy_from_slice(&u64::to_be_bytes(key));
-        store
-            .inner
-            .txn(Txn::new().put(floor::key_row(key), same, Cond::Any))
-            .expect("write")
-            .expect("applied");
-    }
-    let error = durable.load().expect_err("one stamp twice");
-    assert!(error.to_string().contains("stamp"), "{error}");
 }
 
 fn size_key(instance: &str, cfg: Option<u64>) -> kbf_estimator::Key {

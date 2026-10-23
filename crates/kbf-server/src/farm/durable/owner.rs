@@ -16,11 +16,11 @@
 //! holds for that node and nothing else, and does not mark the frontend as superseded as
 //! a newer generation of the store does ([`kbf_state::Fenced`]).
 //!
-//! A node this frontend never claimed (a lease taken up at a start whose daemon has not
-//! said `Hello` here yet) has no counter to check: a write for it is conditional on its
-//! lease rows alone. A node whose claim failed after a `Hello` (the store could not be read
-//! or written, or another frontend won every try) is lost like one the daemon left: nothing
-//! is written for it until a claim succeeds.
+//! A node this frontend never claimed (a lease taken up by a request that joined its
+//! operation, before its daemon said `Hello` here) has no counter to check: a write for it
+//! is conditional on its lease rows alone. A node whose claim failed after a `Hello` (the
+//! store could not be read or written, or another frontend won every try) is lost like one
+//! the daemon left: nothing is written for it until a claim succeeds.
 //!
 //! The frontend also acknowledges a node's heartbeats only while it owns the node, looking
 //! at the row again when the last look is [`OWNER_CACHE_TTL`] old, and only while it has
@@ -57,9 +57,9 @@ pub(super) const OWNER_HANDOVER_WAIT: Duration = HANDOVER_GRACE.saturating_add(O
 /// [`LEASE_GRACE`] after its last write, and a reader that takes a missing row to mean the
 /// daemon is gone would wait one renewal interval ([`SESSION_RENEWAL`]) beyond that. The
 /// window is what is left of the two after the work and twice the margin: a derived
-/// constant, which no reader of a missing row relies on yet. It is longer than a renewal
-/// interval and a heartbeat interval together, checked at compile time, so a frontend that
-/// renews its rows on schedule never withholds an acknowledgement.
+/// constant, which the orphan sweep relies on ([`ORPHAN_WAIT`]). It is longer than a
+/// renewal interval and a heartbeat interval together, checked at compile time, so a
+/// frontend that renews its rows on schedule never withholds an acknowledgement.
 pub const ACK_WINDOW: Duration = ROW_LIFE.saturating_sub(RUN_LIFE);
 
 /// How long after its last write a daemon's session row, written on schedule, is certain
@@ -92,7 +92,7 @@ pub(super) fn pair_row(high: u64, low: u64) -> [u8; 16] {
     ((u128::from(high) << 64) | u128::from(low)).to_be_bytes()
 }
 
-fn owner_key(worker: &WorkerId) -> String {
+pub(super) fn owner_key(worker: &WorkerId) -> String {
     format!("{OWNER}{worker}")
 }
 
@@ -350,8 +350,9 @@ impl Durable {
 impl State {
     /// A daemon said `Hello` here as `worker`, whose newest stream is `instance`'s: this
     /// frontend becomes its owner, takes up the leases the store holds for it that the
-    /// scheduler does not hold, and reads what the node's session row said before the
-    /// registration replaces it. Call it before the registration is written and the worker
+    /// scheduler does not hold (a drain of the node that ended at the start, for want of a
+    /// lease, is put back in force: [`State::resume_drain`]), and reads what the node's
+    /// session row said before the registration replaces it. Call it before the registration is written and the worker
     /// is fed to the scheduler.
     ///
     /// The leases the scheduler recovered for the node wait for it to register, as they
@@ -380,6 +381,7 @@ impl State {
                 self.take_in_stored(op);
             }
         }
+        self.resume_drain(now, worker);
         let moved = match arrival.previous {
             Some(owner) => owner.frontend != arrival.frontend,
             None => false,
