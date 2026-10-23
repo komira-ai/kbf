@@ -1,6 +1,6 @@
 //! `--create-local-database` and the checks that a Postgres login is admitted, on a fake host
 //! whose `psql` answers from a small model of a server (no server needed). The same code is
-//! run against a real server in `database_tests.rs` (the `state-postgres` job).
+//! run against a real server in `database_tests.rs`.
 //!
 //! Every refusal and every printed line is checked for the names the operator wrote: they
 //! are `secretrole`, `secretdb` and `/run/secretsock` here, and none may appear.

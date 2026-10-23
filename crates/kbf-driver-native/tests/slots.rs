@@ -101,21 +101,16 @@ async fn an_action_ends_with_every_process_of_its_uid_and_nothing_else() {
     let (mine, other) = (&users.0[0], &users.0[1]);
     let cas = Arc::new(MemoryCas::default());
     let rt = NativeRuntime::new(config(&scratch, users.pool()), Arc::clone(&cas)).expect("runtime");
-    // After the start, which ends every process of every slot.
-    let mut root_sleep = sleeper(None);
-    let mut other_sleep = sleeper(Some(other));
-    let mut setuid = Command::new(scratch.setuid_sleep())
-        .arg("300")
-        .stdin(Stdio::null())
-        .uid(mine.uid)
-        .gid(mine.gid)
-        .spawn()
-        .expect("the setuid sleep");
-    let setuid_pid = i32::try_from(setuid.id()).expect("pid");
-    let setuid_ids = ids_of(setuid_pid);
-    let listed = uid::processes(mine.uid).expect("list");
-    let watched = uid::effective(mine.uid).expect("list");
     let mut steps = leave_a_sleeper(&scratch.act());
+    // The action says it started and waits for the test, which plants the processes of
+    // the other users and the setuid sleep while it runs: a free slot that holds a
+    // process when a lease is handed to it is refused at slot-ready, so planted before
+    // the lease the processes of the user and of the other slot would be ended by the
+    // clean that makes the slot ready, not by the lease.
+    steps.splice(
+        1..1,
+        ["write-lines", "started", ";", "wait-for", "go", "60", ";"].map(str::to_owned),
+    );
     steps.extend(
         [
             ";",
@@ -131,7 +126,39 @@ async fn an_action_ends_with_every_process_of_its_uid_and_nothing_else() {
         .map(str::to_owned),
     );
     let argv: Vec<&str> = steps.iter().map(String::as_str).collect();
-    let first = lease(&rt, &cas, 1, &Spec::argv(&argv)).await;
+    let root_dir = scratch.lease_root(1);
+    let planting = async {
+        let give_up = Instant::now() + PROMPT * 3;
+        while !root_dir.join("started").exists() {
+            assert!(Instant::now() < give_up, "the lease never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let root_sleep = sleeper(None);
+        let other_sleep = sleeper(Some(other));
+        let setuid = Command::new(scratch.setuid_sleep())
+            .arg("300")
+            .stdin(Stdio::null())
+            .uid(mine.uid)
+            .gid(mine.gid)
+            .spawn()
+            .expect("the setuid sleep");
+        let setuid_pid = i32::try_from(setuid.id()).expect("pid");
+        let setuid_ids = ids_of(setuid_pid);
+        let listed = uid::processes(mine.uid).expect("list");
+        let watched = uid::effective(mine.uid).expect("list");
+        std::fs::write(root_dir.join("go"), b"").expect("go");
+        (
+            root_sleep,
+            other_sleep,
+            setuid,
+            (setuid_pid, setuid_ids),
+            (listed, watched),
+        )
+    };
+    let spec = Spec::argv(&argv);
+    let (first, planted) = tokio::join!(lease(&rt, &cas, 1, &spec), planting);
+    let (mut root_sleep, mut other_sleep, mut setuid, (setuid_pid, setuid_ids), (listed, watched)) =
+        planted;
     let out = stdout(&cas, &first);
     let lines: Vec<&str> = out.lines().collect();
     // As the slot's clean counts them: launchd starts its own agents of the domain

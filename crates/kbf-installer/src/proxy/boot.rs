@@ -12,7 +12,7 @@
 //!   ([`super::recover`]): migrate forward ([`Migrator`]), spawn as a candidate (the child
 //!   port writes the pid record before it returns, so a proxy that dies before the wait ends
 //!   adopts the process instead of starting a second), wait for `/readyz`, take the
-//!   generation (no live holder, so the child bumps the epoch).
+//!   generation (no live holder; the child keeps the epoch).
 //! - **Retries.** An attempt that fails is reported with its [`Reason`] and tried again after
 //!   a wait that doubles from [`Retry::first_wait`] to [`Retry::max_wait`], at most
 //!   [`Retry::attempts`] times in all. A process an attempt left behind is stopped first: SIGKILL

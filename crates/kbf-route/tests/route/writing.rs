@@ -99,7 +99,7 @@ fn gone(who: &str) -> StorageError {
 /// not yet marked down: the primary of the blob cannot be reached, the map still has it
 /// active, and the write goes to the next owner and is answered, once there. The first
 /// owner is tried first (and only dialled for the failed attempt), the next is dialled
-/// with the same generation. Mutant: `at_a_write_owner` ends at the first owner's failure.
+/// with the same generation. Catches: `at_a_write_owner` ends at the first owner's failure.
 #[tokio::test]
 async fn a_write_goes_on_to_the_next_owner_when_the_first_cannot_be_reached() {
     let map = map(1, 2, active(&[1, 2, 3]));
@@ -136,7 +136,7 @@ async fn the_owner_that_failed_is_tried_first_by_the_next_write() {
 /// Catches an answer from a node that was reached passed over for the next owner: a node
 /// that declines the write (the request is invalid, or it is broken) is the answer and the
 /// next owner is not dialled; so is STALE_MAP, which is the map's rule (fetched, once)
-/// rather than the next owner's. Mutant: every failure moves on.
+/// rather than the next owner's. Catches: every failure moves on.
 #[tokio::test]
 async fn a_write_an_owner_answered_is_not_tried_at_the_next() {
     let map = map(1, 2, active(&[1, 2, 3]));
@@ -172,7 +172,7 @@ async fn a_write_an_owner_answered_is_not_tried_at_the_next() {
 
 /// Catches a write failed with the last owner's failure, or with a failure that is not the
 /// owners': when no owner can be reached the caller is told what the first one said, and
-/// both were tried. Mutant: the last failure returned.
+/// both were tried. Catches: the last failure returned.
 #[tokio::test]
 async fn a_write_no_owner_can_take_fails_with_the_first_owners_failure() {
     let map = map(1, 2, active(&[1, 2, 3]));
@@ -212,7 +212,7 @@ async fn a_write_goes_on_to_the_blobs_other_owner_only() {
 
 /// Catches a member whose address is not one stopping the write: the member cannot be
 /// dialled (the test cluster has no node for it), as a read passes it over, so does a
-/// write. Mutant: the dial error returned.
+/// write. Catches: the dial error returned.
 #[tokio::test]
 async fn a_member_that_cannot_be_dialled_is_passed_over_by_a_write() {
     let map = map(1, 2, active(&[1, 2, 3]));
@@ -230,7 +230,7 @@ async fn a_member_that_cannot_be_dialled_is_passed_over_by_a_write() {
 /// action's first owner, the next owner holds none of them and would refuse the entry as
 /// `Absent`, so when the first cannot be reached the caller must see UNAVAILABLE (which it
 /// can retry), and the next owner must be asked nothing.
-/// Mutant: `commit_in` goes through `at_a_write_owner`.
+/// Catches: `commit_in` goes through `at_a_write_owner`.
 #[tokio::test]
 async fn a_plain_commit_does_not_go_to_an_owner_that_lacks_the_blobs() {
     let map = map(1, 2, active(&[1, 2, 3]));
@@ -254,7 +254,7 @@ async fn a_plain_commit_does_not_go_to_an_owner_that_lacks_the_blobs() {
 
 /// Catches a commit with a closure that ends at the action's owner when it cannot be
 /// reached: the blobs the next owner lacks are copied to it (and only the ones it lacks),
-/// and the entry is committed there. Mutant: `commit_with_closure` ends at the first owner.
+/// and the entry is committed there. Catches: `commit_with_closure` ends at the first owner.
 #[tokio::test]
 async fn a_commit_with_closure_goes_on_to_the_next_owner_and_copies_there() {
     let map = map(1, 2, active(&[1, 2, 3]));
@@ -282,7 +282,7 @@ async fn a_commit_with_closure_goes_on_to_the_next_owner_and_copies_there() {
 
 /// Catches a commit that ends when the action's owner answers FindMissing and then fails
 /// to take a copy: the failure is the owner's, so the next owner is asked what it lacks,
-/// is copied that, and commits. Mutant: the copy's `put` failure counted as not the
+/// is copied that, and commits. Catches: the copy's `put` failure counted as not the
 /// owner's (`Tried::Elsewhere`).
 #[tokio::test]
 async fn a_commit_goes_on_when_the_owner_fails_to_take_a_copy() {
@@ -312,7 +312,7 @@ async fn a_commit_goes_on_when_the_owner_fails_to_take_a_copy() {
 
 /// Catches a commit that ends when the action's owner holds every blob of the entry (so
 /// there is nothing to copy) and then fails the commit itself: the next owner is copied
-/// what it lacks and commits. Mutant: the commit's failure counted as not the owner's
+/// what it lacks and commits. Catches: the commit's failure counted as not the owner's
 /// (`Tried::Elsewhere`).
 #[tokio::test]
 async fn a_commit_goes_on_when_the_owner_fails_the_commit_itself() {
@@ -343,7 +343,7 @@ async fn a_commit_goes_on_when_the_owner_fails_the_commit_itself() {
 /// Catches a commit retried for a failure that is not the owner's: when a blob of the entry
 /// cannot be read from the farm (its holders cannot be reached), the next owner of the
 /// action would read it no better, so the commit ends with that read's failure and the next
-/// owner is not asked a thing. Mutant: a failed read counted as the owner's failure.
+/// owner is not asked a thing. Catches: a failed read counted as the owner's failure.
 #[tokio::test]
 async fn a_closure_blob_that_cannot_be_read_does_not_move_the_commit_on() {
     let map = map(1, 2, active(&[1, 2, 3]));

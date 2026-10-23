@@ -42,7 +42,7 @@ const ONE_TO_ONE: (u32, u32) = (1, 1);
 /// Catches: a peak that is the largest process, or the largest sum of footprints at one
 /// poll (a polled sample), instead of the sum of each process's lifetime maximum. Two
 /// processes whose maxima were at different times (their footprints now are small) sum;
-/// mutant seen red: the sum folded with `max` instead (peak 300 MiB, not 500).
+/// catches: the sum folded with `max` instead (peak 300 MiB, not 500).
 #[test]
 fn the_peak_sums_each_processs_lifetime_maximum_not_a_polled_footprint() {
     let mut meter = Meter::default();
@@ -60,8 +60,8 @@ fn the_peak_sums_each_processs_lifetime_maximum_not_a_polled_footprint() {
 }
 
 /// Catches: CPU added up over polls (a process read three times counted three times),
-/// or the first reading kept. The second poll's counters replace the first's; mutant
-/// seen red: `poll` not recording its readings.
+/// or the first reading kept. The second poll's counters replace the first's; catches `poll` not
+/// recording its readings.
 #[test]
 fn cpu_is_the_last_reading_of_each_process_not_a_sum_of_readings() {
     let mut meter = Meter::default();
@@ -81,7 +81,7 @@ fn cpu_is_the_last_reading_of_each_process_not_a_sum_of_readings() {
 }
 
 /// Catches: a process that exits between polls dropping out of the totals (the usage
-/// would shrink when its pid stops answering). Mutant seen red: `poll` not recording.
+/// would shrink when its pid stops answering). Catches: `poll` not recording.
 #[test]
 fn an_exited_process_keeps_what_it_was_last_read_with() {
     let mut meter = Meter::default();
@@ -101,7 +101,7 @@ fn an_exited_process_keeps_what_it_was_last_read_with() {
 }
 
 /// Catches: a pid the kernel handed to a new process within the lease replacing the
-/// old process's totals (its memory and CPU lost). Mutant seen red: `record` without the
+/// old process's totals (its memory and CPU lost). Catches: `record` without the
 /// regression check.
 #[test]
 fn a_reused_pid_keeps_the_process_that_held_it_before() {
@@ -123,7 +123,7 @@ fn a_reused_pid_keeps_the_process_that_held_it_before() {
 
 /// Catches: mach ticks read as nanoseconds (Apple Silicon's timebase is 125/3, so CPU
 /// would be 41.7 times too small), a divide before the multiply losing the fraction,
-/// a zero denominator panicking, and an overflow wrapping. Mutants seen red:
+/// a zero denominator panicking, and an overflow wrapping. Catches:
 /// numer and denom swapped; `denom.max(1)` removed (divide by zero).
 #[test]
 fn ticks_become_microseconds_with_the_machines_timebase() {
@@ -151,7 +151,7 @@ fn ticks_become_microseconds_with_the_machines_timebase() {
 
 /// Catches: the usage claiming a cgroup or no basis, an unread peak reported as zero
 /// bytes ("absent is not zero"), and a lease with no readable process losing its wall
-/// time. Mutants seen red: `basis` left unspecified; `read.then_some` replaced by
+/// time. Catches: `basis` left unspecified; `read.then_some` replaced by
 /// `Some`; `cgroup: Some(default)`.
 #[test]
 fn nothing_read_reports_only_the_wall_time_under_the_footprint_basis() {
@@ -201,7 +201,7 @@ fn the_report_is_made_on_macos_only() {
 /// Catches: a reused pid that is told only by its CPU time. The new process holds a
 /// smaller high-water mark than the old one but has run at least as long (equal or more
 /// CPU), so only the footprint clause of the check can see the reuse; without it the old
-/// process's 100 MiB is overwritten and the peak reads 30 MiB. Mutant seen red: the
+/// process's 100 MiB is overwritten and the peak reads 30 MiB. Catches: the
 /// footprint clause dropped from `record`.
 #[test]
 fn a_reused_pid_with_a_smaller_peak_and_no_less_cpu_is_still_a_new_process() {

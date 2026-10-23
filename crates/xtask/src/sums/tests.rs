@@ -102,7 +102,7 @@ fn a_kbf_tarball_and_its_version_facts_are_listed_together() {
     // Catches: the pairing in one direction only, the waiver skipping more than the facts
     // of a tarball, and a waiver that is ignored. Rows: a `kbf` tarball without facts is
     // refused, and passes when the pairing is waived; facts without their tarball are
-    // refused either way; both listed pass either way. Mutants: either `if` dropped.
+    // refused either way; both listed pass either way. Catches: either `if` dropped.
     let tarball = "kbf-c0ffee012345-linux-x86_64.tar.gz";
     let facts = "kbf-c0ffee012345-linux-x86_64.version.json";
     let no_facts = format!("{tarball}: its version facts {facts} are not listed in {SUMS}");

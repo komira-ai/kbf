@@ -127,7 +127,9 @@ impl Subject for Through {
         let mut procs = self.procs.lock().expect("lock");
         let n = procs.len();
         let node = node(&self.scratch.join(format!("node-{n}")));
-        let front = frontend(&node.field("storage="), &[]);
+        let state = self.scratch.join(format!("state-{n}")).join("state.db");
+        let state = format!("--state-store=sqlite://{}", state.display());
+        let front = frontend(&node.field("storage="), &[&state]);
         let endpoint =
             Endpoint::from_shared(format!("http://{}", front.field("reapi="))).expect("endpoint");
         procs.push(node);
@@ -177,7 +179,12 @@ fn get(api: &str, path: &str) -> (u16, String) {
 fn the_frontend_process_is_ready_with_its_node_and_stops_on_sigterm() {
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-health");
     let mut node = node(&dir);
-    let mut front = frontend(&node.field("storage="), &["--readyz-store-timeout-ms=500"]);
+    let state = dir.join("state").join("state.db");
+    let state = format!("--state-store=sqlite://{}", state.display());
+    let mut front = frontend(
+        &node.field("storage="),
+        &["--readyz-store-timeout-ms=500", &state],
+    );
     let api = front.field("api=");
     assert_eq!(get(&api, "/healthz").0, 200);
     let (code, body) = get(&api, "/readyz");
@@ -227,6 +234,42 @@ fn a_refused_frontend_start_exits_2() {
         assert!(!err.contains("hunter2"), "{args:?}: {err}");
         assert!(out.stdout.is_empty(), "{args:?}");
     }
+}
+
+/// Asserts that a frontend given neither `--state-store` nor a settings file with the key
+/// exits 2 naming the flag, at a start and under `--check` alike and with the same text,
+/// and that it prints nothing on standard output: the start line, which comes once the
+/// listeners are bound, is absent, so nothing listened.
+#[test]
+fn a_frontend_with_no_state_store_is_refused_at_a_start_and_by_check() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-no-state-store");
+    let config = kbf_testkit::config::flag(&dir);
+    let flags = [
+        config.as_str(),
+        "--listen=127.0.0.1:0",
+        "--worker-listen=127.0.0.1:0",
+        "--storage=http://127.0.0.1:1",
+    ];
+    let run = |extra: &[&str]| {
+        Command::new(BIN)
+            .arg("frontend")
+            .args(flags)
+            .args(extra)
+            .output()
+            .expect("run kbf")
+    };
+    let started = run(&[]);
+    let checked = run(&["--check"]);
+    for (how, out) in [("a start", &started), ("--check", &checked)] {
+        assert_eq!(out.status.code(), Some(2), "{how}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("kbf frontend: --state-store is not set"),
+            "{how}: {err}"
+        );
+        assert!(out.stdout.is_empty(), "{how}");
+    }
+    assert_eq!(started.stderr, checked.stderr);
 }
 
 /// Catches a frontend process that takes `--state-store=sqlite://...` and does not open
@@ -330,22 +373,18 @@ fn without_password(url: &str) -> String {
 /// a runtime from within a runtime"), or whose `/readyz` is not 200 over the schema the
 /// installer made, or that creates the tables itself: started on a database nobody ran
 /// `setup` on it must exit with the one line that says what to run, and leave no schema.
-/// Needs a Postgres server: `KBF_TEST_POSTGRES_URL` names a database the test may create
-/// the `kbf_state` schema in.
+/// Needs a Postgres server, and fails without one: `KBF_TEST_POSTGRES_URL` names a server the
+/// test may create a database on. The database is the test's own and starts with no schema.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_frontend_process_with_a_postgres_state_store_is_ready_over_the_installers_schema() {
-    let url = std::env::var("KBF_TEST_POSTGRES_URL")
-        .expect("KBF_TEST_POSTGRES_URL names a database the test may create schemas in");
+    let database = kbf_state::postgres::TestDatabase::empty();
+    let url = database.url();
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-postgres");
     let node = node(&dir);
     // The flag refuses a password (the command line is world-readable), so the process
     // gets the URL without one; the server the job runs trusts its loopback clients.
     let flag = format!("--state-store={}", without_password(&url));
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connect");
-    client
-        .batch_execute("DROP SCHEMA IF EXISTS kbf_state CASCADE")
-        .expect("start from a database with no schema");
 
     let storage = format!("--storage=http://{}", node.field("storage="));
     let refused = Command::new(BIN)

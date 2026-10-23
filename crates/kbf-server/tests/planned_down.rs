@@ -627,3 +627,63 @@ fn a_heartbeat_on_the_end_tick_ends_the_plan_and_one_before_it_does_not() {
         "a beat on the end tick"
     );
 }
+
+/// Catches: an undo that promotes a member that is not planned down (a member that is `Active`
+/// would be written again under a new generation), one that changes nothing it says it
+/// changed, and one that is accepted for a member nobody registered. A planned member is made
+/// `Active` by the undo, in a new generation, and the answer is that it changed; a second
+/// undo changes nothing and says so.
+#[test]
+fn undoing_a_plan_changes_only_a_member_that_is_planned_down() {
+    let farm = Farm::new();
+    let [a, _] = farm.ids;
+    let before = farm.members.current_map().expect("read").expect("a map");
+
+    assert!(!farm.members.undo_plan(a).expect("nothing to undo"));
+    let same = farm.members.current_map().expect("read").expect("a map");
+    assert_eq!(same.generation(), before.generation());
+    assert_eq!(farm.state(a), Some(MemberState::Active));
+
+    let planned = farm.members.plan_down(a, PLAN).expect("planned");
+    assert!(farm.members.undo_plan(a).expect("undone"));
+    let after = farm.members.current_map().expect("read").expect("a map");
+    assert!(after.generation() > planned.generation());
+    assert_eq!(farm.state(a), Some(MemberState::Active));
+    assert!(!farm.members.planned_down(a).expect("read"));
+    assert!(!farm.members.undo_plan(a).expect("already undone"));
+
+    let stranger = farm.members.undo_plan(MemberId(9)).expect_err("nobody");
+    assert!(matches!(
+        stranger,
+        MembershipError::NotRegistered(MemberId(9))
+    ));
+}
+
+/// Catches: a plan that has run out still shown as a restart under way. The member keeps
+/// beating, so its row lives; between the end of the plan and its next beat the mark is still
+/// in the store, and the look says the member is not planned down and has no time since the
+/// mark.
+#[test]
+fn a_plan_that_ran_out_is_not_shown_as_marked() {
+    let farm = Farm::new();
+    let [a, _] = farm.ids;
+    farm.members
+        .plan_down(a, Duration::from_secs(100))
+        .expect("planned");
+    let marked = farm.members.look().expect("look");
+    let seen = marked.members.iter().find(|m| m.id == a).expect("listed");
+    assert!(seen.planned_down);
+    assert!(seen.marked_ago.is_some());
+
+    for _ in 0..4 {
+        farm.store.clock.advance(SECOND * 20);
+        farm.beat(0);
+    }
+    farm.store.clock.advance(SECOND * 20);
+    assert!(farm.store.fake.get("down/1").expect("read").is_some());
+    let ran_out = farm.members.look().expect("look");
+    let seen = ran_out.members.iter().find(|m| m.id == a).expect("listed");
+    assert_eq!(seen.state, MemberState::Down);
+    assert!(!seen.planned_down);
+    assert_eq!(seen.marked_ago, None);
+}

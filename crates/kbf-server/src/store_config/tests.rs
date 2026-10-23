@@ -562,7 +562,7 @@ async fn with_a_registry_the_node_must_be_active_at_every_call() {
 /// other child's GET shows, and a report older than the TTL reads as pending, so
 /// convergence is never claimed from a report nobody renewed.
 ///
-/// Mutant seen red: the TTL dropped from the row (the lapsed report still converges).
+/// Catches: the TTL dropped from the row (the lapsed report still converges).
 #[test]
 fn two_children_over_one_store_share_the_acks_and_a_lapsed_report_is_pending() {
     let (first, clock, store) = rig();

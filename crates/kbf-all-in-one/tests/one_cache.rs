@@ -262,9 +262,9 @@ fn big() -> Vec<u8> {
 
 /// Catches a fill over the in-process plane that holds the blob whole between the
 /// halves (the plane's `read_to` gathering the stream, or the plane's whole-blob
-/// `get`, before writing: the "buffer" mutants), or that writes it anywhere but the
+/// `get`, before writing: the "buffer" defects), or that writes it anywhere but the
 /// entry's file, or that lets more than two chunks sit between the halves (a wider
-/// channel: the "channel(3)" mutant). A 12 MiB input reaches the lease's file through
+/// channel: the "channel(3)" defect). A 12 MiB input reaches the lease's file through
 /// one streamed read and no whole-blob read; before each chunk is handed out (the pump
 /// holding none then), the fill's file holds all but at most three chunks of what came
 /// before: one in the channel between the halves, one the fill holds while the file
@@ -311,7 +311,7 @@ async fn two_leases_needing_one_input_read_it_once_into_one_file() {
 }
 
 /// Catches the plane's pump reading on for a fill that is gone (a lease killed while
-/// its inputs are written drops the fill: the "pump ignores a closed channel" mutant
+/// its inputs are written drops the fill: the "pump ignores a closed channel" defect
 /// reads the blob to its end for nobody) or keeping the storage's stream open: with the
 /// stream handing out a chunk per permit, the fill is dropped once its first chunk is in
 /// its file; the pump takes the one chunk it was waiting for, finds nobody to give it to
@@ -456,7 +456,7 @@ async fn scrape(api: std::net::SocketAddr) -> std::collections::BTreeMap<String,
 
 /// Catches the server half's write tier not reporting its bytes to the one cache (the
 /// input cache's budget would then leave the hot store out: the "storage never
-/// attached" and "counts nothing" mutants) or reporting other bytes than its blocks: a
+/// attached" and "counts nothing" defects) or reporting other bytes than its blocks: a
 /// server started as `kbf-all-in-one` starts its half, with one cache, stages a blob of
 /// 1,000 bytes (in the open grouped block, which seals only after 30 s, so nothing is
 /// flushed meanwhile); the one cache's storage bytes are then the tier's used bytes,
@@ -512,7 +512,7 @@ async fn server_half(
 }
 
 /// Catches the hot store's flushed copies decided otherwise than by the one cache: the
-/// "never keep" mutant (a server with no one cache, `kbf-server` alone or an
+/// "never keep" defect (a server with no one cache, `kbf-server` alone or an
 /// all-in-one whose hot store is on another disk, would delete what it serves local
 /// reads from) and the "always keep" one (a second copy beside the input cache's): a
 /// server half without a one cache and one with it each upload a blob in a block of its

@@ -20,7 +20,7 @@ use super::{engine, patterned};
 /// in flight never pass `--transfer-in-flight` (and reach it), each digest is read from
 /// the server once, the other 15,000 requests join those reads, and all of it goes over
 /// one connection. Catches per-call limits that multiply by the leases, duplicate
-/// fetches, and a connection per lease or per request. Mutants seen red: a semaphore
+/// fetches, and a connection per lease or per request. Catches: a semaphore
 /// per scope (34 reads at once for a limit of 16); no in-flight map (none of the 15,000
 /// requests joined a read).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -90,7 +90,7 @@ async fn t1_sixteen_leases_share_one_limit_one_connection_and_one_read_per_diges
 /// Then the gates open, and the most requests ever served at once (reads, writes and
 /// FindMissing together) is the limit. The per-walk limits of kbf-outputs and the
 /// container driver are per lease, so 16 leases are held to the process's limit only
-/// by the engine. Mutants seen red every run: no permit in `put` (phase 2), in
+/// by the engine. Catches: no permit in `put` (phase 2), in
 /// `put_chunks` (phase 2), in FindMissing (phases 1 and 3), FindMissing releasing its
 /// permit before the call (phase 1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -216,11 +216,11 @@ async fn uploads_finds_and_reads_of_sixteen_leases_share_the_one_limit() {
 /// must hold no more than the uploads' share of `--transfer-in-flight` (12 of 16) and
 /// the reads must finish while the writes are still held. Before the fix the writes
 /// took all 16 permits and the reads waited for them: on the farm node, nine leases'
-/// input fills waited 22 minutes for one lease's upload. Mutants seen red: no share
+/// input fills waited 22 minutes for one lease's upload. Catches: no share
 /// taken by `put` or by `put_chunks` (held writes 16, reads stuck), a share of the
 /// whole limit (the same). Issue #647: while the writes are held, one FindMissing call
 /// of the reading lease (whose outputs might all be stored already) must finish too.
-/// Mutant seen red: FindMissing taking the uploads' share like a write (it waits
+/// Catches: FindMissing taking the uploads' share like a write (it waits
 /// behind the held writes).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn held_uploads_leave_permits_for_another_leases_reads() {
@@ -294,7 +294,7 @@ fn chunks_of(bytes: &[u8]) -> Chunks {
 /// Catches reads into memory that ignore `--transfer-bytes-in-flight`: with a budget of
 /// one blob, three blobs of that size and one twice as large (which waits for the whole
 /// budget and goes alone) are read one at a time, though eight requests may be in
-/// flight. Mutant seen red: no byte budget (4 reads at once).
+/// flight. Catches: no byte budget (4 reads at once).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reads_into_memory_stay_within_the_byte_budget() {
     let fake = Arc::new(Fake::default());
@@ -327,7 +327,7 @@ async fn reads_into_memory_stay_within_the_byte_budget() {
 
 /// Catches the engine's connection left at HTTP/2's default windows (64 KiB, which caps
 /// a stream at the window per round trip): it asks for `--transfer-stream-window-bytes`
-/// per stream and eight times that for the connection. Mutant seen red: no window set
+/// per stream and eight times that for the connection. Catches: no window set
 /// (hyper's defaults went out instead: 2 MiB and 5 MiB).
 #[tokio::test]
 async fn the_connection_asks_for_the_configured_windows() {
@@ -345,7 +345,7 @@ async fn the_connection_asks_for_the_configured_windows() {
 
 /// Catches tonic's 4 MiB decode limit left on the engine's clients, or the engine's
 /// limit left below the front's: a message of 16.5 MiB (a full 16 MiB batch with its
-/// framing; the front's limit is 17 MiB) is read. Mutants seen red: no
+/// framing; the front's limit is 17 MiB) is read. Catches: no
 /// `max_decoding_message_size` (OUT_OF_RANGE, "decoded message length too large");
 /// `MAX_MESSAGE_BYTES` left at 5 MiB.
 #[tokio::test]
@@ -363,7 +363,7 @@ async fn a_message_up_to_sixteen_mib_and_framing_is_decoded() {
 /// and Z are given up, Z never reaching the server; Y, which B still waits for, is read
 /// once and B gets it. Catches leaked work (a dropped lease's queued reads still run)
 /// and wrongly cancelled work (a shared read cancelled with the lease that started
-/// it). Mutants seen red: give up a flight whatever its waiters (B got "the fetch
+/// it). Catches: give up a flight whatever its waiters (B got "the fetch
 /// ended without an answer"); never give up (3 reads left, not 1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t3_a_dropped_lease_cancels_what_it_queued_but_not_a_shared_read() {
@@ -421,7 +421,7 @@ async fn t3_a_dropped_lease_cancels_what_it_queued_but_not_a_shared_read() {
 /// Catches a read given up when more than half of its blob had arrived (the next lease
 /// to ask would fetch it all again): lease A's read of H stops waiting after 2,000 of
 /// its 3,000 bytes; lease B then asks for H and joins the same read, which the server
-/// serves once. Mutant seen red: give up whatever has arrived (B joined no read).
+/// serves once. Catches: give up whatever has arrived (B joined no read).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_read_more_than_half_done_finishes_for_the_next_caller() {
     let fake = Arc::new(Fake::default());
@@ -499,7 +499,7 @@ async fn a_read_whose_task_is_gone_is_unavailable() {
 ///   holds: one upload skipped, nothing written.
 /// - A refused `put_chunks` (UNAVAILABLE, not retried) is a write call but no blob
 ///   written.
-/// Mutants seen red (each with the values shown, not a timeout): the shared read
+/// Catches (each with the values shown, not a timeout): the shared read
 /// counted for no lease (A shows 0, 0, 0); the joining lease credited with the bytes
 /// (B shows `read_bytes` 300); `written_blobs` added before the write (the refused one
 /// shows 1); C's skip counted as written (C shows 1).

@@ -16,7 +16,8 @@
 //! - [`activate`]: the swap on trial: `activate`, `confirm`, `revert`, the start check
 //!   and the expiry, and the repair of the links after an interrupted verb.
 //! - [`meta_log`]: the node's metadata log, saved at a release's first start and put back when
-//!   the host goes back to the release that ran before (an older binary refuses a raised log).
+//!   the host goes back to the release that ran before (a binary from before skipped entries
+//!   refuses a raised log).
 //! - [`migrator`]: brings the state database to the schema a release declares, and asks a
 //!   binary which schema that is (`--version --json`); the swap's migration and the schema
 //!   step of `boot-check` share it.

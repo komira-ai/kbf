@@ -193,7 +193,7 @@ fn commits(metrics: &CacheMetrics, command: &str) -> u64 {
 /// end-to-end time shorter than the stages inside it, a segment's blob count or size
 /// not recorded, footer GETs counted as reads, the in-flight level left raised, and
 /// a write skipped because its blob is stored counted as an error.
-/// Mutants seen red: each stage timer removed; the footer timer moved around the PUT;
+/// Catches: each stage timer removed; the footer timer moved around the PUT;
 /// the skipped write's `ok()` removed.
 #[tokio::test]
 async fn a_bytestream_write_times_each_stage_of_its_store() {

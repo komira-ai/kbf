@@ -134,7 +134,7 @@ fn files(served: &Served) -> Vec<String> {
 /// a node refuses is `400`, the answer names `kbf-<commit>-<platform>.version.json` and the
 /// reason, no path of the host, and nothing is stored (no file, no listing of facts).
 ///
-/// Mutants seen red: the platform comparison removed (a document naming another platform
+/// Catches: the platform comparison removed (a document naming another platform
 /// is stored); the check removed (every document is stored).
 #[tokio::test]
 async fn a_facts_document_that_does_not_parse_or_contradicts_the_upload_is_refused() {
@@ -290,7 +290,7 @@ async fn the_facts_body_is_bounded_and_a_failing_directory_is_an_error() {
 /// with the note, the facts arriving silences it for that platform, and another platform
 /// without any is still noted. The listing says so for the same platforms.
 ///
-/// Mutant seen red: the upload of a platform without facts refused (`409`).
+/// Catches: the upload of a platform without facts refused (`409`).
 #[tokio::test]
 async fn a_platform_without_facts_is_accepted_and_the_answers_say_so() {
     let served = serve().await;
@@ -336,7 +336,7 @@ async fn a_platform_without_facts_is_accepted_and_the_answers_say_so() {
 /// `500` that names no path, and the listing, which only looks for the file, still lists the
 /// platform.
 ///
-/// Mutant seen red: the read error taken as no document (the put answers `201` with a note).
+/// Catches: the read error taken as no document (the put answers `201` with a note).
 #[tokio::test]
 async fn a_stored_facts_document_that_cannot_be_read_fails_the_put_without_a_path() {
     let served = serve().await;

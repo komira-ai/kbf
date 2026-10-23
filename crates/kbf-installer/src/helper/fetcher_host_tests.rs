@@ -182,7 +182,7 @@ fn names(real: &RealFetcher) -> Vec<&str> {
 /// Catches a fetcher that reads, or asks the host for its parts, when it is built: `setup`'s
 /// would have no file to read and no user to find.
 ///
-/// Mutants planted: the parts asked for in `HostFetcher::new`; the parts kept after the
+/// Catches: the parts asked for in `HostFetcher::new`; the parts kept after the
 /// first fetch.
 #[test]
 fn the_host_is_asked_at_each_fetch_and_not_when_the_fetcher_is_built() {
@@ -201,7 +201,7 @@ fn the_host_is_asked_at_each_fetch_and_not_when_the_fetcher_is_built() {
 /// Catches a fetcher that reads the file once (at construction, or at the first fetch that got
 /// that far) and keeps it.
 ///
-/// Mutants planted: the parsed file cached in the fetcher after its first successful read.
+/// Catches: the parsed file cached in the fetcher after its first successful read.
 #[test]
 fn installer_toml_is_read_at_each_fetch_so_a_file_written_later_is_used() {
     let rig = Rig::new("host-fetcher-lazy");
@@ -237,7 +237,7 @@ fn installer_toml_is_read_at_each_fetch_so_a_file_written_later_is_used() {
 /// Catches a value taken from the wrong key or left at its default, a source that is not the
 /// file's, and a host part dropped or replaced on the way into the real fetcher.
 ///
-/// Mutants planted: `Policy::of` replaced by a policy of defaults; `Limits::of` by the
+/// Catches: `Policy::of` replaced by a policy of defaults; `Limits::of` by the
 /// defaults; the source's base changed; the lease source replaced by `NotWired`.
 #[test]
 fn a_fetch_is_made_from_the_file_and_the_hosts_parts() {
@@ -280,7 +280,7 @@ fn a_fetch_is_made_from_the_file_and_the_hosts_parts() {
 /// roots where the farm's CA is required), a message that still says the file has no key for
 /// them, and the snapshot read as a licence to fetch.
 ///
-/// Mutants planted: the frontend arm returning a `url` source.
+/// Catches: the frontend arm returning a `url` source.
 #[test]
 fn the_frontend_source_is_refused_until_the_fetcher_uses_the_snapshot() {
     let rig = Rig::new("host-fetcher-frontend");
@@ -304,7 +304,7 @@ fn the_frontend_source_is_refused_until_the_fetcher_uses_the_snapshot() {
 /// Catches `bundled` falling through to a source that fetches (the network where the host is
 /// air-gapped), the denial left to the callers that ask, and a refusal that does not say why.
 ///
-/// Mutants to plant: the gate only in the callers (the direct calls here fetch); the `bundled`
+/// Catches: the gate only in the callers (the direct calls here fetch); the `bundled`
 /// arm returning the `frontend` refusal (red: the message); returning a `url` source built from
 /// nothing (red: no refusal).
 #[test]
@@ -333,7 +333,7 @@ fn a_bundled_host_denies_every_fetch_by_the_fetcher_itself() {
 /// Catches a staged order read as a fetch (the frontend source is not buildable, and a `url`
 /// host would start the child), and `staged` allowed on a `bundled` host only.
 ///
-/// Mutants to plant: the staged form building the real fetcher (every case but `url`, which
+/// Catches: the staged form building the real fetcher (every case but `url`, which
 /// starts the child, is red); the staged form refused unless the file says `bundled`.
 #[test]
 fn a_staged_order_takes_the_package_on_every_kind_of_host_and_never_starts_the_child() {
@@ -374,7 +374,7 @@ fn a_staged_order_takes_the_package_on_every_kind_of_host_and_never_starts_the_c
 ///
 /// Catches the hook answered from the configuration, and a missing seed taken for a seed.
 ///
-/// Mutant to plant: the hook delegating to the fetch-source fetcher (a `url` host without a
+/// Catches: the hook delegating to the fetch-source fetcher (a `url` host without a
 /// child refuses).
 #[test]
 fn the_host_fetcher_reports_the_seed_of_its_package_or_why_it_has_none() {
@@ -417,7 +417,7 @@ fn the_host_fetcher_reports_the_seed_of_its_package_or_why_it_has_none() {
 /// looked at only on a host that fetches nothing, and a file that cannot be read taken for a
 /// default source.
 ///
-/// Mutants to plant: the word taken from the order's source; the look delegating to the
+/// Catches: the word taken from the order's source; the look delegating to the
 /// fetch-source fetcher (a `url` host without a child cannot look); the source reported as
 /// `None` when no seed is found.
 #[test]
@@ -471,7 +471,7 @@ fn the_host_fetcher_looks_at_the_package_and_reports_the_source_the_file_names()
 /// Catches the word taken for a default when the file cannot be read (a bundled host that no
 /// longer says so), and the trait's default left in place.
 ///
-/// Mutants to plant: `source` left at the trait's default (`None`); `unwrap_or("url")` on it.
+/// Catches: `source` left at the trait's default (`None`); `unwrap_or("url")` on it.
 #[test]
 fn the_host_fetcher_tells_the_source_word_and_nothing_when_it_cannot() {
     let seeded = Seeded::scratch("host-fetcher-source");
@@ -493,7 +493,7 @@ fn the_host_fetcher_tells_the_source_word_and_nothing_when_it_cannot() {
 ///
 /// Catches the question answered only where a source can fetch.
 ///
-/// Mutant to plant: the probe delegating to the fetch-source fetcher.
+/// Catches: the probe delegating to the fetch-source fetcher.
 #[test]
 fn the_host_fetcher_asks_an_installed_release_for_its_version() {
     let seeded = Seeded::scratch("host-fetcher-probe");
@@ -514,7 +514,7 @@ fn the_host_fetcher_asks_an_installed_release_for_its_version() {
 ///
 /// Catches a key that is parsed and silently dropped on the way to the fetch child.
 ///
-/// Mutants to plant: the `release_ca` arm removed (the key ignored: red, no refusal).
+/// Catches: the `release_ca` arm removed (the key ignored: red, no refusal).
 #[test]
 fn a_url_host_with_a_release_ca_is_refused_not_fetched_with_the_system_roots() {
     let rig = Rig::new("host-fetcher-release-ca");
@@ -544,7 +544,7 @@ fn a_url_host_with_a_release_ca_is_refused_not_fetched_with_the_system_roots() {
 /// Catches the narrowing never applied (the file's refs only parsed and rendered, as they were
 /// before), applied to the wrong settings, or widening.
 ///
-/// Mutants planted: the `narrowed_to` call removed from `assemble`.
+/// Catches: the `narrowed_to` call removed from `assemble`.
 #[test]
 fn installer_tomls_source_refs_narrow_installer_confs_in_a_fetch() {
     let rig = Rig::new("host-fetcher-refs");
@@ -638,7 +638,7 @@ fn a_host_without_its_parts_is_unavailable_with_the_reason() {
 ///
 /// Catches the two forms swapped, either delegating to the other.
 ///
-/// Mutants planted: `fetch` calling `fetch_activation`; `fetch_activation` calling `fetch`.
+/// Catches: `fetch` calling `fetch_activation`; `fetch_activation` calling `fetch`.
 #[test]
 fn the_two_forms_reach_the_real_fetchers_matching_forms() {
     let rig = Rig::new("host-fetcher-forms");
@@ -662,7 +662,7 @@ fn the_two_forms_reach_the_real_fetchers_matching_forms() {
 /// wrong ones under a root flag), a fixed owner (root's, where a scratch test is not root),
 /// and a lease source or child dropped.
 ///
-/// Mutants planted: `Root::new("/")` in place of the host's root; the owner fixed at 0:0
+/// Catches: `Root::new("/")` in place of the host's root; the owner fixed at 0:0
 /// (equivalent when the tests run as root).
 #[test]
 fn the_hosts_own_parts_are_rooted_at_the_host_and_owned_by_this_process() {
@@ -693,7 +693,7 @@ fn the_hosts_own_parts_are_rooted_at_the_host_and_owned_by_this_process() {
 /// whoever the caller is), and the child looked up when the fetcher is built, where `setup`
 /// has not made the user yet.
 ///
-/// Mutants planted: the child's error dropped for a default child.
+/// Catches: the child's error dropped for a default child.
 #[test]
 fn on_a_host_the_child_is_looked_up_per_fetch_and_the_real_executor_answers() {
     let (layout, _) = host_root("host-fetcher-on-host");

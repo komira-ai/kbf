@@ -89,6 +89,9 @@ struct Report {
     // The commit the host runs is for the health check; here it only has to be a string.
     #[serde(rename = "running_commit")]
     _running_commit: Option<String>,
+    // The node id is for the identity check; here it only has to be a string.
+    #[serde(rename = "node_id")]
+    _node_id: Option<String>,
     in_progress: bool,
 }
 

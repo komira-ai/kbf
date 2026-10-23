@@ -1,11 +1,11 @@
 //! Starting a release where no child serves, and making it take the generation (FP
-//! section 6, "both children dead"; section 8, "a cold start bumps the epoch").
+//! section 6, "both children dead"; section 8, whose epoch bump a cold start no longer makes).
 //!
 //! One machinery, two callers: [`Swap::cold_start`](super::swap::Swap) after a restart in
 //! the middle of an update, and the supervisor's boot ([`super::supervisor`]) on a host
 //! with no live child. The steps are the same in both: spawn the release as a candidate in
 //! its slot (the child port records the process before it returns), wait until the process
-//! is ready, make it take the generation (with no live holder the child bumps the epoch),
+//! is ready, make it take the generation (with no live holder the child keeps the epoch),
 //! then release the gate into the slot. This module has no update record: the swap saves its
 //! own intent between [`Cold::spawn`] and [`Cold::await_ready`].
 

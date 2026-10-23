@@ -354,12 +354,11 @@ async fn the_admin_port_refuses_a_non_loopback_address() {
     assert!(error.to_string().contains("--admin-listen"), "{error}");
 }
 
-/// Catches: an epoch that does not follow the rule. A takeover from a live holder keeps
-/// it (daemons keep their leases), a candidate's open leaves it as it was, and a cold
-/// start over the same store bumps it (a start with no live holder cannot trust what the
-/// last one leased). Mutant: the takeover bumps the epoch.
+/// Asserts that no start moves the epoch: a takeover from a live holder keeps it (daemons
+/// keep their leases), a candidate's open leaves it as it was, and a cold start over the
+/// same store keeps it too (an operator raises the epoch, `POST /v1/epoch/bump`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_epoch_is_kept_by_a_takeover_and_bumped_by_a_cold_start() {
+async fn the_epoch_is_kept_by_a_takeover_and_by_a_cold_start() {
     let node = Node::start().await;
     let store = shared();
     let a = Child::start(&managed_flags(&node, &[]), &store).await;
@@ -371,6 +370,6 @@ async fn the_epoch_is_kept_by_a_takeover_and_bumped_by_a_cold_start() {
     assert_eq!(b.takeover(held).await.0, 200);
     assert_eq!(epoch(&store), first, "a takeover moved the epoch");
     let c = Child::start(&managed_flags(&node, &[]), &store).await;
-    assert_eq!(epoch(&store), first + 1, "a cold start kept the epoch");
+    assert_eq!(epoch(&store), first, "a cold start moved the epoch");
     assert_eq!(c.role().await["held_generation"], held + 2);
 }

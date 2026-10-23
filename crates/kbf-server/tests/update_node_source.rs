@@ -1,11 +1,9 @@
 //! The node step's recheck of a staged run's package (`update/steps.rs`, steps 1 to 5): a host
 //! whose package no longer carries the release is given back before the activate order, not
 //! held after it. A fetch run reads no package. The picker's gate is in
-//! `update_pick_source.rs`, the walk through the controller in `update_controller_source.rs`,
-//! the rest of steps 1 to 5 in `update_node_step.rs`.
+//! `update_pick_source.rs`, the rest of steps 1 to 5 in `update_node_step.rs`.
 //!
-//! Each test names the defect it would catch. Each 'Mutants it catches' line names a change
-//! that turns the test red.
+//! Each test names the defect it would catch.
 
 #[path = "update_support/mod.rs"]
 mod support;

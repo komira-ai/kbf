@@ -11,7 +11,7 @@ use tonic::Request;
 
 use super::support::{Front, blob, seg};
 
-/// Catches an upload with no connection of its own dropped at once (mutant: the
+/// Catches an upload with no connection of its own dropped at once (defect: the
 /// reaper takes a missing connection for a closed one): a `Begin` that reaches the
 /// service with no peer address, as from a listener whose streams are not wrapped by
 /// `Connections::track`, keeps its upload and its budget until the idle time drops

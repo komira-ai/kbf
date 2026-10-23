@@ -26,7 +26,7 @@ fn row(grid: &Value, key: &str) -> Vec<String> {
         .collect()
 }
 
-/// Catches (mutant: a build without the shape given another build's cell): the grid of
+/// Catches (defect: a build without the shape given another build's cell): the grid of
 /// three builds after a restart. `g1` passed X and then failed it (the later run is the
 /// cell), failed Y; `g2` failed X and has no Y; `g3` ran only Z. A cell is `absent` where
 /// a build has no run of the row, a row is only made for what some build ran, and the

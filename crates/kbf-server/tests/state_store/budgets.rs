@@ -112,7 +112,7 @@ async fn farm_runs_are_not_given_back(end: End) {
 
 /// Catches: farm runs that live only in the old process. An operation whose run was lost
 /// `FARM_RERUNS` times is, at the successor, given a further rerun at its next fault (one
-/// more than the cap, at every handover). Mutant: the fate row not written for a fault.
+/// more than the cap, at every handover). Catches: the fate row not written for a fault.
 #[tokio::test(start_paused = true)]
 async fn farm_runs_survive_a_handover() {
     farm_runs_are_not_given_back(End::Handover).await;
@@ -170,7 +170,7 @@ async fn avoid_is_kept(end: End, lost_on: &str) {
 
 /// Catches: the nodes placement skips for an operation living only in the old process,
 /// so the successor runs it on the node that lost it (placement picks one of the two
-/// nodes by its own order, and the test loses the run on each). Mutant: the avoid set not written.
+/// nodes by its own order, and the test loses the run on each). Catches: the avoid set not written.
 #[tokio::test(start_paused = true)]
 async fn the_nodes_to_avoid_survive_a_handover() {
     avoid_is_kept(End::Handover, "node-a").await;
@@ -220,7 +220,7 @@ async fn not_started_is_kept(end: End) {
 
 /// Catches: the count of give-ups as not started living only in the old process, so a
 /// node that drops every `Start` holds the operation for `NOT_STARTED_RERUNS` more at
-/// every handover. Mutant: the not-started count not written.
+/// every handover. Catches: the not-started count not written.
 #[tokio::test(start_paused = true)]
 async fn the_not_started_budget_survives_a_handover() {
     not_started_is_kept(End::Handover).await;

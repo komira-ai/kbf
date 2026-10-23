@@ -33,6 +33,8 @@
 #[cfg(any(test, feature = "test-support"))]
 mod backend;
 mod conn;
+#[cfg(feature = "test-database")]
+mod database;
 mod reach;
 pub mod schema;
 mod session;
@@ -51,6 +53,8 @@ use postgres::types::ToSql;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use backend::PostgresBackend;
+#[cfg(feature = "test-database")]
+pub use database::{TestDatabase, test_database};
 pub use reach::{Unreached, reach};
 use session::{Edge, Pool, RangeShape, Session};
 use tx::{Level, Row, Tx, micros};
@@ -665,8 +669,11 @@ impl Store for PostgresStore {
             Ok((head, rows))
         })?;
         let mut out = Vec::with_capacity(rows.len());
+        let mut last = after;
         for row in &rows {
             let rev: i64 = row.get(0);
+            let revision = Revision(u64::try_from(rev).unwrap_or(0));
+            last = revision;
             let kind: i16 = row.get(2);
             let value: Option<Vec<u8>> = row.get(3);
             let event = match kind {
@@ -674,19 +681,20 @@ impl Store for PostgresStore {
                 1 => Event::Delete,
                 2 => Event::Expire,
                 other => {
-                    return Err(StoreError::Failed(format!("unknown feed row kind {other}")));
+                    // A newer release wrote it: skip it, and the cursor still passes it.
+                    tracing::warn!("skipped feed row {revision:?} of unknown kind {other}");
+                    continue;
                 }
             };
             out.push(Change {
-                revision: Revision(u64::try_from(rev).unwrap_or(0)),
+                revision,
                 key: row.get(1),
                 event,
             });
         }
-        let last = out.last().map_or(after, |change| change.revision);
         // A page that is not full has reached the head; a full one resumes after its
-        // last row.
-        let cursor = if out.len() < limit && !sequence {
+        // last row read, a skipped one included.
+        let cursor = if rows.len() < limit && !sequence {
             Revision(u64::try_from(head).unwrap_or(0)).max(after)
         } else {
             last
@@ -970,8 +978,7 @@ mod tests {
     }
 
     fn url() -> String {
-        std::env::var("KBF_TEST_POSTGRES_URL")
-            .expect("KBF_TEST_POSTGRES_URL names a database the tests may create schemas in")
+        kbf_testkit::database::server_url()
     }
 
     /// A store on a schema of its own, and a client on the same database.
@@ -1015,7 +1022,6 @@ mod tests {
     // neither being retried, and a retry loop with no end. The server's words name the
     // state.
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn only_serialization_failures_and_deadlocks_are_run_again_and_not_for_ever() {
         let (store, mut client) = store_and_client("kbf_unit_retry");
         // One result type throughout: the coverage of a generic function is that of its
@@ -1056,7 +1062,6 @@ mod tests {
     // Catches an error that is not the server's (no connection, a closed one) being
     // described as the empty "db error", or with its cause dropped.
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn an_error_that_is_not_the_servers_is_described_with_its_cause() {
         let refused = postgres::Client::connect("postgres://nobody@127.0.0.1:1/x", postgres::NoTls)
             .err()
@@ -1094,7 +1099,6 @@ mod tests {
     // one (the store's sessions are all dead here, and a batch that begins a transaction
     // would fail).
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn an_empty_batch_answers_nothing_without_a_connection() {
         let config = PostgresConfig::parse(&url())
             .and_then(|config| config.with_schema("kbf_unit_empty"))
@@ -1133,14 +1137,13 @@ mod tests {
         assert_eq!(store.apply_batch(put()).expect("commits").len(), 1);
     }
 
-    // Catches the feed read wrongly: each kind of row mapped to its event, a full page
-    // resuming after its last row and a short one at the head, a store with sequence
-    // revisions reading to the end of the table, and a row of a kind this code does not
-    // know being read as an event (the feed would lose a change): it must fail and name
-    // the kind.
+    /// Asserts that each kind of feed row maps to its event, a full page resumes after its
+    /// last row and a short one at the head, a store with sequence revisions reads to the
+    /// end of the table, and a row of a kind this code does not know is left out of the
+    /// page rather than failing it: a full page of only such rows is empty and its cursor
+    /// still passes them, and the known rows after it are read.
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
-    fn the_feed_maps_each_kind_pages_and_refuses_a_kind_it_does_not_know() {
+    fn the_feed_maps_each_kind_pages_and_skips_a_kind_it_does_not_know() {
         use super::{Change, Event, Flaw};
         let (store, mut client) = store_and_client("kbf_unit_kind");
         client
@@ -1187,18 +1190,26 @@ mod tests {
                 .len(),
             3
         );
+        let store = flawed.with_flaw(Flaw::None);
         client
             .batch_execute(
-                "INSERT INTO kbf_unit_kind.feed (rev, key, kind) VALUES (6, 'k', 9); \
-                 UPDATE kbf_unit_kind.head SET rev = 6",
+                "INSERT INTO kbf_unit_kind.feed (rev, key, kind, value) VALUES \
+                 (6, 'k', 9, NULL), (7, 'm', 0, 'w'); \
+                 UPDATE kbf_unit_kind.head SET rev = 7",
             )
-            .expect("a row of a kind from the future");
-        assert_eq!(
-            flawed
-                .with_flaw(Flaw::None)
-                .changes(Revision(3), 10)
-                .unwrap_err(),
-            StoreError::Failed("unknown feed row kind 9".to_owned())
-        );
+            .expect("a row of a kind from the future, then a put");
+        let after = Change {
+            revision: Revision(7),
+            key: "m".into(),
+            event: Event::Put(b"w".to_vec()),
+        };
+        let page = store.changes(Revision(3), 10).expect("reads");
+        assert_eq!(page.rows, std::slice::from_ref(&after));
+        assert_eq!(page.cursor, Revision(7));
+        let skipped = store.changes(Revision(3), 1).expect("reads");
+        assert_eq!((skipped.rows.len(), skipped.cursor), (0, Revision(6)));
+        let resumed = store.changes(skipped.cursor, 1).expect("reads");
+        assert_eq!(resumed.rows, [after]);
+        assert_eq!(resumed.cursor, Revision(7));
     }
 }

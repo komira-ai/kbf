@@ -2471,6 +2471,21 @@ dependencies = [
  "rustix",
  "thiserror",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "kbf-state-copy"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "kbf-state",
+ "kbf-testkit",
+ "postgres",
+ "rusqlite",
+ "sha2 0.11.0",
+ "thiserror",
 ]
 
 [[package]]
@@ -2509,7 +2524,9 @@ dependencies = [
 name = "kbf-testkit"
 version = "0.1.0"
 dependencies = [
+ "kbf-testkit",
  "libc",
+ "postgres",
  "rustix",
  "tokio",
 ]

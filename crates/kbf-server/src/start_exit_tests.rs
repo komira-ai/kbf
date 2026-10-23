@@ -47,7 +47,7 @@ impl Error for Wrapped {
 
 /// Catches a start that is refused for a reason a restart cannot clear but exits as
 /// not ready (it would be restarted for ever), or a refusal that moves with its text
-/// (mutant: [`StartFailure::of`] answering not ready for every error): flags, files
+/// (defect: [`StartFailure::of`] answering not ready for every error): flags, files
 /// given wrongly, a directory that is not a log, a permission.
 #[test]
 fn what_a_restart_cannot_clear_is_refused() {
@@ -76,7 +76,7 @@ fn what_a_restart_cannot_clear_is_refused() {
 }
 
 /// Catches a stale boot (the frontend's state store restored from an older copy) that
-/// exits 2, which `RestartPreventExitStatus=2` leaves down for good (mutant: the
+/// exits 2, which `RestartPreventExitStatus=2` leaves down for good (defect: the
 /// `StaleWriter` arm removed), whether the cache's error is matched itself or found
 /// under a wrapper by the source chain.
 #[test]
@@ -90,7 +90,7 @@ fn a_stale_writer_is_not_ready() {
     assert_eq!(class(under), StartFailure::NotReady);
 }
 
-/// Catches a directory held by the process that is stopping that exits 2 (mutants: the
+/// Catches a directory held by the process that is stopping that exits 2 (defects: the
 /// `Locked` arms removed), through the real second open of one directory, and an I/O
 /// failure a later try can clear (a busy, read-only or full device) that exits 2.
 #[tokio::test]
@@ -129,7 +129,7 @@ async fn a_held_directory_and_a_device_not_ready_are_not_ready() {
 }
 
 /// Catches a class that exits with another status than the units name: 2 is what
-/// `RestartPreventExitStatus=2` never restarts, 75 is what it does (mutant: either
+/// `RestartPreventExitStatus=2` never restarts, 75 is what it does (defect: either
 /// constant changed, or both 2).
 #[test]
 fn each_class_has_its_status() {
@@ -146,7 +146,7 @@ fn each_class_has_its_status() {
 /// a node behind on boots restarts until they catch up, which must not read as an ordinary
 /// crash loop): a `StaleWriter`, bare, inside the cache's variant or wrapped, carries the
 /// line naming the restored state store and the wait; any other failure carries none.
-/// Mutant: `hint` always `None`.
+/// Catches: `hint` always `None`.
 #[test]
 fn a_stale_writer_says_the_state_store_is_older() {
     let hint = |e: Box<dyn Error>| super::hint(e.as_ref());
@@ -170,7 +170,7 @@ fn a_stale_writer_says_the_state_store_is_older() {
 /// Catches a stale start that prints its error without the line that says why (the
 /// restarts would read as an ordinary crash loop), or the line for a failure it does not
 /// fit: `said` is the error, then the hint for a `StaleWriter`; the error alone otherwise.
-/// Mutant: `said` without the hint line.
+/// Catches: `said` without the hint line.
 #[test]
 fn what_a_failed_start_says_is_its_error_then_the_hint() {
     let stale: Box<dyn Error> = Box::new(stale());
@@ -185,7 +185,7 @@ fn what_a_failed_start_says_is_its_error_then_the_hint() {
     assert_eq!(super::said("kbf storage", busy.as_ref()).lines().count(), 1);
 }
 
-/// Catches a node whose registered keys fail its probe being left down (mutant: the
+/// Catches a node whose registered keys fail its probe being left down (defect: the
 /// `ColdApplyError` arm removed): the operator registers a working pair and the restart
 /// reads it, so the exit is 75; the failures a restart cannot clear (no keys of its own,
 /// a refused node, core dumps that stay on) are 2.

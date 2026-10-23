@@ -306,7 +306,7 @@ async fn rebuild_of<M: MetaLog, O: ObjectStore>(cache: &Cache<M, O>) -> Rebuild 
 /// (every log counts from 1) names nothing. A new node over a new log rebuilds over
 /// 7 old segments of two old logs (the same epoch and seqs in both) and reads every blob
 /// back with its bytes; a blob of each old log with the same text-derived name does not
-/// get confused with the other's. Mutant seen red: `ObjectKeys::object` answering `None`
+/// get confused with the other's. Catches: `ObjectKeys::object` answering `None`
 /// for another log's key (every segment skipped as foreign).
 #[tokio::test]
 async fn old_layout_segments_are_adopted_and_read() {
@@ -334,7 +334,7 @@ async fn old_layout_segments_are_adopted_and_read() {
 
 /// Catches: a rebuild that leaves out the objects of a node writer: this node's own
 /// earlier boot (its metadata directory was wiped) and another member's. The new boot
-/// finds both, indexes them, and a read of each gives its bytes. Mutant seen red: the
+/// finds both, indexes them, and a read of each gives its bytes. Catches: the
 /// listing under the log's own prefix instead of the root (nothing of a node writer is
 /// found).
 #[tokio::test]
@@ -363,7 +363,7 @@ async fn object_of(cache: &Cache<Log, Bucket>, digest: Digest) -> Option<ObjectI
 /// Catches: an adoption that replaces a blob written while the rebuild was due: the new
 /// node stores a blob (its own object) that an old segment also holds; after the rebuild
 /// the blob is still at the node's own object, and the old segment's copy was counted as
-/// kept. Mutant seen red: `adopt_segment` inserting without the digest check (the blob's
+/// kept. Catches: `adopt_segment` inserting without the digest check (the blob's
 /// location is the old object).
 #[tokio::test]
 async fn adopt_never_replaces_a_newer_write() {
@@ -393,7 +393,7 @@ async fn adopt_never_replaces_a_newer_write() {
 /// than a trailer), 100 bytes of nothing (a torn tail), a valid segment under a key that
 /// is not an object name of the cache, and a valid segment of an epoch of the cache's
 /// own log that it never allocated. The 3 real segments are all indexed, the four others
-/// counted (2 skipped, 2 foreign), and the rebuild completes. Mutants seen red: a skip
+/// counted (2 skipped, 2 foreign), and the rebuild completes. Catches: a skip
 /// returned as an error (the rebuild never completes); the unallocated-epoch segment
 /// adopted (the log refuses it, and the rebuild fails on the refusal).
 #[tokio::test]
@@ -441,7 +441,7 @@ async fn torn_and_foreign_objects_are_skipped_not_fatal() {
 /// listing fails on the third call, after 4 objects: the rebuild reports the failure, is
 /// not done, and the log holds the key of the fourth object (a batch of 2 committed
 /// twice); the next call resumes after exactly that key (5 objects left), finishes, and a
-/// third lists nothing. Mutants seen red: progress not committed (the second call starts
+/// third lists nothing. Catches: progress not committed (the second call starts
 /// from the top: 9 objects, `resumed_after` empty); `RebuildDone` committed before the
 /// listing (the second call is `already_done`, with 5 segments not indexed); stopping
 /// after the first page (4 segments held at most).
@@ -487,7 +487,7 @@ async fn a_rebuild_resumes_after_its_last_progress_and_finishes_once() {
 /// Catches: a rebuild that treats a failed read of a footer as the object being no
 /// segment (a transient store error then drops a segment's blobs for good, the rebuild
 /// marked done without them): the call fails, is not done, and a retry that reads
-/// successfully indexes it. The failing read is of one object's tail. Mutant seen red:
+/// successfully indexes it. The failing read is of one object's tail. Catches:
 /// `SkipReason::Read` counted as skipped.
 #[tokio::test]
 async fn a_failed_footer_read_stops_the_rebuild_instead_of_skipping() {
@@ -545,7 +545,7 @@ async fn a_log_that_misanswers_a_rebuild_command_fails_the_rebuild() {
 /// the log): the object is deleted from the store after the rebuild; a read of a blob in
 /// it must fail as unreachable (not internal, not served), the blob must then be reported
 /// missing so a client uploads it again, and the upload must heal the entry into the
-/// node's own object. Mutant seen red: `adopted_writers` not filled (the unreachable mark
+/// node's own object. Catches: `adopted_writers` not filled (the unreachable mark
 /// is refused and the read fails the same way every time, the blob never reported missing).
 #[tokio::test]
 async fn a_lost_adopted_object_is_marked_reported_missing_and_healed() {
@@ -583,7 +583,7 @@ async fn a_lost_adopted_object_is_marked_reported_missing_and_healed() {
 
 /// Catches: a rebuild that indexes the objects its own writer is writing (the node's puts
 /// do that): the node writes 3 segments before the rebuild; the rebuild counts them as
-/// its own, adopts none of them, and the index is as it was. Mutant seen red: no
+/// its own, adopts none of them, and the index is as it was. Catches: no
 /// current-writer check in the log (the three counted as segments, all records kept).
 #[tokio::test]
 async fn a_rebuild_leaves_the_nodes_own_objects_to_its_puts() {
@@ -635,7 +635,7 @@ async fn the_marker_is_the_logs_not_the_caches() {
 
 /// Catches: an adoption command that a segment of many records does not fit in: a segment
 /// of more than `ADOPT_RECORDS` records is adopted in several commands and every record
-/// is indexed. Mutant seen red: only the first chunk of a segment committed.
+/// is indexed. Catches: only the first chunk of a segment committed.
 #[tokio::test]
 async fn a_segment_of_many_records_is_adopted_whole() {
     let bucket = Bucket::new();

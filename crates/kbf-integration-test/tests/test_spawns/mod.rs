@@ -56,13 +56,13 @@ fn unlisted(path: &str, what: &str) -> String {
 fn the_control_tree_passes() {
     // Catches: the control refused (a listed test file, a listed unit test module, a
     // test file without an interpreter, or production code naming `perl` with no
-    // `-c`), so every planted defect below would go red for the wrong reason.
+    // `-c`), so every broken tree below would go red for the wrong reason.
     assert_eq!(problems(&tree(), BUDGET), Vec::<String>::new());
 }
 
 #[test]
 fn a_planted_spawn_in_an_unlisted_test_file_is_refused() {
-    // Catches (planted defect): `Command::new("perl")` in a new file under
+    // Catches: `Command::new("perl")` in a new file under
     // `crates/*/tests/`, a support module there, and a script with a `#!/bin/bash`
     // line a test writes, none of them listed: a lint that skips `tests/`, reads only
     // program literals or misses the `#!` form passes them.
@@ -92,7 +92,7 @@ fn a_planted_spawn_in_an_unlisted_test_file_is_refused() {
 
 #[test]
 fn a_planted_spawn_in_unlisted_unit_test_code_is_refused() {
-    // Catches (planted defect): a `#[cfg(test)]` module under `crates/*/src/` that
+    // Catches: a `#[cfg(test)]` module under `crates/*/src/` that
     // spawns `/usr/bin/python3`, in a file with no row: a lint that reads only
     // `tests/` passes it. The file's production code names nothing.
     let mut t = tree();
@@ -122,7 +122,7 @@ fn a_listed_file_may_change_its_spawns() {
 
 #[test]
 fn a_stale_row_is_refused() {
-    // Catches (planted defect): a row left for a test file that is gone, or that no
+    // Catches: a row left for a test file that is gone, or that no
     // longer names an interpreter, so the list stops shrinking with the code.
     let want = vec![
         "line 5: the [test-interpreters] row for `crates/k/tests/probe.rs` names nothing \
@@ -142,7 +142,7 @@ fn a_stale_row_is_refused() {
 
 #[test]
 fn a_malformed_or_repeated_row_is_refused() {
-    // Catches (planted defect): a row with a blank for its tab (so the parser drops
+    // Catches: a row with a blank for its tab (so the parser drops
     // it and its file is unlisted, both said), and a second row for one file, which
     // would let a stale copy hide.
     let blank = BUDGET.replace("probe.rs\tprocess", "probe.rs process");

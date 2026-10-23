@@ -303,7 +303,7 @@ mod tests {
     /// the bound socket has the same property (a forked child keeps the listener open,
     /// and so answering), which is not what this test is about.
     ///
-    /// Mutant: the `Drop` of `StartersLock` removed.
+    /// Catches: the `Drop` of `StartersLock` removed.
     #[test]
     fn a_child_forked_while_the_lock_was_held_does_not_keep_it_after_the_drop() {
         // `prepare_dir` wants a directory of mode 0700, which it makes itself: it is made

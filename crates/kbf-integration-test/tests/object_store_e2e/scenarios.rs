@@ -1,5 +1,4 @@
-//! The failure scenarios. Each test names the defect it catches and the mutant that was
-//! planted to see it red (the list, with the results, is in the pull request).
+//! The failure scenarios. Each test names the defect it catches.
 
 use std::io::Write as _;
 use std::net::TcpStream;
@@ -33,7 +32,7 @@ fn all_heard(status: &Status, count: usize) -> bool {
 }
 
 /// Catches a status that calls the farm converged while a node is down or has not applied
-/// the generation. Mutants (each seen red): `Convergence::of` counting every active node as
+/// the generation. Also catches: `Convergence::of` counting every active node as
 /// applied; and all three places that judge an `ok` against the generation removed at once
 /// (the node's `for_beat`, `Acks::convergence`, `Convergence::of`: any one alone is covered
 /// by the other two, so this test cannot tell which was removed).
@@ -102,8 +101,8 @@ async fn a_node_that_is_down_during_the_put_is_pending_until_it_comes_back() {
 }
 
 /// Catches a frontend restart in the middle of a rotation that costs a node its working
-/// credential, or that lets the status claim a convergence nobody reported. Mutants (each
-/// seen red): `Convergence::of` counting every active node as applied, and the three
+/// credential, or that lets the status claim a convergence nobody reported. Also
+/// catches: `Convergence::of` counting every active node as applied, and the three
 /// generation judgements removed at once (the restarted frontend reads the acks the old one
 /// left in the shared store and would call the farm converged on the rotated generation);
 /// and `Registry::put_connection` removing the new secret version after the commit instead
@@ -187,7 +186,7 @@ async fn a_frontend_restart_mid_rotation_loses_no_credential_and_claims_nothing(
 }
 
 /// Catches a node whose registered keys fail its probe being reported applied, or being
-/// left without a working store. Mutants (each seen red): the probe-failed branch of
+/// left without a working store. Also catches: the probe-failed branch of
 /// `ColdPick::registered` in `cold_apply.rs` returning `Applied::running` (the status says
 /// `ok` for a registration the node did not take), `Convergence::of` counting every
 /// active node as applied, and `Registry::put_connection` removing the new secret version
@@ -282,8 +281,8 @@ async fn put_and_lose_the_answer(
     panic!("the frontend never committed the request");
 }
 
-/// Catches a retry of a PUT whose answer was lost making a second change. Mutant (seen
-/// red): the unchanged path of `Registry::put_connection` and `put_binding` committing a
+/// Catches a retry of a PUT whose answer was lost making a second change. Also
+/// catches: the unchanged path of `Registry::put_connection` and `put_binding` committing a
 /// generation bump, so the retry moves the generation and every node is told of a
 /// registration that is the same as the one it holds.
 ///

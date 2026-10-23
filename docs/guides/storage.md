@@ -311,15 +311,20 @@ version 1.
 A start with a hot store raises the log straight to version 5, so it takes the version 2
 commands with it.
 
-A raise is permanent. A binary that does not run the log's version refuses the log at that
-entry. So **rolling back to an older build is possible only if the older build runs the
-log's version.** Version 5, for example, cannot be opened by a build that runs version 4.
-`kbf --version --json` prints `meta_log`, the highest version a build runs; compare it
-across two builds before you go back.
+A raise is permanent. From this build on, a binary that does not run the log's version
+skips the raise and keeps the version and format the log had reached before it. Decoding
+does not depend on the version, so it applies every command it knows and skips any command
+it does not know (one that a later build added). An entry that is not a well-formed message
+still refuses the log. What a skipped entry did is lost to that binary, so **rolling back
+to an older build loses nothing only if the older build knows every command the log
+holds.** A build that predates skipping refuses the log at the raise, so it cannot be
+rolled back to at all. `kbf --version --json` prints `meta_log`, the highest version a
+build runs; compare it across two builds before you go back.
 
-To roll back past a raise, restore a copy of the metadata directory that was taken before
-the raise. A byte copy of every file in the directory, taken while the server is stopped,
-is a valid backup. `kbf-deploy linux meta-backup` takes one and `meta-verify` checks it; see
+To roll back past a raise without that loss, or to a build that predates skipping, restore
+a copy of the metadata directory that was taken before the raise. A byte copy of every file
+in the directory, taken while the server is stopped, is a valid backup.
+`kbf-deploy linux meta-backup` takes one and `meta-verify` checks it; see
 [the storage node guide](../deploy/storage-node.md#metadata-backup-and-restore). A backup is
 refused unless the write tier has nothing unflushed. Never start a restored copy against a
 live server's object store: it shares the log's id and its object-key epochs.

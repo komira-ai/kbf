@@ -232,7 +232,7 @@ async fn authentication_failures_say_what_failed() {
 }
 
 /// Catches a layer whose bytes are not the manifest's digest being used (the "wrong blob
-/// digest accepted" mutant): same length and different length, in the first and the
+/// digest accepted" defect): same length and different length, in the first and the
 /// last layer, each an error naming the blob, with no file left from the fetch.
 #[tokio::test]
 async fn a_tampered_layer_is_refused_and_nothing_is_left() {
@@ -298,7 +298,7 @@ async fn a_tampered_config_or_manifest_is_refused() {
     assert!(matches!(got, Err(Error::ManifestDigest { .. })), "{got:?}");
 }
 
-/// Catches an image index being used (the "index accepted" mutant): the pin names an
+/// Catches an image index being used (the "index accepted" defect): the pin names an
 /// index, and the registry serves one.
 #[tokio::test]
 async fn an_image_index_is_refused() {
