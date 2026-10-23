@@ -48,7 +48,7 @@ use kbf_front::{Backend, Dispatch, Finished, Recorder, Stage, Submission, Ticket
 use kbf_meta::ActionRecord;
 use kbf_proto::google::rpc;
 use kbf_proto::reapi::ActionResult;
-use kbf_proto::update::{UpdateOrder, UpdateStatus};
+use kbf_proto::update::UpdateStatus;
 use kbf_proto::worker::{
     self, LeaseOffer, NodeStatus, ResultAck, ResultAckReason as Reason, ServerMessage, Start,
     server_message,
@@ -210,17 +210,6 @@ pub struct NodeLook {
     pub whole_machine_hold: bool,
     /// The newest `UpdateStatus` of its current stream; `None` before one.
     pub update: Option<UpdateReport>,
-}
-
-/// An order that did not reach a node.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum SendError {
-    /// The node never registered.
-    #[error("no node {0} has registered")]
-    Unknown(String),
-    /// Its newest stream is closed.
-    #[error("node {0} is not connected")]
-    NotConnected(String),
 }
 
 /// An OK result and its action-cache record, from the report to the answer.
@@ -728,22 +717,6 @@ impl Farm {
         }
         state.machine.report_update(worker, report);
         true
-    }
-
-    /// Sends `order` to `worker` on its newest stream.
-    ///
-    /// # Errors
-    /// [`SendError`]: the node never registered, or its stream is closed.
-    pub fn send_order(&self, worker: &WorkerId, order: UpdateOrder) -> Result<(), SendError> {
-        let state = self.lock();
-        let link = state
-            .links
-            .get(worker)
-            .ok_or_else(|| SendError::Unknown(worker.to_string()))?;
-        let message = server_message::Message::UpdateOrder(order);
-        link.outbound
-            .send(Ok(crate::worker::message(message)))
-            .map_err(|_| SendError::NotConnected(worker.to_string()))
     }
 
     /// Every node registered since this farm started, as the update node step reads it, in

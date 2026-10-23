@@ -37,7 +37,7 @@ pub enum Command {
     /// timer. Section 5.1 also says "never retry", which this controller keeps in the sense
     /// that it never orders a second activation: it gives the *same* order id again at every
     /// look until the order is taken or the step's activate limit holds the run, and never
-    /// draws a new id for the host ([`super::Transport::activate`]). A helper acts on an id
+    /// draws a new id for the host. A helper acts on an id
     /// once, so the repeat cannot swap twice. That is a choice the design leaves open.
     Activate {
         /// The id of the order; the helper's status names it.
