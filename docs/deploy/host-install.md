@@ -407,7 +407,7 @@ drop as the attestation check) in a directory that `nobody` owns inside the stag
 own `HOME`:
 
 1. lists the repository's releases with `gh api`, 100 a page, newest first, page after page until
-   a page is not full, and at most 30 pages; never only the latest, so a rollback to an old release
+   a page is empty, and at most 30 pages (an empty page ends it; a short one does not); never only the latest, so a rollback to an old release
    works;
 2. finds the asset named `kbf-<40 hex>-darwin-arm64.tar.gz` whose commit starts with the 12 hex
    digits of the version, across all the pages read. None is `unknown_release`; assets of two
@@ -449,8 +449,9 @@ launchd, and no stage left behind.
   releases (an old attested release is installable, as with a directory) or withhold one (the
   install fails). What it picks must still pass the attestation for the full commit.
 - A request costs one API call per 100 releases plus the download's, against GitHub's rate limit
-  for the token (or the address, without one). A listing longer than 3000 releases does not show
-  its oldest releases.
+  for the token (or the address, without one). A listing of about 3000 releases or more does not
+  show its oldest releases, so whoever can publish many releases can make a rollback to an old
+  one fail (`fetch_failed`); it cannot make a wrong release install.
 - The size limit is watched about every 10 ms, so a fast download can write a little past it
   before it is killed; the copy then refuses the file, and the stage is removed.
 - A channel with `sums` pins the commit and the tarball's hash, and needs an edit of the sums file

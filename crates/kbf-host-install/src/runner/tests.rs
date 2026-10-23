@@ -324,6 +324,44 @@ fn writes(dir: &std::path::Path, file: &str, blocks: u32, max: u64) -> Cmd {
     }
 }
 
+/// Catches output that is held in memory whole: a child that prints far more than the cap
+/// still succeeds (it is not blocked on a full pipe), the caller gets the cap and one byte
+/// more, which shows the output was longer, and a quiet or short child is untouched.
+#[test]
+fn output_past_its_cap_is_dropped_and_the_child_still_finishes() {
+    let big = Cmd {
+        stdout_max: Some(1000),
+        ..within(
+            "/usr/bin/head",
+            &["-c", "50000000", "/dev/zero"],
+            Duration::from_secs(60),
+        )
+    };
+    let exec = SystemRunner.run(&big).unwrap();
+    assert!(exec.success());
+    assert_eq!(exec.stdout.len(), 1001);
+
+    let short = Cmd {
+        stdout_max: Some(1000),
+        ..within(
+            "/usr/bin/head",
+            &["-c", "1000", "/dev/zero"],
+            Duration::from_secs(60),
+        )
+    };
+    assert_eq!(SystemRunner.run(&short).unwrap().stdout.len(), 1000);
+
+    // Standard error is kept up to a fixed amount.
+    let noisy = within(
+        "/bin/sh",
+        &["-c", "/usr/bin/head -c 20000000 /dev/zero >&2"],
+        Duration::from_secs(60),
+    );
+    let exec = SystemRunner.run(&noisy).unwrap();
+    assert!(exec.success());
+    assert_eq!(exec.stderr.len(), 1024 * 1024 + 1);
+}
+
 fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
     let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
     std::fs::create_dir_all(&target).unwrap();

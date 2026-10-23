@@ -617,7 +617,9 @@ fn darwin_commits(page: &serde_json::Value) -> Vec<String> {
 /// a tarball that is not the attested one. When the repository has published no darwin
 /// release yet, the listing must be empty, the fetch must say unknown, and the same
 /// verification runs on the newest attested build of `main` (its workflow artifact); the
-/// capture `fetch_mode` says which of the two happened.
+/// capture `fetch_mode` says which of the two happened, and a workflow warning is printed for
+/// the second. A repository that has published any release but none with a darwin tarball
+/// fails the test.
 #[test]
 #[ignore = "needs a Mac, root and the network: cargo xtask sudo-test"]
 fn a_real_release_is_fetched_as_nobody_and_verified() {
@@ -665,6 +667,7 @@ fn a_real_release_is_fetched_as_nobody_and_verified() {
 
     // The newest release with a darwin tarball, from the real listing.
     let mut newest = None;
+    let mut published = 0_usize;
     for page in 1..=MAX_PAGES {
         let exec = run(&fetcher.list_cmd(page));
         if page == 1 {
@@ -674,6 +677,12 @@ fn a_real_release_is_fetched_as_nobody_and_verified() {
         let listing: serde_json::Value = serde_json::from_slice(&exec.stdout).unwrap();
         newest = darwin_commits(&listing).into_iter().next();
         let count = listing.as_array().map_or(0, Vec::len);
+        published += listing
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|release| release["draft"] != true)
+            .count();
         if newest.is_some() || count < 100 {
             break;
         }
@@ -700,8 +709,18 @@ fn a_real_release_is_fetched_as_nobody_and_verified() {
         );
         (tarball, bundle, commit)
     } else {
+        // The stand-in is for a repository with no release at all: once one is published, a
+        // listing without a darwin tarball is a failure, not a reason to skip the fetch.
+        assert_eq!(
+            published, 0,
+            "the repository has {published} published release(s) but none has a darwin tarball"
+        );
         fs::create_dir_all(out_dir()).unwrap();
         fs::write(out_dir().join("fetch_mode"), "no-release\n").unwrap();
+        // A workflow annotation, so the run page says the fetch was not exercised.
+        println!(
+            "::warning title=host-install-mac::no published darwin release, so no release was fetched; only the attestation check ran, on the newest build of main"
+        );
         // The real listing has no darwin release: the fetch says so.
         assert_eq!(
             fetcher.fetch("000000000000", &scratch),

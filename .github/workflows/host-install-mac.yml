@@ -48,6 +48,8 @@ jobs:
       - run: sw_vers
       # The fetch test goes to GitHub as root, and sudo clears the environment: it reads the
       # workflow's own read-only token from this file.
+      - name: Token file of the fetch test, readable by its owner alone
+        run: install -m 0600 /dev/null /private/var/tmp/kbf-real-fetch-token
       - name: Token of the fetch test
         env:
           GH_TOKEN: ${{ github.token }}

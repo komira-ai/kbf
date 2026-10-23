@@ -68,6 +68,10 @@ pub struct Cmd {
     pub stdin: Vec<u8>,
     /// What the command may write, watched while it runs; none for no limit.
     pub write_cap: Option<WriteCap>,
+    /// How much of its standard output is kept: past this, one byte more is kept (so the
+    /// caller can see the output was longer) and the rest is read and dropped; none to keep
+    /// it all.
+    pub stdout_max: Option<usize>,
 }
 
 /// How a child ended and what it wrote.
@@ -116,14 +120,21 @@ const POLL: Duration = Duration::from_millis(10);
 /// the pipe open); what has not arrived by then is dropped.
 const DRAIN_GRACE: Duration = Duration::from_secs(1);
 
-/// A thread that reads `stream` to its end and sends what it read.
-fn drain<R: Read + Send + 'static>(stream: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+/// How much of a child's standard error is kept: it is only ever shown in a message.
+const STDERR_MAX: usize = 1024 * 1024;
+
+/// A thread that reads `stream` to its end and sends the first `keep` bytes and one more;
+/// the rest is read and dropped, so the child never blocks on a full pipe and memory stays
+/// bounded.
+fn drain<R: Read + Send + 'static>(stream: Option<R>, keep: usize) -> mpsc::Receiver<Vec<u8>> {
     let (send, receive) = mpsc::channel();
     thread::spawn(move || {
         let mut bytes = Vec::new();
         // A read that fails part way keeps what came before it.
         stream.into_iter().for_each(|mut stream| {
-            let _ = stream.read_to_end(&mut bytes);
+            let limit = u64::try_from(keep).map_or(u64::MAX, |k| k.saturating_add(1));
+            let _ = stream.by_ref().take(limit).read_to_end(&mut bytes);
+            let _ = io::copy(&mut stream, &mut io::sink());
         });
         let _ = send.send(bytes);
     });
@@ -272,8 +283,8 @@ impl Runner for SystemRunner {
             });
         }
         // Both streams are read while the child runs, or it blocks on a full pipe.
-        let stdout = drain(child.stdout.take());
-        let stderr = drain(child.stderr.take());
+        let stdout = drain(child.stdout.take(), cmd.stdout_max.unwrap_or(usize::MAX));
+        let stderr = drain(child.stderr.take(), STDERR_MAX);
         let status = match wait_watching(&mut child, cmd.timeout, cmd.write_cap.as_ref())? {
             Waited::Exited(status) => status,
             // Past its limit: kill it and reap it. A kill that fails means it just ended.

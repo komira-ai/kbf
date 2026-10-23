@@ -139,7 +139,7 @@ fn assert_untouched(fx: &Fx) {
 
 /// The version's digits pick the one release across the pages, an old release included: the
 /// first two pages are full and hold nothing of it, the third holds it, and the listing is
-/// read to its last page and no further.
+/// read until an empty page and no further.
 #[test]
 fn the_listing_picks_the_unique_asset_across_pages() {
     let fx = Fx::new("mac-gh-pages");
@@ -160,7 +160,7 @@ fn the_listing_picks_the_unique_asset_across_pages() {
         .collect();
     assert_eq!(
         listed,
-        [1, 2, 3].map(|n| format!("repos/komira-ai/kbf/releases?per_page=100&page={n}"))
+        [1, 2, 3, 4].map(|n| format!("repos/komira-ai/kbf/releases?per_page=100&page={n}"))
     );
     let download = &gh_calls(&fx, &sim, "release")[0];
     assert_eq!(download.args[2], "v0.1");
@@ -179,7 +179,23 @@ fn the_listing_picks_the_unique_asset_across_pages() {
             .commit,
         NEW
     );
-    assert_eq!(gh_calls(&fx, &sim, "api").len(), 2);
+    assert_eq!(gh_calls(&fx, &sim, "api").len(), 3);
+}
+
+/// A page with fewer than 100 releases is not the end of the listing: a second commit that
+/// starts with the same digits on the page after it still makes the release ambiguous.
+#[test]
+fn a_short_page_does_not_end_the_listing() {
+    let fx = Fx::new("mac-gh-short-page");
+    let sim = github(&fx);
+    sim.pages.borrow_mut().push(page(&[release(
+        "v2.0",
+        &[&format!("bbbbbbbbbbbb{}", "c".repeat(28))],
+    )]));
+    let result = run(&fx, &sim, &channel(&fx, false), NEW_VERSION);
+    assert_eq!(refusal(result), Refusal::AmbiguousRelease);
+    assert!(gh_calls(&fx, &sim, "release").is_empty());
+    assert_untouched(&fx);
 }
 
 /// No asset of a commit that starts with the digits is an unknown release, however many
@@ -565,7 +581,7 @@ fn the_attestation_is_still_checked_offline_after_a_fetch() {
         .filter(|c| c.program == fx.host.gh.to_str().unwrap())
         .map(|c| c.args[0].clone())
         .collect();
-    assert_eq!(verbs, ["api", "release", "attestation"]);
+    assert_eq!(verbs, ["api", "api", "release", "attestation"]);
     let attest = &gh_calls(&fx, &sim, "attestation")[0];
     let args = attest.args.join(" ");
     let stage_dir = fx.host.stage();
