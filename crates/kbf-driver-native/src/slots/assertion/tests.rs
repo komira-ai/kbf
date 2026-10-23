@@ -224,7 +224,7 @@ fn mounts_and_attached_images_under_the_users_folders_are_found() {
     let home = Path::new("/private/var/pool/u");
     let folders = Path::new("/private/var/folders/xx/yy");
     assert_eq!(
-        mount_lines(mount, &images, 61001, &[home, folders]),
+        mount_lines(mount, &images, (61001, "u"), &[home, folders]),
         lines(&[
             "mounted /private/var/folders/xx/yy/T/vol",
             "image /dev/disk4 attached by the uid",
@@ -236,12 +236,38 @@ fn mounts_and_attached_images_under_the_users_folders_are_found() {
         mount_lines(
             "/dev/d on / (apfs)\n",
             &images[2..3],
-            61001,
+            (61001, "u"),
             &[home, folders]
         )
         .is_empty()
     );
     assert!(hdiutil_images(b"not a plist").is_err());
+}
+
+/// Catches a mount the user made anywhere but under its own folders (an smb or nfs share
+/// on a directory in `/private/tmp`): macOS marks such a mount `mounted by <name>`, and
+/// that is a line, once, wherever the mount is; another user's mount, and a name that only
+/// starts like the user's, are not.
+#[test]
+fn a_mount_marked_as_mounted_by_the_user_is_found_wherever_it_is() {
+    let mount = "\
+//u@host/share on /private/tmp/share (smbfs, nodev, nosuid, mounted by u)
+//v@host/other on /private/tmp/other (smbfs, nodev, nosuid, mounted by v)
+//w@host/third on /private/tmp/third (smbfs, nodev, nosuid, mounted by uu)
+//u@host/under on /private/var/pool/u/mnt (smbfs, nodev, nosuid, mounted by u)
+";
+    let home = Path::new("/private/var/pool/u");
+    assert_eq!(
+        mount_lines(mount, &[], (61001, "u"), &[home]),
+        lines(&[
+            "mounted /private/var/pool/u/mnt",
+            "mounted /private/tmp/share by the user",
+        ])
+    );
+    assert_eq!(
+        mounted_by(mount, "v"),
+        vec![PathBuf::from("/private/tmp/other")]
+    );
 }
 
 /// Catches an ACL on the home read as the listing's first line (the directory itself),
@@ -333,7 +359,15 @@ fn the_entry_keeps_its_four_folders_empty_and_nothing_else() {
     let kept = |name: &str| (name.to_owned(), true, facts());
     let skeleton = ["0", "C", "T", "X"];
     let clean = entry_lines(&root, &[kept("0"), kept("C"), kept("T")], &skeleton, 61001);
-    assert_eq!(clean, lines(&[". owned by 61001:20 mode 755 flags 0x0"]));
+    assert_eq!(
+        clean,
+        lines(&[
+            ". owned by 61001:20 mode 755 flags 0x0",
+            ". 0 mode 700",
+            ". C mode 700",
+            ". T mode 700",
+        ])
+    );
     let full = (
         "T".to_owned(),
         true,
@@ -363,10 +397,13 @@ fn the_entry_keeps_its_four_folders_empty_and_nothing_else() {
         found,
         lines(&[
             ". owned by 61001:20 mode 755 flags 0x0",
+            ". T mode 700",
             "T: entry leak",
             "stray: not part of the entry",
             "Z: not part of the entry",
+            ". 0 mode 700",
             "0: owned by 0",
+            ". C mode 700",
             "C: flags 0x2",
         ])
     );
@@ -413,6 +450,82 @@ fn a_baseline_is_recorded_only_of_a_clean_user_and_every_probe() {
     assert!(wrong[0].starts_with("ipc: cannot run"), "{wrong:?}");
 }
 
+/// Catches a baseline of a recorded probe that accepts a wrong state as a recorded fact:
+/// a home with another mode or a file in it, and an entry with a name that is not one of
+/// its folders, are not baselines (the user is not clean), while a home with an ACL or an
+/// extended attribute is, and a later home without it differs.
+#[test]
+fn a_recorded_baseline_holds_facts_and_not_a_wrong_state() {
+    for (probe, wrong) in [
+        (Probe::Home, "mode 755, not 700"),
+        (Probe::Home, "entry leftover"),
+        (Probe::Home, "flags 0x2"),
+        (Probe::Entry, "stray: not part of the entry"),
+        (Probe::Entry, "T: entry leak"),
+    ] {
+        let user = Fake::clean();
+        let mut found = clean_lines(probe);
+        found.push(wrong);
+        user.set(probe, &found);
+        assert_eq!(
+            record(&user).expect_err("not a baseline"),
+            lines(&[&format!("{probe}: + {wrong}")]),
+            "{probe}"
+        );
+    }
+    let user = Fake::clean();
+    user.set(
+        Probe::Home,
+        &[
+            "acl 0: group:everyone deny delete",
+            "xattr com.apple.provenance",
+        ],
+    );
+    user.set(
+        Probe::Entry,
+        &[
+            ". owned by 61001:20 mode 700 flags 0x0",
+            ". T xattr com.apple.x",
+        ],
+    );
+    let base = record(&user).expect("facts are recorded");
+    assert!(assert(&user, Some(&base), &ALL, &|| false).is_empty());
+    // The attribute gone and a new one are both differences.
+    let now = Fake::clean();
+    now.set(
+        Probe::Home,
+        &["acl 0: group:everyone deny delete", "xattr kbf.new"],
+    );
+    now.set(
+        Probe::Entry,
+        &[
+            ". owned by 61001:20 mode 700 flags 0x0",
+            ". T xattr com.apple.x",
+        ],
+    );
+    assert_eq!(
+        assert(&now, Some(&base), &[Probe::Home, Probe::Entry], &|| false),
+        lines(&[
+            "home: + xattr kbf.new",
+            "home: - xattr com.apple.provenance"
+        ])
+    );
+}
+
+/// Catches a check that goes on reading after the lease was killed: once `stopped` says
+/// so no further probe runs, and the result is red and says why.
+#[test]
+fn a_stopped_check_reads_no_further_probe() {
+    let base = baseline();
+    let reads = std::cell::Cell::new(0);
+    let red = assert(&Fake::clean(), Some(&base), &CHEAP, &|| {
+        reads.set(reads.get() + 1);
+        reads.get() > 2
+    });
+    assert_eq!(reads.get(), 3);
+    assert_eq!(red, lines(&["ipc: not read, the check was stopped"]));
+}
+
 /// Catches a comparison that tolerates nothing launchd varies (a pid, a service loaded
 /// on demand, a service that was not loaded yet) and one that tolerates too much: the
 /// services differ from the baseline's and the user is still clean, while a foreign job,
@@ -424,7 +537,7 @@ fn the_comparison_tolerates_launchds_services_and_nothing_a_lease_can_make() {
     let now = Fake::clean();
     now.set(Probe::Services, &["com.apple.other.agent"]);
     assert!(
-        assert(&now, Some(&base), &ALL).is_empty(),
+        assert(&now, Some(&base), &ALL, &|| false).is_empty(),
         "launchd's own services vary"
     );
     let cases: [(Probe, &[&str], &str); 8] = [
@@ -456,12 +569,12 @@ fn the_comparison_tolerates_launchds_services_and_nothing_a_lease_can_make() {
     for (probe, found, line) in cases {
         let now = Fake::clean();
         now.set(probe, found);
-        let red = assert(&now, Some(&base), &ALL);
+        let red = assert(&now, Some(&base), &ALL, &|| false);
         assert!(red.contains(&line.to_owned()), "{probe}: {red:?}");
     }
     let now = Fake::clean();
     now.set(Probe::Record, &["id uid=61001(u) gid=20(staff)"]);
-    let red = assert(&now, Some(&base), &[Probe::Record]);
+    let red = assert(&now, Some(&base), &[Probe::Record], &|| false);
     assert_eq!(
         red,
         lines(&["record: - UniqueID=61001"]),
@@ -469,7 +582,7 @@ fn the_comparison_tolerates_launchds_services_and_nothing_a_lease_can_make() {
     );
     let now = Fake::clean();
     now.set(Probe::Entry, &[". owned by 61001:20 mode 700 flags 0x2"]);
-    let red = assert(&now, Some(&base), &[Probe::Entry]);
+    let red = assert(&now, Some(&base), &[Probe::Entry], &|| false);
     assert_eq!(
         red,
         lines(&[
@@ -487,7 +600,7 @@ fn a_probe_that_cannot_run_or_has_no_baseline_is_red() {
     for probe in ALL {
         let now = Fake::clean();
         now.fail(probe, "boom");
-        let red = assert(&now, Some(&base), &[probe]);
+        let red = assert(&now, Some(&base), &[probe], &|| false);
         assert_eq!(red.len(), 1, "{probe}: {red:?}");
         assert!(
             red[0].starts_with(&format!("{probe}: cannot run")),
@@ -498,16 +611,18 @@ fn a_probe_that_cannot_run_or_has_no_baseline_is_red() {
     let red = assert(
         &Fake::clean(),
         None,
-        &[Probe::Entry, Probe::Record, Probe::Ipc],
+        &[Probe::Home, Probe::Entry, Probe::Record, Probe::Ipc],
+        &|| false,
     );
     assert_eq!(
         red,
         lines(&[
+            "home: no baseline to compare with",
             "entry: no baseline to compare with",
             "record: no baseline to compare with"
         ])
     );
-    assert!(assert(&Fake::clean(), None, &[Probe::Ipc]).is_empty());
+    assert!(assert(&Fake::clean(), None, &[Probe::Ipc], &|| false).is_empty());
 }
 
 /// Catches a cheap subset that leaves out one of the probes a slot is handed over with
@@ -551,7 +666,7 @@ impl Slotted for Slot {
 fn asserted_book(world: &Arc<Fake>, base: &Arc<Snapshot>) -> Arc<Book<Slot>> {
     let (world, base) = (Arc::clone(world), Arc::clone(base));
     let cleaner: Cleaner<Slot> = Arc::new(move |_: &Slot| {
-        let red = assert(world.as_ref(), Some(&base), &ALL);
+        let red = assert(world.as_ref(), Some(&base), &ALL, &|| false);
         if red.is_empty() {
             Outcome::Clean
         } else {
@@ -600,7 +715,7 @@ async fn a_slot_that_fails_the_assertion_at_slot_ready_is_set_aside() {
     let (index, permit) = book.take().await.expect("a slot");
     // What a lease finds at slot-ready: a mount that was not there at the clean.
     world.set(Probe::Mounts, &["mounted /private/var/folders/x/T/vol"]);
-    let red = assert(world.as_ref(), Some(&base), &CHEAP);
+    let red = assert(world.as_ref(), Some(&base), &CHEAP, &|| false);
     assert_eq!(
         red,
         lines(&["mounts: + mounted /private/var/folders/x/T/vol"])

@@ -1,7 +1,11 @@
 //! The assertion that a pool user holds nothing a lease left, for real: the baseline is
 //! recorded when the slots start, a clean user passes every probe, a state planted as
 //! the user (a process, a launchd job, a System V semaphore, an attached disk image, a
-//! file in the home, a file in `/private/tmp`, a cron job) turns the probe that looks
+//! file in the home, a file in `/private/tmp`, a cron job; and for the finer probes a
+//! changed mode, flag, ACL or attribute of the home, a stray file and a changed folder in
+//! the `/var/folders` entry, a changed directory record, a mount under the home, a crash
+//! report in a shared folder, a process with only its effective uid, and a job that
+//! writes the path of a system plist into its own description) turns the probe that looks
 //! for it red, and the clean that follows removes it and the assertion is green again.
 //! A slot that fails the assertion at slot-ready is set aside and comes back once a
 //! clean passes the assertion.
@@ -24,6 +28,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use kbf_driver_native::NativeRuntime;
@@ -39,8 +44,16 @@ fn assert_root() {
 /// A pool of one user, started the way the daemon starts it: the clean, the warm-up and
 /// the baseline.
 fn start(name: &str) -> (Users, Scratch, Slots) {
+    start_prepared(name, None)
+}
+
+/// [`start`] after `prepare` ran for the user.
+fn start_prepared(name: &str, prepare: Option<fn(&SlotUser)>) -> (Users, Scratch, Slots) {
     assert_root();
     let users = Users::new(name, 1);
+    if let Some(prepare) = prepare {
+        prepare(&users.0[0]);
+    }
     let scratch = Scratch::new(name);
     let pool = users.pool();
     let slots = Slots::start(&pool, Duration::from_secs(10)).expect("slots");
@@ -102,6 +115,9 @@ struct Control {
     red: &'static str,
     /// Whether the cheap probes, run at slot-ready, must see it too.
     cheap: bool,
+    /// Run for the user before the slots start, so that what the plant needs exists in the
+    /// baseline.
+    prepare: Option<fn(&SlotUser)>,
 }
 
 /// The positive control of one probe. With a pool of one user: the assertion is green;
@@ -111,7 +127,7 @@ struct Control {
 /// assertion is green. `plant` returns what to say when it fails to plant, and a
 /// substring the red line must carry.
 async fn red_then_green(control: Control, plant: impl FnOnce(&SlotUser, &Scratch) -> String) {
-    let (users, scratch, slots) = start(control.name);
+    let (users, scratch, slots) = start_prepared(control.name, control.prepare);
     let user = users.0[0].clone();
     assert_eq!(
         slots.count(),
@@ -186,6 +202,7 @@ async fn a_lingering_process_is_seen_then_cleaned() {
         name: "assert-proc",
         red: "processes: + ",
         cheap: true,
+        prepare: None,
     };
     red_then_green(control, |user, _| {
         let sleeper = support::pool::sleeper(Some(user));
@@ -263,6 +280,7 @@ async fn a_launch_agent_is_seen_then_cleaned() {
         name: "assert-agent",
         red: "launchd: + job ",
         cheap: true,
+        prepare: None,
     };
     red_then_green(control, |user, scratch| {
         bootstrap(
@@ -284,6 +302,7 @@ async fn a_semaphore_is_seen_then_cleaned() {
         name: "assert-sem",
         red: "ipc: + s ",
         cheap: true,
+        prepare: None,
     };
     red_then_green(control, |user, _| {
         let id = semaphore_of(user);
@@ -345,6 +364,7 @@ async fn an_attached_image_is_seen_then_cleaned() {
         name: "assert-image",
         red: "mounts: + image ",
         cheap: true,
+        prepare: None,
     };
     red_then_green(control, |user, scratch| {
         let image: PathBuf = scratch.0.join("assert.dmg");
@@ -384,6 +404,7 @@ async fn a_file_in_the_home_is_seen_then_cleaned() {
         name: "assert-home",
         red: "home: + entry ",
         cheap: true,
+        prepare: None,
     };
     red_then_green(control, |user, _| {
         let file = home_of(user).join("kbf-assert-file");
@@ -414,6 +435,7 @@ async fn a_file_in_private_tmp_is_seen_then_cleaned() {
         name: "assert-tmp",
         red: "shared: + ",
         cheap: false,
+        prepare: None,
     };
     red_then_green(control, |user, _| {
         let path = format!("/private/tmp/{name}");
@@ -432,6 +454,7 @@ async fn a_cron_job_is_seen_then_cleaned() {
         name: "assert-cron",
         red: "schedules: + ",
         cheap: false,
+        prepare: None,
     };
     red_then_green(control, |user, _| {
         let mut crontab = Command::new("/usr/bin/crontab")
@@ -502,7 +525,8 @@ async fn a_slot_that_fails_the_check_at_slot_ready_is_set_aside_and_comes_back()
 /// Catches a lease that runs on a user the slot-ready check would refuse (the runtime
 /// never calls the check, or ignores its answer): with one slot, a process of the user
 /// started after the start-up clean makes the first slot fail the check, the lease waits
-/// for the recovery thread (its first pass is 5 s after the slot goes dirty), and it
+/// for the recovery thread (its first pass is [`FIRST_RECOVERY_PASS`] after the slot
+/// goes dirty), and it
 /// runs only on the cleaned user: the process is already dead, killed by that clean and
 /// not by the clean after the lease, and the lease took longer than a lease that is not
 /// held up.
@@ -526,8 +550,461 @@ async fn a_lease_waits_for_a_slot_that_fails_the_check_to_be_cleaned() {
         ended.is_some_and(|status| !status.success()),
         "the lease ran before the user was cleaned: {ended:?}"
     );
+    // The recovery thread's first pass over a slot is that long after the slot went dirty;
+    // a lease that was not held up for it took a fraction of a second.
+    let first_pass = kbf_driver_native::slots::macos::FIRST_RECOVERY_PASS;
     assert!(
-        took >= Duration::from_secs(4),
-        "the lease was not held up for the recovery: {took:?}"
+        took >= first_pass.saturating_sub(Duration::from_secs(1)),
+        "the lease was not held up for the recovery ({first_pass:?}): {took:?}"
     );
+}
+
+/// `getconf <name>` as `user`: a path, which the system makes when it is asked.
+fn getconf(user: &SlotUser, name: &str) -> PathBuf {
+    let (ok, said) = as_user(user, "/usr/bin/getconf", &[name]);
+    assert!(ok, "getconf {name}: {said}");
+    PathBuf::from(said.trim())
+}
+
+/// The user's `/var/folders` entry: the parent of its `DARWIN_USER_DIR`.
+fn entry_of(user: &SlotUser) -> PathBuf {
+    let dir = getconf(user, "DARWIN_USER_DIR");
+    let parent = dir.parent().expect("an entry").to_owned();
+    std::fs::canonicalize(parent).expect("the entry exists")
+}
+
+/// Makes the folders of the entry before the slots start, so that the baseline has them.
+fn make_entry(user: &SlotUser) {
+    getconf(user, "DARWIN_USER_DIR");
+    getconf(user, "DARWIN_USER_TEMP_DIR");
+}
+
+/// Catches an entry probe that cannot see a name in the entry root that is not one of its
+/// folders (the clean removes it whole; the probe is what shows it did).
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_assert"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stray_file_in_the_entry_is_seen_then_cleaned() {
+    let control = Control {
+        name: "assert-entry-stray",
+        red: "entry: + ",
+        cheap: true,
+        prepare: Some(make_entry),
+    };
+    red_then_green(control, |user, _| {
+        let file = entry_of(user).join("kbf-assert-stray");
+        std::fs::write(&file, b"left").expect("file");
+        std::os::unix::fs::chown(&file, Some(user.uid), Some(user.gid)).expect("chown");
+        "kbf-assert-stray: not part of the entry".to_owned()
+    })
+    .await;
+}
+
+/// Catches an entry probe that looks at the entry root only: a file in one of its folders
+/// (`T`, the user's temporary folder) is a line of its own.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_assert"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_in_an_entry_folder_is_seen_then_cleaned() {
+    let control = Control {
+        name: "assert-entry-folder",
+        red: "entry: + ",
+        cheap: true,
+        prepare: Some(make_entry),
+    };
+    red_then_green(control, |user, _| {
+        let file = getconf(user, "DARWIN_USER_TEMP_DIR").join("kbf-assert-leak");
+        std::fs::write(&file, b"left").expect("file");
+        std::os::unix::fs::chown(&file, Some(user.uid), Some(user.gid)).expect("chown");
+        "T: entry kbf-assert-leak".to_owned()
+    })
+    .await;
+}
+
+/// Catches an entry probe that does not record the mode of a folder: `0` is made 755.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_assert"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_mode_of_an_entry_folder_is_seen_then_cleaned() {
+    let control = Control {
+        name: "assert-entry-mode",
+        red: "entry: + ",
+        cheap: true,
+        prepare: Some(make_entry),
+    };
+    red_then_green(control, |user, _| {
+        let folder = getconf(user, "DARWIN_USER_DIR");
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        ". 0 mode 755".to_owned()
+    })
+    .await;
+}
+
+/// Catches an entry probe that does not read the extended attributes of a folder (the
+/// descriptor-based `flistxattr` of the reader), and a clean that leaves one.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_assert"]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attribute_on_an_entry_folder_is_seen_then_cleaned() {
+    let control = Control {
+        name: "assert-entry-xattr",
+        red: "entry: + ",
+        cheap: true,
+        prepare: Some(make_entry),
+    };
+    red_then_green(control, |user, _| {
+        let folder = getconf(user, "DARWIN_USER_DIR");
+        let (ok, said) = root(
+            "/usr/bin/xattr",
+            &["-w", "kbf.assert", "x", &folder.to_string_lossy()],
+        );
+        assert!(ok, "xattr: {said}");
+        ". 0 xattr kbf.assert".to_owned()
+    })
+    .await;
+}
+
+/// Catches a home probe that does not compare the mode (755 instead of 700).
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_assert"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_mode_of_the_home_is_seen_then_cleaned() {
+    let control = Control {
+        name: "assert-home-mode",
+        red: "home: + ",
+        cheap: true,
+        prepare: None,
+    };
+    red_then_green(control, |user, _| {
+        std::fs::set_permissions(home_of(user), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        "mode 755, not 700".to_owned()
+    })
+    .await;
+}
+
+/// Catches a home probe that cannot read the extended attributes of the home (a wrong
+/// `flistxattr` call returns none), and a clean that leaves one.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_assert"]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attribute_on_the_home_is_seen_then_cleaned() {
+    let control = Control {
+        name: "assert-home-xattr",
+        red: "home: + ",
+        cheap: true,
+        prepare: None,
+    };
+    red_then_green(control, |user, _| {
+        let (ok, said) = root(
+            "/usr/bin/xattr",
+            &["-w", "kbf.assert", "x", &home_of(user).to_string_lossy()],
+        );
+        assert!(ok, "xattr: {said}");
+        "xattr kbf.assert".to_owned()
+    })
+    .await;
+}
+
+/// Catches a home probe that cannot read an ACL from `ls -led` (a changed format or a
+/// wrong skip of the first line), and a clean that leaves one.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_assert"]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acl_on_the_home_is_seen_then_cleaned() {
+    let control = Control {
+        name: "assert-home-acl",
+        red: "home: + acl ",
+        cheap: true,
+        prepare: None,
+    };
+    red_then_green(control, |user, _| {
+        let (ok, said) = root(
+            "/bin/chmod",
+            &[
+                "+a",
+                "everyone deny delete",
+                &home_of(user).to_string_lossy(),
+            ],
+        );
+        assert!(ok, "chmod +a: {said}");
+        "deny delete".to_owned()
+    })
+    .await;
+}
+
+/// Catches a home probe that does not read the flags (`uchg` locks the home).
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_assert"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flag_on_the_home_is_seen_then_cleaned() {
+    let control = Control {
+        name: "assert-home-flag",
+        red: "home: + ",
+        cheap: true,
+        prepare: None,
+    };
+    red_then_green(control, |user, _| {
+        let (ok, said) = root(
+            "/usr/bin/chflags",
+            &["uchg", &home_of(user).to_string_lossy()],
+        );
+        assert!(ok, "chflags: {said}");
+        "flags 0x2".to_owned()
+    })
+    .await;
+}
+
+/// The home as a system tool makes it can carry an ACL and an extended attribute. Catches
+/// a baseline that demands a home with none (the slot would start dirty, and stay so):
+/// with both on the home before the start, the slot is offered, and green at every look.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_assert"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_home_made_with_an_attribute_and_an_acl_starts_clean() {
+    fn mark(user: &SlotUser) {
+        let home = home_of(user).to_string_lossy().into_owned();
+        let (ok, said) = root(
+            "/usr/bin/xattr",
+            &["-w", "com.apple.provenance", "x", &home],
+        );
+        assert!(ok, "xattr: {said}");
+        let (ok, said) = root("/bin/chmod", &["+a", "everyone deny delete", &home]);
+        assert!(ok, "chmod +a: {said}");
+    }
+    let (_users, scratch, slots) = start_prepared("assert-home-made", Some(mark));
+    assert_eq!(slots.count(), 1, "the slot started dirty");
+    let slot = slots.take().await.expect("a slot");
+    let all = slot.assert_everything().await.expect("ran");
+    assert!(all.is_empty(), "{all:?}");
+    let ready = slot.assert_ready(&scratch.0).await.expect("ran");
+    assert!(ready.is_empty(), "{ready:?}");
+    slot.release().await;
+}
+
+/// Sets `UserShell` of a user's directory record back when dropped (the clean does not
+/// repair the record), so a failed test leaves the user as it was.
+struct ShellBack {
+    record: String,
+    was: Option<String>,
+}
+
+impl Drop for ShellBack {
+    fn drop(&mut self) {
+        let _ = match &self.was {
+            Some(shell) => root(
+                "/usr/bin/dscl",
+                &[".", "-create", &self.record, "UserShell", shell],
+            ),
+            None => root(
+                "/usr/bin/dscl",
+                &[".", "-delete", &self.record, "UserShell"],
+            ),
+        };
+    }
+}
+
+/// Catches a record probe that does not read the directory record (a constant, or an
+/// `id` only): a changed `UserShell` is a line that is new and one that is gone, and the
+/// record is green again once it is put back.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_assert"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_directory_record_is_seen_and_green_again_when_restored() {
+    let (users, _scratch, slots) = start("assert-record");
+    let user = users.0[0].clone();
+    let slot = slots.take().await.expect("a slot");
+    let record = format!("/Users/{}", user.name);
+    let (_, read) = root("/usr/bin/dscl", &[".", "-read", &record, "UserShell"]);
+    let was = read
+        .strip_prefix("UserShell:")
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+    let _back = ShellBack {
+        record: record.clone(),
+        was: was.clone(),
+    };
+    let (ok, said) = root(
+        "/usr/bin/dscl",
+        &[".", "-create", &record, "UserShell", "/usr/bin/false"],
+    );
+    assert!(ok, "dscl -create: {said}");
+    let red = slot.assert_everything().await.expect("ran");
+    assert!(
+        red.iter()
+            .any(|l| l == "record: + UserShell=/usr/bin/false"),
+        "{red:?}"
+    );
+    assert!(
+        red.iter()
+            .any(|l| l.starts_with("record: - UserShell=") && !l.contains("false")),
+        "{red:?}"
+    );
+    drop(_back);
+    let green = slot.assert_everything().await.expect("ran");
+    assert!(green.is_empty(), "{green:?}");
+    slot.release().await;
+}
+
+/// Detaches a disk image when dropped.
+struct Detach(Mutex<Option<String>>);
+
+impl Drop for Detach {
+    fn drop(&mut self) {
+        let device = self.0.lock().ok().and_then(|mut d| d.take());
+        if let Some(device) = device {
+            let _ = root("/usr/bin/hdiutil", &["detach", "-force", &device]);
+        }
+    }
+}
+
+/// Catches a mount probe that cannot see a filesystem mounted under the home (the clean
+/// unmounts it): an image attached by root with its mount point in the home.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_assert"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mount_under_the_home_is_seen_then_cleaned() {
+    let detach = Arc::new(Detach(Mutex::new(None)));
+    let control = Control {
+        name: "assert-mount",
+        red: "mounts: + mounted ",
+        cheap: true,
+        prepare: None,
+    };
+    let device = Arc::clone(&detach);
+    red_then_green(control, move |user, scratch| {
+        let image: PathBuf = scratch.0.join("mount.dmg");
+        let path = image.to_string_lossy().into_owned();
+        let (made, said) = root(
+            "/usr/bin/hdiutil",
+            &[
+                "create", "-quiet", "-size", "1m", "-fs", "HFS+", "-volname", "kbfmount", &path,
+            ],
+        );
+        assert!(made, "hdiutil create: {said}");
+        let point = home_of(user).join("kbf-mnt");
+        std::fs::create_dir(&point).expect("mount point");
+        std::os::unix::fs::chown(&point, Some(user.uid), Some(user.gid)).expect("chown");
+        let (attached, said) = root(
+            "/usr/bin/hdiutil",
+            &[
+                "attach",
+                "-nobrowse",
+                "-mountpoint",
+                &point.to_string_lossy(),
+                &path,
+            ],
+        );
+        assert!(attached, "hdiutil attach: {said}");
+        let whole = said
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().next())
+            .map(str::to_owned);
+        *device.0.lock().expect("lock") = whole;
+        "kbf-mnt".to_owned()
+    })
+    .await;
+    drop(detach);
+}
+
+/// Catches a shared-places probe that does not look in the crash folders: a report that
+/// names the user's uid, written by root as the crash reporter does, in the system's
+/// `DiagnosticReports`.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_assert"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crash_report_naming_the_user_is_seen_then_cleaned() {
+    let folder = Path::new("/Library/Logs/DiagnosticReports");
+    std::fs::create_dir_all(folder).expect("reports");
+    let report = folder.join(format!("kbf-assert-{}.ips", std::process::id()));
+    let _guard = Remove(report.clone());
+    let control = Control {
+        name: "assert-crash",
+        red: "shared: + ",
+        cheap: false,
+        prepare: None,
+    };
+    red_then_green(control, |user, _| {
+        std::fs::write(
+            &report,
+            format!(
+                "{{\"app_name\":\"canary\",\"bug_type\":\"309\"}}\n{{\"pid\":912,\"userID\":{},\"procName\":\"canary\"}}\n",
+                user.uid
+            ),
+        )
+        .expect("report");
+        report.to_string_lossy().into_owned()
+    })
+    .await;
+}
+
+/// Catches a process probe that matches the real uid only: a process whose real uid is
+/// root and whose effective uid is the user's (a setuid program that dropped half of its
+/// rights) is a finding, and the assertion is green once it is ended.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_assert"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_process_with_only_the_effective_uid_of_the_user_is_seen() {
+    let (users, _scratch, slots) = start("assert-euid");
+    let user = users.0[0].clone();
+    let slot = slots.take().await.expect("a slot");
+    let uid = user.uid;
+    let mut command = Command::new("/bin/sleep");
+    command.arg("300").stdin(Stdio::null());
+    // SAFETY: the closure calls only `seteuid`, which is async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::seteuid(uid) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let mut child = command.spawn().expect("sleep");
+    let pid = child.id();
+    let red = slot.assert_everything().await.expect("ran");
+    let wanted = format!("processes: + {pid} /bin/sleep");
+    let seen = red.contains(&wanted);
+    child.kill().expect("kill");
+    child.wait().expect("wait");
+    assert!(seen, "{wanted:?} not in {red:?}");
+    let green = slot.assert_everything().await.expect("ran");
+    assert!(green.is_empty(), "{green:?}");
+    slot.release().await;
+}
+
+/// Catches a launchd probe that trusts a line of a job's own description: a job the user
+/// submitted (it has no plist) whose argument carries a line `path = /System/...` that
+/// looks like the plist line of one of launchd's own services. It is not launchd's own
+/// and is a finding, like any job the lease made.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_assert"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_that_writes_a_system_plist_path_into_its_description_is_seen() {
+    let control = Control {
+        name: "assert-forged",
+        red: "launchd: + job ",
+        cheap: true,
+        prepare: None,
+    };
+    red_then_green(control, |user, scratch| {
+        let label = "com.apple.kbf-assert-forged";
+        let forged = "x\n\tpath = /System/Library/LaunchAgents/com.apple.cfprefsd.xpc.agent.plist";
+        let (uid, gid) = (user.uid.to_string(), user.gid.to_string());
+        let (submitted, said) = root(
+            "/bin/launchctl",
+            &[
+                "asuser",
+                &uid,
+                &scratch.as_user_binary(),
+                AS_USER_ARG,
+                &uid,
+                &gid,
+                "--",
+                "/bin/launchctl",
+                "submit",
+                "-l",
+                label,
+                "--",
+                "/usr/bin/tail",
+                "-f",
+                "/dev/null",
+                forged,
+            ],
+        );
+        let service = format!("user/{uid}/{label}");
+        wait_until(&format!("{label} is listed ({submitted}: {said})"), || {
+            root("/bin/launchctl", &["print", &service]).0
+        });
+        label.to_owned()
+    })
+    .await;
 }

@@ -44,6 +44,9 @@ fn the_services_of_a_domain_are_the_table_between_its_braces() {
             (None, "kbf.c".to_owned()),
         ]
     );
+    // A label with a space in it is whole, not its last word.
+    let spaced = "user/700 = {\n\tservices = {\n\t\t   55      -   a b\n\t\t   -     -   \n\t\t   7\n\t}\n}\n";
+    assert_eq!(listed_services(spaced), [(Some(55), "a b".to_owned())]);
     assert_eq!(listed_services("user/700 = {\n}\n"), []);
     assert_eq!(listed_services(""), []);
 }

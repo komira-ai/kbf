@@ -15,21 +15,23 @@
 //! - A red result is the same as a failed clean: the slot is not offered, the differing
 //!   lines are logged, and the recovery thread cleans and asserts it again.
 
-use std::ffi::CString;
 use std::io;
 use std::ops::RangeInclusive;
-use std::os::unix::ffi::OsStrExt as _;
+use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+use rustix::fs::{CWD, Dir, Mode, OFlags};
 
 use kbf_daemon::RuntimeError;
 use kbf_daemon::uid;
 use kbf_mac_session::sweep::SweepPlan;
 
-use super::host::{self, output};
+use super::host;
 use super::{Ready, Slot, launch_command};
 use crate::network::{Isolation, Network};
 use crate::slots::assertion::{self, Facts, Job, Lines, Probe, Reader, Snapshot};
@@ -54,15 +56,23 @@ const RECORD_ATTRS: [&str; 5] = [
     "UserShell",
 ];
 
+/// How long one tool the readers run may take: a hung `hdiutil` or `launchctl` is a probe
+/// that cannot run (red), never a lease or a recovery that waits for ever.
+const READ_WITHIN: Duration = Duration::from_secs(60);
+
+/// What `launchctl print` exits with for a target that is not there ("Could not find
+/// service"). Any other failure is not "gone".
+const NOT_FOUND: i32 = 113;
+
+/// How long the processes probe waits before it looks a second time at a finding.
+const LOOK_AGAIN: Duration = Duration::from_millis(500);
+
 /// How long the warm-up command may take.
 const WARM_UP_WITHIN: Duration = Duration::from_secs(60);
 
 /// The directory the warm-up's profile is given as its lease directory: root's, and
 /// nothing the user can write.
 const WARM_UP_LEASE: &str = "/private/var/empty";
-
-/// `XATTR_NOFOLLOW` of `listxattr(2)`.
-const XATTR_NOFOLLOW: libc::c_int = 0x0001;
 
 /// Reads one user's probes from the Mac.
 pub(super) struct MacReader<'a> {
@@ -82,9 +92,18 @@ impl<'a> MacReader<'a> {
         }
     }
 
+    /// The labels of launchd's own services the baseline noted: they are not printed again.
+    fn known(&self) -> &[String] {
+        self.ready
+            .baseline
+            .get()
+            .and_then(|b| b.lines(Probe::Services))
+            .map_or(&[][..], Vec::as_slice)
+    }
+
     fn jobs(&self) -> Result<&[Job], String> {
         self.jobs
-            .get_or_init(|| jobs_of(self.ready.user.uid))
+            .get_or_init(|| jobs_of(self.ready.user.uid, self.known()))
             .as_deref()
             .map_err(Clone::clone)
     }
@@ -95,19 +114,33 @@ impl<'a> MacReader<'a> {
         roots
     }
 
+    /// The processes of the uid that are not launchd's own. A finding is looked at once
+    /// more, with the jobs read again: one of launchd's own services that ended between
+    /// the process table and the jobs (an idle on-demand daemon) is in the first look
+    /// alone, a lease's process is in both.
     fn processes(&self) -> Result<Lines, String> {
+        let found = self.processes_by(self.jobs()?)?;
+        if found.is_empty() {
+            return Ok(found);
+        }
+        std::thread::sleep(LOOK_AGAIN);
+        let jobs = jobs_of(self.ready.user.uid, self.known())?;
+        self.processes_by(&jobs)
+    }
+
+    fn processes_by(&self, jobs: &[Job]) -> Result<Lines, String> {
         let uid = self.ready.user.uid;
         // The processes first, then the jobs: a process started in between is in
         // neither, never in the first alone.
-        let table = output(PS, &["-axo", "pid=,ruid=,uid=,svuid=,stat=,comm="])?;
+        let table = tool(PS, &["-axo", "pid=,ruid=,uid=,svuid=,stat=,comm="])?;
         let procs = assertion::parse_ps(&String::from_utf8_lossy(&table))?;
-        let own = assertion::own_pids(self.jobs()?);
+        let own = assertion::own_pids(jobs);
         Ok(assertion::uid_processes(&procs, uid, &own))
     }
 
     fn ipc(&self) -> Result<Lines, String> {
         let user = &self.ready.user;
-        let table = output(IPCS, &["-a"])?;
+        let table = tool(IPCS, &["-a"])?;
         let rows = assertion::ipc_rows(&String::from_utf8_lossy(&table), &user.name, user.uid);
         Ok(rows
             .iter()
@@ -116,20 +149,20 @@ impl<'a> MacReader<'a> {
     }
 
     fn mounts(&self) -> Result<Lines, String> {
-        let mounted = String::from_utf8_lossy(&output(MOUNT, &[])?).into_owned();
-        let images = assertion::hdiutil_images(&output(HDIUTIL, &["info", "-plist"])?)?;
-        let uid = self.ready.user.uid;
+        let mounted = String::from_utf8_lossy(&tool(MOUNT, &[])?).into_owned();
+        let images = assertion::hdiutil_images(&tool(HDIUTIL, &["info", "-plist"])?)?;
+        let user = &self.ready.user;
         Ok(assertion::mount_lines(
             &mounted,
             &images,
-            uid,
+            (user.uid, &user.name),
             &self.roots(),
         ))
     }
 
     fn home(&self) -> Result<Lines, String> {
         let ready = self.ready;
-        let facts = facts_of(&ready.home, true)?;
+        let facts = facts_of(&ready.home)?;
         Ok(assertion::home_lines(
             &facts,
             (ready.user.uid, ready.user.gid),
@@ -138,26 +171,19 @@ impl<'a> MacReader<'a> {
 
     fn entry(&self) -> Result<Lines, String> {
         let folders = &self.ready.folders;
-        let root = facts_of(folders, false)?;
+        let (root, names) = facts_and_names(folders)?;
         let mut children = Vec::new();
-        let names =
-            std::fs::read_dir(folders).map_err(|e| format!("{}: {e}", folders.display()))?;
         for name in names {
-            let name = name.map_err(|e| format!("{}: {e}", folders.display()))?;
-            let path = name.path();
+            let path = folders.join(&name);
             let is_dir = std::fs::symlink_metadata(&path)
                 .map_err(|e| format!("{}: {e}", path.display()))?
                 .is_dir();
             let facts = if is_dir {
-                facts_of(&path, true)?
+                facts_of(&path)?
             } else {
                 Facts::default()
             };
-            children.push((
-                name.file_name().to_string_lossy().into_owned(),
-                is_dir,
-                facts,
-            ));
+            children.push((name, is_dir, facts));
         }
         Ok(assertion::entry_lines(
             &root,
@@ -192,9 +218,9 @@ impl<'a> MacReader<'a> {
         let record = format!("/Users/{name}");
         let mut args = vec![".", "-read", record.as_str()];
         args.extend(RECORD_ATTRS);
-        let said = output(DSCL, &args)?;
+        let said = tool(DSCL, &args)?;
         let mut lines = assertion::dscl_lines(&String::from_utf8_lossy(&said), &RECORD_ATTRS);
-        let id = output(ID, &[name])?;
+        let id = tool(ID, &[name])?;
         lines.push(format!("id {}", String::from_utf8_lossy(&id).trim()));
         Ok(lines)
     }
@@ -218,82 +244,214 @@ impl Reader for MacReader<'_> {
 }
 
 /// The jobs of `user/<uid>`: each service `launchctl print user/<uid>` lists, with whether
-/// its plist is launchd's own. A domain that is not there has none; `launchctl` that
-/// cannot be run is an error, and so is a listing no job could be read from.
-fn jobs_of(uid: u32) -> Result<Vec<Job>, String> {
-    let Some(domain) = print(&format!("user/{uid}"))? else {
+/// it is launchd's own. A domain that is not there has none. A launchctl that cannot be
+/// run or says anything but "not found", and a listed service that cannot be read and is
+/// still listed on a second look, are errors: a job that is not seen is never green.
+///
+/// A service whose label the baseline noted (`known`) is launchd's own and is not printed
+/// again, which keeps the read to the few services that are new. Any other is printed and
+/// is launchd's own only if its plist is ([`own_plist`]).
+fn jobs_of(uid: u32, known: &[String]) -> Result<Vec<Job>, String> {
+    let domain_target = format!("user/{uid}");
+    let Some(domain) = print(&domain_target)? else {
         return Ok(Vec::new());
     };
     let mut jobs = Vec::new();
     for (pid, label) in probe::listed_services(&domain) {
-        // A service gone since the listing is no job.
-        let Some(printed) = print(&format!("user/{uid}/{label}"))? else {
+        if known.contains(&label) {
+            jobs.push(Job {
+                pid,
+                label,
+                own: true,
+            });
+            continue;
+        }
+        let Some(printed) = print(&format!("{domain_target}/{label}"))? else {
+            // Gone since the listing, or not readable: the listing says which.
+            let again = print(&domain_target)?.unwrap_or_default();
+            if probe::listed_services(&again)
+                .iter()
+                .any(|(_, l)| *l == label)
+            {
+                return Err(format!("the job {label:?} is listed and cannot be printed"));
+            }
             continue;
         };
-        let own = probe::plist_path(&printed).is_some_and(probe::is_own_plist);
+        let own = probe::plist_path(&printed).is_some_and(|path| own_plist(path, &label));
         jobs.push(Job { pid, label, own });
     }
     Ok(jobs)
 }
 
-/// What `launchctl print <target>` says; `None` when it exits non-zero (the target is not
-/// there).
-fn print(target: &str) -> Result<Option<String>, String> {
-    let out = Command::new(uid::LAUNCHCTL)
-        .args(["print", target])
-        .env_clear()
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("{} print {target}: {e}", uid::LAUNCHCTL))?;
-    Ok(out
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned()))
+/// Whether the plist the job `label` says it came from is launchd's own, judged on the
+/// file and not on a line of text a job can write: the real path lies under one of the
+/// system's folders ([`probe::is_own_plist`]), root owns the file and no one else can
+/// write it, and its `Label` is the job's.
+fn own_plist(path: &str, label: &str) -> bool {
+    let Ok(real) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(meta) = std::fs::metadata(&real) else {
+        return false;
+    };
+    if !probe::is_own_plist(&real.to_string_lossy()) || meta.uid() != 0 || meta.mode() & 0o022 != 0
+    {
+        return false;
+    }
+    plist::Value::from_file(&real)
+        .ok()
+        .and_then(|v| {
+            v.as_dictionary()?
+                .get("Label")?
+                .as_string()
+                .map(|l| l == label)
+        })
+        .unwrap_or(false)
 }
 
-/// What is read of the directory `path` (without following a link), its names as well
-/// when `entries` says so.
-fn facts_of(path: &Path, entries: bool) -> Result<Facts, String> {
+/// What `launchctl print <target>` says; `None` when the target is not there
+/// ([`NOT_FOUND`]).
+///
+/// # Errors
+/// `launchctl` did not run or finish, or exited any other way (a domain being torn down
+/// is not an absent one).
+fn print(target: &str) -> Result<Option<String>, String> {
+    let mut command = Command::new(uid::LAUNCHCTL);
+    command.args(["print", target]);
+    let (status, stdout, stderr) = run_within(&mut command, READ_WITHIN)
+        .map_err(|e| format!("{} print {target}: {e}", uid::LAUNCHCTL))?;
+    if status.success() {
+        return Ok(Some(String::from_utf8_lossy(&stdout).into_owned()));
+    }
+    if status.code() == Some(NOT_FOUND) {
+        return Ok(None);
+    }
+    Err(format!(
+        "{} print {target}: {status}: {}",
+        uid::LAUNCHCTL,
+        String::from_utf8_lossy(&stderr).trim()
+    ))
+}
+
+/// `program`'s stdout, if it exited 0 within [`READ_WITHIN`].
+fn tool(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+    let mut command = Command::new(program);
+    command.args(args);
+    let (status, stdout, stderr) =
+        run_within(&mut command, READ_WITHIN).map_err(|e| format!("{program}: {e}"))?;
+    if status.success() {
+        return Ok(stdout);
+    }
+    Err(format!(
+        "{program} {args:?}: {status}: {}",
+        String::from_utf8_lossy(&stderr).trim()
+    ))
+}
+
+/// Runs `command` with a plain environment and no input; its status and output. It is
+/// killed, and the call fails, if it has not finished within `within`.
+fn run_within(
+    command: &mut Command,
+    within: Duration,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
+    let mut child = command
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let out = drain(child.stdout.take());
+    let err = drain(child.stderr.take());
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < within => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            other => {
+                // The readers end with the pipes; they are not waited for here, as a
+                // child of the tool may hold them open.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("did not finish within {within:?}: {other:?}"));
+            }
+        }
+    };
+    let join = |t: std::thread::JoinHandle<Vec<u8>>| t.join().unwrap_or_default();
+    Ok((status, join(out), join(err)))
+}
+
+/// Reads `pipe` to its end on a thread of its own, so that a tool that prints more than a
+/// pipe holds does not block.
+fn drain<R: io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    })
+}
+
+/// Opens the directory `path` without following a link in its last component.
+fn open_dir(path: &Path) -> io::Result<OwnedFd> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    rustix::fs::openat(CWD, path, flags, Mode::empty()).map_err(io::Error::from)
+}
+
+/// What is read of the directory `path` (not following a link): everything through one
+/// descriptor, so that a link put in its place after the open is not followed to list some
+/// other directory.
+fn facts_of(path: &Path) -> Result<Facts, String> {
+    facts_and_names(path).map(|(facts, names)| Facts {
+        entries: names,
+        ..facts
+    })
+}
+
+/// [`facts_of`] without the names, and the names of the directory apart.
+fn facts_and_names(path: &Path) -> Result<(Facts, Vec<String>), String> {
     let at = |e: io::Error| format!("{}: {e}", path.display());
-    let meta = std::fs::symlink_metadata(path).map_err(at)?;
-    let listed = output(LS, &["-led", &path.to_string_lossy()])?;
+    let fd = open_dir(path).map_err(at)?;
+    let file = std::fs::File::from(fd);
+    let meta = file.metadata().map_err(at)?;
+    let fd = OwnedFd::from(file);
     let mut names = Vec::new();
-    if entries {
-        for entry in std::fs::read_dir(path).map_err(at)? {
-            names.push(
-                entry
-                    .map_err(at)?
-                    .file_name()
-                    .to_string_lossy()
-                    .into_owned(),
-            );
+    for entry in Dir::read_from(&fd).map_err(|e| at(e.into()))? {
+        let entry = entry.map_err(|e| at(e.into()))?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            names.push(String::from_utf8_lossy(name).into_owned());
         }
     }
-    Ok(Facts {
+    let listed = tool(LS, &["-led", &path.to_string_lossy()])?;
+    let facts = Facts {
         uid: meta.uid(),
         gid: meta.gid(),
         mode: meta.mode() & 0o7777,
         flags: std::os::macos::fs::MetadataExt::st_flags(&meta),
         acl: assertion::acl_entries(&String::from_utf8_lossy(&listed)),
-        xattrs: xattrs_of(path).map_err(at)?,
-        entries: names,
-    })
+        xattrs: xattrs_of(&fd).map_err(at)?,
+        entries: Vec::new(),
+    };
+    Ok((facts, names))
 }
 
-/// The names of the extended attributes of `path`, not following a link.
-fn xattrs_of(path: &Path) -> io::Result<Vec<String>> {
-    let c = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::other("a path with a NUL"))?;
-    // SAFETY: `c` is a NUL-terminated path; a null buffer of size 0 only asks for the size.
-    let size = unsafe { libc::listxattr(c.as_ptr(), std::ptr::null_mut(), 0, XATTR_NOFOLLOW) };
+/// The names of the extended attributes of the open directory `fd`.
+pub(super) fn xattrs_of(fd: &OwnedFd) -> io::Result<Vec<String>> {
+    let raw = fd.as_raw_fd();
+    // SAFETY: `raw` is a descriptor `fd` keeps open; a null buffer of size 0 only asks for
+    // the size.
+    let size = unsafe { libc::flistxattr(raw, std::ptr::null_mut(), 0, 0) };
     let size = usize::try_from(size).map_err(|_| io::Error::last_os_error())?;
-    let mut names = vec![0_u8; size];
     if size == 0 {
         return Ok(Vec::new());
     }
+    let mut names = vec![0_u8; size];
     // SAFETY: `names` is a writable buffer of `size` bytes, which the call fills at most.
-    let got =
-        unsafe { libc::listxattr(c.as_ptr(), names.as_mut_ptr().cast(), size, XATTR_NOFOLLOW) };
+    let got = unsafe { libc::flistxattr(raw, names.as_mut_ptr().cast(), size, 0) };
     let got = usize::try_from(got).map_err(|_| io::Error::last_os_error())?;
     names.truncate(got);
     Ok(names
@@ -310,7 +468,7 @@ pub(super) fn after_clean(ready: &Ready, program: &Path, clean: &dyn Fn() -> Out
     let dirty = |why: String| Outcome::Dirty { why };
     if let Some(baseline) = ready.baseline.get() {
         let reader = MacReader::new(ready, None);
-        let red = assertion::assert(&reader, Some(baseline), &assertion::ALL);
+        let red = assertion::assert(&reader, Some(baseline), &assertion::ALL, &|| false);
         return if red.is_empty() {
             Outcome::Clean
         } else {
@@ -394,10 +552,24 @@ impl Slot {
     /// # Errors
     /// The check did not finish.
     pub async fn assert_ready(&self, lease: &Path) -> Result<Lines, RuntimeError> {
+        self.assert_ready_until(lease, &Arc::new(AtomicBool::new(false)))
+            .await
+    }
+
+    /// [`Slot::assert_ready`] that stops before its next probe once `cancel` is set (a
+    /// kill of the lease), and says so.
+    ///
+    /// # Errors
+    /// As [`Slot::assert_ready`].
+    pub async fn assert_ready_until(
+        &self,
+        lease: &Path,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<Lines, RuntimeError> {
         if !self.asserted {
             return Ok(Vec::new());
         }
-        self.assert_probes(&assertion::CHEAP, Some(lease.to_owned()))
+        self.assert_probes(&assertion::CHEAP, Some(lease.to_owned()), cancel)
             .await
     }
 
@@ -408,19 +580,23 @@ impl Slot {
     /// As [`Slot::assert_ready`].
     #[doc(hidden)]
     pub async fn assert_everything(&self) -> Result<Lines, RuntimeError> {
-        self.assert_probes(&assertion::ALL, None).await
+        self.assert_probes(&assertion::ALL, None, &Arc::new(AtomicBool::new(false)))
+            .await
     }
 
     async fn assert_probes(
         &self,
         probes: &'static [Probe],
         lease: Option<std::path::PathBuf>,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<Lines, RuntimeError> {
-        let (book, index) = (std::sync::Arc::clone(&self.book), self.index);
+        let (book, index) = (Arc::clone(&self.book), self.index);
+        let cancel = Arc::clone(cancel);
         let red = tokio::task::spawn_blocking(move || {
             let ready = book.ready(index);
             let reader = MacReader::new(ready, lease.as_deref());
-            assertion::assert(&reader, ready.baseline.get(), probes)
+            let stopped = || cancel.load(Ordering::SeqCst);
+            assertion::assert(&reader, ready.baseline.get(), probes, &stopped)
         })
         .await;
         red.map_err(|e| RuntimeError::Failed(format!("the assertion did not finish: {e}")))

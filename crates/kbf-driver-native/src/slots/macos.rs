@@ -210,6 +210,11 @@ impl Slots {
     }
 }
 
+/// How long the recovery thread waits before its first pass over a slot that went dirty:
+/// for the tests of `tests/slot_assert.rs`, which time a lease held up by it.
+#[doc(hidden)]
+pub const FIRST_RECOVERY_PASS: Duration = Backoff::DAEMON.first;
+
 /// The cleaner of a root daemon's slots: [`host::MacSlot`] through [`clean::clean`],
 /// wrapped in [`WithSkipped`] when `skipped` is given (only a test gives one), and then
 /// the assertion ([`assert::after_clean`]): the baseline recorded the first time a clean

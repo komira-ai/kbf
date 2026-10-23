@@ -104,6 +104,9 @@ pub(crate) struct Book<R> {
     reasons: Mutex<BTreeMap<usize, String>>,
 }
 
+/// How many slots the first clean of the book works on at once.
+const START_WORKERS: usize = 8;
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     // Each update is one set operation, so the set is consistent after a panic.
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -135,16 +138,7 @@ impl<R: Slotted + Send + Sync + 'static> Book<R> {
             ready,
             cleaner,
         });
-        for index in 0..book.ready.len() {
-            // A clean that panics leaves the slot dirty, as at every later clean.
-            let clean = catch_unwind(AssertUnwindSafe(|| book.settle(index)));
-            if clean.unwrap_or(false) {
-                lock(&book.free).insert(index);
-                book.permits.add_permits(1);
-            } else {
-                lock(&book.dirty).insert(index);
-            }
-        }
+        book.settle_all();
         let weak = Arc::downgrade(&book);
         let wake = Arc::clone(&book.wake);
         // A thread that cannot be made (out of memory) leaves dirty slots dirty, as the
@@ -158,6 +152,43 @@ impl<R: Slotted + Send + Sync + 'static> Book<R> {
         }
         book.wake_up();
         book
+    }
+
+    /// Cleans every slot once, up to [`START_WORKERS`] at a time (the first clean of a slot
+    /// also records its baseline, which launches a command as its user, so one after the
+    /// other would take as many such launches as there are slots), and logs how long all
+    /// took.
+    fn settle_all(&self) {
+        let started = std::time::Instant::now();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let work = || {
+            loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if index >= self.ready.len() {
+                    break;
+                }
+                // A clean that panics leaves the slot dirty, as at every later clean.
+                let clean = catch_unwind(AssertUnwindSafe(|| self.settle(index)));
+                if clean.unwrap_or(false) {
+                    lock(&self.free).insert(index);
+                    self.permits.add_permits(1);
+                } else {
+                    lock(&self.dirty).insert(index);
+                }
+            }
+        };
+        std::thread::scope(|scope| {
+            for _ in 1..START_WORKERS.min(self.ready.len()) {
+                scope.spawn(work);
+            }
+            work();
+        });
+        tracing::info!(
+            slots = self.ready.len(),
+            dirty = lock(&self.dirty).len(),
+            took = ?started.elapsed(),
+            "the slots are cleaned"
+        );
     }
 
     /// Slot `index`.

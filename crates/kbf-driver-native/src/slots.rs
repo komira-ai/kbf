@@ -417,10 +417,14 @@ impl Runner {
     /// # Errors
     /// The check did not finish.
     #[cfg(target_os = "macos")]
-    pub async fn assert_ready(&self, lease: &Path) -> Result<Vec<String>, RuntimeError> {
+    pub async fn assert_ready(
+        &self,
+        lease: &Path,
+        cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<String>, RuntimeError> {
         match self {
             Self::Daemon => Ok(Vec::new()),
-            Self::Slot(slot) => slot.assert_ready(lease).await,
+            Self::Slot(slot) => slot.assert_ready_until(lease, cancel).await,
         }
     }
 

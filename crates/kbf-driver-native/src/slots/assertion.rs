@@ -15,9 +15,9 @@
 //! | [`Probe::Processes`] | no process has it as its real, effective or saved uid, but launchd's own |
 //! | [`Probe::Domain`] | `launchctl print user/<uid>` lists no job but launchd's own |
 //! | [`Probe::Ipc`] | `ipcs -a` lists no object it owns or made |
-//! | [`Probe::Mounts`] | nothing is mounted or attached under its home, its `/var/folders` entry or the lease directory, and it attached no image |
-//! | [`Probe::Home`] | its home is an empty directory, mode 0700, its uid and gid, with no flags, ACL or extended attribute |
-//! | [`Probe::Entry`] | its `/var/folders` entry is as recorded, with every directory empty |
+//! | [`Probe::Mounts`] | nothing is mounted or attached under its home, its `/var/folders` entry or the lease directory, no mount anywhere is marked as mounted by it, and it attached no image |
+//! | [`Probe::Home`] | its home is an empty directory, mode 0700, its uid and gid, with no flags, and the ACL and extended attributes it had in the baseline |
+//! | [`Probe::Entry`] | its `/var/folders` entry is as recorded (root, and the mode and extended attributes of each folder), with every directory empty |
 //! | [`Probe::Shared`] | it owns nothing in the shared places and the crash folders |
 //! | [`Probe::Schedules`] | it has no cron or `at` job |
 //! | [`Probe::Record`] | its directory record and `id` equal the baseline's |
@@ -27,12 +27,16 @@
 //! where its plist lies ([`super::probe::is_own_plist`]), never by its label or a line
 //! of text that a lease can choose.
 //!
+//! Only the `user/<uid>` domain is read for jobs; a job loaded into another domain of
+//! the uid (`gui/<uid>`) runs as a process of the uid while it runs, which
+//! [`Probe::Processes`] sees, and is not seen while it is idle.
+//!
 //! A probe that cannot run is red, never green; so is a probe that needs a baseline and
 //! has none.
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::probe;
 
@@ -81,7 +85,8 @@ pub(crate) const CHEAP: [Probe; 6] = [
 pub(crate) enum Kind {
     /// Every line is something that must not be there.
     Absent,
-    /// The lines must equal the baseline's.
+    /// The lines must equal the baseline's. A baseline holds only the lines
+    /// [`baseline_defects`] does not find wrong.
     Recorded,
     /// The lines are kept in the baseline and not compared.
     Noted,
@@ -90,7 +95,7 @@ pub(crate) enum Kind {
 impl Probe {
     pub(crate) const fn kind(self) -> Kind {
         match self {
-            Self::Entry | Self::Record => Kind::Recorded,
+            Self::Home | Self::Entry | Self::Record => Kind::Recorded,
             Self::Services => Kind::Noted,
             _ => Kind::Absent,
         }
@@ -156,9 +161,7 @@ pub(crate) fn record(reader: &dyn Reader) -> Result<Snapshot, Lines> {
         match reader.read(probe) {
             Ok(lines) => {
                 let lines = tidy(lines);
-                if probe.kind() == Kind::Absent {
-                    wrong.extend(differences(probe, &lines, None));
-                }
+                wrong.extend(baseline_defects(probe, &lines));
                 snapshot.0.insert(probe, lines);
             }
             Err(why) => wrong.push(cannot_run(probe, &why)),
@@ -171,12 +174,44 @@ pub(crate) fn record(reader: &dyn Reader) -> Result<Snapshot, Lines> {
     }
 }
 
+/// What a baseline of `probe` may not hold, as red lines: any line of a probe that must
+/// find nothing, and for a recorded one the lines that are a wrong state and not a
+/// recorded fact (the home's owner, mode, flags and names; a name in the entry that is not
+/// one of its folders).
+fn baseline_defects(probe: Probe, lines: &[String]) -> Lines {
+    let recorded = |l: &&String| match probe {
+        Probe::Home => l.starts_with("acl ") || l.starts_with("xattr "),
+        Probe::Entry => l.starts_with(". "),
+        _ => true,
+    };
+    match probe.kind() {
+        Kind::Absent => lines.iter().map(|l| format!("{probe}: + {l}")).collect(),
+        Kind::Recorded => lines
+            .iter()
+            .filter(|l| !recorded(l))
+            .map(|l| format!("{probe}: + {l}"))
+            .collect(),
+        Kind::Noted => Vec::new(),
+    }
+}
+
 /// Reads `probes` and compares them with `baseline`: the lines that differ, `probe: +
 /// line` for what is there and should not be, `probe: - line` for what the baseline has
-/// and is gone. Empty means the user is as the baseline says.
-pub(crate) fn assert(reader: &dyn Reader, baseline: Option<&Snapshot>, probes: &[Probe]) -> Lines {
+/// and is gone. Empty means the user is as the baseline says. `stopped` is asked before
+/// each probe: when it says so (the lease was killed) the rest are not read, and the
+/// result says that.
+pub(crate) fn assert(
+    reader: &dyn Reader,
+    baseline: Option<&Snapshot>,
+    probes: &[Probe],
+    stopped: &dyn Fn() -> bool,
+) -> Lines {
     let mut wrong = Vec::new();
     for &probe in probes {
+        if stopped() {
+            wrong.push(format!("{probe}: not read, the check was stopped"));
+            break;
+        }
         let now = match reader.read(probe) {
             Ok(lines) => tidy(lines),
             Err(why) => {
@@ -401,14 +436,44 @@ pub(crate) fn hdiutil_images(xml: &[u8]) -> Result<Vec<Image>, String> {
     Ok(found)
 }
 
+/// The mount points in `mount`'s output whose options say `mounted by <name>`, which
+/// macOS prints for a filesystem a user mounted (an nfs or smb share) wherever it is.
+pub(crate) fn mounted_by(mount: &str, name: &str) -> Vec<PathBuf> {
+    let marker = format!("mounted by {name}");
+    mount
+        .lines()
+        .filter_map(|line| {
+            let (_, rest) = line.split_once(" on ")?;
+            let (point, options) = rest.rsplit_once(" (")?;
+            let options = options.trim_end().trim_end_matches(')');
+            options
+                .split(',')
+                .any(|o| o.trim() == marker)
+                .then(|| PathBuf::from(point))
+        })
+        .collect()
+}
+
 /// What is mounted or attached that the user's state must not hold: mounts in `mount`'s
-/// output at or under one of `roots`, images attached by `uid`, and images that lie at or
-/// mount under one of `roots`.
-pub(crate) fn mount_lines(mount: &str, images: &[Image], uid: u32, roots: &[&Path]) -> Lines {
-    let mut lines: Lines = probe::mounts_under(mount, roots)
+/// output at or under one of `roots`, mounts marked as mounted by `name` anywhere, images
+/// attached by `uid`, and images that lie at or mount under one of `roots`.
+pub(crate) fn mount_lines(
+    mount: &str,
+    images: &[Image],
+    (uid, name): (u32, &str),
+    roots: &[&Path],
+) -> Lines {
+    let under_roots = probe::mounts_under(mount, roots);
+    let mut lines: Lines = under_roots
         .iter()
         .map(|p| format!("mounted {}", p.display()))
         .collect();
+    lines.extend(
+        mounted_by(mount, name)
+            .iter()
+            .filter(|p| !under_roots.contains(p))
+            .map(|p| format!("mounted {} by the user", p.display())),
+    );
     let under = |p: &str| roots.iter().any(|r| Path::new(p).starts_with(r));
     for image in images {
         let device = image.device.as_deref().unwrap_or("?");
@@ -452,7 +517,8 @@ pub(crate) struct Facts {
 }
 
 /// How the home `facts` differ from an empty directory of `uid`:`gid`, mode 0700, with no
-/// flags, ACL or extended attribute.
+/// flags. Its ACL and extended attributes are lines too (`acl ...`, `xattr ...`): a
+/// home made by the system's tools can carry some, which the baseline then records.
 pub(crate) fn home_lines(facts: &Facts, (uid, gid): (u32, u32)) -> Lines {
     let mut lines = Vec::new();
     if (facts.uid, facts.gid) != (uid, gid) {
@@ -473,7 +539,8 @@ pub(crate) fn home_lines(facts: &Facts, (uid, gid): (u32, u32)) -> Lines {
     lines
 }
 
-/// The lines of the `/var/folders` entry: its root as found (recorded), and everything
+/// The lines of the `/var/folders` entry: its root as found (recorded), the mode and
+/// extended attributes of each folder it keeps (recorded), and everything
 /// below it that is not an empty folder the user owns (`skeleton`: the names the clean
 /// keeps, emptied; the others must not exist).
 ///
@@ -497,6 +564,9 @@ pub(crate) fn entry_lines(
             lines.push(format!("{name}: not part of the entry"));
             continue;
         }
+        // What a folder is when the entry is clean is recorded with the root.
+        lines.push(format!(". {name} mode {:o}", facts.mode));
+        lines.extend(facts.xattrs.iter().map(|x| format!(". {name} xattr {x}")));
         if facts.uid != uid {
             lines.push(format!("{name}: owned by {}", facts.uid));
         }

@@ -954,7 +954,7 @@ impl<C: Cas> crate::slots::canary::Offer for SlotOffer<'_, C> {
             }
         }
         // The state the user is in, before the canaries and the lease touch it.
-        let ready = slot.assert_ready(&made.lease);
+        let ready = slot.assert_ready(&made.lease, &cancel);
         let red = match until_killed(ready, &cancel, &mut killed).await {
             Raced::Done(done) => done?,
             Raced::Killed(by) => {

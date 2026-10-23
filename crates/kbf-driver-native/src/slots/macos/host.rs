@@ -558,15 +558,34 @@ fn open_dir(path: &Path) -> io::Result<OwnedFd> {
 }
 
 /// Gives the open directory `dir` to `uid`:`gid` with `mode` and the user flags `flags`
-/// (all it has otherwise are cleared).
+/// (all it has otherwise are cleared), and takes every extended attribute off it: the
+/// assertion compares them with the baseline's, which is read after a clean.
 fn own(dir: &OwnedFd, (uid, gid, mode): (u32, u32, u32), flags: u32) -> io::Result<()> {
     set_flags(dir, flags)?;
+    strip_xattrs(dir)?;
     rustix::fs::fchown(
         dir,
         Some(rustix::fs::Uid::from_raw(uid)),
         Some(rustix::fs::Gid::from_raw(gid)),
     )?;
     rustix::fs::fchmod(dir, Mode::from_raw_mode(mode as _))?;
+    Ok(())
+}
+
+/// Removes every extended attribute of the open directory `dir`.
+fn strip_xattrs(dir: &OwnedFd) -> io::Result<()> {
+    for name in super::assert::xattrs_of(dir)? {
+        let name = std::ffi::CString::new(name).map_err(io::Error::other)?;
+        // SAFETY: `dir` is a descriptor this function borrows and `name` a NUL-terminated
+        // attribute name.
+        if unsafe { libc::fremovexattr(dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            let why = io::Error::last_os_error();
+            // One that went since the listing is removed.
+            if why.raw_os_error() != Some(libc::ENOATTR) {
+                return Err(why);
+            }
+        }
+    }
     Ok(())
 }
 
