@@ -325,13 +325,16 @@ impl MacSlot<'_> {
             }
             Ok(not_launchds_own(pids, &services_of(uid)))
         };
+        let t0 = Instant::now();
         let round = super::term_uid(
             uid,
             self.grace.min(self.within),
             &mut scan,
             probe::SCAN_PAUSE,
         );
-        crate::grace::then_kill(round, "slot clean", |ignored| {
+        tracing::info!(uid, ms = t0.elapsed().as_millis(), "TIMING clean term round");
+        let t1 = Instant::now();
+        let r = crate::grace::then_kill(round, "slot clean", |ignored| {
             if let Some(brief) = crate::grace::brief(ignored) {
                 tracing::warn!(uid, "slot clean: {brief}");
             }
@@ -344,7 +347,9 @@ impl MacSlot<'_> {
                 &mut || std::thread::sleep(probe::SCAN_PAUSE),
             )
         })
-        .map(|_| ())
+        .map(|_| ());
+        tracing::info!(uid, ms = t1.elapsed().as_millis(), "TIMING clean kill phase");
+        r
     }
 }
 
@@ -692,6 +697,13 @@ const SERVICES_WITHIN: Duration = Duration::from_secs(15);
 /// checks then stand in for). Each is printed on its own for its plist's path
 /// ([`Service::own`]); one not printed in time is not launchd's own.
 fn services_of(uid: u32) -> Vec<Service> {
+    let t0 = Instant::now();
+    let r = services_of_timed(uid);
+    tracing::info!(uid, n = r.len(), ms = t0.elapsed().as_millis(), "TIMING services_of");
+    r
+}
+
+fn services_of_timed(uid: u32) -> Vec<Service> {
     let give_up = Instant::now() + SERVICES_WITHIN;
     let Some(domain) = launchctl_print(&format!("user/{uid}"), PRINT_WITHIN) else {
         return Vec::new();
