@@ -425,7 +425,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
             && let Some(w) = words.find(|w| {
                 // `--config FILE` takes its value as the next word.
                 let is_value = std::mem::replace(&mut after_config, *w == "--config");
-                !w.starts_with('-') && !is_value && !(verb && *w == "boot-check")
+                !(w.starts_with('-') || is_value || (verb && *w == "boot-check"))
             })
         {
             v(
