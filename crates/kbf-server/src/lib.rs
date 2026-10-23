@@ -157,7 +157,10 @@ pub mod write_tier;
 
 pub use config::{Args, ConfigError, Role, SERVER, s3_store};
 pub use drain::{Drain, DrainStatus};
-pub use farm::{DONE_FLOOR, EpochBump, EpochPolicy, Farm, ID_BLOCK, SESSION_RENEWAL, StateError};
+pub use farm::{
+    ACK_WINDOW, DONE_FLOOR, EpochBump, EpochPolicy, Farm, ID_BLOCK, OWNER_CACHE_TTL,
+    SESSION_RENEWAL, StateError,
+};
 pub use health::Readiness;
 pub use identity::{DenyList, DenyListError, Peers};
 pub use kbf_sched::MemoryLadder;

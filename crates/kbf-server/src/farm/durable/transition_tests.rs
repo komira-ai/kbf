@@ -10,12 +10,12 @@ use kbf_types::{Answer, Failure, FencePolicy, LeaseKind, Outcome, Refusal, Resou
 use super::blocks_tests::{Racing, durable_over, request};
 use super::*;
 
-fn subject() -> Subject {
+pub(super) fn subject() -> Subject {
     Subject::of(Described::default()).0
 }
 
 /// The grant of lease `seq` of operation `operation` to `worker`.
-fn start(operation: u64, seq: u64, worker: &str) -> StartLease {
+pub(super) fn start(operation: u64, seq: u64, worker: &str) -> StartLease {
     StartLease {
         worker: WorkerId::new(worker),
         lease: LeaseId::new(5, seq),
@@ -28,7 +28,7 @@ fn start(operation: u64, seq: u64, worker: &str) -> StartLease {
     }
 }
 
-fn answer(operation: u64, seq: u64) -> Answer {
+pub(super) fn answer(operation: u64, seq: u64) -> Answer {
     Answer {
         operation: OperationId(operation),
         lease: LeaseId::new(5, seq),
@@ -39,7 +39,7 @@ fn answer(operation: u64, seq: u64) -> Answer {
     }
 }
 
-fn requeue(operation: u64, seq: u64) -> Requeue {
+pub(super) fn requeue(operation: u64, seq: u64) -> Requeue {
     Requeue {
         operation: OperationId(operation),
         lease: LeaseId::new(5, seq),
@@ -57,7 +57,7 @@ fn refusal(operation: u64) -> Refusal {
 }
 
 /// An ending whose result carries `message`, so two endings tell apart.
-fn ending(message: &str) -> Ending {
+pub(super) fn ending(message: &str) -> Ending {
     Ending {
         finished: Finished::Failed(kbf_proto::google::rpc::Status {
             code: 3,
@@ -68,7 +68,7 @@ fn ending(message: &str) -> Ending {
     }
 }
 
-fn rows(store: &Racing, prefix: &str) -> usize {
+pub(super) fn rows(store: &Racing, prefix: &str) -> usize {
     store.scan_prefix(prefix).expect("scan").len()
 }
 

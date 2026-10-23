@@ -8,11 +8,14 @@ use kbf_types::{FarmTime, LeaseId, WorkerId};
 use super::{Farm, Settled, State, StreamId, wire_lease};
 
 impl Farm {
-    /// Heartbeat `seq` on `stream`. Returns whether it was taken (and is to be
-    /// acknowledged): a heartbeat from a replaced stream is dropped. Each lease it
-    /// lists that the scheduler no longer holds on `worker` is sent a `Cancel`. A lease
-    /// it leaves out that a proven restart lost past its operation's farm reruns
-    /// finishes the operation: its callers are answered (nothing is cached).
+    /// Heartbeat `seq` on `stream`. Returns whether it was taken and is to be
+    /// acknowledged: a heartbeat from a replaced stream is dropped, and one is not
+    /// acknowledged (though the scheduler hears it) when this frontend no longer owns the
+    /// worker, or has not written the worker's session row lately, so a daemon that the
+    /// other frontends cannot see alive, or that has moved, fences on time. Each lease it
+    /// lists that the scheduler no longer holds on `worker` is sent a `Cancel`. A lease it
+    /// leaves out that a proven restart lost past its operation's farm reruns finishes the
+    /// operation: its callers are answered (nothing is cached).
     pub async fn heartbeat(
         &self,
         worker: &WorkerId,
@@ -24,21 +27,21 @@ impl Farm {
         let taken = self
             .lock()
             .take_heartbeat(now, worker, stream, seq, running);
-        let Some(settled) = taken else {
+        let Some((settled, acknowledged)) = taken else {
             return false;
         };
         for settled in settled {
             self.deliver(settled).await;
         }
-        true
+        acknowledged
     }
 }
 
 impl State {
     /// [`Farm::heartbeat`] under the lock: `None` for a heartbeat from a replaced
-    /// stream, else what its callers are told, for each operation it finished. Not
-    /// generic, unlike `Farm::heartbeat`, so every test binary's runs count toward the
-    /// same function's coverage.
+    /// stream, else what its callers are told, for each operation it finished, and whether
+    /// the heartbeat is acknowledged. Not generic, unlike `Farm::heartbeat`, so every test
+    /// binary's runs count toward the same function's coverage.
     fn take_heartbeat(
         &mut self,
         now: FarmTime,
@@ -46,7 +49,7 @@ impl State {
         stream: StreamId,
         seq: u64,
         running: Vec<LeaseId>,
-    ) -> Option<Vec<Settled>> {
+    ) -> Option<(Vec<Settled>, bool)> {
         let link = self.links.get_mut(worker).filter(|l| l.stream == stream)?;
         link.newest_beat = link.newest_beat.max(seq);
         let outbound = link.outbound.clone();
@@ -55,7 +58,11 @@ impl State {
             running: running.clone(),
         };
         let answers = self.feed(now, event);
-        self.renew_session(now, worker);
+        // A node this frontend does not own is not kept alive in the store by it.
+        let owns = self.owns_worker(now, worker);
+        if owns {
+            self.renew_session(now, worker);
+        }
         for lease in self.sched.not_held(worker, &running) {
             tracing::info!(%worker, %lease, "a lease not held here is listed: cancelled");
             let cancel = server_message::Message::Cancel(Cancel {
@@ -67,6 +74,8 @@ impl State {
                 message: Some(cancel),
             }));
         }
-        Some(answers.iter().map(|a| self.settle(a)).collect())
+        let acknowledged = owns && self.session_fresh(now, worker);
+        let settled = answers.iter().map(|a| self.settle(a)).collect();
+        Some((settled, acknowledged))
     }
 }

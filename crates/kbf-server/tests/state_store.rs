@@ -46,6 +46,8 @@ mod fate;
 mod floors;
 #[path = "state_store/handover.rs"]
 mod handover;
+#[path = "state_store/owner.rs"]
+mod owner;
 #[path = "state_store/result_ack.rs"]
 mod result_ack;
 #[path = "state_store/shared.rs"]
@@ -77,6 +79,8 @@ struct Flaky {
     lie_lease: AtomicBool,
     /// How many more reads of a `queue/` row fail before they succeed.
     fail_queue_get: AtomicI64,
+    /// How many times every `lease/` row has been read by a scan.
+    lease_scans: AtomicUsize,
     /// The writes that applied, oldest first, as the transaction prints.
     applied: std::sync::Mutex<Vec<String>>,
 }
@@ -167,6 +171,7 @@ impl Flaky {
             lie: AtomicBool::new(false),
             lie_lease: AtomicBool::new(false),
             fail_queue_get: AtomicI64::new(0),
+            lease_scans: AtomicUsize::new(0),
             applied: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -257,6 +262,8 @@ impl Store for Flaky {
     }
 
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
+        let scans = &self.lease_scans;
+        scans.fetch_add(usize::from(prefix == "lease/"), Ordering::SeqCst);
         self.inner.store().scan_prefix(prefix)
     }
 
@@ -1039,9 +1046,23 @@ async fn a_store_with_an_unreadable_row_refuses_the_farm() {
 use conditional::{
     a_daemon_of_another_frontend_holds_back_the_refusal,
     a_refusal_loses_to_a_grant_made_by_another_frontend,
-    a_result_reaching_two_frontends_is_acknowledged_once,
+    a_result_reaching_the_frontend_a_daemon_left_finishes_nothing,
     a_second_give_up_queues_nothing_beside_the_new_lease,
     daemon_sessions_that_cannot_be_read_hold_back_a_refusal,
+};
+use owner::{
+    a_claim_the_store_refused_is_made_when_it_returns,
+    a_daemon_that_moves_to_another_frontend_keeps_its_lease,
+    a_give_up_for_a_node_the_daemon_left_is_dropped_once,
+    a_hello_to_the_frontend_that_holds_the_lease_takes_nothing_in,
+    a_joined_submit_finds_its_lease_through_the_index,
+    a_new_process_that_moves_waits_before_its_unlisted_lease_is_lost,
+    acks_stop_when_session_renewals_fail, acks_stop_when_the_daemon_moves,
+    an_ack_waits_for_the_session_row,
+    an_owner_row_that_cannot_be_read_blocks_the_claim_until_the_next_hello,
+    the_frontend_a_daemon_left_drops_only_that_nodes_writes,
+    the_same_process_that_moves_loses_an_unlisted_lease_at_once,
+    two_frontends_never_both_grant_to_the_same_worker,
 };
 use shared::{
     a_second_frontend_started_over_the_store_keeps_its_epoch,
@@ -1085,10 +1106,23 @@ restarts!(
     the_operator_bump_raises_the_epoch_once,
     frontends_opening_an_empty_store_together_keep_one_epoch,
     a_second_give_up_queues_nothing_beside_the_new_lease,
-    a_result_reaching_two_frontends_is_acknowledged_once,
+    a_result_reaching_the_frontend_a_daemon_left_finishes_nothing,
     a_daemon_of_another_frontend_holds_back_the_refusal,
     a_refusal_loses_to_a_grant_made_by_another_frontend,
     daemon_sessions_that_cannot_be_read_hold_back_a_refusal,
+    a_daemon_that_moves_to_another_frontend_keeps_its_lease,
+    a_give_up_for_a_node_the_daemon_left_is_dropped_once,
+    a_hello_to_the_frontend_that_holds_the_lease_takes_nothing_in,
+    the_frontend_a_daemon_left_drops_only_that_nodes_writes,
+    two_frontends_never_both_grant_to_the_same_worker,
+    a_joined_submit_finds_its_lease_through_the_index,
+    acks_stop_when_session_renewals_fail,
+    an_ack_waits_for_the_session_row,
+    acks_stop_when_the_daemon_moves,
+    a_new_process_that_moves_waits_before_its_unlisted_lease_is_lost,
+    the_same_process_that_moves_loses_an_unlisted_lease_at_once,
+    a_claim_the_store_refused_is_made_when_it_returns,
+    an_owner_row_that_cannot_be_read_blocks_the_claim_until_the_next_hello,
     lost_leases_are_counted_across_a_restart_and_the_third_is_refused,
     a_crash_at_any_write_of_a_finish_leaves_the_operation_or_its_result,
     a_crash_at_any_write_of_a_refusal_leaves_the_operation_or_its_refusal

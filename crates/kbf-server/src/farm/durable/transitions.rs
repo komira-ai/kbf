@@ -26,9 +26,16 @@
 //!
 //! A write the store applied and did not acknowledge is tried again, and finds its own work
 //! in the rows: the lease row of the grant, no lease row to give up, the result.
+//!
+//! A grant, a lease given up and a result that finds its lease row also check the `owner/`
+//! row of the lease's node (the `owner` module): the transaction fails, whatever else it
+//! read, if the daemon has said `Hello` to another frontend since this one did. The grant
+//! puts the operation's `lease-by-op/` row beside the lease row (the `leases` module), and
+//! the lease given up, like every ending, deletes it.
 
 use kbf_types::StartLease;
 
+use super::leases::lease_by_op_row;
 use super::*;
 
 impl Durable {
@@ -39,8 +46,11 @@ impl Durable {
     ///
     /// # Errors
     /// [`StateError::Missing`] if the operation is not queued and holds no such lease,
-    /// [`StateError::Conflict`] if its rows changed under the write.
+    /// [`StateError::Conflict`] if its rows changed under the write,
+    /// [`StateError::StaleOwner`] if the worker is another frontend's.
     pub(super) fn granted(&self, start: &StartLease) -> Result<(), StateError> {
+        // First: a node another frontend owns is granted nothing, whatever the rows say.
+        let txn = self.guard(Txn::new(), &start.worker)?;
         let queued = queue_key(start.operation);
         let grant = LeaseGrant {
             lease: start.lease,
@@ -51,11 +61,13 @@ impl Durable {
             return self.granted_before(&grant, queued);
         };
         let value = encode(FarmInput::Committed(ControlRecord::Lease(grant)))?;
-        self.commit(Txn::new().delete(queued, Cond::Version(row.version)).put(
-            lease_key(start.lease),
-            value,
-            Cond::Absent,
-        ))
+        let lease = lease_key(start.lease);
+        let index = lease_by_op_key(start.operation);
+        let txn = txn
+            .delete(queued, Cond::Version(row.version))
+            .put(lease, value, Cond::Absent)
+            .put(index, lease_by_op_row(start.lease), Cond::Any);
+        self.commit_owned(&start.worker, txn)
     }
 
     /// The grant of an operation that is not queued: written already if the lease row is
@@ -153,9 +165,21 @@ impl Durable {
                 Ok(())
             };
         };
+        // The lease is the node's owner's to give up. The floors are the farm's, and are
+        // written whoever owns the node: a give-up refused for the owner is not tried again.
+        txn = match self.guard(txn.clone(), &requeue.worker) {
+            Ok(guarded) => guarded,
+            Err(refused) => {
+                if floors_changed {
+                    self.commit(txn)?;
+                }
+                return Err(refused);
+            }
+        };
         txn = txn
             .check(op, Cond::Version(unfinished.version))
-            .delete(lease, Cond::Version(held.version));
+            .delete(lease, Cond::Version(held.version))
+            .delete(lease_by_op_key(requeue.operation), Cond::Any);
         if let Some(count) = losses {
             let key = loss_key(requeue.operation);
             let cond = self.current(&key)?;
@@ -170,7 +194,8 @@ impl Durable {
             txn = txn.put(key, row, cond);
         }
         let queue = queue_key(requeue.operation);
-        self.commit(txn.put(queue, Vec::new(), Cond::Absent))
+        let txn = txn.put(queue, Vec::new(), Cond::Absent);
+        self.commit_owned(&requeue.worker, txn)
     }
 
     /// What a write that replaces the row at `key` must find: the version it has now, or
@@ -205,9 +230,12 @@ impl Durable {
         let Some(row) = self.store.get(&key)? else {
             return self.end_queued(operation, ending, &key, |_| true);
         };
-        let txn = Txn::new().delete(key.clone(), Cond::Version(row.version));
+        // The result of a lease is taken by the owner of the node that holds it.
+        let worker = lease_row(&key, &row)?.worker;
+        let txn = self.guard(Txn::new(), &worker)?;
+        let txn = txn.delete(key.clone(), Cond::Version(row.version));
         let txn = self.unpin(txn, operation)?;
-        let committed = self.commit(ending.settle(txn, operation));
+        let committed = self.commit_owned(&worker, ending.settle(txn, operation));
         if matches!(committed, Err(StateError::Conflict(_))) && self.store.get(&key)?.is_none() {
             return self.end_queued(operation, ending, &key, |_| true);
         }

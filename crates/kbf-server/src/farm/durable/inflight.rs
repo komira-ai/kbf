@@ -106,22 +106,30 @@ impl Durable {
     }
 
     /// The operation `operation` as the store holds it, or `None` if it has no `op/` row.
+    /// Its lease is found through its `lease-by-op/` row ([`Durable::lease_of`]).
     fn stored_operation(
         &self,
         operation: OperationId,
+    ) -> Result<Option<StoredOperation>, StateError> {
+        self.stored_with(operation, None)
+    }
+
+    /// [`Durable::stored_operation`], given the lease the caller has read as the
+    /// operation's (`None` leaves the lookup to this call).
+    pub(super) fn stored_with(
+        &self,
+        operation: OperationId,
+        known: Option<LeaseGrant>,
     ) -> Result<Option<StoredOperation>, StateError> {
         let key = op_key(operation);
         let Some(row) = self.store.get(&key)? else {
             return Ok(None);
         };
         let request = request_row(&key, &row)?;
-        let mut lease = None;
-        for (key, row) in self.store.scan_prefix("lease/")? {
-            let grant = lease_row(&key, &row)?;
-            if grant.operation == operation {
-                lease = Some(grant);
-            }
-        }
+        let lease = match known {
+            Some(grant) => Some(grant),
+            None => self.lease_of(operation)?,
+        };
         let losses = match self.store.get(&loss_key(operation))? {
             Some(row) => u32::try_from(number("loss", &row)?)
                 .map_err(|_| corrupt(&loss_key(operation), "not a loss count"))?,
