@@ -66,13 +66,16 @@ pub fn gpus_from_macos_sysctl(text: &str) -> Result<u64, ParseError> {
 pub const GPU_KIND_NATIVE: &str = "native";
 
 /// The core count of a Mac's GPU from `ioreg -r -d 1 -c AGXAccelerator`: the number in
-/// the first `"gpu-core-count" = <n>` line. `None` when no such line has a number (a
+/// the first `"gpu-core-count" = <n>` line (the tree art `ioreg` draws before a property,
+/// `| `, is skipped). `None` when no such line has a number (a
 /// guest's paravirtual GPU, or a Mac whose `ioreg` printed nothing).
 #[must_use]
 pub fn gpu_cores_from_macos_ioreg(text: &str) -> Option<u64> {
     text.lines().find_map(|line| {
         let (key, value) = line.split_once('=')?;
-        if key.trim() != "\"gpu-core-count\"" {
+        // `ioreg` draws its tree in front of a node's property lines (`| `, `| | `).
+        let key = key.trim_matches(|c: char| c == '|' || c.is_whitespace());
+        if key != "\"gpu-core-count\"" {
             return None;
         }
         value.trim().parse().ok().filter(|&n| n > 0)
@@ -81,7 +84,7 @@ pub fn gpu_cores_from_macos_ioreg(text: &str) -> Option<u64> {
 
 /// The Metal GPU family of an Apple silicon chip, from its name as
 /// `machdep.cpu.brand_string` gives it (`Apple M3 Ultra`): the N of the highest
-/// `MTLGPUFamilyAppleN` the chip supports. M1 is 7, M2 is 8, M3 and M4 are 9, M5 is 10.
+/// `MTLGPUFamilyAppleN` the chip supports. M1 is 7, M2 is 8, M3 and M4 are 9.
 /// `None` for a name that is not `Apple M<n>` or a generation this table does not know
 /// yet: the node then reports no family, and a newer chip is added here.
 #[must_use]
@@ -92,7 +95,6 @@ pub fn metal_family_of_apple_chip(brand: &str) -> Option<u32> {
         1 => Some(7),
         2 => Some(8),
         3 | 4 => Some(9),
-        5 => Some(10),
         _ => None,
     }
 }

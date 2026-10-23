@@ -17,7 +17,8 @@
 //! names its device `Apple Paravirtual device`), not a farm Mac: a pass there shows the
 //! profile leaves the Metal path open for a pool user with no GUI session, and says
 //! nothing of an M-series GPU's throughput, its Metal family or its user clients. The
-//! farm Macs run the same test with their real GPU.
+//! same test is run by hand on a farm Mac (`cargo xtask sudo-test`, below) to see its real
+//! GPU; no workflow runs it there.
 //!
 //! Every test is `#[ignore]`: each needs root and real users. The macOS CI jobs run them
 //! with `cargo xtask sudo-test -p kbf-driver-native --test slot_gpu -- --test-threads=1
@@ -120,6 +121,9 @@ async fn a_pool_user_under_the_slot_profile_runs_a_compute_kernel() {
 /// for every lease; this shows a GPU run does not put anything where it does not. (On the
 /// hosted runner the run left three entries in the cache folder and one in the temporary
 /// folder, so the check is not vacuous there.)
+/// The test covers the user's home, cache and temporary folders only: not a Metal process
+/// left running after the lease (the kill at the lease's end is `slot_term`'s), nor a
+/// shader cache kept outside those folders.
 #[ignore = "needs root and real users: cargo xtask sudo-test"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_gpu_lease_leaves_nothing_in_the_slot_users_folders() {

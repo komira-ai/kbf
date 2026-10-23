@@ -27,20 +27,29 @@ const PLANTED: [&str; 2] = [
     "(deny mach-lookup (global-name \"com.apple.MTLCompilerService\"))",
 ];
 
-/// Whether profile line `line` denies something Metal needs.
+/// Whether profile line `line` denies something Metal needs: one of the operations listed
+/// in the match below, alone or among several in one deny. This is a list of known denies,
+/// not a proof that Metal works; `tests/slot_gpu.rs` is that proof, on a Mac.
 fn breaks_the_gpu(line: &str) -> bool {
     let Some(rule) = line.trim().strip_prefix("(deny ") else {
         return false;
     };
-    let operation = rule
-        .split(|c: char| c.is_whitespace() || c == ')')
-        .next()
-        .unwrap_or("");
-    match operation {
-        "default" | "iokit*" | "iokit-open" | "mach*" => true,
-        "mach-lookup" => denies_service(rule),
-        _ => false,
-    }
+    // A deny names one or more operations before its filters: `(deny a b (filter ...))`.
+    let head = rule.split('(').next().unwrap_or("");
+    head.split(|c: char| c.is_whitespace() || c == ')')
+        .filter(|op| !op.is_empty())
+        .any(|operation| match operation {
+            "default"
+            | "iokit*"
+            | "iokit-open"
+            | "iokit-get-properties"
+            | "mach*"
+            | "ipc-posix-shm*"
+            | "ipc-posix-shm-read*"
+            | "ipc-posix-shm-read-data" => true,
+            "mach-lookup" => denies_service(rule),
+            _ => false,
+        })
 }
 
 /// Whether the filters of a `mach-lookup` deny (`rule` is the text after `(deny `)
@@ -88,7 +97,7 @@ fn breaking(profile: &str) -> Vec<&str> {
 /// Metal services open; and the device rules appended to every profile, which name
 /// other services, are not taken for such a deny.
 #[test]
-fn the_slot_profile_denies_nothing_the_gpu_needs() {
+fn the_slot_profile_has_none_of_the_denies_known_to_take_the_gpu() {
     for network in [Network::On, Network::Off] {
         let profile = generated(slot_profile(network));
         assert_eq!(
@@ -125,6 +134,10 @@ fn a_planted_deny_is_found_in_the_profile_the_builder_emits() {
         "(deny iokit*)",
         "(deny iokit-open (iokit-user-client-class \"AGXDeviceUserClient\"))",
         "(deny mach*)",
+        "(deny file-write* iokit-open)",
+        "(deny iokit-get-properties)",
+        "(deny ipc-posix-shm*)",
+        "(deny network* mach-lookup (global-name \"com.apple.MTLCompilerService\"))",
         "(deny mach-lookup)",
         "(deny mach-lookup (global-name-prefix \"com.apple.\"))",
         "(deny mach-lookup (global-name-prefix \"com.apple.MTL\"))",
@@ -140,6 +153,8 @@ fn a_planted_deny_is_found_in_the_profile_the_builder_emits() {
         "(deny file-mount)",
         "(deny file-write*)",
         "(deny network*)",
+        "(deny file-write* network*)",
+        "(deny file-write* mach-lookup (global-name \"com.apple.other\"))",
         "(allow iokit-open)",
         "(allow mach-lookup (global-name \"com.apple.MTLCompilerService\"))",
         "(deny mach-lookup (global-name \"com.apple.CoreDevice.CoreDeviceService\"))",

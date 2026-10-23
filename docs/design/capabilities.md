@@ -44,7 +44,7 @@ entries beside it:
 |---|---|---|
 | `gpu.kind` | `native`: the daemon runs on the hardware, so the GPU is the host's own | `kern.hv_vmm_present` is not 1 |
 | `gpu.cores` | the GPU's core count; left out when it cannot be read | `gpu-core-count` of `ioreg -r -d 1 -c AGXAccelerator` (the IOKit registry; `sysctl` has no GPU core count) |
-| `gpu.metal_family` | the N of the highest `MTLGPUFamilyAppleN` the chip supports (M1: 7, M2: 8, M3 and M4: 9, M5: 10); left out for a chip not in the table | the chip name in `machdep.cpu.brand_string` |
+| `gpu.metal_family` | the N of the highest `MTLGPUFamilyAppleN` the chip supports (M1: 7, M2: 8, M3 and M4: 9); left out for a chip not in the table | the chip name in `machdep.cpu.brand_string` |
 
 A Mac whose daemon runs in a virtual machine (`kern.hv_vmm_present` is 1) reports `gpu`
 = 0 and none of these entries: its paravirtual GPU is not the hardware's. A request can

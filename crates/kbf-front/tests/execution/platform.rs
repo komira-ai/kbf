@@ -403,7 +403,9 @@ async fn ios_device_requests_reach_the_scheduler_and_bad_ones_are_refused() {
 /// is bookable, so a GPU test runs beside the Mac's other work) or booked as none (two
 /// GPU tests would share the GPU); more than the Mac's one GPU accepted (no node could
 /// serve it and it would wait for ever; it is refused, naming the one GPU); and the same
-/// request for Linux booked differently (`gpu=2` stays a booking of two). An `os`
+/// request for Linux booked differently (`gpu=2` stays a booking of two); two GPUs on a
+/// `whole_machine` lease on macOS accepted (it is refused like the action lease); and a
+/// request that names no OS booked as a Mac's (`arch` and `gpu=1` book one GPU as asked). An `os`
 /// property names macOS as `OSFamily` does.
 #[tokio::test]
 async fn a_gpu_on_macos_is_the_macs_one_slot() {
@@ -425,12 +427,27 @@ async fn a_gpu_on_macos_is_the_macs_one_slot() {
         let status = start(&farm, &two.action).await.expect_err("two GPUs");
         assert_eq!(status.code(), Code::InvalidArgument);
         assert!(status.message().contains("one GPU"), "{status:?}");
+        // The whole Mac has one GPU too: two is refused for that lease kind as well.
+        let whole_two = job(
+            &format!("whole two {os:?}"),
+            &[os, ("gpu", "2"), ("kbf-lease", "whole_machine")],
+            false,
+        );
+        farm.upload(&whole_two.blobs.iter().collect::<Vec<_>>())
+            .await;
+        let status = start(&farm, &whole_two.action).await.expect_err("two GPUs");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("one GPU"), "{status:?}");
     }
     let linux = job("linux", &[("os", "linux"), ("gpu", "2")], false);
     farm.upload(&linux.blobs.iter().collect::<Vec<_>>()).await;
     start(&farm, &linux.action).await.expect("Execute");
+    // No OS named: not a request for a Mac, so booked as asked.
+    let no_os = job("no os", &[("arch", "arm64"), ("gpu", "1")], false);
+    farm.upload(&no_os.blobs.iter().collect::<Vec<_>>()).await;
+    start(&farm, &no_os.action).await.expect("Execute");
     let submitted = script.submitted();
-    assert_eq!(submitted.len(), 5);
+    assert_eq!(submitted.len(), 6);
     let booked = |i: usize| {
         (
             submitted[i].request.kind,
@@ -443,6 +460,7 @@ async fn a_gpu_on_macos_is_the_macs_one_slot() {
     assert_eq!(booked(2), (LeaseKind::WholeMachine, 0));
     assert_eq!(booked(3), (LeaseKind::Action, 1));
     assert_eq!(booked(4), (LeaseKind::Action, 2));
+    assert_eq!(booked(5), (LeaseKind::Action, 1));
     for i in [0, 2] {
         assert_eq!(
             submitted[i].request.resources,

@@ -101,7 +101,9 @@ fn an_apple_silicon_mac_has_one_gpu() {
 /// Catches: a Mac's GPU core count read from the wrong line (the `model` or
 /// `IOClass` line, the first number in the text), a count that is not a whole number
 /// or is zero taken as the cores, and text with no such line (a guest's paravirtual GPU,
-/// a Mac whose `ioreg` printed nothing) given a count instead of none.
+/// a Mac whose `ioreg` printed nothing) given a count instead of none; and a count
+/// missed because the registry's tree art (`| `) stands before the property, or taken from
+/// inside a dictionary value.
 #[test]
 fn a_macs_gpu_core_count_is_the_registry_line() {
     let ioreg = include_str!("fixtures/apple_m3_ultra.ioreg");
@@ -116,6 +118,17 @@ fn a_macs_gpu_core_count_is_the_registry_line() {
     ] {
         assert_eq!(gpu_cores_from_macos_ioreg(text), None, "{text:?}");
     }
+    // Property lines under tree art, and a count nested in another node's dict.
+    let tree = "+-o AGXAcceleratorG15X  <class AGXAcceleratorG15X>\n  | {\n  |   \"model\" = \"Apple M3 Ultra\"\n  |   \"gpu-core-count\" = 80\n  | | \"x\" = 1\n  | }\n";
+    assert_eq!(gpu_cores_from_macos_ioreg(tree), Some(80));
+    let deep = "  | | | \"gpu-core-count\" = 60\n";
+    assert_eq!(gpu_cores_from_macos_ioreg(deep), Some(60));
+    let nested = "  \"IOKitDiagnostics\" = {\"gpu-core-count\"=7}\n";
+    assert_eq!(
+        gpu_cores_from_macos_ioreg(nested),
+        None,
+        "inside a dict, not a property"
+    );
     let two = "\"gpu-core-count\" = 10\n\"gpu-core-count\" = 40\n";
     assert_eq!(gpu_cores_from_macos_ioreg(two), Some(10), "the first");
 }
@@ -132,7 +145,6 @@ fn a_chips_metal_family_follows_its_generation() {
         ("Apple M2 Pro", 8),
         ("Apple M3 Ultra", 9),
         ("Apple M4", 9),
-        ("Apple M5 Max", 10),
     ] {
         assert_eq!(metal_family_of_apple_chip(brand), Some(family), "{brand}");
     }
@@ -140,6 +152,7 @@ fn a_chips_metal_family_follows_its_generation() {
         "",
         "Apple M",
         "Apple M0",
+        "Apple M5 Max",
         "Apple M6",
         "Apple M12",
         "Intel(R) Xeon(R)",
