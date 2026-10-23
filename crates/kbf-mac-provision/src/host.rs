@@ -117,6 +117,12 @@ pub trait Host {
     fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
         self.run_in(program, args, None, &[])
     }
+    /// Runs the program at `program` with `args`, its standard input fed `input` and then
+    /// closed, its standard error closed and its environment empty but for `LC_ALL=C`.
+    ///
+    /// # Errors
+    /// The program could not be started, fed or waited for.
+    fn run_with_input(&self, program: &str, args: &[&str], input: &str) -> io::Result<Output>;
     /// `lstat` of `path` on the Mac; `None` when there is nothing there.
     fn lstat(&self, path: &str) -> Option<Stat>;
     /// Writes `bytes` to the file at `path`, never through a link: it is created with
@@ -206,6 +212,35 @@ impl Host for RealHost {
         })
     }
 
+    fn run_with_input(&self, program: &str, args: &[&str], input: &str) -> io::Result<Output> {
+        let mut child = Command::new(self.on(program))
+            .args(args)
+            .env_clear()
+            .env("LC_ALL", "C")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("no stdin"))?;
+        // Fed from a thread, so that a program that prints as it reads cannot fill its
+        // output pipe while this waits for room in its input.
+        let out = std::thread::scope(|scope| {
+            let feed = scope.spawn(move || stdin.write_all(input.as_bytes()));
+            let out = child.wait_with_output();
+            // A program that exits before it has read everything closes the pipe: its
+            // status says whether that is a failure.
+            let _ = feed.join();
+            out
+        })?;
+        Ok(Output {
+            success: out.status.success(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        })
+    }
+
     fn lstat(&self, path: &str) -> Option<Stat> {
         fs::symlink_metadata(self.on(path))
             .ok()
@@ -283,6 +318,23 @@ impl<'a> Mac<'a> {
             .run(program, args)
             .map(|o| o.stdout.trim_end_matches('\n').to_owned())
             .unwrap_or_default()
+    }
+
+    /// What `program args` prints on stdout, as [`Mac::out`] gives it, when it runs and
+    /// exits 0; the reason when it does not.
+    pub(crate) fn try_out(&self, program: &str, args: &[&str]) -> Result<String, String> {
+        match self.host.run(program, args) {
+            Ok(o) if o.success => Ok(o.stdout.trim_end_matches('\n').to_owned()),
+            Ok(_) => Err(format!("{program} exited non-zero")),
+            Err(e) => Err(format!("{program} did not run: {e}")),
+        }
+    }
+
+    /// Whether `program args` runs, is fed `input` and exits 0.
+    pub(crate) fn succeeds_with_input(&self, program: &str, args: &[&str], input: &str) -> bool {
+        self.host
+            .run_with_input(program, args, input)
+            .is_ok_and(|o| o.success)
     }
 
     /// Whether `program args` runs and exits 0.

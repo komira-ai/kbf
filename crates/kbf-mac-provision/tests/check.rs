@@ -129,7 +129,7 @@ fn the_node_config_has_no_label_key_for_any_profile() {
     let texts = [
         base.clone(),
         format!("{base}daemon_user=root\n"),
-        format!("{base}pool_users=2\n"),
+        base.replace("pool_users=4", "pool_users=2"),
         support::EXAMPLE.to_owned(),
     ];
     for text in texts {
