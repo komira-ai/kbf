@@ -32,9 +32,9 @@ use tokio::net::TcpStream;
 const TTL: Duration = Duration::from_secs(30);
 const DWELL: Duration = Duration::from_secs(120);
 
-/// The tick of every server here: one that does not come within a test. The update controller
-/// looks at every tick, and its reads of the store meet the faults that a test arms for a
-/// request (`support/looks.rs` says why). No test here waits for a tick.
+/// The tick of every server here: one that does not come within a test. A server task that
+/// looks at every tick would meet the faults that a test arms for a request (`support/looks.rs`
+/// says why). No test here waits for a tick.
 const TICK: Duration = Duration::from_secs(3600);
 
 fn config() -> MembershipConfig {
@@ -633,10 +633,10 @@ async fn members_is_read_like_nodes_and_takes_no_write() {
 }
 
 /// The reads of `(update/desired, deny/)` the server makes by itself as it starts, with no
-/// release store: the update controller reads `update/desired` once (no release is desired),
-/// and the sweeper's refresh reads `deny/` ([`looks::Looks`]). A test that arms a fault first
+/// release store: nothing reads `update/desired`, and the sweeper's refresh reads `deny/`
+/// ([`looks::Looks`]). A test that arms a fault first
 /// waits for them; the test at the end holds the numbers.
-const START_LOOKS: (usize, usize) = (1, 1);
+const START_LOOKS: (usize, usize) = (0, 1);
 
 /// A server whose state store is the hooked fake, which the test makes fail.
 fn failing(hooked: &Arc<Hooked>) -> Server {
@@ -707,12 +707,13 @@ async fn a_store_that_fails_is_503_and_a_map_that_is_wrong_or_a_panic_is_500() {
 /// Catches the wait of `Looks::done` being wrong, which the failing-store test above cannot
 /// show by itself (it would flake, or hang): the server's own reads of `update/desired` and
 /// `deny/` are `START_LOOKS` at start, and it reads nothing at all by itself after the wait,
-/// for as long as a test runs. A reader added beside the controller and the sweeper, a read
-/// added to one's look, or a tick that comes, makes the total more, and a fault armed after
+/// for as long as a test runs. A reader added beside the sweeper, a read
+/// added to its look, or a tick that comes, makes the total more, and a fault armed after
 /// the wait would be met by one of them and not by its request; a read fewer makes a count
 /// less, and the wait never ends.
 ///
-/// Mutants seen red: `START_LOOKS` of `(0, 1)` and of `(1, 0)` (the counts after the wait).
+/// A `START_LOOKS` above the real counts never ends the wait; one below them lets a read
+/// through after it.
 #[tokio::test]
 async fn the_server_reads_the_store_by_itself_only_at_start() {
     let hooked = Hooked::new();

@@ -74,7 +74,7 @@ mod tests {
     /// missing CONNECT privilege are a login refusal, a missing database is told apart, and
     /// any other code is passed on as the code alone.
     ///
-    /// Mutants seen red: the 42501 operand dropped; `3D000` mapped to `Login`.
+    /// Catches: the 42501 operand dropped; `3D000` mapped to `Login`.
     #[test]
     fn each_sqlstate_is_told_to_the_recipe_that_fits_it() {
         for code in ["28000", "28P01", "42501"] {

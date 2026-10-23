@@ -212,7 +212,7 @@ async fn every_call(channel: &Channel, generation: u64) -> Vec<(&'static str, We
 /// Catches a call that a node serves whatever map its caller routed by: each of the
 /// twelve calls (every method of the four services) from a caller behind the node, or
 /// with no map seen (0), is STALE_MAP naming the node's generation, and none reaches the
-/// store or the segments; the same calls under the node's generation all do. Mutants:
+/// store or the segments; the same calls under the node's generation all do. Catches:
 /// the check removed from any one call (the row for that call reads `Reached`).
 #[tokio::test]
 async fn every_call_of_a_caller_behind_the_node_is_stale_map() {
@@ -292,7 +292,7 @@ async fn a_fetch_that_brings_nothing_is_unavailable() {
 /// asked under (a multi-member node must not serve until it has learned its first map):
 /// each of the twelve calls, from a caller at any generation (0 included), is UNAVAILABLE
 /// and none reaches the store or the segments; the node tried to fetch a map for each.
-/// Mutant: `check` returning `Ok(())` when the source has no map.
+/// Catches: `check` returning `Ok(())` when the source has no map.
 #[tokio::test]
 async fn a_node_with_a_source_and_no_map_refuses_every_call() {
     let (mem, source, channel) = node_holding(Held::none(), Fetch::Nothing).await;

@@ -861,7 +861,7 @@ mod tests {
     /// can no longer be sent again, so they would be held for nothing), and a client body
     /// that is not ready read as an end: a wait is passed on as a wait, the bytes past the
     /// prefix end any resend, and the empty frame and trailers after them are passed on
-    /// and not kept. Mutant: frames without bytes kept after the upload streamed.
+    /// and not kept. Catches: frames without bytes kept after the upload streamed.
     #[tokio::test]
     async fn frames_after_the_bytes_passed_on_are_not_kept() {
         let upload = Upload::new(Body::new(Paced(
@@ -894,7 +894,7 @@ mod tests {
 
     /// Catches an upload given up on because the stream's end arrived as a frame (an empty
     /// data frame, which HTTP/2 uses to carry END_STREAM): it carries no byte, so it does
-    /// not stop the upload being sent again, and it is part of what is sent again. Mutant:
+    /// not stop the upload being sent again, and it is part of what is sent again. Catches:
     /// every frame past the prefix counted as passed on.
     #[tokio::test]
     async fn a_frame_without_bytes_does_not_stop_a_resend() {

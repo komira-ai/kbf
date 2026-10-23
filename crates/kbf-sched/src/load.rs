@@ -5,8 +5,9 @@ use std::cmp::Ordering;
 
 use kbf_types::Resources;
 
-/// A worker's load; the smaller is the less loaded. The larger of its CPU share and its
-/// memory share of what is booked, then how many leases it holds.
+/// A worker's load; the smaller is the less loaded. The largest of its CPU share, its
+/// memory share and its lease share (its leases of its lease cap, if it reports one) of
+/// what is booked, then how many leases it holds.
 ///
 /// Both shares count because the node's limits differ in what happens at the end: a node
 /// out of cores runs its actions slowly, a node out of memory kills them. A share is not
@@ -25,8 +26,11 @@ impl Load {
     pub(crate) fn new(booked: Resources, capacity: Resources, leases: usize) -> Self {
         let cpu = Share::new(booked.cpu_millis, capacity.cpu_millis);
         let memory = Share::new(booked.memory_bytes, capacity.memory_bytes);
+        // A node with no lease cap (or a cap of 0) has no lease share to be short of.
+        let held = u64::try_from(leases).unwrap_or(u64::MAX);
+        let lease_cap = Share::new(held, capacity.leases.unwrap_or(0));
         Self {
-            share: cpu.max(memory),
+            share: cpu.max(memory).max(lease_cap),
             leases,
         }
     }
@@ -134,6 +138,24 @@ mod tests {
         assert_eq!(no_memory, load((500, 1_000), (0, 0), 1));
         assert!(no_memory < load((501, 1_000), (0, 0), 1));
         assert_eq!(load((9, 0), (9, 0), 0), load((0, 5), (0, 5), 0));
+    }
+
+    /// Catches: a capped node ranked by its CPUs alone: a 32-core node capped at 2 leases
+    /// that holds 1 is half used, more than a peer at 10 of 32 cores, and a node at its
+    /// cap is more loaded than any under it. A node without a cap, or with a cap of 0,
+    /// is ranked as before.
+    #[test]
+    fn a_capped_node_is_ranked_by_its_lease_share_too() {
+        let capped = |cap: Option<u64>, leases: usize| {
+            let capacity = Resources::new(32_000, 0);
+            let capacity = cap.map_or(capacity, |c| capacity.with_lease_cap(c));
+            Load::new(Resources::new(leases as u64 * 1_000, 0), capacity, leases)
+        };
+        let peer = load((10_000, 32_000), (0, 0), 10);
+        assert!(peer < capped(Some(2), 1));
+        assert!(capped(Some(2), 1) < capped(Some(2), 2));
+        assert_eq!(capped(None, 1), load((1_000, 32_000), (0, 0), 1));
+        assert_eq!(capped(Some(0), 1), capped(None, 1));
     }
 
     /// Catches: leases ignored when the shares tie, or counted before the shares.

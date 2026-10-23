@@ -66,7 +66,7 @@ fn request(i: u32) -> pb::RegisterRequest {
 
 /// Catches: the report of the node's log history dropped between the wire and the store (the
 /// request's `last_member_id` and `last_boot` not read): a node that says it last wrote as
-/// member 3 at boot 5 is answered member 3 at boot 6, not member 1 at boot 1. Mutant: the
+/// member 3 at boot 5 is answered member 3 at boot 6, not member 1 at boot 1. Catches: the
 /// service passes `None` to `register_after`, red.
 #[tokio::test]
 async fn register_reads_the_nodes_last_member_and_boot() {
@@ -375,7 +375,7 @@ async fn a_heartbeat_carries_what_the_node_owes() {
 /// Catches: the wire's open-writes report not reaching the judgement, or reaching it wrong,
 /// and the map generation it rides with. A heartbeat that says 3 writes are open at map 7
 /// shows 3 and 7 for the node; one that says `writes_known = false` shows none whatever count
-/// rides with it; one from an older node (neither field) shows none, never zero. Mutants: the
+/// rides with it; one from an older node (neither field) shows none, never zero. Catches: the
 /// flag ignored; the count read from the debts field; the generation dropped.
 #[tokio::test]
 async fn a_heartbeat_carries_the_writes_the_node_has_open() {
@@ -430,7 +430,7 @@ async fn a_heartbeat_carries_the_writes_the_node_has_open() {
 /// `runs_log` and `build_commit` do not replace the registration's; a log version of 0 is
 /// 0, not absent; a heartbeat that says none of them (an older node) leaves the log version
 /// `None`; and a registration of a node that says none (restarted on an older build) clears
-/// all three. Mutants: the service reading the facts of neither call (the rows stay `None`),
+/// all three. Catches: the service reading the facts of neither call (the rows stay `None`),
 /// of the registration only, or of the heartbeat only (`log_version` stays at 1); a
 /// heartbeat that takes over the registration's `runs_log`; an absent version read as 0.
 #[tokio::test]

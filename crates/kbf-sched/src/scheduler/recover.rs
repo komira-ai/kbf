@@ -90,7 +90,8 @@ impl Scheduler {
 
     /// Takes `operations` up in an empty scheduler, which grants leases under `term`
     /// from `next_seq` and operation ids from `next_operation` on (both past every id
-    /// the store ever named, finished operations' included, so no id names two).
+    /// the store ever named or reserved, finished operations' included, so no id names
+    /// two). Leases are placed without limit until [`Scheduler::use_seq_block`] sets one.
     ///
     /// An operation with no lease is queued. One with a lease holds it on its worker,
     /// which has not registered with this scheduler yet: for [`LEASE_GRACE`] the lease

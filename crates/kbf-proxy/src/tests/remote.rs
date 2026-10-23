@@ -216,7 +216,7 @@ fn handler_path(case: &Case) -> String {
 /// One token that differs from a good one in a single way is refused with 401, and neither
 /// the child nor the handler is reached, on either route.
 ///
-/// Kills: each check of the verifier taken out (a mutant that skips the audience check, one
+/// Kills: each check of the verifier taken out (a defect that skips the audience check, one
 /// that accepts any `kid`), and a refusal that still forwards the call.
 #[tokio::test(start_paused = true)]
 async fn a_token_that_is_wrong_in_one_way_is_refused_on_both_routes() {

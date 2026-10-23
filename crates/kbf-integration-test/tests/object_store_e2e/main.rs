@@ -8,7 +8,7 @@
 //! adapters the frontend binary does not have yet (see [`farm`]).
 //!
 //! Each scenario is a failure the operator can meet; the tests say which defect each
-//! catches and which mutant was planted to see it red (`docs/design/object-store-registration.md`).
+//! catches (`docs/design/object-store-registration.md`).
 
 #![cfg(target_os = "linux")]
 

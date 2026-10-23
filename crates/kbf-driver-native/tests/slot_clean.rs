@@ -449,6 +449,36 @@ async fn a_lease_finds_nothing_the_lease_before_it_left_on_its_slot() {
     );
 }
 
+/// A lease, as lease `1.seq`, whose action says `started` in its directory and then waits
+/// for `go`; `plant` runs in between and its result is returned with the lease's.
+///
+/// Whatever is in a free slot when a lease is handed it is refused at slot-ready (the
+/// assertion, `tests/slot_assert.rs`), so a state that the clean after the lease is to
+/// remove, or to fail on, is made while the lease runs, as a lease would make it.
+async fn lease_planting<T>(
+    rt: &NativeRuntime<MemoryCas>,
+    cas: &Arc<MemoryCas>,
+    scratch: &Scratch,
+    seq: u64,
+    plant: impl FnOnce() -> T,
+) -> (kbf_proto::reapi::ActionResult, T) {
+    let act = scratch.act();
+    let spec = Spec::argv(&[&act, "write-lines", "started", ";", "wait-for", "go", "60"]);
+    let root = scratch.lease_root(seq);
+    let planting = async {
+        let give_up = Instant::now() + PROMPT * 3;
+        while !root.join("started").exists() {
+            assert!(Instant::now() < give_up, "the lease never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let planted = plant();
+        std::fs::write(root.join("go"), b"").expect("go");
+        planted
+    };
+    let (ran, planted) = tokio::join!(support::run(rt, cas, seq, &spec), planting);
+    (ran.expect("the lease ran"), planted)
+}
+
 #[path = "slot_clean/single_pass.rs"]
 mod single_pass;
 #[path = "slot_clean/steps_needed.rs"]
@@ -790,24 +820,36 @@ async fn a_process_the_kill_cannot_end_fails_the_clean_within_its_deadline() {
         Some("1"),
         "the slot was dirty at start-up"
     );
-    // After the start, which would fail on it.
-    let stuck = Unkillable::new(user.uid);
-    let mut ids = None;
-    let give_up = Instant::now() + PROMPT;
-    while ids != Some((user.uid, 0)) && Instant::now() < give_up {
-        std::thread::sleep(Duration::from_millis(20));
-        ids = ids_of(stuck.0);
-    }
-    let listed = uid::processes(user.uid).expect("list").contains(&stuck.0);
-    // Killed by its guard after 120 s at the latest: a kill with no deadline, which
-    // waits for it forever (on the runtime's thread too, as the dropped run ends its
-    // uid), then ends, and the test fails instead of hanging the job.
-    let (release, guard) = stuck.guard(Duration::from_secs(120));
+    // After the slot-ready check, which would refuse the slot on it: planted while the
+    // lease runs, as a process the action left behind would be.
     let act = scratch.act();
-    let action = Spec::argv(&[&act, "id"]).store(&cas);
+    let waiting = Spec::argv(&[&act, "write-lines", "started", ";", "wait-for", "go", "60"]);
+    let action = waiting.store(&cas);
+    let root = scratch.lease_root(1);
     let started = Instant::now();
-    let ended =
-        tokio::time::timeout(Duration::from_secs(90), rt.run(support::work(1, action, 0))).await;
+    let lease = tokio::time::timeout(Duration::from_secs(90), rt.run(support::work(1, action, 0)));
+    let planting = async {
+        let give_up = Instant::now() + PROMPT * 3;
+        while !root.join("started").exists() {
+            assert!(Instant::now() < give_up, "the lease never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let stuck = Unkillable::new(user.uid);
+        let mut ids = None;
+        let give_up = Instant::now() + PROMPT;
+        while ids != Some((user.uid, 0)) && Instant::now() < give_up {
+            std::thread::sleep(Duration::from_millis(20));
+            ids = ids_of(stuck.0);
+        }
+        let listed = uid::processes(user.uid).expect("list").contains(&stuck.0);
+        // Killed by its guard after 120 s at the latest: a kill with no deadline, which
+        // waits for it forever (on the runtime's thread too, as the dropped run ends its
+        // uid), then ends, and the test fails instead of hanging the job.
+        let (release, guard) = stuck.guard(Duration::from_secs(120));
+        std::fs::write(root.join("go"), b"").expect("go");
+        (ids, listed, release, guard)
+    };
+    let (ended, (ids, listed, release, guard)) = tokio::join!(lease, planting);
     let took = started.elapsed();
     let after = slots_reported(&rt);
     let _ = release.send(());

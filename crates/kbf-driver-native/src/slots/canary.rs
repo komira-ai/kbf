@@ -409,7 +409,7 @@ impl Report {
 }
 
 /// Runs every canary of `canaries` with `run` (which starts the probe as the slot's user
-/// under the lease's profile), none skipped after a failure, so each can be seen red on
+/// under the lease's profile), none skipped after a failure, so each can fail on
 /// its own. A canary that could not be started or timed out is a failure too. Every
 /// result is logged with the canary's name and how long it took.
 pub fn check(canaries: &[Canary], run: &mut dyn FnMut(&Canary) -> io::Result<Ran>) -> Report {
@@ -1395,8 +1395,8 @@ mod tests {
     /// by that uid, are still there): on a kill during prepare, a failed hand-over and a
     /// canary that could not start, the slot stays with the caller, which removes the
     /// directory and only then releases it; and after a kill while waiting for the next
-    /// slot, with one set aside, no slot is held and the directory is removed. Seen red
-    /// with the offer releasing the slot itself on an error (the slot is released
+    /// slot, with one set aside, no slot is held and the directory is removed. Catches
+    /// the offer releasing the slot itself on an error (the slot is released
     /// before the directory event).
     #[test]
     fn on_every_failure_the_directory_goes_before_the_slot_is_released() {
@@ -1451,7 +1451,7 @@ mod tests {
     /// runtime shutting down, or a panic unwinding through the poll): the drop sets the
     /// cancel flag, so the work records no step after the one in flight. A run that
     /// finishes does not leave the flag set (the canaries reuse it after the hand-over).
-    /// Seen red with the drop guard removed.
+    /// Catches the drop guard being removed.
     #[test]
     fn a_dropped_wait_stops_the_blocking_work_too() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1530,7 +1530,7 @@ mod tests {
     /// killed and its slot released): the work records a step every 20 ms and stops at
     /// its next step once the flag is set; after `until_killed` returns, no step is
     /// recorded, and fewer than all of them ran. A run that finishes first is `Done`.
-    /// Seen red with `until_killed` returning on the kill without awaiting the work.
+    /// Catches `until_killed` returning on the kill without awaiting the work.
     #[test]
     fn a_kill_waits_for_the_blocking_work_to_stop() {
         use std::sync::atomic::{AtomicBool, Ordering};

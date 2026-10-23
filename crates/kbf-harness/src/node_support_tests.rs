@@ -8,7 +8,7 @@ use super::*;
 #[test]
 fn the_stand_in_crun_is_set_up_with_its_id_tools_and_the_image_unpacked() {
     // Catches: a node whose start-up finds no `crun`, no setuid id tools or no unpacked image
-    // (it would refuse to start, or pull an image no registry serves). Mutant: `crun` makes
+    // (it would refuse to start, or pull an image no registry serves). Catches: `crun` makes
     // the id tools mode 0755, or unpacks the image under another digest.
     let root = crate::scratch("node-support-crun");
     let (bin, data) = (root.join("bin"), root.join("data"));
@@ -48,7 +48,7 @@ fn the_stand_in_crun_is_set_up_with_its_id_tools_and_the_image_unpacked() {
 fn a_directory_closed_to_others_is_not_where_a_container_daemon_works() {
     // Catches: a container node started under a home directory the driver refuses (its
     // containers' ids cannot search down to the data directory), and a scratch root that
-    // ignores a directory that is open. Mutant: `open_to_others` always true, or always false.
+    // ignores a directory that is open. Catches: `open_to_others` always true, or always false.
     let root = crate::scratch("node-support-root");
     let open = root.join("open");
     std::fs::create_dir_all(&open).expect("dir");
@@ -72,7 +72,7 @@ fn files_holding_finds_each_inode_that_holds_the_bytes_whole() {
     // Catches: a hot copy missed (the test then proves a blob is not stored twice when it
     // is), one inode counted once per name (a hard link is no second copy), a file that holds
     // only the start of the bytes (or all of it but the end) taken for a copy, and a path that is not there ending the
-    // search. Mutants: the missing path `unwrap`ped; `any` on the anchor alone.
+    // search. Catches: the missing path `unwrap`ped; `any` on the anchor alone.
     let d = crate::scratch("files-holding");
     let bytes: Vec<u8> = (0..200u8).collect();
     let (dir, other) = (d.join("a/b"), d.join("c"));

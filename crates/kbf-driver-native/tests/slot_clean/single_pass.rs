@@ -25,9 +25,9 @@ use kbf_driver_native::NativeRuntime;
 use kbf_driver_native::slots::SlotUser;
 use kbf_driver_native::slots::clean::{Check, Skipped, Step};
 
-use super::{as_user, assert_root, entries, slots_reported};
+use super::{as_user, assert_root, entries, lease_planting, slots_reported};
 use crate::support::pool::{Scratch, Users, config, home_of};
-use crate::support::{MemoryCas, PROMPT, Spec, stdout};
+use crate::support::{CLEAN_ALLOWANCE, GRACE_ALLOWANCE, MemoryCas, PROMPT, Spec, stdout};
 
 /// A runtime over one pool user named after the test, optionally with a step left out of its clean.
 struct Rig {
@@ -66,6 +66,16 @@ impl Rig {
         crate::support::run(&self.rt, &self.cas, seq, &Spec::argv(&[&act, "id"]))
             .await
             .expect("the lease ran")
+    }
+
+    /// [`Rig::lease`] whose action waits while `plant` makes a state in the user's slot
+    /// ([`lease_planting`]); the lease's result and `plant`'s.
+    async fn lease_planting<T>(
+        &self,
+        seq: u64,
+        plant: impl FnOnce() -> T,
+    ) -> (kbf_proto::reapi::ActionResult, T) {
+        lease_planting(&self.rt, &self.cas, &self.scratch, seq, plant).await
     }
 
     fn reported(&self) -> Option<String> {
@@ -120,22 +130,25 @@ struct Locked {
 async fn locked_home(name: &str, skipped: Option<Skipped>, next: bool) -> Locked {
     let rig = Rig::new(name, skipped);
     let home = home_of(&rig.user);
-    std::fs::write(home.join("kbf-locked"), b"x").expect("file");
-    std::fs::create_dir(home.join("kbf-locked-dir")).expect("dir");
-    std::fs::write(home.join("kbf-locked-dir/inner"), b"x").expect("inner");
-    for path in ["kbf-locked", "kbf-locked-dir", "kbf-locked-dir/inner"] {
-        rig.give(&home.join(path));
-    }
-    let locked = as_user(
-        &rig.user,
-        "/usr/bin/chflags",
-        &["uchg", &home.to_string_lossy()],
-    );
-    assert!(
-        locked.status.success(),
-        "chflags uchg on the home: {locked:?}"
-    );
-    let first = rig.lease(1).await;
+    let (first, ()) = rig
+        .lease_planting(1, || {
+            std::fs::write(home.join("kbf-locked"), b"x").expect("file");
+            std::fs::create_dir(home.join("kbf-locked-dir")).expect("dir");
+            std::fs::write(home.join("kbf-locked-dir/inner"), b"x").expect("inner");
+            for path in ["kbf-locked", "kbf-locked-dir", "kbf-locked-dir/inner"] {
+                rig.give(&home.join(path));
+            }
+            let locked = as_user(
+                &rig.user,
+                "/usr/bin/chflags",
+                &["uchg", &home.to_string_lossy()],
+            );
+            assert!(
+                locked.status.success(),
+                "chflags uchg on the home: {locked:?}"
+            );
+        })
+        .await;
     assert_eq!(first.exit_code, 0);
     let reported = rig.reported();
     let flags = std::fs::symlink_metadata(&home).expect("home").st_flags();
@@ -199,14 +212,17 @@ async fn a_file_in_the_entry_root_outside_its_folders_is_removed() {
     let entry = rig.entry();
     let file = entry.join("kbf-entry-stray");
     let stray = entry.join("kbf-entry-stray-dir");
-    std::fs::write(&file, b"x").expect("file");
-    std::fs::create_dir(&stray).expect("dir");
-    std::fs::write(stray.join("inner"), b"x").expect("inner");
-    for path in [&file, &stray, &stray.join("inner")] {
-        rig.give(path);
-    }
-    let planted = Planted(vec![file.clone(), stray.clone()]);
-    let first = rig.lease(1).await;
+    let _planted = Planted(vec![file.clone(), stray.clone()]);
+    let (first, ()) = rig
+        .lease_planting(1, || {
+            std::fs::write(&file, b"x").expect("file");
+            std::fs::create_dir(&stray).expect("dir");
+            std::fs::write(stray.join("inner"), b"x").expect("inner");
+            for path in [&file, &stray, &stray.join("inner")] {
+                rig.give(path);
+            }
+        })
+        .await;
     assert_eq!(first.exit_code, 0);
     let left = entries(&entry);
     let reported = rig.reported();
@@ -218,7 +234,6 @@ async fn a_file_in_the_entry_root_outside_its_folders_is_removed() {
     )
     .await
     .expect("the second lease ran");
-    drop(planted);
     assert!(
         !left.iter().any(|n| n.starts_with("kbf-entry-stray")),
         "the entry root still holds {left:?}"
@@ -358,9 +373,12 @@ async fn a_failed_clean_leaves_the_user_dirty_and_the_recovery_cleans_it_again()
     let rig = Rig::new("dirty", None);
     let home = home_of(&rig.user);
     let stuck = home.join("kbf-ci-stuck");
-    std::fs::write(&stuck, b"stuck").expect("stuck file");
-    crate::support::pool::run("/usr/bin/chflags", &["uchg", &stuck.to_string_lossy()]);
-    let first = rig.lease(1).await;
+    let (first, ()) = rig
+        .lease_planting(1, || {
+            std::fs::write(&stuck, b"stuck").expect("stuck file");
+            crate::support::pool::run("/usr/bin/chflags", &["uchg", &stuck.to_string_lossy()]);
+        })
+        .await;
     assert_eq!(first.exit_code, 0);
     let reported = rig.reported();
     let act = rig.scratch.act();
@@ -376,9 +394,12 @@ async fn a_failed_clean_leaves_the_user_dirty_and_the_recovery_cleans_it_again()
         .filter(|e| e.file_name().to_string_lossy().starts_with(".kbf-"))
         .count();
     crate::support::pool::run("/usr/bin/chflags", &["nouchg", &stuck.to_string_lossy()]);
+    // The offer cleans the slot again (with the SIGTERM grace and the assertion) before
+    // the lease runs on it, and the lease's own end gives the same grace.
+    let bound = PROMPT * 3 + GRACE_ALLOWANCE + CLEAN_ALLOWANCE;
     let third = tokio::time::timeout(
-        PROMPT * 3,
-        crate::support::run(&rig.rt, &rig.cas, 3, &Spec::argv(&[&act, "id"])),
+        bound + Duration::from_secs(5),
+        crate::support::run_within(&rig.rt, &rig.cas, 3, &Spec::argv(&[&act, "id"]), bound),
     )
     .await
     .expect("the next offer got the slot once the file could go")
@@ -459,9 +480,12 @@ async fn a_node_whose_every_slot_is_dirty_recovers_by_itself_and_reports_it() {
     assert_eq!(reported_slots(&reports).as_deref(), Some("1"));
     let home = home_of(&rig.user);
     let stuck = home.join("kbf-ci-stuck");
-    std::fs::write(&stuck, b"stuck").expect("stuck file");
-    crate::support::pool::run("/usr/bin/chflags", &["uchg", &stuck.to_string_lossy()]);
-    let first = rig.lease(1).await;
+    let (first, ()) = rig
+        .lease_planting(1, || {
+            std::fs::write(&stuck, b"stuck").expect("stuck file");
+            crate::support::pool::run("/usr/bin/chflags", &["uchg", &stuck.to_string_lossy()]);
+        })
+        .await;
     assert_eq!(first.exit_code, 0);
     let down = report_says(&mut reports, "0", PROMPT).await;
     assert!(

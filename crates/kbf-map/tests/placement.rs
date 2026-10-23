@@ -1,7 +1,6 @@
 //! Placement: who owns a digest, and how that moves with the map.
 //!
-//! Each test names the defect it catches; the mutant that was planted to watch it fail
-//! is in the pull request.
+//! Each test names the defect it catches.
 
 mod common;
 

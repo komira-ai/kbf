@@ -16,7 +16,7 @@ fn page(fake: &Fake, path: &str) -> (u16, String) {
 /// the fixture is its own: age 41.2 s, in-phase 40.1 s), an age left in raw
 /// milliseconds, a phase shown only by colour (its word is in the pill), a node that is
 /// not a link to its own leases, the term left out, a header without `scope`.
-/// Mutants: `age_ms` and `since_ms` swapped; the phase word dropped from the pill; the
+/// Catches: `age_ms` and `since_ms` swapped; the phase word dropped from the pill; the
 /// node written as plain text.
 #[test]
 fn every_lease_shows_its_fields_in_a_labelled_table() {
@@ -79,7 +79,7 @@ fn every_lease_shows_its_fields_in_a_labelled_table() {
 /// into the form never reaching the route, an empty submit read as a node (the API
 /// answers it `400`), "All nodes" missing on a filtered page or shown on an unfiltered
 /// one, a query key of the page's own handed on to the route (it would be `400`).
-/// Mutants: `node` not forwarded; the empty-node check dropped; a stray key forwarded.
+/// Catches: `node` not forwarded; the empty-node check dropped; a stray key forwarded.
 #[test]
 fn the_node_filter_is_forwarded_and_an_empty_one_is_not() {
     let fake = sched_farm();
@@ -116,7 +116,7 @@ fn the_node_filter_is_forwarded_and_an_empty_one_is_not() {
 /// page that follows a `next_page` that is not a `/v1/leases` link of the API (another
 /// host, another route, a protocol-relative URL) or carries a key of its own, and a
 /// page that cannot be read again from the link it wrote.
-/// Mutants: the link written on the route's path; the token dropped; the path check
+/// Catches: the link written on the route's path; the token dropped; the path check
 /// removed.
 #[test]
 fn the_next_page_is_the_apis_link_on_this_page() {
@@ -200,7 +200,7 @@ fn an_empty_farm_says_so_and_why_it_may_be_empty() {
 /// status is the page's (a bad token is `400`, with the filter still there to correct
 /// it), a `401`'s challenge and a `503`'s retry time are passed on, a route that cannot
 /// be reached or answers a document the page cannot read is `502`.
-/// Mutants: the status forced to 200; the headers not passed on; the filter dropped
+/// Catches: the status forced to 200; the headers not passed on; the filter dropped
 /// from the failed page.
 #[test]
 fn a_failed_read_keeps_the_apis_status_and_the_filter() {
@@ -260,7 +260,7 @@ fn a_failed_read_keeps_the_apis_status_and_the_filter() {
 /// API sends, or the visitor types, written as markup: node, lease id, phase,
 /// operation, instance, digest, platform, QoS and term, and the node filter in the form
 /// and in the URL it reads. (Every field is JSON, so none is non-UTF-8 here.)
-/// Mutant: `Html::text` writing raw.
+/// Catches: `Html::text` writing raw.
 #[test]
 fn hostile_strings_are_text() {
     let mut item = lease(HOSTILE, HOSTILE, HOSTILE, 1, 2);
@@ -296,7 +296,7 @@ fn hostile_strings_are_text() {
 }
 
 /// Catches: an age that rounds into the next unit or reads in the wrong one.
-/// Mutants: a unit boundary moved by one; seconds shown rounded.
+/// Catches: a unit boundary moved by one; seconds shown rounded.
 #[test]
 fn ages_read_in_their_largest_units_truncated() {
     use super::super::sched::age;

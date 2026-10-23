@@ -12,23 +12,25 @@
 //! Then the version: one above the highest `v<MAJOR>.<MINOR>.N` of the `VERSION` base
 //! among the tags and the releases (drafts too), or `1`; or, on a re-run of a commit the
 //! highest tag already names, that tag's version again (`reused=true`). Then the push is
-//! classified from the files `--before` to `--sha` changed:
+//! classified from the files changed since the highest release tag that is an ancestor of
+//! `--sha` (and not `--sha` itself, so a re-run measures what its release covered):
 //!
 //! - `code`: some file ships in a release. Not code: a root `*.md`, `docs/**`,
 //!   `.github/**`, `site/**`, `infra/**` (a `.md` under `crates/` is code: it may be
-//!   `include_str!`ed). `VERSION` is code (a bump releases). A mixed push is code.
+//!   `include_str!`ed). `VERSION` is code (a bump releases). A mixed range is code.
 //! - `site`: some file is under `site/` or `docs/`, which kbf.dev renders.
-//! - `pipeline`: some file is the release machinery or what it trusts (`.github/`,
-//!   `infra/`, `crates/xtask/`, `crates/kbf-gate/`, `.config/`, `.cargo/`,
-//!   `rust-toolchain*`, `deny.toml`, `Cargo.lock`): the pipeline does not release a
-//!   commit that changes it; the next push that does not releases both. Classes are not
-//!   exclusive: such a file under `crates/` is code too.
+//! - `pipeline`: some file the commit `--sha` itself changed (over its first parent) is the
+//!   release machinery or what it trusts (`.github/`, `infra/`, `crates/xtask/`,
+//!   `crates/kbf-gate/`, `.config/`, `.cargo/`, `rust-toolchain*`, `deny.toml`,
+//!   `Cargo.lock`): the pipeline does not release a commit that changes it; the next
+//!   commit that does not releases both. It is the commit's own change and not the range's:
+//!   a range keeps a pipeline file until a release clears it, and none would be made.
+//!   Classes are not exclusive: such a file under `crates/` is code too.
 //!
-//! A `--before` of all zeros (a branch's first push) names no earlier commit, and one
-//! this checkout does not hold (a forced push) cannot be diffed: both read as `code=true`
-//! and `site=true`, the checks that are safe to repeat. A first push is no change to the
-//! pipeline (`pipeline=false`); a before that is lost might hide one, so it reads
-//! `pipeline=true`. A push that changed no file is not code, and neither is it a site.
+//! Because the range runs from the last release and not from the push, a push that a newer
+//! push superseded or queued behind is released with the next, and a docs-only push after
+//! code releases that code. With no release tag yet, the first release is all of it
+//! (`code=true`, `site=true`). A range with no changed file is not code, and not a site.
 //!
 //! Prints `version`, `tag`, `reused`, `code`, `site` and `pipeline` as `key=value` lines,
 //! and appends them to `--output` (on Actions, `GITHUB_OUTPUT`).
@@ -36,10 +38,10 @@
 use std::path::{Path, PathBuf};
 
 use super::append_output;
-use super::git::{git, git_output};
+use super::git::{commit_of, git, git_output, is_ancestor, release_tags};
 use super::tags::{self, Base, Standing, Version};
 use crate::Error;
-use crate::build_commit::{full_commit, is_commit};
+use crate::build_commit::full_commit;
 
 /// The arguments of `release plan`.
 #[derive(clap::Args)]
@@ -50,11 +52,7 @@ pub struct PlanArgs {
     /// The commit pushed, a full SHA (on Actions, `GITHUB_SHA`).
     #[arg(long)]
     pub sha: String,
-    /// The commit the branch was at before the push (`github.event.before`): a SHA, or
-    /// all zeros for the first push.
-    #[arg(long)]
-    pub before: String,
-    /// A checkout holding both commits (`fetch-depth: 0`).
+    /// A checkout holding the whole history and every tag (`fetch-depth: 0`).
     #[arg(long, default_value = ".")]
     pub repo_dir: PathBuf,
     /// The freeze (on Actions, `vars.RELEASE_FREEZE`): when it is not empty, nothing is
@@ -117,44 +115,54 @@ pub fn classify(paths: &[String]) -> Class {
     }
 }
 
-/// The files `before..sha` changed, renames as the two paths they touch, or none when
-/// `before` is not a commit this checkout holds.
-fn changed(repo_dir: &Path, before: &str, sha: &str) -> Result<Option<Vec<String>>, Error> {
-    let probe = format!("{before}^{{commit}}");
-    let known = git_output(repo_dir, &["rev-parse", "--verify", "--quiet", &probe])?;
-    if !known.status.success() {
-        return Ok(None);
-    }
+/// The files `from..sha` changed, renames as the two paths they touch.
+fn changed(repo_dir: &Path, from: &str, sha: &str) -> Result<Vec<String>, Error> {
     let listed = git(
         repo_dir,
-        &["diff", "--name-only", "-z", "--no-renames", before, sha],
+        &["diff", "--name-only", "-z", "--no-renames", from, sha],
     )?;
-    Ok(Some(
-        listed
-            .split('\0')
-            .filter(|p| !p.is_empty())
-            .map(str::to_owned)
-            .collect(),
-    ))
+    Ok(listed
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
-/// `--before` as a commit to diff from: none for the first push (all zeros).
-fn before_of(before: &str) -> Result<Option<&str>, Error> {
-    if !before.is_empty() && before.bytes().all(|b| b == b'0') {
-        return Ok(None);
+/// The highest release tag in this checkout that names an ancestor of `sha` other than
+/// `sha` itself: what the release being planned is measured against. A tag on `sha` is a
+/// release of it already made (a re-run), so the range is the one that release covered.
+fn base_tag(repo_dir: &Path, sha: &str) -> Result<Option<String>, Error> {
+    let mut best: Option<(Version, String)> = None;
+    for tag in release_tags(repo_dir)? {
+        let Some(version) = Version::parse_tag(&tag) else {
+            continue;
+        };
+        if best.as_ref().is_some_and(|(top, _)| *top >= version) {
+            continue;
+        }
+        let at = commit_of(repo_dir, &tag)?;
+        if at != sha && is_ancestor(repo_dir, &at, sha)? {
+            best = Some((version, tag));
+        }
     }
-    if is_commit(before) {
-        return Ok(Some(before));
+    Ok(best.map(|(_, tag)| tag))
+}
+
+/// The files `sha` itself changed over its first parent: none for a root commit.
+fn own_change(repo_dir: &Path, sha: &str) -> Result<Vec<String>, Error> {
+    let probe = format!("{sha}^1^{{commit}}");
+    if !git_output(repo_dir, &["rev-parse", "--verify", "--quiet", &probe])?
+        .status
+        .success()
+    {
+        return Ok(Vec::new());
     }
-    Err(Error::Usage(format!(
-        "--before {before:?} is not a commit (12 to 40 lowercase hex digits) or all zeros"
-    )))
+    changed(repo_dir, &format!("{sha}^1"), sha)
 }
 
 /// The `release plan` verb: the lines to print.
 pub fn run(a: &PlanArgs) -> Result<Vec<String>, Error> {
     full_commit("--sha", &a.sha)?;
-    let before = before_of(&a.before)?;
     if !a.freeze.is_empty() {
         return Err(Error::Refused(vec![format!(
             "frozen: RELEASE_FREEZE is {:?}: nothing is released until an admin clears it",
@@ -192,20 +200,20 @@ pub fn run(a: &PlanArgs) -> Result<Vec<String>, Error> {
             false,
         ),
     };
-    let class = match before {
-        None => Class {
-            code: true,
-            site: true,
-            pipeline: false,
-        },
-        Some(before) => match changed(&a.repo_dir, before, &a.sha)? {
-            Some(paths) => classify(&paths),
-            None => Class {
-                code: true,
-                site: true,
-                pipeline: true,
-            },
-        },
+    // Code and site over everything since the highest release tag, so the code of a
+    // push that was superseded or queued is in the next release; with no tag yet, over
+    // everything. The pipeline flag is the commit's own change (see the module doc).
+    let (code, site) = match base_tag(&a.repo_dir, &a.sha)? {
+        None => (true, true),
+        Some(tag) => {
+            let class = classify(&changed(&a.repo_dir, &format!("refs/tags/{tag}"), &a.sha)?);
+            (class.code, class.site)
+        }
+    };
+    let class = Class {
+        code,
+        site,
+        pipeline: classify(&own_change(&a.repo_dir, &a.sha)?).pipeline,
     };
     let lines = vec![
         format!("version={version}"),

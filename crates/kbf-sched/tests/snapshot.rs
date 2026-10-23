@@ -120,7 +120,7 @@ impl Harness {
 /// digest, instance, node, QoS and platform of the lease, the three phases a lease
 /// passes (proposed before its grant commits, granted after, running once the worker
 /// says so), the grant and start times, and the two ages (since the grant, and since
-/// the phase began). Mutants: age measured from the start; the phase age measured from
+/// the phase began). Catches: age measured from the start; the phase age measured from
 /// the grant; the start time not recorded; `Proposed` and `Granted` swapped.
 #[test]
 fn a_lease_is_viewed_through_its_phases() {
@@ -168,7 +168,7 @@ fn a_lease_is_viewed_through_its_phases() {
 
 /// Catches a node filter that leaks another node's leases, drops its own, or errors on
 /// a node the scheduler does not know, and a view not in lease order or holding a lease
-/// that ended. Mutants: the filter ignored; the filter inverted.
+/// that ended. Catches: the filter ignored; the filter inverted.
 #[test]
 fn leases_filter_by_node_and_end_with_their_operation() {
     let mut h = Harness::new();
@@ -221,7 +221,7 @@ fn leases_filter_by_node_and_end_with_their_operation() {
 
 /// Catches a queue summary that miscounts, loses the platform or QoS split, orders its
 /// groups wrongly (platform, then the more urgent QoS first), or ages from the wrong
-/// moment: the oldest age is of the longest waiter overall and per group. Mutants: the
+/// moment: the oldest age is of the longest waiter overall and per group. Catches: the
 /// age taken from the newest instead of the oldest; depth counting the running lease;
 /// groups keyed by QoS only.
 #[test]
@@ -291,7 +291,7 @@ fn the_queue_is_counted_and_aged_per_platform_and_qos() {
 
 /// Catches a requeued operation aged from its first submission: it waits in the queue
 /// again from the moment its lease was given up, and the age of a silent node's work is
-/// not the time it ran. Mutant: `queued_at` not reset on a requeue.
+/// not the time it ran. Catches: `queued_at` not reset on a requeue.
 #[test]
 fn a_requeued_operation_waits_from_its_give_up() {
     let mut h = Harness::new();
@@ -313,7 +313,7 @@ fn a_requeued_operation_waits_from_its_give_up() {
 
 /// Catches work no worker can run reported without its reason, grouped wrongly, or
 /// counted outside the depth: the reason, the count of operations that wait for it, and
-/// the first of them in queue order as the example. Mutants: example the last instead of
+/// the first of them in queue order as the example. Catches: example the last instead of
 /// the first; counts per operation reset.
 #[test]
 fn work_nobody_can_run_is_grouped_by_its_reason() {
@@ -387,7 +387,7 @@ fn avoiding(n: u8) -> Harness {
 
 /// Catches the workers placement avoids left out of the queue view, or listed for an
 /// operation that is not queued: the operation, its action and the nodes, in operation
-/// order. Mutants: `avoided` empty; nodes of a running operation listed.
+/// order. Catches: `avoided` empty; nodes of a running operation listed.
 #[test]
 fn queued_work_names_the_workers_it_avoids() {
     let h = avoiding(3);

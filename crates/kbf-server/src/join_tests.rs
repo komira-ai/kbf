@@ -25,7 +25,7 @@ fn unit_of(seed: u64) -> f64 {
     unit
 }
 
-/// Catches a join wait that is not jittered (mutant: [`jittered`] returns its wait):
+/// Catches a join wait that is not jittered (defect: [`jittered`] returns its wait):
 /// every node then retries at the same instants after a frontend restart. For every
 /// failure count up to the cap, the waits of 64 seeds each lie in `[backoff / 2,
 /// backoff]` and are not all one value; the ends of the range are the unit's ends, and a
@@ -62,7 +62,7 @@ fn the_system_source_spreads_over_the_unit_interval() {
 /// (a release is named by the full commit, and the short one is a prefix that two commits can
 /// share), or reports nothing when the build knows no full one (the empty text). The full
 /// commit wins when there is one, the short one is the fallback, and what the node reports is
-/// the pair this build embeds. Mutants: the arms swapped; the short commit always.
+/// the pair this build embeds. Catches: the arms swapped; the short commit always.
 #[test]
 fn the_reported_commit_is_the_full_one_or_the_short_one_when_the_build_knows_no_full_one() {
     let full = "0123456789abcdef0123456789abcdef01234567";
@@ -107,7 +107,7 @@ fn half() -> f64 {
 }
 
 /// Catches a join loop that sleeps [`backoff`] itself rather than the jittered wait
-/// (mutant: `join` sleeping `backoff(self.retry, failures)`): on the paused clock the
+/// (defect: `join` sleeping `backoff(self.retry, failures)`): on the paused clock the
 /// gaps between dials of a registration that always fails are exactly the waits the
 /// jitter source says, `backoff * 3/4` for a unit of one half, doubling to the cap.
 #[tokio::test(start_paused = true)]
@@ -144,7 +144,7 @@ async fn the_join_loop_waits_the_jittered_backoff() {
     assert_eq!(want[6], RETRY_MAX.mul_f64(0.75));
 }
 
-/// Catches a heartbeat loop whose failed calls wait [`backoff`] itself (mutant:
+/// Catches a heartbeat loop whose failed calls wait [`backoff`] itself (defect:
 /// `beat_until_lapse` sleeping `backoff(self.retry, failures)`): after a frontend
 /// restart every registered node would beat again in step. On the paused clock the gap
 /// between two failed beats is the heartbeat interval, then the jittered wait.

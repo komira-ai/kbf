@@ -6,7 +6,7 @@
 //! least loaded worker with room) and unservable verdict, and compares the scheduler's
 //! effects and public state with them
 //! after each input. Nothing here calls `Resources::fits` or `saturating_sub`: a
-//! mutant there must not also bend the reference.
+//! defect there must not also bend the reference.
 //!
 //! Checked after every input: I1 to I7, I10, I11, I13 and I14, plus L2 (a refusal comes
 //! at the first tick at or after the end of its unservable wait, never later). With

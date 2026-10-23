@@ -243,7 +243,7 @@ fn the_root_is_the_logs_prefix_less_its_id() {
 }
 
 /// Catches: a registered node that raises a log of a cell of several voters to version
-/// 4 (a replica that does not run it would refuse the log from then on).
+/// 4 (a replica that does not run it would skip its commands from then on).
 #[test]
 fn only_a_single_voter_log_is_raised_for_a_node() {
     assert_eq!(one_voter(1), Ok(()));

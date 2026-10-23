@@ -82,6 +82,7 @@ fn the_install_step_argv() {
             "install",
             "-y",
             "--no-install-recommends",
+            "--allow-downgrades",
             "-o",
             "Dpkg::Options::=--force-confold",
             "-o",

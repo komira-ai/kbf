@@ -483,14 +483,14 @@ fn every_install_answer_maps() {
     let r = rig();
     r.fake.says(exited(
         2,
-        "{\"result\":\"refused\",\"reason\":\"older_than_installed\"}\n",
+        "{\"result\":\"refused\",\"reason\":\"channel_not_allowed\"}\n",
     ));
     r.fake.says(exited(
         3,
         "{\"result\":\"failed\",\"reason\":\"install_failed\"}\n",
     ));
     let refused = r.ssh.install(&host(), &version("1")).expect_err("refused");
-    assert_eq!(refused, PortError::other("refused: older_than_installed"));
+    assert_eq!(refused, PortError::other("refused: channel_not_allowed"));
     let failed = r.ssh.install(&host(), &version("1")).expect_err("failed");
     assert_eq!(failed, PortError::other("failed: install_failed"));
     assert!(!refused.is_unreachable() && !failed.is_unreachable());
@@ -790,7 +790,7 @@ fn every_query_answer_maps() {
     assert_eq!(got[0], Ok(Installed::Version("1.2.3-1".into())));
     assert_eq!(got[1], Ok(Installed::InProgress));
     assert_eq!(got[2], Ok(Installed::InProgress));
-    assert_eq!(got[3], Err(PortError::other("not installed")));
+    assert_eq!(got[3], Ok(Installed::NotInstalled));
     assert_eq!(got[4], Ok(Installed::Version("1:2.0-1".into())));
     assert_eq!(got[5], Err(PortError::other("bad answer")));
     assert_eq!(got[6], Err(PortError::other("bad answer")));

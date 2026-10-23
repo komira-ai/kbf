@@ -10,9 +10,9 @@ use crate::tests::Fake;
 use crate::{Fetched, Source, SourceError};
 
 /// Catches: a pattern segment matching more or less than one non-empty segment
-/// (mutants: each condition of the `{name}` guard dropped, a prefix match), or a
-/// dot segment, in any spelling, matching one (mutant: the dot check dropped); a
-/// path with a backslash, whitespace or a control character matching (mutant: the
+/// (catches: each condition of the `{name}` guard dropped, a prefix match), or a
+/// dot segment, in any spelling, matching one (catches: the dot check dropped); a
+/// path with a backslash, whitespace or a control character matching (catches: the
 /// character check dropped).
 #[test]
 fn a_pattern_matches_segment_by_segment() {
@@ -67,7 +67,7 @@ const PAGE: Page = Page {
 };
 
 /// Catches: a failed read answered as a document, or with another status than its
-/// kind's (mutants: a non-200 status treated as success; `status` mapping changed).
+/// kind's (catches: a non-200 status treated as success; `status` mapping changed).
 #[test]
 fn each_failure_has_its_kind_and_status() {
     let fake = Fake::default().down("/v1/doc");
@@ -117,7 +117,7 @@ fn status_error(url: &str, status: u16, body: &str) -> ReadError {
 /// Catches: "history is off" said of a record the history does not hold, of a route that
 /// is off by policy, of a route that is not a history route, or of a status that is not
 /// `404`; and not said of the history routes the farm lacks (they answer as an unknown
-/// route: `404` with no body). Mutants: the status check dropped; the empty-message check
+/// route: `404` with no body). Catches: the status check dropped; the empty-message check
 /// dropped; a route of the list dropped; the `/`-boundary check dropped (`/v1/runsx`).
 #[test]
 fn history_is_off_only_when_a_history_route_is_missing() {
@@ -176,7 +176,7 @@ fn history_is_off_only_when_a_history_route_is_missing() {
 /// with the size from `Content-Range` (any case of the name), a `416` has no bytes and the
 /// size from its `Content-Range`, a `200` is the whole and its length is the size, a
 /// `Content-Range` that does not parse leaves the size unknown, any other status is the
-/// error, and an undeclared URL is refused unsent. Mutants: the `416` body kept; the `206`
+/// error, and an undeclared URL is refused unsent. Catches: the `416` body kept; the `206`
 /// size taken from the body; the header name matched case-sensitively; `/` split from the
 /// left; a refusal read as bytes.
 #[test]
@@ -239,7 +239,7 @@ impl Source for Plain {
 /// Catches: the default `get_range` showing more than was asked for, or losing the size.
 /// A `200` is answered as the server would answer the range: `206` with the bytes and a
 /// `Content-Range` naming the whole (the range clamped to the end), `416` with the size
-/// for a start past the end, an empty `200` as it is, any other status untouched. Mutants:
+/// for a start past the end, an empty `200` as it is, any other status untouched. Catches:
 /// the body not cut; `last` taken as exclusive; the `416` branch dropped; the header
 /// dropped; the status check dropped.
 #[test]
@@ -287,7 +287,7 @@ fn the_default_ranged_read_cuts_the_whole_answer_to_the_range() {
 /// losing the size. A `200` is answered as the server answers `bytes=-n`: `206` with the
 /// last `n` bytes and a `Content-Range` naming the whole (`n` clamped to the size), `416`
 /// with the size for an `n` of zero, an empty `200` as it is, any other status untouched.
-/// Mutants: the front kept instead of the end; `n` not clamped (a panic on a short log);
+/// Catches: the front kept instead of the end; `n` not clamped (a panic on a short log);
 /// the first byte of the range off by one; the `n == 0` branch dropped; the header
 /// dropped; the status check dropped.
 #[test]
@@ -334,7 +334,7 @@ fn the_default_suffix_read_cuts_the_whole_answer_to_its_end() {
 /// Catches: a suffix read that is not read as the server answers it, and one that
 /// reaches the source as a span or a plain read. A `206` is its bytes with the size from
 /// `Content-Range`, a `416` has no bytes and the size, a `200` is the whole and its length
-/// the size, any other status the error; an undeclared URL is refused unsent. Mutants:
+/// the size, any other status the error; an undeclared URL is refused unsent. Catches:
 /// `suffix` asking for a span (`Ask::Span`); the `416` body kept; a refusal read as bytes.
 #[test]
 fn a_suffix_read_is_asked_as_a_suffix_and_read_as_the_server_answers_it() {

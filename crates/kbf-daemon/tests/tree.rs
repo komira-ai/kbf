@@ -177,7 +177,7 @@ async fn existing_paths_are_never_written_through() {
 /// directory or a symlink's target; and a Directory or a file blob the tree names in
 /// two places (fetched once) written in only one of them, or the second copy of a
 /// file given the first one's executable bit.
-/// Mutant seen red: the second place of a Directory dropped (`Entry::Occupied` arm
+/// Catches: the second place of a Directory dropped (`Entry::Occupied` arm
 /// of the level's places made a no-op).
 #[tokio::test]
 async fn a_tree_is_written_as_described() {

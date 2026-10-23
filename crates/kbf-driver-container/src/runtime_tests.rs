@@ -152,7 +152,7 @@ fn the_private_paths_are_the_outputs_from_the_input_root() {
 }
 
 /// Catches a tree store opened at a path with ':' or ',' (refused, as the scratch
-/// directory's is: the "no path check" mutant opens it anyway), one
+/// directory's is: the "no path check" defect opens it anyway), one
 /// whose directory cannot be made (the node then links every file, with a warning, and
 /// does not stop), and a store that is not opened when it can be.
 #[test]
