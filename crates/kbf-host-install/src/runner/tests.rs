@@ -260,7 +260,7 @@ fn a_drop_goes_through_chroot_on_a_mac() {
     let mut c = cmd("/usr/bin/gh", &["attestation", "verify"]);
     for through_chroot in [false, true] {
         assert_eq!(
-            launch(&c, through_chroot),
+            launch(&c, through_chroot).unwrap(),
             Launch {
                 program: "/usr/bin/gh".into(),
                 args: vec!["attestation".into(), "verify".into()],
@@ -274,7 +274,7 @@ fn a_drop_goes_through_chroot_on_a_mac() {
     };
     c.run_as = Some(id);
     assert_eq!(
-        launch(&c, false),
+        launch(&c, false).unwrap(),
         Launch {
             program: "/usr/bin/gh".into(),
             args: vec!["attestation".into(), "verify".into()],
@@ -282,7 +282,7 @@ fn a_drop_goes_through_chroot_on_a_mac() {
         }
     );
     assert_eq!(
-        launch(&c, true),
+        launch(&c, true).unwrap(),
         Launch {
             program: "/usr/sbin/chroot".into(),
             args: [
@@ -379,4 +379,27 @@ fn a_cap_works_without_a_time_limit_and_over_a_missing_directory() {
         ..cmd("/usr/bin/true", &[])
     };
     assert!(SystemRunner.run(&missing).unwrap().success());
+}
+
+/// A drop through `chroot` to uid 0 is refused, so `chroot` never runs a command as root.
+#[test]
+fn a_chroot_drop_to_uid_zero_is_refused() {
+    use super::{Identity, launch};
+    let mut c = cmd("/usr/bin/gh", &[]);
+    c.run_as = Some(Identity { uid: 0, gid: 20 });
+    let kind = launch(&c, true).map_err(|e| e.kind());
+    assert_eq!(kind, Err(std::io::ErrorKind::PermissionDenied));
+    // This process's own drop is not covered by this check.
+    assert!(launch(&c, false).is_ok());
+}
+
+/// A drop through `chroot` to gid 0 is refused, so the child never keeps group 0 (`wheel`).
+#[test]
+fn a_chroot_drop_to_gid_zero_is_refused() {
+    use super::{Identity, launch};
+    let mut c = cmd("/usr/bin/gh", &[]);
+    c.run_as = Some(Identity { uid: 501, gid: 0 });
+    let kind = launch(&c, true).map_err(|e| e.kind());
+    assert_eq!(kind, Err(std::io::ErrorKind::PermissionDenied));
+    assert!(launch(&c, false).is_ok());
 }

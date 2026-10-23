@@ -338,6 +338,13 @@ fn print_my_groups() {
         .map(|g| g.as_raw().to_string())
         .collect();
     println!("groups: {}", groups.join(" "));
+    println!(
+        "ids: {} {} {} {}",
+        rustix::process::getuid().as_raw(),
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getgid().as_raw(),
+        rustix::process::getegid().as_raw()
+    );
 }
 
 /// The groups the process `cmd` starts belongs to (the probe's own `groups:` line); the raw
@@ -353,6 +360,21 @@ fn groups_of(name: &str, cmd: &Cmd) -> Vec<u32> {
         .unwrap_or_else(|| panic!("{name}: no groups line: {text}"));
     line.split_whitespace()
         .map(|g| g.parse().unwrap())
+        .collect()
+}
+
+/// The real and effective uid and gid of the process `cmd` starts (the probe's `ids:` line),
+/// as `[uid, euid, gid, egid]`.
+fn ids_of(name: &str, cmd: &Cmd) -> Vec<u32> {
+    let out = run(cmd);
+    assert!(out.success(), "{name}: {}", out.stderr_text());
+    let text = out.stdout_text();
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("ids:"))
+        .unwrap_or_else(|| panic!("{name}: no ids line: {text}"));
+    line.split_whitespace()
+        .map(|n| n.parse().unwrap())
         .collect()
 }
 
@@ -400,6 +422,12 @@ fn dscl_ids_of_nobody_and_a_drop_to_them() {
     dropped.run_as = Some(ids);
     let by_runner = groups_of("runner_drop", &dropped);
     assert_eq!(by_runner, [ids.gid], "the runner left {by_runner:?}");
+    // The drop also set the user and group, real and effective: a `chroot` that skipped `-u`
+    // would leave root's.
+    let who = ids_of("runner_drop", &dropped);
+    println!("ids after the drop (uid euid gid egid): {who:?}");
+    assert_ne!(who[0], 0, "the child is still root");
+    assert_eq!(who, [ids.uid, ids.uid, ids.gid, ids.gid]);
 }
 
 /// The value of a field at the top of a service's listing: a line of exactly one tab, then

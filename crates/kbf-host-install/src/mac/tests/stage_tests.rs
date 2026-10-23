@@ -248,6 +248,9 @@ fn the_accounts_must_exist_and_not_be_root() {
     assert!(verify_failure_of(&fx, &sim).contains("dscl: exit status"));
     let sim = Sim::new(&fx.host, 0, 0);
     assert!(verify_failure_of(&fx, &sim).contains("no usable ids"));
+    // A real uid with group 0 (`wheel`) is refused as well.
+    let sim = Sim::new(&fx.host, 301, 0);
+    assert!(verify_failure_of(&fx, &sim).contains("no usable ids"));
     let sim = fx.sim();
     sim.break_("launchctl"); // not used here: the accounts are asked with dscl
     run(&fx, &sim, NEW_VERSION).unwrap();

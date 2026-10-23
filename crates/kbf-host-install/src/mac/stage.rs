@@ -369,7 +369,7 @@ fn lookup(host: &MacHost, runner: &dyn Runner, name: &str) -> Result<Identity, O
     let exec =
         run_ok(runner, &tools::dscl_ids(name, host.tuning.tool), "dscl").map_err(verify_failed)?;
     tools::parse_ids(&exec.stdout_text())
-        .filter(|id| id.uid != 0)
+        .filter(|id| id.uid != 0 && id.gid != 0)
         .ok_or_else(|| verify_failed(format!("the account {name} has no usable ids")))
 }
 

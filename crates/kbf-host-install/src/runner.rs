@@ -60,7 +60,8 @@ pub struct Cmd {
     /// Variables the child sees besides the fixed three.
     pub env: Vec<(String, String)>,
     /// The user and group the child runs as, with no supplementary group; none for the
-    /// caller's own. A root caller is needed (see [`launch`]).
+    /// caller's own. A root caller is needed (see [`launch`]). On macOS the command starts in
+    /// `/`, because `chroot` sets the working directory.
     pub run_as: Option<Identity>,
     /// Bytes written to the child's standard input, which is then closed; none for an
     /// input that is closed at once.
@@ -190,9 +191,17 @@ struct Launch {
 /// effective gid (group 0, `wheel`, for root) as the child's only supplementary group;
 /// `CommandExt::groups` would set them explicitly but is not stable. `chroot -u -g -G /`
 /// sets the groups to the one gid, drops, and runs the program; the root it enters is `/`.
-fn launch(cmd: &Cmd, through_chroot: bool) -> Launch {
-    match cmd.run_as {
+/// That path refuses a target of uid 0 or gid 0 (`PermissionDenied`), which `refuse_setuid_drop`
+/// does not cover there: `chroot` would run the program as root, or in group 0, without a drop.
+fn launch(cmd: &Cmd, through_chroot: bool) -> io::Result<Launch> {
+    Ok(match cmd.run_as {
         Some(id) if through_chroot => {
+            if id.uid == 0 || id.gid == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "a privilege drop through chroot needs a uid and a gid that are not root's",
+                ));
+            }
             let ids = [id.uid, id.gid, id.gid].map(|n| n.to_string());
             let mut args: Vec<String> = ["-u", &ids[0], "-g", &ids[1], "-G", &ids[2], "/"]
                 .map(str::to_owned)
@@ -210,7 +219,7 @@ fn launch(cmd: &Cmd, through_chroot: bool) -> Launch {
             args: cmd.args.clone(),
             set_ids: other,
         },
-    }
+    })
 }
 
 /// Refuse a privilege drop made by this process when its effective uid is root and its real
@@ -228,7 +237,7 @@ fn refuse_setuid_drop(set_ids: Option<Identity>, uid: u32, euid: u32) -> io::Res
 
 impl Runner for SystemRunner {
     fn run(&self, cmd: &Cmd) -> io::Result<Exec> {
-        let launch = launch(cmd, cfg!(target_os = "macos"));
+        let launch = launch(cmd, cfg!(target_os = "macos"))?;
         refuse_setuid_drop(
             launch.set_ids,
             rustix::process::getuid().as_raw(),
