@@ -56,7 +56,8 @@ fn a_frontend_with_a_state_store_passes() {
     ] {
         let flag = format!("--state-store={url}");
         assert_eq!(
-            found(&frontend(&[flag.as_str()])), Report::default(),
+            found(&frontend(&[flag.as_str()])),
+            Report::default(),
             "{url}"
         );
     }
