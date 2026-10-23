@@ -76,7 +76,7 @@ async fn settled_told(farm: &Farm, node: usize, digest: &Digest) -> bool {
 /// Catches a debt settled before its copy is made, or a copy never made: with the replica
 /// unreachable, the pass leaves the debt and nothing is sent; once it is back, the pass
 /// makes the copy (the same bytes), settles the debt, and tells the frontend; the next pass
-/// has nothing to do. Mutants: the debt settled whatever happened; the copy not sent.
+/// has nothing to do. Catches: the debt settled whatever happened; the copy not sent.
 #[tokio::test]
 async fn the_copy_is_made_when_the_replica_returns() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -118,7 +118,7 @@ async fn the_copy_is_made_when_the_replica_returns() {
 /// answered with one copy is 1 once it has finished (the writes in flight are not the
 /// debts: none is in flight now), only on the node that holds the blob, still 1 after a
 /// restart (the journal is read when it is opened), and 0 once the worker has made the copy.
-/// Mutants: the count taken from the writes in flight; the replica counted too; the count
+/// Catches: the count taken from the writes in flight; the replica counted too; the count
 /// kept at 1 after the debt is settled; the count of a reopened journal 0.
 #[tokio::test]
 async fn the_count_a_node_reports_is_the_copies_it_owes() {
@@ -155,7 +155,7 @@ async fn the_count_a_node_reports_is_the_copies_it_owes() {
 /// Catches a blob sent to an owner that already has it, and a read of the store for it:
 /// the replica gets the blob by other means (a copy sent to it directly) while the debt
 /// stands; the pass asks it, finds it there, and settles without reading the blob.
-/// Mutant: the question skipped.
+/// Catches: the question skipped.
 #[tokio::test]
 async fn an_owner_that_already_holds_the_blob_is_asked_not_sent_it() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -578,7 +578,7 @@ async fn an_owner_killed_mid_build_is_repaired_when_it_returns() {
 /// answered) and the blob is not yet present here. A pass in that window reads NotFound, and
 /// must leave the debt owed; once the commit is released the write is answered, the blob is
 /// present with one copy, the debt is still owed, and the next pass (the replica back) makes
-/// the second copy. Mutant: NotFound settles whatever is in flight.
+/// the second copy. Catches: NotFound settles whatever is in flight.
 #[tokio::test]
 async fn a_debt_is_not_settled_while_its_write_is_committing() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -756,7 +756,7 @@ async fn a_storage_without_its_own_action_entry_reports_no_closure() {
 /// begun counting the write (it began before the pass read `begun`, so the count is
 /// unchanged), asked the replica, and read NotFound locally; then the write commits and
 /// drops its in-flight mark; then the pass settles. The blob is held with one copy, so the
-/// debt must stay, and the next pass makes the copy. Mutant: `settle_evicted` without the
+/// debt must stay, and the next pass makes the copy. Catches: `settle_evicted` without the
 /// look at the store after the in-flight test.
 #[tokio::test]
 async fn a_debt_is_not_dropped_for_a_blob_committed_after_the_worker_read_it_absent() {
@@ -852,7 +852,7 @@ async fn a_write_whose_commit_fails_leaves_no_debt() {
 /// Catches a pass that waits for ever on an owner that is up and does not answer: the
 /// owner's durable `FindMissing` hangs, so the pass ends at the probe bound with the debt owed, and
 /// a pass over the owner answering again settles it. (A hang deadline, not a speed.)
-/// Mutant: the question asked without the bound.
+/// Catches: the question asked without the bound.
 #[tokio::test]
 async fn an_owner_that_does_not_answer_is_waited_for_not_hung_on() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -900,7 +900,7 @@ async fn an_owner_that_does_not_answer_is_waited_for_not_hung_on() {
 
 /// Catches a worker that cannot be stopped while a pass is stuck: the owner's durable
 /// `FindMissing` hangs and the probe bound is an hour, so only the stop can end `run`, and it does.
-/// Mutant: `stop` polled only between passes.
+/// Catches: `stop` polled only between passes.
 #[tokio::test]
 async fn run_stops_in_the_middle_of_a_stuck_pass() {
     let farm = Farm::start(2, ChainConfig::default()).await;

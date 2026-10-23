@@ -1,15 +1,15 @@
 //! `release verdict-write`: the Beta record a release tag carries as its message.
 //!
 //! It records that the gates of one commit passed: the commit, the set the files in `<dir>`
-//! hash to ([`set_hash_of`]), the tag the release is planned to get, and the three runs
-//! (`ci`, `beta`, `artifacts`) that passed it, each as a green gate and named in the note.
-//! It judges nothing itself: the caller has already required those runs to be green. The
-//! record is an audit record: `release verify` does not read it, and the release notes
-//! only show it.
+//! hash to ([`set_hash_of`]), the tag the release is planned to get, and the one pipeline run
+//! whose three stages (`ci`, `artifacts`, `beta`) passed it, each as a green gate and the run
+//! named in the note. It judges nothing itself: the release runs only when that pipeline run
+//! succeeded. The record is an audit record: `release verify` does not read it, and the
+//! release notes only show it.
 //!
 //! The stage is [`STAGE`], Beta. It records no bake and no load: a bake belongs to the
-//! gamma farm check, which is not a stage of this record. Beta tests bytes it rebuilt
-//! itself, not the attested ones; the note says so: `tested_bytes: rebuilt`.
+//! gamma farm check, which is not a stage of this record. The beta smoke ran the attested
+//! `kbf` of the run's own files; the note says so.
 
 use std::path::PathBuf;
 
@@ -20,8 +20,8 @@ use super::verify::set_hash_of;
 use crate::Error;
 use crate::build_commit::full_commit;
 
-/// The stage of the record a release carries: Beta, the last stage whose runs the release
-/// workflow requires.
+/// The stage of the record a release carries: Beta, the last stage of the pipeline run the
+/// release follows.
 pub const STAGE: Stage = Stage::Beta;
 
 /// The arguments of `release verdict-write`.
@@ -41,15 +41,9 @@ pub struct WriteArgs {
     /// The attempt of this run (on Actions, `GITHUB_RUN_ATTEMPT`).
     #[arg(long, default_value_t = 1)]
     pub attempt: u32,
-    /// The push run of `ci` that passed for the commit.
+    /// The pipeline run (ci, artifacts, beta) that passed for the commit.
     #[arg(long)]
-    pub ci_run: u64,
-    /// The push run of `beta` that passed for the commit.
-    #[arg(long)]
-    pub beta_run: u64,
-    /// The push run of `artifacts` that passed for the commit.
-    #[arg(long)]
-    pub artifacts_run: u64,
+    pub pipeline_run: u64,
     /// What makes the release not reversible, one line (repeat for more).
     #[arg(long)]
     pub not_reversible: Vec<String>,
@@ -102,8 +96,8 @@ pub fn build(a: &WriteArgs, now: u64) -> Result<ResultDoc, Error> {
     doc.finished = Some(at);
     doc.tag = Some(a.tag.clone());
     doc.note = Some(format!(
-        "gate runs: ci {}, beta {}, artifacts {}; tested_bytes: rebuilt",
-        a.ci_run, a.beta_run, a.artifacts_run
+        "gate run: pipeline {} (ci, artifacts, beta); beta smoke on the attested kbf",
+        a.pipeline_run
     ));
     doc.not_reversible = a.not_reversible.clone();
     doc.escapes = a.escape.clone();

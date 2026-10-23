@@ -115,7 +115,7 @@ fn builds_lists_the_builds_with_their_result() {
 }
 
 /// Catches: a filter the page does not take, a duplicated one or a state that is not
-/// `open` or `closed` reaching the API (mutants: the unknown-key arm, the duplicate
+/// `open` or `closed` reaching the API (catches: the unknown-key arm, the duplicate
 /// check or the state check dropped): each is a `400` page that reads nothing and shows
 /// why; an instance over the bound forwarded; an empty filter sent as a value.
 #[test]
@@ -175,7 +175,7 @@ fn builds_list_answers_the_api_status() {
 }
 
 /// Catches: the summary not shown, not linked to the Build page, or the id not kept
-/// in the form; a field or counter shown under another's name (mutants: the
+/// in the form; a field or counter shown under another's name (catches: the
 /// uploaded and downloaded values swapped, first and last seen swapped), since every
 /// one has its own value in the fixture and is checked with its name.
 #[test]
@@ -247,7 +247,7 @@ fn builds_with_an_unknown_id_or_no_api_says_so() {
 
 /// Catches: a `?id=` that decodes to `.` or `..` read as a build: written into
 /// `/v1/invocations/{id}` it is a dot segment, which the reader refuses, so the page
-/// answered `500` as a page bug (mutant: the dot check in `builds` dropped). It names
+/// answered `500` as a page bug (catches: the dot check in `builds` dropped). It names
 /// no build: `404` with the lookup form, nothing read.
 #[test]
 fn builds_with_a_dot_id_names_no_build_and_reads_nothing() {
@@ -275,7 +275,7 @@ fn builds_with_a_dot_id_names_no_build_and_reads_nothing() {
 
 /// Catches: an outcome tag this page does not know (the server adds outcomes,
 /// `docs/design/ui-data.md` 6.1) failing the whole page as a malformed answer
-/// (mutant: the `Other` fallback dropped); a known tag with the wrong shape, or an
+/// (catches: the `Other` fallback dropped); a known tag with the wrong shape, or an
 /// outcome that is not one tag, rendered as a guess rather than refused; no outcome
 /// yet (`null`) not shown as pending; each on the Build page's rows and on the Action
 /// page, which reads the row flattened into its answer.
@@ -339,7 +339,7 @@ fn an_outcome_of_a_tag_the_page_does_not_know_is_shown_by_its_tag() {
 
 /// Catches: rows not shown or not linked to their Action page, the next-page link
 /// missing or not carrying the token, the token not passed to the API; a row's
-/// first attempt shown as its last, or its attempt count wrong (mutant:
+/// first attempt shown as its last, or its attempt count wrong (catches:
 /// `attempts.first()` for `attempts.last()`), seen on a row requeued once.
 #[test]
 fn build_shows_its_actions_and_pages_through_them() {
@@ -403,7 +403,7 @@ fn build_answers_the_api_status_or_502() {
 }
 
 /// Catches: the action's fields, attempts, usage, outputs or logs not shown, or a
-/// field or attempt cell shown under another's name (mutant: CPU user showing the
+/// field or attempt cell shown under another's name (catches: CPU user showing the
 /// system time), an output the store no longer holds still linked, a log the store
 /// no longer holds read.
 #[test]
@@ -661,7 +661,7 @@ fn summary_tool_and_state() {
     assert!(html.contains("<dd>idle</dd>"), "{html}");
 }
 
-/// Catches: the size bound off by one (mutant: `<` for `<=`), so a log of exactly
+/// Catches: the size bound off by one (catches: `<` for `<=`), so a log of exactly
 /// the bound is a link, or one byte over it is read into the page.
 #[test]
 fn a_log_of_the_bound_is_shown_and_one_byte_more_is_a_link() {

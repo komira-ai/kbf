@@ -684,7 +684,7 @@ fn a_kbf_tarball_without_its_version_facts_fails_the_sums_check() {
     // lost the step would publish a platform with nothing for a reader of the platform's facts), and the
     // message not naming the tarball and the file missing. The second half is the control:
     // with the facts listed and present the same set passes, so the refusal was for them
-    // and for nothing else, and `kbf-daemon`'s tarball (no facts) is not named. Mutant:
+    // and for nothing else, and `kbf-daemon`'s tarball (no facts) is not named. Catches:
     // the pairing taken out of `verify_sums`.
     let names: &[&str] = &["kbf", "kbf-daemon"];
     let r = Release::build_with("facts-missing", &[("linux-x86_64", names)]);
@@ -708,7 +708,7 @@ fn version_facts_without_their_kbf_tarball_fail_the_sums_check() {
     // Catches: facts in the release set of a platform that has no `kbf` there (a stray
     // file, or another build's, would be attested and carried as if it stated something of
     // a binary that ships), and a message that does not name both files. The control is
-    // the pairing of the test above, with the tarball listed. Mutant: the reverse pairing
+    // the pairing of the test above, with the tarball listed. Catches: the reverse pairing
     // taken out of `verify_sums`.
     let names: &[&str] = &["kbf-daemon"];
     let r = Release::build_with("facts-orphan", &[("linux-x86_64", names)]);

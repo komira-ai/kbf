@@ -16,9 +16,10 @@
 //! - `meta_log`: the highest metadata-log machine version this build runs
 //!   ([`kbf_server::raft_log::RUNS`], read through `.get()`; there is no second copy of the
 //!   number). A rollout compares it across two builds: going from N to N-1 is reversible
-//!   only if `meta_log(N) <= meta_log(N-1)`, because a log raised past what N-1 runs
-//!   cannot be opened by it. A build that does not print the field is unknown, and
-//!   unknown is not reversible;
+//!   only if `meta_log(N) <= meta_log(N-1)`, because a build from before skipped entries
+//!   cannot open a log raised past what it runs (a later build opens it, skips the raise and
+//!   loses the commands it does not know). A build that does not print the field is unknown,
+//!   and unknown is not reversible;
 //! - `min_protocol` and `protocol`: the oldest and the newest `kbf.worker.v1` protocol
 //!   version this binary speaks ([`kbf_server::worker`]); the daemon half speaks exactly
 //!   `protocol` (a test pins the two halves equal);

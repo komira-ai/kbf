@@ -111,7 +111,7 @@ fn a_container_node_opens_its_cache_and_trees_under_the_data_dir() {
 }
 
 /// C-19. Catches the native driver on Linux using a cache its own actions could write
-/// (the "enable the cache on Linux native" mutant), or making the cache or trees
+/// (the "enable the cache on Linux native" defect), or making the cache or trees
 /// directories: under `--data-dir` it makes `leases` and nothing else, and logs that
 /// the cache and trees are off.
 #[test]

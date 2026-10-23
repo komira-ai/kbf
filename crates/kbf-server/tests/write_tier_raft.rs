@@ -186,11 +186,11 @@ fn later() -> Instant {
     Instant::now() + TierOptions::SEAL_AFTER
 }
 
-/// Catches: a server whose tier attaches over a Raft log left at machine version 1
-/// (the tier's first commit, `AddTier`, cannot be encoded in format 1: the start is
-/// refused), a raise committed again at every start (each one an entry a version-1
-/// binary would also refuse, and a raise that is not idempotent), and a raised log that
-/// an older binary opens instead of refusing at the raise.
+/// Asserts that a server whose tier attaches raises its Raft log to machine version 5
+/// once (the tier's first commit, `AddTier`, cannot be encoded in format 1, so a log left
+/// at version 1 would refuse the start; a second start commits no second raise), and that
+/// a binary that runs only version 1 or version 4 opens the raised log, skips the one raise
+/// and stays at version 1.
 #[tokio::test]
 async fn a_raft_server_with_a_tier_raises_its_log_once() {
     let dirs = Dirs::new("raised-once");
@@ -210,15 +210,13 @@ async fn a_raft_server_with_a_tier_raises_its_log_once() {
     assert_eq!(log.applied_index(), applied, "the raise committed again");
     drop(cache);
 
-    // A binary that runs only version 4 (every command but `ReseatStaged`) refuses the
-    // log at the raise, as one that runs version 1 does: it never applies an entry it
-    // cannot decode, or skips one.
+    // A binary that runs only version 4 (every command but `ReseatStaged`) opens the log
+    // and skips the raise, as one that runs version 1 does: it stays at version 1.
     for runs in [MachineVersion::V1, MachineVersion::V4] {
-        let rolled_back = dirs.open_running(runs).await;
-        assert!(
-            matches!(rolled_back, Err(RaftLogError::Decode { .. })),
-            "{runs:?}: {rolled_back:?}"
-        );
+        let older = dirs.open_running(runs).await;
+        let older = older.expect("an older binary opens the raised log");
+        assert_eq!(older.skipped_entries(), 1, "{runs:?}");
+        assert_eq!(older.machine_version(), MachineVersion::V1, "{runs:?}");
     }
 }
 

@@ -24,7 +24,7 @@ fn installed_copy(name: &str) -> (PathBuf, PathBuf) {
 /// operator would restart a healthy proxy on every request), and one that compares the
 /// wrong pair: running against a path other than the installed one.
 ///
-/// Mutants planted: `replaced` returning `true` always; capture stat-ing the installed path
+/// Catches: `replaced` returning `true` always; capture stat-ing the installed path
 /// instead of the running one (red in the capture test below).
 #[test]
 fn an_untouched_install_is_not_replaced() {
@@ -38,7 +38,7 @@ fn an_untouched_install_is_not_replaced() {
 /// file beside the old and renames it over, often with the same bytes and size. The running
 /// program is the old inode, held through a second link as `/proc/self/exe` holds it.
 ///
-/// Mutants planted: `replaced` returning `false` always; identity of (dev, size) instead of
+/// Catches: `replaced` returning `false` always; identity of (dev, size) instead of
 /// (dev, ino); the `RestartPending` impl returning `false`.
 #[test]
 fn a_rename_over_the_install_path_is_replaced() {
@@ -59,7 +59,7 @@ fn a_rename_over_the_install_path_is_replaced() {
 /// Pins the documented limit: a rewrite in place keeps the inode and is not seen. If the
 /// behaviour changes, the module notes and the design text change with it.
 ///
-/// Mutant planted: comparing size or mtime besides the inode (this test goes red).
+/// Catches: comparing size or mtime besides the inode (this test goes red).
 #[test]
 fn a_rewrite_in_place_is_not_replaced() {
     let (_dir, installed) = installed_copy("rb-in-place");
@@ -74,7 +74,7 @@ fn a_rewrite_in_place_is_not_replaced() {
 /// Catches `false` for a program that is gone: the package was removed and the running proxy
 /// is no longer the installed one. Also a path that was never there.
 ///
-/// Mutant planted: a missing path reading as not replaced (`unwrap_or(false)` style).
+/// Catches: a missing path reading as not replaced (`unwrap_or(false)` style).
 #[test]
 fn a_removed_install_path_is_replaced() {
     let (dir, installed) = installed_copy("rb-removed");
@@ -92,7 +92,7 @@ fn a_removed_install_path_is_replaced() {
 /// running image, so pointing the installed path at it is "not replaced", and at another
 /// file is "replaced". Also runs the real `capture()` once against the real install path.
 ///
-/// Mutants planted: running identity read from the installed path (the second assert goes
+/// Catches: running identity read from the installed path (the second assert goes
 /// red); `/proc/self/exe` replaced by another path.
 #[test]
 fn capture_names_the_running_image() {

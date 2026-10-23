@@ -39,7 +39,7 @@ fn start_note(html: &str) -> Option<&str> {
 /// Catches: a page of the banner without the start time, or with another one than the
 /// server's: the fixture's `started_unix_ms` is 2026-10-21T08:30:15Z (a time written from
 /// the wrong unit, the seconds read as milliseconds or the reverse, a date off by a
-/// day or an hour shows) and its `uptime_ms` 2 h 5 min. Mutants: the note dropped from any
+/// day or an hour shows) and its `uptime_ms` 2 h 5 min. Catches: the note dropped from any
 /// one page; `rfc3339` fed seconds; `uptime_ms` shown as the age of something else.
 #[test]
 fn every_page_of_the_banner_says_when_the_server_started() {
@@ -61,7 +61,7 @@ fn every_page_of_the_banner_says_when_the_server_started() {
 /// (a string).
 /// The page is `200`, says that the time is not known, and says why; what it says of why
 /// is escaped. The Overview is excluded where its own health read is the page (it is `502`
-/// then, as before). Mutants: the read's failure made the page's; an `unwrap` of the key;
+/// then, as before). Catches: the read's failure made the page's; an `unwrap` of the key;
 /// the reason not written; written raw.
 #[test]
 fn a_page_without_a_start_time_says_so_and_still_renders() {
@@ -114,7 +114,7 @@ fn a_page_without_a_start_time_says_so_and_still_renders() {
 
 /// Catches: the Overview, which has the health in hand, making up a time when its own
 /// document has none (an older server), or failing; and a start time without an uptime
-/// shown with an "ago" nobody sent. Mutants: `Started::of` returning `At` for `None`;
+/// shown with an "ago" nobody sent. Catches: `Started::of` returning `At` for `None`;
 /// the uptime defaulted to zero.
 #[test]
 fn the_overview_reads_the_start_from_its_own_health_document() {
@@ -146,7 +146,7 @@ fn the_overview_reads_the_start_from_its_own_health_document() {
 /// Catches (hostile fixture): the largest numbers a server can send, which a page that
 /// adds, subtracts or converts them to a signed type would panic on or wrap: the
 /// start time and uptime of `u64::MAX`, and zero. Both render, the page stays `200`, and
-/// the zero start is the Unix epoch. Mutants: `rfc3339` in a narrower type; the uptime
+/// the zero start is the Unix epoch. Catches: `rfc3339` in a narrower type; the uptime
 /// subtracted from the start.
 #[test]
 fn extreme_start_times_render_without_panic() {
@@ -177,7 +177,7 @@ fn extreme_start_times_render_without_panic() {
 
 /// Catches: a read of `/v1/health` for a page that shows none of what the banner is
 /// about: a Leases, Queue, Nodes or Node page whose own read failed. Only the failed route
-/// is asked, and the answer stays the API's. Mutants: the health read moved before the
+/// is asked, and the answer stays the API's. Catches: the health read moved before the
 /// page's own; made unconditional.
 #[test]
 fn a_failed_page_does_not_read_the_start_time() {
@@ -196,7 +196,7 @@ fn a_failed_page_does_not_read_the_start_time() {
 
 /// Catches: the banner's wording or formatting wrong, written straight (not through a
 /// page): a day-long uptime, one under a second, one not sent, and the reason of a missing
-/// time written escaped. Mutants: the sentence without its full stop; the uptime unit
+/// time written escaped. Catches: the sentence without its full stop; the uptime unit
 /// dropped; the reason written raw.
 #[test]
 fn the_note_is_one_sentence_each_way() {

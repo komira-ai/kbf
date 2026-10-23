@@ -35,7 +35,7 @@ async fn raw(channel: &tonic::transport::Channel, path: &'static str) -> Status 
 /// with a role that is no role are refused by the table, before the service; a method not in
 /// the table (the old `GetKeys`) is refused for the storage certificate too.
 ///
-/// Mutants seen red: the row `&[Daemon, Storage]` (the daemon is served); the row deleted
+/// Catches: the row `&[Daemon, Storage]` (the daemon is served); the row deleted
 /// (the storage node is refused).
 #[tokio::test]
 async fn only_a_storage_certificate_is_served_the_store() {
@@ -89,7 +89,7 @@ async fn only_a_storage_certificate_is_served_the_store() {
 /// with no registry in play; another node on its own connection is not. A check made only
 /// when the connection opens would serve both.
 ///
-/// Mutant seen red: `admit_leaf` skipping the `deny/` rows.
+/// Catches: `admit_leaf` skipping the `deny/` rows.
 #[tokio::test]
 async fn a_node_denied_on_a_live_connection_is_refused_at_its_next_call() {
     let farm = farm(Source::new(3), false).await;
@@ -125,7 +125,7 @@ async fn a_node_denied_on_a_live_connection_is_refused_at_its_next_call() {
 /// (no secret, no store error) rather than served. The same node is served again once the
 /// store reads, so the refusal is the failed read and not the node.
 ///
-/// Mutant seen red: the read's error ignored (`if let Ok(denied) = members.denied()`), which
+/// Catches: the read's error ignored (`if let Ok(denied) = members.denied()`), which
 /// serves the secret to a node whose revocation could not be checked.
 #[tokio::test]
 async fn a_failed_deny_read_refuses_the_fetch_instead_of_serving_it() {
@@ -162,7 +162,7 @@ async fn a_failed_deny_read_refuses_the_fetch_instead_of_serving_it() {
 /// one gets the whole store (a restored frontend), and nothing registered is generation 0
 /// with no store.
 ///
-/// Mutant seen red: the service answering the config for an equal generation.
+/// Catches: the service answering the config for an equal generation.
 #[tokio::test]
 async fn an_unchanged_generation_is_answered_without_the_secret() {
     let source = Source::new(7);
@@ -233,7 +233,7 @@ async fn a_secret_that_is_not_readable_is_unavailable() {
 /// dropped, a registration that keeps the acks of the boot before it, and a stale boot's
 /// heartbeat recorded.
 ///
-/// Mutants seen red: both answers announcing 0; `forget` not called at the register.
+/// Catches: both answers announcing 0; `forget` not called at the register.
 #[tokio::test]
 async fn heartbeats_announce_the_generation_and_report_what_the_node_applied() {
     let source = Source::new(4);
@@ -343,7 +343,7 @@ async fn a_node_without_the_fields_is_unsupported() {
 /// a registry that cannot be read is UNAVAILABLE (retry), and one that panics in the
 /// store is INTERNAL with fixed text, never the panic's.
 ///
-/// Mutant seen red: the registry result ignored (`let _ =`).
+/// Catches: the registry result ignored (`let _ =`).
 #[tokio::test]
 async fn with_a_registry_an_unenrolled_node_is_refused_and_a_failing_registry_is_not_open() {
     use std::sync::atomic::Ordering;
@@ -414,7 +414,7 @@ async fn with_a_registry_an_unenrolled_node_is_refused_and_a_failing_registry_is
 /// reaches the registry and is refused, a missing node or role is UNAUTHENTICATED, another
 /// role is PERMISSION_DENIED, and plain text refuses a proxied identity too.
 ///
-/// Mutant seen red: `admit_presented` treating a proxied identity as a certificate with
+/// Catches: `admit_presented` treating a proxied identity as a certificate with
 /// no leaf (every proxied call UNAUTHENTICATED).
 #[tokio::test]
 async fn a_proxied_identity_is_admitted_by_its_node_and_role_not_by_a_certificate() {
@@ -475,7 +475,7 @@ async fn a_proxied_identity_is_admitted_by_its_node_and_role_not_by_a_certificat
 /// registration generation (the state store failed): the node must keep its membership. The
 /// answer carries 0, "none or cannot say", and the map as ever.
 ///
-/// Mutant seen red: the announced number 7, not 0, when the source cannot say.
+/// Catches: the announced number 7, not 0, when the source cannot say.
 #[tokio::test]
 async fn a_frontend_that_cannot_say_its_generation_announces_zero_and_still_answers() {
     let source = Source::new(4);
@@ -510,7 +510,7 @@ async fn a_frontend_that_cannot_say_its_generation_announces_zero_and_still_answ
 /// names is served until the file is replaced and refused at its next call after, on the
 /// connection it already has; a node it does not name is served throughout.
 ///
-/// Mutant seen red: `admit_leaf` not consulting the deny list.
+/// Catches: `admit_leaf` not consulting the deny list.
 #[tokio::test]
 async fn the_worker_deny_list_file_applies_at_every_call() {
     let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "store-config");
@@ -554,7 +554,7 @@ async fn the_worker_deny_list_file_applies_at_every_call() {
 /// `Heartbeat` still answer, the heartbeat's report is lost (the farm reads `pending`, the safe
 /// side), and nothing about the failure reaches the node.
 ///
-/// Mutant seen red: the error of `record` returned from `Heartbeat`.
+/// Catches: the error of `record` returned from `Heartbeat`.
 #[tokio::test]
 async fn acks_that_cannot_be_kept_do_not_fail_the_membership_calls() {
     use std::sync::atomic::Ordering;

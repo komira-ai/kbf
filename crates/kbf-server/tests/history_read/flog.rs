@@ -201,7 +201,7 @@ async fn a_failed_runs_logs_outlive_the_cas_blob() {
     b.stop().await;
 }
 
-/// Catches (mutant "copy successful runs too"): a copy and a row for a run that passed (the
+/// Catches (defect "copy successful runs too"): a copy and a row for a run that passed (the
 /// PUTs of a farm that mostly passes would be doubled), or a failed run that wrote no
 /// object (no copy). Counted in PUTs: one chunk for the passing build; a chunk and a copy
 /// for the failing one.
@@ -240,7 +240,7 @@ async fn a_successful_run_writes_no_flog_object() {
     a.stop().await;
 }
 
-/// Catches (security, mutant "skip the instance check on the logs route"): a copy served to
+/// Catches (security, defect "skip the instance check on the logs route"): a copy served to
 /// a caller authorized on another instance than the run's, live or after a restart, and
 /// the instance of the run named in the refusal or its bytes in it. The run of the allowed
 /// instance is served, so it is the route that refuses and not the route that is off.
@@ -352,7 +352,7 @@ async fn a_server_with_no_history_has_no_log_route() {
     server.stop().await;
 }
 
-/// Catches (mutant "write the obj row before the PUT"): a row naming an object that was not
+/// Catches (defect "write the obj row before the PUT"): a row naming an object that was not
 /// written, which every read of the copy would fail on for as long as it is kept, and a copy
 /// that could not be written failing the run (it is the log that is lost, never the run):
 /// the run reads back with its tails, links the blob, says there is no copy, and the failed

@@ -176,21 +176,29 @@ impl clap::builder::TypedValueParser for StateStoreParser {
 /// the OS package's socket directory, reached by peer authentication.
 const LOCAL_POSTGRES: &str = "postgres:///kbf?host=/run/postgresql";
 
+/// What a start on a `sqlite://` store logs, once: SQLite is on its way out.
+const SQLITE_REMOVED: &str = "the SQLite state store is removed in the next release: move the \
+     scheduler's state to Postgres before upgrading (see the upgrade notes)";
+
 fn has_password(url: &PostgresUrl) -> bool {
     url.config.has_password()
 }
 
 impl StateStoreUri {
-    /// What an [`open`](Self::open) does with the store's epoch: a new one. An open is a
-    /// cold start (no live holder hands the store over; that is
-    /// [`open_after_handover`](Self::open_after_handover), which keeps it), so a restored
-    /// or swapped file, or a Postgres database restored from a backup, can never resume
-    /// leases an earlier incarnation granted. A fresh store has no epoch to bump: it is
-    /// given a first one no other store's is likely to equal (`Durable::open`).
+    /// What an [`open`](Self::open) does with the store's epoch: it keeps it, so a restart
+    /// of a frontend, or the start of another one over the same Postgres, does not make
+    /// the daemons drop the runs of the leases they hold. A fresh store has no epoch to
+    /// keep: it is given a first one no other store's is likely to equal (`Durable::open`),
+    /// and when several frontends open an empty store together they end with one.
+    ///
+    /// The epoch changes when an operator raises it (`POST /v1/epoch/bump`,
+    /// [`Farm::bump_epoch`](crate::Farm::bump_epoch)), which a restore of the store from a
+    /// backup calls for: the frontends that start after it serve the new epoch, and the
+    /// daemons drop the leases a lost history granted.
     #[must_use]
     pub const fn epoch_policy(&self) -> EpochPolicy {
         match self {
-            Self::Sqlite(_) | Self::Postgres(_) => EpochPolicy::Bump,
+            Self::Sqlite(_) | Self::Postgres(_) => EpochPolicy::Keep,
         }
     }
 
@@ -251,10 +259,14 @@ impl StateStoreUri {
         Ok(Candidate::over(self.open_backend()?))
     }
 
-    /// The backend's store, opened as it is: no generation taken, nothing written here.
+    /// The backend's store, opened as it is: no generation taken, nothing written here. A
+    /// SQLite store opens, and the start logs [`SQLITE_REMOVED`] once.
     fn open_backend(&self) -> Result<Arc<dyn Store>, StateError> {
         match self {
-            Self::Sqlite(path) => open_sqlite(path),
+            Self::Sqlite(path) => {
+                tracing::warn!("{SQLITE_REMOVED}");
+                open_sqlite(path)
+            }
             Self::Postgres(url) => open_postgres(url),
         }
     }

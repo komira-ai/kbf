@@ -22,9 +22,9 @@ fn opts() -> kbf_tier::TierOptions {
     options(1 << 30, LIMIT)
 }
 
-/// Catches: an acknowledgement before `fdatasync` (mutant: skip the file sync), so a
+/// Catches: an acknowledgement before `fdatasync` (defect: skip the file sync), so a
 /// power cut keeps only the bytes some later sync happened to cover; and a block
-/// whose name was not synced before its first acknowledgement (mutant: skip
+/// whose name was not synced before its first acknowledgement (defect: skip
 /// `sync_dir`), so a power cut that keeps no unsynced name change loses the file.
 #[test]
 fn acknowledged_ranges_read_back_after_a_power_cut() {
@@ -45,7 +45,7 @@ fn acknowledged_ranges_read_back_after_a_power_cut() {
 }
 
 /// Catches: bytes past the committed length (synced, never named by a committed
-/// `PutStaged`) kept at a restart (mutant: no truncation), where a later flush or
+/// `PutStaged`) kept at a restart (defect: no truncation), where a later flush or
 /// read would treat them as stored.
 #[test]
 fn bytes_past_the_committed_length_are_cut_at_restart() {
@@ -97,7 +97,7 @@ fn out_of_order_commits_survive_a_power_cut() {
 
 /// Catches: orphan blocks left on disk, filling it (an upload open at the restart, an
 /// upload synced before its `PutStaged` committed, a grouped block nothing committed
-/// in), a sweep whose deletions are not made durable (mutant: no `sync_dir` after
+/// in), a sweep whose deletions are not made durable (defect: no `sync_dir` after
 /// it), and a sweep that deletes a flushed `.seg` copy or a file the tier does not
 /// own.
 #[test]
@@ -255,7 +255,7 @@ fn node(member: u64, boot: u64) -> Writer {
 /// (the boot was reused: it would append to, or delete, another process's block), and
 /// one that refuses over an earlier boot's staged block or another member's (it must
 /// recover the first and leave the second as an orphan, as an earlier epoch's). The
-/// new block is named by the node writer, so a third start sees it. Mutant seen red:
+/// new block is named by the node writer, so a third start sees it. Catches:
 /// `at_or_after` comparing members only (the earlier boot's block refuses the start).
 #[test]
 fn a_node_writer_restarts_over_earlier_boots_and_refuses_its_own() {

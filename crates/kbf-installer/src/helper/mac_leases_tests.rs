@@ -229,7 +229,7 @@ fn refused(answer: Result<usize, String>, needle: &str) {
 /// for the keepers, then the daemon, then its row, by absolute path, with an empty
 /// environment, in `/`, as root, with the timeout.
 ///
-/// Mutants seen red: none planted for the argument list or the environment; they are pinned by equality.
+/// The argument list and the environment have no separate defect named here; they are pinned by equality.
 #[test]
 fn an_idle_mac_reads_zero_and_the_programs_are_asked_as_designed() {
     let mut rig = MacHost::new("idle");
@@ -265,7 +265,7 @@ fn an_idle_mac_reads_zero_and_the_programs_are_asked_as_designed() {
 /// by an action, or a `leases/` the daemon has not made) is a live lease; each keeper is
 /// one, however many times `pgrep` repeats a pid.
 ///
-/// Mutant seen red: keepers ignored (the keeper count taken as 0).
+/// Catches: keepers ignored (the keeper count taken as 0).
 #[test]
 fn a_keeper_alone_is_a_live_lease() {
     let mut rig = MacHost::new("keeper");
@@ -280,7 +280,7 @@ fn a_keeper_alone_is_a_live_lease() {
 /// keeper starts, or after its action ended and before the outputs are uploaded) is a live
 /// lease while the daemon runs.
 ///
-/// Mutant seen red: lease directories ignored.
+/// Catches: lease directories ignored.
 #[test]
 fn a_lease_directory_alone_is_a_live_lease_while_the_daemon_runs() {
     let mut rig = MacHost::new("dir");
@@ -292,7 +292,7 @@ fn a_lease_directory_alone_is_a_live_lease_while_the_daemon_runs() {
 /// answer is the larger count (one keeper and one directory is one lease; two keepers and one
 /// directory is two; one keeper and three directories is three).
 ///
-/// Mutant seen red: the two counts summed instead of the larger taken.
+/// Catches: the two counts summed instead of the larger taken.
 #[test]
 fn the_answer_is_the_larger_of_the_keepers_and_the_directories() {
     let mut rig = MacHost::new("max-1");
@@ -319,7 +319,7 @@ fn the_answer_is_the_larger_of_the_keepers_and_the_directories() {
 /// and whatever its bytes: `lease-3-7` (a file), `lease-4-1`, a name that only starts like
 /// the warm-up's or the survey's, the bare prefix and a name that is not UTF-8.
 ///
-/// Mutants seen red: warm-up and survey directories counted as leases; an unknown `lease-` name ignored (only `lease-<n>-<n>` counted).
+/// Catches: warm-up and survey directories counted as leases; an unknown `lease-` name ignored (only `lease-<n>-<n>` counted).
 #[test]
 fn warm_up_and_survey_directories_are_not_leases_and_an_unknown_lease_name_is() {
     let mut rig = MacHost::new("names-own");
@@ -366,7 +366,7 @@ fn warm_up_and_survey_directories_are_not_leases_and_an_unknown_lease_name_is() 
 /// for the daemon: an error asking for the daemon is not "no daemon" (which would let the
 /// stale-directory rule through).
 ///
-/// Mutants seen red: `pgrep` exit 2 read as none; unparseable output skipped (garbled output read as idle); exit 0 with no pid read as none; a failing daemon `pgrep` read as no daemon.
+/// Catches: `pgrep` exit 2 read as none; unparseable output skipped (garbled output read as idle); exit 0 with no pid read as none; a failing daemon `pgrep` read as no daemon.
 #[test]
 fn a_pgrep_that_did_not_say_none_cannot_tell() {
     let failing: Vec<(&str, Reply, &str)> = vec![
@@ -424,7 +424,7 @@ fn a_pgrep_that_did_not_say_none_cannot_tell() {
 /// `CAPTURE` bytes is refused (even though every line in it is a pid), and one byte less is
 /// read.
 ///
-/// Mutant seen red: the length check against the capture limit removed (truncated output read as complete).
+/// Catches: the length check against the capture limit removed (truncated output read as complete).
 #[test]
 fn output_that_fills_the_capture_buffer_cannot_tell() {
     let lines = |bytes: usize| "1\n".repeat(bytes / 2);
@@ -448,7 +448,7 @@ fn output_that_fills_the_capture_buffer_cannot_tell() {
 /// ended, or the list is cut), two rows for one pid, or a row it cannot read (a missing
 /// column, a parent or a time that is no number).
 ///
-/// Mutants seen red: a pid with no row accepted; a pid with two rows accepted.
+/// Catches: a pid with no row accepted; a pid with two rows accepted.
 #[test]
 fn a_daemon_row_that_cannot_be_read_cannot_tell() {
     let good = row(309, 1, "10:00", DAEMON);
@@ -497,7 +497,7 @@ fn a_daemon_row_that_cannot_be_read_cannot_tell() {
 /// that starts with a pid `pgrep` did not name is ignored, and the daemon's own row, wherever
 /// it falls, is found.
 ///
-/// Mutant seen red: the parent-is-launchd filter dropped (the continuation test then finds two daemons).
+/// Catches: the parent-is-launchd filter dropped (the continuation test then finds two daemons).
 #[test]
 fn continuation_lines_of_a_multi_line_command_are_ignored() {
     let mut rig = MacHost::new("continuation");
@@ -517,7 +517,7 @@ fn continuation_lines_of_a_multi_line_command_are_ignored() {
 /// the check refuse; none under launchd, or two, cannot tell, and the refusal says to run the
 /// daemon only as its launchd job.
 ///
-/// Mutants seen red: the parent-is-launchd filter dropped; the launchd-job hint dropped from the
+/// Catches: the parent-is-launchd filter dropped; the launchd-job hint dropped from the
 /// refusal.
 #[test]
 fn the_daemon_is_the_one_process_launchd_started() {
@@ -559,7 +559,7 @@ fn the_daemon_is_the_one_process_launchd_started() {
 /// overrides a key, a binary that is not `kbf`, a different mode) the `data-dir` read here may
 /// not be the one it uses, and the check cannot tell.
 ///
-/// Mutant seen red: the command-line check dropped (H2).
+/// Catches: the command-line check dropped (H2).
 #[test]
 fn a_daemon_not_started_as_kbf_toml_says_cannot_tell() {
     let cases = [
@@ -594,7 +594,7 @@ fn a_daemon_not_started_as_kbf_toml_says_cannot_tell() {
 /// after the change, so 16:38 (998 s) is allowed, 16:39 (997 s: the daemon started 1 s after
 /// the change) and anything older is not. A daemon older than a day is read in days.
 ///
-/// Mutants seen red: the start-time check dropped (H2); the 2 s slack set to 0; the days of an
+/// Catches: the start-time check dropped (H2); the 2 s slack set to 0; the days of an
 /// elapsed time dropped; the restart hint dropped from the refusal.
 #[test]
 fn a_daemon_that_started_before_kbf_toml_changed_cannot_tell() {
@@ -627,7 +627,7 @@ fn a_daemon_that_started_before_kbf_toml_changed_cannot_tell() {
 /// long past and only the status-change time is recent: a daemon that started 200 s before it
 /// cannot be told to use this `kbf.toml`, one that started 995 s after it can.
 ///
-/// Mutants seen red: the later of the two times replaced by the modification time alone; the
+/// Catches: the later of the two times replaced by the modification time alone; the
 /// restart hint dropped from the refusal.
 #[test]
 fn a_kbf_toml_whose_status_changed_after_the_daemon_started_cannot_tell() {
@@ -665,7 +665,7 @@ fn a_kbf_toml_whose_status_changed_after_the_daemon_started_cannot_tell() {
 ///
 /// With no directory there is nothing to note.
 ///
-/// Mutants seen red: the stale-directory rule allowing while the daemon IS running; a failing daemon `pgrep` read as no daemon; `pgrep` exit 2 read as none; the two counts summed; the note naming no directory.
+/// Catches: the stale-directory rule allowing while the daemon IS running; a failing daemon `pgrep` read as no daemon; `pgrep` exit 2 read as none; the two counts summed; the note naming no directory.
 #[test]
 fn stale_directories_are_allowed_only_when_the_daemon_is_positively_not_running() {
     let mut rig = MacHost::new("f1-stale");
@@ -708,7 +708,7 @@ fn stale_directories_are_allowed_only_when_the_daemon_is_positively_not_running(
 /// its keeper, and neither signal can be trusted. Missing, a directory in its place and a
 /// link to nothing cannot tell; a link to a file is a file (the daemon tests it the same way).
 ///
-/// Mutant seen red: the `sandbox-exec` check dropped (H5).
+/// Catches: the `sandbox-exec` check dropped (H5).
 #[test]
 fn a_mac_without_sandbox_exec_cannot_tell() {
     let at = |rig: &MacHost| rig.root.join("usr/bin/sandbox-exec");
@@ -739,7 +739,7 @@ fn a_mac_without_sandbox_exec_cannot_tell() {
 /// `data-dir` or a relative one, a pool key (not read by this source), and a file that is
 /// there for the trust check but gone for the timestamp read.
 ///
-/// Mutants seen red: the trust check dropped; the driver check dropped; the pool-key check dropped; the mode check dropped.
+/// Catches: the trust check dropped; the driver check dropped; the pool-key check dropped; the mode check dropped.
 #[test]
 fn a_kbf_toml_that_is_not_a_native_daemons_or_not_trusted_cannot_tell() {
     let toml_cases: Vec<(&str, String, &str)> = vec![
@@ -889,7 +889,7 @@ fn a_kbf_toml_that_is_not_a_native_daemons_or_not_trusted_cannot_tell() {
 /// are failures too, except a name that vanished from the listing, which is a lease that
 /// ended and is not one.
 ///
-/// Mutant seen red: a symlinked `leases/` followed.
+/// Catches: a symlinked `leases/` followed.
 #[test]
 fn a_leases_directory_that_is_not_a_plain_directory_cannot_tell() {
     let leases = |rig: &MacHost| rig.leases();
@@ -931,7 +931,7 @@ fn a_leases_directory_that_is_not_a_plain_directory_cannot_tell() {
 /// shows another account's arguments to root only, and for anyone else it would match
 /// nothing and read idle.
 ///
-/// Mutant seen red: the root check dropped.
+/// Catches: the root check dropped.
 #[test]
 fn a_check_not_run_as_root_cannot_tell() {
     let mut rig = MacHost::new("not-root");
@@ -945,7 +945,7 @@ fn a_check_not_run_as_root_cannot_tell() {
 /// starts) has made its directory by the time the directories are read last, so it counts;
 /// read first, the directory would be missed and its keeper not yet started.
 ///
-/// Mutants seen red: the directories read before the processes (H4); the directories ignored.
+/// Catches: the directories read before the processes (H4); the directories ignored.
 #[test]
 fn a_lease_that_starts_during_the_check_is_seen() {
     for during in [KEEPER_PATTERN, DAEMON_PATTERN] {
@@ -964,7 +964,7 @@ fn a_lease_that_starts_during_the_check_is_seen() {
 /// with spaces are read; a line that starts with a pid not asked for, a blank line and a
 /// header are skipped.
 ///
-/// Mutant seen red: the days of an elapsed time dropped.
+/// Catches: the days of an elapsed time dropped.
 #[test]
 fn rows_are_read_from_padded_columns() {
     let text = "  PID  PPID ELAPSED COMMAND\n\n   42     1 2-03:04:05 /bin/x  a  b \n    7     1    1:02:03 y\n   99     1    00:01 z\n";
@@ -992,7 +992,7 @@ fn rows_are_read_from_padded_columns() {
 /// text, a bare number, too many fields, a sign, letters, an empty field and a number too
 /// long to be a time are not.
 ///
-/// Mutant seen red: the days of an elapsed time dropped.
+/// Catches: the days of an elapsed time dropped.
 #[test]
 fn elapsed_time_is_read_as_ps_prints_it() {
     assert_eq!(etime_secs("05:03"), Some(303));
@@ -1030,7 +1030,7 @@ fn the_clock_reads_the_present() {
 /// is a real executor under the root and its runner starts real programs, so on a Linux
 /// scratch root with no `sandbox-exec` it cannot tell, naming the file.
 ///
-/// Mutant seen red: the `sandbox-exec` check dropped.
+/// Catches: the `sandbox-exec` check dropped.
 #[test]
 fn the_host_source_reads_the_host_root_it_is_given() {
     let root = scratch_dir("mac-leases-on-host");

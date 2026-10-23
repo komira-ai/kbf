@@ -90,7 +90,7 @@ fn malformed_and_duplicate_rows_are_refused() {
 #[test]
 fn a_matching_budget_passes() {
     // Catches: a check that refuses a tree whose every file has its row (the control
-    // for the planted defects below).
+    // for the broken trees below).
     let budget = "[files]\na.sh\tCI\nb.py\tempty\n";
     assert_eq!(
         check(budget, &[found("a.sh"), found("b.py")]),
@@ -100,7 +100,7 @@ fn a_matching_budget_passes() {
 
 #[test]
 fn an_unlisted_file_is_refused() {
-    // Catches (planted defect): a new `x.sh` with no row passing the lint.
+    // Catches: a new `x.sh` with no row passing the lint.
     assert_eq!(
         check("[files]\n", &[found("x.sh")]),
         vec![format!(
@@ -112,7 +112,7 @@ fn an_unlisted_file_is_refused() {
 
 #[test]
 fn a_stale_row_is_refused() {
-    // Catches (planted defect): a row left behind for a deleted file, so a later file
+    // Catches: a row left behind for a deleted file, so a later file
     // of that name would be listed without review.
     assert_eq!(
         check("[files]\ngone.sh\tCI\n", &[]),
@@ -140,7 +140,7 @@ fn a_row_matches_only_its_own_section() {
 
 #[test]
 fn interpreter_files_are_found_by_extension_or_first_line() {
-    // Catches (one planted defect among them: an extensionless
+    // Catches (one of them an extensionless
     // `#!/usr/bin/env python3`): an interpreter file missed because it has no
     // extension, an upper-case one, or a `#!` line through `env` options or
     // `busybox`; and a Rust inner attribute or a compiled tool's `#!` taken for one.
@@ -264,7 +264,7 @@ const LIB: &str = "crates/x/src/lib.rs";
 
 #[test]
 fn a_production_sh_c_is_found() {
-    // Catches (planted defect): `Command::new("sh").arg("-c")` in production code
+    // Catches: `Command::new("sh").arg("-c")` in production code
     // passing the lint; the keeper's shape (the shell a `Path` in one function, `-c`
     // an `.arg` in another) and a macro's argument list missed; and a file with two
     // spawns reported twice (its one row is per file).

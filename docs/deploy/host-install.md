@@ -99,14 +99,14 @@ The unit (this program again, as root, with the fixed environment) does the inst
 0. Reads the allowlist and the source again, takes a non-blocking `flock` on
    `/run/kbf-host-install.lock` and keeps it until it exits; if another install holds it,
    answers `failed` with reason `busy` and runs nothing.
-1. Reads the installed version with `dpkg-query`. A target older than the installed version
-   is refused; the same version is a no-op that reports `already_installed`. A package dpkg
-   flags with an error (the third character of its status, `R` for reinstall required) is not
-   cleanly installed: an install of the same or a newer version goes ahead (apt repairs it),
-   an older one is refused as ever.
+1. Reads the installed version with `dpkg-query`. The same version is a no-op that reports
+   `already_installed`; any other version, older or newer, is installed. A rollback is an
+   install of an older version, and nothing here refuses it. A package dpkg flags with an
+   error (the third character of its status, `R` for reinstall required) is not cleanly
+   installed: an install of any version goes ahead, the same one included (apt repairs it).
 2. Runs `apt-get update` restricted to the channel's source file
    (`-o Dir::Etc::SourceList=<file> -o Dir::Etc::SourceParts=-`), then
-   `apt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold
+   `apt-get install -y --no-install-recommends --allow-downgrades -o Dpkg::Options::=--force-confold
    -o DPkg::Lock::Timeout=300 -t <suite> kbf=<version>` with the same restriction.
 3. Reads the installed version again and reports `installed` only if it is the target and
    the package is cleanly installed.
@@ -122,12 +122,12 @@ One JSON line on stdout.
 |---|---|---|
 | install, done | `{"result":"installed","installed_version":"...","unit_state":"finished"}` | 0 |
 | install, same version | `{"result":"already_installed","installed_version":"...","unit_state":"not_run"}` | 0 |
-| query | `{"result":"query","installed_version":"..."\|null,"running_commit":"..."\|null,"in_progress":true\|false}` | 0 |
+| query | `{"result":"query","installed_version":"..."\|null,"running_commit":"..."\|null,"node_id":"..."\|null,"in_progress":true\|false}` | 0 |
 | refused | `{"result":"refused","reason":"<code>"}` | 2 |
 | failed | `{"result":"failed","reason":"<code>"}`, detail on stderr | 3 |
 
 Refusal codes: `bad_command`, `channel_not_allowed`, `config_invalid`, `config_unsafe`,
-`channel_unsigned`, `key_untrusted`, `channel_insecure`, `older_than_installed`. Failure codes:
+`channel_unsigned`, `key_untrusted`, `channel_insecure`. Failure codes:
 `audit_unavailable`, `query_failed`, `installed_version_invalid`, `package_state_unclean`,
 `update_failed`, `install_failed`, `verify_failed`, `busy`, `lock_unavailable`.
 
@@ -137,7 +137,11 @@ Every line has a `result`: `installed`, `already_installed`, `query`, `refused` 
 and null when it is not installed or dpkg flags an error on the package (the updater then
 installs, which repairs it). `running_commit` is the commit `kbf --version --json` of the
 installed binary reports, or null; the binary is killed after 10 seconds, and a binary that
-fails, hangs or prints something else has none.
+fails, hangs or prints something else has none. `node_id` is the id of the node: `[node] id`
+of `/etc/kbf/kbf.toml`, else its `[identity] node-id`, else the short host name in lower case
+(the id an enrolling node takes when its configuration names none). It is null when the file
+is missing or is not root's alone to write, or when the value is not a DNS label. A client that
+acts on one host among several compares it with the id it expects before it does anything.
 
 `in_progress` is true when any of three things holds, and false only when none does: the
 install lock `/run/kbf-host-install.lock` is held (probed, then let go at once; the process

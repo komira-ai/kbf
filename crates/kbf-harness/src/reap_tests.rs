@@ -74,7 +74,7 @@ fn the_sentinel_is_done_only_when_it_is_told_so() {
     // Catches: a sentinel that takes anything it reads for the all-clear (a harness's stray
     // line would then leave the daemons of a run that died), one that takes the end of the
     // input for it (the whole point), and one that does not see a `done` on the last line
-    // with no newline, or after other lines. Mutants: `Ok(_)` is done; the end is done.
+    // with no newline, or after other lines. Catches: `Ok(_)` is done; the end is done.
     let said = |text: &str| word(&mut Cursor::new(text.to_owned()));
     assert_eq!(said("done\n"), Word::Done);
     assert_eq!(said("done"), Word::Done);
@@ -94,7 +94,7 @@ fn the_sentinel_is_done_only_when_it_is_told_so() {
 #[test]
 fn a_harness_that_died_has_its_daemons_killed_and_its_socket_removed() {
     // Catches: the cleanup that does not clean: a daemon per loop left running, holding the
-    // farm's connection, and the control socket left in the temporary directory. Mutants:
+    // farm's connection, and the control socket left in the temporary directory. Catches:
     // the lost branch kills no daemon; it removes no socket; it kills one lane too few.
     let r = reap("reap-lost", 3);
     assert_eq!(r.run(&mut Cursor::new(String::new())), 1);
@@ -108,7 +108,7 @@ fn a_harness_that_died_has_its_daemons_killed_and_its_socket_removed() {
 fn a_harness_that_ended_well_has_nothing_cleaned_up() {
     // Catches: a sentinel that kills the daemons of a run that ended well (the loops have
     // killed their own; a second kill waits on a daemon for nothing) or removes a socket
-    // the next run may own by then. Mutant: the done branch cleans up as well.
+    // the next run may own by then. Catches: the done branch cleans up as well.
     let r = reap("reap-done", 2);
     assert_eq!(r.run(&mut Cursor::new("done\n".to_owned())), 0);
     assert_eq!((kills(&r, 0), kills(&r, 1)), (0, 0));
@@ -129,7 +129,7 @@ fn a_cleanup_without_a_socket_kills_the_daemons_alone() {
 fn the_cleanup_is_the_daemons_it_was_made_from() {
     // Catches: a Duration that does not survive the command line (the kill bound becoming
     // zero seconds would give up on every daemon at once), a lane count or a path that does
-    // not. Mutant: the bound is read as seconds.
+    // not. Catches: the bound is read as seconds.
     let daemons = Daemons {
         buck2: PathBuf::from("/b/buck2"),
         project: PathBuf::from("/p"),
@@ -183,7 +183,7 @@ fn the_command_line_names_the_socket_only_when_there_is_one() {
 fn a_sentinel_that_is_dropped_is_told_done_and_leaves_everything_alone() {
     // Catches: a harness that ends well while its sentinel kills the daemons of a finished run
     // (the pipe closed with no `done`), or that leaves the sentinel running for ever. The
-    // sentinel is a real process, the kbf-beta binary. Mutant: `Drop` closes the pipe and
+    // sentinel is a real process, the kbf-beta binary. Catches: `Drop` closes the pipe and
     // says nothing.
     let r = reap("sentinel-done", 2);
     let sentinel =
@@ -201,7 +201,7 @@ fn a_sentinel_whose_pipe_closes_with_no_done_cleans_up() {
     // Catches: a sentinel that is not wired to its input (a pipe that is not its standard
     // input, or a standard input it never reads): the harness dies, the kernel closes the pipe,
     // and nothing happens. Here the pipe is closed by hand, which is what the kernel does.
-    // Mutants: the sentinel is started with no input (it cleans up at once, so the "nothing
+    // Catches: the sentinel is started with no input (it cleans up at once, so the "nothing
     // yet" check fails); its input is never read.
     let r = reap("sentinel-lost", 2);
     let mut sentinel =
@@ -247,7 +247,7 @@ fn the_groups_the_files_name_are_killed_and_nothing_else_is() {
     // Catches: a sentinel that leaves the grandchildren of a killed harness's roles running
     // (the kernel kills a role, not what it started), and one that signals what a file
     // should not make it signal: a number that is not a group (0 and 1), text, a file that
-    // is not a `.pgid` (the `leave.txt` names a live group that must survive). Mutants:
+    // is not a `.pgid` (the `leave.txt` names a live group that must survive). Catches:
     // `kill_groups` does nothing (the named group survives); the extension filter removed
     // (`leave.txt` is killed).
     let dir = crate::scratch("kill-groups");
@@ -273,7 +273,7 @@ fn a_group_named_by_a_file_is_killed_with_the_children_in_it() {
     // children (the actions of a native driver) are in the role's group but are not its
     // leader, and they would be left running after the harness died. The role leads a group
     // of its own; the child is started into that group (`process_group(role)`, as a fork of
-    // the role is) and leads none. Mutant: `kill_groups` kills the pid the file names
+    // the role is) and leads none. Catches: `kill_groups` kills the pid the file names
     // (`kill_process`), not the group (the child survives).
     let dir = crate::scratch("kill-groups-child");
     let mut role = grouped_sleeper();
@@ -297,7 +297,7 @@ fn a_group_named_by_a_file_is_killed_with_the_children_in_it() {
 #[test]
 fn the_command_line_names_the_group_directory_only_when_there_is_one() {
     // Catches: `--pgids` lost on the way to the sentinel (a killed harness's grandchildren
-    // survive again), or given with no value. Mutant: `args` leaves it out.
+    // survive again), or given with no value. Catches: `args` leaves it out.
     let mut r = reap("reap-pgids-args", 1);
     let args: Vec<String> = r
         .args()

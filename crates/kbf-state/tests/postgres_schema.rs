@@ -1,76 +1,64 @@
 //! The schema the installer owns, against a real server: creating it, migrating it under
-//! a serving store, and the refusals. Each test makes a schema of its own and drops it.
+//! a serving store, and the refusals. Each test makes a database of its own and drops it, so
+//! the schema in it (the default one, `kbf_state`) and the schema lock, which is one per
+//! database, are the test's alone.
 //!
-//! The tests that need a server are `#[ignore]`d; the `state-postgres` job runs them with
-//! `--include-ignored`. `KBF_TEST_POSTGRES_URL` names a database they may create and drop
-//! schemas in.
+//! The tests need a server and fail without one, so the pull-request gate runs them with the
+//! rest. `KBF_TEST_POSTGRES_URL` names a server they may create and drop databases on.
 #![cfg(feature = "postgres")]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use kbf_state::postgres::schema::{self, Migration, SchemaError};
-use kbf_state::postgres::{PostgresConfig, PostgresStore};
+use kbf_state::postgres::{PostgresConfig, PostgresStore, TestDatabase};
 use kbf_state::{Cond, Store, StoreError, Txn};
 use postgres::{Client, NoTls};
 
-const URL_VAR: &str = "KBF_TEST_POSTGRES_URL";
+/// The schema the store and the installer use, which each test's database holds alone.
+const SCHEMA: &str = PostgresConfig::DEFAULT_SCHEMA;
 
-static NEXT: AtomicU64 = AtomicU64::new(0);
-
-fn url() -> String {
-    std::env::var(URL_VAR)
-        .unwrap_or_else(|_| panic!("{URL_VAR} must name a postgres:// URL the tests may use"))
-}
-
-fn sql(statement: &str) -> Result<(), postgres::Error> {
-    Client::connect(&url(), NoTls)?.batch_execute(statement)
-}
-
-/// A schema name no other test uses, dropped with the guard.
-struct Scratch {
-    name: String,
-}
+/// A database no other test uses, dropped with the guard.
+struct Scratch(TestDatabase);
 
 impl Scratch {
     fn new() -> Scratch {
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        Scratch {
-            name: format!("kbf_s{}_{n}", std::process::id()),
-        }
+        Scratch(TestDatabase::empty())
+    }
+
+    fn url(&self) -> String {
+        self.0.url()
     }
 
     fn config(&self) -> PostgresConfig {
-        PostgresConfig::parse(&url())
-            .and_then(|c| c.with_schema(&self.name))
-            .expect("the test URL parses")
+        PostgresConfig::parse(&self.url()).expect("parses")
+    }
+
+    /// `statement`, run with the schema first on the search path.
+    fn sql(&self, statement: &str) -> Result<(), postgres::Error> {
+        Client::connect(&self.url(), NoTls)?
+            .batch_execute(&format!("SET search_path TO {SCHEMA}; {statement}"))
     }
 
     fn query(&self, statement: &str) -> Vec<postgres::Row> {
-        let mut client = Client::connect(&url(), NoTls).expect("connects");
+        let mut client = Client::connect(&self.url(), NoTls).expect("connects");
         client
-            .batch_execute(&format!("SET search_path TO {}", self.name))
+            .batch_execute(&format!("SET search_path TO {SCHEMA}"))
             .ok();
         client.query(statement, &[]).expect("the query runs")
     }
 
     fn has_schema(&self) -> bool {
-        let mut client = Client::connect(&url(), NoTls).expect("connects");
+        let mut client = Client::connect(&self.url(), NoTls).expect("connects");
         !client
             .query(
                 "SELECT 1 FROM pg_namespace WHERE nspname = $1",
-                &[&self.name],
+                &[&PostgresConfig::DEFAULT_SCHEMA],
             )
             .expect("catalog")
             .is_empty()
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = sql(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.name));
     }
 }
 
@@ -116,7 +104,6 @@ fn refusal(config: &PostgresConfig) -> String {
 /// Mutants seen red: the schema_version INSERT left out (`current` says not initialised);
 /// a table of migration 1 misnamed (the store's first statement fails).
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_fresh_database_gets_the_schema_and_a_store_runs_on_it() {
     let s = Scratch::new();
     let config = s.config();
@@ -143,7 +130,6 @@ fn a_fresh_database_gets_the_schema_and_a_store_runs_on_it() {
 /// Mutant seen red: `connect` made to run the old `CREATE SCHEMA IF NOT EXISTS` statements
 /// (the open succeeded and the schema existed afterwards).
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_store_does_not_create_the_schema_and_says_what_to_run() {
     let s = Scratch::new();
     let why = refusal(&s.config());
@@ -167,7 +153,6 @@ fn a_store_does_not_create_the_schema_and_says_what_to_run() {
 /// check on every new connection would not be caught here: with the expand rule it passes
 /// too, so only the first connection is judged, to save a query per connect.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn migrating_to_n_plus_1_leaves_the_serving_n_child_working() {
     let s = Scratch::new();
     let installer = s.config();
@@ -227,16 +212,12 @@ fn migrating_to_n_plus_1_leaves_the_serving_n_child_working() {
 ///
 /// Mutant seen red: `TooNew` check removed (the store opened on a schema it cannot run).
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_schema_changed_incompatibly_by_a_newer_release_is_refused() {
     let s = Scratch::new();
     let config = s.config();
     schema::apply(&config, &schema::embedded(), 1).expect("creates");
-    sql(&format!(
-        "INSERT INTO {}.schema_version (version, name, kind) VALUES (2, 'later', 'contract')",
-        s.name
-    ))
-    .expect("the later release's row");
+    let row = "INSERT INTO schema_version (version, name, kind) VALUES (2, 'later', 'contract')";
+    s.sql(row).expect("the later release's row");
     let why = refusal(&config.clone().with_supported_schema(1, 1));
     assert!(
         why.contains("version 2") && why.contains("1 to 1") && why.contains("matches the database"),
@@ -252,7 +233,6 @@ fn a_schema_changed_incompatibly_by_a_newer_release_is_refused() {
 ///
 /// Mutant seen red: `found < supported.min` comparison inverted.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_schema_older_than_the_binary_needs_is_refused() {
     let s = Scratch::new();
     let config = s.config();
@@ -274,7 +254,6 @@ fn a_schema_older_than_the_binary_needs_is_refused() {
 /// Mutant seen red: the `ContractPending` check removed (the DROP ran and the column was
 /// gone).
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn an_update_never_runs_a_contract_step_and_runs_nothing_when_one_is_pending() {
     let s = Scratch::new();
     let config = s.config();
@@ -306,7 +285,6 @@ fn an_update_never_runs_a_contract_step_and_runs_nothing_when_one_is_pending() {
 ///
 /// Mutant seen red: the BEGIN left out of `run_in_transaction` (`half` existed).
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_migration_that_fails_is_rolled_back_whole() {
     let s = Scratch::new();
     let config = s.config();
@@ -336,7 +314,6 @@ fn a_migration_that_fails_is_rolled_back_whole() {
 /// Catches a database ahead of the installer being "migrated" backwards or ignored: the
 /// package is older than the schema it is asked to serve.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn an_installer_older_than_the_schema_refuses_and_a_release_it_cannot_serve_is_refused() {
     let s = Scratch::new();
     let config = s.config();
@@ -359,7 +336,6 @@ fn an_installer_older_than_the_schema_refuses_and_a_release_it_cannot_serve_is_r
 
 /// Catches a set that skips or reorders versions, and a database whose rows skip one.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn numbering_gaps_are_refused_in_the_set_and_in_the_database() {
     let s = Scratch::new();
     let config = s.config();
@@ -371,11 +347,8 @@ fn numbering_gaps_are_refused_in_the_set_and_in_the_database() {
         }
     );
     schema::apply(&config, &schema::embedded(), 1).expect("creates");
-    sql(&format!(
-        "INSERT INTO {}.schema_version (version, name, kind) VALUES (3, 'x', 'expand')",
-        s.name
-    ))
-    .expect("a skipped row");
+    let row = "INSERT INTO schema_version (version, name, kind) VALUES (3, 'x', 'expand')";
+    s.sql(row).expect("a skipped row");
     assert_eq!(
         schema::apply(&config, &two(), 2).unwrap_err(),
         SchemaError::Gap {
@@ -391,14 +364,10 @@ fn numbering_gaps_are_refused_in_the_set_and_in_the_database() {
 /// Mutant seen red: migration 1 written with `CREATE TABLE IF NOT EXISTS` (it "succeeded"
 /// over the old tables).
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn tables_from_before_the_schema_was_versioned_are_refused() {
     let s = Scratch::new();
-    sql(&format!(
-        "CREATE SCHEMA {n}; CREATE TABLE {n}.kv (key text PRIMARY KEY)",
-        n = s.name
-    ))
-    .expect("an old store");
+    let old = format!("CREATE SCHEMA {SCHEMA}; CREATE TABLE {SCHEMA}.kv (key text PRIMARY KEY)");
+    s.sql(&old).expect("an old store");
     let SchemaError::Failed { why, .. } =
         schema::apply(&s.config(), &schema::embedded(), 1).unwrap_err()
     else {
@@ -421,7 +390,6 @@ fn tables_from_before_the_schema_was_versioned_are_refused() {
 /// Mutant seen red: the advisory lock removed (a thread failed on a duplicate key or on
 /// `CREATE TABLE` already existing).
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn installers_that_race_apply_a_migration_once() {
     let s = Scratch::new();
     let config = s.config();
@@ -446,16 +414,14 @@ fn installers_that_race_apply_a_migration_once() {
 
 // ---- bounded waits ----------------------------------------------------------------------
 
-/// The schema lock is one per database, whatever the schema: the tests below hold it on
-/// purpose, so they take turns (one at a time, process-wide).
-static HOLDS_THE_LOCK: Mutex<()> = Mutex::new(());
-
-/// A session that holds the schema lock, as an installer in the middle of a migration does.
+/// A session that holds the schema lock of the database at `url`, as an installer in the
+/// middle of a migration does. The lock is one per database, whatever the schema: the tests
+/// below hold it on purpose, each in the database of its own, so no other test waits on it.
 struct LockHolder(Client);
 
 impl LockHolder {
-    fn take() -> LockHolder {
-        let mut client = Client::connect(&url(), NoTls).expect("connects");
+    fn take(url: &str) -> LockHolder {
+        let mut client = Client::connect(url, NoTls).expect("connects");
         client
             .batch_execute("BEGIN; SELECT pg_advisory_xact_lock(hashtext('kbf-state-schema'))")
             .expect("the lock is free");
@@ -488,14 +454,10 @@ fn apply_in_thread(
 /// Mutants seen red: the `SET LOCAL lock_timeout` left out (the short wait never ends: the
 /// 5 s receive times out); `Busy` mapped to a plain database error.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_migration_waits_for_the_schema_lock_for_as_long_as_it_is_told() {
-    let _turn = HOLDS_THE_LOCK
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
     let s = Scratch::new();
 
-    let holder = LockHolder::take();
+    let holder = LockHolder::take(&s.url());
     let started = Instant::now();
     let short = apply_in_thread(s.config(), two(), 2, Duration::from_millis(300));
     let gave_up = short.recv_timeout(Duration::from_secs(5));
@@ -508,7 +470,7 @@ fn a_migration_waits_for_the_schema_lock_for_as_long_as_it_is_told() {
     assert!(waited >= Duration::from_millis(250), "{waited:?}");
     assert!(!s.has_schema(), "a migration that waited left a schema");
 
-    let holder = LockHolder::take();
+    let holder = LockHolder::take(&s.url());
     let long = apply_in_thread(s.config(), two(), 2, Duration::from_secs(60));
     assert!(
         long.recv_timeout(Duration::from_millis(500)).is_err(),
@@ -533,20 +495,12 @@ fn a_migration_waits_for_the_schema_lock_for_as_long_as_it_is_told() {
 /// Mutant seen red: the lock timeout reset (`SET LOCAL lock_timeout = 0`) right after the
 /// schema lock, so only the advisory wait was bounded: the `ALTER` waited past the 5 s.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_migration_gives_up_when_a_table_it_alters_is_in_use() {
-    let _turn = HOLDS_THE_LOCK
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
     let s = Scratch::new();
     schema::apply(&s.config(), &schema::embedded(), 1).expect("version 1");
-    let mut reader = Client::connect(&url(), NoTls).expect("connects");
-    reader
-        .batch_execute(&format!(
-            "BEGIN; SET LOCAL search_path TO {}; SELECT count(*) FROM kv",
-            s.name
-        ))
-        .expect("a read in progress");
+    let mut reader = Client::connect(&s.url(), NoTls).expect("connects");
+    let read = format!("BEGIN; SET LOCAL search_path TO {SCHEMA}; SELECT count(*) FROM kv");
+    reader.batch_execute(&read).expect("a read in progress");
     let mut set = schema::embedded();
     set.push(
         Migration::new(
@@ -579,12 +533,10 @@ fn a_migration_gives_up_when_a_table_it_alters_is_in_use() {
 ///
 /// Mutant seen red: `describe_refusal` returning the server's text.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_refused_connection_does_not_name_the_database() {
-    let (base, _) = url()
-        .rsplit_once('/')
-        .map(|(a, b)| (a.to_owned(), b.to_owned()))
-        .expect("a URL");
+    let s = Scratch::new();
+    let url = s.url();
+    let (base, _) = url.rsplit_once('/').expect("a URL");
     let config = PostgresConfig::parse(&format!("{base}/kbf_nodb_marker")).expect("parses");
     let err = schema::apply(&config, &schema::embedded(), 1).unwrap_err();
     let SchemaError::Database(why) = &err else {
@@ -606,9 +558,9 @@ fn a_refused_connection_does_not_name_the_database() {
 ///
 /// Mutant seen red: `Busy` returned for every error of the opening statements.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_refusal_of_the_opening_statements_is_not_busy() {
-    let config = PostgresConfig::parse(&url())
+    let s = Scratch::new();
+    let config = PostgresConfig::parse(&s.url())
         .and_then(|c| c.with_schema("pg_catalog"))
         .expect("parses");
     let err =

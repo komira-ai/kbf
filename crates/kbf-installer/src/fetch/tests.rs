@@ -60,7 +60,7 @@ fn pull_by(
 /// refused before a request is made (an upper-case digest would name a second copy; a longer
 /// one is a path).
 ///
-/// Mutant seen red: `is_digest` accepting any 64 characters.
+/// Catches: `is_digest` accepting any 64 characters.
 #[test]
 fn a_digest_that_is_not_lowercase_hex_is_refused_before_anything_starts() {
     for bad in [
@@ -86,7 +86,7 @@ fn a_digest_that_is_not_lowercase_hex_is_refused_before_anything_starts() {
 /// Catches the declared size trusted: a source could otherwise be asked for a gigabyte the
 /// host never agreed to take.
 ///
-/// Mutants seen red: `>` for `>=` at the cap (the exact-cap case); the `min` with the ceiling
+/// Catches: `>` for `>=` at the cap (the exact-cap case); the `min` with the ceiling
 /// removed (a cap over 1 GiB in the settings).
 #[test]
 fn a_size_outside_the_hosts_cap_is_refused_before_anything_starts() {
@@ -144,7 +144,7 @@ fn the_room_needed_is_the_tarball_its_extraction_and_the_release_replaced() {
 /// Catches the check being skipped or comparing the wrong way round: a full disk would be
 /// found by a failed write half way through a download instead.
 ///
-/// Mutant seen red: `free < need` as `free > need`.
+/// Catches: `free < need` as `free > need`.
 #[test]
 fn a_disk_without_room_is_refused_before_anything_starts() {
     let dir = scratch_dir("fetch-disk");
@@ -160,7 +160,7 @@ fn a_disk_without_room_is_refused_before_anything_starts() {
 /// A source that is not a plain https URL is refused (settings refuse it too; the child checks
 /// again, so a bug in either is not one mistake from a request for another host).
 ///
-/// Mutant seen red: the scheme check removed from `https_base`'s caller.
+/// Catches: the scheme check removed from `https_base`'s caller.
 #[test]
 fn a_source_that_is_not_a_plain_https_url_is_refused() {
     for base in [
@@ -391,7 +391,7 @@ fn the_child_is_this_program_as_the_fetch_user_or_a_typed_error() {
 /// Catches a child started with no user by a root helper (the parser of untrusted bytes would be
 /// root, with only the limits left), a named root, and root's group taken for harmless.
 ///
-/// Mutants: `None` taken as "no switch, so fine"; the group left out of the check; the check
+/// Catches: `None` taken as "no switch, so fine"; the group left out of the check; the check
 /// made on `run_as` alone (a root process with none named passes).
 #[test]
 fn a_child_that_would_run_as_root_is_refused() {
@@ -443,7 +443,7 @@ fn a_child_that_would_run_as_root_is_refused() {
 /// Catches the check placed after the identity is read and lent (the key would be read, and held
 /// in memory, on the way to a refusal), and a refusal worded as a missing file.
 ///
-/// Mutant: the check removed from `fetch_component` (the error is then the missing file).
+/// Catches: the check removed from `fetch_component` (the error is then the missing file).
 #[test]
 fn a_root_child_is_refused_before_the_identity_is_read() {
     let source = Source::Frontend(FrontendSource {
@@ -497,7 +497,7 @@ fn the_child_makes_itself_not_dumpable() {
 /// Catches the description's call left out of either check (a host's key read and lent to a child
 /// that is not going to start, or a request to a source the settings would not have named).
 ///
-/// Mutants: the `refuse_root` call removed from `describe_release` (the error is then the missing
+/// Catches: the `refuse_root` call removed from `describe_release` (the error is then the missing
 /// file); the `check_source` call removed (the error is then the child that cannot start).
 #[test]
 fn a_description_is_refused_for_the_same_reasons_before_anything_starts() {
@@ -538,7 +538,7 @@ fn a_description_is_refused_for_the_same_reasons_before_anything_starts() {
 /// Catches the identity's fault lost or turned into another (a child started without the
 /// identity it was to be lent), in the describe path as in the component path.
 ///
-/// Mutant: `lend_identity` skipped in `describe_release` (red: the child cannot start).
+/// Catches: `lend_identity` skipped in `describe_release` (red: the child cannot start).
 #[test]
 fn a_description_needs_the_nodes_identity_before_a_child_exists() {
     use crate::testkit::A;
@@ -569,7 +569,7 @@ fn a_description_needs_the_nodes_identity_before_a_child_exists() {
 ///
 /// Catches a cap read from the timeout's key or the timeout in the wrong unit.
 ///
-/// Mutants planted: the timeout in milliseconds; the cap from `fetch_timeout_s`.
+/// Catches: the timeout in milliseconds; the cap from `fetch_timeout_s`.
 #[test]
 fn limits_are_the_installer_tomls_cap_and_timeout() {
     let toml = InstallerToml {

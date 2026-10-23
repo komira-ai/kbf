@@ -37,7 +37,15 @@ pub const PROMPT: Duration = Duration::from_secs(10);
 /// What a run may take on top of its bound for the SIGTERM grace its end gives the
 /// processes (the default, two seconds), and for the clean of a slot, which gives the
 /// same grace again.
-const GRACE_ALLOWANCE: Duration = Duration::from_secs(10);
+pub const GRACE_ALLOWANCE: Duration = Duration::from_secs(10);
+
+/// What a run may take on top of that when its slot has to be cleaned first (a slot set
+/// aside at slot-ready, or left dirty by a failed clean, is cleaned again before the lease
+/// is given it): the clean ends the user's processes with the same grace, then the
+/// assertion reads the user against its baseline, and the hand-out runs the slot-ready
+/// check and the profile canaries. A clean of a real user takes several seconds with the
+/// grace, and the recovery thread's first pass waits as long again as its backoff.
+pub const CLEAN_ALLOWANCE: Duration = Duration::from_secs(30);
 
 /// A CAS in memory; `delay` holds every `get` back (to kill a lease mid-fetch).
 #[derive(Debug, Default)]
@@ -329,13 +337,21 @@ pub async fn run(
     seq: u64,
     spec: &Spec,
 ) -> Result<ActionResult, RuntimeError> {
+    run_within(runtime, cas, seq, spec, PROMPT * 3 + GRACE_ALLOWANCE).await
+}
+
+/// [`run`] with the bound on the run given.
+pub async fn run_within(
+    runtime: &NativeRuntime<MemoryCas>,
+    cas: &MemoryCas,
+    seq: u64,
+    spec: &Spec,
+    bound: Duration,
+) -> Result<ActionResult, RuntimeError> {
     let action = spec.store(cas);
-    tokio::time::timeout(
-        PROMPT * 3 + GRACE_ALLOWANCE,
-        runtime.run(work(seq, action, 0)),
-    )
-    .await
-    .expect("the run ends")
+    tokio::time::timeout(bound, runtime.run(work(seq, action, 0)))
+        .await
+        .expect("the run ends")
 }
 
 pub fn stdout(cas: &MemoryCas, result: &ActionResult) -> String {

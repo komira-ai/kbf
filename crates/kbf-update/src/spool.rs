@@ -117,7 +117,7 @@ mod tests {
     /// the node's own state file with them, a spool that is not made 0700 when missing, and an
     /// `open` that cannot say where the spool is.
     ///
-    /// Mutants planted: the prefix test inverted (the record is removed, the partial left);
+    /// Catches: the prefix test inverted (the record is removed, the partial left);
     /// the mode 0o755 (the mode assertion fails); the removal skipped (the partial remains).
     #[test]
     fn a_start_removes_the_partial_files_of_a_crash_and_nothing_else() {
@@ -150,7 +150,7 @@ mod tests {
     /// `InvalidData` error that leaves nothing behind, and a file in the place of the spool is
     /// an error of `open`.
     ///
-    /// Mutant planted: the size cap skipped in `to_bytes` (the 2 MiB record is written).
+    /// Catches: the size cap skipped in `to_bytes` (the 2 MiB record is written).
     #[test]
     fn a_record_the_installer_would_refuse_is_not_written_and_a_file_is_no_spool() {
         let dir = scratch("spool-bad");

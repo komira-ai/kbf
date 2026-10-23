@@ -144,7 +144,7 @@ fn another_namespace_is_refused_both_in_the_signature_and_in_the_file() {
 
 #[test]
 fn a_software_key_is_refused_even_when_listed() {
-    // Catches: accepting any key type (M10 mutant "accept any key type"): a software
+    // Catches: accepting any key type (M10 defect "accept any key type"): a software
     // ed25519 key added to the file by mistake must not erase a Mac.
     let (line, sig) = software_signature("bob", b"m");
     let signers = AllowedSigners::parse(&line).unwrap();
@@ -156,7 +156,7 @@ fn a_software_key_is_refused_even_when_listed() {
 
 #[test]
 fn a_signature_without_a_touch_is_refused() {
-    // Catches: ignoring the flags byte (M10 mutant "ignore the flags byte").
+    // Catches: ignoring the flags byte (M10 defect "ignore the flags byte").
     let key = SkKey::new(1);
     let signers = signers_for(&key);
     let untouched = key.sign_with(NAMESPACE, b"m", 0);

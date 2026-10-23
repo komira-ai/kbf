@@ -162,7 +162,7 @@ async fn write_as(bucket: &Bucket, writer: NodeWriter, n: usize) -> Vec<String> 
 /// boots of one member, both counting seq from 1, would then name the same objects),
 /// or that is not exactly `<root>cas/<member>/<boot>/<seq>` in 16 hex digits each; and
 /// a key that does not parse back to its object, or parses in a spelling the cache
-/// never writes. Mutant seen red: the boot dropped from the key (boot 2's keys equal
+/// never writes. Catches: the boot dropped from the key (boot 2's keys equal
 /// boot 1's).
 #[tokio::test]
 async fn object_keys_carry_member_and_boot() {
@@ -232,7 +232,7 @@ async fn object_keys_carry_member_and_boot() {
 /// bucket holds old-layout objects of a log whose id equals the member id, at the epoch
 /// equal to the boot and the very seqs the node will number; the node writes N
 /// segments. No write may name an existing key, and every old object must read back
-/// byte for byte. Mutant seen red: the node key reusing the old layout,
+/// byte for byte. Catches: the node key reusing the old layout,
 /// `<root><member>/cas/<boot>/<seq>` (the node's writes replace the old objects).
 #[tokio::test]
 async fn no_key_collision_with_old_server_objects() {

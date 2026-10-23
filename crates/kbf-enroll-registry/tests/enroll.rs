@@ -184,7 +184,7 @@ fn token_reasons_are_told_only_after_the_secret_and_in_order() {
 }
 
 // Catches an enroll that reads the use count outside the transaction's compare: more
-// concurrent callers than uses must still make exactly `max_uses` nodes. (Mutant: drop
+// concurrent callers than uses must still make exactly `max_uses` nodes. (Catches: drop
 // Cond::Version on the token row.)
 fn racing_enrollments_make_exactly_max_uses_nodes(env: Env) {
     const MAX: u32 = 3;
@@ -691,7 +691,7 @@ fn serials_are_stored_and_denied_as_the_deny_list_spells_them() {
 
 // Catches a decision made on a stale read: a rival takes a use between this call's reads
 // and its commit, so the commit fails; the call must read again, sign again and end with
-// both nodes and both uses. (Mutant: a cached token row, or no version on the token row,
+// both nodes and both uses. (Catches: a cached token row, or no version on the token row,
 // would end with one use recorded for two nodes.)
 #[test]
 fn a_lost_race_is_decided_again_on_fresh_rows() {
@@ -927,7 +927,7 @@ fn nothing_is_written_where_membership_scans() {
 
 // Catches the key row written without Cond::Absent: another node registers the same key
 // between this call's check and its commit, and the commit must fail and be decided again
-// (then refused), not overwrite the other node's key row. (Mutant: Cond::Any on the key put.)
+// (then refused), not overwrite the other node's key row. (Catches: Cond::Any on the key put.)
 #[test]
 fn a_key_registered_by_a_rival_during_the_commit_is_not_overwritten() {
     let env = fake();

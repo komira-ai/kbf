@@ -62,8 +62,8 @@ fn wiring(nodes: usize) -> Wiring {
 fn topologies() -> Vec<(&'static str, Topology)> {
     let mut rehearsal_small = Topology::rehearsal(2);
     rehearsal_small.limits = Limits::small();
-    let mut beta_mutant = Topology::beta();
-    beta_mutant.overrides = vec![
+    let mut beta_shrunk = Topology::beta();
+    beta_shrunk.overrides = vec![
         (Role::Node(1), kbf_harness::b0::shrunk()),
         // `b0`'s `extra_flags` in the test of a farm that never becomes ready.
         (
@@ -79,7 +79,7 @@ fn topologies() -> Vec<(&'static str, Topology)> {
         ("rehearsal", Topology::rehearsal(2)),
         ("rehearsal-small", rehearsal_small),
         ("beta", Topology::beta()),
-        ("beta-mutant", beta_mutant),
+        ("beta-shrunk", beta_shrunk),
         ("beta-every", beta_every),
     ]
 }

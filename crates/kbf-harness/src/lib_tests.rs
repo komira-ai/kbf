@@ -7,7 +7,7 @@ fn only_the_directories_of_runs_that_are_over_are_swept() {
     // Catches: the scratch directories of every run of the tests piling up in the temporary
     // directory (thousands, after a day of runs), and a sweep that takes what is not its own:
     // the directory of a process that is running (a test binary alongside this one), a name
-    // that is not `<name>-<pid>`, a file. Mutants: nothing removed; a running process's
+    // that is not `<name>-<pid>`, a file. Catches: nothing removed; a running process's
     // directory removed; a name with no pid removed.
     let root = scratch("sweep").join("root");
     let _ = std::fs::remove_dir_all(&root);

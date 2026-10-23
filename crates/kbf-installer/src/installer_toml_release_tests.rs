@@ -2,7 +2,7 @@
 //! (docs/design/kbf-installer.md section 3): `release_source = "bundled"`, the frontend
 //! snapshot (`frontend_url`, `frontend_ca`, `frontend_ca_sha256`), `release_ca`, and the
 //! tolerant reader. The older keys' tests are `installer_toml_tests.rs`'s. Each test says the
-//! defect it catches and the mutants to plant to see it go red.
+//! defect it catches.
 
 use std::path::PathBuf;
 
@@ -63,7 +63,7 @@ fn snapshot() -> FrontendPull {
 /// Catches `bundled` missing from the set of sources, and the exclusion that covers `url`
 /// not covering it: a key accepted under the wrong source.
 ///
-/// Mutants to plant: `"bundled"` removed from the `not_frontend` test (the identity and the
+/// Catches: `"bundled"` removed from the `not_frontend` test (the identity and the
 /// snapshot are then accepted beside it); from the `not_url` test (`release_ca` is then
 /// accepted); the `release_url` arm for `bundled` returning a source.
 #[test]
@@ -95,7 +95,7 @@ fn bundled_is_a_source_that_excludes_every_key_naming_another() {
 /// Catches a snapshot read with a key missing (a fetch with no CA pinned), and a snapshot
 /// accepted under a source that never looks at it.
 ///
-/// Mutants to plant: the `(Some, Some, Some)` arm taking any two keys; the group accepted
+/// Catches: the `(Some, Some, Some)` arm taking any two keys; the group accepted
 /// beside `release_source = "url"`.
 #[test]
 fn the_frontend_snapshot_is_three_keys_that_come_together() {
@@ -128,7 +128,7 @@ fn the_frontend_snapshot_is_three_keys_that_come_together() {
 /// short digest), and a refusal that quotes the value (a digest is public, but a URL is
 /// not: it can hold user information).
 ///
-/// Mutants to plant: the path check of the address removed; `absolute_path` skipped for the CA;
+/// Catches: the path check of the address removed; `absolute_path` skipped for the CA;
 /// the digest taken as a plain string; the digest's own error text (which quotes the value)
 /// passed through.
 #[test]
@@ -169,7 +169,7 @@ fn each_snapshot_key_is_checked_by_its_own_rule() {
 ///
 /// Catches a key accepted under the wrong source, and a path rule loosened for it.
 ///
-/// Mutants to plant: the exclusion for `frontend` removed (then the defaulted source takes
+/// Catches: the exclusion for `frontend` removed (then the defaulted source takes
 /// it); for `bundled` removed; `absolute` skipped for the key.
 #[test]
 fn release_ca_is_an_absolute_path_for_the_url_source_only() {
@@ -201,7 +201,7 @@ fn release_ca_is_an_absolute_path_for_the_url_source_only() {
 /// Catches a new key made required (or defaulted to something), which would refuse every
 /// existing host's file.
 ///
-/// Mutants to plant: the snapshot group's `(None, None, None)` arm made a problem; `release_ca`
+/// Catches: the snapshot group's `(None, None, None)` arm made a problem; `release_ca`
 /// defaulting to a path.
 #[test]
 fn a_file_written_before_the_new_keys_still_parses_to_the_same_values() {
@@ -228,7 +228,7 @@ fn a_file_written_before_the_new_keys_still_parses_to_the_same_values() {
 /// fetch from a default source), and the tolerant one left closed (the proxy refusing to start
 /// over a key it never reads).
 ///
-/// Mutants to plant: the `retain` of `parse_tolerant` removed (red: the future keys are
+/// Catches: the `retain` of `parse_tolerant` removed (red: the future keys are
 /// refused); `parse` filtering its table the same way (red: the closed refusals); the filter
 /// keeping `release_source`.
 #[test]
@@ -270,7 +270,7 @@ fn the_closed_reader_refuses_what_it_does_not_know_and_the_tolerant_one_ignores_
 /// default `kbf.toml`), and a relative path let through (the children are started from a
 /// directory of the proxy's, not the operator's).
 ///
-/// Mutants to plant: the key left out of `render`; left out of `TOLERANT_KEYS`; `absolute` not
+/// Catches: the key left out of `render`; left out of `TOLERANT_KEYS`; `absolute` not
 /// asked of it in `from_raw`.
 #[test]
 fn frontend_config_is_an_absolute_path_that_both_readers_take() {
@@ -302,7 +302,7 @@ fn frontend_config_is_an_absolute_path_that_both_readers_take() {
 /// Catches a tolerant reader that ignores everything (a `confirm_window_s` of 5 accepted), one
 /// that skips the proxy table's own rules, and one that quotes the parser.
 ///
-/// Mutants to plant: `from_raw` skipped by `parse_tolerant`; `redact` removed from its
+/// Catches: `from_raw` skipped by `parse_tolerant`; `redact` removed from its
 /// deserialization error; the size check removed.
 #[test]
 fn the_tolerant_reader_still_checks_what_it_reads() {
@@ -337,7 +337,7 @@ fn the_tolerant_reader_still_checks_what_it_reads() {
 /// keys: the URL is planted (a password in it) in each key, in the wrong type, and beside a
 /// source that refuses the key, and neither `Display` nor `Debug` of the error may hold it.
 ///
-/// Mutants to plant: the digest's own error (it quotes the text) passed through; `{v:?}` in a
+/// Catches: the digest's own error (it quotes the text) passed through; `{v:?}` in a
 /// message of the address, the path or the exclusion checks.
 #[test]
 fn a_value_typed_into_a_new_key_is_never_repeated() {

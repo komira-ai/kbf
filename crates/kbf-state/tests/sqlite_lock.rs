@@ -18,7 +18,7 @@ use kbf_testkit::forked::ForkedChild;
 
 // Catches a lock the store's drop releases only by closing its descriptor: the restart
 // of a frontend in a process that also spawns children (a test binary) is refused with
-// `Locked`. Mutant: the `Drop` of `LockFile` removed.
+// `Locked`. Catches: the `Drop` of `LockFile` removed.
 #[test]
 fn a_child_forked_while_the_store_was_open_does_not_keep_the_file_locked_after_the_drop() {
     let dir = scratch("lock-forked-drop");
@@ -33,7 +33,7 @@ fn a_child_forked_while_the_store_was_open_does_not_keep_the_file_locked_after_t
 
 // Catches a demotion (the handover to the next frontend) that gives up the lock only
 // by closing it: the successor's `StoreLock`, or its open, is refused while any child
-// forked in the meantime has not exec'd. Mutant: the `Drop` of `LockFile` removed.
+// forked in the meantime has not exec'd. Catches: the `Drop` of `LockFile` removed.
 #[test]
 fn a_demoted_store_gives_up_the_lock_though_a_forked_child_has_a_copy() {
     let dir = scratch("lock-forked-demote");
@@ -47,7 +47,7 @@ fn a_demoted_store_gives_up_the_lock_though_a_forked_child_has_a_copy() {
 }
 
 // Catches a `StoreLock` (what a restore holds) that is released only by the close, and
-// the answer of `is_held` after it. Mutant: the `Drop` of `LockFile` removed.
+// the answer of `is_held` after it. Catches: the `Drop` of `LockFile` removed.
 #[test]
 fn a_store_lock_is_free_after_its_drop_though_a_forked_child_has_a_copy() {
     let dir = scratch("lock-forked-store-lock");

@@ -30,7 +30,7 @@ fn stale(current: u64) -> impl Fn(&Result<crate::Digest, StorageError>) -> bool 
 /// Catches a node that serves a write routed by a map it does not hold: a caller behind
 /// the node (an older generation, or 0 for "no map seen") must get STALE_MAP naming the
 /// node's generation, and the blob must not be stored; the same blob under the node's
-/// generation is stored. Mutants: the check removed; `<` made `<=` (the current
+/// generation is stored. Catches: the check removed; `<` made `<=` (the current
 /// generation refused); the check moved after the store (the blob lands before the
 /// refusal).
 #[tokio::test]
@@ -59,7 +59,7 @@ async fn a_caller_behind_the_node_gets_stale_map_and_nothing_is_stored() {
 /// Catches a node that tells a caller that is ahead of it that it is stale (the caller's
 /// map may be the right one; the node has only not been told) or serves the write under a
 /// map it cannot compare. UNAVAILABLE, naming both generations, and nothing stored.
-/// Mutant: `>` made `>=` or the arm returning STALE_MAP.
+/// Catches: `>` made `>=` or the arm returning STALE_MAP.
 #[tokio::test]
 async fn a_caller_ahead_of_the_node_is_unavailable_not_stale() {
     let (mem, _, channel) = node(7).await;
@@ -100,7 +100,7 @@ async fn the_node_judges_by_the_map_it_holds_now() {
 
 /// Catches the held-blob shortcut answering a stale caller: a write the node would
 /// acknowledge unread ("already stored") is refused all the same, because the node no
-/// longer holds the placement the caller wrote under. Mutant: the check after the
+/// longer holds the placement the caller wrote under. Catches: the check after the
 /// `find_missing` shortcut.
 #[tokio::test]
 async fn a_stale_caller_is_refused_even_for_a_blob_the_node_holds() {
@@ -119,7 +119,7 @@ async fn a_stale_caller_is_refused_even_for_a_blob_the_node_holds() {
 /// is one of several, so it cannot tell a caller's placement is the current one. Every
 /// generation is refused UNAVAILABLE and nothing is stored. (A node given no source at all
 /// is a one-member farm and serves every generation: the plain `StorageService` tests.)
-/// Mutant: the no-map case answering `Ok`.
+/// Catches: the no-map case answering `Ok`.
 #[tokio::test]
 async fn a_node_with_a_source_and_no_map_serves_no_generation() {
     let mem = std::sync::Arc::new(Mem::default());
@@ -151,7 +151,7 @@ async fn raw(channel: &Channel, header: Option<MetadataValue<tonic::metadata::As
 /// node's generation in the trailer (the only way to tell it from the FAILED_PRECONDITION
 /// of an action write whose closure is not held); a call with no generation entry is "no
 /// map seen", so stale; an entry that is not a decimal number is INVALID_ARGUMENT, not
-/// read as 0 or as current. Mutants: the trailer dropped; an absent entry read as
+/// read as 0 or as current. Catches: the trailer dropped; an absent entry read as
 /// current; a malformed entry read as 0.
 #[tokio::test]
 async fn the_wire_names_the_generation_and_refuses_a_malformed_one() {

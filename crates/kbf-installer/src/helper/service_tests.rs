@@ -47,7 +47,7 @@ fn world(
 /// Catches `ps` lines that are not an executable path (a kernel thread, a bare name) being
 /// taken for one, and a path with spaces being cut.
 ///
-/// Mutant planted: the `starts_with('/')` filter dropped.
+/// Catches: the `starts_with('/')` filter dropped.
 #[test]
 fn ps_output_keeps_only_absolute_paths() {
     let out = b"/sbin/launchd\n  /var/lib/kbf-installer/releases/x y/kbf-daemon \nkernel_task\n\n";
@@ -64,7 +64,7 @@ fn ps_output_keeps_only_absolute_paths() {
 /// process is a service that can confirm. The question is one fixed command, the unit after
 /// `--`, so a unit name can never be read as an option.
 ///
-/// Mutants planted: the `ActiveState` test dropped (a failed unit with a stale MainPID
+/// Catches: the `ActiveState` test dropped (a failed unit with a stale MainPID
 /// passes); MainPID 0 accepted; the `--` removed.
 #[test]
 fn the_unit_must_be_active_with_a_main_process() {
@@ -93,7 +93,7 @@ fn the_unit_must_be_active_with_a_main_process() {
 /// the state, an unparsable pid, a manager that cannot be started, and (launchd) a job that
 /// is not loaded or loaded but not running.
 ///
-/// Mutants planted: a non-zero exit read as success; the launchd `pid = 0` accepted.
+/// Catches: a non-zero exit read as success; the launchd `pid = 0` accepted.
 #[test]
 fn an_answer_that_does_not_say_active_is_no() {
     let (_, _, _, mut host) = world("svc-odd", "x");
@@ -150,7 +150,7 @@ fn an_answer_that_does_not_say_active_is_no() {
 /// check not yet run (Linux); the unit not active; the process gone. The right release, with
 /// the window started, passes. (macOS arms at the swap and has no boot check.)
 ///
-/// Mutants planted: string prefix instead of path components (the sibling directory
+/// Catches: string prefix instead of path components (the sibling directory
 /// passes); the " (deleted)" test dropped; the boot-check test dropped.
 #[test]
 fn a_confirm_needs_the_new_release_running_and_started_once() {
@@ -211,7 +211,7 @@ fn a_confirm_needs_the_new_release_running_and_started_once() {
 /// Catches a release root reached through a link being compared by its spelling: the kernel
 /// reports resolved paths, so a root that is itself a link still matches.
 ///
-/// Mutant planted: `resolved` returning its argument.
+/// Catches: `resolved` returning its argument.
 #[test]
 fn paths_are_compared_resolved() {
     let (layout, dir) = host_root("svc-resolved");
@@ -241,7 +241,7 @@ fn paths_are_compared_resolved() {
 /// was deleted; processes elsewhere are not releases; a host whose processes cannot be listed
 /// is an error (the caller then removes nothing).
 ///
-/// Mutants planted: the " (deleted)" suffix refused (a running, replaced release is
+/// Catches: the " (deleted)" suffix refused (a running, replaced release is
 /// collected); the error swallowed into an empty set.
 #[test]
 fn releases_in_use_are_the_ones_processes_execute_from() {
@@ -269,7 +269,7 @@ fn releases_in_use_are_the_ones_processes_execute_from() {
 /// environment, its paths become executables, and a failed or hung `ps` is an error, not an
 /// empty table (which would let `gc` remove a running release).
 ///
-/// Mutants planted: a non-zero exit accepted; the timeout flag ignored.
+/// Catches: a non-zero exit accepted; the timeout flag ignored.
 #[test]
 fn the_macos_table_comes_from_ps() {
     let runner = FakeRunner::new(|spawn| {
@@ -342,7 +342,7 @@ fn the_recorder_records_and_answers_unknown_commands() {
 /// names the process, one that is loaded and has no pid is "not running", and one not loaded
 /// is "not loaded"; on a Mac a confirm then finds the executable of that process.
 ///
-/// Mutants planted: the exit status of `launchctl print` ignored (a job that is not loaded
+/// Catches: the exit status of `launchctl print` ignored (a job that is not loaded
 /// gives a pid); a pid of 0 taken as a process.
 #[test]
 fn a_launchd_job_is_read_by_launchctl_print() {
