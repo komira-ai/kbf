@@ -576,6 +576,8 @@ mod tests {
         denies: Option<bool>,
         /// What mounting a `devfs` answers.
         mount: Answer,
+        /// Whether starting a tool fails.
+        no_tools: bool,
         calls: RefCell<Vec<String>>,
     }
 
@@ -587,6 +589,7 @@ mod tests {
                 kern: 0,
                 denies: Some(false),
                 mount: || Ok(()),
+                no_tools: false,
                 calls: RefCell::default(),
             }
         }
@@ -618,6 +621,9 @@ mod tests {
         }
         fn run(&self, program: &str, args: &[String]) -> io::Result<Out> {
             self.note(format!("run {program} {}", args.join(" ")));
+            if self.no_tools {
+                return Err(io::Error::from_raw_os_error(libc::ENOENT));
+            }
             let helper = ["bootout"];
             if args.first().is_some_and(|a| helper.contains(&a.as_str())) {
                 return Ok(Out {
@@ -908,6 +914,16 @@ mod tests {
             probe(&fake, Op::MachRegister, lease),
             Seen::Failed(_)
         ));
+        // A tool that cannot be started, and a platform without the call.
+        let mut fake = world(Op::LaunchdBootstrap, World::Shut);
+        fake.no_tools = true;
+        let seen = probe(&fake, Op::LaunchdBootstrap, lease);
+        assert!(matches!(seen, Seen::Failed(_)), "{seen:?}");
+        #[cfg(not(target_os = "macos"))]
+        for op in [Op::MachRegister, Op::LsOpen] {
+            let seen = probe(&RealFs, op, lease);
+            assert!(matches!(seen, Seen::Failed(_)), "{op:?}: {seen:?}");
+        }
         // Failures before the door is tried.
         let writes = Fake::new(|| errno(libc::EROFS));
         for op in [Op::Mount, Op::LaunchdBootstrap] {
