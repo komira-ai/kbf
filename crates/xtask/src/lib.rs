@@ -23,7 +23,7 @@
 //!   <dir>` ([`package`]): one binary as a release asset, a tarball that is the same
 //!   bytes on every runner, and its SBOM, with their lines in `SHA256SUMS.<platform>`.
 //! - `installer-tarball --binary <path> --platform <platform> --commit <sha> --units
-//!   <dir> --trust <dir> --sysusers <file> --tmpfiles <file> --out <dir>`
+//!   <dir> --trust <dir> --sysusers <file> --tmpfiles <file> --needrestart <file> --out <dir>`
 //!   ([`installer_tarball`]): the files the Debian package ships, at the same paths and
 //!   modes (one list, [`pkg_linux::files`]), in a tarball that is the same bytes on every
 //!   runner, for `packaging/install.sh`.
@@ -230,6 +230,9 @@ enum Verb {
         /// The tmpfiles.d file.
         #[arg(long)]
         tmpfiles: PathBuf,
+        /// The needrestart drop-in.
+        #[arg(long)]
+        needrestart: PathBuf,
         /// The directory the tarball goes in; created when missing.
         #[arg(long)]
         out: PathBuf,
@@ -251,6 +254,9 @@ enum Verb {
         /// The tmpfiles.d file.
         #[arg(long)]
         tmpfiles: PathBuf,
+        /// The needrestart drop-in.
+        #[arg(long)]
+        needrestart: PathBuf,
         /// The platform the binary was built for (`linux-x86_64`, `linux-arm64`).
         #[arg(long, value_enum)]
         platform: package::Platform,
@@ -873,6 +879,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             trust,
             sysusers,
             tmpfiles,
+            needrestart,
             out,
         } => installer_tarball::installer_tarball(
             platform,
@@ -883,6 +890,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 trust: &trust,
                 sysusers: &sysusers,
                 tmpfiles: &tmpfiles,
+                needrestart: &needrestart,
             },
             &out,
         ),
@@ -892,6 +900,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             trust,
             sysusers,
             tmpfiles,
+            needrestart,
             platform,
             version,
             version_of,
@@ -909,6 +918,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                     trust: &trust,
                     sysusers: &sysusers,
                     tmpfiles: &tmpfiles,
+                    needrestart: &needrestart,
                     platform,
                     version: &version,
                 },
