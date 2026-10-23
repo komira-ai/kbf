@@ -101,8 +101,8 @@ pub use kbf_types::NodePhase;
 pub use requeue::{Gib, Requeue, RequeueReason};
 pub use scheduler::loss::LOSS_REQUEUES;
 pub use scheduler::memory::{
-    FARM_RERUNS, Floor, FloorChange, LadderError, MEMORY_FLOORS, MemoryLadder, MemoryState,
-    NOT_STARTED_RERUNS,
+    FARM_RERUNS, Floor, FloorChange, KeyFloor, LadderError, MEMORY_FLOORS, MemoryLadder,
+    MemoryState, NOT_STARTED_RERUNS,
 };
 pub use scheduler::{
     Avoided, FINISHED_RETENTION, Fate, LeasePhase, LeaseView, MAX_AVOIDED, OpState,

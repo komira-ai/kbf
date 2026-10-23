@@ -1,7 +1,7 @@
 //! Offers over the worker session (`docs/design/pull-updates.md` sections 5 and 6.4), end to
 //! end: a real frontend over loopback with a release store and a state store, daemons that
 //! speak the session, and the node's own update client (`kbf-update`) taking the offers. What
-//! the server keeps of the statuses the nodes send is `tests/update_hosts.rs`.
+//! the server keeps of the statuses the nodes send is `src/update_status/tests.rs`.
 
 #[path = "support/hooked.rs"]
 mod hooked;

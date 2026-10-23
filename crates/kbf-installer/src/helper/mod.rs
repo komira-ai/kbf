@@ -47,6 +47,7 @@ pub mod restart;
 pub mod serve;
 pub mod service;
 pub mod status;
+pub mod trusted_toml;
 
 #[cfg(test)]
 mod crash_tests;

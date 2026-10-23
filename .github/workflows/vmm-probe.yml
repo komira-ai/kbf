@@ -1,0 +1,82 @@
+# The VM probe binary for a Mac: kbf-vmm (signed ad hoc with the hardened runtime and the
+# virtualization entitlement by `cargo xtask sign-darwin`, which gives that entitlement to
+# kbf-vmm only) and kbf-guest, built from the commit, as a workflow artifact to download
+# and run on a Mac with virtualization (`kbf-vmm probe`, `probe-bench`, `image base`).
+#
+# A GitHub-hosted macOS runner is itself a virtual machine without nested virtualization,
+# so this job cannot run a guest. It builds and signs the binaries, checks the signature,
+# runs `--help` and the tests that need no hypervisor, and keeps the files. It runs on a
+# pull request that changes either crate, by hand, and on a push to main. Nothing is
+# attested here: the artifact is a build of the commit, to be fetched with `gh run
+# download` and checked against the SHA-256 in the job summary.
+name: vmm-probe
+
+on:
+  pull_request:
+    paths:
+      - crates/kbf-vmm/**
+      - crates/kbf-guest/**
+      - tools/ci/darwin-entitlements.txt
+      - .github/workflows/vmm-probe.yml
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - crates/kbf-vmm/**
+      - crates/kbf-guest/**
+
+permissions: {}
+
+concurrency:
+  group: vmm-probe-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  darwin-arm64:
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      TARGET: aarch64-apple-darwin
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: sw_vers
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-vmm -p kbf-guest --bin kbf-vmm --bin kbf-guest
+      - name: Sign kbf-vmm (with the virtualization entitlement) and check it
+        run: cargo xtask sign-darwin "target/$TARGET/release/kbf-vmm" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
+      - name: Sign kbf-guest (no entitlements) and check it
+        run: cargo xtask sign-darwin "target/$TARGET/release/kbf-guest" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
+      - name: The signed kbf-vmm starts
+        run: target/aarch64-apple-darwin/release/kbf-vmm --version
+      - name: The signed kbf-vmm lists its commands
+        run: target/aarch64-apple-darwin/release/kbf-vmm --help
+      # The tests that need no hypervisor: arguments, JSON shapes, the digest refusal,
+      # clone logic against a fake clonefile, statistics, and the commands that report a
+      # missing base. The signing tests run codesign on copies of the binary.
+      - run: cargo test --locked -p kbf-vmm -p kbf-guest
+      - run: cargo test --locked -p kbf-vmm --test signing -- --ignored
+      - name: Tar kbf-vmm (a tar keeps the executable bit)
+        run: tar -C "target/$TARGET/release" -czf "kbf-vmm-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-vmm
+      - name: Tar kbf-guest
+        run: tar -C "target/$TARGET/release" -czf "kbf-guest-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-guest
+      - name: Sum the tarballs in the job summary
+        run: shasum -a 256 ./*.tar.gz >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vmm-probe-darwin-arm64
+          path: ./*.tar.gz
+          retention-days: 30
+          if-no-files-found: error
