@@ -309,34 +309,32 @@ fn print_my_groups() {
     println!("groups: {}", groups.join(" "));
 }
 
-/// The groups the test binary's copy belongs to when `run_as` starts it.
-fn groups_of_child(copy: &Path, run_as: Option<Identity>) -> Vec<u32> {
-    let mut probe = Cmd {
+/// The groups the process `cmd` starts belongs to (the probe's own `groups:` line); the raw
+/// output is kept as `groups_<name>`.
+fn groups_of(name: &str, cmd: &Cmd) -> Vec<u32> {
+    let out = run(cmd);
+    capture(&format!("groups_{name}"), &out);
+    assert!(out.success(), "{name}: {}", out.stderr_text());
+    let text = out.stdout_text();
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("groups:"))
+        .unwrap_or_else(|| panic!("{name}: no groups line: {text}"));
+    line.split_whitespace()
+        .map(|g| g.parse().unwrap())
+        .collect()
+}
+
+/// The probe: the test binary's copy, printing its groups.
+fn probe(copy: &Path) -> Cmd {
+    Cmd {
         program: copy.display().to_string(),
         args: ["--ignored", "--exact", "print_my_groups", "--nocapture"]
             .map(str::to_owned)
             .to_vec(),
         timeout: Some(LIMIT),
         ..Cmd::default()
-    };
-    probe.run_as = run_as;
-    let out = run(&probe);
-    capture(
-        &format!(
-            "groups_{}",
-            if run_as.is_some() { "dropped" } else { "root" }
-        ),
-        &out,
-    );
-    assert!(out.success(), "{}", out.stderr_text());
-    let text = out.stdout_text();
-    let line = text
-        .lines()
-        .find_map(|line| line.strip_prefix("groups:"))
-        .unwrap_or_else(|| panic!("no groups line: {text}"));
-    line.split_whitespace()
-        .map(|g| g.parse().unwrap())
-        .collect()
+    }
 }
 
 /// `dscl` gives the ids of `nobody`, the account the attestation check runs as, and the
@@ -360,14 +358,143 @@ fn dscl_ids_of_nobody_and_a_drop_to_them() {
     fs::copy(std::env::current_exe().unwrap(), &copy).unwrap();
     fs::set_permissions(&copy, fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(&*dir, fs::Permissions::from_mode(0o755)).unwrap();
-    let as_root = groups_of_child(&copy, None);
+    let as_root = groups_of("root", &probe(&copy));
     assert!(
         as_root.len() > 1,
         "root belongs to several groups: {as_root:?}"
     );
-    let dropped = groups_of_child(&copy, Some(ids));
+    // The runner's own drop (`Command::uid` and `gid`): what it leaves is recorded.
+    let mut dropped = probe(&copy);
+    dropped.run_as = Some(ids);
+    let by_runner = groups_of("runner_drop", &dropped);
+    // The same through chroot(8), which sets the groups itself.
+    let mut wrapped = probe(&copy);
+    let id_args = [
+        ids.uid.to_string(),
+        ids.gid.to_string(),
+        ids.gid.to_string(),
+    ];
+    wrapped.args = [
+        "-u",
+        &id_args[0],
+        "-g",
+        &id_args[1],
+        "-G",
+        &id_args[2],
+        "/",
+        &copy.display().to_string(),
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .chain(probe(&copy).args)
+    .collect();
+    wrapped.program = "/usr/sbin/chroot".to_owned();
+    let by_chroot = groups_of("chroot_drop", &wrapped);
     assert!(
-        dropped.iter().all(|g| *g == ids.gid),
-        "only the primary group is left: {dropped:?}"
+        by_chroot.iter().all(|g| *g == ids.gid),
+        "the runner left {by_runner:?}, chroot left {by_chroot:?}"
     );
+}
+
+/// The value of a field at the top of a service's listing: a line of exactly one tab, then
+/// `key = value`. (Written again here, plainly, to check the crate's reader against.)
+fn top_level<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("\t{key} = ");
+    text.lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+}
+
+/// How many lines of the listing are inside a nested block (two tabs or more).
+fn nested_lines(text: &str) -> usize {
+    text.lines().filter(|line| line.starts_with("\t\t")).count()
+}
+
+/// The field name of a nested line: what precedes ` = ` or ` => `.
+fn nested_key(line: &str) -> Option<&str> {
+    let line = line.trim_start();
+    line.split_once(" = ")
+        .or_else(|| line.split_once(" => "))
+        .map(|(key, _)| key)
+}
+
+/// The services launchd lists in the system domain, as labels.
+fn system_labels() -> Vec<String> {
+    let list = Cmd {
+        program: tools::LAUNCHCTL.to_owned(),
+        args: vec!["print".to_owned(), "system".to_owned()],
+        timeout: Some(LIMIT),
+        ..Cmd::default()
+    };
+    let exec = run(&list);
+    capture("print_system_domain", &exec);
+    let mut labels: Vec<String> = exec
+        .stdout_text()
+        .lines()
+        .filter_map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let [pid, status, label] = words.as_slice() else {
+                return None;
+            };
+            let number = |w: &str| w == "-" || w.parse::<i64>().is_ok();
+            (number(pid) && number(status) && label.contains('.') && !label.contains('='))
+                .then(|| (*label).to_owned())
+        })
+        .collect();
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
+/// Over the real listings of the system's own services, which have nested blocks (`arguments`,
+/// `endpoints`, `event triggers`, ...): the crate's readers agree, for every one of them, with
+/// the field at the top of the listing. The listing with the most nested lines is kept, and the
+/// names of the nested fields (with their counts) are written to `nested_keys.txt`.
+#[test]
+#[ignore = "needs a Mac and root: cargo xtask sudo-test"]
+fn print_of_the_systems_own_services_is_read_at_the_top_level() {
+    assert_root();
+    let labels = system_labels();
+    assert!(labels.len() > 20, "{} services listed", labels.len());
+    let mut listed = 0_usize;
+    let mut keys: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut most: Option<(usize, Exec)> = None;
+    for label in labels.iter().take(500) {
+        let exec = run(&tools::print(label, LIMIT));
+        if !exec.success() {
+            continue;
+        }
+        listed += 1;
+        let text = exec.stdout_text();
+        let running = top_level(&text, "state") == Some("running");
+        assert_eq!(tools::print_running(&text), running, "{label}: {text}");
+        let pid = top_level(&text, "pid").and_then(|p| p.parse::<u32>().ok());
+        assert_eq!(tools::print_pid(&text), pid.filter(|p| *p > 0), "{label}");
+        let ended = !running
+            && (top_level(&text, "last exit code").is_some_and(|c| c.parse::<i32>().is_ok())
+                || top_level(&text, "last terminating signal").is_some());
+        assert_eq!(tools::print_finished(&text), ended, "{label}");
+        for line in text.lines().filter(|line| line.starts_with("\t\t")) {
+            if let Some(key) = nested_key(line) {
+                *keys.entry(key.to_owned()).or_default() += 1;
+            }
+        }
+        let depth = nested_lines(&text);
+        if most.as_ref().is_none_or(|(best, _)| depth > *best) {
+            most = Some((depth, exec));
+        }
+    }
+    let mut counted: Vec<_> = keys.iter().collect();
+    counted.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    let table: String = counted
+        .iter()
+        .take(200)
+        .map(|(key, n)| format!("{n}\t{key}\n"))
+        .collect();
+    let dir = out_dir();
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("nested_keys.txt"), &table).unwrap();
+    let (depth, exec) = most.expect("a listing");
+    capture("print_nested_blocks", &exec);
+    assert!(listed > 20, "{listed} listed");
+    assert!(depth > 0, "no listing has a nested block");
 }
