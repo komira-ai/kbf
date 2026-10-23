@@ -76,9 +76,8 @@ const HEARTBEAT_MAX: Duration = Duration::from_millis(MAX_HEARTBEAT_INTERVAL_MS)
 // A frontend that renews a session row on schedule acknowledges every heartbeat: the
 // renewal comes due at the first heartbeat after `SESSION_RENEWAL`, which comes at most one
 // heartbeat interval later.
-const _: () = assert!(
-    SESSION_RENEWAL.as_millis() + HEARTBEAT_MAX.as_millis() < ACK_WINDOW.as_millis()
-);
+const _: () =
+    assert!(SESSION_RENEWAL.as_millis() + HEARTBEAT_MAX.as_millis() < ACK_WINDOW.as_millis());
 
 /// The two numbers of a 16-byte row, big-endian; `None` for a row of another length.
 pub(super) fn pair_of(row: &[u8]) -> Option<(u64, u64)> {
@@ -190,12 +189,18 @@ impl Durable {
     }
 
     fn remember_handover(&self, worker: &WorkerId, previous: Option<Owner>) {
-        let mut handovers = self.handovers.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut handovers = self
+            .handovers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         handovers.insert(worker.clone(), previous);
     }
 
     fn forget_handover(&self, worker: &WorkerId) {
-        let mut handovers = self.handovers.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut handovers = self
+            .handovers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         handovers.remove(worker);
     }
 
@@ -204,7 +209,10 @@ impl Durable {
     /// own (this frontend's), else the row's.
     fn replaced(&self, worker: &WorkerId, read: Option<Owner>) -> Option<Owner> {
         let own = read.is_some_and(|owner| owner.frontend == self.frontend);
-        let handovers = self.handovers.lock().unwrap_or_else(PoisonError::into_inner);
+        let handovers = self
+            .handovers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         match handovers.get(worker) {
             Some(before) if own => *before,
             _ => read,

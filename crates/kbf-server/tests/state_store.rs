@@ -1389,8 +1389,12 @@ async fn a_crash_at_any_write_of_a_refusal_leaves_the_operation_or_its_refusal(b
             let (_, mut inbox) = lose_lease(&farm).await;
             assert_eq!(starts(&mut inbox).len(), 1);
         }
+        // The new session registers while the store takes writes (the frontend becomes the
+        // node's owner); the store then takes `writes` writes of the heartbeat that loses
+        // the lease for the third time, and the heartbeat may go unacknowledged.
+        let (stream, _inbox) = register(&farm);
         disk.store.fail_after(writes);
-        let _ = lose_lease(&farm).await;
+        let _ = farm.heartbeat(&node(), stream, 1, Vec::new()).await;
         disk.crash(farm);
         let (unfinished, ended) = standing(&disk);
         assert_eq!(
