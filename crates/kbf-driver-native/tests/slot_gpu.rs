@@ -13,8 +13,9 @@
 //! daemon's context on a real Mac (root is refused there, even with Full Disk Access for
 //! the trust store); the slot profile denies leases access to them instead. The test
 //! checks that the deny holds for a lease (a readable file of the uid's in each store is
-//! unreadable under the profile), that the Metal probe still runs under it, and that an
-//! MLX matrix product still runs under it when MLX can be installed on the runner.
+//! unreadable under the profile) and that the Metal probe still runs under it. An MLX
+//! matrix product is not run: it needs a Python interpreter, which the interpreter
+//! budget (`tools/interpreter_budget.tsv`) does not allow a test to name.
 //!
 //! The test is `#[ignore]`: it needs root, real users, a Metal device and `swiftc`. The
 //! macOS CI job runs it with `cargo xtask sudo-test -p kbf-driver-native --test slot_gpu
@@ -304,61 +305,6 @@ fn plant(file: &Path, owner: u32, folder_owner: u32, mode: u32, litter: &mut Lit
     std::os::unix::fs::chown(file, Some(owner), None).expect("chown");
 }
 
-/// The MLX arm: `Ok` with what the matrix product printed, or `Err` with why MLX could not
-/// be set up on this runner (no `python3`, no wheel, no network), which the test prints
-/// as `MLX_SKIPPED`. A product that fails once MLX is installed is a failure of the
-/// profile, not a skip: it is returned as `Ok` with its output for the test to judge.
-fn mlx_arm(slot: &Slot, lease: &Lease, venv: &Path, python: &Path) -> Result<String, String> {
-    let ran = |network, program: &Path, args: &[&str]| {
-        lease
-            .command_with(slot, &lease.isolation, network, &[], (program, args))
-            .output()
-            .map_err(|e| e.to_string())
-    };
-    let step = |what: &str, network, program: &Path, args: &[&str]| {
-        let out = ran(network, program, args)?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-        } else {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let tail: Vec<&str> = err.lines().rev().take(3).collect();
-            Err(format!("{what}: {tail:?}"))
-        }
-    };
-    step(
-        "venv",
-        Network::Off,
-        Path::new("/usr/bin/python3"),
-        &["-m", "venv", venv.to_str().unwrap()],
-    )?;
-    step(
-        "pip install mlx",
-        Network::On,
-        python,
-        &[
-            "-m",
-            "pip",
-            "install",
-            "--quiet",
-            "--disable-pip-version-check",
-            "mlx",
-        ],
-    )?;
-    let product = ran(
-        Network::Off,
-        python,
-        &[
-            "-c",
-            "import mlx.core as mx; a = mx.ones((256, 256)); b = a @ a; mx.eval(b); print('MLX_PASS', float(b[0, 0]))",
-        ],
-    )?;
-    Ok(format!(
-        "{}{}",
-        String::from_utf8_lossy(&product.stdout),
-        String::from_utf8_lossy(&product.stderr)
-    ))
-}
-
 fn wait_for(file: &Path, needle: &str, secs: u64) -> bool {
     let until = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < until {
@@ -387,9 +333,7 @@ fn wait_for(file: &Path, needle: &str, secs: u64) -> bool {
 ///   write there) cannot be read by a lease under the slot profile, and the same read
 ///   outside the sandbox is printed as `PROTECTED-CONTROL`, so the deny is seen to be the
 ///   profile's when the store lets the uid in;
-/// - the Metal probe passes under the slot profile with that deny, and so does an MLX
-///   matrix product (`MLX_PASS`) when MLX installs on the runner (`MLX_SKIPPED` says why
-///   not).
+/// - the Metal probe passes under the slot profile with that deny.
 #[ignore = "needs root, real users, a Metal device and swiftc: see spike-slot-reach.yml job slot-gpu"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
@@ -495,12 +439,6 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
         ));
     }
 
-    // MLX under the profile, when it installs: a venv in the lease, mlx from the network
-    // (the profile with the network on), then a matrix product on the GPU with it off.
-    let venv = lease.dir.join("venv");
-    let python = venv.join("bin/python");
-    let mlx = mlx_arm(&slot, &lease, &venv, &python);
-
     // What a framework import makes in the security-message folder, planted as the system
     // makes it.
     let message = Path::new(MDS_MESSAGES)
@@ -559,13 +497,6 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
             "a lease under the slot profile read a file in {store}"
         );
         println!("PROTECTED-DENIED {store}: {}", why.trim());
-    }
-    match &mlx {
-        Ok(said) => assert!(
-            said.contains("MLX_PASS 256.0"),
-            "an MLX matrix product under the slot profile: {said}"
-        ),
-        Err(why) => println!("MLX_SKIPPED {why}"),
     }
     assert_eq!(free, 1, "the clean left the slot dirty");
     assert!(

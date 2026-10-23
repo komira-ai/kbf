@@ -336,8 +336,7 @@ error would have failed every clean on such a Mac and set every slot dirty. So:
   while an earlier lease ran. The daemons are not sandboxed by the lease's profile and keep writing
   for the uid. The `read-protected` canary asserts the deny ([slot profile canaries](#slot-profile-canaries)).
   Neither operation is one Metal needs, and the deny is not in the list of known GPU-breaking denies
-  (`tests/gpu_profile.rs`); `tests/slot_gpu.rs` runs the Metal probe, and MLX when it installs,
-  under the profile.
+  (`tests/gpu_profile.rs`); `tests/slot_gpu.rs` runs the Metal probe under the profile (MLX is not run: a test may not name a Python interpreter).
 
 Known limits:
 
