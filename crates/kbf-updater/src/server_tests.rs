@@ -40,6 +40,11 @@ fn prepare(name: &str, proxy_uid: u32) -> Config {
         operator_api: "127.0.0.1:1".parse().expect("addr"),
         token_file: dir.join("unused"),
         operator_proxy_auth_file: None,
+        ssh_key_file: dir.join("unused-key"),
+        ssh_user: "kbf".to_owned(),
+        channel: "stable".to_owned(),
+        ssh_connect_timeout: std::time::Duration::from_secs(5),
+        ssh_command_timeout: std::time::Duration::from_secs(30),
     }
 }
 
