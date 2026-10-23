@@ -301,7 +301,7 @@ A row not refused in its own form sets the slot aside. The profile rows are
 |---|---|---|---|
 | `write-outside` | `(deny file-write*)` | create a file in `/private/tmp` | `EPERM` or `EACCES` |
 | `link-outside` | `(deny file-write*)` | hard-link `/etc/hosts` into the lease | `EPERM` or `EACCES` |
-| `mach-register` | `(deny mach-register)` | `bootstrap_check_in` of a service name | `kern_return` 1100 (`BOOTSTRAP_NOT_PRIVILEGED`) |
+| `mach-register` | `(deny mach-register)` | `bootstrap_check_in` of a service name no job declares | `kern_return` 1100 (`BOOTSTRAP_NOT_PRIVILEGED`) |
 | `lsopen` | `(deny lsopen)` | `sandbox_check` of `lsopen`, the question Launch Services asks before it starts an application | denied (`sandbox=1`) |
 | `file-mount` | `(deny file-mount)` | `mount(2)` of a `devfs` on a directory of the lease | `EPERM` |
 | `launchd-bootstrap` | none: `(allow default)` | `launchctl bootstrap user/<uid>` of a `Background` `KeepAlive` agent whose file is in the lease | `Bootstrap failed: 5` |
@@ -310,7 +310,17 @@ A slot user has no login session on a node, so `lsopen` cannot be seen working b
 application: `open` and `LSOpenCFURLRef` failed or waited with the rule dropped as with it kept
 (measured on the runner). The canary asks the sandbox the question Launch Services asks. The
 `file-mount` canary mounts a `devfs` itself: a user may mount one on a directory it owns, and
-the runner showed that succeed with the rule dropped and fail with `EPERM` with it kept.
+the runner showed that succeed with the rule dropped and fail with `EPERM` with it kept. On a
+node where `vfs.generic.usermount` is 0 a user cannot mount at all, so `EPERM` comes either way
+and the canary cannot see a missing rule there; the slot cannot mount either.
+
+For `mach-register` the service name is one no job declares, so with the rule dropped launchd
+answers 1102 (`BOOTSTRAP_UNKNOWN_SERVICE`), never success: the sandbox refuses before launchd
+looks the name up, with 1100 instead of 1102. The canary depends on that split, and a dropped
+rule is reported as a failure (not a refusal of this door), not as an open door. The `lsopen`
+canary shows that the rule is in the profile the process runs under, not that Launch Services
+refused an open. The `launchd-bootstrap` canary writes its job file with mode 0644, so the
+refusal is not a file launchd rejects for its permissions.
 
 Left open on purpose:
 
@@ -322,5 +332,8 @@ Left open on purpose:
   `diskimages-helper`, even with `(deny file-mount)`. The clean's unmount step and the death
   of the helper remove it; the `file-mount` canary names a mount point, which the rule refuses.
 
-None of cargo, clang, swiftc, git, a Python virtual environment or `swift build
---disable-sandbox` broke with the three added denies on a hosted macOS runner.
+Measured once on a hosted macOS runner, not guarded by a kept test: cargo, clang, swiftc, git, a
+Python virtual environment and `swift build --disable-sandbox` ran with the three added denies.
+Not measured: anything that registers a Mach port by name (`CFMessagePort`, `NSMachPort`, an
+XCTest host), tools that attach a disk image on a named mount point, and macOS UI tests, which
+`lsopen` denial fails (error -54); a slot is back to not running them.

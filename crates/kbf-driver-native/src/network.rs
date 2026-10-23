@@ -143,10 +143,10 @@ pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 ///
 /// Three denies shut what the clean does not reach (each was open without the sandbox,
 /// closed with the rule and open again with the rule removed, on a hosted macOS runner;
-/// no build tool tried broke with them: cargo, clang, swiftc, git, a Python venv,
-/// `swift build --disable-sandbox`): `mach-register` is checking in a Mach service
-/// name with launchd (`bootstrap_check_in`), a service that outlives the action's
-/// process tree; `lsopen` is opening an application through Launch Services, which
+/// cargo, clang, swiftc, git, a Python venv and `swift build --disable-sandbox` ran
+/// under them there once; no kept test runs them): `mach-register` is checking in a
+/// Mach service name with launchd (`bootstrap_check_in`), which would give a service
+/// that could outlive the action's process tree; `lsopen` is opening an application through Launch Services, which
 /// starts it outside the sandbox (see [`BASE_PROFILE`]); `file-mount` is mounting a
 /// file system on a directory (`hdiutil attach -mountpoint`). A slot's canaries
 /// ([`crate::slots::canary`]) try each. Left open on purpose: `job-creation`, since

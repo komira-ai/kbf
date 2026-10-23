@@ -195,7 +195,10 @@ fn number_after(text: &str, marker: &str) -> Option<i32> {
     rest[..end].parse().ok()
 }
 
-/// Checks in a Mach service name (unique to this process) with launchd.
+/// Checks in a Mach service name (unique to this process, declared by no job) with
+/// launchd. With the sandbox's rule launchd is not reached and the answer is 1100; with
+/// the rule dropped launchd looks the name up and answers 1102, which is a failure of
+/// this door (see [`refused`]), never `Allowed`: that split is what the canary reads.
 pub fn mach_register(fs: &dyn Fs) -> Seen {
     let name = format!("com.kbf.canary.{}", std::process::id());
     match fs.check_in(&name) {
@@ -281,8 +284,24 @@ pub fn sandbox_denies(operation: &str) -> io::Result<bool> {
     let operation = CString::new(operation).map_err(io::Error::other)?;
     // SAFETY: `operation` is a NUL-terminated string that outlives the call, the filter
     // `SANDBOX_FILTER_NONE` takes no further argument, and the pid is our own.
-    let denied = unsafe { sandbox_check(libc::getpid(), operation.as_ptr(), FILTER_NONE) };
-    Ok(denied != 0)
+    let answer = unsafe { sandbox_check(libc::getpid(), operation.as_ptr(), FILTER_NONE) };
+    let errno = io::Error::last_os_error();
+    read_sandbox_answer(answer, errno)
+}
+
+/// What `sandbox_check` answered: 1 denied, 0 allowed, anything else (it answers -1
+/// when it cannot tell) is an error carrying `errno`, so it is never read as a denial.
+///
+/// # Errors
+/// The answer is neither 0 nor 1.
+pub fn read_sandbox_answer(answer: i32, errno: io::Error) -> io::Result<bool> {
+    match answer {
+        0 => Ok(false),
+        1 => Ok(true),
+        n => Err(io::Error::other(format!(
+            "sandbox_check answered {n} instead of 0 or 1: {errno}"
+        ))),
+    }
 }
 
 /// Whether this process's sandbox denies `operation`.
@@ -297,7 +316,9 @@ pub fn sandbox_denies(_operation: &str) -> io::Result<bool> {
     ))
 }
 
-/// Asks the sandbox whether Launch Services may open anything (`lsopen`). A slot user
+/// Asks the sandbox whether Launch Services may open anything (`lsopen`). This shows
+/// that the rule is in the profile the process runs under; it does not show Launch
+/// Services refusing an open. A slot user
 /// has no login session on a node, so an application cannot be opened to see the rule
 /// work (`open` and `LSOpenCFURLRef` fail or wait with the rule dropped as with it
 /// kept); the question Launch Services asks before it starts one is asked instead.
@@ -317,10 +338,15 @@ pub fn mount(fs: &dyn Fs, mount: &Path) -> Seen {
         return Seen::Failed(format!("mount point: {e}"));
     }
     let seen = match fs.mount_devfs(mount) {
-        Ok(()) => {
-            let _ = fs.unmount(mount);
-            Seen::Allowed
-        }
+        Ok(()) => match fs.unmount(mount) {
+            Ok(()) => Seen::Allowed,
+            Err(e) => {
+                return Seen::Failed(format!(
+                    "mounted, and could not unmount {}: {e}",
+                    mount.display()
+                ));
+            }
+        },
         Err(e) => e.raw_os_error().map_or_else(
             || Seen::Failed(e.to_string()),
             |n| refused(Op::Mount, Refusal::Errno(n), &Out::default()),
@@ -395,6 +421,19 @@ pub fn bootstrap(fs: &dyn Fs, job: &Path) -> Seen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Catches a `sandbox_check` that failed (-1, or any answer but 0 and 1) read as a
+    /// denial, which would let the `lsopen` canary pass with its rule removed.
+    #[test]
+    fn a_sandbox_check_that_failed_is_not_a_denial() {
+        let errno = || io::Error::from_raw_os_error(libc::EINVAL);
+        assert!(!read_sandbox_answer(0, errno()).unwrap());
+        assert!(read_sandbox_answer(1, errno()).unwrap());
+        for n in [-1, 2, i32::MIN] {
+            let e = read_sandbox_answer(n, errno()).unwrap_err().to_string();
+            assert!(e.contains(&n.to_string()), "{e}");
+        }
+    }
 
     fn out(code: i32, text: &str) -> Out {
         Out {

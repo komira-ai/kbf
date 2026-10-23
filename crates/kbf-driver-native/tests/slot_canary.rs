@@ -216,8 +216,9 @@ async fn failing_under(name: &str, change: WeakenedProfile) -> Vec<Vec<&'static 
 }
 
 /// Catches a Mach-service canary that cannot fail, or a profile in which dropping
-/// `(deny mach-register)` goes unseen: the user can check in a service name with
-/// launchd, so that canary alone must be reported as not refused.
+/// `(deny mach-register)` goes unseen: with the rule dropped launchd answers 1102
+/// (unknown service) instead of the sandbox's 1100, which is not a refusal of that
+/// door, so that canary alone must be reported as failed.
 #[ignore = "needs root and real users: cargo xtask sudo-test"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_profile_without_its_mach_register_deny_fails_that_canary_alone() {

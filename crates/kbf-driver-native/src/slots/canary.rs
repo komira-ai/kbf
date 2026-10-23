@@ -212,9 +212,13 @@ impl Fs for RealFs {
 
     fn write(&self, path: &Path, text: &str) -> io::Result<()> {
         use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // An explicit mode: launchd refuses a job file a group or others may write, and
+        // that must not depend on the daemon's umask.
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o644)
             .open(path)?;
         file.write_all(text.as_bytes())
     }
@@ -576,6 +580,8 @@ mod tests {
         denies: Option<bool>,
         /// What mounting a `devfs` answers.
         mount: Answer,
+        /// What unmounting answers.
+        unmount: Answer,
         /// Whether starting a tool fails.
         no_tools: bool,
         calls: RefCell<Vec<String>>,
@@ -589,6 +595,7 @@ mod tests {
                 kern: 0,
                 denies: Some(false),
                 mount: || Ok(()),
+                unmount: || Ok(()),
                 no_tools: false,
                 calls: RefCell::default(),
             }
@@ -647,7 +654,7 @@ mod tests {
         }
         fn unmount(&self, dir: &Path) -> io::Result<()> {
             self.note(format!("unmount {}", dir.display()));
-            Ok(())
+            (self.unmount)()
         }
         fn uid(&self) -> u32 {
             501
@@ -835,6 +842,14 @@ mod tests {
                 format!("unmount {mount}"),
                 format!("remove {mount}"),
             ]
+        );
+        let mut stuck = world(Op::Mount, World::Open);
+        stuck.unmount = || errno(libc::EBUSY);
+        let lease = Path::new("/lease");
+        let seen = doors::mount(&stuck, &lease.join(MOUNT_NAME));
+        assert!(
+            matches!(&seen, Seen::Failed(t) if t.contains("could not unmount")),
+            "{seen:?}: a mount left behind is a failure, not an open door"
         );
         let (seen, got) = calls(Op::Mount, World::Shut);
         assert_eq!(seen, Seen::Refused(Refusal::Errno(libc::EPERM)));
