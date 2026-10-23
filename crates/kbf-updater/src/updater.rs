@@ -15,8 +15,11 @@
 //! hold, the undrain and the full health follow. A restart finds the host in `waiting_healthy`
 //! and polls again; it installs again only from `installing`, and only if the host says no
 //! apply is running and the target is not installed. A Mac that answers `already_installed`
-//! (it runs the target) is not polled; a Mac that answers `installed`, or a host of another
-//! role that answers `apply_started`, fails the roll.
+//! (it runs the target) is not polled, but a restart in `waiting_healthy` cannot tell that
+//! answer from an install, so it polls: a stale `failed` status ends the resumed roll at once,
+//! and none ends it at the deadline, either way with the node left drained. A Mac that
+//! answers `installed`, or a host of another role that answers `apply_started`, fails the
+//! roll.
 //!
 //! The machine is deterministic: no clock but the [`Clock`] port, no randomness, no threads of
 //! its own. [`Updater::drive`] runs one roll to the end on the caller's thread; the other

@@ -328,6 +328,45 @@ fn a_resumed_install_is_not_repeated_when_the_apply_is_running() {
     assert_eq!(roll.hosts[0].attempts, 2);
 }
 
+/// Proves a host found `installing` with the target already installed is still waited for as an
+/// apply: when its apply failed the roll halts with the reason (no install, health never asked),
+/// and when the apply is done the roll goes on to the health hold and gives the node back.
+#[test]
+fn a_resumed_install_with_the_target_present_still_waits_for_the_apply() {
+    let rig = Rig::new("mac-resume-installing-failed");
+    rig.inst
+        .set_installed("mac", Installed::Version("2.0".into()));
+    rig.inst.begin_apply("mac");
+    rig.inst.script_apply(
+        "mac",
+        vec![],
+        Some(Apply::Failed("health_timeout".to_owned())),
+    );
+    let u = stopped_at(&rig, Phase::Installing, 1);
+    let roll = u.drive("roll-1").expect("drive");
+    assert_eq!(roll.state, RollState::Failed);
+    assert_eq!(
+        failure(&roll).1,
+        format!("the apply on mac failed: health_timeout; {NOTE}")
+    );
+    assert!(rig.log.installs().is_empty());
+    assert!(!words(&rig, "mac").contains(&"health".to_owned()));
+
+    let rig = Rig::new("mac-resume-installing-done");
+    rig.inst
+        .set_installed("mac", Installed::Version("2.0".into()));
+    rig.inst.begin_apply("mac");
+    rig.inst.script_apply("mac", vec![], Some(Apply::Done));
+    let u = stopped_at(&rig, Phase::Installing, 1);
+    let roll = u.drive("roll-1").expect("drive");
+    assert_eq!(roll.state, RollState::Done, "{:?}", roll.failure);
+    assert!(rig.log.installs().is_empty());
+    assert_eq!(
+        words(&rig, "mac"),
+        ["query", "query", "health", "undrain", "health"]
+    );
+}
+
 /// Proves an install whose answer was lost does not become a second install while the apply
 /// runs: the call gets no answer, the roll asks the host, finds the apply running, and polls.
 #[test]
