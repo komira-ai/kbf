@@ -226,6 +226,8 @@ URL or a unit.
 
 ### 6.1 Flags and failure
 
+**Removed.** `kbf-server` no longer serves `GET /v1/update` or `POST /v1/update/{desired,pause,resume}` (404), and writes none of the `update/*` rows below; a store that holds them is left as it is. Sections 6.1 to 6.3 describe the retired API (see `docs/api.md`).
+
 `--releases-dir DIR` names the content-addressed release store (files named by their SHA-256). `GET /v1/update` and
 `POST /v1/update/desired` need `--releases-dir` and `--state-store`; pause and resume need only `--state-store`. Without what an endpoint
 needs it answers **503** saying which flag is missing; nothing answers an empty 200.
