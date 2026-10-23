@@ -365,6 +365,27 @@ fn a_failure_before_the_flip_changes_nothing_that_runs() {
     assert_eq!(sim.daemon_bootouts.get(), 0);
 }
 
+/// A flip that stops after `previous` moved puts `previous` back: it must not name the
+/// release that is still running.
+#[test]
+fn a_flip_that_stops_halfway_puts_previous_back() {
+    let fx = Fx::new("mac-apply-halfflip");
+    let sim = fx.sim();
+    launched(&fx, &sim);
+    let current_link = fx.host.current();
+    *sim.before.borrow_mut() = Some(Box::new(move |cmd| {
+        // `current` becomes a directory the link cannot be renamed over.
+        if cmd.program.ends_with("xattr") && current_link.is_symlink() {
+            fs::remove_file(&current_link).unwrap();
+            fs::create_dir(&current_link).unwrap();
+            fs::write(current_link.join("f"), b"").unwrap();
+        }
+    }));
+    assert_eq!(apply(&fx, &sim).1, "failed:links_failed\n");
+    assert_eq!(fx.link(&fx.host.previous()), None);
+    assert_eq!(sim.daemon_bootouts.get(), 0, "the daemon was not touched");
+}
+
 /// The plan and the stage are checked again before they are used.
 #[test]
 fn a_plan_or_stage_that_is_not_what_was_checked_is_refused() {

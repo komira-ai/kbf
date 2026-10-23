@@ -189,7 +189,10 @@ version text is kept in `VERSION`, and `query` reports it as `installed_version`
 Everything below is done once, as an administrator with `sudo`; this program does none of it.
 
 1. The binary is `/usr/local/libexec/kbf/kbf-host-install`, `root:wheel` 0755, in directories
-   (`/usr/local`, `libexec`, `kbf`) that group and others cannot write.
+   (`/usr/local`, `libexec`, `kbf`) that group and others cannot write. An install checks this
+   before it does anything else and refuses with `config_unsafe` when the program or one of
+   those directories is not root's or is writable by group or others (some Intel Homebrew
+   setups leave `/usr/local` group-writable).
 2. An ordinary account for the updater's ssh login. It is not root and not an administrator;
    the examples call it `kbfupdate`. Remote Login is on, and its
    `~kbfupdate/.ssh/authorized_keys` has exactly one line:
@@ -261,7 +264,9 @@ stage):
 9. the staged binary is root's, in directories only root can write.
 
 The stage is opened to traverse-only (0711) for steps 4 and 8, which run as other users, and
-is 0700 otherwise. The same version already installed and running is `already_installed`; an
+is 0700 otherwise. While it is 0711 the users `nobody` and `_kbf` can pass through it but
+cannot list it or write to it, and every file in it is root's and not writable by them; the
+files are public release bytes. It is closed to 0700 again before `plan.json` is written. The same version already installed and running is `already_installed`; an
 older version is installed like a newer one.
 
 ### The apply
@@ -307,11 +312,20 @@ The result is one line in `/var/db/kbf-host-install/status` and the `apply` fiel
 
 A reader polls `query` until `in_progress` is false and then reads `apply`.
 
+A second install while the apply job is loaded and has not ended, including the moment after
+launchd has loaded it and before it has started, is `busy`: the stage is not touched. A failed
+move of the links is undone before `failed:links_failed` is recorded, so `previous` keeps naming
+the release before the last apply.
+
 ### A rollback is an install of an older version
 
 There is no floor and no "not older" refusal. To go back, install the older version from the
 channel that offers it; it takes the same path, and `previous` is only where the last apply came
 from.
+
+The other side of this is that whoever holds the updater's key can install any release the
+channel's pinned `SHA256SUMS` lists, including an old one with a known defect. The only way to
+make a release uninstallable is to remove its line from that file.
 
 ### `query` on a Mac
 

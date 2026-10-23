@@ -75,6 +75,15 @@ pub fn print_running(text: &str) -> bool {
     print_value(text, "state") == Some("running")
 }
 
+/// Whether a `launchctl print` listing says the service ran and ended: it is not running and
+/// has a last exit code (or a terminating signal). A job that is loaded and has not started
+/// yet (`spawn scheduled`, `(never exited)`) is not finished.
+pub fn print_finished(text: &str) -> bool {
+    !print_running(text)
+        && (print_value(text, "last exit code").is_some_and(|code| code.parse::<i32>().is_ok())
+            || print_value(text, "last terminating signal").is_some())
+}
+
 /// The files `pid` has open as its program and libraries, one `n<path>` field each.
 pub fn lsof_text(pid: u32, limit: Duration) -> Cmd {
     cmd(

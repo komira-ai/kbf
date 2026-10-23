@@ -257,6 +257,11 @@ fn install_front(
     channel: &Channel,
     audit_ok: bool,
 ) -> Result<Outcome, Outcome> {
+    // The program the sudoers rule and the apply job name runs as root: it and every
+    // directory above it must be root's and closed to others.
+    host.trust
+        .check_file(&host.self_exe)
+        .map_err(|e| Outcome::Refused(refusal(e)))?;
     let allowlist = MacAllowlist::load(&host.trust, &host.allowlist).map_err(Outcome::Refused)?;
     let channel = allowlist
         .channel(&host.trust, channel)

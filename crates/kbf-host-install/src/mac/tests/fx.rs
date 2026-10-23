@@ -93,7 +93,10 @@ impl Fx {
         let dir = TestDir::under(std::env::temp_dir(), name);
         mkdir(&dir, 0o755);
         let uid = fs::metadata(&*dir).unwrap().uid();
-        let host = MacHost::for_test(&dir, Trust::owned_by(uid, &dir));
+        let mut host = MacHost::for_test(&dir, Trust::owned_by(uid, &dir));
+        host.self_exe = dir.join("libexec/kbf-host-install");
+        mkdir(&dir.join("libexec"), 0o755);
+        write(&host.self_exe, 0o755, b"program");
         for sub in [
             "kit",
             "kit/releases",
@@ -279,6 +282,8 @@ pub struct Sim {
     pub loaded: RefCell<BTreeSet<String>>,
     /// Whether the apply job (when loaded) says `state = running`.
     pub apply_running: Cell<bool>,
+    /// Whether the apply job (when loaded) is scheduled and has not started.
+    pub apply_spawning: Cell<bool>,
     pub quarantined: RefCell<BTreeSet<PathBuf>>,
     /// Things that go wrong, by name.
     pub broken: RefCell<BTreeSet<&'static str>>,
@@ -318,6 +323,7 @@ impl Sim {
             calls: RefCell::default(),
             loaded: RefCell::new(BTreeSet::from([DAEMON_LABEL.to_owned()])),
             apply_running: Cell::new(false),
+            apply_spawning: Cell::new(false),
             quarantined: RefCell::default(),
             broken: RefCell::default(),
             welcome: Cell::new(true),
@@ -372,10 +378,12 @@ impl Sim {
                 if !loaded {
                     return exec(113, "", "Could not find service");
                 }
-                let state = if label == APPLY_LABEL && !self.apply_running.get() {
-                    "not running"
+                let (state, last) = if label != APPLY_LABEL || self.apply_running.get() {
+                    ("running", "(never exited)")
+                } else if self.apply_spawning.get() {
+                    ("spawn scheduled", "(never exited)")
                 } else {
-                    "running"
+                    ("not running", "0")
                 };
                 let pid = if self.is_broken("no-pid") {
                     ""
@@ -384,7 +392,9 @@ impl Sim {
                 };
                 exec(
                     0,
-                    &format!("system/{label} = {{\n{pid}\tstate = {state}\n}}\n"),
+                    &format!(
+                        "system/{label} = {{\n{pid}\tstate = {state}\n\tlast exit code = {last}\n}}\n"
+                    ),
                     "",
                 )
             }

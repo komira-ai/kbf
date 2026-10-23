@@ -634,6 +634,48 @@ fn a_running_apply_whose_job_is_gone_is_reported_lost() {
     assert_eq!(status::effective(&fx.host, &sim), Some(ApplyState::Done));
 }
 
+/// A job that is loaded and has not started yet is not gone: it is `running` until it has
+/// an exit; a second install in that gap is `busy`.
+#[test]
+fn an_apply_job_that_has_not_started_yet_is_still_running() {
+    let fx = Fx::new("mac-status-spawning");
+    mkdir(&fx.host.work, 0o711);
+    let sim = fx.sim();
+    status::write(&fx.host, &ApplyState::Running).unwrap();
+    sim.loaded
+        .borrow_mut()
+        .insert(crate::mac::layout::APPLY_LABEL.to_owned());
+    sim.apply_spawning.set(true);
+    assert_eq!(status::effective(&fx.host, &sim), Some(ApplyState::Running));
+    // Ended: it has an exit code.
+    sim.apply_spawning.set(false);
+    assert_eq!(
+        status::effective(&fx.host, &sim),
+        Some(ApplyState::Failed("apply_lost".into()))
+    );
+}
+
+/// What `launchctl print` says of a job that ended, and of one that did not start.
+#[test]
+fn launchctl_print_says_when_a_job_has_ended() {
+    assert!(tools::print_finished(
+        "\tstate = not running\n\tlast exit code = 0\n"
+    ));
+    assert!(tools::print_finished(
+        "\tstate = not running\n\tlast exit code = 78\n"
+    ));
+    assert!(tools::print_finished(
+        "\tstate = not running\n\tlast terminating signal = Killed: 9\n"
+    ));
+    assert!(!tools::print_finished(
+        "\tstate = spawn scheduled\n\tlast exit code = (never exited)\n"
+    ));
+    assert!(!tools::print_finished("\tstate = not running\n"));
+    assert!(!tools::print_finished(
+        "\tstate = running\n\tlast exit code = 0\n"
+    ));
+}
+
 // ---- the kit ----
 
 #[test]

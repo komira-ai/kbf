@@ -64,7 +64,7 @@ fn the_unprivileged_process_relays_through_sudo() {
         assert_eq!(calls[0].program, "/usr/bin/sudo");
         assert_eq!(
             calls[0].args,
-            ["-n", "/usr/local/libexec/kbf/kbf-host-install", "--as-root"]
+            ["-n", fx.host.self_exe.to_str().unwrap(), "--as-root"]
         );
         assert_eq!(calls[0].stdin, INSTALL.as_bytes());
     }

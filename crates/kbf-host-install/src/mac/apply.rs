@@ -204,7 +204,11 @@ fn apply(host: &MacHost, runner: &dyn Runner) -> Result<(), String> {
     }
     let before = kit::links(host).map_err(|_| "links_unreadable")?;
     lay_out(host, runner, &plan, &staged)?;
-    flip(host, &before, &plan.commit).map_err(|_| "links_failed")?;
+    if flip(host, &before, &plan.commit).is_err() {
+        // A flip that stopped halfway must not leave `previous` naming the release that ran.
+        let _ = restore(host, &before);
+        return Err("links_failed".to_owned());
+    }
     let Err(why) = restart(host, runner) else {
         return Ok(());
     };
@@ -278,8 +282,9 @@ fn flip(host: &MacHost, before: &Links, commit: &str) -> io::Result<()> {
 
 /// Both links as they were.
 fn restore(host: &MacHost, before: &Links) -> io::Result<()> {
-    kit::set_link(&host.current(), before.current.as_deref())?;
-    kit::set_link(&host.previous(), before.previous.as_deref())
+    let current = kit::set_link(&host.current(), before.current.as_deref());
+    let previous = kit::set_link(&host.previous(), before.previous.as_deref());
+    current.and(previous)
 }
 
 /// Restart the daemon: out, gone, in, welcomed. The error is the reason.

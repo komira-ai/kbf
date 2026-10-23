@@ -252,6 +252,41 @@ fn one_install_at_a_time() {
     assert_eq!(fx.handle(&sim, INSTALL).code, 0);
 }
 
+/// An install that comes while the apply job is loaded and not yet started is `busy`, and
+/// leaves the stage the job is about to read.
+#[test]
+fn an_install_is_busy_while_the_apply_job_is_starting() {
+    let fx = Fx::new("mac-install-spawning");
+    let sim = fx.sim();
+    assert_eq!(fx.handle(&sim, INSTALL).code, 0);
+    sim.apply_spawning.set(true);
+    let plan = fs::read(fx.host.stage().join("plan.json")).unwrap();
+    let answer = fx.handle(&sim, INSTALL);
+    assert_eq!((answer.code, reason(&answer)), (3, "busy".into()));
+    assert_eq!(fs::read(fx.host.stage().join("plan.json")).unwrap(), plan);
+}
+
+/// The program that runs as root must be root's, in directories closed to others; an
+/// install through any other is refused before anything is read or staged.
+#[test]
+fn an_install_is_refused_when_the_program_is_not_trusted() {
+    let fx = Fx::new("mac-install-selfexe");
+    let sim = fx.sim();
+    let dir = fx.host.self_exe.parent().unwrap().to_owned();
+    fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o777)).unwrap();
+    let answer = fx.handle(&sim, INSTALL);
+    assert_eq!((answer.code, reason(&answer)), (2, "config_unsafe".into()));
+    assert!(!fx.host.stage().exists());
+    assert_eq!(sim.count("/bin/launchctl"), 0);
+    fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    fs::set_permissions(
+        &fx.host.self_exe,
+        std::os::unix::fs::PermissionsExt::from_mode(0o775),
+    )
+    .unwrap();
+    assert_eq!(fx.handle(&sim, INSTALL).code, 2);
+}
+
 /// The work directory is made 0711 when missing, and must be root's.
 #[test]
 fn the_work_directory_is_root_only() {

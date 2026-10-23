@@ -80,12 +80,12 @@ pub fn write(host: &MacHost, state: &ApplyState) -> io::Result<()> {
     fs::rename(&aside, host.status_file())
 }
 
-/// Whether the apply job is loaded and running. A job launchd cannot be asked about counts
-/// as running: busy is the safe answer.
+/// Whether the apply job is loaded and has not ended: running, or not started yet. A job
+/// launchd cannot be asked about counts as running: busy is the safe answer.
 fn job_running(host: &MacHost, runner: &dyn Runner) -> bool {
     match runner.run(&tools::print(APPLY_LABEL, host.tuning.tool)) {
         Err(_) => true,
-        Ok(exec) => exec.success() && tools::print_running(&exec.stdout_text()),
+        Ok(exec) => exec.success() && !tools::print_finished(&exec.stdout_text()),
     }
 }
 
