@@ -383,7 +383,7 @@ fn dscl_ids_of_nobody_and_a_drop_to_them() {
         "root belongs to several groups: {as_root:?}"
     );
     // The runner's drop leaves the one group. (Started with `Command::uid` and `gid` alone,
-    // the child kept group 0: the run that found it is in the pull request.)
+    // the child kept group 0; see komira-ai/kbf#1594.)
     let mut dropped = probe(&copy);
     dropped.run_as = Some(ids);
     let by_runner = groups_of("runner_drop", &dropped);

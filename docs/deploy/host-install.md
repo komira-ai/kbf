@@ -283,6 +283,11 @@ stage):
    (`kbf --mode=daemon --config /usr/local/etc/kbf/kbf.toml --check`);
 9. the staged binary is root's, in directories only root can write.
 
+Steps 4 and 8 start their program through `/usr/sbin/chroot -u <uid> -g <gid> -G <gid> / ...`:
+started by `Command::uid` and `gid` alone, a child on macOS keeps the old effective gid (group 0,
+`wheel`) as a supplementary group, and `chroot` sets the one group itself. The real-Mac test
+checks that the child's groups are its own gid and nothing else.
+
 The stage is opened to traverse-only (0711) for steps 4 and 8, which run as other users, and
 is 0700 otherwise. While it is 0711 the users `nobody` and `_kbf` can pass through it but
 cannot list it or write to it. Every file in it is root's and not writable by them except
