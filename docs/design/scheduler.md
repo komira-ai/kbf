@@ -344,11 +344,21 @@ What the code does today:
   committed the operation is `Refused` and its waiters are answered (`Refuse`). The wait
   counts from the first round at which the operation was unservable, through changes
   of its reason, and the refusal is proposed at the first round at or after that time
-  plus the wait. It restarts whenever the operation is servable again. It is not zero because a worker
-  that can run the work is often a moment away: daemons reconnect within seconds of a
-  server restart, and a Mac that reboots is gone for minutes. Work that no kbf daemon
-  could ever run is refused by the front before it is queued (see
-  [capabilities.md](capabilities.md#what-the-code-enforces-today)).
+  plus the wait. It restarts whenever the operation is servable again. It is not zero
+  because a worker that can run the work is often a moment away: daemons reconnect
+  within seconds of a server restart, and a Mac that reboots is gone for minutes. Work
+  that no kbf daemon could ever run is refused by the front before it is queued (see
+  [capabilities.md](capabilities.md#what-the-code-enforces-today)). When several
+  frontends share one state store, each knows only the daemons connected to it, so
+  before such a refusal is committed the frontend reads the `session/` rows of the store,
+  which hold the capabilities and capacity of every frontend's daemons. If a daemon of
+  another frontend could run the operation, the refusal is taken back (the scheduler
+  puts the operation in the queue again, `Scheduler::hold_refusal`) and comes due again
+  after another wait; a store whose session rows cannot be read holds it too. A refusal
+  that is committed is written only while the operation is still queued in the store, so
+  it never removes an operation another frontend has granted. The frontend that loses
+  such a race drops its write as stale, and the callers waiting on it at that frontend
+  are not answered by it.
 
 **Planned**, in roughly the order they are needed:
 
