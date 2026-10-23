@@ -2,7 +2,7 @@
 //! binary's own parser, in-process, with the `kbf.toml` each mode is started with: the
 //! package's unit is `kbf --mode=<mode>` and nothing else, every setting is the file's.
 //! The file is the one `kbf-installer setup` writes for the mode
-//! (`kbf-installer/tests/golden/kbf_toml`), or, for a storage node an operator wrote by
+//! (`kbf-setup/tests/golden/kbf_toml`), or, for a storage node an operator wrote by
 //! hand, the stores and certificates in a file of its own.
 //!
 //! Where a defect class is already caught elsewhere, the test is named here, not
@@ -11,7 +11,7 @@
 //! and start lines parse (`package_units.rs`), a key kbf refuses in `kbf.toml` is refused
 //! naming the key and the file (`config_file.rs::an_unknown_key_is_refused_naming_the_key_and_the_file`),
 //! every key `setup` writes is a real flag of its table
-//! (`kbf-installer`'s `kbf_settings_tests`), and the preflight accepts a metadata log
+//! (`kbf-setup`'s `kbf_settings_tests`), and the preflight accepts a metadata log
 //! under the node's data root for a storage-and-daemon node
 //! (`preflight/tests.rs::a_storage_and_daemon_node_with_its_meta_dir_under_its_data_dir_passes`).
 //!
@@ -37,14 +37,12 @@ const PROGRAM: &str = "/usr/bin/kbf";
 /// The `kbf.toml` `kbf-installer setup` writes for `mode`.
 fn setup_file(mode: &str) -> &'static str {
     match mode {
-        "all-in-one" => {
-            include_str!("../../kbf-installer/tests/golden/kbf_toml/all-in-one.toml")
-        }
-        "daemon" => include_str!("../../kbf-installer/tests/golden/kbf_toml/daemon.toml"),
-        "frontend" => include_str!("../../kbf-installer/tests/golden/kbf_toml/frontend.toml"),
-        "storage" => include_str!("../../kbf-installer/tests/golden/kbf_toml/storage.toml"),
+        "all-in-one" => include_str!("../../kbf-setup/tests/golden/kbf_toml/all-in-one.toml"),
+        "daemon" => include_str!("../../kbf-setup/tests/golden/kbf_toml/daemon.toml"),
+        "frontend" => include_str!("../../kbf-setup/tests/golden/kbf_toml/frontend.toml"),
+        "storage" => include_str!("../../kbf-setup/tests/golden/kbf_toml/storage.toml"),
         "storage-and-daemon" => {
-            include_str!("../../kbf-installer/tests/golden/kbf_toml/storage-and-daemon.toml")
+            include_str!("../../kbf-setup/tests/golden/kbf_toml/storage-and-daemon.toml")
         }
         other => panic!("no setup file for the mode {other}"),
     }

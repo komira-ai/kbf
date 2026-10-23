@@ -555,7 +555,7 @@ fn a_start_with_a_bad_file_exits_2_and_makes_nothing() {
 }
 
 /// Catches a `kbf.toml` that `kbf-installer setup` writes and `kbf` does not accept. The five
-/// files the installer's tests pin (`kbf-installer/tests/golden/kbf_toml`, one per mode) are
+/// files the setup library's tests pin (`kbf-setup/tests/golden/kbf_toml`, one per mode) are
 /// put under a scratch directory with the certificates, keys and token they name, and `kbf
 /// --mode=<mode> --config <file> --check` must exit 0 and print `ok` (a node that enrolls says it is configured and not enrolled yet): a key `kbf` does not
 /// have, a key in the wrong table, a required flag the file lacks, a certificate of the wrong
@@ -563,8 +563,7 @@ fn a_start_with_a_bad_file_exits_2_and_makes_nothing() {
 /// start does and starts nothing).
 #[test]
 fn the_kbf_toml_that_setup_writes_passes_check_in_every_mode() {
-    let goldens =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../kbf-installer/tests/golden/kbf_toml");
+    let goldens = Path::new(env!("CARGO_MANIFEST_DIR")).join("../kbf-setup/tests/golden/kbf_toml");
     for mode in names::MODES {
         let dir = scratch(&format!("installer-{}", mode.name));
         let etc = dir.join("etc");

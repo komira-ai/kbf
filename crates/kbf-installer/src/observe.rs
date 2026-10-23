@@ -3,8 +3,9 @@
 //! On a host behind the frontend proxy the serving child changes with a handover: slot A
 //! listens at `base_port`, slot B ten ports above, and the operator listener is at offset 2
 //! of a slot (docs/design/frontend-proxy.md section 7; the offsets are the proxy's frozen
-//! contract and are copied here, as this crate does not link the proxy). `setup` checks its
-//! copy against the proxy's; the deploy verb's observers read the child through it.
+//! contract and are copied here, as this module does not link the proxy). A test of the proxy
+//! verb (`proxy_verb_tests.rs`) checks the copy against the proxy's; the deploy verb's
+//! observers read the child through it.
 
 use std::fmt;
 

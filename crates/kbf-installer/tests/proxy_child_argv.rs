@@ -18,9 +18,10 @@ use kbf_proxy::slot::Slot as GateSlot;
 
 const SECRET: &str = "/run/kbf-proxy/proxy-auth";
 
-/// The `frontend.toml` that `setup` writes for an all-in-one host (the golden the installer's
-/// own tests hold its output to).
-const ALL_IN_ONE_FRONTEND: &str = include_str!("golden/kbf_toml/all-in-one-frontend.toml");
+/// The `frontend.toml` that `setup` writes for an all-in-one host (the golden the setup
+/// library's own tests hold its output to).
+const ALL_IN_ONE_FRONTEND: &str =
+    include_str!("../../kbf-setup/tests/golden/kbf_toml/all-in-one-frontend.toml");
 
 /// What a child's `kbf.toml` supplies on a real host and a parse without a file needs.
 const FROM_CONFIG: [&str; 2] = [

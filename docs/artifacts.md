@@ -470,7 +470,7 @@ job builds it from the signed binary it has just built and checked: the pinned d
 root that `gh` fetched, and an `installer.conf` from `cargo xtask pkg-trust`, then `cargo xtask
 pkg build` writes the package (the same bytes for the same inputs; `pkgbuild` is not
 deterministic). It installs these entries, all root:wheel, at the paths of the installer's macOS
-layout (`crates/kbf-installer/src/layout.rs`; a test compares the package's paths with it):
+layout (`crates/kbf-setup/src/layout.rs`; a test compares the package's paths with it):
 
 | Path | Mode | Layout |
 |---|---|---|
