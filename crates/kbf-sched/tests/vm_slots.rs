@@ -279,3 +279,27 @@ fn a_mac_that_goes_away_and_returns_takes_its_vms_again() {
     );
     assert_eq!(h.booked("mac").vms, 1);
 }
+
+/// Catches: a VM that asks for the whole Mac's memory placed beside another lease (it
+/// would not be alone as a request at the host's memory must be), and one that is never
+/// placed on an empty Mac. The action books no memory, so only the exclusive rule holds
+/// the VM back while it runs.
+#[test]
+fn a_vm_at_the_whole_macs_memory_runs_alone() {
+    let mut h = Harness::new();
+    h.mac("mac", MAC);
+    h.submit(1, action(1, 0));
+    let (grants, _) = h.tick();
+    let [held] = grants.as_slice() else {
+        panic!("{grants:?}");
+    };
+    h.submit(2, vm(2, 24));
+    assert!(
+        h.tick().0.is_empty(),
+        "a VM at the host's memory beside an action"
+    );
+    h.finish(held);
+    let (grants, _) = h.tick();
+    assert_eq!(grants.len(), 1, "the empty Mac takes it: {grants:?}");
+    assert_eq!(h.booked("mac").memory_bytes, 24 * GIB);
+}
