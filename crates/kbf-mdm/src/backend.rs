@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn only_kbf_prefixed_identifiers_are_declarations_the_gate_may_touch() {
-        // Catches: matching identifiers by substring (M10 mutant), which would let the
+        // Catches: matching identifiers by substring (M10 defect), which would let the
         // gate remove an operator's `com.example.kbf.settings`.
         assert!(KbfDeclaration::new("kbf.osupdate.C02X").is_some());
         assert!(KbfDeclaration::new("com.example.kbf.settings").is_none());

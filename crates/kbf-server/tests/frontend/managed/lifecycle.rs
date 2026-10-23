@@ -57,7 +57,7 @@ async fn calls_that_do_not_apply_change_nothing() {
 /// Catches: an old holder that is fenced by a takeover and is never told to stand down
 /// (the supervisor died, or the call was lost) leaving its callers hanging: a caller that
 /// waits on Execute at A is answered once B writes the `done/` row, though A was only
-/// found fenced by a refused write of its own (a cordon). Mutant: nothing follows the
+/// found fenced by a refused write of its own (a cordon). Catches: nothing follows the
 /// `done/` rows of a process found superseded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fenced_holder_answers_its_waiting_callers_without_a_stand_down() {

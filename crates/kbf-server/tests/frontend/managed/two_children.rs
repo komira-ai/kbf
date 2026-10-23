@@ -91,7 +91,7 @@ async fn report(
 /// children); a result committed through B that does not reach a waiter on A (the
 /// follower of `done/` rows); a takeover that does not take the generation, or takes it
 /// and bumps the epoch; an old child that writes after the takeover (any committed write
-/// of a fenced family, the cordon an operator asks of A included). Mutants: the takeover
+/// of a fenced family, the cordon an operator asks of A included). Catches: the takeover
 /// leaves the generation where it is; the fence not checked in the write's transaction;
 /// A's follower not started.
 async fn fifty_builds_across_a_takeover(a_inner: Arc<dyn Store>, b_inner: Arc<dyn Store>) {

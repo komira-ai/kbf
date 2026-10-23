@@ -430,6 +430,8 @@ message Resources {
   uint64 memory_bytes = 2;
   uint64 gpus = 3;
   uint64 vms = 4;
+  // The most Action leases a node runs at once; unset: no cap.
+  optional uint64 leases = 5;
 }
 
 // A key and a value: a request property, or an exact capability a node reports.

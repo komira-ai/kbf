@@ -157,7 +157,7 @@ fn the_xcode_manifest_sandbox_default_is_written_when_the_profile_asks() {
     );
 }
 
-/// Catches: an apply that fixes an item that passes (the script's mutant "apply writes
+/// Catches: an apply that fixes an item that passes (the script's defect "apply writes
 /// on every run"), rewrites a file that is already right ("apply rewrites a drop-in
 /// that is already right"), or records the settings again.
 #[test]
@@ -182,7 +182,7 @@ fn apply_on_a_converged_mac_changes_nothing() {
     assert!(!mac.path(RECORD).exists());
 }
 
-/// Catches: `apply`, `restart` or `revert` running without root (the script's mutant
+/// Catches: `apply`, `restart` or `revert` running without root (the script's defect
 /// "apply runs without root"), or changing anything before refusing.
 #[test]
 fn the_changing_verbs_refuse_without_root() {
@@ -248,7 +248,7 @@ fn apply_sets_the_other_values_of_remote_login_and_ssh() {
 }
 
 /// Catches: apply clearing a lease user's auto-login that kbf-mac-session set for a
-/// whole_machine lease (the script's mutant "a lease user in range fails (apply clears
+/// whole_machine lease (the script's defect "a lease user in range fails (apply clears
 /// it mid-lease)", `t_lease_autologin`).
 #[test]
 fn apply_leaves_a_lease_users_auto_login() {
@@ -288,7 +288,7 @@ fn apply_clears_auto_login_and_kcpassword() {
 }
 
 /// Catches: an Xcode installed from a `.xip` whose SHA-256 is not the pinned one (the
-/// script's mutant "an xip is used without its SHA-256"), or from one that expands to
+/// script's defect "an xip is used without its SHA-256"), or from one that expands to
 /// another build ("an expanded Xcode is not checked for its build"), a staging
 /// directory left behind, or an apply that says nothing when it cannot install (the
 /// script's `t_xcode_sources`).
@@ -403,7 +403,7 @@ fn a_fix_that_cannot_write_says_why_and_the_item_still_fails() {
 }
 
 /// Catches: the role account made over another account that holds its id (the script's
-/// mutant "the role id of another account is taken over").
+/// defect "the role id of another account is taken over").
 #[test]
 fn apply_does_not_take_over_another_accounts_id() {
     let mut mac = FakeMac::fresh("apply-role-taken");

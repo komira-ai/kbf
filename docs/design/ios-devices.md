@@ -283,7 +283,7 @@ A device action needs, all **[A]** until probe P-D3:
 
 The daemon itself runs `devicectl` for its survey, precheck and cleanup
 ([section 8](#8-the-lease-lifecycle)) under the actions' sandbox too, as it asks its
-Xcodes every question (CEO decision on issue #164: `xcrun` reads and fills a cache
+Xcodes every question (decision on issue #164: `xcrun` reads and fills a cache
 that leases can write); its profile is that of a device lease, which may reach
 CoreDevice (below). The action runs `xcodebuild` inside it.
 

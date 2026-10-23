@@ -169,7 +169,7 @@ fn no_gates_job_exists_and_nothing_polls_for_other_runs() {
 
 #[test]
 fn the_job_list_is_pinned() {
-    // Catches: the chain changed without its rule. Mutants: the job `publish` renamed; a job
+    // Catches: the chain changed without its rule. In particular: the job `publish` renamed; a job
     // renamed; a job added.
     red(
         &plant_top("  publish:\n", "  publish-release:\n"),
@@ -254,7 +254,7 @@ fn every_job_needs_exactly_what_the_graph_says() {
 #[test]
 fn only_publish_writes_and_no_job_signs() {
     // Catches: a write scope outside publish (a dry run could publish; a token that could
-    // push), and an OIDC token in a job that runs a third party's code. Mutants: verify,
+    // push), and an OIDC token in a job that runs a third party's code. Catches: verify,
     // tag and notes get `contents: write`; publish gets `packages: write`, then `id-token:
     // write`; plan gets `id-token: write`; publish loses `contents: write`.
     red(
@@ -357,7 +357,7 @@ fn the_jobs_that_write_run_only_for_a_successful_pipeline_run_that_releases() {
 #[test]
 fn the_environment_is_declared_where_the_key_is_read_and_where_writes_happen() {
     // Catches: a key move to an environment secret that would stop working, or a job that
-    // reads the key outside the environment. Mutants: the environment dropped from tag,
+    // reads the key outside the environment. Catches: the environment dropped from tag,
     // publish and bump; another environment; one added to notes.
     for job in ["tag", "publish", "bump"] {
         red(
@@ -381,7 +381,7 @@ fn the_environment_is_declared_where_the_key_is_read_and_where_writes_happen() {
 
 #[test]
 fn a_red_job_stops_the_release() {
-    // Catches: a stage that is skipped or ignored. Mutants: `always()` on publish;
+    // Catches: a stage that is skipped or ignored. In particular: `always()` on publish;
     // `failure()`; `cancelled()`; `continue-on-error` on a gate step and on the tag step; an
     // `if:` on a step of tag, of verify and of notes (not the previous release's).
     red(
@@ -555,7 +555,7 @@ fn the_commit_and_the_run_are_the_pipeline_runs_for_every_job() {
 #[test]
 fn the_release_bots_key_is_read_in_tag_and_bump_only() {
     // Catches: the one key that can create `v*` tags (and open pull requests in the internal
-    // repository) readable by a job that runs more code. Mutants: the key read in publish,
+    // repository) readable by a job that runs more code. Catches: the key read in publish,
     // notes, plan; the token minted in verify; the old `RELEASE_TAGGER_*` names; the freeze
     // read outside plan; another secret read; the key not read by tag and bump.
     for job in ["publish", "notes", "plan", "verify"] {
@@ -834,7 +834,7 @@ fn tag_writes_the_record_then_mints_the_token_then_tags_the_commit_of_the_run() 
 #[test]
 fn notes_check_the_tag_and_hand_on_the_set_and_the_notes() {
     // Catches: notes for another release, a set hash that is not the one the tag check
-    // printed, a tag check before the files are checked or against another main. Mutants:
+    // printed, a tag check before the files are checked or against another main. Catches:
     // `release verify` dropped; its flags; its output; a main ref; the check order; the
     // notes dropped or for other flags; the upload.
     red(
@@ -933,7 +933,7 @@ fn notes_check_the_tag_and_hand_on_the_set_and_the_notes() {
 
 #[test]
 fn publish_is_given_the_planned_tag_the_set_the_run_and_the_notes() {
-    // Catches: a release of other files or notes than the ones checked. Mutants: the hash,
+    // Catches: a release of other files or notes than the ones checked. In particular: the hash,
     // run id or tag from nowhere; the flag dropped; the token not the workflow's; the notes
     // file another one, not downloaded, or downloaded elsewhere; the files not checked.
     red(
@@ -1025,7 +1025,7 @@ fn publish_is_given_the_planned_tag_the_set_the_run_and_the_notes() {
 #[test]
 fn bump_is_given_the_version_and_a_token_for_the_internal_repository_alone() {
     // Catches: a pull request opened for another version or by a token that reaches more.
-    // Mutants: the owner, repository or a permission changed or added; the version from
+    // Catches: the owner, repository or a permission changed or added; the version from
     // nowhere; the commit, internal repository or submodule changed; the workflow's token.
     red(
         &plant(
@@ -1095,7 +1095,7 @@ fn bump_is_given_the_version_and_a_token_for_the_internal_repository_alone() {
 
 #[test]
 fn actions_stay_pinned_and_the_token_starts_empty() {
-    // Catches: the shared rules loosened in this file. Mutants: an action pinned to a tag;
+    // Catches: the shared rules loosened in this file. In particular: an action pinned to a tag;
     // the App-token action pinned to a tag; the top-level `permissions: {}` removed; a
     // self-hosted runner.
     red(
@@ -1124,7 +1124,7 @@ fn actions_stay_pinned_and_the_token_starts_empty() {
 #[test]
 fn a_binary_runs_only_after_its_files_are_attested() {
     // Catches: an unattested binary executed in a job that sees the tag and the notes.
-    // Mutants: a binary run by hand; this release's attestation step lost before the run; the
+    // Catches: a binary run by hand; this release's attestation step lost before the run; the
     // previous release's step lost, or under another condition than the run it guards.
     red(
         &plant(
@@ -1193,7 +1193,7 @@ fn only_the_previous_releases_check_waives_the_version_facts() {
     // Catches: the first release with version facts failing on the release before it (which
     // has none) so that nothing is published, and the other way round: a waiver on the check
     // of the release being made, so a set without the facts of its kbf goes out.
-    // Mutants: the flag dropped from `previous`; the flag added to `dist`.
+    // Catches: the flag dropped from `previous`; the flag added to `dist`.
     red(
         &plant(
             "notes",
@@ -1240,7 +1240,7 @@ fn a_comment_naming_the_key_is_not_a_read_of_it() {
 #[test]
 fn the_files_are_checked_for_signer_repository_commit_and_sums_in_verify_and_notes() {
     // Catches: an attestation check that accepts another signing workflow, another
-    // repository or commit, or a set whose sums were never run. Mutants: in each of verify
+    // repository or commit, or a set whose sums were never run. Catches: in each of verify
     // and notes, `--workflow-ref` pointed at ci.yml, `--repo` at another repository,
     // `--commit` at a fixed sha, the `sha256sum` step replaced by `true`.
     let flags = [

@@ -315,7 +315,7 @@ mod tests {
     /// word or left out, a confirm that names a source reaching the file, and an order whose
     /// source this build does not know written as a fetch.
     ///
-    /// Mutants planted: the source hard-coded to fetch; the offer consumed for a staged
+    /// Catches: the source hard-coded to fetch; the offer consumed for a staged
     /// order; a source of none defaulted to fetch.
     #[test]
     fn a_staged_order_is_written_as_a_locator_and_an_unknown_source_is_not_written() {
@@ -423,7 +423,7 @@ mod tests {
     /// is accepted), a confirm carrying only expected facts is refused as a confirm with
     /// extras, and the word of every verb is the one the file carries.
     ///
-    /// Mutants planted: `min_protocol >= protocol` (equal is refused); the components check
+    /// Catches: `min_protocol >= protocol` (equal is refused); the components check
     /// removed (an activation with none is accepted); the facts check on `||` replaced by `&&`
     /// (an empty platform with a profile is accepted); the facts-required arm made to pass an
     /// activation with none (the "no facts" break is accepted).
@@ -506,7 +506,7 @@ mod tests {
     /// activation have no files to fetch; adding components, facts or both is refused
     /// whole, each with the reason that names the verb.
     ///
-    /// Mutants planted: the old rule restored (a `frontend_update` must name components, so
+    /// Catches: the old rule restored (a `frontend_update` must name components, so
     /// the locator is refused); the check widened so a `frontend_update` may carry components
     /// (the `components` case is accepted); the same for facts (the `facts` case).
     #[test]
@@ -547,7 +547,7 @@ mod tests {
     /// offer it is given, no wire verb value maps to it, and the word is the contract's
     /// `frontend_update` in a record (which the reader, not this crate's writer, takes).
     ///
-    /// Mutants planted: the guard in `for_order` removed; the wire's catch-all arm made to
+    /// Catches: the guard in `for_order` removed; the wire's catch-all arm made to
     /// map to it.
     #[test]
     fn a_node_never_writes_a_frontend_update() {
@@ -624,7 +624,7 @@ mod tests {
     /// proxy whose request type is closed, refuses the record whole, so a fetch would break
     /// after any upgrade), and a reader that refuses the word `fetch`.
     ///
-    /// Mutants to plant: `skip_serializing_if` removed from the field (the golden bytes gain
+    /// Catches: `skip_serializing_if` removed from the field (the golden bytes gain
     /// the key); the word `fetch` made an unknown variant.
     #[test]
     fn a_record_that_fetches_is_todays_bytes_and_an_explicit_fetch_is_read() {
@@ -660,7 +660,7 @@ mod tests {
     /// ways to say where the bytes come from), a source on a verb that moves no release, and
     /// the check widened until the empty activation passes.
     ///
-    /// Mutants to plant: the staged arm for `activate` removed (the golden is `NoComponents`);
+    /// Catches: the staged arm for `activate` removed (the golden is `NoComponents`);
     /// components allowed beside a staged source; the source refused on `frontend_update`;
     /// allowed on `confirm`; an unknown word read as `fetch`.
     #[test]

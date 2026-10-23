@@ -34,5 +34,24 @@ kbf-testkit.workspace = true
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
+# Metal, for the test that runs a compute kernel as a pool user under the slot profile
+# (tests/slot_gpu.rs).
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2.workspace = true
+objc2-foundation = { workspace = true, features = ["NSError", "NSString"] }
+objc2-metal = { workspace = true, features = [
+    "block2",
+    "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLDevice",
+    "MTLLibrary",
+    "MTLResource",
+    "MTLTypes",
+] }
+
 [lints]
 workspace = true

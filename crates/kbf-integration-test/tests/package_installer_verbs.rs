@@ -7,8 +7,8 @@
 //! - an `ExecStart=`/`ExecStartPre=` of any packaged unit, or a `ProgramArguments` of the
 //!   property list, whose `kbf-installer` command line the real parser (`kbf_installer::cli`)
 //!   refuses, or whose verb is one the binary answers "not implemented";
-//! - a runtime unit that execs `kbf` anywhere but the layout's `releases/current` link, the
-//!   path `setup` and `activate` create and flip;
+//! - a runtime unit that execs `kbf` anywhere but `/usr/bin/kbf`, the file the kbf package
+//!   installs (a Linux host has no release tree for it);
 //! - a property list that is not gated on the macOS configuration directory of the layout, or
 //!   that restarts a launchd label `setup` does not bootstrap.
 //!
@@ -131,19 +131,16 @@ fn plist_problems(plist: &str) -> Vec<String> {
     found
 }
 
-/// The release path a runtime unit may exec, from the layout.
-fn current_kbf() -> String {
-    format!("{}/kbf", layout(Platform::Linux).current())
-}
+/// The `kbf` a runtime unit may exec: the kbf package's own file.
+const PACKAGED_KBF: &str = "/usr/bin/kbf";
 
 fn exec_problems(name: &str, text: &str) -> Vec<String> {
-    let want = current_kbf();
     commands(text)
         .iter()
         .filter_map(|c| c.split_whitespace().next())
         .filter(|p| p.ends_with("/kbf") && !p.contains("%i"))
-        .filter(|p| *p != want)
-        .map(|p| format!("exec: {name}: execs {p}, the layout's current release is {want}"))
+        .filter(|p| *p != PACKAGED_KBF)
+        .map(|p| format!("exec: {name}: execs {p}, the kbf package installs {PACKAGED_KBF}"))
         .collect()
 }
 
@@ -173,9 +170,10 @@ fn the_property_list_runs_a_verb_that_exists_for_a_label_setup_bootstraps() {
     assert_eq!(plist_problems(&plist), Vec::<String>::new());
 }
 
+/// Asserts that every `kbf` a runtime unit execs is `/usr/bin/kbf`, the kbf package's file,
+/// and that the mode units run it twice each, a check and a start.
 #[test]
-fn the_runtime_units_exec_the_layouts_current_release() {
-    assert_eq!(current_kbf(), "/var/lib/kbf-installer/releases/current/kbf");
+fn the_runtime_units_exec_the_packaged_kbf() {
     let mut checked = 0;
     for name in services() {
         let text = read(&packaging().join("linux/units").join(&name));
@@ -183,7 +181,7 @@ fn the_runtime_units_exec_the_layouts_current_release() {
         assert!(problems.is_empty(), "{problems:?}");
         checked += commands(&text)
             .iter()
-            .filter(|c| c.starts_with(&current_kbf()))
+            .filter(|c| c.split_whitespace().next() == Some(PACKAGED_KBF))
             .count();
     }
     // Five mode units, a check and a start each: the four node modes and the plain
@@ -213,13 +211,13 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-daemon.service",
+        "ExecStart=/usr/bin/kbf",
         "ExecStart=/var/lib/kbf-installer/releases/current/kbf",
-        "ExecStart=/var/lib/kbf-installer/current/kbf",
         "exec",
     ),
     (
         "kbf-storage-and-daemon.service",
-        "ExecStartPre=/var/lib/kbf-installer/releases/current/kbf",
+        "ExecStartPre=/usr/bin/kbf",
         "ExecStartPre=/var/lib/kbf-installer/releases/previous/kbf",
         "exec",
     ),

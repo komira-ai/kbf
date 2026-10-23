@@ -7,7 +7,7 @@ fn cmd(program: &str, args: &[&str]) -> Cmd {
     Cmd {
         program: program.into(),
         args: args.iter().map(|a| (*a).into()).collect(),
-        timeout: None,
+        ..Cmd::default()
     }
 }
 
@@ -184,4 +184,145 @@ fn a_missing_program_is_an_error_within_a_limit() {
         ))
         .unwrap_err();
     assert_ne!(error.kind(), std::io::ErrorKind::TimedOut);
+}
+
+/// Variables a command asks for are added to the fixed three, and nothing else.
+#[test]
+fn a_command_may_add_variables() {
+    let mut c = cmd("/usr/bin/env", &[]);
+    c.env = vec![("HOME".into(), "/h".into()), ("GH_X".into(), "1".into())];
+    let out = SystemRunner.run(&c).unwrap();
+    let seen: BTreeSet<String> = out.stdout_text().lines().map(str::to_owned).collect();
+    assert!(seen.contains("HOME=/h") && seen.contains("GH_X=1"));
+    assert_eq!(seen.len(), 5);
+}
+
+/// Bytes given to a command arrive on its standard input, which is then closed; they are
+/// written while the command runs, so more than a pipe holds does not block.
+#[test]
+fn a_command_may_be_given_standard_input() {
+    let mut c = cmd("/usr/bin/cat", &[]);
+    c.stdin = b"query".to_vec();
+    let out = SystemRunner.run(&c).unwrap();
+    assert_eq!(out.stdout, b"query");
+    c.stdin = vec![b'x'; 1 << 20];
+    assert_eq!(SystemRunner.run(&c).unwrap().stdout.len(), 1 << 20);
+    // A command that never reads does not hang the writer.
+    let mut c = cmd("/usr/bin/true", &[]);
+    c.stdin = vec![b'x'; 1 << 20];
+    assert!(SystemRunner.run(&c).unwrap().success());
+}
+
+/// A command runs as the user and group it is given: the caller's own is allowed, and
+/// another one is refused to a caller who is not root.
+#[test]
+fn a_command_may_run_as_a_user() {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata("/proc/self").unwrap();
+    let (uid, gid) = (meta.uid(), meta.gid());
+    let mut c = cmd("/usr/bin/id", &["-u"]);
+    c.run_as = Some(super::Identity { uid, gid });
+    assert_eq!(
+        SystemRunner.run(&c).unwrap().stdout_text().trim(),
+        uid.to_string()
+    );
+    if uid != 0 {
+        c.run_as = Some(super::Identity { uid: uid + 1, gid });
+        assert!(SystemRunner.run(&c).is_err());
+    }
+}
+
+/// A drop made by this process is refused when its effective uid is root and its real uid is
+/// not (the standard library would keep the caller's groups); a plain root, a plain user, a
+/// real root with another effective uid and a command that drops nothing pass.
+#[test]
+fn a_privilege_drop_needs_a_real_uid_of_root() {
+    use super::{Identity, refuse_setuid_drop};
+    let ids = Some(Identity {
+        uid: 65534,
+        gid: 65534,
+    });
+    let kind = |uid, euid| refuse_setuid_drop(ids, uid, euid).map_err(|e| e.kind());
+    assert_eq!(kind(1000, 0), Err(std::io::ErrorKind::PermissionDenied));
+    assert_eq!(kind(0, 0), Ok(()));
+    assert_eq!(kind(1000, 1000), Ok(()));
+    assert_eq!(kind(0, 1000), Ok(()));
+    // No drop, no matter who runs it.
+    assert!(refuse_setuid_drop(None, 1000, 0).is_ok());
+}
+
+/// A command with no `run_as` is started as it is. One with `run_as` is started by `chroot`
+/// on macOS, which sets the user, the group and the one supplementary group (the program
+/// and its arguments follow the root `/`); elsewhere this process sets the user and group.
+#[test]
+fn a_drop_goes_through_chroot_on_a_mac() {
+    use super::{Identity, Launch, launch};
+    let mut c = cmd("/usr/bin/gh", &["attestation", "verify"]);
+    for through_chroot in [false, true] {
+        assert_eq!(
+            launch(&c, through_chroot).unwrap(),
+            Launch {
+                program: "/usr/bin/gh".into(),
+                args: vec!["attestation".into(), "verify".into()],
+                set_ids: None
+            }
+        );
+    }
+    let id = Identity {
+        uid: 4_294_967_294,
+        gid: 4_294_967_293,
+    };
+    c.run_as = Some(id);
+    assert_eq!(
+        launch(&c, false).unwrap(),
+        Launch {
+            program: "/usr/bin/gh".into(),
+            args: vec!["attestation".into(), "verify".into()],
+            set_ids: Some(id)
+        }
+    );
+    assert_eq!(
+        launch(&c, true).unwrap(),
+        Launch {
+            program: "/usr/sbin/chroot".into(),
+            args: [
+                "-u",
+                "4294967294",
+                "-g",
+                "4294967293",
+                "-G",
+                "4294967293",
+                "/",
+                "/usr/bin/gh",
+                "attestation",
+                "verify"
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            set_ids: None
+        }
+    );
+}
+
+/// A drop through `chroot` to uid 0 is refused, so `chroot` never runs a command as root.
+#[test]
+fn a_chroot_drop_to_uid_zero_is_refused() {
+    use super::{Identity, launch};
+    let mut c = cmd("/usr/bin/gh", &[]);
+    c.run_as = Some(Identity { uid: 0, gid: 20 });
+    let kind = launch(&c, true).map_err(|e| e.kind());
+    assert_eq!(kind, Err(std::io::ErrorKind::PermissionDenied));
+    // This process's own drop is not covered by this check.
+    assert!(launch(&c, false).is_ok());
+}
+
+/// A drop through `chroot` to gid 0 is refused, so the child never keeps group 0 (`wheel`).
+#[test]
+fn a_chroot_drop_to_gid_zero_is_refused() {
+    use super::{Identity, launch};
+    let mut c = cmd("/usr/bin/gh", &[]);
+    c.run_as = Some(Identity { uid: 501, gid: 0 });
+    let kind = launch(&c, true).map_err(|e| e.kind());
+    assert_eq!(kind, Err(std::io::ErrorKind::PermissionDenied));
+    assert!(launch(&c, false).is_ok());
 }

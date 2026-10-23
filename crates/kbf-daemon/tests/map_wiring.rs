@@ -121,7 +121,7 @@ async fn farm(name: &str) -> Farm {
 /// Catches a farm whose map stops at the frontend: both nodes register, the frontend hands
 /// the daemon the map of both members (`Welcome.map` or a `MapUpdate`) and each node holds
 /// the map its heartbeat brings; the daemon's blobs then go to their first owner, which
-/// copies them to the second (R = 2), so both nodes hold each, and read back. Mutants: the
+/// copies them to the second (R = 2), so both nodes hold each, and read back. Catches: the
 /// frontend started with no map source (the daemon never holds a map: the wait for it never
 /// ends); a node that does not keep the map it is sent (its holder stays empty); a plane
 /// that writes through the frontend instead of the owner (a blob lands on neither node); a
@@ -154,7 +154,7 @@ async fn a_blob_written_by_a_daemon_lands_on_both_its_owners_through_the_maps_th
 /// it: with the second owner stopped a write is still answered (one copy, not an error),
 /// the first owner keeps a record of the copy it owes, and when the second owner returns
 /// (the same address, so the same member, with the cache it had) the first owner's repair
-/// worker copies the blob and the record is settled. Mutants: no repair worker started (the
+/// worker copies the blob and the record is settled. Catches: no repair worker started (the
 /// debt stays for ever); a write that fails when the second owner is away; a worker that
 /// settles the debt without making the copy (the returned node does not hold the blob).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

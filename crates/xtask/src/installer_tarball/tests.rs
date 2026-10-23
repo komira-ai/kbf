@@ -21,6 +21,7 @@ struct Inputs {
     trust: PathBuf,
     sysusers: PathBuf,
     tmpfiles: PathBuf,
+    needrestart: PathBuf,
 }
 
 impl Inputs {
@@ -31,6 +32,7 @@ impl Inputs {
             trust: &self.trust,
             sysusers: &self.sysusers,
             tmpfiles: &self.tmpfiles,
+            needrestart: &self.needrestart,
         }
     }
 }
@@ -45,7 +47,8 @@ fn dir_of(dir: &Path, sub: &str, files: &[(&str, &str)]) -> PathBuf {
     d
 }
 
-/// A binary, two units, the three trust files, and the two systemd files, in `dir`.
+/// A binary, two units of the installer package, the unit of a mode (the `kbf` package's), the
+/// slice, the three trust files, and the two systemd files, in `dir`.
 fn inputs(dir: &Path) -> Inputs {
     let binary = dir.join("kbf-installer");
     std::fs::write(&binary, b"the installer").expect("binary");
@@ -54,7 +57,8 @@ fn inputs(dir: &Path) -> Inputs {
         "units",
         &[
             ("kbf-installer.service", "[Unit]\n"),
-            ("kbf-frontend.service", "[Unit]\n"),
+            ("kbf-proxy.service", "[Unit]\n"),
+            ("kbf-daemon.service", "[Unit]\n"),
             ("kbf.slice", "[Slice]\n"),
         ],
     );
@@ -71,12 +75,15 @@ fn inputs(dir: &Path) -> Inputs {
     std::fs::write(&sysusers, "u kbf\n").expect("sysusers");
     let tmpfiles = dir.join("tmpfiles.conf");
     std::fs::write(&tmpfiles, "d /x\n").expect("tmpfiles");
+    let needrestart = dir.join("needrestart.conf");
+    std::fs::write(&needrestart, "# stub\n").expect("needrestart");
     Inputs {
         binary,
         units,
         trust,
         sysusers,
         tmpfiles,
+        needrestart,
     }
 }
 
@@ -92,17 +99,19 @@ fn problems_of(files: &[File], tgz: &[u8]) -> Vec<String> {
 fn the_payload_is_the_packages_files_at_the_packages_paths_and_modes_sorted() {
     // Catches: a payload at other paths or modes than the .deb's (the pinned gh is
     // 0755 there, a payload giving every trust file 0644 would leave the installer
-    // unable to run it), a missing sysusers.d or tmpfiles.d file, or an order that
-    // depends on the directory listing.
+    // unable to run it), a missing sysusers.d or tmpfiles.d file, an order that
+    // depends on the directory listing, and the unit of a mode (the `kbf` package's, in the
+    // directory here as in the repository) reaching the payload.
     let dir = scratch("payload");
     let files = payload_of(&inputs(&dir)).expect("payload");
     let got: Vec<(&str, u32)> = files.iter().map(|f| (f.path.as_str(), f.mode)).collect();
     assert_eq!(
         got,
         [
+            ("etc/needrestart/conf.d/kbf.conf", 0o644),
             ("usr/bin/kbf-installer", 0o755),
-            ("usr/lib/systemd/system/kbf-frontend.service", 0o644),
             ("usr/lib/systemd/system/kbf-installer.service", 0o644),
+            ("usr/lib/systemd/system/kbf-proxy.service", 0o644),
             ("usr/lib/systemd/system/kbf.slice", 0o644),
             ("usr/lib/sysusers.d/kbf-installer.conf", 0o644),
             ("usr/lib/tmpfiles.d/kbf-installer.conf", 0o644),
@@ -129,6 +138,7 @@ fn the_payload_is_exactly_the_debs_files_with_the_debs_modes_and_bytes() {
         trust: &root.join("testdata/trust"),
         sysusers: &root.join("sysusers.d/kbf-installer.conf"),
         tmpfiles: &root.join("tmpfiles.d/kbf-installer.conf"),
+        needrestart: &root.join("needrestart/kbf.conf"),
     };
     let deb: Vec<String> = pkg_linux::listing(&pkg_linux::files(&sources).expect("deb"))
         .lines()

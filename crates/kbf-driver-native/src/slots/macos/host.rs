@@ -79,6 +79,9 @@ pub struct MacSlot<'a> {
     /// The uids of the pool's users: C9 does not walk a folder one of them owns a
     /// directory on the path of.
     pub pool: std::ops::RangeInclusive<u32>,
+    /// What this clean has judged of launchd's services ([`probe::OwnLabels`]); a clean
+    /// reads each service's plist once.
+    pub(super) judged: probe::OwnLabels,
 }
 
 /// `launchctl`, run for real: each call is killed at its alarm.
@@ -202,7 +205,8 @@ impl Os for MacSlot<'_> {
                     if look > 0 {
                         std::thread::sleep(probe::SCAN_PAUSE);
                     }
-                    let left = leftover_processes(user.uid).map_err(|e| e.to_string())?;
+                    let pids = uid::processes(user.uid).map_err(|e| e.to_string())?;
+                    let left = not_launchds_own(pids, user.uid, &self.judged);
                     if !left.is_empty() {
                         return Err(format!("processes {:?}", named(&left)));
                     }
@@ -219,8 +223,8 @@ impl Os for MacSlot<'_> {
         // The processes first, then the services: a process started in between is in
         // neither list, never in the first alone.
         let pids = uid::processes(user.uid);
-        let services = services_of(user.uid);
-        match pids.map(|pids| not_launchds_own(pids, &services)) {
+        let services = services_of(user.uid, &self.judged);
+        match pids.map(|pids| not_launchds_own_in(pids, &services)) {
             Ok(pids) => {
                 if !pids.is_empty() {
                     note(Step::Kill, format!("processes {:?}", named(&pids)));
@@ -324,7 +328,7 @@ impl MacSlot<'_> {
             if pids.is_empty() {
                 return Ok(pids);
             }
-            Ok(not_launchds_own(pids, &services_of(uid)))
+            Ok(not_launchds_own(pids, uid, &self.judged))
         };
         let round = super::term_uid(
             uid,
@@ -640,21 +644,53 @@ fn make_home(home: &Path, uid: u32, gid: u32) -> io::Result<()> {
 /// The process table could not be read.
 pub fn leftover_processes(uid: u32) -> io::Result<Vec<i32>> {
     let pids = uid::processes(uid)?;
-    Ok(not_launchds_own(pids, &services_of(uid)))
+    Ok(not_launchds_own(pids, uid, &probe::OwnLabels::default()))
 }
 
-/// The processes `launchctl print user/<uid>` lists as running one of launchd's own
-/// agents ([`Service::own`]); read before a domain's bootout, which empties the list.
+/// The processes of `uid` that `launchctl print user/<uid>` lists as running one of
+/// launchd's own agents ([`Service::own`]); read before a domain's bootout, which
+/// empties the list. Nothing is listed when no process of the uid is alive.
 pub(crate) fn launchds_own(uid: u32) -> Vec<i32> {
-    services_of(uid)
-        .into_iter()
-        .filter(|s| s.own)
-        .filter_map(|s| s.pid)
-        .collect()
+    let judged = probe::OwnLabels::default();
+    probe::own_of_uid(
+        uid::processes(uid),
+        |pids| own_pids(uid, pids, &judged),
+        || {
+            // The process table could not be read: every service launchd lists as
+            // running its own agent, as before the table was read first.
+            (services_of(uid, &judged).into_iter())
+                .filter(|s| s.own)
+                .filter_map(|s| s.pid)
+                .collect()
+        },
+    )
+}
+
+/// The members of `pids` that launchd lists as running one of its own agents. The
+/// domain is not printed for no pids, and only the services that run one of `pids` are
+/// printed for their plists, each once for `judged`.
+fn own_pids(uid: u32, pids: &[i32], judged: &probe::OwnLabels) -> Vec<i32> {
+    let give_up = Instant::now() + SERVICES_WITHIN;
+    probe::own_among(
+        pids,
+        || {
+            launchctl_print(&format!("user/{uid}"), PRINT_WITHIN)
+                .map(|domain| probe::listed_services(&domain))
+                .unwrap_or_default()
+        },
+        |pid, label| judged.is_own(label, Some(pid), || is_own_service(uid, label, give_up)),
+    )
+}
+
+/// `pids` without those launchd lists as running one of its own agents.
+fn not_launchds_own(mut pids: Vec<i32>, uid: u32, judged: &probe::OwnLabels) -> Vec<i32> {
+    let own = own_pids(uid, &pids, judged);
+    pids.retain(|pid| !own.contains(pid));
+    pids
 }
 
 /// `pids` without those `services` lists as running one of launchd's own agents.
-fn not_launchds_own(mut pids: Vec<i32>, services: &[Service]) -> Vec<i32> {
+fn not_launchds_own_in(mut pids: Vec<i32>, services: &[Service]) -> Vec<i32> {
     pids.retain(|pid| !services.iter().any(|s| s.own && s.pid == Some(*pid)));
     pids
 }
@@ -681,8 +717,8 @@ const SERVICES_WITHIN: Duration = Duration::from_secs(15);
 /// The services `launchctl print user/<uid>` lists: none when the domain is gone (or
 /// cannot be printed, or the print does not answer in time, which the kill and the other
 /// checks then stand in for). Each is printed on its own for its plist's path
-/// ([`Service::own`]); one not printed in time is not launchd's own.
-fn services_of(uid: u32) -> Vec<Service> {
+/// ([`Service::own`]), once for `judged`; one not printed in time is not launchd's own.
+fn services_of(uid: u32, judged: &probe::OwnLabels) -> Vec<Service> {
     let give_up = Instant::now() + SERVICES_WITHIN;
     let Some(domain) = launchctl_print(&format!("user/{uid}"), PRINT_WITHIN) else {
         return Vec::new();
@@ -690,15 +726,19 @@ fn services_of(uid: u32) -> Vec<Service> {
     probe::listed_services(&domain)
         .into_iter()
         .map(|(pid, label)| {
-            let left = give_up.saturating_duration_since(Instant::now());
-            let printed = launchctl_print(&format!("user/{uid}/{label}"), left.min(PRINT_WITHIN));
-            let own = printed
-                .as_deref()
-                .and_then(probe::plist_path)
-                .is_some_and(probe::is_own_plist);
+            let own = judged.is_own(&label, pid, || is_own_service(uid, &label, give_up));
             Service { pid, label, own }
         })
         .collect()
+}
+
+/// Whether `user/<uid>/<label>`'s plist is launchd's own, from its own print, which is
+/// waited for until `give_up` (and [`PRINT_WITHIN`] at most); `None` when it was not
+/// printed.
+fn is_own_service(uid: u32, label: &str, give_up: Instant) -> Option<bool> {
+    let left = give_up.saturating_duration_since(Instant::now());
+    let printed = launchctl_print(&format!("user/{uid}/{label}"), left.min(PRINT_WITHIN))?;
+    Some(probe::plist_path(&printed).is_some_and(probe::is_own_plist))
 }
 
 /// What `launchctl print <target>` says, if it succeeds within `within`; a print that

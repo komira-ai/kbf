@@ -149,7 +149,7 @@ impl Exec for Killed<'_> {
 /// the binary of the release that was running keeps its bytes and its inode, so a
 /// process running it is undisturbed.
 ///
-/// Mutants seen red: `previous` not moved; `staged` left.
+/// Catches: `previous` not moved; `staged` left.
 #[test]
 fn an_order_swaps_a_staged_release_in_on_trial_and_changes_no_release_file() {
     let (mut exec, layout) = host("swap");
@@ -197,7 +197,7 @@ fn an_order_swaps_a_staged_release_in_on_trial_and_changes_no_release_file() {
 /// points nowhere and a service that cannot start), and the state written before the
 /// refusal.
 ///
-/// Mutant seen red: the installed check dropped.
+/// Catches: the installed check dropped.
 #[test]
 fn a_release_that_is_not_installed_is_refused_and_nothing_changes() {
     let (mut exec, layout) = host("not-installed");
@@ -217,7 +217,7 @@ fn a_release_that_is_not_installed_is_refused_and_nothing_changes() {
 /// release again, so an order whose number is below anything recorded is carried out, and
 /// the recorded floor (an old build's field) is left as it was.
 ///
-/// Mutant seen red: the old floor check put back (the order below 7 is refused).
+/// Catches: the old floor check put back (the order below 7 is refused).
 #[test]
 fn an_order_is_never_refused_for_its_number_and_the_floor_stays() {
     let (mut exec, layout) = host("floor");
@@ -239,7 +239,7 @@ fn an_order_is_never_refused_for_its_number_and_the_floor_stays() {
 /// becomes the release on trial, so a revert goes nowhere), and a second order that
 /// takes a swap on trial over.
 ///
-/// Mutants seen red: the order id not compared (the repeat is refused as another
+/// Catches: the order id not compared (the repeat is refused as another
 /// order); the pending check dropped (the other order swaps).
 #[test]
 fn a_repeated_order_changes_nothing_and_another_order_waits_for_the_pending_one() {
@@ -272,7 +272,7 @@ fn a_repeated_order_changes_nothing_and_another_order_waits_for_the_pending_one(
 /// own crash, that swaps the running release in over itself: `previous` would become
 /// `current` and a revert would have nothing to go back to.
 ///
-/// Mutant seen red: the already-current check dropped.
+/// Catches: the already-current check dropped.
 #[test]
 fn an_order_for_the_release_that_is_current_is_a_no_op() {
     let (mut exec, layout) = host("current");
@@ -303,7 +303,7 @@ fn an_order_for_the_release_that_is_current_is_a_no_op() {
 /// leaves the swap pending, a confirm after a revert taken for a repeat, and a repeat
 /// that is an error.
 ///
-/// Mutants seen red: the order id not compared; the pending record not cleared; the
+/// Catches: the order id not compared; the pending record not cleared; the
 /// commit not compared.
 #[test]
 fn a_confirm_keeps_the_swap_only_for_the_order_that_made_it() {
@@ -358,7 +358,7 @@ fn a_confirm_keeps_the_swap_only_for_the_order_that_made_it() {
 /// that is now the current release (the state keeps no release before it), leaves the
 /// swap pending, or deletes the release it came from.
 ///
-/// Mutants seen red: `current` not moved back; `previous` kept; `pending_confirm` kept.
+/// Catches: `current` not moved back; `previous` kept; `pending_confirm` kept.
 #[test]
 fn a_revert_puts_the_previous_release_back_and_keeps_the_release_it_left() {
     let (mut exec, layout) = host("revert");
@@ -416,7 +416,7 @@ fn a_revert_with_nothing_pending_goes_to_the_previous_release_and_with_none_is_r
 /// with the previous release's files gone it must change nothing and leave the swap
 /// pending, so the host reports it and an operator decides.
 ///
-/// Mutants seen red: the state written before the check; the previous link removed
+/// Catches: the state written before the check; the previous link removed
 /// before the check.
 #[test]
 fn a_revert_whose_previous_release_is_gone_changes_nothing() {
@@ -448,7 +448,7 @@ fn a_revert_whose_previous_release_is_gone_changes_nothing() {
 /// that is re-armed by every start (a crash loop would never run out), a start budget
 /// that is off by one, and a release that starts after its budget is spent.
 ///
-/// Mutants seen red: the window armed at the swap; `deadline.or(..)` replaced by a new
+/// Catches: the window armed at the swap; `deadline.or(..)` replaced by a new
 /// deadline each start; the budget checked after the start; no budget.
 #[test]
 fn the_window_starts_at_the_first_start_and_a_crash_loop_runs_out_of_starts() {
@@ -503,7 +503,7 @@ fn the_window_starts_at_the_first_start_and_a_crash_loop_runs_out_of_starts() {
 /// Catches a confirm window that runs out and is not enforced at the next start, and a
 /// start that the window had not run out for being reverted.
 ///
-/// Mutant seen red: the deadline not compared at a start.
+/// Catches: the deadline not compared at a start.
 #[test]
 fn a_start_after_the_deadline_reverts_and_one_before_it_does_not() {
     let (mut exec, layout) = host("boot-late");
@@ -543,7 +543,7 @@ fn a_start_after_the_deadline_reverts_and_one_before_it_does_not() {
 /// the only trigger), one reverted a second early, one confirmed in time that is
 /// reverted anyway, and a revert that happens at the exact second as a wait.
 ///
-/// Mutants seen red: `now < deadline` written `now <= deadline`; the confirm not
+/// Catches: `now < deadline` written `now <= deadline`; the confirm not
 /// clearing the record.
 #[test]
 fn a_swap_not_confirmed_within_its_window_is_reverted() {
@@ -592,7 +592,7 @@ fn a_swap_not_confirmed_within_its_window_is_reverted() {
 /// Catches a window the order (or a hostile frontend) can set to a year or to nothing:
 /// the host's bounds are enforced at both places a window is taken, inclusive.
 ///
-/// Mutants seen red: either bound moved by one; the check missing from `boot_check`.
+/// Catches: either bound moved by one; the check missing from `boot_check`.
 #[test]
 fn a_window_outside_the_hosts_bounds_is_refused() {
     let (mut exec, layout) = host("bounds");
@@ -638,7 +638,7 @@ fn a_window_outside_the_hosts_bounds_is_refused() {
 /// mix, with the release a revert goes to intact. After the first step of a swap the
 /// host still runs the old release and `previous` already names it.
 ///
-/// Mutants seen red: the links moved before the state is written (the state is the old
+/// Catches: the links moved before the state is written (the state is the old
 /// one after a kill at 0 steps); `current` moved before `previous` (a kill after one
 /// step leaves `current` on the new release with no `previous`).
 #[test]
@@ -715,7 +715,7 @@ fn a_host_killed_between_any_two_steps_of_a_swap_or_a_revert_converges() {
 /// happen, one that does nothing for links that disagree with the state, and one that
 /// invents a `current` for an empty host.
 ///
-/// Mutants seen red: the moved flag always true; the converge skipped.
+/// Catches: the moved flag always true; the converge skipped.
 #[test]
 fn reconcile_moves_links_to_the_state_and_leaves_a_consistent_host_alone() {
     let (mut exec, layout) = host("reconcile");
@@ -745,7 +745,7 @@ fn reconcile_moves_links_to_the_state_and_leaves_a_consistent_host_alone() {
 /// running release, the previous one and one more (the newest of the rest) are kept,
 /// the others removed, and a revert still works.
 ///
-/// Mutants seen red: `gc` not keeping the state's previous; the newest-first order
+/// Catches: `gc` not keeping the state's previous; the newest-first order
 /// reversed.
 #[test]
 fn retention_keeps_the_running_the_previous_and_one_more() {
@@ -793,7 +793,7 @@ fn retention_keeps_the_running_the_previous_and_one_more() {
 /// to, so no pending confirm), points `current` at it and leaves `previous` unset, and a
 /// repeat changes nothing.
 ///
-/// Mutants to plant: `pending_confirm` set in `first`; the state written after the links;
+/// Catches: `pending_confirm` set in `first`; the state written after the links;
 /// the repeat arm removed (the repeat then fails with `NotFirst`).
 #[test]
 fn the_first_release_becomes_current_with_no_trial() {
@@ -817,7 +817,7 @@ fn the_first_release_becomes_current_with_no_trial() {
 /// the host: another release current is `NotFirst` (setup never replaces a release: that is
 /// an update), and a release with no binary is `NotInstalled`; neither writes a state.
 ///
-/// Mutants to plant: the `NotFirst` guard removed; the `has_binary` check removed.
+/// Catches: the `NotFirst` guard removed; the `has_binary` check removed.
 #[test]
 fn a_first_release_never_replaces_one_and_must_be_installed() {
     let (mut exec, layout) = host("first-refused");
@@ -847,7 +847,7 @@ fn a_first_release_never_replaces_one_and_must_be_installed() {
 /// neither writes the state; the same release installed is staged, and staging it again
 /// changes nothing.
 ///
-/// Mutants to plant: the `has_binary` check removed from `stage_frontend`; the state written
+/// Catches: the `has_binary` check removed from `stage_frontend`; the state written
 /// before the check.
 #[test]
 fn a_frontend_stage_needs_the_release_on_the_host_and_writes_nothing_otherwise() {
@@ -881,7 +881,7 @@ fn a_frontend_stage_needs_the_release_on_the_host_and_writes_nothing_otherwise()
 /// setup made it current) is cleared, and a `staged` that names another release stays (it
 /// is another decision's).
 ///
-/// Mutants to plant: `staged` carried over unchanged; `staged` cleared whatever it names.
+/// Catches: `staged` carried over unchanged; `staged` cleared whatever it names.
 #[test]
 fn a_first_release_that_was_staged_is_current_and_no_longer_staged() {
     for (staged, want) in [(A, None), (B, Some(c(B)))] {

@@ -604,7 +604,7 @@ fn carrying(commit: &str) -> InstallerStatus {
 /// refusals, not a busy host), and a word that is not a source being taken: it is a 400 and
 /// nothing is saved or written.
 ///
-/// Mutants planted: the 409 sent with the code `update_open`; the 422 sent as a 409.
+/// Catches: the 409 sent with the code `update_open`; the 422 sent as a 409.
 #[tokio::test]
 async fn the_source_refusals_reach_the_client_with_their_codes_and_an_unknown_source_is_a_400() {
     let h = harness("pr5a-r-source", quick());
@@ -641,7 +641,7 @@ async fn the_source_refusals_reach_the_client_with_their_codes_and_an_unknown_so
 /// a client has read so far), and one that does not say a staged update is staged: the key is
 /// there only for `staged`, and the client reads it back as it was sent.
 ///
-/// Mutants planted: the key written for a fetch; the key never written.
+/// Catches: the key written for a fetch; the key never written.
 #[tokio::test]
 async fn a_status_names_the_source_of_an_update_only_when_it_is_not_a_fetch() {
     let h = harness("pr5a-r-status-fetch", quick());

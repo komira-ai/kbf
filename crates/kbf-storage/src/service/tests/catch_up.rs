@@ -50,7 +50,7 @@ fn store() -> (Arc<Mem>, Digest, Digest) {
 /// Catches a node that, while it rebuilds its index, tells a caller a blob it may hold is
 /// missing: a Read of it must be UNAVAILABLE (the gRPC code, and `Unavailable` through the
 /// client a router uses), never NOT_FOUND; a FindMissingBlobs naming it beside a held blob
-/// must fail as a whole, UNAVAILABLE; an action-cache miss is UNAVAILABLE too. Mutants:
+/// must fail as a whole, UNAVAILABLE; an action-cache miss is UNAVAILABLE too. Catches:
 /// the gate removed (NOT_FOUND, a missing list, a `None` entry come back); a gate that
 /// drops only the missed digests from the FindMissing answer (an empty list comes back,
 /// which tells the caller the blob is held); the gate read after the lookup is not caught
@@ -87,7 +87,7 @@ async fn no_false_miss_during_catch_up() {
 /// closure blob the node did not find as if the blob were missing: Prepare and Commit
 /// must answer UNAVAILABLE (a caller retries) and never the Absent refusal (which a caller
 /// acts on by uploading, or gives up with FAILED_PRECONDITION). Refusals that are not
-/// about a blob's absence stand: Unreachable and NotDaemon are still refusals. Mutant:
+/// about a blob's absence stand: Unreachable and NotDaemon are still refusals. Catches:
 /// the refusal passed through unchanged (FAILED_PRECONDITION / Absent leaks).
 #[tokio::test]
 async fn a_closure_write_during_catch_up_is_retryable() {
@@ -140,7 +140,7 @@ async fn a_closure_write_during_catch_up_is_retryable() {
 /// Catches a gate that refuses more than misses: while the node rebuilds, a held blob
 /// reads back whole, a FindMissing of held blobs answers none missing, a new blob is
 /// written and reads back, and an action-cache entry is written (Prepare, Commit) and
-/// read. Mutant: every call refused while catching up.
+/// read. Catches: every call refused while catching up.
 #[tokio::test]
 async fn hits_and_writes_are_served_while_catching_up() {
     let (mem, held, _) = store();
@@ -183,7 +183,7 @@ async fn hits_and_writes_are_served_while_catching_up() {
 /// Catches a gate that outlives the rebuild: after [`CatchUp::finish`] a true miss is the
 /// store's answer again: NOT_FOUND for a read, the digest in the FindMissing answer, no
 /// entry for an action-cache miss, and the Absent refusal for a closure blob. The same
-/// calls are refused UNAVAILABLE first, so the test sees the gate lift. Mutant: misses
+/// calls are refused UNAVAILABLE first, so the test sees the gate lift. Catches: misses
 /// answered UNAVAILABLE whatever the state.
 #[tokio::test]
 async fn catch_up_done_lifts_the_gate() {
@@ -234,7 +234,7 @@ async fn a_node_caught_up_from_the_start_answers_misses() {
 }
 
 /// Catches a `finished` that never returns once the rebuild is done (it waits for a
-/// notification sent before it registered: mutant, the flag read before the waiter is
+/// notification sent before it registered: the flag read before the waiter is
 /// registered), or that returns while the rebuild is still going: a waiter that began
 /// before `finish` and one that began after both complete; a caught-up state completes
 /// at once. The hang guard is generous and asserts nothing about speed.

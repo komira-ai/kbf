@@ -21,7 +21,7 @@ takes two store URIs and, sometimes, a directory; the daemon takes one directory
 
 | Term | What it is | Set by |
 |---|---|---|
-| **Object store** (the cold store) | The durable home of every blob: an S3 bucket (MinIO, RustFS) or a directory on a disk. Nothing leaves it but by being deleted, and nothing is deleted yet. | `kbf-server --cold-store` |
+| **Object store** (the cold store) | The durable home of every blob: an S3 bucket (MinIO, RustFS) or a directory on a disk. A `file://` directory deletes its least recently used objects when its disk is short of room ([Eviction under disk pressure](../design/storage.md#eviction-under-disk-pressure)), and the start-up pass deletes orphan files; an `s3://` store is never evicted from. | `kbf-server --cold-store` |
 | **Write tier** (the hot store) | A fast local disk in front of the object store. Uploads land there first and are flushed to the object store in the background; reads are served from it while a blob is still there. Optional: without one, uploads go straight to the object store. | `kbf-server --hot-store` |
 | **Metadata log** | The index of what the object store holds (digest to segment object and offset) and the action cache: a single-voter Raft log on a local disk. Lose it and the blobs are unreachable. | in the hot store's directory (`<hot>/meta`), else `kbf-server --meta-dir` |
 | **Input cache** | The daemon's per-node cache of input files, from which each lease's inputs are linked. Evicts least recently used past its budget. | `kbf-daemon --data-dir` (`cache/`) |
@@ -502,7 +502,7 @@ metadata directory.
 
 ## A mode's units
 
-Each mode of the one `kbf` binary has a packaged unit, installed by `kbf-installer` and
+Each mode of the one `kbf` binary has a packaged unit, installed by the `kbf` package (which runs `/usr/bin/kbf`) and
 configured by `/etc/kbf/kbf.toml`; they are described, with the rules they are held to, in
 [kbf-units.md](kbf-units.md). `kbf-deploy linux render-units`, `check-units` and
 `install-units` (and the converged form of them, with `--restart-minio` and `--uninstall`)

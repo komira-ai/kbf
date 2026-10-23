@@ -318,7 +318,8 @@ impl<C: Cas> NativeRuntime<C> {
         entries
     }
 
-    /// Sends the daemon the number of free slots through `part` now and whenever it
+    /// Sends the daemon the number of usable slots (not dirty; a slot a lease
+    /// is running in counts) through `part` now and whenever it
     /// changes (a slot went dirty, or was cleaned again), so the node reports its slots
     /// without waiting for the Xcode survey to change. The survey's own report then
     /// leaves the `action_slots` entry out: this part owns it. Without a pool, or off a
@@ -1843,7 +1844,7 @@ mod tests {
 
     /// Catches a node with a pool and no `sandbox-exec` starting (the check exists but
     /// `NativeRuntime::new` does not call it, or calls it after something is made): the
-    /// start is refused for that reason, before the scratch root is made. Seen red with
+    /// start is refused for that reason, before the scratch root is made. It fails with
     /// the call removed from `build`: the start succeeds on macOS and is refused for the
     /// wrong reason elsewhere.
     #[test]
@@ -1881,7 +1882,7 @@ mod tests {
 
     /// Catches: a failed lease's usage lost (the daemon asks once, after `run` failed),
     /// handed out twice (a second lease with the same id would report the first's),
-    /// kept for a lease that succeeded, or kept without bound. Mutants seen red: `remove`
+    /// kept for a lease that succeeded, or kept without bound. Catches: `remove`
     /// replaced by `get().cloned()` (taken twice); the bound removed (300 kept);
     /// `pop_first` replaced by `pop_last` (the newest lease's usage dropped).
     #[test]

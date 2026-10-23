@@ -37,7 +37,8 @@ by `crates/kbf-integration-test/tests/release_artifacts`.
 
 Thirteen tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), two Debian packages of
-`kbf-installer` ([below](#the-kbf-installer-package-deb)) and one macOS package of it
+`kbf-installer` ([below](#the-kbf-installer-package-deb)), two of `kbf`
+([below](#the-kbf-package-deb)) and one macOS package of `kbf-installer`
 ([below](#the-kbf-installer-package-pkg-macos)), built by one job per platform:
 
 | Asset | Runner | Target |
@@ -60,17 +61,24 @@ and released like the others, so a package or an operator takes it by digest fro
 files. It is not a component of the release it installs on a host, and it does not
 update itself (the design's section 1).
 
-The packages are the two Linux jobs' debs and the macOS job's `.pkg`:
+The packages are the two Linux jobs' debs (two each) and the macOS job's `.pkg`:
 
 | Asset | Built by | Holds |
 |---|---|---|
-| `kbf-installer-<commit>-linux-x86_64.deb` | the `linux-x86_64` job (`ubuntu-24.04`, nfpm for amd64) | the `kbf-installer` of the tarball of the same name, the units, the pinned `gh` for amd64 and a trust directory |
+| `kbf-installer-<commit>-linux-x86_64.deb` | the `linux-x86_64` job (`ubuntu-24.04`, nfpm for amd64) | the `kbf-installer` of the tarball of the same name, the units of the proxy and of the installer, the pinned `gh` for amd64 and a trust directory |
 | `kbf-installer-<commit>-linux-arm64.deb` | the `linux-arm64` job (`ubuntu-24.04-arm`, nfpm for arm64) | the same for arm64 |
+| `kbf-<commit>-linux-x86_64.deb` | the `linux-x86_64` job | the `kbf` of the tarball of the same name at `/usr/bin/kbf`, the unit of every mode, a dependency on `kbf-installer` of the same version or later, and the replacement of `kbf-installer` (its files, not the package) |
+| `kbf-<commit>-linux-arm64.deb` | the `linux-arm64` job | the same for arm64 |
 | `kbf-installer-<commit>-darwin-arm64.pkg` | the `darwin-arm64` job (`macos-15`, `cargo xtask pkg build`) | the `kbf-installer` of the tarball of the same name, its LaunchDaemon property list, the pinned darwin `gh` and a trust directory |
 
 The set above is pinned: `crates/kbf-integration-test/tests/release_artifacts` fails a pull request
 that drops one of these files from the workflow, packages one that is not listed, or
 leaves this table describing another set.
+
+The `kbf-installer` package no longer holds the unit of a mode; the `kbf` package does. On a host
+that has the earlier `kbf-installer` package, upgrade the two together, in one `apt install` of
+both debs: the new `kbf-installer` alone drops the unit files of a running node, and `Replaces`
+takes effect only when the `kbf` package is unpacked.
 
 Every kit that changes a host changes a Linux one (systemd units, the MDM services, a
 systemd user service, or a cluster through `kubectl`), and `kbf-deploy` for macOS is
@@ -203,8 +211,8 @@ sorted by name.
   change on: an installer older than that refuses a kbf that prints it
   (`version-unreadable`), so the installer package that reads `seq` ships before the kbf
   that prints it.
-- `state_schema`: the schema version of the SQLite state file the binary creates and
-  reads.
+- `state_schema`: the newest Postgres state schema version the binary embeds a
+  migration for.
 - `version`: the package version.
 
 `--json` without `--version` is a usage error. The fields are a contract: the test
@@ -320,8 +328,8 @@ How a bundle is made, and what is checked of it:
   artifact `bundles-linux` or `bundles-darwin-arm64`.
 - **Not an SBOM's.** The SBOM attestation of a tarball carries the whole SBOM and can be
   larger than a bundle may be (below); it is not given to a host. A tarball has exactly
-  one bundle, a `kbf-installer` package has exactly one (`<package>.sigstore.json`, the
-  same kind of attestation over the one `.deb`), and nothing else has one.
+  one bundle, a package (`kbf-installer` or `kbf`) has exactly one (`<package>.sigstore.json`,
+  the same kind of attestation over the one `.deb`), and nothing else has one.
 - **Not in `SHA256SUMS`.** The bundle is made after the sums, from the files they list, so
   they cannot list it. `cargo xtask verify-assets sums` leaves out names that end
   `.sigstore.json`, and `cargo xtask release check` holds the directory to one
@@ -361,6 +369,8 @@ refusing it unless:
 
 - `usr/bin/kbf-installer` is byte for byte the binary in the tarball
   `build-commit check-asset` checked for the commit;
+- it holds neither `usr/bin/kbf` nor the unit of a mode: [the `kbf` package](#the-kbf-package-deb)
+  carries them;
 - its control file says the architecture of the platform;
 - `/usr/share/kbf-installer/trust/gh` is the pinned `gh` the job downloaded (checked by
   SHA-256 before use) and executable, `trusted_root.jsonl` is the Sigstore trusted root
@@ -404,6 +414,52 @@ file you give it, so the verification above is the operator's step; the package 
 signed with a key and is not published through an apt repository; and the trusted root
 inside it is a snapshot, which a later Sigstore key rotation outdates (no code reads its
 `valid_until` yet).
+
+## The kbf package (deb)
+
+`kbf` is the second package of a Linux host: the runtime `/usr/bin/kbf` and the systemd
+unit of every mode (`kbf-all-in-one.service`, `kbf-daemon.service`, `kbf-frontend.service`,
+`kbf-storage-and-daemon.service`, `kbf-storage.service`). Installing a newer one is the update
+of a host. The package has no maintainer script, so the package manager replaces the file and
+restarts nothing: the operator restarts the mode unit that runs it (a stop drains).
+`kbf-proxy.service` is the `kbf-installer` package's and is not changed by this package.
+Each mode unit runs the installer's `boot-check` before it starts `kbf`, so the package
+depends on `kbf-installer`: deb `kbf-installer (>= <version>)`, rpm `kbf-installer >=
+<version>`, with the version of the `kbf-installer` package built in the same job
+(`<version>+<12 of the commit>`). apt and dnf compare that version as text, so the dependency
+names the installer built with this `kbf` and does not order builds: a rollback to an older
+`kbf` can be refused and an older installer accepted (unsettled until `pkg-config` carries
+the version `crates/xtask/src/pkg_version.rs` describes).
+
+The five mode units were files of the `kbf-installer` package before this one carried them, so
+the deb of `kbf` says `Replaces: kbf-installer` (any version of it, and no `Conflicts`): without
+it dpkg refuses to unpack `kbf` over the files an older `kbf-installer` owns. The rpm names no
+replacement; installing it asks for the installer of the same version or later, which does not
+own those files.
+
+`cargo xtask pkg-config` writes both packages' configurations from one command line
+(`--binary` the `kbf-installer`, `--kbf` the `kbf` of the same job), and `pkg-build` builds the
+deb and the rpm of each twice and compares them. The `kbf` package is not installed in a
+container (the install test takes one package, and this one needs the other); its files are
+checked in the asset step. `cargo xtask pkg-kbf-asset` makes the deb the asset
+`kbf-<commit>-<platform>.deb` and lists it in `SHA256SUMS`, refusing it unless:
+
+- `usr/bin/kbf` is byte for byte the `kbf` in the tarball `kbf-<commit>-<platform>.tar.gz`
+  that `build-commit check-asset` checked for the commit, mode 0755;
+- it holds the unit of every mode, mode 0644, and no other file;
+- its control file says the package `kbf`, the architecture of the platform,
+  `Depends: kbf-installer (>= <its own version>)` and `Replaces: kbf-installer`.
+
+It is attested like the other deb: build provenance (as one subject of the `SHA256SUMS`
+attestation, and alone, with its bundle `kbf-<commit>-<platform>.deb.sigstore.json` in
+`bundles-linux`) and **no SBOM attestation**; the `kbf` it carries has the SBOM of its tarball.
+The verify job checks both offline and runs `cargo xtask pkg-kbf-asset --verify-only` on the
+signed file. The deb is verified like the installer's and installed with it (the dependency
+needs `kbf-installer` installed first, or both files given to one `apt install ./<file>` call):
+
+```text
+sudo apt install ./kbf-installer-<commit>-linux-x86_64.deb ./kbf-<commit>-linux-x86_64.deb
+```
 
 ## The kbf-installer package (pkg, macOS)
 

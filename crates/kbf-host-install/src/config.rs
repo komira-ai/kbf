@@ -103,13 +103,16 @@ impl Allowlist {
 
 /// The refusal for a file that could not be trusted: unsafe when someone else could have
 /// written it, invalid when it could not be read.
-fn refusal(error: TrustError) -> Refusal {
+pub(crate) fn refusal(error: TrustError) -> Refusal {
     match error {
         TrustError::NotOwned
         | TrustError::Writable
         | TrustError::ParentNotOwned
         | TrustError::ParentWritable => Refusal::ConfigUnsafe,
-        TrustError::Io(_) | TrustError::NotRegular | TrustError::TooLarge => Refusal::ConfigInvalid,
+        TrustError::Io(_)
+        | TrustError::NotRegular
+        | TrustError::NotDirectory
+        | TrustError::TooLarge => Refusal::ConfigInvalid,
     }
 }
 

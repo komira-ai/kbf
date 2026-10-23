@@ -36,7 +36,7 @@ fn after_a_power_cut(farm: &Farm, node: usize) -> Vec<RepairRecord> {
 /// disk when the writer is told: with the replica cut off, the write is answered, the
 /// primary holds the blob, the replica does not, the primary owes exactly this copy
 /// (naming the replica and the generation), and a power cut right after the answer
-/// leaves the record. Mutants: the record not made; the journal's sync skipped.
+/// leaves the record. Catches: the record not made; the journal's sync skipped.
 #[tokio::test]
 async fn an_answer_with_one_copy_comes_with_a_durable_record() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -61,7 +61,7 @@ async fn an_answer_with_one_copy_comes_with_a_durable_record() {
 /// Catches an answer given when the record could not be made: the journal's sync fails, so
 /// the write is not answered (UNAVAILABLE naming the journal) and the primary does not
 /// hold the blob; the journal has stopped, so another one-copy write is refused too; and a
-/// write whose replica is back still lands on both. Mutants: the failure of `degrade`
+/// write whose replica is back still lands on both. Catches: the failure of `degrade`
 /// ignored; the commit before the record.
 #[tokio::test]
 async fn no_answer_is_given_when_the_record_cannot_be_made() {
@@ -99,7 +99,7 @@ async fn no_answer_is_given_when_the_record_cannot_be_made() {
 
 /// Catches debts that do not survive the primary restarting: three one-copy writes, then
 /// the primary's process dies and the machine loses power; the reopened journal owes all
-/// three, and a repair worker could start from it. Mutant: the journal's sync skipped.
+/// three, and a repair worker could start from it. Catches: the journal's sync skipped.
 #[tokio::test]
 async fn the_records_survive_a_restart_of_the_primary() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -128,7 +128,7 @@ async fn the_records_survive_a_restart_of_the_primary() {
 
 /// Catches a write abandoned because the replica died part way through the blob: the
 /// replica's appends are held and its node is then cut off with the blob half sent; the
-/// primary goes on receiving, holds the whole blob and owes the copy. Mutant: the loss
+/// primary goes on receiving, holds the whole blob and owes the copy. Catches: the loss
 /// of the leg ends the write.
 #[tokio::test]
 async fn a_replica_that_dies_part_way_does_not_stop_the_write() {
@@ -157,7 +157,7 @@ async fn a_replica_that_dies_part_way_does_not_stop_the_write() {
 /// Catches a replica the map names down being called (a connection attempt that costs the
 /// write the connect timeout) or its copy not being owed: with the replica down in the
 /// map, the write is answered, no byte reaches it, and the record names the generation
-/// that said so. Mutant: the check of the replica's state removed.
+/// that said so. Catches: the check of the replica's state removed.
 #[tokio::test]
 async fn a_replica_the_map_names_down_is_owed_at_once() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -182,7 +182,7 @@ async fn a_replica_the_map_names_down_is_owed_at_once() {
 
 /// Catches a refusal treated as a replica that could not be reached: a replica holding a
 /// newer map (STALE_MAP) and a replica whose store fails are the writer's answer, and
-/// nothing is owed. Mutant: every replica error counts as unreachable.
+/// nothing is owed. Catches: every replica error counts as unreachable.
 #[tokio::test]
 async fn a_refusal_is_not_a_copy_owed() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -209,7 +209,7 @@ async fn a_refusal_is_not_a_copy_owed() {
 /// Catches a primary that waits for ever on a replica that accepts nothing or commits
 /// nothing, and one that fails the write for it: after the bounds, the write is answered
 /// with the copy owed (the replica may still commit later; the repair finds it there).
-/// Mutants: the stall or the commit bound removed.
+/// Catches: the stall or the commit bound removed.
 #[tokio::test]
 async fn a_replica_that_stops_answering_is_owed_after_its_bounds() {
     let config = ChainConfig {
@@ -240,7 +240,7 @@ async fn a_replica_that_stops_answering_is_owed_after_its_bounds() {
 
 /// Catches the frontend's ledger being waited for, or not told: a ledger that never
 /// returns does not delay the answer, and it was told of the record.
-/// Mutant: the report awaited before the answer.
+/// Catches: the report awaited before the answer.
 #[tokio::test]
 async fn the_frontend_is_told_but_never_waited_for() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -293,7 +293,7 @@ async fn with_the_primary_down_the_next_owner_takes_the_write() {
 /// owner, `kbf_route::Router::put`, and gets INVALID_ARGUMENT "not the primary"): with the
 /// first owner's connections cut and the map still naming it active, the write to the
 /// second is answered, the second holds the blob, and it owes the first its copy.
-/// Mutant: the plan's `(None, Some(1), ..)` arm guarded by the first owner being down.
+/// Catches: the plan's `(None, Some(1), ..)` arm guarded by the first owner being down.
 #[tokio::test]
 async fn the_second_owner_takes_a_write_whose_primary_is_dead_but_not_yet_down() {
     let farm = Farm::start(2, ChainConfig::default()).await;
@@ -318,7 +318,7 @@ async fn the_second_owner_takes_a_write_whose_primary_is_dead_but_not_yet_down()
 
 /// Catches the second owner taking a client write and keeping it to itself: with the
 /// first owner up and the map naming it active, the write to the second lands on both and
-/// nothing is owed. Mutant: the second owner's plan having no copy to send.
+/// nothing is owed. Catches: the second owner's plan having no copy to send.
 #[tokio::test]
 async fn the_second_owner_takes_a_write_while_the_map_has_the_first_up() {
     let farm = Farm::start(2, ChainConfig::default()).await;

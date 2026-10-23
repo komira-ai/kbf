@@ -101,7 +101,7 @@ fn refusal(config: &PostgresConfig) -> String {
 /// database the version row is there, every table the store needs exists, a store opens on
 /// it and writes, and a second `apply` runs nothing.
 ///
-/// Mutants seen red: the schema_version INSERT left out (`current` says not initialised);
+/// Catches: the schema_version INSERT left out (`current` says not initialised);
 /// a table of migration 1 misnamed (the store's first statement fails).
 #[test]
 fn a_fresh_database_gets_the_schema_and_a_store_runs_on_it() {
@@ -127,7 +127,7 @@ fn a_fresh_database_gets_the_schema_and_a_store_runs_on_it() {
 /// Catches kbf creating tables itself: a store opened on a database with no schema must
 /// refuse with the one line that says what to run, and leave the database as it found it.
 ///
-/// Mutant seen red: `connect` made to run the old `CREATE SCHEMA IF NOT EXISTS` statements
+/// Catches: `connect` made to run the old `CREATE SCHEMA IF NOT EXISTS` statements
 /// (the open succeeded and the schema existed afterwards).
 #[test]
 fn a_store_does_not_create_the_schema_and_says_what_to_run() {
@@ -149,7 +149,7 @@ fn a_store_does_not_create_the_schema_and_says_what_to_run() {
 /// fail, new connections the pool opens afterwards must work, and a restart of child N on
 /// the migrated schema must start (the revert case). Child N+1 (1..=2) starts too.
 ///
-/// Mutant seen red: the expand rule removed from `check_conn` (the restart refuses). A
+/// Catches: the expand rule removed from `check_conn` (the restart refuses). A
 /// check on every new connection would not be caught here: with the expand rule it passes
 /// too, so only the first connection is judged, to save a query per connect.
 #[test]
@@ -210,7 +210,7 @@ fn migrating_to_n_plus_1_leaves_the_serving_n_child_working() {
 /// recorded as a contract step (what a later release would write); child N (1..=1) must
 /// refuse with one line naming both versions, and child N+1 (1..=2) must start.
 ///
-/// Mutant seen red: `TooNew` check removed (the store opened on a schema it cannot run).
+/// Catches: `TooNew` check removed (the store opened on a schema it cannot run).
 #[test]
 fn a_schema_changed_incompatibly_by_a_newer_release_is_refused() {
     let s = Scratch::new();
@@ -231,7 +231,7 @@ fn a_schema_changed_incompatibly_by_a_newer_release_is_refused() {
 /// Catches a child starting on a schema older than it needs (an update whose migration did
 /// not run): version 1 on a build that supports 2 to 2.
 ///
-/// Mutant seen red: `found < supported.min` comparison inverted.
+/// Catches: `found < supported.min` comparison inverted.
 #[test]
 fn a_schema_older_than_the_binary_needs_is_refused() {
     let s = Scratch::new();
@@ -251,7 +251,7 @@ fn a_schema_older_than_the_binary_needs_is_refused() {
 /// step is refused whole (nothing, not even an earlier pending expand step, is run), while
 /// the expand prefix of the same set applies when `upto` stops before it.
 ///
-/// Mutant seen red: the `ContractPending` check removed (the DROP ran and the column was
+/// Catches: the `ContractPending` check removed (the DROP ran and the column was
 /// gone).
 #[test]
 fn an_update_never_runs_a_contract_step_and_runs_nothing_when_one_is_pending() {
@@ -283,7 +283,7 @@ fn an_update_never_runs_a_contract_step_and_runs_nothing_when_one_is_pending() {
 /// Catches a migration that fails half way leaving half its work: the second statement of
 /// migration 2 fails, and neither its first statement nor a version row may remain.
 ///
-/// Mutant seen red: the BEGIN left out of `run_in_transaction` (`half` existed).
+/// Catches: the BEGIN left out of `run_in_transaction` (`half` existed).
 #[test]
 fn a_migration_that_fails_is_rolled_back_whole() {
     let s = Scratch::new();
@@ -361,7 +361,7 @@ fn numbering_gaps_are_refused_in_the_set_and_in_the_database() {
 /// Catches tables from before schemas were versioned (a U1 dev database) being adopted:
 /// the fresh-start ruling means migration 1 must fail, loudly, and record nothing.
 ///
-/// Mutant seen red: migration 1 written with `CREATE TABLE IF NOT EXISTS` (it "succeeded"
+/// Catches: migration 1 written with `CREATE TABLE IF NOT EXISTS` (it "succeeded"
 /// over the old tables).
 #[test]
 fn tables_from_before_the_schema_was_versioned_are_refused() {
@@ -387,7 +387,7 @@ fn tables_from_before_the_schema_was_versioned_are_refused() {
 /// four threads apply to one empty schema; all succeed, version 1 is recorded once, and
 /// exactly one of them ran it.
 ///
-/// Mutant seen red: the advisory lock removed (a thread failed on a duplicate key or on
+/// Catches: the advisory lock removed (a thread failed on a duplicate key or on
 /// `CREATE TABLE` already existing).
 #[test]
 fn installers_that_race_apply_a_migration_once() {
@@ -451,7 +451,7 @@ fn apply_in_thread(
 /// the lock held, a short wait ends in `Busy` after about the wait and creates nothing; a
 /// long wait stays blocked until the holder lets go and then runs; a third call is a no-op.
 ///
-/// Mutants seen red: the `SET LOCAL lock_timeout` left out (the short wait never ends: the
+/// Catches: the `SET LOCAL lock_timeout` left out (the short wait never ends: the
 /// 5 s receive times out); `Busy` mapped to a plain database error.
 #[test]
 fn a_migration_waits_for_the_schema_lock_for_as_long_as_it_is_told() {
@@ -492,7 +492,7 @@ fn a_migration_waits_for_the_schema_lock_for_as_long_as_it_is_told() {
 /// stall every query behind it. It must give up as `Busy`, roll back, and leave the schema
 /// at version 1 with the old child's read undisturbed.
 ///
-/// Mutant seen red: the lock timeout reset (`SET LOCAL lock_timeout = 0`) right after the
+/// Catches: the lock timeout reset (`SET LOCAL lock_timeout = 0`) right after the
 /// schema lock, so only the advisory wait was bounded: the `ALTER` waited past the 5 s.
 #[test]
 fn a_migration_gives_up_when_a_table_it_alters_is_in_use() {
@@ -531,7 +531,7 @@ fn a_migration_gives_up_when_a_table_it_alters_is_in_use() {
 /// error: a database that does not exist is refused with its SQLSTATE and not its name, in
 /// `apply`, in `current` and in `Debug`.
 ///
-/// Mutant seen red: `describe_refusal` returning the server's text.
+/// Catches: `describe_refusal` returning the server's text.
 #[test]
 fn a_refused_connection_does_not_name_the_database() {
     let s = Scratch::new();
@@ -556,7 +556,7 @@ fn a_refused_connection_does_not_name_the_database() {
 /// cannot be made in the system catalog) being reported as `Busy`, which would tell the
 /// swap to retry something that never will work. It is a plain database error.
 ///
-/// Mutant seen red: `Busy` returned for every error of the opening statements.
+/// Catches: `Busy` returned for every error of the opening statements.
 #[test]
 fn a_refusal_of_the_opening_statements_is_not_busy() {
     let s = Scratch::new();

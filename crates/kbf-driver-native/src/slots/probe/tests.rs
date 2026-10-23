@@ -51,6 +51,146 @@ fn the_services_of_a_domain_are_the_table_between_its_braces() {
     assert_eq!(listed_services(""), []);
 }
 
+/// Catches a clean that lists launchd's services (one print of the domain and one per
+/// service, 40 or so) when no process of the uid is alive: with live pids the list is
+/// read and the services judged (counted), with none nothing is listed or judged.
+#[test]
+fn no_service_is_listed_when_no_process_is_alive() {
+    let (listed, judged) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+    let own = |pids: &[i32]| {
+        own_among(
+            pids,
+            || {
+                listed.set(listed.get() + 1);
+                vec![(Some(7), "own.a".to_owned())]
+            },
+            |_, _| {
+                judged.set(judged.get() + 1);
+                true
+            },
+        )
+    };
+    assert_eq!(own(&[7]), [7]);
+    assert_eq!((listed.get(), judged.get()), (1, 1));
+    assert_eq!(own(&[]), Vec::<i32>::new());
+    assert_eq!((listed.get(), judged.get()), (1, 1));
+}
+
+/// Catches a clean that prints every service for its plist: only a service that runs one
+/// of the live pids is judged (not one with no process, nor one of another pid), and the
+/// result is the live pids whose service is judged launchd's own.
+#[test]
+fn only_the_services_running_a_live_pid_are_judged() {
+    let services = vec![
+        (Some(10), "own.a".to_owned()),
+        (Some(11), "lease.b".to_owned()),
+        (None, "own.idle".to_owned()),
+        (Some(99), "own.other".to_owned()),
+        (Some(12), "own.c".to_owned()),
+    ];
+    let mut asked = Vec::new();
+    let own = own_among(
+        &[10, 11, 12, 13],
+        || services,
+        |_, label| {
+            asked.push(label.to_owned());
+            label.starts_with("own.")
+        },
+    );
+    assert_eq!(own, [10, 12]);
+    assert_eq!(asked, ["own.a", "lease.b", "own.c"]);
+}
+
+/// Catches a clean that prints a service again for every scan of its kill loop and every
+/// look after it: a service (label and pid) is judged once, whatever the answer, and a
+/// new one is judged on its own; a new `OwnLabels` (the next clean) judges again. A print
+/// that told nothing counts as not own and is asked again, not kept (a timeout must not
+/// make a launchd agent a stray for the rest of the clean).
+#[test]
+fn a_clean_judges_each_service_once() {
+    let judged = OwnLabels::default();
+    let calls = std::cell::Cell::new(0);
+    let calls = &calls;
+    let judge = |answer: Option<bool>| {
+        move || {
+            calls.set(calls.get() + 1);
+            answer
+        }
+    };
+    for _ in 0..3 {
+        assert!(judged.is_own("own.a", Some(5), judge(Some(true))));
+        assert!(!judged.is_own("lease.b", None, judge(Some(false))));
+    }
+    assert_eq!(calls.get(), 2);
+    assert!(judged.is_own("own.c", Some(6), judge(Some(true))));
+    assert_eq!(calls.get(), 3);
+    assert!(!OwnLabels::default().is_own("own.a", Some(5), judge(Some(false))));
+    assert_eq!(calls.get(), 4);
+    for asked in 5..=7 {
+        assert!(!judged.is_own("slow.d", Some(8), judge(None)));
+        assert_eq!(calls.get(), asked);
+    }
+    assert!(judged.is_own("slow.d", Some(8), judge(Some(true))));
+    assert!(judged.is_own("slow.d", Some(8), judge(Some(false))));
+    assert_eq!(calls.get(), 8);
+}
+
+/// Catches a memo that keeps a label as launchd's own for the whole clean: the same label
+/// running another process (the job was registered again, from another plist) is
+/// judged again, and its answer is its own.
+#[test]
+fn the_same_label_under_another_process_is_judged_again() {
+    let judged = OwnLabels::default();
+    assert!(judged.is_own("com.apple.x", Some(10), || Some(true)));
+    assert!(!judged.is_own("com.apple.x", Some(11), || Some(false)));
+    assert!(judged.is_own("com.apple.x", Some(10), || Some(false)));
+    assert!(!judged.is_own("com.apple.x", Some(11), || Some(true)));
+}
+
+/// Catches a memo that stops answering once a thread panicked while holding it: the
+/// answers already kept are still given and new ones are kept.
+#[test]
+fn a_poisoned_memo_still_answers() {
+    let judged = OwnLabels::default();
+    assert!(judged.is_own("own.a", Some(1), || Some(true)));
+    std::thread::scope(|scope| {
+        let gone = scope.spawn(|| {
+            let _held = judged.known.lock().expect("not yet poisoned");
+            panic!("a thread died holding the memo");
+        });
+        assert!(gone.join().is_err());
+    });
+    assert!(judged.known.is_poisoned());
+    assert!(judged.is_own("own.a", Some(1), || Some(false)));
+    assert!(judged.is_own("own.b", Some(2), || Some(true)));
+}
+
+/// Catches an own list that is empty when the process table could not be read (launchd's
+/// own agents would then be sent SIGTERM at the end of a lease): a table read gives the
+/// pids found among its pids and lists nothing else; a failed read falls back to all
+/// the own services.
+#[test]
+fn a_failed_process_table_read_lists_all_the_own_services() {
+    let (among, all) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+    let own = |table: Result<Vec<i32>, ()>| {
+        own_of_uid(
+            table,
+            |pids| {
+                among.set(among.get() + 1);
+                pids.to_vec()
+            },
+            || {
+                all.set(all.get() + 1);
+                vec![3, 4]
+            },
+        )
+    };
+    assert_eq!(own(Ok(vec![1, 2])), [1, 2]);
+    assert_eq!((among.get(), all.get()), (1, 0));
+    assert_eq!(own(Err(())), [3, 4]);
+    assert_eq!((among.get(), all.get()), (1, 1));
+}
+
 /// Catches a shared sweep without `/Library/Caches` (a raw plant there by the uid survived
 /// the clean), one that still sweeps all of `/private/var/folders` (the other uids'
 /// entries are listed and searched), and one that lost a place or launchd's per-uid
@@ -179,12 +319,32 @@ fn the_kill_loop_is_bounded_by_scans_and_by_the_deadline() {
     let (result, kills, pauses) = run_loop(&stuck, 3, Ok(()));
     assert_eq!(result, Err("processes [7] survived SIGKILL".to_owned()));
     assert_eq!((kills, pauses), (4, 3));
-    // Out of time while quiet once: not quiet twice.
-    let (result, _, _) = run_loop(&[], 0, Ok(()));
+    // Out of time while quiet once, and not quiet at the one more scan: not quiet twice.
+    let (result, _, _) = run_loop(&[&[], &[8]], 0, Ok(()));
+    assert_eq!(result, Err("processes [8] survived SIGKILL".to_owned()));
+    // A uid that is quiet only every other scan never gets its pair: at the scan bound
+    // the last scan was empty, once.
+    let flapping: Vec<&[i32]> = (0..MAX_SCANS)
+        .map(|n| if n % 2 == 0 { &[7][..] } else { &[][..] })
+        .collect();
+    let (result, kills, _) = run_loop(&flapping, usize::MAX, Ok(()));
     assert_eq!(
         result,
         Err("the uid was not quiet for two scans".to_owned())
     );
+    assert_eq!(kills, MAX_SCANS);
+}
+
+/// Catches a kill loop that fails a uid which went quiet just as the deadline passed:
+/// the first scan finds a process, the second (after the deadline) finds none, and the
+/// one more scan the deadline allows finds none again, so the uid is quiet. The extra
+/// scan is the only one: a process found at it fails the loop, with no third.
+#[test]
+fn a_deadline_that_passes_after_one_quiet_scan_allows_one_more_scan() {
+    assert_eq!(run_loop(&[&[5]], 1, Ok(())), (Ok(()), 3, 2));
+    let (result, kills, _) = run_loop(&[&[5], &[], &[9], &[9]], 1, Ok(()));
+    assert_eq!(result, Err("processes [9] survived SIGKILL".to_owned()));
+    assert_eq!(kills, 3);
 }
 
 /// Catches a kill that fails and is ignored (the scans would then judge a live uid) and a

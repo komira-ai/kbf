@@ -260,7 +260,7 @@ mod tests {
     }
 
     /// Catches a storage half's start that can succeed on a later try but exits 2, which
-    /// `RestartPreventExitStatus=2` never restarts (mutant: `Failed::code` answering 2
+    /// `RestartPreventExitStatus=2` never restarts (defects: `Failed::code` answering 2
     /// for every `Server`): a log directory the stopping process still holds, and a boot
     /// the frontend's restored state store handed out again (`StaleWriter`) exit 75, and
     /// a refusal that no restart clears (a log that is not one) still exits 2.
@@ -284,7 +284,7 @@ mod tests {
     /// Catches a StaleWriter start that does not say why it keeps restarting (it would read
     /// as an ordinary crash loop), and a hint printed for a failure it does not fit: the
     /// stale start's stderr is its error and then the restored-state-store line, a refusal's
-    /// its error alone. Mutant: `Failed::text` without the hint line.
+    /// its error alone. Catches: `Failed::text` without the hint line.
     #[test]
     fn a_stale_start_says_the_state_store_is_older_and_a_refusal_only_itself() {
         let stale = kbf_meta::StaleWriter {
@@ -302,7 +302,7 @@ mod tests {
     /// Catches the order of a stop (the defect of kbf#1087's restart drill): the half beside
     /// the daemon stopped before the daemon half had drained, so a running action lost the
     /// storage it reads and writes through. `stop` must fire only after the drain
-    /// returned. Mutant: `drain_then_stop` sending `stop` before it calls `drain`.
+    /// returned. Catches: `drain_then_stop` sending `stop` before it calls `drain`.
     #[test]
     fn the_half_beside_the_daemon_stops_only_after_the_drain() {
         let tokio = Runtime::new().expect("runtime");
@@ -456,7 +456,7 @@ mod tests {
     /// half beside it fails after a moment, and the daemon half stops at once and the
     /// failure is reported as the half's (`the storage half stopped`, not a clean exit).
     /// The call runs on a thread the test waits on for 30 s, so a daemon that serves on
-    /// fails here instead of hanging the run. Mutant: `other_ended` never awaited.
+    /// fails here instead of hanging the run. Catches: `other_ended` never awaited.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_half_that_stops_on_its_own_stops_the_daemon_half_and_is_reported() {

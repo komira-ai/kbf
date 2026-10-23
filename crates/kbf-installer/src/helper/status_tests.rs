@@ -1,6 +1,6 @@
 //! `status.json` as the helper writes it: the golden bytes of the writer, and the node's reader
 //! reading them. (The frontend proxy's reader is tested beside the proxy, on the same writer.)
-//! What each test proves is named on it, with the mutant to plant to turn it red.
+//! What each test proves is named on it, with the defect it catches.
 
 use std::fs;
 
@@ -50,7 +50,7 @@ fn described() -> (State, Memory) {
 /// Catches a key of `status.json` changed without the readers being looked at: the node's
 /// reader, the proxy's and this file all name the keys.
 ///
-/// Mutants to plant: `available` written before `release_source`; either key written as `null`
+/// Catches: `available` written before `release_source`; either key written as `null`
 /// when it is absent (the second test); `seq` written as text.
 #[test]
 fn the_golden_status_is_what_the_writer_writes() {
@@ -66,7 +66,7 @@ fn the_golden_status_is_what_the_writer_writes() {
 /// Catches a writer and a reader that disagree on a key (the node would then report nothing of
 /// the package to the frontend, silently), which the golden file alone cannot see.
 ///
-/// Mutants to plant: the reader's `available` or `release_source` field renamed; the writer's
+/// Catches: the reader's `available` or `release_source` field renamed; the writer's
 /// key renamed.
 #[test]
 fn the_node_reads_what_the_writer_writes() {
@@ -102,7 +102,7 @@ fn the_node_reads_what_the_writer_writes() {
 /// Catches a key written as `null` (a reader that treats a present key as a word would read a
 /// source called "null").
 ///
-/// Mutant to plant: the `skip_serializing_if` of either key removed.
+/// Catches: the `skip_serializing_if` of either key removed.
 #[test]
 fn a_status_with_no_seed_and_no_source_carries_neither_key() {
     let bytes = render(&State::default(), &Memory::default());
@@ -121,7 +121,7 @@ fn a_status_with_no_seed_and_no_source_carries_neither_key() {
 /// attribute a refusal, and an update whose order was refused would wait out its staging
 /// deadline), and a key written as `null`.
 ///
-/// Mutants to plant: the key renamed in the writer; its `skip_serializing_if` removed.
+/// Catches: the key renamed in the writer; its `skip_serializing_if` removed.
 #[test]
 fn the_order_a_refusal_answers_is_told_while_there_is_one_and_read_by_every_reader() {
     use crate::proxy::api::traits::{JsonFileStatus, StatusReader};

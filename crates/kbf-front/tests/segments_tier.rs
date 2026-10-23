@@ -517,7 +517,7 @@ async fn a_segment_the_tier_does_not_take_is_hashed_before_its_put() {
 }
 
 /// Catches a large record held whole in memory when the write tier has no room for it
-/// (mutant: the whole-body fallback kept for it), or refused for its size (mutant: the
+/// (defect: the whole-body fallback kept for it), or refused for its size (defect: the
 /// refusal restored): at the tier's budget, a `Begin` declaring a record one byte over
 /// `MAX_UNSTAGED_BLOB_BYTES` is answered FAILED_PRECONDITION, at which the client sends
 /// it by ByteStream; one declaring records of at most that size is admitted (held in

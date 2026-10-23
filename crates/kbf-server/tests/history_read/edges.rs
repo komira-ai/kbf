@@ -122,7 +122,7 @@ async fn a_header_of_another_id_or_with_no_chunk_is_no_record() {
     b.stop().await;
 }
 
-/// Catches (mutant "the records are not checked against the names"): an instance added
+/// Catches (defect "the records are not checked against the names"): an instance added
 /// after the header was read for the summary and before the records were, served to a
 /// caller who was never asked about it. The records are read under the same check as the
 /// summary, and the request answers `503`.

@@ -66,7 +66,7 @@ fn idle(members: &[MemberReport], node: u64, generation: u64) -> Vec<NotIdle> {
 
 // Catches: a node that is not idle called idle, and one that is called busy. A farm of
 // three quiet members is idle at the map the node held; each change below is one reason.
-// Mutants (planted locally): `Unknown` writes read as zero; the node's own debts left out of
+// Catches: `Unknown` writes read as zero; the node's own debts left out of
 // the total; the generation not compared.
 #[test]
 fn a_quiet_node_in_a_quiet_farm_is_idle_and_each_unknown_or_busy_value_is_a_reason() {
@@ -526,7 +526,7 @@ fn quiet_report(generation: u64) -> Reported {
 // Catches: the heartbeat's counts not reaching the judgement, and the gate not following
 // them. Writes open on a: it is not idle; they end: it is. Debts count up and down: a's two
 // copies owed show per node and in the total, b's one adds to it, and settling brings each
-// back. Mutants: the writes read from the wrong field; the debts summed without the node's
+// back. Catches: the writes read from the wrong field; the debts summed without the node's
 // own.
 #[test]
 fn open_writes_and_repair_debt_count_up_and_down() {
@@ -727,7 +727,7 @@ fn a_node_planned_down_is_judged_by_its_report_and_another_one_holds_the_rest() 
 
 // Catches an off-by-one in the end of a plan, for the view and for the beat that ends it
 // (both ask `Planned::in_force`): a plan is in force one nanosecond before its end and not at
-// it; a stopped member's plan is in force (the mark holds it); none is never. Mutants: `<=`
+// it; a stopped member's plan is in force (the mark holds it); none is never. Catches: `<=`
 // for `<`.
 #[test]
 fn a_plan_is_in_force_until_its_end_and_not_at_it() {
@@ -744,7 +744,7 @@ fn a_plan_is_in_force_until_its_end_and_not_at_it() {
 // Catches a report written for a member by a caller that does not hold it (#978's holder
 // check runs before the row is rewritten): a node cannot say another node has no open writes
 // and owes nothing, which would let a rollout stop that node. The refused report leaves the
-// debts and the writes unknown; the holder's own is taken. Mutant: the report written before
+// debts and the writes unknown; the holder's own is taken. Catches: the report written before
 // the holder is asked.
 #[test]
 fn a_caller_that_does_not_hold_the_member_cannot_report_for_it() {

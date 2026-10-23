@@ -21,7 +21,7 @@ fn mentions_backup(exec: &FakeExec) -> Vec<String> {
 /// directory go, then systemd reloads; a second run on the result plans none of it, and a host
 /// that never had the backup gets no `kbf-backup` step at all.
 ///
-/// Mutants to plant: the `disable` left out (red: no disable); the reload left out (red:
+/// Catches: the `disable` left out (red: no disable); the reload left out (red:
 /// no reload); the directory left out (red: the directory stays); the removal made
 /// unconditional (red: steps on the clean host).
 #[test]
@@ -81,7 +81,7 @@ fn a_host_set_up_with_the_backup_timer_loses_the_timer_and_its_dropin() {
 
 /// Catches a fresh host getting backup steps or a reload it does not need.
 ///
-/// Mutant to plant: the removal made unconditional (red: a step names kbf-backup).
+/// Catches: the removal made unconditional (red: a step names kbf-backup).
 #[test]
 fn a_host_that_never_had_the_backup_timer_gets_no_step_for_it() {
     let mut exec = released(host(), Platform::Linux);

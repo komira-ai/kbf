@@ -1,0 +1,10 @@
++-o AGXAcceleratorG15X  <class AGXAcceleratorG15X, id 0x100000a1c, registered, matched, active, busy 0 (0 ms), retain 28>
+    {
+      "IOClass" = "AGXAcceleratorG15X"
+      "IOProviderClass" = "AGXAccelerator"
+      "model" = "Apple M3 Ultra"
+      "gpu-core-count" = 80
+      "MetalPluginName" = "AGXMetalG15X"
+      "IOPersonalityPublisher" = "com.apple.AGX"
+    }
+

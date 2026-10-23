@@ -201,7 +201,7 @@ fn a_frontend_is_started_on_its_slots_ports_and_a_candidate_awaits_the_takeover(
 /// given to a host that has none: with a file named, every slot and start carries `--config=`
 /// once and is otherwise the command line without it; with none, no word starts `--config`.
 ///
-/// Mutants to plant: the `--config` word dropped (red: none carries it); the word pushed
+/// Catches: the `--config` word dropped (red: none carries it); the word pushed
 /// whatever `config_file` is (red: the plain command line has it).
 #[test]
 fn the_frontend_children_read_the_file_installer_toml_names_and_no_other() {
@@ -984,7 +984,7 @@ mod migration {
     /// there; for the installed one it runs the release's own program (here a stand-in that
     /// refuses `--version`), which is `schema_unknown`. No part of the URL is in either.
     ///
-    /// Mutants seen red: `host_migrator` returning a hook that migrates nothing (both `Ok`);
+    /// Catches: `host_migrator` returning a hook that migrates nothing (both `Ok`);
     /// the installed probe not given (`not_staged`).
     #[test]
     fn the_verbs_migrator_asks_the_database_and_the_release() {
@@ -1016,7 +1016,7 @@ mod migration {
     /// is started or recorded, the child's admin port is never asked, the streams stay held, and
     /// the operator gets a fix. Neither the held reason nor the log carries the URL.
     ///
-    /// Mutants seen red: the refusal ignored by the boot (a process was recorded); the fix of
+    /// Catches: the refusal ignored by the boot (a process was recorded); the fix of
     /// `migration-failed` removed.
     #[test]
     fn a_refused_migration_holds_with_its_reason_and_starts_nothing() {
@@ -1080,7 +1080,7 @@ mod migration {
     /// installed release asks its own binary for its schema, the migration runs with it and the
     /// bound, and at that moment no process is recorded; afterwards the release runs and serves.
     ///
-    /// Mutants seen red: the migrator called after `spawn` (a process was already recorded);
+    /// Catches: the migrator called after `spawn` (a process was already recorded);
     /// the schema taken from the installer's newest instead of the release's.
     #[test]
     fn the_installed_release_is_migrated_for_its_own_schema_before_it_is_spawned() {
@@ -1122,7 +1122,7 @@ mod migration {
         /// database is created for this test alone, so no other test process shares its schema.
         /// No part of the URL is in anything the log is given.
         ///
-        /// Mutants seen red: the hook migrating nothing (no schema; kbf's open refused);
+        /// Catches: the hook migrating nothing (no schema; kbf's open refused);
         /// the `schema_version` row written again on the second start (the row changed).
         #[test]
         fn a_cold_start_creates_the_schema_on_a_fresh_database_and_the_next_changes_nothing() {

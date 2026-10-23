@@ -282,6 +282,7 @@ const fn resources(r: &Resources) -> proto::Resources {
         memory_bytes: r.memory_bytes,
         gpus: r.gpus,
         vms: r.vms,
+        leases: r.leases,
     }
 }
 
@@ -530,6 +531,7 @@ fn from_resources(
         memory_bytes: r.memory_bytes,
         gpus: r.gpus,
         vms: r.vms,
+        leases: r.leases,
     })
 }
 
