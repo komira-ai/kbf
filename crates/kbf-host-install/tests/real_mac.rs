@@ -10,6 +10,14 @@
 //! it): the files under `tests/fixtures/mac` are those outputs, and the ordinary unit tests
 //! read them.
 //!
+//! One of them (`a_real_release_is_fetched_as_nobody_and_verified`) goes to GitHub: it lists
+//! the repository's releases with the pinned-style `gh` as `nobody`, fetches the newest
+//! release that has a darwin tarball through the same code the install uses, and runs the real
+//! `gh attestation verify` on it with the production bindings, offline. The workflow leaves a
+//! token for the API in `/private/var/tmp/kbf-real-fetch-token`; the test gets the Sigstore
+//! trusted root from `gh` and, for the case that no release has been published yet, the
+//! newest attested build of `main`.
+//!
 //! Each test captures first and asserts after, so a parser that does not read the real
 //! output still leaves the output to look at.
 
@@ -22,7 +30,11 @@ use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use kbf_host_install::mac_tools::{Cmd, Exec, Identity, Runner, SystemRunner, tools};
+use kbf_host_install::mac_tools::{
+    Cmd, Exec, Identity, Runner, SystemRunner,
+    fetch::{FetchError, Fetcher, Limits, MAX_PAGES},
+    release, tools,
+};
 use kbf_testkit::dir::TestDir;
 
 const LIMIT: Duration = Duration::from_secs(30);
@@ -491,4 +503,288 @@ fn print_of_the_systems_own_services_is_read_at_the_top_level() {
     capture("print_nested_blocks", &exec);
     assert!(listed > 20, "{listed} listed");
     assert!(depth > 0, "no listing has a nested block");
+}
+
+// ---- the fetch from GitHub, and the real attestation check ----
+
+/// Where the workflow left a token for the GitHub API (the sudo that runs these tests clears
+/// the environment).
+const TOKEN_FILE: &str = "/private/var/tmp/kbf-real-fetch-token";
+
+/// `gh` as root, with the workflow's token and a home of its own.
+fn root_gh(gh: &Path, home: &Path, token: &str, args: &[&str]) -> Exec {
+    let exec = run(&Cmd {
+        program: gh.display().to_string(),
+        args: args.iter().map(|a| (*a).to_owned()).collect(),
+        timeout: Some(Duration::from_secs(300)),
+        env: vec![
+            ("HOME".to_owned(), home.display().to_string()),
+            ("GH_CONFIG_DIR".to_owned(), home.display().to_string()),
+            ("GH_TOKEN".to_owned(), token.to_owned()),
+            ("GH_NO_UPDATE_NOTIFIER".to_owned(), "1".to_owned()),
+        ],
+        ..Cmd::default()
+    });
+    assert!(
+        exec.success(),
+        "gh {}: {}",
+        args.join(" "),
+        exec.stderr_text()
+    );
+    exec
+}
+
+fn real_gh() -> PathBuf {
+    ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.exists())
+        .expect("the runner has gh")
+}
+
+/// A directory `nobody` can pass through, with files it can read.
+fn readable(dir: &Path) {
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn attest<'a>(
+    gh: &'a Path,
+    tarball: &'a Path,
+    bundle: &'a Path,
+    root: &'a Path,
+    commit: &'a str,
+    who: Identity,
+    home: &'a Path,
+) -> tools::Attest<'a> {
+    tools::Attest {
+        gh,
+        tarball,
+        bundle,
+        trusted_root: root,
+        repo: release::REPO,
+        workflow: "komira-ai/kbf/.github/workflows/artifacts.yml",
+        source_ref: "refs/heads/main",
+        commit,
+        who,
+        home,
+    }
+}
+
+/// The darwin tarballs `releases` (a page of the listing) name, newest first.
+fn darwin_commits(page: &serde_json::Value) -> Vec<String> {
+    page.as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|release| release["assets"].as_array().into_iter().flatten())
+        .filter_map(|asset| asset["name"].as_str())
+        .filter_map(release::commit_of_name)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The code the install uses lists the repository's releases as `nobody` and fetches the
+/// newest one that has a darwin tarball, picked by the first 12 digits of its commit; the
+/// real `gh attestation verify` accepts the fetched tarball with the production bindings,
+/// offline and as `nobody`, and refuses it for another commit, another signer workflow, and
+/// a tarball that is not the attested one. When the repository has published no darwin
+/// release yet, the listing must be empty, the fetch must say unknown, and the same
+/// verification runs on the newest attested build of `main` (its workflow artifact); the
+/// capture `fetch_mode` says which of the two happened.
+#[test]
+#[ignore = "needs a Mac, root and the network: cargo xtask sudo-test"]
+fn a_real_release_is_fetched_as_nobody_and_verified() {
+    assert_root();
+    let token = fs::read_to_string(TOKEN_FILE).unwrap();
+    let token = token.trim();
+    let gh = real_gh();
+    let ids = tools::parse_ids(&run(&tools::dscl_ids("nobody", LIMIT)).stdout_text()).unwrap();
+
+    let dir = TestDir::under("/private/var/tmp", "kbf-real-fetch-run");
+    readable(&dir);
+    let home = dir.join("home");
+    let scratch = dir.join("fetch");
+    for sub in [&home, &scratch] {
+        fs::create_dir(sub).unwrap();
+        fs::set_permissions(sub, fs::Permissions::from_mode(0o700)).unwrap();
+        rustix::fs::chown(
+            sub,
+            Some(rustix::fs::Uid::from_raw(ids.uid)),
+            Some(rustix::fs::Gid::from_raw(ids.gid)),
+        )
+        .unwrap();
+    }
+    // The Sigstore trusted root, as the installer package carries one.
+    let root_home = dir.join("root-home");
+    fs::create_dir(&root_home).unwrap();
+    let root_copy = dir.join("trusted_root.jsonl");
+    let trusted = root_gh(&gh, &root_home, token, &["attestation", "trusted-root"]);
+    fs::write(&root_copy, &trusted.stdout).unwrap();
+    fs::set_permissions(&root_copy, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let fetcher = Fetcher {
+        runner: &SystemRunner,
+        gh: &gh,
+        who: ids,
+        home: &home,
+        token: Some(token),
+        limits: Limits {
+            tool: LIMIT,
+            download: Duration::from_secs(600),
+            tarball_max: 512 * 1024 * 1024,
+            bundle_max: 256 * 1024,
+        },
+    };
+
+    // The newest release with a darwin tarball, from the real listing.
+    let mut newest = None;
+    for page in 1..=MAX_PAGES {
+        let exec = run(&fetcher.list_cmd(page));
+        if page == 1 {
+            capture("releases_page1", &exec);
+        }
+        assert!(exec.success(), "gh api: {}", exec.stderr_text());
+        let listing: serde_json::Value = serde_json::from_slice(&exec.stdout).unwrap();
+        newest = darwin_commits(&listing).into_iter().next();
+        let count = listing.as_array().map_or(0, Vec::len);
+        if newest.is_some() || count < 100 {
+            break;
+        }
+    }
+
+    let (tarball, bundle, commit) = if let Some(commit) = newest {
+        fs::create_dir_all(out_dir()).unwrap();
+        fs::write(out_dir().join("fetch_mode"), "release\n").unwrap();
+        let prefix = &commit[..release::PREFIX_LEN];
+        let fetched = fetcher.fetch(prefix, &scratch).expect("the fetch");
+        assert_eq!(fetched, commit);
+        let tarball = dir.join(release::tarball_name(&commit));
+        let bundle = dir.join(release::bundle_name(&commit));
+        for (from, to) in [
+            (scratch.join(release::tarball_name(&commit)), &tarball),
+            (scratch.join(release::bundle_name(&commit)), &bundle),
+        ] {
+            fs::copy(from, to).unwrap();
+            fs::set_permissions(to, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        println!(
+            "fetched release commit {commit} (found by its first {} digits)",
+            release::PREFIX_LEN
+        );
+        (tarball, bundle, commit)
+    } else {
+        fs::create_dir_all(out_dir()).unwrap();
+        fs::write(out_dir().join("fetch_mode"), "no-release\n").unwrap();
+        // The real listing has no darwin release: the fetch says so.
+        assert_eq!(
+            fetcher.fetch("000000000000", &scratch),
+            Err(FetchError::Unknown)
+        );
+        println!(
+            "no published darwin release: the real listing holds none; verifying the newest attested build of main instead"
+        );
+        let listing = root_gh(
+            &gh,
+            &root_home,
+            token,
+            &[
+                "run",
+                "list",
+                "-R",
+                release::REPO,
+                "--workflow",
+                "artifacts.yml",
+                "--branch",
+                "main",
+                "--event",
+                "push",
+                "--status",
+                "success",
+                "--limit",
+                "1",
+                "--json",
+                "databaseId",
+                "--jq",
+                ".[0].databaseId",
+            ],
+        );
+        let run_id = listing.stdout_text().trim().to_owned();
+        assert!(!run_id.is_empty(), "no successful artifacts run on main");
+        let art = dir.join("art");
+        root_gh(
+            &gh,
+            &root_home,
+            token,
+            &[
+                "run",
+                "download",
+                &run_id,
+                "-R",
+                release::REPO,
+                "-n",
+                "assets-darwin-arm64",
+                "-n",
+                "bundles-darwin-arm64",
+                "-D",
+                &art.display().to_string(),
+            ],
+        );
+        println!("the newest attested build of main: run {run_id}");
+        let tarball = fs::read_dir(art.join("assets-darwin-arm64"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(release::commit_of_name)
+                    .is_some()
+            })
+            .expect("the artifacts hold a darwin tarball");
+        let commit = release::commit_of_name(tarball.file_name().unwrap().to_str().unwrap())
+            .unwrap()
+            .to_owned();
+        let bundle_from = art
+            .join("bundles-darwin-arm64")
+            .join(release::bundle_name(&commit));
+        let (t, b) = (
+            dir.join(release::tarball_name(&commit)),
+            dir.join(release::bundle_name(&commit)),
+        );
+        for (from, to) in [(&tarball, &t), (&bundle_from, &b)] {
+            fs::copy(from, to).unwrap();
+            fs::set_permissions(to, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        (t, b, commit)
+    };
+
+    // The production check, for real.
+    let good = attest(&gh, &tarball, &bundle, &root_copy, &commit, ids, &home);
+    let verified = run(&good.cmd(LIMIT));
+    capture("attestation_verify", &verified);
+    assert!(
+        verified.success(),
+        "gh attestation verify: {:?} {}",
+        verified.code,
+        verified.stderr_text()
+    );
+
+    // The same check refuses what it must.
+    let other = "0".repeat(40);
+    let wrong_commit =
+        run(&attest(&gh, &tarball, &bundle, &root_copy, &other, ids, &home).cmd(LIMIT));
+    capture("attestation_verify_other_commit", &wrong_commit);
+    assert!(!wrong_commit.success(), "another commit was accepted");
+    let mut wrong_workflow = attest(&gh, &tarball, &bundle, &root_copy, &commit, ids, &home);
+    wrong_workflow.workflow = "komira-ai/kbf/.github/workflows/ci.yml";
+    let refused = run(&wrong_workflow.cmd(LIMIT));
+    capture("attestation_verify_other_workflow", &refused);
+    assert!(!refused.success(), "another workflow was accepted");
+    let changed = dir.join("changed.tar.gz");
+    let mut bytes = fs::read(&tarball).unwrap();
+    bytes.push(0);
+    fs::write(&changed, bytes).unwrap();
+    fs::set_permissions(&changed, fs::Permissions::from_mode(0o644)).unwrap();
+    let tampered = run(&attest(&gh, &changed, &bundle, &root_copy, &commit, ids, &home).cmd(LIMIT));
+    capture("attestation_verify_changed_tarball", &tampered);
+    assert!(!tampered.success(), "a changed tarball was accepted");
 }

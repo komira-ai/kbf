@@ -1,7 +1,7 @@
 //! A Mac under a scratch directory, and a runner that plays its tools.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -339,6 +339,10 @@ pub struct Sim {
     /// The answer to `sudo`.
     pub sudo: RefCell<Option<io::Result<Exec>>>,
     pub before: RefCell<Option<Hook>>,
+    /// GitHub: the pages of the releases listing (the JSON `gh api` prints, one text per
+    /// page), and the files each release (by tag) has, by asset name.
+    pub pages: RefCell<Vec<String>>,
+    pub assets: RefCell<BTreeMap<String, BTreeMap<String, Vec<u8>>>>,
     pub on_daemon_bootstrap: RefCell<Option<Box<dyn Fn()>>>,
     pub daemon_bootstraps: Cell<u32>,
     pub daemon_bootouts: Cell<u32>,
@@ -371,6 +375,8 @@ impl Sim {
             nobody_ids: Cell::new(None),
             sudo: RefCell::new(None),
             before: RefCell::new(None),
+            pages: RefCell::default(),
+            assets: RefCell::default(),
             on_daemon_bootstrap: RefCell::new(None),
             daemon_bootstraps: Cell::new(0),
             daemon_bootouts: Cell::new(0),
@@ -504,6 +510,74 @@ impl Sim {
     }
 }
 
+impl Sim {
+    /// `gh api repos/<repo>/releases?per_page=N&page=P`: page P of the scripted listing, an
+    /// empty one past the last.
+    fn gh_api(&self, cmd: &Cmd) -> io::Result<Exec> {
+        if self.is_broken("list-timeout") {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "ran past its limit",
+            ));
+        }
+        if self.is_broken("list-net") {
+            return exec(1, "", "error connecting to api.github.com");
+        }
+        if self.is_broken("list-junk") {
+            return exec(0, "<html>not json</html>", "");
+        }
+        let page: usize = cmd.args[1]
+            .rsplit("page=")
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("a page number");
+        let pages = self.pages.borrow();
+        exec(0, pages.get(page - 1).map_or("[]", String::as_str), "")
+    }
+
+    /// `gh release download <tag> --repo R --pattern A --pattern B --dir D`: writes the
+    /// release's files that match into D.
+    fn gh_download(&self, cmd: &Cmd) -> io::Result<Exec> {
+        let args = &cmd.args;
+        let tag = &args[2];
+        let value_of = |flag: &str| {
+            args.windows(2)
+                .filter(|w| w[0] == flag)
+                .map(|w| w[1].clone())
+                .collect::<Vec<_>>()
+        };
+        let dir = PathBuf::from(&value_of("--dir")[0]);
+        if self.is_broken("download-net") {
+            return exec(1, "", "error connecting to api.github.com");
+        }
+        let assets = self.assets.borrow();
+        let Some(files) = assets.get(tag) else {
+            return exec(1, "", "release not found");
+        };
+        for name in value_of("--pattern") {
+            let Some(bytes) = files.get(&name) else {
+                return exec(1, "", &format!("no assets match {name}"));
+            };
+            let mut bytes = bytes.clone();
+            if self.is_broken("download-big") && !name.ends_with(".sigstore.json") {
+                bytes.resize(self.host.tuning.tarball_max as usize + 1, 0);
+            }
+            if self.is_broken("download-big-bundle") && name.ends_with(".sigstore.json") {
+                bytes.resize(self.host.tuning.bundle_max as usize + 1, 0);
+            }
+            write(&dir.join(&name), 0o644, &bytes);
+        }
+        if self.is_broken("download-timeout") {
+            // A real runner kills the command at its limit; what it wrote stays.
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "ran past its limit",
+            ));
+        }
+        exec(0, "", "")
+    }
+}
+
 impl Runner for Sim {
     fn run(&self, cmd: &Cmd) -> io::Result<Exec> {
         if let Some(hook) = &*self.before.borrow() {
@@ -588,6 +662,12 @@ impl Runner for Sim {
                 .borrow_mut()
                 .take()
                 .unwrap_or_else(|| Err(io::Error::other("no sudo reply"))),
+            program if Path::new(program) == self.host.gh && first == Some("api") => {
+                self.gh_api(cmd)
+            }
+            program if Path::new(program) == self.host.gh && first == Some("release") => {
+                self.gh_download(cmd)
+            }
             program if Path::new(program) == self.host.gh => {
                 let former = args.iter().any(|a| a.contains("komira-build-farm"));
                 if self.is_broken("gh") || (self.is_broken("gh-current") && !former) {

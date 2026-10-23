@@ -31,11 +31,19 @@ pub enum Refusal {
     /// The source switches signature checking off or weakens it (`trusted`,
     /// `allow-insecure`, `allow-weak`, `allow-downgrade-to-insecure`), even if it names a key.
     ChannelInsecure,
+    /// A Mac's `github` channel: no release asset of the repository starts with the version's
+    /// 12 hex digits.
+    UnknownRelease,
+    /// A Mac's `github` channel: the assets of two different commits start with them.
+    AmbiguousRelease,
+    /// A Mac's `github` channel: the release could not be fetched (the network, a time limit,
+    /// a file over its size limit, an answer that is not a listing). Nothing was staged.
+    FetchFailed,
 }
 
 impl Refusal {
     /// Every refusal.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 10] = [
         Self::BadCommand,
         Self::ChannelNotAllowed,
         Self::ConfigInvalid,
@@ -43,6 +51,9 @@ impl Refusal {
         Self::ChannelUnsigned,
         Self::KeyUntrusted,
         Self::ChannelInsecure,
+        Self::UnknownRelease,
+        Self::AmbiguousRelease,
+        Self::FetchFailed,
     ];
 
     /// The refusal whose closed code this is.
@@ -60,6 +71,9 @@ impl Refusal {
             Self::ChannelUnsigned => "channel_unsigned",
             Self::KeyUntrusted => "key_untrusted",
             Self::ChannelInsecure => "channel_insecure",
+            Self::UnknownRelease => "unknown_release",
+            Self::AmbiguousRelease => "ambiguous_release",
+            Self::FetchFailed => "fetch_failed",
         }
     }
 }

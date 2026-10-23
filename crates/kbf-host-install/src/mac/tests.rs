@@ -4,6 +4,7 @@
 mod apply_tests;
 mod dispatch;
 mod fx;
+mod github_tests;
 mod install;
 mod pure;
 mod query;

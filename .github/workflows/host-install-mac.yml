@@ -7,8 +7,9 @@
 #
 # Every raw output is uploaded as an artifact (`gh run download`). The files under
 # crates/kbf-host-install/tests/fixtures/mac are those outputs, committed, and the crate's
-# ordinary unit tests read them. It runs on a pull request that touches the crate, by hand,
-# and on a push to main.
+# ordinary unit tests read them. One test also goes to GitHub: it fetches a published
+# release through the install's own code and runs the real `gh attestation verify` on it.
+# It runs on a pull request that touches the crate, by hand, and on a push to main.
 name: host-install-mac
 
 on:
@@ -38,59 +39,25 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: rustup toolchain install
       - run: sw_vers
+      # The fetch test goes to GitHub as root, and sudo clears the environment: it reads the
+      # workflow's own read-only token from this file.
+      - name: Token of the fetch test
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" > /private/var/tmp/kbf-real-fetch-token
       # The real tests, as root (they bootstrap launchd jobs and drop privileges); the
       # crate's own unit tests run in ci.yml.
-      - run: cargo xtask sudo-test -p kbf-host-install --test real_mac
+      - run: cargo xtask sudo-test -p kbf-host-install --test real_mac -- --nocapture
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
           name: host-install-mac-raw-output
           path: target/real-mac
           if-no-files-found: error
-
-  fetch-probe:
-    runs-on: macos-15
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      actions: read
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: Real inputs
-        run: |
-          set -e
-          id=$(gh run list -R komira-ai/kbf --workflow artifacts.yml --branch main --event push --status success --limit 1 --json databaseId --jq '.[0].databaseId')
-          echo "artifacts run $id"
-          gh run download "$id" -R komira-ai/kbf -n assets-darwin-arm64 -n bundles-darwin-arm64 -D "$RUNNER_TEMP/art"
-          ls "$RUNNER_TEMP/art" | head -40
-          gh attestation trusted-root > "$RUNNER_TEMP/trusted_root.jsonl"
-          wc -c "$RUNNER_TEMP/trusted_root.jsonl"
-          gh --version
-        shell: bash
-      - name: With no credentials
-        env:
-          GH_TOKEN: ""
-        run: |
-          set +e
-          H="$RUNNER_TEMP/probe-home"; mkdir -p "$H"
-          run() { echo "--- $*"; env -i HOME="$H" GH_CONFIG_DIR="$H" PATH=/usr/bin:/bin:/opt/homebrew/bin GH_NO_UPDATE_NOTIFIER=1 "$@" 2>&1 | head -c 700; echo "exit=${PIPESTATUS[0]}"; }
-          run gh release list -R komira-ai/kbf
-          run gh release view v2.50.0 -R cli/cli --json assets
-          run gh api -X GET repos/cli/cli/releases/tags/v2.50.0 --jq .id
-          run gh repo view cli/cli
-          T=$(ls "$RUNNER_TEMP"/art/assets-darwin-arm64/kbf-????????????????????????????????????????-darwin-arm64.tar.gz | head -1)
-          C=$(basename "$T" | sed 's/^kbf-//; s/-darwin-arm64.tar.gz$//')
-          echo "tarball $T commit $C"
-          for P in http://127.0.0.1:9; do
-            run env HTTPS_PROXY=$P https_proxy=$P HTTP_PROXY=$P http_proxy=$P ALL_PROXY=$P all_proxy=$P gh attestation verify "$T" --bundle "$RUNNER_TEMP/art/bundles-darwin-arm64/$(basename "$T").sigstore.json" --custom-trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --repo komira-ai/kbf --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml --cert-oidc-issuer https://token.actions.githubusercontent.com --source-ref refs/heads/main --source-digest "$C" --predicate-type https://slsa.dev/provenance/v1 --digest-alg sha256 --deny-self-hosted-runners
-          done
-          echo "--- with a token, the listing"
-          GH_TOKEN="${{ github.token }}" gh api 'repos/komira-ai/kbf/releases?per_page=2' | head -c 300
-        shell: bash

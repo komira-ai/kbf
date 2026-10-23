@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::fx::{Fx, NEW, NEW_VERSION, OLD, OLD_VERSION, mkdir, write};
-use crate::mac::channel::{DEFAULT_SOURCE_REF, MacAllowlist, is_branch_ref};
+use crate::mac::channel::{DEFAULT_SOURCE_REF, MacAllowlist, Source, is_branch_ref};
 use crate::mac::conf::{node_id, parse_node_id};
 use crate::mac::kit::{self, Links};
 use crate::mac::release::{
@@ -469,7 +469,7 @@ fn a_channel_names_a_drop_directory_and_pinned_sums() {
     )
     .unwrap();
     let channel = list.channel(&fx.host.trust, &stable()).unwrap();
-    assert_eq!(channel.dir, Path::new("/d"));
+    assert_eq!(channel.source, Source::Dir("/d".into()));
     assert_eq!(channel.sums, Some(fx.sums.clone()));
     assert_eq!(channel.source_ref, DEFAULT_SOURCE_REF);
     let list = allowlist(
@@ -495,12 +495,8 @@ fn a_channel_may_have_no_sums() {
     let list = allowlist(&fx, "[channels.stable]\ndir = \"/d\"\n").unwrap();
     let channel = list.channel(&fx.host.trust, &stable()).unwrap();
     assert_eq!(
-        (
-            channel.dir.as_path(),
-            channel.sums,
-            channel.source_ref.as_str()
-        ),
-        (Path::new("/d"), None, DEFAULT_SOURCE_REF)
+        (channel.source, channel.sums, channel.source_ref.as_str()),
+        (Source::Dir("/d".into()), None, DEFAULT_SOURCE_REF)
     );
     // Named sums that others can write are unsafe; sums that are not there are invalid.
     let list = allowlist(

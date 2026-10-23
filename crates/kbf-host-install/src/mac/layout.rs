@@ -52,6 +52,8 @@ pub struct Tuning {
     pub poll: Duration,
     /// How long one external tool may run.
     pub tool: Duration,
+    /// How long the download of a release from GitHub may take.
+    pub fetch: Duration,
     /// The largest release tarball taken in, in bytes.
     pub tarball_max: u64,
     /// The largest attestation bundle taken in, in bytes.
@@ -68,6 +70,7 @@ impl Tuning {
             welcome: Duration::from_secs(180),
             poll: Duration::from_millis(500),
             tool: Duration::from_secs(120),
+            fetch: Duration::from_secs(900),
             tarball_max: 512 * 1024 * 1024,
             bundle_max: 256 * 1024,
             binary_max: 1024 * 1024 * 1024,
@@ -152,6 +155,7 @@ impl MacHost {
                 welcome: Duration::from_millis(120),
                 poll: Duration::from_millis(2),
                 tool: Duration::from_secs(5),
+                fetch: Duration::from_secs(7),
                 tarball_max: 64 * 1024,
                 bundle_max: 4 * 1024,
                 binary_max: 16 * 1024,

@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use super::{Cmd, DEBIAN_FRONTEND, Exec, LANG, PATH, Runner, SystemRunner, fake};
+use super::{Cmd, DEBIAN_FRONTEND, Exec, LANG, PATH, Runner, SystemRunner, WriteCap, fake};
 
 fn cmd(program: &str, args: &[&str]) -> Cmd {
     Cmd {
@@ -302,4 +302,81 @@ fn a_drop_goes_through_chroot_on_a_mac() {
             set_ids: None
         }
     );
+}
+
+/// A command that writes `blocks` MiB to `file` with `dd`, held to `max` bytes in `dir`.
+fn writes(dir: &std::path::Path, file: &str, blocks: u32, max: u64) -> Cmd {
+    Cmd {
+        write_cap: Some(WriteCap {
+            dir: dir.to_path_buf(),
+            max,
+        }),
+        ..within(
+            "/usr/bin/dd",
+            &[
+                "if=/dev/zero",
+                &format!("of={}", dir.join(file).display()),
+                "bs=1048576",
+                &format!("count={blocks}"),
+            ],
+            Duration::from_secs(60),
+        )
+    }
+}
+
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+    std::fs::create_dir_all(&target).unwrap();
+    kbf_testkit::dir::TestDir::under(target, name)
+}
+
+/// Catches a size cap that does not stop a command: one that would write far more than it
+/// is allowed is killed while it runs, with a "too large" error, and writes no more after.
+#[test]
+fn a_child_that_writes_past_its_cap_is_killed() {
+    let dir = scratch("kbf-runner-cap-kill");
+    // 100000 MiB if nothing stopped it.
+    let error = SystemRunner
+        .run(&writes(&dir, "big", 100_000, 1024 * 1024))
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge, "{error}");
+    let size = std::fs::metadata(dir.join("big")).unwrap().len();
+    assert!(size < 4 * 1024 * 1024 * 1024, "{size}");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(std::fs::metadata(dir.join("big")).unwrap().len(), size);
+}
+
+/// Catches a cap that a fast writer slips under: a command that is over the cap when it
+/// exits is refused too, and one within it is not touched.
+#[test]
+fn a_child_over_its_cap_at_exit_is_refused_and_one_within_it_is_not() {
+    let dir = scratch("kbf-runner-cap-exit");
+    let error = SystemRunner
+        .run(&writes(&dir, "over", 3, 1024 * 1024))
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge, "{error}");
+    let other = scratch("kbf-runner-cap-within");
+    let ok = SystemRunner
+        .run(&writes(&other, "within", 1, 3 * 1024 * 1024))
+        .unwrap();
+    assert!(ok.success(), "{}", ok.stderr_text());
+}
+
+/// Catches a cap that needs a time limit: without one the command is still watched, and a
+/// directory that is not there holds nothing.
+#[test]
+fn a_cap_works_without_a_time_limit_and_over_a_missing_directory() {
+    let dir = scratch("kbf-runner-cap-nolimit");
+    let mut over = writes(&dir, "over", 3, 1024 * 1024);
+    over.timeout = None;
+    let error = SystemRunner.run(&over).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge, "{error}");
+    let missing = Cmd {
+        write_cap: Some(WriteCap {
+            dir: dir.join("not-there"),
+            max: 1,
+        }),
+        ..cmd("/usr/bin/true", &[])
+    };
+    assert!(SystemRunner.run(&missing).unwrap().success());
 }
