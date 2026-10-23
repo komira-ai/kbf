@@ -422,6 +422,9 @@ leases cover simulators and macOS GUI and UI tests.
 
 ## 11. Probes later PRs must run
 
+`kbf-vmm probe` runs the Stage A subset of these (G1, G2, G3, P5, P0, P2, P6) and
+`probe-bench` the timings; see [docs/spikes/macos-vm-probe.md](../spikes/macos-vm-probe.md).
+
 None of these can run on GitHub's hosted macOS runners, which cannot boot a macOS guest
 (section 5.4). Each runs on one farm Mac, needs an explicit go for that Mac and that
 probe, and is recorded with its command, its output and the host's macOS and Xcode

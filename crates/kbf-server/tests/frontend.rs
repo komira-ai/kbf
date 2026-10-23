@@ -801,6 +801,52 @@ async fn a_sqlite_state_store_starts_and_is_held() {
     served.abort();
 }
 
+/// The `opkey/` rows of the SQLite state store at `path`, once the frontend that held it
+/// has stopped.
+async fn size_key_rows(path: &std::path::Path) -> Vec<String> {
+    use kbf_state::sqlite::{Options, SqliteStore};
+    for _ in 0..300 {
+        let opened = SqliteStore::open(
+            path,
+            Arc::new(kbf_state::SystemClock::default()),
+            Options::default(),
+        );
+        if let Ok(store) = opened {
+            let rows = store.scan_prefix("opkey/").expect("scan");
+            return rows.into_iter().map(|(key, _)| key).collect();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the state store is still held");
+}
+
+/// A frontend over external storage (it has no metadata log of its own, so no machine
+/// version to read) keys what it queues when `--learned-sizes=on` and writes the key in
+/// the `opkey/` row of its state store; with the default it writes none. The action
+/// names no memory and no platform, so the frontend's default platform pins the OS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_over_external_storage_keeps_the_size_key_in_its_state_store() {
+    for (mode, rows) in [("on", 1), ("off", 0)] {
+        let node = Node::start().await;
+        let dir = scratch_dir(&format!("learned-{mode}"));
+        let state = dir.join("state").join("state.db");
+        let url = format!("--storage=http://{}", node.addr);
+        let store = format!("--state-store=sqlite://{}", state.display());
+        let sizes = format!("--learned-sizes={mode}");
+        let f = flags(&[&url, &store, &sizes]).expect("flags");
+        let front = Front::start(&f).await;
+        let client = front.client().await;
+        let job = Job::new("keyed", &[]);
+        client.upload(&job.blobs()).await;
+        // No daemon is connected: the operation is queued and stays so.
+        let ops = client.execute(&job.action).await;
+        drop((ops, client));
+        drop(front);
+        let found = size_key_rows(&state).await;
+        assert_eq!(found.len(), rows, "--learned-sizes={mode}: {found:?}");
+    }
+}
+
 /// Catches a plain-text listener off loopback starting without the warning the other
 /// modes print (the supervisor's only sign).
 #[tokio::test]

@@ -26,15 +26,12 @@
 //!   below), so a copy packaged into a tarball and extracted elsewhere says what the
 //!   tarball's bytes say. With `XTASK_FAKE_ANNOUNCE` set, it also prints the path it was
 //!   run as on stderr. When what the trailer says `--version --json` prints is exactly
-//!   `fail`, `hang` or `env` (a line end after it), it does that instead: exits 1, never
-//!   answers, or prints its working directory (`cwd=<path>`) and the environment it was
-//!   started with (`NAME=value` per line), so a test can see a binary run (and with what)
-//!   through the trailer alone, which an environment variable cannot do for a program
-//!   started with none. Two more: `orphan` (a line end after it) leaves a process holding
+//!   `fail` or `hang` (a line end after it), it does that instead: exits 1 or never
+//!   answers. Two more: `orphan` (a line end after it) leaves a process holding
 //!   its output for a few seconds and exits 0; and `tamper <name>` (the line ends, and the
 //!   rest of the trailer is what it prints) first appends a byte to `../assets/<name>` and
 //!   rewrites that file's line in `../assets/SHA256SUMS`, as a binary run in the directory
-//!   `release stage-offer` runs it in could. What a test asks of it by an environment
+//!   `release fetch-previous` runs it in could. What a test asks of it by an environment
 //!   variable, the empty environment of `release version-facts` does not carry, so two
 //!   more files beside it do: `kbf.env` (when it exists, the fake overwrites it with `ran` and one `NAME=value`
 //!   line per variable it was given) and `kbf.mode` (`fail`: print the answer, then exit 1;
@@ -55,8 +52,6 @@
 //!   `fakeAttestations`, the line `<SHA-256 of the file> <flags>` (the flags without the
 //!   two that name files). It appends one line to `gh-env` next to it: the proxy and
 //!   no-proxy variables it ran under (`NAME=value`, empty when unset).
-//! - Run as `gh attestation trusted-root`, it prints a line of JSON, as the trusted root
-//!   is one (it appends its arguments to `gh-args` like every `gh` call).
 //! - Run as `gh api <path>`, it prints the value under the key `<path>` of the JSON
 //!   object in `gh-api.json` next to it, or `gh: Not Found (HTTP 404)` on stderr and
 //!   exits 1 when there is none: the GitHub API, as a test wrote it.
@@ -95,8 +90,7 @@
 //!   appends `<name> <arguments>` as one line to `systemd-args` next to the fake's own
 //!   file and exits 0: the host's systemd, as `packaging/install.sh` calls it.
 //!
-//! `XTASK_FAKE_DEFECT` plants one defect of the real build (`beta-bundle-any-commit`: the
-//! bundle check ignores the commit for the beta workflow's bundles only): `ignores-override` (the
+//! `XTASK_FAKE_DEFECT` plants one defect of the real build: `ignores-override` (the
 //! build embeds the head whatever the override), `accepts-bad` (a malformed override
 //! builds), `fails-other` (a malformed override fails, but not on the override),
 //! `build-fails` (every build fails), `json-fails` (`kbf --version --json` exits 1), `stamp-fails` (every build with an override
@@ -109,8 +103,7 @@
 //! bundle named for a `.deb` verifies any file whose flags it lists). Of the API:
 //! `api-fails` (every `gh api` exits 1 with an HTTP 502) or `api-garbage` (every `gh
 //! api` prints something that is not JSON). Of releases: `release-fails` (every `gh
-//! release` command exits 1). Of the trusted root: `trusted-root-fails` (`gh attestation
-//! trusted-root` exits 1). Of sudo:
+//! release` command exits 1). Of sudo:
 //! `tests-fail` (it exits 101, as a failed test binary does) or `fails:<a>,<b>,...`
 //! (it exits 101 when one of its arguments is one of `<a>`, `<b>`, ..., so some units
 //! of several fail). Of systemd: `systemd-fails` (every systemd tool exits 1).
@@ -251,13 +244,6 @@ fn kbf(argv0: &str, args: &[String]) -> ExitCode {
             "hang\n" => loop {
                 std::thread::sleep(Duration::from_secs(3600));
             },
-            "env\n" => {
-                let cwd = std::env::current_dir().expect("a working directory");
-                println!("cwd={}", cwd.display());
-                for (name, value) in std::env::vars_os() {
-                    println!("{}={}", name.to_string_lossy(), value.to_string_lossy());
-                }
-            }
             _ => print!("{json}"),
         }
     } else {
@@ -377,7 +363,6 @@ fn gh(argv0: &str, args: &[String]) -> ExitCode {
         "api" if args.iter().any(|a| a == "--input") => return api_write(dir, args),
         "api" => return api(dir, &args[1]),
         "release" => return release(dir, args),
-        "attestation" if args[1] == "trusted-root" => return trusted_root(),
         _ => {}
     }
     let file = args
@@ -400,16 +385,6 @@ fn gh(argv0: &str, args: &[String]) -> ExitCode {
     }
     eprintln!("xtask-fake: no attestation of {file} verifies with {flags}");
     ExitCode::FAILURE
-}
-
-/// `gh attestation trusted-root`: one line of JSON, or a failure.
-fn trusted_root() -> ExitCode {
-    if defect("trusted-root-fails") {
-        eprintln!("gh: the trusted root could not be fetched");
-        return ExitCode::FAILURE;
-    }
-    println!("{{\"fake\":\"trusted root\"}}");
-    ExitCode::SUCCESS
 }
 
 /// `flags` as one string, without the pair `--source-digest <commit>`.
@@ -477,10 +452,7 @@ fn verify_bundle(dir: &Path, sha256: &str, file: &str, bundle: &str, rest: &[Str
             })
         })
         .unwrap_or_default();
-    // `beta-bundle-any-commit` is `bundle-any-commit` for the beta workflow's bundles only,
-    // so the artifacts controls pass and the beta control is the one reached.
-    let beta = flags.iter().any(|f| f.ends_with("/beta.yml"));
-    let by_commit = !(defect("bundle-any-commit") || (beta && defect("beta-bundle-any-commit")));
+    let by_commit = !defect("bundle-any-commit");
     let by_bytes = !(defect("bundle-any-file")
         || (defect("bundle-deb-bundle-any")
             && (bundle.ends_with(".deb.sigstore.json") || bundle.ends_with(".pkg.sigstore.json"))));

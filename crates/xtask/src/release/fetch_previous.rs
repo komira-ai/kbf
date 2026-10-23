@@ -23,7 +23,7 @@
 //! 2. the release of that tag must exist. A tag with no release is an error, not a step back
 //!    to a lower tag: N-1 is the release before N, not the newest that happens to be whole;
 //! 3. its assets are downloaded into a directory of this process alone;
-//! 4. they are verified as `release offer` verifies a release for that commit: `release
+//! 4. they are verified as a release for that commit is: `release
 //!    check` (`SHA256SUMS`, names, one bundle per tarball) and `verify-assets attestations`
 //!    (provenance, SBOM and bundle of each asset). The bundles are checked offline when
 //!    `--trusted-root` is given; the provenance and SBOM attestations are always asked of
@@ -42,7 +42,7 @@
 //! fails with the binaries already in `--out`.
 //!
 //! This is the previous release tag, not the commit the farm runs: it is no input to
-//! `release offer --previous` or to `reversible` (a rollback goes to what the farm runs).
+//! `reversible` (a rollback goes to what the farm runs).
 
 use std::collections::BTreeSet;
 use std::io::Write;
