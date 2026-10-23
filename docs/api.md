@@ -596,6 +596,44 @@ restart it. `kbf cluster member <id> --state active|draining|planned-down [--for
 `kbf cluster object-store ...` calls the `/v1/object-stores/...` routes (below).
 `kbf cluster epoch-bump --token-file F` calls `POST /v1/epoch/bump`.
 
+## `GET /v1/frontend/retire` and `POST /v1/frontend/retire`
+
+Taking one frontend out of service while other frontends share its state store, for a
+rollout that restarts it. A drain (above) lets the frontend keep its worker streams and its
+queue; a retire moves them to the others.
+
+**`GET /v1/frontend/retire`**: a read, open like `GET /v1/frontend/drain`:
+
+```json
+{ "retired": false, "open_streams": 3, "open_sessions": 2 }
+```
+
+- `retired`: the retire has completed. It is not undone.
+- `open_streams`: Execute and WaitExecution operation streams open now, the callers this
+  frontend still answers (`kbf_front_open_executions`).
+- `open_sessions`: the worker sessions the frontend holds.
+
+**`POST /v1/frontend/retire`**: begins the retire, a write that passes every gate of
+[Who may write](#who-may-write) and takes no body (or `{}`). It answers the same status
+once the retire has completed, with `retired` true. Calling it again changes nothing and
+answers the same status. The retire:
+
+- refuses every new Execute `UNAVAILABLE`, which Buck2 retries when it opens a call;
+- waits, for at most ten seconds (`--handover-quiesce-secs` where the frontend has a
+  handover socket), for the calls between their request and their queueing, then stops
+  taking work: the frontend reads no more of the state store's queue, grants nothing,
+  claims nothing and writes the requeues the store had refused (for at most the same
+  time again);
+- stops the worker listener and ends every worker stream `UNAVAILABLE`, so each daemon
+  dials another frontend, which takes up the leases the daemon lists;
+- turns `/readyz` to `503` (`stopping`) and the health service to `NOT_SERVING`;
+- keeps every open Execute and WaitExecution stream, and answers it from the result another
+  frontend records in the state store, for as long as the process lives.
+
+The REAPI listener is not sent GOAWAY and the process does not exit: the operator restarts
+the unit once `open_streams` is 0. A server that is not a frontend over a state store
+answers both routes `409` (`this server is not a frontend over a state store`).
+
 ## `POST /v1/epoch/bump`
 
 Raises the epoch the state store holds by one, for the day the store was restored from a
@@ -1205,7 +1243,7 @@ otherwise; the body lists each failing check and why:
 
 | Check | Fails when |
 |---|---|
-| `stopping` | the server has received SIGTERM or SIGINT, or `POST /v1/frontend/drain` has begun a drain. It answers `503` from that moment, and for the rest of the drain; open Execute streams are kept until their action is done, and only the shutdown timeout (`--shutdown-timeout-secs`) or a second signal ends them |
+| `stopping` | the server has received SIGTERM or SIGINT, or `POST /v1/frontend/drain` has begun a drain, or `POST /v1/frontend/retire` has retired the frontend. It answers `503` from that moment, and for the rest of the drain; open Execute streams are kept until their action is done, and only the shutdown timeout (`--shutdown-timeout-secs`) or a second signal ends them |
 | `leader` | the server does not hold the scheduler role. A single server runs every role and always holds it; the check is there for a replicated control log, whose followers fail it. **Planned**: a second readiness path, without this check, for the servers that may serve reads ([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)) |
 | `store` | the object store does not answer a one-byte read of the key `<prefix>readyz-probe` within `--readyz-store-timeout-ms` (default 2000; it bounds the gRPC health service's probe too), or answers with an error. The probe only reads: no poll writes, deletes or lists. Nothing writes that key, so "not found" is the expected answer and passes, as does the object's bytes or a range past its end |
 

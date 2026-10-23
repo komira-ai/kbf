@@ -53,6 +53,8 @@ http_invocations,http_sched,http_history,enroll/api,managed/http,ui_mount}.rs` a
 | list the denied entries | `GET /v1/denied` | [N] unit F | write |
 | frontend drain status | `GET /v1/frontend/drain` | [F] | open |
 | begin the frontend's drain | `POST /v1/frontend/drain` | [F] | write |
+| frontend retire status | `GET /v1/frontend/retire` | [F] | open |
+| retire the frontend (stop its intake and worker streams, keep its callers) | `POST /v1/frontend/retire` | [F] | write |
 | raise the stored epoch (after a restore from a backup) | `POST /v1/epoch/bump` | [F] | write |
 | storage health (under-replicated blobs) | `GET /v1/storage` | [F] | open |
 

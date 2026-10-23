@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicBool;
 
 use kbf_front::Cache;
 
-use super::follow;
+use super::FOLLOW_EVERY;
 use crate::farm::Farm;
 
 /// Catches: two followers over one farm, which a stand-down and a refused write can
@@ -18,12 +18,12 @@ async fn only_the_first_of_a_stand_down_and_a_fenced_write_starts_the_follower()
     ));
     let started = AtomicBool::new(false);
     assert!(
-        follow(Arc::clone(&farm), &started),
+        farm.follow_every(&started, FOLLOW_EVERY),
         "the first call starts it"
     );
     assert!(
-        !follow(Arc::clone(&farm), &started),
+        !farm.follow_every(&started, FOLLOW_EVERY),
         "the second started another"
     );
-    assert!(!follow(farm, &started));
+    assert!(!farm.follow_every(&started, FOLLOW_EVERY));
 }

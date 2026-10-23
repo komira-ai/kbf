@@ -80,7 +80,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::http::header::CONTENT_TYPE;
@@ -118,6 +118,7 @@ use crate::listen::{Binder, Socket};
 use crate::members::{Handoff, Members};
 use crate::object_store::delivery::{Delivery, RegistrySource, Reports};
 use crate::proxy_auth::ProxyAuthLayer;
+use crate::retire::Retire;
 use crate::serve::{
     AbortOnDrop, ServeError, cold_store, drain_and_stop, flow_control, keepalive, log_state,
     map_of, members_of, membership, serve_api, stop_api, sweeping, worker_peers,
@@ -1133,10 +1134,13 @@ impl<'a> Prepared<'a> {
             update_rows.clone(),
             listeners.tick,
         );
+        // Set below, where the stand is built, if there is a state store to retire over.
+        let retire = Arc::new(OnceLock::new());
         let api_routes = crate::api::router(
             Arc::clone(&farm),
             token.clone(),
             Arc::clone(&drain),
+            Arc::clone(&retire),
             members.clone(),
             update_rows.clone(),
             enroll_api,
@@ -1255,6 +1259,8 @@ impl<'a> Prepared<'a> {
                 .as_ref()
                 .map_or(crate::managed::QUIESCE_WAIT, |handover| handover.quiesce),
         });
+        // Set once, here: nothing has called the retire route before the listeners serve.
+        let _ = stand.clone().map(|stand| retire.set(Retire::new(stand)));
         let holder = flags
             .handover
             .as_ref()
@@ -1553,6 +1559,9 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
 }
 
 mod handoff;
+mod over;
+
+pub use over::start_frontend_over;
 
 #[cfg(test)]
 mod tests;
