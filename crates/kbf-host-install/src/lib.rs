@@ -10,7 +10,8 @@
 //! sshd then runs it with no arguments, and the request is the one string in
 //! `SSH_ORIGINAL_COMMAND`. (The one argument it takes anywhere is `--version`, which prints
 //! the name and the package version and runs nothing; the release checks the signed Mac
-//! binary with it.) Exactly two requests are accepted, matched as a whole string
+//! binary with it. `--version` beside anything else is refused with the closed line,
+//! unaudited: that is not an sshd request and changes nothing.) Exactly two requests are accepted, matched as a whole string
 //! ([`request`]):
 //!
 //! - `install kbf=<version> from <channel>`: install that version of the `kbf` package
@@ -109,6 +110,14 @@ fn asks_for_version(args: &[std::ffi::OsString]) -> bool {
     matches!(args, [only] if only == "--version")
 }
 
+/// Whether an argument tries to be the version flag (`--version`, `--version=1`) without the
+/// arguments being exactly that. Such an invocation is not an sshd request (sshd passes no
+/// arguments) and changes nothing, so it is refused before the audit log is opened.
+fn names_version(args: &[std::ffi::OsString]) -> bool {
+    args.iter()
+        .any(|arg| arg.to_str().is_some_and(|a| a.starts_with("--version")))
+}
+
 /// The program: handle `SSH_ORIGINAL_COMMAND` against the production paths and exit with
 /// the status of the answer.
 #[must_use]
@@ -117,6 +126,13 @@ pub fn main() -> ExitCode {
     if asks_for_version(&args) {
         println!("{}", version_line());
         return ExitCode::SUCCESS;
+    }
+    if names_version(&args) {
+        return ExitCode::from(host::respond(
+            &outcome::Outcome::Refused(outcome::Refusal::BadCommand),
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        ));
     }
     // Both sides are compiled everywhere, so the Linux build checks the Mac code.
     if cfg!(target_os = "macos") {
@@ -152,6 +168,21 @@ mod tests {
             &["--versions"],
         ] {
             assert!(!asks_for_version(&args(other)), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn a_version_flag_beside_anything_else_is_named_but_does_not_ask() {
+        for other in [
+            &["--version", "query"][..],
+            &["--version=1"],
+            &["x", "--version"],
+        ] {
+            assert!(names_version(&args(other)), "{other:?}");
+            assert!(!asks_for_version(&args(other)), "{other:?}");
+        }
+        for other in [&[][..], &["-V"], &["query"]] {
+            assert!(!names_version(&args(other)), "{other:?}");
         }
     }
 
