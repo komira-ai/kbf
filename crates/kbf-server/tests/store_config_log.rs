@@ -33,7 +33,7 @@ impl Write for Log {
 /// of the call paths reach. The test first asserts the secret is in the answer it fetched,
 /// so a scan that finds nothing is not a scan of nothing.
 ///
-/// Mutant seen red: `Debug` of the store printing its secret (the hand-written one prints
+/// Catches: `Debug` of the store printing its secret (the hand-written one prints
 /// `Secret(..)`); the log line the test writes carries the answer's `Debug`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_secret_is_in_the_answer_and_in_no_log_line() {

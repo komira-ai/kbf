@@ -1,5 +1,5 @@
 //! The floor's one writer, on a scratch host. What each test proves is named on it, with the
-//! mutant to plant to turn it red.
+//! defect it catches.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -24,7 +24,7 @@ fn held(host: &Layout) -> String {
 /// Catches a floor written at the number given whatever stands (a floor that goes down), a
 /// file others can read or write, and a floor not made when there was none.
 ///
-/// Mutants to plant: the comparison dropped (the file is written whatever its number: red on
+/// Catches: the comparison dropped (the file is written whatever its number: red on
 /// the content after the lower raise); the mode 0644 (red on the mode).
 #[test]
 fn a_raise_makes_the_floor_and_never_lowers_it() {
@@ -47,7 +47,7 @@ fn a_raise_makes_the_floor_and_never_lowers_it() {
 /// Catches a floor that cannot be read taken for no floor and written over, which would lower
 /// it (to the number given) behind the operator's back.
 ///
-/// Mutant to plant: the read error mapped to `None`.
+/// Catches: the read error mapped to `None`.
 #[test]
 fn a_floor_that_cannot_be_read_is_left_alone() {
     let (host, _) = host_root("floor-unreadable");
@@ -71,7 +71,7 @@ fn a_floor_that_cannot_be_read_is_left_alone() {
 /// Catches an error swallowed (a raise that reports a floor it did not write: the confirmed
 /// release would then be orderable again as a seed).
 ///
-/// Mutants to plant: the write error ignored; the lock error ignored.
+/// Catches: the write error ignored; the lock error ignored.
 #[test]
 fn a_raise_that_cannot_write_or_lock_says_so() {
     let (host, _) = host_root("floor-write");

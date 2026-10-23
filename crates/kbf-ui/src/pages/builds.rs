@@ -379,7 +379,7 @@ mod tests {
     use super::{Listed, Listing, result};
 
     /// Catches: a result worded from the wrong field: an incomplete closed build shown as
-    /// ok (mutant: `complete` ignored), a build with failures that is still open shown as
+    /// ok (catches: `complete` ignored), a build with failures that is still open shown as
     /// open only.
     #[test]
     fn a_listed_builds_result_is_its_failures_then_its_state() {

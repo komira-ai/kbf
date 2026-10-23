@@ -11,8 +11,8 @@
 //! the process list beside the logs (`logs/processes.txt`), and a farm that does not come up has
 //! the logs in its report (`logs/hang-report.txt`).
 //!
-//! The gate that is never seen red is not a gate, so the scenario carries two mutants
-//! ([`Mutant`]), each a way to make the farm worse that the gates must catch.
+//! A gate that never fails is not a gate, so the scenario carries injected faults
+//! ([`Fault`]), each a way to make the farm worse that the gates must catch.
 //!
 //! **The lost-blob gates** (`lost_blobs_gauge`, `blob_losses`) read `kbf_cache_lost_blobs`
 //! and `kbf_cache_blob_losses_total`, which a process that holds a cache writes: the
@@ -39,7 +39,7 @@ pub const SCENARIO: &str = "farm_under_build_load";
 
 /// A way to make the farm worse, which the gates must catch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mutant {
+pub enum Fault {
     /// Node 1's cold store is told its disk is nearly full, so it evicts what it holds.
     ShrinkNodeCap,
     /// Every node's cold store is told so: with two copies of each blob, one node alone may
@@ -78,8 +78,8 @@ pub struct B0 {
     pub scrape_every: Duration,
     /// Where to append the job summary (`$GITHUB_STEP_SUMMARY`).
     pub summary: Option<PathBuf>,
-    pub mutant: Option<Mutant>,
-    /// Flags to set on a role after the mutant's (a test's way to break one process).
+    pub fault: Option<Fault>,
+    /// Flags to set on a role after the fault's (a test's way to break one process).
     pub extra_flags: Vec<(Role, Vec<String>)>,
     /// How long the farm may take to become ready once its processes have started.
     pub farm_hang: Duration,
@@ -116,11 +116,11 @@ pub fn shrunk() -> Vec<String> {
     ]
 }
 
-/// The mutant's flags for a topology.
-fn overrides(mutant: Option<Mutant>) -> Vec<(Role, Vec<String>)> {
-    match mutant {
-        Some(Mutant::ShrinkNodeCap) => vec![(Role::Node(1), shrunk())],
-        Some(Mutant::ShrinkEveryCap) => (1..=3).map(|n| (Role::Node(n), shrunk())).collect(),
+/// The fault's flags for a topology.
+fn overrides(fault: Option<Fault>) -> Vec<(Role, Vec<String>)> {
+    match fault {
+        Some(Fault::ShrinkNodeCap) => vec![(Role::Node(1), shrunk())],
+        Some(Fault::ShrinkEveryCap) => (1..=3).map(|n| (Role::Node(n), shrunk())).collect(),
         _ => Vec::new(),
     }
 }
@@ -252,7 +252,7 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
         VERSION_BOUND,
     );
     result.write();
-    let mut flags = overrides(args.mutant);
+    let mut flags = overrides(args.fault);
     flags.extend(args.extra_flags.iter().cloned());
     let topology = Topology {
         overrides: flags,
@@ -327,11 +327,11 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
     let midway = after(args.duration / 2);
     let (mut killed, mut interrupted) = (false, false);
     while !load.finished() {
-        if args.mutant == Some(Mutant::KillNodeMidway) && !killed && Instant::now() >= midway {
+        if args.fault == Some(Fault::KillNodeMidway) && !killed && Instant::now() >= midway {
             farm.kill(Role::Node(2));
             exited.push((
                 Role::Node(2).to_string(),
-                "killed by the kill-node-midway mutant".to_owned(),
+                "killed by the kill-node-midway fault".to_owned(),
             ));
             killed = true;
         }

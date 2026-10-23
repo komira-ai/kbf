@@ -41,7 +41,7 @@ fn the_state_round_trips_with_its_schema() {
 /// Catches a state read and written without the lock held: while one run holds it, no
 /// other may take it, and once it is dropped another may.
 ///
-/// Mutant seen red: `acquire` without `lock()` (the second lock is taken at once).
+/// Catches: `acquire` without `lock()` (the second lock is taken at once).
 #[test]
 fn the_lock_is_held_while_a_locked_lives() {
     let (root, dir) = host_root("deploy-host-state-lock");
@@ -70,7 +70,7 @@ fn free_once_dropped(other: &File) {
 /// spawned: the drop must free it for good, though a forked child briefly keeps a duplicate
 /// of the descriptor.
 ///
-/// Mutant: the `Drop` of `Locked` removed (the close alone releases the lock): with the
+/// Catches: the `Drop` of `Locked` removed (the close alone releases the lock): with the
 /// spawner thread running, the single `try_lock` failed 6 of 300 rounds before the unlock
 /// on drop. `tests/state_lock.rs` holds the deterministic version with a forked child.
 #[test]
@@ -99,7 +99,7 @@ fn the_lock_is_free_after_a_drop_while_children_are_spawned() {
 /// which release a root service runs, and anyone who could hold the lock could stall
 /// every deploy. Both are made 0600, and a rewrite keeps the state at 0600.
 ///
-/// Mutant seen red: the state file made 0644 (as before this test).
+/// Catches: the state file made 0644 (as before this test).
 #[test]
 fn the_lock_and_the_state_are_root_s_alone() {
     let (root, dir) = host_root("deploy-host-state-modes");
@@ -116,7 +116,7 @@ fn the_lock_and_the_state_are_root_s_alone() {
 /// the order floor many times, through read, change and write under the lock; an update
 /// lost to a concurrent writer leaves the total short.
 ///
-/// Mutant seen red: `acquire` without `lock()`.
+/// Catches: `acquire` without `lock()`.
 #[test]
 fn concurrent_writers_lose_no_update() {
     let (root, _dir) = host_root("deploy-host-state-writers");
@@ -149,7 +149,7 @@ fn concurrent_writers_lose_no_update() {
 /// leave half a state, which no later run could read): the old file, held open, must
 /// keep the old state whole, the path must name a new file, and no copy may be left.
 ///
-/// Mutant seen red: the state written in place (`fs::write` of the path).
+/// Catches: the state written in place (`fs::write` of the path).
 #[test]
 fn a_write_replaces_the_file_and_never_changes_the_old_one() {
     let (root, dir) = host_root("deploy-host-state-replace");
@@ -387,7 +387,7 @@ fn names(dir: &Path) -> Vec<String> {
 /// Catches a backup that is not made (a lost state has nothing to fall back to), one made
 /// from the new state (it would equal the file), and one that lags a write behind.
 ///
-/// Mutants seen red: the copy to `state.json.bak` left out of `write`; the copy made after
+/// Catches: the copy to `state.json.bak` left out of `write`; the copy made after
 /// the file is replaced.
 #[test]
 fn the_backup_is_the_state_before_the_last_write() {
@@ -422,7 +422,7 @@ fn the_backup_is_the_state_before_the_last_write() {
 /// Catches a damaged file taken for an empty host (the next write would forget the release
 /// the host runs), and a read that "repairs" by writing.
 ///
-/// Mutant seen red: the backup never read (`read_file(&self.backup)` answering "missing").
+/// Catches: the backup never read (`read_file(&self.backup)` answering "missing").
 #[test]
 fn a_damaged_or_missing_state_is_read_from_the_backup() {
     let (root, dir) = host_root("state-bak-read");
@@ -463,7 +463,7 @@ fn a_damaged_or_missing_state_is_read_from_the_backup() {
 /// Catches a backup made from whatever `state.json` holds (the last good state would be
 /// destroyed by the very write that follows the damage).
 ///
-/// Mutant seen red: the "reads back as a state" test dropped from the copy in `write`.
+/// Catches: the "reads back as a state" test dropped from the copy in `write`.
 #[test]
 fn a_damaged_file_never_replaces_the_good_backup() {
     let (root, dir) = host_root("state-bak-keep");
@@ -492,7 +492,7 @@ fn a_damaged_file_never_replaces_the_good_backup() {
 /// Catches the dangerous repair: a lost state read as a fresh host, and the next verb writing
 /// a state that forgets `current`, `previous` and a trial in progress.
 ///
-/// Mutant seen red: `load` answering `Loaded { state: None, .. }` when both files fail.
+/// Catches: `load` answering `Loaded { state: None, .. }` when both files fail.
 #[test]
 fn an_activated_host_without_a_usable_state_is_not_an_empty_one_and_nothing_is_written() {
     let (root, dir) = host_root("state-unusable");
@@ -558,7 +558,7 @@ fn a_host_never_activated_starts_empty_even_with_a_published_release() {
 /// Catches a fall-back on every error, which would serve a schema-1 host its schema-2 backup
 /// of a state from before the migration.
 ///
-/// Mutant seen red: the `Err(e @ StateError::Schema { .. })` arm of `load` removed.
+/// Catches: the `Err(e @ StateError::Schema { .. })` arm of `load` removed.
 #[test]
 fn another_schema_is_refused_and_the_backup_is_not_tried() {
     let (root, dir) = host_root("state-schema-no-fallback");
@@ -578,7 +578,7 @@ fn another_schema_is_refused_and_the_backup_is_not_tried() {
 /// Catches a truncated or emptied file being reported as "another schema", which would stop a
 /// host that has a good backup.
 ///
-/// Mutant seen red: a missing `schema` read as `null` and refused as a schema.
+/// Catches: a missing `schema` read as `null` and refused as a schema.
 #[test]
 fn json_without_a_schema_is_damaged_so_the_backup_is_tried() {
     let (root, dir) = host_root("state-no-schema");
@@ -608,7 +608,7 @@ fn block(dir: &Path, name: &str) {
 /// Catches the order reversed: a death between the two would then leave a new state with a
 /// backup two writes old (or none), and a damaged new file would fall back to the wrong state.
 ///
-/// Mutant seen red: the backup written after the state.
+/// Catches: the backup written after the state.
 #[test]
 fn a_write_that_dies_between_the_backup_and_the_state_loses_nothing() {
     let (root, dir) = host_root("state-write-order");
@@ -646,7 +646,7 @@ fn a_write_that_dies_between_the_backup_and_the_state_loses_nothing() {
 /// the holder lets go within the time it gets the lock; a lock file that cannot be opened is
 /// a lock error (not busy).
 ///
-/// Mutants planted: no wait (busy at once with a holder that lets go in time); the busy
+/// Catches: no wait (busy at once with a holder that lets go in time); the busy
 /// error turned into a lock error.
 #[test]
 fn acquire_within_waits_for_a_holder_then_says_busy() {

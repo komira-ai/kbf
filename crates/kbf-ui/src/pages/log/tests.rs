@@ -60,7 +60,7 @@ fn pre(html: &str) -> &str {
 /// shown as markup; a control character, an escape sequence, a bidirectional override or
 /// a C1 control written raw; bytes that are not UTF-8 dropped, or the page refused. A log
 /// is also read with exactly one `Range`: the last MiB by default, the first with
-/// `?from=start`. Mutants: `printable` returning its text unchanged; the C0 arm dropped;
+/// `?from=start`. Catches: `printable` returning its text unchanged; the C0 arm dropped;
 /// the bidi arm dropped; the DEL arm dropped; the range not sent (the `suffix` call
 /// replaced by a plain read); the default the head.
 #[test]
@@ -114,7 +114,7 @@ fn a_hostile_log_is_shown_as_inert_text_and_read_with_one_range() {
 /// rest, or a download link that is not the route. The cut is `total > shown`: a log of
 /// exactly the cap is whole. The notice names the end that is shown (the last MiB by
 /// default, the first with `?from=start`) and links the other end, which is the page
-/// itself or its `?from=start`; a whole log links neither. Mutants: `more` always false;
+/// itself or its `?from=start`; a whole log links neither. Catches: `more` always false;
 /// always true; `>` written `>=`; the link dropped; the words for the ends swapped; the
 /// other end's link pointing at the page's own end.
 #[test]
@@ -165,7 +165,7 @@ fn a_log_longer_than_the_range_says_which_end_it_shows_and_links_the_other() {
 
 /// Catches: the end of the log taken from anything but `from=start` exactly: `from=end`,
 /// an unknown value, an empty one and a hostile one are the default tail, the first of
-/// two values counts, and a value is never written to the page. Mutants: the match
+/// two values counts, and a value is never written to the page. Catches: the match
 /// arm for `start` always taken; the default the head; the value echoed.
 #[test]
 fn only_from_start_asks_for_the_head() {
@@ -198,7 +198,7 @@ fn only_from_start_asks_for_the_head() {
 /// Catches: a cut inside a code point shown as a replacement character the log does not
 /// hold, or a real invalid byte dropped with it: at the END of a head window and at the
 /// START of a tail window (the euro sign, three bytes, cut after one and after two of
-/// them). Mutants: the cut not trimmed; the trim applied to a log that is whole; the tail
+/// them). Catches: the cut not trimmed; the trim applied to a log that is whole; the tail
 /// trimmed at its end, or the head at its start.
 #[test]
 fn a_cut_inside_a_code_point_drops_the_part_and_a_whole_log_does_not() {
@@ -244,7 +244,7 @@ fn a_cut_inside_a_code_point_drops_the_part_and_a_whole_log_does_not() {
 /// Catches: a source that ignored the range (a `200` with the whole log) shown whole: the
 /// page reads no more than it asked for even then, and keeps the end that was asked for:
 /// the last MiB by default (the 10 bytes before it are not shown), the first with
-/// `?from=start`. Mutants: the body not truncated; a tail cut from its front; a head cut
+/// `?from=start`. Catches: the body not truncated; a tail cut from its front; a head cut
 /// from its back.
 #[test]
 fn a_range_the_source_ignored_is_cut_to_the_cap_from_the_end_asked_for() {
@@ -270,7 +270,7 @@ fn a_range_the_source_ignored_is_cut_to_the_cap_from_the_end_asked_for() {
 /// Catches: an empty log shown as an empty box or as an error, and a size nobody said
 /// shown as zero. A `416` (a start past the end of an empty log), a `200` with no body, and
 /// a `206` with no `Content-Range`: the last has no size and is cut only when it filled the
-/// range. Mutants: the `416` body kept; `unknown` shown as `0 B`; `>=` written `>`.
+/// range. Catches: the `416` body kept; `unknown` shown as `0 B`; `>=` written `>`.
 #[test]
 fn an_empty_log_and_an_unknown_size_are_said_plainly() {
     let empty = Fake::default().with_headers(
@@ -349,7 +349,7 @@ fn only_the_logs_of_a_run_are_pages() {
 }
 
 /// Catches: a run id written raw into the page or into the URL read: it is escaped in the
-/// page and one encoded path segment in the route. Mutants: `segment` dropped from the
+/// page and one encoded path segment in the route. Catches: `segment` dropped from the
 /// route; the heading written without escaping.
 #[test]
 fn a_hostile_run_id_is_escaped_and_encoded() {
@@ -368,7 +368,7 @@ fn a_hostile_run_id_is_escaped_and_encoded() {
 }
 
 /// Catches: the Action page with no way to a run's logs: a link for each of the three logs
-/// of each attempt that has a run id; none shown for a farm that sends no run id. Mutants:
+/// of each attempt that has a run id; none shown for a farm that sends no run id. Catches:
 /// the section dropped; the links built for a stream that is not one.
 #[test]
 fn the_action_page_links_the_logs_of_each_attempt_that_has_a_run() {
@@ -401,7 +401,7 @@ fn the_action_page_links_the_logs_of_each_attempt_that_has_a_run() {
 /// Catches: a character mapped wrongly or at the wrong edge: each C0 control but newline,
 /// tab and carriage return to its picture, DEL to its picture, C1 controls and the
 /// bidirectional controls to the replacement character, and the characters just outside
-/// those ranges left alone. Mutants: any range edge moved by one.
+/// those ranges left alone. Catches: any range edge moved by one.
 #[test]
 fn printable_maps_exactly_the_characters_something_acts_on() {
     let kept = [
@@ -461,7 +461,7 @@ fn only_a_trailing_incomplete_sequence_is_dropped() {
 
 /// Catches: a leading continuation byte kept (a replacement character the log does not
 /// hold), a lead byte or an ASCII byte dropped, or more than the three bytes that can
-/// belong to one code point dropped. Mutants: `take(3)` written `take(4)` or `take(2)`;
+/// belong to one code point dropped. Catches: `take(3)` written `take(4)` or `take(2)`;
 /// the range edges moved by one; the run not stopped at the first other byte.
 #[test]
 fn only_a_leading_run_of_up_to_three_continuation_bytes_is_dropped() {

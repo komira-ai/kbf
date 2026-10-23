@@ -96,7 +96,7 @@ fn left_no_trace(rig: &Rig, request_id: &str) {
 /// make the retry of a refused request an update that never began). The same request id then
 /// asks for the package's release and is a fresh request.
 ///
-/// Mutant planted: the check moved to after the request is saved (the entry is there).
+/// Catches: the check moved to after the request is saved (the entry is there).
 #[test]
 fn a_fetch_on_a_bundled_host_is_refused_before_anything_is_saved_or_written() {
     let rig = Rig::new("pr5a-bundled-fetch");
@@ -113,7 +113,7 @@ fn a_fetch_on_a_bundled_host_is_refused_before_anything_is_saved_or_written() {
 /// Catches a refusal that is too wide: a host that fetches from a URL or from the frontend, or
 /// whose installer says nothing of its source (it predates the report), is ordered as ever.
 ///
-/// Mutant planted: any host that tells its source is refused.
+/// Catches: any host that tells its source is refused.
 #[test]
 fn a_fetch_is_still_ordered_on_a_host_that_fetches_or_says_nothing() {
     for (i, source) in [None, Some("url"), Some("frontend")]
@@ -132,7 +132,7 @@ fn a_fetch_is_still_ordered_on_a_host_that_fetches_or_says_nothing() {
 /// code of its own, before anything is saved or written, and the text names what the host does
 /// have.
 ///
-/// Mutant planted: the commit compared with the installed release instead of the seed.
+/// Catches: the commit compared with the installed release instead of the seed.
 #[test]
 fn a_staged_update_needs_the_package_to_carry_that_commit() {
     for (i, seed) in [None, Some(C), Some(A)].into_iter().enumerate() {
@@ -153,7 +153,7 @@ fn a_staged_update_needs_the_package_to_carry_that_commit() {
 /// the commit with source `staged`; the request map keeps the source and writes it as the one
 /// key a build from before `source` cannot read; the status says it.
 ///
-/// Mutants planted: the order written with source `fetch`; the entry saved with source
+/// Catches: the order written with source `fetch`; the entry saved with source
 /// `fetch`; the status always `fetch`.
 #[test]
 fn a_staged_update_is_ordered_kept_and_reported_by_its_source() {
@@ -178,7 +178,7 @@ fn a_staged_update_is_ordered_kept_and_reported_by_its_source() {
 /// Catches an update that fetches leaving a trace of `source` anywhere an older build would
 /// choke on it: the request map's file, the order and the status carry no `source` for a fetch.
 ///
-/// Mutant planted: `source` written whatever it is.
+/// Catches: `source` written whatever it is.
 #[test]
 fn an_update_that_fetches_writes_no_source_anywhere() {
     let rig = Rig::new("pr5a-fetching-bytes");
@@ -199,7 +199,7 @@ fn an_update_that_fetches_writes_no_source_anywhere() {
 /// A process that is restarted while the update waits for the installer goes on with the
 /// source of the entry it took the update from, and says it while it waits.
 ///
-/// Mutants planted: the spec built with source `fetch`; a resumed update given `fetch`.
+/// Catches: the spec built with source `fetch`; a resumed update given `fetch`.
 #[test]
 fn the_supervisor_is_handed_the_source_also_by_a_process_that_took_the_update_up() {
     let rig = Rig::new("pr5a-handover");
@@ -221,7 +221,7 @@ fn the_supervisor_is_handed_the_source_also_by_a_process_that_took_the_update_up
 /// Catches a rollback ordered from the package: a rollback goes back to a release the host
 /// fetched and the package carries only the newest, so `staged` with `rollback` is refused.
 ///
-/// Mutant planted: the rollback flag not looked at when the source is `staged`.
+/// Catches: the rollback flag not looked at when the source is `staged`.
 #[test]
 fn a_rollback_is_refused_for_a_staged_update() {
     let rig = Rig::new("pr5a-staged-rollback");
@@ -240,7 +240,7 @@ fn a_rollback_is_refused_for_a_staged_update() {
 /// does not name its source yet, so a staged update that asks for the nodes is refused, and
 /// the same request without them is taken.
 ///
-/// Mutant planted: the refusal dropped (a staged update with `nodes` is accepted).
+/// Catches: the refusal dropped (a staged update with `nodes` is accepted).
 #[test]
 fn a_staged_update_takes_no_nodes_yet() {
     let rig = Rig::new("pr5a-staged-nodes");
@@ -260,7 +260,7 @@ fn a_staged_update_takes_no_nodes_yet() {
 /// the retry of the first: the source is part of what the id was used for, both ways round.
 /// The retry with the same source is the same update and writes no second order.
 ///
-/// Mutant planted: the source left out of the tuple a retry is compared by.
+/// Catches: the source left out of the tuple a retry is compared by.
 #[test]
 fn a_request_id_reused_with_another_source_is_refused_and_with_the_same_one_is_a_retry() {
     let rig = Rig::new("pr5a-reuse-fetch");
@@ -286,7 +286,7 @@ fn a_request_id_reused_with_another_source_is_refused_and_with_the_same_one_is_a
 /// nodes, is a request id reused (409 `request_id_reused`, exit 1 in the CLI), not a staged
 /// update that cannot take nodes (409 `source_refused`, exit 3).
 ///
-/// Mutant planted: the source and nodes check run before the request map is looked up.
+/// Catches: the source and nodes check run before the request map is looked up.
 #[test]
 fn a_retry_with_another_source_and_nodes_is_a_reused_id_before_it_is_a_refused_source() {
     let rig = Rig::new("pr5a-reuse-nodes");
@@ -308,7 +308,7 @@ fn a_retry_with_another_source_and_nodes_is_a_reused_id_before_it_is_a_refused_s
 /// Catches the source lost when an update ends: the installer refuses the order of a staged
 /// update, the update ends `failed`, and the status that is then read still says `staged`.
 ///
-/// Mutant planted: the ended update built with source `fetch`.
+/// Catches: the ended update built with source `fetch`.
 #[test]
 fn the_status_of_a_staged_update_that_ended_still_says_its_source() {
     let rig = Rig::new("pr5a-ended-source");
@@ -330,7 +330,7 @@ fn the_status_of_a_staged_update_that_ended_still_says_its_source() {
 /// text offers the staged source, and for a rollback (which a staged update cannot do) the
 /// installer's own `rollback` on the host.
 ///
-/// Mutant planted: the text without the way to roll back.
+/// Catches: the text without the way to roll back.
 #[test]
 fn the_refusal_of_a_fetch_on_a_bundled_host_says_what_can_be_asked() {
     let rig = Rig::new("pr5a-bundled-text");
@@ -348,7 +348,7 @@ fn the_refusal_of_a_fetch_on_a_bundled_host_says_what_can_be_asked() {
 /// but a fetch: its entries have no `source`, and a map kept by this build holds the entry of
 /// a staged update beside them.
 ///
-/// Mutant planted: `default` removed from the entry's `source`.
+/// Catches: `default` removed from the entry's `source`.
 #[test]
 fn a_request_map_from_before_source_reads_and_its_entries_fetch() {
     let rig = Rig::new("pr5a-old-map");
@@ -394,7 +394,7 @@ fn named(who: &str, word: &str) -> String {
 /// fetch, and a word that is not a source being read as one: the parse takes exactly
 /// `fetch` and `staged`.
 ///
-/// Mutants planted: `fetch` removed from the words read; an unknown word read as `fetch`.
+/// Catches: `fetch` removed from the words read; an unknown word read as `fetch`.
 #[test]
 fn a_request_reads_fetch_staged_or_nothing_and_no_other_source() {
     let fetch = parse(&named(B, r#""fetch""#)).unwrap();
@@ -413,7 +413,7 @@ fn a_request_reads_fetch_staged_or_nothing_and_no_other_source() {
 /// upgraded (the request type refuses a key it does not know). A fetch is the four keys it
 /// has always been; a staged request names its source after them.
 ///
-/// Mutant planted: `skip_serializing_if` removed from `source`.
+/// Catches: `skip_serializing_if` removed from `source`.
 #[test]
 fn a_request_that_fetches_is_todays_bytes_and_a_staged_one_names_its_source() {
     let fetch = serde_json::to_string(&fetch_req(B, "r1")).unwrap();

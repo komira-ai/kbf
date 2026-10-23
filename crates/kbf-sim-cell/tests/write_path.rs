@@ -32,9 +32,9 @@ fn outage(seed: u64, kind: Kind) -> (FarmTime, FarmTime, StoreFault) {
 /// returns, and the outage met PUTs.
 ///
 /// Catches an ack before the store has the bytes (property 8, and the window
-/// assertion: mutant "ack on `Upload`"), a blob indexed before or without its PUT
-/// (property 9: mutants "commit `PutBlob` at `Upload`", "index on `PutFailed`"), and
-/// a store whose pause or refusal does nothing (mutant "a pause holds nothing").
+/// assertion: defect "ack on `Upload`"), a blob indexed before or without its PUT
+/// (property 9: defects "commit `PutBlob` at `Upload`", "index on `PutFailed`"), and
+/// a store whose pause or refusal does nothing (defect "a pause holds nothing").
 #[test]
 fn a_store_outage_of_minutes_never_acks_an_unstored_blob() {
     // Half the usual seeds: a run is minutes long, and property 1 reads the whole
@@ -124,9 +124,9 @@ fn retried_elsewhere(report: &RunReport, object: ObjectId, digest: &Digest) -> b
 /// answered failed is answered `UNAVAILABLE` too, and its object is an orphan nothing
 /// indexes; each blob is acknowledged after, under another PUT's object.
 ///
-/// Catches indexing a failed PUT (property 9: mutant "index on `PutFailed`"), an ack
+/// Catches indexing a failed PUT (property 9: defect "index on `PutFailed`"), an ack
 /// of a failed PUT (property 8), and a store whose false failure answers done (the
-/// server's refusals: mutant "a kept-but-failed PUT answers `PutDone`").
+/// server's refusals: defect "a kept-but-failed PUT answers `PutDone`").
 #[test]
 fn store_errors_index_nothing_they_failed() {
     let swept = swept(Kind::StoreErrors, SEEDS);
@@ -168,7 +168,7 @@ fn store_errors_index_nothing_they_failed() {
 ///
 /// Catches a lost ack that leaves a blob never stored (property 7) or indexed under
 /// an object that lacks it (property 9), and a lost ack that is answered after all
-/// (mutant "a lost ack still sends `PutDone`": no deadline fires for it).
+/// (defect "a lost ack still sends `PutDone`": no deadline fires for it).
 #[test]
 fn a_lost_store_ack_times_out_and_leaves_an_orphan_not_a_hole() {
     let mut timed_out = 0;
@@ -197,9 +197,9 @@ fn a_lost_store_ack_times_out_and_leaves_an_orphan_not_a_hole() {
 /// The server killed or cut off at a random point of the write path, a random reach:
 /// properties 1 to 9 hold across the restart.
 ///
-/// Catches a restart that reuses the last start's object ids (property 9: mutant "a
+/// Catches a restart that reuses the last start's object ids (property 9: defect "a
 /// restart reuses the writer epoch"), and an ack sent before the commit (property 8:
-/// mutant "ack before `PutBlob`").
+/// defect "ack before `PutBlob`").
 #[test]
 fn crashes_on_the_write_path_leave_nothing_half_indexed() {
     let swept = swept(Kind::StoreCrash, SEEDS);
@@ -229,10 +229,10 @@ fn survives(after: u64, down: Down) -> bool {
 /// bytes. A crash inside the `PutBlob` commit lands in that commit, and the next start
 /// has the blob indexed exactly when the commit's record was whole on the disk.
 ///
-/// Catches a crash point that never fires (mutant "the in-commit crash is not
-/// armed"), an in-commit crash that lands in a later commit (mutant "planted 40
-/// operations on"), a power cut that keeps what a kill keeps (mutant "`PowerCut`
-/// handled as `Kill`"), a torn record read back as an entry (mutant "open keeps a
+/// Catches a crash point that never fires (defect "the in-commit crash is not
+/// armed"), an in-commit crash that lands in a later commit (defect "planted 40
+/// operations on"), a power cut that keeps what a kill keeps (defect "`PowerCut`
+/// handled as `Kill`"), a torn record read back as an entry (defect "open keeps a
 /// torn tail", property 1), and every defect the sweep above catches, at each point
 /// deterministically.
 #[test]

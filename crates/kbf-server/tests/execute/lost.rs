@@ -85,7 +85,7 @@ async fn come_back(cell: &Client, hello: Hello) -> FakeDaemon {
 /// Catches the fast path missing (buck2 would wait out the 45 s handover grace, or get
 /// INTERNAL): a daemon that restarts mid-lease and names its predecessor, whose stream
 /// has closed, has the lease run again within seconds, on the other node (the "avoid
-/// ignored" mutant would send it back to `node-a`). The client gets the second run's
+/// ignored" defect would send it back to `node-a`). The client gets the second run's
 /// OK result, which the action cache holds; the first run's late `Result` is refused,
 /// answers nobody and leaves the cache alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -115,7 +115,7 @@ async fn a_daemon_restart_mid_lease_reruns_at_once_on_another_node() {
 }
 
 /// Catches a predecessor claim honoured while the named process's stream is still open
-/// (the mutant "no closed-stream check"): that process may be alive on another machine
+/// (the defect "no closed-stream check"): that process may be alive on another machine
 /// with a copied disk, and its run would run beside the rerun. The lease is kept.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_claim_on_a_process_whose_stream_is_open_waits() {
@@ -134,7 +134,7 @@ async fn a_claim_on_a_process_whose_stream_is_open_waits() {
     );
 }
 
-/// Catches any non-empty predecessor honoured (the mutant "trust the claim"): a
+/// Catches any non-empty predecessor honoured (the defect "trust the claim"): a
 /// daemon naming a process that is not the one the node's last stream came from is
 /// not taken at its word.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -212,7 +212,7 @@ async fn an_unknown_lost_value_is_a_plain_failure() {
     daemon.no_work().await;
 }
 
-/// Catches a budget used up on the heartbeat path that answers nobody (the mutant
+/// Catches a budget used up on the heartbeat path that answers nobody (the defect
 /// "heartbeat stays quiet": the server's answer is dropped, and the client waits for
 /// ever): two runs fenced, the third lost to a proven restart, found by the restarted
 /// daemon's first heartbeat.
@@ -278,7 +278,7 @@ fn mac(instance: &str, predecessor: &str, phase: Phase, lease: Option<LeaseId>) 
 
 /// Catches a whole-machine restart mid-action answered INTERNAL (#459's "its result
 /// is lost" taken as a plain failure), and a proven restart that gives up the
-/// restoring lease before its `Start` is sent again (the mutant "requeue at
+/// restoring lease before its `Start` is sent again (the defect "requeue at
 /// registration": the node is still being cleaned). The restarted daemon gets the
 /// `Start` again, restores, reports the run lost, and is sent the action again once
 /// it serves: the only node, so the rerun goes back to it.

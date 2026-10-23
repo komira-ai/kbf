@@ -51,7 +51,7 @@ async fn the_check_builds_each_received_segment() {
     assert_eq!(got, want);
 }
 
-/// Catches a check that panics leaving the upload unanswered (mutant: the join error
+/// Catches a check that panics leaving the upload unanswered (defect: the join error
 /// propagated as a panic of the commit task, so every Commit of the upload waits
 /// forever): received buffers that do not match what was declared (the record lies
 /// past the buffer, which `Begin` never lets happen) make the check panic, and the

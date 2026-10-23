@@ -155,7 +155,7 @@ fn the_overlay_is_written_with_the_marker_and_every_value_and_then_left_alone() 
     assert!(rewritten.contains("execution_concurrency_limit = 16"));
 }
 
-/// The planted defect this verb exists to refuse: **buckconfig overwrites a foreign
+/// Catches the defect this verb exists to refuse: **buckconfig overwrites a foreign
 /// file.** A `.buckconfig.local` the operator wrote (no marker on its first line), a
 /// marker that is not at the start, a first line that only begins with
 /// the marker (`# kbf-pilot-overlay-mine`), a link and a directory are each refused, with

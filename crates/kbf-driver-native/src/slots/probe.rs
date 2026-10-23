@@ -76,9 +76,19 @@ pub(crate) fn plist_path(printed: &str) -> Option<&str> {
         .map(str::trim_end)
 }
 
+/// The program in what `launchctl print user/<uid>/<label>` says: its `program = ` line
+/// one level in. A job that names its program only in `arguments` has none.
+pub(crate) fn program_path(printed: &str) -> Option<&str> {
+    printed
+        .lines()
+        .find_map(|line| line.strip_prefix("\tprogram = "))
+        .map(str::trim_end)
+}
+
 /// The services `launchctl print user/<uid>` lists: `services = {`, one `<pid, 0 when
 /// not running> <last exit or -> <label>` per line, then `}`. A pid of 0 or less is
-/// `None`.
+/// `None`. The label is the rest of the line after the two columns, so a label with a
+/// space in it is whole.
 pub(crate) fn listed_services(domain: &str) -> Vec<(Option<i32>, String)> {
     domain
         .lines()
@@ -86,12 +96,90 @@ pub(crate) fn listed_services(domain: &str) -> Vec<(Option<i32>, String)> {
         .skip(1)
         .take_while(|line| line.trim() != "}")
         .filter_map(|line| {
-            let words: Vec<&str> = line.split_whitespace().collect();
-            let label = (*words.last()?).to_owned();
-            let pid = (words.first()?.parse().ok()).filter(|pid: &i32| *pid > 0);
-            Some((pid, label))
+            let (pid, rest) = line.trim_start().split_once(char::is_whitespace)?;
+            let (_, label) = rest.trim_start().split_once(char::is_whitespace)?;
+            let label = label.trim();
+            let pid = pid.parse().ok().filter(|pid: &i32| *pid > 0);
+            (!label.is_empty()).then(|| (pid, label.to_owned()))
         })
         .collect()
+}
+
+/// What one clean (or one lease end) has judged of launchd's services, by label and the
+/// process it runs: whether a service's plist is launchd's own ([`is_own_plist`]). A
+/// service is printed once for it, however many scans of the clean ask. A job
+/// registered again under a label runs another process, so it is judged again. Scoped
+/// to one clean: a later clean judges again, as a lease may have submitted a job under
+/// any label in between.
+#[derive(Default)]
+pub(crate) struct OwnLabels {
+    known: std::sync::Mutex<std::collections::HashMap<(String, Option<i32>), bool>>,
+}
+
+impl OwnLabels {
+    /// Whether the service `label`, running `pid`, is launchd's own: what was judged before, else what
+    /// `judge` says (called without the lock held, so a slow print blocks no other). A
+    /// `judge` that could not tell (`None`: the print failed or timed out) counts as not
+    /// own, and is not kept: the next ask judges again.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn is_own(
+        &self,
+        label: &str,
+        pid: Option<i32>,
+        judge: impl FnOnce() -> Option<bool>,
+    ) -> bool {
+        let lock = || {
+            self.known
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        let key = (label.to_owned(), pid);
+        if let Some(own) = lock().get(&key) {
+            return *own;
+        }
+        let Some(own) = judge() else {
+            return false;
+        };
+        lock().insert(key, own);
+        own
+    }
+}
+
+/// The members of `pids` that launchd lists as running one of its own agents. `list`
+/// (the domain's services) is not called when `pids` is empty, and `own` (is this label
+/// launchd's own, given its pid) is asked only of the services that run one of `pids`: a service with
+/// no process of the uid cannot be one of them.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn own_among(
+    pids: &[i32],
+    list: impl FnOnce() -> Vec<(Option<i32>, String)>,
+    mut own: impl FnMut(i32, &str) -> bool,
+) -> Vec<i32> {
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    list()
+        .into_iter()
+        .filter_map(|(pid, label)| Some((pid.filter(|pid| pids.contains(pid))?, label)))
+        .filter(|(pid, label)| own(*pid, label))
+        .map(|(pid, _)| pid)
+        .collect()
+}
+
+/// The pids of launchd's own agents among the processes of a uid whose process table was
+/// read as `pids`: those `among` finds in the table, or, when the table could not be
+/// read, all that `all` lists (the own services launchd lists as running), so that a
+/// failed read never leaves an own agent out of the list.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn own_of_uid<E>(
+    pids: Result<Vec<i32>, E>,
+    among: impl FnOnce(&[i32]) -> Vec<i32>,
+    all: impl FnOnce() -> Vec<i32>,
+) -> Vec<i32> {
+    match pids {
+        Ok(pids) => among(&pids),
+        Err(_) => all(),
+    }
 }
 
 /// The mount points in `mount`'s output (`<device> on <path> (<options>)` per line)

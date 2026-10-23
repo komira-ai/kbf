@@ -106,7 +106,7 @@ fn mode_of(exec: &ScratchHost, path: &str) -> u32 {
 /// rollback with no previous release that does anything but refuse (it would point
 /// `current` at nothing, or at itself), and a release copied with other bytes or modes.
 ///
-/// Mutant seen red: rollback falling back to the current release when there is no
+/// Catches: rollback falling back to the current release when there is no
 /// previous one (`state.previous.clone().or(state.current.clone())`).
 #[test]
 fn install_twice_then_roll_back_and_refuse_a_second_rollback() {
@@ -340,7 +340,7 @@ fn a_copy_whose_sha256_differs_is_refused_before_the_switch() {
 /// second lands with other bytes (or not at all) and is refused the same way, before any
 /// link or state names the release.
 ///
-/// Mutant seen red: the read-back loop over `source.binaries` cut to its first element.
+/// Catches: the read-back loop over `source.binaries` cut to its first element.
 #[test]
 fn every_binary_of_a_release_is_read_back_not_only_the_first() {
     let from = source("badcopy2", "kbf A", None);
@@ -399,7 +399,7 @@ fn tree(dir: &Path) -> BTreeMap<PathBuf, (u32, String)> {
 /// even makes the lock file. Each verb runs dry on a fresh host and on one with two
 /// releases, and the tree must be byte for byte what it was.
 ///
-/// Mutant seen red: the lock taken in a dry run too (`Mode::DryRun => Some(..)`).
+/// Catches: the lock taken in a dry run too (`Mode::DryRun => Some(..)`).
 #[test]
 fn a_dry_run_writes_nothing() {
     let (mut exec, root) = host("dry");
@@ -515,7 +515,7 @@ fn releases_left(exec: &ScratchHost) -> Vec<String> {
 /// of a release (here into `/etc/escape`); or that removes an entry of `releases/` that
 /// is not a release.
 ///
-/// Mutants seen red: gc without the state's current (`[state.previous, state.staged]`),
+/// Catches: gc without the state's current (`[state.previous, state.staged]`),
 /// and without the state's previous (`[state.current, state.staged]`).
 #[test]
 fn gc_keeps_current_previous_staged_and_the_newest() {
@@ -613,7 +613,7 @@ fn every_verb_refuses_while_a_deploy_is_pending() {
 /// `gc` that is refused for the trial: with a swap pending the releases it names stay, a
 /// release a process runs stays, and the rest go.
 ///
-/// Mutants planted: the pending commit not kept; the pending `previous` not kept; `in_use`
+/// Catches: the pending commit not kept; the pending `previous` not kept; `in_use`
 /// not kept.
 #[test]
 fn gc_keeps_the_swap_on_trial_and_what_runs() {
@@ -809,7 +809,7 @@ fn a_source_needs_one_binary_and_either_will_do() {
 /// the state directory; the links point at the release; the next-steps line names the
 /// daemon and `launchctl`, not `kbf` and `systemctl`.
 ///
-/// Mutant seen red: `Locked::acquire` taking the Linux lock (`/run` is not there).
+/// Catches: `Locked::acquire` taking the Linux lock (`/run` is not there).
 #[test]
 fn a_mac_install_uses_the_mac_layout_and_makes_its_missing_parents() {
     let (mut exec, layout) = mac("flow");
@@ -859,7 +859,7 @@ fn a_mac_install_uses_the_mac_layout_and_makes_its_missing_parents() {
 /// check refuses what others can write), the plan has no step for it, and a host without
 /// one gets `mkdir /usr/local` as the first step.
 ///
-/// Mutant seen red: `/usr/local` always planned (the 0775 becomes 0755).
+/// Catches: `/usr/local` always planned (the 0775 becomes 0755).
 #[test]
 fn usr_local_is_made_when_missing_and_left_alone_when_there() {
     // The installer tree is under `/usr/local` on a Mac only.
@@ -900,7 +900,7 @@ fn usr_local_is_made_when_missing_and_left_alone_when_there() {
 /// It proceeds while a deploy is pending, keeping that deploy's record; a dry run prints
 /// the plan and changes nothing; and `gc` keeps the staged release.
 ///
-/// Mutants seen red: `stage` switching the links; `stage` refusing while pending; the
+/// Catches: `stage` switching the links; `stage` refusing while pending; the
 /// staged commit not recorded (`gc` then removes the release).
 #[test]
 fn stage_copies_and_records_the_release_and_moves_no_link() {
@@ -989,7 +989,7 @@ fn stage_copies_and_records_the_release_and_moves_no_link() {
 /// install of B makes it current (A previous) and nothing is staged; with C staged, the
 /// install of B leaves C staged (another release's decision is not this one's).
 ///
-/// Mutants planted: `staged` kept by the switch; `staged` cleared whatever it names.
+/// Catches: `staged` kept by the switch; `staged` cleared whatever it names.
 #[test]
 fn installing_the_staged_release_makes_it_current_and_no_longer_staged() {
     let stage_on = |exec: &mut ScratchHost, root: &Layout, commit: &str, from: &Path| {
@@ -1122,7 +1122,7 @@ impl Exec for DiskFull<'_> {
 /// is there and the state is unchanged; the retry on a healthy disk succeeds. A release
 /// that was already installed whole is never removed by a failed repeat of its stage.
 ///
-/// Mutants seen red: the partial directory left in place; the directory removed whether
+/// Catches: the partial directory left in place; the directory removed whether
 /// or not the copy made it (the installed release goes with a failed repeat).
 #[test]
 fn a_stage_that_fills_the_disk_leaves_no_partial_release_and_can_be_retried() {
@@ -1300,7 +1300,7 @@ impl Exec for Watch {
 /// find `releases/<A>` half written, and the next install would refuse it as "there with
 /// other content" for ever.
 ///
-/// Mutant seen red: `staged` set to `None` in `copy_release` (files written at the final name).
+/// Catches: `staged` set to `None` in `copy_release` (files written at the final name).
 #[test]
 fn a_new_release_is_made_apart_and_appears_whole_under_its_name() {
     let mut w = Watch::new("s19-apart");
@@ -1351,7 +1351,7 @@ fn a_new_release_is_made_apart_and_appears_whole_under_its_name() {
 /// not know, and `reconcile` would move it back to the old release), and a state written
 /// before the release is whole.
 ///
-/// Mutant seen red: `switch` writing the state after `execute` of the links.
+/// Catches: `switch` writing the state after `execute` of the links.
 #[test]
 fn the_state_is_written_before_the_links_and_reconcile_finishes_a_swap_that_died() {
     let mut w = Watch::new("s23-state-first");
@@ -1470,7 +1470,7 @@ fn snapshot(dir: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
 /// Catches `stage` copying the release first and only then finding the state unusable, which
 /// left a published release behind an error that said "nothing was changed".
 ///
-/// Mutant seen red: the state read in `stage` moved after `copy_release`.
+/// Catches: the state read in `stage` moved after `copy_release`.
 #[test]
 fn stage_and_install_on_an_unusable_state_publish_nothing() {
     let (mut exec, root) = host("s21-stage");
@@ -1508,7 +1508,7 @@ fn stage_and_install_on_an_unusable_state_publish_nothing() {
 /// Catches stage directories piling up for ever (each is a whole release), and a sweep that
 /// takes a published release for a stage.
 ///
-/// Mutant seen red: the sweep call left out of `install`.
+/// Catches: the sweep call left out of `install`.
 #[test]
 fn a_stage_directory_a_killed_run_left_is_swept_by_install_stage_and_gc() {
     let (mut exec, root) = host("s19-sweep");
@@ -1555,7 +1555,7 @@ fn a_stage_directory_a_killed_run_left_is_swept_by_install_stage_and_gc() {
 ///
 /// Catches an install that widens a directory the package made private.
 ///
-/// Mutant seen red: the "only when missing" test dropped (both always planned).
+/// Catches: the "only when missing" test dropped (both always planned).
 #[test]
 fn an_existing_state_directory_and_install_root_keep_their_mode() {
     let (mut exec, layout) = mac("s5-modes");
@@ -1590,7 +1590,7 @@ fn an_existing_state_directory_and_install_root_keep_their_mode() {
 /// Catches the order swapped, which would for an instant point `current` at the new release
 /// with `previous` still on the one before it, and lose `previous` on a crash between.
 ///
-/// Mutants seen red: `previous` and `current` swapped in `switch`; the same in `converge`.
+/// Catches: `previous` and `current` swapped in `switch`; the same in `converge`.
 #[test]
 fn the_links_move_previous_before_current() {
     let mut w = Watch::new("m7-order");
@@ -1646,7 +1646,7 @@ fn the_links_move_previous_before_current() {
 ///
 /// Catches two stages of one process landing in one directory.
 ///
-/// Mutant seen red: `unique` returning a constant.
+/// Catches: `unique` returning a constant.
 #[test]
 fn stage_names_are_unique() {
     let names: std::collections::BTreeSet<String> = (0..2_000).map(|_| unique()).collect();
@@ -1657,7 +1657,7 @@ fn stage_names_are_unique() {
 /// would then plan to make it, over something it never saw): with `releases/` unreadable, a
 /// dry run of an install stops with the host's error naming the path, and changes nothing.
 ///
-/// Mutant planted: the inspect error read as `None` (the dry run plans the release).
+/// Catches: the inspect error read as `None` (the dry run plans the release).
 #[test]
 fn a_path_that_cannot_be_inspected_is_an_error_not_an_absent_one() {
     let (mut exec, root) = host("inspect-denied");
@@ -1675,7 +1675,7 @@ fn a_path_that_cannot_be_inspected_is_an_error_not_an_absent_one() {
 /// Catches `gc` failing on a host whose `releases/` directory is not there yet (a host that
 /// was never installed to): it has nothing to remove and says so.
 ///
-/// Mutant planted: the missing directory an error.
+/// Catches: the missing directory an error.
 #[test]
 fn gc_with_no_releases_directory_has_nothing_to_do() {
     let (mut exec, root) = host("gc-empty");
@@ -1687,7 +1687,7 @@ fn gc_with_no_releases_directory_has_nothing_to_do() {
 /// would then report nothing to remove on a host full of old releases): only a missing
 /// directory is empty, an unreadable one is an error naming it.
 ///
-/// Mutant planted: any listing error taken as "no releases".
+/// Catches: any listing error taken as "no releases".
 #[test]
 fn gc_on_an_unreadable_releases_directory_is_an_error_not_an_empty_one() {
     let (mut exec, root) = host("gc-denied");

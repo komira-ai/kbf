@@ -7,7 +7,7 @@
 //! certificate, a port, a wait that never ends), and each way a run must go red: a failed
 //! build, a failed action in an event log, a build that never ends, a process that exits, a
 //! farm that never becomes ready. The real
-//! Buck2's farm behaviour, and the mutant that shrinks a node's cap, are the workflow's.
+//! Buck2's farm behaviour, and the fault that shrinks a node's cap, are the workflow's.
 
 #![cfg(target_os = "linux")]
 
@@ -17,7 +17,7 @@ mod support;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use kbf_harness::b0::{B0, Ended, Mutant, run};
+use kbf_harness::b0::{B0, Ended, Fault, run};
 use kbf_harness::farm::Role;
 
 use support::*;
@@ -271,12 +271,12 @@ fn a_node_that_dies_on_its_own_fails_the_liveness_gate() {
 }
 
 /// Catches: the liveness gate that cannot go red: a node killed halfway through the load
-/// (the kill-node-midway mutant) must fail `processes_alive`, and the run must not call a
+/// (the kill-node-midway fault) must fail `processes_alive`, and the run must not call a
 /// farm that lost a member healthy, while the other roles stop cleanly.
 #[test]
 fn a_node_killed_midway_fails_the_liveness_gate() {
     let mut args = b0("kill-midway", "ok", 8);
-    args.mutant = Some(Mutant::KillNodeMidway);
+    args.fault = Some(Fault::KillNodeMidway);
     assert_eq!(run(&args).expect("a run"), Ended::Failed);
     let doc = document(&args);
     assert!(
@@ -400,7 +400,7 @@ fn the_command_line_runs_b0_and_exits_1_on_a_failed_gate() {
         args.project.to_str().expect("utf-8"),
         "--work",
         args.work.to_str().expect("utf-8"),
-        "--mutant",
+        "--fault",
         "kill-node-midway",
     ]
     .iter()

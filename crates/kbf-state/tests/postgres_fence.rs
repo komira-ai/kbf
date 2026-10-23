@@ -2,9 +2,8 @@
 //! fence exists to close, with a transaction held open on the server so the interleaving
 //! is the one under test and not a lucky schedule.
 //!
-//! The tests that need a server are `#[ignore]`d; the `state-postgres` job runs them with
-//! `--include-ignored`. Waits are on conditions (a connection waiting on a lock), never on
-//! elapsed time.
+//! The tests need a server (`KBF_TEST_POSTGRES_URL` names it) and fail without one. Waits are
+//! on conditions (a connection waiting on a lock), never on elapsed time.
 #![cfg(feature = "postgres")]
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,12 +16,8 @@ use kbf_state::postgres::{Flaw, PostgresBackend, PostgresStore};
 use kbf_state::{Cond, Fenced, GENERATION, Store, StoreError, Txn};
 use postgres::{Client, NoTls};
 
-const URL_VAR: &str = "KBF_TEST_POSTGRES_URL";
-
 fn url() -> String {
-    std::env::var(URL_VAR).unwrap_or_else(|_| {
-        panic!("{URL_VAR} must name a postgres:// URL the tests may create schemas in")
-    })
+    kbf_testkit::database::server_url()
 }
 
 fn backend() -> PostgresBackend {
@@ -33,7 +28,6 @@ macro_rules! on_postgres {
     ($($case:ident),+ $(,)?) => {
         $(
             #[test]
-            #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
             fn $case() {
                 fence::$case(&backend());
             }
@@ -119,7 +113,6 @@ impl Rig {
 // and only then does B hold generation 2. Never are both writers live: A's next write
 // fails Fenced.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_take_waits_for_the_holders_open_transaction() {
     let rig = Rig::new();
     let a = Fenced::take(rig.dynstore(), None).expect("A takes");
@@ -165,7 +158,6 @@ fn a_take_waits_for_the_holders_open_transaction() {
 // committed) when A's write starts; A passes a plain read of the generation, waits on the
 // server, B commits, and A's write must then fail Fenced and write nothing.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_write_that_waits_behind_a_take_is_fenced() {
     let rig = Rig::new();
     let a = Fenced::take(rig.dynstore(), None).expect("A takes");
@@ -190,7 +182,6 @@ fn a_write_that_waits_behind_a_take_is_fenced() {
 // is open when A's reap starts, A's check read passes, A's reap waits, B commits, and the
 // reap must then fail Fenced.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_reap_that_waits_behind_a_take_is_fenced() {
     let rig = Rig::new();
     let a = Fenced::take(rig.dynstore(), None).expect("A takes");

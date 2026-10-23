@@ -160,7 +160,7 @@ fn recover_and_extend(disk: &FaultFs, model: &Model, why: &str) -> Recovered {
     rec
 }
 
-/// Catches (each a mutant that turns this red): a persist that returns before its
+/// Catches (each of these turns it red): a persist that returns before its
 /// fsync, or before the directory fsync of a new segment or the hard state's rename
 /// (an acknowledged write is gone after the crash); an open that accepts a torn record
 /// or truncates past the torn tail (an entry that was never written, or an

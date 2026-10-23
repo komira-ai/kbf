@@ -9,7 +9,7 @@ use super::*;
 /// refuses it; served without the secret, the gate would take the call as direct and
 /// answer it. Readiness still answers a plain local probe.
 ///
-/// Mutant: the stand-in served with no secret (`None`) answers `200` to the malformed call.
+/// Catches: the stand-in served with no secret (`None`) answers `200` to the malformed call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_candidate_behind_the_proxy_gates_its_operator_port() {
     const SECRET: [u8; 32] = [0x5a; 32];

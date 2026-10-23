@@ -146,7 +146,7 @@ async fn a_large_write_of_other_bytes_than_its_digest_names_is_refused_and_not_s
 /// Catches: a large write whose stream ends before its last message (no `finish_write`)
 /// committing the part it got, answered with the tier's error instead of the stream's own
 /// refusal (INVALID_ARGUMENT, so a client knows its stream was at fault), or leaving the
-/// blob findable. Mutant seen red: the stream's refusal dropped in `write`.
+/// blob findable. Catches: the stream's refusal dropped in `write`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_large_write_that_is_cut_short_stores_nothing() {
     let farm = Farm::new(Capabilities::default());

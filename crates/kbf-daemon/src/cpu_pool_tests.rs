@@ -6,7 +6,7 @@ use std::sync::{Arc, Barrier};
 use super::*;
 
 /// Catches a pool that runs fewer or more jobs at once than it was given threads for
-/// (mutant: `threads.max(1)` replaced by a constant 1, or by twice the count): with 3
+/// (defect: `threads.max(1)` replaced by a constant 1, or by twice the count): with 3
 /// threads, 3 jobs that wait for each other at a barrier all finish (so 3 run at once),
 /// and the most ever running while 12 jobs are queued is 3.
 #[tokio::test]
@@ -44,7 +44,7 @@ async fn it_runs_as_many_jobs_at_once_as_it_has_threads() {
 }
 
 /// Catches a pool of no threads, which would never run a job, and a panic that kills a
-/// thread or goes unreported (mutants: the `max(1)` dropped; the `catch_unwind` dropped,
+/// thread or goes unreported (defects: the `max(1)` dropped; the `catch_unwind` dropped,
 /// which leaves the single thread dead so the next job never runs): a job that panics
 /// is an error to its caller, and the one thread runs the next job.
 #[tokio::test]

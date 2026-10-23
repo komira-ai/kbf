@@ -135,7 +135,7 @@ impl Rig {
 /// the right one with the new release running keeps it. With nothing pending it needs the
 /// operator (exit 5).
 ///
-/// Mutants planted: the activation compared with the wrong field (any name is accepted);
+/// Catches: the activation compared with the wrong field (any name is accepted);
 /// `accept_confirm` skipped; `apply` ignored (the dry run keeps the swap).
 #[test]
 fn confirm_names_the_pending_activation_and_needs_the_new_release_running() {
@@ -190,7 +190,7 @@ fn confirm_names_the_pending_activation_and_needs_the_new_release_running() {
 /// the unit is restarted once under the lock, and the marker is gone. A dry run does none
 /// of it.
 ///
-/// Mutants planted: the restart skipped; the marker not removed; `apply` ignored.
+/// Catches: the restart skipped; the marker not removed; `apply` ignored.
 #[test]
 fn revert_goes_back_restarts_once_and_leaves_no_marker() {
     let mut rig = Rig::new("revert", true);
@@ -211,7 +211,7 @@ fn revert_goes_back_restarts_once_and_leaves_no_marker() {
 /// the failure is reported (exit 1), and the marker stays for the service's next pass,
 /// which restarts the unit and removes it.
 ///
-/// Mutants planted: the marker written after the change instead of before; the marker
+/// Catches: the marker written after the change instead of before; the marker
 /// removed even when the restart failed.
 #[test]
 fn a_restart_that_fails_stays_owed_to_the_next_pass() {
@@ -234,7 +234,7 @@ fn a_restart_that_fails_stays_owed_to_the_next_pass() {
 /// `previous` (only a confirmed release is ever previous), and a second one has nothing to
 /// go back to (exit 5).
 ///
-/// Mutants planted: the pending check removed; `previous` left as it was.
+/// Catches: the pending check removed; `previous` left as it was.
 #[test]
 fn rollback_goes_to_previous_and_only_when_nothing_is_on_trial() {
     let mut rig = Rig::new("rollback", true);
@@ -289,7 +289,7 @@ impl Rig {
 /// dry run too, before anything is written: `state.json` is the same bytes, `current` stays, no
 /// restart is owed or made. The message says why and the way forward.
 ///
-/// Mutants planted: the bundled check removed (the rollback goes ahead); an unknown relay read
+/// Catches: the bundled check removed (the rollback goes ahead); an unknown relay read
 /// as relaying (the no-field and no-JSON cases go ahead); the check made after the state is
 /// written (the bytes differ).
 #[test]
@@ -332,7 +332,7 @@ fn a_bundled_host_is_not_rolled_back_to_a_kbf_that_cannot_relay() {
 /// goes ahead as it always did, and the release asked is the one rolled back to (the current
 /// release has no answer in the fake, so asking it would refuse).
 ///
-/// Mutants planted: the current release asked instead of `previous`; the answer inverted.
+/// Catches: the current release asked instead of `previous`; the answer inverted.
 #[test]
 fn a_bundled_host_is_rolled_back_to_a_kbf_that_relays() {
     let mut rig = Rig::new("bundled-relays", false);
@@ -351,7 +351,7 @@ fn a_bundled_host_is_rolled_back_to_a_kbf_that_relays() {
 /// `installer.toml` cannot be read) rolls back to a kbf that does not relay as it always did,
 /// and the release is not even asked.
 ///
-/// Mutants planted: the source word not compared (every host is checked); the unknown source
+/// Catches: the source word not compared (every host is checked); the unknown source
 /// treated as bundled.
 #[test]
 fn a_host_that_fetches_is_rolled_back_whatever_the_previous_kbf_relays() {
@@ -377,7 +377,7 @@ fn a_host_that_fetches_is_rolled_back_whatever_the_previous_kbf_relays() {
 /// `previous` = `current`. A `staged` that names another release is another decision's and
 /// stays.
 ///
-/// Mutants planted: `staged` carried over by `revert_in`; the same in `rollback_in`;
+/// Catches: `staged` carried over by `revert_in`; the same in `rollback_in`;
 /// `staged` cleared whatever it names in either.
 #[test]
 fn a_revert_or_rollback_drops_a_staged_release_it_puts_back_and_keeps_another() {
@@ -405,7 +405,7 @@ fn a_revert_or_rollback_drops_a_staged_release_it_puts_back_and_keeps_another() 
 /// pending swap and a release a process runs stay; the others go only with `apply`; and a
 /// host whose processes cannot be listed removes nothing (exit 1).
 ///
-/// Mutants planted: in-use ignored; the dry run applying; the blind host treated as empty.
+/// Catches: in-use ignored; the dry run applying; the blind host treated as empty.
 #[test]
 fn gc_keeps_what_runs_and_removes_nothing_when_it_cannot_tell() {
     let mut rig = Rig::new("gc", true);
@@ -445,7 +445,7 @@ fn gc_keeps_what_runs_and_removes_nothing_when_it_cannot_tell() {
 /// every verb is busy (exit 4) and changes nothing; `quiesce` is exit 5 while a swap is
 /// pending and ok when the host is at rest.
 ///
-/// Mutants planted: the lock not taken by `confirm`; `quiesce` ignoring the pending swap.
+/// Catches: the lock not taken by `confirm`; `quiesce` ignoring the pending swap.
 #[test]
 fn verbs_are_busy_while_the_lock_is_held_and_quiesce_wants_rest() {
     let mut rig = Rig::new("busy", true);
@@ -485,7 +485,7 @@ fn lose_previous_binary(rig: &Rig) {
 /// binary gone, `revert` is refused as a failure (exit 1), nothing moves and no marker stays;
 /// a `rollback` of a host with no trial is refused the same way before anything moves.
 ///
-/// Mutants planted: the marker removal after a failed change dropped; the binary of the
+/// Catches: the marker removal after a failed change dropped; the binary of the
 /// release rolled back to not looked for.
 #[test]
 fn a_change_that_fails_leaves_no_marker_and_moves_nothing() {
@@ -525,7 +525,7 @@ fn a_change_that_fails_leaves_no_marker_and_moves_nothing() {
 /// removed after the restart being passed over: the first is exit 1 with nothing moved, the
 /// second is exit 1 after the restart, the marker still there for the next pass.
 ///
-/// Mutants planted: the write error ignored (the links move); the removal error ignored.
+/// Catches: the write error ignored (the links move); the removal error ignored.
 #[test]
 fn a_marker_that_cannot_be_written_or_removed_is_reported() {
     let mut rig = Rig::new("marker-write", true);
@@ -569,7 +569,7 @@ fn a_marker_that_cannot_be_written_or_removed_is_reported() {
 /// release with nothing before it need the operator (5), a verb naming another activation is
 /// refused (3), and every other state or release error failed (1).
 ///
-/// Mutants planted: the busy arm folded into failed; the unusable state a plain failure.
+/// Catches: the busy arm folded into failed; the unusable state a plain failure.
 #[test]
 fn errors_land_on_the_exit_of_the_contract() {
     use crate::state::StateError;
@@ -607,7 +607,7 @@ fn errors_land_on_the_exit_of_the_contract() {
 /// directory closed, `rollback` is exit 1 with the state moved and the marker kept; with a
 /// state file of another schema `quiesce` is a failure.
 ///
-/// Mutants planted: the rollback error swallowed (success reported); the read error of
+/// Catches: the rollback error swallowed (success reported); the read error of
 /// `quiesce` treated as an empty state.
 #[test]
 fn a_rollback_that_fails_late_keeps_the_marker_and_quiesce_needs_a_readable_state() {

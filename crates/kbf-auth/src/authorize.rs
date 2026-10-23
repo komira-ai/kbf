@@ -244,7 +244,7 @@ mod tests {
         }
     }
 
-    /// Catches: a deny that allows (mutant "deny allows"), answers that are not one
+    /// Catches: a deny that allows (defect "deny allows"), answers that are not one
     /// per instance name, and a refusal not wrapped as Buildbarn wraps it.
     #[tokio::test]
     async fn authorize_wraps_a_refusal_and_keeps_its_code() {

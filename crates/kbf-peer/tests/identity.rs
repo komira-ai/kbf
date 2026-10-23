@@ -124,7 +124,7 @@ fn an_entry_names_a_certificate_by_serial_key_or_dns_name() {
 /// lines): not an IP name written the same, not the role URI, not the common name, not a
 /// name that is a prefix of it or has a trailing dot or a port.
 ///
-/// Mutant seen red: the names compared with `==`.
+/// Catches: the names compared with `==`.
 #[test]
 fn a_node_entry_names_a_dns_name_up_to_case_and_nothing_else() {
     let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
@@ -169,7 +169,7 @@ fn a_node_entry_names_a_dns_name_up_to_case_and_nothing_else() {
 /// another host, does not. A wildcard name is denied by the entry that spells it and by no
 /// host it would cover.
 ///
-/// Mutants seen red: only the first DNS name looked at; a wildcard name skipped.
+/// Catches: only the first DNS name looked at; a wildcard name skipped.
 #[test]
 fn a_node_entry_names_a_certificate_by_any_of_its_dns_names() {
     for sans in [
@@ -202,7 +202,7 @@ fn a_node_entry_names_a_certificate_by_any_of_its_dns_names() {
 /// name that node (and only it, up to case) and no IP address, and no `serial` or
 /// `spki-sha256` entry may name it, since the proxy forwards neither.
 ///
-/// Mutants seen red: the node left out of the names; an IP host covered; a serial entry
+/// Catches: the node left out of the names; an IP host covered; a serial entry
 /// that names the empty serial.
 #[test]
 fn a_proxied_identity_is_one_node_and_no_serial_or_key() {
@@ -224,7 +224,7 @@ fn a_proxied_identity_is_one_node_and_no_serial_or_key() {
 /// covered by the same address and by no other, whatever the two have in common as text, and
 /// a DNS host by the node only.
 ///
-/// Mutants seen red: the addresses dropped; a prefix, suffix or substring match; the mapped
+/// Catches: the addresses dropped; a prefix, suffix or substring match; the mapped
 /// IPv6 form equated with IPv4.
 #[test]
 fn a_proxied_identity_covers_exactly_its_ips() {

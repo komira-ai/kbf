@@ -97,7 +97,7 @@ pub const LEASE_PARAM: &str = "KBF_LEASE";
 /// rules, as the same test shows; there is no `file-link` rule.
 ///
 /// Launchd already refuses a job from any sandboxed process, `(allow default)` alone
-/// included, as `tests/launchd.rs` shows on the macOS runner (and the mutants that
+/// included, as `tests/launchd.rs` shows on the macOS runner (and the defects that
 /// dropped `(deny job-creation)` stayed green). The rule stays as defence in depth: it
 /// keeps the refusal in this profile rather than in launchd's current behaviour.
 /// `(deny lsopen)` is load-bearing: without it an action opens an application, which
@@ -293,7 +293,7 @@ impl WeakenedProfile {
 /// module's tests check that each mach rule is a `global-name-prefix` covering every
 /// name listed here. Their place in the profile does
 /// not decide: with the `usbmuxd` rule before [`NO_NETWORK_PROFILE`]'s allow for every
-/// Unix socket (a mutant), the runner still refused the connect. A lease that books a
+/// Unix socket (a defect), the runner still refused the connect. A lease that books a
 /// device is to get a profile without these (`docs/design/ios-devices.md`, section
 /// 6.1); none does yet.
 pub const NO_DEVICE_RULES: &str = "(deny mach-lookup (global-name-prefix \"com.apple.CoreDevice.\"))\n\
@@ -780,7 +780,7 @@ mod tests {
     /// Catches a generated slot profile that lacks a deny or allow the code means it to
     /// carry (a dropped `(deny file-write*)` would let a pool user write anywhere, and
     /// only the macOS canary would notice), on Linux and in every pull request. Weakening
-    /// seen red: deleting the `(deny file-write*)` line from `SLOT_PROFILE` fails the
+    /// is caught: deleting the `(deny file-write*)` line from `SLOT_PROFILE` fails the
     /// `On` and `Off` rows for it; dropping it from `SLOT_NO_NETWORK_PROFILE` alone
     /// fails `Off`.
     #[test]

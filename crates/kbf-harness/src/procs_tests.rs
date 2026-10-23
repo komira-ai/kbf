@@ -253,7 +253,7 @@ fn ending_a_process_ends_what_it_started() {
     // Catches: a role killed while the actions of its native driver (its children) run on,
     // alone, in the dark: the frontend, nodes and daemons of a run that ended would
     // leave their own children behind. `find` starts `sleep` and stays; killing `find`
-    // must kill `sleep`. Mutant: `kill` signals the process alone, not its group.
+    // must kill `sleep`. Catches: `kill` signals the process alone, not its group.
     let d = crate::scratch("group");
     let mut proc = Proc::start(
         &spec(
@@ -283,7 +283,7 @@ fn ending_a_process_ends_what_it_started() {
 fn a_process_that_exits_takes_what_it_left_running_with_it() {
     // Catches: a role that exited (or crashed) on its own leaving its children running, to
     // hold a port or a lease directory of the next run. The helper starts `sleep` and
-    // exits; the supervisor sweeps the group when it finds the leader ended. Mutant:
+    // exits; the supervisor sweeps the group when it finds the leader ended. Catches:
     // `exited` does not sweep.
     let d = crate::scratch("sweep");
     let report = d.join("report");
@@ -299,7 +299,7 @@ fn a_harness_that_is_killed_leaves_no_process_running() {
     // Catches: a CI job's cancel or timeout (SIGKILL after the grace period) leaving the
     // frontend, nodes and daemons of the run behind, each holding its ports into the
     // next job on the runner. The helper is a harness holding one `sleep`; it is killed
-    // without a chance to run anything. Mutant: no parent-death signal in `Proc::start`.
+    // without a chance to run anything. Catches: no parent-death signal in `Proc::start`.
     let d = crate::scratch("pdeathsig");
     let report = d.join("report");
     let mut harness = helper_process("harness", &report)
@@ -320,7 +320,7 @@ fn a_term_signal_stops_the_farm_through_the_harnesss_own_exit() {
     // Catches: a harness that dies of SIGTERM at once (the default), skipping the stop, the
     // result document and the kill of the Buck2 daemons: with the handler installed it sets
     // the flag its waits look at, and the run stops its processes (stop_all, which reports
-    // them) and exits by itself. Mutant: `install` installs nothing.
+    // them) and exits by itself. Catches: `install` installs nothing.
     let d = crate::scratch("sigterm");
     let report = d.join("report");
     let mut harness = helper_process("interruptible", &report)
@@ -370,7 +370,7 @@ fn the_child_asks_for_sigkill_when_its_harness_goes() {
     // Catches: a child started without the parent-death signal, or with another signal than
     // the one that cannot be ignored. The function the child runs between fork and exec is
     // run in a process of its own (the child's counters are lost at exec) and the process
-    // says what the kernel then holds. Mutant: the function asks for nothing.
+    // says what the kernel then holds. Catches: the function asks for nothing.
     let d = crate::scratch("deathsig");
     let report = d.join("report");
     let status = helper_process("deathsig", &report)
@@ -387,7 +387,7 @@ fn the_sentinel_leads_a_session_of_its_own() {
     // group (a terminal's interrupt, a runner's kill of the job's group) takes with it before
     // it has cleaned up. The function the sentinel runs between fork and exec is run in a
     // process of its own (the child's counters are lost at exec), which says its session.
-    // Mutant: the function does nothing.
+    // Catches: the function does nothing.
     let d = crate::scratch("session");
     let report = d.join("report");
     let status = helper_process("session", &report)
@@ -418,7 +418,7 @@ fn a_harness_killed_by_sigkill_leaves_no_buck2_daemon_running() {
     // parent-death signal does not reach it. The helper is a harness holding a sentinel and a
     // load of two loops over the stand-in `buck2`, which notes every `kill` it is given;
     // nothing is killed while the harness lives, and after its SIGKILL the sentinel kills both
-    // daemons. Mutants: no sentinel is started; the sentinel's input is not a pipe the
+    // daemons. Catches: no sentinel is started; the sentinel's input is not a pipe the
     // harness holds (the sentinel then cleans up at once, and the first check fails).
     let d = crate::scratch("reaped");
     let report = d.join("report");
@@ -475,7 +475,7 @@ fn a_harness_killed_by_sigkill_takes_what_its_roles_started_with_it() {
     // reaches the role only, and without the sentinel's kill of the recorded groups the
     // `sleep` that `find` started runs on, holding the runner. The helper is a harness with
     // a sentinel and a role (`find`) that started `sleep`; the harness is killed with no
-    // chance to run anything. Mutant: the sentinel does not kill the recorded groups
+    // chance to run anything. Catches: the sentinel does not kill the recorded groups
     // (`kill_groups` is not called).
     let d = crate::scratch("grouped");
     let report = d.join("report");
@@ -503,7 +503,7 @@ fn what_a_killed_harness_recorded_survives_the_sweep_of_a_test_that_starts() {
     // thousands, each in a process of its own) removes the directories of dead ones, the
     // records with them, in the moment before the sentinel reads them: the grandchild then
     // runs on. Here the sweep is run by hand between the kill and the check, which makes
-    // the race a certainty. Mutant: the helper makes its directory with `scratch` (named
+    // the race a certainty. Catches: the helper makes its directory with `scratch` (named
     // for its own process id) instead of using its test's.
     let d = crate::scratch("sweep-race");
     let report = d.join("report");
@@ -532,7 +532,7 @@ fn what_a_killed_harness_recorded_survives_the_sweep_of_a_test_that_starts() {
 fn a_process_records_its_group_while_it_runs_and_not_after() {
     // Catches: a role with no record (the sentinel cannot find its group), and a record left
     // after the group was swept (a recycled group id the sentinel would then kill).
-    // Mutants: no file written; `sweep` leaves the file.
+    // Catches: no file written; `sweep` leaves the file.
     let d = crate::scratch("pgid-file");
     let mut proc = Proc::start(&spec("rec", "sleep", &["300"], &d), &d, 0);
     let file = pgid_file(&d, "rec", 0);
@@ -553,7 +553,7 @@ fn a_process_records_its_group_while_it_runs_and_not_after() {
 fn a_group_that_cannot_be_recorded_is_said_and_the_process_still_starts() {
     // Catches: a role that cannot write its record (a full or read-only logs directory)
     // failing silently, or taking the harness down: the record is best effort, because the
-    // parent-death signal still kills the role, and the failure goes to stderr. Mutant: the
+    // parent-death signal still kills the role, and the failure goes to stderr. Catches: the
     // `eprintln!` removed; the error `unwrap`ped.
     let file = Path::new("/proc/no/such/dir/x.pgid");
     write_pgid(file, 7);
@@ -565,7 +565,7 @@ fn log_hits_names_the_file_and_line_of_every_generation_and_stream() {
     // Catches: a scan of the current generation only (a restart's predecessor is where a
     // drop is logged), of stdout only, of lines that do not hold the needle, or of files
     // that are not logs (a `.pgid`, a directory).
-    // Mutants: `.err` skipped; the generation filter; the needle test inverted.
+    // Catches: `.err` skipped; the generation filter; the needle test inverted.
     let d = crate::scratch("log-hits");
     let (out0, err0) = log_files(&d, "node-1", 0);
     let (out1, err1) = log_files(&d, "node-1", 1);

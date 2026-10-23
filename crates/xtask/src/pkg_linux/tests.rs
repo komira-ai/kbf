@@ -28,6 +28,7 @@ impl Tree {
         }
         t.put("sysusers.conf", "u kbf");
         t.put("tmpfiles.conf", "d /x");
+        t.put("needrestart.conf", "# n");
         t
     }
 
@@ -46,6 +47,7 @@ impl Tree {
             trust: at("trust"),
             sysusers: at("sysusers.conf"),
             tmpfiles: at("tmpfiles.conf"),
+            needrestart: at("needrestart.conf"),
             platform: Platform::LinuxX86_64,
             version: "0.0.0+ci",
         }
@@ -68,6 +70,7 @@ fn the_plan_is_the_contract_paths_with_their_modes() {
         .map(|e| (e.dst, e.mode, e.sha256.is_some()))
         .collect();
     let want = [
+        ("/etc/needrestart/conf.d/kbf.conf", 0o644, true),
         ("/usr/bin/kbf-installer", 0o755, true),
         ("/usr/lib/systemd/system/kbf-installer.service", 0o644, true),
         ("/usr/lib/systemd/system/kbf-node.service", 0o644, true),
@@ -402,6 +405,7 @@ fn the_fixtures_make_a_plan_with_the_real_files() {
         trust: &root.join("testdata/trust"),
         sysusers: &root.join("sysusers.d/kbf-installer.conf"),
         tmpfiles: &root.join("tmpfiles.d/kbf-installer.conf"),
+        needrestart: &root.join("needrestart/kbf.conf"),
         platform: Platform::LinuxX86_64,
         version: "0.0.0+ci",
     })
@@ -660,6 +664,7 @@ fn the_package_ships_exactly_the_units_directory() {
         trust: &root.join("testdata/trust"),
         sysusers: &root.join("sysusers.d/kbf-installer.conf"),
         tmpfiles: &root.join("tmpfiles.d/kbf-installer.conf"),
+        needrestart: &root.join("needrestart/kbf.conf"),
         platform: Platform::LinuxX86_64,
         version: "0.0.0+ci",
     })
@@ -776,4 +781,90 @@ fn every_user_and_group_a_packaged_unit_names_is_made_by_sysusers() {
         }
     }
     assert!(seen > 0);
+}
+
+/// The unit-name pattern of the needrestart drop-in's override line, `^kbf[-.@]`, read
+/// as the plain check it is: a literal prefix, then one character of a class.
+fn needrestart_pattern(text: &str) -> (String, Vec<char>) {
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("$nrconf{override_rc}{qr("))
+        .expect("an override_rc line");
+    assert!(line.ends_with(")} = 0;"), "{line:?}");
+    let pattern = line
+        .strip_prefix("$nrconf{override_rc}{qr(^")
+        .and_then(|r| r.strip_suffix(")} = 0;"))
+        .expect("an anchored qr()");
+    let (prefix, class) = pattern.split_once('[').expect("a character class");
+    let class = class.strip_suffix(']').expect("a closed class");
+    (prefix.to_owned(), class.chars().collect())
+}
+
+fn needrestart_skips(text: &str, unit: &str) -> bool {
+    let (prefix, class) = needrestart_pattern(text);
+    unit.strip_prefix(prefix.as_str())
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|c| class.contains(&c))
+}
+
+#[test]
+fn the_package_holds_the_needrestart_drop_in_as_a_0644_config_file() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux");
+    let plan = plan(&Inputs {
+        binary: &root.join("units/kbf-installer.service"),
+        units: &root.join("units"),
+        trust: &root.join("testdata/trust"),
+        sysusers: &root.join("sysusers.d/kbf-installer.conf"),
+        tmpfiles: &root.join("tmpfiles.d/kbf-installer.conf"),
+        needrestart: &root.join("needrestart/kbf.conf"),
+        platform: Platform::LinuxX86_64,
+        version: "0.0.0+ci",
+    })
+    .expect("the real files are a plan");
+    let e = plan
+        .iter()
+        .find(|e| e.dst == "/etc/needrestart/conf.d/kbf.conf")
+        .expect("the drop-in is packaged");
+    assert_eq!((e.mode, e.sha256.is_some()), (0o644, true));
+    let yaml = config(&plan, Platform::LinuxX86_64, "0.0.0+ci");
+    let at = yaml
+        .find("dst: \"/etc/needrestart/conf.d/kbf.conf\"")
+        .expect("in the nfpm configuration");
+    let block = yaml[at..].split("  - dst:").next().expect("block");
+    assert!(block.contains("config|noreplace"), "{block}");
+    assert!(block.contains("mode: 0644"), "{block}");
+}
+
+#[test]
+fn the_needrestart_override_matches_every_packaged_unit_and_a_templated_instance() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux");
+    let text = std::fs::read_to_string(root.join("needrestart/kbf.conf")).expect("drop-in");
+    let mut names: Vec<String> = std::fs::read_dir(root.join("units"))
+        .expect("units")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(!names.is_empty());
+    names.push("kbf-frontend@a.service".to_owned());
+    for name in names {
+        assert!(needrestart_skips(&text, &name), "{name} is not skipped");
+    }
+}
+
+#[test]
+fn the_needrestart_override_leaves_other_units_to_needrestart() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux");
+    let text = std::fs::read_to_string(root.join("needrestart/kbf.conf")).expect("drop-in");
+    for name in [
+        "ssh.service",
+        "kbfx.service",
+        "postgresql.service",
+        "my-kbf-a.service",
+    ] {
+        assert!(!needrestart_skips(&text, name), "{name} is skipped");
+    }
+    assert!(
+        text.lines()
+            .any(|l| l == "$nrconf{override_rc}{qr(^kbf[-.@])} = 0;"),
+        "the override sets the restart choice to 0 (never)"
+    );
 }

@@ -1,5 +1,5 @@
 //! The frontend swap against the fakes of [`super::fakes`]. Each test names the defect it
-//! catches; the mutants that were planted to see it red are listed in the PR.
+//! catches.
 
 use std::time::Duration;
 

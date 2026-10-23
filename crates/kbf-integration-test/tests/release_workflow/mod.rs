@@ -3,29 +3,40 @@
 //! reports each way it differs; the real file must report none, and `tests` plants a defect for
 //! each rule on it.
 //!
-//! - **Events.** Exactly [`EVENTS`] (`push` filtered to `branches: [main]`, and
-//!   `workflow_dispatch`), and the dispatch takes no input. `push` is refused unless every job
-//!   of [`CHAIN`] is present: a push cuts a release only through the whole chain.
+//! - **Events.** Exactly [`EVENTS`]: `workflow_run` of the workflow `pipeline`, `completed`, for
+//!   `branches: [main]` (the one use of the trigger in the repository: `workflows/workflow_run.rs`
+//!   holds the rest of the rule). No dispatch, no push, no tag. `workflow_run` is refused unless
+//!   every job of [`CHAIN`] is present: a pipeline run cuts a release only through the whole chain.
+//!   Every job names the run that started it in its own `if:` or through `plan`: its conclusion is
+//!   `success`, its event `push`, its branch `main` and its repository this one ([`PLAN_IF`]).
 //! - **The graph.** The jobs [`JOBS`], in that order, each with exactly the `needs`, token
-//!   scopes, `if:` and `environment` of [`RULES`]; the jobs that write need `gates`, `plan` and
-//!   `verify`, directly or through another. Only `publish` holds a write scope (`contents`),
-//!   `id-token` is in no job ([`ID_TOKEN`]), and the jobs that tag, publish or bump run only
-//!   under [`RELEASE_IF`]: a push to `main` of code that is not a change to the pipeline.
+//!   scopes, `if:` and `environment` of [`RULES`]; the jobs that write need `plan` and `verify`,
+//!   directly or through another. Only `publish` holds a write scope (`contents`), `id-token` is
+//!   in no job ([`ID_TOKEN`]), and the jobs that tag, publish or bump run only under
+//!   [`RELEASE_IF`]: a successful pipeline run for a push to `main` of code that is not a change
+//!   to the pipeline.
+//! - **Never cancelled, never queued behind a skipped run.** The concurrency group is `release`
+//!   for a successful pipeline run and the run's own for any other (a cancelled or red pipeline
+//!   run starts this workflow too, to skip it, and must not replace a release waiting in the
+//!   group), and it never cancels.
 //! - **Halt on red.** No `always()`, `failure()`, `cancelled()` or `continue-on-error`, and no
 //!   step under `if:` but the ones of `notes` that read the previous release.
-//! - **One commit.** Every checkout is of `github.sha` (no `ref`, `repository` or `token`), and
-//!   no expression reads `inputs.`, a pull request or `head_ref`.
+//! - **One commit.** The workflow sets `COMMIT` to the commit the pipeline run built and
+//!   `PIPELINE_RUN` to its id; every checkout is of that commit (a `ref` of exactly that, no
+//!   `repository` or `token`), and no expression reads `inputs.`, a pull request or `head_ref`,
+//!   nor the name or message of the run that started this one outside the trigger condition.
 //! - **Who holds the bot's key.** `RELEASE_BOT_*` and `actions/create-github-app-token` appear
 //!   in `tag` and `bump` only, and both declare the `release` environment (so moving the key to
 //!   an environment secret is a setting). `RELEASE_FREEZE` is read in `plan` only, and
 //!   `RELEASE_TAGGER_*` nowhere. The token is minted after the build, scoped to one repository and
 //!   the permissions the job needs, and only the step that writes holds it.
-//! - **Data flow.** `gates` outputs the three run ids, `plan` the version, tag and class of
-//!   the push, `verify` downloads the files of the run `gates` saw; `tag` writes the
-//!   record from the gates and tags the planned tag at `github.sha` with that record; `notes`
-//!   checks the tag and writes the notes and the set hash; `publish` is given those, the planned
-//!   tag and `github.sha`; `bump` is given the planned version. Each flag below is held to the
-//!   value that makes it mean what its verb says.
+//! - **Data flow.** `plan` outputs the version, tag and class of the push, from the commit the
+//!   pipeline run left for it; `verify` downloads the files of the pipeline run that started this
+//!   one and no other; `tag` writes the record from that run and tags the planned tag at
+//!   `COMMIT` with that record; `notes` checks the tag and writes the notes and the set hash;
+//!   `publish` is given those, the planned tag and `COMMIT`; `bump` is given the planned version.
+//!   Only `plan` and `verify` read another run's artifacts; every later job takes what `verify`
+//!   checked. Each flag below is held to the value that makes it mean what its verb says.
 //! - **The shared rules.** Actions pinned to a full commit SHA, hosted runners and an empty
 //!   top-level `permissions` are the workflow lint's (`workflows`); they are repeated here so a
 //!   defect planted in this file reads red from this test too.
@@ -36,26 +47,43 @@ use super::workflows;
 const PUBLISH: &str = "publish";
 
 /// The jobs, in file order.
-const JOBS: [&str; 7] = ["gates", "plan", "verify", "tag", "notes", PUBLISH, "bump"];
+const JOBS: [&str; 6] = ["plan", "verify", "tag", "notes", PUBLISH, "bump"];
 
-/// The events that start the workflow. `push` is allowed only with the filter
-/// `branches: [main]` and only while [`CHAIN`] is whole.
-const EVENTS: &[&str] = &["push", "workflow_dispatch"];
+/// The events that start the workflow: the completion of a run of [`PIPELINE`], filtered to
+/// [`TYPES`] and `branches: [main]`, and only while [`CHAIN`] is whole.
+const EVENTS: &[&str] = &["workflow_run"];
 
-/// The jobs a push to `main` must find in the workflow before it may start it: the gates, the
-/// plan, the checks, the tag, the publish and the bump. (No site job: none exists.)
-const CHAIN: &[&str] = &["gates", "plan", "verify", "tag", PUBLISH, "bump"];
+/// The workflow whose completion starts the release (its `name:`).
+pub const PIPELINE: &str = "pipeline";
+
+/// The activity types of the trigger.
+const TYPES: &str = "completed";
+
+/// The jobs a pipeline run must find in the workflow before it may start it: the plan, the
+/// checks, the tag, the publish and the bump. (No site job: none exists.)
+const CHAIN: &[&str] = &["plan", "verify", "tag", PUBLISH, "bump"];
 
 /// The environment of the jobs that hold the release bot's key or write.
 const ENVIRONMENT: &str = "release";
+
+/// The commit the pipeline run built, and its id, as the workflow sets `COMMIT` and
+/// `PIPELINE_RUN` (a `workflow_run` run's own `github.sha` is the latest commit of main).
+pub const COMMIT_EXPR: &str = "${{ github.event.workflow_run.head_sha }}";
+pub const RUN_EXPR: &str = "${{ github.event.workflow_run.id }}";
 
 /// The `if:` of `verify`: a push that ships code and does not change the pipeline.
 pub const VERIFY_IF: &str =
     "${{ needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}";
 
-/// The `if:` of every job that tags, publishes or bumps: a push to `main` (never a dispatch,
-/// so a dry run writes nothing), of code, that is not a change to the release pipeline itself.
-pub const RELEASE_IF: &str = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}";
+/// The `if:` of every job that tags, publishes or bumps: a successful pipeline run for a push to
+/// `main` (so a run that was cancelled, or red, writes nothing), of code, that is not a change
+/// to the release pipeline itself.
+pub const RELEASE_IF: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}";
+
+/// The `if:` of `plan`, which every other job needs: the run that started this one succeeded (so
+/// ci, artifacts and beta all did, each needing the one before), for a push, to main, of this
+/// repository.
+pub const PLAN_IF: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository }}";
 
 /// The jobs that may hold `id-token: write`: none (the kbf.dev upload is a later change that
 /// adds its job here).
@@ -79,45 +107,38 @@ const READ: &[(&str, &str)] = &[
     ("attestations", "read"),
 ];
 
-const RULES: [Rule; 7] = [
-    Rule {
-        job: "gates",
-        needs: &[],
-        permissions: &[("contents", "read"), ("actions", "read")],
-        condition: None,
-        environment: None,
-    },
+const RULES: [Rule; 6] = [
     Rule {
         job: "plan",
-        needs: &["gates"],
-        permissions: &[("contents", "read")],
-        condition: None,
+        needs: &[],
+        permissions: &[("contents", "read"), ("actions", "read")],
+        condition: Some(PLAN_IF),
         environment: None,
     },
     Rule {
         job: "verify",
-        needs: &["gates", "plan"],
+        needs: &["plan"],
         permissions: READ,
         condition: Some(VERIFY_IF),
         environment: None,
     },
     Rule {
         job: "tag",
-        needs: &["gates", "plan", "verify"],
+        needs: &["plan", "verify"],
         permissions: &[("contents", "read")],
         condition: Some(RELEASE_IF),
         environment: Some(ENVIRONMENT),
     },
     Rule {
         job: "notes",
-        needs: &["gates", "plan", "verify", "tag"],
+        needs: &["plan", "verify", "tag"],
         permissions: READ,
         condition: Some(RELEASE_IF),
         environment: None,
     },
     Rule {
         job: PUBLISH,
-        needs: &["gates", "plan", "verify", "tag", "notes"],
+        needs: &["plan", "verify", "tag", "notes"],
         permissions: &[("contents", "write")],
         condition: Some(RELEASE_IF),
         environment: Some(ENVIRONMENT),
@@ -136,12 +157,15 @@ const BOT_JOBS: &[&str] = &["tag", "bump"];
 /// The action that mints it, pinned in `workflows` like every action.
 const APP_TOKEN: &str = "actions/create-github-app-token@";
 /// The jobs that write must (transitively) need these.
-const GATING: &[&str] = &["gates", "plan", "verify"];
+const GATING: &[&str] = &["plan", "verify"];
 /// The jobs that write, or hold a token that can.
 const WRITING: &[&str] = &["tag", "notes", PUBLISH, "bump"];
 
-/// The group and the no-cancel of the one release at a time.
-const GROUP: &str = "release-${{ github.event_name == 'push' && 'push' || github.run_id }}";
+/// The group and the no-cancel of the one release at a time. A pipeline run that did not
+/// succeed starts this workflow too (every job skips); its group is its own, so it never
+/// takes the place of a release that is waiting in `release-main`.
+const GROUP: &str =
+    "release-${{ github.event.workflow_run.conclusion == 'success' && 'main' || github.run_id }}";
 
 /// The expressions an input of a run could reach a script or a checkout through.
 const UNTRUSTED: &[&str] = &[
@@ -149,7 +173,13 @@ const UNTRUSTED: &[&str] = &[
     "github.event.inputs",
     "github.event.pull_request",
     "github.head_ref",
+    "github.event.workflow_run.pull_requests",
+    "github.event.workflow_run.head_commit",
+    "github.event.workflow_run.display_title",
 ];
+/// Parts of the run that started this one that a person chooses (a branch name), and that may
+/// be read in an `if:` only.
+const IF_ONLY: &[&str] = &["github.event.workflow_run.head_branch"];
 /// Status functions and keys that let a job pass or run after a red one.
 const CONTINUING: &[&str] = &["always()", "failure()", "cancelled()", "continue-on-error"];
 
@@ -248,10 +278,9 @@ pub fn problems(release: &str) -> Result<Vec<String>, String> {
     halting(release, &mut out)?;
     secrets(release, &mut out)?;
     checkouts(release, &mut out)?;
-    gates_job(release, &mut out)?;
+    context(release, &mut out)?;
     plan_job(release, &mut out)?;
     downloads_of_this_run(release, &mut out)?;
-    gates_outlast_wait(release, &mut out);
     verify_job(release, &mut out)?;
     tag_job(release, &mut out)?;
     notes_job(release, &mut out)?;
@@ -271,7 +300,7 @@ fn triggers(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     for event in &events {
         if !EVENTS.contains(&event.as_str()) {
             out.push(format!(
-                "the workflow runs on `{event}`, not only {EVENTS:?}: the push trigger is added alone, last"
+                "the workflow runs on `{event}`, not only {EVENTS:?}: a release starts from a successful pipeline run and from nothing else"
             ));
         }
     }
@@ -280,24 +309,27 @@ fn triggers(release: &str, out: &mut Vec<String>) -> Result<(), String> {
             out.push(format!("the workflow does not run on `{event}`"));
         }
     }
-    if events.iter().any(|e| e == "push") {
+    if events.iter().any(|e| e == "workflow_run") {
         let jobs = workflows::job_names(release)?;
         for job in CHAIN {
             if !jobs.iter().any(|j| j == job) {
                 out.push(format!(
-                    "the workflow runs on `push` but has no job `{job}`: a push would cut a release without it"
+                    "the workflow runs on `workflow_run` but has no job `{job}`: a pipeline run would cut a release without it"
                 ));
             }
         }
-        let filters = workflows::push_filters(release).unwrap_or_default();
-        if filters != [("branches".to_owned(), vec!["main".to_owned()])] {
+        let mut filters = workflows::trigger_filters(release, "workflow_run").unwrap_or_default();
+        filters.sort();
+        let want = [
+            ("branches".to_owned(), vec!["main".to_owned()]),
+            ("types".to_owned(), vec![TYPES.to_owned()]),
+            ("workflows".to_owned(), vec![PIPELINE.to_owned()]),
+        ];
+        if filters != want {
             out.push(format!(
-                "`push` is filtered by {filters:?}, not exactly `branches: [main]`: a push of another branch or a tag would cut a release"
+                "`workflow_run` is filtered by {filters:?}, not exactly `workflows: [{PIPELINE}]`, `types: [{TYPES}]` and `branches: [main]`: another workflow, or a run for another branch, would cut a release"
             ));
         }
-    }
-    if !workflows::dispatch_inputs(release)?.is_empty() {
-        out.push("the `workflow_dispatch` trigger declares inputs: a run releases `github.sha` and nothing a person types".to_owned());
     }
     let names = workflows::job_names(release)?;
     if names != JOBS {
@@ -305,15 +337,12 @@ fn triggers(release: &str, out: &mut Vec<String>) -> Result<(), String> {
             "the jobs are {names:?}, not {JOBS:?} in that order (`{PUBLISH}` by that exact name)"
         ));
     }
-    let code = code(release);
-    let group = code.lines().find_map(|l| l.strip_prefix("  group: "));
-    if group != Some(GROUP) {
+    let concurrency = workflows::concurrency(release)?;
+    let want = Some((GROUP.to_owned(), "false".to_owned()));
+    if concurrency != want {
         out.push(format!(
-            "the concurrency group is {group:?}, not `{GROUP}`: one release at a time, a dispatch in a group of its own"
+            "the concurrency is {concurrency:?}, not `group: {GROUP}` with `cancel-in-progress: false`: one release at a time, none cancelled, and a run that releases nothing in a group of its own"
         ));
-    }
-    if !code.lines().any(|l| l == "  cancel-in-progress: false") {
-        out.push("the concurrency does not set `cancel-in-progress: false`: a release in flight would be cancelled".to_owned());
     }
     Ok(())
 }
@@ -396,7 +425,7 @@ fn graph(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         for gate in GATING {
             if !needs.iter().any(|n| n == gate) {
                 out.push(format!(
-                    "the job `{job}` does not need `{gate}`, directly or through another job: it could run on a commit the gates did not pass"
+                    "the job `{job}` does not need `{gate}`, directly or through another job: it could run on a commit the pipeline did not pass"
                 ));
             }
         }
@@ -438,7 +467,18 @@ fn secrets(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     for word in UNTRUSTED {
         if all.contains(word) {
             out.push(format!(
-                "the workflow reads `{word}`: only `github.sha` of a run is released, never what a person or a pull request names"
+                "the workflow reads `{word}`: only the commit the pipeline run built is released, never what a person or a pull request names"
+            ));
+        }
+    }
+    for word in IF_ONLY {
+        let elsewhere = all.lines().any(|l| {
+            l.contains(word)
+                && !(l.trim_start().starts_with("if: ${{ ") && l.trim_end().ends_with("}}"))
+        });
+        if elsewhere {
+            out.push(format!(
+                "the workflow reads `{word}` outside an `if:`: a branch name is chosen by a person and must not reach a script"
             ));
         }
     }
@@ -489,7 +529,7 @@ fn secrets(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// Every checkout is of `github.sha`, with no credentials left behind.
+/// Every checkout is of the commit the pipeline run built, with no credentials left behind.
 fn checkouts(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     for job in JOBS {
         let steps = workflows::job_steps(release, job)?;
@@ -497,11 +537,16 @@ fn checkouts(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         for step in steps.iter().filter(|s| uses(s, "actions/checkout@")) {
             seen += 1;
             for (key, _) in &step.with {
-                if key != "fetch-depth" && key != "persist-credentials" {
+                if !["fetch-depth", "persist-credentials", "ref"].contains(&key.as_str()) {
                     out.push(format!(
-                        "the checkout of `{job}` is given `{key}`: only `github.sha` is checked out"
+                        "the checkout of `{job}` is given `{key}`: only the commit the pipeline run built is checked out"
                     ));
                 }
+            }
+            if input(step, "ref") != Some(COMMIT_EXPR) {
+                out.push(format!(
+                    "the checkout of `{job}` is not of `ref: {COMMIT_EXPR}`: a run started by `workflow_run` checks out the latest commit of main otherwise"
+                ));
             }
             if input(step, "persist-credentials") != Some("false") {
                 out.push(format!(
@@ -607,77 +652,69 @@ fn files_are_checked(job: &str, steps: &[workflows::Step], out: &mut Vec<String>
     }
 }
 
-/// Only `verify` reads a run other than this one's: every later job takes the files `verify`
-/// uploaded, which it checked.
+/// The commit and the pipeline run are set once, for every job, from the run that started this one.
+fn context(release: &str, out: &mut Vec<String>) -> Result<(), String> {
+    let env = workflows::top_env(release)?;
+    for (name, want) in [("COMMIT", COMMIT_EXPR), ("PIPELINE_RUN", RUN_EXPR)] {
+        if !env.iter().any(|(k, v)| k == name && v == want) {
+            out.push(format!(
+                "the workflow does not set `{name}: {want}`: every step would act on another commit or run than the one released"
+            ));
+        }
+    }
+    for job in JOBS {
+        let own = workflows::job_env(release, job)?;
+        if own
+            .iter()
+            .any(|(k, _)| k == "COMMIT" || k == "PIPELINE_RUN")
+        {
+            out.push(format!(
+                "the job `{job}` sets `COMMIT` or `PIPELINE_RUN` itself: they are the workflow's alone"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Only `plan` (the commit the push replaced) and `verify` (the files) read the artifacts of
+/// another run, and each of the pipeline run that started this one: every later job takes the
+/// files `verify` checked.
 fn downloads_of_this_run(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     for rule in &RULES {
-        if rule.job == "verify" {
-            continue;
-        }
         let steps = workflows::job_steps(release, rule.job)?;
-        if steps
+        let reads_other_run = ["plan", "verify"].contains(&rule.job);
+        for d in steps
             .iter()
-            .any(|s| uses(s, "actions/download-artifact@") && input(s, "run-id").is_some())
+            .filter(|s| uses(s, "actions/download-artifact@"))
         {
-            out.push(format!("a download of `{}` names a `run-id`: only `verify` reads another run, the rest take what it verified", rule.job));
+            let named = input(d, "run-id");
+            if !reads_other_run && named.is_some() {
+                out.push(format!("a download of `{}` names a `run-id`: only `plan` and `verify` read another run, the rest take what `verify` checked", rule.job));
+            }
+            if reads_other_run && named != Some(RUN_EXPR) {
+                out.push(format!("a download of `{}` is not of run `{RUN_EXPR}`: the files could come from another run than the one that started this", rule.job));
+            }
+            if named.is_some() && input(d, "github-token") != Some("${{ github.token }}") {
+                out.push(format!(
+                    "a download of `{}` names a `run-id` without `github-token: ${{{{ github.token }}}}`",
+                    rule.job
+                ));
+            }
         }
     }
     Ok(())
 }
-
-/// A job that waits for the gates outlasts the wait: `gates` gives up after this many
-/// minutes (`release gates --timeout-s` is 3 hours), so its own timeout is longer.
-const GATES_GIVE_UP_MINUTES: u32 = 180;
-
-fn gates_outlast_wait(release: &str, out: &mut Vec<String>) {
-    let minutes = job_text(release, "gates").lines().find_map(|l| {
-        l.trim()
-            .strip_prefix("timeout-minutes:")?
-            .trim()
-            .parse::<u32>()
-            .ok()
-    });
-    if minutes.is_none_or(|m| m <= GATES_GIVE_UP_MINUTES) {
-        out.push(format!("the job `gates` has no `timeout-minutes` above {GATES_GIVE_UP_MINUTES}: the job would be killed before the wait for the gates gives up"));
-    }
-}
-
-fn gates_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
-    let steps = workflows::job_steps(release, "gates")?;
-    let verb = "cargo xtask release gates";
-    if let Some((_, step, words)) = run_of("gates", &steps, "cargo xtask release gates ", out) {
-        flag_is(&words, verb, "--sha", "$GITHUB_SHA", out);
-        flag_is(&words, verb, "--branch", "main", out);
-        flag_is(&words, verb, "--repo", "$GITHUB_REPOSITORY", out);
-        flag_is(&words, verb, "--output", "$GITHUB_OUTPUT", out);
-        let id = step.id.as_deref().unwrap_or("");
-        for (name, from) in [
-            ("ci-run", "ci_run"),
-            ("beta-run", "beta_run"),
-            ("artifacts-run", "artifacts_run"),
-        ] {
-            output_is(release, "gates", name, id, from, out)?;
-        }
-    }
-    Ok(())
-}
-
-/// The expression for `--before`: a dispatch has none, and all zeros reads as a first push.
-pub const BEFORE_EXPR: &str =
-    "${{ github.event.before || '0000000000000000000000000000000000000000' }}";
 
 fn plan_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     let steps = workflows::job_steps(release, "plan")?;
     if !full_history(&steps) {
-        out.push("the job `plan` does not check out with `fetch-depth: 0`: it could not diff the push or see the tags".to_owned());
+        out.push("the job `plan` does not check out with `fetch-depth: 0`: it could not see the history or the tags".to_owned());
     }
     let verb = "cargo xtask release plan";
     if let Some((_, step, words)) = run_of("plan", &steps, "cargo xtask release plan ", out) {
-        flag_is(&words, verb, "--sha", "$GITHUB_SHA", out);
-        flag_is(&words, verb, "--before", "$BEFORE", out);
+        flag_is(&words, verb, "--sha", "$COMMIT", out);
         flag_is(&words, verb, "--freeze", "$FREEZE", out);
         flag_is(&words, verb, "--output", "$GITHUB_OUTPUT", out);
-        env_is("plan", step, "BEFORE", BEFORE_EXPR, out);
         env_is("plan", step, "FREEZE", "${{ vars.RELEASE_FREEZE }}", out);
         let id = step.id.as_deref().unwrap_or("");
         for name in ["version", "tag", "code", "site", "pipeline"] {
@@ -690,36 +727,24 @@ fn plan_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
 fn verify_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     let job = "verify";
     let steps = workflows::job_steps(release, job)?;
-    let envs = workflows::job_env(release, job)?;
-    if !envs
-        .iter()
-        .any(|(k, v)| k == "COMMIT" && v == "${{ github.sha }}")
-    {
-        out.push("the job `verify` does not set `COMMIT: ${{ github.sha }}`: every step would check another commit than the one released".to_owned());
-    }
     if let Some((_, locate, words)) = run_of(job, &steps, "cargo xtask release locate ", out) {
-        flag_is(
-            &words,
-            "cargo xtask release locate",
-            "--commit",
-            "$COMMIT",
-            out,
-        );
+        let verb = "cargo xtask release locate";
+        flag_is(&words, verb, "--commit", "$COMMIT", out);
+        flag_is(&words, verb, "--run-id", "$PIPELINE_RUN", out);
         if locate.conditional {
             out.push("the `release locate` step of `verify` is under `if:`".to_owned());
         }
     }
-    let gated = "${{ needs.gates.outputs.artifacts-run }}";
     let downloads: Vec<_> = steps
         .iter()
         .filter(|s| uses(s, "actions/download-artifact@"))
         .collect();
     if downloads.is_empty() {
-        out.push("the job `verify` downloads no artifact of the artifacts run".to_owned());
+        out.push("the job `verify` downloads no artifact of the pipeline run".to_owned());
     }
     for d in downloads {
-        if input(d, "run-id") != Some(gated) {
-            out.push(format!("a download of `verify` is not of run `{gated}`: the files could come from another run than the one the gates saw"));
+        if input(d, "run-id") != Some(RUN_EXPR) {
+            out.push(format!("a download of `verify` is not of run `{RUN_EXPR}`: the files could come from another run than the one that started this"));
         }
     }
     let checked = command(&steps, "cargo xtask release check ").map(|(at, ..)| at);
@@ -849,30 +874,13 @@ fn tag_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
             "`{verb}` is not given `{DIST}`, the verified files"
         ));
     }
-    flag_is(&vw, verb, "--commit", "$GITHUB_SHA", out);
+    flag_is(&vw, verb, "--commit", "$COMMIT", out);
     flag_is(&vw, verb, "--tag", "$TAG", out);
-    flag_is(&vw, verb, "--ci-run", "$CI_RUN", out);
-    flag_is(&vw, verb, "--beta-run", "$BETA_RUN", out);
-    flag_is(&vw, verb, "--artifacts-run", "$ARTIFACTS_RUN", out);
+    flag_is(&vw, verb, "--pipeline-run", "$PIPELINE_RUN", out);
     env_is(job, vs, "TAG", "${{ needs.plan.outputs.tag }}", out);
-    env_is(job, vs, "CI_RUN", "${{ needs.gates.outputs.ci-run }}", out);
-    env_is(
-        job,
-        vs,
-        "BETA_RUN",
-        "${{ needs.gates.outputs.beta-run }}",
-        out,
-    );
-    env_is(
-        job,
-        vs,
-        "ARTIFACTS_RUN",
-        "${{ needs.gates.outputs.artifacts-run }}",
-        out,
-    );
     let record = value(&vw, "--out").unwrap_or("");
     let verb = "cargo xtask release tag";
-    flag_is(&tw, verb, "--sha", "$GITHUB_SHA", out);
+    flag_is(&tw, verb, "--sha", "$COMMIT", out);
     flag_is(&tw, verb, "--tag", "$TAG", out);
     if record.is_empty() || value(&tw, "--message-file") != Some(record) {
         out.push(format!(
@@ -910,7 +918,7 @@ fn bump_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     let verb = "cargo xtask release bump-internal";
     flag_is(&bw, verb, "--repo", "$GITHUB_REPOSITORY", out);
     flag_is(&bw, verb, "--version", "$VERSION", out);
-    flag_is(&bw, verb, "--sha", "$GITHUB_SHA", out);
+    flag_is(&bw, verb, "--sha", "$COMMIT", out);
     flag_is(
         &bw,
         verb,
@@ -948,17 +956,11 @@ fn publish_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         out.push(format!("`{verb}` is not given `{DIST}`"));
     }
     flag_is(&words, verb, "--tag", "$TAG", out);
-    flag_is(&words, verb, "--commit", "$GITHUB_SHA", out);
+    flag_is(&words, verb, "--commit", "$COMMIT", out);
     flag_is(&words, verb, "--run-id", "$RUN_ID", out);
     flag_is(&words, verb, "--set-hash", "$SET_HASH", out);
     env_is(job, step, "TAG", "${{ needs.plan.outputs.tag }}", out);
-    env_is(
-        job,
-        step,
-        "RUN_ID",
-        "${{ needs.gates.outputs.artifacts-run }}",
-        out,
-    );
+    env_is(job, step, "RUN_ID", RUN_EXPR, out);
     env_is(
         job,
         step,
@@ -1005,10 +1007,7 @@ fn notes_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         out.push("the job `notes` does not check out with `fetch-depth: 0`, so the annotated tag object and `origin/main` are not there".to_owned());
     }
     let env = workflows::job_env(release, job)?;
-    for (name, wanted) in [
-        ("COMMIT", "${{ github.sha }}"),
-        ("TAG", "${{ needs.plan.outputs.tag }}"),
-    ] {
+    for (name, wanted) in [("TAG", "${{ needs.plan.outputs.tag }}")] {
         if !env.iter().any(|(k, v)| k == name && v == wanted) {
             out.push(format!("the job `notes` does not set `{name}: {wanted}`: the tag and commit every step checks would not be the ones released"));
         }

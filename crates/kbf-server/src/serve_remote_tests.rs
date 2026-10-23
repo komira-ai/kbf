@@ -130,7 +130,7 @@ async fn operator(peer: &str, proxy: Option<&Behind>) -> (u16, String) {
 /// it does not apply the proxy gate (`serve_api` without its layer), or applies it with no
 /// secret.
 ///
-/// Mutants seen red: `serve_api` without the `gate_requests` layer; the layer given `None`.
+/// Catches: `serve_api` without the `gate_requests` layer; the layer given `None`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_operator_listener_refuses_a_remote_peer_behind_the_proxy() {
     let behind = behind();
@@ -264,7 +264,7 @@ fn forwarded() -> Vec<(&'static str, String)> {
 /// and identity (a call that reached the child some way other than the proxy), because the
 /// listener does not apply the proxy layer.
 ///
-/// Mutants seen red: `worker_peers` without the `ProxyAuthLayer` on the behind-a-proxy arm;
+/// Catches: `worker_peers` without the `ProxyAuthLayer` on the behind-a-proxy arm;
 /// the layer built with no secret.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_worker_listener_refuses_a_remote_peer_behind_the_proxy() {

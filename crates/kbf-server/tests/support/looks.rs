@@ -9,9 +9,6 @@
 //! at once, as the server starts (the first tick of an interval is immediate), and then a
 //! long way off:
 //!
-//! - the update controller, every `Listeners::tick` (a test of this kind gives it a tick that
-//!   does not come within the test): `update/policy` and `update/desired`, and more rows
-//!   once a release is desired, `update/desired` again among them;
 //! - the offers' poll, with a release store and a state store, every tick: `update/desired`;
 //! - the membership sweeper, every beat (a third of the member ttl): `map`, `member/` and
 //!   last `deny/`.
@@ -28,7 +25,7 @@ use std::time::Duration;
 use crate::hooked::Hooked;
 
 /// The counts of the reads of `update/desired` and of `deny/`: the last read of the
-/// controller's look is one of `update/desired`, and the last of the sweeper's refresh is
+/// offers' poll is one of `update/desired`, and the last of the sweeper's refresh is
 /// the one of `deny/`. How many of the first a start makes depends on the setup (a release
 /// offered before the start, a release store for the poll), so each test names its number.
 pub struct Looks {

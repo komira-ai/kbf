@@ -41,7 +41,7 @@ fn the_one_file_is_unpacked_whole_and_executable() {
 /// `../kbf`, an absolute one) or another name, a symlink, hard link, directory, FIFO or
 /// device entry, and an entry over the cap. Each is refused with its own code.
 ///
-/// Mutants seen red: the name comparison dropped; the entry-type check dropped (the
+/// Catches: the name comparison dropped; the entry-type check dropped (the
 /// symlink entry passes); the count of entries not checked.
 #[test]
 fn an_archive_that_is_not_one_regular_file_with_the_name_is_refused() {
@@ -183,7 +183,7 @@ fn tar_of_one() -> Vec<u8> {
 /// reader that stops at the tar's end accepts all four; each is refused, and a tar padded
 /// with zeros (as `tar` pads a record) is still fine.
 ///
-/// Mutants seen red: the check of the bytes after the tar's end dropped (the non-zero
+/// Catches: the check of the bytes after the tar's end dropped (the non-zero
 /// tail passes); the check of the compressed stream's end dropped (the trailing bytes and
 /// the second member pass).
 #[test]
@@ -223,7 +223,7 @@ fn nothing_follows_the_tar_or_the_gzip_member() {
 /// cap (the first is small and right) is stopped at the cap plus framing, not read to its
 /// end; and an unpack that is out of time stops with its own code.
 ///
-/// Mutants seen red: the decompressed bound dropped (the bomb is read in full); the
+/// Catches: the decompressed bound dropped (the bomb is read in full); the
 /// deadline check dropped (the zero budget is ignored).
 #[test]
 fn the_decompressed_size_and_the_time_are_bounded() {

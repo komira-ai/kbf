@@ -188,7 +188,7 @@ async fn resolved(reader: &Reader<Objects>, id: [u8; 12]) -> RunView {
     panic!("run {id} never reached history");
 }
 
-/// Catches (mutant "read the tails inline in the tap"): a log read that never answers
+/// Catches (defect "read the tails inline in the tap"): a log read that never answers
 /// stopping the recorder (its task runs the tap: no later run of any build would be
 /// recorded), a Result held for it, a run held back for it, and a read the budget cannot
 /// serve in time waiting for ever or failing the run. Of two failed runs, the first reads a
@@ -260,7 +260,7 @@ async fn a_stalled_blob_read_never_delays_a_result_and_the_run_arrives_with_busy
     );
 }
 
-/// Catches (mutant "a stop does not wait for the pool"): a failed run whose tails were being
+/// Catches (defect "a stop does not wait for the pool"): a failed run whose tails were being
 /// read when the server stopped lost with them (the writer's last step would run before the
 /// run reached its queue), and a stop that waits for ever for a pool that is slow. The log
 /// takes 300 ms to read, and the server stops at once: the run is in the chunk the last step

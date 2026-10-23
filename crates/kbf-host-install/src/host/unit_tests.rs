@@ -139,29 +139,42 @@ fn the_same_version_is_a_no_op() {
     }
 }
 
-/// A downgrade is refused with exit 2 and nothing but the read runs: an older upstream, an
-/// older revision, a higher epoch installed, and a release candidate of the same version.
+/// An older version is installed like any other: an older upstream, an older revision, a
+/// higher epoch installed, a rebuild suffix, and a release candidate of the installed version.
+/// Both apt steps run, the answer is `installed`, and the install step permits the downgrade
+/// that `apt-get -y` would otherwise refuse.
 #[test]
-fn a_downgrade_is_refused() {
-    for installed in ["1.2.4-1", "1.2.3-2", "1:0.1-1", "2.0", "1.2.3-1+b1"] {
+fn an_older_version_is_installed() {
+    let cases = [
+        ("1.2.4-1", "1.2.3-1"),
+        ("1.2.3-2", "1.2.3-1"),
+        ("1:0.1-1", "1.2.3-1"),
+        ("2.0", "1.2.3-1"),
+        ("1.2.3-1+b1", "1.2.3-1"),
+        ("1.2.3-1", "1.2.3~rc1"),
+    ];
+    for (installed, target) in cases {
         let fx = Fx::new("unit-downgrade");
-        let runner = FakeRunner::new(vec![ok(&format!("ii  {installed}\n"))]);
-        let answer = install(&fx, &runner);
-        assert_eq!(answer.code, 2, "{installed}");
+        let runner = FakeRunner::new(vec![
+            ok(&format!("ii  {installed}\n")),
+            ok(""),
+            ok(""),
+            ok(&format!("ii  {target}\n")),
+        ]);
+        let request = format!("install kbf={target} from candidate");
+        let answer = unit(&fx, &runner, Some(OsStr::new(&request)));
+        assert_eq!(answer.code, 0, "{installed} -> {target}: {}", answer.err);
         assert_eq!(
             answer.json(),
-            json!({"result": "refused", "reason": "older_than_installed"})
+            json!({"result": "installed", "installed_version": target, "unit_state": "finished"})
         );
-        assert_eq!(runner.calls().len(), 1, "{installed}: nothing installed");
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 4, "{installed} -> {target}: both steps ran");
+        assert!(
+            calls[2].args.iter().any(|a| a == "--allow-downgrades"),
+            "{installed} -> {target}: the install step allows a downgrade"
+        );
     }
-    let fx = Fx::new("unit-rc");
-    let runner = FakeRunner::new(vec![ok("ii  1.2.3-1\n")]);
-    let answer = unit(
-        &fx,
-        &runner,
-        Some(OsStr::new("install kbf=1.2.3~rc1 from candidate")),
-    );
-    assert_eq!(answer.code, 2, "an rc is older");
 }
 
 /// A failing step stops the install: the update failing means no install ran, and the
@@ -261,7 +274,7 @@ fn unreadable_state_fails_the_install() {
 /// A package dpkg flags `R` (reinstall required, or any flag in the third place) is not
 /// cleanly installed. The install goes on to repair it: the same version is not a no-op
 /// (apt reinstalls it), a newer one is installed over it; but it is no way round the
-/// rule against older: an older target is refused as ever. And what the install leaves
+/// rule: an older target is installed as any other. And what the install leaves
 /// must be clean, or it is not verified.
 #[test]
 fn a_package_in_error_is_installed_over() {
@@ -288,14 +301,15 @@ fn a_package_in_error_is_installed_over() {
         assert_eq!(install(&fx, &runner).code, 0, "{status}");
 
         let fx = Fx::new("unit-flag-older");
-        let runner = FakeRunner::new(vec![ok(&format!("{status} 1.2.4-1\n"))]);
+        let runner = FakeRunner::new(vec![
+            ok(&format!("{status} 1.2.4-1\n")),
+            ok(""),
+            ok(""),
+            ok("ii  1.2.3-1\n"),
+        ]);
         let answer = install(&fx, &runner);
-        assert_eq!(
-            (answer.code, answer.json()["reason"].as_str()),
-            (2, Some("older_than_installed")),
-            "{status}"
-        );
-        assert_eq!(runner.calls().len(), 1, "{status}");
+        assert_eq!(answer.code, 0, "{status}: {}", answer.err);
+        assert_eq!(runner.calls().len(), 4, "{status}: apt ran");
     }
 }
 

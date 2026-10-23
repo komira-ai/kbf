@@ -49,7 +49,7 @@ fn put(m: &mut MetaState, d: u8, object: ObjectId) -> Applied {
 /// of the three put commands, and a refused put that changes the state anyway. A node
 /// that took another writer's object by a put could index keys it never wrote, and a
 /// stale process (an earlier boot) could write keys the current one also numbers.
-/// Mutant seen red: `writable` accepting any known node writer (an earlier boot then
+/// Catches: `writable` accepting any known node writer (an earlier boot then
 /// puts).
 #[test]
 fn a_foreign_writer_put_is_refused() {
@@ -110,7 +110,7 @@ fn a_foreign_writer_put_is_refused() {
 
 /// Catches: an earlier boot's objects treated as unknown once a later boot is current
 /// (its staged blocks could then never be flushed, nor its lost objects marked), and a
-/// writer never set accepted by those commands. Mutant seen red: `known` comparing the
+/// writer never set accepted by those commands. Catches: `known` comparing the
 /// boot with `==` (the earlier boot's mark is refused).
 #[test]
 fn other_commands_name_any_boot_set_before_and_nothing_else() {
@@ -155,7 +155,7 @@ fn other_commands_name_any_boot_set_before_and_nothing_else() {
 /// Catches: a `SetWriter` that takes a boot the log has set already, or an earlier
 /// one, for the same member (two processes would then number objects under one
 /// writer: the second overwrites the first's keys from seq 1), or that refuses a new
-/// member. A refused one leaves the current writer as it was. Mutant seen red: the
+/// member. A refused one leaves the current writer as it was. Catches: the
 /// check `<=` weakened to `<` (the same boot set twice is accepted).
 #[test]
 fn a_writer_is_set_once_and_only_forward() {

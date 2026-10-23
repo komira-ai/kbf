@@ -112,7 +112,7 @@ fn payload(pair: &Pair) -> Vec<u8> {
 /// clientAuth and serverAuth on the one certificate) and is admitted, so both nodes hold the
 /// blob; the writer is a frontend. With the primary calling its peer under a `daemon`
 /// certificate, the replica refuses the copy (a daemon may not send one), the write fails
-/// and neither node holds the blob. Mutants: `WriteLeg` open to every role; the leg sent
+/// and neither node holds the blob. Catches: `WriteLeg` open to every role; the leg sent
 /// without the primary's certificate.
 #[tokio::test]
 async fn a_copy_is_admitted_only_from_a_storage_certificate() {

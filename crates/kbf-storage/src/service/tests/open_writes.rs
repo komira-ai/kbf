@@ -69,7 +69,7 @@ fn hold_open(channel: &Channel) -> Held {
 
 /// Catches a count that is not the writes open: it must be 1 from the write's first
 /// message until its answer (a write held open by a caller that has sent part of a blob),
-/// 2 with a second beside it, and 0 once both are answered. Mutants: nothing counted; a
+/// 2 with a second beside it, and 0 once both are answered. Catches: nothing counted; a
 /// write counted only from its last message; the count dropped at the first message.
 #[tokio::test]
 async fn a_write_is_open_from_its_first_message_to_its_answer() {
@@ -124,7 +124,7 @@ async fn a_write_is_open_from_its_first_message_to_its_answer() {
 /// before `finish_write` (the caller crashed or the connection broke), a blob that is not
 /// the one named, and a call the caller drops while the node waits for its next message.
 /// Each must bring the count back to 0, or a node that had one such write would never be
-/// idle. Mutant: the decrement only on the success path.
+/// idle. Catches: the decrement only on the success path.
 #[tokio::test]
 async fn a_write_that_fails_or_is_dropped_is_not_left_open() {
     let mem = Arc::new(Mem::default());
@@ -156,7 +156,7 @@ async fn a_write_that_fails_or_is_dropped_is_not_left_open() {
 }
 
 /// Catches an action-cache commit that is not counted: a commit held in the store is a
-/// write the node is still taking, over the wire and in-process. Mutants: the guard
+/// write the node is still taking, over the wire and in-process. Catches: the guard
 /// missing from the `ActionStore` commit; missing from the in-process commit.
 #[tokio::test]
 async fn a_commit_in_flight_is_an_open_write() {
@@ -198,7 +198,7 @@ async fn a_commit_in_flight_is_an_open_write() {
 /// Catches a service whose segment uploads are not counted with the handle the node reports:
 /// the service asks its store for the `Segments` handlers counting in the very handle given
 /// to `with_open_writes` (the store's uploads then move that count; kbf-front's own test
-/// pins that). Mutant: `with_open_writes` leaving the handlers it made at `new`.
+/// pins that). Catches: `with_open_writes` leaving the handlers it made at `new`.
 #[tokio::test]
 async fn the_store_counts_its_segment_uploads_in_the_services_handle() {
     let mem = Arc::new(Mem::default());
@@ -266,7 +266,7 @@ async fn node_waiting_for_a_map(
 /// Catches a write that is not counted while it waits for the map: a caller ahead of the
 /// node makes it fetch the map, and that wait can be seconds with the call already taken in.
 /// A rollout that read zero then would stop the node under it. The write, over the wire and
-/// in-process, is open while it waits and gives the count back when it is refused. Mutant:
+/// in-process, is open while it waits and gives the count back when it is refused. Catches:
 /// the guard taken after the map is judged.
 #[tokio::test]
 async fn a_write_waiting_for_the_map_is_open() {
@@ -292,7 +292,7 @@ async fn a_write_waiting_for_the_map_is_open() {
 }
 
 /// Catches an action-cache commit that is not counted while it waits for the map, over the
-/// wire and in-process. Mutants: the guard taken after the map is judged, in either path.
+/// wire and in-process. Catches: the guard taken after the map is judged, in either path.
 #[tokio::test]
 async fn a_commit_waiting_for_the_map_is_open() {
     let mem = Arc::new(Mem::default());
@@ -326,7 +326,7 @@ async fn a_commit_waiting_for_the_map_is_open() {
 /// Catches a segment upload's `Begin` that is not counted while it waits for the map: the
 /// service judges the map before the store's handlers (which count the upload) see the call.
 /// A `Begin` from a caller ahead of the node is open while the node fetches the map, over the
-/// wire and in-process. Mutant: the count taken after the map is judged.
+/// wire and in-process. Catches: the count taken after the map is judged.
 #[tokio::test]
 async fn a_segment_begin_waiting_for_the_map_is_open() {
     use kbf_proto::worker::BeginRequest;

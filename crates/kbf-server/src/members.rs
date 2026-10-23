@@ -683,7 +683,7 @@ impl Members {
         let (id, boot) = self.assign(&who.instance_id, last)?;
         let member = Member {
             id,
-            // The spelling enrollment stores, so the update controller can join a host to it.
+            // The spelling enrollment stores, so the update look can join a host to it.
             addr: kbf_enroll_registry::canonical_addr(&who.addr),
             zone: who.zone.clone(),
             weight: who.weight,

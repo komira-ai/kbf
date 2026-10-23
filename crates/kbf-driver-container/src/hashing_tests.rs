@@ -61,7 +61,7 @@ fn whole(bytes: &[u8]) -> (Digest, u32) {
 
 /// Catches the walk's old cost, a freshly zeroed megabyte for every file: one worker
 /// buffer serves 200 small files and stays a few kilobytes, and grows to the chunk
-/// size only for a file that needs it (mutant: the buffer sized to `CHUNK` at once).
+/// size only for a file that needs it (catches: the buffer sized to `CHUNK` at once).
 #[test]
 fn a_small_file_does_not_cost_a_chunk_of_buffer() {
     let (dir, fd) = scratch("hashing-buffer");
@@ -83,7 +83,7 @@ fn a_small_file_does_not_cost_a_chunk_of_buffer() {
 
 /// Catches the hash running on one thread whatever the pool has: 64 files of 1 MiB
 /// hashed on a pool of 4 are hashed on more than one thread, on a pool of 1 on
-/// exactly one, and the outcomes are the same either way and in job order (mutant:
+/// exactly one, and the outcomes are the same either way and in job order (catches:
 /// the worker count fixed at 1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn files_are_hashed_on_as_many_threads_as_the_pool_has() {
@@ -123,7 +123,7 @@ async fn files_are_hashed_on_as_many_threads_as_the_pool_has() {
 
 /// Catches a failure that is lost or hides the one before it: with one thread, a file
 /// listed but gone fails with its own error, the files listed before it are hashed, the
-/// ones after it are not reached (mutant: `first_bad` never set, the later files hashed),
+/// ones after it are not reached (catches: `first_bad` never set, the later files hashed),
 /// and a file that does not fit the bytes left is `None`. A file in a directory that is
 /// gone is that file's error too.
 #[tokio::test]
@@ -160,7 +160,7 @@ async fn the_first_failure_stops_the_files_after_it() {
 /// whose `st_size` is 0 but holds bytes (procfs) is refused when it is hashed through,
 /// because what was read is not the size it was stamped with, and is `None` when the
 /// bytes left are fewer than it holds, because the read is bounded by the bytes, not by
-/// `st_size` (a file can grow). Mutants: the bound taken from `st_size` only (the second
+/// `st_size` (a file can grow). Catches: the bound taken from `st_size` only (the second
 /// is hashed whole), the size compared to the stamp's not looked at (the first is
 /// stored under the digest of what was read).
 #[test]
@@ -181,7 +181,7 @@ fn a_file_that_holds_more_than_its_size_says_is_not_trusted() {
 
 /// Catches work that goes on after nobody waits for it: once the guard of a hash is
 /// dropped (the future was dropped, as the upload's deadline does), a worker skips every
-/// file but the first (mutant: the guard's drop does nothing, so all 500 are hashed).
+/// file but the first (catches: the guard's drop does nothing, so all 500 are hashed).
 #[test]
 fn workers_skip_the_files_of_a_hash_that_was_dropped() {
     let (dir, upper) = scratch("hashing-cancel");
@@ -211,7 +211,7 @@ fn workers_skip_the_files_of_a_hash_that_was_dropped() {
 /// Catches a file read twice, or held whole, when the store takes it as it is read: a
 /// file of two and a half chunks goes to the intake in the chunks the hash read, none
 /// over [`CHUNK`], adding up to the file, and is finished under the digest the hash
-/// came to and marked taken (mutants: the chunks not handed over, the file read whole
+/// came to and marked taken (catches: the chunks not handed over, the file read whole
 /// first, the file not finished or not marked). A file past `max`, or one that changed
 /// while it was read, is handed over but never finished; a file the intake declines is
 /// hashed as before and not taken.
