@@ -504,7 +504,13 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         // `setup` checks for root itself and prints its steps ahead of its own result.
         Verb::Setup(args) => {
             let mut steps = Vec::new();
-            let result = setup::cli(root_of(cli), args, cli.apply, &mut steps);
+            let result = setup::cli_with_proxy(
+                root_of(cli),
+                &args.setup,
+                &args.proxy,
+                cli.apply,
+                &mut steps,
+            );
             return finish_setup(cli.json, result, &steps, out, err);
         }
         Verb::Run(args) => run(root_of(cli), args),

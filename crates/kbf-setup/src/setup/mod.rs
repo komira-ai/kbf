@@ -40,6 +40,11 @@
 //!   `--release-url`, `--release-ca`, the frontend snapshot flags) and `--commit` are taken for
 //!   one more release and ignored, with one warning ([`retired`]).
 //! - `kbf.toml` is written after every file a unit needs, and the units after it.
+//! - Two programs run it. `kbf-installer setup` is built with the `proxy` feature: it takes
+//!   `--proxy` and its flags (the `proxy` module), and keeps the `[proxy]` table of `installer.toml`.
+//!   `kbf setup` is not: it sets up the hosts that have no proxy, refuses `--mode=all-in-one`
+//!   (always behind the proxy) and an `installer.toml` that has a `[proxy]` table, and links no
+//!   proxy code.
 
 pub mod aio_migrate;
 pub mod backend;
@@ -49,6 +54,7 @@ pub mod os;
 pub mod paths;
 pub mod plan;
 pub mod provision;
+#[cfg(feature = "proxy")]
 pub mod proxy;
 pub mod retired;
 pub mod validate;
@@ -57,7 +63,13 @@ pub mod validate;
 pub(crate) mod fake;
 #[cfg(test)]
 mod fetch_user_tests;
-#[cfg(test)]
+// The tests of the host's setup are those of `kbf-installer setup`, with the `proxy` feature;
+// the build without it (`kbf setup`) has `no_proxy_tests`.
+#[cfg(all(test, not(feature = "proxy")))]
+mod no_proxy_tests;
+#[cfg(all(test, feature = "proxy"))]
+mod raw_tests;
+#[cfg(all(test, feature = "proxy"))]
 mod tests;
 
 use std::io::{self, Write};
@@ -161,10 +173,11 @@ pub struct Options {
 
 /// The `installer.toml` this run leaves: the file that is there with the flags' settings put
 /// in, or the defaults with them. A file that is not valid is not overwritten (the operator
-/// decides), and a floor never goes down. Its `[proxy]` table is kept; on a `--proxy` host the
-/// keys the flags give are put in it ([`proxy::ProxyPlan::merge`]). The release source and the
-/// keys that go with it are not the flags' to set: the file's own are kept, and a host with no
-/// file gets the default source.
+/// decides), and a floor never goes down. Its `[proxy]` table is kept (a build without the
+/// `proxy` feature refuses a file that has one, and says to leave the table alone); on a
+/// `--proxy` host the keys the flags give are put in it (`proxy::ProxyPlan::merge`). The release
+/// source and the keys that go with it are not the flags' to set: the file's own are kept, and a
+/// host with no file gets the default source.
 pub fn installer_settings(
     exec: &dyn Exec,
     v: &Valid,
@@ -176,6 +189,8 @@ pub fn installer_settings(
         None => InstallerToml::default(),
         Some(Entry::File { bytes, .. }) => {
             let text = String::from_utf8_lossy(&bytes);
+            #[cfg(not(feature = "proxy"))]
+            refuse_proxy_table(&text, installer_toml)?;
             InstallerToml::parse(&text).map_err(|e| {
                 SetupError::NeedsOperator(format!(
                     "{e}\nfix {installer_toml} or remove it, then run setup again"
@@ -206,15 +221,44 @@ pub fn installer_settings(
         }
         _ => (None, None),
     };
-    if let Some(plan) = &v.proxy {
-        settings.proxy = Some(plan.merge(settings.proxy.take())?);
-    }
+    merge_proxy(&mut settings, v)?;
     // The flags decide this key as they decide the rest: the proxy's children read their own
     // file only where a sibling holds `kbf.toml`.
     settings.frontend_config = v
         .storage_port()
         .map(|_| PathBuf::from(paths::frontend_toml(platform)));
     Ok(settings)
+}
+
+/// Refuses a file that has a `[proxy]` table, which a build without the `proxy` feature cannot
+/// keep. The table is the proxy host's configuration: the way on is `kbf-installer setup`, never
+/// removing it, so that is what is said (a file that is not TOML is the parser's to report).
+#[cfg(not(feature = "proxy"))]
+fn refuse_proxy_table(text: &str, installer_toml: &str) -> Result<(), SetupError> {
+    let table = toml::from_str::<toml::Table>(text);
+    if table.is_ok_and(|table| table.contains_key("proxy")) {
+        return Err(SetupError::NeedsOperator(format!(
+            "{installer_toml} has a [proxy] table: this host is set up by kbf-installer setup, \
+             which keeps it; run that (with --proxy), and do not remove the table"
+        )));
+    }
+    Ok(())
+}
+
+/// On a `--proxy` host, puts the keys the flags give into the `[proxy]` table of `settings`.
+#[cfg(feature = "proxy")]
+fn merge_proxy(settings: &mut InstallerToml, v: &Valid) -> Result<(), SetupError> {
+    if let Some(plan) = &v.proxy {
+        settings.proxy = Some(plan.merge(settings.proxy.take())?);
+    }
+    Ok(())
+}
+
+/// Without the `proxy` feature the table is not written (a file that has one is refused when it
+/// is read).
+#[cfg(not(feature = "proxy"))]
+fn merge_proxy(_: &mut InstallerToml, _: &Valid) -> Result<(), SetupError> {
+    Ok(())
 }
 
 /// The role whose certificate and key the fetch child is lent: the daemon's if the host has
@@ -284,6 +328,31 @@ fn emit(
     Ok(plan.steps().len())
 }
 
+/// The `kbf.toml` of the earlier all-in-one layout, when `raw` is an all-in-one host that has
+/// it ([`aio_migrate`]).
+#[cfg(feature = "proxy")]
+fn earlier_layout(
+    exec: &dyn Exec,
+    os: &dyn Os,
+    raw: &Raw,
+) -> Result<Option<aio_migrate::Earlier>, SetupError> {
+    match raw.mode {
+        Mode::AllInOne => aio_migrate::read(exec, os.platform()),
+        _ => Ok(None),
+    }
+}
+
+/// Without the `proxy` feature no host is moved to the proxy layout; an all-in-one host is
+/// refused when the flags are checked.
+#[cfg(not(feature = "proxy"))]
+fn earlier_layout(
+    _: &dyn Exec,
+    _: &dyn Os,
+    _: &Raw,
+) -> Result<Option<aio_migrate::Earlier>, SetupError> {
+    Ok(None)
+}
+
 /// Validate, plan and (with `options.apply`) carry out `setup` for `raw` on the host `os` and
 /// `exec` describe, printing each step and each note (never a secret).
 pub fn run(
@@ -307,10 +376,7 @@ pub fn run(
     // A host of the earlier layout is moved: the flags this run does not give come from its
     // `kbf.toml`. That is read before the flags are checked, and a run without `--proxy` (the
     // command line that set the host up) is told it is that host, not that `--proxy` is required.
-    let earlier = match raw.mode {
-        Mode::AllInOne => aio_migrate::read(&*exec, os.platform())?,
-        _ => None,
-    };
+    let earlier = earlier_layout(&*exec, os, raw)?;
     let mut adopted = raw.clone();
     if let Some(earlier) = &earlier {
         earlier.adopt(&mut adopted)?;
@@ -325,17 +391,16 @@ pub fn run(
     }
     ctx.earlier = earlier;
     if ctx.platform == Platform::Linux {
-        find_shadows(&*exec, valid.mode, valid.proxy.is_some())?;
+        find_shadows(&*exec, valid.mode, valid.behind_proxy())?;
     }
     let service_uid = ctx.service.as_ref().map(|u| u.uid);
     let mut problems = Vec::new();
     kbf_settings::push_problems(&*exec, &valid.kbf, service_uid, &mut problems);
     // The proxy's files belong to the proxy's user, which on an all-in-one host is not the
-    // sibling's `service`. Both are checked before either is reported.
-    if let Some(proxy) = &valid.proxy {
-        let frontend = ctx.frontend_uid();
-        kbf_settings::push_problems(&*exec, &proxy.files(), frontend, &mut problems);
-    }
+    // sibling's `service`. Both are checked before either is reported. A host that is not behind
+    // the proxy names none.
+    let frontend = ctx.frontend_uid();
+    kbf_settings::push_problems(&*exec, &valid.proxy_files(), frontend, &mut problems);
     if !problems.is_empty() {
         return Err(aio_migrate::invalid(problems, moving));
     }
@@ -390,10 +455,36 @@ pub fn run(
     Ok(())
 }
 
-/// The verb as the binary runs it, on the host under `root`.
+/// The verb as `kbf setup` runs it, on the host under `root`: with no proxy flags, which that
+/// program does not have.
 pub fn cli(
     root: PathBuf,
     args: &SetupArgs,
+    apply: bool,
+    out: &mut dyn Write,
+) -> Result<(), SetupError> {
+    on_host(root, raw_from(args), args.no_start, apply, out)
+}
+
+/// The verb as `kbf-installer setup` runs it, on the host under `root`: `args` and the proxy's
+/// flags beside them.
+#[cfg(feature = "proxy")]
+pub fn cli_with_proxy(
+    root: PathBuf,
+    args: &SetupArgs,
+    proxy: &proxy::ProxyFlags,
+    apply: bool,
+    out: &mut dyn Write,
+) -> Result<(), SetupError> {
+    let raw = raw_with_proxy(args, proxy);
+    on_host(root, raw, args.no_start, apply, out)
+}
+
+/// `setup` for `raw` on the host under `root`: its accounts and files, and the real server.
+fn on_host(
+    root: PathBuf,
+    raw: Raw,
+    no_start: bool,
     apply: bool,
     out: &mut dyn Write,
 ) -> Result<(), SetupError> {
@@ -402,17 +493,14 @@ pub fn cli(
     // `os` reads through its own copy of the host, so `run` can change the real one.
     let reader = exec.clone();
     let os = SystemOs::new(&reader, platform);
-    let raw = raw_from(args);
-    let options = Options {
-        apply,
-        no_start: args.no_start,
-    };
+    let options = Options { apply, no_start };
     let schemas = Postgres;
     let backend = Backend { schemas: &schemas };
     run(&os, &mut exec, &backend, &raw, options, out)
 }
 
-/// The command line's values as `run` takes them, unchecked.
+/// The command line's values as `run` takes them, unchecked. The proxy's flags are not
+/// `SetupArgs`', so a host set up from these is not behind the proxy.
 pub fn raw_from(args: &SetupArgs) -> Raw {
     Raw {
         mode: args.mode,
@@ -422,8 +510,18 @@ pub fn raw_from(args: &SetupArgs) -> Raw {
         retired: args.retired.clone(),
         database: args.database.clone(),
         kbf: args.kbf.clone(),
-        proxy: args.proxy.clone(),
+        #[cfg(feature = "proxy")]
+        proxy: proxy::ProxyFlags::default(),
         create_local_database: args.create_local_database,
         installer_config: args.installer_config.as_ref().map(ToString::to_string),
+    }
+}
+
+/// [`raw_from`] with the proxy's flags, which only `kbf-installer setup` takes.
+#[cfg(feature = "proxy")]
+pub fn raw_with_proxy(args: &SetupArgs, proxy: &proxy::ProxyFlags) -> Raw {
+    Raw {
+        proxy: proxy.clone(),
+        ..raw_from(args)
     }
 }

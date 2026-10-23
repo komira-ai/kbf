@@ -45,9 +45,10 @@ pkg-config` writes (for both packages): this directory holds the inputs, and
   unit directory lacks one;
 - nothing else, all of it `root:root`, built in the same way;
 - no dependency on another package, the `kbf-installer` package included: each mode unit runs
-  `kbf boot-check`, which is the `kbf` file the package carries. (`setup` is still the
-  installer's, so a host gets `crun`, `uidmap`, `systemd` and `ca-certificates` from the
-  `kbf-installer` package it installs beside `kbf`.) `pkg-kbf-asset` refuses a deb whose
+  `kbf boot-check`, which is the `kbf` file the package carries. (`kbf setup` is also this
+  package's, for a host with no proxy; the `kbf-installer` package is still where `crun`,
+  `uidmap`, `systemd` and `ca-certificates` come from, and the one that sets a host up behind
+  the proxy.) `pkg-kbf-asset` refuses a deb whose
   `Depends` names `kbf-installer`;
 - in the deb only, `Replaces: kbf-installer` (any version, no `Conflicts`). The five mode units
   were files of the `kbf-installer` package before, and dpkg refuses to unpack `kbf` over files an

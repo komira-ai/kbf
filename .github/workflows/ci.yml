@@ -76,6 +76,19 @@ jobs:
         if: ${{ !cancelled() }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
         if: ${{ !cancelled() }}
+      # The setup library without its `proxy` feature, as the `kbf` binary links it. The workspace
+      # run above has the feature on (the installer is in the workspace), so the code that is
+      # compiled only without it is built and linted here, with the library and the binary alone.
+      - run: cargo clippy -p kbf-setup -p kbf-cli --lib --bins --locked -- -D warnings
+        if: ${{ !cancelled() }}
+      # The same library's tests of that build (`no_proxy_tests`: the refusals of the proxy's side,
+      # and a host with no proxy set up as ever). Its other tests need the feature, and some a
+      # database, so they run in the workspace run of the `test` job. Alone in the command, so
+      # that no other package turns the feature on.
+      - run: cargo clippy -p kbf-setup --all-targets --locked -- -D warnings
+        if: ${{ !cancelled() }}
+      - run: cargo test -p kbf-setup --lib --locked no_proxy_tests
+        if: ${{ !cancelled() }}
       # The interpreter budget only shrinks: a pull request may not add a row to it
       # (crates/xtask/src/budget.rs). A pull request is checked out as the merge commit,
       # so HEAD^1 is the base branch it merges into.

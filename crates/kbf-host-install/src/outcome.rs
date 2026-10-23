@@ -173,6 +173,9 @@ pub enum Outcome {
     },
     /// Refused.
     Refused(Refusal),
+    /// Refused, and why in words: the answer, the exit status and the audit line are those
+    /// of `Refused`; the words go to stderr.
+    RefusedBecause(Refusal, String),
     /// Failed.
     Failed(Failure),
 }
@@ -186,7 +189,7 @@ impl Outcome {
             | Self::Queried(_)
             | Self::ApplyStarted { .. }
             | Self::MacQueried { .. } => 0,
-            Self::Refused(_) => 2,
+            Self::Refused(_) | Self::RefusedBecause(..) => 2,
             Self::Failed(_) => 3,
         }
     }
@@ -227,7 +230,7 @@ impl Outcome {
                 },
                 apply: apply.as_deref(),
             }),
-            Self::Refused(refusal) => to_json(&Reason {
+            Self::Refused(refusal) | Self::RefusedBecause(refusal, _) => to_json(&Reason {
                 result: "refused",
                 reason: refusal.code(),
             }),
@@ -275,18 +278,23 @@ impl Outcome {
             Self::AlreadyInstalled { .. } => ("already_installed", None),
             Self::Queried(_) | Self::MacQueried { .. } => ("query", None),
             Self::ApplyStarted { .. } => ("apply_started", None),
-            Self::Refused(refusal) => ("refused", Some(refusal.code())),
+            Self::Refused(refusal) | Self::RefusedBecause(refusal, _) => {
+                ("refused", Some(refusal.code()))
+            }
             Self::Failed(failure) => ("failed", Some(failure.code.code())),
         }
     }
 
-    /// The text for stderr: the detail of a failure, cleaned, else nothing.
+    /// The text for stderr: the detail of a failure or the reason of a refusal, cleaned,
+    /// else nothing.
     pub fn stderr_detail(&self) -> Option<String> {
-        let Self::Failed(failure) = self else {
-            return None;
+        let detail = match self {
+            Self::Failed(failure) => &failure.detail,
+            Self::RefusedBecause(_, why) => why,
+            _ => return None,
         };
         let mut text = String::new();
-        for c in failure.detail.chars() {
+        for c in detail.chars() {
             let c = if c.is_control() && c != '\n' && c != '\t' {
                 '?'
             } else {
