@@ -32,6 +32,7 @@
 
 #[cfg(any(test, feature = "test-support"))]
 mod backend;
+pub mod boot;
 mod conn;
 #[cfg(feature = "test-database")]
 mod database;

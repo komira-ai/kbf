@@ -153,14 +153,15 @@ fn every_installer_command_of_a_unit_is_a_verb_that_exists() {
         assert!(problems.is_empty(), "{problems:?}");
         seen.insert(name, n);
     }
-    // Not vacuous: the installer's own unit runs one command, each mode unit counts its starts.
+    // Not vacuous: the installer's own unit runs one command. A mode unit runs none: its
+    // `boot-check` is `kbf`'s own.
     assert_eq!(seen["kbf-installer.service"], 1, "{seen:?}");
     for unit in [
         "kbf-daemon.service",
         "kbf-storage.service",
         "kbf-all-in-one.service",
     ] {
-        assert_eq!(seen[unit], 1, "{unit}");
+        assert_eq!(seen[unit], 0, "{unit}");
     }
 }
 
@@ -171,7 +172,7 @@ fn the_property_list_runs_a_verb_that_exists_for_a_label_setup_bootstraps() {
 }
 
 /// Asserts that every `kbf` a runtime unit execs is `/usr/bin/kbf`, the kbf package's file,
-/// and that the mode units run it twice each, a check and a start.
+/// and that the mode units run it three times each, a boot check, a check and a start.
 #[test]
 fn the_runtime_units_exec_the_packaged_kbf() {
     let mut checked = 0;
@@ -184,9 +185,9 @@ fn the_runtime_units_exec_the_packaged_kbf() {
             .filter(|c| c.split_whitespace().next() == Some(PACKAGED_KBF))
             .count();
     }
-    // Five mode units, a check and a start each: the four node modes and the plain
+    // Five mode units, a boot check, a check and a start each: the four node modes and the plain
     // frontend (kbf-frontend.service); the frontend template runs its slot.
-    assert_eq!(checked, 10);
+    assert_eq!(checked, 15);
 }
 
 /// `(file, from, to, rule)`: one defect per rule, planted in a copy of the real file.
