@@ -159,7 +159,7 @@ impl Stoppable {
 async fn a_managed_process_ends_when_told_to_stop() {
     let node = Node::start().await;
     let store = shared();
-    let source = || StoreSource::Shared(Arc::clone(&store) as Arc<dyn Store>);
+    let source = || StoreSource::Fenced(Arc::clone(&store) as Arc<dyn Store>);
     let active = Stoppable::start(&managed_flags(&node, &[]), source()).await;
     let candidate = Stoppable::start(&managed_flags(&node, &["--await-takeover"]), source()).await;
     for (process, role) in [(&active, "active"), (&candidate, "candidate")] {
@@ -180,6 +180,50 @@ async fn a_managed_process_ends_when_told_to_stop() {
     }
     assert_eq!(candidate.stopped().await, Ok(()));
     assert_eq!(active.stopped().await, Ok(()));
+}
+
+/// Asserts that two processes started over one shared store, as two frontends of one Postgres
+/// store are, both serve and neither is fenced: the generation row holds the marker and no
+/// generation, both are active and answer `GetCapabilities`, a write each makes through its
+/// farm (an epoch bump) is answered 200 and leaves neither found superseded, and both stop.
+/// Asserts that `held_generation` of each is null, that a quiesce of either is refused 409
+/// and leaves it active (nothing could take over from it, so it must not stop scheduling),
+/// and that a resume of it answers 200 and it writes after both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_processes_started_over_one_shared_store_both_serve_and_neither_is_fenced() {
+    let node = Node::start().await;
+    let store = shared();
+    let scratch = Scratch::new("shared");
+    let token_flag = scratch.token_flag();
+    let source = || StoreSource::Shared(Arc::clone(&store) as Arc<dyn Store>);
+    let a = Stoppable::start(&managed_flags(&node, &[&token_flag]), source()).await;
+    let b = Stoppable::start(&managed_flags(&node, &[&token_flag]), source()).await;
+
+    let row = store.get(GENERATION).expect("read").expect("a row");
+    assert_eq!(row.value, SHARED_WRITERS);
+    for process in [&a, &b] {
+        let view = process.child.role().await;
+        assert_eq!(view["role"], "active", "{view}");
+        assert_eq!(view["generation"], Value::Null, "the store holds none");
+        assert_eq!(view["held_generation"], Value::Null, "{view}");
+        capabilities(process.child.reapi)
+            .await
+            .expect("GetCapabilities");
+        let bumped = get_post(process.child.api, "/v1/epoch/bump").await;
+        assert_eq!(bumped, 200, "a write through this process's farm");
+    }
+    for process in [&a, &b] {
+        let view = process.child.role().await;
+        assert_eq!(view["superseded"], false, "{view}");
+        let (code, refused) = process.child.post("quiesce").await;
+        assert_eq!(code, 409, "{refused}");
+        assert_eq!(refused["role"], "active", "{refused}");
+        let (code, resumed) = process.child.post("resume").await;
+        assert_eq!((code, resumed["role"].as_str()), (200, Some("active")));
+        assert_eq!(get_post(process.child.api, "/v1/epoch/bump").await, 200);
+    }
+    assert_eq!(b.stopped().await, Ok(()));
+    assert_eq!(a.stopped().await, Ok(()));
 }
 
 /// Catches: a takeover that took the generation and could not start the frontend, which
@@ -275,7 +319,7 @@ async fn a_store_that_cannot_be_read_is_reported_and_stops_a_resume() {
     });
     let managed = Managed::start(
         &managed_flags(&node, &[]),
-        StoreSource::Shared(flaky),
+        StoreSource::Fenced(flaky),
         std::future::pending::<()>(),
     )
     .await
@@ -295,6 +339,26 @@ async fn a_store_that_cannot_be_read_is_reported_and_stops_a_resume() {
     assert_eq!(answer["role"], "quiesced");
     failing.store(false, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(a.post("resume").await.0, 200);
+}
+
+/// Asserts that a start over a shared store that cannot be read is refused with the store's
+/// error and does not start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_over_a_shared_store_that_cannot_be_read_is_refused() {
+    let node = Node::start().await;
+    let flaky: Arc<dyn Store> = Arc::new(Flaky {
+        inner: shared(),
+        failing: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    });
+    let error = Managed::start(
+        &managed_flags(&node, &[]),
+        StoreSource::Shared(flaky),
+        std::future::pending::<()>(),
+    )
+    .await
+    .err()
+    .expect("a store that fails is refused");
+    assert!(error.downcast_ref::<StoreError>().is_some(), "{error}");
 }
 
 /// Catches: a candidate that starts with an operator API address someone else holds

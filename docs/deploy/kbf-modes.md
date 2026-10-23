@@ -224,9 +224,12 @@ disks and CPUs, and `daemon` on hosts that only build.
   `storage-and-daemon` refuse any driver but `container`, so a Mac is never one of those. Its
   `kbf.toml` is rendered by `kbf-mac-provision`. See
   [kbf-installer-setup.md](kbf-installer-setup.md) for the verbs.
-- **The frontend is one process.** The state store's generation fence lets one frontend
-  write at a time, and the proxy's two slots exist to swap a new frontend in for an old one,
-  not to run two. A frontend that is down schedules nothing.
+- **The frontend is one process.** Frontends over one Postgres store share it and none
+  fences another, but a SQLite file is held by one process, and the proxy's two slots exist
+  to swap a new frontend in for an old one, not to run two (the swap takes a generation,
+  which a Postgres store does not hold: see
+  [state-store-cutover.md](state-store-cutover.md)). A frontend that is down schedules
+  nothing.
 - **A `storage-and-daemon` host is for a trusted network.** Its unit runs as the build user,
   which can read the cold store's key from the process's environment, as `all-in-one`'s user
   can read the farm's state. Hosts that must not share a user with a key run `daemon` and

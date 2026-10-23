@@ -889,8 +889,9 @@ fn a_result_row_that_is_not_a_result_is_refused_naming_it() {
     );
 }
 
-/// Catches: a generation read from a row that is not there as 0 (a farm over an unfenced
-/// store names its operations by the epoch, as before) or one that is read wrong.
+/// Asserts that the generation is the stored number, and none when the store has no row (a
+/// farm over an unfenced store names its operations by the epoch, as before) or holds the
+/// marker of shared frontends; and that a row that is neither is refused as corrupt.
 #[test]
 fn the_generation_is_the_stored_number_or_none() {
     let store = Flaky::new();
@@ -898,6 +899,14 @@ fn the_generation_is_the_stored_number_or_none() {
     assert_eq!(durable.generation().expect("read"), None);
     put(&store, GENERATION, 42u64.to_be_bytes().to_vec());
     assert_eq!(durable.generation().expect("read"), Some(42));
+    put(&store, GENERATION, SHARED_WRITERS.to_vec());
+    assert_eq!(durable.generation().expect("read"), None);
+    put(&store, GENERATION, vec![1, 2, 3]);
+    let refused = durable.generation().expect_err("junk");
+    assert!(
+        matches!(&refused, StateError::Corrupt { key, .. } if key == GENERATION),
+        "{refused:?}"
+    );
 }
 
 /// Catches: an operator's cordon or drain not kept (a successor process would offer

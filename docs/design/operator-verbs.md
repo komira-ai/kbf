@@ -71,6 +71,10 @@ here **[D]**.
 | a candidate takes the generation | `POST /v1/admin/takeover` | [F] | admin |
 | end worker streams after a takeover elsewhere | `POST /v1/admin/stand-down` | [F] | admin |
 
+`takeover` and `quiesce` are refused `409` by a process over a Postgres store, which the
+frontends share and which holds no generation to hand over; `resume` of such a process changes
+nothing.
+
 ### Enrollment
 
 All of these answer 404 until enrollment is wired into the frontend (#1055 **[V]**).

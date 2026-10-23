@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use kbf_state::conformance::fence;
 use kbf_state::postgres::{Flaw, PostgresBackend, PostgresStore};
-use kbf_state::{Cond, Fenced, GENERATION, Store, StoreError, Txn};
+use kbf_state::{Cond, Fenced, GENERATION, SHARED_WRITERS, Store, StoreError, Txn, share};
 use postgres::{Client, NoTls};
 
 fn url() -> String {
@@ -196,4 +196,39 @@ fn a_reap_that_waits_behind_a_take_is_fenced() {
         reap.join().expect("join")
     });
     assert_eq!(result, Err(StoreError::Fenced));
+}
+
+/// Shares the rig's store from eight threads at once, and checks that every call succeeded
+/// and that the generation row holds the marker and nothing else.
+fn share_together(rig: &Rig) {
+    thread::scope(|scope| {
+        let workers: Vec<_> = (0..8)
+            .map(|_| scope.spawn(|| share(&*rig.store)))
+            .collect();
+        for worker in workers {
+            worker.join().expect("join").expect("shares");
+        }
+    });
+    let row = rig.store.get(GENERATION).expect("read").expect("a row");
+    assert_eq!(row.value, SHARED_WRITERS);
+}
+
+/// Asserts that eight frontends that open an empty store together all succeed and agree: the
+/// generation row ends holding exactly the shared marker.
+#[test]
+fn concurrent_shares_of_an_empty_store_leave_exactly_the_marker() {
+    share_together(&Rig::new());
+}
+
+/// Asserts that eight frontends that open a store that holds a generation together all
+/// succeed and agree: the row ends holding exactly the shared marker, and the handle that
+/// held the generation is fenced.
+#[test]
+fn concurrent_shares_of_a_store_that_holds_a_generation_leave_exactly_the_marker() {
+    let rig = Rig::new();
+    let holder = Fenced::take(rig.dynstore(), None).expect("A takes");
+    share_together(&rig);
+    let late = holder.txn(Txn::new().put("a/k", "late", Cond::Any));
+    assert_eq!(late.unwrap_err(), StoreError::Fenced);
+    assert!(rig.store.get("a/k").expect("read").is_none());
 }
