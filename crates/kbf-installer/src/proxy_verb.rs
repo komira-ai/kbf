@@ -14,6 +14,11 @@
 //! `/readyz` says 503, and the reason is on the standard error. A child outlives the proxy: a
 //! stop of the proxy signals the proxy alone (`KillMode=process` in `kbf-proxy.service`).
 //!
+//! **Pool mode.** A `[proxy]` table with `[[frontend]]` tables in place of the `upstream` table
+//! is served by `proxy_pool` and none of what follows: the proxy balances over frontends that
+//! run on their own, with no state database, no supervisor, no handover and no update API
+//! (`run` hands over once it has the activated socket, before it opens any of them).
+//!
 //! **The update API.** `/v1/update/frontend` is the update API of [`crate::proxy::api`], run
 //! by an actor on a thread of its own and called through `UpdateBridge`. The proxy
 //! authenticates that route (the operator token) before it calls, bounds the body and the
@@ -215,7 +220,7 @@ fn loaded_from(path: &Path, text: &str) -> Result<Loaded, VerbError> {
 /// status file is the proxy's own `releases.json` (in its state directory) and `--update-dir`
 /// is not looked at; [`open_local`] adds the copies.
 fn handover_config(args: &ProxyArgs, loaded: &Loaded, layout: &Layout) -> HandoverConfig {
-    let table = loaded.proxy.upstream;
+    let table = loaded.proxy.slot_table();
     let at = |port: u16| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let admin = |slot| at(table.admin_port(slot));
     let operator = |slot| at(table.port(slot, Target::Operator));
@@ -228,7 +233,6 @@ fn handover_config(args: &ProxyArgs, loaded: &Loaded, layout: &Layout) -> Handov
             admin: [admin(Slot::A), admin(Slot::B)],
             operator: [operator(Slot::A), operator(Slot::B)],
         },
-        operator_token_file: loaded.proxy.operator_token_file.clone(),
         installer_toml: config_path(args, Platform::current()),
         gate: GateSlot::new(),
         state_dir: loaded.proxy.state_dir.clone(),
@@ -282,6 +286,15 @@ fn open_local(args: &ProxyArgs, state_dir: &Path) -> Result<Option<Local>, VerbE
 /// URL (the reader's own: a password in it is refused too).
 pub fn state_database(path: &Path) -> Result<Database, VerbError> {
     database_of(Database::from_installer_toml(path))
+}
+
+/// The state database `text`, the `installer.toml` at `path`, names ([`state_database`] over
+/// the text already read).
+fn slot_database(path: &Path, text: &str) -> Result<Database, VerbError> {
+    database_of(Database::from_installer_text(
+        &path.display().to_string(),
+        text,
+    ))
 }
 
 fn database_of(found: Result<Database, DatabaseError>) -> Result<Database, VerbError> {
@@ -378,7 +391,7 @@ const STOP_BOUND: Duration = Duration::from_secs(10);
 /// bound does not cover a runtime too stuck to run that task. Any later signal is an operator
 /// who is done waiting and ends the process at once. Both exits are status 1: the stop was
 /// not the clean drain.
-struct Stop {
+pub(crate) struct Stop {
     seen: AtomicBool,
     bound: Duration,
     exit: fn(i32) -> !,
@@ -386,7 +399,7 @@ struct Stop {
 
 impl Stop {
     /// The stop the verb runs with: the bound is [`STOP_BOUND`] and the exit is the process's.
-    fn production() -> Arc<Self> {
+    pub(crate) fn production() -> Arc<Self> {
         Arc::new(Self {
             seen: AtomicBool::new(false),
             bound: STOP_BOUND,
@@ -540,37 +553,17 @@ fn update_line(parts: &Parts, handover: &HandoverConfig) -> String {
     )
 }
 
-/// Serves on `listener` until a stop signal. The signal handlers are registered before the
-/// proxy serves, so none is lost to the default action. The update API's seams are built
-/// first: an order spool or a state directory the service user cannot use is a usage error
-/// before anything is bound.
-fn serve(
-    config: ProxyConfig,
-    database: Database,
-    handover: &HandoverConfig,
-    listener: OwnedFd,
-    root: &kbf_host::Root,
-    frontend_config: Option<PathBuf>,
-) -> Result<(), VerbError> {
-    let (parts, watch) = handover::parts_shared(handover)?;
-    #[cfg(target_os = "linux")]
-    let supervise_with = Supervise {
-        database,
-        state_dir: config.state_dir.clone(),
-        proxy_auth_file: config.proxy_auth_file.clone(),
-        upstream: config.upstream,
-        operator_token_file: config.operator_token_file.clone(),
-        status: handover.status_file.clone(),
-        local: handover.local.clone(),
-        frontend_config,
-        watch,
-    };
-    // Off Linux nothing supervises the proxy, so neither the database, the host root, the
-    // children's file nor the binary watch is used.
-    #[cfg(not(target_os = "linux"))]
-    let _ = (database, root, frontend_config, watch);
-    unblock_stop_signals();
-    let (handle, runner) = Proxy::bind(config, listener).map_err(VerbError::starting)?;
+/// Registers the signal handlers of a proxy that is bound and does not serve yet (so none is
+/// lost to the default action), for slot mode and pool mode alike: SIGTERM and SIGINT stop it
+/// through `stop` and `drain` ([`Stop::signalled`]), and SIGHUP reloads the TLS files.
+///
+/// # Errors
+/// A signal handler could not be registered.
+pub(crate) fn handle_signals(
+    handle: &kbf_proxy::ProxyHandle,
+    stop: &Arc<Stop>,
+    drain: &Arc<dyn Fn() + Send + Sync>,
+) -> std::io::Result<()> {
     let runtime = handle.runtime();
     let (term, int, hup) = runtime.block_on(async {
         (
@@ -579,15 +572,8 @@ fn serve(
             signal(SignalKind::hangup()),
         )
     });
-    let stop = Stop::production();
-    let died = Arc::new(AtomicBool::new(false));
-    // What stops the proxy, for a signal and for the death of the update API alike.
-    let drain: Arc<dyn Fn() + Send + Sync> = {
-        let handle = handle.clone();
-        Arc::new(move || handle.shutdown())
-    };
     for mut signals in [term?, int?] {
-        let (drain, stop) = (Arc::clone(&drain), Arc::clone(&stop));
+        let (drain, stop) = (Arc::clone(drain), Arc::clone(stop));
         runtime.spawn(async move {
             while signals.recv().await.is_some() {
                 drop(stop.signalled(&*drain));
@@ -617,6 +603,47 @@ fn serve(
             }));
         }
     });
+    Ok(())
+}
+
+/// Serves on `listener` until a stop signal. The signal handlers are registered before the
+/// proxy serves, so none is lost to the default action. The update API's seams are built
+/// first: an order spool or a state directory the service user cannot use is a usage error
+/// before anything is bound.
+fn serve(
+    config: ProxyConfig,
+    database: Database,
+    handover: &HandoverConfig,
+    listener: OwnedFd,
+    root: &kbf_host::Root,
+    frontend_config: Option<PathBuf>,
+) -> Result<(), VerbError> {
+    let (parts, watch) = handover::parts_shared(handover)?;
+    #[cfg(target_os = "linux")]
+    let supervise_with = Supervise {
+        database,
+        state_dir: config.state_dir.clone(),
+        proxy_auth_file: config.proxy_auth_file.clone(),
+        upstream: config.slot_table(),
+        status: handover.status_file.clone(),
+        local: handover.local.clone(),
+        frontend_config,
+        watch,
+    };
+    // Off Linux nothing supervises the proxy, so neither the database, the host root, the
+    // children's file nor the binary watch is used.
+    #[cfg(not(target_os = "linux"))]
+    let _ = (database, root, frontend_config, watch);
+    unblock_stop_signals();
+    let (handle, runner) = Proxy::bind(config, listener).map_err(VerbError::starting)?;
+    let stop = Stop::production();
+    let died = Arc::new(AtomicBool::new(false));
+    // What stops the proxy, for a signal and for the death of the update API alike.
+    let drain: Arc<dyn Fn() + Send + Sync> = {
+        let handle = handle.clone();
+        Arc::new(move || handle.shutdown())
+    };
+    handle_signals(&handle, &stop, &drain)?;
     // The handler exists: a SIGHUP held since the start of the verb is delivered now.
     release_reload_signal();
     // A closed standard error (a journal that went away) must not stop the proxy from serving.
@@ -643,7 +670,6 @@ struct Supervise {
     state_dir: std::path::PathBuf,
     proxy_auth_file: std::path::PathBuf,
     upstream: kbf_proxy::config::UpstreamTable,
-    operator_token_file: std::path::PathBuf,
     /// The root half's `status.json`; with `local`, the proxy's own `releases.json`.
     status: std::path::PathBuf,
     /// The proxy's own copies of `kbf` (`--kbf-binary`): the children are run from them and a
@@ -765,7 +791,7 @@ fn start_with(
     use crate::proxy::supervisor::{Adopt, Boot, adopt_children, child_admin, host_migrator};
     use crate::run::SystemRunner;
 
-    child_admin(handle, with.upstream, with.operator_token_file).map(|admin| {
+    child_admin(handle, with.upstream).map(|admin| {
         let report = FileReport::new(&with.state_dir);
         let facts = StatusFile::new(&with.status);
         let migrator = host_migrator(with.database, &facts, child);
@@ -847,10 +873,12 @@ pub fn run(args: &ProxyArgs, root: &Path) -> Result<(), VerbError> {
     let path = config_path(args, Platform::current());
     let text = read_config(&path)?;
     let loaded = loaded_from(&path, &text)?;
-    let database = database_of(Database::from_installer_text(
-        &path.display().to_string(),
-        &text,
-    ))?;
+    // Only slot mode migrates a database before it starts a release: a pool has no release.
+    let database = if loaded.proxy.frontend.is_empty() {
+        Some(slot_database(&path, &text)?)
+    } else {
+        None
+    };
     if args.check {
         kbf_binary(args)?;
         return loaded
@@ -867,6 +895,13 @@ pub fn run(args: &ProxyArgs, root: &Path) -> Result<(), VerbError> {
         std::process::id(),
         FIRST_FD,
     )?;
+    // `[[frontend]]` tables: pool mode, a load balancer over frontends that run on their own,
+    // with no database, no supervisor, no swap and no update API behind it.
+    let Some(database) = database else {
+        unblock_stop_signals();
+        crate::proxy_pool::run(loaded.proxy, listener, release_reload_signal)?;
+        return Ok(());
+    };
     let mut handover = handover_config(
         args,
         &loaded,

@@ -1,8 +1,8 @@
 //! The host fetcher: that it reads the host when asked and not before, what it takes from
 //! `installer.toml` and `installer.conf` and from where, and that each way it cannot be made
 //! is a refusal with its reason. The whole path with a stand-in child is
-//! `tests/fetcher_real.rs`; the file's own rules are in `installer_toml_tests.rs`, and the
-//! trust rule it is read under is in `trusted_toml_tests.rs`.
+//! `tests/fetcher_real.rs`; the file's own rules are in kbf-setup's
+//! `installer_toml_tests.rs`, and the trust rule it is read under is in `trusted_toml_tests.rs`.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;

@@ -145,7 +145,7 @@ fn a_trusted_file_with_bad_content_is_refused_with_the_parsers_reason() {
 /// release-source keys it carries, is read without a refusal: the keys are still understood.
 #[test]
 fn a_trusted_file_with_the_proxy_table_and_the_release_source_keys_is_read() {
-    let text = include_str!("../../tests/golden/all_in_one/installer.toml");
+    let text = include_str!("../../../kbf-setup/tests/golden/all_in_one/installer.toml");
     let got = read(&host(text)).expect("trusted");
     assert_eq!(got, InstallerToml::parse(text).expect("parses"));
     assert!(got.proxy.is_some());

@@ -83,7 +83,6 @@ pub fn quick() -> Timing {
         confirm_backoff_max: Duration::from_millis(10),
         poll: Duration::from_millis(2),
         tick: Duration::from_millis(1),
-        desired_within: Duration::from_millis(50),
     }
 }
 
@@ -373,22 +372,6 @@ impl ChildAdmin for Rig {
             open_streams,
             open_sessions: 0,
         })
-    }
-
-    fn post_desired(
-        &self,
-        slot: Slot,
-        commit: &CommitId,
-        source: kbf_update::Source,
-    ) -> Result<(), crate::proxy::model::DesiredError> {
-        // The line of a fetch is the one it has always been; any other source is named after.
-        let named = if source.is_fetch() {
-            String::new()
-        } else {
-            format!(" {}", source.name())
-        };
-        self.say(format!("admin:desired {slot:?} {commit}{named}"));
-        Ok(())
     }
 }
 

@@ -7,7 +7,7 @@ still does by hand. A Mac is a node only: `setup` refuses every mode but `--mode
 
 ## Layout per platform
 
-The paths are in one place, `crates/kbf-installer/src/layout.rs`. The two platforms differ in these:
+The paths are in one place, `crates/kbf-setup/src/layout.rs` (re-exported as `kbf_installer::layout`). The two platforms differ in these:
 
 | | Linux | macOS |
 |---|---|---|

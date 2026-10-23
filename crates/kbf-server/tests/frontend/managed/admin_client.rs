@@ -18,26 +18,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::Instant;
 
-use kbf_installer::CommitId;
 use kbf_installer::proxy::admin::{Admin, AdminError, Deadlines};
 use kbf_installer::proxy::child_http::Headers;
 use kbf_installer::proxy::model::{
-    OpenCounts, Readiness as ChildReadiness, RoleInfo, RoleState, Slot, Source,
+    OpenCounts, Readiness as ChildReadiness, RoleInfo, RoleState, Slot,
 };
 use kbf_installer::proxy::ports::ChildAdmin;
 use kbf_state::Op;
 
 use super::*;
-
-/// The commit B is built from: its release store holds it, A's does not.
-const NEW: &str = "fedcba9876543210fedcba9876543210fedcba98";
-/// The commit A runs: only A's release store holds it.
-const OLD: &str = "0123456789abcdef0123456789abcdef01234567";
-/// A commit neither release store holds.
-const NOWHERE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-/// Part of the child's `409` for an offer of a commit its release store does not hold
-/// complete: the only refusal it has today for a commit that is not its own.
-const NO_PLATFORM: &str = "holds no platform of this commit complete";
 
 /// The most any one call of the client may take in these tests: far more than a call on
 /// loopback needs, and a bound on the tests that would otherwise hang.
@@ -48,10 +37,6 @@ fn deadlines() -> Deadlines {
         call: CALL,
         quiesce: CALL,
     }
-}
-
-fn commit(text: &str) -> CommitId {
-    CommitId::new(text).expect("a commit id")
 }
 
 fn holder(state: RoleState) -> RoleInfo {
@@ -68,8 +53,7 @@ fn not_holder(state: RoleState) -> RoleInfo {
     }
 }
 
-/// The client for the ports of two children: slot A is `a`, slot B is `b`; the operator
-/// token is the one the children's `--api-token-file` holds.
+/// The client for the ports of two children: slot A is `a`, slot B is `b`.
 fn admin_of(a: &Child, b: &Child, deadlines: Deadlines) -> Arc<Admin> {
     let (a_admin, b_admin, a_api, b_api) = (a.admin, b.admin, a.api, b.api);
     Arc::new(Admin::new(
@@ -82,7 +66,6 @@ fn admin_of(a: &Child, b: &Child, deadlines: Deadlines) -> Arc<Admin> {
             Slot::B => b_api,
         },
         Headers::new(),
-        || Ok(TOKEN.as_bytes().to_vec()),
         deadlines,
     ))
 }
@@ -100,7 +83,7 @@ async fn run<T: Send + 'static>(
 }
 
 /// A swap's two children on one host: A active, B a candidate; each with an operator token
-/// and a release store of its own.
+/// file.
 struct Host {
     a: Child,
     b: Child,
@@ -117,18 +100,9 @@ impl Host {
         let store = shared();
         let scratch = Scratch::new(name);
         let token = scratch.token_flag();
-        let releases = |side: &str| {
-            let dir = scratch.0.join(format!("releases-{side}"));
-            std::fs::create_dir_all(&dir).expect("a release directory");
-            format!("--releases-dir={}", dir.display())
-        };
-        let (a_releases, b_releases) = (releases("a"), releases("b"));
-        let a = Child::start(&managed_flags(&node, &[&token, &a_releases]), &store).await;
-        let b = Child::start(
-            &managed_flags(&node, &["--await-takeover", &token, &b_releases]),
-            &store,
-        )
-        .await;
+        let a = Child::start(&managed_flags(&node, &[&token]), &store).await;
+        let b_flags = managed_flags(&node, &["--await-takeover", &token]);
+        let b = Child::start(&b_flags, &store).await;
         let admin = admin_of(&a, &b, deadlines());
         Self {
             a,
@@ -159,23 +133,6 @@ impl Host {
                 .is_ok_and(|read| read.readyz == ready)
         })
         .await;
-    }
-
-    /// Stores a complete release of `commit` in the release store of the child at `api`:
-    /// the tarball of `kbf` for one platform, and its attestation.
-    async fn release(&self, api: SocketAddr, commit: &str) {
-        let tarball = format!("tarball:kbf:{commit}");
-        let bundle = format!("bundle:kbf:{commit}");
-        for (name, body) in [("kbf", tarball), ("kbf.attestation", bundle)] {
-            let path = format!("/v1/releases/{commit}/linux-x86_64/{name}");
-            let request = format!(
-                "PUT {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\
-                 Authorization: Bearer {TOKEN}\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            );
-            let (code, answer) = exchange(api, &request).await;
-            assert_eq!(code, 201, "{path}: {answer}");
-        }
     }
 }
 
@@ -955,116 +912,4 @@ async fn open_counts_are_the_childs_own_streams_and_a_stood_down_child_with_a_qu
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(idle.idle());
-}
-
-/// Catches an offer that goes to the wrong child or carries the wrong gates: `post_desired`
-/// goes to the operator port of the slot it is given (the new child's, after the bake) with
-/// the bearer token and a JSON body, and the child writes the desired release. B holds its
-/// own commit; A's release store does not, so an offer that went to A (the old slot) fails.
-///
-/// Pins what a commit that is not the child's own release gets TODAY: a `409` with an
-/// `error` text and no `code`, which the client reads as `Conflict`. Once the child answers
-/// `"code": "not_own"` (the desired-commit gate, kbf#1145), the client's `NotOwn` is the
-/// answer and this assertion changes to it.
-///
-/// A wrong token is the child's `401`, a `Status` the swap notes as a failed offer.
-///
-/// Catches: the offer sent to the old slot; the bearer token dropped.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn post_desired_reaches_the_new_childs_operator_port_with_its_own_release() {
-    let host = Host::start("admin-desired").await;
-    host.release(host.a.api, OLD).await;
-    host.run(|admin| admin.quiesce(Slot::A))
-        .await
-        .expect("quiesce");
-    host.run(|admin| admin.takeover(Slot::B, CALL))
-        .await
-        .expect("takeover");
-    host.release(host.b.api, NEW).await;
-
-    let new = commit(NEW);
-    assert_eq!(
-        host.run({
-            let new = new.clone();
-            move |admin| admin.post_desired(Slot::B, &new, Source::Fetch)
-        })
-        .await,
-        Ok(())
-    );
-    let (code, update) = get(host.b.api, "/v1/update").await;
-    assert_eq!(code, 200, "{update}");
-    assert_eq!(update["desired"]["commit"], NEW, "{update}");
-    assert_eq!(update["desired"]["generation"], 1, "{update}");
-    assert_eq!(
-        host.run({
-            let new = new.clone();
-            move |admin| admin.post_desired(Slot::B, &new, Source::Fetch)
-        })
-        .await,
-        Ok(()),
-        "an offer is idempotent"
-    );
-
-    // The old slot's release store does not hold the new commit: an offer sent there fails.
-    let to_old = host
-        .run({
-            let new = new.clone();
-            move |admin| admin.try_post_desired(Slot::A, &new)
-        })
-        .await;
-    assert!(
-        matches!(
-            &to_old,
-            Err(AdminError::Conflict {
-                call: "post_desired",
-                error
-            }) if error.contains(NO_PLATFORM)
-        ),
-        "{to_old:?}"
-    );
-
-    // A commit the child does not hold is a 409 today, with no code.
-    let other = commit(NOWHERE);
-    let not_own = host
-        .run(move |admin| admin.try_post_desired(Slot::B, &other))
-        .await;
-    assert!(
-        matches!(
-            &not_own,
-            Err(AdminError::Conflict {
-                call: "post_desired",
-                error
-            }) if error.contains(NO_PLATFORM)
-        ),
-        "{not_own:?}"
-    );
-    let (_, update) = get(host.b.api, "/v1/update").await;
-    assert_eq!(update["desired"]["commit"], NEW, "a refused offer wrote");
-
-    // The same client with another token: the child's gate answers.
-    let wrong = Arc::new(Admin::new(
-        {
-            let b = host.b.admin;
-            move |_| b
-        },
-        {
-            let b = host.b.api;
-            move |_| b
-        },
-        Headers::new(),
-        || Ok(b"not-the-operator-token-not-the-operator-token".to_vec()),
-        deadlines(),
-    ));
-    let refused = run(&wrong, move |admin| admin.try_post_desired(Slot::B, &new)).await;
-    assert!(
-        matches!(
-            &refused,
-            Err(AdminError::Status {
-                call: "post_desired",
-                code: 401,
-                ..
-            })
-        ),
-        "{refused:?}"
-    );
 }

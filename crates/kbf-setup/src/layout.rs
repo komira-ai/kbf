@@ -9,9 +9,9 @@
 //!   releases/current                       link to <commit>, the release that runs
 //!   releases/current.new, previous.new     a link being replaced (renamed over its name)
 //!   releases/previous                      link to <commit>, the one before it
-//!   state.json, state.json.bak             the state (crate::state) and the last good one
+//!   state.json, state.json.bak             the state (kbf_installer::state) and the last good one
 //!   seq_floor                              the highest seq not allowed (a seed must exceed it)
-//!   work/                                  scratch of a stage in progress (crate::stage)
+//!   work/                                  scratch of a stage in progress (kbf_installer::stage)
 //! /run/kbf-installer/lock                  the lock the state is read and written under
 //! /usr/share/kbf-installer/trust/          what offline verification trusts (package-owned)
 //!   gh, trusted_root.jsonl, installer.conf

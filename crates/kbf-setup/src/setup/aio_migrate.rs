@@ -125,7 +125,7 @@ impl Earlier {
     /// The run does not give `--proxy`, or gives a cold store or metadata directory other than
     /// the file's.
     pub fn adopt(&self, raw: &mut Raw) -> Result<(), SetupError> {
-        if !raw.proxy.proxy {
+        if !raw.behind_proxy() {
             return Err(SetupError::NeedsOperator(format!(
                 "{} says mode = \"all-in-one\", the layout of one process for everything that an earlier release set up: give --proxy and setup splits it into the proxy layout (the proxy, a frontend child and the kbf-storage-and-daemon sibling), keeping the file; it stops and starts none of the services of the move",
                 self.path

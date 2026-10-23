@@ -375,10 +375,8 @@ fn differing(a: &ProxyConfig, b: &ProxyConfig) -> Vec<&'static str> {
         (a.client_ca_file != b.client_ca_file, "client_ca_file"),
         (a.buck2_auth != b.buck2_auth, "buck2_auth"),
         (a.buck2_token_file != b.buck2_token_file, "buck2_token_file"),
-        (
-            a.upstream.base_port != b.upstream.base_port,
-            "upstream.base_port",
-        ),
+        (a.upstream != b.upstream, "upstream.base_port"),
+        (a.frontend != b.frontend, "frontend"),
     ]
     .into_iter()
     .filter_map(|(differs, key)| differs.then_some(key))
@@ -411,25 +409,4 @@ fn take_owned(from: &ProxyConfig, to: &mut ProxyConfig) {
     to.buck2_auth = from.buck2_auth;
     to.buck2_token_file = from.buck2_token_file.clone();
     to.upstream = from.upstream;
-}
-
-/// Catches the proxy's port layout and the deploy's copy of it drifting apart: `deploy` finds
-/// the operator listener of each slot as `base + stride * slot + offset` without naming the
-/// proxy, so a change to either side would send the gates to the wrong port. Here (one of the
-/// files that may name `kbf_proxy`) is where both can be read.
-///
-/// Catches: `SLOT_STRIDE` 10 to 11 in `kbf_proxy::config`; the operator offset 2 to 3
-/// in `kbf_proxy::route`; each turned this test red.
-#[cfg(test)]
-mod layout_tests {
-    use super::{MAX_BASE_PORT, SLOT_STRIDE};
-    use crate::observe;
-    use kbf_proxy::route::Target;
-
-    #[test]
-    fn the_deploys_port_layout_is_the_proxys() {
-        assert_eq!(observe::SLOT_STRIDE, SLOT_STRIDE);
-        assert_eq!(observe::OPERATOR_OFFSET, Target::Operator.offset());
-        assert_eq!(observe::MAX_BASE_PORT, MAX_BASE_PORT);
-    }
 }

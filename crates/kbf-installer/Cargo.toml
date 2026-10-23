@@ -49,6 +49,10 @@ hyper.workspace = true
 kbf-host.workspace = true
 kbf-proxy.workspace = true
 kbf-proto.workspace = true
+# The `setup` verb and the host's layout, `installer.toml` and state database it works on
+# (re-exported here under their old paths). `proxy`: the proxy's side of `setup` (`--proxy`, the
+# `[proxy]` table), which `kbf setup` in the `kbf` binary does not have.
+kbf-setup = { workspace = true, features = ["proxy"] }
 # `postgres`: the schema's migrations and the client that applies them (`database` module).
 kbf-state = { workspace = true, features = ["postgres"] }
 # `ReleasePlatform`: the platform names and the components a host of each needs, which is what

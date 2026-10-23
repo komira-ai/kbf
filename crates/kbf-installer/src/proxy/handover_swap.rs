@@ -18,7 +18,7 @@
 //!
 //! The ports, one by one: `child`, `gate`, `old_proc`, `releases_dir` and the secret come from
 //! the slot; `admin` is [`Admin`] over the two ports of each slot of the upstream table (the
-//! secret on every call, the operator token read from its file on each `post_desired`);
+//! secret on every call);
 //! `recorder` is [`FileRecorder`] over the state directory; `orders` is [`SpoolRootOrders`]
 //! over a clone of the one order spool (it shares the counter, and never opens `orders/`), or,
 //! for a proxy that keeps its own copies of `kbf` ([`Handover::local`]), the
@@ -243,13 +243,12 @@ pub fn admin_secret(proxy: &hyper::HeaderMap) -> Headers {
 }
 
 /// The client of the children's admin and operator ports: each call goes to the port of its
-/// slot with `secret`, and the operator token is read from `token_file` on every offer.
-fn admin_of(slots: SlotAddrs, token_file: PathBuf, secret: Headers) -> Admin {
+/// slot with `secret`.
+fn admin_of(slots: SlotAddrs, secret: Headers) -> Admin {
     Admin::new(
         move |slot| slots.admin(slot),
         move |slot| slots.operator(slot),
         secret,
-        move || std::fs::read(&token_file),
         Deadlines::frontend(),
     )
 }
@@ -301,13 +300,10 @@ impl Migrator for StateDbMigrator {
 /// The swap supervisor over `host`'s ports. Resumes an update that was in flight.
 fn build(cfg: &HandoverConfig, orders: &Orders, host: &Host, seams: &Seams) -> SwapSupervisor {
     let orders = Arc::clone(orders);
-    let admin: Arc<dyn ChildAdmin + Send + Sync> = seams.admin.clone().unwrap_or_else(|| {
-        Arc::new(admin_of(
-            cfg.slots,
-            cfg.operator_token_file.clone(),
-            host.secret.clone(),
-        ))
-    });
+    let admin: Arc<dyn ChildAdmin + Send + Sync> = seams
+        .admin
+        .clone()
+        .unwrap_or_else(|| Arc::new(admin_of(cfg.slots, host.secret.clone())));
     let migrator = StateDbMigrator {
         apply: seams.apply.clone(),
         ..StateDbMigrator::new(&cfg.status_file, cfg.installer_toml.clone())
