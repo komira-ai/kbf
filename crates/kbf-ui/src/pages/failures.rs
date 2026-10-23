@@ -2,7 +2,7 @@
 //! how the Action page shows one failed action's command and log tails.
 //!
 //! Nothing is redacted here: arguments and log text are shown as the farm's API answers
-//! them (CEO ruling for the open UI; `docs/api.md`, "The failures view"). Environment
+//! them (ruling for the open UI; `docs/api.md`, "The failures view"). Environment
 //! variables are names only: the API never sends a value.
 
 use std::collections::BTreeMap;

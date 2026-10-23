@@ -340,7 +340,7 @@ invocation chunks are kept, cut by the same rule, but as immutable objects under
 `history/` in the object store, indexed by rows in the state store, with no root blob,
 no pin on the Raft log and no log-format bump. The text is kept as history.
 
-**Stage 2, durable** (PRs 7 and 8). The CEO's ruling (2026-10-12): "Yes we should
+**Stage 2, durable** (PRs 7 and 8). The ruling (2026-10-12): "Yes we should
 switch to durable build records without waiting for HA." So stage 2 runs on today's
 metadata log, the Raft metadata log: a single-voter Raft log on the server's own disk
 (`kbf-server/src/raft_log`), which a restart already keeps. The pins, with their
@@ -808,7 +808,7 @@ it catches and the mutant planted to see it go red. **The numbers are names, not
 order**: code and tests cite them (`section 9, PR 3`), so they are kept; 12 to 14 are
 new. The list runs in the order the work lands: the agent's path first (the read API,
 the failures view, the client, real CPU and memory), then durability on today's
-single-voter log (CEO, 2026-10-12, 3.5), then the link, tokens for agents on other
+single-voter log (2026-10-12, 3.5), then the link, tokens for agents on other
 machines, retention, and the HTML page for people last.
 
 **Landed**: 1, 2, 3 and 5.
@@ -1016,8 +1016,7 @@ Each with a recommendation; none is decided here.
 5. **Durable home.** Recommend CAS chunks plus one pin per invocation in the log (3.5),
    the pin carrying its closure and updated by compare-and-set; cross-build lists from
    a derived index, never a second authoritative store (3.7); flushed at 256 KiB, at
-   idle or every 120 s, with the in-memory stage shipped first. **Decided** (CEO,
-   2026-10-12: "Yes we should switch to durable build records without waiting for
+   idle or every 120 s, with the in-memory stage shipped first. **Decided** (2026-10-12: "Yes we should switch to durable build records without waiting for
    HA."): the pins and chunks land on today's single-voter the Raft metadata log log, in a
    format bump of their own, before the HA work, which inherits them (3.5).
 6. **The link on a successful buck2 build.** Recommend: today, the printed `Build ID` in

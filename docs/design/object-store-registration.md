@@ -81,7 +81,7 @@ Related: [operator-verbs.md](operator-verbs.md) (every operator verb and its rou
   `crates/kbf-server/src/api.rs`, `gate`]**. The enrollment routes apply all of it to a GET
   too, answer `Cache-Control: no-store`, answer 404 when the feature is off and 409 on a
   fenced frontend (the object-store routes have no fence: section 18) **[F: `crates/kbf-server/src/enroll/api.rs`]**. This ADR copies that shape.
-- **Both frontend children serve at once.** Under the CEO ruling of section 18, an old and a new
+- **Both frontend children serve at once.** Under the ruling of section 18, an old and a new
   frontend child run side by side on one Postgres behind the reverse proxy bundled in
   `kbf-installer`. Remote operators reach the API through a TLS-terminating proxy, whose
   connections arrive from loopback and pass the gate **[F: `docs/api.md`, "Through a reverse
@@ -186,7 +186,7 @@ applied, unsupported, nodes: [{id, state, applied_generation, status, last_seen_
   (15 s, refreshed by each heartbeat) written with compare-and-set. The unit D code
   implements this; the plan had it in memory.
 
-**Schema rule (CEO ruling, section 18).** These are rows in the existing `kbf-state` key/row
+**Schema rule (ruling, section 18).** These are rows in the existing `kbf-state` key/row
 store: `objstore/conn`, `bind`, `gen`, `audit` and `ack` are key prefixes, not tables, and
 this work adds no table and no column. `kbf-installer` creates and migrates the schema; `kbf`
 creates or alters nothing at start and refuses a schema version it does not support. Should a
@@ -451,7 +451,7 @@ route, method or node verb (`:cordon`, `:drain`, `:uncordon`, each needs its own
 red. It is a textual scan, with the limits its header names. It does not check the gate column of the verbs table, which
 lives in the handlers.
 
-## 18. CEO ruling on the frontend architecture (overrides earlier text of this page)
+## 18. Ruling on the frontend architecture (overrides earlier text of this page)
 
 - **Postgres only.** SQLite is dropped; Postgres is a runtime dependency of the frontend and
   the all-in-one. Rows, generation and audit go through the `kbf-state` store on Postgres;
