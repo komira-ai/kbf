@@ -4,7 +4,7 @@
 use super::{Href, Html, attr, escape, url};
 
 /// Catches: any of the five characters that end text or a quoted attribute value left
-/// as it is (mutant: one `match` arm of `escape` removed).
+/// as it is (catches: one `match` arm of `escape` removed).
 #[test]
 fn escape_writes_the_five_markup_characters_as_references() {
     assert_eq!(
@@ -15,7 +15,7 @@ fn escape_writes_the_five_markup_characters_as_references() {
 }
 
 /// Catches: text or an attribute value written raw, so a value can close its quote
-/// and add an attribute (mutant: `open` writing the value unescaped).
+/// and add an attribute (catches: `open` writing the value unescaped).
 #[test]
 fn text_and_attribute_values_are_escaped() {
     let mut h = Html::default();
@@ -41,7 +41,7 @@ fn a_document_starts_with_the_doctype_and_void_elements_have_no_close() {
 }
 
 /// Catches: a URL that leaves this server, or that a browser rewrites into one that
-/// does, accepted as a link (mutants: each clause of `root_relative` removed).
+/// does, accepted as a link (catches: each clause of `root_relative` removed).
 #[test]
 fn only_root_relative_urls_are_links() {
     for bad in [
@@ -67,7 +67,7 @@ fn only_root_relative_urls_are_links() {
     }
 }
 
-/// Catches: a page able to write a `<script>` or `<style>` element (mutant: the tag
+/// Catches: a page able to write a `<script>` or `<style>` element (catches: the tag
 /// allowlist check removed).
 #[test]
 #[should_panic(expected = "<script> is not an allowed element")]
@@ -75,7 +75,7 @@ fn a_script_element_is_refused() {
     Html::default().el("script", &[], |_| {});
 }
 
-/// Catches: an event handler or `style=` attribute written (mutant: the attribute
+/// Catches: an event handler or `style=` attribute written (catches: the attribute
 /// allowlist check removed).
 #[test]
 #[should_panic(expected = "onclick= is not an allowed attribute")]
@@ -84,7 +84,7 @@ fn an_event_handler_attribute_is_refused() {
 }
 
 /// Catches: a URL attribute set from plain text, which would skip `Href`'s check
-/// (mutant: one allowlist for both kinds).
+/// (catches: one allowlist for both kinds).
 #[test]
 #[should_panic(expected = "href= is not an allowed attribute")]
 fn href_takes_an_href_not_text() {

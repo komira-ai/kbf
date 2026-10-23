@@ -40,7 +40,7 @@ fn desired(w: &World) -> Vec<String> {
 /// update when it is not a fetch, and is the event it has always been when it is. The intent
 /// (`update.json`) keeps the source too, because the order is sent again after a restart.
 ///
-/// Mutants planted: the order sent with source `fetch` whatever the plan says; the intent
+/// Catches: the order sent with source `fetch` whatever the plan says; the intent
 /// built with source `fetch`; the plan of a restart built with source `fetch`.
 #[test]
 fn the_order_for_the_nodes_names_the_source_of_the_update_and_the_intent_keeps_it() {
@@ -67,7 +67,7 @@ fn the_order_for_the_nodes_names_the_source_of_the_update_and_the_intent_keeps_i
 /// staged release is kept, the new child serves, and the old one is drained and retired as in
 /// any update.
 ///
-/// Mutants planted: the refusal noted and the update `done`; the refusal sent again; the
+/// Catches: the refusal noted and the update `done`; the refusal sent again; the
 /// failure recorded as step `confirm`.
 #[test]
 fn a_refusal_of_the_order_for_the_nodes_ends_the_update_failed_at_nodes() {
@@ -95,7 +95,7 @@ fn a_refusal_of_the_order_for_the_nodes_ends_the_update_failed_at_nodes() {
 /// before: it is sent again, one poll apart, until the child answers, and the update ends as
 /// the plan said it would.
 ///
-/// Mutant planted: one try only (the update ends `done`, the nodes never told).
+/// Catches: one try only (the update ends `done`, the nodes never told).
 #[test]
 fn an_order_for_the_nodes_that_gets_no_answer_is_sent_again_until_it_does() {
     let (w, old) = World::with_old();
@@ -119,7 +119,7 @@ fn an_order_for_the_nodes_that_gets_no_answer_is_sent_again_until_it_does() {
 /// for `desired_within` and then the update ends `failed` at `nodes` with the reason
 /// `timeout`, the frontend as it is (the new child serves).
 ///
-/// Mutants planted: no bound; the bound counted from the start of the update.
+/// Catches: no bound; the bound counted from the start of the update.
 #[test]
 fn a_child_that_never_answers_ends_the_update_failed_at_nodes_after_the_bound() {
     let (w, old) = World::with_old();

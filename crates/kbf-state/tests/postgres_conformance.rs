@@ -2,10 +2,9 @@
 //! must reject, the startup refusals, the claim path and the parts that are
 //! Postgres's alone (the database clock, one transaction per batch).
 //!
-//! The tests that need a server are `#[ignore]`d so `cargo test --workspace` stays
-//! hermetic; the `state-postgres` job in ci.yml runs them with `--include-ignored`
-//! against a service container. `KBF_TEST_POSTGRES_URL` names a database they may create
-//! and drop schemas in. Waits are on conditions; no assertion depends on elapsed time.
+//! The tests need a server and fail without one, so the pull-request gate runs them with the
+//! rest. `KBF_TEST_POSTGRES_URL` names a database they may create and drop schemas in.
+//! Waits are on conditions; no assertion depends on elapsed time.
 #![cfg(feature = "postgres")]
 
 use std::collections::BTreeSet;
@@ -20,12 +19,8 @@ use kbf_state::postgres::{ConfigError, Flaw, PostgresBackend, PostgresConfig, Po
 use kbf_state::{Cond, Event, Revision, Store, StoreError, StoreTime, Txn};
 use postgres::{Client, NoTls};
 
-const URL_VAR: &str = "KBF_TEST_POSTGRES_URL";
-
 fn url() -> String {
-    std::env::var(URL_VAR).unwrap_or_else(|_| {
-        panic!("{URL_VAR} must name a postgres:// URL the tests may create schemas in")
-    })
+    kbf_testkit::database::server_url()
 }
 
 /// The test URL with a server setting for every connection it opens.
@@ -42,49 +37,41 @@ fn backend(flaw: Flaw) -> PostgresBackend {
 // ---- the suite -------------------------------------------------------------------------
 
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn c1_cas_is_linearizable() {
     c1_linearizable_cas(&backend(Flaw::None));
 }
 
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn c2_transactions_are_atomic() {
     c2_atomic_txn(&backend(Flaw::None));
 }
 
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn c3_counters_are_monotonic() {
     c3_monotonic_counter(&backend(Flaw::None));
 }
 
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn c4_expiry_follows_the_store_clock() {
     c4_store_clock_expiry(&backend(Flaw::None));
 }
 
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn c5_the_feed_skips_no_row() {
     c5_ordered_feed(&backend(Flaw::None));
 }
 
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn c6_acknowledged_writes_survive_a_restart() {
     c6_durable_ack(&backend(Flaw::None));
 }
 
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn c7_a_burst_is_one_group() {
     c7_group_commit(&backend(Flaw::None));
 }
 
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn c8_a_range_scan_is_bounded_and_resumes() {
     c8_bounded_range_scan(&backend(Flaw::None));
 }
@@ -93,7 +80,6 @@ fn c8_a_range_scan_is_bounded_and_resumes() {
 // past the earlier one, and never sees it. This is what makes the C5 run above a check
 // of the commit head rather than a pass by construction.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 #[should_panic(expected = "C5 interleaved")]
 fn sequence_revisions_fail_c5() {
     c5_ordered_feed(&backend(Flaw::SequenceRevisions));
@@ -103,7 +89,6 @@ fn sequence_revisions_fail_c5() {
 
 // Catches a connection that is allowed to acknowledge a commit before it is flushed.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_server_that_does_not_flush_commits_is_refused() {
     for setting in ["off", "local", "remote_write"] {
         let config = PostgresConfig::parse(&url_setting("synchronous_commit", setting))
@@ -121,7 +106,6 @@ fn a_server_that_does_not_flush_commits_is_refused() {
 // Catches expiry judged by anything but the database: with no injected clock a key with a
 // zero time to live is expired the moment it is read, and one with an hour is not.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn the_database_clock_judges_expiry() {
     let backend = backend(Flaw::None);
     let store = PostgresStore::open(&backend.fresh_config()).expect("opens");
@@ -167,7 +151,6 @@ fn the_database_clock_judges_expiry() {
 // Catches a batch that commits its transactions one by one: every row a batch writes
 // carries the id of the one database transaction that wrote it.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_batch_is_one_database_transaction() {
     let backend = backend(Flaw::None);
     let config = backend.fresh_config();
@@ -223,7 +206,6 @@ fn take(key: &str, was: &kbf_state::Versioned) -> Option<Txn> {
 
 // Catches a claim that hands one row to two claimers, or loses one.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn concurrent_claimers_get_disjoint_rows() {
     let backend = backend(Flaw::None);
     let store = PostgresStore::open(&backend.fresh_config()).expect("opens");
@@ -299,13 +281,11 @@ fn claim_past_a_held_row(flaw: Flaw) {
 
 // Catches a claim that waits behind a row another session holds.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_claim_skips_a_row_another_session_holds() {
     claim_past_a_held_row(Flaw::None);
 }
 
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 #[should_panic(expected = "lock timeout")]
 fn a_claim_that_waits_stalls_behind_a_held_row() {
     claim_past_a_held_row(Flaw::ClaimBlocks);
@@ -314,7 +294,6 @@ fn a_claim_that_waits_stalls_behind_a_held_row() {
 // Catches a claim that writes over a row whose version moved on, and one that claims a
 // row its caller declined.
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_lost_version_or_a_declined_row_is_not_claimed() {
     let backend = backend(Flaw::None);
     let store = PostgresStore::open(&backend.fresh_config()).expect("opens");

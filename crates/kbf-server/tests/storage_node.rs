@@ -205,7 +205,7 @@ async fn a_node_with_a_ram_budget_writes_what_it_holds_when_it_stops() {
 /// Catches `kbf storage` not flushing at its stop what its write tier has staged. With a
 /// hot store the node stages an acknowledged write in the open block of its tier, which
 /// the flusher seals only 30 s after it opened, so the cold store holds none of its bytes
-/// until the stop and holds them when `serve` returns, with no RAM budget set. Mutants:
+/// until the stop and holds them when `serve` returns, with no RAM budget set. Catches:
 /// the assembly leaves out `ram.after(node.serving)`; the stop flushes only when
 /// `--ram-ack-bytes` is set. The flush itself, and that it begins only once the calls
 /// have ended, is pinned by `ram_drain/tests.rs` and kbf-front's `write_tier_stop.rs`;

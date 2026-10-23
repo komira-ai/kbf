@@ -88,7 +88,7 @@ fn flushed_to(generation: u64) -> FlushReport {
 /// the sweeper opens the fence and the next answer carries the epoch, which is then owed;
 /// the node finishes its pass (what `fill::round` does) and its acknowledgement and
 /// fingerprint arrive in the next beat, after which the only thing left is the settle
-/// time, and a beat after it promotes the node. Mutants seen red: the request fields not
+/// time, and a beat after it promotes the node. Catches: the request fields not
 /// filled from the node's state (the barrier never opens); the answer's epoch not learned
 /// (nothing is owed); the acknowledgement not sent (blocked on the epoch).
 #[tokio::test]

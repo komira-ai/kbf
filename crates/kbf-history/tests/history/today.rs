@@ -33,7 +33,7 @@ fn ids(runs: &[TodayRun]) -> Vec<u32> {
 
 #[test]
 fn today_index_is_bounded_and_evicts_oldest() {
-    // Catches (mutant "a today index that never evicts"): an index that grows with the
+    // Catches (defect "a today index that never evicts"): an index that grows with the
     // day (it holds every run, and the process the memory); an eviction that forgets the
     // newest instead of the oldest; one that leaves the forgotten run in an index (a
     // digest, a node or an instance still naming it); a bound counted in entries, not

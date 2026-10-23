@@ -62,7 +62,7 @@ fn ports(flags: &super::FrontendFlags) -> [u16; 3] {
 /// the first), or on a block that is not the one Envoy's configuration names: instance a
 /// listens where the flags say, instance b ten ports above each (REAPI, worker and API
 /// together), a port the system chooses stays chosen by it, and a port that cannot be
-/// shifted is refused with the flag named, as is an instance without the socket. Mutants:
+/// shifted is refused with the flag named, as is an instance without the socket. Catches:
 /// the offset applied to a only; one flag left out of the shift.
 #[test]
 fn instance_b_listens_ten_ports_above_instance_a() {
@@ -154,7 +154,7 @@ fn instance_b_listens_ten_ports_above_instance_a() {
 
 /// Catches: the settle read from the wrong flags, or not at all: the defaults are the box
 /// render's (1 s interval, 1 s timeout, 2 failures: 1 x 2 + 1 + 1 = 4 s), each flag moves
-/// it, a zero is refused, and the flags need the socket. Mutants: the plus-one-interval
+/// it, a zero is refused, and the flags need the socket. Catches: the plus-one-interval
 /// dropped; the threshold not multiplied.
 #[test]
 fn the_settle_comes_from_envoys_check_settings() {
@@ -284,7 +284,7 @@ impl kbf_proto::reapi::execution_server::Execution for Stub {
 /// verified (a process that took the successor's port could read every caller's
 /// credentials): the channel `dial_of` makes trusts the `--storage-ca` and the name
 /// `--handover-peer-name` gives, so a successor whose certificate is for that name is
-/// reached, and one named something else is not. Mutants: no CA given to the endpoint (the
+/// reached, and one named something else is not. Catches: no CA given to the endpoint (the
 /// call fails); the domain name left out (the address is checked against the certificate
 /// and the call fails); verification off (the other name is reached).
 #[tokio::test]
@@ -376,7 +376,7 @@ async fn a_successor_over_tls_is_reached_only_under_the_name_its_certificate_has
 
 /// Catches: a frontend that starts with a listener it could not bind, for the operator API
 /// as for the others (it would serve without the endpoint Envoy and operators ask): the
-/// start fails naming the address. Mutant: the API socket's bind error dropped.
+/// start fails naming the address. Catches: the API socket's bind error dropped.
 #[tokio::test]
 async fn an_operator_api_address_in_use_fails_the_start() {
     let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -400,7 +400,7 @@ async fn an_operator_api_address_in_use_fails_the_start() {
 /// Catches: a frontend that does not bind the three listeners it was asked for, or binds
 /// the operator API's on the REAPI's or worker's port. The unit-test build of `Prepared::new`
 /// otherwise only ever sees its failure, so the success path (and the coverage of it in this
-/// build) is this test's. Mutant: the API socket not bound (`api: None`).
+/// build) is this test's. Catches: the API socket not bound (`api: None`).
 #[tokio::test]
 async fn a_frontend_binds_its_three_listeners_on_their_own_ports() {
     let argv = [
@@ -511,7 +511,7 @@ fn the_members_of_a_frontend_carry_the_setting_it_was_given() {
 
 /// Catches a frontend whose raw ByteStream pass-through does not wait for a storage node
 /// that restarts: owners are made holding nothing, so a Read or Write whose owners are all
-/// away fails at once, and the proxy must be given the default bound. Mutant: `proxy_owners`
+/// away fails at once, and the proxy must be given the default bound. Catches: `proxy_owners`
 /// without `with_hold`. The routed and the single-node owners share that one call after the
 /// match, so the farm of one node stands for both.
 #[tokio::test]

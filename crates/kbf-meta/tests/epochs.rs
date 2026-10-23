@@ -292,11 +292,11 @@ fn every_applied_mark_stamps_its_log_index_whether_or_not_the_reason_rises() {
 }
 
 /// Catches: an `ObjectReachable` that clears the mark whatever its generation, and a mark
-/// that keeps its first generation when a later mark of the same reason applies (the
-/// mutant that stamps only when the reason rises). A reachable-again delayed past a newer
+/// that keeps its first generation when a later mark of the same reason applies (a
+/// defect that stamps only when the reason rises). A reachable-again delayed past a newer
 /// loss mark would clear it, and every server would answer present for bytes that are
 /// gone. Two cases: the newer mark has the same reason as the one the prober read (only
-/// this case catches the stamp-on-rise mutant), and it has a higher one.
+/// this case catches stamping only on a rise), and it has a higher one.
 #[test]
 fn a_delayed_object_reachable_leaves_a_newer_mark() {
     for (newer, name) in [

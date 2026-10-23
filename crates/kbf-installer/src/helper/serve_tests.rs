@@ -9,7 +9,7 @@ use super::*;
 /// file replaced by a rename (the package manager's way), or removed, is replaced; one
 /// not touched is not.
 ///
-/// Mutants planted: only the size compared; only the mtime compared.
+/// Catches: only the size compared; only the mtime compared.
 #[test]
 fn the_file_identity_sees_a_rename_over_and_a_removal() {
     let dir = kbf_host::testkit::scratch("serve-identity");

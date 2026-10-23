@@ -51,12 +51,9 @@ pub(super) fn encode(summary: &[u8]) -> Vec<u8> {
     [&[VERSION][..], summary].concat()
 }
 
-/// The key a row key names, and the estimator's row its value holds.
-pub(super) fn decode(row_key: &str, value: &[u8]) -> Option<(Key, Vec<u8>)> {
-    let (version, summary) = value.split_first()?;
-    if *version != VERSION {
-        return None;
-    }
+/// The key a row key names, or `None` for one that does not parse or is not spelled the
+/// way [`row_key`] spells it (two rows could name one key).
+pub(super) fn parse_key(row_key: &str) -> Option<Key> {
     let mut parts = row_key.strip_prefix(super::ESTIMATE)?.split('/');
     let instance = unhex(parts.next()?)?;
     let platform = unhex(parts.next()?)?;
@@ -80,6 +77,14 @@ pub(super) fn decode(row_key: &str, value: &[u8]) -> Option<(Key, Vec<u8>)> {
         Shape(shape),
         cfg,
     );
-    // The key must be spelled the way `row_key` spells it, or two rows could name one.
-    (row_key == self::row_key(&key)).then(|| (key, summary.to_vec()))
+    (row_key == self::row_key(&key)).then_some(key)
+}
+
+/// The key a row key names, and the estimator's row its value holds.
+pub(super) fn decode(row_key: &str, value: &[u8]) -> Option<(Key, Vec<u8>)> {
+    let (version, summary) = value.split_first()?;
+    if *version != VERSION {
+        return None;
+    }
+    parse_key(row_key).map(|key| (key, summary.to_vec()))
 }

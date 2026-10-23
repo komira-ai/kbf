@@ -1,5 +1,5 @@
-//! Flags, start-up failures, and the binary's own wiring (the real safe-to-stop, the installer
-//! and health check that are not built) over a real socket.
+//! Flags, start-up failures, and the binary's own wiring (the real safe-to-stop and health
+//! check, the installer that is not built) over a real socket.
 
 use std::os::unix::net::UnixListener;
 
@@ -13,8 +13,8 @@ use crate::daemon::{
 use crate::fakes::{Event, FakeClock, FakeHealth, FakeInstaller, FakeSafeToStop, Log};
 use crate::inventory::{Host, Role};
 use crate::listener::{Activation, Listen};
-use crate::not_built::{NOT_BUILT, NotBuiltHealth, NotBuiltInstaller};
-use crate::ports::{HealthCheck, Installer, PortErrorKind};
+use crate::not_built::{NOT_BUILT, NotBuiltInstaller};
+use crate::ports::{Installer, PortErrorKind};
 use crate::record::RollStore;
 use crate::server::Recent;
 use crate::testutil::{
@@ -241,12 +241,12 @@ fn post(socket: &std::path::Path) -> (u16, Value) {
     call(socket, "POST", "/v1/updater/rolls", &body.to_string())
 }
 
-/// Catches the not-built installer letting a roll touch a host: with the binary's own wiring,
-/// a POST is accepted (202) and the roll FAILS at the frontend's install with the reason in
-/// the failure, no later host is asked about (the fake operator API sees no request at all),
-/// and the frontend, which has no safe-to-stop, made none either.
+/// Catches a roll that goes on past a frontend: with the binary's own wiring, a POST is
+/// accepted (202) and the roll FAILS at the frontend, before its installer, with the drain
+/// control reason in the failure; no later host is asked about (the fake operator API sees no
+/// request at all), and the frontend, which has no safe-to-stop, made none either.
 #[test]
-fn the_binary_wiring_accepts_a_roll_and_fails_safe_at_the_first_install() {
+fn the_binary_wiring_accepts_a_roll_and_fails_safe_at_the_frontend() {
     let api = fake_api(vec![Some(http(
         200,
         "{\"safe\":true,\"reasons\":[],\"planned_down\":false}",
@@ -264,14 +264,13 @@ fn the_binary_wiring_accepts_a_roll_and_fails_safe_at_the_first_install() {
     let failure = roll.failure.expect("failure");
     assert_eq!(
         (failure.alias.as_str(), failure.code),
-        ("fe", ErrorCode::InstallFailed)
+        ("fe", ErrorCode::SwapAbandoned)
     );
     assert!(
-        failure.detail.contains("no host installer yet"),
+        failure.detail.contains("kbf-proxy drain control"),
         "{}",
         failure.detail
     );
-    assert!(failure.detail.contains("no host was touched"));
     let phases: Vec<_> = roll
         .hosts
         .iter()
@@ -320,9 +319,9 @@ fn a_node_is_checked_with_the_token_and_then_refused_by_the_installer() {
     daemon.wait();
 }
 
-/// Catches the refusing ports answering with anything but a refusal.
+/// Catches the refusing installer answering with anything but a refusal.
 #[test]
-fn the_not_built_ports_refuse_everything() {
+fn the_not_built_installer_refuses_everything() {
     let host = Host {
         alias: "st1".into(),
         address: "st1.farm.example".into(),
@@ -342,8 +341,6 @@ fn the_not_built_ports_refuse_everything() {
             .to_string(),
         NOT_BUILT
     );
-    let e = NotBuiltHealth.check(&host, &v).expect_err("health");
-    assert!(e.to_string().contains("no health check yet"));
 }
 
 /// Catches start-up that goes on over something wrong: an inventory that is not owned by the

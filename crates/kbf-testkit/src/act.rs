@@ -72,6 +72,10 @@
 //!   sandbox or the kernel may refuse, prints `PROBE <name> ok` or `PROBE <name>
 //!   errno=<n>`, and goes on whatever the attempt came to (what each does: the header of
 //!   `src/probe.rs`).
+//! - `shm-owner PREFIX COUNT [SECS]`: makes POSIX shared-memory and semaphore names, starts a
+//!   tracker that removes them when it is asked to end or its pipe from this process
+//!   closes (as Python's resource tracker does), and blocks; its helper `shm-tracker
+//!   PREFIX COUNT` is not for a test to run (what each does: the header of `src/shm.rs`).
 //!
 //! [`main`] first looks at argv0: run through a link named for a tool of
 //! [`crate::fake`], it answers as that tool instead.
@@ -92,6 +96,7 @@ use std::time::{Duration, Instant};
 use rustix::process::Signal;
 
 use crate::act_probe::{self as probe, Probe};
+use crate::shm::{self, Shm};
 use crate::{Error, create, failed, number, read, write_line};
 
 /// The base name a link to a test binary that expands
@@ -247,6 +252,8 @@ pub(crate) enum Step<'a> {
     },
     /// One of the probes of [`crate::act_probe`].
     Probe(Probe<'a>),
+    /// `shm-owner` or `shm-tracker` ([`crate::shm`]).
+    Shm(Shm<'a>),
 }
 
 /// What `test` asks of a path.
@@ -379,9 +386,10 @@ fn step(words: &[String]) -> Result<Step<'_>, Error> {
             out,
             paths: paths.to_vec(),
         },
-        _ => match probe::parse(&strs)? {
-            Some(probe) => Step::Probe(probe),
-            None => return Err(Error::Usage(format!("bad step: {strs:?}"))),
+        _ => match (probe::parse(&strs)?, shm::parse(&strs)?) {
+            (Some(probe), _) => Step::Probe(probe),
+            (None, Some(shm)) => Step::Shm(shm),
+            (None, None) => return Err(Error::Usage(format!("bad step: {strs:?}"))),
         },
     })
 }
@@ -611,6 +619,7 @@ pub(crate) fn perform(steps: &[Step<'_>]) -> Result<Option<u8>, Error> {
                 create(out, text.as_bytes())?;
             }
             Step::Probe(probe) => probe::perform(probe)?,
+            Step::Shm(shm) => shm::perform(shm)?,
         }
     }
     drop(held);
@@ -713,7 +722,7 @@ mod tests {
              test ! -d d ; test -x x ; points-to l t ; holds h a b ; inode-links o a b ; try-read r ; try-write w ; \
              try-list d ; tcp-listen 127.0.0.1:0 pf 1.5 ; tcp-listen [::1]:8080 pf 0 ; \
              tcp-connect 192.0.2.1:80 ; unix-listen s 30 ; unix-connect s ; procargs 1 ; \
-             proc-sees 4242 ; ps-sees m-1",
+             proc-sees 4242 ; ps-sees m-1 ; shm-owner kt 2 ; shm-owner kt 1 0.5 ; shm-tracker kt 2",
         );
         let want = [
             Step::Exit(7),
@@ -866,6 +875,20 @@ mod tests {
             Step::Probe(Probe::Procargs(1)),
             Step::Probe(Probe::ProcSees(4242)),
             Step::Probe(Probe::PsSees("m-1")),
+            Step::Shm(Shm::Owner {
+                prefix: "kt",
+                count: 2,
+                hold: Duration::from_secs(300),
+            }),
+            Step::Shm(Shm::Owner {
+                prefix: "kt",
+                count: 1,
+                hold: Duration::from_millis(500),
+            }),
+            Step::Shm(Shm::Tracker {
+                prefix: "kt",
+                count: 2,
+            }),
         ];
         assert_eq!(parse(&all).expect("parses"), want);
         for bad in [
@@ -953,6 +976,16 @@ mod tests {
             "proc-sees 1.5",
             "ps-sees",
             "ps-sees a b",
+            "shm-owner",
+            "shm-owner kt",
+            "shm-owner kt 0",
+            "shm-owner kt x",
+            "shm-owner kt 1 soon",
+            "shm-owner kt 1 1 1",
+            "shm-tracker kt 1 1",
+            "shm-owner a/b 1",
+            "shm-owner abcdefghijklmnopqrstuvwxyz 1",
+            "shm-tracker kt 1 2",
             "echo a ; ; exit 0",
             "nope",
         ] {

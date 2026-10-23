@@ -380,10 +380,8 @@ mod tests {
     // a pool that does not give a returned session out again: the one connection a pool of
     // one holds is the same one for the second loan.
     #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn a_loan_is_a_working_session_and_comes_back_to_the_pool() {
-        let url = std::env::var("KBF_TEST_POSTGRES_URL")
-            .expect("KBF_TEST_POSTGRES_URL names a database the tests may create schemas in");
+        let url = kbf_testkit::database::server_url();
         let config = PostgresConfig::parse(&url)
             .and_then(|config| config.with_schema("kbf_unit_pool"))
             .expect("a usable URL");

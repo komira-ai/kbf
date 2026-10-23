@@ -1,6 +1,5 @@
 //! The `[daemon] update-dir` and `orders-dir` `setup` writes for a node that takes orders. The
-//! helpers are `tests.rs`'s. Each test says the defect it catches; the mutants planted to see
-//! them go red are in the pull request.
+//! helpers are `tests.rs`'s. Each test says the defect it catches.
 
 use kbf_host::Root;
 
@@ -30,7 +29,7 @@ fn written(exec: &FakeExec, path: &str) -> [Option<String>; 2] {
 /// sibling takes no orders (it is restarted with its package), so it has no key; a frontend and a
 /// storage node have no daemon.
 ///
-/// Mutant seen red: `takes_orders` true for all-in-one (its file gets the keys).
+/// Catches: `takes_orders` true for all-in-one (its file gets the keys).
 #[test]
 fn the_modes_whose_daemon_takes_orders_get_the_installers_directories() {
     let l = layout(Platform::Linux);
@@ -71,7 +70,7 @@ fn the_modes_whose_daemon_takes_orders_get_the_installers_directories() {
 /// (`/var/db/kbf-installer`), and there the keys are `kbf-mac-provision`'s: setup leaves the
 /// file as it was and still makes the same spool.
 ///
-/// Mutant seen red: the spool made 0755.
+/// Catches: the spool made 0755.
 #[test]
 fn the_orders_key_names_the_directory_setup_makes() {
     let mut exec = released(host(), Platform::Linux);
@@ -92,76 +91,29 @@ fn the_orders_key_names_the_directory_setup_makes() {
     );
 }
 
-/// Catches a setup that writes the Mac's `[daemon]` keys (G9: `kbf-mac-provision` is the one
-/// writer) or lets a wrong one pass. On a Mac, provisioned or not by the kit: the file with
-/// `update-dir` (and no `orders-dir`, or the layout's) is kept byte for byte; a file without
-/// `update-dir`, with another one, with another `orders-dir`, a key that is not text, or no
-/// file at all, is refused (exit 5) naming the key and `kbf-mac-provision`, and no path.
-///
-/// Mutants seen red: the Mac writing both keys as Linux does; the check dropped (a wrong key
-/// accepted); `orders-dir` required; a non-text `orders-dir` let through.
+/// A Mac's `kbf.toml` has no `[daemon]` update keys (`kbf-mac-provision` renders none), and
+/// `setup` neither requires them nor writes them: the file is accepted and kept byte for byte,
+/// and one that still has the keys from an earlier provisioning is kept too. With no file at
+/// all, `setup` writes its own keys and no update key.
 #[test]
-fn a_mac_is_checked_and_never_written() {
+fn a_mac_without_the_update_keys_is_accepted_and_none_are_written() {
     let base = "mode = \"daemon\"\n\n[frontend]\nurl = \"https://farm.example:8443\"\n\n[enroll]\ntoken_file = \"/etc/kbf/enroll.token\"\n\n";
     let token = Platform::MacOs.enroll_token();
     let base = base.replace("/etc/kbf/enroll.token", token);
-    let keep = [
-        "[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\n",
+    for daemon in [
+        "[daemon]\ndriver = [\"native\"]\n",
         "[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\norders-dir = \"/var/db/kbf-installer/orders\"\n",
-    ];
-    for daemon in keep {
+    ] {
         let file = format!("{base}{daemon}");
         let mut exec = released(host(), Platform::MacOs);
         put(&mut exec, Platform::MacOs.kbf_toml(), 0o640, ROOT, &file);
         go_ok(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon));
         assert_eq!(text(&exec, Platform::MacOs.kbf_toml()), file);
     }
-    let refuse = [
-        ("", "has no [daemon] update-dir"),
-        (
-            "[daemon]\nupdate-dir = \"/elsewhere\"\n",
-            "[daemon] update-dir is not the installer's directory",
-        ),
-        (
-            "[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\norders-dir = \"/elsewhere\"\n",
-            "[daemon] orders-dir is not the installer's directory",
-        ),
-        (
-            "[daemon]\nupdate-dir = 3\n",
-            "[daemon] update-dir is not text",
-        ),
-        (
-            "[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\norders-dir = 3\n",
-            "[daemon] orders-dir is not text",
-        ),
-    ];
-    for (daemon, why) in refuse {
-        let file = format!("{base}{daemon}");
-        let mut exec = released(host(), Platform::MacOs);
-        put(&mut exec, Platform::MacOs.kbf_toml(), 0o640, ROOT, &file);
-        let err = go(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon), APPLY).expect_err(why);
-        assert_eq!(err.exit(), Exit::NeedsOperator, "{why}");
-        let said = err.to_string();
-        assert!(
-            said.contains(why) && said.contains("kbf-mac-provision renders it"),
-            "{said}"
-        );
-        assert!(
-            !said.contains("/var/db") && !said.contains("/elsewhere"),
-            "{said}"
-        );
-        assert_eq!(
-            text(&exec, Platform::MacOs.kbf_toml()),
-            file,
-            "refused: unchanged"
-        );
-    }
-    let mut exec = host();
+    let mut exec = released(host(), Platform::MacOs);
     exec.entries.remove(&hp(Platform::MacOs.kbf_toml()));
-    let err = go(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon), APPLY).expect_err("no file");
-    assert_eq!(err.exit(), Exit::NeedsOperator);
-    assert!(err.to_string().contains("has no [daemon] update-dir"));
-    assert!(!exec.entries.contains_key(&hp(Platform::MacOs.kbf_toml())));
+    go_ok(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon));
+    assert_eq!(written(&exec, Platform::MacOs.kbf_toml()), [None, None]);
 }
 
 /// Catches the Mac check judging a file that is not TOML as missing keys: `decide` names it.
@@ -183,7 +135,7 @@ fn a_mac_kbf_toml_that_is_not_toml_is_named_as_such() {
 /// file an earlier setup wrote without the keys (it holds only setup's keys) is brought
 /// forward to have them.
 ///
-/// Not run as a mutant: `has_other_settings` counting the update keys as foreign.
+/// Not covered: `has_other_settings` counting the update keys as foreign.
 #[test]
 fn a_rerun_changes_nothing_and_an_older_file_gains_the_keys() {
     let mut exec = released(host(), Platform::Linux);
@@ -218,7 +170,7 @@ fn a_rerun_changes_nothing_and_an_older_file_gains_the_keys() {
 /// key, is refused (exit 5) naming the key and never printing the path, so the operator edits
 /// it by hand; nothing is rewritten.
 ///
-/// Not run as mutants: the refusal message carrying the value; a missing key counted as a match.
+/// Not covered: the refusal message carrying the value; a missing key counted as a match.
 #[test]
 fn a_file_with_other_settings_is_kept_with_the_keys_and_refused_without_them() {
     let other = "\n[listener]\nstorage-listen = \"0.0.0.0:7000\"\n";

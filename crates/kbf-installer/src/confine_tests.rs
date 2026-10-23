@@ -137,7 +137,7 @@ fn start(
 /// limit (it counts every process of the user it is set for) and the parent-death signal (a
 /// change of user clears it), then the check that the parent is still there.
 ///
-/// Mutants seen red: the parent-death signal set before the switch of user; any one call left
+/// Catches: the parent-death signal set before the switch of user; any one call left
 /// out; `RLIMIT_NPROC` set before the switch; the kill of the user's processes before the
 /// switch of user.
 #[test]
@@ -153,7 +153,7 @@ fn the_confined_start_makes_every_call_in_its_order() {
 /// program is still the caller's own user (it would kill the caller's session, or, from a root
 /// helper, every process on the host).
 ///
-/// Mutant seen red: `if switched` removed.
+/// Catches: `if switched` removed.
 #[test]
 fn without_a_user_there_is_no_switch_no_process_limit_and_no_kill() {
     let sys = Played::new(None, 100);
@@ -172,7 +172,7 @@ fn without_a_user_there_is_no_switch_no_process_limit_and_no_kill() {
 ///
 /// Catches the signal sent whoever the user is.
 ///
-/// Mutant: the uid check in `after_switch` removed.
+/// Catches: the uid check in `after_switch` removed.
 #[test]
 fn the_kill_is_never_made_as_root() {
     let sys = Played::new(None, 100);
@@ -213,7 +213,7 @@ fn without_confinement_only_the_switch_is_made() {
 /// Catches a start that goes on after a failed call (a program that might hold more than it
 /// should is run): whichever call fails, it is the last one made and the start is an error.
 ///
-/// Mutant seen red: the result of any one call dropped.
+/// Catches: the result of any one call dropped.
 #[test]
 fn a_failed_call_ends_the_start() {
     let all = full();
@@ -233,7 +233,7 @@ fn a_failed_call_ends_the_start() {
 /// Catches a start that goes on when the parent is already gone (the parent-death signal would
 /// never come, and the program would outlive the installer).
 ///
-/// Mutant seen red: the comparison with the parent's id removed.
+/// Catches: the comparison with the parent's id removed.
 #[test]
 fn a_parent_that_is_gone_ends_the_start() {
     let sys = Played::new(None, 1);

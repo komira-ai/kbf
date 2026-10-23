@@ -411,7 +411,7 @@ fn a_directory_vanishing_mid_walk_fails_nothing_else() {
     support::force_remove(&scratch);
 }
 
-/// Catches the network being on (the mutant leaves out the network namespace, so the
+/// Catches the network being on (the defect leaves out the network namespace, so the
 /// action shares the host's interfaces and DNS): the action must see loopback only, and a
 /// name lookup must fail.
 #[tokio::test]
@@ -426,7 +426,7 @@ async fn there_is_no_network_but_loopback() {
 }
 
 /// Catches an image named by tag, or by index digest, being run: the action digest
-/// would not pin the bytes (the "tag instead of a digest" mutant).
+/// would not pin the bytes (the "tag instead of a digest" defect).
 #[tokio::test]
 #[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 #[allow(
@@ -629,7 +629,7 @@ async fn wait_for_program_in(container: &Path, comm: &str) {
 
 /// Catches (issue #88) a container's cgroup files read before the OCI runtime wrote
 /// them: 100 leases, five at a time, each container's `memory.oom.group` read once
-/// `set_up_container_cgroup` returns, which must be 1 every time. The mutant drops
+/// `set_up_container_cgroup` returns, which must be 1 every time. The defect drops
 /// that function's wait for the action's program: the read then follows the
 /// directory's creation by at most one 5 ms poll, inside the window #88 hit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -774,7 +774,7 @@ fn ids(pid: &str) -> Vec<(&'static str, u32)> {
 }
 
 /// fleet-updates-security S10, "a container action's host uid is not the daemon's".
-/// Catches the "drop the id mappings" mutant: a container without a user namespace runs
+/// Catches the "drop the id mappings" catches: a container without a user namespace runs
 /// its root as the daemon's own uid on the host. Two views of the running action: the ids
 /// of each of its processes as the host sees them, and the owner, on the host, of a file
 /// it created. Then a kill, whose clean step removes files the container's ids still own

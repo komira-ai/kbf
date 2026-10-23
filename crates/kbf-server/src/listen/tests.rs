@@ -209,7 +209,7 @@ fn flaky(budget: Duration, fails: usize) -> (Binder, Slept, Rc<RefCell<Vec<Socke
 /// listeners one after the other, so three waits of the whole budget would outlast the
 /// unit's TimeoutStartSec and systemd would kill the start mid-retry. Two sequential binds
 /// of an address that never comes spend one budget: the second makes its one attempt and
-/// waits for nothing. Mutant: `Binder::bind` does not store what is left.
+/// waits for nothing. Catches: `Binder::bind` does not store what is left.
 #[test]
 fn two_sequential_binds_of_an_absent_address_share_one_budget() {
     let (binder, slept, tried) = flaky(Duration::from_secs(3), usize::MAX);
@@ -227,7 +227,7 @@ fn two_sequential_binds_of_an_absent_address_share_one_budget() {
 
 /// Catches: the second bind of a start waiting its own whole budget after the first
 /// bound late: it has only what the first left (3 s less 250 + 500 ms of waits), and
-/// waits exactly that for an address that never comes. Mutant: `Binder::bind` stores
+/// waits exactly that for an address that never comes. Catches: `Binder::bind` stores
 /// back the budget it started with.
 #[test]
 fn a_bind_waits_only_for_what_an_earlier_bind_left() {
@@ -247,7 +247,7 @@ fn a_bind_waits_only_for_what_an_earlier_bind_left() {
 
 /// Catches: a budget that no longer fits the unit's start timeout. The rendered frontend
 /// and storage units have `TimeoutStartSec=120`; the binds of one start spend at most
-/// BIND_BUDGET of it. Mutant: `BIND_BUDGET` 90 s -> 900 s.
+/// BIND_BUDGET of it. Catches: `BIND_BUDGET` 90 s -> 900 s.
 #[test]
 fn the_bind_budget_is_below_the_units_start_timeout() {
     const TIMEOUT_START_SEC: Duration = Duration::from_secs(120);
@@ -255,7 +255,7 @@ fn the_bind_budget_is_below_the_units_start_timeout() {
 }
 
 /// Catches: `Socket::bind` (the frontend's listeners) not retrying an address that is not
-/// there yet, whatever the retry itself does. Mutant: it calls `TcpListener::bind` itself.
+/// there yet, whatever the retry itself does. Catches: it calls `TcpListener::bind` itself.
 #[test]
 fn a_socket_bind_retries_an_unavailable_address() {
     let (binder, slept, tried) = flaky(BIND_BUDGET, 1);
@@ -266,7 +266,7 @@ fn a_socket_bind_retries_an_unavailable_address() {
 }
 
 /// Catches the same for the gRPC listeners of the other modes (`serve::bind`).
-/// Mutant: it calls `TcpListener::bind` itself.
+/// Catches: it calls `TcpListener::bind` itself.
 #[tokio::test]
 async fn a_grpc_bind_retries_an_unavailable_address() {
     let (binder, slept, tried) = flaky(BIND_BUDGET, 1);
@@ -278,7 +278,7 @@ async fn a_grpc_bind_retries_an_unavailable_address() {
 }
 
 /// Catches the same for the operator API listener (`serve::bind_api`).
-/// Mutant: it calls `TcpListener::bind` itself.
+/// Catches: it calls `TcpListener::bind` itself.
 #[tokio::test]
 async fn an_api_bind_retries_an_unavailable_address() {
     let (binder, slept, tried) = flaky(BIND_BUDGET, 1);
@@ -292,7 +292,7 @@ async fn an_api_bind_retries_an_unavailable_address() {
 /// Catches: the frontend's listeners each given a binder of their own (or a binder that
 /// is not passed on). Each address here is absent for three attempts (waits of 250, 500
 /// and 1000 ms: 1750 ms) and the budget is 2 s: with a budget per bind all three bind,
-/// with one shared the second finds 250 ms left and fails. Mutant: `Bound::bind` makes a
+/// with one shared the second finds 250 ms left and fails. Catches: `Bound::bind` makes a
 /// `Binder::new()` per socket.
 #[test]
 fn the_frontends_listeners_bind_through_one_shared_budget() {
@@ -312,9 +312,9 @@ fn the_frontends_listeners_bind_through_one_shared_budget() {
 /// binding a documentation address (192.0.2.1, on no interface) with a small budget runs
 /// the real wait between attempts and then fails with `AddrNotAvailable`, which the
 /// frontend reports as it is. (The retry rule itself is pinned by the tests above.) The
-/// bind runs on a thread the test gives 60 s: a mutant that removes the bound fails the
+/// bind runs on a thread the test gives 60 s: a change that removes the bound fails the
 /// test instead of hanging the suite (a liveness guard, not a timing assertion).
-/// Mutant: `Binder::bind` returns its failure as `ErrorKind::Other`.
+/// Catches: `Binder::bind` returns its failure as `ErrorKind::Other`.
 #[test]
 fn a_real_bind_to_an_absent_address_waits_then_says_it_is_not_available() {
     let (done, result) = std::sync::mpsc::channel();
@@ -332,7 +332,7 @@ fn a_real_bind_to_an_absent_address_waits_then_says_it_is_not_available() {
 /// Catches: a storage node's `/metrics` listener (`--metrics-listen`) that does not retry an
 /// address that is not there yet, as its storage socket does: a node on a VPN address would
 /// start with the one and die on the other. Both addresses are absent for one attempt, so
-/// both bind after one wait each. Mutant: `NodeMetrics::bind` calls `TcpListener::bind`
+/// both bind after one wait each. Catches: `NodeMetrics::bind` calls `TcpListener::bind`
 /// itself, or `Socket::bind` is not given the binder.
 #[tokio::test]
 async fn a_nodes_metrics_listener_retries_an_unavailable_address() {
@@ -353,7 +353,7 @@ async fn a_nodes_metrics_listener_retries_an_unavailable_address() {
 /// could keep a node waiting twice the unit's start timeout allows. Each address is absent
 /// for three attempts (1750 ms of waits) and the budget is 2 s: with a budget per listener
 /// both bind, with one shared the second finds 250 ms left and fails, naming its address.
-/// Mutant: `bind_node_sockets` gives the metrics listener a `Binder::new()`.
+/// Catches: `bind_node_sockets` gives the metrics listener a `Binder::new()`.
 #[tokio::test]
 async fn a_nodes_two_listeners_bind_through_one_shared_budget() {
     let (binder, slept, _) = flaky(Duration::from_secs(2), 3);
@@ -369,7 +369,7 @@ async fn a_nodes_two_listeners_bind_through_one_shared_budget() {
 }
 
 /// Catches: a node with no `--metrics-listen` binding, or failing on, a second listener.
-/// Mutant: `bind_node_sockets` binds the metrics address when it is `None` (an unspecified
+/// Catches: `bind_node_sockets` binds the metrics address when it is `None` (an unspecified
 /// one).
 #[tokio::test]
 async fn a_node_without_a_metrics_address_binds_only_its_storage_socket() {

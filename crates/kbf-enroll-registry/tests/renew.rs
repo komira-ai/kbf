@@ -391,7 +391,7 @@ fn a_node_expired_for_over_thirty_days_must_enroll_again() {
 
 // Catches a revocation that loses to a renewal: the renewal read the node active, a revoke
 // lands, and the renewal's commit must fail and be decided again (and refused). No cert is
-// recorded after the revoke, the node stays revoked. (Mutant: renew without Cond::Version
+// recorded after the revoke, the node stays revoked. (Catches: renew without Cond::Version
 // on the node row writes the node back as active.)
 #[test]
 fn a_revoke_racing_a_renewal_wins() {

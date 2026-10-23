@@ -1506,7 +1506,6 @@ dependencies = [
  "kbf-enroll",
  "kbf-front",
  "kbf-harness",
- "kbf-host",
  "kbf-installer",
  "kbf-node",
  "kbf-peer",
@@ -1997,7 +1996,6 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "syn 2.0.119",
- "tar",
  "thiserror",
  "tokio",
  "tokio-rustls",
@@ -2038,9 +2036,6 @@ dependencies = [
  "clap",
  "hex",
  "kbf-cli",
- "kbf-host",
- "kbf-installer",
- "kbf-update",
  "rustix",
  "sha2 0.11.0",
  "thiserror",
@@ -2476,6 +2471,21 @@ dependencies = [
  "rustix",
  "thiserror",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "kbf-state-copy"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "kbf-state",
+ "kbf-testkit",
+ "postgres",
+ "rusqlite",
+ "sha2 0.11.0",
+ "thiserror",
 ]
 
 [[package]]
@@ -2514,7 +2524,9 @@ dependencies = [
 name = "kbf-testkit"
 version = "0.1.0"
 dependencies = [
+ "kbf-testkit",
  "libc",
+ "postgres",
  "rustix",
  "tokio",
 ]

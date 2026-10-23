@@ -97,7 +97,7 @@ pub const LEASE_PARAM: &str = "KBF_LEASE";
 /// rules, as the same test shows; there is no `file-link` rule.
 ///
 /// Launchd already refuses a job from any sandboxed process, `(allow default)` alone
-/// included, as `tests/launchd.rs` shows on the macOS runner (and the mutants that
+/// included, as `tests/launchd.rs` shows on the macOS runner (and the defects that
 /// dropped `(deny job-creation)` stayed green). The rule stays as defence in depth: it
 /// keeps the refusal in this profile rather than in launchd's current behaviour.
 /// `(deny lsopen)` is load-bearing: without it an action opens an application, which
@@ -133,21 +133,44 @@ pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 (allow network* (remote unix-socket))\n";
 
 /// The profile of an action that runs as a slot user of the lease-user pool
-/// ([`crate::slots`]): [`BASE_PROFILE`] without its `job-creation`, `lsopen` and
-/// `user-preference-write` denies. Those kept one lease from leaving work or settings
-/// for the next in a uid every lease shared; a slot's uid is its own, its preferences
-/// are in its own home, and what it hands launchd runs as its uid, which the end of the
-/// lease kills (docs/design/macos-end-state.md, section 1, "Sandbox"). The write rule
-/// stays, as a hermeticity aid.
+/// ([`crate::slots`]): [`BASE_PROFILE`] without its `job-creation` and
+/// `user-preference-write` denies, and with `mach-register` and `file-mount` denied
+/// besides. Those two denies kept one lease from leaving work or settings for the next
+/// in a uid every lease shared; a slot's uid is its own, its preferences are in its own
+/// home, and what it hands launchd runs as its uid, which the end of the lease kills
+/// (docs/design/macos-end-state.md, section 1, "Sandbox"). The write rule stays, as a
+/// hermeticity aid.
+///
+/// Three denies shut what the clean does not reach (each was open without the sandbox,
+/// closed with the rule and open again with the rule removed, on a hosted macOS runner;
+/// cargo, clang, swiftc, git, a Python venv and `swift build --disable-sandbox` ran
+/// under them there once; no kept test runs them): `mach-register` is checking in a
+/// Mach service name with launchd (`bootstrap_check_in`), which would give a service
+/// that could outlive the action's process tree; `lsopen` is opening an application through Launch Services, which
+/// starts it outside the sandbox (see [`BASE_PROFILE`]); `file-mount` is mounting a
+/// file system on a directory (`hdiutil attach -mountpoint`). A slot's canaries
+/// ([`crate::slots::canary`]) try each. Left open on purpose: `job-creation`, since
+/// launchd refuses a job from any sandboxed process, `(allow default)` alone included,
+/// so a canary asserts that refusal instead of a rule asserting it; `ipc-posix*`,
+/// whose denial breaks Python's `multiprocessing` and `xcodebuild`; and a `hdiutil
+/// attach` with no mount point, which still mounts under `/Volumes` through
+/// `diskimages-helper` even with `file-mount` denied (the clean's unmount and the
+/// helper's death remove it).
 pub const SLOT_PROFILE: &str = "(version 1)\n\
 (allow default)\n\
+(deny mach-register)\n\
+(deny lsopen)\n\
+(deny file-mount)\n\
 (deny file-write*)\n\
 (allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n";
 
-/// [`SLOT_PROFILE`] for an action without the network: [`NO_NETWORK_PROFILE`] without
-/// the same three denies.
+/// [`SLOT_PROFILE`] for an action without the network: [`NO_NETWORK_PROFILE`] with the
+/// same denies as [`SLOT_PROFILE`].
 pub const SLOT_NO_NETWORK_PROFILE: &str = "(version 1)\n\
 (allow default)\n\
+(deny mach-register)\n\
+(deny lsopen)\n\
+(deny file-mount)\n\
 (deny file-write*)\n\
 (allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n\
 (deny network*)\n\
@@ -197,6 +220,8 @@ fn quoted(path: &Path) -> std::io::Result<String> {
 pub enum WeakenedProfile {
     /// Drops every copy of this line.
     Drop(&'static str),
+    /// Drops every copy of each of these lines.
+    DropAll(&'static [&'static str]),
     /// Adds this line at the end of the profile constant (before the device and home
     /// rules).
     Add(&'static str),
@@ -210,6 +235,10 @@ impl WeakenedProfile {
             Self::Drop(line) => profile
                 .split_inclusive('\n')
                 .filter(|l| l.trim() != line)
+                .collect(),
+            Self::DropAll(lines) => profile
+                .split_inclusive('\n')
+                .filter(|l| !lines.contains(&l.trim()))
                 .collect(),
             Self::Add(line) => format!("{profile}{line}\n"),
         }
@@ -229,7 +258,7 @@ impl WeakenedProfile {
 /// module's tests check that each mach rule is a `global-name-prefix` covering every
 /// name listed here. Their place in the profile does
 /// not decide: with the `usbmuxd` rule before [`NO_NETWORK_PROFILE`]'s allow for every
-/// Unix socket (a mutant), the runner still refused the connect. A lease that books a
+/// Unix socket (a defect), the runner still refused the connect. A lease that books a
 /// device is to get a profile without these (`docs/design/ios-devices.md`, section
 /// 6.1); none does yet.
 pub const NO_DEVICE_RULES: &str = "(deny mach-lookup (global-name-prefix \"com.apple.CoreDevice.\"))\n\
@@ -375,23 +404,26 @@ mod tests {
     use super::*;
 
     /// Catches a slot profile that keeps a deny the pool made needless (a slot user's
-    /// `defaults write` or `open` refused), or that differs from the shared user's in
-    /// anything else (a write rule or a network rule lost).
+    /// `defaults write` refused), lacks one it adds (`mach-register`, `file-mount`), or
+    /// differs from the shared user's in anything else (a write rule, a network rule or
+    /// the `lsopen` deny lost).
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_slot_profile_is_the_shared_one_without_its_three_denies() {
+    fn a_slot_profile_is_the_shared_one_without_two_denies_and_with_two_more() {
         let without = |profile: &str| {
-            let gone = [
-                "(deny job-creation)",
-                "(deny lsopen)",
-                "(deny user-preference-write)",
-            ];
-            let kept: Vec<&str> = profile.lines().filter(|l| !gone.contains(l)).collect();
+            let gone = ["(deny job-creation)", "(deny user-preference-write)"];
+            let mut kept: Vec<&str> = profile.lines().filter(|l| !gone.contains(l)).collect();
             assert_eq!(
                 kept.len() + gone.len(),
                 profile.lines().count(),
                 "{profile}"
             );
+            let at = kept
+                .iter()
+                .position(|l| *l == "(deny lsopen)")
+                .expect("lsopen");
+            kept.splice(at..at, ["(deny mach-register)"]);
+            kept.splice(at + 2..at + 2, ["(deny file-mount)"]);
             kept.join("\n") + "\n"
         };
         assert_eq!(SLOT_PROFILE, without(BASE_PROFILE));
@@ -666,6 +698,9 @@ mod tests {
     const SLOT_RULES: &[(&str, bool)] = &[
         ("(version 1)", false),
         ("(allow default)", false),
+        ("(deny mach-register)", false),
+        ("(deny lsopen)", false),
+        ("(deny file-mount)", false),
         ("(deny file-write*)", false),
         (
             "(allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))",
@@ -704,7 +739,7 @@ mod tests {
     /// Catches a generated slot profile that lacks a deny or allow the code means it to
     /// carry (a dropped `(deny file-write*)` would let a pool user write anywhere, and
     /// only the macOS canary would notice), on Linux and in every pull request. Weakening
-    /// seen red: deleting the `(deny file-write*)` line from `SLOT_PROFILE` fails the
+    /// is caught: deleting the `(deny file-write*)` line from `SLOT_PROFILE` fails the
     /// `On` and `Off` rows for it; dropping it from `SLOT_NO_NETWORK_PROFILE` alone
     /// fails `Off`.
     #[test]
@@ -720,6 +755,20 @@ mod tests {
             }
             if network == Network::On {
                 assert!(!text.contains("(deny network*)"), "{text}");
+            }
+        }
+    }
+
+    /// Catches a slot profile that denies what the pool leaves open on purpose:
+    /// `job-creation` (launchd refuses a sandboxed job anyway, and the bootstrap canary
+    /// asserts that), `ipc-posix*` (it breaks Python's `multiprocessing` and
+    /// `xcodebuild`) and `user-preference-write` (a slot's preferences are its own).
+    #[test]
+    fn the_slot_profile_leaves_three_operations_open() {
+        for network in [Network::On, Network::Off] {
+            let text = generated(network, None);
+            for open in ["job-creation", "ipc-posix", "user-preference-write"] {
+                assert!(!text.contains(open), "{network:?}: {open} in\n{text}");
             }
         }
     }
@@ -754,6 +803,14 @@ mod tests {
         let near = "(a)\n(a) (b)\n  (a)  \n((a))\n(ab)\n";
         assert_eq!(
             WeakenedProfile::Drop("(a)").apply(near),
+            "(a) (b)\n((a))\n(ab)\n"
+        );
+        assert_eq!(
+            WeakenedProfile::DropAll(&["(a)", "(c)"]).apply("(a)\n(b)\n(c)\n(a)\n"),
+            "(b)\n"
+        );
+        assert_eq!(
+            WeakenedProfile::DropAll(&["(a)"]).apply(near),
             "(a) (b)\n((a))\n(ab)\n"
         );
         assert_eq!(

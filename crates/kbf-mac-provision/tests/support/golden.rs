@@ -74,8 +74,6 @@ node-id = "kbf-mac-07"
 [daemon]
 driver = ["native"]
 data-dir = "/Volumes/kbf/data"
-update-dir = "/var/db/kbf-installer"
-orders-dir = "/var/db/kbf-installer/orders"
 "#
     .to_owned()
 }

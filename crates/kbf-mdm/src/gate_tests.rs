@@ -1,5 +1,5 @@
 //! Status, enforce, withdraw, profile and reconciliation (M2.2, S5.2). Each test names
-//! the planted mutant that turns it red.
+//! the defect that turns it red.
 
 use super::fixture::{Fixture, NOW, default_policy};
 use super::*;
@@ -59,7 +59,7 @@ async fn enforce_posts_the_build_the_signed_set_names() {
 
 #[tokio::test]
 async fn enforce_refuses_what_the_set_does_not_allow() {
-    // Catches: skipping the gate's expiry check and its pool floor (S10 mutants), and
+    // Catches: skipping the gate's expiry check and its pool floor (S10 defects), and
     // the pool and platform checks.
     let f = Fixture::new("gate-enforce-refusals");
     let mut bad_deadline = enforce_request("mac-arm64", 12, 10, "27B5");
@@ -318,7 +318,7 @@ async fn a_missing_or_altered_profile_copy_is_refused() {
 
 #[tokio::test]
 async fn reconcile_withdraws_only_stale_kbf_enforcements() {
-    // Catches: matching identifiers by substring (M10 mutant): the operator's own
+    // Catches: matching identifiers by substring (M10 defect): the operator's own
     // declarations, whatever they contain, are never touched.
     let f = Fixture::new("gate-reconcile");
     f.gate

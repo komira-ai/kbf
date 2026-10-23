@@ -44,7 +44,7 @@ async fn serve(routes: Routes) -> SocketAddr {
 /// 16 FindMissing calls at the engine's chunk of 1000; before this change, each upload
 /// asking for itself, this test saw 783. The lease's counters keep their meaning:
 /// every digest asked about once, the 14,000 held ones present, the others written.
-/// Mutants seen red: no `missing` call, each put asking for itself (516 calls); the
+/// Catches: no `missing` call, each put asking for itself (516 calls); the
 /// answer ignored, every blob put (510 calls: the held ones ask for themselves).
 /// This front serves no `Segments`: the records' upload is answered UNIMPLEMENTED and
 /// its blobs go one ByteStream write each, read from their files, so this is also the fallback's test.

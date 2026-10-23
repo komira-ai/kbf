@@ -40,7 +40,7 @@ pub enum WriteTierError {
 /// With a tier, the Raft log is first raised to machine version 5, whose format carries
 /// the tier's commands, including the move of a conflicting staged object's records
 /// ([`RaftMetaLog::raise_machine_version`]; a log already there commits nothing; from
-/// then on a binary that runs only an earlier version refuses the log), then
+/// then on a binary that runs only an earlier version skips the raise), then
 /// the tier's start recovers the directory against the committed staged table, which
 /// outlives the process ([`Cache::attach_tier`]). Without a tier the log is not touched,
 /// so it stays one an older binary reads.

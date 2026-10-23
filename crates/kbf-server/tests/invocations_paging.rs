@@ -117,7 +117,7 @@ impl Paged {
     }
 }
 
-/// Catches (mutants "the token points at the last row listed" and "the token skips a
+/// Catches (defects "the token points at the last row listed" and "the token skips a
 /// row", for each route; "logs list the failed rows again" and "logs miss failed rows
 /// added after the failed part"; and "`next_page` without the filter", a `400`): a
 /// page that repeats or skips a row (or an output) while rows are appended between
@@ -230,7 +230,7 @@ async fn paging_while_rows_are_appended_never_skips_or_repeats() {
     server.stop().await;
 }
 
-/// Catches (mutant "skip the filter check" in the token's decoding): a token made for
+/// Catches (defect "skip the filter check" in the token's decoding): a token made for
 /// one filter used with another, with none, or on another route, answered as if it
 /// were made for it; and a token refused when the same filter is given in another
 /// order.
@@ -290,7 +290,7 @@ async fn a_token_used_with_another_filter_is_400() {
     server.stop().await;
 }
 
-/// Catches (mutant "resolve the token's position anyway": the serial check dropped
+/// Catches (defect "resolve the token's position anyway": the serial check dropped
 /// from the token's decoding): a page token for a record removed at the memory bound
 /// after the token was issued answered with a page of the record made since under
 /// the same key, rather than `404`; and the record's routes answering anything but
@@ -355,7 +355,7 @@ async fn a_token_for_a_record_evicted_after_it_was_issued_is_404() {
     server.stop().await;
 }
 
-/// Catches (mutant "`records_since` = start only"): the `404` of a record not held
+/// Catches (defect "`records_since` = start only"): the `404` of a record not held
 /// without the body of `docs/design/invocations-api.md` 4.10, or with a
 /// `records_since` other than the later of the server's start and the `last_seen` of
 /// the newest client record removed at the bound. The records here are seen in 2030,

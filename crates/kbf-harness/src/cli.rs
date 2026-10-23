@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::b0::{self, B0, Ended, Mutant};
+use crate::b0::{self, B0, Ended, Fault};
 use crate::interrupt::Interrupt;
 use crate::procs::HANG;
 use crate::reap::Reap;
@@ -31,7 +31,7 @@ struct Cli {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum MutantFlag {
+enum FaultFlag {
     /// Node 1's cold store is told its disk is nearly full.
     ShrinkNodeCap,
     /// Every node's cold store is told its disk is nearly full.
@@ -88,15 +88,15 @@ struct B0Flags {
     summary: Option<PathBuf>,
     /// Makes the farm worse in one way the gates must catch.
     #[arg(long, value_enum)]
-    mutant: Option<MutantFlag>,
+    fault: Option<FaultFlag>,
 }
 
-impl From<MutantFlag> for Mutant {
-    fn from(flag: MutantFlag) -> Self {
+impl From<FaultFlag> for Fault {
+    fn from(flag: FaultFlag) -> Self {
         match flag {
-            MutantFlag::ShrinkNodeCap => Mutant::ShrinkNodeCap,
-            MutantFlag::ShrinkEveryCap => Mutant::ShrinkEveryCap,
-            MutantFlag::KillNodeMidway => Mutant::KillNodeMidway,
+            FaultFlag::ShrinkNodeCap => Fault::ShrinkNodeCap,
+            FaultFlag::ShrinkEveryCap => Fault::ShrinkEveryCap,
+            FaultFlag::KillNodeMidway => Fault::KillNodeMidway,
         }
     }
 }
@@ -150,7 +150,7 @@ fn status_of(args: Vec<OsString>, stdin: &mut dyn BufRead) -> u8 {
         pause_secs,
         fill_kib,
         summary,
-        mutant,
+        fault,
     } = flags;
     let args = B0 {
         kbf: bin_dir.join("kbf"),
@@ -168,7 +168,7 @@ fn status_of(args: Vec<OsString>, stdin: &mut dyn BufRead) -> u8 {
         fill_kib,
         scrape_every: Duration::from_secs(1),
         summary,
-        mutant: mutant.map(Mutant::from),
+        fault: fault.map(Fault::from),
         extra_flags: Vec::new(),
         farm_hang: HANG,
         interrupt: Interrupt::process(),

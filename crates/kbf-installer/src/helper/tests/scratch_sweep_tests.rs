@@ -53,7 +53,7 @@ fn holds(rig: &Rig, commit: &str, file: &str) -> bool {
 /// (`cannot use .../work/<B>.partial: File exists`), the fetch is `Rejected`, and the update
 /// is refused with `stage: ...`, so the first assertion fails.
 ///
-/// Mutant it is meant to catch (reasoned, not run: the change is not compiled locally): the
+/// Catches: the
 /// sweep call left out of `recover` (the same red).
 #[test]
 fn a_commit_whose_stage_was_killed_stages_after_run_starts_again() {
@@ -85,7 +85,7 @@ fn a_commit_whose_stage_was_killed_stages_after_run_starts_again() {
 ///
 /// Red on main: nothing is swept, so the names the test lists as gone are all still there.
 ///
-/// Mutants it is meant to catch (reasoned, not run): the suffix test without its dot (red:
+/// Catches: the suffix test without its dot (red:
 /// `xpartial` goes); `.check` left out of the test (red: the two `.check` entries stay); a
 /// sweep that follows links (red: `outside/keep.txt` goes); a sweep of the whole of `work/`
 /// (red: the kept names go).
@@ -136,7 +136,7 @@ fn the_sweep_removes_the_two_suffixes_and_nothing_else_and_follows_no_link() {
 ///
 /// Red on the commit before: the sweep knows two suffixes, so `<B>.look` stays.
 ///
-/// Mutant it is meant to catch (reasoned, not run): `.look` left out of the sweep's test.
+/// Catches: `.look` left out of the sweep's test.
 #[test]
 fn the_sweep_removes_the_scratch_of_a_look_that_was_killed() {
     let mut rig = Rig::new("sweep-look");
@@ -154,7 +154,7 @@ fn the_sweep_removes_the_scratch_of_a_look_that_was_killed() {
 ///
 /// Red on main: `recover` never looks at `work/`, so nothing is logged.
 ///
-/// Mutants it is meant to catch (reasoned, not run): the error of the sweep dropped (red:
+/// Catches: the error of the sweep dropped (red:
 /// nothing in the log); the error returned from `recover` (red: `expect` fails); the error
 /// made a refusal (red: `helper.json` says "refused").
 #[test]
@@ -179,7 +179,7 @@ fn a_work_directory_that_cannot_be_listed_is_logged_not_a_failed_start() {
 /// Not red on main: nothing there takes the lock before the repair. It is the one test that
 /// reaches the sweep's own lock error, and the log line tells it from the repair's refusal.
 ///
-/// Mutant it is meant to catch (reasoned, not run): the sweep's error dropped (red: nothing
+/// Catches: the sweep's error dropped (red: nothing
 /// in the log).
 #[test]
 fn a_lock_that_cannot_be_taken_is_logged_by_the_sweep_and_the_start_goes_on() {
@@ -205,7 +205,7 @@ fn a_lock_that_cannot_be_taken_is_logged_by_the_sweep_and_the_start_goes_on() {
 ///
 /// Not red on main (nothing sweeps there): it pins the choice of where the sweep is made.
 ///
-/// Mutant it is meant to catch (reasoned, not run): the sweep called from `cycle` (red: the
+/// Catches: the sweep called from `cycle` (red: the
 /// directory is gone after the pass).
 #[test]
 fn a_pass_never_sweeps_what_a_stage_of_another_process_may_be_using() {

@@ -86,7 +86,7 @@ fn the_names_are_the_dns_and_ip_subject_alt_names_and_nothing_else() {
 /// a host with a port or userinfo are not covered. A certificate with an empty DNS name
 /// (an issuer's mistake) does not cover the empty host an address like `:8982` has.
 ///
-/// Mutant seen red: the empty host left out of the refusals, so the empty name equals it.
+/// Catches: the empty host left out of the refusals, so the empty name equals it.
 #[test]
 fn a_dns_name_covers_its_host_in_any_ascii_case_and_no_other() {
     let sans = || vec![dns("node-a.farm.example")];
@@ -125,7 +125,7 @@ fn a_dns_name_covers_its_host_in_any_ascii_case_and_no_other() {
 /// farm's certificates carry the node's own names, so a wildcard is refused rather than
 /// widened.
 ///
-/// Mutant seen red: a name starting `*.` matched against the host's parent domain.
+/// Catches: a name starting `*.` matched against the host's parent domain.
 #[test]
 fn a_wildcard_name_covers_nothing() {
     for host in [
@@ -150,7 +150,7 @@ fn a_wildcard_name_covers_nothing() {
 /// string that is no address; a DNS name spelled like an IP covers no IP, and an IP
 /// covers no DNS name.
 ///
-/// Mutant seen red: a DNS name compared to an IP host.
+/// Catches: a DNS name compared to an IP host.
 #[test]
 fn an_ip_name_covers_the_parsed_address_and_a_dns_name_never_an_ip() {
     let sans = || vec![ip("192.0.2.1"), ip("2001:db8::1")];
@@ -186,7 +186,7 @@ fn an_ip_name_covers_the_parsed_address_and_a_dns_name_never_an_ip() {
 /// after them; anything else (a colon not followed by a port, an unbracketed IPv6
 /// address, a path or userinfo) stays whole, so it is never mistaken for a covered host.
 ///
-/// Mutant seen red: the port cut from the first `:`.
+/// Catches: the port cut from the first `:`.
 #[test]
 fn the_host_of_an_address_loses_its_port_and_its_brackets_only() {
     for (addr, host) in [

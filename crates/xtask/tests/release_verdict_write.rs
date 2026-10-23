@@ -41,9 +41,7 @@ impl Fx {
             tag: "v0.3.7".to_owned(),
             run_id: 9001,
             attempt: 2,
-            ci_run: 111,
-            beta_run: 222,
-            artifacts_run: 333,
+            pipeline_run: 111,
             not_reversible: vec![],
             escape: vec![],
             withdraws: vec![],
@@ -58,8 +56,8 @@ impl Fx {
             .args(["release", "verdict-write"])
             .arg(self.root.join("dist"))
             .args(["--commit", SHA, "--tag", "v0.3.7", "--run-id", "9001"])
-            .args(["--attempt", "2", "--ci-run", "111", "--beta-run", "222"])
-            .args(["--artifacts-run", "333", "--at", "5000", "--out"])
+            .args(["--attempt", "2", "--pipeline-run", "111"])
+            .args(["--at", "5000", "--out"])
             .arg(self.root.join("verdict.json"))
             .args(extra)
             .output()
@@ -159,7 +157,7 @@ fn each_of_the_three_gates_is_a_green_gate_and_the_note_names_the_runs() {
     let note = doc.note.expect("a note");
     assert_eq!(
         note,
-        "gate runs: ci 111, beta 222, artifacts 333; tested_bytes: rebuilt"
+        "gate run: pipeline 111 (ci, artifacts, beta); beta smoke on the attested kbf"
     );
 }
 

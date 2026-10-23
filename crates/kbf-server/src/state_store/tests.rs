@@ -79,16 +79,17 @@ fn the_local_postgres_store_is_the_designs_socket_url() {
     );
 }
 
-/// Catches: a Postgres store whose epoch is not bumped by an open (a restored database
-/// could resume the leases of an earlier incarnation; the daemon would keep runs the
-/// scheduler no longer knows), and a SQLite one that stopped being bumped.
+/// Asserts that an open of either store keeps the epoch it holds: a restart of a frontend,
+/// or the start of another one over the same Postgres, does not change it, so the daemons
+/// that reconnect keep the runs of the leases they hold. The epoch changes when an
+/// operator raises it.
 #[test]
-fn every_open_of_either_store_bumps_the_epoch() {
+fn every_open_of_either_store_keeps_the_epoch() {
     for uri in [
         StateStoreUri::local_postgres(),
         StateStoreUri::Sqlite(PathBuf::from("/x.db")),
     ] {
-        assert_eq!(uri.epoch_policy(), EpochPolicy::Bump, "{uri:?}");
+        assert_eq!(uri.epoch_policy(), EpochPolicy::Keep, "{uri:?}");
     }
 }
 
@@ -168,7 +169,7 @@ fn a_sqlite_value_opens_its_file_and_holds_it() {
     let uri = StateStoreUri::Sqlite(file.clone());
     let store = uri.open().expect("opened");
     assert!(file.exists(), "the file is made, with its directory");
-    assert_eq!(store.epoch, EpochPolicy::Bump);
+    assert_eq!(store.epoch, EpochPolicy::Keep);
     let refused = uri.open().err().expect("held");
     assert!(
         matches!(&refused, StateError::Open(why) if why.contains("another kbf process")),
@@ -211,8 +212,8 @@ fn every_open_takes_the_next_writer_generation_and_fences_the_one_before() {
 /// keep the epoch: opened after a handover it takes only the generation it expects (a
 /// restored or swapped file, or a file another writer has taken since, is refused and
 /// nothing is written), and it keeps the epoch of the store (so the daemons that
-/// reconnect keep the runs of their leases), where an open of any other kind bumps it.
-/// The path it names is the file.
+/// reconnect keep the runs of their leases), as every open does. The path it names is the
+/// file.
 #[test]
 fn a_store_opened_after_a_handover_expects_its_generation_and_keeps_the_epoch() {
     use kbf_state::GENERATION;
@@ -220,7 +221,7 @@ fn a_store_opened_after_a_handover_expects_its_generation_and_keeps_the_epoch() 
     let uri = StateStoreUri::Sqlite(dir.join("state.db"));
     assert_eq!(uri.identity(), dir.join("state.db"));
     let holder = uri.open().expect("opened");
-    assert_eq!(holder.epoch, EpochPolicy::Bump);
+    assert_eq!(holder.epoch, EpochPolicy::Keep);
     drop(holder);
 
     let generation = |state: &StateStore| {

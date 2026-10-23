@@ -173,7 +173,7 @@ fn the_deny_list_parses_every_entry_or_names_the_bad_line() {
 /// a prefix is not that node); its serial and key are judged as for a daemon, a listed node
 /// being reported before them.
 ///
-/// Mutants seen red: only the first DNS name looked at; names compared with `==`.
+/// Catches: only the first DNS name looked at; names compared with `==`.
 #[test]
 fn a_storage_certificate_is_denied_by_any_of_its_names_its_serial_or_its_key() {
     let several = PeerCert::from_der(&cert(
@@ -249,7 +249,7 @@ fn a_bad_deny_list_is_refused_at_open() {
 /// file that changed after `open` as though it were still good: a list removed or rewritten
 /// as garbage is an error naming the path (and the line), not a count of zero.
 ///
-/// Mutants seen red: the read error mapped to an empty list; the parse result unwrapped to
+/// Catches: the read error mapped to an empty list; the parse result unwrapped to
 /// its default (`unwrap_or_default`).
 #[test]
 fn a_list_that_goes_bad_after_open_is_an_error_when_its_certificate_entries_are_counted() {

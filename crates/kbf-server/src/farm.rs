@@ -72,7 +72,7 @@ mod phase;
 mod record;
 pub mod sched_view;
 
-pub use durable::{DONE_FLOOR, EpochPolicy, SESSION_RENEWAL, StateError};
+pub use durable::{DONE_FLOOR, EpochBump, EpochPolicy, ID_BLOCK, SESSION_RENEWAL, StateError};
 pub use handover::UNTRACED_LOOKS;
 pub use phase::Reported;
 
@@ -86,6 +86,7 @@ use crate::machine::{FarmMachine, Platform, Sent, Waiter};
 use crate::memory;
 use crate::missing;
 use crate::run_record;
+use crate::size_key::Keyable;
 use crate::stamp::Stamp;
 use crate::update_status::UpdateReport;
 
@@ -296,10 +297,6 @@ struct State {
     /// the operation: a copy of its `Result` is a duplicate, not an unknown lease
     /// ([`State::standing`]).
     answered: BTreeMap<LeaseId, OperationId>,
-    /// The held effect whose last try was refused as unreachable: a "row is gone" for
-    /// this effect and no other may be its own applied work
-    /// ([`State::release_unwritten`]).
-    retrying: Option<Effect>,
     /// Writes given up on for good: dropped as stale or fenced, or over the cap ([`Farm::dropped_writes`]).
     write_drops: u64,
     /// The most committed records `unwritten` holds before a new one is dropped.
@@ -321,6 +318,8 @@ struct State {
     /// The learned-sizes shadow ([`crate::learned`]); off unless `--learned-sizes`
     /// says otherwise.
     learned: Learned,
+    /// Lowered key floors the state store has not taken yet ([`State::lower_key_floors`]).
+    unwritten_floors: Vec<kbf_sched::KeyFloor>,
 }
 
 /// How many committed records the farm holds for a state store that refuses them.
@@ -413,7 +412,6 @@ impl Farm {
                 owed: BTreeMap::new(),
                 answered: BTreeMap::new(),
                 parked: BTreeMap::new(),
-                retrying: None,
                 write_drops: 0,
                 held_cap: HELD_CAP,
                 store_down: false,
@@ -422,6 +420,7 @@ impl Farm {
                 untraced_kept: BTreeMap::new(),
                 untraced_relayed: BTreeMap::new(),
                 learned: Learned::new(LearnedSizes::Off, 0, 0),
+                unwritten_floors: Vec::new(),
             }),
         }
     }
@@ -1022,16 +1021,37 @@ impl Farm {
 
 impl Dispatch for Farm {
     fn submit(&self, mut submission: Submission) -> Result<Ticket, Status> {
+        // An action with no program and no output names no shape: all such actions would
+        // share one key.
+        let shaped =
+            !submission.described.arguments.is_empty() || !submission.described.outputs.is_empty();
         // Outside the lock: hashes the action's shape and drops its argv and paths.
         let usage = self
             .shapes
             .subject(std::mem::take(&mut submission.described));
         let shape = submission.call.as_ref().map(|_| usage.recorded());
         let now = self.now();
+        let platform = Platform::of(&submission.request.needs);
         let waiting = std::time::Instant::now();
         let mut state = self.lock();
         self.cache.metrics().sched_lock_wait.since(waiting);
-        state.admit(&submission.request, &usage)?;
+        let size_key = state
+            .learned
+            .keys()
+            .then(|| {
+                Keyable {
+                    instance: &submission.request.key.instance,
+                    platform: &platform,
+                    shape: usage.key,
+                    shaped,
+                    kind: submission.request.kind,
+                    gpus: submission.request.resources.gpus,
+                    memory: submission.evidence.memory_source,
+                }
+                .key()
+            })
+            .flatten();
+        state.admit(&submission.request, &usage, size_key)?;
         let joined = state.sched.twin(&submission.request).is_some();
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
@@ -1041,16 +1061,28 @@ impl Dispatch for Farm {
             do_not_cache: submission.request.do_not_cache,
             queued: SystemTime::now(),
             usage,
-            platform: Platform::of(&submission.request.needs),
+            platform,
         });
         let name = state.machine.name(waiter);
-        state.learn_submit(&name, &submission.request, &submission.evidence, joined);
+        state.learn_submit(
+            &name,
+            &submission.request,
+            &submission.evidence,
+            joined,
+            size_key,
+        );
         if let Some((call, shape)) = submission.call.take().zip(shape) {
             let call = call.with_shape(shape).with_evidence(submission.evidence);
             state.record_submit(call, &name, &submission.request);
         }
         let (stage, receiver) = watch::channel(Stage::Queued);
         state.stages.insert(waiter, stage);
+        // The operation this submit allocates (none if it joins a twin, which keeps its
+        // own key) is named before the submit is fed: its first placement round follows.
+        if let Some(key) = size_key.filter(|_| !joined) {
+            let next = state.sched.next_operation();
+            state.sched.set_size_key(next, key);
+        }
         state.feed_quiet(
             now,
             Event::Submit {
@@ -1166,7 +1198,7 @@ impl State {
                 }
             }
         };
-        self.finish_learning(lease, worker, accepted || taken == Taken::Held);
+        self.finish_learning(operation, lease, worker, accepted || taken == Taken::Held);
         if accepted && let Some((subject, measured)) = &usage {
             action_usage::log(operation, subject, measured, outcome, lease, worker);
         }
@@ -1235,6 +1267,7 @@ impl State {
     /// answers, for the caller to deliver once the lock is released.
     fn carry_out(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
         self.watch_store(now);
+        self.reserve_seqs();
         self.learned.clock(now);
         // Only the inputs whose callers deliver answers ([`State::feed_quiet`]) release
         // effects an earlier refusal held back: one of them may be an answer.
@@ -1255,6 +1288,12 @@ impl State {
         while let Some(effect) = effects.pop_front() {
             match effect {
                 Effect::Commit(record) => {
+                    // A refusal for want of a daemon waits on if another frontend's could
+                    // run the operation: it is not committed, and is proposed again after
+                    // another unservable wait.
+                    if self.held_for_other_frontends(&record) {
+                        continue;
+                    }
                     if let ControlRecord::Lease(grant) = &record {
                         self.offer(grant);
                     }
@@ -1656,5 +1695,7 @@ fn unrun(outcome: Outcome, farm_runs: &[FarmRun]) -> Finished {
     }
 }
 
+#[cfg(test)]
+mod learned_tests;
 #[cfg(test)]
 mod tests;

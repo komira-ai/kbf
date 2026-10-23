@@ -145,7 +145,7 @@ async fn collect_out(cas: &CountingCas, upper: &std::path::Path) -> (ActionResul
 /// Catches an output tree stored one blob at a time (on the pilot a tree of
 /// thousands of small files took minutes per lease, the CAS idle), stores with no
 /// bound, and `collect` returning before every blob the result names is stored (the
-/// action cache refuses such a result). Mutants seen red: the CAS's `in_flight`
+/// action cache refuses such a result). Catches: the CAS's `in_flight`
 /// passed as 1; no bound (`usize::MAX`).
 #[tokio::test]
 async fn many_blobs_are_stored_at_once_within_the_bound() {
@@ -188,7 +188,7 @@ async fn many_blobs_are_stored_at_once_within_the_bound() {
 
 /// Catches a blob stored once per file that holds it, and a Directory stored once per
 /// place it appears: each is a round trip to the CAS for bytes it already has.
-/// Mutant seen red: the queue's digest check removed.
+/// Catches: the queue's digest check removed.
 #[tokio::test]
 async fn a_digest_named_many_times_is_stored_once() {
     let upper = scratch("shared");
@@ -245,7 +245,7 @@ async fn a_blob_that_cannot_be_stored_fails_the_collection() {
 /// Catches blobs stored that the CAS already holds, and a question per blob: the walk
 /// asks `missing` once, for every distinct digest of the outputs (each file, each
 /// Directory, the Tree), before it stores any, and stores only what the answer names.
-/// The CAS holds 150 of 200 files beforehand. Mutants seen red: the answer ignored
+/// The CAS holds 150 of 200 files beforehand. Catches: the answer ignored
 /// (`src/pending.rs`, every blob stored, the held files included); no `missing` call,
 /// each put left to ask for itself (`asks` empty).
 #[tokio::test]

@@ -1,6 +1,5 @@
 //! Each rule of the estimator has a test here that goes red when the rule is broken;
-//! the doc comment of a test names the rule. The pull request lists the planted mutant
-//! of each.
+//! the doc comment of a test names the rule and the defect it catches.
 
 mod calibration;
 mod memory;
