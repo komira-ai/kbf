@@ -117,7 +117,7 @@ mod tests {
     /// `docs/design/write-path.md`: waiting Writes' unread data takes the window and
     /// the admitted ones starve) at any limit, a window past HTTP/2's largest, a
     /// stream window under 64 KiB, or the stream window cut where 1 MiB fits (the
-    /// worker's 200 streams stay at 1 MiB and 200 MiB). Mutant: a fixed connection
+    /// worker's 200 streams stay at 1 MiB and 200 MiB). Catches: a fixed connection
     /// window.
     #[test]
     fn the_connection_window_holds_every_streams_window() {
@@ -147,7 +147,7 @@ mod tests {
 
     /// Catches: a limit outside 1..=`MAX_STREAMS` (a `Listeners` built in code, not
     /// from the flags) reaching the transport unclamped while the windows are clamped, so
-    /// the connection window no longer holds every stream's window. Mutant: `streams`
+    /// the connection window no longer holds every stream's window. Catches: `streams`
     /// holding the raw limit.
     #[test]
     fn a_limit_out_of_range_is_clamped_with_its_windows() {
@@ -161,7 +161,7 @@ mod tests {
     }
 
     /// Catches: a default other than 10000 for the REAPI listener or 200 for the
-    /// worker listener; a flag that does not reach `Listeners` (mutant: `limits()`
+    /// worker listener; a flag that does not reach `Listeners` (defect: `limits()`
     /// swapping the two, or returning the defaults); the flags crossed.
     #[test]
     fn the_flags_reach_the_listeners() {
