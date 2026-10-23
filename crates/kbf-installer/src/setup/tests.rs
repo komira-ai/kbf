@@ -1092,9 +1092,8 @@ fn the_retired_flags_are_ignored_and_warned_about_once() {
         };
         let out = go_ok(&FakeOs::linux(), &mut flagged, &with);
         assert_eq!(out, format!("{warning}\n{said}"), "{mode:?}");
-        let steps = |exec: &FakeExec| -> Vec<String> {
-            exec.log.iter().map(ToString::to_string).collect()
-        };
+        let steps =
+            |exec: &FakeExec| -> Vec<String> { exec.log.iter().map(ToString::to_string).collect() };
         assert_eq!(steps(&flagged), steps(&plain), "{mode:?}");
         for path in [INSTALLER_TOML, KBF_TOML] {
             let want = text(&plain, path);

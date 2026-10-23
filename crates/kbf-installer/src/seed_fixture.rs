@@ -70,7 +70,6 @@ fn earlier_probe(seq: u64) -> String {
 #[derive(Clone)]
 pub struct Seeded {
     pub layout: Layout,
-    pub root: PathBuf,
     pub commit: CommitId,
     /// The first 12 digits of the commit: the seed directory's name.
     pub build: String,
@@ -94,13 +93,13 @@ pub struct Seeded {
 impl Seeded {
     /// The seed of commit `B` on a host of its own.
     pub fn scratch(name: &str) -> Seeded {
-        let (layout, root) = host_root(name);
-        Seeded::on(layout, root, B)
+        let (layout, _) = host_root(name);
+        Seeded::on(layout, B)
     }
 
-    /// The seed of `commit` on the host `layout` is the layout of, whose root directory is
-    /// `root`, with its honest tarball written.
-    pub fn on(layout: Layout, root: PathBuf, commit: &str) -> Seeded {
+    /// The seed of `commit` on the host `layout` is the layout of, with its honest tarball
+    /// written.
+    pub fn on(layout: Layout, commit: &str) -> Seeded {
         let tarball = tar_gz(&[file("kbf", &elf(0x3e, "payload"))]);
         let build = commit[..12].to_owned();
         let manifest = json!({
@@ -123,7 +122,6 @@ impl Seeded {
         );
         let seeded = Seeded {
             layout,
-            root,
             commit: c(commit),
             build,
             tarball,
