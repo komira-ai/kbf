@@ -223,7 +223,7 @@ mod tests {
         // Catches: a build job that checks out the default shallow depth (or a partial
         // one, or no checkout at all) while recording the facts: its kbf counts no
         // commits, `seq` is 0 in the facts, and the age check refuses every update once the
-        // store holds them. Mutant: `full_history` always true. One defect, one problem.
+        // store holds them. Catches: `full_history` always true. One defect, one problem.
         let shallow = "      - uses: actions/checkout@abc\n        with:\n          persist-credentials: false\n";
         let partial =
             "      - uses: actions/checkout@abc\n        with:\n          fetch-depth: 1\n";
@@ -278,7 +278,7 @@ mod tests {
     fn a_job_that_records_another_build_of_kbf_than_it_packages_is_named() {
         // Catches: the facts of a `kbf` of another build directory (a debug build, an
         // older target) that has the file name of the one that ships; the facts would be
-        // true of a binary nobody installs. Mutant: the comparison dropped from `rules`.
+        // true of a binary nobody installs. Catches: the comparison dropped from `rules`.
         let w = workflow(|job| {
             let other = record(job).replace("target/$TARGET/release", "other/release");
             vec![run(CHECK), run(&other), run(PACKAGE)]

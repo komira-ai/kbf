@@ -533,7 +533,7 @@ fn action_page() -> String {
 }
 
 /// Catches: an answer, of any kind, without the CSP of `docs/design/ui-data.md` 8 or
-/// without `nosniff` (mutants: a weakened policy string, the nosniff entry dropped,
+/// without `nosniff` (catches: a weakened policy string, the nosniff entry dropped,
 /// the stylesheet or an error answer built without them).
 #[test]
 fn every_answer_carries_the_csp_and_nosniff() {
@@ -575,8 +575,8 @@ fn every_answer_carries_the_csp_and_nosniff() {
 
 /// Catches: a page that answers the API's `401` without its `WWW-Authenticate`
 /// (RFC 9110 15.5.2 requires one), or its `429` or `503` without its `Retry-After`
-/// (mutants: the headers not passed on by the Builds page, or by a failed Build or
-/// Action page); any other API header passed on (mutant: the allowlist check dropped); one
+/// (catches: the headers not passed on by the Builds page, or by a failed Build or
+/// Action page); any other API header passed on (catches: the allowlist check dropped); one
 /// passed on with a page whose status is not the API's (a log read that failed).
 #[test]
 fn a_page_with_the_apis_status_passes_on_the_headers_it_needs() {
@@ -633,7 +633,7 @@ fn a_page_with_the_apis_status_passes_on_the_headers_it_needs() {
 }
 
 /// Catches (`docs/design/ui-data.md` 8, red test of U6): a stderr of
-/// `<script>alert(1)</script>` written as markup (mutant: `Html::text` writing raw),
+/// `<script>alert(1)</script>` written as markup (catches: `Html::text` writing raw),
 /// and the same for a target label and a failure message on the Build page.
 #[test]
 fn a_stderr_of_script_renders_as_text() {
@@ -717,7 +717,7 @@ fn violations(page: &Page, seen: &[String]) -> Vec<String> {
 }
 
 /// The page contract (`docs/design/ui-data.md` 6.1). Catches: a page that reads a
-/// route its `reads` does not name (mutant: Build reading `/actions` with only the
+/// route its `reads` does not name (catches: Build reading `/actions` with only the
 /// summary declared, which the reader refuses, so the page is not `200`; and with the
 /// reader's check removed as well, the fake sees the undeclared URL); a declared route
 /// no page reads any more (a stale list); a page missing from the table; a URL read
@@ -759,7 +759,7 @@ fn every_page_reads_only_the_routes_it_declares() {
     }
 }
 
-/// Catches: a reader that sends an undeclared URL (mutant: the `declares` check in
+/// Catches: a reader that sends an undeclared URL (catches: the `declares` check in
 /// `Reader` removed), and a contract check that cannot see it.
 #[test]
 fn a_read_of_an_undeclared_route_is_refused_and_is_a_contract_violation() {
@@ -779,7 +779,7 @@ fn a_read_of_an_undeclared_route_is_refused_and_is_a_contract_violation() {
     assert_eq!(violations(&BUILDS, std::slice::from_ref(&url)), [url]);
 }
 
-/// Catches: a dot segment accepted as a route's `{name}` segment (mutant: the dot
+/// Catches: a dot segment accepted as a route's `{name}` segment (catches: the dot
 /// check in `matches` dropped), so a page could send `/v1/invocations/..`, which a URL
 /// client resolves to `/v1`, a route no page declares.
 #[test]

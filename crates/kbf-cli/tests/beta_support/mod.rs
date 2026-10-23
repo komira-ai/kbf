@@ -87,7 +87,7 @@ pub(crate) fn b0(name: &str, mode: &str, secs: u64) -> B0 {
         fill_kib: 4,
         scrape_every: Duration::from_secs(1),
         summary: Some(dir.join("summary.md")),
-        mutant: None,
+        fault: None,
         extra_flags: Vec::new(),
         farm_hang: Duration::from_secs(60),
         interrupt: Interrupt::new(),
@@ -279,7 +279,7 @@ impl Drop for Stopped {
 /// Every gate of B0 and the test (of tests/beta_b0.rs or tests/beta_b0_red.rs) that turns it red
 /// in a scenario over a real farm.
 /// `None` is a gate that only the real Buck2 can turn red: the stand-in's builds write nothing
-/// to the farm, so no blob can be lost. Those are `kbf-beta b0 --mutant shrink-every-cap`'s
+/// to the farm, so no blob can be lost. Those are `kbf-beta b0 --fault shrink-every-cap`'s
 /// to show red, with the real Buck2 of the workflow.
 pub(crate) const RED_IN_A_SCENARIO: [(&str, Option<&str>); 11] = [
     (
@@ -322,7 +322,7 @@ pub(crate) const RED_IN_A_SCENARIO: [(&str, Option<&str>); 11] = [
     ),
 ];
 
-/// Catches: a gate added to B0 that no scenario test turns red (a gate that is never seen red
+/// Catches: a gate added to B0 that no scenario test turns red (a gate that never fails
 /// is not a gate), and a name in [`RED_IN_A_SCENARIO`] that is no test of this file. The gates
 /// are those a healthy run writes.
 pub(crate) fn assert_every_gate_has_a_scenario(doc: &serde_json::Value) {

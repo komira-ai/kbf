@@ -6,7 +6,7 @@
 //!
 //! The programs it runs are `kbf-act` steps (this test binary through a link). Each
 //! test says the defect it would catch; the reaping test goes red when the init stops
-//! reaping (the mutant: `waitpid(-1, ..)` made `waitpid(program, ..)` in `reap`).
+//! reaping (the catches: `waitpid(-1, ..)` made `waitpid(program, ..)` in `reap`).
 
 kbf_testkit::act_test_hook!();
 
@@ -327,7 +327,7 @@ fn code_within_ten_seconds(mut command: Command) -> Option<i32> {
 
 /// Catches a descriptor the runtime left open (above stderr) reaching the program: this
 /// test leaves one open on purpose, past the init's exec, and the program must not find
-/// it. (The mutant: no `close_range`.)
+/// it. (The catches: no `close_range`.)
 #[test]
 fn a_descriptor_left_open_does_not_reach_the_program() {
     let dir = scratch("close-range");

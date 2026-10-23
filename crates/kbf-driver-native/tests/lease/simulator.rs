@@ -279,7 +279,7 @@ async fn the_end_deletes_the_device_the_daemon_made_whatever_the_lease_directory
 
 /// Catches: the simulator left behind when the action fails (exits non-zero), times
 /// out or is killed: the next lease's tests would find a booted, dirty device, and
-/// the node would fill with them. Mutant planted: the end deletes simulators only
+/// the node would fill with them. Catches: the end deletes simulators only
 /// after an action that exited 0 (red on all three).
 #[tokio::test]
 async fn the_simulator_is_deleted_whatever_the_outcome() {
@@ -337,7 +337,7 @@ fn swept(rt: &kbf_driver_native::NativeRuntime<MemoryCas>) {
 
 /// Catches a run the daemon drops (its future dropped mid-action) leaving its
 /// simulator behind until the next daemon start: the drop must delete it as the end
-/// does. Mutant planted: the drop only removes the directory (red).
+/// does. Catches: the drop only removes the directory (red).
 #[tokio::test]
 async fn a_dropped_run_deletes_its_simulator() {
     let dir = scratch("sim-dropped");
@@ -437,7 +437,7 @@ fn listings_in_turn(dir: &Path, listings: &[String]) -> String {
 /// and only then run the action. The fake's first three listings do not name the
 /// device (none at all; another device; the device marked unavailable), the fourth
 /// does. The action prints the fake's log, which holds four looks when it starts.
-/// Mutants planted: no wait (red: no look, the action sees none); one look only, its
+/// Catches: no wait (red: no look, the action sees none); one look only, its
 /// answer not read (red: one look); `available: false` taken for listed (red: three
 /// looks).
 #[tokio::test]
@@ -483,7 +483,7 @@ async fn the_action_waits_until_xcode_lists_its_simulator() {
 /// would fail later, blamed on the action) or failing without saying why: the lease
 /// fails as the node's (`Failed`) once the wait is up, naming the device, the wait and
 /// the last listing (or how the last look failed), the action not run and the device
-/// still deleted. Mutant planted: the wait ends the first look that fails (red: one
+/// still deleted. Catches: the wait ends the first look that fails (red: one
 /// look, and lease 2's message).
 #[tokio::test]
 async fn a_simulator_xcode_never_lists_fails_the_lease_saying_so() {
@@ -537,7 +537,7 @@ async fn a_simulator_xcode_never_lists_fails_the_lease_saying_so() {
 
 /// Catches a wait that costs a lease whose simulator Xcode lists at once: one look,
 /// no pause before it or after it. The pause between looks is a minute here, and the
-/// run must end within the harness's 30 s. Mutant planted: a pause before the first
+/// run must end within the harness's 30 s. Catches: a pause before the first
 /// look (red: the run times out).
 #[tokio::test]
 async fn a_simulator_listed_at_once_adds_no_wait() {
@@ -596,7 +596,7 @@ const WONT_BOOT: &str =
 /// `xcodebuild test -destination` failed in the action). The fake `xcodebuild` lists
 /// the device only once a `bootstatus` has run, and the fake `xcdevice` lists it at
 /// once: the driver must run the boot first, and the log must show it before every
-/// look. Mutants planted: no boot (red: the lease fails, Xcode never lists the
+/// look. Catches: no boot (red: the lease fails, Xcode never lists the
 /// device); the boot after the looks (red: the lease fails the same way, the first
 /// look found it not listed and the order assertion).
 #[tokio::test]
@@ -629,7 +629,7 @@ async fn the_simulator_is_booted_before_the_looks_that_ask_xcode_for_it() {
 /// at [`Listing::look`], while `CoreSimulatorService` is still at it; the next one
 /// waits on the boot) and a lease that runs the action before the boot ends: the
 /// fake's first two `bootstatus` exit 1, the third exits 0. The action prints the
-/// fake's log, which holds three boots and one look when it starts. Mutant planted:
+/// fake's log, which holds three boots and one look when it starts. Catches:
 /// the wait ends at the first failed try (red: the lease fails).
 #[tokio::test]
 async fn the_driver_tries_the_boot_again_and_runs_the_action_once_it_is_booted() {
@@ -657,7 +657,7 @@ async fn the_driver_tries_the_boot_again_and_runs_the_action_once_it_is_booted()
 /// Catches a device that never boots holding the lease for ever, or failing it
 /// without saying why: the lease fails as the node's (`Failed`) once [`Listing::boot`]
 /// is up, naming the device, the wait and what the last try printed; no look is made,
-/// the action does not run and the device is still deleted. Mutant planted: the
+/// the action does not run and the device is still deleted. Catches: the
 /// failed boot ignored (red: the lease goes on to the looks and runs the action).
 #[tokio::test]
 async fn a_simulator_that_will_not_boot_fails_the_lease_saying_so() {
@@ -734,7 +734,7 @@ async fn a_kill_during_the_wait_for_the_boot_ends_it() {
 /// Catches a `bootstatus` that stalls (a boot with a data migration took up to 2 min
 /// 46 s) holding the wait for as long as it likes: each try has [`Listing::look`] to
 /// answer (200 ms here) and is killed after it. The fake's `bootstatus` sleeps 5 s.
-/// Mutant planted: the try given the `simctl` answer time (red: the run takes the
+/// Catches: the try given the `simctl` answer time (red: the run takes the
 /// 5 s).
 #[tokio::test]
 async fn a_boot_that_does_not_answer_is_cut_and_the_wait_still_ends() {
@@ -769,7 +769,7 @@ async fn a_boot_that_does_not_answer_is_cut_and_the_wait_still_ends() {
 /// the device at once; the fake `xcodebuild`'s first three listings do not (the
 /// placeholders only; another simulator; the device under the ineligible heading), the
 /// fourth does. The action prints the fake's log, which holds four such looks when it
-/// starts. Mutants planted: the look reverted to `xcdevice list` alone (red: no
+/// starts. Catches: the look reverted to `xcdevice list` alone (red: no
 /// `xcodebuild` look); the ineligible heading not cut (red: three looks).
 #[tokio::test]
 async fn the_action_waits_until_xcodebuild_lists_its_simulator() {
@@ -856,7 +856,7 @@ async fn xcodebuild_never_lists(name: &str, shown: String, listed: usize) {
 /// Catches a lease whose simulator `xcodebuild` never lists running its action anyway
 /// (it would fail there, blamed on the action) while `xcdevice list` names the device
 /// (the fake's default): the lease fails as the node's, the listing is the one
-/// `xcodebuild` printed, with no simulator among the placeholders. Mutant planted: the
+/// `xcodebuild` printed, with no simulator among the placeholders. Catches: the
 /// wait ends at the `xcdevice` look (red: the action ran).
 #[tokio::test]
 async fn a_node_whose_xcodebuild_lists_no_simulator_fails_the_lease_not_the_action() {
@@ -865,7 +865,7 @@ async fn a_node_whose_xcodebuild_lists_no_simulator_fails_the_lease_not_the_acti
 
 /// Catches a listing of other simulators taken for one of the lease's (the 34-simulator
 /// listing of run 38290129703, which lacked the new device): the device must be named,
-/// not the list long. Mutant planted: `lists` matching any simulator id (red: the
+/// not the list long. Catches: `lists` matching any simulator id (red: the
 /// action ran).
 #[tokio::test]
 async fn a_populated_listing_without_the_udid_is_not_listed() {
@@ -881,7 +881,7 @@ async fn a_populated_listing_without_the_udid_is_not_listed() {
 /// hosted runner) holding the wait for as long as it likes: each look has
 /// [`Listing::look`] to answer (200 ms here) and is killed after it, counted as not
 /// listed, so the wait ends near [`Listing::within`] with the lease failed saying the
-/// look did not answer. The fake's look sleeps 5 s. Mutant planted: the look given the
+/// look did not answer. The fake's look sleeps 5 s. Catches: the look given the
 /// `simctl` answer time instead of [`Listing::look`] (red: the run takes the 5 s).
 #[tokio::test]
 async fn a_look_that_does_not_answer_is_cut_and_the_wait_still_ends() {
@@ -1279,7 +1279,7 @@ fn gated_listing(dir: &Path, gate: &Path) -> String {
 /// listing does not answer (and the cap is 30 s) until the test lets it: `new` must
 /// return at once, with the sweep still waiting and the owed file in place; then the
 /// device is deleted, the owed file removed, and the sweep reports it is done.
-/// Mutants planted: the sweep run inside `new` (red: `new` takes the 30 s cap and the
+/// Catches: the sweep run inside `new` (red: `new` takes the 30 s cap and the
 /// "returns at once" assertion fails); the owed file removed before the sweep ends
 /// (red: the file is gone while the listing waits).
 #[tokio::test]
@@ -1324,7 +1324,7 @@ async fn the_start_returns_while_the_left_simulators_are_swept_in_the_background
 /// Catches (issue #717): the first listing of the start not answering within the cap
 /// leaving the left device alone for good. The fake's first listing stalls past the
 /// cap and the next answers: the background sweep asks again and deletes the device,
-/// and removes the owed file. Mutant planted: one attempt (`SWEEP_ATTEMPTS` 1; red:
+/// and removes the owed file. Catches: one attempt (`SWEEP_ATTEMPTS` 1; red:
 /// the device is not deleted and the owed file stays).
 #[tokio::test]
 async fn a_listing_that_stalls_past_the_cap_is_asked_again_by_the_background_sweep() {
@@ -1346,7 +1346,7 @@ async fn a_listing_that_stalls_past_the_cap_is_asked_again_by_the_background_swe
 /// first start stalls; the start still returns and removes the lease directory, the
 /// sweep ends out of tries and keeps the owed file; the next start, with no lease
 /// directory left, sweeps on that file alone, deletes the device and removes the file;
-/// a third asks nothing. Mutants planted: the owed file not written (red: the second
+/// a third asks nothing. Catches: the owed file not written (red: the second
 /// start asks nothing); dropped when the listing failed (the same); not removed after
 /// a clean sweep (red: the third start asks).
 #[tokio::test]
@@ -1395,7 +1395,7 @@ async fn a_start_sweep_that_never_gets_an_answer_is_tried_again_at_the_next_star
 /// listing, held until the test lets it, names the running lease's too). A lease
 /// that asks for a simulator is made while the sweep waits for its listing; the sweep
 /// then deletes the left device and not the lease's, which is deleted by the lease's
-/// own end. Mutant planted: no live names kept (red: `delete {UDID}` twice).
+/// own end. Catches: no live names kept (red: `delete {UDID}` twice).
 #[tokio::test]
 async fn the_background_sweep_leaves_the_simulator_of_a_running_lease() {
     let dir = scratch("sim-sweep-live");
@@ -1453,7 +1453,7 @@ async fn the_background_sweep_leaves_the_simulator_of_a_running_lease() {
 
 /// Catches: an owed sweep that cannot make its directory (a file is where it goes)
 /// failing the start, or losing the debt: the start returns, no `simctl` call is made,
-/// and the owed file stays for the next start. Mutant planted: the failure taken for a
+/// and the owed file stays for the next start. Catches: the failure taken for a
 /// clean sweep (red: the owed file is gone).
 #[tokio::test]
 async fn a_sweep_directory_that_cannot_be_made_keeps_the_debt() {
@@ -1473,7 +1473,7 @@ async fn a_sweep_directory_that_cannot_be_made_keeps_the_debt() {
 /// Catches: a runtime that is dropped while its sweep waits to try again leaving the
 /// thread to run its tries on (or the drop waiting for them): the tries are an hour
 /// apart here and every one fails, so the drop must end the wait, not sit through it.
-/// Mutant planted: the pause ignoring the stop (red: the drop takes the minute).
+/// Catches: the pause ignoring the stop (red: the drop takes the minute).
 #[tokio::test]
 async fn dropping_the_runtime_ends_the_sweeps_wait_for_its_next_try() {
     let dir = scratch("sim-sweep-drop");
