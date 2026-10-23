@@ -18,8 +18,8 @@
 //! - [`meta_log`]: the node's metadata log, saved at a release's first start and put back when
 //!   the host goes back to the release that ran before (an older binary refuses a raised log).
 //! - [`migrator`]: brings the state database to the schema a release declares, and asks a
-//!   binary which schema that is (`--version --json`); the swap's migration and the schema
-//!   step of `boot-check` share it.
+//!   binary which schema that is (`--version --json`); the swap's migration uses it. (The
+//!   schema step of a bundled host's `boot-check` is `kbf boot-check`'s now.)
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
 //!
@@ -62,7 +62,6 @@ pub mod app;
 pub mod archive;
 pub mod attest;
 pub mod binary;
-pub mod boot_schema;
 pub mod cli;
 pub mod darwin;
 pub mod database;

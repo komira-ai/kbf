@@ -1,11 +1,12 @@
 # kbf build farm frontend on a host without the frontend proxy: `kbf --mode=frontend`.
 # Static unit: shipped by the kbf package (installed under /usr/lib/systemd/system/),
 # disabled, with no rendering and no @PLACEHOLDER@ in it. It starts only once
-# /etc/kbf/kbf.toml exists (ConditionPathExists=), after kbf-installer's `boot-check` (which
-# brings the state database to the schema the kbf at --kbf declares and fails the start if it
-# cannot) and `kbf --mode=frontend --check` (which prints every missing prerequisite and
-# exits 2). The checks are ExecStartPre=, not ExecCondition=: ExecCondition= skips the start
-# silently on exit 1 to 254, and a unit that cannot start must fail where an operator sees it.
+# /etc/kbf/kbf.toml exists (ConditionPathExists=), after `kbf boot-check` (which brings the
+# state database named by the `database` key of /etc/kbf/installer.toml to the schema this
+# kbf declares and fails the start if it cannot) and `kbf --mode=frontend --check` (which
+# prints every missing prerequisite and exits 2). The checks are ExecStartPre=, not
+# ExecCondition=: ExecCondition= skips the start silently on exit 1 to 254, and a unit that
+# cannot start must fail where an operator sees it.
 #
 # When to use it: on a frontend host that does not run kbf-proxy. The listeners, the state
 # store, the certificates and the cold store are kbf.toml's (--config names it), and the
@@ -59,7 +60,7 @@ LimitNOFILE=1048576
 CPUWeight=300
 # boot-check does not depend on slots or instances: it brings the state database to the
 # schema this kbf needs before the start.
-ExecStartPre=+/usr/bin/kbf-installer boot-check --kbf=/usr/bin/kbf --mode=frontend
+ExecStartPre=+/usr/bin/kbf boot-check --mode=frontend
 # `--check` validates kbf.toml and what a restart cannot change (a file, a user, a flag)
 # and exits 2 for those. Anything that can become ready later (a listen address, a peer,
 # a DNS name, a mount) is not refused here: it exits 75 (not ready, restarted).

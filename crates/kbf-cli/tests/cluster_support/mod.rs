@@ -1,5 +1,7 @@
 //! The helpers of `tests/cluster.rs` and `tests/cluster_object_store.rs`: a one-shot HTTP
-//! server that keeps the request it was sent, and `kbf cluster` run against it.
+//! server that keeps the request it was sent, and `kbf cluster` run against it. [`kbf`] runs
+//! the binary with any words, which `tests/boot_check.rs` and `tests/boot_check_postgres.rs`
+//! use too: `kbf boot-check` reads no `kbf.toml`.
 
 #![allow(dead_code)]
 

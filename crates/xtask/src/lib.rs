@@ -39,8 +39,8 @@
 //!   `kbf` package.
 //! - `pkg-kbf-asset` ([`pkg_kbf_asset`]): the `kbf` deb as the release asset
 //!   `kbf-<commit>-<platform>.deb`, refused unless its `/usr/bin/kbf` is the `kbf` of the
-//!   attested tarball, it depends on `kbf-installer` of its own version or later and replaces
-//!   `kbf-installer`, and it holds the units of the modes and nothing else.
+//!   attested tarball, it depends on no `kbf-installer` and replaces `kbf-installer`, and it
+//!   holds the units of the modes and nothing else.
 //! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf-installer` package
 //!   carries, in the one form a deb and an rpm put in the same order, and the most a package
 //!   that carries a kbf release may weigh. `pkg-config` and `pkg-asset` take them up with
@@ -343,8 +343,8 @@ enum Verb {
         verify_only: bool,
     },
     /// The kbf deb as a release asset, refused unless its `/usr/bin/kbf` is the attested
-    /// `kbf`, it depends on the kbf-installer of its own version or later and replaces it,
-    /// and it holds the units of the modes and nothing else.
+    /// `kbf`, it depends on no kbf-installer and replaces it, and it holds the units of the
+    /// modes and nothing else.
     PkgKbfAsset {
         /// The deb nfpm built, or the directory holding the one (with `--verify-only`: the
         /// asset itself).

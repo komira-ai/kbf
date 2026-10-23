@@ -5,11 +5,10 @@
 //!
 //! The deb is opened as [`crate::pkg_asset`] opens one and refused unless:
 //!
-//! - its control file says the architecture of `--platform`, the package `kbf`, a
-//!   dependency on `kbf-installer (>= <its own version>)`, because each mode unit runs the
-//!   installer's `boot-check` before it starts `kbf`, and that it `Replaces: kbf-installer`,
-//!   because the units of the modes were files of the installer's deb and dpkg refuses to
-//!   unpack a package over files another package owns;
+//! - its control file says the architecture of `--platform`, the package `kbf`, no dependency
+//!   on `kbf-installer` (each mode unit runs `kbf boot-check`, the `kbf` file itself), and
+//!   that it `Replaces: kbf-installer`, because the units of the modes were files of the
+//!   installer's deb and dpkg refuses to unpack a package over files another package owns;
 //! - `usr/bin/kbf` is byte for byte the `kbf` inside `--kbf-tarball`, the tarball
 //!   `build-commit check-asset` has already shown names the commit: the deb carries the
 //!   bytes the build identified, not others. It is mode 0755;
@@ -27,7 +26,7 @@ use std::path::Path;
 use crate::Error;
 use crate::package::Platform;
 use crate::pkg_asset::{self, Mode};
-use crate::pkg_linux::{self, KBF_DEB_REPLACES, KBF_NAME, KBF_PATH, KBF_UNITS, UNIT_DIR};
+use crate::pkg_linux::{KBF_DEB_REPLACES, KBF_NAME, KBF_PATH, KBF_UNITS, NAME, UNIT_DIR};
 
 /// The file name of the asset.
 pub fn file_name(commit: &str, platform: Platform) -> String {
@@ -56,6 +55,14 @@ fn holds(list: &str, want: &str) -> bool {
     list.split(',').any(|d| squashed(d) == squashed(want))
 }
 
+/// Whether the control field value `list` has an entry that names the package `package`,
+/// whatever version or architecture the entry asks for (`pkg (>= 1)`, `pkg:any`) and whether
+/// it is one of several alternatives (`other | pkg`).
+fn names(list: &str, package: &str) -> bool {
+    list.split([',', '|'])
+        .any(|entry| entry.trim().split(['(', ':', ' ']).next() == Some(package))
+}
+
 /// The path of the unit `unit` in a data tarball (no leading slash).
 fn unit_path(unit: &str) -> String {
     format!("{}/{unit}", UNIT_DIR.trim_start_matches('/'))
@@ -78,12 +85,10 @@ pub fn problems(deb: &[u8], c: &Check) -> Result<Vec<String>, Error> {
             package.unwrap_or("(none)")
         ));
     }
-    let version = field(&opened.control, "Version: ").unwrap_or_default();
     let depends = field(&opened.control, "Depends: ").unwrap_or_default();
-    let want = pkg_linux::kbf_depends_deb(version);
-    if !holds(depends, &want) {
+    if names(depends, NAME) {
         problems.push(format!(
-            "control says Depends {depends:?}, which does not hold {want:?}"
+            "control says Depends {depends:?}, but the kbf package depends on no {NAME:?}"
         ));
     }
     let replaces = field(&opened.control, "Replaces: ").unwrap_or_default();

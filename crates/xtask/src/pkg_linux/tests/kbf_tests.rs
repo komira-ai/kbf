@@ -127,29 +127,28 @@ fn the_kbf_plan_refuses_a_missing_binary_or_unit_and_collects_every_problem() {
     assert_eq!(text.lines().count(), 2, "{text}");
 }
 
-/// Asserts that the `kbf` configuration is named `kbf`, depends (deb) and requires (rpm) on
-/// `kbf-installer` of the version it is given or later, makes the deb, and only the deb,
-/// replace `kbf-installer`, suggests nothing, runs no script, and lists its files as root's;
-/// and that the `kbf-installer` configuration names nothing of the `kbf` package and replaces
-/// nothing.
+/// Asserts that the `kbf` configuration is named `kbf`, depends (deb) and requires (rpm) on no
+/// package, not on `kbf-installer`, makes the deb, and only the deb, replace `kbf-installer`,
+/// suggests nothing, runs no script, and lists its files as root's; and that the
+/// `kbf-installer` configuration names nothing of the `kbf` package and replaces nothing.
 #[test]
-fn the_kbf_config_depends_on_the_installer_of_its_own_version() {
+fn the_kbf_config_depends_on_no_package_and_only_the_deb_replaces_the_installer() {
     let t = Tree::new("kbf-config");
     let entries = kbf_plan(&t.inputs()).expect("kbf plan");
     let text = config(Package::Kbf, &entries, Platform::LinuxArm64, "1.2.3+ci");
     assert!(text.contains("name: \"kbf\"\n"), "{text}");
     assert!(text.contains("arch: \"arm64\"\n"), "{text}");
     assert!(text.contains("version: \"1.2.3+ci\"\n"), "{text}");
-    assert!(
-        text.contains("depends:\n  - \"kbf-installer (>= 1.2.3+ci)\"\noverrides:\n"),
-        "{text}"
-    );
-    let rpm = "overrides:\n  rpm:\n    depends:\n      - \"kbf-installer >= 1.2.3+ci\"\n";
-    let deb = "  deb:\n    replaces:\n      - \"kbf-installer\"\ndeb:\n";
-    assert!(text.contains(&format!("{rpm}{deb}")), "{text}");
+    let replaces = "homepage: \"https://github.com/komira-ai/kbf\"\nlicense: \"Apache-2.0\"\n\
+                    overrides:\n  deb:\n    replaces:\n      - \"kbf-installer\"\ndeb:\n";
+    assert!(text.contains(replaces), "{text}");
     assert_eq!(text.matches("replaces").count(), 1, "{text}");
     assert_eq!(KBF_DEB_REPLACES, ["kbf-installer"]);
     for banned in [
+        "depends",
+        "requires",
+        "kbf-installer (",
+        "kbf-installer >=",
         "suggests",
         "recommends",
         "scripts",
@@ -169,8 +168,6 @@ fn the_kbf_config_depends_on_the_installer_of_its_own_version() {
     let installer = config(Package::Installer, &[], Platform::LinuxArm64, "1.2.3+ci");
     assert!(!installer.contains("kbf (>="), "{installer}");
     assert!(!installer.contains("replaces"), "{installer}");
-    assert_eq!(kbf_depends_deb("9"), "kbf-installer (>= 9)");
-    assert_eq!(kbf_depends_rpm("9"), "kbf-installer >= 9");
 }
 
 /// Asserts that the fixture unit directory holds the unit of every mode, so that the `kbf`

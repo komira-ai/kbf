@@ -39,20 +39,17 @@ pkg-config` writes (for both packages): this directory holds the inputs, and
   (`KBF_UNITS`), in `/usr/lib/systemd/system` (0644). `cargo xtask pkg-config` fails when the
   unit directory lacks one;
 - nothing else, all of it `root:root`, built in the same way;
-- a dependency on the `kbf-installer` package of its own version or a later one (deb
-  `kbf-installer (>= <v>)`, rpm `kbf-installer >= <v>`), because each mode unit runs the
-  installer's `boot-check` before it starts `kbf`. The version is the installer's,
-  `<version>+<12 of the commit>`: both packages name the commit they are built from. apt and dnf compare that version as text
-  (`crates/xtask/src/pkg_version.rs`), so the dependency names the installer built with this
-  `kbf` and does not order builds: a rollback to an older `kbf` can be refused, and an older
-  installer can be accepted. Unsettled until `pkg-config` carries the version `pkg_version.rs`
-  describes;
+- no dependency on another package, the `kbf-installer` package included: each mode unit runs
+  `kbf boot-check`, which is the `kbf` file the package carries. (`setup` is still the
+  installer's, so a host gets `crun`, `uidmap`, `systemd` and `ca-certificates` from the
+  `kbf-installer` package it installs beside `kbf`.) `pkg-kbf-asset` refuses a deb whose
+  `Depends` names `kbf-installer`;
 - in the deb only, `Replaces: kbf-installer` (any version, no `Conflicts`). The five mode units
   were files of the `kbf-installer` package before, and dpkg refuses to unpack `kbf` over files an
   older `kbf-installer` owns unless `kbf` says it replaces that package. The rpm names nothing: an
-  rpm `Obsoletes` would remove the installer, which `kbf` needs, and the `Requires` of the
-  installer of the same version or later makes the transaction that installs `kbf` upgrade an
-  older installer, which no longer owns the files. `pkg-kbf-asset` checks the deb's `Replaces`.
+  rpm `Obsoletes` would remove the installer, which a host still runs. An rpm host that has the
+  installer of before the split must upgrade it in the same transaction as `kbf`, because that
+  installer's rpm owns the five unit files. `pkg-kbf-asset` checks the deb's `Replaces`.
 
 ### Which frontend unit
 
@@ -129,7 +126,7 @@ a bundle ([docs/artifacts.md](../../docs/artifacts.md#the-kbf-installer-package-
 `cargo xtask pkg-kbf-asset` does the same for `kbf-<commit>-<platform>.deb`, refused unless its
 `/usr/bin/kbf` is the `kbf` of the job's own tarball ([the `kbf` package](../../docs/artifacts.md#the-kbf-package-deb)).
 The `kbf` package is built twice and compared like the other, but not installed in a
-container: it depends on the `kbf-installer` package, and the install test takes one package.
+container: the install test takes one package.
 Two call sites, one way to build: both go through `pkg-config` and `pkg-build`.
 
 ## What the units run
@@ -140,8 +137,13 @@ Two call sites, one way to build: both go through `pkg-config` and `pkg-build`.
   serves every mode. `--unit` and `--launchd-label` still name the service by hand. The unit has
   no `ExecStartPre=`: the contract's `check` is not built, and a stub would fail every start.
 - Each mode unit runs `/usr/bin/kbf --mode=<mode>`, the `kbf` package's file, after
-  `kbf-installer boot-check --kbf=/usr/bin/kbf --mode=<mode>` (which brings the state database to
-  the schema that `kbf` needs, for the modes that keep state in it) and `kbf --mode=<mode> --check`.
+  `kbf boot-check --mode=<mode>` (which brings the state database named by the `database` key of
+  `/etc/kbf/installer.toml` to the schema that `kbf` itself needs, for the modes that keep state
+  in it, and fails the start if it cannot) and `kbf --mode=<mode> --check`. The installer's own
+  `boot-check --kbf=<kbf> --mode=<mode>` stays for one release for the units of the earlier
+  packages: it runs `<kbf> boot-check --mode=<mode>` over the host's `installer.toml` and ends
+  as that ended. It needs a `kbf` that has the verb: upgrade the `kbf` package with the
+  installer or before it.
 - `crates/kbf-integration-test/tests/package_installer_verbs.rs` parses every `kbf-installer` command line of
   these units, and of the macOS property list, with the binary's own parser and refuses a verb that
   is not built; it also holds every `kbf` the units exec to `/usr/bin/kbf`.

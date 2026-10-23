@@ -1,10 +1,10 @@
 //! The `kbf` package in the pinned release set (docs/artifacts.md): `/usr/bin/kbf` and the
-//! units of the modes are a deb and an rpm of their own, `kbf`, which depends on the
-//! `kbf-installer` package of the same version (each mode unit runs the installer's
-//! `boot-check`). Each Linux job builds both packages from the one configuration step and
-//! makes the deb an asset, `kbf-<commit>-<platform>.deb`; no pull request run attests it, so a
-//! step that goes missing would turn `main` red or release a deb nobody checked. [`rules`]
-//! reads the workflow and names a job that:
+//! units of the modes are a deb and an rpm of their own, `kbf`, which depends on no other
+//! package (each mode unit runs `kbf boot-check`, the file the package carries). Each Linux job
+//! builds both packages from the one configuration step and makes the deb an asset,
+//! `kbf-<commit>-<platform>.deb`; no pull request run attests it, so a step that goes missing
+//! would turn `main` red or release a deb nobody checked. [`rules`] reads the workflow and
+//! names a job that:
 //!
 //! - does not make the `kbf` deb an asset exactly once (`cargo xtask pkg-kbf-asset`,
 //!   [`PACKAGES`]), or makes it for another platform than its own;

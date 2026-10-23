@@ -271,6 +271,8 @@ jobs:
       - run: cargo test -p kbf-server --locked --test frontend -- --include-ignored two_children::fifty_builds_across_a_takeover_over_postgres
       # A frontend process started with a Postgres --state-store reaches /readyz.
       - run: cargo test -p kbf-cli --locked --test frontend_process -- --include-ignored postgres_state_store
+      # `kbf boot-check`, the schema step a unit runs before it starts kbf, over a real server.
+      - run: cargo test -p kbf-cli --locked --test boot_check_postgres -- --include-ignored
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
@@ -627,8 +629,8 @@ jobs:
   # writes, with the test-only kbf-installer-stub standing for both binaries and the real
   # units; `cargo xtask pkg-install-test` installs the kbf-installer deb into a fresh Ubuntu
   # container and its rpm into a fresh Fedora one, with systemd as PID 1, and checks them
-  # (crates/xtask/src/pkg_install.rs). The kbf package is built here and not installed: it
-  # depends on the kbf-installer package.
+  # (crates/xtask/src/pkg_install.rs). The kbf package is built here and not installed: the
+  # install test takes one package.
   packages:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

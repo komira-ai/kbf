@@ -32,8 +32,10 @@
 //!   which holds only part of the history, or a source archive with no git), and nothing is
 //!   newer than 0. A build before this field prints none;
 //! - `state_schema`: the newest Postgres state schema this binary embeds a migration for
-//!   ([`kbf_state::postgres::schema::latest`]); `kbf-installer` migrates the database to it
-//!   before this release starts;
+//!   ([`kbf_state::postgres::schema::latest`]); `kbf boot-check` ([`crate::boot_check`]) reads
+//!   the same number and migrates the database to it before a unit starts this binary, and
+//!   `kbf-installer` migrates to it before it activates this release on a host that keeps
+//!   releases;
 //! - `version`: the package version.
 //!
 //! Only the two words `--version --json`, in either order and nothing else, ask for it;

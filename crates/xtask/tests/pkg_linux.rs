@@ -111,9 +111,9 @@ fn pkg_config_writes_the_configuration_and_the_listing() {
 }
 
 /// Asserts that `pkg-config` also writes the configuration and the listing of the `kbf`
-/// package in `kbf` below the output directory: the binary and the five mode units, a
-/// dependency on `kbf-installer` of the version given, the replacement of `kbf-installer` in
-/// the deb only, and none of the installer's files.
+/// package in `kbf` below the output directory: the binary and the five mode units, no
+/// dependency (not one on `kbf-installer`), the replacement of `kbf-installer` in the deb only,
+/// and none of the installer's files.
 #[test]
 fn pkg_config_writes_the_kbf_package_beside_the_installers() {
     let dir = scratch("config-kbf");
@@ -121,10 +121,8 @@ fn pkg_config_writes_the_kbf_package_beside_the_installers() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let yaml = std::fs::read_to_string(dir.join("out/kbf/nfpm.yaml")).expect("yaml");
     assert!(yaml.contains("name: \"kbf\"\n"), "{yaml}");
-    let deb = "- \"kbf-installer (>= 0.0.0+ci)\"\n";
-    let rpm = "- \"kbf-installer >= 0.0.0+ci\"\n";
-    assert!(yaml.contains(deb), "{yaml}");
-    assert!(yaml.contains(rpm), "{yaml}");
+    assert!(!yaml.contains("depends"), "{yaml}");
+    assert!(!yaml.contains("kbf-installer (>="), "{yaml}");
     let replaces = "  deb:\n    replaces:\n      - \"kbf-installer\"\ndeb:\n";
     assert!(yaml.contains(replaces), "{yaml}");
     let plain = std::fs::read_to_string(dir.join("out/nfpm.yaml")).expect("yaml");
@@ -300,10 +298,10 @@ fn pkg_config_takes_the_version_from_the_binary_or_from_the_flag_and_not_both() 
     assert_eq!(ok.status.code(), Some(0), "{}", text(&ok.stderr));
     let yaml = std::fs::read_to_string(dir.join("of/nfpm.yaml")).expect("yaml");
     assert!(yaml.contains("version: \"0.1.0+0123456789ab\""), "{yaml}");
-    // The `kbf` package has the installer's version, and depends on it.
+    // The `kbf` package has the installer's version, and depends on nothing.
     let kbf = std::fs::read_to_string(dir.join("of/kbf/nfpm.yaml")).expect("kbf yaml");
     assert!(kbf.contains("version: \"0.1.0+0123456789ab\""), "{kbf}");
-    assert!(kbf.contains("(>= 0.1.0+0123456789ab)"), "{kbf}");
+    assert!(!kbf.contains("depends"), "{kbf}");
     let stub = run(&["--version-of", s(&dir.join("kbf-installer"))], "stub");
     assert_eq!(stub.status.code(), Some(1));
     assert!(
@@ -436,10 +434,10 @@ fn deb_of(binary: &[u8], source_ref: &str) -> Vec<u8> {
     deb_from(&control, &data)
 }
 
-/// The control file of a good `kbf` deb: the installer of its version or later is its
-/// dependency, and it replaces the installer.
+/// The control file of a good `kbf` deb: it depends on no package, and it replaces the
+/// installer.
 const KBF_CONTROL: &[u8] = b"Package: kbf\nVersion: 0.1.0\nArchitecture: amd64\n\
-                             Depends: kbf-installer (>= 0.1.0)\nReplaces: kbf-installer\n";
+                             Replaces: kbf-installer\n";
 
 /// A deb as nfpm writes the `kbf` package, holding `kbf` and the unit of every mode.
 fn kbf_deb_of(kbf: &[u8]) -> Vec<u8> {

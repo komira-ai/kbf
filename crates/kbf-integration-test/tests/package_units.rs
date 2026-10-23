@@ -5,9 +5,8 @@
 //! The packages ship these files disabled, with no rendering: kbf-installer's own unit and the
 //! proxy units (the kbf-installer package), and each mode's unit, the frontend's included (the
 //! kbf package, which runs `/usr/bin/kbf`), gated on `/etc/kbf/kbf.toml`
-//! (`ConditionPathExists=`), on `kbf-installer boot-check --kbf=/usr/bin/kbf --mode=<mode>` and
-//! on `kbf --mode=<mode> --check` (both `ExecStartPre=`; `ExecCondition=` would skip a failed
-//! check silently).
+//! (`ConditionPathExists=`), on `kbf boot-check --mode=<mode>` and on `kbf --mode=<mode> --check`
+//! (both `ExecStartPre=`; `ExecCondition=` would skip a failed check silently).
 //! The rules are held here, over the unit parser (`kbf_unitfile`) the docs check uses, each with the defect it catches, and `MUTANTS`
 //! plants one defect per rule in a copy of the real file and requires that rule to name
 //! it. `every_rule_has_a_mutant` fails when a rule is added with no mutant, so no rule
@@ -17,14 +16,16 @@
 //! - a unit missing a rule that its mode needs (`restart`, `stop`,
 //!   `delegate`, `credential`, `caps`, `swap`, `oom`, `cpuset`, user, slice,
 //!   `LimitNOFILE`), each named below;
-//! - a unit that runs a program other than `/usr/bin/kbf` and the installer's binary,
-//!   another mode than its name, a `--config` or any flag the contract does not give it;
+//! - a unit that runs a program other than `/usr/bin/kbf` and the installer's binary (the
+//!   installer's own unit and the proxy's), another mode than its name, a `--config` or any
+//!   flag the contract does not give it;
 //! - kbf-installer's own unit running anything but `run`, or gating its start on a step that is
 //!   not built; the verbs every unit and the macOS property list name exist, and the runtime
 //!   units' program is `/usr/bin/kbf`: `package_installer_verbs.rs`;
 //! - a unit that starts without its gate (`ConditionPathExists=`, the two checks, in
 //!   order), or whose gate is `ExecCondition=` or a `-`-prefixed command that ignores a
-//!   failure, or whose `boot-check` names another kbf or another mode than the unit's;
+//!   failure, or whose `boot-check` is not `kbf boot-check` for the unit's own mode, run as
+//!   root;
 //! - kbf-installer's own unit losing a hardening key or its place before the runtime units;
 //! - a kbf-deploy placeholder (`@KEY@`, `<value>`) left in a file that is not rendered;
 //! - a file added or removed without this test being told.
@@ -295,8 +296,9 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     }
 
     // Every program the unit runs is a package's own file: the kbf-installer package replaces
-    // /usr/bin/kbf-installer, the kbf package replaces /usr/bin/kbf. Only the two root checks
-    // carry a `+`; a `-` would ignore a failed gate, and `!`, `@`, `:` change the sandbox.
+    // /usr/bin/kbf-installer, the kbf package replaces /usr/bin/kbf. Only the root check
+    // (`kbf boot-check`) carries a `+`; a `-` would ignore a failed gate, and `!`, `@`, `:`
+    // change the sandbox.
     // The proxy's reload is the one `ExecReload` a unit may have, and it runs a program outside
     // the packages' files (`/bin/kill`): `proxy-reload` pins its exact text, so the generic
     // exec and reload rules skip that one key there.
@@ -308,7 +310,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         .map(|d| (d.key.as_str(), trim(&d.value)))
         .collect();
     for (key, value) in &execs {
-        let plus_ok = value.starts_with(&format!("+{INSTALLER} boot-check"));
+        let plus_ok = value.starts_with(&format!("+{KBF} boot-check"));
         if value.starts_with(['-', '!', '@', ':']) || (value.starts_with('+') && !plus_ok) {
             v("exec-prefix", format!("{key}={value}"));
         }
@@ -417,11 +419,13 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     for (key, value) in &execs {
         let mut words = value.trim_start_matches('+').split_whitespace();
         let mut after_config = false;
+        // The root check's word is `boot-check`; the rule `gate-check` pins the line it is in.
+        let verb = *key == "ExecStartPre";
         if words.next().is_some_and(|p| p.ends_with("/kbf"))
             && let Some(w) = words.find(|w| {
                 // `--config FILE` takes its value as the next word.
                 let is_value = std::mem::replace(&mut after_config, *w == "--config");
-                !w.starts_with('-') && !is_value
+                !w.starts_with('-') && !is_value && !(verb && *w == "boot-check")
             })
         {
             v(
@@ -438,10 +442,11 @@ fn violations(name: &str, text: &str) -> Vec<String> {
             format!("ExecStart= flags are {flags:?}, not {allowed:?}"),
         );
     }
-    // Catches a start without the two checks, in this order: boot-check first (root, brings the
-    // state database to the schema the kbf at /usr/bin/kbf needs, for the mode the unit runs),
-    // then the mode's own `--check`. Written as ExecStartPre=, so a failure fails the unit.
-    let boot = format!("+{INSTALLER} boot-check --kbf={KBF} --mode={mode}");
+    // Catches a start without the two checks, in this order: boot-check first (root, `kbf
+    // boot-check` brings the state database to the schema the kbf at /usr/bin/kbf needs, for the
+    // mode the unit runs), then the mode's own `--check`. Written as ExecStartPre=, so a failure
+    // fails the unit.
+    let boot = format!("+{KBF} boot-check --mode={mode}");
     let check = format!("{KBF} --mode={mode} --check");
     let mut want: Vec<&str> = vec![boot.as_str()];
     want.push(check.as_str());
@@ -898,7 +903,7 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-daemon.service",
-        "ExecStartPre=+/usr/bin/kbf-installer boot-check --kbf=/usr/bin/kbf --mode=daemon\n",
+        "ExecStartPre=+/usr/bin/kbf boot-check --mode=daemon\n",
         "",
         "gate-check",
     ),
@@ -1223,7 +1228,7 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-frontend.service",
-        "ExecStartPre=+/usr/bin/kbf-installer boot-check --kbf=/usr/bin/kbf --mode=frontend\n",
+        "ExecStartPre=+/usr/bin/kbf boot-check --mode=frontend\n",
         "",
         "gate-check",
     ),
@@ -1316,26 +1321,28 @@ fn each_planted_defect_is_reported_by_its_rule() {
 }
 
 /// Asserts that the `gate-check` rule reports each of the five mode units whose `boot-check`
-/// is not `--kbf=/usr/bin/kbf --mode=<the unit's mode>`: one with neither flag, one that names
-/// the `kbf` of the earlier layout's release tree, and one that names the mode of another unit.
+/// is not `+/usr/bin/kbf boot-check --mode=<the unit's mode>`: one with no mode, one that is
+/// the installer's `boot-check` of the earlier packages, one that names the mode of another
+/// unit and one that does not run as root.
 #[test]
-fn a_boot_check_that_names_another_kbf_or_mode_fails_the_gate_check_of_every_mode_unit() {
+fn a_boot_check_other_than_kbfs_for_the_units_mode_fails_the_gate_check_of_every_mode_unit() {
     let mut checked = 0;
     for name in FILES.iter().filter(|n| mode_of(n).is_some()) {
         let mode = mode_of(name).expect("a mode unit");
         let text = read(name);
-        let right = format!("boot-check --kbf={KBF} --mode={mode}\n");
+        let right = format!("+{KBF} boot-check --mode={mode}\n");
         assert!(text.contains(&right), "{name}: no `{right}`");
-        let tree = "/var/lib/kbf-installer/releases/current/kbf";
+        let earlier = format!("+{INSTALLER} boot-check --kbf={KBF} --mode={mode}\n");
         let other = if mode == "daemon" {
             "storage"
         } else {
             "daemon"
         };
         for wrong in [
-            "boot-check\n".to_owned(),
-            format!("boot-check --kbf={tree} --mode={mode}\n"),
-            format!("boot-check --kbf={KBF} --mode={other}\n"),
+            format!("+{KBF} boot-check\n"),
+            earlier,
+            format!("+{KBF} boot-check --mode={other}\n"),
+            format!("{KBF} boot-check --mode={mode}\n"),
         ] {
             let changed = text.replacen(&right, &wrong, 1);
             let found = violations(name, &changed);
