@@ -513,12 +513,16 @@ fn a_frontend_host_is_refused_without_asking_the_api() {
         FRONTEND_REFUSAL,
         "frontend updates need the kbf-proxy drain control, which is not built yet"
     );
+    // Asked before the installer: the frontend is refused, the other roles are not.
+    assert_eq!(health.refusal(&fe), Some(FRONTEND_REFUSAL.to_owned()));
+    assert_eq!(health.refusal(&host("st1", Role::Storage)), None);
+    assert_eq!(health.refusal(&host("dm", Role::Daemon)), None);
     assert!(server.requests().is_empty());
 }
 
 /// Catches a roll that goes past a frontend it cannot judge: a roll over every host puts the
-/// frontend first, the installer is called for it, its health is refused, and the roll fails
-/// with `swap_abandoned` and the refusal text. No host after it is installed, checked or
+/// frontend first, the roll fails at it with `swap_abandoned` and the refusal text before the
+/// installer is called, so the frontend is not changed. No host is installed, checked or
 /// asked about, and the operator API is not called.
 #[test]
 fn a_roll_with_a_frontend_fails_at_it_and_touches_no_host_after() {
@@ -541,8 +545,38 @@ fn a_roll_with_a_frontend_fails_at_it_and_touches_no_host_after() {
         "{}",
         failure.detail
     );
-    for after in ["st1", "dm", "st2"] {
-        assert!(rig.log.touching(after).is_empty(), "{after} was touched");
-    }
+    // The installer, the safe-to-stop check and the health port are not called for any host,
+    // the frontend included.
+    assert!(rig.log.events().is_empty(), "{:?}", rig.log.events());
     assert!(server.requests().is_empty());
+}
+
+/// Catches a stale install time: a host rolled to v1, then v2, then v1 again must be held to
+/// the third install, not the first. A status the v2 process sent between the second and the
+/// third install is older than the last install, and must not read as a restart.
+#[test]
+fn a_later_roll_to_the_same_version_starts_a_new_freshness_bar() {
+    let dm = host("dm", Role::Daemon);
+    let v1 = target();
+    let v2 = Version::parse("0.1.8+g0123456789ab-4").expect("version");
+    let server = routes(vec![(
+        "/v1/nodes/dm",
+        node(true, "serving", Some(INSTALL_MS + 5_000)),
+    )]);
+    let now = Arc::new(Mutex::new(INSTALL_MS));
+    let clock = Arc::clone(&now);
+    let health = NodeHealth::with_api(
+        api(&server, "nh-dm-rolls"),
+        Arc::new(move || *clock.lock().expect("lock")),
+    );
+    health.installing(&dm, &v1);
+    health.settled(&dm, &v1);
+    *now.lock().expect("lock") = INSTALL_MS + 2_000;
+    health.installing(&dm, &v2);
+    health.settled(&dm, &v2);
+    *now.lock().expect("lock") = INSTALL_MS + 10_000;
+    health.installing(&dm, &v1);
+    // The status at +5 s is the v2 process's: before the last install.
+    let why = waiting(&health.check(&dm, &v1));
+    assert!(why.contains("has not restarted"), "{why}");
 }

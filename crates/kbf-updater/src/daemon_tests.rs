@@ -241,12 +241,12 @@ fn post(socket: &std::path::Path) -> (u16, Value) {
     call(socket, "POST", "/v1/updater/rolls", &body.to_string())
 }
 
-/// Catches the not-built installer letting a roll touch a host: with the binary's own wiring,
-/// a POST is accepted (202) and the roll FAILS at the frontend's install with the reason in
-/// the failure, no later host is asked about (the fake operator API sees no request at all),
-/// and the frontend, which has no safe-to-stop, made none either.
+/// Catches a roll that goes on past a frontend: with the binary's own wiring, a POST is
+/// accepted (202) and the roll FAILS at the frontend, before its installer, with the drain
+/// control reason in the failure; no later host is asked about (the fake operator API sees no
+/// request at all), and the frontend, which has no safe-to-stop, made none either.
 #[test]
-fn the_binary_wiring_accepts_a_roll_and_fails_safe_at_the_first_install() {
+fn the_binary_wiring_accepts_a_roll_and_fails_safe_at_the_frontend() {
     let api = fake_api(vec![Some(http(
         200,
         "{\"safe\":true,\"reasons\":[],\"planned_down\":false}",
@@ -264,14 +264,13 @@ fn the_binary_wiring_accepts_a_roll_and_fails_safe_at_the_first_install() {
     let failure = roll.failure.expect("failure");
     assert_eq!(
         (failure.alias.as_str(), failure.code),
-        ("fe", ErrorCode::InstallFailed)
+        ("fe", ErrorCode::SwapAbandoned)
     );
     assert!(
-        failure.detail.contains("no host installer yet"),
+        failure.detail.contains("kbf-proxy drain control"),
         "{}",
         failure.detail
     );
-    assert!(failure.detail.contains("no host was touched"));
     let phases: Vec<_> = roll
         .hosts
         .iter()

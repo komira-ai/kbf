@@ -137,6 +137,14 @@ pub trait HealthCheck: Send + Sync {
     /// notes the time of the first attempt for the pair.
     fn installing(&self, host: &Host, target: &Version);
 
+    /// Why `host` must not be installed on at all, if the adapter could not judge it after:
+    /// asked before the installer is called for the host, and a reason fails the roll there.
+    fn refusal(&self, host: &Host) -> Option<String>;
+
+    /// `host` reached `Done` on `target`: whatever the adapter noted for the install is over,
+    /// so that a later roll (to the same version again, after another) starts its own bar.
+    fn settled(&self, host: &Host, target: &Version);
+
     fn check(&self, host: &Host, target: &Version) -> Result<Health, PortError>;
 }
 

@@ -3,9 +3,11 @@
 //!
 //! # A frontend host
 //!
-//! Not judged: [`FRONTEND_REFUSAL`]. A frontend update has to move traffic away and back
-//! at kbf-proxy's drain control, which is not built yet, so the check says
-//! [`Health::Abandoned`] and the roll fails at that host, before any host after it.
+//! Not installed on and not judged: [`FRONTEND_REFUSAL`]. A frontend update has to move
+//! traffic away and back at kbf-proxy's drain control, which is not built yet. The roll asks
+//! [`HealthCheck::refusal`] before it calls the installer for a host and fails there, with
+//! nothing changed on the host and none after it touched. [`NodeHealth::check`] says the same
+//! ([`Health::Abandoned`]) as a second line of defence.
 //!
 //! # A storage host
 //!
@@ -219,6 +221,15 @@ impl NodeHealth {
 impl HealthCheck for NodeHealth {
     fn installing(&self, host: &Host, target: &Version) {
         self.installs.note(&host.alias, target);
+    }
+
+    /// A frontend is refused before it is installed, not after (see [`FRONTEND_REFUSAL`]).
+    fn refusal(&self, host: &Host) -> Option<String> {
+        (host.role == Role::Frontend).then(|| FRONTEND_REFUSAL.to_owned())
+    }
+
+    fn settled(&self, host: &Host, _target: &Version) {
+        self.installs.forget(&host.alias);
     }
 
     /// A daemon-only host is judged as a daemon, a storage host as a storage node, and a

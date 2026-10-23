@@ -494,6 +494,11 @@ impl Updater {
                 ));
             }
             Phase::Pending | Phase::Checking => {
+                // A host the health port will not judge is not installed on either: refused
+                // before the installer, so that nothing on it changes.
+                if let Some(why) = self.ports.health.refusal(host) {
+                    return Err(Halt::Fail(ErrorCode::SwapAbandoned, why));
+                }
                 if host.role != Role::Frontend {
                     self.mark(idx, Phase::Checking, false)?;
                     self.check_safe(host)?;
@@ -511,6 +516,7 @@ impl Updater {
         }
         self.wait_healthy(host, target)?;
         self.mark(idx, Phase::Done, false)?;
+        self.ports.health.settled(host, target);
         Ok(())
     }
 

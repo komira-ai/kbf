@@ -168,3 +168,13 @@ fn the_health_port_hears_of_every_install_before_it_begins() {
         ["fe", "fe", "st1", "dm", "st2"]
     );
 }
+
+/// Catches the health port not being told that a host is done: it hears of each host once it
+/// reached `Done`, in roll order, and of no host that did not.
+#[test]
+fn the_health_port_hears_of_each_host_that_is_done() {
+    let rig = Rig::new("settled");
+    let u = rig.open();
+    assert_eq!(rig.roll(&u).state, RollState::Done);
+    assert_eq!(rig.health.settled_calls(), ["fe", "st1", "dm", "st2"]);
+}

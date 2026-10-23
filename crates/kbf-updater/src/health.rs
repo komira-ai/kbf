@@ -43,7 +43,8 @@ pub fn system_wall_clock() -> WallClock {
 ///
 /// The first call is the one that counts: an attempt that failed or was slow may still land
 /// later, and the swap it starts then began after the first call but before the last. Keyed
-/// by version too, so a roll to a newer version starts its own clock.
+/// by version too, and forgotten when the host is done ([`InstallTimes::forget`]), so that
+/// a later roll starts its own clock.
 pub struct InstallTimes {
     now: WallClock,
     at: Mutex<BTreeMap<(String, String), u64>>,
@@ -65,6 +66,15 @@ impl InstallTimes {
             .unwrap_or_else(PoisonError::into_inner)
             .entry((alias.to_owned(), target.as_str().to_owned()))
             .or_insert(now);
+    }
+
+    /// The installs for `alias` are over (the host is done): forget its times, so that the
+    /// next roll to any version, the same one again too, starts a new bar.
+    pub fn forget(&self, alias: &str) {
+        self.at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(a, _), _| a != alias);
     }
 
     /// When the installer was first called for `alias` and `target`, if this process did.
