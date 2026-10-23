@@ -22,9 +22,19 @@
 //! - **tests and development**: `--socket`, a path the updater binds itself, mode 0600, its
 //!   own user.
 //!
-//! This build has no host installer ([`crate::not_built`]): a roll is accepted and fails at
-//! the first install, with no host touched. The health check is real for storage and daemon
-//! hosts and refuses a frontend ([`crate::node_health`]).
+//! The installer is [`SshInstaller`], for storage and daemon hosts. Its settings are flags:
+//!
+//! - `--ssh-key-file`: the private key file ssh logs in with (a path; the key is never on
+//!   the command line);
+//! - `--ssh-user`: the user the host's forced command is installed for;
+//! - `--channel`: the package channel an install comes from;
+//! - optional `--ssh-connect-timeout-secs` (default 10) and `--ssh-command-timeout-secs`
+//!   (default 900, the time one install may take).
+//!
+//! The health check is real for storage and daemon hosts and refuses a frontend
+//! ([`crate::node_health`]); the roll asks it before it installs, so ssh is never run for a
+//! frontend. A Mac host is not supported: the inventory has no such role and refuses a line
+//! that names one.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -34,6 +44,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use serde_json::json;
 
@@ -42,21 +53,22 @@ use crate::health::system_wall_clock;
 use crate::inventory::Inventory;
 use crate::listener::{Activation, Listen, open};
 use crate::node_health::NodeHealth;
-use crate::not_built::NotBuiltInstaller;
 use crate::operator::OperatorApi;
 use crate::ports::SystemClock;
 use crate::record::RollStore;
 use crate::safe_http::HttpSafeToStop;
 use crate::server::{AuditSink, Recent, Server, Settings};
+use crate::ssh_installer::{Exec, SshInstaller, SystemExec};
 use crate::{Ports, Timing, Updater};
 
 pub const USAGE: &str = "usage: kbf-updater --version\n       kbf-updater --state-dir DIR \
 --inventory FILE --proxy-uid UID --operator-api http://IP:PORT --token-file FILE \
-[--operator-proxy-auth-file FILE] [--socket PATH]\n\
+--ssh-key-file FILE --ssh-user USER --channel NAME [--operator-proxy-auth-file FILE] \
+[--ssh-connect-timeout-secs N] [--ssh-command-timeout-secs N] [--socket PATH]\n\
 the socket comes from systemd socket activation (LISTEN_PID, LISTEN_FDS=1) or from --socket, \
 which is for tests and development\n";
 
-const FLAGS: [&str; 7] = [
+const FLAGS: [&str; 12] = [
     "--state-dir",
     "--inventory",
     "--socket",
@@ -64,7 +76,18 @@ const FLAGS: [&str; 7] = [
     "--operator-api",
     "--token-file",
     "--operator-proxy-auth-file",
+    "--ssh-key-file",
+    "--ssh-user",
+    "--channel",
+    "--ssh-connect-timeout-secs",
+    "--ssh-command-timeout-secs",
 ];
+
+/// How long ssh may take to connect, unless a flag says otherwise.
+const DEFAULT_CONNECT_SECS: u64 = 10;
+/// How long one call may take, unless a flag says otherwise: as long as a restart waits for
+/// an install that is in progress.
+const DEFAULT_COMMAND_SECS: u64 = 900;
 
 /// The settings of a run.
 #[derive(Clone, Debug)]
@@ -79,11 +102,18 @@ pub struct Config {
     pub token_file: PathBuf,
     /// The proxy's per-boot secret, if the frontend is behind kbf-proxy.
     pub operator_proxy_auth_file: Option<PathBuf>,
+    /// The private key file ssh logs in with.
+    pub ssh_key_file: PathBuf,
+    pub ssh_user: String,
+    /// The package channel an install comes from.
+    pub channel: String,
+    pub ssh_connect_timeout: Duration,
+    pub ssh_command_timeout: Duration,
 }
 
 /// The settings from the command line (without the program name) and from what the service
 /// manager passed. Each flag is given once, as `--flag value` or `--flag=value`; all but
-/// `--socket` and `--operator-proxy-auth-file` are required, and the socket is either
+/// `--socket`, `--operator-proxy-auth-file` and the two ssh timeouts are required, and the socket is either
 /// `--socket` or the activated descriptor.
 pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, String> {
     let mut found: BTreeMap<&str, String> = BTreeMap::new();
@@ -119,9 +149,21 @@ pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, S
         .map_err(|_| "--proxy-uid must be a number".to_owned())?;
     let operator_api = parse_operator_url(&take("--operator-api")?)?;
     let token_file = PathBuf::from(take("--token-file")?);
+    let ssh_key_file = PathBuf::from(take("--ssh-key-file")?);
+    let ssh_user = take("--ssh-user")?;
+    let channel = take("--channel")?;
     let operator_proxy_auth_file = found
         .remove("--operator-proxy-auth-file")
         .map(PathBuf::from);
+    let mut seconds = |flag: &str, default: u64| match found.remove(flag) {
+        None => Ok(Duration::from_secs(default)),
+        Some(text) => text
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .map_err(|_| format!("{flag} must be a number of seconds")),
+    };
+    let ssh_connect_timeout = seconds("--ssh-connect-timeout-secs", DEFAULT_CONNECT_SECS)?;
+    let ssh_command_timeout = seconds("--ssh-command-timeout-secs", DEFAULT_COMMAND_SECS)?;
     let listen = match (
         found.remove("--socket"),
         activation.passed_to(std::process::id())?,
@@ -149,6 +191,11 @@ pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, S
         operator_api,
         token_file,
         operator_proxy_auth_file,
+        ssh_key_file,
+        ssh_user,
+        channel,
+        ssh_connect_timeout,
+        ssh_command_timeout,
     })
 }
 
@@ -215,9 +262,31 @@ pub fn stderr_sink() -> AuditSink {
     Arc::new(|line| eprintln!("{line}"))
 }
 
-/// The ports of this build: the real safe-to-stop, health check and clock, and the refusing
-/// installer.
+/// The ports of this build: the real safe-to-stop, health check, clock and ssh installer.
 pub fn build_ports(cfg: &Config) -> Result<Ports, String> {
+    build_ports_with_exec(cfg, Arc::new(SystemExec))
+}
+
+/// [`build_ports`], running the installer's processes through `exec`. A test passes a
+/// recorder in place of the system, so that no `ssh` runs.
+pub fn build_ports_with_exec(cfg: &Config, exec: Arc<dyn Exec>) -> Result<Ports, String> {
+    // The key is read by ssh, not here; a path that is no file is told at start-up.
+    let key_ok = std::fs::metadata(&cfg.ssh_key_file).is_ok_and(|m| m.is_file());
+    if !key_ok {
+        return Err(format!(
+            "--ssh-key-file {} is not a file",
+            cfg.ssh_key_file.display()
+        ));
+    }
+    let installer = SshInstaller::new(
+        cfg.ssh_key_file.clone(),
+        &cfg.ssh_user,
+        &cfg.channel,
+        cfg.ssh_connect_timeout,
+        cfg.ssh_command_timeout,
+    )
+    .map_err(|e| e.to_string())?
+    .with_exec(exec);
     // One client, checked once: both ports read the same token files.
     let api = OperatorApi::new(
         cfg.operator_api,
@@ -226,7 +295,7 @@ pub fn build_ports(cfg: &Config) -> Result<Ports, String> {
     )?;
     Ok(Ports {
         safe: Box::new(HttpSafeToStop::from_api(api.clone())),
-        installer: Box::new(NotBuiltInstaller),
+        installer: Box::new(installer),
         health: Box::new(NodeHealth::with_api(api, system_wall_clock())),
         clock: Box::new(SystemClock::new()),
     })
