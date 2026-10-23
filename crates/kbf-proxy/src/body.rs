@@ -29,17 +29,35 @@ use crate::replay::{Failure, REPLAY_BYTES, ReplayBuffer, may_retry};
 use crate::reply::unavailable_trailers;
 use crate::route::Idle;
 use crate::slot::Permit;
+use crate::upstreams::MemberPermit;
 
 /// A response body that failed after its headers went out.
 #[derive(Debug, thiserror::Error)]
 #[error("the upstream stream failed")]
 pub(crate) struct BodyError;
 
-/// What a stream holds for its whole life: its slot permit and its upstream stream. It drops
+/// What binds a stream to a child: the slot permit of slot mode, or the permit of a member of
+/// the pool in pool mode.
+pub(crate) enum StreamPermit {
+    Slot(Permit),
+    Member(MemberPermit),
+}
+
+impl StreamPermit {
+    /// The pool member the stream is on; none in slot mode.
+    pub(crate) fn member(&self) -> Option<usize> {
+        match self {
+            Self::Slot(_) => None,
+            Self::Member(permit) => Some(permit.index()),
+        }
+    }
+}
+
+/// What a stream holds for its whole life: its permit and its upstream stream. It drops
 /// when the last of its two halves (the response body, the request pump) is done, never at
 /// the downstream END_STREAM.
 pub(crate) struct Lifetime {
-    _permit: Permit,
+    _permit: StreamPermit,
     _reservation: Reservation,
     /// Set by the response half when it gives up: the request pump resets the upstream stream.
     cancel: Notify,
@@ -49,7 +67,7 @@ pub(crate) struct Lifetime {
 
 impl Lifetime {
     pub(crate) fn new(
-        permit: Permit,
+        permit: StreamPermit,
         reservation: Reservation,
         count: Arc<StreamCount>,
     ) -> Arc<Self> {

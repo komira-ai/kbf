@@ -48,7 +48,7 @@ fn the_proxy_table_is_read_from_installer_toml() {
     ))
     .expect("valid");
     let config = loaded.proxy;
-    assert_eq!(config.upstream.base_port, 18_000);
+    assert_eq!(config.slot_table().base_port, 18_000);
     assert_eq!(config.hold_max_s, 15);
     assert_eq!(
         config.operator_token_file,
@@ -244,7 +244,7 @@ fn the_proxy_reads_the_keys_it_needs_and_ignores_the_rest_of_the_file() {
         (loaded.confirm_window_s, loaded.fetch_timeout_s),
         (300, 1200)
     );
-    assert_eq!(loaded.proxy.upstream.base_port, 18_000);
+    assert_eq!(loaded.proxy.slot_table().base_port, 18_000);
     assert_eq!(loaded.proxy.hold_max_s, 15);
     let low = format!("confirm_window_s = 10\n{PROXY}");
     let refused = usage_of(load(&file("low-window", low.as_bytes())));
@@ -1071,7 +1071,7 @@ fn the_start_migrates_the_installed_release_before_it_runs_it() {
         ),
         state_dir: state_dir.clone(),
         proxy_auth_file: config.proxy_auth_file.clone(),
-        upstream: config.upstream,
+        upstream: config.slot_table(),
         status,
         local: None,
         frontend_config: None,

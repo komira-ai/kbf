@@ -81,8 +81,9 @@ impl Readiness {
     }
 
     /// One poll of `addr`: true only for a 200 within [`POLL_TIMEOUT`]. A refused connection,
-    /// a hang, a reset, a 503 and anything that is not HTTP are all "not ready".
-    async fn ask(&self, addr: SocketAddr) -> bool {
+    /// a hang, a reset, a 503 and anything that is not HTTP are all "not ready". The poll of a
+    /// pool member asks the same question (`crate::pool_probe`).
+    pub(crate) async fn ask(&self, addr: SocketAddr) -> bool {
         let asked = async {
             let mut io = (self.connector)(addr).await.ok()?;
             io.write_all(REQUEST).await.ok()?;
