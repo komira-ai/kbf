@@ -51,6 +51,40 @@ impl Member {
     }
 }
 
+/// Runs `f` on a thread of its own, which is in no runtime, and returns its result; a panic
+/// in `f` is raised again in the caller. The test server's client (`TestDatabase`) blocks on
+/// a runtime of its own to make and to drop a database, and tokio refuses that on a thread
+/// that is running tasks.
+fn off_runtime<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    std::thread::scope(|scope| match scope.spawn(f).join() {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    })
+}
+
+/// A database of its own on the test server, with the state schema, made and dropped off
+/// the runtime (see [`off_runtime`]), so that it is also dropped when a test fails.
+struct Database(Option<TestDatabase>);
+
+impl Database {
+    fn new() -> Self {
+        Self(Some(off_runtime(test_database)))
+    }
+
+    /// The URL of the database.
+    fn url(&self) -> String {
+        self.0.as_ref().expect("held until dropped").url()
+    }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        if let Some(database) = self.0.take() {
+            off_runtime(move || drop(database));
+        }
+    }
+}
+
 /// Two frontends started over one Postgres database, a storage node they share, and a handle
 /// of the test's own on the database.
 struct Pair {
@@ -60,7 +94,7 @@ struct Pair {
     _node: Node,
     _scratch: Scratch,
     /// Declared last, so the database is dropped after the stores of this struct.
-    _database: TestDatabase,
+    _database: Database,
 }
 
 impl Pair {
@@ -68,7 +102,7 @@ impl Pair {
         let node = Node::start().await;
         let scratch = Scratch::new(name);
         let token = scratch.token_flag();
-        let database = test_database();
+        let database = Database::new();
         let storage = format!("--storage=http://{}", node.addr);
         let mut given = flags(&[&storage, &token, "--heartbeat-interval-ms=100"]).expect("flags");
         // The flag refuses a URL that carries a password, which the test server's does.

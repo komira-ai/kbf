@@ -202,9 +202,7 @@ fn a_reap_that_waits_behind_a_take_is_fenced() {
 /// and that the generation row holds the marker and nothing else.
 fn share_together(rig: &Rig) {
     thread::scope(|scope| {
-        let workers: Vec<_> = (0..8)
-            .map(|_| scope.spawn(|| share(&*rig.store)))
-            .collect();
+        let workers: Vec<_> = (0..8).map(|_| scope.spawn(|| share(&*rig.store))).collect();
         for worker in workers {
             worker.join().expect("join").expect("shares");
         }
