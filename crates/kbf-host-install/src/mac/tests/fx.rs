@@ -162,6 +162,7 @@ impl Fx {
         write(&host.daemon_plist, 0o644, b"<plist/>");
         write(&host.daemon_config, 0o644, b"mode = \"daemon\"\n");
         write(&host.gh, 0o755, b"gh");
+        write(&host.curl, 0o755, b"curl");
         write(&host.trusted_root, 0o644, b"{}");
 
         let channel_dir = dir.join("channel");
@@ -339,7 +340,7 @@ pub struct Sim {
     /// The answer to `sudo`.
     pub sudo: RefCell<Option<io::Result<Exec>>>,
     pub before: RefCell<Option<Hook>>,
-    /// GitHub: the pages of the releases listing (the JSON `gh api` prints, one text per
+    /// GitHub: the pages of the releases listing (the JSON the API prints, one text per
     /// page), and the files each release (by tag) has, by asset name.
     pub pages: RefCell<Vec<String>>,
     pub assets: RefCell<BTreeMap<String, BTreeMap<String, Vec<u8>>>>,
@@ -511,9 +512,16 @@ impl Sim {
 }
 
 impl Sim {
-    /// `gh api repos/<repo>/releases?per_page=N&page=P`: page P of the scripted listing, an
-    /// empty one past the last.
-    fn gh_api(&self, cmd: &Cmd) -> io::Result<Exec> {
+    /// `curl ... --url https://api.github.com/repos/<repo>/releases?per_page=N&page=P`: page P
+    /// of the scripted listing, an empty one past the last. "list-http" is an HTTP error
+    /// (`--fail`: exit 22), "list-rate" the answer of an exhausted rate limit (the same).
+    fn curl_list(&self, cmd: &Cmd) -> io::Result<Exec> {
+        if self.is_broken("list-http") {
+            return exec(22, "", "curl: (22) The requested URL returned error: 500");
+        }
+        if self.is_broken("list-rate") {
+            return exec(22, "", "curl: (22) The requested URL returned error: 403");
+        }
         if self.is_broken("list-timeout") {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -526,7 +534,10 @@ impl Sim {
         if self.is_broken("list-junk") {
             return exec(0, "<html>not json</html>", "");
         }
-        let page: usize = cmd.args[1]
+        let page: usize = cmd
+            .args
+            .last()
+            .expect("the url")
             .rsplit("page=")
             .next()
             .and_then(|n| n.parse().ok())
@@ -662,9 +673,7 @@ impl Runner for Sim {
                 .borrow_mut()
                 .take()
                 .unwrap_or_else(|| Err(io::Error::other("no sudo reply"))),
-            program if Path::new(program) == self.host.gh && first == Some("api") => {
-                self.gh_api(cmd)
-            }
+            program if Path::new(program) == self.host.curl => self.curl_list(cmd),
             program if Path::new(program) == self.host.gh && first == Some("release") => {
                 self.gh_download(cmd)
             }

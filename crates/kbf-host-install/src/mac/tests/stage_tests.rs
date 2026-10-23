@@ -231,6 +231,13 @@ fn unusable_pins_are_refused() {
         Err(Outcome::Refused(Refusal::KeyUntrusted))
     ));
     fs::set_permissions(&fx.host.gh, fs::Permissions::from_mode(0o755)).unwrap();
+    // The system curl that lists the releases is held to the same standard.
+    fs::set_permissions(&fx.host.curl, fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(matches!(
+        run(&fx, &sim, NEW_VERSION),
+        Err(Outcome::Refused(Refusal::KeyUntrusted))
+    ));
+    fs::set_permissions(&fx.host.curl, fs::Permissions::from_mode(0o755)).unwrap();
     fs::remove_file(&fx.host.trusted_root).unwrap();
     assert!(matches!(
         run(&fx, &sim, NEW_VERSION),
