@@ -539,7 +539,12 @@ async fn a_lease_waits_for_a_slot_that_fails_the_check_to_be_cleaned() {
     let rt = NativeRuntime::new(config(&scratch, users.pool()), Arc::clone(&cas)).expect("runtime");
     let mut sleeper = support::pool::sleeper(Some(&users.0[0]));
     let started = std::time::Instant::now();
-    let ran = support::run(&rt, &cas, 1, &Spec::argv(&["/usr/bin/true"]))
+    // The lease waits for the slot to be set aside, for the recovery thread's first pass,
+    // and for the clean and the assertion of that pass: its bound allows for them.
+    let first_pass = kbf_driver_native::slots::macos::FIRST_RECOVERY_PASS;
+    let bound =
+        support::PROMPT * 3 + support::GRACE_ALLOWANCE + support::CLEAN_ALLOWANCE + first_pass;
+    let ran = support::run_within(&rt, &cas, 1, &Spec::argv(&["/usr/bin/true"]), bound)
         .await
         .expect("the lease ran");
     let took = started.elapsed();
@@ -551,7 +556,6 @@ async fn a_lease_waits_for_a_slot_that_fails_the_check_to_be_cleaned() {
     );
     // The recovery thread's first pass over a slot is that long after the slot went dirty;
     // a lease that was not held up for it took a fraction of a second.
-    let first_pass = kbf_driver_native::slots::macos::FIRST_RECOVERY_PASS;
     assert!(
         took >= first_pass.saturating_sub(Duration::from_secs(1)),
         "the lease was not held up for the recovery ({first_pass:?}): {took:?}"

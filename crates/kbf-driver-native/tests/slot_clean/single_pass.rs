@@ -27,7 +27,7 @@ use kbf_driver_native::slots::clean::{Check, Skipped, Step};
 
 use super::{as_user, assert_root, entries, lease_planting, slots_reported};
 use crate::support::pool::{Scratch, Users, config, home_of};
-use crate::support::{MemoryCas, PROMPT, Spec, stdout};
+use crate::support::{CLEAN_ALLOWANCE, GRACE_ALLOWANCE, MemoryCas, PROMPT, Spec, stdout};
 
 /// A runtime over one pool user named after the test, optionally with a step left out of its clean.
 struct Rig {
@@ -394,9 +394,12 @@ async fn a_failed_clean_leaves_the_user_dirty_and_the_recovery_cleans_it_again()
         .filter(|e| e.file_name().to_string_lossy().starts_with(".kbf-"))
         .count();
     crate::support::pool::run("/usr/bin/chflags", &["nouchg", &stuck.to_string_lossy()]);
+    // The offer cleans the slot again (with the SIGTERM grace and the assertion) before
+    // the lease runs on it, and the lease's own end gives the same grace.
+    let bound = PROMPT * 3 + GRACE_ALLOWANCE + CLEAN_ALLOWANCE;
     let third = tokio::time::timeout(
-        PROMPT * 3,
-        crate::support::run(&rig.rt, &rig.cas, 3, &Spec::argv(&[&act, "id"])),
+        bound + Duration::from_secs(5),
+        crate::support::run_within(&rig.rt, &rig.cas, 3, &Spec::argv(&[&act, "id"]), bound),
     )
     .await
     .expect("the next offer got the slot once the file could go")

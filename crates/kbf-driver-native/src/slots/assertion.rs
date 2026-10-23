@@ -326,10 +326,11 @@ pub(crate) fn uid_processes(procs: &[Proc], uid: u32, own: &[i32]) -> Lines {
 /// write it, and its `Label` is the job's.
 pub(crate) fn own_plist(path: &str, label: &str, roots: &[&str], owner: u32) -> bool {
     use std::os::unix::fs::MetadataExt as _;
-    let Ok(real) = std::fs::canonicalize(path) else {
-        return false;
-    };
-    let Ok(meta) = std::fs::metadata(&real) else {
+    // The real path, and its metadata (a file that goes between the two is not launchd's).
+    let Some((real, meta)) = std::fs::canonicalize(path)
+        .ok()
+        .and_then(|real| std::fs::metadata(&real).ok().map(|meta| (real, meta)))
+    else {
         return false;
     };
     let under = |root: &&str| real.to_string_lossy().starts_with(*root);

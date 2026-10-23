@@ -44,8 +44,13 @@ pub(crate) fn run_bounded(
         .spawn()
         .map_err(|e| e.to_string())?;
     let (sender, receiver) = mpsc::channel();
-    drain(child.stdout.take(), 0, sender.clone());
-    drain(child.stderr.take(), 1, sender);
+    // Both are piped above, so both are there.
+    drain(
+        child.stdout.take().expect("stdout is piped"),
+        0,
+        sender.clone(),
+    );
+    drain(child.stderr.take().expect("stderr is piped"), 1, sender);
     let Some(status) = poll_exit(&mut child, until) else {
         let _ = child.kill();
         let reaped = poll_exit(&mut child, Instant::now() + kill_wait).is_some();
@@ -87,16 +92,10 @@ pub(crate) fn poll_exit(child: &mut Child, until: Instant) -> Option<ExitStatus>
 
 /// Reads `pipe` to its end on a thread of its own and sends it as stream `which`, so that
 /// a tool that prints more than a pipe holds does not block.
-fn drain<R: Read + Send + 'static>(
-    pipe: Option<R>,
-    which: usize,
-    sender: Sender<(usize, Vec<u8>)>,
-) {
+fn drain<R: Read + Send + 'static>(mut pipe: R, which: usize, sender: Sender<(usize, Vec<u8>)>) {
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut bytes);
-        }
+        let _ = pipe.read_to_end(&mut bytes);
         // The receiver is gone when the call gave up; the bytes are then not wanted.
         let _ = sender.send((which, bytes));
     });
