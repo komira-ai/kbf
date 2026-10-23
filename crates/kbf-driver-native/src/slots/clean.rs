@@ -49,8 +49,10 @@ pub enum Step {
     Bootout,
     /// C2. The uid's crontab and `at` jobs, before the kill: no job starts after it.
     Schedules,
-    /// C3. Every process of the uid, by effective or real uid, until two scans 200 ms
-    /// apart find none (at most 100 scans, within a deadline).
+    /// C3. SIGTERM to every process of the uid and a grace for them to end
+    /// ([`crate::grace`]), then SIGKILL to every process of the uid, by effective or
+    /// real uid, until two scans 200 ms apart find none (at most 100 scans, within a
+    /// deadline).
     Kill,
     /// C4. The disk images the uid attached, detached, and every mount under its folders,
     /// unmounted.

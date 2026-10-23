@@ -222,6 +222,11 @@ Options:
           
           [default: 250]
 
+      --native-term-grace-ms <NATIVE_TERM_GRACE_MS>
+          How long a lease's processes are given to end after SIGTERM before they are killed, in milliseconds; 0 kills them at once (native). A workload that cleans up when asked to end, such as Python's multiprocessing resource tracker with the shared memory it made, does so in this time; one that ignores SIGTERM is named in the lease's stderr. A slot's clean uses the same value (at most its own time limit). More than 60000 is taken as 60000. The wait comes after the action's timeout and its memory watch have ended it (neither runs during it), and on top of the time given to the kill that follows. A lease past its memory limit is killed at once. Applies on every platform
+          
+          [default: 2000]
+
       --xcode-apps <XCODE_APPS>
           The directory searched for `Xcode*.app` (native). Each Xcode whose own `xcodebuild` answers `-version`, `-license check` and `-checkFirstLaunchStatus`, and for which `xcrun --find clang` does (each within a minute, under the actions' sandbox), is ready: it is reported as an `xcode` entry, and an action that names its build runs with it as `DEVELOPER_DIR`. One that is not is listed in the node's status with why and the command that fixes it, and logged at WARN. The daemon says Hello without waiting for its first survey, which runs in the background: until it ends, each Xcode is listed as not surveyed yet and none is reported
           

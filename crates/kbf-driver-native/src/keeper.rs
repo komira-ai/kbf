@@ -76,7 +76,6 @@ impl Keeper {
     }
 
     /// The keeper's pid.
-    #[cfg(test)]
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.child.id()
