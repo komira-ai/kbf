@@ -18,6 +18,11 @@
 //!   link planted at the error log, check fails, restart refuses with exit 2, apply
 //!   replaces the link and the file it named keeps its bytes; `sshd -T` reports the
 //!   drop-in's values.
+//! - **Applied on a small scale:** `pool_users` for 3 users in a block of ids nobody
+//!   holds, with `kbf_volume` not mounted (so no home is made and apply exits 1): the
+//!   users and the group are what `dscl -read` says, a second apply makes nothing, a
+//!   user removed and a shell changed by hand are made again, check names no attribute,
+//!   and the users and the group are removed at the end.
 //! - **Asserted as read:** `macos_version`, `macos_build`, `filevault`, `xcode` and
 //!   `probe` pass before any apply; `simulator_runtimes` fails exactly when `xcrun
 //!   simctl list runtimes` lists a runtime.
@@ -140,9 +145,9 @@ fn assert_root() {
     );
 }
 
-/// The first id from `from` that no user and no group holds.
-fn free_id(from: u32) -> u32 {
-    let taken: BTreeSet<u32> = [("/Users", "UniqueID"), ("/Groups", "PrimaryGroupID")]
+/// The ids some user or group holds.
+fn taken_ids() -> BTreeSet<u32> {
+    [("/Users", "UniqueID"), ("/Groups", "PrimaryGroupID")]
         .into_iter()
         .flat_map(|(dir, attr)| {
             output("/usr/bin/dscl", &[".", "-list", dir, attr])
@@ -150,8 +155,21 @@ fn free_id(from: u32) -> u32 {
                 .filter_map(|line| line.split_whitespace().nth(1)?.parse().ok())
                 .collect::<Vec<u32>>()
         })
-        .collect();
+        .collect()
+}
+
+/// The first id from `from` that no user and no group holds.
+fn free_id(from: u32) -> u32 {
+    let taken = taken_ids();
     (from..).find(|id| !taken.contains(id)).expect("a free id")
+}
+
+/// The first id from `from` that starts `n` ids in a row that no user and no group holds.
+fn free_block(from: u32, n: u32) -> u32 {
+    let taken = taken_ids();
+    (from..)
+        .find(|&first| (first..first + n).all(|id| !taken.contains(&id)))
+        .expect("a free block")
 }
 
 /// The pinned Xcodes: one `xcode=` line for each `Xcode*.app` directory in
@@ -597,4 +615,191 @@ fn sshd_reports_the_drop_ins_values() {
     ] {
         assert!(effective.lines().any(|l| l == want), "sshd -T lacks {want}");
     }
+}
+
+/// The value of attribute `attr` of directory record `record`, from `dscl . -read`
+/// (empty when there is none): the first word after `attr:`, and after the prefix
+/// `dsAttrTypeNative:` when dscl puts one on it.
+fn dscl_value(record: &str, attr: &str) -> String {
+    let o = Command::new("/usr/bin/dscl")
+        .args([".", "-read", record, attr])
+        .output()
+        .expect("ran dscl");
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .find_map(|line| {
+            let line = line.strip_prefix("dsAttrTypeNative:").unwrap_or(line);
+            let rest = line.strip_prefix(attr)?.strip_prefix(':')?;
+            Some(
+                rest.split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// Removes the test pool's users and group when dropped, whether the test passed or not.
+struct PoolCleanup(u32);
+
+impl PoolCleanup {
+    fn remove(&self) {
+        for i in 0..self.0 {
+            let user = format!("/Users/kbf-pool-{i}");
+            Command::new("/usr/bin/dscl")
+                .args([".", "-delete", user.as_str()])
+                .output()
+                .expect("ran dscl");
+        }
+        Command::new("/usr/bin/dscl")
+            .args([".", "-delete", "/Groups/kbfpool"])
+            .output()
+            .expect("ran dscl");
+    }
+}
+
+impl Drop for PoolCleanup {
+    fn drop(&mut self) {
+        self.remove();
+    }
+}
+
+/// Catches: the batched `dscl` commands being in a form this macOS does not run (a user
+/// or an attribute missing after them), a second run that is not idempotent on a real
+/// directory, one that does not remake only what was changed by hand, and a pool check
+/// that reads a real `dscl -readall` otherwise than the fake's. Makes 3 users in a block
+/// of ids nobody holds, with the volume not mounted (so no home is made, and exit 1 is
+/// expected), and removes them.
+#[test]
+#[ignore = "needs root: run by `cargo xtask sudo-test -p kbf-mac-provision --test as_root`"]
+fn a_small_pool_is_made_by_one_batch_made_again_and_checked() {
+    let (_serial, host) = host();
+    let first = free_block(61000, 3);
+    let profile = format!("{SCRATCH}/profile-pool");
+    let text = fs::read_to_string(&host.profile).expect("read the profile");
+    fs::write(
+        &profile,
+        format!("{text}pool_users=3\npool_first_uid={first}\n"),
+    )
+    .expect("write the pool profile");
+    let _cleanup = PoolCleanup(3);
+    let apply = || {
+        prov(&[
+            "apply",
+            "--profile",
+            profile.as_str(),
+            "--keys",
+            "pool_users",
+        ])
+    };
+    let gid = first.to_string();
+    let attributes = |i: u32| {
+        let user = format!("/Users/kbf-pool-{i}");
+        let uid = (first + i).to_string();
+        let home = format!("/Volumes/kbf/home/kbf-pool-{i}");
+        [
+            ("UniqueID", uid),
+            ("PrimaryGroupID", gid.clone()),
+            ("UserShell", "/usr/bin/false".to_owned()),
+            ("NFSHomeDirectory", home),
+            ("IsHidden", "1".to_owned()),
+            ("Password", "*".to_owned()),
+        ]
+        .map(|(attr, want)| (user.clone(), attr, want))
+    };
+    let assert_pool = || {
+        assert_eq!(dscl_value("/Groups/kbfpool", "PrimaryGroupID"), gid);
+        for i in 0..3 {
+            for (user, attr, want) in attributes(i) {
+                assert_eq!(dscl_value(&user, attr), want, "{user} {attr}");
+            }
+            assert_eq!(
+                dscl_value(&format!("/Users/kbf-pool-{i}"), "AuthenticationAuthority"),
+                ""
+            );
+        }
+    };
+    let made = apply();
+    assert!(
+        made.stdout
+            .contains(&format!("CHANGE pool_users: group kbfpool, gid {gid}")),
+        "{}",
+        made.stdout
+    );
+    for i in 0..3 {
+        let change = format!("CHANGE pool_users: user kbf-pool-{i}, uid {}", first + i);
+        assert!(
+            made.stdout.contains(&change),
+            "lacks {change}\n{}",
+            made.stdout
+        );
+    }
+    assert_pool();
+
+    let again = apply();
+    let remade: Vec<&str> = again
+        .stdout
+        .lines()
+        .filter(|l| l.contains("group kbfpool") || l.contains(": user kbf-pool-"))
+        .collect();
+    assert!(remade.is_empty(), "{remade:?}");
+    assert_pool();
+
+    let checked = prov(&[
+        "check",
+        "--profile",
+        profile.as_str(),
+        "--keys",
+        "pool_users",
+    ]);
+    for attr in [
+        "UniqueID=",
+        "PrimaryGroupID=",
+        "UserShell=",
+        "NFSHomeDirectory=",
+        "IsHidden=",
+        "Password=",
+    ] {
+        assert!(!checked.stdout.contains(attr), "{attr}\n{}", checked.stdout);
+    }
+    for other in [
+        "AuthenticationAuthority",
+        "administrator",
+        "wheel",
+        "belongs to",
+    ] {
+        assert!(
+            !checked.stdout.contains(other),
+            "{other}\n{}",
+            checked.stdout
+        );
+    }
+
+    // Two users changed by hand are made again, the third left.
+    let one = "/Users/kbf-pool-1";
+    for args in [
+        vec![".", "-delete", one],
+        vec![".", "-create", "/Users/kbf-pool-2", "UserShell", "/bin/zsh"],
+    ] {
+        let o = Command::new("/usr/bin/dscl")
+            .args(&args)
+            .output()
+            .expect("ran dscl");
+        assert!(o.status.success(), "{args:?}");
+    }
+    let repaired = apply();
+    let changed: Vec<&str> = repaired
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with("CHANGE pool_users: user "))
+        .collect();
+    assert_eq!(
+        changed,
+        [
+            format!("CHANGE pool_users: user kbf-pool-1, uid {}", first + 1),
+            format!("CHANGE pool_users: user kbf-pool-2, uid {}", first + 2),
+        ]
+    );
+    assert_pool();
 }

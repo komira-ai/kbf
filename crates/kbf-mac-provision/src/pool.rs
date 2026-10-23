@@ -8,11 +8,15 @@
 
 use std::io;
 
-use crate::accounts::{DSCL, DSEDITGROUP, dscl_attr, has_authority, holder, is_member};
+use crate::accounts::DSEDITGROUP;
+use crate::directory::{Batch, Directory};
 use crate::items::{Ctx, Lines, Outcome, fail, or, pass, run};
 
 /// The pool's primary group.
 const GROUP: &str = "kbfpool";
+/// The ids of `admin` and `wheel`, whose members are those with the group as primary.
+const ADMIN_GID: u64 = 80;
+const WHEEL_GID: u64 = 0;
 const SHELL: &str = "/usr/bin/false";
 const DISKUTIL: &str = "/usr/sbin/diskutil";
 const MDUTIL: &str = "/usr/bin/mdutil";
@@ -188,14 +192,19 @@ fn attributes(c: &Ctx<'_>, u: &PoolUser) -> [(&'static str, String); 6] {
     ]
 }
 
-/// The attributes of `u` that differ: `(name, found, want)`.
-fn wrong_attributes(c: &Ctx<'_>, u: &PoolUser) -> Vec<(&'static str, String, String)> {
-    let record = format!("/Users/{}", u.name);
+/// The attributes of `u` that differ: `(name, found, want)`. A user that is not in the
+/// directory differs in all of them.
+fn wrong_attributes(
+    c: &Ctx<'_>,
+    dir: &Directory,
+    u: &PoolUser,
+) -> Vec<(&'static str, String, String)> {
+    let record = dir.user(&u.name);
     attributes(c, u)
         .into_iter()
         .filter_map(|(attr, want)| {
-            let found = dscl_attr(c, &record, attr);
-            (found != want).then_some((attr, found, want))
+            let found = record.map_or("", |r| r.get(attr));
+            (found != want).then(|| (attr, found.to_owned(), want))
         })
         .collect()
 }
@@ -206,22 +215,23 @@ fn home_want(c: &Ctx<'_>, u: &PoolUser) -> String {
 }
 
 /// What is wrong with pool user `u`, each prefixed with its name.
-fn user_problems(c: &Ctx<'_>, u: &PoolUser) -> Vec<String> {
-    let mut wrong: Vec<String> = wrong_attributes(c, u)
+fn user_problems(c: &Ctx<'_>, dir: &Directory, u: &PoolUser) -> Vec<String> {
+    let mut wrong: Vec<String> = wrong_attributes(c, dir, u)
         .into_iter()
         .map(|(attr, found, want)| format!("{attr}={}, want {want}", or(&found, "absent")))
         .collect();
-    let record = format!("/Users/{}", u.name);
-    if has_authority(c, &record) {
-        wrong.push("an AuthenticationAuthority".to_owned());
+    if let Some(record) = dir.user(&u.name) {
+        if record.has("AuthenticationAuthority") {
+            wrong.push("an AuthenticationAuthority".to_owned());
+        }
+        if dir.is_member(record, "admin", ADMIN_GID) {
+            wrong.push("an administrator".to_owned());
+        }
+        if dir.is_member(record, "wheel", WHEEL_GID) {
+            wrong.push("in wheel".to_owned());
+        }
     }
-    if is_member(c, &u.name, "admin") {
-        wrong.push("an administrator".to_owned());
-    }
-    if is_member(c, &u.name, "wheel") {
-        wrong.push("in wheel".to_owned());
-    }
-    if let Some(other) = holder(c, "/Users", "UniqueID", u.uid.into(), &u.name) {
+    if let Some(other) = dir.uid_holder(u.uid.into(), |name| name == u.name) {
         wrong.push(format!("uid {} belongs to {other}", u.uid));
     }
     let (found, want) = (c.mac.ls(&u.home), home_want(c, u));
@@ -234,18 +244,20 @@ fn user_problems(c: &Ctx<'_>, u: &PoolUser) -> Vec<String> {
         .collect()
 }
 
-/// The group's id and its holder, the homes directory and every pool user.
+/// The group's id and its holder, the homes directory and every pool user, all judged
+/// from one read of the directory.
 fn problems(c: &Ctx<'_>) -> Vec<String> {
+    let dir = Directory::read(c);
     let gid = c.profile.pool_first_uid;
     let mut wrong = Vec::new();
-    let found = dscl_attr(c, &format!("/Groups/{GROUP}"), "PrimaryGroupID");
+    let found = dir.group(GROUP).map_or("", |g| g.get("PrimaryGroupID"));
     if found != gid.to_string() {
         wrong.push(format!(
             "group {GROUP}: PrimaryGroupID={}, want {gid}",
-            or(&found, "absent")
+            or(found, "absent")
         ));
     }
-    if let Some(other) = holder(c, "/Groups", "PrimaryGroupID", gid.into(), GROUP) {
+    if let Some(other) = dir.gid_holder(gid.into(), GROUP) {
         wrong.push(format!("gid {gid} belongs to {other}"));
     }
     let homes = homes(c);
@@ -254,7 +266,7 @@ fn problems(c: &Ctx<'_>) -> Vec<String> {
         wrong.push(format!("{homes} is {found}, want {ROOT_DIR}"));
     }
     for u in pool_users(c) {
-        wrong.extend(user_problems(c, &u));
+        wrong.extend(user_problems(c, &dir, &u));
     }
     wrong
 }
@@ -263,6 +275,7 @@ fn problems(c: &Ctx<'_>) -> Vec<String> {
 /// `pool_first_uid`), shell `/usr/bin/false`, its home on the volume, hidden, and no
 /// password; none is an administrator or in `wheel`; no other user holds its uid and
 /// no other group the gid; each home is the user's, mode 700, in a directory of root's.
+/// The directory is read twice in all (users and groups), not once for each user.
 pub(crate) fn pool_users_item(c: &Ctx<'_>) -> Outcome {
     let wrong = problems(c);
     if !wrong.is_empty() {
@@ -280,28 +293,38 @@ pub(crate) fn pool_users_item(c: &Ctx<'_>) -> Outcome {
     ))
 }
 
-/// Makes the group and each pool user what [`pool_users_item`] wants: sets the
-/// attributes that differ, removes a password hash and the memberships of `admin` and
-/// `wheel`, and makes the homes, only on the mounted volume and only in a homes
-/// directory that is (or that it makes) a directory of root's, mode 755, never through a
-/// link. A user whose uid another user holds is left; nothing is changed while another
-/// group holds the gid. What is at a home's path and is not a directory is left.
+/// Makes the group and each pool user what [`pool_users_item`] wants, in one `dscl`
+/// process fed the commands: sets the attributes that differ (a user that is right is
+/// not touched, so a second run, or a run on a part of a pool, does only what is left),
+/// removes a password hash and the memberships of `admin` and `wheel`, and makes the
+/// homes, only on the mounted volume and only in a homes directory that is (or that it
+/// makes) a directory of root's, mode 755, never through a link. Nothing is changed
+/// while another group holds the gid or another user holds a uid of the block. What is
+/// at a home's path and is not a directory is left.
 pub(crate) fn fix_pool_users(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
     let gid = c.profile.pool_first_uid;
-    if let Some(other) = holder(c, "/Groups", "PrimaryGroupID", gid.into(), GROUP) {
+    let dir = Directory::read(c);
+    if let Some(other) = dir.gid_holder(gid.into(), GROUP) {
         return Err(io::Error::other(format!(
             "gid {gid} belongs to {other}: no pool user changed"
         )));
     }
+    let users = pool_users(c);
+    for u in &users {
+        let ours = |name: &str| users.iter().any(|p| p.name == name);
+        if let Some(other) = dir.uid_holder(u.uid.into(), ours) {
+            return Err(io::Error::other(format!(
+                "uid {} belongs to {other}: no pool user changed",
+                u.uid
+            )));
+        }
+    }
+    let mut batch = Batch::default();
     let group = format!("/Groups/{GROUP}");
-    if dscl_attr(c, &group, "PrimaryGroupID") != gid.to_string() {
-        run(c, DSCL, &[".", "-create", &group]);
-        run(
-            c,
-            DSCL,
-            &[".", "-create", &group, "PrimaryGroupID", &gid.to_string()],
-        );
-        run(c, DSCL, &[".", "-create", &group, "Password", "*"]);
+    if dir.group(GROUP).map_or("", |g| g.get("PrimaryGroupID")) != gid.to_string() {
+        batch.create(&group);
+        batch.set(&group, "PrimaryGroupID", &gid.to_string());
+        batch.set(&group, "Password", "*");
         out.change(c.key, format!("group {GROUP}, gid {gid}"));
     }
     let mounted = volume_mounted(c);
@@ -319,9 +342,10 @@ pub(crate) fn fix_pool_users(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
     // would land, owned by a pool uid, wherever the link points.
     let found = c.mac.ls(&homes);
     let homes_ok = mounted && found == ROOT_DIR;
-    for u in pool_users(c) {
-        fix_user(c, out, &u, homes_ok)?;
+    for u in &users {
+        fix_user(c, out, (&dir, &mut batch), u, homes_ok)?;
     }
+    batch.run(c);
     if !mounted {
         Err(unmounted(c, "no home made"))
     } else if homes_ok {
@@ -351,36 +375,36 @@ pub(crate) fn dir_of(
     Ok(())
 }
 
-fn fix_user(c: &Ctx<'_>, out: &mut Lines, u: &PoolUser, homes_ok: bool) -> io::Result<()> {
-    if let Some(other) = holder(c, "/Users", "UniqueID", u.uid.into(), &u.name) {
-        out.note(
-            c.key,
-            format!("uid {} belongs to {other}: {} left", u.uid, u.name),
-        );
-        return Ok(());
-    }
+/// Queues what pool user `u` needs on `batch`, removes it from `admin` and `wheel`, and
+/// makes its home, saying each.
+fn fix_user(
+    c: &Ctx<'_>,
+    out: &mut Lines,
+    (dir, batch): (&Directory, &mut Batch),
+    u: &PoolUser,
+    homes_ok: bool,
+) -> io::Result<()> {
     let record = format!("/Users/{}", u.name);
-    let wrong = wrong_attributes(c, u);
+    let found = dir.user(&u.name);
+    let wrong = wrong_attributes(c, dir, u);
     if !wrong.is_empty() {
-        run(c, DSCL, &[".", "-create", &record]);
+        if found.is_none() {
+            batch.create(&record);
+        }
         for (attr, _, want) in &wrong {
-            run(c, DSCL, &[".", "-create", &record, attr, want]);
+            batch.set(&record, attr, want);
         }
         out.change(c.key, format!("user {}, uid {}", u.name, u.uid));
     }
-    if has_authority(c, &record) {
-        run(
-            c,
-            DSCL,
-            &[".", "-delete", &record, "AuthenticationAuthority"],
-        );
+    if found.is_some_and(|r| r.has("AuthenticationAuthority")) {
+        batch.delete(&record, "AuthenticationAuthority");
         out.change(
             c.key,
             format!("{}: AuthenticationAuthority removed", u.name),
         );
     }
-    for group in ["admin", "wheel"] {
-        if is_member(c, &u.name, group) {
+    for (group, gid) in [("admin", ADMIN_GID), ("wheel", WHEEL_GID)] {
+        if found.is_some_and(|r| dir.is_member(r, group, gid)) {
             run(
                 c,
                 DSEDITGROUP,

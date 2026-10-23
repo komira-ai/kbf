@@ -1,0 +1,226 @@
+//! The lease-user pool at its default size, made in one `dscl` process fed its
+//! commands, and checked from one read of the directory, against a fake Mac.
+
+mod support;
+
+use support::{FakeMac, apply_keys, calls, check_keys, lines};
+
+/// The commands that make pool user `i` of a pool from `first` that is not there.
+fn make(i: u32, first: u32) -> String {
+    let (name, uid) = (format!("kbf-pool-{i}"), first + i);
+    let mut text = format!("create /Users/{name}\n");
+    for (attr, value) in [
+        ("UniqueID", uid.to_string()),
+        ("PrimaryGroupID", first.to_string()),
+        ("UserShell", "/usr/bin/false".to_owned()),
+        ("NFSHomeDirectory", format!("/Volumes/kbf/home/{name}")),
+        ("IsHidden", "1".to_owned()),
+        ("Password", "*".to_owned()),
+    ] {
+        text.push_str(&format!("create /Users/{name} {attr} {value}\n"));
+    }
+    text
+}
+
+/// A converged Mac with no pool, whose profile has `pool`.
+fn without_pool(name: &str, pool: Option<(u32, u32)>) -> FakeMac {
+    let mut mac = FakeMac::converged(name);
+    mac.remove_pool(4);
+    mac.set_pool(pool);
+    mac.log.borrow_mut().clear();
+    mac
+}
+
+/// Catches: the default pool not being 100 users from uid 61000 (and group `kbfpool`
+/// 61000), whatever `lease_uids` says: the check names the group and the last user.
+#[test]
+fn a_profile_without_pool_keys_wants_100_users_from_uid_61000() {
+    let mut mac = FakeMac::converged("batch-defaults");
+    mac.set_pool(None);
+    let r = check_keys(&mac, Some("pool_users"));
+    assert!(
+        r.text.contains(
+            "FAIL pool_users: group kbfpool: PrimaryGroupID=700, want 61000; kbf-pool-0: UniqueID=700, want 61000;"
+        ),
+        "{}",
+        r.text
+    );
+    assert!(
+        r.text.contains("kbf-pool-99: UniqueID=absent, want 61099"),
+        "{}",
+        r.text
+    );
+    assert!(!r.text.contains("kbf-pool-100"), "{}", r.text);
+    mac.converge_pool(100, 61000);
+    let r = check_keys(&mac, Some("pool_users"));
+    assert_eq!(
+        lines(&r, "PASS pool_users: 100 users kbf-pool-0..kbf-pool-99 (uids 61000-61099, group kbfpool 61000)").len(),
+        1,
+        "{}",
+        r.text
+    );
+}
+
+/// Catches: the commands fed to `dscl` in another form or order than group first and
+/// then, for each user, the record and each attribute: the batch text for 3 users.
+#[test]
+fn apply_feeds_dscl_the_commands_for_a_small_pool() {
+    let mac = without_pool("batch-text", Some((3, 800)));
+    let r = apply_keys(&mac, Some("pool_users"));
+    assert_eq!(r.failed, 0, "{}", r.text);
+    let want = format!(
+        "create /Groups/kbfpool\ncreate /Groups/kbfpool PrimaryGroupID 800\ncreate /Groups/kbfpool Password *\n{}{}{}",
+        make(0, 800),
+        make(1, 800),
+        make(2, 800)
+    );
+    assert_eq!(*mac.inputs.borrow(), [want]);
+    assert!(
+        mac.inputs.borrow()[0].contains("create /Users/kbf-pool-2 UniqueID 802\n"),
+        "uid 802"
+    );
+    assert_eq!(calls(&mac, "dscl . <stdin").len(), 1);
+    assert_eq!(check_keys(&mac, Some("pool_users")).failed, 0);
+}
+
+/// The number of `dscl` programs `apply` ran for a pool of `n` users from 61000.
+fn dscl_runs(n: u32) -> usize {
+    let mac = without_pool(&format!("batch-runs-{n}"), Some((n, 61000)));
+    let r = apply_keys(&mac, Some("pool_users"));
+    assert_eq!(r.failed, 0, "{}", r.text);
+    assert_eq!(mac.inputs.borrow().len(), 1);
+    assert_eq!(
+        mac.inputs.borrow()[0].lines().count(),
+        3 + 7 * n as usize,
+        "one group and {n} users"
+    );
+    calls(&mac, "dscl").len()
+}
+
+/// Catches: a `dscl` run for each user or attribute (26 s for 100 users measured): the
+/// default pool of 100 is made by as many `dscl` runs as a pool of 3, and one of them
+/// writes.
+#[test]
+fn the_default_pool_is_made_by_as_many_dscl_runs_as_a_pool_of_three() {
+    assert_eq!(dscl_runs(100), dscl_runs(3));
+    let mac = without_pool("batch-100", None);
+    apply_keys(&mac, Some("pool_users"));
+    assert_eq!(
+        mac.writes()
+            .iter()
+            .filter(|w| w.starts_with("dscl"))
+            .count(),
+        1
+    );
+    assert_eq!(check_keys(&mac, Some("pool_users")).failed, 0);
+    assert_eq!(
+        lines(&check_keys(&mac, Some("pool_users")), "PASS").len(),
+        1
+    );
+}
+
+/// Catches: a check that asks `dscl` or `dseditgroup` for each user: for 4 users or
+/// 100, it reads `/Users` and `/Groups` once each and runs nothing else.
+#[test]
+fn the_check_reads_the_directory_twice_whatever_the_pool_size() {
+    for (n, first) in [(4, 700), (100, 61000)] {
+        let mut mac = FakeMac::converged(&format!("batch-read-{n}"));
+        mac.set_pool(Some((n, first)));
+        mac.converge_pool(n, first);
+        mac.log.borrow_mut().clear();
+        let r = check_keys(&mac, Some("pool_users"));
+        assert_eq!(r.failed, 0, "{}", r.text);
+        assert_eq!(
+            *mac.log.borrow(),
+            [
+                "dscl . -readall /Users RecordName UniqueID PrimaryGroupID UserShell NFSHomeDirectory IsHidden Password AuthenticationAuthority",
+                "dscl . -readall /Groups RecordName PrimaryGroupID GroupMembership"
+            ],
+            "{n} users"
+        );
+    }
+}
+
+/// Catches: an apply that is not idempotent (a second one feeds `dscl` again or
+/// prints), and one that is not resumable: on a pool with two users missing, one with
+/// a wrong shell and one with a password hash, it feeds `dscl` those four users' commands
+/// and no others.
+#[test]
+fn a_second_apply_does_nothing_and_a_partial_pool_gets_only_what_is_missing() {
+    let mut mac = without_pool("batch-resume", Some((100, 61000)));
+    assert_eq!(apply_keys(&mac, Some("pool_users")).failed, 0);
+    mac.log.borrow_mut().clear();
+    let r = apply_keys(&mac, Some("pool_users"));
+    assert_eq!((r.failed, r.text.as_str()), (0, ""));
+    assert_eq!(mac.inputs.borrow().len(), 1, "no second batch");
+    assert_eq!(calls(&mac, "dscl . <stdin"), Vec::<String>::new());
+
+    let s = mac.state_mut();
+    s.remove_user("kbf-pool-10");
+    s.remove_user("kbf-pool-11");
+    s.user_attr("kbf-pool-20", "UserShell", "/bin/zsh");
+    s.user_attr("kbf-pool-30", "AuthenticationAuthority", ";ShadowHash;");
+    let r = apply_keys(&mac, Some("pool_users"));
+    assert_eq!(r.failed, 0, "{}", r.text);
+    let want = format!(
+        "{}{}create /Users/kbf-pool-20 UserShell /usr/bin/false\ndelete /Users/kbf-pool-30 AuthenticationAuthority\n",
+        make(10, 61000),
+        make(11, 61000)
+    );
+    assert_eq!(mac.inputs.borrow()[1], want);
+    assert_eq!(mac.inputs.borrow().len(), 2);
+}
+
+/// Catches: a block that overlaps a record outside the pool being made over: a user
+/// that is not one of the pool (named like one, but past `pool_users`) holds a uid of
+/// the block, and a pool user is also wrong. Nothing is written, not even for the
+/// users that are not in the way, and the failure names the user.
+#[test]
+fn a_block_that_overlaps_a_user_outside_the_pool_is_refused_whole() {
+    let mut mac = FakeMac::converged("batch-overlap");
+    let s = mac.state_mut();
+    s.user("kbf-pool-9", 702);
+    s.user_attr("kbf-pool-0", "UserShell", "/bin/zsh");
+    s.remove_user("kbf-pool-3");
+    mac.log.borrow_mut().clear();
+    let r = check_keys(&mac, Some("pool_users"));
+    assert!(
+        r.text.contains("kbf-pool-2: uid 702 belongs to kbf-pool-9"),
+        "{}",
+        r.text
+    );
+    let r = apply_keys(&mac, Some("pool_users"));
+    assert_eq!(r.failed, 1, "{}", r.text);
+    assert!(
+        r.text
+            .contains("NOTE pool_users: uid 702 belongs to kbf-pool-9: no pool user changed"),
+        "{}",
+        r.text
+    );
+    assert!(
+        r.text
+            .contains("kbf-pool-0: UserShell=/bin/zsh, want /usr/bin/false"),
+        "{}",
+        r.text
+    );
+    assert!(mac.inputs.borrow().is_empty());
+    assert!(mac.writes().is_empty(), "{:?}", mac.writes());
+}
+
+/// Catches: a `dscl` that fails or reads nothing being counted as having made the
+/// users: the item still fails and names the user that is missing.
+#[test]
+fn a_batch_that_dscl_refuses_leaves_the_item_failing() {
+    let mut mac = FakeMac::converged("batch-refused");
+    mac.state_mut().remove_user("kbf-pool-3");
+    mac.state_mut().stdin_fails = true;
+    let r = apply_keys(&mac, Some("pool_users"));
+    assert_eq!(r.failed, 1, "{}", r.text);
+    assert!(
+        r.text
+            .contains("FAIL pool_users: kbf-pool-3: UniqueID=absent, want 703"),
+        "{}",
+        r.text
+    );
+    assert_eq!(mac.inputs.borrow().len(), 1);
+}

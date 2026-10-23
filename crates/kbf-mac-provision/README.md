@@ -26,19 +26,24 @@ What the script did not do:
     root) and excluded from Time Machine (`tmutil isexcluded`). `apply` writes the
     marker, runs `mdutil -i off` and `tmutil addexclusion`; it does not make the volume
     (`diskutil apfs addVolume` is the operator's).
-  - `pool_users` (`pool_users`, 1 to 64, default 4; `pool_first_uid`, default the uid
-    after `lease_uids` and never below 600): users `kbf-pool-<i>` for `i < pool_users`
+  - `pool_users` (`pool_users`, 1 to 100, default 100; `pool_first_uid`, default 61000
+    and never below 600): users `kbf-pool-<i>` for `i < pool_users`
     with uid `pool_first_uid + i`, primary group `kbfpool` (gid `pool_first_uid`),
     shell `/usr/bin/false`, home `kbf-pool-<i>` in the `home` directory of
     `kbf_volume` (theirs, mode 700, in a directory of root's, mode 755), hidden,
     `Password` `*` and no
-    `AuthenticationAuthority`; none an administrator or in `wheel` (`dseditgroup`), and
-    no other account holding a pool uid or the gid. The pool's uids must be at most
-    65535 and outside `lease_uids`. `apply` makes them with `dscl . -create`, removes
-    `admin` and `wheel` memberships with `dseditgroup -o edit -d`, and makes the homes
-    only while the volume is mounted and its `home` directory is a directory of root's,
-    mode 755 (never through a link there); it leaves a user whose uid another holds,
-    and changes nothing while another group holds the gid.
+    `AuthenticationAuthority`; none an administrator or in `wheel` (primary group, or listed in the group's
+    `GroupMembership`), and no other account holding a pool uid or the gid. The pool's
+    uids must be at most 65535 and outside `lease_uids`. `check` reads `/Users` and
+    `/Groups` once each (`dscl . -readall`) and judges every user from that: the cost
+    does not grow with a spawn for each user. `apply` makes the group and the users in
+    one `dscl .` process fed the commands on standard input, setting only what differs
+    (a user that is right is left, so a second `apply` makes nothing, and a part of a
+    pool is finished, not remade), removes `admin` and `wheel` memberships with
+    `dseditgroup -o edit -d`, and makes the homes only while the volume is mounted and
+    its `home` directory is a directory of root's, mode 755 (never through a link
+    there). It changes nothing while another group holds the gid or an account that is
+    not one of the pool's users holds a uid of the block.
   - `daemon_user` (`role`, the default, or `root`; `kbf_cache`, an absolute path):
     with `role` nothing changes and nothing is checked. With `root` the property list
     has no `UserName` or `GroupName`, the error log is root's, the node key (`kbf_key`)

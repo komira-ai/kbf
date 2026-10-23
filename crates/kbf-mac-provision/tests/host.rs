@@ -156,3 +156,33 @@ fn mkdir_chown_rename_and_remove_act_on_the_path_itself() {
     assert!(host.remove("/f/x").is_err());
     host.pause(0);
 }
+
+/// Catches: input not reaching the program, its environment not empty, a program that
+/// fails reported as one that succeeded, and a deadlock when the program prints as it
+/// reads more than a pipe holds (the input here is 4 MiB through `cat`).
+#[test]
+fn a_program_is_fed_its_input_and_its_output_is_read_while_it_is() {
+    let host = RealHost::new("/");
+    let out = host.run_with_input("/usr/bin/env", &[], "ignored").unwrap();
+    assert_eq!((out.success, out.stdout.as_str()), (true, "LC_ALL=C\n"));
+    let input = "create /Users/x UniqueID 7\n".repeat(150_000);
+    let out = host.run_with_input("/bin/cat", &[], &input).unwrap();
+    assert!(out.success);
+    assert_eq!(out.stdout, input);
+    let out = host.run_with_input("/usr/bin/false", &[], "x").unwrap();
+    assert!(!out.success);
+    assert!(
+        host.run_with_input("/nonexistent/program", &[], "x")
+            .is_err()
+    );
+}
+
+/// Catches: a program that exits without reading its input (a broken pipe) failing
+/// the call, or killing the caller.
+#[test]
+fn a_program_that_does_not_read_its_input_is_not_an_error() {
+    let host = RealHost::new("/");
+    let input = "x".repeat(1 << 20);
+    let out = host.run_with_input("/usr/bin/true", &[], &input).unwrap();
+    assert!(out.success);
+}

@@ -69,7 +69,7 @@ pub(crate) mod probe;
 pub const MIN_UID: u32 = 600;
 
 /// The most users a pool may have, as in provisioning.
-pub const MAX_USERS: u32 = 64;
+pub const MAX_USERS: u32 = 100;
 
 /// The mode of the root of the lease directories (`--data-dir`'s `leases`) when a pool
 /// runs actions: the daemon's (root's), searchable but not listable by others, so that a
@@ -581,13 +581,20 @@ mod tests {
                 vec![user("d", 700, 700), user("e", 700, 700)],
                 PoolError::Twice(700),
             ),
-            (vec![user("f", 700, 700); 65], PoolError::Size(65)),
+            (vec![user("f", 700, 700); 101], PoolError::Size(101)),
         ];
         for (users, want) in refused {
             assert_eq!(Pool::new(users), Err(want.clone()), "{want}");
         }
         let edge = Pool::new(vec![user("g", MIN_UID, 1)]).expect("the lowest uid");
         assert_eq!(edge.users(), [user("g", 600, 1)]);
+        let full = Pool::provisioned(MAX_USERS, 61000).expect("a full pool");
+        assert_eq!(full.users().len(), 100);
+        assert_eq!(full.users()[99], user("kbf-pool-99", 61099, 61000));
+        assert_eq!(
+            Pool::provisioned(MAX_USERS + 1, 61000),
+            Err(PoolError::Size(101))
+        );
         let pool = Pool::provisioned(2, 700).expect("pool");
         assert_eq!(
             pool.users(),
