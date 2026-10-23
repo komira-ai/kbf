@@ -526,6 +526,80 @@ fn a_stopped_check_reads_no_further_probe() {
     assert_eq!(red, lines(&["ipc: not read, the check was stopped"]));
 }
 
+/// Catches a job told to be launchd's own by a line of text it can write, or by a path
+/// that only looks like a system one: the plist must really lie under the system folder
+/// (a `..` or a link out of it does not), be owned by the system's owner and not
+/// writable by others, and carry the job's label (a real system path put in a job's
+/// description does not make it that service). XML and binary plists are both read.
+#[test]
+fn a_plist_is_launchds_own_only_by_the_file_it_names() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-driver-native-plist");
+    let base = std::fs::canonicalize(dir.path()).expect("the directory");
+    let (system, outside) = (base.join("system"), base.join("outside"));
+    std::fs::create_dir_all(&system).expect("system");
+    std::fs::create_dir_all(&outside).expect("outside");
+    let owner = std::fs::metadata(&base).expect("meta").uid();
+    let roots = [format!("{}/", system.display())];
+    let roots: Vec<&str> = roots.iter().map(String::as_str).collect();
+    let xml = |label: &str| {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Label</key><string>{label}</string></dict></plist>"
+        )
+    };
+    let write = |path: &Path, text: &str, mode: u32| {
+        std::fs::write(path, text).expect("plist");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("mode");
+        path.to_string_lossy().into_owned()
+    };
+    let good = write(&system.join("a.plist"), &xml("com.apple.a"), 0o644);
+    assert!(own_plist(&good, "com.apple.a", &roots, owner));
+    // Another label: a system path in a job's description does not make it that service.
+    assert!(!own_plist(&good, "kbf.job", &roots, owner));
+    // Outside the folder, by `..` and by a link.
+    let outer = write(&outside.join("b.plist"), &xml("com.apple.b"), 0o644);
+    assert!(own_plist(
+        &outer,
+        "com.apple.b",
+        &[&format!("{}/", outside.display())],
+        owner
+    ));
+    assert!(!own_plist(&outer, "com.apple.b", &roots, owner));
+    let dotdot = format!("{}/../outside/b.plist", system.display());
+    assert!(!own_plist(&dotdot, "com.apple.b", &roots, owner));
+    symlink(&outer, system.join("link.plist")).expect("link");
+    let linked = system.join("link.plist").to_string_lossy().into_owned();
+    assert!(!own_plist(&linked, "com.apple.b", &roots, owner));
+    // Owned by another, writable by the group or others, missing, not a plist.
+    assert!(!own_plist(&good, "com.apple.a", &roots, owner + 1));
+    let group = write(&system.join("g.plist"), &xml("com.apple.g"), 0o664);
+    assert!(!own_plist(&group, "com.apple.g", &roots, owner));
+    let other = write(&system.join("o.plist"), &xml("com.apple.o"), 0o646);
+    assert!(!own_plist(&other, "com.apple.o", &roots, owner));
+    let missing = format!("{}/missing.plist", system.display());
+    assert!(!own_plist(&missing, "x", &roots, owner));
+    let junk = write(&system.join("j.plist"), "not a plist", 0o644);
+    assert!(!own_plist(&junk, "x", &roots, owner));
+    let empty = write(
+        &system.join("e.plist"),
+        "<plist version=\"1.0\"><dict/></plist>",
+        0o644,
+    );
+    assert!(!own_plist(&empty, "x", &roots, owner));
+    // A binary plist is read as well.
+    let mut dict = plist::Dictionary::new();
+    dict.insert(
+        "Label".to_owned(),
+        plist::Value::String("com.apple.bin".to_owned()),
+    );
+    let binary = system.join("bin.plist");
+    plist::Value::Dictionary(dict)
+        .to_file_binary(&binary)
+        .expect("binary");
+    let binary = binary.to_string_lossy().into_owned();
+    assert!(own_plist(&binary, "com.apple.bin", &roots, owner));
+}
+
 /// Catches a comparison that tolerates nothing launchd varies (a pid, a service loaded
 /// on demand, a service that was not loaded yet) and one that tolerates too much: the
 /// services differ from the baseline's and the user is still clean, while a foreign job,

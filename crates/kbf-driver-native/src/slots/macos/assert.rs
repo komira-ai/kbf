@@ -250,7 +250,7 @@ impl Reader for MacReader<'_> {
 ///
 /// A service whose label the baseline noted (`known`) is launchd's own and is not printed
 /// again, which keeps the read to the few services that are new. Any other is printed and
-/// is launchd's own only if its plist is ([`own_plist`]).
+/// is launchd's own only if its plist is ([`assertion::own_plist`]).
 fn jobs_of(uid: u32, known: &[String]) -> Result<Vec<Job>, String> {
     let domain_target = format!("user/{uid}");
     let Some(domain) = print(&domain_target)? else {
@@ -277,36 +277,11 @@ fn jobs_of(uid: u32, known: &[String]) -> Result<Vec<Job>, String> {
             }
             continue;
         };
-        let own = probe::plist_path(&printed).is_some_and(|path| own_plist(path, &label));
+        let own = probe::plist_path(&printed)
+            .is_some_and(|path| assertion::own_plist(path, &label, &probe::OWN_PLISTS, 0));
         jobs.push(Job { pid, label, own });
     }
     Ok(jobs)
-}
-
-/// Whether the plist the job `label` says it came from is launchd's own, judged on the
-/// file and not on a line of text a job can write: the real path lies under one of the
-/// system's folders ([`probe::is_own_plist`]), root owns the file and no one else can
-/// write it, and its `Label` is the job's.
-fn own_plist(path: &str, label: &str) -> bool {
-    let Ok(real) = std::fs::canonicalize(path) else {
-        return false;
-    };
-    let Ok(meta) = std::fs::metadata(&real) else {
-        return false;
-    };
-    if !probe::is_own_plist(&real.to_string_lossy()) || meta.uid() != 0 || meta.mode() & 0o022 != 0
-    {
-        return false;
-    }
-    plist::Value::from_file(&real)
-        .ok()
-        .and_then(|v| {
-            v.as_dictionary()?
-                .get("Label")?
-                .as_string()
-                .map(|l| l == label)
-        })
-        .unwrap_or(false)
 }
 
 /// What `launchctl print <target>` says; `None` when the target is not there

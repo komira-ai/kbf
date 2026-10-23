@@ -4,8 +4,7 @@
 //! file in the home, a file in `/private/tmp`, a cron job; and for the finer probes a
 //! changed mode, flag, ACL or attribute of the home, a stray file and a changed folder in
 //! the `/var/folders` entry, a changed directory record, a mount under the home, a crash
-//! report in a shared folder, a process with only its effective uid, and a job that
-//! writes the path of a system plist into its own description) turns the probe that looks
+//! report in a shared folder, and a process with only its effective uid) turns the probe that looks
 //! for it red, and the clean that follows removes it and the assertion is green again.
 //! A slot that fails the assertion at slot-ready is set aside and comes back once a
 //! clean passes the assertion.
@@ -816,18 +815,24 @@ async fn a_changed_directory_record_is_seen_and_green_again_when_restored() {
     };
     let (ok, said) = root(
         "/usr/bin/dscl",
-        &[".", "-create", &record, "UserShell", "/usr/bin/false"],
+        &[
+            ".",
+            "-create",
+            &record,
+            "UserShell",
+            "/bin/kbf-assert-shell",
+        ],
     );
     assert!(ok, "dscl -create: {said}");
     let red = slot.assert_everything().await.expect("ran");
     assert!(
         red.iter()
-            .any(|l| l == "record: + UserShell=/usr/bin/false"),
+            .any(|l| l == "record: + UserShell=/bin/kbf-assert-shell"),
         "{red:?}"
     );
     assert!(
         red.iter()
-            .any(|l| l.starts_with("record: - UserShell=") && !l.contains("false")),
+            .any(|l| l.starts_with("record: - UserShell=") && !l.contains("kbf-assert-shell")),
         "{red:?}"
     );
     drop(_back);
@@ -960,51 +965,4 @@ async fn a_process_with_only_the_effective_uid_of_the_user_is_seen() {
     let green = slot.assert_everything().await.expect("ran");
     assert!(green.is_empty(), "{green:?}");
     slot.release().await;
-}
-
-/// Catches a launchd probe that trusts a line of a job's own description: a job the user
-/// submitted (it has no plist) whose argument carries a line `path = /System/...` that
-/// looks like the plist line of one of launchd's own services. It is not launchd's own
-/// and is a finding, like any job the lease made.
-#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_assert"]
-#[tokio::test(flavor = "multi_thread")]
-async fn a_job_that_writes_a_system_plist_path_into_its_description_is_seen() {
-    let control = Control {
-        name: "assert-forged",
-        red: "launchd: + job ",
-        cheap: true,
-        prepare: None,
-    };
-    red_then_green(control, |user, scratch| {
-        let label = "com.apple.kbf-assert-forged";
-        let forged = "x\n\tpath = /System/Library/LaunchAgents/com.apple.cfprefsd.xpc.agent.plist";
-        let (uid, gid) = (user.uid.to_string(), user.gid.to_string());
-        let (submitted, said) = root(
-            "/bin/launchctl",
-            &[
-                "asuser",
-                &uid,
-                &scratch.as_user_binary(),
-                AS_USER_ARG,
-                &uid,
-                &gid,
-                "--",
-                "/bin/launchctl",
-                "submit",
-                "-l",
-                label,
-                "--",
-                "/usr/bin/tail",
-                "-f",
-                "/dev/null",
-                forged,
-            ],
-        );
-        let service = format!("user/{uid}/{label}");
-        wait_until(&format!("{label} is listed ({submitted}: {said})"), || {
-            root("/bin/launchctl", &["print", &service]).0
-        });
-        label.to_owned()
-    })
-    .await;
 }

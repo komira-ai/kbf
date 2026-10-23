@@ -310,6 +310,34 @@ pub(crate) fn uid_processes(procs: &[Proc], uid: u32, own: &[i32]) -> Lines {
         .collect()
 }
 
+/// Whether the plist the job `label` says it came from is launchd's own, judged on the
+/// file and not on a line of text that a job can write (a submitted job has no plist, and
+/// an argument can carry a line that looks like the plist line): the real path (links and
+/// `..` resolved) lies under one of `roots`, `owner` owns the file and no one else can
+/// write it, and its `Label` is the job's.
+pub(crate) fn own_plist(path: &str, label: &str, roots: &[&str], owner: u32) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(real) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(meta) = std::fs::metadata(&real) else {
+        return false;
+    };
+    let under = |root: &&str| real.to_string_lossy().starts_with(*root);
+    if !roots.iter().any(under) || meta.uid() != owner || meta.mode() & 0o022 != 0 {
+        return false;
+    }
+    plist::Value::from_file(&real)
+        .ok()
+        .and_then(|v| {
+            v.as_dictionary()?
+                .get("Label")?
+                .as_string()
+                .map(|l| l == label)
+        })
+        .unwrap_or(false)
+}
+
 /// One service of the uid's launchd domain, as the assertion needs it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Job {
