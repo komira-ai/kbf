@@ -19,7 +19,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use futures::StreamExt as _;
-use kbf_all_in_one::LocalDataPlane;
 use kbf_cas_conformance::{Subject, patterned};
 use kbf_front::{Cache, CacheStorage, SegmentsConfig};
 use kbf_meta::{ActionRecord, Role};
@@ -28,6 +27,7 @@ use kbf_proto::worker::segments_server::Segments;
 use kbf_server::{LocalStore, StorageListener};
 use kbf_storage::service::RemoteStorage;
 use kbf_storage::{Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError};
+use kbf_storage_and_daemon::LocalDataPlane;
 use kbf_testkit::dir::TestDir;
 use kbf_transfer::{Cas as _, CasError, digest_of, label};
 use kbf_types::Digest;

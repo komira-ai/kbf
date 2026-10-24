@@ -1,7 +1,7 @@
 //! What a farm of nodes running the container driver over the stand-in `crun` needs on
 //! disk: the stand-in and the image it names, unpacked ([`crun`]), the planted cgroup tree
 //! ([`cgroup_tree`]) and id files ([`id_files`]), and the check of what is on a node's
-//! disk ([`files_holding`]). Shared by this crate's farm, kbf-all-in-one's tests/binary.rs
+//! disk ([`files_holding`]). Shared by this crate's farm, kbf-storage-and-daemon's tests/binary.rs
 //! and kbf-cli's tests (their `support/node.rs` re-exports it).
 
 use std::path::{Path, PathBuf};

@@ -1340,40 +1340,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kbf-all-in-one"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "clap",
- "futures",
- "kbf-cas-conformance",
- "kbf-daemon",
- "kbf-driver-container",
- "kbf-front",
- "kbf-harness",
- "kbf-meta",
- "kbf-node",
- "kbf-objstore",
- "kbf-outputs",
- "kbf-proto",
- "kbf-segments",
- "kbf-server",
- "kbf-storage",
- "kbf-testkit",
- "kbf-threads",
- "kbf-transfer",
- "kbf-types",
- "libc",
- "prost",
- "rcgen",
- "rustix",
- "tokio",
- "tonic",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "kbf-auth"
 version = "0.1.0"
 dependencies = [
@@ -1473,7 +1439,6 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
- "kbf-all-in-one",
  "kbf-ca",
  "kbf-cas-conformance",
  "kbf-daemon",
@@ -1490,6 +1455,7 @@ dependencies = [
  "kbf-setup",
  "kbf-state",
  "kbf-storage",
+ "kbf-storage-and-daemon",
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
@@ -2542,6 +2508,40 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+]
+
+[[package]]
+name = "kbf-storage-and-daemon"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "futures",
+ "kbf-cas-conformance",
+ "kbf-daemon",
+ "kbf-driver-container",
+ "kbf-front",
+ "kbf-harness",
+ "kbf-meta",
+ "kbf-node",
+ "kbf-objstore",
+ "kbf-outputs",
+ "kbf-proto",
+ "kbf-segments",
+ "kbf-server",
+ "kbf-storage",
+ "kbf-testkit",
+ "kbf-threads",
+ "kbf-transfer",
+ "kbf-types",
+ "libc",
+ "prost",
+ "rcgen",
+ "rustix",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -7,8 +7,8 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# The one binary: `kbf <mode>` over the libraries of kbf-node and kbf-all-in-one
-# (docs/design/cluster.md, sections 1 and 5.1). Like kbf-all-in-one it links both the
+# The one binary: `kbf <mode>` over the libraries of kbf-node and kbf-storage-and-daemon
+# (docs/design/cluster.md, sections 1 and 5.1). Like kbf-storage-and-daemon it links both the
 # server and the node library (the version stamp is kbf-server's), so it is listed in
 # `JOINERS` in crates/kbf-integration-test/tests/layering.rs.
 [[bin]]
@@ -34,7 +34,7 @@ test = false
 
 [dependencies]
 clap.workspace = true
-kbf-all-in-one.workspace = true
+kbf-storage-and-daemon.workspace = true
 kbf-node.workspace = true
 kbf-server.workspace = true
 # The startup self-checks (src/preflight): the role a certificate names, and a
@@ -122,7 +122,7 @@ kbf-front.workspace = true
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 kbf-driver-container.workspace = true
 # The farm of real `kbf` processes the rehearsal (tests/rehearsal_in_a_box.rs) drives, and
-# the stand-in `podman`'s store (tests/support, through kbf-all-in-one's node.rs).
+# the stand-in `podman`'s store (tests/support, through kbf-storage-and-daemon's node.rs).
 kbf-harness.workspace = true
 
 [lints]

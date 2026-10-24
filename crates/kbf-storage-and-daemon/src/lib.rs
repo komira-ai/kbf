@@ -1,4 +1,6 @@
-//! `kbf-all-in-one`: the library behind `kbf all-in-one` (the `kbf` binary, crates/kbf-cli),
+//! `kbf-storage-and-daemon`: the library behind `kbf storage-and-daemon` (the `kbf` binary,
+//! crates/kbf-cli), the storage node and a worker daemon in one process. It still holds
+//! the code of `kbf all-in-one`, a refused mode that goes away with it; that mode was
 //! the farm server and a worker daemon in one process, for a one-node
 //! Linux farm (the README says what it does today and what it does not do yet; the
 //! design is kbf#657). The daemon's blobs move through calls into

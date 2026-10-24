@@ -14,7 +14,6 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use futures::StreamExt as _;
-use kbf_all_in_one::LocalDataPlane;
 use kbf_daemon::cache::{Cache, CacheConfig};
 use kbf_front::{CacheStorage, SegmentsConfig};
 use kbf_meta::{ActionRecord, Role};
@@ -22,6 +21,7 @@ use kbf_proto::reapi::{ActionResult, Directory, FileNode};
 use kbf_proto::worker::segments_server::Segments;
 use kbf_server::LocalStore;
 use kbf_storage::{Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError};
+use kbf_storage_and_daemon::LocalDataPlane;
 use kbf_testkit::dir::TestDir;
 use kbf_transfer::{Cas as _, CasError, label, proto_digest};
 use kbf_types::Digest;

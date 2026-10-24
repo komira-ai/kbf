@@ -1,7 +1,13 @@
-# kbf-all-in-one
+# kbf-storage-and-daemon
 
-The library behind `kbf all-in-one` (the `kbf` binary, `crates/kbf-cli`; this crate has no
-binary of its own): the farm server and a worker daemon in one process, for a one-node
+The library behind `kbf storage-and-daemon` (the `kbf` binary, `crates/kbf-cli`; this crate
+has no binary of its own), the mode every storage node runs: the storage node and a worker
+daemon in one process over `LocalDataPlane`. The sections below start with the older
+`kbf all-in-one` code that this crate still holds; that mode is refused by the binary and
+its code is deleted with the mode, leaving `storage_and_daemon.rs`, `plane.rs`,
+`intake.rs`, `one_cache.rs` and the run helpers.
+
+`kbf all-in-one` was the farm server and a worker daemon in one process, for a one-node
 Linux farm. The daemon's blobs move through calls into the server's cache instead of over the network;
 everything else is what `kbf-server` and `kbf-daemon` do on one host today. The design
 is in kbf#657.

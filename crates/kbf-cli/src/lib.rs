@@ -24,7 +24,7 @@
 //!   refuses a start with no `--state-store` (or `state-store` key), `--check` included.
 //! - `storage-and-daemon`: the storage node and the daemon in one process, the
 //!   daemon reading and writing the node's storage in-process
-//!   ([`kbf_all_in_one::storage_and_daemon`]). Takes `storage`'s flags and
+//!   ([`kbf_storage_and_daemon::storage_and_daemon`]). Takes `storage`'s flags and
 //!   `kbf-daemon`'s.
 //!
 //! **A start with no mode flags reads `kbf.toml`** ([`node`]): `kbf --mode=storage`,
@@ -110,11 +110,11 @@ pub enum Invocation {
     /// `kbf daemon`.
     Daemon(Box<kbf_node::Cli>),
     /// `kbf all-in-one`.
-    AllInOne(Box<kbf_all_in_one::cli::Flags>),
+    AllInOne(Box<kbf_storage_and_daemon::cli::Flags>),
     /// `kbf storage`.
     Storage(Box<kbf_server::storage_node::StorageFlags>),
     /// `kbf storage-and-daemon`.
-    StorageAndDaemon(Box<kbf_all_in_one::storage_and_daemon::Flags>),
+    StorageAndDaemon(Box<kbf_storage_and_daemon::storage_and_daemon::Flags>),
     /// `kbf frontend`.
     Frontend(Box<kbf_server::frontend::FrontendFlags>),
     /// A start that reads `kbf.toml` ([`node`]): `--mode` (or the file's mode) with no
@@ -132,9 +132,9 @@ fn longs(cmd: &Command) -> BTreeSet<String> {
 fn own_command(entry: Entry) -> Command {
     match entry {
         Entry::Daemon => kbf_node::Cli::command(),
-        Entry::AllInOne => kbf_all_in_one::cli::command(),
+        Entry::AllInOne => kbf_storage_and_daemon::cli::command(),
         Entry::Storage => kbf_server::storage_node::command(),
-        Entry::StorageAndDaemon => kbf_all_in_one::storage_and_daemon::command(),
+        Entry::StorageAndDaemon => kbf_storage_and_daemon::storage_and_daemon::command(),
         Entry::Frontend => kbf_server::frontend::command(),
     }
 }
@@ -762,9 +762,9 @@ fn parse_invocation(args: &[OsString]) -> Result<Invocation, clap::Error> {
         }
         Entry::AllInOne => {
             refuse_foreign_flags(mode.name, m)?;
-            Ok(Invocation::AllInOne(Box::new(kbf_all_in_one::cli::parse(
-                m,
-            )?)))
+            Ok(Invocation::AllInOne(Box::new(
+                kbf_storage_and_daemon::cli::parse(m)?,
+            )))
         }
         Entry::Storage => {
             refuse_foreign_flags(mode.name, m)?;
@@ -775,7 +775,7 @@ fn parse_invocation(args: &[OsString]) -> Result<Invocation, clap::Error> {
         Entry::StorageAndDaemon => {
             refuse_foreign_flags(mode.name, m)?;
             Ok(Invocation::StorageAndDaemon(Box::new(
-                kbf_all_in_one::storage_and_daemon::parse(m)?,
+                kbf_storage_and_daemon::storage_and_daemon::parse(m)?,
             )))
         }
         Entry::Frontend => {
@@ -846,9 +846,11 @@ fn start(invocation: &Invocation, config: &std::path::Path) -> ExitCode {
 pub fn run(invocation: &Invocation) -> ExitCode {
     match invocation {
         Invocation::Daemon(cli) => kbf_node::run(cli),
-        Invocation::AllInOne(flags) => kbf_all_in_one::run(flags),
+        Invocation::AllInOne(flags) => kbf_storage_and_daemon::run(flags),
         Invocation::Storage(flags) => kbf_server::storage_node::run(flags),
-        Invocation::StorageAndDaemon(flags) => kbf_all_in_one::storage_and_daemon::run(flags),
+        Invocation::StorageAndDaemon(flags) => {
+            kbf_storage_and_daemon::storage_and_daemon::run(flags)
+        }
         Invocation::Frontend(flags) => kbf_server::frontend::run(flags),
         Invocation::Registered(start) => node::run(start),
     }

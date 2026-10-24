@@ -16,10 +16,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use clap::Parser as _;
-use kbf_all_in_one::LocalDataPlane;
 use kbf_daemon::cpu_pool::CpuPool;
 use kbf_driver_container::tree::{OutputLimits, collect};
 use kbf_proto::reapi::ActionResult;
+use kbf_storage_and_daemon::LocalDataPlane;
 use kbf_testkit::dir::TestDir;
 use kbf_transfer::Cas;
 use kbf_types::LeaseId;
