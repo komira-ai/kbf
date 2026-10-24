@@ -282,3 +282,23 @@ fn file_errors_are_reported() {
     assert!(!remove(Path::new("kbf-mac-session-no-such-file")).unwrap());
     assert!(sync_parent(Path::new("kbf-mac-session-no-such-file")).is_ok());
 }
+
+/// Catches: a password file owned by anyone but the expected owner (root on a Mac)
+/// being trusted, so an unprivileged user could choose the VM user's login password;
+/// and the error not naming whose it is.
+#[test]
+fn the_vm_password_must_be_owned_by_the_expected_uid() {
+    let dir = scratch("vm-password-owner");
+    let paths = SessionPaths::under(&dir);
+    let pw = "ab".repeat(32);
+    std::fs::write(&paths.vm_password, &pw).unwrap();
+    std::fs::set_permissions(&paths.vm_password, std::fs::Permissions::from_mode(0o400)).unwrap();
+    assert_eq!(read_vm_password(&paths), Ok(pw));
+    let other = SessionPaths {
+        vm_password_owner: paths.vm_password_owner + 1,
+        ..paths
+    };
+    let error = read_vm_password(&other).unwrap_err();
+    assert!(error.contains("is owned by uid"), "{error}");
+    assert!(error.contains("vm-user-password"), "{error}");
+}

@@ -10,6 +10,8 @@ use kbf_types::LeaseId;
 
 const RESTART: &str = "/bin/launchctl reboot userspace";
 const VM: &str = "kbf-vm";
+/// What provisioning wrote as the VM user's password: 64 lowercase hex digits.
+const PW: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// The VM user's uid: an ordinary one above the rig's lease range (`me()` to `me()+3`).
 fn vm_uid() -> u32 {
@@ -33,10 +35,20 @@ fn add_account(rig: &Rig, uid: u32, gid: u32) {
     );
 }
 
+/// Makes the VM user's password file as provisioning does: `text`, mode 0400.
+fn put_password(rig: &Rig, text: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = rig.dir.join("vm-user-password");
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, text).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+}
+
 /// A rig on a Mac with the VM user `kbf-vm` and its account, its boot reset done, the
 /// fake host logging the intent record at every command.
 fn vm_rig(name: &str) -> Rig {
     let rig = rig_vm_with(name, range(), None, Some(VM));
+    put_password(&rig, PW);
     rig.helper.boot_reset(&[]).unwrap();
     rig.host.state().intent = Some(rig.dir.join("session-intent"));
     add_account(&rig, vm_uid(), my_gid());
@@ -327,7 +339,7 @@ fn role_kill_uid_ends_the_vm_user_s_processes_and_no_one_else_s() {
 /// would rest at the login window and VMs could not start), writes the record before
 /// the switch is made, restarts first, restarts a Mac already resting at the VM user
 /// with its session up (killing its VMs), or writes a `/etc/kcpassword` that is not
-/// the VM user's fresh password.
+/// the password in the provisioning file, or resets a password.
 #[test]
 fn session_idle_rests_at_the_vm_user_in_the_order_of_session_login() {
     let rig = vm_rig("idle-vm");
@@ -338,7 +350,6 @@ fn session_idle_rests_at_the_vm_user_in_the_order_of_session_login() {
         [
             "account kbf-vm".to_owned(),
             "command /usr/bin/fdesetup isactive (no intent)".to_owned(),
-            "reset_password kbf-vm".to_owned(),
             format!(
                 "command /usr/bin/defaults write {domain} autoLoginUser -string kbf-vm (no intent)"
             ),
@@ -348,7 +359,7 @@ fn session_idle_rests_at_the_vm_user_in_the_order_of_session_login() {
     assert_eq!(intent(&rig), Some(Intent::Vm));
     assert_eq!(
         std::fs::read(rig.dir.join("kcpassword")).unwrap(),
-        kcpassword(b"pw-kbf-vm")
+        kcpassword(PW.as_bytes())
     );
     // Repeating it before the session is up sets it again; clearing never happens.
     auto_login_is(&rig, VM);
@@ -408,7 +419,7 @@ fn whole_machine_leases_still_switch_through_the_vm_user() {
     assert_eq!(intent(&rig), Some(Intent::Vm));
     assert_eq!(
         std::fs::read(rig.dir.join("kcpassword")).unwrap(),
-        kcpassword(b"pw-kbf-vm")
+        kcpassword(PW.as_bytes())
     );
     assert!(
         log(&rig)
@@ -456,7 +467,6 @@ fn session_idle_at_the_vm_user_stops_at_the_first_step_that_fails() {
     );
     let error = rig.helper.session_idle().unwrap_err();
     assert!(error.contains("FileVault is on"), "{error}");
-    assert!(!log(&rig).iter().any(|call| call.contains("reset_password")));
     assert_eq!(intent(&rig), lease);
     rig.host.state().answers.clear();
 
@@ -473,11 +483,13 @@ fn session_idle_at_the_vm_user_stops_at_the_first_step_that_fails() {
     // failing alone.
     let blocker = |name: &str| std::fs::create_dir_all(rig.dir.join(name).join("inside")).unwrap();
     let unblock = |name: &str| std::fs::remove_dir_all(rig.dir.join(name)).unwrap();
-    rig.host.state().fail.insert("reset_password");
+    let file = rig.dir.join("vm-user-password");
+    std::fs::rename(&file, rig.dir.join("moved")).unwrap();
     let error = rig.helper.session_idle().unwrap_err();
-    assert!(error.contains("setting the password of kbf-vm"), "{error}");
+    assert!(error.contains(&file.display().to_string()), "{error}");
+    assert!(error.contains("run kbf-mac-provision apply"), "{error}");
     untouched(&rig);
-    rig.host.state().fail.clear();
+    std::fs::rename(rig.dir.join("moved"), &file).unwrap();
     blocker("kcpassword.new");
     let error = rig.helper.session_idle().unwrap_err();
     assert!(error.contains("kcpassword"), "{error}");
@@ -673,4 +685,91 @@ fn the_boot_reset_keeps_only_a_rest_at_a_usable_vm_user() {
     let (booted, cleared) = reset(&rig, "vm-noaccount", Some(VM));
     assert!(cleared);
     assert_eq!(intent(&booted), None);
+}
+
+/// Catches: `session-idle` that makes up a password for the VM user (a reset strands
+/// its login keychain, and provisioning's own check then fails), writes
+/// `/etc/kcpassword` from anything but the provisioning file's password, or rewrites
+/// `/etc/kcpassword` when it already holds that password.
+#[test]
+fn session_idle_uses_the_provisioned_password_and_never_resets_one() {
+    let rig = vm_rig("idle-pw");
+    rig.helper.session_idle().unwrap();
+    let kc = rig.dir.join("kcpassword");
+    assert_eq!(std::fs::read(&kc).unwrap(), kcpassword(PW.as_bytes()));
+    assert!(!log(&rig).iter().any(|call| call.contains("reset_password")));
+    // Already right: left alone (its inode is the same file).
+    let before = std::fs::metadata(&kc).unwrap();
+    rig.helper.session_idle().unwrap();
+    let after = std::fs::metadata(&kc).unwrap();
+    use std::os::unix::fs::MetadataExt as _;
+    assert_eq!(before.ino(), after.ino());
+    // A different one: rewritten.
+    std::fs::write(&kc, b"stale").unwrap();
+    rig.helper.session_idle().unwrap();
+    assert_eq!(std::fs::read(&kc).unwrap(), kcpassword(PW.as_bytes()));
+    assert!(!log(&rig).iter().any(|call| call.contains("reset_password")));
+    // A new password in the file (provisioning replaced it) is the one written.
+    let other = "f".repeat(64);
+    put_password(&rig, &other);
+    rig.helper.session_idle().unwrap();
+    assert_eq!(std::fs::read(&kc).unwrap(), kcpassword(other.as_bytes()));
+}
+
+/// Catches: a password file `session-idle` accepts though provisioning would not (not
+/// 64 lowercase hex, a trailing newline, uppercase, a link, a directory, the wrong
+/// mode, the wrong owner), or an error that does not name the file and the fix, or one
+/// that still writes `/etc/kcpassword`, `autoLoginUser` or the record.
+#[test]
+fn session_idle_refuses_a_missing_or_invalid_password_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let rig = vm_rig("idle-pw-bad");
+    let file = rig.dir.join("vm-user-password");
+    let named = file.display().to_string();
+    let refused = |rig: &Rig| {
+        let error = rig.helper.session_idle().unwrap_err();
+        assert!(error.contains(&named), "{error}");
+        assert!(error.contains("run kbf-mac-provision apply"), "{error}");
+        let calls = log(rig);
+        assert!(
+            calls
+                .iter()
+                .all(|call| !call.contains("defaults write") && !call.contains(RESTART)),
+            "{calls:#?}"
+        );
+        assert!(!rig.dir.join("kcpassword").exists());
+        assert_eq!(intent(rig), None);
+    };
+    std::fs::remove_file(&file).unwrap();
+    refused(&rig);
+    for text in [
+        "",
+        "abc",
+        &format!("{PW}\n"),
+        &PW.to_uppercase(),
+        &format!("{PW}0"),
+        &PW[1..],
+        &format!("g{}", &PW[1..]),
+    ] {
+        put_password(&rig, text);
+        refused(&rig);
+    }
+    // A link to a good file is never followed.
+    let good = rig.dir.join("good");
+    std::fs::write(&good, PW).unwrap();
+    std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o400)).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(&good, &file).unwrap();
+    refused(&rig);
+    std::fs::remove_file(&file).unwrap();
+    // A directory.
+    std::fs::create_dir(&file).unwrap();
+    refused(&rig);
+    std::fs::remove_dir(&file).unwrap();
+    // Group- or other-readable, or writable.
+    for mode in [0o600, 0o440, 0o404, 0o444] {
+        put_password(&rig, PW);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+        refused(&rig);
+    }
 }

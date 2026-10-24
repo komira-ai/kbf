@@ -133,6 +133,8 @@ pub fn prepare(
         session: SessionPaths {
             intent: args.state_dir.join("session-intent"),
             kcpassword: args.kcpassword.clone(),
+            vm_password: args.state_dir.join(crate::autologin::VM_PASSWORD_FILE),
+            vm_password_owner: 0,
             loginwindow: args.loginwindow.clone(),
         },
         vm_user: args.vm_user.clone(),

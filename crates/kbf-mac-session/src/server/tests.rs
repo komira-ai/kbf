@@ -1,5 +1,6 @@
 use std::io::Read as _;
 use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -94,6 +95,12 @@ fn served_vm(name: &str, check: Arc<Scripted>, reset: bool, vm_user: Option<&str
     let dir = scratch(&format!("server-{name}"));
     std::fs::create_dir(dir.join("Users")).unwrap();
     let host = FakeHost::default();
+    if vm_user.is_some() {
+        // What provisioning wrote: 64 hex digits, mode 0400.
+        let file = dir.join("vm-user-password");
+        std::fs::write(&file, "ab".repeat(32)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+    }
     let settings = Settings {
         range: UidRange::new(me(), me() + 1).unwrap(),
         gid: my_gid(),

@@ -8,9 +8,11 @@
 //! - `session-idle` clears `autoLoginUser` and `/etc/kcpassword`, removes the intent
 //!   record, and asks for the same restart: the Mac rests at the login window. With a
 //!   VM user configured (`--vm-user`) it rests there instead: it needs the VM user's
-//!   account and FileVault off, writes the intent record `vm`, gives the VM user a
-//!   fresh random password, writes `/etc/kcpassword` for it, sets `autoLoginUser` to it,
-//!   and last asks for the restart (the order of `session-login`). It switches a lease's
+//!   account and FileVault off, reads the VM user's password from the file
+//!   `kbf-mac-provision` wrote (it never makes or resets one, which would strand the
+//!   account's login keychain; a missing or invalid file fails, naming the path),
+//!   writes `/etc/kcpassword` for it if that differs, sets `autoLoginUser` to it, then
+//!   the intent record `vm`, and last asks for the restart. It switches a lease's
 //!   session away too, as `session-idle` always has.
 //! - `session-login <lease>` switches away from the VM user's session, the one session
 //!   a lease may replace. That no VM runs then is the daemon's rule (it drains first).
@@ -40,7 +42,9 @@ use kbf_types::LeaseId;
 
 use super::Helper;
 use super::role::{Gui, Role};
-use crate::autologin::{self, Intent, read_intent, remove, write_intent, write_kcpassword};
+use crate::autologin::{
+    self, Intent, ensure_kcpassword, read_intent, remove, write_intent, write_kcpassword,
+};
 use crate::lease::{parse_lease, user_name};
 use crate::ledger::Ledger;
 
@@ -134,11 +138,10 @@ impl Helper {
         if self.resting_at_vm_with_gui(&role)? {
             return Ok(None);
         }
-        let password = self
-            .host
-            .reset_password(role.name)
-            .map_err(|why| format!("setting the password of {}: {why}", role.name))?;
-        write_kcpassword(&paths.kcpassword, password.as_bytes())
+        // The VM user's password is set once, by `kbf-mac-provision`, and never changed
+        // here: a reset would strand its login keychain.
+        let password = autologin::read_vm_password(paths)?;
+        ensure_kcpassword(&paths.kcpassword, password.as_bytes())
             .map_err(|why| format!("writing {}: {why}", paths.kcpassword.display()))?;
         autologin::set_auto_login(self.host.as_ref(), paths, role.name)?;
         write_intent(&paths.intent, Intent::Vm)
