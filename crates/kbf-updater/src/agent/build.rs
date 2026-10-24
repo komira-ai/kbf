@@ -24,6 +24,29 @@ use crate::operator::OperatorApi;
 use crate::ports::{Drain, Health, HealthCheck, PortError, SystemClock};
 use crate::version::Version;
 
+/// A host whose node is never drained (a frontend host that runs no daemon): the frontend's own
+/// drain is the helper's, and there is no node to give back.
+pub struct NoDrain;
+
+impl Drain for NoDrain {
+    fn drain(&self, _host: &Host, _deadline: Duration) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    fn leases(&self, _host: &Host) -> Result<usize, PortError> {
+        Ok(0)
+    }
+
+    fn undrain(&self, _host: &Host) -> Result<(), PortError> {
+        Ok(())
+    }
+}
+
+/// [`NoDrain`], as a port.
+pub fn no_drain() -> Arc<dyn Drain> {
+    Arc::new(NoDrain)
+}
+
 /// The ports of an agent that cannot reach what it needs of the frontend: it refuses every
 /// update before it fetches anything, and drains nothing. The text says why.
 pub struct NoCredential(pub &'static str);

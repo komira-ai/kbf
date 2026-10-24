@@ -10,8 +10,8 @@ use kbf_testkit::dir::TestDir;
 use kbf_types::HostRole;
 
 use super::build::{
-    NO_CREDENTIAL, NoCredential, NoDrain, build, drain_for, frontend_ports, identity_of_files,
-    no_drain, run_agent, run_config, unix_now,
+    NO_CREDENTIAL, NoCredential, build, drain_for, frontend_ports, identity_of_files, run_agent,
+    run_config, unix_now,
 };
 use super::coordinator::{Endpoint, TlsFiles};
 use super::flags::{Config, NodeApi, Timing};
