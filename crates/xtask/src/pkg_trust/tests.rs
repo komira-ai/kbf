@@ -196,6 +196,21 @@ fn an_out_path_that_is_not_a_directory_is_refused_and_left_alone() {
 }
 
 #[test]
+fn an_out_path_that_cannot_be_inspected_is_refused_with_the_os_error() {
+    // Catches: a stat failure other than "not there" (here a parent that is a file) being
+    // treated as an absent directory and then failing later in create_dir_all, or being
+    // swallowed.
+    let dir = scratch("unstatable");
+    let (gh, root) = inputs(&dir, b"gh", ROOT);
+    let parent = dir.join("file");
+    std::fs::write(&parent, b"keep").expect("file");
+    let out = parent.join("trust");
+    let p = refused(write(&gh, &root, "refs/heads/main", &out));
+    assert!(p[0].starts_with(&format!("{}: ", out.display())), "{p:?}");
+    assert_eq!(std::fs::read(&parent).expect("kept"), b"keep");
+}
+
+#[test]
 fn conf_ref_reads_back_only_what_conf_writes() {
     // Catches: pkg-asset accepting a conf with more than the one line it generates (a
     // second key, a comment, CRLF, no final newline, an empty value), which the
