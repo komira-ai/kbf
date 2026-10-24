@@ -186,3 +186,16 @@ fn a_program_that_does_not_read_its_input_is_not_an_error() {
     let out = host.run_with_input("/usr/bin/true", &[], &input).unwrap();
     assert!(out.success);
 }
+
+/// Catches: the random source read under the test root instead of the machine's
+/// (a root of a scratch directory has no `/dev/urandom`), too few bytes, or the same
+/// bytes twice (a password made from them would be guessable).
+#[test]
+fn random_bytes_come_from_the_machines_source_whatever_the_root() {
+    let dir = scratch("random");
+    let host = RealHost::new(dir.to_str().unwrap());
+    let (a, b) = (host.random(32).unwrap(), host.random(32).unwrap());
+    assert_eq!((a.len(), b.len()), (32, 32));
+    assert_ne!(a, b);
+    assert!(host.random(0).unwrap().is_empty());
+}
