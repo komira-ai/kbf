@@ -246,47 +246,31 @@ fn there_is_a_test_of_necessity_for_every_step() {
 }
 
 /// Catches a test that passes vacuously (a core row unplanted), one that fails where the
-/// system only refuses a non-core row (crontab and at in a launch daemon's context), and
-/// one that excuses a row for a reason that is not the system's refusal.
+/// system only refuses crontab or at (a launch daemon's context), and one that excuses a row
+/// for anything but the plant's exact `refused <row>: EPERM` line.
 #[test]
 fn a_row_the_system_refuses_is_not_plantable_and_any_other_unplanted_row_fails() {
-    let text = "crontab: tmp/tmp.40513: Operation not permitted\n\
-                at: cannot open lockfile /usr/lib/cron/jobs/.lockfile: Operation not permitted\n\
-                planted tmp\n";
+    let text =
+        "crontab: tmp/tmp.1: Operation not permitted\nrefused crontab: EPERM\nrefused at: EPERM\n";
     let got = classify_unplanted(&["crontab", "at"], text);
     assert_eq!(got.failed, Vec::<String>::new());
     assert_eq!(
         got.not_plantable,
         vec![
-            (
-                "crontab".to_owned(),
-                "crontab: tmp/tmp.40513: Operation not permitted".to_owned()
-            ),
-            (
-                "at".to_owned(),
-                "at: cannot open lockfile /usr/lib/cron/jobs/.lockfile: Operation not permitted"
-                    .to_owned()
-            ),
+            ("crontab".to_owned(), "refused crontab: EPERM".to_owned()),
+            ("at".to_owned(), "refused at: EPERM".to_owned()),
         ]
     );
-    // Another failure of the same rows is a failure; so is a row nothing says anything of.
+    // The tool's own words are not the marker; nor is another row's line, nor a row that
+    // may not be excused, whatever the output says.
     let got = classify_unplanted(
-        &["crontab", "at", "sem"],
-        "crontab: bad\nat: no such queue\n",
+        &["crontab", "at", "shared", "var-tmp", "sem"],
+        "crontab: bad: Operation not permitted\nrefused shared: EPERM\nrefused var-tmp: EPERM\nrefused sem: EPERM\nrefused attic: EPERM\n",
     );
-    assert_eq!(got.failed, ["crontab", "at", "sem"]);
+    assert_eq!(got.failed, ["crontab", "at", "shared", "var-tmp", "sem"]);
     assert!(got.not_plantable.is_empty());
-    // EPERM counts as the refusal; the line must name the row's tool.
-    let got = classify_unplanted(&["shared"], "sh: Shared/x: EPERM\n");
-    assert_eq!(got.not_plantable.len(), 1);
-    let got = classify_unplanted(&["shared"], "unrelated: Operation not permitted\n");
-    assert_eq!(got.failed, ["shared"]);
-    // A core row is never excused, whatever the output says.
     for row in CORE {
-        let got = classify_unplanted(
-            &[row],
-            "home tmp T C keychain agent defaults: Operation not permitted\n",
-        );
+        let got = classify_unplanted(&[row], &format!("refused {row}: EPERM\n"));
         assert_eq!(
             got,
             Unplanted {

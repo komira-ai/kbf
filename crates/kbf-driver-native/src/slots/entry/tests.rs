@@ -116,7 +116,7 @@ fn every_call_on_the_entry_is_made_as_the_uid() {
     flags_step(&me(), dir, &mut as_root(&Log::default()), run).expect("flags");
     contents_step(&me(), dir, run).expect("contents");
     left(&me(), Path::new(FOLDERS), run).expect("left");
-    left_home(&me(), Path::new(HOME), run).expect("left home");
+    left_home(&me(), (Path::new(HOME), &[]), run).expect("left home");
     let calls = log.borrow();
     assert_eq!(calls.len(), 8);
     // The daemon's modes get the ids and drop inside their own process (the pool user
@@ -246,12 +246,12 @@ fn a_failure_of_the_home_and_of_the_entry_are_both_in_the_contents_failure() {
 #[test]
 fn the_look_of_the_home_is_one_call_as_the_uid_and_names_the_home_when_it_fails() {
     let log = Log::default();
-    let lines = left_home(&me(), Path::new(HOME), &mut runner(&log, &[])).expect("looked");
+    let lines = left_home(&me(), (Path::new(HOME), &[]), &mut runner(&log, &[])).expect("looked");
     assert_eq!(lines, vec!["lines", "of", "output"]);
     assert_eq!(*log.borrow(), vec![home_call("look-home")]);
     let why = left_home(
         &me(),
-        Path::new(HOME),
+        (Path::new(HOME), &[]),
         &mut runner(&Log::default(), &["look-home"]),
     )
     .expect_err("fails");
@@ -914,7 +914,7 @@ fn the_home_is_emptied_as_the_uid_and_a_directory_it_owns_with_no_permission_is_
 }
 
 #[test]
-fn the_look_of_the_home_reports_files_and_removes_the_empty_directories_it_can() {
+fn the_look_of_the_home_reports_files_and_empty_directories_and_changes_nothing() {
     let dir = tree("look-home");
     let home = dir.path().join("home");
     fs::create_dir_all(home.join("a/b")).expect("dirs");
@@ -925,12 +925,12 @@ fn the_look_of_the_home_reports_files_and_removes_the_empty_directories_it_can()
     assert_eq!((code, err.as_str()), (Some(0), ""));
     let lines: Vec<&str> = out.lines().collect();
     let at = |name: &str| home.join(name).display().to_string();
-    // A file and a link; a directory holding a file is not itself named, and an empty one
-    // is removed (the clean would have), not named.
-    assert!(!home.join("a").exists());
+    // A file, a link and an empty directory (the clean should have removed it); a directory
+    // holding a file is not itself named. Nothing is removed by the look.
+    assert!(home.join("a/b").is_dir());
     assert_eq!(
         lines,
-        [at("full/f"), at("link")]
+        [at("a/b"), at("full/f"), at("link")]
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>()
@@ -1165,20 +1165,32 @@ fn the_keychain_mode_is_selected_and_has_nothing_to_wipe_off_macos() {
     assert_eq!((code, out.as_str(), err.as_str()), (Some(0), "", ""));
 }
 
-#[cfg(not(target_os = "macos"))]
+/// The home look with `kept` after the path.
+fn look_home_with(home: &Path, kept: &[&Path]) -> (Option<i32>, String, String) {
+    let (uid, gid) = (me_now().to_string(), my_gid().to_string());
+    let mut words: Vec<String> = vec![
+        ARG.into(),
+        LOOK_HOME.into(),
+        uid,
+        gid,
+        home.to_string_lossy().into_owned(),
+    ];
+    words.extend(kept.iter().map(|k| k.to_string_lossy().into_owned()));
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    run_mode(&words, &mut |_, _| Ok(()))
+}
+
 #[test]
-fn an_empty_directory_the_system_keeps_is_accepted_by_the_home_look_and_others_are_not() {
-    use kbf_mac_session::sweep::pretend_unremovable;
+fn an_empty_directory_the_clean_kept_is_accepted_by_the_home_look_and_any_other_is_not() {
     let dir = tree("look-empty");
     let home = dir.path().join("home");
-    fs::create_dir_all(home.join("Library/Preferences")).expect("dirs");
+    let kept = home.join("Library/Preferences");
+    fs::create_dir_all(&kept).expect("dirs");
     fs::create_dir_all(home.join("Library/Keychains")).expect("dirs");
     fs::write(home.join("Library/Keychains/keychain-2.db"), "x").expect("file");
-    // The system keeps `Preferences`: accepted, and the folder that holds it. The look
-    // names the keychain file only, so the wait for the keychain applies (rule 3).
-    pretend_unremovable(&["Preferences"]);
-    let (code, out, err) = call(LOOK_HOME, &home);
-    pretend_unremovable(&[]);
+    // The clean kept `Preferences`: accepted, and the folder that holds it. The look names the
+    // keychain file only, so the wait for the keychain applies.
+    let (code, out, err) = look_home_with(&home, &[&kept]);
     assert_eq!((code, err.as_str()), (Some(0), ""));
     let lines: Vec<String> = out.lines().map(str::to_owned).collect();
     assert_eq!(
@@ -1190,20 +1202,19 @@ fn an_empty_directory_the_system_keeps_is_accepted_by_the_home_look_and_others_a
         ]
     );
     assert!(keychain_only(&lines, &home));
-    // Not kept by the system: the empty directory is removed by the look, none is named.
-    let (code, _, _) = call(LOOK_HOME, &home);
-    assert_eq!(code, Some(0));
-    assert!(!home.join("Library/Preferences").exists());
-    // An empty directory that cannot be removed for another reason is left, named.
-    if !rustix::process::geteuid().is_root() {
-        let held = dir.path().join("held");
-        fs::create_dir_all(held.join("sub/empty")).expect("dirs");
-        fs::set_permissions(held.join("sub"), fs::Permissions::from_mode(0o500)).expect("chmod");
-        let (code, out, _) = call(LOOK_HOME, &held);
-        fs::set_permissions(held.join("sub"), fs::Permissions::from_mode(0o700)).expect("chmod");
-        assert_eq!(code, Some(0));
-        assert!(out.contains("sub/empty"), "{out}");
-    }
+    // Not among them: an empty directory the clean should have removed is left, named. The
+    // look removes nothing.
+    let (_, out, _) = look_home_with(&home, &[]);
+    assert!(out.contains("Library/Preferences"), "{out}");
+    assert!(kept.is_dir());
+    // Only the home's look takes a kept set.
+    let (uid, gid) = (me_now().to_string(), my_gid().to_string());
+    let (code, _, err) = run_mode(
+        &[ARG, LOOK, &uid, &gid, &home.to_string_lossy(), "/x"],
+        &mut |_, _| Ok(()),
+    );
+    assert_eq!(code, Some(2));
+    assert!(err.contains("usage"), "{err}");
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1216,9 +1227,71 @@ fn the_home_is_emptied_past_a_refusal_and_an_empty_kept_directory_is_no_error() 
     fs::write(home.join("Library/Preferences/x"), "x").expect("file");
     fs::write(home.join("Library/y"), "x").expect("file");
     pretend_unremovable(&["Preferences"]);
-    let (code, _, err) = call(EMPTY_HOME, &home);
+    let (code, out, err) = call(EMPTY_HOME, &home);
     pretend_unremovable(&[]);
     assert_eq!((code, err.as_str()), (Some(0), ""));
+    // It says which it kept, for the look to accept.
+    assert_eq!(
+        kept_from(&out),
+        vec![home.join("Library/Preferences")],
+        "{out}"
+    );
     assert!(home.join("Library/Preferences").is_dir());
     assert!(!home.join("Library/y").exists());
+}
+
+#[test]
+fn the_kept_directories_are_read_from_the_lines_that_name_them() {
+    assert_eq!(
+        kept_from("kept /a/b\nnoise\nkept /c\n"),
+        vec![PathBuf::from("/a/b"), PathBuf::from("/c")]
+    );
+    assert!(kept_from("").is_empty());
+}
+
+#[test]
+fn the_contents_step_hands_on_what_the_homes_empty_kept_and_the_look_is_told_after_a_failure() {
+    let dirs = (Path::new(HOME), Path::new(FOLDERS));
+    // Success: the kept set is the step's result.
+    let log = Log::default();
+    let mut run = |program: &Path, args: &[OsString]| {
+        let line = format!("{} {}", program.display(), words(args));
+        log.borrow_mut().push(line.clone());
+        if line.contains("__entry empty-home") {
+            return Ok(format!("kept {HOME}/Library/Preferences\n"));
+        }
+        Ok(String::new())
+    };
+    let kept = contents_step_waiting(&me(), dirs, &mut run, &mut |_| ()).expect("emptied");
+    assert_eq!(
+        kept,
+        vec![PathBuf::from(format!("{HOME}/Library/Preferences"))]
+    );
+    // Failure with only keychain files left: the look is given the kept set the failure named,
+    // so the kept directory is not what stops the wait.
+    let log = Log::default();
+    let mut failed_once = true;
+    let mut run = |program: &Path, args: &[OsString]| {
+        let line = format!("{} {}", program.display(), words(args));
+        log.borrow_mut().push(line.clone());
+        if line.contains("__entry empty-home") && failed_once {
+            failed_once = false;
+            return Err(format!(
+                "{HOME}/Library: refused\nkept {HOME}/Library/Preferences"
+            ));
+        }
+        if line.contains("__entry look-home") {
+            return Ok(format!("{HOME}/Library/Keychains/keychain-2.db\n"));
+        }
+        Ok(String::new())
+    };
+    let mut waits = 0;
+    contents_step_waiting(&me(), dirs, &mut run, &mut |_| waits += 1).expect("second try");
+    assert_eq!(waits, 1);
+    assert!(
+        log.borrow().iter().any(|l| l.contains("__entry look-home")
+            && l.ends_with(&format!("{HOME}/Library/Preferences"))),
+        "{:?}",
+        log.borrow()
+    );
 }

@@ -114,14 +114,9 @@ pub fn covered_by(step: Step) -> &'static [&'static str] {
 /// The rows lease A must plant on any Mac: a run that planted fewer proves nothing.
 pub const CORE: [&str; 7] = ["home", "T", "C", "keychain", "agent", "defaults", "tmp"];
 
-/// What to look for in the plant's own output to tell that the system refused the
-/// planting of a row, by the tool or place that names it.
-const NEEDLES: [(&str, &str); 4] = [
-    ("crontab", "crontab"),
-    ("at", "at:"),
-    ("shared", "Shared"),
-    ("var-tmp", "var/tmp"),
-];
+/// The only rows whose planting the system may refuse and the test excuse: the setuid
+/// schedulers, which a launch daemon without Full Disk Access is refused.
+const EXCUSABLE: [&str; 2] = ["crontab", "at"];
 
 /// How [`classify_unplanted`] sorted the rows lease A did not plant.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -133,27 +128,21 @@ pub struct Unplanted {
     pub failed: Vec<String>,
 }
 
-/// Sorts `unplanted` (rows not planted) by what the plant's own output `text` says: a
-/// non-core row whose tool or place is named in a line with "Operation not permitted" or
-/// `EPERM` is not plantable here; every other row, and every core row, is a failure.
+/// Sorts `unplanted` (rows not planted) by what the plant's own output `text` says: a row
+/// of [`EXCUSABLE`] for which the plant printed exactly `refused <row>: EPERM` is not
+/// plantable here; every other row, and every core row, is a failure.
 #[must_use]
 pub fn classify_unplanted(unplanted: &[&str], text: &str) -> Unplanted {
     let mut sorted = Unplanted::default();
     for row in unplanted {
-        let refused = NEEDLES
-            .iter()
-            .filter(|(r, _)| r == row && !CORE.contains(row))
-            .find_map(|(_, needle)| {
-                text.lines().find(|l| {
-                    l.contains(needle)
-                        && (l.contains("Operation not permitted") || l.contains("EPERM"))
-                })
-            });
-        match refused {
-            Some(line) => sorted
-                .not_plantable
-                .push(((*row).to_owned(), line.trim().to_owned())),
-            None => sorted.failed.push((*row).to_owned()),
+        let line = format!("refused {row}: EPERM");
+        let refused = EXCUSABLE.contains(row)
+            && !CORE.contains(row)
+            && text.lines().any(|l| l.trim() == line);
+        if refused {
+            sorted.not_plantable.push(((*row).to_owned(), line));
+        } else {
+            sorted.failed.push((*row).to_owned());
         }
     }
     sorted

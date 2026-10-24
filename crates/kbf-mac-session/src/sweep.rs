@@ -94,6 +94,9 @@ pub struct Swept {
     pub removed: usize,
     /// Each place that could not be swept, and why. Empty when the sweep is complete.
     pub errors: Vec<String>,
+    /// The empty directories the system would not let the pool user remove, which the
+    /// sweep kept ([`remove_present`]): the baseline of what a check may find left empty.
+    pub kept: Vec<PathBuf>,
 }
 
 /// Sweeps `plan` for the user `user` with uid `uid`.
@@ -171,6 +174,7 @@ fn empty_base(path: &Path, uid: u32, keep: &[&str], swept: &mut Swept) -> io::Re
         note(swept, &here, result.map(drop));
     }
     note(swept, path, park.drain(uid, dev));
+    swept.kept.extend(park.kept.take());
     Ok(())
 }
 
@@ -215,6 +219,7 @@ fn empty_kept(
         note(swept, &here.join(&entry), result.map(drop));
     }
     note(swept, here, park.drain(uid, dev));
+    swept.kept.extend(park.kept.take());
     Ok(())
 }
 
@@ -538,7 +543,10 @@ fn remove_present(
     if placed | (park.skipped.get() > skipped_before) {
         // This directory was placed by the system (emptied, never removed), or something
         // the pool user may not open is inside and stays with it, and so does this one
-        // (counted, for the one above it).
+        // (counted, for the one above it). What a lease set on a placed one is taken off.
+        if placed {
+            scrub_kept(&child)?;
+        }
         park.skipped.set(park.skipped.get() + 1);
         return Ok(());
     }
@@ -548,11 +556,52 @@ fn remove_present(
         // here, unless something was made in it since.
         Err(Errno::PERM) if !rustix::process::geteuid().is_root() && listed(&child)?.is_empty() => {
             warn_once(here);
+            scrub_kept(&child)?;
+            park.kept.borrow_mut().push(here.to_owned());
             park.skipped.set(park.skipped.get() + 1);
             Ok(())
         }
         other => Ok(other?),
     }
+}
+
+/// The attribute SIP puts on what it protects: the one extended attribute a kept directory
+/// keeps. Off macOS a test names its own.
+#[cfg(target_os = "macos")]
+const KEEP_XATTR: &str = "com.apple.rootless";
+#[cfg(not(target_os = "macos"))]
+const KEEP_XATTR: &str = "user.kbf.rootless";
+
+/// Takes off a directory the sweep keeps (one the system placed, or will not let the pool
+/// user remove) what a lease can set on it: the user flags, and every extended attribute
+/// but [`KEEP_XATTR`] that the system lets the pool user remove (the system's own are
+/// protected and stay). A refusal to clear the flags fails.
+fn scrub_kept(dir: &OwnedFd) -> io::Result<()> {
+    clear_root(dir)?;
+    strip_xattrs_except(dir, KEEP_XATTR)
+}
+
+/// The names of `names` that [`strip_xattrs_except`] removes: all but `keep`.
+fn xattrs_to_remove<'a>(names: &'a [String], keep: &str) -> Vec<&'a str> {
+    names
+        .iter()
+        .map(String::as_str)
+        .filter(|n| *n != keep)
+        .collect()
+}
+
+/// Removes the extended attributes of the open directory `dir` but `keep`. One that went
+/// since the listing, or that the system protects from its owner (`EPERM`), stays.
+fn strip_xattrs_except(dir: &OwnedFd, keep: &str) -> io::Result<()> {
+    let names = crate::xattr::list(dir)?;
+    for name in xattrs_to_remove(&names, keep) {
+        match crate::xattr::remove(dir, name) {
+            Ok(()) => {}
+            Err(why) if crate::xattr::left(&why) => {}
+            Err(why) => return Err(why),
+        }
+    }
+    Ok(())
 }
 
 /// Removes the empty directory `name` of `dir`.
@@ -585,28 +634,6 @@ pub fn pretend_unremovable(names: &[&str]) {
     UNREMOVABLE.with_borrow_mut(|n| *n = names.iter().map(Into::into).collect());
 }
 
-/// Removes the empty directory at `path`, if the system lets the process.
-///
-/// # Errors
-/// The removal was refused or failed; `PermissionDenied`-or-"not permitted" is
-/// [`removal_refused`].
-pub fn remove_empty_dir(path: &Path) -> io::Result<()> {
-    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-        return Err(io::Error::other("not a path to a directory"));
-    };
-    let Some(dir) = open_base(parent)? else {
-        return Ok(());
-    };
-    Ok(rmdir_at(&dir, name)?)
-}
-
-/// Whether `why`, from [`remove_empty_dir`], is the system refusing the removal ("operation
-/// not permitted").
-#[must_use]
-pub fn removal_refused(why: &io::Error) -> bool {
-    why.raw_os_error() == Some(Errno::PERM.raw_os_error())
-}
-
 /// How deep the removal recurses before it moves what is below up to the top: it holds one
 /// descriptor per level (a Mac's default is 256 in all), so this stays well under that.
 const PARK_DEPTH: usize = 64;
@@ -626,6 +653,8 @@ struct Park<'a> {
     next: std::cell::Cell<u32>,
     /// How many entries the removal left because the pool user may not open them.
     skipped: std::cell::Cell<usize>,
+    /// The empty directories kept because the system refused their removal.
+    kept: std::cell::RefCell<Vec<PathBuf>>,
 }
 
 impl<'a> Park<'a> {
@@ -635,6 +664,7 @@ impl<'a> Park<'a> {
             names: std::cell::RefCell::default(),
             next: std::cell::Cell::new(0),
             skipped: std::cell::Cell::new(0),
+            kept: std::cell::RefCell::default(),
         }
     }
 

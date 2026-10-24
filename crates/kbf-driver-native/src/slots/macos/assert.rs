@@ -185,7 +185,13 @@ impl<'a> MacReader<'a> {
         let ready = self.ready;
         let mut facts = facts_without_names(&ready.home)?;
         // As the user: root without Full Disk Access cannot look inside its `Library`.
-        facts.entries = entry::left_home(&self.as_uid(), &ready.home, &mut host::run_child)?;
+        let kept = ready
+            .kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        facts.entries =
+            entry::left_home(&self.as_uid(), (&ready.home, &kept), &mut host::run_child)?;
         Ok(assertion::home_lines(
             &facts,
             (ready.user.uid, ready.user.gid),

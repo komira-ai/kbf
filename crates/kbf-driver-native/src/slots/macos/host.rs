@@ -202,7 +202,13 @@ impl Os for MacSlot<'_> {
                 &self.as_uid(),
                 (&ready.home, &ready.folders),
                 &mut run_child,
-            ),
+            )
+            .map(|kept| {
+                *ready
+                    .kept
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = kept;
+            }),
             Step::Shared => complete(&sweep::sweep(&probe::shared_plan(), &user.name, user.uid)),
             Step::Crashes => joined(crash::sweep(&crash_dirs(), &self.crash_scope())),
             Step::Restore => restore(ready, &self.as_uid()),
@@ -572,7 +578,12 @@ fn home_is_empty(ready: &Ready, me: &entry::AsUid<'_>) -> Result<(), String> {
         ));
     }
     // As the uid: root without Full Disk Access cannot look inside the home's `Library`.
-    match entry::left_home(me, home, &mut run_child) {
+    let kept = ready
+        .kept
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    match entry::left_home(me, (home, &kept), &mut run_child) {
         Ok(lines) if lines.is_empty() => Ok(()),
         Ok(lines) => Err(format!("{}: {lines:?}", home.display())),
         Err(why) => Err(why),

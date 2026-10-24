@@ -29,7 +29,7 @@
 
 use std::ffi::OsString;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use kbf_mac_session::sweep;
 
@@ -80,13 +80,25 @@ pub(crate) type Run<'a> = dyn FnMut(&Path, &[OsString]) -> Result<String, String
 impl AsUid<'_> {
     /// This binary's entry `mode` on `dir`, which drops to the uid itself.
     fn mode(&self, mode: &str, dir: &Path, run: &mut Run<'_>) -> Result<String, String> {
-        let args = [
+        self.mode_with(mode, dir, &[], run)
+    }
+
+    /// [`Self::mode`], with `more` paths after `dir` (the home look's kept set).
+    fn mode_with(
+        &self,
+        mode: &str,
+        dir: &Path,
+        more: &[PathBuf],
+        run: &mut Run<'_>,
+    ) -> Result<String, String> {
+        let mut args: Vec<OsString> = vec![
             ARG.into(),
             mode.into(),
             self.uid.to_string().into(),
             self.gid.to_string().into(),
             dir.as_os_str().to_owned(),
         ];
+        args.extend(more.iter().map(|p| p.as_os_str().to_owned()));
         run(self.program, &args)
     }
 }
@@ -109,7 +121,8 @@ pub(crate) fn flags_step(
 }
 
 /// C7: the home emptied as the uid (root without Full Disk Access cannot empty its
-/// `Library`), then the entry emptied as the uid.
+/// `Library`), then the entry emptied as the uid; the empty directories the home's empty
+/// kept.
 ///
 /// # Errors
 /// A part failed; both are tried.
@@ -117,7 +130,7 @@ pub(crate) fn contents_step(
     me: &AsUid<'_>,
     dirs: (&Path, &Path),
     run: &mut Run<'_>,
-) -> Result<(), String> {
+) -> Result<Vec<PathBuf>, String> {
     contents_step_waiting(me, dirs, run, &mut std::thread::sleep)
 }
 
@@ -146,12 +159,18 @@ pub(crate) fn contents_step_waiting(
     (home, folders): (&Path, &Path),
     run: &mut Run<'_>,
     sleep: &mut dyn FnMut(std::time::Duration),
-) -> Result<(), String> {
+) -> Result<Vec<PathBuf>, String> {
     let mut failed = Vec::new();
     failed.extend(wipe_keychains(me, home, run).err());
-    failed.extend(empty_home_waiting(me, home, run, sleep).err());
+    let kept = match empty_home_waiting(me, home, run, sleep) {
+        Ok(kept) => kept,
+        Err(why) => {
+            failed.push(why);
+            Vec::new()
+        }
+    };
     failed.extend(empty(me, folders, run).err());
-    join(failed)
+    join(failed).map(|()| kept)
 }
 
 /// The home emptied; while only files of `Library/Keychains` are left, again every
@@ -161,13 +180,15 @@ fn empty_home_waiting(
     home: &Path,
     run: &mut Run<'_>,
     sleep: &mut dyn FnMut(std::time::Duration),
-) -> Result<(), String> {
+) -> Result<Vec<PathBuf>, String> {
     let mut waited = std::time::Duration::ZERO;
     loop {
-        let Err(why) = empty_home(me, home, run) else {
-            return Ok(());
+        let why = match empty_home(me, home, run) {
+            Ok(kept) => return Ok(kept),
+            Err(why) => why,
         };
-        let left = left_home(me, home, run).ok();
+        let kept = kept_from(&why);
+        let left = left_home(me, (home, &kept), run).ok();
         if !left.as_deref().is_some_and(|l| keychain_only(l, home)) {
             return Err(why);
         }
@@ -424,28 +445,41 @@ pub(crate) fn empty(me: &AsUid<'_>, folders: &Path, run: &mut Run<'_>) -> Result
     )
 }
 
-/// C7 for the home `home`: emptied as the uid.
+/// C7 for the home `home`: emptied as the uid; the empty directories it kept.
 ///
 /// # Errors
 /// The call failed.
-pub(crate) fn empty_home(me: &AsUid<'_>, home: &Path, run: &mut Run<'_>) -> Result<(), String> {
+pub(crate) fn empty_home(
+    me: &AsUid<'_>,
+    home: &Path,
+    run: &mut Run<'_>,
+) -> Result<Vec<PathBuf>, String> {
     me.mode(EMPTY_HOME, home, run)
-        .map(drop)
+        .map(|said| kept_from(&said))
         .map_err(|why| format!("{}: {why}", home.display()))
 }
 
+/// The empty directories the home's empty kept, which it names in `kept <path>` lines on
+/// its standard output (and, when it failed, on its error output too).
+pub(crate) fn kept_from(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .filter_map(|l| l.strip_prefix("kept "))
+        .map(PathBuf::from)
+        .collect()
+}
+
 /// What the uid finds left in the home `home`, one line each; what it cannot open is not
-/// left.
+/// left, nor is an empty directory in `kept` (the ones the last empty kept). Read-only.
 ///
 /// # Errors
 /// The uid could not look.
 pub(crate) fn left_home(
     me: &AsUid<'_>,
-    home: &Path,
+    (home, kept): (&Path, &[PathBuf]),
     run: &mut Run<'_>,
 ) -> Result<Vec<String>, String> {
     let said = me
-        .mode(LOOK_HOME, home, run)
+        .mode_with(LOOK_HOME, home, kept, run)
         .map_err(|why| format!("{}: {why}", home.display()))?;
     Ok(said.lines().map(str::to_owned).collect())
 }
@@ -486,10 +520,15 @@ pub(crate) fn dispatch(
     if args.get(1).is_none_or(|a| a != ARG) {
         return None;
     }
-    let [_, _, mode, uid, gid, dir] = args else {
+    let [_, _, mode, uid, gid, dir, kept @ ..] = args else {
         let _ = writeln!(err, "{USAGE}");
         return Some(2);
     };
+    // Only the home's look takes the kept set after the path.
+    if !kept.is_empty() && mode != LOOK_HOME {
+        let _ = writeln!(err, "{USAGE}");
+        return Some(2);
+    }
     let id = |text: &OsString| text.to_str().and_then(|t| t.parse::<u32>().ok());
     let (Some(uid), Some(gid)) = (id(uid).filter(|n| *n != 0), id(gid).filter(|n| *n != 0)) else {
         let _ = writeln!(err, "{USAGE}: the ids are not non-root ids");
@@ -526,11 +565,19 @@ pub(crate) fn dispatch(
         ACL => return Some(acl_mode(dir, uid, &mut run_find, err)),
         EMPTY_HOME => sweep::empty(dir, uid),
         KEYCHAIN => return Some(keychain_mode(&mut keychain::wipe_user_keychains, err)),
-        LOOK_HOME => return Some(look_home(dir, out, err)),
+        LOOK_HOME => return Some(look_home(dir, kept, out, err)),
         _ => return Some(look(dir, out, err)),
     };
     for error in &swept.errors {
         let _ = writeln!(err, "{error}");
+    }
+    for kept in &swept.kept {
+        let _ = writeln!(out, "kept {}", kept.display());
+        // The error output carries them too when the empty failed: the caller reads them
+        // from whichever it gets.
+        if !swept.errors.is_empty() {
+            let _ = writeln!(err, "kept {}", kept.display());
+        }
     }
     Some(i32::from(!swept.errors.is_empty()))
 }
@@ -572,7 +619,7 @@ fn look(dir: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                 let path = folder.join(n);
                 let placed = sweep::path_is_system_placed(&path);
                 if placed {
-                    left_below(&path, out, err, &mut code);
+                    left_below(&path, &[], out, err, &mut code);
                 }
                 !placed
             });
@@ -594,9 +641,10 @@ fn look(dir: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 /// [`LOOK_HOME`]: a line for each file, link or empty directory left below `dir`, leaving
 /// out what the pool user cannot open and a directory that holds only such things (it
 /// stays because they do). Exit 1 when something could not be listed.
-fn look_home(dir: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+fn look_home(dir: &Path, kept: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let mut code = 0;
-    left_below(dir, out, err, &mut code);
+    let kept: Vec<PathBuf> = kept.iter().map(PathBuf::from).collect();
+    left_below(dir, &kept, out, err, &mut code);
     code
 }
 
@@ -616,7 +664,13 @@ impl Found {
     }
 }
 
-fn left_below(dir: &Path, out: &mut dyn Write, err: &mut dyn Write, code: &mut i32) -> Found {
+fn left_below(
+    dir: &Path,
+    kept: &[PathBuf],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    code: &mut i32,
+) -> Found {
     let mut found = Found::default();
     let names = match std::fs::read_dir(dir).and_then(|names| {
         names
@@ -647,20 +701,18 @@ fn left_below(dir: &Path, out: &mut dyn Write, err: &mut dyn Write, code: &mut i
             continue;
         }
         let placed = sweep::path_is_system_placed(&path);
-        let inside = left_below(&path, out, err, code);
+        let inside = left_below(&path, kept, out, err, code);
         found.printed |= inside.printed;
         found.protected |= inside.protected;
         found.failed |= inside.failed;
         if inside.nothing() & !placed {
-            // An empty directory: the clean removes it, so one the system keeps (it refuses
-            // the pool user the removal) is accepted, and any other is left.
-            match sweep::remove_empty_dir(&path) {
-                Ok(()) => {}
-                Err(why) if sweep::removal_refused(&why) => found.protected = true,
-                Err(_) => {
-                    let _ = writeln!(out, "{}", path.display());
-                    found.printed = true;
-                }
+            // An empty directory: the clean removes it, so one is left unless it is among
+            // those the clean kept because the system refused their removal. Read-only.
+            if kept.contains(&path) {
+                found.protected = true;
+            } else {
+                let _ = writeln!(out, "{}", path.display());
+                found.printed = true;
             }
         }
         // An empty directory the system placed stays, and so does the one that holds it.

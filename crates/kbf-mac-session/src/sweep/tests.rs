@@ -136,7 +136,8 @@ fn everything_the_uid_owns_goes_and_the_folder_stays() {
         swept,
         Swept {
             removed: 3,
-            errors: Vec::new()
+            errors: Vec::new(),
+            ..Swept::default()
         }
     );
     assert!(names(&base).is_empty());
@@ -178,7 +179,8 @@ fn a_planted_link_is_removed_and_its_target_kept() {
         swept,
         Swept {
             removed: 3,
-            errors: Vec::new()
+            errors: Vec::new(),
+            ..Swept::default()
         }
     );
     assert!(names(&base).is_empty());
@@ -221,7 +223,8 @@ fn named_entries_go_whole_and_absent_ones_are_fine() {
         swept,
         Swept {
             removed: 3,
-            errors: Vec::new()
+            errors: Vec::new(),
+            ..Swept::default()
         }
     );
     assert_eq!(names(&dir.join("Users")), ["kbf-lease-2-8"]);
@@ -457,7 +460,8 @@ fn empty_removes_every_entry_whoever_owns_it_and_keeps_the_folder() {
         swept,
         Swept {
             removed: 4,
-            errors: Vec::new()
+            errors: Vec::new(),
+            ..Swept::default()
         }
     );
     assert!(names(&home).is_empty());
@@ -574,7 +578,8 @@ fn empty_passes_over_an_entry_gone_since_the_listing() {
         swept,
         Swept {
             removed: 1,
-            errors: Vec::new()
+            errors: Vec::new(),
+            ..Swept::default()
         }
     );
     assert!(names(&home).is_empty());
@@ -1472,22 +1477,81 @@ fn a_directory_the_system_will_not_remove_fails_when_it_is_not_empty() {
     );
 }
 
+#[test]
+fn a_kept_directory_loses_every_attribute_but_the_one_it_keeps() {
+    let names: Vec<String> = ["user.lease", KEEP_XATTR, "user.other"]
+        .iter()
+        .map(|n| (*n).to_owned())
+        .collect();
+    assert_eq!(
+        xattrs_to_remove(&names, KEEP_XATTR),
+        ["user.lease", "user.other"]
+    );
+    assert!(xattrs_to_remove(&[], KEEP_XATTR).is_empty());
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_attr(path: &Path, name: &str) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let c_name = std::ffi::CString::new(name).unwrap();
+    // SAFETY: NUL-terminated strings and a 1-byte value.
+    unsafe { libc::setxattr(c_path.as_ptr(), c_name.as_ptr(), b"x".as_ptr().cast(), 1, 0) == 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn attrs_of(path: &Path) -> Vec<String> {
+    let fd = open_base(path).unwrap().unwrap();
+    crate::xattr::list(&fd).unwrap()
+}
+
+/// A directory the system placed keeps its own attribute and loses the lease's; so does one
+/// the system will not let the pool user remove, which is also recorded as kept.
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn the_removal_of_an_empty_directory_says_whether_the_system_refused_it() {
-    let dir = scratch("remove-empty");
-    fs::create_dir_all(dir.join("gone")).unwrap();
-    fs::create_dir_all(dir.join("kept")).unwrap();
-    assert!(remove_empty_dir(&dir.join("gone")).is_ok());
-    assert!(!dir.join("gone").exists());
-    pretend_unremovable(&["kept"]);
-    let why = remove_empty_dir(&dir.join("kept")).expect_err("refused");
+fn what_a_lease_set_on_a_kept_directory_is_taken_off() {
+    if root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = scratch("scrub");
+    let home = dir.join("home");
+    fs::create_dir_all(home.join("placed")).unwrap();
+    fs::create_dir_all(home.join("Library/Preferences")).unwrap();
+    if !set_attr(&home.join("placed"), "user.lease") {
+        eprintln!("skipped: this file system keeps no extended attributes");
+        return;
+    }
+    assert!(set_attr(&home.join("placed"), KEEP_XATTR));
+    assert!(set_attr(&home.join("Library/Preferences"), "user.lease"));
+    assert!(set_attr(&home.join("Library/Preferences"), KEEP_XATTR));
+    place(&["placed"]);
+    pretend_unremovable(&["Preferences"]);
+    let swept = empty(&home, me());
+    place(&[]);
     pretend_unremovable(&[]);
-    assert!(removal_refused(&why));
-    // Not a refusal: the directory is not empty.
-    fs::write(dir.join("kept/f"), "x").unwrap();
-    let why = remove_empty_dir(&dir.join("kept")).expect_err("not empty");
-    assert!(!removal_refused(&why));
-    assert!(remove_empty_dir(Path::new("/")).is_err());
-    assert!(remove_empty_dir(&dir.join("absent/child")).is_ok());
+    assert_eq!(swept.errors, Vec::<String>::new());
+    assert_eq!(attrs_of(&home.join("placed")), [KEEP_XATTR]);
+    assert_eq!(attrs_of(&home.join("Library/Preferences")), [KEEP_XATTR]);
+    assert_eq!(swept.kept, vec![home.join("Library/Preferences")]);
+}
+
+#[test]
+fn an_attribute_that_went_or_is_the_systems_is_left_and_any_other_refusal_fails() {
+    let gone = io::Error::from_raw_os_error(libc::EPERM);
+    assert!(crate::xattr::left(&gone));
+    #[cfg(target_os = "macos")]
+    let none = io::Error::from_raw_os_error(libc::ENOATTR);
+    #[cfg(not(target_os = "macos"))]
+    let none = io::Error::from_raw_os_error(libc::ENODATA);
+    assert!(crate::xattr::left(&none));
+    assert!(!crate::xattr::left(&io::Error::from_raw_os_error(
+        libc::EIO
+    )));
+    let dir = scratch("xattr-fail");
+    let fd = open_base(&dir).unwrap().unwrap();
+    let why = crate::xattr::remove(&fd, "user.absent").expect_err("no such attribute");
+    assert!(crate::xattr::left(&why));
+    let why = crate::xattr::remove(&fd, "a\0b").expect_err("bad name");
+    assert!(!crate::xattr::left(&why));
 }

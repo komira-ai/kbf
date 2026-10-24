@@ -80,8 +80,12 @@ ok() { echo "planted $*"; }
 printf %s "$m" > "/private/tmp/$m" && ok tmp
 printf %s "$m" > "/private/var/tmp/$m" && ok var-tmp
 printf %s "$m" > "/Users"/Shared/"$m" && ok shared
-echo "0 0 1 1 * /usr/bin/true # $m" | crontab - && crontab -l | grep -q "$m" && ok crontab
-echo /usr/bin/true | at now + 2 hours && [ -n "$(atq)" ] && ok at
+# A refusal by the system is printed as `refused <row>: EPERM`, which the test reads exactly.
+e="/private/tmp/$m.err"
+refused() { grep -q 'Operation not permitted' "$e" && echo "refused $1: EPERM"; cat "$e" >&2; }
+echo "0 0 1 1 * /usr/bin/true # $m" | crontab - 2>"$e" && crontab -l | grep -q "$m" && ok crontab || refused crontab
+echo /usr/bin/true | at now + 2 hours 2>"$e" && [ -n "$(atq)" ] && ok at || refused at
+rm -f "$e"
 exit 0
 "#;
 
