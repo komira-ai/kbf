@@ -153,7 +153,7 @@ pub fn diagnose(host: &dyn DiagHost, a: &DiagArgs) -> Value {
     json!({
         "wait_path": a.wait_path,
         "wait_path_appeared": appeared,
-        "waited_ms": u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+        "waited_s": waited.as_secs_f64(),
         "ids": host.ids(),
         "facts": facts,
         "writes": [
@@ -168,7 +168,7 @@ pub fn diagnose(host: &dyn DiagHost, a: &DiagArgs) -> Value {
 /// Prints `report` on stdout and tries to leave it in the share's `results/` too (a
 /// failure there is part of the answer, so it is printed, not returned).
 pub fn emit(report: &Value, share: &Path, out: &mut dyn Write) {
-    let text = serde_json::to_string_pretty(report).unwrap_or_default();
+    let text = format!("{report:#}");
     let _ = writeln!(out, "{text}");
     let dest = share.join("results").join("kbf-diag.json");
     if let Err(e) = std::fs::write(&dest, &text) {
@@ -311,14 +311,22 @@ mod tests {
         let a = args(&d);
         let host = Fake::new(3);
         let r = diagnose(&host, &a);
+        assert_eq!((host.pauses.get(), r["waited_s"].clone()), (3, json!(1.5)));
+        // Nothing to wait for: no pause, and the path is reported as not asked for.
+        let mut none = args(&d);
+        none.wait_path = None;
+        let idle = Fake::new(u32::MAX);
+        let r = diagnose(&idle, &none);
         assert_eq!(
-            (host.pauses.get(), r["waited_ms"].clone()),
-            (3, json!(1500))
+            (idle.pauses.get(), r["wait_path_appeared"].clone()),
+            (0, json!(true))
         );
+        assert_eq!(r["wait_path"], json!(null));
         let never = Fake::new(u32::MAX);
         let r = diagnose(&never, &a);
         assert_eq!(r["wait_path_appeared"], false);
-        assert!(never.pauses.get() > 100 && never.pauses.get() < 1000);
+        assert!(never.pauses.get() > 100);
+        assert!(never.pauses.get() < 1000);
         assert!(!never.runs.borrow().is_empty());
     }
 

@@ -350,7 +350,8 @@ mod tests {
         let e = write_result(&dir.join("both.json"), &json!({}))
             .unwrap_err()
             .to_string();
-        assert!(e.contains("rename") && e.contains("both.json"), "{e}");
+        assert!(e.contains("rename"), "{e}");
+        assert!(e.contains("both.json"), "{e}");
         assert!(
             !dir.join("both.tmp").exists(),
             "the temporary file is removed"
