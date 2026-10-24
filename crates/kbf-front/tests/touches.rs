@@ -114,6 +114,16 @@ impl HeldLog {
             .count()
     }
 
+    /// How many commits of any kind but a touch have been asked for so far.
+    fn commits_but_touches(&self) -> usize {
+        self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|c| kind(c) != Kind::Touch)
+            .count()
+    }
+
     /// The touch commits asked for so far, blobs and actions.
     fn touch_commands(&self) -> Vec<Touch> {
         self.asked
@@ -321,6 +331,27 @@ async fn a_touch_whose_commit_fails_is_committed_later() {
     let touches = log.touches();
     assert_eq!(touches.len(), 3, "two refused, one applied: {touches:?}");
     assert!(touches.iter().all(|t| t == &BTreeSet::from([blob])));
+}
+
+/// Asserts that storing a blob the index already holds, while the log answers the touch
+/// of that blob with another command's outcome, succeeds and does not store the blob
+/// again: the blob is still held, only its touch is not recorded. The one touch commit
+/// is asked for, and no commit of any other kind follows it.
+#[tokio::test]
+async fn a_touch_answered_with_another_outcome_leaves_the_stored_blob_held() {
+    let cache = cache().await;
+    let log = cache.meta();
+    let blob = store(&cache, "stored twice").await;
+    let before = log.commits_but_touches();
+    assert!(log.touches().is_empty(), "the first store touched nothing");
+
+    log.fail_next_touches(1);
+    let again = VerifiedBlob::hashed(Bytes::from_static(b"stored twice"));
+    cache.store_blobs(vec![again]).await.expect("store again");
+
+    assert_eq!(log.touches(), [BTreeSet::from([blob])], "one touch asked");
+    assert_eq!(log.commits_but_touches(), before, "stored again");
+    assert!(cache.find_missing(&[blob]).await.expect("find").is_empty());
 }
 
 /// Catches (defect "collect without committing pending touches"): a collection that
