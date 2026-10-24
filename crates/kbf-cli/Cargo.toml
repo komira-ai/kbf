@@ -58,6 +58,10 @@ tracing.workspace = true
 rustix = { workspace = true, features = ["process", "system"] }
 # The Postgres state schema version, which `kbf --version --json` reports.
 kbf-state = { workspace = true, features = ["postgres"] }
+# `kbf setup` (src/setup.rs): the first configuration of a host from the packages. Without the
+# library's `proxy` feature, so this binary links no kbf-proxy: the host behind the proxy is
+# `kbf-installer setup`'s (tests/layering.rs in kbf-integration-test checks the tree).
+kbf-setup.workspace = true
 # The identity `kbf --version --json` prints (src/version.rs), and the bodies of
 # `kbf cluster` (src/cluster.rs).
 serde_json.workspace = true
@@ -87,11 +91,14 @@ postgres.workspace = true
 # `kbf storage-and-daemon` running an action (tests/storage_and_daemon.rs): the act steps
 # it runs through this test binary, the REAPI messages (the node's certificates are made
 # with rcgen, below); the image store layout the stand-in `crun` runs over is
-# kbf-driver-container's, under the Linux-only section at the end.
-kbf-testkit.workspace = true
+# kbf-driver-container's, under the Linux-only section at the end. `postgres`: the databases
+# of tests/boot_check_postgres.rs are made through the guard of the shared catalogs.
+kbf-testkit = { workspace = true, features = ["postgres"] }
 prost.workspace = true
 # The certificate checks (`kbf_ca::verify_cert`) of tests/deploy_units.rs.
 kbf-ca.workspace = true
+# tests/setup.rs runs `kbf setup` over a recording host (`FakeExec`) instead of a real one.
+kbf-host = { workspace = true, features = ["testkit"] }
 # The packaged units (`packaging/linux/units`) parsed with kbf's own parser
 # (tests/deploy_units.rs, tests/package_units.rs).
 kbf-unitfile.workspace = true

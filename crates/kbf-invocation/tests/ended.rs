@@ -304,6 +304,27 @@ fn an_end_is_not_reported_for_a_row_a_later_execute_replaced() {
     assert_eq!(got[5], [one("a", 0, Some(0), EndedKind::Finished, t(5))]);
 }
 
+/// Asserts that an operation's end settles a row once when a later Execute of the action
+/// joined the same operation under the same name (a farm over a state store names an
+/// operation, not each caller, so a repeated Execute of an action in flight gets the same
+/// name): the later call owns the row and the earlier one no longer reaches it.
+#[test]
+fn an_end_is_reported_once_for_a_row_two_executes_of_one_name_share() {
+    let mut r = Records::new();
+    let got = ended(
+        &mut r,
+        [
+            queued("a", t(0), 1, 1),
+            // A waiter of another row, which the later Execute's replacement leaves alone.
+            queued("a", t(1), 2, 2),
+            granted(1, 1, "node-a", t(2)),
+            joined("a", t(3), 1, 1),
+            finished_ok(1, 1, 7, 0, t(4)),
+        ],
+    );
+    assert_eq!(got[4], [one("a", 0, Some(0), EndedKind::Finished, t(4))]);
+}
+
 /// Catches: an end reported for an attempt the row does not hold because it did not fit
 /// within the memory bound (an index past the row's attempts, or a record of an attempt
 /// the page cannot show).

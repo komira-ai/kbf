@@ -11,8 +11,70 @@ use crate::types::{
 };
 
 /// The row that holds the generation: eight bytes, big-endian. It is written only when a
-/// writer's role begins ([`Fenced::take`]).
+/// writer's role begins ([`Fenced::take`]); a store that several frontends share holds
+/// [`SHARED_WRITERS`] there instead ([`share`]).
 pub const GENERATION: &str = "meta/generation";
+
+/// What the generation row holds in a store that several frontends share ([`share`]). It is
+/// not a generation, and not eight bytes, so a build that takes generations
+/// ([`Fenced::take`]) reads the row as [`TakeError::Corrupt`] and does not start on the
+/// store: a build that would fence the shared writers cannot be started beside them.
+pub const SHARED_WRITERS: &[u8] = b"shared-writers";
+
+/// How often [`share`] reads the row and tries to write it before it gives up. A try fails
+/// only when another process wrote the row between the read and the write, and the other
+/// writers write the same value, so a second try ends it; the rest is room for a build that
+/// takes generations while the first start runs.
+const SHARE_ATTEMPTS: usize = 8;
+
+/// The generation `bytes` hold: eight bytes, big-endian. This is how a build that takes
+/// generations reads the row ([`Fenced::take`]).
+///
+/// # Errors
+/// [`TakeError::Corrupt`] when `bytes` are not eight.
+pub fn decode_generation(bytes: &[u8]) -> Result<u64, TakeError> {
+    <[u8; 8]>::try_from(bytes)
+        .map(u64::from_be_bytes)
+        .map_err(|_| TakeError::Corrupt)
+}
+
+/// Makes the generation row of `store` hold [`SHARED_WRITERS`], which is how a store is
+/// opened by frontends that do not take its generation: none of them is fenced by another,
+/// and a build that takes generations is refused by the row.
+///
+/// A store whose row holds the marker is left as it is (nothing is written). A store with no
+/// row gets the marker with an absent-only write, and one whose row holds a generation gets
+/// it in place of the generation, conditional on the version read: so frontends that open
+/// the store together agree, and the row ends holding the marker. A row that changes between
+/// the read and the write is read again. A row that holds neither the marker nor a
+/// generation (eight bytes) is not replaced.
+///
+/// # Errors
+/// [`StoreError`]: the store failed, the row holds neither the marker nor a generation, or
+/// the row changed under every one of the tries.
+pub fn share(store: &dyn Store) -> Result<(), StoreError> {
+    for _ in 0..SHARE_ATTEMPTS {
+        let cond = match store.get(GENERATION)? {
+            Some(row) if row.value == SHARED_WRITERS => return Ok(()),
+            Some(row) if decode_generation(&row.value).is_err() => {
+                return Err(StoreError::Failed(
+                    "the generation row is neither a generation nor the shared marker".to_owned(),
+                ));
+            }
+            Some(row) => Cond::Version(row.version),
+            None => Cond::Absent,
+        };
+        if store
+            .txn(Txn::new().put(GENERATION, SHARED_WRITERS, cond))?
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    Err(StoreError::Failed(
+        "the generation row kept changing while it was set to the shared marker".to_owned(),
+    ))
+}
 
 /// Why a generation could not be taken.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -98,11 +160,7 @@ impl Fenced {
     ) -> Result<(Fenced, T), TakeError> {
         let (found, cond) = match inner.get(GENERATION)? {
             None => (0, Cond::Absent),
-            Some(row) => {
-                let bytes =
-                    <[u8; 8]>::try_from(row.value.as_slice()).map_err(|_| TakeError::Corrupt)?;
-                (u64::from_be_bytes(bytes), Cond::Version(row.version))
-            }
+            Some(row) => (decode_generation(&row.value)?, Cond::Version(row.version)),
         };
         if let Some(expected) = expect.filter(|expected| *expected != found) {
             return Err(TakeError::Mismatch { expected, found });

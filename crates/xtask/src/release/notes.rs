@@ -202,7 +202,7 @@ fn render(
     let mut out = format!("# {tag}\n\n## Before you click\n");
     // Only what verify computed from the two builds (`found`). The verdict's own
     // `not_reversible` list is deliberately NOT read: a list typed into a tag is not a
-    // source (CEO ruling), so verify is the single source of this section.
+    // source (ruling), so verify is the single source of this section.
     section(
         &mut out,
         "### Not reversible",

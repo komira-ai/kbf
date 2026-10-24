@@ -7,8 +7,14 @@ use kbf_host_install::contract::{
     Failure, FailureCode, Outcome, QueryReport, Refusal, install_request, is_query,
 };
 
-use super::answer::{install_answer, query_answer};
+use super::answer::{install_answer, query_answer, restart_answer};
 use super::*;
+use crate::ports::{Apply, InstallAnswer, Installed};
+
+/// A version for the tests that do not care which.
+fn v1() -> Version {
+    Version::parse("1").expect("version")
+}
 
 /// Every refusal. The `match` is the guard: a new variant is a compile error here until the
 /// list below (and so the tests) name it.
@@ -21,6 +27,9 @@ fn refusals() -> Vec<Refusal> {
         Refusal::ChannelUnsigned,
         Refusal::KeyUntrusted,
         Refusal::ChannelInsecure,
+        Refusal::UnknownRelease,
+        Refusal::AmbiguousRelease,
+        Refusal::FetchFailed,
     ];
     for r in &all {
         match r {
@@ -30,7 +39,10 @@ fn refusals() -> Vec<Refusal> {
             | Refusal::ConfigUnsafe
             | Refusal::ChannelUnsigned
             | Refusal::KeyUntrusted
-            | Refusal::ChannelInsecure => {}
+            | Refusal::ChannelInsecure
+            | Refusal::UnknownRelease
+            | Refusal::AmbiguousRelease
+            | Refusal::FetchFailed => {}
         }
     }
     all
@@ -48,6 +60,8 @@ fn failures() -> Vec<FailureCode> {
         FailureCode::VerifyFailed,
         FailureCode::Busy,
         FailureCode::LockUnavailable,
+        FailureCode::RestartFailed,
+        FailureCode::RestartTimeout,
     ];
     for f in &all {
         match f {
@@ -59,7 +73,9 @@ fn failures() -> Vec<FailureCode> {
             | FailureCode::InstallFailed
             | FailureCode::VerifyFailed
             | FailureCode::Busy
-            | FailureCode::LockUnavailable => {}
+            | FailureCode::LockUnavailable
+            | FailureCode::RestartFailed
+            | FailureCode::RestartTimeout => {}
         }
     }
     all
@@ -88,12 +104,20 @@ fn every_install_outcome_of_the_host_is_read() {
             },
         ] {
             let (code, out) = printed(&outcome);
-            assert_eq!(install_answer(code, &out), Ok(()), "{outcome:?}");
+            let want = match outcome {
+                Outcome::Installed { .. } => InstallAnswer::Installed,
+                _ => InstallAnswer::AlreadyInstalled,
+            };
+            assert_eq!(
+                install_answer(code, &out, &Version::parse(version).expect("version")),
+                Ok(want),
+                "{outcome:?}"
+            );
         }
     }
     for refusal in refusals() {
         let (code, out) = printed(&Outcome::Refused(refusal));
-        let got = install_answer(code, &out).expect_err("refused");
+        let got = install_answer(code, &out, &v1()).expect_err("refused");
         assert_eq!(
             got,
             PortError::other(format!("refused: {}", refusal.code()))
@@ -105,10 +129,33 @@ fn every_install_outcome_of_the_host_is_read() {
             detail: "raw apt words".into(),
         });
         let (code, out) = printed(&outcome);
-        let got = install_answer(code, &out).expect_err("failed");
+        let got = install_answer(code, &out, &v1()).expect_err("failed");
         assert_eq!(got, PortError::other(format!("failed: {}", failure.code())));
         assert!(!got.to_string().contains("raw apt"));
     }
+}
+
+/// Catches a drift of the two query fields the roll acts on: the node id and the running
+/// commit are read as the host's own types print them, and an absent one is `None` (an old
+/// host that prints neither is still read).
+#[test]
+fn the_node_id_and_the_running_commit_of_the_host_are_read() {
+    let report = |c: Option<&str>, id: Option<&str>| {
+        let (code, out) = printed(&Outcome::Queried(QueryReport {
+            installed_version: Some("1.2.3-1".to_owned()),
+            running_commit: c.map(str::to_owned),
+            node_id: id.map(str::to_owned),
+            in_progress: false,
+        }));
+        query_answer(code, &out).expect("read")
+    };
+    let both = report(Some("0123456789ab"), Some("node-1"));
+    assert_eq!(both.running_commit.as_deref(), Some("0123456789ab"));
+    assert_eq!(both.node_id.as_deref(), Some("node-1"));
+    let neither = report(None, None);
+    assert_eq!((neither.running_commit, neither.node_id), (None, None));
+    let old = br#"{"result":"query","installed_version":"1","in_progress":false}"#;
+    assert_eq!(query_answer(0, old).expect("old host").node_id, None);
 }
 
 /// Catches a drift of the query report: the field names and types, `null` for nothing
@@ -125,7 +172,7 @@ fn every_query_outcome_of_the_host_is_read() {
     };
     let read = |o: &Outcome| {
         let (code, out) = printed(o);
-        query_answer(code, &out)
+        query_answer(code, &out).map(|r| r.installed)
     };
     assert_eq!(
         read(&report(Some("1.2.3-1"), Some("abc"), false)),
@@ -178,7 +225,7 @@ fn an_answer_of_the_other_verb_is_not_read() {
     });
     let (code, out) = printed(&q);
     assert_eq!(
-        install_answer(code, &out),
+        install_answer(code, &out, &v1()),
         Err(PortError::other("bad answer"))
     );
 }
@@ -282,4 +329,147 @@ fn the_channel_rule_agrees_with_the_host() {
         let host_says = install_request(&format!("install kbf={version} from {c}")).is_some();
         assert_eq!(Channel::parse(&c).is_ok(), host_says, "{c:?}");
     }
+}
+
+/// Asserts that the host's own `restarted` line is read as success for the unit asked for and
+/// for no other, with both ways of naming a frontend; and that every refusal and every failure
+/// code the host can print is read as `refused: <code>` / `failed: <code>` and nothing else.
+#[test]
+fn every_restart_outcome_of_the_host_is_read() {
+    for name in ["-", "a1"] {
+        let (code, out) = printed(&Outcome::Restarted {
+            unit: frontend_unit(name),
+        });
+        assert_eq!(restart_answer(code, &out, &frontend_unit(name)), Ok(()));
+        let other = restart_answer(code, &out, "kbf-frontend@b2.service");
+        assert_eq!(other, Err(PortError::other("bad answer")), "{name}");
+    }
+    let unit = "kbf-frontend.service";
+    for refusal in refusals() {
+        let (code, out) = printed(&Outcome::Refused(refusal));
+        let got = restart_answer(code, &out, unit).expect_err("refused");
+        assert_eq!(
+            got,
+            PortError::other(format!("refused: {}", refusal.code()))
+        );
+    }
+    for failure in failures() {
+        let outcome = Outcome::Failed(Failure {
+            code: failure,
+            detail: "raw systemctl words".into(),
+        });
+        let (code, out) = printed(&outcome);
+        let got = restart_answer(code, &out, unit).expect_err("failed");
+        assert_eq!(got, PortError::other(format!("failed: {}", failure.code())));
+        assert!(!got.to_string().contains("raw systemctl"));
+    }
+}
+
+/// Asserts that an install answer is no restart answer and a restart answer is no install
+/// answer or query report.
+#[test]
+fn an_answer_of_the_other_verb_is_not_a_restart() {
+    let (code, out) = printed(&Outcome::Installed {
+        version: "1".into(),
+    });
+    assert_eq!(
+        restart_answer(code, &out, "kbf-frontend.service"),
+        Err(PortError::other("bad answer"))
+    );
+    let (code, out) = printed(&Outcome::Restarted {
+        unit: "kbf-frontend.service".into(),
+    });
+    assert_eq!(
+        install_answer(code, &out, &v1()),
+        Err(PortError::other("bad answer"))
+    );
+    assert_eq!(
+        query_answer(code, &out),
+        Err(PortError::other("bad answer"))
+    );
+}
+
+/// Asserts that the frontend name rule here and the host's agree, in both directions, over
+/// the plain name, instance names, and the edges: the first character, the characters
+/// after it, the length bound.
+#[test]
+fn the_frontend_name_rule_agrees_with_the_host() {
+    let mut cases: Vec<String> = [
+        "", "-", "--", "-a", "a", "a1", "a-", "a-1", "A", "aB", "1a", "a b", "a/b", "a_b", "a.b",
+        "a@b", "a\nb", "a\0", "a;b", "../x", "*", "\u{ff41}",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    cases.extend(["a".repeat(31), "a".repeat(32), "a".repeat(33)]);
+    for name in cases {
+        let command = format!("restart frontend={name}");
+        let unit = kbf_host_install::contract::restart_request(&command);
+        assert_eq!(frontend_name_ok(&name), unit.is_some(), "{name:?}");
+        // The unit the host restarts is the one the answer is checked against.
+        if frontend_name_ok(&name) {
+            assert_eq!(unit, Some(frontend_unit(&name)), "{name:?}");
+        }
+    }
+}
+
+/// Catches a drift of the Mac answers: the host's own `apply_started` is read as that answer
+/// for the version it names and for no other, and its Mac query line (the report and the
+/// `apply` word, in every state the host writes) is read with the report intact.
+#[test]
+fn the_mac_answers_of_the_host_are_read() {
+    let started = Outcome::ApplyStarted {
+        version: "20261021.1+git9ba38c2-2".into(),
+        commit: "0123456789ab".into(),
+    };
+    let (code, out) = printed(&started);
+    let asked = Version::parse("20261021.1+git9ba38c2-2").expect("version");
+    assert_eq!(
+        install_answer(code, &out, &asked),
+        Ok(InstallAnswer::ApplyStarted)
+    );
+    assert_eq!(
+        install_answer(code, &out, &v1()),
+        Err(PortError::other("bad answer"))
+    );
+    let apply_states = [
+        ("running", Some(Apply::Running)),
+        ("done", Some(Apply::Done)),
+        (
+            "failed:health_timeout:rolled_back",
+            Some(Apply::Failed("health_timeout:rolled_back".to_owned())),
+        ),
+        (
+            "failed:apply_lost",
+            Some(Apply::Failed("apply_lost".to_owned())),
+        ),
+    ];
+    for (line, want) in apply_states {
+        let outcome = Outcome::MacQueried {
+            report: QueryReport {
+                installed_version: Some("1.2.3-1".to_owned()),
+                running_commit: Some("0123456789ab".to_owned()),
+                node_id: Some("mac-1".to_owned()),
+                in_progress: false,
+            },
+            apply: Some(line.to_owned()),
+        };
+        let (code, out) = printed(&outcome);
+        let got = query_answer(code, &out).expect(line);
+        assert_eq!(got.apply, want, "{line}");
+        assert_eq!(got.installed, Installed::Version("1.2.3-1".into()));
+        assert_eq!(got.running_commit.as_deref(), Some("0123456789ab"));
+        assert_eq!(got.node_id.as_deref(), Some("mac-1"));
+    }
+    let none = Outcome::MacQueried {
+        report: QueryReport {
+            installed_version: None,
+            running_commit: None,
+            node_id: Some("mac-1".to_owned()),
+            in_progress: false,
+        },
+        apply: None,
+    };
+    let (code, out) = printed(&none);
+    let got = query_answer(code, &out).expect("no apply yet");
+    assert_eq!((got.apply, got.installed), (None, Installed::NotInstalled));
 }

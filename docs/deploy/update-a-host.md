@@ -5,13 +5,16 @@ This page is about a host that is already set up with [`kbf-installer setup`](kb
 
 | way | state in this build |
 |---|---|
-| by hand, with `kbf-deploy host install` and a restart | works |
+| by hand, with `kbf-deploy host install` and a restart | only a host of the earlier layout, whose units run `releases/current/kbf`; the `kbf` package's units run `/usr/bin/kbf` |
 | `kbf-installer update --frontend`, through the proxy's update API | the host fetches from its `url` source; a refused order is reported late (see below) |
 | pull updates, where the frontend offers and the host fetches | planned |
 
 All three use the same layout: each release in `releases/<commit>/` of the installer tree, the links
 `releases/current` and `releases/previous`, and `state.json`. See
 [host releases](host-releases.md) for the layout and what is trusted.
+
+A farm whose hosts run the packages is rolled by [kbf-updater](kbf-updater.md), which also
+drains, retires and restarts the frontends of a kbf-proxy pool one at a time.
 
 ## Upgrade the installer first (seq)
 
@@ -43,7 +46,8 @@ sudo kbf-deploy host status
   Installing the current release again changes no link. It refuses while a commit-confirm deploy is
   pending in the state.
 - **No verb restarts a service.** After `install --apply` the units still run the old binary until
-  you restart them. Restart the units that run `releases/current/kbf`.
+  you restart them. Restart the units that run `releases/current/kbf` (the mode units of the
+  `kbf` package run `/usr/bin/kbf`, which `host install` does not change).
 - `host status` prints the state and whether the `current` link matches it. It exits 0 when it does
   (or when there is neither), 1 when it does not, and 2 when the state cannot be read
   (`REFUSED: ...`). `--json` prints one object.
@@ -115,7 +119,7 @@ kbf-installer update --frontend --commit <40 hex> \
 | `--api` | the proxy's public address as `host:port`; it must be a loopback address |
 | `--api-ca`, `--api-server-name` | the CA the API's certificate is verified against, and the name it carries (the address's own IP when none is given) |
 | `--token-file` | the operator token, a file of mode 0600 or 0400 (default `/etc/kbf/api-token`, which `setup` writes) |
-| `--nodes` | have the new frontend update the nodes once it has baked; without it only the frontend is swapped |
+| `--nodes` | recorded in the update; the swap sends the new frontend no order for the nodes either way, and the nodes take their release from the host's packages |
 | `--source` | where the release comes from: `fetch` (the default) is the source the installer is configured with; `staged` is the release the host's package carries (`available` in `status.json`). A host whose `release_source` is `bundled` fetches nothing and refuses `fetch` (exit 3, `source_refused`); the proxy refuses `staged` with `--nodes` or a rollback (`source_refused`) and for a commit the package does not carry (`not_staged`), both exit 3 |
 | `--request-id` | names this update, so a run repeated after a lost connection is the same update; random when not given |
 | `--handover-timeout-s` | how long to wait for the update to end, the new frontend's bake included (default 3600) |
@@ -124,17 +128,15 @@ It needs no root and is refused when it comes through `sudo` (exit 2): run it as
 may read the token file. It prints one JSON summary line. The exit codes are 0 for done (and for a
 frontend that already runs the commit), 1 for failed, rolled back, a timeout or an API that does not
 answer, 2 for a usage error (`--source staged` with `--nodes` is one), 3 when the release is
-incompatible or incomplete, when the host will not take the source (`source_refused`,
-`not_staged`), or when the new frontend refused the order to update the nodes (`nodes_refused`),
-and 4 when an update is open, an old child is still draining, or the installer is busy.
+incompatible or incomplete or when the host will not take the source (`source_refused`,
+`not_staged`), and 4 when an update is open, an old child is still draining, or the installer is
+busy.
 
-An update that fails at the order for the nodes has swapped the frontend: the new one serves and
-the nodes were not told. If the new frontend refused the order it is exit 3 (`nodes_refused`,
-with the frontend's own word in the detail); if it never answered in the time the proxy allows it
-is exit 1 (`nodes_unreached`). The same command will not tell the nodes, because the frontend
-already runs the commit (it exits 0): fix what the detail names; the nodes are told by the next
-update to a new commit with `--nodes`. `kbf-installer deploy` is refused on a host whose `release_source` is `bundled`
-(exit 3, `source_refused`, before the bundle is read): it can only fetch.
+The swap sends the new frontend no order for the nodes, so an update does not fail there. An
+update record an earlier build of the proxy wrote can still name `nodes` as the failed step: the
+frontend was swapped and serves, and the nodes were not told. `kbf-installer deploy` is refused on a
+host whose `release_source` is `bundled` (exit 3, `source_refused`, before the bundle is read): it
+can only fetch.
 
 The API refuses a new update with `503` (`handover_unavailable`) when `update.json` is unreadable,
 when the host has no `releases/` directory, when no frontend child was adopted (the proxy's start-up

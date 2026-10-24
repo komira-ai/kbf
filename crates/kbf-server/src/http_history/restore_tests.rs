@@ -779,3 +779,27 @@ fn the_operation_and_the_submit_evidence_come_back_and_old_records_have_none() {
     assert_eq!(rows[0].operation_id, None);
     assert_eq!(rows[0].evidence, None);
 }
+
+/// Catches: submit evidence dropped when a record kept only one of its fields: each of the
+/// memory source, the input byte count and the input file count alone must come back as
+/// evidence (the other fields unnamed), not be read as a record that kept none.
+#[test]
+fn a_record_that_kept_one_evidence_field_comes_back_with_evidence() {
+    use kbf_history::records::BookSource;
+
+    let mut memory_only = run(1, 1_000, 0, RunOutcome::Ok);
+    memory_only.memory_source = BookSource::Hint.into();
+    let mut bytes_only = run(2, 1_000, 0, RunOutcome::Ok);
+    bytes_only.input_bytes = Some(9);
+    let mut files_only = run(3, 1_000, 0, RunOutcome::Ok);
+    files_only.input_files = Some(4);
+    let (rows, _) = to_rows(&[memory_only, bytes_only, files_only], &[]);
+
+    let memory = rows[0].evidence.expect("memory source alone");
+    assert_eq!(memory.memory_source, kbf_invocation::BookSource::Hint);
+    assert_eq!((memory.input_bytes, memory.input_files), (None, None));
+    let bytes = rows[1].evidence.expect("input bytes alone");
+    assert_eq!((bytes.input_bytes, bytes.input_files), (Some(9), None));
+    let files = rows[2].evidence.expect("input files alone");
+    assert_eq!((files.input_bytes, files.input_files), (None, Some(4)));
+}

@@ -22,20 +22,19 @@ use tonic::Code;
 use super::State;
 
 impl State {
-    /// Sends the events of an Execute call answered with `name` on the scheduler's
-    /// operation that a submission of `request` gets: the twin it joins, or the next
-    /// new one, and notes the operation as recorded. Call it before the request is
-    /// fed, so the call comes first.
+    /// Sends the events of an Execute call answered with `name` on `operation`, the
+    /// operation its request gets: the twin it joins (`joined`), or the next new one, and
+    /// notes the operation as recorded. Call it before the request is fed, so the call
+    /// comes first.
     pub(super) fn record_submit(
         &mut self,
         call: ExecuteCall,
         name: &str,
-        request: &kbf_sched::Request,
+        operation: OperationId,
+        joined: bool,
     ) {
-        let twin = self.sched.twin(request);
-        let operation = twin.unwrap_or_else(|| self.sched.next_operation());
         self.recorded.insert(operation);
-        for event in call.answered(name.to_owned(), operation, twin.is_some()) {
+        for event in call.answered(name.to_owned(), operation, joined) {
             self.recorder.emit(event);
         }
     }
@@ -120,6 +119,23 @@ impl State {
                 lease: Some((answer.lease, end)),
                 outcome: answered(finished),
                 result: listing,
+                at: wall_now(),
+            }));
+    }
+
+    /// Sends the end of `operation`, which another frontend ran and the state store now
+    /// shows its callers `finished` with: no lease of this scheduler ended it, and the store
+    /// holds no listing of the result that this frontend reads.
+    pub(super) fn record_followed(&mut self, operation: OperationId, finished: &Finished) {
+        if !self.recorded.remove(&operation) {
+            return;
+        }
+        self.recorder
+            .emit(Event::Finished(kbf_invocation::Finished {
+                operation,
+                lease: None,
+                outcome: answered(finished),
+                result: None,
                 at: wall_now(),
             }));
     }

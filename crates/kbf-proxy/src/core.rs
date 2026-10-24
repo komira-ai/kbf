@@ -14,11 +14,20 @@ use crate::probe::Readiness;
 use crate::security::Security;
 use crate::slot::{ActiveSlot, Slot};
 use crate::term::Terms;
+use crate::upstreams::Upstreams;
 
 /// The clock every stream reads. It is tokio's, so a test under paused time moves it; the
 /// hold queue takes `std` instants, which tokio's convert to and from exactly.
 pub(crate) fn now() -> Instant {
     tokio::time::Instant::now().into_std()
+}
+
+/// How a core finds its children.
+pub(crate) enum Mode {
+    /// Two slots on a table of ports, one of them active (a supervisor starts and swaps them).
+    Slots(UpstreamTable),
+    /// A pool of frontends that run on their own.
+    Pool(Arc<Upstreams>),
 }
 
 pub(crate) struct Core {
@@ -28,8 +37,12 @@ pub(crate) struct Core {
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) limits: Limits,
     pub(crate) security: Security,
-    /// What `/readyz` says: the poll of the active child writes it (`crate::probe`).
+    /// What `/readyz` says in slot mode: the poll of the active child writes it
+    /// (`crate::probe`). In pool mode it is only the question the members' polls ask with.
     pub(crate) ready: Readiness,
+    /// The members of the pool, in pool mode; none in slot mode, which is every use of the
+    /// gate, the hold queue and the terms.
+    pub(crate) upstreams: Option<Arc<Upstreams>>,
     /// The term of each slot's child, for a `WaitExecution` that names the old child's
     /// operation (`crate::term`).
     pub(crate) terms: Terms,
@@ -52,7 +65,7 @@ impl Core {
         security: Security,
     ) -> Arc<Self> {
         Self::with_metrics(
-            table,
+            Mode::Slots(table),
             limits,
             slots,
             connector,
@@ -63,9 +76,10 @@ impl Core {
     }
 
     /// As [`Core::new`], over `metrics` made earlier: what must be loaded before the secret
-    /// is created (the TLS files) counts its failures there.
+    /// is created (the TLS files) counts its failures there. `mode` says where the children
+    /// are.
     pub(crate) fn with_metrics(
-        table: UpstreamTable,
+        mode: Mode,
         limits: Limits,
         slots: ActiveSlot,
         connector: Connector,
@@ -73,12 +87,17 @@ impl Core {
         metrics: Arc<Metrics>,
         ui: bool,
     ) -> Arc<Self> {
+        let (table, upstreams) = match mode {
+            Mode::Slots(table) => (table, None),
+            Mode::Pool(upstreams) => (UpstreamTable::POOL_MODE, Some(upstreams)),
+        };
         Arc::new(Self {
             ui: AtomicBool::new(ui),
             slots,
             queue: HoldQueue::new(HoldLimits::default()),
             ready: Readiness::new(connector.clone()),
             terms: Terms::new(connector.clone()),
+            upstreams,
             pool: Pool::new(table, Arc::clone(&metrics), connector),
             metrics,
             limits,
@@ -93,9 +112,13 @@ impl Core {
         self.table
     }
 
-    /// Whether `/readyz` answers 200 now.
+    /// Whether `/readyz` answers 200 now: in slot mode, the active child's poll passed; in pool
+    /// mode, some member is up and its poll passed.
     pub(crate) fn is_ready(&self) -> bool {
-        self.ready.is_ready(&self.slots, now())
+        match &self.upstreams {
+            Some(members) => members.is_ready(),
+            None => self.ready.is_ready(&self.slots, now()),
+        }
     }
 
     /// Counts a stream going to a backend (held, dialing or bound) against `max_streams`.

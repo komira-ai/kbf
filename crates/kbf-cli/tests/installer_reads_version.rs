@@ -51,14 +51,14 @@ fn the_installer_parses_what_kbf_prints() {
     assert_eq!(parsed.platform, None);
 }
 
-/// The installer takes `release_source = "bundled"` only beside a `kbf` that declares the relay
+/// The installer rolls a `bundled` host back only to a `kbf` that declares the relay
 /// (`RELAY_NEEDED`), and `kbf` is shipped by the same build as the installer: the level this
-/// build declares must meet the level this build's installer needs, or `setup` would refuse the
-/// release it was shipped with.
+/// build declares must meet the level this build's installer needs, or `rollback` would refuse
+/// the release it was shipped with.
 ///
 /// Catches the two numbers drifting apart (the installer's raised, the build's not).
 ///
-/// Mutant to plant: `RELAY_NEEDED` raised to 2 (red on both assertions).
+/// Catches: `RELAY_NEEDED` raised to 2 (red on both assertions).
 #[test]
 fn the_build_declares_the_relay_its_installer_needs() {
     let parsed = Version::parse(kbf_cli::version::line().as_bytes()).expect("parses");
@@ -85,7 +85,7 @@ fn the_build_declares_the_relay_its_installer_needs() {
 /// together and that line cannot go red for it. It only catches `supported()` being changed to
 /// a number below `latest()`.
 ///
-/// Mutants planted: `kbf_installer::stage::supported()` with `protocol: 0` (red on the
+/// Catches: `kbf_installer::stage::supported()` with `protocol: 0` (red on the
 /// protocol line); with `state_schema: 0` (red on the schema line); the server's
 /// `PROTOCOL_VERSION` raised to 2 (red on the protocol line).
 #[test]

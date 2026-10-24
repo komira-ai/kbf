@@ -200,7 +200,9 @@ pub(crate) fn mounts_under(mount: &str, roots: &[&Path]) -> Vec<PathBuf> {
 }
 
 /// The kill loop: `kill`, then `scan` the uid's processes, then `pause`, until two scans
-/// in a row find none, for at most [`MAX_SCANS`] scans and until `expired` says so. The
+/// in a row find none, for at most [`MAX_SCANS`] scans and until `expired` says so. A
+/// deadline that passes after one quiet scan allows one more kill and scan, so a uid that
+/// has just gone quiet is not failed for the second look it had no time for. The
 /// first scan after a kill can be empty while a process the kill raced with starts one
 /// more (a respawn, a fork in flight); the second, [`SCAN_PAUSE`] later, sees it.
 ///
@@ -225,7 +227,8 @@ pub(crate) fn kill_until_quiet(
         } else {
             quiet = 0;
         }
-        if expired() {
+        // After the one more scan the count is 2 (returned) or 0, so this allows only one.
+        if expired() && quiet != 1 {
             break;
         }
         pause();

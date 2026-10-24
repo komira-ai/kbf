@@ -16,7 +16,9 @@
 //! - the trust directory holds `gh` (mode 0755, and byte for byte `--gh`, the pinned
 //!   program the job downloaded and checked, when given), `installer.conf` and a
 //!   `trusted_root.jsonl` that is JSON lines ([`crate::pkg_trust::root_problems`]),
-//!   with the modes of [`crate::pkg_linux::TRUST_FILES`].
+//!   with the modes of [`crate::pkg_linux::TRUST_FILES`];
+//! - it holds neither `usr/bin/kbf` nor a unit of the modes ([`crate::pkg_linux::KBF_UNITS`]):
+//!   the `kbf` package carries them ([`crate::pkg_kbf_asset`]).
 //!
 //! Then, without `--verify-only`, it copies the deb to `<out>/kbf-installer-<commit>-
 //! <platform>.deb` and appends its line to `<out>/SHA256SUMS.<platform>`
@@ -29,11 +31,20 @@ use std::path::{Path, PathBuf};
 
 use crate::fetch::Sha256;
 use crate::package::{Platform, open_sums, read, write_new, write_sums};
-use crate::pkg_linux::{self, TRUST_DIR, TRUST_FILES};
+use crate::pkg_linux::{self, KBF_PATH, KBF_UNITS, TRUST_DIR, TRUST_FILES, UNIT_DIR};
 use crate::{Error, build_commit, pkg_trust, sums};
 
 /// The binary's path in the deb, and in the data tarball (no leading slash).
 const BINARY: &str = "usr/bin/kbf-installer";
+
+/// The paths of the files of the `kbf` package, as a data tarball names them (no leading
+/// slash): the `kbf` binary and the units of the modes.
+pub(crate) fn kbf_package_paths() -> Vec<String> {
+    std::iter::once(KBF_PATH.to_owned())
+        .chain(KBF_UNITS.iter().map(|unit| format!("{UNIT_DIR}/{unit}")))
+        .map(|path| path.trim_start_matches('/').to_owned())
+        .collect()
+}
 
 /// The package file `package` names: the file itself, or, for a directory, the one file
 /// in it whose name ends `.<ext>` (what nfpm left in `pkg-build --out`, under a name made
@@ -181,6 +192,115 @@ fn ar_members(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
     Ok(found)
 }
 
+/// A deb as the checks read it: the text of its `control` file and the regular files of its
+/// data tarball.
+pub(crate) struct Opened {
+    pub(crate) control: String,
+    pub(crate) files: Vec<Member>,
+}
+
+impl Opened {
+    /// The file at `path` (no leading slash), when the deb holds it.
+    pub(crate) fn file(&self, path: &str) -> Option<&Member> {
+        self.files.iter().find(|m| m.path == path)
+    }
+}
+
+/// Opens `deb`, an `ar` archive of a gzip `control.tar.gz` and `data.tar.gz`, as the package
+/// for `platform`. What is wrong with the archive, or with the `Architecture` its control
+/// file says, is added to `problems`. `None` when the checks cannot go on: the archive is not
+/// an `ar` (that alone is then the only problem), or a part is missing or unreadable.
+pub(crate) fn open(deb: &[u8], platform: Platform, problems: &mut Vec<String>) -> Option<Opened> {
+    let parts = match ar_members(deb) {
+        Ok(parts) => parts,
+        Err(e) => {
+            *problems = vec![e];
+            return None;
+        }
+    };
+    let part = |name: &str| parts.iter().find(|(n, _)| n == name).map(|(_, b)| b);
+    let Some(control) = part("control.tar.gz") else {
+        problems.push("has no control.tar.gz (nfpm is configured for gzip)".to_owned());
+        return None;
+    };
+    let Some(data) = part("data.tar.gz") else {
+        problems.push("has no data.tar.gz (nfpm is configured for gzip)".to_owned());
+        return None;
+    };
+    let text = match members(control) {
+        Err(e) => {
+            problems.push(format!("control.tar.gz: {e}"));
+            String::new()
+        }
+        Ok(files) => {
+            let text = files
+                .iter()
+                .find(|m| m.path == "control")
+                .map(|m| String::from_utf8_lossy(&m.bytes).into_owned())
+                .unwrap_or_default();
+            let want = architecture(platform);
+            let got = text.lines().find_map(|l| l.strip_prefix("Architecture: "));
+            if got != Some(want) {
+                problems.push(format!(
+                    "control says Architecture {:?}, not {want:?} for {}",
+                    got.unwrap_or("(none)"),
+                    platform.name()
+                ));
+            }
+            text
+        }
+    };
+    match members(data) {
+        Ok(files) => Some(Opened {
+            control: text,
+            files,
+        }),
+        Err(e) => {
+            problems.push(format!("data.tar.gz: {e}"));
+            None
+        }
+    }
+}
+
+/// What is wrong with `in_deb`, the file `path` of a package, as the file `member` of the
+/// release tarball at `tarball`: not in the package, the tarball without it, not its bytes,
+/// or not mode 0755.
+///
+/// # Errors
+/// The tarball cannot be read.
+pub(crate) fn binary_problems(
+    in_deb: Option<&Member>,
+    path: &str,
+    member: &str,
+    tarball: &Path,
+) -> Result<Vec<String>, Error> {
+    let tgz = read(tarball)?;
+    let shipped = members(&tgz)
+        .ok()
+        .and_then(|m| m.into_iter().find(|m| m.path == member));
+    let mut problems = Vec::new();
+    match (in_deb, shipped) {
+        (None, _) => problems.push(format!("holds no {path}")),
+        (Some(_), None) => {
+            problems.push(format!("{} holds no {member}", tarball.display()));
+        }
+        (Some(in_deb), Some(in_tarball)) => {
+            if in_deb.bytes != in_tarball.bytes {
+                problems.push(format!(
+                    "{path} (sha256:{}) is not the binary of {} (sha256:{})",
+                    Sha256::of(&in_deb.bytes),
+                    tarball.display(),
+                    Sha256::of(&in_tarball.bytes)
+                ));
+            }
+            if in_deb.mode != 0o755 {
+                problems.push(format!("{path} has mode {:04o}, not 0755", in_deb.mode));
+            }
+        }
+    }
+    Ok(problems)
+}
+
 /// The inputs of the checks.
 pub struct Check<'a> {
     pub platform: Platform,
@@ -205,70 +325,17 @@ pub fn problems(deb: &[u8], c: &Check) -> Result<Vec<String>, Error> {
             c.expect_ref
         ));
     }
-    let parts = match ar_members(deb) {
-        Ok(parts) => parts,
-        Err(e) => return Ok(vec![e]),
-    };
-    let part = |name: &str| parts.iter().find(|(n, _)| n == name).map(|(_, b)| b);
-    let Some(control) = part("control.tar.gz") else {
-        problems.push("has no control.tar.gz (nfpm is configured for gzip)".to_owned());
+    let Some(deb) = open(deb, c.platform, &mut problems) else {
         return Ok(problems);
     };
-    let Some(data) = part("data.tar.gz") else {
-        problems.push("has no data.tar.gz (nfpm is configured for gzip)".to_owned());
-        return Ok(problems);
-    };
-    match members(control) {
-        Err(e) => problems.push(format!("control.tar.gz: {e}")),
-        Ok(files) => {
-            let text = files
-                .iter()
-                .find(|m| m.path == "control")
-                .map(|m| String::from_utf8_lossy(&m.bytes).into_owned())
-                .unwrap_or_default();
-            let want = architecture(c.platform);
-            let got = text.lines().find_map(|l| l.strip_prefix("Architecture: "));
-            if got != Some(want) {
-                problems.push(format!(
-                    "control says Architecture {:?}, not {want:?} for {}",
-                    got.unwrap_or("(none)"),
-                    c.platform.name()
-                ));
-            }
-        }
-    }
-    let files = match members(data) {
-        Ok(files) => files,
-        Err(e) => {
-            problems.push(format!("data.tar.gz: {e}"));
-            return Ok(problems);
-        }
-    };
-    let file = |path: &str| files.iter().find(|m| m.path == path);
+    let file = |path: &str| deb.file(path);
     // The binary the attestation covers is the one in the package.
-    let tarball = read(c.binary_tarball)?;
-    let shipped = members(&tarball)
-        .ok()
-        .and_then(|m| m.into_iter().find(|m| m.path == pkg_linux::NAME));
-    match (file(BINARY), shipped) {
-        (None, _) => problems.push(format!("holds no {BINARY}")),
-        (Some(_), None) => problems.push(format!(
-            "{} holds no {}",
-            c.binary_tarball.display(),
-            pkg_linux::NAME
-        )),
-        (Some(in_deb), Some(in_tarball)) => {
-            if in_deb.bytes != in_tarball.bytes {
-                problems.push(format!(
-                    "{BINARY} (sha256:{}) is not the binary of {} (sha256:{})",
-                    Sha256::of(&in_deb.bytes),
-                    c.binary_tarball.display(),
-                    Sha256::of(&in_tarball.bytes)
-                ));
-            }
-            if in_deb.mode != 0o755 {
-                problems.push(format!("{BINARY} has mode {:04o}, not 0755", in_deb.mode));
-            }
+    let binary = binary_problems(file(BINARY), BINARY, pkg_linux::NAME, c.binary_tarball)?;
+    problems.extend(binary);
+    // The runtime and the units of its modes are the `kbf` package's.
+    for path in kbf_package_paths() {
+        if file(&path).is_some() {
+            problems.push(format!("holds {path}, which only the kbf package ships"));
         }
     }
     let dir = TRUST_DIR.trim_start_matches('/');
@@ -333,18 +400,44 @@ pub enum Mode<'a> {
 /// # Errors
 /// The commit is not one, the deb is refused, or a file cannot be read or written.
 pub fn asset(deb: &Path, commit: &str, mode: &Mode, c: &Check) -> Result<Vec<String>, Error> {
+    let said = format!(
+        "a {} package of the binary in {}, trusting {}",
+        c.platform.name(),
+        c.binary_tarball.display(),
+        c.expect_ref
+    );
+    let name = file_name(commit, c.platform);
+    let found = |bytes: &[u8]| problems(bytes, c);
+    publish(deb, (commit, c.platform), &name, mode, found, &said)
+}
+
+/// What the verbs that make a deb an asset have in common: the commit and the platform are
+/// valid, the deb has none of the problems `found` names in its bytes, and it is either copied
+/// to `<out>/<name>` and listed in the sums or, with [`Mode::VerifyOnly`], named `name`
+/// already. `said` is what a verified deb is said to be, after its name.
+///
+/// # Errors
+/// The commit is not one, the platform is not Linux, the deb is refused, or a file cannot be
+/// read or written.
+pub(crate) fn publish(
+    deb: &Path,
+    (commit, platform): (&str, Platform),
+    name: &str,
+    mode: &Mode,
+    found: impl FnOnce(&[u8]) -> Result<Vec<String>, Error>,
+    said: &str,
+) -> Result<Vec<String>, Error> {
     if !build_commit::is_commit(commit) {
         return Err(Error::NotACommit(commit.to_owned()));
     }
-    if !matches!(c.platform, Platform::LinuxX86_64 | Platform::LinuxArm64) {
+    if !matches!(platform, Platform::LinuxX86_64 | Platform::LinuxArm64) {
         return Err(Error::Usage(format!(
             "--platform {}: the package is for Linux",
-            c.platform.name()
+            platform.name()
         )));
     }
-    let name = file_name(commit, c.platform);
     let bytes = read(deb)?;
-    let found = problems(&bytes, c)?;
+    let found = found(&bytes)?;
     let refused = |found: Vec<String>| {
         Error::Refused(
             found
@@ -359,21 +452,16 @@ pub fn asset(deb: &Path, commit: &str, mode: &Mode, c: &Check) -> Result<Vec<Str
     let sha = Sha256::of(&bytes);
     match mode {
         Mode::VerifyOnly => {
-            if deb.file_name().and_then(|n| n.to_str()) != Some(name.as_str()) {
+            if deb.file_name().and_then(|n| n.to_str()) != Some(name) {
                 return Err(Error::Refused(vec![format!(
                     "{} is not named {name}: --verify-only checks the asset itself",
                     deb.display()
                 )]));
             }
-            Ok(vec![format!(
-                "{name}: a {} package of the binary in {}, trusting {}",
-                c.platform.name(),
-                c.binary_tarball.display(),
-                c.expect_ref
-            )])
+            Ok(vec![format!("{name}: {said}")])
         }
         Mode::Add(out) => {
-            let (sums_path, mut lines) = open_sums(out, c.platform)?;
+            let (sums_path, mut lines) = open_sums(out, platform)?;
             if let Some(l) = lines.iter().find(|l| l.name == name) {
                 return Err(Error::Failed(format!(
                     "{} already lists {}",
@@ -381,10 +469,10 @@ pub fn asset(deb: &Path, commit: &str, mode: &Mode, c: &Check) -> Result<Vec<Str
                     l.name
                 )));
             }
-            write_new(&out.join(&name), &bytes)?;
+            write_new(&out.join(name), &bytes)?;
             lines.push(sums::Line {
                 sha256: sha,
-                name: name.clone(),
+                name: name.to_owned(),
             });
             let text = write_sums(&sums_path, &lines)?;
             let mut printed = vec![format!("packaged {name}:")];

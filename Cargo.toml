@@ -81,6 +81,9 @@ md-5 = "0.11.0"
 objc2 = "0.6.5"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
 objc2-open-directory = { version = "0.3.2", default-features = false, features = ["std"] }
+# macOS only (kbf-driver-native's tests): Metal, to run a compute kernel as a pool user.
+# Licence: Zlib OR Apache-2.0 OR MIT, on deny.toml's allow list.
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std"] }
 # macOS only (kbf-vmm): Virtualization.framework, with the block and dispatch crates its
 # completion handlers and queues use. Licences: objc2 family Zlib OR Apache-2.0 OR MIT,
 # block2 and dispatch2 MIT OR Apache-2.0 OR Zlib; all on deny.toml's allow list.
@@ -229,6 +232,7 @@ kbf-route = { path = "crates/kbf-route" }
 kbf-sched = { path = "crates/kbf-sched" }
 kbf-segments = { path = "crates/kbf-segments" }
 kbf-server = { path = "crates/kbf-server" }
+kbf-setup = { path = "crates/kbf-setup" }
 kbf-signer = { path = "crates/kbf-signer" }
 kbf-sim = { path = "crates/kbf-sim" }
 kbf-sim-cell = { path = "crates/kbf-sim-cell" }

@@ -276,7 +276,7 @@ fn name_verify(routes: Vec<Route>) -> Vec<Route> {
 }
 
 /// The exact number of `(method, path)` routes, verbs expanded. A new route moves it.
-const ROUTES: usize = 63;
+const ROUTES: usize = 61;
 
 fn server_routes() -> Vec<Route> {
     let mut files = Vec::new();
@@ -471,4 +471,15 @@ fn the_ui_design_names_no_route_the_server_dropped() {
         !text.contains("update/hosts"),
         "docs/design/kbf-ui-v1.md names `update/hosts`, a route the server no longer serves"
     );
+}
+
+#[test]
+fn the_rollout_rules_cite_no_removed_desired_route_or_moved_file() {
+    let text = fs::read_to_string(root().join("docs/design/frontend-proxy.md")).unwrap();
+    for stale in ["update/age.rs", "returns 409 otherwise"] {
+        assert!(
+            !text.contains(stale),
+            "docs/design/frontend-proxy.md still says `{stale}`: the desired-release route is gone and the age check lives in release/age.rs"
+        );
+    }
 }

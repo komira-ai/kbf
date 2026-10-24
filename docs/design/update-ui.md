@@ -32,7 +32,7 @@ everything the page shows.
   No per-host update state is served.
 - **[F]** #976 serves `GET /v1/update` **open** as `{desired, releases}` (`desired` is `{generation, commit, set_at_ms,
   paused}`), `POST /v1/update/desired` with `Offer` = `deny_unknown_fields {commit}`, and `POST /v1/update/pause` and
-  `/resume` (`release/desired.rs`). Writes pass `operator_gate`. Its owner says it is gaining an optional `expect_generation`
+  `/resume` (`release/desired.rs`, since deleted). Writes pass `operator_gate`. Its owner says it is gaining an optional `expect_generation`
   (409 on mismatch, no write) and a `policy` object in `GET /v1/update`; **this file builds on both and says so**:
   `GET /v1/update` = `{desired, releases, policy?}`, `Offer` = `{commit, expect_generation?}`. **Where pause lives.** At #976's head `policy_view` has no `paused` field: pause is `desired.paused`, and `policy` is null until a
   policy row exists. The page's rule: **use `policy.paused` only if that key is present, else `desired.paused`**, so a policy row

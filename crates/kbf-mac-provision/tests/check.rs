@@ -1,6 +1,6 @@
 //! `check` against a fake Mac: a fresh Mac fails every item `apply` would set; a
 //! converged Mac passes every item; the cases that must pass are not drift. The named
-//! tests are the script's planted mutants, one test per defect (`drift.rs` holds the
+//! tests are the script's defects, one test per defect (`drift.rs` holds the
 //! script's drift table).
 
 mod support;
@@ -13,7 +13,7 @@ use support::{
     lines,
 };
 
-/// Catches: an item dropped from the table (the script's mutants "check skips a key"
+/// Catches: an item dropped from the table (the script's defects "check skips a key"
 /// for `power_womp` and `updates_auto_download`), an item `apply` sets that a fresh Mac
 /// passes, or a check that runs a program that changes the Mac (the script's
 /// `t_converge`, check part).
@@ -59,7 +59,7 @@ fn a_fresh_mac_fails_every_item_apply_sets() {
 }
 
 /// Catches: a converged Mac failing an item: a check reading the wrong program, path or
-/// format (the script's mutants "pmset keys match in any case", "IsHidden read without
+/// format (the script's defects "pmset keys match in any case", "IsHidden read without
 /// the dsAttrTypeNative: prefix", "the sshd drop-in sorts after the system one").
 #[test]
 fn a_converged_mac_passes_every_item() {
@@ -88,7 +88,7 @@ fn a_converged_mac_passes_every_item() {
 }
 
 /// Catches: a rendering defect in the job's property list: another `ProcessType` (the
-/// script's mutant "the job runs as a Standard process"), or no `UserName` ("the job runs
+/// script's defect "the job runs as a Standard process"), or no `UserName` ("the job runs
 /// as root").
 #[test]
 fn the_job_renders_as_the_golden_property_list() {
@@ -129,7 +129,7 @@ fn the_node_config_has_no_label_key_for_any_profile() {
     let texts = [
         base.clone(),
         format!("{base}daemon_user=root\n"),
-        format!("{base}pool_users=2\n"),
+        base.replace("pool_users=4", "pool_users=2"),
         support::EXAMPLE.to_owned(),
     ];
     for text in texts {
@@ -147,7 +147,7 @@ fn the_node_config_has_no_label_key_for_any_profile() {
 }
 
 /// Catches: entries that are not drift reported as drift: an images list beside the
-/// runtime images, a link to a pinned Xcode (the script's mutant "a link to an Xcode
+/// runtime images, a link to a pinned Xcode (the script's defect "a link to an Xcode
 /// counts as unpinned"), a commented keyword before the Include line, a drop-in that
 /// sorts after ours, a dangling link among the drop-ins (the script's
 /// `t_quiet_entries`).
@@ -177,7 +177,7 @@ fn entries_that_are_not_drift_pass() {
 }
 
 /// Catches: a lease user's auto-login failed, so `apply` would clear it mid-lease (the
-/// script's mutant "a lease user in range fails"; `t_lease_autologin`, check part).
+/// script's defect "a lease user in range fails"; `t_lease_autologin`, check part).
 #[test]
 fn a_lease_user_named_by_the_intent_record_passes() {
     let mut mac = FakeMac::converged("lease-autologin");
@@ -202,7 +202,7 @@ fn a_lease_user_named_by_the_intent_record_passes() {
     assert_eq!(check(&lease0).failed, 0);
 }
 
-/// Catches: any `kbf-lease-*` user passing whatever its uid (the script's mutant), here
+/// Catches: any `kbf-lease-*` user passing whatever its uid (the script's defect), here
 /// one past each end of `lease_uids`.
 #[test]
 fn a_lease_user_outside_lease_uids_fails() {
@@ -229,7 +229,7 @@ fn a_lease_user_outside_lease_uids_fails() {
 }
 
 /// Catches: any auto-login user in range passing whatever its name (the script's
-/// mutant), even one the intent record would name if it were a lease user.
+/// defect), even one the intent record would name if it were a lease user.
 #[test]
 fn an_auto_login_user_not_named_kbf_lease_fails() {
     assert_only_fails(
@@ -244,7 +244,7 @@ fn an_auto_login_user_not_named_kbf_lease_fails() {
     );
 }
 
-/// Catches: a lease user in range passing with no intent record (the script's mutant
+/// Catches: a lease user in range passing with no intent record (the script's defect
 /// "with or without an intent record").
 #[test]
 fn a_lease_user_no_intent_record_names_fails() {
@@ -259,7 +259,7 @@ fn a_lease_user_no_intent_record_names_fails() {
     );
 }
 
-/// Catches: the intent record read through a symbolic link (the script's mutant), so a
+/// Catches: the intent record read through a symbolic link (the script's defect), so a
 /// planted link names a lease.
 #[test]
 fn an_intent_record_that_is_a_link_is_ignored() {
@@ -277,7 +277,7 @@ fn an_intent_record_that_is_a_link_is_ignored() {
     );
 }
 
-/// Catches: a `/etc/kcpassword` left with auto-login off passing (the script's mutant
+/// Catches: a `/etc/kcpassword` left with auto-login off passing (the script's defect
 /// "a stale /etc/kcpassword is ignored").
 #[test]
 fn a_kcpassword_left_with_auto_login_off_fails() {
@@ -288,7 +288,7 @@ fn a_kcpassword_left_with_auto_login_off_fails() {
     );
 }
 
-/// Catches: the property list's content not compared (the script's mutant "the job
+/// Catches: the property list's content not compared (the script's defect "the job
 /// file is not compared").
 #[test]
 fn a_property_list_that_differs_fails() {
@@ -305,7 +305,7 @@ fn a_property_list_that_differs_fails() {
     );
 }
 
-/// Catches: the job not checked as loaded (the script's mutant).
+/// Catches: the job not checked as loaded (the script's defect).
 #[test]
 fn a_job_that_is_not_loaded_fails() {
     assert_only_fails(
@@ -315,7 +315,7 @@ fn a_job_that_is_not_loaded_fails() {
     );
 }
 
-/// Catches: a simulator runtime image ignored (the script's mutant).
+/// Catches: a simulator runtime image ignored (the script's defect).
 #[test]
 fn a_simulator_runtime_image_fails() {
     assert_only_fails(
@@ -325,7 +325,7 @@ fn a_simulator_runtime_image_fails() {
     );
 }
 
-/// Catches: a mounted simulator runtime ignored (the script's mutant).
+/// Catches: a mounted simulator runtime ignored (the script's defect).
 #[test]
 fn a_mounted_simulator_runtime_fails() {
     assert_only_fails(
@@ -335,7 +335,7 @@ fn a_mounted_simulator_runtime_fails() {
     );
 }
 
-/// Catches: an Xcode of another build passing (the script's mutant).
+/// Catches: an Xcode of another build passing (the script's defect).
 #[test]
 fn an_xcode_of_another_build_fails() {
     assert_only_fails(
@@ -345,7 +345,7 @@ fn an_xcode_of_another_build_fails() {
     );
 }
 
-/// Catches: an unpinned Xcode ignored (the script's mutant).
+/// Catches: an unpinned Xcode ignored (the script's defect).
 #[test]
 fn an_unpinned_xcode_fails() {
     assert_only_fails(
@@ -355,7 +355,7 @@ fn an_unpinned_xcode_fails() {
     );
 }
 
-/// Catches: one of the three names scutil keeps not checked (the script's mutant drops
+/// Catches: one of the three names scutil keeps not checked (the script's defect drops
 /// `ComputerName`): each name drifts alone.
 #[test]
 fn each_of_the_three_host_names_is_checked() {
@@ -384,8 +384,8 @@ fn each_of_the_three_host_names_is_checked() {
     );
 }
 
-/// Catches: another administrator ignored (the script's mutant), whether listed in the
-/// group or an administrator by primary group (the mutant that skips the user list).
+/// Catches: another administrator ignored (the script's defect), whether listed in the
+/// group or an administrator by primary group (the defect that skips the user list).
 #[test]
 fn another_administrator_fails() {
     assert_only_fails(
@@ -410,7 +410,7 @@ fn another_administrator_fails() {
 }
 
 /// Catches: the administrator checked by the `GroupMembership` list only (the script's
-/// mutant): an admin by primary group alone passes, one in no group fails.
+/// defect): an admin by primary group alone passes, one in no group fails.
 #[test]
 fn the_administrator_is_checked_through_dseditgroup() {
     let mut mac = FakeMac::converged("admin-primary");
@@ -429,7 +429,7 @@ fn the_administrator_is_checked_through_dseditgroup() {
     );
 }
 
-/// Catches: the role account's `Password` not checked (the script's mutant).
+/// Catches: the role account's `Password` not checked (the script's defect).
 #[test]
 fn a_role_account_with_a_password_fails() {
     assert_only_fails(
@@ -440,7 +440,7 @@ fn a_role_account_with_a_password_fails() {
 }
 
 /// Catches: `AuthenticationAuthority` read as one line, where dscl prints its value on
-/// the next (the script's mutant).
+/// the next (the script's defect).
 #[test]
 fn an_authentication_authority_fails_the_role_account() {
     assert_only_fails(
@@ -453,7 +453,7 @@ fn an_authentication_authority_fails_the_role_account() {
     );
 }
 
-/// Catches: a group holding the role id ignored (the script's mutant).
+/// Catches: a group holding the role id ignored (the script's defect).
 #[test]
 fn a_group_holding_the_role_id_fails() {
     assert_only_fails(
@@ -473,7 +473,7 @@ fn a_role_group_with_another_id_fails() {
     );
 }
 
-/// Catches: the sshd `Include` line not required (the script's mutant).
+/// Catches: the sshd `Include` line not required (the script's defect).
 #[test]
 fn an_sshd_config_without_the_include_line_fails() {
     assert_only_fails(
@@ -488,7 +488,7 @@ fn an_sshd_config_without_the_include_line_fails() {
     );
 }
 
-/// Catches: a drop-in that sorts before ours ignored (the script's mutant).
+/// Catches: a drop-in that sorts before ours ignored (the script's defect).
 #[test]
 fn a_drop_in_read_before_ours_fails() {
     assert_only_fails(
@@ -504,7 +504,7 @@ fn a_drop_in_read_before_ours_fails() {
 }
 
 /// Catches: a keyword before the Include line ignored, matched in one case only, or
-/// missed when written `Keyword=value` (three of the script's mutants).
+/// missed when written `Keyword=value` (three of the script's defects).
 #[test]
 fn a_keyword_before_the_include_line_fails() {
     assert_only_fails(
@@ -539,7 +539,7 @@ fn a_keyword_before_the_include_line_fails() {
     );
 }
 
-/// Catches: `sshd -T` not consulted (the script's mutant): what sshd uses differs
+/// Catches: `sshd -T` not consulted (the script's defect): what sshd uses differs
 /// from every file the check reads.
 #[test]
 fn what_sshd_reports_is_checked() {
@@ -552,7 +552,7 @@ fn what_sshd_reports_is_checked() {
     );
 }
 
-/// Catches: `sshd -T` run as another user, which it refuses (the script's mutant "sshd
+/// Catches: `sshd -T` run as another user, which it refuses (the script's defect "sshd
 /// -T runs without root"; `t_sshd_not_root`).
 #[test]
 fn sshd_is_not_asked_without_root() {
@@ -574,7 +574,7 @@ fn sshd_is_not_asked_without_root() {
 }
 
 /// Catches: a large clock offset passing, or a negative one counted as in range (two
-/// of the script's mutants); and the boundary, an offset equal to the maximum, failing.
+/// of the script's defects); and the boundary, an offset equal to the maximum, failing.
 #[test]
 fn the_clock_offset_is_bounded_both_ways() {
     assert_only_fails(
@@ -615,7 +615,7 @@ fn offsets_parse_to_whole_milliseconds() {
     }
 }
 
-/// Catches: a probe with another SHA-256 passing (the script's mutant).
+/// Catches: a probe with another SHA-256 passing (the script's defect).
 #[test]
 fn a_probe_with_another_sha256_fails() {
     assert_only_fails(
@@ -626,7 +626,7 @@ fn a_probe_with_another_sha256_fails() {
 }
 
 /// Catches: an error log that is not safe to empty as root passing check: a symbolic
-/// or a hard link to a root file (the script's mutants "check ignores the error log",
+/// or a hard link to a root file (the script's defects "check ignores the error log",
 /// "a hard link at the error log path counts as safe"; `t_err_log`, check part).
 #[test]
 fn an_error_log_that_is_a_link_fails() {
@@ -654,7 +654,7 @@ fn an_error_log_that_is_a_link_fails() {
     }
 }
 
-/// Catches: a missing error log counted as safe (the script's mutant).
+/// Catches: a missing error log counted as safe (the script's defect).
 #[test]
 fn a_missing_error_log_fails() {
     assert_only_fails(
@@ -664,7 +664,7 @@ fn a_missing_error_log_fails() {
     );
 }
 
-/// Catches: a log directory that is not root's passing (the script's mutant "the log
+/// Catches: a log directory that is not root's passing (the script's defect "the log
 /// directory is the role account's"): the role account could swap the error log.
 #[test]
 fn a_log_directory_that_is_not_roots_fails() {
@@ -694,7 +694,7 @@ fn keys_limits_check_to_the_named_items() {
     assert_eq!(check_keys(&mac, Some(",firewall,")).text.lines().count(), 2);
 }
 
-/// Catches: `--keys` ignoring an unknown item (the script's mutant), so a typo checks
+/// Catches: `--keys` ignoring an unknown item (the script's defect), so a typo checks
 /// nothing and passes.
 #[test]
 fn keys_refuses_an_unknown_item() {
@@ -780,7 +780,7 @@ fn with_no_probe_pinned_the_probe_item_passes() {
 }
 
 /// Catches: a check-only item's failure not saying that `apply` leaves it (the
-/// script's mutant "apply turns FileVault off" relies on the item being check only),
+/// script's defect "apply turns FileVault off" relies on the item being check only),
 /// or a changeable item's failure saying so.
 #[test]
 fn only_check_only_items_say_apply_leaves_them() {

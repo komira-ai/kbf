@@ -14,6 +14,7 @@ mod lifetime;
 mod operator;
 mod own_headers;
 pub(crate) mod pki;
+mod pool_kit;
 mod ready;
 mod reload;
 mod remote;

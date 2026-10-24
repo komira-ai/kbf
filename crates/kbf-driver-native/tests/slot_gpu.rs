@@ -1,537 +1,241 @@
-//! What a pool lease's GPU work leaves behind, and that the slot's clean removes it, on a
-//! Mac with a Metal device (docs/design/macos-end-state.md, "GPU state of a pool lease").
+//! The GPU under the slot profile: a pool user, under the exact profile the driver
+//! generates for a lease, gets a Metal device, compiles a kernel from source at run time
+//! and runs it on the GPU (`slot_gpu/probe.rs`, this binary started as the pool user), and
+//! a profile with one of the two denies that took the GPU away on a hosted runner gets
+//! none of that, so the probe is seen to fail:
+//! - `(deny iokit-open)`: no Metal device (the device step fails);
+//! - a `mach-lookup` deny of `com.apple.MTLCompilerService`: the device and queue work and
+//!   the kernel cannot be compiled or turned into a pipeline (the library or pipeline step
+//!   fails).
 //!
-//! One lease on a pool of one user runs, under the slot profile with the lease's `HOME`
-//! and `TMPDIR`, a Metal probe (`tests/slot_gpu/gpu_probe.swift`: a device, a shader
-//! compiled at run time, a compute kernel), then a second copy that keeps its device
-//! open, so that the I/O Registry has a user client of the uid. The lease ends as the
-//! driver ends it, the lease directory goes, and the clean runs. The files that a
-//! framework import (MLX) makes in the security-message folder, which the Metal probe
-//! does not, are planted the way the system makes them: owned by the uid.
+//! A GPU lease cleans up like any other: what the run left in the user's cache and
+//! temporary folders and home is gone when the slot is given back.
 //!
-//! The analytics and trust stores under `/private/var/protected` are not swept in the
-//! daemon's context on a real Mac (root is refused there, even with Full Disk Access for
-//! the trust store); the slot profile denies leases access to them instead. The test
-//! checks that the deny holds for a lease (a readable file of the uid's in each store is
-//! unreadable under the profile) and that the Metal probe still runs under it. An MLX
-//! matrix product is not run: it needs a Python interpreter, which the interpreter
-//! budget (`tools/interpreter_budget.tsv`) does not allow a test to name.
+//! `tests/gpu_profile.rs` checks the same two denies against the profile text on every
+//! platform; this file shows on a Mac what they do and that the shipped profile has
+//! neither. The hosted macOS runner is a virtual machine with a paravirtual GPU (Metal
+//! names its device `Apple Paravirtual device`), not a farm Mac: a pass there shows the
+//! profile leaves the Metal path open for a pool user with no GUI session, and says
+//! nothing of an M-series GPU's throughput, its Metal family or its user clients. The
+//! same test is run by hand on a farm Mac (`cargo xtask sudo-test`, below) to see its real
+//! GPU; no workflow runs it there.
 //!
-//! The test is `#[ignore]`: it needs root, real users, a Metal device and `swiftc`. The
-//! macOS CI job runs it with `cargo xtask sudo-test -p kbf-driver-native --test slot_gpu
-//! -- --test-threads=1 --nocapture`.
+//! Every test is `#[ignore]`: each needs root and real users. The macOS CI jobs run them
+//! with `cargo xtask sudo-test -p kbf-driver-native --test slot_gpu -- --test-threads=1
+//! --nocapture`. The probe prints `STAGE` lines, which the tests print again as
+//! `GPU-STAGE` lines for the log.
 
 #![cfg(target_os = "macos")]
 
+#[path = "slot_gpu/probe.rs"]
+mod probe;
 mod support;
 
-use std::collections::BTreeMap;
-use std::ffi::OsString;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
-use kbf_driver_native::home;
-use kbf_driver_native::network::{Isolation, Network};
-use kbf_driver_native::slots::macos::{Slot, Slots};
+use kbf_driver_native::NativeRuntime;
+use kbf_driver_native::network::{Isolation, Network, WeakenedProfile};
+use kbf_driver_native::slots::macos::Slots;
 use kbf_driver_native::slots::{LEASES_ROOT_MODE, Pool};
-use support::pool::{Scratch, Users};
+use support::pool::{Scratch, Users, config, home_of};
+use support::{MemoryCas, Spec, stdout};
 
-const PROBE_SOURCE: &str = include_str!("slot_gpu/gpu_probe.swift");
-const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
-const GRACE: Duration = Duration::from_secs(3);
-
-/// The places a system daemon keeps files for a uid outside its folders.
-const PROTECTED: [&str; 2] = [
-    "/private/var/protected/sfanalytics",
-    "/private/var/protected/trustd/private",
-];
-const MDS_MESSAGES: &str = "/private/var/db/mds/messages";
-
-fn text(program: &str, args: &[&str]) -> String {
-    let out = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap_or_else(|e| panic!("{program}: {e}"));
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
-/// The generated UID of the user `name`.
-fn generated_uid(name: &str) -> String {
-    let said = text(
-        "/usr/bin/dscl",
-        &[".", "-read", &format!("/Users/{name}"), "GeneratedUID"],
-    );
-    let guid = said
-        .split_whitespace()
-        .last()
-        .unwrap_or_default()
-        .to_owned();
-    assert_eq!(guid.len(), 36, "GeneratedUID of {name}: {said:?}");
-    guid
-}
-
-/// The probe, built into a folder the pool user can run it from.
-fn build_probe(into: &Path) -> PathBuf {
-    std::fs::create_dir_all(into).expect("probe folder");
-    std::fs::set_permissions(into, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    let source = into.join("gpu_probe.swift");
-    std::fs::write(&source, PROBE_SOURCE).expect("source");
-    let program = into.join("gpu_probe");
-    let built = Command::new("/usr/bin/swiftc")
-        .arg("-O")
-        .arg(&source)
-        .arg("-o")
-        .arg(&program)
-        .output()
-        .expect("swiftc");
-    assert!(
-        built.status.success(),
-        "swiftc: {}",
-        String::from_utf8_lossy(&built.stderr)
-    );
-    program
-}
-
-struct Lease {
-    isolation: Isolation,
-    dir: PathBuf,
-    vars: Vec<(&'static str, OsString)>,
-}
-
-impl Lease {
-    /// `program` as the slot's user under the slot profile, with the lease's variables
-    /// and `extra` ones. It ends on its own or when the test ends the uid's processes.
-    fn command(&self, slot: &Slot, extra: &[&str], program: &Path) -> Command {
-        self.command_with(slot, &self.isolation, Network::Off, extra, (program, &[]))
-    }
-
-    /// `program` with `args` as the slot's user under `isolation` and the slot profile of
-    /// `network`.
-    fn command_with(
-        &self,
-        slot: &Slot,
-        isolation: &Isolation,
-        network: Network,
-        extra: &[&str],
-        (program, args): (&Path, &[&str]),
-    ) -> Command {
-        let mut inner: Vec<String> = Vec::new();
-        for (name, value) in &self.vars {
-            inner.push(format!("{name}={}", value.to_string_lossy()));
+// The pool user's process is this binary again, started with the probe's argument: it
+// answers before the test harness reads its arguments, as the other hooks of `support` do.
+const _: () = {
+    extern "C" fn gpu_probe_hook() {
+        let probe_mode = std::env::args_os().nth(1).is_some_and(|a| a == probe::ARG);
+        if probe_mode {
+            std::process::exit(probe::run());
         }
-        inner.push(format!("PATH={PATH}"));
-        inner.extend(extra.iter().map(|e| (*e).to_owned()));
-        inner.push(program.to_string_lossy().into_owned());
-        inner.extend(args.iter().map(|a| (*a).to_owned()));
-        let (launcher, args) = slot
-            .launch(
-                isolation,
-                network,
-                &self.dir,
-                PathBuf::from("/usr/bin/env"),
-                &inner,
-            )
-            .expect("launch");
-        let mut command = Command::new(launcher);
-        command
-            .args(args)
-            .env_clear()
-            .current_dir("/")
-            .stdin(Stdio::null());
-        command
     }
+    #[used]
+    #[unsafe(link_section = "__DATA,__mod_init_func,mod_init_funcs")]
+    static GPU_PROBE_HOOK: extern "C" fn() = gpu_probe_hook;
+};
+
+/// The two denies that took the GPU away on the hosted runner, with the steps whose
+/// failure shows each.
+const PLANTED: [(&str, &str, &[&str]); 2] = [
+    ("iokit-open", "(deny iokit-open)", &["device"]),
+    (
+        "MTLCompilerService",
+        "(deny mach-lookup (global-name \"com.apple.MTLCompilerService\"))",
+        &["library", "pipeline"],
+    ),
+];
+
+fn assert_root() {
+    support::pool::assert_root("slot_gpu");
 }
 
-/// A lease directory the way the daemon makes one for `slot`.
-async fn lease(scratch: &Scratch, slot: &Slot) -> Lease {
+/// The `STAGE` lines of the probe's output, as `(step, ok)`.
+fn stages(output: &str) -> Vec<(String, bool)> {
+    output
+        .lines()
+        .filter(|l| l.starts_with("STAGE "))
+        .inspect(|l| println!("GPU-{l}"))
+        .filter_map(|l| {
+            let mut words = l.split_whitespace().skip(1);
+            let step = words.next()?.to_owned();
+            Some((step, words.next() == Some("ok")))
+        })
+        .collect()
+}
+
+/// Catches a slot profile that takes the GPU from a pool user, and a driver that cannot
+/// run a GPU lease as one: the action is the probe run through the driver as a pool
+/// user, with the slot profile as the driver generates it. Every step passes and the
+/// process exits 0. (The device step also fails when the user has no access to the GPU
+/// for another reason, such as a session that cannot start the Metal services.)
+#[ignore = "needs root and real users: cargo xtask sudo-test"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pool_user_under_the_slot_profile_runs_a_compute_kernel() {
+    assert_root();
+    let scratch = Scratch::new("gpu-real");
+    let users = Users::new("gpu-real", 1);
+    let cas = Arc::new(MemoryCas::default());
+    let rt = NativeRuntime::new(config(&scratch, users.pool()), Arc::clone(&cas)).expect("runtime");
+    let spec =
+        Spec::argv(&[&scratch.as_user_binary(), probe::ARG]).timeout(Duration::from_secs(300));
+    let result = support::run(&rt, &cas, 1, &spec).await.expect("ran");
+    let out = stdout(&cas, &result);
+    println!("{out}");
+    let steps = stages(&out);
+    let names: Vec<&str> = steps.iter().map(|(s, _)| s.as_str()).collect();
+    let want: Vec<&str> = probe::EXIT.iter().map(|(s, _)| *s).collect();
+    assert_eq!(names, want, "{out}");
+    assert!(steps.iter().all(|(_, ok)| *ok), "{out}");
+    assert_eq!(result.exit_code, 0, "{out}");
+    assert!(out.contains("GPU-PROBE pass"), "{out}");
+}
+
+/// Catches a GPU lease that leaves state for the next lease of its slot: whatever the
+/// Metal run wrote under the user's cache and temporary folders (the probe lists both
+/// as `CACHE-DIR` lines, so the log says how much there was) and in its home is gone
+/// when the lease has ended and the slot is given back. The clean empties those places
+/// for every lease; this shows a GPU run does not put anything where it does not. (On the
+/// hosted runner the run left three entries in the cache folder and one in the temporary
+/// folder, so the check is not vacuous there.)
+/// The test covers the user's home, cache and temporary folders only: not a Metal process
+/// left running after the lease (the kill at the lease's end is `slot_term`'s), nor a
+/// shader cache kept outside those folders.
+#[ignore = "needs root and real users: cargo xtask sudo-test"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gpu_lease_leaves_nothing_in_the_slot_users_folders() {
+    assert_root();
+    let scratch = Scratch::new("gpu-clean");
+    let users = Users::new("gpu-clean", 1);
+    let home = home_of(&users.0[0]);
+    let held = |dir: &Path| {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    };
+    let cas = Arc::new(MemoryCas::default());
+    let rt = NativeRuntime::new(config(&scratch, users.pool()), Arc::clone(&cas)).expect("runtime");
+    let home_before = held(&home);
+    let spec =
+        Spec::argv(&[&scratch.as_user_binary(), probe::ARG]).timeout(Duration::from_secs(300));
+    let result = support::run(&rt, &cas, 1, &spec).await.expect("ran");
+    let out = stdout(&cas, &result);
+    println!("{out}");
+    assert_eq!(result.exit_code, 0, "{out}");
+    let folders: Vec<PathBuf> = out
+        .lines()
+        .filter(|l| l.starts_with("CACHE-DIR "))
+        .inspect(|l| println!("GPU-{l}"))
+        .filter_map(|l| l.split_whitespace().nth(2).map(PathBuf::from))
+        .collect();
+    assert_eq!(folders.len(), 2, "the cache and temporary folders: {out}");
+    support::pool::wait_until("the slot's folders are empty again", || {
+        folders.iter().all(|f| held(f).is_empty())
+    });
+    assert_eq!(held(&home), home_before, "the home");
+}
+
+/// Runs the probe as the pool user of a one-user pool whose slot profile is changed by
+/// `change`, through `Slot::launch`, as the driver starts an action: returns the exit
+/// code and the probe's output.
+async fn probe_under(name: &str, change: WeakenedProfile) -> (Option<i32>, String) {
+    assert_root();
+    let users = Users::new(name, 1);
+    let scratch = Scratch::new(name);
+    let pool = Pool::new(users.0.clone()).expect("pool");
+    let slots =
+        Slots::start_with_profile_change(&pool, Duration::from_secs(10), change).expect("slots");
     let leases = scratch.leases();
     std::fs::create_dir_all(&leases).expect("leases");
     std::fs::set_permissions(&leases, std::fs::Permissions::from_mode(LEASES_ROOT_MODE))
         .expect("chmod");
     let dir = leases.join("lease-1-1");
     std::fs::create_dir(&dir).expect("lease dir");
-    let vars = home::make(&dir).await.expect("home variables");
-    slot.hand_over(&dir).await.expect("hand over");
-    Lease {
-        isolation: Isolation::detect(),
-        dir: std::fs::canonicalize(&dir).expect("real path"),
-        vars,
-    }
-}
-
-/// Every path at or below `root` that `uid` owns. Never through a link.
-fn owned_below(root: &Path, uid: u32, found: &mut Vec<PathBuf>) {
-    let Ok(meta) = std::fs::symlink_metadata(root) else {
-        return;
-    };
-    if meta.uid() == uid {
-        found.push(root.to_owned());
-    }
-    if meta.is_dir() {
-        for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
-            owned_below(&entry.path(), uid, found);
-        }
-    }
-}
-
-/// What the uid owns in the system places the clean sweeps outside its own folders, and
-/// in all of `/private/var/folders` except its entry's root and four folders, which are
-/// the uid's by design (the test looks inside them on its own).
-fn uid_files_outside(uid: u32, folders: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    for root in PROTECTED.iter().map(Path::new).chain([
-        Path::new("/private/var/db/mds"),
-        Path::new("/private/var/folders"),
-    ]) {
-        owned_below(root, uid, &mut found);
-    }
-    found.retain(|path| {
-        path != folders
-            && !["0", "C", "T", "X"]
-                .iter()
-                .any(|name| path == &folders.join(name))
-    });
-    found
-}
-
-/// The processes now, pid to uid.
-fn processes() -> BTreeMap<i32, u32> {
-    text("/bin/ps", &["-ax", "-o", "pid=,uid="])
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
-        })
-        .collect()
-}
-
-/// The I/O Registry's user clients created by a process of `uid`.
-fn registry_clients_of(uid: u32) -> Vec<String> {
-    const CREATOR: &str = "\"IOUserClientCreator\" = \"pid ";
-    let processes = processes();
-    text("/usr/sbin/ioreg", &["-l", "-w0"])
-        .lines()
-        .filter_map(|line| {
-            let rest = &line[line.find(CREATOR)? + CREATOR.len()..];
-            let pid: i32 = rest
-                .split(|c: char| !c.is_ascii_digit())
-                .next()?
-                .parse()
-                .ok()?;
-            (processes.get(&pid) == Some(&uid)).then(|| line.trim().chars().take(160).collect())
-        })
-        .collect()
-}
-
-/// The entries of the `C` folder of the uid's `/var/folders` entry named like a Metal cache.
-fn metal_caches(folders: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(folders.join("C"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("com.apple.metal"))
-        })
-        .collect()
-}
-
-fn names(dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    names
-}
-
-/// What the test puts where a framework import leaves it, and what it must take away
-/// whether the test ends or panics: the planted files and folders, the process that holds
-/// a device, and the probe folder.
-struct Litter {
-    uid: u32,
-    /// Every planted file, whoever owns it.
-    files: Vec<PathBuf>,
-    /// What the uid owns of it, which the clean must remove.
-    residue: Vec<PathBuf>,
-    /// The folders the test made, deepest first, removed when empty.
-    made: Vec<PathBuf>,
-    holder: Option<std::process::Child>,
-    probes: PathBuf,
-}
-
-impl Drop for Litter {
-    fn drop(&mut self) {
-        let _ = Command::new("/usr/bin/pkill")
-            .args(["-KILL", "-U", &self.uid.to_string()])
-            .status();
-        if let Some(holder) = self.holder.as_mut() {
-            let _ = holder.kill();
-            let _ = holder.wait();
-        }
-        for file in &self.files {
-            let _ = std::fs::remove_file(file);
-        }
-        for dir in &self.made {
-            let _ = std::fs::remove_dir(dir);
-        }
-        let _ = std::fs::remove_dir_all(&self.probes);
-    }
-}
-
-/// Makes `file` with the given owner and mode, and the folders above it that are missing.
-/// The folders the test makes belong to `folder_owner`.
-fn plant(file: &Path, owner: u32, folder_owner: u32, mode: u32, litter: &mut Litter) {
-    let folder = file.parent().expect("parent");
-    let mut at = folder;
-    let first = litter.made.len();
-    while !at.exists() {
-        litter.made.push(at.to_owned());
-        at = at.parent().expect("parent");
-    }
-    std::fs::create_dir_all(folder).expect("plant folder");
-    for made in &litter.made[first..] {
-        std::os::unix::fs::chown(made, Some(folder_owner), None).expect("chown folder");
-    }
-    litter.files.push(file.to_owned());
-    std::fs::write(file, "x").expect("plant file");
-    std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode)).expect("chmod");
-    std::os::unix::fs::chown(file, Some(owner), None).expect("chown");
-}
-
-fn wait_for(file: &Path, needle: &str, secs: u64) -> bool {
-    let until = Instant::now() + Duration::from_secs(secs);
-    while Instant::now() < until {
-        if std::fs::read_to_string(file).is_ok_and(|t| t.contains(needle)) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    false
-}
-
-/// Catches a clean that leaves the uid's GPU state to the next lease on its slot. After a
-/// real Metal run (a device, a shader compiled at run time, a kernel) and a second Metal
-/// process still holding its device:
-///
-/// - the probe's Metal caches are in the uid's `/var/folders` entry before the clean, so
-///   the check below cannot pass on an empty entry;
-/// - the registry lists a user client of the uid before the kill, so the registry check can
-///   see one, and none after the clean;
-/// - after the clean the slot is free (the clean found nothing left), the entry holds its
-///   four empty folders and nothing else, the home is empty, and the uid owns nothing under
-///   `/private/var/protected`, `/private/var/db/mds` or `/private/var/folders`;
-/// - the uid's planted file in its security-message folder is gone (the sweep keeps that
-///   folder, which is readable in the daemon's context);
-/// - a file of the uid's that it could read in each protected store (planted when root can
-///   write there) cannot be read by a lease under the slot profile, and the same read
-///   outside the sandbox is printed as `PROTECTED-CONTROL`, so the deny is seen to be the
-///   profile's when the store lets the uid in;
-/// - the Metal probe passes under the slot profile with that deny.
-#[ignore = "needs root, real users, a Metal device and swiftc: see spike-slot-reach.yml job slot-gpu"]
-#[tokio::test(flavor = "multi_thread")]
-async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
-    support::pool::assert_root("slot_gpu");
-    let scratch = Scratch::new("slotgpu");
-    let users = Users::new("slotgpu", 1);
-    let pool = Pool::new(users.0.clone()).expect("pool");
-    // Not `std::env::temp_dir()`: root's own folder, which the pool user cannot enter.
-    let probes = PathBuf::from("/private/tmp").join(format!("kbf-slot-gpu-{}", std::process::id()));
-    let user = users.0[0].clone();
-    let uid = user.uid;
-    let mut litter = Litter {
-        uid,
-        files: Vec::new(),
-        residue: Vec::new(),
-        made: Vec::new(),
-        holder: None,
-        probes: probes.clone(),
-    };
-    let probe = build_probe(&probes);
-    let guid = generated_uid(&user.name);
-
-    let slots =
-        Slots::start_with_grace(&pool, Duration::from_secs(20), GRACE, None).expect("slots");
-    assert_eq!(
-        slots.count(),
-        1,
-        "the clean at the start leaves the slot free"
-    );
     let slot = slots.take().await.expect("a slot");
-    let lease = lease(&scratch, &slot).await;
-    let (home, folders) = (slot.ready().home.clone(), slot.ready().folders.clone());
-
-    // The Metal arm, then a process that keeps its device open.
-    let out = lease.command(&slot, &[], &probe).output().expect("probe");
-    let said = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert!(
-        said.contains("GPU_PROBE_PASS"),
-        "the Metal probe: {said}{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let holding = probes.join("holding.out");
-    litter.holder = Some(
-        lease
-            .command(&slot, &["GPU_HOLD=1"], &probe)
-            .stdout(std::fs::File::create(&holding).expect("holder output"))
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("holder"),
-    );
-    assert!(
-        wait_for(&holding, "HOLD_READY", 180),
-        "the holder never held a device"
-    );
-    let caches = metal_caches(&folders);
-    let clients = registry_clients_of(uid);
-
-    // The deny: a file of the uid's, readable by it, in each protected store root can write
-    // to, which the lease must not read under the slot profile, by either spelling of the
-    // path (`/var` is a link to `/private/var`). A store that refuses root cannot be planted
-    // into, and the deny is then not checked here.
-    let mut denied = Vec::new();
-    let mut planted = 0;
-    let mut listable = 0;
-    for store in PROTECTED {
-        listable += usize::from(std::fs::read_dir(store).is_ok());
-        let file = Path::new(store).join(&guid).join("lease-readable");
-        let folder = file.parent().expect("parent").to_owned();
-        if std::fs::create_dir_all(&folder).is_err() {
-            println!("PROTECTED-NOT-PLANTED {store}: root cannot make a folder here");
-            continue;
-        }
-        plant(&file, uid, 0, 0o644, &mut litter);
-        planted += 1;
-        let cat = Path::new("/bin/cat");
-        let read = |isolation: &Isolation, path: &Path| {
-            lease
-                .command_with(
-                    &slot,
-                    isolation,
-                    Network::Off,
-                    &[],
-                    (cat, &[path.to_str().unwrap()]),
-                )
-                .output()
-                .expect("cat")
-        };
-        let outside = read(&Isolation::None, &file);
-        println!(
-            "PROTECTED-CONTROL {store}: unsandboxed read {}",
-            if outside.status.success() {
-                "works"
-            } else {
-                "is refused"
-            }
-        );
-        let control = outside.status.success();
-        let link_spelling =
-            Path::new("/var").join(file.strip_prefix("/private/var").expect("prefix"));
-        for path in [file.clone(), link_spelling] {
-            let inside = read(&lease.isolation, &path);
-            denied.push((
-                path,
-                control,
-                inside.status.success(),
-                String::from_utf8_lossy(&inside.stderr).into_owned(),
-            ));
-        }
-    }
-    if planted == 0 {
-        println!(
-            "PROTECTED-DENY-NOT-CHECKED: root cannot plant into either protected store on this \
-             host; this test does not check the profile deny here (the read-protected canary does)"
-        );
-    }
-
-    // What a framework import makes in the security-message folder, planted as the system
-    // makes it.
-    let message = Path::new(MDS_MESSAGES)
-        .join(uid.to_string())
-        .join("se_SecurityMessages");
-    plant(&message, uid, 0, 0o600, &mut litter);
-    litter.residue.push(message);
-
-    // The end of the lease as the driver makes it, the lease directory, the clean.
-    let uid_arg = uid.to_string();
-    let _ = Command::new("/usr/bin/pkill")
-        .args(["-TERM", "-U", &uid_arg])
-        .status();
-    std::thread::sleep(GRACE);
-    let _ = Command::new("/usr/bin/pkill")
-        .args(["-KILL", "-U", &uid_arg])
-        .status();
-    if let Some(mut holder) = litter.holder.take() {
-        let _ = holder.wait();
-    }
-    slot.reclaim(&lease.dir).await.expect("reclaim");
-    std::fs::remove_dir_all(&lease.dir).expect("remove the lease directory");
+    let lease = std::fs::canonicalize(&dir).expect("real path");
+    std::fs::create_dir(lease.join("tmp")).expect("tmp");
+    slot.hand_over(&dir).await.expect("hand over");
+    let (program, args) = slot
+        .launch(
+            &Isolation::detect(),
+            Network::On,
+            &lease,
+            PathBuf::from(scratch.as_user_binary()),
+            &[probe::ARG.to_owned()],
+        )
+        .expect("launch");
+    let home = home_of(&users.0[0]);
+    let output = Command::new(program)
+        .args(args)
+        .env_clear()
+        .env("HOME", home)
+        .env("TMPDIR", lease.join("tmp"))
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()
+        .expect("the probe ran");
     slot.release().await;
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
+}
 
-    // Everything is read before anything can end the test, then the plants are removed.
-    let free = slots.count();
-    let outside = uid_files_outside(uid, &folders);
-    let residue_left: Vec<PathBuf> = (litter.residue.iter())
-        .filter(|p| p.exists())
-        .cloned()
-        .collect();
-    let left_in_entry: Vec<String> = names(&folders)
-        .into_iter()
-        .filter_map(|name| {
-            let inside = names(&folders.join(&name));
-            let skeleton = ["0", "C", "T", "X"].contains(&name.as_str());
-            (!skeleton || !inside.is_empty()).then(|| format!("{name}: {inside:?}"))
-        })
-        .collect();
-    let left_in_home = names(&home);
-    let still = registry_clients_of(uid);
-    drop(litter);
-
-    assert!(
-        !caches.is_empty(),
-        "the Metal run left no cache in {}",
-        folders.display()
-    );
-    assert!(
-        !clients.is_empty(),
-        "the registry shows no user client of uid {uid}"
-    );
-    for (path, control, readable, why) in &denied {
+/// Catches a probe that passes whatever the profile says (a device found by another
+/// route, a step that never runs the kernel, an exit code that is always 0): each deny
+/// added to the end of the slot profile the driver generates makes the probe fail at
+/// the step that needs what the deny removed, with that step's exit code, and no step
+/// after it runs. Seen on the hosted runner (a paravirtual GPU) before this test: the
+/// `iokit-open` deny leaves no device, and the `MTLCompilerService` deny leaves the device
+/// and queue and breaks the pipeline.
+#[ignore = "needs root and real users: cargo xtask sudo-test"]
+#[tokio::test(flavor = "multi_thread")]
+async fn each_deny_that_takes_the_gpu_fails_the_probe_at_its_step() {
+    for (label, deny, failing) in PLANTED {
+        let (code, out) = probe_under(
+            &format!("gpu-{}", label.to_ascii_lowercase()),
+            WeakenedProfile::Add(deny),
+        )
+        .await;
+        println!("{out}");
+        let steps = stages(&out);
+        let (last, ok) = steps.last().expect("the probe printed a step");
+        assert!(!ok, "{label}: the last step passed\n{out}");
         assert!(
-            control,
-            "the unsandboxed read of the planted {} was refused too: the deny is unproven",
-            path.display()
+            failing.contains(&last.as_str()),
+            "{label}: failed at {last}\n{out}"
         );
-        assert!(
-            !readable,
-            "a lease under the slot profile read {}",
-            path.display()
-        );
-        println!("PROTECTED-DENIED {}: {}", path.display(), why.trim());
+        let want = probe::EXIT.iter().find(|(s, _)| s == last).map(|(_, c)| *c);
+        assert_eq!(code, want, "{label}\n{out}");
+        assert!(!out.contains("GPU-PROBE pass"), "{label}\n{out}");
     }
-    assert!(
-        planted > 0 || listable == 0,
-        "root can list a protected store here but could plant into none: the deny went unchecked"
-    );
-    assert_eq!(free, 1, "the clean left the slot dirty");
-    assert!(
-        residue_left.is_empty(),
-        "planted residue survived: {residue_left:?}"
-    );
-    assert!(outside.is_empty(), "the uid still owns {outside:?}");
-    assert!(
-        left_in_entry.is_empty(),
-        "the /var/folders entry holds {left_in_entry:?}"
-    );
-    assert!(left_in_home.is_empty(), "the home holds {left_in_home:?}");
-    assert!(
-        still.is_empty(),
-        "the registry still has clients of the uid: {still:?}"
-    );
 }

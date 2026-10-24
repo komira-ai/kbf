@@ -250,3 +250,67 @@ fn dot_dot_is_resolved() {
     ));
     chmod(&open, 0o755);
 }
+
+/// A directory is trusted when it and the ones above it are the trusted user's and closed to
+/// group and others; a file, a missing path, another owner or a writable directory is not.
+#[test]
+fn a_trusted_directory_is_checked_with_its_parents() {
+    let dir = scratch("trust-dir");
+    let trust = me(&dir);
+    let sub = dir.join("sub");
+    fs::create_dir(&sub).unwrap();
+    chmod(&sub, 0o700);
+    trust.check_dir(&sub).unwrap();
+    chmod(&sub, 0o711);
+    trust.check_dir(&sub).unwrap();
+    let f = file(&dir, "f", 0o644, "x");
+    assert!(matches!(trust.check_dir(&f), Err(TrustError::NotDirectory)));
+    assert!(matches!(
+        trust.check_dir(&dir.join("none")),
+        Err(TrustError::Io(_))
+    ));
+    chmod(&sub, 0o775);
+    assert!(matches!(trust.check_dir(&sub), Err(TrustError::Writable)));
+    chmod(&sub, 0o757);
+    assert!(matches!(trust.check_dir(&sub), Err(TrustError::Writable)));
+    chmod(&sub, 0o755);
+    let stranger = Trust::owned_by(fs::metadata(&dir).unwrap().uid() + 1, &dir);
+    assert!(matches!(
+        stranger.check_dir(&sub),
+        Err(TrustError::NotOwned)
+    ));
+    chmod(&dir, 0o777);
+    assert!(matches!(
+        trust.check_dir(&sub),
+        Err(TrustError::ParentWritable)
+    ));
+    chmod(&dir, 0o755);
+}
+
+/// The tree of a trust ends at its anchor: a writable directory above the anchor is not
+/// looked at, one at or below it is.
+#[test]
+fn root_below_stops_at_its_anchor() {
+    let dir = scratch("trust-below");
+    let top = dir.join("top");
+    let inner = top.join("inner");
+    fs::create_dir_all(&inner).unwrap();
+    chmod(&top, 0o755);
+    chmod(&inner, 0o755);
+    let uid = fs::metadata(&dir).unwrap().uid();
+    // Root's tree is not this test's user's: the owner is what is refused.
+    if uid != 0 {
+        let root = Trust::root_below(&fs::canonicalize(&top).unwrap());
+        assert!(matches!(root.check_dir(&inner), Err(TrustError::NotOwned)));
+    }
+    let below = Trust::owned_by(uid, &top);
+    chmod(&dir, 0o777);
+    below.check_dir(&inner).unwrap();
+    chmod(&top, 0o777);
+    assert!(matches!(
+        below.check_dir(&inner),
+        Err(TrustError::ParentWritable)
+    ));
+    chmod(&top, 0o755);
+    chmod(&dir, 0o755);
+}

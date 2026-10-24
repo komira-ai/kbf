@@ -349,7 +349,7 @@ frontend to keep its daemons.
 
 **Kept from #857, #879, #887:** the baton protocol on the control socket (`hello`, `offer <generation>`, `ready`, `released`) and its
 bounded quiesce; `Farm::fence`; `Store::demote` and the generation fence (right for a single writer); the next-generation open with
-the epoch kept; `done/` rows, the follower and `kbf_frontend_relay_untraced`; operation names that carry the generation;
+the epoch kept; `done/` rows, the follower and `kbf_frontend_relay_untraced`; operation names that are never reused (the store's operation ids, `operations/<id>`; they carried the generation before);
 cordon rows; `READY=1` and `Type=notify`; the existing drain (health `NOT_SERVING`, GOAWAY, exit at zero open streams, #793/#810);
 `kbf frontend handover` (now: start the other instance in standby and trigger the take); `kbf-frontend@.service` and the
 control socket's `RuntimeDirectoryPreserve`.
@@ -527,7 +527,7 @@ buck2**:
 
 So the plan cannot rely on reattach for buck2, and does not: Envoy never cuts a stream because a backend is draining, the old
 backend finishes it. Reattach is the safety net for **Bazel** if the old frontend crashes mid-drain: the new frontend must
-resolve the operation name from the store (**[F]** names carry the generation, #857; `op/` and `done/` rows) and answer, or
+resolve the operation name from the store (**[F]** a name is the store's operation id, `operations/<id>`, which any frontend answers from the `op/`, `doneof/` and `done/` rows; names carried the generation before, #857) and answer, or
 `NOT_FOUND` so Bazel re-executes. Test T20 proves it with the pinned Bazel and shows buck2 failing in the same case (documented).
 
 ### 4.2 An `Execute` in flight
@@ -536,7 +536,7 @@ resolve the operation name from the store (**[F]** names carry the generation, #
 shows "executing" while the operation holds a lease, and relays it until it closes, with no timeout: it ends when the operation
 finishes, the client cancels or the old process stops. An operation the store has no trace of is not answered; it is logged and
 counted (`kbf_frontend_relay_untraced`, a gauge that must be zero at every scrape of every test but the planted one). A
-`WaitExecution` is answered the same way. Operation names carry the store generation (**[F]** #857),
+`WaitExecution` is answered the same way. Operation names are the store's operation ids (**[F]**; they carried the store generation, #857),
 so a name is never reused. An operation queued but not leased shows what it showed; it is dispatched by the new frontend.
 **Lost, accepted:** memory-ladder history, usage line, recorder state of operations in flight (K13).
 
@@ -803,7 +803,7 @@ T5, T6 and E1 prove the model's one unproven step: if either cannot be made reli
 - **Q4** State-schema migration (3.4) is a `kbf-state` change of a few days and is on the critical path of the first release that changes a column. Until then the planner refuses such a release.
 - **Q5** Planned-down member state: **decided and built** (#914, `planned_down` with `for_secs`; 2.6 step 4); the router-failover alternative is not taken.
 - **Q6** Node graceful stop and a `Leave` call. **Lean yes.**
-- **Q7 [owner]** `auto_nodes` default false until two click-through runs are clean. **Changed (updfeed U1, CEO-visible):** a policy never written reads `auto_nodes` true. Only an operator's write of `update/desired` starts a run (the poller proposes and never writes it), so that write is the click; `pause` is the stop, and `auto_nodes` written false still stops it.
+- **Q7 [owner]** `auto_nodes` default false until two click-through runs are clean. **Changed (updfeed U1, maintainer-visible):** a policy never written reads `auto_nodes` true. Only an operator's write of `update/desired` starts a run (the poller proposes and never writes it), so that write is the click; `pause` is the stop, and `auto_nodes` written false still stops it.
 - **Q8** One rollout record (K11). **Lean durable `update/*` rows.**
 - **Q9** A nightly mixed-version job against the release before the last tag (T10), a precondition for auto.
 - **Q10** The handover wire frozen at 1 (K12); say so in the doc that owns `handover.rs`.

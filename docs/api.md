@@ -252,8 +252,8 @@ frontend, a daemon opens a worker stream.
 | `state` | `joining` (registered, a write owner, read last), `catching_up`, `active` (a full owner), `draining` (takes no new writes), `down` (its lease lapsed; kept in the map for the dwell, then it leaves the list) or `unknown` (a state a later build wrote that this one does not name; the member stays listed, takes no writes, is never read from and is not counted as `active`) |
 | `weight` | its share of the digests relative to the others |
 | `protocol` | the protocol version in the `RegisterRequest` that wrote the member's row (a heartbeat and a state change keep it; a new registration of the member replaces it). `null` when the row names none, as a row written before this field existed, and for a `down` member: its row expires with its heartbeats, and the version went with it |
-| `runs_log` | the newest metadata-log machine version the node's build can raise its log to, as the `RegisterRequest` that wrote the row said (a heartbeat never replaces it; it fills it only when the row holds none) |
-| `log_version` | the machine version the node's metadata log was at in its newest heartbeat (a registration says it too); it rises when the log is raised |
+| `runs_log` | the newest metadata-log machine version the node's build runs, as the `RegisterRequest` that wrote the row said (a heartbeat never replaces it; it fills it only when the row holds none). Informational: it is frozen at 5 and gates nothing |
+| `log_version` | the machine version the node's metadata log was at in its newest heartbeat (a registration says it too). Informational: no build raises a log any more, so it is the version an earlier build left, and 1 for a new log |
 | `build_commit` | the commit the node's binary was built from, as its registration said (a heartbeat never replaces it; it fills it only when the row holds none): 40 hex digits, or the 12-digit commit when the build did not know the full one, or the text `unknown` when the build had no git checkout; at most 64 bytes are kept |
 | `oldest_protocol` | the least `protocol` among the members whose `protocol` is not `null`; `null` if none is |
 | `protocol_unknown` | how many members have a `null` `protocol`. Never counted in `oldest_protocol`: read the two together, as for [`GET /v1/nodes`](#get-v1nodes) |
@@ -595,6 +595,44 @@ restart it. `kbf cluster member <id> --state active|draining|planned-down [--for
 `POST /v1/members/{id}`, and `kbf cluster denied --token-file F` calls `GET /v1/denied`.
 `kbf cluster object-store ...` calls the `/v1/object-stores/...` routes (below).
 `kbf cluster epoch-bump --token-file F` calls `POST /v1/epoch/bump`.
+
+## `GET /v1/frontend/retire` and `POST /v1/frontend/retire`
+
+Taking one frontend out of service while other frontends share its state store, for a
+rollout that restarts it. A drain (above) lets the frontend keep its worker streams and its
+queue; a retire moves them to the others.
+
+**`GET /v1/frontend/retire`**: a read, open like `GET /v1/frontend/drain`:
+
+```json
+{ "retired": false, "open_streams": 3, "open_sessions": 2 }
+```
+
+- `retired`: the retire has completed. It is not undone.
+- `open_streams`: Execute and WaitExecution operation streams open now, the callers this
+  frontend still answers (`kbf_front_open_executions`).
+- `open_sessions`: the worker sessions the frontend holds.
+
+**`POST /v1/frontend/retire`**: begins the retire, a write that passes every gate of
+[Who may write](#who-may-write) and takes no body (or `{}`). It answers the same status
+once the retire has completed, with `retired` true. Calling it again changes nothing and
+answers the same status. The retire:
+
+- refuses every new Execute `UNAVAILABLE`, which Buck2 retries when it opens a call;
+- waits, for at most ten seconds (`--handover-quiesce-secs` where the frontend has a
+  handover socket), for the calls between their request and their queueing, then stops
+  taking work: the frontend reads no more of the state store's queue, grants nothing,
+  claims nothing and writes the requeues the store had refused (for at most the same
+  time again);
+- stops the worker listener and ends every worker stream `UNAVAILABLE`, so each daemon
+  dials another frontend, which takes up the leases the daemon lists;
+- turns `/readyz` to `503` (`stopping`) and the health service to `NOT_SERVING`;
+- keeps every open Execute and WaitExecution stream, and answers it from the result another
+  frontend records in the state store, for as long as the process lives.
+
+The REAPI listener is not sent GOAWAY and the process does not exit: the operator restarts
+the unit once `open_streams` is 0. A server that is not a frontend over a state store
+answers both routes `409` (`this server is not a frontend over a state store`).
 
 ## `POST /v1/epoch/bump`
 
@@ -942,7 +980,8 @@ are versioned by `admin_protocol` in `kbf --version --json` (`docs/artifacts.md`
 - `instance_id`: a UUID, new for each process.
 - `generation`: the generation the state store is at now (`null` if it cannot be read);
   `held_generation`: the one this process took (`null` for a candidate). A takeover passes
-  the holder's `generation` as `expect`.
+  the holder's `generation` as `expect`. A process over a Postgres store, which the
+  frontends share and which holds no generation, answers `null` for both.
 - `superseded`: the store has refused a write of this process because another writer holds
   the generation.
 - `open_streams`: Execute and WaitExecution streams open; `open_sessions`: worker streams
@@ -962,10 +1001,14 @@ heartbeat is not applied. It writes the requeues the store refused. Idempotent. 
 streams and worker sessions stay open. While quiesced, a worker's heartbeat or result is not
 applied, so a quiesce is meant to last seconds (a takeover's limit is 10): one longer than
 the leases' expiry lets the scheduler expire the leases of work still running and requeue it
-when the process resumes. Nothing bounds it.
+when the process resumes. Nothing bounds it. Refused with `409` when the store holds no
+generation (a Postgres store shared by frontends): nothing could take over, and nothing is
+stopped.
 
 **`POST /v1/admin/resume`** (quiesced or active): undoes a quiesce, for a takeover that did
-not happen. Refused with `409` when the store is no longer at `held_generation` or the
+not happen. A process over a store that holds no generation is never quiesced, so a resume
+of it changes nothing. Refused with `409` when the store is no longer at `held_generation` or
+the
 store has refused a write of this process (another writer holds it: only `stand-down`
 applies). The farm fed the scheduler nothing while it was quiesced, so its memory is the
 store's as of the quiesce; nothing is reloaded.
@@ -975,7 +1018,8 @@ which must be exactly `N` (a store at another generation is refused with `409` a
 is written), keeps the epoch (daemons that redial keep the runs of their leases), reads all
 state from the store, and starts the scheduler, the reconciler and the worker listener on
 the sockets the candidate already bound. `500` if the generation was taken and the
-frontend could not start; the process then ends.
+frontend could not start; the process then ends. Refused with `409` when the store holds no
+generation (a Postgres store shared by frontends).
 
 **`POST /v1/admin/stand-down`** (active, quiesced or stood-down): the old holder's step
 after a takeover elsewhere. It ends the worker streams with `UNAVAILABLE` ("connect
@@ -1092,7 +1136,10 @@ applied_generation, status, last_seen_secs}]}`.
 - `converged` is true only when at least one node is expected, every expected node has
   applied the current generation with status `ok`, and none is `unsupported`. It never claims
   more than the frontend knows: a frontend that has heard from no node says `false`.
-  **This build wires no source of node reports yet: `nodes` is empty and `converged` is `false`.**
+  The reports are the storage nodes' heartbeats: each accepted heartbeat writes a row in the
+  state store with a time to live of 15 seconds, so every frontend child reads the same reports, and a report
+  that is not renewed lapses and reads as `pending`. A farm restarted with an empty store shows
+  `pending` for every node until heartbeats arrive.
 
 **`GET /v1/object-stores/audit`** answers `{entries: [{seq, at, action, subject, outcome,
 generation}]}`, newest first. A row names what was touched and what happened, never a body
@@ -1202,7 +1249,7 @@ otherwise; the body lists each failing check and why:
 
 | Check | Fails when |
 |---|---|
-| `stopping` | the server has received SIGTERM or SIGINT, or `POST /v1/frontend/drain` has begun a drain. It answers `503` from that moment, and for the rest of the drain; open Execute streams are kept until their action is done, and only the shutdown timeout (`--shutdown-timeout-secs`) or a second signal ends them |
+| `stopping` | the server has received SIGTERM or SIGINT, or `POST /v1/frontend/drain` has begun a drain, or `POST /v1/frontend/retire` has retired the frontend. It answers `503` from that moment, and for the rest of the drain; open Execute streams are kept until their action is done, and only the shutdown timeout (`--shutdown-timeout-secs`) or a second signal ends them |
 | `leader` | the server does not hold the scheduler role. A single server runs every role and always holds it; the check is there for a replicated control log, whose followers fail it. **Planned**: a second readiness path, without this check, for the servers that may serve reads ([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)) |
 | `store` | the object store does not answer a one-byte read of the key `<prefix>readyz-probe` within `--readyz-store-timeout-ms` (default 2000; it bounds the gRPC health service's probe too), or answers with an error. The probe only reads: no poll writes, deletes or lists. Nothing writes that key, so "not found" is the expected answer and passes, as does the object's bytes or a range past its end |
 
@@ -2074,56 +2121,13 @@ frontend's store: copy its `files/` directory and save the route's body for each
 (`curl -fsS "$API/v1/releases/$COMMIT" > releases/$COMMIT.json`); a commit that is not
 complete for any platform has no file to save (`409`).
 
-## `GET /v1/update` and `POST /v1/update/{desired,pause,resume}`
+## `GET /v1/update` and `POST /v1/update/{desired,pause,resume}` (removed)
 
-The desired release (`docs/design/pull-updates.md` section 6.3), kept in the `update/desired`
-row of the state store. Without `--state-store` every answer is `503` naming it; without
-`--releases-dir`, `GET /v1/update` and `POST /v1/update/desired` are `503` naming that flag
-(`pause` and `resume` need only the state store). A write that other writers kept racing
-for the whole of its retries is `503` with `Retry-After: 1`: send it again.
-
-- `GET /v1/update` is open: `{"desired": null | {"generation", "commit", "set_at_ms"},
-  "paused": bool, "policy": null | {...}, "proposals": [...], "releases": <the body of GET /v1/releases>}`.
-  `proposals` are the rows under `update/proposed/` (the release poller that wrote them was
-  removed; the list is empty on a new farm and keeps the rows an older one wrote), oldest
-  first, each `{"commit", "tag", "published_at_secs", "proposed_at_ms"}`: the newest published
-  GitHub release of a `v*` tag whose notes name an allowed ref and a commit and that lists
-  `SHA256SUMS` and a provenance bundle for each tarball. Nothing is verified and nothing is
-  started: a proposal is a suggestion, and the run starts when an operator offers the commit
-  with `POST /v1/update/desired`. The poller asks GitHub's public API with no credential, on
-  the active frontend only, with a conditional request, and backs off after a failure. `policy`
-  is the `update/policy` row when the operator wrote one (`paused`, `auto_nodes`,
-  `auto_frontend`, `new_work_only_to_updated`, `accept_failing_builds`, `max_hosts_out`,
-  `min_serving` and the limits in seconds), else `null`; `paused` is its flag (false without
-  a row).
-- `POST /v1/update/desired` with `{"commit": "<40 lowercase hex>"}` and, optionally,
-  `"expect_generation": N` and `"rollback": bool` (JSON content type, the write gates) offers the commit. With
-  `expect_generation` it is a compare-and-set: it writes only if the desired release is at
-  generation N (0 before any offer), else `409` naming both and nothing is written. `409` unless the release store holds some platform of it complete
-  (see above); `400` for a body that is not exactly that. The answer is the desired release.
-  The generation moves only when the commit differs from the desired one, so a repeated click is
-  not a new run; a rollback is the older commit offered the same way and gets a higher
-  generation. Generations increase, but may skip numbers: each write that loses a race has
-  already drawn a counter value.
-  **R4, the age check.** Before the write, the offer is compared with the build of this server
-  (`seq` of `kbf --version --json`, the number of commits behind its commit), using the `seq`
-  the release store holds for the commit. `409` naming both builds, and nothing is written, when
-  the target's `seq` is below the server's (`older`), when it equals the server's and the commit
-  is another one (`seq_tie`: two branches cannot be ordered; a repeat of the running commit is
-  allowed; the commits are compared in full when the build knows its own, else by the 12
-  digits it has as a prefix), or when the server's `seq` is known and the target's is not (`seq_unknown`: a
-  release stored before `seq` was recorded). A server built where commits could not be counted
-  (`seq` 0) does not apply R4. The release store does not record `seq` yet, so today R4 allows
-  every offer. A release naming the running build's own commit is never refused by R4, and the
-  store is not asked about it. The answer is `{"error": "<code>: ...", "code": "older" | "seq_tie" | "seq_unknown"}`;
-  the other `409`s of this route have no `code`.
-  `"rollback": true` (optional, default false; spelled as `rollback` of the proxy's
-  `POST /v1/update/frontend`) skips this check and no other: the release must still be complete,
-  `expect_generation` still applies, and so will the own-commit rule of `source=staged`.
-  The codes `older`, `seq_unknown` and `seq_tie` are stable: a client may key on them.
-- `POST /v1/update/pause` and `POST /v1/update/resume` (the write gates, no body) set `paused` of the policy
-  row, by compare-and-set of that field alone, and answer `{"paused": bool}`. No run is
-  needed, and an offer leaves the flag as it is: while set, no host is started.
+`kbf-server` no longer serves these routes: they answer `404`. It keeps no desired release,
+no update policy and no proposals. Updates are
+OS packages installed by `kbf-updater` on each host. The `update/*` rows that older builds
+left in a state store are not read and not changed; a store that holds them opens and serves
+as before.
 
 ## `UNAVAILABLE` from a storage node that is catching up
 

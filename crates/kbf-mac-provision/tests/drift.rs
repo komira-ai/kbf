@@ -818,6 +818,8 @@ const STAYS: &[(&str, &str)] = &[
     ("kbf_volume", "a directory on the system volume"),
     ("pool_users", "a user with a pool uid"),
     ("pool_users", "a group with the pool gid"),
+    ("pool_users", "a uid below 600"),
+    ("pool_users", "the group's gid"),
     ("ssh_password_auth", "no Include line"),
     ("ssh_password_auth", "an earlier drop-in"),
     ("ssh_password_auth", "a keyword before Include"),
@@ -827,7 +829,7 @@ const STAYS: &[(&str, &str)] = &[
 
 /// Catches: a drift `apply` does not fix (no CHANGE line for it, or check still fails
 /// after it), a fix that breaks another item, a check only item `apply` changes (the
-/// script's mutant "apply turns FileVault off"), an apply that exits 0 while an item
+/// script's defect "apply turns FileVault off"), an apply that exits 0 while an item
 /// still fails ("apply exits 0 when something still fails"), and a drift apply should
 /// leave that it changes (the script's `t_drift`, apply part).
 #[test]

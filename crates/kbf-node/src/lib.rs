@@ -313,7 +313,7 @@ pub struct Cli {
     /// action runs as one of `kbf-pool-0` .. `kbf-pool-<N-1>`, one lease per user at a
     /// time, as kbf-mac-provision makes them (`pool_users`). Required of a root daemon,
     /// which runs no action as root; refused for any other.
-    #[arg(long, requires = "pool_first_uid", value_parser = clap::value_parser!(u32).range(1..=64))]
+    #[arg(long, requires = "pool_first_uid", value_parser = clap::value_parser!(u32).range(1..=100))]
     pool_users: Option<u32>,
     /// The uid of `kbf-pool-0`, and the group id of all the pool users (`pool_first_uid`
     /// in kbf-mac-provision's profile); at least 600.
@@ -1556,7 +1556,7 @@ mod tests {
         for one in ["--pool-users=2", "--pool-first-uid=700"] {
             assert!(pooled(&[one]).is_err(), "{one} alone");
         }
-        for count in ["0", "65"] {
+        for count in ["0", "101"] {
             assert!(pooled(&[&format!("--pool-users={count}"), "--pool-first-uid=700"]).is_err());
         }
         let root = pooled(&["--pool-users=1", "--pool-first-uid=0"]).expect("flags");
@@ -1827,7 +1827,7 @@ mod tests {
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
-    /// Catches (CEO decision on issue #164): the native daemon removing `xcrun`'s cache
+    /// Catches (decision on issue #164): the native daemon removing `xcrun`'s cache
     /// before its first survey. Every `xcrun` lookup of the survey then has nothing
     /// cached and takes seconds, while no Xcode is ready: on the macOS runner (15
     /// `Xcode*.app`) that survey took over 30 s, against about 7 s with the cache kept. The survey runs under the sandbox, so
@@ -1888,7 +1888,7 @@ mod tests {
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
-    /// Catches (CEO decision on issue #164): the native daemon's survey of its Xcodes
+    /// Catches (decision on issue #164): the native daemon's survey of its Xcodes
     /// asking a question outside the actions' sandbox, `xcrun`'s lookup above all (it
     /// reads and fills a cache leases can write), or with an `xcrun` other than the one
     /// the daemon warms. The sandbox program is a fake that marks what it runs (its

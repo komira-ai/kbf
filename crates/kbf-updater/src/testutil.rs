@@ -176,7 +176,7 @@ pub(crate) fn sock(cfg: &Config) -> PathBuf {
     }
 }
 
-/// A fake operator API that answers connection `n`, having read its request head, with what
+/// A fake operator API that answers connection `n`, having read its request (head and body), with what
 /// `answer(n, head)` returns (`None`: never answer).
 pub(crate) fn fake_api_by(
     answer: impl Fn(usize, &str) -> Option<Vec<u8>> + Send + 'static,
@@ -194,7 +194,22 @@ pub(crate) fn fake_api_by(
             while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
                 head.push(byte[0]);
             }
-            let head = String::from_utf8_lossy(&head).into_owned();
+            let mut head = String::from_utf8_lossy(&head).into_owned();
+            // The body, if the request has one, is read too (an unread body resets the
+            // connection under the answer) and is part of what the request was.
+            let length = head
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("Content-Length: ")?
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; length];
+            if stream.read_exact(&mut body).is_ok() {
+                head.push_str(&String::from_utf8_lossy(&body));
+            }
             let reply = answer(n, &head);
             locked(&log).push(head);
             match reply {

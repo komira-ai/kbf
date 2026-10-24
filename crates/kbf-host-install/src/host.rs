@@ -4,8 +4,9 @@
 //! Order matters. A request outside the grammar is refused before any file is read. An
 //! `install` is checked against the allowlist and the source's signing before the audit
 //! log is opened, and is not started at all if the log cannot be opened: no install goes
-//! unrecorded. A refusal or a `query` is answered even when the log is unavailable (the
-//! warning goes to stderr), since neither changes the host.
+//! unrecorded. A `restart` is not started either when the log cannot be opened. A refusal
+//! or a `query` is answered even when the log is unavailable (the warning goes to stderr),
+//! since neither changes the host.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
@@ -109,7 +110,7 @@ pub fn handle_unit(
 
 /// Write the answer: the detail of a failure to `err`, the line to `out`; the exit status.
 /// The writes ignore a closed pipe: the client is gone and there is nobody to tell.
-fn respond(outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+pub(crate) fn respond(outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     if let Some(detail) = outcome.stderr_detail() {
         let _ = writeln!(err, "{detail}");
     }
@@ -131,6 +132,8 @@ pub struct Host {
     pub(crate) hostname: PathBuf,
     /// This program, as the install unit runs it again.
     pub(crate) self_exe: PathBuf,
+    /// How long a restart waits for its unit to be active.
+    pub(crate) restart_wait: plan::Wait,
     pub(crate) trust: Trust,
 }
 
@@ -146,6 +149,7 @@ impl Host {
             node_config: PathBuf::from("/etc/kbf/kbf.toml"),
             hostname: PathBuf::from("/proc/sys/kernel/hostname"),
             self_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from(SELF_EXE)),
+            restart_wait: plan::ACTIVE_WAIT,
             trust: Trust::root(),
         }
     }
@@ -162,6 +166,10 @@ impl Host {
             node_config: dir.join("kbf.toml"),
             hostname: dir.join("hostname"),
             self_exe: PathBuf::from(SELF_EXE),
+            restart_wait: plan::Wait {
+                timeout: std::time::Duration::from_secs(30),
+                interval: std::time::Duration::from_millis(1),
+            },
             trust,
         }
     }
@@ -186,6 +194,7 @@ pub fn handle(
         Ok(Request::Install { version, channel }) => {
             install(host, runner, version, channel, log.is_ok())
         }
+        Ok(Request::Restart { unit }) => restart::run(host, runner, unit, log.is_ok()),
     };
 
     // The audit line first, then the answer. A failed write is told on stderr; the
@@ -199,13 +208,19 @@ pub fn handle(
         ),
         _ => (None, None),
     };
+    let unit = match &request {
+        Ok(Request::Restart { unit }) => Some(unit.as_str().to_owned()),
+        _ => None,
+    };
     let entry = audit::Entry {
         time: audit::now(),
         verb: request.as_ref().ok().map(Request::verb),
         version,
         channel,
+        unit,
         outcome: outcome_word,
         reason,
+        result: None,
         command: request
             .is_err()
             .then(|| command.map(|c| audit::truncate_raw(&c.to_string_lossy())))
@@ -221,7 +236,7 @@ pub fn handle(
     respond(&outcome, out, err)
 }
 
-fn fail(code: FailureCode, detail: impl Into<String>) -> Outcome {
+pub(crate) fn fail(code: FailureCode, detail: impl Into<String>) -> Outcome {
     Outcome::Failed(Failure {
         code,
         detail: detail.into(),
@@ -383,7 +398,7 @@ fn install_front(
     // An install is running (or the lock cannot be asked about): say so, rather than start
     // a unit that would find the lock held, or that systemd refuses by name.
     if locks::flock_held(&host.install_lock) {
-        return Err(fail(FailureCode::Busy, "another install is running"));
+        return Err(fail(FailureCode::Busy, BUSY_DETAIL));
     }
     let started = runner.run(&plan::unit_install(&host.self_exe, version, channel));
     Ok(relay(started, version))
@@ -497,25 +512,33 @@ fn install_body(
     }
 }
 
+/// What a `busy` answer says on stderr: an install or a restart holds the install lock.
+const BUSY_DETAIL: &str = "another install or restart is running";
+
 /// Take the install lock without waiting: an advisory `flock` on a root-owned file under
 /// `/run`, opened without following a symbolic link. Held by the returned file.
 fn take_install_lock(host: &Host) -> Result<File, Outcome> {
+    take_lock(&host.install_lock)
+}
+
+/// Take the advisory lock on the file at `path` without waiting, creating it root-only.
+pub(crate) fn take_lock(path: &std::path::Path) -> Result<File, Outcome> {
     let file = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
         .custom_flags(trust::nofollow())
-        .open(&host.install_lock)
+        .open(path)
         .map_err(|e| {
             fail(
                 FailureCode::LockUnavailable,
-                format!("{}: {e}", host.install_lock.display()),
+                format!("{}: {e}", path.display()),
             )
         })?;
-    // Anything but a lock taken means another install is running (or the lock cannot be
+    // Anything but a lock taken means another install or restart runs (or the lock cannot be
     // held): either way nothing may start.
     file.try_lock()
-        .map_err(|_| fail(FailureCode::Busy, "another install is running"))?;
+        .map_err(|_| fail(FailureCode::Busy, BUSY_DETAIL))?;
     Ok(file)
 }
 
@@ -540,6 +563,9 @@ fn step(runner: &dyn Runner, cmd: &Cmd, code: FailureCode) -> Result<(), Outcome
     }
 }
 
+mod restart;
+#[cfg(test)]
+mod restart_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

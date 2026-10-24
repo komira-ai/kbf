@@ -46,8 +46,14 @@ mod fate;
 mod floors;
 #[path = "state_store/handover.rs"]
 mod handover;
+#[path = "state_store/intake.rs"]
+mod intake;
+#[path = "state_store/owner.rs"]
+mod owner;
 #[path = "state_store/result_ack.rs"]
 mod result_ack;
+#[path = "state_store/results.rs"]
+mod results;
 #[path = "state_store/shared.rs"]
 mod shared;
 #[path = "state_store/subject.rs"]
@@ -77,8 +83,12 @@ struct Flaky {
     lie_lease: AtomicBool,
     /// How many more reads of a `queue/` row fail before they succeed.
     fail_queue_get: AtomicI64,
+    /// How many times every `lease/` row has been read by a scan.
+    lease_scans: AtomicUsize,
     /// The writes that applied, oldest first, as the transaction prints.
     applied: std::sync::Mutex<Vec<String>>,
+    /// The fake's clock, which a test moves by hand; a real store's clock runs by itself.
+    clock: Option<Arc<ManualClock>>,
 }
 
 /// What the store is kept in.
@@ -153,8 +163,12 @@ fn open_sqlite(path: &std::path::Path) -> SqliteStore {
 
 impl Flaky {
     fn new() -> Self {
-        let inner = Fake::with_flaw(Arc::new(ManualClock::default()), Flaw::None);
-        Self::over(Inner::Fake(inner))
+        let clock = Arc::new(ManualClock::default());
+        let inner = Fake::with_flaw(Arc::clone(&clock), Flaw::None);
+        Self {
+            clock: Some(clock),
+            ..Self::over(Inner::Fake(inner))
+        }
     }
 
     fn over(inner: Inner) -> Self {
@@ -167,7 +181,9 @@ impl Flaky {
             lie: AtomicBool::new(false),
             lie_lease: AtomicBool::new(false),
             fail_queue_get: AtomicI64::new(0),
+            lease_scans: AtomicUsize::new(0),
             applied: std::sync::Mutex::new(Vec::new()),
+            clock: None,
         }
     }
 
@@ -199,6 +215,7 @@ impl Flaky {
 
     /// A crash and reopen: what the store acknowledged survives.
     fn restart(self) -> Self {
+        let clock = self.clock.clone();
         let inner = match self.inner {
             Inner::Fake(fake) => Inner::Fake(fake.restart()),
             Inner::Sqlite(tracked) => {
@@ -217,7 +234,10 @@ impl Flaky {
                 Inner::Postgres(Box::new(Tracked::new(reopened)))
             }
         };
-        Self::over(inner)
+        Self {
+            clock,
+            ..Self::over(inner)
+        }
     }
 }
 
@@ -257,6 +277,8 @@ impl Store for Flaky {
     }
 
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
+        let scans = &self.lease_scans;
+        scans.fetch_add(usize::from(prefix == "lease/"), Ordering::SeqCst);
         self.inner.store().scan_prefix(prefix)
     }
 
@@ -403,6 +425,16 @@ impl Disk {
 
     fn rows(&self, prefix: &str) -> usize {
         self.store.scan_prefix(prefix).expect("scan").len()
+    }
+
+    /// Lets `by` pass on the store's clock: the fake's is moved by hand, and a real store's
+    /// runs by itself, so the test waits.
+    fn pass(&self, by: Duration) {
+        let waits = || std::thread::sleep(by);
+        self.store
+            .clock
+            .as_ref()
+            .map_or_else(waits, |clock| clock.advance(by));
     }
 }
 
@@ -1035,9 +1067,39 @@ async fn a_store_with_an_unreadable_row_refuses_the_farm() {
 use conditional::{
     a_daemon_of_another_frontend_holds_back_the_refusal,
     a_refusal_loses_to_a_grant_made_by_another_frontend,
-    a_result_reaching_two_frontends_is_acknowledged_once,
+    a_result_reaching_the_frontend_a_daemon_left_finishes_nothing,
     a_second_give_up_queues_nothing_beside_the_new_lease,
     daemon_sessions_that_cannot_be_read_hold_back_a_refusal,
+};
+use intake::{
+    a_client_waiting_on_one_frontend_gets_the_result_another_recorded,
+    a_cordon_set_through_one_frontend_stops_grants_on_the_other,
+    a_drain_deadline_is_on_the_stores_clock_and_applied_by_the_other,
+    a_frontend_killed_mid_run_loses_nothing,
+    a_lost_grant_race_forgets_the_placement_and_the_operation_runs_once,
+    an_operation_queued_through_one_frontend_runs_on_a_daemon_of_another,
+    starting_a_frontend_leaves_the_leases_of_the_others_alone,
+    the_epoch_an_operator_raised_is_reported_by_the_other_frontend,
+};
+use owner::{
+    a_claim_the_store_refused_is_made_when_it_returns,
+    a_daemon_that_moves_to_another_frontend_keeps_its_lease,
+    a_give_up_for_a_node_the_daemon_left_is_dropped_once,
+    a_hello_to_the_frontend_that_holds_the_lease_takes_nothing_in,
+    a_joined_submit_finds_its_lease_through_the_index,
+    a_new_process_that_moves_waits_before_its_unlisted_lease_is_lost,
+    acks_stop_when_session_renewals_fail, acks_stop_when_the_daemon_moves,
+    an_ack_waits_for_the_session_row,
+    an_owner_row_that_cannot_be_read_blocks_the_claim_until_the_next_hello,
+    the_frontend_a_daemon_left_drops_only_that_nodes_writes,
+    the_same_process_that_moves_loses_an_unlisted_lease_at_once,
+    two_frontends_never_both_grant_to_the_same_worker,
+};
+use results::{
+    a_client_waiting_through_another_frontend_gets_the_result,
+    a_joiner_of_a_leased_operation_never_deletes_its_lease,
+    a_name_in_the_new_form_is_answered_by_every_frontend_at_every_stage,
+    an_old_form_name_is_answered_by_the_issuing_frontend,
 };
 use shared::{
     a_second_frontend_started_over_the_store_keeps_its_epoch,
@@ -1080,13 +1142,38 @@ restarts!(
     the_operator_bump_raises_the_epoch_once,
     frontends_opening_an_empty_store_together_keep_one_epoch,
     a_second_give_up_queues_nothing_beside_the_new_lease,
-    a_result_reaching_two_frontends_is_acknowledged_once,
+    a_result_reaching_the_frontend_a_daemon_left_finishes_nothing,
     a_daemon_of_another_frontend_holds_back_the_refusal,
     a_refusal_loses_to_a_grant_made_by_another_frontend,
     daemon_sessions_that_cannot_be_read_hold_back_a_refusal,
+    a_daemon_that_moves_to_another_frontend_keeps_its_lease,
+    a_give_up_for_a_node_the_daemon_left_is_dropped_once,
+    a_hello_to_the_frontend_that_holds_the_lease_takes_nothing_in,
+    the_frontend_a_daemon_left_drops_only_that_nodes_writes,
+    two_frontends_never_both_grant_to_the_same_worker,
+    a_joined_submit_finds_its_lease_through_the_index,
+    acks_stop_when_session_renewals_fail,
+    an_ack_waits_for_the_session_row,
+    acks_stop_when_the_daemon_moves,
+    a_new_process_that_moves_waits_before_its_unlisted_lease_is_lost,
+    the_same_process_that_moves_loses_an_unlisted_lease_at_once,
+    a_claim_the_store_refused_is_made_when_it_returns,
+    an_owner_row_that_cannot_be_read_blocks_the_claim_until_the_next_hello,
     lost_leases_are_counted_across_a_restart_and_the_third_is_refused,
     a_crash_at_any_write_of_a_finish_leaves_the_operation_or_its_result,
-    a_crash_at_any_write_of_a_refusal_leaves_the_operation_or_its_refusal
+    a_crash_at_any_write_of_a_refusal_leaves_the_operation_or_its_refusal,
+    an_operation_queued_through_one_frontend_runs_on_a_daemon_of_another,
+    a_lost_grant_race_forgets_the_placement_and_the_operation_runs_once,
+    a_client_waiting_on_one_frontend_gets_the_result_another_recorded,
+    a_frontend_killed_mid_run_loses_nothing,
+    a_cordon_set_through_one_frontend_stops_grants_on_the_other,
+    a_drain_deadline_is_on_the_stores_clock_and_applied_by_the_other,
+    starting_a_frontend_leaves_the_leases_of_the_others_alone,
+    the_epoch_an_operator_raised_is_reported_by_the_other_frontend,
+    a_client_waiting_through_another_frontend_gets_the_result,
+    a_name_in_the_new_form_is_answered_by_every_frontend_at_every_stage,
+    a_joiner_of_a_leased_operation_never_deletes_its_lease,
+    an_old_form_name_is_answered_by_the_issuing_frontend
 );
 
 /// A state store opened as a start opens it: from the flag, over `dir`.
@@ -1156,6 +1243,7 @@ fn listeners() -> Listeners {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -1350,8 +1438,12 @@ async fn a_crash_at_any_write_of_a_refusal_leaves_the_operation_or_its_refusal(b
             let (_, mut inbox) = lose_lease(&farm).await;
             assert_eq!(starts(&mut inbox).len(), 1);
         }
+        // The new session registers while the store takes writes (the frontend becomes the
+        // node's owner); the store then takes `writes` writes of the heartbeat that loses
+        // the lease for the third time, and the heartbeat may go unacknowledged.
+        let (stream, _inbox) = register(&farm);
         disk.store.fail_after(writes);
-        let _ = lose_lease(&farm).await;
+        let _ = farm.heartbeat(&node(), stream, 1, Vec::new()).await;
         disk.crash(farm);
         let (unfinished, ended) = standing(&disk);
         assert_eq!(
@@ -2036,11 +2128,12 @@ fn a_farm_without_a_store_has_no_stored_results() {
     );
 }
 
-/// Catches: operation names that repeat across starts that keep the epoch (the hand-over
-/// to a new process keeps it, so a daemon keeps its runs). The names carry the writer
-/// generation, which every start takes: a client holding the first process's name for its
-/// operation is told NOT_FOUND by the second, not handed whichever operation of the second
-/// got the same number (issue #154).
+/// Asserts that a name the first process gave names, in a process started over the same
+/// store that kept the epoch (a daemon keeps its runs), the operation it named and no other:
+/// the names are the store's operation ids, which no process takes twice, so a client
+/// holding the name is never handed whichever operation of the second process has the same
+/// number (issue #154). A new operation of the second process has a name of its own, and a
+/// name nobody gave names nothing.
 #[tokio::test(start_paused = true)]
 async fn a_kept_epoch_does_not_reuse_operation_names() {
     let dir = Scratch::new();
@@ -2064,8 +2157,18 @@ async fn a_kept_epoch_does_not_reuse_operation_names() {
     };
     let second = farm_over(kept);
     assert_eq!(second.lease_epoch(), epoch, "the epoch was kept");
-    assert!(
-        second.wait(&name).is_none(),
-        "the first process's name names an operation of the second"
-    );
+    let same = second.wait(&name).expect("the store holds the operation");
+    assert_eq!(same.action, request(1).key.action, "another operation");
+    let other = second
+        .submit(Submission {
+            request: request(2),
+            call: None,
+            described: Described::default(),
+            evidence: Default::default(),
+        })
+        .expect("submitted")
+        .name;
+    assert_ne!(other, name, "a name was given twice");
+    let nobody = second.wait("operations/9999999999");
+    assert!(nobody.is_none(), "a name nobody gave names an operation");
 }

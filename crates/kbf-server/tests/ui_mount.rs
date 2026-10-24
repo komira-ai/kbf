@@ -88,8 +88,8 @@ fn assert_secure(answer: &Answer, what: &str) {
     assert_eq!(answer.header("strict-transport-security"), None, "{what}");
 }
 
-/// Catches (the CEO's ruling: the UI is open): a page that asks the policy-gated reads
-/// as the network does, so the policy's authenticator refuses it (mutant: the UI's
+/// Catches (the ruling that the UI is open): a page that asks the policy-gated reads
+/// as the network does, so the policy's authenticator refuses it (defect: the UI's
 /// routes built over the server's policy instead of the open one: every page is a `502`
 /// or `404`); the policy's gates removed from the network route instead (the same
 /// request to `/v1/invocations` must still be `401` or `404`); a log read through the
@@ -138,7 +138,7 @@ async fn the_ui_is_open_whatever_the_policy_says_of_the_network_routes() {
     }
 }
 
-/// Catches: a UI that is on when it was turned off (mutant: `ui` ignored), and one whose
+/// Catches: a UI that is on when it was turned off (defect: `ui` ignored), and one whose
 /// absence takes more with it than `/ui`.
 #[tokio::test]
 async fn ui_false_leaves_no_ui_and_every_other_route() {
@@ -182,9 +182,9 @@ async fn the_updates_page_is_gone_and_answers_like_any_unknown_ui_path() {
     server.stop().await;
 }
 
-/// Catches: a mount that serves a method other than `GET` and `HEAD` (mutant: `any`
+/// Catches: a mount that serves a method other than `GET` and `HEAD` (defect: `any`
 /// for `get`), `HEAD` with a body or refused, and any answer, a `405` or `404` included,
-/// without the headers (mutant: the `secure` layer removed).
+/// without the headers (defect: the `secure` layer removed).
 #[tokio::test]
 async fn the_ui_answers_get_and_head_only_and_every_answer_is_secured() {
     let (server, action_page) = with_a_failed_build(pages::OPEN).await;
@@ -222,7 +222,7 @@ async fn the_ui_answers_get_and_head_only_and_every_answer_is_secured() {
     server.stop().await;
 }
 
-/// Catches: a path parameter nothing bounds (mutant: the validation removed from the
+/// Catches: a path parameter nothing bounds (defect: the validation removed from the
 /// limiter): a control character or a very long segment reaching a page, a route, a log
 /// line or an upstream URL; on the pages and on the read routes they use alike.
 #[tokio::test]
@@ -300,11 +300,11 @@ async fn get_from(api: SocketAddr, from: Ipv4Addr, path: &str) -> u16 {
 }
 
 /// Catches (the starvation test of R3): a caller that opens many slow reads taking every
-/// read of the server (mutant: the limiter removed from the read routes: the fifth read
-/// of the same caller is served); one caller's reads counted against another's (mutant:
+/// read of the server (defect: the limiter removed from the read routes: the fifth read
+/// of the same caller is served); one caller's reads counted against another's (defect:
 /// one key for all callers); `/ui` and the API sharing one bound, so that a page cannot be
-/// opened while the API is saturated (mutant: one `ReadLimit` for both); a slot that never
-/// comes back when the reader goes away (mutant: the guard leaked); a `429` without
+/// opened while the API is saturated (defect: one `ReadLimit` for both); a slot that never
+/// comes back when the reader goes away (defect: the guard leaked); a `429` without
 /// `Retry-After`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_caller_with_slow_reads_open_cannot_starve_another_or_the_ui() {

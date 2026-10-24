@@ -180,9 +180,10 @@ because it learns a node's boot only when the node registers, after the frontend
 
 ### The state store: Postgres for the frontend
 
-The frontend's state store is Postgres (CEO ruling: SQLite is dropped for it). The frontend
+The frontend's state store is Postgres (ruling: SQLite is dropped for it). The frontend
 gets `--state-store`, a `postgres://` URI, from `kbf.toml` (`kbf-installer setup` writes it,
-as `postgres:///kbf?host=/run/postgresql&user=kbf-server`), and it has no default: a
+as `postgres:///kbf?host=/run/postgresql&user=kbf-server` unless `--database` gives another,
+and makes that role and database on the host), and it has no default: a
 frontend given none exits 2 naming the flag, and `kbf --mode=frontend --check`, which the
 unit runs before the start, exits 2 the same way. (`all-in-one` alone has a default, the
 host's socket, `postgres:///kbf?host=/run/postgresql`.) A `sqlite://` URI still starts in
@@ -216,7 +217,8 @@ leases the lost history granted after it. Raise the epoch so they drop those lea
 2. On the frontend's host, run `kbf cluster epoch-bump --token-file F` (`POST
    /v1/epoch/bump`, [api.md](../api.md#post-v1epochbump)). It answers the epoch before the
    bump, the one stored now, and the one this frontend serves.
-3. Restart each frontend. A running frontend goes on serving the epoch it started under; the
+3. Restart each frontend. A running frontend goes on serving the epoch it started under
+   (it logs a warning once its next look at the store finds the newer one); the
    one that starts after the bump serves the stored one, and a daemon that reaches it kills
    the runs of the leases it held and lists none, and the operations run again from the
    restored queue. Start the daemons' units after it.
@@ -398,7 +400,7 @@ themselves. There is no `node` mode and no `enroll` word.
 
 ## Installing a mode's unit
 
-`kbf-installer setup` installs the packaged unit of the host's mode and enables it
+The `kbf` package installs the unit of each mode; `kbf-installer setup` enables the one of the host's mode
 ([kbf-installer-setup.md](kbf-installer-setup.md)); `kbf-deploy linux install-units` is
 retired. There is no uninstall for a mode's unit yet. A node moving from the converged units
 (`kbf-server.service`) to `kbf-storage.service` stops the old ones first

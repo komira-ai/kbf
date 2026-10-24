@@ -61,6 +61,11 @@ verb stops with exit code 5 (an operator must restore the file) and writes nothi
 with no state and no link has never been activated and starts empty. A `state.json` of
 another schema is refused, and the backup is not tried.
 
+The root helper that applies a pulled update, `kbf-host-install`, and the daemon that drives it
+over ssh, `kbf-updater`, are release assets too (`kbf-host-install-<commit>-<platform>.tar.gz`
+for Linux and macOS, `kbf-updater-<commit>-linux-<arch>.tar.gz`), attested like every tarball.
+How to fetch and verify them: [host-install.md](host-install.md#getting-the-binary).
+
 ## The verbs
 
 Every verb prints its plan and changes nothing unless `--apply` is given; `--apply`
@@ -91,8 +96,10 @@ Each refuses while a commit-confirm deploy is pending in the state.
 
 **No verb restarts a service.** After `install --apply` or `rollback --apply`, restart
 the units that run `/var/lib/kbf-installer/releases/current/kbf` by hand (`sudo systemctl restart
-<unit>`), then check `kbf-deploy host status`. The units are the packaged files
-(`kbf-installer`'s), and restarting them is the operator's.
+<unit>`), then check `kbf-deploy host status`. The five mode units are the `kbf` package's
+files and run `/usr/bin/kbf`, so installing into `releases/current` changes nothing for them:
+this path is for a host of the earlier layout, whose units run the release. Restarting units
+is the operator's.
 
 ## Staging a release that was verified offline
 

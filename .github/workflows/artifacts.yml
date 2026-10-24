@@ -63,8 +63,8 @@ env:
   CYCLONEDX_SHA256_AARCH64_DARWIN: 4c53dfa21e70b65bf7f8d2592aadde3bcb02c1a40b6ec63b877e5ca65a29e180
   CYCLONEDX_SHA256_X86_64_LINUX: fb8dbee9f182173e062a64a387b21a0badc6fab8b2abf9294973f012972bf6d8
   CYCLONEDX_SHA256_AARCH64_LINUX: 7bf131ca5389b07a4f10c182bcf8a5ad339d64408b6f0d8f6834a0bd6120a06a
-  # The kbf-installer package of each job (the deb of a Linux job, the .pkg of the macOS one): nfpm builds the deb, and its trust directory
-  # holds a pinned gh. Both are release archives checked against their SHA-256 before use (the
+  # The kbf-installer and kbf packages of each job (the debs of a Linux job, the .pkg of the macOS one): nfpm builds the debs, and the
+  # installer's trust directory holds a pinned gh. Both are release archives checked against their SHA-256 before use (the
   # values the projects publish with them, recomputed when pinned; the archive's, not the program's).
   GH_VERSION: 2.102.0
   GH_SHA256_X86_64_LINUX: bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
@@ -105,10 +105,16 @@ jobs:
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
+          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
+          # file, so a restored target/ must hold none of the files a run writes there.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
+            !target/pkg
+            !target/pkg/**
+            !target/pkg-trust
+            !target/pkg-trust/**
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
           # On a push (to main: the build the attest job signs)
@@ -122,13 +128,19 @@ jobs:
       - run: uname -m
       - run: xcodebuild -version
       - run: cargo cyclonedx --version
-      - run: cargo build --locked --release --target "$TARGET" -p kbf-cli -p kbf-deploy -p kbf-installer --bin kbf --bin kbf-deploy --bin kbf-installer
+      # `kbf` is built by itself: built in one command with the installer, cargo builds the setup
+      # library once for both, with the installer's `proxy` feature, and `kbf` would link the proxy
+      # (crates/kbf-integration-test/tests/layering.rs checks the tree of `-p kbf-cli` alone).
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-cli --bin kbf
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-installer -p kbf-host-install --bin kbf-deploy --bin kbf-installer --bin kbf-host-install
       - name: Sign kbf ad hoc with the hardened runtime, and check it
         run: cargo xtask sign-darwin "target/$TARGET/release/kbf" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
       - name: Sign kbf-deploy ad hoc with the hardened runtime, and check it
         run: cargo xtask sign-darwin "target/$TARGET/release/kbf-deploy" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
       - name: Sign kbf-installer ad hoc with the hardened runtime, and check it
         run: cargo xtask sign-darwin "target/$TARGET/release/kbf-installer" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
+      - name: Sign kbf-host-install ad hoc with the hardened runtime, and check it
+        run: cargo xtask sign-darwin "target/$TARGET/release/kbf-host-install" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
       - name: The signed kbf names the commit and a release build
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
       - name: The signed kbf-installer names the commit and a release build
@@ -146,12 +158,16 @@ jobs:
         run: cargo xtask package --binary "target/$TARGET/release/kbf-deploy" --sbom crates/kbf-deploy/kbf-deploy_bin.cdx.json --platform darwin-arm64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf-installer
         run: cargo xtask package --binary "target/$TARGET/release/kbf-installer" --sbom crates/kbf-installer/kbf-installer_bin.cdx.json --platform darwin-arm64 --commit "$GITHUB_SHA" --out dist
+      - name: Package kbf-host-install
+        run: cargo xtask package --binary "target/$TARGET/release/kbf-host-install" --sbom crates/kbf-host-install/kbf-host-install_bin.cdx.json --platform darwin-arm64 --commit "$GITHUB_SHA" --out dist
       - name: Check the packaged kbf's signature, and run it
         run: cargo xtask darwin-asset "dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz" kbf
       - name: Check the packaged kbf-deploy's signature, and run it
         run: cargo xtask darwin-asset "dist/kbf-deploy-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-deploy
       - name: Check the packaged kbf-installer's signature, and run it
         run: cargo xtask darwin-asset "dist/kbf-installer-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-installer
+      - name: Check the packaged kbf-host-install's signature, and run it
+        run: cargo xtask darwin-asset "dist/kbf-host-install-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-host-install
       - name: The packaged kbf names the commit and a release build
         run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz" "$GITHUB_SHA"
       - name: The packaged kbf-installer names the commit and a release build
@@ -188,10 +204,16 @@ jobs:
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
+          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
+          # file, so a restored target/ must hold none of the files a run writes there.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
+            !target/pkg
+            !target/pkg/**
+            !target/pkg-trust
+            !target/pkg-trust/**
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # glibc: the binaries need the glibc of the runner image they were built on (Ubuntu
@@ -218,10 +240,16 @@ jobs:
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
+          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
+          # file, so a restored target/ must hold none of the files a run writes there.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
+            !target/pkg
+            !target/pkg/**
+            !target/pkg-trust
+            !target/pkg-trust/**
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
           # On a push (to main: the build the attest job signs)
@@ -232,7 +260,9 @@ jobs:
       - name: Install cargo-cyclonedx (pinned version and checksum)
         run: cargo xtask fetch --url "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz" --sha256 "$CYCLONEDX_SHA256_X86_64_LINUX" --out "$HOME/.cargo/bin/cargo-cyclonedx" --extract tar.xz --member "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
       - run: cargo cyclonedx --version
-      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-deploy -p kbf-cli -p kbf-installer --bins
+      # `kbf` is built without the installer (see the darwin job): its `kbf setup` links no proxy.
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-cli --bins
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-installer -p kbf-host-install -p kbf-updater --bins
       - run: cargo xtask build-commit check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
       - name: kbf names the commit and a release build
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
@@ -255,6 +285,10 @@ jobs:
         run: cargo xtask package --binary "target/$TARGET/release/kbf" --sbom crates/kbf-cli/kbf_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf-installer
         run: cargo xtask package --binary "target/$TARGET/release/kbf-installer" --sbom crates/kbf-installer/kbf-installer_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
+      - name: Package kbf-host-install
+        run: cargo xtask package --binary "target/$TARGET/release/kbf-host-install" --sbom crates/kbf-host-install/kbf-host-install_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
+      - name: Package kbf-updater
+        run: cargo xtask package --binary "target/$TARGET/release/kbf-updater" --sbom crates/kbf-updater/kbf-updater_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
       - name: The packaged kbf names the commit and a release build
         run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" "$GITHUB_SHA"
       - name: The packaged kbf-installer names the commit and a release build
@@ -265,6 +299,10 @@ jobs:
       # pushed branch on a push). nfpm builds it twice and the bytes must match; a fresh Ubuntu
       # container installs, runs and removes it; `pkg-asset` then refuses it unless it holds the
       # binary of the tarball checked above and trusts that branch, and lists it in SHA256SUMS.
+      # The kbf package is built from the same configuration step: this job's `kbf` at /usr/bin/kbf
+      # and the units of the modes, depending on the kbf-installer package of the same version.
+      # nfpm builds it twice too, and `pkg-kbf-asset` refuses it unless its kbf is the one of the
+      # kbf tarball checked above, and lists it in SHA256SUMS.
       - name: Fetch the pinned gh, for the package's trust directory
         run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_amd64.tar.gz" --sha256 "$GH_SHA256_X86_64_LINUX" --out "$RUNNER_TEMP/tools/gh" --extract tar.gz --member "gh_${GH_VERSION}_linux_amd64/bin/gh"
       - name: Fetch nfpm (pinned version, checked by SHA-256)
@@ -276,13 +314,17 @@ jobs:
       - name: Write the package's trust directory
         run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
       - name: Write the nfpm configuration
-        run: cargo xtask pkg-config --binary "target/$TARGET/release/kbf-installer" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --platform linux-x86_64 --version-of "target/$TARGET/release/kbf-installer" --out target/pkg
-      - name: Build the deb and the rpm, each twice
+        run: cargo xtask pkg-config --binary "target/$TARGET/release/kbf-installer" --kbf "target/$TARGET/release/kbf" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --platform linux-x86_64 --version-of "target/$TARGET/release/kbf-installer" --out target/pkg
+      - name: Build the deb and the rpm of kbf-installer, each twice
         run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/nfpm.yaml --out target/pkg/out
+      - name: Build the deb and the rpm of kbf, each twice
+        run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/kbf/nfpm.yaml --out target/pkg/kbf-out
       - name: Install, run, remove and purge the deb in a fresh Ubuntu container
         run: cargo xtask pkg-install-test --package target/pkg/out --format deb --listing target/pkg/listing.txt --image-dir packaging/linux/test/ubuntu --probe "/usr/share/kbf-installer/trust/gh --version::gh version $GH_VERSION" --probe "kbf-installer --version --json::${GITHUB_SHA:0:12}"
       - name: The deb is the attested binary and trusts this branch, and is an asset
         run: cargo xtask pkg-asset --package target/pkg/out --platform linux-x86_64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-x86_64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --gh "$RUNNER_TEMP/tools/gh" --out dist
+      - name: The kbf deb is the attested kbf with the units of the modes, and is an asset
+        run: cargo xtask pkg-kbf-asset --package target/pkg/kbf-out --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" --out dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-x86_64
@@ -292,10 +334,16 @@ jobs:
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
+          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
+          # file, so a restored target/ must hold none of the files a run writes there.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
+            !target/pkg
+            !target/pkg/**
+            !target/pkg-trust
+            !target/pkg-trust/**
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   linux-arm64:
@@ -320,10 +368,16 @@ jobs:
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
+          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
+          # file, so a restored target/ must hold none of the files a run writes there.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
+            !target/pkg
+            !target/pkg/**
+            !target/pkg-trust
+            !target/pkg-trust/**
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
           # On a push (to main: the build the attest job signs)
@@ -334,7 +388,9 @@ jobs:
       - name: Install cargo-cyclonedx (pinned version and checksum)
         run: cargo xtask fetch --url "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz" --sha256 "$CYCLONEDX_SHA256_AARCH64_LINUX" --out "$HOME/.cargo/bin/cargo-cyclonedx" --extract tar.xz --member "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
       - run: cargo cyclonedx --version
-      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-deploy -p kbf-cli -p kbf-installer --bins
+      # `kbf` is built without the installer (see the darwin job): its `kbf setup` links no proxy.
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-cli --bins
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-installer -p kbf-host-install -p kbf-updater --bins
       - run: cargo xtask build-commit check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
       - name: kbf names the commit and a release build
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
@@ -357,6 +413,10 @@ jobs:
         run: cargo xtask package --binary "target/$TARGET/release/kbf" --sbom crates/kbf-cli/kbf_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf-installer
         run: cargo xtask package --binary "target/$TARGET/release/kbf-installer" --sbom crates/kbf-installer/kbf-installer_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
+      - name: Package kbf-host-install
+        run: cargo xtask package --binary "target/$TARGET/release/kbf-host-install" --sbom crates/kbf-host-install/kbf-host-install_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
+      - name: Package kbf-updater
+        run: cargo xtask package --binary "target/$TARGET/release/kbf-updater" --sbom crates/kbf-updater/kbf-updater_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
       - name: The packaged kbf names the commit and a release build
         run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" "$GITHUB_SHA"
       - name: The packaged kbf-installer names the commit and a release build
@@ -367,6 +427,7 @@ jobs:
       # pushed branch on a push). nfpm builds it twice and the bytes must match; a fresh Ubuntu
       # container installs, runs and removes it; `pkg-asset` then refuses it unless it holds the
       # binary of the tarball checked above and trusts that branch, and lists it in SHA256SUMS.
+      # The kbf package is built and made an asset beside it (see linux-x86_64).
       - name: Fetch the pinned gh, for the package's trust directory
         run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_arm64.tar.gz" --sha256 "$GH_SHA256_AARCH64_LINUX" --out "$RUNNER_TEMP/tools/gh" --extract tar.gz --member "gh_${GH_VERSION}_linux_arm64/bin/gh"
       - name: Fetch nfpm (pinned version, checked by SHA-256)
@@ -378,13 +439,17 @@ jobs:
       - name: Write the package's trust directory
         run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
       - name: Write the nfpm configuration
-        run: cargo xtask pkg-config --binary "target/$TARGET/release/kbf-installer" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --platform linux-arm64 --version-of "target/$TARGET/release/kbf-installer" --out target/pkg
-      - name: Build the deb and the rpm, each twice
+        run: cargo xtask pkg-config --binary "target/$TARGET/release/kbf-installer" --kbf "target/$TARGET/release/kbf" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --platform linux-arm64 --version-of "target/$TARGET/release/kbf-installer" --out target/pkg
+      - name: Build the deb and the rpm of kbf-installer, each twice
         run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/nfpm.yaml --out target/pkg/out
+      - name: Build the deb and the rpm of kbf, each twice
+        run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/kbf/nfpm.yaml --out target/pkg/kbf-out
       - name: Install, run, remove and purge the deb in a fresh Ubuntu container
         run: cargo xtask pkg-install-test --package target/pkg/out --format deb --listing target/pkg/listing.txt --image-dir packaging/linux/test/ubuntu --probe "/usr/share/kbf-installer/trust/gh --version::gh version $GH_VERSION" --probe "kbf-installer --version --json::${GITHUB_SHA:0:12}"
       - name: The deb is the attested binary and trusts this branch, and is an asset
         run: cargo xtask pkg-asset --package target/pkg/out --platform linux-arm64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --gh "$RUNNER_TEMP/tools/gh" --out dist
+      - name: The kbf deb is the attested kbf with the units of the modes, and is an asset
+        run: cargo xtask pkg-kbf-asset --package target/pkg/kbf-out --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" --out dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-arm64
@@ -394,10 +459,16 @@ jobs:
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
+          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
+          # file, so a restored target/ must hold none of the files a run writes there.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
+            !target/pkg
+            !target/pkg/**
+            !target/pkg-trust
+            !target/pkg-trust/**
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # Attestation is per platform group, so the Linux files are attested and verifiable as
@@ -543,6 +614,14 @@ jobs:
           sbom-path: dist/kbf-installer-${{ github.sha }}-linux-x86_64.cdx.json
       - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
+          subject-path: dist/kbf-host-install-${{ github.sha }}-linux-x86_64.tar.gz
+          sbom-path: dist/kbf-host-install-${{ github.sha }}-linux-x86_64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/kbf-updater-${{ github.sha }}-linux-x86_64.tar.gz
+          sbom-path: dist/kbf-updater-${{ github.sha }}-linux-x86_64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
           subject-path: dist/kbf-daemon-${{ github.sha }}-linux-arm64.tar.gz
           sbom-path: dist/kbf-daemon-${{ github.sha }}-linux-arm64.cdx.json
       - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
@@ -561,6 +640,14 @@ jobs:
         with:
           subject-path: dist/kbf-installer-${{ github.sha }}-linux-arm64.tar.gz
           sbom-path: dist/kbf-installer-${{ github.sha }}-linux-arm64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/kbf-host-install-${{ github.sha }}-linux-arm64.tar.gz
+          sbom-path: dist/kbf-host-install-${{ github.sha }}-linux-arm64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/kbf-updater-${{ github.sha }}-linux-arm64.tar.gz
+          sbom-path: dist/kbf-updater-${{ github.sha }}-linux-arm64.cdx.json
       # Each tarball is also attested as its own subject, and the bundle of that attestation
       # (the file `gh attestation verify --bundle` takes offline) is copied beside the tarball
       # as `<tarball>.sigstore.json`, for the release and for a host that verifies without GitHub.
@@ -604,6 +691,22 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-kbf-installer-linux-x86_64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/kbf-installer-${GITHUB_SHA}-linux-x86_64.tar.gz.sigstore.json"
+      - id: provenance-kbf-host-install-linux-x86_64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-host-install-${{ github.sha }}-linux-x86_64.tar.gz
+      - name: Name the bundle of kbf-host-install for linux-x86_64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-host-install-linux-x86_64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-host-install-${GITHUB_SHA}-linux-x86_64.tar.gz.sigstore.json"
+      - id: provenance-kbf-updater-linux-x86_64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-updater-${{ github.sha }}-linux-x86_64.tar.gz
+      - name: Name the bundle of kbf-updater for linux-x86_64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-updater-linux-x86_64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-updater-${GITHUB_SHA}-linux-x86_64.tar.gz.sigstore.json"
       - id: provenance-kbf-installer-deb-linux-x86_64
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -612,6 +715,14 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-kbf-installer-deb-linux-x86_64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/kbf-installer-${GITHUB_SHA}-linux-x86_64.deb.sigstore.json"
+      - id: provenance-kbf-deb-linux-x86_64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-${{ github.sha }}-linux-x86_64.deb
+      - name: Name the bundle of the kbf package for linux-x86_64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-deb-linux-x86_64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-${GITHUB_SHA}-linux-x86_64.deb.sigstore.json"
       - id: provenance-kbf-daemon-linux-arm64
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -652,6 +763,22 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-kbf-installer-linux-arm64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/kbf-installer-${GITHUB_SHA}-linux-arm64.tar.gz.sigstore.json"
+      - id: provenance-kbf-host-install-linux-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-host-install-${{ github.sha }}-linux-arm64.tar.gz
+      - name: Name the bundle of kbf-host-install for linux-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-host-install-linux-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-host-install-${GITHUB_SHA}-linux-arm64.tar.gz.sigstore.json"
+      - id: provenance-kbf-updater-linux-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-updater-${{ github.sha }}-linux-arm64.tar.gz
+      - name: Name the bundle of kbf-updater for linux-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-updater-linux-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-updater-${GITHUB_SHA}-linux-arm64.tar.gz.sigstore.json"
       - id: provenance-kbf-installer-deb-linux-arm64
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -660,6 +787,14 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-kbf-installer-deb-linux-arm64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/kbf-installer-${GITHUB_SHA}-linux-arm64.deb.sigstore.json"
+      - id: provenance-kbf-deb-linux-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-${{ github.sha }}-linux-arm64.deb
+      - name: Name the bundle of the kbf package for linux-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-deb-linux-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-${GITHUB_SHA}-linux-arm64.deb.sigstore.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bundles-linux
@@ -707,6 +842,10 @@ jobs:
         with:
           subject-path: dist/kbf-installer-${{ github.sha }}-darwin-arm64.tar.gz
           sbom-path: dist/kbf-installer-${{ github.sha }}-darwin-arm64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/kbf-host-install-${{ github.sha }}-darwin-arm64.tar.gz
+          sbom-path: dist/kbf-host-install-${{ github.sha }}-darwin-arm64.cdx.json
       # Each tarball is also attested as its own subject; see attest-linux.
       - id: provenance-kbf-darwin-arm64
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -732,6 +871,14 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-kbf-installer-darwin-arm64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/kbf-installer-${GITHUB_SHA}-darwin-arm64.tar.gz.sigstore.json"
+      - id: provenance-kbf-host-install-darwin-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-host-install-${{ github.sha }}-darwin-arm64.tar.gz
+      - name: Name the bundle of kbf-host-install for darwin-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-host-install-darwin-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-host-install-${GITHUB_SHA}-darwin-arm64.tar.gz.sigstore.json"
       - id: provenance-kbf-installer-pkg-darwin-arm64
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -798,6 +945,10 @@ jobs:
         run: cargo xtask pkg-asset --verify-only --package "dist/kbf-installer-$GITHUB_SHA-linux-x86_64.deb" --platform linux-x86_64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-x86_64.tar.gz" --expect-ref "$GITHUB_REF"
       - name: The signed linux-arm64 package holds the attested binary and trusts this branch
         run: cargo xtask pkg-asset --verify-only --package "dist/kbf-installer-$GITHUB_SHA-linux-arm64.deb" --platform linux-arm64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$GITHUB_REF"
+      - name: The signed linux-x86_64 kbf package holds the attested kbf and the units of the modes
+        run: cargo xtask pkg-kbf-asset --verify-only --package "dist/kbf-$GITHUB_SHA-linux-x86_64.deb" --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz"
+      - name: The signed linux-arm64 kbf package holds the attested kbf and the units of the modes
+        run: cargo xtask pkg-kbf-asset --verify-only --package "dist/kbf-$GITHUB_SHA-linux-arm64.deb" --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz"
 
   # Push to main only, after attest-darwin-arm64: the checks the planned deployment
   # job is to make (cargo xtask verify-assets, crates/xtask/src/sums.rs), for the branch

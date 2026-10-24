@@ -147,7 +147,8 @@ impl<U: UpdateHandler + 'static> Service<U> {
             }
             Route::Update => self.update(request).await,
             Route::Health => text(StatusCode::OK, "ok"),
-            // Readiness has one writer, the proxy's own poll of the active child.
+            // Slot mode: the one writer is the proxy's own poll of the active child. Pool mode:
+            // the polls of the members (`pool_probe`), each of which writes its own member.
             Route::Ready if self.core.is_ready() => text(StatusCode::OK, "ok"),
             Route::Ready => text(StatusCode::SERVICE_UNAVAILABLE, "not ready"),
             Route::Metrics => {
@@ -161,6 +162,10 @@ impl<U: UpdateHandler + 'static> Service<U> {
                     .metrics
                     .render(&self.core.slots, &self.core.queue)
                     .into_bytes();
+                // Pool mode: a series for each member, in place of the one child's.
+                if let Some(members) = &self.core.upstreams {
+                    body.extend_from_slice(members.render().as_bytes());
+                }
                 if let Some(child) = child {
                     body.extend_from_slice(child.as_bytes());
                 }

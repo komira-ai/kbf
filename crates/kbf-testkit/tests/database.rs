@@ -3,8 +3,12 @@
 #![cfg(feature = "postgres")]
 
 use std::process::Command;
+use std::time::Duration;
 
-use kbf_testkit::database::{URL_VAR, server_or_fail, server_url, with_database};
+use kbf_testkit::database::{
+    CATALOG_RACE_TRIES, URL_VAR, retry_catalog_race, server_or_fail, server_url, with_database,
+};
+use postgres::error::SqlState;
 
 /// Asserts that a test that needs the server fails, and does not skip, when none is named,
 /// and that the failure names the variable and says what to set it to.
@@ -40,6 +44,75 @@ fn with_database_replaces_only_the_database() {
     ] {
         assert_eq!(with_database(from, "d"), to);
     }
+}
+
+/// A stand-in for the server's error: the SQLSTATE it carries, if any.
+#[derive(Debug, PartialEq)]
+struct Failure(Option<SqlState>);
+
+fn code_of(failure: &Failure) -> Option<&SqlState> {
+    failure.0.as_ref()
+}
+
+/// The error two sessions changing one catalog row at once get.
+fn raced() -> Failure {
+    Failure(Some(SqlState::INTERNAL_ERROR))
+}
+
+/// Asserts that a run that succeeds is not repeated, and gives its value.
+#[test]
+fn a_run_that_succeeds_is_not_repeated() {
+    let mut runs = 0;
+    let result = retry_catalog_race(Duration::ZERO, code_of, || {
+        runs += 1;
+        Ok::<_, Failure>("done")
+    });
+    assert_eq!(result, Ok("done"));
+    assert_eq!(runs, 1);
+}
+
+/// Asserts that "tuple concurrently updated" (XX000) is retried: two runs that meet it and a
+/// third that succeeds give the third's value, after exactly three runs.
+#[test]
+fn a_tuple_concurrently_updated_is_retried_until_the_run_succeeds() {
+    let mut script = vec![Err(raced()), Err(raced()), Ok(7)].into_iter();
+    let mut runs = 0;
+    let result = retry_catalog_race(Duration::ZERO, code_of, || {
+        runs += 1;
+        script.next().expect("no more runs than the script has")
+    });
+    assert_eq!(result, Ok(7));
+    assert_eq!(runs, 3);
+}
+
+/// Asserts that any other error is returned at once, not retried: an error with another
+/// SQLSTATE (a unique violation) and one with none each end the call after one run, with that
+/// error, though a success would have followed.
+#[test]
+fn any_other_error_is_returned_at_once() {
+    for other in [Some(SqlState::UNIQUE_VIOLATION), None] {
+        let mut script = vec![Err(Failure(other.clone())), Ok(1)].into_iter();
+        let mut runs = 0;
+        let result = retry_catalog_race(Duration::ZERO, code_of, || {
+            runs += 1;
+            script.next().expect("no more runs than the script has")
+        });
+        assert_eq!(result, Err(Failure(other)));
+        assert_eq!(runs, 1);
+    }
+}
+
+/// Asserts that the retry is bounded: an error that is XX000 every time ends the call with
+/// that error after exactly `CATALOG_RACE_TRIES` runs.
+#[test]
+fn a_tuple_concurrently_updated_every_time_gives_up_after_the_bound() {
+    let mut runs = 0;
+    let result = retry_catalog_race(Duration::ZERO, code_of, || {
+        runs += 1;
+        Err::<(), _>(raced())
+    });
+    assert_eq!(result, Err(raced()));
+    assert_eq!(runs, CATALOG_RACE_TRIES);
 }
 
 /// This test binary, to be run again as a child that runs only `asks_for_server`.
@@ -79,9 +152,11 @@ fn server_url_reads_the_variable_and_fails_without_it() {
 /// The tests that need a Postgres server. The module is named `database` so the macOS job,
 /// which has none, skips them by that name (`--skip database::`).
 mod database {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
+    use std::time::Duration;
 
-    use kbf_testkit::database::{TestDatabase, server_url};
+    use kbf_testkit::database::{CATALOG_LOCK_KEY, CatalogGuard, TestDatabase, server_url};
     use postgres::{Client, NoTls};
 
     /// Makes a table `rows` in `db` and writes `marker` to it.
@@ -152,5 +227,83 @@ mod database {
             .query_one("SELECT current_database()", &[])
             .expect("asks");
         assert_eq!(row.get::<_, String>(0), db.name());
+    }
+
+    /// Asserts that role and database-privilege DDL from many connections at once, each under
+    /// the guard, never fails: 8 threads, each on a connection of its own, create a role of
+    /// their own, grant it a privilege on the test database and drop it, 25 times. The
+    /// statements run without the retry, so a "tuple concurrently updated" (SQLSTATE XX000)
+    /// fails the test; without the guard the threads meet it.
+    #[test]
+    fn role_ddl_from_many_connections_under_the_guard_never_meets_a_catalog_race() {
+        thread::scope(|scope| {
+            for thread_number in 0..8 {
+                scope.spawn(move || {
+                    let mut admin = Client::connect(&server_url(), NoTls).expect("connects");
+                    let database: String = admin
+                        .query_one("SELECT current_database()", &[])
+                        .expect("asks")
+                        .get(0);
+                    let role = format!("kbf_tk_ddl_{}_{thread_number}", std::process::id());
+                    for round in 0..25 {
+                        let _guard = CatalogGuard::take();
+                        admin
+                            .batch_execute(&format!(
+                                "CREATE ROLE {role} LOGIN; \
+                                 GRANT CREATE ON DATABASE \"{database}\" TO {role}"
+                            ))
+                            .unwrap_or_else(|error| panic!("round {round}, create: {error}"));
+                        admin
+                            .batch_execute(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
+                            .unwrap_or_else(|error| panic!("round {round}, drop: {error}"));
+                    }
+                });
+            }
+        });
+    }
+
+    /// Asserts that two guards are never held at once, whatever connection each is on: 4
+    /// threads take the guard 5 times each and count how many are inside while they hold it,
+    /// which must be only themselves; and every guard is let go of when it is dropped, or the
+    /// next thread would wait for the lock until it gave up.
+    #[test]
+    fn two_guards_are_never_held_at_once() {
+        let inside = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..5 {
+                        let _guard = CatalogGuard::take();
+                        let before = inside.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(before, 0, "another guard is held at the same time");
+                        thread::sleep(Duration::from_millis(5));
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+    }
+
+    /// Asserts that the lock is let go of when the connection that holds it dies: the holder's
+    /// backend is terminated from another connection (it is found by the lock it holds, which
+    /// no one else can hold at the time), and a second guard is then taken, which returns only
+    /// when the lock is free.
+    #[test]
+    fn the_lock_is_released_when_the_holders_connection_dies() {
+        let held = CatalogGuard::take();
+        let mut admin = Client::connect(&server_url(), NoTls).expect("connects");
+        let holder: i32 = admin
+            .query_one(
+                "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted \
+                 AND ((classid::bigint << 32) | objid::bigint) = $1",
+                &[&CATALOG_LOCK_KEY],
+            )
+            .expect("the lock is held by one backend")
+            .get(0);
+        admin
+            .execute("SELECT pg_terminate_backend($1)", &[&holder])
+            .expect("terminates the holder");
+        let _second = CatalogGuard::take();
+        drop(held);
     }
 }

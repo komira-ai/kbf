@@ -13,8 +13,10 @@ fn entry(outcome: &'static str) -> Entry {
         verb: Some("install"),
         version: Some("1.0-1".into()),
         channel: Some("candidate".into()),
+        unit: None,
         outcome,
         reason: None,
+        result: None,
         command: None,
     }
 }

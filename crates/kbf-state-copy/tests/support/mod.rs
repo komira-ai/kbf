@@ -4,8 +4,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::fs::{self, DirEntry};
+use std::fs::{self, DirEntry, Permissions};
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,7 +16,8 @@ use kbf_state::postgres::{PostgresConfig, schema};
 use kbf_state::sqlite::{Options, SqliteStore};
 use kbf_state::{Commit, Cond, ManualClock, Store, Txn};
 use kbf_state_copy::digest::{Counter, Entry};
-use kbf_state_copy::{Args, Error, Seams};
+use kbf_state_copy::{Args, CutoverArgs, Error, PlaceArgs, RollbackArgs, Seams};
+use kbf_testkit::database::ddl;
 use kbf_testkit::dir::TestDir;
 use rusqlite::Connection;
 
@@ -313,6 +315,196 @@ pub fn run_main(args: &[&str]) -> Ran {
     }
 }
 
+/// A run of the command line with the places a test reaches into passed in.
+pub fn run_main_with(seams: &Seams, args: &[&str]) -> Ran {
+    let program = std::iter::once("kbf-state-copy");
+    let argv = program.chain(args.iter().copied()).map(OsString::from);
+    let (mut out, mut err): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
+    let code = kbf_state_copy::main_with_seams(argv, seams, &mut out, &mut err);
+    Ran {
+        code,
+        out: String::from_utf8(out).expect("the output is UTF-8"),
+        err: String::from_utf8(err).expect("the errors are UTF-8"),
+    }
+}
+
+/// The URL a frontend reaches its database by in the runbook: no password, a local socket.
+pub const FRONTEND_URL: &str = "postgres:///kbf?host=/run/postgresql&user=kbf";
+
+/// A kbf.toml whose `[scheduler] state-store` is `value`, with comments, tabs, trailing
+/// spaces, a line ending in CR LF and no final newline around it: text that a rewrite must
+/// leave as it is, byte for byte.
+pub fn config_with(value: &str) -> String {
+    format!(
+        "# the frontend of this farm\n\
+         mode = \"frontend\"\r\n\
+         \n\
+         [listener]\n\
+         \tlisten = \"0.0.0.0:8980\"   \n\
+         \n\
+         [scheduler]\n\
+         # where the scheduler keeps its state\n\
+         state-store = \"{value}\"   # moved by the cutover\n\
+         heartbeat-interval-ms = 500"
+    )
+}
+
+/// A kbf.toml whose state store is the SQLite file `db`.
+pub fn config_for(db: &Path) -> String {
+    config_with(&sqlite_url(db))
+}
+
+/// The `sqlite://` URL of a state file.
+pub fn sqlite_url(db: &Path) -> String {
+    format!("sqlite://{}", db.display())
+}
+
+/// The text of a systemd drop-in whose command line carries the state store of `db`.
+pub fn unit_for(db: &Path) -> String {
+    let url = sqlite_url(db);
+    format!(
+        "[Service]\n\
+         ExecStart=\n\
+         ExecStart=/usr/bin/kbf --mode=frontend --state-store={url} \\\n  \
+         --listen=0.0.0.0:8980\n"
+    )
+}
+
+/// The file `path` with `text` in it and `mode` as its permission bits.
+pub fn write_with_mode(path: &Path, text: &str, mode: u32) {
+    fs::write(path, text).expect("write the file");
+    fs::set_permissions(path, Permissions::from_mode(mode)).expect("set the mode");
+}
+
+/// The permission bits of `path`.
+pub fn mode_of(path: &Path) -> u32 {
+    let meta = fs::metadata(path).expect("the file is there");
+    meta.permissions().mode() & 0o7777
+}
+
+/// The name of the backup that goes with the setting file `file`.
+pub fn backup_of(file: &Path) -> PathBuf {
+    let mut name = file.as_os_str().to_owned();
+    name.push(".pre-postgres");
+    PathBuf::from(name)
+}
+
+/// The name the new text of the setting file `file` has until it is renamed into place.
+pub fn temp_of(file: &Path) -> PathBuf {
+    let mut name = file.as_os_str().to_owned();
+    name.push(".postgres-new");
+    PathBuf::from(name)
+}
+
+/// The bytes of the file at `path`.
+pub fn read(path: &Path) -> Vec<u8> {
+    fs::read(path).expect("read the file")
+}
+
+/// The text of the file at `path`.
+pub fn read_text(path: &Path) -> String {
+    fs::read_to_string(path).expect("read the file")
+}
+
+/// The setting files of a farm: a state file, the kbf.toml that names it, and what the
+/// kbf.toml said when the test began.
+pub struct Farm {
+    pub dir: TestDir,
+    pub db: PathBuf,
+    pub config: PathBuf,
+    pub text: String,
+}
+
+impl Farm {
+    /// A farm around the state file `db` in `dir`, with its kbf.toml (mode 0640).
+    pub fn new(dir: TestDir, db: PathBuf) -> Farm {
+        let config = dir.join("kbf.toml");
+        let text = config_for(&db);
+        write_with_mode(&config, &text, 0o640);
+        Farm {
+            dir,
+            db,
+            config,
+            text,
+        }
+    }
+
+    /// A farm around a copy of the golden state file, which no frontend has open.
+    pub fn golden(name: &str) -> Farm {
+        let dir = scratch(name);
+        let db = golden_copy(&dir);
+        Farm::new(dir, db)
+    }
+
+    /// The names in the farm's directory.
+    pub fn names(&self) -> BTreeSet<String> {
+        names(&self.dir)
+    }
+
+    /// The text of the kbf.toml now.
+    pub fn config_now(&self) -> String {
+        fs::read_to_string(&self.config).expect("read the kbf.toml")
+    }
+
+    /// Where the backup of the kbf.toml goes.
+    pub fn backup(&self) -> PathBuf {
+        let file = fs::canonicalize(&self.config).expect("the kbf.toml is there");
+        backup_of(&file)
+    }
+}
+
+/// The kbf.toml at `path` as the place of the setting.
+pub fn config_place(path: &Path) -> PlaceArgs {
+    PlaceArgs {
+        config: Some(path.to_path_buf()),
+        unit_file: None,
+    }
+}
+
+/// The unit file at `path` as the place of the setting.
+pub fn unit_place(path: &Path) -> PlaceArgs {
+    PlaceArgs {
+        config: None,
+        unit_file: Some(path.to_path_buf()),
+    }
+}
+
+/// The arguments of a cutover, with no unit and no URL of the frontend's own.
+pub fn cutover_args(db: &Path, url: &str, place: PlaceArgs, apply: bool) -> CutoverArgs {
+    CutoverArgs {
+        state_db: db.to_path_buf(),
+        postgres_url: url.to_owned(),
+        place,
+        unit: None,
+        frontend_url: None,
+        apply,
+    }
+}
+
+/// A cutover through the library, with the report it printed.
+pub fn run_cutover(args: &CutoverArgs, seams: &Seams) -> (Result<(), Error>, String) {
+    let mut out: Vec<u8> = Vec::new();
+    let result = kbf_state_copy::cutover::run(args, seams, &mut out);
+    (result, String::from_utf8(out).expect("the report is UTF-8"))
+}
+
+/// A rollback through the library, with the report it printed.
+pub fn run_rollback(
+    place: PlaceArgs,
+    unit: Option<&str>,
+    apply: bool,
+    seams: &Seams,
+) -> (Result<(), Error>, String) {
+    let args = RollbackArgs {
+        place,
+        unit: unit.map(str::to_owned),
+        apply,
+    };
+    let mut out: Vec<u8> = Vec::new();
+    let result = kbf_state_copy::cutover::rollback(&args, seams, &mut out);
+    (result, String::from_utf8(out).expect("the report is UTF-8"))
+}
+
 /// A URL nothing listens on: a connection to it is refused at once.
 pub const UNREACHABLE: &str = "postgres://nobody@127.0.0.1:1/none";
 
@@ -338,11 +530,9 @@ impl Database {
     pub fn bare() -> Database {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let name = format!("kbf_copy_{}_{n}", std::process::id());
-        let mut admin =
-            postgres::Client::connect(&server_url(), postgres::NoTls).expect("the test server");
-        admin
-            .batch_execute(&format!("CREATE DATABASE \"{name}\""))
-            .expect("create the test's database");
+        // A database belongs to the whole server: `ddl` makes it under the shared-catalog guard.
+        let create = format!("CREATE DATABASE \"{name}\"");
+        ddl(&server_url(), &create).expect("create the test's database");
         Database { name }
     }
 
@@ -368,12 +558,8 @@ impl Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
-        if let Ok(mut admin) = postgres::Client::connect(&server_url(), postgres::NoTls) {
-            let _ = admin.batch_execute(&format!(
-                "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)",
-                self.name
-            ));
-        }
+        let statement = format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", self.name);
+        let _ = ddl(&server_url(), &statement);
     }
 }
 

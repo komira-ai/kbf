@@ -166,7 +166,7 @@ fn refusal(who: PeerRole, path: &str, takes: PeerRole) -> String {
 /// frontend), and `admit` reading it other than it says: each row admits its role's
 /// certificate and refuses the other two PERMISSION_DENIED, saying which role it takes.
 ///
-/// Mutant seen red: the Membership rows written `&[Daemon, Storage]`.
+/// Catches: the Membership rows written `&[Daemon, Storage]`.
 #[test]
 fn each_method_takes_its_one_role_and_refuses_the_others() {
     let table: Vec<(&str, Vec<PeerRole>)> = WORKER_LISTENER_ROLES
@@ -198,7 +198,7 @@ fn each_method_takes_its_one_role_and_refuses_the_others() {
 /// plain text or for any role: each is refused PERMISSION_DENIED, saying it is not
 /// served. Case and a trailing slash count: the path must be a row byte for byte.
 ///
-/// Mutant seen red: `roles_for` answering `None` with every role.
+/// Catches: `roles_for` answering `None` with every role.
 #[test]
 fn a_method_missing_from_the_table_is_refused_whatever_the_caller() {
     for path in UNLISTED {
@@ -433,6 +433,7 @@ fn listeners(worker_tls: Option<WorkerTls>) -> Listeners {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -614,7 +615,7 @@ async fn each_half_of_a_node_is_served_on_its_own_certificate() {
 /// PERMISSION_DENIED by the table (its message: the handler's own storage check is
 /// behind it and says otherwise), and so is every other row that is not a daemon's.
 ///
-/// Mutant seen red: the Membership rows written `&[Daemon, Storage]` (the handler then
+/// Catches: the Membership rows written `&[Daemon, Storage]` (the handler then
 /// refuses with its own message).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_daemon_certificate_may_not_register_or_heartbeat() {
@@ -646,7 +647,7 @@ async fn a_daemon_certificate_may_not_register_or_heartbeat() {
 /// (naming node-a, as a daemon's would, so nothing but the role tells them apart): its
 /// session is refused PERMISSION_DENIED, and every daemon row is refused by the table.
 ///
-/// Mutant seen red: the layer left off the worker listener (`worker_peers` without
+/// Catches: the layer left off the worker listener (`worker_peers` without
 /// `.layer`): the session is welcomed and FindMissingBlobs answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_storage_certificate_opens_no_session_and_makes_no_blob_call() {
@@ -677,7 +678,7 @@ async fn a_frontend_certificate_may_call_nothing() {
 /// UNIMPLEMENTED, which is what the router would answer without the table). The control
 /// in plain text: a listed method (Register) is served.
 ///
-/// Mutant seen red: `roles_for` answering `None` with every role.
+/// Catches: `roles_for` answering `None` with every role.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_method_missing_from_the_table_is_refused_on_the_wire() {
     let pki = Pki::new();
@@ -731,7 +732,7 @@ async fn storage_node(
 /// are refused; the host of `host:port`, a bare host, and the name in another case are
 /// admitted, each its own member.
 ///
-/// Mutants seen red: the instance id left unchecked; the address left unchecked.
+/// Catches: the instance id left unchecked; the address left unchecked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_storage_certificate_registers_only_the_instance_and_address_it_names() {
     let pki = Pki::new();
@@ -786,7 +787,7 @@ async fn a_storage_certificate_registers_only_the_instance_and_address_it_names(
 /// node's names. A certificate that does name the host is member 1 afterwards, so none
 /// of the refusals wrote a member.
 ///
-/// Mutants seen red: a name starting `*.` matched against the host's parent domain;
+/// Catches: a name starting `*.` matched against the host's parent domain;
 /// a DNS name compared to an IP host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_certificate_with_no_covering_name_registers_nothing() {
@@ -826,7 +827,7 @@ async fn a_certificate_with_no_covering_name_registers_nothing() {
 /// literal with or without a port, the expanded form), and nothing else: another IP,
 /// and an unbracketed `::1:8982` (an IPv6 address of its own, not `::1` and a port).
 ///
-/// Mutant seen red: the port cut at the last `:` whatever comes before it (`::1:8982`
+/// Catches: the port cut at the last `:` whatever comes before it (`::1:8982`
 /// read as `::1` and a port).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ip_name_covers_the_host_of_the_address_in_any_spelling() {
@@ -864,7 +865,7 @@ async fn an_ip_name_covers_the_host_of_the_address_in_any_spelling() {
 /// and A's boot is still the live one. A's own certificate still gets
 /// FAILED_PRECONDITION for a wrong boot, and its right one promotes it.
 ///
-/// Mutants seen red: the holder check removed from the heartbeat; the check placed after
+/// Catches: the holder check removed from the heartbeat; the check placed after
 /// the boot comparison.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_storage_certificate_beats_only_for_the_member_whose_address_it_names() {
@@ -954,7 +955,7 @@ fn write_list(path: &Path, text: &str) {
 /// matched, and D goes on. Emptying the list lets A beat again (the list is read at
 /// every check).
 ///
-/// Mutants seen red: Register not checked; Heartbeat not checked; the node entry matched
+/// Catches: Register not checked; Heartbeat not checked; the node entry matched
 /// against nothing (only serial and key looked at).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_listed_storage_certificate_may_neither_register_nor_heartbeat() {
@@ -1033,7 +1034,7 @@ async fn a_listed_storage_certificate_may_neither_register_nor_heartbeat() {
 /// Register and Heartbeat UNAVAILABLE (a node retries those) until the file is fixed,
 /// as it refuses a daemon's stream, and says the list is unusable.
 ///
-/// Mutant seen red: a list that fails to parse treated as an empty one.
+/// Catches: a list that fails to parse treated as an empty one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unusable_deny_list_refuses_membership_calls_unavailable() {
     let pki = Pki::new();
@@ -1143,7 +1144,7 @@ async fn store_a_release(store: &ReleaseStore) -> String {
 /// PERMISSION_DENIED by the table, saying it takes the daemon role; a caller with no
 /// certificate has both calls fail at the transport, the handshake being refused.
 ///
-/// Mutants seen red: the `Describe` row left out of the table (a daemon is refused
+/// Catches: the `Describe` row left out of the table (a daemon is refused
 /// "not served"); the row given every role (the storage certificate is described).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn describe_is_a_daemon_call_as_fetch_is() {

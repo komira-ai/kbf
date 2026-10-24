@@ -8,7 +8,11 @@
 //! ```
 //!
 //! sshd then runs it with no arguments, and the request is the one string in
-//! `SSH_ORIGINAL_COMMAND`. Exactly two requests are accepted, matched as a whole string
+//! `SSH_ORIGINAL_COMMAND`. (The one argument it takes anywhere is `--version`, which prints
+//! the name and the package version and runs nothing; the release checks the signed Mac
+//! binary with it. `--version` beside anything else is refused with the closed line,
+//! unaudited: that is not an sshd request and changes nothing.) Exactly three requests are
+//! accepted, matched as a whole string
 //! ([`request`]):
 //!
 //! - `install kbf=<version> from <channel>`: install that version of the `kbf` package
@@ -17,6 +21,11 @@
 //!   signed source. The process sshd starts checks the request and starts ONE transient
 //!   systemd unit an ssh drop cannot kill; the unit runs this program again, takes the install
 //!   lock and holds it for both apt steps ([`plan`], [`host`]);
+//! - `restart frontend=<name>`: restart `kbf-frontend.service` (`-`) or
+//!   `kbf-frontend@<name>.service` and wait until systemd says it is active (Linux only; no
+//!   other unit can be named). A package install restarts nothing, so the updater asks for
+//!   this after one. It holds the install lock for as long as the process runs, so a restart
+//!   and an install do not overlap;
 //! - `query`: print what is installed, what runs, which node this is and whether an install is in progress (the
 //!   install lock held, an install unit not over, or the dpkg lock held).
 //!
@@ -25,6 +34,16 @@
 //! ([`outcome`], every line with a `result`); the exit status is 0 (done), 2 (refused:
 //! nothing ran) or 3 (failed). Every invocation appends one line to the audit log
 //! ([`audit`]).
+//!
+//! # A Mac
+//!
+//! On macOS ([`mac`]) the same `install` and `query` requests are answered (a `restart` is
+//! refused: a Mac has no frontend unit). The install puts the attested release tarball into the
+//! kit layout (`/usr/local/kbf/releases/<commit>/kbf`, links `current` and `previous`) and
+//! restarts the daemon's launchd job on it. The install verb checks the release on one root-owned
+//! copy, launches a one-shot launchd job that does the swap and the restart, and returns; the
+//! result is the `apply` field of `query` (`docs/deploy/host-install.md`). The platform picks
+//! the side; both are compiled everywhere.
 //!
 //! The paths this program reads as root are constants of [`host::Host::production`]. The
 //! only way to point them elsewhere is a `cfg(test)` constructor: no environment variable
@@ -39,6 +58,7 @@ mod config;
 mod debver;
 mod host;
 mod locks;
+pub(crate) mod mac;
 mod node_id;
 mod outcome;
 mod plan;
@@ -66,6 +86,16 @@ pub mod contract {
         }
     }
 
+    /// The unit of `command`, when it is a `restart` request this program accepts; `None`
+    /// for anything it would refuse and for the other requests.
+    #[must_use]
+    pub fn restart_request(command: &str) -> Option<String> {
+        match crate::request::Request::parse(command) {
+            Ok(crate::request::Request::Restart { unit }) => Some(unit.as_str().to_owned()),
+            _ => None,
+        }
+    }
+
     /// Whether `command` is the `query` request.
     #[must_use]
     pub fn is_query(command: &str) -> bool {
@@ -76,10 +106,55 @@ pub mod contract {
     }
 }
 
+/// The Mac's tool command lines and the readers of what the tools print, with the runner
+/// that runs them, for the test that runs them on a real Mac (`tests/real_mac.rs`). Nothing
+/// here is for production code.
+#[doc(hidden)]
+pub mod mac_tools {
+    pub use crate::mac::{fetch, release, tools};
+    pub use crate::runner::{Cmd, Exec, Identity, Runner, SystemRunner};
+}
+
+/// The one line `--version` prints, which the release pipeline reads from the signed
+/// binary: the name and the package version.
+fn version_line() -> String {
+    format!("kbf-host-install {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Whether the arguments are exactly `--version`. sshd passes none, so this never answers
+/// a request; it is how the release checks the binary it signed runs.
+fn asks_for_version(args: &[std::ffi::OsString]) -> bool {
+    matches!(args, [only] if only == "--version")
+}
+
+/// Whether an argument tries to be the version flag (`--version`, `--version=1`) without the
+/// arguments being exactly that. Such an invocation is not an sshd request (sshd passes no
+/// arguments) and changes nothing, so it is refused before the audit log is opened.
+fn names_version(args: &[std::ffi::OsString]) -> bool {
+    args.iter()
+        .any(|arg| arg.to_str().is_some_and(|a| a.starts_with("--version")))
+}
+
 /// The program: handle `SSH_ORIGINAL_COMMAND` against the production paths and exit with
 /// the status of the answer.
 #[must_use]
 pub fn main() -> ExitCode {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if asks_for_version(&args) {
+        println!("{}", version_line());
+        return ExitCode::SUCCESS;
+    }
+    if names_version(&args) {
+        return ExitCode::from(host::respond(
+            &outcome::Outcome::Refused(outcome::Refusal::BadCommand),
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        ));
+    }
+    // Both sides are compiled everywhere, so the Linux build checks the Mac code.
+    if cfg!(target_os = "macos") {
+        return ExitCode::from(mac::main_process());
+    }
     let code = host::dispatch(
         &host::Host::production(),
         &runner::SystemRunner,
@@ -88,4 +163,51 @@ pub fn main() -> ExitCode {
         &mut std::io::stderr(),
     );
     ExitCode::from(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn args(words: &[&str]) -> Vec<OsString> {
+        words.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn only_the_lone_flag_asks_for_the_version() {
+        assert!(asks_for_version(&args(&["--version"])));
+        for other in [
+            &[][..],
+            &["-V"],
+            &["--version", "query"],
+            &["query"],
+            &["--versions"],
+        ] {
+            assert!(!asks_for_version(&args(other)), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn a_version_flag_beside_anything_else_is_named_but_does_not_ask() {
+        for other in [
+            &["--version", "query"][..],
+            &["--version=1"],
+            &["x", "--version"],
+        ] {
+            assert!(names_version(&args(other)), "{other:?}");
+            assert!(!asks_for_version(&args(other)), "{other:?}");
+        }
+        for other in [&[][..], &["-V"], &["query"]] {
+            assert!(!names_version(&args(other)), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn the_version_line_names_the_binary_and_the_package_version() {
+        assert_eq!(
+            version_line(),
+            format!("kbf-host-install {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
 }

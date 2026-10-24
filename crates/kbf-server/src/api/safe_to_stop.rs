@@ -2,7 +2,7 @@
 //! without leaving a blob with one copy? The updater of a host asks it before it stops the
 //! host's process (`docs/api.md`).
 //!
-//! It is the storage gate ([`storage_gate`], mode [`GateMode::Out`]) asked about one member,
+//! It is the storage gate ([`storage_gate`]) asked about one member,
 //! over a look at the members ([`crate::members`]): with this member out, every other member
 //! must be `Active`, heard within the time to live of the membership, not planned down, and report a repair debt of zero; and
 //! at least one other member must exist. The member's own state is not asked (a stop does not
@@ -36,7 +36,7 @@ use super::{ApiState, encode_segment, error, gate, json, member_failure};
 use crate::farm::Farm;
 use crate::members::{MemberLook, Members, MembersLook, MembershipError};
 use crate::proxy_auth::Caller;
-use crate::storage_gate::{GateMode, member_facts, storage_gate, storage_half};
+use crate::storage_gate::{member_facts, storage_gate, storage_half};
 
 /// The instant a look is judged at. The gate reads only how long ago each member was heard,
 /// and a look carries those ages, so any instant later than the oldest age serves; this one
@@ -82,8 +82,7 @@ pub fn safe_to_stop_path(id: &str) -> String {
 /// membership.
 fn verdict(look: &MembersLook, own: &MemberLook, ttl: Duration) -> Verdict {
     let members = member_facts(look, LOOK_AT);
-    let mode = GateMode::Out { fresh_since: None };
-    let shut = storage_gate(&members, own.id, mode, ttl, LOOK_AT).err();
+    let shut = storage_gate(&members, own.id, ttl, LOOK_AT).err();
     Verdict {
         safe: shut.is_none(),
         reasons: shut.into_iter().map(|fail| fail.to_string()).collect(),
@@ -201,7 +200,7 @@ pub(super) async fn check(
     }
     // A server without a state store keeps no members: every host it knows is a daemon.
     let members = api.members.clone();
-    let store = api.update.as_ref().map(|rows| Arc::clone(rows.store()));
+    let store = api.store.clone();
     let (farm, name) = (Arc::clone(&api.farm), id.clone());
     let job = move || read(&name, &farm, members.as_deref(), store.as_deref());
     let looked = tokio::task::spawn_blocking(job).await;
@@ -272,7 +271,7 @@ mod tests {
 
     /// Catches: a member whose peers are all fine answered unsafe, and a safe answer that
     /// still carries a reason or says the member is planned down, or that does not survive
-    /// the JSON the CLI reads it back from. Mutants it catches: the verdict's `safe` taken
+    /// the JSON the CLI reads it back from. It catches: the verdict's `safe` taken
     /// from `shut.is_some()` (the gate inverted), which turns this and every test below that
     /// asks for a verdict red.
     #[test]
@@ -293,7 +292,7 @@ mod tests {
     /// each thing the storage gate shuts on in another member (not `Active`, catching up,
     /// planned down, silent, an unreported or a non-zero repair debt) makes `safe` false
     /// with the gate's own line, the member's own debt does too, and so does a lone member
-    /// (no second copy). Mutants it catches: `reasons` left empty; a reason text changed;
+    /// (no second copy). It catches: `reasons` left empty; a reason text changed;
     /// the peers' debt not read (the gate asked about the member alone).
     #[test]
     fn each_thing_the_gate_shuts_on_makes_the_stop_unsafe_with_its_reason() {
@@ -374,7 +373,7 @@ mod tests {
     }
 
     /// Catches: a worse reason hidden behind a lesser one: a second member down is named
-    /// before another member's debt, as the storage gate ranks them. Mutants it
+    /// before another member's debt, as the storage gate ranks them. It
     /// catches: the first reason found given instead of the worst.
     #[test]
     fn the_worst_reason_is_the_one_given() {
@@ -442,7 +441,7 @@ mod tests {
     /// judged; a node whose storage half is a member is `200` with that member's verdict, the
     /// gate run; a node that cannot be told from one with a member is `409` with the reason;
     /// and the membership failing is `503`, a row that does not decode and a panicked task
-    /// `500`. Mutants it catches: a node with a member answered as a daemon; an unsure node
+    /// `500`. It catches: a node with a member answered as a daemon; an unsure node
     /// answered safe.
     #[tokio::test]
     async fn each_outcome_is_answered_with_its_status() {

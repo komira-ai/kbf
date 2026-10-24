@@ -5,7 +5,7 @@ mod support;
 
 use std::process::{Command, Output};
 
-use support::{UNREACHABLE, built, golden_copy, open, scratch};
+use support::{Farm, UNREACHABLE, built, golden_copy, open, scratch};
 
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_kbf-state-copy"))
@@ -65,4 +65,27 @@ fn a_target_that_cannot_be_reached_ends_with_status_1() {
     assert_eq!(out.status.code(), Some(1));
     assert!(stdout(&out).contains("session/"));
     assert!(stderr(&out).starts_with("kbf-state-copy: failed: "));
+}
+
+/// Asserts that a rollback with no backup ends with status 2, a refusal, and prints the
+/// reason to the standard error and nothing to the standard output.
+#[test]
+fn a_rollback_without_a_backup_ends_with_status_2() {
+    let farm = Farm::golden("binary-rollback");
+    let config = farm.config.to_str().expect("a UTF-8 path");
+    let out = run(&["rollback", "--config", config]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stdout(&out).is_empty());
+    assert!(stderr(&out).starts_with("kbf-state-copy: refused: "));
+}
+
+/// Asserts that a cutover given neither the kbf.toml nor the unit file ends with status 1,
+/// names the mistake on the standard error, and prints nothing to the standard output.
+#[test]
+fn a_cutover_without_a_place_for_the_setting_ends_with_status_1() {
+    let out = run(&["cutover", "state.db", "postgres://h/db"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stdout(&out).is_empty());
+    let said = stderr(&out);
+    assert!(said.contains("give exactly one of --config"));
 }

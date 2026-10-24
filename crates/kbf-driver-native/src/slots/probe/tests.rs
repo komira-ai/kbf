@@ -322,12 +322,32 @@ fn the_kill_loop_is_bounded_by_scans_and_by_the_deadline() {
     let (result, kills, pauses) = run_loop(&stuck, 3, Ok(()));
     assert_eq!(result, Err("processes [7] survived SIGKILL".to_owned()));
     assert_eq!((kills, pauses), (4, 3));
-    // Out of time while quiet once: not quiet twice.
-    let (result, _, _) = run_loop(&[], 0, Ok(()));
+    // Out of time while quiet once, and not quiet at the one more scan: not quiet twice.
+    let (result, _, _) = run_loop(&[&[], &[8]], 0, Ok(()));
+    assert_eq!(result, Err("processes [8] survived SIGKILL".to_owned()));
+    // A uid that is quiet only every other scan never gets its pair: at the scan bound
+    // the last scan was empty, once.
+    let flapping: Vec<&[i32]> = (0..MAX_SCANS)
+        .map(|n| if n % 2 == 0 { &[7][..] } else { &[][..] })
+        .collect();
+    let (result, kills, _) = run_loop(&flapping, usize::MAX, Ok(()));
     assert_eq!(
         result,
         Err("the uid was not quiet for two scans".to_owned())
     );
+    assert_eq!(kills, MAX_SCANS);
+}
+
+/// Catches a kill loop that fails a uid which went quiet just as the deadline passed:
+/// the first scan finds a process, the second (after the deadline) finds none, and the
+/// one more scan the deadline allows finds none again, so the uid is quiet. The extra
+/// scan is the only one: a process found at it fails the loop, with no third.
+#[test]
+fn a_deadline_that_passes_after_one_quiet_scan_allows_one_more_scan() {
+    assert_eq!(run_loop(&[&[5]], 1, Ok(())), (Ok(()), 3, 2));
+    let (result, kills, _) = run_loop(&[&[5], &[], &[9], &[9]], 1, Ok(()));
+    assert_eq!(result, Err("processes [9] survived SIGKILL".to_owned()));
+    assert_eq!(kills, 3);
 }
 
 /// Catches a kill that fails and is ignored (the scans would then judge a live uid) and a

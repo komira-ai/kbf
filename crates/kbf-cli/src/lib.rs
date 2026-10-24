@@ -42,6 +42,17 @@
 //! client of the frontend's operator API that starts nothing. It is outside
 //! [`names::MODES`]; `kbf --help` ends with a line naming it.
 //!
+//! And `kbf boot-check --mode=<mode>` ([`boot_check`]), which the packaged units run before
+//! they start `kbf`: it brings the state database to the schema this kbf needs, for the modes
+//! that keep their state in it, and exits 1 (the unit does not start) when it cannot. It
+//! starts no mode, so it is outside [`names::MODES`] too; `kbf --help` ends with a line
+//! naming it.
+//!
+//! And `kbf setup --mode=<mode> ...` ([`setup`]), the first configuration of a host whose kbf
+//! came from the packages: `kbf-installer setup`'s library run by this binary, with the same
+//! flags (but the proxy's), files, accounts, state database and exit statuses. It starts no mode
+//! either; `kbf --help` names it.
+//!
 //! A mode refuses the flags that belong to another mode ([`refused_by`]): the set is
 //! derived from each mode's own flag set, nothing is listed by hand, so a flag added to
 //! one mode is refused by the others with no edit here.
@@ -67,6 +78,7 @@
 //!
 //! The `kbf-server`, `kbf-daemon` and `kbf-all-in-one` binaries are unchanged.
 
+pub mod boot_check;
 pub mod cluster;
 pub mod config;
 pub mod enroll;
@@ -74,6 +86,7 @@ pub mod names;
 pub mod node;
 pub mod nofile;
 pub mod preflight;
+pub mod setup;
 pub mod version;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -83,12 +96,14 @@ use std::sync::OnceLock;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use boot_check::BOOT_CHECK;
 use clap::builder::PossibleValuesParser;
 use clap::error::ErrorKind;
 use clap::{
     Arg, ArgAction, ArgMatches, Args as _, Command, CommandFactory as _, FromArgMatches as _,
 };
 use names::{Entry, MODES, Mode};
+use setup::SETUP;
 
 /// A parsed command line. The flags are boxed: the variants differ a lot in size.
 #[derive(Clone, Debug)]
@@ -275,7 +290,9 @@ pub fn command() -> Command {
     }
     cmd.after_help(format!(
         "Not a mode: `kbf {CLUSTER} status|drain|undrain|member|safe-to-stop|denied|epoch-bump|object-store` calls a frontend's operator API \
-         (`kbf {CLUSTER} --help`).",
+         (`kbf {CLUSTER} --help`). `kbf {BOOT_CHECK} --mode=<mode>` brings the state database to the schema this kbf needs, \
+         before a unit starts it (`kbf {BOOT_CHECK} --help`). `kbf {SETUP} --mode=<mode>` sets up a host from the \
+         packages (`kbf {SETUP} --help`).",
     ))
 }
 
@@ -774,10 +791,10 @@ pub fn run(invocation: &Invocation) -> ExitCode {
 
 /// The `kbf` binary: the daemon's helper re-execs first (a keeper or a `__chown-dirs`
 /// run of this binary never reads the command line as `kbf`'s), then [`version::line`]
-/// for `kbf --version --json`, then the command line, then [`cluster::run`] for `kbf cluster ...` or else
-/// [`preflight::refusal`] and [`run`]. A command
-/// line that
-/// does not parse exits 2 (0 for `--help` and `--version`).
+/// for `kbf --version --json`, then the command line, then [`cluster::run`] for
+/// `kbf cluster ...`, then [`boot_check::run`] for `kbf boot-check ...`, then [`setup::run`] for
+/// `kbf setup ...`, or else [`preflight::refusal`] and [`run`]. A command line that does not
+/// parse exits 2 (0 for `--help` and `--version`).
 #[must_use]
 pub fn main() -> ExitCode {
     if let Some(code) = kbf_node::dispatch_helpers() {
@@ -794,6 +811,18 @@ pub fn main() -> ExitCode {
     if args.get(1).is_some_and(|word| word == CLUSTER) {
         return match parse_cluster(&args) {
             Ok(cluster) => cluster::run(&cluster),
+            Err(e) => e.exit(),
+        };
+    }
+    if args.get(1).is_some_and(|word| word == BOOT_CHECK) {
+        return match boot_check::parse(&args) {
+            Ok(parsed) => boot_check::run(&parsed),
+            Err(e) => e.exit(),
+        };
+    }
+    if args.get(1).is_some_and(|word| word == SETUP) {
+        return match setup::parse(&args) {
+            Ok(parsed) => setup::run(&parsed),
             Err(e) => e.exit(),
         };
     }

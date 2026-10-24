@@ -9,14 +9,12 @@
 
 use std::time::Duration;
 
-use kbf_update::Source;
-
 use crate::CommitId;
 use crate::migrator::{DbMigrator, Facts, MigrateError, StagedSchema};
 
 use super::model::{
-    AdoptError, CrashPoint, DesiredError, Halt, Intent, Locator, OpenCounts, PortError, ProcIdent,
-    Readiness, Request, Retired, RoleInfo, Slot, StagedFacts, Start,
+    AdoptError, CrashPoint, Halt, Intent, Locator, OpenCounts, PortError, ProcIdent, Readiness,
+    Request, Retired, RoleInfo, Slot, StagedFacts, Start,
 };
 
 /// The process side of the children. The proxy starts them as its own processes.
@@ -72,17 +70,6 @@ pub trait ChildAdmin {
     fn ready(&self, slot: Slot) -> Result<Readiness, PortError>;
 
     fn open_counts(&self, slot: Slot) -> Result<OpenCounts, PortError>;
-
-    /// `POST /v1/update/desired {commit}` on the child's operator port; idempotent
-    /// (FP section 5 step 9). `source` is where the release came from: the body names it
-    /// when it is not a fetch. A child that answered and refused ends the update; one that did
-    /// not answer is asked again ([`DesiredError`]).
-    fn post_desired(
-        &self,
-        slot: Slot,
-        commit: &CommitId,
-        source: Source,
-    ) -> Result<(), DesiredError>;
 }
 
 /// The proxy's routing state for the update: the hold and the per-slot permits. The hold
@@ -117,7 +104,7 @@ pub trait Gate {
 }
 
 /// Forward, backward-compatible Postgres migrations. The kbf child never alters tables
-/// (CEO 14:58Z), so this runs before the candidate starts. The real one is
+///, so this runs before the candidate starts. The real one is
 /// [`crate::migrator::DbMigrator`].
 pub trait Migrator {
     /// Apply every forward migration release `release` needs. Idempotent: running it

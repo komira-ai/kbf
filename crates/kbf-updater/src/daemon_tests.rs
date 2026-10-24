@@ -1,33 +1,35 @@
 //! Flags, start-up failures, and the binary's own wiring (the real safe-to-stop and health
-//! check, the installer that is not built) over a real socket.
+//! check, the ssh installer) over a real socket.
 
 use std::os::unix::net::UnixListener;
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use crate::api::{ErrorCode, Roll, RollState};
 use crate::daemon::{
-    Config, build_ports, drive_loop, parse_flags, parse_operator_url, run_config, start,
-    stderr_sink,
+    Config, Daemon, build_ports, build_ports_with_exec, drive_loop, parse_flags,
+    parse_operator_url, run_config, start, start_with, stderr_sink,
 };
 use crate::fakes::{Event, FakeClock, FakeHealth, FakeInstaller, FakeSafeToStop, Log};
-use crate::inventory::{Host, Role};
+use crate::inventory::{Host, Member, Role};
 use crate::listener::{Activation, Listen};
-use crate::not_built::{NOT_BUILT, NotBuiltInstaller};
-use crate::ports::{Installer, PortErrorKind};
 use crate::record::RollStore;
-use crate::server::Recent;
+use crate::server::{Recent, Settings};
+use crate::ssh_installer::{Exec, ExecError, Exited, Spawn};
 use crate::testutil::{
-    FakeApi, KEY, Lines, TOKEN, call, eventually, fake_api, file, http, own_uid, scratch, sock,
+    FakeApi, KEY, Lines, TOKEN, call, eventually, fake_api, file, http, locked, own_uid, scratch,
+    sock,
 };
-use crate::version::Version;
 use crate::{Ports, Timing, Updater, run_with};
 
 fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| (*s).to_owned()).collect()
 }
 
-const FLAGS: [&str; 12] = [
+const FLAGS: [&str; 18] = [
     "--state-dir",
     "/s",
     "--inventory",
@@ -40,6 +42,12 @@ const FLAGS: [&str; 12] = [
     "http://127.0.0.1:8080",
     "--token-file",
     "/t",
+    "--ssh-key-file",
+    "/k",
+    "--ssh-user",
+    "kbf",
+    "--channel",
+    "stable",
 ];
 
 fn parse(list: &[&str]) -> Result<Config, String> {
@@ -67,6 +75,14 @@ fn the_flags_are_required_and_exact() {
         (993, 0, 8080)
     );
     assert_eq!(cfg.operator_proxy_auth_file, None);
+    assert_eq!(
+        (
+            cfg.ssh_key_file.to_str(),
+            cfg.ssh_user.as_str(),
+            cfg.channel.as_str()
+        ),
+        (Some("/k"), "kbf", "stable")
+    );
     let eq: Vec<String> = FLAGS
         .chunks(2)
         .map(|p| format!("{}={}", p[0], p[1]))
@@ -173,6 +189,190 @@ fn the_operator_proxy_auth_file_is_an_optional_flag() {
     );
 }
 
+/// Catches the two ssh timeouts being required, read from the wrong flag, or taking a
+/// non-number: they default to 10 s to connect and 900 s per call, and each flag sets only its
+/// own.
+#[test]
+fn the_ssh_timeouts_are_optional_flags_in_seconds() {
+    let cfg = parse(&FLAGS).expect("flags");
+    assert_eq!(
+        (
+            cfg.ssh_connect_timeout.as_secs(),
+            cfg.ssh_command_timeout.as_secs()
+        ),
+        (10, 900)
+    );
+    let with = [&FLAGS[..], &["--ssh-connect-timeout-secs", "3"]].concat();
+    let cfg = parse(&with).expect("connect");
+    assert_eq!(
+        (
+            cfg.ssh_connect_timeout.as_secs(),
+            cfg.ssh_command_timeout.as_secs()
+        ),
+        (3, 900)
+    );
+    let with = [&FLAGS[..], &["--ssh-command-timeout-secs=60"]].concat();
+    let cfg = parse(&with).expect("command");
+    assert_eq!(
+        (
+            cfg.ssh_connect_timeout.as_secs(),
+            cfg.ssh_command_timeout.as_secs()
+        ),
+        (10, 60)
+    );
+    for flag in ["--ssh-connect-timeout-secs", "--ssh-command-timeout-secs"] {
+        for bad in ["soon", "-1", "1.5", ""] {
+            let with = [&FLAGS[..], &[flag, bad]].concat();
+            assert_eq!(
+                parse(&with).expect_err(bad),
+                format!("{flag} must be a number of seconds")
+            );
+        }
+    }
+}
+
+/// Catches a drain deadline that is not a flag, that defaults to something else than 600 s,
+/// that takes a non-number, or that may be zero (a drain that waits for nothing is no
+/// drain): the flag sets only the deadline.
+#[test]
+fn the_drain_deadline_is_an_optional_flag_of_at_least_a_second() {
+    assert_eq!(parse(&FLAGS).expect("flags").drain_deadline.as_secs(), 600);
+    let with = [&FLAGS[..], &["--drain-deadline-secs", "90"]].concat();
+    let cfg = parse(&with).expect("deadline");
+    assert_eq!(
+        (
+            cfg.drain_deadline.as_secs(),
+            cfg.ssh_command_timeout.as_secs()
+        ),
+        (90, 900)
+    );
+    for bad in ["soon", "-1", "1.5", ""] {
+        let with = [&FLAGS[..], &["--drain-deadline-secs", bad]].concat();
+        assert_eq!(
+            parse(&with).expect_err(bad),
+            "--drain-deadline-secs must be a number of seconds"
+        );
+    }
+    let zero = [&FLAGS[..], &["--drain-deadline-secs", "0"]].concat();
+    assert_eq!(
+        parse(&zero).expect_err("zero"),
+        "--drain-deadline-secs must be at least 1"
+    );
+}
+
+/// Catches the two bounds of a Mac's apply not being flags: both are optional, default to a
+/// 5 s poll and a 600 s deadline, take a number of seconds, and may not be zero (a poll with
+/// no interval spins; a deadline of nothing fails every apply). Each sets only itself.
+#[test]
+fn the_apply_poll_and_deadline_are_optional_flags_of_at_least_a_second() {
+    let cfg = parse(&FLAGS).expect("flags");
+    assert_eq!(
+        (cfg.apply_poll.as_secs(), cfg.apply_deadline.as_secs()),
+        (5, 600)
+    );
+    let with = [&FLAGS[..], &["--apply-poll-secs", "2"]].concat();
+    let cfg = parse(&with).expect("poll");
+    assert_eq!(
+        (cfg.apply_poll.as_secs(), cfg.apply_deadline.as_secs()),
+        (2, 600)
+    );
+    let with = [&FLAGS[..], &["--apply-deadline-secs=90"]].concat();
+    let cfg = parse(&with).expect("deadline");
+    assert_eq!(
+        (cfg.apply_poll.as_secs(), cfg.apply_deadline.as_secs()),
+        (5, 90)
+    );
+    for flag in ["--apply-poll-secs", "--apply-deadline-secs"] {
+        for bad in ["soon", "-1", "1.5", ""] {
+            let with = [&FLAGS[..], &[flag, bad]].concat();
+            assert_eq!(
+                parse(&with).expect_err(bad),
+                format!("{flag} must be a number of seconds")
+            );
+        }
+        let zero = [&FLAGS[..], &[flag, "0"]].concat();
+        assert_eq!(
+            parse(&zero).expect_err("zero"),
+            format!("{flag} must be at least 1")
+        );
+    }
+}
+
+/// Catches a flag that is parsed and never reaches the roll: the drain deadline and the apply
+/// poll and deadline are the timing's, and the rest of the timing is the default.
+#[test]
+fn the_flags_set_the_timing_of_the_roll() {
+    let with = [
+        &FLAGS[..],
+        &[
+            "--drain-deadline-secs=7",
+            "--apply-poll-secs=3",
+            "--apply-deadline-secs=11",
+        ],
+    ]
+    .concat();
+    let t = crate::daemon::timing(&parse(&with).expect("flags"));
+    assert_eq!(
+        (
+            t.drain_deadline.as_secs(),
+            t.apply_poll.as_secs(),
+            t.apply_deadline.as_secs()
+        ),
+        (7, 3, 11)
+    );
+    assert_eq!(t.poll, Timing::default().poll);
+}
+
+/// Catches the settings of the installer reaching it unchecked: a key path that is no file, a
+/// user or channel the host would not take and a zero timeout each stop the ports from being
+/// built, with the reason, and the key's contents are in no message.
+#[test]
+fn the_ssh_settings_are_checked_when_the_ports_are_built() {
+    let api = fake_api(vec![Some(http(200, "{}"))]);
+    let good = config("sshcfg", "st1 st1.farm.example storage KEY\n", &api);
+    assert!(build_ports(&good).is_ok());
+
+    let mut cfg = good.clone();
+    cfg.ssh_key_file = cfg.ssh_key_file.with_file_name("missing");
+    let e = build_ports(&cfg).err().expect("missing key");
+    assert!(
+        e.starts_with("--ssh-key-file ") && e.ends_with("is not a file"),
+        "{e}"
+    );
+    cfg.ssh_key_file = cfg.state_dir.clone();
+    assert!(
+        build_ports(&cfg)
+            .err()
+            .expect("directory")
+            .contains("is not a file")
+    );
+
+    for (user, why) in [("Root", "ssh user"), ("", "ssh user"), ("-x", "ssh user")] {
+        let mut cfg = good.clone();
+        cfg.ssh_user = user.to_owned();
+        let e = build_ports(&cfg).err().expect(user);
+        assert!(e.contains(why), "{user}: {e}");
+    }
+    let mut cfg = good.clone();
+    cfg.channel = "Stable".to_owned();
+    assert!(
+        build_ports(&cfg)
+            .err()
+            .expect("channel")
+            .contains("channel")
+    );
+    for zero in [0, 1] {
+        let mut cfg = good.clone();
+        if zero == 0 {
+            cfg.ssh_connect_timeout = std::time::Duration::ZERO;
+        } else {
+            cfg.ssh_command_timeout = std::time::Duration::ZERO;
+        }
+        let e = build_ports(&cfg).err().expect("zero");
+        assert!(e.contains("more than zero"), "{e}");
+    }
+}
+
 /// Catches the operator token being sent anywhere but loopback in clear: a non-loopback IP, a
 /// name (no resolver is used), `https`, no scheme and a path or junk are refused; both
 /// loopback families are taken.
@@ -206,6 +406,31 @@ fn the_operator_api_must_be_a_loopback_address() {
     }
 }
 
+/// Asserts that `--proxy-admin` is an optional flag that takes a loopback URL as `--operator-api`
+/// does and names itself when it refuses one: absent it is none, given it is read in both
+/// forms, and a non-loopback address, a name and `https` are refused.
+#[test]
+fn the_proxy_admin_is_an_optional_loopback_flag() {
+    assert_eq!(parse(&FLAGS).expect("flags").proxy_admin, None);
+    let with = [&FLAGS[..], &["--proxy-admin", "http://127.0.0.1:18090"]].concat();
+    let cfg = parse(&with).expect("flags");
+    assert_eq!(cfg.proxy_admin.map(|a| a.port()), Some(18090));
+    let with = [&FLAGS[..], &["--proxy-admin=http://[::1]:18091/"]].concat();
+    let cfg = parse(&with).expect("= form");
+    assert_eq!(cfg.proxy_admin.map(|a| a.port()), Some(18091));
+    let refused = [
+        ("http://192.0.2.5:18090", "loopback"),
+        ("http://localhost:18090", "IP address"),
+        ("https://127.0.0.1:18090", "http://"),
+    ];
+    for (bad, why) in refused {
+        let with = [&FLAGS[..], &["--proxy-admin", bad]].concat();
+        let e = parse(&with).expect_err(bad);
+        assert!(e.starts_with("--proxy-admin must "), "{bad}: {e}");
+        assert!(e.contains(why), "{bad}: {e}");
+    }
+}
+
 /// A config over a scratch directory with `inventory` and a good token file.
 fn config(name: &str, inventory: &str, api: &FakeApi) -> Config {
     let dir = scratch(name);
@@ -220,7 +445,76 @@ fn config(name: &str, inventory: &str, api: &FakeApi) -> Config {
         operator_api: api.addr,
         token_file: file(&dir, "token", TOKEN, 0o600),
         operator_proxy_auth_file: None,
+        proxy_admin: None,
+        ssh_key_file: file(&dir, "id_updater", KEY_TEXT, 0o600),
+        ssh_user: "kbf".to_owned(),
+        channel: "stable".to_owned(),
+        ssh_connect_timeout: Duration::from_secs(5),
+        ssh_command_timeout: Duration::from_secs(30),
+        drain_deadline: Duration::from_secs(600),
+        apply_poll: Duration::from_secs(5),
+        apply_deadline: Duration::from_secs(600),
     }
+}
+
+/// What the private key file holds in these tests: it must reach no answer and no audit line.
+const KEY_TEXT: &str = "PRIVATE-KEY-BYTES-do-not-leak";
+
+/// An [`Exec`] that records each process it is asked to run, one line per call (the program
+/// and its arguments), and answers as the host's forced command does.
+#[derive(Default)]
+struct FakeSsh {
+    calls: Mutex<Vec<String>>,
+}
+
+impl Exec for FakeSsh {
+    fn run(&self, spawn: &Spawn) -> Result<Exited, ExecError> {
+        let args: Vec<String> = spawn
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        locked(&self.calls).push(format!("{} {}", spawn.program.display(), args.join(" ")));
+        let stdout = if args.last().is_some_and(|c| c.starts_with("install ")) {
+            "{\"result\":\"installed\",\"installed_version\":\"2.0-1\",\"unit_state\":\"finished\"}\n"
+        } else {
+            "{\"result\":\"query\",\"installed_version\":\"2.0-1\",\"running_commit\":null,\"in_progress\":false}\n"
+        };
+        Ok(Exited {
+            code: Some(0),
+            stdout: stdout.as_bytes().to_vec(),
+            stdout_overflow: false,
+            stderr: Vec::new(),
+        })
+    }
+}
+
+/// The timing of a test: a roll that cannot go on fails within a second.
+fn quick() -> Timing {
+    Timing {
+        poll: Duration::from_millis(10),
+        safe_bound: Duration::from_millis(300),
+        install_bound: Duration::from_millis(300),
+        query_bound: Duration::from_millis(300),
+        healthy_frontend: Duration::from_millis(300),
+        healthy_storage: Duration::from_millis(300),
+        healthy_daemon: Duration::from_millis(300),
+        drain_deadline: Duration::from_millis(300),
+        apply_poll: Duration::from_millis(10),
+        apply_deadline: Duration::from_millis(300),
+    }
+}
+
+/// The binary's ports with `ssh` standing in for the real program.
+fn start_with_ssh(cfg: &Config, ssh: &Arc<FakeSsh>) -> Daemon {
+    start_with(
+        cfg,
+        build_ports_with_exec(cfg, ssh.clone()).expect("ports"),
+        quick(),
+        Settings::new(cfg.proxy_uid),
+        stderr_sink(),
+    )
+    .expect("start")
 }
 
 fn wait_failed(socket: &std::path::Path) -> Roll {
@@ -241,22 +535,26 @@ fn post(socket: &std::path::Path) -> (u16, Value) {
     call(socket, "POST", "/v1/updater/rolls", &body.to_string())
 }
 
-/// Catches a roll that goes on past a frontend: with the binary's own wiring, a POST is
-/// accepted (202) and the roll FAILS at the frontend, before its installer, with the drain
-/// control reason in the failure; no later host is asked about (the fake operator API sees no
-/// request at all), and the frontend, which has no safe-to-stop, made none either.
+/// Asserts that ssh is never run for a frontend that is no pool member: with the binary's own
+/// ports, an all-hosts roll (frontend, storage, daemon) is accepted (202) and fails at the
+/// frontend, before its installer, with the reason that says to list an instance and a base in
+/// the failure. The recording `Exec` is never called (the recorded calls are empty), no later
+/// host is asked about (the fake operator API sees no request at all) and the later hosts stay
+/// pending.
 #[test]
-fn the_binary_wiring_accepts_a_roll_and_fails_safe_at_the_frontend() {
+fn an_all_hosts_roll_never_runs_ssh_for_a_frontend_that_is_no_member() {
     let api = fake_api(vec![Some(http(
         200,
         "{\"safe\":true,\"reasons\":[],\"planned_down\":false}",
     ))]);
     let cfg = config(
         "unbuilt",
-        "fe fe.farm.example frontend KEY\nst1 st1.farm.example storage KEY\n",
+        "fe fe.farm.example frontend KEY\nst1 st1.farm.example storage KEY\n\
+         dm1 dm1.farm.example daemon KEY\n",
         &api,
     );
-    let daemon = start(&cfg).expect("start");
+    let ssh = Arc::new(FakeSsh::default());
+    let daemon = start_with_ssh(&cfg, &ssh);
     let (status, body) = post(&sock(&cfg));
     assert_eq!((status, &body["state"]), (202, &json!("running")), "{body}");
     let roll = wait_failed(&sock(&cfg));
@@ -267,7 +565,7 @@ fn the_binary_wiring_accepts_a_roll_and_fails_safe_at_the_frontend() {
         ("fe", ErrorCode::SwapAbandoned)
     );
     assert!(
-        failure.detail.contains("kbf-proxy drain control"),
+        failure.detail.contains("instance=<name> and base=<port>"),
         "{}",
         failure.detail
     );
@@ -276,7 +574,12 @@ fn the_binary_wiring_accepts_a_roll_and_fails_safe_at_the_frontend() {
         .iter()
         .map(|h| format!("{:?}", h.phase))
         .collect();
-    assert_eq!(phases, ["Failed", "Pending"]);
+    assert_eq!(phases, ["Failed", "Pending", "Pending"]);
+    assert!(
+        locked(&ssh.calls).is_empty(),
+        "ssh was run: {:?}",
+        locked(&ssh.calls)
+    );
     assert!(
         api.requests().is_empty(),
         "no host was asked about: {:?}",
@@ -286,61 +589,151 @@ fn the_binary_wiring_accepts_a_roll_and_fails_safe_at_the_frontend() {
     daemon.wait();
 }
 
-/// Catches the real safe-to-stop not being wired into the roll: a node-only roll asks the
-/// operator API once, with the token from the file, and is then stopped by the not-built
-/// installer, still before any host is touched.
+/// Catches the ssh installer not being the one wired into the roll for a node: a storage
+/// host is checked with the token, installed through `ssh` (exactly one install call, as the
+/// configured user, with the configured key file and channel, to the host's address, with
+/// the version of the roll as the remote command), and the roll then goes on to ask for its
+/// health: the version of the test names no commit, so the node health check abandons it,
+/// which is a health failure and not an install one. The key's contents
+/// are in no argument, no answer and no audit line.
 #[test]
-fn a_node_is_checked_with_the_token_and_then_refused_by_the_installer() {
+fn a_node_is_installed_over_ssh_with_the_configured_user_key_and_channel() {
     let api = fake_api(vec![Some(http(
         200,
         "{\"safe\":true,\"reasons\":[],\"planned_down\":false}",
     ))]);
-    let cfg = config("unbuilt2", "st1 st1.farm.example storage KEY\n", &api);
-    let daemon = start(&cfg).expect("start");
+    let cfg = config("viassh", "st1 st1.farm.example:2222 storage KEY\n", &api);
+    let ssh = Arc::new(FakeSsh::default());
+    let audit = Lines::default();
+    let daemon = start_with(
+        &cfg,
+        build_ports_with_exec(&cfg, ssh.clone()).expect("ports"),
+        quick(),
+        Settings::new(cfg.proxy_uid),
+        audit.sink(),
+    )
+    .expect("start");
     assert_eq!(post(&sock(&cfg)).0, 202);
     let roll = wait_failed(&sock(&cfg));
     let failure = roll.failure.expect("failure");
     assert_eq!(
         (failure.alias.as_str(), failure.code),
-        ("st1", ErrorCode::InstallFailed)
+        ("st1", ErrorCode::SwapAbandoned)
     );
-    let seen = api.requests();
-    assert_eq!(seen.len(), 1, "{seen:?}");
-    assert!(seen[0].starts_with("GET /v1/members/st1/safe-to-stop "));
-    assert!(seen[0].contains(&format!("Bearer {TOKEN}")));
-    // The token is in no audit line and no answer.
     assert!(
-        !call(&sock(&cfg), "GET", "/v1/updater/rolls", "")
-            .1
-            .to_string()
-            .contains(TOKEN)
+        failure.detail.contains("names no commit"),
+        "{}",
+        failure.detail
     );
+    let calls = locked(&ssh.calls).join("\n");
+    let installs: Vec<&str> = calls
+        .lines()
+        .filter(|l| l.contains(" install kbf="))
+        .collect();
+    assert_eq!(installs.len(), 1, "{calls}");
+    let key = cfg.ssh_key_file.display().to_string();
+    for want in [
+        format!("-i {key} "),
+        "kbf@st1.farm.example".to_owned(),
+        "-p 2222".to_owned(),
+        "install kbf=2.0-1 from stable".to_owned(),
+    ] {
+        assert!(installs[0].contains(&want), "{want}: {}", installs[0]);
+    }
+    let seen = api.requests();
+    assert!(
+        seen[0].starts_with("GET /v1/members/st1/safe-to-stop "),
+        "{seen:?}"
+    );
+    assert!(seen[0].contains(&format!("Bearer {TOKEN}")));
+    let everything = format!(
+        "{calls}{}{}",
+        audit.raw(),
+        call(&sock(&cfg), "GET", "/v1/updater/rolls", "").1
+    );
+    assert!(!everything.contains(KEY_TEXT) && !everything.contains(TOKEN));
     daemon.stopper().stop();
     daemon.wait();
 }
 
-/// Catches the refusing installer answering with anything but a refusal.
+/// Catches a role that is not frontend, storage, daemon or mac-daemon being accepted: the
+/// inventory refuses the line (`mac` alone is not a role), so the updater does not start and
+/// no ssh runs.
 #[test]
-fn the_not_built_installer_refuses_everything() {
+fn an_unknown_role_is_refused_by_the_inventory() {
+    let api = fake_api(vec![Some(http(200, "{}"))]);
+    for role in ["mac", "macos", "homebrew"] {
+        let cfg = config(
+            "mac",
+            &format!("st1 st1.farm.example storage KEY\nm1 m1.farm.example {role} KEY\n"),
+            &api,
+        );
+        let e = start(&cfg).err().expect(role);
+        assert!(
+            e.starts_with("inventory ")
+                && e.contains("is not frontend, storage, daemon or mac-daemon"),
+            "{e}"
+        );
+        assert!(!sock(&cfg).exists());
+    }
+}
+
+/// Asserts that an inventory that lists frontend pool members is refused at start-up without
+/// `--proxy-admin`, with the flag named and nothing bound, that it is accepted with the flag,
+/// and that an inventory without members needs no flag.
+#[test]
+fn pool_members_need_the_proxy_admin_flag() {
+    let api = fake_api(vec![Some(http(200, "{}"))]);
+    let members = "fe-a fe.farm.example frontend KEY instance=a base=18000\n\
+                   fe-b fe.farm.example frontend KEY instance=b base=18010\n";
+    let mut cfg = config("members", members, &api);
+    let e = start(&cfg).err().expect("no admin");
+    assert!(e.contains("--proxy-admin"), "{e}");
+    assert!(e.contains("frontend pool members"), "{e}");
+    assert!(!sock(&cfg).exists());
+    cfg.proxy_admin = Some(api.addr);
+    let daemon = start(&cfg).expect("start with the flag");
+    daemon.stopper().stop();
+    daemon.wait();
+    let plain = config("no-members", "st1 st1.farm.example storage KEY\n", &api);
+    let daemon = start(&plain).expect("start without members");
+    daemon.stopper().stop();
+    daemon.wait();
+}
+
+/// Asserts that the binary's pool is the proxy's admin API when `--proxy-admin` names it, asked
+/// without the operator token, and a pool that says the flag is missing when it does not, and
+/// that its frontend port is the member's own operator API, asked with the token.
+#[test]
+fn the_binarys_pool_and_frontend_ports_reach_the_proxy_and_the_member() {
+    let admin = fake_api(vec![Some(http(200, "[]"))]);
+    let operator = fake_api(vec![Some(http(200, "{\"commit\":\"0123456789ab\"}"))]);
+    let mut cfg = config("pool", "st1 st1.farm.example storage KEY\n", &operator);
+    let ports = build_ports(&cfg).expect("ports");
+    let e = ports.pool.view().expect_err("no pool");
+    assert!(e.to_string().contains("--proxy-admin"), "{e}");
+    cfg.proxy_admin = Some(admin.addr);
+    let ports = build_ports(&cfg).expect("ports");
+    assert_eq!(ports.pool.view(), Ok(Vec::new()));
+    let asked = admin.requests().remove(0);
+    assert!(asked.starts_with("GET /v1/proxy/upstreams HTTP/1.1\r\n"));
+    assert!(!asked.contains(TOKEN), "{asked}");
     let host = Host {
-        alias: "st1".into(),
-        address: "st1.farm.example".into(),
-        role: Role::Storage,
-        host_key: KEY.into(),
+        alias: "fe-a".to_owned(),
+        address: "fe.farm.example".to_owned(),
+        role: Role::Frontend,
+        host_key: KEY.to_owned(),
+        node_id: None,
+        member: Some(Member {
+            instance: "a".to_owned(),
+            base_port: operator.addr.port() - 2,
+        }),
     };
-    let v = Version::parse("2.0").expect("version");
-    let e = NotBuiltInstaller.install(&host, &v).expect_err("install");
-    assert_eq!(
-        (e.kind(), e.to_string().as_str()),
-        (PortErrorKind::Other, NOT_BUILT)
-    );
-    assert_eq!(
-        NotBuiltInstaller
-            .query(&host)
-            .expect_err("query")
-            .to_string(),
-        NOT_BUILT
-    );
+    let commit = ports.frontend.commit(&host);
+    assert_eq!(commit, Ok("0123456789ab".to_owned()));
+    let asked = operator.requests().remove(0);
+    assert!(asked.starts_with("GET /healthz HTTP/1.1\r\n"));
+    assert!(asked.contains(&format!("Bearer {TOKEN}")), "{asked}");
 }
 
 /// Catches start-up that goes on over something wrong: an inventory that is not owned by the
@@ -401,8 +794,11 @@ fn the_driver_loop_audits_what_it_cannot_drive_and_goes_on() {
     let ports = Ports {
         safe: Box::new(FakeSafeToStop::new(&log)),
         installer: Box::new(FakeInstaller::new(&log)),
+        drain: Box::new(crate::fakes::FakeDrain::new(&log)),
         health: Box::new(FakeHealth::new(&log)),
         clock: Box::new(FakeClock::new()),
+        pool: Box::new(crate::fakes::FakePool::new(&log)),
+        frontend: Box::new(crate::fakes::FakeFrontend::new(&log)),
     };
     let updater = Updater::open(
         crate::inventory::Inventory::load(&cfg.inventory, own_uid()).expect("inventory"),
@@ -478,6 +874,12 @@ fn the_process_entry_points() {
         "http://127.0.0.1:1",
         "--token-file",
         cfg.token_file.to_str().expect("utf8"),
+        "--ssh-key-file",
+        cfg.ssh_key_file.to_str().expect("utf8"),
+        "--ssh-user",
+        "kbf",
+        "--channel",
+        "stable",
     ];
     let (code, out) = run_with(&args(&a), |_| panic!("not started"));
     assert_eq!(code, 1);

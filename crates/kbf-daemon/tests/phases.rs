@@ -68,6 +68,7 @@ impl Farm {
             unservable_wait: Duration::from_secs(300),
             default_platform: kbf_front::DefaultPlatform::NONE,
             memory_ladder: kbf_server::MemoryLadder::default(),
+            vm_host_floor: kbf_server::HostFloor::default(),
             learned_sizes: kbf_server::LearnedSizes::Off,
             finished_retention: Duration::from_secs(60),
             shutdown_timeout: Duration::from_secs(10),
@@ -252,7 +253,7 @@ fn logged() -> usize {
 /// be the ByteStream Writes the server received while it ran (none of the test's own
 /// uploads before it), the lease's 8 uploads must be 7 written and the empty stderr
 /// skipped (the server always holds the empty blob), and the reads must be the Action,
-/// the Command, the input root and its one file. Mutants seen red: the run phase read
+/// the Command, the input root and its one file. Catches: the run phase read
 /// from the upload stamps; `written_blobs` never counted (0 against the server's 7).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lease_accounts_for_its_time_and_its_transfers() {

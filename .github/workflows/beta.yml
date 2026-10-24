@@ -85,6 +85,13 @@ jobs:
         with:
           name: sha256sums
           path: dist
+      # The assets artifacts carry the SHA256SUMS.<platform> files the sums were made from;
+      # assembling them must give the published SHA256SUMS, and removes them from dist.
+      - name: Set the published SHA256SUMS aside
+        run: mkdir published
+      - run: mv dist/SHA256SUMS published/SHA256SUMS
+      - name: Assemble SHA256SUMS, which must be the published one
+        run: cargo xtask sums assemble dist --expect published/SHA256SUMS
       - name: Every file is the one SHA256SUMS lists
         run: cargo xtask verify-assets sums dist
       - name: The kbf in the tarball names this commit and a release build
@@ -299,7 +306,8 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - run: cargo clippy -p kbf-state --features postgres --all-targets --locked -- -D warnings
       - run: cargo test -p kbf-state --features postgres --locked -- --include-ignored
-      # The installer's `setup` and update step over a real schema (src/database_tests.rs).
+      # The installer's `setup` and update step over a real schema (crates/kbf-setup/src/database_tests.rs).
+      - run: 'cargo test -p kbf-setup --features proxy --locked --lib -- --include-ignored database:: setup_creates_the_schema'
       - run: 'cargo test -p kbf-installer --locked --lib --test binary -- --include-ignored database:: setup_creates_the_schema'
       # The server over Postgres: the flag opens it (tests/state_store_postgres.rs), and the
       # farm's restart tests run on a schema of their own (`over_postgres` in tests/state_store.rs).
@@ -566,6 +574,9 @@ jobs:
       # by `::database::`), the `provisioned` module of database_tests.rs, and the three
       # tests of that file and the one of setup/more_tests.rs that use `TestDatabase`.
       - run: 'cargo test -p kbf-installer --locked -- --skip ::database:: --skip database::tests::provisioned:: --skip database::tests::setup_creates_the_schema_once --skip database::tests::the_update_step_migrates --skip database::tests::the_bounded_step_gives_up --skip setup_creates_the_schema_over_a_real_server'
+      # The same for the setup library (crates/kbf-setup), which holds the `database` module and
+      # setup/more_tests.rs.
+      - run: 'cargo test -p kbf-setup --features proxy --locked -- --skip database::tests::provisioned:: --skip database::tests::setup_creates_the_schema_once --skip database::tests::the_update_step_migrates --skip database::tests::the_bounded_step_gives_up --skip setup_creates_the_schema_over_a_real_server'
       - name: Fetch gh (pinned release, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_macOS_arm64.zip" --sha256 "$GH_SHA256" --out "$RUNNER_TEMP/tools/gh" --extract zip --member "gh_${GH_VERSION}_macOS_arm64/bin/gh"
       - name: The pinned gh verifies a real attestation offline
@@ -593,6 +604,12 @@ jobs:
       # Mac cannot list afterwards; a process that ignores SIGTERM is named in the lease's
       # stderr (crates/kbf-driver-native/tests/slot_term.rs).
       - run: cargo xtask sudo-test -p kbf-driver-native --test slot_term -- --test-threads=1 --nocapture
+      # The GPU under the slot profile (crates/kbf-driver-native/tests/slot_gpu.rs): a pool user
+      # finds a Metal device, compiles a kernel at run time and runs it on the GPU, and each
+      # deny that takes the GPU away (`iokit-open`, the Metal compiler service) fails the
+      # probe at its step. This runner is a virtual machine with a paravirtual GPU, not a
+      # farm Mac: a pass shows the profile leaves the Metal path open, not a real GPU's
+      # speed or family.
       - run: cargo xtask sudo-test -p kbf-driver-native --test slot_gpu -- --test-threads=1 --nocapture
       # What this runner can do for the Mac legs of the isolation suites (T018, M0; a spike that
       # asserts nothing about isolation): two pool users made with dscl, the real `kbf daemon
@@ -691,12 +708,13 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
-  # The kbf-installer deb and rpm (packaging/linux/README.md): nfpm (pinned, checked
+  # The kbf-installer and kbf debs and rpms (packaging/linux/README.md): nfpm (pinned, checked
   # against its SHA-256) builds each twice from the configuration `cargo xtask pkg-config`
-  # writes, with the test-only kbf-installer-stub and the fixtures under
-  # packaging/linux/testdata until the real binary and the units land; `cargo xtask
-  # pkg-install-test` installs the deb into a fresh Ubuntu container and the rpm into a
-  # fresh Fedora one, with systemd as PID 1, and checks them (crates/xtask/src/pkg_install.rs).
+  # writes, with the test-only kbf-installer-stub standing for both binaries and the real
+  # units; `cargo xtask pkg-install-test` installs the kbf-installer deb into a fresh Ubuntu
+  # container and its rpm into a fresh Fedora one, with systemd as PID 1, and checks them
+  # (crates/xtask/src/pkg_install.rs). The kbf package is built here and not installed: the
+  # install test takes one package.
   packages:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -723,13 +741,15 @@ jobs:
       - name: Fetch nfpm (pinned version, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" --sha256 "$NFPM_SHA256" --out "$RUNNER_TEMP/tools/nfpm" --extract tar.gz --member nfpm
       - name: Write the nfpm configuration
-        run: cargo xtask pkg-config --binary target/debug/kbf-installer-stub --units packaging/linux/units --trust packaging/linux/testdata/trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --platform linux-x86_64 --version 0.0.0+ci --out target/pkg
-      - name: Build the deb and the rpm, each twice
+        run: cargo xtask pkg-config --binary target/debug/kbf-installer-stub --kbf target/debug/kbf-installer-stub --units packaging/linux/units --trust packaging/linux/testdata/trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --platform linux-x86_64 --version 0.0.0+ci --out target/pkg
+      - name: Build the deb and the rpm of kbf-installer, each twice
         run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/nfpm.yaml --out target/pkg/out
+      - name: Build the deb and the rpm of kbf, each twice
+        run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/kbf/nfpm.yaml --out target/pkg/kbf-out
       - name: Install, gate, remove and purge the deb in a fresh Ubuntu container
-        run: cargo xtask pkg-install-test --package target/pkg/out/kbf-installer_0.0.0+ci_amd64.deb --format deb --listing target/pkg/listing.txt --image-dir packaging/linux/test/ubuntu --gate kbf-daemon.service=/etc/kbf/kbf.toml --gate kbf-installer.service=/etc/kbf/installer.toml
+        run: cargo xtask pkg-install-test --package target/pkg/out/kbf-installer_0.0.0+ci_amd64.deb --format deb --listing target/pkg/listing.txt --image-dir packaging/linux/test/ubuntu --gate kbf-installer.service=/etc/kbf/installer.toml
       - name: Install, gate and remove the rpm in a fresh Fedora container
-        run: cargo xtask pkg-install-test --package target/pkg/out/kbf-installer-0.0.0+ci-1.x86_64.rpm --format rpm --listing target/pkg/listing.txt --image-dir packaging/linux/test/fedora --gate kbf-daemon.service=/etc/kbf/kbf.toml --gate kbf-installer.service=/etc/kbf/installer.toml
+        run: cargo xtask pkg-install-test --package target/pkg/out/kbf-installer-0.0.0+ci-1.x86_64.rpm --format rpm --listing target/pkg/listing.txt --image-dir packaging/linux/test/fedora --gate kbf-installer.service=/etc/kbf/installer.toml
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:

@@ -1,7 +1,5 @@
 //! The version facts of a release in the store: what the upload takes, refuses and answers
-//! (`kbf_server::release`, `docs/design/pull-updates.md` section 6.2). Offers made from the
-//! documents are `tests/update_offers.rs` and the unit tests of `release::offers`.
-
+//! (`kbf_server::release`, `docs/design/pull-updates.md` section 6.2).
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
@@ -128,7 +126,7 @@ fn files(served: &Served) -> Vec<String> {
     out
 }
 
-/// Catches a version facts document stored that the offers or the node must not trust, or a
+/// Catches a version facts document stored that the node must not trust, or a
 /// refusal that does not say which file and why: a document that is not a report, names
 /// another commit, names another platform than the path, is a debug build, or states numbers
 /// a node refuses is `400`, the answer names `kbf-<commit>-<platform>.version.json` and the

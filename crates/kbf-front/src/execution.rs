@@ -62,9 +62,10 @@
 //! key on a `whole_machine` lease (the scheduler books the whole worker for one). The
 //! platform's `gpu` value is the number of whole GPUs to book on top (0 when absent); a
 //! value that is not a whole number is INVALID_ARGUMENT. On macOS (a platform whose
-//! `OSFamily` or `os` names it) a GPU is booked only with the whole Mac: `gpu` of 1 or
-//! more is INVALID_ARGUMENT unless the lease is `whole_machine`, which then books no
-//! GPU on top (a Mac reports none; the whole-machine lease has its GPU).
+//! `OSFamily` or `os` names it) a Mac has one GPU, a slot it reports as `gpu` 1: an
+//! `action` lease books it with `gpu=1`, so one GPU lease runs on a Mac at a time while
+//! its CPU is shared, and `gpu` of 2 or more is INVALID_ARGUMENT. A `whole_machine`
+//! lease books no GPU on top (it has the whole Mac, its GPU included).
 //!
 //! The rest of the platform says which workers may run the action
 //! (`kbf_caps::Request::from_platform`: `OSFamily`, `ISA`, `Arch` and kbf's capability
@@ -234,7 +235,10 @@ pub trait Dispatch: Send + Sync + 'static {
     fn submit(&self, submission: Submission) -> Result<Ticket, Status>;
 
     /// A new ticket on the operation called `name`, if it is unfinished or finished
-    /// within the dispatcher's retention (its ticket's stage is then already done).
+    /// within the dispatcher's retention (its ticket's stage is then already done). A
+    /// dispatcher over a state store shared by several frontends answers a name any of them
+    /// gave: a finished operation is kept as long as the store keeps its result. Also what
+    /// GetOperation reads the stage of.
     fn wait(&self, name: &str) -> Option<Ticket>;
 }
 
@@ -959,25 +963,38 @@ fn gpus(platform: &Platform) -> Result<u64, Status> {
     })
 }
 
-/// The GPUs to book for a request that asks for `gpus`. On macOS a GPU comes only with
-/// the whole Mac (`docs/design/macos-vms.md` section 8.1): a request whose platform
-/// names macOS and asks for a GPU must be a `whole_machine` lease, and books none on
-/// top, because a Mac reports no GPU to book and a whole-machine lease is the Mac's,
-/// its GPU included. Any other request books what it asks.
+/// The GPUs to book for a request that asks for `gpus`. A Mac has one GPU, a slot it
+/// reports as `gpu` 1 (`docs/design/macos-vms.md` section 8): an `action` lease on
+/// macOS that asks for it books it, so one GPU lease runs on a Mac at a time while the
+/// Mac's other work shares the rest; a `whole_machine` lease on macOS books none on top,
+/// because it has the whole Mac, its GPU included; a `vm` lease is refused. Any other
+/// request books what it asks.
+/// A request that names no OS (an `arch` and a `gpu`, say) is not a request for a Mac:
+/// it books what it asks, and a Mac, which reports a GPU, can serve it.
 ///
 /// # Errors
-/// INVALID_ARGUMENT for a GPU on macOS outside a `whole_machine` lease.
+/// INVALID_ARGUMENT for more than one GPU on macOS, of any lease kind: a Mac has one, so no
+/// node could serve it; and for any GPU on a macOS `vm` lease, which has no host GPU.
 fn mac_gpus(kind: LeaseKind, gpus: u64, needs: &kbf_caps::Request) -> Result<u64, Status> {
     if gpus == 0 || needs.exact("os") != Some("macos") {
         return Ok(gpus);
     }
-    if kind != LeaseKind::WholeMachine {
+    if gpus > 1 {
         return Err(Status::invalid_argument(format!(
-            "platform property {GPU_KEY}={gpus} on macOS needs {LEASE_KIND_KEY}=whole_machine: \
-             a Mac's GPU is booked with the whole Mac"
+            "platform property {GPU_KEY}={gpus} on macOS asks for more than a Mac has: a Mac \
+             has one GPU, booked by one lease at a time"
         )));
     }
-    Ok(0)
+    match kind {
+        LeaseKind::Action => Ok(gpus),
+        LeaseKind::WholeMachine => Ok(0),
+        // A guest's GPU is not the host's: the host's slot is not the guest's to book.
+        LeaseKind::Vm => Err(Status::invalid_argument(format!(
+            "platform property {GPU_KEY}={gpus} on a macOS {:?} lease: the Mac's GPU is not \
+             passed to a guest",
+            kind.name()
+        ))),
+    }
 }
 
 /// What the lease books: one core and `default_memory` bytes for an `action` (the least
@@ -1251,6 +1268,10 @@ fn operations(
         }
     }))
 }
+
+#[cfg(test)]
+#[path = "execution_gpu_tests.rs"]
+mod gpu_tests;
 
 #[cfg(test)]
 #[path = "execution_progress_tests.rs"]

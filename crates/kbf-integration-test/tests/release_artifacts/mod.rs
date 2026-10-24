@@ -8,8 +8,9 @@
 //! to the same set.
 //!
 //! - **The release set.** The `cargo xtask package` lines of the workflow name exactly
-//!   [`ASSETS`] (binary and platform): `kbf` and `kbf-installer` for the three platforms,
-//!   `kbf-daemon`, `kbf-server` and `kbf-deploy` for Linux, `kbf-deploy` for macOS (a Mac
+//!   [`ASSETS`] (binary and platform): `kbf`, `kbf-installer` and `kbf-host-install` for the
+//!   three platforms, `kbf-daemon`, `kbf-server`, `kbf-deploy` and `kbf-updater` for Linux
+//!   (the updater drives hosts from an operator's Linux box), `kbf-deploy` for macOS (a Mac
 //!   runs `kbf daemon`; there is no darwin `kbf-daemon`). Each one's SBOM attestation is
 //!   [`crate::attested_assets`]' business, and its provenance bundle
 //!   [`crate::attested_bundles`]'.
@@ -50,6 +51,10 @@
 //!   check-asset` already checked. The verify job then runs `pkg-asset --verify-only` on
 //!   each signed deb with `--expect-ref "$GITHUB_REF"`, so the file that was attested is the
 //!   one checked.
+//! - **The `kbf` package.** The same jobs build a second package, `kbf` (`/usr/bin/kbf` and
+//!   the units of the modes, depending on the installer's package), from the same
+//!   `pkg-config` step, and make its deb an asset (`cargo xtask pkg-kbf-asset`); the verify
+//!   job checks each signed one (`kbf_package`'s rules).
 //! - **The installer's Mac package.** The darwin job builds the `kbf-installer` `.pkg`
 //!   (`cargo xtask pkg build`, with the pinned darwin `gh`, the trusted root and an
 //!   `installer.conf` from `pkg-trust`), installs it as root on the runner
@@ -71,16 +76,21 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf", "darwin-arm64"),
     ("kbf-deploy", "darwin-arm64"),
     ("kbf-installer", "darwin-arm64"),
+    ("kbf-host-install", "darwin-arm64"),
     ("kbf", "linux-x86_64"),
     ("kbf-daemon", "linux-x86_64"),
     ("kbf-server", "linux-x86_64"),
     ("kbf-deploy", "linux-x86_64"),
     ("kbf-installer", "linux-x86_64"),
+    ("kbf-host-install", "linux-x86_64"),
+    ("kbf-updater", "linux-x86_64"),
     ("kbf", "linux-arm64"),
     ("kbf-daemon", "linux-arm64"),
     ("kbf-server", "linux-arm64"),
     ("kbf-deploy", "linux-arm64"),
     ("kbf-installer", "linux-arm64"),
+    ("kbf-host-install", "linux-arm64"),
+    ("kbf-updater", "linux-arm64"),
 ];
 
 /// The binaries of [`ASSETS`] that name the commit they were built from (`<binary>
@@ -166,6 +176,7 @@ pub fn problems(workflow: &str) -> Result<Vec<String>, String> {
     identity(workflow, &mut out)?;
     facts::rules(workflow, &mut out)?;
     packages(workflow, &mut out)?;
+    kbf_package::rules(workflow, &mut out)?;
     mac_package(workflow, &mut out)?;
     darwin(workflow, &mut out)?;
     pull_request_gate(workflow, &mut out)?;
@@ -834,9 +845,13 @@ fn the_docs_describe_the_release_set() {
         }
     }
     for platform in PACKAGES {
-        let file = format!("`kbf-installer-<commit>-{platform}.deb`");
-        if !doc.contains(&file) {
-            missing.push(format!("docs/artifacts.md does not list {file}"));
+        for file in [
+            format!("`kbf-installer-<commit>-{platform}.deb`"),
+            format!("`kbf-<commit>-{platform}.deb`"),
+        ] {
+            if !doc.contains(&file) {
+                missing.push(format!("docs/artifacts.md does not list {file}"));
+            }
         }
     }
     let file = format!("`kbf-installer-<commit>-{MAC_PACKAGE}.pkg`");
@@ -893,6 +908,26 @@ mod rules {
     fn verify_package_step(platform: &str) -> String {
         format!(
             "      - name: Package {platform}\n        run: cargo xtask pkg-asset --verify-only --package \"dist/kbf-installer-$GITHUB_SHA-{platform}.deb\" --platform {platform} --commit \"$GITHUB_SHA\" --binary-tarball \"dist/kbf-installer-$GITHUB_SHA-{platform}.tar.gz\" --expect-ref \"$GITHUB_REF\"\n"
+        )
+    }
+
+    /// The steps that write the configuration of both Linux packages from the job's `kbf` and
+    /// build the `kbf` package, as the Linux jobs have them.
+    fn kbf_build_steps() -> String {
+        "      - name: Config\n        run: cargo xtask pkg-config --binary \"target/$TARGET/release/kbf-installer\" --kbf \"target/$TARGET/release/kbf\" --units u --trust t --sysusers s --tmpfiles f --platform p --version 0.0.0+ci --out target/pkg\n      - name: Build kbf\n        run: cargo xtask pkg-build --nfpm n --config target/pkg/kbf/nfpm.yaml --out target/pkg/kbf-out\n".to_owned()
+    }
+
+    /// The step that makes the `kbf` deb of `platform` an asset.
+    fn kbf_asset_step(platform: &str) -> String {
+        format!(
+            "      - name: Kbf asset\n        run: cargo xtask pkg-kbf-asset --package target/pkg/kbf-out --platform {platform} --commit \"$GITHUB_SHA\" --kbf-tarball \"dist/kbf-$GITHUB_SHA-{platform}.tar.gz\" --out dist\n"
+        )
+    }
+
+    /// The verify job's check of the signed `kbf` deb of `platform`.
+    fn verify_kbf_package_step(platform: &str) -> String {
+        format!(
+            "      - name: Kbf package {platform}\n        run: cargo xtask pkg-kbf-asset --verify-only --package \"dist/kbf-$GITHUB_SHA-{platform}.deb\" --platform {platform} --commit \"$GITHUB_SHA\" --kbf-tarball \"dist/kbf-$GITHUB_SHA-{platform}.tar.gz\"\n"
         )
     }
 
@@ -985,7 +1020,9 @@ mod rules {
                 }
             }
             if PACKAGES.contains(job) {
+                w.push_str(&kbf_build_steps());
                 w.push_str(&package_steps(platform));
+                w.push_str(&kbf_asset_step(platform));
             }
             if *job == MAC_PACKAGE {
                 w.push_str(&mac_package_steps());
@@ -1003,6 +1040,7 @@ mod rules {
             if platform == "linux" {
                 for p in PACKAGES {
                     w.push_str(&verify_package_step(p));
+                    w.push_str(&verify_kbf_package_step(p));
                 }
             } else {
                 w.push_str(&verify_mac_package_step());
@@ -1896,8 +1934,11 @@ mod rules {
             ],
         );
     }
+
+    mod kbf_package_tests;
 }
 
 mod facts;
 #[cfg(test)]
 mod installer;
+mod kbf_package;

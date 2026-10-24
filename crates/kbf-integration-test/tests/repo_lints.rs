@@ -54,6 +54,8 @@
 //! - a test scratch directory made by joining a name onto the system temporary directory
 //!   instead of with `kbf_testkit::dir::TestDir`, outside a short list that says why each
 //!   does not leak (module `scratch_dirs`, whose docs say what it misses);
+//! - a `.rs` file under `crates/` whose comments or names narrate how a test was checked
+//!   instead of the defect it catches (module `test_wording`, whose docs state the rule);
 //! - the scans passing vacuously because git listed nothing, no Markdown file was
 //!   scanned or the workflows moved;
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
@@ -70,6 +72,7 @@ mod release_artifacts;
 mod release_workflow;
 mod scratch_dirs;
 mod test_spawns;
+mod test_wording;
 mod workflows;
 
 use std::path::{Path, PathBuf};
@@ -403,7 +406,7 @@ fn every_interpreter_file_workflow_script_and_shell_spawn_is_in_the_budget() {
     );
 }
 
-/// The whole budget scan over planted trees: each planted defect the rule ships to
+/// The whole budget scan over planted trees: each defect the rule ships to
 /// refuse, against a clean control tree.
 mod budget {
     use super::*;
@@ -447,14 +450,14 @@ mod budget {
 
     #[test]
     fn the_control_tree_passes() {
-        // Catches: the control refused, so every planted defect below would go red
+        // Catches: the control refused, so every defect below would go red
         // for the wrong reason.
         assert_eq!(problems(&tree(), BUDGET), Vec::<String>::new());
     }
 
     #[test]
     fn an_unlisted_sh_file_is_refused() {
-        // Catches (planted defect): a new `x.sh` with no row.
+        // Catches: a new `x.sh` with no row.
         let mut t = tree();
         t.insert("tools/new.sh".to_owned(), b"echo\n".to_vec());
         let p = problems(&t, BUDGET);
@@ -464,7 +467,7 @@ mod budget {
 
     #[test]
     fn an_unlisted_extensionless_python_file_is_refused() {
-        // Catches (planted defect): an extensionless `#!/usr/bin/env python3` with no
+        // Catches: an extensionless `#!/usr/bin/env python3` with no
         // row, which an extension-only rule would pass.
         let mut t = tree();
         t.insert("tools/gen".to_owned(), b"#!/usr/bin/env python3\n".to_vec());
@@ -496,7 +499,7 @@ mod budget {
 
     #[test]
     fn a_row_for_a_deleted_file_is_refused() {
-        // Catches (planted defect): a stale row, its file deleted.
+        // Catches: a stale row, its file deleted.
         let mut t = tree();
         t.remove("tools/probe");
         assert_eq!(
@@ -511,7 +514,7 @@ mod budget {
 
     #[test]
     fn a_run_step_with_shell_logic_is_refused() {
-        // Catches (planted defect): a new `run: |` block, and a second step named like
+        // Catches: a new `run: |` block, and a second step named like
         // the one-command `Probe` that chains with `&&` (each refused on its own, so
         // a name shared with a clean step hides nothing), in a workflow and in a
         // composite action; and a one-line command (the first step) refused.
@@ -538,7 +541,7 @@ mod budget {
 
     #[test]
     fn a_workflow_row_cannot_clear_a_run_step() {
-        // Catches (planted defect): a `run: |` block listed under a `[workflow]`
+        // Catches: a `run: |` block listed under a `[workflow]`
         // section, the way the budget once allowed, and a `[workflow]` row left
         // behind. The section stays empty: the step is refused all the same, and so is
         // its row.
@@ -563,7 +566,7 @@ mod budget {
 
     #[test]
     fn an_unlisted_production_sh_c_is_refused() {
-        // Catches (planted defect): `Command::new("sh").arg("-c")` in a src file with
+        // Catches: `Command::new("sh").arg("-c")` in a src file with
         // no [src-sh-c] row; the same text under `crates/*/tests/` is test code (listed
         // under `[test-interpreters]` in the control tree).
         let mut t = tree();

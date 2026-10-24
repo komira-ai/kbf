@@ -18,26 +18,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::Instant;
 
-use kbf_installer::CommitId;
 use kbf_installer::proxy::admin::{Admin, AdminError, Deadlines};
 use kbf_installer::proxy::child_http::Headers;
 use kbf_installer::proxy::model::{
-    OpenCounts, Readiness as ChildReadiness, RoleInfo, RoleState, Slot, Source,
+    OpenCounts, Readiness as ChildReadiness, RoleInfo, RoleState, Slot,
 };
 use kbf_installer::proxy::ports::ChildAdmin;
 use kbf_state::Op;
 
 use super::*;
-
-/// The commit B is built from: its release store holds it, A's does not.
-const NEW: &str = "fedcba9876543210fedcba9876543210fedcba98";
-/// The commit A runs: only A's release store holds it.
-const OLD: &str = "0123456789abcdef0123456789abcdef01234567";
-/// A commit neither release store holds.
-const NOWHERE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-/// Part of the child's `409` for an offer of a commit its release store does not hold
-/// complete: the only refusal it has today for a commit that is not its own.
-const NO_PLATFORM: &str = "holds no platform of this commit complete";
 
 /// The most any one call of the client may take in these tests: far more than a call on
 /// loopback needs, and a bound on the tests that would otherwise hang.
@@ -48,10 +37,6 @@ fn deadlines() -> Deadlines {
         call: CALL,
         quiesce: CALL,
     }
-}
-
-fn commit(text: &str) -> CommitId {
-    CommitId::new(text).expect("a commit id")
 }
 
 fn holder(state: RoleState) -> RoleInfo {
@@ -68,8 +53,7 @@ fn not_holder(state: RoleState) -> RoleInfo {
     }
 }
 
-/// The client for the ports of two children: slot A is `a`, slot B is `b`; the operator
-/// token is the one the children's `--api-token-file` holds.
+/// The client for the ports of two children: slot A is `a`, slot B is `b`.
 fn admin_of(a: &Child, b: &Child, deadlines: Deadlines) -> Arc<Admin> {
     let (a_admin, b_admin, a_api, b_api) = (a.admin, b.admin, a.api, b.api);
     Arc::new(Admin::new(
@@ -82,7 +66,6 @@ fn admin_of(a: &Child, b: &Child, deadlines: Deadlines) -> Arc<Admin> {
             Slot::B => b_api,
         },
         Headers::new(),
-        || Ok(TOKEN.as_bytes().to_vec()),
         deadlines,
     ))
 }
@@ -100,7 +83,7 @@ async fn run<T: Send + 'static>(
 }
 
 /// A swap's two children on one host: A active, B a candidate; each with an operator token
-/// and a release store of its own.
+/// file.
 struct Host {
     a: Child,
     b: Child,
@@ -117,18 +100,9 @@ impl Host {
         let store = shared();
         let scratch = Scratch::new(name);
         let token = scratch.token_flag();
-        let releases = |side: &str| {
-            let dir = scratch.0.join(format!("releases-{side}"));
-            std::fs::create_dir_all(&dir).expect("a release directory");
-            format!("--releases-dir={}", dir.display())
-        };
-        let (a_releases, b_releases) = (releases("a"), releases("b"));
-        let a = Child::start(&managed_flags(&node, &[&token, &a_releases]), &store).await;
-        let b = Child::start(
-            &managed_flags(&node, &["--await-takeover", &token, &b_releases]),
-            &store,
-        )
-        .await;
+        let a = Child::start(&managed_flags(&node, &[&token]), &store).await;
+        let b_flags = managed_flags(&node, &["--await-takeover", &token]);
+        let b = Child::start(&b_flags, &store).await;
         let admin = admin_of(&a, &b, deadlines());
         Self {
             a,
@@ -160,23 +134,6 @@ impl Host {
         })
         .await;
     }
-
-    /// Stores a complete release of `commit` in the release store of the child at `api`:
-    /// the tarball of `kbf` for one platform, and its attestation.
-    async fn release(&self, api: SocketAddr, commit: &str) {
-        let tarball = format!("tarball:kbf:{commit}");
-        let bundle = format!("bundle:kbf:{commit}");
-        for (name, body) in [("kbf", tarball), ("kbf.attestation", bundle)] {
-            let path = format!("/v1/releases/{commit}/linux-x86_64/{name}");
-            let request = format!(
-                "PUT {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\
-                 Authorization: Bearer {TOKEN}\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            );
-            let (code, answer) = exchange(api, &request).await;
-            assert_eq!(code, 201, "{path}: {answer}");
-        }
-    }
 }
 
 /// Catches a client that does not speak the admin wire of the children it drives, across
@@ -192,7 +149,7 @@ impl Host {
 /// Also pins that the takeover keeps the epoch (daemons that redial keep their leases) and
 /// takes exactly one generation, read from the store and not from the client.
 ///
-/// Mutants seen red: `StoodDown` and `Superseded` swapped in `admin.rs`; `holder` derived
+/// Catches: `StoodDown` and `Superseded` swapped in `admin.rs`; `holder` derived
 /// from the generation alone; the takeover sent without `expect`; the slot ignored by the
 /// admin reads (every read from A's port); `ready` asked on the admin port instead of the
 /// operator port; in the child, a takeover that bumps the epoch.
@@ -280,7 +237,7 @@ async fn a_swap_driven_through_the_admin_calls_moves_the_generation_and_the_hold
 /// a candidate is an answer, not a refusal: the admin role view says 0 streams and 0
 /// sessions.)
 ///
-/// Mutant seen red: the takeover sent without `expect` (the refusal is then a `400`, not
+/// Catches: the takeover sent without `expect` (the refusal is then a `400`, not
 /// the child's "needs a candidate").
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_call_that_does_not_apply_to_the_child_is_a_typed_refusal() {
@@ -342,7 +299,7 @@ async fn a_call_that_does_not_apply_to_the_child_is_a_typed_refusal() {
 /// stood-down child (the swap would roll back to a child with no worker listener), and a
 /// refusal the client cannot tell from any other 409.
 ///
-/// Mutants seen red: `StoodDown` and `Superseded` swapped in `admin.rs`; `holder` derived
+/// Catches: `StoodDown` and `Superseded` swapped in `admin.rs`; `holder` derived
 /// from the generation alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resume_gives_the_old_child_back_before_a_stand_down_and_never_after() {
@@ -409,8 +366,8 @@ async fn resume_gives_the_old_child_back_before_a_stand_down_and_never_after() {
 /// child and takes the generation), and a takeover that leaves the candidate changed when
 /// it timed out before it sent anything.
 ///
-/// Mutants seen red: the takeover sent without `expect`; the slot ignored by the role read.
-/// A mutant that survives, and that nothing a real child shows can tell from the original:
+/// Catches: the takeover sent without `expect`; the slot ignored by the role read.
+/// A defect that survives, and that nothing a real child shows can tell from the original:
 /// the limit not applied to the role read. A zero limit gives the same `Timeout` with
 /// nothing taken either way, since the POST gets what is left of the limit, which is
 /// nothing; the split of the limit between the two calls is pinned against a slow fixture
@@ -589,7 +546,7 @@ impl Store for Holding {
 async fn child_over(node: &Node, holding: &Arc<Holding>) -> (Child, SocketAddr) {
     let managed = Managed::start(
         &managed_flags(node, &[]),
-        StoreSource::Shared(Arc::clone(holding) as Arc<dyn Store>),
+        StoreSource::Fenced(Arc::clone(holding) as Arc<dyn Store>),
         std::future::pending::<()>(),
     )
     .await
@@ -629,7 +586,7 @@ async fn child_over(node: &Node, holding: &Arc<Holding>) -> (Child, SocketAddr) 
 /// U2c ask: answer `202` and report `Quiescing` until the farm is quiet, or bound the wait
 /// by what the swap gives it.
 ///
-/// Mutants seen red: the quiesce given the call's deadline instead of its own; in the child,
+/// Catches: the quiesce given the call's deadline instead of its own; in the child,
 /// a quiesce that does not wait for a call that is queueing (red in the second half: the
 /// farm is then fenced behind the Execute and the quiesce finishes after the client left;
 /// the first half alone does not see it, since the fence waits for the same write); a
@@ -784,7 +741,7 @@ async fn a_quiesce_blocks_while_a_call_is_queueing_and_is_dropped_with_a_client_
 /// store answers a writer a newer one replaced; nothing moves the generation row.
 ///
 /// Catches: a `holder` derived from the generation alone (a superseded child reported as the
-/// holder, and a swap that stands its successor down for it). Mutant seen red: `holder`
+/// holder, and a swap that stands its successor down for it). Catches: `holder`
 /// without the `superseded` test in `admin.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_child_the_store_refused_is_no_holder_though_the_generation_row_is_still_its_own() {
@@ -840,7 +797,7 @@ async fn a_child_the_store_refused_is_no_holder_though_the_generation_row_is_sti
 async fn a_takeover_over_a_dead_holder_and_a_cold_start_keep_the_epoch() {
     let node = Node::start().await;
     let store = shared();
-    let source = || StoreSource::Shared(Arc::clone(&store) as Arc<dyn Store>);
+    let source = || StoreSource::Fenced(Arc::clone(&store) as Arc<dyn Store>);
     let a = Stoppable::start(&managed_flags(&node, &[]), source()).await;
     let b = Child::start(&managed_flags(&node, &["--await-takeover"]), &store).await;
     let before = epoch(&store);
@@ -879,7 +836,7 @@ async fn a_takeover_over_a_dead_holder_and_a_cold_start_keep_the_epoch() {
 /// the takeover. (Red with `open_counts` pointed back at the drain route, which reports
 /// `queued_operations` 1 for good.)
 ///
-/// Mutants seen red: `open_counts` asked on the operator port's drain route (the
+/// Catches: `open_counts` asked on the operator port's drain route (the
 /// stood-down child never idle); the takeover sent without `expect`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn open_counts_are_the_childs_own_streams_and_a_stood_down_child_with_a_queue_is_idle() {
@@ -955,116 +912,4 @@ async fn open_counts_are_the_childs_own_streams_and_a_stood_down_child_with_a_qu
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(idle.idle());
-}
-
-/// Catches an offer that goes to the wrong child or carries the wrong gates: `post_desired`
-/// goes to the operator port of the slot it is given (the new child's, after the bake) with
-/// the bearer token and a JSON body, and the child writes the desired release. B holds its
-/// own commit; A's release store does not, so an offer that went to A (the old slot) fails.
-///
-/// Pins what a commit that is not the child's own release gets TODAY: a `409` with an
-/// `error` text and no `code`, which the client reads as `Conflict`. Once the child answers
-/// `"code": "not_own"` (the desired-commit gate, kbf#1145), the client's `NotOwn` is the
-/// answer and this assertion changes to it.
-///
-/// A wrong token is the child's `401`, a `Status` the swap notes as a failed offer.
-///
-/// Mutants seen red: the offer sent to the old slot; the bearer token dropped.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn post_desired_reaches_the_new_childs_operator_port_with_its_own_release() {
-    let host = Host::start("admin-desired").await;
-    host.release(host.a.api, OLD).await;
-    host.run(|admin| admin.quiesce(Slot::A))
-        .await
-        .expect("quiesce");
-    host.run(|admin| admin.takeover(Slot::B, CALL))
-        .await
-        .expect("takeover");
-    host.release(host.b.api, NEW).await;
-
-    let new = commit(NEW);
-    assert_eq!(
-        host.run({
-            let new = new.clone();
-            move |admin| admin.post_desired(Slot::B, &new, Source::Fetch)
-        })
-        .await,
-        Ok(())
-    );
-    let (code, update) = get(host.b.api, "/v1/update").await;
-    assert_eq!(code, 200, "{update}");
-    assert_eq!(update["desired"]["commit"], NEW, "{update}");
-    assert_eq!(update["desired"]["generation"], 1, "{update}");
-    assert_eq!(
-        host.run({
-            let new = new.clone();
-            move |admin| admin.post_desired(Slot::B, &new, Source::Fetch)
-        })
-        .await,
-        Ok(()),
-        "an offer is idempotent"
-    );
-
-    // The old slot's release store does not hold the new commit: an offer sent there fails.
-    let to_old = host
-        .run({
-            let new = new.clone();
-            move |admin| admin.try_post_desired(Slot::A, &new)
-        })
-        .await;
-    assert!(
-        matches!(
-            &to_old,
-            Err(AdminError::Conflict {
-                call: "post_desired",
-                error
-            }) if error.contains(NO_PLATFORM)
-        ),
-        "{to_old:?}"
-    );
-
-    // A commit the child does not hold is a 409 today, with no code.
-    let other = commit(NOWHERE);
-    let not_own = host
-        .run(move |admin| admin.try_post_desired(Slot::B, &other))
-        .await;
-    assert!(
-        matches!(
-            &not_own,
-            Err(AdminError::Conflict {
-                call: "post_desired",
-                error
-            }) if error.contains(NO_PLATFORM)
-        ),
-        "{not_own:?}"
-    );
-    let (_, update) = get(host.b.api, "/v1/update").await;
-    assert_eq!(update["desired"]["commit"], NEW, "a refused offer wrote");
-
-    // The same client with another token: the child's gate answers.
-    let wrong = Arc::new(Admin::new(
-        {
-            let b = host.b.admin;
-            move |_| b
-        },
-        {
-            let b = host.b.api;
-            move |_| b
-        },
-        Headers::new(),
-        || Ok(b"not-the-operator-token-not-the-operator-token".to_vec()),
-        deadlines(),
-    ));
-    let refused = run(&wrong, move |admin| admin.try_post_desired(Slot::B, &new)).await;
-    assert!(
-        matches!(
-            &refused,
-            Err(AdminError::Status {
-                call: "post_desired",
-                code: 401,
-                ..
-            })
-        ),
-        "{refused:?}"
-    );
 }

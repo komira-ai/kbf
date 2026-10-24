@@ -91,7 +91,7 @@ message ServerMessage {
     ResultAck result_ack = 5;
     Cancel cancel = 6;
     MapUpdate map_update = 7;
-    // The release the host should have, after Welcome and at every change.
+    // Reserved for a release offer. The frontend no longer sends it, and a daemon ignores it.
     kbf.update.v1.UpdateOffer update_offer = 8;
     // The frontend's order of the rollout to this host.
     kbf.update.v1.UpdateOrder update_order = 9;

@@ -94,6 +94,7 @@ fn listeners(worker_tls: Option<WorkerTls>) -> Listeners {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -354,7 +355,7 @@ impl tonic::codegen::Service<tonic::codegen::http::Uri> for Resolving {
 /// lazy, so a failed lookup is the first registration's failure, and the join loop must
 /// wait and try again like any other failed registration. The first three dials fail as a
 /// lookup does; the node then registers once, as boot 1, and the lookup was tried four
-/// times. Mutant: [`Joiner::join`] ends (panics) on a failed registration; the node is
+/// times. Catches: [`Joiner::join`] ends (panics) on a failed registration; the node is
 /// never registered and the wait times out.
 #[tokio::test]
 async fn a_frontend_name_that_does_not_resolve_yet_is_retried() {
@@ -388,7 +389,7 @@ async fn a_frontend_name_that_does_not_resolve_yet_is_retried() {
 /// whose [`CatchUp`] says it is rebuilding registers through the frontend's membership
 /// service and is CatchingUp; a heartbeat while it still rebuilds leaves it so and bumps
 /// no generation; after [`CatchUp::finish`] the next heartbeat makes it Active in a new
-/// generation, which is the one the heartbeat answers. Mutants: `catching_up` not sent
+/// generation, which is the one the heartbeat answers. Catches: `catching_up` not sent
 /// (Active); the promotion on every beat (Active while rebuilding); no promotion.
 #[tokio::test]
 async fn a_rebuilding_node_registers_catching_up_and_is_promoted_on_its_report() {
@@ -620,7 +621,7 @@ async fn over_mutual_tls_only_the_storage_role_registers() {
 /// (bound IP, the name, either with a port) register, as a real node's do in the other
 /// tests of this file.
 ///
-/// Mutant seen red: the address left unchecked (a registration for `192.0.2.9` with the
+/// Catches: the address left unchecked (a registration for `192.0.2.9` with the
 /// instance id of `localhost`).
 #[tokio::test]
 async fn over_mutual_tls_a_node_registers_only_where_its_certificate_names_it() {
@@ -828,7 +829,7 @@ async fn until_number(f: &Frontend, want: Option<u64>) {
 /// something else. Through the real joiner and the real membership service: 2 copies owed
 /// is 2 at the frontend, a third is 3 at the next beat, and a node that restarts (its
 /// journal reopened, the process registering again) reports the debts it had, not 0 for
-/// "none since I started". Mutants: the count of debts since the journal was opened; the
+/// "none since I started". Catches: the count of debts since the journal was opened; the
 /// debts never sent; sent as unknown.
 #[tokio::test]
 async fn a_node_with_a_journal_reports_the_copies_it_owes_across_a_restart() {
@@ -872,7 +873,7 @@ async fn a_node_with_a_journal_reports_the_copies_it_owes_across_a_restart() {
 }
 
 /// Catches: a node with no journal saying it owes nothing. Without one it cannot say, and
-/// the frontend must read "unknown", not zero. Mutant: the joiner reports `Known(0)` when
+/// the frontend must read "unknown", not zero. Catches: the joiner reports `Known(0)` when
 /// it has no journal.
 #[tokio::test]
 async fn a_node_without_a_journal_says_it_cannot_say() {
@@ -919,7 +920,7 @@ async fn until_node(
 /// Through the real joiner and membership service: 2 open is 2 at the frontend, one ending
 /// is 1, none is 0 (known, not unknown), and the generation is the one the frontend's map
 /// has. A node whose joiner has no handle cannot say, and the frontend reads "unknown", not
-/// zero. Mutant: the joiner reports `Known(0)` without a handle.
+/// zero. Catches: the joiner reports `Known(0)` without a handle.
 #[tokio::test]
 async fn a_node_reports_the_writes_it_has_open_and_the_map_it_holds() {
     let f = frontend(None);
@@ -1029,7 +1030,7 @@ fn readable_map() -> pb::Map {
 /// given a map", not answered as an empty cache (a FindMissing that says every blob is
 /// missing, a write taken that the map places elsewhere); once a heartbeat brings a map,
 /// and the caller routes by the map the node holds, the same calls are served. The refusal
-/// is the storage service's own check, the only one. Mutant: a service given no map source
+/// is the storage service's own check, the only one. Catches: a service given no map source
 /// (every call is served at once).
 #[tokio::test]
 async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
@@ -1109,7 +1110,7 @@ async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
 /// member joining), or whose heartbeat says it holds a map it does not: the frontend
 /// sends the map only to a node that is behind, so a node that did not take it is stuck
 /// for ever. The node holds generation 1 from its registration; a second registrant
-/// makes generation 2, and the node's own next heartbeat brings it. Mutant: a joiner that
+/// makes generation 2, and the node's own next heartbeat brings it. Catches: a joiner that
 /// ignores the map in a heartbeat's answer.
 #[tokio::test]
 async fn a_heartbeat_brings_a_node_the_map_it_missed() {
@@ -1321,7 +1322,7 @@ async fn joined_node_retaining(map: pb::Map, retained: Vec<pb::Map>) -> Arc<Node
 /// holder the joiner fills. Before the registration it has no map and no member id; after,
 /// it says the map it was sent and the id the registration gave; a caller ahead of it
 /// (`refetch`) is waited for and recorded as wanted, and is answered when the holder takes
-/// that map. Mutants: `registered` never called (no member id: a node cannot take part in a
+/// that map. Catches: `registered` never called (no member id: a node cannot take part in a
 /// chain); `current` reading a holder of its own; `refetch` not recording the generation.
 #[tokio::test]
 async fn the_node_map_is_the_holders_and_knows_the_member_the_registration_named() {
@@ -1370,7 +1371,7 @@ async fn the_node_map_is_the_holders_and_knows_the_member_the_registration_named
 /// Catches a node over mutual TLS that is not a link of the chain, and a repair worker that
 /// is never started: the node keeps a repair journal under its metadata directory, and a
 /// debt put in it is settled by the worker (the map names no other owner of the blob, so
-/// there is no copy to make, and the debt is closed without one). Mutants: the worker not
+/// there is no copy to make, and the debt is closed without one). Catches: the worker not
 /// spawned (the debt stays for ever); the node judged plain text (no journal).
 #[tokio::test]
 async fn a_node_over_mutual_tls_keeps_a_repair_journal_and_a_worker_settles_it() {
@@ -1436,7 +1437,7 @@ async fn a_node_over_mutual_tls_keeps_a_repair_journal_and_a_worker_settles_it()
 /// partner that is not listening both own the blob, the call is answered, the blob is in
 /// this node's store, and the repair journal owes it to the partner. (The half registers
 /// before it opens its cache, so there is no start that lacks a map to refuse from; that
-/// refusal is `a_node_with_a_frontend_serves_nothing_until_it_holds_a_map`'s.) Mutant: `bind_node`
+/// refusal is `a_node_with_a_frontend_serves_nothing_until_it_holds_a_map`'s.) Catches: `bind_node`
 /// handing `in_process` a service made over another, unmapped, chainless storage.
 #[tokio::test]
 async fn a_write_through_the_halfs_in_process_view_is_judged_by_the_map_and_owes_the_partner() {
@@ -1658,7 +1659,7 @@ async fn a_node_that_copies_nothing_keeps_no_repair_journal() {
 /// started with `--frontend` (plain text: it copies nothing, so it keeps no journal and its
 /// debts are "cannot say") reports its open writes through the real service and the real
 /// joiner: 0, then 1 while a `Write` is held open by a caller that has sent part of a blob,
-/// then 0 again. Mutants: the service not given the handle; the joiner not given it.
+/// then 0 again. Catches: the service not given the handle; the joiner not given it.
 #[tokio::test]
 async fn a_started_node_reports_the_writes_it_has_open() {
     use kbf_proto::google::bytestream::WriteRequest;
@@ -1735,7 +1736,7 @@ async fn a_started_node_reports_the_writes_it_has_open() {
 /// Catches: a started node with a repair journal that does not give it to its registration,
 /// so the frontend can never read the debts of a real farm: a mutual-TLS node (it keeps a
 /// journal) is read as owing 0, known, and as having 0 writes open, not "cannot say".
-/// Mutant: the joiner not given the journal.
+/// Catches: the joiner not given the journal.
 #[tokio::test]
 async fn a_started_node_with_a_journal_reports_what_it_owes() {
     let pki = Pki::new();
@@ -1855,7 +1856,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for SharedHourly {
 /// generation 2 while the node holds 1 would be refused for the whole interval (here an
 /// hour, so a node that waits it out never gets the map). The caller asks for the map
 /// ([`kbf_mapsync::MapHolder::reach`], which is what the storage service does for a caller
-/// ahead of it), the node beats at once, and the map arrives. Mutant: the joiner not
+/// ahead of it), the node beats at once, and the map arrives. Catches: the joiner not
 /// watching what is asked for (the wait ends only at the deadline that fails the test).
 #[tokio::test]
 async fn a_caller_ahead_of_the_node_makes_it_beat_at_once() {
@@ -1953,7 +1954,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for FlakyService {
 
 /// Catches: a node that re-registers, or stops, when a heartbeat fails with anything but
 /// NOT_FOUND. The frontend fails the first two heartbeats UNAVAILABLE; the node waits and
-/// beats again (a third and fourth beat arrive) and registered exactly once. A mutant
+/// beats again (a third and fourth beat arrive) and registered exactly once. A defect
 /// that registers again on any failed beat makes the registrations more than one.
 #[tokio::test]
 async fn a_failed_heartbeat_is_retried_without_registering_again() {
@@ -2001,7 +2002,7 @@ async fn a_failed_heartbeat_is_retried_without_registering_again() {
 /// certificate is refused PERMISSION_DENIED (`denied: spki-sha256 ...`) on the same call,
 /// the other is still admitted; allowing the entry and refreshing admits it again.
 ///
-/// Mutants seen red: `plan` building the map without the deny list; the storage handlers
+/// Catches: `plan` building the map without the deny list; the storage handlers
 /// judging the role alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_denied_certificate_is_refused_by_a_real_storage_node_when_the_generation_turns() {
@@ -2215,7 +2216,7 @@ async fn written_by(dir: &Path, digest: &kbf_types::Digest) -> Option<(u64, u64)
     }
 }
 
-/// Catches: a registered node that names its objects in an epoch of its own log (mutant:
+/// Catches: a registered node that names its objects in an epoch of its own log (defect:
 /// `Cache::open_under` taken under `--frontend` in `assemble`, or `Cache::open` in the
 /// storage half), which a wiped node would then name again. A node of each kind
 /// registers with a frontend and writes: its metadata log says the object was written by

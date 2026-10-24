@@ -373,11 +373,12 @@ fn a_stale_complete_is_rejected() {
         keys(&store),
         [
             "done/0000000000000004",
+            "doneof/0000000000000004",
             "meta/epoch",
             "meta/next_op",
             "meta/next_seq"
         ],
-        "a finished operation leaves its result and nothing else"
+        "a finished operation leaves its result, the row naming its action, and nothing else"
     );
 }
 
@@ -430,6 +431,8 @@ fn an_operation_ends_in_one_transaction_that_puts_its_result() {
         [
             "done/0000000000000004",
             "done/0000000000000005",
+            "doneof/0000000000000004",
+            "doneof/0000000000000005",
             "meta/epoch",
             "meta/next_op",
             "meta/next_seq"
@@ -588,7 +591,14 @@ fn a_refusal_removes_the_operation_and_other_effects_write_nothing() {
         .persist(&[Effect::Refuse(refusal)], Some(&ended()))
         .expect("refused");
     assert!(durable.load().expect("load").operations.is_empty());
-    assert_eq!(keys(&store), ["done/0000000000000004", "meta/epoch"]);
+    assert_eq!(
+        keys(&store),
+        [
+            "done/0000000000000004",
+            "doneof/0000000000000004",
+            "meta/epoch"
+        ]
+    );
 }
 
 /// Catches: a loss count that is not written with the give-up that made it (a restart
@@ -851,7 +861,12 @@ fn a_result_row_is_kept_for_the_longer_of_the_retention_and_the_floor() {
     clock.advance(seconds(2));
     assert_eq!(durable.ended(short).expect("read"), None, "past the floor");
     assert_eq!(durable.ended(long).expect("read"), Some(finished.clone()));
-    assert_eq!(store.reap_expired().expect("reap"), 1, "only the short row");
+    // The short operation's `done/` row and its `doneof/` row, which has the same life.
+    assert_eq!(
+        store.reap_expired().expect("reap"),
+        2,
+        "only the short operation's rows"
+    );
     clock.advance(seconds(3600));
     assert_eq!(
         durable.ended(long).expect("read"),
@@ -874,8 +889,9 @@ fn a_result_row_that_is_not_a_result_is_refused_naming_it() {
     );
 }
 
-/// Catches: a generation read from a row that is not there as 0 (a farm over an unfenced
-/// store names its operations by the epoch, as before) or one that is read wrong.
+/// Asserts that the generation is the stored number, and none when the store has no row (a
+/// farm over an unfenced store names its operations by the epoch, as before) or holds the
+/// marker of shared frontends; and that a row that is neither is refused as corrupt.
 #[test]
 fn the_generation_is_the_stored_number_or_none() {
     let store = Flaky::new();
@@ -883,6 +899,14 @@ fn the_generation_is_the_stored_number_or_none() {
     assert_eq!(durable.generation().expect("read"), None);
     put(&store, GENERATION, 42u64.to_be_bytes().to_vec());
     assert_eq!(durable.generation().expect("read"), Some(42));
+    put(&store, GENERATION, SHARED_WRITERS.to_vec());
+    assert_eq!(durable.generation().expect("read"), None);
+    put(&store, GENERATION, vec![1, 2, 3]);
+    let refused = durable.generation().expect_err("junk");
+    assert!(
+        matches!(&refused, StateError::Corrupt { key, .. } if key == GENERATION),
+        "{refused:?}"
+    );
 }
 
 /// Catches: an operator's cordon or drain not kept (a successor process would offer
@@ -1369,24 +1393,15 @@ fn a_floor_row_that_is_not_one_is_refused() {
 }
 
 /// Catches: a floor store the farm loads on trust. A row whose key is not the key of the
-/// floor in it (a copied or edited row would floor another action), two floors with one
-/// stamp (the eviction order is undefined), and a row that is not a floor are refused
-/// naming the row.
+/// floor in it (a copied or edited row would floor another action), and a row that is not a
+/// floor, are refused naming the row.
 #[test]
 fn a_floor_store_that_contradicts_itself_is_refused() {
     let good = floor::encode(&a_floor(1, 5)).expect("encodes");
-    let same = floor::encode(&a_floor(2, 5)).expect("encodes");
     let cases = [
         (
             vec![(floor::row_key(&key_of(2)), good.clone())],
             "not the key of the floor it holds",
-        ),
-        (
-            vec![
-                (floor::row_key(&key_of(1)), good.clone()),
-                (floor::row_key(&key_of(2)), same),
-            ],
-            "a stamp another floor has",
         ),
         (
             vec![(floor::row_key(&key_of(1)), vec![9])],
@@ -1834,8 +1849,7 @@ fn a_store_with_size_key_rows_reads_as_it_did_without_them() {
 }
 
 /// Catches a key floor row read as anything but what was written: another version, a
-/// row cut short or with bytes after it, a row under another key's name, and two rows
-/// with one stamp.
+/// row cut short or with bytes after it, and a row under another key's name.
 #[test]
 fn a_key_floor_row_that_is_not_one_is_refused() {
     let floor = a_key_floor(7, 5);
@@ -1871,19 +1885,6 @@ fn a_key_floor_row_that_is_not_one_is_refused() {
         .expect("applied");
     let error = durable.load().expect_err("under another key's name");
     assert!(error.to_string().contains("not the key"), "{error}");
-    let store = Flaky::new();
-    let durable = open(&store);
-    for key in [7, 8] {
-        let mut same = row.clone();
-        same[1..9].copy_from_slice(&u64::to_be_bytes(key));
-        store
-            .inner
-            .txn(Txn::new().put(floor::key_row(key), same, Cond::Any))
-            .expect("write")
-            .expect("applied");
-    }
-    let error = durable.load().expect_err("one stamp twice");
-    assert!(error.to_string().contains("stamp"), "{error}");
 }
 
 fn size_key(instance: &str, cfg: Option<u64>) -> kbf_estimator::Key {

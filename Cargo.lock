@@ -1506,11 +1506,13 @@ dependencies = [
  "kbf-enroll",
  "kbf-front",
  "kbf-harness",
+ "kbf-host",
  "kbf-installer",
  "kbf-node",
  "kbf-peer",
  "kbf-proto",
  "kbf-server",
+ "kbf-setup",
  "kbf-state",
  "kbf-storage",
  "kbf-testkit",
@@ -1679,6 +1681,9 @@ dependencies = [
  "kbf-testkit",
  "kbf-types",
  "libc",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
  "plist",
  "prost",
  "prost-types",
@@ -1873,10 +1878,13 @@ dependencies = [
 name = "kbf-host-install"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "kbf-testkit",
  "rustix",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "tar",
  "thiserror",
  "time",
  "toml",
@@ -1928,6 +1936,7 @@ dependencies = [
  "kbf-oidc",
  "kbf-proto",
  "kbf-proxy",
+ "kbf-setup",
  "kbf-state",
  "kbf-testkit",
  "kbf-types",
@@ -1973,7 +1982,6 @@ dependencies = [
  "kbf-installer",
  "kbf-map",
  "kbf-objstore",
- "kbf-oidc",
  "kbf-proto",
  "kbf-proxy",
  "kbf-sched",
@@ -2388,7 +2396,6 @@ dependencies = [
  "kbf-tls",
  "kbf-types",
  "kbf-ui",
- "kbf-update",
  "libc",
  "percent-encoding",
  "postgres",
@@ -2412,6 +2419,24 @@ dependencies = [
  "tracing-subscriber",
  "x509-parser",
  "zeroize",
+]
+
+[[package]]
+name = "kbf-setup"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "kbf-host",
+ "kbf-proxy",
+ "kbf-state",
+ "kbf-testkit",
+ "postgres",
+ "rustix",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -2486,6 +2511,7 @@ dependencies = [
  "rusqlite",
  "sha2 0.11.0",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -3069,6 +3095,18 @@ dependencies = [
  "bitflags",
  "objc2",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-metal"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0125f776a10d00af4152d74616409f0d4a2053a6f57fa5b7d6aa2854ac04794"
+dependencies = [
+ "bitflags",
+ "block2",
+ "objc2",
+ "objc2-foundation",
 ]
 
 [[package]]

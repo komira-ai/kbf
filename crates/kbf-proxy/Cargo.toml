@@ -28,7 +28,8 @@ kbf-tls.workspace = true
 rustix = { workspace = true, features = ["fs", "process"] }
 rustls.workspace = true
 serde.workspace = true
-# Reads the child's `role` answer (`held_generation`, the term of its operation names).
+# Reads the child's `role` answer (`held_generation`, the term of its operation names), and
+# writes the pool's admin API answers and member list.
 serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true

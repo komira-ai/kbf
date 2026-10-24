@@ -11,8 +11,8 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use kbf_front::{
-    Cache, CacheError, EVICT_GRACE, EvictReady, EvictRound, HeldObject, MemoryMetaLog, MetaLog,
-    MetaLogError, VerifiedBlob,
+    Cache, CacheError, EVICT_GRACE, EvictRound, HeldObject, MemoryMetaLog, MetaLog, MetaLogError,
+    VerifiedBlob,
 };
 use kbf_meta::{
     Applied, BlobAnswer, Collected, Command, MetaState, ObjectId, Retention, Role, ServerId,
@@ -156,7 +156,7 @@ impl Fixture {
 
     /// One round with `grace`.
     async fn round(&self, grace: Duration) -> Result<EvictRound, CacheError> {
-        self.cache.evict_round(&self.files, grace, ready).await
+        self.cache.evict_round(&self.files, grace).await
     }
 
     async fn present(&self, texts: &[&str]) -> Vec<bool> {
@@ -207,18 +207,6 @@ fn digest(text: &str) -> Digest {
     kbf_segments::sha256(text.as_bytes())
 }
 
-/// A log that needs no readying for `EvictObjects`.
-#[expect(clippy::unnecessary_wraps, reason = "the readiness hook's signature")]
-fn ready(_: &Log) -> Result<EvictReady, MetaLogError> {
-    Ok(EvictReady::Ready)
-}
-
-/// A log of a three-voter cell below the version that takes `EvictObjects`.
-#[expect(clippy::unnecessary_wraps, reason = "the readiness hook's signature")]
-fn needs_v3(_: &Log) -> Result<EvictReady, MetaLogError> {
-    Ok(EvictReady::NeedsV3 { voters: 3 })
-}
-
 /// An action result whose one output file is `text`'s blob.
 fn result_of(text: &str) -> reapi::ActionResult {
     let d = digest(text);
@@ -235,7 +223,7 @@ fn result_of(text: &str) -> reapi::ActionResult {
     }
 }
 
-/// Catches an evictor that ranks by when objects were written, not last used (mutant:
+/// Catches an evictor that ranks by when objects were written, not last used (defect:
 /// reads do not count, so the order is first in, first out): of three objects written
 /// a, b, c and then a read, b is the least recently used, and a shortfall of one
 /// object's length takes b alone.
@@ -261,37 +249,7 @@ async fn evicts_least_recently_used_first() {
     f.remove();
 }
 
-/// Catches an evictor that evicts under a log that does not take `EvictObjects`
-/// (mutant: `NeedsV3` taken as ready), which would commit a command the other replicas
-/// of its cell refuse, or deletes the files without it (mutant: files only), leaving
-/// index entries with no file: round after round, nothing is evicted and the round
-/// says why and how short it stays. Once the log takes the command, the next round
-/// evicts.
-#[tokio::test]
-async fn evict_is_off_until_the_log_takes_evict() {
-    let f = Fixture::new("needs-v3").await;
-    let a = f.store("blob-a").await;
-    let len = f.len_of(a);
-    f.short_by(len);
-
-    for _ in 0..2 {
-        let off = f
-            .cache
-            .evict_round(&f.files, Duration::ZERO, needs_v3)
-            .await;
-        let off = off.expect("a round");
-        assert_eq!((off.objects, off.short, off.needs_v3), (0, len, Some(3)));
-        assert_eq!(f.present(&["blob-a"]).await, [true]);
-        assert!(f.holds(a).await);
-    }
-
-    let round = f.round(Duration::ZERO).await.expect("a round");
-    assert_eq!((round.objects, round.needs_v3), (1, None));
-    assert!(!f.holds(a).await);
-    f.remove();
-}
-
-/// Catches recency bumped only where the store is read (mutant: FindMissing's present
+/// Catches recency bumped only where the store is read (defect: FindMissing's present
 /// answers do not count): a client that asks whether a blob is present and is told yes
 /// relies on it as much as one that reads it. Of a and b, written in that order, a
 /// FindMissing that reports a present makes b the least recently used.
@@ -313,7 +271,7 @@ async fn lru_counts_find_missing_reports() {
     f.remove();
 }
 
-/// Catches an evictor that takes an object used within the grace window (mutant: the
+/// Catches an evictor that takes an object used within the grace window (defect: the
 /// window removed), cutting short a client that was just told its blob is present:
 /// with a 60 s window, two objects written just now stay whatever the shortfall, and
 /// only an object not used since the start (seeded by the start-up pass) goes. What the
@@ -344,7 +302,7 @@ async fn evict_spares_grace_window() {
     f.remove();
 }
 
-/// Catches an evictor that frees more than the shortfall (mutants: everything not in
+/// Catches an evictor that frees more than the shortfall (defect: everything not in
 /// the window evicted; `>` for `>=` in the "covered" check, one object too many) or
 /// works when nothing is short: with four objects of one length and a shortfall of
 /// exactly two lengths, the two least recently used go; once twice the floor is free a
@@ -377,7 +335,7 @@ async fn eviction_stops_at_target() {
     f.remove();
 }
 
-/// Catches files deleted before the index forgets them (mutant: the order swapped),
+/// Catches files deleted before the index forgets them (defect: the order swapped),
 /// so a crash between the two leaves index entries, and action-cache hits, for files
 /// that are gone: the log checks at each `EvictObjects` that the files are still
 /// there, and after the round the action entry that needed the blob is gone with the
@@ -418,7 +376,7 @@ async fn evict_commits_before_delete() {
     f.remove();
 }
 
-/// Catches an evictor that deletes a staged object's file (mutant: the staged check
+/// Catches an evictor that deletes a staged object's file (defect: the staged check
 /// dropped): the index keeps a staged object, so its file must stay too.
 #[tokio::test]
 async fn evict_skips_staged_objects() {

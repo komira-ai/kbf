@@ -57,7 +57,6 @@ fn a_restart_at_every_phase_boundary_ends_with_exactly_one_serving_child() {
         Phase::Switching,
         Phase::Switched,
         Phase::Baking,
-        Phase::Nodes,
         Phase::Draining,
     ];
     for phase in phases {
@@ -216,18 +215,21 @@ fn row_proxy_crash_during_bake_an_expired_bake_passes_at_once() {
     assert!(w.when("order confirm").unwrap() < before + secs(2));
 }
 
+/// Asserts that a restart that finds an `update.json` an earlier build left in the `nodes` phase
+/// goes on to drain and retire the old child and ends `done`, with the confirm sent once in all.
 #[test]
-fn row_proxy_crash_during_nodes_posts_desired_again_after_the_restart() {
-    let (w, old) = World::with_old();
-    crash_when(&w, |i| i.phase == Phase::Nodes && i.nodes_posted);
+fn a_restart_that_finds_the_nodes_phase_of_an_earlier_build_drains_and_ends_done() {
+    let (w, old) = draining_world();
+    crash_when(&w, |i| i.phase == Phase::Draining);
     run_to_crash(&w, Mode::Frontend, old);
-    assert_eq!(w.count("admin:desired"), 1);
-    assert_eq!(restart(&w).0, Ok(Phase::Done));
-    assert_eq!(
-        w.count("admin:desired"),
-        2,
-        "nodes_posted is advisory: the post is repeated"
-    );
+    {
+        let mut records = w.records.borrow_mut();
+        records.last_mut().expect("a record").phase = Phase::Nodes;
+    }
+    assert_eq!(restart(&w).0, Ok(Phase::Done), "{:#?}", w.log());
+    assert_eq!(w.count("order confirm"), 1);
+    assert!(w.when("terminate pid 100").expect("old retired") >= secs(600));
+    assert_eq!(w.holders(), vec![Slot::B]);
 }
 
 #[test]
@@ -372,30 +374,6 @@ fn a_new_child_that_lost_the_generation_after_it_served_is_retired_not_killed() 
     assert_eq!(w.count("kill"), 0);
     assert_eq!(w.count("terminate pid 101"), 1);
     assert_eq!(w.holders(), vec![Slot::A]);
-}
-
-fn failed_at_nodes(i: &Intent) -> bool {
-    i.failure.as_ref().is_some_and(|f| f.step == Step::Nodes)
-}
-
-/// Catches a restart that sends the order for the nodes again after the child refused it for
-/// good: the refusal is in `update.json`, so the new proxy goes on to drain and retire, and the
-/// update ends `failed` at `nodes` as it would have, with the order sent once in all.
-///
-/// Catches: the restart's `settle` not looking at the recorded failure.
-#[test]
-fn a_restart_after_a_refusal_of_the_order_for_the_nodes_does_not_send_it_again() {
-    let (w, old) = draining_world();
-    w.st.borrow_mut().desired_refused = Some("not_own".to_owned());
-    crash_when(&w, failed_at_nodes);
-    run_to_crash(&w, Mode::Frontend, old);
-    assert_eq!(w.count("admin:desired"), 1);
-    let (end, _) = restart(&w);
-    assert_eq!(end, Ok(Phase::Failed), "{:#?}", w.log());
-    assert_eq!(failed_at(&w), Some(Step::Nodes));
-    assert_eq!(w.count("admin:desired"), 1);
-    assert_eq!(w.holders(), vec![Slot::B]);
-    assert!(w.when("terminate pid 100").is_some(), "old child retired");
 }
 
 fn before_in(w: &World, a: &str, b: &str) {

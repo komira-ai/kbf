@@ -330,15 +330,15 @@ fn seen(runtime: &Runtime, log: &Log, digest: Digest) -> BlobAnswer {
 }
 
 /// Catches (red before group commit: the proposals never got past the first, which
-/// waited under the log's lock for the held sync; mutants "one proposal per sync" and
+/// waited under the log's lock for the held sync; defects "one proposal per sync" and
 /// "one persist per entry in a batch": the second sync then holds one proposal and the
-/// rest wait for a third; mutant "answer before the sync": the proposals answer while
-/// their sync is held; mutant "replies zipped in reverse": a caller gets another
+/// rest wait for a third; defect "answer before the sync": the proposals answer while
+/// their sync is held; defect "replies zipped in reverse": a caller gets another
 /// entry's outcome, an epoch for a blob or a blob for an epoch): N proposals of two
 /// kinds that arrive while a sync is held are written and
 /// synced together, so the first sync and one more make every one durable, none
 /// answers before that second sync, and none is visible to a query until it has. (The
-/// store syncs inside each write, so applying before the sync is not a mutant this
+/// store syncs inside each write, so applying before the sync is not a defect this
 /// layer can make.) Each caller gets the outcome of its own command. The first sync may
 /// be a tick's rather than the first proposal's; the proposals then share the second
 /// with it, which the test allows.
@@ -386,7 +386,7 @@ fn proposals_made_during_a_sync_share_the_next_sync_and_answer_after_it() {
     }
 }
 
-/// Catches (mutant "answer before the sync": the batch answers with outcomes it then
+/// Catches (defect "answer before the sync": the batch answers with outcomes it then
 /// fails to make durable): the process dies in the sync of a batch. Every proposal of
 /// the batch is answered, none with an outcome, and after a power cut none of them is
 /// in the log.
@@ -437,7 +437,7 @@ fn a_crash_in_a_batch_sync_answers_none_of_it_and_loses_all_of_it() {
     }
 }
 
-/// Catches (mutant "a committer stops guarding the queue once it has taken its batch":
+/// Catches (defect "a committer stops guarding the queue once it has taken its batch":
 /// the first half's arrival starts a second committer, which takes that half alone
 /// while the first committer is still in its sync, so the second half waits for a
 /// sync of its own, which the gate holds): proposals that arrive at two moments of one
@@ -475,7 +475,7 @@ fn proposals_made_at_two_moments_of_a_sync_share_the_next_sync() {
     assert!(matches!(first, Ok(Applied::Blob(Ok(_)))), "{first:?}");
 }
 
-/// Catches (mutant "a panic in a commit is not caught": the committer dies with its
+/// Catches (defect "a panic in a commit is not caught": the committer dies with its
 /// queue marked as being committed, so no later command starts one and every later
 /// commit, ticks included, waits forever): a sync that panics answers its batch
 /// `Unavailable`, and a commit made after it is still answered (refused: the panic
@@ -526,7 +526,7 @@ fn a_panic_in_a_batch_sync_answers_it_unavailable_and_later_commits_still_answer
     );
 }
 
-/// Catches (mutant "a tick takes its own sync": the tick is proposed as a batch of
+/// Catches (defect "a tick takes its own sync": the tick is proposed as a batch of
 /// its own, so after the held sync the burst and the tick need a sync each, and the
 /// second of them waits on a third sync, which the gate holds): a `Tick` proposed
 /// while a burst of `PutBlobs` waits on a held sync joins the burst's batch. After
@@ -686,19 +686,13 @@ fn tier_of_server_1(runtime: &Runtime, log: &Log) -> Option<TierId> {
         .expect("a query")
 }
 
-/// Catches (mutant "the batch is encoded in format 1", the group-commit side of the
-/// merge with the machine-version raise: after the raise the tier's `AddTier` is
-/// refused; mutant "a refused command takes the next command's answer" (`and` for
-/// `and_then` where the batch's answers are handed out): before the raise the blob
-/// after the refused `AddTier` is answered with the `AllocEpoch`'s epoch): a batch is
-/// encoded in the format the log has committed when the batch commits. Before the raise
-/// to machine version 2 a write tier command in a batch is refused and the rest of the
-/// batch commits, each caller answered with its own outcome; after the raise the same
-/// command commits in a batch with format-1 commands, and a restart replays both
-/// batches (the version, the tier and the blobs come back). A raise commits alone
-/// under the host's lock, so no batch holds a `MachineVersion` entry.
+/// Asserts that a batch holding a write tier command commits whole on a log that was
+/// never raised, each caller answered with its own outcome (the blobs, the tier and the
+/// epoch, in the order proposed), and that a restart replays the batch: the log is still
+/// at machine version 1, and the tier and the blobs come back. A command needs no raise
+/// to commit, and no batch holds a `MachineVersion` entry.
 #[test]
-fn a_batch_is_encoded_in_the_format_committed_before_it_and_replays() {
+fn a_batch_with_a_tier_command_commits_whole_on_a_log_never_raised() {
     let runtime = runtime();
     let (gate, entered) = Gate::new();
     let inner = FaultFs::new();
@@ -709,61 +703,25 @@ fn a_batch_is_encoded_in_the_format_committed_before_it_and_replays() {
     let (log, epoch) = opened(&runtime, fs);
     let _disarm = Disarm(Arc::clone(&gate));
     let (digest_1, put_1) = blob(epoch, 1);
-    let before = one_batch(
+    let (digest_2, put_2) = blob(epoch, 2);
+    let batch = one_batch(
         &runtime,
         &log,
         (&gate, &entered),
         blob(epoch, 0).1,
-        vec![add_tier(), put_1, Command::AllocEpoch],
+        vec![put_1, add_tier(), Command::AllocEpoch, put_2],
     );
-    match before.as_slice() {
-        [
-            Err(MetaLogError::Unavailable(_)),
-            Ok(Applied::Blob(Ok(_))),
-            Ok(Applied::Epoch(e)),
-        ] if *e > epoch => {}
-        other => panic!("before the raise the batch answered {other:?}"),
-    }
-    assert_eq!(tier_of_server_1(&runtime, &log), None);
-    open_gate(&gate);
-    drop(log);
-
-    let inner = inner.restart();
-    let (gate, entered) = Gate::new();
-    let fs = GateFs {
-        inner: inner.clone(),
-        gate: Arc::clone(&gate),
-    };
-    let log = runtime
-        .block_on(RaftMetaLog::open(fs, Retention::default(), "kbf/", new_id))
-        .expect("reopen after the refused tier command");
-    assert!(matches!(
-        seen(&runtime, &log, digest_1),
-        BlobAnswer::Present { .. }
-    ));
-    log.raise_machine_version(MachineVersion::V2)
-        .expect("a raise");
-    gate.arm();
-    let log = Arc::new(log);
-    let _disarm_raised = Disarm(Arc::clone(&gate));
-    let (digest_2, put_2) = blob(epoch, 2);
-    let (digest_3, put_3) = blob(epoch, 3);
-    let after = one_batch(
-        &runtime,
-        &log,
-        (&gate, &entered),
-        blob(epoch, 4).1,
-        vec![put_2, add_tier(), Command::AllocEpoch, put_3],
-    );
-    match after.as_slice() {
+    match batch.as_slice() {
         [
             Ok(Applied::Blob(Ok(_))),
             Ok(Applied::Tier(Ok(()))),
-            Ok(Applied::Epoch(_)),
+            Ok(Applied::Epoch(e)),
             Ok(Applied::Blob(Ok(_))),
-        ] => {}
-        other => panic!("after the raise the batch answered {other:?}"),
+        ] if *e > epoch => {}
+        other => panic!("the batch answered {other:?}"),
     }
+    assert_eq!(log.machine_version(), MachineVersion::V1);
+    assert_eq!(tier_of_server_1(&runtime, &log), Some(TierId::new(1)));
     open_gate(&gate);
     drop(log);
 
@@ -773,10 +731,10 @@ fn a_batch_is_encoded_in_the_format_committed_before_it_and_replays() {
     };
     let log = runtime
         .block_on(RaftMetaLog::open(fs, Retention::default(), "kbf/", new_id))
-        .expect("reopen after the raised batch");
-    assert_eq!(log.machine_version(), MachineVersion::V2);
+        .expect("reopen after the batch");
+    assert_eq!(log.machine_version(), MachineVersion::V1);
     assert_eq!(tier_of_server_1(&runtime, &log), Some(TierId::new(1)));
-    for digest in [digest_1, digest_2, digest_3] {
+    for digest in [digest_1, digest_2] {
         assert!(
             matches!(seen(&runtime, &log, digest), BlobAnswer::Present { .. }),
             "a committed blob did not replay"

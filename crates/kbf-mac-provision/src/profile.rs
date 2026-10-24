@@ -65,7 +65,11 @@ pub const OPTIONAL: &[&str] = &[
 ];
 
 /// How many lease users the pool has when the profile does not say.
-pub const POOL_USERS: u32 = 4;
+pub const POOL_USERS: u32 = 100;
+/// The most lease users a pool has.
+pub const MAX_POOL_USERS: u64 = 100;
+/// The uid of `kbf-pool-0` and the gid of `kbfpool` when the profile does not say.
+pub const POOL_FIRST_UID: u32 = 61000;
 /// The volume the pool's homes, the scratch root and the cache are on when the profile
 /// does not say.
 pub const VOLUME: &str = "/Volumes/kbf";
@@ -477,9 +481,9 @@ fn value<'a>(values: &'a BTreeMap<&'static str, String>, key: &str) -> &'a str {
     values.get(key).map_or("", String::as_str)
 }
 
-/// `pool_users` (1 to 64, default [`POOL_USERS`]) and `pool_first_uid` (default the
-/// uid after `lease_uids`, and never below 600): the pool's uids are at least 600, at
-/// most 65535, and outside `lease_uids`.
+/// `pool_users` (1 to [`MAX_POOL_USERS`], default [`POOL_USERS`]) and `pool_first_uid`
+/// (default [`POOL_FIRST_UID`]): the pool's uids are at least 600, at most 65535, and
+/// outside `lease_uids`.
 fn pool(
     values: &BTreeMap<&'static str, String>,
     lease: &RangeInclusive<u64>,
@@ -490,11 +494,11 @@ fn pool(
         v => Some(v)
             .filter(|v| pattern::number(v))
             .and_then(|v| v.parse::<u64>().ok())
-            .filter(|n| (1..=64).contains(n))
-            .ok_or_else(|| invalid("pool_users", v, "a number from 1 to 64"))?,
+            .filter(|n| (1..=MAX_POOL_USERS).contains(n))
+            .ok_or_else(|| invalid("pool_users", v, "a number from 1 to 100"))?,
     };
     let first = match get("pool_first_uid") {
-        "" => lease.end().saturating_add(1).max(600),
+        "" => u64::from(POOL_FIRST_UID),
         v => Some(v)
             .filter(|v| pattern::number(v))
             .and_then(|v| v.parse::<u64>().ok())

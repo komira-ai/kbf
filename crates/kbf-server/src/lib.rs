@@ -27,15 +27,12 @@
 //!   `/ui` ([`ui_mount`]), whose reads are bounded per caller ([`read_limit`]).
 //! - A drain of the frontend ([`drain`]) that a stop signal or `POST /v1/frontend/drain`
 //!   begins, a second signal escalates, and `kbf cluster` calls through [`api_client`].
-//! - Rollouts ([`rollout`]): the record's store (in memory for now) and the driver that
-//!   cordons, drains and hands drained nodes their update, as far as `updating`.
-//! - Node rolling ([`update`]): the pure picker and node step of a split-mode update
-//!   (`docs/design/split-mode-updates.md`, sections 2.6 to 2.11), which host goes next and
-//!   its one next move. Nothing drives them yet.
+//! - Node rolling ([`update`]): the durable rows and facts of a split-mode update
+//!   (`docs/design/split-mode-updates.md`, sections 2.6 to 2.11). Nothing picks hosts or
+//!   steps them: updates are OS packages, driven by `kbf-updater`.
 //! - The MDM gate ([`mdm`]): the server's verbs at `kbf-mdm-gate` (inventory, enforce
 //!   and withdraw a macOS build, install an allowlisted profile; no erase), a client
-//!   over mutual TLS, and the polling of an update's DDM progress. Not yet called by
-//!   the rollout driver.
+//!   over mutual TLS, and the polling of an update's DDM progress. Nothing calls it yet.
 //! - Build history ([`history`]): off unless `--history-objects` is given, each attempt and
 //!   cache hit of an invocation a client named is recorded in an object store, off the
 //!   path of the call it belongs to, with a run id the build pages name the run by. It
@@ -122,8 +119,8 @@ pub mod read_limit;
 mod rebuild;
 pub mod release;
 pub mod replication;
+pub mod retire;
 pub mod retired;
-pub mod rollout;
 mod run_record;
 pub mod serve;
 #[cfg(test)]
@@ -146,7 +143,6 @@ mod test_dir;
 mod timeout;
 pub mod token;
 pub mod ui_mount;
-pub mod update;
 pub mod update_status;
 pub mod verbs;
 pub mod vitals;
@@ -157,7 +153,10 @@ pub mod write_tier;
 
 pub use config::{Args, ConfigError, Role, SERVER, s3_store};
 pub use drain::{Drain, DrainStatus};
-pub use farm::{DONE_FLOOR, EpochBump, EpochPolicy, Farm, ID_BLOCK, SESSION_RENEWAL, StateError};
+pub use farm::{
+    ACK_WINDOW, DONE_FLOOR, EpochBump, EpochPolicy, Farm, ID_BLOCK, INTAKE_POLL, ORPHAN_WAIT,
+    OWNER_CACHE_TTL, SESSION_RENEWAL, StateError,
+};
 pub use health::Readiness;
 pub use identity::{DenyList, DenyListError, Peers};
 pub use kbf_sched::MemoryLadder;
@@ -179,6 +178,7 @@ pub use start_exit::{
 pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
 pub use streams::{StreamArgs, StreamLimits};
 pub use ui_mount::bind_server_with_options;
+pub use worker::HostFloor;
 pub use worker::WorkerService;
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build

@@ -191,7 +191,7 @@ fn a_second_store_over_one_directory_is_refused() {
     ));
 }
 
-/// Fail fast, not hang, when a mutant reinstalls without end: panic on the `max`+1st install.
+/// Fail fast, not hang, when a defect reinstalls without end: panic on the `max`+1st install.
 fn at_most_installs(rig: &Rig, max: usize) {
     let seen = Arc::new(AtomicUsize::new(0));
     rig.inst.on_install(move |h| {
@@ -208,8 +208,11 @@ fn open_over(rig: &Rig, rec: &crate::record::Record) -> Result<Updater, StoreErr
         Ports {
             safe: Box::new(rig.stop.clone()),
             installer: Box::new(rig.inst.clone()),
+            drain: Box::new(rig.drain.clone()),
             health: Box::new(rig.health.clone()),
             clock: Box::new(rig.clock.clone()),
+            pool: Box::new(rig.pool.clone()),
+            frontend: Box::new(rig.front.clone()),
         },
         Timing::default(),
     )
@@ -230,11 +233,13 @@ fn listed(ask: &[&str], have: &[&str]) -> crate::record::Record {
     rec
 }
 
-/// Catches a record whose hosts are not the request's plan, which would roll a host nobody
-/// asked for, or the right hosts in the wrong order: a swapped host and a missing one are
-/// refused by the record's own check; a reordered pair, and a frontend not first, are
-/// refused when the inventory (which knows the frontend) makes the plan. The right plans
-/// load, including one with the frontend moved to the front.
+/// Asserts that a record whose hosts are not the request's plan is refused, so that no host
+/// nobody asked for is rolled, and no right host in the wrong order: a swapped host, a missing
+/// one and a reordering that is no move of hosts to the front are refused by the record's own
+/// check; a reordered pair, hosts moved to the front that the inventory does not make
+/// frontends, and a frontend not first, are refused when the inventory (which knows the
+/// frontends) makes the plan. The right plans load, including one with the frontend moved to
+/// the front.
 #[test]
 fn a_record_whose_hosts_are_not_the_requests_plan_is_refused() {
     let rig = Rig::new("plan-check");
@@ -247,8 +252,10 @@ fn a_record_whose_hosts_are_not_the_requests_plan_is_refused() {
     assert!(inconsistent(&listed(&["st1", "dm"], &["st1"])).contains("not the request's"));
     assert!(inconsistent(&listed(&["st1", "dm"], &["dm", "st1"])).contains("not the plan"));
     assert!(inconsistent(&listed(&["st1", "fe"], &["st1", "fe"])).contains("not the plan"));
+    let moved = inconsistent(&listed(&["st1", "dm", "st2"], &["dm", "st2", "st1"]));
+    assert!(moved.contains("not the plan"), "{moved}");
     assert!(
-        inconsistent(&listed(&["st1", "dm", "st2"], &["dm", "st2", "st1"])).contains("request's")
+        inconsistent(&listed(&["st1", "dm", "st2"], &["st2", "dm", "st1"])).contains("request's")
     );
 
     for (ask, have) in [

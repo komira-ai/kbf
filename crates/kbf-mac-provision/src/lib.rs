@@ -42,6 +42,7 @@ pub mod profile;
 pub mod record;
 
 mod accounts;
+mod directory;
 mod pattern;
 mod pool;
 mod software;

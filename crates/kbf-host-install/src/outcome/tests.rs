@@ -6,7 +6,7 @@ fn json(outcome: &Outcome) -> Value {
     serde_json::from_str(&outcome.json_line()).unwrap()
 }
 
-const ALL_REFUSALS: [(Refusal, &str); 7] = [
+const ALL_REFUSALS: [(Refusal, &str); 10] = [
     (Refusal::BadCommand, "bad_command"),
     (Refusal::ChannelNotAllowed, "channel_not_allowed"),
     (Refusal::ConfigInvalid, "config_invalid"),
@@ -14,9 +14,12 @@ const ALL_REFUSALS: [(Refusal, &str); 7] = [
     (Refusal::ChannelUnsigned, "channel_unsigned"),
     (Refusal::KeyUntrusted, "key_untrusted"),
     (Refusal::ChannelInsecure, "channel_insecure"),
+    (Refusal::UnknownRelease, "unknown_release"),
+    (Refusal::AmbiguousRelease, "ambiguous_release"),
+    (Refusal::FetchFailed, "fetch_failed"),
 ];
 
-const ALL_FAILURES: [(FailureCode, &str); 9] = [
+const ALL_FAILURES: [(FailureCode, &str); 11] = [
     (FailureCode::AuditUnavailable, "audit_unavailable"),
     (FailureCode::QueryFailed, "query_failed"),
     (
@@ -29,6 +32,8 @@ const ALL_FAILURES: [(FailureCode, &str); 9] = [
     (FailureCode::VerifyFailed, "verify_failed"),
     (FailureCode::Busy, "busy"),
     (FailureCode::LockUnavailable, "lock_unavailable"),
+    (FailureCode::RestartFailed, "restart_failed"),
+    (FailureCode::RestartTimeout, "restart_timeout"),
 ];
 
 /// Catches a renamed code: the codes are the contract with the updater.
@@ -186,6 +191,19 @@ fn audit_fields() {
 #[test]
 fn stderr_detail_is_cleaned_and_bounded() {
     assert_eq!(Outcome::Refused(Refusal::BadCommand).stderr_detail(), None);
+    // A refusal with its reason: the same line, status and audit fields as without, and the
+    // reason (cleaned) on stderr.
+    let why = Outcome::RefusedBecause(Refusal::FetchFailed, "slow\x1b down".into());
+    assert_eq!(why.stderr_detail().as_deref(), Some("slow? down"));
+    assert_eq!(why.exit_code(), 2);
+    assert_eq!(
+        why.json_line(),
+        Outcome::Refused(Refusal::FetchFailed).json_line()
+    );
+    assert_eq!(
+        why.audit_fields(),
+        Outcome::Refused(Refusal::FetchFailed).audit_fields()
+    );
     assert_eq!(
         Outcome::Installed {
             version: "1".into()
@@ -321,4 +339,74 @@ fn other_lines_are_not_a_units_answer() {
     ] {
         assert_eq!(Outcome::from_unit_line(line), None, "{line:?}");
     }
+}
+
+/// Asserts that a restart answers with the `restarted` line naming the unit, exit status 0,
+/// the audit outcome `restarted` and no stderr detail, and that the line is not the answer
+/// of an install unit.
+#[test]
+fn the_restarted_answer() {
+    let restarted = Outcome::Restarted {
+        unit: "kbf-frontend@a1.service".into(),
+    };
+    assert_eq!(
+        restarted.json_line(),
+        r#"{"result":"restarted","unit":"kbf-frontend@a1.service"}"#
+    );
+    assert_eq!(restarted.exit_code(), 0);
+    assert_eq!(restarted.audit_fields(), ("restarted", None));
+    assert_eq!(restarted.stderr_detail(), None);
+    assert_eq!(Outcome::from_unit_line(&restarted.json_line()), None);
+}
+
+/// A Mac's two answers have their own lines, which the Linux ones never are: the apply
+/// started (exit 0), and the query with the standing of the last apply after the four fields
+/// of a query; neither is an install unit's answer.
+#[test]
+fn the_mac_answers() {
+    let started = Outcome::ApplyStarted {
+        version: "0.1.7+gbbbbbbbbbbbb-3".into(),
+        commit: "b".repeat(40),
+    };
+    assert_eq!(
+        started.json_line(),
+        format!(
+            r#"{{"result":"apply_started","version":"0.1.7+gbbbbbbbbbbbb-3","commit":"{}","apply":"running"}}"#,
+            "b".repeat(40)
+        )
+    );
+    assert_eq!(started.exit_code(), 0);
+    assert_eq!(started.audit_fields(), ("apply_started", None));
+    assert_eq!(started.stderr_detail(), None);
+    let report = || QueryReport {
+        installed_version: Some("1".into()),
+        running_commit: Some("abc".into()),
+        node_id: Some("mac-a".into()),
+        in_progress: false,
+    };
+    let done = Outcome::MacQueried {
+        report: report(),
+        apply: Some("failed:not_welcomed:rolled_back".into()),
+    };
+    assert_eq!(
+        done.json_line(),
+        r#"{"result":"query","installed_version":"1","running_commit":"abc","node_id":"mac-a","in_progress":false,"apply":"failed:not_welcomed:rolled_back"}"#
+    );
+    let none = Outcome::MacQueried {
+        report: report(),
+        apply: None,
+    };
+    assert!(
+        none.json_line()
+            .ends_with(r#""in_progress":false,"apply":null}"#)
+    );
+    assert_eq!(
+        (done.exit_code(), none.audit_fields()),
+        (0, ("query", None))
+    );
+    for outcome in [&started, &done] {
+        assert_eq!(Outcome::from_unit_line(&outcome.json_line()), None);
+    }
+    // The Linux query line is unchanged: it has no `apply`.
+    assert!(!Outcome::Queried(report()).json_line().contains("apply"));
 }

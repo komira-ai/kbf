@@ -13,10 +13,9 @@ use kbf_host::testkit::ScratchHost;
 use super::pipeline_fetcher_tests::PipelineFetcher;
 use super::*;
 use crate::helper::fetcher::fake::Tamper;
-use crate::setup::backend::{Fetching, Releases};
 
-/// A second handle on the rig's root, for `setup`: it is another program than the helper,
-/// with an executor of its own. Both remove the root when they go; the second removal
+/// A second handle on the rig's root, for the first release: it is another program than the
+/// helper, with an executor of its own. Both remove the root when they go; the second removal
 /// finds nothing and does not mind.
 fn second_handle(rig: &Rig) -> ScratchHost {
     ScratchHost {
@@ -50,10 +49,11 @@ fn real_frontend(name: &str) -> (Rig, PipelineFetcher) {
     (rig, fetcher)
 }
 
-/// Catches `setup`'s first release being left staged as well as current. The first release
-/// goes through the pipeline and `Fetching`, and the state says it is current and stages
-/// nothing: status.json says `idle` (not `staged`, for good), and the frontend's first update
-/// is taken, where a release both staged and current answers it `frontend_busy` for ever.
+/// Asserts that a first release is not left staged as well as current. The first release goes
+/// through the pipeline and `activate::first` (as `record-release` makes one), and the state
+/// says it is current and stages nothing: status.json says `idle` (not `staged`, for good), and
+/// the frontend's first update is taken, where a release both staged and current answers it
+/// `frontend_busy` for ever.
 ///
 /// Red on the code before the fix, where the pipeline wrote `staged` and `first` kept it.
 /// Each of the two alone is masked here by the other being right (a pipeline that does not
@@ -61,11 +61,17 @@ fn real_frontend(name: &str) -> (Rig, PipelineFetcher) {
 /// wrote), so each has its own test: `the_pipeline_installs_and_never_writes_the_state`
 /// and `a_first_release_that_was_staged_is_current_and_no_longer_staged`.
 #[test]
-fn setups_first_release_is_not_left_staged_and_a_frontend_update_follows() {
+fn a_first_release_is_not_left_staged_and_a_frontend_update_follows() {
     let mut rig = Rig::bare_frontend("first-then-update");
     let fetcher = PipelineFetcher::new(&rig.layout);
-    let setup = Fetching::new(&fetcher, rig.layout.clone(), second_handle(&rig));
-    setup.install_first(&c(A)).expect("the first release");
+    let locator = ReleaseLocator {
+        commit: c(A),
+        components: Vec::new(),
+        source: Source::Fetch,
+    };
+    fetcher.fetch(&locator).expect("fetched");
+    let mut first = second_handle(&rig);
+    activate::first(&mut first, &rig.layout, &c(A), &mut std::io::sink()).expect("the first");
     assert!(installed(&rig, A), "it came through the pipeline");
     let state = rig.state();
     assert_eq!(state.current, Some(c(A)));
@@ -94,7 +100,7 @@ fn setups_first_release_is_not_left_staged_and_a_frontend_update_follows() {
 /// word, `staged` stays empty, status.json does not say `staged`, and the next update, of
 /// another commit, is taken, where a leftover would answer it `frontend_busy`.
 ///
-/// Mutants planted: the pipeline writing `staged` after its install; a refused update
+/// Catches: the pipeline writing `staged` after its install; a refused update
 /// clearing `staged` whatever it names (see the next test).
 #[test]
 fn a_frontend_update_refused_after_its_fetch_leaves_nothing_staged() {
@@ -127,7 +133,7 @@ fn a_frontend_update_refused_after_its_fetch_leaves_nothing_staged() {
 /// takes: a repeat is verified again) is refused after the fetch. B is still the release
 /// the first order staged, so it stays staged and the proxy can still confirm it.
 ///
-/// Mutant planted: the refusal after the fetch clearing `staged` whatever it names.
+/// Catches: the refusal after the fetch clearing `staged` whatever it names.
 #[test]
 fn a_repeat_of_the_staged_update_refused_after_its_fetch_keeps_it_staged() {
     let (mut rig, fetcher) = real_frontend("repeat-refused");
@@ -154,7 +160,7 @@ fn a_repeat_of_the_staged_update_refused_after_its_fetch_keeps_it_staged() {
 /// C (the report is not what the order expected) is refused after the fetch; B stays
 /// staged through both, and a successful node activation of C swaps and still leaves B.
 ///
-/// Mutants planted: the pipeline writing `staged` (C displaces B, and the swap then clears
+/// Catches: the pipeline writing `staged` (C displaces B, and the swap then clears
 /// it as C); a refusal after the fetch clearing `staged` whatever it names.
 #[test]
 fn another_orders_staged_release_survives_a_refused_stage_and_a_node_swap() {
@@ -195,7 +201,7 @@ fn another_orders_staged_release_survives_a_refused_stage_and_a_node_swap() {
 /// `staged` stays empty, so the frontend's next update is taken (a leftover would answer
 /// `frontend_busy`).
 ///
-/// Mutant planted: the pipeline writing `staged` after its install.
+/// Catches: the pipeline writing `staged` after its install.
 #[test]
 fn a_node_activation_refused_after_its_fetch_stages_nothing() {
     let (mut rig, fetcher) = real_frontend("activation-refused");

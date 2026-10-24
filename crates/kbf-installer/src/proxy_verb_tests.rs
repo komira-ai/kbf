@@ -48,7 +48,7 @@ fn the_proxy_table_is_read_from_installer_toml() {
     ))
     .expect("valid");
     let config = loaded.proxy;
-    assert_eq!(config.upstream.base_port, 18_000);
+    assert_eq!(config.slot_table().base_port, 18_000);
     assert_eq!(config.hold_max_s, 15);
     assert_eq!(
         config.operator_token_file,
@@ -113,8 +113,7 @@ fn the_update_apis_numbers_and_places_come_from_the_file_and_the_flags() {
     let (layout, _) = crate::testkit::host_root_on("places", Platform::Linux);
     let cfg = handover_config(&args, &loaded, &layout);
     // The children's ports are the upstream table's: in a slot the operator listener is at
-    // offset 2 and the admin calls at 3, slot B ten ports above slot A, all on loopback; and
-    // the operator token is the one the proxy checks callers against.
+    // offset 2 and the admin calls at 3, slot B ten ports above slot A, all on loopback.
     let at = |port| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     assert_eq!(
         cfg.slots,
@@ -122,10 +121,6 @@ fn the_update_apis_numbers_and_places_come_from_the_file_and_the_flags() {
             admin: [at(18003), at(18013)],
             operator: [at(18002), at(18012)],
         }
-    );
-    assert_eq!(
-        cfg.operator_token_file,
-        PathBuf::from("/etc/kbf/operator.token")
     );
     assert!(!cfg.gate.is_filled());
     assert_eq!(
@@ -249,7 +244,7 @@ fn the_proxy_reads_the_keys_it_needs_and_ignores_the_rest_of_the_file() {
         (loaded.confirm_window_s, loaded.fetch_timeout_s),
         (300, 1200)
     );
-    assert_eq!(loaded.proxy.upstream.base_port, 18_000);
+    assert_eq!(loaded.proxy.slot_table().base_port, 18_000);
     assert_eq!(loaded.proxy.hold_max_s, 15);
     let low = format!("confirm_window_s = 10\n{PROXY}");
     let refused = usage_of(load(&file("low-window", low.as_bytes())));
@@ -454,7 +449,6 @@ pub(super) fn handover(name: &str) -> HandoverConfig {
             admin: [loopback(18003), loopback(18013)],
             operator: [loopback(18002), loopback(18012)],
         },
-        operator_token_file: root.join("operator.token"),
         installer_toml: root.join("installer.toml"),
         gate: GateSlot::new(),
     }
@@ -1077,8 +1071,7 @@ fn the_start_migrates_the_installed_release_before_it_runs_it() {
         ),
         state_dir: state_dir.clone(),
         proxy_auth_file: config.proxy_auth_file.clone(),
-        upstream: config.upstream,
-        operator_token_file: config.operator_token_file.clone(),
+        upstream: config.slot_table(),
         status,
         local: None,
         frontend_config: None,
@@ -1112,4 +1105,17 @@ fn the_start_migrates_the_installed_release_before_it_runs_it() {
     ] {
         assert!(!line.contains(part) && !boot.contains(part), "{part}");
     }
+}
+
+/// Asserts that the copy of the proxy's port layout in `observe` is the proxy's own
+/// (`kbf_proxy::config`, the same constants `setup --proxy` checks its flags against): the
+/// deploy verb finds the operator listener of each slot as `base + stride * slot + offset`
+/// without naming the proxy, so a layout that differs would send its gates to the wrong port.
+#[test]
+fn the_deploys_port_layout_is_the_proxys() {
+    use crate::observe::{MAX_BASE_PORT, OPERATOR_OFFSET, SLOT_STRIDE};
+
+    assert_eq!(SLOT_STRIDE, kbf_proxy::config::SLOT_STRIDE);
+    assert_eq!(OPERATOR_OFFSET, Target::Operator.offset());
+    assert_eq!(MAX_BASE_PORT, kbf_proxy::config::MAX_BASE_PORT);
 }

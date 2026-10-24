@@ -64,6 +64,7 @@ async fn farm(name: &str, source: Arc<dyn MapSource>) -> Arc<MapHolder> {
         unservable_wait: Duration::from_secs(300),
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: Duration::from_secs(60),
         shutdown_timeout: Duration::from_secs(10),
@@ -127,7 +128,7 @@ async fn a_daemon_follows_the_map_the_server_holds() {
 
 /// Catches a farm that depends on the push: with every `MapUpdate` lost, a daemon that
 /// finds it is behind (a storage node named generation 5) asks, and the server answers
-/// with the map it holds. Mutants: the server not answering a `MapRequest`; the daemon
+/// with the map it holds. Catches: the server not answering a `MapRequest`; the daemon
 /// not sending one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lost_map_update_is_harmless() {

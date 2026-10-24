@@ -4,6 +4,7 @@
 mod support;
 
 use kbf_proto::worker::{Capability, Hello};
+use kbf_server::HostFloor;
 use kbf_server::worker::capacity;
 use kbf_types::Resources;
 use support::{FakeDaemon, Job, done, hello, output, ran};
@@ -26,11 +27,11 @@ fn hello_with_gpus(node: &str, gpus: &str) -> Hello {
 #[test]
 fn capacity_reads_the_gpu_entry() {
     assert_eq!(
-        capacity(&hello_with_gpus("g", "2")),
+        capacity(&hello_with_gpus("g", "2"), HostFloor::default()),
         Ok(Resources::new(4_000, 8 * GIB).with_gpus(2))
     );
     assert_eq!(
-        capacity(&hello("c", 4, 8)),
+        capacity(&hello("c", 4, 8), HostFloor::default()),
         Ok(Resources::new(4_000, 8 * GIB))
     );
     let mut twice = hello_with_gpus("g", "1");
@@ -39,7 +40,7 @@ fn capacity_reads_the_gpu_entry() {
         value: "1".to_owned(),
     });
     for bad in [twice, hello_with_gpus("g", "one")] {
-        let refused = capacity(&bad).expect_err("refused");
+        let refused = capacity(&bad, HostFloor::default()).expect_err("refused");
         assert!(refused.contains("gpu"), "{refused}");
     }
 }
@@ -117,8 +118,9 @@ async fn a_gpu_serves_one_lease_at_a_time() {
     cpu_only.no_work().await;
 }
 
-/// The Mac of a GPU test: 12 CPUs, 32 GiB, the native and whole-machine drivers, and no
-/// `gpu` entry (a Mac reports none).
+/// The Mac of a GPU test: 12 CPUs, 32 GiB, the native and whole-machine drivers, and the
+/// GPU entries a Mac reports: one `gpu` slot, of a native GPU with 80 cores and Metal
+/// family 9.
 fn mac() -> Hello {
     support::hello_on(
         "mac-1",
@@ -129,6 +131,10 @@ fn mac() -> Hello {
             ("os", "macos"),
             ("drivers", "native"),
             ("drivers", "native-whole-machine"),
+            ("gpu", "1"),
+            ("gpu.kind", "native"),
+            ("gpu.cores", "80"),
+            ("gpu.metal_family", "9"),
         ],
     )
 }
@@ -173,24 +179,86 @@ async fn a_gpu_test_on_a_mac_books_the_whole_mac() {
     done(&mut beside_ops).await;
 }
 
-/// Catches a GPU asked for on macOS outside a whole-machine lease that is taken: it
-/// would wait for a GPU no Mac reports (or, if one did, share the Mac with other
-/// work). It is refused at once, saying what to add. A GPU asked for with no OS named
-/// is not a Mac's, and is booked as before (see `a_gpu_serves_one_lease_at_a_time`).
+/// Catches a GPU action lease on a Mac that cannot be placed (the Mac's GPU slot is
+/// not booked, so it is refused or waits for ever), two GPU leases that run on one Mac
+/// together (the GPU slot is not held, or is freed late), CPU-only work held back by
+/// the booked GPU (the Mac's CPU stays shared), and a GPU slot kept after its lease
+/// ends so that the queued GPU lease never runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_gpu_on_macos_outside_a_whole_machine_lease_is_refused() {
+async fn a_gpu_action_on_a_mac_books_its_one_gpu_slot() {
     let cell = support::Cell::start().await;
-    let job = Job::new("a GPU action lease", &[("OSFamily", "macos"), ("gpu", "1")]);
+    let mut mac = FakeDaemon::connect(cell.worker_addr, mac())
+        .await
+        .expect("registered");
+    let props = [("OSFamily", "darwin"), ("gpu", "1")];
+    let first = Job::new("first model test", &props);
+    let second = Job::new("second model test", &props);
+    let beside = Job::new("a small Mac action", &[("OSFamily", "darwin")]);
+    for job in [&first, &second, &beside] {
+        cell.upload(&job.blobs()).await;
+    }
+    let mut first_ops = cell.execute(&first.action).await;
+    let first_start = mac.start().await;
+    assert_eq!(first_start.kind, "action");
+    assert_eq!(
+        first_start.action_digest.as_ref(),
+        Some(&first.action.proto)
+    );
+
+    let mut second_ops = cell.execute(&second.action).await;
+    mac.no_work().await;
+
+    // The Mac's CPU is still shared: an action that asks for no GPU runs beside it.
+    let mut beside_ops = cell.execute(&beside.action).await;
+    let beside_start = mac.start().await;
+    assert_eq!(
+        beside_start.action_digest.as_ref(),
+        Some(&beside.action.proto)
+    );
+    let small = output(&cell, "ran beside", 0).await;
+    assert!(
+        mac.report(ran(beside_start.lease_id, &small))
+            .await
+            .accepted
+    );
+    done(&mut beside_ops).await;
+
+    let answered = output(&cell, "the first model answered", 0).await;
+    assert!(
+        mac.report(ran(first_start.lease_id, &answered))
+            .await
+            .accepted
+    );
+    done(&mut first_ops).await;
+    let second_start = mac.start().await;
+    assert_eq!(
+        second_start.action_digest.as_ref(),
+        Some(&second.action.proto)
+    );
+    let answered = output(&cell, "the second model answered", 0).await;
+    assert!(
+        mac.report(ran(second_start.lease_id, &answered))
+            .await
+            .accepted
+    );
+    done(&mut second_ops).await;
+}
+
+/// Catches more than a Mac's one GPU asked for on macOS taken: it would wait for ever
+/// for a node that cannot exist. It is refused at once, saying a Mac has one. A GPU
+/// asked for with no OS named is not a Mac's, and is booked as before (see
+/// `a_gpu_serves_one_lease_at_a_time`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_gpus_on_macos_are_refused() {
+    let cell = support::Cell::start().await;
+    let job = Job::new("two GPUs", &[("OSFamily", "macos"), ("gpu", "2")]);
     cell.upload(&job.blobs()).await;
     let refused = cell
         .execute_with(&job.action, false)
         .await
         .expect_err("refused");
     assert_eq!(refused.code(), tonic::Code::InvalidArgument);
-    assert!(
-        refused.message().contains("kbf-lease=whole_machine"),
-        "{refused:?}"
-    );
+    assert!(refused.message().contains("one GPU"), "{refused:?}");
 }
 
 /// A Hello for `node` with 4 CPUs, 8 GiB and an `action_slots` entry of `slots`.
@@ -209,21 +277,26 @@ fn hello_with_slots(node: &str, slots: &str) -> Hello {
 #[test]
 fn capacity_reads_the_action_slots_entry() {
     assert_eq!(
-        capacity(&hello_with_slots("m", "2")),
+        capacity(&hello_with_slots("m", "2"), HostFloor::default()),
         Ok(Resources::new(4_000, 8 * GIB).with_lease_cap(2))
     );
     assert_eq!(
-        capacity(&hello_with_slots("m", "0")),
+        capacity(&hello_with_slots("m", "0"), HostFloor::default()),
         Ok(Resources::new(4_000, 8 * GIB).with_lease_cap(0))
     );
-    assert_eq!(capacity(&hello("c", 4, 8)).unwrap().leases, None);
+    assert_eq!(
+        capacity(&hello("c", 4, 8), HostFloor::default())
+            .unwrap()
+            .leases,
+        None
+    );
     let mut twice = hello_with_slots("m", "1");
     twice.capabilities.push(Capability {
         key: "action_slots".to_owned(),
         value: "1".to_owned(),
     });
     for bad in [twice, hello_with_slots("m", "two")] {
-        let refused = capacity(&bad).expect_err("refused");
+        let refused = capacity(&bad, HostFloor::default()).expect_err("refused");
         assert!(refused.contains("action_slots"), "{refused}");
     }
 }

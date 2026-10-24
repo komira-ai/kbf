@@ -97,10 +97,10 @@ fn part<'a>(notes: &'a str, from: &str) -> &'a str {
 
 #[test]
 fn a_record_supplied_not_reversible_list_is_not_used_and_the_all_clear_opens_the_notes() {
-    // Catches (CEO ruling Q3: verify is the only source of the irreversible list): a notes
+    // Catches (ruling Q3: verify is the only source of the irreversible list): a notes
     // writer that unions in, or falls back to, the verdict's `not_reversible` lines. Proves
     // a verdict naming a line leaves the section at the all-clear when the builds agree, and
-    // that the line appears nowhere in the notes. Mutant: re-add the union in `render`.
+    // that the line appears nowhere in the notes. Catches: the union re-added in `render`.
     let notes = notes_of(&with_notes("notes-irreversible", |d| {
         d.not_reversible = vec!["drops the legacy index".to_owned()];
     }));
@@ -607,7 +607,7 @@ fn the_notes_of_the_record_verdict_write_writes_come_from_the_builds_not_its_lis
 
 #[test]
 fn notes_are_written_whatever_the_record_says() {
-    // Catches (mutant: `notes` refuses a record that failed): the notes judging the
+    // Catches (defect: `notes` refuses a record that failed): the notes judging the
     // record. A record that says it is red, a message that is not a record and a tag
     // with no message all get notes; the first states the status, the others say
     // there is no readable record. The commits and what is not reversible are the same.

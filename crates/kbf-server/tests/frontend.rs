@@ -1230,7 +1230,7 @@ async fn the_api_listener_serves_metrics_in_the_prometheus_text_format() {
 /// /v1/releases/...` on that API, so a store with nowhere to be written would be a silent
 /// no-op. Both `kbf frontend` and `kbf-server` refuse the flag without `--api-listen`.
 ///
-/// Mutant seen red: `requires = "api_listen"` dropped from the flag.
+/// Catches: `requires = "api_listen"` dropped from the flag.
 #[test]
 fn releases_dir_needs_the_operator_api() {
     let refused = frontend::command().try_get_matches_from([
@@ -1259,7 +1259,7 @@ fn releases_dir_needs_the_operator_api() {
 /// tarball put on its operator API with the token comes back through `ReleaseService.Fetch`
 /// on its worker listener, and a put without the token is refused.
 ///
-/// Mutants seen red: the router not merged in `frontend.rs`; the service not added to its
+/// Catches: the router not merged in `frontend.rs`; the service not added to its
 /// worker server.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_frontend_with_a_releases_dir_serves_the_release_store() {
@@ -1329,7 +1329,7 @@ async fn a_frontend_with_a_releases_dir_serves_the_release_store() {
 /// frontend (the main deployment mode) answers 200 with the entry that `POST` stored, its
 /// reason, and `no-store`. The state store is the one a frontend takes today (SQLite).
 ///
-/// Mutant seen red: the `verbs::routes` merge deleted from `frontend.rs` (404).
+/// Catches: the `verbs::routes` merge deleted from `frontend.rs` (404).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_frontend_serves_the_deny_list_listing() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1430,7 +1430,7 @@ async fn the_reapi_listener_serves_tls_when_given_a_certificate() {
 /// not recover and so fails the action): with an action still running on a daemon, stop
 /// is signalled, a new Execute is refused, the open stream stays open, and
 /// when the daemon finishes the client gets the result and no error; the serving future
-/// ends once the client is gone. Planted mutant: `kbf_server::serve::drain_and_stop` calling
+/// ends once the client is gone. Catches: `kbf_server::serve::drain_and_stop` calling
 /// `closer.close()` before the sleep: the serving future ends at stop and the "holds the
 /// stop" assertion goes red.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1577,7 +1577,7 @@ async fn a_listen_address_that_is_taken_is_a_refused_start_naming_it() {
 /// streams and queued operations, and `Drain::close` (the second stop signal's action).
 /// An Execute waits for a worker: the status reads one stream and one queued operation;
 /// a `POST` with the token drains (`/readyz` 503); a close ends the stream UNAVAILABLE
-/// and the serving future. Mutant: the frontend's API router given a
+/// and the serving future. Catches: the frontend's API router given a
 /// drain that is not the one its serving future drains.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
@@ -1742,7 +1742,7 @@ async fn a_frontend_without_a_state_store_has_no_storage_health() {
 /// on its `/metrics`. (The routed kind renders through the same `Remote`: its unit test
 /// is `backend_tests`.)
 ///
-/// Mutant: `Remote::render_metrics` returning `self.metrics.render()` alone.
+/// Catches: `Remote::render_metrics` returning `self.metrics.render()` alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_storage_frontend_exports_the_bytes_in_flight() {
     let node = Node::start().await;
@@ -1987,7 +1987,7 @@ async fn a_frontend_with_members_writes_where_the_map_says() {
 /// state store, so a frontend without `--api-listen`, `--api-token-file` or `--state-store`
 /// refuses the flag at parse time instead of serving routes that always answer 403 or 404.
 ///
-/// Mutant seen red: `requires_all` dropped from the flag.
+/// Catches: `requires_all` dropped from the flag.
 #[test]
 fn the_secrets_dir_needs_the_api_the_token_and_the_state_store() {
     let all = [
@@ -2037,7 +2037,7 @@ fn the_secrets_dir_needs_the_api_the_token_and_the_state_store() {
 /// without the flag the same GET answers 404 to a caller past the gate. A directory that
 /// cannot be made stops the start and names the flag.
 ///
-/// Mutants seen red: the routes not merged in `frontend.rs`; the routes merged for a frontend
+/// Catches: the routes not merged in `frontend.rs`; the routes merged for a frontend
 /// without the flag.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_frontend_with_a_secrets_dir_serves_the_object_store_routes() {

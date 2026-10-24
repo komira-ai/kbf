@@ -7,7 +7,7 @@ still does by hand. A Mac is a node only: `setup` refuses every mode but `--mode
 
 ## Layout per platform
 
-The paths are in one place, `crates/kbf-installer/src/layout.rs`. The two platforms differ in these:
+The paths are in one place, `crates/kbf-setup/src/layout.rs` (re-exported as `kbf_installer::layout`). The two platforms differ in these:
 
 | | Linux | macOS |
 |---|---|---|
@@ -75,8 +75,7 @@ restarts to ten seconds and writes to `/Library/Logs/kbf-installer/kbf-installer
 
    ```text
    sudo /usr/local/kbf-installer/bin/kbf-installer setup --mode=daemon \
-       --frontend-url=https://frontend.example.invalid:8443 --token-file=/srv/kbf/enroll.token \
-       --release-source=frontend                                   # dry run
+       --frontend-url=https://frontend.example.invalid:8443 --token-file=/srv/kbf/enroll.token   # dry run
    sudo /usr/local/kbf-installer/bin/kbf-installer --apply setup ...
    ```
 
@@ -103,12 +102,9 @@ has the flags, the dry run and the exit codes.
 
 ### The first release
 
-`setup --commit <40 hex>` fetches and verifies the first release with the installer's own fetcher,
-but only from the `url` source (`--release-source=url --release-url=https://...`). The `frontend`
-source, which the example above uses and which is the default for a node, has no address or CA key
-in `installer.toml` yet, so a fetch from it is refused and `setup --commit` stops with exit 1.
-Whether a Mac's directories and the `_kbf-fetch` account pass the fetcher's trust checks has not
-been tested. Without a working `url` source, place the first release by hand and record it: put the `kbf` binary in `/usr/local/kbf-installer/releases/<commit>/kbf` (root-owned,
+`setup` installs no release (it takes `--commit` and the flags of the release source for one more
+release, ignores them and says so). Place the first release by hand and record it: put the `kbf`
+binary in `/usr/local/kbf-installer/releases/<commit>/kbf` (root-owned,
 not writable by group or others, executable by others, a Mach-O file), then run
 
 ```text
@@ -132,7 +128,7 @@ kbf-proxy packages (package-update design, `design.md` section 12), then run `se
 - Running `kbf-mac-provision` with a profile, and everything in it that is check-only: the
   administrator account, FileVault, macOS and Xcode installs, the APFS volume for the lease users.
 - Creating the enrollment token on the frontend and putting the token file on the Mac.
-- Placing and recording the first release (above) when the host has no `url` source to fetch it from.
+- Placing and recording the first release (above).
 - Updating: a Mac takes no update order yet. `kbf-installer run` activates a release only after it
   has counted the live leases, and for a launchd job it has no lease source, so it refuses the
   order (`cannot tell whether leases are live`). Update by hand, see [updating a host](update-a-host.md).

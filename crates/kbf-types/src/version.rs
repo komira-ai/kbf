@@ -59,9 +59,10 @@ pub struct Version {
     /// that predates the field or did not know its full commit (no git checkout).
     #[serde(default)]
     pub commit_full: Option<String>,
-    /// The highest metadata-log machine version the build runs. Going from release N to
-    /// N-1 is reversible only if `meta_log(N) <= meta_log(N-1)`; `None` (a build that
-    /// predates the field) is unknown, and unknown is not reversible.
+    /// The highest metadata-log machine version the build runs. Informational from the
+    /// build that stopped raising logs on: it no longer changes with a release. Going from
+    /// release N to N-1 is reversible only if `meta_log(N) <= meta_log(N-1)`; `None` (a
+    /// build that predates the field) is unknown, and unknown is not reversible.
     #[serde(default)]
     pub meta_log: Option<u64>,
     pub min_protocol: u64,
@@ -189,7 +190,7 @@ mod tests {
     /// (unknown, not refused), and a missing required field, a field of the wrong type, one
     /// named twice, text that is not JSON and anything after the object are refused.
     ///
-    /// Mutant to plant: the `seq` field's `#[serde(default)]` dropped (an older build is
+    /// Catches: the `seq` field's `#[serde(default)]` dropped (an older build is
     /// then refused).
     #[test]
     fn the_version_object_is_read_by_its_fields() {
@@ -242,7 +243,7 @@ mod tests {
     /// `seq` was refused by every installer built before it; the next field must not be.
     /// Nested values (an object, an array) in an unknown field are skipped too.
     ///
-    /// Mutant seen red: `deny_unknown_fields` on `Version` (the extra field is then refused).
+    /// Catches: `deny_unknown_fields` on `Version` (the extra field is then refused).
     #[test]
     fn the_version_object_ignores_a_field_it_does_not_know() {
         let shape = json(COMMIT, "release");
@@ -264,7 +265,7 @@ mod tests {
     /// twice is refused (also with an unknown field present), and so is a missing required
     /// one.
     ///
-    /// Mutant to plant: a hand-written reader that keeps the last of two equal keys (the
+    /// Catches: a hand-written reader that keeps the last of two equal keys (the
     /// second `commit` then wins and the object is accepted).
     #[test]
     fn a_tolerant_version_object_still_refuses_a_repeated_or_missing_field() {
@@ -295,7 +296,7 @@ mod tests {
     /// ("could not count") is a value, not an absent field. Both real shapes parse: the one
     /// a build before `seq` printed and the one a build after prints.
     ///
-    /// Mutant to plant: the `seq` field dropped from `Version` (the value is then lost).
+    /// Catches: the `seq` field dropped from `Version` (the value is then lost).
     #[test]
     fn the_version_object_may_carry_seq() {
         let before = Version::parse(json(COMMIT, "release").as_bytes()).expect("pre-seq");
@@ -315,7 +316,7 @@ mod tests {
     /// the installer reports) not being read, a build that predates it refused instead of
     /// read as `None`, and a level that is text accepted.
     ///
-    /// Mutant to plant: the `relay` field dropped from `Version` (the value is then lost).
+    /// Catches: the `relay` field dropped from `Version` (the value is then lost).
     #[test]
     fn the_version_object_may_carry_a_relay_level() {
         let before = Version::parse(json(COMMIT, "release").as_bytes()).expect("pre-relay");
@@ -334,7 +335,7 @@ mod tests {
     /// build's commit) not being read, a build that predates it or does not know its commit
     /// refused instead of read as `None`, and a value that is not text accepted.
     ///
-    /// Mutants to plant: `#[serde(skip)]` or a misspelled `#[serde(rename = "commit_ful")]` on
+    /// Catches: `#[serde(skip)]` or a misspelled `#[serde(rename = "commit_ful")]` on
     /// the field (the value is then lost: red on the `Some(COMMIT)` line); the field typed
     /// `Option<serde_json::Value>` (the number is then accepted: red on the last assertion).
     #[test]
@@ -355,7 +356,7 @@ mod tests {
     /// is refused whatever it holds, and exactly 4 KiB of valid JSON (padded with spaces)
     /// is read.
     ///
-    /// Mutant seen red: the length check dropped.
+    /// Catches: the length check dropped.
     #[test]
     fn a_version_object_is_read_up_to_four_kib() {
         let text = json(COMMIT, "release");
@@ -373,7 +374,7 @@ mod tests {
     /// the one named) and the profile (a debug build is not a release). Each is its own
     /// refusal, and a commit shorter than 12 digits is compared whole.
     ///
-    /// Mutants seen red: the commit comparison dropped; the profile comparison dropped.
+    /// Catches: the commit comparison dropped; the profile comparison dropped.
     #[test]
     fn a_version_must_name_the_commit_and_be_a_release_build() {
         let release = Version::parse(json(COMMIT, "release").as_bytes()).expect("parses");

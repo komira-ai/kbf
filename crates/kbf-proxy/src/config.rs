@@ -2,7 +2,13 @@
 //!
 //! [`ProxyConfig`] is read once at start (SIGHUP reloads the certificate files only, not
 //! this table). Unknown keys are refused, so a typo is an error at start, not a default.
+//!
+//! The children are given one of two ways, never both. The `upstream` table is slot mode: two
+//! slots, A and B, that a supervisor starts and swaps between. `[[frontend]]` tables are pool
+//! mode: any number of frontends that run on their own, which the proxy balances over and
+//! drains one at a time (`admin_listen` is where the drain is asked for).
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -49,6 +55,10 @@ pub const ADMIN_OFFSET: u16 = 3;
 pub const MAX_BASE_PORT: u16 = u16::MAX - SLOT_STRIDE - 4;
 
 impl UpstreamTable {
+    /// The table of a config that has none (pool mode): port 0. Only slot-mode code reads a
+    /// table, and it does not run in pool mode.
+    pub const POOL_MODE: Self = Self { base_port: 0 };
+
     const fn base(self, slot: Slot) -> u16 {
         match slot {
             Slot::A => self.base_port,
@@ -67,6 +77,42 @@ impl UpstreamTable {
     pub const fn admin_port(self, slot: Slot) -> u16 {
         self.base(slot) + ADMIN_OFFSET
     }
+}
+
+/// One `[[frontend]]` table of pool mode: a frontend that runs on its own, which the proxy
+/// balances over. Its listeners are at the offsets of [`UpstreamTable`] from `base_port`
+/// (REAPI 0, worker 1, operator 2, admin calls 3, enrollment 4), on loopback.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Frontend {
+    /// What the admin API drains it by and the metrics label it with: 1 to
+    /// [`MAX_NAME_BYTES`] of letters, digits, `-` and `_`; unique in the table.
+    pub name: String,
+    /// The first of its [`FRONTEND_SPAN`] ports (1024 to [`MAX_FRONTEND_PORT`]).
+    pub base_port: u16,
+}
+
+impl Frontend {
+    /// Whether `port` is one of its [`FRONTEND_SPAN`] ports (a `base_port` in range, which the
+    /// table check has settled).
+    fn owns(&self, port: u16) -> bool {
+        let last = self.base_port + (FRONTEND_SPAN - 1);
+        (self.base_port..=last).contains(&port)
+    }
+}
+
+/// The ports a frontend uses from its `base_port` up: REAPI, worker, operator, admin calls and
+/// enrollment. The base ports of two frontends are at least this far apart.
+pub const FRONTEND_SPAN: u16 = 5;
+/// The largest frontend `base_port`: its highest offset (enrollment, 4) must still be a port.
+pub const MAX_FRONTEND_PORT: u16 = u16::MAX - (FRONTEND_SPAN - 1);
+/// The longest frontend name, in bytes.
+pub const MAX_NAME_BYTES: usize = 64;
+
+/// Whether `name` is a frontend name: it goes into a URL path and a metrics label unescaped.
+fn name_is_plain(name: &str) -> bool {
+    let plain = |b: u8| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_');
+    (1..=MAX_NAME_BYTES).contains(&name.len()) & name.bytes().all(plain)
 }
 
 /// Pre-stream and keepalive limits (design section 3). Every field has a default.
@@ -151,8 +197,22 @@ pub struct ServerCert {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
-    /// The children's ports.
-    pub upstream: UpstreamTable,
+    /// The children's ports in slot mode: the supervisor starts two children, A and B, on
+    /// them and swaps between them. Give this table or `[[frontend]]`, not both.
+    #[serde(default)]
+    pub upstream: Option<UpstreamTable>,
+    /// Pool mode: the frontends that run on their own, which the proxy balances over (the
+    /// least busy that is ready takes the next stream) and drains one at a time. Names are
+    /// unique and base ports at least [`FRONTEND_SPAN`] apart. No child is started, no swap
+    /// is held. Give these tables or `upstream`, not both.
+    #[serde(default)]
+    pub frontend: Vec<Frontend>,
+    /// Pool mode: where the admin API listens, plain HTTP on a loopback address with a port
+    /// (`host:port`). It lists the frontends and drains or undrains one (`pool_admin`). Unset,
+    /// there is no admin API. Refused in slot mode, for an address that is not loopback
+    /// (nothing on this socket asks for a credential) and for a port of a frontend.
+    #[serde(default, deserialize_with = "admin_address")]
+    pub admin_listen: Option<SocketAddr>,
     /// The public address, as `host:port`. The proxy does not read it: it takes the socket
     /// `kbf-proxy.socket` hands it. `kbf-installer setup` turns it into the socket's drop-in
     /// (`ListenStream=`); unset, the socket keeps the port the package ships.
@@ -215,14 +275,30 @@ const fn default_ui() -> bool {
 fn listen_address<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<SocketAddr>, D::Error> {
-    use serde::de::Error;
     const WHY: &str = "listen: must be a socket address, host:port with a port from 1 to 65535 (an IPv6 host in brackets)";
+    socket_address(deserializer, WHY)
+}
+
+/// Reads `admin_listen` the way `listen` is read, naming its own key.
+fn admin_address<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<SocketAddr>, D::Error> {
+    const WHY: &str = "admin_listen: must be a socket address, host:port with a port from 1 to 65535 (an IPv6 host in brackets)";
+    socket_address(deserializer, WHY)
+}
+
+/// A socket address with a port, or the refusal `why`.
+fn socket_address<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+    why: &'static str,
+) -> Result<Option<SocketAddr>, D::Error> {
+    use serde::de::Error;
     match toml::Value::deserialize(deserializer)? {
         toml::Value::String(text) => match text.parse::<SocketAddr>() {
             Ok(addr) if addr.port() != 0 => Ok(Some(addr)),
-            _ => Err(D::Error::custom(WHY)),
+            _ => Err(D::Error::custom(why)),
         },
-        _ => Err(D::Error::custom(WHY)),
+        _ => Err(D::Error::custom(why)),
     }
 }
 
@@ -243,6 +319,12 @@ impl ProxyConfig {
     #[must_use]
     pub const fn frontend_hold(&self) -> Duration {
         Duration::from_secs(self.hold_max_s)
+    }
+
+    /// The slot-mode table: [`UpstreamTable::POOL_MODE`] in pool mode, where nothing reads it.
+    #[must_use]
+    pub fn slot_table(&self) -> UpstreamTable {
+        self.upstream.unwrap_or(UpstreamTable::POOL_MODE)
     }
 
     /// Reads and checks a `[proxy]` table (the text of the table's body).
@@ -334,11 +416,7 @@ impl ProxyConfig {
         }
         SniCerts::check_entries(&self.cert_entries())
             .map_err(|e| ConfigError::ServerCerts(e.to_string()))?;
-        if !(1024..=MAX_BASE_PORT).contains(&self.upstream.base_port) {
-            return Err(ConfigError::Invalid(
-                "upstream.base_port must be 1024 to 65521 so both slots fit",
-            ));
-        }
+        self.check_children()?;
         if self.buck2_auth == Buck2Auth::Bearer && self.buck2_token_file.is_none() {
             return Err(ConfigError::Invalid(
                 "buck2_auth = \"bearer\" needs buck2_token_file",
@@ -366,7 +444,80 @@ impl ProxyConfig {
         }
         Ok(())
     }
+
+    /// The rules about the children: exactly one of slot mode (`upstream`) and pool mode
+    /// (`[[frontend]]`), the rules of the one given, and `admin_listen` for pool mode only.
+    fn check_children(&self) -> Result<(), ConfigError> {
+        match (self.upstream, self.frontend.is_empty()) {
+            (Some(_), false) => Err(ConfigError::Invalid(
+                "give upstream or [[frontend]], not both",
+            )),
+            (None, true) => Err(ConfigError::Invalid(
+                "the children are needed: an upstream table, or [[frontend]] tables",
+            )),
+            (Some(upstream), true) => {
+                if !(1024..=MAX_BASE_PORT).contains(&upstream.base_port) {
+                    return Err(ConfigError::Invalid(
+                        "upstream.base_port must be 1024 to 65521 so both slots fit",
+                    ));
+                }
+                match self.admin_listen {
+                    Some(_) => Err(ConfigError::Invalid(
+                        "admin_listen is for pool mode: give [[frontend]] tables",
+                    )),
+                    None => Ok(()),
+                }
+            }
+            (None, false) => self.check_frontends(),
+        }
+    }
+
+    /// The rules of pool mode: plain unique names, base ports that leave each frontend its
+    /// [`FRONTEND_SPAN`] ports, and an `admin_listen` on loopback and on none of those ports.
+    fn check_frontends(&self) -> Result<(), ConfigError> {
+        let mut names = BTreeSet::new();
+        for frontend in &self.frontend {
+            if !name_is_plain(&frontend.name) {
+                return Err(ConfigError::Invalid(
+                    "frontend.name must be 1 to 64 letters, digits, '-' or '_'",
+                ));
+            }
+            if !names.insert(frontend.name.as_str()) {
+                return Err(ConfigError::Invalid("frontend names must be unique"));
+            }
+            if !(1024..=MAX_FRONTEND_PORT).contains(&frontend.base_port) {
+                return Err(ConfigError::Invalid(
+                    "frontend.base_port must be 1024 to 65531 so its five ports fit",
+                ));
+            }
+        }
+        let mut bases: Vec<u16> = self.frontend.iter().map(|f| f.base_port).collect();
+        bases.sort_unstable();
+        let apart = |pair: &[u16]| pair[1] - pair[0] >= FRONTEND_SPAN;
+        if !bases.windows(2).all(apart) {
+            return Err(ConfigError::Invalid(
+                "frontend base ports must be at least 5 apart so their ports do not overlap",
+            ));
+        }
+        let loopback = |admin: SocketAddr| admin.ip().is_loopback();
+        if !self.admin_listen.is_none_or(loopback) {
+            return Err(ConfigError::Invalid(
+                "admin_listen must be a loopback address: it asks for no credential",
+            ));
+        }
+        let overlaps = |admin: SocketAddr| self.frontend.iter().any(|f| f.owns(admin.port()));
+        if self.admin_listen.is_some_and(overlaps) {
+            return Err(ConfigError::Invalid(
+                "admin_listen must not use a port of a frontend (base_port to base_port + 4)",
+            ));
+        }
+        Ok(())
+    }
 }
+
+#[cfg(test)]
+#[path = "config_pool_tests.rs"]
+mod pool_tests;
 
 #[cfg(test)]
 mod tests {
@@ -614,7 +765,7 @@ key_file = "/etc/kbf/tls/worker.key"
         let ports: Vec<u16> = Slot::ALL
             .into_iter()
             .flat_map(|slot| {
-                let t = config.upstream;
+                let t = config.slot_table();
                 [
                     Target::Reapi,
                     Target::Worker,

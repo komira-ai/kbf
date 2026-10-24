@@ -81,8 +81,8 @@ fn finish_pass(cache: &Cache, gates: &Gates, pass: crate::support::cache_kit::Ho
 }
 
 /// R-2. Catches a cache that does not survive a restart (the "wipe `v1/` at start"
-/// mutant), a clean stop that saves no snapshot (the "skip the snapshot at a clean
-/// stop" mutant: the post-pass one is never written in run 1 either), and a start that
+/// defect), a clean stop that saves no snapshot (the "skip the snapshot at a clean
+/// stop" defect: the post-pass one is never written in run 1 either), and a start that
 /// ignores the snapshot (whose fills would adopt the files: no bytes either, so the
 /// misses tell). The first lease of run 2, with the pass held, fetches nothing, every
 /// file is a hit from the loaded index, and each entry is re-hashed once; a second
@@ -128,7 +128,7 @@ async fn a_restart_serves_from_the_loaded_index_and_re_hashes_each_entry_once() 
 }
 
 /// R-3. Catches an entry changed while the daemon was down being served (the "mark
-/// every entry verified at load" mutant): one byte flipped, with the size, mode and
+/// every entry verified at load" defect): one byte flipped, with the size, mode and
 /// mtime restored. Its first use after the restart re-hashes it, evicts it and fetches
 /// it again, and counts one verify failure.
 #[tokio::test]
@@ -193,8 +193,8 @@ async fn lru_run(dir: &Path, cas: &CountingCas) -> Vec<Key> {
 }
 
 /// R-4. Catches a size limit enforced only on insert (the "skip the at-load eviction"
-/// mutant), and recency lost across a restart (the "write insert time instead of last
-/// use" and "update last use only on insert" mutants): run 2, with a budget of three
+/// defect), and recency lost across a restart (the "write insert time instead of last
+/// use" and "update last use only on insert" defects): run 2, with a budget of three
 /// entries and no lease, drains exactly K3, K1 and K5, the least recently used in run
 /// 1's order, after loading run 1's last uses.
 #[tokio::test]
@@ -223,7 +223,7 @@ async fn the_drain_at_start_removes_the_least_recently_used() {
 }
 
 /// R-4, run 2b. Catches a drain that removes keys from the index outside their slots
-/// (the "remove every drained key first, then unlink each under its slot" mutant): the
+/// (the "remove every drained key first, then unlink each under its slot" defect): the
 /// drain is held inside K1's slot (removed from the index, not yet unlinked), K3 is
 /// already drained, K5 not reached. A lease needing K3, K1 and K5 refetches K3, waits
 /// on K1's slot and refetches it once the drain lets go, and hits K5, which its pin
@@ -313,9 +313,9 @@ async fn filled(dir: &Path, cas: &CountingCas, count: usize) -> kbf_proto::reapi
 }
 
 /// R-6. Catches trusting a snapshot that fails its CRC (the "skip the CRC check"
-/// mutant), a bad snapshot stopping the start or the cache (the "refuse to start" and
-/// "disable the cache" mutants), and a pass that deletes what the index does not list
-/// (the "make the pass unlink unknown files" mutant). One byte of one entry's last use
+/// defect), a bad snapshot stopping the start or the cache (the "refuse to start" and
+/// "disable the cache" defects), and a pass that deletes what the index does not list
+/// (the "make the pass unlink unknown files" defect). One byte of one entry's last use
 /// is flipped: the run starts empty, its lease's keys are adopted by their fills with
 /// nothing fetched, and one pass indexes every file, unlinking none.
 #[tokio::test]
@@ -381,9 +381,9 @@ async fn a_snapshot_of_another_version_is_discarded_and_the_budget_holds_after_t
 }
 
 /// R-7. Catches a short or padded snapshot read as entries (the "read entries until EOF
-/// without the length check" mutant), a short read that crashes the start (the "unwrap
-/// the short read" mutant), and a key counted twice (the "skip the duplicate-key check"
-/// mutant). Each malformed snapshot is discarded as corrupt, the run starts with a
+/// without the length check" defect), a short read that crashes the start (the "unwrap
+/// the short read" defect), and a key counted twice (the "skip the duplicate-key check"
+/// defect). Each malformed snapshot is discarded as corrupt, the run starts with a
 /// total of 0, and the pass adopts every file once. The count and duplicate forgeries
 /// carry a valid CRC.
 #[tokio::test]
@@ -439,7 +439,7 @@ async fn malformed_snapshots_are_discarded() {
 }
 
 /// R-8. Catches an indexed file that is gone failing a lease, and drift never
-/// corrected (the "make the pass only adopt" mutant): two entries deleted while the
+/// corrected (the "make the pass only adopt" defect): two entries deleted while the
 /// daemon is stopped; a lease needing one fetches it again, and one pass drops the
 /// other.
 #[tokio::test]
@@ -483,7 +483,7 @@ async fn entries_deleted_while_stopped_are_refetched_or_dropped() {
 }
 
 /// R-9 (b). Catches the pass dropping an entry on a stale listing (the "drop an entry
-/// without the `fstatat`" mutant): the pass lists K's directory, a fill then inserts
+/// without the `fstatat`" defect): the pass lists K's directory, a fill then inserts
 /// K, and the pass, comparing, keeps it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_pass_keeps_an_entry_inserted_after_its_listing() {
@@ -527,7 +527,7 @@ async fn the_pass_keeps_an_entry_inserted_after_its_listing() {
 }
 
 /// R-9 (c). Catches the pass adopting on its listing's view (the "adopt without
-/// re-checking the index under the slot" mutant): K is on disk and not indexed; the
+/// re-checking the index under the slot" defect): K is on disk and not indexed; the
 /// pass compares and is held before it takes K's slot; a fill adopts K meanwhile; the
 /// pass then finds K indexed and leaves it, so K is adopted and counted once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -572,7 +572,7 @@ async fn the_pass_re_checks_the_index_under_the_slot() {
 }
 
 /// R-9, the pass's side of a held slot. Catches the adopt pass changing a key whose
-/// slot someone holds (the "drop the held-slot check" mutant): the evictor is held
+/// slot someone holds (the "drop the held-slot check" defect): the evictor is held
 /// between removing K from the index and unlinking it, so K's file is on disk and not
 /// indexed; a pass meanwhile leaves K alone, the evictor unlinks it, and K is neither
 /// indexed nor counted.
@@ -625,7 +625,7 @@ async fn the_pass_leaves_a_key_whose_slot_is_held() {
 /// uncached). The child here is held before exec until the reopen has been made, so the
 /// interleaving is the failing one every time.
 ///
-/// Mutant: the `Drop` of `DirLock` removed.
+/// Catches: the `Drop` of `DirLock` removed.
 #[test]
 fn a_child_forked_while_the_cache_was_open_does_not_keep_the_directory_locked() {
     let dir = scratch("cache-forked-lock");

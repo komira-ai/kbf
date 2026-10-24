@@ -93,7 +93,7 @@
 //!   ([`child_real::ProcChild::recorded`]), and [`supervisor::adopt_children`] reads it;
 //!   [`Swap::adopt`] reads `update.json` alone.
 //! - **confirm** is sent once the bake passes and is idempotent at the root half, because
-//!   a restart between the confirm and the `nodes` record sends it again.
+//!   a restart between the confirm and the `draining` record sends it again.
 //! - **abort** ends an update as `failed` with step `abort`, not `rolled_back`; so does an
 //!   abort that arrives while the old child quiesces (it is `abort`, not `switch`).
 //! - **Compatibility gate (R1, R4)** is not here: [`model::StagedFacts`] is carried and
@@ -105,15 +105,13 @@
 //!   its own), so a restart finishes it, or puts the new child back if it never landed.
 //!   The new child served: it is never killed, only drained and sent SIGTERM.
 //! - **Confirm** is sent up to `Timing::confirm_attempts` times with a doubling wait. If
-//!   it never lands, the new child keeps serving, the staged release is kept, the nodes
-//!   are not sent, the old child is drained and retired, and the update ends `failed`
-//!   with `failure.step == confirm`. After the switch no failure drops the staged release.
-//! - **Nodes** (step 9): the order for the nodes is posted again, one `Timing::poll` apart,
-//!   while the new child gives no answer, for `Timing::desired_within`. A child that answers
-//!   and refuses it (a 4xx, or a 409 with a code such as `not_own`) and one that never answers
-//!   end the update `failed` with `failure.step == nodes` (`failure.reason` is the child's code
-//!   and words, or `timeout`). The frontend was swapped and keeps serving, and the old child is
-//!   still drained and retired. The order names the update's source when it is not a fetch.
+//!   it never lands, the new child keeps serving, the staged release is kept, the old child
+//!   is drained and retired, and the update ends `failed` with `failure.step == confirm`.
+//!   After the switch no failure drops the staged release.
+//! - **Nodes**: the swap sends the new child no desired release; it goes from the bake to the
+//!   drain. The `nodes` phase and step stay in [`model::Phase`] and [`model::Step`] so that an
+//!   `update.json` an earlier build wrote still reads, and a restart that finds that phase goes
+//!   on to the drain.
 //! - **All-in-one stop**: after `quiesce`, the proxy sends SIGTERM to the old process
 //!   ([`aio`]).
 //! - A dead new child during the bake (the proxy running) leaves the update parked in

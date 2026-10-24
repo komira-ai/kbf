@@ -2,12 +2,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::{
-    APT_GET, DPKG_QUERY, KBF, RUNNING_BUILD_TIMEOUT_SECS, SYSTEMCTL, SYSTEMD_RUN, UNIT_ENV,
-    apt_install, apt_update, installed_version, running_build, unit_install, unit_name,
-    units_running,
+    ACTIVE_WAIT, APT_GET, DPKG_QUERY, KBF, RUNNING_BUILD_TIMEOUT_SECS, SYSTEMCTL, SYSTEMD_RUN,
+    UNIT_ENV, Wait, apt_install, apt_update, installed_version, restart_unit, running_build,
+    unit_active, unit_install, unit_name, units_running,
 };
 use crate::config::ChannelSource;
-use crate::request::{Channel, Version};
+use crate::request::{Channel, Unit, Version};
 use crate::runner::Cmd;
 
 const SELF_EXE: &str = "/usr/libexec/kbf/kbf-host-install";
@@ -35,6 +35,10 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|a| (*a).to_owned()).collect()
 }
 
+fn frontend(name: &str) -> Unit {
+    Unit::frontend(name).unwrap()
+}
+
 /// Every command a plan builds, for the scans below.
 fn every_command() -> Vec<Cmd> {
     let v = version("1.2.3-1");
@@ -45,7 +49,64 @@ fn every_command() -> Vec<Cmd> {
         apt_update(&source()),
         apt_install(&source(), &v),
         unit(v.as_str()),
+        restart_unit(&frontend("-")),
+        restart_unit(&frontend("a1")),
+        unit_active(&frontend("-")),
+        unit_active(&frontend("a1")),
     ]
+}
+
+/// Asserts that a restart is `systemctl restart -- <unit>` with a time limit, for the plain
+/// frontend unit and for an instance, and that the unit is the only argument that varies.
+#[test]
+fn the_restart_argv() {
+    for (name, want) in [
+        ("-", "kbf-frontend.service"),
+        ("a1", "kbf-frontend@a1.service"),
+    ] {
+        assert_eq!(
+            restart_unit(&frontend(name)),
+            Cmd {
+                program: SYSTEMCTL.into(),
+                args: strings(&["restart", "--", want]),
+                timeout: Some(Duration::from_secs(120)),
+                ..Cmd::default()
+            }
+        );
+    }
+}
+
+/// Asserts that the look at whether a unit is active is `systemctl is-active -- <unit>` with
+/// a time limit shorter than the restart's, for the plain frontend unit and for an instance.
+#[test]
+fn the_is_active_argv() {
+    for (name, want) in [
+        ("-", "kbf-frontend.service"),
+        ("a1", "kbf-frontend@a1.service"),
+    ] {
+        assert_eq!(
+            unit_active(&frontend(name)),
+            Cmd {
+                program: SYSTEMCTL.into(),
+                args: strings(&["is-active", "--", want]),
+                timeout: Some(Duration::from_secs(10)),
+                ..Cmd::default()
+            }
+        );
+    }
+}
+
+/// Asserts that a real restart waits two minutes for the unit to be active and looks every
+/// half second.
+#[test]
+fn the_wait_of_a_real_restart() {
+    assert_eq!(
+        ACTIVE_WAIT,
+        Wait {
+            timeout: Duration::from_secs(120),
+            interval: Duration::from_millis(500),
+        }
+    );
 }
 
 /// The exact vector of the update step: `apt-get update` of the one source, with the other
@@ -135,7 +196,7 @@ fn the_query_commands() {
                 "--showformat=${db:Status-Abbrev} ${Version}\\n",
                 "kbf"
             ]),
-            timeout: None,
+            ..Cmd::default()
         }
     );
     // The binary runs as root and may hang: it gets a limit; nothing else here does.
@@ -145,6 +206,7 @@ fn the_query_commands() {
             program: KBF.into(),
             args: strings(&["--version", "--json"]),
             timeout: Some(Duration::from_secs(10)),
+            ..Cmd::default()
         }
     );
     assert_eq!(RUNNING_BUILD_TIMEOUT_SECS, 10);
@@ -164,7 +226,7 @@ fn the_query_commands() {
                 "--",
                 "kbf-host-install-*"
             ]),
-            timeout: None,
+            ..Cmd::default()
         }
     );
 }

@@ -148,6 +148,20 @@ pub enum ErrorCode {
     HealthTimeout,
     /// The host's swap was abandoned.
     SwapAbandoned,
+    /// A daemon host is not the node the inventory lists for it, or lists none; nothing was
+    /// drained.
+    NodeIdentity,
+    /// The frontend could not drain the host's node, or did not answer; the node may be left
+    /// drained.
+    DrainFailed,
+    /// The host runs the target, but the frontend could not return its node to placement; the
+    /// node is left drained.
+    UndrainFailed,
+    /// A frontend member refused or failed its retire, or did not end its streams; it is left
+    /// drained.
+    RetireFailed,
+    /// The host could not restart a frontend member's unit; the member is left drained.
+    RestartFailed,
 }
 
 impl ErrorCode {
@@ -169,7 +183,12 @@ impl ErrorCode {
             | ErrorCode::SafeToStopUnavailable
             | ErrorCode::InstallFailed
             | ErrorCode::HealthTimeout
-            | ErrorCode::SwapAbandoned => 500,
+            | ErrorCode::SwapAbandoned
+            | ErrorCode::NodeIdentity
+            | ErrorCode::DrainFailed
+            | ErrorCode::UndrainFailed
+            | ErrorCode::RetireFailed
+            | ErrorCode::RestartFailed => 500,
         }
     }
 }
@@ -224,6 +243,11 @@ impl RollState {
 }
 
 /// Where one host is in its turn.
+///
+/// The last four phases are a frontend pool member's (see [`crate::inventory::Member`]): the
+/// turn goes `pending`, `draining`, `retiring`, `installing`, `restarting`, `waiting_healthy`,
+/// `undraining`, `done`. They were added to the set after the others, and a record written
+/// before them holds none of them and reads as it did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
@@ -233,6 +257,14 @@ pub enum Phase {
     WaitingHealthy,
     Done,
     Failed,
+    /// A member is out of the proxy's pool and its open streams are waited for.
+    Draining,
+    /// The member's frontend is retiring: it hands its work to the other frontends.
+    Retiring,
+    /// The member's unit is restarted on the new package.
+    Restarting,
+    /// The member runs the target and is ready; it is being put back in the pool.
+    Undraining,
 }
 
 /// One host of a roll.
@@ -386,6 +418,11 @@ mod tests {
             (ErrorCode::InstallFailed, "install_failed", 500),
             (ErrorCode::HealthTimeout, "health_timeout", 500),
             (ErrorCode::SwapAbandoned, "swap_abandoned", 500),
+            (ErrorCode::NodeIdentity, "node_identity", 500),
+            (ErrorCode::DrainFailed, "drain_failed", 500),
+            (ErrorCode::UndrainFailed, "undrain_failed", 500),
+            (ErrorCode::RetireFailed, "retire_failed", 500),
+            (ErrorCode::RestartFailed, "restart_failed", 500),
         ];
         for (c, name, status) in all {
             assert_eq!(

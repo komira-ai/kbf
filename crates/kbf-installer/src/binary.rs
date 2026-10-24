@@ -111,8 +111,8 @@ impl BinaryKind {
 // store reads its version facts with too.
 pub use kbf_types::{VERSION_CAP, Version};
 
-/// The `relay` a `kbf` must declare for a host to take `release_source = "bundled"`: without
-/// it the frontend is never told that the host fetches nothing, and would order a fetch the
+/// The `relay` a `kbf` must declare for a host with `release_source = "bundled"` to go back to
+/// it (`rollback`): without it the frontend is never told that the host fetches nothing, and would order a fetch the
 /// installer can only refuse. Raised when `kbf` relays more of what the installer says.
 pub const RELAY_NEEDED: u64 = 1;
 

@@ -80,7 +80,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::http::header::CONTENT_TYPE;
@@ -118,6 +118,7 @@ use crate::listen::{Binder, Socket};
 use crate::members::{Handoff, Members};
 use crate::object_store::delivery::{Delivery, RegistrySource, Reports};
 use crate::proxy_auth::ProxyAuthLayer;
+use crate::retire::Retire;
 use crate::serve::{
     AbortOnDrop, ServeError, cold_store, drain_and_stop, flow_control, keepalive, log_state,
     map_of, members_of, membership, serve_api, stop_api, sweeping, worker_peers,
@@ -157,6 +158,8 @@ pub const ALLOWED: &[&str] = &[
     "unservable_wait_secs",
     "default_platform",
     "memory_ladder_gib",
+    "vm_host_floor_cpus",
+    "vm_host_floor_mem_gib",
     "learned_sizes",
     "finished_retention_secs",
     "shutdown_timeout_secs",
@@ -1119,24 +1122,21 @@ impl<'a> Prepared<'a> {
             }
             None => (None, futures::future::pending().boxed(), None, None),
         };
-        let update_rows = state_store.clone().map(crate::update::Rows::new);
         let object_stores = flags
             .object_store_secrets_dir
             .as_deref()
             .map(|dir| open_object_stores(dir, state_store.clone().zip(members.clone())))
             .transpose()?;
         let delivery = object_stores.as_ref().map(|stores| stores.delivery.clone());
-        let offers = crate::release::offers::offers_of(
-            releases.clone(),
-            update_rows.clone(),
-            listeners.tick,
-        );
+        // Set below, where the stand is built, if there is a state store to retire over.
+        let retire = Arc::new(OnceLock::new());
         let api_routes = crate::api::router(
             Arc::clone(&farm),
             token.clone(),
             Arc::clone(&drain),
+            Arc::clone(&retire),
             members.clone(),
-            update_rows.clone(),
+            state_store.clone(),
             enroll_api,
         )
         .merge(crate::verbs::routes(token.clone(), members.clone()))
@@ -1144,12 +1144,6 @@ impl<'a> Prepared<'a> {
         .merge(crate::object_store::api::routes(
             token.clone(),
             object_stores.map(|stores| stores.api),
-        ))
-        .merge(crate::release::desired::router(
-            releases.clone(),
-            update_rows,
-            token,
-            Arc::clone(&farm),
         ))
         .merge(crate::health::routes(&checks, &farm, members.as_ref()))
         .merge(metrics_route(
@@ -1176,12 +1170,10 @@ impl<'a> Prepared<'a> {
             peers,
             listeners.heartbeat_interval,
             listeners.hello_wait,
-        );
+        )
+        .with_host_floor(listeners.vm_host_floor);
         // Daemons are sent the members' map: Welcome.map and a MapUpdate at each bump.
         let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
-        let sessions = offers
-            .into_iter()
-            .fold(sessions, WorkerService::with_offers);
         let worker_service = WorkerServer::new(sessions)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -1252,6 +1244,8 @@ impl<'a> Prepared<'a> {
                 .as_ref()
                 .map_or(crate::managed::QUIESCE_WAIT, |handover| handover.quiesce),
         });
+        // Set once, here: nothing has called the retire route before the listeners serve.
+        let _ = stand.clone().map(|stand| retire.set(Retire::new(stand)));
         let holder = flags
             .handover
             .as_ref()
@@ -1319,6 +1313,8 @@ impl<'a> Prepared<'a> {
                     farm.tick().await;
                 }
             };
+            // What the other frontends of a shared state store did (`Farm::intake`).
+            let intaking = farm.poll_intake();
             let stopping = async {
                 shutdown.await;
                 drain_and_stop(&stopper, listeners.shutdown_timeout).await;
@@ -1337,6 +1333,7 @@ impl<'a> Prepared<'a> {
                 Err(e) = &mut api_serve => Err(ServeError::Api(e)),
                 Err(e) = &mut enroll_serve => Err(ServeError::from(e)),
                 () = ticking => Ok(()),
+                () = intaking => Ok(()),
                 () = ticker.run() => Ok(()),
                 () = stopping => Ok(()),
                 Ok(departure) = departed => departure.map_err(ServeError::Handover),

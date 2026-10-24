@@ -37,6 +37,11 @@ const OWN_PREFIX: &str = "kbf_proxy_";
 /// The child's `/metrics` body without the proxy's series and `# EOF`, or nothing (counted
 /// as a failure).
 pub(crate) async fn fetch(core: &Core, authorization: Option<HeaderValue>) -> Option<String> {
+    // Pool mode has no one active child to ask, and that is not a failure to count: each
+    // member's own series are the proxy's (`crate::upstreams::Upstreams::render`).
+    if core.upstreams.is_some() {
+        return None;
+    }
     let body = tokio::time::timeout(DEADLINE, ask(core, authorization))
         .await
         .ok()

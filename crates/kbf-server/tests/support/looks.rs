@@ -9,9 +9,10 @@
 //! at once, as the server starts (the first tick of an interval is immediate), and then a
 //! long way off:
 //!
-//! - the offers' poll, with a release store and a state store, every tick: `update/desired`;
 //! - the membership sweeper, every beat (a third of the member ttl): `map`, `member/` and
 //!   last `deny/`.
+//!
+//! The server reads `update/desired` by itself no more: only a handler does.
 //!
 //! A test waits for these ([`Looks::done`]) before it arms an injection, and holds the
 //! numbers it waits for with a test of its own that the server reads nothing more.
@@ -24,10 +25,8 @@ use std::time::Duration;
 
 use crate::hooked::Hooked;
 
-/// The counts of the reads of `update/desired` and of `deny/`: the last read of the
-/// offers' poll is one of `update/desired`, and the last of the sweeper's refresh is
-/// the one of `deny/`. How many of the first a start makes depends on the setup (a release
-/// offered before the start, a release store for the poll), so each test names its number.
+/// The counts of the reads of `update/desired` and of `deny/`: the last of the sweeper's
+/// refresh is the one of `deny/`. A test names the numbers it waits for.
 pub struct Looks {
     desired: Arc<AtomicUsize>,
     deny: Arc<AtomicUsize>,

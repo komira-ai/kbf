@@ -13,11 +13,12 @@
 //!   `subject-path` exactly `dist/<tarball>` (not a glob or a list, which would make
 //!   one bundle for several tarballs). A step for a tarball no job of that group
 //!   packages is named too.
-//! - **The installer's package.** The `kbf-installer` deb that `cargo xtask pkg-asset`
-//!   lists as an asset ([`attested_assets::packaged_debs`]) and the Mac `.pkg` that
+//! - **The packages.** The `kbf-installer` deb that `cargo xtask pkg-asset` lists as an
+//!   asset ([`attested_assets::packaged_debs`]), the `kbf` deb that `cargo xtask
+//!   pkg-kbf-asset` lists ([`attested_assets::packaged_kbf_debs`]) and the Mac `.pkg` that
 //!   `cargo xtask pkg-macos-asset` lists ([`attested_assets::packaged_macos_pkgs`]) are
-//!   held to the same two rules, as `dist/kbf-installer-<commit>-<platform>.deb` (`.pkg`)
-//!   and its `.deb.sigstore.json` (`.pkg.sigstore.json`).
+//!   held to the same two rules, as `dist/kbf-installer-<commit>-<platform>.deb` (`.pkg`),
+//!   `dist/kbf-<commit>-<platform>.deb` and their `.deb.sigstore.json` (`.pkg.sigstore.json`).
 //! - **Its bundle's name.** The step after it sets `BUNDLE` to that step's
 //!   `bundle-path` output and copies it to `dist/<tarball>.sigstore.json` (the action
 //!   leaves it in a temporary directory under a name that is the same for every
@@ -96,21 +97,22 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
     if packaged.is_empty() {
         return Err("no `cargo xtask package` line in any `run:` step".to_owned());
     }
-    // The installer packages: (platform, extension), the deb of a Linux job and the `.pkg`
-    // of the macOS one.
-    let packages: Vec<(String, &str)> = attested_assets::packaged_debs(artifacts)?
-        .into_iter()
-        .map(|p| (p, "deb"))
-        .chain(
-            attested_assets::packaged_macos_pkgs(artifacts)?
-                .into_iter()
-                .map(|p| (p, "pkg")),
-        )
-        .collect();
+    // The packages: (binary, platform, extension), the installer's deb and the `kbf` deb of a
+    // Linux job and the installer's `.pkg` of the macOS one.
+    let mut packages: Vec<(&str, String, &str)> = Vec::new();
+    for platform in attested_assets::packaged_debs(artifacts)? {
+        packages.push(("kbf-installer", platform, "deb"));
+    }
+    for platform in attested_assets::packaged_kbf_debs(artifacts)? {
+        packages.push(("kbf", platform, "deb"));
+    }
+    for platform in attested_assets::packaged_macos_pkgs(artifacts)? {
+        packages.push(("kbf-installer", platform, "pkg"));
+    }
     let groups: BTreeSet<&str> = packaged
         .iter()
         .map(|(_, p)| group(p))
-        .chain(packages.iter().map(|(p, _)| group(p)))
+        .chain(packages.iter().map(|(_, p, _)| group(p)))
         .collect();
     let mut out = Vec::new();
     for g in &groups {
@@ -126,10 +128,10 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
             .filter(|(_, p)| group(p) == *g)
             .map(|(n, p)| (n.as_str(), p.as_str()))
             .collect();
-        let my_packages: Vec<(&str, &str)> = packages
+        let my_packages: Vec<(&str, &str, &str)> = packages
             .iter()
-            .filter(|(p, _)| group(p) == *g)
-            .map(|(p, ext)| (p.as_str(), *ext))
+            .filter(|(_, p, _)| group(p) == *g)
+            .map(|(name, p, ext)| (*name, p.as_str(), *ext))
             .collect();
         let steps = workflows::job_steps(artifacts, &attest_job)?;
         attested_alone(&attest_job, &steps, &mine, &my_packages, &mut out);
@@ -166,13 +168,13 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
 }
 
 /// The provenance and bundle-naming steps of every tarball of `mine` (name and platform)
-/// and every installer package of `packages` (platform, extension) in the attest job `job`, the steps
-/// that attest anything else, and any `run:` step that is not the naming of a bundle.
+/// and every package of `packages` (binary, platform, extension) in the attest job `job`, the
+/// steps that attest anything else, and any `run:` step that is not the naming of a bundle.
 fn attested_alone(
     job: &str,
     steps: &[workflows::Step],
     mine: &[(&str, &str)],
-    packages: &[(&str, &str)],
+    packages: &[(&str, &str, &str)],
     out: &mut Vec<String>,
 ) {
     let mut expected = Vec::new();
@@ -185,14 +187,11 @@ fn attested_alone(
             format!("dist/{name}-${{GITHUB_SHA}}-{platform}.tar.gz.sigstore.json"),
         ));
     }
-    for (platform, ext) in packages {
+    for (name, platform, ext) in packages {
         targets.push((
-            format!("kbf-installer package ({ext}) for {platform}"),
-            format!(
-                "dist/{}.{ext}",
-                attested_assets::stem("kbf-installer", platform)
-            ),
-            format!("dist/kbf-installer-${{GITHUB_SHA}}-{platform}.{ext}.sigstore.json"),
+            format!("{name} package ({ext}) for {platform}"),
+            format!("dist/{}.{ext}", attested_assets::stem(name, platform)),
+            format!("dist/{name}-${{GITHUB_SHA}}-{platform}.{ext}.sigstore.json"),
         ));
     }
     for (what, subject, bundle) in targets {

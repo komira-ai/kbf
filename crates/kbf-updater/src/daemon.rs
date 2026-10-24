@@ -14,6 +14,13 @@
 //! for a frontend that runs behind kbf-proxy (`--proxy-auth-file` there): its operator API
 //! refuses a call without it. It is read on every call, like the token.
 //!
+//! Also optional, and required when the inventory lists frontend pool members (lines with
+//! `instance=` and `base=`): `--proxy-admin`, `http://<loopback ip>:<port>`, the admin API of
+//! the kbf-proxy in pool mode (its `admin_listen`), through which a member is drained and
+//! put back. The API asks for no credential, so none is sent to it; a host that is not a
+//! loopback address is refused. The updater runs on the frontend host: it reaches each member's
+//! operator API (its `base` plus two) on loopback with the token it uses for `--operator-api`.
+//!
 //! And the socket, one of two (never both):
 //!
 //! - **production**: socket activation. systemd binds the socket (`SocketUser=<proxy user>`,
@@ -22,9 +29,30 @@
 //! - **tests and development**: `--socket`, a path the updater binds itself, mode 0600, its
 //!   own user.
 //!
-//! This build has no host installer ([`crate::not_built`]): a roll is accepted and fails at
-//! the first install, with no host touched. The health check is real for storage and daemon
-//! hosts and refuses a frontend ([`crate::node_health`]).
+//! The installer is [`SshInstaller`], for storage and daemon hosts. Its settings are flags:
+//!
+//! - `--ssh-key-file`: the private key file ssh logs in with (a path; the key is never on
+//!   the command line);
+//! - `--ssh-user`: the user the host's forced command is installed for;
+//! - `--channel`: the package channel an install comes from;
+//! - optional `--ssh-connect-timeout-secs` (default 10) and `--ssh-command-timeout-secs`
+//!   (default 900, the time one install may take);
+//! - optional `--drain-deadline-secs` (default 600, at least 1);
+//! - optional `--apply-poll-secs` (default 5, at least 1) and `--apply-deadline-secs` (default
+//!   600, at least 1), for `mac-daemon` hosts.
+//!
+//! A daemon host's node is drained at the frontend before its install and given back after
+//! it runs the target ([`crate::node_drain`]); `--drain-deadline-secs` (default 600) is how long
+//! its leases are waited for. The health check is real for storage and daemon hosts and refuses a
+//! frontend that is no pool member ([`crate::node_health`]); the roll asks it before it
+//! installs, so ssh is never run for one. A frontend pool member is rolled through the proxy's
+//! pool and its own API ([`crate::pool_http`], [`crate::frontend_http`]).
+//!
+//! A `mac-daemon` host is rolled as a daemon host, except that its install only starts an
+//! apply on the Mac: the roll asks the host's `query` every `--apply-poll-secs` until the
+//! apply is `done` for the target, for at most `--apply-deadline-secs`, and then holds for the
+//! daemon's health as for any daemon host. A failed apply, or a deadline that runs out, ends
+//! the roll with the node left drained.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -34,29 +62,35 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use serde_json::json;
 
 use crate::api::RollState;
-use crate::health::system_wall_clock;
+use crate::frontend_http::HttpFrontend;
 use crate::inventory::Inventory;
 use crate::listener::{Activation, Listen, open};
+use crate::node_drain::NodeDrain;
 use crate::node_health::NodeHealth;
-use crate::not_built::NotBuiltInstaller;
 use crate::operator::OperatorApi;
+use crate::pool_http::HttpPool;
 use crate::ports::SystemClock;
 use crate::record::RollStore;
 use crate::safe_http::HttpSafeToStop;
 use crate::server::{AuditSink, Recent, Server, Settings};
+use crate::ssh_installer::{Exec, SshInstaller, SystemExec};
 use crate::{Ports, Timing, Updater};
 
 pub const USAGE: &str = "usage: kbf-updater --version\n       kbf-updater --state-dir DIR \
 --inventory FILE --proxy-uid UID --operator-api http://IP:PORT --token-file FILE \
-[--operator-proxy-auth-file FILE] [--socket PATH]\n\
+--ssh-key-file FILE --ssh-user USER --channel NAME [--operator-proxy-auth-file FILE] \
+[--proxy-admin http://IP:PORT] [--ssh-connect-timeout-secs N] [--ssh-command-timeout-secs N] \
+[--drain-deadline-secs N] [--apply-poll-secs N] [--apply-deadline-secs N] [--socket PATH]\n\
 the socket comes from systemd socket activation (LISTEN_PID, LISTEN_FDS=1) or from --socket, \
-which is for tests and development\n";
+which is for tests and development; --proxy-admin is required when the inventory lists \
+frontend pool members\n";
 
-const FLAGS: [&str; 7] = [
+const FLAGS: [&str; 16] = [
     "--state-dir",
     "--inventory",
     "--socket",
@@ -64,7 +98,28 @@ const FLAGS: [&str; 7] = [
     "--operator-api",
     "--token-file",
     "--operator-proxy-auth-file",
+    "--proxy-admin",
+    "--ssh-key-file",
+    "--ssh-user",
+    "--channel",
+    "--ssh-connect-timeout-secs",
+    "--ssh-command-timeout-secs",
+    "--drain-deadline-secs",
+    "--apply-poll-secs",
+    "--apply-deadline-secs",
 ];
+
+/// How long ssh may take to connect, unless a flag says otherwise.
+const DEFAULT_CONNECT_SECS: u64 = 10;
+/// How long one call may take, unless a flag says otherwise: as long as a restart waits for
+/// an install that is in progress.
+const DEFAULT_COMMAND_SECS: u64 = 900;
+/// How long a daemon host's node is given to finish its leases, unless a flag says otherwise.
+const DEFAULT_DRAIN_SECS: u64 = 600;
+/// How often a Mac host is asked how its apply stands, unless a flag says otherwise.
+const DEFAULT_APPLY_POLL_SECS: u64 = 5;
+/// How long a Mac host's apply may take, unless a flag says otherwise.
+const DEFAULT_APPLY_DEADLINE_SECS: u64 = 600;
 
 /// The settings of a run.
 #[derive(Clone, Debug)]
@@ -79,12 +134,31 @@ pub struct Config {
     pub token_file: PathBuf,
     /// The proxy's per-boot secret, if the frontend is behind kbf-proxy.
     pub operator_proxy_auth_file: Option<PathBuf>,
+    /// The admin API of the kbf-proxy in pool mode; required when the inventory lists frontend
+    /// pool members.
+    pub proxy_admin: Option<SocketAddr>,
+    /// The private key file ssh logs in with.
+    pub ssh_key_file: PathBuf,
+    pub ssh_user: String,
+    /// The package channel an install comes from.
+    pub channel: String,
+    pub ssh_connect_timeout: Duration,
+    pub ssh_command_timeout: Duration,
+    /// How long a daemon host's node is given to finish its leases once drained; its host is
+    /// installed when that is out, leases or not.
+    pub drain_deadline: Duration,
+    /// How often a `mac-daemon` host is asked how its apply stands.
+    pub apply_poll: Duration,
+    /// How long a `mac-daemon` host's apply may take to be done for the target.
+    pub apply_deadline: Duration,
 }
 
 /// The settings from the command line (without the program name) and from what the service
 /// manager passed. Each flag is given once, as `--flag value` or `--flag=value`; all but
-/// `--socket` and `--operator-proxy-auth-file` are required, and the socket is either
-/// `--socket` or the activated descriptor.
+/// `--socket`, `--operator-proxy-auth-file`, `--proxy-admin`, the two ssh timeouts, the drain
+/// deadline and the two apply bounds are required, and the socket is either `--socket` or the
+/// activated descriptor. (`--proxy-admin` is required by [`start_with`] when the inventory
+/// lists frontend pool members.)
 pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, String> {
     let mut found: BTreeMap<&str, String> = BTreeMap::new();
     let mut rest = args.iter();
@@ -119,9 +193,37 @@ pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, S
         .map_err(|_| "--proxy-uid must be a number".to_owned())?;
     let operator_api = parse_operator_url(&take("--operator-api")?)?;
     let token_file = PathBuf::from(take("--token-file")?);
+    let ssh_key_file = PathBuf::from(take("--ssh-key-file")?);
+    let ssh_user = take("--ssh-user")?;
+    let channel = take("--channel")?;
     let operator_proxy_auth_file = found
         .remove("--operator-proxy-auth-file")
         .map(PathBuf::from);
+    let proxy_admin = found
+        .remove("--proxy-admin")
+        .map(|url| parse_loopback_url("--proxy-admin", &url))
+        .transpose()?;
+    let mut seconds = |flag: &str, default: u64| match found.remove(flag) {
+        None => Ok(Duration::from_secs(default)),
+        Some(text) => text
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .map_err(|_| format!("{flag} must be a number of seconds")),
+    };
+    let ssh_connect_timeout = seconds("--ssh-connect-timeout-secs", DEFAULT_CONNECT_SECS)?;
+    let ssh_command_timeout = seconds("--ssh-command-timeout-secs", DEFAULT_COMMAND_SECS)?;
+    let drain_deadline = seconds("--drain-deadline-secs", DEFAULT_DRAIN_SECS)?;
+    if drain_deadline.is_zero() {
+        return Err("--drain-deadline-secs must be at least 1".to_owned());
+    }
+    let apply_poll = seconds("--apply-poll-secs", DEFAULT_APPLY_POLL_SECS)?;
+    if apply_poll.is_zero() {
+        return Err("--apply-poll-secs must be at least 1".to_owned());
+    }
+    let apply_deadline = seconds("--apply-deadline-secs", DEFAULT_APPLY_DEADLINE_SECS)?;
+    if apply_deadline.is_zero() {
+        return Err("--apply-deadline-secs must be at least 1".to_owned());
+    }
     let listen = match (
         found.remove("--socket"),
         activation.passed_to(std::process::id())?,
@@ -149,21 +251,38 @@ pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, S
         operator_api,
         token_file,
         operator_proxy_auth_file,
+        proxy_admin,
+        ssh_key_file,
+        ssh_user,
+        channel,
+        ssh_connect_timeout,
+        ssh_command_timeout,
+        drain_deadline,
+        apply_poll,
+        apply_deadline,
     })
 }
 
 /// `http://<ip>:<port>` with a loopback ip. The operator token goes over this connection in
 /// clear, so any other host, a name, or `https` is refused.
 pub fn parse_operator_url(url: &str) -> Result<SocketAddr, String> {
-    let rest = url.strip_prefix("http://").ok_or(
-        "--operator-api must start with http:// (the token travels in clear, on loopback)",
-    )?;
+    parse_loopback_url("--operator-api", url)
+}
+
+/// The value of the flag `flag` as `http://<ip>:<port>` with a loopback ip: these calls travel in
+/// clear, so any other host, a name, or `https` is refused.
+pub fn parse_loopback_url(flag: &str, url: &str) -> Result<SocketAddr, String> {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return Err(format!(
+            "{flag} must start with http:// (the call travels in clear, on loopback)"
+        ));
+    };
     let addr: SocketAddr = rest
         .trim_end_matches('/')
         .parse()
-        .map_err(|_| "--operator-api must be http://<ip>:<port>, with an IP address".to_owned())?;
+        .map_err(|_| format!("{flag} must be http://<ip>:<port>, with an IP address"))?;
     if !addr.ip().to_canonical().is_loopback() {
-        return Err("--operator-api must be a loopback address".to_owned());
+        return Err(format!("{flag} must be a loopback address"));
     }
     Ok(addr)
 }
@@ -215,21 +334,61 @@ pub fn stderr_sink() -> AuditSink {
     Arc::new(|line| eprintln!("{line}"))
 }
 
-/// The ports of this build: the real safe-to-stop, health check and clock, and the refusing
-/// installer.
+/// The ports of this build: the real safe-to-stop, health check, clock and ssh installer.
 pub fn build_ports(cfg: &Config) -> Result<Ports, String> {
+    build_ports_with_exec(cfg, Arc::new(SystemExec))
+}
+
+/// [`build_ports`], running the installer's processes through `exec`. A test passes a
+/// recorder in place of the system, so that no `ssh` runs.
+pub fn build_ports_with_exec(cfg: &Config, exec: Arc<dyn Exec>) -> Result<Ports, String> {
+    // The key is read by ssh, not here; a path that is no file is told at start-up.
+    let key_ok = std::fs::metadata(&cfg.ssh_key_file).is_ok_and(|m| m.is_file());
+    if !key_ok {
+        return Err(format!(
+            "--ssh-key-file {} is not a file",
+            cfg.ssh_key_file.display()
+        ));
+    }
+    let installer = SshInstaller::new(
+        cfg.ssh_key_file.clone(),
+        &cfg.ssh_user,
+        &cfg.channel,
+        cfg.ssh_connect_timeout,
+        cfg.ssh_command_timeout,
+    )
+    .map_err(|e| e.to_string())?
+    .with_exec(exec);
+    // Shared: the roll installs with it, and the health check asks it what a daemon runs.
+    let installer = Arc::new(installer);
     // One client, checked once: both ports read the same token files.
     let api = OperatorApi::new(
         cfg.operator_api,
         cfg.token_file.clone(),
         cfg.operator_proxy_auth_file.clone(),
     )?;
+    // The pool is the proxy's admin API, or none when there is no `--proxy-admin`.
+    let admin = cfg.proxy_admin;
+    let pool = admin.map_or_else(HttpPool::unconfigured, HttpPool::new);
     Ok(Ports {
         safe: Box::new(HttpSafeToStop::from_api(api.clone())),
-        installer: Box::new(NotBuiltInstaller),
-        health: Box::new(NodeHealth::with_api(api, system_wall_clock())),
+        installer: Box::new(Arc::clone(&installer)),
+        drain: Box::new(NodeDrain::with_api(api.clone())),
+        health: Box::new(NodeHealth::with_api(api.clone(), installer)),
         clock: Box::new(SystemClock::new()),
+        pool: Box::new(pool),
+        frontend: Box::new(HttpFrontend::with_api(api)),
     })
+}
+
+/// The bounds of the roll: the defaults, and the three the flags set.
+pub fn timing(cfg: &Config) -> Timing {
+    Timing {
+        drain_deadline: cfg.drain_deadline,
+        apply_poll: cfg.apply_poll,
+        apply_deadline: cfg.apply_deadline,
+        ..Timing::default()
+    }
 }
 
 /// Start with the ports of this build.
@@ -237,7 +396,7 @@ pub fn start(cfg: &Config) -> Result<Daemon, String> {
     start_with(
         cfg,
         build_ports(cfg)?,
-        Timing::default(),
+        timing(cfg),
         Settings::new(cfg.proxy_uid),
         stderr_sink(),
     )
@@ -267,6 +426,12 @@ pub fn start_with(
 ) -> Result<Daemon, String> {
     let inventory = Inventory::load(&cfg.inventory, cfg.inventory_owner)
         .map_err(|e| format!("inventory {}: {e}", cfg.inventory.display()))?;
+    if inventory.has_members() && cfg.proxy_admin.is_none() {
+        return Err(format!(
+            "inventory {} lists frontend pool members, which need --proxy-admin",
+            cfg.inventory.display()
+        ));
+    }
     let store = RollStore::open(&cfg.state_dir)
         .map_err(|e| format!("state dir {}: {e}", cfg.state_dir.display()))?;
     let updater = Updater::open(inventory, store, ports, timing)

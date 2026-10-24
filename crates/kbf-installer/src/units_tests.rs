@@ -1,5 +1,5 @@
 //! The paths the packaged units and the launchd job files run, read against the layout
-//! (`layout.rs`) that the installer makes them true with.
+//! (`kbf-setup`'s `layout.rs`) that the installer makes them true with.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,16 +35,15 @@ fn programs(unit: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Catches a unit whose `kbf` is not the release the installer links as `current`
-/// (`/var/lib/kbf-installer/current/kbf` is a path the installer never makes, so the
-/// unit's start fails on every host), and a unit program under the installer's tree
-/// that is not that link. Reads the layout's own `current()`,
-/// so a change of the layout moves this with it. The count guards against the scan
-/// reading nothing (a moved directory) and passing.
+/// Asserts that every `kbf` a Linux unit runs is `/usr/bin/kbf`, the file the kbf package
+/// installs (a path under the installer's tree, such as the `releases/current` link a host
+/// of the earlier layout has, is a file the package manager does not replace), and that no
+/// unit program lies under the installer's tree. The tree is the layout's own
+/// `install_root()`, so a change of the layout moves this with it. The count guards against
+/// the scan reading nothing (a moved directory) and passing.
 #[test]
-fn every_linux_unit_runs_the_kbf_the_layout_links_as_current() {
+fn every_linux_unit_runs_the_kbf_the_package_installs() {
     let layout = Layout::linux(Root::host());
-    let current_kbf = format!("{}/kbf", layout.current());
     let tree = layout.install_root().to_string();
     let dir = repo_file("packaging/linux/units");
     let mut checked = 0;
@@ -62,18 +61,20 @@ fn every_linux_unit_runs_the_kbf_the_layout_links_as_current() {
             .into_owned();
         let text = fs::read_to_string(&path).expect("unit");
         for (key, program) in programs(&text) {
-            let in_tree = program.starts_with(&format!("{tree}/"));
-            let is_kbf = program.ends_with("/kbf");
-            if is_kbf || in_tree {
-                assert_eq!(program, current_kbf, "{name} {key}");
+            assert!(
+                !program.starts_with(&format!("{tree}/")),
+                "{name} {key} runs {program}, under the installer's tree"
+            );
+            if program.ends_with("/kbf") {
+                assert_eq!(program, "/usr/bin/kbf", "{name} {key}");
                 checked += 1;
             }
         }
     }
-    // kbf-daemon, kbf-storage, kbf-storage-and-daemon, kbf-all-in-one: a check and a
-    // start each; kbf-frontend: a check and a start.
+    // kbf-daemon, kbf-storage, kbf-storage-and-daemon, kbf-all-in-one: a boot check, a
+    // check and a start each; kbf-frontend: a boot check, a check and a start.
     assert!(
-        checked >= 10,
+        checked >= 15,
         "only {checked} kbf commands found in {dir:?}"
     );
 }

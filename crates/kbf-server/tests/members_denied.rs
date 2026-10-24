@@ -157,6 +157,7 @@ fn listeners(worker_tls: WorkerTls) -> Listeners {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -211,7 +212,7 @@ fn frontend_behind(pki: &Pki, proxy: Option<Behind>) -> (SocketAddr, Arc<Hooked>
 /// with the boot it first got is still the live one, which a refusal that came after the
 /// boot was assigned would have raised.
 ///
-/// Mutants seen red: the `Register` not reading the rows; the rows read after the member
+/// Catches: the `Register` not reading the rows; the rows read after the member
 /// is registered; `node` entries matched against nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_denied_certificate_cannot_register_and_a_refusal_writes_nothing() {
@@ -281,7 +282,7 @@ async fn a_denied_certificate_cannot_register_and_a_refusal_writes_nothing() {
 /// renew it, so A is `Down` and B is `Active`, and A's beat is still PERMISSION_DENIED
 /// (the entry is judged before the row).
 ///
-/// Mutants seen red: `Heartbeat` not reading the map's list; the list read after the row is
+/// Catches: `Heartbeat` not reading the map's list; the list read after the row is
 /// touched (the refused beat renews it, so A is still `Active` at seventy seconds).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_denied_member_is_refused_its_beats_and_goes_down_when_its_row_lapses() {
@@ -349,7 +350,7 @@ async fn a_denied_member_is_refused_its_beats_and_goes_down_when_its_row_lapses(
 /// `Register` reads it, and one the proxy vouched for as the certificate's own node and
 /// role registers.
 ///
-/// Mutant seen red: the mutual-TLS arm of `worker_peers` built with `ProxyAuthLayer::new(None)`.
+/// Catches: the mutual-TLS arm of `worker_peers` built with `ProxyAuthLayer::new(None)`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_flagged_mutual_tls_worker_listener_still_reads_the_proxys_word() {
     const SECRET: [u8; 32] = [0x77; 32];

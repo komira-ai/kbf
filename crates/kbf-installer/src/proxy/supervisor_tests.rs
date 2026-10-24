@@ -201,7 +201,7 @@ fn a_frontend_is_started_on_its_slots_ports_and_a_candidate_awaits_the_takeover(
 /// given to a host that has none: with a file named, every slot and start carries `--config=`
 /// once and is otherwise the command line without it; with none, no word starts `--config`.
 ///
-/// Mutants to plant: the `--config` word dropped (red: none carries it); the word pushed
+/// Catches: the `--config` word dropped (red: none carries it); the word pushed
 /// whatever `config_file` is (red: the plain command line has it).
 #[test]
 fn the_frontend_children_read_the_file_installer_toml_names_and_no_other() {
@@ -305,15 +305,6 @@ impl ChildAdmin for ScriptAdmin<'_> {
 
     fn open_counts(&self, _: Slot) -> Result<crate::proxy::model::OpenCounts, PortError> {
         unreachable!("the boot never counts")
-    }
-
-    fn post_desired(
-        &self,
-        _: Slot,
-        _: &CommitId,
-        _: kbf_update::Source,
-    ) -> Result<(), crate::proxy::model::DesiredError> {
-        unreachable!("the boot never posts a desired release")
     }
 }
 
@@ -876,44 +867,38 @@ fn serve_once(listener: TcpListener) -> std::thread::JoinHandle<String> {
     })
 }
 
-/// Catches an admin client wired to the wrong place: the desired-release offer of each slot goes
-/// to that slot's operator port, with the proxy's secret and the operator token read from the
-/// file at the call (a missing file is the error of the token, not of the network).
+/// Asserts that the admin client of the proxy's start is wired to the ports of the slot it is
+/// asked about: the readiness read of each slot goes to that slot's operator port, and the role
+/// read of each slot to that slot's admin port, with the proxy's secret.
 #[test]
-fn the_child_admin_offers_a_release_to_the_operator_port_of_its_slot() {
-    use crate::proxy::admin::AdminError;
+fn the_child_admin_reads_the_operator_port_and_the_admin_port_of_its_slot() {
     let (gate, _runner) = gate();
-    let token_file = kbf_host::testkit::scratch("supervisor-child-admin").join("operator.token");
-    let offset = UpstreamTable { base_port: 0 }.port(kbf_proxy::slot::Slot::A, Target::Operator);
-    let stride =
-        UpstreamTable { base_port: 0 }.port(kbf_proxy::slot::Slot::B, Target::Operator) - offset;
-
-    let table = UpstreamTable { base_port: 20_000 };
-    let missing = child_admin(&gate.handle, table, token_file.clone()).expect("admin");
-    assert!(
-        matches!(
-            missing.try_post_desired(Slot::A, &c(A)),
-            Err(AdminError::Token(std::io::ErrorKind::NotFound))
-        ),
-        "no token file"
-    );
-
-    std::fs::write(&token_file, "operator-token\n").expect("token");
+    let (first, second) = (kbf_proxy::slot::Slot::A, kbf_proxy::slot::Slot::B);
+    let flat = UpstreamTable { base_port: 0 };
+    let stride = flat.port(second, Target::Operator) - flat.port(first, Target::Operator);
     for (slot, extra) in [(Slot::A, 0), (Slot::B, stride)] {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
+        let offset = flat.port(first, Target::Operator);
         let table = UpstreamTable {
             base_port: port - offset - extra,
         };
-        let admin = child_admin(&gate.handle, table, token_file.clone()).expect("admin");
+        let admin = child_admin(&gate.handle, table).expect("admin");
         let seen = serve_once(listener);
-        admin.try_post_desired(slot, &c(A)).expect("offered");
+        assert!(admin.try_ready(slot).expect("answered").readyz);
         let head = seen.join().expect("fixture");
-        assert!(head.starts_with("POST /v1/update/desired "), "{head}");
-        assert!(
-            head.contains("authorization: Bearer operator-token\r\n"),
-            "{head}"
-        );
+        assert!(head.starts_with("GET /readyz "), "{head}");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let table = UpstreamTable {
+            base_port: port - flat.admin_port(first) - extra,
+        };
+        let admin = child_admin(&gate.handle, table).expect("admin");
+        let seen = serve_once(listener);
+        assert!(admin.try_role(slot).is_err(), "an empty answer is no role");
+        let head = seen.join().expect("fixture");
+        assert!(head.starts_with("GET /v1/admin/role "), "{head}");
         for (name, value) in gate.handle.admin_headers().iter() {
             let line = format!("{}: {}\r\n", name.as_str(), value.to_str().expect("ASCII"));
             assert!(head.contains(&line), "{line:?} in {head}");
@@ -984,7 +969,7 @@ mod migration {
     /// there; for the installed one it runs the release's own program (here a stand-in that
     /// refuses `--version`), which is `schema_unknown`. No part of the URL is in either.
     ///
-    /// Mutants seen red: `host_migrator` returning a hook that migrates nothing (both `Ok`);
+    /// Catches: `host_migrator` returning a hook that migrates nothing (both `Ok`);
     /// the installed probe not given (`not_staged`).
     #[test]
     fn the_verbs_migrator_asks_the_database_and_the_release() {
@@ -1016,7 +1001,7 @@ mod migration {
     /// is started or recorded, the child's admin port is never asked, the streams stay held, and
     /// the operator gets a fix. Neither the held reason nor the log carries the URL.
     ///
-    /// Mutants seen red: the refusal ignored by the boot (a process was recorded); the fix of
+    /// Catches: the refusal ignored by the boot (a process was recorded); the fix of
     /// `migration-failed` removed.
     #[test]
     fn a_refused_migration_holds_with_its_reason_and_starts_nothing() {
@@ -1080,7 +1065,7 @@ mod migration {
     /// installed release asks its own binary for its schema, the migration runs with it and the
     /// bound, and at that moment no process is recorded; afterwards the release runs and serves.
     ///
-    /// Mutants seen red: the migrator called after `spawn` (a process was already recorded);
+    /// Catches: the migrator called after `spawn` (a process was already recorded);
     /// the schema taken from the installer's newest instead of the release's.
     #[test]
     fn the_installed_release_is_migrated_for_its_own_schema_before_it_is_spawned() {
@@ -1122,7 +1107,7 @@ mod migration {
         /// database is created for this test alone, so no other test process shares its schema.
         /// No part of the URL is in anything the log is given.
         ///
-        /// Mutants seen red: the hook migrating nothing (no schema; kbf's open refused);
+        /// Catches: the hook migrating nothing (no schema; kbf's open refused);
         /// the `schema_version` row written again on the second start (the row changed).
         #[test]
         fn a_cold_start_creates_the_schema_on_a_fresh_database_and_the_next_changes_nothing() {
