@@ -188,7 +188,7 @@ zeroize = "1.9.1"
 zip = { version = "9.0.1", default-features = false, features = ["deflate-flate2"] }
 
 kbf-alert = { path = "crates/kbf-alert" }
-kbf-all-in-one = { path = "crates/kbf-all-in-one" }
+kbf-storage-and-daemon = { path = "crates/kbf-storage-and-daemon" }
 kbf-auth = { path = "crates/kbf-auth" }
 kbf-ca = { path = "crates/kbf-ca" }
 kbf-caps = { path = "crates/kbf-caps" }

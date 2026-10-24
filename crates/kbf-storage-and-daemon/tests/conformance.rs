@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use clap::Parser as _;
-use kbf_all_in_one::LocalDataPlane;
 use kbf_cas_conformance::Subject;
+use kbf_storage_and_daemon::LocalDataPlane;
 use kbf_testkit::dir::TestDir;
 
 /// A server per [`Subject::fresh`], with a write tier of its own or none.

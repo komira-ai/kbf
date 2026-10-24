@@ -281,7 +281,7 @@ fn pure_modules_deny_the_clippy_lists() {
 
 /// The crates allowed to depend on both the server and the node library: the combined
 /// binary and the one `kbf` binary.
-const JOINERS: &[&str] = &["kbf-all-in-one", "kbf-cli"];
+const JOINERS: &[&str] = &["kbf-storage-and-daemon", "kbf-cli"];
 
 /// What the server library's normal dependencies must not reach: the daemon side. The
 /// server stores and schedules; it never moves blobs as a client.
@@ -563,7 +563,7 @@ fn tierstore_reaches_no_other_workspace_crate() {
 /// (docs/design/kbf-proxy-api.md, sections 1 and 11). The proxy routes bytes: it never
 /// decodes a child's protocol (`kbf-proto`), runs none of the frontend, storage or node code
 /// (`kbf-server`, `kbf-front`, `kbf-storage`, `kbf-node`, `kbf-daemon`, the binaries
-/// `kbf-cli` and `kbf-all-in-one`), and does not know the installer, its host plan or its
+/// `kbf-cli` and `kbf-storage-and-daemon`), and does not know the installer, its host plan or its
 /// update types (`kbf-installer`, `kbf-setup`, `kbf-host`, `kbf-update`, `kbf-deploy`): the
 /// admin calls to a child are the installer's, through a trait that lives there (the proxy
 /// makes none), and the installer and the setup library depend on the proxy, not the other way
@@ -580,7 +580,7 @@ const PROXY_MUST_NOT_REACH: &[&str] = &[
     "kbf-node",
     "kbf-daemon",
     "kbf-cli",
-    "kbf-all-in-one",
+    "kbf-storage-and-daemon",
     "kbf-proto",
 ];
 

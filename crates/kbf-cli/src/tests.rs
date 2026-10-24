@@ -314,7 +314,7 @@ fn help_lists_the_modes_under_the_mode_flag_and_no_commands() {
 #[test]
 fn each_mode_refuses_the_flags_of_another() {
     let daemon = longs(&kbf_node::Cli::command());
-    let both = longs(&kbf_all_in_one::cli::command());
+    let both = longs(&kbf_storage_and_daemon::cli::command());
     let storage = longs(&kbf_server::storage_node::command());
     let frontend = longs(&kbf_server::frontend::command());
     let others: BTreeSet<String> = [&both, &storage, &frontend]
@@ -417,7 +417,7 @@ fn only_the_scheduling_modes_take_a_state_store() {
 /// Catches an all-in-one that takes less or more than `kbf-all-in-one` takes: its
 /// flags are exactly those of that command.
 #[test]
-fn all_in_one_takes_exactly_what_kbf_all_in_one_takes() {
+fn all_in_one_takes_exactly_what_kbf_storage_and_daemon_takes() {
     let mode = MODES
         .iter()
         .find(|m| m.name == names::ALL_IN_ONE)
@@ -429,7 +429,7 @@ fn all_in_one_takes_exactly_what_kbf_all_in_one_takes() {
     }
     // And the two flags every mode takes besides (`--config`, `--check`).
     assert!(new.remove(CONFIG) && new.remove(CHECK));
-    assert_eq!(longs(&kbf_all_in_one::cli::command()), new);
+    assert_eq!(longs(&kbf_storage_and_daemon::cli::command()), new);
 }
 
 /// Catches a vote flag creeping back in, or a reserved flag listed by hand: no mode
@@ -458,7 +458,10 @@ fn there_is_no_vote_flag() {
 /// derivation reads it.
 #[test]
 fn no_mode_has_a_short_flag_or_an_alias() {
-    for cmd in [kbf_node::Cli::command(), kbf_all_in_one::cli::command()] {
+    for cmd in [
+        kbf_node::Cli::command(),
+        kbf_storage_and_daemon::cli::command(),
+    ] {
         for arg in cmd.get_arguments() {
             assert_eq!(arg.get_short(), None, "{}", arg.get_id());
             assert!(arg.get_all_aliases().is_none(), "{}", arg.get_id());
@@ -542,7 +545,7 @@ fn the_daemon_takes_no_store_credential_or_environment_variable() {
 #[test]
 fn a_build_node_refuses_every_cold_store_flag() {
     let cold: BTreeSet<String> = [
-        kbf_all_in_one::cli::command(),
+        kbf_storage_and_daemon::cli::command(),
         kbf_server::storage_node::command(),
         <kbf_server::Args as clap::CommandFactory>::command(),
     ]
@@ -576,7 +579,7 @@ fn a_build_node_refuses_every_cold_store_flag() {
 #[test]
 fn the_refused_set_leaves_the_daemons_own_flags() {
     let daemon = longs(&kbf_node::Cli::command());
-    let both = longs(&kbf_all_in_one::cli::command());
+    let both = longs(&kbf_storage_and_daemon::cli::command());
     assert!(daemon.intersection(&both).any(|f| f == "cpu-threads"));
     for flag in refused_by(names::DAEMON) {
         assert!(!daemon.contains(*flag), "{flag}");
@@ -618,10 +621,10 @@ fn the_modes_parse_as_the_old_binaries_do() {
     let inv = parse_internal(with(DAEMON, &[])).expect("daemon");
     assert!(matches!(&inv, Invocation::Daemon(cli) if format!("{alias:?}") == format!("{cli:?}")));
 
-    let matches = kbf_all_in_one::cli::command()
+    let matches = kbf_storage_and_daemon::cli::command()
         .try_get_matches_from(with(&["kbf-all-in-one"], &BOTH[2..]))
         .expect("alias");
-    let alias = kbf_all_in_one::cli::parse(&matches).expect("alias flags");
+    let alias = kbf_storage_and_daemon::cli::parse(&matches).expect("alias flags");
     let inv = parse_internal(with(BOTH, &[])).expect("both");
     assert!(
         matches!(&inv, Invocation::AllInOne(flags) if format!("{alias:?}") == format!("{flags:?}"))

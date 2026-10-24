@@ -1,5 +1,5 @@
 [package]
-name = "kbf-all-in-one"
+name = "kbf-storage-and-daemon"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,9 +7,10 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# The farm server and a worker daemon in one process, the daemon's blobs moving through
-# calls into the server (`LocalDataPlane`). A library: the `kbf` binary runs it as
-# `kbf all-in-one` and `kbf storage-and-daemon` (crates/kbf-cli). The one crate, with
+# The storage node and a worker daemon in one process, the daemon's blobs moving through
+# calls into the storage half (`LocalDataPlane`). A library: the `kbf` binary runs it as
+# `kbf storage-and-daemon` (crates/kbf-cli). The `kbf all-in-one` code inside is refused
+# by the binary and goes away with the mode. The one crate, with
 # kbf-cli, that links both the server and the node library
 # (crates/kbf-integration-test/tests/layering.rs).
 
