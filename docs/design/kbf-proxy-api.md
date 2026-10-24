@@ -4,8 +4,13 @@
 > (the swap, the takeover, the handover driver, the update API at `/v1/update/frontend` and
 > the `kbf-installer update` client; section 11 and the units it names) was removed:
 > `kbf-installer proxy` serves a pool of frontends that run on their own (`[[proxy.frontend]]`
-> tables) and refuses the `upstream` table. Passages below that describe that supervision are
-> history.
+> tables) and refuses the `upstream` table. The crate's two-slot machinery went with it: the
+> slots and the gate (`slot`), the hold queue (`hold`), the routing of a `WaitExecution` by the
+> old child's term (`term`), the append of the active child's `/metrics` (`child_metrics`),
+> the CI credential of the update API (`remote`), the fenced re-dispatch and the loom models.
+> Sections 5, 6 and 7 are reduced to a note on what replaced them; the pool is section 9
+> ("Pool mode") and the files of `crates/kbf-proxy/src/upstreams.rs`, `pool_probe.rs` and
+> `pool_admin.rs`. Other passages below that describe the supervision are history.
 
 Status: design for review, unit U4b of `docs/design/frontend-proxy.md` (the design; section numbers below are its). Stacked on U4a (`kbf-server/src/proxy_auth.rs`, the child's side of the identity contract). Refs #1095. The crate skeleton in `crates/kbf-proxy` holds the parts that are plain values, with tests; everything marked "(U4b-n)" is not in it yet. Where this note and the design differ, this note says so. Revised after three reviews (concurrency and h2; seams for U7 and U8; a re-check of both) and support's binding needs for U7b and U8b: the Review log at the end says what each finding became.
 
@@ -19,87 +24,42 @@ Reusable from the repo: `kbf-front/src/proxy/bytestream.rs` (peek, keep the firs
 
 | Module | Holds | In skeleton |
 |---|---|---|
-| `slot` | `Slot`, `ActiveSlot` (gate, permits, generations), `Permit`, `HoldGuard`, `Pending`, `Bind`, `Retire` | yes |
-| `hold` | `HoldLimits`, `HoldQueue` (admit, expire), `Ticket`, `Wake` | yes |
 | `route` | `Route`, `Target`, `AuthClass`, `Idle`, the closed path table | yes |
 | `auth` | `decide`, `Buck2Auth`, `Token`, `Tokens`, `Refusal` | yes |
 | `identity` | `Identity`, `identity_of`, `ProxySecret`, `forward_headers`, `admin_headers`, `strip_reserved` | yes |
-| `replay` | `ReplayBuffer`, `Failure`, `may_retry`, `is_fenced`, the fenced contract | yes |
-| `config` | `ProxyConfig`, `UpstreamTable`, `Limits` | yes |
-| `control` | `UpdateHandler`, `UpdateRequest`, `UpdateReply`, `ProxySnapshot`, `SlotStats`, `NoUpdates` | yes |
+| `replay` | `ReplayBuffer`, `Failure`, `may_retry` | yes |
+| `config` | `ProxyConfig`, `Frontend`, `UpstreamTable`, `Limits`, `SLOT_MODE_REMOVED` | yes |
+| `control` | `UpdateHandler`, `UpdateRequest`, `UpdateReply`, `NoUpdates` | yes |
 | `tls` | `TlsReloader` (cert, key and CA as one unit, SIGHUP), the handshake | U4b-2 |
 | `serve` | accept loop, hyper's h2 server (windows, concurrent streams), per-connection task, the proxy's own routes (`/healthz`, `/readyz`, `/metrics`, the update API), shutdown drain | U4b-1 |
-| `core` | the state every stream shares: gate, hold queue, pool, counters, `max_streams` count | U4b-1 |
-| `stream` | one stream: bind (hold queue), dispatch, retry, GOAWAY and reset mapping | U4b-1 |
+| `core` | the state every stream shares: the members, the pool, counters, `max_streams` count, the streams in flight | U4b-1 |
+| `stream` | one stream: placement on a member, dispatch, retry on another member, GOAWAY and reset mapping | U4b-1 |
 | `body` | the request `Source` (replay frames), the `pump`, the response `Down`, idle `Activity`, `Lifetime` | U4b-1 |
-| `pool` | upstream h2c pool per (slot, generation, target), on h2's own client (section 18) | U4b-1 |
-| `reply`, `metrics`, `sync` | the proxy's own answers; counters; the loom shim | U4b-1 |
-| `probe` | `Readiness`, `poll`: the once-a-second `GET /readyz` of the active child's operator listener, the one writer of the proxy's `/readyz` (connect, I/O error, timeout and non-200 each fail the poll; the generation is read before the question) | U4b-3b |
-| `term` | `operation_term`, `probe` (the operation name in the first gRPC message of a `WaitExecution`, as plain values), `Terms` and its once-a-second poll of each open child's `GET /v1/admin/role` (`held_generation`, the term its operation names carry): the old child's term routes a `WaitExecution` for its operation to it while it lives (`ActiveSlot::bind_preferring`; `frontend-proxy.md` section 3, "Routing") | WaitExecution by term |
-| `limits`, `keepalive` | the h2 builders and flood limits; PING keepalive both ways | U4b-3a |
+| `pool` | upstream h2c pool per (member address, target), on h2's own client (section 18) | U4b-1 |
+| `reply`, `metrics` | the proxy's own answers; counters | U4b-1 |
+| `probe` | `Readiness::ask`: the `GET /readyz` of a member's operator listener (connect, I/O error, timeout and non-200 each fail the poll) | U4b-3b |
+| `upstreams`, `pool_probe`, `pool_admin` | the members of the pool (up or draining, ready or not, streams open), the poll of each, and the admin API on `admin_listen` | pool |
+| `limits`, `keepalive` | the h2 builders and flood limits, `STREAM_WINDOW_BYTES` and `HEADER_BYTES`; PING keepalive both ways | U4b-3a |
 | `h1` | HTTP/1.1 for update, probes and `/v1/*` only | U4b-2 |
 | `proxy` | `Proxy::bind`, `ProxyRunner`, `ProxyHandle` | U4b-1 |
 
-This table is the finished crate's map; section 18 says where U4b-1 as built differs (the module `h2` of the first plan is `stream`/`body`; `probe` came back in U4b-3b, and `/readyz` is now the proxy's view of a ready child).
+This table is the finished crate's map; section 18 says where U4b-1 as built differs (the module `h2` of the first plan is `stream`/`body`; `probe` came back in U4b-3b). The `slot`, `hold`, `term`, `child_metrics`, `remote` and `sync` modules of the two-slot design are gone.
 
-Dependencies of the finished crate: `hyper` (`http1`, `http2`, `server`, `client`: the pool is not `hyper-util`'s `client-legacy`, which keeps one h2 connection per host and never dials more at `MAX_CONCURRENT_STREAMS`; U4b-1 built it on h2's own client instead of hyper's `conn::http2`, section 18), `hyper-util` (`tokio`, `server-auto`), `h2` **directly** (the window, flood-limit and GOAWAY settings are not reachable through hyper's builders; h2 0.4.20 has one initial window per connection, no per-stream setter and no connection-only credit release, section 10), `tokio` (the skeleton already uses its `sync` feature: the hold doorbell is a `watch`), `tokio-rustls`, `rustls`, `kbf-tls`, `kbf-peer`, `futures`, `httparse`; `loom` as a dev-dependency. The workspace declares neither `h2` nor `tower` today and U4b adds nothing it does not use. U4b-1 declares the hyper features it needs explicitly.
+Dependencies of the finished crate: `hyper` (`http1`, `http2`, `server`, `client`: the pool is not `hyper-util`'s `client-legacy`, which keeps one h2 connection per host and never dials more at `MAX_CONCURRENT_STREAMS`; U4b-1 built it on h2's own client instead of hyper's `conn::http2`, section 18), `hyper-util` (`tokio`, `server-auto`), `h2` **directly** (the window, flood-limit and GOAWAY settings are not reachable through hyper's builders; h2 0.4.20 has one initial window per connection, no per-stream setter and no connection-only credit release, section 10), `tokio`, `tokio-rustls`, `rustls`, `kbf-tls`, `kbf-peer`, `futures`, `httparse`. The workspace declares neither `h2` nor `tower` today and U4b adds nothing it does not use. U4b-1 declares the hyper features it needs explicitly.
 
 ## 3. Public API
 
-The skeleton compiles the first block (signatures abridged to the load-bearing ones; docs are in the code). The second block is planned (U4b-1 to U4b-3). U7b and U8b code against both. Support's six needs map to it in the table after the blocks.
+The crate's public API (signatures abridged to the load-bearing ones; docs are in the code). The two-slot gate (`ActiveSlot`, `Permit`, `HoldGuard`, `Retire`) and the hold queue (`HoldQueue`) that this section once listed were removed with the supervision; section 5 says what places a stream now.
 
 ```rust
-// slot: the binding rule. Slot word: bit 63 CLOSED, bit 62 RETIRED, rest = open permits.
-// The gate is ONE AtomicU64: active slot, hold flag, the hold's bound (ms), a hold sequence. Every change is one CAS.
-pub enum Slot { A, B }                       // text form "a" / "b": name(), Display, FromStr, serde
-pub struct ActiveSlot { /* Arc<..> */ }      // Clone; the shared handle
-impl ActiveSlot {
-    pub fn new() -> Self;                    // both slots closed, nothing active, not holding
-    pub fn starting(hold_max: Duration) -> (Self, HoldGuard); // holding from the first instant (adoption)
-    pub fn open(&self, slot: Slot) -> u64;   // child ready: bindable; returns the generation (an open slot keeps its own)
-    pub fn adopt(&self, active: Slot, other: Option<Slot>);   // open both, set_active; hold untouched
-    pub fn set_active(&self, slot: Slot) -> Result<(), SwapError>; // Closed slot refused; hold untouched
-    pub fn clear_active(&self);              // no active slot; a hold in force stays, with its bound
-    pub fn hold(&self, hold_max: Duration) -> Result<HoldGuard, AlreadyHolding>; // Err changes nothing
-    pub fn release_into(&self, slot: Slot) -> Result<(), SwapError>;  // set active AND end the hold, one CAS
-                                             // no hold: only sets active. Closed slot: Err, hold stays
-    pub fn active(&self) -> Option<Slot>;  pub fn holding(&self) -> bool;
-    pub fn epoch(&self) -> u64;              // moves each time a hold ends, whichever way
-    pub fn subscribe(&self) -> watch::Receiver<u64>;  // the doorbell: the epoch, rung by `Inner::ring`
-    pub fn abandoned_holds(&self) -> u64;    // holds ended by a guard's drop (kbf_proxy_hold_abandoned_total)
-    pub fn bind(&self) -> Bind;   // Bound(Permit) | Held { epoch, hold_max } | NoActive
-    pub fn bind_preferring(&self, prefer: Option<Slot>) -> Bind;   // bind(), but to prefer if that slot is open and not active
-    pub fn is_open(&self, slot: Slot) -> bool;   // opened and not retired since
-    pub fn begin_stream(&self) -> Pending;   // counted from accept; a retry begins one BEFORE dropping its old permit
-    pub fn open_streams(&self) -> u64;       // pending first, then both slots' permits: a hint, never 0 while one lives
-    pub fn open_permits(&self, slot: Slot) -> u64;  pub fn generation(&self, slot: Slot) -> u64;
-    pub fn can_retire(&self, slot: Slot) -> bool;   // read-only probe: open, not active, 0 permits
-    pub fn retire(&self, slot: Slot) -> Retire;     // the commit: CAS 0 -> CLOSED|RETIRED
-}
-pub enum Retire { Closed, AlreadyClosed, NeverOpened, Current, Busy(u64) } // signal a child ONLY on Closed (this call)
-pub struct HoldGuard;   // no methods. Drop while its hold is in force = release into NOTHING: no active slot,
-                        // held and later streams get UNAVAILABLE, abandoned_holds + 1. After release_into: inert.
-pub struct Permit;      impl Permit { pub const fn slot(&self) -> Slot; pub const fn generation(&self) -> u64; }
-
-// hold
-pub const ALL_IN_ONE_HOLD: Duration;         // 300 s; a frontend swap uses ProxyConfig::frontend_hold()
-pub const STREAM_WINDOW_BYTES: u32;          // 256 KiB: the ONE h2 window of every stream, both directions
-pub struct HoldLimits { pub queue_streams: usize, pub window_bytes: u32 }   // Default: 2048, STREAM_WINDOW_BYTES
-impl HoldLimits { pub const fn worst_case_bytes(&self) -> u64; }            // queue * (window + 16 KiB)
-pub struct HoldQueue;  impl HoldQueue {
-    pub fn new(l: HoldLimits) -> Self;
-    pub fn admit(&self, now: Instant, hold_max: Duration, since: Option<Instant>) -> Result<Ticket, QueueFull>;
-    pub fn expire(&self, now: Instant) -> usize;     // the sweep: fail streams past their bound, count, return how many
-    pub fn held(&self) -> usize;  pub fn expired_total(&self) -> u64; }   // kbf_proxy_hold_expired_total
-impl Ticket { pub fn wake(&self, now: Instant, released: bool) -> Wake;  // Wait | Bind | Expire: one CAS, shared with expire
-    pub fn since(&self) -> Instant;  pub fn deadline(&self) -> Instant; } // pass since() back to admit when held again
+// limits (crate-private): the ONE h2 window of every stream, both directions, and the header cap.
+pub const STREAM_WINDOW_BYTES: u32;          // 256 KiB
+pub const HEADER_BYTES: u64;                 // 16 KiB, outside the window
 
 // route and auth: pure.
-pub fn route_of(path: &str) -> Route;        // Child(Target) | Update | Health | Ready | Metrics | Unknown
+pub fn route_of(path: &str) -> Route;        // Child(Target) | Ui | Update | Health | Ready | Metrics | Unknown
 pub const fn auth_class(r: Route) -> Option<AuthClass>;
-pub const fn bypasses_hold(r: Route) -> bool; // true for everything that does not go to a backend
 pub fn idle_of(path: &str) -> Idle;          // Never for Execute and WaitExecution, else 7200 s
-pub fn is_wait_execution(path: &str) -> bool; // the one call whose request is read for a term
 pub fn decide(c: AuthClass, m: Buck2Auth, t: &Tokens, p: Presented<'_>) -> Result<(), Refusal>;
 
 // identity: what the child sees.
@@ -111,12 +71,10 @@ pub fn strip_reserved(h: &mut HeaderMap);    // on every child answer
 
 // replay
 pub struct ReplayBuffer;  // NOT Copy. push(n) -> bool, end_request(), window_open(), replayable(), close()
-impl ReplayBuffer { pub fn on_first_response(&mut self, h: &HeaderMap, end_stream: bool) -> bool; } // fenced? read BEFORE close
-pub enum Failure { Connect, RefusedStream, GoAway, Fenced, Other }
+pub enum Failure { Connect, RefusedStream, GoAway, Other }
 pub fn may_retry(path: &str, f: Failure, b: &ReplayBuffer, attempts: u8) -> bool;
-pub fn is_fenced(h: &HeaderMap, end_stream: bool) -> bool;
 
-// control: the update API. (ChildControl is NOT here: U7a defines it in kbf-installer.)
+// control: the update API's handler. The built-in NoUpdates answers 503.
 pub const MAX_UPDATE_BODY: usize;  pub const UPDATE_DEADLINE: Duration;   // 4096 bytes, 30 s
 pub struct UpdateRequest { pub method: String, pub path: String, pub body: Vec<u8> }
 pub struct UpdateReply { pub status: u16, pub headers: Vec<(HeaderName, HeaderValue)>, pub body: Vec<u8> }
@@ -125,110 +83,57 @@ impl UpdateReply { pub const fn json(status: u16, body: Vec<u8>) -> Self;
     pub fn payload_too_large() -> Self; pub fn timed_out() -> Self; }   // 413, 504: the proxy's own
 pub trait UpdateHandler: Send + Sync {       // commands idempotent; the proxy lets a handler finish after a 504
     fn handle(&self, r: UpdateRequest) -> impl Future<Output = UpdateReply> + Send; }
-pub struct ProxySnapshot { pub active: Option<Slot>, pub holding: bool, pub held: usize,
-    pub per_slot: [SlotStats; 2], pub ready: bool, pub holds_abandoned: u64 }   // stats(slot)
-pub struct SlotStats { pub open_streams: u64 }
-// config: ProxyConfig::from_toml_str, ProxyConfig::frontend_hold() -> Duration,
-//         UpstreamTable::{port, admin_port}, Limits (max_streams, memory_budget_mib,
-//         Limits::stream_ceiling_bytes(), worst_case_bytes(): checked against the budget at start).
-```
+// config: ProxyConfig::from_toml_str, Frontend { name, base_port }, Limits (max_streams,
+//         memory_budget_mib, Limits::stream_ceiling_bytes(), worst_case_bytes(): checked against
+//         the budget at start). A table with the removed `upstream` table is read and written
+//         back (`ProxyConfig::check`, `UpstreamTable`), and refused at the proxy's start
+//         (`ProxyConfig::check_pool`) with SLOT_MODE_REMOVED.
 
-Planned, not in the skeleton:
-
-```rust
 pub struct Proxy;  impl Proxy {
     /// Takes the systemd-activated listener (fd 3, LISTEN_FDS == 1 or an error), builds the
-    /// runtime, reads or creates the secret, and returns without serving. The gate starts
-    /// holding (`ActiveSlot::starting(cfg.frontend_hold())`).
+    /// runtime, reads or creates the secret, binds the admin socket if `admin_listen` is set,
+    /// and returns without serving. A config with no `[[frontend]]` table is refused.
     pub fn bind(cfg: ProxyConfig, listener: OwnedFd) -> io::Result<(ProxyHandle, ProxyRunner)>;
 }
 pub struct ProxyRunner;  impl ProxyRunner {
-    /// Serves on the calling thread (a synchronous `main`) until `shutdown`. `updates` is
-    /// built from the handle first, so U8a's actor can hold one. A startup hold the
-    /// supervisor has not released within `hold_max_s` of this call is dropped by the proxy.
+    /// Serves on the calling thread (a synchronous `main`) until `shutdown`.
     pub fn run<U: UpdateHandler + 'static>(self, updates: U) -> io::Result<()>;
 }
 pub struct ProxyHandle { /* Clone; no generics */ }
 impl ProxyHandle {
-    pub fn runtime(&self) -> tokio::runtime::Handle;   // U7a's async actor runs here, no second runtime
-    pub fn slots(&self) -> &ActiveSlot;                // the gate: hold, release_into, active, clear_active, open, adopt, retire
-    pub fn expire(&self) -> usize;                     // HoldQueue::expire(now): the swap calls it on each poll
-    pub fn startup_hold(&self) -> Option<HoldGuard>;   // take once; release_into ends adoption
-    pub fn snapshot(&self) -> ProxySnapshot;           // GET /v1/update/frontend; a hint
-    pub fn open_streams(&self) -> u64;                 // restart-on-idle (U7b); a hint
+    pub fn runtime(&self) -> tokio::runtime::Handle;   // the host's signal handlers run here, no second runtime
+    pub fn open_streams(&self) -> u64;                 // restart-on-idle; a hint
     pub fn secret_origin(&self) -> SecretOrigin;       // Created | Existing
     pub fn admin_headers(&self) -> HeaderMap;          // every call to a child admin port carries these
     pub fn reload_tls(&self) -> Result<(), TlsReloadError>; // what SIGHUP calls
-    pub fn shutdown(&self);                            // also what U7a's actor calls if it exits or panics
+    pub fn shutdown(&self);
 }
 ```
 
-| Support's need (U7b/U8b) | API | Exactly as asked? |
-|---|---|---|
-| 1. `hold(max)` holds only backend streams; update API, probes, metrics bypass; 15 s / 300 s | `slots().hold(max)`; `bypasses_hold` is true for every route that is not `Child(_)`; `frontend_hold()` 20 s default (config `hold_max_s = 15` gives 15), `ALL_IN_ONE_HOLD` 300 s | yes; the config default stays 20 s, set 15 to match |
-| 2. `release_into(slot)`: set active and release every held stream, atomically; none held: only sets active; adopted-held and old-slot rollback | `slots().release_into(slot)`: one CAS on the gate word, rings the doorbell only if a hold ended; works on any hold (guard or `starting`), into any open slot | yes; a closed slot is refused and the hold stays |
-| 3. `expire()` fails streams past `hold_max`, counts, returns the count | `ProxyHandle::expire()` over `HoldQueue::expire`; the stream's own deadline stays as the guarantee; each stream is failed and counted once by whichever acts first | yes; both kept, see section 6 |
-| 4. read the active slot as an Option | `slots().active() -> Option<Slot>` | yes |
-| 5. `clear_active` for both children dead | `slots().clear_active()`; keeps the hold; then `open`, `release_into` | yes |
-| 6. dropping the hold guard releases into nothing | `HoldGuard::drop`: active cleared, held streams `UNAVAILABLE`, counted; inert after `release_into` | yes; also clears the active slot, so later streams fail too (the alternative, keep the active slot, would bind to a quiesced child) |
-
-There is no `set_ready`: readiness has one writer, the proxy's own poll. There is no `open_sessions`. `ProxySecret::create_or_read(path) -> io::Result<(ProxySecret, SecretOrigin)>` (U4b-2) writes a temp file, fsyncs and `link`s it into place, so a crash never leaves a 0-byte file; it adds no trailing newline (the child requires exactly 32 bytes); an existing file that is not 32 bytes is replaced the same way and reported `Created`.
+There is no `set_ready`: readiness has one writer per member, the proxy's own poll of it. `ProxySecret::create_or_read(path) -> io::Result<(ProxySecret, SecretOrigin)>` (U4b-2) writes a temp file, fsyncs and `link`s it into place, so a crash never leaves a 0-byte file; it adds no trailing newline (the child requires exactly 32 bytes); an existing file that is not 32 bytes is replaced the same way and reported `Created`.
 
 ## 4. Threading and async model
 
 - One multi-thread tokio runtime built inside `Proxy::bind` (workers = min(cores, 8)), reachable as `ProxyHandle::runtime()`; `kbf-installer`'s `main` stays synchronous and calls `ProxyRunner::run`. One accept task; one task per connection; hyper spawns the per-stream service futures. **Panics:** each connection task is wrapped in `FutureExt::catch_unwind`, and each stream future is wrapped too (a stream panic is a tokio `JoinError`, not a connection close, so the connection wrap does not see it). Both increment `kbf_proxy_panics_total`; a panic closes that connection or resets that stream and nothing else. The wrap is the blast-radius limit, not error handling.
-- The bound data path takes no lock: `ActiveSlot`, the permits and the counters are atomics. The locks: the TLS config (`RwLock<Arc<ServerConfig>>`, read once per handshake), the pool's connection list (per target, held for a pick, never across an await), and the hold registry's mutex (`HoldQueue`: admit, ticket drop and the `expire` sweep), which only a held stream or the supervisor takes.
-- **One writer for control.** `set_active`, `clear_active`, `hold`, `release_into`, `open`, `adopt` and `retire` are called by one task (U7a's actor; design section 4). The proxy calls no `ChildControl` method, so the proxy type has no `ChildControl` parameter. If that actor exits or panics it calls `ProxyHandle::shutdown()` (fail-stop): a proxy that keeps serving with a dead supervisor answers every update call 504 and holds nothing, so systemd restarts it and adoption runs.
-- Streams read the clock only through a `Clock` (paused time in tests); the skeleton's pure functions take `Instant` as input.
-- **Memory** is bounded by counts, and the counts are knobs. h2 0.4.20 has one initial window per connection and no per-stream setter, so every stream's window is `STREAM_WINDOW_BYTES` (256 KiB) in each direction, held or bound, and the connection window is `1000 streams x window`: no set of held bodies can exhaust it, so an update POST or `/healthz` on that connection never stalls on credit (a promise to the client; it costs memory only if data arrives, and arrival is capped by the stream counts). One stream pins at most `2 x window + replay buffer (64 KiB) + header list (16 KiB)` = 592 KiB (`Limits::stream_ceiling_bytes`); the replay term is held for a 3 hour Execute's whole life. `limits.max_streams` (default 8192; bound, held and dialing together; one more is refused `UNAVAILABLE` at header time) times that must fit `limits.memory_budget_mib` (default 8192, for a host of 16 GiB or more) or the config is refused at start: 4.75 GiB by default. The hold queue is a subset: 2048 held x (256 KiB + 16 KiB) = 544 MiB. The proxy runs with `OOMScoreAdjust=-900`, so the kernel kills the children before it, which is why the budget is checked, not hoped for. The price of one window: a single upload moves at most window/RTT (5 MB/s at 50 ms, 250 MB/s at 1 ms); parallel streams are unaffected.
+- The data path takes one short lock to place a stream (the members' state, `upstreams`: a pick, a drain and a count are never apart, and the lock is never held across an await); the counters are atomics. The other locks: the TLS config (`RwLock<Arc<ServerConfig>>`, read once per handshake) and the pool's connection list (per target, held for a pick, never across an await).
+- Streams read the clock only through tokio's (paused time in tests); the skeleton's pure functions take `Instant` as input.
+- **Memory** is bounded by counts, and the counts are knobs. h2 0.4.20 has one initial window per connection and no per-stream setter, so every stream's window is `STREAM_WINDOW_BYTES` (256 KiB) in each direction, and the connection window is `1000 streams x window`: no set of unread bodies can exhaust it, so an update POST or `/healthz` on that connection never stalls on credit (a promise to the client; it costs memory only if data arrives, and arrival is capped by the stream counts). One stream pins at most `2 x window + replay buffer (64 KiB) + header list (16 KiB)` = 592 KiB (`Limits::stream_ceiling_bytes`); the replay term is held for a 3 hour Execute's whole life. `limits.max_streams` (default 8192; bound and dialing together; one more is refused `UNAVAILABLE` at header time) times that must fit `limits.memory_budget_mib` (default 8192, for a host of 16 GiB or more) or the config is refused at start: 4.75 GiB by default. The proxy runs with `OOMScoreAdjust=-900`, so the kernel kills the children before it, which is why the budget is checked, not hoped for. The price of one window: a single upload moves at most window/RTT (5 MB/s at 50 ms, 250 MB/s at 1 ms); parallel streams are unaffected.
 
-## 5. Per-stream binding and the permit
+## 5. Placement of a stream and its permit
 
-**Rule.** A stream binds to the slot active when its headers arrived, except a `WaitExecution` naming the old child's term, which binds to the old child's slot while that child lives (`bind_preferring`). The bind is one atomic step on the slot word, not a load followed by an increment, because that pair races a retire.
+This section described the per-stream binding to one of two slots, the permit on a slot's state word, the generation of a slot, the retire and the loom models of the bind; they went with the two-slot supervision.
 
-**Mechanism.** Each slot is one `AtomicU64`: bit 63 `CLOSED`, bit 62 `RETIRED` (closed by a retire, as opposed to never opened), the rest count permits. `bind` loads the gate (active slot and hold flag), then `fetch_update`s the slot word: increment unless `CLOSED`. A closed slot sends it back to reload the gate; an unchanged gate on a closed slot is `NoActive` (never a spin). `retire(slot)` refuses `Current`, otherwise `compare_exchange(0, CLOSED|RETIRED)`: a stream that incremented first makes it fail (`Busy(n)`), one that comes later sees `CLOSED`. `open` of a closed or retired slot starts a new **generation**; slots are reused (A, B, A), so `open` must work on a retired slot.
-
-**What the permit guarantees.** Only "the slot was not closed when the permit was taken". It does not mean the stream dispatches before a hold: bind reads the gate, then increments another word, and a pool-queued stream dispatches long after it bound. A stream can bind to A, the supervisor can hold and quiesce A, and the stream can dispatch to a child that answers fenced. That is expected, not a bug; the safety net is the fenced answer and a retry that goes back through `bind` (section 10). I did not add a re-check of the hold flag after the permit: it narrows the window without closing it and cannot be tested deterministically.
-
-**Permit lifetime.** The permit is owned by the future that owns the upstream request and response pumps. It drops after both upstream halves are finished, reset or dropped, never at the downstream END_STREAM: a client-streaming request still open when the response completes keeps `open_permits` at 1 until the upstream RST is sent, or `retire` would return `Closed` and SIGTERM would hit a child still serving it. A queued stream (waiting for an upstream connection) holds its permit from header time. `Pending` counts a stream from accept; the permit is taken before the `Pending` drops, a retry calls `begin_stream()` before it drops its old permit, and `open_streams()` is one word counting live `Pending`s and permits (a stream holding both counts twice, so read it for `== 0`). It never reads 0 while a stream lives, between accept and bind, across a retry, or for a bypass stream (update API, probes, h1: a `Pending` for their life). Test: `open_streams_never_reads_zero_while_a_stream_lives`; it failed against the first version, a sum of the slot words and a separate pending count, which either read order misses one hand-over of.
-
-**Retire.** `can_retire(old)` is the read-only probe a supervisor polls during bake; `retire(old)` is the commit. It returns `Closed` only on the call that closed the slot, `AlreadyClosed` for a repeat (a re-run after an actor restart), so a supervisor signals a child only on `Closed`. It is necessary but not sufficient: the supervisor also needs the child's own `open_streams == 0 && open_sessions == 0` (design section 5 step 10). `NeverOpened` is not proof a child is gone (a proxy restart before `adopt`). No timeout, no kill. A stuck stream stays visible. A child that was stopped needs no bake: its loopback sockets are gone, every upstream stream ends, and `retire` is polled until `Closed`. **Respawn rule:** `open` on an open slot is the same child and returns the same generation; to run a new child in a slot the caller stops the old one, `clear_active()`s if it is active, polls `retire` to `Closed`, then `open`s (a new generation, so the dead process's pool is never reused); `reopen` is not provided. I rejected making `open` fail on a retired slot (it would forbid A, B, A); a stale `open` is the single writer's discipline.
-
-**Loom test (U4b-1; a hard requirement of that PR, not optional).** U4b-1 adds a private `sync` shim through which `slot.rs` takes its atomics (`loom::sync::atomic` under `cfg(loom)`; the skeleton imports `std::sync::atomic`). Model 1: thread 1 calls `bind` once; thread 2 calls `open(B)`, `set_active(B)`, `retire(A)`; thread 3 calls `hold`, then `release_into` or drops the guard. Invariants over every interleaving: a `Permit` for A exists only if `retire` returned `Busy`; if `retire` returned `Closed`, thread 1 got `Bound(B)`, `Held` or `NoActive`, never `Bound(A)`; no underflow; after the permit drops `retire` returns `Closed`. Model 2 (the lost wakeup): a binder samples the epoch inside `bind`, gets `Held`, and `release` lands before the binder parks; the binder's wait condition (`epoch != sampled`) must already be true, for every interleaving (the `watch` doorbell is rung by the same function after the epoch moves, and the waiter re-reads the epoch on wake; the skeleton tests the drop-on-panic ring). Model 3: a stream binds to A, `hold` and `retire`-attempt run, and the stream dispatches after: the permit keeps `retire` at `Busy`. The skeleton's racing test is the stress version (it retires in a loop and binds concurrently); the loom models are the gate.
-
-**Mutants.** `bind` as load-then-`fetch_add`: model 1 and the racing test fail. `retire` that ignores the count: `streams_stay_on_the_slot_they_bound_to` fails. A `Notify` woken once instead of the epoch: model 2 fails. A permit dropped at response end: `open_permits_stays_1_until_upstream_rst` (U4b-1) fails.
+**Rule.** A stream is placed on a member of the pool when its headers arrived (section 9, "Pool mode"), by one pick under the members' lock, which counts the stream on the member in the same step. The count is the stream's **permit** on the member (`MemberPermit`): it drops after both upstream halves are finished, reset or dropped, never at the downstream END_STREAM, so a draining member's count reaches 0 only when its last stream is over. A stream that waits for an upstream connection keeps its permit from header time. `ProxyHandle::open_streams()` is the streams between accept and the answer's head (`Pending`) plus the streams open on the members, read for `== 0`.
 
 ## 6. The hold gate
 
-Design section 5 step 6.1 and 5a. `hold(hold_max)` sets the hold flag, the bound and a sequence number in the same word as the active slot, in one compare-and-swap, so a stream either sees the hold with its bound (`Bind::Held`) or binds before it, and a rejected `hold` changes nothing. Only a stream going to a backend is held: `bypasses_hold` is true for every route that is not `Child(_)` (the update API, probes, metrics, and a path outside the table). A held stream is accepted, its headers are read (so the route is known and bypass works), nothing is opened upstream, and no credit is returned. The exception is a `WaitExecution`: its first message is read ahead (at most 8 frames), and credit is returned for those frames, before the hold.
+This section described the hold gate of a frontend swap: the hold flag in the gate word, the hold queue, its wakeup and expiry, the guard whose drop ended a hold into nothing, and the bypass routes. The gate and the queue were removed with the supervision. A request that no member takes (every member draining, or each that could take it has failed it) is answered at once: trailers-only `UNAVAILABLE` for gRPC, 503 with `Retry-After: 1` for the rest. Nothing waits for a member to appear.
 
-- **Wakeup (no lost release).** A stream calls `bind()`; on `Held { epoch, hold_max }` it admits a `Ticket` (`HoldQueue::admit(now, hold_max, since)`), then waits for "release epoch differs from `epoch` or the deadline". The epoch was sampled before the gate read; every end of a hold (`release_into`, the guard's drop, a panic's drop) goes through one function, `Inner::ring`, after the gate changed: it moves the atomic epoch, then writes the `watch<u64>` doorbell (`ActiveSlot::subscribe`) that lives inside `Inner`. The waiter parks on `wait_for(*e != sampled)`, which checks the current value first, and re-reads `epoch()` on every wake (the atomic is the truth, the channel only wakes the task). On wake the stream calls `bind()` again. Arrival order is **not** guaranteed: tasks wake in any order and a stream that arrives after the release can bind ahead of the queue.
-- **One winner.** The stream decides in its own task, once, with `Ticket::wake(now, released)`: a seen release binds even if the deadline has passed too; an expiry answers trailers-only `UNAVAILABLE` and the task ends, so it can never also bind.
-- **Ending a hold** (round 3, support's needs 2 and 6). `hold(hold_max)` takes the bound: `ProxyConfig::frontend_hold()` (`hold_max_s`, default 20 s: the 3 + 10 + 2 s budget plus a 5 s margin; set 15 for the 15 s support asked for) or `ALL_IN_ONE_HOLD` (300 s). It returns a `HoldGuard`. `release_into(slot)` ends the hold into `slot` in one CAS (held streams bind into it; with nothing held it only sets the active slot) and makes the guard inert. **Dropping the guard first ends the hold into nothing**: no slot is active, held and later streams get `UNAVAILABLE`, `kbf_proxy_hold_abandoned_total` ticks and the gate stays closed until a supervisor sets a slot. This **reverses round 2**, which released a dropped guard to the active slot; support (the consumer, U7b) asked for it, and it is their call: a dropped guard means the supervisor died mid-swap, and the active slot may be a quiesced child. A cancel path must `resume(old)` then `release_into(old)` before its guard drops. I rejected a second dead-man timer: a hung actor is U7a's watchdog, and each stream still expires at its bound.
-- **Buffer** (C3, re-derived in round 3): h2 0.4.20 gives one initial window per connection (`initial_window_size`, SETTINGS) and one connection window; `FlowControl::release_capacity` returns connection and stream credit together (`recv.rs:465`) and refuses more than was received. So a held stream's window is the same `STREAM_WINDOW_BYTES` (256 KiB) as a bound one, the header list is capped at 16 KiB outside it, and a held stream **withholds all credit**: no `release_capacity` until it binds. The connection window is `1000 x window`, so held bodies cannot starve a bypass request on the connection (section 4). At most 2048 held streams (544 MiB worst case); the 2049th gets `UNAVAILABLE` at once and `kbf_proxy_hold_rejected_total` ticks.
-- **Expiry** (support's need 3). Two mechanisms, one count. Each held stream has its own deadline (`since + hold_max`, from its first hold), and its task answers trailers-only `UNAVAILABLE` when it passes: this is the guarantee, with no one polling. `HoldQueue::expire(now)` (`ProxyHandle::expire()`) is the explicit sweep the swap calls on each poll: it fails every held stream past its bound now, counts them in `kbf_proxy_hold_expired_total` and returns how many it failed. Both decide with one compare-and-swap on the ticket (waiting to bound or to expired), so each stream is counted once, a swept stream stays failed even if a release follows, and an expired stream is never bound. Expiry does not release the gate or abort the update.
-- **Held streams are not bound** (C2): no permit, counted in `held` and in `Pending`; `old.open_streams` excludes them.
-- **Bypass:** `bypasses_hold` routes never queue. On h1 the proxy stops reading further requests on a held connection and at `hold_max` answers 503 with `Retry-After`.
-- **Client reset while held:** the ticket drops. **`abort`:** the supervisor calls `resume` on the old child, then `release_into(old)`; held streams bind to the old slot. Crash: the hold is lost, accepted (design section 6).
-- **Mutant "a window with no active child":** `set_active` and `release_into` refuse a closed slot and `bind` on no active slot is `NoActive`. After a stop with no live replacement the supervisor calls `clear_active()`, so a release answers `NoActive` at once instead of binding streams to a dead child for the 3 s connect timeout.
+## 7. The members' ports and the pool
 
-## 7. The upstream table, the supervisor's flows and the pool
+**Ports.** A member's listeners are at fixed offsets from its `base_port` (`[[proxy.frontend]]`, section 9): REAPI 0, worker 1, operator 2, admin calls 3, enrollment 4, all on `127.0.0.1` (the table cannot name another host). The readiness poll is a `GET /readyz` over plain HTTP/1.1 to a member's **operator** listener, the one every frontend already answers it on, once a second; each member has its own, and it is the only writer of that member's readiness (`/readyz` of the proxy is 200 while some member is up and ready).
 
-**Static in U4b** (C10). `[proxy.upstream] base_port = N`. Slot A listens on `N + 0..4`, slot B on `N + 10..14`; offsets: REAPI 0, worker 1, operator 2, admin 3, enrollment 4 (the `+4` is U4b-2's addition to this table and needs U2's go-ahead; `base_port` is at most 65521 so slot B's `+4` is still a port). All `127.0.0.1`; the table cannot name another host. Admin calls carry `ProxyHandle::admin_headers()` (the secret, no identity). U4a's gate covers the REAPI, worker and operator listeners; the admin listener is U2's and unbuilt, so **requirement on U2:** it refuses every request whose trust is not `Proxied` (test `it: admin_port_refuses_an_unproxied_caller`), and until then no claim is made that the admin port is closed to local processes. The 1 s readiness poll is a `GET /readyz` over plain HTTP/1.1 to the active child's **operator** listener, the one every frontend already answers it on (U4b-3b; the admin listener does not exist yet, and the poll moves there if U2 asks for it, with `admin_headers`). `UpstreamTable::port` and `admin_port` compute the ports.
-
-**Frontend swap (U7a's supervisor, all through `ProxyHandle`).**
-1. Start the candidate in the idle slot, wait ready, `slots().open(new)`.
-2. `let hold = slots().hold(cfg.frontend_hold())?`; `control.quiesce(old)`; `control.takeover(new)`.
-3. Success: `release_into(new)`. Failure: kill the candidate, **`retire(new)`** (a slot left open with no child would accept a later `set_active`), `control.resume(old)`, `release_into(old)`. Either way the guard is then inert; `ProxyHandle::expire()` is called on each poll while held.
-4. `control.stand_down(old)`; poll `can_retire(old)` and the child's counts through bake; then `retire(old)` once, and on `Closed` SIGTERM.
-
-**All-in-one swap (stop, then start; 7b).** 1. `hold(ALL_IN_ONE_HOLD)`. 2. Stop the old daemon, `clear_active()` at once, then poll `retire(old)` until `Closed` (its sockets are gone and the permits drain; a slot still `Busy` after the hold bound is reported stuck and never reopened). 3. Start the new one in the idle slot, wait ready, `open(new)`, `release_into(new)`. **New start fails:** `open(old)` returns a **new** generation because step 2 retired the slot (without the retire it would return the dead process's), then `release_into(old)`; **both dead:** start the recorded-active child fresh, `open`, `release_into`. Crash points: before the stop, the old daemon still serves and a cancelled supervisor calls `resume(old)` then `release_into(old)`; if its guard drops first the hold ends into nothing (streams `UNAVAILABLE`, `/readyz` 503, counted) until a slot is set; a proxy crash loses the hold (accepted). Tests: `all_in_one_failed_start_restarts_old_with_new_generation`, `both_children_dead_then_a_fresh_start_is_released_into`.
-
-**Adoption after a proxy restart.** `Proxy::bind` starts the gate holding; the supervisor takes `startup_hold()`, checks pidfd, `/proc/<pid>/exe` and `role` on both children, calls `adopt(active, other)` and `release_into(active)` (or into the other slot, when the recorded update says rollback; the guard is not needed for that). `hold_max` bounds each stream's wait; a startup hold not released within `hold_max_s` of `run` is dropped by the proxy, so a supervisor that never arrives is `UNAVAILABLE` and `/readyz` 503, not a silent hold. If `secret_origin()` is `Created`, the adopted children hold a different secret and would read every call as anonymous: the supervisor refuses to adopt and restarts them.
-
-**Readiness** has one writer (C10): the proxy polls the active child every 1 s, and `/readyz` is 200 only with an active child and a poll that passed within 5 s. The supervisor cannot set it.
-
-**Pool** (C1), per (slot, generation, target). Prior-knowledge HTTP/2, no ALPN, built on `hyper::client::conn::http2::SendRequest`. A pick **reserves** a connection by CAS on its in-flight counter (`< advertised max`) before `send_request`, so pick and send are atomic and `h2` never queues behind one connection. Until the child's `SETTINGS` arrive the assumed max is 100. When every connection is full the stream dials: dials in flight count against the cap of 256 per (slot, target), at most 16 dial at once, and waiters wake on "stream freed or dial finished", so a release does not make thousands of tasks dial together and trip the 3 s connect timeout. A stream beyond the cap waits and keeps its permit. **Generation:** `retire` and a killed candidate close every pool connection of that (slot, generation); a reused slot opens a new generation, so the first stream after a restart never meets a dead connection. A child GOAWAY marks the connection draining (including the graceful form with `last_stream_id = 2^31-1`), is never forwarded, and a stream refused above `last_stream_id` is `Failure::GoAway`, retried. `GoAway` and `Connect` come from typed errors (`is_go_away()` with `is_remote()`, `TrySendError::take_message` returning the request unsent), never from error strings; test `goaway_below_last_stream_id_retries_the_in_flight_stream` (GOAWAY with `last_stream_id = 1` while stream 3 is in flight). A child that stops accepting connections fails new streams with `UNAVAILABLE` after 3 s; open streams are untouched. **Upstream keepalive:** PING every 30 s; an unanswered PING marks the connection suspect (no new streams) and does not close it at 20 s, since a quiesce or a Postgres takeover can stall a loopback child past that; death is the socket closing, with a 5 minute backstop (a PING unanswered for 5 minutes closes the connection, streams on it included).
+**Pool** (C1), per (member address, target). Prior-knowledge HTTP/2, no ALPN, built on `hyper::client::conn::http2::SendRequest`. A pick **reserves** a connection by CAS on its in-flight counter (`< advertised max`) before `send_request`, so pick and send are atomic and `h2` never queues behind one connection. Until the child's `SETTINGS` arrive the assumed max is 100. When every connection is full the stream dials: dials in flight count against the cap of 256 per (slot, target), at most 16 dial at once, and waiters wake on "stream freed or dial finished", so a release does not make thousands of tasks dial together and trip the 3 s connect timeout. A stream beyond the cap waits and keeps its permit. **Members:** a member is a process that runs on its own, so its pools are keyed by where it listens, made when first asked for and kept; a connection of a process that died is found dead by the next stream that picks it (a send on it fails, or its socket closed), is dropped, and the stream dials again. A child GOAWAY marks the connection draining (including the graceful form with `last_stream_id = 2^31-1`), is never forwarded, and a stream refused above `last_stream_id` is `Failure::GoAway`, retried. `GoAway` and `Connect` come from typed errors (`is_go_away()` with `is_remote()`, `TrySendError::take_message` returning the request unsent), never from error strings; test `goaway_below_last_stream_id_retries_the_in_flight_stream` (GOAWAY with `last_stream_id = 1` while stream 3 is in flight). A child that stops accepting connections fails new streams with `UNAVAILABLE` after 3 s; open streams are untouched. **Upstream keepalive:** PING every 30 s; an unanswered PING marks the connection suspect (no new streams) and does not close it at 20 s, since a quiesce or a Postgres takeover can stall a loopback child past that; death is the socket closing, with a 5 minute backstop (a PING unanswered for 5 minutes closes the connection, streams on it included).
 
 ## 8. TLS and identity
 
@@ -273,12 +178,10 @@ server_key_file  = "/etc/kbf/tls/server.key"
 buck2_auth = "none"                  # none | bearer | mtls
 buck2_token_file = "/etc/kbf/buck2.token"   # required for bearer
 proxy_auth_file = "/run/kbf-proxy/proxy-auth"
-state_dir = "/var/lib/kbf-proxy"     # update.json and the swap state machine are U7a's
-hold_max_s = 20                      # a frontend swap's hold; all-in-one is fixed at 300
-remote_operator_file = "/etc/kbf/remote-ci.toml"   # optional, off when absent: a CI job's GitHub OIDC token for POST /v1/update/desired and POST /v1/update/frontend (frontend-proxy.md section 4a)
+# state_dir, hold_max_s and remote_operator_file belonged to the two-slot supervision and the CI
+# credential of the update API: they are still accepted, so that a file written before keeps
+# starting the proxy, and nothing reads them.
 ui = true                            # the read-only web UI at /ui: open (no certificate, no token), GET and HEAD only; false makes /ui a 404 at the proxy
-[proxy.upstream]
-base_port = 18000
 # The list form of the server certificates, in place of server_cert_file/server_key_file:
 # [[proxy.server_cert]]
 # names = ["reapi.example.com"]        # DNS names, each in the certificate's SANs
@@ -296,40 +199,38 @@ max_header_list_bytes = 16384   keepalive_interval_s = 30   keepalive_ack_s = 20
 
 **Server certificates.** `server_cert_file` + `server_key_file` is the same as one `[[proxy.server_cert]]` with no names and `default = true`, so a config written before SNI stays valid. With a list, a ClientHello whose server name equals a `names` entry (case-insensitive, trailing dot ignored) gets that entry's certificate; no server name, or a name that is in no entry, gets the entry marked `default = true`. Two or more entries need exactly one default; an entry without `names` must be the default. At start, and at every reload, each pair is checked: the key is the certificate's, every configured name is a DNS subject alternative name of the leaf (a `*.rest` SAN covers one label), no name appears twice, and the shape rules above hold; a reload also refuses an expired leaf. Any failure refuses the whole list: a start does not proceed, and a reload keeps the previous one. Client certificates are verified against `client_ca_file` and the per-path rules apply, the same on every name.
 
-**Pool mode.** The children are given one of two ways, never both. The `[proxy.upstream]` table is slot mode, described in this document: two slots, A and B, that the supervisor starts and swaps between. `[[proxy.frontend]]` tables are pool mode: frontends that run on their own, which the proxy balances over, with no supervisor, no swap and no hold.
+**Pool mode.** The children are given as `[[proxy.frontend]]` tables, at least one: frontends that run on their own, which the proxy balances over, with no supervisor, no swap and no hold. The `[proxy.upstream]` table of the two-slot supervision is refused at the proxy's start (`ProxyConfig::check_pool`, which `kbf-installer proxy` calls) with a message that says the supervision was removed and what to give instead (`SLOT_MODE_REMOVED`). `ProxyConfig::check`, which `kbf-installer setup` and the release fetcher read the file with, accepts the table and writes it back, so a file written before the removal is not refused where the proxy is not started.
 
 ```toml
 [proxy]
-admin_listen = "127.0.0.1:18090"     # optional, pool mode only, loopback only, plain HTTP, no credential
+admin_listen = "127.0.0.1:18090"     # optional, loopback only, plain HTTP, no credential
 [[proxy.frontend]]
 name = "a"                           # 1 to 64 of letters, digits, '-' and '_'; unique
-base_port = 18000                    # 1024 to 65531; the same offsets as a slot (REAPI 0, worker 1, operator 2, admin 3, enroll 4)
+base_port = 18000                    # 1024 to 65531; the offsets of a member's listeners (REAPI 0, worker 1, operator 2, admin 3, enroll 4)
 [[proxy.frontend]]
 name = "b"
 base_port = 18010                    # at least 5 above or below any other frontend's
 ```
 
-A stream goes to the frontend with the fewest streams open among those that are up (not draining) and ready; frontends with as many are taken in turn. A frontend is ready while its last `GET /readyz` on its operator listener, asked once a second, passed; a frontend that is up but not ready is taken only when none is ready, and one that cannot be connected to is not ready until a poll passes again. A draining frontend is never taken and its open streams run to their end. A stream that fails before any answer (a refused connection, `REFUSED_STREAM`, a GOAWAY that proves it unprocessed, a fenced answer) is placed once more on a frontend that has not failed it, if the request is whole (the rules of section 10). `/readyz` is 200 while some frontend is up and ready. With every frontend draining or failed, a call is `UNAVAILABLE`. A `WaitExecution` is not read for the term of an old child. `GET /metrics` has the series `kbf_proxy_member_up`, `kbf_proxy_member_ready`, `kbf_proxy_member_open_streams` (by `member` and `target`), `kbf_proxy_member_picked_total` and `kbf_proxy_member_failed_total` for each frontend, and no child series.
+A stream goes to the frontend with the fewest streams open among those that are up (not draining) and ready; frontends with as many are taken in turn. A frontend is ready while its last `GET /readyz` on its operator listener, asked once a second, passed; a frontend that is up but not ready is taken only when none is ready, and one that cannot be connected to is not ready until a poll passes again. A draining frontend is never taken and its open streams run to their end. A stream that fails before any answer (a refused connection, `REFUSED_STREAM`, a GOAWAY that proves it unprocessed) is placed once more on a frontend that has not failed it, if the request is whole (the rules of section 10). `/readyz` is 200 while some frontend is up and ready. With every frontend draining or failed, a call is `UNAVAILABLE`. A `WaitExecution` is not read for the term of an old child. `GET /metrics` has the series `kbf_proxy_member_up`, `kbf_proxy_member_ready`, `kbf_proxy_member_open_streams` (by `member` and `target`), `kbf_proxy_member_picked_total` and `kbf_proxy_member_failed_total` for each frontend, and no child series.
 
 The admin API is served on `admin_listen` and on no other socket: `GET /v1/proxy/upstreams` lists `{"name", "state": "up"|"draining", "ready", "open_streams": {"reapi", "worker", "operator", "enroll"}}` for each frontend; `POST /v1/proxy/upstreams/{name}:drain` and `...:undrain` change the state, are idempotent and answer the same list; an unknown name is a 404 and changes nothing. The API asks for no credential, and a request a web page could have sent is a 403: one with an `Origin` header, or whose `Host` is not an IP literal on loopback (use the address of `admin_listen`; a DNS name that was made to point at it does not pass). `admin_listen` must not be a port of a frontend (`base_port` to `base_port + 4`). A frontend leaves the pool for an update by being drained, waited for until its `open_streams` are 0, restarted, waited for until it is ready, and undrained.
 
-Unknown keys are refused at start. U4b-3 adds `proxy: Option<ProxyConfig>` to the installer's settings and keeps the installer's own deny-unknown rule. The operator token and update credential (C9) are read by the proxy; U8 injects a different `UpdateHandler`, not a different token source.
+Unknown keys are refused at start. U4b-3 adds `proxy: Option<ProxyConfig>` to the installer's settings and keeps the installer's own deny-unknown rule. The operator token, which is also the update credential (C9), is read by the proxy.
 
 ## 10. Keepalive, retry, GOAWAY and resets
 
 - **No stream deadlines.** No route timeout, no max stream duration. Idle timeout: `idle_of(path)` is `Never` for `Execution/Execute` and `Execution/WaitExecution` (matched by full method path) and 7200 s for the rest.
 - **Dead peers.** Downstream PING every 30 s, ack within 20 s; a failed ack closes that connection only. Upstream PING marks a connection suspect and closes it only after 5 minutes without an answer (section 7).
-- **Replay buffer** (C5): one buffer serves hold and retry. Request bytes are kept from the first byte, at most 64 KB, as `Bytes` clones (the skeleton counts bytes), freed at `close()`. A 3 hour Execute keeps its buffer until the first response frame, since tonic sends headers lazily. The window closes for good at an upstream response head that is not fenced, or when a frame would overflow it. `may_retry` is true only for: not ByteStream, fewer than 2 dispatches, window open **and the client's END_STREAM seen** (`replayable`), failure in `{Connect, RefusedStream, GoAway, Fenced}`. An open bidirectional request (`Worker.Session`) is never re-dispatched: no remainder is spliced onto a new stream.
-- **Order at the first response head** (`on_first_response`): evaluate `is_fenced` on it first. Fenced: the window stays open, `may_retry` decides, and the caller `close()`s after the re-dispatch is issued or refused. Not fenced: close, then forward. Closing first would make a fenced answer unretriable.
-- **Fenced-not-committed** (C6): a trailers-only answer with `grpc-status: 14` and exactly one `x-kbf-fenced: nothing-committed`. Any other shape (a body, two markers, another status) is not fenced. If `may_retry` refuses, the client gets the same `UNAVAILABLE` with the marker stripped, which a gRPC client retries by itself; correct because the marker means nothing committed.
-- **A retry is a new bind**, not a reuse of the slot: reset the old upstream stream, call `begin_stream()` (so the stream is never in no count), drop the old permit, call `bind()` with `attempts + 1`. If a hold is in force the stream takes a queue place like any other (same `queue_streams` bound, a fresh ticket with the stream's first `since`, so chained holds cannot extend its wait past one bound) and goes to the slot the hold ends into; else to the active slot. Two attempts at most, so no loop.
-- **Resets, in the order applied.** (1) `REFUSED_STREAM` or a GOAWAY above `last_stream_id`: `may_retry` first, before any mapping. (2) `RST_STREAM(NO_ERROR)` after the child sent a complete response: not an error, forward the response. (3) A reset on a non-gRPC path (`/v1/*`, `/metrics`): 502 on h1 or `RST(INTERNAL_ERROR)` on h2, never a gRPC trailer. (4) A gRPC path, headers not yet sent: trailers-only `UNAVAILABLE`. (5) Headers sent: a trailers frame with `UNAVAILABLE` follows the data; a data frame cut mid-message is followed by the same non-OK trailer, which tonic reports as a status error, never as a short OK message (tested with a tonic client). Client RST: propagated upstream as `RST_STREAM(CANCEL)`; the permit drops after it is sent. **Child GOAWAY:** never forwarded. **The proxy's own GOAWAY:** only on its shutdown and on a connection that trips a flood limit (a misbehaving connection only); a hold, a flip and a retire send none.
-- **Flow control.** One window for every stream, 256 KiB (`STREAM_WINDOW_BYTES`), in both directions, held or bound: h2 0.4.20 cannot grow one stream's window after dispatch. A held stream returns no credit; a bound stream returns credit as the other side consumes (`release_capacity`). The connection window is 1000 x window, so no combination of held bodies stalls a bypass request. Adaptive BDP is off. Raising the window to buy upload speed raises `max_streams x window` in step; the memory-budget check at start enforces it.
-- **h2 flood limits.** Derived from the 1000-stream cap, not left at the defaults of about 20: a Buck2 build cancel resets hundreds of streams at once, and tripping the limit would GOAWAY the connection with pre-flip streams on it. Max pending reset streams (rapid reset) is set above 1000, the header-list cap, CONTINUATION frame count and byte caps, concurrent streams per connection 1000. Test: 1000 client cancels on one connection trip nothing; a real rapid-reset attack does.
+- **Replay buffer** (C5): request bytes are kept from the first byte, at most 64 KB, as `Bytes` clones (the skeleton counts bytes), freed at `close()`. A 3 hour Execute keeps its buffer until the first response frame, since tonic sends headers lazily. The window closes for good at the upstream's response head, or when a frame would overflow it. `may_retry` is true only for: not ByteStream, fewer than 2 dispatches, window open **and the client's END_STREAM seen** (`replayable`), failure in `{Connect, RefusedStream, GoAway}`. An open bidirectional request (`Worker.Session`) is never re-dispatched: no remainder is spliced onto a new stream. The "fenced, nothing committed" answer of the two-slot design (a trailers-only `grpc-status: 14` with `x-kbf-fenced`) is gone: no child sends it.
+- **A retry is a new placement**, not a reuse of the member: the old upstream stream is reset, the old permit dropped, and the stream is picked again with the members that failed it left out (`attempts + 1`). With no member left the stream is `UNAVAILABLE`. Two attempts at most, so no loop.
+- **Resets, in the order applied.** (1) `REFUSED_STREAM` or a GOAWAY above `last_stream_id`: `may_retry` first, before any mapping. (2) `RST_STREAM(NO_ERROR)` after the child sent a complete response: not an error, forward the response. (3) A reset on a non-gRPC path (`/v1/*`, `/metrics`): 502 on h1 or `RST(INTERNAL_ERROR)` on h2, never a gRPC trailer. (4) A gRPC path, headers not yet sent: trailers-only `UNAVAILABLE`. (5) Headers sent: a trailers frame with `UNAVAILABLE` follows the data; a data frame cut mid-message is followed by the same non-OK trailer, which tonic reports as a status error, never as a short OK message (tested with a tonic client). Client RST: propagated upstream as `RST_STREAM(CANCEL)`; the permit drops after it is sent. **Child GOAWAY:** never forwarded. **The proxy's own GOAWAY:** only on its shutdown and on a connection that trips a flood limit (a misbehaving connection only); a drain sends none.
+- **Flow control.** One window for every stream, 256 KiB (`STREAM_WINDOW_BYTES`), in both directions: h2 0.4.20 cannot grow one stream's window after dispatch. A stream returns credit as the other side consumes (`release_capacity`). The connection window is 1000 x window, so no combination of unread bodies stalls a probe on the connection. Adaptive BDP is off. Raising the window to buy upload speed raises `max_streams x window` in step; the memory-budget check at start enforces it.
+- **h2 flood limits.** Derived from the 1000-stream cap, not left at the defaults of about 20: a Buck2 build cancel resets hundreds of streams at once, and tripping the limit would GOAWAY the connection with its other streams on it. Max pending reset streams (rapid reset) is set above 1000, the header-list cap, CONTINUATION frame count and byte caps, concurrent streams per connection 1000. Test: 1000 client cancels on one connection trip nothing; a real rapid-reset attack does.
 
 ## 11. Pre-stream limits and the verb
 
-Handshake, h2 preface and h1 request-head timeouts: 10 s each (`pre_stream_timeout_s`); `max_connections`, `max_connections_per_ip`; per-address rate limit before any token check. **HTTP/1.1** (C4) is served only for `/v1/*`, `/healthz`, `/readyz` and `/metrics`; the request head is parsed with `httparse`, at most 16 KB and 100 headers, origin-form targets only (`CONNECT`, absolute-form and `Upgrade` are 400), and a gRPC path on h1 is 426. The hold bypass is decided from the same parse.
+Handshake, h2 preface and h1 request-head timeouts: 10 s each (`pre_stream_timeout_s`); `max_connections`, `max_connections_per_ip`; per-address rate limit before any token check. **HTTP/1.1** (C4) is served only for `/v1/*`, `/healthz`, `/readyz` and `/metrics`; the request head is parsed with `httparse`, at most 16 KB and 100 headers, origin-form targets only (`CONNECT`, absolute-form and `Upgrade` are 400), and a gRPC path on h1 is 426.
 
 **Verb.** `kbf-installer proxy [--config PATH] [--check]`: `--config` defaults to `/etc/kbf/installer.toml`; `--check` loads `installer.toml` the way a run does, through `InstallerToml::parse_tolerant` (the confirm windows, the fetch timeout, `database` and the `[proxy]` table, not only the table) and exits 0 or 2 without binding. A key the verb does not read is not checked, so `--check` (the `ExecStartPre` of `kbf-proxy.service`) does not catch a misspelt key of the rest of the file; `setup` and the root run helper, which read the file closed, refuse it. A malformed `[proxy]` table still makes the root run helper refuse `installer.toml`, since both check the one table. No other flag: everything else is the `[proxy]` table, since configuration is flags and files, not the environment. The two environment variables it reads (`LISTEN_FDS`, `LISTEN_PID`) are the platform's socket-activation markers. To add it: a `Verb::Proxy` variant (`cli.rs`), a `built_by` arm, a dispatch arm (`app.rs`), `needs_root` false. It is not a `kbf-cli` mode: `kbf-cli`'s `GROUPS` rule (every flag of every mode in one group) then does not apply, but the child's new `--await-takeover` (U2) must join a group there. Installer dependency: `kbf-installer` gains `kbf-proxy` and with it tokio, hyper and rustls in the same binary as the root helper. **Risk, with a recommendation:** the root half links a network stack it never runs. Keep the design's single verb, and add a layering test (U4b-3b) that the root helper's modules (`helper/`, `run`) and every file outside the dispatch name neither `kbf_proxy` nor the verb's module `proxy_verb`; if the maintainers prefer no shared binary, `kbf-proxy` gets its own `main` and the verb becomes `exec` of it, which is a unit-file change, not an API one.
 
@@ -500,7 +401,7 @@ What the first I/O PR does, where it differs from sections 2 to 15, and what it 
 - **`Proxy::bind(cfg: ProxyConfig, listener: OwnedFd)`** builds the runtime and starts the gate holding. `ProxyHandle` has `runtime`, `slots`, `expire`, `startup_hold`, `snapshot`, `open_streams`, `shutdown`; `secret_origin`, `admin_headers` and `reload_tls` arrive with the secret and TLS code in U4b-2. `ProxySnapshot::ready` is false and `/readyz` is 503 until U4b-3's poll writes it. `LISTEN_FDS` handling belongs to the verb (U4b-3).
 - **Review SHOULDs.** `Inner::ring` takes the epoch inside the doorbell's lock (model 2b). The proxy ends a startup hold nobody released through the crate-private `ActiveSlot::abandon_startup` (sequence 1, so a supervisor's later hold is never touched). (Changed in U4b-3a: a stream's `since` now lives in `run`, so a retry that is held again keeps the first bound.)
 - **Retry and idle.** Idle is one `Activity` per stream, touched by either half and checked while waiting for the response head and while the response streams. Retry is wired for `Connect`, `RefusedStream` and `GoAway`: at most one more dispatch, the whole request replayed from the kept `Bytes` (a request still open, over 64 KiB or a ByteStream is never repeated), the old pump awaited before the permit drops, and a `Pending` begun before it does. `Fenced` is U4b-3. A body that was read is not sent again as headers-only: coverage found that bug in the first cut.
-- **Loom** runs under `--cfg kbf_loom` (not `loom`: tokio reads that cfg too), `cargo xtask proxy-loom`. The CI step is `run: cargo xtask proxy-loom`; adding it to `ci.yml` needs a token with the workflow scope, which the author does not have, so it is the maintainers' line to add.
+- **Loom** (history): the models of the slot and the gate ran under `--cfg kbf_loom`, `cargo xtask proxy-loom`. They went with the slot; the cfg, the verb and the dependency are gone.
 - **Tests** run over in-memory pipes (`Connector` for the pool, `Listen` for the accept loop) under paused time. With real sockets a paused clock advances whenever every task waits on I/O, which fired the idle and hold timers in the middle of a round trip.
 - **Not safe to expose yet**: there is no TLS, no auth, and `/metrics` and the update API answer anyone who connects. U4b-2 puts auth at `Service::handle`, the one place a request is classified.
 - **Left for U4b-2 and U4b-3** (keepalive, fenced re-dispatch and flood limits are done in U4b-3a below): TLS, identity, auth, h1, the secret file, `kbf-tls` optional client (U4b-2); keepalive both ways, fenced re-dispatch, flood limits and attack tests, the readiness poll (done in U4b-3b), `kbf-installer proxy`, the layering test, the `kbf-integration-test` soak, the h2 preface timeout, connection-panic counting, closing a retired generation's pool at once (it is dropped when the slot's next generation is first used) (U4b-3).
@@ -525,7 +426,7 @@ Fixed, each with a test seen red under the mutant:
 - **A trailers error** after the data is a failed stream, not a silently short response (h2 cannot produce it today: the arm is shared with the data error, so there is no second path to test).
 - **A child that never answers the PING** at dial is a failed dial (and counted), not a connection that runs on h2's assumed 100 streams.
 - **`Proxy::bind` refuses `buck2_auth` other than `none`** (`ErrorKind::Unsupported`) until U4b-2: a configuration that asks for authentication is not served open.
-- **The loom gate** counts the tests it ran (`xtask proxy-loom` fails under five), and model 2 fails if no interleaving answered `Held`.
+- **The loom gate** (history): it counted the tests it ran and is gone with the models.
 - The redundant `Pending` carried across a retry is gone: the stream's own lives for the whole run. The two 1000-stream constants are named `DOWNSTREAM_`/`UPSTREAM_CONNECTION_STREAMS`.
 
 Known and left: `/healthz` answers 200 unconditionally and `/readyz` 503 until a poll has passed (the poll is `probe`, U4b-3b: 200 only while the gate has an active slot and a poll of that slot, in that generation, answered 200 within the last 5 s); `kbf_proxy_hold_seconds` of the frontend-proxy note is not exported yet (U4b-3); a stream is bound after its task is scheduled, not at the instant its headers arrive (microseconds; a flip inside it binds the new slot); a shutdown cuts streams that outlive the fixed 5 s drain; `ProxyHandle::expire` is `#[must_use]`; `xtask proxy-loom` sets `RUSTFLAGS`, which replaces any `[target]` rustflags of a cargo config; **`ci.yml` has no loom step, which is a merge blocker for "loom in CI"** (needs a workflow-scope token); the base branch's `kbf-server/tests/proxy_auth.rs` carries a `private address literal that `repo_lints` refuses (U4a's change).

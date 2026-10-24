@@ -184,7 +184,8 @@ pub struct InstallerToml {
     pub frontend: Option<FrontendPull>,
     /// The `[proxy]` table, read by `kbf-installer proxy`. No flag of `setup` writes it (the
     /// operator does, by hand); [`InstallerToml::render`] writes the whole table, so a file that
-    /// is read and rendered keeps every key of it, the slot table of an earlier build included.
+    /// is read and rendered keeps every key of it, the slot table of an earlier build included
+    /// (the proxy refuses that table at its start, setup and the release fetcher do not).
     /// Only a build with the `proxy` feature has it: without, a file with a `[proxy]` table is
     /// not read at all.
     #[cfg(feature = "proxy")]

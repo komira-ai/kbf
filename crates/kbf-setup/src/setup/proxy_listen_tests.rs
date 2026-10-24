@@ -9,7 +9,7 @@ const UNITS: &[&str] = &["kbf-frontend.service"];
 /// The operator's `[proxy]` table, with `extra` on top of it.
 fn table(extra: &str) -> String {
     format!(
-        "[proxy]\n{extra}operator_token_file = \"/etc/kbf/operator.token\"\nserver_cert_file = \"/etc/kbf/tls/server.pem\"\nserver_key_file = \"/etc/kbf/tls/server.key\"\nclient_ca_file = \"/etc/kbf/tls/ca.pem\"\n\n[proxy.upstream]\nbase_port = 18000\n"
+        "[proxy]\n{extra}operator_token_file = \"/etc/kbf/operator.token\"\nserver_cert_file = \"/etc/kbf/tls/server.pem\"\nserver_key_file = \"/etc/kbf/tls/server.key\"\nclient_ca_file = \"/etc/kbf/tls/ca.pem\"\n\n[[proxy.frontend]]\nname = \"a\"\nbase_port = 18000\n"
     )
 }
 

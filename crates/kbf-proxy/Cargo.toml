@@ -8,7 +8,7 @@ repository.workspace = true
 publish.workspace = true
 
 # The frontend host's front door (docs/design/frontend-proxy.md, docs/design/kbf-proxy-api.md):
-# one TLS terminator that routes each HTTP/2 stream to the active child frontend over loopback.
+# one TLS terminator that routes each HTTP/2 stream to a frontend of its pool over loopback.
 # The downstream side is hyper's HTTP/2 and HTTP/1.1 servers behind one TLS terminator; the upstream
 # pool is built on h2's own client, because the child's advertised stream limit is on h2's
 # types and not on hyper's.
@@ -22,14 +22,12 @@ http-body.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["http1", "http2", "server"] }
 hyper-util = { workspace = true, features = ["http2", "tokio"] }
-kbf-oidc.workspace = true
 kbf-peer.workspace = true
 kbf-tls.workspace = true
 rustix = { workspace = true, features = ["fs", "process"] }
 rustls.workspace = true
 serde.workspace = true
-# Reads the child's `role` answer (`held_generation`, the term of its operation names), and
-# writes the pool's admin API answers and member list.
+# Writes the pool's admin API answers and member list.
 serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
@@ -40,15 +38,8 @@ toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-kbf-oidc = { workspace = true, features = ["testkit"] }
 rcgen.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "test-util"] }
-# A test that runs a `tracing` macro installs a subscriber, so the macro's fields count as run.
-tracing-subscriber.workspace = true
-
-# The model checker, under its own cfg (see the workspace lints and cargo xtask proxy-loom).
-[target.'cfg(kbf_loom)'.dependencies]
-loom.workspace = true
 
 [lints]
 workspace = true

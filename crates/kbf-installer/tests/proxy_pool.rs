@@ -102,7 +102,8 @@ fn check(path: &Path) -> Output {
 }
 
 /// Asserts that `--check` takes a pool table, with a state database named or not (a pool
-/// migrates nothing), and refuses (exit 2, naming both) a table that has the slot table as well.
+/// migrates nothing), and refuses (exit 2, saying that the two-slot supervision was removed) a
+/// table that has the slot table as well.
 #[test]
 fn check_takes_a_pool_table_and_refuses_one_that_is_also_a_slot_table() {
     let path = pool_config("check", free_address(), "", DATABASE);
@@ -121,7 +122,7 @@ fn check_takes_a_pool_table_and_refuses_one_that_is_also_a_slot_table() {
     let out = check(&other);
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{err}");
-    assert!(err.contains("not both"), "{err}");
+    assert!(err.contains("two-slot supervision was removed"), "{err}");
 }
 
 /// Starts the verb with `listener` as its descriptor 3 and `LISTEN_PID` set to the child's own

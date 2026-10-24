@@ -1,7 +1,6 @@
 //! Readiness of the members of a pool: one task per member asks its operator listener
-//! `GET /readyz` every second, with the question the slot-mode poll asks
-//! ([`crate::probe::Readiness::ask`]: a 200 within 3 s is a pass, anything else is not), and
-//! records the answer on the member.
+//! `GET /readyz` every second ([`crate::probe::Readiness::ask`]: a 200 within 3 s is a pass,
+//! anything else is not), and records the answer on the member.
 //!
 //! The answer is the member's whole readiness: a pass makes it ready at once, a failed poll
 //! makes it not ready at once, and a stream that could not connect to it makes it not ready
