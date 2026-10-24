@@ -1538,6 +1538,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-coordinator"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "bytes",
+ "clap",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "kbf-ca",
+ "kbf-oidc",
+ "kbf-peer",
+ "kbf-testkit",
+ "kbf-tls",
+ "kbf-types",
+ "kbf-updater",
+ "rcgen",
+ "rustix",
+ "rustls",
+ "serde",
+ "serde_json",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "kbf-coverage"
 version = "0.1.0"
 dependencies = [
@@ -2665,6 +2696,7 @@ dependencies = [
  "httparse",
  "kbf-host-install",
  "kbf-testkit",
+ "kbf-types",
  "libc",
  "serde",
  "serde_json",

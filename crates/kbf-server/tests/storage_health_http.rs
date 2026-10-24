@@ -78,7 +78,6 @@ fn start() -> Server {
         listen: loopback(),
         token: None,
         local_cache: None,
-        releases: None,
     };
     let bound = bind_server_with_state(
         Arc::new(Cache::memory()),
