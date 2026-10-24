@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use futures::future::AbortRegistration;
-use kbf_front::{Backend, Cache, Described, Submission};
+use kbf_front::{Backend, Cache, Described, Dispatch, Submission};
 use kbf_sched::{DaemonInstance, Request};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{
