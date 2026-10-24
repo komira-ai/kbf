@@ -12,6 +12,7 @@
 //! - [`session`]: the launchd session type `Ready` reports, and the root refusal.
 //!
 //! - [`mount`]: `mount-share`, the guest's own bounded virtiofs mount.
+//! - [`frame`]: the frames probe results and ready markers travel in over virtio-socket.
 //! - [`probe`]: the probe modes `kbf-vmm probe g2` and `g3` read, which run as any user.
 //!
 //! It serves a Unix socket. The virtio socket a VM gives it, the relay through
@@ -20,6 +21,7 @@
 
 pub mod client;
 pub mod diag;
+pub mod frame;
 pub mod mount;
 pub mod probe;
 #[cfg(target_os = "macos")]

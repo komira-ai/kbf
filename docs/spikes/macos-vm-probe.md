@@ -335,6 +335,44 @@ Read `matrix` in `<harvest>/private/var/log/kbf-probe-diag` (one row per share, 
 | `other-owner` works and `base` fails | the directory must not be owned by the VM's user (unlikely; re-run as root to get this row) |
 | the automount write works and the matrix rows fail | use the automount path for results (it needs a user session or the system's own mount; see `automount` in the guest's probe result) |
 
+### E1 result, fourth run: no file can be read or written on a share, so results go over vsock
+
+Four runs on a Mac Studio (host and guest on macOS 27.0.1) gave one answer: the guest boots,
+launchd runs the daemons written offline, and the share mounts, but inside the guest every
+file read or write on a virtiofs share fails with `EPERM`, for root and for `nobody`
+(in the fourth run the guest could not even read `matrix.json`). Listing a directory works
+and files show as owned by `_unknown`. The guest's own disk is fine and the host logs no
+sandbox or TCC denial. Apple documents the share for a user logged in to the guest; the
+probe guests rest at the login window. So results and markers no longer depend on the share:
+
+- the host attaches a virtio socket device and listens on port 5000 (`VmSpec.vsock_ports`,
+  `VmSpec.results_dir`); `src/sink.rs` writes each frame it receives into the VM's
+  `results/` directory under the name the probes already wait for;
+- `kbf-guest probe-guest` and `probe-ready` send their answer first as a frame
+  (`kbf_guest::frame`: a four-byte big-endian length, then JSON `{"kind", "name", "body"}`
+  with `kind` one of `ready`, `result`, `log`; the host answers `ack` or `refused`) and
+  write the file into the share only when vsock cannot be used. Each attempt, up to five two
+  seconds apart, and each failure is logged to the daemon's log;
+- `probe-diag` reports `vsock`: whether the guest connected and whether a `log` frame named
+  `vsock-test` came back acknowledged.
+
+What to read in the next E1 run:
+
+| where | line | meaning |
+|---|---|---|
+| `e1.json`, each arm | `guest_marker_ms` is a number and `results_files` lists `ready-system`, `ready-login`, `guest-probe-root.json`, `guest-probe-user.json`, `vsock-test.log` | the vsock route works end to end |
+| `e1.json`, each arm | `helper_log` has `kbf-vmm: vsock Ready ready-system -> .../results/ready-system` | the host received and wrote the frame |
+| `<harvest>/private/var/log/kbf-probe-diag` | `"vsock": {"connected": true, "round_trip": true}` | the guest reached the host and got an acknowledgement |
+| same | `"connected": false` with `"stage": "socket"` and an `errno` | the guest kernel has no vsock socket family for processes (`EAFNOSUPPORT`, 47): the premise of this change is wrong and a different channel is needed |
+| same | `"stage": "connect"` | the family exists but nothing accepted: look at the listener (`helper_log` has no `vsock port` line) and at whether the VM has a socket device |
+| same | `"connected": true`, `"round_trip": false` | the host received the connection and the frames were not answered; the `error` says which side |
+| `com.kbf.probe.system.log` in the harvest (`/private/var/tmp`, the log directory of the daemons that run as `nobody`) | `vsock port 5000: ready-system delivered on attempt N` | the guest used vsock; `vsock not usable ... writing ... instead` means it fell back to the share |
+
+The macOS socket family (`AF_VSOCK`, 40) and the address layout (`struct sockaddr_vm` with a
+length byte, as in the macOS SDK) are taken from the SDK headers and have not run in a macOS
+guest yet; the host's use of the connection's descriptor as an ordinary stream socket is
+Apple-undocumented. Both are what this run answers.
+
 ## What to send back
 
 Everything the commands wrote, including each helper's log (the cause of a VM that did

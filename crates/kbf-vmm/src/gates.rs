@@ -51,7 +51,7 @@ impl Channels {
         vsock: false,
         console: false,
     };
-    const VSOCK: Self = Self {
+    pub(crate) const VSOCK: Self = Self {
         vsock: true,
         console: false,
     };
@@ -84,6 +84,9 @@ pub(crate) fn attach_share(spec: &mut VmSpec, share: &Share, channels: Channels)
     ];
     if channels.vsock {
         spec.vsock_ports = vec![guest::VSOCK_PORT];
+        // The guest sends its results and markers on that port; the helper writes them into
+        // the results directory the probes read.
+        spec.results_dir = Some(share.results());
     }
     if channels.console {
         spec.console_ports = vec![guest::CONSOLE_NAME.to_owned()];

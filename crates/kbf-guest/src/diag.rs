@@ -8,7 +8,8 @@
 //! directory, remove) in the share root, in `results/` and in a control directory on the
 //! guest's own disk, reporting each step's errno. It prints one JSON object on stdout
 //! (the launch daemon sends that to a file the harvest reads) and also tries to leave it
-//! in `results/kbf-diag.json`. It runs system tools for the facts and does no shell work.
+//! in `results/kbf-diag.json`. It also says whether the guest can connect to the host on
+//! virtio-socket and whether a test frame came back acknowledged. It runs system tools for the facts and does no shell work.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -40,6 +41,9 @@ pub struct DiagArgs {
     /// Where to mount it.
     #[arg(long, default_value = "/private/tmp/kbfmnt-diag")]
     pub mountpoint: PathBuf,
+    /// The vsock port the host listens on for results; the diagnosis sends it a test frame.
+    #[arg(long, default_value_t = 5000)]
+    pub vsock_port: u32,
 }
 
 /// What the diagnosis asks of the guest; a fake in tests.
@@ -50,6 +54,10 @@ pub trait DiagHost {
     fn ids(&self) -> Value;
     fn exists(&self, path: &Path) -> bool;
     fn pause(&self, d: Duration);
+    /// Connects to the host on vsock `port`, sends a `log` frame named `vsock-test` and
+    /// waits for the acknowledgement: whether the connection was made, whether the frame
+    /// came back acknowledged, and the errno or error of the step that failed.
+    fn vsock_round_trip(&self, port: u32) -> Value;
     /// Mounts `tag` at `mountpoint`, runs `inside` on it, and unmounts it again with the
     /// system call; the errno of each of the three.
     fn mount_cycle(&self, tag: &str, mountpoint: &Path, inside: &dyn Fn(&Path) -> Value) -> Value;
@@ -158,6 +166,7 @@ pub fn diagnose(host: &dyn DiagHost, a: &DiagArgs) -> Value {
         "wait_path_appeared": appeared,
         "waited_s": waited.as_secs_f64(),
         "ids": host.ids(),
+        "vsock": host.vsock_round_trip(a.vsock_port),
         "facts": facts,
         "writes": [
             write_steps(&a.share),
@@ -267,6 +276,9 @@ mod tests {
         fn pause(&self, _: Duration) {
             self.pauses.set(self.pauses.get() + 1);
         }
+        fn vsock_round_trip(&self, port: u32) -> Value {
+            json!({"port": port, "connected": true, "round_trip": true})
+        }
         fn mount_cycle(&self, tag: &str, mp: &Path, inside: &dyn Fn(&Path) -> Value) -> Value {
             self.mounted
                 .borrow_mut()
@@ -293,6 +305,7 @@ mod tests {
             automount_dir: dir.join("automount"),
             tag: "t".into(),
             mountpoint: dir.join("mp"),
+            vsock_port: 4242,
         }
     }
 
@@ -353,6 +366,10 @@ mod tests {
             ]
         );
         assert_eq!(r["ids"]["uid"], 0);
+        // The vsock question is asked on the port the daemon was given, and its answer is
+        // in the report next to the share facts.
+        assert_eq!(r["vsock"]["port"], 4242);
+        assert_eq!(r["vsock"]["round_trip"], true);
         assert_eq!(r["facts"]["mount"]["stdout"], "/sbin/mount");
         assert_eq!(
             *host.mounted.borrow(),

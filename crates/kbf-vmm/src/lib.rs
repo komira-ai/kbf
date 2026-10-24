@@ -20,6 +20,7 @@ pub mod probe;
 pub mod report;
 pub mod sampler;
 pub mod signature;
+pub mod sink;
 pub mod spec;
 pub mod system;
 pub mod volume;
