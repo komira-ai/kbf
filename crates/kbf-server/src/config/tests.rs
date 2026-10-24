@@ -484,17 +484,16 @@ fn plain_text_off_loopback_checks_each_listener_through_loopback_only() {
     }
 }
 
-/// Catches a `--releases-dir` that cannot be opened being passed over: the store's directory
-/// is made, and one that cannot be (here a path under a regular file) is an error naming the
-/// flag and the directory, not an API without a store. A usable one gives the API its store.
+/// The retired `--releases-dir` is read by nothing: a path that could never be made (here
+/// under a regular file) does not stop the operator API, and one that does not exist is not
+/// created.
 ///
-/// Catches: the open's error dropped (`.ok()`): the API starts store-less.
+/// Catches: the flag still opening (and so making) a directory, or refusing the start.
 #[test]
-fn a_releases_dir_that_cannot_be_made_stops_the_start_naming_it() {
+fn a_retired_releases_dir_is_neither_opened_nor_made() {
     let base = crate::test_dir::scratch_dir("config-releases");
     let file = base.join("a-file");
     std::fs::write(&file, b"x").expect("file");
-    let under = file.join("store");
     let args = |dir: &std::path::Path| {
         Args::try_parse_from([
             "kbf-server",
@@ -503,14 +502,11 @@ fn a_releases_dir_that_cannot_be_made_stops_the_start_naming_it() {
         ])
         .expect("parses")
     };
-    let why = args(&under).api().expect_err("cannot be made").to_string();
-    assert!(
-        why.contains("--releases-dir") && why.contains("a-file/store"),
-        "{why}"
-    );
-    let api = args(&base.join("releases"))
+    args(&file.join("store"))
         .api()
-        .expect("usable")
+        .expect("the retired flag cannot stop the API")
         .expect("an API");
-    assert!(api.releases.is_some());
+    let absent = base.join("releases");
+    args(&absent).api().expect("usable").expect("an API");
+    assert!(!absent.exists());
 }

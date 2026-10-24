@@ -102,17 +102,29 @@ pub enum RoleError {
 /// # Errors
 /// See [`RoleError`].
 pub fn role_of(der: &[u8]) -> Result<PeerRole, RoleError> {
-    let cert = parse(der)?;
-    let names: Vec<&str> = alt_names(&cert)
-        .filter_map(|name| match name {
-            GeneralName::URI(uri) => uri.strip_prefix(ROLE_URI_PREFIX),
-            _ => None,
-        })
-        .collect();
+    let names = uri_values_of(der, ROLE_URI_PREFIX)?;
     let [name] = names.as_slice() else {
         return Err(RoleError::Count(names.len()));
     };
-    PeerRole::from_name(name).ok_or_else(|| RoleError::Unknown((*name).to_owned()))
+    PeerRole::from_name(name).ok_or_else(|| RoleError::Unknown(name.clone()))
+}
+
+/// What follows `prefix` in each of the certificate's URI subjectAltNames that starts with
+/// it, in the order the certificate lists them (byte for byte: the prefix is not matched
+/// ignoring case). [`role_of`] reads the role this way; a listener for a certificate that
+/// names more than a role (the update coordinator reads an updater's host role) reads the
+/// other prefix the same way.
+///
+/// # Errors
+/// [`RoleError::NotACertificate`]: the bytes are not an X.509 certificate.
+pub fn uri_values_of(der: &[u8], prefix: &str) -> Result<Vec<String>, RoleError> {
+    let cert = parse(der)?;
+    Ok(alt_names(&cert)
+        .filter_map(|name| match name {
+            GeneralName::URI(uri) => uri.strip_prefix(prefix).map(str::to_owned),
+            _ => None,
+        })
+        .collect())
 }
 
 fn parse(der: &[u8]) -> Result<X509Certificate<'_>, RoleError> {

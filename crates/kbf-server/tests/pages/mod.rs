@@ -115,7 +115,6 @@ impl Server {
             listen: loopback(),
             token: None,
             local_cache: None,
-            releases: None,
         };
         let bound = bind_server_with_ui(
             Arc::clone(&cache),
