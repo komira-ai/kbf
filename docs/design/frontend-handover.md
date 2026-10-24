@@ -114,12 +114,11 @@ unread only if the old frontend could not read the store for ten minutes. The ga
 remains is a store written by an earlier release, which ended an operation in two
 transactions and could leave the result in no row, and a result read after its row expired. The old
 frontend does not end that stream on a timer either. After two looks in a row with no trace
-it logs a WARN naming the operation and raises `kbf_frontend_relay_untraced`, and the stream
+it logs a WARN naming the operation, and the stream
 stays open; it ends when the client cancels (Buck2 does on its own timeouts, interrupts and
 exit; an Envoy or connection drop cancels it too) or the operator stops the old instance. A
 cancelled stream no longer counts as a waiting caller, so the old process can exit once the
-rest have ended. `kbf_frontend_relay_untraced` is 0 unless one of those gaps happened: it replaces
-`kbf_frontend_relay_lost_total`, which counted builds ended by the old three-look rule.
+rest have ended.
 
 `WaitExecution`, which Buck2 never calls but other clients may, follows the same rule: a
 stream opened before the handover is answered from the same channel as the `Execute` it
@@ -133,8 +132,7 @@ status the stream broke with, as before: there is nothing to follow.
 and the old one goes not ready. A call that reaches the old one after it has handed over is
 forwarded to the new one (`Execute` and `WaitExecution`: the same message and metadata, which
 the new one authorizes again) and answered from there to its end; it waits inside its own
-open call while the new one takes the store, and nothing is queued or refused. Each is
-counted: `kbf_handover_relayed_total` and `kbf_handover_relays_open`. Storage calls (CAS,
+open call while the new one takes the store, and nothing is queued or refused. Storage calls (CAS,
 ByteStream, action cache) go to the storage nodes from either frontend. A call that raced the
 fence itself (between its request and its queueing) gets UNAVAILABLE at open, which Buck2
 asks again.

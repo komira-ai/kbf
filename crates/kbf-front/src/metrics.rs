@@ -564,17 +564,6 @@ pub struct CacheMetrics {
     /// Finished attempts the learned-sizes shadow compared with its estimate, by the
     /// level the estimate came from and how the attempt fell (`kbf_estimator_shadow_total`).
     pub estimator_shadow: ShadowTotals,
-    /// Operations a frontend that handed its work to a successor follows, whose callers
-    /// still wait, and of which the state store held no trace at the last looks
-    /// (`kbf_frontend_relay_untraced`). They are not ended: each waits until the
-    /// operation shows up in the store, its caller cancels, or the process stops.
-    pub frontend_relay_untraced: Level,
-    /// Execute and WaitExecution calls a frontend that handed its roles over forwarded to
-    /// its successor (`kbf_handover_relayed_total`).
-    pub handover_relayed: Counter,
-    /// Relayed calls open now: each keeps the frontend alive until its action ends
-    /// (`kbf_handover_relays_open`).
-    pub handover_relays_open: Gauge,
     /// Write-tier calls queued on or running on the blocking pool.
     pub tier_in_flight: Gauge,
     /// The wait of one write-tier call for a blocking-pool thread.
@@ -644,9 +633,6 @@ impl Default for CacheMetrics {
             sched_queued: Level::default(),
             sched_leases: Level::default(),
             estimator_shadow: ShadowTotals::default(),
-            frontend_relay_untraced: Level::default(),
-            handover_relayed: Counter::default(),
-            handover_relays_open: Gauge::default(),
             tier_in_flight: Gauge::default(),
             tier_wait: Histogram::new(Unit::Seconds),
             tier_call: Histogram::new(Unit::Seconds),
@@ -903,23 +889,6 @@ impl CacheMetrics {
             self.sched_leases.get(),
         );
         self.estimator_shadow.render(&mut out);
-        out.gauge(
-            "kbf_frontend_relay_untraced",
-            "Operations a frontend that handed its work over follows that the state store \
-             held no trace of at the last looks (their callers keep waiting)",
-            self.frontend_relay_untraced.get(),
-        );
-        out.counter(
-            "kbf_handover_relayed_total",
-            "Execute and WaitExecution calls forwarded to the successor of a frontend that \
-             handed its roles over",
-            self.handover_relayed.get(),
-        );
-        out.gauge(
-            "kbf_handover_relays_open",
-            "Relayed Execute and WaitExecution calls open now",
-            self.handover_relays_open.get(),
-        );
         out.gauge(
             "kbf_tier_in_flight",
             "Write-tier calls queued on or running on the blocking pool",
