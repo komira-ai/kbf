@@ -51,7 +51,7 @@
 //! probe digest (it passes when one answers), so a farm that has lost its `--storage`
 //! node is ready while its other members are. `READY=1` to the service manager, and the
 //! successor's "serving" to its predecessor, do not wait for this check
-//! (`handover::Ready`); `/readyz` stays failing until storage answers.
+//! (`ready::Ready`); `/readyz` stays failing until storage answers.
 //!
 //! **Handing over** (`--handover-socket` with `--instance`, [`crate::handover`]): behind
 //! Envoy, a frontend started while another serves on the same state file binds its own
@@ -111,19 +111,22 @@ use crate::front_maps::FrontMaps;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::handover::{
     self, EnvoyCheck, Facts, Handover, HandoverError, Holder, Instance, Leave, Message, Peer,
-    Ready, Released, Stand, Stop,
+    Released,
 };
 use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
 use crate::listen::{Binder, Socket};
 use crate::members::{Handoff, Members};
 use crate::object_store::delivery::{Delivery, RegistrySource, Reports};
 use crate::proxy_auth::ProxyAuthLayer;
+use crate::ready::Ready;
 use crate::retire::Retire;
 use crate::serve::{
     AbortOnDrop, ServeError, cold_store, drain_and_stop, flow_control, keepalive, log_state,
     map_of, members_of, membership, serve_api, stop_api, sweeping, worker_peers,
 };
+use crate::stand::Stand;
 use crate::start::{Escalation, escalating, interruptions};
+use crate::stop::Stop;
 use crate::store_config::acks::Acks;
 use crate::worker::WorkerService;
 use crate::{Args, ConfigError, SERVER_VERSION, sizes_on};
@@ -960,7 +963,7 @@ impl<'a> Prepared<'a> {
         ) -> Result<Bound, ServeError>,
     ) -> Result<Self, Box<dyn Error>> {
         let args = &flags.server;
-        args.release_poll.warn();
+        args.retired_release.warn();
         let listeners = args.listeners()?;
         let proxy = args.proxy()?;
         let policy = args.reapi_auth_policy()?;
@@ -1096,7 +1099,7 @@ impl<'a> Prepared<'a> {
         let (worker_incoming, worker_latch) = worker.grpc(worker_tls)?;
         worker_stop.closes(worker_latch);
         let api_listener = api_socket.map(Socket::http).transpose()?;
-        let (token, releases) = api.map_or((None, None), |api| (api.token, api.releases));
+        let token = api.and_then(|api| api.token);
         // The enroll listener (which is closed the moment the drain begins, like the
         // others) and the operator API's enrollment routes, which need the CA's pin: both
         // are off without `--enroll-listen`, and the routes then answer 404.
@@ -1140,7 +1143,6 @@ impl<'a> Prepared<'a> {
             enroll_api,
         )
         .merge(crate::verbs::routes(token.clone(), members.clone()))
-        .merge(crate::release::router(releases.clone(), token.clone()))
         .merge(crate::object_store::api::routes(
             token.clone(),
             object_stores.map(|stores| stores.api),
@@ -1289,7 +1291,6 @@ impl<'a> Prepared<'a> {
             let worker_stopped = worker_stop.fired();
             let worker_serve = worker_server
                 .add_service(worker_service)
-                .add_service(crate::release::service(releases))
                 .add_optional_service(membership)
                 .add_optional_service(cold_store)
                 .serve_with_incoming_shutdown(worker_incoming, worker_stopped);

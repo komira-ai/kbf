@@ -87,7 +87,7 @@ reapi-max-streams = 10000
 # release-poll-refs = []
 # Retired: no longer read, the release poller was removed. Accepted and ignored for one release
 # release-poll-repo = "OWNER/NAME"
-# The release store (`docs/design/pull-updates.md`, section 6): a directory where the tarballs of a release and their build attestations are kept, uploaded with `PUT /v1/releases/{commit}/{platform}/{name}` on the operator API (which needs the token) and fetched by the nodes through `ReleaseService.Fetch` on the worker listener, behind its mutual TLS. Made if missing. Without it every update endpoint answers 503 saying so
+# Retired: no longer read, the release store was removed; a directory left there is not touched. Accepted and ignored for one release
 # releases-dir = "DIR"
 # How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done. Buck2 never recovers a stream that breaks mid-action, so the default, 0, is no deadline; set one at least as long as the longest action. When it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off)
 shutdown-timeout-secs = 0

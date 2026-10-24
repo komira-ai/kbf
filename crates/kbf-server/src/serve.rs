@@ -181,9 +181,6 @@ pub struct Api {
     /// daemon whose input cache shares the disk with this server's store
     /// (`kbf all-in-one`).
     pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
-    /// The release store (`--releases-dir`), whose upload route is mounted here and whose
-    /// `ReleaseService` the worker listener serves. `None`: the update endpoints answer 503.
-    pub releases: Option<Arc<crate::release::ReleaseStore>>,
 }
 
 /// Why the server could not start or stopped.
@@ -778,8 +775,8 @@ where
     let reapi_incoming = Incoming::new(reapi_incoming, listeners.reapi_tls);
     let worker_incoming = Incoming::new(worker_incoming, worker_tls);
     let probe_timeout = listeners.store_probe_timeout;
-    let (api_listen, token, local, releases) = api.map_or((None, None, None, None), |api| {
-        (Some(api.listen), api.token, api.local_cache, api.releases)
+    let (api_listen, token, local) = api.map_or((None, None, None), |api| {
+        (Some(api.listen), api.token, api.local_cache)
     });
     // One line: a `?` alone on its own line is a never-taken error region, a missed
     // line in the coverage ratchet (it counts lines per generic copy, best copy wins).
@@ -809,7 +806,6 @@ where
         None,
     )
     .merge(crate::verbs::routes(token.clone(), members.clone()))
-    .merge(crate::release::router(releases.clone(), token.clone()))
     .merge(crate::health::routes(&checks, &farm, members.as_ref()))
     .merge(crate::metrics::router(
         Arc::clone(&cache),
@@ -927,7 +923,6 @@ where
             });
         let worker_serve = worker_server
             .add_service(worker_service)
-            .add_service(crate::release::service(releases))
             .add_service(worker_blobs)
             .add_service(worker_cas)
             .add_service(worker_segments)

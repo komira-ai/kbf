@@ -29,8 +29,8 @@ use kbf_front::Closer;
 use serde::Serialize;
 use tokio::sync::{oneshot, watch};
 
-use crate::handover::Stop;
 use crate::health::Readiness;
+use crate::stop::Stop;
 
 /// What `GET /v1/frontend/drain` answers, and what a drain reports after it begins.
 ///

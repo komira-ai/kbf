@@ -1,12 +1,10 @@
-//! The stop signal, and the rig the tests of the parts of a handover build a serving
-//! frontend from.
+//! The rig the tests of the parts of a handover build a serving frontend from.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use futures::FutureExt as _;
 use futures::future::{AbortHandle, AbortRegistration};
 use kbf_front::{Backend, Cache, Described, Dispatch, Submission};
 use kbf_sched::Request;
@@ -25,7 +23,7 @@ use crate::health::Readiness;
 use crate::state_store::StateStore;
 
 /// A directory of the test's own, removed when dropped.
-pub(super) struct Scratch(pub kbf_testkit::dir::TestDir);
+pub(crate) struct Scratch(pub kbf_testkit::dir::TestDir);
 
 impl Scratch {
     pub fn new() -> Self {
@@ -45,7 +43,7 @@ impl Scratch {
 
 /// A state store over the fake that counts the writer's role being given up, can refuse
 /// to give it up, can have its reads fail, and runs a hook when it is given up.
-pub(super) struct Gives {
+pub(crate) struct Gives {
     inner: Fake,
     pub demoted: AtomicUsize,
     pub refuses_to_demote: AtomicBool,
@@ -157,7 +155,7 @@ impl Store for Gives {
 }
 
 /// A request to run, distinguished by `tag`.
-pub(super) fn request(tag: u8) -> Request {
+pub(crate) fn request(tag: u8) -> Request {
     Request {
         key: ActionKey {
             instance: "main".to_owned(),
@@ -173,7 +171,7 @@ pub(super) fn request(tag: u8) -> Request {
 }
 
 /// Queues `request` on `farm`.
-pub(super) fn submit(farm: &Farm, request: Request) -> Result<kbf_front::Ticket, Status> {
+pub(crate) fn submit(farm: &Farm, request: Request) -> Result<kbf_front::Ticket, Status> {
     farm.submit(Submission {
         request,
         call: None,
@@ -184,7 +182,7 @@ pub(super) fn submit(farm: &Farm, request: Request) -> Result<kbf_front::Ticket,
 
 /// A serving frontend's parts, as a holder stands them down: a farm over a store, a drain,
 /// the stop of the worker listener and the task that expires rows.
-pub(super) struct Rig {
+pub(crate) struct Rig {
     pub dir: Scratch,
     pub store: Arc<Gives>,
     pub backend: Backend,
@@ -301,53 +299,4 @@ impl Rig {
     pub fn uid() -> u32 {
         rustix::process::geteuid().as_raw()
     }
-}
-
-/// Catches: a stop that completes before it is fired (a listener would close while the
-/// frontend serves), one that never completes once fired (a listener that is told to stop
-/// and does not), a clone that does not share the signal, and one fired before anything
-/// waits that is lost.
-#[tokio::test]
-async fn a_stop_completes_for_every_waiter_once_it_is_fired() {
-    let stop = Stop::new();
-    let clone = stop.clone();
-    assert!(stop.fired().now_or_never().is_none(), "fired before it was");
-    let waiting = tokio::spawn(stop.fired());
-    clone.fire();
-    waiting.await.expect("the waiter completes");
-    assert!(stop.fired().now_or_never().is_some(), "a late waiter waits");
-    assert!(clone.fired().now_or_never().is_some());
-}
-
-/// Catches: a stop that closes its listeners late (when the server next polls them: a
-/// listener asleep in accept keeps its socket, and with it the address), and one that
-/// does not close a listener registered after it was given.
-#[tokio::test]
-async fn a_stop_closes_the_listeners_registered_with_it_when_it_is_given() {
-    let any = || "127.0.0.1:0".parse().expect("address");
-    let stop = Stop::new();
-    let socket = crate::listen::Socket::bind(any(), &crate::listen::Binder::new()).expect("bind");
-    let addr = socket.local;
-    let (incoming, latch) = socket.grpc(None).expect("registered");
-    stop.closes(latch);
-    assert!(
-        std::net::TcpStream::connect(addr).is_ok(),
-        "closed before the stop"
-    );
-    stop.fire();
-    assert!(
-        std::net::TcpStream::connect(addr).is_err(),
-        "still open after the stop"
-    );
-    drop(incoming);
-
-    // Registered after the stop was given: closed at once.
-    let socket = crate::listen::Socket::bind(any(), &crate::listen::Binder::new()).expect("bind");
-    let addr = socket.local;
-    let (_incoming, latch) = socket.grpc(None).expect("registered");
-    stop.closes(latch);
-    assert!(
-        std::net::TcpStream::connect(addr).is_err(),
-        "a late listener stays open"
-    );
 }

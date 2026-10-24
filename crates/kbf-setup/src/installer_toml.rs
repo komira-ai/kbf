@@ -122,7 +122,7 @@ impl Source {
 /// has the digest, is looked at when it is used, not when the file is read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrontendPull {
-    /// `https://host[:port]` of the worker listener, where `ReleaseService.Fetch` is served.
+    /// `https://host[:port]` of the worker listener the frontend release source dials.
     pub url: String,
     /// The copy of the CA the listener's certificate chains to.
     pub ca: PathBuf,

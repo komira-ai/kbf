@@ -4,8 +4,9 @@ use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{Released, notify};
+use crate::handover::Released;
 use crate::health::Checks;
+use crate::notify;
 
 /// How often the probes are asked again while one fails.
 const LOOK: Duration = Duration::from_millis(100);
