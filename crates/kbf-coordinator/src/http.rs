@@ -6,7 +6,8 @@
 //!   is read.
 //! - **Control** (TLS, no client certificate): `POST /v1/desired` with CI's OIDC token as
 //!   the bearer and the desired state as JSON; `GET /v1/status` with the operator token as
-//!   the bearer.
+//!   the bearer; `GET /v1/convergence` with CI's OIDC token as the bearer (the operator
+//!   token is refused there).
 //!
 //! An answer is JSON, and an error is `{"error":"<code>"}` with a code from a closed set:
 //! never a claim value, a path or the text of an internal error.
@@ -23,13 +24,16 @@ use kbf_updater::wire::{HEARTBEAT_PATH, Heartbeat, MAX_HEARTBEAT_BYTES};
 use serde::Serialize;
 
 use crate::identity::identity_of;
-use crate::service::{Coordinator, SetError};
+use crate::service::{CiRefused, Coordinator, SetError};
 
 /// The path CI posts the desired state to.
 pub const DESIRED_PATH: &str = "/v1/desired";
 
 /// The path an operator reads the status from.
 pub const STATUS_PATH: &str = "/v1/status";
+
+/// The path CI reads whether the farm has converged from.
+pub const CONVERGENCE_PATH: &str = "/v1/convergence";
 
 /// The most bytes of a desired state read.
 pub const MAX_DESIRED_BYTES: usize = 4096;
@@ -115,8 +119,17 @@ where
                 Err(_) => error(StatusCode::UNAUTHORIZED, "unauthorized"),
             }
         }
+        (Surface::Control, Method::GET, CONVERGENCE_PATH) => {
+            match coordinator.convergence(bearer(&request)).await {
+                Ok(convergence) => json(StatusCode::OK, &convergence),
+                Err(CiRefused::Unauthorized(_)) => error(StatusCode::UNAUTHORIZED, "unauthorized"),
+                Err(CiRefused::Unavailable) => {
+                    error(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+                }
+            }
+        }
         (Surface::Heartbeat, _, HEARTBEAT_PATH)
-        | (Surface::Control, _, DESIRED_PATH | STATUS_PATH) => {
+        | (Surface::Control, _, DESIRED_PATH | STATUS_PATH | CONVERGENCE_PATH) => {
             error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
         }
         _ => error(StatusCode::NOT_FOUND, "not_found"),

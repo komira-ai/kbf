@@ -38,7 +38,8 @@ by `crates/kbf-integration-test/tests/release_artifacts`.
 Thirteen tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), two Debian packages of
 `kbf-installer` ([below](#the-kbf-installer-package-deb)), two of `kbf`
-([below](#the-kbf-package-deb)) and one macOS package of `kbf-installer`
+([below](#the-kbf-package-deb)), one frontend container image per Linux architecture
+([below](#the-frontend-image-oci)) and one macOS package of `kbf-installer`
 ([below](#the-kbf-installer-package-pkg-macos)), built by one job per platform:
 
 | Asset | Runner | Target |
@@ -71,7 +72,7 @@ the guide says. Each tarball holds one member, the binary under its own name. Th
 `kbf-host-install` is signed and checked like the other macOS binaries. `kbf-host-install
 --version` prints its name and package version, which is all the release asks of it.
 
-The packages are the two Linux jobs' debs (two each) and the macOS job's `.pkg`:
+The packages are the two Linux jobs' debs (two each) and frontend images, and the macOS job's `.pkg`:
 
 | Asset | Built by | Holds |
 |---|---|---|
@@ -79,6 +80,8 @@ The packages are the two Linux jobs' debs (two each) and the macOS job's `.pkg`:
 | `kbf-installer-<commit>-linux-arm64.deb` | the `linux-arm64` job (`ubuntu-24.04-arm`, nfpm for arm64) | the same for arm64 |
 | `kbf-<commit>-linux-x86_64.deb` | the `linux-x86_64` job | the `kbf` of the tarball of the same name at `/usr/bin/kbf`, the unit of every mode, a dependency on `kbf-installer` of the same version or later, and the replacement of `kbf-installer` (its files, not the package) |
 | `kbf-<commit>-linux-arm64.deb` | the `linux-arm64` job | the same for arm64 |
+| `kbf-frontend-image-<commit>-linux-x86_64.oci.tar` | the `linux-x86_64` job (`ubuntu-24.04`, BuildKit) | an OCI image of the `kbf` of the tarball of the same name, which runs `kbf --mode=frontend` as a user that is not root |
+| `kbf-frontend-image-<commit>-linux-arm64.oci.tar` | the `linux-arm64` job | the same for arm64 |
 | `kbf-installer-<commit>-darwin-arm64.pkg` | the `darwin-arm64` job (`macos-15`, `cargo xtask pkg build`) | the `kbf-installer` of the tarball of the same name, its LaunchDaemon property list, the pinned darwin `gh` and a trust directory |
 
 The set above is pinned: `crates/kbf-integration-test/tests/release_artifacts` fails a pull request
@@ -259,7 +262,7 @@ and a host that trusts one asks for that branch with `--source-ref`; an asset at
 only takes the files of the pipeline run of a push to `main`, so a file built from any other branch is
 never released.
 
-Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write`, and only
+Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write` (the release workflow's `deploy` job holds `id-token: write` alone, to present it to the update coordinator, and signs nothing; see [Releases](#releases)), and only
 under the exact `if:` that limits it to a push to `main` (the
 `verify-*` jobs run under the same one). The workflow lint
 (`crates/kbf-integration-test/tests/workflows`) refuses those scopes in any other job, and in one
@@ -473,6 +476,61 @@ needs `kbf-installer` installed first, or both files given to one `apt install .
 sudo apt install ./kbf-installer-<commit>-linux-x86_64.deb ./kbf-<commit>-linux-x86_64.deb
 ```
 
+## The frontend image (OCI)
+
+The frontend ships as a container image for each Linux architecture, a release asset like the
+packages: `kbf-frontend-image-<commit>-linux-x86_64.oci.tar` and
+`kbf-frontend-image-<commit>-linux-arm64.oci.tar`. Each is an OCI image layout in one tar. Nothing
+is pushed to a registry: load the file where the image is to run.
+
+```text
+docker image load --input kbf-frontend-image-<commit>-linux-x86_64.oci.tar
+# or, on a containerd host
+ctr images import kbf-frontend-image-<commit>-linux-x86_64.oci.tar
+```
+
+The loaded image is named `kbf-frontend:<commit>`. It holds the `kbf` binary the job built and
+attested, unpacked from `kbf-<commit>-<platform>.tar.gz` into the build context, never a rebuild,
+on a distroless `cc` base pinned by digest (`packaging/container/frontend/Dockerfile` says why
+that base). It runs as uid 65532, its entrypoint is `kbf --mode=frontend`, and the configuration
+is a `/etc/kbf/kbf.toml` you mount; the image holds no secret and no address. It declares the ports
+8980, 8981 and 8982 (the defaults of `docs/deploy/kbf-modes.md`). The deployment guide for it will
+be its own page under `docs/deploy/`.
+
+The build is reproducible: the job builds the image twice from the commit's time
+(`SOURCE_DATE_EPOCH`, with BuildKit's own provenance and SBOM attachments off) and the two files
+must be the same bytes. `cargo xtask pkg-image-asset` lists the image in `SHA256SUMS`, refusing it
+unless:
+
+- `usr/bin/kbf` is, in the layers as they stack, byte for byte the `kbf` in the tarball
+  `kbf-<commit>-<platform>.tar.gz` that `build-commit check-asset` checked for the commit, mode 0755;
+- its config says Linux and the architecture of the platform, the entrypoint
+  `/usr/bin/kbf --mode=frontend` and a user that is not root;
+- every blob it names is present and hashes to its digest.
+
+It is attested like a deb: build provenance (one subject of the `SHA256SUMS` attestation, and alone,
+with its bundle `kbf-frontend-image-<commit>-<platform>.oci.tar.sigstore.json` in `bundles-linux`)
+and **no SBOM attestation**; the `kbf` it carries has the SBOM of its tarball. The verify job checks
+both offline and runs `cargo xtask pkg-image-asset --verify-only` on the signed file. Verify one
+before loading it, as for the installer's deb above:
+
+```text
+gh attestation trusted-root > trusted_root.jsonl
+gh attestation verify kbf-frontend-image-<commit>-linux-x86_64.oci.tar \
+  --bundle kbf-frontend-image-<commit>-linux-x86_64.oci.tar.sigstore.json \
+  --custom-trusted-root trusted_root.jsonl \
+  --repo komira-ai/kbf \
+  --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml \
+  --cert-oidc-issuer https://token.actions.githubusercontent.com \
+  --source-ref refs/heads/main \
+  --source-digest <commit> \
+  --predicate-type https://slsa.dev/provenance/v1 \
+  --deny-self-hosted-runners
+```
+
+`beta.yml` loads the x86_64 image of each push into Docker, runs its `kbf --version` and checks
+that the `kbf` in it names the commit and a release build.
+
 ## The kbf-installer package (pkg, macOS)
 
 A Mac gets `kbf-installer` the same way, as one file that holds everything it needs to verify a
@@ -575,11 +633,12 @@ can create one. The jobs, each with the least token it needs:
 | `notes` | checks the tag (`release verify`), the identity of this release and of the one before it, and writes the notes | read |
 | `publish` | creates the release with those files and notes (`release publish`) | `contents: write`; environment `release` |
 | `bump` | opens the pull request in the internal repository that moves its submodule to the release (`release bump-internal`) | `contents: read`; environment `release` |
+| `deploy` | after `publish`, sets the release as the desired version on the farm's update coordinator and waits for the farm to converge (`deploy-farm`); passes with a notice when the repository variable `KBF_COORDINATOR_URL` is unset ([deploy/kbf-updater.md](deploy/kbf-updater.md#turn-on-the-deploy-step)) | `contents: read`, `id-token: write`; environment `release` |
 
 Every job after `plan` runs only when `plan` says the push ships code and does not change the
 pipeline (`.github/`, `infra/`, `crates/xtask/` and the like): a push of docs only releases
 nothing and the run is green, and a push that changes the pipeline is released by the next one
-that does not. `tag`, `notes`, `publish` and `bump` also repeat the condition on the run that started the
+that does not. `tag`, `notes`, `publish`, `bump` and `deploy` also repeat the condition on the run that started the
 workflow (conclusion `success`, event `push`, branch `main`, this repository). The pipeline run is never cancelled
 and the newest waiting push queues behind it; `plan` measures from the highest release tag that is an ancestor of the
 commit, so the code of a push that was replaced while waiting is released with the next one. No job runs after a red one (no `always()`, no
@@ -629,7 +688,7 @@ commit. (The notes are written after the tag, because they read it.)
 
 `crates/kbf-integration-test/tests/release_workflow` holds the file to all of this (and `pipeline_workflow` holds the pipeline it follows to its order, its cancel and its triggers): the events
 (the completion of a `pipeline` run for `main` only), the job graph and the scopes, `if:` and environment of each job, the halt on
-red, a checkout of the commit the pipeline built alone, the release bot's key read in `tag` and `bump` only,
+red, a checkout of the commit the pipeline built alone, the release bot's key read in `tag` and `bump` only, `id-token: write` in `deploy` only (the coordinator's address is read from a repository variable there and nowhere else),
 the data that flows from job to job, pinned actions and an empty top-level `permissions`. The
 job list is pinned, `publish` among them (`gamma.yml`, which followed the workflow, is deleted). On every
 pull request into `main`, CI asks GitHub the same on-`main` question for the pull request's base

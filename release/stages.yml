@@ -45,10 +45,10 @@ stages:
     events: [workflow_call]
   # Gamma has no stage here: gamma.yml is deleted, and gamma moves to kbf-updater (the
   # package-update design, section 13). The 24 hour bake and its verdict run outside Actions.
-  # release.yml plans, verifies, tags with the release bot, publishes and bumps the internal
-  # repository, in one run. It is started by the completion of a successful pipeline run
-  # (`workflow_run`), the one workflow that is, so that a newer push cancelling the pipeline
-  # never cancels a release that has started.
+  # release.yml plans, verifies, tags with the release bot, publishes, bumps the internal
+  # repository and sets the release as the farm's desired version, in one run. It is started by
+  # the completion of a successful pipeline run (`workflow_run`), the one workflow that is, so
+  # that a newer push cancelling the pipeline never cancels a release that has started.
   - name: prod
     runs: actions
     after: [beta]
@@ -126,3 +126,8 @@ jobs:
     stage: prod
   - job: release.yml#bump
     stage: prod
+  # Presents the run's OIDC token to the farm's update coordinator and signs nothing: the row is
+  # `signing: true` because the job holds `id-token: write`, which only a signing row may.
+  - job: release.yml#deploy
+    stage: prod
+    signing: true
