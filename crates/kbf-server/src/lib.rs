@@ -150,7 +150,6 @@ pub mod verbs;
 pub mod vitals;
 pub mod worker;
 pub mod worker_roles;
-pub mod write_rules;
 pub mod write_tier;
 
 pub use config::{Args, ConfigError, Role, SERVER, s3_store};
