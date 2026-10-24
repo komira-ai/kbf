@@ -36,6 +36,8 @@
 //! and the deploy shape, the ownership step and the unit.
 
 pub mod cli;
+#[cfg(all(test, target_os = "linux"))]
+mod entry_tests;
 mod intake;
 #[cfg(target_os = "linux")]
 mod one_cache;

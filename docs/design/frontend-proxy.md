@@ -36,9 +36,10 @@ sections that described the removed machinery are not reused.
    the store takes no writer generation (section 11); its scheduler writes are conditional on
    the rows it read, so any number of frontends serve at once, and each takes up the work the
    store shows it (`docs/design/scheduler.md`, "Frontends that share work").
-5. **An update is a roll, one frontend at a time**: drain at the proxy, wait for the streams,
-   retire, install, restart, wait until ready, undrain (section 4). `kbf-updater` drives it
-   ([../deploy/kbf-updater.md](../deploy/kbf-updater.md)). Nothing is held, queued or swapped.
+5. **An update is a roll, one frontend at a time**, driven by `kbf-updater` through each
+   member's own operator API, not through the proxy: the member drains itself, is installed,
+   restarted and waited for (section 4). The updater does not call the proxy's admin API.
+   Nothing is held, queued or swapped.
 6. **An `all-in-one` process is not a member the updater rolls**: it serves its own storage and
    daemon, and the pool is of `kbf --mode=frontend` processes. A proxy in front of it is the
    operator's.
@@ -176,35 +177,33 @@ flow control and what is done with a child's GOAWAY and resets are section 10 of
 
 ## 4. Updating a frontend
 
-A frontend leaves the pool, is updated and returns, alone. `kbf-updater` (rolling a version
-over a farm) does it for a frontend that is a member of the pool, before every other host, and
-never when the frontend is the last member that is up. The steps, with the call each makes:
+`kbf-updater` rolls the members of a pool one at a time, before every other host, through each
+member's operator API on loopback at `127.0.0.1:<base + 2>`, and never when the member is the
+last one serving. The proxy is not asked to drain, retire or undrain anything; it stops sending
+to a member whose `/readyz` answers 503 and sends to it again when it answers 200. The steps are
+those of [../deploy/kbf-updater.md](../deploy/kbf-updater.md), "What a roll does with a frontend
+pool member", which is the authority; in short:
 
-1. **Drain at the proxy.** `POST /v1/proxy/upstreams/<name>:drain` on `admin_listen`: the proxy
-   gives the frontend no new stream. The streams it has run on to their end.
-2. **Wait for the streams.** The updater waits until the REAPI and operator streams the proxy
-   shows open on the frontend are 0, for at most 900 seconds (`drain_failed`).
-3. **Retire.** `POST /v1/frontend/retire` on the frontend's operator API (`docs/api.md`). The
-   frontend refuses every new Execute `UNAVAILABLE` (Buck2 retries when it opens a call),
-   waits, for at most ten seconds, for the calls between their request and their queueing,
-   then stops taking work: it reads no more of the store's queue, grants and claims nothing, and
-   writes the requeues the store had refused. It stops the worker listener and ends every worker
-   stream `UNAVAILABLE`, so each daemon dials another frontend through the proxy, which takes up
-   the leases the daemon lists. It goes not ready, and answers the callers it still holds from
-   the `done/` rows the others write. A retire is not undone, and the process does not exit.
-   The updater then waits until the frontend reports 0 streams open, for at most 900 seconds
-   (`retire_failed`).
-4. **Install and restart.** The package is installed on the host (once per host) and the
+1. **Peers ready.** Every other member answers `/readyz` 200 for a window in a row.
+2. **Drain.** `POST /v1/frontend/drain` on the member (`docs/api.md`): `/readyz` 503, no new
+   work, GOAWAY on its listeners, a wait for the open executions, and its exit. The updater
+   waits for the exit, or for the drain status to report the phase `closing`.
+3. **Install and restart.** The package is installed on the host (once per host), and the
    frontend's unit, `kbf-frontend@<name>.service` (`kbf-frontend.service` for the member named
-   `-`), is restarted (`restart frontend=<name>` of `kbf-host-install`). A stop drains:
-   the unit has `TimeoutStopSec=infinity` ([../deploy/kbf-units.md](../deploy/kbf-units.md)).
-5. **Ready.** The updater waits until the proxy lists the frontend ready and its `/healthz`
+   `-`), is restarted (`restart frontend=<name>` of `kbf-host-install`). A stop drains: the
+   unit has `TimeoutStopSec=infinity` ([../deploy/kbf-units.md](../deploy/kbf-units.md)).
+4. **Ready.** The updater waits until the member's `/readyz` answers 200 and its `/healthz`
    reports the commit of the target.
-6. **Undrain.** `POST /v1/proxy/upstreams/<name>:undrain`.
+
+An earlier build of the updater drained a member at the proxy, waited for its streams, called
+`POST /v1/frontend/retire` and undrained it at the end. That roll is superseded by the one
+above; the frontend still serves the retire route (`docs/api.md`), and the updater no longer
+calls it.
 
 **What each party sees.** Buck2 builds in flight keep their `Execute` and `WaitExecution`
-streams: the retire comes after the streams on the frontend reached 0, and a stream the retire
-still finds is answered from the store. New calls go to the other frontends. Daemons redial and
+streams: the member's drain refuses new calls and lets the open executions finish, and the
+calls it still holds when it exits are answered from the store. New calls go to the other
+frontends. Daemons redial and
 keep the runs of their leases: the epoch is the store's, and a frontend that starts keeps it.
 An operator's cordon or drain is a row in the store, so every frontend holds it.
 
@@ -227,8 +226,9 @@ at most one extra run or one extra budget step. The memory an operation is booke
 highest rung it was raised to; a booking from the last measured peak plus a buffer is not
 built (learned sizes run in shadow and change no booking).
 
-**When a step fails**, the roll stops and the frontend is left drained, named in the updater's
-detail; the updater never undrains a frontend it could not show to be healthy. What the
+**When a step fails**, the roll stops and the frontend is named as draining or not serving in
+the updater's detail; the updater does not start another until an operator has fixed it and
+started a new roll. What the
 operator does is in [../deploy/kbf-updater.md](../deploy/kbf-updater.md).
 
 ## 5. Failure behaviour

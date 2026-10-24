@@ -6,8 +6,6 @@ use std::process::Command;
 use kbf_cli::names;
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf");
-#[cfg(target_os = "linux")]
-const FAKE_CRUN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-crun");
 
 fn run(args: &[&str]) -> (Option<i32>, String, String) {
     run_with(args, &[])
@@ -97,10 +95,6 @@ fn the_daemon_refuses_the_store_flags_with_exit_2() {
 #[cfg(target_os = "linux")]
 const DAEMON_REFUSAL: &str =
     "kbf-daemon: --data-dir: make /proc/nonexistent/kbf: No such file or directory (os error 2)";
-
-/// The same for the combined binary's refused start.
-#[cfg(target_os = "linux")]
-const ALL_IN_ONE_REFUSAL: &str = "kbf-all-in-one: server: --meta-dir is required: the metadata log lives in the hot store's directory when --hot-store is a file:// store, and nowhere else is given";
 
 /// Catches a `kbf --version` that names the package version alone: the artifacts
 /// workflow's build-commit check wants `kbf <package version>+<commit>`, the stamp of
@@ -192,7 +186,7 @@ fn json_alone_is_a_usage_error() {
 /// it.
 #[test]
 fn an_unknown_flag_is_a_usage_error_2() {
-    for mode in [names::DAEMON, names::ALL_IN_ONE] {
+    for mode in [names::DAEMON, names::STORAGE_AND_DAEMON] {
         let (code, out, err) = run(&[mode, "--no-such-flag"]);
         assert_eq!(code, Some(2), "{mode}: {err}");
         assert!(
@@ -212,11 +206,16 @@ fn help_lists_the_five_modes_and_unknown_modes_exit_2() {
     let (code, out, _) = run(&["--help"]);
     assert_eq!(code, Some(0));
     assert!(!out.contains("Commands:"), "{out}");
-    let want: Vec<&str> = names::MODES.iter().map(|m| m.name).collect();
+    let want: Vec<&str> = names::MODES
+        .iter()
+        .map(|m| m.name)
+        .filter(|name| *name != names::ALL_IN_ONE)
+        .collect();
     assert!(
         out.contains(&format!("[possible values: {}]", want.join(", "))),
         "{out}"
     );
+    assert!(!out.contains("all-in-one"), "{out}");
     for mode in &want {
         assert!(
             !out.lines().any(|l| l.starts_with(&format!("  {mode} "))),
@@ -249,7 +248,7 @@ fn help_lists_the_five_modes_and_unknown_modes_exit_2() {
 #[test]
 fn each_alias_works_hidden_and_the_flag_form_is_the_same_page() {
     let (_, top, _) = run(&["--help"]);
-    for mode in names::MODES {
+    for mode in names::MODES.iter().filter(|m| m.name != names::ALL_IN_ONE) {
         let (code, alias, err) = run(&[mode.name, "--help"]);
         assert_eq!(code, Some(0), "{}: {err}", mode.name);
         let (code, flag, err) = run(&[&format!("--mode={}", mode.name), "--help"]);
@@ -292,7 +291,7 @@ fn positional_words_are_refused_with_exit_2() {
 
 /// The smoke test the README names: the command line in backticks after `Smoke test:`
 /// in README.md. Catches a README that stops naming a command `kbf` runs, and a
-/// `kbf --mode=all-in-one --help` that does not exit 0.
+/// `kbf --mode=storage-and-daemon --help` that does not exit 0.
 #[test]
 fn the_readmes_smoke_test_runs() {
     let readme = include_str!("../../../README.md");
@@ -301,11 +300,14 @@ fn the_readmes_smoke_test_runs() {
         .find(|l| l.starts_with("Smoke test: `kbf "))
         .expect("the README has a smoke-test line");
     let cmd = line.split('`').nth(1).expect("a command in backticks");
-    assert_eq!(cmd, "kbf --mode=all-in-one --help");
+    assert_eq!(cmd, "kbf --mode=storage-and-daemon --help");
     let args: Vec<&str> = cmd.split_whitespace().skip(1).collect();
     let (code, out, err) = run(&args);
     assert_eq!(code, Some(0), "{err}");
-    assert!(out.contains("Usage: kbf --mode=all-in-one"), "{out}");
+    assert!(
+        out.contains("Usage: kbf --mode=storage-and-daemon"),
+        "{out}"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -329,36 +331,85 @@ fn daemon_runs_the_daemons_start() {
     assert_eq!(err.lines().last(), Some(DAEMON_REFUSAL));
 }
 
-#[cfg(target_os = "linux")]
-/// Catches `kbf all-in-one` that does not reach the combined start: the server half
-/// refuses a cold store that cannot be made (exit 2, as in `kbf-all-in-one`).
+/// Catches an all-in-one start that is not refused, or a refusal that does not name what
+/// replaces the mode: the mode asked for as the flag, as the flag with a separate value,
+/// as the hidden word, with `--check`, with a flag of the mode and with the help, each
+/// exits 2 with the one message and writes nothing on standard output.
 #[test]
-fn all_in_one_runs_both_halves_start() {
-    let ([ca, cert, key], _files) = daemon_files("all_in_one_runs_both_halves_start");
-    // The container driver's host, as the self-checks want it: a `crun` that answers
-    // `--version` (never run otherwise; the start stops at the cold store).
-    let dir = scratch("all_in_one_runs_both_halves_start_host");
-    let crun = dir.join("crun");
-    std::os::unix::fs::symlink(FAKE_CRUN, &crun).expect("link crun");
-    let runtime = format!("--oci-runtime={}", crun.display());
-    let (code, _, err) = run_with(
-        &[
-            names::ALL_IN_ONE,
-            "--driver=container",
-            "--server=https://127.0.0.1:1",
-            &ca,
-            &cert,
-            &key,
-            "--node-id=n",
-            &runtime,
-            "--listen=127.0.0.1:0",
-            "--worker-listen=127.0.0.1:0",
-            "--cold-store=file:///proc/nonexistent/cold",
-        ],
-        &[],
-    );
+fn every_way_to_ask_for_all_in_one_exits_2_with_the_message() {
+    for argv in [
+        &["--mode=all-in-one"][..],
+        &["--mode", "all-in-one"],
+        &["all-in-one"],
+        &["--mode=all-in-one", "--check"],
+        &["--mode=all-in-one", "--listen=127.0.0.1:0"],
+        &["--mode=all-in-one", "--help"],
+        &["all-in-one", "--help"],
+        &["--config=/nonexistent/kbf.toml", "--mode=all-in-one"],
+    ] {
+        let (code, out, err) = run(argv);
+        assert_eq!(code, Some(2), "{argv:?}: {err}");
+        assert!(out.is_empty(), "{argv:?}: {out}");
+        assert!(err.contains(kbf_cli::ALL_IN_ONE_REMOVED), "{argv:?}: {err}");
+    }
+    assert!(kbf_cli::ALL_IN_ONE_REMOVED.contains("--mode=frontend"));
+    assert!(kbf_cli::ALL_IN_ONE_REMOVED.contains("--mode=storage-and-daemon"));
+    assert!(kbf_cli::ALL_IN_ONE_REMOVED.contains("docs/deploy/kbf-modes.md"));
+}
+
+/// Catches `mode = "all-in-one"` in `kbf.toml` that starts, or is refused with another
+/// message: a bare `kbf` and `kbf --check` that read the file's mode exit 2 with the
+/// message, and the list of modes the refusal gives for other mistakes leaves it out.
+#[test]
+fn a_kbf_toml_with_the_all_in_one_mode_is_refused() {
+    let dir = scratch("all_in_one_in_the_file");
+    let file = dir.join("kbf.toml");
+    let write = |text: &str| {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(&file, text).expect("kbf.toml");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("mode");
+    };
+    write("mode = \"all-in-one\"\n");
+    let path = file.display().to_string();
+    for argv in [
+        vec!["--config", path.as_str()],
+        vec!["--config", path.as_str(), "--check"],
+    ] {
+        let (code, out, err) = run(&argv);
+        assert_eq!(code, Some(2), "{argv:?}: {err}");
+        assert!(out.is_empty(), "{argv:?}: {out}");
+        assert!(err.contains(kbf_cli::ALL_IN_ONE_REMOVED), "{argv:?}: {err}");
+    }
+    write("mode = \"nonsense\"\n");
+    let (code, _, err) = run(&["--config", path.as_str()]);
     assert_eq!(code, Some(2), "{err}");
-    assert_eq!(err.lines().last(), Some(ALL_IN_ONE_REFUSAL));
+    assert!(!err.contains("all-in-one"), "{err}");
+}
+
+/// Catches `kbf boot-check --mode=all-in-one` that reaches the database step, and
+/// `kbf setup --mode=all-in-one` that does anything but refuse: both exit 2 with the
+/// message, as the flag with one word or two, and `setup --apply` as a user that is not
+/// root is refused for the mode first.
+#[test]
+fn boot_check_and_setup_refuse_all_in_one() {
+    for argv in [
+        &["boot-check", "--mode=all-in-one"][..],
+        &["boot-check", "--mode", "all-in-one"],
+        &["setup", "--mode=all-in-one"],
+        &["setup", "--mode", "all-in-one", "--apply"],
+    ] {
+        let (code, out, err) = run(argv);
+        assert_eq!(code, Some(2), "{argv:?}: {err}");
+        assert!(out.is_empty(), "{argv:?}: {out}");
+        assert!(err.contains(kbf_cli::ALL_IN_ONE_REMOVED), "{argv:?}: {err}");
+    }
+    let (_, help, _) = run(&["boot-check", "--help"]);
+    assert!(!help.contains("all-in-one"), "{help}");
+    let (_, help, _) = run(&["setup", "--help"]);
+    assert!(
+        help.contains("[possible values: frontend, storage, daemon, storage-and-daemon]"),
+        "{help}"
+    );
 }
 
 /// Catches the daemon's helper re-execs read as `kbf`'s own command line: a keeper

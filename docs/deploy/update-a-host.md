@@ -14,7 +14,8 @@ The by-hand way uses this layout: each release in `releases/<commit>/` of the in
 [host releases](host-releases.md) for the layout and what is trusted.
 
 A farm whose hosts run the packages is rolled by [kbf-updater](kbf-updater.md), which also
-drains, retires and restarts the frontends of a kbf-proxy pool one at a time.
+drains, installs and restarts the frontend members of a pool one at a time, through each
+member's own operator API.
 
 ## Upgrade the installer first (seq)
 
@@ -114,7 +115,11 @@ frontend host behind the proxy runs a pool of frontends that run on their own
 
 A release reaches a host as an operating-system package. `kbf-updater` drains the host, installs the
 package, restarts the units, waits until the host is healthy and undrains it; on a Mac it installs the
-signed tarball instead. The frontend keeps no release store and no desired release: the routes
+signed tarball instead. On a Linux daemon host the install is done by `kbf-host-install --serve --layout deb` (or `rpm`),
+which fetches the release's attested package, checks it offline, installs it with the package manager,
+restarts the units, and puts the previous package back if the new one is not confirmed by its deadline
+([host-install.md](host-install.md#on-a-linux-daemon-host-that-runs-the-package)). A host set up by
+hand moves to the package once ([native-package-migration.md](native-package-migration.md)). The frontend keeps no release store and no desired release: the routes
 `GET /v1/update` and `POST /v1/update/{desired,pause,resume}` and the release routes answer `404`, and
 `--releases-dir` is accepted, ignored and warned about (see [the operator API](../api.md)).
 

@@ -25,7 +25,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::builder::PossibleValuesParser;
 use clap::{Arg, Command};
 use kbf_state::postgres::PostgresConfig;
 use kbf_state::postgres::boot::BootStep;
@@ -130,7 +129,6 @@ pub struct Args {
 /// `kbf boot-check ...`'s command line.
 #[must_use]
 pub fn command() -> Command {
-    let modes: Vec<&'static str> = names::MODES.iter().map(|m| m.name).collect();
     Command::new(BOOT_CHECK)
         .bin_name(format!("kbf {BOOT_CHECK}"))
         .about(
@@ -143,10 +141,10 @@ pub fn command() -> Command {
                 .long(MODE)
                 .value_name("MODE")
                 .required(true)
-                .value_parser(PossibleValuesParser::new(modes))
+                .value_parser(crate::mode_values())
                 .help(
-                    "The mode of the unit that runs the check: only frontend and all-in-one \
-                     keep state in the database, the others pass",
+                    "The mode of the unit that runs the check: only the frontend keeps \
+                     state in the database, the others pass",
                 ),
         )
         .arg(
@@ -168,6 +166,7 @@ pub fn command() -> Command {
 /// # Errors
 /// What `clap` refuses: no `--mode`, a word that is not a mode, any other flag or word.
 pub fn parse(args: &[OsString]) -> Result<Args, clap::Error> {
+    crate::refuse_all_in_one(args)?;
     let argv = args.iter().take(1).chain(args.iter().skip(2));
     let matches = command().try_get_matches_from(argv)?;
     Ok(Args {

@@ -79,8 +79,9 @@ turn of a member is:
    then runs its own drain, which does not depend on the balancer: `/readyz` 503, no new work and
    GOAWAY on its listeners, a wait for the executions open on it, and its exit. The roll waits
    until the member's operator API refuses the connection (it has exited) or its
-   `GET /v1/frontend/drain` reports `"closing": true` (the frontend in this tree does not report
-   it, and is waited for until it exits), for at most `--frontend-drain-deadline-secs`
+   `GET /v1/frontend/drain` reports `"phase": "closing"` (the streams that are left are being
+   closed and the process exits within seconds; a status with another phase, or none, is taken
+   to be still draining), for at most `--frontend-drain-deadline-secs`
    (`drain_failed`). A member that answers the status but says it is not draining fails the roll
    at once (`drain_failed`). A member that is not running refuses the connection of the drain
    itself, has nothing to drain, and the turn goes on; a drain that gets no answer (a timeout)
