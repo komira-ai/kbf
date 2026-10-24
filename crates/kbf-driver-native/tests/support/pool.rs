@@ -31,9 +31,24 @@ pub const GID: u32 = 20;
 /// the clean's check would find after the kill. Made if missing, root's, mode 0755.
 pub const HOMES: &str = "/private/var/kbf-ci-homes.noindex";
 
+/// Writes the driver's log to stderr, so a failed clean on a machine prints its reason
+/// (the slot's dirty step and what it found). `RUST_LOG` picks the filter; without it,
+/// warnings of the `kbf` crates.
+pub fn log_to_stderr() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("kbf_driver_native=warn,kbf_daemon=warn,kbf_mac_session=warn")
+    });
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 /// Stops a test run as the runner's user, where every check would fail for the wrong
 /// reason. Asks the kernel, not the code under test.
 pub fn assert_root(test: &str) {
+    log_to_stderr();
     // SAFETY: geteuid takes no arguments and cannot fail.
     let euid = unsafe { libc::geteuid() };
     assert_eq!(

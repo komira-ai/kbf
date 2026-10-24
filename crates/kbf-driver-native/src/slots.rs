@@ -62,6 +62,8 @@ pub mod clean;
 pub(crate) mod crash;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod domain;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod entry;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -504,6 +506,7 @@ impl Runner {
 pub fn dispatch() -> Option<std::process::ExitCode> {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     canary_exit(&args)
+        .or_else(|| entry_exit(&args))
         .map(|code| std::process::ExitCode::from(u8::try_from(code).unwrap_or(1)))
         .or_else(|| as_user_mode(&args))
 }
@@ -529,6 +532,13 @@ fn canary_exit(args: &[std::ffi::OsString]) -> Option<i32> {
     canary::dispatch(args, &canary::RealFs, &mut std::io::stdout())
 }
 
+/// The `/var/folders` entry mode ([`entry::ARG`]) for `args`, run as this process's uid:
+/// its exit code when they select it.
+fn entry_exit(args: &[std::ffi::OsString]) -> Option<i32> {
+    let uid = rustix::process::getuid().as_raw();
+    entry::dispatch(args, uid, &mut std::io::stdout(), &mut std::io::stderr())
+}
+
 /// [`dispatch`] for a test binary, which has no `main` of its own: when the arguments
 /// ask for the mode, runs it and exits (with 127 whatever went wrong: the mode returns
 /// only when it did not execute the program, and has said why on stderr). Called by
@@ -537,6 +547,7 @@ fn canary_exit(args: &[std::ffi::OsString]) -> Option<i32> {
 pub fn hook() {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let _ = canary_exit(&args).map(|code| std::process::exit(code));
+    let _ = entry_exit(&args).map(|code| std::process::exit(code));
     let _ = as_user_mode(&args).map(|_| std::process::exit(127));
 }
 

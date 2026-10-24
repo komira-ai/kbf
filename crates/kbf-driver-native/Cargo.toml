@@ -31,7 +31,7 @@ tracing.workspace = true
 # What the tests run as actions and as fake Xcode tools: kbf-testkit's act verbs and
 # its fake xcrun, xcodebuild and sandbox-exec, through links to the test binary.
 kbf-testkit.workspace = true
-tracing-subscriber.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 # Metal, for the test that runs a compute kernel as a pool user under the slot profile

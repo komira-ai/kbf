@@ -781,6 +781,29 @@ fn clear_flags_makes_the_uids_entries_rwx_and_leaves_other_owners_alone() {
     assert_eq!(clear_flags(&dir.join("absent"), me()), Swept::default());
 }
 
+/// A directory its owner left with no permission at all cannot be opened by the owner,
+/// and a clean that runs as the uid must still give it `u+rwx` and look below it.
+/// Catches a clear that skips what it cannot open: the directory stays at 0, and the
+/// walk never sees the locked file below it.
+#[test]
+fn clear_flags_opens_a_directory_its_owner_left_without_permissions() {
+    if root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = scratch("clear-mode-zero");
+    let home = dir.join("home");
+    fs::create_dir_all(home.join("closed/inner")).unwrap();
+    fs::write(home.join("closed/inner/f"), "x").unwrap();
+    chmod(&home.join("closed/inner"), 0o000);
+    chmod(&home.join("closed"), 0o000);
+    let swept = clear_flags(&home, me());
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+    let modes = [mode(&home.join("closed")), mode(&home.join("closed/inner"))];
+    assert_eq!(swept.errors, Vec::<String>::new());
+    assert_eq!(modes, [0o700, 0o700]);
+}
+
 /// Catches a flag clear that fails on a deep tree (a lease that builds one would cost its
 /// slot for good: the removal that follows clears the locks itself) or that recurses
 /// without a bound: past the limit it stops looking, with no error, for either owner.

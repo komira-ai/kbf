@@ -19,11 +19,16 @@
 //! - System V IPC: every message queue, shared memory segment and semaphore set
 //!   `ipcs` lists with the user as owner or creator is removed (`ipcrm`). POSIX named
 //!   semaphores and shared memory are not reached: macOS lists them nowhere.
-//! - C6 clears the flags on the home and the entry **first** (`sweep::clear_flags` opens
-//!   each root and clears it before it looks below), removes ACLs of the uid's entries
-//!   (`find -x ... -user <uid> -exec chmod -N`, so a hard link to another owner's file
-//!   keeps its ACL) and sets the owner's `u+rwx`. C7 then empties the home, whoever owns
-//!   what is in it, and the entry, keeping `0`, `C`, `T` and `X` ([`probe::SKELETON`]).
+//! - C6 clears the flags on the home **first** (`sweep::clear_flags` opens each root and
+//!   clears it before it looks below), removes ACLs of the uid's entries (`find -x ...
+//!   -user <uid> -exec chmod -N`, so a hard link to another owner's file keeps its ACL)
+//!   and sets the owner's `u+rwx`. C7 then empties the home, whoever owns what is in it.
+//! - The `/var/folders` entry is cleaned **as the slot's uid**, never as root
+//!   ([`crate::slots::entry`]): the daemon is a launch daemon without Full Disk Access,
+//!   and root cannot clear the flags or ACLs of the entry's `0`, `C`, `T` and `X` nor
+//!   list them, while their owner can. C6 does for the entry what it does for the home,
+//!   by a child that drops to the uid; C7 empties the entry that way, keeping `0`, `C`,
+//!   `T` and `X` ([`probe::SKELETON`]); the check looks at it that way too.
 //! - C10 gives the home back to the user, mode 0700, no flags (made anew if it is gone),
 //!   and the entry's roots what they had when the slot was resolved
 //!   ([`super::Entry`]), without a lock or `hidden`.
@@ -46,7 +51,7 @@ use super::Ready;
 use crate::slots::assertion;
 use crate::slots::clean::{Left, Os, Step};
 use crate::slots::domain::{self, Launchd, Said};
-use crate::slots::{crash, probe};
+use crate::slots::{crash, entry, probe};
 
 const HDIUTIL: &str = "/usr/bin/hdiutil";
 const DISKUTIL: &str = "/usr/sbin/diskutil";
@@ -82,6 +87,9 @@ pub struct MacSlot<'a> {
     /// What this clean has judged of launchd's services ([`probe::OwnLabels`]); a clean
     /// reads each service's plist once.
     pub(super) judged: probe::OwnLabels,
+    /// The daemon's binary: the `/var/folders` entry is cleaned by it, as the slot's user
+    /// ([`entry`]).
+    pub(super) program: &'a Path,
 }
 
 /// `launchctl`, run for real: each call is killed at its alarm.
@@ -179,24 +187,23 @@ impl Os for MacSlot<'_> {
                 }
                 joined(failed)
             }
-            Step::Flags => {
-                let mut failed = Vec::new();
-                // The roots first, inside `clear_flags`, then below them.
-                for root in [&ready.home, &ready.folders] {
-                    failed.extend(sweep::clear_flags(root, user.uid).errors);
-                    if let Err(why) = remove_acls(root, user.uid) {
-                        failed.push(why);
-                    }
-                }
-                joined(failed)
-            }
-            Step::Contents => {
-                let mut failed = sweep::empty(&ready.home, user.uid).errors;
-                failed.extend(
-                    sweep::empty_keeping(&ready.folders, user.uid, &probe::SKELETON).errors,
-                );
-                joined(failed)
-            }
+            Step::Flags => entry::flags_step(
+                &self.as_uid(),
+                (&ready.home, &ready.folders),
+                // The home, as root, the root first, then below it.
+                &mut |home| {
+                    let mut failed = sweep::clear_flags(home, user.uid).errors;
+                    failed.extend(remove_acls(home, user.uid).err());
+                    failed
+                },
+                &mut run_child,
+            ),
+            Step::Contents => entry::contents_step(
+                &self.as_uid(),
+                (&ready.home, &ready.folders),
+                &mut |home| sweep::empty(home, user.uid).errors,
+                &mut run_child,
+            ),
             Step::Shared => complete(&sweep::sweep(&probe::shared_plan(), &user.name, user.uid)),
             Step::Crashes => joined(crash::sweep(&crash_dirs(), &self.crash_scope())),
             Step::Restore => restore(ready),
@@ -266,32 +273,14 @@ impl Os for MacSlot<'_> {
         if let Err(why) = home_is_empty(self.ready) {
             note(Step::Contents, why);
         }
-        match list(&self.ready.folders) {
-            Ok(names) => {
-                for name in names
-                    .iter()
-                    .filter(|n| !probe::SKELETON.contains(&n.as_str()))
-                {
-                    note(
-                        Step::Contents,
-                        format!("{}: {name}", self.ready.folders.display()),
-                    );
-                }
-                for folder in names
-                    .iter()
-                    .filter(|n| probe::SKELETON.contains(&n.as_str()))
-                {
-                    let folder = self.ready.folders.join(folder);
-                    let entries = list(&folder);
-                    if !matches!(&entries, Ok(names) if names.is_empty()) {
-                        note(Step::Contents, format!("{}: {entries:?}", folder.display()));
-                    }
+        // As the uid: root cannot look inside the entry's folders.
+        match entry::left(&self.as_uid(), &self.ready.folders, &mut run_child) {
+            Ok(lines) => {
+                for line in lines {
+                    note(Step::Contents, line);
                 }
             }
-            Err(why) => note(
-                Step::Contents,
-                format!("{}: {why}", self.ready.folders.display()),
-            ),
+            Err(why) => note(Step::Contents, why),
         }
         let crashes = crash::found(&crash_dirs(), &self.crash_scope());
         if !crashes.is_empty() {
@@ -309,6 +298,15 @@ impl Os for MacSlot<'_> {
 }
 
 impl MacSlot<'_> {
+    /// The slot's user, as [`entry`] runs the `/var/folders` entry's clean.
+    fn as_uid(&self) -> entry::AsUid<'_> {
+        entry::AsUid {
+            program: self.program,
+            uid: self.ready.user.uid,
+            gid: self.ready.user.gid,
+        }
+    }
+
     /// C9's scope: this slot's uid, and the pool's.
     fn crash_scope(&self) -> crash::Scope {
         crash::Scope {
@@ -454,6 +452,28 @@ fn remove_acls(root: &Path, uid: u32) -> Result<(), String> {
             "-x", &root, "-user", &uid, "!", "-type", "l", "-exec", CHMOD, "-N", "{}", "+",
         ],
     )
+}
+
+/// [`entry::Run`], for real: `program` with `args`, a plain environment and no input;
+/// what it printed, or why it failed (its status and what it said, the first 4000
+/// characters of it).
+fn run_child(program: &Path, args: &[std::ffi::OsString]) -> Result<String, String> {
+    let out = Command::new(program)
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("{}: {e}", program.display()))?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+    }
+    let said = String::from_utf8_lossy(&out.stderr);
+    Err(format!(
+        "{}: {}: {}",
+        program.display(),
+        out.status,
+        said.trim().chars().take(4000).collect::<String>()
+    ))
 }
 
 /// Whether a sweep was complete.
