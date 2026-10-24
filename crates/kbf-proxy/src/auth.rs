@@ -71,9 +71,6 @@ pub enum Refusal {
     /// The address has presented too many wrong tokens lately: gRPC `RESOURCE_EXHAUSTED` (8),
     /// HTTP 429. The token was not looked at.
     RateLimited,
-    /// The credential could not be judged now (the OIDC issuer's keys cannot be fetched and
-    /// none are held): gRPC `UNAVAILABLE` (14), HTTP 503. Not a verdict on the caller.
-    Unavailable,
 }
 
 impl Refusal {
@@ -84,7 +81,6 @@ impl Refusal {
             Self::Unauthenticated => 16,
             Self::PermissionDenied => 7,
             Self::RateLimited => 8,
-            Self::Unavailable => 14,
         }
     }
 
@@ -95,15 +91,14 @@ impl Refusal {
             Self::Unauthenticated => 401,
             Self::PermissionDenied => 403,
             Self::RateLimited => 429,
-            Self::Unavailable => 503,
         }
     }
 }
 
 /// A token as the proxy keeps it: its SHA-256, so the comparison is over equal-length
 /// digests, and the bytes themselves. The bytes are kept only for the operator token, which
-/// the proxy presents to the child on behalf of a CI job it admitted by OIDC (the child's
-/// operator API takes no other credential); nothing else reads them.
+/// the proxy presents to the child on behalf of a host updater it admitted for its own node
+/// (the child's operator API takes no other credential); nothing else reads them.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Token {
     digest: [u8; 32],
@@ -195,7 +190,7 @@ impl Token {
 pub struct Tokens {
     /// The Buck2 API key (`buck2_auth = "bearer"`).
     pub buck2: Option<Token>,
-    /// The operator token, which is also the update credential until OIDC (#1088).
+    /// The operator token, which is also the update credential.
     pub operator: Option<Token>,
 }
 

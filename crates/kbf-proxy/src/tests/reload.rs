@@ -2,8 +2,9 @@
 
 use std::sync::atomic::Ordering;
 
-use super::kit::{Access, CAPS, Rig};
+use super::kit::{Access, CAPS};
 use super::pki::{Pki, client_config};
+use super::pool_kit::Rig;
 use super::secure::{connect_tls, h2_over_tls, tls_rig};
 use crate::auth::Buck2Auth;
 use crate::scratch::scratch;
@@ -119,7 +120,7 @@ async fn a_failed_reload_keeps_the_old_unit_and_counts() {
         "the old CA still verifies"
     );
 
-    let text = rig.core.metrics.render(&rig.core.slots, &rig.core.queue);
+    let text = rig.core.metrics.render();
     assert!(
         text.contains("kbf_proxy_tls_reload_failed_total 3"),
         "{text}"
@@ -139,7 +140,7 @@ async fn a_failed_reload_keeps_the_old_unit_and_counts() {
 async fn a_reload_refuses_an_expired_certificate() {
     let pki = Pki::new("expiry CA");
     let paths = pki.write(&scratch("reload-expired"), &pki.server());
-    let rig = Rig::start_secure(Buck2Auth::None, Access::Tls(paths.clone())).await;
+    let rig = Rig::start_secure(Buck2Auth::None, Access::Tls(paths.clone()));
     pki.install(&paths, &pki.expired_server(), &pki.ca_pem);
     assert!(rig.tls.as_ref().expect("TLS").reload().is_err());
     assert_eq!(failed(&rig), 1);

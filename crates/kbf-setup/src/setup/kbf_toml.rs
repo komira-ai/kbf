@@ -10,11 +10,6 @@
 //! and ignores every order. `all-in-one` has neither, as its in-process daemon refuses
 //! `--update-dir`. The installer's own settings are `installer.toml`, never here.
 //!
-//! An `all-in-one` host has two such files, both rendered and decided by this module: `kbf.toml`
-//! is the sibling's (`mode = "storage-and-daemon"`, no enrollment table, so `kbf` reads it as
-//! plain flags) and `frontend.toml` is the frontend children's (`mode = "frontend"`, the
-//! operator token and the state database).
-//!
 //! A file that exists is not overwritten blindly: when every key in it is one `setup`
 //! writes, `setup` rewrites it; when it holds other settings, `setup` leaves it alone if
 //! its own keys already say what the flags say, and refuses (exit 5) if they differ, naming
@@ -54,15 +49,6 @@ pub struct UpdateDirs<'a> {
 
 /// The keys of [`UpdateDirs`], as `(table, key)`.
 pub const UPDATE_KEYS: [(&str, &str); 2] = [("daemon", "update-dir"), ("daemon", "orders-dir")];
-
-/// The table of `text` when it is a `kbf.toml` whose top-level `mode` is `all-in-one`: the layout
-/// of one process for everything, which an all-in-one host no longer has and `setup` splits
-/// ([`super::aio_migrate`]). A text that is not TOML is none (`decide` names that fault).
-pub fn all_in_one_table(text: &str) -> Option<Table> {
-    let table = text.parse::<Table>().ok()?;
-    let says = lookup(&table, "", "mode").and_then(Value::as_str) == Some("all-in-one");
-    says.then_some(table)
-}
 
 /// The tables of the file, in the order they are written: every table a setting can be in
 /// (a test renders each mode's file and compares it with its golden, so a missing one fails).

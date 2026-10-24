@@ -12,23 +12,23 @@ use http::{HeaderValue, Request, Response};
 use tokio::task::JoinSet;
 
 use super::kit::{
-    CAPS, DATA, HEADERS, Rig, Seen, WRITE, finish, grpc_ok, next_of, read_all, script, tagged,
-    until,
+    CAPS, DATA, HEADERS, Seen, WRITE, finish, grpc_ok, next_of, read_all, script, tagged, until,
 };
+use super::pool_kit::Rig;
 
 /// `(kind, ends, len)` of each recorded frame.
 fn shape(frames: &[Seen]) -> Vec<(u8, bool, usize)> {
     frames.iter().map(|f| (f.kind, f.ends(), f.len)).collect()
 }
 
-async fn recording_rig() -> Rig {
-    Rig::start(tagged("a"), tagged("b")).await
+fn recording_rig() -> Rig {
+    Rig::start(&[tagged("a")])
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_request_of_n_chunks_arrives_as_n_data_frames_the_last_one_ending_the_stream() {
-    let rig = recording_rig().await;
-    rig.a.state.raw_record.store(true, Ordering::Release);
+    let rig = recording_rig();
+    rig.a().state.raw_record.store(true, Ordering::Release);
     let mut client = rig.client().await;
     let (_response, mut body) = client.start(WRITE, false).await;
     body.send_data(Bytes::from_static(b"one"), false)
@@ -37,11 +37,11 @@ async fn a_request_of_n_chunks_arrives_as_n_data_frames_the_last_one_ending_the_
         .expect("2");
     body.send_data(Bytes::from_static(b"third!"), true)
         .expect("3");
-    until(|| rig.a.state.recorded_end()).await;
+    until(|| rig.a().state.recorded_end()).await;
     assert_eq!(
-        shape(&rig.a.state.recorded()),
+        shape(&rig.a().state.recorded()),
         vec![
-            (HEADERS, false, rig.a.state.recorded()[0].len),
+            (HEADERS, false, rig.a().state.recorded()[0].len),
             (DATA, false, 3),
             (DATA, false, 6),
             (DATA, true, 6),
@@ -52,18 +52,18 @@ async fn a_request_of_n_chunks_arrives_as_n_data_frames_the_last_one_ending_the_
 
 #[tokio::test(start_paused = true)]
 async fn a_client_that_ends_with_a_separate_empty_frame_costs_at_most_one_empty_frame() {
-    let rig = recording_rig().await;
-    rig.a.state.raw_record.store(true, Ordering::Release);
+    let rig = recording_rig();
+    rig.a().state.raw_record.store(true, Ordering::Release);
     let mut client = rig.client().await;
     let (_response, mut body) = client.start(WRITE, false).await;
     body.send_data(Bytes::from_static(b"one"), false)
         .expect("1");
     body.send_data(Bytes::from_static(b"two"), false)
         .expect("2");
-    until(|| rig.a.state.recorded().len() == 3).await;
+    until(|| rig.a().state.recorded().len() == 3).await;
     body.send_data(Bytes::new(), true).expect("end");
-    until(|| rig.a.state.recorded_end()).await;
-    let frames = rig.a.state.recorded();
+    until(|| rig.a().state.recorded_end()).await;
+    let frames = rig.a().state.recorded();
     let data: Vec<_> = frames.iter().filter(|f| f.kind == DATA).collect();
     assert_eq!(data.iter().filter(|f| f.ends()).count(), 1, "one END");
     assert!(
@@ -83,8 +83,8 @@ async fn a_client_that_ends_with_a_separate_empty_frame_costs_at_most_one_empty_
 
 #[tokio::test(start_paused = true)]
 async fn an_end_that_is_already_queued_rides_on_the_last_data_frame() {
-    let rig = recording_rig().await;
-    rig.a.state.raw_record.store(true, Ordering::Release);
+    let rig = recording_rig();
+    rig.a().state.raw_record.store(true, Ordering::Release);
     let mut client = rig.client().await;
     let (_response, mut body) = client.start(WRITE, false).await;
     // Written with no await between: the proxy reads all three at once.
@@ -93,8 +93,8 @@ async fn an_end_that_is_already_queued_rides_on_the_last_data_frame() {
     body.send_data(Bytes::from_static(b"two"), false)
         .expect("2");
     body.send_data(Bytes::new(), true).expect("end");
-    until(|| rig.a.state.recorded_end()).await;
-    let frames = rig.a.state.recorded();
+    until(|| rig.a().state.recorded_end()).await;
+    let frames = rig.a().state.recorded();
     assert_eq!(
         shape(&frames)[1..],
         [(DATA, false, 3), (DATA, true, 3)],
@@ -104,20 +104,20 @@ async fn an_end_that_is_already_queued_rides_on_the_last_data_frame() {
 
 #[tokio::test(start_paused = true)]
 async fn a_bodiless_request_ends_on_its_headers() {
-    let rig = recording_rig().await;
-    rig.a.state.raw_record.store(true, Ordering::Release);
+    let rig = recording_rig();
+    rig.a().state.raw_record.store(true, Ordering::Release);
     let mut client = rig.client().await;
     let (_response, _body) = client.start(CAPS, true).await;
-    until(|| rig.a.state.recorded_end()).await;
-    let frames = rig.a.state.recorded();
+    until(|| rig.a().state.recorded_end()).await;
+    let frames = rig.a().state.recorded();
     assert_eq!(frames.len(), 1, "HEADERS alone: {frames:?}");
     assert!(frames[0].kind == HEADERS && frames[0].ends());
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_request_with_trailers_passes_them_as_trailers_without_an_empty_frame() {
-    let rig = recording_rig().await;
-    rig.a.state.raw_record.store(true, Ordering::Release);
+    let rig = recording_rig();
+    rig.a().state.raw_record.store(true, Ordering::Release);
     let mut client = rig.client().await;
     let (_response, mut body) = client.start(WRITE, false).await;
     body.send_data(Bytes::from_static(b"msg"), false)
@@ -125,8 +125,8 @@ async fn a_request_with_trailers_passes_them_as_trailers_without_an_empty_frame(
     let mut trailers = http::HeaderMap::new();
     trailers.insert("x-sum", HeaderValue::from_static("1"));
     body.send_trailers(trailers).expect("trailers");
-    until(|| rig.a.state.recorded_end()).await;
-    let frames = rig.a.state.recorded();
+    until(|| rig.a().state.recorded_end()).await;
+    let frames = rig.a().state.recorded();
     assert_eq!(
         shape(&frames)[1..],
         [(DATA, false, 3), (HEADERS, true, frames[2].len)],
@@ -136,11 +136,12 @@ async fn a_request_with_trailers_passes_them_as_trailers_without_an_empty_frame(
 
 #[tokio::test(start_paused = true)]
 async fn a_redispatched_request_also_ends_on_its_last_frame() {
-    let rig = recording_rig().await;
-    // The first connection answers the stream with GOAWAY(last = 0); the retry goes to the
-    // second, which records.
-    rig.a.state.raw_goaway_first.store(true, Ordering::Release);
-    rig.a.state.raw_record.store(true, Ordering::Release);
+    let rig = Rig::start(&[tagged("a"), tagged("b")]);
+    // The first member's connection answers the stream with GOAWAY(last = 0); the retry goes
+    // to the second member, which records.
+    let (first, second) = (&rig.children[0].state, &rig.children[1].state);
+    first.raw_goaway_first.store(true, Ordering::Release);
+    second.raw_record.store(true, Ordering::Release);
     let mut client = rig.client().await;
     let (_response, mut body) = client.start(CAPS, false).await;
     body.send_data(Bytes::from_static(b"one"), false)
@@ -149,9 +150,9 @@ async fn a_redispatched_request_also_ends_on_its_last_frame() {
         .expect("2");
     body.send_data(Bytes::from_static(b"three"), true)
         .expect("3");
-    until(|| rig.a.state.recorded_end()).await;
+    until(|| second.recorded_end()).await;
     assert_eq!(rig.core.metrics.retries.load(Ordering::Acquire), 1);
-    let frames = rig.a.state.recorded();
+    let frames = second.recorded();
     assert_eq!(
         shape(&frames)[1..],
         [(DATA, false, 3), (DATA, false, 4), (DATA, true, 5)],
@@ -238,11 +239,7 @@ async fn many_concurrent_uploads_never_get_the_upstream_link_goawayed() {
         });
     }
     let failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let rig = Rig::start(
-        forwarding_frontend(node, Arc::clone(&failures)),
-        tagged("b"),
-    )
-    .await;
+    let rig = Rig::start(&[forwarding_frontend(node, Arc::clone(&failures))]);
     let mut client = rig.client().await;
     let mut open = JoinSet::new();
     for _ in 0..150 {

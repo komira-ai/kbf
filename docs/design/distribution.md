@@ -1,5 +1,10 @@
 # Distribution: kbf, kbf-installer and the package
 
+> **Retired in part.** The proxy's update API at `/v1/update/frontend`, its two-slot
+> supervision of frontend children and the `kbf-installer update` client were removed; a
+> pool of frontends behind the proxy is rolled as a package by `kbf-updater`. Passages below
+> that describe them are history.
+
 Status: design of record. Nothing here is built unless a sentence says so. Labels: **[V]** verified in
 a primary source or in the repo, **[L]** likely (inference, or memory of a primary source), **[U]**
 unverified or not yet designed.

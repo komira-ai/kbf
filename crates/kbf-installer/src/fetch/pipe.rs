@@ -167,7 +167,7 @@ fn readable(fd: i32, wait: Duration) -> io::Result<bool> {
 /// What the result `n` of `poll` says: whether the descriptor is ready. A call a signal
 /// interrupted is "not yet" (the caller looks at the clock and asks again); any other failure
 /// is an error. `last` is read only for a failure.
-pub(crate) fn polled(n: libc::c_int, last: impl FnOnce() -> io::Error) -> io::Result<bool> {
+pub(crate) fn polled(n: libc::c_int, last: fn() -> io::Error) -> io::Result<bool> {
     if n >= 0 {
         return Ok(n > 0);
     }
@@ -232,7 +232,7 @@ impl Tally {
         &mut self,
         read: io::Result<usize>,
         buf: &[u8],
-        out: &mut impl Write,
+        out: &mut dyn Write,
     ) -> Result<bool, PipeFault> {
         let n = match chunk(read)? {
             Chunk::End => return Ok(true),
@@ -296,7 +296,7 @@ fn drain(
     lend: Option<BorrowedFd<'_>>,
     caps: Caps,
     length: Length,
-    out: &mut impl Write,
+    out: &mut dyn Write,
 ) -> Result<Received, PipeFault> {
     refuse_root(spec.run_as, own_ids())?;
     let mut command = Command::new(&spec.program);

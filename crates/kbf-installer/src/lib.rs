@@ -18,9 +18,6 @@
 //! - [`meta_log`]: the node's metadata log, saved at a release's first start and put back when
 //!   the host goes back to the release that ran before (a binary from before skipped entries
 //!   refuses a raised log).
-//! - [`migrator`]: brings the state database to the schema a release declares, and asks a
-//!   binary which schema that is (`--version --json`); the swap's migration uses it. (The
-//!   schema step of a bundled host's `boot-check` is `kbf boot-check`'s now.)
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
 //!
@@ -47,11 +44,9 @@
 //!   `--version --json`, and on macOS the quarantine attribute and the code signature.
 //! - [`proxy_verb`]: `kbf-installer proxy`, the host of the `kbf-proxy` runtime (the one
 //!   public port of a frontend host); it shares nothing with the root helper above.
-//! - [`proxy`]: the frontend proxy's update machinery, against traits (no socket, no child):
-//!   the swap orchestrator, and in `proxy::api` the update API (routes, bearer-token check,
-//!   the actor that owns one update, idempotent request ids).
-//! - `proxy_pool`: the proxy verb's other mode, a load balancer over frontends that run on
-//!   their own (`[[frontend]]` tables), with none of the above behind it.
+//! - `proxy_pool`: what the proxy verb serves, a load balancer over frontends that run on
+//!   their own (`[[frontend]]` tables). The two-slot supervision of frontend children that
+//!   the verb once had was removed.
 //! - [`run`]: the one place a process is started, behind a trait a test plays.
 //! - [`refusal`]: every way a stage is refused, one enum with a stable code per case.
 //!
@@ -75,9 +70,6 @@ pub mod golden;
 pub mod helper;
 pub mod host_mode;
 pub mod meta_log;
-pub mod migrator;
-pub mod observe;
-pub mod proxy;
 mod proxy_pool;
 pub mod proxy_verb;
 pub mod record;

@@ -7,8 +7,9 @@
 //! steps are carried out. It is root's: run by anyone else it exits 2 and says so.
 //!
 //! What it does not take is the proxy's side: the library is linked without its `proxy` feature,
-//! so there are no `--proxy` flags (clap refuses them as flags it does not know), a host behind
-//! the proxy (an all-in-one host always is) is `kbf-installer setup --proxy`'s, and the `kbf`
+//! so there are no `--proxy` flags (clap refuses them as flags it does not know; `kbf-installer
+//! setup` takes them only to refuse them, two-slot supervision having been removed), an
+//! `installer.toml` with a `[proxy]` table is `kbf-installer setup`'s to keep, and the `kbf`
 //! binary links none of the proxy's code.
 //!
 //! Exit status: 0 done, 1 failed, 2 a command line or a prerequisite that is not right (not
@@ -38,8 +39,9 @@ pub const SETUP: &str = "setup";
     about = "First configuration of a host from the packages: the accounts, directories, \
              installer.toml, kbf.toml and the units of the mode, and the state database's schema",
     after_help = "Without --apply, setup prints each step as DRY-RUN and changes nothing. A \
-                  frontend behind the proxy and an all-in-one host are set up by `kbf-installer \
-                  setup --proxy`: this command takes none of the proxy's flags."
+                  proxy over frontends is configured by hand with [[proxy.frontend]] tables in \
+                  installer.toml (docs/design/kbf-proxy-api.md); this command takes none of the \
+                  proxy's flags."
 )]
 pub struct Args {
     /// Print an error as one JSON object on standard output.

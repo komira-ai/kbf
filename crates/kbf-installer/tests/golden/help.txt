@@ -17,7 +17,7 @@ Commands:
   boot-check      Run before each start of a release on trial; counts the start
   quiesce         For maintainer scripts: take the lock; exit 5 while a swap is pending
   check           Validate the installer's configuration, trust files and path chain
-  proxy           Serve the frontend host's public port: route each stream to the active child frontend
+  proxy           Serve the frontend host's public port: balance each stream over the pool of frontends
   help            Print this message or the help of the given subcommand(s)
 
 Options:
@@ -52,17 +52,17 @@ Options:
       --token-file <TOKEN_FILE>
           The enrollment token (a file of mode 0600 or tighter); setup keeps a copy that only kbf reads. For the modes that enroll
       --database <DATABASE>
-          The state database, as postgres:///NAME?host=SOCKET_DIR&user=ROLE (no password), for `frontend` and `all-in-one`: written to installer.toml and, as `state-store`, to kbf.toml, and setup creates (or brings forward) its schema. Left out, it is postgres:///kbf?host=/run/postgresql&user=kbf-server on this host's own Postgres server, and setup creates the role and the database as if --create-local-database were given. Given, the server exists before setup runs, and so do the role and the database unless --create-local-database makes them
+          The state database, as postgres:///NAME?host=SOCKET_DIR&user=ROLE (no password), for `frontend` and `all-in-one`: written to installer.toml and, as `state-store`, to kbf.toml, and setup creates (or brings forward) its schema. Left out, it is postgres:///kbf?host=/run/postgresql&user=ROLE on this host's own Postgres server (ROLE is kbf-server for `frontend`, kbf for `all-in-one`: the account the mode's unit runs as), and setup creates the role and the database as if --create-local-database were given. Given, the server exists before setup runs, and so do the role and the database unless --create-local-database makes them
       --create-local-database
           Create the login role and the database the `--database` URL names (owned by the role, no password), on a host whose Postgres runs locally, as the server's superuser over its Unix socket (peer authentication, no password), if they are not there. `frontend` and `all-in-one` do this whenever --database is left out, so the flag only matters beside --database. Never edits `pg_hba.conf`; prints the rules the logins need, and refuses, saying which rule to add, when the server does not admit a login. With --database and without this flag, setup only checks that it can log in
       --no-start
           Enable the units without starting them
       --listen <LISTEN>
-          The public REAPI listener, as IP:PORT (kbf's --listen). frontend
+          The public REAPI listener, as IP:PORT (kbf's --listen). frontend, all-in-one
       --worker-listen <WORKER_LISTEN>
-          The worker listener (daemons and storage nodes dial it), as IP:PORT. frontend
+          The worker listener (daemons and storage nodes dial it), as IP:PORT. frontend, all-in-one
       --api-listen <API_LISTEN>
-          The operator API listener, as IP:PORT; default 127.0.0.1:8982. frontend
+          The operator API listener, as IP:PORT; default 127.0.0.1:8982. frontend, all-in-one
       --reapi-tls-cert <REAPI_TLS_CERT>
           The REAPI listener's certificate (PEM file, absolute path); needs --reapi-tls-key
       --reapi-tls-key <REAPI_TLS_KEY>
@@ -111,16 +111,6 @@ Options:
           Retired: accepted and ignored for one release, with a warning (setup writes no release keys)
       --commit <COMMIT>
           Retired: accepted and ignored for one release, with a warning (setup installs no release)
-      --proxy
-          Set this host up behind `kbf-installer proxy`: write the `[proxy]` table of installer.toml and enable kbf-proxy.socket and kbf-proxy.service instead of kbf-frontend.service (an all-in-one host also gets kbf-storage-and-daemon.service, and cannot be set up without --proxy). Only for `--mode=frontend` and `--mode=all-in-one`. The proxy takes --reapi-tls-cert, --reapi-tls-key and --worker-client-ca; the listener flags are not taken
-      --proxy-base-port <PROXY_BASE_PORT>
-          The first loopback port of the frontend children the proxy starts (1024 to 65521); slot A uses it and the four after, slot B ten above. Default 18000. With --proxy
-      --buck2-auth <BUCK2_AUTH>
-          How REAPI and Buck2 callers authenticate to the proxy; default none. With --proxy [possible values: none, bearer, mtls]
-      --buck2-token-file <BUCK2_TOKEN_FILE>
-          The Buck2 API key file, an absolute path, for --buck2-auth bearer
-      --storage-port <STORAGE_PORT>
-          The loopback port of the kbf-storage-and-daemon sibling an all-in-one host runs, which the frontend child dials in plain text (1024 to 65535, clear of the children's ports). Default 8990. Only for `--mode=all-in-one`, with --proxy
   -h, --help
           Print help
 
@@ -268,17 +258,14 @@ Options:
   -h, --help   Print help
 
 === kbf-installer proxy --help ===
-Serve the frontend host's public port: route each stream to the active child frontend
+Serve the frontend host's public port: balance each stream over the pool of frontends
 
 Usage: kbf-installer proxy [OPTIONS]
 
 Options:
-      --config <CONFIG>          The installer.toml whose `[proxy]` table configures the proxy (default: the platform's, `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac)
-      --json                     Print the result as one JSON object on standard output
-      --apply                    Do what the verb says. Without it a mutating verb is a dry run
-      --orders-dir <ORDERS_DIR>  The order spool the update API writes and the root half reads: owned by the service user. As `run --orders-dir`. Default: `orders` in the host's state directory
-      --check                    Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing
-      --update-dir <UPDATE_DIR>  Root's directory: the proxy reads `status.json` here, to start the installed release when no frontend child is running, and the update API reads its status. As `run --update-dir`. Default: the host's state directory (`/var/lib/kbf-installer`, `/var/db/kbf-installer` on a Mac)
-      --kbf-binary <KBF_BINARY>  The kbf the package installed (`/usr/bin/kbf`; an absolute path). With it the proxy keeps a verified copy of each kbf it runs in `releases` of its state directory, starts its children only from those copies, and keeps its installed and staged releases in `releases.json` there: root's `status.json` and order spool are not used (`--update-dir` and `--orders-dir` are ignored) and the update API orders nothing. Without it the proxy works as before
-  -h, --help                     Print help
+      --config <CONFIG>  The installer.toml whose `[proxy]` table configures the proxy (default: the platform's, `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac)
+      --json             Print the result as one JSON object on standard output
+      --apply            Do what the verb says. Without it a mutating verb is a dry run
+      --check            Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing
+  -h, --help             Print help
 

@@ -381,8 +381,7 @@ A client that submitted through one frontend can ask any other for the result.
   Any other answers from the store: the `op/` and `queue/` rows say it is queued or running
   (executing, once a lease is held), and the `done/` row holds its result. The channel the
   answer is made on is looked at again at every intake poll (`Progress`, the look
-  `Farm::follow` and the handover's `Handed::look` make for the callers of an operation they
-  did not run), until it shows the result, and is dropped when no stream or call holds it. A
+  `Farm::follow` makes for the callers of an operation it did not run), until it shows the result, and is dropped when no stream or call holds it. A
   store that cannot be read, or has no trace of the operation, answers NOT_FOUND.
 - **Whose result it is.** A call is authorized against the instance name the operation was
   submitted under, and a `done/` row holds only the response. The transaction that finishes

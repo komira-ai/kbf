@@ -6,8 +6,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio_rustls::client::TlsStream;
 
-use super::kit::{CAPS, OPERATOR, OPERATOR_TOKEN, Rig};
+use super::kit::{CAPS, OPERATOR, OPERATOR_TOKEN};
 use super::pki::{Pki, client_config};
+use super::pool_kit::Rig;
 use super::secure::{connect_tls, tls_rig};
 use crate::auth::Buck2Auth;
 
@@ -50,7 +51,7 @@ async fn http11_serves_probes_and_operator_paths() {
     let served = h1(&rig, &pki, &get("/v1/status?x=1", &auth)).await;
     assert!(status_of(&served).starts_with("HTTP/1.1 200"), "{served}");
     assert!(served.contains("\r\na\r\n"), "the child's answer: {served}");
-    let seen = rig.a.state.headers_of(OPERATOR);
+    let seen = rig.a().state.headers_of(OPERATOR);
     assert_eq!(seen.len(), 1);
     assert!(seen[0].get("connection").is_none() && seen[0].get("host").is_none());
     assert!(seen[0].get("x-kbf-node-id").is_none());
@@ -58,7 +59,7 @@ async fn http11_serves_probes_and_operator_paths() {
 
     let refused = h1(&rig, &pki, &get(OPERATOR, "")).await;
     assert!(status_of(&refused).starts_with("HTTP/1.1 401"), "{refused}");
-    assert_eq!(rig.a.state.dispatches(), 1);
+    assert_eq!(rig.a().state.dispatches(), 1);
 }
 
 /// A client that offers no ALPN at all is an HTTP/1.1 client.
@@ -103,7 +104,7 @@ async fn a_grpc_path_on_http11_is_426() {
             "{response}"
         );
     }
-    assert_eq!(rig.a.state.dispatches(), 0);
+    assert_eq!(rig.a().state.dispatches(), 0);
 }
 
 /// A path outside the table is a 404 on HTTP/1.1, as on HTTP/2.
@@ -127,7 +128,7 @@ async fn an_unknown_path_on_http11_is_404() {
         status_of(&response).starts_with("HTTP/1.1 404"),
         "{response}"
     );
-    assert_eq!(rig.a.state.dispatches(), 0);
+    assert_eq!(rig.a().state.dispatches(), 0);
 }
 
 /// `CONNECT`, an absolute-form target and an `Upgrade` header are `400`.
@@ -149,7 +150,7 @@ async fn only_origin_form_requests_without_upgrade_are_served() {
             "{request}: {response}"
         );
     }
-    assert_eq!(rig.a.state.dispatches(), 0);
+    assert_eq!(rig.a().state.dispatches(), 0);
 }
 
 /// A head over 16 KiB, or with over 100 headers, is refused and the connection closes.
@@ -204,14 +205,12 @@ async fn a_slow_head_is_closed() {
     assert!(done.is_ok(), "the server kept a half-sent head for 30 s");
 }
 
-/// A request for a backend that the gate holds waits, and at the bound is answered `503`
-/// with `Retry-After`; the probes are not held.
-///
-/// Kills: a held h1 request that never answers; a probe held.
+/// Asserts that a request for a backend that no member takes is answered `503` with
+/// `Retry-After` and reaches no child, while the probes are answered as before.
 #[tokio::test(start_paused = true)]
-async fn a_held_http11_request_is_503_at_the_bound() {
-    let (rig, pki, _) = tls_rig("h1-hold", Buck2Auth::None).await;
-    let _guard = rig.core.slots.hold(Duration::from_secs(20)).expect("hold");
+async fn an_http11_request_no_member_takes_is_503() {
+    let (rig, pki, _) = tls_rig("h1-unplaced", Buck2Auth::None).await;
+    assert!(rig.members.set_draining("a", true));
     let health = h1(&rig, &pki, &get("/healthz", "")).await;
     assert!(status_of(&health).starts_with("HTTP/1.1 200"), "{health}");
 
@@ -225,7 +224,7 @@ async fn a_held_http11_request_is_503_at_the_bound() {
         response.to_ascii_lowercase().contains("retry-after: 1"),
         "{response}"
     );
-    assert_eq!(rig.a.state.dispatches(), 0);
+    assert_eq!(rig.a().state.dispatches(), 0);
 }
 
 /// A shutdown closes an idle HTTP/1.1 connection and lets the server end.

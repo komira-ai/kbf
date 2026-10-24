@@ -7,8 +7,9 @@ use bytes::Bytes;
 use h2::Reason;
 
 use super::kit::{
-    CAPS, RawFrame, RawPeer, Rig, finish, frame_on, grpc_ok, script, send_end, tagged, until,
+    CAPS, RawFrame, RawPeer, finish, frame_on, grpc_ok, script, send_end, tagged, until,
 };
+use super::pool_kit::Rig;
 use crate::limits::{DOWNSTREAM_CONNECTION_STREAMS, PENDING_RESET_STREAMS};
 
 /// `ENHANCE_YOUR_CALM`, the error code h2 puts on the GOAWAY of a flood.
@@ -55,21 +56,19 @@ async fn a_thousand_client_cancels_on_one_connection_trip_nothing() {
             grpc_ok(&mut call.respond, "after");
         }
     });
-    let rig = Rig::start(a, tagged("b")).await;
+    let rig = Rig::start(&[a]);
     let mut client = rig.client().await;
     let mut open = Vec::new();
     for _ in 0..streams {
         open.push(client.start(CAPS, false).await);
     }
-    until(|| rig.a.state.dispatches() == streams).await;
-    assert_eq!(
-        rig.core.slots.open_permits(crate::slot::Slot::A),
-        streams as u64
-    );
+    until(|| rig.a().state.dispatches() == streams).await;
+    let open_on_a = || rig.members.snapshot()[0].open_streams.reapi;
+    assert_eq!(open_on_a(), streams as u64);
     for (_response, body) in &mut open {
         body.send_reset(Reason::CANCEL);
     }
-    until(|| rig.core.slots.open_permits(crate::slot::Slot::A) == 0).await;
+    until(|| open_on_a() == 0).await;
     assert!(client.alive(), "the connection was not sent away");
     assert_eq!(client.unary(CAPS).await.text(), "after");
 }
@@ -80,7 +79,7 @@ async fn a_thousand_client_cancels_on_one_connection_trip_nothing() {
 /// connection keeps serving. At the default it is sent a GOAWAY.
 #[tokio::test(start_paused = true)]
 async fn a_thousand_streams_opened_and_cancelled_in_one_burst_trip_nothing() {
-    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    let rig = Rig::start(&[tagged("a")]);
     let mut peer = RawPeer::connect(&rig).await;
     // One more than the stream cap: h2 trips on the reset after its limit, so a limit of
     // exactly 1000 passes 1000 pairs and fails this.
@@ -96,7 +95,7 @@ async fn a_thousand_streams_opened_and_cancelled_in_one_burst_trip_nothing() {
 /// while a client on another connection is served before and after.
 #[tokio::test(start_paused = true)]
 async fn a_rapid_reset_attack_is_sent_away_on_its_own_connection_only() {
-    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    let rig = Rig::start(&[tagged("a")]);
     let mut good = rig.client().await;
     assert_eq!(good.unary(CAPS).await.text(), "a");
 
@@ -143,7 +142,7 @@ async fn sent_away(peer: &mut RawPeer) -> bool {
 /// connection is untouched.
 #[tokio::test(start_paused = true)]
 async fn a_continuation_flood_is_sent_away_on_its_own_connection_only() {
-    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    let rig = Rig::start(&[tagged("a")]);
     let mut good = rig.client().await;
     let mut attacker = RawPeer::connect(&rig).await;
     let mut flood = frame_on(RawFrame::HEADERS, 0, 1, &[0x83, 0x86, 0x84]);
@@ -160,7 +159,7 @@ async fn a_continuation_flood_is_sent_away_on_its_own_connection_only() {
 /// the connection is not sent away, and the next call on it is served.
 #[tokio::test(start_paused = true)]
 async fn an_oversize_header_list_is_refused_on_its_stream_only() {
-    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    let rig = Rig::start(&[tagged("a")]);
     let mut peer = RawPeer::connect(&rig).await;
     // `x: <20000 bytes>` as a literal field without indexing (name and value literal), so the
     // block is over the 16 KiB cap and spans a HEADERS and a CONTINUATION frame.
@@ -191,7 +190,7 @@ async fn an_oversize_header_list_is_refused_on_its_stream_only() {
         "stream 1 was not refused, or stream 3 not served"
     );
     assert_eq!(
-        rig.a.state.dispatches(),
+        rig.a().state.dispatches(),
         1,
         "only the call of stream 3 reached the child"
     );

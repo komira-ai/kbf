@@ -9,8 +9,9 @@
 use kbf_peer::PeerRole;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::kit::{Access, CAPS, CLIENT_IP, OPERATOR_TOKEN, Rig, SECRET};
+use super::kit::{Access, CAPS, CLIENT_IP, OPERATOR_TOKEN, SECRET};
 use super::pki::client_config;
+use super::pool_kit::Rig;
 use super::secure::{connect_tls, h2_over_tls, tls_rig};
 use crate::auth::Buck2Auth;
 use crate::identity::Identity;
@@ -21,16 +22,6 @@ const STATUS: &str = "/v1/nodes/host-1";
 /// What a host sends in place of the token: a value the proxy must not pass on.
 const HOST_TOKEN: &str = "whatever-the-host-holds-0123456789abcdef";
 
-/// Held so the `tracing` macros of the code under test run their fields (a subscriber that
-/// writes nowhere): a test's coverage must not rest on another test's subscriber.
-fn logging() -> tracing::subscriber::DefaultGuard {
-    tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_writer(std::io::sink)
-            .finish(),
-    )
-}
-
 fn identity(role: PeerRole, node: &str) -> Identity {
     Identity {
         node_id: node.into(),
@@ -39,12 +30,12 @@ fn identity(role: PeerRole, node: &str) -> Identity {
     }
 }
 
-async fn rig(mode: Buck2Auth, role: PeerRole, node: &str) -> Rig {
-    Rig::start_secure(mode, Access::Plain(Some(identity(role, node)))).await
+fn rig(mode: Buck2Auth, role: PeerRole, node: &str) -> Rig {
+    Rig::start_secure(mode, Access::Plain(Some(identity(role, node))))
 }
 
 fn authorization(rig: &Rig, path: &str) -> Vec<Option<String>> {
-    rig.a
+    rig.a()
         .state
         .headers_of(path)
         .iter()
@@ -60,9 +51,8 @@ fn authorization(rig: &Rig, path: &str) -> Vec<Option<String>> {
 /// token of its own), and the child sees the operator token and not the host's.
 #[tokio::test(start_paused = true)]
 async fn an_updater_drains_uncordons_and_reads_its_own_node() {
-    let _log = logging();
     for host_sends in [None, Some(HOST_TOKEN)] {
-        let rig = rig(Buck2Auth::None, PeerRole::Updater, "host-1").await;
+        let rig = rig(Buck2Auth::None, PeerRole::Updater, "host-1");
         let mut client = rig.client().await;
         client.bearer = host_sends.map(str::to_owned);
         for (method, path, body) in [
@@ -78,7 +68,7 @@ async fn an_updater_drains_uncordons_and_reads_its_own_node() {
                 "{method} {path}"
             );
         }
-        assert_eq!(rig.a.state.dispatches(), 3);
+        assert_eq!(rig.a().state.dispatches(), 3);
     }
 }
 
@@ -114,7 +104,7 @@ async fn an_updater_is_refused_everything_but_its_own_nodes_three_calls() {
     ];
     for token in [None, Some(OPERATOR_TOKEN)] {
         for mode in [Buck2Auth::None, Buck2Auth::Mtls] {
-            let rig = rig(mode, PeerRole::Updater, "host-1").await;
+            let rig = rig(mode, PeerRole::Updater, "host-1");
             let mut client = rig.client().await;
             client.bearer = token.map(str::to_owned);
             for (method, path) in calls {
@@ -125,7 +115,7 @@ async fn an_updater_is_refused_everything_but_its_own_nodes_three_calls() {
                     || (reply.status == Some(200) && reply.grpc_status().as_deref() == Some("7"));
                 assert!(refused, "{method} {path} {mode:?} {token:?}: {reply:?}");
             }
-            assert_eq!(rig.a.state.dispatches(), 0, "the child was asked");
+            assert_eq!(rig.a().state.dispatches(), 0, "the child was asked");
         }
     }
 }
@@ -134,7 +124,7 @@ async fn an_updater_is_refused_everything_but_its_own_nodes_three_calls() {
 /// proxy answers them itself.
 #[tokio::test(start_paused = true)]
 async fn an_updater_still_reaches_what_is_open_to_everyone() {
-    let rig = rig(Buck2Auth::None, PeerRole::Updater, "host-1").await;
+    let rig = rig(Buck2Auth::None, PeerRole::Updater, "host-1");
     let mut client = rig.client().await;
     client.bearer = None;
     assert_eq!(client.plain("GET", "/healthz", b"").await.status, Some(200));
@@ -146,7 +136,7 @@ async fn an_updater_still_reaches_what_is_open_to_everyone() {
 #[tokio::test(start_paused = true)]
 async fn node_and_frontend_certificates_get_no_scoped_calls() {
     for role in [PeerRole::Daemon, PeerRole::Storage, PeerRole::Frontend] {
-        let rig = rig(Buck2Auth::None, role, "host-1").await;
+        let rig = rig(Buck2Auth::None, role, "host-1");
         let mut client = rig.client().await;
         for bearer in [None, Some(HOST_TOKEN.to_owned())] {
             client.bearer = bearer.clone();
@@ -159,7 +149,7 @@ async fn node_and_frontend_certificates_get_no_scoped_calls() {
                 );
             }
         }
-        assert_eq!(rig.a.state.dispatches(), 0, "{role:?}");
+        assert_eq!(rig.a().state.dispatches(), 0, "{role:?}");
     }
 }
 
@@ -169,14 +159,13 @@ async fn node_and_frontend_certificates_get_no_scoped_calls() {
 /// role the proxy serves nothing) closes the connection.
 #[tokio::test(start_paused = true)]
 async fn an_updater_certificate_is_admitted_at_the_door_for_its_own_node() {
-    let _log = logging();
     let (rig, pki, _) = tls_rig("self-node-e2e", Buck2Auth::None).await;
     let updater = pki.client(&["host-1"], Some("updater"));
     let mut client = h2_over_tls(&rig, client_config(&pki.ca_pem, Some(&updater), &["h2"])).await;
     client.bearer = Some(HOST_TOKEN.to_owned());
     let reply = client.plain("POST", DRAIN, b"{}").await;
     assert_eq!(reply.status, Some(200), "{reply:?}");
-    let seen = rig.a.state.headers_of(DRAIN);
+    let seen = rig.a().state.headers_of(DRAIN);
     assert_eq!(seen.len(), 1);
     let header = |name: &str| {
         seen[0]
@@ -195,7 +184,7 @@ async fn an_updater_certificate_is_admitted_at_the_door_for_its_own_node() {
 
     let other = client.plain("POST", "/v1/nodes/host-2:drain", b"{}").await;
     assert_eq!(other.status, Some(403));
-    assert_eq!(rig.a.state.dispatches(), 1);
+    assert_eq!(rig.a().state.dispatches(), 1);
 
     let coordinator = pki.client(&["coordinator.farm"], Some("coordinator"));
     let config = client_config(&pki.ca_pem, Some(&coordinator), &["h2"]);

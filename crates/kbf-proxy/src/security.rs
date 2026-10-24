@@ -8,7 +8,6 @@ use std::net::IpAddr;
 use std::time::Instant;
 
 use http::{HeaderMap, Method, Uri};
-use kbf_oidc::Verified;
 
 use kbf_peer::PeerRole;
 
@@ -17,7 +16,6 @@ use crate::auth::{
     decide_updater,
 };
 use crate::identity::{Identity, ProxySecret};
-use crate::remote::RemoteCi;
 use crate::route::{AuthClass, self_node_of};
 
 /// The mode, the tokens, the secret the children are told and the limit on wrong tokens.
@@ -27,8 +25,6 @@ pub(crate) struct Security {
     pub(crate) tokens: Tokens,
     pub(crate) secret: ProxySecret,
     pub(crate) failures: FailureLimit,
-    /// The CI credential, if the proxy was given an allow-list.
-    pub(crate) remote: Option<RemoteCi>,
 }
 
 /// What admitted a call.
@@ -36,8 +32,6 @@ pub(crate) struct Security {
 pub(crate) enum Admitted {
     /// The credential the class takes: a certificate, the operator token or the Buck2 key.
     Credential,
-    /// A CI job's OIDC token, for one of the two calls of [`crate::remote::ROUTES`].
-    Ci(Verified),
     /// A host updater's certificate, for a call about its own node (the node's id): the
     /// caller puts the operator token in place of whatever the host sent.
     SelfNode(String),
@@ -50,26 +44,15 @@ impl Security {
             tokens,
             secret,
             failures: FailureLimit::new(),
-            remote: None,
         }
     }
 
-    /// The same, admitting the OIDC tokens of `remote` for the calls of [`RemoteCi::allows`].
-    pub(crate) fn with_remote(mut self, remote: RemoteCi) -> Self {
-        self.remote = Some(remote);
-        self
-    }
-
-    /// [`Security::authorize`] for a call that may carry a CI job's OIDC token instead of the
-    /// operator token.
+    /// [`Security::authorize`] for a call that may be a host updater's, about its own node.
     ///
-    /// The token is looked at only when there is an allow-list, the class takes the operator
-    /// token, the call is one of the two of [`RemoteCi::allows`], the bearer is shaped like a
-    /// JWS and is not the operator token. Order: the address's limit on wrong credentials
-    /// first (before any hashing or key lookup), then the verifier. A token the verifier
-    /// refuses counts against the address as a wrong token does; keys that cannot be fetched
-    /// are not the caller's fault and count for nothing. Any other call is [`Security::authorize`].
-    pub(crate) async fn authorize_call(
+    /// An updater certificate is decided by [`decide_updater`]: the three calls about its own
+    /// node pass as [`Admitted::SelfNode`], anything else the updater may not make is refused.
+    /// Every other caller is [`Security::authorize`].
+    pub(crate) fn authorize_call(
         &self,
         class: AuthClass,
         call: (&Method, &Uri),
@@ -85,30 +68,6 @@ impl Security {
                 (AuthClass::Operator, Some(node)) => Admitted::SelfNode(node.to_owned()),
                 _ => Admitted::Credential,
             });
-        }
-        if let (Some(remote), AuthClass::Operator | AuthClass::Update, Some(bearer)) =
-            (&self.remote, class, bearer_of(headers))
-            && RemoteCi::allows(call.0, call.1)
-            && RemoteCi::looks_like_jwt(bearer)
-        {
-            if !self.failures.allows(ip, now) {
-                return Err(Refusal::RateLimited);
-            }
-            let operator = self.tokens.operator.as_ref();
-            if !operator.is_some_and(|t| t.admits(bearer)) {
-                return match remote.verify(bearer).await {
-                    Ok(who) => Ok(Admitted::Ci(who)),
-                    Err(kbf_oidc::Refusal::KeysUnavailable) => {
-                        tracing::warn!("remote ci: the issuer's keys are unavailable");
-                        Err(Refusal::Unavailable)
-                    }
-                    Err(refusal) => {
-                        tracing::warn!(reason = refusal.name(), %ip, "remote ci: token refused");
-                        self.failures.record(ip, now);
-                        Err(Refusal::Unauthenticated)
-                    }
-                };
-            }
         }
         self.authorize(class, headers, identity, ip, now)
             .map(|()| Admitted::Credential)

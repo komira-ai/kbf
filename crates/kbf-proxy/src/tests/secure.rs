@@ -9,6 +9,7 @@
 
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -19,10 +20,11 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 use super::kit::{
-    Access, BUCK2_TOKEN, CAPS, CLIENT_IP, Client, OPERATOR, OPERATOR_TOKEN, Rig, SECRET,
-    client_builder, finish,
+    Access, BUCK2_TOKEN, CAPS, CLIENT_IP, Client, OPERATOR, OPERATOR_TOKEN, SECRET, client_builder,
+    finish,
 };
 use super::pki::{Pki, client_config};
+use super::pool_kit::Rig;
 use crate::auth::Buck2Auth;
 use crate::identity::Identity;
 use crate::route::{Route, route_of};
@@ -62,15 +64,14 @@ async fn call(client: &mut Client, path: &str) -> String {
 
 /// One cell of the matrix: a proxy in `mode` whose client presented `role` (a verified
 /// certificate, or none) and `bearer`, calling `path`. Also checks the child saw the call
-/// if and only if it was let through to a child path (`/metrics` asks the child too).
+/// if and only if it was let through to a child path.
 async fn cell(mode: Buck2Auth, role: Option<PeerRole>, bearer: Option<&str>, path: &str) -> String {
-    let rig = Rig::start_secure(mode, Access::Plain(role.map(identity))).await;
+    let rig = Rig::start_secure(mode, Access::Plain(role.map(identity)));
     let mut client = rig.client().await;
     client.bearer = bearer.map(str::to_owned);
     let got = call(&mut client, path).await;
-    let reached = rig.a.state.dispatches();
-    let expected =
-        usize::from(got == "ok" && matches!(route_of(path), Route::Child(_) | Route::Metrics));
+    let reached = rig.a().state.dispatches();
+    let expected = usize::from(got == "ok" && matches!(route_of(path), Route::Child(_)));
     assert_eq!(
         reached, expected,
         "{path} {mode:?} {role:?} {bearer:?}: {got}"
@@ -215,32 +216,31 @@ async fn probes_and_enrollment_are_open() {
             assert_eq!(cell(mode, ANON, NO, path).await, "ok", "{path} {mode:?}");
         }
     }
-    let rig = Rig::start_secure(Mtls, Access::Plain(None)).await;
+    let rig = Rig::start_secure(Mtls, Access::Plain(None));
     let mut client = rig.client().await;
     client.bearer = None;
     assert_eq!(call(&mut client, ENROLL).await, "ok");
-    assert_eq!(rig.a.state.headers_of(ENROLL).len(), 1);
+    assert_eq!(rig.a().state.headers_of(ENROLL).len(), 1);
 }
 
-/// A refusal is counted and never reaches a child, a hold or a permit.
-///
-/// Kills: auth after the hold queue or after the dial.
+/// Asserts that a refusal is counted, and that it is made before the call is placed on a
+/// member: no stream is open on any member, and no dial was made.
 #[tokio::test(start_paused = true)]
-async fn a_refused_call_never_waits_in_the_hold_queue() {
-    let rig = Rig::start_secure(Buck2Auth::Mtls, Access::Plain(None)).await;
-    let guard = rig.core.slots.hold(Duration::from_secs(20)).expect("hold");
+async fn a_refused_call_is_counted_and_never_placed() {
+    let rig = Rig::start_secure(Buck2Auth::Mtls, Access::Plain(None));
     let mut client = rig.client().await;
     assert_eq!(call(&mut client, CAPS).await, "16");
-    assert_eq!(rig.core.queue.held(), 0, "refused before it could be held");
+    assert_eq!(rig.members.open_total(), 0, "refused before it was placed");
+    assert_eq!(rig.members.snapshot()[0].open_streams.reapi, 0);
+    assert_eq!(rig.core.metrics.upstream_dials.load(Ordering::Acquire), 0);
     assert_eq!(
         rig.core
             .metrics
-            .render(&rig.core.slots, &rig.core.queue)
+            .render()
             .matches("auth_refused_total 1")
             .count(),
         1
     );
-    drop(guard);
 }
 
 /// A node id that cannot be a header value is refused as `PERMISSION_DENIED`, never forwarded
@@ -254,10 +254,10 @@ async fn an_identity_that_cannot_be_a_header_is_refused() {
         role: PeerRole::Daemon,
         ips: Vec::new(),
     };
-    let rig = Rig::start_secure(Buck2Auth::None, Access::Plain(Some(bad))).await;
+    let rig = Rig::start_secure(Buck2Auth::None, Access::Plain(Some(bad)));
     let reply = rig.client().await.unary(WORKER).await;
     assert_eq!(reply.grpc_status().as_deref(), Some("7"), "{reply:?}");
-    assert_eq!(rig.a.state.dispatches(), 0);
+    assert_eq!(rig.a().state.dispatches(), 0);
 }
 
 /// A refusal is sent from the request headers, so the stream is closed before the client's
@@ -265,15 +265,15 @@ async fn an_identity_that_cannot_be_a_header_is_refused() {
 /// answer (RFC 9113 section 8.1), not fail on the closed stream.
 ///
 /// Kills: a test client that treats `InactiveStreamId` from `send_data` as a failure of the
-/// call, which failed `bind_run_hold_release_and_shutdown` when the refusal won the race.
+/// call, which failed `bind_run_and_shutdown` when the refusal won the race.
 #[tokio::test(start_paused = true)]
 async fn a_refusal_that_beats_the_message_is_still_read() {
-    let rig = Rig::start_secure(Buck2Auth::Bearer, Access::Plain(None)).await;
+    let rig = Rig::start_secure(Buck2Auth::Bearer, Access::Plain(None));
     let mut client = rig.client().await;
     let reply = client.unary_after(CAPS, Duration::from_secs(1)).await;
     assert_eq!(reply.grpc_status().as_deref(), Some("16"), "{reply:?}");
     assert!(reply.error.is_none(), "{reply:?}");
-    assert_eq!(rig.a.state.dispatches(), 0);
+    assert_eq!(rig.a().state.dispatches(), 0);
 }
 
 /// Wrong tokens are counted per address; past the burst even the right token is not looked
@@ -284,7 +284,7 @@ async fn a_refusal_that_beats_the_message_is_still_read() {
 /// token hashed before the limit is asked.
 #[tokio::test(start_paused = true)]
 async fn wrong_tokens_are_rate_limited_per_address() {
-    let rig = Rig::start_secure(Buck2Auth::Bearer, Access::Plain(None)).await;
+    let rig = Rig::start_secure(Buck2Auth::Bearer, Access::Plain(None));
     let mut right = rig.client_from(super::kit::CLIENT_IP).await;
     right.bearer = Some(BUCK2_TOKEN.into());
     for _ in 0..3 * crate::auth::FAILURE_BURST {
@@ -329,7 +329,7 @@ async fn wrong_tokens_are_rate_limited_per_address() {
 /// Kills: a gRPC status on a plain HTTP answer; a 401 that does not say how to authenticate.
 #[tokio::test(start_paused = true)]
 async fn http_paths_are_refused_with_http_statuses() {
-    let rig = Rig::start_secure(Buck2Auth::None, Access::Plain(None)).await;
+    let rig = Rig::start_secure(Buck2Auth::None, Access::Plain(None));
     let mut client = rig.client().await;
     client.bearer = Some(WRONG.into());
     for _ in 0..crate::auth::FAILURE_BURST {
@@ -351,10 +351,10 @@ async fn http_paths_are_refused_with_http_statuses() {
         role: PeerRole::Daemon,
         ips: Vec::new(),
     };
-    let rig = Rig::start_secure(Buck2Auth::None, Access::Plain(Some(bad))).await;
+    let rig = Rig::start_secure(Buck2Auth::None, Access::Plain(Some(bad)));
     let reply = rig.client().await.plain("GET", OPERATOR, b"").await;
     assert_eq!(reply.status, Some(403), "{reply:?}");
-    assert_eq!(rig.a.state.dispatches(), 0);
+    assert_eq!(rig.a().state.dispatches(), 0);
 }
 
 // ---- TLS ----
@@ -389,7 +389,7 @@ pub(super) async fn h2_over_tls(rig: &Rig, config: Arc<rustls::ClientConfig>) ->
 pub(super) async fn tls_rig(name: &str, mode: Buck2Auth) -> (Rig, Pki, crate::tls::TlsPaths) {
     let pki = Pki::new("farm CA");
     let paths = pki.write(&scratch(name), &pki.server());
-    let rig = Rig::start_secure(mode, Access::Tls(paths.clone())).await;
+    let rig = Rig::start_secure(mode, Access::Tls(paths.clone()));
     (rig, pki, paths)
 }
 
@@ -431,7 +431,7 @@ async fn a_verified_certificate_reaches_the_child_as_identity_headers() {
         .expect("body");
     assert_eq!(finish(response).await.text(), "a");
 
-    let seen = rig.a.state.headers_of(WORKER);
+    let seen = rig.a().state.headers_of(WORKER);
     assert_eq!(seen.len(), 1);
     assert_eq!(
         reserved(&seen[0]),
@@ -456,7 +456,7 @@ async fn a_client_without_a_certificate_is_anonymous_to_the_child() {
     body.send_data(Bytes::from_static(b"x"), true)
         .expect("body");
     assert_eq!(finish(response).await.text(), "a");
-    let seen = rig.a.state.headers_of(CAPS);
+    let seen = rig.a().state.headers_of(CAPS);
     assert_eq!(
         reserved(&seen[0]),
         [
@@ -464,6 +464,51 @@ async fn a_client_without_a_certificate_is_anonymous_to_the_child() {
             ("x-kbf-proxy-auth".to_owned(), hex::encode(SECRET)),
         ]
     );
+}
+
+/// Asserts that a stream one member refuses and that is placed again on the other member
+/// carries the same identity headers on both dispatches (the node id, the role, the secret and
+/// the connection's address), and that nothing the client forged under `x-kbf-*` reaches
+/// either member.
+#[tokio::test(start_paused = true)]
+async fn a_stream_placed_again_carries_the_same_identity_headers() {
+    use h2::Reason;
+
+    use super::kit::{read_all, script, security, send_end, tagged};
+    use crate::config::Limits;
+    use crate::control::NoUpdates;
+
+    let refusing = script(|mut call| async move {
+        read_all(&mut call.body).await;
+        call.respond.send_reset(Reason::REFUSED_STREAM);
+    });
+    let pki = Pki::new("farm CA");
+    let paths = pki.write(&scratch("placed-again-identity"), &pki.server());
+    let rig = Rig::build_with(
+        &[refusing, tagged("b")],
+        NoUpdates,
+        Limits::default(),
+        security(Buck2Auth::None),
+        Access::Tls(paths),
+    );
+    let daemon = pki.client(&["node-7.farm"], Some("daemon"));
+    let mut client = h2_over_tls(&rig, client_config(&pki.ca_pem, Some(&daemon), &["h2"])).await;
+    let (response, mut body) = client.start_with(CAPS, false, &FORGED).await;
+    send_end(&mut body, Bytes::from_static(b"ping"));
+    assert_eq!(finish(response).await.text(), "b");
+    assert_eq!(rig.dispatches(), [1, 1], "refused once, then answered");
+
+    let want = [
+        ("x-kbf-client-addr".to_owned(), CLIENT_IP.to_string()),
+        ("x-kbf-node-id".to_owned(), "node-7.farm".to_owned()),
+        ("x-kbf-proxy-auth".to_owned(), hex::encode(SECRET)),
+        ("x-kbf-role".to_owned(), "daemon".to_owned()),
+    ];
+    for child in &rig.children {
+        let seen = child.state.headers_of(CAPS);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(reserved(&seen[0]), want);
+    }
 }
 
 /// Each connection carries its own certificate's identity.
@@ -481,7 +526,7 @@ async fn two_connections_are_two_identities() {
         assert_eq!(b.unary(WORKER).await.text(), "a");
     }
     let mut nodes: Vec<String> = rig
-        .a
+        .a()
         .state
         .headers_of(WORKER)
         .iter()
@@ -520,7 +565,7 @@ async fn a_wrong_role_certificate_is_denied_on_a_worker_path() {
     assert_eq!(reply.grpc_status().as_deref(), Some("7"), "{reply:?}");
     let mut served = h2_over_tls(&rig, client_config(&pki.ca_pem, Some(&storage), &["h2"])).await;
     assert_eq!(served.unary(WORKER).await.text(), "a");
-    assert_eq!(rig.a.state.dispatches(), 1);
+    assert_eq!(rig.a().state.dispatches(), 1);
 }
 
 /// A client certificate issued by an intermediate CA, sent with it as `[leaf, intermediate]`,
@@ -535,7 +580,7 @@ async fn the_identity_is_the_leafs_when_a_chain_is_sent() {
         .client_chain(&["node-5.farm"], Some("storage"));
     let mut client = h2_over_tls(&rig, client_config(&pki.ca_pem, Some(&leaf), &["h2"])).await;
     assert_eq!(client.unary(WORKER).await.text(), "a");
-    let seen = rig.a.state.headers_of(WORKER);
+    let seen = rig.a().state.headers_of(WORKER);
     assert_eq!(
         reserved(&seen[0]),
         [
@@ -565,7 +610,7 @@ async fn an_expired_or_server_only_client_certificate_is_not_served() {
             .expect("the client side completes");
         assert!(closed_by_the_server(tls).await);
     }
-    assert_eq!(rig.a.state.dispatches(), 0);
+    assert_eq!(rig.a().state.dispatches(), 0);
     assert_eq!(
         rig.core
             .metrics
@@ -598,7 +643,7 @@ async fn a_certificate_of_another_ca_is_not_served() {
         .await
         .expect("the client side completes");
     assert!(closed_by_the_server(tls).await);
-    assert_eq!(rig.a.state.dispatches(), 0);
+    assert_eq!(rig.a().state.dispatches(), 0);
     assert_eq!(
         rig.core
             .metrics
@@ -632,7 +677,7 @@ async fn a_certificate_without_a_usable_identity_closes_the_connection() {
             .load(std::sync::atomic::Ordering::Relaxed),
         3
     );
-    assert_eq!(rig.a.state.dispatches(), 0);
+    assert_eq!(rig.a().state.dispatches(), 0);
 }
 
 /// TLS only: a client that speaks HTTP/2 in the clear is not served, and one that offers a
@@ -650,7 +695,7 @@ async fn plaintext_and_other_protocols_are_refused() {
             .await
             .is_err()
     );
-    assert_eq!(rig.a.state.dispatches(), 0);
+    assert_eq!(rig.a().state.dispatches(), 0);
 }
 
 /// A client that opens a connection and never speaks is closed at the handshake bound.

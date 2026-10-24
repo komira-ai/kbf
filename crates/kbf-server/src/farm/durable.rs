@@ -881,24 +881,6 @@ impl Durable {
         self.commit(txn)
     }
 
-    /// The unfinished operations that run `action` (of `instance`, if given): at most one
-    /// per instance, since a twin joins the operation that is running.
-    pub(super) fn operations_of(
-        &self,
-        instance: Option<&str>,
-        action: &Digest,
-    ) -> Result<Vec<OperationId>, StateError> {
-        let mut found = Vec::new();
-        for (key, row) in self.scan_known("op/")? {
-            let request = request_row(&key, &row)?;
-            let named = instance.is_none_or(|instance| request.key.instance == instance);
-            if named && request.key.action == *action {
-                found.push(parse_operation(&key, "op/")?);
-            }
-        }
-        Ok(found)
-    }
-
     /// Where `operation` stands. The reads are separate, so a finish may land between
     /// them: `done/` is read again when the operation's rows are gone, and a finish (one
     /// transaction) leaves its result by then.

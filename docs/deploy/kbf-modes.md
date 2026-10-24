@@ -60,13 +60,16 @@ farm.
 
 `kbf-proxy` is the public front door of a frontend host. It terminates TLS on one port,
 checks the client certificate when one is presented, and routes each HTTP/2 stream (not
-each connection) to the active child frontend on loopback, telling the child who the
+each connection) to a frontend of its pool on loopback, telling the frontend who the
 caller is. REAPI, worker sessions, the operator API and enrollment all arrive on that one
 port; a path the proxy does not know is answered by the proxy and never forwarded. The
-proxy exists so that a frontend can be updated without failing a build: it starts the
-frontend children itself, in two slots, and swaps them. It fronts `kbf --mode=frontend`
-only; an `all-in-one` process cannot sit behind it. The swap is described in
-[update-a-host.md](update-a-host.md).
+proxy exists so that a frontend can be updated without failing a build: the frontends of
+its pool (`[[proxy.frontend]]` tables of the `[proxy]` table) run on their own, and an
+update drains one at a time through the proxy's admin API. The proxy starts, adopts and
+swaps no frontend: the two-slot supervision it once had was removed, and a `[proxy]` table
+with the `upstream` table is refused. It fronts `kbf --mode=frontend` only; an `all-in-one`
+process cannot sit behind it. The update of a pool is described in
+[kbf-updater.md](kbf-updater.md).
 
 ### The installer's role
 
@@ -93,7 +96,7 @@ host; a farm sets routable addresses.
 | storage service | `--storage-listen` | `127.0.0.1:8982` | `storage`, `storage-and-daemon` |
 | storage metrics | `--metrics-listen` | off unless given | `storage`, `storage-and-daemon` |
 | the proxy's public port | `ListenStream=` of `kbf-proxy.socket` | `8980` | proxy hosts |
-| the proxy's children | `[proxy.upstream] base_port` | `18000` | proxy hosts |
+| the proxy's frontends | `base_port` of each `[[proxy.frontend]]` table | none | proxy hosts |
 
 Some defaults come from tools around the binary, not from `kbf`:
 
@@ -103,11 +106,11 @@ Some defaults come from tools around the binary, not from `kbf`:
   because 8982 is the operator API's on a frontend host; the enrolled node takes its storage
   port from the frontend's configuration. The renderer's REAPI, worker and operator
   ports are 8980, 8981 and 8982.
-- Behind the proxy, slot A's children listen on `base_port` (REAPI), `base_port + 1`
-  (worker), `+ 2` (operator API), `+ 3` (admin calls, which a frontend no longer serves)
-  and `+ 4` (enrollment); slot B is ten ports above slot A. `kbf-installer setup` refuses a
-  base port whose ranges cover 8980 or 8982. `--instance` no longer moves a frontend's
-  listeners: the flag is accepted and ignored.
+- Behind the proxy, a frontend of the pool listens on its `base_port` (REAPI),
+  `base_port + 1` (worker), `+ 2` (operator API), `+ 3` (admin calls, which a frontend no
+  longer serves) and `+ 4` (enrollment); the `base_port`s of two frontends are at least five
+  apart. `--instance` no longer moves a frontend's listeners: the flag is accepted and
+  ignored.
 - A daemon opens no listening port.
 
 A listener serves plain text unless its TLS flags are given. The REAPI and worker listeners
@@ -225,8 +228,8 @@ disks and CPUs, and `daemon` on hosts that only build.
   `kbf.toml` is rendered by `kbf-mac-provision`. See
   [kbf-installer-setup.md](kbf-installer-setup.md) for the verbs.
 - **The frontend is one process.** Frontends over one Postgres store share it and none
-  fences another, but a SQLite file is held by one process, and the proxy's two slots exist
-  to swap a new frontend in for an old one, not to run two (the swap takes a generation,
+  fences another, but a SQLite file is held by one process, and the proxy no longer swaps a
+  new frontend in for an old one (its two slots were removed; the swap took a generation,
   which a Postgres store does not hold: see
   [state-store-cutover.md](state-store-cutover.md)). A frontend that is down schedules
   nothing.
@@ -272,8 +275,9 @@ the `Planned:` paragraph.
 3. **The cold store.** `file://` stays on one host only. Choose an `s3://` store every
    storage node can reach, register it with the frontend as above, and give each node the
    same `--cold-store` URI. A fresh prefix is a fresh cold store.
-4. **The frontend.** Run `kbf --mode=frontend` on its own host, or behind the proxy
-   (`kbf-installer setup --mode=frontend --proxy`). Bind `--listen` and `--worker-listen`
+4. **The frontend.** Run `kbf --mode=frontend` on its own host, or behind the proxy (a pool of
+   frontends given as `[[proxy.frontend]]` tables, written by hand: `kbf-installer setup` sets up
+   no proxy). Bind `--listen` and `--worker-listen`
    to addresses the nodes reach, give them the TLS flags, and set `--storage` (required) to
    the first storage node, with `--storage-client-cert`, `--storage-client-key` and
    `--storage-ca` for the mutual TLS to it. Add `--api-listen` and `--api-token-file` for
@@ -353,7 +357,7 @@ maintenance without stopping it, `kbf cluster drain <node>`.
 - [kbf-units.md](kbf-units.md): each mode's packaged systemd unit and how it is checked.
 - [kbf-installer-setup.md](kbf-installer-setup.md): `kbf-installer setup`, the state database,
   the proxy host and backup.
-- [update-a-host.md](update-a-host.md): updating a host and swapping a frontend.
+- [update-a-host.md](update-a-host.md): updating a host.
 - [storage-node.md](storage-node.md): storage hosts, disks, memory and the cold store on a
   single host.
 - [linux-build-host.md](linux-build-host.md): what a Linux build host installs and gives

@@ -1,5 +1,10 @@
 # kbf-installer: contract
 
+> **Retired in part.** The proxy's two-slot supervision of frontend children, its update API at
+> `/v1/update/frontend` and the `kbf-installer update` client were removed: `kbf-installer
+> proxy` serves a pool of frontends that run on their own (`[[proxy.frontend]]` tables) and
+> refuses the `upstream` table. Passages below that describe them are history.
+
 Status: design of record for the parallel PRs; on-prem only for now (section 13 lists what is deferred). Marks: **(built)** exists on `feature/pull-updates`; **(to build)** does not. Orders, the order spool, the fetch child, generation and the verification steps are agreed with `pull-updates.md` (#1024), which is their authority (section 12); settings, CLI, units and layout names are decided here, and #1021 (distribution), #966 and #1024 are edited to match (section 11).
 
 ## 1. Purpose
