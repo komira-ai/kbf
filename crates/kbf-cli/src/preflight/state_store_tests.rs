@@ -9,7 +9,7 @@ use crate::Invocation;
 /// The invocation of `kbf` run with `args`.
 fn parsed(args: &[&str]) -> Invocation {
     let argv = std::iter::once("kbf").chain(args.iter().copied());
-    crate::parse_from(argv).expect("flags parse")
+    crate::parse_internal(argv).expect("flags parse")
 }
 
 /// The invocation of `kbf frontend` run with `more` beside the one flag it requires.

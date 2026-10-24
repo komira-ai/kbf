@@ -130,9 +130,7 @@ durable store, not a cache: a `file://` cold store on the same disk holds its ow
   read back over REAPI; SIGTERM ends the process with 0. `kbf all-in-one` is given no
   `--cas`, so a daemon half wired to the transfer engine would not start. Also the starts
   each half refuses, with their exit statuses, and `kbf` run with keeper arguments,
-  which answers as the keeper before it reads a flag and starts no server. Its
-  `--help` is `kbf-cli`'s `tests/help_golden.rs` against
-  `tests/golden/kbf-all-in-one-help.txt`.
+  which answers as the keeper before it reads a flag and starts no server.
 - `tests/one_read.rs`: the container driver's output collection over a lease of the
   plane, with a write tier and without: an inotify watch counts the opens of each output
   file, which must be one each (a file over 1 GiB too, held after with a tier and

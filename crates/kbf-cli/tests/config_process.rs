@@ -278,7 +278,8 @@ fn settings(mode: &str, dir: &Path, pki: &Pki, host: Host) -> Settings {
 /// as a `kbf.toml`, which exit the same and print the same.
 #[test]
 fn check_exits_0_2_or_75_in_every_mode_and_starts_nothing() {
-    for mode in names::MODES {
+    // `all-in-one` is refused before any file is read; binary.rs pins that.
+    for mode in names::MODES.iter().filter(|m| m.name != names::ALL_IN_ONE) {
         for (host, want) in [(Host::Fine, 0), (Host::Missing, 2), (Host::Early, 75)] {
             let dir = scratch(&format!("check-{}-{host:?}", mode.name));
             let pki = Pki::new(&dir);
@@ -564,7 +565,8 @@ fn a_start_with_a_bad_file_exits_2_and_makes_nothing() {
 #[test]
 fn the_kbf_toml_that_setup_writes_passes_check_in_every_mode() {
     let goldens = Path::new(env!("CARGO_MANIFEST_DIR")).join("../kbf-setup/tests/golden/kbf_toml");
-    for mode in names::MODES {
+    // `all-in-one` is refused before any file is read; binary.rs pins that.
+    for mode in names::MODES.iter().filter(|m| m.name != names::ALL_IN_ONE) {
         let dir = scratch(&format!("installer-{}", mode.name));
         let etc = dir.join("etc");
         std::fs::create_dir_all(&etc).expect("etc");

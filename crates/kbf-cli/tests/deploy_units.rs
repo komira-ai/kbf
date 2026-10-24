@@ -136,6 +136,13 @@ fn each_packaged_mode_unit_starts_its_own_mode_on_the_kbf_toml_setup_writes() {
         let words = start_words(&unit(&name), &name);
         assert_eq!(words, [format!("--mode={}", mode.name)], "{name}");
         let config = write_config(dir.path(), setup_file(mode.name));
+        if mode.name == "all-in-one" {
+            // Kept for one release; `kbf` refuses the mode the unit names. A follow-up
+            // rewrites this fixture for the replacement nodes.
+            let e = parse_with(argv(&words, &config), None).expect_err("refused");
+            assert!(e.to_string().contains(kbf_cli::ALL_IN_ONE_REMOVED), "{e}");
+            continue;
+        }
         let parsed = match parse_with(argv(&words, &config), None) {
             Ok(parsed) => parsed,
             Err(e) => panic!("kbf {} refuses {name} on its setup file:\n{e}", mode.name),
@@ -316,6 +323,11 @@ fn no_packaged_unit_is_refused_over_where_its_directories_are() {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        if mode == "all-in-one" {
+            // `kbf` refuses the mode, so there is no start to check; a follow-up
+            // moves this case to a mode that has a metadata directory.
+            continue;
+        }
         for text in [text.clone(), farm] {
             let name = format!("kbf-{mode}.service");
             let words = start_words(&unit(&name), &name);
