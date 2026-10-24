@@ -1910,7 +1910,10 @@ name = "kbf-host-install"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "kbf-host",
+ "kbf-installer",
  "kbf-testkit",
+ "kbf-update",
  "rustix",
  "serde",
  "serde_json",

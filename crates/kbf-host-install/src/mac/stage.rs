@@ -40,6 +40,7 @@ use crate::host::fail;
 use crate::outcome::{FailureCode, Outcome};
 use crate::request::Version;
 use crate::runner::{Exec, Identity, Runner};
+use crate::trust::Trust;
 use crate::trust::nofollow;
 
 /// The workflow of the repository ([`release::REPO`]) whose attestation is accepted.
@@ -105,7 +106,7 @@ fn stage_inner(
     let token = match &channel.source {
         Source::Github {
             token_file: Some(file),
-        } => Some(read_token(host, file)?),
+        } => Some(read_token(&host.trust, file)?),
         _ => None,
     };
     // The pinned tools are root's, or nothing from them is believed.
@@ -254,11 +255,8 @@ fn pick_failed(e: PickError, whence: &str, github: bool) -> Outcome {
 
 /// The token for the API in `file`, which is root's alone to write: one line of letters,
 /// digits, `_` and `-`.
-fn read_token(host: &MacHost, file: &Path) -> Result<String, Outcome> {
-    let text = host
-        .trust
-        .read(file)
-        .map_err(|e| Outcome::Refused(refusal(e)))?;
+pub(crate) fn read_token(trust: &Trust, file: &Path) -> Result<String, Outcome> {
+    let text = trust.read(file).map_err(|e| Outcome::Refused(refusal(e)))?;
     let token = text.trim();
     let plain = !token.is_empty()
         && token.len() <= 255
@@ -297,6 +295,7 @@ fn fetch_release(
     make_home(&scratch, nobody)?;
     let tuning = &host.tuning;
     let fetcher = Fetcher {
+        platform: release::PLATFORM,
         runner,
         curl: &host.curl,
         gh: &host.gh,

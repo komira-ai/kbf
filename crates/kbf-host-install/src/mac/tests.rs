@@ -3,7 +3,7 @@
 
 mod apply_tests;
 mod dispatch;
-mod fx;
+pub(crate) mod fx;
 mod github_tests;
 mod install;
 mod pure;

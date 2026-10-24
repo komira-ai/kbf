@@ -38,19 +38,34 @@ pub fn is_commit(text: &str) -> bool {
 
 /// The commit in a tarball's file name `kbf-<40 hex>-darwin-arm64.tar.gz`.
 pub fn commit_of_name(name: &str) -> Option<&str> {
+    commit_of_name_on(PLATFORM, name)
+}
+
+/// The commit in a tarball's file name `kbf-<40 hex>-<platform>.tar.gz`.
+pub fn commit_of_name_on<'a>(platform: &str, name: &'a str) -> Option<&'a str> {
     name.strip_prefix("kbf-")
-        .and_then(|rest| rest.strip_suffix(&format!("-{PLATFORM}.tar.gz")))
+        .and_then(|rest| rest.strip_suffix(&format!("-{platform}.tar.gz")))
         .filter(|commit| is_commit(commit))
 }
 
 /// The tarball of `commit`.
 pub fn tarball_name(commit: &str) -> String {
-    format!("kbf-{commit}-{PLATFORM}.tar.gz")
+    tarball_name_on(PLATFORM, commit)
+}
+
+/// The tarball of `commit` for `platform`.
+pub fn tarball_name_on(platform: &str, commit: &str) -> String {
+    format!("kbf-{commit}-{platform}.tar.gz")
 }
 
 /// The attestation bundle of `commit`'s tarball.
 pub fn bundle_name(commit: &str) -> String {
-    format!("{}.sigstore.json", tarball_name(commit))
+    bundle_name_on(PLATFORM, commit)
+}
+
+/// The attestation bundle of `commit`'s tarball for `platform`.
+pub fn bundle_name_on(platform: &str, commit: &str) -> String {
+    format!("{}.sigstore.json", tarball_name_on(platform, commit))
 }
 
 /// The release a version picks out.
