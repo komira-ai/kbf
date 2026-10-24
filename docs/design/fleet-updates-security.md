@@ -321,6 +321,22 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 >   is killed and deleted as `kill-uid` and `user-delete` do. A reset that fails
 >   part-way names each failure and can be repeated. It restarts nothing: a stale
 >   session's processes end with `kill-uid`'s bootout of `gui/<uid>`.
+> - **The standing VM user.** A Mac provisioned for macOS guest VMs starts the helper with
+>   `--vm-user <name>` (never a `kbf-lease-` name, `root` or `_kbf`; the flag is refused
+>   at start otherwise). The account is made by provisioning, not by the helper, and is
+>   outside the ledger, so the boot reset and `user-delete` can never reach it.
+>   `session-idle` then rests the Mac at that user: it writes the intent record `vm`,
+>   gives the user a fresh random password, writes `/etc/kcpassword`, sets
+>   `autoLoginUser` and restarts (FileVault must be off, as for `session-login`). The
+>   boot reset keeps that rest when the record is `vm`, or when there is no record and
+>   `autoLoginUser` already names the VM user; any other session is cleared as before.
+>   `session-login <lease>` still switches away from the VM user. Three verbs act for
+>   the VM user: `role-run` (a process in its `gui/<uid>` domain, refused until the
+>   domain exists and while a lease holds the session), `role-session-ready` (false
+>   while a lease holds the session) and `role-kill-uid` (ends the session with the
+>   processes). Its uid is read from the directory each time and must be an ordinary
+>   uid outside the lease range. That VMs and a whole-machine lease never run together
+>   on one Mac is the daemon's rule: it drains VMs before `session-login`.
 > - Every program the switch and the scan run (`defaults`, `launchctl`, `fdesetup`,
 >   `sfltool`) goes through the host's command runner with an empty environment, so
 >   the unit tests fake each one and nothing in CI restarts: the macOS CI job runs the

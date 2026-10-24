@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::autologin::CommandOutput;
-use crate::helper::{Host, LiveProcess, NewUser};
+use crate::helper::{Account, Host, LiveProcess, NewUser};
 
 /// The fake clock's time.
 pub(crate) const NOW: u64 = 1_800_000_000;
@@ -42,7 +42,7 @@ pub(crate) struct State {
     pub(crate) pauses: usize,
     /// Calls that fail, by name ("uid_taken", "make_home", "create_user",
     /// "delete_user", "domain_exists", "bootout gui", "kill_all", "live_processes",
-    /// "command", "reset_password", "boot_session").
+    /// "command", "reset_password", "boot_session", "account").
     pub(crate) fail: BTreeSet<&'static str>,
     /// What `command` answers, by the command's text (`program arg ...`). A command
     /// with no answer succeeds and prints nothing, except `fdesetup isactive`, which
@@ -188,6 +188,14 @@ impl Host for FakeHost {
                 ..CommandOutput::default()
             },
         })
+    }
+
+    fn account(&self, name: &str) -> io::Result<Option<Account>> {
+        self.call("account", format!("account {name}"))?;
+        Ok(self.state().users.get(name).map(|user| Account {
+            uid: user.uid,
+            gid: user.gid,
+        }))
     }
 
     /// The password is `pw-<name>`.

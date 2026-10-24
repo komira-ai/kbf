@@ -57,15 +57,38 @@ fn the_intent_record_names_one_lease_and_is_private() {
     let dir = scratch("intent");
     let path = dir.join("session-intent");
     assert_eq!(read_intent(&path), Ok(None));
-    write_intent(&path, LeaseId::new(3, 7)).unwrap();
+    write_intent(&path, Intent::Lease(LeaseId::new(3, 7))).unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "3.7\n");
     let mode = std::fs::metadata(&path).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600);
-    assert_eq!(read_intent(&path), Ok(Some(LeaseId::new(3, 7))));
+    assert_eq!(
+        read_intent(&path),
+        Ok(Some(Intent::Lease(LeaseId::new(3, 7))))
+    );
     // Written again over the old record, whole.
-    write_intent(&path, LeaseId::new(3, 8)).unwrap();
-    assert_eq!(read_intent(&path), Ok(Some(LeaseId::new(3, 8))));
-    for bad in ["3.7", "3.7\n4.1\n", "03.7\n", "\n", "kbf-lease-3-7\n"] {
+    write_intent(&path, Intent::Lease(LeaseId::new(3, 8))).unwrap();
+    assert_eq!(
+        read_intent(&path),
+        Ok(Some(Intent::Lease(LeaseId::new(3, 8))))
+    );
+    // The VM user's record is its own spelling, not a lease id.
+    write_intent(&path, Intent::Vm).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "vm\n");
+    assert_eq!(read_intent(&path), Ok(Some(Intent::Vm)));
+    assert_eq!(Intent::Vm.to_string(), "vm");
+    assert_eq!(Intent::Lease(LeaseId::new(3, 7)).to_string(), "3.7");
+    for bad in [
+        "3.7",
+        "3.7\n4.1\n",
+        "03.7\n",
+        "\n",
+        "kbf-lease-3-7\n",
+        "vm",
+        "VM\n",
+        "vm\nvm\n",
+        " vm\n",
+        "vm \n",
+    ] {
         std::fs::write(&path, bad).unwrap();
         assert!(read_intent(&path).is_err(), "{bad:?} was taken");
     }
@@ -146,6 +169,36 @@ fn clearing_auto_login_checks_a_failed_delete_with_a_read() {
     assert!(error.contains("running /usr/bin/defaults"), "{error}");
 }
 
+/// Catches: an `autoLoginUser` read that takes an unset key as an error (the boot reset
+/// would fail on every Mac at the login window), takes any failure as unset (it would
+/// clear what it could not read), or keeps the newline.
+#[test]
+fn the_auto_login_user_reads_as_set_unset_or_unreadable() {
+    let dir = scratch("read-auto-login");
+    let paths = SessionPaths::under(&dir);
+    let read = format!("{DEFAULTS} read {} autoLoginUser", paths.loginwindow);
+    let host = FakeHost::default();
+    assert_eq!(read_auto_login(&host, &paths), Ok(None));
+    answer(&host, &read, true, "kbf-vm\n");
+    assert_eq!(
+        read_auto_login(&host, &paths),
+        Ok(Some("kbf-vm".to_owned()))
+    );
+    host.state().answers.insert(
+        read,
+        CommandOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "permission denied".to_owned(),
+        },
+    );
+    let error = read_auto_login(&host, &paths).unwrap_err();
+    assert!(error.contains("permission denied"), "{error}");
+    host.state().fail.insert("command");
+    let error = read_auto_login(&host, &paths).unwrap_err();
+    assert!(error.contains("running /usr/bin/defaults"), "{error}");
+}
+
 /// Catches: a session switch on a Mac with FileVault on (it would restart to the
 /// unlock screen and never log in), or an unreadable answer taken as off.
 #[test]
@@ -218,7 +271,7 @@ fn file_errors_are_reported() {
     assert!(read_intent(&taken).is_err(), "a directory read as a record");
     assert!(remove(&taken).is_err(), "a directory removed as a file");
     std::fs::create_dir_all(dir.join("record.new/inside")).unwrap();
-    assert!(write_intent(&dir.join("record"), LeaseId::new(1, 1)).is_err());
+    assert!(write_intent(&dir.join("record"), Intent::Lease(LeaseId::new(1, 1))).is_err());
     let paths = SessionPaths {
         kcpassword: taken.clone(),
         ..SessionPaths::under(&dir)

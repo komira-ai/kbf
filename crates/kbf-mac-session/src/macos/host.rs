@@ -14,7 +14,7 @@ use objc2_open_directory::{ODNode, ODRecord, ODSession, kODNodeTypeLocalNodes};
 use security_framework::random::SecRandom;
 
 use crate::autologin::{self, CommandOutput};
-use crate::helper::{self, Host, LiveProcess, NewUser};
+use crate::helper::{self, Account, Host, LiveProcess, NewUser};
 
 const USERS: &str = "dsRecTypeStandard:Users";
 const GROUPS: &str = "dsRecTypeStandard:Groups";
@@ -58,6 +58,33 @@ impl Host for MacHost {
             return Err(io::Error::from_raw_os_error(code));
         }
         Ok(!found.is_null())
+    }
+
+    fn account(&self, name: &str) -> io::Result<Option<Account>> {
+        let c_name = std::ffi::CString::new(name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the name holds NUL"))?;
+        // SAFETY: a zeroed passwd is a valid value for getpwnam_r to overwrite.
+        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut buffer = vec![0 as libc::c_char; 1 << 16];
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: every pointer is to a live, writable value of the right type, the name
+        // is NUL-terminated, and `buffer.len()` is the buffer's size.
+        let code = unsafe {
+            libc::getpwnam_r(
+                c_name.as_ptr(),
+                &raw mut entry,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &raw mut found,
+            )
+        };
+        if code != 0 {
+            return Err(io::Error::from_raw_os_error(code));
+        }
+        Ok((!found.is_null()).then_some(Account {
+            uid: entry.pw_uid,
+            gid: entry.pw_gid,
+        }))
     }
 
     fn make_home(&self, homes: &Path, name: &str, uid: u32, gid: u32) -> io::Result<()> {

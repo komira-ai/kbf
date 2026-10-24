@@ -6,7 +6,8 @@
 //! [`Reply::Refused`], and hangs up). The client's request is then one frame, a
 //! [`Call`] that carries that nonce, so a request written before the helper's check
 //! cannot pass for one written after it (S4.3). `run` attaches four descriptors to it
-//! (`SCM_RIGHTS`): stdin, stdout, stderr and the lease directory, in that order. The
+//! (`SCM_RIGHTS`): stdin, stdout, stderr and the lease directory, in that order, and so
+//! does `role-run`. The
 //! helper answers with one frame, except that a started `run` answers
 //! [`Reply::Started`] and then, when the process exits, [`Reply::Exited`].
 
@@ -79,8 +80,22 @@ pub enum Request {
     UserDelete { lease: String },
     /// Auto-login into the lease's user, then a userspace restart.
     SessionLogin { lease: String },
-    /// Clear auto-login, then a userspace restart.
+    /// Rest the Mac, then a userspace restart: at the standing VM user when the helper
+    /// has one (`--vm-user`), else at the login window (auto-login cleared).
     SessionIdle,
+    /// Start a process as the standing VM user in its GUI session, with the same four
+    /// descriptors as `run`. Refused unless the VM user's `gui/<uid>` domain is up and
+    /// no lease holds the session.
+    RoleRun {
+        argv: Vec<String>,
+        #[serde(default)]
+        env: Vec<(String, String)>,
+    },
+    /// Whether the standing VM user's GUI session (`gui/<uid>`) is up. False while a
+    /// lease holds the session.
+    RoleSessionReady,
+    /// End every process of the standing VM user (its session with them).
+    RoleKillUid,
     /// The boot reset, before the daemon's `Hello`: `held` are the leases the server
     /// still holds for this node.
     BootReset {
@@ -648,6 +663,28 @@ mod tests {
         let classes = vec![("lease-users".to_owned(), 1)];
         let text = serde_json::to_string(&Reply::Baselined { classes }).unwrap();
         assert_eq!(text, r#"{"baselined":{"classes":[["lease-users",1]]}}"#);
+    }
+
+    /// Catches: role verbs that change the wire of the lease verbs, or whose names
+    /// differ from the ones the daemon sends; and a `role-run` that needs an `env` an
+    /// older sender leaves out.
+    #[test]
+    fn the_role_verbs_are_their_own_verbs() {
+        let text = serde_json::to_string(&Request::RoleSessionReady).unwrap();
+        assert_eq!(text, r#"{"verb":"role-session-ready"}"#);
+        let text = serde_json::to_string(&Request::RoleKillUid).unwrap();
+        assert_eq!(text, r#"{"verb":"role-kill-uid"}"#);
+        let run = Request::RoleRun {
+            argv: vec!["/usr/bin/true".to_owned()],
+            env: Vec::new(),
+        };
+        let text = serde_json::to_string(&run).unwrap();
+        assert_eq!(
+            text,
+            r#"{"verb":"role-run","argv":["/usr/bin/true"],"env":[]}"#
+        );
+        let bare = r#"{"verb":"role-run","argv":["/usr/bin/true"]}"#;
+        assert_eq!(serde_json::from_str::<Request>(bare).unwrap(), run);
     }
 
     /// Catches a `run` that changes on the wire for the daemons that predate the

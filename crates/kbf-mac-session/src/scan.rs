@@ -376,7 +376,7 @@ fn auto_login(host: &dyn Host, settings: &Settings) -> Result<Vec<String>, Strin
         }
     }
     match read_intent(&paths.intent) {
-        Ok(Some(lease)) => items.push(format!("{AUTO_LOGIN} intent {lease}")),
+        Ok(Some(intent)) => items.push(format!("{AUTO_LOGIN} intent {intent}")),
         Ok(None) => {}
         Err(why) => return Err(format!("{AUTO_LOGIN}: {why}")),
     }

@@ -3,10 +3,12 @@
 //! state and the userspace restart.
 //!
 //! - **The intent record** is a root-only file in the helper's state directory that
-//!   names the one lease whose user the session switch logs in: `<term>.<seq>` and a
-//!   newline. `session-login` writes it before it changes anything else, and
-//!   `session-idle` removes it after auto-login is cleared, so whenever auto-login names
-//!   a lease user, the record names that lease. The boot reset reads it, and so does
+//!   names who the session switch logs in: the one lease whose user it logs in,
+//!   `<term>.<seq>` and a newline, or `vm` and a newline for the standing VM user (the
+//!   Mac's resting state when a VM user is configured). `session-login` writes it
+//!   before it changes anything else, and `session-idle` removes it after auto-login is
+//!   cleared (or, with a VM user configured, rewrites it to `vm`), so whenever
+//!   auto-login names a lease user, the record names that lease. The boot reset reads it, and so does
 //!   `kbf-mac-provision check`, which fails a lease user's auto-login that no record
 //!   names.
 //! - **`/etc/kcpassword`** holds the password the login window logs in with,
@@ -115,11 +117,35 @@ pub fn kcpassword(password: &[u8]) -> Vec<u8> {
     bytes
 }
 
-/// The lease the intent record names; `None` when there is none.
+/// What the intent record names: the lease whose user the session switch logged in, or
+/// the standing VM user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Intent {
+    /// `<term>.<seq>`: a whole-machine lease holds the session.
+    Lease(LeaseId),
+    /// `vm`: the Mac rests at the VM user.
+    Vm,
+}
+
+/// The spelling of [`Intent::Vm`] in the record. It is not a lease id, so a reader that
+/// knows only leases refuses the record (and treats it as stale) instead of reading it
+/// as a lease.
+pub const VM_RECORD: &str = "vm";
+
+impl std::fmt::Display for Intent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lease(lease) => lease.fmt(f),
+            Self::Vm => f.write_str(VM_RECORD),
+        }
+    }
+}
+
+/// What the intent record names; `None` when there is no record.
 ///
 /// # Errors
-/// The record cannot be read (or is a link), or does not hold one lease id.
-pub fn read_intent(path: &Path) -> Result<Option<LeaseId>, String> {
+/// The record cannot be read (or is a link), or does not hold one lease id or `vm`.
+pub fn read_intent(path: &Path) -> Result<Option<Intent>, String> {
     let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let opened = match rustix::fs::openat(CWD, path, flags, Mode::empty()) {
         Err(rustix::io::Errno::NOENT) => return Ok(None),
@@ -129,20 +155,23 @@ pub fn read_intent(path: &Path) -> Result<Option<LeaseId>, String> {
     std::fs::File::from(opened)
         .read_to_string(&mut text)
         .map_err(|why| format!("{}: {why}", path.display()))?;
-    let lease = text
+    let named = text
         .strip_suffix('\n')
         .ok_or_else(|| format!("{}: {text:?} is not one lease id", path.display()))?;
-    parse_lease(lease)
-        .map(Some)
+    if named == VM_RECORD {
+        return Ok(Some(Intent::Vm));
+    }
+    parse_lease(named)
+        .map(|lease| Some(Intent::Lease(lease)))
         .map_err(|why| format!("{}: {why}", path.display()))
 }
 
-/// Writes the intent record naming `lease`, durably.
+/// Writes the intent record naming `intent`, durably.
 ///
 /// # Errors
 /// The record could not be written.
-pub fn write_intent(path: &Path, lease: LeaseId) -> io::Result<()> {
-    write_whole(path, format!("{lease}\n").as_bytes())
+pub fn write_intent(path: &Path, intent: Intent) -> io::Result<()> {
+    write_whole(path, format!("{intent}\n").as_bytes())
 }
 
 /// Writes `/etc/kcpassword` for `password`, durably, mode 0600.
@@ -228,6 +257,25 @@ pub fn set_auto_login(host: &dyn Host, paths: &SessionPaths, name: &str) -> Resu
         Err(failed(
             &format!("defaults write {domain} {AUTO_LOGIN_USER}"),
             &output,
+        ))
+    }
+}
+
+/// The login window's `autoLoginUser`; `None` when it is not set.
+///
+/// # Errors
+/// `defaults read` failed for any reason but the key being absent.
+pub fn read_auto_login(host: &dyn Host, paths: &SessionPaths) -> Result<Option<String>, String> {
+    let domain = paths.loginwindow.as_str();
+    let read = command(host, DEFAULTS, &["read", domain, AUTO_LOGIN_USER])?;
+    if read.success {
+        Ok(Some(read.stdout.trim().to_owned()))
+    } else if read.stderr.contains("does not exist") {
+        Ok(None)
+    } else {
+        Err(failed(
+            &format!("defaults read {domain} {AUTO_LOGIN_USER}"),
+            &read,
         ))
     }
 }
