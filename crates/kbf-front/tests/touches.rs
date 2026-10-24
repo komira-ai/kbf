@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use kbf_front::{Cache, MemoryMetaLog, MetaLog, MetaLogError, TouchConfig, VerifiedBlob};
-use kbf_meta::{Applied, Command, MetaState, Retention, Role, Touch};
+use kbf_meta::{Applied, BlobAnswer, Command, MetaState, Retention, Role, Touch};
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
 use kbf_proto::reapi::ActionResult;
 use kbf_types::{Digest, FarmTime};
@@ -354,6 +354,39 @@ async fn a_touch_answered_with_another_outcome_leaves_the_stored_blob_held() {
 
     assert_eq!(log.touches(), [BTreeSet::from([blob])], "one touch asked");
     assert_eq!(log.commits_but_touches(), before, "stored again");
+    assert!(cache.find_missing(&[blob]).await.expect("find").is_empty());
+}
+
+/// Asserts that storing a blob the index holds, while a collection removes that blob
+/// after the store found it and before the log applied its touch, stores the blob
+/// again: the log answers the touch with the blob as lost, so the store does not take
+/// it for held. The one touch commit is asked for, and the blob is held afterwards.
+#[tokio::test]
+async fn a_blob_collected_before_its_touch_is_stored_again() {
+    let cache = Arc::new(cache().await);
+    let log = cache.meta();
+    let blob = store(&cache, "collected under the store").await;
+    cache.tick(days(5)).await.expect("tick");
+    log.hold(Kind::Touch);
+    let again = VerifiedBlob::hashed(Bytes::from_static(b"collected under the store"));
+    let storing = tokio::spawn({
+        let cache = Arc::clone(&cache);
+        async move { cache.store_blobs(vec![again]).await }
+    });
+    // The store found the blob in the index; its touch commit is held.
+    within(log.entered.notified()).await;
+    // Untouched since day 0, the blob has expired by day 30.
+    log.inner
+        .commit(Command::Tick(days(30)))
+        .await
+        .expect("tick");
+    log.inner.commit(Command::Collect).await.expect("collect");
+    let gone = log.inner.query(move |s| s.blob(&blob)).await;
+    assert!(matches!(gone, Ok(BlobAnswer::Absent)), "collected");
+    log.release_all();
+    within(storing).await.expect("join").expect("store again");
+
+    assert_eq!(log.touches(), [BTreeSet::from([blob])], "one touch asked");
     assert!(cache.find_missing(&[blob]).await.expect("find").is_empty());
 }
 
