@@ -14,18 +14,20 @@ let mode = arguments[1]
 let service = arguments[2]
 
 // The data-protection keychain, with the accessibility after first unlock and with the
-// default one.
-let variants: [(name: String, accessible: CFString?)] = [
-    ("after-first-unlock", kSecAttrAccessibleAfterFirstUnlock),
-    ("default", nil),
+// default one, and the user's default file keychain.
+typealias Variant = (name: String, dp: Bool, accessible: CFString?)
+let variants: [Variant] = [
+    ("after-first-unlock", true, kSecAttrAccessibleAfterFirstUnlock),
+    ("default", true, nil),
+    ("file-default", false, nil),
 ]
 
-func query(_ variant: (name: String, accessible: CFString?)) -> [String: Any] {
+func query(_ variant: Variant) -> [String: Any] {
     return [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: service,
         kSecAttrAccount as String: "kbf-\(variant.name)",
-        kSecUseDataProtectionKeychain as String: true,
+        kSecUseDataProtectionKeychain as String: variant.dp,
     ]
 }
 
