@@ -190,6 +190,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: $RUNNER_TEMP/tools/gh attestation trusted-root > "$RUNNER_TEMP/trusted_root.jsonl"
+      # A cache saved before #1616 may still hold these; a restored target/ must not.
+      - name: Clear what an old cache restored where the package is written
+        run: rm -rf target/pkg target/pkg-trust
       - name: Write the package's trust directory
         run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
       - name: Build the kbf-installer package
@@ -320,6 +323,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: $RUNNER_TEMP/tools/gh attestation trusted-root > "$RUNNER_TEMP/trusted_root.jsonl"
+      # A cache saved before #1616 may still hold these; a restored target/ must not.
+      - name: Clear what an old cache restored where the package is written
+        run: rm -rf target/pkg target/pkg-trust
       - name: Write the package's trust directory
         run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
       - name: Write the nfpm configuration
@@ -470,6 +476,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: $RUNNER_TEMP/tools/gh attestation trusted-root > "$RUNNER_TEMP/trusted_root.jsonl"
+      # A cache saved before #1616 may still hold these; a restored target/ must not.
+      - name: Clear what an old cache restored where the package is written
+        run: rm -rf target/pkg target/pkg-trust
       - name: Write the package's trust directory
         run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
       - name: Write the nfpm configuration
