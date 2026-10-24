@@ -174,7 +174,7 @@ async fn a_node_with_two_roles_enrolls_and_everything_is_installed_with_its_mode
     assert_eq!(node.renew_after, h.running.fake.now() + fake::LIFE_S / 2);
 
     // Each certificate is for the key in the file next to it.
-    for role in Role::ALL {
+    for role in NODE_ROLES {
         let key = h.store.key_pair(role).expect("key");
         let pem = std::fs::read_to_string(h.store.cert_path(role)).expect("cert");
         assert!(pem.starts_with("-----BEGIN CERTIFICATE-----\n"));
@@ -190,6 +190,9 @@ async fn a_node_with_two_roles_enrolls_and_everything_is_installed_with_its_mode
 }
 
 use rustls::pki_types::pem::PemObject;
+
+/// The roles of a node (a host's updater is not one).
+const NODE_ROLES: [Role; 2] = [Role::Storage, Role::Daemon];
 
 #[tokio::test]
 async fn private_keys_and_the_token_secret_are_written_nowhere_but_where_they_belong() {

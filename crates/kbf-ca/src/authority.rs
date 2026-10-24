@@ -427,13 +427,17 @@ impl Authority {
     ///
     /// # Errors
     /// [`CaError`]: a clock or time the policy refuses, a name that is not a name, an
-    /// advertise host for a daemon, or a signer that fails.
+    /// advertise host for a daemon, the role `updater` (see [`Authority::issue_updater`]), or a
+    /// signer that fails.
     pub fn issue_node(
         &self,
         cert: &NodeCert<'_>,
         now: i64,
         entropy: &mut dyn Entropy,
     ) -> Result<Issued, CaError> {
+        if cert.role == Role::Updater {
+            return Err(CaError::NotANodeRole);
+        }
         let id = cert.node_id.as_str();
         let mut names = vec![SanType::DnsName(ia5(id)?)];
         if let Some(host) = cert.advertise {
@@ -449,7 +453,7 @@ impl Authority {
                 ExtendedKeyUsagePurpose::ServerAuth,
                 ExtendedKeyUsagePurpose::ClientAuth,
             ],
-            Role::Daemon => vec![ExtendedKeyUsagePurpose::ClientAuth],
+            Role::Daemon | Role::Updater => vec![ExtendedKeyUsagePurpose::ClientAuth],
         };
         self.sign_leaf(
             Leaf {

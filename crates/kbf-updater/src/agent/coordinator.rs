@@ -153,29 +153,66 @@ impl HttpsCoordinator {
         self.timeout = timeout;
         self
     }
+}
 
-    fn connect(&self) -> Result<TcpStream, CoordinatorError> {
-        let unreachable = |e: io::Error| CoordinatorError::Unreachable(e.to_string());
-        let addrs = (self.endpoint.host.as_str(), self.endpoint.port)
-            .to_socket_addrs()
-            .map_err(unreachable)?;
-        let mut last = io::Error::other("the name has no address");
-        for addr in addrs {
-            match TcpStream::connect_timeout(&addr, self.timeout) {
-                Ok(stream) => {
-                    stream
-                        .set_read_timeout(Some(self.timeout))
-                        .map_err(unreachable)?;
-                    stream
-                        .set_write_timeout(Some(self.timeout))
-                        .map_err(unreachable)?;
-                    return Ok(stream);
-                }
-                Err(e) => last = e,
+/// A failure of the connection, told as the coordinator being unreachable.
+pub(crate) fn down(e: impl std::fmt::Display) -> CoordinatorError {
+    CoordinatorError::Unreachable(e.to_string())
+}
+
+fn connect(endpoint: &Endpoint, timeout: Duration) -> Result<TcpStream, CoordinatorError> {
+    let addrs = (endpoint.host.as_str(), endpoint.port)
+        .to_socket_addrs()
+        .map_err(down)?;
+    let mut last = io::Error::other("the name has no address");
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => {
+                stream.set_read_timeout(Some(timeout)).map_err(down)?;
+                stream.set_write_timeout(Some(timeout)).map_err(down)?;
+                return Ok(stream);
             }
+            Err(e) => last = e,
         }
-        Err(unreachable(last))
     }
+    Err(down(last))
+}
+
+/// A connection to `endpoint`, TLS up, with this host's certificate presented and the server's
+/// checked: it chains to the farm CA, is for the endpoint's name, and names the role
+/// `server_role` (and no other). The files are read now, so a renewed pair is used from the
+/// next call; with `bound` the certificate must still name that identity.
+///
+/// # Errors
+/// [`CoordinatorError`]: the files, the connection, or what answered.
+pub(crate) fn dial(
+    endpoint: &Endpoint,
+    files: &TlsFiles,
+    bound: Option<&Identity>,
+    timeout: Duration,
+    server_role: &str,
+) -> Result<StreamOwned<ClientConnection, TcpStream>, CoordinatorError> {
+    let (config, leaf) = load(files)?;
+    if let Some(expected) = bound {
+        let now = identity_of(leaf.as_ref())
+            .map_err(|e| CoordinatorError::Files(format!("{}: {e}", files.cert.display())))?;
+        if &now != expected {
+            return Err(CoordinatorError::Files(format!(
+                "{} now names another node or role than the agent started as; restart it",
+                files.cert.display()
+            )));
+        }
+    }
+    let connection = ClientConnection::new(config, endpoint.name.clone()).map_err(down)?;
+    let mut tls = StreamOwned::new(connection, connect(endpoint, timeout)?);
+    // The handshake first: what answered must be the right server before anything is said.
+    while tls.conn.is_handshaking() {
+        tls.conn
+            .complete_io(&mut tls.sock)
+            .map_err(|e| handshake_error(&e))?;
+    }
+    check_role(&tls.conn, server_role)?;
+    Ok(tls)
 }
 
 /// The TLS client configuration the files make.
@@ -242,29 +279,13 @@ fn handshake_error(error: &io::Error) -> CoordinatorError {
 
 impl Coordinator for HttpsCoordinator {
     fn heartbeat(&self, beat: &Heartbeat) -> Result<Reply, CoordinatorError> {
-        let (config, leaf) = load(&self.files)?;
-        if let Some(expected) = &self.identity {
-            let now = identity_of(leaf.as_ref()).map_err(|e| {
-                CoordinatorError::Files(format!("{}: {e}", self.files.cert.display()))
-            })?;
-            if &now != expected {
-                return Err(CoordinatorError::Files(format!(
-                    "{} now names another node or role than the agent started as; restart it",
-                    self.files.cert.display()
-                )));
-            }
-        }
-        let down = |e: io::Error| CoordinatorError::Unreachable(e.to_string());
-        let connection = ClientConnection::new(config, self.endpoint.name.clone())
-            .map_err(|e| down(io::Error::other(e)))?;
-        let mut tls = StreamOwned::new(connection, self.connect()?);
-        // The handshake first: what answered must be the coordinator before anything is said.
-        while tls.conn.is_handshaking() {
-            tls.conn
-                .complete_io(&mut tls.sock)
-                .map_err(|e| handshake_error(&e))?;
-        }
-        check_role(&tls.conn)?;
+        let mut tls = dial(
+            &self.endpoint,
+            &self.files,
+            self.identity.as_ref(),
+            self.timeout,
+            COORDINATOR_ROLE,
+        )?;
         // A heartbeat is strings and two enums: it serializes.
         let body = serde_json::to_vec(beat).unwrap_or_default();
         let head = format!(
@@ -277,32 +298,33 @@ impl Coordinator for HttpsCoordinator {
         tls.write_all(head.as_bytes()).map_err(down)?;
         tls.write_all(&body).map_err(down)?;
         tls.flush().map_err(down)?;
-        parse_reply(&read_all(&mut tls, self.timeout)?)
+        parse_reply(&read_all(&mut tls, self.timeout, REPLY_MAX + 8 * 1024)?)
     }
 }
 
-/// The server's certificate names the role `coordinator`, and only that. (A certificate that
-/// cannot be read names no role.)
-fn check_role(conn: &ClientConnection) -> Result<(), CoordinatorError> {
+/// The server's certificate names the role `role`, and only that. (A certificate that cannot
+/// be read names no role.)
+fn check_role(conn: &ClientConnection, role: &str) -> Result<(), CoordinatorError> {
     let leaf = conn
         .peer_certificates()
         .and_then(<[_]>::first)
         .map_or(&[][..], AsRef::as_ref);
     let roles = uri_values_of(leaf, kbf_peer::ROLE_URI_PREFIX).unwrap_or_default();
-    if roles == [COORDINATOR_ROLE] {
+    if roles == [role] {
         Ok(())
     } else {
         Err(CoordinatorError::Untrusted(format!(
-            "its certificate's role is not `{COORDINATOR_ROLE}` (it names {roles:?})"
+            "its certificate's role is not `{role}` (it names {roles:?})"
         )))
     }
 }
 
-/// Everything the server sends, up to [`REPLY_MAX`] and a head. A server that closes without
-/// the TLS close is read as ended: the length of the body decides whether it is whole.
-fn read_all(
+/// Everything the server sends, up to `limit` bytes (a body and a head). A server that closes
+/// without the TLS close is read as ended: the length of the body decides whether it is whole.
+pub(crate) fn read_all(
     tls: &mut StreamOwned<ClientConnection, TcpStream>,
     window: Duration,
+    limit: usize,
 ) -> Result<Vec<u8>, CoordinatorError> {
     let end = Instant::now() + window;
     let mut raw = Vec::new();
@@ -318,7 +340,7 @@ fn read_all(
             Ok(0) => return Ok(raw),
             Ok(n) => {
                 raw.extend_from_slice(&chunk[..n]);
-                if raw.len() > REPLY_MAX + 8 * 1024 {
+                if raw.len() > limit {
                     return Err(CoordinatorError::Malformed("it is too long".to_owned()));
                 }
             }

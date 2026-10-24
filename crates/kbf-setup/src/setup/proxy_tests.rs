@@ -44,8 +44,9 @@ fn a_frontend_host_gets_no_proxy_table_and_no_proxy_unit() {
 
 /// Asserts that an `installer.toml` of an earlier build, with the slot table or the keys of an
 /// all-in-one host, still parses and is not rewritten: after a setup without any proxy flag the
-/// file is the same bytes, no write of it is planned, setup says it kept the table, and it
-/// enables the frontend unit and no proxy unit.
+/// file is the same bytes, no write of it is planned, setup says it kept the table (the slot
+/// table included, which only the proxy refuses), and it enables the frontend unit and no proxy
+/// unit.
 #[test]
 fn a_proxy_table_that_is_there_is_kept_byte_for_byte() {
     for (name, golden) in [

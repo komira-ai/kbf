@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use kbf_host_install::contract::local::ServeConfig;
+use kbf_updater::agent::enroll::parse_flags as parse_enroll;
 use kbf_updater::agent::flags::{DEFAULT_HELPER_SOCKET, parse_flags};
 
 fn dir() -> PathBuf {
@@ -72,6 +73,29 @@ fn the_linux_units_agree_with_the_programs_and_with_each_other() {
         "the shipped unit carries no operator token"
     );
     assert!(!unit_value(&agent, "ExecStart").contains("token"));
+    // The certificate is the enrollment's, in the unit's own state directory, and the frontend
+    // is where the node's drain is made and the certificate is renewed.
+    let state = config
+        .state_dir
+        .expect("the unit names the enrollment's directory");
+    assert!(config.frontend.is_some());
+    assert_eq!(
+        state,
+        Path::new("/var/lib").join(unit_value(&agent, "StateDirectory"))
+    );
+    assert_eq!(unit_value(&agent, "StateDirectoryMode"), "0700");
+    assert_eq!(config.files.cert, state.join("pki/updater.pem"));
+    assert_eq!(config.files.key, state.join("pki/updater.key"));
+
+    // The enrollment command of the README is the program's, for this unit's host: the same
+    // frontend and the same directory, with the token in a file inside it.
+    let example = read("enroll-example.txt");
+    let enroll = words(example.trim());
+    assert_eq!(enroll[1], "enroll");
+    let flags = parse_enroll(&enroll[2..]).expect("the enrollment's flags");
+    assert_eq!(Some(flags.frontend), config.frontend);
+    assert_eq!(flags.state_dir, state);
+    assert!(flags.token_file.starts_with(&state));
     assert_eq!(config.helper_socket, Path::new(DEFAULT_HELPER_SOCKET));
     let user = unit_value(&agent, "User");
     assert_ne!(user, "root");
@@ -117,6 +141,8 @@ fn the_macos_jobs_agree_with_the_programs_and_with_each_other() {
         "the shipped job carries no operator token"
     );
     assert!(!agent.contains("--token-file</string>"));
+    assert!(config.frontend.is_some());
+    assert_eq!(config.state_dir, Some(PathBuf::from("/var/db/kbf-updater")));
     let user = plist_value(&agent, "UserName");
     assert_ne!(user, "root");
 

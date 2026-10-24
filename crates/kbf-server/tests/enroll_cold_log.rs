@@ -201,6 +201,7 @@ async fn join(
         &secret,
         &TokenSpec {
             roles: RoleSet::new([Role::Storage]).expect("roles"),
+            host_role: None,
             max_uses: 1,
             ttl: None,
             node_id: None,

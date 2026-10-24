@@ -12,7 +12,9 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use hooked::Hooked;
-use kbf_server::members::{Members, MembershipConfig, MembershipError, Progress, Registrant};
+use kbf_server::members::{
+    Members, MembershipConfig, MembershipError, OLDEST_PROTOCOL, Progress, Registrant,
+};
 use kbf_state::Store;
 
 fn config() -> MembershipConfig {
@@ -130,4 +132,28 @@ fn a_store_that_fails_is_a_store_error_before_it_is_a_protocol_error() {
         "{up}"
     );
     assert_eq!(s.fake.get("instance/node-1").expect("read"), None);
+}
+
+/// Asserts that a build as it ships (`Members::new`, not a stand-in) floors the first map of
+/// an empty store at `OLDEST_PROTOCOL`, and refuses a node that speaks one protocol below it,
+/// naming `OLDEST_PROTOCOL`.
+#[test]
+fn a_build_as_shipped_floors_its_first_map_at_its_oldest_protocol() {
+    let s = Hooked::new();
+    let members = Members::new(Arc::clone(&s) as Arc<dyn Store>, config());
+    let first = members
+        .register(&node(1, OLDEST_PROTOCOL))
+        .expect("register");
+    assert_eq!(first.map.min_protocol(), OLDEST_PROTOCOL);
+    let refused = members
+        .register(&node(2, OLDEST_PROTOCOL - 1))
+        .expect_err("below the floor");
+    assert!(
+        matches!(
+            refused,
+            MembershipError::Protocol { got, min }
+                if (got, min) == (OLDEST_PROTOCOL - 1, OLDEST_PROTOCOL)
+        ),
+        "{refused}"
+    );
 }

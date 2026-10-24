@@ -97,7 +97,10 @@ fn a_file_that_is_not_a_proxy_config_is_refused_with_its_path_and_reason() {
     let typo = POOL.replacen("[proxy]\n", "[proxy]\nsurprise = 1\n", 1);
     refused(&file("typo", typo.as_bytes()), "unknown field");
     let both = format!("{POOL}[proxy.upstream]\nbase_port = 18000\n");
-    refused(&file("both", both.as_bytes()), "not both");
+    refused(
+        &file("both", both.as_bytes()),
+        "two-slot supervision was removed",
+    );
     refused(
         &file("big", &vec![b'#'; MAX_FILE_BYTES + 1]),
         "bytes; at most",

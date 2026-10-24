@@ -256,7 +256,13 @@ sections 7 and 9). `setup` therefore sets up no proxy host:
 - **A `[proxy]` table that the file has is kept.** `setup` reads it (the table of an earlier build,
   slot table `[proxy.upstream]` included, parses) and writes the file back in the canonical form
   with every key and value of the table kept, so a file that is in that form is the same bytes.
-  A run without any proxy flag never drops or merges into it.
+  A run without any proxy flag never drops or merges into it. Only the proxy refuses the slot
+  table: `kbf-installer proxy` (and so the proxy's start, `--check` included) exits 2 with the
+  words that say the supervision was removed and that a `[[proxy.frontend]]` table for each
+  frontend takes its place; `setup` and the release fetcher go on reading the file, so edit the
+  table at your own time. The proxy's keys `state_dir`, `hold_max_s` and `remote_operator_file`
+  belonged to that supervision and to the CI credential of its update API: they are still
+  accepted and kept, and nothing reads them.
   `kbf setup` does not link the proxy and so refuses a file that has the table (exit 5), telling
   you to run `kbf-installer setup` and to leave the table where it is. The top-level key
   `frontend_config`, which an earlier build wrote on an all-in-one host behind the proxy, is kept

@@ -7,10 +7,10 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::clock::StoreTime;
-use crate::store::{LivenessGuard, Store};
+use crate::store::Store;
 use crate::types::{
-    Changes, Commit, CommitStats, Cond, Conflict, Op, Revision, ScanPage, ScanRange, StoreError,
-    Txn, Versioned,
+    Changes, Commit, CommitStats, Conflict, Op, Revision, ScanPage, ScanRange, StoreError, Txn,
+    Versioned,
 };
 
 /// What a recorded write did to its key.
@@ -32,8 +32,8 @@ pub struct Write {
     /// The kind of operation.
     pub kind: WriteKind,
     /// Whether its transaction committed. A write refused (a failed precondition, a
-    /// fence, a store failure) is recorded too, with `false`: the question a test asks
-    /// is usually which keys a component *tried* to write.
+    /// store failure) is recorded too, with `false`: the question a test asks is usually
+    /// which keys a component *tried* to write.
     pub committed: bool,
 }
 
@@ -44,8 +44,7 @@ struct Log {
 }
 
 /// Forwards every call to the store underneath and records the writes. A
-/// precondition-only operation (a check) is not a write and is not recorded, so a
-/// fence's own check of the generation row does not show up.
+/// precondition-only operation (a check) is not a write and is not recorded.
 pub struct RecordingStore {
     inner: Arc<dyn Store>,
     log: Mutex<Log>,
@@ -140,32 +139,11 @@ impl Store for RecordingStore {
         self.inner.reap_expired()
     }
 
-    fn reap_expired_if(
-        &self,
-        key: &str,
-        cond: Cond,
-    ) -> Result<Result<usize, Conflict>, StoreError> {
-        self.log().reaps += 1;
-        self.inner.reap_expired_if(key, cond)
-    }
-
     fn commit_stats(&self) -> CommitStats {
         self.inner.commit_stats()
     }
 
     fn now(&self) -> StoreTime {
         self.inner.now()
-    }
-
-    fn demote(&self) -> Result<(), StoreError> {
-        self.inner.demote()
-    }
-
-    fn hold_liveness(&self, generation: u64) -> Result<LivenessGuard, StoreError> {
-        self.inner.hold_liveness(generation)
-    }
-
-    fn holder_alive(&self, generation: u64) -> Result<bool, StoreError> {
-        self.inner.holder_alive(generation)
     }
 }

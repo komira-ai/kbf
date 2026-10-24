@@ -39,7 +39,7 @@ use kbf_server::farm::{NodeAction, Reported};
 use kbf_server::fleet::PlacementView;
 use kbf_server::{EpochPolicy, Farm, StateStore};
 use kbf_state::sqlite::{Options, SCHEMA_VERSION, SqliteStore};
-use kbf_state::{Fenced, ManualClock, Revision, Store, Txn};
+use kbf_state::{ManualClock, Revision, Store, Txn};
 use kbf_types::{
     ActionKey, Digest, DigestFunction, LeaseId, LeaseKind, OperationId, Qos, Resources, WorkerId,
 };
@@ -198,14 +198,13 @@ async fn accepted(farm: &Farm, worker: &str, lease: LeaseId) -> bool {
 }
 
 fn farm_over(store: Arc<dyn Store>) -> Farm {
-    let fenced = Fenced::take(store, None).expect("the next writer generation");
     Farm::new(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
     )
     .with_state(Some(StateStore {
-        store: Arc::new(fenced),
+        store,
         epoch: EpochPolicy::Keep,
         members: Default::default(),
         history: None,
@@ -280,7 +279,6 @@ async fn write_into(dir: &Path) {
         "meta/epoch",
         "meta/next_op",
         "meta/next_seq",
-        "meta/generation",
     ] {
         assert!(
             text.lines().any(|l| l.starts_with(&format!("kv {prefix}"))),

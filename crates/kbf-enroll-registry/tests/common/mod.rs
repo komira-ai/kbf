@@ -16,7 +16,7 @@ use kbf_state::{
     Changes, Clock, Commit, CommitStats, Conflict, ManualClock, Revision, ScanPage, ScanRange,
     Store, StoreError, StoreTime, Txn, Versioned,
 };
-use kbf_types::{NodeId, RefusalReason, Role, RoleSet, TokenId, TokenSecret};
+use kbf_types::{HostRole, NodeId, RefusalReason, Role, RoleSet, TokenId, TokenSecret};
 
 pub const DAY: u64 = 24 * 3600;
 
@@ -84,6 +84,7 @@ pub fn roles(of: &[Role]) -> RoleSet {
 pub fn spec(of: &[Role], max_uses: u32) -> TokenSpec {
     TokenSpec {
         roles: roles(of),
+        host_role: None,
         max_uses,
         ttl: None,
         node_id: None,
@@ -92,6 +93,16 @@ pub fn spec(of: &[Role], max_uses: u32) -> TokenSpec {
         replace: false,
         label: "lab".to_owned(),
         created_by: "tester".to_owned(),
+    }
+}
+
+/// A token for the host `name`'s updater, which runs `host_role`: one use, as the registry
+/// requires of one.
+pub fn updater_spec(name: &str, host_role: HostRole) -> TokenSpec {
+    TokenSpec {
+        host_role: Some(host_role),
+        node_id: Some(node(name)),
+        ..spec(&[Role::Updater], 1)
     }
 }
 
@@ -176,7 +187,7 @@ impl Req {
 pub fn issue(of: &[Role], seed: u8, now: u64) -> Vec<IssuedRole> {
     of.iter()
         .map(|role| {
-            let index = if *role == Role::Storage { 1 } else { 2 };
+            let index = role_index(*role);
             let mut spki = [0u8; 32];
             spki[0] = seed;
             spki[1] = index;
@@ -192,8 +203,16 @@ pub fn issue(of: &[Role], seed: u8, now: u64) -> Vec<IssuedRole> {
         .collect()
 }
 
+fn role_index(role: Role) -> u8 {
+    match role {
+        Role::Storage => 1,
+        Role::Daemon => 2,
+        Role::Updater => 3,
+    }
+}
+
 pub fn serial_of(seed: u8, role: Role) -> String {
-    let index = if role == Role::Storage { 1 } else { 2 };
+    let index = role_index(role);
     format!("{seed:x}0{index}")
 }
 
@@ -207,6 +226,9 @@ pub enum Mode {
     FailTxn,
     /// Every read fails in the backend.
     FailGet,
+    /// Every transaction is refused as written by a superseded handle
+    /// ([`StoreError::Fenced`]).
+    Fenced,
 }
 
 /// A store that delegates, records the transactions it applies, can run a hook just before
@@ -265,6 +287,7 @@ impl Store for Wrap {
                 })
                 .collect()),
             Mode::FailTxn => Err(StoreError::Failed("down".to_owned())),
+            Mode::Fenced => Err(StoreError::Fenced),
             Mode::Pass | Mode::FailGet => self.inner.apply_batch(batch),
         }
     }

@@ -1,7 +1,6 @@
 //! What an operation's memory kills leave in the state store, and what a farm that takes
 //! the store over (after a handover, or after the old process died) books and holds
-//! because of them. Two farms run over one store: the old one holds writer generation
-//! 1, the successor takes generation 2.
+//! because of them. Two farms run over one store, one after the other.
 
 use kbf_proto::worker::MemoryKill;
 use kbf_proto::worker::server_message::Message;
@@ -106,11 +105,11 @@ fn granted_to(successor: &TestFarm) -> u64 {
 #[tokio::test(start_paused = true)]
 async fn a_raised_booking_and_its_kills_survive_a_handover() {
     let disk = Disk::new();
-    let old = disk.generation_farm();
+    let old = disk.farm(EpochPolicy::Keep);
     let (_, runs) = killed_once(&disk, &old).await;
 
     old.fence();
-    let successor = disk.generation_farm();
+    let successor = disk.farm(EpochPolicy::Keep);
     assert_eq!(granted_to(&successor), 16 * GIB, "the ladder restarted");
     assert_eq!(successor.memory_runs(), runs);
 }
@@ -120,11 +119,11 @@ async fn a_raised_booking_and_its_kills_survive_a_handover() {
 #[tokio::test(start_paused = true)]
 async fn a_raised_booking_and_its_kills_survive_a_crash() {
     let mut disk = Disk::new();
-    let old = disk.generation_farm();
+    let old = disk.farm(EpochPolicy::Keep);
     let (_, runs) = killed_once(&disk, &old).await;
 
     disk.crash(old);
-    let successor = disk.generation_farm();
+    let successor = disk.farm(EpochPolicy::Keep);
     assert_eq!(granted_to(&successor), 16 * GIB, "the ladder restarted");
     assert_eq!(successor.memory_runs(), runs);
 }
@@ -135,7 +134,7 @@ async fn a_raised_booking_and_its_kills_survive_a_crash() {
 #[tokio::test(start_paused = true)]
 async fn the_fate_row_goes_when_the_operation_finishes() {
     let disk = Disk::new();
-    let farm = disk.generation_farm();
+    let farm = disk.farm(EpochPolicy::Keep);
     let (_, _) = killed_once(&disk, &farm).await;
     assert_eq!(disk.rows("fate/"), 1, "a kill left no fate row");
 

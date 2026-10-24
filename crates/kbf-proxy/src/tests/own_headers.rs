@@ -1,6 +1,6 @@
-//! The security headers on the answers the proxy makes itself (the 503 handover page, 404, 405,
-//! 400, 401, 426, the probes, the update API's reply) and their absence from a forwarded child
-//! answer, which carries only what the child set, each header once.
+//! The security headers on the answers the proxy makes itself (the 503 of a request no member
+//! takes, 404, 405, 400, 401, 426, the probes, the update API's reply) and their absence from a
+//! forwarded child answer, which carries only what the child set, each header once.
 
 use std::sync::atomic::Ordering;
 
@@ -9,8 +9,9 @@ use http::HeaderMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio_rustls::client::TlsStream;
 
-use super::kit::{CAPS, OPERATOR, OPERATOR_TOKEN, Rig, Script, read_all, script, tagged};
+use super::kit::{CAPS, OPERATOR, OPERATOR_TOKEN, Script, read_all, script, tagged};
 use super::pki::{Pki, client_config};
+use super::pool_kit::Rig;
 use super::secure::{connect_tls, tls_rig};
 use crate::auth::Buck2Auth;
 use crate::reply::OWN_HEADERS;
@@ -28,8 +29,6 @@ const WANT: [(&str, &str); 5] = [
     ("cross-origin-resource-policy", "same-origin"),
 ];
 
-const HOLD: std::time::Duration = std::time::Duration::from_secs(20);
-
 fn exactly_once(headers: &HeaderMap, what: &str) {
     for (name, want) in WANT {
         let all: Vec<_> = headers.get_all(name).iter().collect();
@@ -46,15 +45,15 @@ fn the_set_is_the_ruled_set() {
 }
 
 /// Every answer the proxy makes itself over HTTP/2 carries each header exactly once: the
-/// probes, `/metrics`, an unknown path, the UI's 404 (switched off) and 405, a 401, the held
-/// request's 503 with its `Retry-After`, the update API's reply, and the trailers-only gRPC
-/// answers (`UNIMPLEMENTED`, `UNAUTHENTICATED`).
+/// probes, `/metrics`, an unknown path, the UI's 404 (switched off) and 405, a 401, the 503 of a
+/// request no member takes with its `Retry-After`, the update API's reply, and the
+/// trailers-only gRPC answers (`UNIMPLEMENTED`, `UNAUTHENTICATED`, `UNAVAILABLE`).
 ///
 /// Kills: a header missing on any of those paths (one constructor not secured); a header set
 /// twice; the update reply's own headers replacing the set.
 #[tokio::test(start_paused = true)]
 async fn every_answer_the_proxy_makes_carries_each_header_once() {
-    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    let rig = Rig::start(&[tagged("a")]);
     rig.core.ui.store(true, Ordering::Release);
     let mut client = rig.client().await;
     for (method, path, status) in [
@@ -83,14 +82,14 @@ async fn every_answer_the_proxy_makes_carries_each_header_once() {
     exactly_once(&reply.headers, "ui off");
 
     client.bearer = Some(OPERATOR_TOKEN.to_owned());
-    let _guard = rig.core.slots.hold(HOLD).expect("no hold");
+    assert!(rig.members.set_draining("a", true));
     let reply = client.plain("GET", OPERATOR, b"").await;
-    assert_eq!(reply.status, Some(503), "held past its bound");
+    assert_eq!(reply.status, Some(503), "no member takes it");
     assert_eq!(reply.headers.get("retry-after").expect("header"), "1");
-    exactly_once(&reply.headers, "held 503");
+    exactly_once(&reply.headers, "unplaced 503");
     let reply = client.unary(CAPS).await;
     assert_eq!(reply.grpc_status().as_deref(), Some("14"));
-    exactly_once(&reply.headers, "held grpc");
+    exactly_once(&reply.headers, "unplaced grpc");
 }
 
 /// A refused gRPC call (no credential in `bearer` mode) is a trailers-only answer with the set.
@@ -98,7 +97,7 @@ async fn every_answer_the_proxy_makes_carries_each_header_once() {
 /// Kills: `refused` building its gRPC answer outside the secured constructor.
 #[tokio::test(start_paused = true)]
 async fn a_refused_grpc_call_carries_the_set() {
-    let rig = Rig::start_secure(Buck2Auth::Bearer, super::kit::Access::Plain(None)).await;
+    let rig = Rig::start_secure(Buck2Auth::Bearer, super::kit::Access::Plain(None));
     let mut client = rig.client().await;
     client.bearer = None;
     let reply = client.unary(CAPS).await;
@@ -131,7 +130,7 @@ fn opinionated_child() -> Script {
 /// or `cross-origin-resource-policy` appearing that the child never sent).
 #[tokio::test(start_paused = true)]
 async fn a_forwarded_answer_passes_through_unchanged() {
-    let rig = Rig::start(opinionated_child(), opinionated_child()).await;
+    let rig = Rig::start(&[opinionated_child()]);
     rig.core.ui.store(true, Ordering::Release);
     let mut client = rig.client().await;
     client.bearer = None;
@@ -200,8 +199,8 @@ fn head_lines(response: &str) -> Vec<String> {
         .collect()
 }
 
-/// Over HTTP/1.1 the proxy's own answers (400, 405, 401, 426, the held 503, a 404) carry each
-/// header once on the wire, and a forwarded answer carries none of them.
+/// Over HTTP/1.1 the proxy's own answers (400, 405, 401, 426, the 503 of a request no member
+/// takes, a 404) carry each header once on the wire, and a forwarded answer carries none of them.
 ///
 /// Kills: the h1 path building an answer the HTTP/2 path does not (`bad_request`,
 /// `upgrade_required`); a set that is only applied to HTTP/2; the set on a forwarded answer.
@@ -248,19 +247,19 @@ async fn http11_answers_carry_the_set_once_and_forwarded_ones_do_not() {
         );
     }
 
-    let _guard = rig.core.slots.hold(HOLD).expect("hold");
-    let held = h1(&rig, &pki, &request(&format!("GET {OPERATOR}"), &auth)).await;
-    assert!(held.starts_with("HTTP/1.1 503"), "{held}");
-    let lines = head_lines(&held);
+    assert!(rig.members.set_draining("a", true));
+    let unplaced = h1(&rig, &pki, &request(&format!("GET {OPERATOR}"), &auth)).await;
+    assert!(unplaced.starts_with("HTTP/1.1 503"), "{unplaced}");
+    let lines = head_lines(&unplaced);
     for (name, want) in WANT {
         let found = lines
             .iter()
             .filter(|l| l.starts_with(&format!("{name}:")))
             .count();
-        assert_eq!(found, 1, "held 503: {name} in {lines:?}");
+        assert_eq!(found, 1, "unplaced 503: {name} in {lines:?}");
         assert!(
             lines.contains(&format!("{name}: {want}").to_ascii_lowercase()),
-            "held 503: {name}"
+            "unplaced 503: {name}"
         );
     }
     assert!(lines.contains(&"retry-after: 1".to_owned()), "{lines:?}");

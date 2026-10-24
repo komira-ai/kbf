@@ -112,7 +112,7 @@ pub enum SecretOrigin {
     /// The file was there, whole: children that read it earlier hold this secret.
     Existing,
     /// The proxy wrote a new file: a child that started earlier holds another secret and
-    /// would read every call as anonymous, so a supervisor must restart it, not adopt it.
+    /// would read every call as anonymous until it is restarted.
     Created,
 }
 
@@ -209,9 +209,9 @@ pub fn forward_headers(
     Ok(())
 }
 
-/// The headers of an admin call to a child (`takeover`, `quiesce`, ...): the secret and no
-/// identity, built by the same strip-then-set path as every proxied request, so U7b does not
-/// re-implement the header contract.
+/// The headers of an admin call to a child: the secret and no identity, built by the same
+/// strip-then-set path as every proxied request, so a caller does not re-implement the header
+/// contract.
 ///
 /// # Errors
 /// [`IdentityError::HeaderValue`] (never, for a 32-byte secret).
@@ -221,8 +221,7 @@ pub fn admin_headers(secret: &ProxySecret) -> Result<HeaderMap, IdentityError> {
     Ok(headers)
 }
 
-/// Strips every `x-kbf-*` header from a child's answer before it goes to a client. The
-/// proxy reads the one it defines (the fenced marker, [`crate::replay::FENCED`]) first.
+/// Strips every `x-kbf-*` header from a child's answer before it goes to a client.
 pub fn strip_reserved(headers: &mut HeaderMap) {
     remove_reserved(headers);
 }
@@ -477,10 +476,10 @@ mod tests {
     #[test]
     fn a_childs_answer_loses_its_reserved_headers() {
         let mut h = HeaderMap::new();
-        h.insert("x-kbf-fenced", HeaderValue::from_static("1"));
+        h.insert("x-kbf-node-id", HeaderValue::from_static("1"));
         h.insert("x-child-id", HeaderValue::from_static("b"));
         strip_reserved(&mut h);
-        assert!(h.get("x-kbf-fenced").is_none());
+        assert!(h.get("x-kbf-node-id").is_none());
         assert!(h.get("x-child-id").is_some());
     }
 
@@ -519,7 +518,7 @@ mod tests {
         }
 
         /// A file that is not 32 bytes (a 0-byte one, a newline-terminated one) is replaced by a
-        /// whole one and reported `Created`, so the supervisor restarts the children.
+        /// whole one and reported `Created`, so the children that hold the old secret are known.
         ///
         /// Kills: reading a short file as a secret; failing for ever on a half file.
         #[test]

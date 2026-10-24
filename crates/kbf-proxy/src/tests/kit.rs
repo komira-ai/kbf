@@ -1,4 +1,5 @@
-//! The fake children, the client and the rig the tests share.
+//! The fake children, the client and the in-memory network the tests share. The rig that puts
+//! them behind a proxy is `pool_kit::Rig`.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -15,21 +16,17 @@ use h2::{RecvStream, SendStream};
 use http::{HeaderMap, HeaderValue, Request};
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream};
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
+use super::pool_kit::Rig;
 use crate::auth::{Buck2Auth, Token, Tokens};
-use crate::config::{Limits, UpstreamTable};
-use crate::control::{NoUpdates, UpdateHandler};
-use crate::core::Core;
 use crate::identity::Identity;
 use crate::identity::ProxySecret;
-use crate::pool::{BoxIo, Connector, upstream_addr};
-use crate::route::Target;
+use crate::pool::{BoxIo, Connector};
 use crate::security::Security;
-use crate::serve::{Listen, serve};
-use crate::slot::{ActiveSlot, Slot};
-use crate::tls::{Acceptor, TlsPaths, TlsReloader};
+use crate::serve::Listen;
+use crate::tls::TlsPaths;
 
 pub(super) const EXECUTE: &str = "/build.bazel.remote.execution.v2.Execution/Execute";
 pub(super) const CAPS: &str = "/build.bazel.remote.execution.v2.Capabilities/GetCapabilities";
@@ -72,8 +69,6 @@ pub(super) struct Call {
     pub method: http::Method,
     /// The request's URI as the child received it: path and query.
     pub uri: http::Uri,
-    /// The request's headers as the child received them.
-    pub headers: http::HeaderMap,
     /// How many streams this child has accepted so far, this one included.
     pub nth: usize,
     /// Rung to make this stream's connection send a graceful GOAWAY.
@@ -113,7 +108,6 @@ pub(super) struct ChildState {
     pub raw_record: AtomicBool,
     pub frames: Mutex<Vec<Seen>>,
     pub dispatches: AtomicUsize,
-    pub conns_open: AtomicUsize,
     pub conns_total: AtomicUsize,
     pub seen: Mutex<Vec<(String, HeaderMap)>>,
 }
@@ -121,10 +115,6 @@ pub(super) struct ChildState {
 impl ChildState {
     pub(super) fn dispatches(&self) -> usize {
         self.dispatches.load(Ordering::Acquire)
-    }
-
-    pub(super) fn conns_open(&self) -> usize {
-        self.conns_open.load(Ordering::Acquire)
     }
 
     pub(super) fn headers_of(&self, path: &str) -> Vec<HeaderMap> {
@@ -296,7 +286,7 @@ pub(super) fn failing_listener() -> MemListen {
     MemListen { rx }
 }
 
-/// One slot's fake child: a listener on each of its addresses, one set of counters.
+/// One member's fake child: a listener on each of its addresses, one set of counters.
 pub(super) struct Child {
     pub state: Arc<ChildState>,
     net: Option<Arc<MemNet>>,
@@ -599,7 +589,6 @@ async fn connection(
     let Ok(mut conn) = builder.handshake::<_, Bytes>(io).await else {
         return;
     };
-    state.conns_open.fetch_add(1, Ordering::AcqRel);
     state.conns_total.fetch_add(1, Ordering::AcqRel);
     let goaway = Arc::new(Notify::new());
     let mut graceful = false;
@@ -619,7 +608,6 @@ async fn connection(
                     respond,
                     method: parts.method.clone(),
                     uri: parts.uri.clone(),
-                    headers: parts.headers.clone(),
                     nth,
                     goaway: Arc::clone(&goaway),
                 }));
@@ -630,7 +618,6 @@ async fn connection(
             }
         }
     }
-    state.conns_open.fetch_sub(1, Ordering::AcqRel);
 }
 
 /// Reads a request body to its end, returning the credit as it goes.
@@ -864,38 +851,13 @@ impl Client {
     }
 }
 
-/// The address a slot's target listens on.
-pub(super) fn addr_of(table: UpstreamTable, slot: Slot, target: Target) -> SocketAddr {
-    upstream_addr(table, slot, target)
-}
-
-const TARGETS: [Target; 4] = [
-    Target::Reapi,
-    Target::Worker,
-    Target::Operator,
-    Target::Enroll,
-];
-
 /// The address the tests give the proxy's clients.
 pub(super) const CLIENT_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
 
-/// Two fake children behind one proxy core, with A active and open.
-pub(super) struct Rig {
-    pub core: Arc<Core>,
-    pub net: Arc<MemNet>,
-    pub a: Child,
-    pub b: Child,
-    pub table: UpstreamTable,
-    /// The TLS reloader of a rig built with [`Access::Tls`].
-    pub tls: Option<Arc<TlsReloader>>,
-    feed: mpsc::UnboundedSender<(DuplexStream, IpAddr)>,
-    stop: watch::Sender<bool>,
-    pub serving: JoinHandle<()>,
-}
-
 static NEXT_BASE: AtomicU16 = AtomicU16::new(21_000);
 
-/// Binds the six loopback ports of the static table (REAPI, worker, operator of each slot).
+/// Binds the six loopback ports of two members that are ten ports apart (REAPI, worker,
+/// operator of each); the base port of the first is returned.
 pub(super) fn reserve_ports() -> (u16, Vec<std::net::TcpListener>) {
     const OFFSETS: [u16; 6] = [0, 1, 2, 10, 11, 12];
     loop {
@@ -908,131 +870,6 @@ pub(super) fn reserve_ports() -> (u16, Vec<std::net::TcpListener>) {
         if let Some(listeners) = bound {
             return (base, listeners);
         }
-    }
-}
-
-impl Rig {
-    pub(super) async fn start(a: Script, b: Script) -> Self {
-        Self::start_with(a, b, NoUpdates, Limits::default()).await
-    }
-
-    /// Two tagging children behind a proxy with A active, under `mode` and `access`.
-    pub(super) async fn start_secure(mode: Buck2Auth, access: Access) -> Self {
-        let slots = ActiveSlot::new();
-        slots.open(Slot::A);
-        slots.set_active(Slot::A).expect("A is open");
-        let (a, b) = (tagged("a"), tagged("b"));
-        let (updates, limits) = (NoUpdates, Limits::default());
-        Self::build_with(a, b, updates, limits, slots, security(mode), access).await
-    }
-
-    pub(super) async fn start_with<U: UpdateHandler + 'static>(
-        a: Script,
-        b: Script,
-        updates: U,
-        limits: Limits,
-    ) -> Self {
-        let slots = ActiveSlot::new();
-        slots.open(Slot::A);
-        slots.set_active(Slot::A).expect("A is open");
-        Self::build(a, b, updates, limits, slots).await
-    }
-
-    /// A rig over the gate `slots` as the caller made it.
-    pub(super) async fn build<U: UpdateHandler + 'static>(
-        a: Script,
-        b: Script,
-        updates: U,
-        limits: Limits,
-        slots: ActiveSlot,
-    ) -> Self {
-        let security = security(Buck2Auth::None);
-        Self::build_with(a, b, updates, limits, slots, security, Access::Plain(None)).await
-    }
-
-    /// A rig with its own authentication and its own way of accepting connections.
-    pub(super) async fn build_with<U: UpdateHandler + 'static>(
-        a: Script,
-        b: Script,
-        updates: U,
-        limits: Limits,
-        slots: ActiveSlot,
-        security: Security,
-        access: Access,
-    ) -> Self {
-        let table = UpstreamTable { base_port: 18_000 };
-        let net = Arc::new(MemNet::default());
-        let core = Core::new(table, limits, slots, net.connector(), security);
-        let (tls, acceptor) = match access {
-            Access::Plain(identity) => (None, Acceptor::Plain(identity)),
-            Access::Tls(paths) => {
-                let reloader =
-                    TlsReloader::load(paths, Arc::clone(&core.metrics)).expect("TLS files");
-                let reloader = Arc::new(reloader);
-                (Some(Arc::clone(&reloader)), Acceptor::Tls(reloader))
-            }
-        };
-        let (feed, incoming) = mpsc::unbounded_channel();
-        let (stop, stopped) = watch::channel(false);
-        let serving = tokio::spawn(serve(
-            Arc::clone(&core),
-            updates,
-            MemListen { rx: incoming },
-            acceptor,
-            stopped,
-        ));
-        let child = |slot, script: &Script| {
-            Child::start(
-                &net,
-                TARGETS.map(|t| addr_of(table, slot, t)).to_vec(),
-                script,
-            )
-        };
-        Self {
-            core,
-            a: child(Slot::A, &a),
-            b: child(Slot::B, &b),
-            net,
-            table,
-            tls,
-            feed,
-            stop,
-            serving,
-        }
-    }
-
-    pub(super) async fn client(&self) -> Client {
-        Client::connect(&self.feed, CLIENT_IP).await
-    }
-
-    /// Hands the proxy a connection's far half, as if `ip` had connected.
-    pub(super) fn feed_raw(&self, far: DuplexStream, ip: IpAddr) {
-        self.feed.send((far, ip)).expect("the proxy is listening");
-    }
-
-    pub(super) async fn client_from(&self, ip: IpAddr) -> Client {
-        Client::connect(&self.feed, ip).await
-    }
-
-    /// Starts a new child in `slot` on the table's addresses, as a supervisor does after the
-    /// old one stopped. The old child's connections are untouched.
-    pub(super) fn respawn(&mut self, slot: Slot, script: &Script) {
-        let addrs = TARGETS.map(|t| addr_of(self.table, slot, t)).to_vec();
-        let child = Child::start(&self.net, addrs, script);
-        match slot {
-            Slot::A => self.a = child,
-            Slot::B => self.b = child,
-        }
-    }
-
-    /// Makes B ready and the active slot, as a finished swap does.
-    pub(super) fn flip_to_b(&self) {
-        self.core.slots.open(Slot::B);
-        self.core.slots.set_active(Slot::B).expect("B is open");
-    }
-
-    pub(super) fn shutdown(&self) {
-        self.stop.send_replace(true);
     }
 }
 

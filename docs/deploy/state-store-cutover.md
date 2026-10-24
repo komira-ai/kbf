@@ -184,8 +184,8 @@ and serves no admin calls, so the child is never brought up and a swap fails bef
 the old one. Run a frontend over a Postgres store under its own unit, without
 `--await-takeover`, and start and stop it there.
 
-A SQLite state file is held by one process and keeps its generation until it is moved to
-Postgres.
+A SQLite state file is held by one process. This release writes no generation to it; a
+number an earlier release left in it is not changed.
 
 ## What the cutover does, and what it refuses
 

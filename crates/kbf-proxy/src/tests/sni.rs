@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use kbf_tls::CertEntry;
 
-use super::kit::{Access, Rig};
+use super::kit::Access;
 use super::pki::{Pki, client_config};
+use super::pool_kit::Rig;
 use super::secure::connect_tls_as;
 use crate::auth::Buck2Auth;
 use crate::scratch::scratch;
@@ -54,7 +55,7 @@ async fn setup(test: &str) -> Setup {
         ],
         client_ca,
     };
-    let rig = Rig::start_secure(Buck2Auth::None, Access::Tls(paths)).await;
+    let rig = Rig::start_secure(Buck2Auth::None, Access::Tls(paths));
     Setup {
         rig,
         public_ca,
@@ -238,5 +239,5 @@ async fn client_certificates_are_required_where_they_were_on_both_names() {
             "{host}: the server's rejection is an alert, not a plain close: {read:?}"
         );
     }
-    assert_eq!(s.rig.a.state.dispatches(), 2);
+    assert_eq!(s.rig.a().state.dispatches(), 2);
 }

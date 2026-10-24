@@ -40,13 +40,32 @@ fn the_pool_tables_survive_a_render() {
     assert_eq!(again.render(), text);
 }
 
-/// Asserts that a table with both the slot table and frontends is refused when the file is
-/// read, naming the key, as the proxy would refuse it at start.
+/// Asserts that a table with the slot table of the removed two-slot supervision, beside
+/// frontends or alone, is read when the file is read and renders with the slot table kept, so
+/// that `setup` and the release fetcher go on reading a file written before the removal, and
+/// that the check the proxy makes at its start refuses it in the words that say what replaced
+/// it.
 #[test]
-fn a_table_with_both_modes_is_refused_when_the_file_is_read() {
-    let both = format!("{POOL}\n[proxy.upstream]\nbase_port = 19000\n");
-    let why = InstallerToml::parse(&both)
-        .expect_err("refused")
-        .to_string();
-    assert!(why.contains("not both"), "{why}");
+fn a_table_with_the_slot_table_is_read_and_kept_and_refused_only_by_the_proxy_check() {
+    let beside = format!("{POOL}\n[proxy.upstream]\nbase_port = 19000\n");
+    let alone = POOL.replace(
+        "\n[[proxy.frontend]]\nname = \"a\"\nbase_port = 18000\n\n\
+         [[proxy.frontend]]\nname = \"b\"\nbase_port = 18010\n",
+        "\n[proxy.upstream]\nbase_port = 18000\n",
+    );
+    assert_ne!(alone, POOL);
+    for text in [beside, alone] {
+        let parsed = InstallerToml::parse(&text).expect("read");
+        let proxy = parsed.proxy.as_ref().expect("a proxy table");
+        assert!(proxy.upstream.is_some(), "{text}");
+        let rendered = parsed.render();
+        assert!(
+            rendered.contains("\n[proxy.upstream]\nbase_port = "),
+            "{rendered}"
+        );
+        assert_eq!(InstallerToml::parse(&rendered).expect("again"), parsed);
+        let why = proxy.check_pool().expect_err("refused").to_string();
+        assert!(why.contains("two-slot supervision was removed"), "{why}");
+        assert!(why.contains("[[proxy.frontend]]"), "{why}");
+    }
 }

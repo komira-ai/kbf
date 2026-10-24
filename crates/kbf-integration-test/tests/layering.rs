@@ -382,6 +382,34 @@ fn storage_reaches_no_frontend_crate() {
     );
 }
 
+/// The crates that make or hold certificate authority: the farm CA (`kbf-ca`: the signer
+/// and the issuing of every certificate) and the frontend (`kbf-server`, which holds the CA
+/// and runs the enroll listener).
+const CA_SIDE: &[&str] = &["kbf-ca", "kbf-server"];
+
+/// The update coordinator and a host's updater take their certificates from the farm CA
+/// and never hold it: the coordinator's certificate is made for it, and an updater makes its
+/// key on the host and has a certificate signed for it (`docs/design/updates.md`, section
+/// 5). Neither crate's normal dependencies may reach the CA or the frontend.
+#[test]
+fn the_coordinator_and_the_updater_hold_no_ca_code() {
+    let g = load_graph();
+    for member in ["kbf-coordinator", "kbf-updater", "kbf-enroll"] {
+        let (_, root) = g.members.get(member).expect("a workspace member");
+        assert!(root.is_some(), "{member} must have a library target");
+        let violations = reaches(&g, member, CA_SIDE);
+        assert!(
+            violations.is_empty(),
+            "{member} reaches the CA side:\n{}",
+            violations.join("\n")
+        );
+    }
+    assert!(
+        !reaches(&g, "kbf-server", &["kbf-ca"]).is_empty(),
+        "the frontend's closure must reach kbf-ca, or this walk proves nothing"
+    );
+}
+
 /// The daemon crates: the daemon's code, which the `kbf-daemon` binary is and which
 /// `kbf daemon` runs inside the `kbf` binary, with the drivers, which `kbf-node` names
 /// and so are in its closure.
@@ -459,9 +487,9 @@ fn route_reaches_neither_the_frontend_nor_the_daemon() {
 /// (`kbf-server`, `kbf-front`, `kbf-storage`, `kbf-node`, `kbf-daemon`, the binaries
 /// `kbf-cli` and `kbf-all-in-one`), and does not know the installer, its host plan or its
 /// update types (`kbf-installer`, `kbf-setup`, `kbf-host`, `kbf-update`, `kbf-deploy`): the
-/// admin calls to a child are the installer's, through a trait that lives there (the proxy's
-/// one is the read-only `GET role`, for the child's term, over plain HTTP), and the installer
-/// and the setup library depend on the proxy, not the other way round.
+/// admin calls to a child are the installer's, through a trait that lives there (the proxy
+/// makes none), and the installer and the setup library depend on the proxy, not the other way
+/// round.
 const PROXY_MUST_NOT_REACH: &[&str] = &[
     "kbf-installer",
     "kbf-setup",
