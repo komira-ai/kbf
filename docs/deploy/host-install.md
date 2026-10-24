@@ -4,6 +4,46 @@
 a version of the `kbf` package. It is not a command anyone types: sshd runs it as the forced
 command of one key, and it does only what the allowlist on that host permits.
 
+## Getting the binary
+
+A release carries `kbf-host-install` as a tarball per platform, built, signed and attested by
+the same run as every other asset ([../artifacts.md](../artifacts.md)):
+
+| Host | Asset |
+|---|---|
+| Linux, x86_64 | `kbf-host-install-<commit>-linux-x86_64.tar.gz` |
+| Linux, arm64 | `kbf-host-install-<commit>-linux-arm64.tar.gz` |
+| macOS, Apple silicon | `kbf-host-install-<commit>-darwin-arm64.tar.gz` (ad hoc signed with the hardened runtime) |
+
+No package ships it: neither the `kbf` nor the `kbf-installer` deb installs it, so a Linux
+host gets it from the tarball too. Each tarball holds one member, `kbf-host-install`. Its
+`<commit>` is the commit of the release the host is on or going to. The updater,
+`kbf-updater`, is the same kind of asset for the operator's Linux box
+(`kbf-updater-<commit>-linux-<arch>.tar.gz`, one member `kbf-updater`).
+
+Fetch the tarball with its bundle and check the bundle before the binary is placed anywhere
+(the flags are those of [../artifacts.md](../artifacts.md#provenance-bundles-verifying-a-tarball-offline)):
+
+```text
+gh release download <tag> --repo komira-ai/kbf \
+  --pattern 'kbf-host-install-<commit>-<platform>.tar.gz*' --pattern SHA256SUMS --dir dl
+gh attestation trusted-root > dl/trusted_root.jsonl
+cd dl && sha256sum --check --strict --ignore-missing SHA256SUMS      # shasum -a 256 -c on a Mac
+gh attestation verify kbf-host-install-<commit>-<platform>.tar.gz \
+  --bundle kbf-host-install-<commit>-<platform>.tar.gz.sigstore.json \
+  --custom-trusted-root trusted_root.jsonl --repo komira-ai/kbf \
+  --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml \
+  --cert-oidc-issuer https://token.actions.githubusercontent.com \
+  --source-ref refs/heads/main --source-digest <commit> \
+  --predicate-type https://slsa.dev/provenance/v1 --deny-self-hosted-runners
+tar -xzf kbf-host-install-<commit>-<platform>.tar.gz kbf-host-install
+```
+
+Place the binary at the path the key or the Mac section below names, as root, in directories
+only root can write. `kbf-host-install --version` prints `kbf-host-install <package version>`
+and does nothing else: it is the one argument the program takes outside the Mac's two
+internal ones, and what the release uses to check the signed Mac binary runs.
+
 ## The key
 
 The updater's ssh key is installed in root's `authorized_keys` as
@@ -15,7 +55,7 @@ from="203.0.113.10",restrict,command="/usr/libexec/kbf/kbf-host-install" ssh-ed2
 `from=` is the address the updater connects from. `restrict` turns off forwarding, a
 terminal and the rest. `command=` runs this program whatever the client asked for; the
 client's request arrives only in `SSH_ORIGINAL_COMMAND`. The program reads nothing from its
-arguments or standard input.
+arguments or standard input (bar `--version`, above).
 
 One more entry point exists, and it is not reachable over ssh: an install runs this same
 program again inside a systemd unit (see below), with the request in the variable
@@ -238,7 +278,7 @@ and `query` reports it as `installed_version`.
 
 Everything below is done once, as an administrator with `sudo`; this program does none of it.
 
-1. The binary is `/usr/local/libexec/kbf/kbf-host-install`, `root:wheel` 0755, in directories
+1. The binary is the `kbf-host-install` of the verified darwin-arm64 release tarball ([Getting the binary](#getting-the-binary)), placed at `/usr/local/libexec/kbf/kbf-host-install`, `root:wheel` 0755, in directories
    (`/usr/local`, `libexec`, `kbf`) that group and others cannot write. An install checks this
    before it does anything else and refuses with `config_unsafe` when the program or one of
    those directories is not root's or is writable by group or others (some Intel Homebrew

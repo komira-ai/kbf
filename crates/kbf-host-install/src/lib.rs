@@ -8,7 +8,11 @@
 //! ```
 //!
 //! sshd then runs it with no arguments, and the request is the one string in
-//! `SSH_ORIGINAL_COMMAND`. Exactly three requests are accepted, matched as a whole string
+//! `SSH_ORIGINAL_COMMAND`. (The one argument it takes anywhere is `--version`, which prints
+//! the name and the package version and runs nothing; the release checks the signed Mac
+//! binary with it. `--version` beside anything else is refused with the closed line,
+//! unaudited: that is not an sshd request and changes nothing.) Exactly three requests are
+//! accepted, matched as a whole string
 //! ([`request`]):
 //!
 //! - `install kbf=<version> from <channel>`: install that version of the `kbf` package
@@ -111,10 +115,42 @@ pub mod mac_tools {
     pub use crate::runner::{Cmd, Exec, Identity, Runner, SystemRunner};
 }
 
+/// The one line `--version` prints, which the release pipeline reads from the signed
+/// binary: the name and the package version.
+fn version_line() -> String {
+    format!("kbf-host-install {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Whether the arguments are exactly `--version`. sshd passes none, so this never answers
+/// a request; it is how the release checks the binary it signed runs.
+fn asks_for_version(args: &[std::ffi::OsString]) -> bool {
+    matches!(args, [only] if only == "--version")
+}
+
+/// Whether an argument tries to be the version flag (`--version`, `--version=1`) without the
+/// arguments being exactly that. Such an invocation is not an sshd request (sshd passes no
+/// arguments) and changes nothing, so it is refused before the audit log is opened.
+fn names_version(args: &[std::ffi::OsString]) -> bool {
+    args.iter()
+        .any(|arg| arg.to_str().is_some_and(|a| a.starts_with("--version")))
+}
+
 /// The program: handle `SSH_ORIGINAL_COMMAND` against the production paths and exit with
 /// the status of the answer.
 #[must_use]
 pub fn main() -> ExitCode {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if asks_for_version(&args) {
+        println!("{}", version_line());
+        return ExitCode::SUCCESS;
+    }
+    if names_version(&args) {
+        return ExitCode::from(host::respond(
+            &outcome::Outcome::Refused(outcome::Refusal::BadCommand),
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        ));
+    }
     // Both sides are compiled everywhere, so the Linux build checks the Mac code.
     if cfg!(target_os = "macos") {
         return ExitCode::from(mac::main_process());
@@ -127,4 +163,51 @@ pub fn main() -> ExitCode {
         &mut std::io::stderr(),
     );
     ExitCode::from(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn args(words: &[&str]) -> Vec<OsString> {
+        words.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn only_the_lone_flag_asks_for_the_version() {
+        assert!(asks_for_version(&args(&["--version"])));
+        for other in [
+            &[][..],
+            &["-V"],
+            &["--version", "query"],
+            &["query"],
+            &["--versions"],
+        ] {
+            assert!(!asks_for_version(&args(other)), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn a_version_flag_beside_anything_else_is_named_but_does_not_ask() {
+        for other in [
+            &["--version", "query"][..],
+            &["--version=1"],
+            &["x", "--version"],
+        ] {
+            assert!(names_version(&args(other)), "{other:?}");
+            assert!(!asks_for_version(&args(other)), "{other:?}");
+        }
+        for other in [&[][..], &["-V"], &["query"]] {
+            assert!(!names_version(&args(other)), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn the_version_line_names_the_binary_and_the_package_version() {
+        assert_eq!(
+            version_line(),
+            format!("kbf-host-install {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
 }

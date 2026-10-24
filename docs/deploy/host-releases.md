@@ -61,6 +61,11 @@ verb stops with exit code 5 (an operator must restore the file) and writes nothi
 with no state and no link has never been activated and starts empty. A `state.json` of
 another schema is refused, and the backup is not tried.
 
+The root helper that applies a pulled update, `kbf-host-install`, and the daemon that drives it
+over ssh, `kbf-updater`, are release assets too (`kbf-host-install-<commit>-<platform>.tar.gz`
+for Linux and macOS, `kbf-updater-<commit>-linux-<arch>.tar.gz`), attested like every tarball.
+How to fetch and verify them: [host-install.md](host-install.md#getting-the-binary).
+
 ## The verbs
 
 Every verb prints its plan and changes nothing unless `--apply` is given; `--apply`

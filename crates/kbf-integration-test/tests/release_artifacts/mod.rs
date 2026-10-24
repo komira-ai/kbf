@@ -8,8 +8,9 @@
 //! to the same set.
 //!
 //! - **The release set.** The `cargo xtask package` lines of the workflow name exactly
-//!   [`ASSETS`] (binary and platform): `kbf` and `kbf-installer` for the three platforms,
-//!   `kbf-daemon`, `kbf-server` and `kbf-deploy` for Linux, `kbf-deploy` for macOS (a Mac
+//!   [`ASSETS`] (binary and platform): `kbf`, `kbf-installer` and `kbf-host-install` for the
+//!   three platforms, `kbf-daemon`, `kbf-server`, `kbf-deploy` and `kbf-updater` for Linux
+//!   (the updater drives hosts from an operator's Linux box), `kbf-deploy` for macOS (a Mac
 //!   runs `kbf daemon`; there is no darwin `kbf-daemon`). Each one's SBOM attestation is
 //!   [`crate::attested_assets`]' business, and its provenance bundle
 //!   [`crate::attested_bundles`]'.
@@ -75,16 +76,21 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf", "darwin-arm64"),
     ("kbf-deploy", "darwin-arm64"),
     ("kbf-installer", "darwin-arm64"),
+    ("kbf-host-install", "darwin-arm64"),
     ("kbf", "linux-x86_64"),
     ("kbf-daemon", "linux-x86_64"),
     ("kbf-server", "linux-x86_64"),
     ("kbf-deploy", "linux-x86_64"),
     ("kbf-installer", "linux-x86_64"),
+    ("kbf-host-install", "linux-x86_64"),
+    ("kbf-updater", "linux-x86_64"),
     ("kbf", "linux-arm64"),
     ("kbf-daemon", "linux-arm64"),
     ("kbf-server", "linux-arm64"),
     ("kbf-deploy", "linux-arm64"),
     ("kbf-installer", "linux-arm64"),
+    ("kbf-host-install", "linux-arm64"),
+    ("kbf-updater", "linux-arm64"),
 ];
 
 /// The binaries of [`ASSETS`] that name the commit they were built from (`<binary>

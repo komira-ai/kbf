@@ -91,3 +91,51 @@ fn the_unit_variable_selects_the_unit_body() {
         );
     }
 }
+
+/// The release pipeline signs the Mac binary and runs `--version` on it, before and after
+/// packaging; the answer is the name and the package version, whatever request the
+/// environment carries, and nothing runs.
+///
+/// Catches: a binary that treats `--version` as a refused request (exit 2, the closed
+/// refusal line), so the signed binary cannot be checked.
+#[test]
+fn version_prints_the_name_and_runs_nothing() {
+    for request in [None, Some("query"), Some("install kbf=1 from candidate")] {
+        let out = run(request.map(OsStr::new), &["--version"]);
+        assert_eq!(out.status.code(), Some(0), "{request:?}");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            concat!("kbf-host-install ", env!("CARGO_PKG_VERSION"), "\n"),
+            "{request:?}"
+        );
+        assert!(out.stderr.is_empty(), "{request:?}");
+    }
+}
+
+/// Only the one argument asks for the version: `--version` beside anything else is refused
+/// with the closed line, before the audit log is touched (it is not an sshd request, and
+/// nothing it could do changes the host), so it is safe to drive as root and prints nothing
+/// on stderr. (`-V` is not a version flag at all; `only_the_lone_flag_asks_for_the_version`
+/// covers it.)
+///
+/// Catches: a refused `--version` combination that opens the audit log first, which prints
+/// "audit log unavailable" for a user who cannot write it, or writes a line as root.
+#[test]
+fn version_with_anything_else_is_refused() {
+    for args in [
+        &["--version", "query"][..],
+        &["--version", "--json"],
+        &["--version=1"],
+    ] {
+        for request in [None, Some("query")] {
+            let out = run(request.map(OsStr::new), args);
+            assert_eq!(out.status.code(), Some(2), "{args:?} {request:?}");
+            assert_eq!(
+                String::from_utf8(out.stdout).unwrap(),
+                REFUSED,
+                "{args:?} {request:?}"
+            );
+            assert!(out.stderr.is_empty(), "{args:?} {request:?}");
+        }
+    }
+}
