@@ -166,19 +166,7 @@ fn rows(text: &str, word: &str) -> Vec<(String, String)> {
 
 /// `program` with `args` as `user`, outside any sandbox, with a plain environment.
 fn as_user(user: &SlotUser, program: &str, args: &[&str]) -> std::process::Output {
-    Command::new(program)
-        .args(args)
-        .uid(user.uid)
-        .gid(user.gid)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-        .env("HOME", home_of(user))
-        .env("USER", &user.name)
-        .env("LOGNAME", &user.name)
-        .current_dir("/")
-        .stdin(Stdio::null())
-        .output()
-        .expect(program)
+    support::pool::as_user(user, &home_of(user), program, args)
 }
 
 /// `program` with `args` as root; its stdout and stderr, and whether it exited 0.

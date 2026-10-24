@@ -347,7 +347,7 @@ kernels and MLX under the slot profile. What such a lease leaves, measured on a 
 | I/O Registry user clients of the uid's processes | the kernel | C3: they end with the processes |
 
 There is no GPU step: C7 already empties the three folders that hold every Metal and MLX cache, and
-the lease's `HOME` keeps `~/Library/Caches` inside the lease. Shader cache reuse exists only inside a
+the lease's `HOME` keeps `~/Library/Caches` inside the lease. C7 runs as the uid, which keeps the folders the system placed in the entry (they are emptied, never removed), so the test looks for files, not for an empty tree, and looks as the uid: a root process without Full Disk Access cannot list the entry. Shader cache reuse exists only inside a
 lease; the next lease on the uid compiles again (first compile 180 to 270 ms for a small kernel, 1 s
 for an MLX `mx.compile`).
 

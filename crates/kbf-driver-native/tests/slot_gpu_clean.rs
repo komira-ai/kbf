@@ -14,12 +14,16 @@
 //! interpreter, which the interpreter budget (`tools/interpreter_budget.tsv`) does not
 //! allow a test to name.
 //!
-//! Which user: with `KBF_TEST_POOL_USER` set to a user name, the test uses that existing
-//! user (it looks up its uid, group and generated UID, and never creates, changes or
-//! deletes it), as a root launch daemon without Full Disk Access cannot delete a user
-//! with `dscl` (`eDSPermissionError`). Without it, the test makes a throwaway user, as the
-//! hosted runner needs, and deletes it at the end. The user's home must be empty and the
-//! user must have no process.
+//! Which user: with `KBF_TEST_POOL_USER` set to a user name (on a provisioned Mac,
+//! `kbf-pool-0`, of group `kbfpool`), the test uses that existing user (it looks up its
+//! uid, group and generated UID, and never creates, changes or deletes it), as a root
+//! launch daemon without Full Disk Access cannot delete a user with `dscl`
+//! (`eDSPermissionError`). Without it, the test makes a throwaway user, as the hosted
+//! runner needs, and deletes it at the end. The user's home must be empty and the user
+//! must have no process (the clean at the start of the test fails the test otherwise).
+//!
+//! The looks at the uid's `/var/folders` entry and home are made as the uid: a root
+//! process without Full Disk Access is refused inside them and would see nothing.
 //!
 //! The test is `#[ignore]`: it needs root, real users, a Metal device and `swiftc`. The
 //! macOS CI job runs it with `cargo xtask sudo-test -p kbf-driver-native --test slot_gpu_clean
@@ -31,7 +35,7 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -40,11 +44,13 @@ use kbf_driver_native::home;
 use kbf_driver_native::network::{Isolation, Network};
 use kbf_driver_native::slots::macos::{Slot, Slots};
 use kbf_driver_native::slots::{LEASES_ROOT_MODE, Pool, SlotUser};
-use support::pool::{Scratch, Users};
+use support::pool::{Scratch, Users, as_user};
 
 const PROBE_SOURCE: &str = include_str!("slot_gpu_clean/gpu_probe.swift");
 const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 const GRACE: Duration = Duration::from_secs(3);
+/// The name of the files the test plants in the home and in `T/` of the entry.
+const MARKER: &str = "kbf-gpu-clean-marker";
 
 fn text(program: &str, args: &[&str]) -> String {
     let out = Command::new(program)
@@ -166,33 +172,16 @@ async fn lease(scratch: &Scratch, slot: &Slot) -> Lease {
     }
 }
 
-/// Every path at or below `root` that `uid` owns. Never through a link.
-fn owned_below(root: &Path, uid: u32, found: &mut Vec<PathBuf>) {
-    let Ok(meta) = std::fs::symlink_metadata(root) else {
-        return;
-    };
-    if meta.uid() == uid {
-        found.push(root.to_owned());
-    }
-    if meta.is_dir() {
-        for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
-            owned_below(&entry.path(), uid, found);
-        }
-    }
-}
-
-/// What the uid owns in all of `/private/var/folders` except its entry's root and four
-/// folders, which are the uid's by design (the test looks inside them on its own).
-fn uid_files_outside(uid: u32, folders: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    owned_below(Path::new("/private/var/folders"), uid, &mut found);
-    found.retain(|path| {
-        path != folders
-            && !["0", "C", "T", "X"]
-                .iter()
-                .any(|name| path == &folders.join(name))
-    });
-    found
+/// What `find` run **as the uid** prints for `args`, a line each. The uid, not root: a
+/// launch daemon has no Full Disk Access and cannot list the uid's `/var/folders` entry,
+/// so a root look would see an empty folder whatever it holds. A path the uid itself is
+/// refused (a data-vault folder) prints to stderr, which is dropped.
+fn found(user: &SlotUser, home: &Path, args: &[&str]) -> Vec<String> {
+    let out = as_user(user, home, "/usr/bin/find", args);
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The processes now, pid to uid.
@@ -222,31 +211,6 @@ fn registry_clients_of(uid: u32) -> Vec<String> {
             (processes.get(&pid) == Some(&uid)).then(|| line.trim().chars().take(160).collect())
         })
         .collect()
-}
-
-/// The entries of the `C` folder of the uid's `/var/folders` entry named like a Metal cache.
-fn metal_caches(folders: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(folders.join("C"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("com.apple.metal"))
-        })
-        .collect()
-}
-
-fn names(dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    names
 }
 
 /// What the test must take away whether it ends or panics: the uid's processes, the
@@ -282,17 +246,22 @@ fn wait_for(file: &Path, needle: &str, secs: u64) -> bool {
 }
 
 /// Catches a clean that leaves the uid's GPU state to the next lease on its slot. After a
-/// real Metal run (a device, a shader compiled at run time, a kernel) and a second Metal
-/// process still holding its device:
+/// real Metal run (a device, a shader compiled at run time, a kernel), a second Metal
+/// process still holding its device, and a marker file planted in the home and in `T/` of
+/// the uid's `/var/folders` entry:
 ///
-/// - the probe's Metal caches are in the uid's `/var/folders` entry before the clean, so
-///   the check below cannot pass on an empty entry;
-/// - the registry lists a user client of the uid before the kill, so the registry check can
-///   see one, and none after the clean;
-/// - after the clean the slot is free (the clean found nothing left), the entry holds its
-///   four empty folders and nothing else, the home is empty, and the uid owns nothing under
-///   `/private/var/folders` outside its entry's folders;
+/// - every thing the test looks for is seen to exist before the clean (the probe's Metal
+///   caches, a registry user client of the uid, both markers), so a look that cannot see
+///   (an empty answer from a folder it is refused) fails the test instead of passing it;
+/// - after the clean the slot is free (the clean's own check found nothing), the markers
+///   and the caches are gone, no file is left in the entry's four folders or the home
+///   (system-placed folders the clean keeps, emptied, are folders, not files), the entry
+///   holds nothing besides its four folders, the uid owns nothing else under
+///   `/private/var/folders`, and the registry has no client of the uid;
 /// - the Metal probe passes under the slot profile, with its deny of the protected stores.
+///
+/// All looks at the entry and the home are made as the uid (a root launch daemon without
+/// Full Disk Access cannot list them).
 #[ignore = "needs root, real users, a Metal device and swiftc: see spike-slot-reach.yml job slot-gpu-clean"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
@@ -329,6 +298,8 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
     let slot = slots.take().await.expect("a slot");
     let lease = lease(&scratch, &slot).await;
     let (home, folders) = (slot.ready().home.clone(), slot.ready().folders.clone());
+    let look = |args: &[&str]| found(&user, &home, args);
+    let entry = folders.to_string_lossy().into_owned();
 
     // The Metal arm, then a process that keeps its device open.
     let out = lease.command(&slot, &[], &probe).output().expect("probe");
@@ -351,7 +322,16 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
         wait_for(&holding, "HOLD_READY", 180),
         "the holder never held a device"
     );
-    let caches = metal_caches(&folders);
+    // The markers are planted by the uid in the two places a stray file would sit.
+    let markers = [home.join(MARKER), folders.join("T").join(MARKER)];
+    for marker in &markers {
+        let planted = as_user(&user, &home, "/usr/bin/touch", &[&marker.to_string_lossy()]);
+        assert!(planted.status.success(), "plant {}", marker.display());
+    }
+    let caches_c = format!("{entry}/C");
+    let metal = ["-name", "com.apple.metal*"];
+    let caches = look(&[&caches_c, "-maxdepth", "1", metal[0], metal[1]]);
+    let marked = look(&[&entry, &home.to_string_lossy(), "-name", MARKER]);
     let clients = registry_clients_of(uid);
 
     // The end of the lease as the driver makes it, the lease directory, the clean.
@@ -372,35 +352,71 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
 
     // Everything is read before anything can end the test, then the plants are removed.
     let free = slots.count();
-    let outside = uid_files_outside(uid, &folders);
-    let left_in_entry: Vec<String> = names(&folders)
+    let home_arg = home.to_string_lossy().into_owned();
+    let files_in = |dirs: &[&str]| -> Vec<String> {
+        let mut args: Vec<&str> = dirs.to_vec();
+        args.extend(["-mindepth", "1", "-not", "-type", "d"]);
+        look(&args)
+    };
+    let (a0, a_c, a_t, a_x) = (
+        format!("{entry}/0"),
+        format!("{entry}/C"),
+        format!("{entry}/T"),
+        format!("{entry}/X"),
+    );
+    let files_in_entry = files_in(&[&a0, &a_c, &a_t, &a_x]);
+    let files_in_home = files_in(&[&home_arg]);
+    let beside: Vec<String> = look(&[&entry, "-mindepth", "1", "-maxdepth", "1"])
         .into_iter()
-        .filter_map(|name| {
-            let inside = names(&folders.join(&name));
-            let skeleton = ["0", "C", "T", "X"].contains(&name.as_str());
-            (!skeleton || !inside.is_empty()).then(|| format!("{name}: {inside:?}"))
+        .filter(|path| {
+            !["0", "C", "T", "X"]
+                .iter()
+                .any(|n| path.ends_with(&format!("/{n}")))
         })
         .collect();
-    let left_in_home = names(&home);
+    let outside = look(&[
+        "/private/var/folders",
+        "-path",
+        &entry,
+        "-prune",
+        "-o",
+        "-user",
+        &uid_arg,
+        "-print",
+    ]);
+    let markers_after = look(&[&entry, &home_arg, "-name", MARKER]);
+    let caches_after = look(&[&caches_c, "-maxdepth", "1", metal[0], metal[1]]);
     let still = registry_clients_of(uid);
     drop(litter);
 
     assert!(
         !caches.is_empty(),
-        "the Metal run left no cache in {}",
-        folders.display()
+        "the Metal run left no cache in {entry}/C, or the look cannot see it"
     );
+    assert_eq!(marked.len(), 2, "the markers before the clean: {marked:?}");
     assert!(
         !clients.is_empty(),
         "the registry shows no user client of uid {uid}"
     );
     assert_eq!(free, 1, "the clean left the slot dirty");
-    assert!(outside.is_empty(), "the uid still owns {outside:?}");
+    assert!(markers_after.is_empty(), "markers left: {markers_after:?}");
     assert!(
-        left_in_entry.is_empty(),
-        "the /var/folders entry holds {left_in_entry:?}"
+        caches_after.is_empty(),
+        "Metal caches left: {caches_after:?}"
     );
-    assert!(left_in_home.is_empty(), "the home holds {left_in_home:?}");
+    assert!(
+        files_in_entry.is_empty(),
+        "files left in the /var/folders entry: {files_in_entry:?}"
+    );
+    assert!(
+        beside.is_empty(),
+        "the entry holds more than its four folders: {beside:?}"
+    );
+    assert!(
+        files_in_home.is_empty(),
+        "files left in the home: {files_in_home:?}"
+    );
+    assert!(outside.is_empty(), "the uid still owns {outside:?}");
     assert!(
         still.is_empty(),
         "the registry still has clients of the uid: {still:?}"
