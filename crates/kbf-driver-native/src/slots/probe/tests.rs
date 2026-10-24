@@ -246,18 +246,43 @@ garbage line
     assert_eq!(mounts_under("", &[home]), Vec::<PathBuf>::new());
 }
 
-/// Catches a restore that touches what is already right, one that asks the system's
-/// owner or mode wrong, and one that compares more than the owner and the permission
-/// bits (flags and ACLs of the four folders are the system's).
+/// Catches a restore that touches a folder within the system's layout (0 and X at 755 or
+/// narrower, C and T at 700 or narrower), one that widens a folder, and one that leaves a
+/// group or other bit on C or T, or a group or other write on 0 or X.
 #[test]
-fn a_folder_is_given_back_its_owner_check_and_its_mode_only_where_they_differ() {
-    let want = (501, 0o700);
-    assert_eq!(folder_fix(want, want), (false, false));
-    // The file-type bits of a stat mode are not part of the mode.
-    assert_eq!(folder_fix((501, 0o40700), want), (false, false));
-    assert_eq!(folder_fix((0, 0o700), want), (true, false));
-    assert_eq!(folder_fix((501, 0o755), want), (false, true));
-    assert_eq!(folder_fix((0, 0o755), want), (true, true));
+fn a_folder_is_narrowed_only_when_it_is_wider_than_the_systems_layout() {
+    assert_eq!((folder_ceiling("0"), folder_ceiling("X")), (0o755, 0o755));
+    assert_eq!((folder_ceiling("C"), folder_ceiling("T")), (0o700, 0o700));
+    // Within: no change, and the file-type bits of a stat mode are not part of the mode.
+    for (name, mode) in [
+        ("0", 0o755),
+        ("0", 0o40755),
+        ("X", 0o700),
+        ("X", 0o750),
+        ("C", 0o700),
+        ("T", 0o500),
+        ("0", 0o655),
+        ("T", 0o40700),
+    ] {
+        let want = folder_fix((501, mode), 501, folder_ceiling(name));
+        assert_eq!(want, (false, None), "{name} {mode:o}");
+    }
+    // Wider: narrowed to the bits the ceiling allows, never widened.
+    for (name, mode, to) in [
+        ("0", 0o775, 0o755),
+        ("0", 0o757, 0o755),
+        ("X", 0o777, 0o755),
+        ("C", 0o755, 0o700),
+        ("T", 0o710, 0o700),
+        ("T", 0o770, 0o700),
+        ("C", 0o4700, 0o700),
+    ] {
+        let got = folder_fix((501, mode), 501, folder_ceiling(name));
+        assert_eq!(got, (false, Some(to)), "{name} {mode:o}");
+    }
+    // A wrong owner is reported whatever the mode.
+    assert_eq!(folder_fix((0, 0o700), 501, 0o700), (true, None));
+    assert_eq!(folder_fix((0, 0o777), 501, 0o700), (true, Some(0o700)));
 }
 
 /// A scripted uid: `scans` are what the successive scans find (then nothing).

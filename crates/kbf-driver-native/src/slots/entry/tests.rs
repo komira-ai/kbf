@@ -541,34 +541,57 @@ fn the_clear_mode_leaves_the_entry_and_its_four_folders_as_the_system_has_them()
     }
 }
 
-fn restore_in(entry: &Path, uid: u32) -> (usize, Vec<String>, Vec<PathBuf>) {
+fn restore_in(entry: &Path, uid: u32) -> (Vec<String>, Vec<(PathBuf, u32)>) {
     let mut changed = Vec::new();
     let swept = restore_folders(
         entry,
         uid,
         (
-            &mut |path| {
-                changed.push(path.to_owned());
+            &mut |path, mode| {
+                changed.push((path.to_owned(), mode));
                 Ok(())
             },
             &mut |_| Ok(()),
         ),
     );
-    (changed.len(), swept.errors, changed)
+    (swept.errors, changed)
+}
+
+fn set_modes(entry: &Path, modes: [u32; 4]) {
+    for (folder, mode) in ["0", "C", "T", "X"].into_iter().zip(modes) {
+        fs::set_permissions(entry.join(folder), fs::Permissions::from_mode(mode)).expect("chmod");
+    }
 }
 
 #[test]
-fn the_restore_changes_the_mode_of_a_folder_only_where_it_differs() {
-    let dir = tree("restore");
+fn the_restore_makes_no_chmod_on_a_folder_within_the_systems_layout() {
+    let dir = tree("restore-within");
     let entry = entry_with_files(&dir);
-    for folder in ["0", "C", "T", "X"] {
-        fs::set_permissions(entry.join(folder), fs::Permissions::from_mode(0o700)).expect("chmod");
-    }
-    assert_eq!(restore_in(&entry, me_now()).0, 0);
-    fs::set_permissions(entry.join("C"), fs::Permissions::from_mode(0o755)).expect("chmod");
-    let (count, errors, changed) = restore_in(&entry, me_now());
-    assert_eq!((count, errors), (1, Vec::new()));
-    assert_eq!(changed, vec![entry.join("C")]);
+    // The system's own: 0 and X at 755, C and T at 700.
+    set_modes(&entry, [0o755, 0o700, 0o700, 0o755]);
+    assert_eq!(restore_in(&entry, me_now()), (Vec::new(), Vec::new()));
+    // Narrower is within it and is not widened.
+    set_modes(&entry, [0o700, 0o700, 0o500, 0o750]);
+    assert_eq!(restore_in(&entry, me_now()), (Vec::new(), Vec::new()));
+}
+
+#[test]
+fn the_restore_narrows_only_a_folder_wider_than_the_systems_layout() {
+    let dir = tree("restore-wider");
+    let entry = entry_with_files(&dir);
+    set_modes(&entry, [0o777, 0o755, 0o710, 0o775]);
+    let (errors, changed) = restore_in(&entry, me_now());
+    assert_eq!(errors, Vec::<String>::new());
+    assert_eq!(
+        changed,
+        vec![
+            (entry.join("0"), 0o755),
+            (entry.join("C"), 0o700),
+            (entry.join("T"), 0o700),
+            (entry.join("X"), 0o755),
+        ]
+    );
+    set_modes(&entry, [0o700; 4]);
 }
 
 #[test]
@@ -576,8 +599,8 @@ fn the_restore_fails_naming_a_folder_that_is_not_the_pool_users() {
     let dir = tree("restore-owner");
     let entry = entry_with_files(&dir);
     // The test is another uid than the one asked for: the folders are not that uid's.
-    let (count, errors, _) = restore_in(&entry, me_now() + 1);
-    assert_eq!(count, 0);
+    let (errors, changed) = restore_in(&entry, me_now() + 1);
+    assert_eq!(changed, Vec::new());
     assert_eq!(errors.len(), 4, "{errors:?}");
     assert!(
         errors[0].starts_with(&*entry.join("0").to_string_lossy()),
@@ -592,8 +615,8 @@ fn the_restore_skips_a_missing_folder_and_fails_on_a_file_or_a_refused_change() 
     let entry = dir.path().join("entry");
     fs::create_dir_all(entry.join("T")).expect("T");
     fs::write(entry.join("C"), "x").expect("file");
-    fs::set_permissions(entry.join("T"), fs::Permissions::from_mode(0o755)).expect("chmod");
-    let mut refuse = |_: &Path| Err(std::io::Error::from_raw_os_error(1));
+    fs::set_permissions(entry.join("T"), fs::Permissions::from_mode(0o750)).expect("chmod");
+    let mut refuse = |_: &Path, _: u32| Err(std::io::Error::from_raw_os_error(1));
     let swept = restore_folders(&entry, me_now(), (&mut refuse, &mut |_| Ok(())));
     assert_eq!(swept.errors.len(), 2, "{:?}", swept.errors);
     assert!(
@@ -614,6 +637,7 @@ fn the_restore_mode_is_selected_and_runs_as_the_uid() {
     let dir = tree("restore-mode");
     let entry = entry_with_files(&dir);
     fs::set_permissions(entry.join("T"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    fs::set_permissions(entry.join("0"), fs::Permissions::from_mode(0o755)).expect("chmod");
     let (code, _, err) = call(RESTORE, &entry);
     assert_eq!((code, err.as_str()), (Some(0), ""));
     let mode = fs::metadata(entry.join("T"))
@@ -621,6 +645,12 @@ fn the_restore_mode_is_selected_and_runs_as_the_uid() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o7777, 0o700);
+    // `0` at 755 is the system's own and stays.
+    let zero = fs::metadata(entry.join("0"))
+        .expect("meta")
+        .permissions()
+        .mode();
+    assert_eq!(zero & 0o7777, 0o755);
 }
 
 #[test]
@@ -710,7 +740,7 @@ fn a_refused_strip_of_a_folder_fails_the_restore_naming_it() {
     let swept = restore_folders(
         &entry,
         me_now(),
-        (&mut |_| Ok(()), &mut |_| {
+        (&mut |_, _| Ok(()), &mut |_| {
             Err(std::io::Error::from_raw_os_error(libc::EIO))
         }),
     );

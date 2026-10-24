@@ -16,7 +16,7 @@
 //!   the uid owns inside them ([`CLEAR`]), then the ACLs again. The entry and its four
 //!   folders keep the flags and ACLs the system set (`sunlnk` is root's to clear, and
 //!   root without Full Disk Access cannot); the check accepts them.
-//! - [`restore`] (C10): the four folders' mode, as the uid ([`RESTORE`]); their flags and
+//! - [`restore`] (C10): the four folders narrowed to the system's modes, as the uid ([`RESTORE`]); their flags and
 //!   ACLs stay as the system has them.
 //! - [`empty`] (C7): the entry's `0`, `C`, `T` and `X` emptied and kept, anything else in
 //!   the entry removed ([`EMPTY`]).
@@ -195,13 +195,13 @@ pub(crate) fn restore(me: &AsUid<'_>, folders: &Path, run: &mut Run<'_>) -> Resu
 }
 
 /// [`RESTORE`]: each of [`SKELETON`]'s folders in `dir` that exists has its extended
-/// attributes taken off (the protected ones stay) and is given mode 0700 where its mode
-/// differs, and nothing else; one the uid does not own is an error that
-/// names it. Run as the uid. Exit 1 when a folder could not be put right.
+/// attributes taken off (the protected ones stay) and is narrowed to the system's layout
+/// ([`probe::folder_ceiling`]) only when its mode is wider, and nothing else; one the uid
+/// does not own is an error that names it. Run as the uid. Exit 1 when a folder could not be put right.
 fn restore_folders(
     dir: &Path,
     uid: u32,
-    (chmod, strip): (&mut PathCall<'_>, &mut PathCall<'_>),
+    (chmod, strip): (&mut ChmodCall<'_>, &mut PathCall<'_>),
 ) -> sweep::Swept {
     use std::os::unix::fs::MetadataExt as _;
     let mut swept = sweep::Swept::default();
@@ -227,19 +227,25 @@ fn restore_folders(
         if let Err(why) = strip(&path) {
             swept.errors.push(format!("{}: {why}", path.display()));
         }
-        let (wrong_owner, wrong_mode) = probe::folder_fix((meta.uid(), meta.mode()), (uid, 0o700));
+        let (wrong_owner, narrow_to) =
+            probe::folder_fix((meta.uid(), meta.mode()), uid, probe::folder_ceiling(name));
         if wrong_owner {
             swept.errors.push(format!(
                 "{}: owned by {}, not the pool user",
                 path.display(),
                 meta.uid()
             ));
-        } else if wrong_mode && let Err(why) = chmod(&path) {
+        } else if let Some(mode) = narrow_to
+            && let Err(why) = chmod(&path, mode)
+        {
             swept.errors.push(format!("{}: {why}", path.display()));
         }
     }
     swept
 }
+
+/// A change of a path's mode that can fail.
+type ChmodCall<'a> = dyn FnMut(&Path, u32) -> std::io::Result<()> + 'a;
 
 /// A call on a path that can fail.
 type PathCall<'a> = dyn FnMut(&Path) -> std::io::Result<()> + 'a;
@@ -401,9 +407,9 @@ pub(crate) fn dispatch(
             dir,
             uid,
             (
-                &mut |path| {
+                &mut |path, mode| {
                     use std::os::unix::fs::PermissionsExt as _;
-                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
                 },
                 &mut strip_xattrs,
             ),

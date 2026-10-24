@@ -39,14 +39,28 @@ pub(crate) fn ownership_to_change(has: (u32, u32, u32), want: (u32, u32, u32)) -
     )
 }
 
-/// What a restored `/var/folders` folder (the entry's `0`, `C`, `T`, `X`) is given back:
-/// its owner and its permission bits only. The system sets the rest (flags such as
-/// `sunlnk`, ACLs, extended attributes); neither root without Full Disk Access nor the
-/// owner can change them, so they are the baseline and are never touched. From what it
-/// `has` (uid, mode) and `want`s: whether the owner is wrong, and whether the mode
-/// differs (the owner changes that itself).
-pub(crate) fn folder_fix(has: (u32, u32), want: (u32, u32)) -> (bool, bool) {
-    (has.0 != want.0, has.1 & 0o7777 != want.1 & 0o7777)
+/// The widest mode the system gives the entry's folder `name`: `0` and `X` are made 0755,
+/// `C` and `T` 0700 (measured on a Mac; the system refuses a `chmod` of them, even by the
+/// owner, without Full Disk Access). Narrower is within it.
+pub(crate) fn folder_ceiling(name: &str) -> u32 {
+    match name {
+        "0" | "X" => 0o755,
+        _ => 0o700,
+    }
+}
+
+/// What the restore of the entry's folder has to do, from what it `has` (uid, mode), the
+/// pool user `uid` and the `ceiling` of its mode ([`folder_ceiling`]): whether the owner
+/// is wrong (nothing can fix it), and the mode to `chmod` it to, only when it is wider
+/// than the ceiling (the bits beyond it taken away, nothing added). Within the ceiling
+/// nothing is touched: the flags, ACLs and attributes are the system's, and the system
+/// refuses even the owner's `chmod` of the folder.
+pub(crate) fn folder_fix(has: (u32, u32), uid: u32, ceiling: u32) -> (bool, Option<u32>) {
+    let mode = has.1 & 0o7777;
+    (
+        has.0 != uid,
+        (mode & !ceiling != 0).then_some(mode & ceiling),
+    )
 }
 
 /// The places the shared sweep covers: launchd's per-uid files, and every entry the uid

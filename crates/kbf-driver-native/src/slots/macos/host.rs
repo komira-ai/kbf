@@ -358,7 +358,7 @@ pub(super) fn crash_dirs() -> Vec<PathBuf> {
 }
 
 /// C10: the home the user's (made anew where it is gone), mode 0700, no flags; the
-/// entry's four folders their mode back, as the uid (see [`entry::restore`]). The flags
+/// entry's four folders narrowed to the system's modes, as the uid (see [`entry::restore`]). The flags
 /// and ACLs of the entry and its folders are the system's and are never touched.
 fn restore(ready: &Ready, me: &entry::AsUid<'_>) -> Result<(), String> {
     let (uid, gid) = (ready.user.uid, ready.user.gid);
@@ -375,7 +375,8 @@ fn restore(ready: &Ready, me: &entry::AsUid<'_>) -> Result<(), String> {
     joined(failed)
 }
 
-/// Whether the entry's four folders are as C10 leaves them: the pool user's, mode 0700.
+/// Whether the entry's four folders are as C10 leaves them: the pool user's, and no wider
+/// than the system makes them (`0` and `X` 0755, `C` and `T` 0700).
 fn entry_is_restored(ready: &Ready) -> Result<(), String> {
     let mut wrong = Vec::new();
     for name in probe::SKELETON {
@@ -385,7 +386,7 @@ fn entry_is_restored(ready: &Ready) -> Result<(), String> {
             continue;
         };
         let has = (meta.st_uid, u32::from(meta.st_mode));
-        if probe::folder_fix(has, (ready.user.uid, 0o700)) != (false, false) {
+        if probe::folder_fix(has, ready.user.uid, probe::folder_ceiling(name)) != (false, None) {
             wrong.push(format!(
                 "{}: owner {} mode {:o}",
                 path.display(),
