@@ -615,7 +615,10 @@ mod tests {
     /// refused with the line that says why when the flag has no state store or a SQLite one.
     #[tokio::test(flavor = "current_thread")]
     async fn a_started_server_carries_the_pack_index_the_flag_names() {
-        let db = kbf_state::postgres::test_database();
+        // The test database makes and drops itself with a runtime of its own, which tokio
+        // refuses on a thread that is running tasks: both happen on a thread of their own.
+        let db = std::thread::spawn(kbf_state::postgres::test_database);
+        let db = db.join().expect("a test database");
         let root = crate::test_dir::scratch_dir("kbf-server-pack-index");
         let mut args = Args::parse_from([
             "kbf-server",
@@ -641,6 +644,8 @@ mod tests {
         let refused = boot(&args, &root, "none").await;
         let said = refused.err().expect("no state store").to_string();
         assert!(said.contains("needs --state-store"), "{said}");
+        let dropped = std::thread::spawn(move || drop(db));
+        dropped.join().expect("the test database is dropped");
     }
 
     /// Catches the server sizing itself from anything but the CPU count: on the 44-core,

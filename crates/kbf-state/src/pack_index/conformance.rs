@@ -680,11 +680,7 @@ pub fn p10_concurrent_records_of_one_pack_agree<B: PackBackend>(backend: &B) {
         info_of(KEY, "n1", pack.size, (0, 3, 3)),
     );
     let all = digests(&[(1, 10), (2, 20), (3, 30)]);
-    let want = vec![
-        loc(KEY, 0, 10, 0),
-        loc(KEY, 10, 20, 0),
-        loc(KEY, 30, 30, 0),
-    ];
+    let want = vec![loc(KEY, 0, 10, 0), loc(KEY, 10, 20, 0), loc(KEY, 30, 30, 0)];
     same(
         "P10 concurrent: each blob has one row, in the pack, at its offset",
         locate(&index, &all),
