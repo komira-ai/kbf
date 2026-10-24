@@ -263,6 +263,27 @@ fn the_members_of_a_frontend_carry_the_setting_it_was_given() {
     assert!(members_of(None, Some(setting)).is_none());
 }
 
+/// Asserts that `--pack-index` is off by default and is taken beside a Postgres state store,
+/// and that a frontend refuses it at parse time, with the line that says why, beside a SQLite
+/// state store and with none.
+#[test]
+fn the_pack_index_flag_needs_a_postgres_state_store() {
+    const POSTGRES: &str = "--state-store=postgres:///kbf?host=/run/postgresql";
+    let off = parsed(&[POSTGRES]).expect("parses");
+    assert!(!off.server.pack_index);
+    let on = parsed(&[POSTGRES, "--pack-index"]).expect("parses");
+    assert!(on.server.pack_index);
+    let sqlite = ["--state-store=sqlite:///x.db", "--pack-index"];
+    let e = parsed(&sqlite).expect_err("SQLite");
+    assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict);
+    let said = e.to_string();
+    assert!(said.contains("not SQLite"), "{said}");
+    let e = parsed(&["--pack-index"]).expect_err("no state store");
+    assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict);
+    let said = e.to_string();
+    assert!(said.contains("needs --state-store"), "{said}");
+}
+
 /// Catches a frontend whose raw ByteStream pass-through does not wait for a storage node
 /// that restarts: owners are made holding nothing, so a Read or Write whose owners are all
 /// away fails at once, and the proxy must be given the default bound. Catches: `proxy_owners`

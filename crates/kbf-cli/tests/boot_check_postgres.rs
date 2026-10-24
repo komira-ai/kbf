@@ -111,11 +111,12 @@ impl Drop for Database {
 /// then opens on it: the unit starts on the schema it needs.
 #[test]
 fn a_database_with_no_schema_is_given_it_and_the_unit_starts() {
-    let created = "created the schema at version 1";
+    let latest = schema::latest();
+    let created = format!("created the schema at version {latest}");
     let db = Database::new("fresh", None);
     let (code, err) = db.boot_check("frontend");
     assert_eq!(code, Some(0), "{err}");
-    assert!(err.contains(created), "{err}");
+    assert!(err.contains(&created), "{err}");
     assert_eq!(schema::current(&db.config()), Ok(schema::latest()));
     PostgresStore::open(&db.config()).expect("a store opens on what the check made");
 }
@@ -128,7 +129,7 @@ fn a_database_at_the_schema_of_this_build_is_left_alone() {
     let db = Database::new("current", None);
     schema::apply(&db.config(), &schema::embedded(), schema::latest()).expect("installed");
     let before = db.versions();
-    assert_eq!(before.len(), 1);
+    assert!(!before.is_empty());
     let (code, err) = db.boot_check("frontend");
     assert_eq!(code, Some(0), "{err}");
     assert!(err.contains("nothing to apply"), "{err}");
@@ -137,25 +138,26 @@ fn a_database_at_the_schema_of_this_build_is_left_alone() {
 
 /// Asserts that a database ahead of this build by an expand step (a later release migrated it,
 /// and this release was installed again) passes the check and is left as it was: exit 0, the
-/// line says nothing was applied and names no installer package, the schema is still 2, and a
-/// store of this build opens on it.
+/// line says nothing was applied and names no installer package, the schema is still the later
+/// one, and a store of this build opens on it.
 #[test]
 fn a_database_ahead_by_an_expand_step_passes_the_check_and_is_left_alone() {
     let db = Database::new("ahead", None);
+    let n1 = schema::latest() + 1;
     let later = Migration::new(
-        2,
+        n1,
         "note",
         "-- kbf-migration: expand\nALTER TABLE kv ADD COLUMN note text;",
     )
     .expect("an additive migration lints");
     let mut set = schema::embedded();
     set.push(later);
-    schema::apply(&db.config(), &set, 2).expect("the later release is installed");
+    schema::apply(&db.config(), &set, n1).expect("the later release is installed");
     let (code, err) = db.boot_check("frontend");
     assert_eq!(code, Some(0), "{err}");
     assert!(err.contains("nothing to apply"), "{err}");
     assert!(!err.contains("installer"), "{err}");
-    assert_eq!(schema::current(&db.config()), Ok(2));
+    assert_eq!(schema::current(&db.config()), Ok(n1));
     PostgresStore::open(&db.config()).expect("this build serves what an expand step added");
 }
 
@@ -165,16 +167,18 @@ fn a_database_ahead_by_an_expand_step_passes_the_check_and_is_left_alone() {
 #[test]
 fn a_contract_step_above_this_build_is_refused_when_the_store_opens() {
     let db = Database::new("contract", None);
-    schema::apply(&db.config(), &schema::embedded(), 1).expect("installed");
+    let n1 = schema::latest() + 1;
+    schema::apply(&db.config(), &schema::embedded(), schema::latest()).expect("installed");
+    let row = format!(
+        "INSERT INTO kbf_state.schema_version (version, name, kind) \
+         VALUES ({n1}, 'later', 'contract')"
+    );
     db.client()
-        .batch_execute(
-            "INSERT INTO kbf_state.schema_version (version, name, kind) \
-             VALUES (2, 'later', 'contract')",
-        )
+        .batch_execute(&row)
         .expect("the later release's row");
     let (code, err) = db.boot_check("frontend");
     assert_eq!(code, Some(0), "{err}");
-    assert_eq!(schema::current(&db.config()), Ok(2));
+    assert_eq!(schema::current(&db.config()), Ok(n1));
     match PostgresStore::open(&db.config()) {
         Err(StoreError::Failed(why)) => assert!(why.contains("matches the database"), "{why}"),
         Err(other) => panic!("not a failure: {other:?}"),

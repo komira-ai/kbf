@@ -284,16 +284,20 @@ fn a_store_whose_schema_is_not_current_is_refused() {
     has(&error.to_string(), "schema is at version 0");
     has(&report, "key families (rows, digest):");
     let ahead = Database::with_schema();
-    let sql = "INSERT INTO kbf_state.schema_version (version, name, kind) \
-               VALUES (2, 'later', 'expand')";
+    let later = kbf_state::postgres::schema::latest() + 1;
+    let sql = format!(
+        "INSERT INTO kbf_state.schema_version (version, name, kind) \
+         VALUES ({later}, 'later', 'expand')"
+    );
     ahead
         .client()
-        .batch_execute(sql)
+        .batch_execute(&sql)
         .expect("record a later version");
     let (result, _report) = apply(&db, &ahead.url());
     let error = result.expect_err("a schema the tool does not know is refused");
     assert_eq!(error.code(), 2);
-    has(&error.to_string(), "schema is at version 2");
+    let said = format!("schema is at version {later}");
+    has(&error.to_string(), &said);
     assert_eq!(shape(&mut ahead.client()), [0, 0, 0, 0]);
 }
 

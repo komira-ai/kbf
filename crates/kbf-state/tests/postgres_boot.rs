@@ -62,20 +62,26 @@ fn with(extra: Migration) -> Vec<Migration> {
     set
 }
 
-/// Migration 2 of the build that is one release ahead: only adds a column.
+/// The migration after the newest of this build, in the build that is one release ahead: only
+/// adds a column.
 fn expand() -> Migration {
     Migration::new(
-        2,
+        schema::latest() + 1,
         "note",
         "-- kbf-migration: expand\nALTER TABLE kv ADD COLUMN note text;",
     )
     .expect("an additive migration lints")
 }
 
-/// Migration 2 of a build that removes what an earlier release stopped using.
+/// The migration after the newest of this build, in a build that removes what an earlier
+/// release stopped using.
 fn contract() -> Migration {
-    Migration::new(2, "tidy", "-- kbf-migration: contract\nSELECT 1;")
-        .expect("a contract migration lints")
+    Migration::new(
+        schema::latest() + 1,
+        "tidy",
+        "-- kbf-migration: contract\nSELECT 1;",
+    )
+    .expect("a contract migration lints")
 }
 
 /// The schema `s` is at, as the step's own reader says.
@@ -89,9 +95,11 @@ fn at(s: &Scratch) -> Result<u32, SchemaError> {
 fn a_database_with_no_schema_gets_it_and_a_store_opens_on_it() {
     let s = Scratch::new();
     let step = BootStep::of_this_build(s.config());
-    let said = step.migrate_to(schema::latest()).expect("creates");
-    assert_eq!(said, "created the schema at version 1");
-    assert_eq!(at(&s), Ok(1));
+    let latest = schema::latest();
+    let said = step.migrate_to(latest).expect("creates");
+    let want = format!("created the schema at version {latest}");
+    assert_eq!(said, want);
+    assert_eq!(at(&s), Ok(latest));
     PostgresStore::open(&s.config()).expect("a store opens on what the step made");
 }
 
@@ -100,13 +108,15 @@ fn a_database_with_no_schema_gets_it_and_a_store_opens_on_it() {
 #[test]
 fn a_schema_behind_the_build_is_migrated_before_the_unit_starts() {
     let s = Scratch::new();
-    schema::apply(&s.config(), &schema::embedded(), 1).expect("the earlier release is installed");
-    assert_eq!(at(&s), Ok(1));
+    let (n, n1) = (schema::latest(), schema::latest() + 1);
+    schema::apply(&s.config(), &schema::embedded(), n).expect("the earlier release is installed");
+    assert_eq!(at(&s), Ok(n));
     let step = BootStep::new(s.config(), with(expand()), LOCK_WAIT);
-    let said = step.migrate_to(2).expect("migrates");
-    assert_eq!(said, "migrated the schema from 1 to 2");
-    assert_eq!(at(&s), Ok(2));
-    let build = s.config().with_supported_schema(1, 2);
+    let said = step.migrate_to(n1).expect("migrates");
+    let want = format!("migrated the schema from {n} to {n1}");
+    assert_eq!(said, want);
+    assert_eq!(at(&s), Ok(n1));
+    let build = s.config().with_supported_schema(1, n1);
     PostgresStore::open(&build).expect("a store of the later release opens");
 }
 
@@ -115,27 +125,30 @@ fn a_schema_behind_the_build_is_migrated_before_the_unit_starts() {
 #[test]
 fn a_schema_at_the_build_is_left_alone() {
     let s = Scratch::new();
-    schema::apply(&s.config(), &schema::embedded(), 1).expect("installed");
+    let latest = schema::latest();
+    schema::apply(&s.config(), &schema::embedded(), latest).expect("installed");
     let step = BootStep::of_this_build(s.config());
-    let said = step.migrate_to(schema::latest()).expect("nothing to do");
-    assert_eq!(said, "the schema is at version 1, nothing to apply");
-    assert_eq!(at(&s), Ok(1));
+    let said = step.migrate_to(latest).expect("nothing to do");
+    let want = format!("the schema is at version {latest}, nothing to apply");
+    assert_eq!(said, want);
+    assert_eq!(at(&s), Ok(latest));
 }
 
 /// Asserts that a database ahead of the build by an expand step is left as it was and is not a
 /// refusal: the step says nothing was applied and names no installer package, the schema is
-/// still 2, and a store of the build opens on it. A kbf package rolled back to an earlier
-/// release starts on the schema its successor left.
+/// still the later one, and a store of the build opens on it. A kbf package rolled back to an
+/// earlier release starts on the schema its successor left.
 #[test]
 fn a_schema_ahead_of_the_build_by_an_expand_step_is_left_alone() {
     let s = Scratch::new();
-    schema::apply(&s.config(), &with(expand()), 2).expect("the later release is installed");
-    assert_eq!(at(&s), Ok(2));
+    let n1 = schema::latest() + 1;
+    schema::apply(&s.config(), &with(expand()), n1).expect("the later release is installed");
+    assert_eq!(at(&s), Ok(n1));
     let step = BootStep::of_this_build(s.config());
     let said = step.migrate_to(schema::latest()).expect("nothing to apply");
     assert!(said.contains("nothing to apply"), "{said}");
     assert!(!said.contains("installer"), "{said}");
-    assert_eq!(at(&s), Ok(2));
+    assert_eq!(at(&s), Ok(n1));
     PostgresStore::open(&s.config()).expect("the build serves what an expand step added");
 }
 
@@ -145,16 +158,17 @@ fn a_schema_ahead_of_the_build_by_an_expand_step_is_left_alone() {
 #[test]
 fn a_contract_step_above_the_build_is_refused_when_the_store_opens() {
     let s = Scratch::new();
-    schema::apply(&s.config(), &schema::embedded(), 1).expect("installed");
+    let n1 = schema::latest() + 1;
+    schema::apply(&s.config(), &schema::embedded(), schema::latest()).expect("installed");
     let mut client = Client::connect(&url(), NoTls).expect("connects");
     let row = format!(
-        "INSERT INTO {}.schema_version (version, name, kind) VALUES (2, 'later', 'contract')",
+        "INSERT INTO {}.schema_version (version, name, kind) VALUES ({n1}, 'later', 'contract')",
         s.name
     );
     client.batch_execute(&row).expect("the later release's row");
     let step = BootStep::of_this_build(s.config());
     step.migrate_to(schema::latest()).expect("nothing to apply");
-    assert_eq!(at(&s), Ok(2));
+    assert_eq!(at(&s), Ok(n1));
     match PostgresStore::open(&s.config()) {
         Err(StoreError::Failed(why)) => assert!(why.contains("matches the database"), "{why}"),
         Err(other) => panic!("not a failure: {other:?}"),
@@ -167,11 +181,12 @@ fn a_contract_step_above_the_build_is_refused_when_the_store_opens() {
 #[test]
 fn a_pending_contract_step_is_refused_and_not_run() {
     let s = Scratch::new();
-    schema::apply(&s.config(), &schema::embedded(), 1).expect("installed");
+    let (n, n1) = (schema::latest(), schema::latest() + 1);
+    schema::apply(&s.config(), &schema::embedded(), n).expect("installed");
     let step = BootStep::new(s.config(), with(contract()), LOCK_WAIT);
-    let why = step.migrate_to(2).expect_err("a contract step");
+    let why = step.migrate_to(n1).expect_err("a contract step");
     assert!(why.contains("contract step"), "{why}");
-    assert_eq!(at(&s), Ok(1));
+    assert_eq!(at(&s), Ok(n));
 }
 
 /// Asserts that a schema lock held by another session ends the step with the busy refusal after
@@ -180,20 +195,22 @@ fn a_pending_contract_step_is_refused_and_not_run() {
 #[test]
 fn a_held_schema_lock_is_a_refusal_after_the_wait() {
     let s = Scratch::new();
-    schema::apply(&s.config(), &schema::embedded(), 1).expect("installed");
+    let (n, n1) = (schema::latest(), schema::latest() + 1);
+    schema::apply(&s.config(), &schema::embedded(), n).expect("installed");
     let mut other = Client::connect(&url(), NoTls).expect("connects");
     let mut held = other.transaction().expect("begins");
     let lock = "SELECT pg_advisory_xact_lock(hashtext('kbf-state-schema'))";
     held.batch_execute(lock).expect("holds the lock");
     let step = BootStep::new(s.config(), with(expand()), Duration::from_millis(200));
-    let why = step.migrate_to(2).expect_err("busy");
+    let why = step.migrate_to(n1).expect_err("busy");
     assert_eq!(why, SchemaError::Busy.to_string());
-    assert_eq!(at(&s), Ok(1));
+    assert_eq!(at(&s), Ok(n));
     held.commit().expect("lock let go");
     // The lock is one key on the whole server, and the other tests take it while they migrate
     // their own schemas in parallel: once this test lets go, the step is given time to wait
     // them out.
     let step = BootStep::new(s.config(), with(expand()), LOCK_WAIT);
-    let said = step.migrate_to(2).expect("migrates");
-    assert_eq!(said, "migrated the schema from 1 to 2");
+    let said = step.migrate_to(n1).expect("migrates");
+    let want = format!("migrated the schema from {n} to {n1}");
+    assert_eq!(said, want);
 }
