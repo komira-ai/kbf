@@ -116,6 +116,20 @@ async fn stream_end(ops: &mut Streaming<Operation>) -> Status {
     ended.expect("the stream ends in time")
 }
 
+/// Asserts that a new Execute of `job` on `client` is not taken once the wait is over. The
+/// frontend refuses it UNAVAILABLE and sends the REAPI listener GOAWAY in the same step, so
+/// on the connection `client` already holds it surfaces as UNAVAILABLE from the service or
+/// as CANCELLED when the GOAWAY got there first (as in
+/// `an_open_execute_survives_stop_until_its_action_is_done`). Any other code, or an Execute
+/// that is answered, fails.
+async fn assert_refused_after_the_wait(client: &Client, job: &Job) {
+    let refused = execute_refused(client, job).await;
+    assert!(
+        matches!(refused, Some(Code::Unavailable | Code::Cancelled)),
+        "a new Execute was not refused after the wait: {refused:?}"
+    );
+}
+
 /// Asserts that in the wait the frontend answers `/readyz` 503 at once and serves on: a
 /// unary call is answered and a new Execute is taken. When the wait is over the phase is
 /// `draining`, a new Execute is refused UNAVAILABLE, and the frontend takes no more work in
@@ -152,12 +166,7 @@ async fn the_wait_serves_everything_and_its_end_hands_the_work_to_the_other_fron
         in_phase(a.api, "draining").await
     })
     .await;
-    let refused = execute_refused(&on_a, &second).await;
-    assert_eq!(
-        refused,
-        Some(Code::Unavailable),
-        "a new Execute was not refused UNAVAILABLE after the wait"
-    );
+    assert_refused_after_the_wait(&on_a, &second).await;
 
     let mut late = on_b.execute(&third.action).await;
     until("both operations are queued on the other", async || {
@@ -318,12 +327,7 @@ async fn a_stop_signal_runs_the_same_sequence() {
         in_phase(a.api, "draining").await
     })
     .await;
-    let refused = execute_refused(&client, &third).await;
-    assert_eq!(
-        refused,
-        Some(Code::Unavailable),
-        "a new Execute was not refused UNAVAILABLE after the wait"
-    );
+    assert_refused_after_the_wait(&client, &third).await;
     assert!(!pair.a.served.is_finished(), "exited with executions open");
 
     drop((before, in_the_wait));

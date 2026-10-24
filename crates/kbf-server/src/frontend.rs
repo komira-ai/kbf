@@ -892,10 +892,10 @@ impl<'a> Prepared<'a> {
         // Set once, here: nothing has called the retire or the drain route before the
         // listeners serve. A frontend over a state store drains by the sequence of
         // [`crate::sequence`], and its stop signal begins it.
-        let _ = stand.map(|stand| {
+        if let Some(stand) = stand {
             let sequence = Sequence::new(stand.clone(), api_stop.clone(), flags.drain);
-            retire.set(Retire::new(stand, sequence))
-        });
+            let _ = retire.set(Retire::new(stand, sequence));
+        }
         background.extend(enroll_renewal);
 
         let shutdown = shutdown()?;
