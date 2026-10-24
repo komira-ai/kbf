@@ -314,6 +314,10 @@ Decided:
   emptied again every 2 seconds for 60 seconds and fails, naming the path, if they are still there: a
   keychain is never skipped. `slot_clean`'s `a_keychain_item_one_lease_stores_is_not_readable_by_the_next`
   shows an item one lease stores is not readable by the next.
+  On a Studio, in the daemon's context, the data-protection keychain is not available to a pool user at all
+  (`errSecNotAvailable`, -25291, for every delete and find), and an ad-hoc-signed process lacks the
+  entitlement for it (`errSecMissingEntitlement`, -34018): both mean nothing is reachable, so nothing can
+  survive through it, and both count as clean; every other status fails the clean.
 
 Open:
 - **D5. The farm signing identity.** A Developer ID (DR = identifier plus team, stable across

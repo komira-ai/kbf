@@ -8,8 +8,11 @@ fn a_status_says_whether_to_delete_again_stop_or_fail() {
     assert_eq!(after_delete(false, NOT_FOUND), Deleted::Nothing);
     // A process without the entitlement cannot reach the data-protection keychain.
     assert_eq!(after_delete(true, MISSING_ENTITLEMENT), Deleted::Nothing);
+    // No keychain available in that context, for either keychain.
+    assert_eq!(after_delete(true, NOT_AVAILABLE), Deleted::Nothing);
+    assert_eq!(after_delete(false, NOT_AVAILABLE), Deleted::Nothing);
     // No file keychain for the user: there is none to hold an item.
-    for status in [-25294, -25307, -25291, -25308, -60008] {
+    for status in [-25294, -25307, -25308, -60008] {
         assert_eq!(after_delete(false, status), Deleted::Nothing, "{status}");
         // The data-protection keychain does not answer so: that is a failure.
         assert_eq!(
@@ -27,6 +30,8 @@ fn a_status_says_whether_an_item_is_left() {
     assert_eq!(after_find(true, 0), Left::Items);
     assert_eq!(after_find(true, NOT_FOUND), Left::None);
     assert_eq!(after_find(true, MISSING_ENTITLEMENT), Left::None);
+    assert_eq!(after_find(true, NOT_AVAILABLE), Left::None);
+    assert_eq!(after_find(false, NOT_AVAILABLE), Left::None);
     assert_eq!(after_find(false, -25294), Left::None);
     assert_eq!(after_find(true, -25294), Left::Failed(-25294));
     assert_eq!(after_find(false, -50), Left::Failed(-50));

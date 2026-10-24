@@ -18,12 +18,16 @@ pub(crate) const NOT_FOUND: i32 = -25300;
 /// to the data-protection keychain, and neither has any other process of the uid that
 /// lacks them.
 pub(crate) const MISSING_ENTITLEMENT: i32 = -34018;
+/// `errSecNotAvailable`: no keychain is available to that user in that context. On a Mac
+/// in the daemon's context the data-protection keychain answers so to a pool user for every
+/// call, delete and find alike: nothing is reachable, so nothing survives through it.
+pub(crate) const NOT_AVAILABLE: i32 = -25291;
 /// Why there is no file-based keychain to ask: no such keychain (`errSecNoSuchKeychain`),
-/// no default one (`errSecNoDefaultKeychain`), not available (`errSecNotAvailable`), or
+/// no default one (`errSecNoDefaultKeychain`), or
 /// the interaction it would need is not allowed (`errSecInteractionNotAllowed`), or the
 /// CSSM answer for a missing one (-60008). A user with
 /// no file keychain has none to leave an item in.
-const NO_FILE_KEYCHAIN: [i32; 5] = [-25294, -25307, -25291, -25308, -60008];
+const NO_FILE_KEYCHAIN: [i32; 4] = [-25294, -25307, -25308, -60008];
 
 /// The classes of item, by the name a failure gives.
 pub(crate) const CLASSES: [&str; 5] = [
@@ -56,7 +60,9 @@ pub(crate) enum Left {
 /// Whether `status` says this process cannot reach the keychain at all (`dp`: the
 /// data-protection one), so that there is nothing it could delete from it.
 fn unreachable_keychain(dp: bool, status: i32) -> bool {
-    status == MISSING_ENTITLEMENT || (!dp && NO_FILE_KEYCHAIN.contains(&status))
+    status == MISSING_ENTITLEMENT
+        || status == NOT_AVAILABLE
+        || (!dp && NO_FILE_KEYCHAIN.contains(&status))
 }
 
 /// [`Deleted`] from the status of `SecItemDelete`.
