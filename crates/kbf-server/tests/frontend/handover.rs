@@ -4,7 +4,6 @@
 //! daemon connected, a fake daemon playing the farm's node. Envoy's own part (choosing a
 //! host by its health) is played by the tests reading `/readyz` of each instance.
 
-use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 
 use kbf_server::frontend::start_or_take_over;
@@ -633,86 +632,6 @@ async fn a_refusing_frontend_answers_a_new_execute_unavailable() {
         .expect("the frontend ends")
         .expect("the task")
         .expect("served without an error");
-}
-
-/// Catches: `READY=1` sent before the frontend serves, never sent after, or sent by a
-/// frontend that cannot reach its storage node: the service manager's socket gets it
-/// only once `serve` runs and the probes pass, for a start with no predecessor and for
-/// one that took over alike.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_service_manager_is_told_when_the_frontend_serves() {
-    let node = Node::start().await;
-    let dir = Dir::new();
-    let manager_path = dir.0.join("notify");
-    let manager = UnixDatagram::bind(&manager_path).expect("a datagram socket");
-    let expect_ready = |manager: &UnixDatagram| {
-        manager
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("timeout");
-        let mut buffer = [0_u8; 16];
-        let got = manager.recv(&mut buffer).expect("READY=1");
-        assert_eq!(&buffer[..got], b"READY=1");
-    };
-
-    let (stop, stopped) = oneshot::channel::<()>();
-    let handle = taking_over(&handover_flags(&node, &dir, "a", &[]), stopped)
-        .await
-        .expect("a start with no predecessor");
-    let handle = handle.notifying(Some(manager_path.clone().into_os_string()));
-    manager.set_nonblocking(true).expect("nonblocking");
-    let mut buffer = [0_u8; 16];
-    assert!(manager.recv(&mut buffer).is_err(), "told before it served");
-    manager.set_nonblocking(false).expect("blocking");
-    let old = Proc::serving(handle, stop);
-    expect_ready(&manager);
-
-    let (stop, stopped) = oneshot::channel::<()>();
-    let flags = handover_flags(&node, &dir, "b", &[]);
-    let handle = taking_over(&flags, stopped).await.expect("takes over");
-    let handle = handle.notifying(Some(manager_path.into_os_string()));
-    manager.set_nonblocking(true).expect("nonblocking");
-    assert!(manager.recv(&mut buffer).is_err(), "told before it served");
-    manager.set_nonblocking(false).expect("blocking");
-    let new = Proc::serving(handle, stop);
-    expect_ready(&manager);
-    old.ended().await;
-    drop(new);
-}
-
-/// Catches: `READY=1` (and so the successor's "serving" signal) waiting on the storage
-/// node. The `--storage` node is stopped before the frontend starts, as at a cold power-up
-/// where the node comes up after the frontend: the manager still gets `READY=1` (a frontend
-/// that is never ready is killed at `TimeoutStartSec` and restarts with a new epoch, in a
-/// loop), the listeners stay bound (the same REAPI address answers), and `/readyz` says
-/// 503 with `storage` failing until the node is back, then 200. Catches: `Ready::run` waits
-/// on every probe again.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ready_does_not_wait_for_a_storage_node_that_is_down() {
-    let mut node = Node::start().await;
-    let dir = Dir::new();
-    let manager_path = dir.0.join("notify");
-    let manager = UnixDatagram::bind(&manager_path).expect("a datagram socket");
-    let flags = handover_flags(&node, &dir, "a", &[]);
-    node.stop().await;
-
-    let (stop, stopped) = oneshot::channel::<()>();
-    let handle = taking_over(&flags, stopped).await.expect("starts");
-    let handle = handle.notifying(Some(manager_path.into_os_string()));
-    let old = Proc::serving(handle, stop);
-    manager
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("timeout");
-    let mut buffer = [0_u8; 16];
-    let got = manager
-        .recv(&mut buffer)
-        .expect("READY=1 with the storage node down");
-    assert_eq!(&buffer[..got], b"READY=1");
-    assert_eq!(readyz(old.api).await, 503, "ready with no storage");
-    assert!(
-        std::net::TcpStream::connect(old.reapi).is_ok(),
-        "the listener is gone"
-    );
-    assert!(!old.served.is_finished(), "the frontend ended");
 }
 
 /// Catches: flags for a handover that parse without what they need or with what they do

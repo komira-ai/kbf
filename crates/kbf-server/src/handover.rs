@@ -20,7 +20,7 @@
 //! 2. The holder answers `offer` with the state store's generation, and goes on serving.
 //!    The successor builds everything that does not need the store and answers `ready`.
 //!    A successor that fails, or goes away, up to here has changed nothing.
-//! 3. On `ready` the holder stands down, in this order ([`outgoing::Stand`]): it hands
+//! 3. On `ready` the holder stands down, in this order ([`crate::stand::Stand`]): it hands
 //!    over ([`crate::Drain::hand_over`]: it stays ready, and its readiness stops asking
 //!    the stores it is giving up), waits, for a bounded time, for the calls between their
 //!    request and their queueing and the results being taken; fences its farm (from then
@@ -33,7 +33,7 @@
 //! 4. The successor takes the next generation of the store, expecting exactly the one it
 //!    was told ([`crate::StateStoreUri::open_after_handover`]), keeps the epoch (so the
 //!    daemons that reconnect keep the runs of their leases), serves, and, once its
-//!    probes pass, tells systemd it is ready ([`notify`]) and the holder it is `serving`.
+//!    probes pass, tells systemd it is ready ([`crate::notify`]) and the holder it is `serving`.
 //! 5. The holder, on `serving`, waits the settle (Envoy's check interval, threshold and
 //!    timeout: [`EnvoyCheck::settle`]) so Envoy has seen the successor, and goes not
 //!    ready ([`crate::Drain::unready`]). Envoy then sends it no new stream. It answers
@@ -52,26 +52,20 @@
 
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use futures::future::BoxFuture;
-use tokio::sync::watch;
-
-use crate::listen::Latch;
-
 mod incoming;
-mod notify;
 mod outgoing;
-mod ready;
 pub(crate) mod wire;
 
 pub(crate) use incoming::{Released, knock};
-pub(crate) use outgoing::{Dial, Facts, Holder, Leave, Peer, Stand};
-pub(crate) use ready::Ready;
+pub(crate) use outgoing::{Dial, Facts, Holder, Leave, Peer};
 pub use wire::Message;
 
 use crate::farm::StateError;
+
+pub(crate) use crate::stand::Stand;
+pub(crate) use crate::stop::Stop;
 
 /// Which of the two instances of a frontend this process is: the two run side by side
 /// during an update, on port blocks [`Instance::SECOND_OFFSET`] apart.
@@ -216,58 +210,5 @@ pub enum HandoverError {
     State(#[from] StateError),
 }
 
-/// A signal that, once given, stays given: what stops a listener. The listeners it is
-/// to close are closed as it is given, not when the server next looks at them.
-#[derive(Clone)]
-pub(crate) struct Stop(Arc<Signal>);
-
-struct Signal {
-    given: watch::Sender<bool>,
-    latches: Mutex<Vec<Latch>>,
-}
-
-impl Stop {
-    pub fn new() -> Self {
-        Self(Arc::new(Signal {
-            given: watch::Sender::new(false),
-            latches: Mutex::new(Vec::new()),
-        }))
-    }
-
-    /// Gives the signal: closes the listeners registered with [`Stop::closes`], and
-    /// completes every [`Stop::fired`].
-    pub fn fire(&self) {
-        let mut latches = self
-            .0
-            .latches
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        self.0.given.send_replace(true);
-        latches.drain(..).for_each(|latch| latch.close());
-    }
-
-    /// Has `latch` close its listener when the signal is given, at once if it was.
-    pub fn closes(&self, latch: Latch) {
-        let mut latches = self
-            .0
-            .latches
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        latches.push(latch.clone());
-        if *self.0.given.borrow() {
-            latch.close();
-        }
-    }
-
-    /// Completes when the signal is given (immediately if it was).
-    pub fn fired(&self) -> BoxFuture<'static, ()> {
-        let mut fired = self.0.given.subscribe();
-        // Held by the caller too: the sender outlives every future this returns.
-        Box::pin(async move {
-            let _ = fired.wait_for(|fired| *fired).await;
-        })
-    }
-}
-
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

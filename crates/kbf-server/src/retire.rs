@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 
 use crate::farm::FOLLOW_EVERY;
-use crate::handover::Stand;
+use crate::stand::Stand;
 
 /// What `GET /v1/frontend/retire` answers, and what a retire answers after it ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

@@ -913,7 +913,7 @@ All of this is on arch-v2. Build on it; do not re-implement it.
 
 - **Kept**: `Farm::quiet/fence/follow/end_worker_streams` and the durable `done/` and `cordon/` rows
   (`farm/handover.rs`, `farm/durable.rs`), `open_after_handover` and `EpochPolicy::Keep`, `Fenced`/`Store::demote`,
-  `READY=1` (`handover/notify.rs`, `ready.rs`), the daemon-side redial, the `Stop`/`Latch` pair, the
+  `READY=1` (`notify.rs`, `ready.rs`), the daemon-side redial, the `Stop`/`Latch` pair (`stop.rs`), the
   `kbf-frontend@` units. `Drain` is wrapped by the staged object (5.1), not replaced in place.
 - **Dropped from the Envoy path** (merged, so this is code left unused by it, not code never written): the control
   socket and `SCM_RIGHTS` wire (`handover/wire.rs`, `incoming.rs`, `outgoing.rs`), `listen.rs`' adopt and spare dup, the
