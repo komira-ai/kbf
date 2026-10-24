@@ -156,11 +156,14 @@ fn empty_base(path: &Path, uid: u32, keep: &[&str], swept: &mut Swept) -> io::Re
                 Some(stat) if is_kept(&name, keep, &stat, dev) => {
                     empty_kept(&dir, &name, &here, &stat, uid, dev, swept).map(|()| 0)
                 }
-                Some(stat) => tolerate(
-                    remove_entry(&dir, &name, &here, &stat, (uid, dev, 1), &park).map(|()| 1),
-                    (&dir, &name, &here),
-                    skipped,
-                ),
+                Some(stat) => {
+                    unlock_own(&dir, &name, &stat, rustix::process::geteuid().as_raw());
+                    tolerate(
+                        remove_entry(&dir, &name, &here, &stat, (uid, dev, 1), &park).map(|()| 1),
+                        (&dir, &name, &here),
+                        skipped,
+                    )
+                }
                 None => Ok(0),
             },
         );
@@ -199,7 +202,7 @@ fn empty_kept(
     for entry in listed(&child)? {
         let there = here.join(&entry);
         let result = tolerate(
-            examine(&child, &entry).and_then(|inner| match inner {
+            examine_inner(&child, &entry).and_then(|inner| match inner {
                 Some(inner) => {
                     remove_entry(&child, &entry, &there, &inner, (uid, dev, 2), &park).map(|()| 1)
                 }
@@ -487,7 +490,8 @@ fn remove_present(
             "another filesystem is mounted here; not crossed",
         ));
     }
-    if stat.st_uid == uid {
+    let placed = is_placed(dir, name, stat);
+    if (stat.st_uid == uid) & !placed {
         unlock(dir, name, stat)?;
     }
     if !is_dir(stat) {
@@ -503,7 +507,7 @@ fn remove_present(
     for entry in listed(&child)? {
         let inner_path = here.join(&entry);
         tolerate(
-            examine(&child, &entry).and_then(|inner| match inner {
+            examine_inner(&child, &entry).and_then(|inner| match inner {
                 Some(inner) => remove_entry(
                     &child,
                     &entry,
@@ -519,9 +523,10 @@ fn remove_present(
         )?;
     }
     drop(child);
-    if park.skipped.get() > skipped_before {
-        // Something the pool user may not open is inside, and stays with it, and so does
-        // this directory (counted, for the one above it).
+    if placed | (park.skipped.get() > skipped_before) {
+        // This directory was placed by the system (emptied, never removed), or something
+        // the pool user may not open is inside and stays with it, and so does this one
+        // (counted, for the one above it).
         park.skipped.set(park.skipped.get() + 1);
         return Ok(());
     }
@@ -680,6 +685,109 @@ fn examine(dir: &OwnedFd, name: &OsStr) -> io::Result<Option<Stat>> {
     stat
 }
 
+/// [`examine`] of an entry below a folder the sweep keeps, after [`unlock_own`].
+fn examine_inner(dir: &OwnedFd, name: &OsStr) -> io::Result<Option<Stat>> {
+    let stat = examine(dir, name);
+    if let Ok(Some(found)) = &stat {
+        unlock_own(dir, name, found, rustix::process::geteuid().as_raw());
+    }
+    stat
+}
+
+/// Gives the directory `name` of `dir`, examined as `stat`, back the owner's `rwx` when the
+/// process (`euid`, not root) owns it and the owner cannot open it (no `r` or no `x`): the owner can always do that,
+/// so a lease that took every permission from a folder to keep its files past the clean
+/// gains nothing, and the sweep goes on into it. A refused change leaves it as it is (a
+/// protected store of the system, which is then skipped). Not done for root, nor for an
+/// entry another uid owns.
+fn unlock_own(dir: &OwnedFd, name: &OsStr, stat: &Stat, euid: u32) {
+    #[cfg(test)]
+    if !tests::unlocking() {
+        return;
+    }
+    let at = if cfg!(target_os = "macos") {
+        AtFlags::SYMLINK_NOFOLLOW
+    } else {
+        AtFlags::empty()
+    };
+    let owner_needs_it = is_dir(stat) & (stat.st_uid == euid) & (euid != 0) & !owner_can_open(stat);
+    if owner_needs_it {
+        let _ = rustix::fs::chmodat(dir, name, owner_rwx(stat), at);
+    }
+}
+
+/// Whether the owner has `r` and `x` on `stat`: it can open and search it.
+#[allow(clippy::unnecessary_cast)] // `st_mode` is u32 on Linux, u16 on macOS
+fn owner_can_open(stat: &Stat) -> bool {
+    stat.st_mode as u32 & 0o500 == 0o500
+}
+
+/// The flag only the system sets (`sunlnk`, `SF_NOUNLINK`): the entry may not be unlinked.
+const SF_NOUNLINK: u32 = 0x0010_0000;
+
+/// The attribute SIP puts on what it protects.
+#[cfg(target_os = "macos")]
+const ROOTLESS: &std::ffi::CStr = c"com.apple.rootless";
+
+/// Whether a directory with the flags `flags` and the SIP attribute (`rootless`, or not)
+/// was placed by the system: it carries `sunlnk` or `com.apple.rootless`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn placed(flags: u32, rootless: bool) -> bool {
+    flags & SF_NOUNLINK != 0 || rootless
+}
+
+/// Whether the directory `name` of `dir`, examined as `stat`, was placed by the system
+/// (see [`placed`]) below a folder it keeps: neither its flags nor its ACL are the pool
+/// user's to change, and it is never removed; what is in it is the lease's, and goes. Only
+/// for a process that is not root, like the pool user's own sweeps.
+fn is_placed(dir: &OwnedFd, name: &OsStr, stat: &Stat) -> bool {
+    let not_root = !rustix::process::geteuid().is_root();
+    not_root & is_dir(stat) & system_placed(dir, name, stat)
+}
+
+#[cfg(target_os = "macos")]
+fn system_placed(dir: &OwnedFd, name: &OsStr, stat: &Stat) -> bool {
+    placed(
+        stat.st_flags,
+        crate::macos::dir_has_xattr(dir, name, ROOTLESS),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+thread_local! {
+    /// The names a test says the system placed (nothing is, off macOS).
+    static PRETENDED: std::cell::RefCell<Vec<OsString>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Off macOS nothing is placed by the system, but what a test names.
+#[cfg(not(target_os = "macos"))]
+fn system_placed(_dir: &OwnedFd, name: &OsStr, _stat: &Stat) -> bool {
+    PRETENDED.with_borrow(|names| names.iter().any(|n| n == name))
+}
+
+/// For tests off macOS: the directories of these names, on this thread, count as placed by
+/// the system.
+#[cfg(not(target_os = "macos"))]
+#[doc(hidden)]
+pub fn pretend_placed(names: &[&str]) {
+    PRETENDED.with_borrow_mut(|n| *n = names.iter().map(Into::into).collect());
+}
+
+/// [`is_placed`] for the path `path`.
+#[must_use]
+pub fn path_is_system_placed(path: &Path) -> bool {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return false;
+    };
+    let Ok(Some(dir)) = open_base(parent) else {
+        return false;
+    };
+    match present(rustix::fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW)) {
+        Ok(Some(stat)) => is_placed(&dir, name, &stat),
+        _ => false,
+    }
+}
+
 /// The names in `dir`, read whole before any is removed.
 pub(crate) fn list(dir: &OwnedFd) -> io::Result<Vec<OsString>> {
     let mut names = Vec::new();
@@ -811,13 +919,14 @@ fn clear_entry(
     (uid, dev, depth): (u32, StDev, usize),
     swept: &mut Swept,
 ) -> io::Result<()> {
-    let Some(stat) = examine(dir, name)? else {
+    let Some(stat) = examine_inner(dir, name)? else {
         return Ok(());
     };
     if stat.st_dev != dev {
         return Ok(());
     }
-    if stat.st_uid == uid {
+    // A directory the system placed keeps its flags and ACL; what is in it is cleared.
+    if (stat.st_uid == uid) & !is_placed(dir, name, &stat) {
         clear_marked(dir, name, &stat)?;
         swept.removed += 1;
         make_owner_rwx(dir, name, &stat)?;

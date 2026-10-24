@@ -884,7 +884,7 @@ fn the_acl_mode_runs_find_on_a_real_tree() {
 }
 
 #[test]
-fn the_home_is_emptied_as_the_uid_and_what_it_cannot_open_stays() {
+fn the_home_is_emptied_as_the_uid_and_a_directory_it_owns_with_no_permission_is_opened() {
     if rustix::process::geteuid().is_root() {
         eprintln!("skipped: permission bits do not stop root");
         return;
@@ -901,16 +901,12 @@ fn the_home_is_emptied_as_the_uid_and_what_it_cannot_open_stays() {
     .expect("chmod");
     let (code, _, err) = call(EMPTY_HOME, &home);
     assert_eq!((code, err.as_str()), (Some(0), ""));
-    assert!(home.join("Library/Preferences").exists());
+    // The uid owns it, so it can give itself the permission back: nothing keeps its files.
+    assert!(!home.join("Library").exists());
     assert!(!home.join("top").exists());
-    // The look agrees: nothing is left that it can open.
+    // The look agrees: nothing is left.
     let (code, out, err) = call(LOOK_HOME, &home);
     assert_eq!((code, out.as_str(), err.as_str()), (Some(0), "", ""));
-    fs::set_permissions(
-        home.join("Library/Preferences"),
-        fs::Permissions::from_mode(0o700),
-    )
-    .expect("chmod");
 }
 
 #[test]
@@ -946,11 +942,13 @@ fn the_look_of_the_home_and_of_the_entry_leave_out_what_the_user_cannot_open() {
         return;
     }
     let dir = tree("look-protected");
-    let entry = entry_with_files(&dir);
+    let entry = dir.path().join("entry");
+    for folder in ["0", "C", "T", "X"] {
+        fs::create_dir_all(entry.join(folder)).expect("folder");
+    }
     let vault = entry.join("T").join("vault");
     fs::create_dir_all(&vault).expect("vault");
     fs::set_permissions(&vault, fs::Permissions::from_mode(0o000)).expect("chmod");
-    call(EMPTY, &entry);
     let (code, out, err) = call(LOOK, &entry);
     assert_eq!((code, out.as_str(), err.as_str()), (Some(0), "", ""));
     fs::create_dir_all(entry.join("T").join("kept")).expect("kept");
@@ -966,4 +964,157 @@ fn the_look_of_the_home_and_of_the_entry_leave_out_what_the_user_cannot_open() {
     assert_eq!((code, out.as_str()), (Some(0), ""));
     fs::set_permissions(&inner, fs::Permissions::from_mode(0o700)).expect("chmod");
     fs::set_permissions(&vault, fs::Permissions::from_mode(0o700)).expect("chmod");
+}
+
+#[test]
+fn only_leftovers_all_in_the_keychains_are_waited_for() {
+    let home = Path::new(HOME);
+    let line = |rest: &str| format!("{HOME}/{rest}");
+    let some = [
+        line("Library/Keychains/.flA5"),
+        line("Library/Keychains/login"),
+    ];
+    assert!(keychain_only(&some, home));
+    assert!(!keychain_only(&[], home));
+    assert!(!keychain_only(&[line("Library/Preferences/x")], home));
+    assert!(!keychain_only(
+        &[line("Library/Keychains/a"), line("top")],
+        home
+    ));
+    assert!(!keychain_only(&[line("Library/KeychainsX/a")], home));
+}
+
+/// A runner for the contents step: `empties` is how many of the home's empties fail, then
+/// succeed; the look of the home says `left`.
+fn keychain_runner<'a>(
+    log: &'a Log,
+    mut fail_empties: usize,
+    left: &'a str,
+) -> impl FnMut(&Path, &[OsString]) -> Result<String, String> + 'a {
+    move |program, args| {
+        let line = format!("{} {}", program.display(), words(args));
+        log.borrow_mut().push(line.clone());
+        if line.contains("__entry empty-home") && fail_empties > 0 {
+            fail_empties -= 1;
+            return Err(format!("{HOME}/Library: Operation not permitted"));
+        }
+        if line.contains("__entry look-home") {
+            return Ok(left.to_owned());
+        }
+        Ok(String::new())
+    }
+}
+
+#[test]
+fn a_home_held_by_the_keychain_is_emptied_again_once_after_a_wait() {
+    let dirs = (Path::new(HOME), Path::new(FOLDERS));
+    let held = format!("{HOME}/Library/Keychains/.flA5\\n");
+    // One failure, then it goes: one wait, the empty made twice, the entry emptied.
+    let log = Log::default();
+    let mut waits = Vec::new();
+    contents_step_waiting(
+        &me(),
+        dirs,
+        &mut keychain_runner(&log, 1, &held),
+        &mut |d| waits.push(d),
+    )
+    .expect("emptied on the second try");
+    assert_eq!(waits, vec![KEYCHAIN_WAIT]);
+    assert_eq!(
+        *log.borrow(),
+        vec![
+            home_call("empty-home"),
+            home_call("look-home"),
+            home_call("empty-home"),
+            mode_call("empty"),
+        ]
+    );
+    // Still there after the wait: it fails, naming the path; it is never skipped.
+    let log = Log::default();
+    let mut waits = Vec::new();
+    let why = contents_step_waiting(
+        &me(),
+        dirs,
+        &mut keychain_runner(&log, 2, &held),
+        &mut |d| waits.push(d),
+    )
+    .expect_err("fails");
+    assert_eq!(waits.len(), 1);
+    assert!(why.contains(".flA5"), "{why}");
+    assert!(why.contains("Operation not permitted"), "{why}");
+}
+
+#[test]
+fn a_home_that_fails_for_another_reason_is_not_waited_for() {
+    let dirs = (Path::new(HOME), Path::new(FOLDERS));
+    let other = format!("{HOME}/Library/Preferences/x\\n");
+    for left in [other.as_str(), ""] {
+        let log = Log::default();
+        let mut waits = 0;
+        let why = contents_step_waiting(
+            &me(),
+            dirs,
+            &mut keychain_runner(&log, 1, left),
+            &mut |_| waits += 1,
+        )
+        .expect_err("fails at once");
+        assert_eq!(waits, 0, "{left:?}");
+        assert!(why.contains("Operation not permitted"), "{why}");
+    }
+    // The home cannot be looked at: no wait either.
+    let log = Log::default();
+    let mut run = |program: &Path, args: &[OsString]| {
+        let line = format!("{} {}", program.display(), words(args));
+        log.borrow_mut().push(line.clone());
+        if line.contains("empty-home") || line.contains("look-home") {
+            return Err("failed".to_owned());
+        }
+        Ok(String::new())
+    };
+    let mut waits = 0;
+    contents_step_waiting(&me(), dirs, &mut run, &mut |_| waits += 1).expect_err("fails");
+    assert_eq!(waits, 0);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_directory_the_system_placed_is_accepted_when_empty_and_its_contents_are_not() {
+    use kbf_mac_session::sweep::pretend_placed;
+    let dir = tree("placed");
+    let entry = entry_with_files(&dir);
+    call(EMPTY, &entry);
+    let placed = entry.join("T").join("com.apple.trustd");
+    fs::create_dir_all(&placed).expect("placed");
+    pretend_placed(&["com.apple.trustd"]);
+    // Empty, it is accepted by the look of the entry and of a home that holds it.
+    let (code, out, err) = call(LOOK, &entry);
+    assert_eq!((code, out.as_str(), err.as_str()), (Some(0), "", ""));
+    let home = dir.path().join("home");
+    fs::create_dir_all(home.join("Library").join("com.apple.trustd")).expect("dirs");
+    let (code, out, _) = call(LOOK_HOME, &home);
+    assert_eq!((code, out.as_str()), (Some(0), ""));
+    // What is in it is left, and named.
+    fs::write(placed.join("leak"), "x").expect("file");
+    let (code, out, _) = call(LOOK, &entry);
+    assert_eq!(code, Some(0));
+    assert!(out.contains("com.apple.trustd/leak"), "{out}");
+    // The empty keeps it and removes what is in it.
+    let (code, _, err) = call(EMPTY, &entry);
+    assert_eq!((code, err.as_str()), (Some(0), ""));
+    assert!(placed.is_dir() && !placed.join("leak").exists());
+    // The ACL pass lets go the refusal for it.
+    let refusal = format!(
+        "chmod: Failed to clear ACL on file {}: Operation not permitted\n",
+        placed.display()
+    );
+    let mut err = Vec::new();
+    assert_eq!(
+        acl_mode(&entry, 5, &mut fake_find(false, &refusal), &mut err),
+        0
+    );
+    pretend_placed(&[]);
+    assert_eq!(
+        acl_mode(&entry, 5, &mut fake_find(false, &refusal), &mut err),
+        1
+    );
 }

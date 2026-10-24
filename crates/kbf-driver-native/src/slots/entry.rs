@@ -111,11 +111,51 @@ pub(crate) fn flags_step(
 /// A part failed; both are tried.
 pub(crate) fn contents_step(
     me: &AsUid<'_>,
-    (home, folders): (&Path, &Path),
+    dirs: (&Path, &Path),
     run: &mut Run<'_>,
 ) -> Result<(), String> {
+    contents_step_waiting(me, dirs, run, &mut std::thread::sleep)
+}
+
+/// How long the home's empty waits before it tries again when only the keychain's files
+/// were left: securityd holds a lock file there for a moment after a lease.
+pub(crate) const KEYCHAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether `lines`, what the uid finds left in `home`, are all in its `Library/Keychains`
+/// and there is at least one: the system holds them for a moment, and the empty is tried
+/// once more after [`KEYCHAIN_WAIT`]. Never skipped: a keychain is readable by the next
+/// lease that runs as the same user.
+pub(crate) fn keychain_only(lines: &[String], home: &Path) -> bool {
+    let keychains = home.join("Library/Keychains");
+    !lines.is_empty() & lines.iter().all(|l| Path::new(l).starts_with(&keychains))
+}
+
+/// [`contents_step`], waiting with `sleep`.
+///
+/// # Errors
+/// A part failed; both are tried.
+pub(crate) fn contents_step_waiting(
+    me: &AsUid<'_>,
+    (home, folders): (&Path, &Path),
+    run: &mut Run<'_>,
+    sleep: &mut dyn FnMut(std::time::Duration),
+) -> Result<(), String> {
     let mut failed = Vec::new();
-    failed.extend(empty_home(me, home, run).err());
+    if let Err(first) = empty_home(me, home, run) {
+        let held = left_home(me, home, run).ok();
+        if held
+            .as_deref()
+            .is_some_and(|lines| keychain_only(lines, home))
+        {
+            sleep(KEYCHAIN_WAIT);
+            if let Err(again) = empty_home(me, home, run) {
+                let left = left_home(me, home, run).unwrap_or_default();
+                failed.push(format!("{again}; left after waiting: {left:?}"));
+            }
+        } else {
+            failed.push(first);
+        }
+    }
     failed.extend(empty(me, folders, run).err());
     join(failed)
 }
@@ -482,7 +522,18 @@ fn look(dir: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             continue;
         }
         let folder = dir.join(&name);
-        match names(&folder) {
+        match names(&folder).map(|mut inside| {
+            // A directory the system placed is kept; only what is in it is left.
+            inside.retain(|n| {
+                let path = folder.join(n);
+                let placed = sweep::path_is_system_placed(&path);
+                if placed {
+                    left_below(&path, out, err, &mut code);
+                }
+                !placed
+            });
+            inside
+        }) {
             Ok(inside) if inside.is_empty() => {}
             Ok(inside) => {
                 let _ = writeln!(out, "{}: {inside:?}", folder.display());
@@ -551,14 +602,17 @@ fn left_below(dir: &Path, out: &mut dyn Write, err: &mut dyn Write, code: &mut i
             found.printed = true;
             continue;
         }
+        let placed = sweep::path_is_system_placed(&path);
         let inside = left_below(&path, out, err, code);
         found.printed |= inside.printed;
         found.protected |= inside.protected;
         found.failed |= inside.failed;
-        if inside.nothing() {
+        if inside.nothing() & !placed {
             let _ = writeln!(out, "{}", path.display());
             found.printed = true;
         }
+        // An empty directory the system placed stays, and so does the one that holds it.
+        found.protected |= inside.nothing() & placed;
     }
     found
 }
@@ -605,7 +659,10 @@ fn acl_mode(dir: &Path, uid: u32, find: &mut Find<'_>, err: &mut dyn Write) -> i
     let others: Vec<&str> = said
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .filter(|l| !refused_path(l).is_some_and(sweep::path_is_protected))
+        .filter(|l| {
+            !refused_path(l)
+                .is_some_and(|p| sweep::path_is_protected(p) || sweep::path_is_system_placed(p))
+        })
         .collect();
     if said.trim().is_empty() {
         let _ = writeln!(err, "{FIND} failed");

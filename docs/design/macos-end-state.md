@@ -301,6 +301,15 @@ Decided:
   post-clean check and the slot-ready assertion accept such an entry and fail on anything left that
   the pool user can open. This does not hold against code that can read the stores another way:
   revisit (a VM per lease, or MDM-granted Full Disk Access) before running untrusted code.
+- **D7a. What D7 never skips.** A directory the pool user *owns* and cannot open (no `r` or `x`) is first
+  given its owner `rwx` back by the pool user, then emptied: a lease cannot keep files past the clean by
+  closing a folder it owns. Only an entry whose permission cannot be restored (a store of the system) or
+  that another uid owns is skipped. A directory below the four folders (or in the home) that carries
+  `sunlnk` or the `com.apple.rootless` attribute is placed by the system like the four folders: kept,
+  never given flag, mode or ACL changes, never removed, and emptied (what is in it is the lease's); the
+  look and the assertion accept it while it is empty. A home that is left holding only files under
+  `Library/Keychains` (securityd's lock file, held for a moment) is emptied once more after 3 seconds and
+  fails, naming the path, if they are still there: a keychain is never skipped.
 
 Open:
 - **D5. The farm signing identity.** A Developer ID (DR = identifier plus team, stable across

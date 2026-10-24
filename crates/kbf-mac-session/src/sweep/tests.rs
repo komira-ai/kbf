@@ -17,6 +17,15 @@ pub(super) enum Point<'a> {
     Examined(&'a OsStr),
 }
 
+thread_local! {
+    /// Whether the sweep gives an owned directory with no permission back its `rwx`.
+    static UNLOCKING: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+pub(super) fn unlocking() -> bool {
+    UNLOCKING.with(std::cell::Cell::get)
+}
+
 /// A test's hook: the point reached, and how many listings the sweep has made so far.
 type Hook = Box<dyn FnMut(&Point<'_>, usize)>;
 
@@ -1218,7 +1227,10 @@ fn the_empty_leaves_what_the_user_cannot_open_and_removes_the_rest() {
     fs::write(entry.join("Library/note"), "x").unwrap();
     chmod(&entry.join("T/vault"), 0o000);
     chmod(&entry.join("Library/Preferences"), 0o000);
+    // The owner's unlock is refused (a store of the system), as it is for a vault.
+    UNLOCKING.with(|u| u.set(false));
     let swept = empty_keeping(&entry, me(), &["T"]);
+    UNLOCKING.with(|u| u.set(true));
     chmod(&entry.join("T/vault"), 0o700);
     chmod(&entry.join("Library/Preferences"), 0o700);
     assert_eq!(swept.errors, Vec::<String>::new());
@@ -1260,4 +1272,117 @@ fn only_a_top_level_refusal_of_the_examination_is_taken_as_an_entry_not_there() 
     let other = Err(io::Error::from_raw_os_error(Errno::IO.raw_os_error()));
     assert!(skip_protected_top(other, 0, here).is_err());
     assert!(skip_protected_top(Ok(None), 0, here).unwrap().is_none());
+}
+
+fn place(names: &[&str]) {
+    pretend_placed(names);
+}
+
+/// Catches a lease that takes every permission from a folder it owns to keep its files
+/// past the clean: the owner can chmod it back, so the sweep does, and empties it.
+#[test]
+fn a_directory_the_user_owns_with_no_permission_is_emptied() {
+    if root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = scratch("unlock-own");
+    let entry = dir.join("entry");
+    fs::create_dir_all(entry.join("T/hidden/deeper")).unwrap();
+    fs::write(entry.join("T/hidden/deeper/secret"), "x").unwrap();
+    chmod(&entry.join("T/hidden/deeper"), 0o000);
+    chmod(&entry.join("T/hidden"), 0o000);
+    let swept = empty_keeping(&entry, me(), &["T"]);
+    assert_eq!(swept.errors, Vec::<String>::new());
+    assert!(names(&entry.join("T")).is_empty());
+    // Cleared the same way before the removal.
+    fs::create_dir_all(entry.join("T/closed")).unwrap();
+    chmod(&entry.join("T/closed"), 0o000);
+    let swept = clear_flags_within(&entry, me(), &["T"]);
+    assert_eq!(swept.errors, Vec::<String>::new());
+    let mode = fs::metadata(entry.join("T/closed"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o700, 0o700);
+}
+
+/// The unlock is for the owner only: an entry another uid owns, or a process that is root,
+/// is left as it is; and with it off, a closed owned directory is skipped as a store.
+#[test]
+fn the_unlock_is_for_the_owner_and_a_refused_one_is_skipped_with_the_warning() {
+    if root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = scratch("unlock-owner");
+    fs::create_dir_all(dir.join("closed")).unwrap();
+    chmod(&dir.join("closed"), 0o000);
+    let fd = open_base(&dir).unwrap().unwrap();
+    let stat = rustix::fs::statat(&fd, "closed", AtFlags::SYMLINK_NOFOLLOW).unwrap();
+    unlock_own(&fd, OsStr::new("closed"), &stat, other());
+    unlock_own(&fd, OsStr::new("closed"), &stat, 0);
+    assert!(cannot_open(&fd, OsStr::new("closed")));
+    unlock_own(&fd, OsStr::new("closed"), &stat, me());
+    assert!(!cannot_open(&fd, OsStr::new("closed")));
+    // A refused change (a store the system protects) leaves it closed: skipped.
+    chmod(&dir.join("closed"), 0o000);
+    UNLOCKING.with(|u| u.set(false));
+    fs::create_dir_all(dir.join("home/Library/Preferences")).unwrap();
+    chmod(&dir.join("home/Library/Preferences"), 0o000);
+    let swept = empty(&dir.join("home"), me());
+    UNLOCKING.with(|u| u.set(true));
+    chmod(&dir.join("home/Library/Preferences"), 0o700);
+    chmod(&dir.join("closed"), 0o700);
+    assert_eq!(swept.errors, Vec::<String>::new());
+    assert!(dir.join("home/Library/Preferences").exists());
+}
+
+/// A directory the system placed (`sunlnk`, `com.apple.rootless`) below a kept folder
+/// keeps its flags and mode, stays, and is emptied; what is in it goes.
+#[test]
+fn a_directory_the_system_placed_is_kept_and_emptied() {
+    if root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = scratch("placed");
+    let entry = dir.join("entry");
+    fs::create_dir_all(entry.join("T/com.apple.trustd/TemporaryItems")).unwrap();
+    fs::write(entry.join("T/com.apple.trustd/TemporaryItems/f"), "x").unwrap();
+    fs::write(entry.join("T/com.apple.trustd/g"), "x").unwrap();
+    fs::create_dir_all(entry.join("T/plain/com.apple.trustd")).unwrap();
+    chmod(&entry.join("T/com.apple.trustd"), 0o500);
+    chmod(&entry.join("T/com.apple.trustd/TemporaryItems"), 0o500);
+    place(&["com.apple.trustd"]);
+    // The clear leaves the placed directory's mode, clears what is in it.
+    let swept = clear_flags_within(&entry, me(), &["T"]);
+    assert_eq!(swept.errors, Vec::<String>::new());
+    let mode = |p: &str| fs::metadata(entry.join(p)).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode("T/com.apple.trustd"), 0o500);
+    assert_eq!(mode("T/com.apple.trustd/TemporaryItems"), 0o700);
+    // The empty removes everything but the placed directories themselves.
+    chmod(&entry.join("T/com.apple.trustd"), 0o700);
+    let swept = empty_keeping(&entry, me(), &["T"]);
+    place(&[]);
+    assert_eq!(swept.errors, Vec::<String>::new());
+    assert!(entry.join("T/com.apple.trustd").is_dir());
+    assert!(names(&entry.join("T/com.apple.trustd")).is_empty());
+    // The one nested in a plain directory stays with it.
+    assert!(entry.join("T/plain/com.apple.trustd").is_dir());
+    assert!(!path_is_system_placed(&entry.join("T/absent")));
+    place(&["com.apple.trustd"]);
+    assert!(path_is_system_placed(&entry.join("T/com.apple.trustd")));
+    assert!(!path_is_system_placed(&entry.join("T/plain")));
+    assert!(!path_is_system_placed(Path::new("/")));
+    place(&[]);
+}
+
+#[test]
+fn a_directory_is_the_systems_when_it_has_sunlnk_or_the_rootless_attribute() {
+    assert!(placed(0x0010_0000, false));
+    assert!(placed(0x0010_0000 | 0x8000, false));
+    assert!(placed(0, true));
+    assert!(!placed(0x8000 | 0x2, false));
+    assert!(!placed(0, false));
 }
