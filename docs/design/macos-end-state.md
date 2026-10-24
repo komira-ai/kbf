@@ -308,8 +308,8 @@ Decided:
   `sunlnk` or the `com.apple.rootless` attribute is placed by the system like the four folders: kept,
   never given flag, mode or ACL changes, never removed, and emptied (what is in it is the lease's); the
   look and the assertion accept it while it is empty. The clean first deletes every keychain item of the
-  pool user, as the pool user (`SecItemDelete` for each class, in the data-protection and the file
-  keychain, then asks again and fails, naming what is left). A home that is left holding only files under
+  pool user, as the pool user (`SecItemDelete` for each class, in the data-protection keychain (a file
+  keychain's items are files in the home, and the search list holds the system keychain, which the user may not change), then asks again and fails, naming what is left). A home that is left holding only files under
   `Library/Keychains` (`secd` removes the per-user keychain it made about a minute after the lease) is
   emptied again every 2 seconds for 60 seconds and fails, naming the path, if they are still there: a
   keychain is never skipped. `slot_clean`'s `a_keychain_item_one_lease_stores_is_not_readable_by_the_next`

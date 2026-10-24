@@ -33,7 +33,7 @@ fn a_status_says_whether_an_item_is_left() {
 }
 
 #[test]
-fn every_class_is_deleted_in_both_keychains_and_checked_and_nothing_left_is_clean() {
+fn every_class_is_deleted_in_the_data_protection_keychain_and_checked_and_nothing_left_is_clean() {
     let deleted = RefCell::new(Vec::new());
     let found = RefCell::new(Vec::new());
     let failed = wipe(
@@ -47,38 +47,32 @@ fn every_class_is_deleted_in_both_keychains_and_checked_and_nothing_left_is_clea
         },
     );
     assert!(failed.is_empty(), "{failed:?}");
-    let all: Vec<(usize, bool)> = (0..CLASSES.len())
-        .flat_map(|c| [(c, true), (c, false)])
-        .collect();
+    let all: Vec<(usize, bool)> = (0..CLASSES.len()).map(|c| (c, true)).collect();
     assert_eq!(*deleted.borrow(), all);
     assert_eq!(*found.borrow(), all);
 }
 
 #[test]
-fn items_that_survive_or_a_failure_fail_naming_the_class_and_keychain() {
-    // Class 0 in the data-protection keychain: one deletion removes an item, the next finds
-    // none, but the check still sees one. Class 3 in the file keychain: the deletion fails.
-    // Class 2 in the data-protection keychain: it never stops returning items.
+fn items_that_survive_or_a_failure_fail_naming_the_class() {
+    // Class 0: one deletion removes an item, the next finds none, but the check still sees
+    // one. Class 3: the deletion fails. Class 2: it never stops returning items. Class 4:
+    // the check fails.
     let rounds = RefCell::new(0);
     let failed = wipe(
-        &mut |class, dp| match (class, dp) {
-            (0, true) => {
+        &mut |class, _| match class {
+            0 => {
                 let mut n = rounds.borrow_mut();
                 *n += 1;
                 if *n == 1 { 0 } else { NOT_FOUND }
             }
-            (3, false) => -50,
-            (2, true) => 0,
+            3 => -50,
+            2 => 0,
             _ => NOT_FOUND,
         },
-        &mut |class, dp| {
-            if (class, dp) == (0, true) {
-                0
-            } else if (class, dp) == (4, false) {
-                -50
-            } else {
-                NOT_FOUND
-            }
+        &mut |class, _| match class {
+            0 => 0,
+            4 => -50,
+            _ => NOT_FOUND,
         },
     );
     assert_eq!(
@@ -96,7 +90,7 @@ fn items_that_survive_or_a_failure_fail_naming_the_class_and_keychain() {
     assert!(
         failed
             .iter()
-            .any(|l| l == "key in the file keychain: delete status -50"),
+            .any(|l| l == "key in the data-protection keychain: delete status -50"),
         "{failed:?}"
     );
     assert!(
@@ -109,7 +103,7 @@ fn items_that_survive_or_a_failure_fail_naming_the_class_and_keychain() {
     assert!(
         failed
             .iter()
-            .any(|l| l == "identity in the file keychain: find status -50"),
+            .any(|l| l == "identity in the data-protection keychain: find status -50"),
         "{failed:?}"
     );
 }

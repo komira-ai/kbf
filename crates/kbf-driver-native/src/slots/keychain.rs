@@ -2,9 +2,12 @@
 //!
 //! The per-user data-protection keychain `secd` keeps for a uid outlives the lease that
 //! filled it, and an item stored there must not be readable by the next lease on the
-//! same uid. The clean deletes every item of every class, in both the data-protection
-//! keychain and the file-based one, as the uid (the `keychain` mode of
-//! [`super::entry`]), then asks for each class once more and fails, naming what is left.
+//! same uid. The clean deletes every item of every class in the data-protection keychain,
+//! as the uid (the `keychain` mode of [`super::entry`]), then asks for each class once more
+//! and fails, naming what is left. The file-based keychains are not asked: the search list
+//! of a user holds the system keychain too, which the user may not change (a deletion there
+//! answers `errSecInvalidOwnerEdit`), and the user's own live in its home, which the home's
+//! empty removes and its look checks.
 //!
 //! The decisions are plain functions over a status code, so they are tested on every
 //! platform; the calls into Security.framework are macOS's.
@@ -78,7 +81,7 @@ pub(crate) fn after_find(dp: bool, status: i32) -> Left {
 /// How many times a class is deleted before it is said to keep returning items.
 pub(crate) const ROUNDS: usize = 8;
 
-/// Deletes every item of each class through `delete(class index, dp)` (a status) and checks
+/// Deletes every item of each class in the data-protection keychain through `delete(class index, dp)` (a status) and checks
 /// with `find(class index, dp)`: the lines of what failed or is left, none when the user's
 /// keychains hold nothing.
 pub(crate) fn wipe(
@@ -86,35 +89,37 @@ pub(crate) fn wipe(
     find: &mut dyn FnMut(usize, bool) -> i32,
 ) -> Vec<String> {
     let mut failed = Vec::new();
+    let dp = true;
     for (index, class) in CLASSES.iter().enumerate() {
-        for dp in [true, false] {
-            let keychain = if dp { "data-protection" } else { "file" };
-            let mut rounds = 0;
-            loop {
-                match after_delete(dp, delete(index, dp)) {
-                    Deleted::Some if rounds + 1 < ROUNDS => rounds += 1,
-                    Deleted::Some => {
-                        failed.push(format!("{class} in the {keychain} keychain: still returned after {ROUNDS} deletions"));
-                        break;
-                    }
-                    Deleted::Nothing => break,
-                    Deleted::Failed(status) => {
-                        failed.push(format!(
-                            "{class} in the {keychain} keychain: delete status {status}"
-                        ));
-                        break;
-                    }
+        let mut rounds = 0;
+        loop {
+            match after_delete(dp, delete(index, dp)) {
+                Deleted::Some if rounds + 1 < ROUNDS => rounds += 1,
+                Deleted::Some => {
+                    failed.push(format!(
+                        "{class} in the data-protection keychain: still returned after {ROUNDS} deletions"
+                    ));
+                    break;
+                }
+                Deleted::Nothing => break,
+                Deleted::Failed(status) => {
+                    failed.push(format!(
+                        "{class} in the data-protection keychain: delete status {status}"
+                    ));
+                    break;
                 }
             }
-            match after_find(dp, find(index, dp)) {
-                Left::None => {}
-                Left::Items => {
-                    failed.push(format!("{class} in the {keychain} keychain: items left"))
-                }
-                Left::Failed(status) => failed.push(format!(
-                    "{class} in the {keychain} keychain: find status {status}"
-                )),
+        }
+        match after_find(dp, find(index, dp)) {
+            Left::None => {}
+            Left::Items => {
+                failed.push(format!(
+                    "{class} in the data-protection keychain: items left"
+                ));
             }
+            Left::Failed(status) => failed.push(format!(
+                "{class} in the data-protection keychain: find status {status}"
+            )),
         }
     }
     failed
