@@ -295,7 +295,7 @@ fn strip_xattrs(path: &Path) -> std::io::Result<()> {
         // SAFETY: as above.
         #[cfg(not(target_os = "macos"))]
         let done = unsafe { libc::lremovexattr(c_path.as_ptr(), name.as_ptr()) };
-        if done == 0 { Ok(()) } else { Err(errno()) }
+        usize::try_from(done).map(drop).map_err(|_| errno())
     };
     strip_with(&mut list, &mut remove)
 }
@@ -514,6 +514,13 @@ struct Found {
     failed: bool,
 }
 
+impl Found {
+    /// Whether nothing was printed, skipped or failed: the directory is empty.
+    fn nothing(&self) -> bool {
+        !(self.printed | self.protected | self.failed)
+    }
+}
+
 fn left_below(dir: &Path, out: &mut dyn Write, err: &mut dyn Write, code: &mut i32) -> Found {
     let mut found = Found::default();
     let names = match std::fs::read_dir(dir).and_then(|names| {
@@ -548,7 +555,7 @@ fn left_below(dir: &Path, out: &mut dyn Write, err: &mut dyn Write, code: &mut i
         found.printed |= inside.printed;
         found.protected |= inside.protected;
         found.failed |= inside.failed;
-        if !inside.printed && !inside.protected && !inside.failed {
+        if inside.nothing() {
             let _ = writeln!(out, "{}", path.display());
             found.printed = true;
         }

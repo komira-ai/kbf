@@ -617,7 +617,7 @@ async fn a_file_in_an_entry_folder_is_seen_then_cleaned() {
         let file = getconf(user, "DARWIN_USER_TEMP_DIR").join("kbf-assert-leak");
         std::fs::write(&file, b"left").expect("file");
         std::os::unix::fs::chown(&file, Some(user.uid), Some(user.gid)).expect("chown");
-        "T: entry kbf-assert-leak".to_owned()
+        "T: [\"kbf-assert-leak\"]".to_owned()
     })
     .await;
 }

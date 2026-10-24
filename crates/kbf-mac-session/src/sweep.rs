@@ -316,16 +316,7 @@ fn visit(
     (depth, park): (usize, &Park),
     swept: &mut Swept,
 ) -> io::Result<()> {
-    let stat = match examine(dir, name) {
-        // Apple's own protected caches (data vaults) refuse root without Full Disk
-        // Access even to be examined; they are not the uid's, which cannot make one.
-        Err(why) if protected_top_entry(depth, &why) => {
-            warn_once(here);
-            return Ok(());
-        }
-        other => other?,
-    };
-    let Some(stat) = stat else {
+    let Some(stat) = skip_protected_top(examine(dir, name), depth, here)? else {
         return Ok(());
     };
     // Another filesystem mounted here is never entered.
@@ -388,6 +379,13 @@ pub fn path_is_protected(path: &Path) -> bool {
     }
 }
 
+/// Whether the error `why` of an entry is a refusal of the system, this process is not
+/// root, and it cannot open the entry `name` of `dir`. Not short-circuited: the three are
+/// read together.
+fn skippable(why: &io::Error, dir: &OwnedFd, name: &OsStr) -> bool {
+    refused(why) & !rustix::process::geteuid().is_root() & cannot_open(dir, name)
+}
+
 /// `result`, with a refusal of the system taken as a success for the entry `name` of `dir`
 /// (at `here`) that this process cannot open, when the process is not root: it is skipped
 /// with one warning per path, and counted in `skipped`, so that a directory it keeps is no
@@ -399,9 +397,7 @@ fn tolerate<T: Default>(
     skipped: &std::cell::Cell<usize>,
 ) -> io::Result<T> {
     match result {
-        Err(why)
-            if refused(&why) && !rustix::process::geteuid().is_root() && cannot_open(dir, name) =>
-        {
+        Err(why) if skippable(&why, dir, name) => {
             warn_once(here);
             skipped.set(skipped.get() + 1);
             Ok(T::default())
@@ -416,6 +412,24 @@ fn tolerate<T: Default>(
 /// error, still fails the sweep.
 fn protected_top_entry(depth: usize, why: &io::Error) -> bool {
     depth == 0 && why.raw_os_error() == Some(Errno::PERM.raw_os_error())
+}
+
+/// `examined`, the examination of an entry at `depth` of a swept base at `here`, with the
+/// system's refusal of a top-level entry (Apple's data vaults refuse root without Full Disk
+/// Access even to be examined; they are not the uid's, which cannot make one) taken as an
+/// entry that is not there, said once.
+fn skip_protected_top(
+    examined: io::Result<Option<Stat>>,
+    depth: usize,
+    here: &Path,
+) -> io::Result<Option<Stat>> {
+    match examined {
+        Err(why) if protected_top_entry(depth, &why) => {
+            warn_once(here);
+            Ok(None)
+        }
+        other => other,
+    }
 }
 
 /// Logs that `path` is skipped, once for each path in the process.
@@ -505,14 +519,13 @@ fn remove_present(
         )?;
     }
     drop(child);
-    match rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR) {
-        // Something the pool user may not open is inside, and stays with it.
-        Err(Errno::NOTEMPTY) if park.skipped.get() > skipped_before => {
-            park.skipped.set(park.skipped.get() + 1);
-            Ok(())
-        }
-        other => Ok(other?),
+    if park.skipped.get() > skipped_before {
+        // Something the pool user may not open is inside, and stays with it, and so does
+        // this directory (counted, for the one above it).
+        park.skipped.set(park.skipped.get() + 1);
+        return Ok(());
     }
+    Ok(rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR)?)
 }
 
 /// How deep the removal recurses before it moves what is below up to the top: it holds one

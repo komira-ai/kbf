@@ -1248,3 +1248,16 @@ fn the_empty_still_fails_naming_what_the_user_can_open_and_cannot_remove() {
         swept.errors
     );
 }
+
+/// Catches a top-level refusal that fails the sweep, and one that is skipped deeper, or
+/// when it is another error.
+#[test]
+fn only_a_top_level_refusal_of_the_examination_is_taken_as_an_entry_not_there() {
+    let denied = || Err(io::Error::from_raw_os_error(Errno::PERM.raw_os_error()));
+    let here = Path::new("/Library/Caches/com.apple.example");
+    assert!(skip_protected_top(denied(), 0, here).unwrap().is_none());
+    assert!(skip_protected_top(denied(), 1, here).is_err());
+    let other = Err(io::Error::from_raw_os_error(Errno::IO.raw_os_error()));
+    assert!(skip_protected_top(other, 0, here).is_err());
+    assert!(skip_protected_top(Ok(None), 0, here).unwrap().is_none());
+}
