@@ -68,7 +68,7 @@ fn one_apply_converges_a_fresh_mac() {
     );
     let r = check(&mac);
     assert_eq!(r.failed, 0, "{}", r.text);
-    assert!(r.text.ends_with("check: 32 pass, 0 fail\n"), "{}", r.text);
+    assert!(r.text.ends_with("check: 33 pass, 0 fail\n"), "{}", r.text);
     let sha = sha256_hex(mac.profile_text().as_bytes());
     assert_eq!(
         fs::read_to_string(mac.path(PLIST)).unwrap(),
