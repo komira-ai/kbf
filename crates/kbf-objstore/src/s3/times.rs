@@ -58,9 +58,9 @@ fn unix_millis(date: [u64; 3], clock: [u64; 3], millis: u64) -> Option<u64> {
 fn days_in_month(year: u64, month: u64) -> u64 {
     const DAYS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     // A leap year is one divisible by 4, except a century that 400 does not divide.
-    let by_four = u64::from(year % 4 == 0);
-    let by_hundred = u64::from(year % 100 == 0);
-    let by_four_hundred = u64::from(year % 400 == 0);
+    let by_four = u64::from(year.is_multiple_of(4));
+    let by_hundred = u64::from(year.is_multiple_of(100));
+    let by_four_hundred = u64::from(year.is_multiple_of(400));
     let leap = by_four + by_four_hundred - by_hundred;
     DAYS[(month - 1) as usize] + u64::from(month == 2) * leap
 }

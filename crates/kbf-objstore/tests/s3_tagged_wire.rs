@@ -150,7 +150,8 @@ async fn a_put_if_match_that_fails_is_typed() {
     let s = store(endpoint);
     let mut errors = Vec::new();
     for _ in 0..4 {
-        let put = s.put_if_match(&key(), Bytes::from("abc"), "\"old\"");
+        let k = key();
+        let put = s.put_if_match(&k, Bytes::from("abc"), "\"old\"");
         errors.push(put.await.unwrap_err());
     }
     assert_eq!(service(&errors[0]), (412, "PreconditionFailed"));
@@ -280,7 +281,8 @@ async fn reads_are_sent_again_after_a_transport_failure_and_a_replace_is_not() {
 
     let (endpoint, seen) = script(vec![String::new()]).await;
     let s = store(endpoint);
-    let put = s.put_if_match(&key(), Bytes::from("x"), "\"t\"");
+    let k = key();
+    let put = s.put_if_match(&k, Bytes::from("x"), "\"t\"");
     let err = put.await.unwrap_err();
     assert!(matches!(err, ObjectStoreError::Transport(_)), "{err}");
     assert_eq!(seen.lock().unwrap().len(), 1);
