@@ -3,8 +3,11 @@
 //! Two clones of the base boot at once, one headless and one (with `--graphics`) with a
 //! graphics device. For the whole guest wait the host records every helper event with
 //! its time, samples the helper's CPU, the framework's VM service processes and the
-//! clone's disk allocation, and watches for the marker a launch daemon of the guest
-//! writes into the share. With `--keep` the clones stay, and `image harvest` then reads
+//! clone's disk allocation, and watches for the frames the launch daemons of the guest
+//! deliver over vsock (two ready markers, two probe answers and the share diagnosis; the
+//! report gives the time of each and lists the missing ones, and the first to arrive is the
+//! guest marker). The run ends when every frame has come or the guest wait is over, and the
+//! guests are then asked to shut down before they are force-stopped. With `--keep` the clones stay, and `image harvest` then reads
 //! the guest's own logs off their disks. `docs/spikes/macos-vm-probe.md` maps each
 //! outcome to a cause.
 
@@ -17,7 +20,7 @@ use crate::bundle::{self, Identity};
 use crate::gates::{Channels, attach_share, base_missing, clean};
 use crate::guest::{self, Share};
 use crate::matrix::{self, Prepared};
-use crate::probe::{Ctx, Vm};
+use crate::probe::{Ctx, StopKind, Vm};
 use crate::report::Report;
 use crate::sampler::{self, Sample};
 use crate::spec::VmSpec;
@@ -31,12 +34,47 @@ struct Arm {
     /// The matrix shares of this VM (empty without `--matrix`).
     matrix: Vec<Prepared>,
     samples: Vec<Sample>,
-    marker_ms: Option<u64>,
+    /// Every expected frame that has arrived, with the host time it was first seen at, in
+    /// arrival order. The first is the guest marker.
+    frames: Vec<(&'static str, u64)>,
+    /// How the VM ended when the host stopped it, and how long that took.
+    stop: Option<(StopKind, u64)>,
 }
 
+/// Every frame a healthy guest delivers over vsock: the system and login markers, the
+/// two probe answers and the share diagnosis. A run waits for all of them, within the
+/// guest timeout, and reports the ones that never came.
+const EXPECTED: [&str; 5] = [
+    guest::READY_SYSTEM,
+    guest::READY_LOGIN,
+    guest::ROOT_RESULT,
+    guest::USER_RESULT,
+    kbf_guest::diag::REPORT_NAME,
+];
+
 impl Arm {
-    fn marker(&self) -> PathBuf {
-        self.share.results().join(guest::READY_SYSTEM)
+    /// Records the expected frames that are in the directory the host received them in and
+    /// not yet seen, at host time `ms`. The share is not looked at: a file the guest puts
+    /// there is not a frame it sent over vsock, and a guest can write anything to it.
+    fn look(&mut self, ms: u64) {
+        let dir = &self.share.received;
+        for name in EXPECTED {
+            let seen = self.frames.iter().any(|(n, _)| *n == name);
+            if !seen && std::fs::symlink_metadata(dir.join(name)).is_ok() {
+                self.frames.push((name, ms));
+            }
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.frames.len() == EXPECTED.len()
+    }
+
+    fn missing(&self) -> Vec<&'static str> {
+        EXPECTED
+            .into_iter()
+            .filter(|n| !self.frames.iter().any(|(f, _)| f == n))
+            .collect()
     }
 }
 
@@ -55,7 +93,7 @@ fn names(dir: &Path) -> Vec<String> {
 
 /// Removes the share directories of `name` (a start that failed leaves them).
 fn remove_shares(ctx: &Ctx<'_>, name: &str) {
-    for suffix in ["-share", "-tagged"] {
+    for suffix in ["-share", "-tagged", "-results"] {
         let _ = std::fs::remove_dir_all(ctx.work.join(format!("{name}{suffix}")));
     }
 }
@@ -73,7 +111,7 @@ fn start_arm(ctx: &Ctx<'_>, name: &str, graphics: bool) -> Result<(Vm, Arm), Str
             name,
             Identity::Keep,
             |spec: &mut VmSpec| {
-                attach_share(spec, &share, Channels::NONE);
+                attach_share(spec, &share, Channels::VSOCK);
                 matrix::attach(spec, &shares);
                 spec.graphics = graphics;
             },
@@ -97,7 +135,8 @@ fn start_arm(ctx: &Ctx<'_>, name: &str, graphics: bool) -> Result<(Vm, Arm), Str
             share,
             matrix: shares,
             samples: Vec::new(),
-            marker_ms: None,
+            frames: Vec::new(),
+            stop: None,
         },
     ))
 }
@@ -117,8 +156,8 @@ fn sample_all(ctx: &Ctx<'_>, vms: &[Vm], arms: &mut [Arm]) -> Option<String> {
     error
 }
 
-/// Watches both guests until each has written its marker or ended, or the guest wait is
-/// over; samples on a fixed beat, once at the start and once at the end.
+/// Watches both guests until each has delivered every expected frame or ended, or the
+/// guest wait is over; samples on a fixed beat, once at the start and once at the end.
 fn observe(ctx: &Ctx<'_>, vms: &mut [Vm], arms: &mut [Arm]) -> Option<String> {
     let began = Instant::now();
     let mut next = Duration::ZERO;
@@ -129,26 +168,41 @@ fn observe(ctx: &Ctx<'_>, vms: &mut [Vm], arms: &mut [Arm]) -> Option<String> {
             next += ctx.timing.sample_every;
         }
         for (vm, arm) in vms.iter_mut().zip(arms.iter_mut()) {
-            if arm.marker_ms.is_some() {
+            if arm.complete() {
                 continue;
             }
             if vm.ended.is_none() {
                 vm.watch(ctx.timing.tick, ctx.timing.tick, false);
             }
-            // Existence only, without following a link the guest may have left.
-            if std::fs::symlink_metadata(arm.marker()).is_ok() {
-                arm.marker_ms = Some(vm.ms());
-            }
+            arm.look(vm.ms());
         }
         let settled = vms
             .iter()
             .zip(arms.iter())
-            .all(|(vm, arm)| arm.marker_ms.is_some() || vm.ended.is_some());
+            .all(|(vm, arm)| arm.complete() || vm.ended.is_some());
         if settled || began.elapsed() >= ctx.timing.guest_timeout {
             break;
         }
     }
     sample_all(ctx, vms, arms).or(table_error)
+}
+
+/// Asks every guest to shut down at once, then gives each up to the shutdown timeout, so
+/// that a guest's disk is flushed before the clone is harvested; a guest that does not
+/// obey is force-stopped. The helper's request is `requestStopWithError` (the guest's
+/// power-button request), not the framework's force stop.
+fn stop_gracefully(ctx: &Ctx<'_>, vms: &mut [Vm], arms: &mut [Arm]) {
+    for vm in vms.iter_mut().filter(|vm| vm.ended.is_none()) {
+        vm.request_shutdown();
+    }
+    for (vm, arm) in vms.iter_mut().zip(arms.iter_mut()) {
+        if vm.ended.is_some() {
+            continue;
+        }
+        let asked = vm.ms();
+        let how = vm.finish_shutdown(&ctx.timing);
+        arm.stop = Some((how, vm.ms().saturating_sub(asked)));
+    }
 }
 
 fn arm_json(ctx: &Ctx<'_>, vm: &Vm, arm: &Arm) -> Value {
@@ -159,11 +213,16 @@ fn arm_json(ctx: &Ctx<'_>, vm: &Vm, arm: &Arm) -> Value {
         "share": arm.share.dir,
         "started_ms": vm.started_ms(),
         "stayed_up": vm.started_ms().is_some() && vm.ended.is_none(),
-        "guest_marker_ms": arm.marker_ms,
+        "guest_marker": arm.frames.first().map(|(name, _)| *name),
+        "guest_marker_ms": arm.frames.first().map(|(_, ms)| *ms),
+        "frames": arm.frames.iter().map(|(n, ms)| json!({"name": n, "ms": ms})).collect::<Vec<_>>(),
+        "frames_missing": arm.missing(),
+        "stop": arm.stop.map(|(how, ms)| json!({"how": how.name(), "ms": ms})),
         "trace": vm.trace_json(),
         "samples": arm.samples.iter().map(Sample::json).collect::<Vec<_>>(),
         "activity": sampler::summarize(&arm.samples),
-        "results_files": names(&arm.share.results()),
+        "results_files": names(&arm.share.received),
+        "share_files": names(&arm.share.results()),
         "matrix_host": matrix::host_listing(&arm.matrix),
         "helper_log": vm.proc.diagnostics(),
         "harvest": format!(
@@ -177,7 +236,7 @@ fn arm_json(ctx: &Ctx<'_>, vm: &Vm, arm: &Arm) -> Value {
 
 fn one_line(arm: &Value) -> String {
     format!(
-        "{} ({}): started {}, guest marker {}, disk blocks grown {}, ended {}",
+        "{} ({}): started {}, guest marker {}, frames missing {}, disk blocks grown {}, ended {}",
         arm["name"].as_str().unwrap_or_default(),
         if arm["graphics"] == json!(true) {
             "graphics"
@@ -185,7 +244,11 @@ fn one_line(arm: &Value) -> String {
             "headless"
         },
         arm["started_ms"],
-        arm["guest_marker_ms"],
+        match arm["guest_marker"].as_str() {
+            Some(name) => format!("{name} at {}", arm["guest_marker_ms"]),
+            None => "none".to_owned(),
+        },
+        arm["frames_missing"],
         arm["activity"]["disk_blocks_512_grown"],
         arm["trace"]["ended"],
     )
@@ -225,6 +288,7 @@ pub fn e1(ctx: &Ctx<'_>) -> Report {
         }
     }
     let table_error = observe(ctx, &mut vms, &mut arms);
+    stop_gracefully(ctx, &mut vms, &mut arms);
     let arm_reports: Vec<Value> = vms
         .iter()
         .zip(&arms)
@@ -271,6 +335,13 @@ mod tests {
         c
     }
 
+    /// A booted guest that has already delivered every expected frame.
+    fn complete_guest() -> Script {
+        EXPECTED
+            .into_iter()
+            .fold(Script::booted(), |s, f| s.with_guest_file(f, "{}"))
+    }
+
     fn arm(r: &Report, i: usize) -> &Value {
         &r.details["arms"][i]
     }
@@ -314,6 +385,22 @@ mod tests {
         assert!(sys.starts.borrow().iter().all(|(s, _)| !s.graphics));
     }
 
+    /// Catches an E1 whose guests cannot send their markers over vsock: each arm gets the
+    /// vsock listener and a results directory that is its own share's `results/`, so the
+    /// marker the guest sends lands where the host looks for it.
+    #[test]
+    fn each_arm_gets_its_own_results_directory_behind_the_vsock_listener() {
+        let work = work_with_base("e1-vsock");
+        let sys = FakeSystem::new();
+        let r = e1(&guest_ctx(&sys, &work));
+        assert_eq!(r.status, Status::Ok, "{r:?}");
+        let starts = sys.starts.borrow();
+        for (spec, name) in starts.iter().map(|(s, _)| s).zip(["e1-x", "e1-y"]) {
+            assert_eq!(spec.vsock_ports, [crate::guest::VSOCK_PORT]);
+            assert_eq!(spec.results_dir, Some(work.join(format!("{name}-results"))));
+        }
+    }
+
     /// Catches a report that drops the helper's events or their times: a silent guest must
     /// still show its started event and the beat of samples, with disk and CPU read.
     #[test]
@@ -353,7 +440,7 @@ mod tests {
         let work = work_with_base("e1-stopped");
         let sys = FakeSystem::new();
         sys.script(Script::booted().then(Poll::Event(Event::Stopped { ms: 7 })));
-        sys.script(Script::booted().with_guest_file(guest::READY_SYSTEM, "{}"));
+        sys.script(complete_guest());
         let mut c = guest_ctx(&sys, &work);
         c.timing.guest_timeout = Duration::from_secs(60);
         let began = Instant::now();
@@ -369,8 +456,178 @@ mod tests {
         assert!(x["guest_marker_ms"].is_null());
         let y = arm(&r, 1);
         assert!(y["guest_marker_ms"].is_u64());
-        assert_eq!(y["results_files"], json!([guest::READY_SYSTEM]));
+        assert_eq!(y["results_files"].as_array().map(Vec::len), Some(5));
         assert!(r.summary.expect("summary").contains("the VM stopped"));
+    }
+
+    /// Catches a guest marker that rests on the system job alone: the fifth Studio run had
+    /// a headless guest deliver the login marker and both probe results while its system
+    /// job never started, and the arm was reported silent. Any frame the guest delivers
+    /// proves its userspace ran, and the report names which one arrived first.
+    #[test]
+    fn any_frame_the_guest_delivers_is_its_marker_and_the_report_names_it() {
+        let work = work_with_base("e1-any-marker");
+        let sys = FakeSystem::new();
+        sys.script(Script::booted().with_guest_file(guest::READY_LOGIN, "{}"));
+        sys.script(Script::booted().with_guest_file(guest::USER_RESULT, "{}"));
+        let r = e1(&guest_ctx(&sys, &work));
+        assert_eq!(arm(&r, 0)["guest_marker"], guest::READY_LOGIN);
+        assert!(arm(&r, 0)["guest_marker_ms"].is_u64());
+        assert_eq!(arm(&r, 1)["guest_marker"], guest::USER_RESULT);
+        assert!(arm(&r, 1)["guest_marker_ms"].is_u64());
+        let summary = r.summary.expect("summary");
+        assert!(summary.contains("marker ready-login"), "{summary}");
+        assert!(
+            summary.contains("marker guest-probe-user.json"),
+            "{summary}"
+        );
+        let work = work_with_base("e1-other-file");
+        let sys = FakeSystem::new();
+        sys.script(Script::booted().with_guest_file("vsock-test.log", "x"));
+        let r = e1(&guest_ctx(&sys, &work));
+        assert!(arm(&r, 0)["guest_marker"].is_null());
+        assert!(arm(&r, 0)["guest_marker_ms"].is_null());
+    }
+
+    /// Catches a run that stops at the first frame, as run 6 did (three samples, then the
+    /// VMs were stopped before the root probe, the login marker and the diagnosis came):
+    /// the later frames arrive on their own polls, the run waits for them, and each is
+    /// reported in arrival order with a time that does not go back, none missing.
+    #[test]
+    fn the_run_waits_for_every_frame_and_reports_the_time_of_each() {
+        let work = work_with_base("e1-all-frames");
+        let sys = FakeSystem::new();
+        let guest = || {
+            [
+                (guest::READY_LOGIN, 20),
+                (guest::ROOT_RESULT, 40),
+                (guest::USER_RESULT, 60),
+                (kbf_guest::diag::REPORT_NAME, 80),
+            ]
+            .into_iter()
+            .fold(
+                Script::booted().with_guest_file(guest::READY_SYSTEM, "{}"),
+                |s, (name, after)| s.delivering_after(after, name, "{}"),
+            )
+        };
+        sys.script(guest());
+        sys.script(guest());
+        let mut c = guest_ctx(&sys, &work);
+        // Long enough never to be the reason the run ends; the frames end it.
+        c.timing.guest_timeout = Duration::from_secs(600);
+        let r = e1(&c);
+        for i in 0..2 {
+            let a = arm(&r, i);
+            assert_eq!(a["frames_missing"], json!([]));
+            let names: Vec<&str> = a["frames"]
+                .as_array()
+                .expect("frames")
+                .iter()
+                .map(|f| f["name"].as_str().expect("name"))
+                .collect();
+            assert_eq!(
+                names,
+                [
+                    guest::READY_SYSTEM,
+                    guest::READY_LOGIN,
+                    guest::ROOT_RESULT,
+                    guest::USER_RESULT,
+                    kbf_guest::diag::REPORT_NAME
+                ]
+            );
+            let times: Vec<u64> = a["frames"]
+                .as_array()
+                .expect("frames")
+                .iter()
+                .map(|f| f["ms"].as_u64().expect("ms"))
+                .collect();
+            assert!(times.windows(2).all(|w| w[0] <= w[1]), "{times:?}");
+            assert_eq!(a["guest_marker"], guest::READY_SYSTEM);
+        }
+        let summary = r.summary.expect("summary");
+        assert!(summary.contains("frames missing []"), "{summary}");
+    }
+
+    /// Catches a guest that fakes frames: a file the guest puts in the share is not a frame
+    /// it sent over vsock (the share is the guest's to write), so it is not counted, is
+    /// still listed as missing, and is shown apart from what was received.
+    #[test]
+    fn files_a_guest_puts_in_the_share_are_not_frames() {
+        let work = work_with_base("e1-spoof");
+        let sys = FakeSystem::new();
+        let mut spoof = Script::booted();
+        for f in EXPECTED {
+            spoof = spoof.with_share_file(f, "{}");
+        }
+        sys.script(spoof);
+        sys.script(Script::booted().with_guest_file(guest::READY_LOGIN, "{}"));
+        let r = e1(&guest_ctx(&sys, &work));
+        let x = arm(&r, 0);
+        assert!(x["guest_marker"].is_null());
+        assert_eq!(x["frames"], json!([]));
+        assert_eq!(x["frames_missing"].as_array().map(Vec::len), Some(5));
+        assert_eq!(x["results_files"], json!([]));
+        assert_eq!(x["share_files"].as_array().map(Vec::len), Some(5));
+        let y = arm(&r, 1);
+        assert_eq!(y["guest_marker"], guest::READY_LOGIN);
+        assert_eq!(y["share_files"], json!([]));
+    }
+
+    /// Catches a report that hides what did not arrive: the frames that never came are
+    /// listed by name, in the order they are expected, and the ones that came are not.
+    #[test]
+    fn the_frames_that_never_came_are_listed_by_name() {
+        let work = work_with_base("e1-missing");
+        let sys = FakeSystem::new();
+        sys.script(
+            Script::booted()
+                .with_guest_file(guest::READY_SYSTEM, "{}")
+                .with_guest_file(guest::USER_RESULT, "{}"),
+        );
+        let r = e1(&guest_ctx(&sys, &work));
+        assert_eq!(
+            arm(&r, 0)["frames_missing"],
+            json!([
+                guest::READY_LOGIN,
+                guest::ROOT_RESULT,
+                kbf_guest::diag::REPORT_NAME
+            ])
+        );
+        assert_eq!(
+            arm(&r, 1)["frames_missing"].as_array().map(Vec::len),
+            Some(5)
+        );
+        let summary = r.summary.expect("summary");
+        assert!(summary.contains("ready-login"), "{summary}");
+    }
+
+    /// Catches a stop that is only a force stop, which leaves the guest's disk unflushed
+    /// (run 6: every guest log empty in the harvest). The guest is asked to shut down
+    /// first and the report says how each VM ended: shut down, force-stopped after it
+    /// ignored the request, or killed when the helper would not exit either; a VM that had
+    /// already ended is not asked.
+    #[test]
+    fn the_guests_are_asked_to_shut_down_before_they_are_forced() {
+        let work = work_with_base("e1-shutdown");
+        let sys = FakeSystem::new();
+        sys.script(Script::booted());
+        sys.script(Script::booted().deaf());
+        let r = e1(&guest_ctx(&sys, &work));
+        assert_eq!(arm(&r, 0)["stop"]["how"], "guest shut down");
+        assert_eq!(
+            arm(&r, 1)["stop"]["how"],
+            "force-stopped after the guest did not shut down"
+        );
+        assert!(arm(&r, 1)["stop"]["ms"].is_u64());
+        let work = work_with_base("e1-shutdown-kill");
+        let sys = FakeSystem::new();
+        let mut stuck = Script::booted().deaf();
+        stuck.exits_on_stop = false;
+        sys.script(stuck);
+        sys.script(Script::booted().then(Poll::Event(Event::Stopped { ms: 7 })));
+        let r = e1(&guest_ctx(&sys, &work));
+        assert_eq!(arm(&r, 0)["stop"]["how"], "helper killed");
+        assert!(arm(&r, 1)["stop"].is_null());
     }
 
     /// Catches an arm that has already written its marker being watched (and its helper
@@ -381,10 +638,14 @@ mod tests {
         let work = work_with_base("e1-one-silent");
         let sys = FakeSystem::new();
         sys.script(Script::booted());
-        sys.script(Script::booted().with_guest_file(guest::READY_SYSTEM, "{}"));
-        let r = e1(&guest_ctx(&sys, &work));
+        sys.script(complete_guest());
+        let mut c = guest_ctx(&sys, &work);
+        // Several rounds with the second arm already complete.
+        c.timing.guest_timeout = Duration::from_millis(200);
+        let r = e1(&c);
         assert!(arm(&r, 0)["guest_marker_ms"].is_null());
         assert!(arm(&r, 1)["guest_marker_ms"].is_u64());
+        assert_eq!(arm(&r, 1)["frames_missing"], json!([]));
         assert_eq!(arm(&r, 0)["stayed_up"], true);
         let work = work_with_base("e1-never-started");
         let sys = FakeSystem::new();

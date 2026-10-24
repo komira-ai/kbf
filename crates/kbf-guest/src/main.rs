@@ -19,6 +19,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use kbf_guest::diag;
+use kbf_guest::frame::Kind;
 use kbf_guest::mount;
 use kbf_guest::probe;
 use kbf_guest::server::{Agent, Config, HELLO_TIMEOUT};
@@ -119,8 +120,12 @@ fn run_with(
                 ExitCode::FAILURE
             }
         },
-        Cmd::ProbeGuest(args) => probe_cmd(host, &args.out, |h| probe::probe_guest(h, &args)),
-        Cmd::ProbeReady(args) => probe_cmd(host, &args.out, |h| probe::probe_ready(h, &args)),
+        Cmd::ProbeGuest(args) => probe_cmd(host, &args.out, Kind::Result, args.vsock_port, |h| {
+            probe::probe_guest(h, &args)
+        }),
+        Cmd::ProbeReady(args) => probe_cmd(host, &args.out, Kind::Ready, args.vsock_port, |h| {
+            probe::probe_ready(h, &args)
+        }),
         Cmd::MountShare(args) => mount_cmd(mounter, &args),
         Cmd::ProbeDiag(args) => diag_cmd(diagnoser, &args),
     }
@@ -134,6 +139,7 @@ fn diag_cmd(diagnoser: Option<&dyn diag::DiagHost>, args: &diag::DiagArgs) -> Ex
     };
     let report = diag::diagnose(diagnoser, args);
     diag::emit(&report, &args.share, &mut std::io::stdout());
+    diag::deliver(diagnoser, args.vsock_port, &report, &mut std::io::stderr());
     ExitCode::SUCCESS
 }
 
@@ -185,22 +191,27 @@ fn real_probe_host() -> Option<Box<dyn probe::Host>> {
     None
 }
 
-/// Runs a probe against `host` and writes its answer to `out`; `None` for the host means
-/// this is not a macOS guest: refuse with 2.
+/// Runs a probe against `host` and delivers its answer as `kind`: over vsock `port` first,
+/// into `out` in the share when that fails (every attempt is logged on stderr); `None` for
+/// the host means this is not a macOS guest: refuse with 2.
 fn probe_cmd(
     host: Option<&dyn probe::Host>,
     out: &std::path::Path,
+    kind: Kind,
+    port: u32,
     run: impl FnOnce(&dyn probe::Host) -> Result<serde_json::Value, String>,
 ) -> ExitCode {
     let Some(host) = host else {
         eprintln!("kbf-guest: the probe subcommands run inside a macOS guest");
         return ExitCode::from(2);
     };
+    eprintln!("{}", probe::started_line(host, out));
     let written = run(host).and_then(|v| {
-        probe::write_result(out, &v).map_err(|e| format!("write {}: {e}", out.display()))
+        probe::deliver(host, port, kind, out, &v, &mut std::io::stderr())
+            .map_err(|e| format!("write {}: {e}", out.display()))
     });
     match written {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kbf-guest: {e}");
             ExitCode::FAILURE
@@ -273,11 +284,16 @@ mod tests {
     }
 
     fn h() -> H {
-        H(std::cell::Cell::new(false))
+        H(std::cell::Cell::new(false), false)
     }
 
-    /// A host that answers every question.
-    struct H(std::cell::Cell<bool>);
+    /// A host whose vsock acknowledges every frame.
+    fn h_acking() -> H {
+        H(std::cell::Cell::new(false), true)
+    }
+
+    /// A host that answers every question; the flag is whether its vsock works.
+    struct H(std::cell::Cell<bool>, bool);
 
     impl probe::Host for H {
         fn ids(&self) -> (u32, u32) {
@@ -294,6 +310,17 @@ mod tests {
         }
         fn vsock(&self, _: u32) -> serde_json::Value {
             serde_json::json!(null)
+        }
+        fn send_frame(
+            &self,
+            _: u32,
+            _: &kbf_guest::frame::Frame,
+        ) -> Result<(), kbf_guest::frame::SendError> {
+            if self.1 {
+                Ok(())
+            } else {
+                Err(kbf_guest::frame::SendError::Unavailable("no device".into()))
+            }
         }
         fn console(&self, _: &str) -> serde_json::Value {
             serde_json::json!(null)
@@ -316,17 +343,39 @@ mod tests {
         let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-guest-main-ok");
         let out = dir.join("r.json");
         let ok = |_: &dyn probe::Host| Ok(serde_json::json!({"k": 1}));
-        assert_eq!(probe_cmd(Some(&h()), &out, ok), ExitCode::SUCCESS);
+        let go = |host: Option<&dyn probe::Host>,
+                  out: &std::path::Path,
+                  run: fn(&dyn probe::Host) -> Result<serde_json::Value, String>| {
+            probe_cmd(host, out, Kind::Result, 5000, run)
+        };
+        assert_eq!(go(Some(&h()), &out, ok), ExitCode::SUCCESS);
         assert!(out.exists());
         assert_eq!(
-            probe_cmd(Some(&h()), &out, |_| Err("no".into())),
+            go(Some(&h()), &out, |_| Err("no".into())),
             ExitCode::FAILURE
         );
-        assert_eq!(
-            probe_cmd(Some(&h()), &dir.join("x/r.json"), ok),
-            ExitCode::FAILURE
-        );
-        assert_eq!(probe_cmd(None, &out, ok), ExitCode::from(2));
+        assert_eq!(go(Some(&h()), &dir.join("x/r.json"), ok), ExitCode::FAILURE);
+        assert_eq!(go(None, &out, ok), ExitCode::from(2));
+    }
+
+    /// Catches a probe that writes into the share although the host acknowledged its
+    /// answer over vsock (both markers and results), and one that exits non-zero then.
+    #[test]
+    fn probes_deliver_over_vsock_and_leave_the_share_alone() {
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-guest-main-vsock");
+        let refusal = || Err("kbf-guest refuses to run as root".to_owned());
+        let guest = dir.join("g.json");
+        let ready = dir.join("r.json");
+        let g = ["probe-guest", "--out", guest.to_str().expect("p")];
+        let r = ["probe-ready", "--out", ready.to_str().expect("p")];
+        for args in [&g[..], &r[..]] {
+            assert_eq!(
+                run_with(cli(args), refusal(), Some(&h_acking()), None, None),
+                ExitCode::SUCCESS
+            );
+        }
+        assert!(!guest.exists());
+        assert!(!ready.exists());
     }
 
     /// Catches a probe subcommand refused as root (it must run as any user: the root
@@ -416,6 +465,9 @@ mod tests {
             true
         }
         fn pause(&self, _: std::time::Duration) {}
+        fn vsock_round_trip(&self, _: u32) -> serde_json::Value {
+            serde_json::json!(null)
+        }
         fn mount_cycle(
             &self,
             _: &str,
@@ -423,6 +475,13 @@ mod tests {
             _: &dyn Fn(&std::path::Path) -> serde_json::Value,
         ) -> serde_json::Value {
             serde_json::json!(null)
+        }
+        fn send_frame(
+            &self,
+            _: u32,
+            _: &kbf_guest::frame::Frame,
+        ) -> Result<(), kbf_guest::frame::SendError> {
+            Ok(())
         }
     }
 

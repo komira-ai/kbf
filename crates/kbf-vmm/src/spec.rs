@@ -42,6 +42,11 @@ pub struct VmSpec {
     pub vsock_ports: Vec<u32>,
     /// Console port names; bytes the guest writes to one are an [`Event::Console`].
     pub console_ports: Vec<String>,
+    /// When set, the frames a guest sends on the vsock ports are written into this
+    /// directory (`sink`): the host's results directory, where the probes look for files.
+    /// Without it a connection is only counted and closed.
+    #[serde(default)]
+    pub results_dir: Option<PathBuf>,
 }
 
 impl VmSpec {
@@ -57,6 +62,7 @@ impl VmSpec {
             tagged: Vec::new(),
             vsock_ports: Vec::new(),
             console_ports: Vec::new(),
+            results_dir: None,
         }
     }
 }
@@ -75,7 +81,8 @@ pub enum Event {
     Vsock { port: u32 },
     /// The guest wrote `text` to a console port.
     Console { port: String, text: String },
-    /// The VM stopped after the parent closed the helper's stdin.
+    /// The VM stopped: the guest shut down after a shutdown request, or the parent closed
+    /// the helper's stdin and the VM was force-stopped.
     Stopped { ms: u64 },
     /// A call failed. `code` is the Virtualization.framework error code name when there is
     /// one (`VirtualMachineLimitExceeded`).
@@ -101,6 +108,10 @@ impl Event {
         serde_json::from_str(line).map_err(|e| format!("not a helper event ({e}): {line}"))
     }
 }
+
+/// The line the parent writes to the helper's stdin to ask the guest to shut down (the
+/// helper then waits for the guest to stop). Closing the stdin instead force-stops the VM.
+pub const SHUTDOWN_COMMAND: &str = "shutdown";
 
 /// The error code name the helper uses when a start is refused for the two-guest limit.
 pub const LIMIT_EXCEEDED: &str = "VirtualMachineLimitExceeded";
@@ -146,6 +157,17 @@ mod tests {
         assert!(Event::parse(r#"{"event":"unknown"}"#).is_err());
     }
 
+    /// Catches a spec file written before `results_dir` existed no longer loading, and a
+    /// default that attaches a sink nobody asked for.
+    #[test]
+    fn a_spec_without_a_results_dir_still_loads_with_none() {
+        let text = serde_json::to_string(&VmSpec::minimal("/b".into())).expect("json");
+        let mut v: serde_json::Value = serde_json::from_str(&text).expect("value");
+        v.as_object_mut().expect("object").remove("results_dir");
+        let s: VmSpec = serde_json::from_value(v).expect("old spec");
+        assert_eq!(s.results_dir, None);
+    }
+
     /// Catches a spec that loses a field on its way to the helper's file.
     #[test]
     fn a_spec_round_trips_through_json() {
@@ -168,6 +190,7 @@ mod tests {
         ];
         s.vsock_ports = vec![5000];
         s.console_ports = vec!["kbf.probe".into()];
+        s.results_dir = Some("/share/results".into());
         let text = serde_json::to_string(&s).expect("json");
         assert_eq!(serde_json::from_str::<VmSpec>(&text).expect("parse"), s);
     }

@@ -86,8 +86,10 @@ Each probe VM has a graphics device unless `--headless` is given (a headless gue
 crash-loops its window server, see E1). `probe e1` keeps its first arm headless either
 way, as the comparison.
 
-Without the daemons, or if the guest cannot mount the share or write into it, the probes
-that need code running in the guest report `needs-manual` and list the possible causes.
+Without the daemons the probes that need code running in the guest report `needs-manual`
+and list the possible causes. The guest's answers and markers do not need the share: they
+travel over virtio-socket into a directory only the host can write (see "How results reach
+the host").
 
 G1 judges a clone booted by the framework's running state held for 20 seconds. With
 `--guest-binary` and the daemons in the base it also waits for each clone to write the
@@ -133,8 +135,9 @@ with a graphics device (the default; `--headless` removes it from the second arm
 every helper event with its arrival time, samples every 10 seconds the helper's CPU
 time, the CPU time of every `com.apple.Virtualization.VirtualMachine` service process
 (the one whose CPU rises belongs to the guest that executes) and the clone's `disk.img`
-allocation, and looks for the system marker. A stop or error event ends that arm's wait at
-once and is reported. `--keep` leaves both clones and their shares in the work directory.
+allocation, and waits for the frames the guest sends over virtio-socket (see "How results
+reach the host", below). A stop or error event ends that arm's wait at once and is
+reported. `--keep` leaves both clones and their shares in the work directory.
 Then `image harvest` reads the guest's own logs off each kept disk.
 
 Run it as the console user that ran `image base` (a root run or an ssh run has no
@@ -190,7 +193,32 @@ Read the report (`e1.json`, per arm under `details.arms`) and the harvest togeth
 holds and with the setup marker's time in `stats`. Compare the two arms: a file in one and
 not the other points at the graphics device.
 
+### How results reach the host (current)
+
+This is the design the code has now; the run sections after it are history, and each says
+where it is superseded.
+
+- The guest sends every result and marker to the host on virtio-socket port 5000 as a frame
+  (`kbf_guest::frame`): `ready` (a marker), `result` (a probe's answer, the diagnosis) and
+  `log`. The host answers each frame with `ack` or `refused`.
+- The host writes the frames into `<work dir>/<vm>-results`, a directory made `0700` before
+  the VM starts and outside every directory the guest can write to (the share is
+  `<vm>-share`). The helper opens that directory once, without following a link, and makes
+  every file through that descriptor (`openat`, `renameat`), so nothing the guest does to
+  the share can redirect a write. A VM may create at most 64 files and 64 MiB in it, a log
+  is capped at 4 MiB, a connection carries at most 256 frames, and each frame must arrive
+  within 30 seconds (a connection whose socket timeouts cannot be set is refused).
+- The probes read only that directory (E1's `frames`, G2's answer). The share is not used
+  for results. A guest that cannot reach vsock falls back to writing the file into the
+  share's `results/` directory, and E1 reports those files as `share_files`; they are not
+  counted as frames, because a guest can write anything there.
+- The guest runs `kbf-guest` from its own disk (`/usr/local/libexec/kbf-guest`), not from
+  the share, which is not mounted when launchd loads the jobs.
+
 ### E1 result, first run, and the fix
+
+> Superseded: results and markers no longer go through the share (see "How results reach
+> the host"); the diagnosis below is still the record of what the first run showed.
 
 The first run (a Mac Studio, macOS 27.0.1 guest and host) showed that both guests boot
 fully and launchd runs the offline-written plists: `com.kbf.probe.local` wrote
@@ -228,6 +256,8 @@ that the probes still report whether it is usable. The mount is run from a copy 
 share is mounted; and `kbf-guest mount-share` refuses the automount tag.
 
 ### E1 result, second run: the share mounts, every write into it is refused
+
+> History: the share is no longer a results channel.
 
 With the own-tag mount, `com.kbf.probe.mount.log` is empty in both clones and `kbf-guest`
 runs from the share (`com.kbf.probe.root.log` is written), so the guest reaches userspace
@@ -277,6 +307,8 @@ unmounts it with the system call, reporting the errno of each. Read it like this
 | everything ok in the diagnosis but `com.kbf.probe.root.log` still shows the refusal | the refusal is specific to the binary running from the share (the process is located on the volume it writes to) |
 
 ### E1 result, third run: nothing can be created in any share
+
+> History: the share is no longer a results channel.
 
 `probe-diag` settled the guest side. The first step of every write fails: `create`, with
 `EPERM`, for root (uid 0, all groups), in the share root `/private/var/kbf-mnt`, in
@@ -334,6 +366,175 @@ Read `matrix` in `<harvest>/private/var/log/kbf-probe-diag` (one row per share, 
 | a row fails in the guest but its file is listed in `matrix_host` | the write reached the host and the guest was told it failed |
 | `other-owner` works and `base` fails | the directory must not be owned by the VM's user (unlikely; re-run as root to get this row) |
 | the automount write works and the matrix rows fail | use the automount path for results (it needs a user session or the system's own mount; see `automount` in the guest's probe result) |
+
+### E1 result, fourth run: no file can be read or written on a share, so results go over vsock
+
+Four runs on a Mac Studio (host and guest on macOS 27.0.1) gave one answer: the guest boots,
+launchd runs the daemons written offline, and the share mounts, but inside the guest every
+file read or write on a virtiofs share fails with `EPERM`, for root and for `nobody`
+(in the fourth run the guest could not even read `matrix.json`). Listing a directory works
+and files show as owned by `_unknown`. The guest's own disk is fine and the host logs no
+sandbox or TCC denial. Apple documents the share for a user logged in to the guest; the
+probe guests rest at the login window. So results and markers no longer depend on the share:
+
+- the host attaches a virtio socket device and listens on port 5000 (`VmSpec.vsock_ports`,
+  `VmSpec.results_dir`); `src/sink.rs` writes each frame it receives into the VM's
+  host-only results directory (`<vm>-results`; the first version of this change wrote into
+  the share's `results/`, which a guest could redirect with a link, and that is superseded,
+  see "How results reach the host") under the name the probes wait for;
+- `kbf-guest probe-guest` and `probe-ready` send their answer first as a frame
+  (`kbf_guest::frame`: a four-byte big-endian length, then JSON `{"kind", "name", "body"}`
+  with `kind` one of `ready`, `result`, `log`; the host answers `ack` or `refused`) and
+  write the file into the share only when vsock cannot be used. Each attempt, up to five two
+  seconds apart, and each failure is logged to the daemon's log;
+- `probe-diag` reports `vsock`: whether the guest connected and whether a `log` frame named
+  `vsock-test` came back acknowledged.
+
+What to read in the next E1 run:
+
+| where | line | meaning |
+|---|---|---|
+| `e1.json`, each arm | `guest_marker_ms` is a number and `results_files` lists `ready-system`, `ready-login`, `guest-probe-root.json`, `guest-probe-user.json`, `vsock-test.log` | the vsock route works end to end |
+| `e1.json`, each arm | `helper_log` has `kbf-vmm: vsock Ready ready-system -> .../results/ready-system` | the host received and wrote the frame |
+| `<harvest>/private/var/log/kbf-probe-diag` | `"vsock": {"connected": true, "round_trip": true}` | the guest reached the host and got an acknowledgement |
+| same | `"connected": false` with `"stage": "socket"` and an `errno` | the guest kernel has no vsock socket family for processes (`EAFNOSUPPORT`, 47): the premise of this change is wrong and a different channel is needed |
+| same | `"stage": "connect"` | the family exists but nothing accepted: look at the listener (`helper_log` has no `vsock port` line) and at whether the VM has a socket device |
+| same | `"connected": true`, `"round_trip": false` | the host received the connection and the frames were not answered; the `error` says which side |
+| `com.kbf.probe.system.log` in the harvest (`/private/var/tmp`, the log directory of the daemons that run as `nobody`) | `vsock port 5000: ready-system delivered on attempt N` | the guest used vsock; `vsock not usable ... writing ... instead` means it fell back to the share |
+
+The macOS socket family (`AF_VSOCK`, 40) and the address layout (`struct sockaddr_vm` with a
+length byte, as in the macOS SDK) are taken from the SDK headers and have not run in a macOS
+guest yet; the host's use of the connection's descriptor as an ordinary stream socket is
+Apple-undocumented. Both are what this run answers.
+
+### E1 result, fifth run: vsock works on a Studio; the headless guest's system job never started
+
+The fifth run (results under `<work dir>/e1-run-b5/results/`) proved the vsock route on a
+Mac Studio, host and guest on macOS 27.0.1:
+
+- both arms delivered `ready-login`, `guest-probe-root.json`, `guest-probe-user.json` and
+  `vsock-test` over vsock, each "on attempt 1" in the daemons' logs; the helper logs show
+  every frame stored (`kbf-vmm: vsock Ready ...`, `Result ...`, `Log vsock-test ...`);
+- `probe-diag` in both guests reports `"vsock": {"connected": true, "round_trip": true}`, so
+  the guest kernel has the socket family, the address layout is right and the host's use of
+  the connection's descriptor as a stream socket works;
+- file operations on the share still fail with `EPERM` in the guest (`matrix.json` and the
+  second mount's create), which is why the results no longer use it;
+- the graphics arm also delivered `ready-system`, with its guest marker at 15821 ms.
+
+The headless arm never sent `ready-system`: `e1.json` has `guest_marker_ms` null for it
+although its other four jobs ran. Its `com.kbf.probe.system.log` exists and is empty.
+
+Cause. The five probe jobs ran `kbf-guest` from the share (`/private/var/kbf-mnt/kbf-guest`),
+which exists only after the mount daemon has mounted the share; the plists have
+`RunAtLoad` and nothing that waits for the mount, and the daemons' `--wait-path` only
+starts after the program has been executed. launchd checks the program path when it loads a
+job. The headless guest's unified log (`private/var/db/diagnostics`, read with `strings`)
+holds, next to the `com.kbf.probe.system` and `com.kbf.probe.login` jobs, `Service could not
+initialize: access(/private/var/kbf-mnt/kbf-guest, X_OK) failed with errno 2 - No such file
+or directory` and `Could not find and/or execute program specified by service: 2: No such
+file or directory: /private/var/kbf-mnt/kbf-guest`. The graphics arm's log has the same
+`Could not find and/or execute` line for the login job, and that job delivered later, so
+launchd sometimes starts such a job again and sometimes does not; the system job on the
+headless arm was the one that did not. An empty log file is what a job that launchd
+could not execute leaves: launchd creates the file, the program never runs. The text of the
+launchd message in the headless log is not tied to a label there (the strings are
+fragments), so the match to the system job rests on the empty log, the other four jobs
+having run, and the identical path; no line shows launchd giving up on that job.
+
+Fix (this change). The probe jobs run the copy of `kbf-guest` on the guest's own disk
+(`/usr/local/libexec/kbf-guest`, the one the mount daemon and `probe-diag` already use), so
+the program always exists at load; the jobs still wait for the share's `results` directory
+before they probe. Each probe also writes `kbf-guest: started, will deliver <file> (uid,
+euid, session)` to its log before it waits, so an empty log now means the job did not run.
+E1's guest marker no longer rests on the system job: the first of `ready-system`,
+`ready-login`, `guest-probe-root.json` and `guest-probe-user.json` to arrive counts, and
+`e1.json` reports which one in `guest_marker` next to `guest_marker_ms` (the summary prints
+`guest marker <name> at <ms>`). Both were chosen: the path fix removes the cause, and the
+wider marker keeps a future single failing job from reading as a silent guest.
+
+What to read in the next E1 run:
+
+| where | line | meaning |
+|---|---|---|
+| `e1.json`, each arm | `guest_marker` and a number in `guest_marker_ms` | which frame arrived first, and when; `ready-system` on both arms means the path fix worked |
+| `<harvest>/private/var/tmp/com.kbf.probe.system.log` | `kbf-guest: started, will deliver ...` then `delivered on attempt 1` | the job ran and delivered |
+| same | empty | the job still did not start: read the guest's unified log for the job's label |
+| same | `started` and nothing after | the job started and is waiting: the share's `results` directory never appeared |
+
+### E1 result, sixth run: the path fix works; E1 stopped the VMs too soon
+
+The sixth run (results under `<work dir>/e1-run-b6/results/`, the head that ran the probe
+jobs from the guest's own disk) confirmed the fix: both arms delivered `ready-system`
+(13049 ms headless, 15352 ms with graphics), and the headless arm's four job logs each show
+`started` and then `delivered on attempt 1`.
+
+The new gap was the host's. E1 ended an arm at its first frame, took three samples and
+force-stopped both VMs about 15 seconds after the first growth of the disk. The graphics
+arm had delivered only `ready-system` and `guest-probe-user.json`; its root probe, login
+marker and diagnosis had not run yet, and every guest log in both harvests but one was
+empty, because a force stop leaves the guest's disk unflushed. So the run had no vsock
+diagnosis at all.
+
+Changes:
+
+- E1 waits, per arm, for all five frames (`ready-system`, `ready-login`,
+  `guest-probe-root.json`, `guest-probe-user.json`, `kbf-probe-diag.json`) or for the end
+  of the VM or the guest timeout. `e1.json` lists each arrived frame with the host time it
+  was first seen at (`frames`), the ones that never came (`frames_missing`), and keeps
+  `guest_marker` and `guest_marker_ms` for the first. The summary line prints the missing
+  frames.
+- `probe-diag` also sends its whole report as a `result` frame named
+  `kbf-probe-diag.json` (the same five attempts as a probe's answer, no write to the share
+  on failure), so the diagnosis reaches the host's results directory without a harvest.
+- Both VMs are asked to shut down before they are stopped. The helper reads a `shutdown`
+  line on its stdin and calls `VZVirtualMachine.requestStopWithError` (the guest's
+  power-button request, not the framework's force stop); the host waits up to a minute for
+  the guest to power off and the helper to exit, then closes the helper's stdin (the force
+  stop `stopWithCompletionHandler`), then kills the helper. `e1.json` has `stop.how`
+  (`guest shut down`, `force-stopped after the guest did not shut down` or `helper
+  killed`) and `stop.ms` for each arm. Whether a macOS guest at the login window honours
+  the request is not known until a Mac runs it; `stop.how` answers it.
+
+What to read in the next E1 run:
+
+| where | line | meaning |
+|---|---|---|
+| `e1.json`, each arm | `frames_missing` is `[]` | every probe job ran; each frame's time is in `frames` |
+| same | a name in `frames_missing` | that job did not deliver within the guest timeout; its log in the harvest says whether it started |
+| `<vm>-results/kbf-probe-diag.json` (the host-only directory) | the diagnosis, including `"vsock": {"round_trip": true}` | the diagnosis arrived without the harvest |
+| `e1.json`, each arm | `stop.how` is `guest shut down` | the request worked and the harvest logs are complete |
+| same | `force-stopped ...` | the guest ignored the request; the harvest logs may be empty again |
+
+### E1 result, seventh run: the channel is complete; the guest ignores the stop request; the host side hardened
+
+The seventh run (results under `<work dir>/e1-run-b7/results/`) was green on the channel:
+both arms had `frames_missing` empty, all five frames over vsock (headless 13.07 to 14.60
+s, graphics 15.23 to 16.74 s), and the diagnosis reported `"connected": true,
+"round_trip": true`. The guest at the login window ignored `requestStopWithError` on both
+arms and was force-stopped after the 60 s wait, so the harvest logs are no longer empty
+but the guest does not shut down on request. A guest-side shutdown on the host's request
+(a clean `shutdown` run by the guest itself) is a follow-up, not part of this change.
+
+A review of the host side found that the results directory was `<share>/results`, which
+the guest can write to as root: it could rename it and put a link to any host directory in
+its place, and the host's `create_new` and `rename` followed the link (`O_NOFOLLOW` covers
+only the last path component), an arbitrary file write as the host user. Changes:
+
+- frames go to `<work dir>/<vm>-results`, `0700`, outside the share, opened once with
+  `O_DIRECTORY | O_NOFOLLOW` and written only through that descriptor (`openat`,
+  `renameat`); the sink refuses a directory that is not private;
+- E1 reads only that directory. A file a guest puts in the share is listed as
+  `share_files` and is never a frame;
+- one VM may create at most 64 files and 64 MiB, and the log cap is kept under one lock, so
+  two connections cannot pass it together;
+- each frame must arrive within 30 seconds (a read timeout alone let a guest holding a slot
+  with one byte every 29 seconds), and a connection whose socket timeouts cannot be set is
+  refused instead of read without a timeout.
+
+What to read in the next E1 run: `results_files` (the host directory) lists the frames and
+`share_files` is empty unless the vsock route failed; `frames_missing` is `[]`; a frame
+in `share_files` and not in `results_files` means the guest used the fallback.
 
 ## What to send back
 

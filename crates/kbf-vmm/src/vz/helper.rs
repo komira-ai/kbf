@@ -1,9 +1,11 @@
 //! The VM helper (`kbf-vmm vm-run`): runs one VM on its own serial dispatch queue and
 //! reports on stdout, one JSON [`Event`] per line, until its stdin closes or the guest
-//! stops. Closing stdin force-stops the VM (the guest is not asked to shut down). The main
+//! stops. The line `shutdown` on stdin asks the guest to shut down
+//! (`requestStopWithError`, the guest's power-button request); the helper then waits for
+//! the guest to stop. Closing stdin force-stops the VM. The main
 //! thread only waits on channels; it is never needed by the framework.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -14,7 +16,7 @@ use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchQueueAttr};
 use objc2::rc::Retained;
 use objc2::runtime::{Bool, NSObject, NSObjectProtocol, ProtocolObject};
-use objc2::{AnyThread, DefinedClass, define_class, msg_send};
+use objc2::{AnyThread, DefinedClass, Message, define_class, msg_send};
 use objc2_foundation::NSError;
 use objc2_virtualization::{
     VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketListener,
@@ -22,8 +24,9 @@ use objc2_virtualization::{
 };
 
 use super::config::{self, ConsoleFds};
-use super::{Queued, describe};
-use crate::spec::{Event, VmSpec};
+use super::{Queued, Shared, describe};
+use crate::sink::{self, Limiter, MAX_CONNECTIONS, Results};
+use crate::spec::{Event, SHUTDOWN_COMMAND, VmSpec};
 
 /// Prints one event line.
 fn emit(e: &Event) {
@@ -32,7 +35,16 @@ fn emit(e: &Event) {
     let _ = out.flush();
 }
 
+/// Where connections are served from: the host's results directory, opened once, and the
+/// bound on how many run at once.
+struct Sink {
+    results: Arc<Results>,
+    limiter: Limiter,
+}
+
 struct ObserverIvars {
+    /// Present when the spec asks for the guest's frames to be written to files.
+    sink: Option<Sink>,
     /// Tells the main thread the guest stopped by itself.
     done: Mutex<Sender<()>>,
     guest_stopped: Arc<AtomicBool>,
@@ -87,20 +99,61 @@ define_class!(
             connection: &VZVirtioSocketConnection,
             _device: &VZVirtioSocketDevice,
         ) -> Bool {
-            // SAFETY: `destinationPort` and `close` are plain accessors on a connection the
-            // framework keeps alive for this call.
+            // SAFETY: `destinationPort` is a plain accessor on a connection the framework
+            // keeps alive for this call.
             let port = unsafe { connection.destinationPort() };
             emit(&Event::Vsock { port });
-            // SAFETY: as above; the helper does not use the connection afterwards.
-            unsafe { connection.close() };
+            let Some(sink) = &self.ivars().sink else {
+                // SAFETY: as above; the helper does not use the connection afterwards.
+                unsafe { connection.close() };
+                return Bool::YES;
+            };
+            let Some(permit) = sink.limiter.try_acquire() else {
+                eprintln!(
+                    "kbf-vmm: vsock port {port}: refused, {MAX_CONNECTIONS} connections are open"
+                );
+                return Bool::NO;
+            };
+            // SAFETY: `fileDescriptor` is a plain accessor; the descriptor stays open for as
+            // long as the connection object lives, which `keep` below extends to the end of
+            // the serving thread.
+            let fd = unsafe { connection.fileDescriptor() };
+            // SAFETY: retaining and releasing an Objective-C object is atomic, and the
+            // thread only drops this reference (it uses the raw descriptor, never a
+            // message to the object), so releasing it on that thread is sound.
+            let keep = unsafe { Shared::new(connection.retain()) };
+            let results = sink.results.clone();
+            std::thread::spawn(move || {
+                serve_connection(fd, &results);
+                drop(keep);
+                drop(permit);
+            });
             Bool::YES
         }
     }
 );
 
+/// Answers the frames on the connection `fd` until it ends, writing them into `results`.
+/// A connection whose timeouts cannot be set is dropped unread.
+fn serve_connection(fd: RawFd, results: &Results) {
+    match sink::serve_socket(fd, results, &mut std::io::stderr()) {
+        Ok(served) => eprintln!(
+            "kbf-vmm: vsock connection ended ({:?}): {} stored, {} refused",
+            served.end, served.stored, served.refused
+        ),
+        Err(e) => eprintln!("kbf-vmm: vsock {e}"),
+    }
+}
+
 impl Observer {
-    fn new(done: Sender<()>, guest_stopped: Arc<AtomicBool>, began: Instant) -> Retained<Self> {
+    fn new(
+        done: Sender<()>,
+        guest_stopped: Arc<AtomicBool>,
+        began: Instant,
+        sink: Option<Sink>,
+    ) -> Retained<Self> {
         let this = Self::alloc().set_ivars(ObserverIvars {
+            sink,
             done: Mutex::new(done),
             guest_stopped,
             began,
@@ -149,6 +202,35 @@ fn fail(stage: &str, message: String, code: Option<String>) -> Result<(), String
     Err(message)
 }
 
+/// Asks the guest to shut down, on the VM's queue, and reports the request (or why it
+/// failed). The guest stopping is reported by the delegate.
+fn request_guest_shutdown(
+    queue: &DispatchQueue,
+    holder: &Holder,
+    ms: impl Fn() -> u64 + Send + 'static,
+) {
+    let h = holder.clone();
+    queue.exec_async(move || {
+        let Ok(slot) = h.lock() else { return };
+        let Some(running) = slot.as_ref() else { return };
+        // SAFETY: on the VM's queue, the only place the VM is touched.
+        match unsafe { running.get().vm.requestStopWithError() } {
+            Ok(()) => emit(&Event::State {
+                state: "shutdown-requested".to_owned(),
+                ms: ms(),
+            }),
+            Err(e) => {
+                let (message, code) = describe(&e);
+                emit(&Event::Error {
+                    stage: "shutdown".to_owned(),
+                    message,
+                    code,
+                });
+            }
+        }
+    });
+}
+
 /// Releases the VM, its delegate and its listeners on the VM's queue, where the framework
 /// expects every call on them, instead of on whichever thread drops the last reference.
 fn release_on_queue(queue: &DispatchQueue, holder: &Holder) {
@@ -184,6 +266,12 @@ pub fn run(spec: &VmSpec) -> Result<(), String> {
 
     let cfg = Queued::new(built.config);
     let ports = spec.vsock_ports.clone();
+    // Opened before the VM starts, without following a link; every file is made through
+    // this descriptor.
+    let results = match spec.results_dir.as_deref().map(Results::open).transpose() {
+        Ok(r) => r.map(Arc::new),
+        Err(e) => return fail("results", e, None),
+    };
     let q = queue.clone();
     let (h, gs, dtx) = (holder.clone(), guest_stopped.clone(), done_tx.clone());
     queue.exec_async(move || {
@@ -196,7 +284,11 @@ pub fn run(spec: &VmSpec) -> Result<(), String> {
                 cfg.get(),
                 &q,
             );
-            let observer = Observer::new(dtx, gs, began);
+            let sink = results.map(|results| Sink {
+                results,
+                limiter: Limiter::new(MAX_CONNECTIONS),
+            });
+            let observer = Observer::new(dtx, gs, began, sink);
             vm.setDelegate(Some(ProtocolObject::from_ref(&*observer)));
             let mut listeners = Vec::new();
             for dev in vm.socketDevices().iter() {
@@ -242,12 +334,22 @@ pub fn run(spec: &VmSpec) -> Result<(), String> {
         }
     }
 
-    // The parent closing stdin is the request to stop.
+    // The line `shutdown` asks the guest to shut down; the parent closing stdin is the
+    // request to force-stop.
     let stdin_done = done_tx;
+    let (shutdown_queue, shutdown_holder) = (queue.clone(), holder.clone());
     std::thread::spawn(move || {
-        let mut sink = [0u8; 256];
-        let mut stdin = std::io::stdin().lock();
-        while matches!(stdin.read(&mut sink), Ok(n) if n > 0) {}
+        let mut stdin = BufReader::new(std::io::stdin().lock());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if !matches!(stdin.read_line(&mut line), Ok(n) if n > 0) {
+                break;
+            }
+            if line.trim() == SHUTDOWN_COMMAND {
+                request_guest_shutdown(&shutdown_queue, &shutdown_holder, ms);
+            }
+        }
         let _ = stdin_done.send(());
     });
     let _ = done_rx.recv();

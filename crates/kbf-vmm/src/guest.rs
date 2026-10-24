@@ -38,7 +38,8 @@ pub const AUTOMOUNT_TAG: &str = "com.apple.virtio-fs.automount";
 pub const SHARE_TAG: &str = "kbfshare";
 /// Where the offline write puts a copy of `kbf-guest` on the guest's own disk (inside the
 /// Data volume, without a leading slash: [`BOOTSTRAP_OFFLINE`]). The mount daemon runs
-/// it, because the copy on the share cannot be reached before the share is mounted.
+/// it, and so does every probe daemon, because the copy on the share cannot be reached
+/// before the share is mounted (launchd checks a job's program path when it loads the job).
 pub const BOOTSTRAP: &str = "/usr/local/libexec/kbf-guest";
 const BOOTSTRAP_OFFLINE: &str = "usr/local/libexec/kbf-guest";
 /// How many times the mount daemon tries the mount, and the pause between two tries. After
@@ -86,6 +87,10 @@ pub const USER_LOG_DIR: &str = "/private/var/tmp";
 pub struct Share {
     pub dir: PathBuf,
     pub tagged: PathBuf,
+    /// Where the frames the guest sends over vsock are written: on the host, outside every
+    /// directory the guest can write to, and closed to other users (0700). Nothing in the
+    /// share can stand in for a frame, or redirect where one is written.
+    pub received: PathBuf,
 }
 
 impl Share {
@@ -98,7 +103,8 @@ impl Share {
 /// Makes fresh share directories for the VM `name`, with the results directory and, when
 /// given, the guest binary. A directory a previous run left is removed first (a symbolic
 /// link is removed, not followed). The results and tagged directories are world-writable
-/// because the guest's unprivileged daemons write into them.
+/// because the guest's unprivileged daemons write into them; the directory the host
+/// receives frames in (`received`) is private to the host.
 ///
 /// # Errors
 /// A directory or the copy could not be made.
@@ -106,8 +112,11 @@ pub fn prepare_share(ctx: &Ctx<'_>, name: &str) -> Result<Share, String> {
     let dir = ctx.work.join(format!("{name}-share"));
     let tagged = ctx.work.join(format!("{name}-tagged"));
     let results = dir.join(RESULTS);
+    let received = ctx.work.join(format!("{name}-results"));
     remove_leftover(&dir);
     remove_leftover(&tagged);
+    remove_leftover(&received);
+    make_dir(&received, 0o700)?;
     make_dir(&dir, 0o755)?;
     make_dir(&tagged, 0o777)?;
     make_dir(&results, 0o777)?;
@@ -115,7 +124,11 @@ pub fn prepare_share(ctx: &Ctx<'_>, name: &str) -> Result<Share, String> {
         copy_exclusive(bin, &dir.join(GUEST_BIN))
             .map_err(|e| format!("copy {} into the share: {e}", bin.display()))?;
     }
-    Ok(Share { dir, tagged })
+    Ok(Share {
+        dir,
+        tagged,
+        received,
+    })
 }
 
 /// Makes the new directory `path` with exactly `mode` (not reduced by the umask).
@@ -183,12 +196,13 @@ pub struct GuestRun {
     pub traffic: Value,
 }
 
-/// Waits for each of `wanted` (file names under the results directory) and reads them.
-pub fn collect(ctx: &Ctx<'_>, vm: &mut Vm, share: &Share, wanted: &[&str]) -> GuestRun {
+/// Waits for each of `wanted` (file names under `dir`: the share's results directory, or
+/// the host's `received` directory when the guest sends over vsock) and reads them.
+pub fn collect(ctx: &Ctx<'_>, vm: &mut Vm, dir: &Path, wanted: &[&str]) -> GuestRun {
     let mut results = BTreeMap::new();
     let mut missing = Vec::new();
     for name in wanted {
-        let path = share.results().join(name);
+        let path = dir.join(name);
         if vm
             .wait_file(&path, ctx.timing.guest_timeout, ctx.timing.tick)
             .is_none()
@@ -283,8 +297,11 @@ pub fn daemon_plist(
     )
 }
 
+/// The command of a probe daemon: the copy of `kbf-guest` on the guest's own disk. launchd
+/// checks the program path when it loads a job, and the share is not mounted yet then; a
+/// job whose program is on the share can fail to start and never run again.
 fn guest_args(sub: &[&str]) -> Vec<String> {
-    let mut v = vec![format!("{GUEST_SHARE}/{GUEST_BIN}")];
+    let mut v = vec![BOOTSTRAP.to_owned()];
     v.extend(sub.iter().map(|s| (*s).to_owned()));
     v
 }
@@ -575,11 +592,15 @@ mod tests {
             login.contains(READY_LOGIN)
         ]));
         assert!(files.iter().all(|f| f.mode == 0o644 || f.path == paths[2]));
-        // The daemons run the binary from, and wait for, the paths the mounter provides.
+        // The daemons wait for, and write into, the paths the mounter provides, but run
+        // the copy on the guest's own disk: launchd checks the program path when it loads
+        // a job, before the mount exists (the fifth E1 run: the headless guest's system job
+        // never started, "access(.../kbf-mnt/kbf-guest, X_OK) failed with errno 2").
         assert_eq!(GUEST_SHARE, GUEST_MOUNT);
         assert!(GUEST_RESULTS.starts_with(GUEST_MOUNT));
         for text in [&root, &user, &system, &login] {
-            assert!(text.contains(&format!("<string>{GUEST_SHARE}/{GUEST_BIN}</string>")));
+            assert!(text.contains(&format!("<string>{BOOTSTRAP}</string>")));
+            assert!(!text.contains(&format!("{GUEST_SHARE}/{GUEST_BIN}")));
             assert!(text.contains(&format!("<string>{GUEST_RESULTS}</string>")));
             assert!(text.contains(&format!("{GUEST_SHARE}/{RESULTS}/")));
             assert!(
@@ -757,6 +778,11 @@ mod tests {
         let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
         assert_eq!(mode(&share.results()), 0o777);
         assert_eq!(mode(&share.tagged), 0o777);
+        // The directory frames are received in is the host's: private, and not in the share.
+        assert_eq!(mode(&share.received), 0o700);
+        assert!(share.received.is_dir());
+        assert!(!share.received.starts_with(&share.dir));
+        assert_eq!(share.received, work.join("vm-results"));
         let bin = work.join("kbf-guest-src");
         std::fs::write(&bin, "bin").expect("bin");
         c.guest_binary = Some(bin);
@@ -847,7 +873,7 @@ mod tests {
         let run = collect(
             &c,
             &mut vm,
-            &share,
+            &share.results(),
             &["a.json", "b.json", "c.json", "d.json"],
         );
         assert_eq!(run.results["a.json"]["k"], 1);

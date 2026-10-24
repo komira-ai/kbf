@@ -30,6 +30,10 @@ pub trait VmProcess {
     fn poll(&mut self, wait: Duration) -> Poll;
     /// SIGKILL: the helper gets no chance to stop its VM.
     fn kill9(&mut self);
+    /// Asks the guest to shut down (the helper keeps running until the guest has stopped,
+    /// then exits). Without a guest that obeys, [`request_stop`](Self::request_stop) is
+    /// still needed.
+    fn request_shutdown(&mut self);
     /// Closes the helper's stdin, which makes it force-stop its VM (the guest is not asked
     /// to shut down) and exit.
     fn request_stop(&mut self);

@@ -202,6 +202,7 @@ kbf-enroll-registry = { path = "crates/kbf-enroll-registry" }
 kbf-enroll = { path = "crates/kbf-enroll" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
+kbf-guest = { path = "crates/kbf-guest" }
 kbf-gate = { path = "crates/kbf-gate" }
 kbf-harness = { path = "crates/kbf-harness" }
 kbf-history = { path = "crates/kbf-history" }

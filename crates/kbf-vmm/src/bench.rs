@@ -100,7 +100,7 @@ fn await_markers(ctx: &Ctx<'_>, vm: &mut Vm, share: &Share, t0: Instant) -> Mark
 
 /// Removes a run's directories.
 fn remove(ctx: &Ctx<'_>, name: &str) {
-    for suffix in ["", "-share", "-tagged"] {
+    for suffix in ["", "-share", "-tagged", "-results"] {
         let _ = std::fs::remove_dir_all(ctx.work.join(format!("{name}{suffix}")));
     }
 }

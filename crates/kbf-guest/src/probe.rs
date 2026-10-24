@@ -6,18 +6,30 @@
 //! included, because what each user may do is part of the answer; they write one file and
 //! run no command for the host.
 //!
+//! A probe's answer and its ready marker go to the host over virtio-socket first
+//! ([`deliver`]) and into the share only when the socket cannot be used: the first E1
+//! runs showed that no file read or write on a share works in a guest at the login
+//! window.
+//!
 //! Result keys the host reads: `mount_custom_tag.exit_code`, `automount.dir_readable`.
 
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::frame::{Frame, Kind, SendError};
+
 /// How long a probe waits for its shared folder (or the login window) to appear.
 pub const WAIT: Duration = Duration::from_secs(300);
 /// One wait step.
 pub const TICK: Duration = Duration::from_millis(500);
+
+/// How many times a frame is sent over vsock before the share is used instead.
+pub const VSOCK_ATTEMPTS: u32 = 5;
+/// The pause between two attempts.
+pub const VSOCK_RETRY: Duration = Duration::from_secs(2);
 
 /// What a probe asks of the guest; a fake in tests.
 pub trait Host {
@@ -29,6 +41,12 @@ pub trait Host {
     fn process_running(&self, name: &str) -> bool;
     /// Tries a guest-side vsock connection to the host on `port`.
     fn vsock(&self, port: u32) -> Value;
+    /// One attempt to send `frame` to the host on vsock `port` and read the host's reply:
+    /// connect, write the frame, wait for the `ack`.
+    ///
+    /// # Errors
+    /// No connection or reply ([`SendError::Unavailable`]), or the host refused the frame.
+    fn send_frame(&self, port: u32, frame: &Frame) -> Result<(), SendError>;
     /// Looks for the console port `name` and writes to every candidate device.
     fn console(&self, name: &str) -> Value;
     /// Mounts the virtiofs `tag` at `mountpoint` the way a user would.
@@ -65,6 +83,7 @@ pub struct GuestArgs {
     /// readability is part of the answer, whatever `--wait-path` is.
     #[arg(long, default_value = "/Volumes/My Shared Files/kbf")]
     pub automount_dir: PathBuf,
+    /// The vsock port the host listens on for results.
     #[arg(long, default_value_t = 5000)]
     pub vsock_port: u32,
     #[arg(long, default_value = "kbf.probe")]
@@ -87,6 +106,9 @@ pub struct ReadyArgs {
     /// Wait for this process (for instance `loginwindow`) to be running first.
     #[arg(long)]
     pub wait_process: Option<String>,
+    /// The vsock port the host listens on for results.
+    #[arg(long, default_value_t = 5000)]
+    pub vsock_port: u32,
 }
 
 /// Waits for `path`; the milliseconds it took (0 when there is nothing to wait for).
@@ -139,6 +161,100 @@ pub fn probe_ready(host: &dyn Host, a: &ReadyArgs) -> Result<Value, String> {
     }))
 }
 
+/// The first line a probe writes to its log, before it waits for anything: what it will
+/// deliver and who it is. A job whose log stays empty did not start.
+#[must_use]
+pub fn started_line(host: &dyn Host, out: &Path) -> String {
+    let (uid, euid) = host.ids();
+    format!(
+        "kbf-guest: started, will deliver {} (uid {uid}, euid {euid}, session {})",
+        out.display(),
+        host.session()
+    )
+}
+
+/// Where [`deliver`] put a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivered {
+    /// The host acknowledged the frame on this attempt.
+    Vsock { attempt: u32 },
+    /// Vsock could not be used; the file is in the share.
+    Share,
+}
+
+/// Sends `frame` with `send`, up to [`VSOCK_ATTEMPTS`] times [`VSOCK_RETRY`] apart (a
+/// refusal is not retried), logging every attempt; the attempt that worked, `None` when
+/// none did.
+pub fn send_with_retries(
+    send: &mut dyn FnMut(&Frame) -> Result<(), SendError>,
+    pause: &dyn Fn(Duration),
+    port: u32,
+    frame: &Frame,
+    log: &mut dyn Write,
+) -> Option<u32> {
+    let name = &frame.name;
+    for attempt in 1..=VSOCK_ATTEMPTS {
+        match send(frame) {
+            Ok(()) => {
+                let _ = writeln!(
+                    log,
+                    "kbf-guest: vsock port {port}: {name} delivered on attempt {attempt}"
+                );
+                return Some(attempt);
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    log,
+                    "kbf-guest: vsock port {port}: attempt {attempt} of {VSOCK_ATTEMPTS} for {name} failed: {e}"
+                );
+                if matches!(e, SendError::Refused(_)) {
+                    break;
+                }
+                if attempt < VSOCK_ATTEMPTS {
+                    pause(VSOCK_RETRY);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Sends `value` to the host as a frame of `kind` named after `out`'s file name, retrying
+/// up to [`VSOCK_ATTEMPTS`] times [`VSOCK_RETRY`] apart, and writes it to `out` (the
+/// share) only when no attempt worked or the host refused the frame. Every attempt and
+/// failure is logged to `log`.
+///
+/// # Errors
+/// The value cannot be serialized, or vsock failed and so did the write to `out`.
+pub fn deliver(
+    host: &dyn Host,
+    port: u32,
+    kind: Kind,
+    out: &Path,
+    value: &Value,
+    log: &mut dyn Write,
+) -> io::Result<Delivered> {
+    let name = out
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let frame = Frame {
+        kind,
+        name: name.clone(),
+        body: serde_json::to_string_pretty(value)?,
+    };
+    let mut send = |f: &Frame| host.send_frame(port, f);
+    if let Some(attempt) = send_with_retries(&mut send, &|d| host.pause(d), port, &frame, log) {
+        return Ok(Delivered::Vsock { attempt });
+    }
+    let _ = writeln!(
+        log,
+        "kbf-guest: vsock not usable for {name}; writing {} instead",
+        out.display()
+    );
+    write_result(out, value).map(|()| Delivered::Share)
+}
+
 /// Writes `value` to `out` through a temporary file, so the host never reads half of it.
 ///
 /// # Errors
@@ -171,8 +287,11 @@ pub fn write_result(out: &Path, value: &Value) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
 
     struct Fake {
+        sends: RefCell<Vec<(u32, Frame)>>,
+        replies: RefCell<VecDeque<Result<(), SendError>>>,
         ids: (u32, u32),
         present: RefCell<Vec<PathBuf>>,
         appears_after: Cell<Option<u32>>,
@@ -183,6 +302,8 @@ mod tests {
     impl Fake {
         fn new() -> Self {
             Self {
+                sends: RefCell::new(Vec::new()),
+                replies: RefCell::new(VecDeque::new()),
                 ids: (0, 0),
                 present: RefCell::new(Vec::new()),
                 appears_after: Cell::new(None),
@@ -213,6 +334,13 @@ mod tests {
         }
         fn vsock(&self, port: u32) -> Value {
             json!({"port": port})
+        }
+        fn send_frame(&self, port: u32, frame: &Frame) -> Result<(), SendError> {
+            self.sends.borrow_mut().push((port, frame.clone()));
+            self.replies
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| Err(SendError::Unavailable("no vsock device".to_owned())))
         }
         fn console(&self, name: &str) -> Value {
             json!({"name": name})
@@ -289,6 +417,19 @@ mod tests {
         assert!(err.contains("/share never appeared"), "{err}");
     }
 
+    /// Catches a probe that starts silently: a job that logged nothing could not be told
+    /// from one that never ran (the fifth E1 run). The first line names the output, the
+    /// ids and the session, and is written before any wait.
+    #[test]
+    fn a_probe_says_it_started_before_it_waits() {
+        let line = started_line(&Fake::new(), Path::new("/m/results/ready-system"));
+        assert!(line.starts_with("kbf-guest: started"), "{line}");
+        assert!(line.contains("ready-system"), "{line}");
+        assert!(line.contains("uid 0"), "{line}");
+        assert!(line.contains("session System"), "{line}");
+        assert!(!line.contains('\n'));
+    }
+
     /// Catches a ready marker written before the process it waits for exists, or one
     /// that waits forever.
     #[test]
@@ -299,6 +440,7 @@ mod tests {
             out: "/o".into(),
             wait_path: None,
             wait_process: Some("loginwindow".into()),
+            vsock_port: 5000,
         };
         let v = probe_ready(&h, &a).expect("ready");
         assert_eq!((h.pauses.get(), v["session"].clone()), (4, json!("System")));
@@ -312,12 +454,14 @@ mod tests {
             out: "/o".into(),
             wait_path: Some("/x".into()),
             wait_process: None,
+            vsock_port: 5000,
         };
         assert!(probe_ready(&Fake::new(), &a).is_err());
         let a = ReadyArgs {
             out: "/o".into(),
             wait_path: None,
             wait_process: None,
+            vsock_port: 5000,
         };
         assert!(probe_ready(&Fake::new(), &a).is_ok());
     }
@@ -356,5 +500,120 @@ mod tests {
             !dir.join("both.tmp").exists(),
             "the temporary file is removed"
         );
+    }
+
+    fn out_in(dir: &Path) -> PathBuf {
+        dir.join("ready-system")
+    }
+
+    /// Catches a result that goes to the share although the host acknowledged it (the
+    /// share refuses every read and write in the guest), a frame with the wrong kind, name,
+    /// port or body, and a retry that does not stop at the first ack.
+    #[test]
+    fn a_frame_the_host_acknowledges_is_not_written_to_the_share() {
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-guest-deliver-ok");
+        let h = Fake::new();
+        h.replies
+            .borrow_mut()
+            .extend([Err(SendError::Unavailable("not yet".to_owned())), Ok(())]);
+        let mut log = Vec::new();
+        let value = json!({"uid": 0});
+        let d = deliver(&h, 5000, Kind::Ready, &out_in(&dir), &value, &mut log).expect("deliver");
+        assert_eq!(d, Delivered::Vsock { attempt: 2 });
+        assert!(!out_in(&dir).exists(), "nothing in the share");
+        let sends = h.sends.borrow();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[1].0, 5000);
+        assert_eq!(sends[1].1.kind, Kind::Ready);
+        assert_eq!(sends[1].1.name, "ready-system");
+        assert_eq!(
+            serde_json::from_str::<Value>(&sends[1].1.body).expect("json"),
+            value
+        );
+        assert_eq!(h.pauses.get(), 1, "one pause between the two attempts");
+        let log = String::from_utf8(log).expect("utf8");
+        assert!(
+            log.contains("attempt 1 of 5 for ready-system failed: not yet"),
+            "{log}"
+        );
+        assert!(log.contains("delivered on attempt 2"), "{log}");
+    }
+
+    /// Catches a fallback that is not taken when vsock never works, retries that are not
+    /// bounded, a pause after the last attempt, and a share write that is skipped.
+    #[test]
+    fn without_vsock_the_attempts_are_bounded_and_the_share_gets_the_file() {
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-guest-deliver-share");
+        let h = Fake::new();
+        let mut log = Vec::new();
+        let d = deliver(
+            &h,
+            5000,
+            Kind::Result,
+            &out_in(&dir),
+            &json!({"a": 1}),
+            &mut log,
+        )
+        .expect("deliver");
+        assert_eq!(d, Delivered::Share);
+        assert_eq!(h.sends.borrow().len(), VSOCK_ATTEMPTS as usize);
+        assert_eq!(h.pauses.get(), VSOCK_ATTEMPTS - 1);
+        assert!(
+            std::fs::read_to_string(out_in(&dir))
+                .expect("file")
+                .contains("\"a\"")
+        );
+        let log = String::from_utf8(log).expect("utf8");
+        assert_eq!(
+            log.matches("failed: no vsock device").count(),
+            VSOCK_ATTEMPTS as usize
+        );
+        assert!(
+            log.contains("vsock not usable for ready-system; writing"),
+            "{log}"
+        );
+    }
+
+    /// Catches a refused frame being retried (the host would refuse it again) and a
+    /// fallback that is lost when the share refuses too: the error is the share's.
+    #[test]
+    fn a_refusal_is_not_retried_and_a_failing_share_is_an_error() {
+        let dir =
+            kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-guest-deliver-refused");
+        let h = Fake::new();
+        h.replies
+            .borrow_mut()
+            .push_back(Err(SendError::Refused("bad name".to_owned())));
+        let mut log = Vec::new();
+        let d =
+            deliver(&h, 5000, Kind::Result, &out_in(&dir), &json!({}), &mut log).expect("deliver");
+        assert_eq!(d, Delivered::Share);
+        assert_eq!((h.sends.borrow().len(), h.pauses.get()), (1, 0));
+        assert!(
+            String::from_utf8(log)
+                .expect("utf8")
+                .contains("the host refused it: bad name")
+        );
+        let missing = dir.join("no/such/dir/ready-system");
+        let e = deliver(
+            &Fake::new(),
+            5000,
+            Kind::Ready,
+            &missing,
+            &json!({}),
+            &mut Vec::new(),
+        );
+        assert!(e.is_err());
+        // A path with no file name sends an empty name, which the host refuses.
+        let h = Fake::new();
+        let _ = deliver(
+            &h,
+            5000,
+            Kind::Ready,
+            Path::new("/"),
+            &json!({}),
+            &mut Vec::new(),
+        );
+        assert_eq!(h.sends.borrow()[0].1.name, "");
     }
 }
