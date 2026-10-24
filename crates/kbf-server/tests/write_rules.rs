@@ -1,8 +1,8 @@
 //! The table of `kbf_server::write_rules`, checked against keys the code writes: each
 //! subsystem is run on an in-memory store and every key it leaves behind must be named by
 //! a family of the table, with the rule the design gives it (section 8 of
-//! `docs/design/frontend-proxy.md`). The scheduler's and the history index's keys are
-//! checked by the swap test of `tests/frontend/managed/writes.rs`.
+//! `docs/design/frontend-proxy.md`). The scheduler's and the history index's keys are not
+//! checked here: the swap test that checked them went with the handover.
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -300,9 +300,8 @@ fn the_file_is_each_setting_under_the_table_of_its_group_as_text() {
 #[test]
 fn the_compositions_apply_the_edits_of_a_farm_to_the_units_defaults() {
     // Catches: an edit of the farm that goes missing or lands on the wrong role: the
-    // frontend's SQLite store and control socket, the nodes' directory cold store and
-    // scrape route, the limits and the overrides over them, the container driver's
-    // stand-in.
+    // frontend's SQLite store, the nodes' directory cold store and scrape route, the
+    // limits and the overrides over them, the container driver's stand-in.
     let w = wiring();
     let place = |image| Settings {
         root: Path::new("/R"),
@@ -318,9 +317,8 @@ fn the_compositions_apply_the_edits_of_a_farm_to_the_units_defaults() {
         (Role::Daemon(1), vec!["--reserve-cpus=3".to_owned()]),
         (Role::Frontend, vec!["--api-listen=127.0.0.1:1".to_owned()]),
     ];
-    let front: Unit = frontend(&place(""), 1000, Path::new("/tmp/s.sock"), &topo);
+    let front: Unit = frontend(&place(""), 1000, &topo);
     assert!(has(&front, "--state-store=sqlite:///R/state/state.db"));
-    assert!(has(&front, "--handover-socket=/tmp/s.sock"));
     assert!(has(&front, "--default-platform=none"));
     assert!(has(&front, "--api-listen=127.0.0.1:1"));
     let nodes = |n| -> Unit { node((&place(""), 1000), n, 9999, &topo, None) };

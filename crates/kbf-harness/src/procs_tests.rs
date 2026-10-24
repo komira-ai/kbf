@@ -84,7 +84,7 @@ fn helper() {
                 fill_kib: 1,
                 run_id: "reaped".to_owned(),
             };
-            let reap = crate::reap::Reap::new(&crate::load::Daemons::of(&cfg), None, None);
+            let reap = crate::reap::Reap::new(&crate::load::Daemons::of(&cfg), None);
             let sentinel = crate::reap::Sentinel::start(
                 &crate::stand_in::sibling_bin("kbf-beta"),
                 &reap,
@@ -111,7 +111,7 @@ fn helper() {
                 kill_timeout: Duration::from_secs(30),
                 run_id: "grouped".to_owned(),
             };
-            let reap = crate::reap::Reap::new(&daemons, None, Some(dir.clone()));
+            let reap = crate::reap::Reap::new(&daemons, Some(dir.clone()));
             let sentinel = crate::reap::Sentinel::start(
                 &crate::stand_in::sibling_bin("kbf-beta"),
                 &reap,

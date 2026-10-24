@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use kbf_history::{HistoryRoot, IndexRoot, WriterId};
+use kbf_history::{HistoryRoot, IndexRoot};
 use kbf_objstore::{Floor, FsStore, FsStoreError, KeyError, KeyPrefix};
 
 use super::driver::{History, Options, over};
@@ -82,20 +82,6 @@ impl HistoryFlags {
         state: Option<&StateStore>,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Option<History>, HistoryError> {
-        self.open_as(state, env, None)
-    }
-
-    /// [`HistoryFlags::open_with`], the writer named `writer` (a process that has an id
-    /// names its writer by it) and not by the time it started.
-    ///
-    /// # Errors
-    /// As [`HistoryFlags::open`].
-    pub fn open_as(
-        &self,
-        state: Option<&StateStore>,
-        env: &dyn Fn(&str) -> Option<String>,
-        writer: Option<WriterId>,
-    ) -> Result<Option<History>, HistoryError> {
         let Some(uri) = &self.history_objects else {
             return Ok(None);
         };
@@ -104,10 +90,7 @@ impl HistoryFlags {
         let store = Arc::clone(&state.store);
         let (place, rows) = (describe(uri), index_root.as_str());
         tracing::info!("history: objects in {place}, index {rows}");
-        let mut options = Options::default();
-        if let Some(writer) = writer {
-            options.writer = writer;
-        }
+        let options = Options::default();
         match uri {
             StoreUri::File(dir) => {
                 let objects = FsStore::open(dir, Floor::KeepFree)?;
@@ -145,18 +128,6 @@ pub fn with_history(
     state: Option<StateStore>,
     flags: &HistoryFlags,
 ) -> Result<Option<StateStore>, HistoryError> {
-    with_history_as(state, flags, None)
-}
-
-/// [`with_history`], the writer named `writer` when there is one.
-///
-/// # Errors
-/// [`HistoryError`]: see [`HistoryFlags::open`].
-pub fn with_history_as(
-    state: Option<StateStore>,
-    flags: &HistoryFlags,
-    writer: Option<WriterId>,
-) -> Result<Option<StateStore>, HistoryError> {
-    let history = flags.open_as(state.as_ref(), &process_env, writer)?;
+    let history = flags.open_with(state.as_ref(), &process_env)?;
     Ok(state.map(|state| StateStore { history, ..state }))
 }

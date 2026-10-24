@@ -9,12 +9,6 @@
 
 mod support;
 
-#[path = "frontend/handover.rs"]
-mod handover;
-
-#[path = "frontend/managed.rs"]
-mod managed;
-
 #[path = "frontend/membership_tls.rs"]
 mod membership_tls;
 

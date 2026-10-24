@@ -87,8 +87,8 @@ pub struct B0 {
     /// the Buck2 daemons and ends `FAILED` instead of running on.
     pub interrupt: Interrupt,
     /// The program that runs as the sentinel (`kbf-beta`, which answers `reap`): it kills the
-    /// Buck2 daemons and removes the frontend's control socket if this run is killed with no
-    /// chance to ([`crate::reap`]). `None` runs without one.
+    /// Buck2 daemons and the roles' process groups if this run is killed with no chance to
+    /// ([`crate::reap`]). `None` runs without one.
     pub reaper: Option<PathBuf>,
 }
 
@@ -158,7 +158,6 @@ fn buck2_version(buck2: &Path, cwd: &Path, out: &Path, limit: Duration) -> Strin
 fn start_sentinel(
     args: &B0,
     project: &Path,
-    farm_dir: &Path,
     logs: &Path,
     run_id: &str,
 ) -> std::io::Result<Option<Sentinel>> {
@@ -172,11 +171,7 @@ fn start_sentinel(
         kill_timeout: args.kill_timeout,
         run_id: run_id.to_owned(),
     };
-    let reap = Reap::new(
-        &daemons,
-        Some(crate::farm::control_socket(farm_dir)),
-        Some(logs.to_owned()),
-    );
+    let reap = Reap::new(&daemons, Some(logs.to_owned()));
     Sentinel::start(program, &reap, &logs.join("reaper.err")).map(Some)
 }
 
@@ -267,7 +262,7 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
     // Before the farm, so a run killed while it starts leaves nothing either. Dropped after
     // the farm and the load (locals drop in reverse), which have then cleaned up themselves.
     let run_id = format!("{}-{}", result.doc.run_id, std::process::id());
-    let _sentinel = match start_sentinel(args, &project, &farm_dir, logs, &run_id) {
+    let _sentinel = match start_sentinel(args, &project, logs, &run_id) {
         Ok(sentinel) => sentinel,
         Err(e) => return fail(result, Status::Failed, format!("the sentinel: {e}")),
     };

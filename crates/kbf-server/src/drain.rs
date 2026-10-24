@@ -115,9 +115,9 @@ impl Drain {
         self.closer.undrain()
     }
 
-    /// The server has handed its roles to a successor and keeps answering what is
+    /// The server is retiring and has stood its roles down, and keeps answering what is
     /// open: it stays ready, and `/readyz` and the health service stop asking the
-    /// probes of stores that are frozen or answered through the successor. Returns
+    /// probes of stores that are frozen or answered by other frontends. Returns
     /// whether this call was the first.
     pub fn hand_over(&self) -> bool {
         self.readiness.set_handed_over()

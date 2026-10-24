@@ -142,3 +142,49 @@ async fn the_retired_release_poll_flags_start_and_warn_once_each() {
         assert_eq!(text.matches(&line).count(), 1, "{text}");
     }
 }
+
+/// Asserts that the flags of the removed handover and admin port (a unit or `kbf.toml`
+/// written before the removal carries them) start a frontend and log one warning for each,
+/// naming the flag, and that a frontend given none logs none of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_retired_handover_flags_start_and_warn_once_each() {
+    let log = Log::default();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let start = |f: &frontend::FrontendFlags| {
+        tracing::dispatcher::with_default(&dispatch, || {
+            start_frontend(f, || Ok(pending::<()>())).expect("starts")
+        })
+    };
+
+    let _plain = start(&flags(&[]));
+    assert!(
+        !log.text().contains("the handover was removed"),
+        "{}",
+        log.text()
+    );
+    let given = [
+        "--handover-socket=/run/kbf/control.sock",
+        "--instance=a",
+        "--handover-quiesce-secs=10",
+        "--handover-follow-interval-ms=200",
+        "--handover-watchdog-secs=15",
+        "--handover-peer-name=kbf.example.internal",
+        "--envoy-check-interval-ms=1000",
+        "--envoy-check-timeout-ms=1000",
+        "--envoy-unhealthy-threshold=2",
+        "--admin-listen=127.0.0.1:18983",
+        "--await-takeover",
+    ];
+    let _old = start(&flags(&given));
+    let text = log.text();
+    for flag in given {
+        let flag = flag.split('=').next().expect("a flag");
+        let line = format!("{flag} is no longer read: the handover was removed");
+        assert_eq!(text.matches(&line).count(), 1, "{text}");
+    }
+}

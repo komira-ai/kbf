@@ -36,7 +36,8 @@ fn command_line(table: UpstreamTable, slot: Slot, start: Start) -> Vec<OsString>
     words
 }
 
-/// The four listeners and the admin flags a child parses from that command line.
+/// The four listeners and the retired admin and handover flags a child parses from that
+/// command line (a frontend accepts the last three and ignores them: [`kbf_server::retired`]).
 struct Parsed {
     reapi: SocketAddr,
     worker: SocketAddr,
@@ -44,6 +45,7 @@ struct Parsed {
     admin: SocketAddr,
     await_takeover: bool,
     handover: bool,
+    instance: bool,
     secret: Option<std::path::PathBuf>,
 }
 
@@ -56,14 +58,15 @@ fn parse(mut words: Vec<OsString>) -> Result<Parsed, clap::Error> {
 fn parse_as_given(words: Vec<OsString>) -> Result<Parsed, clap::Error> {
     match kbf_cli::parse_from(words)? {
         kbf_cli::Invocation::Frontend(flags) => {
-            let admin = flags.admin.expect("--admin-listen was given");
+            let admin = (flags.retired.admin_listen.as_deref()).expect("--admin-listen was given");
             Ok(Parsed {
                 reapi: flags.server.listen,
                 worker: flags.server.worker_listen,
                 api: flags.server.api_listen,
-                admin: admin.listen,
-                await_takeover: admin.await_takeover,
-                handover: flags.handover.is_some(),
+                admin: admin.parse().expect("an address"),
+                await_takeover: flags.retired.await_takeover,
+                handover: flags.retired.handover_socket.is_some(),
+                instance: flags.retired.instance.is_some(),
                 secret: flags.server.proxy_auth_file.clone(),
             })
         }
@@ -79,8 +82,7 @@ fn gate(slot: Slot) -> GateSlot {
 }
 
 /// Catches a spawner whose command line the `kbf` parser refuses (the child would exit 2 at
-/// once: the old `--instance=<slot>` needs a handover socket, and nobody gave one), that
-/// puts a slot's listener off the proxy's table (the proxy would dial a port nothing
+/// once), that puts a slot's listener off the proxy's table (the proxy would dial a port nothing
 /// serves), or that starts a candidate without `--await-takeover` (it would take the
 /// generation by itself and the swap would have two writers) or an active child with it (it
 /// would wait for a takeover nothing sends).
@@ -99,10 +101,8 @@ fn every_slot_and_start_parses_and_listens_where_the_proxys_table_dials() {
             assert_eq!(got.api, Some(want(Target::Operator)), "{shown:?}");
             assert_eq!(got.admin, at(table.admin_port(gate(slot))), "{shown:?}");
             assert_eq!(got.await_takeover, start == Start::Candidate, "{shown:?}");
-            assert!(
-                !got.handover,
-                "{shown:?}: no handover socket, so no --instance"
-            );
+            assert!(!got.handover, "{shown:?}: no handover socket");
+            assert!(!got.instance, "{shown:?}: no --instance");
             assert_eq!(got.secret.as_deref(), Some(Path::new(SECRET)), "{shown:?}");
         }
     }
@@ -163,25 +163,4 @@ fn the_frontend_file_of_an_all_in_one_host_completes_the_command_line() {
         parse_as_given(with(None)).is_err(),
         "nothing else supplies them"
     );
-}
-
-/// The control for the two tests above: the parser really does refuse the `--instance` flag
-/// without a handover socket, and `--await-takeover` without an admin port, so the tests
-/// above go red on a spawner that brings either back.
-#[test]
-fn the_parser_refuses_what_the_old_command_line_gave() {
-    let table = UpstreamTable { base_port: 18_000 };
-    let mut with_instance = command_line(table, Slot::A, Start::Active);
-    with_instance.push(OsString::from("--instance=a"));
-    let e = parse(with_instance)
-        .err()
-        .expect("--instance alone is refused");
-    assert!(e.to_string().contains("handover-socket"), "{e}");
-
-    let mut no_admin = command_line(table, Slot::A, Start::Candidate);
-    no_admin.retain(|w| !w.to_string_lossy().starts_with("--admin-listen"));
-    let e = parse(no_admin)
-        .err()
-        .expect("a candidate needs the admin port");
-    assert!(e.to_string().contains("admin-listen"), "{e}");
 }

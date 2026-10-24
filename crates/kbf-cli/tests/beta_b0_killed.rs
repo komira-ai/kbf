@@ -1,6 +1,6 @@
 //! Scenario B0 and the sentinel (docs/design/kbf-cicd.md, section 4.3): a run that is killed
 //! with no chance to clean up (SIGKILL, which a runner sends a job it cancels) leaves no Buck2
-//! daemon, no control socket and no farm process behind.
+//! daemon and no farm process behind.
 
 #![cfg(target_os = "linux")]
 
@@ -46,25 +46,6 @@ fn gone(pid: i32) -> bool {
     })
 }
 
-/// The control socket the process `pid` (the frontend) was told: the `handover-socket` of
-/// the `kbf.toml` its command line names with `--config=`.
-fn handover_socket(pid: rustix::process::Pid) -> PathBuf {
-    let cmdline = std::fs::read(format!("/proc/{}/cmdline", pid.as_raw_nonzero()))
-        .expect("the frontend's command line");
-    let config = cmdline
-        .split(|b| *b == 0)
-        .filter_map(|word| std::str::from_utf8(word).ok()?.strip_prefix("--config="))
-        .map(PathBuf::from)
-        .next()
-        .expect("a settings file");
-    let text = std::fs::read_to_string(&config).expect("the frontend's kbf.toml");
-    let table: toml::Table = text.parse().expect("TOML");
-    table["handover"]["handover-socket"]
-        .as_str()
-        .map(PathBuf::from)
-        .expect("a control socket")
-}
-
 /// A `kbf-beta` that is killed when the test ends however it ends.
 struct Beta(Child);
 
@@ -107,11 +88,11 @@ fn a_healthy_run_with_a_sentinel_passes_and_the_sentinel_cleans_up_nothing() {
 /// Catches: the claim that a run leaves nothing behind if it is killed. `kbf-beta` is run as
 /// the workflow runs it, over the stand-in `buck2` that notes every `kill` it is given, and is
 /// sent SIGKILL under load (it runs no `Drop` and no handler). The farm's processes die with
-/// it (the parent-death signal), and the sentinel, which does not, kills both loops' daemons
-/// and removes the frontend's control socket. Nothing was killed while the run lived, so the
-/// markers are the sentinel's. Catches: no sentinel started (`reaper: None` in the CLI).
+/// it (the parent-death signal), and the sentinel, which does not, kills both loops' daemons.
+/// Nothing was killed while the run lived, so the markers are the sentinel's. Catches: no
+/// sentinel started (`reaper: None` in the CLI).
 #[test]
-fn a_kbf_beta_killed_by_sigkill_leaves_no_daemon_socket_or_farm_process() {
+fn a_kbf_beta_killed_by_sigkill_leaves_no_daemon_or_farm_process() {
     let _slot = take_slot();
     let dir = scratch("sigkill");
     let (project, bins, work) = (dir.join("project"), dir.join("bin"), dir.join("work"));
@@ -144,8 +125,6 @@ fn a_kbf_beta_killed_by_sigkill_leaves_no_daemon_socket_or_farm_process() {
     wait_for_the_load(&work);
     let frontend = pid_of(&work, "frontend");
     let node = pid_of(&work, "node-1");
-    let socket = handover_socket(frontend);
-    assert!(socket.exists(), "the frontend made its control socket");
     assert_eq!(
         (kills(&work, 0), kills(&work, 1)),
         (0, 0),
@@ -157,9 +136,6 @@ fn a_kbf_beta_killed_by_sigkill_leaves_no_daemon_socket_or_farm_process() {
 
     until("both daemons to be killed", || {
         (kills(&work, 0) >= 1 && kills(&work, 1) >= 1).then_some(())
-    });
-    until("the control socket to be removed", || {
-        (!socket.exists()).then_some(())
     });
     for pid in [frontend, node] {
         until("a farm process to die with the harness", || {

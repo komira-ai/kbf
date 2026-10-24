@@ -125,6 +125,9 @@ const GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        // The flags of the removed handover and admin port, accepted and ignored for one
+        // release (`kbf_server::retired::RetiredHandoverFlags`): the keys stay so that a
+        // `kbf.toml` written before the removal is still read.
         "handover",
         &[
             "admin-listen",

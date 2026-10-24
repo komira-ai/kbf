@@ -16,8 +16,8 @@
 # same ports). The socket handover between two instances (a template unit) is retired: the
 # proxy swaps frontend children instead.
 #
-# No --instance and no --handover-socket: kbf refuses --instance without --handover-socket,
-# and without either the process is a plain frontend. An update is a restart: a stop
+# No --instance and no --handover-socket: kbf still accepts them, ignores them and logs a
+# warning for each, and the process is a plain frontend. An update is a restart: a stop
 # drains (below), the package manager replaces /usr/bin/kbf, and the start runs the new
 # file. Builds in flight finish before the old process exits; the listeners are closed from
 # the stop to the next start.

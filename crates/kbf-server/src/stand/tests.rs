@@ -1,16 +1,185 @@
-//! A holder that stands down with requeues the state store has not taken yet.
+//! A retire that stands down with requeues the state store has not taken yet.
 
 use std::io;
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use kbf_sched::DaemonInstance;
-use kbf_types::WorkerId;
+use futures::future::AbortRegistration;
+use kbf_front::{Backend, Cache, Described, Submission};
+use kbf_sched::{DaemonInstance, Request};
+use kbf_state::fake::{Fake, Flaw};
+use kbf_state::{
+    Changes, Commit, CommitStats, Conflict, ManualClock, Revision, ScanPage, ScanRange, Store,
+    StoreError, StoreTime, Txn, Versioned,
+};
+use kbf_types::{ActionKey, Digest, DigestFunction, LeaseKind, Qos, Resources, WorkerId};
 use tokio::sync::mpsc;
 
 use super::*;
-use crate::farm::{Outbound, Reported, StreamId};
-use crate::handover::tests::{Rig, request, submit};
+use crate::farm::{EpochPolicy, Outbound, Reported, StreamId};
+use crate::health::Readiness;
+use crate::state_store::StateStore;
+
+/// A state store over the fake that can refuse writes, as a store with a failing disk
+/// does, and counts the batches of writes it is asked to apply.
+struct Refuses {
+    inner: Fake,
+    /// How many of the next batches of writes the store refuses (as a failure of the
+    /// backend), counting down by one per refusal.
+    refuse_next: AtomicUsize,
+    /// Every write answers that a newer writer exists ([`StoreError::Fenced`]).
+    newer_writer: AtomicBool,
+    /// Batches of writes the store was asked to apply, refused or not.
+    writes_tried: AtomicUsize,
+}
+
+impl Refuses {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Fake::with_flaw(Arc::new(ManualClock::default()), Flaw::None),
+            refuse_next: AtomicUsize::new(0),
+            newer_writer: AtomicBool::new(false),
+            writes_tried: AtomicUsize::new(0),
+        })
+    }
+
+    fn put(&self, key: &str, value: Vec<u8>) {
+        let put = Txn::new().put(key, value, kbf_state::Cond::Any);
+        self.inner.txn(put).expect("store").expect("put");
+    }
+}
+
+impl Store for Refuses {
+    fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
+        self.writes_tried.fetch_add(1, Ordering::SeqCst);
+        if self.newer_writer.load(Ordering::SeqCst) {
+            return Err(StoreError::Fenced);
+        }
+        let refused = self
+            .refuse_next
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        if refused.is_ok() {
+            return Err(StoreError::Failed(
+                "the store refuses this write".to_owned(),
+            ));
+        }
+        self.inner.apply_batch(batch)
+    }
+
+    fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {
+        self.inner.get(key)
+    }
+
+    fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
+        self.inner.scan_prefix(prefix)
+    }
+
+    fn scan_range(&self, scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
+        self.inner.scan_range(scan)
+    }
+
+    fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {
+        self.inner.changes(after, limit)
+    }
+
+    fn reap_expired(&self) -> Result<usize, StoreError> {
+        self.inner.reap_expired()
+    }
+
+    fn commit_stats(&self) -> CommitStats {
+        self.inner.commit_stats()
+    }
+
+    fn now(&self) -> StoreTime {
+        self.inner.now()
+    }
+}
+
+/// A request to run, distinguished by `tag`.
+fn request(tag: u8) -> Request {
+    Request {
+        key: ActionKey {
+            instance: "main".to_owned(),
+            action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
+        },
+        qos: Qos::Ci,
+        kind: LeaseKind::Action,
+        resources: Resources::new(1_000, 1 << 30),
+        hermetic: true,
+        do_not_cache: false,
+        needs: kbf_caps::Request::default(),
+    }
+}
+
+/// Queues `request` on `farm`.
+fn submit(farm: &Farm, request: Request) -> Result<kbf_front::Ticket, Status> {
+    farm.submit(Submission {
+        request,
+        call: None,
+        described: Described::default(),
+        evidence: Default::default(),
+    })
+}
+
+/// A serving frontend's parts, as a retire stands them down: a farm over a store, a drain,
+/// the stop of the worker listener and the task that expires rows.
+struct Rig {
+    store: Arc<Refuses>,
+    backend: Backend,
+    farm: Arc<Farm>,
+    drain: Arc<Drain>,
+    /// The drain's readiness, which a retire marks handed over as it begins.
+    readiness: Arc<Readiness>,
+    worker: Stop,
+    sweeper: AbortHandle,
+    /// Kept so the sweeper is not aborted before it is told to be.
+    _sweeping: AbortRegistration,
+}
+
+impl Rig {
+    fn new() -> Self {
+        let store = Refuses::new();
+        // A store opened for a writer holds a generation.
+        store.put(kbf_state::GENERATION, 7_u64.to_be_bytes().to_vec());
+        let backend = Backend::from(Arc::new(Cache::memory()));
+        let farm = Farm::new(
+            backend.clone(),
+            kbf_sched::UNSERVABLE_WAIT,
+            kbf_sched::FINISHED_RETENTION,
+        )
+        .with_state(Some(StateStore {
+            store: store.clone(),
+            epoch: EpochPolicy::Keep,
+            members: Default::default(),
+            history: None,
+        }))
+        .expect("a farm over the store");
+        let (closer, _closing) = kbf_front::closing();
+        let readiness = Arc::new(Readiness::default());
+        let (drain, _goaway) = Drain::new(closer, Arc::clone(&readiness));
+        let (sweeper, _sweeping) = AbortHandle::new_pair();
+        Self {
+            store,
+            backend,
+            farm: Arc::new(farm),
+            drain: Arc::new(drain),
+            readiness,
+            worker: Stop::new(),
+            sweeper,
+            _sweeping,
+        }
+    }
+
+    fn stand(&self, wait: Duration) -> Stand {
+        Stand {
+            drain: Arc::clone(&self.drain),
+            farm: Arc::clone(&self.farm),
+            worker: self.worker.clone(),
+            sweeper: self.sweeper.clone(),
+            wait,
+        }
+    }
+}
 
 /// Log lines written by the test's subscriber on this thread.
 #[derive(Clone, Default)]
@@ -57,7 +226,7 @@ fn register(rig: &Rig, instance: &str, predecessor: &str, outbound: Outbound) ->
         &node(),
         DaemonInstance::new(instance),
         DaemonInstance::new(predecessor),
-        Reported::serving(kbf_types::Resources::new(4_000, 8 << 30), caps),
+        Reported::serving(Resources::new(4_000, 8 << 30), caps),
         outbound,
         Default::default(),
     )
@@ -99,34 +268,18 @@ async fn with_an_unsettled_requeue(rig: &Rig) -> String {
     operation
 }
 
-/// Catches: a holder that stands down with requeues its state store refused, never
-/// written (the successor would recover the operation holding a lease the farm gave up,
-/// and wait out its grace). A store that refuses the write three times and then takes it
-/// has the operation's queue row (and loss count) when the holder is released, and no
-/// lease row; a successor over it recovers the operation queued, not leased.
+/// Asserts that a retire stands down only after the requeues its state store refused are
+/// written. A store that refuses the write three times and then takes it has the
+/// operation's queue row (and loss count) when the stand-down returns, and no lease row; a
+/// farm over it recovers the operation queued, not leased.
 #[tokio::test]
-async fn a_requeue_the_store_refused_is_written_before_the_writer_role_is_given_up() {
+async fn a_requeue_the_store_refused_is_written_before_the_stand_down_returns() {
     let rig = Rig::new();
     let operation = with_an_unsettled_requeue(&rig).await;
     rig.store.refuse_next.store(3, Ordering::SeqCst);
-    let seen = Arc::new(Mutex::new(None));
-    let during = Arc::clone(&seen);
-    let store = Arc::clone(&rig.store);
-    rig.store.on_demote(move || {
-        let rows = |prefix: &str| store.scan_prefix(prefix).expect("scan").len();
-        *during.lock().expect("lock") = Some((rows("queue/"), rows("lease/")));
-    });
 
-    rig.stand(Duration::from_secs(30))
-        .run()
-        .await
-        .expect("released");
+    rig.stand(Duration::from_secs(30)).release().await;
 
-    assert_eq!(
-        *seen.lock().expect("lock"),
-        Some((1, 0)),
-        "written before the role was given up"
-    );
     assert_eq!(keys(&rig, "queue/"), [format!("queue/{operation}")]);
     assert_eq!(keys(&rig, "loss/"), [format!("loss/{operation}")]);
     assert!(keys(&rig, "lease/").is_empty());
@@ -143,16 +296,15 @@ async fn a_requeue_the_store_refused_is_written_before_the_writer_role_is_given_
         members: Default::default(),
         history: None,
     }))
-    .expect("a successor over the store");
+    .expect("a farm over the store");
     assert_eq!(successor.queued_operations(), 1, "recovered queued");
 }
 
-/// Catches: a holder that waits for ever on a store that refuses (the handover would
-/// never complete), or one that stays silent about what it left behind. A store that
-/// refuses past the deadline: the holder is released all the same, the write was tried
-/// more than once, and the log names the operation and how many are left.
+/// Asserts that a store that refuses past the deadline does not hold a retire up for ever
+/// and does not pass in silence: the stand-down returns all the same, the write was tried
+/// more than once, and the log names the operation.
 #[tokio::test]
-async fn a_requeue_the_store_refuses_past_the_deadline_is_logged_and_the_handover_completes() {
+async fn a_requeue_the_store_refuses_past_the_deadline_is_logged_and_the_stand_down_returns() {
     let rig = Rig::new();
     let operation = with_an_unsettled_requeue(&rig).await;
     rig.store.refuse_next.store(usize::MAX, Ordering::SeqCst);
@@ -160,10 +312,8 @@ async fn a_requeue_the_store_refuses_past_the_deadline_is_logged_and_the_handove
     let _logging = lines.subscribe();
     let before = rig.store.writes_tried.load(Ordering::SeqCst);
 
-    let run = rig.stand(Duration::from_millis(100)).run().await;
+    rig.stand(Duration::from_millis(100)).release().await;
 
-    assert!(run.is_ok(), "the handover completes");
-    assert_eq!(rig.store.demoted.load(Ordering::SeqCst), 1);
     assert!(rig.store.writes_tried.load(Ordering::SeqCst) >= before + 2);
     assert!(keys(&rig, "queue/").is_empty());
     let log = lines.text();
@@ -171,22 +321,24 @@ async fn a_requeue_the_store_refuses_past_the_deadline_is_logged_and_the_handove
     assert!(log.contains(&operation), "{log}");
 }
 
-/// Catches: a holder that goes on writing after a newer writer exists. A store that says
-/// so (Fenced) on the first attempt is tried exactly once and the holder, whose deadline
-/// is ten minutes, is released at once; and a farm that already learned it from an
-/// earlier write tries none. Either way the log names the operation.
+/// Asserts that a retire stops writing once a newer writer exists. A store that says so
+/// (Fenced) on the first attempt is tried exactly once and the retire, whose deadline is
+/// ten minutes, returns at once; and a farm that already learned it from an earlier write
+/// tries none. Either way the log names the operation.
 #[tokio::test]
 async fn a_newer_writer_stops_the_flush_at_once() {
     let rig = Rig::new();
     let operation = with_an_unsettled_requeue(&rig).await;
+    assert!(!rig.farm.superseded(), "not fenced yet");
     rig.store.newer_writer.store(true, Ordering::SeqCst);
     let lines = Lines::default();
     let _logging = lines.subscribe();
     let before = rig.store.writes_tried.load(Ordering::SeqCst);
 
-    let run = tokio::time::timeout(Duration::from_secs(20), rig.stand(LONG).run()).await;
+    let run = tokio::time::timeout(Duration::from_secs(20), rig.stand(LONG).release()).await;
 
-    assert!(run.expect("not waiting for the deadline").is_ok());
+    run.expect("not waiting for the deadline");
+    assert!(rig.farm.superseded(), "fenced by the newer writer");
     assert_eq!(rig.store.writes_tried.load(Ordering::SeqCst), before + 1);
     assert!(lines.text().contains(&operation), "{}", lines.text());
 
@@ -196,17 +348,44 @@ async fn a_newer_writer_stops_the_flush_at_once() {
     rig.store.newer_writer.store(true, Ordering::SeqCst);
     rig.farm.tick().await;
     let before = rig.store.writes_tried.load(Ordering::SeqCst);
-    let run = tokio::time::timeout(Duration::from_secs(20), rig.stand(LONG).run()).await;
-    assert!(run.expect("not waiting for the deadline").is_ok());
+    let run = tokio::time::timeout(Duration::from_secs(20), rig.stand(LONG).release()).await;
+    run.expect("not waiting for the deadline");
     assert_eq!(rig.store.writes_tried.load(Ordering::SeqCst), before);
 }
 
-/// Catches: a flush that works on a farm that has nothing to write, or that has no state
-/// store at all (a holder with nothing unsettled must not wait out its deadline).
+/// Asserts that a flush on a farm that has nothing to write does not wait out the
+/// deadline: a retire with nothing unsettled returns at once.
 #[tokio::test]
-async fn a_holder_with_nothing_unsettled_does_not_wait() {
+async fn a_retire_with_nothing_unsettled_does_not_wait() {
     let rig = Rig::new();
     let _ticket = submit(&rig.farm, request(1)).expect("queued");
-    let run = tokio::time::timeout(Duration::from_secs(20), rig.stand(LONG).run()).await;
-    assert!(run.expect("no wait").is_ok());
+    let run = tokio::time::timeout(Duration::from_secs(20), rig.stand(LONG).release()).await;
+    run.expect("no wait");
+}
+
+/// Asserts that a retire fences the farm only once no call is between its request and its
+/// queueing, or once the wait is up: the farm takes work while one is in flight and refuses
+/// it after, and a wait that is up fences a farm that is still busy.
+#[tokio::test]
+async fn a_retire_waits_for_the_farm_to_be_quiet_for_a_bounded_time() {
+    let rig = Rig::new();
+    let busy = rig.backend.metrics().execute_presubmit_in_flight.raise();
+    let stand = rig.stand(LONG);
+    let during = async {
+        while !rig.readiness.is_handed_over() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            submit(&rig.farm, request(1)).is_ok(),
+            "fenced while a call was in flight"
+        );
+        drop(busy);
+    };
+    tokio::join!(stand.release(), during);
+    assert!(submit(&rig.farm, request(2)).is_err());
+
+    let rig = Rig::new();
+    let _busy = rig.backend.metrics().execute_presubmit_in_flight.raise();
+    rig.stand(Duration::ZERO).release().await;
+    assert!(submit(&rig.farm, request(3)).is_err());
 }

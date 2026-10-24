@@ -231,7 +231,7 @@ fn refused(world: &World, store: &Store, why: &str) -> Reply {
     Reply::json(409, body)
 }
 
-/// The admin routes, as `managed/http.rs` of the child serves them.
+/// The admin routes, as the child served them.
 fn admin_route(world: &mut World, store: &Store, request: &Seen) -> Reply {
     let live = matches!(world.role, "active" | "quiesced");
     match (request.method.as_str(), request.path.as_str()) {

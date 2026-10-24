@@ -70,8 +70,6 @@ pub struct Farm {
     hang: Duration,
     /// Whether the run was asked to stop.
     interrupt: Interrupt,
-    /// The frontend's control socket, removed when the farm stops.
-    socket: Option<PathBuf>,
     /// The block of ports the farm's processes bind, held while the farm lives, and the
     /// ports of it that the processes were told.
     claim: Option<(Claim, Ports)>,
@@ -107,23 +105,6 @@ fn make_dirs(root: &Path) -> PathBuf {
     root.join("bin")
 }
 
-/// A number of `dir`'s path: farms started in one process (tests run side by side) have
-/// directories of their own, so each gets a control socket of its own.
-fn path_tag(dir: &Path) -> u64 {
-    use std::hash::{Hash as _, Hasher as _};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (dir, std::process::id()).hash(&mut hasher);
-    hasher.finish()
-}
-
-/// The control socket of the frontend of a farm in `dir`, started by this process: in the
-/// temporary directory, where a path is short enough for a socket's. The sentinel
-/// ([`crate::reap`]) removes it when the harness is killed.
-#[must_use]
-pub fn control_socket(dir: &Path) -> PathBuf {
-    std::env::temp_dir().join(format!("kbf-farm-{:x}.sock", path_tag(dir)))
-}
-
 impl Farm {
     /// Writes each process's `kbf.toml` and starts a process from it, then waits for each process's
     /// start line. `dir` holds every process's directories (and must be fresh); `logs`
@@ -143,8 +124,6 @@ impl Farm {
     /// - with [`Driver::Native`], `--driver=native` replaces it and `KBF_IMAGES` is empty
     ///   (only the container driver takes `--image`);
     /// - the frontend's `--default-platform` is `none` (the nodes are this host);
-    /// - the frontend's control socket is in the temporary directory (a `RuntimeDirectory=`
-    ///   is systemd's, and a scratch path is too long for a socket's);
     /// - the topology's [`Limits`] and overrides are set on top.
     ///
     /// Every other setting is the unit's.
@@ -210,7 +189,6 @@ impl Farm {
             node_ids,
             hang: HANG,
             interrupt: topo.interrupt.clone(),
-            socket: None,
             claim: Some((claim, ports.clone())),
             scratch: None,
         };
@@ -247,8 +225,6 @@ impl Farm {
         let token = etc.join("api-token");
         crate::pki::write_private(&token, format!("{API_TOKEN}\n").as_bytes());
         farm.ca = std::fs::read(etc.join("ca.pem")).expect("ca");
-        let socket = control_socket(dir);
-        let _ = std::fs::remove_file(&socket);
         let loopback0 = loopback(0);
         let place = Settings {
             root: &root,
@@ -258,8 +234,7 @@ impl Farm {
             wiring: &wiring,
             image: "",
         };
-        let unit = units::frontend(&place, uid, &socket, topo);
-        farm.socket = Some(socket);
+        let unit = units::frontend(&place, uid, topo);
         farm.launch(
             topo.kbf_of(Role::Frontend, &bins.kbf),
             Role::Frontend,
@@ -358,7 +333,6 @@ impl Farm {
             node_ids: Vec::new(),
             hang: HANG,
             interrupt: Interrupt::new(),
-            socket: None,
             claim: None,
             scratch: None,
         };
@@ -792,7 +766,7 @@ impl Farm {
 
     /// [`Farm::stop_all`] in `total` at most: each role is waited for what is left of it
     /// (and for no more than the farm's wait), and a role that has not drained by then is
-    /// killed. Also removes the frontend's control socket.
+    /// killed.
     pub fn stop_all_within(&mut self, total: Duration) -> Vec<(Role, String)> {
         let mut ended = Vec::new();
         let (hang, end) = (self.hang, after(total));
@@ -820,16 +794,7 @@ impl Farm {
                 ),
             ));
         }
-        self.remove_socket();
         ended
-    }
-
-    /// Removes the frontend's control socket, which the process leaves behind when it is
-    /// killed, and which would otherwise stay in the temporary directory.
-    fn remove_socket(&mut self) {
-        if let Some(socket) = self.socket.take() {
-            let _ = std::fs::remove_file(socket);
-        }
     }
 
     /// [`Farm::stop_all`], and every process must have exited 0.
@@ -841,14 +806,6 @@ impl Farm {
         for (role, how) in ended {
             assert_eq!(how, "exit 0", "{role}\n{}", self.logs());
         }
-    }
-}
-
-impl Drop for Farm {
-    /// Every process is killed with its group (each [`Proc`] does it as it drops); the
-    /// control socket goes too.
-    fn drop(&mut self) {
-        self.remove_socket();
     }
 }
 

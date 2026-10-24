@@ -192,10 +192,10 @@ The URI carries no password (kbf refuses one: the command line is readable by ev
 the node), so the database is reached by the socket or by the server user's own role. The
 database and its schema are `kbf-installer`'s.
 
-The unit gives no `--handover-socket` (nor a `RuntimeDirectory=` for one): `kbf frontend`
-refuses a Postgres `--state-store` together with it (`HandoverError::PostgresStore`: a Postgres
-store cannot give up its writer role), and the bundled proxy of `docs/design/frontend-proxy.md`
-replaces the handover. An update of a Postgres frontend is a restart.
+The unit gives no `--handover-socket` (nor a `RuntimeDirectory=` for one): `kbf frontend` has
+no handover any more, and the flag, like `--instance`, is accepted and ignored with a
+warning. The bundled proxy of `docs/design/frontend-proxy.md` replaces the handover. An update
+of a Postgres frontend is a restart.
 
 **The epoch, and a restore from a backup.** The state store holds the farm's epoch
 (`meta/epoch`), and a frontend that starts keeps it: a restart of a frontend, or the start
@@ -236,14 +236,14 @@ epoch-bump`, then restart the frontend.
 The socket-handover template (two instances, `kbf-frontend@a` and `kbf-frontend@b`, and the
 `kbf frontend handover` command that started the idle one) was retired by a maintainer
 decision: the kbf-installer package no longer ships it, `kbf` no longer has the command, and
-no step of this guide enables it. A frontend keeps its state in Postgres, and `kbf
-frontend` refuses a Postgres `--state-store` together with `--handover-socket`
-(`HandoverError::PostgresStore`), so the template could not start on a host kbf-installer
-set up. A host without the proxy runs `kbf-frontend.service` (one process; an update is a
-restart, and the stop drains, below); a host with the proxy lets kbf-installer's proxy swap
-frontend children (`docs/design/frontend-proxy.md`). `kbf-server`'s own control socket
-stays for the test farm. The retired design is kept as history in
-`docs/design/frontend-handover.md`.
+no step of this guide enables it. A frontend keeps its state in Postgres, which has no
+writer role to hand over, so the template could not start on a host kbf-installer set up.
+A host without the proxy runs `kbf-frontend.service` (one process; an update is a restart,
+and the stop drains, below); a host with the proxy lets kbf-installer's proxy swap
+frontend children (`docs/design/frontend-proxy.md`). `kbf-server` has no control socket
+either: the handover code and its flags (`--handover-socket`, `--instance` and the rest) are
+removed, and the flags are accepted and ignored with a warning for one release. The retired
+design is kept as history in `docs/design/frontend-handover.md`.
 
 ### Stopping a frontend: TimeoutStopSec=infinity
 

@@ -74,8 +74,9 @@ A frontend host enables exactly one of two units; they bind the same ports.
 `kbf-*.socket` and `kbf.slice`, a fourth trust file, no unit of the `kbf-installer` package).
 
 The socket-handover template (`kbf-frontend@.service`, instances `a` and `b`) is no longer
-packaged: the proxy swaps frontend children instead, and a frontend with a Postgres store
-refuses a control socket.
+packaged: the proxy swaps frontend children instead, and `kbf` serves no control socket
+(`--instance`, `--handover-socket` and the other flags of the removed handover are accepted,
+ignored and logged as retired).
 
 Dependencies: the `kbf-installer` deb `crun, uidmap, systemd, ca-certificates`; its rpm the same
 with Fedora's name for `uidmap`, `shadow-utils`. Never Podman, never Envoy (a test pins it): Envoy

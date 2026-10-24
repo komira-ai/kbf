@@ -1,8 +1,8 @@
-//! What a farm does when another process takes its work over (`crate::handover`): it
-//! stops taking any ([`Farm::fence`]), ends the worker streams so the daemons reconnect to
-//! the successor ([`Farm::end_worker_streams`]), answers the callers it still holds from
-//! what the successor writes to the state store ([`Farm::follow`]), and keeps an
-//! operator's cordons across the change.
+//! What a farm does when the other frontends of its state store take its work over (a
+//! retire, `crate::retire`): it stops taking any ([`Farm::fence`]), ends the worker streams
+//! so the daemons reconnect to another frontend ([`Farm::end_worker_streams`]), answers the
+//! callers it still holds from what the others write to the state store ([`Farm::follow`]),
+//! and keeps an operator's cordons across the change.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

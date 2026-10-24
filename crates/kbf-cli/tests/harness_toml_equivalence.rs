@@ -125,11 +125,7 @@ fn processes<T>(topo: &Topology, shape: impl Fn(Unit) -> T) -> Vec<(String, T)> 
             41020,
         )
     };
-    let socket = Path::new("/tmp/kbf-farm-1.sock");
-    out.push((
-        "frontend".to_owned(),
-        shape(frontend(&front, uid, socket, topo)),
-    ));
+    out.push(("frontend".to_owned(), shape(frontend(&front, uid, topo))));
     let roots = ["/farm/node-1", "/farm/node-2", "/farm/node-3"];
     let ids = ["node-1", "node-2", "node-3"];
     for i in 0..nodes {
