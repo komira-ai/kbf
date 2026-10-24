@@ -134,30 +134,40 @@ is signed ad hoc with the hardened runtime, as the other macOS binaries are; a M
 `_kbf-updater` from the property list in `packaging/host-agent/macos`.
 
 ```text
-kbf-updater agent --coordinator <dns name>:<port> --client-cert FILE --client-key FILE --ca FILE
-                  --channel NAME [--operator-api http://IP:PORT --token-file FILE
+kbf-updater agent --coordinator <dns name>:<port> --channel NAME
+                  (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
+                  [--frontend <dns name>:<port>]
+                  [--operator-api http://IP:PORT --token-file FILE
                   [--operator-proxy-auth-file FILE]] [--helper-socket PATH]
                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
                   [--health-poll-secs N] [--retry-secs N]
 ```
 
-- `--coordinator`: a DNS name and a port. The coordinator's certificate must chain to `--ca` for
-  that name and have the role `coordinator`; that is checked after the handshake and before
+- `--coordinator`: a DNS name and a port. The coordinator's certificate must chain to the farm CA
+  for that name and have the role `coordinator`; that is checked after the handshake and before
   anything is sent.
-- `--client-cert`, `--client-key`, `--ca`: files an operator placed (enrollment, the one-time
-  token and the certificate it gets, is a later step). The certificate is the farm CA's `updater`
+- `--state-dir`: the directory `kbf-updater enroll` filled ([below](#enrolling-a-host)): the key,
+  the certificate and the CA are its files. The agent renews the certificate at half its life
+  and writes the new one there; `--frontend` is where. The certificate is the farm CA's `updater`
   certificate: its one DNS name is this node's id and its `urn:kbf:host-role:` is what the host
   runs (`storage`, `daemon` or `mac-daemon`; a `frontend` is refused, the roll updates frontends).
-  The agent reads both from it. The files are read for every heartbeat, so a renewed pair is used
-  from the next one, if it names the same node and role as the pair the agent started with (a
-  pair for another node is refused until the agent is restarted). The key file must be a regular
-  file of the agent's user with mode 0600 or 0400, as the token file must.
+  The agent reads both from it. The files are read for every heartbeat and every call to the
+  frontend, so a renewed pair is used from the next one, if it names the same node and role as the
+  pair the agent started with (a pair for another node is refused until the agent is restarted).
+  The key file must be a regular file of the agent's user with mode 0600 or 0400, as the token
+  file must.
+- `--client-cert`, `--client-key`, `--ca`: instead of `--state-dir`, files an operator placed.
+  Nothing renews them. Not both.
+- `--frontend`: the frontend's public address, a DNS name and a port (the kbf-proxy). The node's
+  drain, undrain and status are calls there, made with the updater's certificate and **no token**;
+  see [the boundary](#the-boundary). It is required with `--state-dir`.
 - `--channel`: the channel of the helper's allowlist. The version the coordinator names is looked
   up in it by the helper, never fetched by URL.
 - `--helper-socket`: the socket of `kbf-host-install --serve` (default
   `/run/kbf-host-install/local.sock`; [host-install.md](host-install.md#the-local-socket)).
-- `--operator-api`, `--token-file`, `--operator-proxy-auth-file`: optional, together; see the
-  boundary below.
+- `--operator-api`, `--token-file`, `--operator-proxy-auth-file`: optional, together: the full
+  operator token over the frontend's loopback, an opt-in fallback used instead of the
+  certificate; see the boundary below.
 - Times, in seconds, 1 to 86400: `--heartbeat-secs` 15, `--drain-deadline-secs` 600,
   `--health-timeout-secs` 300, `--health-poll-secs` 5, `--retry-secs` 900.
 
@@ -181,7 +191,7 @@ before it worked:
    checked there. An unattested build, one of another commit, or one the channel does not have is
    refused here, and the node has not been touched.
 2. **Drain** the node at the frontend (`:drain` of the operator API, as the roll mode does for a
-   daemon host; a storage host is never drained) and wait for its leases, for at most
+   daemon host, with the updater's certificate through the proxy; a storage host is never drained) and wait for its leases, for at most
    `--drain-deadline-secs`.
 3. **Switch** (`switch`): the helper puts X on trial and restarts the units.
 4. **Health**: the node's health check (`node_health`: a storage member is `active` on the build, a daemon is connected on it) of X, held drained, for
@@ -196,16 +206,149 @@ pending marker (`query`) and finishes the trial from step 4; nothing is fetched,
 switched twice. A target that failed is not tried again before `--retry-secs`, however often
 the coordinator names it.
 
+### Enrolling a host
+
+A host gets its updater certificate from the farm CA with a one-time token, with `kbf-updater enroll`:
+
+```text
+kbf-updater enroll --frontend <dns name>:<port> --node-id ID --token-file FILE --state-dir DIR
+```
+
+1. On the frontend the operator makes the token (`POST /v1/enroll/tokens`, [../api.md](../api.md)):
+   `{"roles": ["updater"], "node_id": "host-1", "host_role": "daemon"}`, one use. The token fixes
+   the node id and the host role; a token for a node's roles (`storage`, `daemon`) is refused for
+   an updater, and an updater token is refused for any other role, for another node id, a second
+   time and after it expired.
+2. On the host, as the agent's account, the token goes in a file of that account's with mode 0600
+   and the state directory is that account's with mode 0700 (the command refuses otherwise,
+   before it reads the token). The command makes the key on the host (mode 0600; only a request
+   signed by it is sent), checks the frontend against the CA pin the token carries and the answer
+   (role, node id, key, chain) before it writes anything, installs `pki/updater.key`,
+   `pki/updater.pem` and `pki/ca.pem`, and removes the token file. Run again after a success it
+   finds the host enrolled and changes nothing; after a failure it leaves the token file for a retry.
+3. The agent started with `--state-dir DIR` renews the certificate at half its life (spread by up
+   to 10%), by a request signed by the key the registry holds, retrying every five minutes
+   doubling to an hour, and logs an error when less than a day is left. A host whose certificate
+   lapsed during an outage recovers by itself, for as long as the host is not replaced.
+
+Revoking the host by its id (`POST /v1/enroll/nodes/{id}/revoke`) revokes its updater row too, so the
+renewal is refused and the certificate runs out at its end. The proxy does not read the deny list,
+so a certificate already issued keeps its three own-node calls (drain, uncordon, status) until it
+expires: seven days by default, thirty at most. A host re-enrolled with a `replace` token stops
+the old key from renewing in the same way and does not cut off a certificate already issued.
+The `deadline_secs` of a self-drain is whatever the host sends; it only moves that host's own
+drain deadline.
+
+The CA's key is the frontend's alone; the coordinator holds none. The units in
+`packaging/host-agent` use this layout ([its README](../../packaging/host-agent/README.md)).
+
 ### The boundary
 
-The design says the full operator token must not be on hosts. **No scoped credential exists yet**:
-`docs/api.md` plans the operator API's roles (`admin`, a short-lived `rollout`), and the token is
-the one operator credential until they land. The drain of a node (`NodeDrain`: cordon, drain,
-uncordon) and the node's health are calls to the operator API, which is on the frontend's
-loopback. This mode therefore takes `--operator-api` and `--token-file` as the roll mode does, and
-updates only where both are within reach; the agent reaches nothing else of the frontend. **The
-packaged units give the agent neither**: without them it heartbeats and refuses every update
-order before it fetches anything, so a host runs the agent only as far as the heartbeat until an
-operator decides to put the token on it (anything running as the agent's account can then read
-it). The mechanism is the one the design names, behind two small ports (`Drain`, `HealthCheck`)
-so that a scoped credential replaces the adapter and not the agent.
+The design says the full operator token must not be on hosts, and the agent does not need it. The
+drain of a node (`NodeDrain`: cordon, drain, uncordon) and the node's status for its health are
+calls to the operator API, which is on the frontend's loopback. The agent makes them through the
+frontend's public proxy with its updater certificate: **the proxy admits, for that certificate,
+`POST /v1/nodes/{id}:drain`, `POST /v1/nodes/{id}:uncordon` and `GET /v1/nodes/{id}` for the
+certificate's own node id, and nothing else** (another node's id, the cordon, a listing, the update
+API and everything else is `403`; so are the worker and build-cache paths whatever `buck2_auth`
+says), and puts the operator token in itself. The shipped units give the agent no token. The proxy's certificate for the name in `--frontend` must be the farm CA's `frontend` certificate (the agent checks the chain to the farm CA, the name and the role before it sends a byte), not a public one.
+
+What remains of the token: `--operator-api` and `--token-file` (and the proxy secret file) are an
+opt-in fallback for a host whose operator accepts the token there (anything running as the agent's
+account can then read it); given, they are used instead of the certificate. A **storage** host
+needs them: its health is read from `GET /v1/enroll/nodes` and `GET /v1/members`, which a
+certificate cannot reach, so a storage host's agent without them heartbeats and refuses every update
+order before it fetches anything, and the roll updates the host. Without `--frontend` and without
+the token an agent does the same for any host. The mechanism is behind two small ports (`Drain`,
+`HealthCheck`), so that a storage-health route a certificate may call replaces the refusal and not
+the agent.
+
+## Turn on the deploy step
+
+The last job of `release.yml`, `deploy`, tells the update coordinator "desired = this release" once
+`publish` has made the release, and waits until the farm converges. It is the end-to-end check of
+a release on a real farm. It does nothing until an operator has done the three things below, once;
+until then the job prints `::notice::the deploy step is off` and passes, so a fork or a repository
+that runs no farm is unaffected. Nothing in this repository does any of them.
+
+1. **Deploy the coordinator** (`kbf-coordinator`, [the design](../design/updates.md)) with a
+   certificate the farm CA issued with the role `coordinator`, and an allow-list for CI's OIDC
+   token in the file `--oidc-config` names. The job's token is the run's, so the allow-list must
+   say exactly this, and nothing wider:
+
+   ```toml
+   [remote_operator]
+   issuer = "https://token.actions.githubusercontent.com"
+   audience = "https://<the coordinator's control address, as written in the variable below>"
+   repository_id = "<the numeric id of komira-ai/kbf>"
+   repository = "komira-ai/kbf"
+   job_workflow_ref = ["komira-ai/kbf/.github/workflows/release.yml@refs/heads/main"]
+   refs = ["refs/heads/main"]
+   environments = ["release"]
+   event_names = ["workflow_run"]
+   ```
+
+   `event_names` must name `workflow_run`: the release workflow is started by the completion of
+   the pipeline, and its tokens say so (the default list is `push` and `workflow_dispatch`).
+   The `sha` of the token is the head of `main`, not the commit released. A token is good for one
+   call. The control listener (`--control-listen`) must be reachable from GitHub-hosted runners;
+   the heartbeat listener need not be.
+2. **Enroll the hosts**, so that their updaters heartbeat to the coordinator
+   ([The agent mode](#the-agent-mode)). A host that does not heartbeat is `down`, and the
+   coordinator does not wait for it: it says `converged` when every host that does heartbeat runs
+   the release, none is updating or failed, and at least the minimums (below) are up. The step
+   does not take that alone: it remembers how many hosts of each role were live when it started
+   (see below) and fails if fewer run the release at the end, so a host that the release made
+   stop heartbeating fails the deploy. A host that was already down when the step started is not
+   expected; raise the minimums to the number of hosts the farm must keep, for the roles whose
+   count matters beyond that.
+3. **Set the repository variables** (Settings, Secrets and variables, Actions, Variables):
+
+   | variable | value |
+   |---|---|
+   | `KBF_COORDINATOR_URL` | `https://<name>:<port>` of the control listener, no path. Unset or empty: the step is off |
+   | `KBF_COORDINATOR_CA` | the farm CA's certificate (PEM, public). The coordinator's certificate is the farm CA's, which no system store holds; empty trusts the system store instead |
+   | `KBF_MIN_UP_STORAGE`, `KBF_MIN_UP_FRONTEND` | optional: the storage hosts and frontends that must stay up while others update (default 1 each). The operator picks the storage number so that every blob stays readable |
+
+### What the step does
+
+`cargo xtask deploy-farm` (one `run:` line):
+
+1. reads `GET /v1/convergence` once, before anything is changed, and keeps the hosts live then
+   (at the version, updating or failed, so not `down`) per role as the baseline, and prints it
+   (`baseline: hosts live before the deploy: storage 3, frontend 2`). A 503 on this read is tried
+   again like the POST. A coordinator that has just restarted (the table says so) may not have
+   heard from every host yet; a host it hears from later counts as one that joined;
+2. posts `{"version": <the release's version>, "min_up": {...}}` to `/v1/desired` (the per-role
+   limits are the coordinator's defaults), with an OIDC token for the audience that is the URL as
+   written in the variable (the audience keeps a trailing `/` the variable has, which the URL
+   the calls go to does not, so write the variable and the allow-list's `audience` alike). A 503
+   on the POST is tried again, up to four times;
+3. reads `GET /v1/convergence` every 30 seconds, with a fresh token each time, and prints a
+   table of the counts per role (`at_desired`, `updating`, `failed`, `down`);
+4. ends when the coordinator says `converged` and every role has at least as many hosts at the
+   version as it had live at the baseline (exit 0; a host that joined during the deploy only
+   adds); when it says `converged` and a role has fewer, which fails with the role, the count
+   expected, the count reached and how many went down; `blocked` (a live host failed its update to
+   this version and is still behind it); when the counts have not changed for 20 minutes
+   (`--stall-min`; a host whose update takes longer than that leaves the counts as they are, so
+   raise the flag past the longest update); when the coordinator's desired version is no longer
+   this release's (another writer replaced it); when 60 minutes are up (`--deadline-min`); or when the coordinator refuses
+   the token (401 or 403, at once: the allow-list does not match this job). Any of those but
+   convergence fails the job; the release stays published whatever it says. Another failed read
+   is reported and tried again, and counts as no change.
+
+`GET /v1/convergence` answers `{"desired", "quiet", "state", "roles": [{"role", "at_desired",
+"updating", "failed", "down"}]}`, where `state` is `converged`, `blocked` or `in_progress`. It
+takes CI's OIDC token and refuses the operator token (the operator's read is `GET /v1/status`).
+It is computed from the heartbeats and the desired state, and stores nothing. `converged` needs
+the coordinator to be past its 30 second quiet start, at least one live host, every live host at
+the version and none updating or failed, and `min_up` hosts of the storage and frontend roles up,
+so a coordinator that has just restarted does not report a farm it has not heard from as
+converged.
+
+The `deploy` job runs in the `release` environment, like `publish`: if the environment has
+required reviewers, a release is approved a second time before the job starts.
+
+One release at a time holds across the deploy: the workflow's group does not cancel, so a second
+release waits for the first release's deploy (at most 90 minutes) to end.

@@ -1,6 +1,7 @@
 //! The agent over fakes, with its two threads: what the heartbeat says, that it goes on while an
 //! update blocks, how an order is taken, and how a restart and a failure are handled.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -9,6 +10,7 @@ use kbf_types::ReleasePlatform;
 use super::coordinator::CoordinatorError;
 use super::flags::Timing;
 use super::local::Trial;
+use super::renew::Renewer;
 use super::run::{Agent, Stop, World};
 use super::status::Status;
 use super::testing::{
@@ -36,6 +38,7 @@ struct Rig {
     health: FakeHealth,
     logs: Arc<Mutex<Vec<String>>>,
     timing: Timing,
+    renewer: Option<Arc<dyn Renewer>>,
 }
 
 impl Rig {
@@ -51,6 +54,7 @@ impl Rig {
             health,
             logs: Arc::default(),
             timing: timing(),
+            renewer: None,
             events,
         }
     }
@@ -68,6 +72,7 @@ impl Rig {
                 health: Arc::new(self.health.clone()),
                 clock: Arc::new(SystemClock::new()),
                 unix_now: Arc::new(|| 10_000),
+                renewer: self.renewer.clone(),
                 log: Arc::new(move |line| logs.lock().unwrap().push(line.to_owned())),
             },
             Status::unknown(ReleasePlatform::LinuxX86_64, version("0")),
@@ -440,4 +445,54 @@ fn the_status_is_refreshed_once_a_heartbeat_has_passed_with_no_order() {
     rig.run_until(&agent, |rig| rig.events.count("local:query") >= 4);
     let queries = rig.events.count("local:query");
     assert!(queries >= 4, "{queries}");
+}
+
+/// A renewer that counts its rounds and takes its time over each.
+struct SlowRenewer {
+    rounds: Arc<AtomicUsize>,
+    takes: Duration,
+    wait: Duration,
+}
+
+impl Renewer for SlowRenewer {
+    fn round(&self) -> Duration {
+        self.rounds.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(self.takes);
+        self.wait
+    }
+}
+
+/// The certificate's renewal runs on a thread of its own, again and again for as long as the
+/// agent runs: a renewal that takes a long time (the frontend is slow) does not hold back a
+/// heartbeat, and the agent still stops when told.
+#[test]
+fn the_renewer_runs_beside_the_heartbeats_and_does_not_hold_them_back() {
+    let mut rig = Rig::new();
+    let rounds = Arc::new(AtomicUsize::new(0));
+    rig.renewer = Some(Arc::new(SlowRenewer {
+        rounds: Arc::clone(&rounds),
+        takes: Duration::from_millis(400),
+        wait: Duration::from_millis(1),
+    }));
+    let agent = rig.agent();
+    rig.run_until(&agent, |rig| {
+        rounds.load(Ordering::SeqCst) >= 2 && rig.beats().len() >= 3
+    });
+    assert!(
+        rounds.load(Ordering::SeqCst) >= 2,
+        "renewed again after waiting"
+    );
+    assert!(
+        rig.beats().len() >= 3,
+        "heartbeats went on while a renewal was under way"
+    );
+}
+
+/// An agent given no renewer (the files are an operator's) starts none.
+#[test]
+fn an_agent_with_no_renewer_has_none_to_run() {
+    let rig = Rig::new();
+    let agent = rig.agent();
+    rig.run_until(&agent, |rig| !rig.beats().is_empty());
+    assert!(!rig.beats().is_empty());
 }

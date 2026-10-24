@@ -70,7 +70,22 @@ impl EnrollService {
             });
             keys.push((*role, parsed.key));
         }
-        let advertise = advertise_of(self, &node_id)?;
+        // Only a storage node's certificate names a host, and the node row read here is the
+        // node's: an updater of the same id is not judged by it.
+        let advertise = if keys.iter().any(|(role, _)| *role == Role::Storage) {
+            advertise_of(self, &node_id)?
+        } else {
+            None
+        };
+        // An updater is renewed as the host role it enrolled with, which the registry keeps
+        // on its row; a node id with no updater row is not known as one.
+        let host_role = if keys.iter().any(|(role, _)| *role == Role::Updater) {
+            let held = registry::updater_host_role(&*core.store, &node_id)
+                .map_err(|e| registry_reason(&e))?;
+            Some(held.ok_or(RefusalReason::UnknownNode)?)
+        } else {
+            None
+        };
         let mut sign = || {
             // The frontend names and the refusals are the current ones: a node enrolled
             // before a `--frontend-name` was added must not keep a certificate naming it.
@@ -86,8 +101,7 @@ impl EnrollService {
             }
             keys.iter()
                 .map(|(role, key)| {
-                    let named = advertise.as_deref().filter(|_| *role == Role::Storage);
-                    core.issue(&node_id, *role, key, named)
+                    core.issue_for(&node_id, *role, key, host_role, advertise.as_deref())
                 })
                 .collect()
         };

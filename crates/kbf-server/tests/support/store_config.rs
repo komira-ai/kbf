@@ -373,6 +373,7 @@ pub fn enroll(store: &dyn Store, name: &str) {
     let token = TokenId::parse("aaaaaaaaaaaa").expect("a token id");
     let spec = TokenSpec {
         roles: RoleSet::new([Role::Daemon]).expect("roles"),
+        host_role: None,
         max_uses: 5,
         ttl: None,
         node_id: None,

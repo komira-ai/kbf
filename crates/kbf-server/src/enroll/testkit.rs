@@ -233,6 +233,7 @@ pub fn register_cold(farm: &Farm) -> u64 {
 pub fn spec(roles: &[Role]) -> TokenSpec {
     TokenSpec {
         roles: RoleSet::new(roles.iter().copied()).expect("roles"),
+        host_role: None,
         max_uses: 1,
         ttl: None,
         node_id: None,

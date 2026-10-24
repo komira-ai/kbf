@@ -1,7 +1,7 @@
 //! The rows, their keys and their codec.
 //!
 //! Every row is a hand-derived `prost` message, not a generated one, so that a binary
-//! reading a row written by a newer binary (a handover runs both against one store) ignores
+//! reading a row written by a newer binary (a roll runs both against one store) ignores
 //! the fields it does not know instead of refusing the row. Numbers are never reused.
 
 use kbf_state::{StoreTime, Version, Versioned};
@@ -13,6 +13,9 @@ use crate::error::{Corrupt, Internal};
 
 pub(crate) const TOKEN_PREFIX: &str = "enroll/token/";
 pub(crate) const NODE_PREFIX: &str = "enroll/node/";
+/// A host's updater has its own row family: its node id is also the id of the host's storage
+/// or daemon node, and the two enrollments must neither supersede nor deny one another.
+pub(crate) const UPDATER_PREFIX: &str = "enroll/updater/";
 pub(crate) const DENY_PREFIX: &str = "deny/";
 pub(crate) const CA_GENERATION: &str = "enroll/ca/generation";
 
@@ -21,6 +24,18 @@ pub(crate) fn token_key(id: &TokenId) -> String {
 }
 pub(crate) fn node_key(id: &NodeId) -> String {
     format!("{NODE_PREFIX}{id}")
+}
+pub(crate) fn updater_key(id: &NodeId) -> String {
+    format!("{UPDATER_PREFIX}{id}")
+}
+/// The row of the node `id` enrolled as `roles`: a host's updater has its own row, every other
+/// set of roles is the node's.
+pub(crate) fn row_key(roles: RoleSet, id: &NodeId) -> String {
+    if roles.contains(Role::Updater) {
+        updater_key(id)
+    } else {
+        node_key(id)
+    }
 }
 pub(crate) fn serial_key(serial: &str) -> String {
     format!("enroll/serial/{serial}")
@@ -98,6 +113,9 @@ pub(crate) struct TokenRow {
     pub created_by: String,
     #[prost(uint64, optional, tag = "13")]
     pub revoked_at: Option<u64>,
+    /// What the host runs, for a token that grants the role `updater`.
+    #[prost(string, optional, tag = "14")]
+    pub host_role: Option<String>,
 }
 
 /// One certificate a node holds or held.
@@ -131,7 +149,7 @@ pub(crate) struct PriorRow {
 pub(crate) const STATE_ACTIVE: i32 = 1;
 pub(crate) const STATE_REVOKED: i32 = 2;
 
-/// `enroll/node/<id>`.
+/// `enroll/node/<id>`, or `enroll/updater/<id>` for a host's updater.
 #[derive(Clone, PartialEq, prost::Message)]
 pub(crate) struct NodeRow {
     #[prost(message, repeated, tag = "1")]
@@ -156,6 +174,9 @@ pub(crate) struct NodeRow {
     pub revoked_by: String,
     #[prost(message, repeated, tag = "11")]
     pub priors: Vec<PriorRow>,
+    /// What the host runs, for an updater's row (copied from its token when it enrolled).
+    #[prost(string, optional, tag = "12")]
+    pub host_role: Option<String>,
 }
 
 /// `enroll/serial/<hex>`.

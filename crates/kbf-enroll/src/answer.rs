@@ -232,7 +232,8 @@ fn parse<'a>(der: &'a [u8]) -> Option<X509Certificate<'a>> {
     }
 }
 
-/// Whether the certificate's DNS names include the node id; a daemon's are exactly it.
+/// Whether the certificate's DNS names include the node id; a daemon's and an updater's are
+/// exactly it.
 fn names_node(cert: &X509Certificate<'_>, node_id: &NodeId, role: Role) -> bool {
     let names: Vec<&str> = cert
         .extensions()
@@ -248,7 +249,7 @@ fn names_node(cert: &X509Certificate<'_>, node_id: &NodeId, role: Role) -> bool 
         })
         .collect();
     match role {
-        Role::Daemon => names == [node_id.as_str()],
+        Role::Daemon | Role::Updater => names == [node_id.as_str()],
         Role::Storage => names.contains(&node_id.as_str()),
     }
 }

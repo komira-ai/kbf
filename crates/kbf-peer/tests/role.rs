@@ -30,7 +30,7 @@ fn der(sans: Vec<SanType>) -> Vec<u8> {
 /// name beside the role (a daemon's node id) taken for a second role.
 #[test]
 fn each_role_is_read_from_its_one_uri() {
-    let spelled = ["frontend", "storage", "daemon"];
+    let spelled = ["frontend", "storage", "daemon", "updater"];
     assert_eq!(PeerRole::ALL.map(PeerRole::name), spelled);
     for (want, name) in PeerRole::ALL.into_iter().zip(spelled) {
         assert_eq!(want.to_string(), name);

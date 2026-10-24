@@ -28,6 +28,9 @@ use support::{
 };
 use x509_parser::prelude::{FromDer, X509Certificate};
 
+/// The roles of a node (a host's updater is not one).
+const NODE_ROLES: [Role; 2] = [Role::Storage, Role::Daemon];
+
 fn authority() -> Authority {
     Authority::create(External::new(), Policy::default(), NOW, &mut Stream(1)).expect("a root")
 }
@@ -178,7 +181,7 @@ fn two_roots_do_not_share_a_name() {
 fn a_node_certificate_is_the_table_and_nothing_else() {
     let ca = authority();
     let root = view(ca.root_der());
-    for role in Role::ALL {
+    for role in NODE_ROLES {
         let key = key();
         let issued = issue(&ca, "node-1", role, &key, None);
         let v = view(&issued.der);
@@ -234,7 +237,7 @@ fn a_hostile_request_gets_only_the_table() {
         .as_ref()
         .to_vec();
     let parsed = parse_csr(&der).expect("valid");
-    for role in Role::ALL {
+    for role in NODE_ROLES {
         let issued = issue(&ca, "n1", role, &parsed.key, None);
         let v = view(&issued.der);
         expected(role, "n1")(&v);
@@ -249,7 +252,7 @@ fn a_hostile_request_gets_only_the_table() {
 fn a_node_certificate_cannot_be_asked_for_the_frontend_role() {
     for role in Role::ALL {
         match role {
-            Role::Storage | Role::Daemon => {}
+            Role::Storage | Role::Daemon | Role::Updater => {}
         }
     }
     assert!("frontend".parse::<Role>().is_err());
@@ -522,13 +525,35 @@ fn an_updater_certificate_names_the_updater_role_and_the_hosts_role() {
         assert_eq!(v.spki, key.spki());
         assert_eq!(
             kbf_peer::role_of(&issued.der),
-            Err(kbf_peer::RoleError::Unknown("updater".to_owned())),
-            "storage admits no updater"
+            Ok(kbf_peer::PeerRole::Updater),
+            "listeners read the role `updater` and refuse it by their own tables"
         );
         as_client(&[ca.root_der()], &[&issued.der]).expect("dials the coordinator");
         as_server(&[ca.root_der()], &[&issued.der], "host-7")
             .expect_err("an updater certificate serves nothing");
     }
+}
+
+// Catches: the updater role issued as a node's certificate, which would give it the node
+// shape (a role URI and the node's names, no host role) instead of its own.
+#[test]
+fn a_node_certificate_cannot_be_an_updaters() {
+    let ca = authority();
+    let key = key();
+    let id = node("host-7");
+    assert_eq!(
+        ca.issue_node(
+            &NodeCert {
+                node_id: &id,
+                role: Role::Updater,
+                key: &key,
+                advertise: None,
+            },
+            NOW,
+            &mut Stream(5),
+        ),
+        Err(CaError::NotANodeRole)
+    );
 }
 
 // Catches: a coordinator certificate with the wrong role, an EKU that lets it act as a

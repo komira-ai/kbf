@@ -17,5 +17,6 @@ mod ready;
 mod reload;
 mod routing;
 mod secure;
+mod self_node;
 mod sni;
 mod ui;

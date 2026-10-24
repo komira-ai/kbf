@@ -173,7 +173,7 @@ both instances' certificates carry their names. **[V]** the cert-reload mechanis
 
 #### 2.5.2 The sequence
 
-**[F]** The mechanics of the baton are those of `docs/design/frontend-handover.md` (#887) minus the sockets. In order:
+**[F]** The mechanics of the baton were those of the frontend handover (#887, removed; see `docs/design/frontend-proxy.md`) minus the sockets. In order:
 
 | # | Step | Owner | Detail |
 |---|---|---|---|

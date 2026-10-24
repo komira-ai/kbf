@@ -53,7 +53,7 @@ pub struct UpstreamTable {
 /// One `[[frontend]]` table: a frontend that runs on its own, which the proxy balances over.
 /// Its listeners are at fixed offsets from `base_port` (REAPI 0, worker 1, operator 2, admin
 /// calls 3, enrollment 4), on loopback; the offsets are the frozen contract with the
-/// children (design section 7).
+/// children (`kbf-proxy-api.md` section 7).
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Frontend {

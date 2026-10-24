@@ -8,6 +8,10 @@
 //!   advisories`, kept in one GitHub issue (opened, updated, or commented on and closed when
 //!   none remain) instead of failing a pull request. Exit 0 whatever it found; 1 when
 //!   cargo-deny or `gh` failed. `advisories.yml` runs it daily and on every push to `main`.
+//! - `deploy-farm --url <url> --version <v> [--deadline-min 60] [--stall-min 20]` ([`deploy_farm`]): after a
+//!   release is published, set it as the update coordinator's desired version (CI's OIDC token)
+//!   and wait until the farm converges; exit 1 when it is blocked, stalled or out of time. An
+//!   empty `--url` prints a notice and exits 0.
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
 //!   row the working tree's budget file has and `<rev>`'s does not is refused, unless
 //!   git sees the row's path renamed from a path `<rev>` has a row for. CI runs
@@ -95,6 +99,7 @@ pub mod build_commit;
 pub mod bundles;
 pub mod crun_tests;
 pub mod darwin;
+pub mod deploy_farm;
 pub mod entitlements;
 pub mod fetch;
 pub mod installer_tarball;
@@ -167,6 +172,9 @@ enum Verb {
     BuildCommit(BuildCommit),
     /// Keep the advisories `cargo deny` reports in one GitHub issue.
     Advisories(advisories::Args),
+    /// Set a published release as the farm's desired version on the update coordinator and
+    /// wait for the farm to converge.
+    DeployFarm(deploy_farm::Args),
     /// Refuse a row the budget file gains against `--base`.
     BudgetDiff {
         /// The revision to compare with (on a pull request, the base branch).
@@ -886,6 +894,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             root: &root,
         }),
         Verb::Advisories(args) => advisories::run(&args, &root, &cargo_program()),
+        Verb::DeployFarm(args) => deploy_farm::run(&args),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
         Verb::Fetch {
             url,

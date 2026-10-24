@@ -117,3 +117,27 @@ fn the_platform_is_named_as_the_releases_name_it() {
         assert_eq!(platform_of(os, arch), None, "{os} {arch}");
     }
 }
+
+/// `kbf-updater enroll` is its own command: wrong flags are a usage error of its own (exit 2, its
+/// usage), and flags that are right for a host with no token are a failure with the reason (exit
+/// 1); neither starts the agent or the roll.
+#[test]
+fn the_enroll_command_is_a_usage_error_or_a_failed_enrollment() {
+    let (code, text) = run(&args(&["kbf-updater", "enroll", "--bogus", "1"]));
+    assert_eq!(code, 2);
+    assert!(text.contains("usage: kbf-updater enroll"), "{text}");
+    let (code, text) = crate::run_enroll_with(&args(&["kbf-updater", "enroll"]));
+    assert_eq!(code, 2);
+    assert!(text.contains("--frontend is required"), "{text}");
+    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "entry-enroll");
+    let (code, text) = run(&args(&[
+        "kbf-updater",
+        "enroll",
+        "--frontend=localhost:1",
+        "--node-id=host-1",
+        &format!("--token-file={}", dir.join("none").display()),
+        &format!("--state-dir={}", dir.join("state").display()),
+    ]));
+    assert_eq!(code, 1);
+    assert!(text.contains("none"), "{text}");
+}

@@ -90,6 +90,24 @@ impl Pki {
         }
     }
 
+    /// The frontend's certificate, for `localhost`: what the public proxy presents.
+    pub fn frontend(&self) -> Leaf {
+        let (pair, public) = key_pair();
+        let issued = self
+            .ca
+            .issue_frontend(
+                &["localhost", "127.0.0.1"],
+                &public,
+                now(),
+                &mut SystemEntropy,
+            )
+            .expect("issued");
+        Leaf {
+            der: issued.der,
+            key: pair.serialize_der(),
+        }
+    }
+
     /// An updater's certificate for the node `name` of a host running as `role`.
     pub fn updater(&self, name: &str, role: HostRole) -> Leaf {
         let (pair, public) = key_pair();

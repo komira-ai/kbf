@@ -128,6 +128,31 @@ fn a_daemon_certificate_names_exactly_the_node_and_a_storage_one_at_least() {
 }
 
 #[test]
+fn an_updater_certificate_names_exactly_the_node() {
+    let pki = Pki::new();
+    let node = node();
+    let bundle = pki.root_pem();
+    let updater = issue(&pki, &node, Role::Updater, None);
+    run(&pki.pin(), &node, Role::Updater, &updater, &bundle).expect("the node and nothing else");
+
+    // A name beside the node's makes the certificate another host's too: refused, as a daemon's.
+    let extra = issue(&pki, &node, Role::Updater, Some("other.example.com"));
+    let err = run(&pki.pin(), &node, Role::Updater, &extra, &bundle).unwrap_err();
+    assert_eq!(
+        err,
+        AnswerError::Cert {
+            role: Role::Updater,
+            fault: CertFault::Name
+        }
+    );
+
+    // A certificate of another role is not the updater's, whatever its names.
+    let daemon = issue(&pki, &node, Role::Daemon, None);
+    let err = run(&pki.pin(), &node, Role::Updater, &daemon, &bundle).unwrap_err();
+    assert_eq!(err, AnswerError::RoleSet);
+}
+
+#[test]
 fn two_certificates_for_one_role_are_not_the_requested_set() {
     let pki = Pki::new();
     let node = node();
