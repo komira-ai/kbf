@@ -8,13 +8,20 @@
 //!
 //! 1. With an empty `--url` the verb prints a notice and exits 0: a fork, or a repository
 //!    whose operator has not set the coordinator's address, deploys nothing and fails nothing.
-//! 2. `POST /v1/desired` with the version and the minimums, authenticated by a GitHub
+//! 2. `GET /v1/convergence` once, before anything is changed: the hosts live then (at the
+//!    desired version, updating or failed; not `down`) are the baseline, per role, and are
+//!    printed.
+//! 3. `POST /v1/desired` with the version and the minimums, authenticated by a GitHub
 //!    Actions OIDC token whose audience is the coordinator (`--audience`, by default the URL).
-//! 3. `GET /v1/convergence` every `--every-secs`, with a fresh token each time (a token is
+//! 4. `GET /v1/convergence` every `--every-secs`, with a fresh token each time (a token is
 //!    good for one call and for ten minutes; a deploy waits for an hour). Each answer is
 //!    printed as a table.
 //!
-//! It ends with exit 0 when the coordinator says `converged`, and 1 when it says `blocked`
+//! It ends with exit 0 when the coordinator says `converged` and every role has at least as
+//! many hosts at the version as it had live at the baseline (the coordinator's `converged`
+//! answers for the hosts it hears from, so a host the release crashed would not stop it); a
+//! host that was `down` before the deploy is not in the baseline, and one that joins during
+//! it only adds. It ends with 1 when a role has fewer, when the coordinator says `blocked`
 //! (a host failed its update to this version), when the counts have not changed for
 //! `--stall-min` minutes, when `--deadline-min` minutes are up, or when a call is refused
 //! (401, 403), when the coordinator's desired version is no longer this release's (another
@@ -46,11 +53,16 @@ const MAX_ANSWER: u64 = 1 << 20;
 /// How many times the POST is tried when the call fails for a reason that may pass.
 const POST_ATTEMPTS: u32 = 4;
 
-/// Whether a failed call may pass: the coordinator's 503, and nothing else (a certificate it
-/// is not trusted by, or a runner without a token, does not get better).
+/// Whether a failed call may pass: the coordinator's 503 on the POST or on the baseline read,
+/// and nothing else (a certificate it is not trusted by, or a runner without a token, does
+/// not get better; a poll that fails is tried again anyway).
 fn retryable(what: &str, why: &str) -> bool {
-    what == "set the desired version" && why == "status 503"
+    matches!(what, SET_DESIRED | READ_BASELINE) && why == "status 503"
 }
+
+/// What the calls are named in an error.
+const SET_DESIRED: &str = "set the desired version";
+const READ_BASELINE: &str = "read the farm before the deploy";
 
 /// The path of the desired state, and of the convergence read.
 const DESIRED_PATH: &str = "/v1/desired";
@@ -119,6 +131,16 @@ pub enum Error {
         "the coordinator's desired version is {0:?}, not this release's: another writer replaced it"
     )]
     Superseded(String),
+    #[error(
+        "{role}: {expected} hosts were live before the deploy, {reached} run {version}: {} went down",
+        .expected - .reached
+    )]
+    Lost {
+        role: String,
+        expected: u64,
+        reached: u64,
+        version: String,
+    },
     #[error("the counts have not changed for {0} seconds")]
     Stalled(u64),
     #[error("the farm has not converged after {0} seconds")]
@@ -283,26 +305,14 @@ pub fn deploy(
             .and_then(|()| out.flush())
             .map_err(|e| Error::Output(e.to_string()))
     };
+    let baseline =
+        Read::of(&client.send_retrying(out, READ_BASELINE, CONVERGENCE_PATH, None, plan)?)?.live();
+    log(out, &baseline_line(&baseline))?;
     let body = json!({
         "version": plan.version,
         "min_up": {"storage": plan.min_up_storage, "frontend": plan.min_up_frontend},
     });
-    // A 503 (the coordinator could not reach the token issuer) is not a verdict: the POST is
-    // tried a few times; a refusal or another failure is final.
-    let mut attempt = 1;
-    loop {
-        match client.send(out, "set the desired version", DESIRED_PATH, Some(&body)) {
-            Err(Error::Call { what, why }) if attempt < POST_ATTEMPTS && retryable(what, &why) => {
-                log(out, &format!("the POST failed, trying again: {why}"))?;
-                attempt += 1;
-                std::thread::sleep(plan.every);
-            }
-            other => {
-                other?;
-                break;
-            }
-        }
-    }
+    client.send_retrying(out, SET_DESIRED, DESIRED_PATH, Some(&body), plan)?;
     log(out, &format!("desired version {} set", plan.version))?;
 
     let started = Instant::now();
@@ -317,7 +327,7 @@ pub fn deploy(
                     return Err(Error::Superseded(read.desired));
                 }
                 match read.state.as_str() {
-                    "converged" => return Ok(()),
+                    "converged" => return read.holds(&baseline, &plan.version),
                     "blocked" => return Err(Error::Blocked(plan.version.clone())),
                     _ => {}
                 }
@@ -349,6 +359,33 @@ struct Client<'a> {
 }
 
 impl Client<'_> {
+    /// [`Client::send`], tried again (up to `POST_ATTEMPTS` calls) when the failure may pass:
+    /// a 503 means the coordinator could not reach the token issuer, which is no verdict.
+    fn send_retrying(
+        &self,
+        out: &mut dyn Write,
+        what: &'static str,
+        path: &str,
+        body: Option<&Value>,
+        plan: &Plan,
+    ) -> Result<Value, Error> {
+        let mut attempt = 1;
+        loop {
+            match self.send(out, what, path, body) {
+                Err(Error::Call { what, why })
+                    if attempt < POST_ATTEMPTS && retryable(what, &why) =>
+                {
+                    writeln!(out, "the call failed, trying again: {what}: {why}")
+                        .and_then(|()| out.flush())
+                        .map_err(|e| Error::Output(e.to_string()))?;
+                    attempt += 1;
+                    std::thread::sleep(plan.every);
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// A fresh OIDC token for the plan's audience; masked in the log.
     fn token(&self, out: &mut dyn Write) -> Result<String, Error> {
         let call = |why: String| Error::Call {
@@ -446,6 +483,19 @@ fn plain(text: &str) -> String {
     line.trim_start_matches(':').to_owned()
 }
 
+/// The baseline as one log line.
+fn baseline_line(baseline: &[(String, u64)]) -> String {
+    let roles: Vec<String> = baseline.iter().map(|(r, n)| format!("{r} {n}")).collect();
+    format!(
+        "baseline: hosts live before the deploy: {}",
+        if roles.is_empty() {
+            "none".to_owned()
+        } else {
+            roles.join(", ")
+        }
+    )
+}
+
 /// What the coordinator said, as far as the table needs it.
 struct Read {
     state: String,
@@ -479,6 +529,35 @@ impl Read {
             quiet: answer["quiet"].as_bool().unwrap_or(false),
             roles,
         })
+    }
+
+    /// The hosts live now (not `down`) per role.
+    fn live(&self) -> Vec<(String, u64)> {
+        let live = |[at, updating, failed, _]: &[u64; 4]| at + updating + failed;
+        self.roles
+            .iter()
+            .map(|(role, counts)| (role.clone(), live(counts)))
+            .collect()
+    }
+
+    /// Whether every role of the baseline has as many hosts at the version as it had live.
+    fn holds(&self, baseline: &[(String, u64)], version: &str) -> Result<(), Error> {
+        for (role, expected) in baseline {
+            let reached = self
+                .roles
+                .iter()
+                .find(|(r, _)| r == role)
+                .map_or(0, |(_, [at, ..])| *at);
+            if reached < *expected {
+                return Err(Error::Lost {
+                    role: role.clone(),
+                    expected: *expected,
+                    reached,
+                    version: version.to_owned(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn table(&self) -> String {

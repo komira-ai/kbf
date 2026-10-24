@@ -288,12 +288,14 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    call. The control listener (`--control-listen`) must be reachable from GitHub-hosted runners;
    the heartbeat listener need not be.
 2. **Enroll the hosts**, so that their updaters heartbeat to the coordinator
-   ([The agent mode](#the-agent-mode)). A host that does not heartbeat is `down`, and is not
-   waited for; the farm is converged when every host that does heartbeat runs the release, none is
-   updating or failed, and at least the minimums (below) are up. **A host that went down because
-   of the release does not stop `converged`**: the step answers for the hosts that are heard from,
-   and the table's `down` column shows the rest, so read it, and raise the minimums to the number
-   of hosts the farm must keep.
+   ([The agent mode](#the-agent-mode)). A host that does not heartbeat is `down`, and the
+   coordinator does not wait for it: it says `converged` when every host that does heartbeat runs
+   the release, none is updating or failed, and at least the minimums (below) are up. The step
+   does not take that alone: it remembers how many hosts of each role were live when it started
+   (see below) and fails if fewer run the release at the end, so a host that the release made
+   stop heartbeating fails the deploy. A host that was already down when the step started is not
+   expected; raise the minimums to the number of hosts the farm must keep, for the roles whose
+   count matters beyond that.
 3. **Set the repository variables** (Settings, Secrets and variables, Actions, Variables):
 
    | variable | value |
@@ -306,14 +308,22 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
 
 `cargo xtask deploy-farm` (one `run:` line):
 
-1. posts `{"version": <the release's version>, "min_up": {...}}` to `/v1/desired` (the per-role
+1. reads `GET /v1/convergence` once, before anything is changed, and keeps the hosts live then
+   (at the version, updating or failed, so not `down`) per role as the baseline, and prints it
+   (`baseline: hosts live before the deploy: storage 3, frontend 2`). A 503 on this read is tried
+   again like the POST. A coordinator that has just restarted (the table says so) may not have
+   heard from every host yet; a host it hears from later counts as one that joined;
+2. posts `{"version": <the release's version>, "min_up": {...}}` to `/v1/desired` (the per-role
    limits are the coordinator's defaults), with an OIDC token for the audience that is the URL as
    written in the variable (the audience keeps a trailing `/` the variable has, which the URL
    the calls go to does not, so write the variable and the allow-list's `audience` alike). A 503
    on the POST is tried again, up to four times;
-2. reads `GET /v1/convergence` every 30 seconds, with a fresh token each time, and prints a
+3. reads `GET /v1/convergence` every 30 seconds, with a fresh token each time, and prints a
    table of the counts per role (`at_desired`, `updating`, `failed`, `down`);
-3. ends when the coordinator says `converged` (exit 0); `blocked` (a live host failed its update to
+4. ends when the coordinator says `converged` and every role has at least as many hosts at the
+   version as it had live at the baseline (exit 0; a host that joined during the deploy only
+   adds); when it says `converged` and a role has fewer, which fails with the role, the count
+   expected, the count reached and how many went down; `blocked` (a live host failed its update to
    this version and is still behind it); when the counts have not changed for 20 minutes
    (`--stall-min`; a host whose update takes longer than that leaves the counts as they are, so
    raise the flag past the longest update); when the coordinator's desired version is no longer

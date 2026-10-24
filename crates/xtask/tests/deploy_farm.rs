@@ -27,7 +27,8 @@ struct Seen {
 
 /// What the fake coordinator answers.
 struct Script {
-    /// The answers of `GET /v1/convergence`, one per read; the last repeats. A number is a
+    /// The answers of `GET /v1/convergence`, one per read (the first is the baseline); the
+    /// last repeats. A number is a
     /// status with no body.
     reads: Vec<Result<Value, u16>>,
     /// The status of `POST /v1/desired`.
@@ -41,9 +42,18 @@ struct Script {
 }
 
 impl Script {
+    /// A script whose first answer is the baseline read before the POST (a farm of two
+    /// storage hosts and one daemon, one more daemon down), then `reads`.
     fn new(reads: Vec<Result<Value, u16>>) -> Self {
+        Self::after(Ok(farm("converged", 0, 0)), reads)
+    }
+
+    /// A script whose baseline read is `baseline`, then `reads`.
+    fn after(baseline: Result<Value, u16>, reads: Vec<Result<Value, u16>>) -> Self {
+        let mut all = vec![baseline];
+        all.extend(reads);
         Self {
-            reads,
+            reads: all,
             post: 200,
             post_503s: 0,
             token: 200,
@@ -237,7 +247,7 @@ fn run(fake: &Fake, plan: &Plan) -> (Result<(), Error>, String) {
 
 #[test]
 fn the_desired_version_is_posted_then_the_farm_is_polled_to_converged() {
-    // Proves: one POST of the version and the minimums, then reads until `converged`;
+    // Proves: one read of the farm, one POST of the version and the minimums, then reads until `converged`;
     // exit 0; each read's table is printed; every call carries a token of its own, asked
     // for the coordinator's audience and masked in the log.
     let mut first = farm("in_progress", 1, 0);
@@ -257,19 +267,19 @@ fn the_desired_version_is_posted_then_the_farm_is_polled_to_converged() {
         body,
         json!({"version": "2.0", "min_up": {"storage": 1, "frontend": 1}})
     );
-    assert_eq!(fake.requests("/v1/convergence").len(), 3);
+    assert_eq!(fake.requests("/v1/convergence").len(), 4);
     let tokens: Vec<String> = ["/v1/desired", "/v1/convergence"]
         .iter()
         .flat_map(|p| fake.requests(p))
         .map(|r| r.authorization)
         .collect();
-    assert_eq!(tokens.len(), 4);
+    assert_eq!(tokens.len(), 5);
     let mut distinct = tokens.clone();
     distinct.sort();
     distinct.dedup();
-    assert_eq!(distinct.len(), 4, "a token is used once: {tokens:?}");
+    assert_eq!(distinct.len(), 5, "a token is used once: {tokens:?}");
     let asked = fake.requests("/token");
-    assert_eq!(asked.len(), 4);
+    assert_eq!(asked.len(), 5);
     let audience = format!(
         "audience=https%3A%2F%2F127.0.0.1%3A{}",
         fake.base.rsplit(':').next().expect("port")
@@ -278,7 +288,7 @@ fn the_desired_version_is_posted_then_the_farm_is_polled_to_converged() {
         asked.iter().all(|r| r.path.ends_with(&audience)),
         "{asked:?}"
     );
-    for n in 0..4 {
+    for n in 0..5 {
         assert!(out.contains(&format!("::add-mask::tok-{n}")), "{out}");
     }
     assert!(
@@ -301,7 +311,7 @@ fn a_blocked_farm_fails_at_once_with_its_table_printed() {
     ]));
     let (result, out) = run(&fake, &fake.plan());
     assert_eq!(result, Err(Error::Blocked("2.0".to_owned())));
-    assert_eq!(fake.requests("/v1/convergence").len(), 2);
+    assert_eq!(fake.requests("/v1/convergence").len(), 3);
     assert!(out.contains("farm: blocked, desired 2.0"), "{out}");
     assert!(
         out.lines()
@@ -351,13 +361,13 @@ fn a_read_that_fails_is_tried_again_and_a_refused_one_is_not() {
             status: 401
         })
     );
-    assert_eq!(fake_no.requests("/v1/convergence").len(), 1);
+    assert_eq!(fake_no.requests("/v1/convergence").len(), 2);
 }
 
 #[test]
 fn a_refused_post_reads_nothing() {
     // Proves: when the coordinator refuses the token on the POST (403), the verb fails with
-    // the refusal and makes no read.
+    // the refusal and makes no read but the baseline.
     let mut script = Script::new(vec![Ok(farm("converged", 0, 0))]);
     script.post = 403;
     let fake = serve(script);
@@ -369,7 +379,7 @@ fn a_refused_post_reads_nothing() {
             status: 403
         })
     );
-    assert!(fake.requests("/v1/convergence").is_empty());
+    assert_eq!(fake.requests("/v1/convergence").len(), 1);
     let mut script = Script::new(vec![]);
     script.post = 400;
     let bad = serve(script);
@@ -397,14 +407,17 @@ fn a_post_the_coordinator_could_not_serve_is_tried_again_and_a_final_one_is_not(
     let (result, out) = run(&fake, &fake.plan());
     assert_eq!(result, Ok(()), "{out}");
     assert_eq!(fake.requests("/v1/desired").len(), 3);
-    assert!(out.contains("the POST failed, trying again"), "{out}");
+    assert!(
+        out.contains("the call failed, trying again: set the desired version"),
+        "{out}"
+    );
     let mut script = Script::new(vec![Ok(farm("converged", 0, 0))]);
     script.post_503s = 100;
     let down = serve(script);
     let (result, _) = run(&down, &down.plan());
     assert!(matches!(result, Err(Error::Call { .. })), "{result:?}");
     assert_eq!(down.requests("/v1/desired").len(), 4);
-    assert!(down.requests("/v1/convergence").is_empty());
+    assert_eq!(down.requests("/v1/convergence").len(), 1);
 }
 
 #[test]
@@ -418,23 +431,27 @@ fn a_convergence_on_another_version_is_not_this_deploys() {
         let fake = serve(Script::new(vec![Ok(other)]));
         let (result, _) = run(&fake, &fake.plan());
         assert_eq!(result, Err(Error::Superseded("3.0".to_owned())));
-        assert_eq!(fake.requests("/v1/convergence").len(), 1);
+        assert_eq!(fake.requests("/v1/convergence").len(), 2);
     }
 }
 
 #[test]
 fn what_the_coordinator_prints_cannot_start_a_workflow_command() {
     // Proves: a version or role that starts with `::` or holds a line break reaches the log
-    // as one plain line, so no line of the table is a workflow command.
+    // as one plain line, so no line of the baseline or the table is a workflow command.
     let mut hostile = farm("converged", 0, 0);
     hostile["desired"] = json!("2.0");
     hostile["roles"][0]["role"] = json!("::error::boom\n::add-mask::x");
-    let fake = serve(Script::new(vec![Ok(hostile)]));
+    let fake = serve(Script::after(Ok(hostile.clone()), vec![Ok(hostile)]));
     let (result, out) = run(&fake, &fake.plan());
     assert_eq!(result, Ok(()), "{out}");
     assert!(out.contains("error::boom::add-mask::x"), "{out}");
+    assert!(
+        out.contains("baseline: hosts live before the deploy: error::boom::add-mask::x 2"),
+        "{out}"
+    );
     let masks = out.lines().filter(|l| l.starts_with("::")).count();
-    assert_eq!(masks, 2, "only the client's own masks: {out}");
+    assert_eq!(masks, 3, "only the client's own masks: {out}");
     assert!(!out.lines().any(|l| l.starts_with("::error")), "{out}");
 }
 
@@ -564,6 +581,142 @@ fn a_log_that_cannot_be_written_ends_the_deploy_with_an_error() {
     }
 }
 
+/// A farm answer with the given counts per role: (role, at_desired, updating, failed, down).
+fn counts(state: &str, desired: &str, roles: &[(&str, u64, u64, u64, u64)]) -> Value {
+    let rows: Vec<Value> = roles
+        .iter()
+        .map(|(role, at, updating, failed, down)| {
+            json!({"role": role, "at_desired": at, "updating": updating, "failed": failed, "down": down})
+        })
+        .collect();
+    json!({"desired": desired, "quiet": false, "state": state, "roles": rows})
+}
+
+#[test]
+fn a_host_that_goes_down_during_the_deploy_fails_it_though_the_farm_says_converged() {
+    // Proves: three storage hosts live before the deploy, one stops heartbeating, and the
+    // coordinator (which answers for the hosts it hears from) says `converged`: the deploy
+    // fails naming the role, the 3 expected, the 2 reached and the 1 that went down.
+    let fake = serve(Script::after(
+        Ok(counts("in_progress", "1.0", &[("storage", 3, 0, 0, 0)])),
+        vec![
+            Ok(counts("in_progress", "2.0", &[("storage", 1, 2, 0, 0)])),
+            Ok(counts("converged", "2.0", &[("storage", 2, 0, 0, 1)])),
+        ],
+    ));
+    let (result, out) = run(&fake, &fake.plan());
+    assert_eq!(
+        result,
+        Err(Error::Lost {
+            role: "storage".to_owned(),
+            expected: 3,
+            reached: 2,
+            version: "2.0".to_owned()
+        }),
+        "{out}"
+    );
+    let message = result.expect_err("lost").to_string();
+    assert!(message.contains("storage"), "{message}");
+    assert!(message.contains("3 hosts were live"), "{message}");
+    assert!(message.contains("2 run 2.0"), "{message}");
+    assert!(message.contains("1 went down"), "{message}");
+}
+
+#[test]
+fn a_host_that_was_down_before_the_deploy_does_not_block_it() {
+    // Proves: a host already down at the baseline is not expected: two storage hosts live and
+    // one down before, two at the version after, passes (and the daemon role, with its one
+    // host down at both reads and none live, is not expected either).
+    let fake = serve(Script::after(
+        Ok(counts(
+            "in_progress",
+            "1.0",
+            &[("storage", 2, 0, 0, 1), ("daemon", 0, 0, 0, 1)],
+        )),
+        vec![Ok(counts(
+            "converged",
+            "2.0",
+            &[("storage", 2, 0, 0, 1), ("daemon", 0, 0, 0, 1)],
+        ))],
+    ));
+    let (result, out) = run(&fake, &fake.plan());
+    assert_eq!(result, Ok(()), "{out}");
+}
+
+#[test]
+fn a_host_that_joins_during_the_deploy_is_fine() {
+    // Proves: more hosts at the version than were live at the baseline, and a role the
+    // baseline did not list at all, pass.
+    let fake = serve(Script::after(
+        Ok(counts("in_progress", "1.0", &[("storage", 1, 0, 0, 0)])),
+        vec![Ok(counts(
+            "converged",
+            "2.0",
+            &[("storage", 3, 0, 0, 0), ("frontend", 1, 0, 0, 0)],
+        ))],
+    ));
+    let (result, out) = run(&fake, &fake.plan());
+    assert_eq!(result, Ok(()), "{out}");
+}
+
+#[test]
+fn a_role_that_vanishes_from_the_answer_counts_as_all_its_hosts_lost() {
+    // Proves: a baseline role the final answer does not list has no host at the version.
+    let fake = serve(Script::after(
+        Ok(counts("in_progress", "1.0", &[("storage", 2, 0, 0, 0)])),
+        vec![Ok(counts("converged", "2.0", &[("frontend", 1, 0, 0, 0)]))],
+    ));
+    let (result, _) = run(&fake, &fake.plan());
+    assert!(
+        matches!(
+            result,
+            Err(Error::Lost {
+                expected: 2,
+                reached: 0,
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn the_hosts_live_before_the_deploy_are_printed_before_the_post() {
+    // Proves: updating and failed hosts count as live and down ones do not, per role, in a
+    // line printed before the desired version is set.
+    let fake = serve(Script::after(
+        Ok(counts(
+            "blocked",
+            "1.0",
+            &[("storage", 2, 1, 1, 5), ("frontend", 1, 0, 0, 0)],
+        )),
+        vec![Ok(counts(
+            "converged",
+            "2.0",
+            &[("storage", 4, 0, 0, 5), ("frontend", 1, 0, 0, 0)],
+        ))],
+    ));
+    let (result, out) = run(&fake, &fake.plan());
+    assert_eq!(result, Ok(()), "{out}");
+    let line = "baseline: hosts live before the deploy: storage 4, frontend 1";
+    let at = out.find(line).unwrap_or_else(|| panic!("{out}"));
+    let posted = out.find("desired version 2.0 set").expect("posted");
+    assert!(at < posted, "{out}");
+}
+
+#[test]
+fn a_503_on_the_read_before_the_deploy_is_tried_again() {
+    // Proves: the baseline read is retried on a 503 like the POST, and the deploy goes on.
+    let fake = serve(Script::after(Err(503), vec![Ok(farm("converged", 0, 0))]));
+    // The first read is a 503, the second answers; the baseline is the second.
+    let (result, out) = run(&fake, &fake.plan());
+    assert_eq!(result, Ok(()), "{out}");
+    assert!(
+        out.contains("the call failed, trying again: read the farm before the deploy"),
+        "{out}"
+    );
+}
+
 fn args_for(fake: &Fake, ca_pem: &str) -> Args {
     use clap::Parser;
     #[derive(Parser)]
@@ -616,7 +769,7 @@ fn the_verb_trusts_the_system_roots_or_the_ca_it_is_given() {
     let Err(xtask::Error::Failed(why)) = refused else {
         panic!("a certificate of another CA was trusted: {refused:?}");
     };
-    assert!(why.contains("set the desired version"), "{why}");
+    assert!(why.contains("read the farm before the deploy"), "{why}");
     let posts = fake.requests("/v1/desired").len();
     assert_eq!(posts, 2, "the pinned-to-another-CA run sent nothing");
 }
@@ -660,7 +813,7 @@ fn a_certificate_the_roots_do_not_hold_is_not_trusted() {
         matches!(
             result,
             Err(Error::Call {
-                what: "set the desired version",
+                what: "read the farm before the deploy",
                 ..
             })
         ),
