@@ -12,8 +12,10 @@ flag, a port or an endpoint, `kbf --mode=frontend --help` and
 [kbf-modes.md](kbf-modes.md) are the references.
 
 The frontend image is a release asset (see [docs/artifacts.md](../artifacts.md) for the
-frontend image release asset). Until it is published, build the image yourself from the
-`kbf` binary; the compose example names the image as a placeholder.
+frontend image release asset): load it with `docker image load`, and it is tagged
+`kbf-frontend:<commit>`. The compose example names it by `KBF_COMMIT`. Until a release
+carries it, build the image yourself from the `kbf` binary with
+`packaging/container/frontend/Dockerfile`.
 
 ## The topology
 
