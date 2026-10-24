@@ -53,9 +53,10 @@ All are flags; none is read from the environment.
 | `--state-dir`, `--inventory`, `--proxy-uid`, `--token-file`, `--ssh-key-file`, `--ssh-user`, `--channel` | required |
 | `--operator-api http://<loopback ip>:<port>` | required: the frontend's operator API, for safe-to-stop and the health of storage and daemon hosts. Not a loopback address is refused |
 | `--operator-proxy-auth-file` | the proxy's per-boot secret, for a frontend that runs behind kbf-proxy |
-| `--proxy-admin http://<loopback ip>:<port>` | the admin API of the kbf-proxy in pool mode (`admin_listen`). Required when the inventory lists pool members; refused unless it is a loopback address. It asks for no credential, and none is sent |
+| `--proxy-admin http://<loopback ip>:<port>` | optional: the admin API of the kbf-proxy in pool mode (`admin_listen`). Given, a pool member is rolled through the proxy ([below](#what-a-roll-does-with-a-frontend-pool-member)); not given, it is rolled without one ([below](#a-frontend-pool-member-without-a-proxy)). Refused unless it is a loopback address. It asks for no credential, and none is sent |
 | `--socket` | the roll API's socket, for tests and development; in production systemd passes it |
 | `--ssh-connect-timeout-secs`, `--ssh-command-timeout-secs`, `--drain-deadline-secs`, `--apply-poll-secs`, `--apply-deadline-secs` | optional bounds in seconds; they default to 10, 900, 600, 5 and 600 |
+| `--peer-ready-secs`, `--frontend-drain-deadline-secs` | optional bounds in seconds, at least 1, for a member rolled without a proxy: how long every other member must answer `/readyz` 200 in a row before a member is drained (default 30), and how long a member is given to exit once it is told to drain (default 1200, which must be longer than the longest execution a member may have open). Nothing reads them when `--proxy-admin` is given |
 
 The updater reaches each member's operator API on loopback at `127.0.0.1:<base + 2>`, with the
 same token (`--token-file`) and proxy secret as `--operator-api`.
@@ -119,6 +120,76 @@ A `roll.json` written by an earlier build, which has none of the phases `drainin
 The other way does not hold: an earlier build does not know these phases and refuses to start on
 a `roll.json` that holds one, so finish or abort a roll that is in a member's turn before
 downgrading the updater.
+
+## A frontend pool member without a proxy
+
+A farm whose frontends sit behind a load balancer of its own (Envoy, a cloud balancer, anything
+that stops sending to a backend whose `/readyz` answers 503) needs no kbf-proxy to be rolled.
+Start the updater **without `--proxy-admin`** and the inventory lines with `instance=` and `base=`
+are rolled by the member's own drain. The load balancer is never asked: the member says it is not
+ready, and the balancer, whatever it is, stops sending to it. The member is rolled alone, and the
+turn is:
+
+1. **Check** (`pending`). Every other member of the inventory is asked `GET /readyz` on its own
+   operator port (`base` plus 2) every 5 seconds. Each must answer 200 every time for
+   `--peer-ready-secs` (30) in a row; an answer of 503, and a member that cannot be asked, start
+   the window again. If the window has not been had `--peer-ready-secs` plus 300 seconds after the
+   first ask, the roll fails with `unsafe_to_stop` and nothing has been changed. A member that is
+   the only one in the inventory has no other to serve and is refused the same way. The member
+   itself is not asked.
+2. **Drain** (`draining`). `POST /v1/frontend/drain` on the member's operator API. The frontend
+   then runs its own drain, which does not depend on the balancer: `/readyz` 503, no new work and
+   GOAWAY on its listeners, a wait for the executions open on it, and its exit. The roll waits
+   until the member's operator API refuses the connection (it has exited) or its
+   `GET /v1/frontend/drain` reports `"closing": true` (the frontend in this tree does not report
+   it, and is waited for until it exits), for at most `--frontend-drain-deadline-secs`
+   (`drain_failed`). A member that answers the status but says it is not draining fails the roll
+   at once (`drain_failed`). A member that is not running refuses the connection of the drain
+   itself, has nothing to drain, and the turn goes on; a drain that gets no answer (a timeout)
+   fails the roll with `frontend member a (fe-a) may be draining`.
+3. **Install** (`installing`). As with a proxy: the package is installed on the host unless it has
+   the target, once per host, at the first member.
+4. **Restart** (`restarting`). `restart frontend=<instance>` through `kbf-host-install`, which
+   starts the new version (`restart_failed`).
+5. **Ready** (`waiting_healthy`). The roll waits until the member's own `GET /readyz` answers 200
+   and its `GET /healthz` reports a `commit` that the target's version names, for at most 300
+   seconds (`health_timeout`; `swap_abandoned` if the version names no commit).
+
+Nothing is put back at the end: a drained frontend has exited, and the restart made a new process,
+which is ready or is not. The next member is rolled only when this one is ready, which is also
+what the next check asks of it.
+
+**The bound.** `--frontend-drain-deadline-secs` (default 1200) must be longer than the longest
+execution a member may have open, or the roll gives up on a drain that is still going as it
+should. The frontend in this tree puts no bound of its own on a drain that its endpoint began
+(`--shutdown-timeout-secs` bounds only a drain that a signal began), so an execution that runs
+past the bound fails every roll at that member until it ends. A drain that outlasts the bound
+fails the roll with `drain_failed` and `frontend member a (fe-a) is left draining`: the member
+goes on draining and exits by itself, and a new roll finds it stopped (its connection is refused)
+and goes on from the install.
+
+**A member that is stopped, or a wrong `base`.** A member whose operator API refuses the
+connection of the first drain is taken for one that an earlier roll left stopped, and is installed
+on and restarted. A `base` in the inventory that is not the member's has the same look: the unit is
+restarted though it was never drained, which ends any execution open on it (a Buck2 build does not
+reattach, so each is a failed action), and the wait for readiness fails, since it asks at the same
+wrong address. Check the `base` of a new line before the first roll.
+
+Every failure after the drain stops the roll and names the member as not serving (`frontend member
+a (fe-a) is not serving`): the install, the restart and the readiness wait leave a member that is
+down or not ready, and the load balancer sends nothing to it. The other members serve. An operator
+fixes it and starts another roll, which begins at the check again.
+
+A restart of the updater finds the phase in `roll.json`. In `draining` the member's drain is read
+first: a member that says it is not draining was never told to (the record is written before the
+drain is sent), and is checked against the other members as in the check. The member is then told
+to drain again (a drain does nothing to a member that is draining) and its exit is waited for; in
+`installing` the host is asked what it has, as with a proxy; in `restarting` and `waiting_healthy`
+the member is **not** told to drain, which would take down the process the restart started. The
+phases are the ones a turn at a proxy has, without `retiring` and `undraining`, and no field was
+added to the record. A `roll.json` in `retiring` or `undraining`, begun with a proxy, fails the
+member with `swap_abandoned`: abort that roll rather than change `--proxy-admin` in the middle of
+it.
 
 ## The agent mode
 

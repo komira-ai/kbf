@@ -14,6 +14,13 @@
 //! `installing`, `restarting`, `waiting_healthy` and `undraining`. Every failure on the way
 //! leaves the member drained. The roll never takes the last member that is up and ready out.
 //!
+//! Without a proxy (`--proxy-admin` not given, [`Pool::configured`] false) a member takes the
+//! turn of `updater_no_proxy.rs` instead: every other member must have answered `/readyz` 200
+//! for a while, the member drains itself and exits, the host is installed on and the member's
+//! unit restarted, and the roll waits for it to be ready on the target's commit. Its phases are
+//! `draining`, `installing`, `restarting` and `waiting_healthy`; nothing is put back, because a
+//! drained frontend is a new process after the restart.
+//!
 //! A `mac-daemon` host takes the daemon's turn with one difference. Its `install` only starts
 //! the apply on the Mac and answers `apply_started`; the roll marks the host `waiting_healthy`
 //! and polls `query` every [`Timing::apply_poll`] until the apply is `done` with the target
@@ -59,6 +66,8 @@ use crate::version::Version;
 
 #[path = "updater_frontend.rs"]
 mod frontend;
+#[path = "updater_no_proxy.rs"]
+mod no_proxy;
 
 /// How long the roll waits for the streams of a frontend member to end, both the streams the
 /// proxy still holds open on it after it is drained, and those the member itself reports once
@@ -526,7 +535,11 @@ impl Updater {
             }
         }
         if let (Role::Frontend, Some(member)) = (host.role, &host.member) {
-            self.frontend_turn(idx, host, &member.instance, target, phase)?;
+            if self.ports.pool.configured() {
+                self.frontend_turn(idx, host, &member.instance, target, phase)?;
+            } else {
+                self.no_proxy_turn(idx, host, &member.instance, target, phase)?;
+            }
             self.mark(idx, Phase::Done, false)?;
             return Ok(());
         }

@@ -116,11 +116,14 @@ fn a_name_that_is_not_a_member_name_makes_no_request() {
     assert!(server.requests().is_empty());
 }
 
-/// Asserts that a pool made without `--proxy-admin` answers every call with the same error
-/// that says so, and asks nothing.
+/// Asserts that a pool made without `--proxy-admin` says it is not configured and answers every
+/// call with the same error that says so, and asks nothing, and that a pool made over an admin
+/// API says it is configured.
 #[test]
 fn a_pool_that_is_not_configured_says_so() {
+    assert!(HttpPool::new(closed_port()).configured());
     let pool = HttpPool::unconfigured();
+    assert!(!pool.configured());
     let said = PortError::other(NOT_CONFIGURED);
     assert_eq!(pool.view(), Err(said.clone()));
     assert_eq!(pool.drain("a"), Err(said.clone()));

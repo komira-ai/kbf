@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use crate::fakes::draining;
 use crate::frontend_http::HttpFrontend;
 use crate::inventory::{Host, Member, Role};
 use crate::operator::OperatorApi;
@@ -132,7 +133,109 @@ fn a_commit_that_cannot_be_read_is_an_error() {
     assert!(e.to_string().contains("garbled health report"), "{e}");
 }
 
-/// Asserts that a host that is not a pool member is refused by all three calls, with its
+const DRAINING: &str = r#"{"draining":true,"open_executions":2,"queued_operations":1}"#;
+
+/// Asserts that a drain is a `POST` of the drain route to the member's own operator port, with
+/// the operator token, that its status is a `GET` of the same route read as the draining flag
+/// and the open executions, with `closing` false when the member does not say and true when it
+/// does, and that a status the member does not know the fields of is still read.
+#[test]
+fn a_drain_is_posted_and_its_status_is_read_from_the_members_own_port() {
+    let server = answering(200, DRAINING);
+    let front = adapter("fh-drain");
+    let host = member_host(server.addr);
+    assert_eq!(front.drain(&host), Ok(()));
+    assert_eq!(front.drain_status(&host), Ok(draining(2)));
+    let seen = server.requests();
+    assert!(seen[0].starts_with("POST /v1/frontend/drain HTTP/1.1\r\n"));
+    assert!(seen[1].starts_with("GET /v1/frontend/drain HTTP/1.1\r\n"));
+    for request in &seen {
+        assert!(request.contains(&format!("Bearer {TOKEN}")), "{request}");
+    }
+    let body = r#"{"draining":true,"open_executions":0,"phase":"closing","new":1}"#;
+    let closing = answering(200, body);
+    let status = front
+        .drain_status(&member_host(closing.addr))
+        .expect("closing");
+    assert!(status.closing);
+    assert_eq!(status.open_executions, 0);
+}
+
+/// Asserts that the readiness is a `GET /readyz` to the member's own operator port, that a 200
+/// is ready and a 503 is not ready and neither is an error.
+#[test]
+fn the_readiness_is_200_for_ready_and_503_for_not_ready() {
+    let front = adapter("fh-ready");
+    let up = answering(200, "{}");
+    assert_eq!(front.ready(&member_host(up.addr)), Ok(true));
+    assert!(up.requests()[0].starts_with("GET /readyz HTTP/1.1\r\n"));
+    let down = answering(503, "{}");
+    assert_eq!(front.ready(&member_host(down.addr)), Ok(false));
+}
+
+/// Asserts that each answer to the drain, its status and the readiness that is not what was
+/// asked for is an error of the right kind that is not a refused connection: a refusal of the
+/// gates names what to check, a 5xx is no answer, anything else is a surprise, a status that is
+/// not a drain status is garbled, and a 5xx to the readiness is no answer and not a 503. No text
+/// carries the token or the host's address.
+#[test]
+fn failures_of_the_drain_and_the_readiness_are_errors_of_the_right_kind() {
+    let cases = [
+        (403, PortErrorKind::Other, "refused the call (403)"),
+        (500, PortErrorKind::Unreachable, "answered 500"),
+        (404, PortErrorKind::Other, "answered 404"),
+    ];
+    let front = adapter("fh-drain-errors");
+    for (status, kind, text) in cases {
+        let server = answering(status, "{}");
+        let host = member_host(server.addr);
+        let results: [Result<(), PortError>; 3] = [
+            front.drain(&host),
+            front.drain_status(&host).map(drop),
+            front.ready(&host).map(drop),
+        ];
+        for result in results {
+            let e = result.expect_err(text);
+            assert_eq!(e.kind(), kind, "{e}");
+            assert!(e.to_string().contains(text), "{e}");
+            assert!(!e.is_refused(), "{e}");
+            for secret in [TOKEN, "secret-host", &server.addr.to_string()] {
+                assert!(!e.to_string().contains(secret), "{secret} in {e}");
+            }
+        }
+    }
+    let garbled = answering(200, "[]");
+    let e = front
+        .drain_status(&member_host(garbled.addr))
+        .expect_err("garbled");
+    assert!(e.to_string().contains("garbled drain status"), "{e}");
+}
+
+/// Asserts that a member that is not running is a refused connection for the drain, its status
+/// and the readiness, and that a member that reads the request and does not answer in time is
+/// unreachable and not refused: only the first is a member that has exited.
+#[test]
+fn a_member_that_is_gone_refuses_the_connection_and_a_slow_one_does_not() {
+    let front = adapter("fh-gone");
+    let dead = member_host(closed_port());
+    let errors = [
+        front.drain(&dead).expect_err("dead"),
+        front.drain_status(&dead).expect_err("dead"),
+        front.ready(&dead).expect_err("dead"),
+    ];
+    for e in errors {
+        assert!(e.is_unreachable(), "{e}");
+        assert!(e.is_refused(), "{e}");
+    }
+    let slow = fake_api(vec![None]);
+    let e = front
+        .drain_status(&member_host(slow.addr))
+        .expect_err("timed out");
+    assert!(e.is_unreachable(), "{e}");
+    assert!(!e.is_refused(), "{e}");
+}
+
+/// Asserts that a host that is not a pool member is refused by every call, with its
 /// alias, and that no request is made.
 #[test]
 fn a_host_that_is_no_member_is_refused_without_a_request() {
@@ -142,10 +245,13 @@ fn a_host_that_is_no_member_is_refused_without_a_request() {
         ..member_host(server.addr)
     };
     let front = adapter("fh-bare");
-    let results: [Result<(), PortError>; 3] = [
+    let results: [Result<(), PortError>; 6] = [
         front.retire(&bare).map(drop),
         front.retire_status(&bare).map(drop),
         front.commit(&bare).map(drop),
+        front.drain(&bare),
+        front.drain_status(&bare).map(drop),
+        front.ready(&bare).map(drop),
     ];
     for result in results {
         let e = result.expect_err("refused");

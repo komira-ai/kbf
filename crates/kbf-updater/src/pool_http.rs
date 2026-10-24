@@ -59,8 +59,8 @@ impl From<Row> for PoolMember {
     }
 }
 
-/// The pool over the proxy's admin API. Without `--proxy-admin` there is no pool, and each call
-/// says so.
+/// The pool over the proxy's admin API. Without `--proxy-admin` there is no pool
+/// ([`Pool::configured`] is false, and the roll does not ask it), and each call says so.
 #[derive(Clone)]
 pub struct HttpPool {
     api: Option<OperatorApi>,
@@ -106,6 +106,10 @@ impl HttpPool {
 }
 
 impl Pool for HttpPool {
+    fn configured(&self) -> bool {
+        self.api.is_some()
+    }
+
     fn view(&self) -> Result<Vec<PoolMember>, PortError> {
         let api = self.api()?;
         let what = api.what();
