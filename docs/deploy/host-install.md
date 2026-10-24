@@ -705,7 +705,7 @@ container ([the example](../../packaging/host-agent/linux/host-install-frontend.
 | `name`, `restart` | the container's name and Docker's restart policy (`always`, `unless-stopped`, `on-failure[:N]`). `no` is refused: nothing else starts the container, so it would stay down after a reboot of the host or of Docker |
 | `network`, `user` | optional: `--network` and `--user` |
 | `ports`, `mounts`, `command` | `--publish` and `--volume` entries, and the flags after the image; each entry is one argument, never a shell word |
-| `api` | where this host reaches the frontend's operator API (a published port), for `/readyz` and `/healthz` |
+| `api` | where this host reaches the frontend's operator API (a published port, or the host's own listen address under `network = "host"`), for `/readyz` and `/healthz` |
 | `drain_token_file` | the operator token as a path **inside** the container |
 | `peers` | optional: the other frontends' operator APIs this host can reach |
 | `drain_secs` | optional (default 180, at most 1800): how long a drain is waited for |
@@ -749,7 +749,7 @@ same configuration, waited for the same way (on the old commit), the marker is c
 switch answers `failed` (`switch_failed`). If the old container cannot be made again either,
 the answer is `revert_failed` and the marker stays: the deadline, or a `revert`, tries again.
 
-Three things to know when you set it up:
+Four things to know when you set it up:
 
 - **`peers` is the only guard this program has against taking down the last ready frontend.**
   Without it nothing here looks at another frontend, and only the coordinator's order protects
@@ -760,6 +760,11 @@ Three things to know when you set it up:
   (not `--api-listen 127.0.0.1:...`), or `/readyz` is never seen and every switch fails. Writes
   still require a loopback peer, which Docker's NAT does not give an outside caller; the drain
   runs inside the container, where the peer is loopback.
+- **On the host network** (`network = "host"`, passed as `docker run --network host`), the
+  container shares the host's network. Give no `ports`: there is nothing to publish. The helper does not refuse
+  `ports` here; it passes them on as `--publish`, and Docker ignores them on the host network. `api` is then the operator listen address on the host itself, so
+  `--api-listen 127.0.0.1:...` works, and writes from a loopback peer are accepted. The other
+  frontend listeners are the host's own ports.
 - **The health the updater's agent reports is what the last switch saw.** It comes from the
   release this program recorded as current, which `switch` sets after `/readyz` answered 200 on
   the target commit. It is not a probe made at each heartbeat: a container that crashes later is
