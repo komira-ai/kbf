@@ -324,9 +324,10 @@ fn role_kill_uid_ends_the_vm_user_s_processes_and_no_one_else_s() {
 }
 
 /// Catches: `session-idle` on a Mac with a VM user that clears auto-login (the Mac
-/// would rest at the login window and VMs could not start), writes the record after the
-/// password, sets auto-login before the record, restarts first, or writes a
-/// `/etc/kcpassword` that is not the VM user's fresh password.
+/// would rest at the login window and VMs could not start), writes the record before
+/// the switch is made, restarts first, restarts a Mac already resting at the VM user
+/// with its session up (killing its VMs), or writes a `/etc/kcpassword` that is not
+/// the VM user's fresh password.
 #[test]
 fn session_idle_rests_at_the_vm_user_in_the_order_of_session_login() {
     let rig = vm_rig("idle-vm");
@@ -339,7 +340,7 @@ fn session_idle_rests_at_the_vm_user_in_the_order_of_session_login() {
             "command /usr/bin/fdesetup isactive (no intent)".to_owned(),
             "reset_password kbf-vm".to_owned(),
             format!(
-                "command /usr/bin/defaults write {domain} autoLoginUser -string kbf-vm (intent vm)"
+                "command /usr/bin/defaults write {domain} autoLoginUser -string kbf-vm (no intent)"
             ),
             format!("command {RESTART} (intent vm)"),
         ]
@@ -349,14 +350,35 @@ fn session_idle_rests_at_the_vm_user_in_the_order_of_session_login() {
         std::fs::read(rig.dir.join("kcpassword")).unwrap(),
         kcpassword(b"pw-kbf-vm")
     );
-    // Repeating it changes nothing but the password.
+    // Repeating it before the session is up sets it again; clearing never happens.
+    auto_login_is(&rig, VM);
+    log(&rig);
     rig.helper.session_idle().unwrap();
     assert_eq!(intent(&rig), Some(Intent::Vm));
+    let calls = log(&rig);
     assert!(
-        log(&rig)
-            .iter()
-            .all(|call| !call.contains("defaults delete"))
+        calls.iter().any(|call| call.contains(RESTART)),
+        "{calls:#?}"
     );
+    assert!(calls.iter().all(|call| !call.contains("defaults delete")));
+    // Once the VM user's session is up, a repeat changes nothing and restarts nothing.
+    gui_up(&rig);
+    let kc = std::fs::read(rig.dir.join("kcpassword")).unwrap();
+    log(&rig);
+    rig.helper.session_idle().unwrap();
+    let calls = log(&rig);
+    assert!(
+        calls
+            .iter()
+            .all(|call| !call.contains(RESTART) && !call.contains("reset_password")),
+        "{calls:#?}"
+    );
+    assert_eq!(std::fs::read(rig.dir.join("kcpassword")).unwrap(), kc);
+    // Auto-login naming someone else is not a rest: it is set again.
+    auto_login_is(&rig, "someone");
+    log(&rig);
+    rig.helper.session_idle().unwrap();
+    assert!(log(&rig).iter().any(|call| call.contains(RESTART)));
 }
 
 /// Catches: the whole-machine lane broken by a VM user: a lease's session not replaced
@@ -451,11 +473,6 @@ fn session_idle_at_the_vm_user_stops_at_the_first_step_that_fails() {
     // failing alone.
     let blocker = |name: &str| std::fs::create_dir_all(rig.dir.join(name).join("inside")).unwrap();
     let unblock = |name: &str| std::fs::remove_dir_all(rig.dir.join(name)).unwrap();
-    blocker("session-intent.new");
-    let error = rig.helper.session_idle().unwrap_err();
-    assert!(error.contains("writing"), "{error}");
-    untouched(&rig);
-    unblock("session-intent.new");
     rig.host.state().fail.insert("reset_password");
     let error = rig.helper.session_idle().unwrap_err();
     assert!(error.contains("setting the password of kbf-vm"), "{error}");
@@ -474,7 +491,21 @@ fn session_idle_at_the_vm_user_stops_at_the_first_step_that_fails() {
     let error = rig.helper.session_idle().unwrap_err();
     assert!(error.contains("no"), "{error}");
     assert!(log(&rig).iter().all(|call| !call.contains(RESTART)));
+    // Every failure so far left the lease's record: its user stays guarded.
+    assert_eq!(intent(&rig), lease);
+    assert!(
+        rig.helper
+            .user_delete("1.1")
+            .unwrap_err()
+            .contains("holds the GUI")
+    );
     rig.host.state().answers.clear();
+    // The record is written last: failing alone, it still stops the restart.
+    blocker("session-intent.new");
+    let error = rig.helper.session_idle().unwrap_err();
+    assert!(error.contains("writing"), "{error}");
+    assert!(log(&rig).iter().all(|call| !call.contains(RESTART)));
+    unblock("session-intent.new");
     answer(&rig, RESTART.to_owned(), false, "", "not now");
     let error = rig.helper.session_idle().unwrap_err();
     assert!(error.contains("not now"), "{error}");
@@ -492,6 +523,7 @@ fn the_boot_reset_deletes_lease_users_and_never_the_vm_user() {
     rig.helper.user_create("1.2", None).unwrap();
     rig.helper.session_idle().unwrap();
     let before = std::fs::read(rig.dir.join("kcpassword")).unwrap();
+    auto_login_is(&rig, VM);
     {
         let mut state = rig.host.state();
         state.procs.insert(vm_uid(), 4);
@@ -526,7 +558,11 @@ fn the_boot_reset_deletes_lease_users_and_never_the_vm_user() {
             .iter()
             .all(|call| !call.contains(&format!("/{}", vm_uid())))
     );
-    assert!(calls.iter().all(|call| !call.contains("defaults")));
+    assert!(
+        calls
+            .iter()
+            .all(|call| !call.contains("defaults write") && !call.contains("defaults delete"))
+    );
     assert_eq!(booted.host.state().procs[&vm_uid()], 4);
     let users = booted.host.state().users.clone();
     assert_eq!(users.keys().collect::<Vec<_>>(), [VM]);
@@ -598,6 +634,30 @@ fn the_boot_reset_keeps_only_a_rest_at_a_usable_vm_user() {
     let (booted, cleared) = reset(&rig, "lease-record", Some(VM));
     assert!(cleared);
     assert_eq!(intent(&booted), None);
+
+    // A `vm` record over an auto-login that is not the VM user's (a switch that stopped
+    // half-made): cleared, not kept.
+    for (name, says) in [("half-lease", Some("kbf-lease-4-4")), ("half-none", None)] {
+        let rig = vm_rig(name);
+        std::fs::write(rig.dir.join("session-intent"), "vm\n").unwrap();
+        if let Some(user) = says {
+            auto_login_is(&rig, user);
+        }
+        kcpassword_file(&rig);
+        let (booted, cleared) = reset(&rig, name, Some(VM));
+        assert!(cleared, "{name}");
+        assert_eq!(intent(&booted), None);
+        assert!(!booted.dir.join("kcpassword").exists());
+    }
+    // A `vm` record over the VM user's auto-login is kept as it is.
+    let rig = vm_rig("vm-kept");
+    std::fs::write(rig.dir.join("session-intent"), "vm\n").unwrap();
+    auto_login_is(&rig, VM);
+    kcpassword_file(&rig);
+    let booted = rebooted(&rig, "vm-kept", Some(VM));
+    booted.helper.boot_reset(&[]).unwrap();
+    assert_eq!(intent(&booted), Some(Intent::Vm));
+    assert!(booted.dir.join("kcpassword").exists());
 
     // A `vm` record with no VM user configured, or no account: stale.
     let rig = vm_rig("vm-record");

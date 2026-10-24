@@ -686,7 +686,7 @@ host needs auto-login in two cases, and in neither for the admin account:
   uid range whose lease `kbf-mac-session`'s intent record names (the record lives
   for the session, from `session-login` to `session-idle`), and `apply` never clears
   that. A lease user no record names is one left behind: `check` fails it and
-  `apply` clears auto-login and `/etc/kcpassword`.
+  `apply` clears auto-login and `/etc/kcpassword`. (Without `--vm-user`; `kbf-mac-provision` does not yet know the `vm` record, so a Mac whose helper has `--vm-user` must not be checked or applied until it does. See the standing VM user in the [security design](fleet-updates-security.md).)
 - **A VM cannot be started from a launch daemon.** This is an open probe of the macOS
   VMs design. If the probe fails, the fallback is an **open decision**: a session of a
   dedicated non-admin VM user, held while the node serves VM leases. That is an

@@ -36,7 +36,7 @@ pub(super) struct Role<'a> {
 
 /// Where the GUI session of the VM user stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Gui {
+pub(super) enum Gui {
     /// `gui/<uid>` exists and no lease holds the session.
     Up,
     /// A lease holds the session.
@@ -72,7 +72,7 @@ impl Helper {
         Ok(Role { name, account })
     }
 
-    fn vm_gui(&self, role: &Role<'_>) -> Result<Gui, String> {
+    pub(super) fn vm_gui(&self, role: &Role<'_>) -> Result<Gui, String> {
         if let Some(Intent::Lease(lease)) = read_intent(&self.settings.session.intent)? {
             return Ok(Gui::Leased(lease));
         }
@@ -151,7 +151,8 @@ impl Helper {
         Ok(self.vm_gui(&role)? == Gui::Up)
     }
 
-    /// `role-kill-uid`: as [`Self::kill_uid`] for the VM user.
+    /// `role-kill-uid`: as [`Self::kill_uid`] for the VM user. It does not look at the
+    /// intent record, so it also ends the VM user's session while a lease holds the GUI.
     ///
     /// # Errors
     /// Why it was refused, or processes survived the kill rounds.

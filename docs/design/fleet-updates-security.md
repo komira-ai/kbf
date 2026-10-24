@@ -325,11 +325,21 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 >   `--vm-user <name>` (never a `kbf-lease-` name, `root` or `_kbf`; the flag is refused
 >   at start otherwise). The account is made by provisioning, not by the helper, and is
 >   outside the ledger, so the boot reset and `user-delete` can never reach it.
->   `session-idle` then rests the Mac at that user: it writes the intent record `vm`,
->   gives the user a fresh random password, writes `/etc/kcpassword`, sets
->   `autoLoginUser` and restarts (FileVault must be off, as for `session-login`). The
->   boot reset keeps that rest when the record is `vm`, or when there is no record and
->   `autoLoginUser` already names the VM user; any other session is cleared as before.
+>   `session-idle` then rests the Mac at that user: it gives the user a fresh random
+>   password, writes `/etc/kcpassword`, sets `autoLoginUser`, writes the intent record
+>   `vm` last (so a failure part-way leaves a lease's record guarding its user) and
+>   restarts (FileVault must be off, as for `session-login`). A repeat while the record
+>   is `vm`, `autoLoginUser` is the VM user and `gui/<uid>` exists restarts nothing, so
+>   running VMs survive it. The boot reset keeps that rest when `autoLoginUser` names the
+>   VM user and the record is `vm` or absent; any other session, including a `vm` record
+>   over some other auto-login, is cleared as before. Only provisioning may name the
+>   account: the helper does not check for an admin or human account beyond the uid
+>   range, and `role-kill-uid` and `session-idle` act on whatever account is named. A
+>   Mac restarted mid-lease rests at the login window until the daemon calls
+>   `session-idle` after `boot-reset`. The leak scan's baseline for such a Mac must be
+>   recorded while it rests at the VM user. The fresh password each rest is not
+>   rewrapped into the login keychain; whether the session's keychain unlocks is open
+>   until measured on a Mac, and `--vm-user` stays unset until then.
 >   `session-login <lease>` still switches away from the VM user. Three verbs act for
 >   the VM user: `role-run` (a process in its `gui/<uid>` domain, refused until the
 >   domain exists and while a lease holds the session), `role-session-ready` (false

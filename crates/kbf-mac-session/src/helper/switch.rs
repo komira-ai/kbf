@@ -39,6 +39,7 @@ use std::sync::atomic::Ordering;
 use kbf_types::LeaseId;
 
 use super::Helper;
+use super::role::{Gui, Role};
 use crate::autologin::{self, Intent, read_intent, remove, write_intent, write_kcpassword};
 use crate::lease::{parse_lease, user_name};
 use crate::ledger::Ledger;
@@ -95,17 +96,23 @@ impl Helper {
     }
 
     /// `session-idle`: rests the Mac, then a userspace restart: at the VM user when one
-    /// is configured, else at the login window (auto-login cleared).
+    /// is configured, else at the login window (auto-login cleared). A Mac already
+    /// resting at a VM user whose GUI session is up is left alone: no restart, so
+    /// running VMs survive a repeat.
     ///
     /// # Errors
     /// Auto-login could not be cleared (or set to the VM user, whose account must be
     /// one the helper acts on, with FileVault off), the record changed, or the restart
-    /// asked for. A failure after the record was written leaves it, so a repeat or the
-    /// boot reset finishes or clears what was set.
+    /// asked for. A failure while setting the VM user leaves the previous record, so a
+    /// lease's user stays guarded until the switch is made; a repeat or the boot reset
+    /// finishes or clears what was set.
     pub fn session_idle(&self) -> Result<(), String> {
         let ledger = self.lock();
         if self.settings.vm_user.is_some() {
-            let name = self.rest_at_vm()?;
+            let Some(name) = self.rest_at_vm()? else {
+                tracing::info!("already resting at the VM user; nothing to restart");
+                return Ok(());
+            };
             drop(ledger);
             tracing::info!("auto-login set to {name}; restarting userspace");
         } else {
@@ -116,15 +123,17 @@ impl Helper {
         autologin::restart_userspace(self.host.as_ref())
     }
 
-    /// Makes the VM user the one the login window logs in, in `session-login`'s order:
-    /// the record first, then the password, `/etc/kcpassword` and `autoLoginUser`.
-    /// Returns the VM user's name.
-    fn rest_at_vm(&self) -> Result<String, String> {
+    /// Makes the VM user the one the login window logs in: the password,
+    /// `/etc/kcpassword` and `autoLoginUser`, then the record last, so a failure before
+    /// it leaves the old record guarding its lease user. Returns the VM user's name,
+    /// or `None` when the Mac already rests there with its GUI session up.
+    fn rest_at_vm(&self) -> Result<Option<String>, String> {
         let role = self.vm_role()?;
         let paths = &self.settings.session;
         autologin::require_filevault_off(self.host.as_ref())?;
-        write_intent(&paths.intent, Intent::Vm)
-            .map_err(|why| format!("writing {}: {why}", paths.intent.display()))?;
+        if self.resting_at_vm_with_gui(&role)? {
+            return Ok(None);
+        }
         let password = self
             .host
             .reset_password(role.name)
@@ -132,33 +141,49 @@ impl Helper {
         write_kcpassword(&paths.kcpassword, password.as_bytes())
             .map_err(|why| format!("writing {}: {why}", paths.kcpassword.display()))?;
         autologin::set_auto_login(self.host.as_ref(), paths, role.name)?;
-        Ok(role.name.to_owned())
+        write_intent(&paths.intent, Intent::Vm)
+            .map_err(|why| format!("writing {}: {why}", paths.intent.display()))?;
+        Ok(Some(role.name.to_owned()))
+    }
+
+    /// Whether the record is `vm`, `autoLoginUser` is the VM user and `gui/<uid>` exists.
+    fn resting_at_vm_with_gui(&self, role: &Role<'_>) -> Result<bool, String> {
+        let paths = &self.settings.session;
+        if read_intent(&paths.intent)? != Some(Intent::Vm) {
+            return Ok(false);
+        }
+        let named = autologin::read_auto_login(self.host.as_ref(), paths)?;
+        Ok(named.as_deref() == Some(role.name) && self.vm_gui(role)? == Gui::Up)
+    }
+
+    /// Whether `autoLoginUser` is the VM user; anything unreadable is "no".
+    fn auto_login_is_vm(&self, role: &Role<'_>) -> bool {
+        match autologin::read_auto_login(self.host.as_ref(), &self.settings.session) {
+            Ok(named) => named.as_deref() == Some(role.name),
+            Err(why) => {
+                tracing::warn!("auto-login is unreadable, so not the VM user's: {why}");
+                false
+            }
+        }
     }
 
     /// Whether the boot reset keeps the Mac resting at the VM user: one is configured
-    /// with an account the helper acts on, and the record names it, or there is no
-    /// record and `autoLoginUser` already is the VM user (the record is written then).
-    /// Anything unreadable is "no": the reset then clears auto-login.
+    /// with an account the helper acts on, `autoLoginUser` is it, and the record names
+    /// it or there is no record (the record is written then). A `vm` record over any
+    /// other auto-login is a half-made switch and is cleared.
     fn keeps_vm_rest(&self, intent: Option<Intent>) -> bool {
         let Ok(role) = self.vm_role() else {
             return false;
         };
-        let paths = &self.settings.session;
         match intent {
-            Some(Intent::Vm) => true,
+            Some(Intent::Vm) => self.auto_login_is_vm(&role),
             Some(Intent::Lease(_)) => false,
             None => {
-                match autologin::read_auto_login(self.host.as_ref(), paths) {
-                    Ok(Some(named)) if named == role.name => {}
-                    Ok(_) => return false,
-                    Err(why) => {
-                        tracing::warn!("auto-login is unreadable, so not the VM user's: {why}");
-                        return false;
-                    }
-                }
-                write_intent(&paths.intent, Intent::Vm)
-                    .map_err(|why| tracing::warn!("writing {}: {why}", paths.intent.display()))
-                    .is_ok()
+                let paths = &self.settings.session;
+                self.auto_login_is_vm(&role)
+                    && write_intent(&paths.intent, Intent::Vm)
+                        .map_err(|why| tracing::warn!("writing {}: {why}", paths.intent.display()))
+                        .is_ok()
             }
         }
     }
