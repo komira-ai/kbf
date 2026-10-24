@@ -4,9 +4,10 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kbf_testkit::dir::TestDir;
 use kbf_types::{HostRole, ReleasePlatform};
@@ -42,6 +43,9 @@ enum Plan {
     SayAndCut(Vec<u8>),
     /// Read the request and say nothing for a while.
     Silent,
+    /// Read the request, then send the start of an answer a few bytes at a time, for longer
+    /// than the client allows for the whole of it.
+    Trickle,
 }
 
 /// What the server saw of one connection.
@@ -137,6 +141,15 @@ fn one(config: &Arc<ServerConfig>, tcp: TcpStream, answer: Plan) -> Seen {
             let _ = tls.flush();
         }
         Plan::Silent => std::thread::sleep(Duration::from_millis(400)),
+        Plan::Trickle => {
+            for byte in b"HTTP/1.1 200 OK\r\nX-Slow: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy".iter()
+            {
+                if tls.write_all(&[*byte]).and_then(|()| tls.flush()).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(60));
+            }
+        }
     }
     seen
 }
@@ -396,6 +409,7 @@ fn a_certificate_from_another_ca_is_not_accepted_by_the_coordinator() {
     };
     std::fs::write(&files.cert, mine.cert_pem()).unwrap();
     std::fs::write(&files.key, mine.key_pem()).unwrap();
+    std::fs::set_permissions(&files.key, std::fs::Permissions::from_mode(0o600)).unwrap();
     let (addr, server) = rig.coordinator(vec![ok(r#"{"reply":"nothing"}"#)]);
     let client = HttpsCoordinator::new(
         Endpoint::parse(&format!("localhost:{}", addr.port())).unwrap(),
@@ -579,4 +593,83 @@ fn a_server_that_offers_another_protocol_is_unreachable() {
     let err = rig.client(addr).heartbeat(&beat()).unwrap_err();
     assert!(matches!(err, CoordinatorError::Unreachable(_)), "{err:?}");
     server.join().unwrap();
+}
+
+/// A server that answers a few bytes at a time is cut off at the time allowed for the whole
+/// reply, not waited for as long as each read finds a byte.
+#[test]
+fn a_reply_that_trickles_is_cut_off_at_the_time_allowed_for_all_of_it() {
+    let rig = Rig::new("co-trickle");
+    let (addr, server) = rig.coordinator(vec![Plan::Trickle]);
+    let client = rig.client(addr).with_timeout(Duration::from_millis(500));
+    let started = Instant::now();
+    let err = client.heartbeat(&beat()).unwrap_err();
+    assert!(matches!(err, CoordinatorError::Unreachable(_)), "{err:?}");
+    assert!(
+        started.elapsed() < Duration::from_millis(1800),
+        "{:?}",
+        started.elapsed()
+    );
+    server.join().unwrap();
+}
+
+/// The key file is held to the rule of the token file: a key that others can read, or that is
+/// a symlink, is not used.
+#[test]
+fn a_client_key_that_others_can_read_is_not_used() {
+    let rig = Rig::new("co-keymode");
+    assert!(client_config(&rig.files).is_ok());
+    for mode in [0o644, 0o660, 0o640, 0o700] {
+        std::fs::set_permissions(&rig.files.key, std::fs::Permissions::from_mode(mode)).unwrap();
+        let err = client_config(&rig.files).err().unwrap();
+        assert!(
+            matches!(&err, CoordinatorError::Files(why) if why.contains("--client-key") && why.contains("0600")),
+            "{mode:o}: {err:?}"
+        );
+    }
+    std::fs::set_permissions(&rig.files.key, std::fs::Permissions::from_mode(0o400)).unwrap();
+    assert!(client_config(&rig.files).is_ok());
+    let link = rig.dir.join("link.key");
+    std::os::unix::fs::symlink(&rig.files.key, &link).unwrap();
+    let files = TlsFiles {
+        key: link,
+        ..rig.files.clone()
+    };
+    assert!(client_config(&files).is_err());
+}
+
+/// A certificate swapped on disk for another node's, or for another role's, is not used by an
+/// agent that started as the first: no heartbeat is sent as one node while the drain targets
+/// another.
+#[test]
+fn a_certificate_that_now_names_another_node_is_not_used() {
+    let rig = Rig::new("co-rebind");
+    let (addr, server) = rig.coordinator(vec![ok(r#"{"reply":"nothing"}"#)]);
+    let bound = rig
+        .client(addr)
+        .bound_to(identity_of(&rig.updater.der).unwrap());
+    assert!(bound.heartbeat(&beat()).is_ok(), "the pair it started with");
+    server.join().unwrap();
+
+    for (node, role) in [("n2", HostRole::Daemon), ("n1", HostRole::MacDaemon)] {
+        let other = rig.pki.updater(node, role);
+        std::fs::write(&rig.files.cert, other.cert_pem()).unwrap();
+        std::fs::write(&rig.files.key, other.key_pem()).unwrap();
+        // Nothing listens at this address: the refusal comes before any connection.
+        let gone = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let err = HttpsCoordinator::new(
+            Endpoint::parse(&format!("localhost:{}", gone.port())).unwrap(),
+            rig.files.clone(),
+        )
+        .bound_to(identity_of(&rig.updater.der).unwrap())
+        .heartbeat(&beat())
+        .unwrap_err();
+        assert!(
+            matches!(&err, CoordinatorError::Files(why) if why.contains("another node or role")),
+            "{node} {role}: {err:?}"
+        );
+    }
 }

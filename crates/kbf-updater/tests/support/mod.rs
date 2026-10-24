@@ -128,6 +128,11 @@ impl Pki {
     pub fn write_updater_files(&self, dir: &Path, leaf: &Leaf) {
         std::fs::write(dir.join("cert.pem"), pem_of("CERTIFICATE", &leaf.der)).unwrap();
         std::fs::write(dir.join("key.pem"), pem_of("PRIVATE KEY", &leaf.key)).unwrap();
+        std::fs::set_permissions(
+            dir.join("key.pem"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
         std::fs::write(dir.join("ca.pem"), self.root_pem()).unwrap();
     }
 }

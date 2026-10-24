@@ -4,13 +4,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::flags::{DEFAULT_HELPER_SOCKET, Timing, parse_flags};
+use super::flags::{DEFAULT_HELPER_SOCKET, NodeApi, Timing, parse_flags};
 
 fn args(words: &[&str]) -> Vec<String> {
     words.iter().map(|w| (*w).to_owned()).collect()
 }
 
-const REQUIRED: [&str; 14] = [
+const REQUIRED: [&str; 10] = [
     "--coordinator",
     "coordinator.farm.example:8443",
     "--client-cert",
@@ -21,6 +21,9 @@ const REQUIRED: [&str; 14] = [
     "/etc/kbf/updater/ca.pem",
     "--channel",
     "stable",
+];
+
+const NODE_API: [&str; 4] = [
     "--operator-api",
     "http://127.0.0.1:18002",
     "--token-file",
@@ -37,7 +40,7 @@ fn with(extra: &[&str]) -> Vec<String> {
 /// no proxy secret; `--flag=value` is `--flag value`.
 #[test]
 fn the_required_flags_make_a_config_with_the_defaults() {
-    let config = parse_flags(&args(&REQUIRED)).unwrap();
+    let config = parse_flags(&with(&NODE_API)).unwrap();
     assert_eq!(config.coordinator.host, "coordinator.farm.example");
     assert_eq!(config.coordinator.port, 8443);
     assert_eq!(
@@ -48,16 +51,19 @@ fn the_required_flags_make_a_config_with_the_defaults() {
     assert_eq!(config.files.ca, PathBuf::from("/etc/kbf/updater/ca.pem"));
     assert_eq!(config.channel, "stable");
     assert_eq!(
-        config.operator_api,
-        "127.0.0.1:18002".parse::<SocketAddr>().unwrap()
+        config.node_api,
+        Some(NodeApi {
+            addr: "127.0.0.1:18002".parse::<SocketAddr>().unwrap(),
+            token_file: PathBuf::from("/etc/kbf/updater/token"),
+            proxy_auth_file: None,
+        })
     );
-    assert_eq!(config.token_file, PathBuf::from("/etc/kbf/updater/token"));
-    assert_eq!(config.operator_proxy_auth_file, None);
     assert_eq!(config.helper_socket, PathBuf::from(DEFAULT_HELPER_SOCKET));
     assert_eq!(config.timing, Timing::DEFAULT);
     assert_eq!(Timing::DEFAULT.heartbeat, Duration::from_secs(15));
 
-    let inline: Vec<String> = REQUIRED
+    let inline: Vec<String> = [REQUIRED.as_slice(), NODE_API.as_slice()]
+        .concat()
         .chunks(2)
         .map(|pair| format!("{}={}", pair[0], pair[1]))
         .collect();
@@ -69,6 +75,10 @@ fn the_required_flags_make_a_config_with_the_defaults() {
 #[test]
 fn the_optional_flags_are_read() {
     let config = parse_flags(&with(&[
+        "--operator-api",
+        "http://127.0.0.1:18002",
+        "--token-file",
+        "/etc/kbf/updater/token",
         "--operator-proxy-auth-file",
         "/etc/kbf/updater/proxy",
         "--helper-socket",
@@ -86,7 +96,7 @@ fn the_optional_flags_are_read() {
     ]))
     .unwrap();
     assert_eq!(
-        config.operator_proxy_auth_file,
+        config.node_api.unwrap().proxy_auth_file,
         Some(PathBuf::from("/etc/kbf/updater/proxy"))
     );
     assert_eq!(config.helper_socket, PathBuf::from("/run/other.sock"));
@@ -138,7 +148,7 @@ fn flags_that_are_missing_or_wrong_are_refused_by_name() {
         assert!(err.contains(why), "{extra:?}: {err}");
     }
     let replace = |flag: &str, value: &str| {
-        let mut words = args(&REQUIRED);
+        let mut words = with(&NODE_API);
         let at = words.iter().position(|w| w == flag).unwrap();
         words[at + 1] = value.to_owned();
         parse_flags(&words).unwrap_err()
@@ -149,4 +159,20 @@ fn flags_that_are_missing_or_wrong_are_refused_by_name() {
     assert!(replace("--channel", "").contains("--channel must be a channel name"));
     assert!(replace("--operator-api", "http://203.0.113.5:18002").contains("loopback"));
     assert!(replace("--operator-api", "https://127.0.0.1:1").contains("http://"));
+}
+
+/// With neither `--operator-api` nor `--token-file` the config has no node API: the agent is
+/// given no credential for the frontend. Giving one without the other, or the proxy secret
+/// alone, is refused.
+#[test]
+fn the_operator_credential_is_given_whole_or_not_at_all() {
+    assert_eq!(parse_flags(&args(&REQUIRED)).unwrap().node_api, None);
+    for half in [
+        &NODE_API[..2],
+        &NODE_API[2..],
+        &["--operator-proxy-auth-file", "/p"],
+    ] {
+        let err = parse_flags(&with(half)).unwrap_err();
+        assert!(err.contains("given together"), "{half:?}: {err}");
+    }
 }

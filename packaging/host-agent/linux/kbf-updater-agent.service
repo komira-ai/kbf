@@ -2,11 +2,15 @@
 # heartbeats to the coordinator over mutual TLS and runs this host's update through the local
 # socket of kbf-host-local.service. It listens on nothing.
 #
-# The certificate, key and CA are files an operator placed (enrollment is a later step). The
-# drain of the node and its health go to the frontend's loopback operator API with the operator
-# token: no scoped credential exists yet (docs/api.md plans the roles), so the token file is
-# the full operator token and this unit runs only where both it and the loopback API are within
-# reach. Edit the values to the farm's.
+# The certificate, key and CA are files an operator placed (enrollment is a later step); the
+# key is owned by kbf-updater with mode 0600. Edit the values to the farm's.
+#
+# This unit gives the agent NO credential for the frontend's operator API: the drain of the node
+# and its health need the full operator token (no scoped credential exists yet; docs/api.md
+# plans the roles), and the design keeps that token off hosts. So the agent heartbeats and
+# refuses every update order, before it fetches anything. An operator who accepts the token on
+# a host adds `--operator-api http://127.0.0.1:18002 --token-file FILE` to the command line
+# below, knowing that anything running as kbf-updater can then read it.
 [Unit]
 Description=kbf-updater agent, this host's update agent
 Documentation=https://github.com/komira-ai/kbf/blob/main/docs/design/updates.md
@@ -16,7 +20,7 @@ Wants=network-online.target kbf-host-local.service
 [Service]
 Type=simple
 User=kbf-updater
-ExecStart=/usr/libexec/kbf/kbf-updater agent --coordinator coordinator.farm.example:8443 --client-cert /etc/kbf/updater/cert.pem --client-key /etc/kbf/updater/key.pem --ca /etc/kbf/updater/ca.pem --channel stable --operator-api http://127.0.0.1:18002 --token-file /etc/kbf/updater/operator-token
+ExecStart=/usr/libexec/kbf/kbf-updater agent --coordinator coordinator.farm.example:8443 --client-cert /etc/kbf/updater/cert.pem --client-key /etc/kbf/updater/key.pem --ca /etc/kbf/updater/ca.pem --channel stable
 Restart=always
 RestartSec=5
 NoNewPrivileges=yes
@@ -25,6 +29,16 @@ ProtectHome=yes
 PrivateTmp=yes
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
 
 [Install]
 WantedBy=multi-user.target

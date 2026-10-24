@@ -19,7 +19,7 @@ pub mod update;
 
 mod build;
 
-pub use build::{no_drain, run_agent, run_config};
+pub use build::{NoCredential, no_drain, run_agent, run_config};
 pub use run::{Agent, Stop, World};
 
 #[cfg(test)]

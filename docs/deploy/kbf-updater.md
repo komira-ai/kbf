@@ -129,8 +129,8 @@ working (until the roll and its ssh path are deleted, in the last step of that d
 
 ```text
 kbf-updater agent --coordinator <dns name>:<port> --client-cert FILE --client-key FILE --ca FILE
-                  --channel NAME --operator-api http://IP:PORT --token-file FILE
-                  [--operator-proxy-auth-file FILE] [--helper-socket PATH]
+                  --channel NAME [--operator-api http://IP:PORT --token-file FILE
+                  [--operator-proxy-auth-file FILE]] [--helper-socket PATH]
                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
                   [--health-poll-secs N] [--retry-secs N]
 ```
@@ -143,12 +143,15 @@ kbf-updater agent --coordinator <dns name>:<port> --client-cert FILE --client-ke
   certificate: its one DNS name is this node's id and its `urn:kbf:host-role:` is what the host
   runs (`storage`, `daemon` or `mac-daemon`; a `frontend` is refused, the roll updates frontends).
   The agent reads both from it. The files are read for every heartbeat, so a renewed pair is used
-  from the next one.
+  from the next one, if it names the same node and role as the pair the agent started with (a
+  pair for another node is refused until the agent is restarted). The key file must be a regular
+  file of the agent's user with mode 0600 or 0400, as the token file must.
 - `--channel`: the channel of the helper's allowlist. The version the coordinator names is looked
   up in it by the helper, never fetched by URL.
 - `--helper-socket`: the socket of `kbf-host-install --serve` (default
   `/run/kbf-host-install/local.sock`; [host-install.md](host-install.md#the-local-socket)).
-- `--operator-api`, `--token-file`, `--operator-proxy-auth-file`: see the boundary below.
+- `--operator-api`, `--token-file`, `--operator-proxy-auth-file`: optional, together; see the
+  boundary below.
 - Times, in seconds, 1 to 86400: `--heartbeat-secs` 15, `--drain-deadline-secs` 600,
   `--health-timeout-secs` 300, `--health-poll-secs` 5, `--retry-secs` 900.
 
@@ -194,6 +197,9 @@ The design says the full operator token must not be on hosts. **No scoped creden
 the one operator credential until they land. The drain of a node (`NodeDrain`: cordon, drain,
 uncordon) and the node's health are calls to the operator API, which is on the frontend's
 loopback. This mode therefore takes `--operator-api` and `--token-file` as the roll mode does, and
-updates only where both are within reach; the agent reaches nothing else of the frontend. The
-mechanism is the one the design names, behind two small ports (`Drain`, `HealthCheck`) so that a
-scoped credential replaces the adapter and not the agent.
+updates only where both are within reach; the agent reaches nothing else of the frontend. **The
+packaged units give the agent neither**: without them it heartbeats and refuses every update
+order before it fetches anything, so a host runs the agent only as far as the heartbeat until an
+operator decides to put the token on it (anything running as the agent's account can then read
+it). The mechanism is the one the design names, behind two small ports (`Drain`, `HealthCheck`)
+so that a scoped credential replaces the adapter and not the agent.

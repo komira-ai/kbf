@@ -13,7 +13,7 @@ here is in a package yet: the binaries are release assets (`docs/deploy/host-ins
 | `macos/com.komira.kbf-updater-agent.plist` | the agent on a Mac, as `_kbf-updater` |
 
 The values in the files are examples (`coordinator.farm.example`, the paths of the certificate,
-the key, the CA and the token): edit them to the farm's. `crates/kbf-updater/tests/agent_packaging.rs`
+the key and the CA): edit them to the farm's. `crates/kbf-updater/tests/agent_packaging.rs`
 reads these files and checks that every command line parses as the programs parse it, that
 the two ends agree on the socket and on the account that may connect to it, and that the agent
 is not root.
@@ -24,10 +24,12 @@ is not root.
   is a later step). The certificate says which node this is and what the host runs.
 - **A configuration for the helper's channels**: on Linux `/etc/kbf/host-install-releases.toml`,
   on a Mac the existing `host-install.toml`. See `docs/deploy/host-install.md`, "The local socket".
-- **The frontend's loopback operator API and its token.** The drain of the node and the node's
-  health are calls to it, as in the roll mode. The operator API has no scoped credential yet
-  (`docs/api.md`: its roles are planned), so the token is the full operator token, and the API
-  is on the frontend's loopback: the agent updates only where both are within reach. This is
-  the boundary the design names ("the full operator token must not be on hosts"), and it is not
-  crossed here; a scoped credential for `:drain`, `:uncordon` and node status is what lifts it.
+- **No credential for the frontend's operator API, as shipped.** The drain of the node and the
+  node's health are calls to it, and it has no scoped credential yet (`docs/api.md`: its roles are
+  planned), so they need the full operator token, which the design keeps off hosts. The units
+  and jobs here give the agent none: it heartbeats and refuses every update order before it
+  fetches anything. An operator who accepts the token on a host adds `--operator-api` and
+  `--token-file` to the agent's command line (the API is on the frontend's loopback), knowing
+  that the agent's account can then read the token. A scoped credential for `:drain`,
+  `:uncordon` and node status is what lifts the boundary.
 - **A frontend host is not served**: its certificate is refused. The roll updates frontends.

@@ -8,7 +8,7 @@ use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 
 use super::coordinator::{HttpsCoordinator, TlsFiles};
-use super::flags::Config;
+use super::flags::{Config, NodeApi};
 use super::local::{Limits, LocalInstaller, SocketLocal};
 use super::run::{Agent, Stop, World};
 use super::status::{Status, host_platform};
@@ -17,7 +17,7 @@ use crate::inventory::{Host, Role};
 use crate::node_drain::NodeDrain;
 use crate::node_health::NodeHealth;
 use crate::operator::OperatorApi;
-use crate::ports::{Drain, PortError, SystemClock};
+use crate::ports::{Drain, Health, HealthCheck, PortError, SystemClock};
 use crate::version::Version;
 
 /// A host whose node is never drained (a storage host): the drain and the undrain are done
@@ -41,6 +41,66 @@ impl Drain for NoDrain {
 /// [`NoDrain`], as a port.
 pub fn no_drain() -> Arc<dyn Drain> {
     Arc::new(NoDrain)
+}
+
+/// The ports of an agent that was given no credential for the frontend's operator API: it
+/// refuses every update before it fetches anything, and drains nothing.
+pub struct NoCredential;
+
+const NO_CREDENTIAL: &str = "this agent was given no operator API credential, so it cannot drain \
+     its node and updates nothing";
+
+impl HealthCheck for NoCredential {
+    fn refusal(&self, _host: &Host) -> Option<String> {
+        Some(NO_CREDENTIAL.to_owned())
+    }
+
+    fn check(&self, _host: &Host, _target: &Version) -> Result<Health, PortError> {
+        Err(PortError::other(NO_CREDENTIAL))
+    }
+
+    fn check_held(&self, _host: &Host, _target: &Version) -> Result<Health, PortError> {
+        Err(PortError::other(NO_CREDENTIAL))
+    }
+}
+
+impl Drain for NoCredential {
+    fn drain(&self, _host: &Host, _deadline: Duration) -> Result<(), PortError> {
+        Err(PortError::other(NO_CREDENTIAL))
+    }
+
+    fn leases(&self, _host: &Host) -> Result<usize, PortError> {
+        Err(PortError::other(NO_CREDENTIAL))
+    }
+
+    fn undrain(&self, _host: &Host) -> Result<(), PortError> {
+        Err(PortError::other(NO_CREDENTIAL))
+    }
+}
+
+/// The drain and the health of a host.
+type NodePorts = (Arc<dyn Drain>, Arc<dyn HealthCheck>);
+
+/// The drain and the health of a host through `api`, or the refusals of [`NoCredential`].
+fn node_ports(
+    api: Option<&NodeApi>,
+    role: Role,
+    local: &Arc<SocketLocal>,
+) -> Result<NodePorts, String> {
+    let Some(api) = api else {
+        return Ok((Arc::new(NoCredential), Arc::new(NoCredential)));
+    };
+    let api = OperatorApi::new(
+        api.addr,
+        api.token_file.clone(),
+        api.proxy_auth_file.clone(),
+    )?;
+    let drain = drain_for(role, &api);
+    let health = Arc::new(NodeHealth::with_api(
+        api,
+        Arc::new(LocalInstaller(local.clone())),
+    ));
+    Ok((drain, health))
 }
 
 /// Who the updater certificate in `files` says this host is.
@@ -105,20 +165,10 @@ pub fn build(cfg: &Config) -> Result<Agent, String> {
         member: None,
     };
     let local = Arc::new(SocketLocal::new(&cfg.helper_socket, Limits::default()));
-    let api = OperatorApi::new(
-        cfg.operator_api,
-        cfg.token_file.clone(),
-        cfg.operator_proxy_auth_file.clone(),
-    )?;
-    let drain = drain_for(host.role, &api);
-    let health = Arc::new(NodeHealth::with_api(
-        api,
-        Arc::new(LocalInstaller(local.clone())),
-    ));
-    let coordinator = Arc::new(HttpsCoordinator::new(
-        cfg.coordinator.clone(),
-        cfg.files.clone(),
-    ));
+    let (drain, health) = node_ports(cfg.node_api.as_ref(), host.role, &local)?;
+    let coordinator = Arc::new(
+        HttpsCoordinator::new(cfg.coordinator.clone(), cfg.files.clone()).bound_to(identity),
+    );
     let world = World {
         coordinator,
         local,

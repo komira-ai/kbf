@@ -10,17 +10,18 @@ use kbf_testkit::dir::TestDir;
 use kbf_types::HostRole;
 
 use super::build::{
-    NoDrain, build, drain_for, identity_of_files, no_drain, run_agent, run_config, unix_now,
+    NoCredential, NoDrain, build, drain_for, identity_of_files, no_drain, run_agent, run_config,
+    unix_now,
 };
 use super::coordinator::{Endpoint, TlsFiles};
-use super::flags::{Config, Timing};
+use super::flags::{Config, NodeApi, Timing};
 use super::pki::{Pki, write_files};
 use super::run::Stop;
 use super::status::host_platform;
 use super::testing::host;
 use crate::inventory::Role;
 use crate::operator::OperatorApi;
-use crate::ports::Drain;
+use crate::ports::{Drain, HealthCheck};
 use crate::version::Version;
 
 struct Rig {
@@ -43,9 +44,11 @@ impl Rig {
             files,
             channel: "stable".to_owned(),
             helper_socket: dir.join("no-helper.sock"),
-            operator_api: "127.0.0.1:1".parse().unwrap(),
-            token_file: token,
-            operator_proxy_auth_file: None,
+            node_api: Some(NodeApi {
+                addr: "127.0.0.1:1".parse().unwrap(),
+                token_file: token,
+                proxy_auth_file: None,
+            }),
             timing: Timing {
                 heartbeat: Duration::from_millis(20),
                 ..Timing::DEFAULT
@@ -139,7 +142,7 @@ fn an_agent_is_built_for_every_host_but_a_frontend() {
     );
 
     let mut rig2 = Rig::new("bd-notoken", HostRole::Daemon);
-    rig2.config.token_file = rig2.dir.join("absent");
+    rig2.config.node_api.as_mut().unwrap().token_file = rig2.dir.join("absent");
     assert!(build(&rig2.config).err().unwrap().contains("--token-file"));
     rig.config.files.cert = rig.dir.join("absent.pem");
     assert!(build(&rig.config).is_err());
@@ -151,7 +154,8 @@ fn an_agent_is_built_for_every_host_but_a_frontend() {
 #[test]
 fn a_storage_host_is_not_drained_and_a_daemon_host_is() {
     let rig = Rig::new("bd-drain", HostRole::Daemon);
-    let api = OperatorApi::new(rig.config.operator_api, rig.config.token_file.clone(), None)
+    let node = rig.config.node_api.clone().unwrap();
+    let api = OperatorApi::new(node.addr, node.token_file, None)
         .unwrap()
         .with_timeout(Duration::from_millis(200));
     let storage = drain_for(Role::Storage, &api);
@@ -214,4 +218,26 @@ fn the_caller_gets_the_stop_handle_before_the_agent_runs() {
 #[test]
 fn the_clock_is_unix_seconds() {
     assert!(unix_now() > 1_700_000_000);
+}
+
+/// An agent given no operator API credential is built, but it refuses every update order before
+/// anything is fetched, and drains nothing.
+#[test]
+fn an_agent_without_the_operator_credential_refuses_every_update() {
+    let mut rig = Rig::new("bd-nocred", HostRole::Daemon);
+    rig.config.node_api = None;
+    assert!(build(&rig.config).is_ok());
+    let h = host(Role::Daemon);
+    let v = Version::parse("1.2.3").unwrap();
+    assert!(
+        NoCredential
+            .refusal(&h)
+            .unwrap()
+            .contains("no operator API credential")
+    );
+    assert!(NoCredential.check(&h, &v).is_err());
+    assert!(NoCredential.check_held(&h, &v).is_err());
+    assert!(NoCredential.drain(&h, Duration::from_secs(1)).is_err());
+    assert!(NoCredential.leases(&h).is_err());
+    assert!(NoCredential.undrain(&h).is_err());
 }

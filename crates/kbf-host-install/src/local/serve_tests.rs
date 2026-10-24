@@ -9,14 +9,16 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use kbf_testkit::dir::TestDir;
 use serde_json::{Value, json};
 
 use super::answer::{Answer, Code};
+use super::backend::Fault;
 use super::core_tests::{A, B, Fx, VA, VB};
 use super::request::MAX_LINE_LEN;
-use super::serve::{ServeConfig, Serving, bind, passwd_ids};
+use super::serve::{ServeConfig, Serving, bind, passwd_ids, read_line};
 use crate::trust::Trust;
 
 fn trust(dir: &Path) -> Trust {
@@ -465,4 +467,94 @@ fn the_tick_logs_what_it_did() {
         },
         Code::Busy,
     );
+}
+
+/// A client that sends a byte now and then is cut off at the window for the whole line, not
+/// given a new window with every byte; a line sent at once, in pieces within the window, or
+/// too long, or not text, is read as it should be.
+#[test]
+fn a_client_that_trickles_is_cut_off_at_the_window_for_the_whole_line() {
+    let window = Duration::from_millis(300);
+    let (client, server) = UnixStream::pair().unwrap();
+    let slow = std::thread::spawn(move || {
+        for _ in 0..40 {
+            if (&client).write_all(b"q").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+    let started = Instant::now();
+    assert_eq!(read_line(&server, window), None);
+    assert!(started.elapsed() < Duration::from_millis(1500));
+    drop(server);
+    slow.join().unwrap();
+
+    let read = |bytes: &[u8]| {
+        let (client, server) = UnixStream::pair().unwrap();
+        (&client).write_all(bytes).unwrap();
+        drop(client);
+        read_line(&server, window)
+    };
+    assert_eq!(read(b"query\n").as_deref(), Some("query"));
+    assert_eq!(read(b"query"), None, "no end of line");
+    assert_eq!(read(b""), None, "nothing sent");
+    assert_eq!(read(&[0xff, b'\n']), None, "not text");
+    let mut long = vec![b'a'; MAX_LINE_LEN];
+    long.push(b'\n');
+    assert_eq!(read(&long).map(|l| l.len()), Some(MAX_LINE_LEN));
+    long.insert(0, b'a');
+    assert_eq!(read(&long), None, "one byte too many");
+    // In pieces, within the window.
+    let (client, server) = UnixStream::pair().unwrap();
+    let pieces = std::thread::spawn(move || {
+        (&client).write_all(b"que").unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        (&client).write_all(b"ry\n").unwrap();
+    });
+    assert_eq!(read_line(&server, window).as_deref(), Some("query"));
+    pieces.join().unwrap();
+}
+
+/// A revert that fails with the release still on trial is tried again after a pause, not on
+/// every turn of the loop (and its unit restarted five times a second).
+#[test]
+fn a_revert_that_fails_is_not_retried_on_every_turn() {
+    let logged = with_serving("sv-retry", |fx, wire| {
+        fx.ask(&format!("install kbf={VB} from stable"));
+        fx.ask(&format!("switch kbf={VB}"));
+        fx.clock.set(100_000);
+        fx.world.borrow_mut().revert_fault = Some(Fault::failed(Code::RevertFailed, "links"));
+        let run = fx.dir.join("run");
+        fs::create_dir(&run).unwrap();
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
+        let meta = fs::metadata(&*fx.dir).unwrap();
+        let listener = bind(
+            &trust(&fx.dir),
+            &run.join("r.sock"),
+            (meta.uid(), meta.gid()),
+        )
+        .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(900));
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+        wire.serving.run(&listener, &stop).unwrap();
+        stopper.join().unwrap();
+        let reverts = fx
+            .world
+            .borrow()
+            .calls
+            .iter()
+            .filter(|c| *c == "revert")
+            .count();
+        assert_eq!(reverts, 1);
+        assert!(fx.query().pending.is_some(), "still on trial");
+    });
+    // One attempt, said twice: the loop's line and the failure's.
+    assert_eq!(logged.len(), 2, "{logged:?}");
 }

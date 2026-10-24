@@ -3,8 +3,8 @@
 //!
 //! ```text
 //! kbf-updater agent --coordinator <dns name>:<port> --client-cert FILE --client-key FILE --ca FILE
-//!                   --channel NAME --operator-api http://IP:PORT --token-file FILE
-//!                   [--operator-proxy-auth-file FILE] [--helper-socket PATH]
+//!                   --channel NAME [--operator-api http://IP:PORT --token-file FILE
+//!                   [--operator-proxy-auth-file FILE]] [--helper-socket PATH]
 //!                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
 //!                   [--health-poll-secs N] [--retry-secs N]
 //! ```
@@ -21,8 +21,10 @@
 //! - `--operator-api`, `--token-file`, `--operator-proxy-auth-file`: the frontend's loopback
 //!   operator API, as in the roll mode, for the drain of the node and the node's health.
 //!   **There is no scoped credential for these calls yet** (`docs/api.md`: the operator API's
-//!   roles are planned), so the token is the full operator token and the API is the frontend's
-//!   loopback: the agent updates only where both are within reach.
+//!   roles are planned), so the token is the full operator token. Giving it to an agent is a
+//!   choice of the operator, made by giving both `--operator-api` and `--token-file` (the
+//!   proxy secret needs them): without them the agent heartbeats and refuses every update
+//!   order, before it fetches anything. The packaged units give neither.
 //! - Times, in seconds: `--heartbeat-secs` (default 15), `--drain-deadline-secs` (600, how long
 //!   the node's leases are waited for), `--health-timeout-secs` (300, how long the release on
 //!   trial has to show healthy), `--health-poll-secs` (5) and `--retry-secs` (900, how long a
@@ -37,8 +39,8 @@ use super::coordinator::{Endpoint, TlsFiles};
 use crate::daemon::parse_operator_url;
 
 pub const USAGE: &str = "usage: kbf-updater agent --coordinator DNSNAME:PORT --client-cert FILE \
---client-key FILE --ca FILE --channel NAME --operator-api http://IP:PORT --token-file FILE \
-[--operator-proxy-auth-file FILE] [--helper-socket PATH] [--heartbeat-secs N] \
+--client-key FILE --ca FILE --channel NAME [--operator-api http://IP:PORT --token-file FILE \
+[--operator-proxy-auth-file FILE]] [--helper-socket PATH] [--heartbeat-secs N] \
 [--drain-deadline-secs N] [--health-timeout-secs N] [--health-poll-secs N] [--retry-secs N]\n";
 
 const FLAGS: [&str; 14] = [
@@ -100,10 +102,18 @@ pub struct Config {
     pub files: TlsFiles,
     pub channel: String,
     pub helper_socket: PathBuf,
-    pub operator_api: SocketAddr,
-    pub token_file: PathBuf,
-    pub operator_proxy_auth_file: Option<PathBuf>,
+    /// The frontend's operator API for the drain and the health, if the operator gave the agent
+    /// the credential for it.
+    pub node_api: Option<NodeApi>,
     pub timing: Timing,
+}
+
+/// The frontend's loopback operator API and the credential for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeApi {
+    pub addr: SocketAddr,
+    pub token_file: PathBuf,
+    pub proxy_auth_file: Option<PathBuf>,
 }
 
 /// A number of seconds from 1 to a day.
@@ -157,11 +167,26 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
     if !channel_ok(&channel) {
         return Err("--channel must be a channel name: [a-z0-9][a-z0-9-]{0,31}".to_owned());
     }
-    let operator_api = parse_operator_url(&take("--operator-api")?)?;
-    let token_file = PathBuf::from(take("--token-file")?);
-    let operator_proxy_auth_file = found
+    let api = found.remove("--operator-api");
+    let token = found.remove("--token-file");
+    let proxy_auth_file = found
         .remove("--operator-proxy-auth-file")
         .map(PathBuf::from);
+    let node_api = match (api, token) {
+        (Some(api), Some(token)) => Some(NodeApi {
+            addr: parse_operator_url(&api)?,
+            token_file: PathBuf::from(token),
+            proxy_auth_file,
+        }),
+        (None, None) if proxy_auth_file.is_none() => None,
+        _ => {
+            return Err(
+                "--operator-api and --token-file are given together (and the proxy secret \
+                 file only with them), or not at all"
+                    .to_owned(),
+            );
+        }
+    };
     let helper_socket = found
         .remove("--helper-socket")
         .map_or_else(|| PathBuf::from(DEFAULT_HELPER_SOCKET), PathBuf::from);
@@ -182,9 +207,7 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
         files,
         channel,
         helper_socket,
-        operator_api,
-        token_file,
-        operator_proxy_auth_file,
+        node_api,
         timing,
     })
 }

@@ -6,8 +6,11 @@
 //!   (`urn:kbf:role:coordinator`): a certificate of any other role of the farm's, a storage
 //!   node's say, is refused after the handshake and before the heartbeat is written.
 //! - **Who it is.** The client certificate and key are read from their files for every
-//!   heartbeat, so a renewed pair is used from the next one with no restart. Nothing of the
-//!   host's identity is in the body: the coordinator reads it from the certificate.
+//!   heartbeat, so a renewed pair is used from the next one with no restart. The key file is
+//!   held to the rule of the token file (a regular file of the updater's user, mode 0600 or
+//!   0400). Nothing of the host's identity is in the body: the coordinator reads it from the
+//!   certificate, and a certificate that names another node or role than the one the agent
+//!   started as is not used (the drain it does targets the node it started as).
 //! - **What it takes back.** A 200 whose body is exactly a [`Reply`], read strictly and no
 //!   more than [`REPLY_MAX`] bytes. Anything else is an error, and the updater does nothing
 //!   with it but heartbeat again.
@@ -19,17 +22,22 @@ use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kbf_peer::uri_values_of;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
+use crate::identity::{Identity, identity_of};
+use crate::secret::read_secret;
 use crate::wire::{HEARTBEAT_PATH, Heartbeat, Reply};
 
 /// The most bytes of a reply that are read.
 pub const REPLY_MAX: usize = 16 * 1024;
+
+/// The most bytes of the client key file that are read.
+const KEY_MAX: u64 = 16 * 1024;
 
 /// The role a coordinator's certificate names.
 pub const COORDINATOR_ROLE: &str = "coordinator";
@@ -119,6 +127,7 @@ pub struct HttpsCoordinator {
     endpoint: Endpoint,
     files: TlsFiles,
     timeout: Duration,
+    identity: Option<Identity>,
 }
 
 impl HttpsCoordinator {
@@ -127,7 +136,16 @@ impl HttpsCoordinator {
             endpoint,
             files,
             timeout: TIMEOUT,
+            identity: None,
         }
+    }
+
+    /// Heartbeat only with a certificate that names `identity`: a pair swapped on disk for
+    /// another node's is refused until the agent is restarted.
+    #[must_use]
+    pub fn bound_to(mut self, identity: Identity) -> Self {
+        self.identity = Some(identity);
+        self
     }
 
     #[must_use]
@@ -166,6 +184,13 @@ impl HttpsCoordinator {
 /// [`CoordinatorError::Files`] for a file that is not there or not PEM of its kind, a key that
 /// is not the certificate's, or a CA file with no usable certificate.
 pub fn client_config(files: &TlsFiles) -> Result<Arc<ClientConfig>, CoordinatorError> {
+    load(files).map(|(config, _)| config)
+}
+
+/// [`client_config`], and the DER of the leaf certificate it was made from.
+fn load(
+    files: &TlsFiles,
+) -> Result<(Arc<ClientConfig>, CertificateDer<'static>), CoordinatorError> {
     let bad = |path: &Path, why: &dyn std::fmt::Display| {
         CoordinatorError::Files(format!("{}: {why}", path.display()))
     };
@@ -173,10 +198,12 @@ pub fn client_config(files: &TlsFiles) -> Result<Arc<ClientConfig>, CoordinatorE
     let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&read(&files.cert)?)
         .collect::<Result<_, _>>()
         .map_err(|e| bad(&files.cert, &e))?;
-    if chain.is_empty() {
+    let Some(leaf) = chain.first().cloned() else {
         return Err(bad(&files.cert, &"it holds no certificate"));
-    }
-    let key = PrivateKeyDer::from_pem_slice(&read(&files.key)?).map_err(|e| bad(&files.key, &e))?;
+    };
+    let key_pem =
+        read_secret(&files.key, "--client-key", KEY_MAX).map_err(|e| bad(&files.key, &e))?;
+    let key = PrivateKeyDer::from_pem_slice(&key_pem).map_err(|e| bad(&files.key, &e))?;
     let mut roots = RootCertStore::empty();
     for ca in CertificateDer::pem_slice_iter(&read(&files.ca)?) {
         let ca = ca.map_err(|e| bad(&files.ca, &e))?;
@@ -195,7 +222,7 @@ pub fn client_config(files: &TlsFiles) -> Result<Arc<ClientConfig>, CoordinatorE
         })
         .map_err(|e| CoordinatorError::Files(format!("not a TLS configuration: {e}")))?;
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(Arc::new(config))
+    Ok((Arc::new(config), leaf))
 }
 
 /// Whether `error`, from the TLS stream, is the server's certificate being refused.
@@ -215,7 +242,18 @@ fn handshake_error(error: &io::Error) -> CoordinatorError {
 
 impl Coordinator for HttpsCoordinator {
     fn heartbeat(&self, beat: &Heartbeat) -> Result<Reply, CoordinatorError> {
-        let config = client_config(&self.files)?;
+        let (config, leaf) = load(&self.files)?;
+        if let Some(expected) = &self.identity {
+            let now = identity_of(leaf.as_ref()).map_err(|e| {
+                CoordinatorError::Files(format!("{}: {e}", self.files.cert.display()))
+            })?;
+            if &now != expected {
+                return Err(CoordinatorError::Files(format!(
+                    "{} now names another node or role than the agent started as; restart it",
+                    self.files.cert.display()
+                )));
+            }
+        }
         let down = |e: io::Error| CoordinatorError::Unreachable(e.to_string());
         let connection = ClientConnection::new(config, self.endpoint.name.clone())
             .map_err(|e| down(io::Error::other(e)))?;
@@ -239,7 +277,7 @@ impl Coordinator for HttpsCoordinator {
         tls.write_all(head.as_bytes()).map_err(down)?;
         tls.write_all(&body).map_err(down)?;
         tls.flush().map_err(down)?;
-        parse_reply(&read_all(&mut tls)?)
+        parse_reply(&read_all(&mut tls, self.timeout)?)
     }
 }
 
@@ -264,11 +302,19 @@ fn check_role(conn: &ClientConnection) -> Result<(), CoordinatorError> {
 /// the TLS close is read as ended: the length of the body decides whether it is whole.
 fn read_all(
     tls: &mut StreamOwned<ClientConnection, TcpStream>,
+    window: Duration,
 ) -> Result<Vec<u8>, CoordinatorError> {
+    let end = Instant::now() + window;
     let mut raw = Vec::new();
     let mut chunk = [0_u8; 4096];
     loop {
-        match tls.read(&mut chunk) {
+        // The whole reply has `window`, not each read: a server that trickles is cut off.
+        let left = end.saturating_duration_since(Instant::now());
+        let read = tls
+            .sock
+            .set_read_timeout(Some(left))
+            .and_then(|()| tls.read(&mut chunk));
+        match read {
             Ok(0) => return Ok(raw),
             Ok(n) => {
                 raw.extend_from_slice(&chunk[..n]);

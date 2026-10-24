@@ -22,12 +22,12 @@
 //! Every request but `query` and `revert` is audited, and is not run when the audit log
 //! cannot be opened. A revert is never held back by it.
 
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt, chown};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::answer::{Answer, Code};
 use super::backend::Backend;
@@ -43,8 +43,11 @@ pub const DEFAULT_WINDOW_SECS: u64 = 600;
 /// How long the loop sleeps when no connection waits.
 const IDLE: Duration = Duration::from_millis(200);
 
-/// How long a client has to send its line, and to take the answer.
+/// How long a client has, in all, to send its line, and for each write of the answer.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the loop leaves a revert alone after one that failed.
+const REVERT_RETRY: Duration = Duration::from_secs(30);
 
 pub const USAGE: &str = "usage: kbf-host-install --serve --socket PATH --socket-user NAME \
 [--window-secs N] [--restart-unit UNIT]...\n";
@@ -185,9 +188,8 @@ impl<B: Backend> Serving<'_, B> {
     /// Read the request line from `stream`, answer it, and audit it.
     pub fn serve_one(&self, stream: UnixStream) {
         let _ = stream.set_nonblocking(false);
-        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-        let line = read_line(&stream);
+        let line = read_line(&stream, IO_TIMEOUT);
         let answer = self.answer(line.as_deref());
         let mut writer = &stream;
         let wrote = writeln!(writer, "{}", answer.json_line()).and_then(|()| writer.flush());
@@ -268,21 +270,26 @@ impl<B: Backend> Serving<'_, B> {
         }
     }
 
-    /// Go back, if a release on trial is past its deadline; audited like a revert.
-    pub fn tick(&self) {
+    /// Go back, if a release on trial is past its deadline; audited like a revert. Whether it
+    /// tried and failed, so that the loop leaves it alone for a while.
+    pub fn tick(&self) -> bool {
         let Some(answer) = self.ab.tick() else {
-            return;
+            return false;
         };
         (self.log)(&format!("the deadline passed: {}", answer.json_line()));
         let log = Audit::open(self.trust, self.audit);
         self.record(Some(&LocalRequest::Revert), None, &answer, log);
+        !matches!(answer, Answer::Reverted { .. })
     }
 
     /// Serve until `stop` is set: the connections, and the ticks between them.
     pub fn run(&self, listener: &UnixListener, stop: &AtomicBool) -> io::Result<()> {
         listener.set_nonblocking(true)?;
+        let mut hold_revert_until = Instant::now();
         while !stop.load(Ordering::Relaxed) {
-            self.tick();
+            if Instant::now() >= hold_revert_until && self.tick() {
+                hold_revert_until = Instant::now() + REVERT_RETRY;
+            }
             match listener.accept() {
                 Ok((stream, _)) => self.serve_one(stream),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(IDLE),
@@ -293,12 +300,31 @@ impl<B: Backend> Serving<'_, B> {
     }
 }
 
-/// The first line the client sent, within [`MAX_LINE_LEN`] bytes, without its end; none when
-/// it sent none, a longer one, or text that is not UTF-8.
-fn read_line(stream: &UnixStream) -> Option<String> {
-    let mut line = String::new();
-    let read = BufReader::new(stream.take(MAX_LINE_LEN as u64 + 1)).read_line(&mut line);
-    read.ok()?;
-    let line = line.strip_suffix('\n')?;
-    (line.len() <= MAX_LINE_LEN).then(|| line.to_owned())
+/// The first line the client sent, within [`MAX_LINE_LEN`] bytes and within `window` in all
+/// (a client that trickles bytes is cut off, not waited for), without its end; none when it
+/// sent none in time, a longer one, or text that is not UTF-8.
+pub(super) fn read_line(stream: &UnixStream, window: Duration) -> Option<String> {
+    let end = Instant::now() + window;
+    let mut line = Vec::new();
+    let mut chunk = [0u8; 64];
+    loop {
+        // A zero timeout is an error: a deadline that has passed ends the wait there.
+        let left = end.saturating_duration_since(Instant::now());
+        let got = stream
+            .set_read_timeout(Some(left))
+            .and_then(|()| (&*stream).read(&mut chunk))
+            .ok()?;
+        let chunk = chunk.get(..got).filter(|c| !c.is_empty())?;
+        let (head, found) = chunk
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or((chunk, false), |at| (&chunk[..at], true));
+        line.extend_from_slice(head);
+        if line.len() > MAX_LINE_LEN {
+            return None;
+        }
+        if found {
+            return String::from_utf8(line).ok();
+        }
+    }
 }

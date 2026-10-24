@@ -139,7 +139,12 @@ pub fn write_files(dir: &Path, pki: &Pki, leaf: &Leaf) -> TlsFiles {
     };
     TlsFiles {
         cert: write("updater.pem", &leaf.cert_pem()),
-        key: write("updater.key", &leaf.key_pem()),
+        key: {
+            let key = write("updater.key", &leaf.key_pem());
+            std::fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .expect("the key is private");
+            key
+        },
         ca: write("ca.pem", &pki.root_pem()),
     }
 }

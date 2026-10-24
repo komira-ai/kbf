@@ -67,6 +67,11 @@ fn the_linux_units_agree_with_the_programs_and_with_each_other() {
     let line = words(&unit_value(&agent, "ExecStart"));
     assert_eq!(line[1], "agent");
     let config = parse_flags(&line[2..]).expect("the agent's flags");
+    assert_eq!(
+        config.node_api, None,
+        "the shipped unit carries no operator token"
+    );
+    assert!(!unit_value(&agent, "ExecStart").contains("token"));
     assert_eq!(config.helper_socket, Path::new(DEFAULT_HELPER_SOCKET));
     let user = unit_value(&agent, "User");
     assert_ne!(user, "root");
@@ -107,6 +112,11 @@ fn the_macos_jobs_agree_with_the_programs_and_with_each_other() {
     let args = program_arguments(&agent);
     assert_eq!(args[1], "agent");
     let config = parse_flags(&args[2..]).expect("the agent's flags");
+    assert_eq!(
+        config.node_api, None,
+        "the shipped job carries no operator token"
+    );
+    assert!(!agent.contains("--token-file</string>"));
     let user = plist_value(&agent, "UserName");
     assert_ne!(user, "root");
 
