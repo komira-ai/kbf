@@ -30,7 +30,7 @@ pub enum Item {
 }
 
 /// Everything harvest copies. Adding to this list is the only way to read more.
-pub const ALLOWLIST: [Item; 6] = [
+pub const ALLOWLIST: [Item; 8] = [
     Item::File("private/var/log/kbf-probe-local"),
     Item::Matching {
         dir: "private/var/log",
@@ -41,6 +41,14 @@ pub const ALLOWLIST: [Item; 6] = [
     Item::Tree("private/var/db/uuidtext"),
     Item::Tree("private/var/db/timesync"),
     Item::Tree("Library/Logs/DiagnosticReports"),
+    // The share diagnosis (`kbf-guest probe-diag`) and the logs of the daemons that run as
+    // `nobody`, which cannot create a file in /var/log.
+    Item::File("private/var/log/kbf-probe-diag"),
+    Item::Matching {
+        dir: "private/var/tmp",
+        prefix: "com.kbf.probe.",
+        suffix: ".log",
+    },
 ];
 
 /// Paths whose existence and times are recorded without copying them.
@@ -386,6 +394,10 @@ mod tests {
         put(&v, "private/var/log/system.log", "not on the list");
         put(&v, "private/var/log/unrelated-daemon-file.log", "not ours");
         put(&v, "private/var/log/com.kbf.probe.mount.old", "not a log");
+        put(&v, "private/var/log/kbf-probe-diag", "dg");
+        put(&v, "private/var/tmp/com.kbf.probe.user.log", "ul");
+        put(&v, "private/var/tmp/other.log", "not ours");
+        put(&v, "private/var/tmp/com.kbf.probe.user.txt", "not a log");
         put(&v, "private/var/db/diagnostics/Persist/0001.tracev3", "t1");
         put(&v, "private/var/db/diagnostics/timesync/a.timesync", "ts");
         put(&v, "private/var/db/uuidtext/AB/CDEF", "uu");
@@ -415,6 +427,8 @@ mod tests {
             "private/var/log/kbf-probe-local",
             "private/var/log/com.kbf.probe.mount.log",
             "private/var/log/com.kbf.probe.system.log",
+            "private/var/log/kbf-probe-diag",
+            "private/var/tmp/com.kbf.probe.user.log",
             "private/var/db/diagnostics/Persist/0001.tracev3",
             "private/var/db/diagnostics/timesync/a.timesync",
             "private/var/db/uuidtext/AB/CDEF",
@@ -431,7 +445,7 @@ mod tests {
         );
         let copied: BTreeSet<String> = strings(&m, "copied", "path").into_iter().collect();
         assert_eq!(copied, want);
-        assert_eq!(m["total_bytes"], 42);
+        assert_eq!(m["total_bytes"], 46);
         assert_eq!(m["skipped"], json!([]));
         assert_eq!(m["absent"], json!([]));
         // The guest's file times are kept in the manifest: they date the daemon's run.
@@ -510,7 +524,8 @@ mod tests {
         let m = copy_allowlist(&v, &out, &all()).expect("harvest");
         let got = tree(&out);
         assert!(
-            got.iter().all(|p| p.starts_with("private/var/db/")),
+            got.iter()
+                .all(|p| p.starts_with("private/var/db/") || p.starts_with("private/var/tmp/")),
             "{got:?}"
         );
         for p in &got {
@@ -812,7 +827,7 @@ mod tests {
     /// Catches an allowlist that grew without review: it is pinned here, entry by entry.
     #[test]
     fn the_allowlist_is_the_reviewed_list() {
-        assert_eq!(ALLOWLIST.len(), 6);
+        assert_eq!(ALLOWLIST.len(), 8);
         assert_eq!(ALLOWLIST[0], Item::File("private/var/log/kbf-probe-local"));
         assert_eq!(
             ALLOWLIST[1],
@@ -829,6 +844,12 @@ mod tests {
                 Item::Tree("private/var/db/uuidtext"),
                 Item::Tree("private/var/db/timesync"),
                 Item::Tree("Library/Logs/DiagnosticReports"),
+                Item::File("private/var/log/kbf-probe-diag"),
+                Item::Matching {
+                    dir: "private/var/tmp",
+                    prefix: "com.kbf.probe.",
+                    suffix: ".log"
+                },
             ]
         );
         assert_eq!(STATS, ["private/var/db/.AppleSetupDone", "private/var/log"]);

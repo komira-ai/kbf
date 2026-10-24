@@ -19,6 +19,7 @@
 //! not built.
 
 pub mod client;
+pub mod diag;
 pub mod mount;
 pub mod probe;
 #[cfg(target_os = "macos")]

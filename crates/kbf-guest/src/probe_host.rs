@@ -168,3 +168,60 @@ impl crate::mount::Mounter for SystemHost {
         std::thread::sleep(d);
     }
 }
+
+impl crate::diag::DiagHost for SystemHost {
+    fn run(&self, program: &str, args: &[&str]) -> Value {
+        match Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+        {
+            Ok(out) => json!({
+                "exit_code": out.status.code(),
+                "stdout": String::from_utf8_lossy(&out.stdout).trim_end(),
+                "stderr": String::from_utf8_lossy(&out.stderr).trim_end(),
+            }),
+            Err(e) => json!({"spawn_error": e.to_string()}),
+        }
+    }
+
+    fn ids(&self) -> Value {
+        // SAFETY: the four calls take no arguments and cannot fail.
+        let (uid, euid, gid, egid) = unsafe {
+            (
+                libc::getuid(),
+                libc::geteuid(),
+                libc::getgid(),
+                libc::getegid(),
+            )
+        };
+        json!({"uid": uid, "euid": euid, "gid": gid, "egid": egid})
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
+
+    fn pause(&self, d: Duration) {
+        std::thread::sleep(d);
+    }
+
+    fn mount_cycle(&self, tag: &str, mountpoint: &Path, inside: &dyn Fn(&Path) -> Value) -> Value {
+        use crate::mount::Mounter;
+        if let Err(e) = self.mount(tag, mountpoint) {
+            return json!({"mounted": false, "error": e});
+        }
+        let inside = inside(mountpoint);
+        let unmounted = std::ffi::CString::new(mountpoint.as_os_str().as_encoded_bytes())
+            .map_err(|e| e.to_string())
+            .and_then(|path| {
+                // SAFETY: `path` is a NUL-terminated string that outlives the call.
+                if unsafe { libc::unmount(path.as_ptr(), 0) } == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error().to_string())
+                }
+            });
+        json!({"mounted": true, "inside": inside, "unmount_error": unmounted.err()})
+    }
+}

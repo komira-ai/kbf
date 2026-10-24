@@ -227,6 +227,55 @@ that the probes still report whether it is usable. The mount is run from a copy 
 `kbf-guest` on the guest's disk because the copy on the share cannot be reached before the
 share is mounted; and `kbf-guest mount-share` refuses the automount tag.
 
+### E1 result, second run: the share mounts, every write into it is refused
+
+With the own-tag mount, `com.kbf.probe.mount.log` is empty in both clones and `kbf-guest`
+runs from the share (`com.kbf.probe.root.log` is written), so the guest reaches userspace
+and runs our code; both arms behave the same, so the graphics device does not matter for
+this. But `com.kbf.probe.root.log` holds 99 copies of `kbf-guest: write
+/private/var/kbf-mnt/results/guest-probe-root.json: Operation not permitted (os error 1)`
+and once `umount: unmount(/private/tmp/kbfmnt-root): Operation not permitted`, so no
+result and no `ready-system` marker ever reaches the host.
+
+What the code and the logs settle, and what they do not:
+
+- The host side is not read-only (`vz/config.rs` passes `readOnly` false for both kinds of
+  share), `results/` is made `0777` by the host, and the share lives in the console user's
+  home. Apple documents that the framework reads and writes host files as the effective
+  user of the VM process, ignoring a guest's `chown`, so a mode or an owner on the host
+  does not explain a guest root being refused.
+- The refusal is the same for a root file write and for a root `unmount`, which points at
+  a policy in the guest that is not a file mode: a MAC-framework check (sandbox, TCC
+  network-volume access, which applies to processes started by launchd that are not apps)
+  or a mount flag. That is a hypothesis; nothing here proves it.
+- The old code wrote through a temporary file and a rename and reported only "write": it
+  could not say whether the create, the write or the rename was refused. It now tries
+  the temporary file route first and then writes the result in place, and its error text
+  names each step that failed. If only the rename was refused, the result files now land.
+- The logs of the daemons that run as `nobody` were absent in both clones. `nobody` cannot
+  create a file in `/var/log`, which is where launchd was told to put them; these daemons
+  now log in `/private/var/tmp`, and the harvest copies `com.kbf.probe.*.log` from there.
+  (Whether they ran at all is not known from run two.)
+
+New diagnostics for the next run. `kbf-guest probe-diag` runs as a root daemon
+(`com.kbf.probe.diag`) from the copy of `kbf-guest` on the guest's disk, so it reports even
+when the mount fails. It waits up to 5 minutes for `/private/var/kbf-mnt/results`, then
+prints one JSON object to `/private/var/log/kbf-probe-diag` (the harvest copies it):
+`id`, `mount` (the mount table entry and its flags), `sw_vers`, `csrutil status`, `ls
+-ldeO@` and `stat` (owner, group, mode, flags, extended attributes, ACL) of the mount
+point, of `results/` and of a control directory on the guest's disk, and, for the mount
+point, `results/` and the control directory, each step of a write (create, write, rename,
+mkdir, remove) with its errno and the first step that failed. It also mounts the
+`kbfprobe` tag at `/private/tmp/kbfmnt-diag`, runs the same write steps inside it, and
+unmounts it with the system call, reporting the errno of each. Read it like this:
+
+| `writes` | meaning |
+|---|---|
+| control all ok, share root and `results/` fail at `create` | the guest refuses to create files on virtiofs for root; compare `ls` flags and the unified log around the time (`log show --archive ... --predicate 'process == "tccd" OR process == "sandboxd" OR eventMessage CONTAINS "deny"'`) |
+| `create` and `write` ok, `rename` fails | virtiofs refuses a rename; the in-place fallback now covers it |
+| `results/` fails and the mount root works (or the reverse) | a per-directory difference: owner or mode as the guest maps it |
+| everything ok in the diagnosis but `com.kbf.probe.root.log` still shows the refusal | the refusal is specific to the binary running from the share (the process is located on the volume it writes to) |
+
 ## What to send back
 
 Everything the commands wrote, including each helper's log (the cause of a VM that did

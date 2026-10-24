@@ -73,6 +73,13 @@ pub const LOCAL_LABEL: &str = "com.kbf.probe.local";
 /// boot proves launchd loaded our plists, its modification time says when, and `image
 /// harvest` reads it.
 pub const LOCAL_MARKER: &str = "/private/var/log/kbf-probe-local";
+/// The label of the root daemon that runs `kbf-guest probe-diag`, and the file launchd
+/// writes its JSON to (on the guest's own disk, because the share refuses writes).
+pub const DIAG_LABEL: &str = "com.kbf.probe.diag";
+pub const DIAG_OUTPUT: &str = "/private/var/log/kbf-probe-diag";
+/// Where the daemons that run as `nobody` keep their logs: `nobody` cannot create a file
+/// in `/var/log`, and the second E1 run left no log of theirs there.
+pub const USER_LOG_DIR: &str = "/private/var/tmp";
 
 /// The host side of the share for one VM.
 #[derive(Debug, Clone)]
@@ -244,6 +251,11 @@ pub fn daemon_plist(
     stdout: Option<&str>,
     restart: bool,
 ) -> String {
+    let log_dir = if user.is_some() {
+        USER_LOG_DIR
+    } else {
+        "/var/log"
+    };
     let keep_alive = if restart {
         "  <key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>\n  <key>ThrottleInterval</key>\n  <integer>3</integer>\n"
     } else {
@@ -267,7 +279,7 @@ pub fn daemon_plist(
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
-<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{label}</string>\n  <key>ProgramArguments</key>\n  <array>\n{args}  </array>\n{user}  <key>RunAtLoad</key>\n  <true/>\n{keep_alive}  <key>StandardErrorPath</key>\n  <string>/var/log/{label}.log</string>\n{stdout}</dict>\n</plist>\n"
+<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{label}</string>\n  <key>ProgramArguments</key>\n  <array>\n{args}  </array>\n{user}  <key>RunAtLoad</key>\n  <true/>\n{keep_alive}  <key>StandardErrorPath</key>\n  <string>{log_dir}/{label}.log</string>\n{stdout}</dict>\n</plist>\n"
     )
 }
 
@@ -279,9 +291,9 @@ fn guest_args(sub: &[&str]) -> Vec<String> {
 
 /// The files the offline write puts into the guest: the Setup Assistant marker, the mount
 /// point directory, the copy of `kbf-guest` the mount daemon runs (when `bootstrap` holds
-/// its bytes), and six launch daemons (the share mounter, a probe as root, a probe as
-/// `nobody`, the system marker, the login marker, and the local marker that needs none of
-/// the others).
+/// its bytes), and seven launch daemons (the share mounter, a probe as root, a probe as
+/// `nobody`, the system marker, the login marker, the share diagnosis, and the local
+/// marker that needs none of the others).
 #[must_use]
 pub fn offline_payload(bootstrap: Option<Vec<u8>>) -> Vec<OfflineFile> {
     let out = |name: &str| format!("{GUEST_SHARE}/{RESULTS}/{name}");
@@ -305,7 +317,7 @@ pub fn offline_payload(bootstrap: Option<Vec<u8>>) -> Vec<OfflineFile> {
         mode: 0o755,
     }));
     // (label, user, arguments, restarted by launchd until it succeeds)
-    let daemons: [(&str, Option<&str>, Vec<String>, bool); 6] = [
+    let daemons: [(&str, Option<&str>, Vec<String>, bool); 7] = [
         (
             "com.kbf.probe.mount",
             None,
@@ -396,6 +408,22 @@ pub fn offline_payload(bootstrap: Option<Vec<u8>>) -> Vec<OfflineFile> {
             true,
         ),
         (
+            // From the guest's own disk, so that it reports even when the mount fails.
+            DIAG_LABEL,
+            None,
+            [
+                BOOTSTRAP,
+                "probe-diag",
+                "--share",
+                GUEST_MOUNT,
+                "--wait-path",
+                GUEST_RESULTS,
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            false,
+        ),
+        (
             LOCAL_LABEL,
             None,
             [
@@ -416,7 +444,11 @@ pub fn offline_payload(bootstrap: Option<Vec<u8>>) -> Vec<OfflineFile> {
                 label,
                 user,
                 &args,
-                (label == LOCAL_LABEL).then_some(LOCAL_MARKER),
+                match label {
+                    LOCAL_LABEL => Some(LOCAL_MARKER),
+                    DIAG_LABEL => Some(DIAG_OUTPUT),
+                    _ => None,
+                },
                 restart,
             )
             .into_bytes(),
@@ -480,7 +512,7 @@ mod tests {
             user.contains("<key>UserName</key>\n  <string>nobody</string>"),
             "{user}"
         );
-        assert!(user.contains("<string>/var/log/com.kbf.x.log</string>"));
+        assert!(user.contains(&format!("<string>{USER_LOG_DIR}/com.kbf.x.log</string>")));
         let root = daemon_plist(
             "com.kbf.y",
             None,
@@ -508,7 +540,7 @@ mod tests {
     /// start, a daemon that waits for a path the mounter does not make, or a root control
     /// that runs as nobody (the G3 verdict compares the two users).
     #[test]
-    fn the_offline_payload_holds_the_marker_the_mount_point_the_binary_and_six_daemons() {
+    fn the_offline_payload_holds_the_marker_the_mount_point_the_binary_and_seven_daemons() {
         let files = offline_payload(Some(b"bin".to_vec()));
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths[0], "private/var/db/.AppleSetupDone");
@@ -519,7 +551,7 @@ mod tests {
             (&b"bin"[..], 0o755)
         );
         assert_eq!(BOOTSTRAP, format!("/{}", paths[2]));
-        assert_eq!(paths.len(), 9);
+        assert_eq!(paths.len(), 10);
         assert!(paths[3..].iter().all(|p| holds(&[
             p.starts_with("Library/LaunchDaemons/com.kbf.probe."),
             p.ends_with(".plist")
@@ -557,7 +589,7 @@ mod tests {
         }
         // Without the binary the copy is not written; the daemons still are.
         let bare = offline_payload(None);
-        assert_eq!(bare.len(), 8);
+        assert_eq!(bare.len(), 9);
         assert!(bare.iter().all(|f| f.path != paths[2]));
     }
 
@@ -627,12 +659,12 @@ mod tests {
             ]),
             "{plist}"
         );
-        // Only the local daemon has its output redirected.
+        // Only the local and the diagnosis daemons have their output redirected.
         for f in files.iter().filter(|f| f.path.ends_with(".plist")) {
             let text = String::from_utf8(f.contents.clone()).expect("utf8");
             assert_eq!(
                 text.contains("StandardOutPath"),
-                f.path.contains(LOCAL_LABEL),
+                f.path.contains(LOCAL_LABEL) || f.path.contains(DIAG_LABEL),
                 "{}",
                 f.path
             );
@@ -647,6 +679,55 @@ mod tests {
             let label = name.trim_end_matches(".plist");
             assert!(label.starts_with("com.kbf.probe."), "{label}");
         }
+    }
+
+    /// Catches a diagnosis daemon that needs the share (it must report when the mount
+    /// fails), runs as a user that the share may refuse, would loop, or sends its JSON
+    /// somewhere the harvest does not read, and logs of the `nobody` daemons in a
+    /// directory `nobody` cannot write (the second E1 run left none).
+    #[test]
+    fn the_diagnosis_runs_from_the_guest_disk_and_the_user_daemons_log_where_they_can() {
+        let files = offline_payload(Some(Vec::new()));
+        let diag = plist_of(&files, DIAG_LABEL);
+        assert!(
+            holds(&[
+                diag.contains(&format!("<string>{BOOTSTRAP}</string>")),
+                diag.contains("<string>probe-diag</string>"),
+                diag.contains(&format!("<string>{GUEST_RESULTS}</string>")),
+                !diag.contains(&format!("{GUEST_SHARE}/{GUEST_BIN}")),
+                !diag.contains("UserName"),
+                !diag.contains("KeepAlive"),
+                diag.contains(&format!(
+                    "<key>StandardOutPath</key>\n  <string>{DIAG_OUTPUT}</string>"
+                )),
+            ]),
+            "{diag}"
+        );
+        assert_eq!(
+            crate::harvest::ALLOWLIST[6],
+            crate::harvest::Item::File(DIAG_OUTPUT.trim_start_matches('/'))
+        );
+        for label in ["user", "system", "login"] {
+            let p = plist_of(&files, &format!("com.kbf.probe.{label}"));
+            assert!(
+                p.contains(&format!(
+                    "<string>{USER_LOG_DIR}/com.kbf.probe.{label}.log</string>"
+                )),
+                "{p}"
+            );
+        }
+        assert!(
+            plist_of(&files, "com.kbf.probe.root")
+                .contains("<string>/var/log/com.kbf.probe.root.log</string>")
+        );
+        assert_eq!(
+            crate::harvest::ALLOWLIST[7],
+            crate::harvest::Item::Matching {
+                dir: USER_LOG_DIR.trim_start_matches('/'),
+                prefix: "com.kbf.probe.",
+                suffix: ".log"
+            }
+        );
     }
 
     /// Catches a binary read from the wrong place or a missing file that is not reported.
