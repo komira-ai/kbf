@@ -5,17 +5,21 @@
 //! and `TMPDIR`, a Metal probe (`tests/slot_gpu_clean/gpu_probe.swift`: a device, a shader
 //! compiled at run time, a compute kernel), then a second copy that keeps its device
 //! open, so that the I/O Registry has a user client of the uid. The lease ends as the
-//! driver ends it, the lease directory goes, and the clean runs. The files that a
-//! framework import (MLX) makes in the security-message folder, which the Metal probe
-//! does not, are planted the way the system makes them: owned by the uid.
+//! driver ends it, the lease directory goes, and the clean runs.
 //!
-//! The analytics and trust stores under `/private/var/protected` are not swept in the
-//! daemon's context on a real Mac (root is refused there, even with Full Disk Access for
-//! the trust store); the slot profile denies leases access to them instead. The test
-//! checks that the deny holds for a lease (a readable file of the uid's in each store is
-//! unreadable under the profile) and that the Metal probe still runs under it. An MLX
-//! matrix product is not run: it needs a Python interpreter, which the interpreter
-//! budget (`tools/interpreter_budget.tsv`) does not allow a test to name.
+//! The OS-owned protected stores (`/private/var/protected/trustd/private`,
+//! `/private/var/protected/sfanalytics`, `/private/var/db/mds/messages`) are out of scope
+//! of the clean and of this test: the daemon has no Full Disk Access and neither lists nor
+//! removes anything in them. An MLX matrix product is not run: it needs a Python
+//! interpreter, which the interpreter budget (`tools/interpreter_budget.tsv`) does not
+//! allow a test to name.
+//!
+//! Which user: with `KBF_TEST_POOL_USER` set to a user name, the test uses that existing
+//! user (it looks up its uid, group and generated UID, and never creates, changes or
+//! deletes it), as a root launch daemon without Full Disk Access cannot delete a user
+//! with `dscl` (`eDSPermissionError`). Without it, the test makes a throwaway user, as the
+//! hosted runner needs, and deletes it at the end. The user's home must be empty and the
+//! user must have no process.
 //!
 //! The test is `#[ignore]`: it needs root, real users, a Metal device and `swiftc`. The
 //! macOS CI job runs it with `cargo xtask sudo-test -p kbf-driver-native --test slot_gpu_clean
@@ -35,19 +39,12 @@ use std::time::{Duration, Instant};
 use kbf_driver_native::home;
 use kbf_driver_native::network::{Isolation, Network};
 use kbf_driver_native::slots::macos::{Slot, Slots};
-use kbf_driver_native::slots::{LEASES_ROOT_MODE, Pool};
+use kbf_driver_native::slots::{LEASES_ROOT_MODE, Pool, SlotUser};
 use support::pool::{Scratch, Users};
 
 const PROBE_SOURCE: &str = include_str!("slot_gpu_clean/gpu_probe.swift");
 const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 const GRACE: Duration = Duration::from_secs(3);
-
-/// The places a system daemon keeps files for a uid outside its folders.
-const PROTECTED: [&str; 2] = [
-    "/private/var/protected/sfanalytics",
-    "/private/var/protected/trustd/private",
-];
-const MDS_MESSAGES: &str = "/private/var/db/mds/messages";
 
 fn text(program: &str, args: &[&str]) -> String {
     let out = Command::new(program)
@@ -58,19 +55,26 @@ fn text(program: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// The generated UID of the user `name`.
-fn generated_uid(name: &str) -> String {
+/// The existing user named by `KBF_TEST_POOL_USER`, from the directory service: its uid,
+/// its primary group and (checked to be a real record) its generated UID.
+fn existing_user(name: &str) -> SlotUser {
+    let number = |flag: &str| -> u32 {
+        let said = text("/usr/bin/id", &[flag, name]);
+        said.trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("id {flag} {name}: {said:?}"))
+    };
     let said = text(
         "/usr/bin/dscl",
         &[".", "-read", &format!("/Users/{name}"), "GeneratedUID"],
     );
-    let guid = said
-        .split_whitespace()
-        .last()
-        .unwrap_or_default()
-        .to_owned();
+    let guid = said.split_whitespace().last().unwrap_or_default();
     assert_eq!(guid.len(), 36, "GeneratedUID of {name}: {said:?}");
-    guid
+    SlotUser {
+        name: name.to_owned(),
+        uid: number("-u"),
+        gid: number("-g"),
+    }
 }
 
 /// The probe, built into a folder the pool user can run it from.
@@ -177,17 +181,11 @@ fn owned_below(root: &Path, uid: u32, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// What the uid owns in the system places the clean sweeps outside its own folders, and
-/// in all of `/private/var/folders` except its entry's root and four folders, which are
-/// the uid's by design (the test looks inside them on its own).
+/// What the uid owns in all of `/private/var/folders` except its entry's root and four
+/// folders, which are the uid's by design (the test looks inside them on its own).
 fn uid_files_outside(uid: u32, folders: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    for root in PROTECTED.iter().map(Path::new).chain([
-        Path::new("/private/var/db/mds"),
-        Path::new("/private/var/folders"),
-    ]) {
-        owned_below(root, uid, &mut found);
-    }
+    owned_below(Path::new("/private/var/folders"), uid, &mut found);
     found.retain(|path| {
         path != folders
             && !["0", "C", "T", "X"]
@@ -251,17 +249,10 @@ fn names(dir: &Path) -> Vec<String> {
     names
 }
 
-/// What the test puts where a framework import leaves it, and what it must take away
-/// whether the test ends or panics: the planted files and folders, the process that holds
-/// a device, and the probe folder.
+/// What the test must take away whether it ends or panics: the uid's processes, the
+/// process that holds a device, and the probe folder.
 struct Litter {
     uid: u32,
-    /// Every planted file, whoever owns it.
-    files: Vec<PathBuf>,
-    /// What the uid owns of it, which the clean must remove.
-    residue: Vec<PathBuf>,
-    /// The folders the test made, deepest first, removed when empty.
-    made: Vec<PathBuf>,
     holder: Option<std::process::Child>,
     probes: PathBuf,
 }
@@ -275,34 +266,8 @@ impl Drop for Litter {
             let _ = holder.kill();
             let _ = holder.wait();
         }
-        for file in &self.files {
-            let _ = std::fs::remove_file(file);
-        }
-        for dir in &self.made {
-            let _ = std::fs::remove_dir(dir);
-        }
         let _ = std::fs::remove_dir_all(&self.probes);
     }
-}
-
-/// Makes `file` with the given owner and mode, and the folders above it that are missing.
-/// The folders the test makes belong to `folder_owner`.
-fn plant(file: &Path, owner: u32, folder_owner: u32, mode: u32, litter: &mut Litter) {
-    let folder = file.parent().expect("parent");
-    let mut at = folder;
-    let first = litter.made.len();
-    while !at.exists() {
-        litter.made.push(at.to_owned());
-        at = at.parent().expect("parent");
-    }
-    std::fs::create_dir_all(folder).expect("plant folder");
-    for made in &litter.made[first..] {
-        std::os::unix::fs::chown(made, Some(folder_owner), None).expect("chown folder");
-    }
-    litter.files.push(file.to_owned());
-    std::fs::write(file, "x").expect("plant file");
-    std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode)).expect("chmod");
-    std::os::unix::fs::chown(file, Some(owner), None).expect("chown");
 }
 
 fn wait_for(file: &Path, needle: &str, secs: u64) -> bool {
@@ -326,35 +291,33 @@ fn wait_for(file: &Path, needle: &str, secs: u64) -> bool {
 ///   see one, and none after the clean;
 /// - after the clean the slot is free (the clean found nothing left), the entry holds its
 ///   four empty folders and nothing else, the home is empty, and the uid owns nothing under
-///   `/private/var/protected`, `/private/var/db/mds` or `/private/var/folders`;
-/// - the uid's planted file in its security-message folder is gone (the sweep keeps that
-///   folder, which is readable in the daemon's context);
-/// - a file of the uid's that it could read in each protected store (planted when root can
-///   write there) cannot be read by a lease under the slot profile, and the same read
-///   outside the sandbox is printed as `PROTECTED-CONTROL`, so the deny is seen to be the
-///   profile's when the store lets the uid in;
-/// - the Metal probe passes under the slot profile with that deny.
+///   `/private/var/folders` outside its entry's folders;
+/// - the Metal probe passes under the slot profile, with its deny of the protected stores.
 #[ignore = "needs root, real users, a Metal device and swiftc: see spike-slot-reach.yml job slot-gpu-clean"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
     support::pool::assert_root("slot_gpu_clean");
     let scratch = Scratch::new("slotgpu");
-    let users = Users::new("slotgpu", 1);
-    let pool = Pool::new(users.0.clone()).expect("pool");
+    // The existing user the environment names, or a throwaway one (deleted when `made`
+    // drops).
+    let made;
+    let user = match std::env::var("KBF_TEST_POOL_USER") {
+        Ok(name) if !name.is_empty() => existing_user(&name),
+        _ => {
+            made = Users::new("slotgpu", 1);
+            made.0[0].clone()
+        }
+    };
+    let pool = Pool::new(vec![user.clone()]).expect("pool");
     // Not `std::env::temp_dir()`: root's own folder, which the pool user cannot enter.
     let probes = PathBuf::from("/private/tmp").join(format!("kbf-slot-gpu-{}", std::process::id()));
-    let user = users.0[0].clone();
     let uid = user.uid;
     let mut litter = Litter {
         uid,
-        files: Vec::new(),
-        residue: Vec::new(),
-        made: Vec::new(),
         holder: None,
         probes: probes.clone(),
     };
     let probe = build_probe(&probes);
-    let guid = generated_uid(&user.name);
 
     let slots =
         Slots::start_with_grace(&pool, Duration::from_secs(20), GRACE, None).expect("slots");
@@ -391,73 +354,6 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
     let caches = metal_caches(&folders);
     let clients = registry_clients_of(uid);
 
-    // The deny: a file of the uid's, readable by it, in each protected store root can write
-    // to, which the lease must not read under the slot profile, by either spelling of the
-    // path (`/var` is a link to `/private/var`). A store that refuses root cannot be planted
-    // into, and the deny is then not checked here.
-    let mut denied = Vec::new();
-    let mut planted = 0;
-    let mut listable = 0;
-    for store in PROTECTED {
-        listable += usize::from(std::fs::read_dir(store).is_ok());
-        let file = Path::new(store).join(&guid).join("lease-readable");
-        let folder = file.parent().expect("parent").to_owned();
-        if std::fs::create_dir_all(&folder).is_err() {
-            println!("PROTECTED-NOT-PLANTED {store}: root cannot make a folder here");
-            continue;
-        }
-        plant(&file, uid, 0, 0o644, &mut litter);
-        planted += 1;
-        let cat = Path::new("/bin/cat");
-        let read = |isolation: &Isolation, path: &Path| {
-            lease
-                .command_with(
-                    &slot,
-                    isolation,
-                    Network::Off,
-                    &[],
-                    (cat, &[path.to_str().unwrap()]),
-                )
-                .output()
-                .expect("cat")
-        };
-        let outside = read(&Isolation::None, &file);
-        println!(
-            "PROTECTED-CONTROL {store}: unsandboxed read {}",
-            if outside.status.success() {
-                "works"
-            } else {
-                "is refused"
-            }
-        );
-        let control = outside.status.success();
-        let link_spelling =
-            Path::new("/var").join(file.strip_prefix("/private/var").expect("prefix"));
-        for path in [file.clone(), link_spelling] {
-            let inside = read(&lease.isolation, &path);
-            denied.push((
-                path,
-                control,
-                inside.status.success(),
-                String::from_utf8_lossy(&inside.stderr).into_owned(),
-            ));
-        }
-    }
-    if planted == 0 {
-        println!(
-            "PROTECTED-DENY-NOT-CHECKED: root cannot plant into either protected store on this \
-             host; this test does not check the profile deny here (the read-protected canary does)"
-        );
-    }
-
-    // What a framework import makes in the security-message folder, planted as the system
-    // makes it.
-    let message = Path::new(MDS_MESSAGES)
-        .join(uid.to_string())
-        .join("se_SecurityMessages");
-    plant(&message, uid, 0, 0o600, &mut litter);
-    litter.residue.push(message);
-
     // The end of the lease as the driver makes it, the lease directory, the clean.
     let uid_arg = uid.to_string();
     let _ = Command::new("/usr/bin/pkill")
@@ -477,10 +373,6 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
     // Everything is read before anything can end the test, then the plants are removed.
     let free = slots.count();
     let outside = uid_files_outside(uid, &folders);
-    let residue_left: Vec<PathBuf> = (litter.residue.iter())
-        .filter(|p| p.exists())
-        .cloned()
-        .collect();
     let left_in_entry: Vec<String> = names(&folders)
         .into_iter()
         .filter_map(|name| {
@@ -502,28 +394,7 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
         !clients.is_empty(),
         "the registry shows no user client of uid {uid}"
     );
-    for (path, control, readable, why) in &denied {
-        assert!(
-            control,
-            "the unsandboxed read of the planted {} was refused too: the deny is unproven",
-            path.display()
-        );
-        assert!(
-            !readable,
-            "a lease under the slot profile read {}",
-            path.display()
-        );
-        println!("PROTECTED-DENIED {}: {}", path.display(), why.trim());
-    }
-    assert!(
-        planted > 0 || listable == 0,
-        "root can list a protected store here but could plant into none: the deny went unchecked"
-    );
     assert_eq!(free, 1, "the clean left the slot dirty");
-    assert!(
-        residue_left.is_empty(),
-        "planted residue survived: {residue_left:?}"
-    );
     assert!(outside.is_empty(), "the uid still owns {outside:?}");
     assert!(
         left_in_entry.is_empty(),

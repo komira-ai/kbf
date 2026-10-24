@@ -19,7 +19,7 @@ this document is about Macs only.
 | **How an action starts** | Every pool action goes through `launchctl asuser <uid>`, then drops to the slot uid (`setgid`/`initgroups`/`setuid`) in the `as-user` mode `kbf-mac-session/src/macos/gui.rs` already has, then execs. That puts it in the `user/<uid>` bootstrap namespace, where per-user `cfprefsd`, `secd`/`trustd` and CoreSimulator live [I]. The daemon refuses to run an action as uid 0. | A plain `setuid` from root stays in the system namespace and "cannot reach the user's ... services whatever its uid" (`gui.rs:3-6`), so `defaults`, the keychain and `simctl` would fail or pass by luck. |
 | **Slots and scheduling** | The daemon reports `N` action slots; the scheduler never places more than `N` action leases. This is new scheduler work: `Resources.vms` is the model, but nothing books or fills it today (`kbf-types/src/work.rs:67-70`). A whole-machine lease needs every slot idle, so the scheduler **drains** the node for it: no new action leases, wait out the running ones. | Without a slot count, a ninth lease would share a uid. Without a drain, whole-machine leases starve while action leases keep arriving. |
 | **One volume** | The worker cache, the scratch root and the pool homes are on a **dedicated APFS volume** (one per Mac, made at provisioning), with `.metadata_never_index` and the backup exclusion on its roots. | macOS has no `protected_hardlinks`: on the system volume a slot could `link()` a root-owned cache inode into `/private/tmp`, where no uid sweep finds it and it pins cache bytes. Across volumes that `link()` gets EXDEV, and a home wipe unlinks everything the home holds. Spotlight off keeps `mdworker` from starting under a slot uid. |
-| **Clean between leases** | Pool users are reused. After every lease the daemon cleans the slot in **one pass**, in this order (C1 to C11, `slots/clean.rs`): (1) end the uid's launchd domains, `user/<uid>` and `gui/<uid>`, **whole** (never a job by its label: inside a domain that is going down that answers 124, "tearing down"), then poll `launchctl print user/<uid>` until it lists no job but launchd's own (told by where the job's plist lies, under `/System` or `/Library/Apple`, never by its label), waiting out 124, within a bound; (2) remove the uid's crontab and `at` jobs, so no job starts after the kill; (3) **kill every process of the uid**: first `kill(-1, SIGTERM)` and up to `--native-term-grace-ms` (default 2 s, 0 for none) for the uid's processes to end, so that a workload's resource tracker can unlink the POSIX shared memory and semaphores it made (a Mac cannot list those names, so nothing could remove them later); then a child drops to the uid and execs `kill(-1, SIGKILL)` (no Rust runs after `fork()` in the threaded daemon), repeated until two scans 200 ms apart find none, within 100 scans and a deadline; (4) detach the disk images the uid attached (owner from `hdiutil info -plist`) and unmount every mount under its home or `/var/folders` entry; (5) remove its System V IPC objects; (6) clear the user flags (`uchg`, `uappnd`, `nodump`, `opaque`, `hidden`), remove ACLs and make the owner's mode `u+rwx`, on the **roots first** (the home and the `/var/folders` entry themselves, because a locked directory cannot lose an entry) and then below them; (7) empty the real home (keychains included) and the uid's `/var/folders` entry, keeping `0`, `C`, `T` and `X` emptied and removing anything else in the entry root; (8) remove the uid's files in `/private/tmp`, `/private/var/tmp`, `/Library/Caches`, the `Shared` folder under `/Users` and the analytics and trust stores under `/private/var/protected` (`sfanalytics`, `trustd/private`), the uid's folder `/private/var/db/mds/messages/<uid>`, and launchd's per-uid `disabled` and `loginitems` plists; (9) remove the crash reports about the uid in the crash folders, `/cores` and every `/Users/*/Library/Logs/DiagnosticReports`: a file the uid owns, or an `.ips` report with the uid as the `userID` of its JSON header or body (a text report is attributed by its owner alone, since a newline in a process path can forge its lines; how a report is otherwise attributed is not known), found by walking each folder by descriptor without following a link; (10) give the home back to the user, mode 0700, no flags, and the entry's roots what they had when the slot was resolved, with no lock and not `hidden`; (11) a second look at the uid's processes, 200 ms after the first; then a **post-clean check**: no process whose effective *or* real uid is the slot's (`PROC_UID_ONLY` union `PROC_RUID_ONLY`, so a setuid-root binary the slot started is seen), checked once more after a short wait; no job in `user/<uid>`; no image of the uid; the home empty, the user's, mode 0700, without flags; none of the uid's files in the swept places. | A kill by uid is exact: it ignores process groups, `setsid` and pid reuse. Ending the domain first stops the respawn loop. The deadline turns a process stuck in uninterruptible wait into a failed clean, not a hung slot. Every item in (4) and (5) outlives a kill and a home wipe. The flags go before the removal because the shipped order (remove, then clear the flag on the home root) failed on a home locked by its user, and the retry that followed hid it. |
+| **Clean between leases** | Pool users are reused. After every lease the daemon cleans the slot in **one pass**, in this order (C1 to C11, `slots/clean.rs`): (1) end the uid's launchd domains, `user/<uid>` and `gui/<uid>`, **whole** (never a job by its label: inside a domain that is going down that answers 124, "tearing down"), then poll `launchctl print user/<uid>` until it lists no job but launchd's own (told by where the job's plist lies, under `/System` or `/Library/Apple`, never by its label), waiting out 124, within a bound; (2) remove the uid's crontab and `at` jobs, so no job starts after the kill; (3) **kill every process of the uid**: first `kill(-1, SIGTERM)` and up to `--native-term-grace-ms` (default 2 s, 0 for none) for the uid's processes to end, so that a workload's resource tracker can unlink the POSIX shared memory and semaphores it made (a Mac cannot list those names, so nothing could remove them later); then a child drops to the uid and execs `kill(-1, SIGKILL)` (no Rust runs after `fork()` in the threaded daemon), repeated until two scans 200 ms apart find none, within 100 scans and a deadline; (4) detach the disk images the uid attached (owner from `hdiutil info -plist`) and unmount every mount under its home or `/var/folders` entry; (5) remove its System V IPC objects; (6) clear the user flags (`uchg`, `uappnd`, `nodump`, `opaque`, `hidden`), remove ACLs and make the owner's mode `u+rwx`, on the **roots first** (the home and the `/var/folders` entry themselves, because a locked directory cannot lose an entry) and then below them; (7) empty the real home (keychains included) and the uid's `/var/folders` entry, keeping `0`, `C`, `T` and `X` emptied and removing anything else in the entry root; (8) remove the uid's files in `/private/tmp`, `/private/var/tmp`, `/Library/Caches` and the `Shared` folder under `/Users`, and launchd's per-uid `disabled` and `loginitems` plists; (9) remove the crash reports about the uid in the crash folders, `/cores` and every `/Users/*/Library/Logs/DiagnosticReports`: a file the uid owns, or an `.ips` report with the uid as the `userID` of its JSON header or body (a text report is attributed by its owner alone, since a newline in a process path can forge its lines; how a report is otherwise attributed is not known), found by walking each folder by descriptor without following a link; (10) give the home back to the user, mode 0700, no flags, and the entry's roots what they had when the slot was resolved, with no lock and not `hidden`; (11) a second look at the uid's processes, 200 ms after the first; then a **post-clean check**: no process whose effective *or* real uid is the slot's (`PROC_UID_ONLY` union `PROC_RUID_ONLY`, so a setuid-root binary the slot started is seen), checked once more after a short wait; no job in `user/<uid>`; no image of the uid; the home empty, the user's, mode 0700, without flags; none of the uid's files in the swept places. | A kill by uid is exact: it ignores process groups, `setsid` and pid reuse. Ending the domain first stops the respawn loop. The deadline turns a process stuck in uninterruptible wait into a failed clean, not a hung slot. Every item in (4) and (5) outlives a kill and a home wipe. The flags go before the removal because the shipped order (remove, then clear the flag on the home root) failed on a home locked by its user, and the retry that followed hid it. |
 | **When a clean fails** | The user is left **dirty**: the slot is not offered to a lease, the node reports one slot fewer, and the reason is logged (at `ERROR` the first time, at `DEBUG` while it stays the same); nothing is written to disk. There is no retry inside the pass, and the user is never deleted or made again. One **recovery thread** of the daemon is the only thing that cleans a dirty slot again: while any slot is dirty it re-cleans the dirty ones, one at a time, after 5 s, then 10 s, doubling to 5 min while a pass frees none, and starting again from 5 s after a pass that frees a slot or when another slot goes dirty. It needs no lease and no Xcode survey, so a node whose every slot is dirty comes back by itself. Each change in the number of usable slots is pushed to the daemon through its own part of the driver watch (the count and the push under one lock, so an older count never overwrites a newer one), and does not wait for anything else to change. | A failure that still happens has a cause the step order does not remove; it should be seen in the log, not hidden by a second attempt. Deleting a user is an OpenDirectory write (slow, the most likely to fail) and under a user's own processes would leave them running as an orphan uid. A node that takes no lease and reports nothing new would otherwise stay at zero slots until restart. |
 | **Sandbox** | Today's `sandbox-exec` profile stays, **as a hermeticity aid only**. It denies file writes outside the lease directory, `/dev`, the slot user's real home and its `/var/folders` entry. The deny rules for the network, `job-creation` and `user-preference-write` go: the clean covers what they protected. `lsopen` stays, and `mach-register` and `file-mount` are added: the clean does not reach an application Launch Services starts outside the sandbox, a Mach service name checked in with launchd, or a file system mounted on a directory. Each has a profile canary that the slot passes before a lease runs ([slot profile canaries](#slot-profile-canaries)). `NO_DEVICE_RULES` stays (`network.rs`). | The write rule still catches a build that writes into the source tree or `/usr/local`. The removed rules only existed because all leases shared one uid, and they break real tests today (`defaults write`, embedded XPC services, the network). |
 | **Network** | Open: internet and the LAN. The default for `network` becomes `on`; `network=off` stays as an opt-in (D2); under `off` a connect to the node's own non-loopback address is still allowed, so a service on the node's LAN address stays reachable. | Tests need the internet and the LAN. |
@@ -309,8 +309,6 @@ kernels and MLX under the slot profile. What such a lease leaves, measured on a 
 | Metal shader caches (`com.apple.metal`, `com.apple.metalfe`, `com.apple.gpuarchiver`) and the front-end module cache of MLX | `C/` of the uid's `/var/folders` entry | C7 |
 | `com.apple.MTLCompilerService` and Launch Services caches | `T/` and `0/` of the same entry | C7 |
 | Keychain, container-manager and quarantine files | the home | C7 |
-| Analytics and trust-store files the uid owns | `/private/var/protected/sfanalytics/<GUID>` and `/private/var/protected/trustd/private/<GUID>`, `<GUID>` the user's generated UID | C8 where root can list the folder; on a Mac Studio nothing (see below), and the slot profile denies leases access to them |
-| The uid's security-message folder | `/private/var/db/mds/messages/<uid>` | C8 |
 | I/O Registry user clients of the uid's processes | the kernel | C3: they end with the processes |
 
 There is no GPU step: C7 already empties the three folders that hold every Metal and MLX cache, and
@@ -318,43 +316,30 @@ the lease's `HOME` keeps `~/Library/Caches` inside the lease. Shader cache reuse
 lease; the next lease on the uid compiles again (first compile 180 to 270 ms for a small kernel, 1 s
 for an MLX `mx.compile`).
 
-The files under `/private/var/protected` and `/private/var/db/mds` are keyed by uid or generated
-UID, owned by the uid, and outlive the user, so C8 finds them by owner, never by the name of the
-user, and `user-delete` sweeps the same places. They appeared after a lease imported MLX, not after
-plain Metal use. A folder `<GUID>` the uid does not own stays, empty, after the sweep.
+**Out of scope: the OS-owned protected stores.** The clean has no Full Disk Access, and none
+is granted. Three stores are the operating system's, and the clean never tries to delete in them,
+never lists them as residue and never sets a slot dirty because of them:
+`/private/var/protected/trustd/private`, `/private/var/protected/sfanalytics` and
+`/private/var/db/mds/messages`. A lease that imports a GPU framework can cause system daemons to
+write files for its uid there (measured on a hosted runner, whose agent has Full Disk Access); on a
+Mac Studio the daemon's context is refused (`EPERM`) in the first two, and `trustd/private` refuses
+root even with Full Disk Access. Everything a build can write stays wiped and asserted: the home,
+the temporary folders, the caches, the processes and the GPU state in the table above.
 
-**Measured on a Mac Studio (macOS 27, system integrity protection on).** In the daemon's context (a
-root launchd job; the privacy database shows Full Disk Access denied for the kbf binaries), listing
-`/private/var/protected/sfanalytics` and `/private/var/protected/trustd/private` fails with `EPERM`.
-`trustd/private` is refused even to root with Full Disk Access (over ssh); neither folder carries the
-`restricted` flag, so the protection is a data vault's. `/private/var/db/mds/messages` lists fine. The
-hosted runner hid this, because its agent process has Full Disk Access. A C8 that fails closed on any
-error would have failed every clean on such a Mac and set every slot dirty. So:
+Revisit the protected stores (a VM per lease, or MDM-granted Full Disk Access) before running
+untrusted code.
 
-- **The sweep skips a protected base it is denied.** The plan names a `protected` set holding
-  only those two folders. When root cannot open, examine or list one of them (`/private/var/protected/sfanalytics`,
-  `/private/var/protected/trustd/private`) with `EPERM` or
-  `EACCES`, the base is skipped (a denial at any other base, `/private/var/folders` or `/private/tmp` say, is an error): not an error, not a dirty slot, and one warning per process and
-  base (not per lease) says the slot profile denies leases access to it. Every other error at a base,
-  and any error below a base that could be listed, still fails closed. The check after the sweep
-  (the listing of what the uid still owns) skips the same bases, classified by the same code. `/private/var/db/mds/messages/<uid>`
-  keeps its sweep.
-- **The slot profile denies the two folders instead.** `SLOT_PROFILE` and `SLOT_NO_NETWORK_PROFILE`
-  carry `(deny file-read* file-write* (subpath ".../sfanalytics") (subpath ".../trustd/private"))`
-  after the write allows, so a lease cannot read what a system daemon left there for the same uid
-  while an earlier lease ran. The daemons are not sandboxed by the lease's profile and keep writing
-  for the uid. The `read-protected` canary asserts the deny ([slot profile canaries](#slot-profile-canaries)).
-  Neither operation is one Metal needs, and the deny is not in the list of known GPU-breaking denies
-  (`tests/gpu_profile.rs`); `tests/slot_gpu.rs` runs the Metal probe under the profile (MLX is not run: a test may not name a Python interpreter).
-
-  Two things are not proven. Security framework trust evaluation (`trustd`, a certificate chain
-  or a TLS handshake) under the new deny is **unmeasured**: no test runs an evaluation under the profile, so
-  whether it needs to read `trustd/private` is not known.
-  And on a Mac Studio `slot_gpu` cannot plant into the protected stores (root is refused), so it
-  prints `PROTECTED-DENY-NOT-CHECKED` there and **the `read-protected` canary is the only proof of
-  the deny**; the test checks the deny where root can plant, which the hosted runner allows (and
-  asserts, with an unsandboxed control read, that the file was readable without the profile,
-  through both the `/private/var` and the `/var` spelling).
+**The slot profile still denies the first two stores.** `SLOT_PROFILE` and
+`SLOT_NO_NETWORK_PROFILE` carry `(deny file-read* file-write* (subpath ".../sfanalytics") (subpath
+".../trustd/private"))` after the write allows, so a lease cannot read what a system daemon left
+there for the same uid while an earlier lease ran. This is cheap isolation and does not conflict
+with the decision: it keeps the deny and its canary. The daemons are not sandboxed by the lease's
+profile and keep writing for the uid. `mds/messages` has no deny. The `read-protected` canary asserts
+the deny ([slot profile canaries](#slot-profile-canaries)); it is the only proof of it, as the test
+of this section plants nothing there. The deny is not in the list of known GPU-breaking denies
+(`tests/gpu_profile.rs`); `tests/slot_gpu_clean.rs` runs the Metal probe under the profile. Security
+framework trust evaluation (`trustd`, a certificate chain or a TLS handshake) under the deny is
+**unmeasured**: no test runs an evaluation under the profile.
 
 Known limits:
 
@@ -366,13 +351,10 @@ Known limits:
   paths during a run) is not owned by the uid and was not attributed to GPU use. The clean leaves it.
 - Two defunct processes (zombies whose parent is not the lease) stayed after the kill. They hold
   nothing and the clean's process check passes.
-- Root cannot remove the uid's files in the two `/private/var/protected` places on a Mac Studio (the
-  finding above), so they stay after a clean and accumulate per uid; the profile deny keeps a later
-  lease from reading them. A system daemon can still read them for the same uid. Whether they grow
-  without bound is not measured.
-- The files under `/private/var/db/mds` are planted by the test, so it
-  shows the sweep removes them, not that a system update keeps them in the same places. A check that a
-  real framework lease leaves no uid-owned file there belongs to the baseline assertion.
+- Files that system daemons write for the uid in the protected stores stay after a clean and
+  accumulate per uid (out of scope above). The profile deny keeps a later lease from reading the
+  first two; a system daemon can still read them for the same uid. Whether they grow without bound
+  is not measured.
 - The test of this section runs on the VM. Whether a Mac Studio leaves other state (a different
   GPU driver, a persistent shader cache outside the user's folders) is not known.
 

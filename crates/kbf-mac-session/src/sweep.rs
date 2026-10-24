@@ -41,7 +41,7 @@ const DIRECTORY: OFlags = OFlags::RDONLY
 pub const MAX_DEPTH: usize = 256;
 
 /// Where the sweep looks.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SweepPlan {
     /// Single entries named after the user, removed whole (a directory with all it
     /// holds): `{user}` and `{uid}` stand for the user's name and uid. The parent
@@ -49,10 +49,6 @@ pub struct SweepPlan {
     pub named: Vec<String>,
     /// Directories in which every entry the uid owns is removed, at any depth.
     pub owned: Vec<PathBuf>,
-    /// The bases of `owned` that are data-vault folders: root is refused them on a Mac,
-    /// and only these are skipped when it is ([`SweepPlan::skips`]). A denial at any
-    /// other base is an error.
-    pub protected: Vec<PathBuf>,
 }
 
 impl SweepPlan {
@@ -64,26 +60,19 @@ impl SweepPlan {
         Self {
             named: vec!["/private/var/at/tabs/{user}".to_owned()],
             owned: vec![PathBuf::from("/private/var/at/jobs")],
-            protected: Vec::new(),
         }
     }
 
     /// macOS's other places besides the home folder (which the helper adds from where
     /// it made it): launchd's per-uid overrides and login items, the shared user
     /// folder and the temporary folders (`/private/var/folders` holds each user's
-    /// `DARWIN_USER_TEMP_DIR` and cache folders), and what system daemons keep for a
-    /// uid outside its folders: the security-message folder of the uid under
-    /// `/private/var/db/mds/messages`, and the files the uid owns in the analytics and
-    /// trust stores under `/private/var/protected` (one folder per user, named by its
-    /// generated UID, made when a process of the user imports a framework that uses the
-    /// GPU). They are keyed by uid and outlive the user, so they are found by owner.
+    /// `DARWIN_USER_TEMP_DIR` and cache folders).
     #[must_use]
     pub fn macos() -> Self {
         Self {
             named: [
                 "/private/var/db/com.apple.xpc.launchd/disabled.{uid}.plist",
                 "/private/var/db/com.apple.xpc.launchd/loginitems.{uid}.plist",
-                "/private/var/db/mds/messages/{uid}",
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -93,12 +82,6 @@ impl SweepPlan {
                 PathBuf::from("/private/tmp"),
                 PathBuf::from("/private/var/tmp"),
                 PathBuf::from("/private/var/folders"),
-                PathBuf::from("/private/var/protected/sfanalytics"),
-                PathBuf::from("/private/var/protected/trustd/private"),
-            ],
-            protected: vec![
-                PathBuf::from("/private/var/protected/sfanalytics"),
-                PathBuf::from("/private/var/protected/trustd/private"),
             ],
         }
     }
@@ -127,7 +110,7 @@ pub fn sweep(plan: &SweepPlan, user: &str, uid: u32) -> Swept {
         note(&mut swept, &path, result);
     }
     for base in &plan.owned {
-        let result = sweep_base(plan, base, uid, &mut swept);
+        let result = sweep_base(base, uid, &mut swept);
         note(&mut swept, base, result);
     }
     swept
@@ -277,75 +260,8 @@ fn remove_named(path: &Path, uid: u32, swept: &mut Swept) -> io::Result<()> {
     Ok(())
 }
 
-/// Removes every entry the uid owns below the plan directory `base`, unless it is one of
-/// the plan's `protected` bases and root is denied it ([`SweepPlan::skips`]). Any other
-/// error at the base, and every error below a base that could be listed, leaves the
-/// sweep incomplete.
-fn sweep_base(plan: &SweepPlan, base: &Path, uid: u32, swept: &mut Swept) -> io::Result<()> {
-    match sweep_listed_base(base, uid, swept) {
-        Err(why) if plan.skips(base, &why) => Ok(()),
-        other => other,
-    }
-}
-
-impl SweepPlan {
-    /// Whether `why`, the error of opening, examining or listing the plan base `base`
-    /// itself, means the base is skipped: `base` is one of the plan's `protected` bases and
-    /// the error is `EPERM` or `EACCES`. The first skip of a base in this process is logged.
-    ///
-    /// On a Mac, `/private/var/protected/sfanalytics` and `trustd/private` answer `EPERM`
-    /// to root in the daemon's context (the daemon has no Full Disk Access, and
-    /// `trustd/private` refuses root even with it). The slot's sandbox profile denies leases
-    /// access to them instead (docs/design/macos-end-state.md, "GPU state"), so a lease
-    /// leaves nothing there to sweep. One warning per process and base, not per lease.
-    /// A denial at any other base is an error: it would leave a lease's residue.
-    #[must_use]
-    pub fn skips(&self, base: &Path, why: &io::Error) -> bool {
-        let refused = matches!(
-            why.raw_os_error(),
-            Some(n) if n == libc::EPERM || n == libc::EACCES
-        );
-        let skipped = refused && self.protected.iter().any(|p| p == base);
-        if skipped && first_denial(base) {
-            tracing::warn!(
-                base = %base.display(),
-                "not swept, the slot profile denies leases access to it: {why}"
-            );
-        }
-        skipped
-    }
-
-    /// Whether `base` is skipped now: a protected base that root cannot open, examine or
-    /// list (the three steps [`sweep`] takes at a base, and the same classification of
-    /// them). For a check that looks at the places a sweep would, without sweeping.
-    #[must_use]
-    pub fn denied_base(&self, base: &Path) -> bool {
-        let looked = open_base(base).and_then(|opened| match opened {
-            None => Ok(()),
-            Some(dir) => rustix::fs::fstat(&dir)
-                .map(drop)
-                .map_err(io::Error::from)
-                .and_then(|()| list(&dir).map(drop)),
-        });
-        looked.is_err_and(|why| self.skips(base, &why))
-    }
-}
-
-/// Whether this is the first time this process skips `base`.
-fn first_denial(base: &Path) -> bool {
-    static SKIPPED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
-    let mut skipped = SKIPPED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if skipped.iter().any(|seen| seen == base) {
-        return false;
-    }
-    skipped.push(base.to_path_buf());
-    true
-}
-
-/// [`sweep_base`] without the skip: an `Err` is the base not opening or not listing.
-fn sweep_listed_base(base: &Path, uid: u32, swept: &mut Swept) -> io::Result<()> {
+/// Removes every entry the uid owns below the plan directory `base`.
+fn sweep_base(base: &Path, uid: u32, swept: &mut Swept) -> io::Result<()> {
     let Some(dir) = open_base(base)? else {
         return Ok(());
     };

@@ -134,10 +134,11 @@ pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 
 /// The data-vault folders under `/private/var/protected` where a GPU framework's first
 /// use in a process of a uid leaves files (analytics and trust stores, one folder per
-/// uid). A lease may not read or write them: system daemons write there for the uid on
-/// its behalf, and a later lease of the same uid would read what an earlier one left. The
-/// clean cannot remove them (root is refused there, see `kbf_mac_session::sweep`), so the
-/// slot profile shuts them ([`SLOT_PROFILE`]).
+/// uid). They are OS-owned and out of the clean's scope (it has no Full Disk Access and
+/// neither lists nor removes in them). A lease may not read or write them anyway, which
+/// costs nothing: system daemons write there for the uid on its behalf, and a later
+/// lease of the same uid would read what an earlier one left. The slot profile shuts
+/// them ([`SLOT_PROFILE`]).
 pub const PROTECTED_STORES: [&str; 2] = [
     "/private/var/protected/sfanalytics",
     "/private/var/protected/trustd/private",
@@ -165,7 +166,7 @@ pub const PROTECTED_DENY: &str = protected_deny!();
 /// hermeticity aid.
 ///
 /// Plus the deny of [`PROTECTED_STORES`], read and write, after the write allows: the
-/// clean cannot sweep those folders, so a lease may not touch them (docs/design/macos-end-state.md,
+/// clean does not touch those folders, so a lease may not either (docs/design/macos-end-state.md,
 /// "GPU state"). The canary `read-protected` stands for it.
 ///
 /// Three denies shut what the clean does not reach (each was open without the sandbox,
@@ -834,8 +835,8 @@ mod tests {
         }
     }
 
-    /// Catches a protected-store deny that does not shut what the canary and the sweep
-    /// name (it lists one store, or reads and not writes), or one a later allow undoes (a
+    /// Catches a protected-store deny that does not shut what the canary
+    /// names (it lists one store, or reads and not writes), or one a later allow undoes (a
     /// later rule wins in a sandbox profile, so it must come after the lease's write allow):
     /// the line names both stores of [`PROTECTED_STORES`] and both operations, and follows
     /// the allow of the lease directory, in both profiles.

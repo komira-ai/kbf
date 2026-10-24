@@ -68,9 +68,7 @@ pub enum Step {
     /// kept, and anything else in the entry removed whole.
     Contents,
     /// C8. The uid's files in the shared places (`/private/tmp`, `/private/var/tmp`, the
-    /// `Shared` folder under `/Users`, `/Library/Caches`, the analytics and trust stores
-    /// under `/private/var/protected`), launchd's per-uid files and the uid's folder of
-    /// security messages under `/private/var/db/mds/messages`.
+    /// `Shared` folder under `/Users`, `/Library/Caches`) and launchd's per-uid files.
     Shared,
     /// C9. The crash reports about the uid, in the crash folders and `/cores`.
     Crashes,

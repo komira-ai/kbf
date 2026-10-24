@@ -96,12 +96,10 @@ fn served_from(name: &str, check: Arc<Scripted>, reset: bool) -> Served {
         schedules: SweepPlan {
             named: Vec::new(),
             owned: Vec::new(),
-            protected: Vec::new(),
         },
         sweep: SweepPlan {
             named: Vec::new(),
             owned: Vec::new(),
-            protected: Vec::new(),
         },
         grant_keys: None,
         serial: "S".to_owned(),
@@ -601,12 +599,10 @@ fn serve_returns_when_accept_fails() {
             schedules: SweepPlan {
                 named: Vec::new(),
                 owned: Vec::new(),
-                protected: Vec::new(),
             },
             sweep: SweepPlan {
                 named: Vec::new(),
                 owned: Vec::new(),
-                protected: Vec::new(),
             },
             grant_keys: None,
             serial: "S".to_owned(),
@@ -657,12 +653,10 @@ fn quiet_helper(dir: &Path) -> Helper {
         schedules: SweepPlan {
             named: Vec::new(),
             owned: Vec::new(),
-            protected: Vec::new(),
         },
         sweep: SweepPlan {
             named: Vec::new(),
             owned: Vec::new(),
-            protected: Vec::new(),
         },
         grant_keys: None,
         serial: "S".to_owned(),

@@ -194,7 +194,7 @@ fn a_failed_process_table_read_lists_all_the_own_services() {
 /// Catches a shared sweep without `/Library/Caches` (a raw plant there by the uid survived
 /// the clean), one that still sweeps all of `/private/var/folders` (the other uids'
 /// entries are listed and searched), and one that lost a place or launchd's per-uid
-/// files: the plan names exactly the seven places and the three named entries.
+/// files: the plan names exactly the five places and the two named files.
 #[test]
 fn the_shared_plan_covers_the_shared_places_and_caches_not_the_folders() {
     let plan = shared_plan();
@@ -204,8 +204,6 @@ fn the_shared_plan_covers_the_shared_places_and_caches_not_the_folders() {
             Path::new("/Users").join("Shared"),
             PathBuf::from("/private/tmp"),
             PathBuf::from("/private/var/tmp"),
-            PathBuf::from("/private/var/protected/sfanalytics"),
-            PathBuf::from("/private/var/protected/trustd/private"),
             PathBuf::from("/Library/Caches"),
         ]
     );
@@ -213,8 +211,7 @@ fn the_shared_plan_covers_the_shared_places_and_caches_not_the_folders() {
         plan.named,
         [
             "/private/var/db/com.apple.xpc.launchd/disabled.{uid}.plist",
-            "/private/var/db/com.apple.xpc.launchd/loginitems.{uid}.plist",
-            "/private/var/db/mds/messages/{uid}"
+            "/private/var/db/com.apple.xpc.launchd/loginitems.{uid}.plist"
         ]
     );
 }

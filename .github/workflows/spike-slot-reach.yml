@@ -182,9 +182,8 @@ jobs:
         run: cargo xtask sudo-test -p kbf-driver-native --test slot_canary -- --test-threads=1 --nocapture
 
   # The GPU state of a pool lease (crates/kbf-driver-native/tests/slot_gpu_clean.rs): a Metal run
-  # as a pool user, a second process holding its device, the files a framework import leaves
-  # outside the user's folders, then the clean, and a check that none of it is left. The same
-  # command as the native-macos job of beta.yml runs after a push to main.
+  # as a pool user, a second process holding its device, then the clean, and a check that none of
+  # it is left. The same command as the native-macos job of beta.yml runs after a push to main.
   slot-gpu-clean:
     runs-on: macos-latest
     timeout-minutes: 30
