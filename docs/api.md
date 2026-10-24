@@ -241,7 +241,7 @@ changes nothing.
 |---|---|
 | `half` | how the node stands to the storage members. `member`: its storage half is the member whose address it enrolled with, joined as the controller and safe-to-stop join them. `no_storage`: it enrolled with no storage address. `unknown_node`: the enrollment registry does not know it. `unlinked`: no member, or more than one, has its address |
 | `why` | for `unknown_node` and `unlinked` only: which, in one line |
-| `member` | for `member` only (`null` otherwise): that member's own `id`, `state` (as in `GET /v1/members`) and `build_commit` (`null` if it said none or its row lapsed). No other member is named, and no address |
+| `member` | for `member` only (`null` otherwise): that member's own `id`, `state` (as in `GET /v1/members`) and `build_commit` (`null` if it said none or its row lapsed). No other member is named, and no other node's address |
 | `storage.members_active` | the members whose state is `active`, as in `GET /v1/storage` |
 | `storage.under_replicated_blobs` | blobs held once that should be held twice, as in `GET /v1/storage`; `null` while unknown, never zero |
 

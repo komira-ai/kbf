@@ -10,9 +10,9 @@
 //!   member whose address it enrolled with, joined as the controller and safe-to-stop join
 //!   them), `no_storage` (it enrolled with no storage address), `unknown_node` (the
 //!   enrollment registry does not know it) or `unlinked` (no member, or more than one, has
-//!   its address; `why` says which).
+//!   its address; `why` says which, and may repeat the address the node itself enrolled with).
 //! - `member`: for a `member` node only, that member's own `id`, `state` and `build_commit`.
-//!   No other member is named, and no address.
+//!   No other member is named, and no other node's address.
 //! - `storage`: two numbers about the storage as a whole, `members_active` and
 //!   `under_replicated_blobs` (`null` while unknown, never zero), as `GET /v1/storage`
 //!   counts them.
@@ -324,6 +324,10 @@ mod tests {
                 Some(text) => {
                     let said = own.why.unwrap_or_default();
                     assert!(said.contains(text), "{id}: {said}");
+                    // Only the node's own address may appear, never another node's.
+                    for other in ["192.0.2.1", "192.0.2.2"] {
+                        assert!(!said.contains(other), "{id}: {said}");
+                    }
                 }
             }
         }
