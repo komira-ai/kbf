@@ -12,6 +12,12 @@ pub const REPO: &str = "komira-ai/kbf";
 /// The platform of a Mac's release.
 pub const PLATFORM: &str = "darwin-arm64";
 
+/// The extension of a release tarball.
+pub const TARBALL_EXTENSION: &str = "tar.gz";
+
+/// The release's checksum file, which lists the sha256 of every other file.
+pub const SUMS_NAME: &str = "SHA256SUMS";
+
 /// How many hex digits of the commit a version carries.
 pub const PREFIX_LEN: usize = 12;
 
@@ -43,48 +49,15 @@ pub fn commit_of_name(name: &str) -> Option<&str> {
 
 /// The commit in a tarball's file name `kbf-<40 hex>-<platform>.tar.gz`.
 pub fn commit_of_name_on<'a>(platform: &str, name: &'a str) -> Option<&'a str> {
+    commit_of_asset_on(platform, TARBALL_EXTENSION, name)
+}
+
+/// The commit in a release file's name `kbf-<40 hex>-<platform>.<extension>`.
+pub fn commit_of_asset_on<'a>(platform: &str, extension: &str, name: &'a str) -> Option<&'a str> {
     name.strip_prefix("kbf-")
-        .and_then(|rest| rest.strip_suffix(&format!("-{platform}.tar.gz")))
+        .and_then(|rest| rest.strip_suffix(&format!("-{platform}.{extension}")))
         .filter(|commit| is_commit(commit))
 }
-
-/// A kind of release file a commit has for a platform.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReleaseFile {
-    /// `kbf-<commit>-<platform>.tar.gz`, the binary.
-    Tarball,
-    /// `kbf-frontend-image-<commit>-<platform>.oci.tar`, the frontend as a container image.
-    FrontendImage,
-}
-
-impl ReleaseFile {
-    /// The file name of `commit`'s asset of this kind for `platform`.
-    pub fn name_on(self, platform: &str, commit: &str) -> String {
-        match self {
-            Self::Tarball => tarball_name_on(platform, commit),
-            Self::FrontendImage => format!("kbf-frontend-image-{commit}-{platform}.oci.tar"),
-        }
-    }
-
-    /// The attestation bundle of the asset.
-    pub fn bundle_on(self, platform: &str, commit: &str) -> String {
-        format!("{}.sigstore.json", self.name_on(platform, commit))
-    }
-
-    /// The commit in the file name `name` of this kind for `platform`.
-    pub fn commit_of_name_on<'a>(self, platform: &str, name: &'a str) -> Option<&'a str> {
-        let (head, tail) = match self {
-            Self::Tarball => ("kbf-", ".tar.gz"),
-            Self::FrontendImage => ("kbf-frontend-image-", ".oci.tar"),
-        };
-        name.strip_prefix(head)
-            .and_then(|rest| rest.strip_suffix(&format!("-{platform}{tail}")))
-            .filter(|commit| is_commit(commit))
-    }
-}
-
-/// The name of the release's list of sums.
-pub const SUMS_NAME: &str = "SHA256SUMS";
 
 /// The sha256 that `sums` lists for the file `name`: the lines are `<64 hex>  <name>`.
 ///
@@ -117,7 +90,12 @@ pub fn tarball_name(commit: &str) -> String {
 
 /// The tarball of `commit` for `platform`.
 pub fn tarball_name_on(platform: &str, commit: &str) -> String {
-    format!("kbf-{commit}-{platform}.tar.gz")
+    asset_name_on(platform, TARBALL_EXTENSION, commit)
+}
+
+/// The release file `kbf-<commit>-<platform>.<extension>`.
+pub fn asset_name_on(platform: &str, extension: &str, commit: &str) -> String {
+    format!("kbf-{commit}-{platform}.{extension}")
 }
 
 /// The attestation bundle of `commit`'s tarball.
@@ -127,7 +105,12 @@ pub fn bundle_name(commit: &str) -> String {
 
 /// The attestation bundle of `commit`'s tarball for `platform`.
 pub fn bundle_name_on(platform: &str, commit: &str) -> String {
-    format!("{}.sigstore.json", tarball_name_on(platform, commit))
+    bundle_of(&tarball_name_on(platform, commit))
+}
+
+/// The attestation bundle of the release file `asset`.
+pub fn bundle_of(asset: &str) -> String {
+    format!("{asset}.sigstore.json")
 }
 
 /// The release a version picks out.

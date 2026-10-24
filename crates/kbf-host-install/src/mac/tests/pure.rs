@@ -9,9 +9,10 @@ use std::time::Duration;
 use super::fx::{Fx, NEW, NEW_VERSION, OLD, OLD_VERSION, mkdir, write};
 use crate::mac::channel::{DEFAULT_SOURCE_REF, MacAllowlist, Source, is_branch_ref};
 use crate::mac::conf::{node_id, parse_node_id};
+use crate::mac::fetch::AssetKind;
 use crate::mac::kit::{self, Links};
 use crate::mac::release::{
-    PickError, ReleaseFile, SUMS_NAME, bundle_name, commit_prefix, is_commit, listed_hash, pick,
+    PickError, SUMS_NAME, bundle_name, bundle_of, commit_prefix, is_commit, listed_hash, pick,
     pick_named, tarball_name,
 };
 use crate::mac::status::{self, ApplyState};
@@ -892,8 +893,8 @@ fn the_running_commit_is_the_release_the_daemon_process_executes() {
 #[test]
 fn a_release_file_has_its_own_name_bundle_and_commit() {
     let commit = "0123456789abcdef0123456789abcdef01234567";
-    let tarball = ReleaseFile::Tarball;
-    let image = ReleaseFile::FrontendImage;
+    let tarball = AssetKind::Tarball;
+    let image = AssetKind::FrontendImage;
     assert_eq!(
         tarball.name_on("linux-arm64", commit),
         format!("kbf-{commit}-linux-arm64.tar.gz")
@@ -903,15 +904,19 @@ fn a_release_file_has_its_own_name_bundle_and_commit() {
         format!("kbf-frontend-image-{commit}-linux-arm64.oci.tar")
     );
     assert_eq!(
-        image.bundle_on("linux-x86_64", commit),
+        bundle_of(&image.name_on("linux-x86_64", commit)),
         format!("kbf-frontend-image-{commit}-linux-x86_64.oci.tar.sigstore.json")
     );
     assert_eq!(
-        tarball.bundle_on("linux-x86_64", commit),
-        format!("{}.sigstore.json", tarball.name_on("linux-x86_64", commit))
+        bundle_of(&tarball.name_on("linux-x86_64", commit)),
+        format!("kbf-{commit}-linux-x86_64.tar.gz.sigstore.json")
     );
 
-    for kind in [tarball, image] {
+    assert_eq!(
+        AssetKind::Deb.name_on("linux-arm64", commit),
+        format!("kbf-{commit}-linux-arm64.deb")
+    );
+    for kind in [tarball, image, AssetKind::Deb, AssetKind::Rpm] {
         let name = kind.name_on("linux-arm64", commit);
         assert_eq!(kind.commit_of_name_on("linux-arm64", &name), Some(commit));
         assert_eq!(kind.commit_of_name_on("linux-x86_64", &name), None);

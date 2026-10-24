@@ -27,9 +27,9 @@ use kbf_installer::stage::BUNDLE_CAP;
 use super::answer::Code;
 use super::backend::Fault;
 use super::frontend::{FetchedImage, ImageSource};
-use super::linux::{Linux, Prepared, commit_id, copy_hashing, fetch_fault, read_capped};
-use crate::mac::fetch::{Fetcher, Limits};
-use crate::mac::release::{PickError, ReleaseFile, SUMS_NAME, listed_hash};
+use super::linux::{Linux, Prepared, commit_id, copy_hashing_mode, fetch_fault, read_capped};
+use crate::mac::fetch::{AssetKind, Fetcher, Limits};
+use crate::mac::release::{PickError, SUMS_NAME, bundle_of, listed_hash};
 use crate::request::{Channel, Version};
 use crate::runner::Identity;
 
@@ -86,7 +86,7 @@ impl<E: Exec> Linux<E> {
         let gh = self.layout.join(&self.layout.gh());
         let home = scratch.join("home");
         let fetcher = Fetcher {
-            asset: ReleaseFile::FrontendImage,
+            asset: AssetKind::FrontendImage,
             platform: &platform,
             runner: &*self.runner,
             curl: &self.tools.curl,
@@ -105,8 +105,10 @@ impl<E: Exec> Linux<E> {
             .fetch(&prepared.prefix, scratch)
             .map_err(fetch_fault)?;
         let files = Files {
-            image: scratch.join(ReleaseFile::FrontendImage.name_on(&platform, &commit)),
-            bundle: scratch.join(ReleaseFile::FrontendImage.bundle_on(&platform, &commit)),
+            image: scratch.join(AssetKind::FrontendImage.name_on(&platform, &commit)),
+            bundle: scratch.join(bundle_of(
+                &AssetKind::FrontendImage.name_on(&platform, &commit),
+            )),
             sums: scratch.join(SUMS_NAME),
         };
         Ok((commit, files))
@@ -148,13 +150,13 @@ impl<E: Exec> Linux<E> {
     ) -> Result<FetchedImage, Fault> {
         let id = commit_id(commit)?;
         let platform = Self::platform(prepared);
-        let name = ReleaseFile::FrontendImage.name_on(&platform, commit);
+        let name = AssetKind::FrontendImage.name_on(&platform, commit);
         let dir = self.make_check_dir(commit, prepared.who)?;
         let fetch_failed =
             |what: &str, e: io::Error| Fault::refused(Code::FetchFailed, format!("{what}: {e}"));
         let image = dir.join(&name);
         // Public files, which the unprivileged `gh` reads: 0644 (under the usual umask).
-        let copied = copy_hashing(&files.image, &image, self.tools.image_max, 0o644)
+        let copied = copy_hashing_mode(&files.image, &image, self.tools.image_max, 0o644)
             .map_err(|e| fetch_failed(&name, e))?;
         let bundle = dir.join("bundle.json");
         let text = read_capped(&files.bundle, BUNDLE_CAP).map_err(|e| fetch_failed("bundle", e))?;

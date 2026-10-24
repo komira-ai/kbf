@@ -560,7 +560,7 @@ it on trial, keep it or go back.
 
 ```text
 kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N]
-                 (--restart-unit UNIT... | --frontend-container)
+                 [--layout installer|deb|rpm] (--restart-unit UNIT... | --frontend-container)
 ```
 
 - `--socket`: an absolute path. The program binds it itself (a `umask` of 0177, then a `chown`
@@ -569,12 +569,17 @@ kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N]
 - `--socket-user`: the one account that may connect. On Linux it is looked up in `/etc/passwd`,
   on a Mac with `dscl`; root is refused.
 - `--window-secs`: how long a release on trial has to be confirmed, 120 to 1800 (default 600).
+- `--layout`: how a Linux host keeps its releases. `installer` (the default) is the hand-placed
+  layout of `kbf-installer`, described under "On Linux". `deb` and `rpm` are a host whose units
+  are the `kbf` package's and run `/usr/bin/kbf`, updated by installing that package ("On a Linux
+  daemon host that runs the package"). A Mac takes none.
 - `--restart-unit`: on Linux, a unit that runs the release (`kbf-<name>.service` or
   `kbf-<name>@<instance>.service`), repeated for each; at least one is required, unless the host
   serves a frontend container. A Mac restarts the daemon's launchd job and takes none.
 - `--frontend-container`: a Linux host whose frontend runs as a container, not as units: the
   release is the frontend's image and the switch recreates the container
-  ([A frontend container](#a-frontend-container)). Not given with `--restart-unit`.
+  ([A frontend container](#a-frontend-container)). Not given with `--restart-unit`, nor with
+  `--layout deb` or `rpm`.
 
 Nothing else is configured by a flag or the environment: the files this program reads as root are
 constants, as above. The units and jobs that start it are in
@@ -654,6 +659,36 @@ tarball must hold the one executable of this CPU; and the binary run as the unpr
 say it is that commit. Nothing is fetched when the trust files are not root's. A release whose
 `protocol` or `state_schema` is newer than this program's `kbf-installer` understands is refused
 (the installer's rule, `verify_failed`): put the newer installer on the host first.
+
+### On a Linux daemon host that runs the package
+
+With `--layout deb` (or `rpm`) the host's units are the packaged ones
+([packaging/linux](../../packaging/linux/README.md)), which run `/usr/bin/kbf`. No release is laid
+out beside the running one and no link moves: the update is two installations of a package file,
+with the trial recorded first. The same five requests apply, with the same answers and codes, and
+the same channels file as above. The package and a record of it live in the program's state
+directory (`/var/lib/kbf-host-install`: `package.json` and `packages/`, root's, 0600 and 0700).
+
+| request | does |
+|---|---|
+| `install` | fetches the release's `kbf-<commit>-linux-<cpu>.deb` (or `.rpm`), its `.sigstore.json` bundle and the release's `SHA256SUMS` as the installer's unprivileged user, copies them once as root, and checks the copy, offline, before it keeps anything: the sha256 `SHA256SUMS` lists for the file; `gh attestation verify` (this repository's `artifacts.yml` on a hosted runner, for the full commit, on the channel's branch, with the pinned `gh` and trusted root); and the package manager's own reading of the file (`dpkg-deb --field`, `rpm --query --package`): the package `kbf`, for this CPU, at the version asked for. Nothing is installed, restarted or recorded |
+| `switch` | checks the kept file's sha256 again; reads the installed version from the package database; keeps a verified copy of the package that runs (the one kept already, or the release of that version fetched and checked the same way); writes the trial, with its deadline, naming that copy; then installs the new file (`dpkg --force-confold --install`, or `rpm --upgrade --oldpackage --replacepkgs`: one file, no repository, no dependency resolution) and restarts each `--restart-unit` and waits for it. A package that fails to install, or a unit that does not come up, puts the previous package back at once |
+| `confirm` | ends the trial and forgets every kept file but the new package and the one before it |
+| `revert` | and the deadline: installs the kept copy of the package that ran (fetching and checking it again if the file is gone or changed), ends the trial, restarts the units |
+| `query` | as above; `commit` is the commit of the package this host kept, else the 12 digits of the installed version, else the version text |
+
+A rollback is an installation of an older version and is never refused: `dpkg` downgrades by itself
+and `rpm` is told `--oldpackage`. The deadline is on disk before the package manager is asked for
+anything, so a restart of this program or a reboot finds the trial and goes back once the deadline
+has passed, as for the other layout. A going back that fails (the package manager cannot install the
+kept file) leaves the trial, and the next try finds it. The audit log and the install lock are the
+same as above.
+
+The release publishes a deb for each CPU. It does not publish an rpm yet, so on an rpm host an
+`install` is `unknown_release` until it does; the code path is the same.
+
+A node that was set up by hand moves to this layout once, with
+`kbf-host-install --migrate-to-package` ([native-package-migration.md](native-package-migration.md)).
 
 ### A frontend container
 

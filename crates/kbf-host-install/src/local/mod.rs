@@ -18,7 +18,9 @@
 //! put back by this program ([`core::Ab::tick`]), whether or not the release, the updater
 //! or the host is still up, and the first tick after a start does the same for a deadline
 //! that passed while the host was down. The platform does the rest ([`backend::Backend`]):
-//! [`linux`] on the layout of `kbf-installer`, [`mac_backend`] on the kit tree.
+//! [`linux`] on the layout of `kbf-installer`, [`package`] on the `kbf` package (a Linux
+//! daemon host whose units run `/usr/bin/kbf`; `--layout deb` or `--layout rpm`),
+//! [`mac_backend`] on the kit tree.
 
 pub mod answer;
 pub mod backend;
@@ -36,6 +38,13 @@ pub mod frontend;
 pub mod linux;
 #[cfg(target_os = "linux")]
 mod linux_image;
+// A Linux host that runs the `kbf` package: the update is the package manager's.
+#[cfg(target_os = "linux")]
+pub mod package;
+#[cfg(target_os = "linux")]
+pub mod package_format;
+#[cfg(target_os = "linux")]
+pub mod package_store;
 // Compiled and tested everywhere, used by the program on a Mac only.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub mod mac_backend;
@@ -48,6 +57,8 @@ mod core_tests;
 mod linux_tests;
 #[cfg(test)]
 mod mac_backend_tests;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod package_tests;
 #[cfg(test)]
 mod production_tests;
 #[cfg(test)]

@@ -31,9 +31,9 @@ use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 
 use super::channel::{MacChannel, Source};
-use super::fetch::{FetchError, Fetcher, Limits};
+use super::fetch::{AssetKind, FetchError, Fetcher, Limits};
 use super::layout::{BINARY, DAEMON_USER, MacHost, UNPRIVILEGED_USER};
-use super::release::{self, PickError, ReleaseFile};
+use super::release::{self, PickError};
 use super::tools;
 use crate::config::refusal;
 use crate::host::fail;
@@ -295,8 +295,8 @@ fn fetch_release(
     make_home(&scratch, nobody)?;
     let tuning = &host.tuning;
     let fetcher = Fetcher {
-        asset: ReleaseFile::Tarball,
         platform: release::PLATFORM,
+        asset: AssetKind::Tarball,
         runner,
         curl: &host.curl,
         gh: &host.gh,

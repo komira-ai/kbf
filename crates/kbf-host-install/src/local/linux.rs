@@ -54,8 +54,7 @@ use super::backend::{Backend, Fault, Pending};
 use super::units::restart_and_wait;
 use crate::host::Host;
 use crate::mac::channel::{MacAllowlist, Source};
-use crate::mac::fetch::{FetchError, Fetcher, Limits};
-use crate::mac::release::ReleaseFile;
+use crate::mac::fetch::{AssetKind, FetchError, Fetcher, Limits};
 use crate::mac::stage::read_token;
 use crate::outcome::Refusal;
 use crate::plan::Wait;
@@ -136,11 +135,35 @@ pub(super) fn commit_id(commit: &str) -> Result<CommitId, Fault> {
     CommitId::new(commit).map_err(|e| Fault::failed(Code::StateUnavailable, e.to_string()))
 }
 
-fn state_fault(e: impl std::fmt::Display) -> Fault {
+pub(super) fn state_fault(e: impl std::fmt::Display) -> Fault {
     Fault::failed(Code::StateUnavailable, e.to_string())
 }
 
-/// What a failed fetch is, as the socket tells it.
+/// The scratch directory `<work>/<prefix>.fetch` (and its `home`) that the unprivileged user
+/// `who` fetches into, made new and owned by it; `work` is made, readable by all, if it is not
+/// there.
+pub(super) fn fetch_scratch_in(work: &Path, prefix: &str, who: Identity) -> Result<PathBuf, Fault> {
+    let stage_failed = |e: io::Error| Fault::failed(Code::StageFailed, format!("scratch: {e}"));
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(work)
+        .map_err(stage_failed)?;
+    let scratch = work.join(format!("{prefix}.fetch"));
+    match fs::remove_dir_all(&scratch) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(stage_failed(e)),
+        _ => {}
+    }
+    for (dir, mode) in [(scratch.clone(), 0o700), (scratch.join("home"), 0o700)] {
+        fs::create_dir(&dir)
+            .and_then(|()| fs::set_permissions(&dir, fs::Permissions::from_mode(mode)))
+            .and_then(|()| std::os::unix::fs::chown(&dir, Some(who.uid), Some(who.gid)))
+            .map_err(stage_failed)?;
+    }
+    Ok(scratch)
+}
+
+/// The refusal a fetch that found nothing, or could not fetch, is.
 pub(super) fn fetch_fault(e: FetchError) -> Fault {
     match e {
         FetchError::Unknown => Fault::refused(Code::UnknownRelease, "no release has that commit"),
@@ -200,25 +223,8 @@ impl<E: Exec> Linux<E> {
 
     /// The scratch directory the unprivileged user fetches into, owned by it.
     pub(super) fn fetch_scratch(&self, prefix: &str, who: Identity) -> Result<PathBuf, Fault> {
-        let stage_failed = |e: io::Error| Fault::failed(Code::StageFailed, format!("scratch: {e}"));
         let work = self.layout.join(&self.layout.work_dir());
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o755)
-            .create(&work)
-            .map_err(stage_failed)?;
-        let scratch = work.join(format!("{prefix}.fetch"));
-        match fs::remove_dir_all(&scratch) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(stage_failed(e)),
-            _ => {}
-        }
-        for (dir, mode) in [(scratch.clone(), 0o700), (scratch.join("home"), 0o700)] {
-            fs::create_dir(&dir)
-                .and_then(|()| fs::set_permissions(&dir, fs::Permissions::from_mode(mode)))
-                .and_then(|()| std::os::unix::fs::chown(&dir, Some(who.uid), Some(who.gid)))
-                .map_err(stage_failed)?;
-        }
-        Ok(scratch)
+        fetch_scratch_in(&work, prefix, who)
     }
 
     /// What a fetch needs of the root-owned configuration, read once: the channel's source
@@ -296,8 +302,8 @@ impl<E: Exec> Linux<E> {
         let gh = self.layout.join(&self.layout.gh());
         let home = scratch.join("home");
         let fetcher = Fetcher {
-            asset: ReleaseFile::Tarball,
             platform: &platform,
+            asset: AssetKind::Tarball,
             runner: &*self.runner,
             curl: &self.tools.curl,
             gh: &gh,
@@ -322,7 +328,6 @@ impl<E: Exec> Linux<E> {
             &scratch.join(&tarball_name),
             &target,
             self.tools.tarball_max,
-            0o600,
         )
         .map_err(|e| Fault::refused(Code::FetchFailed, format!("{tarball_name}: {e}")))?;
         let bundle = read_capped(&scratch.join(&bundle_name), BUNDLE_CAP)
@@ -399,16 +404,23 @@ fn open_plain(src: &Path, cap: u64) -> io::Result<File> {
     Ok(file)
 }
 
-/// Copy the untrusted file `src` to the new file `dst` (root's, `mode`) through the open
+/// Copy the untrusted file `src` to the new file `dst` (root's, 0600) through the open
 /// descriptor, hashing what is copied (see [`open_plain`]). A file that grew since it was
 /// looked at is cut at `cap`; the digest then names the cut bytes, which no attestation lists.
-pub(super) fn copy_hashing(src: &Path, dst: &Path, cap: u64, mode: u32) -> io::Result<Copied> {
+pub(super) fn copy_hashing(src: &Path, dst: &Path, cap: u64) -> io::Result<Copied> {
+    copy_hashing_mode(src, dst, cap, 0o600)
+}
+
+/// [`copy_hashing`] into a file of mode `mode`.
+pub(super) fn copy_hashing_mode(src: &Path, dst: &Path, cap: u64, mode: u32) -> io::Result<Copied> {
     let file = open_plain(src, cap)?;
     let mut out = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(mode)
         .open(dst)?;
+    // The mode is exactly `mode`, whatever the umask.
+    out.set_permissions(fs::Permissions::from_mode(mode))?;
     let mut capped = file.take(cap);
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 64 * 1024];

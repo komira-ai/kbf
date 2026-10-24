@@ -418,3 +418,32 @@ impl Runner for Shared {
         self.0.run(cmd)
     }
 }
+
+/// Each layout reaches its own backend before anything is bound or written (an account this
+/// host does not have stops all three at the same place), and a Mac, which keeps its releases
+/// in the kit, refuses a package layout.
+#[test]
+fn each_layout_reaches_its_backend_and_a_mac_takes_only_its_own() {
+    for layout in ["installer", "deb", "rpm"] {
+        let config = ServeConfig::parse(&words(&[
+            "--socket",
+            "/run/kbf/s",
+            "--socket-user",
+            "no-such-account-kbf",
+            "--layout",
+            layout,
+            "--restart-unit",
+            "kbf-daemon.service",
+        ]))
+        .unwrap();
+        if cfg!(target_os = "linux") {
+            assert!(serve_linux(&config).is_err(), "{layout}");
+        }
+        let mac = serve_mac(&config).unwrap_err();
+        if layout == "installer" {
+            assert!(mac.contains("a Mac restarts the daemon's job"), "{mac}");
+        } else {
+            assert!(mac.contains("--layout is for a Linux host"), "{mac}");
+        }
+    }
+}

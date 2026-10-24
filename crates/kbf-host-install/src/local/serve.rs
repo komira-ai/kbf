@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N]
-//!                   (--restart-unit UNIT... | --frontend-container)
+//!                   [--layout installer|deb|rpm] (--restart-unit UNIT... | --frontend-container)
 //! ```
 //!
 //! The program binds the socket itself (a umask of 0177, then a chown to the account), in a
@@ -21,6 +21,11 @@
 //! root are constants, as they are for the ssh path; no flag moves them. `--frontend-container`
 //! serves a frontend that runs as a container instead of units ([`super::frontend`]); it takes
 //! no `--restart-unit`.
+//!
+//! `--layout` says how a Linux host keeps its releases: `installer` (the default) is the
+//! hand-placed layout of `kbf-installer` (`releases/<commit>` with the links `current` and
+//! `previous`); `deb` and `rpm` are a host whose units run the `kbf` package's `/usr/bin/kbf`,
+//! updated by installing that package ([`super::package`]). A Mac takes none.
 //!
 //! Every request but `query` and `revert` is audited, and is not run when the audit log
 //! cannot be opened. A revert is never held back by it.
@@ -53,7 +58,31 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const REVERT_RETRY: Duration = Duration::from_secs(30);
 
 pub const USAGE: &str = "usage: kbf-host-install --serve --socket PATH --socket-user NAME \
-[--window-secs N] (--restart-unit UNIT... | --frontend-container)\n";
+[--window-secs N] [--layout installer|deb|rpm] \
+(--restart-unit UNIT... | --frontend-container)\n";
+
+/// How a host keeps the releases it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layout {
+    /// The hand-placed layout of `kbf-installer` (a Mac's kit tree is its counterpart).
+    #[default]
+    Installer,
+    /// The `kbf` package, as a `.deb`.
+    Deb,
+    /// The `kbf` package, as an `.rpm`.
+    Rpm,
+}
+
+impl Layout {
+    fn named(name: &str) -> Option<Self> {
+        match name {
+            "installer" => Some(Self::Installer),
+            "deb" => Some(Self::Deb),
+            "rpm" => Some(Self::Rpm),
+            _ => None,
+        }
+    }
+}
 
 /// The settings of a served socket, from the flags.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +90,7 @@ pub struct ServeConfig {
     pub socket: PathBuf,
     pub user: String,
     pub window_secs: u64,
+    pub layout: Layout,
     pub units: Vec<Unit>,
     /// The host runs the frontend as a container, not as units.
     pub frontend_container: bool,
@@ -76,6 +106,7 @@ impl ServeConfig {
         let mut socket = None;
         let mut user = None;
         let mut window = None;
+        let mut layout = None;
         let mut units = Vec::new();
         let mut frontend_container = false;
         let mut rest = args.iter();
@@ -108,6 +139,7 @@ impl ServeConfig {
                 "--socket" => once(&mut socket)?,
                 "--socket-user" => once(&mut user)?,
                 "--window-secs" => once(&mut window)?,
+                "--layout" => once(&mut layout)?,
                 "--restart-unit" => {
                     units.push(Unit::service(&value).map_err(|BadCommand| {
                         format!("--restart-unit {value:?} is not a kbf unit")
@@ -134,10 +166,20 @@ impl ServeConfig {
                 "--frontend-container and --restart-unit are not given together".to_owned(),
             );
         }
+        let layout = match layout {
+            Some(name) => Layout::named(&name).ok_or("--layout must be installer, deb or rpm")?,
+            None => Layout::default(),
+        };
+        if frontend_container && layout != Layout::Installer {
+            return Err(
+                "--frontend-container and --layout deb or rpm are not given together".to_owned(),
+            );
+        }
         Ok(Self {
             socket,
             user,
             window_secs,
+            layout,
             units,
             frontend_container,
         })

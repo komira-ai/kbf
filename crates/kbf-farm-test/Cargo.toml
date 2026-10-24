@@ -1,5 +1,5 @@
 [package]
-name = "kbf-all-in-one-test"
+name = "kbf-farm-test"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# T009's black-box suite of the all-in-one farm, tests only: see README.md. No library target
+# T009's black-box suite of the farm (a frontend, storage-and-daemon nodes, a plain daemon), tests only: see README.md. No library target
 # and no binary of its own; the farm's processes are found beside the test binary (`kbf_harness::stand_in`).
 # Everything is a dev-dependency, so nothing here is linked into a shipped binary.
 
