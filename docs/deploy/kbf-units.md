@@ -238,11 +238,13 @@ A frontend runs as `kbf-frontend.service`, one process; an update of it is a res
 stop drains (below). Frontends that share one Postgres state store serve at once and none
 fences another, so a farm that must not fail a build keeps more than one and puts
 `kbf-proxy` in front of them (`docs/design/frontend-proxy.md`). `kbf-updater` then rolls
-them one at a time: it drains a frontend at the proxy, waits until its streams are 0,
-retires it (`POST /v1/frontend/retire`, [api.md](../api.md#get-v1frontendretire-and-post-v1frontendretire)),
-installs the package, restarts the unit, waits until the proxy lists it ready on the new
-commit, and undrains it ([kbf-updater.md](kbf-updater.md)). The proxy starts, adopts and
-swaps no frontend, and `kbf-server` has no control socket.
+them one at a time through each member's operator API at `127.0.0.1:<base + 2>`, never the last
+one serving: it waits until the other members answer `/readyz`, drains the member
+(`POST /v1/frontend/drain`, [api.md](../api.md#get-v1frontenddrain-and-post-v1frontenddrain))
+and waits for its exit, installs the package once per host, restarts the unit
+(`restart frontend=<name>`), and waits until the member is ready on the target commit
+([kbf-updater.md](kbf-updater.md)). The proxy starts, adopts and swaps no frontend, is not asked
+to drain one, and `kbf-server` has no control socket.
 
 Removed: the socket-handover template (two instances, `kbf-frontend@a` and `kbf-frontend@b`),
 the `kbf frontend handover` command that started the idle one, the proxy's two-slot
