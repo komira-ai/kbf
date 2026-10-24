@@ -40,7 +40,7 @@
 //! - **Orphans.** A lease whose node has no session anywhere is requeued after
 //!   [`ORPHAN_WAIT`] (the `sweep` module).
 //!
-//! A frontend that is fenced for a handover, or whose store cannot be read, does nothing.
+//! A frontend that is fenced by a retire, or whose store cannot be read, does nothing.
 
 use std::collections::BTreeSet;
 
@@ -214,7 +214,7 @@ impl Farm {
     /// state store queued, forgets what they took, answers the callers of what they
     /// finished, applies the cordons and floors they set, and requeues the leases of nodes
     /// no frontend hears. Cheap when nothing changed. A farm with no state store, and one a
-    /// handover fenced, do nothing; so does one whose store cannot be read.
+    /// retire fenced, do nothing; so does one whose store cannot be read.
     ///
     /// Placement follows at the next tick.
     pub fn intake(&self) {

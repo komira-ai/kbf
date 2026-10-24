@@ -108,16 +108,10 @@ jobs:
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
-          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
-          # file, so a restored target/ must hold none of the files a run writes there.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-            !target/pkg
-            !target/pkg/**
-            !target/pkg-trust
-            !target/pkg-trust/**
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
           # On a push (to main: the build the attest job signs)
@@ -190,8 +184,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: $RUNNER_TEMP/tools/gh attestation trusted-root > "$RUNNER_TEMP/trusted_root.jsonl"
-      # A cache saved before #1616 may still hold these; a restored target/ must not.
-      - name: Clear what an old cache restored where the package is written
+      # A restored cache holds target/ as a whole (a path list cannot leave out a directory
+      # inside one it names), so it may hold a previous run's package files; pkg-trust and
+      # pkg-config refuse to overwrite a file.
+      - name: Remove the package files a restored target/ may hold
         run: rm -rf target/pkg target/pkg-trust
       - name: Write the package's trust directory
         run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
@@ -210,16 +206,10 @@ jobs:
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
-          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
-          # file, so a restored target/ must hold none of the files a run writes there.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-            !target/pkg
-            !target/pkg/**
-            !target/pkg-trust
-            !target/pkg-trust/**
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # glibc: the binaries need the glibc of the runner image they were built on (Ubuntu
@@ -246,16 +236,10 @@ jobs:
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
-          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
-          # file, so a restored target/ must hold none of the files a run writes there.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-            !target/pkg
-            !target/pkg/**
-            !target/pkg-trust
-            !target/pkg-trust/**
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
           # On a push (to main: the build the attest job signs)
@@ -323,8 +307,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: $RUNNER_TEMP/tools/gh attestation trusted-root > "$RUNNER_TEMP/trusted_root.jsonl"
-      # A cache saved before #1616 may still hold these; a restored target/ must not.
-      - name: Clear what an old cache restored where the package is written
+      # A restored cache holds target/ as a whole (a path list cannot leave out a directory
+      # inside one it names), so it may hold a previous run's package files; pkg-trust and
+      # pkg-config refuse to overwrite a file.
+      - name: Remove the package files a restored target/ may hold
         run: rm -rf target/pkg target/pkg-trust
       - name: Write the package's trust directory
         run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
@@ -368,16 +354,10 @@ jobs:
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
-          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
-          # file, so a restored target/ must hold none of the files a run writes there.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-            !target/pkg
-            !target/pkg/**
-            !target/pkg-trust
-            !target/pkg-trust/**
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   linux-arm64:
@@ -402,16 +382,10 @@ jobs:
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
-          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
-          # file, so a restored target/ must hold none of the files a run writes there.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-            !target/pkg
-            !target/pkg/**
-            !target/pkg-trust
-            !target/pkg-trust/**
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
           # On a push (to main: the build the attest job signs)
@@ -476,8 +450,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: $RUNNER_TEMP/tools/gh attestation trusted-root > "$RUNNER_TEMP/trusted_root.jsonl"
-      # A cache saved before #1616 may still hold these; a restored target/ must not.
-      - name: Clear what an old cache restored where the package is written
+      # A restored cache holds target/ as a whole (a path list cannot leave out a directory
+      # inside one it names), so it may hold a previous run's package files; pkg-trust and
+      # pkg-config refuse to overwrite a file.
+      - name: Remove the package files a restored target/ may hold
         run: rm -rf target/pkg target/pkg-trust
       - name: Write the package's trust directory
         run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
@@ -521,16 +497,10 @@ jobs:
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
-          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
-          # file, so a restored target/ must hold none of the files a run writes there.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-            !target/pkg
-            !target/pkg/**
-            !target/pkg-trust
-            !target/pkg-trust/**
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # Attestation is per platform group, so the Linux files are attested and verifiable as

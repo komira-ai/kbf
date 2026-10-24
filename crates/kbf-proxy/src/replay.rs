@@ -1,5 +1,4 @@
-//! The replay buffer and the retry rule (design section 3, "Properties kept from the Envoy
-//! spec").
+//! The replay buffer and the retry rule (`kbf-proxy-api.md` section 10).
 //!
 //! A stream's request (headers plus data) is kept in a [`ReplayBuffer`] of [`REPLAY_BYTES`]
 //! from its first byte. The buffer keeps filling as the client sends, until a data frame would

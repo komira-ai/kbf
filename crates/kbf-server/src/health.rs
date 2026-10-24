@@ -11,10 +11,11 @@
 //!     timeout. The probe only reads (`get_range` of one byte), so a poll never writes
 //!     to the bucket; an absent key is an answer, and so passes.
 //!
-//! Once the server has handed over ([`Readiness::set_handed_over`]) the probes are not
-//! asked and the check passes on `stopping` and `leader` alone: its stores are frozen or
-//! answered through a successor, so a probe could fail or wait out its timeout while the
-//! server is still the one to answer open calls (`docs/design/aio-handover.md`).
+//! Once the server has given its roles away ([`Readiness::set_handed_over`], which a retire
+//! does: `POST /v1/frontend/retire`, `docs/api.md`) the probes are not asked and the check
+//! passes on `stopping` and `leader` alone: its farm is fenced and the others hold the store's
+//! work, so a probe could fail or wait out its timeout while the server is still the one to
+//! answer the calls it kept open.
 //!
 //! The routes are served by the same future as the REAPI and worker listeners, which
 //! are bound before it runs and stop when it returns, so an answer from either route

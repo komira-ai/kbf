@@ -1,5 +1,5 @@
 //! The h2 builders of both sides, and the flood limits, in one place (design note sections
-//! 10 and 18).
+//! 4 and 10).
 //!
 //! The flow-control numbers are the same everywhere: one [`STREAM_WINDOW_BYTES`] window for
 //! every stream, and a connection window of a thousand of them, so one connection's streams
