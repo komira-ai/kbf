@@ -23,17 +23,17 @@
 //!
 //! # Frontend pool members
 //!
-//! A frontend that runs as a member of the kbf-proxy pool is one `frontend` line with two more
-//! words after the key (and after the node id, if the line has one), in any order:
+//! A frontend that runs as a member of a pool of frontends behind a load balancer is one
+//! `frontend` line with two more words after the key (and after the node id, if the line has one), in any order:
 //!
 //! ```text
 //! fe-a      fe.farm.example       frontend  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample  instance=a base=18000
 //! fe-b      fe.farm.example       frontend  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample  instance=b base=18010
 //! ```
 //!
-//! `instance=<name>` is the name the proxy knows the member by and the unit instance the
+//! `instance=<name>` is the name of the member and the unit instance the
 //! host restarts (`kbf-frontend@<name>.service`; `-` is the plain unit), and `base=<port>` is
-//! the first of the member's five ports, as in the proxy's `[[proxy.frontend]]` table: the
+//! the first of the member's five ports: the
 //! member's operator API is at `base + 2` on loopback. Every member of the file is on the host
 //! the updater runs on, so every member lists the same address and host key, and no two share a
 //! name or have overlapping ports (bases at least five apart). A `frontend` line with neither
@@ -54,14 +54,14 @@ use crate::api::{ApiError, ErrorCode, Hosts};
 use crate::ssh_installer::frontend_name_ok;
 
 /// The ports a pool member uses from its base port up: REAPI, worker, operator, admin calls
-/// and enrollment (kbf-proxy's `FRONTEND_SPAN`). The bases of two members are at least this
+/// and enrollment (a frontend's `FRONTEND_SPAN`). The bases of two members are at least this
 /// far apart.
 pub const MEMBER_PORTS: u16 = 5;
 
 /// The offset of a member's operator listener from its base port.
 pub const OPERATOR_OFFSET: u16 = 2;
 
-/// The lowest base port a member may have (kbf-proxy's rule).
+/// The lowest base port a member may have.
 const MIN_BASE: u16 = 1024;
 
 /// The highest base port a member may have: its last port must still be a port.
@@ -71,8 +71,8 @@ const MAX_BASE: u16 = u16::MAX - (MEMBER_PORTS - 1);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     /// A frontend: rolled before the other hosts, no safe-to-stop. One that is a pool
-    /// [`Member`] is taken out of the pool, retired, updated, restarted and put back; one that
-    /// is not is refused by the real health check.
+    /// [`Member`] drains itself, is updated and restarted; one that is not is refused by the
+    /// real health check.
     Frontend,
     /// A storage node, possibly with a daemon.
     Storage,
@@ -117,10 +117,10 @@ pub struct Host {
     pub member: Option<Member>,
 }
 
-/// A frontend that is a member of the kbf-proxy pool, as its inventory line lists it.
+/// A frontend that is a member of a pool, as its inventory line lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Member {
-    /// The name the proxy knows it by, and the unit instance the host restarts for it.
+    /// The name of the member, and the unit instance the host restarts for it.
     pub instance: String,
     /// The first of its [`MEMBER_PORTS`] ports.
     pub base_port: u16,
@@ -247,7 +247,7 @@ impl Inventory {
     }
 
     /// Whether some host is a pool member: the roll then takes it out of service before it is
-    /// installed on, at the proxy when there is one, and itself otherwise.
+    /// installed on, by draining itself.
     pub fn has_members(&self) -> bool {
         self.hosts.iter().any(|h| h.member.is_some())
     }

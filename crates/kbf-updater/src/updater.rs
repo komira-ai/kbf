@@ -7,19 +7,14 @@
 //! finds the host where its work began and never earlier.
 //! The first failure stops the roll and no later host is asked about, let alone touched.
 //!
-//! A frontend that is a member of the kbf-proxy pool (an inventory line with `instance=` and
-//! `base=`) takes a turn of its own, in `updater_frontend.rs`: drained at the proxy, its
-//! streams waited for, retired, installed on, restarted, waited for until the proxy lists it
-//! ready on the target's commit, and put back. Its phases are `draining`, `retiring`,
-//! `installing`, `restarting`, `waiting_healthy` and `undraining`. Every failure on the way
-//! leaves the member drained. The roll never takes the last member that is up and ready out.
-//!
-//! Without a proxy (`--proxy-admin` not given, [`Pool::configured`] false) a member takes the
-//! turn of `updater_no_proxy.rs` instead: every other member must have answered `/readyz` 200
-//! for a while, the member drains itself and exits, the host is installed on and the member's
-//! unit restarted, and the roll waits for it to be ready on the target's commit. Its phases are
-//! `draining`, `installing`, `restarting` and `waiting_healthy`; nothing is put back, because a
-//! drained frontend is a new process after the restart.
+//! A frontend that is a member of a pool of frontends (an inventory line with `instance=` and
+//! `base=`) takes a turn of its own, in `updater_no_proxy.rs`, whatever load balancer is in
+//! front of the pool: every other member must have answered `/readyz` 200 for a while, the
+//! member drains itself and exits, the host is installed on and the member's unit restarted,
+//! and the roll waits for it to be ready on the target's commit. Its phases are `draining`,
+//! `installing`, `restarting` and `waiting_healthy`; nothing is put back, because a drained
+//! frontend is a new process after the restart. The roll never takes a member out unless every
+//! other one is ready.
 //!
 //! A `mac-daemon` host takes the daemon's turn with one difference. Its `install` only starts
 //! the apply on the Mac and answers `apply_started`; the roll marks the host `waiting_healthy`
@@ -58,7 +53,7 @@ use crate::api::{
 use crate::inventory::{Host, Inventory, Role};
 use crate::ports::{
     Apply, Clock, Drain, FrontendControl, Health, HealthCheck, InstallAnswer, Installed, Installer,
-    Pool, PortError, SafeToStop, Stop,
+    PortError, SafeToStop, Stop,
 };
 use crate::record::{FORMAT, Record, RollStore, StoreError, roll_id};
 use crate::timing::Timing;
@@ -69,20 +64,13 @@ mod frontend;
 #[path = "updater_no_proxy.rs"]
 mod no_proxy;
 
-/// How long the roll waits for the streams of a frontend member to end, both the streams the
-/// proxy still holds open on it after it is drained, and those the member itself reports once
-/// it has retired. When it is out the roll fails with the member left drained.
-pub const STREAMS_BOUND: Duration = Duration::from_secs(900);
-
-/// The seven ports of a roll.
+/// The six ports of a roll.
 pub struct Ports {
     pub safe: Box<dyn SafeToStop>,
     pub installer: Box<dyn Installer>,
     pub drain: Box<dyn Drain>,
     pub health: Box<dyn HealthCheck>,
     pub clock: Box<dyn Clock>,
-    /// The proxy's pool, for the frontends that are members of it.
-    pub pool: Box<dyn Pool>,
     /// A frontend member's own API.
     pub frontend: Box<dyn FrontendControl>,
 }
@@ -535,11 +523,7 @@ impl Updater {
             }
         }
         if let (Role::Frontend, Some(member)) = (host.role, &host.member) {
-            if self.ports.pool.configured() {
-                self.frontend_turn(idx, host, &member.instance, target, phase)?;
-            } else {
-                self.no_proxy_turn(idx, host, &member.instance, target, phase)?;
-            }
+            self.no_proxy_turn(idx, host, &member.instance, target, phase)?;
             self.mark(idx, Phase::Done, false)?;
             return Ok(());
         }

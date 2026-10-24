@@ -1,6 +1,5 @@
 //! The turn of a frontend that is a member of a pool (an inventory line with `instance=` and
-//! `base=`) when the updater has no proxy to drain it at: it was started without
-//! `--proxy-admin`. A child of the roll state machine in `updater.rs`. The frontends sit behind
+//! `base=`). A child of the roll state machine in `updater.rs`. The frontends sit behind
 //! some load balancer that the updater knows nothing about, which stops sending to a member
 //! whose `/readyz` answers 503, and a member drains itself (`POST /v1/frontend/drain`) in a way
 //! that does not depend on which balancer it is: `/readyz` 503, no new work, a wait for the
@@ -31,7 +30,7 @@
 //! A member whose turn was found half done after a restart of the updater is told to drain again
 //! only in `draining` (a drain does nothing to a member that is draining, and a member that has
 //! exited refuses the connection, which is taken for a member with nothing left to drain); in
-//! `installing` the host is asked what it has, as with a proxy, and `restarting` and
+//! `installing` the host is asked what it has, and `restarting` and
 //! `waiting_healthy` go on without a drain, which would take down the new process. The record
 //! says `draining` before the drain is sent, so a member found in `draining` that answers that it
 //! is not draining is checked against the other members first, as in `pending`.
@@ -60,14 +59,14 @@ impl Updater {
         target: &Version,
         found: Phase,
     ) -> Result<(), Halt> {
-        // The phases of a turn at a proxy that this one has no place for: the roll was begun with
-        // a proxy and the updater was started without one. It is not guessed at.
+        // The phases of a turn at a proxy that this one has no place for: an earlier build began
+        // the roll with a proxy. It is not guessed at.
         if matches!(found, Phase::Retiring | Phase::Undraining) {
             return Err(Halt::Fail(
                 ErrorCode::SwapAbandoned,
                 format!(
-                    "{} was left by a turn at a proxy ({found:?}) and the updater has no \
-                     --proxy-admin; abort the roll",
+                    "{} was left by a turn at a proxy ({found:?}), which this build does not \
+                     take; abort the roll",
                     host.alias
                 ),
             ));

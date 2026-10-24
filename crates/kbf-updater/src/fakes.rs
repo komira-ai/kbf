@@ -12,8 +12,7 @@ use std::time::Duration;
 use crate::inventory::{Host, Role};
 use crate::ports::{
     Apply, Clock, Drain, DrainStatus, FrontendControl, Health, HealthCheck, InstallAnswer,
-    Installed, Installer, Pool, PoolMember, PortError, Report, RetireStatus, SafeToStop, Stop,
-    Verdict,
+    Installed, Installer, PortError, Report, SafeToStop, Stop, Verdict,
 };
 use crate::version::Version;
 
@@ -33,16 +32,6 @@ pub enum Event {
     /// The node's leases were read.
     Leases(String),
     Undrain(String),
-    /// The proxy's pool was listed.
-    PoolView,
-    /// The proxy was asked to drain the member of this name.
-    PoolDrain(String),
-    /// The proxy was asked to put the member of this name back.
-    PoolUndrain(String),
-    /// The host's frontend member was asked to retire.
-    Retire(String),
-    /// The host's frontend member was asked how its retire stands.
-    RetireStatus(String),
     /// The host's frontend member was asked what commit it was built from.
     Commit(String),
     /// The host was asked to restart the frontend unit of this name.
@@ -57,7 +46,7 @@ pub enum Event {
 
 impl Event {
     /// The call as a short word: its kind, then the detail a test tells calls apart by (the
-    /// version of an install, the deadline of a drain, the name of a pool member or a unit).
+    /// version of an install, the deadline of a drain, the name of a unit).
     pub fn word(&self) -> String {
         match self {
             Event::Check(_) => "check".to_owned(),
@@ -67,11 +56,6 @@ impl Event {
             Event::Drain(_, secs) => format!("drain {secs}"),
             Event::Leases(_) => "leases".to_owned(),
             Event::Undrain(_) => "undrain".to_owned(),
-            Event::PoolView => "pool view".to_owned(),
-            Event::PoolDrain(name) => format!("pool drain {name}"),
-            Event::PoolUndrain(name) => format!("pool undrain {name}"),
-            Event::Retire(_) => "retire".to_owned(),
-            Event::RetireStatus(_) => "retire status".to_owned(),
             Event::Commit(_) => "commit".to_owned(),
             Event::Restart(_, unit) => format!("restart {unit}"),
             Event::MemberDrain(_) => "member drain".to_owned(),
@@ -117,16 +101,11 @@ impl Log {
                 | Event::Drain(a, _)
                 | Event::Leases(a)
                 | Event::Undrain(a)
-                | Event::PoolDrain(a)
-                | Event::PoolUndrain(a)
-                | Event::Retire(a)
-                | Event::RetireStatus(a)
                 | Event::Commit(a)
                 | Event::MemberDrain(a)
                 | Event::MemberDrainStatus(a)
                 | Event::Ready(a)
                 | Event::Restart(a, _) => a == alias,
-                Event::PoolView => false,
             })
             .collect()
     }
@@ -494,166 +473,6 @@ impl Drain for FakeDrain {
     }
 }
 
-/// A member of the fake pool as a test says it is, with `streams` open on its REAPI listener.
-pub fn pool_member(name: &str, draining: bool, ready: bool, streams: u64) -> PoolMember {
-    PoolMember {
-        name: name.to_owned(),
-        draining,
-        ready,
-        reapi_streams: streams,
-        operator_streams: 0,
-    }
-}
-
-/// The answers to scripted calls of `view`, in order.
-type Views = VecDeque<Result<Vec<PoolMember>, PortError>>;
-
-/// A fake of the proxy's pool: a table of members that a drain and an undrain move, which every
-/// call is logged against. Unscripted calls succeed.
-#[derive(Clone)]
-pub struct FakePool {
-    log: Log,
-    members: Arc<Mutex<Vec<PoolMember>>>,
-    /// Answers of `view` to give first, in place of the table.
-    views: Arc<Mutex<Views>>,
-    /// Per member: the (REAPI, operator) streams it reports on each `view` while it is draining.
-    streams: Arc<Script<(u64, u64)>>,
-    drains: Arc<Script<Result<(), PortError>>>,
-    undrains: Arc<Script<Result<(), PortError>>>,
-    /// Whether there is a proxy at all; true until a test says otherwise.
-    configured: Arc<Mutex<bool>>,
-}
-
-impl FakePool {
-    /// An empty pool.
-    pub fn new(log: &Log) -> FakePool {
-        FakePool {
-            log: log.clone(),
-            members: Arc::default(),
-            views: Arc::default(),
-            streams: Arc::new(Script::new((0, 0))),
-            drains: Arc::new(Script::new(Ok(()))),
-            undrains: Arc::new(Script::new(Ok(()))),
-            configured: Arc::new(Mutex::new(true)),
-        }
-    }
-
-    /// Say whether there is a proxy: a pool that is not configured is the updater started
-    /// without `--proxy-admin`, and no call to it is expected.
-    pub fn set_configured(&self, configured: bool) {
-        *lock(&self.configured) = configured;
-    }
-
-    /// The pool is these members, all up and ready with no stream open.
-    pub fn set_members(&self, names: &[&str]) {
-        let member = |name: &&str| pool_member(name, false, true, 0);
-        *lock(&self.members) = names.iter().map(member).collect();
-    }
-
-    /// The table as it is now, member by member.
-    pub fn table(&self) -> Vec<PoolMember> {
-        lock(&self.members).clone()
-    }
-
-    /// Say whether the proxy's probe of `name` passes.
-    pub fn set_ready(&self, name: &str, ready: bool) {
-        for member in lock(&self.members).iter_mut() {
-            if member.name == name {
-                member.ready = ready;
-            }
-        }
-    }
-
-    /// Say that `name` is draining, as an operator's drain would have left it.
-    pub fn set_draining(&self, name: &str, draining: bool) {
-        for member in lock(&self.members).iter_mut() {
-            if member.name == name {
-                member.draining = draining;
-            }
-        }
-    }
-
-    /// Answers of `view` to give first, one per call, in place of the table.
-    pub fn script_views(&self, views: Vec<Result<Vec<PoolMember>, PortError>>) {
-        lock(&self.views).extend(views);
-    }
-
-    /// The (REAPI, operator) streams `name` reports on each `view` while it is draining:
-    /// `first` in order, then `then`. A member that is up reports none.
-    pub fn script_streams(&self, name: &str, first: Vec<(u64, u64)>, then: (u64, u64)) {
-        self.streams.set(name, first, then);
-    }
-
-    pub fn script_drain(
-        &self,
-        name: &str,
-        first: Vec<Result<(), PortError>>,
-        then: Result<(), PortError>,
-    ) {
-        self.drains.set(name, first, then);
-    }
-
-    pub fn script_undrain(
-        &self,
-        name: &str,
-        first: Vec<Result<(), PortError>>,
-        then: Result<(), PortError>,
-    ) {
-        self.undrains.set(name, first, then);
-    }
-
-    /// Move the member `name` into or out of the pool, as the proxy does; no such member is an
-    /// error, as the proxy's 404.
-    fn move_member(&self, name: &str, draining: bool) -> Result<(), PortError> {
-        match lock(&self.members).iter_mut().find(|m| m.name == name) {
-            Some(member) => {
-                member.draining = draining;
-                Ok(())
-            }
-            None => Err(PortError::other(format!("no member {name}"))),
-        }
-    }
-}
-
-impl Pool for FakePool {
-    fn configured(&self) -> bool {
-        *lock(&self.configured)
-    }
-
-    fn view(&self) -> Result<Vec<PoolMember>, PortError> {
-        self.log.push(Event::PoolView);
-        if let Some(scripted) = lock(&self.views).pop_front() {
-            return scripted;
-        }
-        let mut table = self.table();
-        for member in table.iter_mut().filter(|m| m.draining) {
-            (member.reapi_streams, member.operator_streams) = self.streams.next(&member.name);
-        }
-        Ok(table)
-    }
-
-    fn drain(&self, name: &str) -> Result<(), PortError> {
-        self.log.push(Event::PoolDrain(name.to_owned()));
-        self.drains.next(name)?;
-        self.move_member(name, true)
-    }
-
-    fn undrain(&self, name: &str) -> Result<(), PortError> {
-        self.log.push(Event::PoolUndrain(name.to_owned()));
-        self.undrains.next(name)?;
-        self.move_member(name, false)
-    }
-}
-
-/// A finished retire with nothing left open.
-pub fn retired() -> RetireStatus {
-    RetireStatus {
-        retired: true,
-        open_streams: 0,
-        open_sessions: 0,
-    }
-}
-
 /// The commit an unscripted member reports (40 digits, of which a version names 12).
 pub const MEMBER_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -672,13 +491,11 @@ pub fn gone() -> PortError {
 }
 
 /// A fake of a frontend member's own API; every call is in the [`Log`] by the host's alias.
-/// Unscripted, a member retires at once, reports [`MEMBER_COMMIT`], is ready, accepts a drain
+/// Unscripted, a member reports [`MEMBER_COMMIT`], is ready, accepts a drain
 /// and has exited ([`gone`]) when its drain is read.
 #[derive(Clone)]
 pub struct FakeFrontend {
     log: Log,
-    retires: Arc<Script<Result<RetireStatus, PortError>>>,
-    statuses: Arc<Script<Result<RetireStatus, PortError>>>,
     commits: Arc<Script<Result<String, PortError>>>,
     drains: Arc<Script<Result<(), PortError>>>,
     drain_statuses: Arc<Script<Result<DrainStatus, PortError>>>,
@@ -689,8 +506,6 @@ impl FakeFrontend {
     pub fn new(log: &Log) -> FakeFrontend {
         FakeFrontend {
             log: log.clone(),
-            retires: Arc::new(Script::new(Ok(retired()))),
-            statuses: Arc::new(Script::new(Ok(retired()))),
             commits: Arc::new(Script::new(Ok(MEMBER_COMMIT.to_owned()))),
             drains: Arc::new(Script::new(Ok(()))),
             drain_statuses: Arc::new(Script::new(Err(gone()))),
@@ -728,24 +543,6 @@ impl FakeFrontend {
         self.readies.set(alias, first, then);
     }
 
-    pub fn script_retire(
-        &self,
-        alias: &str,
-        first: Vec<Result<RetireStatus, PortError>>,
-        then: Result<RetireStatus, PortError>,
-    ) {
-        self.retires.set(alias, first, then);
-    }
-
-    pub fn script_status(
-        &self,
-        alias: &str,
-        first: Vec<Result<RetireStatus, PortError>>,
-        then: Result<RetireStatus, PortError>,
-    ) {
-        self.statuses.set(alias, first, then);
-    }
-
     pub fn script_commit(
         &self,
         alias: &str,
@@ -757,16 +554,6 @@ impl FakeFrontend {
 }
 
 impl FrontendControl for FakeFrontend {
-    fn retire(&self, host: &Host) -> Result<RetireStatus, PortError> {
-        self.log.push(Event::Retire(host.alias.clone()));
-        self.retires.next(&host.alias)
-    }
-
-    fn retire_status(&self, host: &Host) -> Result<RetireStatus, PortError> {
-        self.log.push(Event::RetireStatus(host.alias.clone()));
-        self.statuses.next(&host.alias)
-    }
-
     fn commit(&self, host: &Host) -> Result<String, PortError> {
         self.log.push(Event::Commit(host.alias.clone()));
         self.commits.next(&host.alias)
@@ -937,89 +724,20 @@ mod tests {
         assert_eq!(clock.now(), Duration::from_secs(10));
     }
 
-    fn up(name: &str) -> PoolMember {
-        pool_member(name, false, true, 0)
-    }
-
-    /// Asserts that the fake pool is a table that a drain and an undrain move, that a member
-    /// reports its scripted streams only while it is draining, that a scripted answer to a
-    /// drain changes nothing when it is an error, that a member that does not exist is an error,
-    /// and that scripted views come before the table.
+    /// Asserts that the fake frontend reports the commit of a member unless it is scripted
+    /// otherwise, per host, and that each call is logged against the host.
     #[test]
-    fn the_fake_pool_is_a_table_that_drain_and_undrain_move() {
-        let log = Log::default();
-        let pool = FakePool::new(&log);
-        pool.set_members(&["a", "b"]);
-        assert_eq!(pool.view(), Ok(vec![up("a"), up("b")]));
-        pool.script_streams("a", vec![(2, 1)], (0, 0));
-        assert_eq!(pool.drain("a"), Ok(()));
-        let busy = PoolMember {
-            reapi_streams: 2,
-            operator_streams: 1,
-            ..pool_member("a", true, true, 0)
-        };
-        assert_eq!(pool.view(), Ok(vec![busy, up("b")]));
-        let idle = pool_member("a", true, true, 0);
-        assert_eq!(pool.view(), Ok(vec![idle, up("b")]));
-        assert_eq!(pool.undrain("a"), Ok(()));
-        assert_eq!(pool.table(), vec![up("a"), up("b")]);
-
-        let no = PortError("no".into());
-        pool.script_drain("b", vec![Err(no.clone())], Ok(()));
-        assert_eq!(pool.drain("b"), Err(no.clone()));
-        assert_eq!(pool.table(), vec![up("a"), up("b")]);
-        assert_eq!(pool.drain("b"), Ok(()));
-        pool.script_undrain("b", vec![Err(no.clone())], Ok(()));
-        assert_eq!(pool.undrain("b"), Err(no.clone()));
-        assert_eq!(pool.table()[1], pool_member("b", true, true, 0));
-        assert_eq!(pool.drain("c"), Err(PortError::other("no member c")));
-        assert_eq!(pool.undrain("c"), Err(PortError::other("no member c")));
-
-        pool.set_draining("b", false);
-        pool.set_ready("b", false);
-        let down = pool_member("b", false, false, 0);
-        assert_eq!(pool.table(), vec![up("a"), down]);
-        pool.script_views(vec![Err(no.clone()), Ok(vec![up("z")])]);
-        assert_eq!(pool.view(), Err(no));
-        assert_eq!(pool.view(), Ok(vec![up("z")]));
-        assert_eq!(pool.view().expect("table").len(), 2);
-
-        assert_eq!(log.touching("a").len(), 2);
-        assert_eq!(log.touching("c").len(), 2);
-        assert_eq!(log.events()[0], Event::PoolView);
-    }
-
-    /// Asserts that the fake frontend retires at once and reports the commit of a member unless
-    /// it is scripted otherwise, per host, and that each call is logged against the host.
-    #[test]
-    fn the_fake_frontend_follows_its_scripts_and_logs_by_host() {
+    fn the_fake_frontend_reports_the_commit_as_scripted_and_logs_by_host() {
         let log = Log::default();
         let front = FakeFrontend::new(&log);
         let (a, b) = (host("a"), host("b"));
-        assert_eq!(front.retire(&a), Ok(retired()));
-        assert_eq!(front.retire_status(&a), Ok(retired()));
         assert_eq!(front.commit(&a), Ok(MEMBER_COMMIT.to_owned()));
-        let open = RetireStatus {
-            open_streams: 3,
-            ..retired()
-        };
         let no = PortError("no".into());
-        front.script_retire("b", vec![Ok(open)], Err(no.clone()));
-        front.script_status("b", vec![Ok(open)], Ok(retired()));
         front.script_commit("b", vec![Err(no.clone())], Ok("abc".to_owned()));
-        assert_eq!(front.retire(&b), Ok(open));
-        assert_eq!(front.retire(&b), Err(no.clone()));
-        assert_eq!(front.retire_status(&b), Ok(open));
-        assert_eq!(front.retire_status(&b), Ok(retired()));
         assert_eq!(front.commit(&b), Err(no));
         assert_eq!(front.commit(&b), Ok("abc".to_owned()));
-        let kinds = [
-            Event::Retire("a".into()),
-            Event::RetireStatus("a".into()),
-            Event::Commit("a".into()),
-        ];
-        assert_eq!(log.touching("a"), kinds);
-        assert_eq!(log.touching("b").len(), 6);
+        assert_eq!(log.touching("a"), [Event::Commit("a".into())]);
+        assert_eq!(log.touching("b").len(), 2);
     }
 
     /// Asserts that the fake installer restarts a frontend unit and logs the host and the unit,
@@ -1048,7 +766,7 @@ mod tests {
     }
 
     /// Asserts that every kind of call has its own word, with the detail the tests tell calls
-    /// apart by: the version of an install, the deadline of a drain, the pool member or unit.
+    /// apart by: the version of an install, the deadline of a drain or the unit.
     #[test]
     fn every_call_has_its_own_word() {
         let a = || "a".to_owned();
@@ -1060,11 +778,6 @@ mod tests {
             Event::Drain(a(), 600),
             Event::Leases(a()),
             Event::Undrain(a()),
-            Event::PoolView,
-            Event::PoolDrain("m".into()),
-            Event::PoolUndrain("m".into()),
-            Event::Retire(a()),
-            Event::RetireStatus(a()),
             Event::Commit(a()),
             Event::Restart(a(), "u".into()),
             Event::MemberDrain(a()),
@@ -1084,11 +797,6 @@ mod tests {
                 "drain 600",
                 "leases",
                 "undrain",
-                "pool view",
-                "pool drain m",
-                "pool undrain m",
-                "retire",
-                "retire status",
                 "commit",
                 "restart u",
                 "member drain",
@@ -1128,17 +836,5 @@ mod tests {
         ];
         assert_eq!(log.touching("a"), kinds);
         assert_eq!(log.touching("b").len(), 7);
-    }
-
-    /// Asserts that a fake pool is configured, as a proxy is, until a test says it is not, and
-    /// that it can be set both ways.
-    #[test]
-    fn the_fake_pool_is_configured_unless_a_test_says_otherwise() {
-        let pool = FakePool::new(&Log::default());
-        assert!(pool.configured());
-        pool.set_configured(false);
-        assert!(!pool.configured());
-        pool.set_configured(true);
-        assert!(pool.configured());
     }
 }
