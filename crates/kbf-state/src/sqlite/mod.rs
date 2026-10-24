@@ -253,7 +253,10 @@ impl Drop for SqliteStore {
     /// Stops the writer after the calls already queued, then releases the file lock.
     fn drop(&mut self) {
         // Closing the queue ends the writer after the requests already in it.
-        drop(std::mem::replace(&mut self.requests, mpsc::sync_channel(0).0));
+        drop(std::mem::replace(
+            &mut self.requests,
+            mpsc::sync_channel(0).0,
+        ));
         // A writer that panicked has nothing more to say to us.
         let _ = held(&self.writer).take().map(JoinHandle::join);
         drop(held(&self.lock).take());

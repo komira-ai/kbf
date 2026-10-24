@@ -62,8 +62,8 @@ use tx::{Level, Row, Tx, micros};
 use crate::clock::{Clock, StoreTime};
 use crate::store::{Span, Store, page_of};
 use crate::{
-    Change, Changes, Commit, CommitStats, Conflict, Direction, Event, Revision, ScanPage, ScanRange,
-    StoreError, Txn, Version, Versioned,
+    Change, Changes, Commit, CommitStats, Conflict, Direction, Event, Revision, ScanPage,
+    ScanRange, StoreError, Txn, Version, Versioned,
 };
 
 /// The most times a batch is run again after a serialization failure.
@@ -718,8 +718,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ConfigError, Fail, MAX_ATTEMPTS, PostgresConfig, PostgresStore, Revision, Store, StoreError,
-        Txn, describe,
+        ConfigError, Fail, MAX_ATTEMPTS, PostgresConfig, PostgresStore, Revision, Store,
+        StoreError, Txn, describe,
     };
     use crate::Cond;
 

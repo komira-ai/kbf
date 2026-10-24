@@ -8,8 +8,8 @@ use std::time::Duration;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::recording::{RecordingStore, Write, WriteKind};
 use kbf_state::{
-    Changes, Commit, CommitStats, Cond, Conflict, ManualClock, Revision, ScanPage, ScanRange, Store,
-    StoreError, StoreTime, Txn, Versioned,
+    Changes, Commit, CommitStats, Cond, Conflict, ManualClock, Revision, ScanPage, ScanRange,
+    Store, StoreError, StoreTime, Txn, Versioned,
 };
 
 fn fake() -> Arc<dyn Store> {
