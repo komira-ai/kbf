@@ -14,13 +14,14 @@ use kbf_enroll_registry::{
     EnrollRequest, IssuedRole, RegistryError, enroll_txn, list_nodes, list_tokens,
 };
 use kbf_state::fake::{Fake, Flaw};
-use kbf_state::{Fenced, ManualClock, Store, StoreError};
+use kbf_state::{ManualClock, Store, StoreError};
 use kbf_types::enroll_api::{NodeList, NodeRevoked, TokenCreated, TokenList, TokenRevoked};
 use kbf_types::{CaPin, NodeId, RefusalReason, Role, Token, TokenId, TokenSecret};
 use serde::de::DeserializeOwned;
 use sha2::{Digest as _, Sha256};
 
 use super::*;
+use crate::enroll::testkit::WritesFenced;
 use crate::enroll::{OsRandom, PinError, PinSource, Random};
 
 const BEARER: &str = "operator-token-0123456789abcdef0123456789";
@@ -522,18 +523,17 @@ async fn a_node_revoke_writes_deny_rows_and_burns_the_id() {
     assert_eq!(with(r#"{"x":1}"#).await.status(), StatusCode::BAD_REQUEST);
 }
 
-// Catches a write that does not go through the fenced handle (a demoted or stale frontend
-// signing a token the new signer does not know about) or that answers the fence as a 500
-// or as success: a stale handle's create, DELETE and revoke land nothing and answer 409;
-// the current handle's calls, the control, succeed; reads are not fenced. The two
-// frontends draw from different random streams (see `state_over_from`): with the same
-// stream the stale create would collide with the current one's token id and answer 400.
+/// Asserts that a store that refuses every write as one of a superseded handle
+/// (`StoreError::Fenced`) is answered with 409 "not the signer", not as a 500 or as
+/// success: a stale handle's create, DELETE and revoke land nothing; the calls through a
+/// handle the store lets write, the control, succeed; reads are not refused. The two
+/// frontends draw from different random streams (see `state_over_from`).
 #[tokio::test]
 async fn a_stale_frontend_cannot_write() {
     let inner = fake();
     let as_store = || -> Arc<dyn Store> { inner.clone() };
-    let stale: Arc<dyn Store> = Arc::new(Fenced::take(as_store(), None).expect("first"));
-    let newer: Arc<dyn Store> = Arc::new(Fenced::take(as_store(), None).expect("second"));
+    let stale: Arc<dyn Store> = Arc::new(WritesFenced(as_store()));
+    let newer = as_store();
     let (old_state, new_state) = (state_over_from(stale, 100), state_over(newer.clone()));
 
     let created = make(&new_state, r#"{"roles":["daemon"]}"#).await;

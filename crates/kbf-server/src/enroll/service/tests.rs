@@ -1,10 +1,12 @@
 //! `Enroll` through the service: what is checked in which order, what a refusal looks like
 //! on the wire, and what an answer holds. Each test names the defect it catches.
 
+use std::num::NonZeroUsize;
+
 use kbf_enroll_registry::{list_nodes, list_tokens};
 use kbf_proto::kbf::enroll::v1 as pb;
 use kbf_proto::kbf::enroll::v1::enroll_server::Enroll as _;
-use kbf_state::{Fenced, Store, StoreError};
+use kbf_state::{Cond, Revision, ScanRange, Store, StoreError, Txn};
 use kbf_types::{RefusalReason, Role, TokenId};
 use rcgen::PublicKeyData as _;
 use tonic::{Code, Request, Status};
@@ -12,8 +14,8 @@ use x509_parser::prelude::{FromDer as _, X509Certificate};
 
 use super::*;
 use crate::enroll::testkit::{
-    FRONTEND, Farm, START, csr_bad_signature, csr_oversized, csr_rsa, enroll_request, farm,
-    farm_at, key, node, spec, token,
+    FRONTEND, Farm, START, WritesFenced, csr_bad_signature, csr_oversized, csr_rsa, enroll_request,
+    farm, farm_at, key, node, spec, token,
 };
 
 const ADVERTISE: &str = "s1.nodes.test:8983";
@@ -410,16 +412,12 @@ async fn a_malformed_request_is_refused_before_the_store_is_read() {
     assert_eq!(uses(&farm), 0);
 }
 
-/// A frontend that is no longer the writer answers `NotSigner`, whatever the request.
-///
-/// Catches: a superseded frontend issuing certificates the successor's registry does not
-/// know (they would be unrevocable), or mapping the fence to a retryable store error.
+/// Asserts that a frontend whose store refuses its writes as a superseded handle's answers
+/// `NotSigner` to an enroll request, and records no node.
 #[tokio::test]
 async fn a_fenced_frontend_answers_not_signer() {
     let farm = farm("enroll-fenced");
-    let base = Arc::clone(&farm.store);
-    let stale: Arc<dyn Store> = Arc::new(Fenced::take(Arc::clone(&base), None).expect("first"));
-    let _newer = Fenced::take(base, None).expect("second");
+    let stale: Arc<dyn Store> = Arc::new(WritesFenced(Arc::clone(&farm.store)));
     let service = crate::enroll::testkit::service_over(&stale, &farm.ca);
     let tok = token(&farm, 1, &spec(&[Role::Daemon]));
     let (request, _) = enroll_request(&tok, "node-01", &[Role::Daemon], "");
@@ -431,6 +429,46 @@ async fn a_fenced_frontend_answers_not_signer() {
     );
     assert_is(&status, RefusalReason::NotSigner);
     assert!(list_nodes(&*farm.store).expect("nodes").is_empty());
+}
+
+/// Asserts that the store which refuses writes as a superseded handle's answers `get`,
+/// `scan_prefix`, `scan_range`, `changes`, `commit_stats` and `now` as the store underneath
+/// does, and answers `StoreError::Fenced` to `apply_batch` and to `reap_expired`.
+#[test]
+fn a_store_that_refuses_writes_reads_as_the_store_underneath_does() {
+    let farm = farm("enroll-fenced-reads");
+    let inner = Arc::clone(&farm.store);
+    let outer = WritesFenced(Arc::clone(&inner));
+    let prefix = "fenced-reads/";
+    let key = "fenced-reads/key";
+    let write = inner
+        .apply_batch(vec![Txn::new().put(key, "v", Cond::Any)])
+        .expect("write");
+    write[0].as_ref().expect("committed");
+
+    let seen = outer.get(key).expect("outer get");
+    let held = inner.get(key).expect("inner get");
+    assert_eq!(seen, held);
+    let seen = outer.scan_prefix(prefix).expect("outer scan_prefix");
+    let held = inner.scan_prefix(prefix).expect("inner scan_prefix");
+    assert_eq!(seen, held);
+    let seen = outer
+        .scan_range(ScanRange::new(prefix, NonZeroUsize::MIN))
+        .expect("outer scan_range");
+    let held = inner
+        .scan_range(ScanRange::new(prefix, NonZeroUsize::MIN))
+        .expect("inner scan_range");
+    assert_eq!(seen, held);
+    let seen = outer.changes(Revision::ZERO, 10).expect("outer changes");
+    let held = inner.changes(Revision::ZERO, 10).expect("inner changes");
+    assert_eq!(seen, held);
+    assert_eq!(outer.commit_stats(), inner.commit_stats());
+    assert_eq!(outer.now(), inner.now());
+
+    let batch = outer.apply_batch(vec![Txn::new()]);
+    assert_eq!(batch, Err(StoreError::Fenced));
+    let reap = outer.reap_expired();
+    assert_eq!(reap, Err(StoreError::Fenced));
 }
 
 /// A CA that cannot sign now (the clock is before the build's floor) is `NotSigner`, and

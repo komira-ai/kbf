@@ -12,24 +12,23 @@ use std::sync::Arc;
 use kbf_front::Cache;
 use kbf_server::{EpochPolicy, Farm, StateError, StateStore, StateStoreUri};
 use kbf_state::postgres::{PostgresConfig, PostgresStore, TestDatabase, test_database};
-use kbf_state::{
-    Cond, Fenced, GENERATION, SHARED_WRITERS, Store, StoreError, TakeError, Txn, decode_generation,
-};
+use kbf_state::{Cond, GENERATION, SHARED_WRITERS, Store, Txn};
 
 fn uri(url: &str) -> StateStoreUri {
     url.parse().expect("a postgres:// URL the store accepts")
 }
 
 /// Asserts that the generation row of `store` holds the marker of shared frontends and
-/// nothing else, which a build that takes generations cannot read as a generation.
+/// nothing else: the bytes `shared-writers`, which are not eight bytes, so a build that
+/// reads the row as a generation finds it corrupt.
 fn assert_marked(store: &dyn Store) {
     let row = store.get(GENERATION).expect("read").expect("a row");
     assert_eq!(row.value, SHARED_WRITERS);
-    assert_eq!(decode_generation(&row.value), Err(TakeError::Corrupt));
+    assert_eq!(row.value, b"shared-writers");
+    assert_ne!(row.value.len(), 8);
 }
 
-/// A handle on the database that is not a frontend's: what an older build opens before it
-/// takes a generation.
+/// A handle on the database that is not a frontend's.
 fn raw(db: &TestDatabase) -> Arc<dyn Store> {
     let config = PostgresConfig::parse(&db.url()).expect("a config");
     Arc::new(PostgresStore::open(&config).expect("a connection"))
@@ -77,9 +76,8 @@ fn a_start_on_a_database_without_the_installers_schema_is_refused() {
 /// given an epoch of its own and the next start keeps it (every start keeps it, so a
 /// frontend started over the database leaves the daemons their runs); that no start takes a
 /// generation, the generation row holding the marker of shared frontends after the first
-/// and after the second; that the first frontend is not fenced by the second, in its store
-/// handle or in its farm; and that an open that expects a generation is refused, with the
-/// store as it was.
+/// and after the second; and that the first frontend is not fenced by the second, in its
+/// store handle or in its farm.
 #[test]
 fn a_flag_opened_postgres_store_is_shared_and_keeps_epochs() {
     let db = test_database();
@@ -126,15 +124,6 @@ fn a_flag_opened_postgres_store_is_shared_and_keeps_epochs() {
         .expect("the first frontend's farm writes")
         .expect("a state store");
     assert!(!first_farm.superseded(), "a start fenced the first");
-
-    let refused = uri
-        .open_after_handover(1)
-        .err()
-        .expect("no generation to succeed");
-    assert!(
-        matches!(&refused, StateError::Open(why) if why.contains("not an 8-byte number")),
-        "{refused:?}"
-    );
     assert_marked(first.store.as_ref());
 }
 
@@ -161,24 +150,27 @@ fn frontends_that_open_a_new_database_together_all_write_and_leave_the_marker() 
 }
 
 /// Asserts that opening a store that holds a generation (as a build that takes generations
-/// left it) replaces the generation with the marker, which is the cold cutover: the old
-/// build's handle is fenced and writes nothing, a build that takes generations is refused
-/// on the store as corrupt, the new frontend writes, and a second open changes nothing.
+/// left it: eight bytes, big-endian) replaces the generation with the marker, which is the
+/// cold cutover: the row's version moves, the new frontend writes, and a second open changes
+/// nothing.
 #[test]
 fn a_store_that_holds_a_generation_is_converted_to_the_marker_on_open() {
     let db = test_database();
     let uri = uri(&db.url());
-    let old = Fenced::take(raw(&db), None).expect("an older build takes generation 1");
-    old.txn(write()).expect("store").expect("commits");
+    let old = raw(&db);
+    let generation = Txn::new().put(GENERATION, 1_u64.to_be_bytes(), Cond::Any);
+    old.txn(generation).expect("store").expect("commits");
     let before = old.get(GENERATION).expect("read").expect("a row");
-    assert_eq!(decode_generation(&before.value), Ok(1));
+    assert_eq!(before.value, 1_u64.to_be_bytes());
 
     let opened = uri.open().expect("opens");
 
     assert_marked(opened.store.as_ref());
-    assert_eq!(old.txn(write()).unwrap_err(), StoreError::Fenced);
-    let refused = Fenced::take(raw(&db), None).expect_err("a build that takes generations");
-    assert_eq!(refused, TakeError::Corrupt);
+    let after = opened.store.get(GENERATION).expect("read").expect("a row");
+    assert_ne!(
+        after.version, before.version,
+        "the generation was not replaced"
+    );
     opened.store.txn(write()).expect("store").expect("commits");
     let marked = opened.store.get(GENERATION).expect("read");
     let again = uri.open().expect("opens again");

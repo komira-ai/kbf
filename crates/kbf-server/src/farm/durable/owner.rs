@@ -14,7 +14,7 @@
 //! said `Hello` elsewhere meanwhile, writes nothing and fails with
 //! [`StateError::StaleOwner`]. That error is about one node: it drops what the frontend
 //! holds for that node and nothing else, and does not mark the frontend as superseded as
-//! a newer generation of the store does ([`kbf_state::Fenced`]).
+//! a refusal of the store as `Fenced` does ([`kbf_state::StoreError::Fenced`]).
 //!
 //! A node this frontend never claimed (a lease taken up by a request that joined its
 //! operation, before its daemon said `Hello` here) has no counter to check: a write for it

@@ -25,8 +25,8 @@
 //! **Discipline.** Every write is one transaction and carries the version (or the absence)
 //! of every row it decided on, so a racing writer makes it fail and the call decides again
 //! on fresh rows, at most [`ATTEMPTS`] times. No row is cached between calls, so a handle
-//! that has lost the writer role ([`kbf_state::Fenced`]) changes nothing: its writes fail
-//! and the call answers [`kbf_types::RefusalReason::NotSigner`].
+//! whose writes the store refuses as superseded ([`kbf_state::StoreError::Fenced`]) changes
+//! nothing and the call answers [`kbf_types::RefusalReason::NotSigner`].
 //!
 //! **The secret.** The row holds `SHA-256` of the 32 secret bytes. The enroll
 //! transaction reads the token row, then hashes the presented secret whether or not the
