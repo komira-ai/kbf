@@ -149,7 +149,7 @@ This section described the hold gate of a frontend swap: the hold flag in the ga
 |---|---|---|
 | Worker | `/kbf.worker.*`, `/kbf.map.v1.Membership/`, `/kbf.update.*`, `/kbf.enroll.v1.ColdStore/` | verified certificate with role Daemon or Storage; none: `UNAUTHENTICATED`; other role: `PERMISSION_DENIED` |
 | Reapi | REAPI services, ByteStream | `none`: open; `mtls`: any verified certificate but a host updater's; `bearer`: the right token |
-| Operator | other `/v1/*`, `/metrics` | operator token; a certificate with the role `updater` instead makes `POST /v1/nodes/{id}:drain`, `POST /v1/nodes/{id}:uncordon` and `GET /v1/nodes/{id}` for its own node id (`route::self_node_of`), the proxy putting the operator token in itself, and nothing else: any other call of an `updater` certificate is `PERMISSION_DENIED` whatever the class, the probes, the UI and enrollment excepted |
+| Operator | other `/v1/*`, `/metrics` | operator token |
 | Update | `/v1/update/frontend*` | operator token now (one function, swap point for OIDC #1088) |
 | Probe | `/healthz`, `/readyz` | open |
 | Enroll | `/kbf.enroll.v1.Enroll/` | no certificate and no token at the proxy, in every mode; the child checks the enrollment token |
