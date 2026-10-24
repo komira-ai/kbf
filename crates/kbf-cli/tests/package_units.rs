@@ -93,6 +93,13 @@ fn each_package_unit_runs_one_boot_check_for_its_own_mode_that_kbfs_own_parser_t
         let line = format!("+/usr/bin/kbf boot-check {flag}");
         assert_eq!(first, line, "{mode}");
         let argv = ["kbf", "boot-check", flag.as_str()].map(OsString::from);
+        if mode == kbf_cli::names::ALL_IN_ONE {
+            // The unit is kept for one release; `kbf` refuses the mode it names.
+            let e = kbf_cli::boot_check::parse(&argv).expect_err("refused");
+            assert!(e.to_string().contains(kbf_cli::ALL_IN_ONE_REMOVED), "{e}");
+            checked += 1;
+            continue;
+        }
         let parsed = kbf_cli::boot_check::parse(&argv).unwrap_or_else(|e| panic!("{mode}: {e}"));
         assert_eq!(parsed.mode, mode);
         let default = Path::new(kbf_cli::boot_check::DEFAULT_INSTALLER_CONFIG);
@@ -115,6 +122,18 @@ fn each_package_unit_command_line_parses_with_kbfs_own_parser() {
     let config = frontend_config(&dir);
     for (mode, text) in units() {
         let lines = kbf_lines(&text);
+        if mode == kbf_cli::names::ALL_IN_ONE {
+            // The unit is kept for one release; `kbf` refuses the mode it names.
+            for line in lines {
+                let argv: Vec<OsString> = std::iter::once("kbf".to_owned())
+                    .chain(line)
+                    .map(OsString::from)
+                    .collect();
+                let e = kbf_cli::parse_from(argv).expect_err("refused");
+                assert!(e.to_string().contains(kbf_cli::ALL_IN_ONE_REMOVED), "{e}");
+            }
+            continue;
+        }
         assert!(
             lines.len() >= 2,
             "{mode}: fewer kbf lines than a check and a start"

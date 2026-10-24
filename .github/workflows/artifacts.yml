@@ -342,13 +342,16 @@ jobs:
       - name: A BuildKit builder, pinned by digest
         run: docker buildx create --name kbf-image --driver docker-container --driver-opt image=moby/buildkit:v0.23.2@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e --use
       - name: Build the frontend image, build 1 of 2
-        run: docker buildx build --builder kbf-image --no-cache --platform linux/amd64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-frontend:$GITHUB_SHA" --file packaging/container/frontend/Dockerfile --output "type=oci,dest=target/image-out/1.oci.tar,rewrite-timestamp=true" target/image
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/amd64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-frontend:$GITHUB_SHA" --file packaging/container/frontend/Dockerfile --output "type=docker,oci-mediatypes=true,dest=target/image-out/1.oci.tar,rewrite-timestamp=true" target/image
       - name: Build the frontend image, build 2 of 2
-        run: docker buildx build --builder kbf-image --no-cache --platform linux/amd64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-frontend:$GITHUB_SHA" --file packaging/container/frontend/Dockerfile --output "type=oci,dest=target/image-out/2.oci.tar,rewrite-timestamp=true" target/image
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/amd64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-frontend:$GITHUB_SHA" --file packaging/container/frontend/Dockerfile --output "type=docker,oci-mediatypes=true,dest=target/image-out/2.oci.tar,rewrite-timestamp=true" target/image
       - name: The two builds of the frontend image are the same bytes
         run: cmp target/image-out/1.oci.tar target/image-out/2.oci.tar
       - name: The frontend image is the attested kbf, and is an asset
         run: cargo xtask pkg-image-asset --service frontend --image target/image-out/1.oci.tar --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" --out dist
+      # `docker image load` reads the file the release ships, as a host does.
+      - name: Load the frontend image with docker
+        run: docker image load --input "dist/kbf-frontend-image-$GITHUB_SHA-linux-x86_64.oci.tar"
       # The coordinator image (packaging/container/kbf-coordinator/Dockerfile) is made the same
       # way from the `kbf-coordinator` built above, which `build-commit check` has shown names the
       # commit. It has no tarball of its own, so the image is held to that file.
@@ -357,13 +360,16 @@ jobs:
       - name: The coordinator image context holds the built kbf-coordinator
         run: cp "target/$TARGET/release/kbf-coordinator" target/coordinator-image/kbf-coordinator
       - name: Build the coordinator image, build 1 of 2
-        run: docker buildx build --builder kbf-image --no-cache --platform linux/amd64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-coordinator:$GITHUB_SHA" --file packaging/container/kbf-coordinator/Dockerfile --output "type=oci,dest=target/coordinator-image-out/1.oci.tar,rewrite-timestamp=true" target/coordinator-image
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/amd64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-coordinator:$GITHUB_SHA" --file packaging/container/kbf-coordinator/Dockerfile --output "type=docker,oci-mediatypes=true,dest=target/coordinator-image-out/1.oci.tar,rewrite-timestamp=true" target/coordinator-image
       - name: Build the coordinator image, build 2 of 2
-        run: docker buildx build --builder kbf-image --no-cache --platform linux/amd64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-coordinator:$GITHUB_SHA" --file packaging/container/kbf-coordinator/Dockerfile --output "type=oci,dest=target/coordinator-image-out/2.oci.tar,rewrite-timestamp=true" target/coordinator-image
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/amd64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-coordinator:$GITHUB_SHA" --file packaging/container/kbf-coordinator/Dockerfile --output "type=docker,oci-mediatypes=true,dest=target/coordinator-image-out/2.oci.tar,rewrite-timestamp=true" target/coordinator-image
       - name: The two builds of the coordinator image are the same bytes
         run: cmp target/coordinator-image-out/1.oci.tar target/coordinator-image-out/2.oci.tar
       - name: The coordinator image is the built kbf-coordinator, and is an asset
         run: cargo xtask pkg-image-asset --service coordinator --image target/coordinator-image-out/1.oci.tar --platform linux-x86_64 --commit "$GITHUB_SHA" --binary "target/$TARGET/release/kbf-coordinator" --out dist
+      # `docker image load` reads the file the release ships, as a host does.
+      - name: Load the coordinator image with docker
+        run: docker image load --input "dist/kbf-coordinator-image-$GITHUB_SHA-linux-x86_64.oci.tar"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-x86_64
@@ -498,13 +504,16 @@ jobs:
       - name: A BuildKit builder, pinned by digest
         run: docker buildx create --name kbf-image --driver docker-container --driver-opt image=moby/buildkit:v0.23.2@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e --use
       - name: Build the frontend image, build 1 of 2
-        run: docker buildx build --builder kbf-image --no-cache --platform linux/arm64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-frontend:$GITHUB_SHA" --file packaging/container/frontend/Dockerfile --output "type=oci,dest=target/image-out/1.oci.tar,rewrite-timestamp=true" target/image
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/arm64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-frontend:$GITHUB_SHA" --file packaging/container/frontend/Dockerfile --output "type=docker,oci-mediatypes=true,dest=target/image-out/1.oci.tar,rewrite-timestamp=true" target/image
       - name: Build the frontend image, build 2 of 2
-        run: docker buildx build --builder kbf-image --no-cache --platform linux/arm64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-frontend:$GITHUB_SHA" --file packaging/container/frontend/Dockerfile --output "type=oci,dest=target/image-out/2.oci.tar,rewrite-timestamp=true" target/image
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/arm64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-frontend:$GITHUB_SHA" --file packaging/container/frontend/Dockerfile --output "type=docker,oci-mediatypes=true,dest=target/image-out/2.oci.tar,rewrite-timestamp=true" target/image
       - name: The two builds of the frontend image are the same bytes
         run: cmp target/image-out/1.oci.tar target/image-out/2.oci.tar
       - name: The frontend image is the attested kbf, and is an asset
         run: cargo xtask pkg-image-asset --service frontend --image target/image-out/1.oci.tar --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" --out dist
+      # `docker image load` reads the file the release ships, as a host does.
+      - name: Load the frontend image with docker
+        run: docker image load --input "dist/kbf-frontend-image-$GITHUB_SHA-linux-arm64.oci.tar"
       # The coordinator image (packaging/container/kbf-coordinator/Dockerfile) is made the same
       # way from the `kbf-coordinator` built above, which `build-commit check` has shown names the
       # commit. It has no tarball of its own, so the image is held to that file.
@@ -513,13 +522,16 @@ jobs:
       - name: The coordinator image context holds the built kbf-coordinator
         run: cp "target/$TARGET/release/kbf-coordinator" target/coordinator-image/kbf-coordinator
       - name: Build the coordinator image, build 1 of 2
-        run: docker buildx build --builder kbf-image --no-cache --platform linux/arm64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-coordinator:$GITHUB_SHA" --file packaging/container/kbf-coordinator/Dockerfile --output "type=oci,dest=target/coordinator-image-out/1.oci.tar,rewrite-timestamp=true" target/coordinator-image
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/arm64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-coordinator:$GITHUB_SHA" --file packaging/container/kbf-coordinator/Dockerfile --output "type=docker,oci-mediatypes=true,dest=target/coordinator-image-out/1.oci.tar,rewrite-timestamp=true" target/coordinator-image
       - name: Build the coordinator image, build 2 of 2
-        run: docker buildx build --builder kbf-image --no-cache --platform linux/arm64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-coordinator:$GITHUB_SHA" --file packaging/container/kbf-coordinator/Dockerfile --output "type=oci,dest=target/coordinator-image-out/2.oci.tar,rewrite-timestamp=true" target/coordinator-image
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/arm64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-coordinator:$GITHUB_SHA" --file packaging/container/kbf-coordinator/Dockerfile --output "type=docker,oci-mediatypes=true,dest=target/coordinator-image-out/2.oci.tar,rewrite-timestamp=true" target/coordinator-image
       - name: The two builds of the coordinator image are the same bytes
         run: cmp target/coordinator-image-out/1.oci.tar target/coordinator-image-out/2.oci.tar
       - name: The coordinator image is the built kbf-coordinator, and is an asset
         run: cargo xtask pkg-image-asset --service coordinator --image target/coordinator-image-out/1.oci.tar --platform linux-arm64 --commit "$GITHUB_SHA" --binary "target/$TARGET/release/kbf-coordinator" --out dist
+      # `docker image load` reads the file the release ships, as a host does.
+      - name: Load the coordinator image with docker
+        run: docker image load --input "dist/kbf-coordinator-image-$GITHUB_SHA-linux-arm64.oci.tar"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-arm64

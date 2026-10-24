@@ -13,8 +13,17 @@ pub enum Mode {
     Storage,
     Daemon,
     StorageAndDaemon,
+    /// Removed: setup refuses it with [`ALL_IN_ONE_REMOVED`]. Hidden from the listed values.
+    #[value(hide = true)]
     AllInOne,
 }
+
+/// What a command line that asks for the `all-in-one` mode is told, by `kbf`, `kbf setup`
+/// and `kbf-installer setup` alike. The mode was removed: a frontend and one or more
+/// storage-and-daemon nodes replace it.
+pub const ALL_IN_ONE_REMOVED: &str = "the all-in-one mode was removed: run one node with \
+`--mode=frontend` and one or more nodes with `--mode=storage-and-daemon` instead \
+(docs/deploy/kbf-modes.md)";
 
 impl Mode {
     /// Whether this mode keeps its state in the Postgres database the installer owns (the

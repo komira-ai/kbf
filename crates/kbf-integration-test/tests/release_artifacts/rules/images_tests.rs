@@ -110,6 +110,18 @@ fn the_frontend_image_is_built_twice_from_the_attested_tarball_and_compared() {
             "{flag}: {got:?}"
         );
     }
+    // An OCI-layout export has no manifest.json, and `docker image load` refuses it.
+    let oci = good().replacen(
+        &steps,
+        &steps.replace("type=docker,oci-mediatypes=true,", "type=oci,"),
+        1,
+    );
+    let got = found(&oci);
+    assert!(
+        got.iter()
+            .any(|l| l.contains("`docker image load` cannot read the image")),
+        "type=oci: {got:?}"
+    );
     let skippable = steps.replace(
         "      - name: Same\n",
         "      - name: Same\n        if: always()\n",

@@ -264,7 +264,7 @@ pub(super) const DAEMON: [&str; 8] = [
 pub(super) fn needs_from_in(args: &[&str], config: &str) -> Needs {
     let argv = std::iter::once("kbf").chain(args.iter().copied());
     super::needs_in(
-        &crate::parse_from(argv).expect("flags parse"),
+        &crate::parse_internal(argv).expect("flags parse"),
         Path::new(config),
     )
 }
@@ -272,7 +272,7 @@ pub(super) fn needs_from_in(args: &[&str], config: &str) -> Needs {
 /// The needs of `kbf` run with `args`: from the flags to the checks, as a start goes.
 pub(super) fn needs_from(args: &[&str]) -> Needs {
     let argv = std::iter::once("kbf").chain(args.iter().copied());
-    super::needs(&crate::parse_from(argv).expect("flags parse"))
+    super::needs(&crate::parse_internal(argv).expect("flags parse"))
 }
 
 // ---- the needs of a daemon ----------------------------------------------------------------
@@ -1129,7 +1129,7 @@ mod wiring {
 
     fn parse(args: &[&str]) -> Needs {
         let argv = std::iter::once("kbf").chain(args.iter().copied());
-        needs(&crate::parse_from(argv).expect("flags parse"))
+        needs(&crate::parse_internal(argv).expect("flags parse"))
     }
 
     fn flags_of(n: &Needs) -> Vec<(&'static str, bool)> {

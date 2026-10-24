@@ -42,7 +42,7 @@ Options:
       --json
           Print the result as one JSON object on standard output
       --mode <MODE>
-          The kbf mode this host runs (`kbf --mode=...`) [possible values: frontend, storage, daemon, storage-and-daemon, all-in-one]
+          The kbf mode this host runs (`kbf --mode=...`) [possible values: frontend, storage, daemon, storage-and-daemon]
       --apply
           Do what the verb says. Without it a mutating verb is a dry run
       --min-generation <MIN_GENERATION>
@@ -234,7 +234,7 @@ Options:
       --window-secs <WINDOW_SECS>  [default: 900]
       --apply                      Do what the verb says. Without it a mutating verb is a dry run
       --kbf <KBF>                  The kbf this unit starts, on a bundled host (one with no releases and no state): the check runs `<kbf> boot-check --mode=<mode>` over the host's installer.toml (under --root), which migrates the state database, and ends as it ends. Needs --mode
-      --mode <MODE>                The mode of the unit that runs the check: only frontend and all-in-one keep state in the database. Needs --kbf [possible values: frontend, storage, daemon, storage-and-daemon, all-in-one]
+      --mode <MODE>                The mode of the unit that runs the check: only frontend and all-in-one keep state in the database. Needs --kbf [possible values: frontend, storage, daemon, storage-and-daemon]
   -h, --help                       Print help
 
 === kbf-installer quiesce --help ===

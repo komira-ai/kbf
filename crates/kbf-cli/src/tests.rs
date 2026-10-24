@@ -51,7 +51,7 @@ fn with(base: &[&str], extra: &[&str]) -> Vec<String> {
 }
 
 fn refusal(argv: Vec<String>) -> clap::Error {
-    parse_from(argv).expect_err("refused")
+    parse_internal(argv).expect_err("refused")
 }
 
 fn error(argv: Vec<String>) -> String {
@@ -63,23 +63,24 @@ fn error(argv: Vec<String>) -> String {
 #[test]
 fn each_mode_parses_its_flags() {
     command().debug_assert();
-    let daemon = parse_from(with(DAEMON, &["--cpu-threads=3"])).expect("daemon");
+    let daemon = parse_internal(with(DAEMON, &["--cpu-threads=3"])).expect("daemon");
     assert!(matches!(&daemon, Invocation::Daemon(cli)
         if format!("{cli:?}").contains("cpu_threads: Some(3)")));
-    let both = parse_from(with(BOTH, &["--listen=127.0.0.1:9980"])).expect("all-in-one");
+    let both = parse_internal(with(BOTH, &["--listen=127.0.0.1:9980"])).expect("all-in-one");
     assert!(matches!(&both, Invocation::AllInOne(flags)
         if flags.server.listen.to_string() == "127.0.0.1:9980"));
-    let storage = parse_from(with(STORAGE, &["--storage-listen=127.0.0.1:9982"])).expect("storage");
+    let storage =
+        parse_internal(with(STORAGE, &["--storage-listen=127.0.0.1:9982"])).expect("storage");
     assert!(matches!(&storage, Invocation::Storage(flags)
         if flags.listen.to_string() == "127.0.0.1:9982" && flags.tls.is_none()));
-    let frontend = parse_from(with(FRONTEND, &["--listen=127.0.0.1:9980"])).expect("frontend");
+    let frontend = parse_internal(with(FRONTEND, &["--listen=127.0.0.1:9980"])).expect("frontend");
     assert!(matches!(&frontend, Invocation::Frontend(flags)
         if flags.server.listen.to_string() == "127.0.0.1:9980" && flags.tls.is_none()));
     let converged = with(
         CONVERGED,
         &["--storage-listen=127.0.0.1:9982", "--cpu-threads=3"],
     );
-    let converged = parse_from(converged).expect("storage-and-daemon");
+    let converged = parse_internal(converged).expect("storage-and-daemon");
     assert!(matches!(&converged, Invocation::StorageAndDaemon(flags)
         if flags.storage.listen.to_string() == "127.0.0.1:9982"
             && format!("{:?}", flags.daemon).contains("cpu_threads: Some(3)")));
@@ -126,7 +127,7 @@ fn an_unknown_word_is_rejected() {
         vec!["kbf", "--mode=daemon", "node"],
         vec!["kbf", "--mode=storage", "daemon"],
     ] {
-        let err = parse_from(argv.clone()).expect_err("rejected");
+        let err = parse_internal(argv.clone()).expect_err("rejected");
         assert!(
             matches!(
                 err.kind(),
@@ -145,7 +146,7 @@ fn an_unknown_word_is_rejected() {
 #[test]
 fn the_mode_flag_names_every_mode_like_the_alias_does() {
     for argv in [DAEMON, BOTH, STORAGE, CONVERGED, FRONTEND] {
-        let alias = parse_from(argv.iter().map(|w| (*w).to_owned())).expect("alias form");
+        let alias = parse_internal(argv.iter().map(|w| (*w).to_owned())).expect("alias form");
         let mode = argv[1];
         let flags: Vec<String> = argv[2..].iter().map(|f| (*f).to_owned()).collect();
         for form in [
@@ -162,7 +163,7 @@ fn the_mode_flag_names_every_mode_like_the_alias_does() {
                 if flags.is_empty() && mode == names::STORAGE {
                     continue; // `kbf --mode=storage` alone reads kbf.toml (below)
                 }
-                let got = parse_from(argv.clone()).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                let got = parse_internal(argv.clone()).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
                 assert_eq!(format!("{got:?}"), format!("{alias:?}"), "{argv:?}");
             }
         }
@@ -188,7 +189,7 @@ fn the_mode_flag_names_every_mode_like_the_alias_does() {
 /// the file; a start that gives mode flags is never one.
 #[test]
 fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
-    let registered = |argv: &[&str]| match parse_from(argv.iter().copied()) {
+    let registered = |argv: &[&str]| match parse_internal(argv.iter().copied()) {
         Ok(Invocation::Registered(start)) => Some(*start),
         _ => None,
     };
@@ -234,7 +235,7 @@ fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
     // The old units: the alias on its own flags, or on none, is the old start.
     assert!(registered(&["kbf", "storage"]).is_none());
     assert!(matches!(
-        parse_from(["kbf", "storage"]),
+        parse_internal(["kbf", "storage"]),
         Ok(Invocation::Storage(_))
     ));
     assert!(registered(&["kbf", "daemon"]).is_none());
@@ -256,7 +257,7 @@ fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
             let mut argv = vec!["kbf".to_owned(), format!("--mode={mode}")];
             argv.extend(flags.iter().map(|f| (*f).to_owned()));
             assert!(
-                !matches!(parse_from(argv.clone()), Ok(Invocation::Registered(_))),
+                !matches!(parse_internal(argv.clone()), Ok(Invocation::Registered(_))),
                 "{argv:?}"
             );
         }
@@ -274,7 +275,11 @@ fn help_lists_the_modes_under_the_mode_flag_and_no_commands() {
         assert!(help.contains(flag), "{flag}: {help}");
     }
     assert!(!help.contains("--label"), "{help}");
-    let named: Vec<&str> = MODES.iter().map(|m| m.name).collect();
+    let named: Vec<&str> = MODES
+        .iter()
+        .map(|m| m.name)
+        .filter(|name| *name != names::ALL_IN_ONE)
+        .collect();
     let cmd = command();
     let values = cmd
         .get_arguments()
@@ -282,15 +287,17 @@ fn help_lists_the_modes_under_the_mode_flag_and_no_commands() {
         .expect("--mode")
         .get_possible_values()
         .iter()
+        .filter(|v| !v.is_hide_set())
         .map(|v| v.get_name().to_owned())
         .collect::<Vec<_>>();
     assert_eq!(values, named);
+    assert!(!help.contains("all-in-one"), "{help}");
     assert!(help.contains("kbf cluster"), "{help}");
     // A mode's own help is reached by the flag form and shows it.
-    let e = parse_from(["kbf", "--mode=storage", "--help"]).expect_err("help");
+    let e = parse_internal(["kbf", "--mode=storage", "--help"]).expect_err("help");
     assert_eq!(e.kind(), ErrorKind::DisplayHelp);
     assert!(e.to_string().contains("kbf --mode=storage"), "{e}");
-    let e = parse_from(["kbf", "--help"]).expect_err("help");
+    let e = parse_internal(["kbf", "--help"]).expect_err("help");
     assert_eq!(e.kind(), ErrorKind::DisplayHelp);
     // The hidden aliases are listed by nothing.
     assert!(
@@ -376,7 +383,7 @@ fn each_mode_refuses_the_flags_of_another() {
 #[test]
 fn only_the_scheduling_modes_take_a_state_store() {
     let sqlite = with(BOTH, &["--state-store=sqlite:///var/lib/kbf/state.db"]);
-    let both = parse_from(sqlite).expect("all-in-one");
+    let both = parse_internal(sqlite).expect("all-in-one");
     let path = std::path::PathBuf::from("/var/lib/kbf/state.db");
     assert!(matches!(&both, Invocation::AllInOne(flags)
         if flags.server.state_store == Some(kbf_server::StateStoreUri::Sqlite(path.clone()))));
@@ -387,10 +394,10 @@ fn only_the_scheduling_modes_take_a_state_store() {
     ));
     assert!(postgres.contains("must carry no password"), "{postgres}");
     assert!(!postgres.contains("hunter2"), "{postgres}");
-    let default = parse_from(with(BOTH, &[])).expect("all-in-one");
+    let default = parse_internal(with(BOTH, &[])).expect("all-in-one");
     assert!(matches!(&default, Invocation::AllInOne(flags)
         if flags.server.state_store == Some(kbf_server::StateStoreUri::local_postgres())));
-    let front = parse_from(with(
+    let front = parse_internal(with(
         FRONTEND,
         &["--state-store=sqlite:///var/lib/kbf/state.db"],
     ))
@@ -608,14 +615,14 @@ fn the_modes_parse_as_the_old_binaries_do() {
     let alias =
         <kbf_node::Cli as clap::Parser>::try_parse_from(with(&["kbf-daemon"], &DAEMON[2..]))
             .expect("alias");
-    let inv = parse_from(with(DAEMON, &[])).expect("daemon");
+    let inv = parse_internal(with(DAEMON, &[])).expect("daemon");
     assert!(matches!(&inv, Invocation::Daemon(cli) if format!("{alias:?}") == format!("{cli:?}")));
 
     let matches = kbf_all_in_one::cli::command()
         .try_get_matches_from(with(&["kbf-all-in-one"], &BOTH[2..]))
         .expect("alias");
     let alias = kbf_all_in_one::cli::parse(&matches).expect("alias flags");
-    let inv = parse_from(with(BOTH, &[])).expect("both");
+    let inv = parse_internal(with(BOTH, &[])).expect("both");
     assert!(
         matches!(&inv, Invocation::AllInOne(flags) if format!("{alias:?}") == format!("{flags:?}"))
     );
@@ -628,7 +635,7 @@ fn help_and_version_are_not_errors() {
         vec!["kbf", "--version"],
         vec!["kbf", "all-in-one", "--help"],
     ] {
-        let e = parse_from(argv).expect_err("an exit");
+        let e = parse_internal(argv).expect_err("an exit");
         assert!(matches!(
             e.kind(),
             ErrorKind::DisplayVersion | ErrorKind::DisplayHelp
@@ -687,7 +694,7 @@ fn a_refusal_comes_before_a_missing_required_flag() {
 }
 
 fn check(argv: &[&str]) -> Result<(), String> {
-    parse_from(argv.iter().copied())
+    parse_internal(argv.iter().copied())
         .map(drop)
         .map_err(|e| e.to_string())
 }
@@ -724,7 +731,7 @@ fn the_parser_takes_a_modes_own_command_line() {
         ("--help", ErrorKind::DisplayHelp),
         ("--version", ErrorKind::DisplayVersion),
     ] {
-        let e = parse_from(["kbf", word]).expect_err("prints and starts nothing");
+        let e = parse_internal(["kbf", word]).expect_err("prints and starts nothing");
         assert_eq!(e.kind(), kind, "{word}");
     }
 }
@@ -845,7 +852,7 @@ fn a_frontend_has_no_store_and_none_of_a_storage_nodes_listener() {
             "--storage-ca=/a",
         ],
     );
-    let parsed = parse_from(tls).expect("frontend with TLS");
+    let parsed = parse_internal(tls).expect("frontend with TLS");
     assert!(matches!(&parsed, Invocation::Frontend(flags)
         if flags.tls.as_ref().is_some_and(|t| t.iter().map(|p| p.display().to_string()).eq(["/c", "/k", "/a"]))));
 }
@@ -965,4 +972,55 @@ fn the_parser_takes_the_mode_flag_and_the_file_flags() {
     for word in ["node", "enroll"] {
         assert!(check(&["kbf", word]).is_err(), "{word}");
     }
+}
+
+/// Catches a way of asking for `all-in-one` that the parser lets through: the flag with its
+/// value in one word or two, the hidden word, the flag after other flags, and
+/// `mode = "all-in-one"` in the file, each fails with the one message, and a mode that only
+/// contains the word is not taken for it.
+#[test]
+fn every_way_to_ask_for_all_in_one_is_refused_with_the_message() {
+    for argv in [
+        vec!["kbf", "--mode=all-in-one"],
+        vec!["kbf", "--mode", "all-in-one"],
+        vec!["kbf", "all-in-one"],
+        vec!["kbf", "all-in-one", "--help"],
+        vec!["kbf", "--check", "--mode=all-in-one"],
+        vec!["kbf", "--mode=all-in-one", "--listen=127.0.0.1:0"],
+    ] {
+        let e = parse_from(argv.clone()).expect_err("refused");
+        assert_eq!(e.kind(), ErrorKind::InvalidValue, "{argv:?}");
+        assert_eq!(e.exit_code(), 2, "{argv:?}");
+        assert!(e.to_string().contains(ALL_IN_ONE_REMOVED), "{argv:?}: {e}");
+    }
+    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-cli-lib-aio");
+    let file = dir.join("kbf.toml");
+    std::fs::write(&file, "mode = \"all-in-one\"\n").expect("kbf.toml");
+    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+        .expect("mode");
+    let e = parse_with(["kbf"], Some(file.as_path())).expect_err("refused");
+    assert_eq!(e.exit_code(), 2);
+    assert!(e.to_string().contains(ALL_IN_ONE_REMOVED), "{e}");
+    // A flag overrides the file, so a file that holds the removed mode does not stop a start
+    // that names another.
+    assert!(parse_with(["kbf", "--mode=storage"], Some(file.as_path())).is_ok());
+}
+
+/// Catches a text that does not say what replaces the mode, and a refusal of a mode that is
+/// not there that lists `all-in-one` among the choices.
+#[test]
+fn the_message_names_the_replacement_and_no_list_offers_all_in_one() {
+    for word in [
+        "removed",
+        "--mode=frontend",
+        "--mode=storage-and-daemon",
+        "docs/deploy/kbf-modes.md",
+    ] {
+        assert!(ALL_IN_ONE_REMOVED.contains(word), "{word}");
+    }
+    let e = error(vec!["kbf".into(), "--mode=nonsense".into()]);
+    assert!(
+        e.contains("possible values") && !e.contains("all-in-one"),
+        "{e}"
+    );
 }

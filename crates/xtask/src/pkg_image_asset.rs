@@ -3,7 +3,7 @@
 //! frontend or coordinator image as a release asset, `kbf-frontend-image-<commit>-<platform>.oci.tar`
 //! or `kbf-coordinator-image-<commit>-<platform>.oci.tar`, and the checks that tie it to the
 //! bytes the attestation covers. The image is an OCI image layout in one tar (what `docker buildx build
-//! --output type=oci` writes); `docker image load` and `ctr images import` read it.
+//! --output type=docker,oci-mediatypes=true` writes); `docker image load` and `ctr images import` read it.
 //!
 //! The image is opened (its `index.json`, the manifest, the config and the layers it names, each
 //! blob checked against the digest that names it) and refused unless:
