@@ -46,11 +46,15 @@ pub enum PeerRole {
     Storage,
     /// A build node.
     Daemon,
+    /// A host's updater: it dials the update coordinator, and calls the frontend (through
+    /// the proxy) for its own node only. Its certificate also names the host's role
+    /// (`urn:kbf:host-role:<name>`, read with [`uri_values_of`]).
+    Updater,
 }
 
 impl PeerRole {
-    /// Every role, in the order section 9 lists them.
-    pub const ALL: [Self; 3] = [Self::Frontend, Self::Storage, Self::Daemon];
+    /// Every role, in the order section 9 lists them, then the updater.
+    pub const ALL: [Self; 4] = [Self::Frontend, Self::Storage, Self::Daemon, Self::Updater];
 
     /// The name a certificate spells after [`ROLE_URI_PREFIX`].
     #[must_use]
@@ -59,6 +63,7 @@ impl PeerRole {
             Self::Frontend => "frontend",
             Self::Storage => "storage",
             Self::Daemon => "daemon",
+            Self::Updater => "updater",
         }
     }
 

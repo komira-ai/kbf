@@ -606,3 +606,36 @@ fn only_a_table_wholly_enrollments_is_its_own() {
         assert!(!is_own_table(not_own), "{not_own:?}");
     }
 }
+
+/// An updater's settings are what a node's file gives for the four keys it names, and the
+/// defaults for the rest: no advertise address, no zone, the pin, no mode.
+#[test]
+fn an_updaters_config_is_the_four_values_and_the_defaults() {
+    let url = FrontendUrl {
+        host: HostName::Dns("frontend.example".to_owned()),
+        port: 443,
+    };
+    let config = Config::updater(
+        url.clone(),
+        "host-1".parse().unwrap(),
+        PathBuf::from("/var/lib/kbf-updater/token"),
+        PathBuf::from("/var/lib/kbf-updater"),
+    );
+    assert_eq!(config.frontend, url);
+    assert_eq!(config.node_id.as_str(), "host-1");
+    assert_eq!(
+        config.token_file,
+        PathBuf::from("/var/lib/kbf-updater/token")
+    );
+    assert_eq!(config.state_dir, PathBuf::from("/var/lib/kbf-updater"));
+    assert_eq!(config.trust, Trust::Pin);
+    assert_eq!(
+        (&config.mode, &config.advertise, config.zone.as_str()),
+        (&None, &None, "")
+    );
+    assert!(
+        config
+            .role_warnings(RoleSet::new([kbf_types::Role::Updater]).unwrap())
+            .is_empty()
+    );
+}

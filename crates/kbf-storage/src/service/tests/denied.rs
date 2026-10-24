@@ -136,7 +136,14 @@ async fn a_listed_certificate_is_refused_on_every_method_and_the_role_comes_firs
         let generation = call(Endpoint::FindMissing, &channel)
             .await
             .expect_err("a caller with no generation is behind the node's");
-        assert_eq!(generation.code(), Code::FailedPrecondition, "{role}");
+        // A role the endpoint takes is judged next on its generation; a role it does not take
+        // (a host's updater, which no storage endpoint serves) is refused for its role.
+        let want = if expected(Endpoint::FindMissing).contains(&role.name()) {
+            Code::FailedPrecondition
+        } else {
+            Code::PermissionDenied
+        };
+        assert_eq!(generation.code(), want, "{role}");
     }
 }
 

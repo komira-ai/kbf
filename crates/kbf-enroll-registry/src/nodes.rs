@@ -2,7 +2,7 @@
 
 use kbf_map::DenyEntry;
 use kbf_state::{Cond, Store, Txn};
-use kbf_types::{NodeId, RoleSet};
+use kbf_types::{HostRole, NodeId, RoleSet};
 use prost::Message as _;
 
 use crate::ATTEMPTS;
@@ -95,6 +95,22 @@ pub fn list_nodes(store: &dyn Store) -> Result<Vec<NodeInfo>, RegistryError> {
 pub fn node_state(store: &dyn Store, id: &NodeId) -> Result<Option<NodeState>, RegistryError> {
     let read = rows::fetch::<NodeRow>(store, &rows::node_key(id), "node")?;
     Ok(read.map(|read| state_of(&read.row)).transpose()?)
+}
+
+/// What the host `id` runs, as its updater enrolled: `None` for an id that has no updater
+/// row. A renewal asks it, to issue the certificate the host already holds.
+///
+/// # Errors
+/// The store failing; a row that does not decode.
+pub fn updater_host_role(
+    store: &dyn Store,
+    id: &NodeId,
+) -> Result<Option<HostRole>, RegistryError> {
+    let read = rows::fetch::<NodeRow>(store, &rows::updater_key(id), "node")?;
+    Ok(read
+        .map(|read| crate::tokens::host_role_of(read.row.host_role.as_deref(), "node"))
+        .transpose()?
+        .flatten())
 }
 
 /// The `deny/` keys that end a node's certificates: its unexpired serials (current and

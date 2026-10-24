@@ -251,6 +251,7 @@ fn check_policy(
 fn replay(
     store: &dyn Store,
     req: &EnrollRequest<'_>,
+    roles: RoleSet,
     csr_hash: &[u8; 32],
     now: u64,
 ) -> Result<Option<Enrolled>, Fail> {
@@ -261,7 +262,8 @@ fn replay(
     if owner.row.node_id != req.node_id.as_str() {
         return Err(RefusalReason::MalformedRequest.into());
     }
-    let Some(node) = rows::fetch::<NodeRow>(store, &rows::node_key(req.node_id), "node")? else {
+    let key = rows::row_key(roles, req.node_id);
+    let Some(node) = rows::fetch::<NodeRow>(store, &key, "node")? else {
         return Ok(None);
     };
     let certs = stored_certs(&node.row)?;
@@ -296,6 +298,9 @@ fn attempt(
 ) -> Result<Enrolled, Fail> {
     let roles = RoleSet::new(req.csrs.iter().map(|(role, _)| *role))
         .map_err(|_| RefusalReason::BadRoles)?;
+    if roles.mixes_updater() {
+        return Err(RefusalReason::BadRoles.into());
+    }
     let host_port = advertise_of(roles, req.advertise)?;
     let csr_hash = request_hash(req.csrs);
     for _ in 0..ATTEMPTS {
@@ -321,12 +326,12 @@ fn decide_and_commit(
     let now = rows::seconds(store.now());
     let token = rows::fetch::<TokenRow>(store, &rows::token_key(req.token_id), "token")?;
     let token = verify_secret(token, req.secret)?;
-    if let Some(done) = replay(store, req, csr_hash, now)? {
+    if let Some(done) = replay(store, req, roles, csr_hash, now)? {
         return Ok(Some(done));
     }
     check_policy(&token.row, now, roles, req.node_id, host_port)?;
 
-    let node_key = rows::node_key(req.node_id);
+    let node_key = rows::row_key(roles, req.node_id);
     let existing = rows::fetch::<NodeRow>(store, &node_key, "node")?;
     let (node_cond, replaced) = match existing {
         None => (Cond::Absent, None),
@@ -370,6 +375,11 @@ fn decide_and_commit(
         token_label: token.row.label.clone(),
         state: STATE_ACTIVE,
         created_at: now,
+        host_role: token
+            .row
+            .host_role
+            .clone()
+            .filter(|_| roles.contains(Role::Updater)),
         ..NodeRow::default()
     };
     let ttl = std::time::Duration::from_secs(token.row.expires_at.saturating_sub(now) + 24 * 3600);

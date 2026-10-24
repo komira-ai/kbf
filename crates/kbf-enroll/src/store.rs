@@ -295,6 +295,17 @@ impl Store {
         Ok(Self { pki })
     }
 
+    /// The store of `state_dir` without touching the file system: the paths of its files
+    /// ([`Store::key_path`], [`Store::cert_path`], [`Store::ca_path`]), for a caller that names
+    /// them in a flag before anything runs. Reading or writing through it checks nothing
+    /// about the directories; [`Store::open`] does.
+    #[must_use]
+    pub fn unopened(state_dir: &Path) -> Self {
+        Self {
+            pki: state_dir.join(PKI),
+        }
+    }
+
     fn staging(&self) -> PathBuf {
         self.pki.join(STAGING)
     }

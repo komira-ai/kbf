@@ -20,6 +20,7 @@ mod reload;
 mod remote;
 mod routing;
 mod secure;
+mod self_node;
 mod sni;
 mod ui;
 mod wait_term;

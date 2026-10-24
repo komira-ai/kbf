@@ -120,9 +120,22 @@ fn flags_that_are_missing_or_wrong_are_refused_by_name() {
         let mut words = args(&REQUIRED);
         words.drain(position..position + 2);
         let err = parse_flags(&words).unwrap_err();
-        assert_eq!(err, format!("{flag} is required"));
+        if ["--client-cert", "--client-key", "--ca"].contains(flag) {
+            assert!(
+                err.starts_with("give --state-dir, or all of"),
+                "{flag}: {err}"
+            );
+        } else {
+            assert_eq!(err, format!("{flag} is required"));
+        }
     }
-    let cases: [(&[&str], &str); 10] = [
+    let cases: [(&[&str], &str); 13] = [
+        (&["--frontend", "203.0.113.5:443"], "--frontend:"),
+        (&["--frontend", "frontend"], "--frontend:"),
+        (
+            &["--state-dir", "/var/lib/kbf-updater"],
+            "give --state-dir, or all of",
+        ),
         (&["--retry-secs"], "--retry-secs needs a value"),
         (&["--ca", "/other"], "--ca is given twice"),
         (&["--nope", "1"], "unknown argument --nope"),
@@ -175,4 +188,63 @@ fn the_operator_credential_is_given_whole_or_not_at_all() {
         let err = parse_flags(&with(half)).unwrap_err();
         assert!(err.contains("given together"), "{half:?}: {err}");
     }
+}
+
+const STATE: [&str; 6] = [
+    "--coordinator",
+    "coordinator.farm.example:8443",
+    "--channel",
+    "stable",
+    "--state-dir",
+    "/var/lib/kbf-updater",
+];
+
+/// With `--state-dir` the certificate, the key and the CA are the files the enrollment wrote
+/// there, and the agent renews them at the frontend it was told; nothing is placed by hand.
+#[test]
+fn a_state_directory_names_the_files_and_the_frontend_renews_them() {
+    let mut words = args(&STATE);
+    words.extend(args(&["--frontend", "frontend.farm.example:443"]));
+    let config = parse_flags(&words).unwrap();
+    assert_eq!(
+        config.state_dir,
+        Some(PathBuf::from("/var/lib/kbf-updater"))
+    );
+    assert_eq!(
+        config.files.cert,
+        PathBuf::from("/var/lib/kbf-updater/pki/updater.pem")
+    );
+    assert_eq!(
+        config.files.key,
+        PathBuf::from("/var/lib/kbf-updater/pki/updater.key")
+    );
+    assert_eq!(
+        config.files.ca,
+        PathBuf::from("/var/lib/kbf-updater/pki/ca.pem")
+    );
+    let frontend = config.frontend.unwrap();
+    assert_eq!(
+        (frontend.host.as_str(), frontend.port),
+        ("frontend.farm.example", 443)
+    );
+    assert_eq!(config.node_api, None, "no token, as shipped");
+}
+
+/// A state directory without a frontend would be a certificate nothing renews, and files placed
+/// by hand beside a state directory would be two answers to where the certificate is: both are
+/// refused. A frontend alone, with placed files, is the drain without a renewal.
+#[test]
+fn the_state_directory_goes_with_the_frontend_and_not_with_placed_files() {
+    let err = parse_flags(&args(&STATE)).unwrap_err();
+    assert_eq!(
+        err,
+        "--state-dir needs --frontend: the certificate is renewed there"
+    );
+    let mut both = args(&STATE);
+    both.extend(args(&["--frontend", "f.example:443"]));
+    both.extend(args(&["--ca", "/etc/kbf/updater/ca.pem"]));
+    let err = parse_flags(&both).unwrap_err();
+    assert!(err.starts_with("give --state-dir, or all of"), "{err}");
+    let placed = parse_flags(&with(&["--frontend", "f.example:443"])).unwrap();
+    assert_eq!((placed.state_dir, placed.frontend.is_some()), (None, true));
 }

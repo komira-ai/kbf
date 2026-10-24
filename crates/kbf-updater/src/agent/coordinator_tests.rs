@@ -36,7 +36,7 @@ fn beat() -> Heartbeat {
 
 /// What the server does with a request.
 #[derive(Clone, Debug)]
-enum Plan {
+pub(super) enum Plan {
     /// Write these bytes and close properly.
     Say(Vec<u8>),
     /// Write these bytes and drop the connection with no TLS close.
@@ -50,15 +50,15 @@ enum Plan {
 
 /// What the server saw of one connection.
 #[derive(Debug, Default)]
-struct Seen {
+pub(super) struct Seen {
     /// The request, head and body, as bytes; none when the handshake failed.
-    request: Vec<u8>,
+    pub(super) request: Vec<u8>,
     /// The client's certificate, DER.
-    client: Option<Vec<u8>>,
-    handshake_failed: bool,
+    pub(super) client: Option<Vec<u8>>,
+    pub(super) handshake_failed: bool,
 }
 
-fn server_config(pki: &Pki, leaf: &Leaf) -> Arc<ServerConfig> {
+pub(super) fn server_config(pki: &Pki, leaf: &Leaf) -> Arc<ServerConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut roots = RootCertStore::empty();
     roots
@@ -82,7 +82,10 @@ fn server_config(pki: &Pki, leaf: &Leaf) -> Arc<ServerConfig> {
 
 /// Serve connections: `answers` gives the bytes to write back for each request in turn (none
 /// to say nothing and wait), and the server ends after the last. Each connection's `Seen`.
-fn serve(config: Arc<ServerConfig>, answers: Vec<Plan>) -> (SocketAddr, JoinHandle<Vec<Seen>>) {
+pub(super) fn serve(
+    config: Arc<ServerConfig>,
+    answers: Vec<Plan>,
+) -> (SocketAddr, JoinHandle<Vec<Seen>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = std::thread::spawn(move || {
@@ -154,7 +157,7 @@ fn one(config: &Arc<ServerConfig>, tcp: TcpStream, answer: Plan) -> Seen {
     seen
 }
 
-fn http(status: &str, headers: &str, body: &str) -> Plan {
+pub(super) fn http(status: &str, headers: &str, body: &str) -> Plan {
     Plan::Say(
         format!(
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}\
@@ -165,7 +168,7 @@ fn http(status: &str, headers: &str, body: &str) -> Plan {
     )
 }
 
-fn ok(body: &str) -> Plan {
+pub(super) fn ok(body: &str) -> Plan {
     http("200 OK", "", body)
 }
 

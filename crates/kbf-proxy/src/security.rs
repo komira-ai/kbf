@@ -10,12 +10,15 @@ use std::time::Instant;
 use http::{HeaderMap, Method, Uri};
 use kbf_oidc::Verified;
 
+use kbf_peer::PeerRole;
+
 use crate::auth::{
     Buck2Auth, FailureLimit, Presented, Refusal, Tokens, bearer_of, checks_token, decide,
+    decide_updater,
 };
 use crate::identity::{Identity, ProxySecret};
 use crate::remote::RemoteCi;
-use crate::route::AuthClass;
+use crate::route::{AuthClass, self_node_of};
 
 /// The mode, the tokens, the secret the children are told and the limit on wrong tokens.
 #[derive(Debug)]
@@ -35,6 +38,9 @@ pub(crate) enum Admitted {
     Credential,
     /// A CI job's OIDC token, for one of the two calls of [`crate::remote::ROUTES`].
     Ci(Verified),
+    /// A host updater's certificate, for a call about its own node (the node's id): the
+    /// caller puts the operator token in place of whatever the host sent.
+    SelfNode(String),
 }
 
 impl Security {
@@ -72,6 +78,14 @@ impl Security {
         ip: IpAddr,
         now: Instant,
     ) -> Result<Admitted, Refusal> {
+        if let Some(updater) = identity.filter(|id| id.role == PeerRole::Updater) {
+            let own = self_node_of(call.0, call.1);
+            decide_updater(class, &updater.node_id, own)?;
+            return Ok(match (class, own) {
+                (AuthClass::Operator, Some(node)) => Admitted::SelfNode(node.to_owned()),
+                _ => Admitted::Credential,
+            });
+        }
         if let (Some(remote), AuthClass::Operator | AuthClass::Update, Some(bearer)) =
             (&self.remote, class, bearer_of(headers))
             && RemoteCi::allows(call.0, call.1)

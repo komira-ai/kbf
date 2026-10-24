@@ -235,20 +235,25 @@ async fn admit(
             now(),
         )
         .await;
-    let who = match verdict {
+    match verdict {
         Ok(Admitted::Credential) => return Ok(()),
-        Ok(Admitted::Ci(who)) => who,
+        Ok(Admitted::Ci(who)) => {
+            tracing::info!(jti = %who.jti, workflow = %who.job_workflow_ref,
+                git_ref = ?who.git_ref, sha = ?who.sha, path = request.uri().path(),
+                "remote ci: admitted");
+        }
+        Ok(Admitted::SelfNode(node)) => {
+            tracing::info!(%node, method = %request.method(), path = request.uri().path(),
+                "host updater: admitted for its own node");
+        }
         Err(refusal) => {
             Metrics::inc(&core.metrics.auth_refused);
             return Err(Box::new(refused(route.grpc(), refusal)));
         }
-    };
-    tracing::info!(jti = %who.jti, workflow = %who.job_workflow_ref,
-        git_ref = ?who.git_ref, sha = ?who.sha, path = request.uri().path(),
-        "remote ci: admitted");
+    }
     // A call for the child carries the operator token from here on: the child's gate takes no
-    // other credential, and the OIDC token goes no further than this proxy. The update API is
-    // the proxy's own.
+    // other credential, and the OIDC token (or whatever a host updater sent) goes no further
+    // than this proxy. The update API is the proxy's own.
     if route != Route::Update {
         let operator = security
             .tokens

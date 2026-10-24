@@ -299,6 +299,7 @@ async fn the_secret_is_in_the_create_response_only() {
     let mut want = vec![
         "id",
         "roles",
+        "host_role",
         "max_uses",
         "uses",
         "expires_at",
@@ -590,6 +591,14 @@ async fn a_bad_create_is_refused_and_stores_nothing() {
         format!(r#"{{"roles":["daemon"],"expires_in":{}}}"#, 30 * day + 1),
         r#"{"roles":["daemon"],"node_id":"Bad_ID"}"#.to_owned(),
         r#"{"roles":["daemon"],"max_use":3}"#.to_owned(),
+        // An updater's token names its host role, its one node, and has one use; the host
+        // role goes with no other role.
+        r#"{"roles":["updater"],"node_id":"n7"}"#.to_owned(),
+        r#"{"roles":["updater"],"host_role":"daemon"}"#.to_owned(),
+        r#"{"roles":["updater"],"host_role":"nope","node_id":"n7"}"#.to_owned(),
+        r#"{"roles":["updater"],"host_role":"daemon","node_id":"n7","max_uses":2}"#.to_owned(),
+        r#"{"roles":["updater","daemon"],"host_role":"daemon","node_id":"n7"}"#.to_owned(),
+        r#"{"roles":["daemon"],"host_role":"daemon"}"#.to_owned(),
     ];
     for body in bodies {
         let (code, answer) = text(ok(&state, &Route::Create(body.clone())).await).await;
@@ -612,6 +621,23 @@ async fn a_bad_create_is_refused_and_stores_nothing() {
     assert_eq!(info.names, [".example"]);
     assert!(info.replace);
     assert_eq!(info.created_by, "operator-api");
+
+    let updater = make(
+        &state,
+        r#"{"roles":["updater"],"host_role":"mac-daemon","node_id":"host-3"}"#,
+    )
+    .await;
+    assert_eq!(updater.info.roles, ["updater"]);
+    assert_eq!(updater.info.host_role.as_deref(), Some("mac-daemon"));
+    assert_eq!(updater.info.node_id.as_deref(), Some("host-3"));
+    assert_eq!(updater.info.max_uses, 1);
+    let (_, list): (_, TokenList) = json(ok(&state, &Route::List).await).await;
+    let listed = list
+        .tokens
+        .iter()
+        .find(|t| t.id == updater.info.id)
+        .expect("listed");
+    assert_eq!(listed.host_role.as_deref(), Some("mac-daemon"));
 }
 
 // Catches a token stored before the pin or the randomness is known (a row whose string
