@@ -3,8 +3,8 @@
 //! Two clones of the base boot at once, one headless and one (with `--graphics`) with a
 //! graphics device. For the whole guest wait the host records every helper event with
 //! its time, samples the helper's CPU, the framework's VM service processes and the
-//! clone's disk allocation, and watches for the marker a launch daemon of the guest
-//! writes into the share. With `--keep` the clones stay, and `image harvest` then reads
+//! clone's disk allocation, and watches for the first frame a launch daemon of the guest
+//! delivers (a ready marker or a probe result; the report names which). With `--keep` the clones stay, and `image harvest` then reads
 //! the guest's own logs off their disks. `docs/spikes/macos-vm-probe.md` maps each
 //! outcome to a cause.
 
@@ -31,12 +31,28 @@ struct Arm {
     /// The matrix shares of this VM (empty without `--matrix`).
     matrix: Vec<Prepared>,
     samples: Vec<Sample>,
-    marker_ms: Option<u64>,
+    /// The first frame the guest delivered, and when.
+    marker: Option<(&'static str, u64)>,
 }
 
+/// What the guest delivers over vsock, in the order it is looked for. Any one proves that
+/// the guest's userspace ran and the vsock path works; the system marker alone is not
+/// enough, because that job can fail to start on its own (the fifth Studio run).
+const MARKERS: [&str; 4] = [
+    guest::READY_SYSTEM,
+    guest::READY_LOGIN,
+    guest::ROOT_RESULT,
+    guest::USER_RESULT,
+];
+
 impl Arm {
-    fn marker(&self) -> PathBuf {
-        self.share.results().join(guest::READY_SYSTEM)
+    /// The first of [`MARKERS`] in the results directory. Existence only, without
+    /// following a link the guest may have left.
+    fn delivered(&self) -> Option<&'static str> {
+        let dir = self.share.results();
+        MARKERS
+            .into_iter()
+            .find(|m| std::fs::symlink_metadata(dir.join(m)).is_ok())
     }
 }
 
@@ -97,7 +113,7 @@ fn start_arm(ctx: &Ctx<'_>, name: &str, graphics: bool) -> Result<(Vm, Arm), Str
             share,
             matrix: shares,
             samples: Vec::new(),
-            marker_ms: None,
+            marker: None,
         },
     ))
 }
@@ -129,21 +145,20 @@ fn observe(ctx: &Ctx<'_>, vms: &mut [Vm], arms: &mut [Arm]) -> Option<String> {
             next += ctx.timing.sample_every;
         }
         for (vm, arm) in vms.iter_mut().zip(arms.iter_mut()) {
-            if arm.marker_ms.is_some() {
+            if arm.marker.is_some() {
                 continue;
             }
             if vm.ended.is_none() {
                 vm.watch(ctx.timing.tick, ctx.timing.tick, false);
             }
-            // Existence only, without following a link the guest may have left.
-            if std::fs::symlink_metadata(arm.marker()).is_ok() {
-                arm.marker_ms = Some(vm.ms());
+            if let Some(name) = arm.delivered() {
+                arm.marker = Some((name, vm.ms()));
             }
         }
         let settled = vms
             .iter()
             .zip(arms.iter())
-            .all(|(vm, arm)| arm.marker_ms.is_some() || vm.ended.is_some());
+            .all(|(vm, arm)| arm.marker.is_some() || vm.ended.is_some());
         if settled || began.elapsed() >= ctx.timing.guest_timeout {
             break;
         }
@@ -159,7 +174,8 @@ fn arm_json(ctx: &Ctx<'_>, vm: &Vm, arm: &Arm) -> Value {
         "share": arm.share.dir,
         "started_ms": vm.started_ms(),
         "stayed_up": vm.started_ms().is_some() && vm.ended.is_none(),
-        "guest_marker_ms": arm.marker_ms,
+        "guest_marker": arm.marker.map(|(name, _)| name),
+        "guest_marker_ms": arm.marker.map(|(_, ms)| ms),
         "trace": vm.trace_json(),
         "samples": arm.samples.iter().map(Sample::json).collect::<Vec<_>>(),
         "activity": sampler::summarize(&arm.samples),
@@ -185,7 +201,10 @@ fn one_line(arm: &Value) -> String {
             "headless"
         },
         arm["started_ms"],
-        arm["guest_marker_ms"],
+        match arm["guest_marker"].as_str() {
+            Some(name) => format!("{name} at {}", arm["guest_marker_ms"]),
+            None => "none".to_owned(),
+        },
         arm["activity"]["disk_blocks_512_grown"],
         arm["trace"]["ended"],
     )
@@ -390,6 +409,35 @@ mod tests {
         assert!(y["guest_marker_ms"].is_u64());
         assert_eq!(y["results_files"], json!([guest::READY_SYSTEM]));
         assert!(r.summary.expect("summary").contains("the VM stopped"));
+    }
+
+    /// Catches a guest marker that rests on the system job alone: the fifth Studio run had
+    /// a headless guest deliver the login marker and both probe results while its system
+    /// job never started, and the arm was reported silent. Any frame the guest delivers
+    /// proves its userspace ran, and the report names which one arrived first.
+    #[test]
+    fn any_frame_the_guest_delivers_is_its_marker_and_the_report_names_it() {
+        let work = work_with_base("e1-any-marker");
+        let sys = FakeSystem::new();
+        sys.script(Script::booted().with_guest_file(guest::READY_LOGIN, "{}"));
+        sys.script(Script::booted().with_guest_file(guest::USER_RESULT, "{}"));
+        let r = e1(&guest_ctx(&sys, &work));
+        assert_eq!(arm(&r, 0)["guest_marker"], guest::READY_LOGIN);
+        assert!(arm(&r, 0)["guest_marker_ms"].is_u64());
+        assert_eq!(arm(&r, 1)["guest_marker"], guest::USER_RESULT);
+        assert!(arm(&r, 1)["guest_marker_ms"].is_u64());
+        let summary = r.summary.expect("summary");
+        assert!(summary.contains("marker ready-login"), "{summary}");
+        assert!(
+            summary.contains("marker guest-probe-user.json"),
+            "{summary}"
+        );
+        let work = work_with_base("e1-other-file");
+        let sys = FakeSystem::new();
+        sys.script(Script::booted().with_guest_file("vsock-test.log", "x"));
+        let r = e1(&guest_ctx(&sys, &work));
+        assert!(arm(&r, 0)["guest_marker"].is_null());
+        assert!(arm(&r, 0)["guest_marker_ms"].is_null());
     }
 
     /// Catches an arm that has already written its marker being watched (and its helper

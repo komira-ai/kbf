@@ -38,7 +38,8 @@ pub const AUTOMOUNT_TAG: &str = "com.apple.virtio-fs.automount";
 pub const SHARE_TAG: &str = "kbfshare";
 /// Where the offline write puts a copy of `kbf-guest` on the guest's own disk (inside the
 /// Data volume, without a leading slash: [`BOOTSTRAP_OFFLINE`]). The mount daemon runs
-/// it, because the copy on the share cannot be reached before the share is mounted.
+/// it, and so does every probe daemon, because the copy on the share cannot be reached
+/// before the share is mounted (launchd checks a job's program path when it loads the job).
 pub const BOOTSTRAP: &str = "/usr/local/libexec/kbf-guest";
 const BOOTSTRAP_OFFLINE: &str = "usr/local/libexec/kbf-guest";
 /// How many times the mount daemon tries the mount, and the pause between two tries. After
@@ -283,8 +284,11 @@ pub fn daemon_plist(
     )
 }
 
+/// The command of a probe daemon: the copy of `kbf-guest` on the guest's own disk. launchd
+/// checks the program path when it loads a job, and the share is not mounted yet then; a
+/// job whose program is on the share can fail to start and never run again.
 fn guest_args(sub: &[&str]) -> Vec<String> {
-    let mut v = vec![format!("{GUEST_SHARE}/{GUEST_BIN}")];
+    let mut v = vec![BOOTSTRAP.to_owned()];
     v.extend(sub.iter().map(|s| (*s).to_owned()));
     v
 }
@@ -575,11 +579,15 @@ mod tests {
             login.contains(READY_LOGIN)
         ]));
         assert!(files.iter().all(|f| f.mode == 0o644 || f.path == paths[2]));
-        // The daemons run the binary from, and wait for, the paths the mounter provides.
+        // The daemons wait for, and write into, the paths the mounter provides, but run
+        // the copy on the guest's own disk: launchd checks the program path when it loads
+        // a job, before the mount exists (the fifth E1 run: the headless guest's system job
+        // never started, "access(.../kbf-mnt/kbf-guest, X_OK) failed with errno 2").
         assert_eq!(GUEST_SHARE, GUEST_MOUNT);
         assert!(GUEST_RESULTS.starts_with(GUEST_MOUNT));
         for text in [&root, &user, &system, &login] {
-            assert!(text.contains(&format!("<string>{GUEST_SHARE}/{GUEST_BIN}</string>")));
+            assert!(text.contains(&format!("<string>{BOOTSTRAP}</string>")));
+            assert!(!text.contains(&format!("{GUEST_SHARE}/{GUEST_BIN}")));
             assert!(text.contains(&format!("<string>{GUEST_RESULTS}</string>")));
             assert!(text.contains(&format!("{GUEST_SHARE}/{RESULTS}/")));
             assert!(

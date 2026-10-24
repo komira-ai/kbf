@@ -161,6 +161,18 @@ pub fn probe_ready(host: &dyn Host, a: &ReadyArgs) -> Result<Value, String> {
     }))
 }
 
+/// The first line a probe writes to its log, before it waits for anything: what it will
+/// deliver and who it is. A job whose log stays empty did not start.
+#[must_use]
+pub fn started_line(host: &dyn Host, out: &Path) -> String {
+    let (uid, euid) = host.ids();
+    format!(
+        "kbf-guest: started, will deliver {} (uid {uid}, euid {euid}, session {})",
+        out.display(),
+        host.session()
+    )
+}
+
 /// Where [`deliver`] put a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivered {
@@ -385,6 +397,19 @@ mod tests {
     fn probe_guest_fails_when_the_share_never_appears() {
         let err = probe_guest(&Fake::new(), &guest_args(Some("/share"))).expect_err("timeout");
         assert!(err.contains("/share never appeared"), "{err}");
+    }
+
+    /// Catches a probe that starts silently: a job that logged nothing could not be told
+    /// from one that never ran (the fifth E1 run). The first line names the output, the
+    /// ids and the session, and is written before any wait.
+    #[test]
+    fn a_probe_says_it_started_before_it_waits() {
+        let line = started_line(&Fake::new(), Path::new("/m/results/ready-system"));
+        assert!(line.starts_with("kbf-guest: started"), "{line}");
+        assert!(line.contains("ready-system"), "{line}");
+        assert!(line.contains("uid 0"), "{line}");
+        assert!(line.contains("session System"), "{line}");
+        assert!(!line.contains('\n'));
     }
 
     /// Catches a ready marker written before the process it waits for exists, or one

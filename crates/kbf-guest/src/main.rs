@@ -204,6 +204,7 @@ fn probe_cmd(
         eprintln!("kbf-guest: the probe subcommands run inside a macOS guest");
         return ExitCode::from(2);
     };
+    eprintln!("{}", probe::started_line(host, out));
     let written = run(host).and_then(|v| {
         probe::deliver(host, port, kind, out, &v, &mut std::io::stderr())
             .map_err(|e| format!("write {}: {e}", out.display()))

@@ -373,6 +373,61 @@ length byte, as in the macOS SDK) are taken from the SDK headers and have not ru
 guest yet; the host's use of the connection's descriptor as an ordinary stream socket is
 Apple-undocumented. Both are what this run answers.
 
+### E1 result, fifth run: vsock works on a Studio; the headless guest's system job never started
+
+The fifth run (results under `<work dir>/e1-run-b5/results/`) proved the vsock route on a
+Mac Studio, host and guest on macOS 27.0.1:
+
+- both arms delivered `ready-login`, `guest-probe-root.json`, `guest-probe-user.json` and
+  `vsock-test` over vsock, each "on attempt 1" in the daemons' logs; the helper logs show
+  every frame stored (`kbf-vmm: vsock Ready ...`, `Result ...`, `Log vsock-test ...`);
+- `probe-diag` in both guests reports `"vsock": {"connected": true, "round_trip": true}`, so
+  the guest kernel has the socket family, the address layout is right and the host's use of
+  the connection's descriptor as a stream socket works;
+- file operations on the share still fail with `EPERM` in the guest (`matrix.json` and the
+  second mount's create), which is why the results no longer use it;
+- the graphics arm also delivered `ready-system`, with its guest marker at 15821 ms.
+
+The headless arm never sent `ready-system`: `e1.json` has `guest_marker_ms` null for it
+although its other four jobs ran. Its `com.kbf.probe.system.log` exists and is empty.
+
+Cause. The five probe jobs ran `kbf-guest` from the share (`/private/var/kbf-mnt/kbf-guest`),
+which exists only after the mount daemon has mounted the share; the plists have
+`RunAtLoad` and nothing that waits for the mount, and the daemons' `--wait-path` only
+starts after the program has been executed. launchd checks the program path when it loads a
+job. The headless guest's unified log (`private/var/db/diagnostics`, read with `strings`)
+holds, next to the `com.kbf.probe.system` and `com.kbf.probe.login` jobs, `Service could not
+initialize: access(/private/var/kbf-mnt/kbf-guest, X_OK) failed with errno 2 - No such file
+or directory` and `Could not find and/or execute program specified by service: 2: No such
+file or directory: /private/var/kbf-mnt/kbf-guest`. The graphics arm's log has the same
+`Could not find and/or execute` line for the login job, and that job delivered later, so
+launchd sometimes starts such a job again and sometimes does not; the system job on the
+headless arm was the one that did not. An empty log file is what a job that launchd
+could not execute leaves: launchd creates the file, the program never runs. The text of the
+launchd message in the headless log is not tied to a label there (the strings are
+fragments), so the match to the system job rests on the empty log, the other four jobs
+having run, and the identical path; no line shows launchd giving up on that job.
+
+Fix (this change). The probe jobs run the copy of `kbf-guest` on the guest's own disk
+(`/usr/local/libexec/kbf-guest`, the one the mount daemon and `probe-diag` already use), so
+the program always exists at load; the jobs still wait for the share's `results` directory
+before they probe. Each probe also writes `kbf-guest: started, will deliver <file> (uid,
+euid, session)` to its log before it waits, so an empty log now means the job did not run.
+E1's guest marker no longer rests on the system job: the first of `ready-system`,
+`ready-login`, `guest-probe-root.json` and `guest-probe-user.json` to arrive counts, and
+`e1.json` reports which one in `guest_marker` next to `guest_marker_ms` (the summary prints
+`guest marker <name> at <ms>`). Both were chosen: the path fix removes the cause, and the
+wider marker keeps a future single failing job from reading as a silent guest.
+
+What to read in the next E1 run:
+
+| where | line | meaning |
+|---|---|---|
+| `e1.json`, each arm | `guest_marker` and a number in `guest_marker_ms` | which frame arrived first, and when; `ready-system` on both arms means the path fix worked |
+| `<harvest>/private/var/tmp/com.kbf.probe.system.log` | `kbf-guest: started, will deliver ...` then `delivered on attempt 1` | the job ran and delivered |
+| same | empty | the job still did not start: read the guest's unified log for the job's label |
+| same | `started` and nothing after | the job started and is waiting: the share's `results` directory never appeared |
+
 ## What to send back
 
 Everything the commands wrote, including each helper's log (the cause of a VM that did
