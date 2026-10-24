@@ -106,8 +106,9 @@ async fn upstream_ping_keeps_a_quiet_connection_warm() {
 
 /// Catches a pool that keeps putting streams on a connection whose child has stopped
 /// answering PINGs (the stream would wait for a child that is not there), and an upstream
-/// keepalive that closes at the ack bound instead of the backstop: a quiesce can stall a
-/// loopback child for longer than 20 s, and the streams already on it are still good.
+/// keepalive that closes at the ack bound instead of the backstop: a loaded or restarting
+/// frontend can stall a loopback child for longer than 20 s, and the streams already on it
+/// are still good.
 #[tokio::test(start_paused = true)]
 async fn an_unanswered_upstream_ping_stops_new_streams_and_only_the_backstop_closes() {
     let rig = Rig::start(&[tagged("a")]);

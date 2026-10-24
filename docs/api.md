@@ -187,9 +187,9 @@ placement, and, after the list, the oldest protocol version among them:
 | `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` (each server process has its own term, the Raft term under the Raft metadata log: [worker-protocol.md](design/worker-protocol.md#server-restarts-and-the-lease-epoch)) |
 
 The list is the nodes this server process has seen, so it says nothing of a daemon that has
-not connected to it yet: a server that has just started, or that took over from another
-(the frontend swap, [design/frontend-proxy.md](design/frontend-proxy.md)), lists only those
-that have registered since. `oldest_protocol` and `protocol_unknown` describe that list and
+not connected to it yet: a server that has just started, or one of several frontends that
+share a state store ([design/frontend-proxy.md](design/frontend-proxy.md)), lists only
+those that have registered with it. `oldest_protocol` and `protocol_unknown` describe that list and
 no more. The check that a release may stop accepting the oldest version
 ([design/frontend-proxy.md](design/frontend-proxy.md) section 9, rule R1) reads them; it is
 not made by this server.
@@ -654,9 +654,9 @@ no longer changes it; this call is the one way it changes.
 
 `404` from a server with no `--state-store`, which keeps no epoch; `503` when the store
 cannot be reached or other writers kept changing the epoch for the whole of the call's tries
-(it changed nothing; call again); `409` when a newer frontend has taken the store's
-writer role from this one (it changed nothing, and calling again on this frontend cannot
-succeed: call the frontend that serves).
+(it changed nothing; call again); `409` when the store refuses the write as fenced
+(`Fenced`; no current store returns it, so a live store does not answer it; it changed
+nothing).
 
 ## `/v1/enroll/tokens` and `/v1/enroll/nodes`
 
@@ -714,8 +714,8 @@ lists them as the deny list spells them (`node n1`, `serial ...`, `spki-sha256 .
 for a node already revoked, `404` for an unknown or malformed id.
 
 **Failures.** `400` for a body or value the registry refuses, `404` (above), `409` when
-this frontend is not the signer (it lost the writer role: nothing was written, call the
-current frontend; the enroll wire's `NotSigner`), `503` when the state store failed or
+the store refuses the write as fenced (`Fenced`, which no current store returns: nothing
+was written; the enroll wire's `NotSigner`), `503` when the state store failed or
 other writers kept winning (try again), `500` for a stored row that does not decode.
 `401`, `403` and `415` are the gates'.
 
@@ -808,8 +808,8 @@ therefore "renew, then restart each node within the dwell", and no re-enrollment
 
 **Refusals** are exactly a `RefusalReason`: the gRPC status code is `reason.code()` and
 the message is `reason.message()`, byte for byte, with no detail. The node client
-recognises a refusal only by both. `NotSigner` is a frontend that lost the writer role,
-or whose CA cannot sign now (its signer is down, the clock is before the build's floor);
+recognises a refusal only by both. `NotSigner` is a store that refuses the write as fenced
+(`Fenced`, which no current store returns), or a frontend whose CA cannot sign now (its signer is down, the clock is before the build's floor);
 any other state-store failure is `StoreUnavailable`.
 
 **Limits.** The request body is at most **16 KiB** (a longer message is `MalformedRequest`).
@@ -964,7 +964,7 @@ codes and the rotation runbook are in [the design](design/object-store-registrat
 
 The routes exist when the frontend is started with `--object-store-secrets-dir DIR` (which
 needs `--api-listen`, `--api-token-file` and `--state-store`). `DIR` holds one file of mode
-0600 per connection, `<name>.<version>.json`, in a directory made 0700; every frontend child
+0600 per connection, `<name>.<version>.json`, in a directory made 0700; every frontend
 that serves at once must be able to read it, and it must stay out of any backup of the host
 (the state store, and so `state-backup`, never holds a secret key). Without the flag every
 route answers `404` `not_enabled` to a caller who passed the gate.
@@ -975,7 +975,7 @@ the routes list and change the farm's store and the key to it. One token, no rol
 proxy on the host reaches them from loopback and passes the gate: whether the proxy carries
 these routes is the operator's decision. Every answer, errors and `405` included, carries
 `Cache-Control: no-store`. A body is at most 16 KiB (`413 payload_too_large`) and refuses
-unknown fields. No route is fenced: two frontend children on one state store both serve them,
+unknown fields. No route is fenced: two frontends on one state store both serve them,
 and a lost race is `409 conflict`, never a lost write.
 
 | Route | Does |
@@ -1048,7 +1048,7 @@ applied_generation, status, last_seen_secs}]}`.
   applied the current generation with status `ok`, and none is `unsupported`. It never claims
   more than the frontend knows: a frontend that has heard from no node says `false`.
   The reports are the storage nodes' heartbeats: each accepted heartbeat writes a row in the
-  state store with a time to live of 15 seconds, so every frontend child reads the same reports, and a report
+  state store with a time to live of 15 seconds, so every frontend reads the same reports, and a report
   that is not renewed lapses and reads as `pending`. A farm restarted with an empty store shows
   `pending` for every node until heartbeats arrive.
 
@@ -1191,9 +1191,9 @@ says which in `ready`.
 | `queue.depth`, `queue.oldest_age_ms` | `depth` and `oldest_age_ms` of `GET /v1/queue`, both read from one scheduler snapshot (`depth` is also `queued_operations` of `GET /v1/frontend/drain`). `oldest_age_ms` is how long the longest-waiting operation has waited, in milliseconds, and `null` only when nothing waits |
 | `leases` | the sum of `lease_count` of `GET /v1/nodes` |
 | `storage` | `members_active`, `members_total` and `under_replicated_blobs` of `GET /v1/storage` (`null` while unknown, never zero); `storage` is `null` when this server keeps no storage members, and when the membership cannot be read, with `storage_unavailable` saying why |
-| `started_unix_ms`, `uptime_ms` | when the server started, as milliseconds since the Unix epoch on its wall clock, and the milliseconds since then by its monotonic clock (so a clock step does not change `uptime_ms`). A frontend swap starts a new frontend, and with it a new `started_unix_ms`: it is when the in-memory state below began to fill |
+| `started_unix_ms`, `uptime_ms` | when the server started, as milliseconds since the Unix epoch on its wall clock, and the milliseconds since then by its monotonic clock (so a clock step does not change `uptime_ms`). A retire and restart of the frontend starts a new process, and with it a new `started_unix_ms`: it is when the in-memory state below began to fill |
 
-In memory like `GET /v1/nodes`: after a restart or a frontend swap `nodes`, `queue` and
+In memory like `GET /v1/nodes`: after a restart or a retire and restart of the frontend `nodes`, `queue` and
 `leases` count only what has reconnected since. The update state and the history store's
 counters are not in this answer.
 
@@ -1849,7 +1849,7 @@ there is nothing to mount it on.
   payment, display capture, clipboard, midi, xr, and the rest of its list) with an
   empty allowlist. No `Strict-Transport-Security`, deliberately: a farm often serves a
   private-CA or self-signed certificate, and HSTS would stop a browser from proceeding
-  past its warning. The proxy's own answers (503 handover page, 404, 405, 401) carry a
+  past its warning. The proxy's own answers (503, 404, 405, 401) carry a
   stricter set; see `docs/deploy/kbf-ui.md`.
 - **Bounds.** Each caller has at most 4 reads open at once on `/ui`, and 4 on the read
   routes the pages use (`/v1/blobs`, `/v1/invocations` and below, `/v1/runs` and the history

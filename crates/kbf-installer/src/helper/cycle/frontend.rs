@@ -1,6 +1,6 @@
-//! The root half of the frontend proxy's three orders (`docs/design/frontend-proxy.md`
-//! section 2, `kbf-installer.md` section 6). The proxy writes them; none of them moves a
-//! unit, so none owes a restart:
+//! The root half of the frontend proxy's three orders. Nothing writes them since the proxy's
+//! update API was removed; the root half still understands them (`kbf-installer.md`
+//! section 6). None of them moves a unit, so none owes a restart:
 //!
 //! - `frontend_update{commit}`: the fetcher pulls, verifies and installs the release into
 //!   `releases/<commit>/` (no component list: the source is the installer's own, or, for an

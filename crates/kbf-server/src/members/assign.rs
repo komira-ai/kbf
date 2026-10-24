@@ -1,5 +1,5 @@
 //! The member id and boot a registration is given, and how a node's own history raises them
-//! (`docs/design/frontend-proxy-u0.md`, section (e)).
+//! (`docs/deploy/kbf-units.md`, "A new or restored state store, and the nodes' boots").
 //!
 //! A storage node's metadata log refuses a boot of a member that is not after the latest it
 //! set for that member (`kbf_meta::StaleWriter`). A state store that is new (a fresh
