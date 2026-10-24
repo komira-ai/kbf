@@ -12,6 +12,8 @@
 > ("Pool mode") and the files of `crates/kbf-proxy/src/upstreams.rs`, `pool_probe.rs` and
 > `pool_admin.rs`. Other passages below that describe the supervision are history.
 
+The recommended way to update a frontend without failing a build is a load balancer in front of several frontends: [frontends-behind-a-load-balancer.md](../deploy/frontends-behind-a-load-balancer.md).
+
 Status: design for review, unit U4b of `docs/design/frontend-proxy.md` (the design; section numbers below are its). Stacked on U4a (`kbf-server/src/proxy_auth.rs`, the child's side of the identity contract). Refs #1095. The crate skeleton in `crates/kbf-proxy` holds the parts that are plain values, with tests; everything marked "(U4b-n)" is not in it yet. Where this note and the design differ, this note says so. Revised after three reviews (concurrency and h2; seams for U7 and U8; a re-check of both) and support's binding needs for U7b and U8b: the Review log at the end says what each finding became.
 
 ## 1. What U4b is

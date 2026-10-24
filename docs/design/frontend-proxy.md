@@ -6,6 +6,8 @@
 > frontends that run on their own (`[[proxy.frontend]]` tables) and refuses the `upstream`
 > table. Passages below that describe that supervision are history.
 
+The recommended way to update a frontend without failing a build is a load balancer in front of several frontends: [frontends-behind-a-load-balancer.md](../deploy/frontends-behind-a-load-balancer.md).
+
 Status: design for review, 2026-10-18, revised to the owner's answers of that date. Written against `origin/feature/arch-v2`. Claims about code that I did not re-read are listed in section 14 and must be checked by the unit that depends on them (unit U0 does the first ones).
 
 ## 1. Decisions
