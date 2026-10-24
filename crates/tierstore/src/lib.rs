@@ -1,8 +1,9 @@
 //! A hot/cold object store over S3-compatible backends.
 //!
 //! The crate knows nothing of what is stored: objects are immutable byte strings under string
-//! keys, and it depends on no crate of the workspace it lives in, so that it can move to a
-//! repository of its own.
+//! keys, and it has no crate of the workspace it lives in among its normal dependencies, so that
+//! it can move to a repository of its own (its tests of the `server` feature use two of them as
+//! dev-dependencies, which stay behind).
 //!
 //! - [`Backend`] is the minimal API of an S3-compatible store: a create-only put (it fails
 //!   with [`Error::AlreadyExists`] where the key exists, as `If-None-Match: *` does), a put
@@ -37,6 +38,11 @@
 //! client put or delete there is refused, and a listing leaves them out.
 //!
 //! Every proxy, reconciler and cache takes its settings as constructor parameters.
+//!
+//! With the `server` feature the crate also has the `server` module, the S3 API front of a
+//! [`Proxy`] (the calls of S3 clients, signed with SigV4, answered from the two tiers), and the
+//! `tierstore` binary, which runs a proxy, that front and a [`Reconciler`] in one process
+//! (`cargo build -p tierstore --features server`).
 
 #![forbid(unsafe_code)]
 
@@ -49,6 +55,8 @@ mod journal;
 mod lease;
 mod memory;
 mod reconciler;
+#[cfg(feature = "server")]
+pub mod server;
 mod state;
 mod tiered;
 
