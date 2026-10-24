@@ -4,7 +4,7 @@ The black-box suites of the daemon, a beta stage test (design: T009, T018). Test
 crate has no library and no binary, and every dependency is a dev-dependency. A test starts
 the real `kbf` processes through `kbf-harness` and talks to them as a deployer's client would
 (REAPI); it links no `kbf-server` or `kbf-node` code. One crate per component under test,
-named for it (`kbf-all-in-one-test` is the all-in-one farm's). The Mac legs go here as more
+named for it (`kbf-farm-test` is the farm's). The Mac legs go here as more
 test targets (the first: `tests/mac_pool_spike`, below).
 
 ## No residue, no cross-action data access (T018)
@@ -100,7 +100,7 @@ not written yet must `unimplemented!("mac leg: ...")`, so a missing leg is loud.
 | helper | crate | why |
 |---|---|---|
 | `NodeView`, `Isolation`, `Proc`; the probes over files (`walk`, `Snapshot`, `clean_since`, `scan`, `files_containing`, `world_writable`, ...); `canary`, `noise`; `Tree`, `Job` | `kbf-testkit` | no protocol and no platform in them, and `kbf-testkit` takes no kbf crate (every crate may depend on it); unit-tested in `kbf-testkit/tests/` |
-| the REAPI channel, `upload_action`, `execute` | `kbf-harness` (`reapi`) | they name `kbf-proto` and `tonic`; shared with `kbf-all-in-one-test`; unit-tested in `kbf-harness/src/reapi_tests.rs` |
+| the REAPI channel, `upload_action`, `execute` | `kbf-harness` (`reapi`) | they name `kbf-proto` and `tonic`; shared with `kbf-farm-test`; unit-tested in `kbf-harness/src/reapi_tests.rs` |
 | `LinuxNode`, the `/proc` and cgroup probes (`processes_of`, `open_fds`, ...), `Rig` (one node, the stand-in `crun`'s knobs) | here, `tests/isolation/common/` | Linux-only or specific to this farm; part of a test binary the pull-request gate does not run |
 
 ### Running

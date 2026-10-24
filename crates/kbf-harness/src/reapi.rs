@@ -1,4 +1,4 @@
-//! A client of a farm's frontend for the black-box test crates (`kbf-all-in-one-test`,
+//! A client of a farm's frontend for the black-box test crates (`kbf-farm-test`,
 //! `kbf-daemon-test`): the REAPI channel under the farm CA ([`connect`]), one action built
 //! from a [`Job`] and uploaded through a [`Cas`] ([`upload_action`]), and its `Execute`
 //! ([`execute`]).

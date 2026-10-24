@@ -1,4 +1,4 @@
-//! The all-in-one suite of the black-box crates (crates/kbf-all-in-one-test/README.md): the farm,
+//! The farm suite of the black-box crates (crates/kbf-farm-test/README.md): the farm,
 //! end to end. The farm is `kbf_harness::farm::Farm`, the REAPI client of its frontend is
 //! `kbf_harness::reapi`; this file holds the tests.
 //!
@@ -28,7 +28,7 @@ const OUTPUT: &[u8] = b"a file\n";
 /// A farm of `topology` in a fresh directory, removed when the farm drops.
 fn start(name: &str, topology: &Topology) -> Farm {
     let scratch = TestDir::under(
-        scratch_root(PathBuf::from(env!("CARGO_TARGET_TMPDIR"))).join("kbf-all-in-one-test"),
+        scratch_root(PathBuf::from(env!("CARGO_TARGET_TMPDIR"))).join("kbf-farm-test"),
         name,
     );
     let dir = scratch.path().to_path_buf();

@@ -1,7 +1,8 @@
 //! What the tests that run a node binary share: its certificates, the stand-in
 //! `crun` and cgroup tree its container driver runs over, and the checks of what is
-//! on its disk. Used by tests/all_in_one.rs, tests/storage_and_daemon.rs and
-//! tests/rehearsal_in_a_box.rs (through `#[path]`: each is a test crate of its own).
+//! on its disk. Used by tests/storage_and_daemon.rs and
+//! tests/storage_and_daemon_behind_frontend.rs (through `#[path]`: each is a test crate of
+//! its own).
 
 #![allow(dead_code)] // Each test binary uses its own part of this module.
 
@@ -46,8 +47,8 @@ pub(crate) fn scratch_root() -> std::path::PathBuf {
 /// session needs on the worker listener, and clientAuth, the daemon row of the farm's
 /// table), the server's (`localhost`: role `storage` and both key usages, the storage row,
 /// which is also what the in-process scheduler presents as a TLS server), the frontend's
-/// (`frontend.pem`: `localhost`, role `frontend` and both key usages, which `kbf
-/// all-in-one` wants on its worker listener), and a storage
+/// (`frontend.pem`: `localhost`, role `frontend` and both key usages, which a frontend
+/// wants on its worker listener), and a storage
 /// client's (`client.pem`, naming the role `frontend` as a storage listener under mutual
 /// TLS requires), written into `dir`; every key private to this user, as `kbf`'s startup
 /// self-checks want them.
