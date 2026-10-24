@@ -406,10 +406,9 @@ for one that holds a generation, nothing for one that holds the marker), so any 
 frontends open the store and none fences another. The marker is not eight bytes, so a build
 that takes generations reads the row as corrupt and refuses to start on the store; the writes
 of such a build that is still running are refused by the marker. The scheduler's writes are
-kept apart by the rows they read, as the sections above say, and `write_rules` calls the
-families that were fenced `Conditional` for such a store (`classify_shared`). The move from
-generations to the marker is a cold cutover: every frontend that takes generations is stopped
-before the first one that does not is started (see
+kept apart by the rows they read, as the sections above say. The move from generations to the
+marker is a cold cutover: every frontend that takes generations is stopped before the first one
+that does not is started (see
 [the state-store cutover](../deploy/state-store-cutover.md#moving-to-frontends-that-share-the-store)).
 A SQLite file is held by one process and still takes its generation, which a handover reads.
 
