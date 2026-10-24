@@ -320,6 +320,15 @@ fn only_a_200_with_exactly_a_reply_is_a_reply() {
             Plan::Say(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"reply\":\"nothing\"}".to_vec()),
             "malformed",
         ),
+        // Framed two ways at once: which one is the body is not for the client to guess.
+        (
+            Plan::Say(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 19\r\n\
+                  Connection: close\r\n\r\n{\"reply\":\"nothing\"}"
+                    .to_vec(),
+            ),
+            "malformed",
+        ),
         (
             Plan::Say(b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\nConnection: close\r\n\r\n{\"reply\":\"nothing\"}".to_vec()),
             "malformed",
