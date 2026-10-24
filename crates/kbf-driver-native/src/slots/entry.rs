@@ -11,9 +11,9 @@
 //! `__as-user` ([`crate::slots::AS_USER_ARG`]) and a system tool. Nothing here runs a
 //! shell, and root applies no flag or ACL change to the entry.
 //!
-//! - [`clear_flags`] (C6): the user flags and the owner's mode of the entry root and
-//!   everything the uid owns below it ([`CLEAR`]), then the ACLs of the uid's entries
-//!   (`find -x ... -user <uid> -exec chmod -N`).
+//! - [`clear_flags`] (C6): the ACLs of the uid's entries (`find -x ... -user <uid>
+//!   -exec chmod -N`), the user flags and the owner's mode of the entry root and
+//!   everything the uid owns below it ([`CLEAR`]), then the ACLs again.
 //! - [`empty`] (C7): the entry's `0`, `C`, `T` and `X` emptied and kept, anything else in
 //!   the entry removed ([`EMPTY`]).
 //! - [`left`] (the check): what an uid-side look finds in the entry afterwards
@@ -34,11 +34,11 @@ use super::probe::SKELETON;
 /// The argument after argv0 that selects this binary's entry mode:
 /// `__entry <mode> <uid> <gid> <dir>`.
 pub const ARG: &str = "__entry";
-/// The mode that clears the flags and modes below the entry: `__entry clear <dir>`.
+/// The mode that clears the flags and modes below the entry: `__entry clear <uid> <gid> <dir>`.
 pub const CLEAR: &str = "clear";
-/// The mode that empties the entry: `__entry empty <dir>`.
+/// The mode that empties the entry: `__entry empty <uid> <gid> <dir>`.
 pub const EMPTY: &str = "empty";
-/// The mode that prints what is left in the entry: `__entry look <dir>`.
+/// The mode that prints what is left in the entry: `__entry look <uid> <gid> <dir>`.
 pub const LOOK: &str = "look";
 
 const USAGE: &str = "usage: __entry clear|empty|look <uid> <gid> <dir>";
@@ -142,18 +142,24 @@ pub(crate) fn acl_args(entry: &Path, uid: u32) -> Vec<OsString> {
     args
 }
 
-/// C6 for the entry `folders`: the flags and modes below it cleared, then the ACLs of
-/// the uid's entries removed, both as the uid. Both are tried; every failure is named
-/// with the entry.
+/// C6 for the entry `folders`, all as the uid: the ACLs of the uid's entries removed, the
+/// flags and modes below it cleared, and the ACLs removed again. Neither of the two can
+/// do what the other lets through: the uid obeys an ACL that denies the listing of a
+/// directory (root did not), so the flags below it are out of reach of the sweep until
+/// the first removal, and a locked file cannot have its ACL changed until the sweep
+/// unlocks it. The first removal is therefore allowed to fail; the sweep and the last
+/// removal are not, and every failure of those is named with the entry.
 ///
 /// # Errors
-/// A call failed.
+/// The sweep or the last removal failed.
 pub(crate) fn clear_flags(me: &AsUid<'_>, folders: &Path, run: &mut Run<'_>) -> Result<(), String> {
+    let find = me.launch(OsStr::new(FIND), &acl_args(folders, me.uid));
+    // Whatever this cannot reach is reached after the sweep, and judged then.
+    let _ = run(me.program, &find);
     let mut failed = Vec::new();
     if let Err(why) = me.mode(CLEAR, folders, run) {
         failed.push(why);
     }
-    let find = me.launch(OsStr::new(FIND), &acl_args(folders, me.uid));
     if let Err(why) = run(me.program, &find) {
         failed.push(why);
     }
@@ -243,6 +249,10 @@ pub(crate) fn dispatch(
 /// each of those that is not empty. Exit 1 when something could not be listed.
 fn look(dir: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let names = |path: &Path| -> std::io::Result<Vec<String>> {
+        // A link in place of a folder is not followed: it is reported, not listed.
+        if !std::fs::symlink_metadata(path)?.is_dir() {
+            return Err(std::io::Error::other("not a directory"));
+        }
         let mut names = std::fs::read_dir(path)?
             .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
             .collect::<Result<Vec<_>, _>>()?;

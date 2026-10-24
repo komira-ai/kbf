@@ -593,6 +593,18 @@ macro_rules! as_user_test_hook {
 mod tests {
     use super::*;
 
+    /// Off macOS the entry mode is selected and the drop to a pool user refuses.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_entry_mode_refuses_to_drop_to_a_pool_user_off_macos() {
+        let args: Vec<std::ffi::OsString> = ["kbf-daemon", entry::ARG, "empty", "5", "5", "/x"]
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        assert_eq!(entry_exit(&args), Some(126));
+        assert_eq!(entry_exit(&args[..1]), None);
+    }
+
     fn user(name: &str, uid: u32, gid: u32) -> SlotUser {
         SlotUser {
             name: name.to_owned(),

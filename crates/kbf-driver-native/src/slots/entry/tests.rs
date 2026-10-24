@@ -81,6 +81,7 @@ fn the_flags_step_clears_the_home_as_root_and_the_entry_as_the_uid_in_that_order
         *log.borrow(),
         vec![
             format!("root {HOME}"),
+            launched(FIND, &words(&acl)),
             mode_call("clear"),
             launched(FIND, &words(&acl)),
         ]
@@ -122,7 +123,7 @@ fn every_call_on_the_entry_is_made_as_the_uid() {
     contents_step(&me(), dir, &mut as_root(&Log::default()), run).expect("contents");
     left(&me(), Path::new(FOLDERS), run).expect("left");
     let calls = log.borrow();
-    assert_eq!(calls.len(), 4);
+    assert_eq!(calls.len(), 5);
     // The daemon's modes get the ids and drop inside their own process (the pool user
     // need not be able to execute the binary); the system tool is run by `as-user`.
     for call in calls.iter() {
@@ -131,6 +132,33 @@ fn every_call_on_the_entry_is_made_as_the_uid() {
         let tool = call.starts_with(&format!("{PROGRAM} __as-user 61003 20 -- {FIND} "));
         assert!(own || tool, "{call}");
     }
+}
+
+#[test]
+fn the_acls_are_removed_before_and_after_the_sweep_and_only_the_last_removal_is_judged() {
+    let log = Log::default();
+    let acl = words(&acl_args(Path::new(FOLDERS), 61003));
+    let first = format!("{PROGRAM} __as-user 61003 20 -- {FIND} ");
+    // Every call fails but the sweep, which is the second: the first removal is let fail.
+    let calls = RefCell::new(0);
+    let mut run = |program: &Path, args: &[OsString]| {
+        let line = format!("{} {}", program.display(), words(args));
+        log.borrow_mut().push(line.clone());
+        *calls.borrow_mut() += 1;
+        if line.starts_with(&first) && *calls.borrow() == 1 {
+            return Err("early removal failed".to_owned());
+        }
+        Ok(String::new())
+    };
+    clear_flags(&me(), Path::new(FOLDERS), &mut run).expect("only the last removal is judged");
+    assert_eq!(
+        *log.borrow(),
+        vec![
+            launched(FIND, &acl),
+            mode_call("clear"),
+            launched(FIND, &acl),
+        ]
+    );
 }
 
 #[test]
@@ -163,7 +191,7 @@ fn a_uid_side_failure_of_the_flags_step_fails_it_naming_the_entry() {
         assert!(why.starts_with(&format!("{FOLDERS}: ")), "{why}");
         assert!(why.contains(&format!("{fail} failed")), "{why}");
         // The other call is made anyway: both failures are shown.
-        assert_eq!(log.borrow().len(), 3, "{fail}");
+        assert_eq!(log.borrow().len(), 4, "{fail}");
     }
 }
 
@@ -191,7 +219,7 @@ fn a_failure_of_the_home_as_root_fails_the_step_and_the_entry_is_still_cleaned()
     )
     .expect_err("fails");
     assert_eq!(why, "home: locked");
-    assert_eq!(log.borrow().len(), 2);
+    assert_eq!(log.borrow().len(), 3);
 }
 
 #[test]
@@ -349,6 +377,19 @@ fn the_entry_mode_refuses_bad_arguments_before_it_drops_anything() {
             "{ids:?}"
         );
     }
+    // An id that is not text is refused like one that is not a number.
+    use std::os::unix::ffi::OsStringExt as _;
+    let args: Vec<OsString> = vec![
+        "kbf-daemon".into(),
+        ARG.into(),
+        EMPTY.into(),
+        OsString::from_vec(vec![0xff, 0xfe]),
+        "20".into(),
+        "/x".into(),
+    ];
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert_eq!(dispatch(&args, no_drop, &mut out, &mut err), Some(2));
+    assert!(String::from_utf8_lossy(&err).contains("non-root ids"));
     let (code, _, err) = run_mode(&[ARG, "bogus", "501", "20", "/x"], no_drop);
     assert_eq!((code, err.contains("no mode")), (Some(2), true));
 }
@@ -395,14 +436,15 @@ fn the_empty_mode_keeps_the_four_folders_empty_and_removes_the_rest() {
 #[test]
 fn the_empty_mode_fails_with_the_path_when_something_cannot_be_removed() {
     let dir = tree("empty-fails");
+    // The removal of a file in a read-only directory fails, but not for root.
+    if rustix::process::geteuid().is_root() {
+        eprintln!("skipped: root removes from a read-only directory");
+        return;
+    }
     let entry = entry_with_files(&dir);
     let locked = entry.join("T").join("deep");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).expect("chmod");
     let (code, _, err) = call(EMPTY, &entry);
-    // Opens for write; the removal of a file in a read-only directory fails (not as root).
-    if rustix::process::geteuid().is_root() {
-        return;
-    }
     assert_eq!(code, Some(1), "{err}");
     assert!(err.contains(&*locked.to_string_lossy()), "{err}");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("chmod");
@@ -450,4 +492,12 @@ fn the_look_mode_fails_when_it_cannot_list_the_entry_or_one_of_its_folders() {
     let (code, _, err) = call(LOOK, &entry);
     assert_eq!(code, Some(1));
     assert!(err.contains("entry/T"), "{err}");
+    // A link in the place of a folder is reported, never followed into its target.
+    fs::remove_file(entry.join("T")).expect("rm");
+    let target = dir.path().join("elsewhere");
+    fs::create_dir_all(&target).expect("target");
+    std::os::unix::fs::symlink(&target, entry.join("T")).expect("link");
+    let (code, out, err) = call(LOOK, &entry);
+    assert_eq!((code, out.as_str()), (Some(1), ""));
+    assert!(err.contains("entry/T: not a directory"), "{err}");
 }

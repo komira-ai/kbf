@@ -645,28 +645,34 @@ fn clear_entry(
 /// which a removal by root does not need changed.
 fn make_owner_rwx(dir: &OwnedFd, name: &OsStr, stat: &Stat) -> io::Result<()> {
     let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    let file = match rustix::fs::openat(dir, name, flags, Mode::empty()) {
-        Ok(file) => file,
+    // Linux has no mode of a link to set (and refuses the flag for any entry).
+    let at = if cfg!(target_os = "macos") {
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW
+    } else {
+        rustix::fs::AtFlags::empty()
+    };
+    let (opened, file) = match rustix::fs::openat(dir, name, flags, Mode::empty()) {
+        Ok(file) => (rustix::fs::fstat(&file)?, Some(file)),
         // A directory its owner took every permission from cannot be opened, by the
-        // owner (a clean that runs as the uid): the mode is set by name, never on a link.
+        // owner (a clean that runs as the uid): it is judged again by name, and its mode
+        // set by name, never on a link.
         Err(rustix::io::Errno::ACCESS)
             if !rustix::fs::FileType::from_raw_mode(stat.st_mode).is_symlink() =>
         {
-            // Linux has no mode of a link to set (and refuses the flag for any entry).
-            let at = if cfg!(target_os = "macos") {
-                rustix::fs::AtFlags::SYMLINK_NOFOLLOW
-            } else {
-                rustix::fs::AtFlags::empty()
-            };
-            return Ok(rustix::fs::chmodat(dir, name, owner_rwx(stat), at)?);
+            (
+                rustix::fs::statat(dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?,
+                None,
+            )
         }
         Err(_) => return Ok(()),
     };
-    let opened = rustix::fs::fstat(&file)?;
     if (opened.st_dev, opened.st_ino) != (stat.st_dev, stat.st_ino) {
         return Ok(());
     }
-    Ok(rustix::fs::fchmod(&file, owner_rwx(stat))?)
+    match file {
+        Some(file) => Ok(rustix::fs::fchmod(&file, owner_rwx(stat))?),
+        None => Ok(rustix::fs::chmodat(dir, name, owner_rwx(stat), at)?),
+    }
 }
 
 /// The permission bits of `stat` with the owner's `rwx` added.

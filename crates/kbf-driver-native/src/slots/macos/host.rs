@@ -605,12 +605,21 @@ fn open_dir(path: &Path) -> io::Result<OwnedFd> {
 fn own(dir: &OwnedFd, (uid, gid, mode): (u32, u32, u32), flags: u32) -> io::Result<()> {
     set_flags(dir, flags)?;
     strip_xattrs(dir)?;
-    rustix::fs::fchown(
-        dir,
-        Some(rustix::fs::Uid::from_raw(uid)),
-        Some(rustix::fs::Gid::from_raw(gid)),
-    )?;
-    rustix::fs::fchmod(dir, Mode::from_raw_mode(mode as _))?;
+    // Only what differs is changed: the entry's folders are the user's already after the
+    // uid-side clean, and root, with no Full Disk Access, may not change them.
+    let now = rustix::fs::fstat(dir)?;
+    let has = (now.st_uid, now.st_gid, u32::from(now.st_mode));
+    let (owner, mode_differs) = probe::ownership_to_change(has, (uid, gid, mode));
+    if owner {
+        rustix::fs::fchown(
+            dir,
+            Some(rustix::fs::Uid::from_raw(uid)),
+            Some(rustix::fs::Gid::from_raw(gid)),
+        )?;
+    }
+    if mode_differs {
+        rustix::fs::fchmod(dir, Mode::from_raw_mode(mode as _))?;
+    }
     Ok(())
 }
 

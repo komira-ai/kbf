@@ -371,3 +371,18 @@ fn the_program_of_a_job_is_the_line_one_level_in() {
     assert_eq!(program_path("x = {\n\t\tprogram = /deeper\n}\n"), None);
     assert_eq!(program_path("x = {\n\tpath = /p\n}\n"), None);
 }
+
+#[test]
+fn the_restore_changes_only_what_differs() {
+    let want = (501, 20, 0o700);
+    assert_eq!(ownership_to_change(want, want), (false, false));
+    // The file-type bits of a stat mode are not part of the mode.
+    assert_eq!(
+        ownership_to_change((501, 20, 0o40700), want),
+        (false, false)
+    );
+    assert_eq!(ownership_to_change((0, 20, 0o700), want), (true, false));
+    assert_eq!(ownership_to_change((501, 0, 0o700), want), (true, false));
+    assert_eq!(ownership_to_change((501, 20, 0o755), want), (false, true));
+    assert_eq!(ownership_to_change((0, 0, 0o755), want), (true, true));
+}

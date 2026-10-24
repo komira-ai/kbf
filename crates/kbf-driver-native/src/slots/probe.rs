@@ -48,6 +48,17 @@ pub(crate) fn unrestored(flags: u32) -> bool {
     flags & NOT_RESTORED != 0
 }
 
+/// What the restore of a directory has to change to give it `want` (uid, gid, mode),
+/// from what it `has`: whether the owner (and group) and whether the mode. Nothing that
+/// is right already is touched, since root without Full Disk Access is refused the
+/// change of the uid's `/var/folders` entry even to the value it holds.
+pub(crate) fn ownership_to_change(has: (u32, u32, u32), want: (u32, u32, u32)) -> (bool, bool) {
+    (
+        (has.0, has.1) != (want.0, want.1),
+        has.2 & 0o7777 != want.2 & 0o7777,
+    )
+}
+
 /// The places the shared sweep covers: launchd's per-uid files, and every entry the uid
 /// owns in the `Shared` folder under `/Users`, `/private/tmp`, `/private/var/tmp` and
 /// `/Library/Caches`. Not all of `/private/var/folders`: the uid can write only its own
