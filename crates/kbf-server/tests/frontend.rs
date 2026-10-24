@@ -24,6 +24,12 @@ mod object_stores;
 #[path = "frontend/proxy_auth.rs"]
 mod proxy_auth;
 
+#[path = "frontend/ready.rs"]
+mod ready;
+
+#[path = "frontend/retire.rs"]
+mod retire;
+
 use std::future::pending;
 use std::net::SocketAddr;
 use std::sync::Arc;

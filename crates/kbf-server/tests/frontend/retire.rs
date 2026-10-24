@@ -10,8 +10,85 @@ use kbf_server::frontend::start_frontend;
 use kbf_server::{ServeError, StateStoreUri};
 use kbf_state::postgres::{PostgresConfig, PostgresStore, TestDatabase, test_database};
 use serde_json::json;
+use support::done_within_quiet;
+use tokio::task::JoinHandle;
+use tonic::Code;
 
 use super::*;
+
+/// Waits until `look` says yes, for at most twenty seconds.
+async fn until(what: &str, mut look: impl AsyncFnMut() -> bool) {
+    for _ in 0..1000 {
+        if look().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("never happened: {what}");
+}
+
+async fn readyz(api: SocketAddr) -> u16 {
+    get(api, "/readyz").await.0
+}
+
+/// One request and its answer, bounded: a process that never answers fails the test
+/// instead of hanging it.
+async fn exchange(addr: SocketAddr, request: &str) -> (u16, Value) {
+    let exchanged = async {
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("send");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        response
+    };
+    let response = tokio::time::timeout(Duration::from_secs(30), exchanged)
+        .await
+        .unwrap_or_else(|_| panic!("{addr} did not answer within 30 seconds"));
+    let (head, body) = response.split_once("\r\n\r\n").expect("a head and a body");
+    let code = head.split_whitespace().nth(1).and_then(|c| c.parse().ok());
+    (
+        code.expect("a status code"),
+        serde_json::from_str(body).unwrap_or(Value::Null),
+    )
+}
+
+/// A scratch directory of the test's own, removed when dropped.
+struct Scratch(kbf_testkit::dir::TestDir);
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        Self(kbf_testkit::dir::TestDir::under(
+            env!("CARGO_TARGET_TMPDIR"),
+            &format!("kbf-managed-{name}"),
+        ))
+    }
+
+    /// The `--api-token-file` flag for a token file of this directory, 0600.
+    fn token_flag(&self) -> String {
+        let file = self.0.join("token");
+        std::fs::write(&file, format!("{TOKEN}\n")).expect("token file");
+        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .expect("mode");
+        format!("--api-token-file={}", file.display())
+    }
+}
+
+const TOKEN: &str = "a-token-that-is-long-enough-for-a-test";
+
+async fn refused(addr: SocketAddr) -> bool {
+    TcpStream::connect(addr).await.is_err()
+}
+
+/// The code an Execute is refused with, however it is surfaced.
+async fn execute_refused(client: &Client, job: &Job) -> Option<Code> {
+    match client.execute_with(&job.action, false).await {
+        Err(status) => Some(status.code()),
+        Ok(mut ops) => match ops.message().await {
+            Err(status) => Some(status.code()),
+            Ok(_) => None,
+        },
+    }
+}
 
 /// A frontend serving in this test, until `stop` is dropped.
 struct Member {

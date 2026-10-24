@@ -4,7 +4,7 @@
 //! The read is open, like the drain's. The write passes the gates of [`gate`] and takes no
 //! body, or `{}`. A server that is not a frontend over a state store has nothing to retire
 //! over and answers both `409`: the cell the handlers read is set only by a frontend that
-//! built a [`Stand`](crate::handover::Stand), which it does with a state store.
+//! built a [`Stand`](crate::stand::Stand), which it does with a state store.
 
 use std::sync::Arc;
 

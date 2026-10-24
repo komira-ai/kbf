@@ -26,9 +26,6 @@ mod admin_secret;
 #[path = "managed/proxy.rs"]
 mod proxy;
 
-#[path = "managed/retire.rs"]
-mod retire;
-
 #[path = "managed/two_children.rs"]
 mod two_children;
 

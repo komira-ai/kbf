@@ -51,7 +51,7 @@
 //! probe digest (it passes when one answers), so a farm that has lost its `--storage`
 //! node is ready while its other members are. `READY=1` to the service manager, and the
 //! successor's "serving" to its predecessor, do not wait for this check
-//! (`handover::Ready`); `/readyz` stays failing until storage answers.
+//! (`ready::Ready`); `/readyz` stays failing until storage answers.
 //!
 //! **Handing over** (`--handover-socket` with `--instance`, [`crate::handover`]): behind
 //! Envoy, a frontend started while another serves on the same state file binds its own
@@ -111,19 +111,22 @@ use crate::front_maps::FrontMaps;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::handover::{
     self, EnvoyCheck, Facts, Handover, HandoverError, Holder, Instance, Leave, Message, Peer,
-    Ready, Released, Stand, Stop,
+    Released,
 };
 use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
 use crate::listen::{Binder, Socket};
 use crate::members::{Handoff, Members};
 use crate::object_store::delivery::{Delivery, RegistrySource, Reports};
 use crate::proxy_auth::ProxyAuthLayer;
+use crate::ready::Ready;
 use crate::retire::Retire;
 use crate::serve::{
     AbortOnDrop, ServeError, cold_store, drain_and_stop, flow_control, keepalive, log_state,
     map_of, members_of, membership, serve_api, stop_api, sweeping, worker_peers,
 };
+use crate::stand::Stand;
 use crate::start::{Escalation, escalating, interruptions};
+use crate::stop::Stop;
 use crate::store_config::acks::Acks;
 use crate::worker::WorkerService;
 use crate::{Args, ConfigError, SERVER_VERSION, sizes_on};
