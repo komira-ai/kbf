@@ -129,6 +129,50 @@ impl Client {
         }
     }
 
+    /// `role-run`: starts `argv` as the standing VM user in its GUI session, with the
+    /// four descriptors stdin, stdout, stderr and the working directory.
+    ///
+    /// # Errors
+    /// The call failed or was refused (no VM user, its session not up, or a lease
+    /// holding the session).
+    pub fn role_run(
+        &self,
+        argv: &[String],
+        env: &[(String, String)],
+        fds: [BorrowedFd<'_>; 4],
+    ) -> Result<Running, ClientError> {
+        let request = Request::RoleRun {
+            argv: argv.to_vec(),
+            env: env.to_vec(),
+        };
+        match self.call(&request, &fds)? {
+            (stream, Reply::Started { pid }) => Ok(Running { stream, pid }),
+            (_, other) => Err(unexpected(other)),
+        }
+    }
+
+    /// `role-session-ready`: whether the standing VM user's GUI session is up.
+    ///
+    /// # Errors
+    /// The call failed or was refused.
+    pub fn role_session_ready(&self) -> Result<bool, ClientError> {
+        match self.call(&Request::RoleSessionReady, &[])?.1 {
+            Reply::SessionReady { ready } => Ok(ready),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// `role-kill-uid`: returns once no process of the standing VM user is left.
+    ///
+    /// # Errors
+    /// The call failed or was refused.
+    pub fn role_kill_uid(&self) -> Result<(), ClientError> {
+        match self.call(&Request::RoleKillUid, &[])?.1 {
+            Reply::Killed => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// `kill-uid`: returns once no process of the lease user is left.
     ///
     /// # Errors

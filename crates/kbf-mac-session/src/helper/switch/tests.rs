@@ -1,4 +1,4 @@
-use crate::autologin::{CommandOutput, kcpassword, read_intent};
+use crate::autologin::{CommandOutput, Intent, kcpassword, read_intent};
 use crate::helper::tests::{Rig, fds, log, me, rig, rig_with};
 use crate::helper::{Outcome, Reset};
 use crate::lease::UidRange;
@@ -15,7 +15,7 @@ fn switch_rig(name: &str) -> Rig {
     rig
 }
 
-fn intent(rig: &Rig) -> Option<LeaseId> {
+fn intent(rig: &Rig) -> Option<Intent> {
     read_intent(&rig.dir.join("session-intent")).unwrap()
 }
 
@@ -74,7 +74,7 @@ fn session_login_writes_the_intent_before_anything_and_restarts_last() {
             format!("command {RESTART} (intent 1.1)"),
         ]
     );
-    assert_eq!(intent(&rig), Some(LeaseId::new(1, 1)));
+    assert_eq!(intent(&rig), Some(Intent::Lease(LeaseId::new(1, 1))));
     assert_eq!(
         std::fs::read(rig.dir.join("kcpassword")).unwrap(),
         kcpassword(b"pw-kbf-lease-1-1")
@@ -264,7 +264,7 @@ fn the_boot_reset_keeps_a_live_intent() {
         std::fs::read(booted.dir.join("kcpassword")).unwrap(),
         before
     );
-    assert_eq!(intent(&booted), Some(LeaseId::new(1, 1)));
+    assert_eq!(intent(&booted), Some(Intent::Lease(LeaseId::new(1, 1))));
 }
 
 /// Catches: an unreadable record, or one naming a lease whose user is gone, taken as
@@ -331,6 +331,8 @@ fn nothing_but_the_boot_reset_is_served_before_it() {
         Request::UserDelete { lease: lease() },
         Request::SessionLogin { lease: lease() },
         Request::SessionIdle,
+        Request::RoleSessionReady,
+        Request::RoleKillUid,
         Request::Scan,
         Request::Baseline,
         Request::RebootDirty,
@@ -353,6 +355,14 @@ fn nothing_but_the_boot_reset_is_served_before_it() {
     assert!(matches!(
         booted.helper.handle(run, fds(&booted.dir)),
         Outcome::Reply(Reply::Refused { .. })
+    ));
+    let role_run = Request::RoleRun {
+        argv: vec!["/usr/bin/true".to_owned()],
+        env: Vec::new(),
+    };
+    assert!(matches!(
+        booted.helper.handle(role_run, fds(&booted.dir)),
+        Outcome::Reply(Reply::Refused { reason }) if reason.contains("boot reset has not run")
     ));
     assert!(booted.host.state().users.is_empty());
     let reset = Request::BootReset { held: Vec::new() };

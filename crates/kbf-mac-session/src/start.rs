@@ -14,7 +14,7 @@ use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, Stat};
 use crate::autologin::SessionPaths;
 use crate::grant::GrantKeys;
 use crate::helper::{Helper, Host, Settings};
-use crate::lease::UidRange;
+use crate::lease::{UidRange, VmUser};
 use crate::ledger::Ledger;
 use crate::scan::{ScanFolder, ScanSettings};
 use crate::server;
@@ -69,6 +69,12 @@ pub struct Args {
     /// switch sets and clears its `autoLoginUser`.
     #[arg(long, default_value = "/Library/Preferences/com.apple.loginwindow")]
     pub loginwindow: String,
+    /// The standing VM user's account name, on a Mac provisioned for VMs: the Mac rests
+    /// logged in as it (`session-idle`), and the `role-*` verbs act as it. It must not
+    /// be a lease user's name (`kbf-lease-...`), `root` or `_kbf`. Without it the Mac
+    /// rests at the login window and the `role-*` verbs are refused.
+    #[arg(long)]
+    pub vm_user: Option<VmUser>,
 }
 
 /// A bound socket and the helper behind it, ready to serve.
@@ -127,8 +133,11 @@ pub fn prepare(
         session: SessionPaths {
             intent: args.state_dir.join("session-intent"),
             kcpassword: args.kcpassword.clone(),
+            vm_password: args.state_dir.join(crate::autologin::VM_PASSWORD_FILE),
+            vm_password_owner: 0,
             loginwindow: args.loginwindow.clone(),
         },
+        vm_user: args.vm_user.clone(),
         scan: ScanSettings::in_state_dir(&args.state_dir, scan),
     };
     tracing::info!(

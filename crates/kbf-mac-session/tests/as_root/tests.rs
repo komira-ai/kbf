@@ -923,3 +923,21 @@ fn a_gui_run_holds_no_group_but_its_own() {
     );
     assert_eq!(lines.last(), Some(&"exit 0"), "{held:?}");
 }
+
+/// Catches: the macOS host's account lookup (the VM user's uid and gid come from it, and
+/// the helper kills and starts processes by that uid) that finds no one for a name the
+/// directory has, finds someone for a name it does not, or reads the wrong ids.
+#[test]
+#[ignore = "needs root: run by `cargo xtask sudo-test -p kbf-mac-session --test as_root`"]
+fn the_macos_host_looks_an_account_up_by_name() {
+    assert_root();
+    #[cfg(target_os = "macos")]
+    {
+        use kbf_mac_session::helper::{Account, Host as _};
+        use kbf_mac_session::macos::MacHost;
+        let root = MacHost.account("root").expect("look root up");
+        assert_eq!(root, Some(Account { uid: 0, gid: 0 }));
+        let nobody = MacHost.account("kbf-no-such-account").expect("look up");
+        assert_eq!(nobody, None);
+    }
+}
