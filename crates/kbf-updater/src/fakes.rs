@@ -48,6 +48,29 @@ pub enum Event {
     Restart(String, String),
 }
 
+impl Event {
+    /// The call as a short word: its kind, then the detail a test tells calls apart by (the
+    /// version of an install, the deadline of a drain, the name of a pool member or a unit).
+    pub fn word(&self) -> String {
+        match self {
+            Event::Check(_) => "check".to_owned(),
+            Event::Install(_, version) => format!("install {version}"),
+            Event::Query(_) => "query".to_owned(),
+            Event::Health(_) => "health".to_owned(),
+            Event::Drain(_, secs) => format!("drain {secs}"),
+            Event::Leases(_) => "leases".to_owned(),
+            Event::Undrain(_) => "undrain".to_owned(),
+            Event::PoolView => "pool view".to_owned(),
+            Event::PoolDrain(name) => format!("pool drain {name}"),
+            Event::PoolUndrain(name) => format!("pool undrain {name}"),
+            Event::Retire(_) => "retire".to_owned(),
+            Event::RetireStatus(_) => "retire status".to_owned(),
+            Event::Commit(_) => "commit".to_owned(),
+            Event::Restart(_, unit) => format!("restart {unit}"),
+        }
+    }
+}
+
 /// The calls made to the fakes, in order.
 #[derive(Clone, Default)]
 pub struct Log(Arc<Mutex<Vec<Event>>>);
@@ -930,5 +953,50 @@ mod tests {
         inst.install(&a, &v).expect("install");
         assert_eq!(inst.installed("b"), Installed::Version("2.0".into()));
         assert_eq!(inst.query(&b), Ok(Installed::Version("2.0".into())));
+    }
+
+    /// Asserts that every kind of call has its own word, with the detail the tests tell calls
+    /// apart by: the version of an install, the deadline of a drain, the pool member or unit.
+    #[test]
+    fn every_call_has_its_own_word() {
+        let a = || "a".to_owned();
+        let words: Vec<String> = [
+            Event::Check(a()),
+            Event::Install(a(), "2.0".into()),
+            Event::Query(a()),
+            Event::Health(a()),
+            Event::Drain(a(), 600),
+            Event::Leases(a()),
+            Event::Undrain(a()),
+            Event::PoolView,
+            Event::PoolDrain("m".into()),
+            Event::PoolUndrain("m".into()),
+            Event::Retire(a()),
+            Event::RetireStatus(a()),
+            Event::Commit(a()),
+            Event::Restart(a(), "u".into()),
+        ]
+        .iter()
+        .map(Event::word)
+        .collect();
+        assert_eq!(
+            words,
+            [
+                "check",
+                "install 2.0",
+                "query",
+                "health",
+                "drain 600",
+                "leases",
+                "undrain",
+                "pool view",
+                "pool drain m",
+                "pool undrain m",
+                "retire",
+                "retire status",
+                "commit",
+                "restart u",
+            ]
+        );
     }
 }

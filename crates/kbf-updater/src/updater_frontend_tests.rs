@@ -253,7 +253,8 @@ fn an_install_still_in_progress_after_a_restart_is_waited_for_and_not_repeated()
     rig.pool.set_draining("a", true);
     let target = Installed::Version(TARGET.to_owned());
     rig.inst.set_installed("fe1", target);
-    rig.inst.script_query("fe1", vec![Ok(Installed::InProgress)]);
+    rig.inst
+        .script_query("fe1", vec![Ok(Installed::InProgress)]);
     rig.store().save(&record(Phase::Installing)).expect("save");
     let u = open_over(&rig, "");
     let roll = u.drive("roll-1").expect("drive");
@@ -327,7 +328,8 @@ fn a_drain_wait_that_times_out_fails_before_the_retire_and_leaves_the_member_dra
 fn the_retire_is_waited_on_until_the_member_has_no_stream_open() {
     let rig = member_rig("fe-retire-wait");
     rig.front.script_retire("fe1", vec![], Ok(open(2)));
-    rig.front.script_status("fe1", vec![Ok(open(1))], Ok(retired()));
+    rig.front
+        .script_status("fe1", vec![Ok(open(1))], Ok(retired()));
     let u = open_over(&rig, "");
     let roll = run(&u, only("fe1"));
     assert_eq!(roll.state, RollState::Done);
@@ -485,7 +487,8 @@ fn failures() -> Vec<Case> {
             setup: |rig| {
                 let both = vec![up("a"), up("b")];
                 let drained = vec![pool_member("a", true, true, 0), up("b")];
-                rig.pool.script_views(vec![Ok(both), Ok(drained), Ok(vec![up("b")])]);
+                rig.pool
+                    .script_views(vec![Ok(both), Ok(drained), Ok(vec![up("b")])]);
             },
         },
         Case {

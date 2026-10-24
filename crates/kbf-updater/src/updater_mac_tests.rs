@@ -40,15 +40,7 @@ fn words(rig: &Rig, alias: &str) -> Vec<String> {
     rig.log
         .touching(alias)
         .into_iter()
-        .map(|e| match e {
-            Event::Check(_) => "check".to_owned(),
-            Event::Install(_, version) => format!("install {version}"),
-            Event::Query(_) => "query".to_owned(),
-            Event::Health(_) => "health".to_owned(),
-            Event::Drain(_, secs) => format!("drain {secs}"),
-            Event::Leases(_) => "leases".to_owned(),
-            Event::Undrain(_) => "undrain".to_owned(),
-        })
+        .map(|e| e.word())
         .collect()
 }
 
