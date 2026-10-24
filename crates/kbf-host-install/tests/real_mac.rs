@@ -665,6 +665,7 @@ fn a_real_release_is_fetched_as_nobody_and_verified() {
     fs::set_permissions(&root_copy, fs::Permissions::from_mode(0o644)).unwrap();
 
     let fetcher_with = |token| Fetcher {
+        asset: release::ReleaseFile::Tarball,
         platform: "darwin-arm64",
         runner: &SystemRunner,
         curl: Path::new("/usr/bin/curl"),
