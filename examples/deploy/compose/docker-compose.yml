@@ -35,9 +35,10 @@ services:
       - frontend-b
 
   frontend-a:
-    # Placeholder: the tag the loaded image has on your machine.
-    image: kbf-frontend:local
-    command: ["kbf", "--config", "/etc/kbf/kbf.toml"]
+    # The frontend image release asset, loaded with `docker image load`, is tagged
+    # kbf-frontend:<commit> (docs/artifacts.md). Its entrypoint runs `kbf --mode=frontend`
+    # and its default arguments read /etc/kbf/kbf.toml, mounted below.
+    image: kbf-frontend:${KBF_COMMIT:?set KBF_COMMIT to the release commit}
     volumes:
       - ./frontend-a.toml:/etc/kbf/kbf.toml:ro
       - ./tls:/etc/kbf/tls:ro
@@ -52,8 +53,7 @@ services:
         condition: service_healthy
 
   frontend-b:
-    image: kbf-frontend:local
-    command: ["kbf", "--config", "/etc/kbf/kbf.toml"]
+    image: kbf-frontend:${KBF_COMMIT:?set KBF_COMMIT to the release commit}
     volumes:
       - ./frontend-b.toml:/etc/kbf/kbf.toml:ro
       - ./tls:/etc/kbf/tls:ro
