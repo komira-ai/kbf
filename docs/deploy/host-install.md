@@ -760,6 +760,11 @@ Three things to know when you set it up:
   (not `--api-listen 127.0.0.1:...`), or `/readyz` is never seen and every switch fails. Writes
   still require a loopback peer, which Docker's NAT does not give an outside caller; the drain
   runs inside the container, where the peer is loopback.
+- **On the host network** (`network = "host"`, passed as `docker run --network host`), the
+  container shares the host's network. Give no `ports`: there is nothing to publish, and `--publish`
+  has no effect with the host network. `api` is then the operator listen address on the host itself, so
+  `--api-listen 127.0.0.1:...` works, and writes from a loopback peer are accepted. The other
+  frontend listeners are the host's own ports.
 - **The health the updater's agent reports is what the last switch saw.** It comes from the
   release this program recorded as current, which `switch` sets after `/readyz` answered 200 on
   the target commit. It is not a probe made at each heartbeat: a container that crashes later is

@@ -162,7 +162,8 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
   the certificate and the CA are its files. The agent renews the certificate at half its life
   and writes the new one there; `--enroll-frontend` is where. The certificate is the farm CA's `updater`
   certificate: its one DNS name is this node's id and its `urn:kbf:host-role:` is what the host
-  runs (`storage`, `daemon` or `mac-daemon`; a `frontend` is refused, the roll updates frontends).
+  runs (`frontend`, `storage`, `daemon` or `mac-daemon`; a `frontend` host's helper runs the
+  frontend as a container, see [A frontend host](#a-frontend-host)).
   The agent reads both from it. The files are read for every heartbeat and every call to the
   frontend, so a renewed pair is used from the next one, if it names the same node and role as the
   pair the agent started with (a pair for another node is refused until the agent is restarted).
@@ -203,6 +204,25 @@ with the same run configuration, waits for `/readyz` and `/healthz` on the targe
 the old image back on any failure; the agent's health check is the helper's word that the release
 runs. The coordinator orders frontends one at a time and never the last one that is ready; the
 helper adds its own refusal when a `peers` entry of its configuration is not ready.
+
+**A lone frontend is never updated by the coordinator.** A frontend is ordered only when at least
+`max(KBF_MIN_UP_FRONTEND, 1)` *other* frontends are up (`required_up` in
+`crates/kbf-coordinator/src/decide.rs`), so with one frontend there is nobody else and no order is
+ever sent, whatever `KBF_MIN_UP_FRONTEND` says; the deploy job then fails when the stall or the
+deadline passes. A storage host is in the same case when `KBF_MIN_UP_STORAGE` is 1 or more (the
+default) and it is the only one. For a farm the coordinator deploys, run two or more frontends. With
+one, update it by hand in a maintenance window, through its helper's socket
+([host-install.md](host-install.md#the-five-requests)), as the socket's account:
+
+```text
+install kbf=<version> from <channel>
+switch kbf=<version>
+confirm kbf=<version>
+```
+
+The farm's frontend is down for the length of the switch (its `drain_secs`, the stop, and
+`ready_secs`), so do it when nothing needs it. The switch answers `switched` only after `/readyz` answered 200 on the
+new commit; send `confirm` then, or the helper reverts at the window's deadline.
 
 ### The heartbeat
 
@@ -256,6 +276,8 @@ kbf-updater enroll --frontend <dns name>:<port> --node-id ID --token-file FILE -
    the node id and the host role; a token for a node's roles (`storage`, `daemon`) is refused for
    an updater, and an updater token is refused for any other role, for another node id, a second
    time and after it expired.
+   A frontend host is enrolled the same way, with `"host_role": "frontend"` in the token. The word
+   `frontend` is refused only in the token's `roles` list (`Role::from_str`), never as the `host_role`.
 2. On the host, as the agent's account, the token goes in a file of that account's with mode 0600
    and the state directory is that account's with mode 0700 (the command refuses otherwise,
    before it reads the token). The command makes the key on the host (mode 0600; only a request
