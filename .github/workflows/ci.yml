@@ -212,9 +212,12 @@ jobs:
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --profile pr
       # What the test run left on the disk, so a run that ran the runner out of room says
       # which directories grew (the instrumented build, the tests' own temporary files).
-      - name: Disk use after the tests (report)
+      - name: Free disk after the tests (report)
         if: ${{ always() }}
-        run: 'df -h / ; du -xh --max-depth=3 target 2>/dev/null | sort -h | tail -n 25'
+        run: df -h /
+      - name: Disk use under target after the tests (report)
+        if: ${{ always() }}
+        run: du -xhd 2 target
       # No step below runs Postgres tests on their own: they are in the run above, which
       # fails any of them when KBF_TEST_POSTGRES_URL (set for the job) names no server.
       - name: Report
