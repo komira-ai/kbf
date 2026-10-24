@@ -87,6 +87,10 @@ pub const USER_LOG_DIR: &str = "/private/var/tmp";
 pub struct Share {
     pub dir: PathBuf,
     pub tagged: PathBuf,
+    /// Where the frames the guest sends over vsock are written: on the host, outside every
+    /// directory the guest can write to, and closed to other users (0700). Nothing in the
+    /// share can stand in for a frame, or redirect where one is written.
+    pub received: PathBuf,
 }
 
 impl Share {
@@ -99,7 +103,8 @@ impl Share {
 /// Makes fresh share directories for the VM `name`, with the results directory and, when
 /// given, the guest binary. A directory a previous run left is removed first (a symbolic
 /// link is removed, not followed). The results and tagged directories are world-writable
-/// because the guest's unprivileged daemons write into them.
+/// because the guest's unprivileged daemons write into them; the directory the host
+/// receives frames in (`received`) is private to the host.
 ///
 /// # Errors
 /// A directory or the copy could not be made.
@@ -107,8 +112,11 @@ pub fn prepare_share(ctx: &Ctx<'_>, name: &str) -> Result<Share, String> {
     let dir = ctx.work.join(format!("{name}-share"));
     let tagged = ctx.work.join(format!("{name}-tagged"));
     let results = dir.join(RESULTS);
+    let received = ctx.work.join(format!("{name}-results"));
     remove_leftover(&dir);
     remove_leftover(&tagged);
+    remove_leftover(&received);
+    make_dir(&received, 0o700)?;
     make_dir(&dir, 0o755)?;
     make_dir(&tagged, 0o777)?;
     make_dir(&results, 0o777)?;
@@ -116,7 +124,11 @@ pub fn prepare_share(ctx: &Ctx<'_>, name: &str) -> Result<Share, String> {
         copy_exclusive(bin, &dir.join(GUEST_BIN))
             .map_err(|e| format!("copy {} into the share: {e}", bin.display()))?;
     }
-    Ok(Share { dir, tagged })
+    Ok(Share {
+        dir,
+        tagged,
+        received,
+    })
 }
 
 /// Makes the new directory `path` with exactly `mode` (not reduced by the umask).
@@ -184,12 +196,13 @@ pub struct GuestRun {
     pub traffic: Value,
 }
 
-/// Waits for each of `wanted` (file names under the results directory) and reads them.
-pub fn collect(ctx: &Ctx<'_>, vm: &mut Vm, share: &Share, wanted: &[&str]) -> GuestRun {
+/// Waits for each of `wanted` (file names under `dir`: the share's results directory, or
+/// the host's `received` directory when the guest sends over vsock) and reads them.
+pub fn collect(ctx: &Ctx<'_>, vm: &mut Vm, dir: &Path, wanted: &[&str]) -> GuestRun {
     let mut results = BTreeMap::new();
     let mut missing = Vec::new();
     for name in wanted {
-        let path = share.results().join(name);
+        let path = dir.join(name);
         if vm
             .wait_file(&path, ctx.timing.guest_timeout, ctx.timing.tick)
             .is_none()
@@ -765,6 +778,11 @@ mod tests {
         let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
         assert_eq!(mode(&share.results()), 0o777);
         assert_eq!(mode(&share.tagged), 0o777);
+        // The directory frames are received in is the host's: private, and not in the share.
+        assert_eq!(mode(&share.received), 0o700);
+        assert!(share.received.is_dir());
+        assert!(!share.received.starts_with(&share.dir));
+        assert_eq!(share.received, work.join("vm-results"));
         let bin = work.join("kbf-guest-src");
         std::fs::write(&bin, "bin").expect("bin");
         c.guest_binary = Some(bin);
@@ -855,7 +873,7 @@ mod tests {
         let run = collect(
             &c,
             &mut vm,
-            &share,
+            &share.results(),
             &["a.json", "b.json", "c.json", "d.json"],
         );
         assert_eq!(run.results["a.json"]["k"], 1);

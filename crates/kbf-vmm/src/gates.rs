@@ -33,7 +33,7 @@ pub(crate) fn clean(ctx: &Ctx<'_>, vms: &mut [Vm]) {
         return;
     }
     for vm in vms.iter() {
-        for suffix in ["", "-share", "-tagged"] {
+        for suffix in ["", "-share", "-tagged", "-results"] {
             let _ = std::fs::remove_dir_all(ctx.work.join(format!("{}{suffix}", vm.name)));
         }
     }
@@ -85,8 +85,8 @@ pub(crate) fn attach_share(spec: &mut VmSpec, share: &Share, channels: Channels)
     if channels.vsock {
         spec.vsock_ports = vec![guest::VSOCK_PORT];
         // The guest sends its results and markers on that port; the helper writes them into
-        // the results directory the probes read.
-        spec.results_dir = Some(share.results());
+        // the host's private directory, never into the share the guest can write.
+        spec.results_dir = Some(share.received.clone());
     }
     if channels.console {
         spec.console_ports = vec![guest::CONSOLE_NAME.to_owned()];
@@ -273,7 +273,13 @@ fn guest_session(
             true,
         ));
     }
-    let run = guest::collect(ctx, &mut vm, &share, wanted);
+    // Over vsock the answer is in the host's own directory; otherwise in the share.
+    let from = if channels.vsock {
+        share.received.clone()
+    } else {
+        share.results()
+    };
+    let run = guest::collect(ctx, &mut vm, &from, wanted);
     clean(ctx, std::slice::from_mut(&mut vm));
     Ok((run, boot, have_binary))
 }

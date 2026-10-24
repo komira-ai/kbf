@@ -19,8 +19,16 @@ use crate::system::{OfflineFile, Poll, Signature, System, VmProcess};
 pub struct Script {
     /// Answers to `poll`, in order; then `Quiet`.
     pub events: Vec<Poll>,
-    /// Files the "guest" writes into `<automount>/results/` as soon as the helper starts.
+    /// Files the "guest" delivers as soon as the helper starts: over vsock into the spec's
+    /// results directory when it has one (as a real guest does), else into
+    /// `<automount>/results/`.
     pub guest_files: Vec<(String, String)>,
+    /// Files the "guest" writes into the share's `results/` directory whatever the spec
+    /// says (the fallback path, or a guest faking a frame).
+    pub share_files: Vec<(String, String)>,
+    /// Files delivered like `guest_files` but only once the helper has been polled this many
+    /// times: a guest whose frames arrive one after another.
+    pub late_files: Vec<(u32, String, String)>,
     /// Whether the helper exits after `request_stop`.
     pub exits_on_stop: bool,
     /// Whether the guest obeys a shutdown request (the helper then exits by itself).
@@ -35,6 +43,8 @@ impl Script {
         Self {
             events: vec![Poll::Event(Event::Started { ms: 100 })],
             guest_files: Vec::new(),
+            share_files: Vec::new(),
+            late_files: Vec::new(),
             exits_on_stop: true,
             obeys_shutdown: true,
             log: None,
@@ -55,6 +65,8 @@ impl Script {
                 code: code.map(str::to_owned),
             })],
             guest_files: Vec::new(),
+            share_files: Vec::new(),
+            late_files: Vec::new(),
             exits_on_stop: true,
             obeys_shutdown: true,
             log: None,
@@ -64,6 +76,19 @@ impl Script {
     /// Adds a file the guest writes.
     pub fn with_guest_file(mut self, name: &str, body: &str) -> Self {
         self.guest_files.push((name.to_owned(), body.to_owned()));
+        self
+    }
+
+    /// Adds a file the guest writes into the share's `results/` directory itself.
+    pub fn with_share_file(mut self, name: &str, body: &str) -> Self {
+        self.share_files.push((name.to_owned(), body.to_owned()));
+        self
+    }
+
+    /// Adds a frame the guest delivers after the helper has been polled `polls` times.
+    pub fn delivering_after(mut self, polls: u32, name: &str, body: &str) -> Self {
+        self.late_files
+            .push((polls, name.to_owned(), body.to_owned()));
         self
     }
 
@@ -89,6 +114,9 @@ impl Script {
 pub struct FakeProc {
     pid: u32,
     events: VecDeque<Poll>,
+    /// Frames still to arrive: the poll count they are due at, where, and what.
+    late: Vec<(u32, PathBuf, String)>,
+    polls: u32,
     killed: bool,
     stop_asked: bool,
     shutdown_asked: bool,
@@ -105,6 +133,15 @@ impl VmProcess for FakeProc {
         self.pid
     }
     fn poll(&mut self, wait: Duration) -> Poll {
+        self.polls += 1;
+        let polls = self.polls;
+        self.late.retain(|(due, path, body)| {
+            let arrived = polls >= *due;
+            if arrived {
+                std::fs::write(path, body).expect("late guest file");
+            }
+            !arrived
+        });
         if self.killed {
             return Poll::Gone {
                 code: None,
@@ -251,18 +288,36 @@ impl System for FakeSystem {
             .borrow_mut()
             .pop_front()
             .unwrap_or_else(Script::booted);
-        if let Some(dir) = &spec.automount_dir {
-            for (name, body) in &script.guest_files {
-                let path = dir.join("results").join(name);
-                std::fs::create_dir_all(path.parent().expect("parent")).expect("results dir");
+        let write = |dir: &Path, files: &[(String, String)]| {
+            for (name, body) in files {
+                let path = dir.join(name);
+                std::fs::create_dir_all(dir).expect("results dir");
                 std::fs::write(path, body).expect("guest file");
             }
+        };
+        let mut late = Vec::new();
+        if let Some(dir) = &spec.automount_dir {
+            let share = dir.join("results");
+            write(&share, &script.share_files);
+            match &spec.results_dir {
+                Some(received) => write(received, &script.guest_files),
+                None => write(&share, &script.guest_files),
+            }
+            let into = spec.results_dir.clone().unwrap_or(share);
+            std::fs::create_dir_all(&into).expect("results dir");
+            late = script
+                .late_files
+                .iter()
+                .map(|(n, name, body)| (*n, into.join(name), body.clone()))
+                .collect();
         }
         let pid = self.next_pid.get();
         self.next_pid.set(pid + 1);
         Ok(Box::new(FakeProc {
             pid,
             events: script.events.into(),
+            late,
+            polls: 0,
             killed: false,
             stop_asked: false,
             shutdown_asked: false,

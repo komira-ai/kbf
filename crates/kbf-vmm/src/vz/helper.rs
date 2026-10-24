@@ -5,11 +5,8 @@
 //! the guest to stop. Closing stdin force-stops the VM. The main
 //! thread only waits on channels; it is never needed by the framework.
 
-use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::mem::ManuallyDrop;
-use std::os::fd::{FromRawFd, RawFd};
-use std::path::PathBuf;
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -28,7 +25,7 @@ use objc2_virtualization::{
 
 use super::config::{self, ConsoleFds};
 use super::{Queued, Shared, describe};
-use crate::sink::{self, Limiter, MAX_CONNECTIONS};
+use crate::sink::{self, Limiter, MAX_CONNECTIONS, Results};
 use crate::spec::{Event, SHUTDOWN_COMMAND, VmSpec};
 
 /// Prints one event line.
@@ -38,13 +35,10 @@ fn emit(e: &Event) {
     let _ = out.flush();
 }
 
-/// How long the host waits for the next frame of a connection before it gives up on it.
-const FRAME_READ_TIMEOUT_SECS: libc::time_t = 30;
-
-/// Where connections are served from: the results directory and the bound on how many
-/// run at once.
+/// Where connections are served from: the host's results directory, opened once, and the
+/// bound on how many run at once.
 struct Sink {
-    dir: PathBuf,
+    results: Arc<Results>,
     limiter: Limiter,
 }
 
@@ -128,9 +122,9 @@ define_class!(
             // thread only drops this reference (it uses the raw descriptor, never a
             // message to the object), so releasing it on that thread is sound.
             let keep = unsafe { Shared::new(connection.retain()) };
-            let dir = sink.dir.clone();
+            let results = sink.results.clone();
             std::thread::spawn(move || {
-                serve_connection(fd, &dir);
+                serve_connection(fd, &results);
                 drop(keep);
                 drop(permit);
             });
@@ -139,41 +133,16 @@ define_class!(
     }
 );
 
-/// Answers the frames on the connection `fd` until it ends, writing them under `dir`.
-///
-/// UNCERTAIN (checked only by the first run on a Mac): that the descriptor of a
-/// `VZVirtioSocketConnection` is an ordinary stream socket that `read(2)` and `write(2)`
-/// serve and that honours `SO_RCVTIMEO`. Apple documents the descriptor but not its type.
-fn serve_connection(fd: RawFd, dir: &std::path::Path) {
-    let timeout = libc::timeval {
-        tv_sec: FRAME_READ_TIMEOUT_SECS,
-        tv_usec: 0,
-    };
-    // SAFETY: `timeout` is a `timeval` and its size is passed; a failure only means reads
-    // can block, which the end of the VM ends too.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            std::ptr::from_ref(&timeout).cast(),
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        eprintln!(
-            "kbf-vmm: vsock read timeout not set: {}",
-            std::io::Error::last_os_error()
-        );
+/// Answers the frames on the connection `fd` until it ends, writing them into `results`.
+/// A connection whose timeouts cannot be set is dropped unread.
+fn serve_connection(fd: RawFd, results: &Results) {
+    match sink::serve_socket(fd, results, &mut std::io::stderr()) {
+        Ok(served) => eprintln!(
+            "kbf-vmm: vsock connection ended ({:?}): {} stored, {} refused",
+            served.end, served.stored, served.refused
+        ),
+        Err(e) => eprintln!("kbf-vmm: vsock {e}"),
     }
-    // SAFETY: the connection object owns `fd` and outlives this call (see `should_accept`),
-    // so the `File` must never close it: `ManuallyDrop` keeps it from doing so.
-    let mut stream = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
-    let served = sink::serve(&mut *stream, dir, &mut std::io::stderr());
-    eprintln!(
-        "kbf-vmm: vsock connection ended ({:?}): {} stored, {} refused",
-        served.end, served.stored, served.refused
-    );
 }
 
 impl Observer {
@@ -233,8 +202,6 @@ fn fail(stage: &str, message: String, code: Option<String>) -> Result<(), String
     Err(message)
 }
 
-/// Releases the VM, its delegate and its listeners on the VM's queue, where the framework
-/// expects every call on them, instead of on whichever thread drops the last reference.
 /// Asks the guest to shut down, on the VM's queue, and reports the request (or why it
 /// failed). The guest stopping is reported by the delegate.
 fn request_guest_shutdown(
@@ -264,6 +231,8 @@ fn request_guest_shutdown(
     });
 }
 
+/// Releases the VM, its delegate and its listeners on the VM's queue, where the framework
+/// expects every call on them, instead of on whichever thread drops the last reference.
 fn release_on_queue(queue: &DispatchQueue, holder: &Holder) {
     let h = holder.clone();
     queue.exec_sync(move || {
@@ -297,7 +266,12 @@ pub fn run(spec: &VmSpec) -> Result<(), String> {
 
     let cfg = Queued::new(built.config);
     let ports = spec.vsock_ports.clone();
-    let results_dir = spec.results_dir.clone();
+    // Opened before the VM starts, without following a link; every file is made through
+    // this descriptor.
+    let results = match spec.results_dir.as_deref().map(Results::open).transpose() {
+        Ok(r) => r.map(Arc::new),
+        Err(e) => return fail("results", e, None),
+    };
     let q = queue.clone();
     let (h, gs, dtx) = (holder.clone(), guest_stopped.clone(), done_tx.clone());
     queue.exec_async(move || {
@@ -310,8 +284,8 @@ pub fn run(spec: &VmSpec) -> Result<(), String> {
                 cfg.get(),
                 &q,
             );
-            let sink = results_dir.map(|dir| Sink {
-                dir,
+            let sink = results.map(|results| Sink {
+                results,
                 limiter: Limiter::new(MAX_CONNECTIONS),
             });
             let observer = Observer::new(dtx, gs, began, sink);

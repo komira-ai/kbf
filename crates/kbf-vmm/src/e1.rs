@@ -53,11 +53,11 @@ const EXPECTED: [&str; 5] = [
 ];
 
 impl Arm {
-    /// Records the expected frames that are in the results directory and not yet seen,
-    /// at host time `ms`. Existence only, without following a link the guest may have
-    /// left.
+    /// Records the expected frames that are in the directory the host received them in and
+    /// not yet seen, at host time `ms`. The share is not looked at: a file the guest puts
+    /// there is not a frame it sent over vsock, and a guest can write anything to it.
     fn look(&mut self, ms: u64) {
-        let dir = self.share.results();
+        let dir = &self.share.received;
         for name in EXPECTED {
             let seen = self.frames.iter().any(|(n, _)| *n == name);
             if !seen && std::fs::symlink_metadata(dir.join(name)).is_ok() {
@@ -93,7 +93,7 @@ fn names(dir: &Path) -> Vec<String> {
 
 /// Removes the share directories of `name` (a start that failed leaves them).
 fn remove_shares(ctx: &Ctx<'_>, name: &str) {
-    for suffix in ["-share", "-tagged"] {
+    for suffix in ["-share", "-tagged", "-results"] {
         let _ = std::fs::remove_dir_all(ctx.work.join(format!("{name}{suffix}")));
     }
 }
@@ -221,7 +221,8 @@ fn arm_json(ctx: &Ctx<'_>, vm: &Vm, arm: &Arm) -> Value {
         "trace": vm.trace_json(),
         "samples": arm.samples.iter().map(Sample::json).collect::<Vec<_>>(),
         "activity": sampler::summarize(&arm.samples),
-        "results_files": names(&arm.share.results()),
+        "results_files": names(&arm.share.received),
+        "share_files": names(&arm.share.results()),
         "matrix_host": matrix::host_listing(&arm.matrix),
         "helper_log": vm.proc.diagnostics(),
         "harvest": format!(
@@ -396,10 +397,7 @@ mod tests {
         let starts = sys.starts.borrow();
         for (spec, name) in starts.iter().map(|(s, _)| s).zip(["e1-x", "e1-y"]) {
             assert_eq!(spec.vsock_ports, [crate::guest::VSOCK_PORT]);
-            assert_eq!(
-                spec.results_dir,
-                Some(work.join(format!("{name}-share")).join("results"))
-            );
+            assert_eq!(spec.results_dir, Some(work.join(format!("{name}-results"))));
         }
     }
 
@@ -493,41 +491,31 @@ mod tests {
 
     /// Catches a run that stops at the first frame, as run 6 did (three samples, then the
     /// VMs were stopped before the root probe, the login marker and the diagnosis came):
-    /// the later frames arrive on their own time, the run waits for them, and each is
-    /// reported with its own time and none is listed missing.
+    /// the later frames arrive on their own polls, the run waits for them, and each is
+    /// reported in arrival order with a time that does not go back, none missing.
     #[test]
     fn the_run_waits_for_every_frame_and_reports_the_time_of_each() {
         let work = work_with_base("e1-all-frames");
         let sys = FakeSystem::new();
-        sys.script(Script::booted().with_guest_file(guest::READY_SYSTEM, "{}"));
-        sys.script(Script::booted().with_guest_file(guest::READY_SYSTEM, "{}"));
-        let mut c = guest_ctx(&sys, &work);
-        c.timing.guest_timeout = Duration::from_secs(20);
-        let later = |name: &'static str| {
-            let results = work.join(name).join("results");
-            let late = [
-                guest::READY_LOGIN,
-                guest::ROOT_RESULT,
-                guest::USER_RESULT,
-                kbf_guest::diag::REPORT_NAME,
-            ];
-            std::thread::spawn(move || {
-                while !results.join(guest::READY_SYSTEM).exists() {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                for f in late {
-                    std::thread::sleep(Duration::from_millis(60));
-                    std::fs::write(results.join(f), "{}").expect("frame");
-                }
-            })
+        let guest = || {
+            [
+                (guest::READY_LOGIN, 20),
+                (guest::ROOT_RESULT, 40),
+                (guest::USER_RESULT, 60),
+                (kbf_guest::diag::REPORT_NAME, 80),
+            ]
+            .into_iter()
+            .fold(
+                Script::booted().with_guest_file(guest::READY_SYSTEM, "{}"),
+                |s, (name, after)| s.delivering_after(after, name, "{}"),
+            )
         };
-        let writers = [later("e1-x-share"), later("e1-y-share")];
-        let began = Instant::now();
+        sys.script(guest());
+        sys.script(guest());
+        let mut c = guest_ctx(&sys, &work);
+        // Long enough never to be the reason the run ends; the frames end it.
+        c.timing.guest_timeout = Duration::from_secs(600);
         let r = e1(&c);
-        for w in writers {
-            w.join().expect("writer");
-        }
-        assert!(began.elapsed() < Duration::from_secs(10));
         for i in 0..2 {
             let a = arm(&r, i);
             assert_eq!(a["frames_missing"], json!([]));
@@ -537,20 +525,52 @@ mod tests {
                 .iter()
                 .map(|f| f["name"].as_str().expect("name"))
                 .collect();
-            assert_eq!(names[0], guest::READY_SYSTEM);
-            assert_eq!(names.len(), 5);
+            assert_eq!(
+                names,
+                [
+                    guest::READY_SYSTEM,
+                    guest::READY_LOGIN,
+                    guest::ROOT_RESULT,
+                    guest::USER_RESULT,
+                    kbf_guest::diag::REPORT_NAME
+                ]
+            );
             let times: Vec<u64> = a["frames"]
                 .as_array()
                 .expect("frames")
                 .iter()
                 .map(|f| f["ms"].as_u64().expect("ms"))
                 .collect();
-            assert!(times.windows(2).all(|w| w[0] <= w[1]));
-            assert!(times[4] > times[0], "{times:?}");
+            assert!(times.windows(2).all(|w| w[0] <= w[1]), "{times:?}");
             assert_eq!(a["guest_marker"], guest::READY_SYSTEM);
         }
         let summary = r.summary.expect("summary");
         assert!(summary.contains("frames missing []"), "{summary}");
+    }
+
+    /// Catches a guest that fakes frames: a file the guest puts in the share is not a frame
+    /// it sent over vsock (the share is the guest's to write), so it is not counted, is
+    /// still listed as missing, and is shown apart from what was received.
+    #[test]
+    fn files_a_guest_puts_in_the_share_are_not_frames() {
+        let work = work_with_base("e1-spoof");
+        let sys = FakeSystem::new();
+        let mut spoof = Script::booted();
+        for f in EXPECTED {
+            spoof = spoof.with_share_file(f, "{}");
+        }
+        sys.script(spoof);
+        sys.script(Script::booted().with_guest_file(guest::READY_LOGIN, "{}"));
+        let r = e1(&guest_ctx(&sys, &work));
+        let x = arm(&r, 0);
+        assert!(x["guest_marker"].is_null());
+        assert_eq!(x["frames"], json!([]));
+        assert_eq!(x["frames_missing"].as_array().map(Vec::len), Some(5));
+        assert_eq!(x["results_files"], json!([]));
+        assert_eq!(x["share_files"].as_array().map(Vec::len), Some(5));
+        let y = arm(&r, 1);
+        assert_eq!(y["guest_marker"], guest::READY_LOGIN);
+        assert_eq!(y["share_files"], json!([]));
     }
 
     /// Catches a report that hides what did not arrive: the frames that never came are

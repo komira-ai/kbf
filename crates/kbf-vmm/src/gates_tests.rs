@@ -299,7 +299,7 @@ fn g2_retries_without_the_console_port_and_g3_never_asks_for_the_channels() {
 }
 
 /// Catches a vsock listener whose frames go nowhere (no results directory), a results
-/// directory that is not the one the probes read, and a VM without the listener that is
+/// directory inside the share the guest can write to, and a VM without the listener that is
 /// given a sink anyway.
 #[test]
 fn the_results_directory_is_attached_with_the_vsock_port_only() {
@@ -308,14 +308,19 @@ fn the_results_directory_is_attached_with_the_vsock_port_only() {
     let share = Share {
         dir: "/w/vm-share".into(),
         tagged: "/w/vm-tagged".into(),
+        received: "/w/vm-results".into(),
     };
     let mut with = crate::spec::VmSpec::minimal("/w/vm".into());
     attach_share(&mut with, &share, Channels::VSOCK);
     assert_eq!(with.vsock_ports, [VSOCK_PORT]);
-    assert_eq!(with.results_dir, Some(share.results()));
-    assert_eq!(
-        with.results_dir.as_deref(),
-        Some(std::path::Path::new("/w/vm-share/results"))
+    assert_eq!(with.results_dir, Some(share.received.clone()));
+    // Not a directory of the share, which the guest can write to.
+    assert!(
+        !with
+            .results_dir
+            .as_deref()
+            .expect("dir")
+            .starts_with(&share.dir)
     );
     let mut without = crate::spec::VmSpec::minimal("/w/vm".into());
     attach_share(&mut without, &share, Channels::NONE);
@@ -723,6 +728,7 @@ fn a_guest_gets_the_share_under_its_own_tag_beside_the_automount_one() {
     let share = Share {
         dir: "/w/vm-share".into(),
         tagged: "/w/vm-tagged".into(),
+        received: "/w/vm-results".into(),
     };
     let mut spec = crate::spec::VmSpec::minimal("/w/vm".into());
     attach_share(&mut spec, &share, Channels::NONE);

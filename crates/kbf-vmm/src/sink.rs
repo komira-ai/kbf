@@ -2,18 +2,30 @@
 //! (`kbf_guest::frame`) become files in the VM's results directory, exactly where the
 //! probes read them from the share (`ready-system`, `guest-probe-root.json`, ...).
 //!
-//! The guest is not trusted. A frame names a file; the name is checked before any path is
-//! made from it (no separator, no leading dot, no `..`, bounded length), the file is made
-//! under a name no guest name can have and renamed into place (so a reader never sees half
-//! of it and a link the guest planted is replaced, not followed), a log is capped, and a
-//! connection carries a bounded number of frames. [`Limiter`] bounds the connections.
+//! The guest is not trusted, and the results directory is on the host, outside every
+//! directory the guest can write to (a share the guest can write would let it swap the
+//! directory for a link and send the host's writes anywhere). [`Results`] opens it once,
+//! without following a link, and makes every file through that descriptor (`openat`,
+//! `renameat`), so nothing the guest does to a path can redirect a write.
+//!
+//! A frame names a file; the name is checked before any path is made from it (no
+//! separator, no leading dot, no `..`, bounded length), the file is made under a name no
+//! guest name can have and renamed into place (so a reader never sees half of it), a log
+//! is capped, and the whole VM may create only [`MAX_FILES`] files and [`MAX_TOTAL_BYTES`]
+//! bytes. A connection carries a bounded number of frames, each within a deadline.
+//! [`Limiter`] bounds the connections.
 
-use std::fs::OpenOptions;
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::mem::ManuallyDrop;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use kbf_guest::frame::{Frame, Kind, read_frame, write_frame};
 
@@ -25,6 +37,16 @@ pub const MAX_FRAMES_PER_CONNECTION: u32 = 256;
 pub const MAX_NAME_BYTES: usize = 100;
 /// The most one `<name>.log` file may hold.
 pub const MAX_LOG_BYTES: u64 = 4 << 20;
+/// The most distinct files one VM may create in its results directory.
+pub const MAX_FILES: usize = 64;
+/// The most bytes all of one VM's files may hold together.
+pub const MAX_TOTAL_BYTES: u64 = 64 << 20;
+/// The longest one frame may take to arrive, from the wait for its first byte to its last.
+/// A single read is bounded too ([`READ_TIMEOUT_SECS`]), but a guest that sends a byte
+/// just inside that bound would hold a slot for ever without this.
+pub const FRAME_DEADLINE: Duration = Duration::from_secs(30);
+/// The longest one read or write on a connection may block.
+pub const READ_TIMEOUT_SECS: libc::time_t = 5;
 
 /// Whether `name` is safe to make a file name of.
 ///
@@ -55,62 +77,239 @@ fn part_name(name: &str) -> String {
     format!(".{name}.{}.part", COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
-/// Writes `frame` under `dir` and returns the file's path.
-///
-/// `ready` and `result` frames replace the file `<name>`; a `log` frame is appended to
-/// `<name>.log` up to [`MAX_LOG_BYTES`].
-///
-/// # Errors
-/// The kind is a reply kind, the name is unsafe, the log is full, or the file cannot be
-/// written (the text says which).
-pub fn store(dir: &Path, frame: &Frame) -> Result<PathBuf, String> {
-    check_name(&frame.name)?;
-    match frame.kind {
-        Kind::Ready | Kind::Result => {
-            let target = dir.join(&frame.name);
-            let part = dir.join(part_name(&frame.name));
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o644)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&part)
-                .map_err(|e| format!("create {}: {e}", part.display()))?;
-            let written = file
-                .write_all(frame.body.as_bytes())
-                .and_then(|()| std::fs::rename(&part, &target));
-            if let Err(e) = written {
-                let _ = std::fs::remove_file(&part);
-                return Err(format!("write {}: {e}", target.display()));
-            }
-            Ok(target)
+/// The state the budget and the log caps are judged on, held under one lock so that two
+/// connections writing the same name cannot both pass a check that only one may.
+#[derive(Debug, Default)]
+struct Spent {
+    /// The bytes each file made so far holds, by file name.
+    files: HashMap<String, u64>,
+    total: u64,
+}
+
+/// A VM's results directory on the host, opened once; every file is made through the
+/// descriptor.
+#[derive(Debug)]
+pub struct Results {
+    dir: File,
+    path: PathBuf,
+    spent: Mutex<Spent>,
+}
+
+/// `openat(2)` of `name` under `dir`, without following a link at the leaf.
+fn open_at(dir: RawFd, name: &str, flags: libc::c_int) -> io::Result<File> {
+    let name = CString::new(name).map_err(io::Error::other)?;
+    // SAFETY: `dir` is a descriptor `Results` keeps open and `name` is NUL-terminated and
+    // outlives the call; the returned descriptor is owned by the `File` made from it.
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::c_uint::from(0o600_u16),
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by openat(2) and nothing else owns it.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn rename_at(dir: RawFd, from: &str, to: &str) -> io::Result<()> {
+    let (from, to) = (
+        CString::new(from).map_err(io::Error::other)?,
+        CString::new(to).map_err(io::Error::other)?,
+    );
+    // SAFETY: both are NUL-terminated and outlive the call; `dir` stays open.
+    let rc = unsafe { libc::renameat(dir, from.as_ptr(), dir, to.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn unlink_at(dir: RawFd, name: &str) {
+    if let Ok(name) = CString::new(name) {
+        // SAFETY: `name` is NUL-terminated and outlives the call; `dir` stays open.
+        let _ = unsafe { libc::unlinkat(dir, name.as_ptr(), 0) };
+    }
+}
+
+impl Results {
+    /// Opens `path`, which must be a directory (not a link to one), owned by this user and
+    /// closed to everyone else (mode 0700).
+    ///
+    /// # Errors
+    /// It cannot be opened, is a link, or is not private.
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|e| format!("open the results directory {}: {e}", path.display()))?;
+        let meta = dir
+            .metadata()
+            .map_err(|e| format!("stat {}: {e}", path.display()))?;
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return Err(format!("{} is not owned by this user", path.display()));
         }
-        Kind::Log => {
-            let target = dir.join(format!("{}.log", frame.name));
-            let mut file = OpenOptions::new()
-                .append(true)
-                .create(true)
-                .mode(0o644)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(&target)
+        if meta.mode() & 0o077 != 0 {
+            return Err(format!(
+                "{} is open to other users (mode {:o}); it must be 0700",
+                path.display(),
+                meta.mode() & 0o777
+            ));
+        }
+        Ok(Self {
+            dir,
+            path: path.to_owned(),
+            spent: Mutex::new(Spent::default()),
+        })
+    }
+
+    /// The directory's path, for messages.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Writes `frame` and returns the file's path.
+    ///
+    /// `ready` and `result` frames replace the file `<name>`; a `log` frame is appended to
+    /// `<name>.log` up to [`MAX_LOG_BYTES`]. At most [`MAX_FILES`] files and
+    /// [`MAX_TOTAL_BYTES`] bytes in all.
+    ///
+    /// # Errors
+    /// The kind is a reply kind, the name is unsafe, a cap or the budget is spent, or the
+    /// file cannot be written (the text says which).
+    pub fn store(&self, frame: &Frame) -> Result<PathBuf, String> {
+        check_name(&frame.name)?;
+        let fd = self.dir.as_raw_fd();
+        let len = frame.body.len() as u64;
+        // One lock for the whole write: the checks and the write are one step.
+        let mut spent = self
+            .spent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match frame.kind {
+            Kind::Ready | Kind::Result => {
+                let old = spent.files.get(&frame.name).copied();
+                spent.admit(&frame.name, old, len)?;
+                let part = part_name(&frame.name);
+                let target = self.path.join(&frame.name);
+                let mut file = open_at(fd, &part, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)
+                    .map_err(|e| format!("create {}: {e}", self.path.join(&part).display()))?;
+                let written = file
+                    .write_all(frame.body.as_bytes())
+                    .and_then(|()| rename_at(fd, &part, &frame.name));
+                if let Err(e) = written {
+                    unlink_at(fd, &part);
+                    return Err(format!("write {}: {e}", target.display()));
+                }
+                spent.record(&frame.name, old, len);
+                Ok(target)
+            }
+            Kind::Log => {
+                let file_name = format!("{}.log", frame.name);
+                let target = self.path.join(&file_name);
+                let old = spent.files.get(&file_name).copied();
+                if old.unwrap_or(0) + len > MAX_LOG_BYTES {
+                    return Err(format!(
+                        "{} would pass {MAX_LOG_BYTES} bytes",
+                        target.display()
+                    ));
+                }
+                spent.admit_growth(&file_name, old, len)?;
+                let mut file = open_at(
+                    fd,
+                    &file_name,
+                    libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_NONBLOCK,
+                )
                 .map_err(|e| format!("open {}: {e}", target.display()))?;
-            let meta = file
-                .metadata()
-                .map_err(|e| format!("stat {}: {e}", target.display()))?;
-            if !meta.is_file() {
-                return Err(format!("{} is not a regular file", target.display()));
+                let meta = file
+                    .metadata()
+                    .map_err(|e| format!("stat {}: {e}", target.display()))?;
+                if !meta.is_file() {
+                    return Err(format!("{} is not a regular file", target.display()));
+                }
+                file.write_all(frame.body.as_bytes())
+                    .map_err(|e| format!("write {}: {e}", target.display()))?;
+                spent.files.insert(file_name, old.unwrap_or(0) + len);
+                spent.total += len;
+                Ok(target)
             }
-            if meta.len() + frame.body.len() as u64 > MAX_LOG_BYTES {
-                return Err(format!(
-                    "{} would pass {MAX_LOG_BYTES} bytes",
-                    target.display()
-                ));
+            Kind::Ack | Kind::Refused => {
+                Err("a guest sends ready, result and log frames".to_owned())
             }
-            file.write_all(frame.body.as_bytes())
-                .map_err(|e| format!("write {}: {e}", target.display()))?;
-            Ok(target)
         }
-        Kind::Ack | Kind::Refused => Err("a guest sends ready, result and log frames".to_owned()),
+    }
+}
+
+impl Spent {
+    /// Whether a file `name` that held `old` bytes may be replaced by one of `new`.
+    fn admit(&self, name: &str, old: Option<u64>, new: u64) -> Result<(), String> {
+        self.check(name, old.is_none(), self.total - old.unwrap_or(0) + new)
+    }
+
+    /// Whether a file `name` that held `old` bytes may grow by `by`.
+    fn admit_growth(&self, name: &str, old: Option<u64>, by: u64) -> Result<(), String> {
+        self.check(name, old.is_none(), self.total + by)
+    }
+
+    fn check(&self, name: &str, is_new: bool, total_after: u64) -> Result<(), String> {
+        if is_new && self.files.len() >= MAX_FILES {
+            return Err(format!(
+                "the budget of {MAX_FILES} files is spent; {name} not stored"
+            ));
+        }
+        if total_after > MAX_TOTAL_BYTES {
+            return Err(format!(
+                "the budget of {MAX_TOTAL_BYTES} bytes is spent; {name} not stored"
+            ));
+        }
+        Ok(())
+    }
+
+    fn record(&mut self, name: &str, old: Option<u64>, new: u64) {
+        self.total = self.total - old.unwrap_or(0) + new;
+        self.files.insert(name.to_owned(), new);
+    }
+}
+
+/// A stream whose reads fail once the current frame's deadline has passed; the deadline
+/// is set again at the start of each frame.
+struct Deadline<'a, S> {
+    inner: &'a mut S,
+    frame: Duration,
+    until: Instant,
+}
+
+impl<S> Deadline<'_, S> {
+    fn start_frame(&mut self) {
+        self.until = Instant::now() + self.frame;
+    }
+}
+
+impl<S: Read> Read for Deadline<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if Instant::now() >= self.until {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the frame did not arrive in time",
+            ));
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl<S: Write> Write for Deadline<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -137,17 +336,34 @@ pub struct Served {
     pub end: End,
 }
 
-/// Answers the frames on `stream` until it ends: each is stored under `dir` and answered
+/// Answers the frames on `stream` until it ends: each is stored in `results` and answered
 /// with an `ack`, or answered with `refused` and the reason. A frame that cannot be read
 /// ends the connection (the stream cannot be resynchronised) after one `refused` reply.
 /// Every frame and failure is logged to `log`.
-pub fn serve<S: Read + Write>(stream: &mut S, dir: &Path, log: &mut dyn Write) -> Served {
+pub fn serve<S: Read + Write>(stream: &mut S, results: &Results, log: &mut dyn Write) -> Served {
+    serve_within(stream, results, log, FRAME_DEADLINE)
+}
+
+/// [`serve`] with each frame due within `frame`.
+fn serve_within<S: Read + Write>(
+    stream: &mut S,
+    results: &Results,
+    log: &mut dyn Write,
+    frame: Duration,
+) -> Served {
+    let mut stream = Deadline {
+        inner: stream,
+        frame,
+        until: Instant::now() + frame,
+    };
+    let stream = &mut stream;
     let mut served = Served {
         stored: 0,
         refused: 0,
         end: End::TooManyFrames,
     };
     for _ in 0..MAX_FRAMES_PER_CONNECTION {
+        stream.start_frame();
         let frame = match read_frame(stream) {
             Ok(Some(f)) => f,
             Ok(None) => {
@@ -161,7 +377,7 @@ pub fn serve<S: Read + Write>(stream: &mut S, dir: &Path, log: &mut dyn Write) -
                 return served;
             }
         };
-        let reply = match store(dir, &frame) {
+        let reply = match results.store(&frame) {
             Ok(path) => {
                 let _ = writeln!(
                     log,
@@ -190,6 +406,49 @@ pub fn serve<S: Read + Write>(stream: &mut S, dir: &Path, log: &mut dyn Write) -
         }
     }
     served
+}
+
+/// Sets the read and write timeouts of the connection `fd` to [`READ_TIMEOUT_SECS`].
+///
+/// # Errors
+/// `setsockopt` failed; the connection must not be read without a timeout.
+pub fn set_io_timeouts(fd: RawFd) -> io::Result<()> {
+    let timeout = libc::timeval {
+        tv_sec: READ_TIMEOUT_SECS,
+        tv_usec: 0,
+    };
+    for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+        // SAFETY: `timeout` is a `timeval` and its size is passed.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                std::ptr::from_ref(&timeout).cast(),
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Serves the connection on `fd`, which the caller keeps open (it is not closed here).
+/// The connection is refused, unread, when its timeouts cannot be set.
+///
+/// UNCERTAIN until a Mac ran it, and it did: the descriptor of a
+/// `VZVirtioSocketConnection` is an ordinary stream socket that honours the timeouts.
+///
+/// # Errors
+/// The timeouts could not be set.
+pub fn serve_socket(fd: RawFd, results: &Results, log: &mut dyn Write) -> Result<Served, String> {
+    set_io_timeouts(fd).map_err(|e| format!("connection refused, timeouts not set: {e}"))?;
+    // SAFETY: the caller owns `fd` and keeps it open for this call, so the `File` must
+    // never close it: `ManuallyDrop` keeps it from doing so.
+    let mut stream = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+    Ok(serve(&mut *stream, results, log))
 }
 
 /// Bounds how many connections are served at once.
@@ -234,9 +493,28 @@ impl Limiter {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::os::unix::fs::PermissionsExt;
 
     fn dir(name: &str) -> kbf_testkit::dir::TestDir {
         kbf_testkit::dir::TestDir::under(std::env::temp_dir(), &format!("kbf-vmm-sink-{name}"))
+    }
+
+    /// A private results directory `results` under `d`, opened.
+    fn open(d: &Path) -> (PathBuf, Results) {
+        let path = d.join("results");
+        std::fs::create_dir(&path).expect("results");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        let r = Results::open(&path).expect("open");
+        (path, r)
+    }
+
+    fn names(p: &Path) -> Vec<String> {
+        let mut v: Vec<_> = std::fs::read_dir(p)
+            .expect("dir")
+            .map(|e| e.expect("e").file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
     }
 
     /// Catches a name that could leave the results directory or collide with the sink's
@@ -266,24 +544,49 @@ mod tests {
         assert_eq!(check_name(&"a".repeat(MAX_NAME_BYTES)), Ok(()));
     }
 
+    /// Catches a results directory that a guest or another user could write to, or one
+    /// that is a link: it is refused when it is open to others, owned by someone else's
+    /// mode, a link to a private directory, missing, or a file.
+    #[test]
+    fn the_results_directory_must_be_a_private_directory_and_not_a_link() {
+        let d = dir("open");
+        let open_dir = d.join("open");
+        std::fs::create_dir(&open_dir).expect("dir");
+        for mode in [0o755, 0o770, 0o707, 0o777] {
+            std::fs::set_permissions(&open_dir, std::fs::Permissions::from_mode(mode))
+                .expect("mode");
+            let e = Results::open(&open_dir).expect_err("open to others");
+            assert!(e.contains("must be 0700"), "{e}");
+        }
+        let (real, _) = open(&d);
+        std::os::unix::fs::symlink(&real, d.join("link")).expect("link");
+        let e = Results::open(&d.join("link")).expect_err("a link");
+        assert!(e.contains("open the results directory"), "{e}");
+        assert!(Results::open(&d.join("none")).is_err());
+        std::fs::write(d.join("file"), "x").expect("file");
+        assert!(Results::open(&d.join("file")).is_err());
+    }
+
     /// Catches a ready or result frame that does not land at `<results>/<name>` with the
     /// body byte for byte, one that leaves its temporary file, and one that does not
     /// replace an earlier file (a retried marker).
     #[test]
-    fn ready_and_result_frames_become_the_files_the_probes_read() {
+    fn ready_and_result_frames_become_files_in_the_results_directory() {
         let d = dir("files");
-        let p = store(&d, &Frame::new(Kind::Ready, "ready-system", "{\"a\": 1}\n")).expect("ready");
-        assert_eq!(p, d.join("ready-system"));
+        let (path, r) = open(&d);
+        let p = r
+            .store(&Frame::new(Kind::Ready, "ready-system", "{\"a\": 1}\n"))
+            .expect("ready");
+        assert_eq!(p, path.join("ready-system"));
         assert_eq!(std::fs::read_to_string(&p).expect("read"), "{\"a\": 1}\n");
-        store(&d, &Frame::new(Kind::Result, "ready-system", "second")).expect("again");
+        r.store(&Frame::new(Kind::Result, "ready-system", "second"))
+            .expect("again");
         assert_eq!(std::fs::read_to_string(&p).expect("read"), "second");
-        store(&d, &Frame::new(Kind::Result, "guest-probe-root.json", "{}")).expect("result");
-        let mut names: Vec<_> = std::fs::read_dir(&*d)
-            .expect("dir")
-            .map(|e| e.expect("e").file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        assert_eq!(names, ["guest-probe-root.json", "ready-system"]);
+        r.store(&Frame::new(Kind::Result, "guest-probe-root.json", "{}"))
+            .expect("result");
+        assert_eq!(names(&path), ["guest-probe-root.json", "ready-system"]);
+        let mode = std::fs::metadata(&p).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     /// Catches a frame whose name escapes the directory being written outside it, and the
@@ -291,26 +594,39 @@ mod tests {
     #[test]
     fn a_frame_cannot_write_outside_the_results_directory() {
         let d = dir("escape");
-        let results = d.join("results");
-        std::fs::create_dir(&results).expect("results");
+        let (path, r) = open(&d);
         for name in ["../escaped", "a/../../escaped", "/tmp/escaped", ".part"] {
             for kind in [Kind::Ready, Kind::Result, Kind::Log] {
-                assert!(
-                    store(&results, &Frame::new(kind, name, "x")).is_err(),
-                    "{name}"
-                );
+                assert!(r.store(&Frame::new(kind, name, "x")).is_err(), "{name}");
             }
         }
         for kind in [Kind::Ack, Kind::Refused] {
-            let e = store(&results, &Frame::new(kind, "ok", "x")).expect_err("kind");
+            let e = r.store(&Frame::new(kind, "ok", "x")).expect_err("kind");
             assert!(e.contains("ready, result and log"), "{e}");
         }
-        assert_eq!(std::fs::read_dir(&results).expect("dir").count(), 0);
-        assert_eq!(
-            std::fs::read_dir(&*d).expect("dir").count(),
-            1,
-            "only results/"
-        );
+        assert_eq!(names(&path), Vec::<String>::new());
+        assert_eq!(names(&d), ["results"]);
+    }
+
+    /// Catches the arbitrary host file write the verifier found: a guest that swaps the
+    /// results directory for a link to a directory elsewhere (`mv results r.old; ln -s
+    /// <dir> results`) after the sink opened it. The sink writes through the descriptor it
+    /// opened, so the link's target gets nothing and the frames land in the original.
+    #[test]
+    fn a_results_directory_swapped_for_a_link_after_opening_is_not_followed() {
+        let d = dir("swap");
+        let (path, r) = open(&d);
+        r.store(&Frame::new(Kind::Ready, "before", "1"))
+            .expect("before");
+        let outside = d.join("outside");
+        std::fs::create_dir(&outside).expect("outside");
+        std::fs::rename(&path, d.join("r.old")).expect("move");
+        std::os::unix::fs::symlink(&outside, &path).expect("link");
+        for kind in [Kind::Result, Kind::Ready, Kind::Log] {
+            r.store(&Frame::new(kind, "after", "2")).expect("stored");
+        }
+        assert_eq!(names(&outside), Vec::<String>::new());
+        assert_eq!(names(&d.join("r.old")), ["after", "after.log", "before"]);
     }
 
     /// Catches a symbolic link in the results directory being followed: a marker over a link
@@ -319,18 +635,20 @@ mod tests {
     #[test]
     fn a_link_the_guest_planted_is_replaced_or_refused_never_followed() {
         let d = dir("link");
+        let (path, r) = open(&d);
         let target = d.join("victim");
         std::fs::write(&target, "keep").expect("victim");
-        std::os::unix::fs::symlink(&target, d.join("ready-system")).expect("link");
-        std::os::unix::fs::symlink(&target, d.join("x.log")).expect("link");
-        store(&d, &Frame::new(Kind::Ready, "ready-system", "new")).expect("replaced");
+        std::os::unix::fs::symlink(&target, path.join("ready-system")).expect("link");
+        std::os::unix::fs::symlink(&target, path.join("x.log")).expect("link");
+        r.store(&Frame::new(Kind::Ready, "ready-system", "new"))
+            .expect("replaced");
         assert_eq!(std::fs::read_to_string(&target).expect("victim"), "keep");
         assert_eq!(
-            std::fs::read_to_string(d.join("ready-system")).expect("m"),
+            std::fs::read_to_string(path.join("ready-system")).expect("m"),
             "new"
         );
-        assert!(!d.join("ready-system").is_symlink());
-        assert!(store(&d, &Frame::new(Kind::Log, "x", "boom")).is_err());
+        assert!(!path.join("ready-system").is_symlink());
+        assert!(r.store(&Frame::new(Kind::Log, "x", "boom")).is_err());
         assert_eq!(std::fs::read_to_string(&target).expect("victim"), "keep");
     }
 
@@ -339,51 +657,125 @@ mod tests {
     #[test]
     fn logs_append_up_to_a_cap_and_only_to_files() {
         let d = dir("log");
-        let log = |s: &str| store(&d, &Frame::new(Kind::Log, "vsock-test", s));
+        let (path, r) = open(&d);
+        let log = |s: &str| r.store(&Frame::new(Kind::Log, "vsock-test", s));
         log("one\n").expect("one");
         let p = log("two\n").expect("two");
-        assert_eq!(p, d.join("vsock-test.log"));
+        assert_eq!(p, path.join("vsock-test.log"));
         assert_eq!(std::fs::read_to_string(&p).expect("read"), "one\ntwo\n");
         let fill = "x".repeat(usize::try_from(MAX_LOG_BYTES).expect("fits") - 8);
         log(&fill).expect("fills up to the cap");
         let e = log("overflow").expect_err("over the cap");
         assert!(e.contains("would pass"), "{e}");
-        std::fs::create_dir(d.join("dir.log")).expect("dir");
-        assert!(store(&d, &Frame::new(Kind::Log, "dir", "x")).is_err());
+        std::fs::create_dir(path.join("dir.log")).expect("dir");
+        assert!(r.store(&Frame::new(Kind::Log, "dir", "x")).is_err());
         // A FIFO with no reader cannot be opened for writing without blocking; with a reader
         // it opens, and is refused as not a regular file.
-        let fifo = std::ffi::CString::new(d.join("pipe.log").to_str().expect("p")).expect("c");
+        let fifo = CString::new(path.join("pipe.log").to_str().expect("p")).expect("c");
         // SAFETY: `fifo` is a NUL-terminated path that outlives the call.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        let e = store(&d, &Frame::new(Kind::Log, "pipe", "x")).expect_err("no reader");
+        let e = r
+            .store(&Frame::new(Kind::Log, "pipe", "x"))
+            .expect_err("no reader");
         assert!(e.contains("open"), "{e}");
         let _reader = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
-            .open(d.join("pipe.log"))
+            .open(path.join("pipe.log"))
             .expect("reader");
-        let e = store(&d, &Frame::new(Kind::Log, "pipe", "x")).expect_err("fifo");
+        let e = r
+            .store(&Frame::new(Kind::Log, "pipe", "x"))
+            .expect_err("fifo");
         assert!(e.contains("not a regular file"), "{e}");
     }
 
+    /// Catches a guest that fills the host: past the file budget a new name is refused
+    /// while an existing one can still be replaced, and past the byte budget nothing
+    /// grows, whether by replacing, by a new file or by a log; replacing with a smaller
+    /// body gives the bytes back.
+    #[test]
+    fn a_vm_may_create_only_so_many_files_and_bytes() {
+        let d = dir("budget");
+        let (path, r) = open(&d);
+        for i in 0..MAX_FILES {
+            r.store(&Frame::new(Kind::Result, &format!("f{i}"), "x"))
+                .expect("within the budget");
+        }
+        let e = r
+            .store(&Frame::new(Kind::Result, "one-too-many", "x"))
+            .expect_err("file budget");
+        assert!(e.contains("files is spent"), "{e}");
+        let e = r
+            .store(&Frame::new(Kind::Log, "one-too-many", "x"))
+            .expect_err("a log is a file too");
+        assert!(e.contains("files is spent"), "{e}");
+        r.store(&Frame::new(Kind::Result, "f0", "replaced"))
+            .expect("an existing name is not a new file");
+        assert_eq!(names(&path).len(), MAX_FILES);
+
+        let d = dir("bytes");
+        let (_, r) = open(&d);
+        let big = "x".repeat(2 << 20);
+        for i in 0..32 {
+            r.store(&Frame::new(Kind::Result, &format!("b{i}"), &big))
+                .expect("within the byte budget");
+        }
+        let e = r
+            .store(&Frame::new(Kind::Result, "more", "x"))
+            .expect_err("byte budget");
+        assert!(e.contains("bytes is spent"), "{e}");
+        assert!(r.store(&Frame::new(Kind::Log, "b0", "x")).is_err());
+        assert!(
+            r.store(&Frame::new(Kind::Result, "b0", &format!("{big}x")))
+                .is_err()
+        );
+        r.store(&Frame::new(Kind::Result, "b0", "small"))
+            .expect("a smaller body gives bytes back");
+        r.store(&Frame::new(Kind::Result, "more", "x"))
+            .expect("and the room is usable");
+    }
+
+    /// Catches a log cap that two connections can pass together (each checks the size,
+    /// both append): many threads appending to one log stop at the cap exactly, and the
+    /// file holds what was acknowledged.
+    #[test]
+    fn concurrent_appends_to_one_log_cannot_pass_the_cap() {
+        let d = dir("race");
+        let (path, r) = open(&d);
+        let r = Arc::new(r);
+        let chunk = "y".repeat(1 << 20);
+        let stored: usize = (0..16)
+            .map(|_| {
+                let (r, chunk) = (r.clone(), chunk.clone());
+                std::thread::spawn(move || {
+                    usize::from(r.store(&Frame::new(Kind::Log, "race", &chunk)).is_ok())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("thread"))
+            .sum();
+        assert_eq!(stored as u64, MAX_LOG_BYTES >> 20);
+        let size = std::fs::metadata(path.join("race.log")).expect("log").len();
+        assert_eq!(size, MAX_LOG_BYTES);
+    }
+
     /// Catches a write that fails halfway leaving its temporary file behind, and the error
-    /// naming nothing: a directory where the marker goes makes the rename fail.
+    /// naming nothing: a directory where the marker goes makes the rename fail, and a
+    /// failed write is not counted against the budget.
     #[test]
     fn a_failed_write_leaves_no_temporary_file() {
         let d = dir("fail");
-        std::fs::create_dir(d.join("ready-system")).expect("blocker");
-        std::fs::write(d.join("ready-system").join("x"), "x").expect("x");
-        let e = store(&d, &Frame::new(Kind::Ready, "ready-system", "m")).expect_err("rename");
+        let (path, r) = open(&d);
+        std::fs::create_dir(path.join("ready-system")).expect("blocker");
+        std::fs::write(path.join("ready-system").join("x"), "x").expect("x");
+        let e = r
+            .store(&Frame::new(Kind::Ready, "ready-system", "m"))
+            .expect_err("rename");
         assert!(e.starts_with("write "), "{e}");
         assert!(e.contains("ready-system"), "{e}");
-        assert_eq!(
-            std::fs::read_dir(&*d).expect("dir").count(),
-            1,
-            "no .part left"
-        );
-        let missing = d.join("none");
-        let e = store(&missing, &Frame::new(Kind::Ready, "r", "m")).expect_err("no dir");
-        assert!(e.contains("create"), "{e}");
+        assert_eq!(names(&path), ["ready-system"], "no .part left");
+        assert_eq!(r.spent.lock().expect("lock").total, 0);
     }
 
     /// A stream that reads from `input` and keeps what is written.
@@ -417,20 +809,20 @@ mod tests {
     }
 
     impl Read for Pipe {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             self.input.read(buf)
         }
     }
 
     impl Write for Pipe {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             if self.fail_writes {
-                return Err(std::io::Error::other("gone"));
+                return Err(io::Error::other("gone"));
             }
             self.output.extend_from_slice(buf);
             Ok(buf.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> {
+        fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
@@ -440,13 +832,14 @@ mod tests {
     #[test]
     fn each_frame_is_answered_and_the_connection_ends_when_the_guest_closes() {
         let d = dir("serve");
+        let (path, r) = open(&d);
         let mut pipe = Pipe::with(&[
             Frame::new(Kind::Ready, "ready-login", "{}"),
             Frame::new(Kind::Result, "../evil", "x"),
             Frame::new(Kind::Log, "vsock-test", "hello\n"),
         ]);
         let mut log = Vec::new();
-        let served = serve(&mut pipe, &d, &mut log);
+        let served = serve(&mut pipe, &r, &mut log);
         assert_eq!(
             served,
             Served {
@@ -462,8 +855,8 @@ mod tests {
         assert_eq!(replies[1].name, "../evil");
         assert!(replies[1].body.contains("dot"), "{}", replies[1].body);
         assert_eq!(replies[2], Frame::new(Kind::Ack, "vsock-test", ""));
-        assert!(d.join("ready-login").exists());
-        assert!(d.join("vsock-test.log").exists());
+        assert!(path.join("ready-login").exists());
+        assert!(path.join("vsock-test.log").exists());
         assert!(!d.join("evil").exists());
         let log = String::from_utf8(log).expect("utf8");
         assert!(log.contains("Ready ready-login ->"), "{log}");
@@ -475,6 +868,7 @@ mod tests {
     #[test]
     fn a_frame_that_cannot_be_read_ends_the_connection_with_a_refusal() {
         let d = dir("bad");
+        let (path, r) = open(&d);
         for bytes in [
             vec![0xff, 0xff, 0xff, 0xff],
             vec![0, 0, 0, 9, b'{'],
@@ -485,7 +879,7 @@ mod tests {
                 output: Vec::new(),
                 fail_writes: false,
             };
-            let served = serve(&mut pipe, &d, &mut Vec::new());
+            let served = serve(&mut pipe, &r, &mut Vec::new());
             assert_eq!(
                 served,
                 Served {
@@ -497,7 +891,7 @@ mod tests {
             let replies = pipe.replies();
             assert_eq!((replies.len(), replies[0].kind), (1, Kind::Refused));
         }
-        assert_eq!(std::fs::read_dir(&*d).expect("dir").count(), 0);
+        assert_eq!(names(&path), Vec::<String>::new());
     }
 
     /// Catches a connection that is served without end: after the per-connection frame
@@ -505,19 +899,117 @@ mod tests {
     #[test]
     fn a_connection_is_bounded_in_frames_and_ends_when_replies_fail() {
         let d = dir("bound");
+        let (_, r) = open(&d);
         let many: Vec<Frame> = (0..=MAX_FRAMES_PER_CONNECTION)
             .map(|_| Frame::new(Kind::Log, "spam", "x"))
             .collect();
         let mut pipe = Pipe::with(&many);
-        let served = serve(&mut pipe, &d, &mut Vec::new());
+        let served = serve(&mut pipe, &r, &mut Vec::new());
         assert_eq!(
             (served.stored, served.end),
             (MAX_FRAMES_PER_CONNECTION, End::TooManyFrames)
         );
         let mut pipe = Pipe::with(&[Frame::new(Kind::Ready, "r", "{}")]);
         pipe.fail_writes = true;
-        let served = serve(&mut pipe, &d, &mut Vec::new());
+        let served = serve(&mut pipe, &r, &mut Vec::new());
         assert_eq!((served.stored, served.end), (1, End::ReplyFailed));
+    }
+
+    /// A stream that hands out one byte of a valid frame per read, each after a pause,
+    /// the way a guest that sends a byte just inside the per-read timeout does.
+    struct Drip {
+        bytes: Vec<u8>,
+        at: usize,
+        pause: Duration,
+        reads: usize,
+    }
+
+    impl Read for Drip {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            std::thread::sleep(self.pause);
+            self.reads += 1;
+            if self.at >= self.bytes.len() {
+                return Ok(0);
+            }
+            buf[0] = self.bytes[self.at];
+            self.at += 1;
+            Ok(1)
+        }
+    }
+
+    impl Write for Drip {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Catches a connection that a slow guest holds for ever: each read is fast enough
+    /// for a per-read timeout, but the frame as a whole is not, so it ends as a bad frame
+    /// at the deadline with most of the frame unread. A frame that arrives in time
+    /// is served by the same code.
+    #[test]
+    fn a_frame_that_arrives_too_slowly_ends_the_connection_at_the_deadline() {
+        let d = dir("drip");
+        let (path, r) = open(&d);
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &Frame::new(Kind::Ready, "r", "{}")).expect("frame");
+        let total = bytes.len();
+        let mut slow = Drip {
+            bytes: bytes.clone(),
+            at: 0,
+            pause: Duration::from_millis(20),
+            reads: 0,
+        };
+        let began = Instant::now();
+        let served = serve_within(&mut slow, &r, &mut Vec::new(), Duration::from_millis(100));
+        assert_eq!(served.end, End::BadFrame);
+        assert!(slow.reads < total, "{} reads of {total}", slow.reads);
+        assert!(began.elapsed() < Duration::from_secs(5));
+        assert_eq!(names(&path), Vec::<String>::new());
+        let mut quick = Drip {
+            bytes,
+            at: 0,
+            pause: Duration::ZERO,
+            reads: 0,
+        };
+        let served = serve_within(&mut quick, &r, &mut Vec::new(), Duration::from_secs(30));
+        assert_eq!((served.stored, served.end), (1, End::Closed));
+    }
+
+    /// Catches a connection read with no timeout because `setsockopt` failed (the old code
+    /// only printed): on a descriptor that cannot take the options the connection is
+    /// refused without reading, and on a real socket the options are set and the frames
+    /// are served without closing the caller's descriptor.
+    #[test]
+    fn a_connection_whose_timeouts_cannot_be_set_is_refused() {
+        let d = dir("sock");
+        let (path, r) = open(&d);
+        let e = serve_socket(-1, &r, &mut Vec::new()).expect_err("bad descriptor");
+        assert!(e.contains("timeouts not set"), "{e}");
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` has room for the two descriptors socketpair returns.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        // SAFETY: both descriptors were just returned and are owned here.
+        let (mut guest, host) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+        write_frame(&mut guest, &Frame::new(Kind::Ready, "ready-login", "{}")).expect("send");
+        guest.flush().expect("flush");
+        // SAFETY: shutting down the write side of an open socket.
+        assert_eq!(
+            unsafe { libc::shutdown(guest.as_raw_fd(), libc::SHUT_WR) },
+            0
+        );
+        let served = serve_socket(host.as_raw_fd(), &r, &mut Vec::new()).expect("served");
+        assert_eq!((served.stored, served.end), (1, End::Closed));
+        assert!(path.join("ready-login").exists());
+        let reply = read_frame(&mut guest).expect("reply").expect("a frame");
+        assert_eq!(reply.kind, Kind::Ack);
+        // The descriptor was not closed by the serving.
+        // SAFETY: fcntl F_GETFD on a descriptor still owned by `host`.
+        assert!(unsafe { libc::fcntl(host.as_raw_fd(), libc::F_GETFD) } >= 0);
     }
 
     /// Catches a limiter that admits more than its maximum, one that does not free a slot
