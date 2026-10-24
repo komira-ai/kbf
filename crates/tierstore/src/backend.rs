@@ -148,7 +148,9 @@ pub trait Backend: Send + Sync {
     ///
     /// The last key of a page is the continuation token of the next one, and a page of fewer
     /// than `max_keys` objects is the last. The provided implementation cuts the whole
-    /// listing; a backend over a network lists a page at a time instead.
+    /// listing; a backend over a network lists a page at a time instead, and one whose store
+    /// caps a page (S3 gives at most 1000 keys) reads further pages until it has `max_keys`
+    /// objects or the listing ends, because a caller takes a short page for the last.
     async fn list_page(
         &self,
         prefix: &str,
