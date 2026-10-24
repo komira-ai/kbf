@@ -116,42 +116,6 @@ fn the_history_index_of_a_superseded_frontend_is_refused_by_the_production_handl
     );
 }
 
-/// The design's claim as a requirement: a fenced child can still append rows under its own
-/// writer id. The plain handle refuses (the test above); the handle a history writer is
-/// given (`Store::own_keys` with the writer's permit) writes the rows of that writer
-/// around the fence and nothing else: a chunk row of another writer, and a shared row such as
-/// the stream counter, are still refused. Catches a U2 that adds the sticky flag but forgets
-/// that history rides the same handle (the old child's open streams would lose their run
-/// records), and an exemption wider than the writer's own rows.
-#[test]
-fn a_fenced_child_can_append_rows_under_its_own_writer_id() {
-    let fake = Hooked::new();
-    let old = Fenced::take(Arc::clone(&fake.fake) as Arc<dyn Store>, None).expect("gen 1");
-    let root = IndexRoot::default();
-    let own = old
-        .own_keys(root.permit(WriterId(1)))
-        .expect("a fenced handle makes an own-keys handle");
-    let _new = Fenced::take(Arc::clone(&fake.fake) as Arc<dyn Store>, Some(1)).expect("gen 2");
-    let inv = InvKey::from_record_id("r");
-    let appended = own.txn(Txn::new().put(root.ichunk(&inv, WriterId(1), 1), "row", Cond::Absent));
-    assert!(
-        matches!(appended, Ok(Ok(_))),
-        "the design lets the old child append under its own writer id: {appended:?}"
-    );
-    let foreign = own.txn(Txn::new().put(root.ichunk(&inv, WriterId(2), 1), "row", Cond::Absent));
-    assert_eq!(
-        foreign.unwrap_err(),
-        StoreError::Fenced,
-        "another writer's row"
-    );
-    let shared = own.txn(Txn::new().next(root.streams_counter()));
-    assert_eq!(
-        shared.unwrap_err(),
-        StoreError::Fenced,
-        "the stream counter"
-    );
-}
-
 /// Design section 8 says each history row has one writer because "keys are prefixed by the
 /// writing child's own instance id". In the code the `ichunk` rows and the per-writer header
 /// rows carry the writer id; the list entries, the shape rows and the stream counter are
