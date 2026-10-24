@@ -48,4 +48,5 @@ mod pattern;
 mod pool;
 mod software;
 mod sshd;
-mod vm_user;
+
+pub mod vm_user;

@@ -31,7 +31,8 @@ use crate::pool::dir_of;
 /// The VM user's name.
 pub(crate) const VM_USER: &str = "kbf-vm";
 const HOME: &str = concat!("/Users", "/kbf-vm");
-const SHELL: &str = "/bin/zsh";
+/// The VM user's login shell.
+pub const SHELL: &str = "/bin/zsh";
 /// `staff`, the primary group of an ordinary user.
 const STAFF_GID: u32 = 20;
 /// kbf-mac-session's state directory: root's, mode 700.

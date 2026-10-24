@@ -61,6 +61,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
+use kbf_mac_provision::vm_user::SHELL;
 use sha2::{Digest as _, Sha256};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-mac-provision");
@@ -918,7 +919,7 @@ fn the_vm_user_is_made_with_a_root_only_password_file_and_checked() {
     for (attr, want) in [
         ("UniqueID", uid.to_string()),
         ("PrimaryGroupID", "20".to_owned()),
-        ("UserShell", "/bin/zsh".to_owned()),
+        ("UserShell", SHELL.to_owned()),
         ("NFSHomeDirectory", record.to_owned()),
         ("IsHidden", "1".to_owned()),
     ] {
@@ -982,7 +983,7 @@ fn the_vm_user_is_made_with_a_root_only_password_file_and_checked() {
     assert!(
         drifted
             .stdout
-            .contains("UserShell=/usr/bin/false, want /bin/zsh")
+            .contains(&format!("UserShell=/usr/bin/false, want {SHELL}"))
     );
     let repaired = apply();
     let changes: Vec<&str> = repaired
@@ -998,5 +999,5 @@ fn the_vm_user_is_made_with_a_root_only_password_file_and_checked() {
         fs::read_to_string(VM_PASSWORD_FILE).expect("read the password file"),
         password
     );
-    assert_eq!(dscl_value(record, "UserShell"), "/bin/zsh");
+    assert_eq!(dscl_value(record, "UserShell"), SHELL);
 }

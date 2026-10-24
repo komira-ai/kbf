@@ -1,5 +1,7 @@
 //! The fake Mac's standing VM user `kbf-vm`, as `apply` leaves it.
 
+use kbf_mac_provision::vm_user::SHELL;
+
 use super::{FakeMac, LOGINWINDOW};
 
 /// The VM user's uid in the tests' profile.
@@ -36,7 +38,7 @@ impl FakeMac {
         for (a, v) in [
             ("UniqueID", uid.as_str()),
             ("PrimaryGroupID", "20"),
-            ("UserShell", "/bin/zsh"),
+            ("UserShell", SHELL),
             ("NFSHomeDirectory", VM_HOME),
             ("IsHidden", "1"),
             ("Password", "********"),

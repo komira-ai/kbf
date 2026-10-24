@@ -7,6 +7,7 @@ mod support;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 
+use kbf_mac_provision::vm_user::SHELL;
 use support::vm::{
     KCPASSWORD, VM_HOME, VM_PASSWORD, VM_PASSWORD_FILE, VM_STATE_DIR, VM_UID, kcpassword_of,
 };
@@ -49,7 +50,7 @@ fn a_mac_with_the_vm_user_passes_check() {
     assert_eq!(r.failed, 0, "{}", r.text);
     assert!(
         r.text.contains(&format!(
-            "PASS vm_user_uid: kbf-vm (uid {VM_UID}, group staff, shell /bin/zsh): hidden, standard, password in {VM_PASSWORD_FILE}, home {VM_HOME}\n"
+            "PASS vm_user_uid: kbf-vm (uid {VM_UID}, group staff, shell {SHELL}): hidden, standard, password in {VM_PASSWORD_FILE}, home {VM_HOME}\n"
         )),
         "{}",
         r.text
@@ -81,7 +82,7 @@ fn check_names_each_way_the_vm_user_is_wrong() {
                 m.state_mut()
                     .user_attr("kbf-vm", "UserShell", "/usr/bin/false")
             },
-            "UserShell=/usr/bin/false, want /bin/zsh",
+            "UserShell=/usr/bin/false, want ",
         ),
         (
             "group",
@@ -181,6 +182,13 @@ fn check_names_each_way_the_vm_user_is_wrong() {
             r.text
         );
         assert!(!r.text.contains("hunter2"), "{name}: {}", r.text);
+        if name == "shell" {
+            assert!(
+                failed[0].contains(&format!("want {SHELL}")),
+                "{}",
+                failed[0]
+            );
+        }
     }
     let mac = FakeMac::converged_vm("vm-drift-missing-file", false);
     mac.remove(VM_PASSWORD_FILE);
@@ -271,7 +279,7 @@ fn apply_makes_the_vm_user_and_keeps_its_password_in_the_file_only() {
         for (attr, want) in [
             ("UniqueID", "460"),
             ("PrimaryGroupID", "20"),
-            ("UserShell", "/bin/zsh"),
+            ("UserShell", SHELL),
             ("NFSHomeDirectory", VM_HOME),
             ("IsHidden", "1"),
         ] {
