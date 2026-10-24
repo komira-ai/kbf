@@ -13,10 +13,7 @@
 //! | [`Rule::UniqueInsert`] | any process, unchecked, as an insert (`Cond::Absent`) | a history stream row and object row, unique by allocation (the key holds a stream id from a counter block, or a run id, which no other process is given), and a list entry, whose value is empty so the same row from two writers is one row |
 //! | [`Rule::Conditional`] | any frontend of the store, at any time, with the checks the write carries (the scheduler's transitions are conditional on the versions of the rows they read) | what [`Rule::Fenced`] is for a store whose frontends take no generation: see below |
 //!
-//! The history rows follow from `kbf_history::RowKind`; [`classify`] asks it. A history
-//! writer writes its rows through a handle that applies exactly the unchecked rules above
-//! and sends everything else through the fence (`kbf_state::OwnKeys`), so a key of a fenced
-//! family cannot reach the store unchecked, whatever a caller does.
+//! The history rows follow from `kbf_history::RowKind`; [`classify`] asks it.
 //!
 //! **A store the frontends share.** A Postgres store opened by [`crate::StateStoreUri::open`]
 //! holds no generation: its `meta/generation` row holds `kbf_state::SHARED_WRITERS`, no
@@ -32,6 +29,10 @@
 //! for the families and nothing in the server consults it. [`classify`] stays what it was,
 //! for a store whose writer holds a generation (a SQLite file, and a store a takeover or a
 //! handover opened).
+//!
+//! These are the rules the design assigns. No handle applies [`Rule::OwnInstance`] or
+//! [`Rule::UniqueInsert`] unchecked now: every write of the frontend, the history's included,
+//! goes through the generation handle, and a superseded frontend's writes are all refused.
 //!
 //! Not in the table, because they are not state-store keys of the frontend: the object
 //! store's history objects (`history/...`, named by the writer id), the cold store, and

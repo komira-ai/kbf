@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use crate::clock::StoreTime;
-use crate::own_keys::{OwnKeys, Permit};
 use crate::store::{LivenessGuard, Store};
 use crate::types::{
     Changes, Commit, CommitStats, Cond, Conflict, Revision, ScanPage, ScanRange, StoreError, Txn,
@@ -103,7 +102,6 @@ pub enum TakeError {
 /// check that the generation row is still the version this handle wrote, so once another
 /// handle takes the next generation, every write here fails with [`StoreError::Fenced`]
 /// and none lands. Reads are not fenced.
-#[derive(Clone)]
 pub struct Fenced {
     inner: Arc<dyn Store>,
     generation: u64,
@@ -257,13 +255,5 @@ impl Store for Fenced {
 
     fn demote(&self) -> Result<(), StoreError> {
         self.inner.demote()
-    }
-
-    fn own_keys(&self, permit: Permit) -> Option<Arc<dyn Store>> {
-        Some(Arc::new(OwnKeys::new(
-            Arc::new(self.clone()),
-            Arc::clone(&self.inner),
-            permit,
-        )))
     }
 }

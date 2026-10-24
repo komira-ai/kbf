@@ -36,7 +36,6 @@ pub mod conformance;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
 mod fence;
-mod own_keys;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(any(test, feature = "test-support"))]
@@ -49,7 +48,6 @@ use std::time::Duration;
 
 pub use clock::{Clock, ManualClock, StoreTime, SystemClock};
 pub use fence::{Fenced, GENERATION, SHARED_WRITERS, TakeError, decode_generation, share};
-pub use own_keys::{OwnKeys, Permit};
 pub use store::{Announcement, LivenessGuard, Store};
 pub use types::{
     Change, Changes, Commit, CommitStats, Cond, Conflict, Direction, Event, Op, ResumeToken,
