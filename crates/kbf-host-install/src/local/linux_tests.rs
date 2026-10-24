@@ -439,7 +439,7 @@ fn refused(code: Code) -> impl Fn(&Fault) -> bool {
 }
 
 /// The release is fetched as the unprivileged user, checked by `gh attestation verify` offline
-/// for the full commit and the farm's workflow on hosted runners and the channel's branch, run
+/// for the full commit and the release workflow on hosted runners and the channel's branch, run
 /// once as that user and installed as `releases/<commit>`; no link moves, nothing restarts, and
 /// the scratch is gone.
 #[test]

@@ -7,6 +7,7 @@ here is in a package yet: the binaries are release assets (`docs/deploy/host-ins
 | file | what |
 |---|---|
 | `linux/kbf-host-local.service` | `kbf-host-install --serve`, as root: the local socket (`/run/kbf-host-install/local.sock`, mode 0600, owned by `kbf-updater`) that stages a release, switches to it on trial, and goes back by itself at the deadline |
+| `linux/kbf-host-local.service` on a host that runs the `kbf` package | add `--layout deb` (or `rpm`) to its `--serve` line: the update is then an installation of the attested package (`docs/deploy/host-install.md`, "On a Linux daemon host that runs the package"); a hand-placed host moves once with `kbf-host-install --migrate-to-package` (`docs/deploy/native-package-migration.md`) |
 | `linux/kbf-updater-agent.service` | `kbf-updater agent`, as `kbf-updater`: the heartbeat to the coordinator and the host's A/B through that socket |
 | `linux/kbf-updater.conf` | the sysusers.d entry of the `kbf-updater` account (no login, no home) |
 | `enroll-example.txt` | the enrollment command, as the tests read it |

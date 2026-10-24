@@ -68,6 +68,8 @@ mod host;
 mod local;
 mod locks;
 pub(crate) mod mac;
+#[cfg(target_os = "linux")]
+mod migrate;
 mod node_id;
 mod outcome;
 mod plan;
@@ -160,6 +162,18 @@ fn names_version(args: &[std::ffi::OsString]) -> bool {
         .any(|arg| arg.to_str().is_some_and(|a| a.starts_with("--version")))
 }
 
+/// `--migrate-to-package`, which a Linux host runs and nothing else does.
+#[cfg(target_os = "linux")]
+fn migrate_to_package(args: &[String]) -> ExitCode {
+    migrate::main(args)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn migrate_to_package(_args: &[String]) -> ExitCode {
+    eprintln!("kbf-host-install: --migrate-to-package is for a Linux host");
+    ExitCode::from(2)
+}
+
 /// The program: handle `SSH_ORIGINAL_COMMAND` against the production paths and exit with
 /// the status of the answer.
 #[must_use]
@@ -175,6 +189,17 @@ pub fn main() -> ExitCode {
             &mut std::io::stdout(),
             &mut std::io::stderr(),
         ));
+    }
+    // The held step that moves a hand-placed Linux host to the `kbf` package.
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--migrate-to-package")
+    {
+        let rest: Option<Vec<String>> = args[1..]
+            .iter()
+            .map(|arg| arg.to_str().map(str::to_owned))
+            .collect();
+        return rest.map_or(ExitCode::from(2), |rest| migrate_to_package(&rest));
     }
     // The local socket: `kbf-updater`'s door, beside the forced command (see [`local`]).
     if args.first().is_some_and(|arg| arg == "--serve") {
