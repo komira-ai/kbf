@@ -325,6 +325,27 @@ jobs:
         run: cargo xtask pkg-asset --package target/pkg/out --platform linux-x86_64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-x86_64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --gh "$RUNNER_TEMP/tools/gh" --out dist
       - name: The kbf deb is the attested kbf with the units of the modes, and is an asset
         run: cargo xtask pkg-kbf-asset --package target/pkg/kbf-out --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" --out dist
+      # The frontend image (packaging/container/frontend/Dockerfile): the attested kbf, unpacked from
+      # the tarball above and not rebuilt, on a pinned base. It is built twice from the commit's time
+      # (SOURCE_DATE_EPOCH, no provenance or SBOM attachments of buildx's own) and the two
+      # tarballs must be the same bytes; `pkg-image-asset` then refuses it unless its kbf is the
+      # tarball's, it runs `kbf --mode=frontend` as a user that is not root and it is for this platform.
+      - name: The commit's time, for the frontend image
+        run: cargo xtask source-date-epoch --commit "$GITHUB_SHA" --output "$GITHUB_ENV"
+      - name: The frontend image directories
+        run: mkdir -p target/image target/image-out
+      - name: The frontend image context holds the attested kbf
+        run: tar -xzf "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" -C target/image kbf
+      - name: A BuildKit builder, pinned by digest
+        run: docker buildx create --name kbf-image --driver docker-container --driver-opt image=moby/buildkit:v0.23.2@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e --use
+      - name: Build the frontend image, build 1 of 2
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/amd64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-frontend:$GITHUB_SHA" --file packaging/container/frontend/Dockerfile --output "type=oci,dest=target/image-out/1.oci.tar,rewrite-timestamp=true" target/image
+      - name: Build the frontend image, build 2 of 2
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/amd64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-frontend:$GITHUB_SHA" --file packaging/container/frontend/Dockerfile --output "type=oci,dest=target/image-out/2.oci.tar,rewrite-timestamp=true" target/image
+      - name: The two builds of the frontend image are the same bytes
+        run: cmp target/image-out/1.oci.tar target/image-out/2.oci.tar
+      - name: The frontend image is the attested kbf, and is an asset
+        run: cargo xtask pkg-image-asset --image target/image-out/1.oci.tar --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" --out dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-x86_64
@@ -450,6 +471,27 @@ jobs:
         run: cargo xtask pkg-asset --package target/pkg/out --platform linux-arm64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --gh "$RUNNER_TEMP/tools/gh" --out dist
       - name: The kbf deb is the attested kbf with the units of the modes, and is an asset
         run: cargo xtask pkg-kbf-asset --package target/pkg/kbf-out --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" --out dist
+      # The frontend image (packaging/container/frontend/Dockerfile): the attested kbf, unpacked from
+      # the tarball above and not rebuilt, on a pinned base. It is built twice from the commit's time
+      # (SOURCE_DATE_EPOCH, no provenance or SBOM attachments of buildx's own) and the two
+      # tarballs must be the same bytes; `pkg-image-asset` then refuses it unless its kbf is the
+      # tarball's, it runs `kbf --mode=frontend` as a user that is not root and it is for this platform.
+      - name: The commit's time, for the frontend image
+        run: cargo xtask source-date-epoch --commit "$GITHUB_SHA" --output "$GITHUB_ENV"
+      - name: The frontend image directories
+        run: mkdir -p target/image target/image-out
+      - name: The frontend image context holds the attested kbf
+        run: tar -xzf "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" -C target/image kbf
+      - name: A BuildKit builder, pinned by digest
+        run: docker buildx create --name kbf-image --driver docker-container --driver-opt image=moby/buildkit:v0.23.2@sha256:ddd1ca44b21eda906e81ab14a3d467fa6c39cd73b9a39df1196210edcb8db59e --use
+      - name: Build the frontend image, build 1 of 2
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/arm64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-frontend:$GITHUB_SHA" --file packaging/container/frontend/Dockerfile --output "type=oci,dest=target/image-out/1.oci.tar,rewrite-timestamp=true" target/image
+      - name: Build the frontend image, build 2 of 2
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/arm64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-frontend:$GITHUB_SHA" --file packaging/container/frontend/Dockerfile --output "type=oci,dest=target/image-out/2.oci.tar,rewrite-timestamp=true" target/image
+      - name: The two builds of the frontend image are the same bytes
+        run: cmp target/image-out/1.oci.tar target/image-out/2.oci.tar
+      - name: The frontend image is the attested kbf, and is an asset
+        run: cargo xtask pkg-image-asset --image target/image-out/1.oci.tar --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" --out dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-arm64
@@ -947,8 +989,12 @@ jobs:
         run: cargo xtask pkg-asset --verify-only --package "dist/kbf-installer-$GITHUB_SHA-linux-arm64.deb" --platform linux-arm64 --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$GITHUB_REF"
       - name: The signed linux-x86_64 kbf package holds the attested kbf and the units of the modes
         run: cargo xtask pkg-kbf-asset --verify-only --package "dist/kbf-$GITHUB_SHA-linux-x86_64.deb" --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz"
+      - name: The signed linux-x86_64 frontend image holds the attested kbf
+        run: cargo xtask pkg-image-asset --verify-only --image "dist/kbf-frontend-image-$GITHUB_SHA-linux-x86_64.oci.tar" --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz"
       - name: The signed linux-arm64 kbf package holds the attested kbf and the units of the modes
         run: cargo xtask pkg-kbf-asset --verify-only --package "dist/kbf-$GITHUB_SHA-linux-arm64.deb" --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz"
+      - name: The signed linux-arm64 frontend image holds the attested kbf
+        run: cargo xtask pkg-image-asset --verify-only --image "dist/kbf-frontend-image-$GITHUB_SHA-linux-arm64.oci.tar" --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz"
 
   # Push to main only, after attest-darwin-arm64: the checks the planned deployment
   # job is to make (cargo xtask verify-assets, crates/xtask/src/sums.rs), for the branch

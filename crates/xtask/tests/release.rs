@@ -1575,6 +1575,77 @@ fn check_accepts_the_installer_package_of_the_commit_with_its_bundle() {
     );
 }
 
+fn image(commit: &str, platform: &str) -> String {
+    format!("kbf-frontend-image-{commit}-{platform}.oci.tar")
+}
+
+#[test]
+fn check_accepts_the_frontend_image_of_each_linux_arch_with_its_bundle() {
+    // Catches: an `.oci.tar` in SHA256SUMS refused as "not an asset of <commit>" (the release
+    // of the first main push that lists an image fails), accepted with no bundle, and the
+    // bundles line not counting the image as a package.
+    let root = scratch("check-image");
+    let dist = dist(&root, COMMIT);
+    add_deb(&dist, &image(COMMIT, "linux-x86_64"), true);
+    add_deb(&dist, &image(COMMIT, "linux-arm64"), true);
+    let (code, out, err) = check(&dist, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(
+        out,
+        format!(
+            "sums: 8 files match; the flipped copy does not\n\
+             names: every listed file is an asset of {COMMIT}\n\
+             bundles: each of the 3 tarballs and 2 package(s) has one provenance bundle\n"
+        )
+    );
+    let root = scratch("check-image-no-bundle");
+    let held = dist_without_bundle(&root);
+    let (code, out, err) = check(&held.0, COMMIT);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!(
+            "xtask: {}: no provenance bundle {}.sigstore.json\n",
+            held.1, held.1
+        )
+    );
+}
+
+/// A `dist` of the commit with the x86_64 frontend image listed and no bundle for it: the
+/// directory and the image's name.
+fn dist_without_bundle(root: &Path) -> (PathBuf, String) {
+    let dist = dist(root, COMMIT);
+    let name = image(COMMIT, "linux-x86_64");
+    add_deb(&dist, &name, false);
+    (dist, name)
+}
+
+#[test]
+fn check_refuses_a_frontend_image_of_another_commit_arch_or_name() {
+    // Catches: an image accepted for another commit's build, for an architecture the release
+    // does not build (an unknown one, or the Mac's, which has no container image), under a
+    // binary name that is not the frontend image's, or with no commit in its name at all.
+    for foreign in [
+        image(OTHER, "linux-arm64"),
+        image(COMMIT, "linux-riscv"),
+        image(COMMIT, "darwin-arm64"),
+        format!("kbf-daemon-{COMMIT}-linux-arm64.oci.tar"),
+        format!("-{COMMIT}-linux-arm64.oci.tar"),
+        "kbf-frontend-image-linux-arm64.oci.tar".to_owned(),
+    ] {
+        let root = scratch("check-image-foreign");
+        let dist = dist(&root, COMMIT);
+        add_deb(&dist, &foreign, true);
+        let (code, out, err) = check(&dist, COMMIT);
+        assert_eq!(code, Some(1), "{foreign}: {out}");
+        assert_eq!(
+            err,
+            format!("xtask: {foreign}: not an asset of {COMMIT}\n"),
+            "{foreign}"
+        );
+    }
+}
+
 #[test]
 fn check_accepts_the_macos_installer_package_of_the_commit_and_refuses_the_uncommitted_name() {
     // Catches: a `.pkg` in SHA256SUMS refused as "not an asset of <commit>" (the release of

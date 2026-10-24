@@ -41,6 +41,10 @@
 //!   `kbf-<commit>-<platform>.deb`, refused unless its `/usr/bin/kbf` is the `kbf` of the
 //!   attested tarball, it depends on no `kbf-installer` and replaces `kbf-installer`, and it
 //!   holds the units of the modes and nothing else.
+//! - `pkg-image-asset` ([`pkg_image_asset`]): the frontend OCI image tarball as the release asset
+//!   `kbf-frontend-image-<commit>-<platform>.oci.tar`, refused unless its `usr/bin/kbf` is the
+//!   `kbf` of the attested tarball, it runs `kbf --mode=frontend` as a user that is not root,
+//!   and it is built for the platform.
 //! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf-installer` package
 //!   carries, in the one form a deb and an rpm put in the same order, and the most a package
 //!   that carries a kbf release may weigh. `pkg-config` and `pkg-asset` take them up with
@@ -101,6 +105,7 @@ pub mod installer_tarball;
 pub mod package;
 pub mod pkg;
 pub mod pkg_asset;
+pub mod pkg_image_asset;
 pub mod pkg_install;
 pub mod pkg_kbf_asset;
 pub mod pkg_linux;
@@ -172,6 +177,17 @@ enum Verb {
         /// The revision to compare with (on a pull request, the base branch).
         #[arg(long)]
         base: String,
+    },
+    /// Append `SOURCE_DATE_EPOCH=<seconds>`, the committer time of `--commit`, to `--output`
+    /// (on Actions, `GITHUB_ENV`), so a later step builds an image that carries the commit's
+    /// time and no clock of the build's.
+    SourceDateEpoch {
+        /// The commit (`$GITHUB_SHA`), 12 to 40 lowercase hex digits.
+        #[arg(long)]
+        commit: String,
+        /// The file to append the line to.
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Download a pinned file, check its SHA-256 and install it (mode 0755).
     Fetch {
@@ -370,6 +386,34 @@ enum Verb {
         )]
         out: Option<PathBuf>,
         /// Only check `--package`, which must be named as the asset; write nothing.
+        #[arg(long)]
+        verify_only: bool,
+    },
+    /// The frontend OCI image tarball as a release asset, refused unless its `usr/bin/kbf` is
+    /// the attested `kbf`, its entrypoint is `kbf --mode=frontend`, it runs as a user that is
+    /// not root and it is built for the platform.
+    PkgImageAsset {
+        /// The image tarball `docker buildx build --output type=oci` wrote (with
+        /// `--verify-only`: the asset itself).
+        #[arg(long)]
+        image: PathBuf,
+        /// The platform it was built for (`linux-x86_64`, `linux-arm64`).
+        #[arg(long, value_enum)]
+        platform: package::Platform,
+        /// The commit it was built from (`$GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// The `kbf-<commit>-<platform>.tar.gz` whose `kbf` the image must hold.
+        #[arg(long)]
+        kbf_tarball: PathBuf,
+        /// The directory the asset and its line of `SHA256SUMS.<platform>` go in.
+        #[arg(
+            long,
+            required_unless_present = "verify_only",
+            conflicts_with = "verify_only"
+        )]
+        out: Option<PathBuf>,
+        /// Only check `--image`, which must be named as the asset; write nothing.
         #[arg(long)]
         verify_only: bool,
     },
@@ -800,6 +844,30 @@ fn git_stdout(root: &Path, args: &[&str]) -> Result<Vec<u8>, Error> {
     Ok(out.stdout)
 }
 
+/// The `source-date-epoch` verb: appends `SOURCE_DATE_EPOCH=<committer time>` of `commit`,
+/// as `root` holds it, to `output`, and returns the line.
+fn source_date_epoch(root: &Path, commit: &str, output: &Path) -> Result<String, Error> {
+    if !build_commit::is_commit(commit) {
+        return Err(Error::NotACommit(commit.to_owned()));
+    }
+    let said = git_stdout(root, &["show", "-s", "--format=%ct", commit])?;
+    let seconds = String::from_utf8_lossy(&said).trim().to_owned();
+    if seconds.is_empty() || !seconds.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(Error::Failed(format!(
+            "git says the time of {commit} is {seconds:?}, not seconds since the epoch"
+        )));
+    }
+    let line = format!("SOURCE_DATE_EPOCH={seconds}");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output)
+        .map_err(Error::spawn(format!("open {}", output.display())))?;
+    std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes())
+        .map_err(Error::spawn(format!("append to {}", output.display())))?;
+    Ok(line)
+}
+
 /// The budget file as `rev` holds it, read with `git show` in `root`.
 fn budget_at(root: &Path, rev: &str) -> Result<String, Error> {
     let spec = format!("{rev}:{}", budget::BUDGET);
@@ -887,6 +955,9 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         }),
         Verb::Advisories(args) => advisories::run(&args, &root, &cargo_program()),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
+        Verb::SourceDateEpoch { commit, output } => {
+            source_date_epoch(&root, &commit, &output).map(|line| vec![line])
+        }
         Verb::Fetch {
             url,
             sha256,
@@ -1018,6 +1089,25 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 _ => pkg_asset::Mode::VerifyOnly,
             },
             &pkg_kbf_asset::Check {
+                platform,
+                kbf_tarball: &kbf_tarball,
+            },
+        ),
+        Verb::PkgImageAsset {
+            image,
+            platform,
+            commit,
+            kbf_tarball,
+            out,
+            verify_only,
+        } => pkg_image_asset::asset(
+            &image,
+            &commit,
+            &match (&out, verify_only) {
+                (Some(out), false) => pkg_asset::Mode::Add(out),
+                _ => pkg_asset::Mode::VerifyOnly,
+            },
+            &pkg_image_asset::Check {
                 platform,
                 kbf_tarball: &kbf_tarball,
             },

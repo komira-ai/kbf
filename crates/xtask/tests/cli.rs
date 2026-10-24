@@ -625,3 +625,83 @@ fn budget_diff_defaults_to_this_repository() {
         "ok: tools/interpreter_budget.tsv adds no row to HEAD's\n"
     );
 }
+
+/// The commit `HEAD` names in `root`.
+fn head_of(root: &Path) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git");
+    text(&out.stdout).trim().to_owned()
+}
+
+#[test]
+fn source_date_epoch_appends_the_committer_time_of_the_commit_and_refuses_anything_else() {
+    // Catches: an image stamped with the build's clock (the line holds another time than the
+    // commit's), a line written over the file's earlier ones, a commit that is not in the
+    // repository accepted, and a name that is not a commit passed to git as an option.
+    let root = repo("source-date-epoch", "[files]\n[workflow]\n[src-sh-c]\n");
+    git(&root, &["commit", "-q", "--allow-empty", "-m", "second"]);
+    let env = root.join("github-env");
+    std::fs::write(&env, "EARLIER=1\n").expect("env");
+    let first = head_of(&root);
+    let commit_time = |rev: &str| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&*root)
+            .args(["show", "-s", "--format=%ct", rev])
+            .output()
+            .expect("git");
+        text(&out.stdout).trim().to_owned()
+    };
+    let (code, out, err) = outcome(
+        xtask(
+            &root,
+            &[
+                "source-date-epoch",
+                "--commit",
+                &first,
+                "--output",
+                env.to_str().expect("utf8"),
+            ],
+        )
+        .output()
+        .expect("run"),
+    );
+    assert_eq!(code, Some(0), "{err}");
+    let want = format!("SOURCE_DATE_EPOCH={}", commit_time(&first));
+    assert_eq!(out, format!("{want}\n"));
+    assert_eq!(
+        std::fs::read_to_string(&env).expect("env"),
+        format!("EARLIER=1\n{want}\n")
+    );
+    for bad in [
+        "--output=/dev/null",
+        "abc",
+        "0123456789abcdef0123456789abcdef01234567",
+    ] {
+        let (code, _, err) = outcome(
+            xtask(
+                &root,
+                &[
+                    "source-date-epoch",
+                    "--commit",
+                    bad,
+                    "--output",
+                    env.to_str().expect("utf8"),
+                ],
+            )
+            .output()
+            .expect("run"),
+        );
+        assert_ne!(code, Some(0), "{bad}");
+        assert!(!err.is_empty(), "{bad}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&env).expect("env"),
+        format!("EARLIER=1\n{want}\n"),
+        "a refused commit writes nothing"
+    );
+}
