@@ -11,13 +11,16 @@ use crate::trust::Trust;
 const MINIMAL: &str = r#"
 [frontend]
 name = "kbf-frontend"
-restart = "no"
+restart = "unless-stopped"
 api = "127.0.0.1:8982"
 drain_token_file = "/token"
 "#;
 
 fn with(extra: &str) -> String {
-    MINIMAL.replace("restart = \"no\"", &format!("restart = \"no\"\n{extra}"))
+    MINIMAL.replace(
+        "restart = \"unless-stopped\"",
+        &format!("restart = \"unless-stopped\"\n{extra}"),
+    )
 }
 
 fn refusal(text: &str) -> String {
@@ -88,7 +91,7 @@ fn what_is_left_out_takes_its_default() {
             "--name",
             "kbf-frontend",
             "--restart",
-            "no",
+            "unless-stopped",
             "sha256:abc"
         ]
     );
@@ -102,9 +105,18 @@ fn values_that_are_not_what_they_name_are_refused() {
         (MINIMAL.replace("kbf-frontend", "kbf frontend"), "name"),
         (MINIMAL.replace("kbf-frontend", "-x"), "name"),
         (MINIMAL.replace("kbf-frontend", &"x".repeat(65)), "name"),
-        (MINIMAL.replace("\"no\"", "\"sometimes\""), "restart"),
-        (MINIMAL.replace("\"no\"", "\"on-failure:x\""), "restart"),
-        (MINIMAL.replace("\"no\"", "\"always:3\""), "restart"),
+        (
+            MINIMAL.replace("\"unless-stopped\"", "\"sometimes\""),
+            "restart",
+        ),
+        (
+            MINIMAL.replace("\"unless-stopped\"", "\"on-failure:x\""),
+            "restart",
+        ),
+        (
+            MINIMAL.replace("\"unless-stopped\"", "\"always:3\""),
+            "restart",
+        ),
         (with("network = \"container:other\""), "network"),
         (with("user = \"a:b:c\""), "user"),
         (with("user = \":b\""), "user"),
@@ -151,15 +163,30 @@ fn the_edges_of_the_ranges_are_accepted() {
     ] {
         FrontendConfig::parse(&with(extra)).expect(extra);
     }
-    for restart in [
-        "no",
-        "always",
-        "unless-stopped",
-        "on-failure",
-        "on-failure:0",
-    ] {
-        FrontendConfig::parse(&MINIMAL.replace("\"no\"", &format!("\"{restart}\"")))
+    for restart in ["always", "unless-stopped", "on-failure", "on-failure:0"] {
+        FrontendConfig::parse(&MINIMAL.replace("\"unless-stopped\"", &format!("\"{restart}\"")))
             .expect(restart);
+    }
+}
+
+/// A frontend that is told not to restart stays down after a reboot of the host or of docker,
+/// and nothing else starts it, so the policy `no` is refused and says why.
+#[test]
+fn a_restart_policy_of_no_is_refused() {
+    let why = refusal(&MINIMAL.replace("\"unless-stopped\"", "\"no\""));
+    assert!(why.contains("restart"), "{why}");
+    assert!(why.contains("reboot"), "{why}");
+}
+
+/// The three policies that bring the container back after a reboot are read as given.
+#[test]
+fn the_policies_that_restart_after_a_reboot_are_accepted() {
+    for restart in ["unless-stopped", "always", "on-failure"] {
+        let config = FrontendConfig::parse(
+            &MINIMAL.replace("\"unless-stopped\"", &format!("\"{restart}\"")),
+        )
+        .expect(restart);
+        assert_eq!(config.run.restart, restart);
     }
 }
 

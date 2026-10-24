@@ -96,7 +96,7 @@ fn each_call_is_one_docker_command_with_its_arguments() {
     assert_eq!(args(&seen), ["image", "rm", "sha256:abc"]);
 
     let spec = FrontendConfig::parse(
-        "[frontend]\nname = \"f\"\nrestart = \"no\"\napi = \"127.0.0.1:1\"\ndrain_token_file = \"/t\"\n",
+        "[frontend]\nname = \"f\"\nrestart = \"unless-stopped\"\napi = \"127.0.0.1:1\"\ndrain_token_file = \"/t\"\n",
     )
     .unwrap()
     .run;

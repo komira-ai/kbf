@@ -13,6 +13,7 @@ use kbf_testkit::dir::TestDir;
 use super::config::{FrontendConfig, RunSpec};
 use super::fake::{API, Source, World};
 use super::record::Record;
+use super::runtime::Runtime;
 use super::{Frontend, RECORD};
 use crate::host::Host;
 use crate::local::answer::{Answer, Code, QueryView};
@@ -414,6 +415,60 @@ fn a_frontend_that_is_not_ready_on_the_target_commit_is_replaced_by_the_old_one(
     let rig = Rig::new("short-commit");
     rig.world.0.borrow_mut().lies_about_commit = Some("bbbbbbbb".to_owned());
     assert!(failed(Code::RevertFailed)(&rig.update()));
+}
+
+/// The previous image was pruned while the release was on trial: a revert cannot make it
+/// again, so it fails without touching the container that runs.
+#[test]
+fn a_revert_with_a_pruned_previous_image_keeps_the_running_container_and_fails() {
+    let rig = Rig::new("revert-pruned");
+    assert!(matches!(rig.update(), Answer::Switched { .. }));
+    rig.world.remove_image(OLD_ID).unwrap();
+    let before = rig.steps().len();
+
+    let answer = rig.ask("revert");
+    assert!(failed(Code::RevertFailed)(&answer), "{answer:?}");
+    assert!(
+        matches!(&answer, Answer::Failed(_, why) if why.contains(OLD_ID)),
+        "{answer:?}"
+    );
+    let made = rig.world.made().unwrap();
+    assert_eq!((made.image_id.as_str(), made.running), (NEW_ID, true));
+    // The image was looked up and that is all: no stop, no remove, no run.
+    assert_eq!(rig.steps()[before..], [] as [String; 0]);
+    assert!(rig.record().pending.is_some());
+}
+
+/// The same when the switch itself fails: the new container is not ready, the old image is
+/// gone, and the new container stays up with the failure of the going back reported.
+#[test]
+fn a_switch_that_is_not_ready_with_a_pruned_previous_image_leaves_the_new_container() {
+    let rig = Rig::new("switch-pruned");
+    assert!(matches!(rig.install(), Answer::Staged { .. }));
+    rig.world.remove_image(OLD_ID).unwrap();
+    rig.world
+        .0
+        .borrow_mut()
+        .never_ready
+        .insert(NEW_ID.to_owned());
+
+    let answer = rig.switch();
+    assert!(failed(Code::RevertFailed)(&answer), "{answer:?}");
+    let made = rig.world.made().unwrap();
+    assert_eq!((made.image_id.as_str(), made.running), (NEW_ID, true));
+    // The old container was replaced by the switch itself; after the new one failed there
+    // was one `run` and no second `remove`.
+    let steps = rig.steps();
+    assert_eq!(steps.iter().filter(|e| *e == "remove").count(), 1);
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|e| e.starts_with("run:"))
+            .collect::<Vec<_>>(),
+        [&format!("run:{NEW_ID}")]
+    );
+    assert_eq!(steps.last().unwrap(), &format!("run:{NEW_ID}"));
+    assert!(rig.record().pending.is_some());
 }
 
 /// A container that ends as soon as it starts never answers: the switch fails after the time
