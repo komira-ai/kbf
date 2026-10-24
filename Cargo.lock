@@ -2402,7 +2402,6 @@ dependencies = [
  "kbf-estimator",
  "kbf-front",
  "kbf-history",
- "kbf-installer",
  "kbf-invocation",
  "kbf-log",
  "kbf-map",

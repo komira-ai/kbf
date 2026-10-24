@@ -179,9 +179,8 @@ fn argv_with(words: &[String], config: &Path) -> Vec<OsString> {
 /// Catches the plain frontend unit's command lines (`kbf-frontend.service`, for a host
 /// without the proxy) that `kbf`'s own parser refuses: both the `--check` line and the
 /// start, with the host's `kbf.toml` replaced by one that stands for the frontend, must
-/// parse to the frontend, the start not as a check. The defects, planted in the unit's
-/// own start line, must each be refused by that parser: a mode that does not exist, and
-/// `--instance` without `--handover-socket` (kbf refuses it).
+/// parse to the frontend, the start not as a check. A mode that does not exist, put in the
+/// unit's own start line, must be refused by that parser.
 #[test]
 fn the_plain_frontend_unit_command_lines_parse_with_kbfs_own_parser() {
     let (_, text) = units()
@@ -210,9 +209,5 @@ fn the_plain_frontend_unit_command_lines_parse_with_kbfs_own_parser() {
     assert!(
         refused(&|w| w[0] = "--mode=no-such-mode".into()),
         "an unknown mode parsed"
-    );
-    assert!(
-        refused(&|w| w.push("--instance=a".into())),
-        "--instance without --handover-socket parsed"
     );
 }

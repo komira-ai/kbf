@@ -156,7 +156,7 @@ fn version_json_reports_the_build_identity() {
             v["commit_full"].as_str().unwrap_or_default(),
             kbf_server::BUILD_COMMIT_FULL
         );
-        assert_eq!(v["admin_protocol"], kbf_server::managed::ADMIN_PROTOCOL);
+        assert_eq!(v["admin_protocol"], 1);
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         let profile = if cfg!(debug_assertions) {
             "debug"

@@ -7,8 +7,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, Fenced, GENERATION, Revision, SHARED_WRITERS, ScanPage,
-    ScanRange, Store, StoreError, StoreTime, Txn, Versioned,
+    Changes, Commit, CommitStats, Conflict, Fenced, GENERATION, Revision, ScanPage, ScanRange,
+    Store, StoreError, StoreTime, Txn, Versioned,
 };
 
 use crate::farm::{EpochPolicy, StateError};
@@ -375,16 +375,6 @@ pub fn generation_of(store: &dyn Store) -> Result<u64, StateError> {
         why: "not an 8-byte number".to_owned(),
     })?;
     Ok(u64::from_be_bytes(bytes))
-}
-
-/// Whether the generation row of `store` holds [`SHARED_WRITERS`]: the frontends share the
-/// store and none holds a generation. False when the store cannot be read.
-pub(crate) fn holds_no_generation(store: &dyn Store) -> bool {
-    store
-        .get(GENERATION)
-        .ok()
-        .flatten()
-        .is_some_and(|row| row.value == SHARED_WRITERS)
 }
 
 /// A store handle that reads and writes nothing: what a candidate probes.

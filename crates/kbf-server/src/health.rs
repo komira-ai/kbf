@@ -92,7 +92,7 @@ impl Readiness {
         first
     }
 
-    /// This server has handed its roles to a successor: [`Checks::failing`] stops asking
+    /// This server is retiring and has stood its roles down: [`Checks::failing`] stops asking
     /// the probes. Readiness is otherwise untouched (it stays ready), and nothing undoes
     /// it. Returns whether this call was the first.
     pub fn set_handed_over(&self) -> bool {

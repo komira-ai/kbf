@@ -90,7 +90,6 @@ host; a farm sets routable addresses.
 | worker listener | `--worker-listen` | `127.0.0.1:8981` | `frontend`, `all-in-one` |
 | operator API | `--api-listen` | off unless given | `frontend`, `all-in-one` |
 | enrollment | `--enroll-listen` | off unless given | `frontend` |
-| admin calls | `--admin-listen` | off unless given; loopback only | `frontend` |
 | storage service | `--storage-listen` | `127.0.0.1:8982` | `storage`, `storage-and-daemon` |
 | storage metrics | `--metrics-listen` | off unless given | `storage`, `storage-and-daemon` |
 | the proxy's public port | `ListenStream=` of `kbf-proxy.socket` | `8980` | proxy hosts |
@@ -105,10 +104,10 @@ Some defaults come from tools around the binary, not from `kbf`:
   port from the frontend's configuration. The renderer's REAPI, worker and operator
   ports are 8980, 8981 and 8982.
 - Behind the proxy, slot A's children listen on `base_port` (REAPI), `base_port + 1`
-  (worker), `+ 2` (operator API), `+ 3` (admin calls) and `+ 4` (enrollment); slot B is ten
-  ports above slot A. `kbf-installer setup` refuses a base port whose ranges cover 8980 or
-  8982. With `--instance b`, a frontend listens ten ports above what `--listen`,
-  `--worker-listen` and `--api-listen` say.
+  (worker), `+ 2` (operator API), `+ 3` (admin calls, which a frontend no longer serves)
+  and `+ 4` (enrollment); slot B is ten ports above slot A. `kbf-installer setup` refuses a
+  base port whose ranges cover 8980 or 8982. `--instance` no longer moves a frontend's
+  listeners: the flag is accepted and ignored.
 - A daemon opens no listening port.
 
 A listener serves plain text unless its TLS flags are given. The REAPI and worker listeners

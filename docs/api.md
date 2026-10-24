@@ -619,9 +619,8 @@ once the retire has completed, with `retired` true. Calling it again changes not
 answers the same status. The retire:
 
 - refuses every new Execute `UNAVAILABLE`, which Buck2 retries when it opens a call;
-- waits, for at most ten seconds (`--handover-quiesce-secs` where the frontend has a
-  handover socket), for the calls between their request and their queueing, then stops
-  taking work: the frontend reads no more of the state store's queue, grants nothing,
+- waits, for at most ten seconds, for the calls between their request and their queueing,
+  then stops taking work: the frontend reads no more of the state store's queue, grants nothing,
   claims nothing and writes the requeues the store had refused (for at most the same
   time again);
 - stops the worker listener and ends every worker stream `UNAVAILABLE`, so each daemon
@@ -758,8 +757,6 @@ carries the SHA-256 of the root, and pins it.
 | `--enroll-rate-per-minute=N`, `--enroll-rate-burst=N`, `--enroll-max-in-flight=N` | the limits below (defaults 60, 30, 64) |
 | `--enroll-worker-endpoint`, `--enroll-cas-endpoint`, `--enroll-storage-port` | what every node is told (`NodeConfig`) |
 | `--enroll-allow-unenforced-deny` | see the start gate |
-
-With `--instance=b` the enroll port moves ten above, as the others do.
 
 
 **Order of an `Enroll`.** The shape (ids, role names, the size of each CSR) is checked
@@ -938,107 +935,21 @@ whoever acts on a zero keeps new writes away from the node first (drains it), th
 again. A member that left the map (a `DOWN` member leaves after the dwell) is not counted.
 `503` with `{"error": ...}` when the membership cannot be read.
 
-## The admin calls: `GET /v1/admin/role` and `POST /v1/admin/{quiesce,resume,takeover,stand-down}`
+## The admin calls (removed)
 
-A `kbf --mode frontend` started with `--admin-listen <addr>` serves these on a port of
-their own, separate from the operator API. The address must be a loopback address (any
-other is refused at start, in the flags and again when the port is bound): the calls move
-the scheduler's role, so nothing but the host's own processes may reach them. The port
-needs `--state-store`.
-
-**Who may call.** With `--proxy-auth-file` (a frontend behind the proxy) every call, `GET
-role` too, must present the proxy's secret as `x-kbf-proxy-auth: <64 hex digits>` (the
-header of [Behind the farm's proxy](#behind-the-farms-proxy); no identity header is
-needed). A call with no secret, or a wrong one, is refused `403` with
-`{"error": "..."}`, as on the operator API, and is not acted on. The proxy sends the secret
-on every admin call. Without `--proxy-auth-file` the calls take no credential: the port is
-loopback-only and every local process may call it, which is for a host with no proxy. The calls and the `role` answer
-are versioned by `admin_protocol` in `kbf --version --json` (`docs/artifacts.md`).
-
-**`GET /v1/admin/role`**:
-
-```json
-{
-  "role": "active",
-  "instance_id": "5d1c4a52-8b0e-4f64-9a27-3c0e4f8d9a10",
-  "admin_protocol": 1,
-  "generation": 7,
-  "held_generation": 7,
-  "superseded": false,
-  "open_streams": 3,
-  "open_sessions": 2,
-  "reapi": "127.0.0.1:8980",
-  "worker": "127.0.0.1:8981",
-  "api": "127.0.0.1:8982"
-}
-```
-
-- `role`: `candidate` (started with `--await-takeover`: holds no generation and schedules
-  nothing), `active` (holds the generation and schedules), `quiesced` (holds it and has
-  stopped scheduling, assigning and requeueing) or `stood-down` (another process holds the
-  generation).
-- `instance_id`: a UUID, new for each process.
-- `generation`: the generation the state store is at now (`null` if it cannot be read);
-  `held_generation`: the one this process took (`null` for a candidate). A takeover passes
-  the holder's `generation` as `expect`. A process over a Postgres store, which the
-  frontends share and which holds no generation, answers `null` for both.
-- `superseded`: the store has refused a write of this process because another writer holds
-  the generation.
-- `open_streams`: Execute and WaitExecution streams open; `open_sessions`: worker streams
-  open.
-- `reapi`, `worker`, `api`: the listeners. A candidate has no worker listener, and a
-  stood-down process has none again.
-
-Every call below answers `200` with this object after the call. A call that does not apply
-answers `409` with the object and an `error` naming why (`role`, or a generation); a body
-that is not what the call takes is `400`.
-
-**`POST /v1/admin/quiesce`** (active or quiesced): waits, for at most 10 seconds, for the
-Execute calls between their request and their queueing and the results being taken, then
-fences the farm: it feeds the scheduler nothing, so nothing is granted, assigned or
-requeued, a call that would queue is refused `UNAVAILABLE`, and a worker's result or
-heartbeat is not applied. It writes the requeues the store refused. Idempotent. Open
-streams and worker sessions stay open. While quiesced, a worker's heartbeat or result is not
-applied, so a quiesce is meant to last seconds (a takeover's limit is 10): one longer than
-the leases' expiry lets the scheduler expire the leases of work still running and requeue it
-when the process resumes. Nothing bounds it. Refused with `409` when the store holds no
-generation (a Postgres store shared by frontends): nothing could take over, and nothing is
-stopped.
-
-**`POST /v1/admin/resume`** (quiesced or active): undoes a quiesce, for a takeover that did
-not happen. A process over a store that holds no generation is never quiesced, so a resume
-of it changes nothing. Refused with `409` when the store is no longer at `held_generation` or
-the
-store has refused a write of this process (another writer holds it: only `stand-down`
-applies). The farm fed the scheduler nothing while it was quiesced, so its memory is the
-store's as of the quiesce; nothing is reloaded.
-
-**`POST /v1/admin/takeover`**, body `{"expect": N}` (candidate only): takes the generation,
-which must be exactly `N` (a store at another generation is refused with `409` and nothing
-is written), keeps the epoch (daemons that redial keep the runs of their leases), reads all
-state from the store, and starts the scheduler, the reconciler and the worker listener on
-the sockets the candidate already bound. `500` if the generation was taken and the
-frontend could not start; the process then ends. Refused with `409` when the store holds no
-generation (a Postgres store shared by frontends).
-
-**`POST /v1/admin/stand-down`** (active, quiesced or stood-down): the old holder's step
-after a takeover elsewhere. It ends the worker streams with `UNAVAILABLE` ("connect
-again"), stops the worker listener, goes not ready (`/readyz`, the health service) and
-answers the Execute and WaitExecution streams it kept from the `done/` rows the new
-holder writes, with no GOAWAY and no timeout. It does not give up the state store. It is
-not undone. A process that is never told to stand down but finds it is fenced (the store
-refused a write of its own: `superseded` turns true) fences its farm and answers its kept
-calls from the `done/` rows the same way. The process exits only when told to (`open_streams` and `open_sessions` say
-when it holds nothing).
-
-**A candidate** (`--await-takeover`, which needs `--admin-listen`) opens the state store
-without taking the generation, touches no epoch and writes nothing; it serves `/readyz`,
-`grpc.health.v1` and `GetCapabilities`, and no other REAPI call (`UNIMPLEMENTED`). It runs
-no scheduler or reconciler and binds no worker listener. It makes and changes no schema.
-A SQLite state file is held by one process (an exclusive file lock), so a candidate cannot
-run beside the process that holds the file: side by side needs the Postgres store.
-A start without `--await-takeover` takes the next generation and keeps the epoch, as any
-start does; only `POST /v1/epoch/bump` changes it.
+A `kbf --mode frontend` no longer serves `GET /v1/admin/role` and
+`POST /v1/admin/{quiesce,resume,takeover,stand-down}`, and has no candidate that waits for
+a takeover: frontends that share a Postgres state store each take work from it, and a
+frontend leaves service by [the retire](#get-v1frontendretire-and-post-v1frontendretire) or a stop. The flags that
+turned the admin port on (`--admin-listen`, `--await-takeover`) and the flags of the
+handover between two frontends of one host (`--handover-socket`, `--instance`,
+`--handover-quiesce-secs`, `--handover-follow-interval-ms`, `--handover-watchdog-secs`,
+`--handover-peer-name`, `--envoy-check-interval-ms`, `--envoy-check-timeout-ms`,
+`--envoy-unhealthy-threshold`), and their keys in the `[handover]` table of `kbf.toml`, are
+still accepted so that a unit or file written before the removal starts: they are hidden
+from `--help`, do nothing, and each one given logs a warning naming it. They are removed in
+the release after. `admin_protocol` in `kbf --version --json` (`docs/artifacts.md`) stays 1
+for a proxy that still reads it.
 
 ## `/v1/object-stores/...`
 

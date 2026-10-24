@@ -50,10 +50,10 @@ The SQLite file is never changed by any of them.
    file it is given; a cutover of the key while the flag is on the command line changes
    nothing the frontend reads.
 
-   **Take out `--handover-socket` first.** A frontend that hands over (a `handover-socket`
-   key under `[handover]` in its `kbf.toml`, or a `--handover-socket` flag) refuses a
-   `postgres://` store and does not start. The tool does not look for it: remove it by hand
-   before the dry run.
+   **Take out `--handover-socket` anyway.** The frontend no longer hands over: a
+   `handover-socket` key under `[handover]` in its `kbf.toml`, or a `--handover-socket` flag,
+   is accepted and ignored with a warning, and it no longer stops a `postgres://` store from
+   starting. The tool does not look for it: remove it by hand so the warning goes.
 
    The dry run below names the file and the old and new value of the setting; it refuses a
    file whose setting does not name the state file you are copying.
@@ -156,8 +156,9 @@ agree (the write is conditional on the row they read), and a store that already 
 marker is left as it is. Do it in this order:
 
 1. **Stop every frontend of an earlier release that uses the database**: each `kbf frontend`
-   and `kbf all-in-one` unit, and any process started with `--admin-listen` (a candidate
-   waiting for a takeover included). Check that each unit says `inactive`.
+   and `kbf all-in-one` unit, and any process of an earlier release started with
+   `--admin-listen` (a candidate waiting for a takeover included). Check that each unit says
+   `inactive`.
 2. **Back up the database** (the `kbf_state` schema). The marker is not undone by going back to
    an earlier binary: see "If a frontend of an earlier release is started" below. The backup
    is the way back.
@@ -174,17 +175,15 @@ still running when the marker is written is refused by the store at its next wri
 cut short by it. To go back to an earlier release, restore the backup of step 2 (the writes
 made since are lost, as after a rollback above).
 
-The admin port's `takeover` of a store that holds the marker is refused, for the row is not a
-generation to expect, and so is `quiesce`, for nothing could take over from the process (it
-keeps scheduling). `GET /v1/admin/role` answers `null` for `generation` and
-`held_generation`. A frontend of this release does not hand a generation over because it
-holds none.
+A frontend of this release serves no admin port and has no takeover: it holds no generation
+to hand over.
 
 **The proxy's slot supervision does not work over a Postgres store.** It starts every child
 as a candidate (`--await-takeover`) and then calls `takeover`, to start a frontend at boot or
-to swap one in for another. On a store that holds the marker that call is refused, so the
-child is never brought up and a swap fails before it stops the old one. Run a frontend over a
-Postgres store under its own unit, without `--await-takeover`, and start and stop it there.
+to swap one in for another. A frontend of this release accepts and ignores `--await-takeover`
+and serves no admin calls, so the child is never brought up and a swap fails before it stops
+the old one. Run a frontend over a Postgres store under its own unit, without
+`--await-takeover`, and start and stop it there.
 
 A SQLite state file is held by one process and keeps its generation until it is moved to
 Postgres.

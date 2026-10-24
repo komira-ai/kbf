@@ -653,8 +653,8 @@ fn violations(name: &str, text: &str) -> Vec<String> {
 
     if plain {
         // Catches a plain frontend that still carries the handover model: a template, an
-        // instance (kbf refuses --instance without --handover-socket), a control socket,
-        // a RuntimeDirectory= for it, a `%i`. Read over every line of the unit's commands.
+        // instance and a control socket (flags kbf still accepts, ignores and warns of), a
+        // RuntimeDirectory= for it, a `%i`. Read over every line of the unit's commands.
         if name.contains('@') {
             v("proxyless", "a template unit".into());
         }

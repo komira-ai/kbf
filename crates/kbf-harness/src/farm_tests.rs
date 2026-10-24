@@ -550,25 +550,6 @@ fn a_farm_that_lost_a_node_a_member_or_its_frontend_is_not_whole() {
 }
 
 #[test]
-fn the_control_socket_is_removed_when_the_farm_stops_and_when_it_is_dropped() {
-    // Catches: the frontend's control socket left in the temporary directory by every run
-    // (a killed process cannot remove its own), one more per run on a long-lived host.
-    // Catches: `stop_all_within` or `Drop for Farm` does not remove it.
-    let d = dir("socket");
-    let socket = d.join("kbf-farm.sock");
-    std::fs::write(&socket, b"").expect("socket");
-    let mut farm = Farm::supervise(&d, vec![sleeper(Role::Frontend, &d)]);
-    farm.socket = Some(socket.clone());
-    let _ = farm.stop_all();
-    assert!(!socket.exists(), "removed by the stop");
-    std::fs::write(&socket, b"").expect("socket");
-    let mut farm = Farm::supervise(&d, vec![sleeper(Role::Frontend, &d)]);
-    farm.socket = Some(socket.clone());
-    drop(farm);
-    assert!(!socket.exists(), "removed by the drop");
-}
-
-#[test]
 fn a_farm_that_is_dropped_leaves_no_process_running() {
     // Catches: a run that panics or returns early (the farm goes out of scope with no stop)
     // leaving its processes running. Catches: `Proc` has no `Drop`.

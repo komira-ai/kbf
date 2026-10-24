@@ -468,18 +468,14 @@ fn driven(unit: Unit, driver: Driver) -> Unit {
     }
 }
 
-/// The frontend's unit. The unit's state store is the host's Postgres and it has no control
-/// socket (kbf refuses the two together); the box has no Postgres, so the farm gives the
-/// frontend a SQLite file and a control socket (in the temporary directory: a scratch path
-/// is too long for a socket's).
+/// The frontend's unit. The unit's state store is the host's Postgres; the box has none, so
+/// the farm gives the frontend a SQLite file.
 #[must_use]
-pub fn frontend(s: &Settings, uid: u32, socket: &Path, topo: &Topology) -> Unit {
+pub fn frontend(s: &Settings, uid: u32, topo: &Topology) -> Unit {
     let state = format!("--state-store=sqlite://{}/state/state.db", s.root.display());
-    let control = format!("--handover-socket={}", socket.display());
     let unit = Unit::new(Mode::Frontend, s, uid)
         .replace(&[state])
         .set(&[ONE_HOST_PLATFORM.to_owned()])
-        .append(&[control])
         .set(&topo.limits.frontend);
     overrides(topo, Role::Frontend, unit)
 }
