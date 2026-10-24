@@ -13,9 +13,6 @@
 //!   file fails to open with [`SqliteError::Locked`]. The network-filesystem check reads
 //!   the `statfs` type of the file's directory, so it is made on Linux only: on any other
 //!   system nothing is refused, and keeping the file on a local disk is the operator's job.
-//! - **Handing over.** [`Store::demote`] stops the writer and releases the lock while the
-//!   reader stays open, so a successor process can open the file and write while this one
-//!   goes on reading the change feed. Every write after it is `StoreError::Fenced`.
 //! - **Epoch.** Every open bumps the epoch recorded in the file ([`SqliteStore::epoch`]);
 //!   [`restore`] does too, so a restored or swapped file never reuses an epoch the replaced
 //!   file issued. The farm's epoch, the one `Welcome` names, is not this one: a frontend
@@ -58,7 +55,7 @@ use crate::GROUP_COMMIT_WINDOW;
 use crate::clock::{Clock, StoreTime};
 use crate::store::Store;
 use crate::types::{
-    Changes, Commit, CommitStats, Cond, Conflict, Revision, ScanPage, ScanRange, StoreError, Txn,
+    Changes, Commit, CommitStats, Conflict, Revision, ScanPage, ScanRange, StoreError, Txn,
     Versioned,
 };
 use writer::{Reply, Request, Shared, Writer};
@@ -106,13 +103,12 @@ pub struct SqliteStore {
     path: PathBuf,
     clock: Arc<dyn Clock>,
     epoch: u64,
-    /// Taken at drop or [`Store::demote`], so the writer sees its queue close; `None`
-    /// once the store has given up the writer role.
-    requests: Mutex<Option<SyncSender<Request>>>,
+    /// Replaced at drop, so the writer sees its queue close.
+    requests: SyncSender<Request>,
     writer: Mutex<Option<JoinHandle<()>>>,
     reader: Mutex<Connection>,
     shared: Arc<Shared>,
-    /// Held until the store is dropped or demoted; released after the writer is gone.
+    /// Held until the store is dropped; released after the writer is gone.
     lock: Mutex<Option<guard::LockFile>>,
 }
 
@@ -177,7 +173,7 @@ impl SqliteStore {
             path: path.to_owned(),
             clock,
             epoch,
-            requests: Mutex::new(Some(requests)),
+            requests,
             writer: Mutex::new(Some(handle)),
             reader: Mutex::new(reader),
             shared,
@@ -215,42 +211,23 @@ impl SqliteStore {
     }
 
     /// Queues a request for the writer and waits for its group to be on disk.
-    fn call(
-        &self,
-        txns: Vec<Txn>,
-        reap: bool,
-        guard: Option<(String, Cond)>,
-    ) -> Result<Reply, StoreError> {
+    fn call(&self, txns: Vec<Txn>, reap: bool) -> Result<Reply, StoreError> {
         let (reply, answer) = mpsc::sync_channel(1);
         let request = Request {
             txns,
             reap,
-            guard,
             queued: Instant::now(),
             reply,
         };
-        let sender = held(&self.requests).clone().ok_or(StoreError::Fenced)?;
         // A writer that has stopped would not take the request, which is then dropped here
         // with its reply sender, or drops it unanswered: either way the receive fails and
         // the caller is told the writer has stopped.
-        let _ = sender.send(request);
-        // The clone must be gone before the wait: a demote joins the writer, which ends
-        // only when every sender is.
-        drop(sender);
+        let _ = self.requests.send(request);
         answer.recv().ok().ok_or_else(gone)?
     }
 
     fn reader(&self) -> std::sync::MutexGuard<'_, Connection> {
         held(&self.reader)
-    }
-
-    /// Stops the writer after the calls already queued, then releases the file lock.
-    fn stop_writer(&self) {
-        // Closing the queue ends the writer after the requests already in it.
-        drop(held(&self.requests).take());
-        // A writer that panicked has nothing more to say to us.
-        let _ = held(&self.writer).take().map(JoinHandle::join);
-        drop(held(&self.lock).take());
     }
 }
 
@@ -273,14 +250,19 @@ impl std::fmt::Debug for SqliteStore {
 }
 
 impl Drop for SqliteStore {
+    /// Stops the writer after the calls already queued, then releases the file lock.
     fn drop(&mut self) {
-        self.stop_writer();
+        // Closing the queue ends the writer after the requests already in it.
+        drop(std::mem::replace(&mut self.requests, mpsc::sync_channel(0).0));
+        // A writer that panicked has nothing more to say to us.
+        let _ = held(&self.writer).take().map(JoinHandle::join);
+        drop(held(&self.lock).take());
     }
 }
 
 impl Store for SqliteStore {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
-        Ok(self.call(batch, false, None)?.commits)
+        Ok(self.call(batch, false)?.commits)
     }
 
     fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {
@@ -300,16 +282,7 @@ impl Store for SqliteStore {
     }
 
     fn reap_expired(&self) -> Result<usize, StoreError> {
-        Ok(self.call(Vec::new(), true, None)?.reaped)
-    }
-
-    fn reap_expired_if(
-        &self,
-        key: &str,
-        cond: Cond,
-    ) -> Result<Result<usize, Conflict>, StoreError> {
-        let reply = self.call(Vec::new(), true, Some((key.to_owned(), cond)))?;
-        Ok(reply.refused.map_or(Ok(reply.reaped), Err))
+        Ok(self.call(Vec::new(), true)?.reaped)
     }
 
     fn commit_stats(&self) -> CommitStats {
@@ -321,11 +294,6 @@ impl Store for SqliteStore {
 
     fn now(&self) -> StoreTime {
         self.clock.now()
-    }
-
-    fn demote(&self) -> Result<(), StoreError> {
-        self.stop_writer();
-        Ok(())
     }
 }
 

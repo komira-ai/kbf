@@ -10,7 +10,7 @@ use kbf_server::enroll::api::{EnrollApi, NODES, TOKENS, routes};
 use kbf_server::enroll::{OsRandom, PinError, PinSource};
 use kbf_server::token::ApiToken;
 use kbf_state::fake::{Fake, Flaw};
-use kbf_state::{Fenced, ManualClock, Store};
+use kbf_state::{ManualClock, Store};
 use kbf_types::CaPin;
 use kbf_types::enroll_api::{NodeList, TokenCreated, TokenList, TokenRevoked};
 
@@ -55,10 +55,9 @@ async fn serve(enroll: Option<Arc<EnrollApi>>) -> SocketAddr {
 
 fn enrollment() -> Arc<EnrollApi> {
     let clock = Arc::new(ManualClock::default());
-    let fake: Arc<dyn Store> = Arc::new(Fake::with_flaw(clock, Flaw::None));
-    let fenced: Arc<dyn Store> = Arc::new(Fenced::take(fake, None).expect("writer"));
+    let store: Arc<dyn Store> = Arc::new(Fake::with_flaw(clock, Flaw::None));
     Arc::new(EnrollApi::new(
-        fenced,
+        store,
         Arc::new(FixedPin),
         Arc::new(OsRandom),
     ))

@@ -207,6 +207,9 @@ pub enum Mode {
     FailTxn,
     /// Every read fails in the backend.
     FailGet,
+    /// Every transaction is refused as written by a superseded handle
+    /// ([`StoreError::Fenced`]).
+    Fenced,
 }
 
 /// A store that delegates, records the transactions it applies, can run a hook just before
@@ -265,6 +268,7 @@ impl Store for Wrap {
                 })
                 .collect()),
             Mode::FailTxn => Err(StoreError::Failed("down".to_owned())),
+            Mode::Fenced => Err(StoreError::Fenced),
             Mode::Pass | Mode::FailGet => self.inner.apply_batch(batch),
         }
     }

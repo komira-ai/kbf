@@ -1,6 +1,5 @@
 //! The lock beside a state file is free again the moment what held it is dropped (the
-//! store, a demoted store, a `StoreLock`), whatever other threads of the process are
-//! doing.
+//! store, a `StoreLock`), whatever other threads of the process are doing.
 //!
 //! An `flock` belongs to the open file description, which lives until every copy of the
 //! descriptor is closed, and a process forked while the lock is held (any other test of
@@ -12,7 +11,6 @@
 mod common;
 
 use common::{open_manual, scratch};
-use kbf_state::Store;
 use kbf_state::sqlite::{Options, StoreLock};
 use kbf_testkit::forked::ForkedChild;
 
@@ -28,21 +26,6 @@ fn a_child_forked_while_the_store_was_open_does_not_keep_the_file_locked_after_t
     let (second, _) = open_manual(&dir, Options::default());
     assert_eq!(second.epoch(), 2, "the file is opened again after the drop");
     drop(second);
-    child.finish();
-}
-
-// Catches a demotion (the handover to the next frontend) that gives up the lock only
-// by closing it: the successor's `StoreLock`, or its open, is refused while any child
-// forked in the meantime has not exec'd. Catches: the `Drop` of `LockFile` removed.
-#[test]
-fn a_demoted_store_gives_up_the_lock_though_a_forked_child_has_a_copy() {
-    let dir = scratch("lock-forked-demote");
-    let db = dir.join("state.db");
-    let (store, _) = open_manual(&dir, Options::default());
-    let child = ForkedChild::before_exec();
-    store.demote().expect("demote");
-    let taken = StoreLock::take(&db).expect("the lock after the store was demoted");
-    drop(taken);
     child.finish();
 }
 

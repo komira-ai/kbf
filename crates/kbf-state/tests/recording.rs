@@ -8,7 +8,8 @@ use std::time::Duration;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::recording::{RecordingStore, Write, WriteKind};
 use kbf_state::{
-    Cond, Fenced, GENERATION, ManualClock, Revision, ScanRange, Store, StoreError, Txn,
+    Changes, Commit, CommitStats, Cond, Conflict, ManualClock, Revision, ScanPage, ScanRange, Store,
+    StoreError, StoreTime, Txn, Versioned,
 };
 
 fn fake() -> Arc<dyn Store> {
@@ -16,6 +17,43 @@ fn fake() -> Arc<dyn Store> {
         Arc::new(ManualClock::default()),
         Flaw::None,
     ))
+}
+
+/// A store that fails every call with `StoreError::Fenced`.
+struct Refusing;
+
+impl Store for Refusing {
+    fn apply_batch(&self, _batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
+        Err(StoreError::Fenced)
+    }
+
+    fn get(&self, _key: &str) -> Result<Option<Versioned>, StoreError> {
+        Err(StoreError::Fenced)
+    }
+
+    fn scan_prefix(&self, _prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
+        Err(StoreError::Fenced)
+    }
+
+    fn scan_range(&self, _scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
+        Err(StoreError::Fenced)
+    }
+
+    fn changes(&self, _after: Revision, _limit: usize) -> Result<Changes, StoreError> {
+        Err(StoreError::Fenced)
+    }
+
+    fn reap_expired(&self) -> Result<usize, StoreError> {
+        Err(StoreError::Fenced)
+    }
+
+    fn commit_stats(&self) -> CommitStats {
+        CommitStats::default()
+    }
+
+    fn now(&self) -> StoreTime {
+        StoreTime::ZERO
+    }
 }
 
 fn write(key: &str, kind: WriteKind, committed: bool) -> Write {
@@ -82,15 +120,11 @@ fn a_refused_write_is_recorded_as_not_committed() {
     );
 }
 
-// Catches a recorder that records only what succeeds: a store that fails the whole call
-// (here a superseded fence) still has the write recorded, as not committed, and the error
-// reaches the caller unchanged.
+/// Asserts that a store that fails the whole call still has the write recorded, as not
+/// committed, and that the error reaches the caller unchanged.
 #[test]
 fn a_write_the_store_fails_is_recorded_and_the_error_passes_through() {
-    let inner = fake();
-    let old = Fenced::take(Arc::clone(&inner), None).expect("take");
-    Fenced::take(inner, Some(1)).expect("the rival takes");
-    let recording = RecordingStore::new(Arc::new(old));
+    let recording = RecordingStore::new(Arc::new(Refusing));
     let err = recording
         .txn(Txn::new().put("mine", "v", Cond::Any))
         .unwrap_err();
@@ -98,27 +132,7 @@ fn a_write_the_store_fails_is_recorded_and_the_error_passes_through() {
     assert_eq!(recording.writes(), [write("mine", WriteKind::Put, false)]);
 }
 
-// Catches a recorder that sees the fence's own plumbing as the component's writes: under a
-// fenced handle the generation check is appended to every transaction, and the recorded
-// keys are only the component's. Put on the other side of the fence, the take itself is
-// the only write of the generation row.
-#[test]
-fn a_fence_above_the_recorder_adds_no_keys_and_a_take_below_it_shows() {
-    let recording = Arc::new(RecordingStore::new(fake()));
-    let held = Fenced::take(Arc::clone(&recording) as Arc<dyn Store>, None).expect("take");
-    assert_eq!(
-        recording.keys().into_iter().collect::<Vec<_>>(),
-        [GENERATION]
-    );
-    recording.clear();
-    held.txn(Txn::new().put("p/1", "v", Cond::Any))
-        .expect("store")
-        .expect("commit");
-    assert_eq!(recording.writes(), [write("p/1", WriteKind::Put, true)]);
-}
-
-// Catches reaps going unseen (they write Expire rows for keys nobody names) and clear
-// not clearing: reaps are counted on both reap calls, and clear resets writes and reaps.
+/// Asserts that a reap is counted, and that `clear` resets the writes and the reaps to none.
 #[test]
 fn reaps_are_counted_and_clear_forgets_everything() {
     let recording = RecordingStore::new(fake());
@@ -127,15 +141,13 @@ fn reaps_are_counted_and_clear_forgets_everything() {
         .expect("store")
         .expect("commit");
     assert_eq!(recording.reap_expired(), Ok(0));
-    assert_eq!(recording.reap_expired_if("k", Cond::Any), Ok(Ok(0)));
-    assert_eq!(recording.reaps(), 2);
+    assert_eq!(recording.reaps(), 1);
     recording.clear();
     assert_eq!((recording.reaps(), recording.writes()), (0, Vec::new()));
 }
 
-// Catches a wrapper that changes what it forwards: reads, the feed, the clock, the
-// counters and the calls a backend may refuse all behave as the store underneath, and
-// none of them is recorded.
+/// Asserts that reads, the feed, the clock and the counters answer as the store underneath
+/// does, and that none of them is recorded.
 #[test]
 fn everything_else_is_forwarded_and_not_recorded() {
     let inner = fake();
@@ -168,8 +180,5 @@ fn everything_else_is_forwarded_and_not_recorded() {
     );
     assert_eq!(recording.commit_stats(), inner.commit_stats());
     assert_eq!(recording.now(), inner.now());
-    assert!(recording.demote().is_err(), "the fake has no writer role");
-    assert!(recording.hold_liveness(1).is_err());
-    assert!(recording.holder_alive(1).is_err());
     assert_eq!(recording.writes(), Vec::new());
 }

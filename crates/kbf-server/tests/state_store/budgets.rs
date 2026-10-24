@@ -25,7 +25,7 @@ fn take_over(disk: &mut Disk, old: TestFarm, end: End) -> TestFarm {
         End::Handover => old.fence(),
         End::Crash => disk.crash(old),
     }
-    disk.generation_farm()
+    disk.farm(EpochPolicy::Keep)
 }
 
 /// Registers `name` with room for four actions.
@@ -89,7 +89,7 @@ async fn farm_runs_used(farm: &TestFarm, inbox: &mut Inbox) {
 /// last: the operation ends with no further run.
 async fn farm_runs_are_not_given_back(end: End) {
     let mut disk = Disk::new();
-    let old = disk.generation_farm();
+    let old = disk.farm(EpochPolicy::Keep);
     let (_, mut inbox) = register_as(&old, "node-a");
     farm_runs_used(&old, &mut inbox).await;
     assert_eq!((disk.rows("op/"), disk.rows("queue/")), (1, 1));
@@ -130,7 +130,7 @@ async fn farm_runs_survive_a_crash() {
 async fn avoid_is_kept(end: End, lost_on: &str) {
     let lost_on = WorkerId::new(lost_on);
     let mut disk = Disk::new();
-    let old = disk.generation_farm();
+    let old = disk.farm(EpochPolicy::Keep);
     let (_, mut inbox) = register_as(&old, lost_on.as_str());
     submit(&old, request(1)).expect("submitted");
     let lease = one_lease(&mut inbox);
@@ -188,7 +188,7 @@ async fn the_nodes_to_avoid_survive_a_crash() {
 /// old process; the successor's first such give-up ends the operation.
 async fn not_started_is_kept(end: End) {
     let mut disk = Disk::new();
-    let old = disk.generation_farm();
+    let old = disk.farm(EpochPolicy::Keep);
     let (stream, mut inbox) = register_as(&old, "node-a");
     submit(&old, request(1)).expect("submitted");
     for seq in 1..=u64::from(NOT_STARTED_RERUNS) {
