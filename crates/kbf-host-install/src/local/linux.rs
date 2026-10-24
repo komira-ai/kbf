@@ -54,7 +54,7 @@ use super::backend::{Backend, Fault, Pending};
 use super::units::restart_and_wait;
 use crate::host::Host;
 use crate::mac::channel::{MacAllowlist, Source};
-use crate::mac::fetch::{FetchError, Fetcher, Limits};
+use crate::mac::fetch::{AssetKind, FetchError, Fetcher, Limits};
 use crate::mac::stage::read_token;
 use crate::outcome::Refusal;
 use crate::plan::Wait;
@@ -129,12 +129,49 @@ fn commit_id(commit: &str) -> Result<CommitId, Fault> {
     CommitId::new(commit).map_err(|e| Fault::failed(Code::StateUnavailable, e.to_string()))
 }
 
-fn state_fault(e: impl std::fmt::Display) -> Fault {
+pub(super) fn state_fault(e: impl std::fmt::Display) -> Fault {
     Fault::failed(Code::StateUnavailable, e.to_string())
 }
 
+/// The scratch directory `<work>/<prefix>.fetch` (and its `home`) that the unprivileged user
+/// `who` fetches into, made new and owned by it; `work` is made, readable by all, if it is not
+/// there.
+pub(super) fn fetch_scratch_in(work: &Path, prefix: &str, who: Identity) -> Result<PathBuf, Fault> {
+    let stage_failed = |e: io::Error| Fault::failed(Code::StageFailed, format!("scratch: {e}"));
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(work)
+        .map_err(stage_failed)?;
+    let scratch = work.join(format!("{prefix}.fetch"));
+    match fs::remove_dir_all(&scratch) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(stage_failed(e)),
+        _ => {}
+    }
+    for (dir, mode) in [(scratch.clone(), 0o700), (scratch.join("home"), 0o700)] {
+        fs::create_dir(&dir)
+            .and_then(|()| fs::set_permissions(&dir, fs::Permissions::from_mode(mode)))
+            .and_then(|()| std::os::unix::fs::chown(&dir, Some(who.uid), Some(who.gid)))
+            .map_err(stage_failed)?;
+    }
+    Ok(scratch)
+}
+
+/// The refusal a fetch that found nothing, or could not fetch, is.
+pub(super) fn fetch_fault(e: FetchError) -> Fault {
+    match e {
+        FetchError::Unknown => Fault::refused(Code::UnknownRelease, "no release has that commit"),
+        FetchError::Ambiguous => {
+            Fault::refused(Code::AmbiguousRelease, "two releases have that commit")
+        }
+        FetchError::Failed(why) | FetchError::RateLimited(why) => {
+            Fault::refused(Code::FetchFailed, why)
+        }
+    }
+}
+
 /// The refusal of the allowlist or of a channel, as the socket tells it.
-fn config_fault(refusal: Refusal) -> Fault {
+pub(super) fn config_fault(refusal: Refusal) -> Fault {
     let code = match refusal {
         Refusal::ChannelNotAllowed => Code::ChannelNotAllowed,
         Refusal::ConfigUnsafe | Refusal::KeyUntrusted => Code::ConfigUnsafe,
@@ -167,25 +204,8 @@ impl<E: Exec> Linux<E> {
 
     /// The scratch directory the unprivileged user fetches into, owned by it.
     fn fetch_scratch(&self, prefix: &str, who: Identity) -> Result<PathBuf, Fault> {
-        let stage_failed = |e: io::Error| Fault::failed(Code::StageFailed, format!("scratch: {e}"));
         let work = self.layout.join(&self.layout.work_dir());
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o755)
-            .create(&work)
-            .map_err(stage_failed)?;
-        let scratch = work.join(format!("{prefix}.fetch"));
-        match fs::remove_dir_all(&scratch) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(stage_failed(e)),
-            _ => {}
-        }
-        for (dir, mode) in [(scratch.clone(), 0o700), (scratch.join("home"), 0o700)] {
-            fs::create_dir(&dir)
-                .and_then(|()| fs::set_permissions(&dir, fs::Permissions::from_mode(mode)))
-                .and_then(|()| std::os::unix::fs::chown(&dir, Some(who.uid), Some(who.gid)))
-                .map_err(stage_failed)?;
-        }
-        Ok(scratch)
+        fetch_scratch_in(&work, prefix, who)
     }
 
     /// Fetch and verify the release; the commit.
@@ -245,6 +265,7 @@ impl<E: Exec> Linux<E> {
         let home = scratch.join("home");
         let fetcher = Fetcher {
             platform: &platform,
+            asset: AssetKind::Tarball,
             runner: &*self.runner,
             curl: &self.tools.curl,
             gh: &gh,
@@ -258,17 +279,7 @@ impl<E: Exec> Linux<E> {
                 bundle_max: BUNDLE_CAP,
             },
         };
-        let commit = fetcher.fetch(prefix, scratch).map_err(|e| match e {
-            FetchError::Unknown => {
-                Fault::refused(Code::UnknownRelease, "no release has that commit")
-            }
-            FetchError::Ambiguous => {
-                Fault::refused(Code::AmbiguousRelease, "two releases have that commit")
-            }
-            FetchError::Failed(why) | FetchError::RateLimited(why) => {
-                Fault::refused(Code::FetchFailed, why)
-            }
-        })?;
+        let commit = fetcher.fetch(prefix, scratch).map_err(fetch_fault)?;
         let id = commit_id(&commit)?;
         let partial = Partial::create(&self.layout, &id, self.owner)
             .map_err(|e| Fault::failed(Code::StageFailed, e.to_string()))?;
@@ -333,9 +344,9 @@ fn policy(max_component: u64) -> Policy {
 }
 
 /// What was copied: its length and sha256.
-struct Copied {
-    len: u64,
-    sha256: String,
+pub(super) struct Copied {
+    pub(super) len: u64,
+    pub(super) sha256: String,
 }
 
 /// Open the untrusted file `src` without following a symbolic link, and accept it only as a
@@ -358,7 +369,7 @@ fn open_plain(src: &Path, cap: u64) -> io::Result<File> {
 /// Copy the untrusted file `src` to the new file `dst` (root's, 0600) through the open
 /// descriptor, hashing what is copied (see [`open_plain`]). A file that grew since it was
 /// looked at is cut at `cap`; the digest then names the cut bytes, which no attestation lists.
-fn copy_hashing(src: &Path, dst: &Path, cap: u64) -> io::Result<Copied> {
+pub(super) fn copy_hashing(src: &Path, dst: &Path, cap: u64) -> io::Result<Copied> {
     let file = open_plain(src, cap)?;
     let mut out = OpenOptions::new()
         .write(true)
@@ -388,7 +399,7 @@ fn copy_hashing(src: &Path, dst: &Path, cap: u64) -> io::Result<Copied> {
 }
 
 /// The text of the untrusted file `src` (see [`open_plain`]).
-fn read_capped(src: &Path, cap: u64) -> io::Result<String> {
+pub(super) fn read_capped(src: &Path, cap: u64) -> io::Result<String> {
     let mut text = String::new();
     open_plain(src, cap)?.take(cap).read_to_string(&mut text)?;
     Ok(text)

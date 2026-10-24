@@ -1,7 +1,7 @@
 //! The local socket: a unix socket, mode 0600, owned by the one account that may use it.
 //!
 //! ```text
-//! kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N] [--restart-unit UNIT]...
+//! kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N] [--layout installer|deb|rpm] [--restart-unit UNIT]...
 //! ```
 //!
 //! The program binds the socket itself (a umask of 0177, then a chown to the account), in a
@@ -18,6 +18,11 @@
 //! 600). `--restart-unit` names a unit that runs the release (repeatable; a Linux host
 //! needs one at least, and a Mac restarts the daemon's job). The paths this program reads as
 //! root are constants, as they are for the ssh path; no flag moves them.
+//!
+//! `--layout` says how a Linux host keeps its releases: `installer` (the default) is the
+//! hand-placed layout of `kbf-installer` (`releases/<commit>` with the links `current` and
+//! `previous`); `deb` and `rpm` are a host whose units run the `kbf` package's `/usr/bin/kbf`,
+//! updated by installing that package ([`super::package`]). A Mac takes none.
 //!
 //! Every request but `query` and `revert` is audited, and is not run when the audit log
 //! cannot be opened. A revert is never held back by it.
@@ -50,7 +55,30 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const REVERT_RETRY: Duration = Duration::from_secs(30);
 
 pub const USAGE: &str = "usage: kbf-host-install --serve --socket PATH --socket-user NAME \
-[--window-secs N] [--restart-unit UNIT]...\n";
+[--window-secs N] [--layout installer|deb|rpm] [--restart-unit UNIT]...\n";
+
+/// How a host keeps the releases it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layout {
+    /// The hand-placed layout of `kbf-installer` (a Mac's kit tree is its counterpart).
+    #[default]
+    Installer,
+    /// The `kbf` package, as a `.deb`.
+    Deb,
+    /// The `kbf` package, as an `.rpm`.
+    Rpm,
+}
+
+impl Layout {
+    fn named(name: &str) -> Option<Self> {
+        match name {
+            "installer" => Some(Self::Installer),
+            "deb" => Some(Self::Deb),
+            "rpm" => Some(Self::Rpm),
+            _ => None,
+        }
+    }
+}
 
 /// The settings of a served socket, from the flags.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +86,7 @@ pub struct ServeConfig {
     pub socket: PathBuf,
     pub user: String,
     pub window_secs: u64,
+    pub layout: Layout,
     pub units: Vec<Unit>,
 }
 
@@ -71,6 +100,7 @@ impl ServeConfig {
         let mut socket = None;
         let mut user = None;
         let mut window = None;
+        let mut layout = None;
         let mut units = Vec::new();
         let mut rest = args.iter();
         while let Some(arg) = rest.next() {
@@ -96,6 +126,7 @@ impl ServeConfig {
                 "--socket" => once(&mut socket)?,
                 "--socket-user" => once(&mut user)?,
                 "--window-secs" => once(&mut window)?,
+                "--layout" => once(&mut layout)?,
                 "--restart-unit" => {
                     units.push(Unit::service(&value).map_err(|BadCommand| {
                         format!("--restart-unit {value:?} is not a kbf unit")
@@ -117,10 +148,15 @@ impl ServeConfig {
                 .ok_or("--window-secs must be a number from 120 to 1800")?,
             None => DEFAULT_WINDOW_SECS,
         };
+        let layout = match layout {
+            Some(name) => Layout::named(&name).ok_or("--layout must be installer, deb or rpm")?,
+            None => Layout::default(),
+        };
         Ok(Self {
             socket,
             user,
             window_secs,
+            layout,
             units,
         })
     }

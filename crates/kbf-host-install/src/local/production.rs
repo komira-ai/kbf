@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::backend::Backend;
 use super::core::Ab;
-use super::serve::{self, ServeConfig, Serving};
+use super::serve::{self, Layout, ServeConfig, Serving};
 use crate::mac::layout::MacHost;
 use crate::runner::{Runner, SystemRunner};
 use crate::trust::Trust;
@@ -183,11 +183,26 @@ pub(super) fn serve_linux(config: &ServeConfig) -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 fn serve_linux_for(config: &ServeConfig) -> Result<(), String> {
+    let env = LinuxEnv::production();
+    let format = match config.layout {
+        Layout::Installer => {
+            return serve_linux_with(
+                config,
+                &env,
+                &Trust::root(),
+                super::linux::production(config.units.clone()),
+                &AtomicBool::new(false),
+            );
+        }
+        Layout::Deb => super::package_format::Format::Deb,
+        Layout::Rpm => super::package_format::Format::Rpm,
+    };
+    let backend = super::package::production(config.units.clone(), format, &env.state_dir);
     serve_linux_with(
         config,
-        &LinuxEnv::production(),
+        &env,
         &Trust::root(),
-        super::linux::production(config.units.clone()),
+        backend,
         &AtomicBool::new(false),
     )
 }
@@ -209,6 +224,9 @@ pub(super) fn serve_mac_with(
     stop: &AtomicBool,
 ) -> Result<(), String> {
     use crate::mac::tools;
+    if config.layout != Layout::Installer {
+        return Err("--layout is for a Linux host: a Mac keeps its releases in the kit".to_owned());
+    }
     if !config.units.is_empty() {
         return Err(
             "--restart-unit is for a Linux host: a Mac restarts the daemon's job".to_owned(),

@@ -18,7 +18,7 @@ use super::answer::{Answer, Code};
 use super::backend::Fault;
 use super::core_tests::{A, B, Fx, VA, VB};
 use super::request::MAX_LINE_LEN;
-use super::serve::{ServeConfig, Serving, bind, passwd_ids, read_line};
+use super::serve::{Layout, ServeConfig, Serving, bind, passwd_ids, read_line};
 use crate::trust::Trust;
 
 fn trust(dir: &Path) -> Trust {
@@ -41,6 +41,37 @@ fn the_ids_of_an_account_come_from_the_passwd_text() {
     assert_eq!(passwd_ids(passwd, "short"), None);
     assert_eq!(passwd_ids(passwd, "nobody"), None);
     assert_eq!(passwd_ids("", "root"), None);
+}
+
+/// `--layout` says how the host keeps its releases: the hand-placed layout of `kbf-installer`
+/// when it is absent or says `installer`, the `kbf` package as a deb or an rpm when it says so;
+/// anything else, or a second one, is refused.
+#[test]
+fn the_layout_flag_names_how_releases_are_kept() {
+    let with = |extra: &[&str]| {
+        let mut words = vec!["--socket", "/s", "--socket-user", "u"];
+        words.extend_from_slice(extra);
+        ServeConfig::parse(&args(&words))
+    };
+    assert_eq!(with(&[]).unwrap().layout, Layout::Installer);
+    assert_eq!(
+        with(&["--layout", "installer"]).unwrap().layout,
+        Layout::Installer
+    );
+    assert_eq!(with(&["--layout", "deb"]).unwrap().layout, Layout::Deb);
+    assert_eq!(with(&["--layout=rpm"]).unwrap().layout, Layout::Rpm);
+    assert!(
+        with(&["--layout", "tarball"])
+            .unwrap_err()
+            .contains("installer, deb or rpm")
+    );
+    assert!(
+        with(&["--layout", "deb", "--layout", "rpm"])
+            .unwrap_err()
+            .contains("given twice")
+    );
+    assert!(with(&["--layout"]).unwrap_err().contains("needs a value"));
+    assert!(super::serve::USAGE.contains("--layout installer|deb|rpm"));
 }
 
 /// The flags: the socket and its account are required, the window defaults to ten minutes and
