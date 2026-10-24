@@ -25,13 +25,13 @@
   through `install.sh` has no route to the mode units yet.
 - Tested by `crates/xtask/tests/install_sh.rs` against a local HTTP server, with a stub
   installer (`xtask-fake`) and stub unit, trust, sysusers.d and tmpfiles.d files, and fake systemd tools.
-- `container/kbf-frontend/Dockerfile` and `container/kbf-coordinator/Dockerfile`: the images of
+- `container/frontend/Dockerfile` and `container/kbf-coordinator/Dockerfile`: the images of
   the frontend (`kbf --mode=frontend`) and of the update coordinator (docs/design/updates.md): the
-  binary on the pinned Ubuntu base, run as an unprivileged user (uid 10001), its settings, keys
-  and state mounted by the orchestrator and none baked in. The release workflow builds both for
-  each Linux platform from the binaries it attests, tests them (`cargo xtask image-build`,
-  `image-test`) and ships them as `kbf-<image>-image-<commit>-<platform>.tar`, a `docker save`
-  archive, with an SBOM, in `SHA256SUMS` and attested (docs/artifacts.md); there is no registry, and
+  binary on a distroless `cc` base pinned by digest, run as the base's unprivileged user (uid
+  65532), its settings, keys and state mounted by the orchestrator and none baked in. The release
+  workflow builds both for each Linux platform from the binaries it checked (the frontend's is the
+  attested `kbf` of its tarball) and ships them as `kbf-<service>-image-<commit>-<platform>.oci.tar`,
+  an OCI image layout, in `SHA256SUMS` and attested (docs/artifacts.md); there is no registry, and
   docs/deploy/containers.md imports and runs them. Each Dockerfile's header says how to build one
   from a local binary.
   Operating notes: the coordinator takes its own `--oidc-config`, and its audience should be

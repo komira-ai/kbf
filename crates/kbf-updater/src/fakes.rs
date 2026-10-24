@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use crate::inventory::{Host, Role};
 use crate::ports::{
-    Apply, Clock, Drain, FrontendControl, Health, HealthCheck, InstallAnswer, Installed, Installer,
-    Pool, PoolMember, PortError, Report, RetireStatus, SafeToStop, Stop, Verdict,
+    Apply, Clock, Drain, DrainStatus, FrontendControl, Health, HealthCheck, InstallAnswer,
+    Installed, Installer, Pool, PoolMember, PortError, Report, RetireStatus, SafeToStop, Stop,
+    Verdict,
 };
 use crate::version::Version;
 
@@ -46,6 +47,12 @@ pub enum Event {
     Commit(String),
     /// The host was asked to restart the frontend unit of this name.
     Restart(String, String),
+    /// The host's frontend member was told to drain itself.
+    MemberDrain(String),
+    /// The host's frontend member was asked how its own drain stands.
+    MemberDrainStatus(String),
+    /// The host's frontend member was asked whether it is ready.
+    Ready(String),
 }
 
 impl Event {
@@ -67,6 +74,9 @@ impl Event {
             Event::RetireStatus(_) => "retire status".to_owned(),
             Event::Commit(_) => "commit".to_owned(),
             Event::Restart(_, unit) => format!("restart {unit}"),
+            Event::MemberDrain(_) => "member drain".to_owned(),
+            Event::MemberDrainStatus(_) => "member drain status".to_owned(),
+            Event::Ready(_) => "ready".to_owned(),
         }
     }
 }
@@ -112,6 +122,9 @@ impl Log {
                 | Event::Retire(a)
                 | Event::RetireStatus(a)
                 | Event::Commit(a)
+                | Event::MemberDrain(a)
+                | Event::MemberDrainStatus(a)
+                | Event::Ready(a)
                 | Event::Restart(a, _) => a == alias,
                 Event::PoolView => false,
             })
@@ -507,6 +520,8 @@ pub struct FakePool {
     streams: Arc<Script<(u64, u64)>>,
     drains: Arc<Script<Result<(), PortError>>>,
     undrains: Arc<Script<Result<(), PortError>>>,
+    /// Whether there is a proxy at all; true until a test says otherwise.
+    configured: Arc<Mutex<bool>>,
 }
 
 impl FakePool {
@@ -519,7 +534,14 @@ impl FakePool {
             streams: Arc::new(Script::new((0, 0))),
             drains: Arc::new(Script::new(Ok(()))),
             undrains: Arc::new(Script::new(Ok(()))),
+            configured: Arc::new(Mutex::new(true)),
         }
+    }
+
+    /// Say whether there is a proxy: a pool that is not configured is the updater started
+    /// without `--proxy-admin`, and no call to it is expected.
+    pub fn set_configured(&self, configured: bool) {
+        *lock(&self.configured) = configured;
     }
 
     /// The pool is these members, all up and ready with no stream open.
@@ -594,6 +616,10 @@ impl FakePool {
 }
 
 impl Pool for FakePool {
+    fn configured(&self) -> bool {
+        *lock(&self.configured)
+    }
+
     fn view(&self) -> Result<Vec<PoolMember>, PortError> {
         self.log.push(Event::PoolView);
         if let Some(scripted) = lock(&self.views).pop_front() {
@@ -631,14 +657,32 @@ pub fn retired() -> RetireStatus {
 /// The commit an unscripted member reports (40 digits, of which a version names 12).
 pub const MEMBER_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
+/// The drain status of a member that is draining with `open` executions still open.
+pub fn draining(open: u64) -> DrainStatus {
+    DrainStatus {
+        draining: true,
+        open_executions: open,
+        closing: false,
+    }
+}
+
+/// What a member that has exited answers: the connection is refused.
+pub fn gone() -> PortError {
+    PortError::refused("the operator API: connection refused")
+}
+
 /// A fake of a frontend member's own API; every call is in the [`Log`] by the host's alias.
-/// Unscripted, a member retires at once and reports [`MEMBER_COMMIT`].
+/// Unscripted, a member retires at once, reports [`MEMBER_COMMIT`], is ready, accepts a drain
+/// and has exited ([`gone`]) when its drain is read.
 #[derive(Clone)]
 pub struct FakeFrontend {
     log: Log,
     retires: Arc<Script<Result<RetireStatus, PortError>>>,
     statuses: Arc<Script<Result<RetireStatus, PortError>>>,
     commits: Arc<Script<Result<String, PortError>>>,
+    drains: Arc<Script<Result<(), PortError>>>,
+    drain_statuses: Arc<Script<Result<DrainStatus, PortError>>>,
+    readies: Arc<Script<Result<bool, PortError>>>,
 }
 
 impl FakeFrontend {
@@ -648,7 +692,40 @@ impl FakeFrontend {
             retires: Arc::new(Script::new(Ok(retired()))),
             statuses: Arc::new(Script::new(Ok(retired()))),
             commits: Arc::new(Script::new(Ok(MEMBER_COMMIT.to_owned()))),
+            drains: Arc::new(Script::new(Ok(()))),
+            drain_statuses: Arc::new(Script::new(Err(gone()))),
+            readies: Arc::new(Script::new(Ok(true))),
         }
+    }
+
+    /// The answers of a member's own drain (`POST`): `first` in order, then `then`.
+    pub fn script_member_drain(
+        &self,
+        alias: &str,
+        first: Vec<Result<(), PortError>>,
+        then: Result<(), PortError>,
+    ) {
+        self.drains.set(alias, first, then);
+    }
+
+    /// The answers of a member's drain status: `first` in order, then `then`.
+    pub fn script_drain_status(
+        &self,
+        alias: &str,
+        first: Vec<Result<DrainStatus, PortError>>,
+        then: Result<DrainStatus, PortError>,
+    ) {
+        self.drain_statuses.set(alias, first, then);
+    }
+
+    /// The answers of a member's `/readyz`: `first` in order, then `then`.
+    pub fn script_ready(
+        &self,
+        alias: &str,
+        first: Vec<Result<bool, PortError>>,
+        then: Result<bool, PortError>,
+    ) {
+        self.readies.set(alias, first, then);
     }
 
     pub fn script_retire(
@@ -693,6 +770,21 @@ impl FrontendControl for FakeFrontend {
     fn commit(&self, host: &Host) -> Result<String, PortError> {
         self.log.push(Event::Commit(host.alias.clone()));
         self.commits.next(&host.alias)
+    }
+
+    fn drain(&self, host: &Host) -> Result<(), PortError> {
+        self.log.push(Event::MemberDrain(host.alias.clone()));
+        self.drains.next(&host.alias)
+    }
+
+    fn drain_status(&self, host: &Host) -> Result<DrainStatus, PortError> {
+        self.log.push(Event::MemberDrainStatus(host.alias.clone()));
+        self.drain_statuses.next(&host.alias)
+    }
+
+    fn ready(&self, host: &Host) -> Result<bool, PortError> {
+        self.log.push(Event::Ready(host.alias.clone()));
+        self.readies.next(&host.alias)
     }
 }
 
@@ -975,6 +1067,9 @@ mod tests {
             Event::RetireStatus(a()),
             Event::Commit(a()),
             Event::Restart(a(), "u".into()),
+            Event::MemberDrain(a()),
+            Event::MemberDrainStatus(a()),
+            Event::Ready(a()),
         ]
         .iter()
         .map(Event::word)
@@ -996,7 +1091,54 @@ mod tests {
                 "retire status",
                 "commit",
                 "restart u",
+                "member drain",
+                "member drain status",
+                "ready",
             ]
         );
+    }
+
+    /// Asserts that the fake frontend accepts a drain, reports that the member has exited when
+    /// its drain is read, and reports the member ready, unless it is scripted otherwise per host,
+    /// and that each of the three calls is logged against the host.
+    #[test]
+    fn the_fake_frontend_drains_and_reports_readiness_as_scripted() {
+        let log = Log::default();
+        let front = FakeFrontend::new(&log);
+        let (a, b) = (host("a"), host("b"));
+        assert_eq!(front.drain(&a), Ok(()));
+        assert_eq!(front.drain_status(&a), Err(gone()));
+        assert!(gone().is_refused());
+        assert_eq!(front.ready(&a), Ok(true));
+        let no = PortError("no".into());
+        front.script_member_drain("b", vec![Err(no.clone())], Ok(()));
+        front.script_drain_status("b", vec![Ok(draining(2))], Ok(draining(0)));
+        front.script_ready("b", vec![Ok(false), Err(no.clone())], Ok(true));
+        assert_eq!(front.drain(&b), Err(no.clone()));
+        assert_eq!(front.drain(&b), Ok(()));
+        assert_eq!(front.drain_status(&b), Ok(draining(2)));
+        assert_eq!(front.drain_status(&b), Ok(draining(0)));
+        assert_eq!(front.ready(&b), Ok(false));
+        assert_eq!(front.ready(&b), Err(no));
+        assert_eq!(front.ready(&b), Ok(true));
+        let kinds = [
+            Event::MemberDrain("a".into()),
+            Event::MemberDrainStatus("a".into()),
+            Event::Ready("a".into()),
+        ];
+        assert_eq!(log.touching("a"), kinds);
+        assert_eq!(log.touching("b").len(), 7);
+    }
+
+    /// Asserts that a fake pool is configured, as a proxy is, until a test says it is not, and
+    /// that it can be set both ways.
+    #[test]
+    fn the_fake_pool_is_configured_unless_a_test_says_otherwise() {
+        let pool = FakePool::new(&Log::default());
+        assert!(pool.configured());
+        pool.set_configured(false);
+        assert!(!pool.configured());
+        pool.set_configured(true);
+        assert!(pool.configured());
     }
 }

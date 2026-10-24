@@ -625,3 +625,180 @@ fn budget_diff_defaults_to_this_repository() {
         "ok: tools/interpreter_budget.tsv adds no row to HEAD's\n"
     );
 }
+
+/// The commit `HEAD` names in `root`.
+fn head_of(root: &Path) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git");
+    text(&out.stdout).trim().to_owned()
+}
+
+#[test]
+fn source_date_epoch_appends_the_committer_time_of_the_commit_and_refuses_anything_else() {
+    // Catches: an image stamped with the build's clock (the line holds another time than the
+    // commit's), a line written over the file's earlier ones, a commit that is not in the
+    // repository accepted, and a name that is not a commit passed to git as an option.
+    let root = repo("source-date-epoch", "[files]\n[workflow]\n[src-sh-c]\n");
+    git(&root, &["commit", "-q", "--allow-empty", "-m", "second"]);
+    let env = root.join("github-env");
+    std::fs::write(&env, "EARLIER=1\n").expect("env");
+    let first = head_of(&root);
+    let commit_time = |rev: &str| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&*root)
+            .args(["show", "-s", "--format=%ct", rev])
+            .output()
+            .expect("git");
+        text(&out.stdout).trim().to_owned()
+    };
+    let (code, out, err) = outcome(
+        xtask(
+            &root,
+            &[
+                "source-date-epoch",
+                "--commit",
+                &first,
+                "--output",
+                env.to_str().expect("utf8"),
+            ],
+        )
+        .output()
+        .expect("run"),
+    );
+    assert_eq!(code, Some(0), "{err}");
+    let want = format!("SOURCE_DATE_EPOCH={}", commit_time(&first));
+    assert_eq!(out, format!("{want}\n"));
+    assert_eq!(
+        std::fs::read_to_string(&env).expect("env"),
+        format!("EARLIER=1\n{want}\n")
+    );
+    for bad in [
+        "--output=/dev/null",
+        "abc",
+        "0123456789abcdef0123456789abcdef01234567",
+    ] {
+        let (code, _, err) = outcome(
+            xtask(
+                &root,
+                &[
+                    "source-date-epoch",
+                    "--commit",
+                    bad,
+                    "--output",
+                    env.to_str().expect("utf8"),
+                ],
+            )
+            .output()
+            .expect("run"),
+        );
+        assert_ne!(code, Some(0), "{bad}");
+        assert!(!err.is_empty(), "{bad}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&env).expect("env"),
+        format!("EARLIER=1\n{want}\n"),
+        "a refused commit writes nothing"
+    );
+}
+
+#[test]
+fn pkg_image_asset_refuses_a_file_that_is_not_an_image_both_when_adding_and_when_verifying() {
+    // Catches: the verb not wired to the check (a non-image accepted and listed), `--out`
+    // writing before the refusal, and `--verify-only` accepting a file under the wrong name.
+    let root = scratch("image-asset-cli");
+    let image = root.join("image.oci.tar");
+    std::fs::write(&image, b"not a tar").expect("image");
+    let tarball = root.join("kbf.tar.gz");
+    std::fs::write(&tarball, b"x").expect("tarball");
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let path = |p: &Path| p.to_str().expect("utf8").to_owned();
+    let out = root.join("dist");
+    for extra in [
+        vec!["--out".to_owned(), path(&out)],
+        vec!["--verify-only".to_owned()],
+    ] {
+        let mut args = vec![
+            "pkg-image-asset".to_owned(),
+            "--image".to_owned(),
+            path(&image),
+            "--service".to_owned(),
+            "frontend".to_owned(),
+            "--platform".to_owned(),
+            "linux-x86_64".to_owned(),
+            "--commit".to_owned(),
+            commit.to_owned(),
+            "--kbf-tarball".to_owned(),
+            path(&tarball),
+        ];
+        args.extend(extra);
+        let words: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (code, _, err) = outcome(xtask(&root, &words).output().expect("run"));
+        assert_eq!(code, Some(1), "{err}");
+        assert!(err.contains("holds no kbf"), "{err}");
+    }
+    assert!(!out.join("SHA256SUMS.linux-x86_64").exists());
+}
+
+#[test]
+fn pkg_image_asset_wants_the_reference_of_its_service_and_no_other() {
+    // Catches: a coordinator image checked against nothing when adding (the build's file
+    // forgotten), a frontend image checked against a bare binary and not the attested
+    // tarball, and `--verify-only` of a coordinator image given a file the verify job lacks.
+    let root = scratch("image-asset-flags");
+    let image = root.join("image.oci.tar");
+    std::fs::write(&image, b"not a tar").expect("image");
+    let file = root.join("file");
+    std::fs::write(&file, b"x").expect("file");
+    let path = |p: &Path| p.to_str().expect("utf8").to_owned();
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let out = path(&root.join("dist"));
+    let (image, file) = (path(&image), path(&file));
+    let base = |service: &'static str| {
+        vec![
+            "pkg-image-asset",
+            "--image",
+            image.as_str(),
+            "--service",
+            service,
+            "--platform",
+            "linux-x86_64",
+            "--commit",
+            commit,
+        ]
+    };
+    let run = |extra: &[&str], service: &'static str| {
+        let mut args = base(service);
+        args.extend_from_slice(extra);
+        outcome(xtask(&root, &args).output().expect("run"))
+    };
+    let (code, _, err) = run(&["--binary", &file, "--out", &out], "frontend");
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("the frontend image is checked against --kbf-tarball"),
+        "{err}"
+    );
+    let (code, _, err) = run(&["--out", &out], "coordinator");
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("the coordinator image is checked against --binary"),
+        "{err}"
+    );
+    let (code, _, err) = run(&["--kbf-tarball", &file, "--out", &out], "coordinator");
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("the coordinator image is checked against --binary"),
+        "{err}"
+    );
+    let (code, _, err) = run(&["--binary", &file, "--verify-only"], "coordinator");
+    assert_eq!(code, Some(2), "clap refuses the pair: {err}");
+    // A coordinator image with its binary reaches the check, which refuses a non-image.
+    let (code, _, err) = run(&["--binary", &file, "--out", &out], "coordinator");
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("not an OCI image tar"), "{err}");
+    assert!(!root.join("dist").join("SHA256SUMS.linux-x86_64").exists());
+}

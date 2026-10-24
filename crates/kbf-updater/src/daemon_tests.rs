@@ -298,8 +298,42 @@ fn the_apply_poll_and_deadline_are_optional_flags_of_at_least_a_second() {
     }
 }
 
-/// Catches a flag that is parsed and never reaches the roll: the drain deadline and the apply
-/// poll and deadline are the timing's, and the rest of the timing is the default.
+/// Asserts that the two bounds of a frontend member's drain without a proxy are optional flags
+/// that default to 30 s of readiness of the other members and 1200 s for the member to exit,
+/// take a number of seconds, may not be zero (a window of nothing waits for nothing; a deadline
+/// of nothing fails every drain), and that each sets only itself.
+#[test]
+fn the_peer_ready_and_frontend_drain_deadline_are_optional_flags_of_at_least_a_second() {
+    let cfg = parse(&FLAGS).expect("flags");
+    assert_eq!(cfg.peer_ready.as_secs(), 30);
+    assert_eq!(cfg.frontend_drain_deadline.as_secs(), 1200);
+    let with = [&FLAGS[..], &["--peer-ready-secs", "7"]].concat();
+    let cfg = parse(&with).expect("peers");
+    assert_eq!(cfg.peer_ready.as_secs(), 7);
+    assert_eq!(cfg.frontend_drain_deadline.as_secs(), 1200);
+    let with = [&FLAGS[..], &["--frontend-drain-deadline-secs=90"]].concat();
+    let cfg = parse(&with).expect("deadline");
+    assert_eq!(cfg.peer_ready.as_secs(), 30);
+    assert_eq!(cfg.frontend_drain_deadline.as_secs(), 90);
+    for flag in ["--peer-ready-secs", "--frontend-drain-deadline-secs"] {
+        for bad in ["soon", "-1", "1.5", ""] {
+            let with = [&FLAGS[..], &[flag, bad]].concat();
+            assert_eq!(
+                parse(&with).expect_err(bad),
+                format!("{flag} must be a number of seconds")
+            );
+        }
+        let zero = [&FLAGS[..], &[flag, "0"]].concat();
+        assert_eq!(
+            parse(&zero).expect_err("zero"),
+            format!("{flag} must be at least 1")
+        );
+    }
+}
+
+/// Asserts that each of the flags below reaches the roll's timing: the drain deadline, the apply
+/// poll and deadline, the wait for the other members and the deadline of a member's drain, and
+/// that the rest of the timing is the default.
 #[test]
 fn the_flags_set_the_timing_of_the_roll() {
     let with = [
@@ -308,6 +342,8 @@ fn the_flags_set_the_timing_of_the_roll() {
             "--drain-deadline-secs=7",
             "--apply-poll-secs=3",
             "--apply-deadline-secs=11",
+            "--peer-ready-secs=13",
+            "--frontend-drain-deadline-secs=17",
         ],
     ]
     .concat();
@@ -320,6 +356,8 @@ fn the_flags_set_the_timing_of_the_roll() {
         ),
         (7, 3, 11)
     );
+    assert_eq!(t.peer_ready.as_secs(), 13);
+    assert_eq!(t.frontend_drain.as_secs(), 17);
     assert_eq!(t.poll, Timing::default().poll);
 }
 
@@ -454,6 +492,8 @@ fn config(name: &str, inventory: &str, api: &FakeApi) -> Config {
         drain_deadline: Duration::from_secs(600),
         apply_poll: Duration::from_secs(5),
         apply_deadline: Duration::from_secs(600),
+        peer_ready: Duration::from_secs(30),
+        frontend_drain_deadline: Duration::from_secs(1200),
     }
 }
 
@@ -502,6 +542,8 @@ fn quick() -> Timing {
         drain_deadline: Duration::from_millis(300),
         apply_poll: Duration::from_millis(10),
         apply_deadline: Duration::from_millis(300),
+        peer_ready: Duration::from_millis(30),
+        frontend_drain: Duration::from_millis(300),
     }
 }
 
@@ -678,19 +720,18 @@ fn an_unknown_role_is_refused_by_the_inventory() {
     }
 }
 
-/// Asserts that an inventory that lists frontend pool members is refused at start-up without
-/// `--proxy-admin`, with the flag named and nothing bound, that it is accepted with the flag,
-/// and that an inventory without members needs no flag.
+/// Asserts that an inventory that lists frontend pool members starts without `--proxy-admin`,
+/// whose members are then rolled without a proxy, and with it, and that an inventory without
+/// members starts as before.
 #[test]
-fn pool_members_need_the_proxy_admin_flag() {
+fn pool_members_start_with_or_without_the_proxy_admin_flag() {
     let api = fake_api(vec![Some(http(200, "{}"))]);
     let members = "fe-a fe.farm.example frontend KEY instance=a base=18000\n\
                    fe-b fe.farm.example frontend KEY instance=b base=18010\n";
     let mut cfg = config("members", members, &api);
-    let e = start(&cfg).err().expect("no admin");
-    assert!(e.contains("--proxy-admin"), "{e}");
-    assert!(e.contains("frontend pool members"), "{e}");
-    assert!(!sock(&cfg).exists());
+    let daemon = start(&cfg).expect("start without the flag");
+    daemon.stopper().stop();
+    daemon.wait();
     cfg.proxy_admin = Some(api.addr);
     let daemon = start(&cfg).expect("start with the flag");
     daemon.stopper().stop();
@@ -702,18 +743,21 @@ fn pool_members_need_the_proxy_admin_flag() {
 }
 
 /// Asserts that the binary's pool is the proxy's admin API when `--proxy-admin` names it, asked
-/// without the operator token, and a pool that says the flag is missing when it does not, and
-/// that its frontend port is the member's own operator API, asked with the token.
+/// without the operator token, and a pool that says it is not configured and that the flag is
+/// missing when it does not, and that its frontend port is the member's own operator API, asked
+/// with the token.
 #[test]
 fn the_binarys_pool_and_frontend_ports_reach_the_proxy_and_the_member() {
     let admin = fake_api(vec![Some(http(200, "[]"))]);
     let operator = fake_api(vec![Some(http(200, "{\"commit\":\"0123456789ab\"}"))]);
     let mut cfg = config("pool", "st1 st1.farm.example storage KEY\n", &operator);
     let ports = build_ports(&cfg).expect("ports");
+    assert!(!ports.pool.configured());
     let e = ports.pool.view().expect_err("no pool");
     assert!(e.to_string().contains("--proxy-admin"), "{e}");
     cfg.proxy_admin = Some(admin.addr);
     let ports = build_ports(&cfg).expect("ports");
+    assert!(ports.pool.configured());
     assert_eq!(ports.pool.view(), Ok(Vec::new()));
     let asked = admin.requests().remove(0);
     assert!(asked.starts_with("GET /v1/proxy/upstreams HTTP/1.1\r\n"));

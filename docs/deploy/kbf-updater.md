@@ -53,9 +53,10 @@ All are flags; none is read from the environment.
 | `--state-dir`, `--inventory`, `--proxy-uid`, `--token-file`, `--ssh-key-file`, `--ssh-user`, `--channel` | required |
 | `--operator-api http://<loopback ip>:<port>` | required: the frontend's operator API, for safe-to-stop and the health of storage and daemon hosts. Not a loopback address is refused |
 | `--operator-proxy-auth-file` | the proxy's per-boot secret, for a frontend that runs behind kbf-proxy |
-| `--proxy-admin http://<loopback ip>:<port>` | the admin API of the kbf-proxy in pool mode (`admin_listen`). Required when the inventory lists pool members; refused unless it is a loopback address. It asks for no credential, and none is sent |
+| `--proxy-admin http://<loopback ip>:<port>` | optional: the admin API of the kbf-proxy in pool mode (`admin_listen`). Given, a pool member is rolled through the proxy ([below](#what-a-roll-does-with-a-frontend-pool-member)); not given, it is rolled without one ([below](#a-frontend-pool-member-without-a-proxy)). Refused unless it is a loopback address. It asks for no credential, and none is sent |
 | `--socket` | the roll API's socket, for tests and development; in production systemd passes it |
 | `--ssh-connect-timeout-secs`, `--ssh-command-timeout-secs`, `--drain-deadline-secs`, `--apply-poll-secs`, `--apply-deadline-secs` | optional bounds in seconds; they default to 10, 900, 600, 5 and 600 |
+| `--peer-ready-secs`, `--frontend-drain-deadline-secs` | optional bounds in seconds, at least 1, for a member rolled without a proxy: how long every other member must answer `/readyz` 200 in a row before a member is drained (default 30), and how long a member is given to exit once it is told to drain (default 1200, which must be longer than the longest execution a member may have open). Nothing reads them when `--proxy-admin` is given |
 
 The updater reaches each member's operator API on loopback at `127.0.0.1:<base + 2>`, with the
 same token (`--token-file`) and proxy secret as `--operator-api`.
@@ -119,6 +120,76 @@ A `roll.json` written by an earlier build, which has none of the phases `drainin
 The other way does not hold: an earlier build does not know these phases and refuses to start on
 a `roll.json` that holds one, so finish or abort a roll that is in a member's turn before
 downgrading the updater.
+
+## A frontend pool member without a proxy
+
+A farm whose frontends sit behind a load balancer of its own (Envoy, a cloud balancer, anything
+that stops sending to a backend whose `/readyz` answers 503) needs no kbf-proxy to be rolled.
+Start the updater **without `--proxy-admin`** and the inventory lines with `instance=` and `base=`
+are rolled by the member's own drain. The load balancer is never asked: the member says it is not
+ready, and the balancer, whatever it is, stops sending to it. The member is rolled alone, and the
+turn is:
+
+1. **Check** (`pending`). Every other member of the inventory is asked `GET /readyz` on its own
+   operator port (`base` plus 2) every 5 seconds. Each must answer 200 every time for
+   `--peer-ready-secs` (30) in a row; an answer of 503, and a member that cannot be asked, start
+   the window again. If the window has not been had `--peer-ready-secs` plus 300 seconds after the
+   first ask, the roll fails with `unsafe_to_stop` and nothing has been changed. A member that is
+   the only one in the inventory has no other to serve and is refused the same way. The member
+   itself is not asked.
+2. **Drain** (`draining`). `POST /v1/frontend/drain` on the member's operator API. The frontend
+   then runs its own drain, which does not depend on the balancer: `/readyz` 503, no new work and
+   GOAWAY on its listeners, a wait for the executions open on it, and its exit. The roll waits
+   until the member's operator API refuses the connection (it has exited) or its
+   `GET /v1/frontend/drain` reports `"closing": true` (the frontend in this tree does not report
+   it, and is waited for until it exits), for at most `--frontend-drain-deadline-secs`
+   (`drain_failed`). A member that answers the status but says it is not draining fails the roll
+   at once (`drain_failed`). A member that is not running refuses the connection of the drain
+   itself, has nothing to drain, and the turn goes on; a drain that gets no answer (a timeout)
+   fails the roll with `frontend member a (fe-a) may be draining`.
+3. **Install** (`installing`). As with a proxy: the package is installed on the host unless it has
+   the target, once per host, at the first member.
+4. **Restart** (`restarting`). `restart frontend=<instance>` through `kbf-host-install`, which
+   starts the new version (`restart_failed`).
+5. **Ready** (`waiting_healthy`). The roll waits until the member's own `GET /readyz` answers 200
+   and its `GET /healthz` reports a `commit` that the target's version names, for at most 300
+   seconds (`health_timeout`; `swap_abandoned` if the version names no commit).
+
+Nothing is put back at the end: a drained frontend has exited, and the restart made a new process,
+which is ready or is not. The next member is rolled only when this one is ready, which is also
+what the next check asks of it.
+
+**The bound.** `--frontend-drain-deadline-secs` (default 1200) must be longer than the longest
+execution a member may have open, or the roll gives up on a drain that is still going as it
+should. The frontend in this tree puts no bound of its own on a drain that its endpoint began
+(`--shutdown-timeout-secs` bounds only a drain that a signal began), so an execution that runs
+past the bound fails every roll at that member until it ends. A drain that outlasts the bound
+fails the roll with `drain_failed` and `frontend member a (fe-a) is left draining`: the member
+goes on draining and exits by itself, and a new roll finds it stopped (its connection is refused)
+and goes on from the install.
+
+**A member that is stopped, or a wrong `base`.** A member whose operator API refuses the
+connection of the first drain is taken for one that an earlier roll left stopped, and is installed
+on and restarted. A `base` in the inventory that is not the member's has the same look: the unit is
+restarted though it was never drained, which ends any execution open on it (a Buck2 build does not
+reattach, so each is a failed action), and the wait for readiness fails, since it asks at the same
+wrong address. Check the `base` of a new line before the first roll.
+
+Every failure after the drain stops the roll and names the member as not serving (`frontend member
+a (fe-a) is not serving`): the install, the restart and the readiness wait leave a member that is
+down or not ready, and the load balancer sends nothing to it. The other members serve. An operator
+fixes it and starts another roll, which begins at the check again.
+
+A restart of the updater finds the phase in `roll.json`. In `draining` the member's drain is read
+first: a member that says it is not draining was never told to (the record is written before the
+drain is sent), and is checked against the other members as in the check. The member is then told
+to drain again (a drain does nothing to a member that is draining) and its exit is waited for; in
+`installing` the host is asked what it has, as with a proxy; in `restarting` and `waiting_healthy`
+the member is **not** told to drain, which would take down the process the restart started. The
+phases are the ones a turn at a proxy has, without `retiring` and `undraining`, and no field was
+added to the record. A `roll.json` in `retiring` or `undraining`, begun with a proxy, fails the
+member with `swap_abandoned`: abort that roll rather than change `--proxy-admin` in the middle of
+it.
 
 ## The agent mode
 
@@ -256,3 +327,93 @@ order before it fetches anything, and the roll updates the host. Without `--fron
 the token an agent does the same for any host. The mechanism is behind two small ports (`Drain`,
 `HealthCheck`), so that a storage-health route a certificate may call replaces the refusal and not
 the agent.
+
+## Turn on the deploy step
+
+The last job of `release.yml`, `deploy`, tells the update coordinator "desired = this release" once
+`publish` has made the release, and waits until the farm converges. It is the end-to-end check of
+a release on a real farm. It does nothing until an operator has done the three things below, once;
+until then the job prints `::notice::the deploy step is off` and passes, so a fork or a repository
+that runs no farm is unaffected. Nothing in this repository does any of them.
+
+1. **Deploy the coordinator** (`kbf-coordinator`, [the design](../design/updates.md)) with a
+   certificate the farm CA issued with the role `coordinator`, and an allow-list for CI's OIDC
+   token in the file `--oidc-config` names. The job's token is the run's, so the allow-list must
+   say exactly this, and nothing wider:
+
+   ```toml
+   [remote_operator]
+   issuer = "https://token.actions.githubusercontent.com"
+   audience = "https://<the coordinator's control address, as written in the variable below>"
+   repository_id = "<the numeric id of komira-ai/kbf>"
+   repository = "komira-ai/kbf"
+   job_workflow_ref = ["komira-ai/kbf/.github/workflows/release.yml@refs/heads/main"]
+   refs = ["refs/heads/main"]
+   environments = ["release"]
+   event_names = ["workflow_run"]
+   ```
+
+   `event_names` must name `workflow_run`: the release workflow is started by the completion of
+   the pipeline, and its tokens say so (the default list is `push` and `workflow_dispatch`).
+   The `sha` of the token is the head of `main`, not the commit released. A token is good for one
+   call. The control listener (`--control-listen`) must be reachable from GitHub-hosted runners;
+   the heartbeat listener need not be.
+2. **Enroll the hosts**, so that their updaters heartbeat to the coordinator
+   ([The agent mode](#the-agent-mode)). A host that does not heartbeat is `down`, and the
+   coordinator does not wait for it: it says `converged` when every host that does heartbeat runs
+   the release, none is updating or failed, and at least the minimums (below) are up. The step
+   does not take that alone: it remembers how many hosts of each role were live when it started
+   (see below) and fails if fewer run the release at the end, so a host that the release made
+   stop heartbeating fails the deploy. A host that was already down when the step started is not
+   expected; raise the minimums to the number of hosts the farm must keep, for the roles whose
+   count matters beyond that.
+3. **Set the repository variables** (Settings, Secrets and variables, Actions, Variables):
+
+   | variable | value |
+   |---|---|
+   | `KBF_COORDINATOR_URL` | `https://<name>:<port>` of the control listener, no path. Unset or empty: the step is off |
+   | `KBF_COORDINATOR_CA` | the farm CA's certificate (PEM, public). The coordinator's certificate is the farm CA's, which no system store holds; empty trusts the system store instead |
+   | `KBF_MIN_UP_STORAGE`, `KBF_MIN_UP_FRONTEND` | optional: the storage hosts and frontends that must stay up while others update (default 1 each). The operator picks the storage number so that every blob stays readable |
+
+### What the step does
+
+`cargo xtask deploy-farm` (one `run:` line):
+
+1. reads `GET /v1/convergence` once, before anything is changed, and keeps the hosts live then
+   (at the version, updating or failed, so not `down`) per role as the baseline, and prints it
+   (`baseline: hosts live before the deploy: storage 3, frontend 2`). A 503 on this read is tried
+   again like the POST. A coordinator that has just restarted (the table says so) may not have
+   heard from every host yet; a host it hears from later counts as one that joined;
+2. posts `{"version": <the release's version>, "min_up": {...}}` to `/v1/desired` (the per-role
+   limits are the coordinator's defaults), with an OIDC token for the audience that is the URL as
+   written in the variable (the audience keeps a trailing `/` the variable has, which the URL
+   the calls go to does not, so write the variable and the allow-list's `audience` alike). A 503
+   on the POST is tried again, up to four times;
+3. reads `GET /v1/convergence` every 30 seconds, with a fresh token each time, and prints a
+   table of the counts per role (`at_desired`, `updating`, `failed`, `down`);
+4. ends when the coordinator says `converged` and every role has at least as many hosts at the
+   version as it had live at the baseline (exit 0; a host that joined during the deploy only
+   adds); when it says `converged` and a role has fewer, which fails with the role, the count
+   expected, the count reached and how many went down; `blocked` (a live host failed its update to
+   this version and is still behind it); when the counts have not changed for 20 minutes
+   (`--stall-min`; a host whose update takes longer than that leaves the counts as they are, so
+   raise the flag past the longest update); when the coordinator's desired version is no longer
+   this release's (another writer replaced it); when 60 minutes are up (`--deadline-min`); or when the coordinator refuses
+   the token (401 or 403, at once: the allow-list does not match this job). Any of those but
+   convergence fails the job; the release stays published whatever it says. Another failed read
+   is reported and tried again, and counts as no change.
+
+`GET /v1/convergence` answers `{"desired", "quiet", "state", "roles": [{"role", "at_desired",
+"updating", "failed", "down"}]}`, where `state` is `converged`, `blocked` or `in_progress`. It
+takes CI's OIDC token and refuses the operator token (the operator's read is `GET /v1/status`).
+It is computed from the heartbeats and the desired state, and stores nothing. `converged` needs
+the coordinator to be past its 30 second quiet start, at least one live host, every live host at
+the version and none updating or failed, and `min_up` hosts of the storage and frontend roles up,
+so a coordinator that has just restarted does not report a farm it has not heard from as
+converged.
+
+The `deploy` job runs in the `release` environment, like `publish`: if the environment has
+required reviewers, a release is approved a second time before the job starts.
+
+One release at a time holds across the deploy: the workflow's group does not cancel, so a second
+release waits for the first release's deploy (at most 90 minutes) to end.

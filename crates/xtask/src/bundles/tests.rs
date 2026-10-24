@@ -329,38 +329,3 @@ fn the_pairing_is_one_bundle_per_listed_tarball_and_nothing_else() {
         )]
     );
 }
-
-#[test]
-fn an_image_archive_has_a_bundle_and_a_tarball_or_sbom_name_is_not_one() {
-    let image = "kbf-frontend-image-0123456789abcdef0123456789abcdef01234567-linux-x86_64.tar";
-    assert!(is_image(image));
-    assert!(needs_bundle(image));
-    assert!(!is_image(TARBALL), "a .tar.gz is a tarball, not an image");
-    assert!(!is_image(SBOM));
-    assert!(!is_image(&name_of(image)), "a bundle is not an image");
-    assert!(needs_bundle(TARBALL));
-    assert!(!needs_bundle(SBOM));
-}
-
-#[test]
-fn the_pairing_holds_an_image_to_its_own_bundle() {
-    let dir = scratch("pairing-image");
-    let image = "kbf-frontend-image-0123456789abcdef0123456789abcdef01234567-linux-x86_64.tar";
-    let sha = Sha256::of(image.as_bytes());
-    let listed = [Line {
-        sha256: sha,
-        name: image.to_owned(),
-    }];
-    let missing = pairing(dir.path(), &listed).expect("pairing");
-    assert_eq!(
-        missing,
-        [format!(
-            "{image}: no provenance bundle {image}.sigstore.json"
-        )]
-    );
-    std::fs::write(dir.path().join(name_of(image)), good(&sha)).expect("bundle");
-    assert_eq!(
-        pairing(dir.path(), &listed).expect("pairing"),
-        Vec::<String>::new()
-    );
-}

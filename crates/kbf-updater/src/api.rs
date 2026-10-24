@@ -152,7 +152,9 @@ pub enum ErrorCode {
     /// drained.
     NodeIdentity,
     /// The frontend could not drain the host's node, or did not answer; the node may be left
-    /// drained.
+    /// drained. For a frontend member rolled without a proxy: it did not exit within the bound
+    /// and is left draining (a drain it would not accept is not said to be left draining; one it
+    /// did not answer is said to be possibly draining).
     DrainFailed,
     /// The host runs the target, but the frontend could not return its node to placement; the
     /// node is left drained.
@@ -247,7 +249,8 @@ impl RollState {
 /// The last four phases are a frontend pool member's (see [`crate::inventory::Member`]): the
 /// turn goes `pending`, `draining`, `retiring`, `installing`, `restarting`, `waiting_healthy`,
 /// `undraining`, `done`. They were added to the set after the others, and a record written
-/// before them holds none of them and reads as it did.
+/// before them holds none of them and reads as it did. Without a proxy the turn goes `pending`,
+/// `draining`, `installing`, `restarting`, `waiting_healthy`, `done`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {

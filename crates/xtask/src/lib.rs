@@ -8,6 +8,10 @@
 //!   advisories`, kept in one GitHub issue (opened, updated, or commented on and closed when
 //!   none remain) instead of failing a pull request. Exit 0 whatever it found; 1 when
 //!   cargo-deny or `gh` failed. `advisories.yml` runs it daily and on every push to `main`.
+//! - `deploy-farm --url <url> --version <v> [--deadline-min 60] [--stall-min 20]` ([`deploy_farm`]): after a
+//!   release is published, set it as the update coordinator's desired version (CI's OIDC token)
+//!   and wait until the farm converges; exit 1 when it is blocked, stalled or out of time. An
+//!   empty `--url` prints a notice and exits 0.
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
 //!   row the working tree's budget file has and `<rev>`'s does not is refused, unless
 //!   git sees the row's path renamed from a path `<rev>` has a row for. CI runs
@@ -41,12 +45,10 @@
 //!   `kbf-<commit>-<platform>.deb`, refused unless its `/usr/bin/kbf` is the `kbf` of the
 //!   attested tarball, it depends on no `kbf-installer` and replaces `kbf-installer`, and it
 //!   holds the units of the modes and nothing else.
-//! - `image-build`, `image-asset` and `image-test` ([`image`]): the container image of the frontend and of
-//!   the update coordinator as the release assets `kbf-frontend-image-<commit>-<platform>.tar`
-//!   and `kbf-coordinator-image-<commit>-<platform>.tar` (a `docker save` archive, imported
-//!   without a registry), refused unless the image holds the attested binary, runs as a user
-//!   that is not root and bakes in no setting; and its load and run in Docker, which must
-//!   name the commit.
+//! - `pkg-image-asset` ([`pkg_image_asset`]): the frontend or coordinator OCI image tarball as the
+//!   release asset `kbf-<service>-image-<commit>-<platform>.oci.tar`, refused unless its program
+//!   is the attested `kbf` (frontend) or the built `kbf-coordinator`, it runs as a user that is
+//!   not root with the service's entrypoint, and it is built for the platform.
 //! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf-installer` package
 //!   carries, in the one form a deb and an rpm put in the same order, and the most a package
 //!   that carries a kbf release may weigh. `pkg-config` and `pkg-asset` take them up with
@@ -101,13 +103,14 @@ pub mod build_commit;
 pub mod bundles;
 pub mod crun_tests;
 pub mod darwin;
+pub mod deploy_farm;
 pub mod entitlements;
 pub mod fetch;
-pub mod image;
 pub mod installer_tarball;
 pub mod package;
 pub mod pkg;
 pub mod pkg_asset;
+pub mod pkg_image_asset;
 pub mod pkg_install;
 pub mod pkg_kbf_asset;
 pub mod pkg_linux;
@@ -174,11 +177,25 @@ enum Verb {
     BuildCommit(BuildCommit),
     /// Keep the advisories `cargo deny` reports in one GitHub issue.
     Advisories(advisories::Args),
+    /// Set a published release as the farm's desired version on the update coordinator and
+    /// wait for the farm to converge.
+    DeployFarm(deploy_farm::Args),
     /// Refuse a row the budget file gains against `--base`.
     BudgetDiff {
         /// The revision to compare with (on a pull request, the base branch).
         #[arg(long)]
         base: String,
+    },
+    /// Append `SOURCE_DATE_EPOCH=<seconds>`, the committer time of `--commit`, to `--output`
+    /// (on Actions, `GITHUB_ENV`), so a later step builds an image that carries the commit's
+    /// time and no clock of the build's.
+    SourceDateEpoch {
+        /// The commit (`$GITHUB_SHA`), 12 to 40 lowercase hex digits.
+        #[arg(long)]
+        commit: String,
+        /// The file to append the line to.
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Download a pinned file, check its SHA-256 and install it (mode 0755).
     Fetch {
@@ -380,68 +397,40 @@ enum Verb {
         #[arg(long)]
         verify_only: bool,
     },
-    /// Build the container image of the frontend or the coordinator from a binary and save it
-    /// as a `docker save` archive.
-    ImageBuild {
-        /// The image.
+    /// The frontend or coordinator OCI image tarball as a release asset, refused unless its
+    /// program is the attested `kbf` (or the built `kbf-coordinator`), its entrypoint is the
+    /// service's, it runs as a user that is not root and it is built for the platform.
+    PkgImageAsset {
+        /// The image tarball `docker buildx build --output type=oci` wrote (with
+        /// `--verify-only`: the asset itself).
+        #[arg(long)]
+        image: PathBuf,
+        /// The service the image runs.
         #[arg(long, value_enum)]
-        image: image::Image,
-        /// The directory holding the image's `Dockerfile` (`packaging/container/<image>`).
-        #[arg(long)]
-        dockerfile_dir: PathBuf,
-        /// The binary the image carries.
-        #[arg(long)]
-        binary: PathBuf,
-        /// The commit it is built from (`$GITHUB_SHA`).
-        #[arg(long)]
-        commit: String,
-        /// The directory the build context and the archive go in.
-        #[arg(long)]
-        out: PathBuf,
-        /// The docker program.
-        #[arg(long, default_value = "docker")]
-        docker: PathBuf,
-    },
-    /// A container image of the frontend or the coordinator as a release asset, refused unless
-    /// it holds the built binary, runs as a user that is not root and bakes in no setting.
-    ImageAsset {
-        /// The image.
-        #[arg(long, value_enum)]
-        image: image::Image,
-        /// The `docker save` archive of the image, tagged `<repository>:<commit>`.
-        #[arg(long)]
-        archive: PathBuf,
-        /// The binary the image was built from, which `build-commit check` has checked.
-        #[arg(long)]
-        binary: PathBuf,
-        /// The CycloneDX SBOM of that binary.
-        #[arg(long)]
-        sbom: PathBuf,
+        service: pkg_image_asset::Image,
         /// The platform it was built for (`linux-x86_64`, `linux-arm64`).
         #[arg(long, value_enum)]
         platform: package::Platform,
         /// The commit it was built from (`$GITHUB_SHA`).
         #[arg(long)]
         commit: String,
-        /// The directory the assets and their lines of `SHA256SUMS.<platform>` go in.
+        /// The frontend's `kbf-<commit>-<platform>.tar.gz` whose `kbf` the image must hold.
+        #[arg(long, conflicts_with = "binary")]
+        kbf_tarball: Option<PathBuf>,
+        /// The coordinator's `kbf-coordinator` the image must hold (it has no tarball; not
+        /// with `--verify-only`, where the build's file is not at hand).
+        #[arg(long, conflicts_with = "verify_only")]
+        binary: Option<PathBuf>,
+        /// The directory the asset and its line of `SHA256SUMS.<platform>` go in.
+        #[arg(
+            long,
+            required_unless_present = "verify_only",
+            conflicts_with = "verify_only"
+        )]
+        out: Option<PathBuf>,
+        /// Only check `--image`, which must be named as the asset; write nothing.
         #[arg(long)]
-        out: PathBuf,
-    },
-    /// Load an image archive into Docker and check that its binary names the commit, that it
-    /// runs as a user that is not root, and that it does not start with nothing mounted.
-    ImageTest {
-        /// The image.
-        #[arg(long, value_enum)]
-        image: image::Image,
-        /// The `docker save` archive of the image.
-        #[arg(long)]
-        archive: PathBuf,
-        /// The commit it was built from (`$GITHUB_SHA`).
-        #[arg(long)]
-        commit: String,
-        /// The docker program.
-        #[arg(long, default_value = "docker")]
-        docker: PathBuf,
+        verify_only: bool,
     },
     /// Install a package into a fresh container and check it never starts or enables.
     PkgInstallTest {
@@ -870,6 +859,49 @@ fn git_stdout(root: &Path, args: &[&str]) -> Result<Vec<u8>, Error> {
     Ok(out.stdout)
 }
 
+/// The `source-date-epoch` verb: appends `SOURCE_DATE_EPOCH=<committer time>` of `commit`,
+/// as `root` holds it, to `output`, and returns the line.
+fn source_date_epoch(root: &Path, commit: &str, output: &Path) -> Result<String, Error> {
+    if !build_commit::is_commit(commit) {
+        return Err(Error::NotACommit(commit.to_owned()));
+    }
+    let said = git_stdout(root, &["show", "-s", "--format=%ct", commit])?;
+    let seconds = String::from_utf8_lossy(&said).trim().to_owned();
+    let line = format!("SOURCE_DATE_EPOCH={seconds}");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output)
+        .map_err(Error::spawn(format!("open {}", output.display())))?;
+    std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes())
+        .map_err(Error::spawn(format!("append to {}", output.display())))?;
+    Ok(line)
+}
+
+/// What the image of `service` must hold, from the flags: the frontend wants `--kbf-tarball`
+/// always, the coordinator wants `--binary` unless only verifying.
+fn image_reference<'a>(
+    service: pkg_image_asset::Image,
+    tarball: Option<&'a Path>,
+    binary: Option<&'a Path>,
+    verify_only: bool,
+) -> Result<Option<pkg_image_asset::Reference<'a>>, Error> {
+    use pkg_image_asset::{Image, Reference};
+    match (service, tarball, binary, verify_only) {
+        (Image::Frontend, Some(t), None, _) => Ok(Some(Reference::KbfTarball(t))),
+        (Image::Coordinator, None, Some(b), false) => Ok(Some(Reference::Binary(b))),
+        (Image::Coordinator, None, None, true) => Ok(None),
+        (Image::Frontend, ..) => Err(Error::Failed(
+            "the frontend image is checked against --kbf-tarball, and only that".to_owned(),
+        )),
+        (Image::Coordinator, ..) => Err(Error::Failed(
+            "the coordinator image is checked against --binary (not with --verify-only, \
+             which makes the other checks alone)"
+                .to_owned(),
+        )),
+    }
+}
+
 /// The budget file as `rev` holds it, read with `git show` in `root`.
 fn budget_at(root: &Path, rev: &str) -> Result<String, Error> {
     let spec = format!("{rev}:{}", budget::BUDGET);
@@ -956,7 +988,11 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             root: &root,
         }),
         Verb::Advisories(args) => advisories::run(&args, &root, &cargo_program()),
+        Verb::DeployFarm(args) => deploy_farm::run(&args),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
+        Verb::SourceDateEpoch { commit, output } => {
+            source_date_epoch(&root, &commit, &output).map(|line| vec![line])
+        }
         Verb::Fetch {
             url,
             sha256,
@@ -1092,6 +1128,36 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 kbf_tarball: &kbf_tarball,
             },
         ),
+        Verb::PkgImageAsset {
+            image,
+            service,
+            platform,
+            commit,
+            kbf_tarball,
+            binary,
+            out,
+            verify_only,
+        } => {
+            let reference = image_reference(
+                service,
+                kbf_tarball.as_deref(),
+                binary.as_deref(),
+                verify_only,
+            )?;
+            pkg_image_asset::asset(
+                &image,
+                &commit,
+                &match (&out, verify_only) {
+                    (Some(out), false) => pkg_asset::Mode::Add(out),
+                    _ => pkg_asset::Mode::VerifyOnly,
+                },
+                &pkg_image_asset::Check {
+                    image: service,
+                    platform,
+                    reference,
+                },
+            )
+        }
         Verb::PkgMacosAsset {
             package,
             commit,
@@ -1119,55 +1185,6 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         }
         #[cfg(not(target_os = "macos"))]
         Verb::PkgMacosInstallTest { .. } => Err(darwin::needs_macos("pkg-macos-install-test")),
-        Verb::ImageBuild {
-            image,
-            dockerfile_dir,
-            binary,
-            commit,
-            out,
-            docker,
-        } => image::build(
-            &mut pkg_install::process(&docker),
-            &image::Build {
-                image,
-                dockerfile_dir: &dockerfile_dir,
-                binary: &binary,
-                commit: &commit,
-                out: &out,
-            },
-        ),
-        Verb::ImageAsset {
-            image,
-            archive,
-            binary,
-            sbom,
-            platform,
-            commit,
-            out,
-        } => image::asset(
-            &archive,
-            &sbom,
-            &out,
-            &image::Check {
-                image,
-                platform,
-                commit: &commit,
-                binary: &binary,
-            },
-        ),
-        Verb::ImageTest {
-            image,
-            archive,
-            commit,
-            docker,
-        } => image::run(
-            &mut pkg_install::process(&docker),
-            &image::Test {
-                image,
-                archive: &archive,
-                commit: &commit,
-            },
-        ),
         Verb::PkgInstallTest {
             package,
             format,

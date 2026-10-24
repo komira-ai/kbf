@@ -246,9 +246,17 @@ impl Inventory {
         self.hosts.iter().find(|h| h.alias == alias)
     }
 
-    /// Whether some host is a pool member: the roll then needs the proxy's admin API.
+    /// Whether some host is a pool member: the roll then takes it out of service before it is
+    /// installed on, at the proxy when there is one, and itself otherwise.
     pub fn has_members(&self) -> bool {
         self.hosts.iter().any(|h| h.member.is_some())
+    }
+
+    /// The pool members other than the host `alias`, in file order: the frontends that serve
+    /// while that one is rolled. Empty when `alias` is the only member.
+    pub fn peers(&self, alias: &str) -> Vec<&Host> {
+        let others = self.hosts.iter().filter(|h| h.alias != alias);
+        others.filter(|h| h.member.is_some()).collect()
     }
 
     /// The hosts of a roll in the order they are touched: the frontend first, then the rest
@@ -681,6 +689,26 @@ mod tests {
         let all = inv.plan(&Hosts::All(All::All)).expect("all");
         assert_eq!(aliases(&all), ["fe-a", "fe-b", "st1", "padded"]);
         assert!(!sample().has_members());
+    }
+
+    /// Asserts that the peers of a member are the other members in file order, that the peers of
+    /// a host that is no member are all the members, that a host that is not in the file has
+    /// them all too, and that the only member has none.
+    #[test]
+    fn the_peers_of_a_member_are_the_other_members_in_file_order() {
+        let inv = Inventory::parse(&file(&[
+            &member_line("fe-a", "instance=a base=18000"),
+            &format!("st1 st1.farm.example storage {KEY}"),
+            &member_line("fe-b", "instance=b base=18010"),
+            &member_line("fe-c", "instance=c base=18020"),
+        ]))
+        .expect("inventory");
+        assert_eq!(aliases(&inv.peers("fe-b")), ["fe-a", "fe-c"]);
+        assert_eq!(aliases(&inv.peers("fe-a")), ["fe-b", "fe-c"]);
+        assert_eq!(aliases(&inv.peers("st1")), ["fe-a", "fe-b", "fe-c"]);
+        assert_eq!(aliases(&inv.peers("ghost")), ["fe-a", "fe-b", "fe-c"]);
+        let alone = Inventory::parse(&member_line("fe-a", "instance=a base=18000"));
+        assert!(alone.expect("alone").peers("fe-a").is_empty());
     }
 
     /// Asserts that two members cannot share a name or overlap in ports: the same instance

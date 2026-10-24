@@ -208,15 +208,12 @@ impl Release {
         self.attest_from(skip, "refs/heads/main");
     }
 
-    /// The files with a bundle: the tarballs, the `.deb` packages and the image archives.
+    /// The files with a bundle: the tarballs and the `.deb` packages.
     fn bundled(&self) -> Vec<(String, String)> {
         self.sums()
             .into_iter()
             .filter(|(_, name)| {
-                name.ends_with(".tar.gz")
-                    || name.ends_with(".deb")
-                    || name.ends_with(".pkg")
-                    || name.ends_with(".tar")
+                name.ends_with(".tar.gz") || name.ends_with(".deb") || name.ends_with(".pkg")
             })
             .collect()
     }
@@ -281,7 +278,7 @@ impl Release {
         let mut store = String::new();
         for (sha, name) in self.sums() {
             let mut kinds = vec![false];
-            if name.ends_with(".tar.gz") || name.ends_with(".tar") {
+            if name.ends_with(".tar.gz") {
                 kinds.push(true);
             }
             for sbom in kinds {
@@ -676,8 +673,8 @@ fn attestations_refuse_a_foreign_workflow_an_unknown_file_and_a_missing_gh() {
     assert_eq!(code, Some(1));
     assert_eq!(
         err,
-        "xtask: SHA256SUMS lists notes.txt, neither a tarball, an image, a package, an \
-         SBOM nor version facts\n"
+        "xtask: SHA256SUMS lists notes.txt, neither a tarball, a package, an SBOM \
+         nor version facts\n"
     );
 }
 
@@ -1265,75 +1262,5 @@ fn a_verifier_that_mixes_package_and_tarball_bundles_is_caught_by_the_package_co
             "xtask: control failed: the bundle of {deb} verified for commit {}, not the commit it attests\n",
             control_commit(COMMIT)
         )
-    );
-}
-
-/// A release of one tarball and the frontend image of the same platform with its SBOM,
-/// attested as the attest job leaves them: the image has build provenance, an SBOM
-/// attestation and a bundle, like a tarball.
-fn with_image(name: &str) -> (Release, String) {
-    let one = [("linux-x86_64", &["kbf-installer"][..])];
-    let r = Release::build_with(name, &one);
-    let image = format!("kbf-frontend-image-{COMMIT}-linux-x86_64.tar");
-    r.add_listed(&image, "the frontend image for linux-x86_64");
-    r.add_listed(
-        &format!("kbf-frontend-image-{COMMIT}-linux-x86_64.cdx.json"),
-        "{\"bomFormat\":\"CycloneDX\"}",
-    );
-    r.attest(None);
-    (r, image)
-}
-
-#[test]
-fn an_image_is_verified_for_provenance_an_sbom_and_its_own_bundle() {
-    // Catches: an image archive in SHA256SUMS refused as "neither a tarball nor a package"
-    // (verify-linux failing on the first push that lists one), one verified without its
-    // SBOM attestation or without its own bundle.
-    let (r, image) = with_image("image-good");
-    let (code, out, err) = r.verify(WORKFLOW, None);
-    assert_eq!(code, Some(0), "{err}: {out}");
-    assert!(
-        out.lines()
-            .any(|l| l == format!("verified: {image} (provenance, SBOM, bundle)")),
-        "{out}"
-    );
-    let path = r.dist.join(&image);
-    let verifying = format!("attestation verify {} ", s(&path));
-    let calls = r.gh_calls();
-    let on_image: Vec<&String> = calls.iter().filter(|c| c.starts_with(&verifying)).collect();
-    assert!(
-        on_image.iter().any(|c| c.contains(SBOM_PREDICATE)),
-        "no SBOM attestation was asked of the image: {on_image:#?}"
-    );
-    assert!(
-        on_image
-            .iter()
-            .any(|c| c.contains(&format!("--bundle {}", s(&r.bundle_of(&image))))),
-        "the image was not verified against its own bundle: {on_image:#?}"
-    );
-}
-
-#[test]
-fn an_image_without_an_attestation_or_its_bundle_fails_the_run_and_names_it() {
-    // Catches: an image released with provenance only, or with no bundle for a host to
-    // verify it with offline.
-    let (r, image) = with_image("image-missing");
-    r.attest(Some((image.as_str(), true)));
-    let (code, _, err) = r.verify(WORKFLOW, None);
-    assert_eq!(code, Some(1));
-    assert_eq!(
-        err,
-        format!(
-            "xtask: {}: no https://cyclonedx.org/bom attestation signed by {WORKFLOW} verifies\n",
-            s(&r.dist.join(&image))
-        )
-    );
-    r.attest(None);
-    std::fs::remove_file(r.bundle_of(&image)).expect("remove");
-    let (code, _, err) = r.verify(WORKFLOW, None);
-    assert_eq!(code, Some(1));
-    assert_eq!(
-        err,
-        format!("xtask: {image}: no provenance bundle {image}.sigstore.json\n")
     );
 }

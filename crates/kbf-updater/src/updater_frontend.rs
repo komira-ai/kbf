@@ -46,13 +46,17 @@ const TURN: [Phase; 7] = [
 /// Whether a turn found in `found` still has the work of `phase` to do: it has not got past
 /// it. A phase that is no part of the turn (`checking`, which a member's record never holds)
 /// is taken for the start of it.
-fn pending(found: Phase, phase: Phase) -> bool {
+pub(super) fn pending(found: Phase, phase: Phase) -> bool {
     let place = |p: Phase| TURN.iter().position(|q| *q == p);
     place(found) <= place(phase)
 }
 
 /// `result`'s error as a halt with `code`: what failed, then the port's own words.
-fn or_fail<T>(result: Result<T, PortError>, code: ErrorCode, why: &str) -> Result<T, Halt> {
+pub(super) fn or_fail<T>(
+    result: Result<T, PortError>,
+    code: ErrorCode,
+    why: &str,
+) -> Result<T, Halt> {
     result.map_err(|e| Halt::Fail(code, format!("{why}: {e}")))
 }
 
@@ -231,7 +235,12 @@ impl Updater {
     /// whose install had finished, install nothing. An install the host reports as in progress
     /// (one the updater started before it restarted) is waited out, for at most
     /// `Timing::install_bound`, and not run a second time beside it.
-    fn install_once(&self, idx: usize, host: &Host, target: &Version) -> Result<(), Halt> {
+    pub(super) fn install_once(
+        &self,
+        idx: usize,
+        host: &Host,
+        target: &Version,
+    ) -> Result<(), Halt> {
         let alias = &host.alias;
         let start = self.now();
         loop {
@@ -288,6 +297,17 @@ impl Updater {
         if !member.ready {
             return Ok(Health::Waiting(format!("member {name} is not ready")));
         }
+        self.runs_commit(host, name, commit)
+    }
+
+    /// Whether the member `name` of `host` reports a build of the commit that begins with
+    /// `commit`, which is asked of the member itself.
+    pub(super) fn runs_commit(
+        &self,
+        host: &Host,
+        name: &str,
+        commit: &str,
+    ) -> Result<Health, PortError> {
         let built = self.ports.frontend.commit(host)?;
         if names(&built, commit) {
             return Ok(Health::Healthy);

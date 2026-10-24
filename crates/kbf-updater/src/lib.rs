@@ -13,7 +13,9 @@
 //!   first, the first failure stops it, a restart asks the host before it installs again; a
 //!   `mac-daemon` host's install starts an apply that the roll polls until it is done; a
 //!   frontend that is a member of the kbf-proxy pool is drained, retired, installed on,
-//!   restarted and put back, one at a time and never the last one that is up;
+//!   restarted and put back, one at a time and never the last one that is up; without a proxy
+//!   (no `--proxy-admin`) the member drains itself and exits once the other members have been
+//!   ready for a while, and is then installed on and restarted;
 //! - [`fakes`]: a scripted fake of every port.
 //!
 //! And around it:
@@ -96,6 +98,8 @@ mod updater_fresh_host_tests;
 mod updater_frontend_tests;
 #[cfg(test)]
 mod updater_mac_tests;
+#[cfg(test)]
+mod updater_no_proxy_tests;
 #[cfg(test)]
 mod updater_restart_tests;
 #[cfg(test)]

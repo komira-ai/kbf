@@ -18,8 +18,7 @@
 //!   passes `verify-assets sums` (so each `kbf` tarball has its version facts listed; the
 //!   flag, for the release before the build jobs recorded them, waives that and nothing
 //!   else: [`Pairing::Waived`]), every file `SHA256SUMS`
-//!   lists is `<binary>-<sha>-<platform>.tar.gz` or `.cdx.json`, an image
-//!   `<image>-image-<sha>-<platform>.tar`, or `kbf`'s
+//!   lists is `<binary>-<sha>-<platform>.tar.gz` or `.cdx.json`, or `kbf`'s
 //!   `kbf-<sha>-<platform>.version.json` ([`crate::version_facts`]): the assets of that
 //!   commit and no other, and each tarball has exactly
 //!   one provenance bundle, `<tarball>.sigstore.json`, whose one subject is that
@@ -102,6 +101,7 @@ use crate::build_commit::full_commit;
 use crate::bundles;
 use crate::fetch::Sha256;
 use crate::package::{Platform, read};
+use crate::pkg_image_asset;
 use crate::sums::{self, SUMS};
 use crate::version_facts::{self, Pairing};
 
@@ -253,7 +253,8 @@ pub fn main_control(gh: &Path, repo: &str, on: &str, off: &str) -> Result<String
 }
 
 /// Whether `name` is an asset of `commit`: `<binary>-<commit>-<platform>` and
-/// `.tar.gz`, `.cdx.json`, `.deb`, `.pkg` or `.tar` (an image) (the packages; nfpm's own `kbf-installer_<version>_
+/// `.tar.gz`, `.cdx.json`, `.deb`, `.pkg` or `.oci.tar` (the packages; and the frontend or coordinator image,
+/// [`crate::pkg_image_asset`], which exists for the Linux platforms only; nfpm's own `kbf-installer_<version>_
 /// <arch>.deb` and `pkg build`'s `kbf-installer-<version>-macos-arm64.pkg` name no commit and are
 /// not one), or the version facts of `kbf` for a platform ([`version_facts::is_facts_of`]).
 fn is_asset_of(name: &str, commit: &str) -> bool {
@@ -265,10 +266,17 @@ fn is_asset_of(name: &str, commit: &str) -> bool {
         .or_else(|| name.strip_suffix(".cdx.json"))
         .or_else(|| name.strip_suffix(".deb"))
         .or_else(|| name.strip_suffix(".pkg"))
-        .or_else(|| name.strip_suffix(".tar"));
+        .or_else(|| name.strip_suffix(pkg_image_asset::SUFFIX));
     let parts = stem.and_then(|s| s.split_once(&format!("-{commit}-")));
-    parts
-        .is_some_and(|(binary, platform)| !binary.is_empty() && Platform::named(platform).is_some())
+    let is_image = name.ends_with(pkg_image_asset::SUFFIX);
+    parts.is_some_and(|(binary, platform)| {
+        let platform = Platform::named(platform);
+        !binary.is_empty()
+            && platform.is_some()
+            && (!is_image
+                || (pkg_image_asset::Image::named(binary).is_some()
+                    && matches!(platform, Some(Platform::LinuxX86_64 | Platform::LinuxArm64))))
+    })
 }
 
 /// The `release check` verb: the lines to print, then every file name of `dir`
@@ -305,35 +313,22 @@ fn checked(
         .map(|l| l.name.as_str())
         .filter(|n| bundles::is_package(n))
         .collect();
-    let images: Vec<&str> = lines
-        .iter()
-        .map(|l| l.name.as_str())
-        .filter(|n| bundles::is_image(n))
-        .collect();
     names.extend(
         tarballs
             .iter()
             .chain(&packages)
-            .chain(&images)
             .map(|t| bundles::name_of(t)),
     );
-    let and_some = |n: usize, what: &str| {
-        if n == 0 {
-            String::new()
-        } else {
-            format!(" and {n} {what}")
-        }
+    let and_packages = if packages.is_empty() {
+        String::new()
+    } else {
+        format!(" and {} package(s)", packages.len())
     };
-    let and_more = format!(
-        "{}{}",
-        and_some(packages.len(), "package(s)"),
-        and_some(images.len(), "image(s)")
-    );
     let printed = vec![
         sums_line,
         format!("names: every listed file is an asset of {commit}"),
         format!(
-            "bundles: each of the {} tarballs{and_more} has one provenance bundle",
+            "bundles: each of the {} tarballs{and_packages} has one provenance bundle",
             tarballs.len()
         ),
     ];

@@ -49,6 +49,8 @@ fn prepare(name: &str, proxy_uid: u32) -> Config {
         drain_deadline: std::time::Duration::from_secs(600),
         apply_poll: std::time::Duration::from_secs(5),
         apply_deadline: std::time::Duration::from_secs(600),
+        peer_ready: std::time::Duration::from_secs(30),
+        frontend_drain_deadline: std::time::Duration::from_secs(1200),
     }
 }
 
