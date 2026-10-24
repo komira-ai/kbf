@@ -151,7 +151,7 @@ impl System for RealSystem {
         if let Some(uid) = run_as {
             let mut paths = vec![spec.bundle.clone(), spec_path.clone(), log_path.clone()];
             paths.extend(spec.automount_dir.clone());
-            paths.extend(spec.tagged.as_ref().map(|t| t.path.clone()));
+            paths.extend(spec.tagged.iter().map(|t| t.path.clone()));
             for p in paths {
                 chown_tree(&p, uid, uid)?;
             }

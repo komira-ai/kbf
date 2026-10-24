@@ -140,7 +140,7 @@ pub fn build(spec: &VmSpec) -> Result<Built, String> {
             dev.setShare(Some(&share));
             shares.push(Retained::into_super(dev));
         }
-        if let Some(t) = &spec.tagged {
+        for t in &spec.tagged {
             let dev = VZVirtioFileSystemDeviceConfiguration::initWithTag(
                 VZVirtioFileSystemDeviceConfiguration::alloc(),
                 &NSString::from_str(&t.tag),
@@ -148,11 +148,23 @@ pub fn build(spec: &VmSpec) -> Result<Built, String> {
             let shared = VZSharedDirectory::initWithURL_readOnly(
                 VZSharedDirectory::alloc(),
                 &url(&t.path),
-                false,
+                t.read_only,
             );
-            let share =
-                VZSingleDirectoryShare::initWithDirectory(VZSingleDirectoryShare::alloc(), &shared);
-            dev.setShare(Some(&share));
+            if let Some(name) = &t.multiple_name {
+                let dict: Retained<NSDictionary<NSString, VZSharedDirectory>> =
+                    NSDictionary::from_retained_objects(&[&*NSString::from_str(name)], &[shared]);
+                let share = VZMultipleDirectoryShare::initWithDirectories(
+                    VZMultipleDirectoryShare::alloc(),
+                    &dict,
+                );
+                dev.setShare(Some(&share));
+            } else {
+                let share = VZSingleDirectoryShare::initWithDirectory(
+                    VZSingleDirectoryShare::alloc(),
+                    &shared,
+                );
+                dev.setShare(Some(&share));
+            }
             shares.push(Retained::into_super(dev));
         }
         if !shares.is_empty() {

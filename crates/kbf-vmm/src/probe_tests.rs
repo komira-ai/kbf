@@ -416,3 +416,26 @@ fn the_trace_lists_every_event_with_its_arrival_time() {
     assert_eq!(v.event_ms.len(), v.events.len());
     assert!(trace["ended"].is_null());
 }
+
+/// Catches the context's graphics setting not reaching a clone (the default would then be
+/// a headless guest, which crash-loops its window server), and the edit closure losing the
+/// last word (E1's first arm is headless on purpose).
+#[test]
+fn a_clone_gets_the_graphics_device_the_context_asks_for() {
+    let work = work_with_base("probe-clone-gfx");
+    let sys = FakeSystem::new();
+    let mut c = ctx(&sys, &work);
+    c.graphics = true;
+    c.start_clone("a", Identity::Keep, |_| {}, None).expect("a");
+    c.start_clone("b", Identity::Keep, |s| s.graphics = false, None)
+        .expect("b");
+    c.graphics = false;
+    c.start_clone("c", Identity::Keep, |_| {}, None).expect("c");
+    let on: Vec<bool> = sys
+        .starts
+        .borrow()
+        .iter()
+        .map(|(s, _)| s.graphics)
+        .collect();
+    assert_eq!(on, [true, false, false]);
+}

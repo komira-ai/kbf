@@ -341,6 +341,7 @@ pub fn ctx<'a>(sys: &'a FakeSystem, work: &Path) -> crate::probe::Ctx<'a> {
         guest_binary: None,
         keep: false,
         graphics: false,
+        matrix: false,
         timing: crate::probe::Timing::instant(),
     }
 }

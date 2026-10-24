@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use crate::bundle::{self, Identity};
 use crate::gates::{Channels, attach_share, base_missing, clean};
 use crate::guest::{self, Share};
+use crate::matrix::{self, Prepared};
 use crate::probe::{Ctx, Vm};
 use crate::report::Report;
 use crate::sampler::{self, Sample};
@@ -27,6 +28,8 @@ struct Arm {
     graphics: bool,
     clone: PathBuf,
     share: Share,
+    /// The matrix shares of this VM (empty without `--matrix`).
+    matrix: Vec<Prepared>,
     samples: Vec<Sample>,
     marker_ms: Option<u64>,
 }
@@ -60,15 +63,30 @@ fn remove_shares(ctx: &Ctx<'_>, name: &str) {
 /// Starts the clone `name` with its share and, when `graphics`, a graphics device.
 fn start_arm(ctx: &Ctx<'_>, name: &str, graphics: bool) -> Result<(Vm, Arm), String> {
     let share = guest::prepare_share(ctx, name)?;
-    let (vm, _) = ctx.start_clone(
-        name,
-        Identity::Keep,
-        |spec: &mut VmSpec| {
-            attach_share(spec, &share, Channels::NONE);
-            spec.graphics = graphics;
-        },
-        None,
-    )?;
+    let shares = if ctx.matrix {
+        matrix::prepare(ctx, name)
+    } else {
+        Vec::new()
+    };
+    let started = matrix::write_manifest(&share.dir, &shares).and_then(|()| {
+        ctx.start_clone(
+            name,
+            Identity::Keep,
+            |spec: &mut VmSpec| {
+                attach_share(spec, &share, Channels::NONE);
+                matrix::attach(spec, &shares);
+                spec.graphics = graphics;
+            },
+            None,
+        )
+    });
+    let vm = match started {
+        Ok((vm, _)) => vm,
+        Err(e) => {
+            matrix::remove(ctx, &shares, false);
+            return Err(e);
+        }
+    };
     let clone = ctx.work.join(name);
     Ok((
         vm,
@@ -77,6 +95,7 @@ fn start_arm(ctx: &Ctx<'_>, name: &str, graphics: bool) -> Result<(Vm, Arm), Str
             graphics,
             clone,
             share,
+            matrix: shares,
             samples: Vec::new(),
             marker_ms: None,
         },
@@ -145,6 +164,7 @@ fn arm_json(ctx: &Ctx<'_>, vm: &Vm, arm: &Arm) -> Value {
         "samples": arm.samples.iter().map(Sample::json).collect::<Vec<_>>(),
         "activity": sampler::summarize(&arm.samples),
         "results_files": names(&arm.share.results()),
+        "matrix_host": matrix::host_listing(&arm.matrix),
         "helper_log": vm.proc.diagnostics(),
         "harvest": format!(
             "sudo kbf-vmm image harvest --bundle {} --out {}-harvest",
@@ -194,6 +214,9 @@ pub fn e1(ctx: &Ctx<'_>) -> Report {
             }
             Err(e) => {
                 clean(ctx, &mut vms);
+                for arm in &arms {
+                    matrix::remove(ctx, &arm.matrix, false);
+                }
                 if !ctx.keep {
                     remove_shares(ctx, name);
                 }
@@ -208,6 +231,9 @@ pub fn e1(ctx: &Ctx<'_>) -> Report {
         .map(|(vm, arm)| arm_json(ctx, vm, arm))
         .collect();
     clean(ctx, &mut vms);
+    for arm in &arms {
+        matrix::remove(ctx, &arm.matrix, ctx.keep);
+    }
     let summary = arm_reports
         .iter()
         .map(one_line)
@@ -468,5 +494,57 @@ mod tests {
             !work.join("e1-y-share").exists(),
             "so was the failed one's share"
         );
+    }
+
+    /// Catches a matrix that is not attached to both guests (each guest needs its own host
+    /// directories), a manifest the guest cannot read, host listings missing from the
+    /// report, scratch left in the work directory after a run without `--keep`, and
+    /// matrix shares attached when the matrix is off.
+    #[test]
+    fn the_matrix_is_attached_listed_and_cleaned_up() {
+        let work = work_with_base("e1-matrix");
+        let sys = FakeSystem::new();
+        let mut c = guest_ctx(&sys, &work);
+        c.matrix = true;
+        c.keep = true;
+        let r = e1(&c);
+        assert_eq!(r.status, Status::Ok, "{r:?}");
+        let starts = sys.starts.borrow();
+        for (i, name) in ["e1-x", "e1-y"].iter().enumerate() {
+            let tagged = &starts[i].0.tagged;
+            // The main share and the probe share come first, then the matrix.
+            assert_eq!(tagged[0].tag, guest::SHARE_TAG);
+            assert_eq!(tagged[1].tag, guest::TAG);
+            assert!(tagged.len() > 2 && tagged[2..].iter().all(|t| t.tag.starts_with("kbfmx")));
+            let manifest =
+                std::fs::read_to_string(work.join(format!("{name}-share")).join(matrix::MANIFEST))
+                    .expect("manifest");
+            let rows: Value = serde_json::from_str(&manifest).expect("json");
+            assert_eq!(rows.as_array().expect("rows").len(), tagged.len() - 2);
+            let listed = arm(&r, i)["matrix_host"].as_array().expect("listing");
+            assert_eq!(listed.len(), 8, "every variant is listed, skipped or not");
+            assert!(
+                listed
+                    .iter()
+                    .any(|row| row["name"] == "base" && row["entries"] == json!([]))
+            );
+        }
+        // Kept: the work directories stay for inspection.
+        assert!(work.join("kbf-e1-x-mx-base").is_dir());
+        drop(starts);
+        let work = work_with_base("e1-matrix-clean");
+        let mut c = guest_ctx(&sys, &work);
+        c.matrix = true;
+        assert_eq!(e1(&c).status, Status::Ok);
+        assert!(!work.join("kbf-e1-x-mx-base").exists());
+        assert!(!work.join("kbf-e1-y-mx-mode755").exists());
+        // Off: only the two shares, and no listing rows.
+        sys.starts.borrow_mut().clear();
+        let work = work_with_base("e1-nomatrix");
+        let mut c = guest_ctx(&sys, &work);
+        c.matrix = false;
+        let r = e1(&c);
+        assert!(sys.starts.borrow().iter().all(|(s, _)| s.tagged.len() == 2));
+        assert_eq!(arm(&r, 0)["matrix_host"], json!([]));
     }
 }

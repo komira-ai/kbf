@@ -144,9 +144,27 @@ pub fn probe_ready(host: &dyn Host, a: &ReadyArgs) -> Result<Value, String> {
 /// # Errors
 /// The write or the rename failed.
 pub fn write_result(out: &Path, value: &Value) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)?;
     let tmp = out.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
-    std::fs::rename(&tmp, out)
+    let first = std::fs::write(&tmp, &bytes)
+        .map_err(|e| format!("create {}: {e}", tmp.display()))
+        .and_then(|()| {
+            std::fs::rename(&tmp, out)
+                .map_err(|e| format!("rename {} to {}: {e}", tmp.display(), out.display()))
+        });
+    let Err(first) = first else { return Ok(()) };
+    // A share may refuse the temporary file or the rename; the file itself is what the
+    // host waits for, so write it in place rather than not at all.
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::write(out, &bytes).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "create {}: {e} (the temporary file route failed first: {first})",
+                out.display()
+            ),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -317,5 +335,26 @@ mod tests {
         );
         assert!(!dir.join("r.tmp").exists());
         assert!(write_result(&dir.join("no/such/r.json"), &json!({})).is_err());
+        // A temporary file that cannot be made (the first E1 share refused writes) falls back
+        // to writing the result in place.
+        std::fs::create_dir(dir.join("fb.tmp")).expect("blocker");
+        write_result(&dir.join("fb.json"), &json!({"b": 2})).expect("in place");
+        assert!(
+            std::fs::read_to_string(dir.join("fb.json"))
+                .expect("read")
+                .contains("\"b\"")
+        );
+        // When both routes fail the error names both, so the log says which step was refused.
+        std::fs::create_dir(dir.join("both.json")).expect("dir");
+        std::fs::write(dir.join("both.json").join("x"), "x").expect("x");
+        let e = write_result(&dir.join("both.json"), &json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("rename"), "{e}");
+        assert!(e.contains("both.json"), "{e}");
+        assert!(
+            !dir.join("both.tmp").exists(),
+            "the temporary file is removed"
+        );
     }
 }

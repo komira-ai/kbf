@@ -24,7 +24,7 @@ fn context<'a>(
     sys: &'a dyn System,
     common: &Common,
     timing: Timing,
-    (keep, graphics): (bool, bool),
+    keep: bool,
 ) -> Result<Ctx<'a>, String> {
     std::fs::create_dir_all(&common.work_dir)
         .map_err(|e| format!("create {}: {e}", common.work_dir.display()))?;
@@ -37,20 +37,21 @@ fn context<'a>(
         base,
         guest_binary: common.guest_binary.clone(),
         keep,
-        graphics,
+        graphics: !common.headless,
+        matrix: !common.no_matrix,
         timing,
     })
 }
 
 fn probe(sys: &dyn System, args: &ProbeArgs, timing: Timing) -> Report {
-    match context(sys, &args.common, timing, (args.keep, args.graphics)) {
+    match context(sys, &args.common, timing, args.keep) {
         Ok(ctx) => gates::run(&ctx, args.gate, args.run_as_uid),
         Err(e) => Report::error("probe", e),
     }
 }
 
 fn bench_cmd(sys: &dyn System, args: &BenchArgs, timing: Timing) -> Report {
-    match context(sys, &args.common, timing, (false, false)) {
+    match context(sys, &args.common, timing, false) {
         Ok(ctx) => bench::run(&ctx, args.runs),
         Err(e) => Report::error("probe-bench", e),
     }
@@ -83,6 +84,7 @@ pub fn run(
             out,
             disk_gib,
             offline_setup,
+            guest_binary,
         }) => image::base(
             sys,
             &BaseArgs {
@@ -91,9 +93,12 @@ pub fn run(
                 out: out.clone(),
                 disk_gib: *disk_gib,
                 offline_setup: *offline_setup,
+                guest_binary: guest_binary.clone(),
             },
         ),
-        Cmd::Image(ImageCmd::Setup { base }) => image::setup(sys, base),
+        Cmd::Image(ImageCmd::Setup { base, guest_binary }) => {
+            image::setup(sys, base, guest_binary.as_deref())
+        }
         Cmd::Image(ImageCmd::Harvest { bundle, out }) => image::harvest(sys, bundle, out),
     };
     let failed = report.status == Status::Error;

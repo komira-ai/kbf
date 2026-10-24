@@ -15,6 +15,7 @@ pub mod guest;
 pub mod harvest;
 pub mod hostfs;
 pub mod image;
+pub mod matrix;
 pub mod probe;
 pub mod report;
 pub mod sampler;
