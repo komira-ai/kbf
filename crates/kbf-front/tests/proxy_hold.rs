@@ -294,6 +294,120 @@ async fn a_miss_that_an_owner_away_could_not_confirm_is_held() {
     assert_eq!(calls(&farm.fakes), want);
 }
 
+/// A farm whose blob `0`/7 has one owner that the map has `Down` (the first of its read
+/// order) and one that is up (the second, which says it lacks the blob). `down` is the
+/// fake behind the first owner.
+async fn one_owner_down(down: Arc<Fake>) -> (Farm, Arc<Map>) {
+    let up = map(1, MemberState::Active);
+    let order = up.read_order(&digest_of('0', 7));
+    let (first, second) = (order[0].0 as usize, order[1].0 as usize);
+    let mut states = [MemberState::Active; 3];
+    states[first - 1] = MemberState::Down;
+    let mut fakes = serving();
+    fakes[first - 1] = down;
+    fakes[second - 1] = Fake::forcing('1');
+    let farm = farm_of(fakes, &[], &map_of(1, states)).await;
+    (farm, map_of(2, [MemberState::Active; 3]))
+}
+
+/// A Read of a blob that one owner (down in the map) may hold and the other says it lacks
+/// waits for the down owner instead of answering NOT_FOUND, and is served when it is back
+/// (the map names it active again after the first pause).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_miss_confirmed_only_by_the_owners_that_are_up_waits_for_the_one_that_is_down() {
+    let (farm, back) = one_owner_down(Fake::new(false)).await;
+    farm.clock.then(becomes(&farm.maps, back));
+
+    let (bytes, ended) = bounded(read(&farm.front, '0', 7)).await;
+    ended.expect("served once the owner is back");
+    assert_eq!(bytes, 7);
+    assert_eq!(farm.clock.pauses(), [ms(250)]);
+}
+
+/// The same Read when the owner never comes back: after the hold the client is told
+/// UNAVAILABLE (so that the caller retries), naming the node, and not NOT_FOUND.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_miss_confirmed_only_by_the_owners_that_are_up_is_unavailable_after_the_hold() {
+    let (farm, _) = one_owner_down(Fake::new(false)).await;
+
+    let (bytes, ended) = bounded(read(&farm.front, '0', 7)).await;
+    assert_eq!(bytes, 0);
+    let status = ended.expect_err("the owner never came back");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert!(status.message().contains("storage node"), "{status:?}");
+    assert_eq!(farm.clock.elapsed(), BOUND);
+}
+
+/// An owner that fails INTERNAL before its first byte has not said the blob is absent: the
+/// other owner's NOT_FOUND waits one pause, and the owner serves on the second try.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_failing_internal_is_waited_for_when_the_other_says_not_found() {
+    let map = map(1, MemberState::Active);
+    let order = map.read_order(&digest_of('0', 7));
+    let (broken, lacking) = (order[0].0 as usize, order[1].0 as usize);
+    let mut fakes = serving();
+    fakes[broken - 1] = Fake::failing_first(Code::Internal, 1);
+    fakes[lacking - 1] = Fake::forcing('1');
+    let farm = farm_of(fakes, &[], &map).await;
+
+    let (bytes, ended) = bounded(read(&farm.front, '0', 7)).await;
+    ended.expect("served on the second try");
+    assert_eq!(bytes, 7);
+    assert_eq!(farm.clock.pauses(), [ms(250)]);
+}
+
+/// An owner that keeps failing INTERNAL while the other says NOT_FOUND ends the hold with
+/// UNAVAILABLE, never NOT_FOUND and not the INTERNAL of the node.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_failing_internal_for_the_whole_hold_is_unavailable() {
+    let map = map(1, MemberState::Active);
+    let order = map.read_order(&digest_of('0', 7));
+    let (broken, lacking) = (order[0].0 as usize, order[1].0 as usize);
+    let mut fakes = serving();
+    fakes[broken - 1] = Fake::failing_first(Code::Internal, usize::MAX);
+    fakes[lacking - 1] = Fake::forcing('1');
+    let farm = farm_of(fakes, &[], &map).await;
+
+    let (_, ended) = bounded(read(&farm.front, '0', 7)).await;
+    let status = ended.expect_err("never served");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert!(status.message().contains("storage node"), "{status:?}");
+    assert_eq!(farm.clock.elapsed(), BOUND);
+}
+
+/// An owner that cannot be reached at all (a closed port) beside an owner that says
+/// NOT_FOUND is away: the Read is held to the bound and ends UNAVAILABLE.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_that_cannot_be_reached_is_waited_for_when_the_other_says_not_found() {
+    let map = map(1, MemberState::Active);
+    let order = map.read_order(&digest_of('0', 7));
+    let (unreached, lacking) = (order[0].0 as usize, order[1].0 as usize);
+    let mut fakes = serving();
+    fakes[lacking - 1] = Fake::forcing('1');
+    let farm = farm_of(fakes, &[unreached], &map).await;
+
+    let (_, ended) = bounded(read(&farm.front, '0', 7)).await;
+    let status = ended.expect_err("one owner is unreachable");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert_eq!(farm.clock.elapsed(), BOUND);
+}
+
+/// A blob that every owner says it lacks, all of them up in the map, is NOT_FOUND at once:
+/// no pause is slept.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blob_every_owner_lacks_is_not_found_without_a_wait() {
+    let farm = farm_of(
+        (0..3).map(|_| Fake::forcing('1')).collect(),
+        &[],
+        &map(1, MemberState::Active),
+    )
+    .await;
+
+    let (_, ended) = bounded(read(&farm.front, '0', 7)).await;
+    assert_eq!(ended.expect_err("absent").code(), Code::NotFound);
+    assert!(farm.clock.pauses().is_empty());
+}
+
 /// Catches a hold that never ends (defect: unbounded), and one that ends late (a last pause
 /// not cut short at the bound): no node ever answers a Read or an upload, the pauses are
 /// kbf-route's (250 ms doubling to 5 s, the last what is left of the bound), 60 s in all

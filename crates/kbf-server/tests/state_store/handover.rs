@@ -355,17 +355,17 @@ fn recorded_farm(disk: &Disk, recorder: &kbf_front::Recorder) -> TestFarm {
     .expect("a farm over the store")
 }
 
-/// Pins the documented loss in `docs/design/frontend-handover.md` ("Not carried": an
-/// invocation record is split between the two processes). The invocation record is built
-/// by a process's own recorder from the events its own farm sent, and no row of the state
-/// store carries it. So after a handover the successor's recorder has no record of the
-/// build whose call the predecessor recorded, while the caller the predecessor kept is
-/// still answered, from the `done/` row the successor wrote. Catches: a build result that
-/// depended on the recorder (the caller left waiting for a record that is not there), and
-/// a change that starts carrying the record (this test then fails, and the doc line must
-/// change with it). No change to the farm makes the successor find it, since nothing
-/// writes it to the store: this test pins the documented loss; it cannot catch a
-/// regression that has no code to regress.
+/// Asserts that after a retire the other frontend's recorder has no record of a build the
+/// retired frontend recorded, while the caller the retired frontend kept is still answered
+/// from the `done/` row. See `docs/design/frontend-proxy.md` section 4 ("What a roll does
+/// not carry": an invocation record is split between the processes). The invocation
+/// record is built by a process's own recorder from the events its own farm sent, and no
+/// row of the state store carries it. Catches: a build result that depended on the
+/// recorder (the caller left waiting for a record that is not there), and a change that
+/// starts carrying the record (this test then fails, and the doc line must change with it).
+/// No change to the farm makes the successor find it, since nothing writes it to the store:
+/// this test pins the documented loss; it cannot catch a regression that has no code to
+/// regress.
 #[tokio::test(start_paused = true)]
 async fn a_successors_recorder_has_no_record_of_a_build_but_its_caller_is_answered() {
     let disk = Disk::new();

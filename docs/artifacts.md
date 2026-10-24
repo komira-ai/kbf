@@ -189,8 +189,8 @@ sorted by name.
 
 - `admin_protocol`: the version of the admin calls that `kbf --mode frontend` served
   (`GET role`, `POST quiesce`, `resume`, `takeover`, `stand-down`: `docs/api.md`, "The admin
-  calls (removed)"). A frontend no longer serves them; the field stays 1 for a proxy that
-  still reads it.
+  calls (removed)"). A frontend no longer serves them; the field stays 1 for the readers of
+  the version line.
 - `commit`: the first 12 hex digits of the commit built (`unknown` for a build with no
   git checkout); compare it with the first 12 of the commit in the asset's name.
 - `commit_full`: the 40 hex digits of the commit built (`kbf_server::BUILD_COMMIT_FULL`);
