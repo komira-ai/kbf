@@ -61,6 +61,11 @@ fn launched(tool: &str, args: &str) -> String {
     format!("{PROGRAM} __as-user 61003 20 -- {tool} {args}")
 }
 
+/// The call of the entry mode `mode`: it drops to the uid itself.
+fn mode_call(mode: &str) -> String {
+    format!("{PROGRAM} __entry {mode} 61003 20 {FOLDERS}")
+}
+
 #[test]
 fn the_flags_step_clears_the_home_as_root_and_the_entry_as_the_uid_in_that_order() {
     let log = Log::default();
@@ -76,7 +81,7 @@ fn the_flags_step_clears_the_home_as_root_and_the_entry_as_the_uid_in_that_order
         *log.borrow(),
         vec![
             format!("root {HOME}"),
-            launched(PROGRAM, &format!("__entry clear {FOLDERS}")),
+            mode_call("clear"),
             launched(FIND, &words(&acl)),
         ]
     );
@@ -109,7 +114,7 @@ fn root_is_never_given_the_entry_to_clear_or_to_empty() {
 }
 
 #[test]
-fn every_call_on_the_entry_drops_to_the_uid_first() {
+fn every_call_on_the_entry_is_made_as_the_uid() {
     let log = Log::default();
     let run = &mut runner(&log, &[]);
     let dir = (Path::new(HOME), Path::new(FOLDERS));
@@ -118,11 +123,13 @@ fn every_call_on_the_entry_drops_to_the_uid_first() {
     left(&me(), Path::new(FOLDERS), run).expect("left");
     let calls = log.borrow();
     assert_eq!(calls.len(), 4);
+    // The daemon's modes get the ids and drop inside their own process (the pool user
+    // need not be able to execute the binary); the system tool is run by `as-user`.
     for call in calls.iter() {
-        assert!(
-            call.starts_with(&format!("{PROGRAM} __as-user 61003 20 -- ")),
-            "{call}"
-        );
+        let own = call.starts_with(&format!("{PROGRAM} __entry "))
+            && call.contains(&format!(" 61003 20 {FOLDERS}"));
+        let tool = call.starts_with(&format!("{PROGRAM} __as-user 61003 20 -- {FIND} "));
+        assert!(own || tool, "{call}");
     }
 }
 
@@ -138,10 +145,7 @@ fn the_contents_step_empties_the_home_as_root_then_the_entry_as_the_uid() {
     .expect("clean");
     assert_eq!(
         *log.borrow(),
-        vec![
-            format!("root {HOME}"),
-            launched(PROGRAM, &format!("__entry empty {FOLDERS}")),
-        ]
+        vec![format!("root {HOME}"), mode_call("empty"),]
     );
 }
 
@@ -222,10 +226,7 @@ fn the_look_reports_each_line_the_uid_printed() {
     let log = Log::default();
     let lines = left(&me(), Path::new(FOLDERS), &mut runner(&log, &[])).expect("looked");
     assert_eq!(lines, vec!["lines", "of", "output"]);
-    assert_eq!(
-        *log.borrow(),
-        vec![launched(PROGRAM, &format!("__entry look {FOLDERS}"))]
-    );
+    assert_eq!(*log.borrow(), vec![mode_call("look")]);
 }
 
 #[test]
@@ -270,16 +271,34 @@ fn me_now() -> u32 {
     rustix::process::geteuid().as_raw().max(1)
 }
 
-fn call(mode: &[&str], uid: u32) -> (Option<i32>, String, String) {
+/// The entry mode with `words` after argv0, dropping through `drop_to`; its exit code
+/// (`None` when the arguments do not select it), stdout and stderr.
+fn run_mode(
+    words: &[&str],
+    drop_to: &mut dyn FnMut(u32, u32) -> Result<(), String>,
+) -> (Option<i32>, String, String) {
     let mut args: Vec<OsString> = vec!["kbf-daemon".into()];
-    args.extend(mode.iter().map(OsString::from));
+    args.extend(words.iter().map(OsString::from));
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let code = dispatch(&args, uid, &mut out, &mut err);
+    let code = dispatch(&args, drop_to, &mut out, &mut err);
     (
         code,
         String::from_utf8(out).expect("utf8"),
         String::from_utf8(err).expect("utf8"),
     )
+}
+
+/// `mode` on `dir` as the test's own uid and gid, which the fake drop accepts.
+fn call(mode: &str, dir: &Path) -> (Option<i32>, String, String) {
+    let (uid, gid) = (me_now().to_string(), my_gid().to_string());
+    run_mode(
+        &[ARG, mode, &uid, &gid, &dir.to_string_lossy()],
+        &mut |_, _| Ok(()),
+    )
+}
+
+fn my_gid() -> u32 {
+    rustix::process::getegid().as_raw().max(1)
 }
 
 fn entry_with_files(dir: &TestDir) -> PathBuf {
@@ -295,35 +314,72 @@ fn entry_with_files(dir: &TestDir) -> PathBuf {
 
 #[test]
 fn other_arguments_are_not_the_entry_mode() {
-    assert_eq!(call(&[], 5).0, None);
-    assert_eq!(call(&["--help"], 5).0, None);
-    assert_eq!(call(&["__as-user"], 5).0, None);
+    let no_drop = &mut |_, _| panic!("dropped");
+    assert_eq!(run_mode(&[], no_drop).0, None);
+    assert_eq!(run_mode(&["--help"], no_drop).0, None);
+    assert_eq!(run_mode(&["__as-user"], no_drop).0, None);
 }
 
 #[test]
-fn the_entry_mode_refuses_root_and_bad_arguments() {
-    let (code, _, err) = call(&[ARG, EMPTY, "/x"], 0);
-    assert_eq!(
-        (code, err.contains("refusing to run as root")),
-        (Some(2), true)
-    );
-    for bad in [&[ARG][..], &[ARG, EMPTY], &[ARG, EMPTY, "/x", "/y"]] {
-        let (code, _, err) = call(bad, 5);
+fn the_entry_mode_refuses_bad_arguments_before_it_drops_anything() {
+    let no_drop = &mut |_, _| panic!("dropped");
+    for bad in [
+        &[ARG][..],
+        &[ARG, EMPTY, "5", "5"],
+        &[ARG, EMPTY, "5", "5", "/x", "/y"],
+    ] {
+        let (code, _, err) = run_mode(bad, no_drop);
         assert_eq!(
             (code, err.starts_with("usage: ")),
             (Some(2), true),
             "{bad:?}"
         );
     }
-    let (code, _, err) = call(&[ARG, "bogus", "/x"], 5);
+    for ids in [
+        ("0", "20"),
+        ("501", "0"),
+        ("x", "20"),
+        ("501", "-1"),
+        ("", ""),
+    ] {
+        let (code, _, err) = run_mode(&[ARG, EMPTY, ids.0, ids.1, "/x"], no_drop);
+        assert_eq!(
+            (code, err.contains("non-root ids")),
+            (Some(2), true),
+            "{ids:?}"
+        );
+    }
+    let (code, _, err) = run_mode(&[ARG, "bogus", "501", "20", "/x"], no_drop);
     assert_eq!((code, err.contains("no mode")), (Some(2), true));
+}
+
+#[test]
+fn the_entry_mode_drops_to_the_given_ids_and_stops_when_the_drop_fails() {
+    let dir = tree("drop");
+    let entry = entry_with_files(&dir);
+    let mut dropped = Vec::new();
+    let (uid, gid) = (me_now().to_string(), my_gid().to_string());
+    let words = [ARG, LOOK, &uid, &gid, &*entry.to_string_lossy()];
+    let (code, _, _) = run_mode(&words, &mut |u, g| {
+        dropped.push((u, g));
+        Ok(())
+    });
+    assert_eq!((code, dropped), (Some(0), vec![(me_now(), my_gid())]));
+    // A failed drop is 126, and nothing was done to the entry.
+    let words = [ARG, EMPTY, &uid, &gid, &*entry.to_string_lossy()];
+    let (code, _, err) = run_mode(&words, &mut |_, _| Err("setuid: denied".to_owned()));
+    assert_eq!(
+        (code, err.as_str()),
+        (Some(126), "__entry: setuid: denied\n")
+    );
+    assert!(entry.join("stray").exists());
 }
 
 #[test]
 fn the_empty_mode_keeps_the_four_folders_empty_and_removes_the_rest() {
     let dir = tree("empty");
     let entry = entry_with_files(&dir);
-    let (code, _, err) = call(&[ARG, EMPTY, &entry.to_string_lossy()], me_now());
+    let (code, _, err) = call(EMPTY, &entry);
     assert_eq!((code, err.as_str()), (Some(0), ""));
     let mut left: Vec<String> = fs::read_dir(&entry)
         .expect("entry")
@@ -342,7 +398,7 @@ fn the_empty_mode_fails_with_the_path_when_something_cannot_be_removed() {
     let entry = entry_with_files(&dir);
     let locked = entry.join("T").join("deep");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).expect("chmod");
-    let (code, _, err) = call(&[ARG, EMPTY, &entry.to_string_lossy()], me_now());
+    let (code, _, err) = call(EMPTY, &entry);
     // Opens for write; the removal of a file in a read-only directory fails (not as root).
     if rustix::process::geteuid().is_root() {
         return;
@@ -358,7 +414,7 @@ fn the_clear_mode_makes_the_uids_entries_usable() {
     let entry = entry_with_files(&dir);
     let below = entry.join("C").join("deep");
     fs::set_permissions(&below, fs::Permissions::from_mode(0o000)).expect("chmod");
-    let (code, _, err) = call(&[ARG, CLEAR, &entry.to_string_lossy()], me_now());
+    let (code, _, err) = call(CLEAR, &entry);
     assert_eq!((code, err.as_str()), (Some(0), ""));
     let mode = fs::metadata(&below).expect("meta").permissions().mode();
     assert_eq!(mode & 0o700, 0o700);
@@ -368,15 +424,15 @@ fn the_clear_mode_makes_the_uids_entries_usable() {
 fn the_look_mode_prints_what_is_left_and_nothing_when_clean() {
     let dir = tree("look");
     let entry = entry_with_files(&dir);
-    let (code, out, err) = call(&[ARG, LOOK, &entry.to_string_lossy()], me_now());
+    let (code, out, err) = call(LOOK, &entry);
     assert_eq!((code, err.as_str()), (Some(0), ""));
     let shown = |name: &str| out.lines().filter(|l| l.contains(name)).count();
     assert_eq!(shown("stray"), 1, "{out}");
     for folder in ["0", "C", "T", "X"] {
         assert_eq!(shown(&format!("{folder}: [")), 1, "{folder}: {out}");
     }
-    call(&[ARG, EMPTY, &entry.to_string_lossy()], me_now());
-    let (code, out, _) = call(&[ARG, LOOK, &entry.to_string_lossy()], me_now());
+    call(EMPTY, &entry);
+    let (code, out, _) = call(LOOK, &entry);
     assert_eq!((code, out.as_str()), (Some(0), ""));
 }
 
@@ -384,14 +440,14 @@ fn the_look_mode_prints_what_is_left_and_nothing_when_clean() {
 fn the_look_mode_fails_when_it_cannot_list_the_entry_or_one_of_its_folders() {
     let dir = tree("look-fails");
     let missing = dir.path().join("missing");
-    let (code, out, err) = call(&[ARG, LOOK, &missing.to_string_lossy()], me_now());
+    let (code, out, err) = call(LOOK, &missing);
     assert_eq!((code, out.as_str()), (Some(1), ""));
     assert!(err.contains(&*missing.to_string_lossy()), "{err}");
     // A folder that is a file cannot be listed: seen as a failure, never as empty.
     let entry = dir.path().join("entry");
     fs::create_dir_all(&entry).expect("entry");
     fs::write(entry.join("T"), "x").expect("file");
-    let (code, _, err) = call(&[ARG, LOOK, &entry.to_string_lossy()], me_now());
+    let (code, _, err) = call(LOOK, &entry);
     assert_eq!(code, Some(1));
     assert!(err.contains("entry/T"), "{err}");
 }

@@ -4,11 +4,12 @@
 //! cannot clear the flags or the ACLs of the entry's `0`, `C`, `T` and `X`, nor list
 //! them: the system protects a user's temporary and cache folders from a process that
 //! is not the user's own. The user itself can do all of it to the files it owns. So the
-//! entry is cleaned by a child that drops to the slot's uid and gid first
-//! (`__as-user`, [`crate::slots::AS_USER_ARG`]: `setgroups`, `setgid`, `setuid`, in that
-//! order) and then runs, from this binary, one of the modes below, or `find` for the
-//! ACLs. Nothing here runs a shell, and root applies no flag or ACL change to the
-//! entry.
+//! entry is cleaned by a child that drops to the slot's uid and gid (`setgroups`,
+//! `setgid`, `setuid`, in that order) and then runs one of the modes below, or `find`
+//! for the ACLs. The modes drop **in the process that is already running**, so the
+//! pool user never has to be able to execute the daemon's binary; `find` goes through
+//! `__as-user` ([`crate::slots::AS_USER_ARG`]) and a system tool. Nothing here runs a
+//! shell, and root applies no flag or ACL change to the entry.
 //!
 //! - [`clear_flags`] (C6): the user flags and the owner's mode of the entry root and
 //!   everything the uid owns below it ([`CLEAR`]), then the ACLs of the uid's entries
@@ -30,7 +31,8 @@ use kbf_mac_session::sweep;
 
 use super::probe::SKELETON;
 
-/// The argument after argv0 that selects this binary's entry mode.
+/// The argument after argv0 that selects this binary's entry mode:
+/// `__entry <mode> <uid> <gid> <dir>`.
 pub const ARG: &str = "__entry";
 /// The mode that clears the flags and modes below the entry: `__entry clear <dir>`.
 pub const CLEAR: &str = "clear";
@@ -38,6 +40,8 @@ pub const CLEAR: &str = "clear";
 pub const EMPTY: &str = "empty";
 /// The mode that prints what is left in the entry: `__entry look <dir>`.
 pub const LOOK: &str = "look";
+
+const USAGE: &str = "usage: __entry clear|empty|look <uid> <gid> <dir>";
 
 const FIND: &str = "/usr/bin/find";
 const CHMOD: &str = "/bin/chmod";
@@ -69,10 +73,16 @@ impl AsUid<'_> {
         all
     }
 
-    /// This binary's entry `mode` on `dir`, as the uid.
+    /// This binary's entry `mode` on `dir`, which drops to the uid itself.
     fn mode(&self, mode: &str, dir: &Path, run: &mut Run<'_>) -> Result<String, String> {
-        let args = [ARG.into(), mode.into(), dir.as_os_str().to_owned()];
-        run(self.program, &self.launch(self.program.as_os_str(), &args))
+        let args = [
+            ARG.into(),
+            mode.into(),
+            self.uid.to_string().into(),
+            self.gid.to_string().into(),
+            dir.as_os_str().to_owned(),
+        ];
+        run(self.program, &args)
     }
 }
 
@@ -183,36 +193,45 @@ fn named(folders: &Path, failed: Vec<String>) -> Result<(), String> {
     Err(format!("{}: {}", folders.display(), failed.join("; ")))
 }
 
-/// The entry mode for `args` (the program's own, argv0 first), run as `uid`: its exit
-/// code when they select it. Errors go to `err`, what [`LOOK`] finds to `out`. Refuses
-/// to run as root, which could not do what the mode is for and would do it with
-/// powers the entry's owner does not have.
+/// The entry mode for `args` (the program's own, argv0 first): its exit code when they
+/// select it. It drops to the uid and gid it is given with `drop_to` (which checks the
+/// ids it ends with), then runs the mode. Errors go to `err`, what [`LOOK`] finds to
+/// `out`. Refuses root as the target: the mode exists to do what the pool user can.
+/// Exits 2 for arguments it cannot read, 126 when the drop fails.
 pub(crate) fn dispatch(
     args: &[OsString],
-    uid: u32,
+    drop_to: &mut dyn FnMut(u32, u32) -> Result<(), String>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Option<i32> {
     if args.get(1).is_none_or(|a| a != ARG) {
         return None;
     }
-    let (Some(mode), Some(dir), None) = (args.get(2), args.get(3), args.get(4)) else {
-        let _ = writeln!(err, "usage: {ARG} {CLEAR}|{EMPTY}|{LOOK} <dir>");
+    let [_, _, mode, uid, gid, dir] = args else {
+        let _ = writeln!(err, "{USAGE}");
         return Some(2);
     };
-    if uid == 0 {
-        let _ = writeln!(err, "{ARG}: refusing to run as root");
+    let id = |text: &OsString| text.to_str().and_then(|t| t.parse::<u32>().ok());
+    let (Some(uid), Some(gid)) = (id(uid).filter(|n| *n != 0), id(gid).filter(|n| *n != 0)) else {
+        let _ = writeln!(err, "{USAGE}: the ids are not non-root ids");
         return Some(2);
-    }
-    let dir = Path::new(dir);
-    let swept = match mode.to_str() {
-        Some(CLEAR) => sweep::clear_flags(dir, uid),
-        Some(EMPTY) => sweep::empty_keeping(dir, uid, &SKELETON),
-        Some(LOOK) => return Some(look(dir, out, err)),
+    };
+    let mode = match mode.to_str() {
+        Some(mode @ (CLEAR | EMPTY | LOOK)) => mode,
         _ => {
             let _ = writeln!(err, "{ARG}: no mode {mode:?}");
             return Some(2);
         }
+    };
+    if let Err(why) = drop_to(uid, gid) {
+        let _ = writeln!(err, "{ARG}: {why}");
+        return Some(126);
+    }
+    let dir = Path::new(dir);
+    let swept = match mode {
+        CLEAR => sweep::clear_flags(dir, uid),
+        EMPTY => sweep::empty_keeping(dir, uid, &SKELETON),
+        _ => return Some(look(dir, out, err)),
     };
     for error in &swept.errors {
         let _ = writeln!(err, "{error}");

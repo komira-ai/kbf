@@ -532,11 +532,27 @@ fn canary_exit(args: &[std::ffi::OsString]) -> Option<i32> {
     canary::dispatch(args, &canary::RealFs, &mut std::io::stdout())
 }
 
-/// The `/var/folders` entry mode ([`entry::ARG`]) for `args`, run as this process's uid:
-/// its exit code when they select it.
+/// The `/var/folders` entry mode ([`entry::ARG`]) for `args`: its exit code when they
+/// select it. It drops to the pool user inside this process.
 fn entry_exit(args: &[std::ffi::OsString]) -> Option<i32> {
-    let uid = rustix::process::getuid().as_raw();
-    entry::dispatch(args, uid, &mut std::io::stdout(), &mut std::io::stderr())
+    entry::dispatch(
+        args,
+        &mut drop_to_pool_user,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )
+}
+
+/// Drops this process to the pool user `uid`:`gid`, with no supplementary groups.
+#[cfg(target_os = "macos")]
+fn drop_to_pool_user(uid: u32, gid: u32) -> Result<(), String> {
+    kbf_mac_session::macos::gui::drop_to(uid, gid)
+}
+
+/// Drops this process to the pool user: only macOS has pool users.
+#[cfg(not(target_os = "macos"))]
+fn drop_to_pool_user(_uid: u32, _gid: u32) -> Result<(), String> {
+    Err("pool users exist on macOS only".to_owned())
 }
 
 /// [`dispatch`] for a test binary, which has no `main` of its own: when the arguments
