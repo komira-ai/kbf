@@ -1,8 +1,9 @@
 # The binaries nodes and servers run, the deploy tool, and the installer that puts them on
 # a host, built once per commit (docs/artifacts.md): kbf (all five modes, `kbf --version
 # --json` says what it is), kbf-daemon, kbf-server, kbf-deploy and kbf-installer for
-# linux-x86_64 and linux-arm64, and kbf, kbf-deploy, kbf-installer, kbf-host-install and kbf-updater for darwin-arm64
-# (each signed ad hoc with the hardened runtime; a Mac runs `kbf daemon`). Each comes as a
+# linux-x86_64 and linux-arm64, and kbf, kbf-deploy, kbf-installer, kbf-host-install and
+# kbf-updater for darwin-arm64 (each signed ad hoc with the hardened runtime; a Mac runs
+# `kbf daemon`). Each comes as a
 # tarball with a CycloneDX SBOM; one SHA256SUMS covers a commit's files. The kbf of each
 # platform also comes with `kbf-<commit>-<platform>.version.json`, the exact bytes its
 # `--version --json` printed on the runner that built it (only a runner of the platform can

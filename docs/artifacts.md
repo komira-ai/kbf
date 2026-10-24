@@ -35,7 +35,7 @@ by `crates/kbf-integration-test/tests/release_artifacts`.
 
 ## What is built
 
-Thirteen tarballs, each with its SBOM and (once the push is attested) its provenance bundle
+19 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), two Debian packages of
 `kbf-installer` ([below](#the-kbf-installer-package-deb)), two of `kbf`
 ([below](#the-kbf-package-deb)) and one macOS package of `kbf-installer`

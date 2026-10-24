@@ -836,6 +836,7 @@ fn the_docs_describe_the_release_set() {
     // builds (the doc is what an operator verifies against), or no longer saying that
     // pushes to the development branch are attested, what `--version --json` is, and
     // how a tarball is verified offline with its bundle.
+    // Also catches a tarball count in the doc that is not the size of `ASSETS`.
     let doc = std::fs::read_to_string(super::repo_root().join("docs/artifacts.md"))
         .expect("docs/artifacts.md");
     let mut missing = Vec::new();
@@ -844,6 +845,10 @@ fn the_docs_describe_the_release_set() {
         if !doc.contains(&file) {
             missing.push(format!("docs/artifacts.md does not list {file}"));
         }
+    }
+    let count = format!("\n{} tarballs, each", ASSETS.len());
+    if !doc.contains(&count) {
+        missing.push(format!("docs/artifacts.md does not open its list with `{}`: the count of tarballs is not the size of the release set", count.trim()));
     }
     for platform in PACKAGES {
         for file in [
