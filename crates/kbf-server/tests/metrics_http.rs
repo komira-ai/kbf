@@ -55,7 +55,6 @@ fn start_with(local: Option<Arc<LocalCache>>) -> (SocketAddr, SocketAddr) {
         listen: loopback(),
         token: None,
         local_cache: local,
-        releases: None,
     };
     let cache = Arc::new(Cache::memory());
     let bound =

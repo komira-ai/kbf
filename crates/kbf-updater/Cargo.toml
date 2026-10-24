@@ -15,6 +15,7 @@ publish.workspace = true
 # (`daemon`). Synchronous on purpose, threads and blocking sockets, no async runtime: HTTP is
 # read with httparse, which the workspace already uses for its loopback calls.
 [dependencies]
+kbf-types.workspace = true
 httparse.workspace = true
 libc.workspace = true
 serde.workspace = true

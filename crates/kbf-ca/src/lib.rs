@@ -13,6 +13,8 @@
 //! - [`Authority`]: builds the one certificate shape of the design's table, for a node
 //!   ([`Authority::issue_node`]) or for the frontend itself ([`Authority::issue_frontend`],
 //!   a separate function: the role type a token grants has no frontend variant).
+//!   The update coordinator's certificate and each host updater's are separate functions too
+//!   ([`Authority::issue_coordinator`], [`Authority::issue_updater`]).
 //! - [`Bundle`] and [`Rotation`]: the PEM bundle every trust surface reads and the
 //!   staged replacement of the root, cross-signed so a node holding only the old pin
 //!   still verifies.
@@ -34,7 +36,7 @@ mod serial;
 mod signer;
 pub mod verify_cert;
 
-pub use authority::{Authority, Issued, NodeCert, Rotation};
+pub use authority::{Authority, Issued, NodeCert, Rotation, UpdaterCert};
 pub use bundle::Bundle;
 pub use csr::{ISSUED_AT_OID, MAX_CSR_LEN, ParsedCsr, parse_csr};
 pub use entropy::{Entropy, SystemEntropy};
