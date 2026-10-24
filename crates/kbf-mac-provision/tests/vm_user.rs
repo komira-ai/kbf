@@ -793,3 +793,164 @@ fn a_check_that_cannot_read_the_password_file_does_not_fail_auto_login() {
     );
     mac.chmod(VM_PASSWORD_FILE, 0o400);
 }
+
+/// Catches: a password file passed for being the right length alone: 64 characters that
+/// are not lower-case hex digits, or bytes that are not text.
+#[test]
+fn a_password_file_must_be_64_lower_case_hex_digits() {
+    for (name, bytes) in [
+        ("letters", "z".repeat(64).into_bytes()),
+        ("upper", "A".repeat(64).into_bytes()),
+        ("binary", vec![0xff; 64]),
+    ] {
+        let mac = FakeMac::converged_vm(&format!("vm-bad-file-{name}"), false);
+        mac.chmod(VM_PASSWORD_FILE, 0o600);
+        mac.write_bytes(VM_PASSWORD_FILE, &bytes);
+        mac.chmod(VM_PASSWORD_FILE, 0o400);
+        only_fails(&mac, "vm_user_uid", "does not hold 64 hex digits");
+    }
+}
+
+/// Catches: an unreadable directory taken for a Mac with no VM user, or a fix that
+/// goes on with nothing read: check and apply both say so, and apply changes nothing.
+#[test]
+fn a_directory_that_cannot_be_read_is_said_and_nothing_is_changed() {
+    let mac = without_user("vm-no-directory");
+    mac.state.borrow_mut().readall_fails = true;
+    let r = check_keys(&mac, Some("vm_user_uid"));
+    assert!(
+        r.text
+            .contains("FAIL vm_user_uid: could not read the directory"),
+        "{}",
+        r.text
+    );
+    let r = apply_keys(&mac, Some("vm_user_uid"));
+    assert!(
+        r.text
+            .contains("NOTE vm_user_uid: could not read the directory"),
+        "{}",
+        r.text
+    );
+    assert_eq!(mac.writes(), Vec::<String>::new());
+    assert!(!mac.path(VM_PASSWORD_FILE).exists());
+}
+
+/// Catches: a refused password removing a file that was not made in that run (it
+/// is the password of an account that already has one): the file stays, and the
+/// message does not say it was removed.
+#[test]
+fn a_refused_password_leaves_a_file_made_earlier() {
+    let mut mac = FakeMac::converged_vm("vm-refused-kept", false);
+    mac.state_mut()
+        .records
+        .get_mut(VM_HOME)
+        .unwrap()
+        .retain(|(a, _)| a != "AuthenticationAuthority");
+    mac.state.borrow_mut().stdin_rejects = vec!["passwd".into()];
+    let r = apply(&mac);
+    assert!(
+        r.text
+            .contains("NOTE vm_user_uid: dscl did not set the password of kbf-vm\n"),
+        "{}",
+        r.text
+    );
+    assert_eq!(password_file(&mac), VM_PASSWORD);
+}
+
+/// Catches: `/etc/kcpassword` read through a link (the password file of the check
+/// would be whatever the link names), or a link left in place by `apply`, which writes
+/// a file of its own over it and never touches what the link names.
+#[test]
+fn a_kcpassword_that_is_a_link_is_refused_and_replaced() {
+    let mac = FakeMac::converged_vm("vm-kcpassword-link", true);
+    mac.remove(KCPASSWORD);
+    mac.write_bytes("/etc/elsewhere", &kcpassword_of(VM_PASSWORD));
+    mac.symlink(&mac.path("/etc/elsewhere"), KCPASSWORD);
+    only_fails(
+        &mac,
+        "autologin",
+        "/etc/kcpassword is missing or not a file",
+    );
+    let r = apply(&mac);
+    assert_eq!(r.failed, 0, "{}", r.text);
+    assert_eq!(ls(&mac, KCPASSWORD), "-rw------- 0 0");
+    assert_eq!(
+        fs::read(mac.path(KCPASSWORD)).unwrap(),
+        kcpassword_of(VM_PASSWORD)
+    );
+    assert_eq!(
+        fs::read(mac.path("/etc/elsewhere")).unwrap(),
+        kcpassword_of(VM_PASSWORD)
+    );
+}
+
+/// Catches: a wrong `/etc/kcpassword` with auto-login already naming the VM user
+/// rewriting the setting too (a second restart-worthy change), or not fixing the file.
+#[test]
+fn a_wrong_kcpassword_is_rewritten_and_the_setting_left_alone() {
+    let mac = FakeMac::converged_vm("vm-kcpassword-wrong", true);
+    mac.write_bytes(KCPASSWORD, &kcpassword_of("another password"));
+    let r = apply(&mac);
+    assert_eq!(
+        (r.failed, r.text.as_str()),
+        (
+            0,
+            "CHANGE autologin: wrote /etc/kcpassword for kbf-vm (mode 600)\n"
+        )
+    );
+    assert_eq!(
+        fs::read(mac.path(KCPASSWORD)).unwrap(),
+        kcpassword_of(VM_PASSWORD)
+    );
+    assert!(calls(&mac, "defaults write").is_empty());
+}
+
+/// Catches: a password file that is a link (or anything but a regular file) read as
+/// a password when auto-login compares `/etc/kcpassword` with it.
+#[test]
+fn auto_login_does_not_read_a_password_file_that_is_a_link() {
+    let mut mac = FakeMac::converged_vm("vm-password-link", false);
+    mac.converge_vm_autologin();
+    mac.remove(VM_PASSWORD_FILE);
+    mac.write_bytes("/var/db/elsewhere", VM_PASSWORD.as_bytes());
+    mac.symlink(&mac.path("/var/db/elsewhere"), VM_PASSWORD_FILE);
+    let r = check(&mac);
+    assert!(
+        r.text.contains("FAIL autologin: auto-login is kbf-vm, but /var/db/kbf-mac-session/vm-user-password holds no valid password"),
+        "{}",
+        r.text
+    );
+}
+
+/// Catches: a record named `kbf-vm` that a run stopped half-way through (it has no
+/// uid yet) refused as someone else's, when it is this item's own and is finished.
+#[test]
+fn a_half_made_record_is_finished_not_refused() {
+    let mut mac = without_user("vm-half-record");
+    mac.state_mut().user_attr("kbf-vm", "IsHidden", "1");
+    let r = apply(&mac);
+    assert_eq!(r.failed, 0, "{}", r.text);
+    assert!(
+        r.text.contains("CHANGE vm_user_uid: user kbf-vm, uid 460"),
+        "{}",
+        r.text
+    );
+    assert_eq!(mac.state.borrow().passwords[VM_HOME], password_file(&mac));
+}
+
+/// Catches: a `/etc/kcpassword` that is right being written again when only the
+/// setting is missing.
+#[test]
+fn only_the_setting_is_written_when_kcpassword_is_right() {
+    let mut mac = FakeMac::converged_vm("vm-setting-only", true);
+    mac.clear_auto_login();
+    let r = apply(&mac);
+    assert_eq!(
+        (r.failed, r.text.as_str()),
+        (
+            0,
+            "CHANGE autologin: auto-login is kbf-vm (from the next login window; nothing is restarted)\n"
+        )
+    );
+    assert!(calls(&mac, "write /etc/kcpassword").is_empty());
+}

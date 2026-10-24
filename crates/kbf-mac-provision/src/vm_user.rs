@@ -261,9 +261,8 @@ fn password(c: &Ctx<'_>, out: &mut Lines) -> io::Result<(String, bool)> {
 /// `dscl` refuses it, a file made in this run is removed, so the next run makes
 /// another. An account that has a password and a valid file keeps its password.
 pub(crate) fn fix_vm_user(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
-    let Some(uid) = c.profile.vm_user_uid else {
-        return Ok(());
-    };
+    // `apply` fixes only an item that fails, and this one passes while the key is unset.
+    let uid = c.profile.vm_user_uid.unwrap_or_default();
     let dir = Directory::read(c).map_err(io::Error::other)?;
     if let Some(why) = foreign(&dir, uid) {
         return Err(io::Error::other(format!("{why}: {VM_USER} not changed")));
@@ -373,9 +372,8 @@ pub(crate) fn autologin_vm(c: &Ctx<'_>, uid: &str) -> Option<Outcome> {
 /// there is no valid password file. Takes effect at the next login window: nothing is
 /// restarted.
 pub(crate) fn fix_enable_autologin(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
-    let Some(uid) = c.profile.vm_user_uid else {
-        return Err(io::Error::other("the profile has no vm_user_uid"));
-    };
+    // A profile with `autologin=vm` has a `vm_user_uid` (the profile is refused otherwise).
+    let uid = c.profile.vm_user_uid.unwrap_or_default();
     let status = c.mac.out(crate::items::FDESETUP, &["status"]);
     if status.lines().next() != Some("FileVault is Off.") {
         return Err(io::Error::other(format!(
