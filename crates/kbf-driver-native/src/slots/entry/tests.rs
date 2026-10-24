@@ -543,10 +543,17 @@ fn the_clear_mode_leaves_the_entry_and_its_four_folders_as_the_system_has_them()
 
 fn restore_in(entry: &Path, uid: u32) -> (usize, Vec<String>, Vec<PathBuf>) {
     let mut changed = Vec::new();
-    let swept = restore_folders(entry, uid, &mut |path| {
-        changed.push(path.to_owned());
-        Ok(())
-    });
+    let swept = restore_folders(
+        entry,
+        uid,
+        (
+            &mut |path| {
+                changed.push(path.to_owned());
+                Ok(())
+            },
+            &mut |_| Ok(()),
+        ),
+    );
     (changed.len(), swept.errors, changed)
 }
 
@@ -587,7 +594,7 @@ fn the_restore_skips_a_missing_folder_and_fails_on_a_file_or_a_refused_change() 
     fs::write(entry.join("C"), "x").expect("file");
     fs::set_permissions(entry.join("T"), fs::Permissions::from_mode(0o755)).expect("chmod");
     let mut refuse = |_: &Path| Err(std::io::Error::from_raw_os_error(1));
-    let swept = restore_folders(&entry, me_now(), &mut refuse);
+    let swept = restore_folders(&entry, me_now(), (&mut refuse, &mut |_| Ok(())));
     assert_eq!(swept.errors.len(), 2, "{:?}", swept.errors);
     assert!(
         swept.errors[0].contains("C: not a directory"),
@@ -598,7 +605,7 @@ fn the_restore_skips_a_missing_folder_and_fails_on_a_file_or_a_refused_change() 
     // The entry itself is not a directory: the folders under it cannot be looked at.
     let file = dir.path().join("file");
     fs::write(&file, "x").expect("file");
-    let swept = restore_folders(&file, me_now(), &mut refuse);
+    let swept = restore_folders(&file, me_now(), (&mut refuse, &mut |_| Ok(())));
     assert_eq!(swept.errors.len(), 4, "{:?}", swept.errors);
 }
 
@@ -694,4 +701,80 @@ fn the_restore_takes_an_attribute_off_a_folder() {
     assert!(strip_xattrs(bad).is_err());
     // A path that is not there lists nothing and is no error to the caller's walk.
     assert!(strip_xattrs(&entry.join("absent")).is_err());
+}
+
+#[test]
+fn a_refused_strip_of_a_folder_fails_the_restore_naming_it() {
+    let dir = tree("restore-strip");
+    let entry = entry_with_files(&dir);
+    let swept = restore_folders(
+        &entry,
+        me_now(),
+        (&mut |_| Ok(()), &mut |_| {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        }),
+    );
+    assert_eq!(swept.errors.len(), 4, "{:?}", swept.errors);
+    assert!(swept.errors[0].starts_with(&*entry.join("0").to_string_lossy()));
+}
+
+#[test]
+fn the_strip_removes_each_listed_attribute_and_leaves_what_the_system_protects() {
+    // Two names listed; the first is protected, the second goes.
+    let mut removed = Vec::new();
+    let mut list = |buf: Option<&mut [u8]>| match buf {
+        None => Ok(7),
+        Some(buf) => {
+            buf.copy_from_slice(b"a\0b\0\0c\0");
+            Ok(7)
+        }
+    };
+    let mut remove = |name: &std::ffi::CStr| {
+        removed.push(name.to_string_lossy().into_owned());
+        if name.to_bytes() == b"a" {
+            Err(libc::EPERM)
+        } else {
+            Ok(())
+        }
+    };
+    strip_with(&mut list, &mut remove).expect("protected is left");
+    assert_eq!(removed, ["a", "b", "c"]);
+    // Any other refusal of a removal fails.
+    let mut list = |buf: Option<&mut [u8]>| match buf {
+        None => Ok(2),
+        Some(buf) => {
+            buf.copy_from_slice(b"a\0");
+            Ok(2)
+        }
+    };
+    let err = strip_with(&mut list, &mut |_| Err(libc::EIO)).expect_err("fails");
+    assert_eq!(err.raw_os_error(), Some(libc::EIO));
+    // A name with no more room than the listing said is cut to what was got.
+    let mut list = |buf: Option<&mut [u8]>| match buf {
+        None => Ok(4),
+        Some(_) => Ok(0),
+    };
+    strip_with(&mut list, &mut |_| panic!("nothing listed")).expect("empty");
+}
+
+#[test]
+fn a_listing_that_fails_is_left_when_protected_and_an_error_otherwise() {
+    for (first_fails, errno, left) in [
+        (true, libc::EPERM, true),
+        (true, libc::EIO, false),
+        (false, libc::EPERM, true),
+        (false, libc::EIO, false),
+    ] {
+        let mut calls = 0;
+        let mut list = |_: Option<&mut [u8]>| {
+            calls += 1;
+            if first_fails || calls == 2 {
+                Err(errno)
+            } else {
+                Ok(1)
+            }
+        };
+        let got = strip_with(&mut list, &mut |_| Ok(()));
+        assert_eq!(got.is_ok(), left, "{first_fails} {errno}");
+    }
 }

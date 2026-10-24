@@ -201,7 +201,7 @@ pub(crate) fn restore(me: &AsUid<'_>, folders: &Path, run: &mut Run<'_>) -> Resu
 fn restore_folders(
     dir: &Path,
     uid: u32,
-    chmod: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+    (chmod, strip): (&mut PathCall<'_>, &mut PathCall<'_>),
 ) -> sweep::Swept {
     use std::os::unix::fs::MetadataExt as _;
     let mut swept = sweep::Swept::default();
@@ -224,7 +224,7 @@ fn restore_folders(
         };
         // What the lease put on the folder; what the system protects stays (it is
         // recorded as the folder's baseline, and the check finds any other that stays).
-        if let Err(why) = strip_xattrs(&path) {
+        if let Err(why) = strip(&path) {
             swept.errors.push(format!("{}: {why}", path.display()));
         }
         let (wrong_owner, wrong_mode) = probe::folder_fix((meta.uid(), meta.mode()), (uid, 0o700));
@@ -240,6 +240,12 @@ fn restore_folders(
     }
     swept
 }
+
+/// A call on a path that can fail.
+type PathCall<'a> = dyn FnMut(&Path) -> std::io::Result<()> + 'a;
+
+/// The listing of extended attributes: a size without a buffer, else the bytes put in it.
+type List<'a> = dyn FnMut(Option<&mut [u8]>) -> Result<usize, i32> + 'a;
 
 /// Whether the error `errno` of taking an extended attribute off a folder or listing them
 /// is one to leave: the attribute went since the listing, or the system protects it from
@@ -259,46 +265,63 @@ fn strip_xattrs(path: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
     let c_path =
         std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
-    #[cfg(target_os = "macos")]
-    let (list, remove) = (
-        |buf: *mut libc::c_char, size| {
-            // SAFETY: `c_path` is NUL-terminated; `buf` is null with size 0 or writable for `size`.
-            unsafe { libc::listxattr(c_path.as_ptr(), buf, size, libc::XATTR_NOFOLLOW) }
-        },
-        |name: *const libc::c_char| {
-            // SAFETY: both strings are NUL-terminated.
-            unsafe { libc::removexattr(c_path.as_ptr(), name, libc::XATTR_NOFOLLOW) }
-        },
-    );
-    #[cfg(not(target_os = "macos"))]
-    let (list, remove) = (
-        |buf: *mut libc::c_char, size| {
-            // SAFETY: `c_path` is NUL-terminated; `buf` is null with size 0 or writable for `size`.
-            unsafe { libc::llistxattr(c_path.as_ptr(), buf, size) }
-        },
-        |name: *const libc::c_char| {
-            // SAFETY: both strings are NUL-terminated.
-            unsafe { libc::lremovexattr(c_path.as_ptr(), name) }
-        },
-    );
-    let leave = |why: std::io::Error| match why.raw_os_error() {
-        Some(errno) if xattr_left(errno) => Ok(()),
-        _ => Err(why),
+    let errno = || {
+        std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
     };
-    let size = list(std::ptr::null_mut(), 0);
-    let Ok(size) = usize::try_from(size) else {
-        return leave(std::io::Error::last_os_error());
+    let mut list = |buf: Option<&mut [u8]>| {
+        let (ptr, size) = buf.map_or((std::ptr::null_mut(), 0), |b| (b.as_mut_ptr(), b.len()));
+        // SAFETY: `c_path` is NUL-terminated; `ptr` is null with size 0, or writable for
+        // `size` bytes.
+        #[cfg(target_os = "macos")]
+        let got =
+            unsafe { libc::listxattr(c_path.as_ptr(), ptr.cast(), size, libc::XATTR_NOFOLLOW) };
+        // SAFETY: as above.
+        #[cfg(not(target_os = "macos"))]
+        let got = unsafe { libc::llistxattr(c_path.as_ptr(), ptr.cast(), size) };
+        usize::try_from(got).map_err(|_| errno())
+    };
+    let mut remove = |name: &std::ffi::CStr| {
+        // SAFETY: both strings are NUL-terminated.
+        #[cfg(target_os = "macos")]
+        let done =
+            unsafe { libc::removexattr(c_path.as_ptr(), name.as_ptr(), libc::XATTR_NOFOLLOW) };
+        // SAFETY: as above.
+        #[cfg(not(target_os = "macos"))]
+        let done = unsafe { libc::lremovexattr(c_path.as_ptr(), name.as_ptr()) };
+        if done == 0 { Ok(()) } else { Err(errno()) }
+    };
+    strip_with(&mut list, &mut remove)
+}
+
+/// What [`strip_xattrs`] does over the two calls: `list` (a size when given no buffer,
+/// else the bytes of the NUL-separated names put in it) and `remove` of one name; each
+/// fails with an errno.
+fn strip_with(
+    list: &mut List<'_>,
+    remove: &mut dyn FnMut(&std::ffi::CStr) -> Result<(), i32>,
+) -> std::io::Result<()> {
+    let leave = |errno: i32| {
+        if xattr_left(errno) {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(errno))
+        }
+    };
+    let size = match list(None) {
+        Ok(size) => size,
+        Err(errno) => return leave(errno),
     };
     let mut names = vec![0_u8; size];
-    let got = list(names.as_mut_ptr().cast(), size);
-    let Ok(got) = usize::try_from(got) else {
-        return leave(std::io::Error::last_os_error());
-    };
-    names.truncate(got);
+    match list(Some(&mut names)) {
+        Ok(got) => names.truncate(got),
+        Err(errno) => return leave(errno),
+    }
     for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
         let name = std::ffi::CString::new(name).map_err(std::io::Error::other)?;
-        if remove(name.as_ptr()) != 0 {
-            leave(std::io::Error::last_os_error())?;
+        if let Err(errno) = remove(&name) {
+            leave(errno)?;
         }
     }
     Ok(())
@@ -374,10 +397,17 @@ pub(crate) fn dispatch(
     let dir = Path::new(dir);
     let swept = match mode {
         CLEAR => sweep::clear_flags_within(dir, uid, &SKELETON),
-        RESTORE => restore_folders(dir, uid, &mut |path| {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-        }),
+        RESTORE => restore_folders(
+            dir,
+            uid,
+            (
+                &mut |path| {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                },
+                &mut strip_xattrs,
+            ),
+        ),
         EMPTY => sweep::empty_keeping(dir, uid, &SKELETON),
         _ => return Some(look(dir, out, err)),
     };
