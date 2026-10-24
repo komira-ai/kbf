@@ -1,4 +1,4 @@
-//! The daemon half of an all-in-one process in the cell (`FakeDaemon::in_process`):
+//! The daemon half of a storage-and-daemon process in the cell (`FakeDaemon::in_process`):
 //! it stores each output before it reports, and dies and starts again with the
 //! server's process. Here, not in the crate's unit tests, so that the build the cell's
 //! sweeps run is the one these inputs reach.

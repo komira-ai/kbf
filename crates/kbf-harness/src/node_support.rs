@@ -84,7 +84,7 @@ pub fn oci_runtime(bin: &Path) -> String {
 /// looks, holding the daemon's unit; the flags that point the daemon at it.
 pub fn cgroup_tree(bin: &Path) -> Vec<String> {
     let root = bin.join("cgroup");
-    let unit = root.join("kbf.slice/kbf-all-in-one.service");
+    let unit = root.join("kbf.slice/kbf-storage-and-daemon.service");
     std::fs::create_dir_all(&unit).expect("mkdir");
     let plant = |path: PathBuf, text: &str| std::fs::write(path, text).expect("plant");
     plant(
@@ -95,7 +95,10 @@ pub fn cgroup_tree(bin: &Path) -> Vec<String> {
     plant(unit.join("cgroup.procs"), "1\n");
     plant(unit.join("cpuset.cpus.effective"), "0\n");
     let own = bin.join("self-cgroup");
-    plant(own.clone(), "0::/kbf.slice/kbf-all-in-one.service\n");
+    plant(
+        own.clone(),
+        "0::/kbf.slice/kbf-storage-and-daemon.service\n",
+    );
     vec![
         format!("--cgroup-root={}", root.display()),
         format!("--self-cgroup={}", own.display()),

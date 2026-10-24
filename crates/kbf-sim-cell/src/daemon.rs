@@ -11,8 +11,8 @@
 //! heartbeat and resent with each, and on every new stream. One run in ten is long. A `Start` is taken only on
 //! the current stream, with contact confirmed, for a lease it does not hold.
 //!
-//! **The daemon half of `kbf all-in-one`** ([`FakeDaemon::in_process`]) shares the
-//! server's process. Its run stores the action's output ([`output_of`]) in the server
+//! **The daemon half of `kbf storage-and-daemon`** ([`FakeDaemon::in_process`]) shares
+//! the server's process (the cell's server holds the store and the log). Its run stores the action's output ([`output_of`]) in the server
 //! before it reports, and its result names that output: it reports a run only once the
 //! server has acknowledged the output's upload. The process dies with the server's
 //! ([`FakeDaemon::die`]: every run, staged output and unacknowledged result is lost)
@@ -77,7 +77,7 @@ pub struct FakeDaemon {
     unacked: BTreeMap<LeaseId, (Digest, Outcome)>,
     /// Every lease this daemon has reported a result for.
     reported: BTreeSet<LeaseId>,
-    /// The half of an all-in-one process: it stores each run's output first.
+    /// The half of a storage-and-daemon process: it stores each run's output first.
     in_process: bool,
     /// The in-process half's finished runs whose output upload is not acknowledged.
     staging: BTreeMap<LeaseId, Staging>,
@@ -128,7 +128,7 @@ impl FakeDaemon {
         }
     }
 
-    /// The daemon half of an all-in-one process whose server half is `server`: its
+    /// The daemon half of a storage-and-daemon process whose store is `server`: its
     /// instance is `<name>-<incarnation>`.
     #[must_use]
     pub fn in_process(server: NodeId, name: &str, capacity: Resources) -> Self {
