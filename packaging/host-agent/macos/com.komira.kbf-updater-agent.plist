@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  kbf-updater in its agent mode on a Mac (docs/design/updates.md): an unprivileged updater that
+  heartbeats to the coordinator over mutual TLS and runs this host's update through the local
+  socket of com.komira.kbf-host-install-local. It listens on nothing. The certificate, key and CA
+  are files an operator placed (enrollment is a later step). The drain of the node and its health
+  go to the frontend's loopback operator API with the operator token: no scoped credential exists
+  yet (docs/api.md plans the roles), so the token file is the full operator token. Edit the
+  values to the farm's.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.komira.kbf-updater-agent</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/libexec/kbf/kbf-updater</string>
+		<string>agent</string>
+		<string>--coordinator</string>
+		<string>coordinator.farm.example:8443</string>
+		<string>--client-cert</string>
+		<string>/usr/local/etc/kbf/updater/cert.pem</string>
+		<string>--client-key</string>
+		<string>/usr/local/etc/kbf/updater/key.pem</string>
+		<string>--ca</string>
+		<string>/usr/local/etc/kbf/updater/ca.pem</string>
+		<string>--channel</string>
+		<string>stable</string>
+		<string>--operator-api</string>
+		<string>http://127.0.0.1:18002</string>
+		<string>--token-file</string>
+		<string>/usr/local/etc/kbf/updater/operator-token</string>
+		<string>--helper-socket</string>
+		<string>/var/db/kbf-host-install/local.sock</string>
+	</array>
+	<key>UserName</key>
+	<string>_kbf-updater</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>StandardOutPath</key>
+	<string>/Library/Logs/kbf-updater/agent.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Library/Logs/kbf-updater/agent.err.log</string>
+</dict>
+</plist>

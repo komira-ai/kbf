@@ -1,0 +1,38 @@
+# kbf-host-install's local socket: the root half of this host's update agent
+# (docs/design/updates.md, section 4; docs/deploy/host-install.md). It binds a unix socket that
+# only the account of kbf-updater-agent.service can connect to, stages a release beside the one
+# that runs, switches to it on trial, and goes back to the one that ran when nobody confirms
+# the new one by its deadline. The ssh forced command of the same program is not this unit and
+# is unchanged.
+#
+# Not part of a package yet: an operator places it with the binaries (host-install.md, "Getting
+# the binary") and edits the --restart-unit lines to the units this host runs from
+# /var/lib/kbf-installer/releases/current (one --restart-unit each). The unit is named so
+# that it is not one of the transient `kbf-host-install-<version>.service` units the ssh path
+# lists.
+[Unit]
+Description=kbf-host-install, the local socket of this host's update agent
+Documentation=https://github.com/komira-ai/kbf/blob/main/docs/deploy/host-install.md
+After=local-fs.target
+
+[Service]
+Type=simple
+# Root, on purpose: it moves releases under /var/lib/kbf-installer and restarts units. The
+# socket is the access control: mode 0600, owned by the one account named here.
+User=root
+ExecStart=/usr/libexec/kbf/kbf-host-install --serve --socket /run/kbf-host-install/local.sock --socket-user kbf-updater --window-secs 600 --restart-unit kbf-daemon.service
+# systemd makes /run/kbf-host-install (root's, 0755) and its state directory.
+RuntimeDirectory=kbf-host-install
+RuntimeDirectoryMode=0755
+StateDirectory=kbf-host-install
+StateDirectoryMode=0700
+# A pending release is on disk, so a restart of this program, like a reboot, finds it and goes
+# back at once if its deadline has passed.
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

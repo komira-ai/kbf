@@ -26,6 +26,7 @@ pub mod core;
 pub mod production;
 pub mod request;
 pub mod serve;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub mod units;
 
 #[cfg(target_os = "linux")]

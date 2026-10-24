@@ -124,6 +124,7 @@ impl ServeConfig {
 }
 
 /// The ids of the account `name` in the text of a passwd file.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn passwd_ids(passwd: &str, name: &str) -> Option<(u32, u32)> {
     passwd.lines().find_map(|line| {
         let mut fields = line.split(':');

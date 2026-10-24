@@ -119,3 +119,81 @@ A `roll.json` written by an earlier build, which has none of the phases `drainin
 The other way does not hold: an earlier build does not know these phases and refuses to start on
 a `roll.json` that holds one, so finish or abort a roll that is in a member's turn before
 downgrading the updater.
+
+## The agent mode
+
+`kbf-updater agent` is the other mode of this program, and the one the maintainers' design
+([../design/updates.md](../design/updates.md)) ends on: an unprivileged updater on every host that
+dials the coordinator and owns that host's update. The roll mode above is unchanged and keeps
+working (until the roll and its ssh path are deleted, in the last step of that design).
+
+```text
+kbf-updater agent --coordinator <dns name>:<port> --client-cert FILE --client-key FILE --ca FILE
+                  --channel NAME --operator-api http://IP:PORT --token-file FILE
+                  [--operator-proxy-auth-file FILE] [--helper-socket PATH]
+                  [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
+                  [--health-poll-secs N] [--retry-secs N]
+```
+
+- `--coordinator`: a DNS name and a port. The coordinator's certificate must chain to `--ca` for
+  that name and have the role `coordinator`; that is checked after the handshake and before
+  anything is sent.
+- `--client-cert`, `--client-key`, `--ca`: files an operator placed (enrollment, the one-time
+  token and the certificate it gets, is a later step). The certificate is the farm CA's `updater`
+  certificate: its one DNS name is this node's id and its `urn:kbf:host-role:` is what the host
+  runs (`storage`, `daemon` or `mac-daemon`; a `frontend` is refused, the roll updates frontends).
+  The agent reads both from it. The files are read for every heartbeat, so a renewed pair is used
+  from the next one.
+- `--channel`: the channel of the helper's allowlist. The version the coordinator names is looked
+  up in it by the helper, never fetched by URL.
+- `--helper-socket`: the socket of `kbf-host-install --serve` (default
+  `/run/kbf-host-install/local.sock`; [host-install.md](host-install.md#the-local-socket)).
+- `--operator-api`, `--token-file`, `--operator-proxy-auth-file`: see the boundary below.
+- Times, in seconds, 1 to 86400: `--heartbeat-secs` 15, `--drain-deadline-secs` 600,
+  `--health-timeout-secs` 300, `--health-poll-secs` 5, `--retry-secs` 900.
+
+### The heartbeat
+
+A POST of `{"platform", "version", "health", "last_update", "updating"}` to `/v1/heartbeat`, at
+start and every `--heartbeat-secs`, on a thread of its own, so that it goes on through a whole A/B
+(a host that is silent for 45 seconds counts as down). `version` is the version text the host's
+helper knows for the release that runs; for a release placed by hand it is
+`0.1.0+g<12 hex digits>`, which names the commit and nothing else, and an update to the same commit
+teaches the helper the text. `health` is the node's health check against the running version.
+`updating` is the target while an A/B runs; `last_update` is how the last one ended. **The node id
+and the role are in no field**: the coordinator reads them from the certificate.
+
+### One A/B
+
+On a reply of `update to X` (and only X is used from it), in this order, each step only if the one
+before it worked:
+
+1. **Fetch and verify** through the helper (`install`): the release is fetched on the host and
+   checked there. An unattested build, one of another commit, or one the channel does not have is
+   refused here, and the node has not been touched.
+2. **Drain** the node at the frontend (`:drain` of the operator API, as the roll mode does for a
+   daemon host; a storage host is never drained) and wait for its leases, for at most
+   `--drain-deadline-secs`.
+3. **Switch** (`switch`): the helper puts X on trial and restarts the units.
+4. **Health**: the node's health check (`node_health`: a storage member is `active` on the build, a daemon is connected on it) of X, held drained, for
+   at most `--health-timeout-secs`, and never past the helper's deadline less ten seconds.
+5. **Confirm** X if it is healthy. If it is not, **revert**: the helper does that by itself at its
+   deadline whatever this process is doing; the agent asks for it at once.
+6. **Undrain** only if the node is healthy: on X after a confirm, or on the release that ran
+   after a revert. A node that is not healthy stays drained.
+
+The result goes in the next heartbeat. A restart of the agent in the middle finds the helper's
+pending marker (`query`) and finishes the trial from step 4; nothing is fetched, drained or
+switched twice. A target that failed is not tried again before `--retry-secs`, however often
+the coordinator names it.
+
+### The boundary
+
+The design says the full operator token must not be on hosts. **No scoped credential exists yet**:
+`docs/api.md` plans the operator API's roles (`admin`, a short-lived `rollout`), and the token is
+the one operator credential until they land. The drain of a node (`NodeDrain`: cordon, drain,
+uncordon) and the node's health are calls to the operator API, which is on the frontend's
+loopback. This mode therefore takes `--operator-api` and `--token-file` as the roll mode does, and
+updates only where both are within reach; the agent reaches nothing else of the frontend. The
+mechanism is the one the design names, behind two small ports (`Drain`, `HealthCheck`) so that a
+scoped credential replaces the adapter and not the agent.

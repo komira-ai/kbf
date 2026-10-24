@@ -1,0 +1,30 @@
+# kbf-updater in its agent mode (docs/design/updates.md): an unprivileged updater that
+# heartbeats to the coordinator over mutual TLS and runs this host's update through the local
+# socket of kbf-host-local.service. It listens on nothing.
+#
+# The certificate, key and CA are files an operator placed (enrollment is a later step). The
+# drain of the node and its health go to the frontend's loopback operator API with the operator
+# token: no scoped credential exists yet (docs/api.md plans the roles), so the token file is
+# the full operator token and this unit runs only where both it and the loopback API are within
+# reach. Edit the values to the farm's.
+[Unit]
+Description=kbf-updater agent, this host's update agent
+Documentation=https://github.com/komira-ai/kbf/blob/main/docs/design/updates.md
+After=network-online.target kbf-host-local.service
+Wants=network-online.target kbf-host-local.service
+
+[Service]
+Type=simple
+User=kbf-updater
+ExecStart=/usr/libexec/kbf/kbf-updater agent --coordinator coordinator.farm.example:8443 --client-cert /etc/kbf/updater/cert.pem --client-key /etc/kbf/updater/key.pem --ca /etc/kbf/updater/ca.pem --channel stable --operator-api http://127.0.0.1:18002 --token-file /etc/kbf/updater/operator-token
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

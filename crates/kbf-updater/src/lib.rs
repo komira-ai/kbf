@@ -69,7 +69,8 @@ mod daemon_tests;
 mod frontend_http_tests;
 #[cfg(test)]
 mod identity_tests;
-#[cfg(test)]
+// The activated descriptor tests use an abstract socket address, which is Linux's.
+#[cfg(all(test, target_os = "linux"))]
 mod listener_tests;
 #[cfg(test)]
 mod node_drain_tests;

@@ -20,9 +20,11 @@ use crate::runner::{Runner, SystemRunner};
 use crate::trust::Trust;
 
 /// Root's directory for this program's state on a Linux host.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub const LINUX_STATE_DIR: &str = "/var/lib/kbf-host-install";
 
 /// The audit log (shared with the ssh path).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const AUDIT: &str = "/var/log/kbf-host-install.log";
 
 /// Seconds since the Unix epoch.
@@ -76,6 +78,7 @@ pub(super) fn log(line: &str) {
 }
 
 /// Make root's private directory `dir` (0700) if it is not there, and check it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn private_dir(trust: &Trust, dir: &Path) -> Result<(), String> {
     let say = |e: std::io::Error| format!("{}: {e}", dir.display());
     match fs::DirBuilder::new().mode(0o700).create(dir) {
@@ -125,12 +128,14 @@ pub(super) struct Place<'a> {
 
 /// What a Linux host's serving reads: the passwd file the account is looked up in, and the
 /// private state directory and audit log it writes.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) struct LinuxEnv {
     pub(super) passwd: PathBuf,
     pub(super) state_dir: PathBuf,
     pub(super) audit: PathBuf,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl LinuxEnv {
     pub(super) fn production() -> Self {
         Self {
@@ -143,6 +148,7 @@ impl LinuxEnv {
 
 /// A Linux host: the account of the socket from the passwd file (never root), the state directory
 /// made private, then the serving.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn serve_linux_with<B: Backend>(
     config: &ServeConfig,
     env: &LinuxEnv,
@@ -170,6 +176,7 @@ pub(super) fn serve_linux_with<B: Backend>(
 }
 
 /// The Linux side as the program runs it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn serve_linux(config: &ServeConfig) -> Result<(), String> {
     serve_linux_for(config)
 }
@@ -186,6 +193,7 @@ fn serve_linux_for(config: &ServeConfig) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn serve_linux_for(_config: &ServeConfig) -> Result<(), String> {
     Err("this program serves a Linux host on Linux only".to_owned())
 }
