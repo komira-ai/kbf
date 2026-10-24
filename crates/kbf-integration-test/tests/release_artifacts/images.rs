@@ -238,6 +238,12 @@ fn build_job(
                     ));
                 }
             }
+            // `type=oci` writes a layout with no manifest.json, which `docker image load` refuses.
+            if !l.contains("--output \"type=docker,") {
+                out.push(format!(
+                    "{who}: a `docker buildx build` line does not write `--output \"type=docker,...\"`, so `docker image load` cannot read the image"
+                ));
+            }
         }
     }
     // The reference must name the commit before the image is made from it. (A frontend tarball
