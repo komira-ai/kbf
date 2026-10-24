@@ -423,13 +423,10 @@ fn apply_leaves_the_account_alone_when_no_id_is_free_or_its_uid_is_unusable() {
     let mut mac = converged_without_id("updater-uid-none");
     mac.state_mut().user_attr("_kbf-updater", "UniqueID", "");
     let r = apply(&mac);
-    assert!(
-        r.text.contains(
-            "NOTE updater_user: the account _kbf-updater has no UniqueID; remove it with `sudo dscl . -delete /Users/_kbf-updater` and run apply again"
-        ),
-        "{}",
-        r.text
+    let want = format!(
+        "NOTE updater_user: the account _kbf-updater has no UniqueID; remove it with `sudo dscl . -delete {USER}` and run apply again"
     );
+    assert!(r.text.contains(&want), "{}", r.text);
     let mut mac = converged_without_id("updater-uid-vm");
     let text = format!("{}vm_user_uid={ID}\n", mac.profile_text());
     mac.set_profile(text);
