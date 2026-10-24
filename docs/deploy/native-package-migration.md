@@ -60,7 +60,8 @@ Both the plan and `--apply` do these, and change nothing:
 2. The unit is the unit of a daemon mode (`kbf-daemon`, `kbf-storage`, `kbf-storage-and-daemon` or
    `kbf-all-in-one`), is a regular file in `/etc/systemd/system`, has exactly one `ExecStart=`, and
    that runs the `kbf` of a release under `/var/lib/kbf-installer/releases`. Its flags are plain
-   words: a quote, a `$`, a `%`, a `;` or the like in a flag stops the move, and the line says
+   words (letters, digits and `_ . / : = @ + , ~ - ? &`, so a cold-store URL with a query is
+   carried as it is): whitespace, a quote, a backslash, a `$`, a `%`, a `;` or the like in a flag stops the move, and the line says
    which word. A `--mode=` it gives must be the mode of the unit's name.
 3. No drop-in `10-node-flags.conf` and no `<unit>.hand-placed` file is there already.
 4. The package in `--dir` is the package of that commit and passes every check an update's package
