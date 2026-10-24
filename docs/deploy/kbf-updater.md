@@ -256,3 +256,93 @@ order before it fetches anything, and the roll updates the host. Without `--fron
 the token an agent does the same for any host. The mechanism is behind two small ports (`Drain`,
 `HealthCheck`), so that a storage-health route a certificate may call replaces the refusal and not
 the agent.
+
+## Turn on the deploy step
+
+The last job of `release.yml`, `deploy`, tells the update coordinator "desired = this release" once
+`publish` has made the release, and waits until the farm converges. It is the end-to-end check of
+a release on a real farm. It does nothing until an operator has done the three things below, once;
+until then the job prints `::notice::the deploy step is off` and passes, so a fork or a repository
+that runs no farm is unaffected. Nothing in this repository does any of them.
+
+1. **Deploy the coordinator** (`kbf-coordinator`, [the design](../design/updates.md)) with a
+   certificate the farm CA issued with the role `coordinator`, and an allow-list for CI's OIDC
+   token in the file `--oidc-config` names. The job's token is the run's, so the allow-list must
+   say exactly this, and nothing wider:
+
+   ```toml
+   [remote_operator]
+   issuer = "https://token.actions.githubusercontent.com"
+   audience = "https://<the coordinator's control address, as written in the variable below>"
+   repository_id = "<the numeric id of komira-ai/kbf>"
+   repository = "komira-ai/kbf"
+   job_workflow_ref = ["komira-ai/kbf/.github/workflows/release.yml@refs/heads/main"]
+   refs = ["refs/heads/main"]
+   environments = ["release"]
+   event_names = ["workflow_run"]
+   ```
+
+   `event_names` must name `workflow_run`: the release workflow is started by the completion of
+   the pipeline, and its tokens say so (the default list is `push` and `workflow_dispatch`).
+   The `sha` of the token is the head of `main`, not the commit released. A token is good for one
+   call. The control listener (`--control-listen`) must be reachable from GitHub-hosted runners;
+   the heartbeat listener need not be.
+2. **Enroll the hosts**, so that their updaters heartbeat to the coordinator
+   ([The agent mode](#the-agent-mode)). A host that does not heartbeat is `down`, and the
+   coordinator does not wait for it: it says `converged` when every host that does heartbeat runs
+   the release, none is updating or failed, and at least the minimums (below) are up. The step
+   does not take that alone: it remembers how many hosts of each role were live when it started
+   (see below) and fails if fewer run the release at the end, so a host that the release made
+   stop heartbeating fails the deploy. A host that was already down when the step started is not
+   expected; raise the minimums to the number of hosts the farm must keep, for the roles whose
+   count matters beyond that.
+3. **Set the repository variables** (Settings, Secrets and variables, Actions, Variables):
+
+   | variable | value |
+   |---|---|
+   | `KBF_COORDINATOR_URL` | `https://<name>:<port>` of the control listener, no path. Unset or empty: the step is off |
+   | `KBF_COORDINATOR_CA` | the farm CA's certificate (PEM, public). The coordinator's certificate is the farm CA's, which no system store holds; empty trusts the system store instead |
+   | `KBF_MIN_UP_STORAGE`, `KBF_MIN_UP_FRONTEND` | optional: the storage hosts and frontends that must stay up while others update (default 1 each). The operator picks the storage number so that every blob stays readable |
+
+### What the step does
+
+`cargo xtask deploy-farm` (one `run:` line):
+
+1. reads `GET /v1/convergence` once, before anything is changed, and keeps the hosts live then
+   (at the version, updating or failed, so not `down`) per role as the baseline, and prints it
+   (`baseline: hosts live before the deploy: storage 3, frontend 2`). A 503 on this read is tried
+   again like the POST. A coordinator that has just restarted (the table says so) may not have
+   heard from every host yet; a host it hears from later counts as one that joined;
+2. posts `{"version": <the release's version>, "min_up": {...}}` to `/v1/desired` (the per-role
+   limits are the coordinator's defaults), with an OIDC token for the audience that is the URL as
+   written in the variable (the audience keeps a trailing `/` the variable has, which the URL
+   the calls go to does not, so write the variable and the allow-list's `audience` alike). A 503
+   on the POST is tried again, up to four times;
+3. reads `GET /v1/convergence` every 30 seconds, with a fresh token each time, and prints a
+   table of the counts per role (`at_desired`, `updating`, `failed`, `down`);
+4. ends when the coordinator says `converged` and every role has at least as many hosts at the
+   version as it had live at the baseline (exit 0; a host that joined during the deploy only
+   adds); when it says `converged` and a role has fewer, which fails with the role, the count
+   expected, the count reached and how many went down; `blocked` (a live host failed its update to
+   this version and is still behind it); when the counts have not changed for 20 minutes
+   (`--stall-min`; a host whose update takes longer than that leaves the counts as they are, so
+   raise the flag past the longest update); when the coordinator's desired version is no longer
+   this release's (another writer replaced it); when 60 minutes are up (`--deadline-min`); or when the coordinator refuses
+   the token (401 or 403, at once: the allow-list does not match this job). Any of those but
+   convergence fails the job; the release stays published whatever it says. Another failed read
+   is reported and tried again, and counts as no change.
+
+`GET /v1/convergence` answers `{"desired", "quiet", "state", "roles": [{"role", "at_desired",
+"updating", "failed", "down"}]}`, where `state` is `converged`, `blocked` or `in_progress`. It
+takes CI's OIDC token and refuses the operator token (the operator's read is `GET /v1/status`).
+It is computed from the heartbeats and the desired state, and stores nothing. `converged` needs
+the coordinator to be past its 30 second quiet start, at least one live host, every live host at
+the version and none updating or failed, and `min_up` hosts of the storage and frontend roles up,
+so a coordinator that has just restarted does not report a farm it has not heard from as
+converged.
+
+The `deploy` job runs in the `release` environment, like `publish`: if the environment has
+required reviewers, a release is approved a second time before the job starts.
+
+One release at a time holds across the deploy: the workflow's group does not cancel, so a second
+release waits for the first release's deploy (at most 90 minutes) to end.

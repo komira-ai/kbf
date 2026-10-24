@@ -1288,3 +1288,155 @@ fn only_plan_and_verify_download_from_another_run() {
         red(&found, &format!("a download of `{job}` names a `run-id`"));
     }
 }
+
+#[test]
+fn deploy_runs_after_publish_with_the_run_token_and_no_write_scope() {
+    // Catches: the deploy step starting before the release is published or without the
+    // run's conditions, holding a write scope or a token other than the OIDC one, or
+    // dropping the environment whose name the coordinator's allow-list can require.
+    red(
+        &plant("deploy", "needs: [plan, publish]\n", "needs: [plan]\n"),
+        "the job `deploy` needs",
+    );
+    red(
+        &plant(
+            "deploy",
+            "needs: [plan, publish]\n",
+            "needs: [plan, bump]\n",
+        ),
+        "the job `deploy` needs",
+    );
+    red(
+        &plant(
+            "deploy",
+            "      contents: read\n",
+            "      contents: write\n",
+        ),
+        "the job `deploy` holds `contents: write`",
+    );
+    red(
+        &plant(
+            "deploy",
+            "      id-token: write\n",
+            "      id-token: write\n      packages: write\n",
+        ),
+        "the job `deploy` holds `packages: write`",
+    );
+    red(
+        &plant(
+            "deploy",
+            "      id-token: write\n",
+            "      id-token: read\n",
+        ),
+        "the job `deploy` holds the scopes",
+    );
+    red(
+        &plant("deploy", "    environment: release\n", ""),
+        "the job `deploy` has environment",
+    );
+    red(
+        &plant(
+            "deploy",
+            "needs.plan.outputs.pipeline != 'true' }}",
+            "needs.plan.outputs.pipeline != 'false' }}",
+        ),
+        "the job `deploy` has `if:",
+    );
+    red(
+        &plant(
+            "deploy",
+            "github.event.workflow_run.event == 'push' && ",
+            "",
+        ),
+        "the job `deploy` has `if:",
+    );
+}
+
+#[test]
+fn deploy_reads_the_coordinators_address_from_the_variable_alone() {
+    // Catches: an address written in the workflow, the variable read by another job, a
+    // secret in the deploy job, and the verb given anything but the variable and the
+    // planned version.
+    red(
+        &plant(
+            "deploy",
+            "COORDINATOR_URL: ${{ vars.KBF_COORDINATOR_URL }}",
+            "COORDINATOR_URL: https://coordinator.example:8443",
+        ),
+        "writes an address",
+    );
+    red(
+        &plant(
+            "deploy",
+            "COORDINATOR_URL: ${{ vars.KBF_COORDINATOR_URL }}",
+            "COORDINATOR_URL: ${{ secrets.KBF_COORDINATOR_URL }}",
+        ),
+        "reads a secret",
+    );
+    red(
+        &plant(
+            "deploy",
+            "COORDINATOR_URL: ${{ vars.KBF_COORDINATOR_URL }}",
+            "COORDINATOR_URL: ${{ vars.OTHER }}",
+        ),
+        "does not set `COORDINATOR_URL:",
+    );
+    red(
+        &plant(
+            "bump",
+            "          VERSION: ${{ needs.plan.outputs.version }}\n",
+            "          VERSION: ${{ needs.plan.outputs.version }}\n          URL: ${{ vars.KBF_COORDINATOR_URL }}\n",
+        ),
+        "the job `bump` reads `vars.KBF_COORDINATOR_URL`",
+    );
+    red(
+        &plant("deploy", "--url \"$COORDINATOR_URL\"", "--url \"$VERSION\""),
+        "not given `--url $COORDINATOR_URL`",
+    );
+    red(
+        &plant(
+            "deploy",
+            "--ca-pem \"$COORDINATOR_CA\"",
+            "--ca-pem \"$VERSION\"",
+        ),
+        "not given `--ca-pem $COORDINATOR_CA`",
+    );
+    red(
+        &plant(
+            "deploy",
+            "COORDINATOR_CA: ${{ vars.KBF_COORDINATOR_CA }}",
+            "COORDINATOR_CA: ${{ vars.OTHER }}",
+        ),
+        "does not set `COORDINATOR_CA:",
+    );
+    red(
+        &plant("deploy", "--version \"$VERSION\"", "--version \"$COMMIT\""),
+        "not given `--version $VERSION`",
+    );
+    red(
+        &plant(
+            "deploy",
+            "VERSION: ${{ needs.plan.outputs.version }}",
+            "VERSION: 1.1.1",
+        ),
+        "does not set `VERSION:",
+    );
+    red(
+        &plant("deploy", "cargo xtask deploy-farm ", "cargo xtask other "),
+        "does not run `cargo xtask deploy-farm`",
+    );
+}
+
+#[test]
+fn the_deploy_step_is_not_skipped_by_a_condition_of_its_own() {
+    // Catches: the unset variable turned into a skipped step (which would show no notice) by
+    // an `if:` on the step; the lint of every job's steps refuses it.
+    red(
+        &plant(
+            "deploy",
+            "      - name: Set this release as the farm's desired version, and wait for the farm to converge\n",
+            "      - name: Set this release as the farm's desired version, and wait for the farm to converge\n        if: ${{ vars.KBF_COORDINATOR_URL != '' }}\n",
+        ),
+        "a step of `deploy`",
+    );
+}
