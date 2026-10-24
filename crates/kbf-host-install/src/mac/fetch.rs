@@ -33,7 +33,7 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::release::{self, REPO};
+use super::release::{REPO, ReleaseFile, SUMS_NAME};
 use crate::runner::{Cmd, Identity, Runner, WriteCap};
 
 /// Releases asked for per page (GitHub's most).
@@ -80,6 +80,9 @@ pub struct Limits {
 pub struct Fetcher<'a> {
     /// The platform of the release files to take: `darwin-arm64`, `linux-x86_64`, ...
     pub platform: &'a str,
+    /// Which of the commit's files to take. For the frontend image the release's
+    /// `SHA256SUMS` comes with it.
+    pub asset: ReleaseFile,
     pub runner: &'a dyn Runner,
     pub curl: &'a Path,
     pub gh: &'a Path,
@@ -197,10 +200,16 @@ impl Fetcher<'_> {
         let mut args: Vec<String> = ["release", "download", tag, "--repo", REPO]
             .map(str::to_owned)
             .to_vec();
-        for name in [
-            release::tarball_name_on(self.platform, commit),
-            release::bundle_name_on(self.platform, commit),
-        ] {
+        let mut names = vec![
+            self.asset.name_on(self.platform, commit),
+            self.asset.bundle_on(self.platform, commit),
+        ];
+        if self.asset == ReleaseFile::FrontendImage {
+            names.push(SUMS_NAME.to_owned());
+        }
+        // The bundle, and the sums when they come, are small files of the bundle's limit.
+        let small = u64::try_from(names.len() - 1).unwrap_or(u64::MAX);
+        for name in names {
             args.push("--pattern".to_owned());
             args.push(name);
         }
@@ -217,7 +226,7 @@ impl Fetcher<'_> {
                 max: self
                     .limits
                     .tarball_max
-                    .saturating_add(self.limits.bundle_max),
+                    .saturating_add(self.limits.bundle_max.saturating_mul(small)),
             }),
             ..Cmd::default()
         }
@@ -233,7 +242,7 @@ impl Fetcher<'_> {
         let mut complete = false;
         for page in 1..=MAX_PAGES {
             let releases = self.list_page(page)?;
-            note(&mut found, &releases, self.platform, prefix);
+            note(&mut found, &releases, (self.asset, self.platform), prefix);
             // Only an empty page ends the listing: a short one is not taken for the end.
             if releases.is_empty() {
                 complete = true;
@@ -397,16 +406,21 @@ fn retry_after(response: &Response<'_>) -> String {
 
 /// Note the tarballs of the commits that start with `prefix` in `releases`. The first
 /// listing of a commit (the newest release) is the one kept.
-fn note(found: &mut BTreeMap<String, Found>, releases: &[Release], platform: &str, prefix: &str) {
+fn note(
+    found: &mut BTreeMap<String, Found>,
+    releases: &[Release],
+    (asset_kind, platform): (ReleaseFile, &str),
+    prefix: &str,
+) {
     for release in releases.iter().filter(|r| !r.draft && tag_ok(&r.tag_name)) {
         for asset in &release.assets {
-            let Some(commit) = release::commit_of_name_on(platform, &asset.name) else {
+            let Some(commit) = asset_kind.commit_of_name_on(platform, &asset.name) else {
                 continue;
             };
             if !commit.starts_with(prefix) {
                 continue;
             }
-            let bundle = release::bundle_name_on(platform, commit);
+            let bundle = asset_kind.bundle_on(platform, commit);
             found.entry(commit.to_owned()).or_insert_with(|| Found {
                 tag: release.tag_name.clone(),
                 tarball_size: asset.size,

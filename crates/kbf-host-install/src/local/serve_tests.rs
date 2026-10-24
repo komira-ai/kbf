@@ -67,6 +67,7 @@ fn the_flags_make_one_config_and_refuse_the_rest() {
 
     let minimal = ServeConfig::parse(&args(&["--socket", "/s", "--socket-user", "u"])).unwrap();
     assert_eq!((minimal.window_secs, minimal.units.len()), (600, 0));
+    assert!(!minimal.frontend_container);
 
     let bad: [(&[&str], &str); 10] = [
         (&["--socket-user", "u"], "--socket is required"),
@@ -557,4 +558,49 @@ fn a_revert_that_fails_is_not_retried_on_every_turn() {
     });
     // One attempt, said twice: the loop's line and the failure's.
     assert_eq!(logged.len(), 2, "{logged:?}");
+}
+
+/// `--frontend-container` is a flag with no value, given once, and it replaces the units: a
+/// host serves a container or restarts units, not both.
+#[test]
+fn the_frontend_container_flag_stands_for_the_units() {
+    let base = ["--socket", "/s", "--socket-user", "u"];
+    let with = |extra: &[&str]| {
+        let mut words: Vec<&str> = base.to_vec();
+        words.extend(extra);
+        ServeConfig::parse(&args(&words))
+    };
+    let config = with(&["--frontend-container"]).unwrap();
+    assert!(config.frontend_container && config.units.is_empty());
+    // It may come before the flags that take a value.
+    let first = ServeConfig::parse(&args(&[
+        "--frontend-container",
+        "--socket",
+        "/s",
+        "--socket-user",
+        "u",
+    ]))
+    .unwrap();
+    assert!(first.frontend_container);
+    for bad in [
+        &["--frontend-container", "--frontend-container"][..],
+        &["--frontend-container=yes"],
+        &[
+            "--frontend-container",
+            "--restart-unit",
+            "kbf-daemon.service",
+        ],
+        &[
+            "--restart-unit",
+            "kbf-daemon.service",
+            "--frontend-container",
+        ],
+    ] {
+        assert!(with(bad).is_err(), "{bad:?}");
+    }
+    assert!(
+        with(&["--frontend-container", "--frontend-container"])
+            .unwrap_err()
+            .contains("takes no value and is given once")
+    );
 }

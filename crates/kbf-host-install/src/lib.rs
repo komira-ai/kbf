@@ -109,6 +109,7 @@ pub mod contract {
     /// mode of `kbf-updater`, which reads the answers and writes the requests.
     pub mod local {
         pub use crate::local::answer::{Answer, Code, LastView, PendingView, QueryView};
+        pub use crate::local::frontend::config::FrontendConfig;
         pub use crate::local::serve::ServeConfig;
 
         /// The verb of `line`, when it is a request the socket accepts (`stage`, `switch`,

@@ -1,7 +1,8 @@
 //! The local socket: a unix socket, mode 0600, owned by the one account that may use it.
 //!
 //! ```text
-//! kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N] [--restart-unit UNIT]...
+//! kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N]
+//!                   (--restart-unit UNIT... | --frontend-container)
 //! ```
 //!
 //! The program binds the socket itself (a umask of 0177, then a chown to the account), in a
@@ -17,7 +18,9 @@
 //! `--window-secs` is how long a release on trial has to be confirmed (120 to 1800, default
 //! 600). `--restart-unit` names a unit that runs the release (repeatable; a Linux host
 //! needs one at least, and a Mac restarts the daemon's job). The paths this program reads as
-//! root are constants, as they are for the ssh path; no flag moves them.
+//! root are constants, as they are for the ssh path; no flag moves them. `--frontend-container`
+//! serves a frontend that runs as a container instead of units ([`super::frontend`]); it takes
+//! no `--restart-unit`.
 //!
 //! Every request but `query` and `revert` is audited, and is not run when the audit log
 //! cannot be opened. A revert is never held back by it.
@@ -50,7 +53,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const REVERT_RETRY: Duration = Duration::from_secs(30);
 
 pub const USAGE: &str = "usage: kbf-host-install --serve --socket PATH --socket-user NAME \
-[--window-secs N] [--restart-unit UNIT]...\n";
+[--window-secs N] (--restart-unit UNIT... | --frontend-container)\n";
 
 /// The settings of a served socket, from the flags.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +62,8 @@ pub struct ServeConfig {
     pub user: String,
     pub window_secs: u64,
     pub units: Vec<Unit>,
+    /// The host runs the frontend as a container, not as units.
+    pub frontend_container: bool,
 }
 
 impl ServeConfig {
@@ -72,12 +77,19 @@ impl ServeConfig {
         let mut user = None;
         let mut window = None;
         let mut units = Vec::new();
+        let mut frontend_container = false;
         let mut rest = args.iter();
         while let Some(arg) = rest.next() {
             let (name, inline) = match arg.split_once('=') {
                 Some((name, value)) => (name, Some(value.to_owned())),
                 None => (arg.as_str(), None),
             };
+            if name == "--frontend-container" {
+                if inline.is_some() || std::mem::replace(&mut frontend_container, true) {
+                    return Err("--frontend-container takes no value and is given once".to_owned());
+                }
+                continue;
+            }
             let value = match inline {
                 Some(value) => value,
                 None => rest
@@ -117,11 +129,17 @@ impl ServeConfig {
                 .ok_or("--window-secs must be a number from 120 to 1800")?,
             None => DEFAULT_WINDOW_SECS,
         };
+        if frontend_container && !units.is_empty() {
+            return Err(
+                "--frontend-container and --restart-unit are not given together".to_owned(),
+            );
+        }
         Ok(Self {
             socket,
             user,
             window_secs,
             units,
+            frontend_container,
         })
     }
 }

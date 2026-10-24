@@ -83,6 +83,8 @@ fn the_optional_flags_are_read() {
         "/etc/kbf/updater/proxy",
         "--helper-socket",
         "/run/other.sock",
+        "--daemon-node",
+        "d1",
         "--heartbeat-secs",
         "20",
         "--drain-deadline-secs",
@@ -100,6 +102,7 @@ fn the_optional_flags_are_read() {
         Some(PathBuf::from("/etc/kbf/updater/proxy"))
     );
     assert_eq!(config.helper_socket, PathBuf::from("/run/other.sock"));
+    assert_eq!(config.daemon_node.as_deref(), Some("d1"));
     let secs = Duration::from_secs;
     assert_eq!(config.timing.heartbeat, secs(20));
     assert_eq!(config.timing.drain_deadline, secs(30));
@@ -247,4 +250,15 @@ fn the_state_directory_goes_with_the_frontend_and_not_with_placed_files() {
     assert!(err.starts_with("give --state-dir, or all of"), "{err}");
     let placed = parse_flags(&with(&["--frontend", "f.example:443"])).unwrap();
     assert_eq!((placed.state_dir, placed.frontend.is_some()), (None, true));
+}
+
+/// `--daemon-node` is a node id, and is left out unless the host runs a daemon beside its
+/// frontend.
+#[test]
+fn the_daemon_node_is_a_node_id_or_not_given() {
+    assert_eq!(parse_flags(&with(&NODE_API)).unwrap().daemon_node, None);
+    for bad in ["D1", "-d", "d_1", "", "a.b"] {
+        let err = parse_flags(&with(&["--daemon-node", bad])).unwrap_err();
+        assert!(err.contains("--daemon-node"), "{bad}: {err}");
+    }
 }

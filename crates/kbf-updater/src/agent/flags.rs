@@ -6,7 +6,8 @@
 //!                   (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
 //!                   [--frontend <dns name>:<port>]
 //!                   [--operator-api http://IP:PORT --token-file FILE
-//!                   [--operator-proxy-auth-file FILE]] [--helper-socket PATH]
+//!                   [--operator-proxy-auth-file FILE]] [--daemon-node NODE_ID]
+//!                   [--helper-socket PATH]
 //!                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
 //!                   [--health-poll-secs N] [--retry-secs N]
 //! ```
@@ -23,6 +24,9 @@
 //!   and its status are three calls there, made with the updater's own certificate and no
 //!   token: the proxy admits them for the node in the certificate and for no other, and
 //!   admits nothing else from an updater. Renewals go there too.
+//! - `--daemon-node`: for the agent of a frontend host that also runs a daemon: the daemon's
+//!   node id. The frontend's update drains that node around it (the frontend itself is drained
+//!   by the helper, inside the A/B); without the flag a frontend host's node is not drained.
 //! - `--channel`: the release channel the helper's allowlist names; the version the
 //!   coordinator names is looked up in it by the helper, never by URL.
 //! - `--helper-socket`: the socket of `kbf-host-install --serve` (default
@@ -50,14 +54,15 @@ use kbf_types::Role;
 
 use super::coordinator::{Endpoint, TlsFiles};
 use crate::daemon::parse_operator_url;
+use crate::inventory::valid_node_id;
 
 pub const USAGE: &str = "usage: kbf-updater agent --coordinator DNSNAME:PORT --channel NAME \
 (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE) [--frontend DNSNAME:PORT] \
 [--operator-api http://IP:PORT --token-file FILE [--operator-proxy-auth-file FILE]] \
-[--helper-socket PATH] [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N] \
+[--daemon-node NODE_ID] [--helper-socket PATH] [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N] \
 [--health-poll-secs N] [--retry-secs N]\n";
 
-const FLAGS: [&str; 16] = [
+const FLAGS: [&str; 17] = [
     "--coordinator",
     "--state-dir",
     "--frontend",
@@ -68,6 +73,7 @@ const FLAGS: [&str; 16] = [
     "--operator-api",
     "--token-file",
     "--operator-proxy-auth-file",
+    "--daemon-node",
     "--helper-socket",
     "--heartbeat-secs",
     "--drain-deadline-secs",
@@ -125,6 +131,8 @@ pub struct Config {
     /// The frontend's operator API for the drain and the health, if the operator gave the agent
     /// the credential for it.
     pub node_api: Option<NodeApi>,
+    /// The node id of the daemon a frontend host also runs, if it runs one.
+    pub daemon_node: Option<String>,
     pub timing: Timing,
 }
 
@@ -231,6 +239,10 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
             );
         }
     };
+    let daemon_node = found.remove("--daemon-node");
+    if daemon_node.as_deref().is_some_and(|id| !valid_node_id(id)) {
+        return Err("--daemon-node must be a node id: a DNS label".to_owned());
+    }
     let helper_socket = found
         .remove("--helper-socket")
         .map_or_else(|| PathBuf::from(DEFAULT_HELPER_SOCKET), PathBuf::from);
@@ -254,6 +266,7 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
         frontend,
         state_dir,
         node_api,
+        daemon_node,
         timing,
     })
 }

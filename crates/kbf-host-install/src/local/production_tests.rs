@@ -319,6 +319,25 @@ fn a_linux_host_looks_up_the_account_and_makes_its_state_directory() {
     )
     .unwrap_err();
     assert!(err.contains("--restart-unit is required"), "{err}");
+    // A host that serves the frontend container needs no unit: it is on to the account.
+    let container = ServeConfig::parse(&words(&[
+        "--socket",
+        &socket.display().to_string(),
+        "--socket-user",
+        "nobody-here",
+        "--frontend-container",
+    ]))
+    .unwrap();
+    let err = serve_linux_with(&container, &env, &trust, backend(), &stopped).unwrap_err();
+    assert!(err.contains("nobody-here has no usable ids"), "{err}");
+    // The program's own start serves the container the same way, up to the account.
+    if cfg!(target_os = "linux") {
+        let err = serve_linux(&container).unwrap_err();
+        assert!(err.contains("nobody-here has no usable ids"), "{err}");
+    }
+    // And a Mac has no container to serve.
+    let err = serve_mac(&container).unwrap_err();
+    assert!(err.contains("--frontend-container"), "{err}");
     let production = LinuxEnv::production();
     assert_eq!(production.passwd, Path::new("/etc/passwd"));
     assert_eq!(production.state_dir, Path::new("/var/lib/kbf-host-install"));

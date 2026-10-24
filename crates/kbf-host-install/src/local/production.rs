@@ -156,8 +156,10 @@ pub(super) fn serve_linux_with<B: Backend>(
     backend: B,
     stop: &AtomicBool,
 ) -> Result<(), String> {
-    if config.units.is_empty() {
-        return Err("--restart-unit is required on a Linux host".to_owned());
+    if config.units.is_empty() && !config.frontend_container {
+        return Err(
+            "--restart-unit is required on a Linux host (or --frontend-container)".to_owned(),
+        );
     }
     let passwd = trust
         .read(&env.passwd)
@@ -183,12 +185,20 @@ pub(super) fn serve_linux(config: &ServeConfig) -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 fn serve_linux_for(config: &ServeConfig) -> Result<(), String> {
+    let (env, trust, stop) = (
+        LinuxEnv::production(),
+        Trust::root(),
+        AtomicBool::new(false),
+    );
+    if config.frontend_container {
+        return serve_linux_with(config, &env, &trust, super::frontend::production(), &stop);
+    }
     serve_linux_with(
         config,
-        &LinuxEnv::production(),
-        &Trust::root(),
+        &env,
+        &trust,
         super::linux::production(config.units.clone()),
-        &AtomicBool::new(false),
+        &stop,
     )
 }
 
@@ -209,9 +219,11 @@ pub(super) fn serve_mac_with(
     stop: &AtomicBool,
 ) -> Result<(), String> {
     use crate::mac::tools;
-    if !config.units.is_empty() {
+    if !config.units.is_empty() || config.frontend_container {
         return Err(
-            "--restart-unit is for a Linux host: a Mac restarts the daemon's job".to_owned(),
+            "--restart-unit and --frontend-container are for a Linux host: a Mac restarts the \
+             daemon's job"
+                .to_owned(),
         );
     }
     let exec = runner

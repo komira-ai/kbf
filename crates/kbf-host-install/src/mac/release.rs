@@ -48,6 +48,68 @@ pub fn commit_of_name_on<'a>(platform: &str, name: &'a str) -> Option<&'a str> {
         .filter(|commit| is_commit(commit))
 }
 
+/// A kind of release file a commit has for a platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseFile {
+    /// `kbf-<commit>-<platform>.tar.gz`, the binary.
+    Tarball,
+    /// `kbf-frontend-image-<commit>-<platform>.oci.tar`, the frontend as a container image.
+    FrontendImage,
+}
+
+impl ReleaseFile {
+    /// The file name of `commit`'s asset of this kind for `platform`.
+    pub fn name_on(self, platform: &str, commit: &str) -> String {
+        match self {
+            Self::Tarball => tarball_name_on(platform, commit),
+            Self::FrontendImage => format!("kbf-frontend-image-{commit}-{platform}.oci.tar"),
+        }
+    }
+
+    /// The attestation bundle of the asset.
+    pub fn bundle_on(self, platform: &str, commit: &str) -> String {
+        format!("{}.sigstore.json", self.name_on(platform, commit))
+    }
+
+    /// The commit in the file name `name` of this kind for `platform`.
+    pub fn commit_of_name_on<'a>(self, platform: &str, name: &'a str) -> Option<&'a str> {
+        let (head, tail) = match self {
+            Self::Tarball => ("kbf-", ".tar.gz"),
+            Self::FrontendImage => ("kbf-frontend-image-", ".oci.tar"),
+        };
+        name.strip_prefix(head)
+            .and_then(|rest| rest.strip_suffix(&format!("-{platform}{tail}")))
+            .filter(|commit| is_commit(commit))
+    }
+}
+
+/// The name of the release's list of sums.
+pub const SUMS_NAME: &str = "SHA256SUMS";
+
+/// The sha256 that `sums` lists for the file `name`: the lines are `<64 hex>  <name>`.
+///
+/// # Errors
+/// [`PickError::Malformed`] for sums that are not such lines (or name a file twice),
+/// [`PickError::Unknown`] when `name` is not listed.
+pub fn listed_hash(sums: &str, name: &str) -> Result<String, PickError> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut found = None;
+    if !sums.is_empty() && !sums.ends_with('\n') {
+        return Err(PickError::Malformed);
+    }
+    for line in sums.lines() {
+        let (hash, file) = line.split_once("  ").ok_or(PickError::Malformed)?;
+        let hash_ok = hash.len() == 64 && hash.bytes().all(is_hex);
+        if !hash_ok || file.is_empty() || file.contains('/') || !seen.insert(file) {
+            return Err(PickError::Malformed);
+        }
+        if file == name {
+            found = Some(hash.to_owned());
+        }
+    }
+    found.ok_or(PickError::Unknown)
+}
+
 /// The tarball of `commit`.
 pub fn tarball_name(commit: &str) -> String {
     tarball_name_on(PLATFORM, commit)
