@@ -1,4 +1,4 @@
-//! `pkg-image-asset --image <oci.tar> [--service frontend|coordinator] --platform <platform>
+//! `pkg-image-asset --image <oci.tar> --service frontend|coordinator --platform <platform>
 //! --commit <sha> (--kbf-tarball <file> | --binary <file>) (--out <dir> | --verify-only)`: the
 //! frontend or coordinator image as a release asset, `kbf-frontend-image-<commit>-<platform>.oci.tar`
 //! or `kbf-coordinator-image-<commit>-<platform>.oci.tar`, and the checks that tie it to the

@@ -1,6 +1,7 @@
 //! Embeds the commit the coordinator is built from as `KBF_BUILD_COMMIT`, so `--version`
 //! tells two builds of one package version apart and the image that carries the binary can
-//! be checked against the commit it was built for (`cargo xtask image-test`).
+//! be checked against the commit it was built for: `cargo xtask build-commit check`, which the
+//! artifacts workflow runs on the binary it copies out of the coordinator image.
 //!
 //! The commit is `git rev-parse --short=12 HEAD` in the checkout being built, or `unknown`
 //! where that fails (a source archive, no `git`). Uncommitted changes are not marked. There

@@ -580,12 +580,17 @@ fn a_coordinator_image_of_the_built_binary_is_accepted_and_another_is_refused() 
         "{got:?}"
     );
 
-    let mut root = coordinator();
-    root.user = "0";
-    assert_eq!(
-        coordinator_problems("coordinator-root", &root, Some(&good)).len(),
-        1
-    );
+    for user in ["0", "root", "0:0", "root:root"] {
+        let mut root = coordinator();
+        root.user = user;
+        assert_eq!(
+            coordinator_problems("coordinator-root", &root, Some(&good)),
+            vec![format!(
+                "config runs as user {user:?}, which is root or unset"
+            )],
+            "{user:?}"
+        );
+    }
 
     let mut as_kbf = coordinator();
     as_kbf.entrypoint = vec!["/usr/bin/kbf", "--mode=frontend"];
@@ -594,6 +599,22 @@ fn a_coordinator_image_of_the_built_binary_is_accepted_and_another_is_refused() 
         got,
         vec![
             "entrypoint is [\"/usr/bin/kbf\", \"--mode=frontend\"], not [\"/usr/bin/kbf-coordinator\"]"
+                .to_owned()
+        ]
+    );
+}
+
+/// Asserts that the coordinator's entrypoint is compared whole: the right program with one
+/// more trailing argument is refused, not accepted as a prefix match.
+#[test]
+fn a_coordinator_entrypoint_with_an_extra_argument_is_refused() {
+    let mut fix = coordinator();
+    fix.entrypoint = vec!["/usr/bin/kbf-coordinator", "--extra"];
+    let got = coordinator_problems("coordinator-extra-arg", &fix, None);
+    assert_eq!(
+        got,
+        vec![
+            "entrypoint is [\"/usr/bin/kbf-coordinator\", \"--extra\"], not [\"/usr/bin/kbf-coordinator\"]"
                 .to_owned()
         ]
     );
