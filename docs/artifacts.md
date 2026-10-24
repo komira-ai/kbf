@@ -527,9 +527,9 @@ attestation, and alone), an SBOM attestation, and its bundle
 `kbf-<image>-image-<commit>-<platform>.tar.sigstore.json` in `bundles-linux`. The verify job
 checks all three, offline for the bundle, with the commands of
 [the section on bundles](#provenance-bundles-verifying-a-tarball-offline); the archive is what
-the attestation covers, so verify it before `images import`. An image is about the size of the
-Ubuntu base layer plus the binary (tens of megabytes before compression); the four archives
-add to every run's artifacts and to every release.
+the attestation covers, so verify it before `images import`. An image is the
+Ubuntu base layer plus the binary and is not compressed: each archive is 91 to 167 MB, about
+520 MB for the four, and they add that much to every run's artifacts and to every release.
 
 ## The kbf-installer package (pkg, macOS)
 
