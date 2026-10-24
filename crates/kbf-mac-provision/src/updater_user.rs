@@ -129,15 +129,13 @@ pub(crate) fn updater_user(c: &Ctx<'_>) -> Outcome {
     }
 }
 
-/// The id `apply` gives a new account: `updater_id`, else the highest id below 500 that
-/// no user or group holds and that is not `role_id` or `vm_user_uid`.
+/// The id `apply` gives a new account when the profile fixes none: the highest id below
+/// 500 that no user or group holds and that is not `role_id` or `vm_user_uid`.
 fn new_id(c: &Ctx<'_>, dir: &Directory) -> Option<u32> {
-    c.profile.updater_id.or_else(|| {
-        UPDATER_IDS.rev().find(|id| {
-            usable(c, *id)
-                && dir.uid_holder((*id).into(), |_| false).is_none()
-                && dir.gid_holder((*id).into(), "").is_none()
-        })
+    UPDATER_IDS.rev().find(|id| {
+        usable(c, *id)
+            && dir.uid_holder((*id).into(), |_| false).is_none()
+            && dir.gid_holder((*id).into(), "").is_none()
     })
 }
 
@@ -145,9 +143,17 @@ fn new_id(c: &Ctx<'_>, dir: &Directory) -> Option<u32> {
 /// Nothing is changed while another user or group holds the id.
 pub(crate) fn fix_updater_user(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
     let dir = Directory::read(c).map_err(io::Error::other)?;
-    let id = id_of(c, dir.user(NAME))
-        .or_else(|| new_id(c, &dir))
-        .ok_or_else(|| io::Error::other(format!("no free id from 200 to 499 for {NAME}")))?;
+    let id = match (id_of(c, dir.user(NAME)), dir.user(NAME)) {
+        (Some(id), _) => id,
+        (None, Some(record)) => {
+            return Err(io::Error::other(format!(
+                "{NAME} has uid {}, not an id from 200 to 499 other than role_id and vm_user_uid: not changed",
+                record.get("UniqueID")
+            )));
+        }
+        (None, None) => new_id(c, &dir)
+            .ok_or_else(|| io::Error::other(format!("no free id from 200 to 499 for {NAME}")))?,
+    };
     if let Some(other) = dir.uid_holder(id.into(), |name| name == NAME) {
         return Err(io::Error::other(format!(
             "uid {id} belongs to {other}: {NAME} not changed"

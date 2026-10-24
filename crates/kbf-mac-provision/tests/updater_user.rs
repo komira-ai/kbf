@@ -323,3 +323,139 @@ fn check_runs_no_command_that_changes_the_mac() {
     assert_eq!(calls(&mac, "dscl . <stdin"), Vec::<String>::new());
     assert!(!mac.path(STATE_DIR).exists());
 }
+
+/// The converged Mac with `updater_id` left out of the profile.
+fn converged_without_id(name: &str) -> FakeMac {
+    let mut mac = converged_updater(name);
+    let text = mac.profile_text().replace("updater_id=470\n", "");
+    mac.set_profile(text);
+    mac
+}
+
+/// Catches: `apply` repairing only part of the account: a missing group, a drifted
+/// attribute, a password, a directory of root's and a missing one are all put right in
+/// one run, the id is kept, and the run after changes nothing.
+#[test]
+fn apply_repairs_a_drifted_account_and_its_directories() {
+    let mut mac = converged_updater("updater-repair");
+    {
+        let s = mac.state_mut();
+        s.records.remove(GROUP);
+        s.user_attr("_kbf-updater", "UserShell", "/usr/bin/true");
+        s.user_attr(
+            "_kbf-updater",
+            "AuthenticationAuthority",
+            ";ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2>",
+        );
+    }
+    mac.own(STATE_DIR, 0, 0);
+    mac.remove(LOG_DIR);
+    let r = apply(&mac);
+    assert_eq!(r.failed, 0, "{}", r.text);
+    assert_eq!(apply(&mac).text, "");
+    assert_eq!(ls(&mac, STATE_DIR), "drwx------ 470 470");
+    assert_eq!(ls(&mac, LOG_DIR), "drwxr-xr-x 470 470");
+    let mut mac = converged_updater("updater-repair-gid");
+    mac.state_mut().attr(GROUP, "PrimaryGroupID", "471");
+    let r = apply(&mac);
+    assert_eq!(r.failed, 0, "{}", r.text);
+}
+
+/// Catches: an id left to chance landing on one that is taken: with `updater_id` unset
+/// the pick skips ids a user holds, ids a group holds, the role account's and the VM
+/// user's.
+#[test]
+fn an_unset_id_skips_every_id_that_is_taken_or_reserved() {
+    let mut mac = FakeMac::converged("updater-skip");
+    let text = format!(
+        "{}vm_user_uid=499\nupdater_user=_kbf-updater\n",
+        mac.profile_text()
+    );
+    mac.set_profile(text);
+    mac.state_mut().user("builder", 498);
+    mac.state_mut()
+        .attr("/Groups/builders", "PrimaryGroupID", "497");
+    let r = apply_keys(&mac, Some("updater_user"));
+    assert_eq!(r.failed, 0, "{}", r.text);
+    assert_eq!(ls(&mac, STATE_DIR), "drwx------ 496 496");
+}
+
+/// Catches: `apply` choosing an id when every one is taken, or changing the uid of an
+/// account that already has one it must not take (that would hand its files over).
+#[test]
+fn apply_leaves_the_account_alone_when_no_id_is_free_or_its_uid_is_unusable() {
+    let mut mac = FakeMac::converged("updater-no-free-id");
+    let text = format!("{}updater_user=_kbf-updater\n", mac.profile_text());
+    mac.set_profile(text);
+    for id in 200..=499 {
+        if id != 480 {
+            mac.state_mut().user(&format!("u{id}"), id);
+        }
+    }
+    let r = apply_keys(&mac, Some("updater_user"));
+    assert!(
+        r.text
+            .contains("NOTE updater_user: no free id from 200 to 499 for _kbf-updater"),
+        "{}",
+        r.text
+    );
+    assert!(!mac.state.borrow().records.contains_key(USER));
+    for (name, uid) in [("updater-uid-600", 600), ("updater-uid-role", 480)] {
+        let mut mac = converged_without_id(name);
+        mac.state_mut()
+            .user_attr("_kbf-updater", "UniqueID", &uid.to_string());
+        let r = check_keys(&mac, Some("updater_user"));
+        assert!(
+            r.text.contains("FAIL updater_user: uid ")
+                && r.text.contains("is not an id from 200 to 499"),
+            "{}",
+            r.text
+        );
+        let r = apply(&mac);
+        assert!(
+            r.text.contains(&format!(
+                "NOTE updater_user: _kbf-updater has uid {uid}, not an id from 200 to 499"
+            )),
+            "{}",
+            r.text
+        );
+    }
+    let mut mac = converged_without_id("updater-uid-vm");
+    let text = format!("{}vm_user_uid={ID}\n", mac.profile_text());
+    mac.set_profile(text);
+    let r = check_keys(&mac, Some("updater_user"));
+    assert!(
+        r.text
+            .contains("FAIL updater_user: uid 470 is not an id from 200 to 499"),
+        "{}",
+        r.text
+    );
+}
+
+/// Catches: a directory that cannot be read, or a `dscl` that refuses the changes,
+/// reported as a pass or followed by directories made anyway.
+#[test]
+fn a_directory_that_cannot_be_read_or_changed_is_a_failure_not_a_pass() {
+    let mut mac = converged_updater("updater-unreadable");
+    mac.state_mut().readall_fails = true;
+    let r = check_keys(&mac, Some("updater_user"));
+    assert!(
+        r.text
+            .contains("FAIL updater_user: could not read the directory"),
+        "{}",
+        r.text
+    );
+    let r = apply_keys(&mac, Some("updater_user"));
+    assert_eq!(r.failed, 1, "{}", r.text);
+    let mut mac = without_account("updater-dscl-refuses");
+    mac.state_mut().stdin_fails = true;
+    let r = apply(&mac);
+    assert!(
+        r.text.contains(
+            "NOTE updater_user: dscl refused a change to _kbf-updater; no directory made"
+        ),
+        "{}",
+        r.text
+    );
+    assert!(!mac.path(STATE_DIR).exists());
+}
