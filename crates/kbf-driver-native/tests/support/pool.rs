@@ -35,13 +35,25 @@ pub const HOMES: &str = "/private/var/kbf-ci-homes.noindex";
 /// (the slot's dirty step and what it found). `RUST_LOG` picks the filter; without it,
 /// warnings of the `kbf` crates.
 pub fn log_to_stderr() {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("kbf_driver_native=warn,kbf_daemon=warn,kbf_mac_session=warn")
-    });
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    use tracing_subscriber::{Layer as _, fmt, registry};
+    let filter = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|spec| spec.parse::<Targets>().ok())
+        .unwrap_or_else(|| {
+            Targets::new()
+                .with_target("kbf_driver_native", tracing::Level::WARN)
+                .with_target("kbf_daemon", tracing::Level::WARN)
+                .with_target("kbf_mac_session", tracing::Level::WARN)
+        });
+    let _ = registry()
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(filter),
+        )
         .try_init();
 }
 
