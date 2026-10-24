@@ -59,6 +59,44 @@ Host state is rebuilt from heartbeats. No heartbeat for 45 s means down. After a
 - **OIDC**: only CI's token may set the desired state.
 - **Attestation**: each updater checks the GitHub attestation itself: signer `komira-ai/kbf` `artifacts.yml`, hosted runners, full commit, channel ref. The updater resolves X itself from the channel ref of the attested release, validates the version format, and never takes a URL or path from the reply. A bad coordinator can only choose among attested builds.
 
+### 5.1 The OIDC allow-list
+
+`--oidc-config` of `kbf-coordinator` names a TOML file with a `[remote_operator]` table, the allow-list of CI's token. Every value that decides who is let in is required: there is no default issuer, audience, repository or workflow. `crates/kbf-oidc` is the authority. A token is admitted only if all hold, in this order:
+
+| claim | must be | set by |
+|---|---|---|
+| header `alg` | `RS256`; no `jku`, `x5u`, `jwk`, `x5c`, `crit`, `zip`; a `kid` that names a key of the issuer's JWKS (RSA, 2048 bits or more) | fixed |
+| signature | holds under that key | fixed |
+| `iss` | exactly `issuer` (`https://`, no trailing slash; the keys are discovered under it) | `issuer` (required) |
+| `aud` | exactly `audience`, as a string or a one-element array | `audience` (required) |
+| `exp`, `nbf`, `iat` | now within 60 s leeway; `exp - iat` at most `max_token_lifetime_secs` (default 600, at most 3600) | `max_token_lifetime_secs` |
+| `repository_id` | exactly the digits | `repository_id` (required) |
+| `repository` | exactly, if the file names it | `repository` |
+| `job_workflow_ref` | one of the list, each `owner/repo/.github/workflows/<file>@<ref>` | `job_workflow_ref` (required, at least one) |
+| `ref` | one of `refs`, if any are listed | `refs` |
+| `environment` | one of `environments`, if any are listed; when both lists are given both must match | `environments` (`refs` or `environments` is required) |
+| `event_name` | one of `event_names` (default `push`, `workflow_dispatch`; never a `pull_request*` event, which the file is refused for listing) | `event_names` |
+| `runner_environment` | exactly (default `github-hosted`) | `runner_environment` |
+| `jti` | present, not seen before (remembered until the token's `exp`; a full memory of 10,000 refuses new tokens) | fixed |
+
+`sub` is not matched: its form is GitHub's to change, and `repository_id` with `job_workflow_ref` say the same exactly. Nothing in a token is read before its signature holds, and a claim's value is never repeated back to the caller.
+
+The issuer's keys are fetched on the first token and again when a token names an unknown `kid` (the coordinator allows this at most every 30 s), and a key set older than one hour is fetched again by the next token, so a key the issuer withdrew stops verifying within the hour. If that fetch fails the keys held stay in use (an issuer outage does not stop deploys; the cost is that a withdrawn key is trusted until a fetch succeeds). A token whose key is held never waits for a fetch that is under way.
+
+```toml
+[remote_operator]
+issuer = "https://token.actions.githubusercontent.com"
+audience = "<the audience the job asks for>"
+repository_id = "<numeric id of the repository>"
+repository = "komira-ai/kbf"
+job_workflow_ref = ["komira-ai/kbf/.github/workflows/<workflow>.yml@refs/heads/main"]
+environments = ["<a protected environment>"]
+# event_names: push and workflow_dispatch by default
+# runner_environment: the default, github-hosted
+```
+
+A CI job asks for the token with its audience (`ACTIONS_ID_TOKEN_REQUEST_URL` with `&audience=`) and sends it as `Authorization: Bearer`. For a workflow that GitHub starts from a `workflow_run`, `job_workflow_ref` names the copy of the workflow on the default branch, and `event_names` must list `workflow_run`; the token does not say which event started the upstream run, so the workflow's own `if:` is what keeps a run started any other way from calling.
+
 ## 6. Failures
 
 - **Coordinator down**: nothing new starts. Hosts mid-update finish or revert alone.

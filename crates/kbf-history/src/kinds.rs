@@ -1,5 +1,4 @@
-//! Which kind of row a `ui/` key is, and who writes it (`docs/design/frontend-proxy.md`,
-//! section 8).
+//! Which kind of row a `ui/` key is, and who writes it.
 //!
 //! Every row the writer puts is one of:
 //!
