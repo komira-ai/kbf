@@ -4380,6 +4380,7 @@ dependencies = [
  "bytes",
  "futures",
  "hex",
+ "kbf-objstore",
  "serde",
  "serde_json",
  "sha2 0.11.0",

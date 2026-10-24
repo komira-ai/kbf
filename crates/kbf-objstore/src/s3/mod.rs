@@ -11,17 +11,25 @@
 //! upload (`multipart.rs`): parts of [`part_size`] sent one at a time, each held in
 //! memory only while it is sent, and the upload aborted on any failure.
 //!
+//! Beyond the trait, [`S3Store`] has the calls an object used for coordination needs
+//! (`tagged.rs`): [`S3Store::head`] (size, entity tag, time of last write),
+//! [`S3Store::get_all`], [`S3Store::put_if_match`] (`If-Match`) and
+//! [`S3Store::list_stamped`] (a listing with the time of last write).
+//!
 //! Not built yet: TLS (an `https` endpoint is refused).
 
 #[cfg(feature = "testkit")]
 pub mod fake;
 mod multipart;
 mod sigv4;
+mod tagged;
+mod times;
 mod xml;
 
 pub use multipart::{
     MAX_PART_BYTES, MAX_PARTS, MIN_PART_BYTES, MULTIPART_THRESHOLD, PART_BYTES, part_size,
 };
+pub use tagged::{ObjectHead, StampedObject, StampedPage};
 
 use std::fmt;
 use std::num::NonZeroU64;
@@ -540,6 +548,19 @@ impl ObjectStore for S3Store {
         after: Option<&ListToken>,
         max_keys: PageSize,
     ) -> Result<ListPage, ObjectStoreError> {
+        let body = self.list_body(prefix, after, max_keys).await?;
+        xml::list_page(&body)
+    }
+}
+
+impl S3Store {
+    /// The body of the answer to one ListObjectsV2 request.
+    async fn list_body(
+        &self,
+        prefix: &KeyPrefix,
+        after: Option<&ListToken>,
+        max_keys: PageSize,
+    ) -> Result<Bytes, ObjectStoreError> {
         let mut query = vec![
             ("list-type", "2".to_owned()),
             ("prefix", prefix.as_str().to_owned()),
@@ -559,8 +580,7 @@ impl ObjectStore for S3Store {
         if resp.status() != StatusCode::OK {
             return Err(failure(resp).await);
         }
-        let body = resp.bytes().await.map_err(transport)?;
-        xml::list_page(&body)
+        resp.bytes().await.map_err(transport)
     }
 }
 

@@ -2,7 +2,9 @@
 //!
 //! The crate knows nothing of what is stored: objects are immutable byte strings under string
 //! keys, and it depends on no crate of the workspace it lives in, so that it can move to a
-//! repository of its own.
+//! repository of its own. The one exception is the feature `s3` (off by default), which adds
+//! `S3Backend`, an adapter over the S3 client of `kbf-objstore`; without it the crate has no
+//! such dependency (its tests build `kbf-objstore` either way).
 //!
 //! - [`Backend`] is the minimal API of an S3-compatible store: a create-only put (it fails
 //!   with [`Error::AlreadyExists`] where the key exists, as `If-None-Match: *` does), a put
@@ -14,6 +16,10 @@
 //! - [`MemoryBackend`] is an in-memory backend whose times come from a [`TestClock`] that a
 //!   test sets by hand, and [`FaultyBackend`] wraps a backend to fail or delay chosen calls
 //!   and to count them: both are for tests.
+//! - `S3Backend` (feature `s3`, in the module `s3`) is a bucket of an S3-compatible store as
+//!   a [`Backend`]: a create-only put is `If-None-Match: *`, a put that replaces is
+//!   `If-Match`, a get is a ranged GET, a head gives the `ETag` as the content tag, and a
+//!   listing follows the continuation tokens.
 //! - [`Proxy`] is a store over a hot and a cold backend that is itself a [`Backend`]. Any
 //!   number of proxies (one per node, each with its own id) work over the same two backends,
 //!   and none needs state for correctness. A get reads the hot tier, else the cold tier, and
@@ -49,6 +55,8 @@ mod journal;
 mod lease;
 mod memory;
 mod reconciler;
+#[cfg(feature = "s3")]
+pub mod s3;
 mod state;
 mod tiered;
 
@@ -60,4 +68,6 @@ pub use faulty::{FaultyBackend, Op};
 pub use journal::{JournalEntry, JournalOp, decode_journal, encode_journal};
 pub use memory::{MemoryBackend, TestClock};
 pub use reconciler::{PassReport, Reconciler, ReconcilerConfig};
+#[cfg(feature = "s3")]
+pub use s3::S3Backend;
 pub use tiered::{Proxy, ProxyConfig};

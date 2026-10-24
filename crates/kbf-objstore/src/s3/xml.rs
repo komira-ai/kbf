@@ -3,6 +3,8 @@
 
 use roxmltree::{Document, Node};
 
+use super::tagged::{StampedObject, StampedPage};
+use super::times;
 use crate::types::Token;
 use crate::{ListPage, ListToken, ObjectInfo, ObjectKey, ObjectStoreError};
 
@@ -22,8 +24,51 @@ pub(crate) fn error_code_message(body: &[u8]) -> (String, String) {
     )
 }
 
+/// An object of a ListObjectsV2 answer, with the text of the fields only a stamped listing
+/// reads.
+struct Entry {
+    key: ObjectKey,
+    size: u64,
+    modified: Option<String>,
+}
+
 /// A ListObjectsV2 answer as a [`ListPage`].
 pub(crate) fn list_page(body: &[u8]) -> Result<ListPage, ObjectStoreError> {
+    let (entries, next) = list_result(body)?;
+    let objects = entries
+        .into_iter()
+        .map(|entry| ObjectInfo {
+            key: entry.key,
+            size: entry.size,
+        })
+        .collect();
+    Ok(ListPage { objects, next })
+}
+
+/// A ListObjectsV2 answer as a [`StampedPage`]: every object must carry a readable
+/// `<LastModified>`.
+pub(crate) fn stamped_page(body: &[u8]) -> Result<StampedPage, ObjectStoreError> {
+    let (entries, next) = list_result(body)?;
+    let mut objects = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let modified = entry.modified.as_deref().and_then(times::iso8601_millis);
+        let modified_millis = modified.ok_or_else(|| {
+            ObjectStoreError::Protocol(format!(
+                "ListObjectsV2 answer: {}: missing or bad <LastModified>",
+                entry.key
+            ))
+        })?;
+        objects.push(StampedObject {
+            key: entry.key,
+            size: entry.size,
+            modified_millis,
+        });
+    }
+    Ok(StampedPage { objects, next })
+}
+
+/// The objects and the next token of a ListObjectsV2 answer.
+fn list_result(body: &[u8]) -> Result<(Vec<Entry>, Option<ListToken>), ObjectStoreError> {
     let bad = |what: String| ObjectStoreError::Protocol(format!("ListObjectsV2 answer: {what}"));
     let text = std::str::from_utf8(body).map_err(|e| bad(e.to_string()))?;
     let doc = Document::parse(text).map_err(|e| bad(e.to_string()))?;
@@ -31,14 +76,19 @@ pub(crate) fn list_page(body: &[u8]) -> Result<ListPage, ObjectStoreError> {
     if root.tag_name().name() != "ListBucketResult" {
         return Err(bad(format!("root element is <{}>", root.tag_name().name())));
     }
-    let mut objects = Vec::new();
+    let mut entries = Vec::new();
     for c in root.children().filter(|n| is_named(*n, "Contents")) {
         let key = child_text(c, "Key").ok_or_else(|| bad("<Contents> without <Key>".into()))?;
         let key = ObjectKey::new(key).map_err(|e| bad(format!("listed key: {e}")))?;
         let size = child_text(c, "Size")
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| bad(format!("{key}: missing or bad <Size>")))?;
-        objects.push(ObjectInfo { key, size });
+        let modified = child_text(c, "LastModified").map(str::to_owned);
+        entries.push(Entry {
+            key,
+            size,
+            modified,
+        });
     }
     let truncated = match child_text(root, "IsTruncated") {
         Some("true") => true,
@@ -50,7 +100,7 @@ pub(crate) fn list_page(body: &[u8]) -> Result<ListPage, ObjectStoreError> {
         (true, _) => return Err(bad("truncated without <NextContinuationToken>".into())),
         (false, _) => None,
     };
-    Ok(ListPage { objects, next })
+    Ok((entries, next))
 }
 
 /// The `UploadId` of a CreateMultipartUpload answer.
@@ -293,5 +343,46 @@ mod tests {
         assert_eq!(page.objects.len(), 1);
         assert_eq!(page.objects[0].key.as_str(), "p/a");
         assert_eq!(page.objects[0].size, 7);
+    }
+
+    /// Asserts that a stamped page carries each object's key, size and time of last write in
+    /// milliseconds, and the next token as a plain page does.
+    #[test]
+    fn a_stamped_page_carries_the_times_of_last_write() {
+        let body = format!(
+            "<ListBucketResult {NS}><IsTruncated>true</IsTruncated>\
+             <NextContinuationToken>t2</NextContinuationToken>\
+             <Contents><Key>p/a</Key><LastModified>2009-10-12T17:50:30.000Z</LastModified>\
+             <ETag>\"x\"</ETag><Size>3</Size></Contents>\
+             <Contents><Key>p/b</Key><LastModified>1970-01-01T00:00:01.500Z</LastModified>\
+             <Size>0</Size></Contents></ListBucketResult>"
+        );
+        let page = stamped_page(body.as_bytes()).unwrap();
+        assert_eq!(page.next, Some(ListToken(Token::Continue("t2".into()))));
+        let got: Vec<_> = page
+            .objects
+            .iter()
+            .map(|o| (o.key.as_str(), o.size, o.modified_millis))
+            .collect();
+        assert_eq!(got, [("p/a", 3, 1_255_369_830_000), ("p/b", 0, 1_500)]);
+        assert_eq!(list_page(body.as_bytes()).unwrap().objects.len(), 2);
+    }
+
+    /// Asserts that a stamped page is a protocol error, naming the key, when an object has no
+    /// `<LastModified>` or one that is not a time, and that an answer that is not a listing
+    /// is refused as it is for a plain page.
+    #[test]
+    fn a_stamped_page_without_readable_times_is_a_protocol_error() {
+        for modified in ["", "<LastModified>yesterday</LastModified>"] {
+            let body = format!(
+                "<ListBucketResult><Contents><Key>p/a</Key>{modified}<Size>1</Size>\
+                 </Contents></ListBucketResult>"
+            );
+            let err = stamped_page(body.as_bytes()).unwrap_err();
+            assert!(matches!(err, ObjectStoreError::Protocol(_)), "{err:?}");
+            let why = "p/a: missing or bad <LastModified>";
+            assert!(err.to_string().contains(why), "{err}");
+        }
+        assert!(stamped_page(b"not xml").is_err());
     }
 }
