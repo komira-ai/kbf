@@ -505,7 +505,9 @@ pinned by digest (`packaging/container/frontend/Dockerfile` says why that base).
   Its entrypoint is `kbf-coordinator`, with the flags of its mounted files as the default command
   (`packaging/container/kbf-coordinator/Dockerfile`), and it declares the ports 8443 and 8444.
 
-Both are run as `docs/deploy/containers.md` says.
+Both are run as `docs/deploy/containers.md` says. The archives are small, a binary on a distroless
+base: about 34 MB for a frontend image and 13 MB for a coordinator image, about 94 MB for the four,
+and they add that much to every run's artifacts and to every release.
 
 The build is reproducible: the job builds each image twice from the commit's time
 (`SOURCE_DATE_EPOCH`, with BuildKit's own provenance and SBOM attachments off) and the two files
