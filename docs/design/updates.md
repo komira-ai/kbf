@@ -1,6 +1,6 @@
 # kbf updates: a coordinator and an updater on every host
 
-Status: approved design. The coordinator (section 8, PR 1) is built as the `kbf-coordinator` crate, with the wire types in `kbf-updater` (`wire`); the host agent (PR 2) and the deletion of the ssh path (PR 3) are **planned**.
+Status: approved design. The coordinator (section 8, PR 1) is built as the `kbf-coordinator` crate, with the wire types in `kbf-updater` (`wire`). The host agent (PR 2) is built as `kbf-updater agent` and `kbf-host-install --serve` ([../deploy/kbf-updater.md](../deploy/kbf-updater.md#the-agent-mode), [../deploy/host-install.md](../deploy/host-install.md#the-local-socket)), with the certificate, key and CA as files an operator places; enrollment (PR 3) and the deletion of the ssh path (PR 4) are **planned**.
 
 Related: [fleet-updates.md](fleet-updates.md) and [fleet-updates-security.md](fleet-updates-security.md) (the earlier push-shaped design), [pull-updates.md](pull-updates.md) and [split-mode-updates.md](split-mode-updates.md) (the pull-shaped design and the order of a rollout), [install-and-enrollment.md](install-and-enrollment.md) (enrollment and the farm CA), [../deploy/kbf-updater.md](../deploy/kbf-updater.md) (the updater as it is today).
 
@@ -73,5 +73,6 @@ Host state is rebuilt from heartbeats. No heartbeat for 45 s means down. After a
 ## 8. PR split
 
 1. **Coordinator**: `kbf-coordinator`, wire types, decision logic and limits, desired-state call, mTLS, OIDC, image. Fakes. ssh untouched.
-2. **Host agent**: heartbeat loop in `kbf-updater`, enrollment, local A/B with a local `kbf-host-install` socket beside the ssh forced command, systemd and launchd packaging. ssh still works.
-3. **Delete the ssh path**: the items in section 7. Merge only when every host on the maintainers' own host list shows in the coordinator's heartbeats, since `inventory` is gone.
+2. **Host agent**: heartbeat loop in `kbf-updater`, local A/B with a local `kbf-host-install` socket beside the ssh forced command, systemd and launchd packaging. ssh still works. The certificate comes from files an operator places.
+3. **Enrollment**: the one-time token, the farm CA, the certificate for the agent.
+4. **Delete the ssh path**: the items in section 7. Merge only when every host on the maintainers' own host list shows in the coordinator's heartbeats, since `inventory` is gone.

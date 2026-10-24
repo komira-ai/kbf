@@ -78,6 +78,8 @@ pub struct Limits {
 /// as the home of `gh`. `token`, when there is one, is one line of letters, digits, `_` and
 /// `-`.
 pub struct Fetcher<'a> {
+    /// The platform of the release files to take: `darwin-arm64`, `linux-x86_64`, ...
+    pub platform: &'a str,
     pub runner: &'a dyn Runner,
     pub curl: &'a Path,
     pub gh: &'a Path,
@@ -195,7 +197,10 @@ impl Fetcher<'_> {
         let mut args: Vec<String> = ["release", "download", tag, "--repo", REPO]
             .map(str::to_owned)
             .to_vec();
-        for name in [release::tarball_name(commit), release::bundle_name(commit)] {
+        for name in [
+            release::tarball_name_on(self.platform, commit),
+            release::bundle_name_on(self.platform, commit),
+        ] {
             args.push("--pattern".to_owned());
             args.push(name);
         }
@@ -228,7 +233,7 @@ impl Fetcher<'_> {
         let mut complete = false;
         for page in 1..=MAX_PAGES {
             let releases = self.list_page(page)?;
-            note(&mut found, &releases, prefix);
+            note(&mut found, &releases, self.platform, prefix);
             // Only an empty page ends the listing: a short one is not taken for the end.
             if releases.is_empty() {
                 complete = true;
@@ -392,16 +397,16 @@ fn retry_after(response: &Response<'_>) -> String {
 
 /// Note the tarballs of the commits that start with `prefix` in `releases`. The first
 /// listing of a commit (the newest release) is the one kept.
-fn note(found: &mut BTreeMap<String, Found>, releases: &[Release], prefix: &str) {
+fn note(found: &mut BTreeMap<String, Found>, releases: &[Release], platform: &str, prefix: &str) {
     for release in releases.iter().filter(|r| !r.draft && tag_ok(&r.tag_name)) {
         for asset in &release.assets {
-            let Some(commit) = release::commit_of_name(&asset.name) else {
+            let Some(commit) = release::commit_of_name_on(platform, &asset.name) else {
                 continue;
             };
             if !commit.starts_with(prefix) {
                 continue;
             }
-            let bundle = release::bundle_name(commit);
+            let bundle = release::bundle_name_on(platform, commit);
             found.entry(commit.to_owned()).or_insert_with(|| Found {
                 tag: release.tag_name.clone(),
                 tarball_size: asset.size,

@@ -1,8 +1,11 @@
-use kbf_types::HostRole;
+use kbf_types::{HostRole, NodeId};
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, SanType};
 
 use crate::identity::{Identity, IdentityError, identity_of};
-use crate::testutil::id;
+
+fn id(text: &str) -> NodeId {
+    text.parse().expect("a node id")
+}
 
 fn uri(text: &str) -> SanType {
     SanType::URI(text.try_into().expect("an IA5 name"))

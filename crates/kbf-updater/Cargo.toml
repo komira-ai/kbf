@@ -14,15 +14,25 @@ publish.workspace = true
 # adapter (an HTTP client of the frontend's loopback operator API) and the binary's wiring
 # (`daemon`). Synchronous on purpose, threads and blocking sockets, no async runtime: HTTP is
 # read with httparse, which the workspace already uses for its loopback calls.
+#
+# The agent mode (`agent`, docs/design/updates.md) is the other way round: an updater on every
+# host that dials the coordinator over mutual TLS (rustls, the ring provider the workspace
+# already builds, over a std socket), reads its own certificate for who it is (kbf-peer), and
+# drives its host's A/B through `kbf-host-install`'s local socket.
 [dependencies]
+kbf-peer.workspace = true
 kbf-types.workspace = true
 httparse.workspace = true
 libc.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
+kbf-ca.workspace = true
+rcgen.workspace = true
 # The contract test feeds the real answer types of the forced command to the ssh installer.
 kbf-host-install = { path = "../kbf-host-install" }
 kbf-testkit.workspace = true

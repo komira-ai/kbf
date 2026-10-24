@@ -19,7 +19,6 @@ path = "src/main.rs"
 
 [dependencies]
 kbf-oidc.workspace = true
-kbf-peer.workspace = true
 kbf-tls.workspace = true
 kbf-types.workspace = true
 kbf-updater.workspace = true

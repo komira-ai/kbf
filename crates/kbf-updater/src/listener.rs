@@ -137,10 +137,29 @@ fn socket_option(fd: RawFd, option: libc::c_int) -> Result<libc::c_int, String> 
     }
 }
 
+/// The address family of the socket `fd` (`getsockname`, so that it is the same call on every
+/// platform: `SO_DOMAIN` is Linux's).
+fn socket_domain(fd: RawFd) -> Result<libc::c_int, String> {
+    // SAFETY: an all-zero `sockaddr_storage` is a valid value of the type (plain integers).
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: `storage` and `len` are live for the call and `len` is the size of `storage`; a
+    // descriptor that is not open makes the call fail with EBADF, not misbehave.
+    let rc = unsafe { libc::getsockname(fd, (&raw mut storage).cast(), &raw mut len) };
+    if rc == 0 {
+        Ok(libc::c_int::from(storage.ss_family))
+    } else {
+        Err(format!(
+            "descriptor {fd} is not a socket: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
 /// Take ownership of `fd` as the listener, if it is a listening unix stream socket; any other
 /// descriptor is an error and is left alone (not closed).
 pub fn adopt(fd: RawFd) -> Result<UnixListener, String> {
-    if socket_option(fd, libc::SO_DOMAIN)? != libc::AF_UNIX {
+    if socket_domain(fd)? != libc::AF_UNIX {
         return Err(format!("descriptor {fd} is not a unix socket"));
     }
     if socket_option(fd, libc::SO_TYPE)? != libc::SOCK_STREAM {

@@ -1550,7 +1550,6 @@ dependencies = [
  "hyper-util",
  "kbf-ca",
  "kbf-oidc",
- "kbf-peer",
  "kbf-testkit",
  "kbf-tls",
  "kbf-types",
@@ -1910,7 +1909,10 @@ name = "kbf-host-install"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "kbf-host",
+ "kbf-installer",
  "kbf-testkit",
+ "kbf-update",
  "rustix",
  "serde",
  "serde_json",
@@ -2693,11 +2695,16 @@ dependencies = [
 name = "kbf-updater"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "httparse",
+ "kbf-ca",
  "kbf-host-install",
+ "kbf-peer",
  "kbf-testkit",
  "kbf-types",
  "libc",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror",
