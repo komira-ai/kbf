@@ -2,7 +2,10 @@
 //! the operator bearer token from a file, and the proxy's per-boot secret when the frontend runs
 //! behind kbf-proxy. Safe-to-stop ([`crate::safe_http`]) and node health
 //! ([`crate::node_health`]) are reads of it; draining a node ([`crate::node_drain`]) is a read
-//! and two writes.
+//! and two writes. The same client, pointed at the operator port of a pool member
+//! ([`OperatorApi::at`]), retires that frontend ([`crate::frontend_http`]); and without
+//! credentials ([`OperatorApi::anonymous`]) it speaks to the proxy's admin API
+//! ([`crate::pool_http`]).
 //!
 //! A frontend that runs behind kbf-proxy (`--proxy-auth-file`) refuses an operator call that
 //! lacks the proxy's per-boot secret, 403 (`kbf-server` `api.rs` `operator_gate`). With
@@ -31,6 +34,9 @@ pub(crate) const REPLY_MAX: u64 = 1024 * 1024;
 /// What error texts call the far side.
 pub const WHAT: &str = "the operator API";
 
+/// What the error texts call the proxy's admin API.
+pub const PROXY_WHAT: &str = "the proxy's admin API";
+
 /// What an operator checks when the API refuses a call: the flags of the two files (named in
 /// [`crate::secret`]) and the API's own gates.
 pub const CHECK: &str = "--token-file, --operator-proxy-auth-file and the API's gates";
@@ -42,7 +48,10 @@ const PROXY_AUTH_HEADER: &str = "x-kbf-proxy-auth";
 #[derive(Clone)]
 pub struct OperatorApi {
     addr: SocketAddr,
-    token_file: PathBuf,
+    /// What error texts call the far side.
+    what: &'static str,
+    /// The file of the operator token; none for a call that sends no credential.
+    token_file: Option<PathBuf>,
     /// The proxy's secret, for a frontend behind kbf-proxy.
     proxy_auth_file: Option<PathBuf>,
     timeout: Duration,
@@ -63,10 +72,38 @@ impl OperatorApi {
         }
         Ok(OperatorApi {
             addr,
-            token_file,
+            what: WHAT,
+            token_file: Some(token_file),
             proxy_auth_file,
             timeout: TIMEOUT,
         })
+    }
+
+    /// A client for the proxy's admin API, which asks for no credential and listens on loopback
+    /// only: it sends neither the token nor the proxy's secret, so neither leaves this
+    /// process for a socket that does not need it.
+    pub fn anonymous(addr: SocketAddr) -> OperatorApi {
+        OperatorApi {
+            addr,
+            what: PROXY_WHAT,
+            token_file: None,
+            proxy_auth_file: None,
+            timeout: TIMEOUT,
+        }
+    }
+
+    /// What this client's error texts call the API it talks to.
+    pub fn what(&self) -> &'static str {
+        self.what
+    }
+
+    /// The same client, with the same files, for the API at another address (another member
+    /// of a pool has its own operator port).
+    pub fn at(&self, addr: SocketAddr) -> OperatorApi {
+        OperatorApi {
+            addr,
+            ..self.clone()
+        }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> OperatorApi {
@@ -87,15 +124,19 @@ impl OperatorApi {
     }
 
     fn call(&self, method: &str, path: &str, body: &str) -> Result<Reply, PortError> {
-        let token = read_token(&self.token_file).map_err(PortError::other)?;
+        let token = match &self.token_file {
+            Some(file) => Some(read_token(file).map_err(PortError::other)?),
+            None => None,
+        };
         let secret = match &self.proxy_auth_file {
             Some(file) => Some(read_proxy_secret(file).map_err(PortError::other)?),
             None => None,
         };
+        let what = self.what;
         let raw = self
-            .exchange(method, path, body, &token, secret.as_deref())
-            .map_err(|e| PortError::unreachable(format!("{WHAT}: {}", e.kind())))?;
-        Reply::parse(&raw, WHAT)
+            .exchange(method, path, body, token.as_deref(), secret.as_deref())
+            .map_err(|e| PortError::unreachable(format!("{what}: {}", e.kind())))?;
+        Reply::parse(&raw, what)
     }
 
     /// One request, one answer: the raw bytes, up to [`REPLY_MAX`].
@@ -104,18 +145,21 @@ impl OperatorApi {
         method: &str,
         path: &str,
         body: &str,
-        token: &str,
+        token: Option<&str>,
         proxy_secret: Option<&str>,
     ) -> std::io::Result<Vec<u8>> {
         let mut stream = TcpStream::connect_timeout(&self.addr, self.timeout)?;
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;
+        let bearer = token
+            .map(|token| format!("Authorization: Bearer {token}\r\n"))
+            .unwrap_or_default();
         let proxy = proxy_secret
             .map(|secret| format!("{PROXY_AUTH_HEADER}: {secret}\r\n"))
             .unwrap_or_default();
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\
-             Accept: application/json\r\nAuthorization: Bearer {token}\r\n\
+             Accept: application/json\r\n{bearer}\
              {proxy}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             self.addr,
             body.len()

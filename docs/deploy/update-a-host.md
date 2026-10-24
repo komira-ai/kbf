@@ -13,6 +13,9 @@ All three use the same layout: each release in `releases/<commit>/` of the insta
 `releases/current` and `releases/previous`, and `state.json`. See
 [host releases](host-releases.md) for the layout and what is trusted.
 
+A farm whose hosts run the packages is rolled by [kbf-updater](kbf-updater.md), which also
+drains, retires and restarts the frontends of a kbf-proxy pool one at a time.
+
 ## Upgrade the installer first (seq)
 
 A kbf built from main at or after commit 0c650e54 prints `seq` in `--version --json`, and every

@@ -96,6 +96,7 @@ fn host() -> Host {
         role: Role::Storage,
         host_key: KEY.into(),
         node_id: None,
+        member: None,
     }
 }
 

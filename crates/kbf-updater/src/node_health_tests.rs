@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 use crate::api::{ErrorCode, RollState};
 use crate::fakes::{FakeInstaller, Log};
 use crate::health::{commit_of, names};
-use crate::inventory::{Host, Role};
-use crate::node_health::{FRONTEND_REFUSAL, NodeHealth};
+use crate::inventory::{Host, Member, Role};
+use crate::node_health::{MEMBER_ELSEWHERE, NO_MEMBER_REFUSAL, NodeHealth};
 use crate::operator::OperatorApi;
 use crate::ports::{Health, HealthCheck, PortError, PortErrorKind};
 use crate::testutil::{FakeApi, KEY, TOKEN, closed_port, fake_api_by, file, http, scratch};
@@ -29,6 +29,7 @@ fn host(alias: &str, role: Role) -> Host {
         role,
         host_key: KEY.to_owned(),
         node_id: None,
+        member: None,
     }
 }
 
@@ -508,35 +509,46 @@ fn a_version_names_its_commit_and_a_report_matches_by_prefix() {
     ));
 }
 
-/// Catches a frontend being judged like a storage node, or waited on: its health is the
-/// refusal at once, with the text that says the proxy's drain control is missing, and the
-/// operator API is not asked anything (a version without a commit changes nothing).
+/// Asserts that a frontend that is no pool member is refused before it is installed, with the
+/// text that says to list it with an instance and a base, that a frontend member is not
+/// refused and is not judged here, whatever the version, and that no other role is refused.
+/// The operator API is not asked anything.
 #[test]
-fn a_frontend_host_is_refused_without_asking_the_api() {
+fn a_frontend_host_that_is_no_member_is_refused_without_asking_the_api() {
     let server = routes(vec![]);
     let health = adapter(&server, "nh-fe");
     let fe = host("fe", Role::Frontend);
-    let refused = Ok(Health::Abandoned(FRONTEND_REFUSAL.to_owned()));
-    assert_eq!(health.check(&fe, &target()), refused);
+    let member = Member {
+        instance: "a".to_owned(),
+        base_port: 18000,
+    };
+    let pooled = Host {
+        member: Some(member),
+        ..fe.clone()
+    };
+    let elsewhere = Ok(Health::Abandoned(MEMBER_ELSEWHERE.to_owned()));
     let bare = Version::parse("2.0-1").expect("version");
-    assert_eq!(health.check(&fe, &bare), refused);
-    assert_eq!(
-        FRONTEND_REFUSAL,
-        "frontend updates need the kbf-proxy drain control, which is not built yet"
-    );
-    // Asked before the installer: the frontend is refused, the other roles are not.
-    assert_eq!(health.refusal(&fe), Some(FRONTEND_REFUSAL.to_owned()));
+    for version in [target(), bare] {
+        assert_eq!(health.check(&fe, &version), elsewhere);
+        assert_eq!(health.check(&pooled, &version), elsewhere);
+        assert_eq!(health.check_held(&pooled, &version), elsewhere);
+    }
+    // Asked before the installer: the frontend that is no member is refused, nothing else is.
+    assert_eq!(health.refusal(&fe), Some(NO_MEMBER_REFUSAL.to_owned()));
+    assert_eq!(health.refusal(&pooled), None);
     assert_eq!(health.refusal(&host("st1", Role::Storage)), None);
     assert_eq!(health.refusal(&host("dm", Role::Daemon)), None);
+    assert!(NO_MEMBER_REFUSAL.contains("instance=<name> and base=<port>"));
     assert!(server.requests().is_empty());
 }
 
-/// Catches a roll that goes past a frontend it cannot judge: a roll over every host puts the
-/// frontend first, the roll fails at it with `swap_abandoned` and the refusal text before the
-/// installer is called, so the frontend is not changed. No host is installed, checked or
-/// asked about, and the operator API is not called.
+/// Asserts that a roll over a frontend that is no pool member is refused at it: a roll over
+/// every host puts the frontend first, the roll fails at it with `swap_abandoned` and the
+/// refusal text before the installer is called, so the frontend is not changed. No host is
+/// installed, checked or asked about, the proxy's pool is not asked, and the operator API is
+/// not called.
 #[test]
-fn a_roll_with_a_frontend_fails_at_it_and_touches_no_host_after() {
+fn a_roll_with_a_frontend_that_is_no_member_fails_at_it_and_touches_no_host_after() {
     let server = routes(vec![]);
     let rig = Rig::new("nh-roll-fe");
     let ports = Ports {
@@ -545,6 +557,8 @@ fn a_roll_with_a_frontend_fails_at_it_and_touches_no_host_after() {
         drain: Box::new(rig.drain.clone()),
         health: Box::new(adapter(&server, "nh-roll-fe")),
         clock: Box::new(rig.clock.clone()),
+        pool: Box::new(rig.pool.clone()),
+        frontend: Box::new(rig.front.clone()),
     };
     let updater = Updater::open(inventory(), rig.store(), ports, Timing::default()).expect("open");
     let started = updater.start(&all(TARGET, "run-1")).expect("start");
@@ -553,7 +567,7 @@ fn a_roll_with_a_frontend_fails_at_it_and_touches_no_host_after() {
     let failure = roll.failure.expect("failure");
     assert_eq!(failure.code, ErrorCode::SwapAbandoned);
     assert!(
-        failure.detail.contains(FRONTEND_REFUSAL),
+        failure.detail.contains(NO_MEMBER_REFUSAL),
         "{}",
         failure.detail
     );

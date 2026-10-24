@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use crate::api::{ErrorCode, Hosts, Phase, Roll, RollRequest, RollState};
 use crate::fakes::{
-    Event, FakeClock, FakeDrain, FakeHealth, FakeInstaller, FakeSafeToStop, Log, safe,
-    unsafe_because,
+    Event, FakeClock, FakeDrain, FakeFrontend, FakeHealth, FakeInstaller, FakePool, FakeSafeToStop,
+    Log, safe, unsafe_because,
 };
 use crate::inventory::Inventory;
 use crate::ports::{Health, PortError, Stop};
@@ -53,6 +53,8 @@ pub(crate) struct Rig {
     pub drain: FakeDrain,
     pub health: FakeHealth,
     pub clock: FakeClock,
+    pub pool: FakePool,
+    pub front: FakeFrontend,
 }
 
 impl Rig {
@@ -72,6 +74,8 @@ impl Rig {
             drain: FakeDrain::new(&log),
             health: FakeHealth::new(&log),
             clock: FakeClock::new(),
+            pool: FakePool::new(&log),
+            front: FakeFrontend::new(&log),
             log,
         }
     }
@@ -83,6 +87,8 @@ impl Rig {
             drain: Box::new(self.drain.clone()),
             health: Box::new(self.health.clone()),
             clock: Box::new(self.clock.clone()),
+            pool: Box::new(self.pool.clone()),
+            frontend: Box::new(self.front.clone()),
         }
     }
 
@@ -95,7 +101,12 @@ impl Rig {
     }
 
     pub fn open_with(&self, store: RollStore) -> Updater {
-        match Updater::open(inventory(), store, self.ports(), Timing::default()) {
+        self.open_inventory(inventory(), store)
+    }
+
+    /// An updater over `inventory` in place of the standard one.
+    pub fn open_inventory(&self, inventory: Inventory, store: RollStore) -> Updater {
+        match Updater::open(inventory, store, self.ports(), Timing::default()) {
             Ok(u) => u,
             Err(e) => panic!("open: {e}"),
         }
