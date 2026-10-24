@@ -342,11 +342,12 @@ async fn a_touch_answered_with_another_outcome_leaves_the_stored_blob_held() {
     let cache = cache().await;
     let log = cache.meta();
     let blob = store(&cache, "stored twice").await;
-    let before = log.commits_but_touches();
     assert!(log.touches().is_empty(), "the first store touched nothing");
 
     // A blob stored the same day needs no touch; five days on, a store asks for one.
     cache.tick(days(5)).await.expect("tick");
+    // The tick is a commit of its own; count from after it.
+    let before = log.commits_but_touches();
     log.fail_next_touches(1);
     let again = VerifiedBlob::hashed(Bytes::from_static(b"stored twice"));
     cache.store_blobs(vec![again]).await.expect("store again");
