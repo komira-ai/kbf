@@ -6,9 +6,9 @@
 //! - The account: uid `vm_user_uid` (450 to 499), primary group `staff`, shell
 //!   `/bin/zsh`, home `kbf-vm` under `/Users` (mode 700, its own), hidden, with a password; in
 //!   no group that gives it administrator rights, Remote Login or Screen Sharing.
-//! - The password is made here: 32 random bytes in hex, written to a file only root can
-//!   read ([`PASSWORD_FILE`], mode 400, in kbf-mac-session's state directory) before it
-//!   is set on the account, and handed to `dscl` on its standard input. It is never an
+//! - The password is made here: 32 random bytes in hex, handed to `dscl` on its standard
+//!   input and, once `dscl` has set it, written to a file only root can read
+//!   ([`PASSWORD_FILE`], mode 400, in kbf-mac-session's state directory). It is never an
 //!   argument of a program and never printed. The file is there for the root helper
 //!   (kbf-mac-session): it may have to unlock the account's login keychain at session
 //!   start (whether automatic login leaves it locked is not yet measured), and it is
@@ -25,7 +25,7 @@ use std::io;
 
 use crate::accounts::{DSCL, DSEDITGROUP, dscl_attr};
 use crate::directory::{Batch, Directory};
-use crate::items::{Ctx, Lines, Outcome, fail, or, pass, run};
+use crate::items::{Ctx, Lines, Outcome, defaults_read, fail, or, pass, run};
 use crate::pool::dir_of;
 
 /// The VM user's name.
@@ -231,7 +231,7 @@ fn fix_state_dir(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
     }
 }
 
-/// The password in the file, or a new one written to it first. `true` when it is new.
+/// The password in the file, or a new one (not yet written). `true` when it is new.
 fn password(c: &Ctx<'_>, out: &mut Lines) -> io::Result<(String, bool)> {
     if let PasswordFile::Valid(password) = password_file(c) {
         if c.mac.ls(PASSWORD_FILE) != PASSWORD_WANT {
@@ -245,21 +245,15 @@ fn password(c: &Ctx<'_>, out: &mut Lines) -> io::Result<(String, bool)> {
     if bytes.len() != PASSWORD_BYTES {
         return Err(io::Error::other("the random source gave too few bytes"));
     }
-    let password = hex::encode(bytes);
-    c.mac
-        .replace(PASSWORD_FILE, password.as_bytes(), 0, 0, 0o400)?;
-    out.change(
-        c.key,
-        format!("{PASSWORD_FILE}: a new random password, root's, mode 400"),
-    );
-    Ok((password, true))
+    Ok((hex::encode(bytes), true))
 }
 
 /// Makes the account what [`vm_user`] wants. Nothing is changed while another account
-/// holds the uid or the name ([`foreign`]). The password file is written before the
-/// password is set, and the password is fed to `dscl` on its standard input; when
-/// `dscl` refuses it, a file made in this run is removed, so the next run makes
-/// another. An account that has a password and a valid file keeps its password.
+/// holds the uid or the name ([`foreign`]). The password is fed to `dscl` on its
+/// standard input, and only once `dscl` has set it is a new one written to the password
+/// file: a run that stops anywhere in between leaves a file that is missing or invalid,
+/// never a valid one the account does not have, so the next run makes another password.
+/// An account that has a password and a valid file keeps its password.
 pub(crate) fn fix_vm_user(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
     // `apply` fixes only an item that fails, and this one passes while the key is unset.
     let uid = c.profile.vm_user_uid.unwrap_or_default();
@@ -270,14 +264,17 @@ pub(crate) fn fix_vm_user(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
     fix_state_dir(c, out)?;
     let (password, fresh) = password(c, out)?;
     let record = format!("/Users/{VM_USER}");
-    let found = dir.user(VM_USER);
+    let has_password = dir
+        .user(VM_USER)
+        .is_some_and(|r| r.has("AuthenticationAuthority"));
     let mut batch = Batch::default();
     let wrong: Vec<_> = attributes(uid)
         .into_iter()
-        .filter(|(attr, want)| found.is_none_or(|r| r.get(attr) != want))
+        .filter(|(attr, want)| dir.user(VM_USER).is_none_or(|r| r.get(attr) != want))
         .collect();
-    if !wrong.is_empty() {
-        if found.is_none() {
+    let changed = !wrong.is_empty();
+    if changed {
+        if dir.user(VM_USER).is_none() {
             batch.create(&record);
         }
         for (attr, want) in &wrong {
@@ -285,27 +282,48 @@ pub(crate) fn fix_vm_user(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
         }
         out.change(c.key, format!("user {VM_USER}, uid {uid}"));
     }
-    batch.run(c);
-    if fresh || !found.is_some_and(|r| r.has("AuthenticationAuthority")) {
+    if !batch.run(c) {
+        return Err(io::Error::other(format!(
+            "dscl refused a change to {VM_USER}; no password set"
+        )));
+    }
+    if fresh || !has_password {
         // On standard input, so that it is in no argument list.
         let command = format!("passwd {record} {password}\n");
         if !c.mac.succeeds_with_input(DSCL, &["."], &command) {
-            if fresh {
-                let _ = c.mac.remove(PASSWORD_FILE);
-            }
             return Err(io::Error::other(format!(
-                "dscl did not set the password of {VM_USER}{}",
-                if fresh {
-                    "; the password file was removed, the next apply makes another"
-                } else {
-                    ""
-                }
+                "dscl did not set the password of {VM_USER}"
             )));
         }
         out.change(c.key, format!("password of {VM_USER} set (not shown)"));
+        if fresh {
+            c.mac
+                .replace(PASSWORD_FILE, password.as_bytes(), 0, 0, 0o400)?;
+            out.change(
+                c.key,
+                format!("{PASSWORD_FILE}: a new random password, root's, mode 400"),
+            );
+            if has_password {
+                out.note(
+                    c.key,
+                    format!(
+                        "{VM_USER} had a password and the file did not hold it: the password is reset, and its login keychain (if it has one) is still locked with the old one"
+                    ),
+                );
+            }
+        }
     }
+    // The attributes just set decide the groups: read again, not the record from before.
+    let after = if changed {
+        Directory::read(c).map_err(io::Error::other)?
+    } else {
+        dir
+    };
     for (group, gid) in NOT_IN {
-        if found.is_some_and(|r| dir.is_member(r, group, gid)) {
+        if after
+            .user(VM_USER)
+            .is_some_and(|r| after.is_member(r, group, gid))
+        {
             run(
                 c,
                 DSEDITGROUP,
@@ -328,10 +346,16 @@ pub(crate) fn fix_vm_user(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
 
 /// The check of `autologin` when the login window names the VM user, whose `UniqueID`
 /// is `uid` (as dscl printed it); `None` when the profile has no VM user, so that the
-/// name is any other account's. It passes when the uid is the profile's and
-/// `/etc/kcpassword` is a file that holds the password of [`PASSWORD_FILE`].
+/// name is any other account's. It passes only for `autologin=vm`, when the uid is the
+/// profile's and `/etc/kcpassword` is a file that holds the password of [`PASSWORD_FILE`].
 pub(crate) fn autologin_vm(c: &Ctx<'_>, uid: &str) -> Option<Outcome> {
     let want = c.profile.vm_user_uid?;
+    if c.value() != "vm" {
+        return Some(fail(format!(
+            "auto-login is {VM_USER}, but the profile wants it {}: apply clears auto-login and /etc/kcpassword",
+            c.value()
+        )));
+    }
     if uid != want.to_string() {
         return Some(fail(format!(
             "auto-login is {VM_USER} (uid {}), not the profile's VM user (uid {want})",
@@ -397,13 +421,18 @@ pub(crate) fn fix_enable_autologin(c: &Ctx<'_>, out: &mut Lines) -> io::Result<(
         c.mac.replace(kc, &wanted, 0, 0, 0o600)?;
         out.change(c.key, "wrote /etc/kcpassword for kbf-vm (mode 600)");
     }
-    if crate::items::defaults_read(c, crate::accounts::LOGINWINDOW, "autoLoginUser") != VM_USER {
+    if defaults_read(c, crate::accounts::LOGINWINDOW, "autoLoginUser") != VM_USER {
         let domain = c.mac.path(crate::accounts::LOGINWINDOW);
         run(
             c,
             crate::items::DEFAULTS,
             &["write", &domain, "autoLoginUser", "-string", VM_USER],
         );
+        if defaults_read(c, crate::accounts::LOGINWINDOW, "autoLoginUser") != VM_USER {
+            return Err(io::Error::other(
+                "defaults did not set autoLoginUser to kbf-vm",
+            ));
+        }
         out.change(
             c.key,
             "auto-login is kbf-vm (from the next login window; nothing is restarted)",

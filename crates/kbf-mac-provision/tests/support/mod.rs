@@ -99,6 +99,9 @@ pub struct State {
     /// A `dscl .` fed commands skips each line that has one of these in it, as for a
     /// command it refuses, runs the others, and exits 1.
     pub stdin_rejects: Vec<String>,
+    /// A `dscl .` fed commands skips each line that has one of these in it, prints a
+    /// `DS Error` line for it, runs the others, and exits 0.
+    pub stdin_ds_errors: Vec<String>,
     /// `dscl . -readall` exits 1 and prints nothing.
     pub readall_fails: bool,
     /// `dscl . -readall` exits 0 and prints nothing.
@@ -877,8 +880,14 @@ impl Host for FakeMac {
             });
         }
         let rejects = s.stdin_rejects.clone();
+        let ds_errors = s.stdin_ds_errors.clone();
         let mut rejected = false;
+        let mut printed = String::new();
         for line in input.lines() {
+            if ds_errors.iter().any(|r| line.contains(r.as_str())) {
+                printed.push_str("<main> DS Error: -14136 (eDSRecordNotFound)\n");
+                continue;
+            }
             if rejects.iter().any(|r| line.contains(r.as_str())) {
                 rejected = true;
                 continue;
@@ -913,7 +922,7 @@ impl Host for FakeMac {
         }
         Ok(Output {
             success: !rejected,
-            stdout: String::new(),
+            stdout: printed,
         })
     }
 

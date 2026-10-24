@@ -343,11 +343,13 @@ impl<'a> Mac<'a> {
         }
     }
 
-    /// Whether `program args` runs, is fed `input` and exits 0.
+    /// Whether `program args` runs, is fed `input`, exits 0 and prints no `DS Error`
+    /// line (`dscl` reading commands from its standard input may report a refused
+    /// command on its output alone).
     pub(crate) fn succeeds_with_input(&self, program: &str, args: &[&str], input: &str) -> bool {
         self.host
             .run_with_input(program, args, input)
-            .is_ok_and(|o| o.success)
+            .is_ok_and(|o| o.success && !o.stdout.contains("DS Error"))
     }
 
     /// Whether `program args` runs and exits 0.

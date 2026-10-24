@@ -177,8 +177,9 @@ fn intent_user(c: &Ctx<'_>) -> Option<String> {
 }
 
 /// Auto-login is off with no `/etc/kcpassword` left, or it is the lease user whose
-/// lease kbf-mac-session's intent record names, with a uid in `lease_uids`, or it is
-/// the profile's VM user ([`vm_user::autologin_vm`]), the only other account it may be.
+/// lease kbf-mac-session's intent record names, with a uid in `lease_uids`, or, with
+/// `autologin=vm`, it is the profile's VM user ([`vm_user::autologin_vm`]), the only
+/// other account it may be: `autologin=off` clears it.
 /// With `autologin=vm` it must be on: the VM user, or a lease user while a whole_machine
 /// lease runs.
 pub(crate) fn autologin(c: &Ctx<'_>) -> Outcome {

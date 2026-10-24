@@ -261,11 +261,11 @@ fn apply_makes_the_vm_user_and_keeps_its_password_in_the_file_only() {
         r.text.lines().collect::<Vec<_>>(),
         [
             "CHANGE vm_user_uid: /var/db/kbf-mac-session, root's, mode 700".to_owned(),
+            "CHANGE vm_user_uid: user kbf-vm, uid 460".to_owned(),
+            "CHANGE vm_user_uid: password of kbf-vm set (not shown)".to_owned(),
             format!(
                 "CHANGE vm_user_uid: {VM_PASSWORD_FILE}: a new random password, root's, mode 400"
             ),
-            "CHANGE vm_user_uid: user kbf-vm, uid 460".to_owned(),
-            "CHANGE vm_user_uid: password of kbf-vm set (not shown)".to_owned(),
             concat!("CHANGE vm_user_uid: home /Users", "/kbf-vm, mode 700").to_owned(),
         ]
     );
@@ -374,14 +374,12 @@ fn a_missing_password_file_is_made_again_and_set_on_the_account() {
     let password = password_file(&mac);
     assert_ne!(password, VM_PASSWORD);
     assert_eq!(mac.state.borrow().passwords[VM_HOME], password);
-    assert_eq!(
-        r.text.lines().next(),
-        Some(
-            format!(
-                "CHANGE vm_user_uid: {VM_PASSWORD_FILE}: a new random password, root's, mode 400"
-            )
-            .as_str()
-        )
+    assert!(
+        r.text.contains(&format!(
+            "CHANGE vm_user_uid: {VM_PASSWORD_FILE}: a new random password, root's, mode 400\n"
+        )),
+        "{}",
+        r.text
     );
 }
 
@@ -407,15 +405,16 @@ fn an_account_without_a_password_gets_the_files() {
 }
 
 /// Catches: a password dscl refuses leaving a file that no account has (the next
-/// run would trust it): it is removed, the item says so, and the next run makes a
+/// run would trust it): no file is written, the item says so, and the next run makes a
 /// password and sets it.
 #[test]
-fn a_password_dscl_refuses_removes_the_file_it_made() {
+fn a_password_dscl_refuses_leaves_no_file() {
     let mac = without_user("vm-refused");
     mac.state.borrow_mut().stdin_rejects = vec!["passwd".into()];
     let r = apply(&mac);
     assert!(
-        r.text.contains("NOTE vm_user_uid: dscl did not set the password of kbf-vm; the password file was removed, the next apply makes another"),
+        r.text
+            .contains("NOTE vm_user_uid: dscl did not set the password of kbf-vm\n"),
         "{}",
         r.text
     );
@@ -510,13 +509,13 @@ fn apply_writes_no_password_through_a_link_at_the_state_directory() {
     );
 }
 
-/// Catches: auto-login as the VM user refused by an `autologin=off` profile (the
+/// Catches: auto-login as the VM user refused by an `autologin=vm` profile (the
 /// auto-login rule only knew lease users), accepted for another account, or accepted
 /// with a `/etc/kcpassword` that is not the password of the file (the login window
 /// would fail every boot).
 #[test]
 fn autologin_accepts_the_configured_vm_user_and_no_other() {
-    let mut mac = FakeMac::converged_vm("vm-autologin-off", false);
+    let mut mac = FakeMac::converged_vm("vm-autologin-off", true);
     mac.converge_vm_autologin();
     let r = check(&mac);
     assert_eq!(r.failed, 0, "{}", r.text);
@@ -556,7 +555,7 @@ fn autologin_accepts_the_configured_vm_user_and_no_other() {
 /// still fails with no intent record, with the VM user on the profile.
 #[test]
 fn autologin_refuses_what_is_not_exactly_the_vm_user() {
-    let mut mac = FakeMac::converged_vm("vm-autologin-uid", false);
+    let mut mac = FakeMac::converged_vm("vm-autologin-uid", true);
     mac.converge_vm_autologin();
     mac.state_mut().user("kbf-vm", 501);
     let r = check(&mac);
@@ -568,7 +567,7 @@ fn autologin_refuses_what_is_not_exactly_the_vm_user() {
         r.text
     );
 
-    let mut mac = FakeMac::converged_vm("vm-autologin-name", false);
+    let mut mac = FakeMac::converged_vm("vm-autologin-name", true);
     mac.state_mut().user("builder", VM_UID);
     mac.state_mut()
         .default_set(LOGINWINDOW, "autoLoginUser", "builder");
@@ -593,7 +592,7 @@ fn autologin_refuses_what_is_not_exactly_the_vm_user() {
     );
 
     // A lease user is still held to its intent record.
-    let mut mac = FakeMac::converged_vm("vm-autologin-lease", false);
+    let mut mac = FakeMac::converged_vm("vm-autologin-lease", true);
     mac.state_mut().user("kbf-lease-4-2", 642);
     mac.state_mut()
         .default_set(LOGINWINDOW, "autoLoginUser", "kbf-lease-4-2");
@@ -722,16 +721,109 @@ fn apply_does_not_set_auto_login_without_what_it_needs() {
     }
 }
 
-/// Catches: `autologin=off` apply clearing the VM user's auto-login, which the auto-login
-/// rule accepts (the Mac would lose its session at every apply).
+/// Catches: an `autologin=off` profile passing while the Mac logs in as the VM user
+/// (the profile's word ignored, and the password kept in a reversible file): the check
+/// fails, and apply clears the setting and `/etc/kcpassword`.
 #[test]
-fn apply_leaves_the_vm_users_auto_login_when_the_profile_says_off() {
+fn autologin_off_clears_the_vm_users_auto_login() {
     let mut mac = FakeMac::converged_vm("vm-leave", false);
     mac.converge_vm_autologin();
+    only_fails(
+        &mac,
+        "autologin",
+        "auto-login is kbf-vm, but the profile wants it off: apply clears auto-login and /etc/kcpassword",
+    );
     let r = apply(&mac);
-    assert_eq!((r.failed, r.text.as_str()), (0, ""));
-    assert_eq!(mac.writes(), Vec::<String>::new());
-    assert!(mac.path(KCPASSWORD).exists());
+    assert_eq!(r.failed, 0, "{}", r.text);
+    assert_eq!(
+        r.text,
+        "CHANGE autologin: auto-login cleared\nCHANGE autologin: removed /etc/kcpassword\n"
+    );
+    assert!(!mac.path(KCPASSWORD).exists());
+    assert_eq!(
+        support::preference(&mac, LOGINWINDOW, "autoLoginUser"),
+        None
+    );
+}
+
+/// Catches: a `defaults write` that the system refuses reported as a change (nobody is
+/// at the console to see the Mac stop at its login window).
+#[test]
+fn apply_says_when_auto_login_did_not_take() {
+    let mut mac = FakeMac::converged_vm("vm-enable-refused", true);
+    mac.clear_auto_login();
+    mac.state_mut().fails = vec!["defaults write".into()];
+    let r = apply(&mac);
+    assert_eq!(r.failed, 1, "{}", r.text);
+    assert!(
+        r.text
+            .contains("NOTE autologin: defaults did not set autoLoginUser to kbf-vm"),
+        "{}",
+        r.text
+    );
+    assert!(!r.text.contains("auto-login is kbf-vm (from"), "{}", r.text);
+}
+
+/// Catches: a refused account change followed by a password set on a record that is not
+/// there, with the real cause hidden behind "dscl did not set the password".
+#[test]
+fn a_refused_account_change_stops_before_the_password() {
+    let mac = without_user("vm-create-refused");
+    mac.state.borrow_mut().stdin_rejects = vec!["create".into()];
+    let r = apply(&mac);
+    assert_eq!(r.failed, 1, "{}", r.text);
+    assert!(
+        r.text
+            .contains("NOTE vm_user_uid: dscl refused a change to kbf-vm; no password set"),
+        "{}",
+        r.text
+    );
+    assert!(!mac.path(VM_PASSWORD_FILE).exists());
+    assert!(mac.inputs.borrow().iter().all(|i| !i.contains("passwd")));
+}
+
+/// Catches: a `dscl` that reports a refused password on its output and exits 0 taken
+/// for success (the file would hold a password the account does not have).
+#[test]
+fn a_password_dscl_reports_as_an_error_without_failing_leaves_no_file() {
+    let mac = without_user("vm-ds-error");
+    mac.state.borrow_mut().stdin_ds_errors = vec!["passwd".into()];
+    let r = apply(&mac);
+    assert_eq!(r.failed, 1, "{}", r.text);
+    assert!(
+        r.text
+            .contains("NOTE vm_user_uid: dscl did not set the password of kbf-vm"),
+        "{}",
+        r.text
+    );
+    assert!(!mac.path(VM_PASSWORD_FILE).exists());
+}
+
+/// Catches: a lost password file replaced without a word about the keychain (the new
+/// password is set as root, so a login keychain made under the old one stays locked).
+#[test]
+fn a_reset_password_says_the_keychain_is_out_of_step() {
+    let mac = FakeMac::converged_vm("vm-reset-note", false);
+    mac.remove(VM_PASSWORD_FILE);
+    let r = apply(&mac);
+    assert_eq!(r.failed, 0, "{}", r.text);
+    assert!(
+        r.text
+            .contains("NOTE vm_user_uid: kbf-vm had a password and the file did not hold it"),
+        "{}",
+        r.text
+    );
+}
+
+/// Catches: a wrong primary group reported as a removal from `admin` after it was set
+/// to `staff` (the loop used the record from before the change).
+#[test]
+fn a_fixed_primary_group_is_not_reported_as_leaving_admin() {
+    let mut mac = FakeMac::converged_vm("vm-primary-admin", false);
+    mac.state_mut().user_attr("kbf-vm", "PrimaryGroupID", "80");
+    let r = apply(&mac);
+    assert_eq!(r.failed, 0, "{}", r.text);
+    assert_eq!(r.text, "CHANGE vm_user_uid: user kbf-vm, uid 460\n");
 }
 
 /// Catches: a FileVault that is on passing for a profile that asks for a VM user (the
@@ -781,7 +873,7 @@ fn apply_makes_a_missing_state_directory_root_only() {
 /// root's check passes). The item for the file reports its mode instead.
 #[test]
 fn a_check_that_cannot_read_the_password_file_does_not_fail_auto_login() {
-    let mut mac = FakeMac::converged_vm("vm-unreadable", false);
+    let mut mac = FakeMac::converged_vm("vm-unreadable", true);
     mac.converge_vm_autologin();
     mac.chmod(VM_PASSWORD_FILE, 0o000);
     let r = check(&mac);
@@ -909,7 +1001,7 @@ fn a_wrong_kcpassword_is_rewritten_and_the_setting_left_alone() {
 /// a password when auto-login compares `/etc/kcpassword` with it.
 #[test]
 fn auto_login_does_not_read_a_password_file_that_is_a_link() {
-    let mut mac = FakeMac::converged_vm("vm-password-link", false);
+    let mut mac = FakeMac::converged_vm("vm-password-link", true);
     mac.converge_vm_autologin();
     mac.remove(VM_PASSWORD_FILE);
     mac.write_bytes("/var/db/elsewhere", VM_PASSWORD.as_bytes());

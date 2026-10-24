@@ -58,7 +58,7 @@ use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use kbf_mac_provision::vm_user::SHELL;
@@ -959,6 +959,33 @@ fn the_vm_user_is_made_with_a_root_only_password_file_and_checked() {
         authenticated.status.success(),
         "the account does not have the file's password: {}",
         String::from_utf8_lossy(&authenticated.stdout)
+    );
+
+    // What the product relies on: a `passwd` for a record that is not there, fed to
+    // `dscl .` on standard input, is a failure by its exit status or by a `DS Error`
+    // line on its output (the product treats either as one).
+    let mut child = Command::new("/usr/bin/dscl")
+        .arg(".")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("started dscl");
+    child
+        .stdin
+        .take()
+        .expect("dscl's stdin")
+        .write_all(concat!("passwd /Users", "/kbf-no-such-user x\n").as_bytes())
+        .expect("fed dscl");
+    let refused = child.wait_with_output().expect("dscl ran");
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        !refused.status.success() || shown.contains("DS Error"),
+        "dscl took a passwd for no record without a sign: {shown}"
     );
 
     let checked = check();
