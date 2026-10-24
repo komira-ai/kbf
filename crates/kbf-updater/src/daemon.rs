@@ -10,16 +10,15 @@
 //!   address is refused;
 //! - `--token-file`: the file holding the operator bearer token.
 //!
-//! Optional: `--operator-proxy-auth-file`, the file holding the proxy's per-boot secret,
-//! for a frontend that runs behind kbf-proxy (`--proxy-auth-file` there): its operator API
-//! refuses a call without it. It is read on every call, like the token.
-//!
-//! Also optional, and required when the inventory lists frontend pool members (lines with
-//! `instance=` and `base=`): `--proxy-admin`, `http://<loopback ip>:<port>`, the admin API of
-//! the kbf-proxy in pool mode (its `admin_listen`), through which a member is drained and
-//! put back. The API asks for no credential, so none is sent to it; a host that is not a
-//! loopback address is refused. The updater runs on the frontend host: it reaches each member's
+//! Optional: `--peer-ready-secs` (default 30, at least 1) and `--frontend-drain-deadline-secs`
+//! (default 1200, at least 1), for the frontend pool members (lines of the inventory with
+//! `instance=` and `base=`). The updater runs on the frontend host: it reaches each member's
 //! operator API (its `base` plus two) on loopback with the token it uses for `--operator-api`.
+//! A member is rolled behind whatever load balancer there is (`updater_no_proxy.rs`): it drains
+//! itself and exits, and is restarted on the new package, after every other member has answered
+//! `/readyz` 200 for `--peer-ready-secs` in a row. `--frontend-drain-deadline-secs` is how long a
+//! member is given to exit after it is told to drain; it must be longer than the longest
+//! execution a member may have open, which its drain waits for.
 //!
 //! And the socket, one of two (never both):
 //!
@@ -45,8 +44,8 @@
 //! it runs the target ([`crate::node_drain`]); `--drain-deadline-secs` (default 600) is how long
 //! its leases are waited for. The health check is real for storage and daemon hosts and refuses a
 //! frontend that is no pool member ([`crate::node_health`]); the roll asks it before it
-//! installs, so ssh is never run for one. A frontend pool member is rolled through the proxy's
-//! pool and its own API ([`crate::pool_http`], [`crate::frontend_http`]).
+//! installs, so ssh is never run for one. A frontend pool member is rolled through its own API
+//! ([`crate::frontend_http`]).
 //!
 //! A `mac-daemon` host is rolled as a daemon host, except that its install only starts an
 //! apply on the Mac: the roll asks the host's `query` every `--apply-poll-secs` until the
@@ -73,7 +72,6 @@ use crate::listener::{Activation, Listen, open};
 use crate::node_drain::NodeDrain;
 use crate::node_health::NodeHealth;
 use crate::operator::OperatorApi;
-use crate::pool_http::HttpPool;
 use crate::ports::SystemClock;
 use crate::record::RollStore;
 use crate::safe_http::HttpSafeToStop;
@@ -83,12 +81,12 @@ use crate::{Ports, Timing, Updater};
 
 pub const USAGE: &str = "usage: kbf-updater --version\n       kbf-updater --state-dir DIR \
 --inventory FILE --proxy-uid UID --operator-api http://IP:PORT --token-file FILE \
---ssh-key-file FILE --ssh-user USER --channel NAME [--operator-proxy-auth-file FILE] \
-[--proxy-admin http://IP:PORT] [--ssh-connect-timeout-secs N] [--ssh-command-timeout-secs N] \
-[--drain-deadline-secs N] [--apply-poll-secs N] [--apply-deadline-secs N] [--socket PATH]\n\
+--ssh-key-file FILE --ssh-user USER --channel NAME \
+[--ssh-connect-timeout-secs N] [--ssh-command-timeout-secs N] \
+[--drain-deadline-secs N] [--apply-poll-secs N] [--apply-deadline-secs N] \
+[--peer-ready-secs N] [--frontend-drain-deadline-secs N] [--socket PATH]\n\
 the socket comes from systemd socket activation (LISTEN_PID, LISTEN_FDS=1) or from --socket, \
-which is for tests and development; --proxy-admin is required when the inventory lists \
-frontend pool members\n";
+which is for tests and development\n";
 
 const FLAGS: [&str; 16] = [
     "--state-dir",
@@ -97,8 +95,6 @@ const FLAGS: [&str; 16] = [
     "--proxy-uid",
     "--operator-api",
     "--token-file",
-    "--operator-proxy-auth-file",
-    "--proxy-admin",
     "--ssh-key-file",
     "--ssh-user",
     "--channel",
@@ -107,6 +103,8 @@ const FLAGS: [&str; 16] = [
     "--drain-deadline-secs",
     "--apply-poll-secs",
     "--apply-deadline-secs",
+    "--peer-ready-secs",
+    "--frontend-drain-deadline-secs",
 ];
 
 /// How long ssh may take to connect, unless a flag says otherwise.
@@ -120,6 +118,12 @@ const DEFAULT_DRAIN_SECS: u64 = 600;
 const DEFAULT_APPLY_POLL_SECS: u64 = 5;
 /// How long a Mac host's apply may take, unless a flag says otherwise.
 const DEFAULT_APPLY_DEADLINE_SECS: u64 = 600;
+/// How long every other frontend member must have been ready in a row before a member is drained,
+/// unless a flag says otherwise.
+const DEFAULT_PEER_READY_SECS: u64 = 30;
+/// How long a frontend member is given to exit after it is told to drain, unless a flag
+/// says otherwise: 20 minutes, for executions that run up to that long.
+const DEFAULT_FRONTEND_DRAIN_SECS: u64 = 1200;
 
 /// The settings of a run.
 #[derive(Clone, Debug)]
@@ -132,11 +136,6 @@ pub struct Config {
     pub proxy_uid: u32,
     pub operator_api: SocketAddr,
     pub token_file: PathBuf,
-    /// The proxy's per-boot secret, if the frontend is behind kbf-proxy.
-    pub operator_proxy_auth_file: Option<PathBuf>,
-    /// The admin API of the kbf-proxy in pool mode; required when the inventory lists frontend
-    /// pool members.
-    pub proxy_admin: Option<SocketAddr>,
     /// The private key file ssh logs in with.
     pub ssh_key_file: PathBuf,
     pub ssh_user: String,
@@ -151,14 +150,18 @@ pub struct Config {
     pub apply_poll: Duration,
     /// How long a `mac-daemon` host's apply may take to be done for the target.
     pub apply_deadline: Duration,
+    /// How long every other frontend member must answer `/readyz` 200 in a row before a member
+    /// is drained.
+    pub peer_ready: Duration,
+    /// How long a frontend member is given to exit after it is told to drain.
+    pub frontend_drain_deadline: Duration,
 }
 
 /// The settings from the command line (without the program name) and from what the service
 /// manager passed. Each flag is given once, as `--flag value` or `--flag=value`; all but
-/// `--socket`, `--operator-proxy-auth-file`, `--proxy-admin`, the two ssh timeouts, the drain
-/// deadline and the two apply bounds are required, and the socket is either `--socket` or the
-/// activated descriptor. (`--proxy-admin` is required by [`start_with`] when the inventory
-/// lists frontend pool members.)
+/// `--socket`, the two ssh timeouts, the drain deadline, the two apply bounds and the two
+/// bounds of a frontend member's drain are required, and the socket is either `--socket` or
+/// the activated descriptor.
 pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, String> {
     let mut found: BTreeMap<&str, String> = BTreeMap::new();
     let mut rest = args.iter();
@@ -196,13 +199,6 @@ pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, S
     let ssh_key_file = PathBuf::from(take("--ssh-key-file")?);
     let ssh_user = take("--ssh-user")?;
     let channel = take("--channel")?;
-    let operator_proxy_auth_file = found
-        .remove("--operator-proxy-auth-file")
-        .map(PathBuf::from);
-    let proxy_admin = found
-        .remove("--proxy-admin")
-        .map(|url| parse_loopback_url("--proxy-admin", &url))
-        .transpose()?;
     let mut seconds = |flag: &str, default: u64| match found.remove(flag) {
         None => Ok(Duration::from_secs(default)),
         Some(text) => text
@@ -223,6 +219,17 @@ pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, S
     let apply_deadline = seconds("--apply-deadline-secs", DEFAULT_APPLY_DEADLINE_SECS)?;
     if apply_deadline.is_zero() {
         return Err("--apply-deadline-secs must be at least 1".to_owned());
+    }
+    let peer_ready = seconds("--peer-ready-secs", DEFAULT_PEER_READY_SECS)?;
+    if peer_ready.is_zero() {
+        return Err("--peer-ready-secs must be at least 1".to_owned());
+    }
+    let frontend_drain_deadline = seconds(
+        "--frontend-drain-deadline-secs",
+        DEFAULT_FRONTEND_DRAIN_SECS,
+    )?;
+    if frontend_drain_deadline.is_zero() {
+        return Err("--frontend-drain-deadline-secs must be at least 1".to_owned());
     }
     let listen = match (
         found.remove("--socket"),
@@ -250,8 +257,6 @@ pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, S
         proxy_uid,
         operator_api,
         token_file,
-        operator_proxy_auth_file,
-        proxy_admin,
         ssh_key_file,
         ssh_user,
         channel,
@@ -260,18 +265,15 @@ pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, S
         drain_deadline,
         apply_poll,
         apply_deadline,
+        peer_ready,
+        frontend_drain_deadline,
     })
 }
 
 /// `http://<ip>:<port>` with a loopback ip. The operator token goes over this connection in
 /// clear, so any other host, a name, or `https` is refused.
 pub fn parse_operator_url(url: &str) -> Result<SocketAddr, String> {
-    parse_loopback_url("--operator-api", url)
-}
-
-/// The value of the flag `flag` as `http://<ip>:<port>` with a loopback ip: these calls travel in
-/// clear, so any other host, a name, or `https` is refused.
-pub fn parse_loopback_url(flag: &str, url: &str) -> Result<SocketAddr, String> {
+    let flag = "--operator-api";
     let Some(rest) = url.strip_prefix("http://") else {
         return Err(format!(
             "{flag} must start with http:// (the call travels in clear, on loopback)"
@@ -362,31 +364,25 @@ pub fn build_ports_with_exec(cfg: &Config, exec: Arc<dyn Exec>) -> Result<Ports,
     // Shared: the roll installs with it, and the health check asks it what a daemon runs.
     let installer = Arc::new(installer);
     // One client, checked once: both ports read the same token files.
-    let api = OperatorApi::new(
-        cfg.operator_api,
-        cfg.token_file.clone(),
-        cfg.operator_proxy_auth_file.clone(),
-    )?;
-    // The pool is the proxy's admin API, or none when there is no `--proxy-admin`.
-    let admin = cfg.proxy_admin;
-    let pool = admin.map_or_else(HttpPool::unconfigured, HttpPool::new);
+    let api = OperatorApi::new(cfg.operator_api, cfg.token_file.clone())?;
     Ok(Ports {
         safe: Box::new(HttpSafeToStop::from_api(api.clone())),
         installer: Box::new(Arc::clone(&installer)),
         drain: Box::new(NodeDrain::with_api(api.clone())),
         health: Box::new(NodeHealth::with_api(api.clone(), installer)),
         clock: Box::new(SystemClock::new()),
-        pool: Box::new(pool),
         frontend: Box::new(HttpFrontend::with_api(api)),
     })
 }
 
-/// The bounds of the roll: the defaults, and the three the flags set.
+/// The bounds of the roll: the defaults, and the five the flags set.
 pub fn timing(cfg: &Config) -> Timing {
     Timing {
         drain_deadline: cfg.drain_deadline,
         apply_poll: cfg.apply_poll,
         apply_deadline: cfg.apply_deadline,
+        peer_ready: cfg.peer_ready,
+        frontend_drain: cfg.frontend_drain_deadline,
         ..Timing::default()
     }
 }
@@ -426,12 +422,6 @@ pub fn start_with(
 ) -> Result<Daemon, String> {
     let inventory = Inventory::load(&cfg.inventory, cfg.inventory_owner)
         .map_err(|e| format!("inventory {}: {e}", cfg.inventory.display()))?;
-    if inventory.has_members() && cfg.proxy_admin.is_none() {
-        return Err(format!(
-            "inventory {} lists frontend pool members, which need --proxy-admin",
-            cfg.inventory.display()
-        ));
-    }
     let store = RollStore::open(&cfg.state_dir)
         .map_err(|e| format!("state dir {}: {e}", cfg.state_dir.display()))?;
     let updater = Updater::open(inventory, store, ports, timing)

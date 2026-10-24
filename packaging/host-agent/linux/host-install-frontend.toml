@@ -21,8 +21,9 @@ api = "127.0.0.1:8982"
 # The operator token, as a path inside the container: the drain is `kbf cluster drain --frontend`
 # run in the container, where the API is on loopback.
 drain_token_file = "/etc/kbf/operator.token"
-# Other frontends' operator APIs this host can reach. One that does not answer /readyz with 200
-# keeps this frontend up. Leave it out when none is reachable.
+# Other frontends' operator APIs this host can reach (replace the documentation address). One that
+# does not answer /readyz with 200 keeps this frontend up. Without peers nothing here guards the
+# last ready frontend; only the coordinator's order does (docs/deploy/host-install.md).
 peers = ["203.0.113.11:8982"]
 drain_secs = 180
 ready_secs = 90

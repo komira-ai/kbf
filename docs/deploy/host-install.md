@@ -18,8 +18,9 @@ the same run as every other asset ([../artifacts.md](../artifacts.md)):
 No package ships it: neither the `kbf` nor the `kbf-installer` deb installs it, so a Linux
 host gets it from the tarball too. Each tarball holds one member, `kbf-host-install`. Its
 `<commit>` is the commit of the release the host is on or going to. The updater,
-`kbf-updater`, is the same kind of asset for the operator's Linux box
-(`kbf-updater-<commit>-linux-<arch>.tar.gz`, one member `kbf-updater`).
+`kbf-updater`, is the same kind of asset for the operator's Linux box and for a Mac's host agent
+(`kbf-updater-<commit>-linux-<arch>.tar.gz` and `kbf-updater-<commit>-darwin-arm64.tar.gz`, one
+member `kbf-updater`; the Mac one is ad hoc signed with the hardened runtime).
 
 Fetch the tarball with its bundle and check the bundle before the binary is placed anywhere
 (the flags are those of [../artifacts.md](../artifacts.md#provenance-bundles-verifying-a-tarball-offline)):
@@ -712,6 +713,23 @@ When any step fails, the container is removed and made again from the **old** im
 same configuration, waited for the same way (on the old commit), the marker is cleared, and the
 switch answers `failed` (`switch_failed`). If the old container cannot be made again either,
 the answer is `revert_failed` and the marker stays: the deadline, or a `revert`, tries again.
+
+Three things to know when you set it up:
+
+- **`peers` is the only guard this program has against taking down the last ready frontend.**
+  Without it nothing here looks at another frontend, and only the coordinator's order protects
+  you. List every other frontend's operator API this host can reach; the example file's address
+  is a documentation address to replace.
+- **The operator API must be reachable on the published port.** `api` is a published port on the
+  bridge network, so the frontend inside the container must listen on a non-loopback address
+  (not `--api-listen 127.0.0.1:...`), or `/readyz` is never seen and every switch fails. Writes
+  still require a loopback peer, which Docker's NAT does not give an outside caller; the drain
+  runs inside the container, where the peer is loopback.
+- **The health the updater's agent reports is what the last switch saw.** It comes from the
+  release this program recorded as current, which `switch` sets after `/readyz` answered 200 on
+  the target commit. It is not a probe made at each heartbeat: a container that crashes later is
+  reported healthy until the next switch or the host's own supervision (Docker's restart policy)
+  deals with it.
 
 **confirm** clears the marker and forgets the old image. **revert**, which the deadline also
 calls (so a host that rebooted in the middle of a switch is put back when the first check after the
