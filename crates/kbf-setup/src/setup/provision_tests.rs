@@ -26,6 +26,17 @@ fn no_names(text: &str) {
     }
 }
 
+/// What setup printed, less the lines that tell the operator what to add to `pg_hba.conf` and
+/// `pg_ident.conf`: the one place the names are printed, for the operator to copy.
+fn without_access_lines(out: &str) -> String {
+    let kept: Vec<&str> = out
+        .lines()
+        .filter(|line| !line.contains("pg_hba.conf"))
+        .filter(|line| !line.contains("pg_ident.conf"))
+        .collect();
+    kept.join("\n")
+}
+
 /// The flags of a frontend that has setup make the database.
 fn flags() -> Raw {
     let mut r = raw(Mode::Frontend);
@@ -194,14 +205,10 @@ fn refusal(result: Result<impl std::fmt::Debug, SetupError>) -> String {
 
 // ---- the flag ---------------------------------------------------------------------------
 
-/// Catches a flag that takes a URL it cannot make something from, or one that makes
-/// something from a name it should refuse: the recipe's URL is accepted and yields the right
-/// role, database and socket; a remote host, a missing role, `postgres`, a `pg_` role, a name
-/// with a character setup will not create, one over 63 bytes, a mode with no state and a
-/// missing `--database` are each refused by the flag, and no refusal quotes the URL.
-///
-/// Catches: the socket check removed (a host name accepted); the `postgres` check
-/// removed; the 63-byte limit loosened to 64; the no-role check removed.
+/// Asserts that the flag takes the recipe's URL and yields the right role, database and socket,
+/// and refuses what it cannot make: a remote host, a missing role, `postgres`, a `pg_` role, a name
+/// with a character setup will not create, one over 63 bytes and a mode with no state are each
+/// refused by the flag, and no refusal quotes the URL.
 #[test]
 fn the_flag_takes_the_recipe_url_and_refuses_what_it_cannot_make() {
     let ok = local();
@@ -293,14 +300,6 @@ fn the_flag_takes_the_recipe_url_and_refuses_what_it_cannot_make() {
     ));
     assert!(at_limit.validate(Platform::Linux).is_ok());
 
-    let mut r = flags();
-    r.database = None;
-    assert!(
-        r.validate(Platform::Linux)
-            .expect_err("no url")
-            .join("; ")
-            .contains("--create-local-database needs --database")
-    );
     let mut r = raw(Mode::Daemon);
     r.create_local_database = true;
     let why = r
@@ -351,7 +350,7 @@ fn a_fresh_server_gets_a_plain_login_role_then_its_database() {
     let world = Shared::default();
     let (exec, out) = setup_on(&world, &Server::fresh(), &flags(), APPLY);
     let out = out.expect("setup");
-    no_names(&out);
+    no_names(&without_access_lines(&out));
     let w = world.borrow();
     let creates: Vec<_> = w.ran.iter().filter(|(_, s)| s.contains("CREATE")).collect();
     assert_eq!(creates.len(), 2, "{:?}", w.ran);
@@ -508,7 +507,7 @@ fn a_dry_run_names_the_steps_and_creates_nothing() {
     let server = Server::fresh();
     let (exec, out) = setup_on(&world, &server, &flags(), DRY);
     let out = out.expect("dry run");
-    no_names(&out);
+    no_names(&without_access_lines(&out));
     assert!(
         out.contains("DRY-RUN: create the login role: run (as postgres)"),
         "{out}"
@@ -563,7 +562,7 @@ fn a_server_that_cannot_be_asked_is_refused_in_setups_words() {
     let text = refusal(out);
     assert!(text.contains("exit status 2"), "{text}");
     assert!(
-        text.contains("run setup without --create-local-database"),
+        text.contains("pass --database without --create-local-database"),
         "{text}"
     );
 
@@ -620,7 +619,7 @@ fn a_psql_killed_by_a_signal_is_refused_with_no_exit_code() {
     let text = refusal(out);
     assert!(text.contains("(exit status none)"), "{text}");
     assert!(
-        text.contains("run setup without --create-local-database"),
+        text.contains("pass --database without --create-local-database"),
         "{text}"
     );
     no_names(&text);
@@ -911,10 +910,10 @@ fn a_database_url_with_more_than_one_host_or_port_is_refused() {
 
 // ---- the live farm's URL ---------------------------------------------------------------------
 
-/// The farm's own spelling: a bare database name, the socket directory and the role in the
-/// query. Either scheme parses to the same settings, and setup tries the logins and prints a
-/// recipe only when one is refused: it never reads `pg_hba.conf` or `pg_ident.conf`, so the
-/// name of the ident map (`kbfmap` there, `kbf` in the recipe) is not something it knows.
+/// Asserts that the farm's own spelling, a bare database name with the socket directory and the
+/// role in the query, parses to the same settings under either scheme, and that setup never
+/// reads `pg_hba.conf` or `pg_ident.conf` (no step it runs names either), so the name of the
+/// ident map (`kbfmap` there, `kbf` in the rules it prints) is not something it knows.
 #[test]
 fn both_schemes_give_the_same_settings_and_no_ident_map_name_is_read() {
     let settings = |scheme: &str| {
@@ -944,8 +943,7 @@ fn both_schemes_give_the_same_settings_and_no_ident_map_name_is_read() {
     r.database = Some("postgres:///kbf?host=/run/postgresql&user=kbf-server".to_owned());
     r.create_local_database = true;
     let (_, out) = setup_on(&world, &Server::fresh(), &r, APPLY);
-    let out = out.expect("setup");
-    assert!(!out.contains("pg_ident") && !out.contains("map="), "{out}");
+    out.expect("setup");
     let w = world.borrow();
     assert!(
         w.ran
@@ -1035,17 +1033,17 @@ impl std::io::Write for Closes {
     }
 }
 
-/// Catches a closed output being lost: a line setup cannot print about the database (the
-/// dry run's "does not exist yet", a step it is about to run, a step it only plans) stops
-/// setup with an error instead of going on unseen.
-///
-/// Catches: any of the three `?` dropped from its `writeln!`.
+/// Asserts that a closed output is not lost: a line setup cannot print about the database (the
+/// dry run's "does not exist yet", a step it is about to run, a step it only plans, the rules
+/// the server needs) stops setup with an error instead of going on unseen.
 #[test]
 fn a_closed_output_stops_setup_at_each_database_line() {
     for (needle, options) in [
         ("database step: dry run", DRY),
         ("create the login role", APPLY),
         ("create the login role", DRY),
+        ("pg_hba.conf", APPLY),
+        ("pg_hba.conf", DRY),
     ] {
         let world = Shared::default();
         let mut exec = exec_on(&world);
@@ -1064,3 +1062,6 @@ fn a_closed_output_stops_setup_at_each_database_line() {
     }
     std::io::Write::flush(&mut Closes("")).expect("flush");
 }
+
+#[path = "default_database_tests.rs"]
+mod default_database;

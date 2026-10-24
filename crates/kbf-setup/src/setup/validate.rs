@@ -9,6 +9,7 @@
 
 use super::kbf_settings::{KbfFlags, Setting};
 use super::paths;
+use super::plan::database_user_name;
 #[cfg(feature = "proxy")]
 use super::proxy::{ProxyFlags, ProxyPlan};
 use super::retired::RetiredFlags;
@@ -53,12 +54,15 @@ pub struct Valid {
     /// The state database's `postgres://` URL, for the modes that keep their state there. It
     /// has no password and no character a TOML string would escape. No message quotes it.
     pub database: Option<String>,
+    /// Whether `database` is the local default because `--database` was not given.
+    pub database_defaulted: bool,
     /// The `kbf.toml` settings the listener, certificate and storage flags give.
     pub kbf: Vec<Setting>,
     /// The proxy host's settings: `Some` for `--proxy`. The files it names are not in `kbf`.
     #[cfg(feature = "proxy")]
     pub proxy: Option<ProxyPlan>,
-    /// With `--create-local-database`: what to create, from the URL.
+    /// With `--create-local-database`, or no `--database` on a mode that keeps state in Postgres:
+    /// what to create, from the URL.
     pub local_database: Option<LocalDatabase>,
 }
 
@@ -191,6 +195,7 @@ impl Raw {
         };
 
         let (database, local_database) = self.database(&mut problems);
+        let database_defaulted = database.is_some() && self.database.is_none();
         #[cfg(feature = "proxy")]
         let mut kbf = self
             .kbf
@@ -227,6 +232,7 @@ impl Raw {
             token_file,
             min_generation: self.min_generation,
             database,
+            database_defaulted,
             kbf,
             #[cfg(feature = "proxy")]
             proxy,
@@ -234,35 +240,22 @@ impl Raw {
         })
     }
 
-    /// The state database: required where the mode keeps its state in one, refused elsewhere.
-    /// The file it goes into is world-readable, so a password is refused, and the text of a
-    /// URL is never part of a message. The URL names the role (`user=`): setup runs as root
-    /// and the service as its own account, so a role left to the process's user would be two
-    /// different ones. With `--create-local-database` it also names a database and a Unix
-    /// socket directory, and the names are plain.
+    /// The state database: used where the mode keeps its state in one, refused elsewhere.
+    /// Without `--database` such a mode gets the local default ([`default_database`]) and
+    /// has the role and database made, as `--create-local-database` does. The file the URL
+    /// goes into is world-readable, so a password is refused, and the text of a URL is never
+    /// part of a message. The URL names the role (`user=`): setup runs as root and the
+    /// service as its own account, so a role left to the process's user would be two
+    /// different ones. When the role and database are made it also names a database and a
+    /// Unix socket directory, and the names are plain.
     fn database(&self, problems: &mut Vec<String>) -> (Option<String>, Option<LocalDatabase>) {
         let name = mode_name(self.mode);
-        let Some(url) = &self.database else {
-            if self.mode.keeps_state_in_database() {
+        if !self.mode.keeps_state_in_database() {
+            if self.database.is_some() {
                 problems.push(format!(
-                    "--mode={name} keeps its state in Postgres: --database is required, as postgres:///kbf?host=/run/postgresql&user=kbf"
+                    "--database is for the modes that keep their state in Postgres; --mode={name} keeps none"
                 ));
             }
-            if self.create_local_database {
-                problems.push(if self.mode.keeps_state_in_database() {
-                    "--create-local-database needs --database".to_owned()
-                } else {
-                    format!(
-                        "--create-local-database is for the modes that keep their state in Postgres; --mode={name} keeps none"
-                    )
-                });
-            }
-            return (None, None);
-        };
-        if !self.mode.keeps_state_in_database() {
-            problems.push(format!(
-                "--database is for the modes that keep their state in Postgres; --mode={name} keeps none"
-            ));
             if self.create_local_database {
                 problems.push(format!(
                     "--create-local-database is for the modes that keep their state in Postgres; --mode={name} keeps none"
@@ -270,6 +263,9 @@ impl Raw {
             }
             return (None, None);
         }
+        let default = default_database(self.mode);
+        let url = self.database.as_ref().unwrap_or(&default);
+        let create = self.create_local_database || self.database.is_none();
         let plain = url
             .bytes()
             .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\');
@@ -302,13 +298,22 @@ impl Raw {
             );
             return (None, None);
         }
-        let local = if self.create_local_database {
+        let local = if create {
             local_database(&config, problems)
         } else {
             None
         };
         (Some(url.clone()), local)
     }
+}
+
+/// The state database of a host that gives no `--database`: the database `kbf` on this host's
+/// own Postgres socket, reached as the account the frontend runs as.
+fn default_database(mode: Mode) -> String {
+    format!(
+        "postgres:///kbf?host=/run/postgresql&user={}",
+        database_user_name(mode)
+    )
 }
 
 /// What `--create-local-database` makes from the URL, or why it cannot. Only a Unix socket
