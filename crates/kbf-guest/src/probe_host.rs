@@ -142,3 +142,29 @@ impl Host for SystemHost {
         std::thread::sleep(d);
     }
 }
+
+impl crate::mount::Mounter for SystemHost {
+    fn mount(&self, tag: &str, mountpoint: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(mountpoint)
+            .map_err(|e| format!("create {}: {e}", mountpoint.display()))?;
+        let out = Command::new("/sbin/mount_virtiofs")
+            .arg(tag)
+            .arg(mountpoint)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("run /sbin/mount_virtiofs: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "mount_virtiofs exited {:?}: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    }
+
+    fn pause(&self, d: Duration) {
+        std::thread::sleep(d);
+    }
+}

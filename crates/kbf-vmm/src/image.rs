@@ -102,6 +102,9 @@ pub struct BaseArgs {
     /// After the install, write the probe launch daemons and the Setup Assistant marker
     /// into the image as root.
     pub offline_setup: bool,
+    /// The `kbf-guest` the offline setup copies onto the guest's disk (required with
+    /// `offline_setup`).
+    pub guest_binary: Option<PathBuf>,
 }
 
 /// The curl flags of a restore image download. `-q` first, so a `.curlrc` of the invoking
@@ -231,9 +234,13 @@ pub fn base(sys: &dyn System, args: &BaseArgs) -> Report {
     };
     let _ = std::fs::remove_file(&staged);
     let offline = args.offline_setup.then(|| {
+        let binary = args
+            .guest_binary
+            .as_deref()
+            .ok_or_else(|| guest::NEEDS_GUEST_BINARY.to_owned())?;
         sys.offline_write(
             &args.out.join(crate::bundle::DISK),
-            &guest::offline_payload(),
+            &guest::offline_payload_from(binary)?,
         )
     });
     let (offline_json, failed) = match offline {
@@ -266,7 +273,7 @@ pub fn base(sys: &dyn System, args: &BaseArgs) -> Report {
 
 /// `image setup`: the offline write (P0) into an existing base bundle.
 #[must_use]
-pub fn setup(sys: &dyn System, base: &Path) -> Report {
+pub fn setup(sys: &dyn System, base: &Path, guest_binary: Option<&Path>) -> Report {
     let probe = "image-setup";
     if sys.uid() != 0 {
         return Report::needs_manual(
@@ -278,7 +285,14 @@ pub fn setup(sys: &dyn System, base: &Path) -> Report {
     if let Err(e) = crate::bundle::check(base) {
         return Report::error(probe, e.to_string());
     }
-    match sys.offline_write(&base.join(crate::bundle::DISK), &guest::offline_payload()) {
+    let Some(binary) = guest_binary else {
+        return Report::needs_manual(probe, guest::NEEDS_GUEST_BINARY, json!({"bundle": base}));
+    };
+    let payload = match guest::offline_payload_from(binary) {
+        Ok(p) => p,
+        Err(e) => return Report::error(probe, e),
+    };
+    match sys.offline_write(&base.join(crate::bundle::DISK), &payload) {
         Ok(observed) => Report::ok(
             probe,
             format!("the probe launch daemons are in {}", base.display()),
@@ -339,6 +353,7 @@ mod tests {
             out: dir.join("out"),
             disk_gib: 64,
             offline_setup: false,
+            guest_binary: None,
         }
     }
 
@@ -495,9 +510,16 @@ mod tests {
         let sys = FakeSystem::new();
         let mut a = args(&dir, &ipsw_file(&dir), HELLO);
         a.offline_setup = true;
+        a.guest_binary = Some(dir.join("kbf-guest-src"));
+        std::fs::write(dir.join("kbf-guest-src"), "bin").expect("bin");
         let r = base(&sys, &a);
         assert_eq!(r.status, Status::Ok);
         assert_eq!(r.details["offline_setup"]["written"], 5);
+        assert!(
+            sys.offline_calls.borrow()[0]
+                .1
+                .contains(&"usr/local/libexec/kbf-guest".to_owned())
+        );
         assert_eq!(
             sys.offline_calls.borrow()[0].0,
             dir.join("out").join("disk.img")
@@ -506,10 +528,34 @@ mod tests {
         *sys.offline.borrow_mut() = Err("hdiutil said no".into());
         let mut a = args(&dir2, &ipsw_file(&dir2), HELLO);
         a.offline_setup = true;
+        a.guest_binary = Some(dir.join("kbf-guest-src"));
         let r = base(&sys, &a);
         assert_eq!(r.status, Status::NeedsManual);
         assert!(r.reason.expect("reason").contains("hdiutil said no"));
         assert_eq!(r.details["offline_setup"]["failure"], "hdiutil said no");
+    }
+
+    /// Catches an offline setup that writes daemons whose mounter has no binary to run
+    /// (no guest binary named, or one that cannot be read): nothing is written and the
+    /// report says to give `--guest-binary`.
+    #[test]
+    fn the_offline_setup_without_a_readable_guest_binary_writes_nothing() {
+        let dir = tmp("image-offline-nobin");
+        let sys = FakeSystem::new();
+        let mut a = args(&dir, &ipsw_file(&dir), HELLO);
+        a.offline_setup = true;
+        let r = base(&sys, &a);
+        assert_eq!(r.status, Status::NeedsManual);
+        assert!(r.reason.expect("reason").contains("--guest-binary"));
+        assert!(sys.offline_calls.borrow().is_empty());
+        let dir2 = tmp("image-offline-nobin2");
+        let mut a = args(&dir2, &ipsw_file(&dir2), HELLO);
+        a.offline_setup = true;
+        a.guest_binary = Some(dir2.join("missing"));
+        let r = base(&sys, &a);
+        assert_eq!(r.status, Status::NeedsManual);
+        assert!(r.reason.expect("reason").contains("missing"));
+        assert!(sys.offline_calls.borrow().is_empty());
     }
 
     /// Catches a download that is installed unverified, kept after a mismatch, or kept
@@ -618,19 +664,27 @@ mod tests {
         let work = crate::fake::work_with_base("image-setup");
         let base_dir = work.join("base");
         let sys = FakeSystem::new();
-        let r = setup(&sys, &base_dir);
+        let bin = work.join("guest-src");
+        std::fs::write(&bin, "bin").expect("bin");
+        let r = setup(&sys, &base_dir, Some(&bin));
         assert_eq!(r.status, Status::NeedsManual);
         assert!(r.reason.expect("reason").contains("root"));
         assert!(sys.offline_calls.borrow().is_empty());
         sys.uid.set(0);
-        let r = setup(&sys, &work.join("none"));
+        let r = setup(&sys, &work.join("none"), Some(&bin));
         assert_eq!(r.status, Status::Error);
         assert!(sys.offline_calls.borrow().is_empty());
-        let r = setup(&sys, &base_dir);
+        let r = setup(&sys, &base_dir, None);
+        assert_eq!(r.status, Status::NeedsManual);
+        assert!(r.reason.expect("reason").contains("--guest-binary"));
+        let r = setup(&sys, &base_dir, Some(&work.join("missing")));
+        assert_eq!(r.status, Status::Error);
+        assert!(sys.offline_calls.borrow().is_empty());
+        let r = setup(&sys, &base_dir, Some(&bin));
         assert_eq!(r.status, Status::Ok);
         assert_eq!(sys.offline_calls.borrow()[0].0, base_dir.join("disk.img"));
         *sys.offline.borrow_mut() = Err("no volume".into());
-        let r = setup(&sys, &base_dir);
+        let r = setup(&sys, &base_dir, Some(&bin));
         assert_eq!(r.status, Status::Error);
         assert!(r.reason.expect("reason").contains("no volume"));
     }

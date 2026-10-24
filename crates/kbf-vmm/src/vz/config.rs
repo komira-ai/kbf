@@ -140,7 +140,7 @@ pub fn build(spec: &VmSpec) -> Result<Built, String> {
             dev.setShare(Some(&share));
             shares.push(Retained::into_super(dev));
         }
-        if let Some(t) = &spec.tagged {
+        for t in &spec.tagged {
             let dev = VZVirtioFileSystemDeviceConfiguration::initWithTag(
                 VZVirtioFileSystemDeviceConfiguration::alloc(),
                 &NSString::from_str(&t.tag),

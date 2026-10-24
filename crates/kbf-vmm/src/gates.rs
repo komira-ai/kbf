@@ -65,10 +65,19 @@ impl Channels {
 /// devices asked for.
 pub(crate) fn attach_share(spec: &mut VmSpec, share: &Share, channels: Channels) {
     spec.automount_dir = Some(share.dir.clone());
-    spec.tagged = Some(TaggedShare {
-        tag: guest::TAG.to_owned(),
-        path: share.tagged.clone(),
-    });
+    // The guest daemons mount `SHARE_TAG` (the share directory itself, a tag the system
+    // does not mount on its own); `TAG` is the empty directory the probe mounts to answer
+    // G3. The automount tag is never mounted by hand: the system owns that device.
+    spec.tagged = vec![
+        TaggedShare {
+            tag: guest::SHARE_TAG.to_owned(),
+            path: share.dir.clone(),
+        },
+        TaggedShare {
+            tag: guest::TAG.to_owned(),
+            path: share.tagged.clone(),
+        },
+    ];
     if channels.vsock {
         spec.vsock_ports = vec![guest::VSOCK_PORT];
     }
@@ -568,9 +577,18 @@ pub fn p0(ctx: &Ctx<'_>) -> Report {
     if let Err(e) = bundle::clone_bundle(ctx.sys, &ctx.base, &dest, Identity::Keep) {
         return Report::error("p0", e.to_string());
     }
-    let written = ctx
-        .sys
-        .offline_write(&dest.join(bundle::DISK), &guest::offline_payload());
+    let payload = match &ctx.guest_binary {
+        Some(bin) => guest::offline_payload_from(bin),
+        None => Ok(guest::offline_payload(None)),
+    };
+    let payload = match payload {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dest);
+            return Report::error("p0", e);
+        }
+    };
+    let written = ctx.sys.offline_write(&dest.join(bundle::DISK), &payload);
     let boot = match (&written, ctx.guest_binary.is_some()) {
         (Ok(_), true) => boot_for_payload(ctx, &dest),
         (Ok(_), false) => json!({

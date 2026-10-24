@@ -294,7 +294,7 @@ fn g2_retries_without_the_console_port_and_g3_never_asks_for_the_channels() {
     let _ = g3(&ctx(&sys, &work));
     let starts = sys.starts.borrow();
     assert!(starts[0].0.console_ports.is_empty() && starts[0].0.vsock_ports.is_empty());
-    assert!(starts[0].0.tagged.is_some() && starts[0].0.automount_dir.is_some());
+    assert!(starts[0].0.tagged.len() == 2 && starts[0].0.automount_dir.is_some());
 }
 
 /// Catches a needs-root verdict that ignores the root control: the verdict is true only
@@ -613,16 +613,14 @@ fn p0_boots_the_clone_to_see_whether_the_payload_runs() {
             .expect("why")
             .contains("cannot spawn")
     );
-    // A share that cannot be made (the guest binary is missing) is recorded, not fatal.
+    // A guest binary that cannot be read is the operator's error, before anything is written.
+    let writes = sys.offline_calls.borrow().len();
     c.guest_binary = Some(work.join("missing"));
     let r = p0(&c);
-    assert_eq!(r.details["boot"]["attempted"], false);
-    assert!(
-        r.details["boot"]["failure"]
-            .as_str()
-            .expect("why")
-            .contains("copy")
-    );
+    assert_eq!(r.status, Status::Error);
+    assert!(r.reason.expect("why").contains("missing"));
+    assert_eq!(sys.offline_calls.borrow().len(), writes);
+    assert!(!work.join("p0-vm").exists());
 }
 
 /// Catches P6 starting a VM from a binary that does not have the signature the question
@@ -686,4 +684,34 @@ fn g1_reports_every_helper_event_of_each_clone() {
     assert_eq!(vms[0]["booted"], false);
     assert_eq!(vms[1]["trace"]["events"][0]["event"]["event"], "started");
     assert!(vms[1]["trace"]["ended"].is_null());
+}
+
+/// Catches the shares of a guest wired to the wrong tags: the share directory must be
+/// offered under a tag the system does not mount by itself (the automount tag was mounted
+/// twice in the first E1 run: `Resource busy`), the probe's empty directory under its own,
+/// and the automount device must still carry the share directory for the automount probe.
+#[test]
+fn a_guest_gets_the_share_under_its_own_tag_beside_the_automount_one() {
+    use crate::gates::{Channels, attach_share};
+    use crate::guest::{AUTOMOUNT_TAG, SHARE_TAG, Share, TAG};
+    let share = Share {
+        dir: "/w/vm-share".into(),
+        tagged: "/w/vm-tagged".into(),
+    };
+    let mut spec = crate::spec::VmSpec::minimal("/w/vm".into());
+    attach_share(&mut spec, &share, Channels::NONE);
+    assert_eq!(spec.automount_dir.as_deref(), Some(share.dir.as_path()));
+    let tags: Vec<(&str, &std::path::Path)> = spec
+        .tagged
+        .iter()
+        .map(|t| (t.tag.as_str(), t.path.as_path()))
+        .collect();
+    assert_eq!(
+        tags,
+        [
+            (SHARE_TAG, share.dir.as_path()),
+            (TAG, share.tagged.as_path())
+        ]
+    );
+    assert!(spec.tagged.iter().all(|t| t.tag != AUTOMOUNT_TAG));
 }

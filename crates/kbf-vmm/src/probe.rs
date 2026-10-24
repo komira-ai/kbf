@@ -67,7 +67,9 @@ pub struct Ctx<'a> {
     /// Leave the clones and shares on disk when the probe ends (`--keep`), for
     /// `image harvest`.
     pub keep: bool,
-    /// Give the second VM of a pair a graphics device (`--graphics`).
+    /// Give each VM a graphics device (the default; `--headless` turns it off). A headless
+    /// guest crash-loops its window server. E1's first arm stays headless regardless, as
+    /// the comparison.
     pub graphics: bool,
     pub timing: Timing,
 }
@@ -344,6 +346,7 @@ impl Ctx<'_> {
             e.to_string()
         })?;
         let mut spec = VmSpec::minimal(dest);
+        spec.graphics = self.graphics;
         edit(&mut spec);
         let vm = Vm::spawn(self.sys, name, &spec, run_as)?;
         Ok((vm, took))
