@@ -31,6 +31,10 @@ kbf-host-install --migrate-to-package --layout deb --channel stable \
   names `current` and prints `pending confirm: none`. The release it runs is the one the package
   must be, so the move changes the way the node is installed and not the build it runs. Move to a
   newer build afterwards, with the local socket.
+- For an `all-in-one` unit, `/etc/kbf/installer.toml` readable: the packaged unit runs `kbf
+  boot-check` first, which reads that file for a `database` key (none is fine; an unreadable or
+  invalid file stops the start). The other daemon modes do not read it. A hand-placed node has the
+  file already, since the installer reads it.
 - The node drained by whatever drains it (for a storage node, take it out of routing first:
   [update-a-host.md](update-a-host.md#restarting-a-storage-member)). Moving restarts its unit once.
   Do one node at a time.

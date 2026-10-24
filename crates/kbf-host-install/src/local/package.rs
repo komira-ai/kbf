@@ -357,7 +357,7 @@ impl PackageHost {
             }
             Err(SumsError::Malformed) => return Err(verify_refused("SHA256SUMS is malformed")),
         }
-        // 2. The build the farm's workflow made, for the commit.
+        // 2. The build the release workflow made, for the commit.
         let gh_check = GhCheck::pinned(&self.layout, settings);
         let tools = AttestTools {
             trust: &*self.trust,

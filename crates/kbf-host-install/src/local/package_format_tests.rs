@@ -80,6 +80,18 @@ fn the_installed_version_is_read_from_the_package_database() {
     assert!(rpm(2, "").is_err());
     assert!(rpm(0, "0.1.7\n").is_err());
     assert!(rpm(0, "0.1.7 3\n").is_err());
+
+    // Two installed versions (or architectures) are an error, never the first line.
+    assert!(
+        rpm(0, "0.1.7 3.gabcdef012345\n0.1.8 1.g123456789abc\n")
+            .unwrap_err()
+            .contains("more than one")
+    );
+    assert!(
+        deb(0, "ii  0.1.7-1\nii  0.1.7-1\n")
+            .unwrap_err()
+            .contains("more than one")
+    );
 }
 
 #[test]

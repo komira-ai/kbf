@@ -72,6 +72,10 @@ fn with_file(mut cmd: Cmd, file: &Path) -> Cmd {
     cmd
 }
 
+/// The answer when the package database names more than one installed `kbf`: which one runs
+/// is not a guess to make, so nothing is recorded as the previous package.
+const MORE_THAN_ONE: &str = "more than one kbf package is installed";
+
 impl Format {
     /// Which release file this format takes.
     pub fn asset(self) -> AssetKind {
@@ -139,6 +143,9 @@ impl Format {
                     return Ok(None);
                 }
                 let version = words.next().ok_or("no version was printed")?;
+                if words.next().is_some() {
+                    return Err(MORE_THAN_ONE.to_owned());
+                }
                 Ok(Some(version.to_owned()))
             }
             Self::Rpm => {
@@ -146,6 +153,9 @@ impl Format {
                     .next()
                     .zip(words.next())
                     .ok_or("no version and release were printed")?;
+                if words.next().is_some() {
+                    return Err(MORE_THAN_ONE.to_owned());
+                }
                 deb_spelling(version, release)
                     .map(Some)
                     .ok_or_else(|| format!("the release {release:?} names no build"))
