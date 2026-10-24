@@ -950,7 +950,7 @@ mod rules {
     fn image_steps(platform: &str) -> String {
         let build = |n: u32| {
             format!(
-                "      - name: Build {n}\n        run: docker buildx build --builder b --no-cache --platform p --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --file f --output \"type=oci,dest=target/image-out/{n}.oci.tar,rewrite-timestamp=true\" target/image\n"
+                "      - name: Build {n}\n        run: docker buildx build --builder b --no-cache --platform p --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --file f --output \"type=docker,oci-mediatypes=true,dest=target/image-out/{n}.oci.tar,rewrite-timestamp=true\" target/image\n"
             )
         };
         format!(
@@ -972,7 +972,7 @@ mod rules {
     fn coordinator_steps(platform: &str) -> String {
         let build = |n: u32| {
             format!(
-                "      - name: Coordinator build {n}\n        run: docker buildx build --builder b --no-cache --platform p --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --file f --output \"type=oci,dest=target/coordinator-image-out/{n}.oci.tar,rewrite-timestamp=true\" target/coordinator-image\n"
+                "      - name: Coordinator build {n}\n        run: docker buildx build --builder b --no-cache --platform p --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --file f --output \"type=docker,oci-mediatypes=true,dest=target/coordinator-image-out/{n}.oci.tar,rewrite-timestamp=true\" target/coordinator-image\n"
             )
         };
         format!(

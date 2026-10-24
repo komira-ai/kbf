@@ -401,7 +401,7 @@ enum Verb {
     /// program is the attested `kbf` (or the built `kbf-coordinator`), its entrypoint is the
     /// service's, it runs as a user that is not root and it is built for the platform.
     PkgImageAsset {
-        /// The image tarball `docker buildx build --output type=oci` wrote (with
+        /// The image tarball `docker buildx build --output type=docker,oci-mediatypes=true` wrote (with
         /// `--verify-only`: the asset itself).
         #[arg(long)]
         image: PathBuf,
