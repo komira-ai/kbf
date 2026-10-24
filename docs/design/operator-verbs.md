@@ -108,9 +108,6 @@ All answer 404 when the feature is off.
 
 | Verb | Method and route | Status | Gate |
 |---|---|---|---|
-| upload a release file | `PUT /v1/releases/{commit}/{platform}/{name}` | [F] | write, no content-type gate |
-| list releases | `GET /v1/releases` | [F] | open |
-| describe a release (its files by digest; the `releases/<commit>.json` of a `url` source) | `GET /v1/releases/{commit}` | [F] | open |
 | the frontend's own update order, read | `GET /v1/update/frontend` | [V] #1062 | open |
 | the frontend's own update order, write | `POST /v1/update/frontend` | [V] #1062 | write |
 
