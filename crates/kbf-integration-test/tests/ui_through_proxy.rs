@@ -153,7 +153,6 @@ impl Rig {
             listen: loopback(base + 2),
             token: None,
             local_cache: None,
-            releases: None,
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let bound = bind_server_with_ui(
