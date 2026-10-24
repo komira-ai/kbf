@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use kbf_state::Store;
+use kbf_state::postgres::PostgresPackIndex;
+use kbf_state::{PackIndex, PackIndexError, Store};
 
 use crate::farm::{EpochPolicy, StateError};
 use crate::members::MembershipConfig;
@@ -265,6 +266,20 @@ impl StateStoreUri {
     }
 }
 
+/// Why `--pack-index` cannot be honoured.
+#[derive(Debug, thiserror::Error)]
+pub enum PackIndexFlagError {
+    /// The flag is given with no state store to keep the index in.
+    #[error("--pack-index needs --state-store: the pack index is kept there")]
+    NeedsStateStore,
+    /// The state store is SQLite, which does not keep the index.
+    #[error("--pack-index needs a postgres:// --state-store, not SQLite")]
+    NeedsPostgres,
+    /// The index could not be opened on the state store.
+    #[error("--pack-index: {0}")]
+    Open(#[from] PackIndexError),
+}
+
 impl crate::Args {
     /// The state store `--state-store` names, opened, or `None` when the flag is not
     /// given (the scheduler's state is then in memory).
@@ -276,6 +291,35 @@ impl crate::Args {
             .as_ref()
             .map(StateStoreUri::open)
             .transpose()
+    }
+
+    /// The Postgres state store `--pack-index` keeps the index in, or `None` when the flag is
+    /// not given.
+    ///
+    /// # Errors
+    /// [`PackIndexFlagError`]: the flag is given and the state store is missing or is SQLite.
+    pub fn pack_index_url(&self) -> Result<Option<&PostgresUrl>, PackIndexFlagError> {
+        match (self.pack_index, &self.state_store) {
+            (false, _) => Ok(None),
+            (true, None) => Err(PackIndexFlagError::NeedsStateStore),
+            (true, Some(StateStoreUri::Sqlite(_))) => Err(PackIndexFlagError::NeedsPostgres),
+            (true, Some(StateStoreUri::Postgres(url))) => Ok(Some(url)),
+        }
+    }
+
+    /// The pack index `--pack-index` names, opened on the Postgres state store with
+    /// connections of its own, or `None` when the flag is not given. Nothing is created: the
+    /// installer owns the tables.
+    ///
+    /// # Errors
+    /// [`PackIndexFlagError`]: see [`crate::Args::pack_index_url`]; the server cannot be
+    /// reached, or the schema has no pack tables.
+    pub fn open_pack_index(&self) -> Result<Option<Arc<dyn PackIndex>>, PackIndexFlagError> {
+        let Some(url) = self.pack_index_url()? else {
+            return Ok(None);
+        };
+        let index = PostgresPackIndex::open(&url.config)?;
+        Ok(Some(Arc::new(index)))
     }
 }
 

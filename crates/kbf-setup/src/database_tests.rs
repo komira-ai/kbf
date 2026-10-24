@@ -135,7 +135,7 @@ fn next_release() -> Vec<Migration> {
     let mut set = schema::embedded();
     set.push(
         Migration::new(
-            2,
+            schema::latest() + 1,
             "note",
             "-- kbf-migration: expand\nALTER TABLE kv ADD COLUMN note text;",
         )
@@ -159,56 +159,54 @@ fn put(store: &PostgresStore, key: &str) {
 #[test]
 fn setup_creates_the_schema_once_and_a_dry_run_creates_nothing() {
     let s = Scratch::new();
+    let latest = schema::latest();
     let db = Database::new(s.config(), schema::embedded());
-    assert_eq!(db.plan(), Ok((None, 1)));
+    assert_eq!(db.plan(), Ok((None, latest)));
     assert_eq!(
         schema::current(&s.config()),
         Err(SchemaError::NotInitialised)
     );
     let out = db.setup().expect("setup");
-    assert_eq!((out.from, out.to), (None, 1));
-    assert_eq!(db.plan(), Ok((Some(1), 1)));
+    assert_eq!((out.from, out.to), (None, latest));
+    assert_eq!(db.plan(), Ok((Some(latest), latest)));
     PostgresStore::open(&s.config()).expect("kbf starts on what setup made");
     assert!(db.setup().expect("again").ran.is_empty());
 }
 
 /// Catches the update step migrating to the wrong version or breaking the serving child.
-/// Child N is serving on schema 1; the update step for a release that needs schema 2 runs
-/// the new migration; child N keeps writing; a release that needs 3 (an installer older
-/// than the release) is refused and the schema stays at 2; a release that needs 1 changes
-/// nothing.
+/// Child N is serving on schema N, the newest this build embeds; the update step for a
+/// release that needs schema N+1 runs the new migration; child N keeps writing; a release
+/// that needs N+2 (an installer older than the release) is refused and the schema stays at
+/// N+1; a release that needs N changes nothing.
 ///
 /// Catches: the step applying the installer's newest instead of the release's
 /// (the schema moved past what the release asked for).
 #[test]
 fn the_update_step_migrates_to_what_the_release_needs_while_the_old_child_serves() {
     let s = Scratch::new();
+    let n = schema::latest();
+    let (n1, n2) = (n + 1, n + 2);
     Database::new(s.config(), schema::embedded())
         .setup()
         .expect("N installed");
-    let child = PostgresStore::open(&s.config().with_supported_schema(1, 1)).expect("child N");
+    let child = PostgresStore::open(&s.config().with_supported_schema(1, n)).expect("child N");
     put(&child, "a");
 
     let mut db = Database::new(s.config(), next_release());
-    assert_eq!(
-        db.before_start(1).expect("nothing to do"),
-        "the schema is at version 1, nothing to apply"
-    );
-    assert_eq!(schema::current(&s.config()), Ok(1));
-    assert_eq!(
-        db.before_start(2).expect("migrates"),
-        "migrated the schema from 1 to 2"
-    );
+    let stays = format!("the schema is at version {n}, nothing to apply");
+    assert_eq!(db.before_start(n).expect("nothing to do"), stays);
+    assert_eq!(schema::current(&s.config()), Ok(n));
+    let moves = format!("migrated the schema from {n} to {n1}");
+    assert_eq!(db.before_start(n1).expect("migrates"), moves);
     put(&child, "b");
-    assert_eq!(schema::current(&s.config()), Ok(2));
+    assert_eq!(schema::current(&s.config()), Ok(n1));
 
-    let err = db.before_start(3).unwrap_err();
-    assert!(
-        err.contains("needs state schema 3") && err.contains("update the kbf-installer package"),
-        "{err}"
-    );
+    let err = db.before_start(n2).unwrap_err();
+    let wants = format!("needs state schema {n2}");
+    assert!(err.contains(&wants), "{err}");
+    assert!(err.contains("update the kbf-installer package"), "{err}");
     assert!(!err.contains('\n'));
-    assert_eq!(schema::current(&s.config()), Ok(2));
+    assert_eq!(schema::current(&s.config()), Ok(n1));
 }
 
 /// Catches the plan and the update-step line mishandling what the server said, without a

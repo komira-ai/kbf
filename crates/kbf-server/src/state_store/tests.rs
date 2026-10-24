@@ -279,6 +279,39 @@ fn the_flag_takes_a_sqlite_path_or_a_postgres_socket_url_and_defaults_to_none() 
     }
 }
 
+/// Asserts that `--pack-index` is off by default and then needs no store, that given it names
+/// the Postgres state store the index would be opened on, and that the three ways it cannot be
+/// honoured are told apart: no state store, a SQLite one, and a Postgres one nothing listens on.
+#[test]
+fn the_pack_index_flag_is_off_by_default_and_needs_a_postgres_state_store() {
+    let off = Args::try_parse_from(["kbf-server"]).expect("no flag");
+    assert!(!off.pack_index);
+    assert!(off.pack_index_url().expect("no flag").is_none());
+    assert!(off.open_pack_index().expect("no flag").is_none());
+    let mut args = Args::try_parse_from(["kbf-server", "--pack-index"]).expect("the flag");
+    assert!(args.pack_index);
+    let refused = args.open_pack_index().err().expect("no state store");
+    assert!(matches!(refused, PackIndexFlagError::NeedsStateStore));
+    let said = refused.to_string();
+    assert!(said.contains("needs --state-store"), "{said}");
+    args.state_store = Some(StateStoreUri::Sqlite(PathBuf::from("/x.db")));
+    let refused = args.open_pack_index().err().expect("SQLite");
+    assert!(matches!(refused, PackIndexFlagError::NeedsPostgres));
+    let said = refused.to_string();
+    assert!(said.contains("not SQLite"), "{said}");
+    args.state_store = Some(StateStoreUri::local_postgres());
+    let url = args.pack_index_url().expect("a Postgres store");
+    assert!(url.is_some());
+    let dir = scratch("pack-index-no-socket");
+    let text = format!("postgres://kbf:hunter2@/kbf?host={}", dir.display());
+    args.state_store = Some(parse(&text).expect("parses"));
+    let refused = args.open_pack_index().err().expect("nothing listens");
+    assert!(matches!(refused, PackIndexFlagError::Open(_)));
+    let said = refused.to_string();
+    assert!(said.starts_with("--pack-index: "), "{said}");
+    assert!(!said.contains("hunter2"), "{said}");
+}
+
 /// Catches: a refused `--state-store` that quotes its value back. clap echoes the value of
 /// any parser's refusal (`invalid value '...'`), the command line is world-readable, and
 /// the error goes to stderr and the journal. Each value holds a password in a form a

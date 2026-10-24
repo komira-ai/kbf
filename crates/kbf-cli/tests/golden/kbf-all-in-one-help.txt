@@ -546,6 +546,9 @@ Options:
           [default: true]
           [possible values: true, false]
 
+      --pack-index
+          Opens the pack index at start: the tables in the Postgres state store that say which pack holds each blob and where. Nothing reads or writes them yet, so the flag only checks that the store can hold them. Needs `--state-store` as a `postgres://` URL whose schema has the pack tables (`kbf-installer setup` makes them); a `sqlite://` store is refused. Left out, no pack table is touched
+
       --config <FILE>
           Read the mode's settings from this TOML file (default /etc/kbf/kbf.toml when it exists); a flag on the command line overrides its key
 

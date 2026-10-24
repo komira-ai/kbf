@@ -49,7 +49,14 @@ use super::{PostgresConfig, describe};
 pub const MIN_SUPPORTED: u32 = 1;
 
 /// The migrations shipped in this build: version, name, file.
-const EMBEDDED: [(u32, &str, &str); 1] = [(1, "state", include_str!("migrations/0001_state.sql"))];
+const EMBEDDED: [(u32, &str, &str); 2] = [
+    (1, "state", include_str!("migrations/0001_state.sql")),
+    (
+        2,
+        "pack_index",
+        include_str!("migrations/0002_pack_index.sql"),
+    ),
+];
 
 /// Taken (transaction-scoped) by every schema change: the installer's `apply` and `setup`
 /// serialise on it, so two installers racing apply a migration once. The key is

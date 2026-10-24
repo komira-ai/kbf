@@ -39,6 +39,15 @@ before it listens on anything, and `kbf --mode=frontend --check` exits 2 the sam
 the TLS flags the frontend keeps the farm's storage map and routes every call by it;
 `--storage` is then only the bootstrap node.
 
+`--pack-index` (off by default; the `pack-index` key of `[scheduler]` in `kbf.toml`) opens
+the pack index at start: two tables of the Postgres state store (`pack` and `blob`) that
+say which pack holds each blob and where. Nothing reads or writes them yet, so the flag
+only checks that the store can hold them. It needs a `postgres://` state store whose schema
+has the tables, which `kbf-installer setup` and the update step create, and a `sqlite://`
+state store is refused with a line that says so (exit 2). With the flag off no pack table is
+touched. The tables are an additive schema step: a kbf of the previous release keeps running
+on the migrated schema.
+
 **`storage`.** It serves the storage service over gRPC and nothing else: no REAPI, no
 scheduler, no operator API (only `GET /metrics`, on `--metrics-listen`, off unless given).
 It has no state store; it reaches one only through a frontend. Without `--frontend` it is a
