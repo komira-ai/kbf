@@ -47,6 +47,10 @@
 #          is named `publish`; the release lint pins the job list.
 # bump     opens the pull request in the internal repository that moves its submodule to the
 #          released commit, with a token of the release bot scoped to that repository.
+# deploy   sets the published release as the desired version on the farm's update coordinator
+#          and waits for the farm to converge (cargo xtask deploy-farm); it passes with a notice
+#          when the repository variable KBF_COORDINATOR_URL is unset. The one job that holds
+#          `id-token: write`, and no write scope.
 #
 # A run releases one commit; a run of an old commit tags and publishes nothing (the highest
 # release tag must name this commit or an ancestor of it: `release tag` and `release publish`
@@ -399,3 +403,41 @@ jobs:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
           VERSION: ${{ needs.plan.outputs.version }}
         run: cargo xtask release bump-internal --repo "$GITHUB_REPOSITORY" --version "$VERSION" --sha "$COMMIT" --internal-repo komira-ai/komira-internal --submodule kbf
+
+  # The last step of a release: tell the farm's update coordinator "desired = this release" and
+  # wait until the farm converges (docs/deploy/kbf-updater.md, "Turn on the deploy step"). It
+  # runs only after the release is published, holds no write scope and no secret, and holds the
+  # run's OIDC token (`id-token: write`) for the one thing it is for: the coordinator accepts a
+  # token of this workflow on main, for the `release` environment, and nothing else. The
+  # coordinator's address is a repository variable, never written here: unset, the verb
+  # prints a notice and the job passes, so a fork or a repository that does not run a farm is
+  # unaffected. The wait is bounded (the verb's `--deadline-min`, 60 by default, under this
+  # job's timeout), and a farm that is blocked, stalled or out of time fails the job; the
+  # release stays published whatever this job says.
+  deploy:
+    needs: [plan, publish]
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - run: rustup toolchain install
+      # Built before the verb asks for a token, so no build script runs beside one.
+      - run: cargo build -p xtask --locked
+      # The version is the release's; the minimums default to 1 and are the farm's to raise.
+      - name: Set this release as the farm's desired version, and wait for the farm to converge
+        env:
+          COORDINATOR_URL: ${{ vars.KBF_COORDINATOR_URL }}
+          # The farm CA's certificate (public), which the coordinator's certificate chains to.
+          COORDINATOR_CA: ${{ vars.KBF_COORDINATOR_CA }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          MIN_UP_STORAGE: ${{ vars.KBF_MIN_UP_STORAGE || '1' }}
+          MIN_UP_FRONTEND: ${{ vars.KBF_MIN_UP_FRONTEND || '1' }}
+        run: cargo xtask deploy-farm --url "$COORDINATOR_URL" --ca-pem "$COORDINATOR_CA" --version "$VERSION" --min-up-storage "$MIN_UP_STORAGE" --min-up-frontend "$MIN_UP_FRONTEND"
