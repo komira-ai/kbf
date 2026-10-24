@@ -215,6 +215,27 @@ async fn nobody_to_ask_is_unavailable() {
     assert!(error.to_string().contains("no storage map"), "{error}");
 }
 
+/// Catches a whole-blob read that calls a blob missing when an owner of it is down in the map
+/// and the owner that is up says it lacks it (the down one may hold it): UNAVAILABLE, naming
+/// the down owner.
+#[tokio::test]
+async fn a_blob_the_owners_that_are_up_lack_is_unavailable_while_an_owner_is_down() {
+    let members = vec![
+        member(1, MemberState::Down),
+        member(2, MemberState::Active),
+        member(3, MemberState::Active),
+    ];
+    let map = map(1, 2, members);
+    let cluster = Cluster::of(3);
+    let (router, _) = router(&map, &cluster);
+    let (_, digest) =
+        blob_where(|d| map.write_owners(d) == [kbf_map::MemberId(1), kbf_map::MemberId(2)]);
+
+    let error = router.read_blob(&digest).await.expect_err("not served");
+    assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");
+    assert!(error.to_string().contains("is down"), "{error}");
+}
+
 /// Catches an owner that cannot be dialled (an address that is not one) ending the read
 /// or being taken for an absence: it is skipped, the next owner answers, and when nobody
 /// does the failure is the answer, not NOT_FOUND.

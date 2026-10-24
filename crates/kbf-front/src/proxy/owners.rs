@@ -169,17 +169,25 @@ impl Owners {
     /// nodes itself; empty when every owner is down.
     #[must_use]
     pub fn for_digest(&self, digest: &Digest) -> Arc<[Owner]> {
+        self.placed(digest).0
+    }
+
+    /// [`Owners::for_digest`], and the first owner the map names for the digest that is
+    /// down and so is not in the list: UNAVAILABLE naming it. The raw read treats a miss
+    /// as final only when there is none.
+    pub(super) fn placed(&self, digest: &Digest) -> (Arc<[Owner]>, Option<Status>) {
         let Some(routed) = self.routing() else {
-            return self.fixed();
+            return (self.fixed(), None);
         };
-        routed.place(digest).map_or_else(
-            |_| Arc::from(Vec::new()),
-            |placement| {
-                (placement.read.iter())
-                    .filter_map(|member| owner_of(routed, member, placement.generation))
-                    .collect()
-            },
-        )
+        let Ok(placement) = routed.place(digest) else {
+            return (Arc::from(Vec::new()), None);
+        };
+        let owners = (placement.read.iter())
+            .filter_map(|member| owner_of(routed, member, placement.generation))
+            .collect();
+        let away = (placement.away.first())
+            .map(|member| Status::unavailable(format!("storage node {} is down", member.id)));
+        (owners, away)
     }
 
     /// The node an upload of `digest` goes to: the map's first owner that is not down

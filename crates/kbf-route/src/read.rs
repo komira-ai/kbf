@@ -258,6 +258,11 @@ impl Router {
                 }
             }
         }
+        // An owner the map has down was not asked and may hold the blob: it is one that
+        // could not say.
+        if let Some(down) = view.map.down_owners(digest).first() {
+            failure.get_or_insert_with(|| unavailable(format!("storage node {} is down", down.id)));
+        }
         Ok(Walked::Missed {
             absent: absent.len(),
             failure,

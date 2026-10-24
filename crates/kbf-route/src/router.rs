@@ -59,6 +59,10 @@ pub struct Placement {
     /// rank order, then the members that may not hold the blob yet, then, while a change
     /// settles, the previous generation's owners. Empty when every owner is down.
     pub read: Vec<Member>,
+    /// The owners of this generation that are down, and so are not in `read`. A blob that
+    /// no member of `read` holds may be on one of these: the caller is not told it is
+    /// missing while any of them is down.
+    pub away: Vec<Member>,
     /// The member a write goes to: the first owner that is not down. `None` when every
     /// owner is down.
     pub write: Option<Member>,
@@ -186,6 +190,7 @@ impl Router {
         Ok(Placement {
             generation: view.map.generation(),
             read: read_order(&view, digest).into_iter().cloned().collect(),
+            away: view.map.down_owners(digest).into_iter().cloned().collect(),
             write: writers.first().cloned(),
             writers,
         })

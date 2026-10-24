@@ -119,6 +119,8 @@ pub struct Fake {
     pub away: AtomicUsize,
     /// The status that ends a blob of kind `2` after its two chunks (DATA_LOSS if none).
     pub break_with: Option<tonic::Code>,
+    /// What the calls counted by `away` are answered with (UNAVAILABLE if none).
+    pub away_code: Option<tonic::Code>,
 }
 
 struct DropFlag(Arc<AtomicBool>);
@@ -176,6 +178,16 @@ impl Fake {
         })
     }
 
+    /// A node that answers its first `calls` Reads and Writes with `code` before a byte is
+    /// read or sent, and serves after them.
+    pub fn failing_first(code: tonic::Code, calls: usize) -> Arc<Self> {
+        Arc::new(Self {
+            away: AtomicUsize::new(calls),
+            away_code: Some(code),
+            ..Self::default()
+        })
+    }
+
     /// A node whose Reads send two chunks and then end with `code`.
     pub fn breaking_reads(code: tonic::Code) -> Arc<Self> {
         Arc::new(Self {
@@ -220,7 +232,10 @@ impl ByteStream for Fake {
         let name = r.into_inner().resource_name;
         self.note("Read", &name, &metadata);
         if self.take_away() {
-            return Err(Status::unavailable("restarting"));
+            return Err(Status::new(
+                self.away_code.unwrap_or(tonic::Code::Unavailable),
+                "restarting",
+            ));
         }
         let (hash, size) = tail(&name);
         let kind = self.force.or_else(|| hash.chars().next()).unwrap_or('0');
