@@ -19,6 +19,7 @@ use sha2::{Digest as _, Sha256};
 
 mod golden;
 mod pool;
+pub mod vm;
 pub use golden::{golden_config, golden_plist, golden_plist_as};
 
 /// The example profile the tests start from.
@@ -115,6 +116,15 @@ pub struct State {
     pub spotlight_off: BTreeSet<String>,
     /// Paths `tmutil isexcluded` reports excluded.
     pub backup_excluded: BTreeSet<String>,
+    /// The password `dscl` was given for each record (a path under `/Users`), by its
+    /// `passwd` command.
+    pub passwords: BTreeMap<String, String>,
+    /// How many times the random source was read: each read differs from the others.
+    pub random_reads: u8,
+    /// The random source cannot be read.
+    pub random_fails: bool,
+    /// The random source gives one byte fewer than asked.
+    pub random_short: bool,
 }
 
 impl State {
@@ -464,6 +474,11 @@ impl FakeMac {
             ("defaults", ["write", domain, key, "-bool", value @ ("true" | "false")]) => {
                 let domain = self.strip_root(domain).to_owned();
                 s.default_set(&domain, key, bit(value));
+                done(true)
+            }
+            ("defaults", ["write", domain, key, "-string", value]) => {
+                let domain = self.strip_root(domain).to_owned();
+                s.default_set(&domain, key, value);
                 done(true)
             }
             ("defaults", ["delete", domain, key]) => {
@@ -878,6 +893,21 @@ impl Host for FakeMac {
                         attrs.retain(|(a, _)| a != attr);
                     }
                 }
+                // Like dscl's: a hash of the password is kept, and the record is
+                // given an authority; the fake keeps the password itself to be asked.
+                ["passwd", record, password] => {
+                    if s.records.contains_key(*record) {
+                        s.attr(
+                            record,
+                            "AuthenticationAuthority",
+                            ";ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2>",
+                        );
+                        s.attr(record, "Password", "********");
+                        s.passwords.insert((*record).into(), (*password).into());
+                    } else {
+                        rejected = true;
+                    }
+                }
                 other => panic!("the fake dscl cannot run {other:?}"),
             }
         }
@@ -973,6 +1003,21 @@ impl Host for FakeMac {
 
     fn pause(&self, seconds: u64) {
         self.log.borrow_mut().push(format!("sleep {seconds}"));
+    }
+
+    /// Bytes that differ from one read to the next, and are not zero.
+    fn random(&self, len: usize) -> io::Result<Vec<u8>> {
+        self.log.borrow_mut().push(format!("random {len}"));
+        let mut s = self.state.borrow_mut();
+        if s.random_fails {
+            return Err(io::Error::other("no random source"));
+        }
+        s.random_reads += 1;
+        let seed = s.random_reads;
+        let len = if s.random_short { len - 1 } else { len };
+        Ok((0..len)
+            .map(|i| seed.wrapping_mul(37).wrapping_add(i as u8 * 3 + 1))
+            .collect())
     }
 }
 

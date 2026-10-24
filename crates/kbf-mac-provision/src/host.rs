@@ -160,6 +160,12 @@ pub trait Host {
     fn remove(&self, path: &str) -> io::Result<()>;
     /// Waits `seconds` (between tries of a program that may not succeed at once).
     fn pause(&self, seconds: u64);
+    /// `len` bytes from the system's random source (the Mac's, never under
+    /// [`Host::root`]).
+    ///
+    /// # Errors
+    /// The source cannot be read.
+    fn random(&self, len: usize) -> io::Result<Vec<u8>>;
 }
 
 /// The Mac this runs on, with its `/` at `root` (`/` but in tests).
@@ -283,6 +289,13 @@ impl Host for RealHost {
 
     fn pause(&self, seconds: u64) {
         std::thread::sleep(std::time::Duration::from_secs(seconds));
+    }
+
+    fn random(&self, len: usize) -> io::Result<Vec<u8>> {
+        use std::io::Read as _;
+        let mut bytes = vec![0; len];
+        fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        Ok(bytes)
     }
 }
 
@@ -461,5 +474,10 @@ impl<'a> Mac<'a> {
 
     pub(crate) fn pause(&self, seconds: u64) {
         self.host.pause(seconds);
+    }
+
+    /// `len` random bytes.
+    pub(crate) fn random(&self, len: usize) -> io::Result<Vec<u8>> {
+        self.host.random(len)
     }
 }

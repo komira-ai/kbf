@@ -28,6 +28,7 @@
 //! - [`launchd`]: the LaunchDaemon property list the profile renders, the account it
 //!   runs as (`daemon_user`), and the restart.
 //! - `pool`: the lease-user pool `kbf-pool-<i>` and the volume its homes are on.
+//! - `vm_user`: the standing VM user `kbf-vm`, its password file, and auto-login as it.
 //! - [`record`]: the settings as `apply` first found them, and `revert`.
 //! - [`cli`]: flags and exit statuses.
 //!
@@ -47,3 +48,4 @@ mod pattern;
 mod pool;
 mod software;
 mod sshd;
+mod vm_user;

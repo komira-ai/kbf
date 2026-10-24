@@ -48,7 +48,10 @@ crates/kbf-integration-test/tests/interpreters/mod.rs	data: the lint's own lists
 crates/kbf-integration-test/tests/interpreters/rust.rs	data: the lint's own shell names and osascript
 crates/kbf-integration-test/tests/interpreters/tests.rs	data: the lint's tests' tables of interpreter names, paths and #! lines
 crates/kbf-integration-test/tests/repo_lints.rs	data: the #! files planted in the budget lint's trees
+crates/kbf-mac-provision/tests/as_root.rs	data: /bin/zsh as the VM user's expected UserShell value; nothing runs it
 crates/kbf-mac-provision/tests/drift.rs	data: /bin/zsh as a drifted UserShell value; nothing runs it
+crates/kbf-mac-provision/tests/support/vm.rs	data: /bin/zsh as the fake VM user's UserShell value; nothing runs it
+crates/kbf-mac-provision/tests/vm_user.rs	data: /bin/zsh as the VM user's expected UserShell value in reports; nothing runs it
 crates/kbf-mac-session/tests/node_admin.rs	data: /bin/sh as an argument the verb parser must refuse; nothing runs it
 crates/kbf-mac-session/tests/role_user.rs	data: /bin/zsh as a UserShell changed by hand; nothing runs it
 crates/kbf-node/tests/front/mod.rs	Front::user_shell: the tests of how the daemon ends a user's /bin/sh -c command and its background job (`$$`, `$!` name the processes), sent through the front

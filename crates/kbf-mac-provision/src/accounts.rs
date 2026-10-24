@@ -4,11 +4,12 @@
 use std::io;
 
 use crate::items::{Ctx, DEFAULTS, Lines, Outcome, defaults_read, fail, or, pass, run};
+use crate::vm_user;
 
 pub(crate) const DSCL: &str = "/usr/bin/dscl";
 pub(crate) const DSEDITGROUP: &str = "/usr/sbin/dseditgroup";
-const LOGINWINDOW: &str = "/Library/Preferences/com.apple.loginwindow";
-const KCPASSWORD: &str = "/etc/kcpassword";
+pub(crate) const LOGINWINDOW: &str = "/Library/Preferences/com.apple.loginwindow";
+pub(crate) const KCPASSWORD: &str = "/etc/kcpassword";
 /// kbf-mac-session's intent record: the lease whose user the session switch logs in.
 const SESSION_INTENT: &str = "/var/db/kbf-mac-session/session-intent";
 
@@ -176,10 +177,19 @@ fn intent_user(c: &Ctx<'_>) -> Option<String> {
 }
 
 /// Auto-login is off with no `/etc/kcpassword` left, or it is the lease user whose
-/// lease kbf-mac-session's intent record names, with a uid in `lease_uids`.
+/// lease kbf-mac-session's intent record names, with a uid in `lease_uids`, or it is
+/// the profile's VM user ([`vm_user::autologin_vm`]), the only other account it may be.
+/// With `autologin=vm` it must be on: the VM user, or a lease user while a whole_machine
+/// lease runs.
 pub(crate) fn autologin(c: &Ctx<'_>) -> Outcome {
     let user = defaults_read(c, LOGINWINDOW, "autoLoginUser");
     if user.is_empty() {
+        if c.value() == "vm" {
+            return fail(format!(
+                "off, but the profile wants auto-login as {}: apply sets it",
+                vm_user::VM_USER
+            ));
+        }
         return if c.mac.exists(KCPASSWORD) {
             fail("off, but /etc/kcpassword is left over")
         } else {
@@ -187,6 +197,11 @@ pub(crate) fn autologin(c: &Ctx<'_>) -> Outcome {
         };
     }
     let uid = dscl_attr(c, &format!("/Users/{user}"), "UniqueID");
+    if user == vm_user::VM_USER
+        && let Some(outcome) = vm_user::autologin_vm(c, &uid)
+    {
+        return outcome;
+    }
     let in_range = crate::pattern::number(&uid)
         && uid
             .parse::<u64>()
@@ -202,8 +217,11 @@ pub(crate) fn autologin(c: &Ctx<'_>) -> Outcome {
             ))
         };
     }
+    let vm = c.profile.vm_user_uid.map_or_else(String::new, |uid| {
+        format!(" or {} (uid {uid})", vm_user::VM_USER)
+    });
     fail(format!(
-        "auto-login is {user} (uid {}); only a kbf-lease-* user in uids {} may be",
+        "auto-login is {user} (uid {}); only a kbf-lease-* user in uids {}{vm} may be",
         or(&uid, "none"),
         c.profile.get("lease_uids")
     ))
@@ -239,8 +257,12 @@ pub(crate) fn fix_role_user(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
     Ok(())
 }
 
-/// Clears auto-login and removes `/etc/kcpassword`, whichever is there.
+/// With `autologin=vm`, sets auto-login to the VM user ([`vm_user::fix_enable_autologin`]).
+/// Otherwise clears auto-login and removes `/etc/kcpassword`, whichever is there.
 pub(crate) fn fix_autologin(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
+    if c.value() == "vm" {
+        return vm_user::fix_enable_autologin(c, out);
+    }
     if !defaults_read(c, LOGINWINDOW, "autoLoginUser").is_empty() {
         let domain = c.mac.path(LOGINWINDOW);
         run(c, DEFAULTS, &["delete", &domain, "autoLoginUser"]);
