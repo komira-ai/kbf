@@ -36,7 +36,7 @@ fn ticket_named(stage: Stage, name: &str) -> (watch::Sender<Stage>, Ticket) {
 /// runs, so a load balancer's idle timeout cuts it and Buck2 (which never reconnects)
 /// fails the action. An action that runs for ten intervals gets ten progress
 /// operations after the first one, each the same operation, not done, at its current
-/// stage. Mutant: no ticker (`Progress::off`, or a stream that does not select the
+/// stage. Catches: no ticker (`Progress::off`, or a stream that does not select the
 /// tick): the read times out on the paused clock and the test fails.
 #[tokio::test(start_paused = true)]
 async fn an_idle_stream_gets_a_progress_operation_every_tick() {
@@ -159,7 +159,7 @@ async fn a_zero_interval_never_ticks() {
 /// (a stream the client has not read yet would be invisible to a drain that waits for
 /// 0) or that stays raised however the stream ends. Each way a stream ends lowers it
 /// exactly once: the done operation, a client that drops the stream, and
-/// `Closer::close`. Mutants: `operations` not calling `OpenExecute::streaming` (the
+/// `Closer::close`. Catches: `operations` not calling `OpenExecute::streaming` (the
 /// first assertion fails); `Drop` not lowering it (the three settled assertions fail);
 /// `streaming` raising twice per call (the first assertion reads 2).
 #[tokio::test(start_paused = true)]
@@ -210,7 +210,7 @@ async fn open_executions_is_raised_with_the_stream_and_lowered_however_it_ends()
 
 /// Catches an `undrain` that does not take new Execute calls again (an update that
 /// failed its prepare would leave the old process refusing), one that reports a change
-/// when there was none, and one that undoes a close. Mutants: `undrain` doing nothing;
+/// when there was none, and one that undoes a close. Catches: `undrain` doing nothing;
 /// `undrain` returning `true` always; `undrain` setting `Open` from `Closed`.
 #[test]
 fn undrain_takes_calls_again_until_the_close() {

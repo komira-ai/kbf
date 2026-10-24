@@ -457,7 +457,7 @@ const RUN: [&str; 5] = ["run", "--passes", "1", "--unit", "kbf.service"];
 /// pass still ends, an unreadable state stops it before any pass (exit 1), and a memory file
 /// it cannot read stops the loop with the file named.
 ///
-/// Mutants planted: the pass count ignored (the test would hang); `recover` errors dropped
+/// Catches: the pass count ignored (the test would hang); `recover` errors dropped
 /// (the ruined state is then not an exit 1); the cycle error dropped (helper.json is then not
 /// reported).
 #[test]
@@ -504,8 +504,8 @@ fn run_does_its_passes_and_stops_on_a_state_it_cannot_read() {
 ///
 /// Red on main: nothing sweeps `work/`, so the directories are still there.
 ///
-/// Mutant it is meant to catch (reasoned, not run): the `recover` call dropped from `run`
-/// (red: the directories stay).
+/// Catches: the `recover` call dropped from `run`
+/// (the directories stay).
 #[test]
 fn run_removes_the_scratch_a_killed_stage_left_when_it_starts() {
     let (layout, root) = seeded("run-sweeps");
@@ -526,7 +526,7 @@ fn run_removes_the_scratch_a_killed_stage_left_when_it_starts() {
 /// Catches `run` not waiting between passes, or not stopping after the last: two passes on a
 /// host take one `PASS_INTERVAL` (the only wait, none after the last pass) and exit 0.
 ///
-/// Mutants to plant: the wait dropped (the test finishes in well under the interval); the
+/// Catches: the wait dropped (the test finishes in well under the interval); the
 /// wait taken after the last pass too (it takes two intervals).
 #[test]
 fn run_waits_one_interval_between_two_passes_and_not_after_the_last() {
@@ -544,7 +544,7 @@ fn run_waits_one_interval_between_two_passes_and_not_after_the_last() {
 /// needs root and so refuses an ordinary user (exit 1), a ruined state refuses (exit 1), and
 /// a relative root is refused for both verbs before anything is read.
 ///
-/// Mutant planted: the decision printed but the error arm returning `Ok` (the refusals
+/// Catches: the decision printed but the error arm returning `Ok` (the refusals
 /// above are then exit 0).
 #[test]
 fn boot_check_counts_a_start_and_refuses_what_it_cannot_read() {
@@ -685,7 +685,7 @@ fn the_bundled_boot_check_fails_when_kbf_boot_check_does_not_exit_0() {
 /// does not have is an invalid value, neither flag is the connected host's check, and both
 /// give the path and the mode back together.
 ///
-/// Mutants it catches: either `requires` dropped from the flags; `bundled` returning a fixed
+/// Catches: either `requires` dropped from the flags; `bundled` returning a fixed
 /// mode, or `Some` for a lone `--kbf`.
 #[test]
 fn the_bundled_flags_of_boot_check_come_together_or_not_at_all() {
@@ -723,7 +723,7 @@ fn the_bundled_flags_of_boot_check_come_together_or_not_at_all() {
 /// that cannot be read, and a plain message end `failed` (1). Both of the error types a verb
 /// can end with are checked.
 ///
-/// Mutant planted: the guard dropped (every state error asks for an operator).
+/// Catches: the guard dropped (every state error asks for an operator).
 #[test]
 fn only_an_unusable_state_asks_for_an_operator() {
     use crate::helper::cycle::HelperError;
@@ -759,7 +759,7 @@ fn only_an_unusable_state_asks_for_an_operator() {
 /// watches is another file (here one that is no program), so the turn says re-exec, the
 /// loop tries to start it, and the failure is the reason it ends with (exit 1).
 ///
-/// Mutants planted: the watch never consulted; the failed start taken for a success.
+/// Catches: the watch never consulted; the failed start taken for a success.
 #[test]
 fn a_loop_whose_file_was_replaced_tries_the_new_one_and_ends_when_it_cannot_start() {
     let (_, root) = seeded("replaced");
@@ -806,7 +806,7 @@ fn sigpipe_handler() -> libc::sighandler_t {
 /// `revert` and `rollback` need the operator (5), `quiesce` is at rest (0) and a dry-run `gc`
 /// succeeds; each failure of the operator keeps its exit code through the conversion.
 ///
-/// Mutants planted: a verb dispatched to another verb's function; the refused exit folded
+/// Catches: a verb dispatched to another verb's function; the refused exit folded
 /// into failed.
 #[test]
 fn the_operators_verbs_run_through_the_dispatcher_with_their_own_exits() {
@@ -842,7 +842,7 @@ fn the_operators_verbs_run_through_the_dispatcher_with_their_own_exits() {
 /// the exit of the refusal and the program on the line; a release error keeps the exit of
 /// the release verbs.
 ///
-/// Mutants planted: the verb dispatched to `gc`; the refusal folded into the failure exit.
+/// Catches: the verb dispatched to `gc`; the refusal folded into the failure exit.
 #[test]
 fn record_release_runs_through_the_dispatcher_and_refuses_what_is_not_a_release() {
     use crate::record_release::RecordError;
@@ -884,7 +884,7 @@ fn record_release_runs_through_the_dispatcher_and_refuses_what_is_not_a_release(
 /// database (or a launchd label, which names no mode) still runs without one; and a config
 /// that cannot be read stops the service rather than starting it without the step.
 ///
-/// Mutants seen red: the unit check removed (the all-in-one unit ran its pass); the unit
+/// Catches: the unit check removed (the all-in-one unit ran its pass); the unit
 /// check matching only `kbf-frontend@` (the plain `kbf-frontend.service`, the unit setup enables on
 /// a frontend host, ran its pass without the migration);
 /// the all-in-one template (`kbf-all-in-one@1.service`) is in the test list.
@@ -970,7 +970,7 @@ fn the_installer_config_flag_must_be_an_absolute_host_path() {
 /// the database's own error (the socket directory does not exist, so no server is needed),
 /// and one built without the flag has no step.
 ///
-/// Mutants seen red: the `set_schema_step` call removed from `build_helper`.
+/// Catches: the `set_schema_step` call removed from `build_helper`.
 #[test]
 fn run_with_an_installer_config_drives_a_helper_that_migrates_first() {
     let (_, root) = seeded("run-schema-step");
@@ -1007,7 +1007,7 @@ fn run_with_an_installer_config_drives_a_helper_that_migrates_first() {
 /// `sandbox-exec`) each cannot tell, with the reason: the activation is refused
 /// (fail closed), and `run` itself still starts for them.
 ///
-/// Mutants seen red: `leases::NotWired` left in `build_helper` (the daemon's lease reads as
+/// Catches: `leases::NotWired` left in `build_helper` (the daemon's lease reads as
 /// "cannot tell"); the cgroup root taken as the real `/sys/fs/cgroup` instead of the host
 /// root's.
 #[test]
@@ -1041,7 +1041,7 @@ fn run_builds_a_helper_whose_lease_source_reads_the_restarted_units_cgroup() {
 /// absolute path (the root is the sandbox flag's; a relative one is refused with its reason
 /// rather than reading from the working directory).
 ///
-/// Mutants to plant: the `Root::new` error in `under` swallowed.
+/// Catches: the `Root::new` error in `under` swallowed.
 #[test]
 fn run_with_an_installer_config_refuses_a_relative_host_root() {
     let mut argv = RUN.to_vec();
@@ -1068,7 +1068,7 @@ fn run_args(extra: &[&str]) -> RunArgs {
 /// Catches the flag ignored (the fetcher would read a file the operator did not name) and a
 /// default that is not `setup`'s file.
 ///
-/// Mutants planted: the flag's arm returning the default.
+/// Catches: the flag's arm returning the default.
 #[test]
 fn the_fetcher_reads_the_flags_installer_toml_else_the_one_setup_writes() {
     let root = || kbf_host::Root::new("/").expect("root");
@@ -1096,7 +1096,7 @@ fn the_fetcher_reads_the_flags_installer_toml_else_the_one_setup_writes() {
 /// Catches `build_helper` going back to `fetcher::NotWired` (every fetch refused with no reason
 /// to act on).
 ///
-/// Mutants planted: `Box::new(fetcher::NotWired)` in place of the host fetcher.
+/// Catches: `Box::new(fetcher::NotWired)` in place of the host fetcher.
 #[test]
 fn run_builds_its_helper_with_the_host_fetcher_not_the_unwired_one() {
     let (_, root) = seeded("run-fetcher");
@@ -1131,7 +1131,7 @@ fn write_kbf_toml(layout: &Layout, text: &str) {
 /// `setup` enabled for the `mode` of the host's kbf.toml, one per mode, and a flag still
 /// wins over the file.
 ///
-/// Mutants planted: `named_service` ignoring the flags; the first unit of the mode taken
+/// Catches: `named_service` ignoring the flags; the first unit of the mode taken
 /// from another mode's row.
 #[test]
 fn run_without_a_service_flag_restarts_the_unit_of_the_hosts_mode() {
@@ -1182,7 +1182,7 @@ fn run_without_a_service_flag_restarts_the_unit_of_the_hosts_mode() {
 /// mode kbf does not offer (`node`), or a Mac without a label each end it with exit 2 and the
 /// reason, before any pass.
 ///
-/// Mutants planted: the platform check dropped; the unknown mode mapped to a default unit; a
+/// Catches: the platform check dropped; the unknown mode mapped to a default unit; a
 /// missing, unparseable, unreadable or mode-less kbf.toml mapped to a default unit.
 #[test]
 fn run_with_no_service_and_no_mode_to_derive_one_is_a_usage_error() {
@@ -1268,7 +1268,7 @@ fn run_with_no_service_and_no_mode_to_derive_one_is_a_usage_error() {
 /// silently absent, the very thing `run` refuses to start without): on a frontend host the
 /// target carries `/etc/kbf/installer.toml`, on a daemon host none, and a flag is kept.
 ///
-/// Mutants planted: the default dropped; the default given to every mode.
+/// Catches: the default dropped; the default given to every mode.
 #[test]
 fn a_derived_database_unit_reads_the_default_installer_toml_and_others_none() {
     let (_, root) = seeded("run-derived-config");
