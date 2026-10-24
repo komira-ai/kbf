@@ -57,8 +57,9 @@ fn as_root<'a>(log: &'a Log) -> impl FnMut(&Path) -> Vec<String> + 'a {
     }
 }
 
-fn launched(tool: &str, args: &str) -> String {
-    format!("{PROGRAM} __as-user 61003 20 -- {tool} {args}")
+/// The call of the entry mode `mode` on the home.
+fn home_call(mode: &str) -> String {
+    format!("{PROGRAM} __entry {mode} 61003 20 {HOME}")
 }
 
 /// The call of the entry mode `mode`: it drops to the uid itself.
@@ -76,20 +77,19 @@ fn the_flags_step_clears_the_home_as_root_and_the_entry_as_the_uid_in_that_order
         &mut runner(&log, &[]),
     )
     .expect("clean");
-    let acl = acl_args(Path::new(FOLDERS), 61003);
     assert_eq!(
         *log.borrow(),
         vec![
             format!("root {HOME}"),
-            launched(FIND, &words(&acl)),
+            mode_call("acl"),
             mode_call("clear"),
-            launched(FIND, &words(&acl)),
+            mode_call("acl"),
         ]
     );
 }
 
 #[test]
-fn root_is_never_given_the_entry_to_clear_or_to_empty() {
+fn root_is_given_the_home_only_to_clear_never_the_entry_and_never_to_empty() {
     let log = Log::default();
     let mut roots = Vec::new();
     let mut record = |path: &Path| {
@@ -104,14 +104,8 @@ fn root_is_never_given_the_entry_to_clear_or_to_empty() {
         run,
     )
     .expect("flags");
-    contents_step(
-        &me(),
-        (Path::new(HOME), Path::new(FOLDERS)),
-        &mut record,
-        run,
-    )
-    .expect("contents");
-    assert_eq!(roots, vec![PathBuf::from(HOME), PathBuf::from(HOME)]);
+    contents_step(&me(), (Path::new(HOME), Path::new(FOLDERS)), run).expect("contents");
+    assert_eq!(roots, vec![PathBuf::from(HOME)]);
 }
 
 #[test]
@@ -120,25 +114,25 @@ fn every_call_on_the_entry_is_made_as_the_uid() {
     let run = &mut runner(&log, &[]);
     let dir = (Path::new(HOME), Path::new(FOLDERS));
     flags_step(&me(), dir, &mut as_root(&Log::default()), run).expect("flags");
-    contents_step(&me(), dir, &mut as_root(&Log::default()), run).expect("contents");
+    contents_step(&me(), dir, run).expect("contents");
     left(&me(), Path::new(FOLDERS), run).expect("left");
+    left_home(&me(), Path::new(HOME), run).expect("left home");
     let calls = log.borrow();
-    assert_eq!(calls.len(), 5);
+    assert_eq!(calls.len(), 7);
     // The daemon's modes get the ids and drop inside their own process (the pool user
-    // need not be able to execute the binary); the system tool is run by `as-user`.
+    // need not be able to execute the binary).
     for call in calls.iter() {
         let own = call.starts_with(&format!("{PROGRAM} __entry "))
-            && call.contains(&format!(" 61003 20 {FOLDERS}"));
-        let tool = call.starts_with(&format!("{PROGRAM} __as-user 61003 20 -- {FIND} "));
-        assert!(own || tool, "{call}");
+            && (call.contains(&format!(" 61003 20 {FOLDERS}"))
+                || call.contains(&format!(" 61003 20 {HOME}")));
+        assert!(own, "{call}");
     }
 }
 
 #[test]
 fn the_acls_are_removed_before_and_after_the_sweep_and_only_the_last_removal_is_judged() {
     let log = Log::default();
-    let acl = words(&acl_args(Path::new(FOLDERS), 61003));
-    let first = format!("{PROGRAM} __as-user 61003 20 -- {FIND} ");
+    let first = format!("{PROGRAM} __entry acl ");
     // Every call fails but the sweep, which is the second: the first removal is let fail.
     let calls = RefCell::new(0);
     let mut run = |program: &Path, args: &[OsString]| {
@@ -153,33 +147,28 @@ fn the_acls_are_removed_before_and_after_the_sweep_and_only_the_last_removal_is_
     clear_flags(&me(), Path::new(FOLDERS), &mut run).expect("only the last removal is judged");
     assert_eq!(
         *log.borrow(),
-        vec![
-            launched(FIND, &acl),
-            mode_call("clear"),
-            launched(FIND, &acl),
-        ]
+        vec![mode_call("acl"), mode_call("clear"), mode_call("acl")]
     );
 }
 
 #[test]
-fn the_contents_step_empties_the_home_as_root_then_the_entry_as_the_uid() {
+fn the_contents_step_empties_the_home_then_the_entry_both_as_the_uid() {
     let log = Log::default();
     contents_step(
         &me(),
         (Path::new(HOME), Path::new(FOLDERS)),
-        &mut as_root(&log),
         &mut runner(&log, &[]),
     )
     .expect("clean");
     assert_eq!(
         *log.borrow(),
-        vec![format!("root {HOME}"), mode_call("empty"),]
+        vec![home_call("empty-home"), mode_call("empty")]
     );
 }
 
 #[test]
 fn a_uid_side_failure_of_the_flags_step_fails_it_naming_the_entry() {
-    for fail in ["__entry clear", "-exec"] {
+    for fail in ["__entry clear", "__entry acl"] {
         let log = Log::default();
         let why = flags_step(
             &me(),
@@ -202,10 +191,13 @@ fn both_uid_side_failures_of_the_flags_step_are_reported() {
         &me(),
         (Path::new(HOME), Path::new(FOLDERS)),
         &mut as_root(&log),
-        &mut runner(&log, &["__entry clear", "-exec"]),
+        &mut runner(&log, &["__entry clear", "__entry acl"]),
     )
     .expect_err("fails");
-    assert!(why.contains("__entry clear failed; -exec failed"), "{why}");
+    assert!(
+        why.contains("__entry clear failed; __entry acl failed"),
+        "{why}"
+    );
 }
 
 #[test]
@@ -223,16 +215,15 @@ fn a_failure_of_the_home_as_root_fails_the_step_and_the_entry_is_still_cleaned()
 }
 
 #[test]
-fn a_uid_side_failure_of_the_contents_step_fails_it_naming_the_entry() {
+fn a_uid_side_failure_of_the_contents_step_fails_it_naming_the_path() {
     let log = Log::default();
     let why = contents_step(
         &me(),
         (Path::new(HOME), Path::new(FOLDERS)),
-        &mut as_root(&log),
-        &mut runner(&log, &["__entry empty"]),
+        &mut runner(&log, &["__entry empty "]),
     )
     .expect_err("fails");
-    assert_eq!(why, format!("{FOLDERS}: __entry empty failed"));
+    assert_eq!(why, format!("{FOLDERS}: __entry empty  failed"));
 }
 
 #[test]
@@ -241,12 +232,26 @@ fn a_failure_of_the_home_and_of_the_entry_are_both_in_the_contents_failure() {
     let why = contents_step(
         &me(),
         (Path::new(HOME), Path::new(FOLDERS)),
-        &mut |_| vec!["home: busy".to_owned()],
         &mut runner(&log, &["__entry empty"]),
     )
     .expect_err("fails");
-    assert!(why.starts_with("home: busy; "), "{why}");
-    assert!(why.contains(FOLDERS), "{why}");
+    assert!(why.starts_with(&format!("{HOME}: ")), "{why}");
+    assert!(why.contains(&format!("{FOLDERS}: ")), "{why}");
+}
+
+#[test]
+fn the_look_of_the_home_is_one_call_as_the_uid_and_names_the_home_when_it_fails() {
+    let log = Log::default();
+    let lines = left_home(&me(), Path::new(HOME), &mut runner(&log, &[])).expect("looked");
+    assert_eq!(lines, vec!["lines", "of", "output"]);
+    assert_eq!(*log.borrow(), vec![home_call("look-home")]);
+    let why = left_home(
+        &me(),
+        Path::new(HOME),
+        &mut runner(&Log::default(), &["look-home"]),
+    )
+    .expect_err("fails");
+    assert_eq!(why, format!("{HOME}: look-home failed"));
 }
 
 #[test]
@@ -278,12 +283,6 @@ fn acls_are_removed_only_from_the_uids_entries_and_never_through_a_link() {
             "-x {FOLDERS} ! ( -path {FOLDERS} -o -path {FOLDERS}/0 -o -path {FOLDERS}/C -o -path {FOLDERS}/T -o -path {FOLDERS}/X ) -user 61003 ( ( -type d -exec /bin/chmod -N {{}} ; ) -o ( ! -type l -exec /bin/chmod -N {{}} + ) )"
         )
     );
-}
-
-#[test]
-fn the_launch_is_the_as_user_mode_then_the_tool() {
-    let args = me().launch(OsStr::new("/usr/bin/true"), &["a".into(), "b".into()]);
-    assert_eq!(words(&args), "__as-user 61003 20 -- /usr/bin/true a b");
 }
 
 // The entry mode, on a real directory.
@@ -807,4 +806,164 @@ fn a_listing_that_fails_is_left_when_protected_and_an_error_otherwise() {
         let got = strip_with(&mut list, &mut |_| Ok(()));
         assert_eq!(got.is_ok(), left, "{first_fails} {errno}");
     }
+}
+
+#[test]
+fn a_refusal_line_of_find_or_chmod_names_its_path() {
+    for (line, path) in [
+        ("find: /a/b: Operation not permitted", Some("/a/b")),
+        ("find: /a/b: Permission denied", Some("/a/b")),
+        (
+            "chmod: Failed to clear ACL on file /a/c: Operation not permitted",
+            Some("/a/c"),
+        ),
+        ("find: /a/b: No such file or directory", None),
+        ("chmod: invalid option", None),
+        ("/a/b: Operation not permitted", None),
+    ] {
+        assert_eq!(refused_path(line), path.map(Path::new), "{line}");
+    }
+}
+
+fn fake_find(
+    ok: bool,
+    said: &str,
+) -> impl FnMut(&[OsString]) -> std::io::Result<(bool, String)> + use<'_> {
+    move |_| Ok((ok, said.to_owned()))
+}
+
+#[test]
+fn the_acl_mode_fails_on_a_find_error_that_is_not_the_systems_refusal() {
+    let dir = tree("acl");
+    let vault = dir.path().join("vault");
+    fs::create_dir_all(&vault).expect("vault");
+    fs::set_permissions(&vault, fs::Permissions::from_mode(0o000)).expect("chmod");
+    let skip = !rustix::process::geteuid().is_root();
+    let refusal = format!("find: {}: Operation not permitted\n", vault.display());
+    let mut err = Vec::new();
+    assert_eq!(
+        acl_mode(dir.path(), 5, &mut fake_find(true, ""), &mut err),
+        0
+    );
+    if skip {
+        // Only refusals of entries the pool user cannot open are let go.
+        assert_eq!(
+            acl_mode(dir.path(), 5, &mut fake_find(false, &refusal), &mut err),
+            0
+        );
+        assert!(err.is_empty());
+    }
+    let other = "find: /x: Input/output error\n";
+    let both = format!("{refusal}{other}");
+    assert_eq!(
+        acl_mode(dir.path(), 5, &mut fake_find(false, &both), &mut err),
+        1
+    );
+    let said = String::from_utf8(err).expect("utf8");
+    assert!(said.contains("Input/output error"), "{said}");
+    assert!(!said.contains("vault"), "{said}");
+    let mut err = Vec::new();
+    assert_eq!(
+        acl_mode(dir.path(), 5, &mut fake_find(false, ""), &mut err),
+        1
+    );
+    assert!(String::from_utf8_lossy(&err).contains("failed"));
+    let mut broken = |_: &[OsString]| Err(std::io::Error::other("no find"));
+    let mut err = Vec::new();
+    assert_eq!(acl_mode(dir.path(), 5, &mut broken, &mut err), 1);
+    assert!(String::from_utf8_lossy(&err).contains("no find"));
+    fs::set_permissions(&vault, fs::Permissions::from_mode(0o700)).expect("chmod");
+}
+
+#[test]
+fn the_acl_mode_runs_find_on_a_real_tree() {
+    let dir = tree("acl-real");
+    let entry = entry_with_files(&dir);
+    let (code, _, _) = call(ACL, &entry);
+    assert!(matches!(code, Some(0 | 1)), "{code:?}");
+}
+
+#[test]
+fn the_home_is_emptied_as_the_uid_and_what_it_cannot_open_stays() {
+    if rustix::process::geteuid().is_root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = tree("empty-home");
+    let home = dir.path().join("home");
+    fs::create_dir_all(home.join("Library/Preferences")).expect("dirs");
+    fs::write(home.join("Library/x"), "x").expect("file");
+    fs::write(home.join("top"), "x").expect("file");
+    fs::set_permissions(
+        home.join("Library/Preferences"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .expect("chmod");
+    let (code, _, err) = call(EMPTY_HOME, &home);
+    assert_eq!((code, err.as_str()), (Some(0), ""));
+    assert!(home.join("Library/Preferences").exists());
+    assert!(!home.join("top").exists());
+    // The look agrees: nothing is left that it can open.
+    let (code, out, err) = call(LOOK_HOME, &home);
+    assert_eq!((code, out.as_str(), err.as_str()), (Some(0), "", ""));
+    fs::set_permissions(
+        home.join("Library/Preferences"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("chmod");
+}
+
+#[test]
+fn the_look_of_the_home_reports_files_and_empty_directories_it_can_open() {
+    let dir = tree("look-home");
+    let home = dir.path().join("home");
+    fs::create_dir_all(home.join("a/b")).expect("dirs");
+    fs::create_dir_all(home.join("full")).expect("dirs");
+    fs::write(home.join("full/f"), "x").expect("file");
+    std::os::unix::fs::symlink("/nowhere", home.join("link")).expect("link");
+    let (code, out, err) = call(LOOK_HOME, &home);
+    assert_eq!((code, err.as_str()), (Some(0), ""));
+    let lines: Vec<&str> = out.lines().collect();
+    let at = |name: &str| home.join(name).display().to_string();
+    // A file, a link and an empty directory; a directory holding a file is not itself named.
+    assert_eq!(
+        lines,
+        [at("a/b"), at("full/f"), at("link")]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+    // A home that cannot be listed fails.
+    let (code, _, err) = call(LOOK_HOME, &dir.path().join("absent"));
+    assert_eq!(code, Some(1));
+    assert!(err.contains("absent"), "{err}");
+}
+
+#[test]
+fn the_look_of_the_home_and_of_the_entry_leave_out_what_the_user_cannot_open() {
+    if rustix::process::geteuid().is_root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = tree("look-protected");
+    let entry = entry_with_files(&dir);
+    let vault = entry.join("T").join("vault");
+    fs::create_dir_all(&vault).expect("vault");
+    fs::set_permissions(&vault, fs::Permissions::from_mode(0o000)).expect("chmod");
+    call(EMPTY, &entry);
+    let (code, out, err) = call(LOOK, &entry);
+    assert_eq!((code, out.as_str(), err.as_str()), (Some(0), "", ""));
+    fs::create_dir_all(entry.join("T").join("kept")).expect("kept");
+    let (_, out, _) = call(LOOK, &entry);
+    assert!(out.contains("kept") && !out.contains("vault"), "{out}");
+    // A directory that holds only a protected one is not named in the home's look.
+    let home = dir.path().join("home");
+    fs::create_dir_all(home.join("Library")).expect("dirs");
+    let inner = home.join("Library/Preferences");
+    fs::create_dir_all(&inner).expect("dirs");
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o000)).expect("chmod");
+    let (code, out, _) = call(LOOK_HOME, &home);
+    assert_eq!((code, out.as_str()), (Some(0), ""));
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o700)).expect("chmod");
+    fs::set_permissions(&vault, fs::Permissions::from_mode(0o700)).expect("chmod");
 }

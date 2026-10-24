@@ -27,7 +27,7 @@
 //! each runs as are tested on every platform with a fake; the real [`Run`] is the
 //! Mac host's.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::Path;
 
@@ -44,10 +44,19 @@ pub const CLEAR: &str = "clear";
 pub const EMPTY: &str = "empty";
 /// The mode that gives the four folders their mode back: `__entry restore <uid> <gid> <dir>`.
 pub const RESTORE: &str = "restore";
+/// The mode that removes the ACLs of the uid's entries below the four folders:
+/// `__entry acl <uid> <gid> <dir>`; the system's refusals of the entries the pool user
+/// cannot open are not failures.
+pub const ACL: &str = "acl";
+/// The mode that empties the home: `__entry empty-home <uid> <gid> <dir>`.
+pub const EMPTY_HOME: &str = "empty-home";
+/// The mode that prints what is left in the home: `__entry look-home <uid> <gid> <dir>`.
+pub const LOOK_HOME: &str = "look-home";
 /// The mode that prints what is left in the entry: `__entry look <uid> <gid> <dir>`.
 pub const LOOK: &str = "look";
 
-const USAGE: &str = "usage: __entry clear|empty|look|restore <uid> <gid> <dir>";
+const USAGE: &str =
+    "usage: __entry clear|empty|look|restore|acl|empty-home|look-home <uid> <gid> <dir>";
 
 const FIND: &str = "/usr/bin/find";
 const CHMOD: &str = "/bin/chmod";
@@ -65,20 +74,6 @@ pub(crate) struct AsUid<'a> {
 pub(crate) type Run<'a> = dyn FnMut(&Path, &[OsString]) -> Result<String, String> + 'a;
 
 impl AsUid<'_> {
-    /// The arguments of `self.program` that drop to the uid and then run `tool` with
-    /// `args`.
-    pub(crate) fn launch(&self, tool: &OsStr, args: &[OsString]) -> Vec<OsString> {
-        let mut all: Vec<OsString> = vec![
-            super::AS_USER_ARG.into(),
-            self.uid.to_string().into(),
-            self.gid.to_string().into(),
-            "--".into(),
-            tool.to_owned(),
-        ];
-        all.extend_from_slice(args);
-        all
-    }
-
     /// This binary's entry `mode` on `dir`, which drops to the uid itself.
     fn mode(&self, mode: &str, dir: &Path, run: &mut Run<'_>) -> Result<String, String> {
         let args = [
@@ -109,17 +104,18 @@ pub(crate) fn flags_step(
     join(failed)
 }
 
-/// C7: the home emptied by `as_root` (the home only), then the entry emptied as the uid.
+/// C7: the home emptied as the uid (root without Full Disk Access cannot empty its
+/// `Library`), then the entry emptied as the uid.
 ///
 /// # Errors
 /// A part failed; both are tried.
 pub(crate) fn contents_step(
     me: &AsUid<'_>,
     (home, folders): (&Path, &Path),
-    as_root: &mut dyn FnMut(&Path) -> Vec<String>,
     run: &mut Run<'_>,
 ) -> Result<(), String> {
-    let mut failed = as_root(home);
+    let mut failed = Vec::new();
+    failed.extend(empty_home(me, home, run).err());
     failed.extend(empty(me, folders, run).err());
     join(failed)
 }
@@ -168,14 +164,13 @@ pub(crate) fn acl_args(entry: &Path, uid: u32) -> Vec<OsString> {
 /// # Errors
 /// The sweep or the last removal failed.
 pub(crate) fn clear_flags(me: &AsUid<'_>, folders: &Path, run: &mut Run<'_>) -> Result<(), String> {
-    let find = me.launch(OsStr::new(FIND), &acl_args(folders, me.uid));
     // Whatever this cannot reach is reached after the sweep, and judged then.
-    let _ = run(me.program, &find);
+    let _ = me.mode(ACL, folders, run);
     let mut failed = Vec::new();
     if let Err(why) = me.mode(CLEAR, folders, run) {
         failed.push(why);
     }
-    if let Err(why) = run(me.program, &find) {
+    if let Err(why) = me.mode(ACL, folders, run) {
         failed.push(why);
     }
     named(folders, failed)
@@ -243,6 +238,10 @@ fn restore_folders(
     }
     swept
 }
+
+/// `find`, run with these arguments: whether it succeeded, and what it said on its error
+/// output.
+type Find<'a> = dyn FnMut(&[OsString]) -> std::io::Result<(bool, String)> + 'a;
 
 /// A change of a path's mode that can fail.
 type ChmodCall<'a> = dyn FnMut(&Path, u32) -> std::io::Result<()> + 'a;
@@ -344,6 +343,32 @@ pub(crate) fn empty(me: &AsUid<'_>, folders: &Path, run: &mut Run<'_>) -> Result
     )
 }
 
+/// C7 for the home `home`: emptied as the uid.
+///
+/// # Errors
+/// The call failed.
+pub(crate) fn empty_home(me: &AsUid<'_>, home: &Path, run: &mut Run<'_>) -> Result<(), String> {
+    me.mode(EMPTY_HOME, home, run)
+        .map(drop)
+        .map_err(|why| format!("{}: {why}", home.display()))
+}
+
+/// What the uid finds left in the home `home`, one line each; what it cannot open is not
+/// left.
+///
+/// # Errors
+/// The uid could not look.
+pub(crate) fn left_home(
+    me: &AsUid<'_>,
+    home: &Path,
+    run: &mut Run<'_>,
+) -> Result<Vec<String>, String> {
+    let said = me
+        .mode(LOOK_HOME, home, run)
+        .map_err(|why| format!("{}: {why}", home.display()))?;
+    Ok(said.lines().map(str::to_owned).collect())
+}
+
 /// What the uid finds left in the entry `folders`, one line each.
 ///
 /// # Errors
@@ -390,7 +415,7 @@ pub(crate) fn dispatch(
         return Some(2);
     };
     let mode = match mode.to_str() {
-        Some(mode @ (CLEAR | EMPTY | LOOK | RESTORE)) => mode,
+        Some(mode @ (CLEAR | EMPTY | LOOK | RESTORE | ACL | EMPTY_HOME | LOOK_HOME)) => mode,
         _ => {
             let _ = writeln!(err, "{ARG}: no mode {mode:?}");
             return Some(2);
@@ -415,6 +440,9 @@ pub(crate) fn dispatch(
             ),
         ),
         EMPTY => sweep::empty_keeping(dir, uid, &SKELETON),
+        ACL => return Some(acl_mode(dir, uid, &mut run_find, err)),
+        EMPTY_HOME => sweep::empty(dir, uid),
+        LOOK_HOME => return Some(look_home(dir, out, err)),
         _ => return Some(look(dir, out, err)),
     };
     for error in &swept.errors {
@@ -424,7 +452,8 @@ pub(crate) fn dispatch(
 }
 
 /// [`LOOK`]: a line for each name in `dir` that is not one of [`SKELETON`], and for
-/// each of those that is not empty. Exit 1 when something could not be listed.
+/// each of those that is not empty, leaving out what the pool user cannot open (see
+/// [`sweep::path_is_protected`]). Exit 1 when something could not be listed.
 fn look(dir: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let names = |path: &Path| -> std::io::Result<Vec<String>> {
         // A link in place of a folder is not followed: it is reported, not listed.
@@ -435,6 +464,8 @@ fn look(dir: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
             .collect::<Result<Vec<_>, _>>()?;
         names.sort();
+        // What the pool user cannot open is a protected store of the system, not left.
+        names.retain(|n| !sweep::path_is_protected(&path.join(n)));
         Ok(names)
     };
     let mut code = 0;
@@ -463,6 +494,120 @@ fn look(dir: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         }
     }
     code
+}
+
+/// [`LOOK_HOME`]: a line for each file, link or empty directory left below `dir`, leaving
+/// out what the pool user cannot open and a directory that holds only such things (it
+/// stays because they do). Exit 1 when something could not be listed.
+fn look_home(dir: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let mut code = 0;
+    left_below(dir, out, err, &mut code);
+    code
+}
+
+/// What [`left_below`] found in a directory: whether it printed a line, and whether it
+/// skipped something the pool user cannot open.
+#[derive(Default)]
+struct Found {
+    printed: bool,
+    protected: bool,
+    failed: bool,
+}
+
+fn left_below(dir: &Path, out: &mut dyn Write, err: &mut dyn Write, code: &mut i32) -> Found {
+    let mut found = Found::default();
+    let names = match std::fs::read_dir(dir).and_then(|names| {
+        names
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<Result<Vec<_>, _>>()
+    }) {
+        Ok(mut names) => {
+            names.sort();
+            names
+        }
+        Err(why) => {
+            let _ = writeln!(err, "{}: {why}", dir.display());
+            *code = 1;
+            found.failed = true;
+            return found;
+        }
+    };
+    for name in names {
+        let path = dir.join(&name);
+        if sweep::path_is_protected(&path) {
+            found.protected = true;
+            continue;
+        }
+        let is_dir = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
+        if !is_dir {
+            let _ = writeln!(out, "{}", path.display());
+            found.printed = true;
+            continue;
+        }
+        let inside = left_below(&path, out, err, code);
+        found.printed |= inside.printed;
+        found.protected |= inside.protected;
+        found.failed |= inside.failed;
+        if !inside.printed && !inside.protected && !inside.failed {
+            let _ = writeln!(out, "{}", path.display());
+            found.printed = true;
+        }
+    }
+    found
+}
+
+/// The error lines of `find` and `chmod` that name a path they were refused:
+/// `find: <path>: Operation not permitted`, `chmod: Failed to clear ACL on file <path>:
+/// Operation not permitted`; the path.
+fn refused_path(line: &str) -> Option<&Path> {
+    let line = [": Operation not permitted", ": Permission denied"]
+        .iter()
+        .find_map(|tail| line.strip_suffix(tail))?;
+    let path = ["find: ", "chmod: Failed to clear ACL on file "]
+        .iter()
+        .find_map(|head| line.strip_prefix(head))?;
+    Some(Path::new(path))
+}
+
+/// Runs `find` with `args`: whether it succeeded, and what it said on its error output.
+fn run_find(args: &[OsString]) -> std::io::Result<(bool, String)> {
+    let out = std::process::Command::new(FIND)
+        .args(args)
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
+/// [`ACL`]: the ACLs removed below `dir` by `find`; its refusals of entries the pool user
+/// cannot open do not fail it, every other error line does. Exit 1 then.
+fn acl_mode(dir: &Path, uid: u32, find: &mut Find<'_>, err: &mut dyn Write) -> i32 {
+    let (ok, said) = match find(&acl_args(dir, uid)) {
+        Ok(done) => done,
+        Err(why) => {
+            let _ = writeln!(err, "{FIND}: {why}");
+            return 1;
+        }
+    };
+    if ok {
+        return 0;
+    }
+    let others: Vec<&str> = said
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| !refused_path(l).is_some_and(sweep::path_is_protected))
+        .collect();
+    if said.trim().is_empty() {
+        let _ = writeln!(err, "{FIND} failed");
+        return 1;
+    }
+    for line in &others {
+        let _ = writeln!(err, "{line}");
+    }
+    i32::from(!others.is_empty())
 }
 
 #[cfg(test)]

@@ -150,13 +150,20 @@ fn empty_base(path: &Path, uid: u32, keep: &[&str], swept: &mut Swept) -> io::Re
     for name in listed(&dir)? {
         let here = path.join(&name);
         // An entry gone since the listing is neither removed nor an error.
-        let result = examine(&dir, &name).and_then(|stat| match stat {
-            Some(stat) if is_kept(&name, keep, &stat, dev) => {
-                empty_kept(&dir, &name, &here, &stat, uid, dev, swept).map(|()| 0)
-            }
-            Some(stat) => remove_entry(&dir, &name, &stat, (uid, dev, 1), &park).map(|()| 1),
-            None => Ok(0),
-        });
+        let skipped = &park.skipped;
+        let result = tolerate(examine(&dir, &name), (&dir, &name, &here), skipped).and_then(
+            |stat| match stat {
+                Some(stat) if is_kept(&name, keep, &stat, dev) => {
+                    empty_kept(&dir, &name, &here, &stat, uid, dev, swept).map(|()| 0)
+                }
+                Some(stat) => tolerate(
+                    remove_entry(&dir, &name, &here, &stat, (uid, dev, 1), &park).map(|()| 1),
+                    (&dir, &name, &here),
+                    skipped,
+                ),
+                None => Ok(0),
+            },
+        );
         swept.removed += *result.as_ref().unwrap_or(&0);
         note(swept, &here, result.map(drop));
     }
@@ -190,10 +197,17 @@ fn empty_kept(
     };
     let park = Park::new(&child);
     for entry in listed(&child)? {
-        let result = examine(&child, &entry).and_then(|inner| match inner {
-            Some(inner) => remove_entry(&child, &entry, &inner, (uid, dev, 2), &park).map(|()| 1),
-            None => Ok(0),
-        });
+        let there = here.join(&entry);
+        let result = tolerate(
+            examine(&child, &entry).and_then(|inner| match inner {
+                Some(inner) => {
+                    remove_entry(&child, &entry, &there, &inner, (uid, dev, 2), &park).map(|()| 1)
+                }
+                None => Ok(0),
+            }),
+            (&child, &entry, &there),
+            &park.skipped,
+        );
         swept.removed += *result.as_ref().unwrap_or(&0);
         note(swept, &here.join(&entry), result.map(drop));
     }
@@ -254,7 +268,7 @@ fn remove_named(path: &Path, uid: u32, swept: &mut Swept) -> io::Result<()> {
     };
     let dev = rustix::fs::fstat(&dir)?.st_dev;
     let park = Park::new(&dir);
-    remove_entry(&dir, name, &stat, (uid, dev, 1), &park)?;
+    remove_entry(&dir, name, path, &stat, (uid, dev, 1), &park)?;
     park.drain(uid, dev)?;
     swept.removed += 1;
     Ok(())
@@ -317,7 +331,7 @@ fn visit(
     // Another filesystem mounted here is never entered.
     match (stat.st_dev == dev, stat.st_uid == uid, is_dir(&stat)) {
         (true, true, _) => {
-            remove_entry(dir, name, &stat, (uid, dev, depth + 1), park)?;
+            remove_entry(dir, name, here, &stat, (uid, dev, depth + 1), park)?;
             swept.removed += 1;
         }
         // Another owner's directory: searched for the uid's entries, down to the limit.
@@ -339,6 +353,63 @@ fn visit(
     Ok(())
 }
 
+/// Whether `why` is the system refusing the process ("operation not permitted" or
+/// "permission denied").
+fn refused(why: &io::Error) -> bool {
+    matches!(
+        why.raw_os_error(),
+        Some(code) if code == Errno::PERM.raw_os_error() || code == Errno::ACCESS.raw_os_error()
+    )
+}
+
+/// Whether the entry `name` of `dir` cannot be opened by this process, because the system
+/// refuses it ("operation not permitted" or "permission denied"; a link is not followed).
+/// Such an entry is a protected store of the system (an Apple daemon's data vault made for
+/// the pool user): not the pool user's to read, and so not the lease's to carry.
+pub(crate) fn cannot_open(dir: &OwnedFd, name: &OsStr) -> bool {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    matches!(
+        rustix::fs::openat(dir, name, flags, Mode::empty()),
+        Err(Errno::PERM | Errno::ACCESS)
+    )
+}
+
+/// [`cannot_open`] for the path `path`.
+#[must_use]
+pub fn path_is_protected(path: &Path) -> bool {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return false;
+    };
+    match open_base(parent) {
+        Ok(Some(dir)) => cannot_open(&dir, name),
+        // The parent cannot be opened either: what is in it cannot be read.
+        Err(why) => refused(&why),
+        Ok(None) => false,
+    }
+}
+
+/// `result`, with a refusal of the system taken as a success for the entry `name` of `dir`
+/// (at `here`) that this process cannot open, when the process is not root: it is skipped
+/// with one warning per path, and counted in `skipped`, so that a directory it keeps is no
+/// error. The next lease runs as the same user and is refused the entry as well, so it
+/// carries nothing from one lease to the next. An entry that can be opened still fails.
+fn tolerate<T: Default>(
+    result: io::Result<T>,
+    (dir, name, here): (&OwnedFd, &OsStr, &Path),
+    skipped: &std::cell::Cell<usize>,
+) -> io::Result<T> {
+    match result {
+        Err(why)
+            if refused(&why) && !rustix::process::geteuid().is_root() && cannot_open(dir, name) =>
+        {
+            warn_once(here);
+            skipped.set(skipped.get() + 1);
+            Ok(T::default())
+        }
+        other => other,
+    }
+}
+
 /// Whether `why`, from the examination of an entry at `depth` of a swept base, is the
 /// system refusing root a top-level entry (an Apple data vault) and nothing the uid's own:
 /// a refusal ("operation not permitted") of a top-level entry only. Deeper, and any other
@@ -354,7 +425,7 @@ fn warn_once(path: &Path) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if first_time(&mut seen, path) {
-        tracing::warn!(path = %path.display(), "not swept: the system refuses root this entry; it is not the pool user's");
+        tracing::warn!(path = %path.display(), "not swept: the system refuses this entry, and the pool user cannot open it");
     }
 }
 
@@ -379,11 +450,12 @@ type StDev = i32;
 fn remove_entry(
     dir: &OwnedFd,
     name: &OsStr,
+    here: &Path,
     stat: &Stat,
     at: (u32, StDev, usize),
     park: &Park,
 ) -> io::Result<()> {
-    vanished(remove_present(dir, name, stat, at, park))
+    vanished(remove_present(dir, name, here, stat, at, park))
 }
 
 /// [`remove_entry`] with every step's error as it is, "no such file or directory"
@@ -391,6 +463,7 @@ fn remove_entry(
 fn remove_present(
     dir: &OwnedFd,
     name: &OsStr,
+    here: &Path,
     stat: &Stat,
     (uid, dev, depth): (u32, StDev, usize),
     park: &Park,
@@ -412,14 +485,34 @@ fn remove_present(
         return park.take(dir, name, stat);
     }
     let child = open_child(dir, name, stat)?;
+    let skipped_before = park.skipped.get();
     for entry in listed(&child)? {
-        let Some(inner) = examine(&child, &entry)? else {
-            continue;
-        };
-        remove_entry(&child, &entry, &inner, (uid, dev, depth + 1), park)?;
+        let inner_path = here.join(&entry);
+        tolerate(
+            examine(&child, &entry).and_then(|inner| match inner {
+                Some(inner) => remove_entry(
+                    &child,
+                    &entry,
+                    &inner_path,
+                    &inner,
+                    (uid, dev, depth + 1),
+                    park,
+                ),
+                None => Ok(()),
+            }),
+            (&child, &entry, &inner_path),
+            &park.skipped,
+        )?;
     }
     drop(child);
-    Ok(rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR)?)
+    match rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR) {
+        // Something the pool user may not open is inside, and stays with it.
+        Err(Errno::NOTEMPTY) if park.skipped.get() > skipped_before => {
+            park.skipped.set(park.skipped.get() + 1);
+            Ok(())
+        }
+        other => Ok(other?),
+    }
 }
 
 /// How deep the removal recurses before it moves what is below up to the top: it holds one
@@ -439,6 +532,8 @@ struct Park<'a> {
     dir: &'a OwnedFd,
     names: std::cell::RefCell<Vec<OsString>>,
     next: std::cell::Cell<u32>,
+    /// How many entries the removal left because the pool user may not open them.
+    skipped: std::cell::Cell<usize>,
 }
 
 impl<'a> Park<'a> {
@@ -447,6 +542,7 @@ impl<'a> Park<'a> {
             dir,
             names: std::cell::RefCell::default(),
             next: std::cell::Cell::new(0),
+            skipped: std::cell::Cell::new(0),
         }
     }
 
@@ -486,7 +582,14 @@ impl<'a> Park<'a> {
                 return Ok(());
             };
             examine(self.dir, &name)?.map_or(Ok(()), |stat| {
-                remove_entry(self.dir, &name, &stat, (uid, dev, 1), self)
+                remove_entry(
+                    self.dir,
+                    &name,
+                    Path::new(&name),
+                    &stat,
+                    (uid, dev, 1),
+                    self,
+                )
             })?;
         }
     }
@@ -633,12 +736,22 @@ fn clear_within(path: &Path, uid: u32, keep: &[&str], swept: &mut Swept) -> io::
     let dev = rustix::fs::fstat(&dir)?.st_dev;
     for name in listed(&dir)? {
         let here = path.join(&name);
-        let result = examine(&dir, &name).and_then(|stat| match stat {
-            Some(stat) if is_kept(&name, keep, &stat, dev) => open_child(&dir, &name, &stat)
-                .and_then(|child| clear_below(&child, &here, uid, dev, 1, swept)),
-            Some(_) => clear_entry(&dir, &name, &here, (uid, dev, 0), swept),
-            None => Ok(()),
-        });
+        let skipped = std::cell::Cell::new(0);
+        let result =
+            tolerate(examine(&dir, &name), (&dir, &name, &here), &skipped).and_then(|stat| {
+                match stat {
+                    Some(stat) if is_kept(&name, keep, &stat, dev) => {
+                        open_child(&dir, &name, &stat)
+                            .and_then(|child| clear_below(&child, &here, uid, dev, 1, swept))
+                    }
+                    Some(_) => tolerate(
+                        clear_entry(&dir, &name, &here, (uid, dev, 0), swept),
+                        (&dir, &name, &here),
+                        &skipped,
+                    ),
+                    None => Ok(()),
+                }
+            });
         note(swept, &here, vanished(result));
     }
     Ok(())
@@ -666,7 +779,11 @@ fn clear_below(
 ) -> io::Result<()> {
     for name in listed(dir)? {
         let here = path.join(&name);
-        let result = clear_entry(dir, &name, &here, (uid, dev, depth), swept);
+        let result = tolerate(
+            clear_entry(dir, &name, &here, (uid, dev, depth), swept),
+            (dir, &name, &here),
+            &std::cell::Cell::new(0),
+        );
         note(swept, &here, vanished(result));
     }
     Ok(())

@@ -201,7 +201,6 @@ impl Os for MacSlot<'_> {
             Step::Contents => entry::contents_step(
                 &self.as_uid(),
                 (&ready.home, &ready.folders),
-                &mut |home| sweep::empty(home, user.uid).errors,
                 &mut run_child,
             ),
             Step::Shared => complete(&sweep::sweep(&probe::shared_plan(), &user.name, user.uid)),
@@ -270,7 +269,7 @@ impl Os for MacSlot<'_> {
             Ok(objects) => note(Step::Ipc, format!("{objects:?}")),
             Err(why) => note(Step::Ipc, why),
         }
-        if let Err(why) = home_is_empty(self.ready) {
+        if let Err(why) = home_is_empty(self.ready, &self.as_uid()) {
             note(Step::Contents, why);
         }
         // As the uid: root cannot look inside the entry's folders.
@@ -448,7 +447,7 @@ fn remove_acls(root: &Path, uid: u32) -> Result<(), String> {
 /// [`entry::Run`], for real: `program` with `args`, a plain environment and no input;
 /// what it printed, or why it failed (its status and what it said, the first 4000
 /// characters of it).
-fn run_child(program: &Path, args: &[std::ffi::OsString]) -> Result<String, String> {
+pub(super) fn run_child(program: &Path, args: &[std::ffi::OsString]) -> Result<String, String> {
     let out = Command::new(program)
         .args(args)
         .env_clear()
@@ -553,7 +552,7 @@ fn ipc_of(name: &str, uid: u32) -> Result<Vec<(Ipc, String)>, String> {
 }
 
 /// Whether the home is an empty directory of the user's, mode 0700, without flags.
-fn home_is_empty(ready: &Ready) -> Result<(), String> {
+fn home_is_empty(ready: &Ready, me: &entry::AsUid<'_>) -> Result<(), String> {
     let home = &ready.home;
     let want = (ready.user.uid, ready.user.gid, 0o700, 0);
     let found = rustix::fs::lstat(home)
@@ -572,9 +571,11 @@ fn home_is_empty(ready: &Ready) -> Result<(), String> {
             home.display()
         ));
     }
-    match list(home) {
-        Ok(names) if names.is_empty() => Ok(()),
-        entries => Err(format!("{}: {entries:?}", home.display())),
+    // As the uid: root without Full Disk Access cannot look inside the home's `Library`.
+    match entry::left_home(me, home, &mut run_child) {
+        Ok(lines) if lines.is_empty() => Ok(()),
+        Ok(lines) => Err(format!("{}: {lines:?}", home.display())),
+        Err(why) => Err(why),
     }
 }
 
