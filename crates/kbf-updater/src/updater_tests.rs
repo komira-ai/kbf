@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use crate::api::{ErrorCode, Hosts, Phase, Roll, RollRequest, RollState};
 use crate::fakes::{
-    Event, FakeClock, FakeDrain, FakeHealth, FakeInstaller, FakeSafeToStop, Log, safe,
-    unsafe_because,
+    Event, FakeClock, FakeDrain, FakeFrontend, FakeHealth, FakeInstaller, FakeSafeToStop, Log,
+    safe, unsafe_because,
 };
 use crate::inventory::Inventory;
 use crate::ports::{Health, PortError, Stop};
@@ -53,6 +53,7 @@ pub(crate) struct Rig {
     pub drain: FakeDrain,
     pub health: FakeHealth,
     pub clock: FakeClock,
+    pub front: FakeFrontend,
 }
 
 impl Rig {
@@ -72,6 +73,7 @@ impl Rig {
             drain: FakeDrain::new(&log),
             health: FakeHealth::new(&log),
             clock: FakeClock::new(),
+            front: FakeFrontend::new(&log),
             log,
         }
     }
@@ -83,6 +85,7 @@ impl Rig {
             drain: Box::new(self.drain.clone()),
             health: Box::new(self.health.clone()),
             clock: Box::new(self.clock.clone()),
+            frontend: Box::new(self.front.clone()),
         }
     }
 

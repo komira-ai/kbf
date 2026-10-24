@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::inventory::Role;
 
 /// How long the roll waits for each thing. The defaults are the package-update design's
-/// (node health 300 s, daemon 780 s, no answer 120 s); the safe-to-stop
+/// (node health 300 s, daemon 780 s, no answer 120 s); the frontend's bound, the safe-to-stop
 /// bound and the cap on an install in progress are this crate's choices.
 #[derive(Clone, Debug)]
 pub struct Timing {
@@ -18,6 +18,7 @@ pub struct Timing {
     pub install_bound: Duration,
     /// How long a restart waits for a host that does not answer a query at all.
     pub query_bound: Duration,
+    pub healthy_frontend: Duration,
     pub healthy_storage: Duration,
     pub healthy_daemon: Duration,
     /// How long a daemon host's node is given to finish its leases once it is drained. When
@@ -28,6 +29,15 @@ pub struct Timing {
     /// How long a Mac host's apply may take, from the answer `apply_started` (or from a
     /// restart that resumes the wait), to be `done` for the target.
     pub apply_deadline: Duration,
+    /// For a frontend member rolled without a proxy: how long every other member must answer
+    /// `/readyz` 200 without a miss before the member is drained. The wait for that window,
+    /// which a miss restarts, is given this and [`Timing::healthy_frontend`] on top.
+    pub peer_ready: Duration,
+    /// For a frontend member rolled without a proxy: how long the member is given, from the
+    /// start of its own drain, to exit. It must be longer than the longest execution that a
+    /// member may have open, which the drain waits for: the frontend in this tree puts no bound
+    /// on a drain that its endpoint began.
+    pub frontend_drain: Duration,
 }
 
 impl Default for Timing {
@@ -37,11 +47,14 @@ impl Default for Timing {
             safe_bound: Duration::from_secs(300),
             install_bound: Duration::from_secs(900),
             query_bound: Duration::from_secs(120),
+            healthy_frontend: Duration::from_secs(300),
             healthy_storage: Duration::from_secs(300),
             healthy_daemon: Duration::from_secs(780),
             drain_deadline: Duration::from_secs(600),
             apply_poll: Duration::from_secs(5),
             apply_deadline: Duration::from_secs(600),
+            peer_ready: Duration::from_secs(30),
+            frontend_drain: Duration::from_secs(1200),
         }
     }
 }
@@ -49,7 +62,8 @@ impl Default for Timing {
 impl Timing {
     pub(crate) fn healthy(&self, role: Role) -> Duration {
         match role {
-            Role::Frontend | Role::Storage => self.healthy_storage,
+            Role::Frontend => self.healthy_frontend,
+            Role::Storage => self.healthy_storage,
             Role::Daemon | Role::MacDaemon => self.healthy_daemon,
         }
     }

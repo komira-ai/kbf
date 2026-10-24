@@ -96,6 +96,7 @@ fn host() -> Host {
         role: Role::Storage,
         host_key: KEY.into(),
         node_id: None,
+        member: None,
     }
 }
 
@@ -1022,3 +1023,5 @@ fn an_unwritable_work_directory_stops_the_call() {
     );
     assert!(r.fake.calls().is_empty());
 }
+
+mod restart;

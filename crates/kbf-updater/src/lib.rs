@@ -5,12 +5,16 @@
 //! - [`api`]: the request, the roll as a poller sees it, the closed set of error codes;
 //! - [`version`]: the one rule for a version, shared with the host-side wrapper;
 //! - [`inventory`]: the root-owned host file, and the order a roll touches the hosts in;
-//! - [`ports`]: safe-to-stop, install and query, drain, health and the clock, as traits;
+//! - [`ports`]: safe-to-stop, install and query, drain, health, a frontend member's own API
+//!   and the clock, as traits;
 //! - [`ssh_installer`]: the install port over ssh to the `kbf-host-install` forced command;
 //! - [`record`]: `roll.json`, the durable record;
 //! - [`Updater`]: the state machine over all of the above. One roll at a time, the frontends
 //!   first, the first failure stops it, a restart asks the host before it installs again; a
-//!   `mac-daemon` host's install starts an apply that the roll polls until it is done;
+//!   `mac-daemon` host's install starts an apply that the roll polls until it is done; a
+//!   frontend that is a member of a pool of frontends drains itself and exits once the other
+//!   members have been ready for a while, and is then installed on and restarted, one at a
+//!   time;
 //! - [`fakes`]: a scripted fake of every port.
 //!
 //! And around it:
@@ -22,8 +26,8 @@
 //! - [`safe_http`]: the real safe-to-stop, a call to the operator API;
 //! - [`node_drain`]: the real drain of a daemon host's node, over the operator API;
 //! - [`health`] and [`node_health`]: the real health check of a storage or daemon host, over
-//!   the operator API; a frontend is refused (it is a container that `kbf-host-install`
-//!   drains and recreates);
+//!   the operator API; a frontend that is no pool member is refused;
+//! - [`frontend_http`]: the real control of a frontend member, over its own operator API;
 //! - [`daemon`]: the flags and the wiring of all of it.
 //!
 //! And for the coordinator that tells each host's updater what to run
@@ -33,6 +37,7 @@ pub mod agent;
 pub mod api;
 pub mod daemon;
 pub mod fakes;
+pub mod frontend_http;
 pub mod health;
 pub mod http;
 pub mod identity;
@@ -60,6 +65,8 @@ pub use updater::{Ports, Started, Updater};
 #[cfg(test)]
 mod daemon_tests;
 #[cfg(test)]
+mod frontend_http_tests;
+#[cfg(test)]
 mod identity_tests;
 // The activated descriptor tests use an abstract socket address, which is Linux's.
 #[cfg(all(test, target_os = "linux"))]
@@ -86,6 +93,8 @@ mod updater_followup_tests;
 mod updater_fresh_host_tests;
 #[cfg(test)]
 mod updater_mac_tests;
+#[cfg(test)]
+mod updater_no_proxy_tests;
 #[cfg(test)]
 mod updater_restart_tests;
 #[cfg(test)]

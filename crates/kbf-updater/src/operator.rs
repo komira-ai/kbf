@@ -1,7 +1,9 @@
 //! A client of the frontend's loopback operator API (`docs/api.md`): one `GET` or `POST` with
 //! the operator bearer token from a file, held to the rule of [`crate::secret`]. Safe-to-stop
 //! ([`crate::safe_http`]) and node health ([`crate::node_health`]) are reads of it; draining a
-//! node ([`crate::node_drain`]) is a read and two writes.
+//! node ([`crate::node_drain`]) is a read and two writes. The same client, pointed at the
+//! operator port of a pool member ([`OperatorApi::at`]), drains that frontend and reads its
+//! state ([`crate::frontend_http`]).
 //!
 //! A host's updater has no token and does not reach the loopback API: [`OperatorApi::as_updater`]
 //! calls the frontend's worker listener over mutual TLS, presenting the updater's certificate,
@@ -13,7 +15,7 @@
 //! The request has the headers of `kbf cluster`, including a JSON content type: the gated
 //! routes want one on every call, a `GET` too. A `POST` carries a JSON body or none.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -103,6 +105,15 @@ impl OperatorApi {
         self.what
     }
 
+    /// The same client, with the same files, for the API at another address (another member
+    /// of a pool has its own operator port).
+    pub fn at(&self, addr: SocketAddr) -> OperatorApi {
+        OperatorApi {
+            wire: Wire::Loopback(addr),
+            ..self.clone()
+        }
+    }
+
     pub fn with_timeout(mut self, timeout: Duration) -> OperatorApi {
         self.timeout = timeout;
         self
@@ -155,8 +166,14 @@ impl OperatorApi {
         match &self.wire {
             Wire::Loopback(addr) => {
                 let request = Self::request(&addr.to_string(), method, path, body, token);
-                self.loopback(*addr, request.as_bytes())
-                    .map_err(|e| PortError::unreachable(format!("{what}: {}", e.kind())))
+                let sent = self.loopback(*addr, request.as_bytes());
+                sent.map_err(|e| {
+                    let text = format!("{what}: {}", e.kind());
+                    match e.kind() {
+                        ErrorKind::ConnectionRefused => PortError::refused(text),
+                        _ => PortError::unreachable(text),
+                    }
+                })
             }
             Wire::Frontend(frontend) => {
                 let host = format!("{}:{}", frontend.endpoint.host, frontend.endpoint.port);

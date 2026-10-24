@@ -14,6 +14,7 @@ use crate::daemon::{
     parse_operator_url, run_config, start, start_with, stderr_sink,
 };
 use crate::fakes::{Event, FakeClock, FakeHealth, FakeInstaller, FakeSafeToStop, Log};
+use crate::inventory::{Host, Member, Role};
 use crate::listener::{Activation, Listen};
 use crate::record::RollStore;
 use crate::server::{Recent, Settings};
@@ -294,8 +295,42 @@ fn the_apply_poll_and_deadline_are_optional_flags_of_at_least_a_second() {
     }
 }
 
-/// Catches a flag that is parsed and never reaches the roll: the drain deadline and the apply
-/// poll and deadline are the timing's, and the rest of the timing is the default.
+/// Asserts that the two bounds of a frontend member's drain without a proxy are optional flags
+/// that default to 30 s of readiness of the other members and 1200 s for the member to exit,
+/// take a number of seconds, may not be zero (a window of nothing waits for nothing; a deadline
+/// of nothing fails every drain), and that each sets only itself.
+#[test]
+fn the_peer_ready_and_frontend_drain_deadline_are_optional_flags_of_at_least_a_second() {
+    let cfg = parse(&FLAGS).expect("flags");
+    assert_eq!(cfg.peer_ready.as_secs(), 30);
+    assert_eq!(cfg.frontend_drain_deadline.as_secs(), 1200);
+    let with = [&FLAGS[..], &["--peer-ready-secs", "7"]].concat();
+    let cfg = parse(&with).expect("peers");
+    assert_eq!(cfg.peer_ready.as_secs(), 7);
+    assert_eq!(cfg.frontend_drain_deadline.as_secs(), 1200);
+    let with = [&FLAGS[..], &["--frontend-drain-deadline-secs=90"]].concat();
+    let cfg = parse(&with).expect("deadline");
+    assert_eq!(cfg.peer_ready.as_secs(), 30);
+    assert_eq!(cfg.frontend_drain_deadline.as_secs(), 90);
+    for flag in ["--peer-ready-secs", "--frontend-drain-deadline-secs"] {
+        for bad in ["soon", "-1", "1.5", ""] {
+            let with = [&FLAGS[..], &[flag, bad]].concat();
+            assert_eq!(
+                parse(&with).expect_err(bad),
+                format!("{flag} must be a number of seconds")
+            );
+        }
+        let zero = [&FLAGS[..], &[flag, "0"]].concat();
+        assert_eq!(
+            parse(&zero).expect_err("zero"),
+            format!("{flag} must be at least 1")
+        );
+    }
+}
+
+/// Asserts that each of the flags below reaches the roll's timing: the drain deadline, the apply
+/// poll and deadline, the wait for the other members and the deadline of a member's drain, and
+/// that the rest of the timing is the default.
 #[test]
 fn the_flags_set_the_timing_of_the_roll() {
     let with = [
@@ -304,6 +339,8 @@ fn the_flags_set_the_timing_of_the_roll() {
             "--drain-deadline-secs=7",
             "--apply-poll-secs=3",
             "--apply-deadline-secs=11",
+            "--peer-ready-secs=13",
+            "--frontend-drain-deadline-secs=17",
         ],
     ]
     .concat();
@@ -316,6 +353,8 @@ fn the_flags_set_the_timing_of_the_roll() {
         ),
         (7, 3, 11)
     );
+    assert_eq!(t.peer_ready.as_secs(), 13);
+    assert_eq!(t.frontend_drain.as_secs(), 17);
     assert_eq!(t.poll, Timing::default().poll);
 }
 
@@ -434,6 +473,8 @@ fn config(name: &str, inventory: &str, api: &FakeApi) -> Config {
         drain_deadline: Duration::from_secs(600),
         apply_poll: Duration::from_secs(5),
         apply_deadline: Duration::from_secs(600),
+        peer_ready: Duration::from_secs(30),
+        frontend_drain_deadline: Duration::from_secs(1200),
     }
 }
 
@@ -476,11 +517,14 @@ fn quick() -> Timing {
         safe_bound: Duration::from_millis(300),
         install_bound: Duration::from_millis(300),
         query_bound: Duration::from_millis(300),
+        healthy_frontend: Duration::from_millis(300),
         healthy_storage: Duration::from_millis(300),
         healthy_daemon: Duration::from_millis(300),
         drain_deadline: Duration::from_millis(300),
         apply_poll: Duration::from_millis(10),
         apply_deadline: Duration::from_millis(300),
+        peer_ready: Duration::from_millis(30),
+        frontend_drain: Duration::from_millis(300),
     }
 }
 
@@ -514,13 +558,14 @@ fn post(socket: &std::path::Path) -> (u16, Value) {
     call(socket, "POST", "/v1/updater/rolls", &body.to_string())
 }
 
-/// Asserts that ssh is never run for a frontend: with the binary's own ports, an all-hosts roll
-/// (frontend, storage, daemon) is accepted (202) and fails at the frontend, before its
-/// installer, with the reason that says frontends are not rolled here. The recording `Exec` is never called (the recorded calls are empty), no later
+/// Asserts that ssh is never run for a frontend that is no pool member: with the binary's own
+/// ports, an all-hosts roll (frontend, storage, daemon) is accepted (202) and fails at the
+/// frontend, before its installer, with the reason that says to list an instance and a base in
+/// the failure. The recording `Exec` is never called (the recorded calls are empty), no later
 /// host is asked about (the fake operator API sees no request at all) and the later hosts stay
 /// pending.
 #[test]
-fn an_all_hosts_roll_never_runs_ssh_for_a_frontend() {
+fn an_all_hosts_roll_never_runs_ssh_for_a_frontend_that_is_no_member() {
     let api = fake_api(vec![Some(http(
         200,
         "{\"safe\":true,\"reasons\":[],\"planned_down\":false}",
@@ -543,9 +588,7 @@ fn an_all_hosts_roll_never_runs_ssh_for_a_frontend() {
         ("fe", ErrorCode::SwapAbandoned)
     );
     assert!(
-        failure
-            .detail
-            .contains(crate::node_health::FRONTEND_REFUSAL),
+        failure.detail.contains("instance=<name> and base=<port>"),
         "{}",
         failure.detail
     );
@@ -658,18 +701,46 @@ fn an_unknown_role_is_refused_by_the_inventory() {
     }
 }
 
-/// Asserts that an inventory that still lists a frontend as a pool member (`instance=`,
-/// `base=`) is refused at start-up with the line named and nothing bound.
+/// Asserts that an inventory that lists frontend pool members starts, whatever flags there are
+/// for a proxy (none), and that an inventory without members starts as before.
 #[test]
-fn an_inventory_with_pool_members_is_refused_at_start() {
+fn pool_members_start_without_any_proxy_flag() {
     let api = fake_api(vec![Some(http(200, "{}"))]);
-    let members = "fe-a fe.farm.example frontend KEY instance=a base=18000\n";
+    let members = "fe-a fe.farm.example frontend KEY instance=a base=18000\n\
+                   fe-b fe.farm.example frontend KEY instance=b base=18010\n";
     let cfg = config("members", members, &api);
-    let e = start(&cfg).err().expect("refused");
-    assert!(e.starts_with("inventory "), "{e}");
-    assert!(e.contains("line 1"), "{e}");
-    assert!(e.contains("no longer rolls frontends"), "{e}");
-    assert!(!sock(&cfg).exists());
+    let daemon = start(&cfg).expect("start");
+    daemon.stopper().stop();
+    daemon.wait();
+    let plain = config("no-members", "st1 st1.farm.example storage KEY\n", &api);
+    let daemon = start(&plain).expect("start without members");
+    daemon.stopper().stop();
+    daemon.wait();
+}
+
+/// Asserts that the binary's frontend port is the member's own operator API, asked with the
+/// token.
+#[test]
+fn the_binarys_frontend_port_reaches_the_member() {
+    let operator = fake_api(vec![Some(http(200, "{\"commit\":\"0123456789ab\"}"))]);
+    let cfg = config("pool", "st1 st1.farm.example storage KEY\n", &operator);
+    let ports = build_ports(&cfg).expect("ports");
+    let host = Host {
+        alias: "fe-a".to_owned(),
+        address: "fe.farm.example".to_owned(),
+        role: Role::Frontend,
+        host_key: KEY.to_owned(),
+        node_id: None,
+        member: Some(Member {
+            instance: "a".to_owned(),
+            base_port: operator.addr.port() - 2,
+        }),
+    };
+    let commit = ports.frontend.commit(&host);
+    assert_eq!(commit, Ok("0123456789ab".to_owned()));
+    let asked = operator.requests().remove(0);
+    assert!(asked.starts_with("GET /healthz HTTP/1.1\r\n"));
+    assert!(asked.contains(&format!("Bearer {TOKEN}")), "{asked}");
 }
 
 /// Catches start-up that goes on over something wrong: an inventory that is not owned by the
@@ -733,6 +804,7 @@ fn the_driver_loop_audits_what_it_cannot_drive_and_goes_on() {
         drain: Box::new(crate::fakes::FakeDrain::new(&log)),
         health: Box::new(FakeHealth::new(&log)),
         clock: Box::new(FakeClock::new()),
+        frontend: Box::new(crate::fakes::FakeFrontend::new(&log)),
     };
     let updater = Updater::open(
         crate::inventory::Inventory::load(&cfg.inventory, own_uid()).expect("inventory"),

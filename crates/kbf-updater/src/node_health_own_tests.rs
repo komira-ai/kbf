@@ -26,6 +26,7 @@ fn host(node_id: Option<&str>) -> Host {
         role: Role::Storage,
         host_key: KEY.to_owned(),
         node_id: node_id.map(str::to_owned),
+        member: None,
     }
 }
 

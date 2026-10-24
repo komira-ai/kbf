@@ -3,11 +3,16 @@
 //!
 //! # A frontend host
 //!
-//! A frontend is a container that `kbf-host-install` drains and recreates; the roll does not
-//! judge one, and does not install on one: [`HealthCheck::refusal`] says so
-//! ([`FRONTEND_REFUSAL`]), and the roll asks it before it calls the installer for a host, so
-//! ssh is never run for one. [`NodeHealth::check`] answers [`Health::Abandoned`] if it is asked
-//! about one anyway.
+//! A frontend that is a member of a pool of frontends is judged by the roll itself, through the
+//! member's own API (`updater_frontend.rs`: ready and built from the target's commit), because
+//! that needs the member's own operator port and not the operator API of the frontend this
+//! module asks. [`NodeHealth::check`] says so ([`Health::Abandoned`]) if it is asked about one.
+//!
+//! A frontend whose inventory line lists no `instance=` and `base=` is not a member, and
+//! nothing can move traffic away from it: it is not installed on and not judged
+//! ([`NO_MEMBER_REFUSAL`]). The roll asks [`HealthCheck::refusal`] before it calls the
+//! installer for a host and fails there, with nothing changed on the host and none after it
+//! touched.
 //!
 //! # A storage host
 //!
@@ -72,9 +77,12 @@ use crate::operator::{CHECK, OperatorApi, WHAT};
 use crate::ports::{Health, HealthCheck, Installer, PortError};
 use crate::version::Version;
 
-/// What the check says of a frontend host.
-pub const FRONTEND_REFUSAL: &str = "a frontend is a container that kbf-host-install drains and \
-     recreates; it is not rolled here: list storage and daemon hosts only";
+/// What the check says of a frontend host that is listed without `instance=` and `base=`.
+pub const NO_MEMBER_REFUSAL: &str =
+    "a frontend is rolled as a pool member: list it with instance=<name> and base=<port>";
+
+/// What the check says if it is asked about a frontend member.
+pub const MEMBER_ELSEWHERE: &str = "a frontend member is judged by the roll, not here";
 
 #[derive(Deserialize)]
 struct Enrolled {
@@ -345,16 +353,20 @@ fn member_own_health(commit: &str, member: &OwnMember, storage: &Whole) -> Healt
 }
 
 impl HealthCheck for NodeHealth {
-    /// A frontend is refused before it is installed, not after (see [`FRONTEND_REFUSAL`]).
+    /// A frontend that is no pool member is refused before it is installed, not after (see
+    /// [`NO_MEMBER_REFUSAL`]).
     fn refusal(&self, host: &Host) -> Option<String> {
-        (host.role == Role::Frontend).then(|| FRONTEND_REFUSAL.to_owned())
+        match (host.role, &host.member) {
+            (Role::Frontend, None) => Some(NO_MEMBER_REFUSAL.to_owned()),
+            _ => None,
+        }
     }
 
     /// A daemon-only host is judged as a daemon, a storage host as a storage node, and a
-    /// frontend not at all (see [`FRONTEND_REFUSAL`]).
+    /// frontend not here (see [`MEMBER_ELSEWHERE`]).
     fn check(&self, host: &Host, target: &Version) -> Result<Health, PortError> {
         match host.role {
-            Role::Frontend => Ok(Health::Abandoned(FRONTEND_REFUSAL.to_owned())),
+            Role::Frontend => Ok(Health::Abandoned(MEMBER_ELSEWHERE.to_owned())),
             Role::Daemon | Role::MacDaemon => self.daemon(host, target, false),
             Role::Storage => match self.storage_view {
                 StorageView::Lists => self.storage(host, target),

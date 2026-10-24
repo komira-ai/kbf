@@ -309,6 +309,7 @@ fn host(alias: &str, role: Kind, node: &str) -> Host {
         role,
         host_key: "ssh-ed25519 AAAA".to_owned(),
         node_id: Some(node.to_owned()),
+        member: None,
     }
 }
 

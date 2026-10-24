@@ -1,12 +1,20 @@
 //! The roll state machine.
 //!
-//! One roll at a time, over the hosts of a plan: a frontend first (the real health check refuses
-//! one), then one host at a time.
+//! One roll at a time, over the hosts of a plan: the frontend first, then one host at a time.
 //! Per host the turn is `pending`, `checking` (the node's identity, safe-to-stop and, for a
 //! daemon host, the drain; nodes only), `installing`, `waiting_healthy`, `done`. Every phase
 //! change is written to `roll.json` before the work of the new phase starts, so a restart
 //! finds the host where its work began and never earlier.
 //! The first failure stops the roll and no later host is asked about, let alone touched.
+//!
+//! A frontend that is a member of a pool of frontends (an inventory line with `instance=` and
+//! `base=`) takes a turn of its own, in `updater_no_proxy.rs`, whatever load balancer is in
+//! front of the pool: every other member must have answered `/readyz` 200 for a while, the
+//! member drains itself and exits, the host is installed on and the member's unit restarted,
+//! and the roll waits for it to be ready on the target's commit. Its phases are `draining`,
+//! `installing`, `restarting` and `waiting_healthy`; nothing is put back, because a drained
+//! frontend is a new process after the restart. The roll never takes a member out unless every
+//! other one is ready.
 //!
 //! A `mac-daemon` host takes the daemon's turn with one difference. Its `install` only starts
 //! the apply on the Mac and answers `apply_started`; the roll marks the host `waiting_healthy`
@@ -44,20 +52,27 @@ use crate::api::{
 };
 use crate::inventory::{Host, Inventory, Role};
 use crate::ports::{
-    Apply, Clock, Drain, Health, HealthCheck, InstallAnswer, Installed, Installer, PortError,
-    SafeToStop, Stop,
+    Apply, Clock, Drain, FrontendControl, Health, HealthCheck, InstallAnswer, Installed, Installer,
+    PortError, SafeToStop, Stop,
 };
 use crate::record::{FORMAT, Record, RollStore, StoreError, roll_id};
 use crate::timing::Timing;
 use crate::version::Version;
 
-/// The five ports of a roll.
+#[path = "updater_frontend.rs"]
+mod frontend;
+#[path = "updater_no_proxy.rs"]
+mod no_proxy;
+
+/// The six ports of a roll.
 pub struct Ports {
     pub safe: Box<dyn SafeToStop>,
     pub installer: Box<dyn Installer>,
     pub drain: Box<dyn Drain>,
     pub health: Box<dyn HealthCheck>,
     pub clock: Box<dyn Clock>,
+    /// A frontend member's own API.
+    pub frontend: Box<dyn FrontendControl>,
 }
 
 /// `halt`, with the node it leaves drained named. A store error is not changed.
@@ -507,6 +522,11 @@ impl Updater {
                 }
             }
         }
+        if let (Role::Frontend, Some(member)) = (host.role, &host.member) {
+            self.no_proxy_turn(idx, host, &member.instance, target, phase)?;
+            self.mark(idx, Phase::Done, false)?;
+            return Ok(());
+        }
         let held = host.role.is_daemon();
         self.install_and_wait(idx, host, target, phase, held)
             .map_err(|halt| if held { left_drained(host, halt) } else { halt })?;
@@ -549,7 +569,15 @@ impl Updater {
                 }
             }
             Phase::Installing => apply = self.recover_install(idx, host, target)?,
-            Phase::WaitingHealthy | Phase::Done | Phase::Failed => {}
+            // The phases of a frontend member's turn are never a node's; one that is found on
+            // a node is waited on like `waiting_healthy`.
+            Phase::WaitingHealthy
+            | Phase::Done
+            | Phase::Failed
+            | Phase::Draining
+            | Phase::Retiring
+            | Phase::Restarting
+            | Phase::Undraining => {}
         }
         if apply {
             self.wait_apply(host, target)?;

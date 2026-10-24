@@ -47,6 +47,8 @@ fn prepare(name: &str, proxy_uid: u32) -> Config {
         drain_deadline: std::time::Duration::from_secs(600),
         apply_poll: std::time::Duration::from_secs(5),
         apply_deadline: std::time::Duration::from_secs(600),
+        peer_ready: std::time::Duration::from_secs(30),
+        frontend_drain_deadline: std::time::Duration::from_secs(1200),
     }
 }
 
@@ -91,6 +93,7 @@ impl Farm {
             drain: Box::new(crate::fakes::FakeDrain::new(&log)),
             health: Box::new(health),
             clock: Box::new(clock),
+            frontend: Box::new(crate::fakes::FakeFrontend::new(&log)),
         };
         let settings = tune(Settings::new(cfg.proxy_uid));
         let daemon =
@@ -587,6 +590,7 @@ fn bare_server(name: &str) -> (Server, std::sync::mpsc::Receiver<String>, Lines)
         drain: Box::new(crate::fakes::FakeDrain::new(&log)),
         health: Box::new(FakeHealth::new(&log)),
         clock: Box::new(FakeClock::new()),
+        frontend: Box::new(crate::fakes::FakeFrontend::new(&log)),
     };
     let updater = crate::Updater::open(
         crate::inventory::Inventory::load(&cfg.inventory, own_uid()).expect("inventory"),
@@ -725,6 +729,7 @@ fn a_running_roll_found_at_start_is_resumed() {
             drain: Box::new(crate::fakes::FakeDrain::new(&log)),
             health: Box::new(FakeHealth::new(&log)),
             clock: Box::new(FakeClock::new()),
+            frontend: Box::new(crate::fakes::FakeFrontend::new(&log)),
         };
         let updater = crate::Updater::open(
             crate::inventory::Inventory::load(&cfg.inventory, own_uid()).expect("inventory"),

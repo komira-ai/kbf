@@ -182,6 +182,7 @@ pub fn build(cfg: &Config) -> Result<Agent, String> {
         role,
         host_key: String::new(),
         node_id: Some(node_id),
+        member: None,
     };
     let local = Arc::new(SocketLocal::new(&cfg.helper_socket, Limits::default()));
     let (drain, health) = node_ports(cfg, &identity, host.role, &local)?;

@@ -214,7 +214,13 @@ fn an_update_by(way: Way) {
         first["version"], "0.1.0+gaaaaaaaaaaaa",
         "the version of a release placed by hand"
     );
-    assert_eq!(first["platform"], "linux-x86_64");
+    let host = kbf_updater::agent::status::host_platform().expect("a platform kbf releases for");
+    assert!(!host.as_str().is_empty());
+    assert_eq!(
+        first["platform"],
+        host.as_str(),
+        "the heartbeat names the platform of the host the test runs on"
+    );
     for beat in beats.iter() {
         let mut keys: Vec<_> = beat.as_object().unwrap().keys().cloned().collect();
         keys.sort();

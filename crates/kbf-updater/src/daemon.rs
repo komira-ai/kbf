@@ -10,6 +10,16 @@
 //!   address is refused;
 //! - `--token-file`: the file holding the operator bearer token.
 //!
+//! Optional: `--peer-ready-secs` (default 30, at least 1) and `--frontend-drain-deadline-secs`
+//! (default 1200, at least 1), for the frontend pool members (lines of the inventory with
+//! `instance=` and `base=`). The updater runs on the frontend host: it reaches each member's
+//! operator API (its `base` plus two) on loopback with the token it uses for `--operator-api`.
+//! A member is rolled behind whatever load balancer there is (`updater_no_proxy.rs`): it drains
+//! itself and exits, and is restarted on the new package, after every other member has answered
+//! `/readyz` 200 for `--peer-ready-secs` in a row. `--frontend-drain-deadline-secs` is how long a
+//! member is given to exit after it is told to drain; it must be longer than the longest
+//! execution a member may have open, which its drain waits for.
+//!
 //! And the socket, one of two (never both):
 //!
 //! - **production**: socket activation. systemd binds the socket (`SocketUser=<proxy user>`,
@@ -33,8 +43,9 @@
 //! A daemon host's node is drained at the frontend before its install and given back after
 //! it runs the target ([`crate::node_drain`]); `--drain-deadline-secs` (default 600) is how long
 //! its leases are waited for. The health check is real for storage and daemon hosts and refuses a
-//! frontend ([`crate::node_health`]); the roll asks it before it installs, so ssh is never run
-//! for one.
+//! frontend that is no pool member ([`crate::node_health`]); the roll asks it before it
+//! installs, so ssh is never run for one. A frontend pool member is rolled through its own API
+//! ([`crate::frontend_http`]).
 //!
 //! A `mac-daemon` host is rolled as a daemon host, except that its install only starts an
 //! apply on the Mac: the roll asks the host's `query` every `--apply-poll-secs` until the
@@ -55,6 +66,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::api::RollState;
+use crate::frontend_http::HttpFrontend;
 use crate::inventory::Inventory;
 use crate::listener::{Activation, Listen, open};
 use crate::node_drain::NodeDrain;
@@ -71,11 +83,12 @@ pub const USAGE: &str = "usage: kbf-updater --version\n       kbf-updater --stat
 --inventory FILE --proxy-uid UID --operator-api http://IP:PORT --token-file FILE \
 --ssh-key-file FILE --ssh-user USER --channel NAME \
 [--ssh-connect-timeout-secs N] [--ssh-command-timeout-secs N] \
-[--drain-deadline-secs N] [--apply-poll-secs N] [--apply-deadline-secs N] [--socket PATH]\n\
+[--drain-deadline-secs N] [--apply-poll-secs N] [--apply-deadline-secs N] \
+[--peer-ready-secs N] [--frontend-drain-deadline-secs N] [--socket PATH]\n\
 the socket comes from systemd socket activation (LISTEN_PID, LISTEN_FDS=1) or from --socket, \
 which is for tests and development\n";
 
-const FLAGS: [&str; 14] = [
+const FLAGS: [&str; 16] = [
     "--state-dir",
     "--inventory",
     "--socket",
@@ -90,6 +103,8 @@ const FLAGS: [&str; 14] = [
     "--drain-deadline-secs",
     "--apply-poll-secs",
     "--apply-deadline-secs",
+    "--peer-ready-secs",
+    "--frontend-drain-deadline-secs",
 ];
 
 /// How long ssh may take to connect, unless a flag says otherwise.
@@ -103,6 +118,12 @@ const DEFAULT_DRAIN_SECS: u64 = 600;
 const DEFAULT_APPLY_POLL_SECS: u64 = 5;
 /// How long a Mac host's apply may take, unless a flag says otherwise.
 const DEFAULT_APPLY_DEADLINE_SECS: u64 = 600;
+/// How long every other frontend member must have been ready in a row before a member is drained,
+/// unless a flag says otherwise.
+const DEFAULT_PEER_READY_SECS: u64 = 30;
+/// How long a frontend member is given to exit after it is told to drain, unless a flag
+/// says otherwise: 20 minutes, for executions that run up to that long.
+const DEFAULT_FRONTEND_DRAIN_SECS: u64 = 1200;
 
 /// The settings of a run.
 #[derive(Clone, Debug)]
@@ -129,12 +150,18 @@ pub struct Config {
     pub apply_poll: Duration,
     /// How long a `mac-daemon` host's apply may take to be done for the target.
     pub apply_deadline: Duration,
+    /// How long every other frontend member must answer `/readyz` 200 in a row before a member
+    /// is drained.
+    pub peer_ready: Duration,
+    /// How long a frontend member is given to exit after it is told to drain.
+    pub frontend_drain_deadline: Duration,
 }
 
 /// The settings from the command line (without the program name) and from what the service
 /// manager passed. Each flag is given once, as `--flag value` or `--flag=value`; all but
-/// `--socket`, the two ssh timeouts, the drain deadline and the two apply bounds are required,
-/// and the socket is either `--socket` or the activated descriptor.
+/// `--socket`, the two ssh timeouts, the drain deadline, the two apply bounds and the two
+/// bounds of a frontend member's drain are required, and the socket is either `--socket` or
+/// the activated descriptor.
 pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, String> {
     let mut found: BTreeMap<&str, String> = BTreeMap::new();
     let mut rest = args.iter();
@@ -193,6 +220,17 @@ pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, S
     if apply_deadline.is_zero() {
         return Err("--apply-deadline-secs must be at least 1".to_owned());
     }
+    let peer_ready = seconds("--peer-ready-secs", DEFAULT_PEER_READY_SECS)?;
+    if peer_ready.is_zero() {
+        return Err("--peer-ready-secs must be at least 1".to_owned());
+    }
+    let frontend_drain_deadline = seconds(
+        "--frontend-drain-deadline-secs",
+        DEFAULT_FRONTEND_DRAIN_SECS,
+    )?;
+    if frontend_drain_deadline.is_zero() {
+        return Err("--frontend-drain-deadline-secs must be at least 1".to_owned());
+    }
     let listen = match (
         found.remove("--socket"),
         activation.passed_to(std::process::id())?,
@@ -227,6 +265,8 @@ pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, S
         drain_deadline,
         apply_poll,
         apply_deadline,
+        peer_ready,
+        frontend_drain_deadline,
     })
 }
 
@@ -329,17 +369,20 @@ pub fn build_ports_with_exec(cfg: &Config, exec: Arc<dyn Exec>) -> Result<Ports,
         safe: Box::new(HttpSafeToStop::from_api(api.clone())),
         installer: Box::new(Arc::clone(&installer)),
         drain: Box::new(NodeDrain::with_api(api.clone())),
-        health: Box::new(NodeHealth::with_api(api, installer)),
+        health: Box::new(NodeHealth::with_api(api.clone(), installer)),
         clock: Box::new(SystemClock::new()),
+        frontend: Box::new(HttpFrontend::with_api(api)),
     })
 }
 
-/// The bounds of the roll: the defaults, and the three the flags set.
+/// The bounds of the roll: the defaults, and the five the flags set.
 pub fn timing(cfg: &Config) -> Timing {
     Timing {
         drain_deadline: cfg.drain_deadline,
         apply_poll: cfg.apply_poll,
         apply_deadline: cfg.apply_deadline,
+        peer_ready: cfg.peer_ready,
+        frontend_drain: cfg.frontend_drain_deadline,
         ..Timing::default()
     }
 }
