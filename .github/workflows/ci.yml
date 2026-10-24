@@ -76,6 +76,10 @@ jobs:
         if: ${{ !cancelled() }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
         if: ${{ !cancelled() }}
+      # The object store library with its `s3` feature (the adapter over the S3 client of
+      # kbf-objstore), which is off in the workspace run above: no crate turns it on yet.
+      - run: cargo clippy -p tierstore --features s3 --all-targets --locked -- -D warnings
+        if: ${{ !cancelled() }}
       # The setup library without its `proxy` feature, as the `kbf` binary links it. The workspace
       # run above has the feature on (the installer is in the workspace), so the code that is
       # compiled only without it is built and linted here, with the library and the binary alone.
@@ -206,10 +210,12 @@ jobs:
       # it looks like LLVM issue 220574). Lines and branches, all the gate reads, are
       # unaffected: their totals match llvm-cov's own text report.
       - run: mkdir -p target/coverage
+      # `--features tierstore/s3` puts the object store library's S3 backend (off by default; no
+      # crate turns it on yet) into the run, so its tests count toward the 99% of tierstore.
       - name: Run the fast tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --profile pr
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --features tierstore/s3 --locked --branch --no-report --no-fail-fast --profile pr
       # What the test run left on the disk, so a run that ran the runner out of room says
       # which directories grew (the instrumented build, the tests' own temporary files).
       - name: Free disk after the tests (report)

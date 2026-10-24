@@ -150,6 +150,7 @@ pub async fn check_ranges(backend: &dyn Backend, key: &str) {
         (9, 1, "9"),
         (4, 3, "456"),
         (8, 100, "89"),
+        (4, u64::MAX, "456789"),
         (3, 0, ""),
         (10, 0, ""),
         (10, 5, ""),
