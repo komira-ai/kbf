@@ -64,6 +64,8 @@ pub(crate) mod crash;
 pub(crate) mod domain;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod entry;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod keychain;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]

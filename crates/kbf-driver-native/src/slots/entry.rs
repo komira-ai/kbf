@@ -33,6 +33,7 @@ use std::path::Path;
 
 use kbf_mac_session::sweep;
 
+use super::keychain;
 use super::probe::{self, SKELETON};
 
 /// The argument after argv0 that selects this binary's entry mode:
@@ -50,13 +51,16 @@ pub const RESTORE: &str = "restore";
 pub const ACL: &str = "acl";
 /// The mode that empties the home: `__entry empty-home <uid> <gid> <dir>`.
 pub const EMPTY_HOME: &str = "empty-home";
+/// The mode that deletes the uid's keychain items: `__entry keychain <uid> <gid> <dir>`
+/// (`dir` is the home; it is not read).
+pub const KEYCHAIN: &str = "keychain";
 /// The mode that prints what is left in the home: `__entry look-home <uid> <gid> <dir>`.
 pub const LOOK_HOME: &str = "look-home";
 /// The mode that prints what is left in the entry: `__entry look <uid> <gid> <dir>`.
 pub const LOOK: &str = "look";
 
 const USAGE: &str =
-    "usage: __entry clear|empty|look|restore|acl|empty-home|look-home <uid> <gid> <dir>";
+    "usage: __entry clear|empty|look|restore|acl|empty-home|look-home|keychain <uid> <gid> <dir>";
 
 const FIND: &str = "/usr/bin/find";
 const CHMOD: &str = "/bin/chmod";
@@ -117,23 +121,26 @@ pub(crate) fn contents_step(
     contents_step_waiting(me, dirs, run, &mut std::thread::sleep)
 }
 
-/// How long the home's empty waits before it tries again when only the keychain's files
-/// were left: securityd holds a lock file there for a moment after a lease.
-pub(crate) const KEYCHAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+/// How often the home's empty is tried again while only the keychain's files are left,
+/// and for how long in all: `secd` removes the per-user keychain it made for the uid a
+/// while after the lease (about a minute was seen), so the clean waits for it.
+pub(crate) const KEYCHAIN_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const KEYCHAIN_TOTAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Whether `lines`, what the uid finds left in `home`, are all in its `Library/Keychains`
-/// and there is at least one: the system holds them for a moment, and the empty is tried
-/// once more after [`KEYCHAIN_WAIT`]. Never skipped: a keychain is readable by the next
-/// lease that runs as the same user.
+/// and there is at least one: the system holds them for a while, and the empty is tried
+/// again every [`KEYCHAIN_POLL`] for [`KEYCHAIN_TOTAL`]. Never skipped: a keychain is
+/// readable by the next lease that runs as the same user.
 pub(crate) fn keychain_only(lines: &[String], home: &Path) -> bool {
     let keychains = home.join("Library/Keychains");
     !lines.is_empty() & lines.iter().all(|l| Path::new(l).starts_with(&keychains))
 }
 
-/// [`contents_step`], waiting with `sleep`.
+/// [`contents_step`], waiting with `sleep`: the uid's keychain items deleted, the home
+/// emptied (again, polling, while only keychain files are left), the entry emptied.
 ///
 /// # Errors
-/// A part failed; both are tried.
+/// A part failed; all are tried.
 pub(crate) fn contents_step_waiting(
     me: &AsUid<'_>,
     (home, folders): (&Path, &Path),
@@ -141,23 +148,57 @@ pub(crate) fn contents_step_waiting(
     sleep: &mut dyn FnMut(std::time::Duration),
 ) -> Result<(), String> {
     let mut failed = Vec::new();
-    if let Err(first) = empty_home(me, home, run) {
-        let held = left_home(me, home, run).ok();
-        if held
-            .as_deref()
-            .is_some_and(|lines| keychain_only(lines, home))
-        {
-            sleep(KEYCHAIN_WAIT);
-            if let Err(again) = empty_home(me, home, run) {
-                let left = left_home(me, home, run).unwrap_or_default();
-                failed.push(format!("{again}; left after waiting: {left:?}"));
-            }
-        } else {
-            failed.push(first);
-        }
-    }
+    failed.extend(wipe_keychains(me, home, run).err());
+    failed.extend(empty_home_waiting(me, home, run, sleep).err());
     failed.extend(empty(me, folders, run).err());
     join(failed)
+}
+
+/// The home emptied; while only files of `Library/Keychains` are left, again every
+/// [`KEYCHAIN_POLL`] up to [`KEYCHAIN_TOTAL`], then the failure with what is left.
+fn empty_home_waiting(
+    me: &AsUid<'_>,
+    home: &Path,
+    run: &mut Run<'_>,
+    sleep: &mut dyn FnMut(std::time::Duration),
+) -> Result<(), String> {
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        let Err(why) = empty_home(me, home, run) else {
+            return Ok(());
+        };
+        let left = left_home(me, home, run).ok();
+        if !left.as_deref().is_some_and(|l| keychain_only(l, home)) {
+            return Err(why);
+        }
+        if waited >= KEYCHAIN_TOTAL {
+            return Err(format!(
+                "{why}; left after waiting {KEYCHAIN_TOTAL:?}: {:?}",
+                left.unwrap_or_default()
+            ));
+        }
+        sleep(KEYCHAIN_POLL);
+        waited += KEYCHAIN_POLL;
+    }
+}
+
+/// The uid's keychain items deleted, as the uid.
+///
+/// # Errors
+/// The call failed (an item could not be deleted, or one is left).
+pub(crate) fn wipe_keychains(me: &AsUid<'_>, home: &Path, run: &mut Run<'_>) -> Result<(), String> {
+    me.mode(KEYCHAIN, home, run)
+        .map(drop)
+        .map_err(|why| format!("keychain items of {}: {why}", home.display()))
+}
+
+/// [`KEYCHAIN`]: `wipe` deletes the items and says what failed or is left; exit 1 then.
+fn keychain_mode(wipe: &mut dyn FnMut() -> Vec<String>, err: &mut dyn Write) -> i32 {
+    let failed = wipe();
+    for line in &failed {
+        let _ = writeln!(err, "{line}");
+    }
+    i32::from(!failed.is_empty())
 }
 
 fn join(failed: Vec<String>) -> Result<(), String> {
@@ -455,7 +496,9 @@ pub(crate) fn dispatch(
         return Some(2);
     };
     let mode = match mode.to_str() {
-        Some(mode @ (CLEAR | EMPTY | LOOK | RESTORE | ACL | EMPTY_HOME | LOOK_HOME)) => mode,
+        Some(mode @ (CLEAR | EMPTY | LOOK | RESTORE | ACL | EMPTY_HOME | LOOK_HOME | KEYCHAIN)) => {
+            mode
+        }
         _ => {
             let _ = writeln!(err, "{ARG}: no mode {mode:?}");
             return Some(2);
@@ -482,6 +525,7 @@ pub(crate) fn dispatch(
         EMPTY => sweep::empty_keeping(dir, uid, &SKELETON),
         ACL => return Some(acl_mode(dir, uid, &mut run_find, err)),
         EMPTY_HOME => sweep::empty(dir, uid),
+        KEYCHAIN => return Some(keychain_mode(&mut keychain::wipe_user_keychains, err)),
         LOOK_HOME => return Some(look_home(dir, out, err)),
         _ => return Some(look(dir, out, err)),
     };

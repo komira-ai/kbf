@@ -118,7 +118,7 @@ fn every_call_on_the_entry_is_made_as_the_uid() {
     left(&me(), Path::new(FOLDERS), run).expect("left");
     left_home(&me(), Path::new(HOME), run).expect("left home");
     let calls = log.borrow();
-    assert_eq!(calls.len(), 7);
+    assert_eq!(calls.len(), 8);
     // The daemon's modes get the ids and drop inside their own process (the pool user
     // need not be able to execute the binary).
     for call in calls.iter() {
@@ -162,7 +162,11 @@ fn the_contents_step_empties_the_home_then_the_entry_both_as_the_uid() {
     .expect("clean");
     assert_eq!(
         *log.borrow(),
-        vec![home_call("empty-home"), mode_call("empty")]
+        vec![
+            home_call("keychain"),
+            home_call("empty-home"),
+            mode_call("empty")
+        ]
     );
 }
 
@@ -1019,10 +1023,11 @@ fn a_home_held_by_the_keychain_is_emptied_again_once_after_a_wait() {
         &mut |d| waits.push(d),
     )
     .expect("emptied on the second try");
-    assert_eq!(waits, vec![KEYCHAIN_WAIT]);
+    assert_eq!(waits, vec![KEYCHAIN_POLL]);
     assert_eq!(
         *log.borrow(),
         vec![
+            home_call("keychain"),
             home_call("empty-home"),
             home_call("look-home"),
             home_call("empty-home"),
@@ -1035,11 +1040,13 @@ fn a_home_held_by_the_keychain_is_emptied_again_once_after_a_wait() {
     let why = contents_step_waiting(
         &me(),
         dirs,
-        &mut keychain_runner(&log, 2, &held),
+        &mut keychain_runner(&log, usize::MAX, &held),
         &mut |d| waits.push(d),
     )
     .expect_err("fails");
-    assert_eq!(waits.len(), 1);
+    // Polled every 2 s for 60 s, then the failure names what is left.
+    assert_eq!(waits.len(), 30);
+    assert!(waits.iter().all(|w| *w == KEYCHAIN_POLL));
     assert!(why.contains(".flA5"), "{why}");
     assert!(why.contains("Operation not permitted"), "{why}");
 }
@@ -1117,4 +1124,41 @@ fn a_directory_the_system_placed_is_accepted_when_empty_and_its_contents_are_not
         acl_mode(&entry, 5, &mut fake_find(false, &refusal), &mut err),
         1
     );
+}
+
+#[test]
+fn the_keychain_items_are_deleted_first_and_a_failure_names_the_home_and_is_not_skipped() {
+    let dirs = (Path::new(HOME), Path::new(FOLDERS));
+    let log = Log::default();
+    let why = contents_step_waiting(
+        &me(),
+        dirs,
+        &mut runner(&log, &["__entry keychain"]),
+        &mut |_| panic!("no wait"),
+    )
+    .expect_err("fails");
+    assert!(
+        why.starts_with(&format!("keychain items of {HOME}: ")),
+        "{why}"
+    );
+    // The home and the entry are emptied anyway.
+    assert_eq!(log.borrow().len(), 3);
+}
+
+#[test]
+fn the_keychain_mode_prints_what_failed_and_exits_1() {
+    let mut err = Vec::new();
+    assert_eq!(keychain_mode(&mut Vec::new, &mut err), 0);
+    assert!(err.is_empty());
+    let mut wipe = || vec!["key in the file keychain: delete status -50".to_owned()];
+    assert_eq!(keychain_mode(&mut wipe, &mut err), 1);
+    assert!(String::from_utf8_lossy(&err).contains("delete status -50"));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn the_keychain_mode_is_selected_and_has_nothing_to_wipe_off_macos() {
+    let dir = tree("keychain");
+    let (code, out, err) = call(KEYCHAIN, dir.path());
+    assert_eq!((code, out.as_str(), err.as_str()), (Some(0), "", ""));
 }
