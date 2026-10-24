@@ -702,7 +702,7 @@ container ([the example](../../packaging/host-agent/linux/host-install-frontend.
 
 | key | meaning |
 |---|---|
-| `name`, `restart` | the container's name and Docker's restart policy (`no`, `always`, `unless-stopped`, `on-failure[:N]`) |
+| `name`, `restart` | the container's name and Docker's restart policy (`always`, `unless-stopped`, `on-failure[:N]`). `no` is refused: nothing else starts the container, so it would stay down after a reboot of the host or of Docker |
 | `network`, `user` | optional: `--network` and `--user` |
 | `ports`, `mounts`, `command` | `--publish` and `--volume` entries, and the flags after the image; each entry is one argument, never a shell word |
 | `api` | where this host reaches the frontend's operator API (a published port), for `/readyz` and `/healthz` |
@@ -770,6 +770,10 @@ Three things to know when you set it up:
 calls (so a host that rebooted in the middle of a switch is put back when the first check after the
 start finds the deadline passed), removes whatever container there is and makes the old one again
 from the copy of the configuration in the marker, not from the file as it is now.
+A revert looks for the old image **before** it removes anything: if the image is gone, it fails
+(`revert_failed`) and the container that runs is left as it is, and so is a switch that fails
+readiness and cannot go back. Do not run `docker image prune -a` or `docker system prune -a`
+while a release is on trial (a plain `docker image prune` is safe: the old image keeps its tag).
 
 Before the first switch the release that runs is read from the container's image reference
 (`kbf-frontend:<commit>`, the name `docker image load` gives it); make the first container from the

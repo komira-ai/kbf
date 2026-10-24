@@ -140,7 +140,7 @@ fn word_ok(text: &str) -> bool {
 
 fn restart_ok(text: &str) -> bool {
     match text.split_once(':') {
-        None => matches!(text, "no" | "always" | "unless-stopped" | "on-failure"),
+        None => matches!(text, "always" | "unless-stopped" | "on-failure"),
         Some(("on-failure", count)) => count.parse::<u32>().is_ok(),
         Some(_) => false,
     }
@@ -162,7 +162,10 @@ fn check(entry: &RunSpec) -> Result<(), String> {
         return Err("name is not a container name".to_owned());
     }
     if !restart_ok(&entry.restart) {
-        return Err("restart is not no, always, unless-stopped or on-failure[:N]".to_owned());
+        return Err(
+            "restart is not always, unless-stopped or on-failure[:N] (\"no\" would leave the frontend down after a reboot)"
+                .to_owned(),
+        );
     }
     if !entry.network.as_deref().is_none_or(word_ok) {
         return Err("network is not a network name".to_owned());

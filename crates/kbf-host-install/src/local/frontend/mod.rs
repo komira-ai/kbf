@@ -249,6 +249,19 @@ impl<S: ImageSource, R: Runtime, P: Probe> Frontend<S, R, P> {
     fn restore(&self, trial: &Trial) -> Result<(), String> {
         let say = |e: RuntimeError| e.to_string();
         let name = &trial.config.run.name;
+        // The image first: a container that runs is better than none, so when the old image
+        // was pruned the running one is left alone.
+        if self
+            .runtime
+            .image_id(&trial.from_image)
+            .map_err(say)?
+            .is_none()
+        {
+            return Err(format!(
+                "the previous image {} is gone from docker",
+                trial.from_image
+            ));
+        }
         self.runtime.remove(name).map_err(say)?;
         self.runtime
             .run(&trial.config.run, &trial.from_image)
