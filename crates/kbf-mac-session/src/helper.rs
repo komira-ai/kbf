@@ -32,6 +32,9 @@
 //!   take no lease: the account is looked up by its configured name, and its uid must be
 //!   an ordinary uid outside the lease range. `role-run` and `role-session-ready` answer
 //!   for the GUI session only while no lease holds it.
+//! - The image verbs ([`image`]: `image-setup`, `image-harvest`) run the one installed
+//!   `kbf-vmm` as root on a bundle directly inside the images directory, with argv the
+//!   helper builds; the caller names only the bundle (and the output directory).
 //! - Every verb but `boot-reset` is refused until the boot reset has succeeded.
 //!
 //! The mutating verbs run one at a time (one lock around the ledger), and `run` holds
@@ -57,10 +60,12 @@ use crate::scan::ScanSettings;
 use crate::spawn::{self, Spawn};
 use crate::sweep::{SweepPlan, sweep};
 
+mod image;
 mod leak;
 mod role;
 mod switch;
 
+pub use image::ImageSettings;
 pub use switch::Reset;
 
 /// How many times `kill-uid` kills and looks again before it gives up.
@@ -218,6 +223,9 @@ pub struct Settings {
     pub vm_user: Option<VmUser>,
     /// What the leak scan looks at, and where it keeps its baseline and window.
     pub scan: ScanSettings,
+    /// The images directory and the installed programs of `image-setup` and
+    /// `image-harvest`.
+    pub image: ImageSettings,
 }
 
 /// What a request comes to.
@@ -239,6 +247,9 @@ pub struct Helper {
     /// Set, under the ledger's lock, when the last scan came back dirty and no lease
     /// user was created since: the one state `reboot-dirty` is accepted in.
     dirty: AtomicBool,
+    /// Held while an image verb runs: one at a time, apart from the ledger's lock, which
+    /// a minutes-long `kbf-vmm` must not hold back the other verbs with.
+    images: Mutex<()>,
 }
 
 impl Helper {
@@ -250,6 +261,7 @@ impl Helper {
             ledger: Mutex::new(ledger),
             reset_done: AtomicBool::new(false),
             dirty: AtomicBool::new(false),
+            images: Mutex::new(()),
         }
     }
 
@@ -296,6 +308,12 @@ impl Helper {
                 .role_session_ready()
                 .map(|ready| Reply::SessionReady { ready }),
             Request::RoleKillUid => self.role_kill_uid().map(|()| Reply::Killed),
+            Request::ImageSetup { bundle } => self
+                .image_setup(&bundle)
+                .map(|report| Reply::Imaged { report }),
+            Request::ImageHarvest { bundle, out } => self
+                .image_harvest(&bundle, &out)
+                .map(|report| Reply::Imaged { report }),
             Request::SessionReady { lease } => self
                 .session_ready(&lease)
                 .map(|ready| Reply::SessionReady { ready }),

@@ -353,6 +353,25 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 >   processes). Its uid is read from the directory each time and must be an ordinary
 >   uid outside the lease range. That VMs and a whole-machine lease never run together
 >   on one Mac is the daemon's rule: it drains VMs before `session-login`.
+> - **The image verbs** `image-setup <bundle>` and `image-harvest <bundle> <out>` are the two
+>   root-only steps of building a guest image (`kbf-vmm image setup`, which writes the guest's
+>   Data volume offline, and `kbf-vmm image harvest`, a read-only attach), so the daemon runs
+>   them and no one needs `sudo`. The program is `--vmm` (default the kit's `current/kbf-vmm`)
+>   and the guest binary is `--guest-binary`; each must be a regular file, root's and writable
+>   by no one else, and a request carries no program and no argument but the paths (the wire
+>   refuses unknown fields). A path must be a name directly inside `--images-dir`, compared by
+>   component (`..`, a longer path and a lookalike sibling are refused); the helper builds the
+>   path it passes on from the configured directory and that name. The images directory is the
+>   helper's own and not writable by others (group-writable only with the sticky bit, which is
+>   what keeps the VM user from renaming a bundle the helper has taken). Before `kbf-vmm` runs
+>   the helper opens the bundle without following a link, makes it root's and mode 0700
+>   through the descriptor, checks the name still leads to it, and makes every file in it
+>   root's, refusing anything but plain single-link files. After `image-setup` the files, then
+>   the bundle, go to the VM user and carry `uchg` (`chflags -h`); after `image-harvest` the
+>   owners and modes go back to what they were. `image-harvest` makes `<out>` itself (new,
+>   root's, 0700) and has `kbf-vmm` write `<out>/files`. A user-immutable flag is one its owner
+>   can clear, so `uchg` on a bundle the VM user owns stops accidents, not the VM user; keeping
+>   the base root's and group-readable with `schg` is the stronger layout and is not built.
 > - Every program the switch and the scan run (`defaults`, `launchctl`, `fdesetup`,
 >   `sfltool`) goes through the host's command runner with an empty environment, so
 >   the unit tests fake each one and nothing in CI restarts: the macOS CI job runs the

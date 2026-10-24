@@ -32,6 +32,9 @@ pub const RUN_FDS: usize = 4;
 pub const SCAN_LINES: usize = 20;
 pub const SCAN_LINE_BYTES: usize = 300;
 
+/// The most bytes of `kbf-vmm`'s report an image verb's reply carries.
+pub const IMAGE_REPORT_BYTES: usize = 16 * 1024;
+
 /// The receive buffer for ancillary data. On Linux, room for one more descriptor than a
 /// request may carry: the kernel cuts what does not fit, says so (`MSG_CTRUNC`), and
 /// the cut is refused. On macOS the kernel takes at most `MCLBYTES` (2048) bytes of
@@ -96,6 +99,15 @@ pub enum Request {
     RoleSessionReady,
     /// End every process of the standing VM user (its session with them).
     RoleKillUid,
+    /// As root, write the guest's first-boot files into the base image bundle `bundle`
+    /// (`kbf-vmm image setup`), then hand the bundle back to the standing VM user,
+    /// locked. `bundle` is a path directly inside the images directory. There is no
+    /// program and no argument here: the helper runs its own installed `kbf-vmm`.
+    ImageSetup { bundle: String },
+    /// As root, copy the diagnostics allowlist out of the stopped guest bundle `bundle`
+    /// into the new directory `out` (`kbf-vmm image harvest`). Both are paths directly
+    /// inside the images directory; the helper makes `out` (root's, mode 0700).
+    ImageHarvest { bundle: String, out: String },
     /// The boot reset, before the daemon's `Hello`: `held` are the leases the server
     /// still holds for this node.
     BootReset {
@@ -172,6 +184,9 @@ pub enum Reply {
     },
     /// The baseline is recorded: how many items each class holds.
     Baselined { classes: Vec<(String, usize)> },
+    /// An image verb ran: what `kbf-vmm` printed (its JSON report), cut to
+    /// [`IMAGE_REPORT_BYTES`].
+    Imaged { report: String },
     /// The request was refused or failed, and why.
     Refused { reason: String },
 }
@@ -685,6 +700,45 @@ mod tests {
         );
         let bare = r#"{"verb":"role-run","argv":["/usr/bin/true"]}"#;
         assert_eq!(serde_json::from_str::<Request>(bare).unwrap(), run);
+    }
+
+    /// Catches: an image verb that can carry a program, an argument vector or a
+    /// guest binary path from the caller (the helper must run only its own installed
+    /// `kbf-vmm`, with argv it builds), or whose names differ from the daemon's.
+    #[test]
+    fn an_image_verb_carries_paths_and_nothing_to_run() {
+        let setup = Request::ImageSetup {
+            bundle: "/images/base".to_owned(),
+        };
+        let text = serde_json::to_string(&setup).unwrap();
+        assert_eq!(text, r#"{"verb":"image-setup","bundle":"/images/base"}"#);
+        assert_eq!(serde_json::from_str::<Request>(&text).unwrap(), setup);
+        let harvest = Request::ImageHarvest {
+            bundle: "/images/clone".to_owned(),
+            out: "/images/out".to_owned(),
+        };
+        let text = serde_json::to_string(&harvest).unwrap();
+        assert_eq!(
+            text,
+            r#"{"verb":"image-harvest","bundle":"/images/clone","out":"/images/out"}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&text).unwrap(), harvest);
+        for hostile in [
+            r#"{"verb":"image-setup","bundle":"/images/b","program":"/bin/sh"}"#,
+            r#"{"verb":"image-setup","bundle":"/images/b","argv":["/bin/sh"]}"#,
+            r#"{"verb":"image-setup","bundle":"/images/b","guest-binary":"/tmp/g"}"#,
+            r#"{"verb":"image-harvest","bundle":"/images/b","out":"/images/o","args":[]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Request>(hostile).is_err(),
+                "{hostile}"
+            );
+        }
+        let text = serde_json::to_string(&Reply::Imaged {
+            report: "{}".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(text, r#"{"imaged":{"report":"{}"}}"#);
     }
 
     /// Catches a `run` that changes on the wire for the daemons that predate the

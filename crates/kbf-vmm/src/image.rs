@@ -657,6 +657,33 @@ mod tests {
         ]));
     }
 
+    /// Catches an `image setup` that writes a file the payload does not list (the root
+    /// helper runs this verb for the daemon, so nothing outside `offline_payload()` may
+    /// reach the guest's disk), a path that climbs out of the guest volume, or a payload
+    /// that differs from the one `image base --offline-setup` writes.
+    #[test]
+    fn setup_writes_exactly_the_offline_payload_paths() {
+        let work = crate::fake::work_with_base("image-setup-paths");
+        let base_dir = work.join("base");
+        let sys = FakeSystem::new();
+        sys.uid.set(0);
+        let bin = work.join("guest-src");
+        std::fs::write(&bin, "bin").expect("bin");
+        let r = setup(&sys, &base_dir, Some(&bin));
+        assert_eq!(r.status, Status::Ok);
+        let calls = sys.offline_calls.borrow();
+        assert_eq!(calls.len(), 1);
+        let want: Vec<String> = guest::offline_payload(Some(b"bin".to_vec()))
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(calls[0].1, want);
+        for path in &calls[0].1 {
+            assert!(!path.starts_with('/'), "{path}");
+            assert!(!path.split('/').any(|part| part == ".."), "{path}");
+        }
+    }
+
     /// Catches `image setup` writing as a non-root user, writing into a directory that
     /// is not a bundle, writing to the wrong disk, or hiding a write failure.
     #[test]

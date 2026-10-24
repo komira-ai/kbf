@@ -13,7 +13,7 @@ use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, Stat};
 
 use crate::autologin::SessionPaths;
 use crate::grant::GrantKeys;
-use crate::helper::{Helper, Host, Settings};
+use crate::helper::{Helper, Host, ImageSettings, Settings};
 use crate::lease::{UidRange, VmUser};
 use crate::ledger::Ledger;
 use crate::scan::{ScanFolder, ScanSettings};
@@ -75,6 +75,33 @@ pub struct Args {
     /// rests at the login window and the `role-*` verbs are refused.
     #[arg(long)]
     pub vm_user: Option<VmUser>,
+    /// The directory of guest image bundles the image verbs (`image-setup`,
+    /// `image-harvest`) act in: only a bundle directly inside it. It must be the helper's
+    /// own (root's) and not writable by others; group-writable only with the sticky bit,
+    /// so the VM user can make a bundle in it but cannot move one the helper has taken.
+    /// It may be reached through a link (`/var` is one); nothing below it may be.
+    #[arg(long, default_value = "/var/db/kbf-vm/images")]
+    pub images_dir: PathBuf,
+    /// The `kbf-vmm` the image verbs run, the only program they run. It must be a regular
+    /// file, the helper's own (root's) and writable by no one else; the path may go
+    /// through the kit's `current` link.
+    #[arg(long, default_value = "/usr/local/kbf/current/kbf-vmm")]
+    pub vmm: PathBuf,
+    /// The `kbf-guest` for macOS that `image-setup` has `kbf-vmm` copy onto the guest's
+    /// disk; the same ownership rule as `--vmm`.
+    #[arg(long, default_value = "/usr/local/kbf/current/kbf-guest")]
+    pub guest_binary: PathBuf,
+}
+
+impl Args {
+    /// The programs and the directory the image verbs use.
+    fn image_settings(&self) -> ImageSettings {
+        ImageSettings {
+            dir: self.images_dir.clone(),
+            vmm: self.vmm.clone(),
+            guest: self.guest_binary.clone(),
+        }
+    }
 }
 
 /// A bound socket and the helper behind it, ready to serve.
@@ -138,6 +165,7 @@ pub fn prepare(
             loginwindow: args.loginwindow.clone(),
         },
         vm_user: args.vm_user.clone(),
+        image: args.image_settings(),
         scan: ScanSettings::in_state_dir(&args.state_dir, scan),
     };
     tracing::info!(
@@ -186,7 +214,7 @@ pub(crate) fn read_trusted(path: &Path) -> io::Result<String> {
 
 /// Refuses an entry another user owns, or one its group or others may write: the
 /// helper runs as root, so only root's own entries are trusted.
-fn owned_privately(stat: &Stat) -> io::Result<()> {
+pub(crate) fn owned_privately(stat: &Stat) -> io::Result<()> {
     let me = rustix::process::geteuid().as_raw();
     if stat.st_uid != me {
         return Err(io::Error::new(

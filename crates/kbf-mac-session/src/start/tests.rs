@@ -78,6 +78,12 @@ fn the_flags_default_to_the_design() {
     assert_eq!(args.lease_gid, STAFF_GID);
     assert_eq!(args.homes, PathBuf::from("/Users"));
     assert_eq!(args.grant_keys, None);
+    assert_eq!(args.images_dir, PathBuf::from("/var/db/kbf-vm/images"));
+    assert_eq!(args.vmm, PathBuf::from("/usr/local/kbf/current/kbf-vmm"));
+    assert_eq!(
+        args.guest_binary,
+        PathBuf::from("/usr/local/kbf/current/kbf-guest")
+    );
     assert_eq!(args.vm_user, None);
     assert_eq!(args.kcpassword, PathBuf::from("/etc/kcpassword"));
     assert_eq!(
@@ -95,6 +101,27 @@ fn the_flags_default_to_the_design() {
         ])
         .is_err()
     );
+}
+
+/// Catches: image flags that do not reach the helper's settings (the verbs would act in
+/// the default directory with the default programs whatever the Mac is set up with).
+#[test]
+fn the_image_flags_reach_the_settings() {
+    let args = Args::parse_from([
+        "kbf-mac-session",
+        "--daemon-requirement",
+        "r",
+        "--images-dir",
+        "/i",
+        "--vmm",
+        "/k/kbf-vmm",
+        "--guest-binary",
+        "/k/kbf-guest",
+    ]);
+    let image = args.image_settings();
+    assert_eq!(image.dir, PathBuf::from("/i"));
+    assert_eq!(image.vmm, PathBuf::from("/k/kbf-vmm"));
+    assert_eq!(image.guest, PathBuf::from("/k/kbf-guest"));
 }
 
 /// Catches: a VM user flag that takes a lease user's name (the boot reset deletes lease
