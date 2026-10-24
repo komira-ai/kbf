@@ -157,35 +157,52 @@ pub(crate) fn entry_of(key: &str) -> Result<DenyEntry, Corrupt> {
         .ok_or(Corrupt("deny key"))
 }
 
-/// Revokes a node in one transaction: its row becomes `Revoked` (its id is burned), and
+/// Revokes a host in one transaction: its node row becomes `Revoked` (its id is burned) and
 /// deny rows are written for the node id, every unexpired serial it holds or held and the
-/// hash of each of its keys. Returns the entries written.
+/// hash of each of its keys. The host's updater row, when it has one, is revoked in the same
+/// transaction with its serials and keys denied, so its renewal is refused; an updater with
+/// no node row is revoked alone and burns no id. Returns the entries written.
 ///
 /// # Errors
-/// [`RegistryError::NotFound`] for an unknown node; [`RegistryError::Invalid`] for a node
-/// already revoked; the store failing; [`RegistryError::Contended`].
+/// [`RegistryError::NotFound`] for a host with neither row; [`RegistryError::Invalid`] for a
+/// host with nothing left to revoke; the store failing; [`RegistryError::Contended`].
 pub fn revoke_node(
     store: &dyn Store,
     id: &NodeId,
     by: &str,
 ) -> Result<Vec<DenyEntry>, RegistryError> {
-    let key = rows::node_key(id);
+    let node_key = rows::node_key(id);
+    let updater_key = rows::updater_key(id);
     for _ in 0..ATTEMPTS {
-        let read = rows::fetch::<NodeRow>(store, &key, "node")?.ok_or(RegistryError::NotFound)?;
-        if state_of(&read.row)? == NodeState::Revoked {
-            return Err(RegistryError::Invalid("the node is already revoked"));
+        let node = rows::fetch::<NodeRow>(store, &node_key, "node")?;
+        let updater = rows::fetch::<NodeRow>(store, &updater_key, "node")?;
+        if node.is_none() && updater.is_none() {
+            return Err(RegistryError::NotFound);
         }
         let now = rows::seconds(store.now());
-        let mut row = read.row;
-        let keys = deny_keys(id, &row, now, true);
-        row.state = STATE_REVOKED;
-        row.revoked_at = Some(now);
-        row.revoked_by = by.to_owned();
-        let mut txn = Txn::new().put(&key, row.encode_to_vec(), Cond::Version(read.version));
-        // The id stays burned, the address does not: another node may take it.
-        if !row.advertise.is_empty() {
-            txn = txn.delete(rows::advertise_key(&row.advertise), Cond::Any);
+        let mut txn = Txn::new();
+        let mut keys = Vec::new();
+        for (key, read, with_node) in [(&node_key, node, true), (&updater_key, updater, false)] {
+            let Some(read) = read else { continue };
+            if state_of(&read.row)? == NodeState::Revoked {
+                continue;
+            }
+            let mut row = read.row;
+            keys.extend(deny_keys(id, &row, now, with_node));
+            row.state = STATE_REVOKED;
+            row.revoked_at = Some(now);
+            row.revoked_by = by.to_owned();
+            txn = txn.put(key, row.encode_to_vec(), Cond::Version(read.version));
+            // The id stays burned, the address does not: another node may take it.
+            if !row.advertise.is_empty() {
+                txn = txn.delete(rows::advertise_key(&row.advertise), Cond::Any);
+            }
         }
+        if keys.is_empty() {
+            return Err(RegistryError::Invalid("the node is already revoked"));
+        }
+        keys.sort();
+        keys.dedup();
         let txn = with_deny_rows(txn, &keys, now, by, "revoked");
         if store.txn(txn)?.is_ok() {
             return keys.iter().map(|k| Ok(entry_of(k)?)).collect();

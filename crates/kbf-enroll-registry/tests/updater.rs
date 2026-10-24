@@ -318,3 +318,50 @@ fn a_row_with_a_host_role_that_is_not_one_is_unreadable() {
         Some(RegistryError::Corrupt("node"))
     );
 }
+
+/// Revoking a host id also ends its updater: the updater row is revoked, so its renewal is
+/// refused, and its serial and key are denied. A host with an updater and no node row is
+/// revoked by the same call, and its id is not burned.
+#[test]
+fn revoking_a_host_ends_its_updater_renewals() {
+    let env = fake();
+    make_token(&env, 1, &spec(&[Daemon], 1));
+    make_token(&env, 2, &updater_spec("host-1", HostRole::Daemon));
+    make_token(&env, 3, &updater_spec("host-2", HostRole::Daemon));
+    Req::new(1, "host-1", &[Daemon]).enroll(&env, 1).expect("node");
+    Req::new(2, "host-1", &[Updater]).enroll(&env, 2).expect("updater");
+    Req::new(3, "host-2", &[Updater]).enroll(&env, 3).expect("updater alone");
+    let now = env.now();
+    let renew = |name: &str, seed: u8| {
+        let der = b"renew csr".to_vec();
+        let key = issue(&[Updater], seed, now)[0].spki_sha256;
+        renew_txn(
+            &*env.store,
+            &RenewRequest {
+                node_id: &node(name),
+                csrs: &[RenewCsr {
+                    role: Updater,
+                    csr_der: &der,
+                    spki_sha256: key,
+                }],
+                issued_at: now,
+            },
+            &mut || panic!("the signer ran"),
+        )
+    };
+
+    let denied = kbf_enroll_registry::revoke_node(&*env.store, &node("host-1"), "op").expect("revoked");
+    assert!(denied.len() > 2, "node and updater serials and keys are denied: {denied:?}");
+    assert_eq!(renew("host-1", 2), Err(R::NodeRevoked));
+
+    kbf_enroll_registry::revoke_node(&*env.store, &node("host-2"), "op").expect("updater alone");
+    assert_eq!(renew("host-2", 3), Err(R::NodeRevoked));
+    assert!(
+        !deny_rows(&*env.store).unwrap().iter().any(|d| d.entry.to_string() == "node host-2"),
+        "an updater-only revoke burns no node id"
+    );
+    assert!(matches!(
+        kbf_enroll_registry::revoke_node(&*env.store, &node("host-9"), "op"),
+        Err(RegistryError::NotFound)
+    ));
+}

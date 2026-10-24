@@ -225,6 +225,14 @@ kbf-updater enroll --frontend <dns name>:<port> --node-id ID --token-file FILE -
    doubling to an hour, and logs an error when less than a day is left. A host whose certificate
    lapsed during an outage recovers by itself, for as long as the host is not replaced.
 
+Revoking the host by its id (`POST /v1/enroll/nodes/{id}/revoke`) revokes its updater row too, so the
+renewal is refused and the certificate runs out at its end. The proxy does not read the deny list,
+so a certificate already issued keeps its three own-node calls (drain, uncordon, status) until it
+expires: seven days by default, thirty at most. A host re-enrolled with a `replace` token stops
+the old key from renewing in the same way and does not cut off a certificate already issued.
+The `deadline_secs` of a self-drain is whatever the host sends; it only moves that host's own
+drain deadline.
+
 The CA's key is the frontend's alone; the coordinator holds none. The units in
 `packaging/host-agent` use this layout ([its README](../../packaging/host-agent/README.md)).
 
