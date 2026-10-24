@@ -429,7 +429,10 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - run: rustup toolchain install
-      # Built before the verb asks for a token, so no build script runs beside one.
+      # The token service's address and key are in the environment of every step of this job, the
+      # build's scripts included: the build runs from the locked dependency set, and the
+      # coordinator's allow-list (this workflow, on main, for `release`) and the hosts' own
+      # signature and hash checks bound what a token can do.
       - run: cargo build -p xtask --locked
       # The version is the release's; the minimums default to 1 and are the farm's to raise.
       - name: Set this release as the farm's desired version, and wait for the farm to converge

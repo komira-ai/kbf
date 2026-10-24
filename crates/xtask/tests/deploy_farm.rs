@@ -32,6 +32,8 @@ struct Script {
     reads: Vec<Result<Value, u16>>,
     /// The status of `POST /v1/desired`.
     post: u16,
+    /// How many of the first POSTs answer 503 before `post` is used.
+    post_503s: usize,
     /// The status of the runner's token service.
     token: u16,
     /// What the token service answers instead of a token, as bytes.
@@ -43,6 +45,7 @@ impl Script {
         Self {
             reads,
             post: 200,
+            post_503s: 0,
             token: 200,
             token_answer: None,
         }
@@ -157,6 +160,7 @@ fn serve(script: Script) -> Fake {
     let log = Arc::clone(&seen);
     let tokens = AtomicUsize::new(0);
     let reads = AtomicUsize::new(0);
+    let posts = AtomicUsize::new(0);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let conn = rustls::ServerConnection::new(Arc::clone(&config)).expect("conn");
@@ -182,13 +186,20 @@ fn serve(script: Script) -> Fake {
             } else if !request.authorization.starts_with("Bearer tok-") {
                 response(401, r#"{"error":"unauthorized"}"#)
             } else if request.method == "POST" {
-                response(script.post, "{}")
+                if posts.fetch_add(1, Ordering::SeqCst) < script.post_503s {
+                    response(503, "{}")
+                } else {
+                    response(script.post, "{}")
+                }
+            } else if request.path == "/v1/elsewhere" {
+                response(200, &farm("converged", 0, 0).to_string())
             } else {
                 let at = reads
                     .fetch_add(1, Ordering::SeqCst)
                     .min(script.reads.len() - 1);
                 match &script.reads[at] {
                     Ok(body) => response(200, &body.to_string()),
+                    Err(302) => b"HTTP/1.1 302 X\r\nLocation: /v1/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
                     Err(status) => response(*status, "{}"),
                 }
             };
@@ -373,6 +384,70 @@ fn a_refused_post_reads_nothing() {
         ),
         "{result:?}"
     );
+}
+
+#[test]
+fn a_post_the_coordinator_could_not_serve_is_tried_again_and_a_final_one_is_not() {
+    // Proves: a 503 on the POST (the coordinator could not reach the token issuer) is
+    // reported and tried again, and the deploy goes on to converged; a 503 that never ends
+    // fails after a few tries, not at once and not forever.
+    let mut script = Script::new(vec![Ok(farm("converged", 0, 0))]);
+    script.post_503s = 2;
+    let fake = serve(script);
+    let (result, out) = run(&fake, &fake.plan());
+    assert_eq!(result, Ok(()), "{out}");
+    assert_eq!(fake.requests("/v1/desired").len(), 3);
+    assert!(out.contains("the POST failed, trying again"), "{out}");
+    let mut script = Script::new(vec![Ok(farm("converged", 0, 0))]);
+    script.post_503s = 100;
+    let down = serve(script);
+    let (result, _) = run(&down, &down.plan());
+    assert!(matches!(result, Err(Error::Call { .. })), "{result:?}");
+    assert_eq!(down.requests("/v1/desired").len(), 4);
+    assert!(down.requests("/v1/convergence").is_empty());
+}
+
+#[test]
+fn a_convergence_on_another_version_is_not_this_deploys() {
+    // Proves: when the coordinator's desired version is not the one this deploy posted
+    // (another writer replaced it), a `converged` answer ends the deploy as an error naming
+    // the other version, and so does an in-progress one.
+    for state in ["converged", "in_progress"] {
+        let mut other = farm(state, 0, 0);
+        other["desired"] = json!("3.0");
+        let fake = serve(Script::new(vec![Ok(other)]));
+        let (result, _) = run(&fake, &fake.plan());
+        assert_eq!(result, Err(Error::Superseded("3.0".to_owned())));
+        assert_eq!(fake.requests("/v1/convergence").len(), 1);
+    }
+}
+
+#[test]
+fn what_the_coordinator_prints_cannot_start_a_workflow_command() {
+    // Proves: a version or role that starts with `::` or holds a line break reaches the log
+    // as one plain line, so no line of the table is a workflow command.
+    let mut hostile = farm("converged", 0, 0);
+    hostile["desired"] = json!("2.0");
+    hostile["roles"][0]["role"] = json!("::error::boom\n::add-mask::x");
+    let fake = serve(Script::new(vec![Ok(hostile)]));
+    let (result, out) = run(&fake, &fake.plan());
+    assert_eq!(result, Ok(()), "{out}");
+    assert!(out.contains("error::boom::add-mask::x"), "{out}");
+    let masks = out.lines().filter(|l| l.starts_with("::")).count();
+    assert_eq!(masks, 2, "only the client's own masks: {out}");
+    assert!(!out.lines().any(|l| l.starts_with("::error")), "{out}");
+}
+
+#[test]
+fn a_redirect_from_the_coordinator_is_not_followed() {
+    // Proves: a 302 on the read is a failed read, never a second request to the place it
+    // names; the wait ends as a stall.
+    let fake = serve(Script::new(vec![Err(302)]));
+    let mut plan = fake.plan();
+    plan.stall = Duration::from_millis(200);
+    let (result, out) = run(&fake, &plan);
+    assert_eq!(result, Err(Error::Stalled(0)), "{out}");
+    assert!(fake.requests("/v1/elsewhere").is_empty());
 }
 
 #[test]

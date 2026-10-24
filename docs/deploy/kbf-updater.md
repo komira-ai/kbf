@@ -290,7 +290,10 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
 2. **Enroll the hosts**, so that their updaters heartbeat to the coordinator
    ([The agent mode](#the-agent-mode)). A host that does not heartbeat is `down`, and is not
    waited for; the farm is converged when every host that does heartbeat runs the release, none is
-   updating or failed, and at least the minimums (below) are up.
+   updating or failed, and at least the minimums (below) are up. **A host that went down because
+   of the release does not stop `converged`**: the step answers for the hosts that are heard from,
+   and the table's `down` column shows the rest, so read it, and raise the minimums to the number
+   of hosts the farm must keep.
 3. **Set the repository variables** (Settings, Secrets and variables, Actions, Variables):
 
    | variable | value |
@@ -305,12 +308,16 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
 
 1. posts `{"version": <the release's version>, "min_up": {...}}` to `/v1/desired` (the per-role
    limits are the coordinator's defaults), with an OIDC token for the audience that is the URL as
-   written in the variable;
+   written in the variable (the audience keeps a trailing `/` the variable has, which the URL
+   the calls go to does not, so write the variable and the allow-list's `audience` alike). A 503
+   on the POST is tried again, up to four times;
 2. reads `GET /v1/convergence` every 30 seconds, with a fresh token each time, and prints a
    table of the counts per role (`at_desired`, `updating`, `failed`, `down`);
 3. ends when the coordinator says `converged` (exit 0); `blocked` (a live host failed its update to
    this version and is still behind it); when the counts have not changed for 20 minutes
-   (`--stall-min`); when 60 minutes are up (`--deadline-min`); or when the coordinator refuses
+   (`--stall-min`; a host whose update takes longer than that leaves the counts as they are, so
+   raise the flag past the longest update); when the coordinator's desired version is no longer
+   this release's (another writer replaced it); when 60 minutes are up (`--deadline-min`); or when the coordinator refuses
    the token (401 or 403, at once: the allow-list does not match this job). Any of those but
    convergence fails the job; the release stays published whatever it says. Another failed read
    is reported and tried again, and counts as no change.
@@ -323,6 +330,9 @@ the coordinator to be past its 30 second quiet start, at least one live host, ev
 the version and none updating or failed, and `min_up` hosts of the storage and frontend roles up,
 so a coordinator that has just restarted does not report a farm it has not heard from as
 converged.
+
+The `deploy` job runs in the `release` environment, like `publish`: if the environment has
+required reviewers, a release is approved a second time before the job starts.
 
 One release at a time holds across the deploy: the workflow's group does not cancel, so a second
 release waits for the first release's deploy (at most 90 minutes) to end.

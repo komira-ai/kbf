@@ -17,7 +17,9 @@
 //! It ends with exit 0 when the coordinator says `converged`, and 1 when it says `blocked`
 //! (a host failed its update to this version), when the counts have not changed for
 //! `--stall-min` minutes, when `--deadline-min` minutes are up, or when a call is refused
-//! (401, 403) or the job has no OIDC token to ask for. The coordinator does not keep the time
+//! (401, 403), when the coordinator's desired version is no longer this release's (another
+//! writer replaced it, and a convergence on that version is not this deploy's), or the job
+//! has no OIDC token to ask for. The coordinator does not keep the time
 //! of the last change; the stall is the client's to judge. A poll that fails for any other
 //! reason is reported and tried again, and counts as no change.
 //!
@@ -40,6 +42,15 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The most bytes of any answer read.
 const MAX_ANSWER: u64 = 1 << 20;
+
+/// How many times the POST is tried when the call fails for a reason that may pass.
+const POST_ATTEMPTS: u32 = 4;
+
+/// Whether a failed call may pass: the coordinator's 503, and nothing else (a certificate it
+/// is not trusted by, or a runner without a token, does not get better).
+fn retryable(what: &str, why: &str) -> bool {
+    what == "set the desired version" && why == "status 503"
+}
 
 /// The path of the desired state, and of the convergence read.
 const DESIRED_PATH: &str = "/v1/desired";
@@ -104,6 +115,10 @@ pub enum Error {
     Answer(String),
     #[error("blocked: a host failed its update to {0}; the table above says which role")]
     Blocked(String),
+    #[error(
+        "the coordinator's desired version is {0:?}, not this release's: another writer replaced it"
+    )]
+    Superseded(String),
     #[error("the counts have not changed for {0} seconds")]
     Stalled(u64),
     #[error("the farm has not converged after {0} seconds")]
@@ -272,7 +287,22 @@ pub fn deploy(
         "version": plan.version,
         "min_up": {"storage": plan.min_up_storage, "frontend": plan.min_up_frontend},
     });
-    client.send(out, "set the desired version", DESIRED_PATH, Some(&body))?;
+    // A 503 (the coordinator could not reach the token issuer) is not a verdict: the POST is
+    // tried a few times; a refusal or another failure is final.
+    let mut attempt = 1;
+    loop {
+        match client.send(out, "set the desired version", DESIRED_PATH, Some(&body)) {
+            Err(Error::Call { what, why }) if attempt < POST_ATTEMPTS && retryable(what, &why) => {
+                log(out, &format!("the POST failed, trying again: {why}"))?;
+                attempt += 1;
+                std::thread::sleep(plan.every);
+            }
+            other => {
+                other?;
+                break;
+            }
+        }
+    }
     log(out, &format!("desired version {} set", plan.version))?;
 
     let started = Instant::now();
@@ -283,6 +313,9 @@ pub fn deploy(
             Ok(answer) => {
                 let read = Read::of(&answer)?;
                 log(out, &read.table())?;
+                if read.desired != plan.version {
+                    return Err(Error::Superseded(read.desired));
+                }
                 match read.state.as_str() {
                     "converged" => return Ok(()),
                     "blocked" => return Err(Error::Blocked(plan.version.clone())),
@@ -406,6 +439,13 @@ fn percent_encode(text: &str) -> String {
     out
 }
 
+/// `text` as one short plain line: control characters dropped, no leading `::` (the runner
+/// reads a line that starts with it as a workflow command), at most 64 characters.
+fn plain(text: &str) -> String {
+    let line: String = text.chars().filter(|c| !c.is_control()).take(64).collect();
+    line.trim_start_matches(':').to_owned()
+}
+
 /// What the coordinator said, as far as the table needs it.
 struct Read {
     state: String,
@@ -422,7 +462,7 @@ impl Read {
         for row in answer["roles"].as_array().ok_or_else(|| bad("roles"))? {
             let count = |key: &str| row[key].as_u64().ok_or_else(|| bad(key));
             roles.push((
-                row["role"].as_str().ok_or_else(|| bad("role"))?.to_owned(),
+                plain(row["role"].as_str().ok_or_else(|| bad("role"))?),
                 [
                     count("at_desired")?,
                     count("updating")?,
@@ -432,8 +472,10 @@ impl Read {
             ));
         }
         Ok(Self {
-            state: text("state").ok_or_else(|| bad("state"))?,
-            desired: text("desired").unwrap_or_else(|| "(none)".to_owned()),
+            state: text("state")
+                .map(|t| plain(&t))
+                .ok_or_else(|| bad("state"))?,
+            desired: text("desired").map_or_else(|| "(none)".to_owned(), |t| plain(&t)),
             quiet: answer["quiet"].as_bool().unwrap_or(false),
             roles,
         })
