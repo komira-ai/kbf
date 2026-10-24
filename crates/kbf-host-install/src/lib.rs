@@ -11,7 +11,8 @@
 //! `SSH_ORIGINAL_COMMAND`. (The one argument it takes anywhere is `--version`, which prints
 //! the name and the package version and runs nothing; the release checks the signed Mac
 //! binary with it. `--version` beside anything else is refused with the closed line,
-//! unaudited: that is not an sshd request and changes nothing.) Exactly two requests are accepted, matched as a whole string
+//! unaudited: that is not an sshd request and changes nothing.) Exactly three requests are
+//! accepted, matched as a whole string
 //! ([`request`]):
 //!
 //! - `install kbf=<version> from <channel>`: install that version of the `kbf` package
@@ -20,6 +21,11 @@
 //!   signed source. The process sshd starts checks the request and starts ONE transient
 //!   systemd unit an ssh drop cannot kill; the unit runs this program again, takes the install
 //!   lock and holds it for both apt steps ([`plan`], [`host`]);
+//! - `restart frontend=<name>`: restart `kbf-frontend.service` (`-`) or
+//!   `kbf-frontend@<name>.service` and wait until systemd says it is active (Linux only; no
+//!   other unit can be named). A package install restarts nothing, so the updater asks for
+//!   this after one. It holds the install lock for as long as the process runs, so a restart
+//!   and an install do not overlap;
 //! - `query`: print what is installed, what runs, which node this is and whether an install is in progress (the
 //!   install lock held, an install unit not over, or the dpkg lock held).
 //!
@@ -31,9 +37,10 @@
 //!
 //! # A Mac
 //!
-//! On macOS ([`mac`]) the same two requests install the attested release tarball into the kit
-//! layout (`/usr/local/kbf/releases/<commit>/kbf`, links `current` and `previous`) and restart
-//! the daemon's launchd job on it. The install verb checks the release on one root-owned
+//! On macOS ([`mac`]) the same `install` and `query` requests are answered (a `restart` is
+//! refused: a Mac has no frontend unit). The install puts the attested release tarball into the
+//! kit layout (`/usr/local/kbf/releases/<commit>/kbf`, links `current` and `previous`) and
+//! restarts the daemon's launchd job on it. The install verb checks the release on one root-owned
 //! copy, launches a one-shot launchd job that does the swap and the restart, and returns; the
 //! result is the `apply` field of `query` (`docs/deploy/host-install.md`). The platform picks
 //! the side; both are compiled everywhere.
@@ -75,6 +82,16 @@ pub mod contract {
             Ok(crate::request::Request::Install { version, channel }) => {
                 Some((version.as_str().to_owned(), channel.as_str().to_owned()))
             }
+            _ => None,
+        }
+    }
+
+    /// The unit of `command`, when it is a `restart` request this program accepts; `None`
+    /// for anything it would refuse and for the other requests.
+    #[must_use]
+    pub fn restart_request(command: &str) -> Option<String> {
+        match crate::request::Request::parse(command) {
+            Ok(crate::request::Request::Restart { unit }) => Some(unit.as_str().to_owned()),
             _ => None,
         }
     }

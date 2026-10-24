@@ -1,6 +1,6 @@
-//! R4, the age check on the build seq (`kbf_server::update::age`): every row of its table.
+//! R4, the age check on the build seq (`kbf_server::release::age`): every row of its table.
 
-use kbf_server::update::age::{Build, Refusal, check};
+use kbf_server::release::age::{Build, Refusal, check};
 
 /// The running build: seq 500, commit `aaaaaaaaaaaa`.
 const OWN: Build<'static> = Build {

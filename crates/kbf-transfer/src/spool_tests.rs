@@ -47,7 +47,7 @@ fn unreadable(name: &str) -> Spool {
     )
 }
 
-/// Catches a failed write that keeps its reservation (mutant: `release` not called on
+/// Catches a failed write that keeps its reservation (such as `release` not called on
 /// a failed `put`), which would make every later put of that blob a no-op answered
 /// as spooled: a `put` whose write fails is a read error naming the spool, records
 /// nothing, and leaves the digest free to be reserved again.
@@ -64,7 +64,7 @@ async fn a_failed_write_records_nothing_and_frees_the_digest() {
     assert!(spool.reserve(digest).is_some(), "the digest is free again");
 }
 
-/// Catches a failed chunk write that keeps its reservation (mutant: `release` not
+/// Catches a failed chunk write that keeps its reservation (such as `release` not
 /// called when `write_chunks` fails): the chunks of a blob whose write fails are a
 /// read error, nothing is recorded, and the digest is free again.
 #[tokio::test]
@@ -85,7 +85,7 @@ async fn failed_chunk_writes_record_nothing_and_free_the_digest() {
 }
 
 /// Catches a spool read failure answered as a missing blob, which the caller would
-/// fetch or upload elsewhere instead of failing (mutant: `get` maps the read error to
+/// fetch or upload elsewhere instead of failing (such as `get` maps the read error to
 /// `Missing`): a blob put into a spool whose file cannot be read is UNAVAILABLE from
 /// `get`, and the record's read fails.
 #[tokio::test]
@@ -105,7 +105,7 @@ async fn a_spool_that_cannot_be_read_is_an_error_not_a_missing_blob() {
     record.read(0, size).await.expect_err("the read fails");
 }
 
-/// Catches chunks accepted under a digest the spool cannot index (mutant: the parse
+/// Catches chunks accepted under a digest the spool cannot index (such as the parse
 /// check dropped, so a blob is stored under no digest): chunks offered for a digest
 /// that is not SHA-256 are refused as corrupt before anything is reserved.
 #[tokio::test]

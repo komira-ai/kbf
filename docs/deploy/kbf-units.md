@@ -182,7 +182,8 @@ because it learns a node's boot only when the node registers, after the frontend
 
 The frontend's state store is Postgres (ruling: SQLite is dropped for it). The frontend
 gets `--state-store`, a `postgres://` URI, from `kbf.toml` (`kbf-installer setup` writes it,
-as `postgres:///kbf?host=/run/postgresql&user=kbf-server`), and it has no default: a
+as `postgres:///kbf?host=/run/postgresql&user=kbf-server` unless `--database` gives another,
+and makes that role and database on the host), and it has no default: a
 frontend given none exits 2 naming the flag, and `kbf --mode=frontend --check`, which the
 unit runs before the start, exits 2 the same way. (`all-in-one` alone has a default, the
 host's socket, `postgres:///kbf?host=/run/postgresql`.) A `sqlite://` URI still starts in

@@ -330,15 +330,15 @@ fn seen(runtime: &Runtime, log: &Log, digest: Digest) -> BlobAnswer {
 }
 
 /// Catches (red before group commit: the proposals never got past the first, which
-/// waited under the log's lock for the held sync; mutants "one proposal per sync" and
+/// waited under the log's lock for the held sync; defects "one proposal per sync" and
 /// "one persist per entry in a batch": the second sync then holds one proposal and the
-/// rest wait for a third; mutant "answer before the sync": the proposals answer while
-/// their sync is held; mutant "replies zipped in reverse": a caller gets another
+/// rest wait for a third; defect "answer before the sync": the proposals answer while
+/// their sync is held; defect "replies zipped in reverse": a caller gets another
 /// entry's outcome, an epoch for a blob or a blob for an epoch): N proposals of two
 /// kinds that arrive while a sync is held are written and
 /// synced together, so the first sync and one more make every one durable, none
 /// answers before that second sync, and none is visible to a query until it has. (The
-/// store syncs inside each write, so applying before the sync is not a mutant this
+/// store syncs inside each write, so applying before the sync is not a defect this
 /// layer can make.) Each caller gets the outcome of its own command. The first sync may
 /// be a tick's rather than the first proposal's; the proposals then share the second
 /// with it, which the test allows.
@@ -386,7 +386,7 @@ fn proposals_made_during_a_sync_share_the_next_sync_and_answer_after_it() {
     }
 }
 
-/// Catches (mutant "answer before the sync": the batch answers with outcomes it then
+/// Catches (defect "answer before the sync": the batch answers with outcomes it then
 /// fails to make durable): the process dies in the sync of a batch. Every proposal of
 /// the batch is answered, none with an outcome, and after a power cut none of them is
 /// in the log.
@@ -437,7 +437,7 @@ fn a_crash_in_a_batch_sync_answers_none_of_it_and_loses_all_of_it() {
     }
 }
 
-/// Catches (mutant "a committer stops guarding the queue once it has taken its batch":
+/// Catches (defect "a committer stops guarding the queue once it has taken its batch":
 /// the first half's arrival starts a second committer, which takes that half alone
 /// while the first committer is still in its sync, so the second half waits for a
 /// sync of its own, which the gate holds): proposals that arrive at two moments of one
@@ -475,7 +475,7 @@ fn proposals_made_at_two_moments_of_a_sync_share_the_next_sync() {
     assert!(matches!(first, Ok(Applied::Blob(Ok(_)))), "{first:?}");
 }
 
-/// Catches (mutant "a panic in a commit is not caught": the committer dies with its
+/// Catches (defect "a panic in a commit is not caught": the committer dies with its
 /// queue marked as being committed, so no later command starts one and every later
 /// commit, ticks included, waits forever): a sync that panics answers its batch
 /// `Unavailable`, and a commit made after it is still answered (refused: the panic
@@ -526,7 +526,7 @@ fn a_panic_in_a_batch_sync_answers_it_unavailable_and_later_commits_still_answer
     );
 }
 
-/// Catches (mutant "a tick takes its own sync": the tick is proposed as a batch of
+/// Catches (defect "a tick takes its own sync": the tick is proposed as a batch of
 /// its own, so after the held sync the burst and the tick need a sync each, and the
 /// second of them waits on a third sync, which the gate holds): a `Tick` proposed
 /// while a burst of `PutBlobs` waits on a held sync joins the burst's batch. After

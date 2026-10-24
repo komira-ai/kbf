@@ -39,18 +39,22 @@ pub struct SetupArgs {
     /// kbf reads. For the modes that enroll.
     #[arg(long)]
     pub token_file: Option<String>,
-    /// The state database, as postgres:///NAME?host=SOCKET_DIR&user=ROLE (no password).
-    /// Required for `frontend` and `all-in-one`: written to installer.toml and, as
-    /// `state-store`, to kbf.toml, and setup creates (or brings forward) its schema. The
-    /// server exists before setup runs, and so do the role and the database unless
+    /// The state database, as postgres:///NAME?host=SOCKET_DIR&user=ROLE (no password), for
+    /// `frontend` and `all-in-one`: written to installer.toml and, as `state-store`, to kbf.toml,
+    /// and setup creates (or brings forward) its schema. Left out, it is
+    /// postgres:///kbf?host=/run/postgresql&user=kbf-server on this host's own Postgres server,
+    /// and setup creates the role and the database as if --create-local-database were given.
+    /// Given, the server exists before setup runs, and so do the role and the database unless
     /// --create-local-database makes them.
     #[arg(long)]
     pub database: Option<String>,
-    /// For a host whose Postgres runs locally: create the login role and the database the
-    /// `--database` URL names (owned by the role, no password), as the server's superuser over
-    /// its Unix socket (peer authentication, no password), if they are not there. Never
-    /// edits `pg_hba.conf`; refuses, saying which rule to add, when the server does not admit
-    /// the login. Without it, setup only checks that it can log in.
+    /// Create the login role and the database the `--database` URL names (owned by the role,
+    /// no password), on a host whose Postgres runs locally, as the server's superuser over its
+    /// Unix socket (peer authentication, no password), if they are not there. `frontend` and
+    /// `all-in-one` do this whenever --database is left out, so the flag only matters beside
+    /// --database. Never edits `pg_hba.conf`; prints the rules the logins need, and refuses,
+    /// saying which rule to add, when the server does not admit a login. With --database and
+    /// without this flag, setup only checks that it can log in.
     #[arg(long)]
     pub create_local_database: bool,
     /// Enable the units without starting them.

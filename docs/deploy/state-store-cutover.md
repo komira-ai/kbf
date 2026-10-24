@@ -142,6 +142,53 @@ clients must send them again. After a rollback the Postgres store still holds th
 cut over again, drop its schema and set it up again first, because the copy refuses a store
 that holds data.
 
+## Moving to frontends that share the store
+
+A frontend of this release that opens a Postgres store takes no writer generation. It makes
+sure the store's `meta/generation` row holds the marker `shared-writers` instead, and any
+number of frontends can then open the same database and serve at once: none fences another.
+A frontend of an earlier release took the next generation at every start and checked it on
+every write, so a second one over the same database stopped the first.
+
+**This is a cold cutover, and it happens at the first start of this release on a database.**
+The marker is written once, by whichever frontend opens first; frontends that open together
+agree (the write is conditional on the row they read), and a store that already holds the
+marker is left as it is. Do it in this order:
+
+1. **Stop every frontend of an earlier release that uses the database**: each `kbf frontend`
+   and `kbf all-in-one` unit, and any process started with `--admin-listen` (a candidate
+   waiting for a takeover included). Check that each unit says `inactive`.
+2. **Back up the database** (the `kbf_state` schema). The marker is not undone by going back to
+   an earlier binary: see "If a frontend of an earlier release is started" below. The backup
+   is the way back.
+3. **Start the first frontend of this release.** Its open replaces the generation row (an
+   8-byte number, or no row on a new database; a database copied by `kbf-state-copy` carries
+   the SQLite file's number) with the marker. The epoch is not touched, so the daemons that
+   reconnect keep the leases they hold.
+4. **Start the others.** They find the marker and write nothing to the row.
+
+**If a frontend of an earlier release is started after the marker is written**, it does not
+start: it reads the row as `the generation row is not an 8-byte number` and exits. One that is
+still running when the marker is written is refused by the store at its next write
+(`state store fenced`) and stops serving; this is why step 1 comes first, so that no build is
+cut short by it. To go back to an earlier release, restore the backup of step 2 (the writes
+made since are lost, as after a rollback above).
+
+The admin port's `takeover` of a store that holds the marker is refused, for the row is not a
+generation to expect, and so is `quiesce`, for nothing could take over from the process (it
+keeps scheduling). `GET /v1/admin/role` answers `null` for `generation` and
+`held_generation`. A frontend of this release does not hand a generation over because it
+holds none.
+
+**The proxy's slot supervision does not work over a Postgres store.** It starts every child
+as a candidate (`--await-takeover`) and then calls `takeover`, to start a frontend at boot or
+to swap one in for another. On a store that holds the marker that call is refused, so the
+child is never brought up and a swap fails before it stops the old one. Run a frontend over a
+Postgres store under its own unit, without `--await-takeover`, and start and stop it there.
+
+A SQLite state file is held by one process and keeps its generation until it is moved to
+Postgres.
+
 ## What the cutover does, and what it refuses
 
 In order, so that every step that can refuse or fail comes before anything is changed:

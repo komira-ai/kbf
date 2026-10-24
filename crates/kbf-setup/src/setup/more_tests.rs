@@ -38,7 +38,7 @@ fn frontend_with(server: &Server, options: Options) -> (FakeExec, Result<String,
 /// the frontend starts with); the schema is created once, after `installer.toml` and before
 /// `kbf.toml` and any unit, and the output says so.
 ///
-/// Mutants to plant: the key left out of either file; the schema step moved after `kbf.toml`;
+/// Catches: the key left out of either file; the schema step moved after `kbf.toml`;
 /// the step run twice.
 #[test]
 fn the_database_goes_to_both_files_and_its_schema_is_made_between_them() {
@@ -67,7 +67,7 @@ fn the_database_goes_to_both_files_and_its_schema_is_made_between_them() {
 /// Catches a dry run that writes a schema or hides what it would do: it only asks the server
 /// (`plan`), says what `--apply` would do, and changes nothing on the host.
 ///
-/// Mutants to plant: `apply` passed true to the step.
+/// Catches: `apply` passed true to the step.
 #[test]
 fn a_dry_run_asks_the_server_and_changes_nothing() {
     let server = Server::fresh();
@@ -100,7 +100,7 @@ fn a_dry_run_asks_the_server_and_changes_nothing() {
 /// it needs) and before any release, `kbf.toml` or unit; and a host that keeps no state in
 /// Postgres never asks a server.
 ///
-/// Mutants to plant: the step's error ignored.
+/// Catches: the step's error ignored.
 #[test]
 fn an_unreachable_database_stops_before_the_config_and_the_units() {
     let server = Server {
@@ -136,7 +136,7 @@ fn an_unreachable_database_stops_before_the_config_and_the_units() {
 /// finish it (the files already written are not rewritten), and a third run has nothing to do
 /// but report the schema as current.
 ///
-/// Mutants to plant: the settings file rewritten on every run.
+/// Catches: the settings file rewritten on every run.
 #[test]
 fn a_run_that_stopped_at_the_database_is_finished_by_running_again() {
     let down = Server {
@@ -179,22 +179,25 @@ fn a_run_that_stopped_at_the_database_is_finished_by_running_again() {
     assert!(out.contains("\nnothing to do\n"), "{out}");
 }
 
-/// Catches a database flag that is accepted where it must not be: it is required of the two
-/// modes that keep state in Postgres and refused of the others; a password (the file is
-/// world-readable), another scheme or a character a TOML string would escape is refused; and
-/// the message never quotes the URL.
-///
-/// Mutants to plant: the password check removed; the mode check removed.
+/// Asserts that a database flag is accepted only where it means something: the two modes that
+/// keep state in Postgres take the local default when it is left out (the database `kbf` on the
+/// local socket, as the account the frontend runs as, marked as defaulted) and a given URL is
+/// not marked; the other modes refuse the flag; a password (the file is world-readable),
+/// another scheme or a character a TOML string would escape is refused; and the message never
+/// quotes the URL.
 #[test]
-fn the_database_flag_is_required_where_there_is_state_and_refused_with_a_password() {
+fn the_database_flag_defaults_where_there_is_state_and_is_refused_with_a_password() {
     for mode in [Mode::Frontend, Mode::AllInOne] {
         let mut r = raw(mode);
+        let given = r.validate(Platform::Linux).expect("given");
+        assert_eq!(given.database.as_deref(), Some(DATABASE));
+        assert!(!given.database_defaulted);
+        assert!(given.local_database.is_none());
         r.database = None;
-        let why = r
-            .validate(Platform::Linux)
-            .expect_err("required")
-            .join("; ");
-        assert!(why.contains("--database is required"), "{why}");
+        let left_out = r.validate(Platform::Linux).expect("the local default");
+        assert_eq!(left_out.database.as_deref(), Some(DATABASE));
+        assert!(left_out.database_defaulted);
+        assert!(left_out.local_database.is_some());
     }
     let mut r = raw(Mode::Daemon);
     r.database = Some(DATABASE.to_owned());
@@ -245,7 +248,7 @@ fn setup_writes_the_installer_toml_the_unit_reads() {
 /// fix. A link (what `systemctl link` makes), another mode's file, and no file are not
 /// refused.
 ///
-/// Mutants to plant: the check dropped; the check refusing a link; the check refusing another mode's file; the check after
+/// Catches: the check dropped; the check refusing a link; the check refusing another mode's file; the check after
 /// the first plan is applied.
 #[test]
 fn a_regular_file_shadowing_the_packaged_unit_stops_setup_before_any_step() {
@@ -461,7 +464,7 @@ fn a_failure_at_any_step_is_finished_by_running_again() {
 /// the operator which line is wrong and never repeats it. The same holds for the line that
 /// `kbf.toml` refuses over: the database URL in it is not printed.
 ///
-/// Mutants to plant: `Syntax` carrying `e.to_string()` again; the `state-store` value back in
+/// Catches: `Syntax` carrying `e.to_string()` again; the `state-store` value back in
 /// the refusal of a differing `kbf.toml`.
 #[test]
 fn an_error_about_a_file_never_repeats_the_database_url() {
@@ -508,7 +511,7 @@ fn an_error_about_a_file_never_repeats_the_database_url() {
 /// state-store URL typed unquoted, with its password), and `database.rs` carrying the parser's
 /// text for a file that is not TOML.
 ///
-/// Mutants to plant: `redact` left out of the `kbf.toml` refusal (`e` printed); the toml text in
+/// Catches: `redact` left out of the `kbf.toml` refusal (`e` printed); the toml text in
 /// `DatabaseError::NotToml`.
 #[test]
 fn an_invalid_config_file_is_refused_without_its_text() {
@@ -620,7 +623,7 @@ fn the_launchd_gate_is_the_installer_toml_setup_writes_on_a_mac() {
 /// each file sits directly in its platform's `config_dir`, which is `/etc/kbf` on Linux and
 /// `/usr/local/etc/kbf` on macOS, and the `Layout` paths are the `Platform` ones.
 ///
-/// Mutants seen red: the Mac `config_dir` and the Mac `api_token` each set to the Linux path.
+/// Catches: the Mac `config_dir` and the Mac `api_token` each set to the Linux path.
 #[test]
 fn every_config_path_lies_in_its_platforms_config_dir() {
     for (platform, dir) in [

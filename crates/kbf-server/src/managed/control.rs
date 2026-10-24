@@ -20,7 +20,7 @@ use super::candidate::Candidate;
 use crate::farm::FOLLOW_EVERY;
 use crate::frontend::{FrontendFlags, FrontendHandle};
 use crate::handover::{Stand, Stop};
-use crate::state_store::generation_of;
+use crate::state_store::{generation_of, holds_no_generation};
 
 /// The version of the calls and of the `role` answer, which a proxy checks against
 /// `kbf --version --json`. Raised when a call or a field changes meaning.
@@ -54,7 +54,8 @@ pub struct RoleView {
     /// The generation the state store is at now, if it can be read: what a takeover
     /// passes as `expect`.
     pub generation: Option<u64>,
-    /// The generation this process took; none for a candidate.
+    /// The generation this process took; none for a candidate and for a process over a
+    /// store the frontends share, which holds no generation.
     pub held_generation: Option<u64>,
     /// The store has refused a write of this process because another writer holds it.
     pub superseded: bool,
@@ -88,8 +89,9 @@ pub(crate) type Handoff = oneshot::Sender<Result<Box<FrontendHandle>, String>>;
 
 struct Running {
     stand: Stand,
-    /// The generation this process took.
-    held: u64,
+    /// The generation this process took; none when the store is shared by frontends and
+    /// holds no generation.
+    held: Option<u64>,
 }
 
 struct Inner {
@@ -147,7 +149,7 @@ impl Control {
     }
 
     /// This process serves as the writer, through `handle`: it holds the generation the
-    /// store is at.
+    /// store is at, or none when the store is shared by frontends.
     pub(crate) fn set_running(&self, handle: &FrontendHandle) {
         let mut inner = self.inner();
         inner.role = Role::Active;
@@ -158,7 +160,11 @@ impl Control {
             watch(Arc::clone(&stand.farm), Arc::clone(&self.following));
             // A store that cannot be read now is a held generation of 0, which no store
             // is at: a resume is refused.
-            let held = generation_of(stand.store.as_ref()).unwrap_or(0);
+            let held = if holds_no_generation(stand.store.as_ref()) {
+                None
+            } else {
+                Some(generation_of(stand.store.as_ref()).unwrap_or(0))
+            };
             Running { stand, held }
         });
     }
@@ -170,7 +176,7 @@ impl Control {
         let candidate = inner.candidate.as_ref();
         let (held, generation, farm) = match &inner.running {
             Some(run) => (
-                Some(run.held),
+                run.held,
                 generation_of(run.stand.store.as_ref()).ok(),
                 Some(Arc::clone(&run.stand.farm)),
             ),
@@ -200,7 +206,7 @@ impl Control {
     }
 
     /// The running state, if the role is one of `roles`.
-    fn running_in(&self, roles: &[Role]) -> Option<(Role, Stand, u64)> {
+    fn running_in(&self, roles: &[Role]) -> Option<(Role, Stand, Option<u64>)> {
         let inner = self.inner();
         let run = inner.running.as_ref()?;
         roles
@@ -221,11 +227,18 @@ impl Control {
     ///
     /// # Errors
     /// [`Refusal::Role`]: this process is a candidate or stood down.
+    /// [`Refusal::Generation`]: the store is shared by frontends and holds no generation,
+    /// so nothing could take over from this process; nothing is stopped.
     pub async fn quiesce(&self) -> Result<RoleView, Refusal> {
         let _moving = self.moving.lock().await;
-        let Some((role, stand, _)) = self.running_in(&[Role::Active, Role::Quiesced]) else {
+        let Some((role, stand, held)) = self.running_in(&[Role::Active, Role::Quiesced]) else {
             return Err(self.wrong("active or quiesced"));
         };
+        if held.is_none() {
+            return Err(Refusal::Generation(
+                "this store holds no generation: nothing can take over".to_owned(),
+            ));
+        }
         if role == Role::Active {
             stand.quiesce().await;
             self.set_role(Role::Quiesced);
@@ -251,6 +264,9 @@ impl Control {
         // process are then refused (`Fenced`), the farm notes it, and `watch` fences it
         // again and follows the new writer's rows, so the process ends up stood down in
         // effect even though this call answered 200.
+        // A process is quiesced only over a store with a generation (`quiesce` refuses the
+        // other), so `held` is there.
+        let held = held.unwrap_or_default();
         if role == Role::Quiesced {
             let now = generation_of(stand.store.as_ref()).map_err(Refusal::failed)?;
             if now != held {

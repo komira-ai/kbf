@@ -1,11 +1,11 @@
 //! R4's second input: the build `seq` of a release in the store, and the check that puts it
 //! beside the running build's (`docs/design/frontend-proxy.md`, rule R4; the decision itself
-//! is [`crate::update::age::check`]).
+//! is [`crate::release::age::check`]).
 //!
 //! The store does not record a release's `seq` yet (its `kbf --version --json` is kept per
 //! commit and platform by a later change), so the lookup is a seam, [`SeqLookup`], with three
 //! answers ([`TargetSeq`]). [`ReleaseStore`] answers [`TargetSeq::NotRecorded`] for every
-//! commit, under which R4 does not apply and `POST /v1/update/desired` behaves as it did.
+//! commit, under which R4 does not apply.
 //! When the store records `seq`, it answers [`TargetSeq::Seq`], or [`TargetSeq::Missing`] for
 //! a release stored before; only its [`SeqLookup`] changes.
 
@@ -18,7 +18,7 @@ use futures::future::BoxFuture;
 
 use super::key::Commit;
 use super::store::ReleaseStore;
-use crate::update::age::{self, Build, Refusal};
+use crate::release::age::{self, Build, Refusal};
 
 /// What a [`SeqLookup`] knows of a commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,8 +103,8 @@ impl AgeCheck {
         Self::new(crate::BUILD_SEQ, commit, lookup)
     }
 
-    /// Whether `commit` may be offered as the desired release. The running build's own commit
-    /// always may (the proxy's step-9 post names it); any other is compared by `seq`.
+    /// Whether `commit` may be offered as a release to move to. The running build's own
+    /// commit always may; any other is compared by `seq`.
     ///
     /// # Errors
     /// The io error of the lookup; `Ok(Err(_))` is a refusal.

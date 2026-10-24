@@ -342,7 +342,7 @@ async fn execute(reapi: tonic::transport::Channel, action: Digest) -> ActionResu
 /// Catches blob bytes crossing the frontend in map mode. The input (1 MiB) is fetched
 /// from the owner and the output (512 KiB) stored at it, so the daemon's CAS connection
 /// to the frontend is never made, and the session between them, which carries the lease
-/// and its result, carries far less than one blob. Mutant: the plane always on the
+/// and its result, carries far less than one blob. Catches: the plane always on the
 /// frontend's side (the map ignored) puts the blobs on the CAS connection and fails here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn with_a_map_the_frontend_carries_no_blob_bytes() {

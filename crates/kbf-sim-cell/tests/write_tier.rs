@@ -123,8 +123,8 @@ const DOWNS: [Down; 3] = [
 /// 21), each under a kill and power cuts keeping none and all of the unsynced bytes
 /// and names: what each next start does with the cut block, and every property.
 ///
-/// Catches an ack before `fdatasync` (mutant "sync skips the `fdatasync`") and before
-/// the block's name is synced (mutant "no `sync_dir`"): a power cut after the ack
+/// Catches an ack before `fdatasync` (defect "sync skips the `fdatasync`") and before
+/// the block's name is synced (defect "no `sync_dir`"): a power cut after the ack
 /// loses the block (property 8); a start without the orphan sweep (property 12, and
 /// the `AfterSync` and `BeforeRename` rows); a start that keeps bytes past the
 /// committed length (12); recovered unsealed blocks never sealed (13); and the rename
@@ -165,7 +165,7 @@ fn window(kind: Kind, seed: u64) -> (FarmTime, FarmTime) {
 /// budget is reached writes take the direct path, which the store refuses
 /// (backpressure, never loss); the backlog drains once the store is back.
 ///
-/// Catches a budget that is not enforced (mutant "`check_budget` admits anything":
+/// Catches a budget that is not enforced (defect "`check_budget` admits anything":
 /// property 11), an ack inside the outage that the tier did not stage (a direct ack
 /// with no store), and an outage the tier never filled (a test that proves nothing).
 #[test]
@@ -202,11 +202,11 @@ fn a_store_outage_fills_the_tier_then_pushes_back() {
 /// 14's read error): a write that met it is not acknowledged from the tier and goes
 /// direct; a flush whose re-read failed is retried; nothing is lost.
 ///
-/// Catches a write error swallowed (mutant "`write` answers `Ok` when the disk
+/// Catches a write error swallowed (defect "`write` answers `Ok` when the disk
 /// refused": the range is synced and acknowledged without its bytes, property 8),
 /// and faults that never met a write or a flush (a test that proves nothing). Even
 /// seeds plant `ENOSPC` and odd seeds I/O errors; each half is counted on its own,
-/// so a full disk that never fires (verifier mutant "`Fault::NoSpace` fails
+/// so a full disk that never fires (verifier defect "`Fault::NoSpace` fails
 /// nothing") goes red even while the I/O errors still meet writes.
 #[test]
 fn a_full_disk_sends_writes_direct_and_loses_nothing() {
@@ -232,7 +232,7 @@ fn a_full_disk_sends_writes_direct_and_loses_nothing() {
 /// and `fetch_answer` do), the object is marked corrupt and never PUT, its blobs
 /// answer unavailable (never absent), and no read serves the damaged bytes.
 ///
-/// Catches a flusher that uploads without checking the records (mutant "the check
+/// Catches a flusher that uploads without checking the records (defect "the check
 /// passes every record": the damaged object reaches the store), a bad sector that
 /// never landed in a block (a test that proves nothing), and a read that marks an
 /// object whose block stays open (`kbf-front` before `WriteTier::close`: the next
@@ -262,7 +262,7 @@ fn a_bad_block_is_marked_corrupt_and_never_flushed() {
 /// are evicted, reads that found the copy gone fall back to the store, and no read of
 /// a present blob comes back empty.
 ///
-/// Catches eviction of a block whose only copy is local (mutant "`make_room` evicts
+/// Catches eviction of a block whose only copy is local (defect "`make_room` evicts
 /// staged blocks too": the read finds the bytes nowhere, properties 8 and 9), and a
 /// race the runs never met.
 #[test]

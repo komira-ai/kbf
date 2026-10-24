@@ -398,7 +398,7 @@ fn every_malformed_profile_is_refused() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Catches: an unknown key ignored instead of refused (the script's mutant "an unknown
+/// Catches: an unknown key ignored instead of refused (the script's defect "an unknown
 /// key is ignored").
 #[test]
 fn an_unknown_key_is_refused() {
@@ -412,7 +412,7 @@ fn an_unknown_key_is_refused() {
 }
 
 /// Catches: a repeated key accepted, so a later line silently wins (the script's
-/// mutant "a duplicate key is accepted").
+/// defect "a duplicate key is accepted").
 #[test]
 fn a_repeated_key_is_refused() {
     assert_eq!(
@@ -424,7 +424,7 @@ fn a_repeated_key_is_refused() {
     );
 }
 
-/// Catches: a profile without one of its keys accepted (the script's mutant "a missing
+/// Catches: a profile without one of its keys accepted (the script's defect "a missing
 /// key is accepted"): every required key, one at a time.
 #[test]
 fn each_missing_required_key_is_refused() {
@@ -437,7 +437,7 @@ fn each_missing_required_key_is_refused() {
     }
 }
 
-/// Catches: a value allowed any character (the script's mutant "any character in a
+/// Catches: a value allowed any character (the script's defect "any character in a
 /// value"), so `$(...)`, backquotes or `;` reach a program's arguments.
 #[test]
 fn a_value_outside_the_character_set_is_refused() {
@@ -517,7 +517,7 @@ fn print_shows_no_node_label() {
     assert!(printed.contains("profile_sha256="), "{printed}");
 }
 
-/// Catches: a key allowed a space (the script's mutant "a key may hold a space"),
+/// Catches: a key allowed a space (the script's defect "a key may hold a space"),
 /// which in the script matched two adjacent known keys at once.
 #[test]
 fn a_key_with_a_space_or_capital_is_refused() {
@@ -534,7 +534,7 @@ fn a_key_with_a_space_or_capital_is_refused() {
 }
 
 /// Catches: the node name scheme loosened to allow upper case and spaces (the script's
-/// mutant "the name scheme accepts upper case and spaces").
+/// defect "the name scheme accepts upper case and spaces").
 #[test]
 fn a_hostname_outside_the_scheme_is_refused() {
     for name in ["Kbf-Mac-07", "kbf mac 07", "kbf-07", "kbf-mac-x"] {
@@ -545,7 +545,7 @@ fn a_hostname_outside_the_scheme_is_refused() {
     }
 }
 
-/// Catches: a role id of 500 or more accepted (the script's mutant), which is not a
+/// Catches: a role id of 500 or more accepted (the script's defect), which is not a
 /// hidden role account's id.
 #[test]
 fn a_role_id_of_500_or_more_is_refused() {
@@ -562,7 +562,7 @@ fn a_role_id_of_500_or_more_is_refused() {
 }
 
 /// Catches: an expectation allowed to name an Xcode the profile does not pin (the
-/// script's mutant "an expectation may name an unpinned Xcode").
+/// script's defect "an expectation may name an unpinned Xcode").
 #[test]
 fn an_expectation_of_an_unpinned_xcode_is_refused() {
     let text = edited(append("expect_probe=host_identity:19A000=x"));

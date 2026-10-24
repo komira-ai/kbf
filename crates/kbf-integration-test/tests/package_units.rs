@@ -7,9 +7,9 @@
 //! kbf package, which runs `/usr/bin/kbf`), gated on `/etc/kbf/kbf.toml`
 //! (`ConditionPathExists=`), on `kbf boot-check --mode=<mode>` and on `kbf --mode=<mode> --check`
 //! (both `ExecStartPre=`; `ExecCondition=` would skip a failed check silently).
-//! The rules are held here, over the unit parser (`kbf_unitfile`) the docs check uses, each with the defect it catches, and `MUTANTS`
+//! The rules are held here, over the unit parser (`kbf_unitfile`) the docs check uses, each with the defect it catches, and `DEFECTS`
 //! plants one defect per rule in a copy of the real file and requires that rule to name
-//! it. `every_rule_has_a_mutant` fails when a rule is added with no mutant, so no rule
+//! it. `every_rule_has_a_defect` fails when a rule is added with no defect, so no rule
 //! can be one that cannot fail.
 //!
 //! Catches:
@@ -841,7 +841,7 @@ fn the_kbf_modes_are_exactly_the_five() {
     want.sort_unstable();
     assert_eq!(want.len(), 5);
     assert_eq!(modes_in(&FILES), want);
-    // The mutants: a unit for a mode that does not exist, and one unit fewer.
+    // The defects: a unit for a mode that does not exist, and one unit fewer.
     let mut extra = FILES.to_vec();
     extra.push("kbf-node.service");
     assert_ne!(modes_in(&extra), want, "an extra mode unit must not pass");
@@ -873,7 +873,7 @@ fn the_installers_run_and_cache_directories_are_made_by_tmpfiles() {
 
 /// One defect per rule, planted in a copy of the real file: `(file, from, to, rule)`.
 /// `to` replaces the first `from`; the rule named must report the copy.
-const MUTANTS: &[(&str, &str, &str, &str)] = &[
+const DEFECTS: &[(&str, &str, &str, &str)] = &[
     (
         "kbf-storage.service",
         "After=network-online.target\n",
@@ -1351,22 +1351,22 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
-/// Catches a rule in `RULES` that would pass a unit with its defect: each mutant must be
+/// Catches a rule in `RULES` that would pass a unit with its defect: each defect must be
 /// reported by the rule it names, and the unmutated file by none.
 #[test]
 fn each_planted_defect_is_reported_by_its_rule() {
-    for (file, from, to, rule) in MUTANTS {
+    for (file, from, to, rule) in DEFECTS {
         let text = read(file);
         assert!(
             text.contains(from),
-            "{file}: the mutant's `{from}` is not in the file"
+            "{file}: the defect's `{from}` is not in the file"
         );
-        let mutant = text.replacen(from, to, 1);
-        assert_ne!(mutant, text);
-        let found = violations(file, &mutant);
+        let broken = text.replacen(from, to, 1);
+        assert_ne!(broken, text);
+        let found = violations(file, &broken);
         assert!(
             rules_of(&found).contains(rule),
-            "{file}: mutant `{from}` -> `{to}` was not reported by rule {rule}: {found:?}"
+            "{file}: defect `{from}` -> `{to}` was not reported by rule {rule}: {found:?}"
         );
     }
 }
@@ -1417,8 +1417,8 @@ fn a_daemon_stop_timeout_must_exceed_the_drain_deadline() {
     let text = read(name);
     let shipped = "\nTimeoutStopSec=660\n";
     assert!(text.contains(shipped));
-    let stop = |mutant: &str| {
-        violations(name, mutant)
+    let stop = |broken: &str| {
+        violations(name, broken)
             .into_iter()
             .filter(|f| f.starts_with("stop:"))
             .count()
@@ -1459,17 +1459,17 @@ fn units_that_host_the_daemon_signal_only_the_main_process_on_stop() {
     }
 }
 
-/// Catches a rule with no mutant (a check that cannot be shown to fail), and a mutant
+/// Catches a rule with no defect (a check that cannot be shown to fail), and a defect
 /// for a rule that does not exist.
 #[test]
-fn every_rule_has_a_mutant() {
+fn every_rule_has_a_defect() {
     for rule in RULES {
         assert!(
-            MUTANTS.iter().any(|m| m.3 == rule),
-            "rule {rule} has no mutant"
+            DEFECTS.iter().any(|m| m.3 == rule),
+            "rule {rule} has no defect"
         );
     }
-    for m in MUTANTS {
-        assert!(RULES.contains(&m.3), "mutant names no rule: {}", m.3);
+    for m in DEFECTS {
+        assert!(RULES.contains(&m.3), "defect names no rule: {}", m.3);
     }
 }

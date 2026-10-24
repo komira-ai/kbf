@@ -135,7 +135,7 @@ fn the_facts_are_tags_seven_to_nine_of_the_stored_row() {
 /// Catches: a fact of 0 read as absent, and an absent one read as 0 (a node that says
 /// nothing of its log would show a log at version 0, below every real version, and would
 /// count as having reported). A node that says 0, 0 and an empty commit has said so; a node
-/// that says nothing has said nothing. Mutants: a row that stores the facts as plain
+/// that says nothing has said nothing. Catches: a row that stores the facts as plain
 /// numbers (0 for none); a read that maps 0 to `None`.
 #[test]
 fn a_fact_of_zero_is_a_fact_and_a_missing_one_is_none() {
@@ -194,7 +194,7 @@ fn a_registration_replaces_the_facts() {
 /// frontend built before the tags drops them when it beats or changes a state) that never
 /// recovers. The facts of that row read `None` (and a beat that says nothing brings
 /// nothing back); the node's next heartbeat to a frontend that knows the tags brings all
-/// three back, so the hazard lasts one beat. Mutant: a heartbeat that keeps the row's facts
+/// three back, so the hazard lasts one beat. Catches: a heartbeat that keeps the row's facts
 /// without filling the ones it lacks.
 #[test]
 fn a_row_an_older_frontend_rewrote_reads_none_until_the_next_heartbeat() {

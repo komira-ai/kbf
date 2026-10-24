@@ -54,7 +54,7 @@ pub(super) async fn child_until(
     store: Arc<dyn Store>,
     stop: oneshot::Receiver<()>,
 ) -> (Child, JoinHandle<()>) {
-    let managed = Managed::start(flags, StoreSource::Shared(store), async move {
+    let managed = Managed::start(flags, StoreSource::Fenced(store), async move {
         let _ = stop.await;
     })
     .await

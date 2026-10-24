@@ -17,8 +17,14 @@
 //! says (`expect`: what the holder's `role` reports), keeps the epoch, and builds the
 //! frontend over the store as any start does: all state is read from the store, and the
 //! scheduler, the reconciler and the worker listener start, on the sockets the candidate
-//! already bound. A start with no `--await-takeover` is a cold start: it takes the
-//! generation and, like every start, keeps the epoch.
+//! already bound. A start with no `--await-takeover` is a cold start: like every start it
+//! keeps the epoch, and over a Postgres store it takes no generation (the generation row
+//! holds a marker that stops a build which takes generations, see
+//! [`StateStoreUri::open`](crate::StateStoreUri::open)), so a takeover finds no generation
+//! to expect on a store the frontends share: the roles below need a generation to hand
+//! over, so they apply only to a store whose writer holds one. On a store the frontends
+//! share, `takeover` is refused, `quiesce` is refused (nothing could take over from the
+//! process) and `resume` finds nothing quiesced.
 //!
 //! **A SQLite state file** is held by one process (an exclusive file lock), so a candidate
 //! cannot be opened beside the process that holds it: running side by side needs the
@@ -84,8 +90,18 @@ pub enum StoreSource {
     /// Opened from `--state-store`.
     Flags,
     /// An open store, shared with other processes of a test (the SQLite file cannot be
-    /// opened twice; an in-memory one can).
+    /// opened twice; an in-memory one can) as a Postgres store is shared by frontends: the
+    /// start takes no generation and ensures the generation row holds the marker
+    /// ([`StateStoreUri::open`](crate::StateStoreUri::open)), so every process serves and none
+    /// fences another. A candidate over it is as over any store: it takes nothing and writes
+    /// nothing until a takeover, which a store with no generation refuses.
     Shared(Arc<dyn Store>),
+    /// An open store, shared with other processes of a test that take turns holding its
+    /// generation, as the takeover roles of this module do: a start that is not a candidate
+    /// takes the next generation, and every write of the process is checked against it.
+    /// These roles need a generation to hand over, so they apply only to a store whose
+    /// writer holds one.
+    Fenced(Arc<dyn Store>),
 }
 
 /// A frontend, as a candidate or as the writer, with its admin port serving.
@@ -102,8 +118,8 @@ pub struct Managed {
 
 impl Managed {
     /// Starts as the flags say: a candidate with `--await-takeover`, otherwise a frontend
-    /// that takes the generation as a start does (a cold start, which keeps the epoch).
-    /// `shutdown` completing stops it.
+    /// that opens the store as a start does (a cold start, which keeps the epoch and, over
+    /// Postgres, takes no generation). `shutdown` completing stops it.
     ///
     /// # Errors
     /// No `--admin-listen`, a start that is refused (see [`crate::frontend::start_frontend`]),
@@ -144,7 +160,9 @@ impl Managed {
         if admin.await_takeover {
             let candidate = match source {
                 StoreSource::Flags => state_uri(flags)?.open_candidate()?,
-                StoreSource::Shared(store) => state_store::Candidate::over(store),
+                StoreSource::Shared(store) | StoreSource::Fenced(store) => {
+                    state_store::Candidate::over(store)
+                }
             };
             control.set_candidate(Candidate::start(flags, candidate, &stop)?);
         } else {
@@ -154,13 +172,12 @@ impl Managed {
                     crate::frontend::start_or_take_over(flags, move || Ok(stop.fired())).await?
                 }
                 StoreSource::Shared(store) => {
-                    let state = crate::StateStore {
-                        store: Arc::new(kbf_state::Fenced::take(store, None)?),
-                        epoch: crate::farm::EpochPolicy::Keep,
-                        members: crate::members::MembershipConfig::default(),
-                        history: None,
-                    };
-                    crate::frontend::start_over(flags, state, &stop)?
+                    kbf_state::share(store.as_ref())?;
+                    crate::frontend::start_over(flags, state_over(store), &stop)?
+                }
+                StoreSource::Fenced(store) => {
+                    let store = Arc::new(kbf_state::Fenced::take(store, None)?);
+                    crate::frontend::start_over(flags, state_over(store), &stop)?
                 }
             };
             control.set_running(&handle);
@@ -262,6 +279,16 @@ impl Managed {
         let served = handle.serve().await;
         self.stop.fire();
         Ok(served?)
+    }
+}
+
+/// A start's state over `store`, as any start keeps it: the epoch is kept.
+fn state_over(store: Arc<dyn Store>) -> crate::StateStore {
+    crate::StateStore {
+        store,
+        epoch: crate::farm::EpochPolicy::Keep,
+        members: crate::members::MembershipConfig::default(),
+        history: None,
     }
 }
 

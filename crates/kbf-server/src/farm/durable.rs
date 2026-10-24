@@ -88,9 +88,12 @@
 //!   format is needed: a store from that time reads as one whose blocks are spent. The
 //!   epoch row is created with an absent-only write, and a frontend that loses that race
 //!   reads the other's;
-//! - `meta/generation`: the writer generation ([`kbf_state::Fenced`]); every write of the
-//!   scheduler is checked against it. Operation names do not carry it: a farm over a store
-//!   names its operations `operations/<id>`, and the ids are the store's.
+//! - `meta/generation`: the writer generation of a store a build that takes generations
+//!   opened ([`kbf_state::Fenced`], whose every write is checked against it), or the marker
+//!   [`kbf_state::SHARED_WRITERS`] that a start puts there when the frontends share the store
+//!   and none takes a generation. A write of the scheduler is then checked by the rows it
+//!   read, not by a generation. Operation names do not carry it: a farm over a store names
+//!   its operations `operations/<id>`, and the ids are the store's.
 //!
 //! Several frontends may share one store. Each change of the rows above to an operation
 //! (a grant, a lease given up, a result, a refusal) is one transaction that is conditional
@@ -150,7 +153,9 @@ use kbf_sched::{
     DaemonInstance, Fate, Floor, FloorChange, KeyFloor, Recovered, RecoveredLease, Request,
     Requeue, RequeueReason,
 };
-use kbf_state::{Cond, Conflict, GENERATION, Store, StoreError, Txn, Version, Versioned};
+use kbf_state::{
+    Cond, Conflict, GENERATION, SHARED_WRITERS, Store, StoreError, Txn, Version, Versioned,
+};
 use kbf_types::{
     ControlRecord, Digest, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, WaiterId, WorkerId,
 };
@@ -1085,11 +1090,17 @@ impl Durable {
         self.commit(renewed)
     }
 
-    /// The writer generation the store holds, if it has one (a store opened by
-    /// [`crate::StateStoreUri::open`] always does).
+    /// The writer generation the store holds, if it holds one: a store with no generation
+    /// row, and one that holds the marker of shared frontends (a Postgres store opened by
+    /// [`crate::StateStoreUri::open`]), hold none.
     fn generation(&self) -> Result<Option<u64>, StateError> {
-        let row = self.store.get(GENERATION)?;
-        row.map(|row| number(GENERATION, &row)).transpose()
+        let Some(row) = self.store.get(GENERATION)? else {
+            return Ok(None);
+        };
+        if row.value == SHARED_WRITERS {
+            return Ok(None);
+        }
+        number(GENERATION, &row).map(Some)
     }
 
     /// How `operation` ended, if its `done/` row is still there.
@@ -1566,9 +1577,11 @@ impl State {
         let stored = durable.load()?;
         // The farm hands out `operations/<id>` names, whose ids are the store's. The machine's
         // term is the one of the old form, `operations/{term}-{waiter}`, which the farm still
-        // answers for a caller it holds: it carries the writer generation, not the epoch, so a
-        // kept epoch does not let a process answer a name another one wrote (issue #154). A
-        // store handed in without a fence has no generation, and the epoch is the term.
+        // answers for a caller it holds: it carries the writer generation when the store has
+        // one, so a kept epoch does not let a process answer a name another one wrote (issue
+        // #154). A store with none (handed in without a fence, or shared by frontends that
+        // take none) gives the epoch as the term. The farm gives out no name of the old form
+        // over a store, so no client holds one for two frontends of a store to answer.
         self.machine = FarmMachine::new(durable.generation()?.unwrap_or(epoch));
         let now = SystemTime::now();
         let mut recovered = Vec::new();

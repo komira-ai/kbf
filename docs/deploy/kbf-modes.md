@@ -225,9 +225,12 @@ disks and CPUs, and `daemon` on hosts that only build.
   `storage-and-daemon` refuse any driver but `container`, so a Mac is never one of those. Its
   `kbf.toml` is rendered by `kbf-mac-provision`. See
   [kbf-installer-setup.md](kbf-installer-setup.md) for the verbs.
-- **The frontend is one process.** The state store's generation fence lets one frontend
-  write at a time, and the proxy's two slots exist to swap a new frontend in for an old one,
-  not to run two. A frontend that is down schedules nothing.
+- **The frontend is one process.** Frontends over one Postgres store share it and none
+  fences another, but a SQLite file is held by one process, and the proxy's two slots exist
+  to swap a new frontend in for an old one, not to run two (the swap takes a generation,
+  which a Postgres store does not hold: see
+  [state-store-cutover.md](state-store-cutover.md)). A frontend that is down schedules
+  nothing.
 - **A `storage-and-daemon` host is for a trusted network.** Its unit runs as the build user,
   which can read the cold store's key from the process's environment, as `all-in-one`'s user
   can read the farm's state. Hosts that must not share a user with a key run `daemon` and
@@ -248,13 +251,16 @@ the `Planned:` paragraph.
    `sqlite:///absolute/path` for this release only: a start on it works and logs a warning
    that SQLite is removed in the next release (see the upgrade notes). A frontend has no
    default and refuses to start without `--state-store`. A farm's frontend uses Postgres:
-   `kbf-installer setup` provisions the role and database (`--create-local-database`) or
-   refuses with the `pg_hba.conf` and `pg_ident.conf` lines to add, and it never edits either
-   file. Postgres must flush commits before it acknowledges them (`synchronous_commit` on) or
-   the start is refused. A URL with a password is refused: the command line is readable by
-   every user on the host, so the role is reached by the socket and peer authentication. The
-   state store also holds the storage members, the enrollment registry and the object-store
-   registration.
+   `kbf-installer setup` with no `--database` provisions the role and database in one run
+   (the database `kbf` and the role `kbf-server` on the local socket; the schema follows once
+   the server admits the logins, which on a stock server means a second run after the printed
+   lines are added), prints the `pg_hba.conf` and `pg_ident.conf` lines the logins need,
+   refuses with the command that installs Postgres when `psql` or the server is missing, and
+   never edits either file; a role you made by hand is passed with `--database`. Postgres must
+   flush commits before it acknowledges them (`synchronous_commit` on) or the start is
+   refused. A URL with a password is refused: the command line is readable by every user on
+   the host, so the role is reached by the socket and peer authentication. The state store
+   also holds the storage members, the enrollment registry and the object-store registration.
 2. **The CA and certificates.** `all-in-one` already needs mutual TLS between its two halves.
    A farm needs one CA and one certificate per node, each with exactly one role (`frontend`,
    `storage` or `daemon`, as `urn:kbf:role:<role>`). The frontend runs the enrollment

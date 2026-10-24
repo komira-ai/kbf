@@ -546,7 +546,7 @@ impl Store for Holding {
 async fn child_over(node: &Node, holding: &Arc<Holding>) -> (Child, SocketAddr) {
     let managed = Managed::start(
         &managed_flags(node, &[]),
-        StoreSource::Shared(Arc::clone(holding) as Arc<dyn Store>),
+        StoreSource::Fenced(Arc::clone(holding) as Arc<dyn Store>),
         std::future::pending::<()>(),
     )
     .await
@@ -797,7 +797,7 @@ async fn a_child_the_store_refused_is_no_holder_though_the_generation_row_is_sti
 async fn a_takeover_over_a_dead_holder_and_a_cold_start_keep_the_epoch() {
     let node = Node::start().await;
     let store = shared();
-    let source = || StoreSource::Shared(Arc::clone(&store) as Arc<dyn Store>);
+    let source = || StoreSource::Fenced(Arc::clone(&store) as Arc<dyn Store>);
     let a = Stoppable::start(&managed_flags(&node, &[]), source()).await;
     let b = Child::start(&managed_flags(&node, &["--await-takeover"]), &store).await;
     let before = epoch(&store);

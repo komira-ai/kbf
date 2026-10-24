@@ -729,7 +729,7 @@ async fn the_routed_kind_uses_the_storage_node_until_the_map_has_two_members() {
 /// Catches: a frontend backend whose `/metrics` text leaves out `kbf_bytes_in_flight` or
 /// `kbf_bytes_in_flight_peak` (the proxy kinds once rendered only their own counters).
 ///
-/// Mutant: `Remote::render_metrics` returning `self.metrics.render()` alone.
+/// Catches: `Remote::render_metrics` returning `self.metrics.render()` alone.
 fn assert_in_flight_families(text: &str) {
     for family in ["kbf_bytes_in_flight", "kbf_bytes_in_flight_peak"] {
         assert!(
@@ -757,7 +757,7 @@ async fn stored_tree(trio: &Trio) -> (Digest, usize) {
 /// Catches: the routed kind's walk forgetting nothing the router can vouch for, or never
 /// remembering: the second walk of a tree the farm held (a build's next Execute over the
 /// same toolchain) skips it, with no read and no FindMissing, because the router gave the
-/// map's epoch to the walk. Mutant: `Blobs::epoch` for the router returning `None` (the
+/// map's epoch to the walk. Catches: `Blobs::epoch` for the router returning `None` (the
 /// memory would never fire and every other test stays green): the second walk reads all
 /// four directories again. Under a map with a member of unknown boot there is no epoch
 /// and the second walk reads again.
@@ -802,7 +802,7 @@ async fn the_routed_walk_skips_a_tree_it_found_held() {
 
 /// Catches: a single storage node's walk remembering what it found held. Nothing about
 /// one node says that a restart or a lost blob did not happen between two walks, so
-/// [`Backend::remote`] has no epoch and every walk reads the whole tree. Mutant: `Held`
+/// [`Backend::remote`] has no epoch and every walk reads the whole tree. Catches: `Held`
 /// answering an epoch (`Some(1)`): the second walk skips the root.
 #[tokio::test]
 async fn a_walk_over_one_storage_node_never_skips() {

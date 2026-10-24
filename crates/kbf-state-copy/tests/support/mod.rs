@@ -17,6 +17,7 @@ use kbf_state::sqlite::{Options, SqliteStore};
 use kbf_state::{Commit, Cond, ManualClock, Store, Txn};
 use kbf_state_copy::digest::{Counter, Entry};
 use kbf_state_copy::{Args, CutoverArgs, Error, PlaceArgs, RollbackArgs, Seams};
+use kbf_testkit::database::ddl;
 use kbf_testkit::dir::TestDir;
 use rusqlite::Connection;
 
@@ -529,11 +530,9 @@ impl Database {
     pub fn bare() -> Database {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let name = format!("kbf_copy_{}_{n}", std::process::id());
-        let mut admin =
-            postgres::Client::connect(&server_url(), postgres::NoTls).expect("the test server");
-        admin
-            .batch_execute(&format!("CREATE DATABASE \"{name}\""))
-            .expect("create the test's database");
+        // A database belongs to the whole server: `ddl` makes it under the shared-catalog guard.
+        let create = format!("CREATE DATABASE \"{name}\"");
+        ddl(&server_url(), &create).expect("create the test's database");
         Database { name }
     }
 
@@ -559,12 +558,8 @@ impl Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
-        if let Ok(mut admin) = postgres::Client::connect(&server_url(), postgres::NoTls) {
-            let _ = admin.batch_execute(&format!(
-                "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)",
-                self.name
-            ));
-        }
+        let statement = format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", self.name);
+        let _ = ddl(&server_url(), &statement);
     }
 }
 

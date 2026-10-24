@@ -728,14 +728,22 @@ async fn the_server_reads_the_store_by_itself_only_at_start() {
     assert_eq!(every_read.load(Ordering::SeqCst), at_start);
 }
 
-/// Catches: a store written by an older build, which holds `update/*` rows for hosts, the
-/// places in use, a run and a policy, that the server cannot start on or reads and changes:
-/// the server starts over it, answers, and leaves every update row exactly as it was.
+/// Catches: a store written by an older build, which holds `update/*` rows of every kind it
+/// wrote (the run and its counter, the policy, hosts, the places in use, an order counter and
+/// a proposal), that the server cannot start on or reads and changes: the server starts over
+/// it, answers, and leaves every update row exactly as it was. The routes that read the run
+/// are gone, so they answer 404 rather than from the rows.
 #[tokio::test]
 async fn a_store_holding_old_update_rows_starts_serves_and_leaves_them_alone() {
     let hooked = Hooked::new();
-    let old: [(&str, &[u8]); 5] = [
+    let old: [(&str, &[u8]); 8] = [
         ("update/desired", &[0x08, 0x01, 0x12, 0x02, 0x76, 0x32]),
+        ("update/generation", &[0x03]),
+        ("update/order/0000000000000001", &[]),
+        (
+            "update/proposed/0123456789abcdef0123456789abcdef01234567",
+            &[0x0a, 0x02, 0x76, 0x32],
+        ),
         ("update/policy", &[0x08, 0x01, 0x20, 0x02]),
         (
             "update/slot",
@@ -755,6 +763,10 @@ async fn a_store_holding_old_update_rows_starts_serves_and_leaves_them_alone() {
     let server = failing(&hooked);
     looks.done(START_LOOKS).await;
     assert_eq!(members(server.api).await, empty());
+    for gone in ["/v1/update", "/v1/update/desired", "/v1/update/pause"] {
+        let (code, _, body) = http(server.api, "GET", gone, "").await;
+        assert_eq!(code, 404, "{gone}: {body}");
+    }
     let mut held: Vec<(String, Vec<u8>)> = hooked
         .fake
         .scan_prefix("update/")

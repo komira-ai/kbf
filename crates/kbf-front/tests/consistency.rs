@@ -223,7 +223,7 @@ async fn stage(log: &Log, seq: u64, text: &str) {
 
 /// Catches a pass that keeps an orphan: a file of an earlier process's epoch that no
 /// index entry names (an upload whose commit never happened), which nothing else ever
-/// deletes (mutant: the delete branch removed). The indexed file beside it stays.
+/// deletes (defect: the delete branch removed). The indexed file beside it stays.
 #[tokio::test]
 async fn pass_deletes_old_epoch_orphan() {
     let dir = scratch("orphan");
@@ -255,11 +255,11 @@ async fn pass_deletes_old_epoch_orphan() {
 }
 
 /// Catches a pass that deletes a file it must keep, though no index entry names it:
-/// one of this process's epoch, written but not yet committed (mutant: the epoch check
+/// one of this process's epoch, written but not yet committed (defect: the epoch check
 /// dropped); one under another log's prefix, or under this prefix but not an object
-/// name (mutant: the prefix check dropped, so another log's object reads as an orphan
+/// name (defect: the prefix check dropped, so another log's object reads as an orphan
 /// of ours); a staged object whose blobs were collected, which the flusher has just
-/// written (mutant: the staged check dropped); and a file with no header. Foreign and
+/// written (defect: the staged check dropped); and a file with no header. Foreign and
 /// headerless files are counted, never held.
 #[tokio::test]
 async fn pass_keeps_current_epoch_staged_foreign() {
@@ -320,7 +320,7 @@ async fn pass_keeps_current_epoch_staged_foreign() {
 /// own member's earlier boot, of another member at two boots, and an epoch writer's
 /// object of the log it now writes beside. None is in its index; each may be one only a
 /// rebuild knows (boot 1's metadata directory was wiped), so all are kept and counted
-/// foreign, and only its own object is held. Mutant seen red: the orphan rule widened
+/// foreign, and only its own object is held. Catches: the orphan rule widened
 /// from "an earlier epoch of an epoch writer" to "any writer but this one" (every
 /// planted object is deleted).
 #[tokio::test]
@@ -368,7 +368,7 @@ async fn the_start_pass_keeps_other_writers_objects() {
 }
 
 /// Catches a pass that forgets an object because the walk did not see its file, when
-/// the file is there by the time it decides (mutant: no second look before the
+/// the file is there by the time it decides (defect: no second look before the
 /// eviction): a staged object of an earlier process that the flusher writes to the
 /// store and marks flushed after the walk passed its shard. Its blob must stay.
 #[tokio::test]
@@ -403,10 +403,10 @@ async fn pass_keeps_an_object_flushed_after_its_shard_was_walked() {
     std::fs::remove_dir_all(&dir).expect("remove");
 }
 
-/// Catches index entries whose object file is gone kept after the pass (mutant: the
+/// Catches index entries whose object file is gone kept after the pass (defect: the
 /// index side skipped): the blob stays reported present, so a client never uploads
 /// it again, and the action-cache entry naming it stays. Also a staged object with no
-/// file in the store (its copy is a tier's block) sent for eviction (mutant: the staged
+/// file in the store (its copy is a tier's block) sent for eviction (defect: the staged
 /// filter dropped), and a blob in another object, or an entry that needs none of the
 /// lost blobs, taken with it.
 #[tokio::test]
@@ -450,7 +450,7 @@ async fn pass_evicts_index_entry_without_file() {
 
 /// Catches the pass wiping the index when the directory is not the one the index was
 /// written over (an unmounted disk: `FsStore::open` creates the directory empty), by
-/// forgetting every entry for want of its file (mutant: the guard removed). It must
+/// forgetting every entry for want of its file (defect: the guard removed). It must
 /// drop nothing, and report how many objects it held back.
 #[tokio::test]
 async fn pass_drops_nothing_on_empty_dir() {
@@ -481,7 +481,7 @@ async fn pass_drops_nothing_on_empty_dir() {
     std::fs::remove_dir_all(&empty).expect("remove");
 }
 
-/// Catches held bytes that count each file's header (mutant: the scan reports the
+/// Catches held bytes that count each file's header (defect: the scan reports the
 /// file's length, not the object's), so an evictor would free less than it thinks,
 /// or that count a foreign file; and a modification time that is not the file's.
 #[tokio::test]
@@ -513,9 +513,9 @@ async fn held_bytes_match_payloads() {
     std::fs::remove_dir_all(&dir).expect("remove");
 }
 
-/// Catches a pass that ignores its rate (mutant: no wait), so a start of a large
+/// Catches a pass that ignores its rate (defect: no wait), so a start of a large
 /// directory takes the disk from the reads it serves; and one that keeps its pace while
-/// the store is under its free-space floor (mutant: the floor check dropped), when
+/// the store is under its free-space floor (defect: the floor check dropped), when
 /// every upload is refused until it is done. Six files at six opens a second take a
 /// second; the same six at one a second under the floor take no time.
 #[tokio::test]

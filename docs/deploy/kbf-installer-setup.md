@@ -14,13 +14,19 @@ sudo kbf-installer setup --mode=daemon \
 sudo kbf-installer --apply setup ...                                                          # do it
 
 sudo kbf-installer setup --mode=frontend \
-    --database='postgres:///kbf?host=/run/postgresql&user=kbf' --create-local-database \
     --listen=192.0.2.10:8980 --worker-listen=192.0.2.10:8981 \
     --worker-tls-cert=/etc/kbf/worker.pem --worker-tls-key=/etc/kbf/worker.key \
     --worker-client-ca=/etc/kbf/ca.pem \
     --storage-url=https://storage.example.invalid:8983 --storage-ca=/etc/kbf/ca.pem \
     --storage-client-cert=/etc/kbf/worker.pem --storage-client-key=/etc/kbf/worker.key
 ```
+
+The second command gives no `--database`, so one `--apply` of it leaves a login role with no
+password and no privilege and a database that role owns on this host, over the local Postgres
+socket with peer authentication. The schema follows once the server admits the logins `setup`
+makes as that role: on a stock server that means adding the `pg_hba.conf` and `pg_ident.conf`
+lines `setup` prints, reloading the server and running `setup` again. See "The state database"
+below for what has to be installed first and what the server must admit.
 
 ## `kbf setup` on a host from the packages
 
@@ -51,30 +57,33 @@ holds a token.
 | mode | `--frontend-url` | `--token-file` | `--database` |
 |---|---|---|---|
 | `storage`, `daemon`, `storage-and-daemon` | required | required | refused |
-| `frontend`, `all-in-one` | refused | refused | required |
+| `frontend`, `all-in-one` | refused | refused | optional: left out, the local default (see below) |
 
 The modes in the first row enroll with a frontend when they start, so they need its URL
 (`https://host[:port]`, nothing after it) and an enrollment token file (an absolute path, one
 word, mode 0600 or tighter, at most 4 KiB). The other two do not enroll; they keep their state in
-Postgres, which the operator provides before `setup` runs. There is no `node` mode, and a Mac
-accepts only `--mode=daemon`.
+Postgres. On a host that runs the Postgres server, `setup` makes the role, the database and the
+schema itself; the server is the one thing the operator installs first. There is no `node` mode,
+and a Mac accepts only `--mode=daemon`.
 
 | flag | meaning |
 |---|---|
 | `--release-source`, `--release-url`, `--release-ca`, `--frontend-worker-url`, `--frontend-ca`, `--frontend-ca-sha256`, `--commit` | retired: `setup` no longer installs a release or writes where releases come from. The flags are still taken, for one release, so a script that passes them goes on working: their values are not checked and not used, and `setup` prints one `warning: ignored: ...` line naming the ones given, ahead of its steps |
 | `--min-generation N` | the floor for orders; it only goes up, `0` is refused, and a lower value than `installer.toml` holds is refused (exit 5) |
-| `--database`, `--create-local-database` | the state database, see below |
+| `--database`, `--create-local-database` | the state database, see below; `--create-local-database` is redundant when `--database` is left out |
 | `--no-start` | enable units without starting them |
 | `--installer-config` | accepts only the platform's own `installer.toml` path; it is a flag of `run` |
 | `--proxy`, `--proxy-base-port`, `--buck2-auth`, `--buck2-token-file` | a frontend behind the bundled proxy, see below; `--proxy` is required by `--mode=all-in-one` |
 | `--storage-port` | `--mode=all-in-one` only: the loopback port of its sibling, default 8990, see "An all-in-one host" |
 
-`--database` is `postgres:///NAME?host=SOCKET_DIR&user=ROLE`. The role is required, because
-`setup` runs as root and the service as its own account. A URL with a password is refused (the
-file is world-readable), and no message quotes a URL. Settings of `kbf` that `setup` has no flag
-for (`releases-dir`, `reapi-auth-policy`, `worker-deny-list`, `proxy-auth-file` and the tuning
-keys) are the operator's; see the configuration reference. Such keys survive a re-run under the
-rule in "The `kbf.toml` file".
+`--database` is `postgres:///NAME?host=SOCKET_DIR&user=ROLE`. Left out on a `frontend` or
+`all-in-one` host it is `postgres:///kbf?host=/run/postgresql&user=kbf-server`, and `setup`
+makes that role and database (see "The state database"). The role is required in a URL you give,
+because `setup` runs as root and the service as its own account. A URL with a password is
+refused (the file is world-readable), and no message quotes a URL. Settings of `kbf` that
+`setup` has no flag for (`releases-dir`, `reapi-auth-policy`, `worker-deny-list`,
+`proxy-auth-file` and the tuning keys) are the operator's; see the configuration reference. Such
+keys survive a re-run under the rule in "The `kbf.toml` file".
 
 ## The `kbf.toml` flags of a frontend and an all-in-one host
 
@@ -170,10 +179,11 @@ not require them; a file that has them is left as it is. The other keys
    set up by an earlier build) keeps them, and a host with no file gets `release_source =
    "frontend"`, the default. Settings a flag does not cover are kept. The file is closed: one that
    does not parse is left alone (exit 5). The operator's `[proxy]` table is kept.
-7. Frontend and all-in-one: the state database's schema is created or brought forward. With
-   `--create-local-database` the role and the database are made first. A server that cannot be
-   reached, or refuses a login, stops `setup` here (exit 1) with `installer.toml` written and no
-   `kbf.toml` or unit; running it again finishes.
+7. Frontend and all-in-one: the state database's schema is created or brought forward. Without
+   `--database` (or with `--create-local-database`) the role and the database are made first,
+   and the `pg_hba.conf` and `pg_ident.conf` lines the logins need are printed. A server that
+   cannot be reached, or refuses a login, stops `setup` here (exit 1, or 5 where only a person
+   can go on) with `installer.toml` written and no `kbf.toml` or unit; running it again finishes.
 8. `/etc/kbf/kbf.toml`, as above (on an all-in-one host `/etc/kbf/frontend.toml` first).
 9. The units, last. On Linux `systemctl enable`, with `--now` unless `--no-start`: the mode's unit
     (only when a release is installed), and `kbf-installer.service`. `kbf-frontend.service`,
@@ -334,27 +344,58 @@ are reported by name (exit 2). A dry run shows the plan, including the copy, and
 ## The state database
 
 `frontend` and `all-in-one` keep their state in one Postgres database on the host. The package only
-suggests the server, because node hosts use none. `setup` refuses clearly when no server answers
-at the URL's socket.
+suggests the server, because node hosts use none. A single box needs the server installed, a
+`setup`, the rules `setup` prints added to the server, and a second `setup`:
 
-- **`--create-local-database`.** `setup` runs `/usr/bin/psql` as the operating-system user
-  `postgres` over the Unix socket the URL names (peer authentication, no password) and creates, if
-  missing, a login role (no password, not a superuser, no CREATEDB, CREATEROLE or REPLICATION) and
-  a database it owns. It alters nothing that exists: a role that cannot log in or holds any
-  privilege, and a database another role owns, are refused (exit 1). Names are letters, digits,
-  `_` and `-` (at most 63); the role is neither `postgres` nor `pg_`-prefixed; the socket directory
-  is absolute; one server only.
-- **`setup` never edits `pg_hba.conf` or `pg_ident.conf`.** It logs in the way kbf will (as root
-  with the URL's role, and as the service account when it exists) and, when the server refuses,
-  prints the rules to add: above the first `local` line of `pg_hba.conf`
-  `local <database> <role> peer map=kbf`, and in `pg_ident.conf` the lines `kbf root <role>` and
+```text
+sudo apt install postgresql                     # Debian, Ubuntu
+sudo dnf install postgresql-server              # Fedora: then
+sudo postgresql-setup --initdb && sudo systemctl enable --now postgresql
+sudo kbf-installer --apply setup --mode=frontend ...    # no --database: makes the role and database
+# add the printed pg_hba.conf and pg_ident.conf lines, reload the server, then:
+sudo kbf-installer --apply setup --mode=frontend ...    # same flags: makes the schema, the rest
+```
+
+- **The default.** With no `--database`, `setup` uses
+  `postgres:///kbf?host=/run/postgresql&user=kbf-server` (written to `installer.toml` and, as
+  `state-store`, to `kbf.toml`) and makes what is missing of it, as `--create-local-database`
+  does. One run leaves a login role with no password and no privilege and a database that role
+  owns; the schema is made once the server admits the logins (below), on that run if it already
+  does and on the next if not. `--create-local-database` is still accepted and is redundant
+  here; it matters beside a `--database` you give, to have `setup` make that role and database.
+  To keep a role you made by hand, give `--database` without the flag (see "A remote or managed
+  server"). A rerun finds the role, the database and the schema and changes nothing. An
+  `installer.toml` that already names another database is not replaced: `setup` stops (exit 5)
+  and asks for `--database` (the same value keeps it).
+- **What is made.** `setup` runs `/usr/bin/psql` as the operating-system user `postgres` over the
+  Unix socket the URL names (peer authentication, no password) and creates, if missing, a login
+  role (no password, not a superuser, no CREATEDB, CREATEROLE or REPLICATION) and a database it
+  owns. It alters nothing that exists: a role that cannot log in or holds any privilege, and a
+  database another role owns, are refused (exit 5). Names are letters, digits, `_` and `-` (at
+  most 63); the role is neither `postgres` nor `pg_`-prefixed; the socket directory is absolute;
+  one server only. Linux only, which is where `frontend` and `all-in-one` run.
+- **Without psql or a running server, `setup` refuses (exit 5) with the install command**,
+  before anything of the database is made: `apt install postgresql` on Debian and Ubuntu,
+  `dnf install postgresql-server` then `postgresql-setup --initdb` on Fedora and its relatives
+  (both are named when the host's `/etc/os-release`, or `/usr/lib/os-release` behind a link,
+  says neither), and, for a server that is
+  installed and stopped, to start it. The refusal also gives the way out by hand: create the
+  role and database and pass `--database`.
+- **`setup` never edits `pg_hba.conf` or `pg_ident.conf`.** On every run that makes the role and
+  database or checks them (a dry run too), it prints the rules the logins need, as information, so
+  a rerun after a refused login has them with the names filled in: above the first `local` line
+  of `pg_hba.conf`, `local <database> <role> peer map=kbf` (for the default
+  `local kbf kbf-server peer map=kbf`), and in `pg_ident.conf` the lines `kbf root <role>` and
   `kbf <service> <role>` (`<service>` is `kbf-server`: on an all-in-one host it is the proxy's
-  child that holds the connection, not the sibling that runs as `kbf`).
-  Reload the server and run `setup` again. The map name is any name used on both sides.
+  child that holds the connection, not the sibling that runs as `kbf`). Root needs the map
+  because `setup` logs in as root with the role. `setup` then logs in the way kbf will (as root
+  with the role, and as the service account when it exists) and, when the server refuses,
+  stops and says which rule is missing. Add the rules, reload the server (not restart) and run
+  `setup` again. The map name is any name used on both sides.
 - **A remote or managed server.** `setup` holds no password and does not reach a remote
   superuser. Create the role and database, make the server admit the logins, and run `setup`
-  without `--create-local-database`: it checks that it can log in, then creates or brings forward
-  the schema.
+  with `--database` and without `--create-local-database`: it checks that it can log in, then
+  creates or brings forward the schema.
 
 Backups of the database are the operator's: Postgres is a runtime dependency that the operator
 provides, and its own backup and restore tools apply. Neither `setup` nor the package runs one,

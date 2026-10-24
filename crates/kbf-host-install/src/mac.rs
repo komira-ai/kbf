@@ -23,8 +23,9 @@
 //!
 //! # The requests
 //!
-//! The same two as on Linux ([`crate::request`]). `<version>` is the version text of a
-//! build (`0.1.<seq>+g<12 hex>-<run>`); its 12 digits name the release.
+//! The same two as on Linux ([`crate::request`]); the third, `restart frontend=<name>`, is
+//! refused as a bad command, since a Mac has no frontend unit to restart. `<version>` is the
+//! version text of a build (`0.1.<seq>+g<12 hex>-<run>`); its 12 digits name the release.
 //!
 //! - `install kbf=<version> from <channel>`: look up the channel ([`channel`]), checks the
 //!   release and stages it ([`stage`]), then launches the apply job ([`apply`]) and
@@ -185,6 +186,8 @@ fn handle_root(
         Ok(Request::Install { version, channel }) => {
             install(host, runner, version, channel, log.is_ok())
         }
+        // A frontend unit is a Linux systemd unit: a Mac has none to restart.
+        Ok(Request::Restart { .. }) => Outcome::Refused(Refusal::BadCommand),
     };
     let (outcome_word, reason) = outcome.audit_fields();
     let (version, channel) = match &request {
@@ -199,6 +202,7 @@ fn handle_root(
         verb: request.as_ref().ok().map(Request::verb),
         version,
         channel,
+        unit: None,
         outcome: outcome_word,
         reason,
         result: None,

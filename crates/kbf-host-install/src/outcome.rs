@@ -1,11 +1,11 @@
 //! What an invocation did, as the one JSON line on stdout and the exit status.
 //!
-//! Every line has a `result` (`installed`, `already_installed`, `query`, `refused` or
-//! `failed`; a Mac also answers `apply_started`).
+//! Every line has a `result` (`installed`, `already_installed`, `restarted`, `query`,
+//! `refused` or `failed`; a Mac also answers `apply_started`).
 //!
-//! Exit 0: done (installed, already installed, or a query answered). Exit 2: refused, and
-//! nothing ran. Exit 3: failed after a step started (or the audit log could not be
-//! written first). A reason is a code from a closed set, never text taken from the
+//! Exit 0: done (installed, already installed, restarted, or a query answered). Exit 2:
+//! refused, and nothing ran. Exit 3: failed after a step started (or the audit log could
+//! not be written first). A reason is a code from a closed set, never text taken from the
 //! request or from a child process; the detail of a failure goes to stderr, cleaned.
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ pub const MAX_DETAIL_LEN: usize = 2048;
 /// Why a request was refused. Nothing ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// Not one of the two forms.
+    /// Not one of the three forms (on a Mac, not one of its two: it restarts no unit).
     BadCommand,
     /// A channel the allowlist does not name.
     ChannelNotAllowed,
@@ -99,11 +99,15 @@ pub enum FailureCode {
     Busy,
     /// The install lock file could not be opened.
     LockUnavailable,
+    /// `systemctl restart` failed, or could not be run.
+    RestartFailed,
+    /// The unit was restarted and was not active within the time allowed.
+    RestartTimeout,
 }
 
 impl FailureCode {
     /// Every failure.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::AuditUnavailable,
         Self::QueryFailed,
         Self::InstalledVersionInvalid,
@@ -113,6 +117,8 @@ impl FailureCode {
         Self::VerifyFailed,
         Self::Busy,
         Self::LockUnavailable,
+        Self::RestartFailed,
+        Self::RestartTimeout,
     ];
 
     /// The failure whose closed code this is.
@@ -132,6 +138,8 @@ impl FailureCode {
             Self::VerifyFailed => "verify_failed",
             Self::Busy => "busy",
             Self::LockUnavailable => "lock_unavailable",
+            Self::RestartFailed => "restart_failed",
+            Self::RestartTimeout => "restart_timeout",
         }
     }
 }
@@ -160,6 +168,8 @@ pub enum Outcome {
     Installed { version: String },
     /// The target was already installed; nothing ran.
     AlreadyInstalled { version: String },
+    /// The unit was restarted and is active.
+    Restarted { unit: String },
     /// `query`.
     Queried(QueryReport),
     /// A Mac's install is checked and its apply job is launched; the apply goes on by
@@ -186,6 +196,7 @@ impl Outcome {
         match self {
             Self::Installed { .. }
             | Self::AlreadyInstalled { .. }
+            | Self::Restarted { .. }
             | Self::Queried(_)
             | Self::ApplyStarted { .. }
             | Self::MacQueried { .. } => 0,
@@ -206,6 +217,10 @@ impl Outcome {
                 result: "already_installed",
                 installed_version: version,
                 unit_state: "not_run",
+            }),
+            Self::Restarted { unit } => to_json(&Restarted {
+                result: "restarted",
+                unit,
             }),
             Self::Queried(report) => to_json(&Queried {
                 result: "query",
@@ -276,6 +291,7 @@ impl Outcome {
         match self {
             Self::Installed { .. } => ("installed", None),
             Self::AlreadyInstalled { .. } => ("already_installed", None),
+            Self::Restarted { .. } => ("restarted", None),
             Self::Queried(_) | Self::MacQueried { .. } => ("query", None),
             Self::ApplyStarted { .. } => ("apply_started", None),
             Self::Refused(refusal) | Self::RefusedBecause(refusal, _) => {
@@ -307,6 +323,12 @@ impl Outcome {
         }
         Some(text)
     }
+}
+
+#[derive(Serialize)]
+struct Restarted<'a> {
+    result: &'static str,
+    unit: &'a str,
 }
 
 #[derive(Serialize)]

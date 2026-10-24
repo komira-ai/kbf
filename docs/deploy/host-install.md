@@ -63,18 +63,22 @@ program again inside a systemd unit (see below), with the request in the variabl
 `SSH_ORIGINAL_COMMAND`, `SSH_CONNECTION`, `SSH_CLIENT` and `SSH_TTY` is set; in an ssh session it
 is ignored, and the program handles `SSH_ORIGINAL_COMMAND` as usual.
 
-## The two requests
+## The three requests
 
 The whole string must be one of these, with single spaces and nothing before or after:
 
 ```text
 install kbf=<version> from <channel>
+restart frontend=<name>
 query
 ```
 
 - `<version>` is `[0-9][0-9A-Za-z.+~-]*`, at most 128 bytes, without an epoch (no `:`), and a
   version `dpkg` itself accepts (so `1.0-` is refused).
 - `<channel>` is `[a-z0-9][a-z0-9-]{0,31}`.
+- `<name>` is `-`, which names the unit `kbf-frontend.service`, or an instance name
+  `[a-z][a-z0-9-]{0,31}`, which names `kbf-frontend@<name>.service`. The unit string is built
+  from the checked name alone; no other unit can be named, and nothing is expanded.
 - The package is always `kbf`.
 
 Anything else is refused: exit status 2, and no process is started.
@@ -154,6 +158,35 @@ The unit (this program again, as root, with the fixed environment) does the inst
 No shell runs anywhere: every process is started with an explicit argument vector and an
 environment of `PATH`, `LANG=C` and `DEBIAN_FRONTEND=noninteractive` alone.
 
+## What a restart does
+
+A package install restarts no `kbf` unit, so a client that has installed a new version asks for
+the restart of the one frontend unit it rolls, after the install. Linux only: a Mac refuses
+the request as `bad_command` (it has no such unit).
+
+The process sshd starts does all of it, and holds the install lock (`flock` on
+`/run/kbf-host-install.lock`) from before the first command until it answers, so while it runs a
+restart and an install do not overlap: an install that finds the lock held is `busy`, and so is a
+restart.
+
+1. Opens the audit log; fails (`audit_unavailable`) if it cannot, and runs nothing.
+2. Takes the lock without waiting; if another install or restart holds it (or it cannot be
+   opened), answers `failed` with reason `busy` (`lock_unavailable`) and runs nothing.
+3. Runs `systemctl restart -- <unit>` (killed after 120 seconds). A start failure or an exit
+   status but 0 is `failed` with reason `restart_failed`, and the detail on stderr holds the
+   exit status and what `systemctl` wrote.
+4. Runs `systemctl is-active -- <unit>` (each look killed after 10 seconds) every half second
+   until it exits 0, which it does for the states `active` and `reloading` (`activating` does
+   not count).
+   A unit that is not active 120 seconds after the restart returned is `failed` with reason
+   `restart_timeout`. Otherwise the answer is `restarted`, naming the unit.
+
+The restart does not read the channel allowlist. Nothing in the program notices a dropped ssh
+connection: it goes on with the restart and the wait (at most about 250 seconds in all),
+holds the lock until then, and its answer is lost, so a restart asked for again in that time is
+`busy`. If something outside ends the process, the lock goes with it and systemd carries on with
+the restart. Either way the client asks the host again after that bound.
+
 ## The answer
 
 One JSON line on stdout.
@@ -162,6 +195,7 @@ One JSON line on stdout.
 |---|---|---|
 | install, done | `{"result":"installed","installed_version":"...","unit_state":"finished"}` | 0 |
 | install, same version | `{"result":"already_installed","installed_version":"...","unit_state":"not_run"}` | 0 |
+| restart, done | `{"result":"restarted","unit":"kbf-frontend@<name>.service"}` (`kbf-frontend.service` for `-`) | 0 |
 | query | `{"result":"query","installed_version":"..."\|null,"running_commit":"..."\|null,"node_id":"..."\|null,"in_progress":true\|false}` | 0 |
 | refused | `{"result":"refused","reason":"<code>"}` | 2 |
 | failed | `{"result":"failed","reason":"<code>"}`, detail on stderr | 3 |
@@ -170,9 +204,11 @@ Refusal codes: `bad_command`, `channel_not_allowed`, `config_invalid`, `config_u
 `channel_unsigned`, `key_untrusted`, `channel_insecure`, and, on a Mac, for a channel whose source
 is GitHub, `unknown_release`, `ambiguous_release` and `fetch_failed`. Failure codes:
 `audit_unavailable`, `query_failed`, `installed_version_invalid`, `package_state_unclean`,
-`update_failed`, `install_failed`, `verify_failed`, `busy`, `lock_unavailable`.
+`update_failed`, `install_failed`, `verify_failed`, `busy`, `lock_unavailable`, and for a restart
+`restart_failed` and `restart_timeout`.
 
-Every line has a `result`: `installed`, `already_installed`, `query`, `refused` or `failed`.
+Every line has a `result`: `installed`, `already_installed`, `restarted`, `query`, `refused` or
+`failed`.
 
 `installed_version` of a query is the version dpkg reports when `kbf` is cleanly installed,
 and null when it is not installed or dpkg flags an error on the package (the updater then
@@ -187,7 +223,8 @@ acts on one host among several compares it with the id it expects before it does
 `in_progress` is true when any of three things holds, and false only when none does: the
 install lock `/run/kbf-host-install.lock` is held (probed, then let go at once; the process
 that does the work holds it from before it reads the package database until it ends, so the
-gap between the two apt steps is covered); a `kbf-host-install-*` unit is listed by
+gap between the two apt steps is covered; a running restart holds it too, so `in_progress` is
+true during one); a `kbf-host-install-*` unit is listed by
 `systemctl list-units` in the state `active`, `activating`, `deactivating` or `reloading`; or
 some process holds the dpkg frontend lock (read from `/proc/locks`; nothing is locked or
 waited for). If the listing itself fails, the query fails (`query_failed`) and does not
@@ -197,16 +234,17 @@ guess.
 
 Every invocation, refused ones included, appends one JSON line to
 `/var/log/kbf-host-install.log` (created root-owned, mode 0600, never through a symbolic
-link): the time, the verb, the version, the channel, the outcome and the reason. On a Mac the
+link): the time, the verb (`install`, `restart` or `query`), the version, the channel, the
+outcome and the reason, and, on the line of a restart, the `unit`. On a Mac the
 apply job appends one more line when it ends: verb `apply`, the version, outcome `applied` or
 `failed`, and `result`, the status line (`done`, `failed:not_welcomed:rolled_back`, ...). A request
-that was not understood is recorded escaped and cut at 200 characters. An install is not
-started when the log cannot be opened.
+that was not understood is recorded escaped and cut at 200 characters. An install or a restart
+is not started when the log cannot be opened.
 
 ## On a Mac
 
-A Mac takes the same two requests (`install kbf=<version> from <channel>` and `query`) and
-answers in the same shape, but it installs the attested release tarball
+A Mac takes the same `install kbf=<version> from <channel>` and `query` requests (a `restart`
+is refused as `bad_command`) and answers in the same shape, but it installs the attested release tarball
 `kbf-<commit>-darwin-arm64.tar.gz` (not a package), into the kit layout, and restarts the
 daemon's launchd job on it. The program is the same binary; the platform picks the Mac side.
 Nothing here is a Homebrew formula or a `kbf-installer` order.

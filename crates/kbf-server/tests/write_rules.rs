@@ -10,11 +10,10 @@ use std::time::Duration;
 use kbf_enroll_registry::{TokenSpec, bump_ca_generation, create_token};
 use kbf_history::IndexRoot;
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Progress, Registrant};
-use kbf_server::update::{Release, Rows};
-use kbf_server::write_rules::{Rule, classify};
+use kbf_server::write_rules::{Rule, classify, classify_shared};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
-use kbf_types::{FarmTime, Role, RoleSet, TokenId, TokenSecret};
+use kbf_types::{Role, RoleSet, TokenId, TokenSecret};
 
 fn store() -> Arc<dyn Store> {
     Arc::new(Fake::with_flaw(
@@ -23,7 +22,8 @@ fn store() -> Arc<dyn Store> {
     ))
 }
 
-/// Every key in `store`, and that each is of a family the table names, fenced.
+/// Every key in `store`, and that each is of a family the table names, fenced under a
+/// generation and conditional in a store whose frontends take none.
 fn assert_all_fenced(store: &dyn Store, what: &str) -> usize {
     let keys: Vec<String> = store
         .scan_prefix("")
@@ -38,6 +38,12 @@ fn assert_all_fenced(store: &dyn Store, what: &str) -> usize {
             got.map(|c| c.rule),
             Some(Rule::Fenced),
             "{what} wrote {key}, which the table does not name as fenced"
+        );
+        let shared = classify_shared(key, &IndexRoot::default());
+        assert_eq!(
+            shared.map(|c| c.rule),
+            Some(Rule::Conditional),
+            "{what} wrote {key}, which the table does not name as conditional"
         );
     }
     keys.len()
@@ -99,18 +105,6 @@ fn what_membership_writes_is_fenced() {
     assert!(assert_all_fenced(store.as_ref(), "membership") >= 5);
 }
 
-// Catches: the same for the rows of the desired release: the run and
-// the policy.
-#[test]
-fn what_the_update_rows_write_is_fenced() {
-    let store = store();
-    let rows = Rows::new(Arc::clone(&store));
-    rows.offer(&Release::new("v2"), FarmTime::from_millis(1000))
-        .expect("an offer");
-    rows.set_paused(true).expect("a pause");
-    assert!(assert_all_fenced(store.as_ref(), "the update rows") >= 2);
-}
-
 // Catches: the same for enrollment: a token row and the CA generation. The registry's other
 // rows (nodes, serials, keys, advertised names, requests, renewals) are written by an
 // enrollment, under the same `enroll/` prefix by the key builders of its `rows.rs`.
@@ -139,12 +133,14 @@ fn what_enrollment_writes_is_fenced() {
     assert!(assert_all_fenced(store.as_ref(), "enrollment") >= 2);
 }
 
-// Catches: a family whose writer was deleted still labelled as written. The host, slot,
-// order and proposal rows are only read now (`stored_update`, the proposals view), and the
-// table must say so, while the run, counter and policy rows keep their live writer.
+// Catches: a family whose writer was deleted still labelled as written. Every row of the
+// `update/*` family is only left in a store by an older build, and the table must say so.
 #[test]
 fn the_families_with_no_writer_left_are_labelled_read_only() {
     let retired = [
+        "update/desired",
+        "update/generation",
+        "update/policy",
         "update/slot",
         "update/host/node-a",
         "update/order/0000000000000001",
@@ -157,12 +153,5 @@ fn the_families_with_no_writer_left_are_labelled_read_only() {
             .unwrap_or_else(|| panic!("no family has the example {key}"));
         assert_eq!(family.writer, "retired, read-only", "{key}");
         assert_eq!(family.rule, Rule::Fenced, "{key}");
-    }
-    for key in ["update/desired", "update/policy", "update/generation"] {
-        let family = kbf_server::write_rules::FAMILIES
-            .iter()
-            .find(|f| f.example == key)
-            .unwrap_or_else(|| panic!("no family has the example {key}"));
-        assert!(family.writer.starts_with("update/rows"), "{key}");
     }
 }

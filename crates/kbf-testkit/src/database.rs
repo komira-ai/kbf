@@ -13,11 +13,30 @@
 //!
 //! The calls block on the server, so make the database before entering an async runtime (the
 //! blocking client refuses to start inside one).
+//!
+//! # The rule for shared-catalog DDL
+//!
+//! Roles, and the databases of the server with their privileges (`CREATE ROLE`, `DROP ROLE`,
+//! `ALTER ROLE`, `GRANT ... ON DATABASE`, `CREATE DATABASE`, `DROP DATABASE`), live in catalogs
+//! the whole server shares. Two sessions that change one row of them at once fail with
+//! "tuple concurrently updated" (SQLSTATE XX000). The test runner puts every test in a process
+//! of its own and runs them in parallel against one server, so a lock inside a process cannot
+//! keep them apart.
+//!
+//! Shared-catalog DDL in a test therefore goes through [`CatalogGuard`], which holds a
+//! server-wide advisory lock for as long as the DDL (and any product call that does the DDL,
+//! such as a provisioning step) takes, and runs the statements with
+//! [`batch_execute_retrying`], which retries the one error a client outside the guard can still
+//! cause. [`ddl`] is the two in one call for a single statement. A guard is not re-entrant: a
+//! thread that holds one does not take another (or call [`ddl`], or make a [`TestDatabase`])
+//! until it has dropped the first.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
+use postgres::error::SqlState;
 use postgres::{Client, Config, NoTls};
 
 /// The variable that names the Postgres server the tests may create and drop databases on.
@@ -26,6 +45,25 @@ pub const URL_VAR: &str = "KBF_TEST_POSTGRES_URL";
 /// How long a connection to the server may take: a server that does not answer in this long
 /// fails the test (and ends the guard's drop) instead of waiting for the system's own timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The key of the advisory lock a [`CatalogGuard`] holds: one for the whole server, so every
+/// test that changes roles or databases, in whatever process, waits for the one before it.
+/// The bytes are "kbfcat".
+pub const CATALOG_LOCK_KEY: i64 = 0x6b62_6663_6174;
+
+/// The database every guard connects to. An advisory lock belongs to one database of the
+/// server, so guards that connected to different ones would not exclude each other.
+const LOCK_DATABASE: &str = "postgres";
+
+/// How long a guard waits for the lock: a test that never lets go fails the others with a
+/// message, and does not hang them.
+const LOCK_WAIT: Duration = Duration::from_secs(300);
+
+/// How many times [`retry_catalog_race`] runs the statements before it gives up.
+pub const CATALOG_RACE_TRIES: u32 = 50;
+
+/// How long [`batch_execute_retrying`] waits between two runs.
+const CATALOG_RACE_PAUSE: Duration = Duration::from_millis(20);
 
 /// The server is not named: what a failed test says.
 struct NoServer;
@@ -95,6 +133,113 @@ fn connect(server: &str) -> Result<Client, postgres::Error> {
     config.connect_timeout(CONNECT_TIMEOUT).connect(NoTls)
 }
 
+/// `run`, again while it fails with "tuple concurrently updated" (SQLSTATE XX000, which
+/// `code_of` reads from the error): that is two sessions changing one row of a shared
+/// catalog at once, and the statement that lost has changed nothing. The wait between two runs
+/// is `pause`; the last run is the [`CATALOG_RACE_TRIES`]th.
+///
+/// # Errors
+/// The error of `run` at once when its SQLSTATE is anything else (or it has none), and the
+/// error of the last run when every run met XX000.
+pub fn retry_catalog_race<T, E>(
+    pause: Duration,
+    code_of: impl Fn(&E) -> Option<&SqlState>,
+    mut run: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let mut tries = 1;
+    loop {
+        let error = match run() {
+            Ok(done) => return Ok(done),
+            Err(error) => error,
+        };
+        let raced = code_of(&error) == Some(&SqlState::INTERNAL_ERROR);
+        if !raced || tries == CATALOG_RACE_TRIES {
+            return Err(error);
+        }
+        tries += 1;
+        thread::sleep(pause);
+    }
+}
+
+/// Runs `statements` on `client` (several are one transaction, so a run that fails has
+/// changed nothing), again when the server answers "tuple concurrently updated". Hold a
+/// [`CatalogGuard`] around it: the retry covers only a client that does not.
+///
+/// # Errors
+/// The server's error: at once when it is any other, and after [`CATALOG_RACE_TRIES`] runs
+/// when it is that one every time.
+pub fn batch_execute_retrying(
+    client: &mut Client,
+    statements: &str,
+) -> Result<(), postgres::Error> {
+    let run = || client.batch_execute(statements);
+    retry_catalog_race(CATALOG_RACE_PAUSE, postgres::Error::code, run)
+}
+
+/// A server-wide lock on changing the shared catalogs, held until the guard is dropped (see
+/// the rule at the top of this module). It is a session-level advisory lock on a connection of
+/// the guard's own, so it is released when the guard is dropped, and by the server when the
+/// connection dies.
+pub struct CatalogGuard {
+    session: Client,
+}
+
+impl CatalogGuard {
+    /// Waits for the lock on the test server, then holds it.
+    ///
+    /// # Panics
+    /// When [`URL_VAR`] is not set, the server cannot be reached, or the lock is not free
+    /// within five minutes.
+    #[must_use]
+    pub fn take() -> CatalogGuard {
+        CatalogGuard::on(&server_url()).expect("the lock on the shared catalogs")
+    }
+
+    /// Waits for the lock on the server at `server`, then holds it.
+    ///
+    /// # Errors
+    /// The server's error when it cannot be reached or the lock is not free within five
+    /// minutes.
+    ///
+    /// # Panics
+    /// When `server` is not a Postgres URL.
+    pub fn on(server: &str) -> Result<CatalogGuard, postgres::Error> {
+        connect(&with_database(server, LOCK_DATABASE)).and_then(|mut session| {
+            let wait = LOCK_WAIT.as_secs();
+            session
+                .batch_execute(&format!(
+                    "SET lock_timeout = '{wait}s'; SELECT pg_advisory_lock({CATALOG_LOCK_KEY})"
+                ))
+                .map(|()| CatalogGuard { session })
+        })
+    }
+}
+
+impl Drop for CatalogGuard {
+    /// Lets go of the lock. Best effort: a connection that is gone has let go already, as the
+    /// server ends a session's locks with the session.
+    fn drop(&mut self) {
+        let unlock = format!("SELECT pg_advisory_unlock({CATALOG_LOCK_KEY})");
+        let _ = self.session.batch_execute(&unlock);
+    }
+}
+
+/// Runs `statements` on a connection of its own to the server at `server`, under a
+/// [`CatalogGuard`] and with the retry of [`batch_execute_retrying`]: one call for the DDL of a
+/// test that holds no guard. Do not call it while holding one (the lock would wait for itself).
+///
+/// # Errors
+/// The server's error when it cannot be reached, the lock is not free in time, or the
+/// statements fail.
+///
+/// # Panics
+/// When `server` is not a Postgres URL.
+pub fn ddl(server: &str, statements: &str) -> Result<(), postgres::Error> {
+    CatalogGuard::on(server).and_then(|_guard| {
+        connect(server).and_then(|mut admin| batch_execute_retrying(&mut admin, statements))
+    })
+}
+
 /// A database made for one test and dropped with it, with the connections still open to it.
 pub struct TestDatabase {
     name: String,
@@ -122,10 +267,7 @@ impl TestDatabase {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let nanos = UNIX_EPOCH.elapsed().unwrap_or_default().as_nanos();
         let name = format!("kbf_t_{}_{nanos:x}_{n}", std::process::id());
-        connect(server)
-            .expect("the test server answers at the URL given")
-            .batch_execute(&format!("CREATE DATABASE \"{name}\""))
-            .expect("create the test's database");
+        ddl(server, &format!("CREATE DATABASE \"{name}\"")).expect("create the test's database");
         TestDatabase {
             name,
             server: server.to_owned(),
@@ -150,6 +292,6 @@ impl Drop for TestDatabase {
     /// behind is only clutter on a throwaway server.
     fn drop(&mut self) {
         let statement = format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", self.name);
-        let _ = connect(&self.server).and_then(|mut admin| admin.batch_execute(&statement));
+        let _ = ddl(&self.server, &statement);
     }
 }

@@ -1,7 +1,6 @@
 //! Simulation family F3, the scheduler's half: platform routing, cordon and drain
 //! together, including the last worker of a class (`docs/design/simulation.md`
-//! section 5, F3; the catalog is komira-ai/kbf#139). The rollout half
-//! (`RolloutDriver` over this scheduler) is `kbf-server`'s `tests/sim_rollout.rs`.
+//! section 5, F3; the catalog is komira-ai/kbf#139).
 //!
 //! The world (`f3_fleet/world.rs`): four workers in name order, `arm` (the only Linux
 //! arm64 machine), `mac` (the only Mac, four cores, one Xcode build), `x86-a` and
@@ -18,8 +17,8 @@
 //! silent, and silent then back cordoned), F3.3 (a worker dies while draining; the
 //! scheduler's side), F3.4 (a paused drain whose leases end later), F3.7 (a node
 //! reboots while cordoned), F3.8 (capabilities change while cordoned), and a swarm that
-//! turns every kind of act on or off per seed. F3.5, F3.6 and F3.9 need the rollout
-//! driver and are in `kbf-server`.
+//! turns every kind of act on or off per seed. F3.5, F3.6 and F3.9 needed the rollout
+//! driver, which is gone.
 //!
 //! A failing check prints its replay command:
 //! `KBF_SIM_SCENARIO=<name> KBF_SIM_SEED=<n> cargo test -p kbf-sched --test f3_fleet -- --ignored --exact replay`.

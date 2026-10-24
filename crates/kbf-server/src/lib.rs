@@ -27,15 +27,12 @@
 //!   `/ui` ([`ui_mount`]), whose reads are bounded per caller ([`read_limit`]).
 //! - A drain of the frontend ([`drain`]) that a stop signal or `POST /v1/frontend/drain`
 //!   begins, a second signal escalates, and `kbf cluster` calls through [`api_client`].
-//! - Rollouts ([`rollout`]): the record's store (in memory for now) and the driver that
-//!   cordons, drains and hands drained nodes their update, as far as `updating`.
 //! - Node rolling ([`update`]): the durable rows and facts of a split-mode update
 //!   (`docs/design/split-mode-updates.md`, sections 2.6 to 2.11). Nothing picks hosts or
 //!   steps them: updates are OS packages, driven by `kbf-updater`.
 //! - The MDM gate ([`mdm`]): the server's verbs at `kbf-mdm-gate` (inventory, enforce
 //!   and withdraw a macOS build, install an allowlisted profile; no erase), a client
-//!   over mutual TLS, and the polling of an update's DDM progress. Not yet called by
-//!   the rollout driver.
+//!   over mutual TLS, and the polling of an update's DDM progress. Nothing calls it yet.
 //! - Build history ([`history`]): off unless `--history-objects` is given, each attempt and
 //!   cache hit of an invocation a client named is recorded in an object store, off the
 //!   path of the call it belongs to, with a run id the build pages name the run by. It
@@ -124,7 +121,6 @@ pub mod release;
 pub mod replication;
 pub mod retire;
 pub mod retired;
-pub mod rollout;
 mod run_record;
 pub mod serve;
 #[cfg(test)]
@@ -140,7 +136,6 @@ pub mod storage_half;
 pub mod storage_health;
 pub mod storage_node;
 pub mod store_config;
-pub mod stored_update;
 pub mod stores;
 pub mod streams;
 #[cfg(test)]
@@ -148,7 +143,6 @@ mod test_dir;
 mod timeout;
 pub mod token;
 pub mod ui_mount;
-pub mod update;
 pub mod update_status;
 pub mod verbs;
 pub mod vitals;

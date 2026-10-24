@@ -22,7 +22,10 @@
 //!   and is otherwise enabled and left stopped. On a
 //!   frontend or all-in-one host the state database's schema is created or brought forward
 //!   ([`Schemas`]) once `installer.toml` is written, and a unit that makes a frontend is enabled
-//!   and never started.
+//!   and never started. Such a host given no `--database` gets the local default
+//!   (`postgres:///kbf?host=/run/postgresql&user=kbf-server`), and the plain login role and the
+//!   database it owns are made first ([`provision`]); setup alters neither when it is there and
+//!   never edits `pg_hba.conf`, but prints the rules the logins need.
 //! - `--mode=all-in-one` is always behind the proxy (`--proxy`): the host runs the proxy, its
 //!   frontend children and `kbf-storage-and-daemon.service` beside them. `kbf.toml` is the
 //!   sibling's (`mode = "storage-and-daemon"` on the loopback `--storage-port`) and
@@ -211,6 +214,13 @@ pub fn installer_settings(
             )));
         }
         settings.min_generation = floor;
+    }
+    // A database the file already names is the operator's, or an earlier run's with flags this
+    // run does not give: the local default does not replace it.
+    if v.database_defaulted && settings.database.is_some() && settings.database != v.database {
+        return Err(SetupError::NeedsOperator(format!(
+            "{installer_toml} names a state database and --database was not given, so setup would replace it with the local default: give --database (the same value keeps it)"
+        )));
     }
     settings.database = v.database.clone();
     // The node identity belongs to the frontend source, whichever way the file got it.
@@ -414,7 +424,16 @@ pub fn run(
     // anything is enabled: a database that cannot be reached stops setup with no unit.
     if let Some(url) = &valid.database {
         let created = match &valid.local_database {
-            Some(local) => provision::provision(os, exec, local, options.apply, out)?,
+            Some(local) => {
+                let next = provision::provision(os, exec, local, options.apply, out)?;
+                // What the server must admit is told on every run that has a local database,
+                // and before the logins are tried: a refusal ends the run there, and a rerun
+                // after one still has the lines with the names filled in.
+                for line in provision::access_lines(local, valid.mode) {
+                    writeln!(out, "{line}")?;
+                }
+                next
+            }
             None => provision::Next::Schema,
         };
         if created == provision::Next::Pending {

@@ -18,6 +18,9 @@
 //! **Fencing** ([`Fenced`]): a writer takes the store's generation, one row, when its
 //! role begins, and every write it makes checks the row in the same transaction. A
 //! writer that began later makes every write of an earlier one fail, so two never act.
+//! Frontends that share a store take no generation: [`share`] leaves the row holding
+//! [`SHARED_WRITERS`], which no generation can be read from, so a writer that takes
+//! generations is refused by the store and none is started beside the sharing frontends.
 //!
 //! With the `postgres` feature, [`postgres`] is the Postgres backend.
 //!
@@ -45,7 +48,7 @@ mod types;
 use std::time::Duration;
 
 pub use clock::{Clock, ManualClock, StoreTime, SystemClock};
-pub use fence::{Fenced, GENERATION, TakeError};
+pub use fence::{Fenced, GENERATION, SHARED_WRITERS, TakeError, decode_generation, share};
 pub use own_keys::{OwnKeys, Permit};
 pub use store::{Announcement, LivenessGuard, Store};
 pub use types::{

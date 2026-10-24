@@ -1122,18 +1122,12 @@ impl<'a> Prepared<'a> {
             }
             None => (None, futures::future::pending().boxed(), None, None),
         };
-        let update_rows = state_store.clone().map(crate::update::Rows::new);
         let object_stores = flags
             .object_store_secrets_dir
             .as_deref()
             .map(|dir| open_object_stores(dir, state_store.clone().zip(members.clone())))
             .transpose()?;
         let delivery = object_stores.as_ref().map(|stores| stores.delivery.clone());
-        let offers = crate::release::offers::offers_of(
-            releases.clone(),
-            update_rows.clone(),
-            listeners.tick,
-        );
         // Set below, where the stand is built, if there is a state store to retire over.
         let retire = Arc::new(OnceLock::new());
         let api_routes = crate::api::router(
@@ -1142,7 +1136,7 @@ impl<'a> Prepared<'a> {
             Arc::clone(&drain),
             Arc::clone(&retire),
             members.clone(),
-            update_rows.clone(),
+            state_store.clone(),
             enroll_api,
         )
         .merge(crate::verbs::routes(token.clone(), members.clone()))
@@ -1150,12 +1144,6 @@ impl<'a> Prepared<'a> {
         .merge(crate::object_store::api::routes(
             token.clone(),
             object_stores.map(|stores| stores.api),
-        ))
-        .merge(crate::release::desired::router(
-            releases.clone(),
-            update_rows,
-            token,
-            Arc::clone(&farm),
         ))
         .merge(crate::health::routes(&checks, &farm, members.as_ref()))
         .merge(metrics_route(
@@ -1186,9 +1174,6 @@ impl<'a> Prepared<'a> {
         .with_host_floor(listeners.vm_host_floor);
         // Daemons are sent the members' map: Welcome.map and a MapUpdate at each bump.
         let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
-        let sessions = offers
-            .into_iter()
-            .fold(sessions, WorkerService::with_offers);
         let worker_service = WorkerServer::new(sessions)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -1559,9 +1544,6 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
 }
 
 mod handoff;
-mod over;
-
-pub use over::start_frontend_over;
 
 #[cfg(test)]
 mod tests;

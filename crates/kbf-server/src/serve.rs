@@ -754,10 +754,8 @@ where
     // Storage nodes register with a frontend that has a state store to keep them in.
     let members = members_of(state.as_ref(), None);
     let map = map_of(map, members.as_ref())?;
-    // The update rows live in the same store, whose handle is shared.
-    let update_rows = state
-        .as_ref()
-        .map(|s| crate::update::Rows::new(Arc::clone(&s.store)));
+    // The API reads the same store, whose handle is shared.
+    let api_store = state.as_ref().map(|s| Arc::clone(&s.store));
     let farm = Arc::new(farm.with_state(state)?);
     // One start, one bind budget: the three listeners wait for a late interface together.
     let binder = Binder::new();
@@ -799,8 +797,6 @@ where
         history: history.as_ref().map(crate::history::History::reads),
         budget,
     };
-    let offers =
-        crate::release::offers::offers_of(releases.clone(), update_rows.clone(), listeners.tick);
     let api_routes = crate::api::router(
         Arc::clone(&farm),
         token.clone(),
@@ -808,18 +804,12 @@ where
         // A server with no frontend role has nothing to retire: its retire routes answer 409.
         Arc::default(),
         members.clone(),
-        update_rows.clone(),
+        api_store,
         // A server with no frontend role has no enrollment.
         None,
     )
     .merge(crate::verbs::routes(token.clone(), members.clone()))
     .merge(crate::release::router(releases.clone(), token.clone()))
-    .merge(crate::release::desired::router(
-        releases.clone(),
-        update_rows,
-        token,
-        Arc::clone(&farm),
-    ))
     .merge(crate::health::routes(&checks, &farm, members.as_ref()))
     .merge(crate::metrics::router(
         Arc::clone(&cache),
@@ -877,10 +867,6 @@ where
     .with_host_floor(listeners.vm_host_floor);
     // The map, if there is one: no branch in this generic function.
     let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
-    // The offers, if there are a release store and a state store: no branch here either.
-    let sessions = offers
-        .into_iter()
-        .fold(sessions, WorkerService::with_offers);
     let worker_service = WorkerServer::new(sessions)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);

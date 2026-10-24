@@ -7,7 +7,7 @@ use kbf_proto::reapi::GetCapabilitiesRequest;
 use kbf_proto::reapi::capabilities_client::CapabilitiesClient;
 use kbf_server::managed::{ADMIN_PROTOCOL, Managed, StoreSource};
 use kbf_state::fake::{Fake, Flaw};
-use kbf_state::{GENERATION, ManualClock};
+use kbf_state::{GENERATION, ManualClock, SHARED_WRITERS};
 use tonic::Code;
 
 use support::done_within_quiet;
@@ -95,7 +95,7 @@ impl Child {
     async fn start(flags: &FrontendFlags, store: &Arc<Fake>) -> Self {
         let managed = Managed::start(
             flags,
-            StoreSource::Shared(Arc::clone(store) as Arc<dyn Store>),
+            StoreSource::Fenced(Arc::clone(store) as Arc<dyn Store>),
             std::future::pending::<()>(),
         )
         .await
