@@ -4,7 +4,7 @@
 //! A pure function of the desired state, the fleet the heartbeats built, the host and the
 //! time. A host is told to update only if every rule below holds, checked in this order:
 //!
-//! 1. the coordinator has been up for [`QUIET_START`];
+//! 1. the coordinator has been up for [`crate::fleet::QUIET_START`];
 //! 2. the host is not already updating;
 //! 3. the host is behind: it does not run the desired version (a rollback is a desired
 //!    version older than the one the hosts run, under the same rules);
@@ -28,7 +28,7 @@ use kbf_types::{HostRole, NodeId};
 use kbf_updater::wire::{Outcome, Reply};
 
 use crate::desired::Desired;
-use crate::fleet::{Fleet, Host, QUIET_START};
+use crate::fleet::{Fleet, Host};
 
 /// What to tell the host `id` at `now`.
 #[must_use]
@@ -52,7 +52,7 @@ fn order(desired: &Desired, fleet: &Fleet, id: &NodeId, now: Duration) -> bool {
             .filter(|(other, _)| *other != id)
             .map(|(_, h)| h)
     };
-    let quiet = now < fleet.started().saturating_add(QUIET_START);
+    let quiet = fleet.is_quiet(now);
     let failed_here = host
         .beat
         .last_update

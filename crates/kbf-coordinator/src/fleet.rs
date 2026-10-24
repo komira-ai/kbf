@@ -71,6 +71,12 @@ impl Fleet {
         }
     }
 
+    /// Whether `now` is still within [`QUIET_START`] of the coordinator's start.
+    #[must_use]
+    pub fn is_quiet(&self, now: Duration) -> bool {
+        now < self.started.saturating_add(QUIET_START)
+    }
+
     /// When the coordinator started.
     #[must_use]
     pub const fn started(&self) -> Duration {

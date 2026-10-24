@@ -11,7 +11,7 @@ use subtle::ConstantTimeEq;
 
 use crate::decide::decide;
 use crate::desired::{Desired, DesiredError, DesiredStore, StoreError};
-use crate::fleet::{Fleet, QUIET_START};
+use crate::fleet::Fleet;
 use crate::identity::Identity;
 
 /// The time since the coordinator started.
@@ -120,7 +120,8 @@ impl Coordinator {
     }
 
     /// Sets the desired state from `body`, if `bearer` is a GitHub Actions OIDC token the
-    /// allow-list accepts. The check comes before the body is read.
+    /// allow-list accepts. The token is checked before the body is parsed or any state is touched
+    /// (the transport has already read the body, at most [`crate::http::MAX_DESIRED_BYTES`]).
     ///
     /// # Errors
     /// [`SetError`].
@@ -171,7 +172,7 @@ impl Coordinator {
             .collect();
         Ok(Status {
             desired: self.desired.get(),
-            quiet: now < fleet.started().saturating_add(QUIET_START),
+            quiet: fleet.is_quiet(now),
             hosts,
         })
     }

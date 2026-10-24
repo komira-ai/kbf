@@ -4,7 +4,8 @@
 //! without a restart (the files are looked at every interval, and a pair that does not make
 //! a working configuration leaves the one in use). A heartbeat listener's source requires a
 //! client certificate that chains to the farm CA; a control listener's asks for none. A
-//! connection speaks HTTP/1.1 only, and has a limit on its handshake and on its request head.
+//! connection speaks HTTP/1.1 only, and has a limit on its handshake, its request head and
+//! its request body; a listener has a limit on its connections.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -16,6 +17,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use kbf_tls::TlsSource;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
 use crate::http::{Peer, Surface, handle};
@@ -23,6 +25,11 @@ use crate::service::Coordinator;
 
 /// How long a client has to finish its TLS handshake, and then to send a request head.
 pub const CLIENT_PATIENCE: Duration = Duration::from_secs(10);
+
+/// The most connections one listener serves at once. A client with a handshake, a head or a
+/// body in flight holds one for at most [`CLIENT_PATIENCE`] each, so the cap makes a flood
+/// wait in the kernel's backlog rather than take the process's descriptors and memory.
+pub const MAX_CONNECTIONS: usize = 1024;
 
 /// One listener.
 pub struct Listener {
@@ -45,22 +52,32 @@ impl Listener {
 }
 
 /// Serves `listener` for `coordinator` for as long as the future is polled. A client gets
-/// `patience` for its handshake and again for its request head. It never returns.
+/// `patience` for its handshake, again for its request head and again for its request body,
+/// and at most `max_connections` are served at once. It never returns.
 pub async fn serve(
     listener: Listener,
     coordinator: Arc<Coordinator>,
     patience: Duration,
+    max_connections: usize,
 ) -> Infallible {
+    let slots = Arc::new(Semaphore::new(max_connections));
     loop {
+        // A slot first, then the accept: with none free, clients queue in the backlog.
+        // (The semaphore is never closed, so this is always `Some`.)
+        let slot = Arc::clone(&slots).acquire_owned().await.ok();
         match listener.tcp.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(connection(
+                let serving = connection(
                     stream,
                     listener.tls.clone(),
                     listener.surface,
                     Arc::clone(&coordinator),
                     patience,
-                ));
+                );
+                tokio::spawn(async move {
+                    serving.await;
+                    drop(slot);
+                });
             }
             Err(why) => {
                 tracing::warn!(%why, "accept failed");
@@ -100,7 +117,7 @@ async fn connection(
     let service = service_fn(move |request| {
         let coordinator = Arc::clone(&coordinator);
         let peer = peer.clone();
-        async move { Ok::<_, Infallible>(handle(&coordinator, surface, &peer, request).await) }
+        async move { Ok::<_, Infallible>(handle(&coordinator, surface, &peer, request, patience).await) }
     });
     let served = http1::Builder::new()
         .timer(TokioTimer::new())

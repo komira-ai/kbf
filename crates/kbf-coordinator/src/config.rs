@@ -21,7 +21,7 @@ use tokio::net::TcpListener;
 
 use crate::desired::DesiredStore;
 use crate::http::Surface;
-use crate::listen::{CLIENT_PATIENCE, Listener, reload_every, serve};
+use crate::listen::{CLIENT_PATIENCE, Listener, MAX_CONNECTIONS, reload_every, serve};
 use crate::service::{Clock, Coordinator};
 
 /// A start-up error, for the operator.
@@ -150,8 +150,13 @@ pub async fn run(parts: Parts, ready: impl FnOnce(Bound)) -> Result<Infallible, 
     });
     let coordinator = parts.coordinator;
     let (never, _, _) = tokio::join!(
-        serve(heartbeat, Arc::clone(&coordinator), CLIENT_PATIENCE),
-        serve(control, coordinator, CLIENT_PATIENCE),
+        serve(
+            heartbeat,
+            Arc::clone(&coordinator),
+            CLIENT_PATIENCE,
+            MAX_CONNECTIONS
+        ),
+        serve(control, coordinator, CLIENT_PATIENCE, MAX_CONNECTIONS),
         reload_every(vec![parts.heartbeat_tls, parts.control_tls], parts.reload),
     );
     match never {}

@@ -7,8 +7,9 @@
 //! so a crash leaves the old state or the new one. A file that cannot be read back is a
 //! refusal to start: the coordinator does not guess what an operator meant.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
@@ -152,6 +153,9 @@ pub enum StoreError {
 pub struct DesiredStore {
     path: PathBuf,
     current: Mutex<Option<Desired>>,
+    /// Held across a whole replacement, so that writers wait for each other and not readers:
+    /// `current` is only locked to read or to swap, never across the file's fsyncs.
+    writing: Mutex<()>,
 }
 
 fn io_at(path: &Path) -> impl FnOnce(io::Error) -> StoreError + '_ {
@@ -189,6 +193,7 @@ impl DesiredStore {
         Ok(Self {
             path: path.to_owned(),
             current: Mutex::new(current),
+            writing: Mutex::new(()),
         })
     }
 
@@ -203,9 +208,9 @@ impl DesiredStore {
     /// # Errors
     /// [`StoreError::Io`]: the file could not be replaced; the old state stands.
     pub fn set(&self, desired: Desired) -> Result<(), StoreError> {
-        let mut current = self.lock();
+        let _writer = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
         self.write(&desired)?;
-        *current = Some(desired);
+        *self.lock() = Some(desired);
         Ok(())
     }
 
@@ -221,7 +226,18 @@ impl DesiredStore {
             .map_err(io::Error::from)
             .map_err(io_at(&temp))?;
         text.push(b'\n');
-        let mut file = File::create(&temp).map_err(io_at(&temp))?;
+        // A leftover of a crash is replaced, never followed: the temporary file is created
+        // new, owner-only.
+        match fs::remove_file(&temp) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io_at(&temp)(e)),
+            _ => {}
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)
+            .map_err(io_at(&temp))?;
         file.write_all(&text).map_err(io_at(&temp))?;
         file.sync_all().map_err(io_at(&temp))?;
         fs::rename(&temp, &self.path).map_err(io_at(&self.path))?;

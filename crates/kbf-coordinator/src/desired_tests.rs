@@ -122,6 +122,39 @@ fn the_state_file_is_replaced_whole_and_leaves_nothing_behind() {
     );
 }
 
+/// Catches: the temporary file being created by following a name an attacker or a crash left
+/// there, or with the process umask: a symlink at the temporary name is replaced, not written
+/// through, the file it pointed at is untouched, and the state file is owner-only.
+#[test]
+fn a_symlink_at_the_temporary_name_is_not_followed() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let dir = dir("desired-symlink");
+    let file = dir.path().join("desired.json");
+    let victim = dir.path().join("victim");
+    fs::write(&victim, "precious").expect("written");
+    symlink(&victim, dir.path().join("desired.json.new")).expect("linked");
+    let store = DesiredStore::open(&file).expect("opened");
+    store
+        .set(Desired::parse(FULL.as_bytes()).expect("parsed"))
+        .expect("stored");
+    assert_eq!(fs::read_to_string(&victim).expect("read"), "precious");
+    let mode = fs::metadata(&file).expect("stat").permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+}
+
+/// Catches: a temporary name that cannot be cleared (a directory is there) being written
+/// anyway or passed over: the set fails with an I/O error and the old state stands.
+#[test]
+fn a_temporary_name_that_cannot_be_cleared_fails_the_set() {
+    let dir = dir("desired-blocked");
+    let file = dir.path().join("desired.json");
+    fs::create_dir(dir.path().join("desired.json.new")).expect("made");
+    let store = DesiredStore::open(&file).expect("opened");
+    let d = Desired::parse(FULL.as_bytes()).expect("parsed");
+    assert!(matches!(store.set(d), Err(StoreError::Io { .. })));
+    assert_eq!(store.get(), None);
+}
+
 /// Catches: a state file that cannot be written changing the state in memory (the answer to
 /// CI would say the state was set while a restart would lose it), and the failure not being
 /// an error.

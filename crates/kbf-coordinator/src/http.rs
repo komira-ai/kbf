@@ -12,6 +12,7 @@
 //! never a claim value, a path or the text of an internal error.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -71,25 +72,29 @@ fn bearer<B>(request: &Request<B>) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-/// The body of `request`, if it is at most `limit` bytes.
-async fn read<B>(request: Request<B>, limit: usize) -> Option<Bytes>
+/// The body of `request`, if it is at most `limit` bytes and all of it arrives within
+/// `patience`.
+async fn read<B>(request: Request<B>, limit: usize, patience: Duration) -> Option<Bytes>
 where
     B: Body,
     B::Error: Into<BoxError>,
 {
     let body = Limited::new(request.into_body(), limit);
-    body.collect()
+    tokio::time::timeout(patience, body.collect())
         .await
+        .ok()?
         .ok()
         .map(http_body_util::Collected::to_bytes)
 }
 
-/// Answers one request that came in on `surface` from `peer`.
+/// Answers one request that came in on `surface` from `peer`. A body that has not arrived
+/// whole after `patience` is a bad request.
 pub async fn handle<B>(
     coordinator: &Coordinator,
     surface: Surface,
     peer: &Peer,
     request: Request<B>,
+    patience: Duration,
 ) -> Answer
 where
     B: Body,
@@ -99,9 +104,11 @@ where
     let path = request.uri().path().to_owned();
     match (surface, method, path.as_str()) {
         (Surface::Heartbeat, Method::POST, HEARTBEAT_PATH) => {
-            heartbeat(coordinator, peer, request).await
+            heartbeat(coordinator, peer, request, patience).await
         }
-        (Surface::Control, Method::POST, DESIRED_PATH) => desired(coordinator, request).await,
+        (Surface::Control, Method::POST, DESIRED_PATH) => {
+            desired(coordinator, request, patience).await
+        }
         (Surface::Control, Method::GET, STATUS_PATH) => {
             match coordinator.status(bearer(&request)) {
                 Ok(status) => json(StatusCode::OK, &status),
@@ -116,7 +123,12 @@ where
     }
 }
 
-async fn heartbeat<B>(coordinator: &Coordinator, peer: &Peer, request: Request<B>) -> Answer
+async fn heartbeat<B>(
+    coordinator: &Coordinator,
+    peer: &Peer,
+    request: Request<B>,
+    patience: Duration,
+) -> Answer
 where
     B: Body,
     B::Error: Into<BoxError>,
@@ -132,7 +144,7 @@ where
             return error(StatusCode::FORBIDDEN, "forbidden");
         }
     };
-    let beat = read(request, MAX_HEARTBEAT_BYTES)
+    let beat = read(request, MAX_HEARTBEAT_BYTES, patience)
         .await
         .and_then(|bytes| serde_json::from_slice::<Heartbeat>(&bytes).ok());
     match beat {
@@ -141,13 +153,13 @@ where
     }
 }
 
-async fn desired<B>(coordinator: &Coordinator, request: Request<B>) -> Answer
+async fn desired<B>(coordinator: &Coordinator, request: Request<B>, patience: Duration) -> Answer
 where
     B: Body,
     B::Error: Into<BoxError>,
 {
     let token = bearer(&request).map(str::to_owned);
-    let Some(body) = read(request, MAX_DESIRED_BYTES).await else {
+    let Some(body) = read(request, MAX_DESIRED_BYTES, patience).await else {
         return error(StatusCode::BAD_REQUEST, "bad_request");
     };
     match coordinator.set_desired(token.as_deref(), &body).await {

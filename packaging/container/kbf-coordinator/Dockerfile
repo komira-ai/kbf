@@ -17,8 +17,11 @@
 #   /etc/kbf-coordinator/tls.pem, tls.key   the coordinator's certificate (role `coordinator`)
 #   /etc/kbf-coordinator/ca.pem             the farm CA certificate
 #   /etc/kbf-coordinator/oidc.toml          the allow-list of CI's OIDC token
-#   /etc/kbf-coordinator/operator.token     the operator token, mode 0600, owned by uid 10001
+#   /etc/kbf-coordinator/operator.token     the operator token, owned by uid 10001, mode 0600 or
+#                                           0400 (the coordinator refuses any other mode)
 #   /var/lib/kbf-coordinator                a volume the coordinator may write: the desired state
+#                                           (a mounted volume replaces the ownership set below:
+#                                           make it uid 10001, mode 0750)
 FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
 ENV DEBIAN_FRONTEND=noninteractive
 # CI's OIDC keys are fetched over https with the system roots.

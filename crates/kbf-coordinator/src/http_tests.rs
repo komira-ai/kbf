@@ -14,6 +14,9 @@ use serde_json::{Value, json};
 use crate::http::{DESIRED_PATH, MAX_DESIRED_BYTES, Peer, STATUS_PATH, Surface, handle};
 use crate::testutil::{OPERATOR, Rig, ci_token};
 
+/// How long a body has in the tests that are not about patience.
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
 const STATE: &str = r#"{"version":"2.0","min_up":{"storage":1,"frontend":1}}"#;
 
 fn san(sans: &[&str]) -> Vec<SanType> {
@@ -61,7 +64,7 @@ async fn call(
     peer: &Peer,
     request: Request<Full<Bytes>>,
 ) -> (StatusCode, Value) {
-    answer(handle(&rig.coordinator, surface, peer, request).await).await
+    answer(handle(&rig.coordinator, surface, peer, request, PATIENCE).await).await
 }
 
 async fn answer(response: hyper::Response<Full<Bytes>>) -> (StatusCode, Value) {
@@ -231,9 +234,51 @@ async fn a_malformed_heartbeat_is_a_bad_request() {
         .uri(HEARTBEAT_PATH)
         .body(Broken)
         .expect("a request");
-    let response = handle(&rig.coordinator, Surface::Heartbeat, &who, broken).await;
+    let response = handle(&rig.coordinator, Surface::Heartbeat, &who, broken, PATIENCE).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(hosts(&status(&rig).await).is_empty());
+}
+
+/// Catches: a client that sends a head and then no body holding the request open for ever,
+/// on either surface: after the patience the request is a bad request, nothing is noted and
+/// no state is set (the control call does not need a token to be held up either).
+#[tokio::test]
+async fn a_body_that_never_arrives_is_a_bad_request() {
+    let rig = Rig::new("http-stalled");
+    let who = updater("d1", "daemon");
+    let patience = std::time::Duration::from_millis(50);
+    for (surface, peer, path) in [
+        (Surface::Heartbeat, &who, HEARTBEAT_PATH),
+        (Surface::Control, &None, DESIRED_PATH),
+    ] {
+        let stalled = Request::builder()
+            .method("POST")
+            .uri(path)
+            .body(Stalled)
+            .expect("a request");
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            handle(&rig.coordinator, surface, peer, stalled, patience),
+        )
+        .await
+        .expect("answered after the patience, not never");
+        assert_eq!(answered.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+    assert!(hosts(&status(&rig).await).is_empty());
+}
+
+struct Stalled;
+
+impl Body for Stalled {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        Poll::Pending
+    }
 }
 
 struct Broken;
@@ -363,7 +408,9 @@ async fn the_desired_state_is_set_by_ci_and_refused_to_anyone_else() {
         )
         .await,
     ];
-    refused.push(answer(handle(&rig.coordinator, Surface::Control, &None, basic).await).await);
+    refused.push(
+        answer(handle(&rig.coordinator, Surface::Control, &None, basic, PATIENCE).await).await,
+    );
     for (code, body) in refused {
         assert_eq!(code, StatusCode::UNAUTHORIZED);
         assert_eq!(body, json!({"error": "unauthorized"}));
@@ -396,7 +443,7 @@ async fn a_bad_state_is_the_callers_fault_and_a_failing_store_is_ours() {
         .uri(DESIRED_PATH)
         .body(Broken)
         .expect("a request");
-    let response = handle(&rig.coordinator, Surface::Control, &None, broken).await;
+    let response = handle(&rig.coordinator, Surface::Control, &None, broken, PATIENCE).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(status(&rig).await["desired"], Value::Null);
 
@@ -458,6 +505,7 @@ async fn an_unreachable_issuer_is_503_and_an_unreadable_header_is_no_bearer() {
         )
         .body(Full::new(Bytes::new()))
         .expect("a request");
-    let (code, _) = answer(handle(&rig.coordinator, Surface::Control, &None, opaque).await).await;
+    let (code, _) =
+        answer(handle(&rig.coordinator, Surface::Control, &None, opaque, PATIENCE).await).await;
     assert_eq!(code, StatusCode::UNAUTHORIZED);
 }
