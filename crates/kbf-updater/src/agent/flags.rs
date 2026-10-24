@@ -20,9 +20,9 @@
 //!   Nothing renews them. The certificate says which node this is and what the host runs;
 //!   neither is a flag.
 //! - `--frontend`: the frontend's public address, the kbf-proxy. The node's drain, its undrain
-//!   and its status are three calls there, made with the updater's own certificate and no
-//!   token: the proxy admits them for the node in the certificate and for no other, and
-//!   admits nothing else from an updater. Renewals go there too.
+//!   and its status (a storage host's: its own storage view) are calls there, made with the
+//!   updater's own certificate and no token: the proxy admits them for the node in the
+//!   certificate and for no other, and admits nothing else from an updater. Renewals go there too.
 //! - `--channel`: the release channel the helper's allowlist names; the version the
 //!   coordinator names is looked up in it by the helper, never by URL.
 //! - `--helper-socket`: the socket of `kbf-host-install --serve` (default

@@ -218,16 +218,21 @@ pub const fn auth_class(route: Route) -> Option<AuthClass> {
     }
 }
 
-/// The node a host's updater may act on by this call, if the call is one of the three the
+/// The suffix of the one read besides the node's status that an updater may make about its
+/// node: `GET /v1/nodes/{id}/storage-health`.
+const STORAGE_HEALTH: &str = "/storage-health";
+
+/// The node a host's updater may act on by this call, if the call is one of the four the
 /// proxy lets an updater certificate make for its own node (`docs/design/updates.md`):
 ///
 /// - `POST /v1/nodes/{id}:drain`
 /// - `POST /v1/nodes/{id}:uncordon`
 /// - `GET /v1/nodes/{id}`
+/// - `GET /v1/nodes/{id}/storage-health`
 ///
 /// The shapes are exact. The id is a node id as the farm spells it (1 to 63 of `a-z`, `0-9`
 /// and `-`, not starting or ending with `-`), so a `.`, a `/`, a `%` or any other byte makes
-/// the call none of the three: nothing is percent-decoded or normalized, and what the proxy
+/// the call none of the four: nothing is percent-decoded or normalized, and what the proxy
 /// compares with the certificate is what the child will read. A query string makes it none of
 /// them, as does any other verb (`:cordon` included) or method.
 #[must_use]
@@ -236,6 +241,9 @@ pub fn self_node_of<'a>(method: &http::Method, uri: &'a http::Uri) -> Option<&'a
         return None;
     }
     let rest = uri.path().strip_prefix("/v1/nodes/")?;
+    if let Some(id) = rest.strip_suffix(STORAGE_HEALTH) {
+        return (method == http::Method::GET && is_node_label(id)).then_some(id);
+    }
     let (id, verb) = match rest.split_once(':') {
         Some((id, verb)) => (id, Some(verb)),
         None => (rest, None),
@@ -517,16 +525,17 @@ mod tests {
         self_node_of(&method, &uri).map(str::to_owned)
     }
 
-    /// The three calls a host's updater may make about its node, and only those shapes: the
+    /// The four calls a host's updater may make about its node, and only those shapes: the
     /// node's id is returned, and nothing else (another verb, method, query, spelling or
     /// extra segment) names a node.
     #[test]
-    fn the_node_calls_of_an_updater_are_three_exact_shapes() {
+    fn the_node_calls_of_an_updater_are_four_exact_shapes() {
         for (method, uri) in [
             ("POST", "/v1/nodes/host-1:drain"),
             ("POST", "/v1/nodes/host-1:uncordon"),
             ("GET", "/v1/nodes/host-1"),
             ("GET", "http://frontend.test/v1/nodes/host-1"),
+            ("GET", "/v1/nodes/host-1/storage-health"),
         ] {
             assert_eq!(
                 node_call(method, uri).as_deref(),
@@ -539,12 +548,33 @@ mod tests {
             Some(63)
         );
         assert_eq!(node_call("GET", "/v1/nodes/9").as_deref(), Some("9"));
+        // A node that is named like the suffix is a node like any other.
+        assert_eq!(
+            node_call("GET", "/v1/nodes/storage-health/storage-health").as_deref(),
+            Some("storage-health")
+        );
+        assert_eq!(
+            node_call("GET", "/v1/nodes/storage-health").as_deref(),
+            Some("storage-health")
+        );
         let long = format!("/v1/nodes/{}", "a".repeat(64));
         for (method, uri) in [
             ("GET", "/v1/nodes"),
             ("GET", "/v1/nodes/"),
             ("GET", "/v1/nodes/host-1/"),
             ("GET", "/v1/nodes/host-1/leases"),
+            ("POST", "/v1/nodes/host-1/storage-health"),
+            ("PUT", "/v1/nodes/host-1/storage-health"),
+            ("HEAD", "/v1/nodes/host-1/storage-health"),
+            ("GET", "/v1/nodes/host-1/storage-health/"),
+            ("GET", "/v1/nodes/host-1/storage-health?x=1"),
+            ("GET", "/v1/nodes/host-1/storage-healthx"),
+            ("GET", "/v1/nodes/host-1/x/storage-health"),
+            ("GET", "/v1/nodes/host-1:drain/storage-health"),
+            ("GET", "/v1/nodes//storage-health"),
+            ("GET", "/v1/nodes/Host-1/storage-health"),
+            ("GET", "/v1/nodes/host-1%2Fstorage-health"),
+            ("GET", "/v1/nodes/../host-2/storage-health"),
             ("POST", "/v1/nodes/host-1"),
             ("GET", "/v1/nodes/host-1:drain"),
             ("PUT", "/v1/nodes/host-1"),

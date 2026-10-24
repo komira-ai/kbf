@@ -185,10 +185,10 @@ before it worked:
    checked there. An unattested build, one of another commit, or one the channel does not have is
    refused here, and the node has not been touched.
 2. **Drain** the node at the frontend (`:drain` of the operator API, as the roll mode does for a
-   daemon host, with the updater's certificate through the proxy; a storage host is never drained) and wait for its leases, for at most
+   daemon host, with the updater's certificate through the proxy; a storage host is drained too, which does nothing when it runs no daemon) and wait for its leases, for at most
    `--drain-deadline-secs`.
 3. **Switch** (`switch`): the helper puts X on trial and restarts the units.
-4. **Health**: the node's health check (`node_health`: a storage member is `active` on the build, a daemon is connected on it) of X, held drained, for
+4. **Health**: the node's health check (`node_health`: a storage member is `active` on the build and no blob is known to be owed a copy, a daemon is connected on it) of X, held drained, for
    at most `--health-timeout-secs`, and never past the helper's deadline less ten seconds.
 5. **Confirm** X if it is healthy. If it is not, **revert**: the helper does that by itself at its
    deadline whatever this process is doing; the agent asks for it at once.
@@ -227,7 +227,7 @@ kbf-updater enroll --frontend <dns name>:<port> --node-id ID --token-file FILE -
 
 Revoking the host by its id (`POST /v1/enroll/nodes/{id}/revoke`) revokes its updater row too, so the
 renewal is refused and the certificate runs out at its end. The proxy does not read the deny list,
-so a certificate already issued keeps its three own-node calls (drain, uncordon, status) until it
+so a certificate already issued keeps its four own-node calls (drain, uncordon, status, storage health) until it
 expires: seven days by default, thirty at most. A host re-enrolled with a `replace` token stops
 the old key from renewing in the same way and does not cut off a certificate already issued.
 The `deadline_secs` of a self-drain is whatever the host sends; it only moves that host's own
@@ -242,17 +242,23 @@ The design says the full operator token must not be on hosts, and the agent does
 drain of a node (`NodeDrain`: cordon, drain, uncordon) and the node's status for its health are
 calls to the operator API, which is on the frontend's loopback. The agent makes them through the
 frontend's public proxy with its updater certificate: **the proxy admits, for that certificate,
-`POST /v1/nodes/{id}:drain`, `POST /v1/nodes/{id}:uncordon` and `GET /v1/nodes/{id}` for the
-certificate's own node id, and nothing else** (another node's id, the cordon, a listing, the update
+`POST /v1/nodes/{id}:drain`, `POST /v1/nodes/{id}:uncordon`, `GET /v1/nodes/{id}` and
+`GET /v1/nodes/{id}/storage-health` for the certificate's own node id, and nothing else** (another node's id, the cordon, a listing, the update
 API and everything else is `403`; so are the worker and build-cache paths whatever `buck2_auth`
 says), and puts the operator token in itself. The shipped units give the agent no token. The proxy's certificate for the name in `--frontend` must be the farm CA's `frontend` certificate (the agent checks the chain to the farm CA, the name and the role before it sends a byte), not a public one.
 
 What remains of the token: `--operator-api` and `--token-file` (and the proxy secret file) are an
 opt-in fallback for a host whose operator accepts the token there (anything running as the agent's
 account can then read it); given, they are used instead of the certificate. A **storage** host
-needs them: its health is read from `GET /v1/enroll/nodes` and `GET /v1/members`, which a
-certificate cannot reach, so a storage host's agent without them heartbeats and refuses every update
-order before it fetches anything, and the roll updates the host. Without `--frontend` and without
-the token an agent does the same for any host. The mechanism is behind two small ports (`Drain`,
-`HealthCheck`), so that a storage-health route a certificate may call replaces the refusal and not
-the agent.
+needs no token: its health is read from `GET /v1/nodes/{id}/storage-health`
+([../api.md](../api.md#get-v1nodesidstorage-health)), the node's own member (state and build
+commit) and two numbers about the storage as a whole, which the proxy lets its certificate read for
+its own node id only. The host is healthy when its member is `active` on the target's commit, at
+least one member is active, and no blob is known to be owed a copy (`under_replicated_blobs` is
+zero, or `null` while it cannot be told, which is not this host's to wait for). A storage host is
+drained first like a daemon host: it may run a daemon (`storage-and-daemon`), whose leases a restart
+would cut off, and a node the frontend does not know has no daemon, which is nothing to drain.
+Without `--frontend` and without the token an agent refuses every update order before it fetches
+anything. The frontend must be of the release that has the route (an older proxy answers `403`
+and the host's health stays unread, so the update is reverted): update the frontends first for that
+release, or let the roll update the storage hosts.

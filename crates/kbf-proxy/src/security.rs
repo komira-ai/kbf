@@ -49,7 +49,7 @@ impl Security {
 
     /// [`Security::authorize`] for a call that may be a host updater's, about its own node.
     ///
-    /// An updater certificate is decided by [`decide_updater`]: the three calls about its own
+    /// An updater certificate is decided by [`decide_updater`]: the four calls about its own
     /// node pass as [`Admitted::SelfNode`], anything else the updater may not make is refused.
     /// Every other caller is [`Security::authorize`].
     pub(crate) fn authorize_call(

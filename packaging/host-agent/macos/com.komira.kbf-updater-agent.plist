@@ -9,7 +9,7 @@
   frontend. The state directory is owned by _kbf-updater, mode 0700. Edit the values to the farm's.
 
   This job gives the agent NO operator token. The drain of the node, its undrain and its status
-  are three calls to the frontend (--frontend, the public proxy) made with the host's own
+  are calls to the frontend (--frontend, the public proxy) made with the host's own
   certificate: the proxy admits them for this node and for no other. A token is an opt-in
   fallback: adding --operator-api and --token-file (and their values) to ProgramArguments makes
   the agent use it instead, and anything running as _kbf-updater can then read it.

@@ -13,6 +13,9 @@
 //! - `GET /v1/storage`: whether every blob is known to have its copies elsewhere, from the
 //!   storage members' heartbeats ([`crate::storage_health`]); on a frontend with a state
 //!   store.
+//! - `GET /v1/nodes/{node}/storage-health`: one storage host's own member (state and build)
+//!   and the two storage-wide numbers its update is judged by (`storage_own`); what a host's
+//!   updater may read through kbf-proxy for its own node.
 //! - `POST /v1/nodes/{node}:cordon`, `:drain` and `:uncordon`: take a node out of
 //!   placement, drain it, or return it ([`NodeAction`]). A drain's body may be
 //!   `{"deadline_secs": N}`; without one the deadline is [`DRAIN_DEADLINE`]. The answer
@@ -95,6 +98,7 @@ use crate::token::ApiToken;
 mod node_detail;
 mod retire;
 mod safe_to_stop;
+mod storage_own;
 
 pub use safe_to_stop::{Verdict, safe_to_stop_path};
 
@@ -185,6 +189,7 @@ pub fn router(
         .route(NODES, get(nodes))
         .route(MEMBERS, get(members_view))
         .route("/v1/nodes/{target}", get(node_detail::one).post(act))
+        .route("/v1/nodes/{id}/storage-health", get(storage_own::one))
         .route("/v1/members/{id}", post(set_member_state))
         .route("/v1/members/{id}/safe-to-stop", get(safe_to_stop::check))
         .route(DENIED, post(deny_entry).delete(allow_entry))

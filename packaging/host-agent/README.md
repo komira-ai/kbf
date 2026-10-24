@@ -49,14 +49,16 @@ command, which `crates/kbf-updater/tests/agent_packaging.rs` checks against the 
   renews them.)
 - **A configuration for the helper's channels**: on Linux `/etc/kbf/host-install-releases.toml`,
   on a Mac the existing `host-install.toml`. See `docs/deploy/host-install.md`, "The local socket".
-- **No operator token, as shipped.** The drain of the node, its undrain and its status are three
-  calls to the frontend (`--frontend`) made with the host's own certificate. The frontend's
-  proxy admits exactly those three, for the node in the certificate and no other, and puts the
+- **No operator token, as shipped.** The drain of the node, its undrain, its status and (for a
+  storage host) its storage health are calls to the frontend (`--frontend`) made with the host's own
+  certificate. The frontend's proxy admits exactly those four, for the node in the certificate and
+  no other, and puts the
   operator token in itself, so the host never holds it (`docs/design/updates.md`, "Trust"). An
   operator who wants the full token on a host adds `--operator-api` and `--token-file` to the
   agent's command line (the API is on the frontend's loopback), knowing that the agent's account
   can then read it; the agent uses it instead of the certificate.
-- **A storage host's health** is read from operator routes a certificate cannot reach, so a
-  storage host needs the token above or is updated by the roll: its agent heartbeats and
-  refuses update orders until then.
+- **A storage host needs no token either.** Its health is the node's own storage view
+  (`GET /v1/nodes/{id}/storage-health`), which the proxy admits for the node in the certificate
+  and no other, and the agent drains the node first in case it also runs a daemon. The frontend
+  must be of the release that has the route (`docs/deploy/kbf-updater.md`, "The boundary").
 - **A frontend host is not served**: its certificate is refused. The roll updates frontends.

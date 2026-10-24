@@ -37,6 +37,7 @@ http_invocations,http_sched,http_history,enroll/api,ui_mount}.rs` and `frontend.
 |---|---|---|---|
 | cluster status (nodes, software, placement) | `GET /v1/nodes` | [F] | open |
 | one node (capacity, booked, free, leases) | `GET /v1/nodes/{node}` | [F] | open |
+| one storage host's own member and the storage numbers (its updater's health read) | `GET /v1/nodes/{node}/storage-health` | [F] | open |
 | list members of the storage map | `GET /v1/members` | [F] | open |
 | leases the scheduler holds (paged, by node) | `GET /v1/leases` | [F] | open |
 | the queue: depth, ages, why work waits | `GET /v1/queue` | [F] | open |

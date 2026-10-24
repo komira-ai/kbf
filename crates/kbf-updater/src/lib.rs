@@ -75,6 +75,8 @@ mod listener_tests;
 #[cfg(test)]
 mod node_drain_tests;
 #[cfg(test)]
+mod node_health_own_tests;
+#[cfg(test)]
 mod node_health_tests;
 #[cfg(test)]
 mod pool_http_tests;

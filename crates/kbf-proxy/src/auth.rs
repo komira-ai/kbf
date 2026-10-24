@@ -11,7 +11,7 @@
 //!   it (a certificate is neither needed nor enough, and a wrong token is a refusal even
 //!   next to a good certificate: one mechanism per mode, no fallback).
 //! - Operator and update classes: the operator token, whatever the certificate says, except
-//!   for a host updater's certificate ([`decide_updater`]): it makes the three calls about its
+//!   for a host updater's certificate ([`decide_updater`]): it makes the four calls about its
 //!   own node and no others, and the proxy then presents the operator token itself.
 //! - Enroll class: open. A node enrolling has no certificate yet; the child checks the
 //!   enrollment token (or, for a renewal, the key the registry holds).
@@ -238,7 +238,7 @@ fn token_ok(expected: Option<&Token>, presented: Presented<'_>) -> Result<(), Re
 }
 
 /// Decides a call whose verified certificate has the role `updater`: a host's updater may make
-/// the three calls about its own node that [`crate::route::self_node_of`] names, and the calls
+/// the four calls about its own node that [`crate::route::self_node_of`] names, and the calls
 /// anyone may make (probes, the UI, enrollment); nothing else, whatever token it presents.
 /// `self_node` is the node the call is a self-node call for, if it is one.
 ///

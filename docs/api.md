@@ -219,9 +219,36 @@ the list:
 path segment. `404` with `{"error": "no_node"}` for a node that has not registered since
 this server started, and for an id that ends in `:cordon`, `:drain` or `:uncordon`: that
 is a write's path, and a read of it is never a node (an id that holds another colon,
-`host:8080`, is read as it is). A path below the node (`/v1/nodes/{id}/...`) is `404`.
+`host:8080`, is read as it is). A path below the node is `404`, except
+[`/v1/nodes/{id}/storage-health`](#get-v1nodesidstorage-health).
 The node's recent failed runs are not here: they are `GET /v1/runs?node=` with
 `--history-objects`.
+
+## `GET /v1/nodes/{id}/storage-health`
+
+A storage host's own storage health, and nothing else of the storage: what the updater of a
+host reads, through the frontend's proxy with its certificate, to judge the update of its
+storage process (`design/updates.md`, "Trust"). A read open like the list, and one that
+changes nothing.
+
+```json
+{ "node": "st1", "half": "member",
+  "member": { "id": 4, "state": "active", "build_commit": "0123456789ab" },
+  "storage": { "members_active": 3, "under_replicated_blobs": 0 } }
+```
+
+| Field | Meaning |
+|---|---|
+| `half` | how the node stands to the storage members. `member`: its storage half is the member whose address it enrolled with, joined as the controller and safe-to-stop join them. `no_storage`: it enrolled with no storage address. `unknown_node`: the enrollment registry does not know it. `unlinked`: no member, or more than one, has its address |
+| `why` | for `unknown_node` and `unlinked` only: which, in one line |
+| `member` | for `member` only (`null` otherwise): that member's own `id`, `state` (as in `GET /v1/members`) and `build_commit` (`null` if it said none or its row lapsed). No other member is named, and no address |
+| `storage.members_active` | the members whose state is `active`, as in `GET /v1/storage` |
+| `storage.under_replicated_blobs` | blobs held once that should be held twice, as in `GET /v1/storage`; `null` while unknown, never zero |
+
+`{id}` is the node id as the rest of `/v1/nodes` takes it. A server without a state store keeps
+no members and answers `404`; a store or registry that cannot be read answers `503`.
+Through kbf-proxy, an `updater` certificate is admitted to this route for its own node id
+only.
 
 ## `GET /v1/members`
 

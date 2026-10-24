@@ -37,6 +37,19 @@
 //! once when the registry does not know the id, or the node has no storage address (it is not
 //! a storage node, and no wait will make it one).
 //!
+//! # A storage host asked by its own updater
+//!
+//! A host's updater has no operator token; the frontend's proxy lets its certificate read
+//! exactly one more thing about its own node, `GET /v1/nodes/{id}/storage-health`
+//! (`docs/api.md`), and [`NodeHealth::for_updater`] judges a storage host from that alone.
+//! The frontend has joined the node to its member (as above) and says `member` (that
+//! member's own `state` and `build_commit`, and no other), `no_storage`, `unknown_node` or
+//! `unlinked`, with two numbers about the storage as a whole. The host is **healthy** when
+//! its member is `active` on the target's commit, at least one member is active, and no
+//! blob is known to be owed a copy (`under_replicated_blobs` is zero or unknown: a number
+//! that cannot be told because another member is down is not this host's to wait for). The
+//! roll waits otherwise, and fails at once for `no_storage` and `unknown_node`.
+//!
 //! # A daemon host
 //!
 //! The daemon reports no build commit to the frontend (`Hello` carries only
@@ -60,7 +73,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::health::{commit_of, names};
-use crate::inventory::{Host, Role};
+use crate::inventory::{Host, Role, valid_node_id};
 use crate::operator::{CHECK, OperatorApi, WHAT};
 use crate::ports::{Health, HealthCheck, Installer, PortError};
 use crate::version::Version;
@@ -108,18 +121,74 @@ struct Placement {
     state: String,
 }
 
+/// How a node stands to the storage members, in `GET /v1/nodes/{id}/storage-health`.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Half {
+    Member,
+    NoStorage,
+    UnknownNode,
+    Unlinked,
+}
+
+/// The answer of `GET /v1/nodes/{id}/storage-health`.
+#[derive(Deserialize)]
+struct OwnStorage {
+    half: Half,
+    why: Option<String>,
+    member: Option<OwnMember>,
+    storage: Whole,
+}
+
+#[derive(Deserialize)]
+struct OwnMember {
+    id: u64,
+    state: String,
+    build_commit: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Whole {
+    members_active: usize,
+    under_replicated_blobs: Option<u64>,
+}
+
+/// Where a storage host's health is read from.
+#[derive(Clone, Copy)]
+enum StorageView {
+    /// The enrollment registry and the member list: the operator's token reads both.
+    Lists,
+    /// The node's own view: all a host's updater certificate may read.
+    Own,
+}
+
 /// Health of storage and daemon hosts, over the frontend's operator API.
 pub struct NodeHealth {
     api: OperatorApi,
     /// Asked what commit a daemon host runs.
     installer: Arc<dyn Installer>,
+    storage_view: StorageView,
 }
 
 impl NodeHealth {
     /// A health check over a client that was made (and its files checked) already, and the
     /// installer that tells what commit a daemon host runs.
     pub fn with_api(api: OperatorApi, installer: Arc<dyn Installer>) -> NodeHealth {
-        NodeHealth { api, installer }
+        NodeHealth {
+            api,
+            installer,
+            storage_view: StorageView::Lists,
+        }
+    }
+
+    /// As [`NodeHealth::with_api`], for a client that is a host's updater (no token): a storage
+    /// host is judged from its own view and the two storage numbers, which its certificate may
+    /// read.
+    pub fn for_updater(api: OperatorApi, installer: Arc<dyn Installer>) -> NodeHealth {
+        NodeHealth {
+            storage_view: StorageView::Own,
+            ..NodeHealth::with_api(api, installer)
+        }
     }
 
     /// `GET path` and its JSON: `None` for a 404, an error for any other status than 200.
@@ -195,6 +264,25 @@ impl NodeHealth {
         })
     }
 
+    /// A storage host judged from its own view (see the module docs).
+    fn storage_own(&self, host: &Host, target: &Version) -> Result<Health, PortError> {
+        let commit = match commit_of(target) {
+            Ok(commit) => commit,
+            Err(health) => return Ok(health),
+        };
+        let alias = &host.alias;
+        let node = host
+            .node_id
+            .as_deref()
+            .filter(|id| valid_node_id(id))
+            .ok_or_else(|| PortError::other(format!("{alias} has no usable node id")))?;
+        let path = format!("/v1/nodes/{node}/storage-health");
+        let own: OwnStorage = self.read(&path)?.ok_or_else(|| {
+            PortError::other(format!("{WHAT} keeps no storage members (404 on {path})"))
+        })?;
+        Ok(own_health(alias, commit, own))
+    }
+
     /// `held`: the roll holds the node drained, so it is not asked to be serving.
     fn daemon(&self, host: &Host, target: &Version, held: bool) -> Result<Health, PortError> {
         let commit = match commit_of(target) {
@@ -226,6 +314,46 @@ impl NodeHealth {
     }
 }
 
+/// What a storage host's own view says of it, for the target's `commit`.
+fn own_health(alias: &str, commit: &str, own: OwnStorage) -> Health {
+    match (own.half, own.member) {
+        (Half::UnknownNode, _) => Health::Abandoned(format!(
+            "{alias} is not an enrolled node; its alias must be the id it enrolled with"
+        )),
+        (Half::NoStorage, _) => Health::Abandoned(format!(
+            "{alias} advertises no storage address, so it has no storage member"
+        )),
+        (Half::Unlinked, _) => Health::Waiting(
+            own.why
+                .unwrap_or_else(|| format!("no storage member is registered at {alias}'s address")),
+        ),
+        (Half::Member, None) => Health::Waiting(format!("{alias}'s member is not named")),
+        (Half::Member, Some(member)) => member_own_health(commit, &member, &own.storage),
+    }
+}
+
+/// The health of a host whose member is `member`, with the storage as it is.
+fn member_own_health(commit: &str, member: &OwnMember, storage: &Whole) -> Health {
+    let id = member.id;
+    if member.state != "active" {
+        return Health::Waiting(format!("member m{id} is {}, not active", member.state));
+    }
+    match member.build_commit.as_deref() {
+        None => return Health::Waiting(format!("member m{id} has not reported its build commit")),
+        Some(built) if !names(built, commit) => {
+            return Health::Waiting(format!("member m{id} runs build {built}, not the target's"));
+        }
+        Some(_) => {}
+    }
+    if storage.members_active == 0 {
+        return Health::Waiting("no storage member is active".to_owned());
+    }
+    match storage.under_replicated_blobs {
+        Some(owed @ 1..) => Health::Waiting(format!("{owed} blobs are still owed their copies")),
+        Some(0) | None => Health::Healthy,
+    }
+}
+
 impl HealthCheck for NodeHealth {
     /// A frontend that is no pool member is refused before it is installed, not after (see
     /// [`NO_MEMBER_REFUSAL`]).
@@ -242,7 +370,10 @@ impl HealthCheck for NodeHealth {
         match host.role {
             Role::Frontend => Ok(Health::Abandoned(MEMBER_ELSEWHERE.to_owned())),
             Role::Daemon | Role::MacDaemon => self.daemon(host, target, false),
-            Role::Storage => self.storage(host, target),
+            Role::Storage => match self.storage_view {
+                StorageView::Lists => self.storage(host, target),
+                StorageView::Own => self.storage_own(host, target),
+            },
         }
     }
 

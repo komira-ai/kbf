@@ -1,5 +1,5 @@
-//! A host's updater at the proxy: the three calls about its own node (drain, uncordon and
-//! status) with its updater certificate and no token, and nothing else. The child gets the
+//! A host's updater at the proxy: the four calls about its own node (drain, uncordon, status and
+//! its storage health) with its updater certificate and no token, and nothing else. The child gets the
 //! operator token the proxy holds and never anything the host sent; every other call, other
 //! node, other route and other certificate role is refused before a child is asked.
 //!
@@ -19,6 +19,7 @@ use crate::identity::Identity;
 const DRAIN: &str = "/v1/nodes/host-1:drain";
 const UNCORDON: &str = "/v1/nodes/host-1:uncordon";
 const STATUS: &str = "/v1/nodes/host-1";
+const OWN_STORAGE: &str = "/v1/nodes/host-1/storage-health";
 /// What a host sends in place of the token: a value the proxy must not pass on.
 const HOST_TOKEN: &str = "whatever-the-host-holds-0123456789abcdef";
 
@@ -47,10 +48,10 @@ fn authorization(rig: &Rig, path: &str) -> Vec<Option<String>> {
         .collect()
 }
 
-/// The three calls reach the child, whatever the host put in `Authorization` (nothing, or a
+/// The four calls reach the child, whatever the host put in `Authorization` (nothing, or a
 /// token of its own), and the child sees the operator token and not the host's.
 #[tokio::test(start_paused = true)]
-async fn an_updater_drains_uncordons_and_reads_its_own_node() {
+async fn an_updater_drains_uncordons_and_reads_its_own_node_and_storage_health() {
     for host_sends in [None, Some(HOST_TOKEN)] {
         let rig = rig(Buck2Auth::None, PeerRole::Updater, "host-1");
         let mut client = rig.client().await;
@@ -58,6 +59,7 @@ async fn an_updater_drains_uncordons_and_reads_its_own_node() {
         for (method, path, body) in [
             ("POST", DRAIN, &b"{\"deadline_secs\":600}"[..]),
             ("GET", STATUS, b""),
+            ("GET", OWN_STORAGE, b""),
             ("POST", UNCORDON, b""),
         ] {
             let reply = client.plain(method, path, body).await;
@@ -68,21 +70,36 @@ async fn an_updater_drains_uncordons_and_reads_its_own_node() {
                 "{method} {path}"
             );
         }
-        assert_eq!(rig.a().state.dispatches(), 3);
+        assert_eq!(rig.a().state.dispatches(), 4);
     }
 }
 
 /// An updater is refused every other call before the child is asked, with the operator token
 /// beside its certificate or not: another node's id (every spelling of it), the cordon, a
-/// listing, the wrong method, a query, the update API, the operator API at large, the metrics
+/// listing, the storage members and the whole storage's health, the enrollment registry, the wrong method, a query, the update API, the operator API at large, the metrics
 /// and the worker and build-cache paths.
 #[tokio::test(start_paused = true)]
-async fn an_updater_is_refused_everything_but_its_own_nodes_three_calls() {
-    let calls: [(&str, &str); 22] = [
+async fn an_updater_is_refused_everything_but_its_own_nodes_four_calls() {
+    let calls: [(&str, &str); 37] = [
         ("POST", "/v1/nodes/host-2:drain"),
         ("POST", "/v1/nodes/host-2:uncordon"),
         ("GET", "/v1/nodes/host-2"),
         ("POST", "/v1/nodes/host-1:cordon"),
+        ("GET", "/v1/nodes/host-2/storage-health"),
+        ("GET", "/v1/nodes/HOST-1/storage-health"),
+        ("GET", "/v1/nodes/host-1/storage-health?node=host-2"),
+        ("GET", "/v1/nodes/host-1/storage-health/"),
+        ("GET", "/v1/nodes/host-1/storage-healthx"),
+        ("GET", "/v1/nodes/host-1%2Fstorage-health"),
+        ("GET", "/v1/nodes/host-2/../host-1/storage-health"),
+        ("POST", OWN_STORAGE),
+        ("PUT", OWN_STORAGE),
+        ("DELETE", OWN_STORAGE),
+        ("GET", "/v1/storage"),
+        ("GET", "/v1/members"),
+        ("GET", "/v1/members/host-1/safe-to-stop"),
+        ("GET", "/v1/enroll/nodes"),
+        ("GET", "/v1/health"),
         ("GET", "/v1/nodes"),
         ("GET", "/v1/nodes/host-1/leases"),
         ("POST", "/v1/nodes/host-1"),
@@ -140,7 +157,12 @@ async fn node_and_frontend_certificates_get_no_scoped_calls() {
         let mut client = rig.client().await;
         for bearer in [None, Some(HOST_TOKEN.to_owned())] {
             client.bearer = bearer.clone();
-            for (method, path) in [("POST", DRAIN), ("GET", STATUS), ("POST", UNCORDON)] {
+            for (method, path) in [
+                ("POST", DRAIN),
+                ("GET", STATUS),
+                ("GET", OWN_STORAGE),
+                ("POST", UNCORDON),
+            ] {
                 let reply = client.plain(method, path, b"").await;
                 assert_eq!(
                     reply.status,
