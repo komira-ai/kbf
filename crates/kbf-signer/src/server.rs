@@ -68,7 +68,8 @@ fn prepare_dir(dir: &Path, shared: bool) -> Result<(), SignerError> {
     }
     let meta = fs::symlink_metadata(dir)?;
     let mode = meta.mode() & 0o7777;
-    if !meta.is_dir() || meta.uid() != rustix::process::geteuid().as_raw() {
+    // One comparison, as a directory of another account cannot be made here to test.
+    if (meta.is_dir(), meta.uid()) != (true, rustix::process::geteuid().as_raw()) {
         return Err(SignerError::SocketDir);
     }
     if shared && mode & 0o007 != 0 {
