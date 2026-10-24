@@ -6,10 +6,10 @@ This page is about a host that is already set up with [`kbf-installer setup`](kb
 | way | state in this build |
 |---|---|
 | by hand, with `kbf-deploy host install` and a restart | only a host of the earlier layout, whose units run `releases/current/kbf`; the `kbf` package's units run `/usr/bin/kbf` |
-| `kbf-installer update --frontend`, through the proxy's update API | the host fetches from its `url` source; a refused order is reported late (see below) |
+| `kbf-installer update --frontend`, through the proxy's update API | removed, with the proxy's supervision of frontend children (see (b)) |
 | the operating-system package, applied by `kbf-updater` | the way a host normally takes a release (see (c)) |
 
-The first two use the same layout: each release in `releases/<commit>/` of the installer tree, the links
+The by-hand way uses this layout: each release in `releases/<commit>/` of the installer tree, the links
 `releases/current` and `releases/previous`, and `state.json`. See
 [host releases](host-releases.md) for the layout and what is trusted.
 
@@ -99,62 +99,16 @@ until the first member is `active` again before the next. The frontend has its o
 cluster drain --frontend`, for a restart that must not cut a build's stream
 (`POST /v1/frontend/drain`, see [the operator API](../api.md)).
 
-## (b) `kbf-installer update --frontend`
+## (b) `kbf-installer update --frontend` (removed)
 
-On a frontend host that runs behind the bundled proxy (`setup --proxy`), the proxy serves an update
-API at `/v1/update/frontend`. `kbf-installer update` is its client. It swaps the host's frontend
-and waits for the update to end.
-
-```text
-kbf-installer update --frontend --commit <40 hex> \
-    --api 127.0.0.1:8980 --api-ca /etc/kbf/ca.pem --api-server-name frontend.example.invalid \
-    [--token-file /etc/kbf/api-token] [--nodes] [--source fetch|staged] [--request-id ID] \
-    [--handover-timeout-s 3600]
-```
-
-| flag | meaning |
-|---|---|
-| `--commit` | the release to update to |
-| `--frontend` | required: update this host's frontend |
-| `--api` | the proxy's public address as `host:port`; it must be a loopback address |
-| `--api-ca`, `--api-server-name` | the CA the API's certificate is verified against, and the name it carries (the address's own IP when none is given) |
-| `--token-file` | the operator token, a file of mode 0600 or 0400 (default `/etc/kbf/api-token`, which `setup` writes) |
-| `--nodes` | recorded in the update; the swap sends the new frontend no order for the nodes either way, and the nodes take their release from the host's packages |
-| `--source` | where the release comes from: `fetch` (the default) is the source the installer is configured with; `staged` is the release the host's package carries (`available` in `status.json`). A host whose `release_source` is `bundled` fetches nothing and refuses `fetch` (exit 3, `source_refused`); the proxy refuses `staged` with `--nodes` or a rollback (`source_refused`) and for a commit the package does not carry (`not_staged`), both exit 3 |
-| `--request-id` | names this update, so a run repeated after a lost connection is the same update; random when not given |
-| `--handover-timeout-s` | how long to wait for the update to end, the new frontend's bake included (default 3600) |
-
-It needs no root and is refused when it comes through `sudo` (exit 2): run it as the account that
-may read the token file. It prints one JSON summary line. The exit codes are 0 for done (and for a
-frontend that already runs the commit), 1 for failed, rolled back, a timeout or an API that does not
-answer, 2 for a usage error (`--source staged` with `--nodes` is one), 3 when the release is
-incompatible or incomplete or when the host will not take the source (`source_refused`,
-`not_staged`), and 4 when an update is open, an old child is still draining, or the installer is
-busy.
-
-The swap sends the new frontend no order for the nodes, so an update does not fail there. An
-update record an earlier build of the proxy wrote can still name `nodes` as the failed step: the
-frontend was swapped and serves, and the nodes were not told. `kbf-installer deploy` is refused on a
-host whose `release_source` is `bundled` (exit 3, `source_refused`, before the bundle is read): it
-can only fetch.
-
-The API refuses a new update with `503` (`handover_unavailable`) when `update.json` is unreadable,
-when the host has no `releases/` directory, when no frontend child was adopted (the proxy's start-up
-hold is in force), or when the other slot is still running a process.
-
-**What works, and what does not yet.** The API writes a `frontend_update` order, and the root half
-(`kbf-installer run`) fetches, verifies and stages the release. The root half now has a release
-fetcher: it reads `installer.toml` and `installer.conf` at each fetch and fetches from the `url`
-source, the only source a frontend or all-in-one host can be set up with. The root half names the
-proxy's order it refused (`status.json` carries `refused_order_id` beside the `refusal`), so an order that is
-refused (a failed fetch, a failed check) ends the update failed at once, with the refusal's own
-word as the reason. An installer from before that field names no order, and then the update waits out
-the API's staging deadline (15 minutes by default) and ends failed with reason `timeout`; the cause
-is in the `refusal` of `status.json`. One thing is missing:
-
-- No test drives a fetch through the fetch child from `installer.toml`, so the first update on a
-  host is the first proof that its `url` source, its trust files and its fetch user work. Keep the
-  by-hand path (a) as the way back.
+The proxy no longer serves an update API: `/v1/update/frontend` answers `503`, and there is no
+`kbf-installer update` client. The two-slot supervision it belonged to was removed with it: the
+proxy starts, adopts and swaps no frontend child, it writes no `update.json`, `boot.json` or
+`releases.json`, and a `[proxy]` table with the `upstream` table is refused at start (exit 2).
+`kbf-installer proxy` keeps `--kbf-binary`, `--update-dir` and `--orders-dir` as flags that are
+accepted, ignored and warned about, so that a unit written before the removal still starts. A
+frontend host behind the proxy runs a pool of frontends that run on their own
+(`[[proxy.frontend]]` tables), and a pool is rolled as in (c).
 
 ## (c) By package, with `kbf-updater`
 

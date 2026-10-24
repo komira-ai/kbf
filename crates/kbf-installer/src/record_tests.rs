@@ -377,31 +377,27 @@ fn a_frontend_update_is_a_locator_and_nothing_else() {
     }
 }
 
-/// Catches the proxy's order writer and the two readers drifting apart, which is how the
-/// record format once contradicted the design with every unit green: the proxy writes
-/// [`Locator`] as `serde_json` would, and each of the three verbs it sends is accepted by
-/// this crate's parser, by `kbf-update`'s (the format both ends share) and by the root half's
-/// `helper::order::parse`, which yields the same ids and verb and no claims. The same bytes
-/// with components or expected facts added to a `frontend_update` are refused by all three,
-/// and a locator whose verb is `activate` is no activation in any of them (it has no files
-/// to fetch).
-///
-/// Catches: `kbf-update`'s `check` letting a `frontend_update` carry components (its
-/// refusal below is the one that goes red); the installer's `check_shape` doing the same;
-/// `helper::order::parse` mapping the locator to `Verb::Activate`.
+/// Asserts that the three readers of an order record agree on a locator, the six-key record
+/// (`order_id`, `epoch`, `generation`, `verb`, `commit`, `window_s`) that names a release and
+/// carries nothing to fetch: each of the verbs `frontend_update`, `confirm` and `revert` is
+/// accepted by this crate's parser, by `kbf-update`'s (the format both ends share) and by the
+/// root half's `helper::order::parse`, which yields the same ids and verb and no claims. The
+/// same bytes with components or expected facts added to a `frontend_update` are refused by
+/// all three, and a locator whose verb is `activate` is no activation in any of them (it has
+/// no files to fetch).
 #[test]
-fn what_the_proxy_writes_both_readers_accept_and_what_it_cannot_say_both_refuse() {
+fn a_locator_is_accepted_by_all_three_readers_and_what_it_cannot_say_is_refused_by_all() {
     use crate::helper::order::{self, Verb as HelperVerb};
-    use crate::proxy::model::{Locator, Source, Verb as ProxyVerb};
 
-    let locator = |verb| Locator {
-        order_id: 45,
-        epoch: 3,
-        generation: 18,
-        verb,
-        commit: crate::testkit::c(crate::testkit::B),
-        window_s: 900,
-        source: Source::Fetch,
+    let locator = |verb: &str| {
+        json!({
+            "order_id": 45,
+            "epoch": 3,
+            "generation": 18,
+            "verb": verb,
+            "commit": crate::testkit::B,
+            "window_s": 900,
+        })
     };
     let readers = |bytes: &[u8]| {
         (
@@ -410,34 +406,23 @@ fn what_the_proxy_writes_both_readers_accept_and_what_it_cannot_say_both_refuse(
             order::parse(3, 45, bytes).map(|o| (o.verb, o.claims)),
         )
     };
-    for (sent, installer, update, helper) in [
+    for (update, installer, helper) in [
         (
-            ProxyVerb::FrontendUpdate,
-            OrderVerb::FrontendUpdate,
             "frontend_update",
+            OrderVerb::FrontendUpdate,
             HelperVerb::FrontendUpdate,
         ),
-        (
-            ProxyVerb::Confirm,
-            OrderVerb::Confirm,
-            "confirm",
-            HelperVerb::Confirm,
-        ),
-        (
-            ProxyVerb::Revert,
-            OrderVerb::Revert,
-            "revert",
-            HelperVerb::Revert,
-        ),
+        ("confirm", OrderVerb::Confirm, HelperVerb::Confirm),
+        ("revert", OrderVerb::Revert, HelperVerb::Revert),
     ] {
-        let bytes = serde_json::to_vec(&locator(sent)).expect("bytes");
+        let bytes = serde_json::to_vec(&locator(update)).expect("bytes");
         let (a, b, c) = readers(&bytes);
         assert_eq!(a, Ok(installer), "{update}: this crate");
         assert_eq!(b, Ok(update), "{update}: kbf-update");
         assert_eq!(c, Ok((helper, None)), "{update}: the root half");
     }
 
-    let sent = serde_json::to_value(locator(ProxyVerb::FrontendUpdate)).expect("value");
+    let sent = locator("frontend_update");
     let extras: [(&str, Value); 2] = [
         ("components", json!([order_component()])),
         (
@@ -459,7 +444,7 @@ fn what_the_proxy_writes_both_readers_accept_and_what_it_cannot_say_both_refuse(
         assert!(c.is_err(), "{key}: the root half took it");
     }
 
-    let bytes = serde_json::to_vec(&locator(ProxyVerb::Activate)).expect("bytes");
+    let bytes = serde_json::to_vec(&locator("activate")).expect("bytes");
     let (a, b, c) = readers(&bytes);
     assert!(a.is_err(), "this crate: {a:?}");
     assert!(b.is_err(), "kbf-update: {b:?}");

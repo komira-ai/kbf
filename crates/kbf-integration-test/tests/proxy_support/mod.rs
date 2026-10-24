@@ -1,7 +1,7 @@
-//! What the two proxy soaks share (`proxy_soak.rs`, `proxy_aio_soak.rs`): real `kbf`
-//! children (this test binary run through a link named `kbf`), the TLS h2 client of the
+//! What the proxy tests share (`proxy_soak.rs`, `proxy_pool.rs`, `ui_through_proxy.rs`): real
+//! `kbf` children (this test binary run through a link named `kbf`), the TLS h2 client of the
 //! proxy, the `Execute` streams a Buck2 build holds open, and reads of a child's own count
-//! of them. Each soak says in its own header what it proves with them.
+//! of them. Each test says in its own header what it proves with them.
 
 use std::io::{BufReader, Read as _, Write as _};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};

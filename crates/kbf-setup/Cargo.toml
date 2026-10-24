@@ -15,14 +15,15 @@ publish.workspace = true
 # paths; this crate never depends on it.
 #
 # Two programs run this library: `kbf-installer setup` and `kbf setup` (crates/kbf-cli). Only the
-# first sets a host up behind `kbf-installer proxy`, so the proxy's side is the `proxy` feature,
-# which kbf-installer turns on and kbf-cli does not: the `kbf` binary links no kbf-proxy
-# (tests/layering.rs in kbf-integration-test checks the tree of `cargo build -p kbf-cli`).
+# first keeps the `[proxy]` table that `kbf-installer proxy` reads, so the proxy's side is the
+# `proxy` feature, which kbf-installer turns on and kbf-cli does not: the `kbf` binary links no
+# kbf-proxy (tests/layering.rs in kbf-integration-test checks the tree of `cargo build -p
+# kbf-cli`).
 
 [features]
-# `proxy`: `setup --proxy` and its flags (`setup::proxy`), the `[proxy]` table of installer.toml
-# (`installer_toml`) and the host's proxy units. Without it a `[proxy]` table is refused, never
-# rewritten, and `--mode=all-in-one` (always behind the proxy) is refused.
+# `proxy`: the `[proxy]` table of installer.toml (`installer_toml`), read, kept and written back
+# as it is, and the proxy's flags (`setup::proxy`), which `kbf-installer setup` takes only to
+# refuse. Without it a `[proxy]` table is refused, never rewritten.
 proxy = ["dep:kbf-proxy"]
 
 [dependencies]

@@ -8,8 +8,6 @@
 
 use kbf_host::{Cmd, Entry, Exec, HostPath, Owner, Perms, Plan, Planner, RunUser};
 
-use super::aio_migrate::Earlier;
-use super::kbf_settings::Setting;
 use super::kbf_toml::{self, Decision, Ours, UpdateDirs};
 use super::os::{DSCL, LAUNCHCTL, Os, SYSTEMCTL, View};
 use super::paths;
@@ -30,18 +28,14 @@ const MAC_ID_TO: u32 = 400;
 /// The launchd labels: the installer's plist is the package's; the daemon's is the release's.
 pub const MAC_INSTALLER_LABEL: &str = "com.komira.kbf-installer";
 pub const MAC_DAEMON_LABEL: &str = "com.komira.kbf-daemon";
-/// The units of a frontend host behind the proxy.
-pub const PROXY_UNITS: &[&str] = &["kbf-proxy.socket", "kbf-proxy.service"];
-/// The sibling of an all-in-one host's proxy: the storage and the daemon in one process.
+/// The unit of a storage-and-daemon host: the storage and the daemon in one process.
 pub const STORAGE_AND_DAEMON_UNIT: &str = "kbf-storage-and-daemon.service";
-/// The unit of the earlier all-in-one layout, one process for everything; `setup` splits its
-/// `kbf.toml` and leaves the unit to the operator.
-pub const EARLIER_ALL_IN_ONE_UNIT: &str = "kbf-all-in-one.service";
-/// The units of an all-in-one host: the proxy's, then the sibling.
-const ALL_IN_ONE_UNITS: &[&str] = &[PROXY_UNITS[0], PROXY_UNITS[1], STORAGE_AND_DAEMON_UNIT];
-/// The account the proxy and its frontend children run as (`User=` of `kbf-proxy.service`).
+/// The unit of an all-in-one host, one process for everything (`kbf --mode=all-in-one`, no proxy
+/// and no sibling). `setup` enables it, and `kbf-installer run` restarts it after a swap.
+pub const ALL_IN_ONE_UNIT: &str = "kbf-all-in-one.service";
+/// The account a frontend and a storage node run as (`User=` of their units).
 const FRONTEND_USER: &str = "kbf-server";
-/// The frontend instance a host without the proxy runs.
+/// The unit of a frontend host.
 const FRONTEND_UNIT: &str = "kbf-frontend.service";
 pub const INSTALLER_UNIT: &str = "kbf-installer.service";
 /// The timer, and the drop-in of the service it started, that an earlier build's setup wrote
@@ -84,41 +78,25 @@ pub(super) fn file(
 
 /// The units a mode is run by. The names are the static unit files of the package
 /// (`packaging/linux/units`); the installer's own service is separate, since it runs
-/// whatever the mode.
-///
-/// A frontend behind the proxy (`proxy`) is run by the proxy's units, which start the frontend
-/// children themselves: `kbf-frontend.service` is never enabled beside them. The socket is
-/// first, so it holds the public port before the service takes it. An all-in-one host behind
-/// the proxy has the sibling after them (`kbf-all-in-one.service` is the earlier layout's, one
-/// process for everything, and is no longer enabled by `setup`).
-pub fn mode_units(mode: Mode, proxy: bool) -> &'static [&'static str] {
+/// whatever the mode. A frontend is run by `kbf-frontend.service`: the proxy's units are not a
+/// mode's, and `setup` enables none of them. An all-in-one host is run by its one unit.
+pub fn mode_units(mode: Mode) -> &'static [&'static str] {
     match mode {
-        Mode::Frontend if proxy => PROXY_UNITS,
         Mode::Frontend => &[FRONTEND_UNIT],
         Mode::Storage => &["kbf-storage.service"],
         Mode::Daemon => &["kbf-daemon.service"],
         Mode::StorageAndDaemon => &[STORAGE_AND_DAEMON_UNIT],
-        Mode::AllInOne if proxy => ALL_IN_ONE_UNITS,
-        Mode::AllInOne => &[EARLIER_ALL_IN_ONE_UNIT],
+        Mode::AllInOne => &[ALL_IN_ONE_UNIT],
     }
 }
 
-/// The user a mode's unit runs as on Linux (`User=` of the package's units). On an all-in-one
-/// host this is the sibling's; the proxy's is [`FRONTEND_USER`].
+/// The user a mode's unit runs as on Linux (`User=` of the package's units), which is also the
+/// account that logs in to the state database. An all-in-one host runs as `kbf`, the account of
+/// the daemon half it holds.
 pub(crate) fn service_user_name(mode: Mode) -> &'static str {
     match mode {
         Mode::Frontend | Mode::Storage => FRONTEND_USER,
         Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne => "kbf",
-    }
-}
-
-/// The user that holds the connection to the state database: the frontend's, which on an
-/// all-in-one host is the proxy's child (`kbf-server`) and not the sibling `service_user_name`
-/// names.
-pub(crate) fn database_user_name(mode: Mode) -> &'static str {
-    match mode {
-        Mode::AllInOne => FRONTEND_USER,
-        other => service_user_name(other),
     }
 }
 
@@ -128,10 +106,8 @@ fn runs_actions(mode: Mode) -> bool {
 }
 
 /// Whether the mode's daemon takes update orders: the one `kbf` starts with a storage map. The
-/// in-process daemon of the earlier `all-in-one` layout refuses `--update-dir` (`kbf-node`'s
-/// `start_over`), and the sibling of the proxy layout takes no orders either, so neither key is
-/// written for an all-in-one host: this looks at the host's mode, not at the node mode that
-/// host's `kbf.toml` names.
+/// in-process daemon of `all-in-one` refuses `--update-dir` (`kbf-node`'s `start_over`), so it
+/// is not written there.
 pub fn takes_orders(mode: Mode) -> bool {
     matches!(mode, Mode::Daemon | Mode::StorageAndDaemon)
 }
@@ -156,12 +132,6 @@ pub struct Ctx {
     pub root: Owner,
     /// The user the mode's unit runs as (Linux); a Mac runs the daemon as root.
     pub service: Option<RunUser>,
-    /// The user of the proxy and its frontend children when the host also runs a sibling as
-    /// `service` (all-in-one): `kbf-server`. None elsewhere, where `service` is that user.
-    pub frontend: Option<RunUser>,
-    /// The `kbf.toml` of the earlier all-in-one layout, when the host has it: this run splits it
-    /// (`aio_migrate`) instead of deciding on it as on any file that is there.
-    pub earlier: Option<Earlier>,
 }
 
 /// The ids of `user` as the owner of a file.
@@ -176,23 +146,6 @@ impl Ctx {
     /// The owner of what the service user reads or writes; root when there is none.
     fn service_owner(&self) -> Owner {
         self.service.as_ref().map_or(self.root, owner_of)
-    }
-
-    /// The user the proxy and its frontend children run as: the sibling's host has one of its
-    /// own, a frontend host's service user is it.
-    fn frontend_user(&self) -> Option<&RunUser> {
-        self.frontend.as_ref().or(self.service.as_ref())
-    }
-
-    /// The owner of what the proxy and the frontend children read or write; root when there is
-    /// none.
-    fn frontend_owner(&self) -> Owner {
-        self.frontend_user().map_or(self.root, owner_of)
-    }
-
-    /// The uid keys and certificates of the proxy and the children must belong to.
-    pub fn frontend_uid(&self) -> Option<u32> {
-        self.frontend_user().map(|user| user.uid)
     }
 }
 
@@ -213,18 +166,11 @@ pub fn context(os: &dyn Os, mode: Mode) -> Result<Ctx, SetupError> {
         Platform::Linux => Some(account(os, service_user_name(mode))?),
         Platform::MacOs => None,
     };
-    // The proxy runs as the frontend's user, the sibling as the service user: two accounts.
-    let frontend = match (platform, mode) {
-        (Platform::Linux, Mode::AllInOne) => Some(account(os, FRONTEND_USER)?),
-        _ => None,
-    };
     Ok(Ctx {
         platform,
         layout: Layout::new(kbf_host::Root::new("/")?, platform),
         root: os.root_owner(),
         service,
-        frontend,
-        earlier: None,
     })
 }
 
@@ -440,37 +386,34 @@ fn create_fetch_user(p: &mut Pl<'_, '_>, os: &dyn Os, name: &str) -> Result<(), 
     Ok(())
 }
 
-/// Refuses a `--proxy` host whose `kbf.toml` still has the `[tls]` keys of a host before the
-/// proxy: the children would serve TLS behind a proxy that speaks h2c.
-#[cfg(feature = "proxy")]
-fn refuse_leftover_tls(
+/// Refuses an all-in-one host that an earlier build set up behind the proxy's two-slot
+/// supervision: its `installer.toml` names a `frontend_config`, the file the proxy's children
+/// read, which only that setup wrote (beside `frontend.toml`, and a `kbf.toml` that is the
+/// sibling `kbf-storage-and-daemon.service`'s). That layout is not moved to the one unit of
+/// `all-in-one` or rewritten: the host is left as it is. Asked before the flags are checked and
+/// before any step is planned, so a refusal leaves the host as it was. A file that is not TOML is
+/// `installer_settings`' to name. Reads the host, changes nothing.
+pub fn refuse_proxy_layout(
     exec: &dyn Exec,
-    v: &Valid,
-    ctx: &Ctx,
+    mode: Mode,
     platform: Platform,
 ) -> Result<(), SetupError> {
-    // The earlier layout's file has these keys and is replaced by this run, so it is not refused.
-    if v.behind_proxy()
-        && ctx.earlier.is_none()
-        && let Some(Entry::File { bytes, .. }) = exec.inspect(&hp(paths::kbf_toml(platform))?)?
-    {
-        let left = super::proxy::leftover_tls_keys(&String::from_utf8_lossy(&bytes));
-        if !left.is_empty() {
-            return Err(SetupError::NeedsOperator(format!(
-                "{} has [tls] keys ({}) that a --proxy host does not take: the proxy holds the certificates and the children speak plain h2c behind it; remove them by hand, then run setup again",
-                paths::kbf_toml(platform),
-                left.join(", ")
-            )));
-        }
+    if mode != Mode::AllInOne {
+        return Ok(());
     }
-    Ok(())
-}
-
-/// Without the `proxy` feature no host is behind the proxy, so none has a `--proxy` host's
-/// leftovers.
-#[cfg(not(feature = "proxy"))]
-fn refuse_leftover_tls(_: &dyn Exec, _: &Valid, _: &Ctx, _: Platform) -> Result<(), SetupError> {
-    Ok(())
+    let path = paths::installer_toml(platform);
+    let Some(text) = read_current(exec, path)? else {
+        return Ok(());
+    };
+    let named = text
+        .parse::<toml::Table>()
+        .is_ok_and(|table| table.contains_key("frontend_config"));
+    if !named {
+        return Ok(());
+    }
+    Err(SetupError::NeedsOperator(format!(
+        "{path} names a frontend_config: this host was set up by an earlier build as an all-in-one host behind the proxy's two-slot supervision (the proxy, a frontend child and kbf-storage-and-daemon.service), a layout that setup does not rewrite or move to the one unit of --mode=all-in-one; leave this host as it is, or set up another host"
+    )))
 }
 
 /// The part of the plan before the state database's schema: accounts, directories, the tokens
@@ -491,11 +434,10 @@ pub fn before_release(
         .transpose()?;
     let settings = installer_settings(exec, v, platform)?;
     let listen = settings.proxy_listen();
-    refuse_leftover_tls(exec, v, ctx, platform)?;
     let mut notes = Vec::new();
-    if !v.behind_proxy() && settings.has_proxy_table() {
+    if settings.has_proxy_table() {
         notes.push(
-            "installer.toml has a [proxy] table and --proxy was not given: the table is kept, and the frontend unit is enabled as on a host without the proxy; give --proxy if this host runs the proxy"
+            "installer.toml has a [proxy] table: the table is kept as it is, setup enables no proxy unit, and the unit of the mode is enabled as on a host without the proxy"
                 .to_owned(),
         );
     }
@@ -512,24 +454,21 @@ pub fn before_release(
         }
     }
 
-    // The installer's tree is root's; `orders/` inside it is the frontend's (on an all-in-one
-    // host the proxy's, not the sibling's; on a Mac the daemon is root, so it is root's).
+    // The installer's tree is root's; `orders/` inside it is the service user's (on a Mac the
+    // daemon is root, so it is root's).
     let (root, service) = (ctx.root, ctx.service_owner());
-    let frontend = ctx.frontend_owner();
     dir(&mut p, paths::etc_dir(platform), 0o755, root)?;
     let state_dir = ctx.layout.state_dir().to_string();
     dir(&mut p, &state_dir, 0o755, root)?;
-    dir(&mut p, ctx.layout.orders_dir().as_str(), 0o700, frontend)?;
+    dir(&mut p, ctx.layout.orders_dir().as_str(), 0o700, service)?;
 
     // The tokens belong to the user whose process reads them: both loaders refuse a token
-    // file another user owns, or one with a mode other than 0600 or 0400. The operator API is
-    // the frontend's, whatever user the rest of the host runs as.
+    // file another user owns, or one with a mode other than 0600 or 0400.
     if let Some(token) = enroll_token {
         file(&mut p, paths::enroll_token(platform), 0o600, service, token)?;
     }
     if serves_api(v.mode) {
-        let earlier = ctx.earlier.as_ref();
-        operator_token(&mut p, os, exec, frontend, platform, earlier, &mut notes)?;
+        operator_token(&mut p, os, exec, service, platform, &mut notes)?;
     }
 
     file(
@@ -587,24 +526,15 @@ fn proxy_listen(
 }
 
 /// The first operator token: made once, when the file is not there. It is never printed; the
-/// note names the file. Once a file is there, whatever it holds, setup makes no other. A host
-/// being moved from the earlier layout (`earlier`) keeps the token it has, as `owner`'s.
+/// note names the file. Once a file is there, whatever it holds, setup makes no other.
 fn operator_token(
     p: &mut Pl<'_, '_>,
     os: &dyn Os,
     exec: &dyn Exec,
     owner: Owner,
     platform: Platform,
-    earlier: Option<&Earlier>,
     notes: &mut Vec<String>,
 ) -> Result<(), SetupError> {
-    let kept = match earlier {
-        Some(earlier) => earlier.keep_token(p, exec, owner, platform, notes)?,
-        None => false,
-    };
-    if kept {
-        return Ok(());
-    }
     let token = paths::api_token(platform);
     if exec.stat(&hp(token)?)?.is_some() {
         return Ok(());
@@ -615,26 +545,6 @@ fn operator_token(
         "the first operator token is in {token}: read it as root and keep it; setup makes no other"
     ));
     Ok(())
-}
-
-/// A setting `setup` writes without a flag of its own: `[table] key = "value"`.
-fn setting(table: &'static str, key: &'static str, value: String) -> Setting {
-    Setting { table, key, value }
-}
-
-/// The loopback address the sibling of an all-in-one host listens on.
-fn loopback(port: u16) -> String {
-    format!("127.0.0.1:{port}")
-}
-
-/// The settings of `kbf.toml`: the flags' and, on an all-in-one host, where the sibling listens.
-fn node_settings(v: &Valid) -> Vec<Setting> {
-    let mut all = Vec::new();
-    if let Some(port) = v.storage_port() {
-        all.push(setting("listener", "storage-listen", loopback(port)));
-    }
-    all.extend(v.kbf.iter().cloned());
-    all
 }
 
 /// The text of the file at `path`; none when it is not there. A file that is not a regular
@@ -680,43 +590,9 @@ fn config_file(
     Ok(())
 }
 
-/// Plans `frontend.toml`, the file the proxy's children read on an all-in-one host: `mode =
-/// "frontend"`, the operator token, the state database, and the sibling as their storage node
-/// (plain text, on loopback). Decided as `kbf.toml` is. root:<the proxy's group> 0640.
-fn frontend_file(
-    p: &mut Pl<'_, '_>,
-    exec: &dyn Exec,
-    v: &Valid,
-    ctx: &Ctx,
-    port: u16,
-    notes: &mut Vec<String>,
-) -> Result<(), SetupError> {
-    let path = paths::frontend_toml(ctx.platform);
-    let storage = format!("http://{}", loopback(port));
-    let extra = [setting("storage-client", "storage", storage)];
-    let ours = Ours {
-        mode: mode_name(Mode::Frontend),
-        frontend_url: None,
-        token_file: None,
-        api_token_file: Some(paths::api_token(ctx.platform)),
-        state_store: v.database.as_deref(),
-        update: None,
-        extra: &extra,
-    };
-    let current = read_current(exec, &path)?;
-    let decision = kbf_toml::decide(current.as_deref(), &ours, &path);
-    let owner = Owner {
-        uid: ctx.root.uid,
-        gid: ctx.frontend_owner().gid,
-    };
-    let existed = current.is_some();
-    let label = "frontend.toml";
-    config_file(p, label, &path, existed, decision, owner, notes)
-}
-
-/// The part after the state database's schema: `kbf.toml` (on an all-in-one host `frontend.toml`
-/// before it), then the units. `released` says whether there is a `kbf` to start: a release is
-/// installed already, or `/usr/bin/kbf` is present. Reads the host, changes nothing.
+/// The part after the state database's schema: `kbf.toml`, then the units. `released` says
+/// whether there is a `kbf` to start: a release is installed already, or `/usr/bin/kbf` is
+/// present. Reads the host, changes nothing.
 pub fn after_release(
     os: &dyn Os,
     exec: &dyn Exec,
@@ -735,49 +611,27 @@ pub fn after_release(
         ctx.layout.update_dir().to_string(),
         ctx.layout.orders_dir().to_string(),
     );
-    // An all-in-one host's `kbf.toml` is the sibling's, a `storage-and-daemon` node that
-    // listens on the loopback port and has no enrollment: the operator API and the state
-    // database are the frontend children's, in `frontend.toml`.
-    let sibling = v.storage_port();
-    let node_mode = sibling.map_or(v.mode, |_| Mode::StorageAndDaemon);
-    let node_extra = node_settings(v);
     let ours = Ours {
-        mode: mode_name(node_mode),
+        mode: mode_name(v.mode),
         frontend_url: v.frontend_url.as_deref(),
         token_file: v.token_file.as_ref().map(|_| paths::enroll_token(platform)),
-        api_token_file: serves_api(node_mode).then_some(paths::api_token(platform)),
-        state_store: v.database.as_deref().filter(|_| sibling.is_none()),
+        api_token_file: serves_api(v.mode).then_some(paths::api_token(platform)),
+        state_store: v.database.as_deref(),
         // A Mac's `kbf.toml` is kbf-mac-provision's, which renders no update keys.
         update: (takes_orders(v.mode) && platform != Platform::MacOs).then_some(UpdateDirs {
             update_dir: &update_dir,
             orders_dir: &orders_dir,
         }),
-        extra: &node_extra,
+        extra: &v.kbf,
     };
     let current = read_current(exec, kbf_toml_path)?;
-    // The earlier layout's file is split, not decided on: its settings came in as flags, so
-    // `ours` has them, and the original is kept below before this file is replaced.
-    let decision = match &ctx.earlier {
-        Some(_) => Decision::Write(ours.render()),
-        None => kbf_toml::decide(current.as_deref(), &ours, kbf_toml_path),
-    };
-    if let Some(earlier) = &ctx.earlier {
-        earlier.plan(&mut p, ctx, &mut notes)?;
-    }
-    // The children's file first: `kbf.toml` is the last file written, so that a stop part way
-    // leaves no config that passes the sibling's unit condition.
-    if let Some(port) = sibling {
-        frontend_file(&mut p, exec, v, ctx, port, &mut notes)?;
-    }
+    let decision = kbf_toml::decide(current.as_deref(), &ours, kbf_toml_path);
     // root:<service group> 0640: the service reads it, nobody else; only root writes.
     let owner = Owner {
         uid: ctx.root.uid,
         gid: ctx.service_owner().gid,
     };
-    // The earlier layout's file is replaced while its unit may still run, and that unit must not
-    // be restarted onto it: the steps of the move say what to run, so the note that a running kbf
-    // keeps the old file (which reads as "restart it") is left out.
-    let existed = current.is_some() && ctx.earlier.is_none();
+    let existed = current.is_some();
     config_file(
         &mut p,
         "kbf.toml",
@@ -825,19 +679,16 @@ fn remove_old_backup_timer(
     Ok(dropin || dir)
 }
 
-/// What `setup` tells of the units it enables and leaves stopped on a host that keeps its state
+/// What `setup` tells of the unit it enables and leaves stopped on a host that keeps its state
 /// in Postgres: starting one takes the database, the TLS files and the ports, which only the
-/// operator decides. On an all-in-one host the sibling goes first, since the frontend child
-/// dials it, and a restart of it later is felt by the clients: the proxy holds nothing for it.
-fn not_started_note(v: &Valid) -> &'static str {
-    match (v.mode, v.behind_proxy()) {
-        (Mode::AllInOne, _) => {
-            "the proxy units and kbf-storage-and-daemon.service are enabled, not started: start kbf-storage-and-daemon.service first (the frontend child dials it), then kbf-proxy.socket and kbf-proxy.service, when the database, the TLS files and the ports are ready; a later restart of kbf-storage-and-daemon.service leaves clients with UNAVAILABLE until it is back, because the proxy holds no request for it"
+/// operator decides. The all-in-one host has one unit and no proxy, and it is that unit's name
+/// the note gives.
+fn not_started_note(mode: Mode) -> &'static str {
+    match mode {
+        Mode::AllInOne => {
+            "kbf-all-in-one.service is enabled, not started: start it when the database, the TLS files and the ports are ready"
         }
-        (_, true) => {
-            "the proxy units are enabled, not started: start kbf-proxy.socket and kbf-proxy.service when the database, the TLS files and the port are ready"
-        }
-        (_, false) => {
+        _ => {
             "the frontend unit is enabled, not started: start it when the database, the TLS files and the port are ready"
         }
     }
@@ -857,7 +708,7 @@ fn units(
     // frontend is never started here: starting one takes the state database and the public
     // port, which only the operator decides.
     let start_mode = if v.mode.keeps_state_in_database() {
-        notes.push(not_started_note(v).to_owned());
+        notes.push(not_started_note(v.mode).to_owned());
         false
     } else if no_start {
         notes.push("--no-start: units are enabled, not started".to_owned());
@@ -908,13 +759,8 @@ fn units(
             }
         }
         Platform::Linux => {
-            if v.behind_proxy() && os.unit_enabled(FRONTEND_UNIT)? {
-                notes.push(format!(
-                    "{FRONTEND_UNIT} is enabled and the proxy starts the frontend itself: setup does not stop or disable it; do both (systemctl disable --now) before starting the proxy, since the two never run together"
-                ));
-            }
             let backup_gone = remove_old_backup_timer(p, os, &mut notes)?;
-            let wanted = mode_units(v.mode, v.behind_proxy())
+            let wanted = mode_units(v.mode)
                 .iter()
                 .map(|u| (*u, start_mode))
                 .chain([(INSTALLER_UNIT, !no_start)]);

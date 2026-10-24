@@ -39,8 +39,7 @@ The SQLite file is never changed by any of them.
 
 1. **Find the setting.** The frontend takes `--state-store` from the `state-store` key under
    `[scheduler]` in its `kbf.toml` (on a host set up by `kbf-installer setup`,
-   `/etc/kbf/kbf.toml`; on an all-in-one host, `/etc/kbf/frontend.toml`, the frontend's own
-   file), or from a `--state-store=sqlite://<path>` flag on the command line in the unit file
+   `/etc/kbf/kbf.toml`, an all-in-one host's included), or from a `--state-store=sqlite://<path>` flag on the command line in the unit file
    or in a drop-in of it (`/etc/systemd/system/<unit>.d/*.conf`). **A flag on the command line
    overrides the key.** Look in both places: `systemctl cat <unit>` shows the unit and its
    drop-ins, and `kbf.toml` shows the key. If the command line has `--state-store=`, that

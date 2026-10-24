@@ -1952,8 +1952,6 @@ dependencies = [
 name = "kbf-installer"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "base64 0.23.1",
  "bytes",
  "clap",
  "flate2",
@@ -1961,12 +1959,8 @@ dependencies = [
  "h2",
  "hex",
  "http",
- "httparse",
- "hyper",
- "kbf-cli",
  "kbf-host",
  "kbf-installer",
- "kbf-oidc",
  "kbf-proto",
  "kbf-proxy",
  "kbf-setup",
@@ -1975,7 +1969,6 @@ dependencies = [
  "kbf-types",
  "kbf-update",
  "libc",
- "postgres",
  "rcgen",
  "rustix",
  "rustls",
@@ -1983,7 +1976,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "subtle",
  "tar",
  "thiserror",
  "tokio",
@@ -1991,7 +1983,6 @@ dependencies = [
  "toml",
  "tonic",
  "tracing",
- "tracing-subscriber",
  "ureq",
 ]
 

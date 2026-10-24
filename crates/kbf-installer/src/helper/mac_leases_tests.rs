@@ -884,6 +884,19 @@ fn a_kbf_toml_that_is_not_a_native_daemons_or_not_trusted_cannot_tell() {
     refused(rig.count(), "kbf.toml");
 }
 
+/// Asserts that a `[macos]` table without a pool key is read like a file without the table (an
+/// idle daemon host counts no lease), and that a pool key given beside other keys of the table
+/// is still refused as a pool key.
+#[test]
+fn a_macos_table_without_a_pool_key_does_not_make_the_file_unreadable() {
+    let mut rig = MacHost::new("macos-table");
+    rig.toml(&format!("{TOML}[macos]\nsandbox = true\n"));
+    assert_eq!(rig.live(), Ok((0, None)));
+    let mut rig = MacHost::new("macos-table-pool");
+    rig.toml(&format!("{TOML}[macos]\nsandbox = true\npool-users = 4\n"));
+    refused(rig.count(), "sets a pool key");
+}
+
 /// Catches a `leases/` that cannot be listed read as empty: missing, a file, or a link
 /// (even to an empty directory) cannot tell, naming the directory. The listing's own errors
 /// are failures too, except a name that vanished from the listing, which is a lease that

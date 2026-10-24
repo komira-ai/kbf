@@ -49,8 +49,7 @@ futures = "0.3.34"
 # through hyper and tonic.
 h2 = "0.4.20"
 hex = "0.4.3"
-# The status line and headers of an HTTPS answer (kbf-deploy: `mdm fetch`, `mdm verify`)
-# and of the installer's loopback calls to a child (kbf-installer: `proxy::child_http`).
+# The status line and headers of an HTTPS answer (kbf-deploy: `mdm fetch`, `mdm verify`).
 # Already in the tree through hyper.
 httparse = "1.10.1"
 # Header maps of the front-door proxy (kbf-proxy); already in the tree through hyper.
