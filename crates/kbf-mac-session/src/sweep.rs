@@ -511,8 +511,7 @@ fn remove_present(
     let skipped_before = park.skipped.get();
     // The walk goes on past a refusal: everything that can be removed is, and the refusals
     // are judged together.
-    let mut failed: Vec<String> = Vec::new();
-    let mut kind = io::ErrorKind::Other;
+    let mut failed: Vec<(io::ErrorKind, String)> = Vec::new();
     for entry in listed(&child)? {
         let inner_path = here.join(&entry);
         let result = tolerate(
@@ -531,14 +530,12 @@ fn remove_present(
             &park.skipped,
         );
         if let Err(why) = result {
-            if failed.is_empty() {
-                kind = why.kind();
-            }
-            failed.push(format!("{}: {why}", inner_path.display()));
+            failed.push((why.kind(), format!("{}: {why}", inner_path.display())));
         }
     }
-    if !failed.is_empty() {
-        return Err(io::Error::new(kind, failed.join("; ")));
+    if let Some((kind, _)) = failed.first() {
+        let all: Vec<&str> = failed.iter().map(|(_, text)| text.as_str()).collect();
+        return Err(io::Error::new(*kind, all.join("; ")));
     }
     if placed | (park.skipped.get() > skipped_before) {
         // This directory was placed by the system (emptied, never removed), or something
@@ -554,7 +551,7 @@ fn remove_present(
         // The system refuses the pool user the removal of this directory (a folder it keeps
         // in the home, such as `Library/Preferences`): kept while it is empty, which it is
         // here, unless something was made in it since.
-        Err(Errno::PERM) if !rustix::process::geteuid().is_root() && listed(&child)?.is_empty() => {
+        Err(Errno::PERM) if keepable(&child)? => {
             warn_once(here);
             scrub_kept(&child)?;
             park.kept.borrow_mut().push(here.to_owned());
@@ -594,14 +591,30 @@ fn xattrs_to_remove<'a>(names: &'a [String], keep: &str) -> Vec<&'a str> {
 /// since the listing, or that the system protects from its owner (`EPERM`), stays.
 fn strip_xattrs_except(dir: &OwnedFd, keep: &str) -> io::Result<()> {
     let names = crate::xattr::list(dir)?;
-    for name in xattrs_to_remove(&names, keep) {
-        match crate::xattr::remove(dir, name) {
+    strip_named(&names, keep, &mut |name| crate::xattr::remove(dir, name))
+}
+
+/// [`strip_xattrs_except`] over the `names` listed, through `remove`.
+fn strip_named(
+    names: &[String],
+    keep: &str,
+    remove: &mut dyn FnMut(&str) -> io::Result<()>,
+) -> io::Result<()> {
+    for name in xattrs_to_remove(names, keep) {
+        match remove(name) {
             Ok(()) => {}
             Err(why) if crate::xattr::left(&why) => {}
             Err(why) => return Err(why),
         }
     }
     Ok(())
+}
+
+/// Whether a directory the system refused to remove is kept: the process is not root, and
+/// the directory is empty (nothing was made in it since).
+fn keepable(child: &OwnedFd) -> io::Result<bool> {
+    let not_root = !rustix::process::geteuid().is_root();
+    Ok(not_root & listed(child)?.is_empty())
 }
 
 /// Removes the empty directory `name` of `dir`.
@@ -1065,15 +1078,12 @@ fn make_owner_rwx(dir: &OwnedFd, name: &OsStr, stat: &Stat) -> io::Result<()> {
         Ok(file) => (rustix::fs::fstat(&file)?, Some(file)),
         // A directory its owner took every permission from cannot be opened, by the
         // owner (a clean that runs as the uid): it is judged again by name, and its mode
-        // set by name, never on a link.
-        Err(rustix::io::Errno::ACCESS)
-            if !rustix::fs::FileType::from_raw_mode(stat.st_mode).is_symlink() =>
-        {
-            (
-                rustix::fs::statat(dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?,
-                None,
-            )
-        }
+        // set by name. (Never a link: opening one without following it answers ELOOP,
+        // not EACCES, and the inode check below stands in front of the change.)
+        Err(rustix::io::Errno::ACCESS) => (
+            rustix::fs::statat(dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?,
+            None,
+        ),
         Err(_) => return Ok(()),
     };
     if (opened.st_dev, opened.st_ino) != (stat.st_dev, stat.st_ino) {

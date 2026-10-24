@@ -1555,3 +1555,65 @@ fn an_attribute_that_went_or_is_the_systems_is_left_and_any_other_refusal_fails(
     let why = crate::xattr::remove(&fd, "a\0b").expect_err("bad name");
     assert!(!crate::xattr::left(&why));
 }
+
+#[test]
+fn a_refused_removal_of_an_attribute_fails_unless_it_is_the_systems_own_or_gone() {
+    let names: Vec<String> = ["user.a", KEEP_XATTR, "user.b", "user.c"]
+        .iter()
+        .map(|n| (*n).to_owned())
+        .collect();
+    let mut asked = Vec::new();
+    let mut remove = |name: &str| {
+        asked.push(name.to_owned());
+        match name {
+            "user.a" => Err(io::Error::from_raw_os_error(libc::EPERM)),
+            "user.b" => Err(io::Error::from_raw_os_error(libc::EIO)),
+            _ => Ok(()),
+        }
+    };
+    let why = strip_named(&names, KEEP_XATTR, &mut remove).expect_err("EIO fails");
+    assert_eq!(why.raw_os_error(), Some(libc::EIO));
+    // The system's own (EPERM) was let go and the walk went on to the next; the kept
+    // one was never asked for; the failure stopped it.
+    assert_eq!(asked, ["user.a", "user.b"]);
+}
+
+#[test]
+fn a_walk_that_fails_in_two_places_names_both() {
+    if root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = scratch("two-failures");
+    let home = dir.join("home");
+    for name in ["one", "two"] {
+        fs::create_dir_all(home.join(name)).unwrap();
+        fs::write(home.join(name).join("f"), "x").unwrap();
+        chmod(&home.join(name), 0o500);
+    }
+    fs::create_dir_all(home.join("both")).unwrap();
+    for name in ["one", "two"] {
+        fs::create_dir_all(home.join("both").join(name)).unwrap();
+        fs::write(home.join("both").join(name).join("f"), "x").unwrap();
+        chmod(&home.join("both").join(name), 0o500);
+    }
+    let swept = empty(&home, me());
+    for name in ["one", "two"] {
+        chmod(&home.join(name), 0o700);
+        chmod(&home.join("both").join(name), 0o700);
+    }
+    // One error for `both` carries its two failures.
+    let both = swept
+        .errors
+        .iter()
+        .find(|e| e.contains("both"))
+        .expect("both");
+    assert!(both.contains("one/f") && both.contains("two/f"), "{both}");
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_path_below_a_missing_directory_is_not_the_systems() {
+    let dir = scratch("placed-missing");
+    assert!(!path_is_system_placed(&dir.join("absent/child")));
+}
