@@ -1,17 +1,17 @@
-//! What a farm does when another process takes its work over (`crate::handover`): it
-//! stops taking any ([`Farm::fence`]), ends the worker streams so the daemons reconnect to
-//! the successor ([`Farm::end_worker_streams`]), answers the callers it still holds from
-//! what the successor writes to the state store ([`Farm::follow`]), and keeps an
-//! operator's cordons across the change.
+//! What a farm does when the other frontends of its state store take its work over (a
+//! retire, `crate::retire`): it stops taking any ([`Farm::fence`]), ends the worker streams
+//! so the daemons reconnect to another frontend ([`Farm::end_worker_streams`]), answers the
+//! callers it still holds from what the others write to the state store ([`Farm::follow`]),
+//! and keeps an operator's cordons across the change.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use kbf_front::{Handed, Stage};
+use kbf_front::Stage;
 use kbf_sched::{Event, Input};
-use kbf_types::{Answer, Digest, FarmTime, OperationId, StateMachine as _, WaiterId, WorkerId};
+use kbf_types::{Answer, FarmTime, OperationId, StateMachine as _, WaiterId, WorkerId};
 use tokio::sync::watch;
 use tonic::Status;
 
@@ -19,13 +19,12 @@ use super::durable::{Durable, Held, Progress, StateError, StoredCordon};
 use super::{Farm, NodeAction, State};
 
 /// How many looks in a row at the state store may find an operation neither unfinished
-/// nor ended before it is reported as untraced (a WARN, and `kbf_frontend_relay_untraced`).
-/// A writer ends an operation in one transaction (its rows removed, its result put), so a
-/// look finds one or the other; a store that a release ending operations in two
-/// transactions wrote can hold neither for good, and a result past its retention is also
-/// gone. Only a report: an untraced operation's callers are not
-/// answered, they keep waiting (see [`Farm::follow`]).
-pub const UNTRACED_LOOKS: u32 = 2;
+/// nor ended before it is logged as untraced (a WARN). A writer ends an operation in one
+/// transaction (its rows removed, its result put), so a look finds one or the other; a
+/// store that a release ending operations in two transactions wrote can hold neither for
+/// good, and a result past its retention is also gone. Only a log line: an untraced
+/// operation's callers are not answered, they keep waiting (see [`Farm::follow`]).
+const UNTRACED_LOOKS: u32 = 2;
 
 /// How often a fenced farm that was given to [`Farm::follow_every`] looks in the state
 /// store for the results of the calls it kept open.
@@ -96,6 +95,18 @@ impl Farm {
     /// the generation this process holds.
     pub fn resume(&self) {
         self.lock().fenced = false;
+    }
+
+    /// Closes this farm's intake, the step of a drain (`crate::sequence`) before the fence:
+    /// from now on it takes in no operation another frontend queued, and places none on its
+    /// nodes (each is cordoned in the scheduler, with no row written to the state store, so
+    /// no other frontend sees it), so the operations it holds queued are taken by the other
+    /// frontends. It goes on with everything else: a `Result` and a heartbeat of a lease it
+    /// holds are taken, and its callers are answered, from its own nodes and from what the
+    /// other frontends write ([`Farm::intake`]). Unlike [`Farm::fence`] it refuses nothing a
+    /// node reports, so the executions that are running finish here. Nothing undoes it.
+    pub fn close_intake(&self) {
+        self.lock().closed = true;
     }
 
     /// Whether the state store has refused a write of this farm because a newer writer
@@ -170,15 +181,14 @@ impl Farm {
     /// leased is shown executing. A caller waits until its operation finishes, it cancels
     /// (its stream is dropped), or this process is killed: no look count or timer ends
     /// it. An operation the store has no trace of keeps its callers waiting; it is
-    /// reported ([`UNTRACED_LOOKS`], `kbf_frontend_relay_untraced`) so an operator sees
-    /// it. Call it every so often; returns how many callers are still waiting.
+    /// logged at WARN once the looks in a row that found no trace reach `UNTRACED_LOOKS`,
+    /// so an operator sees it. Call it every so often; returns how many callers are still
+    /// waiting.
     ///
     /// # Errors
     /// The state store cannot be read.
     pub fn follow(&self) -> Result<usize, StateError> {
-        let waiting = self.lock().follow()?;
-        self.report_untraced();
-        Ok(waiting)
+        self.lock().follow()
     }
 
     /// Runs [`Farm::follow`] every `every`, for as long as the process lives, so the
@@ -196,22 +206,11 @@ impl Farm {
             let mut look = tokio::time::interval(every);
             loop {
                 look.tick().await;
-                // A store that cannot be read is looked at again at the next look; the farm
-                // reports what it finds no trace of (`kbf_frontend_relay_untraced`).
+                // A store that cannot be read is looked at again at the next look.
                 let _ = farm.follow();
             }
         });
         true
-    }
-
-    /// Sets `kbf_frontend_relay_untraced` to the operations the last looks found no trace
-    /// of.
-    fn report_untraced(&self) {
-        let untraced = self.lock().untraced();
-        self.cache
-            .metrics()
-            .frontend_relay_untraced
-            .set(untraced as u64);
     }
 }
 
@@ -226,6 +225,35 @@ pub(super) enum Flushed {
 }
 
 impl State {
+    /// Cordons, in the scheduler alone, every node this farm has heard from once its intake
+    /// is closed ([`Farm::close_intake`]), so that placement gives none of them work. Before
+    /// every input: a node that registers after the intake closed is cordoned before the
+    /// placement round that follows its registration. A farm whose intake is open does
+    /// nothing. A node that is cordoned already (by this or by an operator) is left as it
+    /// is.
+    pub(super) fn hold_placements(&mut self, now: FarmTime) {
+        if !self.closed {
+            return;
+        }
+        let open = |worker: &&WorkerId| self.sched.cordon(worker).is_none();
+        let nodes: Vec<WorkerId> = self.machine.nodes().filter(open).cloned().collect();
+        for worker in nodes {
+            let none = self.sched.apply(Input::new(now, Event::Cordon { worker }));
+            debug_assert!(none.is_empty(), "a cordon has no effect: {none:?}");
+        }
+    }
+
+    /// The input to feed in place of `event`: on a farm whose intake is closed an uncordon
+    /// is a tick, since the scheduler places work on the node inside the uncordon itself,
+    /// which would give a node this farm was told not to use work. Any other event, and
+    /// every event of a farm whose intake is open, is returned as it is.
+    pub(super) fn held_event(&self, event: Event) -> Event {
+        match event {
+            Event::Uncordon { .. } if self.closed => Event::Tick,
+            event => event,
+        }
+    }
+
     /// Writes the requeues the state store has not taken, and the ones the scheduler has
     /// given up since the last feed, once. Works on a fenced farm: this is the one thing
     /// a fenced farm writes, because the successor's recovery depends on it (see
@@ -326,14 +354,6 @@ impl State {
         Ok(waiting)
     }
 
-    /// How many operations the last looks found no trace of, [`UNTRACED_LOOKS`] times in
-    /// a row, among the ones this farm's callers wait on and the ones relays follow.
-    pub(super) fn untraced(&self) -> usize {
-        let reported = |looks: &&u32| **looks >= UNTRACED_LOOKS;
-        let kept = self.untraced_kept.values().filter(reported).count();
-        kept + self.untraced_relayed.values().filter(reported).count()
-    }
-
     /// Takes up the cordons of the nodes an operator placed before this process started,
     /// as the store holds them: a drain keeps its deadline on the store's clock, `at` now
     /// (already past: paused at the first tick). The rows are remembered as the intake
@@ -383,7 +403,7 @@ impl Progress {
 
 /// One look at `operation`, whose callers wait: what they are shown now (`None` leaves
 /// them as they are). An operation the store has no trace of is shown nothing: it is
-/// counted in `untraced`, reported once it has been untraced for [`UNTRACED_LOOKS`] looks
+/// counted in `untraced`, logged once it has been untraced for [`UNTRACED_LOOKS`] looks
 /// in a row, and its callers go on waiting. A look that finds it starts the count over.
 pub(super) fn note(
     untraced: &mut BTreeMap<OperationId, u32>,
@@ -411,52 +431,4 @@ pub(super) fn show(channel: &watch::Sender<Stage>, stage: Stage) {
         }
         changed
     });
-}
-
-impl Handed for Farm {
-    fn handed(&self) -> bool {
-        self.lock().fenced
-    }
-
-    /// Reads the unfinished rows of the state store (one scan per relayed call, made while
-    /// the successor's first operation arrives); a farm with no store finds none.
-    fn operation_of(
-        &self,
-        instance: Option<&str>,
-        action: &Digest,
-    ) -> Result<Option<OperationId>, String> {
-        let state = self.lock();
-        let Some(durable) = &state.durable else {
-            return Ok(None);
-        };
-        let found = durable
-            .operations_of(instance, action)
-            .map_err(|error| error.to_string())?;
-        Ok(match found[..] {
-            [only] => Some(only),
-            _ => None,
-        })
-    }
-
-    /// The follower ([`Farm::follow`]) for one operation this farm's scheduler never
-    /// held: the same looks, and the same rule for an operation the store has no trace of
-    /// (nothing is shown, it is reported, the call keeps waiting).
-    fn look(&self, operation: OperationId) -> Result<Option<Stage>, String> {
-        let mut state = self.lock();
-        let Some(durable) = &state.durable else {
-            return Ok(None);
-        };
-        let progress = durable
-            .progress(operation)
-            .map_err(|error| error.to_string())?;
-        let stage = note(&mut state.untraced_relayed, operation, &progress);
-        drop(state);
-        self.report_untraced();
-        Ok(stage)
-    }
-
-    fn release(&self, operation: OperationId) {
-        self.lock().untraced_relayed.remove(&operation);
-        self.report_untraced();
-    }
 }

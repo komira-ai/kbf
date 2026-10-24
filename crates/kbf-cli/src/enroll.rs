@@ -231,7 +231,9 @@ impl Want {
         let (mode, roles): (&'static str, &[Role]) = match mode {
             names::STORAGE => (names::STORAGE, &[Role::Storage]),
             names::DAEMON => (names::DAEMON, &[Role::Daemon]),
-            names::STORAGE_AND_DAEMON => (names::STORAGE_AND_DAEMON, &Role::ALL),
+            names::STORAGE_AND_DAEMON => {
+                (names::STORAGE_AND_DAEMON, &[Role::Storage, Role::Daemon])
+            }
             _ => return None,
         };
         Some(Self {

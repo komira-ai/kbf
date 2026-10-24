@@ -168,8 +168,7 @@ pub struct LeaseHost {
 /// - A systemd unit of a `kbf` mode gets [`CgroupLeases`] of that unit, which fails closed
 ///   while the unit's cgroup does not exist. The units are the ones `setup` enables
 ///   ([`mode_units`]); an instance of a template (`kbf-frontend@b.service`) and the plain
-///   form of a unit (`kbf-frontend.service`, for a host without the proxy) are the same
-///   mode's.
+///   form of a unit (`kbf-frontend.service`) are the same mode's.
 /// - Any other unit gets a source that cannot tell, whatever cgroup the unit has: the leases
 ///   of a unit that is no mode's are not the daemon's, so a count read from it would be
 ///   "idle" by accident.
@@ -212,7 +211,7 @@ fn is_unit_of(unit: &str, modes: &[Mode]) -> bool {
     family(unit).is_some_and(|f| {
         modes
             .iter()
-            .flat_map(|m| mode_units(*m, false))
+            .flat_map(|m| mode_units(*m))
             .any(|u| family(u) == Some(f))
     })
 }

@@ -6,9 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use futures::future::BoxFuture;
 
 use super::*;
-use crate::handover::tests::Scratch;
-use crate::handover::wire::Message;
 use crate::health::{Probe, Readiness};
+use crate::test_dir::short_dir;
 
 /// A dependency that fails until the test lets it pass, and counts being asked.
 struct Dependency {
@@ -31,8 +30,8 @@ impl Probe for Dependency {
 /// frontend from running.
 #[tokio::test]
 async fn ready_waits_for_the_probes_then_tells_the_manager() {
-    let dir = Scratch::new();
-    let path = dir.0.join("notify");
+    let dir = short_dir("kbf-ready");
+    let path = dir.join("notify");
     let manager = UnixDatagram::bind(&path).expect("a datagram socket");
     manager.set_nonblocking(true).expect("nonblocking");
     let up = Arc::new(AtomicBool::new(false));
@@ -47,7 +46,6 @@ async fn ready_waits_for_the_probes_then_tells_the_manager() {
     let ready = Ready {
         checks: Arc::clone(&checks),
         notify: Some(path.clone().into_os_string()),
-        predecessor: None,
     };
     let task = tokio::spawn(ready.run());
     // Asked twice while the dependency is down: the first failure was followed by a wait.
@@ -64,71 +62,23 @@ async fn ready_waits_for_the_probes_then_tells_the_manager() {
     let got = manager.recv(&mut buffer).expect("READY=1");
     assert_eq!(&buffer[..got], b"READY=1");
 
-    for notify in [None, Some(dir.0.join("nobody-listens").into_os_string())] {
+    for notify in [None, Some(dir.join("nobody-listens").into_os_string())] {
         Ready {
             checks: Arc::clone(&checks),
             notify,
-            predecessor: None,
         }
         .run()
         .await;
     }
 }
 
-/// Catches: a successor that tells its predecessor it serves before its probes pass (the
-/// predecessor would leave Envoy's rotation while the successor cannot answer), never
-/// tells it once they do (the predecessor waits for its watchdog and leaves anyway), or
-/// stops running because the predecessor is gone.
-#[tokio::test]
-async fn the_predecessor_is_told_once_the_probes_pass() {
-    let up = Arc::new(AtomicBool::new(false));
-    let asked = Arc::new(AtomicUsize::new(0));
-    let dependency = Dependency {
-        up: Arc::clone(&up),
-        asked: Arc::clone(&asked),
-    };
-    let checks = Arc::new(
-        Checks::new(Arc::new(Readiness::default())).probing("dependency", Arc::new(dependency)),
-    );
-    let (ours, theirs) = tokio::net::UnixStream::pair().expect("a pair");
-    let mut predecessor = crate::handover::wire::Link::new(theirs);
-    let task = tokio::spawn(
-        Ready {
-            checks: Arc::clone(&checks),
-            notify: None,
-            predecessor: Some(Released::over(crate::handover::wire::Link::new(ours))),
-        }
-        .run(),
-    );
-    while asked.load(Ordering::SeqCst) < 2 {
-        tokio::task::yield_now().await;
-    }
-    let early = tokio::time::timeout(Duration::from_millis(50), predecessor.hear()).await;
-    assert!(early.is_err(), "told it serves while a probe fails");
-    up.store(true, Ordering::SeqCst);
-    assert_eq!(predecessor.hear().await.expect("told"), Message::Serving);
-    task.await.expect("ready ends");
-
-    // A predecessor that has gone is not an error that stops anything.
-    let (ours, theirs) = tokio::net::UnixStream::pair().expect("a pair");
-    drop(theirs);
-    Ready {
-        checks,
-        notify: None,
-        predecessor: Some(Released::over(crate::handover::wire::Link::new(ours))),
-    }
-    .run()
-    .await;
-}
-
-/// Catches: the frontend waiting on the `storage` probe for `READY=1` and for the
-/// predecessor's "serving": with only the storage probe failing both are sent; with
-/// another probe (the state store) failing neither is, until it passes. Catches: `run`
-/// asks `failing` (every probe) again.
+/// Catches: the frontend waiting on the `storage` probe for `READY=1`: with only the
+/// storage probe failing it is sent; with another probe (the state store) failing it is
+/// not, until it passes. Catches: `run` asks `failing` (every probe) again.
 #[tokio::test]
 async fn ready_does_not_wait_for_storage_but_waits_for_the_rest() {
-    let dir = Scratch::new();
-    let path = dir.0.join("notify");
+    let dir = short_dir("kbf-ready");
+    let path = dir.join("notify");
     let manager = UnixDatagram::bind(&path).expect("a datagram socket");
     manager.set_nonblocking(true).expect("nonblocking");
     let state_up = Arc::new(AtomicBool::new(false));
@@ -154,7 +104,6 @@ async fn ready_does_not_wait_for_storage_but_waits_for_the_rest() {
         Ready {
             checks,
             notify: Some(path.into_os_string()),
-            predecessor: None,
         }
         .run(),
     );

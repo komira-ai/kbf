@@ -929,21 +929,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "generator"
-version = "0.8.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1be81b31c9ce4caf7f3178eeb90662bb1864d3ad363ec6bdada3201adff19c37"
-dependencies = [
- "cc",
- "cfg-if",
- "libc",
- "log",
- "rustversion",
- "windows-link",
- "windows-result",
-]
-
-[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1355,50 +1340,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kbf-all-in-one"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "clap",
- "futures",
- "kbf-cas-conformance",
- "kbf-daemon",
- "kbf-driver-container",
- "kbf-front",
- "kbf-harness",
- "kbf-meta",
- "kbf-node",
- "kbf-objstore",
- "kbf-outputs",
- "kbf-proto",
- "kbf-segments",
- "kbf-server",
- "kbf-storage",
- "kbf-testkit",
- "kbf-threads",
- "kbf-transfer",
- "kbf-types",
- "libc",
- "prost",
- "rcgen",
- "rustix",
- "tokio",
- "tonic",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "kbf-all-in-one-test"
-version = "0.1.0"
-dependencies = [
- "kbf-harness",
- "kbf-testkit",
- "kbf-transfer",
- "tokio",
-]
-
-[[package]]
 name = "kbf-auth"
 version = "0.1.0"
 dependencies = [
@@ -1498,7 +1439,6 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
- "kbf-all-in-one",
  "kbf-ca",
  "kbf-cas-conformance",
  "kbf-daemon",
@@ -1515,6 +1455,7 @@ dependencies = [
  "kbf-setup",
  "kbf-state",
  "kbf-storage",
+ "kbf-storage-and-daemon",
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
@@ -1535,6 +1476,36 @@ dependencies = [
  "tracing",
  "x509-parser",
  "zeroize",
+]
+
+[[package]]
+name = "kbf-coordinator"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "bytes",
+ "clap",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "kbf-ca",
+ "kbf-oidc",
+ "kbf-testkit",
+ "kbf-tls",
+ "kbf-types",
+ "kbf-updater",
+ "rcgen",
+ "rustix",
+ "rustls",
+ "serde",
+ "serde_json",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1761,6 +1732,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-farm-test"
+version = "0.1.0"
+dependencies = [
+ "kbf-harness",
+ "kbf-testkit",
+ "kbf-transfer",
+ "tokio",
+]
+
+[[package]]
 name = "kbf-front"
 version = "0.1.0"
 dependencies = [
@@ -1879,7 +1860,10 @@ name = "kbf-host-install"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "kbf-host",
+ "kbf-installer",
  "kbf-testkit",
+ "kbf-update",
  "rustix",
  "serde",
  "serde_json",
@@ -1919,8 +1903,6 @@ dependencies = [
 name = "kbf-installer"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "base64 0.23.1",
  "bytes",
  "clap",
  "flate2",
@@ -1928,12 +1910,8 @@ dependencies = [
  "h2",
  "hex",
  "http",
- "httparse",
- "hyper",
- "kbf-cli",
  "kbf-host",
  "kbf-installer",
- "kbf-oidc",
  "kbf-proto",
  "kbf-proxy",
  "kbf-setup",
@@ -1942,7 +1920,6 @@ dependencies = [
  "kbf-types",
  "kbf-update",
  "libc",
- "postgres",
  "rcgen",
  "rustix",
  "rustls",
@@ -1950,7 +1927,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "subtle",
  "tar",
  "thiserror",
  "tokio",
@@ -1958,7 +1934,6 @@ dependencies = [
  "toml",
  "tonic",
  "tracing",
- "tracing-subscriber",
  "ureq",
 ]
 
@@ -2282,10 +2257,8 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "kbf-oidc",
  "kbf-peer",
  "kbf-tls",
- "loom",
  "rcgen",
  "rustix",
  "rustls",
@@ -2298,7 +2271,6 @@ dependencies = [
  "tokio-rustls",
  "toml",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -2371,7 +2343,6 @@ dependencies = [
  "kbf-estimator",
  "kbf-front",
  "kbf-history",
- "kbf-installer",
  "kbf-invocation",
  "kbf-log",
  "kbf-map",
@@ -2396,6 +2367,7 @@ dependencies = [
  "kbf-tls",
  "kbf-types",
  "kbf-ui",
+ "kbf-updater",
  "libc",
  "percent-encoding",
  "postgres",
@@ -2539,6 +2511,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-storage-and-daemon"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "futures",
+ "kbf-cas-conformance",
+ "kbf-daemon",
+ "kbf-driver-container",
+ "kbf-front",
+ "kbf-harness",
+ "kbf-meta",
+ "kbf-node",
+ "kbf-objstore",
+ "kbf-outputs",
+ "kbf-proto",
+ "kbf-segments",
+ "kbf-server",
+ "kbf-storage",
+ "kbf-testkit",
+ "kbf-threads",
+ "kbf-transfer",
+ "kbf-types",
+ "libc",
+ "prost",
+ "rcgen",
+ "rustix",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "kbf-store"
 version = "0.1.0"
 dependencies = [
@@ -2663,13 +2669,22 @@ dependencies = [
 name = "kbf-updater"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "httparse",
+ "kbf-ca",
+ "kbf-enroll",
  "kbf-host-install",
+ "kbf-peer",
+ "kbf-proto",
  "kbf-testkit",
+ "kbf-types",
  "libc",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -2831,19 +2846,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "loom"
-version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "419e0dc8046cb947daa77eb95ae174acfbddb7673b4151f56d1eed8e93fbfaca"
-dependencies = [
- "cfg-if",
- "generator",
- "scoped-tls",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "lzma-rs"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2851,15 +2853,6 @@ checksum = "297e814c836ae64db86b36cf2a557ba54368d03f6afcd7d947c266692f71115e"
 dependencies = [
  "byteorder",
  "crc",
-]
-
-[[package]]
-name = "matchers"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
-dependencies = [
- "regex-automata",
 ]
 
 [[package]]
@@ -3977,12 +3970,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "scoped-tls"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
-
-[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4386,6 +4373,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tierstore"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "hex",
+ "kbf-objstore",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "time"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4737,14 +4740,10 @@ version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
- "matchers",
  "nu-ansi-term",
- "once_cell",
- "regex-automata",
  "sharded-slab",
  "smallvec",
  "thread_local",
- "tracing",
  "tracing-core",
  "tracing-log",
 ]
@@ -5036,15 +5035,6 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
-
-[[package]]
-name = "windows-result"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
-dependencies = [
- "windows-link",
-]
 
 [[package]]
 name = "windows-sys"

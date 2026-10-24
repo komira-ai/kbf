@@ -69,9 +69,6 @@ pub enum Refusal {
     /// The address has presented too many wrong tokens lately: gRPC `RESOURCE_EXHAUSTED` (8),
     /// HTTP 429. The token was not looked at.
     RateLimited,
-    /// The credential could not be judged now (the OIDC issuer's keys cannot be fetched and
-    /// none are held): gRPC `UNAVAILABLE` (14), HTTP 503. Not a verdict on the caller.
-    Unavailable,
 }
 
 impl Refusal {
@@ -82,7 +79,6 @@ impl Refusal {
             Self::Unauthenticated => 16,
             Self::PermissionDenied => 7,
             Self::RateLimited => 8,
-            Self::Unavailable => 14,
         }
     }
 
@@ -93,19 +89,15 @@ impl Refusal {
             Self::Unauthenticated => 401,
             Self::PermissionDenied => 403,
             Self::RateLimited => 429,
-            Self::Unavailable => 503,
         }
     }
 }
 
 /// A token as the proxy keeps it: its SHA-256, so the comparison is over equal-length
-/// digests, and the bytes themselves. The bytes are kept only for the operator token, which
-/// the proxy presents to the child on behalf of a CI job it admitted by OIDC (the child's
-/// operator API takes no other credential); nothing else reads them.
+/// digests. The bytes themselves are not kept.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Token {
     digest: [u8; 32],
-    secret: Vec<u8>,
 }
 
 impl std::fmt::Debug for Token {
@@ -120,20 +112,7 @@ impl Token {
     pub fn new(secret: &[u8]) -> Self {
         Self {
             digest: Sha256::digest(secret).into(),
-            secret: secret.to_vec(),
         }
-    }
-
-    /// `Authorization: Bearer <this token>`, marked sensitive so it is not logged. `None` if
-    /// the token has a byte a header cannot hold (a token file's content never does).
-    #[must_use]
-    pub fn bearer_header(&self) -> Option<http::HeaderValue> {
-        let mut value = Vec::with_capacity(7 + self.secret.len());
-        value.extend_from_slice(b"Bearer ");
-        value.extend_from_slice(&self.secret);
-        let mut value = http::HeaderValue::from_bytes(&value).ok()?;
-        value.set_sensitive(true);
-        Some(value)
     }
 
     /// Whether `presented` is this token, in constant time. The caller rate limits before
@@ -193,7 +172,7 @@ impl Token {
 pub struct Tokens {
     /// The Buck2 API key (`buck2_auth = "bearer"`).
     pub buck2: Option<Token>,
-    /// The operator token, which is also the update credential until OIDC (#1088).
+    /// The operator token, which is also the update credential.
     pub operator: Option<Token>,
 }
 
@@ -260,7 +239,16 @@ pub fn decide(
         },
         AuthClass::Reapi => match mode {
             Buck2Auth::None => Ok(()),
-            Buck2Auth::Mtls if presented.identity.is_some() => Ok(()),
+            // A certificate of any farm role but a host updater's, which is for the
+            // coordinator and its frontend's worker listener, and no build-cache credential.
+            Buck2Auth::Mtls
+                if presented
+                    .identity
+                    .is_some_and(|id| id.role != PeerRole::Updater) =>
+            {
+                Ok(())
+            }
+            Buck2Auth::Mtls if presented.identity.is_some() => Err(Refusal::PermissionDenied),
             Buck2Auth::Mtls => Err(Refusal::Unauthenticated),
             Buck2Auth::Bearer => token_ok(tokens.buck2.as_ref(), presented),
         },
@@ -403,11 +391,12 @@ mod tests {
             (PeerRole::Daemon, true),
             (PeerRole::Storage, true),
             (PeerRole::Frontend, false),
+            (PeerRole::Updater, false),
         ] {
             let i = id(role);
             let p = Presented {
                 identity: Some(&i),
-                bearer: Some(b"op-key"),
+                bearer: Some(b"op-key".as_slice()),
             };
             let want = if ok {
                 Ok(())
@@ -457,7 +446,7 @@ mod tests {
         // The operator token is not the Buck2 key.
         let op = Presented {
             identity: None,
-            bearer: Some(b"op-key"),
+            bearer: Some(b"op-key".as_slice()),
         };
         assert_eq!(
             call(AuthClass::Reapi, Buck2Auth::Bearer, op),
@@ -470,7 +459,7 @@ mod tests {
         let i = id(PeerRole::Storage);
         let good = Presented {
             identity: None,
-            bearer: Some(b"op-key"),
+            bearer: Some(b"op-key".as_slice()),
         };
         let cert_only = Presented {
             identity: Some(&i),
@@ -681,5 +670,60 @@ mod tests {
         let one = Tokens::from_files(&good, None).expect("one");
         assert!(one.buck2.is_none());
         assert!(Tokens::from_files(&good, Some(&open)).is_err());
+    }
+
+    /// With `buck2_auth = "mtls"` a certificate of the farm's own roles opens the build cache and
+    /// a host updater's does not: it is for the update calls.
+    #[test]
+    fn an_updater_certificate_is_no_build_cache_credential() {
+        let updater = id(PeerRole::Updater);
+        let presented = Presented {
+            identity: Some(&updater),
+            bearer: None,
+        };
+        assert_eq!(
+            call(AuthClass::Reapi, Buck2Auth::Mtls, presented),
+            Err(Refusal::PermissionDenied)
+        );
+        for role in [PeerRole::Daemon, PeerRole::Storage, PeerRole::Frontend] {
+            let i = id(role);
+            let presented = Presented {
+                identity: Some(&i),
+                bearer: None,
+            };
+            assert_eq!(call(AuthClass::Reapi, Buck2Auth::Mtls, presented), Ok(()));
+        }
+    }
+
+    /// A host updater's certificate opens none of the operator or update paths at the proxy: those
+    /// take the operator token whatever the certificate says, and the frontend serves an updater
+    /// its own-node calls itself.
+    #[test]
+    fn an_updater_certificate_is_no_operator_credential() {
+        let updater = id(PeerRole::Updater);
+        let presented = Presented {
+            identity: Some(&updater),
+            bearer: None,
+        };
+        for class in [AuthClass::Operator, AuthClass::Update] {
+            assert_eq!(
+                call(class, Buck2Auth::Mtls, presented),
+                Err(Refusal::Unauthenticated),
+                "{class:?}"
+            );
+        }
+        let wrong = Presented {
+            identity: Some(&updater),
+            bearer: Some(b"not-the-token".as_slice()),
+        };
+        assert_eq!(
+            call(AuthClass::Operator, Buck2Auth::Mtls, wrong),
+            Err(Refusal::Unauthenticated)
+        );
+        let right = Presented {
+            identity: Some(&updater),
+            bearer: Some(b"op-key".as_slice()),
+        };
+        assert_eq!(call(AuthClass::Operator, Buck2Auth::Mtls, right), Ok(()));
     }
 }

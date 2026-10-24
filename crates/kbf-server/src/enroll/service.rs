@@ -32,12 +32,12 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use kbf_ca::{CaError, NodeCert, PublicKey, SystemEntropy, parse_csr};
+use kbf_ca::{CaError, Issued, NodeCert, PublicKey, SystemEntropy, UpdaterCert, parse_csr};
 use kbf_enroll_registry::{self as registry, Enrolled, IssuedRole, StoredCert};
 use kbf_proto::kbf::enroll::v1 as pb;
 use kbf_proto::kbf::enroll::v1::enroll_server::Enroll;
 use kbf_state::Store;
-use kbf_types::{NodeId, RefusalReason, Role, RoleSet, TokenId};
+use kbf_types::{HostRole, NodeId, RefusalReason, Role, RoleSet, TokenId};
 use sha2::{Digest as _, Sha256};
 use tonic::{Request, Response, Status};
 
@@ -249,7 +249,15 @@ impl EnrollService {
         }
         let csrs = csrs_of(&request.csrs)?;
         let cold = core.cold()?;
-        let mut sign = || core.sign_enroll(&node_id, &csrs, &request.advertise);
+        // What an updater's certificate says the host runs is the token's, fixed when it was
+        // made. The registry verifies the token before it calls the signer, so reading it
+        // here tells a caller who has not proved the secret nothing.
+        let host_role = if csrs.iter().any(|(role, _)| *role == Role::Updater) {
+            registry::token_host_role(&*core.store, &token_id).map_err(|e| registry_reason(&e))?
+        } else {
+            None
+        };
+        let mut sign = || core.sign_enroll(&node_id, &csrs, &request.advertise, host_role);
         let enrolled = registry::enroll_txn(
             &*core.store,
             &registry::EnrollRequest {
@@ -348,7 +356,7 @@ impl Core {
         }
     }
 
-    /// One certificate for `key`, as the registry records it.
+    /// One node certificate for `key`, as the registry records it.
     pub(super) fn issue(
         &self,
         node: &NodeId,
@@ -370,15 +378,49 @@ impl Core {
                 &mut SystemEntropy,
             )
             .map_err(|e| ca_reason(&e))?;
-        let time = |t: i64| u64::try_from(t).map_err(|_| RefusalReason::NotSigner);
-        Ok(IssuedRole {
-            role,
-            spki_sha256: Sha256::digest(key.spki()).into(),
-            serial: serial_bytes(&issued.serial)?,
-            not_before: time(issued.not_before)?,
-            not_after: time(issued.not_after)?,
-            cert_der: issued.der,
-        })
+        issued_role(role, key, issued)
+    }
+
+    /// A host's updater certificate for `key`, as the registry records it.
+    pub(super) fn issue_updater(
+        &self,
+        node: &NodeId,
+        host_role: HostRole,
+        key: &PublicKey,
+    ) -> Result<IssuedRole, RefusalReason> {
+        let issued = self
+            .ca
+            .node()
+            .issue_updater(
+                &UpdaterCert {
+                    node_id: node,
+                    host_role,
+                    key,
+                },
+                self.now(),
+                &mut SystemEntropy,
+            )
+            .map_err(|e| ca_reason(&e))?;
+        issued_role(Role::Updater, key, issued)
+    }
+
+    /// The certificate for one CSR's `role`: an updater's with the token's host role, any
+    /// other as a node's with `advertise` (a storage node's).
+    pub(super) fn issue_for(
+        &self,
+        node: &NodeId,
+        role: Role,
+        key: &PublicKey,
+        host_role: Option<HostRole>,
+        advertise: Option<&str>,
+    ) -> Result<IssuedRole, RefusalReason> {
+        match role {
+            Role::Updater => {
+                self.issue_updater(node, host_role.ok_or(RefusalReason::NotSigner)?, key)
+            }
+            Role::Storage => self.issue(node, role, key, advertise),
+            Role::Daemon => self.issue(node, role, key, None),
+        }
     }
 
     /// The signing step of an `Enroll`: called by the registry once every check has passed.
@@ -387,6 +429,7 @@ impl Core {
         node: &NodeId,
         csrs: &[(Role, &[u8])],
         advertise: &str,
+        host_role: Option<HostRole>,
     ) -> Result<Vec<IssuedRole>, RefusalReason> {
         if node_id_refused(node.as_str(), &self.frontend_names) {
             return Err(RefusalReason::NodeIdNotAllowed);
@@ -404,11 +447,23 @@ impl Core {
         csrs.iter()
             .map(|(role, der)| {
                 let parsed = parse_csr(der).map_err(|_| RefusalReason::BadCsr)?;
-                let named = host.as_deref().filter(|_| *role == Role::Storage);
-                self.issue(node, *role, &parsed.key, named)
+                self.issue_for(node, *role, &parsed.key, host_role, host.as_deref())
             })
             .collect()
     }
+}
+
+/// The registry's record of `issued`, a certificate for `key`.
+fn issued_role(role: Role, key: &PublicKey, issued: Issued) -> Result<IssuedRole, RefusalReason> {
+    let time = |t: i64| u64::try_from(t).map_err(|_| RefusalReason::NotSigner);
+    Ok(IssuedRole {
+        role,
+        spki_sha256: Sha256::digest(key.spki()).into(),
+        serial: serial_bytes(&issued.serial)?,
+        not_before: time(issued.not_before)?,
+        not_after: time(issued.not_after)?,
+        cert_der: issued.der,
+    })
 }
 
 /// Runs a call that blocks on the pool and tells its result as a gRPC answer.

@@ -8,10 +8,10 @@
 //! to the same set.
 //!
 //! - **The release set.** The `cargo xtask package` lines of the workflow name exactly
-//!   [`ASSETS`] (binary and platform): `kbf`, `kbf-installer` and `kbf-host-install` for the
-//!   three platforms, `kbf-daemon`, `kbf-server`, `kbf-deploy` and `kbf-updater` for Linux
-//!   (the updater drives hosts from an operator's Linux box), `kbf-deploy` for macOS (a Mac
-//!   runs `kbf daemon`; there is no darwin `kbf-daemon`). Each one's SBOM attestation is
+//!   [`ASSETS`] (binary and platform): `kbf`, `kbf-installer`, `kbf-host-install` and
+//!   `kbf-updater` for the three platforms (a Mac runs the host agent), `kbf-daemon`,
+//!   `kbf-server`, `kbf-deploy` and `kbf-signer` for Linux, `kbf-deploy` for macOS (a Mac runs `kbf daemon`;
+//!   there is no darwin `kbf-daemon`). Each one's SBOM attestation is
 //!   [`crate::attested_assets`]' business, and its provenance bundle
 //!   [`crate::attested_bundles`]'.
 //! - **Who signs, and when.** The workflow runs for pull requests and the merge queue
@@ -55,6 +55,11 @@
 //!   the units of the modes, depending on the installer's package), from the same
 //!   `pkg-config` step, and make its deb an asset (`cargo xtask pkg-kbf-asset`); the verify
 //!   job checks each signed one (`kbf_package`'s rules).
+//! - **The images.** The same jobs build the frontend's OCI image from the `kbf` of their own
+//!   tarball and the update coordinator's from the `kbf-coordinator` they built, each twice with
+//!   the commit's time and no BuildKit attachments, compare the two files, and make the first an
+//!   asset (`cargo xtask pkg-image-asset --service`, `images`' rules); the verify job checks
+//!   each signed one.
 //! - **The installer's Mac package.** The darwin job builds the `kbf-installer` `.pkg`
 //!   (`cargo xtask pkg build`, with the pinned darwin `gh`, the trusted root and an
 //!   `installer.conf` from `pkg-trust`), installs it as root on the runner
@@ -77,6 +82,7 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-deploy", "darwin-arm64"),
     ("kbf-installer", "darwin-arm64"),
     ("kbf-host-install", "darwin-arm64"),
+    ("kbf-updater", "darwin-arm64"),
     ("kbf", "linux-x86_64"),
     ("kbf-daemon", "linux-x86_64"),
     ("kbf-server", "linux-x86_64"),
@@ -84,6 +90,7 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-installer", "linux-x86_64"),
     ("kbf-host-install", "linux-x86_64"),
     ("kbf-updater", "linux-x86_64"),
+    ("kbf-signer", "linux-x86_64"),
     ("kbf", "linux-arm64"),
     ("kbf-daemon", "linux-arm64"),
     ("kbf-server", "linux-arm64"),
@@ -91,6 +98,7 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-installer", "linux-arm64"),
     ("kbf-host-install", "linux-arm64"),
     ("kbf-updater", "linux-arm64"),
+    ("kbf-signer", "linux-arm64"),
 ];
 
 /// The binaries of [`ASSETS`] that name the commit they were built from (`<binary>
@@ -177,6 +185,7 @@ pub fn problems(workflow: &str) -> Result<Vec<String>, String> {
     facts::rules(workflow, &mut out)?;
     packages(workflow, &mut out)?;
     kbf_package::rules(workflow, &mut out)?;
+    images::rules(workflow, &mut out)?;
     mac_package(workflow, &mut out)?;
     darwin(workflow, &mut out)?;
     pull_request_gate(workflow, &mut out)?;
@@ -835,6 +844,7 @@ fn the_docs_describe_the_release_set() {
     // builds (the doc is what an operator verifies against), or no longer saying that
     // pushes to the development branch are attested, what `--version --json` is, and
     // how a tarball is verified offline with its bundle.
+    // Also catches a tarball count in the doc that is not the size of `ASSETS`.
     let doc = std::fs::read_to_string(super::repo_root().join("docs/artifacts.md"))
         .expect("docs/artifacts.md");
     let mut missing = Vec::new();
@@ -844,10 +854,16 @@ fn the_docs_describe_the_release_set() {
             missing.push(format!("docs/artifacts.md does not list {file}"));
         }
     }
+    let count = format!("\n{} tarballs, each", ASSETS.len());
+    if !doc.contains(&count) {
+        missing.push(format!("docs/artifacts.md does not open its list with `{}`: the count of tarballs is not the size of the release set", count.trim()));
+    }
     for platform in PACKAGES {
         for file in [
             format!("`kbf-installer-<commit>-{platform}.deb`"),
             format!("`kbf-<commit>-{platform}.deb`"),
+            format!("`kbf-frontend-image-<commit>-{platform}.oci.tar`"),
+            format!("`kbf-coordinator-image-<commit>-{platform}.oci.tar`"),
         ] {
             if !doc.contains(&file) {
                 missing.push(format!("docs/artifacts.md does not list {file}"));
@@ -928,6 +944,50 @@ mod rules {
     fn verify_kbf_package_step(platform: &str) -> String {
         format!(
             "      - name: Kbf package {platform}\n        run: cargo xtask pkg-kbf-asset --verify-only --package \"dist/kbf-$GITHUB_SHA-{platform}.deb\" --platform {platform} --commit \"$GITHUB_SHA\" --kbf-tarball \"dist/kbf-$GITHUB_SHA-{platform}.tar.gz\"\n"
+        )
+    }
+
+    /// The steps that build the frontend image of `platform` from the job's kbf tarball, twice,
+    /// compare the builds and make the first an asset.
+    fn image_steps(platform: &str) -> String {
+        let build = |n: u32| {
+            format!(
+                "      - name: Build {n}\n        run: docker buildx build --builder b --no-cache --platform p --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --file f --output \"type=docker,oci-mediatypes=true,dest=target/image-out/{n}.oci.tar,rewrite-timestamp=true\" target/image\n"
+            )
+        };
+        format!(
+            "      - name: Epoch\n        run: cargo xtask source-date-epoch --commit \"$GITHUB_SHA\" --output \"$GITHUB_ENV\"\n      - name: Context\n        run: tar -xzf \"dist/kbf-$GITHUB_SHA-{platform}.tar.gz\" -C target/image kbf\n{}{}      - name: Same\n        run: cmp target/image-out/1.oci.tar target/image-out/2.oci.tar\n      - name: Image asset\n        run: cargo xtask pkg-image-asset --service frontend --image target/image-out/1.oci.tar --platform {platform} --commit \"$GITHUB_SHA\" --kbf-tarball \"dist/kbf-$GITHUB_SHA-{platform}.tar.gz\" --out dist\n",
+            build(1),
+            build(2)
+        )
+    }
+
+    /// The verify job's check of the signed frontend image of `platform`.
+    fn verify_image_step(platform: &str) -> String {
+        format!(
+            "      - name: Image {platform}\n        run: cargo xtask pkg-image-asset --verify-only --service frontend --image \"dist/kbf-frontend-image-$GITHUB_SHA-{platform}.oci.tar\" --platform {platform} --commit \"$GITHUB_SHA\" --kbf-tarball \"dist/kbf-$GITHUB_SHA-{platform}.tar.gz\"\n"
+        )
+    }
+
+    /// The steps that check the job's `kbf-coordinator`, build its image twice from it, compare
+    /// the builds and make the first an asset (the commit's time is `image_steps`').
+    fn coordinator_steps(platform: &str) -> String {
+        let build = |n: u32| {
+            format!(
+                "      - name: Coordinator build {n}\n        run: docker buildx build --builder b --no-cache --platform p --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --file f --output \"type=docker,oci-mediatypes=true,dest=target/coordinator-image-out/{n}.oci.tar,rewrite-timestamp=true\" target/coordinator-image\n"
+            )
+        };
+        format!(
+            "      - name: Coordinator check\n        run: cargo xtask build-commit check \"target/$TARGET/release/kbf-coordinator\" \"$GITHUB_SHA\"\n      - name: Coordinator context\n        run: cp \"target/$TARGET/release/kbf-coordinator\" target/coordinator-image/kbf-coordinator\n{}{}      - name: Coordinator same\n        run: cmp target/coordinator-image-out/1.oci.tar target/coordinator-image-out/2.oci.tar\n      - name: Coordinator asset\n        run: cargo xtask pkg-image-asset --service coordinator --image target/coordinator-image-out/1.oci.tar --platform {platform} --commit \"$GITHUB_SHA\" --binary \"target/$TARGET/release/kbf-coordinator\" --out dist\n",
+            build(1),
+            build(2)
+        )
+    }
+
+    /// The verify job's check of the signed coordinator image of `platform` (no file of the build).
+    fn verify_coordinator_step(platform: &str) -> String {
+        format!(
+            "      - name: Coordinator image {platform}\n        run: cargo xtask pkg-image-asset --verify-only --service coordinator --image \"dist/kbf-coordinator-image-$GITHUB_SHA-{platform}.oci.tar\" --platform {platform} --commit \"$GITHUB_SHA\"\n"
         )
     }
 
@@ -1023,6 +1083,8 @@ mod rules {
                 w.push_str(&kbf_build_steps());
                 w.push_str(&package_steps(platform));
                 w.push_str(&kbf_asset_step(platform));
+                w.push_str(&image_steps(platform));
+                w.push_str(&coordinator_steps(platform));
             }
             if *job == MAC_PACKAGE {
                 w.push_str(&mac_package_steps());
@@ -1041,6 +1103,8 @@ mod rules {
                 for p in PACKAGES {
                     w.push_str(&verify_package_step(p));
                     w.push_str(&verify_kbf_package_step(p));
+                    w.push_str(&verify_image_step(p));
+                    w.push_str(&verify_coordinator_step(p));
                 }
             } else {
                 w.push_str(&verify_mac_package_step());
@@ -1935,10 +1999,12 @@ mod rules {
         );
     }
 
+    mod images_tests;
     mod kbf_package_tests;
 }
 
 mod facts;
+mod images;
 #[cfg(test)]
 mod installer;
 mod kbf_package;

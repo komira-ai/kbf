@@ -1,12 +1,14 @@
-//! The `[proxy]` table of `installer.toml` and the static upstream table.
+//! The `[proxy]` table of `installer.toml`.
 //!
 //! [`ProxyConfig`] is read once at start (SIGHUP reloads the certificate files only, not
 //! this table). Unknown keys are refused, so a typo is an error at start, not a default.
 //!
-//! The children are given one of two ways, never both. The `upstream` table is slot mode: two
-//! slots, A and B, that a supervisor starts and swaps between. `[[frontend]]` tables are pool
-//! mode: any number of frontends that run on their own, which the proxy balances over and
-//! drains one at a time (`admin_listen` is where the drain is asked for).
+//! The children are given as `[[frontend]]` tables: any number of frontends that run on their
+//! own, which the proxy balances over and drains one at a time (`admin_listen` is where the
+//! drain is asked for). The `upstream` table of the removed two-slot supervision is still read
+//! and written back, so that a file written before keeps its table when `kbf-installer setup`
+//! rewrites it and the release fetcher reads it ([`ProxyConfig::check`] accepts it). The proxy's
+//! own start refuses it ([`ProxyConfig::check_pool`], [`SLOT_MODE_REMOVED`]).
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -17,10 +19,13 @@ use kbf_tls::{CertEntry, SniCerts};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::Buck2Auth;
-use crate::hold::{HEADER_BYTES, STREAM_WINDOW_BYTES};
+use crate::limits::{HEADER_BYTES, STREAM_WINDOW_BYTES};
 use crate::replay::REPLAY_BYTES;
-use crate::route::Target;
-use crate::slot::Slot;
+
+/// What a table with the `upstream` table is refused with.
+pub const SLOT_MODE_REMOVED: &str = "two-slot supervision was removed: configure pool mode, a \
+     [[proxy.frontend]] table for each frontend that runs on its own, in place of \
+     [proxy.upstream]";
 
 /// Why a config is refused.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -36,52 +41,19 @@ pub enum ConfigError {
     ServerCerts(String),
 }
 
-/// Ports of the children: slot `A` starts at `base_port`, slot `B` at `base_port + 10`; in a
-/// slot the REAPI, worker and operator listeners are at offsets 0, 1 and 2, the admin
-/// calls at 3 and enrollment at 4. The offsets are the frozen contract with the children
-/// (design section 7).
+/// The `upstream` table of the removed two-slot supervision: the first port of its slot A. It
+/// is kept as it was written; nothing reads the port.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamTable {
-    /// The first port of slot A (1024 to [`MAX_BASE_PORT`]).
+    /// The first port of slot A.
     pub base_port: u16,
 }
 
-/// The slot stride in ports.
-pub const SLOT_STRIDE: u16 = 10;
-/// The admin port's offset in a slot.
-pub const ADMIN_OFFSET: u16 = 3;
-/// The largest `base_port`: slot B's highest offset (enrollment, 4) must still be a port.
-pub const MAX_BASE_PORT: u16 = u16::MAX - SLOT_STRIDE - 4;
-
-impl UpstreamTable {
-    /// The table of a config that has none (pool mode): port 0. Only slot-mode code reads a
-    /// table, and it does not run in pool mode.
-    pub const POOL_MODE: Self = Self { base_port: 0 };
-
-    const fn base(self, slot: Slot) -> u16 {
-        match slot {
-            Slot::A => self.base_port,
-            Slot::B => self.base_port + SLOT_STRIDE,
-        }
-    }
-
-    /// The loopback port of `slot`'s listener `target`.
-    #[must_use]
-    pub const fn port(self, slot: Slot, target: Target) -> u16 {
-        self.base(slot) + target.offset()
-    }
-
-    /// The loopback port of `slot`'s admin calls.
-    #[must_use]
-    pub const fn admin_port(self, slot: Slot) -> u16 {
-        self.base(slot) + ADMIN_OFFSET
-    }
-}
-
-/// One `[[frontend]]` table of pool mode: a frontend that runs on its own, which the proxy
-/// balances over. Its listeners are at the offsets of [`UpstreamTable`] from `base_port`
-/// (REAPI 0, worker 1, operator 2, admin calls 3, enrollment 4), on loopback.
+/// One `[[frontend]]` table: a frontend that runs on its own, which the proxy balances over.
+/// Its listeners are at fixed offsets from `base_port` (REAPI 0, worker 1, operator 2, admin
+/// calls 3, enrollment 4), on loopback; the offsets are the frozen contract with the
+/// children (`kbf-proxy-api.md` section 7).
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Frontend {
@@ -125,8 +97,8 @@ pub struct Limits {
     pub max_connections: usize,
     /// Most open connections from one address.
     pub max_connections_per_ip: usize,
-    /// Most streams in flight across all connections (bound, held and dialing); one more
-    /// is refused at header time. Memory is bounded by this times the stream windows.
+    /// Most streams in flight across all connections (dialing and bound); one more is
+    /// refused at header time. Memory is bounded by this times the stream windows.
     pub max_streams: usize,
     /// The memory the proxy may need at the worst: [`Limits::max_streams`] times
     /// [`Limits::stream_ceiling_bytes`] must fit in it, or the config is refused at start. The
@@ -197,20 +169,20 @@ pub struct ServerCert {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
-    /// The children's ports in slot mode: the supervisor starts two children, A and B, on
-    /// them and swaps between them. Give this table or `[[frontend]]`, not both.
+    /// The `upstream` table of the removed two-slot supervision. [`ProxyConfig::check`]
+    /// accepts it, so that a file written before is read and written back whole;
+    /// [`ProxyConfig::check_pool`] refuses it with [`SLOT_MODE_REMOVED`].
     #[serde(default)]
     pub upstream: Option<UpstreamTable>,
-    /// Pool mode: the frontends that run on their own, which the proxy balances over (the
-    /// least busy that is ready takes the next stream) and drains one at a time. Names are
-    /// unique and base ports at least [`FRONTEND_SPAN`] apart. No child is started, no swap
-    /// is held. Give these tables or `upstream`, not both.
+    /// The frontends that run on their own, which the proxy balances over (the least busy
+    /// that is ready takes the next stream) and drains one at a time. Names are unique and
+    /// base ports at least [`FRONTEND_SPAN`] apart. At least one is needed.
     #[serde(default)]
     pub frontend: Vec<Frontend>,
-    /// Pool mode: where the admin API listens, plain HTTP on a loopback address with a port
+    /// Where the admin API listens, plain HTTP on a loopback address with a port
     /// (`host:port`). It lists the frontends and drains or undrains one (`pool_admin`). Unset,
-    /// there is no admin API. Refused in slot mode, for an address that is not loopback
-    /// (nothing on this socket asks for a credential) and for a port of a frontend.
+    /// there is no admin API. Refused for an address that is not loopback (nothing on this
+    /// socket asks for a credential) and for a port of a frontend.
     #[serde(default, deserialize_with = "admin_address")]
     pub admin_listen: Option<SocketAddr>,
     /// The public address, as `host:port`. The proxy does not read it: it takes the socket
@@ -225,11 +197,10 @@ pub struct ProxyConfig {
     pub buck2_token_file: Option<PathBuf>,
     /// The operator token file (`/etc/kbf/operator.token`), read by the proxy itself at start.
     pub operator_token_file: PathBuf,
-    /// The allow-list for CI jobs that call with a GitHub OIDC token instead of the operator
-    /// token (`[remote_operator]` table of this file, for example `/etc/kbf/remote-ci.toml`;
-    /// `kbf-oidc` documents the keys). Unset (the default), the operator token is the only
-    /// credential. Set, an OIDC token is admitted for `POST /v1/update/desired` and
-    /// `POST /v1/update/frontend` and for nothing else (`remote` module).
+    /// No longer read: the allow-list for CI jobs that called with a GitHub OIDC token instead
+    /// of the operator token went with the update API's handler. The key is still accepted, so
+    /// that a file written before keeps starting the proxy; a CI job's token is no longer
+    /// admitted.
     #[serde(default)]
     pub remote_operator_file: Option<PathBuf>,
     /// The server certificate chain and key, reloaded on SIGHUP together with `client_ca`:
@@ -248,12 +219,13 @@ pub struct ProxyConfig {
     /// The secret file (default `/run/kbf-proxy/proxy-auth`).
     #[serde(default = "default_secret_file")]
     pub proxy_auth_file: PathBuf,
-    /// The proxy's state directory (default `/var/lib/kbf-proxy`). The swap state machine and
-    /// `update.json` belong to U7a's actor, not to the proxy.
+    /// No longer read: the proxy's state directory (default `/var/lib/kbf-proxy`) belonged to
+    /// the swap. The key is still accepted, so that a file written before keeps starting the
+    /// proxy.
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
-    /// Hold bound of a frontend swap, in seconds (default 20: the 15 s takeover budget plus a
-    /// 5 s margin).
+    /// No longer read: the hold bound of a frontend swap, in seconds (default 20). The key is
+    /// still accepted, so that a file written before keeps starting the proxy.
     #[serde(default = "default_hold_s")]
     pub hold_max_s: u64,
     /// Serve the read-only web UI at `/ui` (default `true`). The UI is open: it asks for no
@@ -315,25 +287,14 @@ const fn default_hold_s() -> u64 {
 }
 
 impl ProxyConfig {
-    /// The hold bound of a frontend swap, to pass to `ActiveSlot::hold`.
-    #[must_use]
-    pub const fn frontend_hold(&self) -> Duration {
-        Duration::from_secs(self.hold_max_s)
-    }
-
-    /// The slot-mode table: [`UpstreamTable::POOL_MODE`] in pool mode, where nothing reads it.
-    #[must_use]
-    pub fn slot_table(&self) -> UpstreamTable {
-        self.upstream.unwrap_or(UpstreamTable::POOL_MODE)
-    }
-
-    /// Reads and checks a `[proxy]` table (the text of the table's body).
+    /// Reads a `[proxy]` table (the text of the table's body) and checks it as the proxy does at
+    /// start ([`ProxyConfig::check_pool`]).
     ///
     /// # Errors
     /// [`ConfigError`].
     pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        config.check()?;
+        config.check_pool()?;
         Ok(config)
     }
 
@@ -363,7 +324,8 @@ impl ProxyConfig {
     }
 
     /// Reads and checks the `[proxy]` table of a larger file (`installer.toml`) that the caller
-    /// has already parsed: the same table, the same refusals as [`ProxyConfig::from_toml_str`].
+    /// has already parsed, with [`ProxyConfig::check`]: the table of a file written before the
+    /// two-slot supervision was removed is read, and refused only at the proxy's start.
     ///
     /// # Errors
     /// [`ConfigError`].
@@ -375,22 +337,22 @@ impl ProxyConfig {
         Ok(config)
     }
 
-    /// Reads the allow-list `remote_operator_file` names, if any, and fetches nothing: the
-    /// check of `kbf-installer proxy --check`, so a bad allow-list is found before a restart.
+    /// The proxy's check at start: [`ProxyConfig::check`], and no `upstream` table, which it
+    /// refuses with [`SLOT_MODE_REMOVED`].
     ///
     /// # Errors
-    /// [`ConfigError::Parse`], naming the key and the reason.
-    pub fn check_remote_file(&self) -> Result<(), ConfigError> {
-        match &self.remote_operator_file {
-            None => Ok(()),
-            Some(file) => crate::remote::RemoteCi::check_file(file)
-                .map_err(|e| ConfigError::Parse(format!("remote_operator_file: {e}"))),
+    /// [`ConfigError::Invalid`].
+    pub fn check_pool(&self) -> Result<(), ConfigError> {
+        if self.upstream.is_some() {
+            return Err(ConfigError::Invalid(SLOT_MODE_REMOVED));
         }
+        self.check()
     }
 
-    /// The rules between keys that a parse cannot see: the same checks
-    /// [`ProxyConfig::from_toml_str`] makes, for a caller (`kbf-installer setup`) that builds
-    /// a table from flags and must refuse what the proxy would refuse at start.
+    /// The rules between keys that a parse cannot see, for a caller (`kbf-installer setup`, the
+    /// release fetcher) that reads the table of a file and must not refuse one written before
+    /// the removal of the two-slot supervision: the rules of the pool, unless the table has the
+    /// `upstream` table, whose frontends and `admin_listen` are not looked into.
     ///
     /// # Errors
     /// [`ConfigError::Invalid`].
@@ -416,7 +378,9 @@ impl ProxyConfig {
         }
         SniCerts::check_entries(&self.cert_entries())
             .map_err(|e| ConfigError::ServerCerts(e.to_string()))?;
-        self.check_children()?;
+        if self.upstream.is_none() {
+            self.check_frontends()?;
+        }
         if self.buck2_auth == Buck2Auth::Bearer && self.buck2_token_file.is_none() {
             return Err(ConfigError::Invalid(
                 "buck2_auth = \"bearer\" needs buck2_token_file",
@@ -439,42 +403,18 @@ impl ProxyConfig {
                 "limits.max_streams times the per-stream ceiling exceeds limits.memory_budget_mib",
             ));
         }
-        if self.hold_max_s == 0 {
-            return Err(ConfigError::Invalid("hold_max_s must be above 0"));
-        }
         Ok(())
     }
 
-    /// The rules about the children: exactly one of slot mode (`upstream`) and pool mode
-    /// (`[[frontend]]`), the rules of the one given, and `admin_listen` for pool mode only.
-    fn check_children(&self) -> Result<(), ConfigError> {
-        match (self.upstream, self.frontend.is_empty()) {
-            (Some(_), false) => Err(ConfigError::Invalid(
-                "give upstream or [[frontend]], not both",
-            )),
-            (None, true) => Err(ConfigError::Invalid(
-                "the children are needed: an upstream table, or [[frontend]] tables",
-            )),
-            (Some(upstream), true) => {
-                if !(1024..=MAX_BASE_PORT).contains(&upstream.base_port) {
-                    return Err(ConfigError::Invalid(
-                        "upstream.base_port must be 1024 to 65521 so both slots fit",
-                    ));
-                }
-                match self.admin_listen {
-                    Some(_) => Err(ConfigError::Invalid(
-                        "admin_listen is for pool mode: give [[frontend]] tables",
-                    )),
-                    None => Ok(()),
-                }
-            }
-            (None, false) => self.check_frontends(),
-        }
-    }
-
-    /// The rules of pool mode: plain unique names, base ports that leave each frontend its
-    /// [`FRONTEND_SPAN`] ports, and an `admin_listen` on loopback and on none of those ports.
+    /// The rules about the frontends: at least one, plain unique names, base ports that leave
+    /// each frontend its [`FRONTEND_SPAN`] ports, and an `admin_listen` on loopback and on none
+    /// of those ports.
     fn check_frontends(&self) -> Result<(), ConfigError> {
+        if self.frontend.is_empty() {
+            return Err(ConfigError::Invalid(
+                "the children are needed: [[frontend]] tables",
+            ));
+        }
         let mut names = BTreeSet::new();
         for frontend in &self.frontend {
             if !name_is_plain(&frontend.name) {
@@ -528,16 +468,20 @@ operator_token_file = "/etc/kbf/operator.token"
 server_cert_file = "/etc/kbf/tls/server.pem"
 server_key_file = "/etc/kbf/tls/server.key"
 client_ca_file = "/etc/kbf/tls/ca.pem"
-[upstream]
+[[frontend]]
+name = "a"
 base_port = 18000
 "#;
 
+    /// Asserts that a minimal table gets the documented defaults: the retired keys at the values
+    /// a file written before them reads as, the limits at theirs, and no admin API.
     #[test]
     fn a_minimal_table_gets_the_documented_defaults() {
         let c = ProxyConfig::from_toml_str(MIN).expect("valid");
         assert_eq!(c.buck2_auth, Buck2Auth::None);
         assert_eq!(c.hold_max_s, 20);
-        assert_eq!(c.frontend_hold(), Duration::from_secs(20));
+        assert_eq!(c.remote_operator_file, None);
+        assert_eq!(c.admin_listen, None);
         assert_eq!(c.limits.max_streams, 8_192);
         assert_eq!(c.limits, Limits::default());
         assert_eq!(c.limits.pre_stream_timeout(), Duration::from_secs(10));
@@ -548,9 +492,24 @@ base_port = 18000
         assert_eq!(c.state_dir, PathBuf::from("/var/lib/kbf-proxy"));
     }
 
+    /// Asserts that the keys of the removed supervision and of the removed CI credential are
+    /// still read, with any value they had, so that a file written before keeps starting the
+    /// proxy.
+    #[test]
+    fn the_retired_keys_are_still_read() {
+        let old = format!(
+            "hold_max_s = 0\nstate_dir = \"/var/lib/other\"\nremote_operator_file = \"/etc/kbf/ci.toml\"\n{MIN}"
+        );
+        let c = ProxyConfig::from_toml_str(&old).expect("valid");
+        assert_eq!(c.hold_max_s, 0);
+        assert_eq!(c.state_dir, PathBuf::from("/var/lib/other"));
+        assert_eq!(
+            c.remote_operator_file,
+            Some(PathBuf::from("/etc/kbf/ci.toml"))
+        );
+    }
+
     /// The UI is on unless the table says `ui = false`, and the key is read as a boolean.
-    ///
-    /// Kills: a default of off; the key ignored; a non-boolean accepted.
     #[test]
     fn the_ui_is_on_by_default_and_ui_false_turns_it_off() {
         assert!(ProxyConfig::from_toml_str(MIN).expect("valid").ui);
@@ -569,7 +528,7 @@ base_port = 18000
 operator_token_file = "/etc/kbf/operator.token"
 client_ca_file = "/etc/kbf/tls/ca.pem"
 "#;
-    const UPSTREAM: &str = "[upstream]\nbase_port = 18000\n";
+    const FRONTEND: &str = "[[frontend]]\nname = \"a\"\nbase_port = 18000\n";
 
     fn two_certs(extra: &str) -> String {
         format!(
@@ -584,14 +543,12 @@ default = true
 names = ["farm.internal.example"]
 cert_file = "/etc/kbf/tls/worker.pem"
 key_file = "/etc/kbf/tls/worker.key"
-{UPSTREAM}"#
+{FRONTEND}"#
         )
     }
 
     /// The single-pair form is one default entry with no names, so a config written before
     /// SNI keeps serving one certificate for every name.
-    ///
-    /// Kills: the old form refused, or read as a named entry.
     #[test]
     fn the_single_certificate_form_is_a_one_entry_list() {
         let c = ProxyConfig::from_toml_str(MIN).expect("valid");
@@ -607,8 +564,6 @@ key_file = "/etc/kbf/tls/worker.key"
     }
 
     /// A list of two with one marked default reads in file order with its names.
-    ///
-    /// Kills: names or the default flag dropped between the table and the TLS layer.
     #[test]
     fn a_server_cert_list_is_read_with_names_and_the_default() {
         let c = ProxyConfig::from_toml_str(&two_certs("")).expect("valid");
@@ -622,9 +577,6 @@ key_file = "/etc/kbf/tls/worker.key"
 
     /// The forms do not mix, a half pair is refused, a list needs its default, and one
     /// certificate is required.
-    ///
-    /// Kills: both forms accepted with one silently winning; a start with no certificate; a
-    /// list with no explicit default.
     #[test]
     fn the_certificate_forms_are_exclusive_and_the_default_is_explicit() {
         let pair = "server_cert_file = \"/c\"\nserver_key_file = \"/k\"\n";
@@ -632,13 +584,13 @@ key_file = "/etc/kbf/tls/worker.key"
             ProxyConfig::from_toml_str(&two_certs(pair)),
             Err(ConfigError::Invalid(_))
         ));
-        let half = format!("server_cert_file = \"/c\"\n{HEAD}{UPSTREAM}");
+        let half = format!("server_cert_file = \"/c\"\n{HEAD}{FRONTEND}");
         assert!(matches!(
             ProxyConfig::from_toml_str(&half),
             Err(ConfigError::Invalid(_))
         ));
         assert!(matches!(
-            ProxyConfig::from_toml_str(&format!("{HEAD}{UPSTREAM}")),
+            ProxyConfig::from_toml_str(&format!("{HEAD}{FRONTEND}")),
             Err(ConfigError::Invalid(_))
         ));
         let no_default = two_certs("").replacen("default = true", "", 1);
@@ -746,45 +698,6 @@ key_file = "/etc/kbf/tls/worker.key"
     }
 
     #[test]
-    fn slot_ports_are_fixed_offsets() {
-        let t = UpstreamTable { base_port: 18000 };
-        assert_eq!(t.port(Slot::A, Target::Reapi), 18000);
-        assert_eq!(t.port(Slot::A, Target::Operator), 18002);
-        assert_eq!(t.port(Slot::B, Target::Worker), 18011);
-        assert_eq!(t.admin_port(Slot::A), 18003);
-        assert_eq!(t.admin_port(Slot::B), 18013);
-    }
-
-    /// The largest accepted `base_port` gives every listener of both slots a port (no
-    /// overflow on the first call to the highest offset), and one more is refused.
-    #[test]
-    fn the_largest_base_port_leaves_room_for_every_port() {
-        assert_eq!(MAX_BASE_PORT, 65_521);
-        let at = |port: u16| MIN.replace("18000", &port.to_string());
-        let config = ProxyConfig::from_toml_str(&at(65_521)).expect("the largest");
-        let ports: Vec<u16> = Slot::ALL
-            .into_iter()
-            .flat_map(|slot| {
-                let t = config.slot_table();
-                [
-                    Target::Reapi,
-                    Target::Worker,
-                    Target::Operator,
-                    Target::Enroll,
-                ]
-                .map(|target| t.port(slot, target))
-                .into_iter()
-                .chain([t.admin_port(slot)])
-            })
-            .collect();
-        assert_eq!(ports.iter().max(), Some(&65_535));
-        assert!(matches!(
-            ProxyConfig::from_toml_str(&at(65_522)),
-            Err(ConfigError::Invalid(_))
-        ));
-    }
-
-    #[test]
     fn a_broken_table_is_refused_at_start() {
         let bad = |extra: &str| ProxyConfig::from_toml_str(&format!("{extra}\n{MIN}"));
         assert!(matches!(bad("surprise = 1"), Err(ConfigError::Parse(_))));
@@ -795,10 +708,6 @@ key_file = "/etc/kbf/tls/worker.key"
         assert!(matches!(
             bad("buck2_auth = \"basic\""),
             Err(ConfigError::Parse(_))
-        ));
-        assert!(matches!(
-            bad("hold_max_s = 0"),
-            Err(ConfigError::Invalid(_))
         ));
         assert!(bad("buck2_auth = \"bearer\"\nbuck2_token_file = \"/k\"").is_ok());
         let low = MIN.replace("18000", "80");

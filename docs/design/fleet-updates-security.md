@@ -321,6 +321,38 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 >   is killed and deleted as `kill-uid` and `user-delete` do. A reset that fails
 >   part-way names each failure and can be repeated. It restarts nothing: a stale
 >   session's processes end with `kill-uid`'s bootout of `gui/<uid>`.
+> - **The standing VM user.** A Mac provisioned for macOS guest VMs starts the helper with
+>   `--vm-user <name>` (never a `kbf-lease-` name, `root` or `_kbf`; the flag is refused
+>   at start otherwise). The account is made by provisioning, not by the helper, and is
+>   outside the ledger, so the boot reset and `user-delete` can never reach it.
+>   `session-idle` then rests the Mac at that user: it reads the user's password from
+>   the root-only file `kbf-mac-provision` wrote once (`vm-user-password` in the state
+>   directory: 64 lowercase hex digits, a regular file, not a link, root's, mode 0400;
+>   `kbf-mac-session` duplicates that rule and `kbf-mac-provision` owns it, so the two
+>   change together), writes `/etc/kcpassword` from it when that differs, sets
+>   `autoLoginUser`, writes the intent record `vm` last (so a failure part-way leaves a lease's record guarding its user) and
+>   restarts (FileVault must be off, as for `session-login`). A repeat while the record
+>   is `vm`, `autoLoginUser` is the VM user and `gui/<uid>` exists restarts nothing, so
+>   running VMs survive it. The boot reset keeps that rest when `autoLoginUser` names the
+>   VM user and the record is `vm` or absent; any other session, including a `vm` record
+>   over some other auto-login, is cleared as before. Only provisioning may name the
+>   account: the helper does not check for an admin or human account beyond the uid
+>   range, and `role-kill-uid` and `session-idle` act on whatever account is named. A
+>   Mac restarted mid-lease rests at the login window until the daemon calls
+>   `session-idle` after `boot-reset`. The leak scan's baseline for such a Mac must be
+>   recorded while it rests at the VM user. The helper never makes or resets the VM
+>   user's password (a missing or invalid file fails `session-idle`, naming the path and
+>   saying to run `kbf-mac-provision apply`), so the password is set once at
+>   provisioning and never rotated and the account's login keychain is never stranded
+>   by a reset. What is still open, measured by E2 on a Mac: whether automatic login
+>   unlocks the login keychain at all. `--vm-user` stays unset until then.
+>   `session-login <lease>` still switches away from the VM user. Three verbs act for
+>   the VM user: `role-run` (a process in its `gui/<uid>` domain, refused until the
+>   domain exists and while a lease holds the session), `role-session-ready` (false
+>   while a lease holds the session) and `role-kill-uid` (ends the session with the
+>   processes). Its uid is read from the directory each time and must be an ordinary
+>   uid outside the lease range. That VMs and a whole-machine lease never run together
+>   on one Mac is the daemon's rule: it drains VMs before `session-login`.
 > - Every program the switch and the scan run (`defaults`, `launchctl`, `fdesetup`,
 >   `sfltool`) goes through the host's command runner with an empty environment, so
 >   the unit tests fake each one and nothing in CI restarts: the macOS CI job runs the

@@ -118,7 +118,7 @@ fn a_clean_tree_gives_an_empty_diff() {
 /// must add.
 type Plant = fn(&Rig);
 
-const PLANTS: [(&str, Plant, &str); 9] = [
+const PLANTS: [(&str, Plant, &str); 10] = [
     (
         "a launch agent",
         |rig| std::fs::write(rig.dir.join("LaunchAgents/evil.plist"), "x").unwrap(),
@@ -167,6 +167,11 @@ const PLANTS: [(&str, Plant, &str); 9] = [
         "an intent record",
         |rig| std::fs::write(rig.dir.join("session-intent"), "9.9\n").unwrap(),
         "auto-login intent 9.9",
+    ),
+    (
+        "the VM user's intent record",
+        |rig| std::fs::write(rig.dir.join("session-intent"), "vm\n").unwrap(),
+        "auto-login intent vm",
     ),
     (
         "a launch daemon's new contents",

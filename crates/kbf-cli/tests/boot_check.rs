@@ -43,13 +43,14 @@ fn a_mode_that_keeps_no_state_in_the_database_passes_without_an_installer_toml()
     }
 }
 
-/// Asserts that a frontend or all-in-one host whose `installer.toml` names no database passes
+/// Asserts that a frontend host whose `installer.toml` names no database passes
 /// and says so: it has nothing to migrate.
 #[test]
 fn a_host_whose_installer_toml_names_no_database_passes() {
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "boot-check-no-database");
     let config = installer_config(&dir, "release_source = \"bundled\"\n");
-    for mode in ["frontend", "all-in-one"] {
+    {
+        let mode = "frontend";
         let flag = format!("--mode={mode}");
         let (code, out, err) = boot_check(&[flag.as_str(), config.as_str()]);
         assert_eq!(code, Some(0), "{mode}: {err}");
@@ -58,7 +59,7 @@ fn a_host_whose_installer_toml_names_no_database_passes() {
     }
 }
 
-/// Asserts that a frontend or all-in-one host whose database cannot be reached (the socket
+/// Asserts that a frontend host whose database cannot be reached (the socket
 /// directory is not there) is refused with exit 1 and the database's reason on standard
 /// error, so that the unit does not start, and that the reason does not name the socket.
 #[test]
@@ -68,7 +69,8 @@ fn a_host_whose_database_cannot_be_reached_is_refused_with_exit_1() {
     let config = installer_config(&dir, &format!("database = \"{url}\"\n"));
     let said = "kbf boot-check: state schema: ";
     let socket = "nonexistent-kbf-test-socket";
-    for mode in ["frontend", "all-in-one"] {
+    {
+        let mode = "frontend";
         let flag = format!("--mode={mode}");
         let (code, out, err) = boot_check(&[flag.as_str(), config.as_str()]);
         assert_eq!(code, Some(1), "{mode}: {err}");
@@ -89,7 +91,7 @@ fn an_installer_toml_that_cannot_be_used_is_refused_with_exit_1_and_no_secret() 
     assert_eq!(code, Some(1), "{err}");
     assert!(err.contains("absent.toml"), "{err}");
     let broken = installer_config(&dir, "database = = =");
-    let (code, _, err) = boot_check(&["--mode=all-in-one", broken.as_str()]);
+    let (code, _, err) = boot_check(&["--mode=frontend", broken.as_str()]);
     assert_eq!(code, Some(1), "{err}");
     assert!(err.contains("is not valid TOML"), "{err}");
     let secret = installer_config(&dir, "database = \"postgres://kbf:hunter2@db/kbf\"\n");

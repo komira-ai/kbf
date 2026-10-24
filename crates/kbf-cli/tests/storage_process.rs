@@ -14,7 +14,7 @@ use kbf_cas_conformance::Subject;
 use kbf_storage::Storage as _;
 use kbf_storage::service::RemoteStorage;
 use kbf_testkit::dir::TestDir;
-use kbf_transfer::{TransferConfig, Transfers};
+use kbf_transfer::{Cas as _, TransferConfig, Transfers};
 use tonic::transport::Endpoint;
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf");
@@ -302,4 +302,86 @@ fn plain_text_off_loopback_is_a_refused_start() {
     }
     assert_eq!(err.lines().count(), 3, "{err}");
     assert!(!err.contains("--storage-listen"), "{err}");
+}
+
+/// The start-up pass's last line (`kbf-server`'s `startup_pass`).
+const PASS_DONE: &str = "start-up pass over the cold store directory done";
+
+/// What a round of eviction that evicted logs (`kbf-front`'s `Cache::evict_round`).
+const EVICTED: &str = "evicted the least recently used objects";
+
+/// Catches the start-up pass or the evictor not run over a storage node's `file://` cold
+/// store (defects: `kbf_server::start`'s `file://` arm passes no pass; the evictor loop
+/// removed): a single-node farm is such a node's main use, and the pass deletes its
+/// orphans and forgets its lost objects, the evictor keeps its disk from filling. Without
+/// a hot store (uploads go straight to the cold store), on a fake 16 MiB filesystem
+/// holding only the object files with a 4 MiB floor and no grace window (the server's
+/// hidden test flags, which `kbf storage` takes as `kbf-server` does), the pass logs its
+/// last line, twenty uploads of 1 MiB each succeed (one that finds the directory short of
+/// room is tried again after a round), the evictor logs a round and the first blob is
+/// reported missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_start_up_pass_and_the_evictor_run_over_a_file_cold_store() {
+    const MIB: usize = 1 << 20;
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "storage-pass");
+    let mut child = Command::new(BIN)
+        .args(["storage", "--storage-listen=127.0.0.1:0"])
+        .arg(format!(
+            "--cold-store=file://{}",
+            dir.join("cold").display()
+        ))
+        .arg(format!("--meta-dir={}", dir.join("meta").display()))
+        .arg(format!("--cold-store-size-bytes={}", 16 * MIB))
+        .arg(format!("--cold-store-floor-bytes={}", 4 * MIB))
+        .arg("--cold-store-evict-grace-ms=0")
+        .arg(kbf_testkit::config::flag(&dir))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn kbf storage");
+    let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let stderr = BufReader::new(child.stderr.take().expect("stderr"));
+    let (seen, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in stderr.lines().map_while(Result::ok) {
+            if line.contains(PASS_DONE) || line.contains(EVICTED) {
+                let _ = seen.send(line);
+            }
+        }
+    });
+    let wait = std::time::Duration::from_secs(60);
+    let line = stdout.lines().next().expect("a start line").expect("read");
+    let addr = line
+        .split(' ')
+        .find_map(|field| field.strip_prefix("storage="))
+        .unwrap_or_else(|| panic!("no storage= in {line:?}"))
+        .to_owned();
+    let mut node = Node { child, addr };
+    let line = lines.recv_timeout(wait).expect("the pass's last line");
+    assert!(line.contains(PASS_DONE), "{line}");
+
+    let endpoint = Endpoint::from_shared(format!("http://{}", node.addr)).expect("endpoint");
+    let cas = Transfers::new(endpoint, TransferConfig::default());
+    let mut blobs = Vec::new();
+    // A write that finds the directory short of room is refused as unavailable until a
+    // round of eviction has made room; the client tries again, as any does.
+    let deadline = std::time::Instant::now() + wait;
+    for i in 0..20_u8 {
+        let digest = loop {
+            match cas.put(vec![i; MIB]).await {
+                Ok(digest) => break digest,
+                Err(e) if std::time::Instant::now() < deadline => {
+                    eprintln!("blob {i}: {e}; trying again");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("blob {i} was not stored in time: {e}"),
+            }
+        };
+        blobs.push(digest);
+    }
+    let line = lines.recv_timeout(wait).expect("an eviction round");
+    assert!(line.contains(EVICTED), "{line}");
+    let missing = cas.missing(&blobs[..1]).await;
+    assert_eq!(missing, blobs[..1], "the least recently used blob was kept");
+    assert!(node.stop().is_some_and(|status| status.success()));
 }

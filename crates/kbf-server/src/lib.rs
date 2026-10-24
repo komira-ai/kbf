@@ -26,7 +26,10 @@
 //!   same listener, on by default (`--ui=false` turns it off), the read-only, open web UI under
 //!   `/ui` ([`ui_mount`]), whose reads are bounded per caller ([`read_limit`]).
 //! - A drain of the frontend ([`drain`]) that a stop signal or `POST /v1/frontend/drain`
-//!   begins, a second signal escalates, and `kbf cluster` calls through [`api_client`].
+//!   begins, a second signal escalates, and `kbf cluster` calls through [`api_client`]. A
+//!   frontend over a state store runs it as a sequence that works behind any load balancer
+//!   ([`sequence`]): not ready first, then refusing and GOAWAY, then the open executions
+//!   run out, then the process exits.
 //! - Node rolling ([`update`]): the durable rows and facts of a split-mode update
 //!   (`docs/design/split-mode-updates.md`, sections 2.6 to 2.11). Nothing picks hosts or
 //!   steps them: updates are OS packages, driven by `kbf-updater`.
@@ -87,7 +90,6 @@ pub mod fleet;
 pub mod front_maps;
 pub mod frontend;
 pub mod grpc_health;
-pub mod handover;
 pub mod health;
 mod health_summary;
 pub mod history;
@@ -102,7 +104,6 @@ mod listen;
 mod local;
 pub mod log_file;
 pub mod machine;
-pub mod managed;
 mod map_push;
 pub mod mdm;
 pub mod members;
@@ -111,6 +112,7 @@ mod memory;
 pub mod metrics;
 mod missing;
 pub mod node_map;
+pub mod node_self;
 mod notify;
 pub mod object_store;
 pub mod proxy_auth;
@@ -124,7 +126,10 @@ pub mod replication;
 pub mod retire;
 pub mod retired;
 mod run_record;
+pub mod sequence;
 pub mod serve;
+#[cfg(test)]
+mod serve_goaway_tests;
 #[cfg(test)]
 mod serve_remote_tests;
 mod size_key;
@@ -152,7 +157,6 @@ pub mod verbs;
 pub mod vitals;
 pub mod worker;
 pub mod worker_roles;
-pub mod write_rules;
 pub mod write_tier;
 
 pub use config::{Args, ConfigError, Role, SERVER, s3_store};
@@ -179,7 +183,7 @@ pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_in
 pub use start_exit::{
     NOT_READY, REFUSED, STALE_WRITER_HINT, StartFailure, hint as start_hint, said as start_said,
 };
-pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
+pub use state_store::{PackIndexFlagError, StateStore, StateStoreUri, StateStoreUriError};
 pub use streams::{StreamArgs, StreamLimits};
 pub use ui_mount::bind_server_with_options;
 pub use worker::HostFloor;

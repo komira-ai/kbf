@@ -7,8 +7,8 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# The one binary: `kbf <mode>` over the libraries of kbf-node and kbf-all-in-one
-# (docs/design/cluster.md, sections 1 and 5.1). Like kbf-all-in-one it links both the
+# The one binary: `kbf <mode>` over the libraries of kbf-node and kbf-storage-and-daemon
+# (docs/design/cluster.md, sections 1 and 5.1). Like kbf-storage-and-daemon it links both the
 # server and the node library (the version stamp is kbf-server's), so it is listed in
 # `JOINERS` in crates/kbf-integration-test/tests/layering.rs.
 [[bin]]
@@ -34,7 +34,7 @@ test = false
 
 [dependencies]
 clap.workspace = true
-kbf-all-in-one.workspace = true
+kbf-storage-and-daemon.workspace = true
 kbf-node.workspace = true
 kbf-server.workspace = true
 # The startup self-checks (src/preflight): the role a certificate names, and a
@@ -59,8 +59,9 @@ rustix = { workspace = true, features = ["process", "system"] }
 # The Postgres state schema version, which `kbf --version --json` reports.
 kbf-state = { workspace = true, features = ["postgres"] }
 # `kbf setup` (src/setup.rs): the first configuration of a host from the packages. Without the
-# library's `proxy` feature, so this binary links no kbf-proxy: the host behind the proxy is
-# `kbf-installer setup`'s (tests/layering.rs in kbf-integration-test checks the tree).
+# library's `proxy` feature, so this binary links no kbf-proxy: an installer.toml with a
+# `[proxy]` table is `kbf-installer setup`'s to keep (tests/layering.rs in kbf-integration-test
+# checks the tree).
 kbf-setup.workspace = true
 # The identity `kbf --version --json` prints (src/version.rs), and the bodies of
 # `kbf cluster` (src/cluster.rs).
@@ -121,7 +122,7 @@ kbf-front.workspace = true
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 kbf-driver-container.workspace = true
 # The farm of real `kbf` processes the rehearsal (tests/rehearsal_in_a_box.rs) drives, and
-# the stand-in `podman`'s store (tests/support, through kbf-all-in-one's node.rs).
+# the stand-in `podman`'s store (tests/support, through kbf-storage-and-daemon's node.rs).
 kbf-harness.workspace = true
 
 [lints]

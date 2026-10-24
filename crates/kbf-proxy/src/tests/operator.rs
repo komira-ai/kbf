@@ -1,14 +1,14 @@
 //! The operator API through the proxy, over HTTP: every `/v1/*` path but `/v1/update/frontend*`
-//! reaches the active child's operator listener with its method, path, query, body and
-//! credential intact, and the child's answer comes back. These pin the routing table of
+//! reaches a member's operator listener with its method, path, query, body and credential
+//! intact, and the member's answer comes back. These pin the routing table of
 //! `docs/design/frontend-proxy.md` section 3 at the wire, not only in `route_of`.
 
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
 
 use bytes::Bytes;
 
-use super::kit::{OPERATOR_TOKEN, Rig, Script, read_all, script, tagged};
+use super::kit::{OPERATOR_TOKEN, Script, read_all, script, tagged};
+use super::pool_kit::Rig;
 
 /// One request as a recording child saw it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,9 +59,9 @@ fn seen(log: &Log) -> Vec<Got> {
 /// Kills: a path of the table answered by the proxy; a query string dropped; a method or
 /// body changed on the way; the reply not carried back (status, header, body).
 #[tokio::test(start_paused = true)]
-async fn operator_calls_reach_the_active_child_whole_and_the_reply_comes_back() {
-    let (la, lb): (Log, Log) = Default::default();
-    let rig = Rig::start(recording("a", &la), recording("b", &lb)).await;
+async fn operator_calls_reach_a_member_whole_and_the_reply_comes_back() {
+    let log = Log::default();
+    let rig = Rig::start(&[recording("a", &log)]);
     let mut client = rig.client().await;
     let calls: [(&str, &str, &'static [u8]); 6] = [
         ("GET", "/v1/nodes?state=up&limit=5", b""),
@@ -92,8 +92,7 @@ async fn operator_calls_reach_the_active_child_whole_and_the_reply_comes_back() 
             body: b.to_vec(),
         })
         .collect();
-    assert_eq!(seen(&la), want);
-    assert!(seen(&lb).is_empty(), "the inactive slot sees nothing");
+    assert_eq!(seen(&log), want);
 }
 
 /// The operator token goes on to the child (its gate decides writes) next to the proxy's
@@ -102,11 +101,11 @@ async fn operator_calls_reach_the_active_child_whole_and_the_reply_comes_back() 
 /// Kills: `Authorization` stripped on the way to the child; no proxy secret set.
 #[tokio::test(start_paused = true)]
 async fn the_operator_token_and_the_proxy_secret_reach_the_child() {
-    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    let rig = Rig::start(&[tagged("a")]);
     let mut client = rig.client().await;
     let reply = client.plain("POST", "/v1/members/n7", b"{}").await;
     assert_eq!(reply.status, Some(200));
-    let headers = rig.a.state.headers_of("/v1/members/n7");
+    let headers = rig.a().state.headers_of("/v1/members/n7");
     assert_eq!(headers.len(), 1);
     assert_eq!(
         headers[0]
@@ -122,59 +121,59 @@ async fn the_operator_token_and_the_proxy_secret_reach_the_child() {
 /// Kills: the update prefix forwarded; `/v1/update/frontendx` taken for the update API.
 #[tokio::test(start_paused = true)]
 async fn the_frontend_update_api_is_served_by_the_proxy_not_forwarded() {
-    let (la, lb): (Log, Log) = Default::default();
-    let rig = Rig::start(recording("a", &la), recording("b", &lb)).await;
+    let log = Log::default();
+    let rig = Rig::start(&[recording("a", &log)]);
     let mut client = rig.client().await;
     for (method, path) in [
         ("GET", "/v1/update/frontend"),
         ("POST", "/v1/update/frontend/abort"),
     ] {
         let reply = client.plain(method, path, b"").await;
+        assert_eq!(reply.status, Some(503), "{path}: the built-in handler");
         assert_ne!(
             reply.headers.get("x-child-reply"),
             Some(&http::HeaderValue::from_static("a")),
             "{path} was answered by the child"
         );
     }
-    assert_eq!(rig.a.state.dispatches(), 0, "nothing reached the child");
+    assert_eq!(rig.dispatches(), [0], "nothing reached the child");
     let near = client.plain("GET", "/v1/update/frontendx", b"").await;
     assert_eq!(near.status, Some(200));
     assert_eq!(
-        seen(&la).len(),
+        seen(&log).len(),
         1,
         "a path beside the prefix is the child's"
     );
 }
 
-/// After the slot flips, operator calls go to the new active child.
-///
-/// Kills: a route bound to the slot that was active at start; a flip that leaves operator
-/// calls on the old child.
+/// Asserts that operator calls go to the members that take streams: the first call is answered
+/// by `a`, and once `a` drains the other member has all the calls that follow.
 #[tokio::test(start_paused = true)]
-async fn operator_calls_follow_the_active_slot_after_a_flip() {
+async fn operator_calls_follow_the_members_that_take_streams() {
     let (la, lb): (Log, Log) = Default::default();
-    let rig = Rig::start(recording("a", &la), recording("b", &lb)).await;
+    let rig = Rig::start(&[recording("a", &la), recording("b", &lb)]);
     let mut client = rig.client().await;
     assert_eq!(
         client.plain("GET", "/v1/nodes", b"").await.text(),
         "{\"from\":\"a\"}"
     );
-    rig.flip_to_b();
-    let after = client.plain("GET", "/v1/nodes", b"").await;
-    assert_eq!(after.text(), "{\"from\":\"b\"}");
+    assert!(rig.members.set_draining("a", true));
+    for _ in 0..2 {
+        let after = client.plain("GET", "/v1/nodes", b"").await;
+        assert_eq!(after.text(), "{\"from\":\"b\"}");
+    }
     assert_eq!(seen(&la).len(), 1);
-    assert_eq!(seen(&lb).len(), 1);
+    assert_eq!(seen(&lb).len(), 2);
 }
 
-/// With no active child an operator call is answered 503 by the proxy, plain HTTP with a
-/// retry hint, and no child is asked.
-///
-/// Kills: a 200 or a hang with no active slot; a call sent to a closed slot.
+/// Asserts that with no member taking streams an operator call is answered 503 by the proxy,
+/// plain HTTP with a retry hint, and that no child is asked.
 #[tokio::test(start_paused = true)]
-async fn operator_calls_with_no_active_child_are_503() {
+async fn operator_calls_with_no_member_taking_streams_are_503() {
     let (la, lb): (Log, Log) = Default::default();
-    let rig = Rig::start(recording("a", &la), recording("b", &lb)).await;
-    rig.core.slots.clear_active();
+    let rig = Rig::start(&[recording("a", &la), recording("b", &lb)]);
+    assert!(rig.members.set_draining("a", true));
+    assert!(rig.members.set_draining("b", true));
     let mut client = rig.client().await;
     let reply = client.plain("GET", "/v1/nodes", b"").await;
     assert_eq!(reply.status, Some(503));
@@ -186,215 +185,6 @@ async fn operator_calls_with_no_active_child_are_503() {
             .and_then(|v| v.to_str().ok()),
         Some("1")
     );
-    assert!(seen(&la).is_empty() && seen(&lb).is_empty());
-}
-
-/// A child whose `/metrics` answers `status` with `body`, `size` bytes of it when `size` is
-/// set; or never answers when `silent`.
-fn metrics_child(status: u16, body: &'static str, size: usize, silent: bool) -> Script {
-    script(move |mut call| async move {
-        read_all(&mut call.body).await;
-        if silent {
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-            return;
-        }
-        let data = if size > 0 {
-            Bytes::from(vec![b'x'; size])
-        } else {
-            Bytes::from_static(body.as_bytes())
-        };
-        let response = http::Response::builder()
-            .status(status)
-            .header("content-type", "text/plain; version=0.0.4")
-            .body(())
-            .expect("a response");
-        if let Ok(mut send) = call.respond.send_response(response, false) {
-            let _ = send.send_data(data, true);
-        }
-    })
-}
-
-async fn scrape(rig: &Rig) -> String {
-    let mut client = rig.client().await;
-    let reply = client.plain("GET", "/metrics", b"").await;
-    assert_eq!(reply.status, Some(200));
-    reply.text()
-}
-
-/// `/metrics` is the proxy's series followed by the active child's, so one scrape of the
-/// public port sees both. The child is asked as an operator call: the caller's token and the
-/// proxy secret go with it.
-///
-/// Kills: the child's body not appended; the child asked without the secret; the proxy's own
-/// series lost.
-#[tokio::test(start_paused = true)]
-async fn metrics_carry_the_active_childs_series_after_the_proxys() {
-    let child = metrics_child(200, "kbf_child_series_total 7\n", 0, false);
-    let rig = Rig::start(child, tagged("b")).await;
-    let text = scrape(&rig).await;
-    let own = text.find("kbf_proxy_panics_total 0").expect("proxy series");
-    let theirs = text
-        .find("kbf_child_series_total 7\n")
-        .expect("child series");
-    assert!(own < theirs, "the proxy's series come first:\n{text}");
-    assert!(text.contains("kbf_proxy_child_metrics_failed_total 0"));
-    let asked = rig.a.state.headers_of("/metrics");
-    assert_eq!(asked.len(), 1);
-    assert_eq!(
-        asked[0].get("authorization").and_then(|v| v.to_str().ok()),
-        Some(format!("Bearer {OPERATOR_TOKEN}").as_str())
-    );
-    assert!(asked[0].contains_key("x-kbf-proxy-auth"));
-}
-
-/// After a flip the new active child's series are the ones shown.
-///
-/// Kills: the metrics fetch bound to a fixed slot.
-#[tokio::test(start_paused = true)]
-async fn metrics_follow_the_active_slot() {
-    let a = metrics_child(200, "kbf_child_series_total 1\n", 0, false);
-    let b = metrics_child(200, "kbf_child_series_total 2\n", 0, false);
-    let rig = Rig::start(a, b).await;
-    rig.flip_to_b();
-    let text = scrape(&rig).await;
-    assert!(text.contains("kbf_child_series_total 2\n"), "{text}");
-    assert!(!text.contains("kbf_child_series_total 1\n"));
-}
-
-/// Whatever goes wrong with the child, the proxy's own series are served whole and the
-/// failure is counted.
-///
-/// Kills: a child failure that fails or empties the scrape; an uncounted failure.
-#[tokio::test(start_paused = true)]
-async fn a_child_that_cannot_give_metrics_leaves_the_proxys_series_and_a_count() {
-    let cases: [(&str, Script); 3] = [
-        ("an error status", metrics_child(500, "boom\n", 0, false)),
-        ("a body over 4 MiB", metrics_child(200, "", 5 << 20, false)),
-        ("no answer in 2 s", metrics_child(200, "", 0, true)),
-    ];
-    for (what, child) in cases {
-        let rig = Rig::start(child, tagged("b")).await;
-        let text = scrape(&rig).await;
-        assert!(text.contains("kbf_proxy_panics_total 0"), "{what}");
-        assert!(!text.contains("boom"), "{what}");
-        assert!(!text.contains("xxxx"), "{what}");
-        assert!(
-            text.contains("kbf_proxy_child_metrics_failed_total 1"),
-            "{what}:\n{text}"
-        );
-    }
-    let rig = Rig::start(tagged("a"), tagged("b")).await;
-    rig.core.slots.clear_active();
-    let text = scrape(&rig).await;
-    assert!(
-        text.contains("kbf_proxy_child_metrics_failed_total 1"),
-        "no active child:\n{text}"
-    );
-}
-
-/// A child whose `/metrics` answers 200 with exactly `body`, which need not be UTF-8.
-fn raw_metrics_child(body: &'static [u8]) -> Script {
-    script(move |mut call| async move {
-        read_all(&mut call.body).await;
-        let response = http::Response::builder()
-            .status(200)
-            .header("content-type", "text/plain; version=0.0.4")
-            .body(())
-            .expect("a response");
-        if let Ok(mut send) = call.respond.send_response(response, false) {
-            let _ = send.send_data(Bytes::from_static(body), true);
-        }
-    })
-}
-
-/// The child cannot speak for the proxy: its `kbf_proxy_*` samples and `# HELP`/`# TYPE`
-/// lines are dropped, and so is a `# EOF` terminator (it would end the scrape early). The
-/// proxy's own series appear once; a normal child series survives.
-///
-/// Kills: the child's body appended unfiltered (a duplicate or forged proxy series, a
-/// conflicting `# TYPE`, a stray `# EOF`); a filter that drops the child's own series.
-#[tokio::test(start_paused = true)]
-async fn the_childs_proxy_series_and_eof_are_not_appended() {
-    let child = raw_metrics_child(
-        b"# HELP kbf_proxy_panics_total forged\n\
-          kbf_proxy_panics_total 0\n\
-          # TYPE kbf_proxy_held_streams counter\n\
-          kbf_proxy_slot_open_streams{slot=\"A\"} 99\n\
-          # TYPE kbf_child_series_total counter\n\
-          kbf_child_series_total 7\n\
-          # EOF\n",
-    );
-    let rig = Rig::start(child, tagged("b")).await;
-    let text = scrape(&rig).await;
-    assert_eq!(
-        text.matches("kbf_proxy_panics_total 0").count(),
-        1,
-        "{text}"
-    );
-    assert_eq!(text.matches("# TYPE kbf_proxy_held_streams").count(), 1);
-    assert!(!text.contains("kbf_proxy_held_streams counter"), "{text}");
-    assert!(!text.contains("forged"), "{text}");
-    assert!(!text.contains("} 99"), "{text}");
-    assert!(!text.contains("# EOF"), "{text}");
-    assert!(text.contains("# TYPE kbf_child_series_total counter\n"));
-    assert!(text.contains("kbf_child_series_total 7\n"), "{text}");
-    assert!(text.contains("kbf_proxy_child_metrics_failed_total 0"));
-}
-
-/// A body that is not UTF-8 is not text to append: the proxy's series are served alone and
-/// the scrape counts as a failure.
-///
-/// Kills: invalid bytes appended to the scrape; an uncounted failure.
-#[tokio::test(start_paused = true)]
-async fn a_childs_non_utf8_metrics_are_dropped_and_counted() {
-    let rig = Rig::start(
-        raw_metrics_child(b"kbf_child_series_total 7\n\xff\xfe\n"),
-        tagged("b"),
-    )
-    .await;
-    let mut client = rig.client().await;
-    let reply = client.plain("GET", "/metrics", b"").await;
-    assert_eq!(reply.status, Some(200));
-    assert!(std::str::from_utf8(&reply.body).is_ok(), "own series only");
-    let text = reply.text();
-    assert!(text.contains("kbf_proxy_panics_total 0"));
-    assert!(!text.contains("kbf_child_series_total"), "{text}");
-    assert!(
-        text.contains("kbf_proxy_child_metrics_failed_total 1"),
-        "{text}"
-    );
-}
-
-/// A scrape during a swap hold does not wait for the hold: the child is not asked, the
-/// proxy's series come back at once with the failure counted. Time is paused, so a scrape
-/// that waited would only return by the clock running on; the bound here is far under
-/// `DEADLINE`.
-///
-/// Kills: the metrics fetch waiting on a held slot instead of giving up; a dispatch to a
-/// child during a hold.
-#[tokio::test(start_paused = true)]
-async fn a_scrape_during_a_swap_hold_does_not_wait() {
-    let rig = Rig::start(
-        metrics_child(200, "kbf_child_series_total 7\n", 0, false),
-        tagged("b"),
-    )
-    .await;
-    let _guard = rig
-        .core
-        .slots
-        .hold(Duration::from_secs(20))
-        .expect("no hold in force");
-    let began = tokio::time::Instant::now();
-    let text = tokio::time::timeout(Duration::from_millis(100), scrape(&rig))
-        .await
-        .expect("the scrape did not wait on the hold");
-    assert!(began.elapsed() < Duration::from_millis(100));
-    assert!(text.contains("kbf_proxy_panics_total 0"), "{text}");
-    assert!(!text.contains("kbf_child_series_total"), "{text}");
-    assert!(
-        text.contains("kbf_proxy_child_metrics_failed_total 1"),
-        "{text}"
-    );
-    assert_eq!(rig.a.state.dispatches(), 0);
-    assert_eq!(rig.b.state.dispatches(), 0);
+    assert!(seen(&la).is_empty());
+    assert!(seen(&lb).is_empty());
 }

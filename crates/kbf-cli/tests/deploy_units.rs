@@ -126,7 +126,7 @@ fn paths(p: [PathBuf; 3]) -> [String; 3] {
 /// as other settings than the ones written. Each mode's unit and its setup file are read
 /// by kbf's own parser: the frontend and the all-in-one resolve to their flags (listeners,
 /// certificates toward storage, token file and the Postgres state store as the file
-/// spells them, no handover flag, which a Postgres store refuses), and the three modes
+/// spells them, no flag of the removed handover), and the three modes
 /// that enroll resolve to a start of the mode the unit names, on the file.
 #[test]
 fn each_packaged_mode_unit_starts_its_own_mode_on_the_kbf_toml_setup_writes() {
@@ -136,6 +136,13 @@ fn each_packaged_mode_unit_starts_its_own_mode_on_the_kbf_toml_setup_writes() {
         let words = start_words(&unit(&name), &name);
         assert_eq!(words, [format!("--mode={}", mode.name)], "{name}");
         let config = write_config(dir.path(), setup_file(mode.name));
+        if mode.name == "all-in-one" {
+            // Kept for one release; `kbf` refuses the mode the unit names. A follow-up
+            // rewrites this fixture for the replacement nodes.
+            let e = parse_with(argv(&words, &config), None).expect_err("refused");
+            assert!(e.to_string().contains(kbf_cli::ALL_IN_ONE_REMOVED), "{e}");
+            continue;
+        }
         let parsed = match parse_with(argv(&words, &config), None) {
             Ok(parsed) => parsed,
             Err(e) => panic!("kbf {} refuses {name} on its setup file:\n{e}", mode.name),
@@ -169,10 +176,10 @@ fn each_packaged_mode_unit_starts_its_own_mode_on_the_kbf_toml_setup_writes() {
                     Some(Path::new("/etc/kbf/api-token"))
                 );
                 assert_eq!(flags.server.state_store, Some(setup_state_store()));
-                // `kbf frontend` refuses a Postgres store with a control socket.
+                // The file writes no flag of the removed handover and admin port.
                 assert!(
-                    flags.handover.is_none(),
-                    "the postgres file gives a handover"
+                    flags.retired.warnings().is_empty(),
+                    "the file gives a retired flag"
                 );
             }
             Invocation::AllInOne(flags) => {
@@ -295,6 +302,13 @@ fn no_packaged_unit_is_refused_over_where_its_directories_are() {
         .map(|m| (m.name, setup_file(m.name).to_owned()))
         .collect();
     cases.push(("storage", STORAGE_BY_HAND.to_owned()));
+    // The mode that runs a node's storage and daemon together, given a metadata directory
+    // as the all-in-one's file has (its setup file names none).
+    let node = format!(
+        "{}\n[stores]\nmeta-dir = \"/var/lib/kbf-server/raft\"\n",
+        setup_file("storage-and-daemon")
+    );
+    cases.push(("storage-and-daemon", node));
     let mut moved = 0;
     for (mode, text) in cases {
         let farm = text
@@ -309,6 +323,11 @@ fn no_packaged_unit_is_refused_over_where_its_directories_are() {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        if mode == "all-in-one" {
+            // `kbf` refuses the mode, so there is no start to check; a follow-up
+            // moves this case to a mode that has a metadata directory.
+            continue;
+        }
         for text in [text.clone(), farm] {
             let name = format!("kbf-{mode}.service");
             let words = start_words(&unit(&name), &name);
@@ -392,9 +411,13 @@ fn each_rows_certificate_names_its_role_as_storage_reads_it() {
         assert_eq!(role.name(), row.role(), "{row:?}");
         roles.push(role);
     }
-    // Every role storage knows is some row's.
+    // Every role storage knows is some row's, a host's updater excepted: it is enrolled with a
+    // token (`kbf-updater enroll`), not deployed by a unit of this table.
     for role in PeerRole::ALL {
-        assert!(roles.contains(&role), "{role:?} is no row's");
+        assert!(
+            roles.contains(&role) || role == PeerRole::Updater,
+            "{role:?} is no row's"
+        );
     }
 }
 

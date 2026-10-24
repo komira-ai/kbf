@@ -1,9 +1,9 @@
-//! The secrets of the operator API: the bearer token and the proxy's per-boot secret, each
-//! read from a file that passes the server's own file rule.
+//! The secret of the operator API: the bearer token, read from a file that passes the server's
+//! own file rule.
 //!
-//! Both are read on every call (so a rotated token needs no restart), held only in the
-//! request buffer, and never in an error text, a `Debug` or a log. An error names the flag of
-//! the file, not its path: it reaches `GET /rolls/{id}`.
+//! It is read on every call (so a rotated token needs no restart), held only in the request
+//! buffer, and never in an error text, a `Debug` or a log. An error names the flag of the
+//! file, not its path: it reaches `GET /rolls/{id}`.
 
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -15,12 +15,6 @@ const TOKEN_MAX: u64 = 4096;
 
 /// The flag that names the token file, which error texts name instead of its path.
 pub const TOKEN_FLAG: &str = "--token-file";
-
-/// The flag that names the proxy's secret file.
-pub const PROXY_AUTH_FLAG: &str = "--operator-proxy-auth-file";
-
-/// The size of the proxy's per-boot secret, in bytes (`kbf-server`'s `SECRET_BYTES`).
-const PROXY_SECRET_BYTES: usize = 32;
 
 /// Read the token in the file at `path`: a regular file (not followed if it is a symlink,
 /// not opened if it is a FIFO) owned by this process's user with mode exactly `0600` or
@@ -42,31 +36,22 @@ pub fn read_token(path: &Path) -> Result<String, String> {
     Ok(token.to_owned())
 }
 
-/// Read the proxy's secret from the file at `path`, under the same file rule as the token:
-/// exactly 32 bytes, as `kbf-server` reads its own copy. The result is what the frontend
-/// compares, the bytes as 64 lower-case hex digits. Errors name the flag only.
-pub fn read_proxy_secret(path: &Path) -> Result<String, String> {
-    let bytes = read_secret(path, PROXY_AUTH_FLAG, PROXY_SECRET_BYTES as u64)?;
-    if bytes.len() != PROXY_SECRET_BYTES {
-        return Err(format!(
-            "{PROXY_AUTH_FLAG}: it must hold exactly {PROXY_SECRET_BYTES} bytes"
-        ));
-    }
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
 /// The bytes of a secret file that passes the file rule, at most `limit` of them (and one
 /// more, so that a longer file is seen to be too long). The error text names `flag`.
-fn read_secret(path: &Path, flag: &str, limit: u64) -> Result<Vec<u8>, String> {
+pub(crate) fn read_secret(path: &Path, flag: &str, limit: u64) -> Result<Vec<u8>, String> {
     let fail = |why: &str| format!("{flag}: {why}");
     let io = |e: std::io::Error| fail(&e.kind().to_string());
     let (file, meta) = open_checked(path).map_err(io)?;
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let me = unsafe { libc::geteuid() };
-    file_rule(meta.is_file(), meta.uid(), meta.mode(), me).map_err(fail)?;
+    file_rule(meta.is_file(), meta.uid(), meta.mode(), euid()).map_err(fail)?;
     let mut bytes = Vec::new();
     file.take(limit + 1).read_to_end(&mut bytes).map_err(io)?;
     Ok(bytes)
+}
+
+/// The effective user of this process.
+pub fn euid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
 }
 
 /// Open without following a symlink and without blocking on a FIFO; the metadata is of the

@@ -42,6 +42,7 @@ use crate::members_rpc::MembershipService;
 use crate::object_store::delivery::Delivery;
 use crate::proxy_auth::{ProxyAuthLayer, ProxySecret, gate_requests};
 use crate::state_store::StateStore;
+use crate::stop::Stop;
 use crate::store_config::service::ColdStoreService;
 use crate::streams::{StreamLimits, flow_windows};
 use crate::token::ApiToken;
@@ -145,7 +146,7 @@ impl Default for StreamTiming {
 
 /// How long, after the shutdown timeout ends the open streams UNAVAILABLE, the server
 /// waits for the clients to take it before it stops.
-const CLOSE_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
 /// The worker listener's mutual TLS: every daemon's certificate must name its node
 /// (see [`crate::identity`]).
@@ -205,9 +206,6 @@ pub enum ServeError {
     /// The storage map could not be read from the state store.
     #[error("storage map: {0}")]
     Map(#[from] MembershipError),
-    /// A frontend that was handing its work to a successor could not stand down.
-    #[error("handover: {0}")]
-    Handover(String),
 }
 
 /// A server that is listening: the addresses it bound, and the future that serves
@@ -291,6 +289,34 @@ where
     }
 }
 
+/// [`serve_api`] for an operator API that is sent GOAWAY and goes on answering. When
+/// `goaway` is fired every connection open is sent GOAWAY and finishes the requests it is
+/// answering, while the listener keeps accepting: a second server takes over the socket
+/// (`listeners` are two handles on one, [`crate::listen::Socket::http_pair`]) and serves
+/// until `stop`, so that a drain stays readable (`GET /v1/frontend/drain`, `/readyz`) until
+/// the process ends. A connection accepted in the moment of the change may be sent GOAWAY at
+/// once. The first server ends only at `goaway`, so what ends the operator API fires `goaway`
+/// as well as `stop`. Without a listener it only waits for `stop`.
+pub(crate) async fn serve_api_goaway(
+    listeners: Option<(tokio::net::TcpListener, tokio::net::TcpListener)>,
+    routes: axum::Router,
+    goaway: Stop,
+    stop: impl Future<Output = ()> + Send + 'static,
+    proxy: Option<Arc<ProxySecret>>,
+) -> std::io::Result<()> {
+    let Some((first, second)) = listeners else {
+        stop.await;
+        return Ok(());
+    };
+    let before = serve_api(Some(first), routes.clone(), goaway.fired(), proxy.clone());
+    let after = async {
+        goaway.fired().await;
+        serve_api(Some(second), routes, stop, proxy).await
+    };
+    let (before, after) = tokio::join!(before, after);
+    before.and(after)
+}
+
 /// Turns Nagle's algorithm off on a connection the operator API accepted, as [`bind`]
 /// does for the gRPC listeners. The call fails only on a socket that is already
 /// unusable, whose connection then fails on its own, so its error is not kept.
@@ -330,6 +356,9 @@ pub(crate) fn worker_peers(
 ) -> (WorkerListener, Peers, Option<TlsSource>) {
     let secret = behind.map(|behind| Arc::clone(&behind.secret));
     let proxy = ProxyAuthLayer::new(secret);
+    // HTTP/1.1 is accepted beside h2 for the node calls of a host's updater
+    // (`crate::node_self`); the role table refuses every other call that is not gRPC.
+    let server = server.accept_http1(true);
     match (tls, behind) {
         (Some(tls), _) => (
             server
@@ -753,6 +782,7 @@ where
     let map = map_of(map, members.as_ref())?;
     // The API reads the same store, whose handle is shared.
     let api_store = state.as_ref().map(|s| Arc::clone(&s.store));
+    let node_store = api_store.clone();
     let farm = Arc::new(farm.with_state(state)?);
     // One start, one bind budget: the three listeners wait for a late interface together.
     let binder = Binder::new();
@@ -854,6 +884,13 @@ where
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let membership = membership(members.clone(), &peers, None);
+    // The four calls a host's updater makes about its own node.
+    let node_calls = crate::node_self::routes(
+        Arc::clone(&farm),
+        members.clone(),
+        node_store,
+        peers.clone(),
+    );
     let sessions = WorkerService::new(
         Arc::clone(&farm),
         peers,
@@ -922,6 +959,7 @@ where
                 let _ = goaway.await;
             });
         let worker_serve = worker_server
+            .add_routes(node_calls)
             .add_service(worker_service)
             .add_service(worker_blobs)
             .add_service(worker_cas)

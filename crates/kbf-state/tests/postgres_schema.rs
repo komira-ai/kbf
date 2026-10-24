@@ -62,10 +62,11 @@ impl Scratch {
     }
 }
 
-/// Release N+1's migration: only adds a column and a table.
+/// Release N+1's migration, N being the newest this build embeds: only adds a column and a
+/// table.
 fn second() -> Migration {
     Migration::new(
-        2,
+        schema::latest() + 1,
         "note",
         "-- kbf-migration: expand\n\
          ALTER TABLE kv ADD COLUMN note text;\n\
@@ -107,21 +108,28 @@ fn refusal(config: &PostgresConfig) -> String {
 fn a_fresh_database_gets_the_schema_and_a_store_runs_on_it() {
     let s = Scratch::new();
     let config = s.config();
-    let out = schema::apply(&config, &schema::embedded(), schema::latest()).expect("creates");
-    assert_eq!((out.from, out.to, out.ran.clone()), (None, 1, vec![1]));
-    assert_eq!(out.to_string(), "created the schema at version 1");
-    assert_eq!(schema::current(&config), Ok(1));
+    let latest = schema::latest();
+    let versions: Vec<u32> = (1..=latest).collect();
+    let out = schema::apply(&config, &schema::embedded(), latest).expect("creates");
+    assert_eq!((out.from, out.to), (None, latest));
+    assert_eq!(out.ran, versions);
+    let said = format!("created the schema at version {latest}");
+    assert_eq!(out.to_string(), said);
+    assert_eq!(schema::current(&config), Ok(latest));
     let rows = s.query("SELECT version, name, kind FROM schema_version");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get::<_, String>(2), "expand");
-    for table in ["kv", "feed", "counters", "head"] {
+    assert_eq!(rows.len(), versions.len());
+    for row in &rows {
+        assert_eq!(row.get::<_, String>(2), "expand");
+    }
+    for table in ["kv", "feed", "counters", "head", "pack", "blob"] {
         s.query(&format!("SELECT count(*) FROM {table}"));
     }
     let store = PostgresStore::open(&config).expect("a store opens on the new schema");
     put(&store, "k").expect("writes");
     assert!(store.get("k").expect("reads").is_some());
-    let again = schema::apply(&config, &schema::embedded(), schema::latest()).expect("again");
-    assert_eq!((again.from, again.to, again.ran), (Some(1), 1, vec![]));
+    let again = schema::apply(&config, &schema::embedded(), latest).expect("again");
+    assert_eq!((again.from, again.to), (Some(latest), latest));
+    assert!(again.ran.is_empty());
 }
 
 /// Catches kbf creating tables itself: a store opened on a database with no schema must
@@ -144,10 +152,11 @@ fn a_store_does_not_create_the_schema_and_says_what_to_run() {
 // ---- N to N+1 -------------------------------------------------------------------------
 
 /// Catches an update whose migration breaks the child that is still serving. Child N
-/// (supported 1..=1) has open connections and a writer thread running while the installer
-/// applies migration 2 (an `ALTER TABLE ... ADD COLUMN` and a new table); no write may
-/// fail, new connections the pool opens afterwards must work, and a restart of child N on
-/// the migrated schema must start (the revert case). Child N+1 (1..=2) starts too.
+/// (supported 1..=N, N the newest this build embeds) has open connections and a writer
+/// thread running while the installer applies migration N+1 (an `ALTER TABLE ... ADD
+/// COLUMN` and a new table); no write may fail, new connections the pool opens afterwards
+/// must work, and a restart of child N on the migrated schema must start (the revert case).
+/// Child N+1 (1..=N+1) starts too.
 ///
 /// Catches: the expand rule removed from `check_conn` (the restart refuses). A
 /// check on every new connection would not be caught here: with the expand rule it passes
@@ -156,9 +165,10 @@ fn a_store_does_not_create_the_schema_and_says_what_to_run() {
 fn migrating_to_n_plus_1_leaves_the_serving_n_child_working() {
     let s = Scratch::new();
     let installer = s.config();
-    schema::apply(&installer, &schema::embedded(), 1).expect("N is installed");
-    let child_n = PostgresStore::open(&installer.clone().with_supported_schema(1, 1))
-        .expect("child N starts on schema 1");
+    let (n, n1) = (schema::latest(), schema::latest() + 1);
+    schema::apply(&installer, &schema::embedded(), n).expect("N is installed");
+    let child_n = PostgresStore::open(&installer.clone().with_supported_schema(1, n))
+        .expect("child N starts on schema N");
     put(&child_n, "before").expect("writes");
 
     let stop = AtomicBool::new(false);
@@ -173,8 +183,9 @@ fn migrating_to_n_plus_1_leaves_the_serving_n_child_working() {
             }
             (ok, bad)
         });
-        let out = schema::apply(&installer, &two(), 2).expect("N+1 migrates");
-        assert_eq!((out.from, out.to, out.ran), (Some(1), 2, vec![2]));
+        let out = schema::apply(&installer, &two(), n1).expect("N+1 migrates");
+        assert_eq!((out.from, out.to), (Some(n), n1));
+        assert_eq!(out.ran, vec![n1]);
         // Parallel callers make the pool open connections after the migration.
         thread::scope(|inner| {
             for t in 0..4 {
@@ -194,38 +205,41 @@ fn migrating_to_n_plus_1_leaves_the_serving_n_child_working() {
         failed, 0,
         "{failed} writes failed while the schema was migrated"
     );
-    assert_eq!(schema::current(&installer), Ok(2));
+    assert_eq!(schema::current(&installer), Ok(n1));
     assert!(child_n.get("before").expect("reads").is_some());
 
     let restarted = child_n
         .reopen()
-        .expect("child N restarts on schema 2: only expand rows are above it");
+        .expect("child N restarts on schema N+1: only expand rows are above it");
     put(&restarted, "restarted").expect("writes");
-    PostgresStore::open(&installer.with_supported_schema(1, 2)).expect("child N+1 starts");
+    PostgresStore::open(&installer.with_supported_schema(1, n1)).expect("child N+1 starts");
 }
 
 // ---- refusals -------------------------------------------------------------------------
 
-/// Catches a child starting on a schema a later release changed incompatibly. Version 2 is
-/// recorded as a contract step (what a later release would write); child N (1..=1) must
-/// refuse with one line naming both versions, and child N+1 (1..=2) must start.
+/// Catches a child starting on a schema a later release changed incompatibly. Version N+1
+/// (N the newest this build embeds) is recorded as a contract step (what a later release
+/// would write); child N (1..=N) must refuse with one line naming both versions, and child
+/// N+1 (1..=N+1) must start.
 ///
 /// Catches: `TooNew` check removed (the store opened on a schema it cannot run).
 #[test]
 fn a_schema_changed_incompatibly_by_a_newer_release_is_refused() {
     let s = Scratch::new();
     let config = s.config();
-    schema::apply(&config, &schema::embedded(), 1).expect("creates");
-    let row = "INSERT INTO schema_version (version, name, kind) VALUES (2, 'later', 'contract')";
-    s.sql(row).expect("the later release's row");
-    let why = refusal(&config.clone().with_supported_schema(1, 1));
-    assert!(
-        why.contains("version 2") && why.contains("1 to 1") && why.contains("matches the database"),
-        "{why}"
+    let (n, n1) = (schema::latest(), schema::latest() + 1);
+    schema::apply(&config, &schema::embedded(), n).expect("creates");
+    let row = format!(
+        "INSERT INTO schema_version (version, name, kind) VALUES ({n1}, 'later', 'contract')"
     );
+    s.sql(&row).expect("the later release's row");
+    let why = refusal(&config.clone().with_supported_schema(1, n));
+    assert!(why.contains(&format!("version {n1}")), "{why}");
+    assert!(why.contains(&format!("1 to {n}")), "{why}");
+    assert!(why.contains("matches the database"), "{why}");
     assert!(!why.contains('\n'), "one line: {why:?}");
-    PostgresStore::open(&config.with_supported_schema(1, 2))
-        .expect("the release that knows 2 starts");
+    PostgresStore::open(&config.with_supported_schema(1, n1))
+        .expect("the release that knows N+1 starts");
 }
 
 /// Catches a child starting on a schema older than it needs (an update whose migration did
@@ -247,7 +261,7 @@ fn a_schema_older_than_the_binary_needs_is_refused() {
     PostgresStore::open(&config.with_supported_schema(2, 2)).expect("now it starts");
 }
 
-/// Catches a destructive step reaching the database. A set whose version 2 is a contract
+/// Catches a destructive step reaching the database. A set whose last version is a contract
 /// step is refused whole (nothing, not even an earlier pending expand step, is run), while
 /// the expand prefix of the same set applies when `upto` stops before it.
 ///
@@ -257,8 +271,9 @@ fn a_schema_older_than_the_binary_needs_is_refused() {
 fn an_update_never_runs_a_contract_step_and_runs_nothing_when_one_is_pending() {
     let s = Scratch::new();
     let config = s.config();
+    let (n1, n2) = (schema::latest() + 1, schema::latest() + 2);
     let contract = Migration::new(
-        3,
+        n2,
         "drop_expiry",
         "-- kbf-migration: contract\nALTER TABLE kv DROP COLUMN expires_us;",
     )
@@ -266,44 +281,46 @@ fn an_update_never_runs_a_contract_step_and_runs_nothing_when_one_is_pending() {
     let mut set = two();
     set.push(contract);
     assert_eq!(
-        schema::apply(&config, &set, 3).unwrap_err(),
-        SchemaError::ContractPending { version: 3 }
+        schema::apply(&config, &set, n2).unwrap_err(),
+        SchemaError::ContractPending { version: n2 }
     );
     assert_eq!(schema::current(&config), Err(SchemaError::NotInitialised));
     assert!(!s.has_schema(), "a refused update created the schema");
-    schema::apply(&config, &set, 2).expect("the expand prefix applies");
+    schema::apply(&config, &set, n1).expect("the expand prefix applies");
     assert_eq!(
-        schema::apply(&config, &set, 3).unwrap_err(),
-        SchemaError::ContractPending { version: 3 }
+        schema::apply(&config, &set, n2).unwrap_err(),
+        SchemaError::ContractPending { version: n2 }
     );
     s.query("SELECT expires_us FROM kv");
-    assert_eq!(schema::current(&config), Ok(2));
+    assert_eq!(schema::current(&config), Ok(n1));
 }
 
 /// Catches a migration that fails half way leaving half its work: the second statement of
-/// migration 2 fails, and neither its first statement nor a version row may remain.
+/// the migration after the newest embedded one fails, and neither its first statement nor a
+/// version row may remain.
 ///
 /// Catches: the BEGIN left out of `run_in_transaction` (`half` existed).
 #[test]
 fn a_migration_that_fails_is_rolled_back_whole() {
     let s = Scratch::new();
     let config = s.config();
+    let (n, n1) = (schema::latest(), schema::latest() + 1);
     let mut set = schema::embedded();
     set.push(
         Migration::new(
-            2,
+            n1,
             "broken",
             "-- kbf-migration: expand\nCREATE TABLE half (a int);\nALTER TABLE nosuch ADD COLUMN b int;",
         )
         .expect("lints"),
     );
-    let SchemaError::Failed { version, name, why } = schema::apply(&config, &set, 2).unwrap_err()
+    let SchemaError::Failed { version, name, why } = schema::apply(&config, &set, n1).unwrap_err()
     else {
         panic!("a failed migration")
     };
-    assert_eq!((version, name.as_str()), (2, "broken"));
+    assert_eq!((version, name.as_str()), (n1, "broken"));
     assert!(why.contains("nosuch"), "{why}");
-    assert_eq!(schema::current(&config), Ok(1));
+    assert_eq!(schema::current(&config), Ok(n));
     assert!(
         s.query("SELECT to_regclass('half')::text")[0]
             .get::<_, Option<String>>(0)
@@ -317,19 +334,20 @@ fn a_migration_that_fails_is_rolled_back_whole() {
 fn an_installer_older_than_the_schema_refuses_and_a_release_it_cannot_serve_is_refused() {
     let s = Scratch::new();
     let config = s.config();
-    schema::apply(&config, &two(), 2).expect("version 2");
+    let (n, n1) = (schema::latest(), schema::latest() + 1);
+    schema::apply(&config, &two(), n1).expect("version N+1");
     assert_eq!(
-        schema::apply(&config, &schema::embedded(), 1).unwrap_err(),
+        schema::apply(&config, &schema::embedded(), n).unwrap_err(),
         SchemaError::DatabaseAhead {
-            found: 2,
-            newest: 1
+            found: n1,
+            newest: n
         }
     );
     assert_eq!(
-        schema::apply(&config, &two(), 3).unwrap_err(),
+        schema::apply(&config, &two(), n1 + 1).unwrap_err(),
         SchemaError::NotShipped {
-            wanted: 3,
-            newest: 2
+            wanted: n1 + 1,
+            newest: n1
         }
     );
 }
@@ -339,11 +357,12 @@ fn an_installer_older_than_the_schema_refuses_and_a_release_it_cannot_serve_is_r
 fn numbering_gaps_are_refused_in_the_set_and_in_the_database() {
     let s = Scratch::new();
     let config = s.config();
+    let n1 = schema::latest() + 1;
     assert_eq!(
-        schema::apply(&config, &[second()], 2).unwrap_err(),
+        schema::apply(&config, &[second()], n1).unwrap_err(),
         SchemaError::Numbering {
             expected: 1,
-            found: 2
+            found: n1
         }
     );
     schema::apply(&config, &schema::embedded(), 1).expect("creates");
@@ -488,35 +507,36 @@ fn a_migration_waits_for_the_schema_lock_for_as_long_as_it_is_told() {
 }
 
 /// Catches the wait covering the schema lock only: the old child holds a long read on `kv`
-/// (the table migration 2 alters), so the `ALTER` would queue for an exclusive lock and
-/// stall every query behind it. It must give up as `Busy`, roll back, and leave the schema
-/// at version 1 with the old child's read undisturbed.
+/// (the table migration N+1 alters, N the newest this build embeds), so the `ALTER` would
+/// queue for an exclusive lock and stall every query behind it. It must give up as `Busy`,
+/// roll back, and leave the schema at version N with the old child's read undisturbed.
 ///
 /// Catches: the lock timeout reset (`SET LOCAL lock_timeout = 0`) right after the
 /// schema lock, so only the advisory wait was bounded: the `ALTER` waited past the 5 s.
 #[test]
 fn a_migration_gives_up_when_a_table_it_alters_is_in_use() {
     let s = Scratch::new();
-    schema::apply(&s.config(), &schema::embedded(), 1).expect("version 1");
+    let (n, n1) = (schema::latest(), schema::latest() + 1);
+    schema::apply(&s.config(), &schema::embedded(), n).expect("version N");
     let mut reader = Client::connect(&s.url(), NoTls).expect("connects");
     let read = format!("BEGIN; SET LOCAL search_path TO {SCHEMA}; SELECT count(*) FROM kv");
     reader.batch_execute(&read).expect("a read in progress");
     let mut set = schema::embedded();
     set.push(
         Migration::new(
-            2,
+            n1,
             "half",
             "-- kbf-migration: expand\nCREATE TABLE half (a int);\nALTER TABLE kv ADD COLUMN note text;",
         )
         .expect("lints"),
     );
-    let rx = apply_in_thread(s.config(), set, 2, Duration::from_millis(300));
+    let rx = apply_in_thread(s.config(), set, n1, Duration::from_millis(300));
     let got = rx.recv_timeout(Duration::from_secs(5));
     let still_reading = reader.query("SELECT count(*) FROM kv", &[]).is_ok();
     reader.batch_execute("ROLLBACK").expect("read ends");
     assert_eq!(got.expect("it gives up").unwrap_err(), SchemaError::Busy);
     assert!(still_reading);
-    assert_eq!(schema::current(&s.config()), Ok(1));
+    assert_eq!(schema::current(&s.config()), Ok(n));
     assert_eq!(
         s.query("SELECT count(*) FROM information_schema.tables WHERE table_name = 'half' AND table_schema = current_schema()")[0]
             .get::<_, i64>(0),

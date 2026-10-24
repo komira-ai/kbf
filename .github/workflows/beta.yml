@@ -100,6 +100,28 @@ jobs:
         run: mkdir -p "$RUNNER_TEMP/bin"
       - name: The farm's kbf, out of the tarball
         run: tar -xzf "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" -C "$RUNNER_TEMP/bin" kbf
+      - name: Load the frontend image, the release asset
+        run: docker image load --input "dist/kbf-frontend-image-$GITHUB_SHA-linux-x86_64.oci.tar"
+      - name: The image's kbf runs in the image
+        run: docker run --rm --entrypoint /usr/bin/kbf "kbf-frontend:$GITHUB_SHA" --version
+      - name: A container of the image, to take its kbf out of
+        run: docker create --name kbf-frontend "kbf-frontend:$GITHUB_SHA"
+      - name: The directory for the image's kbf
+        run: mkdir -p "$RUNNER_TEMP/image-bin"
+      - name: The image's kbf, out of the container
+        run: docker cp kbf-frontend:/usr/bin/kbf "$RUNNER_TEMP/image-bin/kbf"
+      - name: The image's kbf names this commit and a release build
+        run: cargo xtask build-commit check --json "$RUNNER_TEMP/image-bin/kbf" "$GITHUB_SHA"
+      - name: Load the coordinator image, the release asset
+        run: docker image load --input "dist/kbf-coordinator-image-$GITHUB_SHA-linux-x86_64.oci.tar"
+      - name: The image's kbf-coordinator runs in the image
+        run: docker run --rm "kbf-coordinator:$GITHUB_SHA" --version
+      - name: A container of the coordinator image, to take its kbf-coordinator out of
+        run: docker create --name kbf-coordinator "kbf-coordinator:$GITHUB_SHA"
+      - name: The image's kbf-coordinator, out of the container
+        run: docker cp kbf-coordinator:/usr/bin/kbf-coordinator "$RUNNER_TEMP/image-bin/kbf-coordinator"
+      - name: The image's kbf-coordinator names this commit
+        run: cargo xtask build-commit check "$RUNNER_TEMP/image-bin/kbf-coordinator" "$GITHUB_SHA"
       - name: The program the sample project's actions run, built here
         run: cp target/debug/kbf-m2-act "$RUNNER_TEMP/bin/kbf-m2-act"
       - name: Fetch buck2 (pinned version, checked by SHA-256)
@@ -313,9 +335,6 @@ jobs:
       # farm's restart tests run on a schema of their own (`over_postgres` in tests/state_store.rs).
       - run: cargo test -p kbf-server --locked --test state_store_postgres -- --include-ignored
       - run: cargo test -p kbf-server --locked --test state_store -- --include-ignored over_postgres
-      # Two frontend children on one Postgres schema hand over 50 builds
-      # (tests/frontend/managed/two_children.rs; its in-memory twin runs in every test run).
-      - run: cargo test -p kbf-server --locked --test frontend -- --include-ignored two_children::fifty_builds_across_a_takeover_over_postgres
       # A frontend process started with a Postgres --state-store reaches /readyz.
       - run: cargo test -p kbf-cli --locked --test frontend_process -- --include-ignored postgres_state_store
       # The cutover tool copies a SQLite state file into an empty database made for each test

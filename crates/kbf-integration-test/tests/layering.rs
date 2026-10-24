@@ -52,7 +52,13 @@
 //!   `SETUP_MAY_NAME_THE_PROXY` naming `kbf_proxy`;
 //! - the `kbf` binary (`kbf-cli`) linking the proxy: `kbf setup` is built on the setup library
 //!   without its `proxy` feature (`kbf-installer` turns it on), so the tree of
-//!   `cargo build -p kbf-cli` holds `kbf-setup` and no `kbf-proxy`.
+//!   `cargo build -p kbf-cli` holds `kbf-setup` and no `kbf-proxy`;
+//! - the hot/cold object store library (`tierstore`) depending, directly or through another
+//!   crate, on any other crate of this workspace, which would stop it from moving to a
+//!   repository of its own (its `s3` feature, off unless a crate turns it on, adds the S3
+//!   client of `kbf-objstore`; a crate that turns it on is a change to make here on
+//!   purpose); and a walk that cannot see its dependencies, which would make that check pass
+//!   vacuously.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -277,7 +283,7 @@ fn pure_modules_deny_the_clippy_lists() {
 
 /// The crates allowed to depend on both the server and the node library: the combined
 /// binary and the one `kbf` binary.
-const JOINERS: &[&str] = &["kbf-all-in-one", "kbf-cli"];
+const JOINERS: &[&str] = &["kbf-storage-and-daemon", "kbf-cli"];
 
 /// What the server library's normal dependencies must not reach: the daemon side. The
 /// server stores and schedules; it never moves blobs as a client.
@@ -382,6 +388,79 @@ fn storage_reaches_no_frontend_crate() {
     );
 }
 
+/// The crates that make or hold certificate authority: the farm CA (`kbf-ca`: the signer
+/// and the issuing of every certificate) and the frontend (`kbf-server`, which holds the CA
+/// and runs the enroll listener).
+const CA_SIDE: &[&str] = &["kbf-ca", "kbf-server"];
+
+/// The update coordinator and a host's updater take their certificates from the farm CA
+/// and never hold it: the coordinator's certificate is made for it, and an updater makes its
+/// key on the host and has a certificate signed for it (`docs/design/updates.md`, section
+/// 5). Neither crate's normal dependencies may reach the CA or the frontend.
+#[test]
+fn the_coordinator_and_the_updater_hold_no_ca_code() {
+    let g = load_graph();
+    for member in ["kbf-coordinator", "kbf-updater", "kbf-enroll"] {
+        let (_, root) = g.members.get(member).expect("a workspace member");
+        assert!(root.is_some(), "{member} must have a library target");
+        let violations = reaches(&g, member, CA_SIDE);
+        assert!(
+            violations.is_empty(),
+            "{member} reaches the CA side:\n{}",
+            violations.join("\n")
+        );
+    }
+    assert!(
+        !reaches(&g, "kbf-server", &["kbf-ca"]).is_empty(),
+        "the frontend's closure must reach kbf-ca, or this walk proves nothing"
+    );
+}
+
+/// A host's updater has no tie to the front-door proxy (`kbf-proxy`, which is being retired):
+/// the frontend serves the updater's calls itself (`kbf_server::node_self`), and the roll no
+/// longer drains a pool. The crate's normal closure holds no `kbf-proxy`, its manifest names
+/// none (the dev-dependencies the closure walk does not see), and no source or test file of it
+/// names the crate or its identity headers.
+#[test]
+fn the_updater_has_no_tie_to_the_proxy() {
+    let g = load_graph();
+    let (_, root) = g.members.get("kbf-updater").expect("a workspace member");
+    assert!(root.is_some(), "kbf-updater must have a library target");
+    let violations = reaches(&g, "kbf-updater", &["kbf-proxy"]);
+    assert!(
+        violations.is_empty(),
+        "kbf-updater reaches the proxy:\n{}",
+        violations.join("\n")
+    );
+    // The walk proves something: a crate that does link the proxy is seen to reach it.
+    assert!(
+        !reaches(&g, "kbf-installer", &["kbf-proxy"]).is_empty(),
+        "the installer's closure must reach kbf-proxy, or this walk proves nothing"
+    );
+
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kbf-updater");
+    let manifest = std::fs::read_to_string(base.join("Cargo.toml")).expect("the manifest");
+    assert!(
+        !manifest.contains("kbf-proxy") && !manifest.contains("kbf_proxy"),
+        "kbf-updater's Cargo.toml names the proxy"
+    );
+    let mut files = Vec::new();
+    rust_files(&base, &base.join("src"), &mut files);
+    rust_files(&base, &base.join("tests"), &mut files);
+    assert!(
+        files.iter().any(|f| f == "src/agent/build.rs") && files.iter().any(|f| f == "src/lib.rs"),
+        "kbf-updater's files were not found under {}",
+        base.display()
+    );
+    for file in &files {
+        let text =
+            std::fs::read_to_string(base.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        for word in ["kbf-proxy", "kbf_proxy"] {
+            assert!(!text.contains(word), "{file} names {word}");
+        }
+    }
+}
+
 /// The daemon crates: the daemon's code, which the `kbf-daemon` binary is and which
 /// `kbf daemon` runs inside the `kbf` binary, with the drivers, which `kbf-node` names
 /// and so are in its closure.
@@ -453,15 +532,46 @@ fn route_reaches_neither_the_frontend_nor_the_daemon() {
     );
 }
 
+/// Asserts that the normal dependencies of the object store library (`tierstore`), direct
+/// and through other crates, include no other crate of this workspace, and that the walk
+/// sees its dependencies (it reaches `tokio`), so the check does not pass on an empty walk.
+/// The graph has the features of the whole workspace: `tierstore`'s `s3` feature, which adds
+/// `kbf-objstore`, is off in it, and a crate that turned it on would fail this test.
+#[test]
+fn tierstore_reaches_no_other_workspace_crate() {
+    let g = load_graph();
+    let (_, root) = g
+        .members
+        .get("tierstore")
+        .expect("tierstore is a workspace member");
+    assert!(root.is_some(), "tierstore must have a library target");
+    assert!(
+        !reaches(&g, "tierstore", &["tokio"]).is_empty(),
+        "tierstore's closure must reach tokio, or this walk proves nothing"
+    );
+    let others: Vec<&str> = g
+        .members
+        .keys()
+        .map(String::as_str)
+        .filter(|name| *name != "tierstore")
+        .collect();
+    let violations = reaches(&g, "tierstore", &others);
+    assert!(
+        violations.is_empty(),
+        "tierstore reaches another crate of this workspace:\n{}",
+        violations.join("\n")
+    );
+}
+
 /// What the front-door proxy library's normal dependencies must not reach
 /// (docs/design/kbf-proxy-api.md, sections 1 and 11). The proxy routes bytes: it never
 /// decodes a child's protocol (`kbf-proto`), runs none of the frontend, storage or node code
 /// (`kbf-server`, `kbf-front`, `kbf-storage`, `kbf-node`, `kbf-daemon`, the binaries
-/// `kbf-cli` and `kbf-all-in-one`), and does not know the installer, its host plan or its
+/// `kbf-cli` and `kbf-storage-and-daemon`), and does not know the installer, its host plan or its
 /// update types (`kbf-installer`, `kbf-setup`, `kbf-host`, `kbf-update`, `kbf-deploy`): the
-/// admin calls to a child are the installer's, through a trait that lives there (the proxy's
-/// one is the read-only `GET role`, for the child's term, over plain HTTP), and the installer
-/// and the setup library depend on the proxy, not the other way round.
+/// admin calls to a child are the installer's, through a trait that lives there (the proxy
+/// makes none), and the installer and the setup library depend on the proxy, not the other way
+/// round.
 const PROXY_MUST_NOT_REACH: &[&str] = &[
     "kbf-installer",
     "kbf-setup",
@@ -474,7 +584,7 @@ const PROXY_MUST_NOT_REACH: &[&str] = &[
     "kbf-node",
     "kbf-daemon",
     "kbf-cli",
-    "kbf-all-in-one",
+    "kbf-storage-and-daemon",
     "kbf-proto",
 ];
 
@@ -507,36 +617,19 @@ fn the_proxy_reaches_no_child_installer_or_runtime_crate() {
     );
 }
 
-/// The files of `kbf-installer/src` that may name the proxy: the verb that hosts it, the
-/// swap's real gate over the proxy's handle (`proxy/gate_real.rs`, with its tests), and the
-/// supervisor that starts the children on the ports of the proxy's upstream table
-/// (`proxy/supervisor.rs`, which also holds the real gate), the verb's own tests
-/// (`proxy_verb_tests.rs`, which start a real proxy over a migrated database and compare the
-/// deploy's copy of the proxy's port layout in `observe.rs` with the proxy's), and the verb's
-/// pool mode (`proxy_pool.rs`, which binds and runs the proxy over frontends that run on
-/// their own, with no supervisor). The rest of `proxy/` is written against traits and names
-/// no proxy type. Everything else, the root helper
-/// (`helper/`, `run.rs`) first of all, runs as root and links a network stack it never runs
-/// if it names a proxy type. The settings file whose `[proxy]` table the verb reads and the
-/// table `setup --proxy` writes are in `kbf-setup` (`SETUP_MAY_NAME_THE_PROXY`).
-const MAY_NAME_THE_PROXY: &[&str] = &[
-    "proxy/gate_real.rs",
-    "proxy/gate_real_tests.rs",
-    "proxy/supervisor.rs",
-    "proxy/supervisor_tests.rs",
-    "proxy_pool.rs",
-    "proxy_verb.rs",
-    "proxy_verb_tests.rs",
-    "proxy_verb_copies_tests.rs",
-];
+/// The files of `kbf-installer/src` that may name the proxy: the verb that hosts it and the
+/// verb's pool mode (`proxy_pool.rs`, which binds and runs the proxy over frontends that run on
+/// their own). Everything else, the root helper (`helper/`, `run.rs`) first of all, runs as root
+/// and links a network stack it never runs if it names a proxy type. The settings file whose
+/// `[proxy]` table the verb reads is in `kbf-setup` (`SETUP_MAY_NAME_THE_PROXY`).
+const MAY_NAME_THE_PROXY: &[&str] = &["proxy_pool.rs", "proxy_verb.rs"];
 
 /// The files of `kbf-setup/src` that may name the proxy: the settings file whose `[proxy]`
-/// table the proxy verb reads (`installer_toml.rs`) and the table `setup --proxy` writes
-/// (`setup/proxy.rs`, which builds the table the proxy would read, with the proxy's own
-/// defaults and checks). `setup` runs as root; the rest of the library names no proxy type.
-/// Both are behind the library's `proxy` feature, which `kbf setup` (the `kbf` binary) does
-/// not turn on.
-const SETUP_MAY_NAME_THE_PROXY: &[&str] = &["installer_toml.rs", "setup/proxy.rs"];
+/// table the proxy verb reads and `setup` keeps as it is (`installer_toml.rs`). `setup` runs as
+/// root; the rest of the library names no proxy type, the proxy's flags (`setup/proxy.rs`, taken
+/// only to be refused) included. The table is behind the library's `proxy` feature, which `kbf
+/// setup` (the `kbf` binary) does not turn on.
+const SETUP_MAY_NAME_THE_PROXY: &[&str] = &["installer_toml.rs"];
 
 /// The files that may name the verb's module (`proxy_verb`): the dispatch and its tests, and the
 /// verb's pool mode (`proxy_pool.rs`, which shares the verb's stop flag and signal handling). A
@@ -626,7 +719,7 @@ fn the_root_half_of_the_installer_names_nothing_of_the_proxy() {
 /// Asserts that, of the files of `kbf-setup/src`, only those in `SETUP_MAY_NAME_THE_PROXY` name
 /// `kbf_proxy`, that each of those still does, and that the scan found the library's files.
 #[test]
-fn the_setup_library_names_the_proxy_only_where_it_writes_the_table() {
+fn the_setup_library_names_the_proxy_only_where_it_keeps_the_table() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kbf-setup/src");
     let mut files = Vec::new();
     rust_files(&src, &src, &mut files);

@@ -10,7 +10,7 @@ use kbf_enroll_registry::{
     Enrolled, ISSUED_AT_WINDOW, IssuedRole, MAX_EXPIRED_AGE, MIN_INTERVAL, NodeState, REPLAY_TTL,
     RenewCsr, RenewRequest, deny_rows, list_nodes, renew_txn, revoke_node,
 };
-use kbf_state::{Cond, Fenced, Store, Txn};
+use kbf_state::{Cond, Store, Txn};
 use kbf_types::{RefusalReason, Role};
 
 use RefusalReason as R;
@@ -438,16 +438,17 @@ fn a_revoke_racing_a_renewal_wins() {
     );
 }
 
-// Catches trouble answered as anything but "try again" or "not the signer".
+/// Asserts that a renew over a store that refuses writes as a superseded handle's answers
+/// `NotSigner`, and over a store whose reads fail, whose writes fail or whose writes keep
+/// conflicting answers `StoreUnavailable`, with the node row unchanged.
 #[test]
 fn trouble_in_the_store_is_unavailable_and_a_fenced_handle_is_not_the_signer() {
     let env = fake();
-    let stale = Fenced::take(env.store.clone(), None).expect("take");
-    let _fresh = Fenced::take(env.store.clone(), Some(1)).expect("take");
     enrolled(&env, "n1", 1, &[Daemon]);
     env.advance(DAY);
     let now = env.now();
     let mut sign = || Ok(renewed(&[Daemon], 1, 2, now));
+    let stale = Wrap::new(env.store.clone(), Mode::Fenced);
     assert_eq!(
         renew_with(&stale, &env, "n1", 1, &[Daemon], now, "a", &mut sign),
         Err(R::NotSigner)

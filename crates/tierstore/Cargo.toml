@@ -1,0 +1,46 @@
+[package]
+name = "tierstore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# `S3Backend`, a `Backend` over the S3 client of `kbf-objstore`. Off by default: without it the
+# crate's own dependencies include no kbf crate (crates/kbf-integration-test/tests/layering.rs
+# checks the normal dependencies without it; the tests always build `kbf-objstore`, see
+# `[dev-dependencies]`). CI runs the tests and clippy with it on (.github/workflows/ci.yml).
+s3 = ["dep:kbf-objstore"]
+
+# A generic hot/cold object store over S3-compatible backends. It knows nothing of kbf and its
+# normal dependencies include no kbf crate unless the `s3` feature is on, so it can move to a
+# repository of its own (crates/kbf-integration-test/tests/layering.rs keeps it that way).
+[dependencies]
+# The backend trait is used as `dyn Backend`, so its async methods are boxed.
+async-trait.workspace = true
+bytes.workspace = true
+# The reconciler's bounded number of parallel copies.
+futures.workspace = true
+# The content tag of the in-memory backend: the hex of the body's SHA-256.
+hex.workspace = true
+# `s3` only: the S3 client that `S3Backend` adapts.
+kbf-objstore = { workspace = true, optional = true }
+# The journal objects, the checkpoints and the usage object are JSON.
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+# `rt` to journal a copy-back in the background, `sync` for the batches of the journal, `time`
+# for the linger, the back-pressure and the injected delays.
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+# The loopback S3 service of the tests of `S3Backend`. A dev-dependency is built for every test
+# build, with the `s3` feature or without it, though only the `s3` tests use it.
+kbf-objstore = { workspace = true, features = ["testkit"] }
+tokio = { workspace = true, features = ["macros", "test-util"] }
+
+[lints]
+workspace = true

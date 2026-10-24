@@ -583,4 +583,74 @@ mod tests {
             .expect("held, not in the index");
         assert_eq!(cache.writer.born.dated(), 0);
     }
+
+    fn blob(text: &'static str) -> VerifiedBlob {
+        VerifiedBlob::hashed(Bytes::from_static(text.as_bytes()))
+    }
+
+    /// Asserts that `hold` takes no entry for the empty blob or for a blob already held,
+    /// refuses a blob the budget cannot give without holding it, and holds a blob the
+    /// budget can give: of two blobs of 5 bytes under a budget of 8, only the first is
+    /// held.
+    #[tokio::test]
+    async fn hold_answers_held_duplicate_and_budget() {
+        let cache = Cache::memory().with_ram_ack_bytes(8);
+        let first = blob("12345");
+        let second = blob("abcde");
+        assert_eq!(cache.hold(&blob("")), Hold::Duplicate);
+        assert_eq!(cache.hold(&first), Hold::Held);
+        assert_eq!(cache.hold(&first), Hold::Duplicate);
+        assert_eq!(cache.hold(&second), Hold::Budget);
+        assert_eq!(cache.unwritten().blobs, 1);
+    }
+
+    /// Asserts that inserting a digest that is held already takes no second entry: the
+    /// first insert is `Held`, the second `Duplicate`, and the set has one blob.
+    #[tokio::test]
+    async fn inserting_a_held_digest_again_is_a_duplicate() {
+        let cache = Cache::memory();
+        let once = blob("inserted twice");
+        assert_eq!(cache.insert_held(&once, None), Hold::Held);
+        assert_eq!(cache.insert_held(&once, None), Hold::Duplicate);
+        assert_eq!(cache.unwritten().blobs, 1);
+    }
+
+    /// Asserts that the producer's `hold_write` holds a blob that is neither held nor in
+    /// the index, and answers `Duplicate` for one already held and for one the index has
+    /// (a late duplicate of a blob already on disk is not queued to be written again).
+    #[tokio::test]
+    async fn hold_write_holds_only_what_is_neither_held_nor_indexed() {
+        let cache = Cache::memory().with_ram_ack_bytes(1024);
+        let fresh = blob("held by the producer");
+        let indexed = blob("indexed already");
+        cache
+            .store_blobs(vec![indexed.clone()])
+            .await
+            .expect("stored");
+        let first = cache.hold_write(&fresh).await.expect("asked");
+        let again = cache.hold_write(&fresh).await.expect("asked");
+        let late = cache.hold_write(&indexed).await.expect("asked");
+        assert_eq!(first, Hold::Held);
+        assert_eq!(again, Hold::Duplicate);
+        assert_eq!(late, Hold::Duplicate);
+        assert_eq!(cache.unwritten().blobs, 1);
+    }
+
+    /// Asserts that dating a drained blob by its acknowledgement dates the object the
+    /// index holds it in: a blob that is held and in the index leaves one dated object.
+    #[tokio::test]
+    async fn dating_by_acknowledgement_dates_the_object_that_holds_the_blob() {
+        let cache = Cache::memory().with_ram_ack_bytes(1024);
+        let written = blob("held, and written by the drain");
+        cache
+            .store_blobs(vec![written.clone()])
+            .await
+            .expect("stored");
+        assert_eq!(cache.hold(&written), Hold::Held);
+        cache
+            .date_by_acknowledgement(&written.digest())
+            .await
+            .expect("held, in the index");
+        assert_eq!(cache.writer.born.dated(), 1);
+    }
 }

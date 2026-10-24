@@ -3,7 +3,7 @@
 //! (`docs/design/kbf-ui-v1.md`: open, read-only, on by default, and opening nothing else).
 //!
 //! The server is the production one (`bind_server_with_ui`, its operator API, REAPI and
-//! worker listeners on the ports of slot A, and `Behind` the proxy's secret file, so a
+//! worker listeners on the ports of the proxy's member, and `Behind` the proxy's secret file, so a
 //! request's client address is believed only when the proxy forwarded it). The proxy runs
 //! `buck2_auth = "bearer"` so that REAPI has a credential to refuse. The browser is a bare
 //! TLS client with no certificate; the operator and the Buck2 client use their bearer
@@ -42,7 +42,6 @@ use kbf_proto::reapi::BatchUpdateBlobsRequest;
 use kbf_proto::reapi::batch_update_blobs_request::Request as BlobRequest;
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
 use kbf_proxy::control::NoUpdates;
-use kbf_proxy::slot::Slot;
 use kbf_proxy::{Proxy, ProxyHandle};
 use kbf_server::proxy_auth::ProxySecret;
 use kbf_server::{Api, Behind, Listeners, bind_server_with_ui};
@@ -104,7 +103,7 @@ impl Rig {
             "operator_token_file = {:?}\nserver_cert_file = {:?}\nserver_key_file = {:?}\n\
              client_ca_file = {:?}\nproxy_auth_file = {secret_file:?}\n\
              buck2_auth = \"bearer\"\nbuck2_token_file = {:?}\n\
-             [upstream]\nbase_port = {base}\n",
+             [[frontend]]\nname = \"a\"\nbase_port = {base}\n",
             dir.path().join("operator.token"),
             pki.server_cert,
             pki.server_key,
@@ -119,8 +118,6 @@ impl Rig {
             let (handle, runner) =
                 Proxy::bind(config, OwnedFd::from(socket)).expect("bind the proxy");
             std::thread::spawn(move || runner.run(NoUpdates));
-            handle.slots().adopt(Slot::A, None);
-            handle.slots().release_into(Slot::A).expect("A is open");
             handle
         })
         .await

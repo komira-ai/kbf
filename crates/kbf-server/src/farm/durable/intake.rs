@@ -40,7 +40,9 @@
 //! - **Orphans.** A lease whose node has no session anywhere is requeued after
 //!   [`ORPHAN_WAIT`] (the `sweep` module).
 //!
-//! A frontend that is fenced for a handover, or whose store cannot be read, does nothing.
+//! A frontend that is fenced by a retire or a drain's close, or whose store cannot be read, does
+//! nothing. One whose intake is closed by a drain ([`Farm::close_intake`]) takes in no operation
+//! of the others' queue and does the rest.
 
 use std::collections::BTreeSet;
 
@@ -214,7 +216,7 @@ impl Farm {
     /// state store queued, forgets what they took, answers the callers of what they
     /// finished, applies the cordons and floors they set, and requeues the leases of nodes
     /// no frontend hears. Cheap when nothing changed. A farm with no state store, and one a
-    /// handover fenced, do nothing; so does one whose store cannot be read.
+    /// retire fenced, do nothing; so does one whose store cannot be read.
     ///
     /// Placement follows at the next tick.
     pub fn intake(&self) {
@@ -301,9 +303,12 @@ impl State {
         for operation in held {
             self.reconcile(operation, queued.get(&operation).copied());
         }
-        for (&operation, &version) in queued {
-            if !self.known_operation(operation) {
-                self.take_in(operation, version);
+        // A farm whose intake is closed ([`Farm::close_intake`]) takes in nothing new.
+        if !self.closed {
+            for (&operation, &version) in queued {
+                if !self.known_operation(operation) {
+                    self.take_in(operation, version);
+                }
             }
         }
         self.intake
@@ -317,7 +322,8 @@ impl State {
     /// No row: another frontend took it, and it leaves the scheduler; unless the scheduler
     /// gave a lease of it up and the store has not taken the requeue yet, when the row is
     /// still to come. A row that is not the one read before: the operation was granted and
-    /// queued again, and is taken in again with the rows of now.
+    /// queued again, and is taken in again with the rows of now, unless the intake is closed:
+    /// then it is only handed off.
     fn reconcile(&mut self, operation: OperationId, row: Option<Version>) {
         let Some(version) = row else {
             if !self.requeue_pending(operation) {
@@ -328,7 +334,9 @@ impl State {
         let before = self.intake.queue_seen.insert(operation, version);
         if before.is_some_and(|before| before != version) {
             self.hand_off(operation);
-            self.take_in(operation, version);
+            if !self.closed {
+                self.take_in(operation, version);
+            }
         }
     }
 

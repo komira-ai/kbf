@@ -1,9 +1,9 @@
 //! `GET /v1/leases` and `GET /v1/queue` on the operator API listener: what the scheduler
 //! holds and what waits for it (`docs/design/kbf-ui-v1.md` appendix A, N3 and N4).
 //!
-//! Both are reads of memory-only state: after a restart or a handover they are empty
-//! until the daemons reconnect. Like `GET /v1/nodes` they answer anyone who reaches the
-//! listener, and nothing is redacted.
+//! Both are reads of memory-only state: after a restart they are empty until the daemons
+//! reconnect, and a frontend lists only what its own scheduler holds. Like `GET /v1/nodes`
+//! they answer anyone who reaches the listener, and nothing is redacted.
 //!
 //! - **`GET /v1/leases`**: `{"term", "items", "next_page"}`. `term` is the scheduler's
 //!   leader term as a string (it is a 64-bit number a JSON reader would round), shared

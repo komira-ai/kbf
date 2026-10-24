@@ -3,12 +3,17 @@
 //! state and the userspace restart.
 //!
 //! - **The intent record** is a root-only file in the helper's state directory that
-//!   names the one lease whose user the session switch logs in: `<term>.<seq>` and a
-//!   newline. `session-login` writes it before it changes anything else, and
-//!   `session-idle` removes it after auto-login is cleared, so whenever auto-login names
-//!   a lease user, the record names that lease. The boot reset reads it, and so does
+//!   names who the session switch logs in: the one lease whose user it logs in,
+//!   `<term>.<seq>` and a newline, or `vm` and a newline for the standing VM user (the
+//!   Mac's resting state when a VM user is configured). `session-login` writes it
+//!   before it changes anything else, and `session-idle` removes it after auto-login is
+//!   cleared (or, with a VM user configured, rewrites it to `vm`), so whenever
+//!   auto-login names a lease user, the record names that lease. The boot reset reads it, and so does
 //!   `kbf-mac-provision check`, which fails a lease user's auto-login that no record
 //!   names.
+//! - **The VM user's password** is made once by `kbf-mac-provision` and kept in a
+//!   root-only file in this state directory ([`read_vm_password`]); this crate reads
+//!   it and never changes it.
 //! - **`/etc/kcpassword`** holds the password the login window logs in with,
 //!   obfuscated by the fixed XOR key macOS uses ([`kcpassword`]); it is not secret,
 //!   which is acceptable only for a random password of a lease user that is deleted
@@ -50,6 +55,10 @@ pub struct SessionPaths {
     pub intent: PathBuf,
     /// `/etc/kcpassword`.
     pub kcpassword: PathBuf,
+    /// The VM user's password, as `kbf-mac-provision` wrote it (see [`read_vm_password`]).
+    pub vm_password: PathBuf,
+    /// The uid that must own `vm_password`: 0 on a Mac, the test's own uid in tests.
+    pub vm_password_owner: u32,
     /// The login window's preferences domain, as `defaults` takes it
     /// (`/Library/Preferences/com.apple.loginwindow`).
     pub loginwindow: String,
@@ -62,6 +71,8 @@ impl SessionPaths {
         Self {
             intent: dir.join("session-intent"),
             kcpassword: dir.join("kcpassword"),
+            vm_password: dir.join("vm-user-password"),
+            vm_password_owner: rustix::process::getuid().as_raw(),
             loginwindow: dir.join("loginwindow").display().to_string(),
         }
     }
@@ -115,11 +126,114 @@ pub fn kcpassword(password: &[u8]) -> Vec<u8> {
     bytes
 }
 
-/// The lease the intent record names; `None` when there is none.
+/// The file name of the VM user's password in the state directory. Coupling: this is
+/// `kbf-mac-provision`'s `PASSWORD_FILE` (`/var/db/kbf-mac-session/vm-user-password`),
+/// which writes it once; the two must agree on the name and on [`read_vm_password`]'s
+/// validity rule (64 lowercase hex digits, no newline, a regular file, root's, mode 0400).
+pub const VM_PASSWORD_FILE: &str = "vm-user-password";
+
+/// The VM user's password, read from `paths.vm_password` as provisioning wrote it. It is
+/// never made or changed here: a password reset would strand the account's login
+/// keychain.
 ///
 /// # Errors
-/// The record cannot be read (or is a link), or does not hold one lease id.
-pub fn read_intent(path: &Path) -> Result<Option<LeaseId>, String> {
+/// The file is missing, a link, not a regular file, not owned by `vm_password_owner`,
+/// not mode 0400, or does not hold exactly 64 lowercase hex digits. The message names
+/// the path and says to run `kbf-mac-provision apply`.
+pub fn read_vm_password(paths: &SessionPaths) -> Result<String, String> {
+    let path = &paths.vm_password;
+    let bad = |why: String| {
+        format!(
+            "the VM user's password file {} {why}; run kbf-mac-provision apply",
+            path.display()
+        )
+    };
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let opened = match rustix::fs::openat(CWD, path, flags, Mode::empty()) {
+        Err(rustix::io::Errno::NOENT) => return Err(bad("is missing".to_owned())),
+        Err(why) => return Err(bad(format!("cannot be opened ({why})"))),
+        Ok(opened) => opened,
+    };
+    let stat = rustix::fs::fstat(&opened).map_err(|why| bad(format!("cannot be read ({why})")))?;
+    if stat.st_mode & 0o170_000 != 0o100_000 {
+        return Err(bad("is not a regular file".to_owned()));
+    }
+    if stat.st_uid != paths.vm_password_owner {
+        return Err(bad(format!("is owned by uid {}", stat.st_uid)));
+    }
+    if stat.st_mode & 0o7777 != 0o400 {
+        return Err(bad(format!(
+            "has mode {:o}, not 400",
+            stat.st_mode & 0o7777
+        )));
+    }
+    let mut text = String::new();
+    std::fs::File::from(opened)
+        .take(VM_PASSWORD_LEN as u64 + 1)
+        .read_to_string(&mut text)
+        .map_err(|why| bad(format!("cannot be read ({why})")))?;
+    if text.len() == VM_PASSWORD_LEN && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        Ok(text)
+    } else {
+        Err(bad("is not 64 lowercase hex digits".to_owned()))
+    }
+}
+
+const VM_PASSWORD_LEN: usize = 64;
+
+/// Writes `/etc/kcpassword` for `password` unless it already holds exactly that
+/// encoding. Returns whether it wrote.
+///
+/// # Errors
+/// The file could not be written.
+pub fn ensure_kcpassword(path: &Path, password: &[u8]) -> io::Result<bool> {
+    let want = kcpassword(password);
+    if read_nofollow(path).as_deref() == Some(&want[..]) {
+        return Ok(false);
+    }
+    write_whole(path, &want)?;
+    Ok(true)
+}
+
+/// A regular file's bytes; `None` for anything else (missing, a link, unreadable).
+fn read_nofollow(path: &Path) -> Option<Vec<u8>> {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let opened = rustix::fs::openat(CWD, path, flags, Mode::empty()).ok()?;
+    let mut bytes = Vec::new();
+    std::fs::File::from(opened).read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// What the intent record names: the lease whose user the session switch logged in, or
+/// the standing VM user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Intent {
+    /// `<term>.<seq>`: a whole-machine lease holds the session.
+    Lease(LeaseId),
+    /// `vm`: the Mac rests at the VM user.
+    Vm,
+}
+
+/// The spelling of [`Intent::Vm`] in the record. It is not a lease id, so a reader that
+/// knows only leases refuses the record (and treats it as stale) instead of reading it
+/// as a lease.
+pub const VM_RECORD: &str = "vm";
+
+impl std::fmt::Display for Intent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lease(lease) => lease.fmt(f),
+            Self::Vm => f.write_str(VM_RECORD),
+        }
+    }
+}
+
+/// What the intent record names; `None` when there is no record.
+///
+/// # Errors
+/// The record cannot be read (or is a link), or does not hold one lease id or `vm`.
+pub fn read_intent(path: &Path) -> Result<Option<Intent>, String> {
     let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let opened = match rustix::fs::openat(CWD, path, flags, Mode::empty()) {
         Err(rustix::io::Errno::NOENT) => return Ok(None),
@@ -129,20 +243,23 @@ pub fn read_intent(path: &Path) -> Result<Option<LeaseId>, String> {
     std::fs::File::from(opened)
         .read_to_string(&mut text)
         .map_err(|why| format!("{}: {why}", path.display()))?;
-    let lease = text
+    let named = text
         .strip_suffix('\n')
         .ok_or_else(|| format!("{}: {text:?} is not one lease id", path.display()))?;
-    parse_lease(lease)
-        .map(Some)
+    if named == VM_RECORD {
+        return Ok(Some(Intent::Vm));
+    }
+    parse_lease(named)
+        .map(|lease| Some(Intent::Lease(lease)))
         .map_err(|why| format!("{}: {why}", path.display()))
 }
 
-/// Writes the intent record naming `lease`, durably.
+/// Writes the intent record naming `intent`, durably.
 ///
 /// # Errors
 /// The record could not be written.
-pub fn write_intent(path: &Path, lease: LeaseId) -> io::Result<()> {
-    write_whole(path, format!("{lease}\n").as_bytes())
+pub fn write_intent(path: &Path, intent: Intent) -> io::Result<()> {
+    write_whole(path, format!("{intent}\n").as_bytes())
 }
 
 /// Writes `/etc/kcpassword` for `password`, durably, mode 0600.
@@ -228,6 +345,25 @@ pub fn set_auto_login(host: &dyn Host, paths: &SessionPaths, name: &str) -> Resu
         Err(failed(
             &format!("defaults write {domain} {AUTO_LOGIN_USER}"),
             &output,
+        ))
+    }
+}
+
+/// The login window's `autoLoginUser`; `None` when it is not set.
+///
+/// # Errors
+/// `defaults read` failed for any reason but the key being absent.
+pub fn read_auto_login(host: &dyn Host, paths: &SessionPaths) -> Result<Option<String>, String> {
+    let domain = paths.loginwindow.as_str();
+    let read = command(host, DEFAULTS, &["read", domain, AUTO_LOGIN_USER])?;
+    if read.success {
+        Ok(Some(read.stdout.trim().to_owned()))
+    } else if read.stderr.contains("does not exist") {
+        Ok(None)
+    } else {
+        Err(failed(
+            &format!("defaults read {domain} {AUTO_LOGIN_USER}"),
+            &read,
         ))
     }
 }

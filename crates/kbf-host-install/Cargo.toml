@@ -31,8 +31,21 @@ flate2.workspace = true
 sha2.workspace = true
 tar.workspace = true
 
+# The Linux side of the local socket moves releases in the layout, with the state and the
+# verify pipeline of `kbf-installer`, so a host has one of each. (The Mac side does not need
+# them, and the program builds without them there.)
+[target.'cfg(target_os = "linux")'.dependencies]
+kbf-host.workspace = true
+kbf-installer.workspace = true
+kbf-update.workspace = true
+
 [dev-dependencies]
 kbf-testkit.workspace = true
+rustix = { workspace = true, features = ["net"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+kbf-host = { workspace = true, features = ["testkit"] }
+kbf-installer = { workspace = true, features = ["testkit"] }
 
 [lints]
 workspace = true

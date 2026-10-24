@@ -1,34 +1,30 @@
 //! The real [`FrontendControl`]: the operator API of one frontend pool member, which is on
 //! loopback at the member's operator port (its `base` of the inventory plus two), through the
-//! client of [`crate::operator`] with the same token and proxy-secret files as every other call.
+//! client of [`crate::operator`] with the same token file as every other call.
 //!
-//! - **retire**: `POST /v1/frontend/retire` (`docs/api.md`). The frontend refuses new work,
-//!   hands its streams and sessions to the other frontends and answers its status when that has
-//!   ended, with `retired` true; the call is given `RETIRE_TIMEOUT` to be answered. It is
-//!   irreversible: the unit is restarted after it. A 409 says the frontend is not one over a
-//!   state store, which has no retire.
-//! - **retire status**: `GET /v1/frontend/retire`, the same status as it is now.
 //! - **commit**: the `commit` of `GET /healthz`, the commit the member's binary was built from
 //!   (12 hex digits, or `unknown` for a build without a git checkout).
+//! - **drain**: `POST /v1/frontend/drain` begins the member's own drain, which ends in its exit.
+//!   A member that is not running refuses the connection, and the error says so
+//!   ([`PortError::is_refused`]).
+//! - **drain status**: `GET /v1/frontend/drain`, the same route read.
+//! - **ready**: `GET /readyz`, 200 for ready and 503 for not.
 //!
 //! Error texts carry no address and no token: they reach `GET /rolls/{id}`.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
 
 use serde::Deserialize;
 
 use crate::inventory::Host;
 use crate::operator::{CHECK, OperatorApi};
-use crate::ports::{FrontendControl, PortError, RetireStatus};
+use crate::ports::{DrainStatus, FrontendControl, PortError};
 
-/// The path of the retire.
-const RETIRE: &str = "/v1/frontend/retire";
+/// The path of the member's own drain.
+const DRAIN: &str = "/v1/frontend/drain";
 
-/// How long the `POST` of the retire may take to be answered. The frontend answers it once the
-/// retire has ended, which is up to ten seconds of quiesce and the same again for the requeues
-/// (more with `--handover-quiesce-secs`), longer than the client's bound for any other call.
-const RETIRE_TIMEOUT: Duration = Duration::from_secs(120);
+/// The path of the member's readiness.
+const READY: &str = "/readyz";
 
 #[derive(Deserialize)]
 struct Alive {
@@ -62,38 +58,9 @@ impl HttpFrontend {
         let addr = SocketAddr::new(loopback, member.operator_port());
         Ok(self.api.at(addr))
     }
-
-    /// The retire status from `POST` (`begin`) or `GET` of the retire route.
-    fn retire_call(&self, host: &Host, begin: bool) -> Result<RetireStatus, PortError> {
-        let api = self.member_api(host)?;
-        let reply = if begin {
-            api.clone().with_timeout(RETIRE_TIMEOUT).post(RETIRE, "")?
-        } else {
-            api.get(RETIRE)?
-        };
-        let (what, alias) = (api.what(), &host.alias);
-        match reply.status {
-            200 => {
-                let parsed = serde_json::from_slice(&reply.body);
-                parsed.map_err(|_| garbled(what, "retire status"))
-            }
-            409 => Err(PortError::other(format!(
-                "{alias} is not a frontend over a state store, which has no retire"
-            ))),
-            _ => Err(reply.failure(what, CHECK)),
-        }
-    }
 }
 
 impl FrontendControl for HttpFrontend {
-    fn retire(&self, host: &Host) -> Result<RetireStatus, PortError> {
-        self.retire_call(host, true)
-    }
-
-    fn retire_status(&self, host: &Host) -> Result<RetireStatus, PortError> {
-        self.retire_call(host, false)
-    }
-
     fn commit(&self, host: &Host) -> Result<String, PortError> {
         let api = self.member_api(host)?;
         let what = api.what();
@@ -104,5 +71,37 @@ impl FrontendControl for HttpFrontend {
         let parsed = serde_json::from_slice::<Alive>(&reply.body);
         let alive = parsed.map_err(|_| garbled(what, "health report"))?;
         Ok(alive.commit)
+    }
+
+    fn drain(&self, host: &Host) -> Result<(), PortError> {
+        let api = self.member_api(host)?;
+        let what = api.what();
+        let reply = api.post(DRAIN, "")?;
+        match reply.status {
+            200 => Ok(()),
+            _ => Err(reply.failure(what, CHECK)),
+        }
+    }
+
+    fn drain_status(&self, host: &Host) -> Result<DrainStatus, PortError> {
+        let api = self.member_api(host)?;
+        let what = api.what();
+        let reply = api.get(DRAIN)?;
+        if reply.status != 200 {
+            return Err(reply.failure(what, CHECK));
+        }
+        let parsed = serde_json::from_slice(&reply.body);
+        parsed.map_err(|_| garbled(what, "drain status"))
+    }
+
+    fn ready(&self, host: &Host) -> Result<bool, PortError> {
+        let api = self.member_api(host)?;
+        let what = api.what();
+        let reply = api.get(READY)?;
+        match reply.status {
+            200 => Ok(true),
+            503 => Ok(false),
+            _ => Err(reply.failure(what, CHECK)),
+        }
     }
 }

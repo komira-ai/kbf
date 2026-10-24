@@ -1,7 +1,7 @@
 //! What a memory floor (the least memory a fresh submission of an action is booked at,
 //! once a run of it passed its own limit) leaves in the state store, and what a farm that
 //! takes the store over offers a fresh submission. Two or more farms run over one store,
-//! each holding the next writer generation.
+//! one after another.
 
 use super::fate::{booked, out_of_memory, register_big};
 use super::*;
@@ -46,7 +46,7 @@ fn offered(farm: &TestFarm, inbox: &mut Inbox, tag: u8) -> u64 {
 /// its node registered.
 fn handover(disk: &Disk, old: &TestFarm, bound: usize) -> (TestFarm, Inbox) {
     old.fence();
-    let successor = disk.generation_farm_bounded(bound);
+    let successor = disk.farm_bounded(bound);
     let (_, inbox) = register_big(&successor);
     (successor, inbox)
 }
@@ -58,7 +58,7 @@ fn handover(disk: &Disk, old: &TestFarm, bound: usize) -> (TestFarm, Inbox) {
 #[tokio::test(start_paused = true)]
 async fn a_floor_is_offered_to_a_fresh_submission_after_a_handover() {
     let disk = Disk::new();
-    let old = disk.generation_farm();
+    let old = disk.farm(EpochPolicy::Keep);
     let (_, mut inbox) = register_big(&old);
     raise(&old, &mut inbox, 1).await;
     assert_eq!(disk.rows("floor/"), 1, "a raised floor left no row");
@@ -76,12 +76,12 @@ async fn a_floor_is_offered_to_a_fresh_submission_after_a_handover() {
 #[tokio::test(start_paused = true)]
 async fn a_floor_is_offered_to_a_fresh_submission_after_a_crash() {
     let mut disk = Disk::new();
-    let old = disk.generation_farm();
+    let old = disk.farm(EpochPolicy::Keep);
     let (_, mut inbox) = register_big(&old);
     raise(&old, &mut inbox, 1).await;
 
     disk.crash(old);
-    let successor = disk.generation_farm();
+    let successor = disk.farm(EpochPolicy::Keep);
     let (_, mut inbox) = register_big(&successor);
     assert_eq!(offered(&successor, &mut inbox, 1), 16 * GIB, "no floor");
 }
@@ -91,7 +91,7 @@ async fn a_floor_is_offered_to_a_fresh_submission_after_a_crash() {
 #[tokio::test(start_paused = true)]
 async fn a_floor_raised_again_replaces_its_row() {
     let disk = Disk::new();
-    let old = disk.generation_farm();
+    let old = disk.farm(EpochPolicy::Keep);
     let (_, mut inbox) = register_big(&old);
     raise(&old, &mut inbox, 1).await;
     // The fresh submission is floored at 16 GiB, killed there and raised to 32 GiB.
@@ -124,7 +124,7 @@ async fn a_floor_raised_again_replaces_its_row() {
 #[tokio::test(start_paused = true)]
 async fn the_oldest_floor_goes_first_and_the_cap_holds_across_handovers() {
     let disk = Disk::new();
-    let a = disk.generation_farm_bounded(2);
+    let a = disk.farm_bounded(2);
     let (_, mut inbox) = register_big(&a);
     raise(&a, &mut inbox, 9).await;
     raise(&a, &mut inbox, 1).await;
@@ -150,7 +150,7 @@ async fn the_oldest_floor_goes_first_and_the_cap_holds_across_handovers() {
 async fn an_evicted_floor_does_not_come_back() {
     for crash in [false, true] {
         let mut disk = Disk::new();
-        let old = disk.generation_farm_bounded(1);
+        let old = disk.farm_bounded(1);
         let (_, mut inbox) = register_big(&old);
         raise(&old, &mut inbox, 1).await;
         raise(&old, &mut inbox, 2).await;
@@ -158,7 +158,7 @@ async fn an_evicted_floor_does_not_come_back() {
 
         let (successor, mut inbox) = if crash {
             disk.crash(old);
-            let successor = disk.generation_farm_bounded(1);
+            let successor = disk.farm_bounded(1);
             let (_, inbox) = register_big(&successor);
             (successor, inbox)
         } else {

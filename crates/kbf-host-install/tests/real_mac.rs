@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use kbf_host_install::mac_tools::{
     Cmd, Exec, Identity, Runner, SystemRunner,
-    fetch::{FetchError, Fetcher, Limits, MAX_PAGES, page_body},
+    fetch::{AssetKind, FetchError, Fetcher, Limits, MAX_PAGES, page_body},
     release, tools,
 };
 use kbf_testkit::dir::TestDir;
@@ -665,6 +665,8 @@ fn a_real_release_is_fetched_as_nobody_and_verified() {
     fs::set_permissions(&root_copy, fs::Permissions::from_mode(0o644)).unwrap();
 
     let fetcher_with = |token| Fetcher {
+        platform: "darwin-arm64",
+        asset: AssetKind::Tarball,
         runner: &SystemRunner,
         curl: Path::new("/usr/bin/curl"),
         gh: &gh,

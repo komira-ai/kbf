@@ -23,16 +23,13 @@ route stays local, and the last column says why.
 - **policy**: the REAPI authentication policy and `invocations.getAuthorizer`; off (404) without
   them.
 - **none**: health and metrics, which need no credentials.
-- **admin**: the admin port (`--admin-listen`), a separate listener that binds loopback only
-  and carries no credential; the calls move the scheduler's role ([../api.md](../api.md), "The
-  admin calls").
 
 ## 1. Routes, one row each
 
 Every row is one method and one path. A router `.route(` call that serves two methods has a row
 per method; a custom method (`:cordon`) has a row per verb. The sources of the router are
 `crates/kbf-server/src/{api,release/http,storage_health,health,metrics,http_blobs,
-http_invocations,http_sched,http_history,enroll/api,managed/http,ui_mount}.rs` and `frontend.rs`, where they are merged.
+http_invocations,http_sched,http_history,enroll/api,node_self,ui_mount}.rs` and `frontend.rs`, where they are merged.
 
 ### Cluster
 
@@ -40,6 +37,7 @@ http_invocations,http_sched,http_history,enroll/api,managed/http,ui_mount}.rs` a
 |---|---|---|---|
 | cluster status (nodes, software, placement) | `GET /v1/nodes` | [F] | open |
 | one node (capacity, booked, free, leases) | `GET /v1/nodes/{node}` | [F] | open |
+| a storage host's own member and the storage numbers (its updater, on the worker listener) | `GET /v1/nodes/{node}/storage-health` | [F] | the `updater` certificate of that node, over mutual TLS ([../api.md](../api.md), "Own-node calls of a host's updater") |
 | list members of the storage map | `GET /v1/members` | [F] | open |
 | leases the scheduler holds (paged, by node) | `GET /v1/leases` | [F] | open |
 | the queue: depth, ages, why work waits | `GET /v1/queue` | [F] | open |
@@ -61,19 +59,11 @@ http_invocations,http_sched,http_history,enroll/api,managed/http,ui_mount}.rs` a
 There is no rebalance verb: handoff of data between members is not built, and none is invented
 here **[D]**.
 
-### Admin port (a separate loopback listener, `--admin-listen`)
+### Admin port (removed)
 
-| Verb | Method and route | Status | Gate |
-|---|---|---|---|
-| the role of this process (candidate, active, quiesced, stood-down) | `GET /v1/admin/role` | [F] | admin |
-| stop scheduling, assigning and requeueing | `POST /v1/admin/quiesce` | [F] | admin |
-| undo a quiesce | `POST /v1/admin/resume` | [F] | admin |
-| a candidate takes the generation | `POST /v1/admin/takeover` | [F] | admin |
-| end worker streams after a takeover elsewhere | `POST /v1/admin/stand-down` | [F] | admin |
-
-`takeover` and `quiesce` are refused `409` by a process over a Postgres store, which the
-frontends share and which holds no generation to hand over; `resume` of such a process changes
-nothing.
+A frontend serves no admin port: `GET /v1/admin/role` and the `quiesce`, `resume`, `takeover`
+and `stand-down` posts are gone with `--admin-listen` ([../api.md](../api.md), "The admin calls
+(removed)").
 
 ### Enrollment
 
@@ -174,7 +164,7 @@ section 8) and is not an operator verb of the farm.
 | install, update, roll back, confirm, revert, gc, status and check of a host | `kbf-installer` (#1048, #1051, #1082, #1083) **[V]** | root and host-local; the installer is the root tool, and `setup` mints the first token |
 | the rollout controller | `kbf-deploy rollout`, #803, #970 **[V]** | a host state machine; installer territory |
 | start a mode, `--check` | `kbf <mode>` **[F]** | the local runtime; it installs nothing |
-| frontend handover, enroll, `kbf node` | `kbf frontend handover`, `kbf enroll`, `kbf node` **[F]** | replaced by the installer's side-by-side children (#1054, #1062) and removed by #1049 **[V]** |
+| frontend handover, enroll, `kbf node` | `kbf frontend handover`, `kbf enroll`, `kbf node` **[F]** | removed: a frontend is updated by a roll of the `kbf-proxy` pool, driven by `kbf-updater` (`frontend-proxy.md` section 4) **[V]** |
 | render, check, install units, swap, verify certificate (the `envoy render, check, apply` verbs are retired: no Envoy) | `kbf-deploy` **[F]** | become installer logic and package units; root |
 | `mdm`, `minio`, `pilot`, `erase-request` | `kbf-deploy` **[F]** | leave the product (distribution.md section 8); an erase request is signed with a security key on the operator's machine |
 | `kbf cluster status`, `drain`, `undrain`, `member`, `denied`, `epoch-bump`, `object-store status\|audit\|connection\|bind\|unbind\|verify` | the `kbf` CLI **[F]** (the last two groups: unit G1) | a thin client of the routes above, no logic |

@@ -18,8 +18,9 @@ the same run as every other asset ([../artifacts.md](../artifacts.md)):
 No package ships it: neither the `kbf` nor the `kbf-installer` deb installs it, so a Linux
 host gets it from the tarball too. Each tarball holds one member, `kbf-host-install`. Its
 `<commit>` is the commit of the release the host is on or going to. The updater,
-`kbf-updater`, is the same kind of asset for the operator's Linux box
-(`kbf-updater-<commit>-linux-<arch>.tar.gz`, one member `kbf-updater`).
+`kbf-updater`, is the same kind of asset for the operator's Linux box and for a Mac's host agent
+(`kbf-updater-<commit>-linux-<arch>.tar.gz` and `kbf-updater-<commit>-darwin-arm64.tar.gz`, one
+member `kbf-updater`; the Mac one is ad hoc signed with the hardened runtime).
 
 Fetch the tarball with its bundle and check the bundle before the binary is placed anywhere
 (the flags are those of [../artifacts.md](../artifacts.md#provenance-bundles-verifying-a-tarball-offline)):
@@ -548,3 +549,240 @@ launchd, and no stage left behind.
   before it is killed; the copy then refuses the file, and the stage is removed.
 - A channel with `sums` pins the commit and the tarball's hash, and needs an edit of the sums file
   for each new release; the point of this source is a channel without them.
+
+## The local socket
+
+`kbf-host-install --serve` is the program's other door, for the agent mode of `kbf-updater`
+([kbf-updater.md](kbf-updater.md#the-agent-mode), [../design/updates.md](../design/updates.md)).
+It serves a unix socket instead of the ssh forced command, which stays as described above and
+is not changed. It does one host's A/B: put the next release beside the one that runs, switch to
+it on trial, keep it or go back.
+
+```text
+kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N]
+                 [--layout installer|deb|rpm] (--restart-unit UNIT... | --frontend-container)
+```
+
+- `--socket`: an absolute path. The program binds it itself (a `umask` of 0177, then a `chown`
+  to the account), mode 0600, in a directory that is root's and that others cannot write. A
+  stale socket file is replaced; a file of another kind in the way is an error.
+- `--socket-user`: the one account that may connect. On Linux it is looked up in `/etc/passwd`,
+  on a Mac with `dscl`; root is refused.
+- `--window-secs`: how long a release on trial has to be confirmed, 120 to 1800 (default 600).
+- `--layout`: how a Linux host keeps its releases. `installer` (the default) is the hand-placed
+  layout of `kbf-installer`, described under "On Linux". `deb` and `rpm` are a host whose units
+  are the `kbf` package's and run `/usr/bin/kbf`, updated by installing that package ("On a Linux
+  daemon host that runs the package"). A Mac takes none.
+- `--restart-unit`: on Linux, a unit that runs the release (`kbf-<name>.service` or
+  `kbf-<name>@<instance>.service`), repeated for each; at least one is required, unless the host
+  serves a frontend container. A Mac restarts the daemon's launchd job and takes none.
+- `--frontend-container`: a Linux host whose frontend runs as a container, not as units: the
+  release is the frontend's image and the switch recreates the container
+  ([A frontend container](#a-frontend-container)). Not given with `--restart-unit`, nor with
+  `--layout deb` or `rpm`.
+
+Nothing else is configured by a flag or the environment: the files this program reads as root are
+constants, as above. The units and jobs that start it are in
+[`packaging/host-agent`](../../packaging/host-agent/README.md).
+
+### The five requests
+
+One line in, one JSON line out, one connection at a time. The same grammar for the version and
+the channel as the forced command's (single spaces, no control byte; no path or URL anywhere).
+
+```text
+query
+install kbf=<version> from <channel>
+switch kbf=<version>
+confirm kbf=<version>
+revert
+```
+
+| request | does |
+|---|---|
+| `install` | looks `<version>` up in the channel, fetches the release **on the host**, verifies it, and lays it out beside the one that runs. No link moves and nothing restarts. The same version asked again is answered from what is laid out; the version the host runs already is answered at once (`current: true`) and teaches the host its version text |
+| `switch` | puts the laid-out release in place **on trial**: the pending marker, with its deadline, is written before the first link moves; then the links move and the units restart on it. A unit that does not come up puts the host back at once |
+| `confirm` | keeps the release on trial. Asked again after it was answered, the answer is the same |
+| `revert` | goes back to the release that ran, now |
+| `query` | what runs, what is on trial and until when, how the last update ended, and whether another install, switch or restart is running |
+
+Answers: `staged` (`version`, `commit`, `current`), `switched` (`version`, `commit`,
+`deadline_unix`), `confirmed`, `reverted` (`version`, the release the host is back on, when it
+knows its text), `query` (`commit`, `version`, `node_id`, `pending`, `last`, `busy`), and
+`{"result":"refused","reason":CODE}` (nothing ran) or `{"result":"failed","reason":CODE}` with a
+code from a closed set: `bad_command`, `channel_not_allowed`, `config_invalid`, `config_unsafe`,
+`unknown_release`, `ambiguous_release`, `fetch_failed`, `verify_failed`, `pending`, `not_staged`,
+`nothing_pending`, `no_current`, `busy`, `stage_failed`, `switch_failed`, `revert_failed`,
+`state_unavailable`, `audit_unavailable`, `peer_not_ready`, `runtime_failed`. The detail of a refusal goes to the journal, cleaned,
+never to the line.
+
+### The revert is this program's
+
+A release on trial has a deadline, in wall-clock seconds, on disk with the marker. The program
+checks it about five times a second between connections: a release that nobody confirmed by its
+deadline is put back by this program, **needing nothing of the release on trial to run**, the
+updater to be alive, or the host to have stayed up. The first check after a start is the same
+check, so a host that rebooted with a release on trial goes back at once if the deadline passed
+while it was down, and waits out what is left of the window if it did not. A revert that
+cannot be done (the units will not start on the release that ran) leaves the marker, and the next
+check tries again.
+
+Every request but `query` is audited like a forced-command request (verb `stage`, `switch`,
+`confirm` or `revert`), and the install, the switch and the confirm are not run when the audit log
+cannot be opened. A revert is never held back by it. The install lock is the same file as the
+forced command's, so the two never overlap.
+
+### On Linux
+
+(A host whose frontend is a container is [below](#a-frontend-container).)
+
+The release goes in the layout of `kbf-installer` ([host-releases.md](host-releases.md)):
+`/var/lib/kbf-installer/releases/<commit>`, the `current` and `previous` links, and the
+installer's `state.json`, which is also where the pending marker lives (`pending_confirm`, with
+the deadline). A host that was set up by hand with `kbf-deploy host install` has all of it; a host
+with no `current` release has nothing to go back to and is refused (`no_current`). The channels
+are in `/etc/kbf/host-install-releases.toml`, in the format of the Mac's allowlist below (a
+channel whose `source = "github"`; the ssh path's `host-install.toml` is the apt channels' and is
+not read):
+
+```toml
+[channels.stable]
+source = "github"
+```
+
+`install` lists the repository's releases, downloads `kbf-<commit>-linux-<arch>.tar.gz` and its
+bundle as the installer's unprivileged user, copies them once into the installer's scratch, and
+runs the installer's verify pipeline over the copy with the pinned `gh` and trusted root
+([host-releases.md](host-releases.md#what-is-trusted)): the attestation must be of this
+repository's `artifacts.yml` on a hosted runner, for the full commit, on the channel's branch; the
+tarball must hold the one executable of this CPU; and the binary run as the unprivileged user must
+say it is that commit. Nothing is fetched when the trust files are not root's. A release whose
+`protocol` or `state_schema` is newer than this program's `kbf-installer` understands is refused
+(the installer's rule, `verify_failed`): put the newer installer on the host first.
+
+### On a Linux daemon host that runs the package
+
+With `--layout deb` (or `rpm`) the host's units are the packaged ones
+([packaging/linux](../../packaging/linux/README.md)), which run `/usr/bin/kbf`. No release is laid
+out beside the running one and no link moves: the update is two installations of a package file,
+with the trial recorded first. The same five requests apply, with the same answers and codes, and
+the same channels file as above. The package and a record of it live in the program's state
+directory (`/var/lib/kbf-host-install`: `package.json` and `packages/`, root's, 0600 and 0700).
+
+| request | does |
+|---|---|
+| `install` | fetches the release's `kbf-<commit>-linux-<cpu>.deb` (or `.rpm`), its `.sigstore.json` bundle and the release's `SHA256SUMS` as the installer's unprivileged user, copies them once as root, and checks the copy, offline, before it keeps anything: the sha256 `SHA256SUMS` lists for the file; `gh attestation verify` (this repository's `artifacts.yml` on a hosted runner, for the full commit, on the channel's branch, with the pinned `gh` and trusted root); and the package manager's own reading of the file (`dpkg-deb --field`, `rpm --query --package`): the package `kbf`, for this CPU, at the version asked for. Nothing is installed, restarted or recorded |
+| `switch` | checks the kept file's sha256 again; reads the installed version from the package database; keeps a verified copy of the package that runs (the one kept already, or the release of that version fetched and checked the same way); writes the trial, with its deadline, naming that copy; then installs the new file (`dpkg --force-confold --install`, or `rpm --upgrade --oldpackage --replacepkgs`: one file, no repository, no dependency resolution) and restarts each `--restart-unit` and waits for it. A package that fails to install, or a unit that does not come up, puts the previous package back at once |
+| `confirm` | ends the trial and forgets every kept file but the new package and the one before it |
+| `revert` | and the deadline: installs the kept copy of the package that ran (fetching and checking it again if the file is gone or changed), ends the trial, restarts the units |
+| `query` | as above; `commit` is the commit of the package this host kept, else the 12 digits of the installed version, else the version text |
+
+A rollback is an installation of an older version and is never refused: `dpkg` downgrades by itself
+and `rpm` is told `--oldpackage`. The deadline is on disk before the package manager is asked for
+anything, so a restart of this program or a reboot finds the trial and goes back once the deadline
+has passed, as for the other layout. A going back that fails (the package manager cannot install the
+kept file) leaves the trial, and the next try finds it. The audit log and the install lock are the
+same as above.
+
+The release publishes a deb for each CPU. It does not publish an rpm yet, so on an rpm host an
+`install` is `unknown_release` until it does; the code path is the same.
+
+A node that was set up by hand moves to this layout once, with
+`kbf-host-install --migrate-to-package` ([native-package-migration.md](native-package-migration.md)).
+
+### A frontend container
+
+With `--frontend-container` the release is the frontend's image
+(`kbf-frontend-image-<commit>-linux-<arch>.oci.tar`, [artifacts.md](../artifacts.md#the-frontend-image-oci))
+and the runtime is Docker. The five requests are the same, so the pending marker, its deadline and
+the revert at the deadline are the same. The host needs `docker` at `/usr/bin/docker`, the channels
+file above (the image is fetched from the same releases), the installer's trust files (the pinned
+`gh` and trusted root), and a root-owned `/etc/kbf/host-install-frontend.toml`, which describes the
+container ([the example](../../packaging/host-agent/linux/host-install-frontend.toml)):
+
+| key | meaning |
+|---|---|
+| `name`, `restart` | the container's name and Docker's restart policy (`always`, `unless-stopped`, `on-failure[:N]`). `no` is refused: nothing else starts the container, so it would stay down after a reboot of the host or of Docker |
+| `network`, `user` | optional: `--network` and `--user` |
+| `ports`, `mounts`, `command` | `--publish` and `--volume` entries, and the flags after the image; each entry is one argument, never a shell word |
+| `api` | where this host reaches the frontend's operator API (a published port), for `/readyz` and `/healthz` |
+| `drain_token_file` | the operator token as a path **inside** the container |
+| `peers` | optional: the other frontends' operator APIs this host can reach |
+| `drain_secs` | optional (default 180, at most 1800): how long a drain is waited for |
+| `ready_secs` | optional (default 90, 10 to 600): how long a new container has to be ready |
+
+A switch has to fit `--window-secs`: `drain_secs` + 30 (the stop) + `ready_secs` is checked against
+it (`config_invalid` when it does not).
+
+**install** fetches the image, its attestation bundle and the release's `SHA256SUMS` as the
+installer's unprivileged user, copies them once into a directory of root's, and checks, before the
+runtime sees the file: the copy's sha256 is the one `SHA256SUMS` lists for the image (and the one
+the channel's pinned `sums` list, if it has some), and `gh attestation verify` accepts the copy
+offline for the full commit on the channel's branch, from `artifacts.yml` on a hosted runner. Only
+then is the image loaded (`docker image load`), and its id recorded in `frontend.json` (root's,
+0600, in `/var/lib/kbf-host-install`). Containers are made from that id, never from a tag. A
+release that fails the check changes nothing: nothing is loaded and nothing is stopped.
+
+**switch**, in this order:
+
+1. it refuses (`peer_not_ready`) if any of `peers` does not answer `/readyz` with 200, before
+   anything is written. This program can see only its own host and these peers; without `peers`
+   the coordinator's order (one frontend at a time, never the last ready one) is the guard;
+2. the pending marker is written to `frontend.json` with its deadline, the images of both
+   releases and a copy of the configuration;
+3. the restart policy is set to `no` (a drained frontend exits by itself, and must not be brought
+   back as the old release);
+4. the frontend is asked to drain through its own operator API: `docker exec` runs
+   `/usr/bin/kbf cluster drain --frontend --token-file <drain_token_file>` in the container, where
+   the API is on loopback ([api.md](../api.md#get-v1frontenddrain-and-post-v1frontenddrain)):
+   `/readyz` answers 503 and the work it has finishes;
+5. it waits until the container has ended (a drained frontend exits when it is idle) or
+   `drain_secs` is out, and then stops it (`docker stop`, 30 s) and removes it;
+6. the new container is made from the new image with **the configuration of step 2, byte for
+   byte**: `docker run --detach --name <name> --restart <restart> [--network] [--user]
+   [--publish]... [--volume]... <image id> <command>...`;
+7. it waits up to `ready_secs` for `/readyz` to answer 200 and `/healthz` to name the release's
+   commit.
+
+When any step fails, the container is removed and made again from the **old** image id with the
+same configuration, waited for the same way (on the old commit), the marker is cleared, and the
+switch answers `failed` (`switch_failed`). If the old container cannot be made again either,
+the answer is `revert_failed` and the marker stays: the deadline, or a `revert`, tries again.
+
+Three things to know when you set it up:
+
+- **`peers` is the only guard this program has against taking down the last ready frontend.**
+  Without it nothing here looks at another frontend, and only the coordinator's order protects
+  you. List every other frontend's operator API this host can reach; the example file's address
+  is a documentation address to replace.
+- **The operator API must be reachable on the published port.** `api` is a published port on the
+  bridge network, so the frontend inside the container must listen on a non-loopback address
+  (not `--api-listen 127.0.0.1:...`), or `/readyz` is never seen and every switch fails. Writes
+  still require a loopback peer, which Docker's NAT does not give an outside caller; the drain
+  runs inside the container, where the peer is loopback.
+- **The health the updater's agent reports is what the last switch saw.** It comes from the
+  release this program recorded as current, which `switch` sets after `/readyz` answered 200 on
+  the target commit. It is not a probe made at each heartbeat: a container that crashes later is
+  reported healthy until the next switch or the host's own supervision (Docker's restart policy)
+  deals with it.
+
+**confirm** clears the marker and forgets the old image. **revert**, which the deadline also
+calls (so a host that rebooted in the middle of a switch is put back when the first check after the
+start finds the deadline passed), removes whatever container there is and makes the old one again
+from the copy of the configuration in the marker, not from the file as it is now.
+A revert looks for the old image **before** it removes anything: if the image is gone, it fails
+(`revert_failed`) and the container that runs is left as it is, and so is a switch that fails
+readiness and cannot go back. Do not run `docker image prune -a` or `docker system prune -a`
+while a release is on trial (a plain `docker image prune` is safe: the old image keeps its tag).
+
+Before the first switch the release that runs is read from the container's image reference
+(`kbf-frontend:<commit>`, the name `docker image load` gives it); make the first container from the
+image of a release with the same options as the file.
+
+### On a Mac
+
+The release is checked and laid out by the same code as the ssh path's install (above), into the
+kit tree, with the channels of the same `host-install.toml`. The swap is the apply job's: the links,
+then a restart of the daemon's job that must say it was welcomed, and the old release started again
+if it does not. The pending marker is `pending.json` in the work directory, root's and 0600, and
+holds the links as they were.

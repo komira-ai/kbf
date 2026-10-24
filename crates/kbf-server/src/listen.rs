@@ -35,20 +35,6 @@ impl Socket {
         bound.map_err(bind_error(addr))
     }
 
-    /// A second handle on the same bound socket: connections wait in one queue, and
-    /// whichever handle is served accepts them. A process that serves a stand-in on the
-    /// clone and hands the original to the real server loses no connection between the
-    /// two ([`crate::managed`]).
-    ///
-    /// # Errors
-    /// The descriptor cannot be duplicated.
-    pub fn try_clone(&self) -> io::Result<Self> {
-        Ok(Self {
-            local: self.local,
-            listener: self.listener.try_clone()?,
-        })
-    }
-
     /// The listener for a gRPC server, and the latch that closes it: connections it
     /// accepts have Nagle's algorithm off (see [`crate::serve::bind`]), and are served
     /// over TLS when `tls` is given ([`Incoming`]: it must be called inside a Tokio
@@ -73,6 +59,23 @@ impl Socket {
     /// The runtime cannot register the socket.
     pub fn http(self) -> Result<tokio::net::TcpListener, ServeError> {
         let registered = tokio::net::TcpListener::from_std(self.listener);
+        registered.map_err(bind_error(self.local))
+    }
+
+    /// The listener for the operator API twice over: two handles on the one socket, one for
+    /// the server that is sent GOAWAY and one for the server that goes on accepting when it
+    /// is ([`crate::serve::serve_api_goaway`]). Dropping a handle leaves the socket open
+    /// while the other is.
+    ///
+    /// # Errors
+    /// The socket cannot be duplicated, or the runtime cannot register it.
+    pub fn http_pair(
+        self,
+    ) -> Result<(tokio::net::TcpListener, tokio::net::TcpListener), ServeError> {
+        let registered = self.listener.try_clone().and_then(|twin| {
+            let first = tokio::net::TcpListener::from_std(self.listener)?;
+            Ok((first, tokio::net::TcpListener::from_std(twin)?))
+        });
         registered.map_err(bind_error(self.local))
     }
 }
@@ -200,7 +203,7 @@ struct Open {
 /// connections and closes the socket at once, wherever the server is in accepting. The
 /// transport's own shutdown keeps the socket open until the last connection is gone, and
 /// stops accepting only when it next looks at the listener; a process that stops
-/// listening (a handover stops the worker listener) must not go on holding the socket
+/// listening (a retire stops the worker listener) must not go on holding the socket
 /// open, where connections would queue for nobody.
 pub(crate) struct Stoppable(Arc<Mutex<Open>>);
 

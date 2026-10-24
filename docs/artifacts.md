@@ -35,17 +35,18 @@ by `crates/kbf-integration-test/tests/release_artifacts`.
 
 ## What is built
 
-Thirteen tarballs, each with its SBOM and (once the push is attested) its provenance bundle
+21 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), two Debian packages of
 `kbf-installer` ([below](#the-kbf-installer-package-deb)), two of `kbf`
-([below](#the-kbf-package-deb)) and one macOS package of `kbf-installer`
+([below](#the-kbf-package-deb)), one frontend and one update coordinator container image per
+Linux architecture ([below](#the-frontend-and-coordinator-images-oci)) and one macOS package of `kbf-installer`
 ([below](#the-kbf-installer-package-pkg-macos)), built by one job per platform:
 
 | Asset | Runner | Target |
 |---|---|---|
-| `kbf-<commit>-darwin-arm64.tar.gz`, `kbf-deploy-<commit>-darwin-arm64.tar.gz`, `kbf-installer-<commit>-darwin-arm64.tar.gz`, `kbf-host-install-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
-| `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz`, `kbf-installer-<commit>-linux-x86_64.tar.gz`, `kbf-host-install-<commit>-linux-x86_64.tar.gz`, `kbf-updater-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
-| `kbf-<commit>-linux-arm64.tar.gz`, `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz`, `kbf-installer-<commit>-linux-arm64.tar.gz`, `kbf-host-install-<commit>-linux-arm64.tar.gz`, `kbf-updater-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
+| `kbf-<commit>-darwin-arm64.tar.gz`, `kbf-deploy-<commit>-darwin-arm64.tar.gz`, `kbf-installer-<commit>-darwin-arm64.tar.gz`, `kbf-host-install-<commit>-darwin-arm64.tar.gz`, `kbf-updater-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
+| `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz`, `kbf-installer-<commit>-linux-x86_64.tar.gz`, `kbf-host-install-<commit>-linux-x86_64.tar.gz`, `kbf-updater-<commit>-linux-x86_64.tar.gz`, `kbf-signer-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
+| `kbf-<commit>-linux-arm64.tar.gz`, `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz`, `kbf-installer-<commit>-linux-arm64.tar.gz`, `kbf-host-install-<commit>-linux-arm64.tar.gz`, `kbf-updater-<commit>-linux-arm64.tar.gz`, `kbf-signer-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
 
 `kbf` is the one binary with all five modes (`kbf --mode=daemon`, `kbf --mode=all-in-one`,
 `kbf --mode=storage`, and the two modes not built yet; [cluster.md](design/cluster.md) sections 1
@@ -64,14 +65,20 @@ update itself (the design's section 1).
 `kbf-host-install` is the root side of the host-driven update: the forced command of the
 key `kbf-updater` holds, which installs a release on the host it runs on
 ([deploy/host-install.md](deploy/host-install.md)). `kbf-updater` is the daemon that
-drives it over ssh from the operator's Linux box, so it has Linux tarballs only. Neither
+drives it over ssh from the operator's Linux box, and, as `kbf-updater agent`, the host agent a
+Mac runs, so it has Linux and macOS tarballs. Neither
 is a package, and neither is a component of a release: a host or an operator takes the
 tarball by digest, verifies it as every tarball is (below), and places the binary where
 the guide says. Each tarball holds one member, the binary under its own name. The macOS
-`kbf-host-install` is signed and checked like the other macOS binaries. `kbf-host-install
+`kbf-host-install` and `kbf-updater` are signed and checked like the other macOS binaries. `kbf-host-install
 --version` prints its name and package version, which is all the release asks of it.
 
-The packages are the two Linux jobs' debs (two each) and the macOS job's `.pkg`:
+`kbf-signer` is the process that holds the CA key and serves a Unix socket to the frontend
+(`kbf --mode=frontend --ca-signer`; [the design](design/install-and-enrollment.md), section 6.1). It has Linux
+tarballs only, no package and no container image; it is taken by digest, verified, and placed like the
+two tools above. Its tarball holds one member, the binary under its own name.
+
+The packages are the two Linux jobs' debs (two each) and container images (two each), and the macOS job's `.pkg`:
 
 | Asset | Built by | Holds |
 |---|---|---|
@@ -79,6 +86,10 @@ The packages are the two Linux jobs' debs (two each) and the macOS job's `.pkg`:
 | `kbf-installer-<commit>-linux-arm64.deb` | the `linux-arm64` job (`ubuntu-24.04-arm`, nfpm for arm64) | the same for arm64 |
 | `kbf-<commit>-linux-x86_64.deb` | the `linux-x86_64` job | the `kbf` of the tarball of the same name at `/usr/bin/kbf`, the unit of every mode, a dependency on `kbf-installer` of the same version or later, and the replacement of `kbf-installer` (its files, not the package) |
 | `kbf-<commit>-linux-arm64.deb` | the `linux-arm64` job | the same for arm64 |
+| `kbf-frontend-image-<commit>-linux-x86_64.oci.tar` | the `linux-x86_64` job (`ubuntu-24.04`, BuildKit) | an OCI image of the `kbf` of the tarball of the same name, which runs `kbf --mode=frontend` as a user that is not root |
+| `kbf-frontend-image-<commit>-linux-arm64.oci.tar` | the `linux-arm64` job | the same for arm64 |
+| `kbf-coordinator-image-<commit>-linux-x86_64.oci.tar` | the `linux-x86_64` job (`ubuntu-24.04`, BuildKit) | an OCI image of the `kbf-coordinator` the job built, which runs it as a user that is not root |
+| `kbf-coordinator-image-<commit>-linux-arm64.oci.tar` | the `linux-arm64` job | the same for arm64 |
 | `kbf-installer-<commit>-darwin-arm64.pkg` | the `darwin-arm64` job (`macos-15`, `cargo xtask pkg build`) | the `kbf-installer` of the tarball of the same name, its LaunchDaemon property list, the pinned darwin `gh` and a trust directory |
 
 The set above is pinned: `crates/kbf-integration-test/tests/release_artifacts` fails a pull request
@@ -184,10 +195,10 @@ sorted by name.
 {"admin_protocol":1,"commit":"0123456789ab","commit_full":"0123456789abcdef0123456789abcdef01234567","meta_log":4,"min_protocol":1,"profile":"release","protocol":1,"relay":1,"seq":812,"state_schema":1,"version":"0.1.0"}
 ```
 
-- `admin_protocol`: the version of the admin calls of `kbf --mode frontend` (`GET role`,
-  `POST quiesce`, `resume`, `takeover`, `stand-down`: `docs/api.md`). It is the contract
-  between a proxy and the frontend processes it starts; a call or an answer field that
-  changes meaning raises it.
+- `admin_protocol`: the version of the admin calls that `kbf --mode frontend` served
+  (`GET role`, `POST quiesce`, `resume`, `takeover`, `stand-down`: `docs/api.md`, "The admin
+  calls (removed)"). A frontend no longer serves them; the field stays 1 for the readers of
+  the version line.
 - `commit`: the first 12 hex digits of the commit built (`unknown` for a build with no
   git checkout); compare it with the first 12 of the commit in the asset's name.
 - `commit_full`: the 40 hex digits of the commit built (`kbf_server::BUILD_COMMIT_FULL`);
@@ -259,7 +270,7 @@ and a host that trusts one asks for that branch with `--source-ref`; an asset at
 only takes the files of the pipeline run of a push to `main`, so a file built from any other branch is
 never released.
 
-Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write`, and only
+Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write` (the release workflow's `deploy` job holds `id-token: write` alone, to present it to the update coordinator, and signs nothing; see [Releases](#releases)), and only
 under the exact `if:` that limits it to a push to `main` (the
 `verify-*` jobs run under the same one). The workflow lint
 (`crates/kbf-integration-test/tests/workflows`) refuses those scopes in any other job, and in one
@@ -473,6 +484,77 @@ needs `kbf-installer` installed first, or both files given to one `apt install .
 sudo apt install ./kbf-installer-<commit>-linux-x86_64.deb ./kbf-<commit>-linux-x86_64.deb
 ```
 
+## The frontend and coordinator images (OCI)
+
+The frontend and the update coordinator ship as container images for each Linux architecture,
+release assets like the packages: `kbf-frontend-image-<commit>-linux-x86_64.oci.tar` and
+`kbf-frontend-image-<commit>-linux-arm64.oci.tar`, and the same two for `kbf-coordinator-image`.
+Each is an OCI image layout in one tar. Nothing is pushed to a registry: load the file where the
+image is to run.
+
+```text
+docker image load --input kbf-frontend-image-<commit>-linux-x86_64.oci.tar
+# or, on a containerd host
+ctr images import kbf-frontend-image-<commit>-linux-x86_64.oci.tar
+```
+
+The loaded images are named `kbf-frontend:<commit>` and `kbf-coordinator:<commit>`. Each holds one
+binary the job built and checked to name the commit, never a rebuild, on a distroless `cc` base
+pinned by digest (`packaging/container/frontend/Dockerfile` says why that base). Each runs as uid
+65532 and holds no secret and no address.
+
+- **Frontend.** The `kbf` unpacked from `kbf-<commit>-<platform>.tar.gz` into the build context.
+  Its entrypoint is `kbf --mode=frontend` and its configuration is a `/etc/kbf/kbf.toml` you
+  mount. It declares the ports 8980, 8981 and 8982 (the defaults of `docs/deploy/kbf-modes.md`).
+- **Coordinator.** The `kbf-coordinator` the job built (it has no tarball of its own), copied
+  into the build context after `build-commit check` showed it names the commit.
+  Its entrypoint is `kbf-coordinator`, with the flags of its mounted files as the default command
+  (`packaging/container/kbf-coordinator/Dockerfile`), and it declares the ports 8443 and 8444.
+
+Both are run as `docs/deploy/containers.md` says. The archives are small, a binary on a distroless
+base: about 34 MB for a frontend image and 13 MB for a coordinator image, about 94 MB for the four,
+and they add that much to every run's artifacts and to every release.
+
+The build is reproducible: the job builds each image twice from the commit's time
+(`SOURCE_DATE_EPOCH`, with BuildKit's own provenance and SBOM attachments off) and the two files
+must be the same bytes. `cargo xtask pkg-image-asset` lists the image in `SHA256SUMS`, refusing it
+unless:
+
+- `usr/bin/kbf` (frontend) is, in the layers as they stack, byte for byte the `kbf` in the tarball
+  `kbf-<commit>-<platform>.tar.gz` that `build-commit check-asset` checked for the commit, mode
+  0755; `usr/bin/kbf-coordinator` is byte for byte the `kbf-coordinator` the job built (`--binary`),
+  mode 0755;
+- its config says Linux and the architecture of the platform, the entrypoint
+  `/usr/bin/kbf --mode=frontend` (frontend) or `/usr/bin/kbf-coordinator`, and a user that is not
+  root;
+- every blob it names is present and hashes to its digest.
+
+It is attested like a deb: build provenance (one subject of the `SHA256SUMS` attestation, and alone,
+with its bundle `kbf-<service>-image-<commit>-<platform>.oci.tar.sigstore.json` in `bundles-linux`)
+and **no SBOM attestation**. The `kbf` of the frontend image has the SBOM of its tarball. The
+coordinator has no tarball and so no SBOM asset yet. The verify job checks both
+offline and runs `cargo xtask pkg-image-asset --verify-only` on each signed file (for the
+coordinator that makes the checks of the image alone: the verify job has not the binary the build
+compared it with). Verify one before loading it, as for the installer's deb above:
+
+```text
+gh attestation trusted-root > trusted_root.jsonl
+gh attestation verify kbf-frontend-image-<commit>-linux-x86_64.oci.tar \
+  --bundle kbf-frontend-image-<commit>-linux-x86_64.oci.tar.sigstore.json \
+  --custom-trusted-root trusted_root.jsonl \
+  --repo komira-ai/kbf \
+  --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml \
+  --cert-oidc-issuer https://token.actions.githubusercontent.com \
+  --source-ref refs/heads/main \
+  --source-digest <commit> \
+  --predicate-type https://slsa.dev/provenance/v1 \
+  --deny-self-hosted-runners
+```
+
+`beta.yml` loads the x86_64 image of each push into Docker, runs its `kbf --version` (and the
+coordinator's `kbf-coordinator --version`) and checks that the binary in it names the commit (and,
+for `kbf`, a release build).
+
 ## The kbf-installer package (pkg, macOS)
 
 A Mac gets `kbf-installer` the same way, as one file that holds everything it needs to verify a
@@ -575,11 +657,12 @@ can create one. The jobs, each with the least token it needs:
 | `notes` | checks the tag (`release verify`), the identity of this release and of the one before it, and writes the notes | read |
 | `publish` | creates the release with those files and notes (`release publish`) | `contents: write`; environment `release` |
 | `bump` | opens the pull request in the internal repository that moves its submodule to the release (`release bump-internal`) | `contents: read`; environment `release` |
+| `deploy` | after `publish`, sets the release as the desired version on the farm's update coordinator and waits for the farm to converge (`deploy-farm`); passes with a notice when the repository variable `KBF_COORDINATOR_URL` is unset ([deploy/kbf-updater.md](deploy/kbf-updater.md#turn-on-the-deploy-step)) | `contents: read`, `id-token: write`; environment `release` |
 
 Every job after `plan` runs only when `plan` says the push ships code and does not change the
 pipeline (`.github/`, `infra/`, `crates/xtask/` and the like): a push of docs only releases
 nothing and the run is green, and a push that changes the pipeline is released by the next one
-that does not. `tag`, `notes`, `publish` and `bump` also repeat the condition on the run that started the
+that does not. `tag`, `notes`, `publish`, `bump` and `deploy` also repeat the condition on the run that started the
 workflow (conclusion `success`, event `push`, branch `main`, this repository). The pipeline run is never cancelled
 and the newest waiting push queues behind it; `plan` measures from the highest release tag that is an ancestor of the
 commit, so the code of a push that was replaced while waiting is released with the next one. No job runs after a red one (no `always()`, no
@@ -629,7 +712,7 @@ commit. (The notes are written after the tag, because they read it.)
 
 `crates/kbf-integration-test/tests/release_workflow` holds the file to all of this (and `pipeline_workflow` holds the pipeline it follows to its order, its cancel and its triggers): the events
 (the completion of a `pipeline` run for `main` only), the job graph and the scopes, `if:` and environment of each job, the halt on
-red, a checkout of the commit the pipeline built alone, the release bot's key read in `tag` and `bump` only,
+red, a checkout of the commit the pipeline built alone, the release bot's key read in `tag` and `bump` only, `id-token: write` in `deploy` only (the coordinator's address is read from a repository variable there and nowhere else),
 the data that flows from job to job, pinned actions and an empty top-level `permissions`. The
 job list is pinned, `publish` among them (`gamma.yml`, which followed the workflow, is deleted). On every
 pull request into `main`, CI asks GitHub the same on-`main` question for the pull request's base
@@ -681,14 +764,14 @@ fails.
 ## macOS signing: what ad hoc with the hardened runtime gives
 
 `cargo xtask sign-darwin` (crates/xtask/src/darwin.rs) signs each macOS binary the job
-builds (`kbf`, `kbf-deploy`, `kbf-installer` and `kbf-host-install`, one step each) with `codesign --force
+builds (`kbf`, `kbf-deploy`, `kbf-installer`, `kbf-host-install` and `kbf-updater`, one step each) with `codesign --force
 --sign - --options runtime`: an ad-hoc signature (no certificate) with the hardened
 runtime. That works without an Apple Developer account, and the job checks it every
 run: `codesign --verify --strict` passes, the signed binary runs (`<binary> --version`
 exits 0 with no `DYLD_*` variable set, on every runner), the code directory's flags are
 exactly `adhoc,runtime`, the signature carries exactly the entitlements the allow
 list `tools/ci/darwin-entitlements.txt` gives the binary (none for `kbf`,
-`kbf-deploy`, `kbf-installer` or `kbf-host-install`; only the `kbf-vmm` stub gets one, `com.apple.security.virtualization`;
+`kbf-deploy`, `kbf-installer`, `kbf-host-install` or `kbf-updater`; only the `kbf-vmm` stub gets one, `com.apple.security.virtualization`;
 [macos-vm-guests.md](design/macos-vm-guests.md) section 7), and the binary's minimum
 macOS is 14.0. After packaging, `cargo xtask darwin-asset` takes the binary back out
 of its tarball, the bytes that ship (refusing a tarball that is not exactly the one
@@ -733,7 +816,7 @@ What it constrains:
 - **Only Apple-signed libraries load.** The hardened runtime turns on library
   validation, and with no Team ID of its own the binary may load only libraries Apple
   signed. That is fine for a binary that links and loads only system libraries, as
-  `kbf` does; `kbf-deploy`, `kbf-installer` and `kbf-host-install` are signed the same way,
+  `kbf` does; `kbf-deploy`, `kbf-installer`, `kbf-host-install` and `kbf-updater` are signed the same way,
   and CI does not list the libraries they load. On a Mac with System Integrity Protection on, a library it linked at start-up that
   Apple did not sign would stop it from starting. CI does not show this: the hosted
   runners have SIP off and library validation off (`vm.cs_library_validation` 0), so

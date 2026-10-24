@@ -65,12 +65,12 @@ const FILES: [&str; 9] = [
     "kbf.slice",
 ];
 
-/// The runtime units kbf-installer starts before (`Before=` of its unit).
-const RUNTIME: [&str; 6] = [
+/// The runtime units kbf-installer starts before (`Before=` of its unit). The proxy is not one:
+/// it runs no release.
+const RUNTIME: [&str; 5] = [
     "kbf-all-in-one.service",
     "kbf-daemon.service",
     "kbf-frontend.service",
-    "kbf-proxy.service",
     "kbf-storage-and-daemon.service",
     "kbf-storage.service",
 ];
@@ -653,8 +653,8 @@ fn violations(name: &str, text: &str) -> Vec<String> {
 
     if plain {
         // Catches a plain frontend that still carries the handover model: a template, an
-        // instance (kbf refuses --instance without --handover-socket), a control socket,
-        // a RuntimeDirectory= for it, a `%i`. Read over every line of the unit's commands.
+        // instance and a control socket (flags kbf still accepts, ignores and warns of), a
+        // RuntimeDirectory= for it, a `%i`. Read over every line of the unit's commands.
         if name.contains('@') {
             v("proxyless", "a template unit".into());
         }

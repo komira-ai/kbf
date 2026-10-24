@@ -39,6 +39,15 @@ before it listens on anything, and `kbf --mode=frontend --check` exits 2 the sam
 the TLS flags the frontend keeps the farm's storage map and routes every call by it;
 `--storage` is then only the bootstrap node.
 
+`--pack-index` (off by default; the `pack-index` key of `[scheduler]` in `kbf.toml`) opens
+the pack index at start: two tables of the Postgres state store (`pack` and `blob`) that
+say which pack holds each blob and where. Nothing reads or writes them yet, so the flag
+only checks that the store can hold them. It needs a `postgres://` state store whose schema
+has the tables, which `kbf-installer setup` and the update step create, and a `sqlite://`
+state store is refused with a line that says so (exit 2). With the flag off no pack table is
+touched. The tables are an additive schema step: a kbf of the previous release keeps running
+on the migrated schema.
+
 **`storage`.** It serves the storage service over gRPC and nothing else: no REAPI, no
 scheduler, no operator API (only `GET /metrics`, on `--metrics-listen`, off unless given).
 It has no state store; it reaches one only through a frontend. Without `--frontend` it is a
@@ -60,13 +69,16 @@ farm.
 
 `kbf-proxy` is the public front door of a frontend host. It terminates TLS on one port,
 checks the client certificate when one is presented, and routes each HTTP/2 stream (not
-each connection) to the active child frontend on loopback, telling the child who the
+each connection) to a frontend of its pool on loopback, telling the frontend who the
 caller is. REAPI, worker sessions, the operator API and enrollment all arrive on that one
 port; a path the proxy does not know is answered by the proxy and never forwarded. The
-proxy exists so that a frontend can be updated without failing a build: it starts the
-frontend children itself, in two slots, and swaps them. It fronts `kbf --mode=frontend`
-only; an `all-in-one` process cannot sit behind it. The swap is described in
-[update-a-host.md](update-a-host.md).
+proxy exists so that a frontend can be updated without failing a build: the frontends of
+its pool (`[[proxy.frontend]]` tables of the `[proxy]` table) run on their own, and an
+update drains one at a time through the proxy's admin API. The proxy starts, adopts and
+swaps no frontend: the two-slot supervision it once had was removed, and a `[proxy]` table
+with the `upstream` table is refused. It fronts `kbf --mode=frontend` only; an `all-in-one`
+process cannot sit behind it. The update of a pool is described in
+[kbf-updater.md](kbf-updater.md).
 
 ### The installer's role
 
@@ -77,7 +89,8 @@ a frontend or all-in-one host, the state database's schema, and the mode's units
 enrollment token and enrolls itself at its first start. A `frontend` or `all-in-one` host
 does not enroll; its certificates and addresses are the operator's, and `setup` takes them as
 flags. A host from the packages can run the same verb as `kbf setup --mode=<mode>` (without the
-proxy's flags). Details: [kbf-installer-setup.md](kbf-installer-setup.md).
+proxy's flags). Details: [kbf-installer-setup.md](kbf-installer-setup.md). A frontend can also run as
+a container image, with no installer: [containers.md](containers.md).
 
 ## Ports and who dials whom
 
@@ -90,11 +103,10 @@ host; a farm sets routable addresses.
 | worker listener | `--worker-listen` | `127.0.0.1:8981` | `frontend`, `all-in-one` |
 | operator API | `--api-listen` | off unless given | `frontend`, `all-in-one` |
 | enrollment | `--enroll-listen` | off unless given | `frontend` |
-| admin calls | `--admin-listen` | off unless given; loopback only | `frontend` |
 | storage service | `--storage-listen` | `127.0.0.1:8982` | `storage`, `storage-and-daemon` |
 | storage metrics | `--metrics-listen` | off unless given | `storage`, `storage-and-daemon` |
 | the proxy's public port | `ListenStream=` of `kbf-proxy.socket` | `8980` | proxy hosts |
-| the proxy's children | `[proxy.upstream] base_port` | `18000` | proxy hosts |
+| the proxy's frontends | `base_port` of each `[[proxy.frontend]]` table | none | proxy hosts |
 
 Some defaults come from tools around the binary, not from `kbf`:
 
@@ -104,11 +116,11 @@ Some defaults come from tools around the binary, not from `kbf`:
   because 8982 is the operator API's on a frontend host; the enrolled node takes its storage
   port from the frontend's configuration. The renderer's REAPI, worker and operator
   ports are 8980, 8981 and 8982.
-- Behind the proxy, slot A's children listen on `base_port` (REAPI), `base_port + 1`
-  (worker), `+ 2` (operator API), `+ 3` (admin calls) and `+ 4` (enrollment); slot B is ten
-  ports above slot A. `kbf-installer setup` refuses a base port whose ranges cover 8980 or
-  8982. With `--instance b`, a frontend listens ten ports above what `--listen`,
-  `--worker-listen` and `--api-listen` say.
+- Behind the proxy, a frontend of the pool listens on its `base_port` (REAPI),
+  `base_port + 1` (worker), `+ 2` (operator API), `+ 3` (admin calls, which a frontend no
+  longer serves) and `+ 4` (enrollment); the `base_port`s of two frontends are at least five
+  apart. `--instance` no longer moves a frontend's listeners: the flag is accepted and
+  ignored.
 - A daemon opens no listening port.
 
 A listener serves plain text unless its TLS flags are given. The REAPI and worker listeners
@@ -225,12 +237,12 @@ disks and CPUs, and `daemon` on hosts that only build.
   `storage-and-daemon` refuse any driver but `container`, so a Mac is never one of those. Its
   `kbf.toml` is rendered by `kbf-mac-provision`. See
   [kbf-installer-setup.md](kbf-installer-setup.md) for the verbs.
-- **The frontend is one process.** Frontends over one Postgres store share it and none
-  fences another, but a SQLite file is held by one process, and the proxy's two slots exist
-  to swap a new frontend in for an old one, not to run two (the swap takes a generation,
-  which a Postgres store does not hold: see
-  [state-store-cutover.md](state-store-cutover.md)). A frontend that is down schedules
-  nothing.
+- **A frontend is one process; several may share a store.** Frontends over one Postgres
+  store share it and none fences another (see
+  [state-store-cutover.md](state-store-cutover.md)); a SQLite file is held by one process, so
+  only one frontend can use it. A farm with one frontend schedules nothing while it is down;
+  with several behind the proxy, the others carry on, and a frontend is updated by a roll
+  ([kbf-updater.md](kbf-updater.md)).
 - **A `storage-and-daemon` host is for a trusted network.** Its unit runs as the build user,
   which can read the cold store's key from the process's environment, as `all-in-one`'s user
   can read the farm's state. Hosts that must not share a user with a key run `daemon` and
@@ -266,15 +278,17 @@ the `Planned:` paragraph.
    `storage` or `daemon`, as `urn:kbf:role:<role>`). The frontend runs the enrollment
    listener: `--enroll-listen`, `--ca-dir`, `--frontend-name` (repeatable) and `--ca-signer`
    (the socket of the `kbf-signer` process that holds the CA key; `--ca-dev-file-signer` is
-   for development). The operator makes a token with `POST /v1/enroll/tokens`, and a node
+   for development; a frontend that runs as another account than the signer needs the
+   signer's `--client-group`, see the signer's socket in [api.md](../api.md)). The operator makes a token with `POST /v1/enroll/tokens`, and a node
    enrolls with it at its first start and renews at half of its certificate's life (7 days by
    default, `--enroll-cert-lifetime-secs`). A node host needs no hand-issued certificate. The
    table of what each certificate must contain is in [kbf-units.md](kbf-units.md).
 3. **The cold store.** `file://` stays on one host only. Choose an `s3://` store every
    storage node can reach, register it with the frontend as above, and give each node the
    same `--cold-store` URI. A fresh prefix is a fresh cold store.
-4. **The frontend.** Run `kbf --mode=frontend` on its own host, or behind the proxy
-   (`kbf-installer setup --mode=frontend --proxy`). Bind `--listen` and `--worker-listen`
+4. **The frontend.** Run `kbf --mode=frontend` on its own host, or behind the proxy (a pool of
+   frontends given as `[[proxy.frontend]]` tables, written by hand: `kbf-installer setup` sets up
+   no proxy). Bind `--listen` and `--worker-listen`
    to addresses the nodes reach, give them the TLS flags, and set `--storage` (required) to
    the first storage node, with `--storage-client-cert`, `--storage-client-key` and
    `--storage-ca` for the mutual TLS to it. Add `--api-listen` and `--api-token-file` for
@@ -311,7 +325,7 @@ leases they held before. Copying a joining member's slice to it
 
 | mode | on SIGTERM or SIGINT | what bounds it |
 |---|---|---|
-| `frontend` | drains | `--shutdown-timeout-secs` (0 by default: no deadline); a second signal |
+| `frontend` | drains, by the sequence below | `--drain-lb-wait` (10 s by default) and `--drain-deadline` (900 s by default); `--shutdown-timeout-secs` (0 by default: no deadline); a second signal |
 | `all-in-one` | the frontend half drains; the daemon half does not | as `frontend`; the daemon half stops when the server half has |
 | `storage` | stops | none of its own |
 | `daemon` | drains | `--drain-deadline-secs` (600 by default); a second signal |
@@ -319,14 +333,19 @@ leases they held before. Copying a joining member's slice to it
 
 **The frontend.** Buck2 does not recover an Execute stream that breaks after it started, so
 a stop that cuts a stream fails its action. On the first signal, or on
-`POST /v1/frontend/drain` (`kbf cluster drain --frontend --token-file F`), the frontend turns
-`/readyz` to 503, refuses each new Execute with `UNAVAILABLE` (which Buck2 retries), sends GOAWAY on
-the REAPI listener, and keeps every open Execute and WaitExecution stream until its action
-is done. It exits 0 once the REAPI connections have closed. The worker listener and the
-operator API stay up until then, so daemons go on reporting results. A second signal, or
-`--shutdown-timeout-secs` running out, ends the open streams `UNAVAILABLE` and stops the
-server. Under systemd that needs `TimeoutStopSec=infinity`; the units that `kbf-deploy`
-renders set it.
+`POST /v1/frontend/drain` (`kbf cluster drain --frontend --token-file F`), the frontend
+(which has a state store) takes itself out of any load balancer in five steps
+([kbf-units.md](kbf-units.md#draining-a-frontend-behind-a-load-balancer)): `/readyz` turns to
+503 while everything is still served; after `--drain-lb-wait` it refuses each new Execute with
+`UNAVAILABLE` (which Buck2 retries), takes no more work from the state store, and sends
+GOAWAY on the REAPI, worker and operator API listeners; it keeps every open Execute and
+WaitExecution stream until its action is done, at most `--drain-deadline`; then it ends the
+worker streams and the streams left `UNAVAILABLE` and exits 0. `GET /v1/frontend/drain`
+reports the phase. A second signal skips the waits, and `--shutdown-timeout-secs` running
+out does the same. A frontend with no state store (a test setup) drains at once: `/readyz`
+503, new Execute calls refused, GOAWAY on the REAPI listener, and exit 0 once the REAPI
+connections have closed. Under systemd that needs `TimeoutStopSec=infinity`; the units that
+`kbf-deploy` renders set it.
 
 **`all-in-one`.** The process has the frontend's drain and no drain of its own for builds.
 `--drain-deadline-secs` is used by `daemon` and `storage-and-daemon`, and `all-in-one` stops
@@ -354,7 +373,7 @@ maintenance without stopping it, `kbf cluster drain <node>`.
 - [kbf-units.md](kbf-units.md): each mode's packaged systemd unit and how it is checked.
 - [kbf-installer-setup.md](kbf-installer-setup.md): `kbf-installer setup`, the state database,
   the proxy host and backup.
-- [update-a-host.md](update-a-host.md): updating a host and swapping a frontend.
+- [update-a-host.md](update-a-host.md): updating a host.
 - [storage-node.md](storage-node.md): storage hosts, disks, memory and the cold store on a
   single host.
 - [linux-build-host.md](linux-build-host.md): what a Linux build host installs and gives

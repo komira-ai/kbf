@@ -72,7 +72,7 @@ fn attempt(
     let csr_hash = request_hash(&pairs);
     for _ in 0..ATTEMPTS {
         let now = rows::seconds(store.now());
-        let key = rows::node_key(req.node_id);
+        let key = rows::row_key(asked, req.node_id);
         let node =
             rows::fetch::<NodeRow>(store, &key, "node")?.ok_or(RefusalReason::UnknownNode)?;
         if state_of(&node.row)? == NodeState::Revoked {

@@ -2,8 +2,7 @@
 //! `kbf-proxy.service` (docs/design/frontend-proxy.md, section 2; kbf-proxy-api.md, section
 //! 11). The generic rules of the parent module (placeholder, install, network, exec, reload,
 //! gate-file) apply to the service too; these are the ones that belong to a socket-activated
-//! service that supervises children it leaves running. Each rule has a broken unit in
-//! `BROKEN_UNITS`, and `every_proxy_rule_has_a_broken_unit` fails when one has none.
+//! service that balances over frontends that run as units of their own and supervises none.
 
 use kbf_unitfile::UnitFile;
 
@@ -74,7 +73,7 @@ pub(super) fn socket_rules(unit: &UnitFile, v: &mut impl FnMut(&str, String)) {
     }
 }
 
-/// `kbf-proxy.service`: the proxy and the supervisor of its children.
+/// `kbf-proxy.service`: the proxy, the load balancer over the frontends of its pool.
 pub(super) fn service_rules(
     unit: &UnitFile,
     start: &[&str],
@@ -112,13 +111,16 @@ pub(super) fn service_rules(
             format!("ExecStartPre= is {pre:?}, not {check:?}"),
         );
     }
-    // Catches a stop or restart that kills the children: with KillMode=control-group (the
-    // default) or mixed, every frontend dies with the proxy and every build in flight
-    // fails; the restart would find nothing to adopt.
-    if get("KillMode") != Some("process") {
+    // Catches a stop that leaves part of the unit running: the proxy starts no process of its
+    // own, so the default KillMode (the control group) ends the unit whole, and `process` or
+    // `none` would leave whatever is left in the group behind after the proxy is gone.
+    if !matches!(get("KillMode"), None | Some("control-group" | "mixed")) {
         v(
             "proxy-kill",
-            format!("KillMode= is {:?}, not process", get("KillMode")),
+            format!(
+                "KillMode= is {:?}, not control-group, mixed or unset",
+                get("KillMode")
+            ),
         );
     }
     // Catches a certificate renewal that cannot reach the proxy without ending its streams:
@@ -186,19 +188,9 @@ pub(super) fn service_rules(
             "no StartLimitIntervalSec=0 in [Unit]".into(),
         );
     }
-    // Catches the proxy's directories missing, or its secret lost at a restart: the
-    // runtime directory must outlive the service (RuntimeDirectoryPreserve=yes) or the
-    // adopted children would read every call as anonymous.
-    let dirs: Vec<&str> = all(unit, "Service", "StateDirectory")
-        .into_iter()
-        .flat_map(str::split_whitespace)
-        .collect();
-    if !dirs.contains(&"kbf-proxy") || !dirs.contains(&"kbf-server") {
-        v(
-            "proxy-state",
-            format!("StateDirectory= is {dirs:?}, not kbf-proxy and kbf-server"),
-        );
-    }
+    // Catches the proxy's secret lost at a restart: the runtime directory must outlive the
+    // service (RuntimeDirectoryPreserve=yes) or the frontends, which keep running, would read
+    // every call as anonymous.
     if get("RuntimeDirectory") != Some("kbf-proxy")
         || get("RuntimeDirectoryPreserve") != Some("yes")
     {
@@ -207,9 +199,8 @@ pub(super) fn service_rules(
             "no RuntimeDirectory=kbf-proxy with RuntimeDirectoryPreserve=yes".into(),
         );
     }
-    // Catches a stop that never ends (the proxy bounds itself to 10 s; with KillMode=process
-    // the SIGKILL after the timeout reaches only the proxy) and one that is not SIGTERM,
-    // which is the signal the verb drains on.
+    // Catches a stop that never ends (the proxy bounds itself to 10 s) and one that is not
+    // SIGTERM, which is the signal the verb drains on.
     let timeout = get("TimeoutStopSec").and_then(|t| t.trim_end_matches('s').parse::<u64>().ok());
     if timeout.is_none_or(|t| !(10..=60).contains(&t)) {
         v(
@@ -274,8 +265,8 @@ const BROKEN_UNITS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-proxy.service",
-        "\nKillMode=process\n",
-        "\n",
+        "\nKillSignal=SIGTERM\n",
+        "\nKillSignal=SIGTERM\nKillMode=process\n",
         "proxy-kill",
     ),
     (
@@ -304,8 +295,8 @@ const BROKEN_UNITS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-proxy.service",
-        "\nStateDirectoryMode=0750\n",
-        "\nStateDirectoryMode=0750\nEnvironment=LISTEN_FDS=1\n",
+        "\nUser=kbf-server\n",
+        "\nUser=kbf-server\nEnvironment=LISTEN_FDS=1\n",
         "proxy-env",
     ),
     (
@@ -358,12 +349,6 @@ const BROKEN_UNITS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-proxy.service",
-        "StateDirectory=kbf-proxy kbf-server\n",
-        "StateDirectory=kbf-proxy\n",
-        "proxy-state",
-    ),
-    (
-        "kbf-proxy.service",
         "TimeoutStopSec=15\n",
         "TimeoutStopSec=infinity\n",
         "proxy-stop",
@@ -408,17 +393,4 @@ fn every_proxy_rule_has_a_broken_unit() {
     for m in BROKEN_UNITS {
         assert!(RULES.contains(&m.3), "broken unit names no rule: {}", m.3);
     }
-}
-
-/// Catches the proxy leaving the units that must come after the installer's: the root half
-/// reverts a release on trial, so it is ordered before every runtime unit, the proxy included.
-#[test]
-fn the_installer_is_ordered_before_the_proxy() {
-    let installer = UnitFile::parse(&read("kbf-installer.service")).expect("parses");
-    assert!(
-        all(&installer, "Unit", "Before")
-            .join(" ")
-            .split_whitespace()
-            .any(|u| u == "kbf-proxy.service")
-    );
 }

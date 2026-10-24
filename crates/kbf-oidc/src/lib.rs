@@ -1,6 +1,6 @@
-//! Verifies a GitHub Actions OIDC token against an allow-list (`docs/design/frontend-proxy.md` section 4).
-//! The caller is the frontend's front door (`kbf-proxy`), for the two update routes a CI job
-//! may start; nothing else uses it.
+//! Verifies a GitHub Actions OIDC token against an allow-list
+//! (`docs/design/updates.md` section 5.1). The caller is the coordinator (`kbf-coordinator`),
+//! which verifies the token of a CI job; nothing else uses it.
 //!
 //! One rule set, in this order (RFC 8725): the token's shape and header ([`jwt`]: `alg`
 //! is `RS256` by fiat, no key-locating headers), the key by `kid` and the signature

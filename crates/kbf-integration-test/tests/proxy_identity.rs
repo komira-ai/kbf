@@ -20,7 +20,6 @@ use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_proxy::config::ProxyConfig;
 use kbf_proxy::control::NoUpdates;
-use kbf_proxy::slot::Slot;
 use kbf_proxy::{Proxy, ProxyHandle};
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL};
 use kbf_server::members_rpc::MembershipService;
@@ -197,7 +196,8 @@ fn private(path: &Path, content: &[u8]) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
 }
 
-/// A proxy over `base`'s ports, with slot A active; `leaf` is its server certificate.
+/// A proxy over a pool of the one member whose ports start at `base`; its server certificate is
+/// issued by `pki`.
 fn start_proxy(dir: &Path, pki: &Pki, base: u16) -> (ProxyHandle, SocketAddr, PathBuf) {
     let server = pki.leaf("localhost", None, ExtendedKeyUsagePurpose::ServerAuth);
     private(&dir.join("server.pem"), server.cert.as_bytes());
@@ -212,7 +212,8 @@ fn start_proxy(dir: &Path, pki: &Pki, base: u16) -> (ProxyHandle, SocketAddr, Pa
     let public = socket.local_addr().expect("address");
     let config = ProxyConfig::from_toml_str(&format!(
         "operator_token_file = {:?}\nserver_cert_file = {:?}\nserver_key_file = {:?}\n\
-         client_ca_file = {:?}\nproxy_auth_file = {secret:?}\n[upstream]\nbase_port = {base}\n",
+         client_ca_file = {:?}\nproxy_auth_file = {secret:?}\n\
+         [[frontend]]\nname = \"a\"\nbase_port = {base}\n",
         dir.join("operator.token"),
         dir.join("server.pem"),
         dir.join("server.key"),
@@ -221,8 +222,6 @@ fn start_proxy(dir: &Path, pki: &Pki, base: u16) -> (ProxyHandle, SocketAddr, Pa
     .expect("a valid table");
     let (handle, runner) = Proxy::bind(config, OwnedFd::from(socket)).expect("bind the proxy");
     std::thread::spawn(move || runner.run(NoUpdates));
-    handle.slots().adopt(Slot::A, None);
-    handle.slots().release_into(Slot::A).expect("A is open");
     (handle, public, secret)
 }
 
@@ -301,7 +300,7 @@ async fn rig(name: &str) -> Rig {
     let started = dir.path().to_path_buf();
     let pki = Arc::new(Pki::new());
     let for_proxy = Arc::clone(&pki);
-    // The child's port is the worker listener of slot A: base + 1.
+    // The child's port is the worker listener of the member: base + 1.
     let incoming = TcpIncoming::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("bind");
     let child = incoming.local_addr().expect("address");
     let base = child.port() - 1;

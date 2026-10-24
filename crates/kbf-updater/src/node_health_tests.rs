@@ -54,7 +54,7 @@ fn routes(table: Routes) -> FakeApi {
 
 fn api(server: &FakeApi, name: &str) -> OperatorApi {
     let token = file(&scratch(name), "token", TOKEN, 0o600);
-    OperatorApi::new(server.addr, token, None)
+    OperatorApi::new(server.addr, token)
         .expect("api")
         .with_timeout(Duration::from_millis(500))
 }
@@ -291,7 +291,6 @@ fn errors_are_of_the_right_kind_and_leak_nothing() {
         OperatorApi::new(
             closed_port(),
             file(&scratch("nh-dead"), "token", TOKEN, 0o600),
-            None,
         )
         .expect("api"),
         Arc::new(FakeInstaller::new(&Log::default())),
@@ -545,7 +544,7 @@ fn a_frontend_host_that_is_no_member_is_refused_without_asking_the_api() {
 /// Asserts that a roll over a frontend that is no pool member is refused at it: a roll over
 /// every host puts the frontend first, the roll fails at it with `swap_abandoned` and the
 /// refusal text before the installer is called, so the frontend is not changed. No host is
-/// installed, checked or asked about, the proxy's pool is not asked, and the operator API is
+/// installed, checked or asked about, and the operator API is
 /// not called.
 #[test]
 fn a_roll_with_a_frontend_that_is_no_member_fails_at_it_and_touches_no_host_after() {
@@ -557,7 +556,6 @@ fn a_roll_with_a_frontend_that_is_no_member_fails_at_it_and_touches_no_host_afte
         drain: Box::new(rig.drain.clone()),
         health: Box::new(adapter(&server, "nh-roll-fe")),
         clock: Box::new(rig.clock.clone()),
-        pool: Box::new(rig.pool.clone()),
         frontend: Box::new(rig.front.clone()),
     };
     let updater = Updater::open(inventory(), rig.store(), ports, Timing::default()).expect("open");

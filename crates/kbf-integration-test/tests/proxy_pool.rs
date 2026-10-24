@@ -1,5 +1,5 @@
 //! The front-door proxy in pool mode in front of two real `kbf` frontends, each over a real
-//! Postgres database of its own (a state store has one writer): one `Execute` is held open on a
+//! Postgres database of its own: one `Execute` is held open on a
 //! frontend, that frontend is drained through the proxy's admin API (`admin_listen`), and the
 //! open `Execute` is left alone while every new one goes to the other frontend.
 //!
@@ -7,8 +7,7 @@
 //! runs it, is a child process: a `kbf storage` node (shared by both frontends) and two `kbf
 //! frontend` processes, which are this test binary run through a link named `kbf` (the trick of
 //! `proxy_soak.rs`). Each frontend keeps its state in a Postgres database of the test's own,
-//! with the installer's schema applied: over one database the later frontend would take the
-//! store's generation and fence the first, which would refuse every `Execute`. Like every
+//! with the installer's schema applied. Like every
 //! Postgres test it needs a server and fails without one: `KBF_TEST_POSTGRES_URL` names a server
 //! the test may create a database on.
 //!
@@ -107,9 +106,8 @@ fn frontend(dir: &std::path::Path, name: &str, storage: &str, base: u16, flag: &
 /// client cancelling it: no worker runs it, so it has no result of its own to complete with.
 #[test]
 fn a_drained_frontend_keeps_its_execute_and_new_ones_go_to_the_other() {
-    // One database for each frontend, with the installer's schema: a state store has one writer
-    // (the generation fence), so a second frontend over the same database would fence the first,
-    // which would then refuse every Execute it is given (FAILED_PRECONDITION).
+    // One database for each frontend, with the installer's schema: the frontends share
+    // nothing but the storage node, so each one's state is its own.
     let (database_a, database_b) = (test_database(), test_database());
 
     // Declared before the children, so it drops after them: they are reaped before it is removed.
@@ -138,7 +136,6 @@ fn a_drained_frontend_keeps_its_execute_and_new_ones_go_to_the_other() {
     let admin_addr = admin_socket.local_addr().expect("addr");
     drop(admin_socket);
     let (mut proxy, pki) = proxy_config(&dir, base);
-    proxy.upstream = None;
     proxy.frontend = vec![
         Frontend {
             name: "a".to_owned(),
@@ -152,10 +149,6 @@ fn a_drained_frontend_keeps_its_execute_and_new_ones_go_to_the_other() {
     proxy.admin_listen = Some(admin_addr);
     proxy.check().expect("a valid pool table");
     let (handle, runner) = Proxy::bind(proxy, OwnedFd::from(public)).expect("bind");
-    assert!(
-        handle.startup_hold().is_none(),
-        "a pool starts with no hold"
-    );
     let serving = std::thread::spawn(move || runner.run(NoUpdates));
 
     let client_runtime = tokio::runtime::Builder::new_multi_thread()

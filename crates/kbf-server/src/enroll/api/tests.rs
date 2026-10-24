@@ -14,13 +14,14 @@ use kbf_enroll_registry::{
     EnrollRequest, IssuedRole, RegistryError, enroll_txn, list_nodes, list_tokens,
 };
 use kbf_state::fake::{Fake, Flaw};
-use kbf_state::{Fenced, ManualClock, Store, StoreError};
+use kbf_state::{ManualClock, Store, StoreError};
 use kbf_types::enroll_api::{NodeList, NodeRevoked, TokenCreated, TokenList, TokenRevoked};
 use kbf_types::{CaPin, NodeId, RefusalReason, Role, Token, TokenId, TokenSecret};
 use serde::de::DeserializeOwned;
 use sha2::{Digest as _, Sha256};
 
 use super::*;
+use crate::enroll::testkit::WritesFenced;
 use crate::enroll::{OsRandom, PinError, PinSource, Random};
 
 const BEARER: &str = "operator-token-0123456789abcdef0123456789";
@@ -299,6 +300,7 @@ async fn the_secret_is_in_the_create_response_only() {
     let mut want = vec![
         "id",
         "roles",
+        "host_role",
         "max_uses",
         "uses",
         "expires_at",
@@ -522,18 +524,17 @@ async fn a_node_revoke_writes_deny_rows_and_burns_the_id() {
     assert_eq!(with(r#"{"x":1}"#).await.status(), StatusCode::BAD_REQUEST);
 }
 
-// Catches a write that does not go through the fenced handle (a demoted or stale frontend
-// signing a token the new signer does not know about) or that answers the fence as a 500
-// or as success: a stale handle's create, DELETE and revoke land nothing and answer 409;
-// the current handle's calls, the control, succeed; reads are not fenced. The two
-// frontends draw from different random streams (see `state_over_from`): with the same
-// stream the stale create would collide with the current one's token id and answer 400.
+/// Asserts that a store that refuses every write as one of a superseded handle
+/// (`StoreError::Fenced`) is answered with 409 "not the signer", not as a 500 or as
+/// success: a stale handle's create, DELETE and revoke land nothing; the calls through a
+/// handle the store lets write, the control, succeed; reads are not refused. The two
+/// frontends draw from different random streams (see `state_over_from`).
 #[tokio::test]
 async fn a_stale_frontend_cannot_write() {
     let inner = fake();
     let as_store = || -> Arc<dyn Store> { inner.clone() };
-    let stale: Arc<dyn Store> = Arc::new(Fenced::take(as_store(), None).expect("first"));
-    let newer: Arc<dyn Store> = Arc::new(Fenced::take(as_store(), None).expect("second"));
+    let stale: Arc<dyn Store> = Arc::new(WritesFenced(as_store()));
+    let newer = as_store();
     let (old_state, new_state) = (state_over_from(stale, 100), state_over(newer.clone()));
 
     let created = make(&new_state, r#"{"roles":["daemon"]}"#).await;
@@ -590,6 +591,14 @@ async fn a_bad_create_is_refused_and_stores_nothing() {
         format!(r#"{{"roles":["daemon"],"expires_in":{}}}"#, 30 * day + 1),
         r#"{"roles":["daemon"],"node_id":"Bad_ID"}"#.to_owned(),
         r#"{"roles":["daemon"],"max_use":3}"#.to_owned(),
+        // An updater's token names its host role, its one node, and has one use; the host
+        // role goes with no other role.
+        r#"{"roles":["updater"],"node_id":"n7"}"#.to_owned(),
+        r#"{"roles":["updater"],"host_role":"daemon"}"#.to_owned(),
+        r#"{"roles":["updater"],"host_role":"nope","node_id":"n7"}"#.to_owned(),
+        r#"{"roles":["updater"],"host_role":"daemon","node_id":"n7","max_uses":2}"#.to_owned(),
+        r#"{"roles":["updater","daemon"],"host_role":"daemon","node_id":"n7"}"#.to_owned(),
+        r#"{"roles":["daemon"],"host_role":"daemon"}"#.to_owned(),
     ];
     for body in bodies {
         let (code, answer) = text(ok(&state, &Route::Create(body.clone())).await).await;
@@ -612,6 +621,23 @@ async fn a_bad_create_is_refused_and_stores_nothing() {
     assert_eq!(info.names, [".example"]);
     assert!(info.replace);
     assert_eq!(info.created_by, "operator-api");
+
+    let updater = make(
+        &state,
+        r#"{"roles":["updater"],"host_role":"mac-daemon","node_id":"host-3"}"#,
+    )
+    .await;
+    assert_eq!(updater.info.roles, ["updater"]);
+    assert_eq!(updater.info.host_role.as_deref(), Some("mac-daemon"));
+    assert_eq!(updater.info.node_id.as_deref(), Some("host-3"));
+    assert_eq!(updater.info.max_uses, 1);
+    let (_, list): (_, TokenList) = json(ok(&state, &Route::List).await).await;
+    let listed = list
+        .tokens
+        .iter()
+        .find(|t| t.id == updater.info.id)
+        .expect("listed");
+    assert_eq!(listed.host_role.as_deref(), Some("mac-daemon"));
 }
 
 // Catches a token stored before the pin or the randomness is known (a row whose string

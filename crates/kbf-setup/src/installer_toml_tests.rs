@@ -419,8 +419,8 @@ fn a_syntax_error_names_the_line_it_starts_on() {
     );
 }
 
-/// The `installer.toml` of a proxy host, as `setup --proxy` writes it with every flag at its
-/// default.
+/// The `installer.toml` of a proxy host, as an earlier build's `setup --proxy` wrote it with
+/// every flag at its default (the slot table, which the reader still takes).
 const PROXY_HOST: &str = include_str!("../tests/golden/proxy_host/installer.toml");
 
 /// The `installer.toml` of an all-in-one host: the release-source keys, `database`,
@@ -559,7 +559,8 @@ server_cert_file = "/etc/kbf/tls/server.pem"
 server_key_file = "/etc/kbf/tls/server.key"
 client_ca_file = "/etc/kbf/tls/ca.pem"
 
-[proxy.upstream]
+[[proxy.frontend]]
+name = "a"
 base_port = 18000
 "#;
 
@@ -574,10 +575,8 @@ fn the_proxy_table_survives_a_render() {
     let text = parsed.render();
     assert_eq!(InstallerToml::parse(&text).expect("parses back"), parsed);
     assert_eq!(InstallerToml::parse(&text).unwrap().render(), text);
-    assert!(
-        text.contains("\n[proxy]\n") && text.contains("[proxy.upstream]"),
-        "{text}"
-    );
+    assert!(text.contains("\n[proxy]\n"), "{text}");
+    assert!(text.contains("[[proxy.frontend]]"), "{text}");
 }
 
 /// Catches `listen` reaching the file unchecked, and the message echoing the value: the

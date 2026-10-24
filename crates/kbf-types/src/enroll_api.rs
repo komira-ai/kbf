@@ -18,8 +18,12 @@ const fn one() -> u32 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TokenCreate {
-    /// The roles it grants: `storage`, `daemon`.
+    /// The roles it grants: `storage`, `daemon`, or `updater` alone.
     pub roles: Vec<String>,
+    /// What the host runs (`frontend`, `storage`, `daemon` or `mac-daemon`): required with
+    /// the role `updater`, which puts it in the host's certificate, and refused otherwise.
+    #[serde(default)]
+    pub host_role: Option<String>,
     /// How many nodes it can enroll: 1 to 1000. One when absent.
     #[serde(default = "one")]
     pub max_uses: u32,
@@ -51,6 +55,9 @@ pub struct TokenInfo {
     pub id: String,
     /// The roles it grants.
     pub roles: Vec<String>,
+    /// What the host runs, for a token that grants `updater`.
+    #[serde(default)]
+    pub host_role: Option<String>,
     /// Uses allowed.
     pub max_uses: u32,
     /// Uses consumed.
@@ -159,6 +166,7 @@ mod tests {
         TokenInfo {
             id: "aaaaaaaaaaaa".to_owned(),
             roles: vec!["storage".to_owned()],
+            host_role: Some("daemon".to_owned()),
             max_uses: 2,
             uses: 1,
             expires_at: 20,
@@ -224,6 +232,7 @@ mod tests {
             want,
             TokenCreate {
                 roles: vec!["daemon".to_owned()],
+                host_role: None,
                 max_uses: 1,
                 expires_in: None,
                 node_id: None,

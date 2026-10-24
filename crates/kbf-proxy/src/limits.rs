@@ -1,9 +1,9 @@
 //! The h2 builders of both sides, and the flood limits, in one place (design note sections
-//! 10 and 18).
+//! 4 and 10).
 //!
 //! The flow-control numbers are the same everywhere: one [`STREAM_WINDOW_BYTES`] window for
-//! every stream, and a connection window of a thousand of them, so held bodies cannot use up
-//! a connection's credit. Adaptive BDP is off: it would grow windows the memory budget
+//! every stream, and a connection window of a thousand of them, so one connection's streams
+//! cannot use up its credit. Adaptive BDP is off: it would grow windows the memory budget
 //! (`Limits::worst_case_bytes`) assumes are fixed.
 //!
 //! The flood limits are derived from the 1000-stream cap and not left at h2's defaults (about
@@ -21,8 +21,14 @@ use hyper::server::conn::http2;
 use hyper_util::rt::TokioExecutor;
 
 use crate::config::Limits;
-use crate::hold::STREAM_WINDOW_BYTES;
 use crate::keepalive;
+
+/// The cap on a request's header list, which sits outside the stream window.
+pub const HEADER_BYTES: u64 = 16 * 1024;
+/// The one initial h2 window of every stream in both directions (h2 0.4.20 cannot raise one
+/// stream's window after the fact). A single upload is capped near `window / RTT`: 5 MB/s at
+/// 50 ms, 250 MB/s at 1 ms.
+pub const STREAM_WINDOW_BYTES: u32 = 256 * 1024;
 
 /// The streams one downstream connection may have open at once. The connection window is this
 /// many stream windows (design note section 4).

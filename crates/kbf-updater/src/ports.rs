@@ -1,8 +1,8 @@
 //! The ports of the roll: everything the state machine asks of the outside world. The real
 //! adapters are [`crate::safe_http`] (safe-to-stop), [`crate::ssh_installer`] (install),
-//! [`crate::node_drain`] (drain), [`crate::node_health`] (health), [`crate::pool_http`] (the
-//! proxy's pool) and [`crate::frontend_http`] (a frontend member's own API).
-//! [`crate::fakes`] has one scripted fake per port.
+//! [`crate::node_drain`] (drain), [`crate::node_health`] (health) and
+//! [`crate::frontend_http`] (a frontend member's own API). [`crate::fakes`] has one scripted
+//! fake per port.
 //!
 //! The traits are synchronous: a roll is one host at a time and waits on each answer, so
 //! there is nothing to overlap, and a caller runs [`crate::Updater::drive`] on its own thread.
@@ -30,6 +30,7 @@ pub enum PortErrorKind {
 pub struct PortError {
     kind: PortErrorKind,
     text: String,
+    refused: bool,
 }
 
 impl PortError {
@@ -38,6 +39,18 @@ impl PortError {
         PortError {
             kind: PortErrorKind::Unreachable,
             text: text.into(),
+            refused: false,
+        }
+    }
+
+    /// No answer because nothing listens at the address: the connection was refused. It is an
+    /// [`PortErrorKind::Unreachable`] error that [`PortError::is_refused`] tells from a timeout
+    /// and from a 5xx, which a process that is still running can give.
+    pub fn refused(text: impl Into<String>) -> PortError {
+        PortError {
+            kind: PortErrorKind::Unreachable,
+            text: text.into(),
+            refused: true,
         }
     }
 
@@ -46,6 +59,7 @@ impl PortError {
         PortError {
             kind: PortErrorKind::Other,
             text: text.into(),
+            refused: false,
         }
     }
 
@@ -55,6 +69,11 @@ impl PortError {
 
     pub fn is_unreachable(&self) -> bool {
         self.kind == PortErrorKind::Unreachable
+    }
+
+    /// Whether the connection was refused: nothing listens there.
+    pub fn is_refused(&self) -> bool {
+        self.refused
     }
 }
 
@@ -195,64 +214,40 @@ pub trait Drain: Send + Sync {
     fn undrain(&self, host: &Host) -> Result<(), PortError>;
 }
 
-/// One member of the kbf-proxy pool, as the proxy's admin API lists it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PoolMember {
-    /// The name the proxy knows it by: the `instance` of its inventory line.
-    pub name: String,
-    /// It takes no new stream: it was drained, or is in a state this build does not know.
-    pub draining: bool,
-    /// The proxy's probe of it passes.
-    pub ready: bool,
-    /// Streams open on its REAPI listener.
-    pub reapi_streams: u64,
-    /// Streams open on its operator listener.
-    pub operator_streams: u64,
-}
-
-impl PoolMember {
-    /// Whether the proxy gives it new streams and expects them answered: up and ready.
-    pub fn serves(&self) -> bool {
-        !self.draining & self.ready
-    }
-
-    /// The streams a restart would cut: those open on its REAPI and operator listeners.
-    pub fn streams(&self) -> u64 {
-        self.reapi_streams + self.operator_streams
-    }
-}
-
-/// The pool of frontends that kbf-proxy balances over, through its loopback admin API.
-pub trait Pool: Send + Sync {
-    /// Every member, as the proxy sees it now.
-    fn view(&self) -> Result<Vec<PoolMember>, PortError>;
-    /// Take the member `name` out of the pool: it takes no new stream, and the streams it has
-    /// go on. Doing it again changes nothing.
-    fn drain(&self, name: &str) -> Result<(), PortError>;
-    /// Put the member `name` back. Doing it again changes nothing.
-    fn undrain(&self, name: &str) -> Result<(), PortError>;
-}
-
-/// What a frontend says of its retire: `GET` and `POST /v1/frontend/retire`.
+/// What a frontend says of its own drain: `GET /v1/frontend/drain`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-pub struct RetireStatus {
-    /// The retire has completed and will not be undone.
-    pub retired: bool,
+pub struct DrainStatus {
+    /// A drain has begun. It is not undone: the frontend exits when it has ended.
+    pub draining: bool,
     /// Execute and WaitExecution streams open on it now.
-    pub open_streams: u64,
-    /// Worker sessions it holds.
-    pub open_sessions: u64,
+    pub open_executions: u64,
+    /// The frontend has ended its drain and is closing its streams, so that it exits: its
+    /// `phase` is `closing`. A frontend that reports no phase, or another one, is taken to be
+    /// draining until its operator API stops answering.
+    #[serde(default, rename = "phase", deserialize_with = "phase_is_closing")]
+    pub closing: bool,
+}
+
+/// Whether a drain `phase` (`serving`, `lb_wait`, `draining` or `closing`) is `closing`.
+fn phase_is_closing<'de, D: serde::Deserializer<'de>>(phase: D) -> Result<bool, D::Error> {
+    let phase: Option<String> = Option::deserialize(phase)?;
+    Ok(phase.as_deref() == Some("closing"))
 }
 
 /// A frontend pool member's own operator API, reached on loopback at the member's ports.
 pub trait FrontendControl: Send + Sync {
-    /// Begin the member's retire and return when it has ended, with the status then. Doing it
-    /// again answers the same status. A retire is not undone: the unit is restarted after it.
-    fn retire(&self, host: &Host) -> Result<RetireStatus, PortError>;
-    /// The member's retire as it is now.
-    fn retire_status(&self, host: &Host) -> Result<RetireStatus, PortError>;
     /// The commit the member's binary was built from.
     fn commit(&self, host: &Host) -> Result<String, PortError>;
+    /// Begin the member's own drain (`POST /v1/frontend/drain`): it answers `/readyz` 503,
+    /// refuses new work, waits for the executions open on it and exits. Doing it again changes
+    /// nothing. A member that is not running answers
+    /// with an error for which [`PortError::is_refused`] is true.
+    fn drain(&self, host: &Host) -> Result<(), PortError>;
+    /// The member's drain as it is now (`GET /v1/frontend/drain`). A member that has exited
+    /// answers with an error for which [`PortError::is_refused`] is true.
+    fn drain_status(&self, host: &Host) -> Result<DrainStatus, PortError>;
+    /// Whether the member's `GET /readyz` answers 200 (`true`) or 503 (`false`).
+    fn ready(&self, host: &Host) -> Result<bool, PortError>;
 }
 
 /// Whether a host runs the target yet.
@@ -435,23 +430,6 @@ mod tests {
         assert_eq!(own.report(&host), refused("report"));
     }
 
-    /// Asserts that a pool member serves only when it is up and ready, whichever of the two
-    /// is missing, and that its streams are those of its REAPI and operator listeners.
-    #[test]
-    fn a_pool_member_serves_when_up_and_ready_and_counts_two_listeners() {
-        let member = |draining, ready| PoolMember {
-            name: "a".to_owned(),
-            draining,
-            ready,
-            reapi_streams: 2,
-            operator_streams: 3,
-        };
-        assert!(member(false, true).serves());
-        assert!(!member(true, true).serves());
-        assert!(!member(false, false).serves());
-        assert_eq!(member(false, true).streams(), 5);
-    }
-
     /// Catches a kind that is lost or shown wrongly: the tuple-style call is `Other`, the
     /// constructors set their kind, and only `Unreachable` is announced in the text.
     #[test]
@@ -465,5 +443,47 @@ mod tests {
         assert!(gone.is_unreachable());
         assert_eq!(gone.to_string(), "unreachable: ssh: timed out");
         assert_ne!(gone, PortError::other("ssh: timed out"));
+    }
+
+    /// Asserts that a refused connection is an unreachable error that says it was refused, that
+    /// it reads like any unreachable error, and that the other constructors are not refused: a
+    /// timeout, a 5xx and an answer that says no are a process that may be running.
+    #[test]
+    fn a_refused_connection_is_unreachable_and_is_told_from_a_timeout() {
+        let closed = PortError::refused("the operator API: connection refused");
+        assert_eq!(closed.kind(), PortErrorKind::Unreachable);
+        assert!(closed.is_unreachable());
+        assert!(closed.is_refused());
+        assert_eq!(
+            closed.to_string(),
+            "unreachable: the operator API: connection refused"
+        );
+        assert!(!PortError::unreachable("timed out").is_refused());
+        assert!(!PortError::other("no").is_refused());
+        assert!(!PortError("no".into()).is_refused());
+        assert_ne!(closed, PortError::unreachable(closed.text.clone()));
+    }
+
+    /// Asserts that a drain status reads the fields the frontend answers with, ignores the ones
+    /// it does not know, and takes a frontend that does not report the `closing` phase to be not closing.
+    #[test]
+    fn a_drain_status_reads_the_frontends_answer() {
+        let plain = r#"{"draining":true,"open_executions":3,"queued_operations":1}"#;
+        let status: DrainStatus = serde_json::from_str(plain).expect("status");
+        assert_eq!(
+            status,
+            DrainStatus {
+                draining: true,
+                open_executions: 3,
+                closing: false
+            }
+        );
+        let closing = r#"{"draining":true,"open_executions":0,"phase":"closing"}"#;
+        let status: DrainStatus = serde_json::from_str(closing).expect("status");
+        assert!(status.closing);
+        let waiting = r#"{"draining":true,"open_executions":2,"phase":"draining"}"#;
+        let status: DrainStatus = serde_json::from_str(waiting).expect("status");
+        assert!(!status.closing);
+        assert!(serde_json::from_str::<DrainStatus>("{}").is_err());
     }
 }

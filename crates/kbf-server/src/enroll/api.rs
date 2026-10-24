@@ -39,7 +39,7 @@ use kbf_state::{Store, StoreError};
 use kbf_types::enroll_api::{
     NodeInfo, NodeList, NodeRevoked, TokenCreate, TokenCreated, TokenInfo, TokenList, TokenRevoked,
 };
-use kbf_types::{NodeId, RoleSet, Token, TokenId, TokenSecret};
+use kbf_types::{HostRole, NodeId, RoleSet, Token, TokenId, TokenSecret};
 use serde::{Deserialize, Serialize};
 
 use super::{PinSource, Random};
@@ -276,6 +276,7 @@ fn token_dto(info: &kbf_enroll_registry::TokenInfo) -> TokenInfo {
     TokenInfo {
         id: info.id.to_string(),
         roles: info.roles.iter().map(|r| r.name().to_owned()).collect(),
+        host_role: info.host_role.map(|role| role.name().to_owned()),
         max_uses: info.max_uses,
         uses: info.uses,
         expires_at: info.expires_at,
@@ -316,6 +317,12 @@ fn node_dto(info: &kbf_enroll_registry::NodeInfo) -> NodeInfo {
 fn make_token(api: &EnrollApi, request: TokenCreate) -> Result<TokenCreated, Failure> {
     let roles = RoleSet::from_names(request.roles.iter().map(String::as_str))
         .map_err(|e| bad(e.to_string()))?;
+    let host_role = request
+        .host_role
+        .as_deref()
+        .map(str::parse::<HostRole>)
+        .transpose()
+        .map_err(|e| bad(format!("host_role: {e}")))?;
     let node_id = request
         .node_id
         .as_deref()
@@ -324,6 +331,7 @@ fn make_token(api: &EnrollApi, request: TokenCreate) -> Result<TokenCreated, Fai
         .map_err(|e| bad(format!("node_id: {e}")))?;
     let spec = TokenSpec {
         roles,
+        host_role,
         max_uses: request.max_uses,
         ttl: request.expires_in.map(Duration::from_secs),
         node_id,

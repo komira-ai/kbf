@@ -15,14 +15,18 @@
 //! - **C8** a bounded, ordered range scan under a prefix, between two bounds, forward or
 //!   in reverse, that pages with a [`ResumeToken`] ([`Store::scan_range`], [`ScanRange`]).
 //!
-//! **Fencing** ([`Fenced`]): a writer takes the store's generation, one row, when its
-//! role begins, and every write it makes checks the row in the same transaction. A
-//! writer that began later makes every write of an earlier one fail, so two never act.
-//! Frontends that share a store take no generation: [`share`] leaves the row holding
-//! [`SHARED_WRITERS`], which no generation can be read from, so a writer that takes
-//! generations is refused by the store and none is started beside the sharing frontends.
+//! **Shared writers**: frontends that share a store take no generation. [`share`] leaves
+//! the row [`GENERATION`] holding [`SHARED_WRITERS`], which no generation can be read from,
+//! so an older build that takes generations is refused by the store and none is started
+//! beside the sharing frontends.
 //!
 //! With the `postgres` feature, [`postgres`] is the Postgres backend.
+//!
+//! **The pack index** ([`pack_index`], [`PackIndex`]) records where each blob lies inside a
+//! pack, in tables of the Postgres schema that are outside the key/value and feed tables and
+//! outside the commit head. It is a separate typed API beside [`Store`]: a Postgres store
+//! opens one with `postgres::PostgresPackIndex`, and `pack_index::memory` (feature
+//! `test-support`) is the in-memory index; the same conformance clauses run against both.
 //!
 //! With the `test-support` feature (and in this crate's own unit tests) `conformance`
 //! states each clause as a function generic over a `conformance::Backend` factory, and
@@ -35,12 +39,12 @@ pub mod clock;
 pub mod conformance;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
-mod fence;
-mod own_keys;
+pub mod pack_index;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(any(test, feature = "test-support"))]
 pub mod recording;
+mod shared;
 pub mod sqlite;
 mod store;
 mod types;
@@ -48,9 +52,12 @@ mod types;
 use std::time::Duration;
 
 pub use clock::{Clock, ManualClock, StoreTime, SystemClock};
-pub use fence::{Fenced, GENERATION, SHARED_WRITERS, TakeError, decode_generation, share};
-pub use own_keys::{OwnKeys, Permit};
-pub use store::{Announcement, LivenessGuard, Store};
+pub use pack_index::{
+    BlobDigest, Location, MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo,
+    Recorded,
+};
+pub use shared::{GENERATION, SHARED_WRITERS, share};
+pub use store::Store;
 pub use types::{
     Change, Changes, Commit, CommitStats, Cond, Conflict, Direction, Event, Op, ResumeToken,
     Revision, ScanPage, ScanRange, StoreError, Txn, Version, Versioned,

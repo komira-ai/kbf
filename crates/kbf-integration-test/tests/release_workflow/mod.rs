@@ -12,13 +12,19 @@
 //! - **The graph.** The jobs [`JOBS`], in that order, each with exactly the `needs`, token
 //!   scopes, `if:` and `environment` of [`RULES`]; the jobs that write need `plan` and `verify`,
 //!   directly or through another. Only `publish` holds a write scope (`contents`), `id-token` is
-//!   in no job ([`ID_TOKEN`]), and the jobs that tag, publish or bump run only under
-//!   [`RELEASE_IF`]: a successful pipeline run for a push to `main` of code that is not a change
-//!   to the pipeline.
+//!   held by `deploy` alone ([`ID_TOKEN`]), and the jobs that tag, publish, bump or deploy run
+//!   only under [`RELEASE_IF`]: a successful pipeline run for a push to `main` of code that is
+//!   not a change to the pipeline.
 //! - **Never cancelled, never queued behind a skipped run.** The concurrency group is `release`
 //!   for a successful pipeline run and the run's own for any other (a cancelled or red pipeline
 //!   run starts this workflow too, to skip it, and must not replace a release waiting in the
 //!   group), and it never cancels.
+//! - **The deploy step.** `deploy` needs `plan` and `publish` (it runs after the release is
+//!   published), holds `contents: read` and `id-token: write` and no secret, and reads the
+//!   coordinator's address from the repository variable `KBF_COORDINATOR_URL` alone: no address
+//!   is written in the file and no other job reads the variable ([`DEPLOY_URL`]). Its one
+//!   `deploy-farm` step is given the release's version and that address, and has no `if:` (an
+//!   unset variable is a notice from the verb, not a skipped step).
 //! - **Halt on red.** No `always()`, `failure()`, `cancelled()` or `continue-on-error`, and no
 //!   step under `if:` but the ones of `notes` that read the previous release.
 //! - **One commit.** The workflow sets `COMMIT` to the commit the pipeline run built and
@@ -34,7 +40,8 @@
 //!   pipeline run left for it; `verify` downloads the files of the pipeline run that started this
 //!   one and no other; `tag` writes the record from that run and tags the planned tag at
 //!   `COMMIT` with that record; `notes` checks the tag and writes the notes and the set hash;
-//!   `publish` is given those, the planned tag and `COMMIT`; `bump` is given the planned version.
+//!   `publish` is given those, the planned tag and `COMMIT`; `bump` and `deploy` are given the
+//!   planned version.
 //!   Only `plan` and `verify` read another run's artifacts; every later job takes what `verify`
 //!   checked. Each flag below is held to the value that makes it mean what its verb says.
 //! - **The shared rules.** Actions pinned to a full commit SHA, hosted runners and an empty
@@ -46,8 +53,15 @@ use super::workflows;
 /// The job that holds the write scope and creates the GitHub release.
 const PUBLISH: &str = "publish";
 
+/// The job that sets the published release as the farm's desired version and waits.
+const DEPLOY: &str = "deploy";
+
+/// The repository variable that holds the coordinator's address, and the one environment
+/// variable of `deploy` it is read into.
+const DEPLOY_URL: &str = "vars.KBF_COORDINATOR_URL";
+
 /// The jobs, in file order.
-const JOBS: [&str; 6] = ["plan", "verify", "tag", "notes", PUBLISH, "bump"];
+const JOBS: [&str; 7] = ["plan", "verify", "tag", "notes", PUBLISH, "bump", DEPLOY];
 
 /// The events that start the workflow: the completion of a run of [`PIPELINE`], filtered to
 /// [`TYPES`] and `branches: [main]`, and only while [`CHAIN`] is whole.
@@ -85,9 +99,9 @@ pub const RELEASE_IF: &str = "${{ github.event.workflow_run.conclusion == 'succe
 /// repository.
 pub const PLAN_IF: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository }}";
 
-/// The jobs that may hold `id-token: write`: none (the kbf.dev upload is a later change that
-/// adds its job here).
-const ID_TOKEN: &[&str] = &[];
+/// The jobs that may hold `id-token: write`: the deploy step, which presents the token to the
+/// farm's update coordinator and signs nothing.
+const ID_TOKEN: &[&str] = &[DEPLOY];
 
 /// The `(job, scope)` pairs that may be `write`.
 const WRITERS: &[(&str, &str)] = &[(PUBLISH, "contents")];
@@ -107,7 +121,7 @@ const READ: &[(&str, &str)] = &[
     ("attestations", "read"),
 ];
 
-const RULES: [Rule; 6] = [
+const RULES: [Rule; 7] = [
     Rule {
         job: "plan",
         needs: &[],
@@ -150,6 +164,13 @@ const RULES: [Rule; 6] = [
         condition: Some(RELEASE_IF),
         environment: Some(ENVIRONMENT),
     },
+    Rule {
+        job: DEPLOY,
+        needs: &["plan", PUBLISH],
+        permissions: &[("contents", "read"), ("id-token", "write")],
+        condition: Some(RELEASE_IF),
+        environment: Some(ENVIRONMENT),
+    },
 ];
 
 /// The jobs that read the release bot's key and mint its token.
@@ -159,7 +180,7 @@ const APP_TOKEN: &str = "actions/create-github-app-token@";
 /// The jobs that write must (transitively) need these.
 const GATING: &[&str] = &["plan", "verify"];
 /// The jobs that write, or hold a token that can.
-const WRITING: &[&str] = &["tag", "notes", PUBLISH, "bump"];
+const WRITING: &[&str] = &["tag", "notes", PUBLISH, "bump", DEPLOY];
 
 /// The group and the no-cancel of the one release at a time. A pipeline run that did not
 /// succeed starts this workflow too (every job skips); its group is its own, so it never
@@ -286,6 +307,7 @@ pub fn problems(release: &str) -> Result<Vec<String>, String> {
     notes_job(release, &mut out)?;
     publish_job(release, &mut out)?;
     bump_job(release, &mut out)?;
+    deploy_job(release, &mut out)?;
     // The shared rules, as the workflow lint reads them (pins, runners, permissions).
     out.extend(
         workflows::scan(release, &workflows::Repo::default())
@@ -933,6 +955,60 @@ fn bump_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         bot.id.as_deref().unwrap_or("")
     );
     env_is(job, bs, "GH_TOKEN", &want, out);
+    Ok(())
+}
+
+/// The deploy step: the address from the repository variable alone, in no other job and in
+/// no literal, the release's version, and the one verb unconditionally.
+fn deploy_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
+    let job = DEPLOY;
+    let steps = workflows::job_steps(release, job)?;
+    for other in JOBS.iter().filter(|j| **j != job) {
+        if job_text(release, other).contains(DEPLOY_URL) {
+            out.push(format!(
+                "the job `{other}` reads `{DEPLOY_URL}`: the coordinator's address is `{job}`'s alone"
+            ));
+        }
+    }
+    let text = job_text(release, job);
+    if text.contains("http://") || text.contains("https://") {
+        out.push(format!(
+            "the job `{job}` writes an address: the coordinator's is the repository variable `{DEPLOY_URL}`, never a literal"
+        ));
+    }
+    if text.contains("secrets.") {
+        out.push(format!(
+            "the job `{job}` reads a secret: it holds the run's OIDC token and nothing else"
+        ));
+    }
+    let Some((_, step, words)) = run_of(job, &steps, "cargo xtask deploy-farm ", out) else {
+        return Ok(());
+    };
+    let verb = "cargo xtask deploy-farm";
+    flag_is(&words, verb, "--url", "$COORDINATOR_URL", out);
+    flag_is(&words, verb, "--ca-pem", "$COORDINATOR_CA", out);
+    flag_is(&words, verb, "--version", "$VERSION", out);
+    env_is(
+        job,
+        step,
+        "COORDINATOR_CA",
+        "${{ vars.KBF_COORDINATOR_CA }}",
+        out,
+    );
+    env_is(
+        job,
+        step,
+        "COORDINATOR_URL",
+        &format!("${{{{ {DEPLOY_URL} }}}}"),
+        out,
+    );
+    env_is(
+        job,
+        step,
+        "VERSION",
+        "${{ needs.plan.outputs.version }}",
+        out,
+    );
     Ok(())
 }
 

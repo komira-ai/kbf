@@ -93,6 +93,13 @@ fn each_package_unit_runs_one_boot_check_for_its_own_mode_that_kbfs_own_parser_t
         let line = format!("+/usr/bin/kbf boot-check {flag}");
         assert_eq!(first, line, "{mode}");
         let argv = ["kbf", "boot-check", flag.as_str()].map(OsString::from);
+        if mode == kbf_cli::names::ALL_IN_ONE {
+            // The unit is kept for one release; `kbf` refuses the mode it names.
+            let e = kbf_cli::boot_check::parse(&argv).expect_err("refused");
+            assert!(e.to_string().contains(kbf_cli::ALL_IN_ONE_REMOVED), "{e}");
+            checked += 1;
+            continue;
+        }
         let parsed = kbf_cli::boot_check::parse(&argv).unwrap_or_else(|e| panic!("{mode}: {e}"));
         assert_eq!(parsed.mode, mode);
         let default = Path::new(kbf_cli::boot_check::DEFAULT_INSTALLER_CONFIG);
@@ -115,6 +122,18 @@ fn each_package_unit_command_line_parses_with_kbfs_own_parser() {
     let config = frontend_config(&dir);
     for (mode, text) in units() {
         let lines = kbf_lines(&text);
+        if mode == kbf_cli::names::ALL_IN_ONE {
+            // The unit is kept for one release; `kbf` refuses the mode it names.
+            for line in lines {
+                let argv: Vec<OsString> = std::iter::once("kbf".to_owned())
+                    .chain(line)
+                    .map(OsString::from)
+                    .collect();
+                let e = kbf_cli::parse_from(argv).expect_err("refused");
+                assert!(e.to_string().contains(kbf_cli::ALL_IN_ONE_REMOVED), "{e}");
+            }
+            continue;
+        }
         assert!(
             lines.len() >= 2,
             "{mode}: fewer kbf lines than a check and a start"
@@ -179,9 +198,8 @@ fn argv_with(words: &[String], config: &Path) -> Vec<OsString> {
 /// Catches the plain frontend unit's command lines (`kbf-frontend.service`, for a host
 /// without the proxy) that `kbf`'s own parser refuses: both the `--check` line and the
 /// start, with the host's `kbf.toml` replaced by one that stands for the frontend, must
-/// parse to the frontend, the start not as a check. The defects, planted in the unit's
-/// own start line, must each be refused by that parser: a mode that does not exist, and
-/// `--instance` without `--handover-socket` (kbf refuses it).
+/// parse to the frontend, the start not as a check. A mode that does not exist, put in the
+/// unit's own start line, must be refused by that parser.
 #[test]
 fn the_plain_frontend_unit_command_lines_parse_with_kbfs_own_parser() {
     let (_, text) = units()
@@ -210,9 +228,5 @@ fn the_plain_frontend_unit_command_lines_parse_with_kbfs_own_parser() {
     assert!(
         refused(&|w| w[0] = "--mode=no-such-mode".into()),
         "an unknown mode parsed"
-    );
-    assert!(
-        refused(&|w| w.push("--instance=a".into())),
-        "--instance without --handover-socket parsed"
     );
 }

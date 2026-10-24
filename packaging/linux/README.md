@@ -11,7 +11,7 @@ pkg-config` writes (for both packages): this directory holds the inputs, and
 
 | path | what |
 |---|---|
-| `sysusers.d/kbf-installer.conf` | the users `kbf`, `kbf-server`, `kbf-fetch`, `kbf-signer` (no login); installed to `/usr/lib/sysusers.d` |
+| `sysusers.d/kbf-installer.conf` | the users `kbf`, `kbf-server`, `kbf-fetch`, `kbf-signer` (no login) and the group `kbf-signer-clients` (the signer and `kbf-server` are its members: see `kbf-signer --client-group`); installed to `/usr/lib/sysusers.d` |
 | `tmpfiles.d/kbf-installer.conf` | `/run/kbf-installer` (0755), `/var/cache/kbf-fetch` (0711); the units author's file, packaged unchanged; installed to `/usr/lib/tmpfiles.d` |
 | `needrestart/kbf.conf` | tells needrestart never to restart a unit named `kbf-*`, `kbf.*` or `kbf@*`; installed to `/etc/needrestart/conf.d/kbf.conf` (0644, a config file the host may edit) |
 | `units/` | the unit files (`kbf-*.service`, `kbf-*.socket`, `kbf.slice`), installed to `/usr/lib/systemd/system`: the five mode units go in the `kbf` package, the others in `kbf-installer`; `testdata/units` is the fixture for the unit tests only |
@@ -59,28 +59,28 @@ pkg-config` writes (for both packages): this directory holds the inputs, and
 
 ### Which frontend unit
 
-A frontend host enables exactly one of two units; they bind the same ports.
+A frontend host runs `kbf-frontend.service`, and may put `kbf-proxy` in front of the frontends.
 
-- `kbf-frontend.service`: a host **without** the frontend proxy. One process, `kbf
+- `kbf-frontend.service`: a frontend. One process, `kbf
   --mode=frontend --config /etc/kbf/kbf.toml`, run from `/usr/bin/kbf` (no slots, no
   `--instance`, no `--handover-socket`); listeners, state store and certificates are
   `kbf.toml`'s. An update is a restart after the `kbf` package is upgraded.
-- `kbf-proxy` (the unprivileged proxy that starts the frontend as its child, in the
-  `kbf-installer` package; its unit is not changed by the package split and runs its children
-  from the installer's release tree as before): a host **with** the proxy does not enable a
-  frontend unit.
+- `kbf-proxy` (the unprivileged proxy in the `kbf-installer` package: the public port and the
+  load balancer over the frontends of its pool, which run on their own; it starts none of
+  them).
 
 `pkg-config` refuses anything else in the unit directory (a unit named none of `kbf-*.service`,
 `kbf-*.socket` and `kbf.slice`, a fourth trust file, no unit of the `kbf-installer` package).
 
 The socket-handover template (`kbf-frontend@.service`, instances `a` and `b`) is no longer
-packaged: the proxy swaps frontend children instead, and a frontend with a Postgres store
-refuses a control socket.
+packaged: `kbf` serves no control socket
+(`--instance`, `--handover-socket` and the other flags of the removed handover are accepted,
+ignored and logged as retired).
 
 Dependencies: the `kbf-installer` deb `crun, uidmap, systemd, ca-certificates`; its rpm the same
-with Fedora's name for `uidmap`, `shadow-utils`. Never Podman, never Envoy (a test pins it): Envoy
-runs on frontend hosts only, is a host prerequisite, and nothing in these packages fetches or
-pins it. The `kbf` package adds only `kbf-installer`.
+with Fedora's name for `uidmap`, `shadow-utils`. Never Podman, never Envoy (a test pins it):
+nothing in these packages depends on, installs or checks Envoy, and kbf runs none. The `kbf`
+package adds only `kbf-installer`.
 
 ## Installing starts and enables nothing
 

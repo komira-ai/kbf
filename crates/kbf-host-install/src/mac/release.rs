@@ -12,6 +12,12 @@ pub const REPO: &str = "komira-ai/kbf";
 /// The platform of a Mac's release.
 pub const PLATFORM: &str = "darwin-arm64";
 
+/// The extension of a release tarball.
+pub const TARBALL_EXTENSION: &str = "tar.gz";
+
+/// The release's checksum file, which lists the sha256 of every other file.
+pub const SUMS_NAME: &str = "SHA256SUMS";
+
 /// How many hex digits of the commit a version carries.
 pub const PREFIX_LEN: usize = 12;
 
@@ -38,19 +44,73 @@ pub fn is_commit(text: &str) -> bool {
 
 /// The commit in a tarball's file name `kbf-<40 hex>-darwin-arm64.tar.gz`.
 pub fn commit_of_name(name: &str) -> Option<&str> {
+    commit_of_name_on(PLATFORM, name)
+}
+
+/// The commit in a tarball's file name `kbf-<40 hex>-<platform>.tar.gz`.
+pub fn commit_of_name_on<'a>(platform: &str, name: &'a str) -> Option<&'a str> {
+    commit_of_asset_on(platform, TARBALL_EXTENSION, name)
+}
+
+/// The commit in a release file's name `kbf-<40 hex>-<platform>.<extension>`.
+pub fn commit_of_asset_on<'a>(platform: &str, extension: &str, name: &'a str) -> Option<&'a str> {
     name.strip_prefix("kbf-")
-        .and_then(|rest| rest.strip_suffix(&format!("-{PLATFORM}.tar.gz")))
+        .and_then(|rest| rest.strip_suffix(&format!("-{platform}.{extension}")))
         .filter(|commit| is_commit(commit))
+}
+
+/// The sha256 that `sums` lists for the file `name`: the lines are `<64 hex>  <name>`.
+///
+/// # Errors
+/// [`PickError::Malformed`] for sums that are not such lines (or name a file twice),
+/// [`PickError::Unknown`] when `name` is not listed.
+pub fn listed_hash(sums: &str, name: &str) -> Result<String, PickError> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut found = None;
+    if !sums.is_empty() && !sums.ends_with('\n') {
+        return Err(PickError::Malformed);
+    }
+    for line in sums.lines() {
+        let (hash, file) = line.split_once("  ").ok_or(PickError::Malformed)?;
+        let hash_ok = hash.len() == 64 && hash.bytes().all(is_hex);
+        if !hash_ok || file.is_empty() || file.contains('/') || !seen.insert(file) {
+            return Err(PickError::Malformed);
+        }
+        if file == name {
+            found = Some(hash.to_owned());
+        }
+    }
+    found.ok_or(PickError::Unknown)
 }
 
 /// The tarball of `commit`.
 pub fn tarball_name(commit: &str) -> String {
-    format!("kbf-{commit}-{PLATFORM}.tar.gz")
+    tarball_name_on(PLATFORM, commit)
+}
+
+/// The tarball of `commit` for `platform`.
+pub fn tarball_name_on(platform: &str, commit: &str) -> String {
+    asset_name_on(platform, TARBALL_EXTENSION, commit)
+}
+
+/// The release file `kbf-<commit>-<platform>.<extension>`.
+pub fn asset_name_on(platform: &str, extension: &str, commit: &str) -> String {
+    format!("kbf-{commit}-{platform}.{extension}")
 }
 
 /// The attestation bundle of `commit`'s tarball.
 pub fn bundle_name(commit: &str) -> String {
-    format!("{}.sigstore.json", tarball_name(commit))
+    bundle_name_on(PLATFORM, commit)
+}
+
+/// The attestation bundle of `commit`'s tarball for `platform`.
+pub fn bundle_name_on(platform: &str, commit: &str) -> String {
+    bundle_of(&tarball_name_on(platform, commit))
+}
+
+/// The attestation bundle of the release file `asset`.
+pub fn bundle_of(asset: &str) -> String {
+    format!("{asset}.sigstore.json")
 }
 
 /// The release a version picks out.

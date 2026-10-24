@@ -181,13 +181,14 @@ fn a_run_that_stopped_at_the_database_is_finished_by_running_again() {
 
 /// Asserts that a database flag is accepted only where it means something: the two modes that
 /// keep state in Postgres take the local default when it is left out (the database `kbf` on the
-/// local socket, as the account the frontend runs as, marked as defaulted) and a given URL is
-/// not marked; the other modes refuse the flag; a password (the file is world-readable),
-/// another scheme or a character a TOML string would escape is refused; and the message never
-/// quotes the URL.
+/// local socket, as the account the mode's unit runs as, marked as defaulted) and a given URL is
+/// not marked; the other modes refuse the flag; a password (the file is world-readable), another
+/// scheme or a character a TOML string would escape is refused; and the message never quotes the
+/// URL.
 #[test]
 fn the_database_flag_defaults_where_there_is_state_and_is_refused_with_a_password() {
-    for mode in [Mode::Frontend, Mode::AllInOne] {
+    let local = "postgres:///kbf?host=/run/postgresql&user=kbf";
+    for (mode, default) in [(Mode::Frontend, DATABASE), (Mode::AllInOne, local)] {
         let mut r = raw(mode);
         let given = r.validate(Platform::Linux).expect("given");
         assert_eq!(given.database.as_deref(), Some(DATABASE));
@@ -195,7 +196,7 @@ fn the_database_flag_defaults_where_there_is_state_and_is_refused_with_a_passwor
         assert!(given.local_database.is_none());
         r.database = None;
         let left_out = r.validate(Platform::Linux).expect("the local default");
-        assert_eq!(left_out.database.as_deref(), Some(DATABASE));
+        assert_eq!(left_out.database.as_deref(), Some(default));
         assert!(left_out.database_defaulted);
         assert!(left_out.local_database.is_some());
     }
@@ -256,8 +257,7 @@ fn a_regular_file_shadowing_the_packaged_unit_stops_setup_before_any_step() {
         (Mode::StorageAndDaemon, "kbf-storage-and-daemon.service"),
         (Mode::Daemon, "kbf-daemon.service"),
         (Mode::Storage, "kbf-storage.service"),
-        (Mode::AllInOne, "kbf-storage-and-daemon.service"),
-        (Mode::AllInOne, "kbf-proxy.service"),
+        (Mode::AllInOne, "kbf-all-in-one.service"),
         (Mode::Frontend, "kbf-frontend.service"),
     ];
     for (mode, file) in cases {
@@ -398,10 +398,9 @@ fn setup_creates_the_schema_over_a_real_server() {
         apply: false,
         no_start: true,
     });
-    assert!(
-        dry.contains("dry run: would create the schema at version 1"),
-        "{dry}"
-    );
+    let latest = kbf_state::postgres::schema::latest();
+    let would = format!("dry run: would create the schema at version {latest}");
+    assert!(dry.contains(&would), "{dry}");
     let none = client
         .query(
             "SELECT 1 FROM pg_namespace WHERE nspname = 'kbf_state'",
@@ -410,9 +409,10 @@ fn setup_creates_the_schema_over_a_real_server() {
         .expect("catalog");
     assert!(none.is_empty(), "the dry run created the schema");
     let made = say(APPLY);
-    assert!(made.contains("created the schema at version 1"), "{made}");
+    let created = format!("created the schema at version {latest}");
+    assert!(made.contains(&created), "{made}");
     client
-        .query_one("SELECT version FROM kbf_state.schema_version", &[])
+        .query_one("SELECT max(version) FROM kbf_state.schema_version", &[])
         .expect("the version row");
     let again = say(APPLY);
     assert!(again.contains("nothing to apply"), "{again}");

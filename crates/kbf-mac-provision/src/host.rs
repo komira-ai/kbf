@@ -160,6 +160,12 @@ pub trait Host {
     fn remove(&self, path: &str) -> io::Result<()>;
     /// Waits `seconds` (between tries of a program that may not succeed at once).
     fn pause(&self, seconds: u64);
+    /// `len` bytes from the system's random source (the Mac's, never under
+    /// [`Host::root`]).
+    ///
+    /// # Errors
+    /// The source cannot be read.
+    fn random(&self, len: usize) -> io::Result<Vec<u8>>;
 }
 
 /// The Mac this runs on, with its `/` at `root` (`/` but in tests).
@@ -284,6 +290,13 @@ impl Host for RealHost {
     fn pause(&self, seconds: u64) {
         std::thread::sleep(std::time::Duration::from_secs(seconds));
     }
+
+    fn random(&self, len: usize) -> io::Result<Vec<u8>> {
+        use std::io::Read as _;
+        let mut bytes = vec![0; len];
+        fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
 }
 
 /// The calls the verbs share, over a [`Host`]. Every path is a path on the Mac.
@@ -330,11 +343,13 @@ impl<'a> Mac<'a> {
         }
     }
 
-    /// Whether `program args` runs, is fed `input` and exits 0.
+    /// Whether `program args` runs, is fed `input`, exits 0 and prints no `DS Error`
+    /// line (`dscl` reading commands from its standard input may report a refused
+    /// command on its output alone).
     pub(crate) fn succeeds_with_input(&self, program: &str, args: &[&str], input: &str) -> bool {
         self.host
             .run_with_input(program, args, input)
-            .is_ok_and(|o| o.success)
+            .is_ok_and(|o| o.success && !o.stdout.contains("DS Error"))
     }
 
     /// Whether `program args` runs and exits 0.
@@ -461,5 +476,10 @@ impl<'a> Mac<'a> {
 
     pub(crate) fn pause(&self, seconds: u64) {
         self.host.pause(seconds);
+    }
+
+    /// `len` random bytes.
+    pub(crate) fn random(&self, len: usize) -> io::Result<Vec<u8>> {
+        self.host.random(len)
     }
 }

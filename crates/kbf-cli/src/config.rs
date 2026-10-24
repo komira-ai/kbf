@@ -64,6 +64,8 @@ const GROUPS: &[(&str, &[&str])] = &[
         &[
             "advertise-addr",
             "api-listen",
+            "drain-deadline",
+            "drain-lb-wait",
             "http2-keepalive-interval-secs",
             "http2-keepalive-timeout-secs",
             "listen",
@@ -106,6 +108,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "input-tree-cache-bytes",
             "input-tree-cache-entries",
             "input-tree-reads-in-flight",
+            "pack-index",
             "progress-interval-secs",
             "readyz-store-timeout-ms",
             "state-store",
@@ -125,6 +128,9 @@ const GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        // The flags of the removed handover and admin port, accepted and ignored for one
+        // release (`kbf_server::retired::RetiredHandoverFlags`): the keys stay so that a
+        // `kbf.toml` written before the removal is still read.
         "handover",
         &[
             "admin-listen",

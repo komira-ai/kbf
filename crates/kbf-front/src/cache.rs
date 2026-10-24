@@ -867,6 +867,8 @@ mod rebuild;
 mod stream;
 mod stream_store;
 mod tail;
+#[cfg(test)]
+mod tests;
 mod tier;
 mod touches;
 mod upload;

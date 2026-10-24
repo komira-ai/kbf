@@ -28,11 +28,11 @@
 //!   memory runs of its kills for memory, the farm runs it used, the nodes placement
 //!   avoids for it and the leases given up as not started ([`kbf_sched::Fate`]), written
 //!   in the transaction of every requeue that follows a fault (whole, so the newest row
-//!   is the whole state) and deleted with the operation's other rows. A successor (after
-//!   a handover or a crash) books the next rung and spends the budgets that are left
-//!   instead of starting over. A store with no row for an operation books and counts as
-//!   it did before the row existed; a row written before the budgets were (version 1)
-//!   carries none of them;
+//!   is the whole state) and deleted with the operation's other rows. A successor (another
+//!   frontend that takes the operation up, or a restart after a crash) books the next rung
+//!   and spends the budgets that are left instead of starting over. A store with no row for
+//!   an operation books and counts as it did before the row existed; a row written before
+//!   the budgets were (version 1) carries none of them;
 //! - `floor/<instance>/<action>`: a memory floor, the least memory a fresh submission of
 //!   the action books ([`kbf_sched::Floor`]): the ask and a stamp that orders the raises,
 //!   written in the transaction of the requeue that raises it, deleted in the one that
@@ -88,12 +88,12 @@
 //!   format is needed: a store from that time reads as one whose blocks are spent. The
 //!   epoch row is created with an absent-only write, and a frontend that loses that race
 //!   reads the other's;
-//! - `meta/generation`: the writer generation of a store a build that takes generations
-//!   opened ([`kbf_state::Fenced`], whose every write is checked against it), or the marker
-//!   [`kbf_state::SHARED_WRITERS`] that a start puts there when the frontends share the store
-//!   and none takes a generation. A write of the scheduler is then checked by the rows it
-//!   read, not by a generation. Operation names do not carry it: a farm over a store names
-//!   its operations `operations/<id>`, and the ids are the store's.
+//! - `meta/generation`: the writer generation of a store an older build that takes
+//!   generations opened, or the marker [`kbf_state::SHARED_WRITERS`] that a start puts there
+//!   when the frontends share the store and none takes a generation. A write of the
+//!   scheduler is then checked by the rows it read, not by a generation. Operation names do
+//!   not carry it: a farm over a store names its operations `operations/<id>`, and the ids
+//!   are the store's.
 //!
 //! Several frontends may share one store. Each change of the rows above to an operation
 //! (a grant, a lease given up, a result, a refusal) is one transaction that is conditional
@@ -881,24 +881,6 @@ impl Durable {
         self.commit(txn)
     }
 
-    /// The unfinished operations that run `action` (of `instance`, if given): at most one
-    /// per instance, since a twin joins the operation that is running.
-    pub(super) fn operations_of(
-        &self,
-        instance: Option<&str>,
-        action: &Digest,
-    ) -> Result<Vec<OperationId>, StateError> {
-        let mut found = Vec::new();
-        for (key, row) in self.scan_known("op/")? {
-            let request = request_row(&key, &row)?;
-            let named = instance.is_none_or(|instance| request.key.instance == instance);
-            if named && request.key.action == *action {
-                found.push(parse_operation(&key, "op/")?);
-            }
-        }
-        Ok(found)
-    }
-
     /// Where `operation` stands. The reads are separate, so a finish may land between
     /// them: `done/` is read again when the operation's rows are gone, and a finish (one
     /// transaction) leaves its result by then.
@@ -1579,8 +1561,8 @@ impl State {
         // term is the one of the old form, `operations/{term}-{waiter}`, which the farm still
         // answers for a caller it holds: it carries the writer generation when the store has
         // one, so a kept epoch does not let a process answer a name another one wrote (issue
-        // #154). A store with none (handed in without a fence, or shared by frontends that
-        // take none) gives the epoch as the term. The farm gives out no name of the old form
+        // #154). A store with none (a store with no generation row, or one holding the shared
+        // marker) gives the epoch as the term. The farm gives out no name of the old form
         // over a store, so no client holds one for two frontends of a store to answer.
         self.machine = FarmMachine::new(durable.generation()?.unwrap_or(epoch));
         let now = SystemTime::now();

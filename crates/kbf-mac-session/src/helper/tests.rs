@@ -13,7 +13,7 @@ pub(super) fn me() -> u32 {
     rustix::process::getuid().as_raw()
 }
 
-fn my_gid() -> u32 {
+pub(super) fn my_gid() -> u32 {
     rustix::process::getgid().as_raw()
 }
 
@@ -40,6 +40,16 @@ pub(super) fn rig_with(
     range: UidRange,
     dir: Option<std::sync::Arc<kbf_testkit::dir::TestDir>>,
 ) -> Rig {
+    rig_vm_with(name, range, dir, None)
+}
+
+/// [`rig_with`] on a Mac whose VM user is `vm_user`, if any.
+pub(super) fn rig_vm_with(
+    name: &str,
+    range: UidRange,
+    dir: Option<std::sync::Arc<kbf_testkit::dir::TestDir>>,
+    vm_user: Option<&str>,
+) -> Rig {
     trace();
     let dir = dir.unwrap_or_else(|| std::sync::Arc::new(scratch(&format!("helper-{name}"))));
     let homes = dir.join("Users");
@@ -61,6 +71,7 @@ pub(super) fn rig_with(
         serial: "SERIAL1".to_owned(),
         session: SessionPaths::under(&dir),
         scan: crate::scan::ScanSettings::under(&dir),
+        vm_user: vm_user.map(|name| crate::lease::VmUser::new(name).unwrap()),
     };
     let ledger = Ledger::open(&dir.join("ledger")).unwrap();
     let helper = Helper::new(Box::new(host.clone()), settings, ledger);
@@ -563,7 +574,7 @@ fn requests_are_routed_and_stray_descriptors_refused() {
     assert_eq!(
         stray,
         Reply::Refused {
-            reason: "only run takes descriptors".to_owned()
+            reason: "only run and role-run take descriptors".to_owned()
         }
     );
     assert_eq!(

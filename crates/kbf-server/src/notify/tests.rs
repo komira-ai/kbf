@@ -3,15 +3,15 @@
 use std::os::unix::net::UnixDatagram;
 
 use super::*;
-use crate::handover::tests::Scratch;
+use crate::test_dir::short_dir;
 
 /// Catches: a ready message that is not `READY=1` (the manager would wait for the start
 /// timeout), one sent to the wrong kind of address (a path taken for an abstract name or
 /// the reverse), and an error swallowed where the manager is not there.
 #[test]
 fn ready_reaches_a_path_and_an_abstract_name() {
-    let dir = Scratch::new();
-    let path = dir.0.join("notify");
+    let dir = short_dir("kbf-notify");
+    let path = dir.join("notify");
     let listening = UnixDatagram::bind(&path).expect("a datagram socket");
     ready(path.as_os_str()).expect("sent to a path");
     let mut buffer = [0_u8; 32];
@@ -30,6 +30,6 @@ fn ready_reaches_a_path_and_an_abstract_name() {
         assert_eq!(&buffer[..got], b"READY=1");
     }
 
-    let nowhere = dir.0.join("nobody-listens");
+    let nowhere = dir.join("nobody-listens");
     assert!(ready(nowhere.as_os_str()).is_err());
 }

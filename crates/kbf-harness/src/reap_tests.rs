@@ -17,14 +17,12 @@ fn kbf_beta() -> PathBuf {
 }
 
 /// What to clean up after a harness with `lanes` loops over the stand-in `buck2`, in a fresh
-/// project directory; and a control socket (a file) in it.
+/// project directory, whose directory is also where the roles' process groups are recorded.
 fn reap(name: &str, lanes: usize) -> Reap {
     let dir = crate::scratch(name);
     let project = dir.join("project");
     std::fs::create_dir_all(&project).expect("project");
     std::fs::write(project.join(".fake-buck2"), "ok").expect("mode");
-    let socket = dir.join("farm.sock");
-    std::fs::write(&socket, "").expect("socket");
     Reap::new(
         &Daemons {
             buck2: sibling_bin(FAKE_BUCK2),
@@ -34,7 +32,6 @@ fn reap(name: &str, lanes: usize) -> Reap {
             // Starts with `-`, as an empty CI run id and the pid make one: it must reach the sentinel.
             run_id: "-7".to_owned(),
         },
-        Some(socket),
         Some(dir),
     )
 }
@@ -92,35 +89,33 @@ fn the_sentinel_is_done_only_when_it_is_told_so() {
 }
 
 #[test]
-fn a_harness_that_died_has_its_daemons_killed_and_its_socket_removed() {
-    // Catches: the cleanup that does not clean: a daemon per loop left running, holding the
-    // farm's connection, and the control socket left in the temporary directory. Catches:
-    // the lost branch kills no daemon; it removes no socket; it kills one lane too few.
+fn a_harness_that_died_has_its_daemons_killed() {
+    // Asserts that the lost branch kills the daemon of every loop (one per loop would
+    // otherwise be left running, holding the farm's connection), the last lane included.
     let r = reap("reap-lost", 3);
     assert_eq!(r.run(&mut Cursor::new(String::new())), 1);
     for lane in 0..3 {
         assert_eq!(kills(&r, lane), 1, "lane {lane}");
     }
-    assert!(!r.socket.as_ref().expect("a socket").exists());
 }
 
 #[test]
 fn a_harness_that_ended_well_has_nothing_cleaned_up() {
     // Catches: a sentinel that kills the daemons of a run that ended well (the loops have
-    // killed their own; a second kill waits on a daemon for nothing) or removes a socket
-    // the next run may own by then. Catches: the done branch cleans up as well.
+    // killed their own; a second kill waits on a daemon for nothing). Catches: the done
+    // branch cleans up as well.
     let r = reap("reap-done", 2);
     assert_eq!(r.run(&mut Cursor::new("done\n".to_owned())), 0);
     assert_eq!((kills(&r, 0), kills(&r, 1)), (0, 0));
-    assert!(r.socket.as_ref().expect("a socket").exists());
 }
 
 #[test]
-fn a_cleanup_without_a_socket_kills_the_daemons_alone() {
-    // Catches: a missing socket (a run that was killed before its frontend started) being an
-    // error that stops the cleanup before, or instead of, the kills.
-    let mut r = reap("reap-no-socket", 1);
-    r.socket = None;
+fn a_cleanup_without_a_group_directory_kills_the_daemons_alone() {
+    // Asserts that a run killed before any role recorded a process group (no directory to
+    // look in) still has its daemons killed: the missing directory is not an error that
+    // stops the cleanup before, or instead of, the kills.
+    let mut r = reap("reap-no-groups", 1);
+    r.pgids = None;
     assert_eq!(r.run(&mut Cursor::new(String::new())), 1);
     assert_eq!(kills(&r, 0), 1);
 }
@@ -137,7 +132,7 @@ fn the_cleanup_is_the_daemons_it_was_made_from() {
         kill_timeout: Duration::from_millis(2500),
         run_id: "-9-1".to_owned(),
     };
-    let r = Reap::new(&daemons, None, None);
+    let r = Reap::new(&daemons, None);
     assert_eq!(r.kill_timeout_ms, 2500);
     let back = r.daemons();
     assert_eq!(
@@ -161,22 +156,7 @@ fn the_cleanup_is_the_daemons_it_was_made_from() {
         kill_timeout: Duration::MAX,
         ..r.daemons()
     };
-    assert_eq!(Reap::new(&huge, None, None).kill_timeout_ms, u64::MAX);
-}
-
-#[test]
-fn the_command_line_names_the_socket_only_when_there_is_one() {
-    // Catches: `--socket` given with no value (the sentinel then refuses its command line and
-    // a killed harness is not cleaned up).
-    let mut r = reap("reap-args", 2);
-    let with = r.args();
-    assert_eq!(
-        with.first().map(|a| a.to_string_lossy().into_owned()),
-        Some("reap".to_owned())
-    );
-    assert!(with.iter().any(|a| a == "--socket"));
-    r.socket = None;
-    assert!(!r.args().iter().any(|a| a == "--socket"));
+    assert_eq!(Reap::new(&huge, None).kill_timeout_ms, u64::MAX);
 }
 
 #[test]
@@ -193,7 +173,6 @@ fn a_sentinel_that_is_dropped_is_told_done_and_leaves_everything_alone() {
     drop(sentinel);
     assert!(!alive(pid), "the sentinel ended with the harness's drop");
     assert_eq!((kills(&r, 0), kills(&r, 1)), (0, 0));
-    assert!(r.socket.as_ref().expect("a socket").exists());
 }
 
 #[test]
@@ -213,9 +192,6 @@ fn a_sentinel_whose_pipe_closes_with_no_done_cleans_up() {
     drop(sentinel.input.take());
     until("the daemons to be killed", || {
         (kills(&r, 0) == 1 && kills(&r, 1) == 1).then_some(())
-    });
-    until("the socket to be removed", || {
-        (!r.socket.as_ref().expect("a socket").exists()).then_some(())
     });
     until("the sentinel to end", || (!alive(pid)).then_some(()));
 }
@@ -297,13 +273,15 @@ fn a_group_named_by_a_file_is_killed_with_the_children_in_it() {
 #[test]
 fn the_command_line_names_the_group_directory_only_when_there_is_one() {
     // Catches: `--pgids` lost on the way to the sentinel (a killed harness's grandchildren
-    // survive again), or given with no value. Catches: `args` leaves it out.
+    // survive again), or given with no value. Catches: `args` leaves it out. The command is
+    // `reap` first, the word the sentinel's binary answers.
     let mut r = reap("reap-pgids-args", 1);
     let args: Vec<String> = r
         .args()
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
+    assert_eq!(args.first().map(String::as_str), Some("reap"));
     let at = args.iter().position(|a| a == "--pgids").expect("--pgids");
     assert_eq!(
         args[at + 1],

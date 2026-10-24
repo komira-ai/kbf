@@ -76,6 +76,10 @@ jobs:
         if: ${{ !cancelled() }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
         if: ${{ !cancelled() }}
+      # The object store library with its `s3` feature (the adapter over the S3 client of
+      # kbf-objstore), which is off in the workspace run above: no crate turns it on yet.
+      - run: cargo clippy -p tierstore --features s3 --all-targets --locked -- -D warnings
+        if: ${{ !cancelled() }}
       # The setup library without its `proxy` feature, as the `kbf` binary links it. The workspace
       # run above has the feature on (the installer is in the workspace), so the code that is
       # compiled only without it is built and linted here, with the library and the binary alone.
@@ -164,7 +168,11 @@ jobs:
       - name: Free disk before (report)
         run: df -h /
       - name: Remove preinstalled toolchains this job does not use
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/powershell /usr/share/swift /usr/local/lib/node_modules
+      # Images the runner preloads and this job never runs; the Postgres service container's
+      # image is in use, so the prune keeps it.
+      - name: Remove container images this job does not use
+        run: docker image prune --all --force
       - name: Free disk after (report)
         run: df -h /
       - run: rustup toolchain install "$COVERAGE_TOOLCHAIN" --profile minimal --component llvm-tools-preview
@@ -202,10 +210,20 @@ jobs:
       # it looks like LLVM issue 220574). Lines and branches, all the gate reads, are
       # unaffected: their totals match llvm-cov's own text report.
       - run: mkdir -p target/coverage
+      # `--features tierstore/s3` puts the object store library's S3 backend (off by default; no
+      # crate turns it on yet) into the run, so its tests count toward the 99% of tierstore.
       - name: Run the fast tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --profile pr
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --features tierstore/s3 --locked --branch --no-report --no-fail-fast --profile pr
+      # What the test run left on the disk, so a run that ran the runner out of room says
+      # which directories grew (the instrumented build, the tests' own temporary files).
+      - name: Free disk after the tests (report)
+        if: ${{ always() }}
+        run: df -h /
+      - name: Disk use under target after the tests (report)
+        if: ${{ always() }}
+        run: du -xhd 2 target
       # No step below runs Postgres tests on their own: they are in the run above, which
       # fails any of them when KBF_TEST_POSTGRES_URL (set for the job) names no server.
       - name: Report

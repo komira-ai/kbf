@@ -1,7 +1,8 @@
 //! The flags of `kbf-installer setup` and `kbf setup`, and the modes they set a host up for. The
 //! rest of the installer's command line is in `kbf_installer::cli`, which re-exports these two
-//! and adds the proxy's flags (`--proxy` and the ones that go with it) to these: they are not
-//! here, so that the `kbf` binary's `setup` takes none of them whatever features are built.
+//! and adds the proxy's flags (`--proxy` and the ones that go with it, which `setup` refuses) to
+//! these: they are not here, so that the `kbf` binary's `setup` takes none of them whatever
+//! features are built.
 
 use clap::{Args, ValueEnum};
 
@@ -12,8 +13,17 @@ pub enum Mode {
     Storage,
     Daemon,
     StorageAndDaemon,
+    /// Removed: setup refuses it with [`ALL_IN_ONE_REMOVED`]. Hidden from the listed values.
+    #[value(hide = true)]
     AllInOne,
 }
+
+/// What a command line that asks for the `all-in-one` mode is told, by `kbf`, `kbf setup`
+/// and `kbf-installer setup` alike. The mode was removed: a frontend and one or more
+/// storage-and-daemon nodes replace it.
+pub const ALL_IN_ONE_REMOVED: &str = "the all-in-one mode was removed: run one node with \
+`--mode=frontend` and one or more nodes with `--mode=storage-and-daemon` instead \
+(docs/deploy/kbf-modes.md)";
 
 impl Mode {
     /// Whether this mode keeps its state in the Postgres database the installer owns (the
@@ -42,8 +52,9 @@ pub struct SetupArgs {
     /// The state database, as postgres:///NAME?host=SOCKET_DIR&user=ROLE (no password), for
     /// `frontend` and `all-in-one`: written to installer.toml and, as `state-store`, to kbf.toml,
     /// and setup creates (or brings forward) its schema. Left out, it is
-    /// postgres:///kbf?host=/run/postgresql&user=kbf-server on this host's own Postgres server,
-    /// and setup creates the role and the database as if --create-local-database were given.
+    /// postgres:///kbf?host=/run/postgresql&user=ROLE on this host's own Postgres server (ROLE is
+    /// kbf-server for `frontend`, kbf for `all-in-one`: the account the mode's unit runs as), and
+    /// setup creates the role and the database as if --create-local-database were given.
     /// Given, the server exists before setup runs, and so do the role and the database unless
     /// --create-local-database makes them.
     #[arg(long)]
