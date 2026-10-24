@@ -34,7 +34,7 @@ On each heartbeat it answers `update to X` only if all hold:
 Limits and order:
 
 - **Per role**: at most N hosts updating at once. Default 1 for frontends and storage, more for daemons and Macs.
-- **Never the last frontend** that is up.
+- **Never the last frontend** that is up: a frontend is ordered only when `max(min_up.frontend, 1)` other frontends are up (`required_up`, `crates/kbf-coordinator/src/decide.rs`). A lone frontend is therefore never ordered to update, and the deploy fails on its stall or deadline; the same holds for a lone storage host when `min_up.storage` is 1 or more. Run two or more frontends if the coordinator deploys them; a single one is updated by hand with the helper (`docs/deploy/kbf-updater.md`, "A frontend host").
 - **Storage**: never so many down that a blob stops being readable.
 - **Minimums**: live heartbeats are checked against the stored minimums, never against the hosts currently known, so a silent host after a restart still counts as missing.
 - **Order**: storage and daemons, then frontends.
