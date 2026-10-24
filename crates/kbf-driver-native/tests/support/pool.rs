@@ -229,6 +229,25 @@ pub fn home_of(user: &SlotUser) -> PathBuf {
     Path::new(HOMES).join(&user.name)
 }
 
+/// `program` with `args` as `user` (home `home`), outside any sandbox, with a plain
+/// environment: what the uid itself sees, as a root process without Full Disk Access
+/// cannot see inside the uid's `/var/folders` entry.
+pub fn as_user(user: &SlotUser, home: &Path, program: &str, args: &[&str]) -> std::process::Output {
+    Command::new(program)
+        .args(args)
+        .uid(user.uid)
+        .gid(user.gid)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", home)
+        .env("USER", &user.name)
+        .env("LOGNAME", &user.name)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .output()
+        .expect(program)
+}
+
 /// Every uid the local directory holds.
 fn taken_uids() -> BTreeSet<u32> {
     let out = Command::new("/usr/bin/dscl")
