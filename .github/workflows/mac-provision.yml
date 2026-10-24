@@ -1,0 +1,68 @@
+# kbf-mac-provision for a Mac: built from the commit for darwin-arm64, signed ad hoc with
+# the hardened runtime by `cargo xtask sign-darwin`, as a workflow artifact to download and
+# copy to a farm Mac (docs/deploy/kbf-installer-macos.md, step 2). No other workflow builds
+# it: the release and artifacts workflows carry the daemon, the installer and their helpers.
+#
+# The job builds and signs the binary, checks the signature, runs `--help` and the tests of
+# the crate (every item against a fake Mac), and keeps the file. It runs on a pull request
+# that changes the crate, by hand, and on a push to main. Nothing is attested here: the
+# artifact is a build of the commit, to be fetched with `gh run download` and checked against
+# the SHA-256 in the job summary.
+name: mac-provision
+
+on:
+  pull_request:
+    paths:
+      - crates/kbf-mac-provision/**
+      - .github/workflows/mac-provision.yml
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - crates/kbf-mac-provision/**
+
+permissions: {}
+
+concurrency:
+  group: mac-provision-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  darwin-arm64:
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      TARGET: aarch64-apple-darwin
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: sw_vers
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-mac-provision --bin kbf-mac-provision
+      - name: Sign kbf-mac-provision ad hoc with the hardened runtime, and check it
+        run: cargo xtask sign-darwin "target/$TARGET/release/kbf-mac-provision" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
+      - name: The signed kbf-mac-provision lists its commands
+        run: target/aarch64-apple-darwin/release/kbf-mac-provision --help
+      - run: cargo test --locked -p kbf-mac-provision
+      - name: Tar kbf-mac-provision (a tar keeps the executable bit)
+        run: tar -C "target/$TARGET/release" -czf "kbf-mac-provision-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-mac-provision
+      - name: Sum the tarball in the job summary
+        run: shasum -a 256 ./*.tar.gz >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mac-provision-darwin-arm64
+          path: ./*.tar.gz
+          retention-days: 30
+          if-no-files-found: error

@@ -64,7 +64,9 @@ restarts to ten seconds and writes to `/Library/Logs/kbf-installer/kbf-installer
 ## A new Mac
 
 1. **Install the package** as above.
-2. **Provision the host.** `kbf-mac-provision apply --profile FILE` (as root) fixes the host
+2. **Provision the host.** `kbf-mac-provision apply --profile FILE` (as root; the binary is not in a
+   release yet: the `mac-provision-darwin-arm64` artifact of the `mac-provision` workflow, run by hand or on a
+   change to the crate, holds a signed build of any commit) fixes the host
    settings and renders the worker profile: it writes `/usr/local/etc/kbf/kbf.toml` and the daemon
    job's plist, and starts the job. It is the one writer of the daemon's `kbf.toml` on
    a Mac. The `kbf.toml` it renders has no `update-dir` or `orders-dir`; a file that still has them
