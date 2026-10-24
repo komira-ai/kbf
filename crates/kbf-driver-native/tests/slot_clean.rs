@@ -39,7 +39,7 @@ use kbf_driver_native::NativeRuntime;
 use kbf_driver_native::slots::SlotUser;
 use kbf_driver_native::slots::clean::Skipped;
 use support::pool::{Scratch, Users, config, home_of, ids_of};
-use support::slot_rows::ROWS;
+use support::slot_rows::{ROWS, classify_unplanted};
 use support::{MemoryCas, PROMPT, Spec, stdout};
 
 fn assert_root() {
@@ -257,7 +257,7 @@ struct Fresh {
 }
 
 impl Fresh {
-    /// The scenario ran: both leases exited 0, lease A planted every row, and lease B
+    /// The scenario ran: both leases exited 0, lease A planted every row the system lets it (the core rows always), and lease B
     /// reached its end. Without it a green or red row means nothing.
     fn assert_ran(&self) {
         assert_eq!(self.a_exit, 0, "lease A: {}\n{}", self.a_text, self.outside);
@@ -409,6 +409,12 @@ async fn freshness(name: &str, skipped: Option<Skipped>) -> Fresh {
         .map(|(row, _)| *row)
         .filter(|row| !planted.contains(*row))
         .collect();
+    // A row the system refuses lease A (crontab and at in a launch daemon's context, without
+    // Full Disk Access) is no channel there either: said, and left out of the precondition.
+    let unplantable = classify_unplanted(&not_planted, &format!("{a_out}{a_err}{}", outside.text));
+    for (row, why) in &unplantable.not_plantable {
+        eprintln!("not plantable here: {row}: {why}");
+    }
     let red: BTreeSet<String> = found.iter().map(|(row, _)| row.clone()).collect();
     let diagnosis = diagnosis(&user);
     eprintln!(
@@ -416,7 +422,7 @@ async fn freshness(name: &str, skipped: Option<Skipped>) -> Fresh {
         outside.text
     );
     Fresh {
-        not_planted: not_planted.into_iter().map(str::to_owned).collect(),
+        not_planted: unplantable.failed,
         found,
         red,
         a_exit: first.exit_code,

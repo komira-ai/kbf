@@ -27,7 +27,9 @@ use std::collections::BTreeSet;
 use kbf_driver_native::slots::clean::{
     self, Check, Left, Os, Outcome, STEPS, Skipped, Step, WithSkipped,
 };
-use support::slot_rows::{COVERS, ROWS, UNCOVERED, UNROWED, covered_by};
+use support::slot_rows::{
+    CORE, COVERS, ROWS, UNCOVERED, UNROWED, Unplanted, classify_unplanted, covered_by,
+};
 
 /// A row left by the lease, and the step that removes it.
 type Residue = (&'static str, Step);
@@ -241,4 +243,58 @@ step_tests! {
 #[test]
 fn there_is_a_test_of_necessity_for_every_step() {
     assert_eq!(TESTED, STEPS);
+}
+
+/// Catches a test that passes vacuously (a core row unplanted), one that fails where the
+/// system only refuses a non-core row (crontab and at in a launch daemon's context), and
+/// one that excuses a row for a reason that is not the system's refusal.
+#[test]
+fn a_row_the_system_refuses_is_not_plantable_and_any_other_unplanted_row_fails() {
+    let text = "crontab: tmp/tmp.40513: Operation not permitted\n\
+                at: cannot open lockfile /usr/lib/cron/jobs/.lockfile: Operation not permitted\n\
+                planted tmp\n";
+    let got = classify_unplanted(&["crontab", "at"], text);
+    assert_eq!(got.failed, Vec::<String>::new());
+    assert_eq!(
+        got.not_plantable,
+        vec![
+            (
+                "crontab".to_owned(),
+                "crontab: tmp/tmp.40513: Operation not permitted".to_owned()
+            ),
+            (
+                "at".to_owned(),
+                "at: cannot open lockfile /usr/lib/cron/jobs/.lockfile: Operation not permitted"
+                    .to_owned()
+            ),
+        ]
+    );
+    // Another failure of the same rows is a failure; so is a row nothing says anything of.
+    let got = classify_unplanted(
+        &["crontab", "at", "sem"],
+        "crontab: bad\nat: no such queue\n",
+    );
+    assert_eq!(got.failed, ["crontab", "at", "sem"]);
+    assert!(got.not_plantable.is_empty());
+    // EPERM counts as the refusal; the line must name the row's tool.
+    let got = classify_unplanted(&["shared"], "sh: Shared/x: EPERM\n");
+    assert_eq!(got.not_plantable.len(), 1);
+    let got = classify_unplanted(&["shared"], "unrelated: Operation not permitted\n");
+    assert_eq!(got.failed, ["shared"]);
+    // A core row is never excused, whatever the output says.
+    for row in CORE {
+        let got = classify_unplanted(
+            &[row],
+            "home tmp T C keychain agent defaults: Operation not permitted\n",
+        );
+        assert_eq!(
+            got,
+            Unplanted {
+                not_plantable: Vec::new(),
+                failed: vec![row.to_owned()]
+            },
+            "{row}"
+        );
+    }
+    assert!(CORE.iter().all(|c| ROWS.iter().any(|(r, _)| r == c)));
 }

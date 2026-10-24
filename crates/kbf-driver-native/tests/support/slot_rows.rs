@@ -110,3 +110,51 @@ pub fn covered_by(step: Step) -> &'static [&'static str] {
         .find(|(s, _)| *s == step)
         .map_or(&[], |(_, rows)| *rows)
 }
+
+/// The rows lease A must plant on any Mac: a run that planted fewer proves nothing.
+pub const CORE: [&str; 7] = ["home", "T", "C", "keychain", "agent", "defaults", "tmp"];
+
+/// What to look for in the plant's own output to tell that the system refused the
+/// planting of a row, by the tool or place that names it.
+const NEEDLES: [(&str, &str); 4] = [
+    ("crontab", "crontab"),
+    ("at", "at:"),
+    ("shared", "Shared"),
+    ("var-tmp", "var/tmp"),
+];
+
+/// How [`classify_unplanted`] sorted the rows lease A did not plant.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Unplanted {
+    /// Rows the system refused to let lease A plant here: the row and the line that says so
+    /// ("Operation not permitted" or EPERM). They are left out of the precondition.
+    pub not_plantable: Vec<(String, String)>,
+    /// Rows not planted for any other reason, or a [`CORE`] row at all: the test fails.
+    pub failed: Vec<String>,
+}
+
+/// Sorts `unplanted` (rows not planted) by what the plant's own output `text` says: a
+/// non-core row whose tool or place is named in a line with "Operation not permitted" or
+/// `EPERM` is not plantable here; every other row, and every core row, is a failure.
+#[must_use]
+pub fn classify_unplanted(unplanted: &[&str], text: &str) -> Unplanted {
+    let mut sorted = Unplanted::default();
+    for row in unplanted {
+        let refused = NEEDLES
+            .iter()
+            .filter(|(r, _)| r == row && !CORE.contains(row))
+            .find_map(|(_, needle)| {
+                text.lines().find(|l| {
+                    l.contains(needle)
+                        && (l.contains("Operation not permitted") || l.contains("EPERM"))
+                })
+            });
+        match refused {
+            Some(line) => sorted
+                .not_plantable
+                .push(((*row).to_owned(), line.trim().to_owned())),
+            None => sorted.failed.push((*row).to_owned()),
+        }
+    }
+    sorted
+}
