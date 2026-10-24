@@ -9,13 +9,17 @@
 //! `session` prints the launchd session type and exits; it is how CI checks what a
 //! LaunchAgent and a LaunchDaemon see. Every subcommand refuses to run as root except
 //! `probe-guest` and `probe-ready`, which record what each user can do in a guest
-//! (src/probe.rs).
+//! (src/probe.rs), and `mount-share`, the root mount daemon's bounded virtiofs mount
+//! (src/mount.rs), and `probe-diag`, which says what a root process sees of the share
+//! and which write step is refused (src/diag.rs).
 
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use kbf_guest::diag;
+use kbf_guest::mount;
 use kbf_guest::probe;
 use kbf_guest::server::{Agent, Config, HELLO_TIMEOUT};
 use kbf_guest::session;
@@ -56,6 +60,13 @@ enum Cmd {
     /// Write a marker file once the guest has reached this point (the share mounted, a
     /// process running). Runs as any user, root included.
     ProbeReady(probe::ReadyArgs),
+    /// Mount a virtiofs tag at a mount point, trying a bounded number of times; logs each
+    /// failure to stderr and exits non-zero when none worked. Runs as any user, root
+    /// included (the guest's mount daemon is root).
+    MountShare(mount::MountArgs),
+    /// Print, as JSON on stdout, what the process is and sees of the mounted share and
+    /// which file operation on it is refused. Runs as any user, root included.
+    ProbeDiag(diag::DiagArgs),
 }
 
 fn main() -> ExitCode {
@@ -66,13 +77,27 @@ fn main() -> ExitCode {
 /// ([`session::refuse_root_here`]): then it says why on stderr and exits 2, with
 /// nothing run and nothing created.
 fn run(cli: Cli, root: Result<(), String>) -> ExitCode {
-    run_with(cli, root, real_probe_host().as_deref())
+    run_with(
+        cli,
+        root,
+        real_probe_host().as_deref(),
+        real_mounter().as_deref(),
+        real_diagnoser().as_deref(),
+    )
 }
 
 /// [`run`] with the host the probe subcommands ask (`None`: not a macOS guest).
-fn run_with(cli: Cli, root: Result<(), String>, host: Option<&dyn probe::Host>) -> ExitCode {
-    if !matches!(cli.command, Cmd::ProbeGuest(_) | Cmd::ProbeReady(_))
-        && let Err(e) = root
+fn run_with(
+    cli: Cli,
+    root: Result<(), String>,
+    host: Option<&dyn probe::Host>,
+    mounter: Option<&dyn mount::Mounter>,
+    diagnoser: Option<&dyn diag::DiagHost>,
+) -> ExitCode {
+    if !matches!(
+        cli.command,
+        Cmd::ProbeGuest(_) | Cmd::ProbeReady(_) | Cmd::MountShare(_) | Cmd::ProbeDiag(_)
+    ) && let Err(e) = root
     {
         eprintln!("{e}");
         return ExitCode::from(2);
@@ -96,7 +121,57 @@ fn run_with(cli: Cli, root: Result<(), String>, host: Option<&dyn probe::Host>) 
         },
         Cmd::ProbeGuest(args) => probe_cmd(host, &args.out, |h| probe::probe_guest(h, &args)),
         Cmd::ProbeReady(args) => probe_cmd(host, &args.out, |h| probe::probe_ready(h, &args)),
+        Cmd::MountShare(args) => mount_cmd(mounter, &args),
+        Cmd::ProbeDiag(args) => diag_cmd(diagnoser, &args),
     }
+}
+
+/// Diagnoses the share with `diagnoser` (`None`: not a macOS guest, refuse with 2).
+fn diag_cmd(diagnoser: Option<&dyn diag::DiagHost>, args: &diag::DiagArgs) -> ExitCode {
+    let Some(diagnoser) = diagnoser else {
+        eprintln!("kbf-guest: probe-diag runs inside a macOS guest");
+        return ExitCode::from(2);
+    };
+    let report = diag::diagnose(diagnoser, args);
+    diag::emit(&report, &args.share, &mut std::io::stdout());
+    ExitCode::SUCCESS
+}
+
+/// The diagnoser `probe-diag` uses: the real guest on macOS, nothing elsewhere.
+#[cfg(target_os = "macos")]
+fn real_diagnoser() -> Option<Box<dyn diag::DiagHost>> {
+    Some(Box::new(kbf_guest::probe_host::SystemHost))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn real_diagnoser() -> Option<Box<dyn diag::DiagHost>> {
+    None
+}
+
+/// Mounts the share `args` names with `mounter` (`None`: not a macOS guest, refuse with 2).
+fn mount_cmd(mounter: Option<&dyn mount::Mounter>, args: &mount::MountArgs) -> ExitCode {
+    let Some(mounter) = mounter else {
+        eprintln!("kbf-guest: mount-share runs inside a macOS guest");
+        return ExitCode::from(2);
+    };
+    match mount::mount_share(mounter, args, &mut std::io::stderr()) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("kbf-guest: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The mounter `mount-share` uses: the real guest on macOS, nothing elsewhere.
+#[cfg(target_os = "macos")]
+fn real_mounter() -> Option<Box<dyn mount::Mounter>> {
+    Some(Box::new(kbf_guest::probe_host::SystemHost))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn real_mounter() -> Option<Box<dyn mount::Mounter>> {
+    None
 }
 
 /// The host the probes ask: the real guest on macOS, nothing elsewhere.
@@ -270,7 +345,10 @@ mod tests {
             "--wait-path",
             "/w",
         ];
-        assert_eq!(run_with(cli(&g), refusal(), Some(&h())), ExitCode::SUCCESS);
+        assert_eq!(
+            run_with(cli(&g), refusal(), Some(&h()), None, None),
+            ExitCode::SUCCESS
+        );
         let r = [
             "probe-ready",
             "--out",
@@ -278,7 +356,10 @@ mod tests {
             "--wait-process",
             "p",
         ];
-        assert_eq!(run_with(cli(&r), refusal(), Some(&h())), ExitCode::SUCCESS);
+        assert_eq!(
+            run_with(cli(&r), refusal(), Some(&h()), None, None),
+            ExitCode::SUCCESS
+        );
         let text = std::fs::read_to_string(&guest).expect("guest result");
         assert!(text.contains("\"uid\": 1"), "{text}");
         assert!(
@@ -286,6 +367,77 @@ mod tests {
                 .expect("ready result")
                 .contains("\"session\"")
         );
-        assert_eq!(run_with(cli(&r), refusal(), None), ExitCode::from(2));
+        assert_eq!(
+            run_with(cli(&r), refusal(), None, None, None),
+            ExitCode::from(2)
+        );
+    }
+
+    /// A mounter that works or fails as told.
+    struct M(bool);
+
+    impl mount::Mounter for M {
+        fn mount(&self, _: &str, _: &std::path::Path) -> Result<(), String> {
+            if self.0 { Ok(()) } else { Err("busy".into()) }
+        }
+        fn pause(&self, _: std::time::Duration) {}
+    }
+
+    /// Catches `mount-share` refused as root (the mount daemon is root), a failed mount
+    /// that exits 0 (the ready marker would then never come and nothing would say why),
+    /// and a run where there is no guest that does not exit 2.
+    #[test]
+    fn mount_share_runs_as_root_and_fails_loud() {
+        let refusal = || Err("kbf-guest refuses to run as root".to_owned());
+        let args = [
+            "mount-share",
+            "--tag=t",
+            "--mountpoint=/m",
+            "--attempts=2",
+            "--delay-ms=0",
+        ];
+        let go = |m: Option<&dyn mount::Mounter>| run_with(cli(&args), refusal(), None, m, None);
+        assert_eq!(go(Some(&M(true))), ExitCode::SUCCESS);
+        assert_eq!(go(Some(&M(false))), ExitCode::FAILURE);
+        assert_eq!(go(None), ExitCode::from(2));
+    }
+
+    /// A diagnoser that answers everything with null.
+    struct D;
+
+    impl diag::DiagHost for D {
+        fn run(&self, _: &str, _: &[&str]) -> serde_json::Value {
+            serde_json::json!(null)
+        }
+        fn ids(&self) -> serde_json::Value {
+            serde_json::json!(null)
+        }
+        fn exists(&self, _: &std::path::Path) -> bool {
+            true
+        }
+        fn pause(&self, _: std::time::Duration) {}
+        fn mount_cycle(
+            &self,
+            _: &str,
+            _: &std::path::Path,
+            _: &dyn Fn(&std::path::Path) -> serde_json::Value,
+        ) -> serde_json::Value {
+            serde_json::json!(null)
+        }
+    }
+
+    /// Catches `probe-diag` refused as root (it is run by a root daemon), a diagnosis that
+    /// fails the process (the report is the answer, a refused write is not an error), and
+    /// a run where there is no guest that does not exit 2.
+    #[test]
+    fn probe_diag_runs_as_root_and_always_reports() {
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-guest-main-diag");
+        let refusal = || Err("kbf-guest refuses to run as root".to_owned());
+        let share = format!("--share={}", dir.join("none").display());
+        let control = format!("--control-dir={}", dir.join("none").display());
+        let args = ["probe-diag", share.as_str(), control.as_str()];
+        let go = |d: Option<&dyn diag::DiagHost>| run_with(cli(&args), refusal(), None, None, d);
+        assert_eq!(go(Some(&D)), ExitCode::SUCCESS);
+        assert_eq!(go(None), ExitCode::from(2));
     }
 }

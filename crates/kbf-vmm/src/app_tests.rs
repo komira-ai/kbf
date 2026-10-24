@@ -182,6 +182,8 @@ fn image_base_passes_its_arguments_and_a_refusal_exits_1() {
             "--disk-gib",
             "80",
             "--offline-setup",
+            "--guest-binary",
+            ipsw.to_str().expect("p"),
         ],
     );
     assert_eq!(code, OK, "{out}");
@@ -293,9 +295,33 @@ fn image_setup_runs_the_offline_write_and_disk_size_is_bounded() {
         "needs-manual"
     );
     sys.uid.set(0);
+    // Without the guest binary nothing is written: the mount daemon would have nothing to run.
     let (code, out, _) = go(Some(&sys), &args);
     assert_eq!(code, OK, "{out}");
+    let v: Value = serde_json::from_str(&out).expect("json");
+    assert!(
+        v["reason"].as_str().expect("r").contains("--guest-binary"),
+        "{out}"
+    );
+    assert!(sys.offline_calls.borrow().is_empty());
+    let bin = work.join("guest-src");
+    std::fs::write(&bin, "bin").expect("bin");
+    let with = [
+        "image",
+        "setup",
+        "--base",
+        base.to_str().expect("p"),
+        "--guest-binary",
+        bin.to_str().expect("p"),
+    ];
+    let (code, out, _) = go(Some(&sys), &with);
+    assert_eq!(code, OK, "{out}");
     assert_eq!(sys.offline_calls.borrow()[0].0, base.join("disk.img"));
+    assert!(
+        sys.offline_calls.borrow()[0]
+            .1
+            .contains(&"usr/local/libexec/kbf-guest".to_owned())
+    );
     for bad in ["0", "31", "4097", "-1"] {
         assert!(
             Cli::try_parse_from([
@@ -336,9 +362,10 @@ fn image_setup_runs_the_offline_write_and_disk_size_is_bounded() {
     }
 }
 
-/// Catches `--graphics` and `--keep` not reaching the probe context (the second VM would
-/// stay headless and the clones would be removed), and a harvest whose two paths are
-/// swapped on the way to the system.
+/// Catches the default dropping the graphics device (a headless guest crash-loops its
+/// window server), `--headless` not reaching the pair (E1's first arm is headless either
+/// way), `--keep` not reaching the probe context (the clones would be removed), and a
+/// harvest whose two paths are swapped on the way to the system.
 #[test]
 fn e1_flags_and_the_harvest_verb_reach_their_steps() {
     let work = work_with_base("app-e1");
@@ -354,7 +381,6 @@ fn e1_flags_and_the_harvest_verb_reach_their_steps() {
             work.to_str().expect("p"),
             "--guest-binary",
             bin.to_str().expect("p"),
-            "--graphics",
             "--keep",
         ],
     );
@@ -362,10 +388,48 @@ fn e1_flags_and_the_harvest_verb_reach_their_steps() {
     let v: Value = serde_json::from_str(&out).expect("json");
     assert_eq!(v["probe"], "e1");
     assert_eq!(v["details"]["clones_kept"], true);
-    assert!(sys.starts.borrow()[1].0.graphics);
+    let graphics: Vec<bool> = sys
+        .starts
+        .borrow()
+        .iter()
+        .map(|(s, _)| s.graphics)
+        .collect();
+    assert_eq!(graphics, [false, true]);
+    // The share matrix is on by default.
+    assert!(sys.starts.borrow().iter().all(|(s, _)| s.tagged.len() > 2));
     assert!(work.join("e1-x").is_dir());
     let cli = Cli::parse_from(["kbf-vmm", "probe", "e1", "--work-dir", "w"]);
-    assert!(matches!(&cli.command, Cmd::Probe(a) if !a.graphics && !a.keep));
+    assert!(matches!(&cli.command, Cmd::Probe(a) if !a.common.headless && !a.keep));
+    let cli = Cli::parse_from(["kbf-vmm", "probe", "e1", "--work-dir", "w", "--headless"]);
+    assert!(matches!(&cli.command, Cmd::Probe(a) if a.common.headless));
+    assert!(
+        Cli::try_parse_from(["kbf-vmm", "probe", "e1", "--work-dir", "w", "--graphics"]).is_err()
+    );
+    // `--headless` reaches the context of every command that builds one.
+    let work2 = work_with_base("app-headless");
+    let sys2 = FakeSystem::new();
+    let (code, out, _) = go(
+        Some(&sys2),
+        &[
+            "probe",
+            "e1",
+            "--work-dir",
+            work2.to_str().expect("p"),
+            "--guest-binary",
+            bin.to_str().expect("p"),
+            "--headless",
+            "--no-matrix",
+        ],
+    );
+    assert_eq!(code, OK, "{out}");
+    assert!(sys2.starts.borrow().iter().all(|(s, _)| !s.graphics));
+    assert!(
+        sys2.starts
+            .borrow()
+            .iter()
+            .all(|(s, _)| s.tagged.len() == 2),
+        "no matrix"
+    );
     let bundle = work.join("e1-x");
     let harvested = work.join("h");
     sys.uid.set(0);

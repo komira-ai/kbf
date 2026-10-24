@@ -47,7 +47,7 @@ sees that copy.
 ```sh
 D=/usr/local/kbf-vmm; sudo mkdir -p $D && sudo cp vmm/kbf-vmm vmm/kbf-guest $D/
 W=/usr/local/kbf-vmm-work; sudo mkdir -p $W
-sudo $D/kbf-vmm image base --ipsw <https-url-or-path> --sha256 <hex> --out $W/base --offline-setup | tee $W/image-base.json
+sudo $D/kbf-vmm image base --ipsw <https-url-or-path> --sha256 <hex> --out $W/base --offline-setup --guest-binary $D/kbf-guest | tee $W/image-base.json
 for g in g1 g2 g3 p0 p2 p6; do sudo $D/kbf-vmm probe $g --work-dir $W --guest-binary $D/kbf-guest | tee $W/$g.json; done
 sudo $D/kbf-vmm probe-bench --work-dir $W --guest-binary $D/kbf-guest --runs 20 | tee $W/bench.json
 ```
@@ -58,10 +58,11 @@ another user. A failed `image base` removes the directory it made, so it can be 
 again.
 
 `--offline-setup` is probe P0's question applied to the new image: as root it attaches the
-disk image, writes the Setup Assistant marker, a mount point and five launch daemons into
-the guest's Data volume, and detaches. The daemons are a root daemon that mounts the
-automount share itself at `/private/var/kbf-mnt` (so the guest side needs no logged-in
-user), a probe as root, a probe as `nobody`, a marker when the guest's launchd runs, a
+disk image, writes the Setup Assistant marker, a mount point, a copy of `kbf-guest`
+(`/usr/local/libexec/kbf-guest` on the guest's own disk, which is why `--guest-binary` is
+required here) and six launch daemons into the guest's Data volume, and detaches. The
+daemons are a root daemon that mounts the share at `/private/var/kbf-mnt` (so the guest
+side needs no logged-in user) by running `kbf-guest mount-share` from that copy, a probe as root, a probe as `nobody`, a marker when the guest's launchd runs, a
 marker when the login window exists, and a local marker (`com.kbf.probe.local`): `sysctl`
 run by launchd with its output going to `/private/var/log/kbf-probe-local` on the guest's
 own disk (the boot time and OS version), depending on nothing else, not even a shell. The
@@ -72,8 +73,18 @@ for the share (`share_wait_ms`); "boot to system ready" includes that wait. If t
 was built without the step, or the step failed, apply it to the existing base:
 
 ```sh
-sudo $D/kbf-vmm image setup --base $W/base
+sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest
 ```
+
+The mount daemon is not restarted by launchd. `kbf-guest mount-share` tries the mount 40
+times, 3 seconds apart, writes every failed attempt to `/var/log/com.kbf.probe.mount.log`
+in the guest and, when none worked, a last line naming the tag, the mount point, the count
+and the last error, then exits non-zero once. A log with more than 40 attempts, or a
+`mount_virtiofs` error repeated forever, is therefore not what this build writes.
+
+Each probe VM has a graphics device unless `--headless` is given (a headless guest
+crash-loops its window server, see E1). `probe e1` keeps its first arm headless either
+way, as the comparison.
 
 Without the daemons, or if the guest cannot mount the share or write into it, the probes
 that need code running in the guest report `needs-manual` and list the possible causes.
@@ -118,7 +129,7 @@ sudo rm /Library/LaunchDaemons/com.kbf.probe.g5.plist
 G1 and the other guest gates can say that a clone booted (the framework reported
 "running") and that no marker came; they cannot say why. `probe e1` is one run that tells
 the causes apart. It starts two clones of the base at once, `e1-x` headless and `e1-y`
-with a graphics device (`--graphics`), and for the whole guest wait (320 seconds) records
+with a graphics device (the default; `--headless` removes it from the second arm too), and for the whole guest wait (320 seconds) records
 every helper event with its arrival time, samples every 10 seconds the helper's CPU
 time, the CPU time of every `com.apple.Virtualization.VirtualMachine` service process
 (the one whose CPU rises belongs to the guest that executes) and the clone's `disk.img`
@@ -132,9 +143,9 @@ harvest writes a new directory and refuses one that exists.
 
 ```sh
 # 1. as root, once: put the current daemons (including the local marker) in the base
-sudo $D/kbf-vmm image setup --base $W/base | tee $W/e1-setup.json
+sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest | tee $W/e1-setup.json
 # 2. as the console user, from Terminal on the Mac (not sudo, not ssh): about 6 minutes
-$D/kbf-vmm probe e1 --work-dir $W --guest-binary $D/kbf-guest --graphics --keep | tee $W/e1.json
+$D/kbf-vmm probe e1 --work-dir $W --guest-binary $D/kbf-guest --keep | tee $W/e1.json
 # 3. as root: copy the allowlisted files off each kept clone's disk
 sudo $D/kbf-vmm image harvest --bundle $W/e1-x --out $W/e1-x-harvest | tee $W/e1-harvest-x.json
 sudo $D/kbf-vmm image harvest --bundle $W/e1-y --out $W/e1-y-harvest | tee $W/e1-harvest-y.json
@@ -170,7 +181,7 @@ Read the report (`e1.json`, per arm under `details.arms`) and the harvest togeth
 |---|---|
 | In `activity`, `disk_blocks_512_grown` is 0 or stops growing within seconds (`disk_last_growth_ms`), `helper_cpu_ms_gained` and `vm_service_max_cpu_ms_gained_between_samples` are small; or `trace.ended` names a stop or error; and the harvest has no `kbf-probe-local` and no diagnostics newer than the setup | The guest never runs launchd to a steady state: it stalls or powers off early. If only the headless arm is like this and the graphics arm differs, the missing display is the cause |
 | CPU and disk writes keep going, `kbf-probe-local` is absent, and the diagnostics show launchd running | launchd did not load our plists: the plists are ignored, or the setup wrote to a volume the guest does not boot from. The log lines name the reason; `stats` shows the marker time |
-| `kbf-probe-local` is present, `com.kbf.probe.mount.log` holds a `mount_virtiofs` error, or `com.kbf.probe.system.log` says the binary under `/private/var/kbf-mnt` does not exist | The share never mounted: the hand mount of the automount tag fails |
+| `kbf-probe-local` is present, `com.kbf.probe.mount.log` ends with `did not mount ... after 40 attempts` (or `com.kbf.probe.system.log` says the binary under `/private/var/kbf-mnt` does not exist) | The share never mounted: the last error in the log is the reason. The first E1 run's `Resource busy` was the automount tag mounted by hand; the daemon now mounts its own tag, so a `Resource busy` here means something else holds the mount point |
 | `kbf-probe-local` is present, `com.kbf.probe.mount.log` is empty, and `com.kbf.probe.system.log` shows a permission or `Killed: 9` error (or the unified log shows AMFI killing the process) | The guest binary cannot run from the share: `nobody` cannot traverse it, the mount is `noexec`, or code signing kills the binary |
 | Everything is present and `guest_marker_ms` is set, or the marker appeared only in the graphics arm | The guest is only slow (beyond 320 seconds), or it needs the graphics device |
 
@@ -178,6 +189,151 @@ Read the report (`e1.json`, per arm under `details.arms`) and the harvest togeth
 (`mtime_unix`): that is when launchd ran the daemon, to compare with the boot time the file
 holds and with the setup marker's time in `stats`. Compare the two arms: a file in one and
 not the other points at the graphics device.
+
+### E1 result, first run, and the fix
+
+The first run (a Mac Studio, macOS 27.0.1 guest and host) showed that both guests boot
+fully and launchd runs the offline-written plists: `com.kbf.probe.local` wrote
+`/private/var/log/kbf-probe-local` with the boot time and `27.0.1` in both clones, so the
+offline write reached the volume the guest boots from. The share never mounted: in both
+clones `com.kbf.probe.mount.log` held 101 copies of `mount_virtiofs: failed to mount
+/private/var/kbf-mnt: Resource busy`, and `com.kbf.probe.root.log` and
+`com.kbf.probe.local.log` were empty, so `kbf-guest` never ran from the share and the
+system marker never came. In the headless clone WindowServer aborted (SIGABRT) about every
+30 seconds (ten crash reports in `Library/Logs/DiagnosticReports`); the graphics clone had
+none.
+
+The cause, from the code: the mount daemon mounted the tag
+`com.apple.virtio-fs.automount`, the tag `kbf-vmm` attaches the automount share under, and
+the guest already mounts that device itself at `/Volumes/My Shared Files`; a second mount
+of the same device is `EBUSY`. The daemon was also restarted by launchd every 3 seconds
+forever, which made the 101 lines. (That the automount mount existed was not read from the
+guest in that run; it is the explanation that fits `Resource busy` and the code. The next
+E1 run shows whether the mount now works.)
+
+What changed:
+
+| share | host directory | tag | where the guest sees it |
+|---|---|---|---|
+| automount | the share directory (`kbf-guest`, `results`) as the folder `kbf` | `com.apple.virtio-fs.automount`, mounted by the system | `/Volumes/My Shared Files/kbf` once a session exists; only the probes' `automount` question reads it |
+| own | the same share directory | `kbfshare`, mounted by `kbf-guest mount-share` | `/private/var/kbf-mnt`; the daemons run `kbf-guest` from it and write `results` into it |
+| probe | an empty world-writable directory | `kbfprobe` | mounted and unmounted by `probe-guest` at `/private/tmp/kbfmnt-*` to answer G3 |
+
+Why a tag of our own rather than waiting for the automount path: the automount is a
+system service whose timing and session dependence were not measured, and a daemon that
+waits for it has nothing to say if it never appears. A tag we mount ourselves depends on
+nothing but the device and fails with the tool's own error. The automount share stays so
+that the probes still report whether it is usable. The mount is run from a copy of
+`kbf-guest` on the guest's disk because the copy on the share cannot be reached before the
+share is mounted; and `kbf-guest mount-share` refuses the automount tag.
+
+### E1 result, second run: the share mounts, every write into it is refused
+
+With the own-tag mount, `com.kbf.probe.mount.log` is empty in both clones and `kbf-guest`
+runs from the share (`com.kbf.probe.root.log` is written), so the guest reaches userspace
+and runs our code; both arms behave the same, so the graphics device does not matter for
+this. But `com.kbf.probe.root.log` holds 99 copies of `kbf-guest: write
+/private/var/kbf-mnt/results/guest-probe-root.json: Operation not permitted (os error 1)`
+and once `umount: unmount(/private/tmp/kbfmnt-root): Operation not permitted`, so no
+result and no `ready-system` marker ever reaches the host.
+
+What the code and the logs settle, and what they do not:
+
+- The host side is not read-only (`vz/config.rs` passes `readOnly` false for both kinds of
+  share), `results/` is made `0777` by the host, and the share lives in the console user's
+  home. Apple documents that the framework reads and writes host files as the effective
+  user of the VM process, ignoring a guest's `chown`, so a mode or an owner on the host
+  does not explain a guest root being refused.
+- The refusal is the same for a root file write and for a root `unmount`, which points at
+  a policy in the guest that is not a file mode: a MAC-framework check (sandbox, TCC
+  network-volume access, which applies to processes started by launchd that are not apps)
+  or a mount flag. That is a hypothesis; nothing here proves it.
+- The old code wrote through a temporary file and a rename and reported only "write": it
+  could not say whether the create, the write or the rename was refused. It now tries
+  the temporary file route first and then writes the result in place, and its error text
+  names each step that failed. If only the rename was refused, the result files now land.
+- The logs of the daemons that run as `nobody` were absent in both clones. `nobody` cannot
+  create a file in `/var/log`, which is where launchd was told to put them; these daemons
+  now log in `/private/var/tmp`, and the harvest copies `com.kbf.probe.*.log` from there.
+  (Whether they ran at all is not known from run two.)
+
+New diagnostics for the next run. `kbf-guest probe-diag` runs as a root daemon
+(`com.kbf.probe.diag`) from the copy of `kbf-guest` on the guest's disk, so it reports even
+when the mount fails. It waits up to 5 minutes for `/private/var/kbf-mnt/results`, then
+prints one JSON object to `/private/var/log/kbf-probe-diag` (the harvest copies it):
+`id`, `mount` (the mount table entry and its flags), `sw_vers`, `csrutil status`, `ls
+-ldeO@` and `stat` (owner, group, mode, flags, extended attributes, ACL) of the mount
+point, of `results/` and of a control directory on the guest's disk, and, for the mount
+point, `results/` and the control directory, each step of a write (create, write, rename,
+mkdir, remove) with its errno and the first step that failed. It also mounts the
+`kbfprobe` tag at `/private/tmp/kbfmnt-diag`, runs the same write steps inside it, and
+unmounts it with the system call, reporting the errno of each. Read it like this:
+
+| `writes` | meaning |
+|---|---|
+| control all ok, share root and `results/` fail at `create` | the guest refuses to create files on virtiofs for root; compare `ls` flags and the unified log around the time (`log show --archive ... --predicate 'process == "tccd" OR process == "sandboxd" OR eventMessage CONTAINS "deny"'`) |
+| `create` and `write` ok, `rename` fails | virtiofs refuses a rename; the in-place fallback now covers it |
+| `results/` fails and the mount root works (or the reverse) | a per-directory difference: owner or mode as the guest maps it |
+| everything ok in the diagnosis but `com.kbf.probe.root.log` still shows the refusal | the refusal is specific to the binary running from the share (the process is located on the volume it writes to) |
+
+### E1 result, third run: nothing can be created in any share
+
+`probe-diag` settled the guest side. The first step of every write fails: `create`, with
+`EPERM`, for root (uid 0, all groups), in the share root `/private/var/kbf-mnt`, in
+`results/` (shown `drwxrwxrwx`, owner `_unknown`) and in a second mount of the `kbfprobe`
+tag; `mkdir` fails the same way. The control directory on the guest's disk passes every
+step. The daemons that run as `nobody` fail the same way (about 95 `create ...
+Operation not permitted` lines each), so no guest identity can create anything in a
+virtiofs share. The mount shows `(AppleVirtIOFS, nodev, nosuid)`, SIP is on, and
+unmounting works now. The host's unified log shows no TCC or sandbox denial in the window.
+So the refusal is on the host side of the share, or in how virtiofs maps ownership for a
+macOS guest (every file shows owner uid 99).
+
+Apple's documentation for `VZSharedDirectory` and `VZVirtioFileSystemDeviceConfiguration`
+says nothing about the host directory's owner, mode, location or path form (no
+requirement of a real path, no statement for `/Users` against `/private`), says the mount
+commands are meant to be run by a user logged in to the guest, and gives automount
+examples that share a directory in the user's home. It names no cause, so there is no
+direct fix; the next run is a matrix.
+
+### The share matrix
+
+`probe e1` now gives each VM, besides the three shares above, one extra virtiofs device
+per row of this table (`--no-matrix` leaves them out). Each has its own host directory
+`kbf-<vm>-mx-<name>` and tag `kbfmx<i>`; rows differ from `base` in one factor.
+
+| name | what differs from `base` (work directory, mode 0777, owned by the user running `kbf-vmm`, single-directory share, writable) |
+|---|---|
+| `base` | nothing |
+| `mode755` | mode 0755 |
+| `tmp` | location `/private/tmp` |
+| `shared` | location the shared-users directory under the Users folder (`Shared`) |
+| `multiple` | a multiple-directory share (the directory is listed as `m`) |
+| `other-owner` | owned by another user; made only by a root run, otherwise listed as skipped |
+| `control-mode555` | negative control: mode 0555, nobody can write on the host |
+| `control-readonly` | negative control: the share is marked read-only |
+
+The host writes the list into `matrix.json` in the main share. The guest (`com.kbf.probe.diag`)
+mounts each tag at `/private/tmp/kbfmx-<name>`, runs the write steps in it (in `m/` for the
+multiple-directory share), and unmounts it. The automount share
+(`/Volumes/My Shared Files/kbf`) is written to as well. After the run the host lists every
+matrix directory in `details.arms[].matrix_host`: its real path, owner and mode, and every
+file the guest left in it (anything listed landed on the host).
+
+Read `matrix` in `<harvest>/private/var/log/kbf-probe-diag` (one row per share, with
+`cycle.inside.steps` and `first_failed_step`) together with `matrix_host` in `e1.json`:
+
+| observation | meaning |
+|---|---|
+| every row fails at `create`, including `tmp` and `shared`, the host listings are empty | the location, the mode and the single/multiple type do not matter; the refusal is in the guest's virtiofs for any host directory (or in the Virtualization service), not in what we pass |
+| `base` fails but `tmp` or `shared` works (or the reverse) | the location matters; compare `real_path` (a path through a symbolic link or a protected folder) and the host's TCC rules for the home directory |
+| `base` fails but `mode755` works | the mode matters (it should not: the guest cannot see the host mode) |
+| `multiple` works and the single-directory rows fail | single-directory shares are read-only for guests in practice; share a multiple-directory share instead |
+| `control-mode555` and `base` fail alike, with the same errno | the host's file permissions are the cause; check who owns `base` and the VM helper's user in `matrix_host` |
+| `control-readonly` fails with a different errno than `base` (`EROFS` against `EPERM`) | `base` is not being treated as read-only; the refusal is something else |
+| a row fails in the guest but its file is listed in `matrix_host` | the write reached the host and the guest was told it failed |
+| `other-owner` works and `base` fails | the directory must not be owned by the VM's user (unlikely; re-run as root to get this row) |
+| the automount write works and the matrix rows fail | use the automount path for results (it needs a user session or the system's own mount; see `automount` in the guest's probe result) |
 
 ## What to send back
 

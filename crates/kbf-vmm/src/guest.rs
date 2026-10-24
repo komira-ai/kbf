@@ -19,16 +19,35 @@ use crate::system::OfflineFile;
 /// Where the system's own automount shows the share once a user session exists. The
 /// probes read it to report whether it is usable without one; they do not depend on it.
 pub const AUTOMOUNT_DIR: &str = "/Volumes/My Shared Files/kbf";
-/// Where the root mount daemon mounts the automount tag itself, so the guest side needs
-/// no user session.
+/// Where the root mount daemon mounts [`SHARE_TAG`], so the guest side needs no user
+/// session.
 pub const GUEST_MOUNT: &str = "/private/var/kbf-mnt";
-/// The share as the guest daemons use it: the shared folder `kbf` under [`GUEST_MOUNT`].
-pub const GUEST_SHARE: &str = "/private/var/kbf-mnt/kbf";
-/// The virtiofs tag the system's automount uses.
+/// The share as the guest daemons use it: the mount's root, which is the host's share
+/// directory itself (it holds `kbf-guest` and `results`).
+pub const GUEST_SHARE: &str = GUEST_MOUNT;
+/// What the daemons wait for before they start: the results directory exists in the
+/// share and nowhere else (the mount point itself exists before the mount).
+pub const GUEST_RESULTS: &str = "/private/var/kbf-mnt/results";
+/// The virtiofs tag the system's automount uses. The system mounts that device itself, at
+/// `/Volumes/My Shared Files`; the first E1 run had the mount daemon mount it again and got
+/// `Resource busy` 101 times. Nothing of ours mounts it, and `kbf-guest mount-share`
+/// refuses it.
 pub const AUTOMOUNT_TAG: &str = "com.apple.virtio-fs.automount";
+/// The virtiofs tag of the share directory that the mount daemon mounts at
+/// [`GUEST_MOUNT`]: a tag the system does not mount on its own.
+pub const SHARE_TAG: &str = "kbfshare";
+/// Where the offline write puts a copy of `kbf-guest` on the guest's own disk (inside the
+/// Data volume, without a leading slash: [`BOOTSTRAP_OFFLINE`]). The mount daemon runs
+/// it, because the copy on the share cannot be reached before the share is mounted.
+pub const BOOTSTRAP: &str = "/usr/local/libexec/kbf-guest";
+const BOOTSTRAP_OFFLINE: &str = "usr/local/libexec/kbf-guest";
+/// How many times the mount daemon tries the mount, and the pause between two tries. After
+/// the last try it logs the failure and exits non-zero, once (launchd does not restart it).
+pub const MOUNT_ATTEMPTS: u32 = 40;
+pub const MOUNT_DELAY_MS: u64 = 3000;
 /// The most a result file may hold before the host refuses to read it.
 pub const MAX_RESULT_BYTES: u64 = 1 << 20;
-/// The custom virtiofs tag of the second share.
+/// The custom virtiofs tag of the empty share the probe mounts itself, to answer G3.
 pub const TAG: &str = "kbfprobe";
 /// The vsock port the host listens on and the guest tries.
 pub const VSOCK_PORT: u32 = 5000;
@@ -54,6 +73,13 @@ pub const LOCAL_LABEL: &str = "com.kbf.probe.local";
 /// boot proves launchd loaded our plists, its modification time says when, and `image
 /// harvest` reads it.
 pub const LOCAL_MARKER: &str = "/private/var/log/kbf-probe-local";
+/// The label of the root daemon that runs `kbf-guest probe-diag`, and the file launchd
+/// writes its JSON to (on the guest's own disk, because the share refuses writes).
+pub const DIAG_LABEL: &str = "com.kbf.probe.diag";
+pub const DIAG_OUTPUT: &str = "/private/var/log/kbf-probe-diag";
+/// Where the daemons that run as `nobody` keep their logs: `nobody` cannot create a file
+/// in `/var/log`, and the second E1 run left no log of theirs there.
+pub const USER_LOG_DIR: &str = "/private/var/tmp";
 
 /// The host side of the share for one VM.
 #[derive(Debug, Clone)]
@@ -93,7 +119,7 @@ pub fn prepare_share(ctx: &Ctx<'_>, name: &str) -> Result<Share, String> {
 }
 
 /// Makes the new directory `path` with exactly `mode` (not reduced by the umask).
-fn make_dir(path: &Path, mode: u32) -> Result<(), String> {
+pub(crate) fn make_dir(path: &Path, mode: u32) -> Result<(), String> {
     std::fs::create_dir(path)
         .and_then(|()| std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)))
         .map_err(|e| format!("create {}: {e}", path.display()))
@@ -101,7 +127,7 @@ fn make_dir(path: &Path, mode: u32) -> Result<(), String> {
 
 /// Removes whatever is at `path` without following a symbolic link. A removal that fails
 /// is not reported here: the `create_dir` that follows fails on what is left.
-fn remove_leftover(path: &Path) {
+pub(crate) fn remove_leftover(path: &Path) {
     let _ = match std::fs::symlink_metadata(path) {
         Err(_) => Ok(()),
         Ok(m) if m.is_dir() => std::fs::remove_dir_all(path),
@@ -214,15 +240,27 @@ fn escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// A launch daemon plist that runs `args` at load, as `user` when given, restarting
-/// itself every few seconds until the share is mounted and the command succeeds.
+/// A launch daemon plist that runs `args` at load, as `user` when given. With `restart`
+/// launchd starts it again every few seconds until it succeeds (the probes waiting for the
+/// share); without, it runs once and a failure stays in its log.
 #[must_use]
 pub fn daemon_plist(
     label: &str,
     user: Option<&str>,
     args: &[String],
     stdout: Option<&str>,
+    restart: bool,
 ) -> String {
+    let log_dir = if user.is_some() {
+        USER_LOG_DIR
+    } else {
+        "/var/log"
+    };
+    let keep_alive = if restart {
+        "  <key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>\n  <key>ThrottleInterval</key>\n  <integer>3</integer>\n"
+    } else {
+        ""
+    };
     let args: String = args
         .iter()
         .map(|a| format!("    <string>{}</string>\n", escape(a)))
@@ -241,7 +279,7 @@ pub fn daemon_plist(
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
-<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{label}</string>\n  <key>ProgramArguments</key>\n  <array>\n{args}  </array>\n{user}  <key>RunAtLoad</key>\n  <true/>\n  <key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>\n  <key>ThrottleInterval</key>\n  <integer>3</integer>\n  <key>StandardErrorPath</key>\n  <string>/var/log/{label}.log</string>\n{stdout}</dict>\n</plist>\n"
+<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{label}</string>\n  <key>ProgramArguments</key>\n  <array>\n{args}  </array>\n{user}  <key>RunAtLoad</key>\n  <true/>\n{keep_alive}  <key>StandardErrorPath</key>\n  <string>{log_dir}/{label}.log</string>\n{stdout}</dict>\n</plist>\n"
     )
 }
 
@@ -252,13 +290,14 @@ fn guest_args(sub: &[&str]) -> Vec<String> {
 }
 
 /// The files the offline write puts into the guest: the Setup Assistant marker, the mount
-/// point directory, and six launch daemons (the share mounter, a probe as root, a probe
-/// as `nobody`, the system marker, the login marker, and the local marker that needs
-/// none of the others).
+/// point directory, the copy of `kbf-guest` the mount daemon runs (when `bootstrap` holds
+/// its bytes), and seven launch daemons (the share mounter, a probe as root, a probe as
+/// `nobody`, the system marker, the login marker, the share diagnosis, and the local
+/// marker that needs none of the others).
 #[must_use]
-pub fn offline_payload() -> Vec<OfflineFile> {
+pub fn offline_payload(bootstrap: Option<Vec<u8>>) -> Vec<OfflineFile> {
     let out = |name: &str| format!("{GUEST_SHARE}/{RESULTS}/{name}");
-    let wait = GUEST_SHARE;
+    let wait = GUEST_RESULTS;
     let mut files = vec![
         OfflineFile {
             path: "private/var/db/.AppleSetupDone".to_owned(),
@@ -272,15 +311,31 @@ pub fn offline_payload() -> Vec<OfflineFile> {
             mode: 0o644,
         },
     ];
-    let daemons: [(&str, Option<&str>, Vec<String>); 6] = [
+    files.extend(bootstrap.map(|contents| OfflineFile {
+        path: BOOTSTRAP_OFFLINE.to_owned(),
+        contents,
+        mode: 0o755,
+    }));
+    // (label, user, arguments, restarted by launchd until it succeeds)
+    let daemons: [(&str, Option<&str>, Vec<String>, bool); 7] = [
         (
             "com.kbf.probe.mount",
             None,
-            vec![
-                "/sbin/mount_virtiofs".to_owned(),
-                AUTOMOUNT_TAG.to_owned(),
-                GUEST_MOUNT.to_owned(),
-            ],
+            [
+                BOOTSTRAP,
+                "mount-share",
+                "--tag",
+                SHARE_TAG,
+                "--mountpoint",
+                GUEST_MOUNT,
+                "--attempts",
+                &MOUNT_ATTEMPTS.to_string(),
+                "--delay-ms",
+                &MOUNT_DELAY_MS.to_string(),
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            false,
         ),
         (
             "com.kbf.probe.root",
@@ -302,6 +357,7 @@ pub fn offline_payload() -> Vec<OfflineFile> {
                 "--mountpoint",
                 "/private/tmp/kbfmnt-root",
             ]),
+            true,
         ),
         (
             "com.kbf.probe.user",
@@ -323,6 +379,7 @@ pub fn offline_payload() -> Vec<OfflineFile> {
                 "--mountpoint",
                 "/private/tmp/kbfmnt-user",
             ]),
+            true,
         ),
         (
             "com.kbf.probe.system",
@@ -334,6 +391,7 @@ pub fn offline_payload() -> Vec<OfflineFile> {
                 "--out",
                 &out(READY_SYSTEM),
             ]),
+            true,
         ),
         (
             "com.kbf.probe.login",
@@ -347,6 +405,23 @@ pub fn offline_payload() -> Vec<OfflineFile> {
                 "--out",
                 &out(READY_LOGIN),
             ]),
+            true,
+        ),
+        (
+            // From the guest's own disk, so that it reports even when the mount fails.
+            DIAG_LABEL,
+            None,
+            [
+                BOOTSTRAP,
+                "probe-diag",
+                "--share",
+                GUEST_MOUNT,
+                "--wait-path",
+                GUEST_RESULTS,
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            false,
         ),
         (
             LOCAL_LABEL,
@@ -359,16 +434,22 @@ pub fn offline_payload() -> Vec<OfflineFile> {
             ]
             .map(str::to_owned)
             .to_vec(),
+            false,
         ),
     ];
-    for (label, user, args) in daemons {
+    for (label, user, args, restart) in daemons {
         files.push(OfflineFile {
             path: format!("Library/LaunchDaemons/{label}.plist"),
             contents: daemon_plist(
                 label,
                 user,
                 &args,
-                (label == LOCAL_LABEL).then_some(LOCAL_MARKER),
+                match label {
+                    LOCAL_LABEL => Some(LOCAL_MARKER),
+                    DIAG_LABEL => Some(DIAG_OUTPUT),
+                    _ => None,
+                },
+                restart,
             )
             .into_bytes(),
             mode: 0o644,
@@ -376,6 +457,19 @@ pub fn offline_payload() -> Vec<OfflineFile> {
     }
     files
 }
+
+/// [`offline_payload`] with the `kbf-guest` at `binary` as the mount daemon's copy.
+///
+/// # Errors
+/// The file could not be read.
+pub fn offline_payload_from(binary: &Path) -> Result<Vec<OfflineFile>, String> {
+    let bytes = std::fs::read(binary).map_err(|e| format!("read {}: {e}", binary.display()))?;
+    Ok(offline_payload(Some(bytes)))
+}
+
+/// The reason `image base --offline-setup` and `image setup` give when no guest binary was
+/// named: the mount daemon runs a copy of it from the guest's own disk.
+pub const NEEDS_GUEST_BINARY: &str = "needs --guest-binary: the guest's mount daemon runs a copy of kbf-guest from the guest's own disk (the copy on the share cannot be reached before the share is mounted)";
 
 /// True when `dir` holds the guest binary.
 #[must_use]
@@ -388,9 +482,16 @@ mod tests {
     use super::*;
     use crate::fake::{FakeSystem, ctx, holds, tmp, work_with_base};
 
+    /// The text of the plist of daemon `label` in `files`.
+    fn plist_of(files: &[OfflineFile], label: &str) -> String {
+        let path = format!("Library/LaunchDaemons/{label}.plist");
+        let f = files.iter().find(|f| f.path == path).expect("daemon");
+        String::from_utf8(f.contents.clone()).expect("utf8")
+    }
+
     /// Catches plist text that is not escaped (a path with `&` would corrupt the file
-    /// launchd reads), a missing user key for the unprivileged daemons, and one present
-    /// for the root control.
+    /// launchd reads), a missing user key for the unprivileged daemons, one present for
+    /// the root control, and a restart policy that does not follow the `restart` flag.
     #[test]
     fn a_daemon_plist_escapes_and_names_its_user() {
         let user = daemon_plist(
@@ -398,6 +499,7 @@ mod tests {
             Some("nobody"),
             &["/a&b".into(), "<c>".into()],
             None,
+            true,
         );
         assert!(
             holds(&[
@@ -410,71 +512,136 @@ mod tests {
             user.contains("<key>UserName</key>\n  <string>nobody</string>"),
             "{user}"
         );
-        assert!(user.contains("<string>/var/log/com.kbf.x.log</string>"));
-        let root = daemon_plist("com.kbf.y", None, &["/bin/true".into()], Some("/o&p"));
+        assert!(user.contains(&format!("<string>{USER_LOG_DIR}/com.kbf.x.log</string>")));
+        let root = daemon_plist(
+            "com.kbf.y",
+            None,
+            &["/bin/true".into()],
+            Some("/o&p"),
+            false,
+        );
         assert!(!root.contains("UserName"), "{root}");
         assert!(
             root.contains("<key>StandardOutPath</key>\n  <string>/o&amp;p</string>"),
             "{root}"
         );
         assert!(!user.contains("StandardOutPath"), "{user}");
+        assert!(holds(&[
+            user.contains("<key>KeepAlive</key>"),
+            user.contains("<key>ThrottleInterval</key>"),
+            !root.contains("KeepAlive"),
+            !root.contains("ThrottleInterval"),
+            root.contains("<key>RunAtLoad</key>"),
+        ]));
     }
 
     /// Catches a payload that lacks the marker that skips Setup Assistant, the mount point
-    /// directory, the root daemon that mounts the share without a user session, a daemon
-    /// the guest would never start, a daemon that waits for a path the mounter does not
-    /// make, or a root control that runs as nobody (the G3 verdict compares the two users).
+    /// directory, the copy of `kbf-guest` the mounter runs, a daemon the guest would never
+    /// start, a daemon that waits for a path the mounter does not make, or a root control
+    /// that runs as nobody (the G3 verdict compares the two users).
     #[test]
-    fn the_offline_payload_holds_the_marker_the_mount_point_and_six_daemons() {
-        let files = offline_payload();
+    fn the_offline_payload_holds_the_marker_the_mount_point_the_binary_and_seven_daemons() {
+        let files = offline_payload(Some(b"bin".to_vec()));
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths[0], "private/var/db/.AppleSetupDone");
         assert_eq!(paths[1], "private/var/kbf-mnt/.keep");
-        assert_eq!(paths.len(), 8);
-        assert!(paths[2..].iter().all(|p| holds(&[
+        assert_eq!(paths[2], "usr/local/libexec/kbf-guest");
+        assert_eq!(
+            (files[2].contents.as_slice(), files[2].mode),
+            (&b"bin"[..], 0o755)
+        );
+        assert_eq!(BOOTSTRAP, format!("/{}", paths[2]));
+        assert_eq!(paths.len(), 10);
+        assert!(paths[3..].iter().all(|p| holds(&[
             p.starts_with("Library/LaunchDaemons/com.kbf.probe."),
             p.ends_with(".plist")
         ])));
-        let text = |i: usize| String::from_utf8(files[i].contents.clone()).expect("utf8");
+        let root = plist_of(&files, "com.kbf.probe.root");
+        let user = plist_of(&files, "com.kbf.probe.user");
+        let system = plist_of(&files, "com.kbf.probe.system");
+        let login = plist_of(&files, "com.kbf.probe.login");
         assert!(holds(&[
-            !text(2).contains("UserName"),
-            text(2).contains("/sbin/mount_virtiofs"),
-            text(2).contains(AUTOMOUNT_TAG),
-            text(2).contains(&format!("<string>{GUEST_MOUNT}</string>")),
+            !root.contains("UserName"),
+            root.contains(ROOT_RESULT),
+            root.contains(AUTOMOUNT_DIR),
         ]));
         assert!(holds(&[
-            !text(3).contains("UserName"),
-            text(3).contains(ROOT_RESULT),
-            text(3).contains(AUTOMOUNT_DIR),
+            user.contains("<string>nobody</string>"),
+            user.contains(USER_RESULT)
         ]));
+        assert!(system.contains(READY_SYSTEM));
         assert!(holds(&[
-            text(4).contains("<string>nobody</string>"),
-            text(4).contains(USER_RESULT)
+            login.contains("loginwindow"),
+            login.contains(READY_LOGIN)
         ]));
-        assert!(text(5).contains(READY_SYSTEM));
-        assert!(holds(&[
-            text(6).contains("loginwindow"),
-            text(6).contains(READY_LOGIN)
-        ]));
-        assert_eq!(paths[7], "Library/LaunchDaemons/com.kbf.probe.local.plist");
-        assert!(files.iter().all(|f| f.mode == 0o644));
-        // The daemons run the binary from, and wait for, the path the mounter provides.
-        assert!(GUEST_SHARE.starts_with(GUEST_MOUNT));
-        for i in 3..7 {
-            assert!(text(i).contains(&format!("<string>{GUEST_SHARE}/{GUEST_BIN}</string>")));
-            assert!(text(i).contains(&format!("<string>{GUEST_SHARE}</string>")));
+        assert!(files.iter().all(|f| f.mode == 0o644 || f.path == paths[2]));
+        // The daemons run the binary from, and wait for, the paths the mounter provides.
+        assert_eq!(GUEST_SHARE, GUEST_MOUNT);
+        assert!(GUEST_RESULTS.starts_with(GUEST_MOUNT));
+        for text in [&root, &user, &system, &login] {
+            assert!(text.contains(&format!("<string>{GUEST_SHARE}/{GUEST_BIN}</string>")));
+            assert!(text.contains(&format!("<string>{GUEST_RESULTS}</string>")));
+            assert!(text.contains(&format!("{GUEST_SHARE}/{RESULTS}/")));
+            assert!(
+                text.contains("<key>KeepAlive</key>"),
+                "waiting daemons restart"
+            );
         }
+        // Without the binary the copy is not written; the daemons still are.
+        let bare = offline_payload(None);
+        assert_eq!(bare.len(), 9);
+        assert!(bare.iter().all(|f| f.path != paths[2]));
+    }
+
+    /// Catches the defect the first E1 run showed: the mount daemon mounting the automount
+    /// tag (the system has it mounted: `Resource busy`, 101 times) instead of the share's
+    /// own tag, running the copy on the share it cannot reach yet, restarting forever
+    /// instead of failing once after a bound, or mounting somewhere the daemons do not read.
+    #[test]
+    fn the_mount_daemon_mounts_its_own_tag_from_the_guest_disk_and_stops_after_a_bound() {
+        let plist = plist_of(&offline_payload(Some(Vec::new())), "com.kbf.probe.mount");
+        let arg = |a: &str| format!("<string>{a}</string>");
+        let ordered = [
+            BOOTSTRAP,
+            "mount-share",
+            "--tag",
+            SHARE_TAG,
+            "--mountpoint",
+            GUEST_MOUNT,
+            "--attempts",
+            &MOUNT_ATTEMPTS.to_string(),
+            "--delay-ms",
+            &MOUNT_DELAY_MS.to_string(),
+        ]
+        .map(arg)
+        .concat();
+        assert!(
+            plist.contains(&ordered.replace("</string><string>", "</string>\n    <string>")),
+            "{plist}"
+        );
+        assert!(holds(&[
+            !plist.contains(AUTOMOUNT_TAG),
+            !plist.contains(&format!("{GUEST_SHARE}/{GUEST_BIN}")),
+            !plist.contains("/sbin/mount_virtiofs"),
+            !plist.contains("UserName"),
+            !plist.contains("KeepAlive"),
+            plist.contains("<key>RunAtLoad</key>"),
+        ]));
+        assert_ne!(SHARE_TAG, AUTOMOUNT_TAG);
+        assert_ne!(SHARE_TAG, TAG);
+        assert!((1..=1000).contains(&MOUNT_ATTEMPTS));
+        // The bound is finite and the whole wait is minutes, not hours.
+        assert!(u64::from(MOUNT_ATTEMPTS) * MOUNT_DELAY_MS <= 600_000);
     }
 
     /// Catches a local-marker daemon that depends on the share or a shell (it must run
     /// when the mount never happens), runs as a user that cannot write the log directory,
-    /// writes somewhere the harvest allowlist does not read, or would be restarted forever
-    /// (the plist restarts a daemon that exits non-zero), and a log name the harvest's
+    /// writes somewhere the harvest allowlist does not read, and a log name the harvest's
     /// pattern would miss.
     #[test]
     fn the_local_daemon_needs_nothing_and_writes_where_harvest_reads() {
-        let files = offline_payload();
-        let plist = String::from_utf8(files[7].contents.clone()).expect("utf8");
+        let files = offline_payload(Some(Vec::new()));
+        let plist = plist_of(&files, LOCAL_LABEL);
         assert!(
             holds(&[
                 plist.contains("<string>com.kbf.probe.local</string>"),
@@ -492,21 +659,88 @@ mod tests {
             ]),
             "{plist}"
         );
-        // Only the local daemon has its output redirected.
-        for f in &files[2..7] {
+        // Only the local and the diagnosis daemons have their output redirected.
+        for f in files.iter().filter(|f| f.path.ends_with(".plist")) {
             let text = String::from_utf8(f.contents.clone()).expect("utf8");
-            assert!(!text.contains("StandardOutPath"), "{}", f.path);
+            assert_eq!(
+                text.contains("StandardOutPath"),
+                f.path.contains(LOCAL_LABEL) || f.path.contains(DIAG_LABEL),
+                "{}",
+                f.path
+            );
         }
         assert_eq!(
             crate::harvest::ALLOWLIST[0],
             crate::harvest::Item::File(LOCAL_MARKER.trim_start_matches('/'))
         );
         // Every daemon log the others write is read by the harvest's name pattern.
-        for f in &files[2..8] {
+        for f in files.iter().filter(|f| f.path.ends_with(".plist")) {
             let name = f.path.trim_start_matches("Library/LaunchDaemons/");
             let label = name.trim_end_matches(".plist");
             assert!(label.starts_with("com.kbf.probe."), "{label}");
         }
+    }
+
+    /// Catches a diagnosis daemon that needs the share (it must report when the mount
+    /// fails), runs as a user that the share may refuse, would loop, or sends its JSON
+    /// somewhere the harvest does not read, and logs of the `nobody` daemons in a
+    /// directory `nobody` cannot write (the second E1 run left none).
+    #[test]
+    fn the_diagnosis_runs_from_the_guest_disk_and_the_user_daemons_log_where_they_can() {
+        let files = offline_payload(Some(Vec::new()));
+        let diag = plist_of(&files, DIAG_LABEL);
+        assert!(
+            holds(&[
+                diag.contains(&format!("<string>{BOOTSTRAP}</string>")),
+                diag.contains("<string>probe-diag</string>"),
+                diag.contains(&format!("<string>{GUEST_RESULTS}</string>")),
+                !diag.contains(&format!("{GUEST_SHARE}/{GUEST_BIN}")),
+                !diag.contains("UserName"),
+                !diag.contains("KeepAlive"),
+                diag.contains(&format!(
+                    "<key>StandardOutPath</key>\n  <string>{DIAG_OUTPUT}</string>"
+                )),
+            ]),
+            "{diag}"
+        );
+        assert_eq!(
+            crate::harvest::ALLOWLIST[6],
+            crate::harvest::Item::File(DIAG_OUTPUT.trim_start_matches('/'))
+        );
+        for label in ["user", "system", "login"] {
+            let p = plist_of(&files, &format!("com.kbf.probe.{label}"));
+            assert!(
+                p.contains(&format!(
+                    "<string>{USER_LOG_DIR}/com.kbf.probe.{label}.log</string>"
+                )),
+                "{p}"
+            );
+        }
+        assert!(
+            plist_of(&files, "com.kbf.probe.root")
+                .contains("<string>/var/log/com.kbf.probe.root.log</string>")
+        );
+        assert_eq!(
+            crate::harvest::ALLOWLIST[7],
+            crate::harvest::Item::Matching {
+                dir: USER_LOG_DIR.trim_start_matches('/'),
+                prefix: "com.kbf.probe.",
+                suffix: ".log"
+            }
+        );
+    }
+
+    /// Catches a binary read from the wrong place or a missing file that is not reported.
+    #[test]
+    fn the_payload_carries_the_bytes_of_the_binary_given() {
+        let dir = tmp("guest-payload-from");
+        let bin = dir.join("kbf-guest");
+        std::fs::write(&bin, "the-bytes").expect("bin");
+        let files = offline_payload_from(&bin).expect("payload");
+        assert_eq!(files[2].contents, b"the-bytes");
+        let e = offline_payload_from(&dir.join("none")).unwrap_err();
+        assert!(e.contains("none"), "{e}");
+        assert!(NEEDS_GUEST_BINARY.contains("--guest-binary"));
     }
 
     /// Catches a share that is not made, a guest binary that is not copied into it, a
