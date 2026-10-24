@@ -1274,6 +1274,7 @@ fn only_a_top_level_refusal_of_the_examination_is_taken_as_an_entry_not_there() 
     assert!(skip_protected_top(Ok(None), 0, here).unwrap().is_none());
 }
 
+#[cfg(not(target_os = "macos"))]
 fn place(names: &[&str]) {
     pretend_placed(names);
 }
@@ -1340,6 +1341,7 @@ fn the_unlock_is_for_the_owner_and_a_refused_one_is_skipped_with_the_warning() {
 
 /// A directory the system placed (`sunlnk`, `com.apple.rootless`) below a kept folder
 /// keeps its flags and mode, stays, and is emptied; what is in it goes.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_directory_the_system_placed_is_kept_and_emptied() {
     if root() {
@@ -1385,4 +1387,107 @@ fn a_directory_is_the_systems_when_it_has_sunlnk_or_the_rootless_attribute() {
     assert!(placed(0, true));
     assert!(!placed(0x8000 | 0x2, false));
     assert!(!placed(0, false));
+}
+
+/// Rule 1: a refusal in the walk does not stop it. The files beside the one that cannot
+/// be removed go, the refusal is named by its path, and everything else is judged after.
+#[test]
+fn a_refusal_in_the_walk_does_not_stop_the_rest() {
+    if root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = scratch("walk-goes-on");
+    let home = dir.join("home");
+    fs::create_dir_all(home.join("Library/locked")).unwrap();
+    fs::write(home.join("Library/locked/f"), "x").unwrap();
+    for name in ["a", "b", "y", "z"] {
+        fs::write(home.join("Library").join(name), "x").unwrap();
+    }
+    chmod(&home.join("Library/locked"), 0o500);
+    let swept = empty(&home, me());
+    chmod(&home.join("Library/locked"), 0o700);
+    assert_eq!(swept.errors.len(), 1, "{:?}", swept.errors);
+    assert!(
+        swept.errors[0].contains("Library/locked/f"),
+        "{:?}",
+        swept.errors
+    );
+    assert_eq!(names(&home.join("Library")), ["locked"]);
+}
+
+/// Rule 2: an empty directory the system will not let the pool user remove is kept, with
+/// the directory that holds it, and is no error; what was in it went.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn an_empty_directory_the_system_will_not_remove_is_kept_and_the_rest_goes() {
+    if root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = scratch("kept-empty");
+    let home = dir.join("home");
+    fs::create_dir_all(home.join("Library/Preferences")).unwrap();
+    fs::write(home.join("Library/Preferences/x"), "x").unwrap();
+    fs::write(home.join("Library/y"), "x").unwrap();
+    fs::create_dir_all(home.join("other")).unwrap();
+    pretend_unremovable(&["Preferences"]);
+    let swept = empty(&home, me());
+    pretend_unremovable(&[]);
+    assert_eq!(swept.errors, Vec::<String>::new());
+    assert_eq!(names(&home), ["Library"]);
+    assert_eq!(names(&home.join("Library")), ["Preferences"]);
+    assert!(names(&home.join("Library/Preferences")).is_empty());
+}
+
+/// Rule 2: a refused removal of a directory that is not empty fails, naming it.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_directory_the_system_will_not_remove_fails_when_it_is_not_empty() {
+    if root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = scratch("kept-not-empty");
+    let home = dir.join("home");
+    fs::create_dir_all(home.join("Preferences")).unwrap();
+    fs::write(home.join("Preferences/x"), "x").unwrap();
+    let late = home.join("Preferences/late");
+    pretend_unremovable(&["Preferences"]);
+    // Something is made in it after its entries were removed.
+    let swept = vanishing(
+        move |point, _| {
+            if matches!(point, Point::Examined(seen) if *seen == "x") {
+                fs::write(&late, "x").unwrap();
+            }
+        },
+        || empty(&home, me()),
+    );
+    pretend_unremovable(&[]);
+    assert_eq!(swept.errors.len(), 1, "{:?}", swept.errors);
+    assert!(
+        swept.errors[0].contains("Preferences"),
+        "{:?}",
+        swept.errors
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn the_removal_of_an_empty_directory_says_whether_the_system_refused_it() {
+    let dir = scratch("remove-empty");
+    fs::create_dir_all(dir.join("gone")).unwrap();
+    fs::create_dir_all(dir.join("kept")).unwrap();
+    assert!(remove_empty_dir(&dir.join("gone")).is_ok());
+    assert!(!dir.join("gone").exists());
+    pretend_unremovable(&["kept"]);
+    let why = remove_empty_dir(&dir.join("kept")).expect_err("refused");
+    pretend_unremovable(&[]);
+    assert!(removal_refused(&why));
+    // Not a refusal: the directory is not empty.
+    fs::write(dir.join("kept/f"), "x").unwrap();
+    let why = remove_empty_dir(&dir.join("kept")).expect_err("not empty");
+    assert!(!removal_refused(&why));
+    assert!(remove_empty_dir(Path::new("/")).is_err());
+    assert!(remove_empty_dir(&dir.join("absent/child")).is_ok());
 }

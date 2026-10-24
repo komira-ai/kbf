@@ -652,8 +652,16 @@ fn left_below(dir: &Path, out: &mut dyn Write, err: &mut dyn Write, code: &mut i
         found.protected |= inside.protected;
         found.failed |= inside.failed;
         if inside.nothing() & !placed {
-            let _ = writeln!(out, "{}", path.display());
-            found.printed = true;
+            // An empty directory: the clean removes it, so one the system keeps (it refuses
+            // the pool user the removal) is accepted, and any other is left.
+            match sweep::remove_empty_dir(&path) {
+                Ok(()) => {}
+                Err(why) if sweep::removal_refused(&why) => found.protected = true,
+                Err(_) => {
+                    let _ = writeln!(out, "{}", path.display());
+                    found.printed = true;
+                }
+            }
         }
         // An empty directory the system placed stays, and so does the one that holds it.
         found.protected |= inside.nothing() & placed;

@@ -314,6 +314,12 @@ Decided:
   emptied again every 2 seconds for 60 seconds and fails, naming the path, if they are still there: a
   keychain is never skipped. `slot_clean`'s `a_keychain_item_one_lease_stores_is_not_readable_by_the_next`
   shows an item one lease stores is not readable by the next.
+  The home's empty goes on past a refusal (it removes everything the pool user can and judges the
+  refusals together). A directory the system will not let the pool user remove (`rmdir` answers
+  "operation not permitted", as for `Library/Preferences` in the daemon's context, where root is refused
+  too) is kept while it is empty, with the folders that hold it; the home look and the slot-ready
+  assertion accept it. A file it cannot remove, or such a directory that is not empty, fails the clean
+  naming the path; only files under `Library/Keychains` are waited for (60 s).
   On a Studio, in the daemon's context, the data-protection keychain is not available to a pool user at all
   (`errSecNotAvailable`, -25291, for every delete and find), and an ad-hoc-signed process lacks the
   entitlement for it (`errSecMissingEntitlement`, -34018): both mean nothing is reachable, so nothing can

@@ -504,9 +504,13 @@ fn remove_present(
     }
     let child = open_child(dir, name, stat)?;
     let skipped_before = park.skipped.get();
+    // The walk goes on past a refusal: everything that can be removed is, and the refusals
+    // are judged together.
+    let mut failed: Vec<String> = Vec::new();
+    let mut kind = io::ErrorKind::Other;
     for entry in listed(&child)? {
         let inner_path = here.join(&entry);
-        tolerate(
+        let result = tolerate(
             examine_inner(&child, &entry).and_then(|inner| match inner {
                 Some(inner) => remove_entry(
                     &child,
@@ -520,9 +524,17 @@ fn remove_present(
             }),
             (&child, &entry, &inner_path),
             &park.skipped,
-        )?;
+        );
+        if let Err(why) = result {
+            if failed.is_empty() {
+                kind = why.kind();
+            }
+            failed.push(format!("{}: {why}", inner_path.display()));
+        }
     }
-    drop(child);
+    if !failed.is_empty() {
+        return Err(io::Error::new(kind, failed.join("; ")));
+    }
     if placed | (park.skipped.get() > skipped_before) {
         // This directory was placed by the system (emptied, never removed), or something
         // the pool user may not open is inside and stays with it, and so does this one
@@ -530,7 +542,69 @@ fn remove_present(
         park.skipped.set(park.skipped.get() + 1);
         return Ok(());
     }
-    Ok(rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR)?)
+    match rmdir_at(dir, name) {
+        // The system refuses the pool user the removal of this directory (a folder it keeps
+        // in the home, such as `Library/Preferences`): kept while it is empty, which it is
+        // here, unless something was made in it since.
+        Err(Errno::PERM) if !rustix::process::geteuid().is_root() && listed(&child)?.is_empty() => {
+            warn_once(here);
+            park.skipped.set(park.skipped.get() + 1);
+            Ok(())
+        }
+        other => Ok(other?),
+    }
+}
+
+/// Removes the empty directory `name` of `dir`.
+#[cfg(target_os = "macos")]
+fn rmdir_at(dir: &OwnedFd, name: &OsStr) -> Result<(), Errno> {
+    rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR)
+}
+
+/// Removes the empty directory `name` of `dir`; off macOS a test names the ones the system
+/// refuses ([`pretend_unremovable`]).
+#[cfg(not(target_os = "macos"))]
+fn rmdir_at(dir: &OwnedFd, name: &OsStr) -> Result<(), Errno> {
+    if UNREMOVABLE.with_borrow(|names| names.iter().any(|n| n == name)) {
+        return Err(Errno::PERM);
+    }
+    rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR)
+}
+
+#[cfg(not(target_os = "macos"))]
+thread_local! {
+    /// The names a test says the system will not let the pool user remove.
+    static UNREMOVABLE: std::cell::RefCell<Vec<OsString>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// For tests off macOS: the empty directories of these names, on this thread, are refused
+/// removal as the system refuses a pool user's `Library/Preferences`.
+#[cfg(not(target_os = "macos"))]
+#[doc(hidden)]
+pub fn pretend_unremovable(names: &[&str]) {
+    UNREMOVABLE.with_borrow_mut(|n| *n = names.iter().map(Into::into).collect());
+}
+
+/// Removes the empty directory at `path`, if the system lets the process.
+///
+/// # Errors
+/// The removal was refused or failed; `PermissionDenied`-or-"not permitted" is
+/// [`removal_refused`].
+pub fn remove_empty_dir(path: &Path) -> io::Result<()> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(io::Error::other("not a path to a directory"));
+    };
+    let Some(dir) = open_base(parent)? else {
+        return Ok(());
+    };
+    Ok(rmdir_at(&dir, name)?)
+}
+
+/// Whether `why`, from [`remove_empty_dir`], is the system refusing the removal ("operation
+/// not permitted").
+#[must_use]
+pub fn removal_refused(why: &io::Error) -> bool {
+    why.raw_os_error() == Some(Errno::PERM.raw_os_error())
 }
 
 /// How deep the removal recurses before it moves what is below up to the top: it holds one

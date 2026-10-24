@@ -914,7 +914,7 @@ fn the_home_is_emptied_as_the_uid_and_a_directory_it_owns_with_no_permission_is_
 }
 
 #[test]
-fn the_look_of_the_home_reports_files_and_empty_directories_it_can_open() {
+fn the_look_of_the_home_reports_files_and_removes_the_empty_directories_it_can() {
     let dir = tree("look-home");
     let home = dir.path().join("home");
     fs::create_dir_all(home.join("a/b")).expect("dirs");
@@ -925,10 +925,12 @@ fn the_look_of_the_home_reports_files_and_empty_directories_it_can_open() {
     assert_eq!((code, err.as_str()), (Some(0), ""));
     let lines: Vec<&str> = out.lines().collect();
     let at = |name: &str| home.join(name).display().to_string();
-    // A file, a link and an empty directory; a directory holding a file is not itself named.
+    // A file and a link; a directory holding a file is not itself named, and an empty one
+    // is removed (the clean would have), not named.
+    assert!(!home.join("a").exists());
     assert_eq!(
         lines,
-        [at("a/b"), at("full/f"), at("link")]
+        [at("full/f"), at("link")]
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>()
@@ -1161,4 +1163,62 @@ fn the_keychain_mode_is_selected_and_has_nothing_to_wipe_off_macos() {
     let dir = tree("keychain");
     let (code, out, err) = call(KEYCHAIN, dir.path());
     assert_eq!((code, out.as_str(), err.as_str()), (Some(0), "", ""));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn an_empty_directory_the_system_keeps_is_accepted_by_the_home_look_and_others_are_not() {
+    use kbf_mac_session::sweep::pretend_unremovable;
+    let dir = tree("look-empty");
+    let home = dir.path().join("home");
+    fs::create_dir_all(home.join("Library/Preferences")).expect("dirs");
+    fs::create_dir_all(home.join("Library/Keychains")).expect("dirs");
+    fs::write(home.join("Library/Keychains/keychain-2.db"), "x").expect("file");
+    // The system keeps `Preferences`: accepted, and the folder that holds it. The look
+    // names the keychain file only, so the wait for the keychain applies (rule 3).
+    pretend_unremovable(&["Preferences"]);
+    let (code, out, err) = call(LOOK_HOME, &home);
+    pretend_unremovable(&[]);
+    assert_eq!((code, err.as_str()), (Some(0), ""));
+    let lines: Vec<String> = out.lines().map(str::to_owned).collect();
+    assert_eq!(
+        lines,
+        vec![
+            home.join("Library/Keychains/keychain-2.db")
+                .display()
+                .to_string()
+        ]
+    );
+    assert!(keychain_only(&lines, &home));
+    // Not kept by the system: the empty directory is removed by the look, none is named.
+    let (code, _, _) = call(LOOK_HOME, &home);
+    assert_eq!(code, Some(0));
+    assert!(!home.join("Library/Preferences").exists());
+    // An empty directory that cannot be removed for another reason is left, named.
+    if !rustix::process::geteuid().is_root() {
+        let held = dir.path().join("held");
+        fs::create_dir_all(held.join("sub/empty")).expect("dirs");
+        fs::set_permissions(held.join("sub"), fs::Permissions::from_mode(0o500)).expect("chmod");
+        let (code, out, _) = call(LOOK_HOME, &held);
+        fs::set_permissions(held.join("sub"), fs::Permissions::from_mode(0o700)).expect("chmod");
+        assert_eq!(code, Some(0));
+        assert!(out.contains("sub/empty"), "{out}");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn the_home_is_emptied_past_a_refusal_and_an_empty_kept_directory_is_no_error() {
+    use kbf_mac_session::sweep::pretend_unremovable;
+    let dir = tree("empty-home-kept");
+    let home = dir.path().join("home");
+    fs::create_dir_all(home.join("Library/Preferences")).expect("dirs");
+    fs::write(home.join("Library/Preferences/x"), "x").expect("file");
+    fs::write(home.join("Library/y"), "x").expect("file");
+    pretend_unremovable(&["Preferences"]);
+    let (code, _, err) = call(EMPTY_HOME, &home);
+    pretend_unremovable(&[]);
+    assert_eq!((code, err.as_str()), (Some(0), ""));
+    assert!(home.join("Library/Preferences").is_dir());
+    assert!(!home.join("Library/y").exists());
 }
