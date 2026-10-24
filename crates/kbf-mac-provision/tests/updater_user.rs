@@ -7,7 +7,7 @@ mod support;
 use kbf_mac_provision::profile::Profile;
 use support::{FakeMac, apply, apply_keys, calls, check, check_keys, lines, ls};
 
-const USER: &str = "/Users/_kbf-updater";
+const USER: &str = concat!("/Users", "/_kbf-updater");
 const GROUP: &str = "/Groups/_kbf-updater";
 const STATE_DIR: &str = "/var/db/kbf-updater";
 const LOG_DIR: &str = "/Library/Logs/kbf-updater";
@@ -196,9 +196,9 @@ fn check_fails_each_drift_of_the_account_and_its_directories() {
     only_fails(
         &drifted("updater-shell", |m| {
             m.state_mut()
-                .user_attr("_kbf-updater", "UserShell", "/bin/sh");
+                .user_attr("_kbf-updater", "UserShell", "/usr/bin/true");
         }),
-        "UserShell=/bin/sh, want /usr/bin/false",
+        "UserShell=/usr/bin/true, want /usr/bin/false",
     );
     only_fails(
         &drifted("updater-password", |m| {
