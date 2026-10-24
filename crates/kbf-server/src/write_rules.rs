@@ -248,24 +248,23 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
             "kbf-enroll-registry",
             "enroll/token/a",
         ),
-        // Rolling updates (`update/rows.rs`).
+        // Rows an older build wrote and no code writes now; they stay fenced so a store
+        // holding them is classified. Nothing reads them either.
         fenced(
             Keys::Exactly("update/desired"),
-            "update/rows",
+            "retired, read-only",
             "update/desired",
         ),
         fenced(
             Keys::Exactly("update/generation"),
-            "update/rows (counter)",
+            "retired, read-only",
             "update/generation",
         ),
         fenced(
             Keys::Exactly("update/policy"),
-            "update/rows",
+            "retired, read-only",
             "update/policy",
         ),
-        // Rows an older build wrote and no code writes now; they stay fenced so a store
-        // holding them is classified, and are read only by `stored_update`.
         fenced(
             Keys::Exactly("update/slot"),
             "retired, read-only",
@@ -276,7 +275,7 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
             "retired, read-only",
             "update/host/node-a",
         ),
-        // Proposals the release poller wrote; none is written now, the view still lists them.
+        // Proposals the release poller wrote; none is written now.
         fenced(
             Keys::Under("update/proposed/"),
             "retired, read-only",

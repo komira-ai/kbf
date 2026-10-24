@@ -1982,7 +1982,6 @@ dependencies = [
  "kbf-installer",
  "kbf-map",
  "kbf-objstore",
- "kbf-oidc",
  "kbf-proto",
  "kbf-proxy",
  "kbf-sched",

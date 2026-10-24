@@ -79,7 +79,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use kbf_map::{DenyEntry, Map, MemberId, MemberState};
-use kbf_state::StoreError;
+use kbf_state::{Store, StoreError};
 use kbf_types::WorkerId;
 use serde::{Deserialize, Serialize};
 
@@ -91,7 +91,6 @@ use crate::members::{Members, MembershipError};
 use crate::proxy_auth::{Caller, Trust};
 use crate::retire::Retire;
 use crate::token::ApiToken;
-use crate::update::Rows;
 
 mod node_detail;
 mod retire;
@@ -157,15 +156,16 @@ struct ApiState {
     /// empty (the routes answer 409) on any other server.
     retire: Arc<OnceLock<Retire>>,
     members: Option<Arc<Members>>,
-    /// The update rows `safe_to_stop` reads (`None`: no state store).
-    update: Option<Rows>,
+    /// The state store `safe_to_stop` reads the enrolled storage members from (`None`: no
+    /// state store).
+    store: Option<Arc<dyn Store>>,
 }
 
 /// The API's routes over `farm`; writes need `token`, and without one are refused.
 /// `drain` is what `POST /v1/frontend/drain` begins; `members` is what
 /// `GET /v1/members` reads and `POST /v1/members/{id}` changes (the same value the
-/// `Membership` service registers into). `update` is where the update rows are read
-/// for `safe_to_stop`. `enroll` is what the `/v1/enroll/...` routes
+/// `Membership` service registers into). `store` is the state store `safe_to_stop`
+/// reads. `enroll` is what the `/v1/enroll/...` routes
 /// call ([`crate::enroll::api`]); `None` when this server has no enrollment, which those
 /// routes answer, behind the gate, with 404.
 /// Writes read the peer address from
@@ -176,7 +176,7 @@ pub fn router(
     drain: Arc<Drain>,
     retire: Arc<OnceLock<Retire>>,
     members: Option<Arc<Members>>,
-    update: Option<Rows>,
+    store: Option<Arc<dyn Store>>,
     enroll: Option<Arc<EnrollApi>>,
 ) -> Router {
     let enrollment = crate::enroll::api::routes(token.clone(), enroll);
@@ -197,7 +197,7 @@ pub fn router(
             drain,
             retire,
             members,
-            update,
+            store,
         }))
         .merge(enrollment)
         .merge(scheduler)
@@ -887,12 +887,6 @@ pub(crate) fn error(code: StatusCode, why: &str) -> Response {
         answer.headers_mut().insert(WWW_AUTHENTICATE, bearer);
     }
     answer
-}
-
-/// [`error`] with a stable machine `code` beside the text, for a refusal a program tells from
-/// the other answers of one status.
-pub(crate) fn error_coded(status: StatusCode, why: &str, code: &str) -> Response {
-    json(status, &serde_json::json!({ "error": why, "code": code }))
 }
 
 #[cfg(test)]

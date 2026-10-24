@@ -111,17 +111,12 @@ All answer 404 when the feature is off.
 | upload a release file | `PUT /v1/releases/{commit}/{platform}/{name}` | [F] | write, no content-type gate |
 | list releases | `GET /v1/releases` | [F] | open |
 | describe a release (its files by digest; the `releases/<commit>.json` of a `url` source) | `GET /v1/releases/{commit}` | [F] | open |
-| read the desired release, releases, policy | `GET /v1/update` | [V] #976, #985 | open |
-| set the desired release (also a rollback: an older commit, a higher generation) | `POST /v1/update/desired` | [V] #976 | write |
-| preview what a commit would change | `GET /v1/update/plan` | [V] #985 (design) | open |
-| pause updates | `POST /v1/update/pause` | [V] #976 | write |
-| resume updates | `POST /v1/update/resume` | [V] #976 | write |
 | the frontend's own update order, read | `GET /v1/update/frontend` | [V] #1062 | open |
 | the frontend's own update order, write | `POST /v1/update/frontend` | [V] #1062 | write |
 
-There is no separate rollback route. There is no update-policy route (`POST /v1/update/policy`
-is named in the pull-updates design and has no code), no image-pull verb and no CA-rotation
-route on this branch: all three are out of scope of the object-store series (Q5).
+The server keeps no desired-release routes (`GET /v1/update`, `POST /v1/update/desired`,
+`pause`, `resume`): updates are OS packages installed by `kbf-updater`. There is no image-pull
+verb and no CA-rotation route on this branch: both are out of scope of the object-store series (Q5).
 
 ### Reads of builds
 

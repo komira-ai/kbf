@@ -41,7 +41,7 @@ The store holds these families on this branch (from the key constructors, and fo
 | Scheduler (`farm/durable.rs`) | `op/`, `queue/`, `lease/`, `session/`, `loss/`, `fate/`, `floor/`, `subject/`, `done/`, `cordon/`, `meta/epoch`, `meta/next_op`, `meta/next_seq`, `meta/alive`, `meta/generation` | `lease/`, `op/` yes; the epoch is `meta/epoch`, not `epoch`; the rest are not named |
 | Membership (`members.rs`) | `map`, `member/`, `down/`, `instance/`, `deny/`, `unfilled/`, `handoff/pin/`, `meta/members_formed`, `meta/members_forming`, counters `member-id`, `boot/<id>` | "member map" only |
 | Enrollment (`kbf-enroll-registry`) | `enroll/token/`, `enroll/node/`, `enroll/serial/`, `enroll/key/`, `enroll/adv/`, `enroll/req/`, `enroll/renew/`, `enroll/ca/generation`, and `deny/` (shared with membership) | no |
-| Update controller (`update/rows.rs`) | `update/desired`, `update/generation`, `update/policy`, `update/slot`, `update/host/`, `update/order/<epoch>` | `update/*`, `desired` (it is `update/desired`) |
+| Update controller (`update/rows.rs`, since deleted) | `update/desired`, `update/generation`, `update/policy`, `update/slot`, `update/host/`, `update/order/<epoch>` | `update/*`, `desired` (it is `update/desired`) |
 | History index (`kbf-history/src/keys.rs`) | `ui/streams`, `ui/invid/`, `ui/ichunk/<inv>/<writer>/<seq>`, `ui/obj/`, `ui/stream/`, `ui/inv/`, `ui/shape/` (root configurable) | no: the design names `history/<instance_id>/` and `log/<instance_id>/` |
 
 Findings that change the design:

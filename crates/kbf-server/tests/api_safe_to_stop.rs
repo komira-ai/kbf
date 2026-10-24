@@ -40,8 +40,7 @@ fn operator_headers() -> String {
     format!("Authorization: Bearer {API_TOKEN}\r\nContent-Type: application/json\r\n")
 }
 
-/// A tick that does not come within a test: the update controller reads the store at every
-/// tick, and no test here waits for one.
+/// A tick that does not come within a test: no test here waits for one.
 const TICK: Duration = Duration::from_secs(3600);
 
 fn config() -> MembershipConfig {

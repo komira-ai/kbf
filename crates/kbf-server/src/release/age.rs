@@ -1,5 +1,5 @@
-//! R4, the age check (`docs/design/frontend-proxy.md`, rule table): the release offered as
-//! desired must not be older than the build of the child that holds the generation. "Older"
+//! R4, the age check (`docs/design/frontend-proxy.md`, rule table): a release offered to move to
+//! must not be older than the build of the child that holds the generation. "Older"
 //! is by build `seq`, the number of commits behind a build (`kbf --version --json`,
 //! [`crate::BUILD_SEQ`]), never by the text of a commit, which has no order.
 //!
@@ -67,8 +67,7 @@ pub fn same_commit(a: &str, b: &str) -> bool {
     short.len() >= 12 && long.starts_with(short)
 }
 
-/// Whether the release `target_commit` may become the desired release of the child that runs
-/// `own`. A `target_seq` of 0 is unknown, as `None` is.
+/// Whether the release `target_commit` may be moved to by the child that runs `own`. A `target_seq` of 0 is unknown, as `None` is.
 ///
 /// # Errors
 /// The [`Refusal`] in the table above.
