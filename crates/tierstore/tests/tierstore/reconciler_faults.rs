@@ -38,7 +38,8 @@ async fn a_checkpoint_that_cannot_be_read_leaves_the_proxy_to_the_next_pass() {
     let proxy = rig.proxy("p1", 1000).await;
     proxy.put("a", body("1")).await.unwrap();
     let mut reconciler = rig.reconciler("r1", 1000);
-    rig.hot.fail_next_on(Op::Get, "_tiering/checkpoint/", down());
+    rig.hot
+        .fail_next_on(Op::Get, "_tiering/checkpoint/", down());
 
     let report = reconciler.pass().await;
     assert_eq!(report.failed, [down()]);
@@ -119,7 +120,10 @@ async fn a_gap_in_the_journal_stops_the_reading_until_it_is_filled() {
     assert_eq!(keys(&*rig.cold_mem).await, ["k1"]);
 
     let second = encode_journal(&[]);
-    rig.hot_mem.put(&journal_key("p1", 2), second).await.unwrap();
+    rig.hot_mem
+        .put(&journal_key("p1", 2), second)
+        .await
+        .unwrap();
     let report = reconciler.pass().await;
     assert_eq!(report.copied, 1);
     assert_eq!(keys(&*rig.cold_mem).await, ["k1", "x"]);

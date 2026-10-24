@@ -137,7 +137,10 @@ pub async fn journal_entry_keys(backend: &dyn Backend, id: &str, seq: u64) -> Ve
 pub async fn set_usage(rig: &Rig, hot_bytes: u64, time: u64) {
     let text = format!(r#"{{"hot_bytes":{hot_bytes},"copy_lag":0,"time":{time}}}"#);
     rig.hot_mem.delete("_tiering/usage").await.unwrap();
-    rig.hot_mem.put("_tiering/usage", body(&text)).await.unwrap();
+    rig.hot_mem
+        .put("_tiering/usage", body(&text))
+        .await
+        .unwrap();
 }
 
 /// Reads ranges of the ten-byte object `0123456789` under `key` and checks every one.
