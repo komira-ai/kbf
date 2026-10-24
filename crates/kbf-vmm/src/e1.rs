@@ -73,7 +73,7 @@ fn start_arm(ctx: &Ctx<'_>, name: &str, graphics: bool) -> Result<(Vm, Arm), Str
             name,
             Identity::Keep,
             |spec: &mut VmSpec| {
-                attach_share(spec, &share, Channels::NONE);
+                attach_share(spec, &share, Channels::VSOCK);
                 matrix::attach(spec, &shares);
                 spec.graphics = graphics;
             },
@@ -312,6 +312,25 @@ mod tests {
         let r = e1(&c);
         assert_eq!(r.status, Status::Ok);
         assert!(sys.starts.borrow().iter().all(|(s, _)| !s.graphics));
+    }
+
+    /// Catches an E1 whose guests cannot send their markers over vsock: each arm gets the
+    /// vsock listener and a results directory that is its own share's `results/`, so the
+    /// marker the guest sends lands where the host looks for it.
+    #[test]
+    fn each_arm_gets_its_own_results_directory_behind_the_vsock_listener() {
+        let work = work_with_base("e1-vsock");
+        let sys = FakeSystem::new();
+        let r = e1(&guest_ctx(&sys, &work));
+        assert_eq!(r.status, Status::Ok, "{r:?}");
+        let starts = sys.starts.borrow();
+        for (spec, name) in starts.iter().map(|(s, _)| s).zip(["e1-x", "e1-y"]) {
+            assert_eq!(spec.vsock_ports, [crate::guest::VSOCK_PORT]);
+            assert_eq!(
+                spec.results_dir,
+                Some(work.join(format!("{name}-share")).join("results"))
+            );
+        }
     }
 
     /// Catches a report that drops the helper's events or their times: a silent guest must

@@ -2,7 +2,9 @@
 //!
 //! No Virtualization.framework here: the guest only uses what any process may.
 
+use std::fs::File;
 use std::io::Write;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -10,12 +12,89 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::frame::{self, Frame, Kind, SendError};
 use crate::probe::Host;
 
 pub struct SystemHost;
 
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+/// The address family of virtio sockets. UNCERTAIN: this is the value `<sys/vsock.h>` of
+/// the macOS SDK gives `AF_VSOCK` (as on Linux), and the layout below is its
+/// `struct sockaddr_vm` (length byte, family byte, two reserved bytes, port, CID). Whether a
+/// macOS guest's kernel serves the family to a process at all is what the first run of this
+/// code in a guest answers; `socket` failing is reported as such, not guessed around.
+const AF_VSOCK: libc::c_int = 40;
+/// The host's context id.
+const HOST_CID: u32 = 2;
+/// How long a read or write on the connection may block.
+const IO_TIMEOUT_SECS: libc::time_t = 10;
+
+/// A failed step of connecting to the host.
+#[derive(Debug)]
+struct ConnectError {
+    stage: &'static str,
+    errno: i32,
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} failed: errno {} ({})",
+            self.stage,
+            self.errno,
+            std::io::Error::from_raw_os_error(self.errno)
+        )
+    }
+}
+
+/// Connects a stream socket to the host on vsock `port`, with a read and write timeout, so
+/// a host that never answers cannot hold the probe.
+fn connect_host(port: u32) -> Result<File, ConnectError> {
+    let fail = |stage| ConnectError {
+        stage,
+        errno: errno(),
+    };
+    // SAFETY: plain socket(2) call; a descriptor it returns is owned by the `File` below.
+    let fd = unsafe { libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(fail("socket"));
+    }
+    // SAFETY: `fd` was just returned by socket(2) and nothing else owns it.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let file = File::from(owned);
+    let timeout = libc::timeval {
+        tv_sec: IO_TIMEOUT_SECS,
+        tv_usec: 0,
+    };
+    for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+        // SAFETY: `timeout` is a `timeval` and its size is passed.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                std::ptr::from_ref(&timeout).cast(),
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(fail("setsockopt"));
+        }
+    }
+    let mut addr = [0u8; 16];
+    addr[0] = 16;
+    addr[1] = AF_VSOCK as u8;
+    addr[4..8].copy_from_slice(&port.to_le_bytes());
+    addr[8..12].copy_from_slice(&HOST_CID.to_le_bytes());
+    // SAFETY: `addr` is a 16-byte buffer and its length is passed.
+    if unsafe { libc::connect(fd, addr.as_ptr().cast(), 16) } != 0 {
+        return Err(fail("connect"));
+    }
+    Ok(file)
 }
 
 impl Host for SystemHost {
@@ -41,27 +120,16 @@ impl Host for SystemHost {
     }
 
     fn vsock(&self, port: u32) -> Value {
-        // macOS has no public AF_VSOCK; 40 is the Linux value, tried to see what the
-        // kernel answers. The socket call is the question; a connect is tried only if it
-        // succeeds, with a BSD-layout address (length byte, family byte) for the host
-        // (CID 2).
-        const AF_VSOCK: libc::c_int = 40;
-        // SAFETY: plain socket(2) call; the descriptor is closed below.
-        let fd = unsafe { libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0) };
-        if fd < 0 {
-            return json!({"socket_errno": errno(), "connected": false});
+        match connect_host(port) {
+            Ok(_) => json!({"socket_errno": null, "connect_errno": null, "connected": true}),
+            Err(e) if e.stage == "socket" => json!({"socket_errno": e.errno, "connected": false}),
+            Err(e) => json!({"socket_errno": null, "connect_errno": e.errno, "connected": false}),
         }
-        let mut addr = [0u8; 16];
-        addr[0] = 16;
-        addr[1] = AF_VSOCK as u8;
-        addr[4..8].copy_from_slice(&port.to_le_bytes());
-        addr[8..12].copy_from_slice(&2u32.to_le_bytes());
-        // SAFETY: `addr` is a 16-byte buffer and its length is passed.
-        let rc = unsafe { libc::connect(fd, addr.as_ptr().cast(), 16) };
-        let connect_errno = (rc != 0).then(errno);
-        // SAFETY: `fd` is the descriptor opened above.
-        unsafe { libc::close(fd) };
-        json!({"socket_errno": null, "connect_errno": connect_errno, "connected": rc == 0})
+    }
+
+    fn send_frame(&self, port: u32, frame: &Frame) -> Result<(), SendError> {
+        let mut stream = connect_host(port).map_err(|e| SendError::Unavailable(e.to_string()))?;
+        frame::exchange(&mut stream, frame)
     }
 
     fn console(&self, name: &str) -> Value {
@@ -204,6 +272,30 @@ impl crate::diag::DiagHost for SystemHost {
 
     fn pause(&self, d: Duration) {
         std::thread::sleep(d);
+    }
+
+    fn vsock_round_trip(&self, port: u32) -> Value {
+        let mut stream = match connect_host(port) {
+            Ok(s) => s,
+            Err(e) => {
+                return json!({
+                    "port": port,
+                    "connected": false,
+                    "round_trip": false,
+                    "stage": e.stage,
+                    "errno": e.errno,
+                    "error": e.to_string(),
+                });
+            }
+        };
+        let test = Frame::new(Kind::Log, "vsock-test", "kbf-guest probe-diag test frame\n");
+        let sent = frame::exchange(&mut stream, &test);
+        json!({
+            "port": port,
+            "connected": true,
+            "round_trip": sent.is_ok(),
+            "error": sent.err().map(|e| e.to_string()),
+        })
     }
 
     fn mount_cycle(&self, tag: &str, mountpoint: &Path, inside: &dyn Fn(&Path) -> Value) -> Value {

@@ -3,8 +3,11 @@
 //! stops. Closing stdin force-stops the VM (the guest is not asked to shut down). The main
 //! thread only waits on channels; it is never needed by the framework.
 
+use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::RawFd;
+use std::mem::ManuallyDrop;
+use std::os::fd::{FromRawFd, RawFd};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -14,7 +17,7 @@ use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchQueueAttr};
 use objc2::rc::Retained;
 use objc2::runtime::{Bool, NSObject, NSObjectProtocol, ProtocolObject};
-use objc2::{AnyThread, DefinedClass, define_class, msg_send};
+use objc2::{AnyThread, DefinedClass, Message, define_class, msg_send};
 use objc2_foundation::NSError;
 use objc2_virtualization::{
     VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketListener,
@@ -22,7 +25,8 @@ use objc2_virtualization::{
 };
 
 use super::config::{self, ConsoleFds};
-use super::{Queued, describe};
+use super::{Queued, Shared, describe};
+use crate::sink::{self, Limiter, MAX_CONNECTIONS};
 use crate::spec::{Event, VmSpec};
 
 /// Prints one event line.
@@ -32,7 +36,19 @@ fn emit(e: &Event) {
     let _ = out.flush();
 }
 
+/// How long the host waits for the next frame of a connection before it gives up on it.
+const FRAME_READ_TIMEOUT_SECS: libc::time_t = 30;
+
+/// Where connections are served from: the results directory and the bound on how many
+/// run at once.
+struct Sink {
+    dir: PathBuf,
+    limiter: Limiter,
+}
+
 struct ObserverIvars {
+    /// Present when the spec asks for the guest's frames to be written to files.
+    sink: Option<Sink>,
     /// Tells the main thread the guest stopped by itself.
     done: Mutex<Sender<()>>,
     guest_stopped: Arc<AtomicBool>,
@@ -87,20 +103,86 @@ define_class!(
             connection: &VZVirtioSocketConnection,
             _device: &VZVirtioSocketDevice,
         ) -> Bool {
-            // SAFETY: `destinationPort` and `close` are plain accessors on a connection the
-            // framework keeps alive for this call.
+            // SAFETY: `destinationPort` is a plain accessor on a connection the framework
+            // keeps alive for this call.
             let port = unsafe { connection.destinationPort() };
             emit(&Event::Vsock { port });
-            // SAFETY: as above; the helper does not use the connection afterwards.
-            unsafe { connection.close() };
+            let Some(sink) = &self.ivars().sink else {
+                // SAFETY: as above; the helper does not use the connection afterwards.
+                unsafe { connection.close() };
+                return Bool::YES;
+            };
+            let Some(permit) = sink.limiter.try_acquire() else {
+                eprintln!(
+                    "kbf-vmm: vsock port {port}: refused, {MAX_CONNECTIONS} connections are open"
+                );
+                return Bool::NO;
+            };
+            // SAFETY: `fileDescriptor` is a plain accessor; the descriptor stays open for as
+            // long as the connection object lives, which `keep` below extends to the end of
+            // the serving thread.
+            let fd = unsafe { connection.fileDescriptor() };
+            // SAFETY: retaining and releasing an Objective-C object is atomic, and the
+            // thread only drops this reference (it uses the raw descriptor, never a
+            // message to the object), so releasing it on that thread is sound.
+            let keep = unsafe { Shared::new(connection.retain()) };
+            let dir = sink.dir.clone();
+            std::thread::spawn(move || {
+                serve_connection(fd, &dir);
+                drop(keep);
+                drop(permit);
+            });
             Bool::YES
         }
     }
 );
 
+/// Answers the frames on the connection `fd` until it ends, writing them under `dir`.
+///
+/// UNCERTAIN (checked only by the first run on a Mac): that the descriptor of a
+/// `VZVirtioSocketConnection` is an ordinary stream socket that `read(2)` and `write(2)`
+/// serve and that honours `SO_RCVTIMEO`. Apple documents the descriptor but not its type.
+fn serve_connection(fd: RawFd, dir: &std::path::Path) {
+    let timeout = libc::timeval {
+        tv_sec: FRAME_READ_TIMEOUT_SECS,
+        tv_usec: 0,
+    };
+    // SAFETY: `timeout` is a `timeval` and its size is passed; a failure only means reads
+    // can block, which the end of the VM ends too.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            std::ptr::from_ref(&timeout).cast(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        eprintln!(
+            "kbf-vmm: vsock read timeout not set: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // SAFETY: the connection object owns `fd` and outlives this call (see `should_accept`),
+    // so the `File` must never close it: `ManuallyDrop` keeps it from doing so.
+    let mut stream = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+    let served = sink::serve(&mut *stream, dir, &mut std::io::stderr());
+    eprintln!(
+        "kbf-vmm: vsock connection ended ({:?}): {} stored, {} refused",
+        served.end, served.stored, served.refused
+    );
+}
+
 impl Observer {
-    fn new(done: Sender<()>, guest_stopped: Arc<AtomicBool>, began: Instant) -> Retained<Self> {
+    fn new(
+        done: Sender<()>,
+        guest_stopped: Arc<AtomicBool>,
+        began: Instant,
+        sink: Option<Sink>,
+    ) -> Retained<Self> {
         let this = Self::alloc().set_ivars(ObserverIvars {
+            sink,
             done: Mutex::new(done),
             guest_stopped,
             began,
@@ -184,6 +266,7 @@ pub fn run(spec: &VmSpec) -> Result<(), String> {
 
     let cfg = Queued::new(built.config);
     let ports = spec.vsock_ports.clone();
+    let results_dir = spec.results_dir.clone();
     let q = queue.clone();
     let (h, gs, dtx) = (holder.clone(), guest_stopped.clone(), done_tx.clone());
     queue.exec_async(move || {
@@ -196,7 +279,11 @@ pub fn run(spec: &VmSpec) -> Result<(), String> {
                 cfg.get(),
                 &q,
             );
-            let observer = Observer::new(dtx, gs, began);
+            let sink = results_dir.map(|dir| Sink {
+                dir,
+                limiter: Limiter::new(MAX_CONNECTIONS),
+            });
+            let observer = Observer::new(dtx, gs, began, sink);
             vm.setDelegate(Some(ProtocolObject::from_ref(&*observer)));
             let mut listeners = Vec::new();
             for dev in vm.socketDevices().iter() {
