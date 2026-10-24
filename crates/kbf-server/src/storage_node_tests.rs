@@ -339,7 +339,7 @@ fn a_node_owes_a_rebuild_until_it_is_done() {
     assert!(!catch_up_for(true).is_catching_up());
 }
 
-// ---- unit U0 of docs/design/frontend-proxy.md, section 11: a node meets a FRESH state store
+// ---- a node meets a FRESH state store (docs/deploy/kbf-units.md, "the nodes' boots")
 
 /// A frontend over a store with nothing in it: the fresh Postgres of the design.
 fn fresh_frontend() -> crate::members::Members {

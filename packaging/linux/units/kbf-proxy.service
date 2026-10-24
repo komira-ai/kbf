@@ -4,7 +4,7 @@
 # /usr/lib/systemd/system/; the operator enables it with kbf-proxy.socket, which
 # holds the public port (socket activation, one descriptor: LISTEN_FDS=1). Its [proxy] table
 # is in /etc/kbf/installer.toml; the unit passes that file by flag and nothing by environment.
-# kbf docs/design/frontend-proxy.md, sections 2, 5 and 6; kbf-proxy-api.md, section 11.
+# kbf docs/design/frontend-proxy.md, sections 2, 4 and 5; kbf-proxy-api.md, section 11.
 #
 # Not the root helper: kbf-installer.service stages and flips releases as root, this
 # service runs as the frontend's own user and starts no process but itself: it does not run,

@@ -10,7 +10,7 @@
 //! - **from the store** otherwise: the `op/`, `queue/`, `done/` and `doneof/` rows say what
 //!   the operation runs and where it stands (`Durable::named_operation`), and the channel of
 //!   the operation is shown what each intake poll finds ([`State::follow_watched`]), by the
-//!   look that `Farm::follow` makes for the callers of a handover (`Progress::stage`). An
+//!   look that `Farm::follow` makes for the callers of a retired frontend (`Progress::stage`). An
 //!   operation is answered as long as its `done/` row is there, which is at least
 //!   [`DONE_FLOOR`](super::DONE_FLOOR) after it finished.
 //!
