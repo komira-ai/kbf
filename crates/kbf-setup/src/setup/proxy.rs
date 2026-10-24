@@ -62,7 +62,9 @@ impl ProxyFlags {
             return None;
         }
         let flags = given.join(", ");
-        let message = format!("{flags}: two-slot supervision was removed, so setup no longer sets up a proxy host: {POOL_BY_HAND}");
+        let message = format!(
+            "{flags}: two-slot supervision was removed, so setup no longer sets up a proxy host: {POOL_BY_HAND}"
+        );
         Some(SetupError::Invalid(vec![message]))
     }
 }
