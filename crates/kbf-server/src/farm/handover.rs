@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use kbf_front::{Handed, Stage};
+use kbf_front::Stage;
 use kbf_sched::{Event, Input};
-use kbf_types::{Answer, Digest, FarmTime, OperationId, StateMachine as _, WaiterId, WorkerId};
+use kbf_types::{Answer, FarmTime, OperationId, StateMachine as _, WaiterId, WorkerId};
 use tokio::sync::watch;
 use tonic::Status;
 
@@ -19,13 +19,12 @@ use super::durable::{Durable, Held, Progress, StateError, StoredCordon};
 use super::{Farm, NodeAction, State};
 
 /// How many looks in a row at the state store may find an operation neither unfinished
-/// nor ended before it is reported as untraced (a WARN, and `kbf_frontend_relay_untraced`).
-/// A writer ends an operation in one transaction (its rows removed, its result put), so a
-/// look finds one or the other; a store that a release ending operations in two
-/// transactions wrote can hold neither for good, and a result past its retention is also
-/// gone. Only a report: an untraced operation's callers are not
-/// answered, they keep waiting (see [`Farm::follow`]).
-pub const UNTRACED_LOOKS: u32 = 2;
+/// nor ended before it is logged as untraced (a WARN). A writer ends an operation in one
+/// transaction (its rows removed, its result put), so a look finds one or the other; a
+/// store that a release ending operations in two transactions wrote can hold neither for
+/// good, and a result past its retention is also gone. Only a log line: an untraced
+/// operation's callers are not answered, they keep waiting (see [`Farm::follow`]).
+const UNTRACED_LOOKS: u32 = 2;
 
 /// How often a fenced farm that was given to [`Farm::follow_every`] looks in the state
 /// store for the results of the calls it kept open.
@@ -170,15 +169,14 @@ impl Farm {
     /// leased is shown executing. A caller waits until its operation finishes, it cancels
     /// (its stream is dropped), or this process is killed: no look count or timer ends
     /// it. An operation the store has no trace of keeps its callers waiting; it is
-    /// reported ([`UNTRACED_LOOKS`], `kbf_frontend_relay_untraced`) so an operator sees
-    /// it. Call it every so often; returns how many callers are still waiting.
+    /// logged at WARN once the looks in a row that found no trace reach `UNTRACED_LOOKS`,
+    /// so an operator sees it. Call it every so often; returns how many callers are still
+    /// waiting.
     ///
     /// # Errors
     /// The state store cannot be read.
     pub fn follow(&self) -> Result<usize, StateError> {
-        let waiting = self.lock().follow()?;
-        self.report_untraced();
-        Ok(waiting)
+        self.lock().follow()
     }
 
     /// Runs [`Farm::follow`] every `every`, for as long as the process lives, so the
@@ -196,22 +194,11 @@ impl Farm {
             let mut look = tokio::time::interval(every);
             loop {
                 look.tick().await;
-                // A store that cannot be read is looked at again at the next look; the farm
-                // reports what it finds no trace of (`kbf_frontend_relay_untraced`).
+                // A store that cannot be read is looked at again at the next look.
                 let _ = farm.follow();
             }
         });
         true
-    }
-
-    /// Sets `kbf_frontend_relay_untraced` to the operations the last looks found no trace
-    /// of.
-    fn report_untraced(&self) {
-        let untraced = self.lock().untraced();
-        self.cache
-            .metrics()
-            .frontend_relay_untraced
-            .set(untraced as u64);
     }
 }
 
@@ -326,14 +313,6 @@ impl State {
         Ok(waiting)
     }
 
-    /// How many operations the last looks found no trace of, [`UNTRACED_LOOKS`] times in
-    /// a row, among the ones this farm's callers wait on and the ones relays follow.
-    pub(super) fn untraced(&self) -> usize {
-        let reported = |looks: &&u32| **looks >= UNTRACED_LOOKS;
-        let kept = self.untraced_kept.values().filter(reported).count();
-        kept + self.untraced_relayed.values().filter(reported).count()
-    }
-
     /// Takes up the cordons of the nodes an operator placed before this process started,
     /// as the store holds them: a drain keeps its deadline on the store's clock, `at` now
     /// (already past: paused at the first tick). The rows are remembered as the intake
@@ -383,7 +362,7 @@ impl Progress {
 
 /// One look at `operation`, whose callers wait: what they are shown now (`None` leaves
 /// them as they are). An operation the store has no trace of is shown nothing: it is
-/// counted in `untraced`, reported once it has been untraced for [`UNTRACED_LOOKS`] looks
+/// counted in `untraced`, logged once it has been untraced for [`UNTRACED_LOOKS`] looks
 /// in a row, and its callers go on waiting. A look that finds it starts the count over.
 pub(super) fn note(
     untraced: &mut BTreeMap<OperationId, u32>,
@@ -411,52 +390,4 @@ pub(super) fn show(channel: &watch::Sender<Stage>, stage: Stage) {
         }
         changed
     });
-}
-
-impl Handed for Farm {
-    fn handed(&self) -> bool {
-        self.lock().fenced
-    }
-
-    /// Reads the unfinished rows of the state store (one scan per relayed call, made while
-    /// the successor's first operation arrives); a farm with no store finds none.
-    fn operation_of(
-        &self,
-        instance: Option<&str>,
-        action: &Digest,
-    ) -> Result<Option<OperationId>, String> {
-        let state = self.lock();
-        let Some(durable) = &state.durable else {
-            return Ok(None);
-        };
-        let found = durable
-            .operations_of(instance, action)
-            .map_err(|error| error.to_string())?;
-        Ok(match found[..] {
-            [only] => Some(only),
-            _ => None,
-        })
-    }
-
-    /// The follower ([`Farm::follow`]) for one operation this farm's scheduler never
-    /// held: the same looks, and the same rule for an operation the store has no trace of
-    /// (nothing is shown, it is reported, the call keeps waiting).
-    fn look(&self, operation: OperationId) -> Result<Option<Stage>, String> {
-        let mut state = self.lock();
-        let Some(durable) = &state.durable else {
-            return Ok(None);
-        };
-        let progress = durable
-            .progress(operation)
-            .map_err(|error| error.to_string())?;
-        let stage = note(&mut state.untraced_relayed, operation, &progress);
-        drop(state);
-        self.report_untraced();
-        Ok(stage)
-    }
-
-    fn release(&self, operation: OperationId) {
-        self.lock().untraced_relayed.remove(&operation);
-        self.report_untraced();
-    }
 }
