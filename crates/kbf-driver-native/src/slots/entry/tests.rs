@@ -615,3 +615,83 @@ fn the_restore_mode_is_selected_and_runs_as_the_uid() {
         .mode();
     assert_eq!(mode & 0o7777, 0o700);
 }
+
+#[test]
+fn only_an_attribute_that_went_or_is_protected_is_left_on_a_folder() {
+    assert!(xattr_left(libc::EPERM));
+    assert!(xattr_left(NO_ATTR));
+    assert!(!xattr_left(libc::EIO));
+    assert!(!xattr_left(libc::EACCES));
+}
+
+fn set_attr(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path");
+    #[cfg(target_os = "macos")]
+    let name = c"kbf.assert";
+    #[cfg(not(target_os = "macos"))]
+    let name = c"user.kbf.assert";
+    #[cfg(target_os = "macos")]
+    // SAFETY: NUL-terminated strings and a 1-byte value.
+    let set = unsafe {
+        libc::setxattr(
+            c_path.as_ptr(),
+            name.as_ptr(),
+            b"x".as_ptr().cast(),
+            1,
+            0,
+            0,
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
+    // SAFETY: NUL-terminated strings and a 1-byte value.
+    let set = unsafe { libc::setxattr(c_path.as_ptr(), name.as_ptr(), b"x".as_ptr().cast(), 1, 0) };
+    set == 0
+}
+
+fn has_attr(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path");
+    #[cfg(target_os = "macos")]
+    // SAFETY: NUL-terminated strings; a null buffer of size 0 only asks for the size.
+    let got = unsafe {
+        libc::getxattr(
+            c_path.as_ptr(),
+            c"kbf.assert".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
+    // SAFETY: NUL-terminated strings; a null buffer of size 0 only asks for the size.
+    let got = unsafe {
+        libc::getxattr(
+            c_path.as_ptr(),
+            c"user.kbf.assert".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    got >= 0
+}
+
+#[test]
+fn the_restore_takes_an_attribute_off_a_folder() {
+    let dir = tree("restore-xattr");
+    let entry = entry_with_files(&dir);
+    if !set_attr(&entry.join("0")) {
+        eprintln!("skipped: this file system keeps no extended attributes");
+        return;
+    }
+    assert!(has_attr(&entry.join("0")));
+    let (code, _, err) = call(RESTORE, &entry);
+    assert_eq!((code, err.as_str()), (Some(0), ""));
+    assert!(!has_attr(&entry.join("0")));
+    // A path that cannot be a C string is an error.
+    let bad = Path::new("a\0b");
+    assert!(strip_xattrs(bad).is_err());
+    // A path that is not there lists nothing and is no error to the caller's walk.
+    assert!(strip_xattrs(&entry.join("absent")).is_err());
+}

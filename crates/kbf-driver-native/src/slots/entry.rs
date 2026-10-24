@@ -194,8 +194,9 @@ pub(crate) fn restore(me: &AsUid<'_>, folders: &Path, run: &mut Run<'_>) -> Resu
     )
 }
 
-/// [`RESTORE`]: each of [`SKELETON`]'s folders in `dir` that exists is given mode 0700
-/// where its mode differs, and nothing else; one the uid does not own is an error that
+/// [`RESTORE`]: each of [`SKELETON`]'s folders in `dir` that exists has its extended
+/// attributes taken off (the protected ones stay) and is given mode 0700 where its mode
+/// differs, and nothing else; one the uid does not own is an error that
 /// names it. Run as the uid. Exit 1 when a folder could not be put right.
 fn restore_folders(
     dir: &Path,
@@ -221,6 +222,11 @@ fn restore_folders(
                 continue;
             }
         };
+        // What the lease put on the folder; what the system protects stays (it is
+        // recorded as the folder's baseline, and the check finds any other that stays).
+        if let Err(why) = strip_xattrs(&path) {
+            swept.errors.push(format!("{}: {why}", path.display()));
+        }
         let (wrong_owner, wrong_mode) = probe::folder_fix((meta.uid(), meta.mode()), (uid, 0o700));
         if wrong_owner {
             swept.errors.push(format!(
@@ -233,6 +239,69 @@ fn restore_folders(
         }
     }
     swept
+}
+
+/// Whether the error `errno` of taking an extended attribute off a folder or listing them
+/// is one to leave: the attribute went since the listing, or the system protects it from
+/// its owner (the entry's folders carry some).
+fn xattr_left(errno: i32) -> bool {
+    errno == libc::EPERM || errno == NO_ATTR
+}
+
+#[cfg(target_os = "macos")]
+const NO_ATTR: i32 = libc::ENOATTR;
+#[cfg(not(target_os = "macos"))]
+const NO_ATTR: i32 = libc::ENODATA;
+
+/// The extended attributes of the directory `path` (not through a link) taken off, the
+/// ones the system protects excepted ([`xattr_left`]).
+fn strip_xattrs(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c_path =
+        std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+    #[cfg(target_os = "macos")]
+    let (list, remove) = (
+        |buf: *mut libc::c_char, size| {
+            // SAFETY: `c_path` is NUL-terminated; `buf` is null with size 0 or writable for `size`.
+            unsafe { libc::listxattr(c_path.as_ptr(), buf, size, libc::XATTR_NOFOLLOW) }
+        },
+        |name: *const libc::c_char| {
+            // SAFETY: both strings are NUL-terminated.
+            unsafe { libc::removexattr(c_path.as_ptr(), name, libc::XATTR_NOFOLLOW) }
+        },
+    );
+    #[cfg(not(target_os = "macos"))]
+    let (list, remove) = (
+        |buf: *mut libc::c_char, size| {
+            // SAFETY: `c_path` is NUL-terminated; `buf` is null with size 0 or writable for `size`.
+            unsafe { libc::llistxattr(c_path.as_ptr(), buf, size) }
+        },
+        |name: *const libc::c_char| {
+            // SAFETY: both strings are NUL-terminated.
+            unsafe { libc::lremovexattr(c_path.as_ptr(), name) }
+        },
+    );
+    let leave = |why: std::io::Error| match why.raw_os_error() {
+        Some(errno) if xattr_left(errno) => Ok(()),
+        _ => Err(why),
+    };
+    let size = list(std::ptr::null_mut(), 0);
+    let Ok(size) = usize::try_from(size) else {
+        return leave(std::io::Error::last_os_error());
+    };
+    let mut names = vec![0_u8; size];
+    let got = list(names.as_mut_ptr().cast(), size);
+    let Ok(got) = usize::try_from(got) else {
+        return leave(std::io::Error::last_os_error());
+    };
+    names.truncate(got);
+    for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+        let name = std::ffi::CString::new(name).map_err(std::io::Error::other)?;
+        if remove(name.as_ptr()) != 0 {
+            leave(std::io::Error::last_os_error())?;
+        }
+    }
+    Ok(())
 }
 
 /// C7 for the entry `folders`: emptied as the uid.
