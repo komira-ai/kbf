@@ -29,8 +29,6 @@ mod desired_tests;
 #[cfg(test)]
 mod http_tests;
 #[cfg(test)]
-mod identity_tests;
-#[cfg(test)]
 mod service_tests;
 #[cfg(test)]
 mod testutil;

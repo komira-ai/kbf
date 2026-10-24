@@ -1,0 +1,217 @@
+//! The real ports of the agent, and the process around it, with files in a scratch directory and
+//! nothing reachable: the identity read from the certificate, the roles an agent will serve, what
+//! each role drains, and the exit codes of the mode.
+
+use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
+use std::time::Duration;
+
+use kbf_testkit::dir::TestDir;
+use kbf_types::HostRole;
+
+use super::build::{
+    NoDrain, build, drain_for, identity_of_files, no_drain, run_agent, run_config, unix_now,
+};
+use super::coordinator::{Endpoint, TlsFiles};
+use super::flags::{Config, Timing};
+use super::pki::{Pki, write_files};
+use super::run::Stop;
+use super::status::host_platform;
+use super::testing::host;
+use crate::inventory::Role;
+use crate::operator::OperatorApi;
+use crate::ports::Drain;
+use crate::version::Version;
+
+struct Rig {
+    dir: TestDir,
+    pki: Pki,
+    config: Config,
+}
+
+impl Rig {
+    fn new(name: &str, role: HostRole) -> Self {
+        let dir = TestDir::under(std::env::temp_dir(), name);
+        let pki = Pki::new();
+        let leaf = pki.updater("n1", role);
+        let files = write_files(&dir, &pki, &leaf);
+        let token = dir.join("token");
+        std::fs::write(&token, "t".repeat(40)).unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let config = Config {
+            coordinator: Endpoint::parse("localhost:1").unwrap(),
+            files,
+            channel: "stable".to_owned(),
+            helper_socket: dir.join("no-helper.sock"),
+            operator_api: "127.0.0.1:1".parse().unwrap(),
+            token_file: token,
+            operator_proxy_auth_file: None,
+            timing: Timing {
+                heartbeat: Duration::from_millis(20),
+                ..Timing::DEFAULT
+            },
+        };
+        Self { dir, pki, config }
+    }
+}
+
+/// The agent knows who it is from its certificate: the node and the host role, and nothing else
+/// is a flag; a file that is not a certificate, holds none, or is no updater's says what is wrong.
+#[test]
+fn the_identity_comes_from_the_certificate() {
+    let rig = Rig::new("bd-identity", HostRole::MacDaemon);
+    let who = identity_of_files(&rig.config.files).unwrap();
+    assert_eq!(
+        (who.node_id.to_string(), who.role),
+        ("n1".to_owned(), HostRole::MacDaemon)
+    );
+
+    let missing = TlsFiles {
+        cert: rig.dir.join("none.pem"),
+        ..rig.config.files.clone()
+    };
+    assert!(
+        identity_of_files(&missing)
+            .unwrap_err()
+            .contains("none.pem")
+    );
+    std::fs::write(rig.dir.join("empty.pem"), "").unwrap();
+    let empty = TlsFiles {
+        cert: rig.dir.join("empty.pem"),
+        ..rig.config.files.clone()
+    };
+    assert!(
+        identity_of_files(&empty)
+            .unwrap_err()
+            .contains("holds no certificate")
+    );
+    std::fs::write(
+        rig.dir.join("junk.pem"),
+        "-----BEGIN CERTIFICATE-----\n!!\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    let junk = TlsFiles {
+        cert: rig.dir.join("junk.pem"),
+        ..rig.config.files.clone()
+    };
+    assert!(identity_of_files(&junk).unwrap_err().contains("junk.pem"));
+    // A storage node's certificate is not an updater's.
+    let node = rig.pki.storage_node("n1");
+    std::fs::write(rig.dir.join("node.pem"), node.cert_pem()).unwrap();
+    let not_updater = TlsFiles {
+        cert: rig.dir.join("node.pem"),
+        ..rig.config.files.clone()
+    };
+    assert!(
+        identity_of_files(&not_updater)
+            .unwrap_err()
+            .contains("role is not `updater`")
+    );
+}
+
+/// An agent is built for a storage, daemon or Mac host; a frontend's certificate is refused (the
+/// roll updates frontends), and so are files that make no TLS configuration and an operator token
+/// file the API client does not accept.
+#[test]
+fn an_agent_is_built_for_every_host_but_a_frontend() {
+    assert!(
+        host_platform().is_some(),
+        "tests run where kbf has releases"
+    );
+    for role in [HostRole::Storage, HostRole::Daemon, HostRole::MacDaemon] {
+        let rig = Rig::new("bd-built", role);
+        let agent = build(&rig.config).unwrap_or_else(|e| panic!("{role}: {e}"));
+        let status = agent.status();
+        assert_eq!(status.version, Version::parse("0").unwrap());
+        assert_eq!(status.health, crate::wire::Health::Unhealthy);
+    }
+    let rig = Rig::new("bd-frontend", HostRole::Frontend);
+    let err = build(&rig.config).err().unwrap();
+    assert!(err.contains("frontend"), "{err}");
+
+    let mut rig = Rig::new("bd-nofiles", HostRole::Daemon);
+    std::fs::write(&rig.config.files.ca, "").unwrap();
+    assert!(
+        build(&rig.config)
+            .err()
+            .unwrap()
+            .contains("holds no certificate")
+    );
+
+    let mut rig2 = Rig::new("bd-notoken", HostRole::Daemon);
+    rig2.config.token_file = rig2.dir.join("absent");
+    assert!(build(&rig2.config).err().unwrap().contains("--token-file"));
+    rig.config.files.cert = rig.dir.join("absent.pem");
+    assert!(build(&rig.config).is_err());
+}
+
+/// A storage host's node is never drained (the roll never drains one, a daemon on it
+/// included): its drain, its leases and its undrain are done already. A daemon host's node is
+/// drained through the frontend, which here cannot be reached.
+#[test]
+fn a_storage_host_is_not_drained_and_a_daemon_host_is() {
+    let rig = Rig::new("bd-drain", HostRole::Daemon);
+    let api = OperatorApi::new(rig.config.operator_api, rig.config.token_file.clone(), None)
+        .unwrap()
+        .with_timeout(Duration::from_millis(200));
+    let storage = drain_for(Role::Storage, &api);
+    let h = host(Role::Storage);
+    assert_eq!(storage.drain(&h, Duration::from_secs(1)), Ok(()));
+    assert_eq!(storage.leases(&h), Ok(0));
+    assert_eq!(storage.undrain(&h), Ok(()));
+    assert_eq!(NoDrain.leases(&h), Ok(0));
+    assert_eq!(no_drain().undrain(&h), Ok(()));
+
+    for role in [Role::Daemon, Role::MacDaemon] {
+        let daemon = drain_for(role, &api);
+        let h = host(role);
+        assert!(
+            daemon.drain(&h, Duration::from_secs(1)).is_err(),
+            "{role:?}"
+        );
+    }
+}
+
+/// `run_config` builds the agent and runs it until it is stopped: with nothing reachable it
+/// heartbeats into the void and ends with exit 0 when told to; an agent that cannot be built is
+/// exit 1 with the reason.
+#[test]
+fn the_process_runs_until_stopped_and_says_why_it_cannot_start() {
+    let rig = Rig::new("bd-run", HostRole::Daemon);
+    let (code, text) = run_config(&rig.config, |stop| {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            stop.stop();
+        });
+    });
+    assert_eq!((code, text.as_str()), (0, ""));
+
+    let frontend = Rig::new("bd-run-fe", HostRole::Frontend);
+    let (code, text) = run_config(&frontend.config, |_| unreachable!("not started"));
+    assert_eq!(code, 1);
+    assert!(
+        text.starts_with("kbf-updater: ") && text.contains("frontend"),
+        "{text}"
+    );
+}
+
+/// `run_agent` hands the caller the handle before it runs.
+#[test]
+fn the_caller_gets_the_stop_handle_before_the_agent_runs() {
+    let rig = Rig::new("bd-ready", HostRole::Storage);
+    let agent = build(&rig.config).unwrap();
+    let stop_seen = Arc::new(std::sync::Mutex::new(None::<Stop>));
+    let slot = Arc::clone(&stop_seen);
+    let (code, _) = run_agent(&agent, move |stop| {
+        stop.stop();
+        *slot.lock().unwrap() = Some(stop);
+    });
+    assert_eq!(code, 0);
+    assert!(stop_seen.lock().unwrap().is_some());
+}
+
+/// The clock the deadlines are read against is the wall clock in Unix seconds.
+#[test]
+fn the_clock_is_unix_seconds() {
+    assert!(unix_now() > 1_700_000_000);
+}

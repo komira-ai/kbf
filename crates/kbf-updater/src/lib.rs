@@ -33,12 +33,14 @@
 //! And for the coordinator that tells each host's updater what to run
 //! (`docs/design/updates.md`): [`wire`], the heartbeat and the reply.
 
+pub mod agent;
 pub mod api;
 pub mod daemon;
 pub mod fakes;
 pub mod frontend_http;
 pub mod health;
 pub mod http;
+pub mod identity;
 pub mod inventory;
 pub mod listener;
 pub mod node_drain;
@@ -65,6 +67,8 @@ pub use updater::{Ports, STREAMS_BOUND, Started, Updater};
 mod daemon_tests;
 #[cfg(test)]
 mod frontend_http_tests;
+#[cfg(test)]
+mod identity_tests;
 #[cfg(test)]
 mod listener_tests;
 #[cfg(test)]
@@ -102,7 +106,8 @@ pub fn version_line() -> String {
 }
 
 /// The binary, as a function so that it is tested: the argument list in, the exit code and the
-/// text out. `--version` prints the version; the flags of [`daemon`] start the updater,
+/// text out. `--version` prints the version; `agent` and the flags of [`agent::flags`] start
+/// the agent mode ([`run_agent_with`]); the flags of [`daemon`] start the updater,
 /// call `ready` with a handle that stops it, and return when it is stopped. Anything else is
 /// a usage error (exit 2); a start that fails is exit 1 with the reason.
 pub fn run_with(args: &[String], ready: impl FnOnce(daemon::Stopper)) -> (u8, String) {
@@ -119,7 +124,21 @@ pub fn run_with(args: &[String], ready: impl FnOnce(daemon::Stopper)) -> (u8, St
     daemon::run_config(&cfg, ready)
 }
 
-/// [`run_with`], for the binary: nothing to do once started.
+/// The agent mode (`kbf-updater agent ...`): the flags in, `ready` called with a handle that
+/// stops it, and the exit code and text out when it is stopped. A usage error is exit 2, a
+/// start that fails is exit 1 with the reason.
+pub fn run_agent_with(args: &[String], ready: impl FnOnce(agent::Stop)) -> (u8, String) {
+    match agent::flags::parse_flags(args.get(2..).unwrap_or_default()) {
+        Ok(cfg) => agent::run_config(&cfg, ready),
+        Err(why) => (2, format!("kbf-updater: {why}\n{}", agent::flags::USAGE)),
+    }
+}
+
+/// [`run_with`] or [`run_agent_with`], for the binary: nothing to do once started.
 pub fn run(args: &[String]) -> (u8, String) {
-    run_with(args, |_| {})
+    if args.get(1).map(String::as_str) == Some("agent") {
+        run_agent_with(args, |_| {})
+    } else {
+        run_with(args, |_| {})
+    }
 }
