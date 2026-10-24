@@ -97,8 +97,8 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
     if packaged.is_empty() {
         return Err("no `cargo xtask package` line in any `run:` step".to_owned());
     }
-    // The packages: (binary, platform, extension), the installer's deb and the `kbf` deb of a
-    // Linux job and the installer's `.pkg` of the macOS one.
+    // The packages: (binary, platform, extension), the installer's deb, the `kbf` deb and the
+    // frontend image of a Linux job and the installer's `.pkg` of the macOS one.
     let mut packages: Vec<(&str, String, &str)> = Vec::new();
     for platform in attested_assets::packaged_debs(artifacts)? {
         packages.push(("kbf-installer", platform, "deb"));
@@ -108,6 +108,9 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
     }
     for platform in attested_assets::packaged_macos_pkgs(artifacts)? {
         packages.push(("kbf-installer", platform, "pkg"));
+    }
+    for platform in attested_assets::packaged_frontend_images(artifacts)? {
+        packages.push(("kbf-frontend-image", platform, "oci.tar"));
     }
     let groups: BTreeSet<&str> = packaged
         .iter()

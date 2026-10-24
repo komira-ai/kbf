@@ -751,6 +751,14 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-kbf-deb-linux-x86_64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/kbf-${GITHUB_SHA}-linux-x86_64.deb.sigstore.json"
+      - id: provenance-kbf-frontend-image-linux-x86_64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-frontend-image-${{ github.sha }}-linux-x86_64.oci.tar
+      - name: Name the bundle of the frontend image for linux-x86_64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-frontend-image-linux-x86_64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-frontend-image-${GITHUB_SHA}-linux-x86_64.oci.tar.sigstore.json"
       - id: provenance-kbf-daemon-linux-arm64
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -823,6 +831,14 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-kbf-deb-linux-arm64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/kbf-${GITHUB_SHA}-linux-arm64.deb.sigstore.json"
+      - id: provenance-kbf-frontend-image-linux-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-frontend-image-${{ github.sha }}-linux-arm64.oci.tar
+      - name: Name the bundle of the frontend image for linux-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-frontend-image-linux-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-frontend-image-${GITHUB_SHA}-linux-arm64.oci.tar.sigstore.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bundles-linux
