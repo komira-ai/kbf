@@ -1,6 +1,6 @@
 //! Reading the role out of a certificate: exactly one `urn:kbf:role:<name>` URI.
 
-use kbf_peer::{PeerRole, ROLE_URI_PREFIX, RoleError, role_of};
+use kbf_peer::{PeerRole, ROLE_URI_PREFIX, RoleError, role_of, uri_values_of};
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, SanType};
 
 fn uri(text: &str) -> SanType {
@@ -92,4 +92,36 @@ fn each_refusal_says_why() {
         garbled.starts_with("the client certificate does not parse: "),
         "{garbled}"
     );
+}
+
+/// Catches: the URI values of one prefix read wrongly: another prefix's URIs mixed in, the
+/// order of the certificate changed, a DNS name or a prefix in another letter case taken for
+/// a value, a value cut short, and bytes that are no certificate read as none.
+#[test]
+fn the_uris_of_one_prefix_are_listed_in_the_certificates_order() {
+    let leaf = der(vec![
+        uri("urn:kbf:host-role:storage"),
+        role("updater"),
+        dns("urn:kbf:host-role:daemon"),
+        uri("URN:KBF:HOST-ROLE:daemon"),
+        uri("urn:kbf:host-role:mac-daemon"),
+        uri("urn:kbf:host-role:"),
+    ]);
+    assert_eq!(
+        uri_values_of(&leaf, "urn:kbf:host-role:"),
+        Ok(vec![
+            "storage".to_owned(),
+            "mac-daemon".to_owned(),
+            String::new()
+        ])
+    );
+    assert_eq!(
+        uri_values_of(&leaf, ROLE_URI_PREFIX),
+        Ok(vec!["updater".to_owned()])
+    );
+    assert_eq!(uri_values_of(&leaf, "urn:other:"), Ok(vec![]));
+    assert!(matches!(
+        uri_values_of(b"not DER", ROLE_URI_PREFIX),
+        Err(RoleError::NotACertificate(_))
+    ));
 }

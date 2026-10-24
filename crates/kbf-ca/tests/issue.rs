@@ -9,10 +9,10 @@ use std::time::Duration;
 
 use kbf_ca::{
     Authority, CLOCK_FLOOR_UNIX, CaError, Entropy, Issued, NodeCert, Policy, PublicKey,
-    SystemEntropy, parse_csr,
+    SystemEntropy, UpdaterCert, parse_csr,
 };
 use kbf_proto::kbf::enroll::v1::IssuedCert;
-use kbf_types::{NodeId, Role};
+use kbf_types::{HostRole, NodeId, Role};
 use rcgen::{
     BasicConstraints, CertificateParams, CustomExtension, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
@@ -478,6 +478,106 @@ fn the_frontend_certificate_needs_good_names() {
     let v = view(&go(&["203.0.113.9"]).expect("an address alone").der);
     assert!(v.dns.is_empty());
     assert_eq!(v.cn, ["203.0.113.9"]);
+}
+
+// ---- the update coordinator's and the updaters' certificates -------------------------
+
+// Catches: an updater certificate that drifts from its row of the table: the role `updater`
+// and the host's role as two URIs, the node's one DNS name, clientAuth and no serverAuth, no
+// extension the table lacks; a host role spelled differently from `HostRole::name`; and a
+// certificate the storage service's role reader would admit as a role it serves.
+#[test]
+fn an_updater_certificate_names_the_updater_role_and_the_hosts_role() {
+    let ca = authority();
+    let golden = [
+        (HostRole::Frontend, "urn:kbf:host-role:frontend"),
+        (HostRole::Storage, "urn:kbf:host-role:storage"),
+        (HostRole::Daemon, "urn:kbf:host-role:daemon"),
+        (HostRole::MacDaemon, "urn:kbf:host-role:mac-daemon"),
+    ];
+    for (host_role, uri) in golden {
+        let key = key();
+        let issued = ca
+            .issue_updater(
+                &UpdaterCert {
+                    node_id: &node("host-7"),
+                    host_role,
+                    key: &key,
+                },
+                NOW,
+                &mut Stream(5),
+            )
+            .expect("issued");
+        let v = view(&issued.der);
+        assert_eq!(v.uris, ["urn:kbf:role:updater", uri], "{host_role:?}");
+        assert_eq!(v.dns, ["host-7"]);
+        assert!(v.ips.is_empty());
+        assert_eq!(v.cn, ["host-7"]);
+        assert_eq!(v.other_sans, 0);
+        assert!(v.client_auth && !v.server_auth);
+        assert_eq!(v.other_ekus, 0);
+        assert_eq!(v.ca, Some((true, false, None)));
+        assert_eq!(v.key_usage, Some((true, KU_DIGITAL_SIGNATURE)));
+        assert_eq!(v.extension_oids, table_extension_oids());
+        assert_eq!(v.spki, key.spki());
+        assert_eq!(
+            kbf_peer::role_of(&issued.der),
+            Err(kbf_peer::RoleError::Unknown("updater".to_owned())),
+            "storage admits no updater"
+        );
+        as_client(&[ca.root_der()], &[&issued.der]).expect("dials the coordinator");
+        as_server(&[ca.root_der()], &[&issued.der], "host-7")
+            .expect_err("an updater certificate serves nothing");
+    }
+}
+
+// Catches: a coordinator certificate with the wrong role, an EKU that lets it act as a
+// client, names that are not the ones given, and a chain that does not verify for the one
+// use it has: a TLS server under its name.
+#[test]
+fn the_coordinator_certificate_is_the_coordinator_role_for_its_names() {
+    let ca = authority();
+    let key = key();
+    let issued = ca
+        .issue_coordinator(
+            &["coordinator.example.com", "203.0.113.9"],
+            &key,
+            NOW,
+            &mut Stream(4),
+        )
+        .expect("issued");
+    let v = view(&issued.der);
+    assert_eq!(v.uris, ["urn:kbf:role:coordinator"]);
+    assert_eq!(v.dns, ["coordinator.example.com"]);
+    assert_eq!(
+        v.ips.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        ["203.0.113.9"]
+    );
+    assert_eq!(v.cn, ["coordinator.example.com"]);
+    assert!(v.server_auth && !v.client_auth);
+    assert_eq!(v.other_ekus, 0);
+    assert_eq!(v.ca, Some((true, false, None)));
+    assert_eq!(v.key_usage, Some((true, KU_DIGITAL_SIGNATURE)));
+    assert_eq!(v.extension_oids, table_extension_oids());
+    assert_eq!(
+        kbf_peer::role_of(&issued.der),
+        Err(kbf_peer::RoleError::Unknown("coordinator".to_owned()))
+    );
+    as_server(&[ca.root_der()], &[&issued.der], "coordinator.example.com")
+        .expect("serves its name");
+    as_client(&[ca.root_der()], &[&issued.der]).expect_err("it dials nobody");
+}
+
+// Catches: a coordinator certificate for no name, for a wildcard, or for a name that is not
+// one (the same names rule as the frontend's).
+#[test]
+fn the_coordinator_certificate_needs_good_names() {
+    let ca = authority();
+    let key = key();
+    let go = |names: &[&str]| ca.issue_coordinator(names, &key, NOW, &mut Stream(3));
+    assert_eq!(go(&[]).unwrap_err(), CaError::NoNames);
+    assert_eq!(go(&["*.example.com"]).unwrap_err(), CaError::Name);
+    assert_eq!(go(&["ok.example", "Bad Name"]).unwrap_err(), CaError::Name);
 }
 
 // ---- serials -------------------------------------------------------------------------
