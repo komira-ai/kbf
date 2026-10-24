@@ -88,11 +88,8 @@ fn files(bytes: &[u8]) -> Result<Vec<(String, u32, Vec<u8>)>, String> {
         }
         let path = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
         let mut body = Vec::new();
-        let mode = entry
-            .header()
-            .mode()
-            .and_then(|mode| entry.read_to_end(&mut body).map(|_| mode))
-            .map_err(|e| format!("{path}: {e}"))?;
+        let mode = entry.header().mode().map_err(not_a_tar)?;
+        entry.read_to_end(&mut body).map_err(not_a_tar)?;
         let path = path
             .trim_start_matches("./")
             .trim_start_matches('/')

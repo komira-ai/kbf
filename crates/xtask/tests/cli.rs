@@ -705,3 +705,39 @@ fn source_date_epoch_appends_the_committer_time_of_the_commit_and_refuses_anythi
         "a refused commit writes nothing"
     );
 }
+
+#[test]
+fn pkg_image_asset_refuses_a_file_that_is_not_an_image_both_when_adding_and_when_verifying() {
+    // Catches: the verb not wired to the check (a non-image accepted and listed), `--out`
+    // writing before the refusal, and `--verify-only` accepting a file under the wrong name.
+    let root = scratch("image-asset-cli");
+    let image = root.join("image.oci.tar");
+    std::fs::write(&image, b"not a tar").expect("image");
+    let tarball = root.join("kbf.tar.gz");
+    std::fs::write(&tarball, b"x").expect("tarball");
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let path = |p: &Path| p.to_str().expect("utf8").to_owned();
+    let out = root.join("dist");
+    for extra in [
+        vec!["--out".to_owned(), path(&out)],
+        vec!["--verify-only".to_owned()],
+    ] {
+        let mut args = vec![
+            "pkg-image-asset".to_owned(),
+            "--image".to_owned(),
+            path(&image),
+            "--platform".to_owned(),
+            "linux-x86_64".to_owned(),
+            "--commit".to_owned(),
+            commit.to_owned(),
+            "--kbf-tarball".to_owned(),
+            path(&tarball),
+        ];
+        args.extend(extra);
+        let words: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (code, _, err) = outcome(xtask(&root, &words).output().expect("run"));
+        assert_eq!(code, Some(1), "{err}");
+        assert!(err.contains("holds no kbf"), "{err}");
+    }
+    assert!(!out.join("SHA256SUMS.linux-x86_64").exists());
+}

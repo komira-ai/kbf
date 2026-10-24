@@ -359,3 +359,151 @@ fn verify_only_wants_the_name_of_the_commit_and_platform_and_a_listed_image_is_n
     let err = asset(&image, COMMIT, &Mode::Add(&out), &c).expect_err("twice");
     assert!(err.to_string().contains("already lists"), "{err}");
 }
+
+/// An image layout with the given `index.json` text and blobs (path, bytes), plus the named
+/// extra tar entries, in a tar.
+fn raw_image(index: &str, blobs: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let mut files: Vec<(&str, u32, &[u8])> = vec![("index.json", 0o644, index.as_bytes())];
+    for (p, b) in blobs {
+        files.push((p.as_str(), 0o644, b.as_slice()));
+    }
+    tar_of(&files)
+}
+
+/// The problems of `image` for x86_64 against the standard attested tarball.
+fn problems_of(name: &str, image: &[u8]) -> Vec<String> {
+    let (_, _, tarball) = world(name, &Fix::new(), &Fix::new().kbf, Platform::LinuxX86_64);
+    problems(image, &check(Platform::LinuxX86_64, &tarball)).expect("problems")
+}
+
+/// Asserts that a layout whose manifest or blobs are malformed is refused with the reason: two
+/// manifests in the index, a digest that is not sha256, a blob the layout does not hold, a config
+/// that is not JSON, a layer that is not a tar and a gzip layer that is not gzip.
+#[test]
+fn a_layout_with_a_malformed_index_digest_blob_or_layer_is_refused_with_the_reason() {
+    let two = raw_image(
+        r#"{"manifests":[{"digest":"sha256:a"},{"digest":"sha256:b"}]}"#,
+        &[],
+    );
+    assert_eq!(
+        problems_of("two", &two),
+        vec!["index.json lists 2 manifests, not exactly one".to_owned()]
+    );
+    let md5 = raw_image(r#"{"manifests":[{"digest":"md5:abc"}]}"#, &[]);
+    assert_eq!(
+        problems_of("md5", &md5),
+        vec![r#"manifest "md5:abc" is not a sha256 digest"#.to_owned()]
+    );
+    let absent = format!("sha256:{}", "0".repeat(64));
+    let missing = raw_image(
+        &format!(r#"{{"manifests":[{{"digest":"{absent}"}}]}}"#),
+        &[],
+    );
+    assert_eq!(
+        problems_of("absent", &missing),
+        vec![format!("holds no blob for the manifest {absent}")]
+    );
+    let junk = b"not json".to_vec();
+    let digest = format!("sha256:{}", Sha256::of(&junk));
+    let bad = raw_image(
+        &format!(r#"{{"manifests":[{{"digest":"{digest}"}}]}}"#),
+        &[(blob_path(&junk), junk)],
+    );
+    let got = problems_of("junk", &bad);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(
+        got[0].starts_with(&format!("the manifest {digest} is not JSON")),
+        "{got:?}"
+    );
+    // A gzip-looking layer that is not gzip, and a layer that is no tar.
+    for (name, layer, wanted) in [
+        ("gz", vec![0x1f, 0x8b, 1, 2, 3], "not a gzip stream"),
+        ("notar", vec![7u8; 700], "not a tar"),
+    ] {
+        let mut fix = Fix::new();
+        fix.gzip = false;
+        let image = fix.image();
+        // Replace the first layer by `layer`, keeping its digest in the manifest by
+        // rebuilding the layout around it.
+        let config = serde_json::json!({"os":"linux","architecture":"amd64",
+            "config":{"User":"65532","Entrypoint":["/usr/bin/kbf","--mode=frontend"]}})
+        .to_string()
+        .into_bytes();
+        let manifest = serde_json::json!({
+            "config":{"digest":format!("sha256:{}", Sha256::of(&config))},
+            "layers":[{"digest":format!("sha256:{}", Sha256::of(&layer))}]})
+        .to_string()
+        .into_bytes();
+        let index = format!(
+            r#"{{"manifests":[{{"digest":"sha256:{}"}}]}}"#,
+            Sha256::of(&manifest)
+        );
+        let raw = raw_image(
+            &index,
+            &[
+                (blob_path(&manifest), manifest),
+                (blob_path(&config), config),
+                (blob_path(&layer), layer),
+            ],
+        );
+        let got = problems_of(name, &raw);
+        assert_eq!(got.len(), 1, "{name}: {got:?}");
+        assert!(got[0].contains(wanted), "{name}: {got:?}");
+        assert!(!image.is_empty());
+    }
+}
+
+/// Asserts that an image whose layers hold no `usr/bin/kbf` is refused by name, that a
+/// directory entry in the outer tar is skipped, and that a tar entry cut short is refused.
+#[test]
+fn an_image_with_no_kbf_is_named_and_a_truncated_tar_is_refused() {
+    let mut tar = tar::Builder::new(Vec::new());
+    let mut h = tar::Header::new_ustar();
+    h.set_path("blobs/").expect("path");
+    h.set_entry_type(tar::EntryType::Directory);
+    h.set_size(0);
+    h.set_mode(0o755);
+    h.set_cksum();
+    tar.append(&h, &b""[..]).expect("dir");
+    let dir_only = tar.into_inner().expect("tar");
+    assert_eq!(
+        problems_of("dir", &dir_only),
+        vec!["holds no index.json: not an OCI image layout".to_owned()]
+    );
+    let full = Fix::new().image();
+    let cut = &full[..700];
+    let got = problems_of("cut", cut);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].starts_with("is not an OCI image tar"), "{got:?}");
+    // Cut inside the body of the first entry: its header is whole, its bytes are not.
+    let got = problems_of("cut-body", &full[..520]);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].starts_with("is not an OCI image tar: "), "{got:?}");
+
+    let layer = tar_of(&[("etc/other", 0o644, b"x")]);
+    let config = serde_json::json!({"os":"linux","architecture":"amd64",
+        "config":{"User":"65532","Entrypoint":["/usr/bin/kbf","--mode=frontend"]}})
+    .to_string()
+    .into_bytes();
+    let manifest = serde_json::json!({
+        "config":{"digest":format!("sha256:{}", Sha256::of(&config))},
+        "layers":[{"digest":format!("sha256:{}", Sha256::of(&layer))}]})
+    .to_string()
+    .into_bytes();
+    let index = format!(
+        r#"{{"manifests":[{{"digest":"sha256:{}"}}]}}"#,
+        Sha256::of(&manifest)
+    );
+    let raw = raw_image(
+        &index,
+        &[
+            (blob_path(&manifest), manifest),
+            (blob_path(&config), config),
+            (blob_path(&layer), layer),
+        ],
+    );
+    assert_eq!(
+        problems_of("nokbf", &raw),
+        vec!["holds no usr/bin/kbf".to_owned()]
+    );
+}

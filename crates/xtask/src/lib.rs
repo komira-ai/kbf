@@ -852,11 +852,6 @@ fn source_date_epoch(root: &Path, commit: &str, output: &Path) -> Result<String,
     }
     let said = git_stdout(root, &["show", "-s", "--format=%ct", commit])?;
     let seconds = String::from_utf8_lossy(&said).trim().to_owned();
-    if seconds.is_empty() || !seconds.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(Error::Failed(format!(
-            "git says the time of {commit} is {seconds:?}, not seconds since the epoch"
-        )));
-    }
     let line = format!("SOURCE_DATE_EPOCH={seconds}");
     let mut file = std::fs::OpenOptions::new()
         .create(true)
