@@ -38,20 +38,18 @@ testkit = ["kbf-host/testkit"]
 test-sandbox = []
 
 [dependencies]
-async-trait.workspace = true
 bytes.workspace = true
 clap.workspace = true
 flate2.workspace = true
 futures.workspace = true
 hex.workspace = true
-httparse.workspace = true
-hyper.workspace = true
 kbf-host.workspace = true
 kbf-proxy.workspace = true
 kbf-proto.workspace = true
 # The `setup` verb and the host's layout, `installer.toml` and state database it works on
-# (re-exported here under their old paths). `proxy`: the proxy's side of `setup` (`--proxy`, the
-# `[proxy]` table), which `kbf setup` in the `kbf` binary does not have.
+# (re-exported here under their old paths). `proxy`: the proxy's side of `setup` (the `[proxy]`
+# table it keeps, and the proxy's flags it takes only to refuse), which `kbf setup` in the `kbf`
+# binary does not have.
 kbf-setup = { workspace = true, features = ["proxy"] }
 # `postgres`: the schema's migrations and the client that applies them (`database` module).
 kbf-state = { workspace = true, features = ["postgres"] }
@@ -70,7 +68,6 @@ rustls-native-certs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-subtle.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 # The proxy verb's signal handlers run on kbf-proxy's runtime.
@@ -81,36 +78,24 @@ tracing.workspace = true
 ureq.workspace = true
 
 [dev-dependencies]
-# The proxy verb's process test is an h2c client of the real binary.
-base64.workspace = true
 bytes.workspace = true
+# The proxy verb's process tests are h2 clients of the real binary.
 h2.workspace = true
 http.workspace = true
 kbf-host = { workspace = true, features = ["testkit"] }
 kbf-installer = { workspace = true, features = ["testkit", "test-sandbox"] }
 # A Postgres database of its own for each test that needs a server (`database` tests).
 kbf-state = { workspace = true, features = ["test-database"] }
-# The proxy verb's process test starts the binary under a guard that reaps it
-# (kbf_testkit::reaped); a child held between fork and exec (kbf_testkit::forked), and a
-# start that waits out a program still open for writing (kbf_testkit::spawn); the test
-# Postgres server's URL (kbf_testkit::database).
+# The proxy verb's process tests start the binary under a guard that reaps it
+# (kbf_testkit::reaped); a child held between fork and exec (kbf_testkit::forked).
 kbf-testkit = { workspace = true, features = ["postgres"] }
 kbf-update.workspace = true
-# The proxy verb's process test mints the OIDC tokens of a CI job (`remote_operator_file`).
-kbf-oidc = { workspace = true, features = ["testkit"] }
 # The proxy verb serves TLS: its process test makes a CA and a server certificate, and is a
 # TLS client of the real binary.
 rcgen.workspace = true
-postgres.workspace = true
 rustls.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
 tokio-rustls.workspace = true
-tracing-subscriber.workspace = true
-
-# The proxy's child command line is parsed by the `kbf` binary's own parser (Linux only: the
-# spawner is). kbf-cli does not depend on the installer.
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-kbf-cli.workspace = true
 
 [lints]
 workspace = true

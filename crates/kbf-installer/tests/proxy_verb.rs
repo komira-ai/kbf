@@ -1,9 +1,8 @@
 //! `kbf-installer proxy` as a service manager runs it: a process with one activated socket.
-//! Nothing here needs root or a child frontend; the proxy has no active child, so every
-//! backend path is `UNAVAILABLE` and `/readyz` is 503, which is what the supervisor-less verb
-//! promises. The update route (`/v1/update/frontend`) is the update API with the handover driver
-//! behind it: on this host (no `releases/` directory, no child) it answers its status and
-//! refuses a `POST`, and the tests at the end say how.
+//! Nothing here needs root or a frontend; the pool's members are ports nothing listens on, so
+//! every backend path is `UNAVAILABLE` and `/readyz` is 503. The tests are of the verb: the
+//! table it takes and refuses, the socket it takes, the signals it handles. The pool's admin API
+//! is `proxy_pool.rs`'s.
 
 #![cfg(target_os = "linux")]
 
@@ -19,11 +18,22 @@ use kbf_testkit::reaped::{self, Reaped};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-installer");
 
-/// The state database of the host, as `installer.toml` names it. Nothing connects to it
-/// here: the start migrates only when it has a release to run.
-const DATABASE: &str = "database = \"postgres:///kbf?host=/nonexistent\"\n";
+/// Two members, on ports nothing listens on.
+const MEMBERS: &str = "[[proxy.frontend]]\nname = \"a\"\nbase_port = 18000\n\
+                       [[proxy.frontend]]\nname = \"b\"\nbase_port = 18010\n";
 
-const TABLE: &str = r#"database = "postgres:///kbf?host=/nonexistent"
+const TABLE: &str = r#"[proxy]
+operator_token_file = "/etc/kbf/operator.token"
+server_cert_file = "/etc/kbf/tls/server.pem"
+server_key_file = "/etc/kbf/tls/server.key"
+client_ca_file = "/etc/kbf/tls/ca.pem"
+[[proxy.frontend]]
+name = "a"
+base_port = 18000
+"#;
+
+/// The table of the removed two-slot supervision, over the same files as `TABLE`.
+const SLOT_TABLE: &str = r#"database = "postgres:///kbf?host=/nonexistent"
 [proxy]
 operator_token_file = "/etc/kbf/operator.token"
 server_cert_file = "/etc/kbf/tls/server.pem"
@@ -33,9 +43,9 @@ client_ca_file = "/etc/kbf/tls/ca.pem"
 base_port = 18000
 "#;
 
-/// A `[proxy]` table over real files in a scratch directory: a CA, a server certificate for
-/// `localhost`, the operator token (0600, 32 or more characters) and a secret path. Returns
-/// the `installer.toml` and the CA file a client trusts.
+/// A `[proxy]` table of a pool over real files in a scratch directory: a CA, a server
+/// certificate for `localhost`, the operator token (0600, 32 or more characters) and a secret
+/// path. Returns the `installer.toml` and the CA file a client trusts.
 fn served_config(name: &str) -> (PathBuf, PathBuf) {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = kbf_host::testkit::scratch(&format!("proxy-bin-{name}"));
@@ -48,12 +58,10 @@ fn served_config(name: &str) -> (PathBuf, PathBuf) {
     };
     let token = private("operator.token", TOKEN);
     let (cert, key) = (dir.join("server.pem"), dir.join("server.key"));
-    let state = dir.join("state");
-    fs::create_dir_all(&state).expect("state dir");
     let text = format!(
-        "{DATABASE}[proxy]\noperator_token_file = {token:?}\nserver_cert_file = {cert:?}\n\
+        "[proxy]\noperator_token_file = {token:?}\nserver_cert_file = {cert:?}\n\
          server_key_file = {key:?}\nclient_ca_file = {ca_file:?}\n\
-         proxy_auth_file = {:?}\nstate_dir = {state:?}\n[proxy.upstream]\nbase_port = 18000\n",
+         proxy_auth_file = {:?}\n{MEMBERS}",
         dir.join("proxy-auth"),
     );
     // Not `config`: it makes the directory again, and the files above are in it.
@@ -93,25 +101,8 @@ fn issue(dir: &Path, prefix: &str) -> PathBuf {
     private("ca.pem", &ca.pem())
 }
 
-/// The operator token `served_config` writes: the bearer the update route is called with.
+/// The operator token `served_config` writes.
 const TOKEN: &str = "operator-token-0123456789-abcdefghijkl";
-
-/// The proxy's state directory (`orders.json`, `requests.json`, `children/`), next to the
-/// config `served_config` wrote.
-fn state_of(config: &Path) -> PathBuf {
-    config.with_file_name("state")
-}
-
-/// The directory the verb is told holds the root half's `status.json`: next to the config, so
-/// every test has its own.
-fn update_dir_of(config: &Path) -> PathBuf {
-    config.with_file_name("update")
-}
-
-/// The order spool the verb is told to use: next to the config.
-fn orders_dir_of(config: &Path) -> PathBuf {
-    config.with_file_name("orders")
-}
 
 fn config(name: &str, text: &str) -> PathBuf {
     let path = kbf_host::testkit::scratch(&format!("proxy-bin-{name}")).join("installer.toml");
@@ -175,8 +166,6 @@ fn check_is_exit_0_for_a_valid_table_and_2_for_every_refusal() {
 /// `min_generation` of the wrong type, a source a later build wrote) beside a valid `[proxy]`
 /// is exit 0 with nothing printed, as the verb's own load is, so a host a later setup wrote
 /// for can still run its proxy.
-///
-/// Catches: `loaded_from` back on `InstallerToml::parse` (red: exit 2).
 #[test]
 fn check_ignores_keys_the_verb_does_not_read() {
     for (name, extra) in [
@@ -193,36 +182,50 @@ fn check_ignores_keys_the_verb_does_not_read() {
     }
 }
 
-/// Catches a proxy that starts on a host with no database: the start migrates before it runs
-/// a release, so a file without a usable `database` is refused as usage, for `--check` and for
-/// a run alike, and the refusal never quotes the URL or its password.
+/// Asserts that a table with the `upstream` table, the removed two-slot supervision, is refused
+/// for `--check` and for a run alike (exit 2, before the run looks at its socket), with the path
+/// of the file, the words that the supervision was removed and the tables to give instead.
 #[test]
-fn a_file_without_a_usable_database_is_refused_and_the_url_is_never_quoted() {
-    let proxy = TABLE.replace("database = \"postgres:///kbf?host=/nonexistent\"\n", "");
-    let secret_url = "postgres://kbf_marker_user:hunter2_marker@127.0.0.1:5432/kbf_marker_db";
-    for (name, text, want) in [
-        ("db-none", proxy.clone(), "state database"),
-        (
-            "db-password",
-            format!("database = {secret_url:?}\n{proxy}"),
-            "carries a password",
-        ),
-    ] {
-        let path = config(name, &text);
-        for args in [&["--check"][..], &[][..]] {
-            let out = run(args, &path);
-            let err = String::from_utf8_lossy(&out.stderr);
-            assert_eq!(out.status.code(), Some(2), "{name}: {err}");
-            assert!(err.contains(want), "{name}: {err}");
-            for secret in [
-                "hunter2_marker",
-                "kbf_marker_user",
-                "kbf_marker_db",
-                "127.0.0.1",
-            ] {
-                assert!(!err.contains(secret), "{name}: {secret} in {err}");
-            }
-        }
+fn a_slot_table_is_refused_with_the_removal_and_the_tables_to_give_instead() {
+    let path = config("slot", SLOT_TABLE);
+    let shown = path.display().to_string();
+    for args in [&["--check"][..], &[][..]] {
+        let out = run(args, &path);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {err}");
+        assert!(err.contains(&shown), "{args:?}: {err}");
+        assert!(
+            err.contains("two-slot supervision was removed"),
+            "{args:?}: {err}"
+        );
+        assert!(err.contains("[[proxy.frontend]]"), "{args:?}: {err}");
+        assert!(!err.contains("LISTEN_PID"), "{args:?}: {err}");
+    }
+}
+
+/// Asserts that the retired flags of the removed supervision (`--kbf-binary`, `--update-dir`,
+/// `--orders-dir`) are accepted, so a unit written before the removal still starts: with all
+/// three given `--check` of a pool table is exit 0, and the standard error has one line for each
+/// flag saying that it is no longer read.
+#[test]
+fn the_retired_flags_are_accepted_and_each_is_named_once_on_standard_error() {
+    let path = config("retired", TABLE);
+    let flags = [
+        "--check",
+        "--kbf-binary",
+        "/usr/bin/kbf",
+        "--update-dir",
+        "/var/lib/kbf-installer",
+        "--orders-dir",
+        "/var/lib/kbf-installer/orders",
+    ];
+    let out = run(&flags, &path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    for flag in ["--kbf-binary", "--update-dir", "--orders-dir"] {
+        let line = format!("{flag} is no longer read: two-slot supervision was removed");
+        assert_eq!(err.matches(&line).count(), 1, "{flag}: {err}");
     }
 }
 
@@ -257,12 +260,6 @@ fn start(path: &Path, listener: &TcpListener) -> Reaped {
     start_with(path, listener, Stdio::piped())
 }
 
-/// The host root of the verb under test: a directory with no `releases/` in it, so the host's
-/// own install (if any) is not what the driver looks at.
-fn root_of(config: &Path) -> PathBuf {
-    config.with_file_name("root")
-}
-
 /// [`start`] with `stderr` for the verb's standard error.
 fn start_with(path: &Path, listener: &TcpListener, stderr: Stdio) -> Reaped {
     start_masked(path, listener, stderr, false)
@@ -271,60 +268,14 @@ fn start_with(path: &Path, listener: &TcpListener, stderr: Stdio) -> Reaped {
 /// [`start_with`], and with `block_term` the verb inherits SIGTERM, SIGINT and SIGHUP blocked, as from
 /// a launcher that blocked them.
 fn start_masked(path: &Path, listener: &TcpListener, stderr: Stdio, block_term: bool) -> Reaped {
-    start_args(path, listener, stderr, block_term, &[])
-}
-
-/// [`start_masked`] with more flags for the verb.
-fn start_args(
-    path: &Path,
-    listener: &TcpListener,
-    stderr: Stdio,
-    block_term: bool,
-    flags: &[&std::ffi::OsStr],
-) -> Reaped {
-    start_env(path, listener, stderr, block_term, flags, &[])
-}
-
-/// [`start_args`] with `env` set in the verb's environment (name, value).
-fn start_env(
-    path: &Path,
-    listener: &TcpListener,
-    stderr: Stdio,
-    block_term: bool,
-    flags: &[&std::ffi::OsStr],
-    env: &[(&str, &Path)],
-) -> Reaped {
-    use std::os::unix::ffi::OsStrExt as _;
-    // Built before the fork: the child only calls `setenv` on them.
-    let env: Vec<(std::ffi::CString, std::ffi::CString)> = env
-        .iter()
-        .map(|(name, value)| {
-            (
-                std::ffi::CString::new(*name).expect("a name"),
-                std::ffi::CString::new(value.as_os_str().as_bytes()).expect("a value"),
-            )
-        })
-        .collect();
     let fd = listener.as_raw_fd();
     let mut command = Command::new(BIN);
     command
         .args(["proxy", "--config"])
         .arg(path)
-        .arg("--orders-dir")
-        .arg(orders_dir_of(path))
-        .arg("--root")
-        .arg(root_of(path))
-        .args(flags)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr);
-    // A test that passes its own `--update-dir` (a `status.json` it wrote) is not given a second.
-    if !flags
-        .iter()
-        .any(|flag| flag.to_str() == Some("--update-dir"))
-    {
-        command.arg("--update-dir").arg(update_dir_of(path));
-    }
     // SAFETY: async-signal-safe calls (`sigprocmask` family, `fcntl`, `dup2`, `getpid`) and
     // `setenv`, which is not: if another thread of this test binary held the environment or
     // allocator lock at `fork`, the child would block before `exec` (the start then fails
@@ -357,9 +308,6 @@ fn start_env(
             // environment to `exec` as soon as one variable is set on the command.
             libc::setenv(c"LISTEN_PID".as_ptr(), digits[at..].as_ptr().cast(), 1);
             libc::setenv(c"LISTEN_FDS".as_ptr(), c"1".as_ptr(), 1);
-            for (name, value) in &env {
-                libc::setenv(name.as_ptr(), value.as_ptr(), 1);
-            }
             Ok(())
         });
     }
@@ -476,7 +424,7 @@ fn listening_ports(pid: u32) -> Vec<u16> {
 /// Catches a verb that does not serve its activated socket, that listens on anything else
 /// (an admin or metrics port of its own), or that
 /// does not stop on SIGTERM with exit 0: it answers `/healthz` 200, `/readyz` 503 with no
-/// active child and an unknown path 404, listens on exactly the one port it was given, and
+/// member ready and an unknown path 404, listens on exactly the one port it was given, and
 /// exits 0 on SIGTERM.
 #[tokio::test(flavor = "current_thread")]
 async fn the_activated_socket_is_served_alone_and_sigterm_stops_it() {
@@ -502,7 +450,7 @@ async fn serve_alone_and_stop_on(signal: i32) {
         .await
         .expect("the proxy answers");
     assert_eq!((status, body.as_str()), (200, "ok"));
-    assert_eq!(get(addr, &ca, "/readyz").await.0, 503, "no active child");
+    assert_eq!(get(addr, &ca, "/readyz").await.0, 503, "no member is ready");
     assert_eq!(get(addr, &ca, "/nothing").await.0, 404);
     assert_eq!(
         listening_ports(child.id()),
@@ -653,133 +601,6 @@ async fn a_closed_standard_error_does_not_stop_the_verb_serving() {
     );
     let (status, took) = exited(&mut child, Duration::from_secs(10));
     assert_eq!(status.and_then(|s| s.code()), Some(0), "after {took:?}");
-}
-
-/// Catches a verb that does not adopt the frontend a previous proxy left, or that takes its
-/// children down when it stops: a process recorded under the proxy's state directory, still
-/// the recorded process, is adopted at start (the startup hold ends into its slot, and the
-/// verb says so), and it is still running after the proxy has drained and exited on SIGTERM.
-#[tokio::test(flavor = "current_thread")]
-async fn a_recorded_frontend_is_adopted_and_outlives_the_proxy_that_stops() {
-    use kbf_installer::proxy::child_real::{Recorded, ident_of};
-
-    let (path, ca) = served_config("adopt");
-    let children = state_of(&path).join("children");
-    fs::create_dir_all(&children).expect("children dir");
-    let mut frontend = Command::new("sleep");
-    frontend.arg("600").stdin(Stdio::null());
-    let frontend = reaped::spawn(&mut frontend, 3).expect("a stand-in frontend");
-    let ident = ident_of(frontend.id()).expect("identity");
-    let record = Recorded {
-        ident,
-        commit: kbf_installer::CommitId::new(&"a".repeat(40)).expect("a commit"),
-    };
-    fs::write(
-        children.join("a.json"),
-        serde_json::to_vec(&record).expect("json"),
-    )
-    .expect("record");
-
-    // The adopted child is asked its role before the startup hold ends into it: a stand-in
-    // admin port answers as an active holder. Slot A's admin port is the base port plus 3.
-    let admin = TcpListener::bind("127.0.0.1:0").expect("admin port");
-    let admin_port = admin.local_addr().expect("addr").port();
-    std::thread::spawn(move || {
-        const ROLE: &str = "{\"role\":\"active\",\"admin_protocol\":1,\"generation\":1,\
-                            \"held_generation\":1,\"superseded\":false}";
-        for stream in admin.incoming().flatten() {
-            let mut stream = stream;
-            let mut head = [0_u8; 1024];
-            let _ = std::io::Read::read(&mut stream, &mut head);
-            let reply = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
-                 Connection: close\r\n\r\n{ROLE}",
-                ROLE.len()
-            );
-            let _ = std::io::Write::write_all(&mut stream, reply.as_bytes());
-        }
-    });
-    let table = fs::read_to_string(&path).expect("config text").replace(
-        "base_port = 18000",
-        &format!("base_port = {}", admin_port - 3),
-    );
-    fs::write(&path, table).expect("write");
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let mut proxy = start(&path, &listener);
-    drop(listener);
-    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca, "/healthz"))
-        .await
-        .expect("the proxy answers");
-    assert_eq!(status, 200);
-
-    // SAFETY: `kill` of our own child.
-    assert_eq!(
-        unsafe { libc::kill(proxy.id().cast_signed(), libc::SIGTERM) },
-        0
-    );
-    let (status, _) = exited(&mut proxy, Duration::from_secs(20));
-    assert_eq!(status.and_then(|s| s.code()), Some(0), "a clean stop");
-    let mut err = String::new();
-    std::io::Read::read_to_string(&mut proxy.stderr.take().expect("stderr"), &mut err)
-        .expect("stderr text");
-    assert!(
-        err.contains("the frontend child in slot A serves"),
-        "the recorded child was not adopted: {err}"
-    );
-    // SAFETY: signal 0 only checks that the process exists; the child is ours.
-    let alive = unsafe { libc::kill(frontend.id().cast_signed(), 0) };
-    assert_eq!(alive, 0, "the frontend went down with the proxy");
-}
-
-/// Catches a cold start that cannot say why it failed or where: with no child to adopt and a
-/// `status.json` that cannot be read, the verb reports each try to `boot.json` in its state
-/// directory (the file replaces itself, state `retrying`, the reason's word) and to its standard
-/// error with the detail, and a stop during the wait between tries ends it cleanly.
-#[tokio::test(flavor = "current_thread")]
-async fn a_cold_start_that_cannot_read_status_reports_each_try_and_stops_cleanly() {
-    let update = kbf_host::testkit::scratch("proxy-bin-cold-update");
-    fs::write(update.join("status.json"), b"{not json").expect("status.json");
-    let (path, _ca) = served_config("cold");
-    let state = state_of(&path);
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let flags = [std::ffi::OsStr::new("--update-dir"), update.as_os_str()];
-    let mut proxy = start_args(&path, &listener, Stdio::piped(), false, &flags);
-    drop(listener);
-    let boot = state.join("boot.json");
-    let began = Instant::now();
-    let text = loop {
-        if let Ok(text) = fs::read_to_string(&boot)
-            && text.contains("retrying")
-        {
-            break text;
-        }
-        assert!(began.elapsed() < Duration::from_secs(60), "no boot.json");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-    let json: serde_json::Value = serde_json::from_str(&text).expect("json");
-    assert_eq!(json["reason"], "status-unreadable");
-    // SAFETY: `kill` of our own child.
-    assert_eq!(
-        unsafe { libc::kill(proxy.id().cast_signed(), libc::SIGTERM) },
-        0
-    );
-    let (status, _) = exited(&mut proxy, Duration::from_secs(20));
-    assert_eq!(status.and_then(|s| s.code()), Some(0), "a clean stop");
-    let mut err = String::new();
-    std::io::Read::read_to_string(&mut proxy.stderr.take().expect("stderr"), &mut err)
-        .expect("stderr text");
-    assert!(
-        err.contains("cold start retrying (attempt 1 of 10): status-unreadable"),
-        "{err}"
-    );
-    assert!(err.contains(", next try in 2 s"), "{err}");
-    assert!(
-        err.contains("; to fix: start the installer service"),
-        "{err}"
-    );
-    assert!(err.contains(" ["), "the detail goes to the log: {err}");
-    assert!(!err.contains("was not written"), "{err}");
 }
 
 /// Catches a verb that serves with the stop signals still blocked, as a launcher that blocked
@@ -1229,250 +1050,8 @@ async fn a_sighup_during_the_stop_does_not_cancel_it() {
     assert!(took < Duration::from_secs(10), "after {took:?}");
 }
 
-const UPDATE: &str = "/v1/update/frontend";
-const COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-/// The body of a `POST` that asks for an update to `COMMIT`.
-fn post_body(request_id: &str) -> String {
-    format!(r#"{{"commit":"{COMMIT}","request_id":"{request_id}","nodes":false}}"#)
-}
-
-fn json(text: &str) -> serde_json::Value {
-    serde_json::from_str(text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"))
-}
-
-/// The names in `dir`.
-fn names_in(dir: &Path) -> Vec<String> {
-    fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
-        .map(|entry| {
-            entry
-                .expect("an entry")
-                .file_name()
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect()
-}
-
-/// A verb serving on a port of its own that answers `/healthz`: its guard, its address, the CA
-/// a client trusts and the config it was started with (the directories it was told to use are
-/// next to it).
-async fn serving(name: &str) -> (Reaped, SocketAddr, PathBuf, PathBuf) {
-    let (config, ca) = served_config(name);
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let proxy = start(&config, &listener);
-    drop(listener);
-    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca, "/healthz"))
-        .await
-        .expect("the proxy answers");
-    assert_eq!(status, 200);
-    (proxy, addr, ca, config)
-}
-
-/// Catches an update route that is still the proxy's 503 `updates are not wired`, or that
-/// reaches something other than the update API: with the operator token a `GET` is the API's
-/// status of "no update" (200, no update id, no phase) although the root half has written no
-/// `status.json` yet, and the verb opened the order spool and its counter where it was told.
-#[tokio::test(flavor = "current_thread")]
-async fn the_update_route_is_the_update_api() {
-    let (_proxy, addr, ca, config) = serving("update-status").await;
-    let (status, text) = call(addr, &ca, "GET", UPDATE, Some(TOKEN), b"").await;
-    assert_eq!(status, 200, "{text}");
-    let body = json(&text);
-    assert_eq!(body["update_id"], serde_json::Value::Null, "{text}");
-    assert_eq!(body["phase"], serde_json::Value::Null, "{text}");
-    assert!(body["restart_pending"].is_boolean(), "{text}");
-    assert!(orders_dir_of(&config).is_dir());
-    assert!(state_of(&config).join("orders.json").is_file());
-}
-
-/// Catches a `POST` that goes as far as an order while nothing can take the update over: the
-/// verb binds the real handover driver, which is bound to the proxy only once the supervisor's
-/// start has ended (it adopts a child or starts the installed release, and on this host,
-/// which has neither, it waits through its retries with the start-up hold in force). A `POST`
-/// meanwhile is refused with 503 and "proxy not bound yet" before anything is saved: no order
-/// is in the spool and no request id was saved, so the same request is a fresh one on a host
-/// that can take it. (What the driver refuses once bound is the swap supervisor's, tested in
-/// `handover_swap`.)
-#[tokio::test(flavor = "current_thread")]
-async fn a_post_before_the_supervisors_start_ends_is_refused_and_writes_nothing() {
-    let (_proxy, addr, ca, config) = serving("update-post").await;
-    let body = post_body("r1");
-    let (status, text) = call(addr, &ca, "POST", UPDATE, Some(TOKEN), body.as_bytes()).await;
-    assert_eq!(status, 503, "{text}");
-    let answer = json(&text);
-    assert_eq!(answer["error"], "handover_unavailable", "{text}");
-    let message = answer["message"].as_str().unwrap_or_default();
-    assert!(message.contains("proxy not bound yet"), "{text}");
-    assert_eq!(names_in(&orders_dir_of(&config)), Vec::<String>::new());
-    assert!(!state_of(&config).join("requests.json").exists());
-}
-
-/// Catches an update route open to a caller the proxy should have refused. The API behind the
-/// route authenticates nothing (the proxy checked the caller before it called), so this is
-/// the one test that holds the property in the shipped binary: no token and a wrong token are
-/// 401 on `GET` and on `POST`, a body over the proxy's 4096 bytes is 413, and none of them
-/// reaches the API (no order, no saved request), while the same `POST` with the token does.
-#[tokio::test(flavor = "current_thread")]
-async fn the_proxy_refuses_before_the_update_api_is_called() {
-    let (_proxy, addr, ca, config) = serving("update-auth").await;
-    let body = post_body("r1");
-    let wrong = Some("not-the-operator-token-0123456789-abcdef");
-    for (method, bearer, payload) in [
-        ("GET", None, ""),
-        ("GET", wrong, ""),
-        ("POST", None, body.as_str()),
-        ("POST", wrong, body.as_str()),
-    ] {
-        let (status, text) = call(addr, &ca, method, UPDATE, bearer, payload.as_bytes()).await;
-        assert_eq!(status, 401, "{method} with {bearer:?}: {text}");
-    }
-    let huge = vec![b' '; 4097];
-    let (status, text) = call(addr, &ca, "POST", UPDATE, Some(TOKEN), &huge).await;
-    assert_eq!(status, 413, "{text}");
-    assert_eq!(names_in(&orders_dir_of(&config)), Vec::<String>::new());
-    assert!(!state_of(&config).join("requests.json").exists());
-
-    let (status, text) = call(addr, &ca, "POST", UPDATE, Some(TOKEN), body.as_bytes()).await;
-    assert_eq!(status, 503, "with the token the API is reached: {text}");
-}
-
-// A CI job's OIDC token (`remote_operator_file`), through the shipped binary: the real update API
-// behind the real proxy, with a fake issuer that the verb trusts through `SSL_CERT_FILE`.
-
-/// A fake issuer, and a verb whose proxy admits its tokens: the guard, the proxy's address, the
-/// CA a client trusts, the config, and the issuer (kept alive).
-async fn serving_remote(
-    name: &str,
-    with_key: bool,
-) -> (
-    Reaped,
-    SocketAddr,
-    PathBuf,
-    PathBuf,
-    kbf_oidc::testkit::FakeIssuer,
-) {
-    use base64::Engine as _;
-    let issuer = kbf_oidc::testkit::FakeIssuer::start(kbf_oidc::testkit::jwks_of(&[
-        &kbf_oidc::testkit::keys()[0],
-    ]))
-    .await;
-    let (config, ca) = served_config(name);
-    let dir = config.parent().expect("the directory").to_owned();
-    let b64 = base64::engine::general_purpose::STANDARD.encode(issuer.root.as_ref());
-    let pem = format!(
-        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
-        b64.as_bytes()
-            .chunks(64)
-            .map(|line| String::from_utf8_lossy(line).into_owned())
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    let trust = dir.join("issuer-ca.pem");
-    fs::write(&trust, pem).expect("write");
-    let allow = dir.join("remote-ci.toml");
-    fs::write(&allow, kbf_oidc::testkit::config_text(&issuer.url)).expect("write");
-    if with_key {
-        let text = fs::read_to_string(&config).expect("read");
-        let text = text.replace(
-            "[proxy.upstream]",
-            &format!("remote_operator_file = {allow:?}\n[proxy.upstream]"),
-        );
-        fs::write(&config, text).expect("write");
-    }
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let proxy = start_env(
-        &config,
-        &listener,
-        Stdio::piped(),
-        false,
-        &[],
-        &[("SSL_CERT_FILE", &trust)],
-    );
-    drop(listener);
-    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca, "/healthz"))
-        .await
-        .expect("the proxy answers");
-    assert_eq!(status, 200);
-    (proxy, addr, ca, config, issuer)
-}
-
-/// A token CI would send, valid now.
-fn ci_token(edit: impl FnOnce(&mut serde_json::Value)) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("after 1970")
-        .as_secs();
-    let mut claims = kbf_oidc::testkit::good_claims("");
-    claims["exp"] = (now + 300).into();
-    claims["iat"] = now.into();
-    claims["nbf"] = now.into();
-    edit(&mut claims);
-    kbf_oidc::testkit::mint(&kbf_oidc::testkit::keys()[0], &claims)
-}
-
-/// Catches a CI token that does not reach the update API the operator's reaches, or reaches
-/// more of it: with the allow-list a good token's `POST` is answered by the same API in the
-/// same words as the operator's (503, the API is not bound yet, and no order is written),
-/// where a stub or a refusal would differ; and the same token opens no other call (`GET`
-/// status, `abort`), is spent by its first use, and a token for another audience is refused.
-/// The issuer is a TLS server of the test that the verb trusts through `SSL_CERT_FILE`.
-#[tokio::test(flavor = "current_thread")]
-async fn a_ci_token_reaches_the_update_api_as_the_operator_token_does() {
-    let (_proxy, addr, ca, config, issuer) = serving_remote("ci-token", true).await;
-    let issuer_url = issuer.url.clone();
-    let token = |edit: fn(&mut serde_json::Value)| {
-        let url = issuer_url.clone();
-        ci_token(move |claims| {
-            claims["iss"] = url.into();
-            edit(claims);
-        })
-    };
-    let body = post_body("r1");
-    let (status, by_operator) = call(addr, &ca, "POST", UPDATE, Some(TOKEN), body.as_bytes()).await;
-    assert_eq!(status, 503, "{by_operator}");
-    let good = token(|_| {});
-    let (status, by_token) = call(addr, &ca, "POST", UPDATE, Some(&good), body.as_bytes()).await;
-    assert_eq!(status, 503, "{by_token}");
-    assert_eq!(
-        json(&by_token)["error"],
-        json(&by_operator)["error"],
-        "{by_token}"
-    );
-    assert_eq!(names_in(&orders_dir_of(&config)), Vec::<String>::new());
-
-    let (status, text) = call(addr, &ca, "POST", UPDATE, Some(&good), body.as_bytes()).await;
-    assert_eq!(status, 401, "spent: {text}");
-    for (method, path) in [
-        ("GET", UPDATE),
-        ("POST", "/v1/update/frontend/abort"),
-        ("POST", "/v1/update/frontend/rollback"),
-    ] {
-        let (status, text) = call(addr, &ca, method, path, Some(&token(|_| {})), b"{}").await;
-        assert_eq!(status, 401, "{method} {path}: {text}");
-    }
-    let wrong = token(|claims| claims["aud"] = "someone-else".into());
-    let (status, text) = call(addr, &ca, "POST", UPDATE, Some(&wrong), body.as_bytes()).await;
-    assert_eq!(status, 401, "{text}");
-}
-
-/// Catches the CI credential on when `remote_operator_file` is not set: the same good token is
-/// 401 on a verb started without it.
-#[tokio::test(flavor = "current_thread")]
-async fn without_the_allow_list_a_ci_token_is_refused() {
-    let (_proxy, addr, ca, _config, issuer) = serving_remote("ci-off", false).await;
-    let url = issuer.url.clone();
-    let good = ci_token(move |claims| claims["iss"] = url.into());
-    let body = post_body("r1");
-    let (status, text) = call(addr, &ca, "POST", UPDATE, Some(&good), body.as_bytes()).await;
-    assert_eq!(status, 401, "{text}");
-}
-
-/// Catches an allow-list that `--check` does not read: it refuses a `remote_operator_file`
-/// that does not exist or is not an allow-list, naming the key.
+/// Asserts that `--check` reads the allow-list of `remote_operator_file`: it refuses one that
+/// does not exist or is not an allow-list, naming the key.
 #[test]
 fn a_bad_allow_list_is_refused_by_check() {
     let (config, _) = served_config("ci-bad");
@@ -1485,9 +1064,10 @@ fn a_bad_allow_list_is_refused_by_check() {
         if let Some(text) = text {
             fs::write(&bad, text).expect("write");
         }
-        let table = fs::read_to_string(&config).expect("read").replace(
-            "[proxy.upstream]",
-            &format!("remote_operator_file = {bad:?}\n[proxy.upstream]"),
+        let table = fs::read_to_string(&config).expect("read").replacen(
+            "[[proxy.frontend]]",
+            &format!("remote_operator_file = {bad:?}\n[[proxy.frontend]]"),
+            1,
         );
         fs::write(&config, table).expect("write");
         let out = run(&["--check"], &config);

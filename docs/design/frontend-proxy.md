@@ -1,5 +1,11 @@
 # Frontend zero-drop update: bundled proxy, per-stream swap, Postgres side by side
 
+> **Retired in part.** The installer's two-slot supervision of the proxy's frontend children
+> (the swap, the takeover, the handover driver, the update API at `/v1/update/frontend` and
+> the `kbf-installer update` client) was removed: `kbf-installer proxy` serves a pool of
+> frontends that run on their own (`[[proxy.frontend]]` tables) and refuses the `upstream`
+> table. Passages below that describe that supervision are history.
+
 Status: design for review, 2026-10-18, revised to the owner's answers of that date. Written against `origin/feature/arch-v2`. Claims about code that I did not re-read are listed in section 14 and must be checked by the unit that depends on them (unit U0 does the first ones).
 
 ## 1. Decisions

@@ -77,12 +77,6 @@ pub fn version_json(commit: &str, profile: &str) -> String {
     )
 }
 
-/// As [`version_json`], for a build that also prints its full commit as `commit_full`.
-pub fn version_json_full(commit: &str, profile: &str) -> String {
-    let more = format!(",\"commit_full\":\"{commit}\"}}");
-    version_json(commit, profile).replacen('}', &more, 1)
-}
-
 /// The paths of the trust list and every directory above them, as a bootstrap leaves
 /// them: root's, 0755 (files 0755 and 0644).
 pub fn trusted_host() -> FakeExec {

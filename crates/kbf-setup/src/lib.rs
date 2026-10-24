@@ -18,8 +18,9 @@
 //! (`kbf_installer::layout`, `kbf_installer::setup`, ...); this crate does not depend on it.
 //!
 //! Two programs run the verb: `kbf-installer setup` and `kbf setup`. The proxy's side of it
-//! (`--proxy` and its flags, the `[proxy]` table of `installer.toml`) is the `proxy` feature,
-//! which `kbf-installer` turns on and `kbf` does not, so the `kbf` binary links no proxy code.
+//! (the `[proxy]` table of `installer.toml`, which `setup` keeps as it is, and the proxy's flags,
+//! which `kbf-installer setup` takes only to refuse) is the `proxy` feature, which
+//! `kbf-installer` turns on and `kbf` does not, so the `kbf` binary links no proxy code.
 
 pub mod cli;
 pub mod database;

@@ -29,8 +29,8 @@ futures.workspace = true
 kbf-unitfile.workspace = true
 kbf-daemon.workspace = true
 # The tests under `tests/` that call into the installer library: `package_trust` (settings,
-# layout, archive), `package_installer_verbs` (cli, layout, setup plan), `observe_ports`
-# (observe) and `proxy_aio_soak` (the proxy swap).
+# layout, archive), `package_installer_verbs` (cli, layout, setup plan) and `observe_ports`
+# (observe).
 kbf-installer.workspace = true
 kbf-objstore.workspace = true
 # The worker protocol's messages and client, for the same probe.

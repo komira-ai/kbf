@@ -3,16 +3,12 @@
 //! A node mode (`storage`, `daemon`, `storage-and-daemon`) gets its listeners, certificates and
 //! storage URL from enrollment, so its file is complete with the mode, the frontend URL and
 //! the token path. A `frontend` host serves the public REAPI listener, the worker listener and
-//! the operator API and proxies blobs to a storage node. An `all-in-one` host is always behind
-//! the proxy: its public listeners and certificates are the proxy's, its `kbf.toml` is the
-//! `storage-and-daemon` sibling's (the cold store, the metadata directory and the daemon
-//! half's identity, and a loopback listener `setup` adds from `--storage-port`), and the
-//! operator API, the state database and the sibling as storage node are the frontend child's
-//! `frontend.toml`, which `plan.rs` derives from `--database` and `--storage-port` and not from
-//! flags of this table. Their certificates and paths are the operator's, and those are the flags
-//! here. A flag sets the `kbf` flag of its key's name (a few carry a longer name for the setup
-//! command line: `--storage-url` is `storage`, `--daemon-cert` is `cert`) and is written as that
-//! key in the table of its group (`crates/kbf-cli/src/config.rs`, `GROUPS`). A test checks every
+//! the operator API and proxies blobs to a storage node; an `all-in-one` host serves the same
+//! listeners and runs the daemon half in its process, with a cold store of its own. Their
+//! certificates and paths are the operator's, and those are the flags here. A flag sets the
+//! `kbf` flag of its key's name (a few carry a longer name for the setup command line:
+//! `--storage-url` is `storage`, `--daemon-cert` is `cert`) and is written as that key in the
+//! table of its group (`crates/kbf-cli/src/config.rs`, `GROUPS`). A test checks every
 //! `(table, key)` against `kbf`'s own per-mode goldens, so a renamed or moved flag fails there.
 //!
 //! The rules, all checked before the host is touched:
@@ -30,9 +26,9 @@
 //! - what the mode cannot start without is required: a frontend its storage URL, an
 //!   all-in-one host its cold store, metadata directory and the daemon half's identity.
 //!
-//! `setup` also writes what the mode needs and has one answer for: on a frontend, the operator
-//! API address (default `127.0.0.1:8982`, as `kbf` documents; the token file `setup` writes
-//! requires it) and, for `all-in-one`, `driver = "container"`, the only driver it accepts.
+//! `setup` also writes what the mode needs and has one answer for: the operator API address
+//! (default `127.0.0.1:8982`, as `kbf` documents; the token file `setup` writes requires it)
+//! and, for `all-in-one`, `driver = "container"`, the only driver it accepts.
 //!
 //! No message carries a value, only the flag and the rule: a path or a URL a person typed can
 //! hold a secret, and a log keeps what is printed.
@@ -76,8 +72,7 @@ enum Want {
 /// Which modes take a setting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Takes {
-    /// `frontend` and `all-in-one`: the files the proxy reads (an all-in-one host is always
-    /// behind it, so on that host these move to `[proxy]` and are not written to its `kbf.toml`).
+    /// `frontend` and `all-in-one`.
     Serving,
     /// `frontend` only.
     Frontend,
@@ -163,21 +158,21 @@ const SPECS: [Spec; 20] = [
         "listen",
         "listener",
         Want::Addr,
-        Takes::Frontend,
+        Takes::Serving,
         Need::Optional,
     ),
     same!(
         "worker-listen",
         "listener",
         Want::Addr,
-        Takes::Frontend,
+        Takes::Serving,
         Need::Optional,
     ),
     same!(
         "api-listen",
         "listener",
         Want::Addr,
-        Takes::Frontend,
+        Takes::Serving,
         Need::Default("127.0.0.1:8982"),
     ),
     same!(
@@ -198,14 +193,14 @@ const SPECS: [Spec; 20] = [
         "worker-tls-cert",
         "tls",
         Want::Cert,
-        Takes::Frontend,
+        Takes::Serving,
         Need::Optional,
     ),
     same!(
         "worker-tls-key",
         "tls",
         Want::Key,
-        Takes::Frontend,
+        Takes::Serving,
         Need::Optional,
     ),
     same!(
@@ -307,25 +302,6 @@ const SPECS: [Spec; 20] = [
     ),
 ];
 
-/// The flags a `--proxy` host does not take: the listeners (the proxy owns the public address
-/// and gives each child loopback ports on its command line) and the worker listener's
-/// certificate pair (the children serve plain h2c).
-const PROXY_REFUSED: [&str; 5] = [
-    "listen",
-    "worker-listen",
-    "api-listen",
-    "worker-tls-cert",
-    "worker-tls-key",
-];
-
-/// Whether an all-in-one host of the proxy layout writes `[table] key` somewhere: in the sibling's
-/// `kbf.toml`, or, for the REAPI pair and the worker client CA, in the `[proxy]` table.
-pub fn all_in_one_writes(table: &str, key: &str) -> bool {
-    SPECS
-        .iter()
-        .any(|s| s.takes.mode(Mode::AllInOne) && s.table == table && s.key == key)
-}
-
 /// The `(table, key)` pairs `mode` writes.
 pub fn written(mode: Mode) -> Vec<(&'static str, &'static str)> {
     SPECS
@@ -339,13 +315,13 @@ pub fn written(mode: Mode) -> Vec<(&'static str, &'static str)> {
 /// `kbf.toml` of a `frontend` or `all-in-one` host.
 #[derive(clap::Args, Clone, Debug, Default, PartialEq, Eq)]
 pub struct KbfFlags {
-    /// The public REAPI listener, as IP:PORT (kbf's --listen). frontend.
+    /// The public REAPI listener, as IP:PORT (kbf's --listen). frontend, all-in-one.
     #[arg(long)]
     pub listen: Option<String>,
-    /// The worker listener (daemons and storage nodes dial it), as IP:PORT. frontend.
+    /// The worker listener (daemons and storage nodes dial it), as IP:PORT. frontend, all-in-one.
     #[arg(long)]
     pub worker_listen: Option<String>,
-    /// The operator API listener, as IP:PORT; default 127.0.0.1:8982. frontend.
+    /// The operator API listener, as IP:PORT; default 127.0.0.1:8982. frontend, all-in-one.
     #[arg(long)]
     pub api_listen: Option<String>,
     /// The REAPI listener's certificate (PEM file, absolute path); needs --reapi-tls-key.
@@ -433,31 +409,6 @@ impl KbfFlags {
         ]
     }
 
-    /// The flags by name, to be filled.
-    fn slots_mut(&mut self) -> [(&'static str, &mut Option<String>); 19] {
-        [
-            ("listen", &mut self.listen),
-            ("worker-listen", &mut self.worker_listen),
-            ("api-listen", &mut self.api_listen),
-            ("reapi-tls-cert", &mut self.reapi_tls_cert),
-            ("reapi-tls-key", &mut self.reapi_tls_key),
-            ("worker-tls-cert", &mut self.worker_tls_cert),
-            ("worker-tls-key", &mut self.worker_tls_key),
-            ("worker-client-ca", &mut self.worker_client_ca),
-            ("storage-url", &mut self.storage_url),
-            ("storage-ca", &mut self.storage_ca),
-            ("storage-client-cert", &mut self.storage_client_cert),
-            ("storage-client-key", &mut self.storage_client_key),
-            ("cold-store", &mut self.cold_store),
-            ("meta-dir", &mut self.meta_dir),
-            ("daemon-server", &mut self.daemon_server),
-            ("daemon-ca-cert", &mut self.daemon_ca_cert),
-            ("daemon-cert", &mut self.daemon_cert),
-            ("daemon-key", &mut self.daemon_key),
-            ("node-id", &mut self.node_id),
-        ]
-    }
-
     pub(super) fn get(&self, flag: &str) -> Option<&str> {
         self.slots()
             .into_iter()
@@ -465,44 +416,14 @@ impl KbfFlags {
             .and_then(|(_, value)| value.as_deref())
     }
 
-    /// Gives each flag an all-in-one host takes that was not given the value `earlier` has for
-    /// its key, `(table, key)`: the settings of the earlier layout's `kbf.toml` carried over,
-    /// where a flag of this run takes precedence. A key that host had and this layout takes no
-    /// flag for (the listeners and the worker listener's certificate, which the proxy owns) is
-    /// not a flag to fill: `validate` refuses those with `--proxy`.
-    pub fn fill_from(&mut self, earlier: impl Fn(&str, &str) -> Option<String>) {
-        for spec in SPECS.iter().filter(|s| s.takes.mode(Mode::AllInOne)) {
-            for (flag, slot) in self.slots_mut() {
-                if spec.flag == Some(flag) && slot.is_none() {
-                    *slot = earlier(spec.table, spec.key);
-                }
-            }
-        }
-    }
-
     /// Check the flags for `mode`: the settings to write, or a line per problem pushed to
     /// `problems`. Files are checked later ([`check_files`]); this needs no host.
-    ///
-    /// On a `--proxy` host (`proxy`) the children are told their loopback listeners by the
-    /// proxy and speak plain h2c behind it, so the listener flags and the worker listener's
-    /// certificate are refused (a value nothing would read); the REAPI pair and the worker
-    /// client CA are the proxy's, and come back among the settings for the caller to move
-    /// out of `kbf.toml`.
-    pub fn validate(&self, mode: Mode, proxy: bool, problems: &mut Vec<String>) -> Vec<Setting> {
+    pub fn validate(&self, mode: Mode, problems: &mut Vec<String>) -> Vec<Setting> {
         let name = super::validate::mode_name(mode);
         let mut out = Vec::new();
         let mut bad = false;
         for s in &SPECS {
             let given = s.flag.and_then(|f| self.get(f));
-            if let (true, Some(flag), Some(_)) = (proxy, s.flag, given)
-                && PROXY_REFUSED.contains(&flag)
-            {
-                problems.push(format!(
-                    "--{flag} is not taken with --proxy: the proxy tells its children their loopback listeners and they serve plain h2c behind it"
-                ));
-                bad = true;
-                continue;
-            }
             if !s.takes.mode(mode) {
                 if let (Some(flag), Some(_)) = (s.flag, given) {
                     problems.push(format!(
@@ -547,19 +468,18 @@ impl KbfFlags {
             }
         }
         if !bad {
-            self.together(mode, proxy, problems);
+            self.together(mode, problems);
         }
         out
     }
 
     /// The flags that only work in company.
-    fn together(&self, mode: Mode, proxy: bool, problems: &mut Vec<String>) {
+    fn together(&self, mode: Mode, problems: &mut Vec<String>) {
         let groups: [&[&str]; 2] = [
             &["reapi-tls-cert", "reapi-tls-key"],
             &["worker-tls-cert", "worker-tls-key", "worker-client-ca"],
         ];
-        // With the proxy the worker group is not one: the client CA is the proxy's alone.
-        for group in groups.iter().take(if proxy { 1 } else { 2 }) {
+        for group in &groups {
             let given = group.iter().filter(|f| self.get(f).is_some()).count();
             if given != 0 && given != group.len() {
                 problems.push(format!(

@@ -64,7 +64,7 @@ pub enum Verb {
     Quiesce,
     /// Validate the installer's configuration, trust files and path chain.
     Check,
-    /// Serve the frontend host's public port: route each stream to the active child frontend.
+    /// Serve the frontend host's public port: balance each stream over the pool of frontends.
     Proxy(ProxyArgs),
     #[command(hide = true)]
     Stage,
@@ -81,13 +81,15 @@ pub enum Verb {
 pub use kbf_setup::cli::{Mode, SetupArgs};
 
 /// The flags of `kbf-installer setup`: those `kbf setup` takes too (`SetupArgs`), and the proxy's,
-/// which only this program has.
+/// which only this program has. The proxy's are hidden and refused (two-slot supervision was
+/// removed, so `setup` no longer sets up a proxy host): `dispatch` answers them before `setup`
+/// runs.
 #[derive(Args)]
 pub struct InstallerSetupArgs {
     /// The flags both programs take.
     #[command(flatten)]
     pub setup: SetupArgs,
-    /// A frontend host behind `kbf-installer proxy`: the `[proxy]` table of installer.toml.
+    /// The flags of the removed proxy host, taken only to be refused with the reason.
     #[command(flatten)]
     pub proxy: kbf_setup::setup::proxy::ProxyFlags,
 }
@@ -226,42 +228,39 @@ pub struct ProxyArgs {
     /// `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac).
     #[arg(long)]
     pub config: Option<std::path::PathBuf>,
-    /// The order spool the update API writes and the root half reads: owned by the service
-    /// user. As `run --orders-dir`. Default: `orders` in the host's state directory.
-    #[arg(long)]
+    /// Retired: no longer read, two-slot supervision was removed. Accepted and ignored, with a
+    /// warning, so that a unit written before the removal still starts.
+    #[arg(long, hide = true)]
     pub orders_dir: Option<std::path::PathBuf>,
     /// Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing.
     #[arg(long)]
     pub check: bool,
-    /// Root's directory: the proxy reads `status.json` here, to start the installed release
-    /// when no frontend child is running, and the update API reads its status. As
-    /// `run --update-dir`. Default: the host's state directory (`/var/lib/kbf-installer`,
-    /// `/var/db/kbf-installer` on a Mac).
-    #[arg(long)]
+    /// Retired: no longer read, two-slot supervision was removed. Accepted and ignored, with a
+    /// warning, so that a unit written before the removal still starts.
+    #[arg(long, hide = true)]
     pub update_dir: Option<std::path::PathBuf>,
-    /// The kbf the package installed (`/usr/bin/kbf`; an absolute path). With it the proxy keeps
-    /// a verified copy of each kbf it runs in `releases` of its state directory, starts its
-    /// children only from those copies, and keeps its installed and staged releases in
-    /// `releases.json` there: root's `status.json` and order spool are not used (`--update-dir`
-    /// and `--orders-dir` are ignored) and the update API orders nothing. Without it the proxy
-    /// works as before.
-    #[arg(long)]
+    /// Retired: no longer read, two-slot supervision was removed. Accepted and ignored, with a
+    /// warning, so that a unit written before the removal still starts.
+    #[arg(long, hide = true)]
     pub kbf_binary: Option<std::path::PathBuf>,
 }
 
-impl ProxyArgs {
-    /// Root's directory, as the flag gives it; else the host's own (as [`RunArgs::update_dir_in`]).
-    pub fn update_dir_in(&self, layout: &crate::layout::Layout) -> std::path::PathBuf {
-        self.update_dir
-            .clone()
-            .unwrap_or_else(|| layout.update_dir().as_str().into())
-    }
+/// What the warning for each retired flag of `proxy` says after the flag's name.
+const RETIRED_PROXY_FLAG: &str = "is no longer read: two-slot supervision was removed";
 
-    /// The order spool, as the flag gives it; else the host's own.
-    pub fn orders_dir_in(&self, layout: &crate::layout::Layout) -> std::path::PathBuf {
-        self.orders_dir
-            .clone()
-            .unwrap_or_else(|| layout.orders_dir().as_str().into())
+impl ProxyArgs {
+    /// One line for each retired flag that was given, naming it.
+    pub fn retired_warnings(&self) -> Vec<String> {
+        let given = [
+            ("--kbf-binary", self.kbf_binary.is_some()),
+            ("--update-dir", self.update_dir.is_some()),
+            ("--orders-dir", self.orders_dir.is_some()),
+        ];
+        given
+            .into_iter()
+            .filter(|(_, given)| *given)
+            .map(|(flag, _)| format!("{flag} {RETIRED_PROXY_FLAG}"))
+            .collect()
     }
 }
 

@@ -15,9 +15,12 @@
 //! source takes the keys of its own and refuses the others'. Parsing checks the shape of every
 //! value and reads no file: the CA files are looked at when they are used.
 //!
-//! `frontend_config` is the one key of the proxy's children: an absolute path, the file they
-//! read (`--config=`) instead of the default `kbf.toml`. `setup` writes it on an all-in-one
-//! host only, where `kbf.toml` is the storage-and-daemon sibling's; the tolerant reader takes it.
+//! `frontend_config` is an absolute path. Nothing reads it since two-slot supervision was
+//! removed; it is accepted and written back so that the file of an earlier build, whose `setup`
+//! wrote it on an all-in-one host behind the proxy, still parses and round-trips. `setup` writes
+//! it no more and keeps the one a file has, and the tolerant reader takes it. It is how `setup`
+//! knows that layout: `--mode=all-in-one` is refused on a host whose file names it
+//! (`setup::plan::refuse_proxy_layout`).
 //!
 //! [`InstallerToml::parse`] is the closed reader, for whoever decides where a release comes
 //! from (the fetcher) or rewrites the file (`setup`): it must understand all of it. A reader
@@ -179,10 +182,11 @@ pub struct InstallerToml {
     /// The frontend's worker listener and its CA, for pulling over the LAN. Only for the
     /// `frontend` source.
     pub frontend: Option<FrontendPull>,
-    /// The `[proxy]` table, read by `kbf-installer proxy`. `setup` writes the keys it has
-    /// flags for on a `--proxy` host and keeps the rest; [`InstallerToml::render`] writes the
-    /// whole table, so a file that is read and rendered keeps every key of it. Only a build with
-    /// the `proxy` feature has it: without, a file with a `[proxy]` table is not read at all.
+    /// The `[proxy]` table, read by `kbf-installer proxy`. No flag of `setup` writes it (the
+    /// operator does, by hand); [`InstallerToml::render`] writes the whole table, so a file that
+    /// is read and rendered keeps every key of it, the slot table of an earlier build included.
+    /// Only a build with the `proxy` feature has it: without, a file with a `[proxy]` table is
+    /// not read at all.
     #[cfg(feature = "proxy")]
     pub proxy: Option<ProxyConfig>,
     /// The state database of a frontend or all-in-one host: a `postgres://` URL without a
@@ -190,9 +194,10 @@ pub struct InstallerToml {
     /// leniently (only this key, and it refuses a password); this field exists so that the
     /// closed reader here does not reject the key, and it has no other consumer.
     pub database: Option<String>,
-    /// The `kbf.toml`-shaped file the proxy's frontend children read (`--config=`) instead of
-    /// the default `kbf.toml`: an absolute path. Written by `setup` on an all-in-one host only,
-    /// where `kbf.toml` is the sibling's; every other host leaves the children the default.
+    /// An absolute path that nothing reads since two-slot supervision was removed; it is accepted
+    /// and written back so that the file of an earlier build (whose `setup` wrote it on an
+    /// all-in-one host) still parses and round-trips. `setup` keeps the one a file has and
+    /// writes none.
     pub frontend_config: Option<PathBuf>,
 }
 
@@ -588,7 +593,8 @@ impl InstallerToml {
         {
             if raw.proxy.is_some() {
                 problems.push(
-                    "proxy: a host behind the proxy is set up by kbf-installer setup, which keeps this table; this setup does not read it".to_owned(),
+                    "proxy: kbf-installer setup keeps this table; this setup does not read it"
+                        .to_owned(),
                 );
             }
         }

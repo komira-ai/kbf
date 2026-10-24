@@ -29,7 +29,7 @@ pub fn mode_unit(layout: &Layout) -> Result<&'static str, String> {
     let shown = layout.kbf_toml();
     let known = crate::cli::Mode::from_str(&mode, false)
         .map_err(|_| format!("{shown} mode is {mode:?}, which is no mode of kbf"))?;
-    first_unit(&shown, &mode, crate::setup::plan::mode_units(known, false))
+    first_unit(&shown, &mode, crate::setup::plan::mode_units(known))
 }
 
 /// The first of the `units` a mode is run by; why not when the mode has none.

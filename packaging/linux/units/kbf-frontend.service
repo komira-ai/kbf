@@ -1,4 +1,4 @@
-# kbf build farm frontend on a host without the frontend proxy: `kbf --mode=frontend`.
+# kbf build farm frontend: `kbf --mode=frontend`.
 # Static unit: shipped by the kbf package (installed under /usr/lib/systemd/system/),
 # disabled, with no rendering and no @PLACEHOLDER@ in it. It starts only once
 # /etc/kbf/kbf.toml exists (ConditionPathExists=), after `kbf boot-check` (which brings the
@@ -8,13 +8,12 @@
 # ExecCondition=: ExecCondition= skips the start silently on exit 1 to 254, and a unit that
 # cannot start must fail where an operator sees it.
 #
-# When to use it: on a frontend host that does not run kbf-proxy. The listeners, the state
+# When to use it: on a frontend host. The listeners, the state
 # store, the certificates and the cold store are kbf.toml's (--config names it), and the
 # binary is /usr/bin/kbf, the kbf package's own file (docs/design/kbf-installer.md, section
-# 7): there are no slots. A host with the proxy runs the frontend as a child of kbf-proxy
-# instead and does not enable this unit; enable one of the two, never both (they bind the
-# same ports). The socket handover between two instances (a template unit) is retired: the
-# proxy swaps frontend children instead.
+# 7): there are no slots. kbf-proxy, where a host runs it, starts, adopts and swaps no frontend:
+# it balances over frontends that run as units of their own. The socket handover between two
+# instances (a template unit) is retired.
 #
 # No --instance and no --handover-socket: kbf still accepts them, ignores them and logs a
 # warning for each, and the process is a plain frontend. An update is a restart: a stop

@@ -129,17 +129,10 @@ fn check_takes_a_pool_table_and_refuses_one_that_is_also_a_slot_table() {
 /// drops.
 fn start(path: &Path, listener: &TcpListener) -> Reaped {
     let fd = listener.as_raw_fd();
-    let root = path.with_file_name("root");
     let mut command = Command::new(BIN);
     command
         .args(["proxy", "--config"])
         .arg(path)
-        .arg("--orders-dir")
-        .arg(path.with_file_name("orders"))
-        .arg("--update-dir")
-        .arg(path.with_file_name("update"))
-        .arg("--root")
-        .arg(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());

@@ -419,8 +419,8 @@ fn a_syntax_error_names_the_line_it_starts_on() {
     );
 }
 
-/// The `installer.toml` of a proxy host, as `setup --proxy` writes it with every flag at its
-/// default.
+/// The `installer.toml` of a proxy host, as an earlier build's `setup --proxy` wrote it with
+/// every flag at its default (the slot table, which the reader still takes).
 const PROXY_HOST: &str = include_str!("../tests/golden/proxy_host/installer.toml");
 
 /// The `installer.toml` of an all-in-one host: the release-source keys, `database`,

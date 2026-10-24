@@ -65,12 +65,12 @@ const FILES: [&str; 9] = [
     "kbf.slice",
 ];
 
-/// The runtime units kbf-installer starts before (`Before=` of its unit).
-const RUNTIME: [&str; 6] = [
+/// The runtime units kbf-installer starts before (`Before=` of its unit). The proxy is not one:
+/// it runs no release.
+const RUNTIME: [&str; 5] = [
     "kbf-all-in-one.service",
     "kbf-daemon.service",
     "kbf-frontend.service",
-    "kbf-proxy.service",
     "kbf-storage-and-daemon.service",
     "kbf-storage.service",
 ];

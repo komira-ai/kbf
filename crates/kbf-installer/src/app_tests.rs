@@ -176,21 +176,33 @@ fn run_defaults_its_directories_to_the_layouts_on_every_platform() {
     assert_eq!(args.orders_dir_in(&layout).as_str(), "/srv/o");
 }
 
-/// Catches the parser putting the Linux directories back as `proxy` defaults: without the flags
-/// they are unset (so the layout's apply), with them they are what was typed.
+/// Asserts that `proxy` still accepts the retired `--update-dir`, `--orders-dir` and
+/// `--kbf-binary` (a unit written before two-slot supervision was removed passes them): without
+/// the flags they are unset, with them they are what was typed.
 #[test]
-fn proxy_leaves_its_directories_to_the_layout_unless_flagged() {
+fn proxy_accepts_its_retired_flags_and_leaves_them_unset_otherwise() {
     let Verb::Proxy(args) = parse(&["proxy"]).verb else {
         panic!("proxy");
     };
-    assert_eq!((args.update_dir, args.orders_dir), (None, None));
-    let Verb::Proxy(args) =
-        parse(&["proxy", "--update-dir", "/srv/u", "--orders-dir", "/srv/o"]).verb
-    else {
+    assert_eq!(
+        (args.update_dir, args.orders_dir, args.kbf_binary),
+        (None, None, None)
+    );
+    let argv = [
+        "proxy",
+        "--update-dir",
+        "/srv/u",
+        "--orders-dir",
+        "/srv/o",
+        "--kbf-binary",
+        "/usr/bin/kbf",
+    ];
+    let Verb::Proxy(args) = parse(&argv).verb else {
         panic!("proxy");
     };
     assert_eq!(args.update_dir, Some("/srv/u".into()));
     assert_eq!(args.orders_dir, Some("/srv/o".into()));
+    assert_eq!(args.kbf_binary, Some("/usr/bin/kbf".into()));
 }
 
 /// Catches the proxy verb asking for root (it runs as the service user), a refused table
@@ -223,7 +235,7 @@ fn the_proxy_verb_runs_unprivileged_and_refuses_a_bad_table_as_usage() {
 
     fs::write(
         &file,
-        "database = \"postgres:///kbf?host=/nonexistent\"\n[proxy]\noperator_token_file = \"/a\"\nserver_cert_file = \"/b\"\nserver_key_file = \"/c\"\nclient_ca_file = \"/d\"\n[proxy.upstream]\nbase_port = 18000\n",
+        "[proxy]\noperator_token_file = \"/a\"\nserver_cert_file = \"/b\"\nserver_key_file = \"/c\"\nclient_ca_file = \"/d\"\n[[proxy.frontend]]\nname = \"a\"\nbase_port = 18000\n",
     )
     .expect("write");
     let (exit, out, err) = run_as(1000, &["proxy", "--check", "--config", &path]);
@@ -289,6 +301,73 @@ fn setup_is_root_only_and_says_so_as_text_or_json() {
         (v["verb"].as_str(), v["error"].as_str()),
         (Some("setup"), Some("needs_root"))
     );
+}
+
+/// Asserts that each of the proxy's flags is refused by `setup` as a usage error (exit 2) that
+/// names the flag and says why (two-slot supervision was removed), before anything else is
+/// checked: the refusal comes to an ordinary user and to root alike, with nothing on standard
+/// output, and not as the root check's "run it with sudo".
+#[test]
+fn setup_refuses_each_proxy_flag_with_the_reason_before_it_checks_anything() {
+    let flags = [
+        "--proxy",
+        "--proxy-base-port=18000",
+        "--buck2-auth=none",
+        "--buck2-token-file=/etc/kbf/bearer",
+        "--storage-port=8990",
+    ];
+    for flag in flags {
+        let name = flag.split('=').next().unwrap_or_default();
+        for euid in [0, 1000] {
+            let (exit, out, err) = run_as(euid, &["setup", "--mode=frontend", flag]);
+            assert_eq!(exit, Exit::Usage, "{flag} as {euid}");
+            assert!(out.is_empty(), "{flag} as {euid}: {out}");
+            let start = format!("kbf-installer: setup: {name}: two-slot supervision was removed");
+            assert!(err.starts_with(&start), "{flag} as {euid}: {err}");
+            assert!(err.contains("[[proxy.frontend]]"), "{err}");
+            assert!(!err.contains("sudo"), "{flag} as {euid}: {err}");
+        }
+    }
+}
+
+/// Asserts that the refusal of the proxy's flags is one JSON object on standard output with
+/// `--json`, naming `setup`, the word `invalid_flags` and the reason, and nothing on standard
+/// error.
+#[test]
+fn the_refusal_of_a_proxy_flag_is_one_json_object_with_json() {
+    let args = ["--json", "setup", "--mode=frontend", "--proxy"];
+    let (exit, out, err) = run_as(1000, &args);
+    assert_eq!((exit, err.as_str()), (Exit::Usage, ""));
+    let v: Value = serde_json::from_str(out.trim_end()).expect("one json object");
+    assert_eq!(
+        (v["verb"].as_str(), v["error"].as_str()),
+        (Some("setup"), Some("invalid_flags"))
+    );
+    let message = v["message"].as_str().unwrap_or_default();
+    assert!(message.starts_with("--proxy: two-slot supervision was removed"));
+}
+
+/// Asserts that the parser of `setup` still takes the proxy's flags, with their values (they are
+/// hidden from the help, which `tests/help_golden.rs` pins, and taken only to be refused), and
+/// that a command line without them gives no refusal.
+#[test]
+fn the_parser_of_setup_still_takes_the_proxy_flags() {
+    let cli = parse(&["setup", "--mode=frontend", "--proxy"]);
+    let Verb::Setup(all) = &cli.verb else {
+        panic!("not the setup verb");
+    };
+    assert!(all.proxy.proxy);
+    assert!(all.proxy.refusal().is_some());
+    let port = parse(&["setup", "--mode=frontend", "--storage-port=8990"]);
+    let Verb::Setup(all) = &port.verb else {
+        panic!("not the setup verb");
+    };
+    assert_eq!(all.proxy.storage_port, Some(8990));
+    let plain = parse(&["setup", "--mode=frontend"]);
+    let Verb::Setup(all) = &plain.verb else {
+        panic!("not the setup verb");
+    };
+    assert!(all.proxy.refusal().is_none());
 }
 
 /// Catches the steps of `setup` going to the wrong stream: they are for a person, so on

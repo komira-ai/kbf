@@ -241,8 +241,8 @@ fn kbf_setup_needs_a_mode() {
 }
 
 /// Asserts that `kbf setup --help` lists the flags of the verb (its own, the library's and
-/// the `kbf.toml` settings) and not the proxy's, and says where a host behind the proxy is set
-/// up; and that `kbf --help` names the verb.
+/// the `kbf.toml` settings) and not the proxy's, and says how a proxy is configured (by hand, with
+/// `[[proxy.frontend]]` tables); and that `kbf --help` names the verb.
 #[test]
 fn the_helps_list_the_flags_and_name_the_verb() {
     let (code, out, err) = kbf(&["setup", "--help"]);
@@ -270,7 +270,7 @@ fn the_helps_list_the_flags_and_name_the_verb() {
         .filter(|l| l.starts_with("--proxy"))
         .collect();
     assert_eq!(proxy_flags, Vec::<&str>::new());
-    assert!(out.contains("kbf-installer setup --proxy"), "{out}");
+    assert!(out.contains("[[proxy.frontend]] tables"), "{out}");
     let (code, top, err) = kbf(&["--help"]);
     assert_eq!(code, Some(0), "{err}");
     assert!(top.contains("kbf setup"), "{top}");

@@ -420,12 +420,13 @@ fn what_a_mode_cannot_start_without_is_required() {
         assert_eq!(err.exit(), Exit::Usage);
         assert!(exec.log.is_empty(), "{flag}");
     }
-    // Seven of its own, and the proxy's three files, which an all-in-one host is always behind.
+    // The seven it cannot start without, and no other: the listeners and certificates are
+    // optional and the operator API address has its default.
     let (err, _) = refused(Mode::AllInOne, KbfFlags::default());
     let SetupError::Invalid(found) = &err else {
         panic!("{err:?}");
     };
-    assert_eq!(found.len(), 10, "{found:#?}");
+    assert_eq!(found.len(), 7, "{found:#?}");
 }
 
 /// Catches flags that only work together being accepted alone: a certificate without its
