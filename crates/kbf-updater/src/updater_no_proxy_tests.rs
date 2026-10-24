@@ -720,8 +720,15 @@ fn an_install_that_stays_in_progress_fails_the_turn_at_the_install_bound() {
 #[test]
 fn members_are_rolled_before_the_other_hosts() {
     let rig = member_rig("np-then-storage");
-    let extra = format!("st1 st1.farm.example storage {KEY}\n");
-    let u = rig.open_inventory(inventory_with(&extra), rig.store());
+    // The storage host is listed before the members on purpose: only the roll's own order
+    // puts the members first.
+    let inv = Inventory::parse(&format!(
+        "st1 st1.farm.example storage {KEY}\n\
+         fe1 fe.farm.example frontend {KEY} instance=a base=18000\n\
+         fe2 fe.farm.example frontend {KEY} instance=b base=18010\n"
+    ))
+    .expect("inventory");
+    let u = rig.open_inventory(inv, rig.store());
     let roll = run(&u, Hosts::default());
     assert_eq!(roll.state, RollState::Done);
     assert_eq!(phases(&roll), [Phase::Done, Phase::Done, Phase::Done]);
